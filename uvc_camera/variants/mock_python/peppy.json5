@@ -1,5 +1,5 @@
 {
-  schema_version: 1,
+  peppy_schema: "node_v1",
   execution: {
     language: "python",
     container: {
