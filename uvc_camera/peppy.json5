@@ -7,32 +7,6 @@
       "uvc",
       "camera",
       "usb",
-    ],
-    variants: [
-      {
-        name: "default",
-        source: {
-          local: "./variants/linux"
-        }
-      },
-      {
-        name: "macos",
-        source: {
-          local: "./variants/macos"
-        }
-      },
-      {
-        name: "mock-rust",
-        source: {
-          local: "./variants/mock_rust"
-        }
-      },
-      {
-        name: "mock-python",
-        source: {
-          local: "./variants/mock_python"
-        }
-      },
     ]
   },
   interfaces: {

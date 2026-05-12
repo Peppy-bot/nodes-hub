@@ -1,0 +1,130 @@
+{
+  peppy_schema: "node_v1",
+  manifest: {
+    name: "openarm01_controller",
+    tag: "0.1.0",
+    labels: [
+      "openarm01"
+    ],
+    depends_on: {
+      nodes: [
+        {
+          name: "openarm01_arm",
+          tag: "0.1.0",
+          local_id: "robot_arm"
+        }
+      ]
+    }
+  },
+  execution: {
+    language: "rust",
+    build_cmd: [
+      "cargo",
+      "build",
+      "--release"
+    ],
+    run_cmd: [
+      "./target/release/fake_openarm01_controller"
+    ]
+  },
+  interfaces: {
+    topics: {
+      emits: [
+        {
+          name: "joint_commands",
+          qos_profile: "reliable",
+          message_format: {
+            target_positions: {
+              $type: "array",
+              $items: "f64",
+              $length: 3
+            },
+            max_velocity: "f64"
+          }
+        }
+      ],
+      consumes: [
+        {
+          local_node_id: "robot_arm", // Linked — references depends_on
+          name: "joint_states",
+        },
+      ],
+    },
+    actions: {
+      exposes: [
+        {
+          name: "move_right_arm",
+          goal_service: {
+            request_message_format: {
+              arm_id: "u16",
+              // x, y, z
+              desired_position: {
+                $type: "array",
+                $items: "i32",
+                $length: 3
+              }
+            },
+            response_message_format: {
+              accepted: "bool"
+            }
+          },
+          feedback_topic: {
+            qos_profile: "standard",
+            message_format: {
+              current_position: {
+                $type: "array",
+                $items: "i32",
+                $length: 3
+              }
+            }
+          },
+          result_service: {
+            response_message_format: {
+              final_position: {
+                $type: "array",
+                $items: "i32",
+                $length: 3
+              }
+            }
+          }
+        },
+        {
+          name: "move_left_arm",
+          goal_service: {
+            request_message_format: {
+              arm_id: "u16",
+              // x, y, z
+              desired_position: {
+                $type: "array",
+                $items: "i32",
+                $length: 3
+              }
+            },
+            response_message_format: {
+              accepted: "bool"
+            }
+          },
+          feedback_topic: {
+            qos_profile: "standard",
+            message_format: {
+              current_position: {
+                $type: "array",
+                $items: "i32",
+                $length: 3
+              }
+            }
+          },
+          result_service: {
+            response_message_format: {
+              final_position: {
+                $type: "array",
+                $items: "i32",
+                $length: 3
+              }
+            }
+          }
+        }
+      ]
+    },
+  }
+}

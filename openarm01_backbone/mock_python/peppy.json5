@@ -14,26 +14,19 @@
           local_id: "robot_arm"
         }
       ]
-    },
-    variants: [
-      {
-        name: "default",
-        source: {
-          local: "./variants/default"
-        }
-      },
-      {
-        name: "mock-rust",
-        source: {
-          local: "./variants/mock_rust"
-        }
-      },
-      {
-        name: "mock-python",
-        source: {
-          local: "./variants/mock_python"
-        }
-      },
+    }
+  },
+  execution: {
+    language: "python",
+    build_cmd: [
+      "uv",
+      "sync",
+      "--no-editable"
+    ],
+    run_cmd: [
+      "./.venv/bin/python",
+      "-m",
+      "fake_openarm01_controller"
     ]
   },
   interfaces: {
@@ -135,5 +128,5 @@
         }
       ]
     },
-  },
+  }
 }

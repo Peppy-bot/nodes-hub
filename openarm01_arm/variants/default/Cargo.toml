@@ -1,8 +1,0 @@
-[package]
-name = "openarm01_arm"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-peppygen = { path = ".peppy/libs/peppygen" }
-peppylib = { path = ".peppy/libs/peppylib" }

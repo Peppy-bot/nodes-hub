@@ -11,15 +11,7 @@
           local_id: "camera_stream"
         }
       ]
-    },
-    variants: [
-      {
-        name: "rust",
-        source: {
-          local: "./variants/rust"
-        }
-      },
-    ]
+    }
   },
   interfaces: {
     topics: {

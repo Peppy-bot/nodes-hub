@@ -5,27 +5,19 @@
     tag: "0.1.0",
     labels: [
       "arm",
-      "openarm01"
+      "openarm01",
+      "rust"
+    ]
+  },
+  execution: {
+    language: "rust",
+    build_cmd: [
+      "cargo",
+      "build",
+      "--release"
     ],
-    variants: [
-      {
-        name: "default",
-        source: {
-          local: "./variants/default"
-        }
-      },
-      {
-        name: "mock-rust",
-        source: {
-          local: "./variants/mock_rust"
-        }
-      },
-      {
-        name: "mock-python",
-        source: {
-          local: "./variants/mock_python"
-        }
-      },
+    run_cmd: [
+      "./target/release/openarm01_arm"
     ]
   },
   interfaces: {

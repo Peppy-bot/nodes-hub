@@ -1,0 +1,62 @@
+{
+  peppy_schema: "node_v1",
+  manifest: {
+    name: "openarm01_arm",
+    tag: "0.1.0",
+    labels: [
+      "arm",
+      "openarm01",
+      "python"
+    ]
+  },
+  execution: {
+    language: "python",
+    build_cmd: [
+      "uv",
+      "sync",
+      "--no-editable"
+    ],
+    run_cmd: [
+      "./.venv/bin/python",
+      "-m",
+      "openarm01_arm"
+    ]
+  },
+  interfaces: {
+    topics: {
+      emits: [
+        {
+          name: "joint_states",
+          qos_profile: "sensor_data",
+          message_format: {
+            positions: {
+              $type: "array",
+              $items: "f64",
+              $length: 3
+            },
+            velocities: {
+              $type: "array",
+              $items: "f64",
+              $length: 3
+            },
+            timestamp: "time"
+          }
+        }
+      ],
+      consumes: [
+        {
+          // No local_node_id — this is an external consumed topic
+          name: "joint_commands",
+          message_format: {
+            target_positions: {
+              $type: "array",
+              $items: "f64",
+              $length: 3
+            },
+            max_velocity: "f64"
+          }
+        }
+      ],
+    },
+  }
+}

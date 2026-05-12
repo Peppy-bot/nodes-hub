@@ -19,27 +19,7 @@
           local_id: "robot_controller"
         }
       ]
-    },
-    variants: [
-      {
-        name: "default",
-        source: {
-          local: "./variants/default"
-        }
-      },
-      {
-        name: "mock-rust",
-        source: {
-          local: "./variants/mock_rust"
-        }
-      },
-      {
-        name: "mock-python",
-        source: {
-          local: "./variants/mock_python"
-        }
-      },
-    ]
+    }
   },
   interfaces: {
     topics: {
