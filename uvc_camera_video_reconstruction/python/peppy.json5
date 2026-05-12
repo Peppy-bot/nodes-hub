@@ -13,6 +13,20 @@
       ]
     }
   },
+  execution: {
+    language: "python",
+    container: {
+      def_file: "apptainer.def",
+      mount_paths: [
+        // host_path:container_path:options
+        "/tmp/video_reconstruction:/tmp/video_reconstruction:rw"
+      ]
+    },
+    parameters: {
+      // How long do you want the reconstruction to be?
+      video_duration_seconds: "u32"
+    }
+  },
   interfaces: {
     topics: {
       consumes: [
@@ -29,20 +43,6 @@
           name: "video_stream_info",
         },
       ]
-    }
-  },
-  execution: {
-    language: "python",
-    container: {
-      def_file: "apptainer.def",
-      mount_paths: [
-        // host_path:container_path:options
-        "/tmp/video_reconstruction:/tmp/video_reconstruction:rw"
-      ]
-    },
-    parameters: {
-      // How long do you want the reconstruction to be?
-      video_duration_seconds: "u32"
     }
   }
 }

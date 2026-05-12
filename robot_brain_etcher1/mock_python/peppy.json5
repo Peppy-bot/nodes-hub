@@ -21,6 +21,19 @@
       ]
     }
   },
+  execution: {
+    language: "python",
+    build_cmd: [
+      "uv",
+      "sync",
+      "--no-editable"
+    ],
+    run_cmd: [
+      "./.venv/bin/python",
+      "-m",
+      "robot_brain_etcher1"
+    ]
+  },
   interfaces: {
     topics: {
       // The brain receives the inputs from the camera

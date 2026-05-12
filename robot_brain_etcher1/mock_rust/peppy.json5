@@ -1,0 +1,66 @@
+{
+  peppy_schema: "node_v1",
+  manifest: {
+    name: "robot_brain_etcher1",
+    tag: "0.1.0",
+    labels: [
+      "brain"
+    ],
+    depends_on: {
+      nodes: [
+        {
+          name: "uvc_camera",
+          tag: "0.1.0",
+          local_id: "camera_stream"
+        },
+        {
+          name: "openarm01_controller",
+          tag: "0.1.0",
+          local_id: "robot_controller"
+        }
+      ]
+    }
+  },
+  execution: {
+    language: "rust",
+    build_cmd: [
+      "cargo",
+      "build",
+      "--release"
+    ],
+    run_cmd: [
+      "./target/release/robot_brain_etcher1"
+    ]
+  },
+  interfaces: {
+    topics: {
+      // The brain receives the inputs from the camera
+      consumes: [
+        {
+          local_node_id: "camera_stream",
+          name: "video_stream",
+        },
+      ],
+    },
+    services: {
+      consumes: [
+        {
+          local_node_id: "camera_stream",
+          name: "video_stream_info",
+        },
+      ]
+    },
+    actions: {
+      consumes: [
+        {
+          local_node_id: "robot_controller",
+          name: "move_right_arm"
+        },
+        {
+          local_node_id: "robot_controller",
+          name: "move_left_arm"
+        }
+      ]
+    }
+  }
+}

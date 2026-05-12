@@ -1,0 +1,128 @@
+{
+  peppy_schema: "node_v1",
+  manifest: {
+    name: "uvc_camera",
+    tag: "0.1.0",
+    labels: [
+      "uvc",
+      "camera",
+      "usb",
+    ]
+  },
+  execution: {
+    language: "rust",
+    container: {
+      def_file: "apptainer.def",
+      mount_paths: [
+        // write permissions required for services
+        "${parameters:device_path}:/dev/video0:rw"
+      ]
+    },
+    parameters: {
+      device_path: "string",
+      video: {
+        frame_rate: "u16",
+        resolution: {
+          width: "u32",
+          height: "u32",
+        },
+        camera_encoding: "string",
+        topic_encoding: "string",
+      },
+    },
+  },
+  interfaces: {
+    topics: {
+      emits: [
+        {
+          name: "video_stream",
+          qos_profile: "sensor_data",
+          message_format: {
+            header: {
+              $type: "object",
+              stamp: "time",
+              frame_id: "u32",
+            },
+            encoding: "string",
+            width: "u32",
+            height: "u32",
+            frame: {
+              $type: "array",
+              $items: "u8",
+            },
+          },
+        }
+      ],
+    },
+    services: {
+      exposes: [
+        {
+          name: "video_stream_info",
+          response_message_format: {
+            width: "u32",
+            height: "u32",
+            frames_per_second: "u8",
+            encoding: "string",
+          }
+        },
+        {
+          name: "set_exposure",
+          request_message_format: {
+            mode: "string",
+            value: "i32",
+          },
+          response_message_format: {
+            success: "bool",
+            message: "string",
+            current_value: "i32",
+          },
+        },
+        {
+          name: "set_white_balance",
+          request_message_format: {
+            mode: "string",
+            temperature: "i32",
+          },
+          response_message_format: {
+            success: "bool",
+            message: "string",
+            current_temperature: "i32",
+          },
+        },
+        {
+          name: "set_gain",
+          request_message_format: {
+            value: "i32",
+          },
+          response_message_format: {
+            success: "bool",
+            message: "string",
+            current_value: "i32",
+          },
+        },
+        {
+          name: "set_brightness",
+          request_message_format: {
+            value: "i32",
+          },
+          response_message_format: {
+            success: "bool",
+            message: "string",
+            current_value: "i32",
+          },
+        },
+        {
+          name: "set_contrast",
+          request_message_format: {
+            value: "i32",
+          },
+          response_message_format: {
+            success: "bool",
+            message: "string",
+            current_value: "i32",
+          },
+        },
+      ]
+    },
+  }
+}
