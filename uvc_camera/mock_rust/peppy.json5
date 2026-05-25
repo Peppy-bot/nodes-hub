@@ -6,7 +6,6 @@
     labels: [
       "uvc",
       "camera",
-      "usb",
     ]
   },
   execution: {
