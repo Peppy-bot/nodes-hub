@@ -23,8 +23,7 @@ fn main() -> Result<()> {
 
 async fn record_video(node_runner: Arc<NodeRunner>) {
     let camera_info = loop {
-        match camera_video_stream_info::poll(&node_runner, Duration::from_secs(5), None, None).await
-        {
+        match camera_video_stream_info::poll(&node_runner, Duration::from_secs(5)).await {
             Ok(response) => {
                 println!(
                     "Camera info: {}x{} @ {} fps, encoding: {}",
@@ -50,8 +49,6 @@ async fn record_video(node_runner: Arc<NodeRunner>) {
     let _ = camera_set_exposure::poll(
         &node_runner,
         Duration::from_secs(5),
-        None,
-        None,
         camera_set_exposure::Request {
             mode: "manual".to_string(),
             value: 200,
@@ -62,8 +59,6 @@ async fn record_video(node_runner: Arc<NodeRunner>) {
     let _ = camera_set_exposure::poll(
         &node_runner,
         Duration::from_secs(5),
-        None,
-        None,
         camera_set_exposure::Request {
             mode: "auto".to_string(),
             value: 0,
@@ -76,8 +71,6 @@ async fn record_video(node_runner: Arc<NodeRunner>) {
     let _ = camera_set_white_balance::poll(
         &node_runner,
         Duration::from_secs(5),
-        None,
-        None,
         camera_set_white_balance::Request {
             mode: "manual".to_string(),
             temperature: 6500,
@@ -88,8 +81,6 @@ async fn record_video(node_runner: Arc<NodeRunner>) {
     let _ = camera_set_white_balance::poll(
         &node_runner,
         Duration::from_secs(5),
-        None,
-        None,
         camera_set_white_balance::Request {
             mode: "auto".to_string(),
             temperature: 0,
@@ -102,8 +93,6 @@ async fn record_video(node_runner: Arc<NodeRunner>) {
     let _ = camera_set_gain::poll(
         &node_runner,
         Duration::from_secs(5),
-        None,
-        None,
         camera_set_gain::Request { value: 100 },
     )
     .await;
@@ -111,8 +100,6 @@ async fn record_video(node_runner: Arc<NodeRunner>) {
     let _ = camera_set_gain::poll(
         &node_runner,
         Duration::from_secs(5),
-        None,
-        None,
         camera_set_gain::Request { value: 0 },
     )
     .await;
@@ -122,8 +109,6 @@ async fn record_video(node_runner: Arc<NodeRunner>) {
     let _ = camera_set_brightness::poll(
         &node_runner,
         Duration::from_secs(5),
-        None,
-        None,
         camera_set_brightness::Request { value: 100 },
     )
     .await;
@@ -131,8 +116,6 @@ async fn record_video(node_runner: Arc<NodeRunner>) {
     let _ = camera_set_brightness::poll(
         &node_runner,
         Duration::from_secs(5),
-        None,
-        None,
         camera_set_brightness::Request { value: 0 },
     )
     .await;
@@ -142,8 +125,6 @@ async fn record_video(node_runner: Arc<NodeRunner>) {
     let _ = camera_set_contrast::poll(
         &node_runner,
         Duration::from_secs(5),
-        None,
-        None,
         camera_set_contrast::Request { value: 100 },
     )
     .await;
@@ -151,8 +132,6 @@ async fn record_video(node_runner: Arc<NodeRunner>) {
     let _ = camera_set_contrast::poll(
         &node_runner,
         Duration::from_secs(5),
-        None,
-        None,
         camera_set_contrast::Request { value: 0 },
     )
     .await;
@@ -169,7 +148,7 @@ async fn record_seconds(node_runner: &Arc<NodeRunner>, fps: u8, seconds: u32) ->
     let frame_count = fps as u32 * seconds;
     let mut frames = Vec::with_capacity(frame_count as usize);
     for frame_num in 0..frame_count {
-        match camera_video_stream::on_next_message_received(node_runner, None, None).await {
+        match camera_video_stream::on_next_message_received(node_runner, None).await {
             Ok((_instance_id, message)) => {
                 frames.push(message.frame);
                 println!("  Frame {}/{}", frame_num + 1, frame_count);

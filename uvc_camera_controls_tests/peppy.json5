@@ -2,13 +2,13 @@
   peppy_schema: "node_v1",
   manifest: {
     name: "uvc_camera_controls_tests",
-    tag: "0.1.0",
+    tag: "v1",
     depends_on: {
-      nodes: [
+      interfaces: [
         {
           name: "uvc_camera",
-          tag: "0.1.0",
-          local_id: "camera"
+          tag: "v1",
+          link_id: "camera"
         },
       ]
     }
@@ -17,7 +17,7 @@
     topics: {
       consumes: [
         {
-          local_node_id: "camera",
+          link_id: "camera",
           name: "video_stream"
         },
       ]
@@ -25,27 +25,27 @@
     services: {
       consumes: [
         {
-          local_node_id: "camera",
+          link_id: "camera",
           name: "video_stream_info"
         },
         {
-          local_node_id: "camera",
+          link_id: "camera",
           name: "set_exposure"
         },
         {
-          local_node_id: "camera",
+          link_id: "camera",
           name: "set_white_balance"
         },
         {
-          local_node_id: "camera",
+          link_id: "camera",
           name: "set_gain"
         },
         {
-          local_node_id: "camera",
+          link_id: "camera",
           name: "set_brightness"
         },
         {
-          local_node_id: "camera",
+          link_id: "camera",
           name: "set_contrast"
         },
       ]
