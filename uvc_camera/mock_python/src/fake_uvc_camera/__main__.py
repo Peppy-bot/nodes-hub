@@ -7,9 +7,9 @@ from pathlib import Path
 
 
 from peppygen import NodeBuilder, NodeRunner, StandaloneConfig
-from peppygen.exposed_services import video_stream_info
-from peppygen.emitted_topics import video_stream
-from peppygen.emitted_topics.video_stream import MessageHeader
+from peppygen.exposed_services.uvc_camera.v1 import video_stream_info
+from peppygen.emitted_topics.uvc_camera.v1 import video_stream
+from peppygen.emitted_topics.uvc_camera.v1.video_stream import MessageHeader
 from peppygen.parameters import Parameters
 
 ASSETS_DIR = Path(__file__).resolve().parent / "assets"

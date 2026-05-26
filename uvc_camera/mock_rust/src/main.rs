@@ -2,8 +2,8 @@ use ffmpeg::format::Pixel;
 use ffmpeg::software::scaling::{Context as ScalerContext, Flags as ScalerFlags};
 use ffmpeg::util::frame::video::Video as VideoFrame;
 use ffmpeg_next as ffmpeg;
-use peppygen::emitted_topics::video_stream::{self, MessageHeader};
-use peppygen::exposed_services::video_stream_info;
+use peppygen::emitted_topics::uvc_camera::v1::video_stream::{self, MessageHeader};
+use peppygen::exposed_services::uvc_camera::v1::video_stream_info;
 use peppygen::parameters::{
     self,
 };

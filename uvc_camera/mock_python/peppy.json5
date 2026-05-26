@@ -16,110 +16,42 @@
     },
     // Those are fake parameters supposed to emulate a real camera
     parameters: {
-      device_path: "string",
+      device_path: {
+        $type: "string",
+        $default: "/dev/video0"
+      },
       video: {
-        frame_rate: "u16",
-        resolution: {
-          width: "u16",
-          height: "u16",
+        frame_rate: {
+          $type: "u16",
+          $default: 30
         },
-        camera_encoding: "string",
-        topic_encoding: "string",
+        resolution: {
+          width: {
+            $type: "u16",
+            $default: 1920
+          },
+          height: {
+            $type: "u16",
+            $default: 1080
+          },
+        },
+        camera_encoding: {
+          $type: "string",
+          $default: "mjpeg"
+        },
+        topic_encoding: {
+          $type: "string",
+          $default: "rgb8"
+        },
       },
     },
   },
   interfaces: {
-    topics: {
-      emits: [
-        {
-          name: "video_stream",
-          qos_profile: "sensor_data",
-          message_format: {
-            header: {
-              $type: "object",
-              stamp: "time",
-              frame_id: "u32",
-            },
-            encoding: "string",
-            width: "u32",
-            height: "u32",
-            frame: {
-              $type: "array",
-              $items: "u8",
-            },
-          },
-        }
-      ],
-    },
-    services: {
-      exposes: [
-        {
-          name: "video_stream_info",
-          response_message_format: {
-            width: "u32",
-            height: "u32",
-            frames_per_second: "u8",
-            encoding: "string",
-          }
-        },
-        {
-          name: "set_exposure",
-          request_message_format: {
-            mode: "string",
-            value: "i32",
-          },
-          response_message_format: {
-            success: "bool",
-            message: "string",
-            current_value: "i32",
-          },
-        },
-        {
-          name: "set_white_balance",
-          request_message_format: {
-            mode: "string",
-            temperature: "i32",
-          },
-          response_message_format: {
-            success: "bool",
-            message: "string",
-            current_temperature: "i32",
-          },
-        },
-        {
-          name: "set_gain",
-          request_message_format: {
-            value: "i32",
-          },
-          response_message_format: {
-            success: "bool",
-            message: "string",
-            current_value: "i32",
-          },
-        },
-        {
-          name: "set_brightness",
-          request_message_format: {
-            value: "i32",
-          },
-          response_message_format: {
-            success: "bool",
-            message: "string",
-            current_value: "i32",
-          },
-        },
-        {
-          name: "set_contrast",
-          request_message_format: {
-            value: "i32",
-          },
-          response_message_format: {
-            success: "bool",
-            message: "string",
-            current_value: "i32",
-          },
-        },
-      ]
-    },
+    conforms_to: [
+      {
+        name: "uvc_camera",
+        tag: "v1"
+      },
+    ],
   }
 }
