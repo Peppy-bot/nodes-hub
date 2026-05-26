@@ -7,16 +7,16 @@
       "brain"
     ],
     depends_on: {
-      nodes: [
+      interfaces: [
         {
           name: "uvc_camera",
           tag: "v1",
-          local_id: "camera_stream"
+          link_id: "camera"
         },
         {
           name: "openarm01_controller",
           tag: "v1",
-          local_id: "robot_controller"
+          link_id: "robot_controller"
         }
       ]
     }
@@ -39,7 +39,7 @@
       // The brain receives the inputs from the camera
       consumes: [
         {
-          local_node_id: "camera_stream",
+          link_id: "camera",
           name: "video_stream",
         },
       ],
@@ -47,7 +47,7 @@
     services: {
       consumes: [
         {
-          local_node_id: "camera_stream",
+          link_id: "camera",
           name: "video_stream_info",
         },
       ]
@@ -55,11 +55,11 @@
     actions: {
       consumes: [
         {
-          local_node_id: "robot_controller",
+          link_id: "robot_controller",
           name: "move_right_arm"
         },
         {
-          local_node_id: "robot_controller",
+          link_id: "robot_controller",
           name: "move_left_arm"
         }
       ]

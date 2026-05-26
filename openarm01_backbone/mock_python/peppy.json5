@@ -2,7 +2,7 @@
   peppy_schema: "node_v1",
   manifest: {
     name: "openarm01_controller",
-    tag: "0.1.0",
+    tag: "v1",
     labels: [
       "openarm01"
     ],
@@ -10,8 +10,13 @@
       nodes: [
         {
           name: "openarm01_arm",
-          tag: "0.1.0",
-          local_id: "robot_arm"
+          tag: "v1",
+          link_id: "right_robot_arm"
+        },
+        {
+          name: "openarm01_arm",
+          tag: "v1",
+          link_id: "left_robot_arm"
         }
       ]
     }
@@ -33,9 +38,10 @@
     topics: {
       emits: [
         {
-          name: "joint_commands",
+          name: "joint_positions",
           qos_profile: "reliable",
           message_format: {
+            arm_id: "u16", // 0 left, 1 right
             target_positions: {
               $type: "array",
               $items: "f64",
@@ -47,7 +53,11 @@
       ],
       consumes: [
         {
-          local_node_id: "robot_arm", // Linked — references depends_on
+          link_id: "right_robot_arm",
+          name: "joint_states",
+        },
+        {
+          link_id: "left_robot_arm",
           name: "joint_states",
         },
       ],
@@ -55,10 +65,10 @@
     actions: {
       exposes: [
         {
-          name: "move_right_arm",
+          name: "move_robot_arm",
           goal_service: {
             request_message_format: {
-              arm_id: "u16",
+              arm_id: "u16", // 0 left, 1 right
               // x, y, z
               desired_position: {
                 $type: "array",
@@ -90,42 +100,6 @@
             }
           }
         },
-        {
-          name: "move_left_arm",
-          goal_service: {
-            request_message_format: {
-              arm_id: "u16",
-              // x, y, z
-              desired_position: {
-                $type: "array",
-                $items: "i32",
-                $length: 3
-              }
-            },
-            response_message_format: {
-              accepted: "bool"
-            }
-          },
-          feedback_topic: {
-            qos_profile: "standard",
-            message_format: {
-              current_position: {
-                $type: "array",
-                $items: "i32",
-                $length: 3
-              }
-            }
-          },
-          result_service: {
-            response_message_format: {
-              final_position: {
-                $type: "array",
-                $items: "i32",
-                $length: 3
-              }
-            }
-          }
-        }
       ]
     },
   }

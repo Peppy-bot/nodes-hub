@@ -1,11 +1,13 @@
-use peppygen::consumed_topics::robot_arm_joint_states;
-use peppygen::emitted_topics::joint_commands;
-use peppygen::exposed_actions::{move_left_arm, move_right_arm};
+use peppygen::consumed_topics::{left_robot_arm_joint_states, right_robot_arm_joint_states};
+use peppygen::emitted_topics::joint_positions;
+use peppygen::exposed_actions::move_robot_arm;
 use peppygen::{NodeBuilder, Parameters, Result};
 use peppylib::runtime::CancellationToken;
-use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const ARM_ID_LEFT: u16 = 0;
+const ARM_ID_RIGHT: u16 = 1;
 
 #[derive(Debug, Clone, Copy)]
 enum ActionOutcome {
@@ -21,188 +23,91 @@ enum CancelPoll {
     Closed,
 }
 
-trait ArmAction: Sized + Send {
-    type GoalRequest: Send;
-
-    fn goal_desired_position(request: &Self::GoalRequest) -> [i32; 3];
-
-    fn expose_action(
-        node_runner: &peppygen::NodeRunner,
-    ) -> impl Future<Output = Result<Self>> + Send + '_;
-
-    async fn next_goal(&mut self) -> Result<Option<Self::GoalRequest>>;
-
-    async fn check_cancel(&mut self) -> Result<CancelPoll>;
-
-    fn send_feedback(&mut self, position: [i32; 3])
-    -> impl Future<Output = Result<()>> + Send + '_;
-
-    fn send_result(
-        &mut self,
-        final_position: [i32; 3],
-    ) -> impl Future<Output = Result<bool>> + Send + '_;
+fn arm_side(arm_id: u16) -> &'static str {
+    match arm_id {
+        ARM_ID_LEFT => "Left",
+        ARM_ID_RIGHT => "Right",
+        _ => "Unknown",
+    }
 }
 
-impl ArmAction for move_left_arm::ActionHandle {
-    type GoalRequest = move_left_arm::GoalRequest;
-
-    fn goal_desired_position(request: &Self::GoalRequest) -> [i32; 3] {
-        request.data.desired_position
-    }
-
-    fn expose_action(
-        node_runner: &peppygen::NodeRunner,
-    ) -> impl Future<Output = Result<Self>> + Send + '_ {
-        Self::expose(node_runner)
-    }
-
-    async fn next_goal(&mut self) -> Result<Option<Self::GoalRequest>> {
-        let goal_holder = Arc::new(Mutex::new(None));
-        let goal_holder_clone = Arc::clone(&goal_holder);
-        let handled = self
-            .handle_goal_next_request(move |request| {
-                *goal_holder_clone.lock().expect("goal lock poisoned") = Some(request);
-                Ok(move_left_arm::GoalResponse::new(true))
-            })
-            .await?;
-        if !handled {
-            return Ok(None);
-        }
-        Ok(goal_holder.lock().expect("goal lock poisoned").take())
-    }
-
-    async fn check_cancel(&mut self) -> Result<CancelPoll> {
-        match tokio::time::timeout(
-            Duration::from_millis(0),
-            self.handle_cancel_next_request(|_request| {
-                Ok(move_left_arm::CancelResponse::new(true, None))
-            }),
-        )
-        .await
-        {
-            Ok(result) => match result? {
-                true => Ok(CancelPoll::Cancelled),
-                false => Ok(CancelPoll::Closed),
-            },
-            Err(_) => Ok(CancelPoll::None),
-        }
-    }
-
-    fn send_feedback(
-        &mut self,
-        position: [i32; 3],
-    ) -> impl Future<Output = Result<()>> + Send + '_ {
-        self.emit_feedback(position)
-    }
-
-    fn send_result(
-        &mut self,
-        final_position: [i32; 3],
-    ) -> impl Future<Output = Result<bool>> + Send + '_ {
-        self.handle_result_next_request(move |_request| {
-            Ok(move_left_arm::ResultResponse::new(final_position))
+async fn next_goal(
+    action: &mut move_robot_arm::ActionHandle,
+) -> Result<Option<move_robot_arm::GoalRequest>> {
+    let goal_holder = Arc::new(Mutex::new(None));
+    let goal_holder_clone = Arc::clone(&goal_holder);
+    let handled = action
+        .handle_goal_next_request(move |request| {
+            *goal_holder_clone.lock().expect("goal lock poisoned") = Some(request);
+            Ok(move_robot_arm::GoalResponse::new(true))
         })
+        .await?;
+    if !handled {
+        return Ok(None);
+    }
+    Ok(goal_holder.lock().expect("goal lock poisoned").take())
+}
+
+async fn check_cancel(action: &mut move_robot_arm::ActionHandle) -> Result<CancelPoll> {
+    match tokio::time::timeout(
+        Duration::from_millis(0),
+        action.handle_cancel_next_request(|_request| {
+            Ok(move_robot_arm::CancelResponse::new(true, None))
+        }),
+    )
+    .await
+    {
+        Ok(result) => match result? {
+            true => Ok(CancelPoll::Cancelled),
+            false => Ok(CancelPoll::Closed),
+        },
+        Err(_) => Ok(CancelPoll::None),
     }
 }
 
-impl ArmAction for move_right_arm::ActionHandle {
-    type GoalRequest = move_right_arm::GoalRequest;
-
-    fn goal_desired_position(request: &Self::GoalRequest) -> [i32; 3] {
-        request.data.desired_position
-    }
-
-    fn expose_action(
-        node_runner: &peppygen::NodeRunner,
-    ) -> impl Future<Output = Result<Self>> + Send + '_ {
-        Self::expose(node_runner)
-    }
-
-    async fn next_goal(&mut self) -> Result<Option<Self::GoalRequest>> {
-        let goal_holder = Arc::new(Mutex::new(None));
-        let goal_holder_clone = Arc::clone(&goal_holder);
-        let handled = self
-            .handle_goal_next_request(move |request| {
-                *goal_holder_clone.lock().expect("goal lock poisoned") = Some(request);
-                Ok(move_right_arm::GoalResponse::new(true))
-            })
-            .await?;
-        if !handled {
-            return Ok(None);
-        }
-        Ok(goal_holder.lock().expect("goal lock poisoned").take())
-    }
-
-    async fn check_cancel(&mut self) -> Result<CancelPoll> {
-        match tokio::time::timeout(
-            Duration::from_millis(0),
-            self.handle_cancel_next_request(|_request| {
-                Ok(move_right_arm::CancelResponse::new(true, None))
-            }),
-        )
-        .await
-        {
-            Ok(result) => match result? {
-                true => Ok(CancelPoll::Cancelled),
-                false => Ok(CancelPoll::Closed),
-            },
-            Err(_) => Ok(CancelPoll::None),
-        }
-    }
-
-    fn send_feedback(
-        &mut self,
-        position: [i32; 3],
-    ) -> impl Future<Output = Result<()>> + Send + '_ {
-        self.emit_feedback(position)
-    }
-
-    fn send_result(
-        &mut self,
-        final_position: [i32; 3],
-    ) -> impl Future<Output = Result<bool>> + Send + '_ {
-        self.handle_result_next_request(move |_request| {
-            Ok(move_right_arm::ResultResponse::new(final_position))
-        })
-    }
-}
-
-async fn run_arm_action<A: ArmAction>(
+async fn run_action(
     node_runner: Arc<peppygen::NodeRunner>,
     cancel_token: CancellationToken,
-    side: &str,
 ) -> Result<()> {
-    println!("[controller] {side} arm action handler started");
-    let mut action = A::expose_action(&node_runner).await?;
-    let mut last_position = [0, 0, 0];
+    println!("[controller] move_robot_arm action handler started");
+    let mut action = move_robot_arm::ActionHandle::expose(&node_runner).await?;
+    // Per-arm last position, indexed by arm_id (0=left, 1=right).
+    let mut last_positions: [[i32; 3]; 2] = [[0, 0, 0], [0, 0, 0]];
 
     loop {
         if cancel_token.is_cancelled() {
-            println!("[controller] {side} arm shutdown requested");
+            println!("[controller] move_robot_arm shutdown requested");
             break;
         }
 
-        let Some(goal_request) = action.next_goal().await? else {
-            println!("[controller] {side} arm action handler closed");
+        let Some(goal_request) = next_goal(&mut action).await? else {
+            println!("[controller] move_robot_arm action handler closed");
             break;
         };
 
-        let desired_position = A::goal_desired_position(&goal_request);
+        let arm_id = goal_request.data.arm_id;
+        let side = arm_side(arm_id);
+        let desired_position = goal_request.data.desired_position;
         println!("[controller] {side} arm received goal: {desired_position:?}");
+
         let cmd_positions = desired_position.map(|v| v as f64);
-        if let Err(e) = joint_commands::emit(&node_runner, cmd_positions, 1.0).await {
-            eprintln!("[controller] {side} emit joint_commands error: {e:?}");
+        if let Err(e) = joint_positions::emit(&node_runner, arm_id, cmd_positions, 1.0).await {
+            eprintln!("[controller] {side} emit joint_positions error: {e:?}");
         } else {
             println!(
-                "[controller] {side} published joint_commands: target={cmd_positions:.3?} max_vel=1.0"
+                "[controller] {side} published joint_positions: arm_id={arm_id} target={cmd_positions:.3?} max_vel=1.0"
             );
         }
+
+        let arm_slot = (arm_id as usize).min(last_positions.len() - 1);
+        let start_position = last_positions[arm_slot];
         let duration = choose_action_duration();
 
         let outcome = execute_goal(
             &mut action,
             &node_runner,
-            last_position,
+            arm_id,
+            start_position,
             desired_position,
             duration,
         )
@@ -211,12 +116,12 @@ async fn run_arm_action<A: ArmAction>(
         let final_position = match outcome {
             ActionOutcome::Completed(position) => {
                 println!("[controller] {side} arm completed at position: {position:?}");
-                last_position = position;
+                last_positions[arm_slot] = position;
                 position
             }
             ActionOutcome::Cancelled(position) => {
                 println!("[controller] {side} arm cancelled at position: {position:?}");
-                last_position = position;
+                last_positions[arm_slot] = position;
                 position
             }
             ActionOutcome::Closed => {
@@ -227,8 +132,11 @@ async fn run_arm_action<A: ArmAction>(
 
         // Use timeout to avoid blocking forever if client doesn't request result
         let result_timeout = Duration::from_secs(10);
-        match tokio::time::timeout(result_timeout, action.send_result(final_position)).await {
-            Ok(Ok(true)) => {} // Result was requested and handled
+        let result_future = action.handle_result_next_request(move |_request| {
+            Ok(move_robot_arm::ResultResponse::new(final_position))
+        });
+        match tokio::time::timeout(result_timeout, result_future).await {
+            Ok(Ok(true)) => {}
             Ok(Ok(false)) => {
                 println!("[controller] {side} arm action handle closed");
                 break;
@@ -248,16 +156,17 @@ async fn run_arm_action<A: ArmAction>(
     Ok(())
 }
 
-async fn execute_goal<A: ArmAction>(
-    action: &mut A,
+async fn execute_goal(
+    action: &mut move_robot_arm::ActionHandle,
     node_runner: &Arc<peppygen::NodeRunner>,
+    arm_id: u16,
     start: [i32; 3],
     target: [i32; 3],
     duration: Duration,
 ) -> Result<ActionOutcome> {
-    action.send_feedback(start).await?;
+    action.emit_feedback(start).await?;
 
-    match action.check_cancel().await? {
+    match check_cancel(action).await? {
         CancelPoll::Cancelled => return Ok(ActionOutcome::Cancelled(start)),
         CancelPoll::Closed => return Ok(ActionOutcome::Closed),
         CancelPoll::None => {}
@@ -269,7 +178,7 @@ async fn execute_goal<A: ArmAction>(
     for step in 1..=steps {
         tokio::time::sleep(step_duration).await;
 
-        match action.check_cancel().await? {
+        match check_cancel(action).await? {
             CancelPoll::Cancelled => return Ok(ActionOutcome::Cancelled(current)),
             CancelPoll::Closed => return Ok(ActionOutcome::Closed),
             CancelPoll::None => {}
@@ -278,10 +187,10 @@ async fn execute_goal<A: ArmAction>(
         let ratio = step as f32 / steps as f32;
         current = interpolate_position(start, target, ratio);
         let cmd_positions = current.map(|v| v as f64);
-        let _ = joint_commands::emit(node_runner, cmd_positions, 1.0).await;
-        action.send_feedback(current).await?;
+        let _ = joint_positions::emit(node_runner, arm_id, cmd_positions, 1.0).await;
+        action.emit_feedback(current).await?;
 
-        match action.check_cancel().await? {
+        match check_cancel(action).await? {
             CancelPoll::Cancelled => return Ok(ActionOutcome::Cancelled(current)),
             CancelPoll::Closed => return Ok(ActionOutcome::Closed),
             CancelPoll::None => {}
@@ -322,23 +231,25 @@ fn lerp_i32(start: i32, target: i32, ratio: f32) -> i32 {
 
 fn main() -> Result<()> {
     NodeBuilder::<Parameters>::new().run(|_args, node_runner| async move {
-        let left_runner = Arc::clone(&node_runner);
-        let right_runner = Arc::clone(&node_runner);
-        let states_runner = Arc::clone(&node_runner);
-        let left_cancel_token = node_runner.cancellation_token().clone();
-        let right_cancel_token = node_runner.cancellation_token().clone();
+        let left_states_runner = Arc::clone(&node_runner);
+        let right_states_runner = Arc::clone(&node_runner);
+        let action_runner = Arc::clone(&node_runner);
+        let action_cancel_token = node_runner.cancellation_token().clone();
 
         tokio::spawn(async move {
             loop {
-                match robot_arm_joint_states::on_next_message_received(&states_runner, None, None)
-                    .await
+                match left_robot_arm_joint_states::on_next_message_received(
+                    &left_states_runner,
+                    None,
+                )
+                .await
                 {
                     Ok((_id, msg)) => println!(
-                        "[controller] joint_states update: positions={:.3?} velocities={:.3?}",
+                        "[controller] left joint_states update: positions={:.3?} velocities={:.3?}",
                         msg.positions, msg.velocities
                     ),
                     Err(e) => {
-                        eprintln!("[controller] joint_states subscription closed: {e:?}");
+                        eprintln!("[controller] left joint_states subscription closed: {e:?}");
                         break;
                     }
                 }
@@ -346,26 +257,28 @@ fn main() -> Result<()> {
         });
 
         tokio::spawn(async move {
-            if let Err(error) = run_arm_action::<move_left_arm::ActionHandle>(
-                left_runner,
-                left_cancel_token,
-                "Left",
-            )
-            .await
-            {
-                tracing::error!("Left arm action error: {error:?}");
+            loop {
+                match right_robot_arm_joint_states::on_next_message_received(
+                    &right_states_runner,
+                    None,
+                )
+                .await
+                {
+                    Ok((_id, msg)) => println!(
+                        "[controller] right joint_states update: positions={:.3?} velocities={:.3?}",
+                        msg.positions, msg.velocities
+                    ),
+                    Err(e) => {
+                        eprintln!("[controller] right joint_states subscription closed: {e:?}");
+                        break;
+                    }
+                }
             }
         });
 
         tokio::spawn(async move {
-            if let Err(error) = run_arm_action::<move_right_arm::ActionHandle>(
-                right_runner,
-                right_cancel_token,
-                "Right",
-            )
-            .await
-            {
-                tracing::error!("Right arm action error: {error:?}");
+            if let Err(error) = run_action(action_runner, action_cancel_token).await {
+                tracing::error!("move_robot_arm action error: {error:?}");
             }
         });
 
