@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use peppygen::consumed_services::camera_stream_video_stream_info;
-use peppygen::consumed_topics::camera_stream_video_stream;
+use peppygen::consumed_services::camera_video_stream_info;
+use peppygen::consumed_topics::camera_video_stream;
 use peppygen::{NodeBuilder, NodeRunner, Parameters, Result};
 
 use ffmpeg_next::Rational;
@@ -21,12 +21,10 @@ fn main() -> Result<()> {
 }
 
 async fn record_video(node_runner: Arc<NodeRunner>, video_duration_seconds: u32) {
-    let (instance_id, camera_info) = loop {
-        let response = camera_stream_video_stream_info::poll(
+    let camera_info = loop {
+        let response = camera_video_stream_info::poll(
             &node_runner,
             std::time::Duration::from_secs(5),
-            None,
-            None,
         )
         .await;
 
@@ -40,7 +38,7 @@ async fn record_video(node_runner: Arc<NodeRunner>, video_duration_seconds: u32)
                     response.data.frames_per_second,
                     response.data.encoding
                 );
-                break (response.instance_id, response.data);
+                break response.data;
             }
             Err(e) => {
                 eprintln!("Failed to get camera info: {}, retrying...", e);
@@ -58,12 +56,7 @@ async fn record_video(node_runner: Arc<NodeRunner>, video_duration_seconds: u32)
     let mut frames: Vec<Vec<u8>> = Vec::with_capacity(total_frames as usize);
 
     for frame_num in 0..total_frames {
-        match camera_stream_video_stream::on_next_message_received(
-            &node_runner,
-            None,
-            Some(&instance_id),
-        )
-        .await
+        match camera_video_stream::on_next_message_received(&node_runner, None).await
         {
             Ok((_instance_id, message)) => {
                 frames.push(message.frame);
