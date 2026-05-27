@@ -1,7 +1,7 @@
 {
   peppy_schema: "node_v1",
   manifest: {
-    name: "openarm01_controller",
+    name: "openarm01_backbone",
     tag: "v1",
     labels: [
       "openarm01"
@@ -65,7 +65,7 @@
     actions: {
       exposes: [
         {
-          name: "move_robot_arm",
+          name: "move_arm",
           goal_service: {
             request_message_format: {
               arm_id: "u16", // 0 left, 1 right

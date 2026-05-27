@@ -1,6 +1,6 @@
 use peppygen::consumed_topics::{left_robot_arm_joint_states, right_robot_arm_joint_states};
 use peppygen::emitted_topics::joint_positions;
-use peppygen::exposed_actions::move_robot_arm;
+use peppygen::exposed_actions::move_arm;
 use peppygen::{NodeBuilder, Parameters, Result};
 use peppylib::runtime::CancellationToken;
 use std::sync::{Arc, Mutex};
@@ -32,14 +32,14 @@ fn arm_side(arm_id: u16) -> &'static str {
 }
 
 async fn next_goal(
-    action: &mut move_robot_arm::ActionHandle,
-) -> Result<Option<move_robot_arm::GoalRequest>> {
+    action: &mut move_arm::ActionHandle,
+) -> Result<Option<move_arm::GoalRequest>> {
     let goal_holder = Arc::new(Mutex::new(None));
     let goal_holder_clone = Arc::clone(&goal_holder);
     let handled = action
         .handle_goal_next_request(move |request| {
             *goal_holder_clone.lock().expect("goal lock poisoned") = Some(request);
-            Ok(move_robot_arm::GoalResponse::new(true))
+            Ok(move_arm::GoalResponse::new(true))
         })
         .await?;
     if !handled {
@@ -48,11 +48,11 @@ async fn next_goal(
     Ok(goal_holder.lock().expect("goal lock poisoned").take())
 }
 
-async fn check_cancel(action: &mut move_robot_arm::ActionHandle) -> Result<CancelPoll> {
+async fn check_cancel(action: &mut move_arm::ActionHandle) -> Result<CancelPoll> {
     match tokio::time::timeout(
         Duration::from_millis(0),
         action.handle_cancel_next_request(|_request| {
-            Ok(move_robot_arm::CancelResponse::new(true, None))
+            Ok(move_arm::CancelResponse::new(true, None))
         }),
     )
     .await
@@ -69,19 +69,19 @@ async fn run_action(
     node_runner: Arc<peppygen::NodeRunner>,
     cancel_token: CancellationToken,
 ) -> Result<()> {
-    println!("[controller] move_robot_arm action handler started");
-    let mut action = move_robot_arm::ActionHandle::expose(&node_runner).await?;
+    println!("[controller] move_arm action handler started");
+    let mut action = move_arm::ActionHandle::expose(&node_runner).await?;
     // Per-arm last position, indexed by arm_id (0=left, 1=right).
     let mut last_positions: [[i32; 3]; 2] = [[0, 0, 0], [0, 0, 0]];
 
     loop {
         if cancel_token.is_cancelled() {
-            println!("[controller] move_robot_arm shutdown requested");
+            println!("[controller] move_arm shutdown requested");
             break;
         }
 
         let Some(goal_request) = next_goal(&mut action).await? else {
-            println!("[controller] move_robot_arm action handler closed");
+            println!("[controller] move_arm action handler closed");
             break;
         };
 
@@ -133,7 +133,7 @@ async fn run_action(
         // Use timeout to avoid blocking forever if client doesn't request result
         let result_timeout = Duration::from_secs(10);
         let result_future = action.handle_result_next_request(move |_request| {
-            Ok(move_robot_arm::ResultResponse::new(final_position))
+            Ok(move_arm::ResultResponse::new(final_position))
         });
         match tokio::time::timeout(result_timeout, result_future).await {
             Ok(Ok(true)) => {}
@@ -157,7 +157,7 @@ async fn run_action(
 }
 
 async fn execute_goal(
-    action: &mut move_robot_arm::ActionHandle,
+    action: &mut move_arm::ActionHandle,
     node_runner: &Arc<peppygen::NodeRunner>,
     arm_id: u16,
     start: [i32; 3],
@@ -278,7 +278,7 @@ fn main() -> Result<()> {
 
         tokio::spawn(async move {
             if let Err(error) = run_action(action_runner, action_cancel_token).await {
-                tracing::error!("move_robot_arm action error: {error:?}");
+                tracing::error!("move_arm action error: {error:?}");
             }
         });
 

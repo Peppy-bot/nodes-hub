@@ -7,7 +7,7 @@ from peppygen.consumed_topics import (
     right_robot_arm_joint_states,
 )
 from peppygen.emitted_topics import joint_positions
-from peppygen.exposed_actions import move_robot_arm
+from peppygen.exposed_actions import move_arm
 from peppygen.parameters import Parameters
 
 ARM_ID_LEFT = 0
@@ -52,19 +52,19 @@ async def _run_arm_action_safe(node_runner):
     try:
         await _run_arm_action(node_runner)
     except Exception as error:
-        print(f"move_robot_arm action error: {error}")
+        print(f"move_arm action error: {error}")
 
 
 async def _run_arm_action(node_runner):
-    print("[controller] move_robot_arm action handler started")
-    action = await move_robot_arm.ActionHandle.expose(node_runner)
+    print("[controller] move_arm action handler started")
+    action = await move_arm.ActionHandle.expose(node_runner)
     # Per-arm last position, indexed by arm_id (0=left, 1=right).
     last_positions = [[0, 0, 0], [0, 0, 0]]
 
     while True:
         goal_request = await _wait_for_goal(action)
         if goal_request is None:
-            print("[controller] move_robot_arm action handler closed")
+            print("[controller] move_arm action handler closed")
             break
 
         arm_id = goal_request.data.arm_id
@@ -107,7 +107,7 @@ async def _run_arm_action(node_runner):
         try:
             await asyncio.wait_for(
                 action.handle_result_next_request(
-                    lambda _request, p=final_position: move_robot_arm.ResultResponse(
+                    lambda _request, p=final_position: move_arm.ResultResponse(
                         final_position=p
                     )
                 ),
@@ -128,7 +128,7 @@ async def _wait_for_goal(action):
 
     def on_goal(request):
         goal_holder.append(request)
-        return move_robot_arm.GoalResponse(accepted=True)
+        return move_arm.GoalResponse(accepted=True)
 
     await action.handle_goal_next_request(on_goal)
     return goal_holder[0] if goal_holder else None
@@ -183,7 +183,7 @@ async def _poll_cancel(action):
     try:
         await asyncio.wait_for(
             action.handle_cancel_next_request(
-                lambda _request: move_robot_arm.CancelResponse(
+                lambda _request: move_arm.CancelResponse(
                     accepted=True, error_message=None
                 )
             ),

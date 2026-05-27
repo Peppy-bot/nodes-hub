@@ -3,12 +3,9 @@ import asyncio
 from peppygen import NodeBuilder, NodeRunner, QoSProfile
 from peppygen.parameters import Parameters
 from peppygen.consumed_actions import (
-    robot_controller_move_left_arm as left_arm,
+    robot_controller_move_arm as arm,
 )
-from peppygen.consumed_actions import (
-    robot_controller_move_right_arm as right_arm,
-)
-from peppygen.consumed_topics import camera_stream_video_stream as video_stream
+from peppygen.consumed_topics import camera_video_stream as video_stream
 
 
 async def ai_process(node_runner: NodeRunner):
@@ -35,17 +32,17 @@ async def ai_process(node_runner: NodeRunner):
 
         # Fire action goals to both arms concurrently
         print("[brain] Firing goals to both arms...")
-        left_goal = left_arm.GoalRequest(arm_id=0, desired_position=fake_position)
-        right_goal = right_arm.GoalRequest(arm_id=1, desired_position=fake_position)
+        left_goal = arm.GoalRequest(arm_id=0, desired_position=fake_position)
+        right_goal = arm.GoalRequest(arm_id=1, desired_position=fake_position)
 
         goal_timeout = 5.0
         result_timeout = 10.0
 
         left_goal_result, right_goal_result = await asyncio.gather(
-            left_arm.ActionHandle.fire_goal(
+            arm.ActionHandle.fire_goal(
                 node_runner, left_goal, goal_timeout, QoSProfile.Standard
             ),
-            right_arm.ActionHandle.fire_goal(
+            arm.ActionHandle.fire_goal(
                 node_runner, right_goal, goal_timeout, QoSProfile.Standard
             ),
             return_exceptions=True,

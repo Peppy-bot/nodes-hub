@@ -1,6 +1,5 @@
-use peppygen::consumed_actions::robot_controller_move_left_arm as left_arm;
-use peppygen::consumed_actions::robot_controller_move_right_arm as right_arm;
-use peppygen::consumed_topics::camera_stream_video_stream as video_stream;
+use peppygen::consumed_actions::robot_controller_move_arm as arm;
+use peppygen::consumed_topics::camera_video_stream as video_stream;
 use peppygen::{NodeBuilder, NodeRunner, Parameters, QoSProfile, Result};
 use peppylib::runtime::CancellationToken;
 use std::sync::Arc;
@@ -15,7 +14,7 @@ async fn ai_process(node_runner: Arc<NodeRunner>, cancel_token: CancellationToke
         }
 
         // Subscribe to video frames from the camera
-        let frame_result = video_stream::on_next_message_received(&node_runner, None, None).await;
+        let frame_result = video_stream::on_next_message_received(&node_runner, None).await;
 
         let (_instance_id, frame) = match frame_result {
             Ok(msg) => {
@@ -38,11 +37,11 @@ async fn ai_process(node_runner: Arc<NodeRunner>, cancel_token: CancellationToke
 
         // Fire action goals to both arms concurrently
         println!("[brain] Firing goals to both arms...");
-        let left_goal = left_arm::GoalRequest {
+        let left_goal = arm::GoalRequest {
             arm_id: 0,
             desired_position: fake_position,
         };
-        let right_goal = right_arm::GoalRequest {
+        let right_goal = arm::GoalRequest {
             arm_id: 1,
             desired_position: fake_position,
         };
@@ -52,19 +51,15 @@ async fn ai_process(node_runner: Arc<NodeRunner>, cancel_token: CancellationToke
 
         // Fire goals to both arms concurrently
         let (left_goal_result, right_goal_result) = tokio::join!(
-            left_arm::ActionHandle::fire_goal(
+            arm::ActionHandle::fire_goal(
                 &node_runner,
                 goal_timeout,
-                None,
-                None,
                 left_goal,
                 QoSProfile::Standard
             ),
-            right_arm::ActionHandle::fire_goal(
+            arm::ActionHandle::fire_goal(
                 &node_runner,
                 goal_timeout,
-                None,
-                None,
                 right_goal,
                 QoSProfile::Standard
             ),
@@ -105,8 +100,8 @@ async fn ai_process(node_runner: Arc<NodeRunner>, cancel_token: CancellationToke
         match (left_handle, right_handle) {
             (Some(left_h), Some(right_h)) => {
                 let (left_result, right_result): (
-                    peppygen::Result<left_arm::ResultResponse>,
-                    peppygen::Result<right_arm::ResultResponse>,
+                    peppygen::Result<arm::ResultResponse>,
+                    peppygen::Result<arm::ResultResponse>,
                 ) = tokio::join!(
                     left_h.get_result(result_timeout),
                     right_h.get_result(result_timeout),
