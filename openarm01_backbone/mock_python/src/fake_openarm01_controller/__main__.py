@@ -1,5 +1,6 @@
 import asyncio
 import time
+from collections import deque
 
 from peppygen import NodeBuilder, NodeRunner
 from peppygen.consumed_topics import (
@@ -12,6 +13,7 @@ from peppygen.parameters import Parameters
 
 ARM_ID_LEFT = 0
 ARM_ID_RIGHT = 1
+ARM_COUNT = 2
 
 
 def _arm_side(arm_id: int) -> str:
@@ -20,6 +22,10 @@ def _arm_side(arm_id: int) -> str:
     if arm_id == ARM_ID_RIGHT:
         return "Right"
     return "Unknown"
+
+
+def _arm_slot(arm_id: int) -> int:
+    return arm_id if 0 <= arm_id < ARM_COUNT else 0
 
 
 async def _receive_joint_states(node_runner: NodeRunner, side: str, topic_module):
@@ -58,17 +64,97 @@ async def _run_arm_action_safe(node_runner):
 async def _run_arm_action(node_runner):
     print("[controller] move_arm action handler started")
     action = await move_arm.ActionHandle.expose(node_runner)
-    # Per-arm last position, indexed by arm_id (0=left, 1=right).
-    last_positions = [[0, 0, 0], [0, 0, 0]]
+    last_positions: list[list[int]] = [[0, 0, 0] for _ in range(ARM_COUNT)]
 
+    # Per-arm goal queues feed per-arm worker tasks so left and right run in
+    # parallel. Completed final_positions land in `completed_results` and are
+    # served back FIFO to result-request callers.
+    arm_queues: list[asyncio.Queue] = [asyncio.Queue() for _ in range(ARM_COUNT)]
+    completed_results: asyncio.Queue = asyncio.Queue()
+    pending_results: deque = deque()
+    workers_alive = ARM_COUNT
+
+    worker_tasks = [
+        asyncio.create_task(
+            _arm_worker(
+                node_runner,
+                arm_id,
+                arm_queues[arm_id],
+                last_positions,
+                completed_results,
+            )
+        )
+        for arm_id in range(ARM_COUNT)
+    ]
+
+    goal_task = asyncio.create_task(_wait_for_goal(action))
+    completion_task = asyncio.create_task(completed_results.get())
+
+    try:
+        while True:
+            if pending_results:
+                final_position = pending_results[0]
+                try:
+                    await asyncio.wait_for(
+                        action.handle_result_next_request(
+                            lambda _request, fp=final_position: move_arm.ResultResponse(
+                                final_position=fp
+                            )
+                        ),
+                        timeout=10.0,
+                    )
+                    pending_results.popleft()
+                except asyncio.TimeoutError:
+                    print(
+                        "[controller] result request timed out, "
+                        f"discarding final_position={final_position}"
+                    )
+                    pending_results.popleft()
+                continue
+
+            if workers_alive == 0:
+                break
+
+            done, _pending = await asyncio.wait(
+                {goal_task, completion_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if goal_task in done:
+                goal_request = goal_task.result()
+                if goal_request is None:
+                    print("[controller] move_arm action handler closed")
+                    for queue in arm_queues:
+                        queue.put_nowait(None)
+                    goal_task = None
+                else:
+                    arm_queues[_arm_slot(goal_request.data.arm_id)].put_nowait(
+                        goal_request
+                    )
+                    goal_task = asyncio.create_task(_wait_for_goal(action))
+            if completion_task in done:
+                final_position = completion_task.result()
+                if final_position is None:
+                    workers_alive -= 1
+                else:
+                    pending_results.append(final_position)
+                completion_task = asyncio.create_task(completed_results.get())
+
+            if goal_task is None and workers_alive == 0 and not pending_results:
+                break
+    finally:
+        for task in (goal_task, completion_task, *worker_tasks):
+            if task is not None and not task.done():
+                task.cancel()
+
+
+async def _arm_worker(node_runner, arm_id, queue, last_positions, completed_results):
+    side = _arm_side(arm_id)
+    slot = _arm_slot(arm_id)
     while True:
-        goal_request = await _wait_for_goal(action)
+        goal_request = await queue.get()
         if goal_request is None:
-            print("[controller] move_arm action handler closed")
-            break
-
-        arm_id = goal_request.data.arm_id
-        side = _arm_side(arm_id)
+            await completed_results.put(None)
+            return
         desired_position = goal_request.data.desired_position
         print(f"[controller] {side} arm received goal: {desired_position}")
 
@@ -82,45 +168,16 @@ async def _run_arm_action(node_runner):
             )
         except Exception as e:
             print(f"[controller] {side} emit joint_positions error: {e!r}")
+
+        start_position = last_positions[slot]
         duration = _choose_action_duration()
 
-        arm_slot = arm_id if 0 <= arm_id < len(last_positions) else 0
-        start_position = last_positions[arm_slot]
-
-        outcome = await _execute_goal(
-            action, node_runner, arm_id, start_position, desired_position, duration
+        final_position = await _execute_goal(
+            node_runner, arm_id, start_position, desired_position, duration
         )
-
-        if outcome[0] == "completed":
-            print(f"[controller] {side} arm completed at position: {outcome[1]}")
-            last_positions[arm_slot] = outcome[1]
-        elif outcome[0] == "cancelled":
-            print(f"[controller] {side} arm cancelled at position: {outcome[1]}")
-            last_positions[arm_slot] = outcome[1]
-        elif outcome[0] == "closed":
-            print(f"[controller] {side} arm action closed")
-            break
-
-        final_position = list(last_positions[arm_slot])
-
-        # Use timeout to avoid blocking forever if client doesn't request result
-        try:
-            await asyncio.wait_for(
-                action.handle_result_next_request(
-                    lambda _request, p=final_position: move_arm.ResultResponse(
-                        final_position=p
-                    )
-                ),
-                timeout=10.0,
-            )
-        except asyncio.TimeoutError:
-            print(
-                f"[controller] {side} arm result request timed out, "
-                "continuing to next goal"
-            )
-        except Exception as e:
-            print(f"[controller] {side} arm result request error: {e}")
-            break
+        print(f"[controller] {side} arm completed at position: {final_position}")
+        last_positions[slot] = final_position
+        await completed_results.put(final_position)
 
 
 async def _wait_for_goal(action):
@@ -140,27 +197,10 @@ def _choose_action_duration():
     return millis / 1000.0
 
 
-async def _execute_goal(action, node_runner, arm_id, start, target, duration):
-    await action.emit_feedback(list(start))
-
-    cancel = await _poll_cancel(action)
-    if cancel == "cancelled":
-        return ("cancelled", list(start))
-    if cancel == "closed":
-        return ("closed", None)
-
+async def _execute_goal(node_runner, arm_id, start, target, duration):
     steps, step_duration = _feedback_plan(duration)
-    current = list(start)
-
     for step in range(1, steps + 1):
         await asyncio.sleep(step_duration)
-
-        cancel = await _poll_cancel(action)
-        if cancel == "cancelled":
-            return ("cancelled", current)
-        if cancel == "closed":
-            return ("closed", None)
-
         ratio = step / steps
         current = _interpolate_position(start, target, ratio)
         cmd_positions = [float(v) for v in current]
@@ -168,30 +208,7 @@ async def _execute_goal(action, node_runner, arm_id, start, target, duration):
             await joint_positions.emit(node_runner, arm_id, cmd_positions, 1.0)
         except Exception:
             pass
-        await action.emit_feedback(current)
-
-        cancel = await _poll_cancel(action)
-        if cancel == "cancelled":
-            return ("cancelled", current)
-        if cancel == "closed":
-            return ("closed", None)
-
-    return ("completed", list(target))
-
-
-async def _poll_cancel(action):
-    try:
-        await asyncio.wait_for(
-            action.handle_cancel_next_request(
-                lambda _request: move_arm.CancelResponse(
-                    accepted=True, error_message=None
-                )
-            ),
-            timeout=0,
-        )
-        return "cancelled"
-    except asyncio.TimeoutError:
-        return "none"
+    return list(target)
 
 
 def _feedback_plan(duration):
