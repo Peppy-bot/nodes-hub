@@ -1,25 +1,13 @@
 {
   peppy_schema: "node_v1",
   manifest: {
-    name: "openarm01_backbone",
+    name: "my_python_robot_arm",
     tag: "v1",
     labels: [
-      "openarm01"
-    ],
-    depends_on: {
-      nodes: [
-        {
-          name: "openarm01_arm",
-          tag: "v1",
-          link_id: "right_robot_arm"
-        },
-        {
-          name: "openarm01_arm",
-          tag: "v1",
-          link_id: "left_robot_arm"
-        }
-      ]
-    }
+      "arm",
+      "openarm01",
+      "python"
+    ]
   },
   execution: {
     language: "python",
@@ -31,17 +19,37 @@
     run_cmd: [
       "./.venv/bin/python",
       "-m",
-      "fake_openarm01_controller"
+      "openarm01_arm"
     ]
   },
   interfaces: {
+    topics: {
+      emits: [
+        {
+          name: "joint_states",
+          qos_profile: "sensor_data",
+          message_format: {
+            positions: {
+              $type: "array",
+              $items: "f64",
+              $length: 3
+            },
+            velocities: {
+              $type: "array",
+              $items: "f64",
+              $length: 3
+            },
+            timestamp: "time"
+          }
+        }
+      ],
+    },
     actions: {
       exposes: [
         {
           name: "move_arm",
           goal_service: {
             request_message_format: {
-              arm_id: "u16", // 0 left, 1 right
               // x, y, z
               desired_position: {
                 $type: "array",
@@ -72,18 +80,8 @@
               }
             }
           }
-        },
-      ],
-      consumes: [
-        {
-          link_id: "right_robot_arm",
-          name: "move_arm",
-        },
-        {
-          link_id: "left_robot_arm",
-          name: "move_arm",
-        },
-      ],
+        }
+      ]
     },
   }
 }

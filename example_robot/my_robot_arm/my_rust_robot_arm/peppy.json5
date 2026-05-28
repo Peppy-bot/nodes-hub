@@ -1,7 +1,7 @@
 {
   peppy_schema: "node_v1",
   manifest: {
-    name: "openarm01_arm",
+    name: "my_rust_robot_arm",
     tag: "v1",
     labels: [
       "arm",

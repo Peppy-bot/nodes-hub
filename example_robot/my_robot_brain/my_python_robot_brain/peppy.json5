@@ -1,7 +1,7 @@
 {
   peppy_schema: "node_v1",
   manifest: {
-    name: "robot_brain_etcher1",
+    name: "my_python_robot_brain",
     tag: "v1",
     labels: [
       "brain"
@@ -24,14 +24,16 @@
     }
   },
   execution: {
-    language: "rust",
+    language: "python",
     build_cmd: [
-      "cargo",
-      "build",
-      "--release"
+      "uv",
+      "sync",
+      "--no-editable"
     ],
     run_cmd: [
-      "./target/release/robot_brain_etcher1"
+      "./.venv/bin/python",
+      "-m",
+      "robot_brain_etcher1"
     ]
   },
   interfaces: {
