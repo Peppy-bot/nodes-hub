@@ -1,12 +1,11 @@
 {
   peppy_schema: "node_v1",
   manifest: {
-    name: "uvc_camera",
+    name: "uvc_camera_python_mock",
     tag: "v1",
     labels: [
       "uvc",
-      "camera",
-      "usb",
+      "camera"
     ]
   },
   execution: {

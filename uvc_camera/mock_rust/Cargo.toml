@@ -1,5 +1,5 @@
 [package]
-name = "fake_uvc_camera"
+name = "uvc_camera_rust_mock"
 version = "0.1.0"
 edition = "2024"
 

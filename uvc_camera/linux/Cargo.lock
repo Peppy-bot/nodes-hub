@@ -4891,7 +4891,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "uvc_camera"
+name = "uvc_camera_linux"
 version = "0.1.0"
 dependencies = [
  "anyhow",

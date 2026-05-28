@@ -3,17 +3,17 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "fake_uvc_camera"
+name = "uvc_camera_python_mock"
 version = "0.1.0"
-description = "fake_uvc_camera peppy node"
+description = "uvc_camera_python_mock peppy node"
 requires-python = ">=3.11,<3.14"
 dependencies = ["peppygen", "av"]
 
 [project.scripts]
-fake_uvc_camera = "fake_uvc_camera.__main__:main"
+uvc_camera_python_mock = "uvc_camera_python_mock.__main__:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/fake_uvc_camera"]
+packages = ["src/uvc_camera_python_mock"]
 
 [dependency-groups]
 dev = []

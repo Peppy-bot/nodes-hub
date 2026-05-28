@@ -1,13 +1,13 @@
 use peppygen::{NodeBuilder, Parameters, Result, StandaloneConfig};
 use std::sync::Arc;
 
-use uvc_camera::camera::{create_control_channel, run_nokhwa_capture_loop};
-use uvc_camera::services::{
+use uvc_camera_linux::camera::{create_control_channel, run_nokhwa_capture_loop};
+use uvc_camera_linux::services::{
     listen_for_set_brightness_requests, listen_for_set_contrast_requests,
     listen_for_set_exposure_requests, listen_for_set_gain_requests,
     listen_for_set_white_balance_requests, listen_for_video_stream_info_requests,
 };
-use uvc_camera::types::{CameraConfigBuilder, Encoding};
+use uvc_camera_linux::types::{CameraConfigBuilder, Encoding};
 
 fn main() -> Result<()> {
     // Load parameters from mock file for standalone execution

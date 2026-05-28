@@ -142,9 +142,9 @@ fn test_capture_color_bars() {
 #[test]
 #[ignore = "Requires v4l2loopback setup"]
 fn test_nokhwa_camera_end_to_end() {
-    use uvc_camera::camera::CameraDevice;
-    use uvc_camera::camera::NokhwaCamera;
-    use uvc_camera::types::{CameraConfig, Encoding, FrameRate, Resolution};
+    use uvc_camera_linux::camera::CameraDevice;
+    use uvc_camera_linux::camera::NokhwaCamera;
+    use uvc_camera_linux::types::{CameraConfig, Encoding, FrameRate, Resolution};
 
     let vcam = match VirtualCamera::new(10, 640, 480, 30) {
         Ok(cam) => cam,
