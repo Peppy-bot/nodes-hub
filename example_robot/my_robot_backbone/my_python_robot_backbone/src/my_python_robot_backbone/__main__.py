@@ -28,10 +28,6 @@ def _arm_side(arm_id: int) -> str:
     return "Unknown"
 
 
-async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Task]:
-    return [asyncio.create_task(_run_arm_action_safe(node_runner))]
-
-
 async def _run_arm_action_safe(node_runner):
     try:
         await _run_arm_action(node_runner)
@@ -47,6 +43,11 @@ async def _run_arm_action(node_runner):
     # accept/reject. On accept, the resulting handle lands here for drive_goal
     # to pick up — re-firing later would just produce a different goal_id.
     pending_handles: dict[int, object] = {}
+    # asyncio.create_task only keeps a weak reference, so we hold the task
+    # ourselves; otherwise GC can drop _drive_goal mid-await, which drops the
+    # backbone GoalContext without completing and races our own get_result on
+    # the arm side.
+    drive_tasks: set[asyncio.Task] = set()
 
     async def decide(request):
         arm_id = request.data.arm_id
@@ -82,7 +83,9 @@ async def _run_arm_action(node_runner):
             break
         arm_id = ctx.request().data.arm_id
         arm_handle = pending_handles.pop(arm_id)
-        asyncio.create_task(_drive_goal(ctx, arm_handle, busy_arms, arm_id))
+        task = asyncio.create_task(_drive_goal(ctx, arm_handle, busy_arms, arm_id))
+        drive_tasks.add(task)
+        task.add_done_callback(drive_tasks.discard)
 
 
 async def _drive_goal(backbone_ctx, arm_handle, busy_arms, arm_id):
@@ -138,6 +141,10 @@ async def _pump_feedback(backbone_ctx, arm_handle, side):
     finally:
         cancel_task.cancel()
     return cancelled[0]
+
+
+async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Task]:
+    return [asyncio.create_task(_run_arm_action_safe(node_runner))]
 
 
 def main():

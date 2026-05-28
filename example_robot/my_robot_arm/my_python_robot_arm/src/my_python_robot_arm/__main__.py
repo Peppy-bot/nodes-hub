@@ -35,6 +35,10 @@ async def _run_action(node_runner: NodeRunner, current_position: list[int]):
     action = await move_arm.ActionHandle.expose(node_runner)
     # Single arm per instance, so just one in-flight goal at a time.
     busy = [False]
+    # asyncio.create_task only keeps a weak reference, so we hold the task
+    # ourselves; otherwise GC can drop _drive_goal mid-await, which drops the
+    # GoalContext without completing and evicts the slot from the registry.
+    drive_tasks: set[asyncio.Task] = set()
 
     def decide(request):
         print(f"[arm] received move_arm goal: {request.data.desired_position}")
@@ -48,7 +52,9 @@ async def _run_action(node_runner: NodeRunner, current_position: list[int]):
         if ctx is None:
             print("[arm] move_arm action handler closed")
             break
-        asyncio.create_task(_drive_goal(ctx, current_position, busy))
+        task = asyncio.create_task(_drive_goal(ctx, current_position, busy))
+        drive_tasks.add(task)
+        task.add_done_callback(drive_tasks.discard)
 
 
 async def _drive_goal(ctx, current_position: list[int], busy: list[bool]):
