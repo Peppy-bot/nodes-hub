@@ -2,11 +2,9 @@ use peppygen::consumed_topics::{left_robot_arm_joint_states, right_robot_arm_joi
 use peppygen::emitted_topics::joint_positions;
 use peppygen::exposed_actions::move_arm;
 use peppygen::{NodeBuilder, Parameters, Result};
-use peppylib::runtime::CancellationToken;
-use std::collections::VecDeque;
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::mpsc;
 
 const ARM_ID_LEFT: u16 = 0;
 const ARM_ID_RIGHT: u16 = 1;
@@ -24,186 +22,118 @@ fn arm_slot(arm_id: u16) -> usize {
     (arm_id as usize).min(ARM_COUNT - 1)
 }
 
-async fn next_goal(action: &mut move_arm::ActionHandle) -> Result<Option<move_arm::GoalRequest>> {
-    let goal_holder = Arc::new(Mutex::new(None));
-    let goal_holder_clone = Arc::clone(&goal_holder);
-    let handled = action
-        .handle_goal_next_request(move |request| {
-            *goal_holder_clone.lock().expect("goal lock poisoned") = Some(request);
-            Ok(move_arm::GoalResponse::new(true))
-        })
-        .await?;
-    if !handled {
-        return Ok(None);
-    }
-    Ok(goal_holder.lock().expect("goal lock poisoned").take())
-}
-
-async fn run_action(
-    node_runner: Arc<peppygen::NodeRunner>,
-    cancel_token: CancellationToken,
-) -> Result<()> {
+async fn run_action(node_runner: Arc<peppygen::NodeRunner>) -> Result<()> {
     println!("[controller] move_arm action handler started");
     let mut action = move_arm::ActionHandle::expose(&node_runner).await?;
     let last_positions: Arc<Mutex<[[i32; 3]; ARM_COUNT]>> =
         Arc::new(Mutex::new([[0; 3]; ARM_COUNT]));
-
-    // Per-arm goal channels: dispatcher forwards goals to the worker for the
-    // matching arm_id so left and right are processed concurrently.
-    let (arm_txs, arm_rxs): (Vec<_>, Vec<_>) = (0..ARM_COUNT)
-        .map(|_| mpsc::unbounded_channel::<move_arm::GoalRequest>())
-        .unzip();
-    let (results_tx, mut results_rx) = mpsc::unbounded_channel::<[i32; 3]>();
-
-    for (arm_id, rx) in arm_rxs.into_iter().enumerate() {
-        let runner = Arc::clone(&node_runner);
-        let positions = Arc::clone(&last_positions);
-        let tx = results_tx.clone();
-        tokio::spawn(async move {
-            arm_worker(runner, arm_id as u16, rx, positions, tx).await;
-        });
-    }
-    drop(results_tx);
-
-    let mut pending_results: VecDeque<[i32; 3]> = VecDeque::new();
-    let mut workers_alive = ARM_COUNT;
+    let busy_arms: Arc<Mutex<HashSet<u16>>> = Arc::new(Mutex::new(HashSet::new()));
 
     loop {
-        if cancel_token.is_cancelled() {
-            println!("[controller] move_arm shutdown requested");
+        let busy_for_decider = Arc::clone(&busy_arms);
+        let next = action
+            .handle_goal_next_request(move |request| {
+                let side = arm_side(request.data.arm_id);
+                println!(
+                    "[controller] {side} arm received goal: {:?}",
+                    request.data.desired_position
+                );
+                // Reject a second goal for the same arm; drive_goal releases the slot when done.
+                if busy_for_decider
+                    .lock()
+                    .expect("busy lock poisoned")
+                    .insert(request.data.arm_id)
+                {
+                    Ok(move_arm::GoalResponse::accept())
+                } else {
+                    Ok(move_arm::GoalResponse::reject(format!(
+                        "arm {} is already moving",
+                        request.data.arm_id
+                    )))
+                }
+            })
+            .await?;
+        let Some(ctx) = next else {
+            println!("[controller] move_arm action handler closed");
             break;
-        }
-
-        if pending_results.is_empty() {
-            if workers_alive == 0 {
-                // No workers left to produce results; only accept new goals
-                // (though with no workers, goals won't progress; this branch
-                // mostly exists to gracefully wind down on shutdown).
-                match next_goal(&mut action).await? {
-                    Some(goal) => {
-                        dispatch_goal(&arm_txs, goal);
-                    }
-                    None => {
-                        println!("[controller] move_arm action handler closed");
-                        break;
-                    }
-                }
-                continue;
-            }
-            tokio::select! {
-                goal_outcome = next_goal(&mut action) => {
-                    match goal_outcome? {
-                        Some(goal) => dispatch_goal(&arm_txs, goal),
-                        None => {
-                            println!("[controller] move_arm action handler closed");
-                            break;
-                        }
-                    }
-                }
-                maybe_result = results_rx.recv() => {
-                    match maybe_result {
-                        Some(final_position) => pending_results.push_back(final_position),
-                        None => workers_alive = 0,
-                    }
-                }
-            }
-        } else {
-            // Hold a pending result; respond to the next result request.
-            // FIFO matches the order the brain typically issues get_result
-            // calls when both arms complete concurrently.
-            let final_position = pending_results[0];
-            let result_future = action.handle_result_next_request(move |_request| {
-                Ok(move_arm::ResultResponse::new(final_position))
-            });
-            match tokio::time::timeout(Duration::from_secs(10), result_future).await {
-                Ok(Ok(true)) => {
-                    pending_results.pop_front();
-                }
-                Ok(Ok(false)) => {
-                    println!("[controller] move_arm result stream closed");
-                    break;
-                }
-                Ok(Err(e)) => {
-                    eprintln!("[controller] result request error: {e}");
-                    break;
-                }
-                Err(_) => {
-                    println!(
-                        "[controller] result request timed out, discarding final_position={:?}",
-                        final_position
-                    );
-                    pending_results.pop_front();
-                }
-            }
-        }
+        };
+        let runner = Arc::clone(&node_runner);
+        let positions = Arc::clone(&last_positions);
+        let busy = Arc::clone(&busy_arms);
+        tokio::spawn(async move {
+            drive_goal(runner, ctx, positions, busy).await;
+        });
     }
-
-    // Closing arm_txs signals workers to exit; results_rx then closes on its
-    // own once each worker drops its results_tx clone.
-    drop(arm_txs);
     Ok(())
 }
 
-fn dispatch_goal(
-    arm_txs: &[mpsc::UnboundedSender<move_arm::GoalRequest>],
-    goal: move_arm::GoalRequest,
-) {
-    let slot = arm_slot(goal.data.arm_id);
-    if let Err(e) = arm_txs[slot].send(goal) {
-        eprintln!("[controller] arm worker channel closed: {e}");
-    }
-}
-
-async fn arm_worker(
+async fn drive_goal(
     node_runner: Arc<peppygen::NodeRunner>,
-    arm_id: u16,
-    mut rx: mpsc::UnboundedReceiver<move_arm::GoalRequest>,
+    ctx: move_arm::GoalContext,
     last_positions: Arc<Mutex<[[i32; 3]; ARM_COUNT]>>,
-    results_tx: mpsc::UnboundedSender<[i32; 3]>,
+    busy_arms: Arc<Mutex<HashSet<u16>>>,
 ) {
+    let arm_id = ctx.request().data.arm_id;
     let side = arm_side(arm_id);
     let slot = arm_slot(arm_id);
-    while let Some(goal_request) = rx.recv().await {
-        let desired_position = goal_request.data.desired_position;
-        println!("[controller] {side} arm received goal: {desired_position:?}");
+    let desired_position = ctx.request().data.desired_position;
 
-        let cmd_positions = desired_position.map(|v| v as f64);
-        if let Err(e) = joint_positions::emit(&node_runner, arm_id, cmd_positions, 1.0).await {
-            eprintln!("[controller] {side} emit joint_positions error: {e:?}");
-        } else {
-            println!(
-                "[controller] {side} published joint_positions: arm_id={arm_id} target={cmd_positions:.3?} max_vel=1.0"
-            );
-        }
+    let cmd_positions = desired_position.map(|v| v as f64);
+    if let Err(e) = joint_positions::emit(&node_runner, arm_id, cmd_positions, 1.0).await {
+        eprintln!("[controller] {side} emit joint_positions error: {e:?}");
+    } else {
+        println!(
+            "[controller] {side} published joint_positions: arm_id={arm_id} target={cmd_positions:.3?} max_vel=1.0"
+        );
+    }
 
-        let start_position = last_positions.lock().expect("last_positions lock poisoned")[slot];
-        let duration = choose_action_duration();
+    let start_position = last_positions.lock().expect("last_positions lock poisoned")[slot];
+    let duration = choose_action_duration();
+    // execute_goal updates this in place; the cancel branch reads the last stepped value.
+    let current_position: Arc<Mutex<[i32; 3]>> = Arc::new(Mutex::new(start_position));
 
-        let final_position = execute_goal(
+    let outcome = tokio::select! {
+        final_position = execute_goal(
             &node_runner,
+            &ctx,
             arm_id,
             start_position,
             desired_position,
             duration,
-        )
-        .await;
+            Arc::clone(&current_position),
+        ) => Some(final_position),
+        _ = ctx.cancel_signal() => None,
+    };
 
-        println!("[controller] {side} arm completed at position: {final_position:?}");
-        last_positions.lock().expect("last_positions lock poisoned")[slot] = final_position;
-
-        if results_tx.send(final_position).is_err() {
-            // Main loop has shut down; stop pulling new goals.
-            break;
+    match outcome {
+        Some(final_position) => {
+            println!("[controller] {side} arm completed at position: {final_position:?}");
+            last_positions.lock().expect("last_positions lock poisoned")[slot] = final_position;
+            if let Err(e) = ctx.complete(final_position).await {
+                eprintln!("[controller] {side} complete error: {e:?}");
+            }
+        }
+        None => {
+            let last_known = *current_position.lock().expect("current_position lock poisoned");
+            last_positions.lock().expect("last_positions lock poisoned")[slot] = last_known;
+            println!("[controller] {side} arm cancelled at position: {last_known:?}");
+            if let Err(e) = ctx.complete_cancelled(last_known).await {
+                eprintln!("[controller] {side} complete_cancelled error: {e:?}");
+            }
         }
     }
+
+    busy_arms.lock().expect("busy lock poisoned").remove(&arm_id);
 }
 
 async fn execute_goal(
     node_runner: &Arc<peppygen::NodeRunner>,
+    ctx: &move_arm::GoalContext,
     arm_id: u16,
     start: [i32; 3],
     target: [i32; 3],
     duration: Duration,
+    current_position: Arc<Mutex<[i32; 3]>>,
 ) -> [i32; 3] {
     let (steps, step_duration) = feedback_plan(duration);
 
@@ -211,8 +141,10 @@ async fn execute_goal(
         tokio::time::sleep(step_duration).await;
         let ratio = step as f32 / steps as f32;
         let current = interpolate_position(start, target, ratio);
+        *current_position.lock().expect("current_position lock poisoned") = current;
         let cmd_positions = current.map(|v| v as f64);
         let _ = joint_positions::emit(node_runner, arm_id, cmd_positions, 1.0).await;
+        let _ = ctx.publish_feedback(current).await;
     }
 
     target
@@ -252,7 +184,6 @@ fn main() -> Result<()> {
         let left_states_runner = Arc::clone(&node_runner);
         let right_states_runner = Arc::clone(&node_runner);
         let action_runner = Arc::clone(&node_runner);
-        let action_cancel_token = node_runner.cancellation_token().clone();
 
         tokio::spawn(async move {
             loop {
@@ -295,7 +226,7 @@ fn main() -> Result<()> {
         });
 
         tokio::spawn(async move {
-            if let Err(error) = run_action(action_runner, action_cancel_token).await {
+            if let Err(error) = run_action(action_runner).await {
                 tracing::error!("move_arm action error: {error:?}");
             }
         });
