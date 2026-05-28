@@ -11,6 +11,15 @@ const ARM_ID_RIGHT: u16 = 1;
 const GOAL_TIMEOUT: Duration = Duration::from_secs(5);
 const CANCEL_TIMEOUT: Duration = Duration::from_secs(2);
 const RESULT_TIMEOUT: Duration = Duration::from_secs(30);
+// Bound each wait for the next feedback message. The feedback end-of-stream
+// sentinel is an ordinary message that can be lost or delayed; without a bound,
+// a lost sentinel would block feedback draining forever and the result would
+// never be fetched, timing out the client. On idle/end/error we stop relaying
+// feedback and fetch the result, which parks server-side until the goal truly
+// completes — so breaking early never loses the result, it only stops relaying
+// intermediate progress. Keep this comfortably below typical client result
+// timeouts and well above the arm's feedback cadence.
+const FEEDBACK_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn arm_side(arm_id: u16) -> &'static str {
     match arm_id {
@@ -109,29 +118,25 @@ impl ArmHandle {
 
 async fn forward(backbone_ctx: move_arm::GoalContext, mut handle: ArmHandle, side: &str) {
     // The decider already accepted on the arm's behalf, so no accept check
-    // here — drain feedback, forward cancels, complete with the arm's result.
+    // here — forward feedback/cancels, then complete with the arm's result.
+    // Result delivery must NOT depend on the feedback stream ending: each wait
+    // for the next feedback message is bounded (see FEEDBACK_IDLE_TIMEOUT), so a
+    // lost/delayed end-of-stream sentinel can never wedge this goal.
     let mut cancelled = false;
     loop {
-        if cancelled {
-            match handle.next_feedback().await {
-                Ok(fp) => {
+        tokio::select! {
+            fb = tokio::time::timeout(FEEDBACK_IDLE_TIMEOUT, handle.next_feedback()) => match fb {
+                Ok(Ok(fp)) => {
                     let _ = backbone_ctx.publish_feedback(fp).await;
                 }
-                Err(_) => break,
-            }
-        } else {
-            tokio::select! {
-                fb = handle.next_feedback() => match fb {
-                    Ok(fp) => {
-                        let _ = backbone_ctx.publish_feedback(fp).await;
-                    }
-                    Err(_) => break,
-                },
-                _ = backbone_ctx.cancel_signal() => {
-                    cancelled = true;
-                    if let Err(e) = handle.cancel(CANCEL_TIMEOUT).await {
-                        eprintln!("[controller] {side} cancel_goal error: {e:?}");
-                    }
+                // Stream ended (Err) or went idle (Elapsed): stop draining and
+                // go fetch the authoritative result.
+                Ok(Err(_)) | Err(_) => break,
+            },
+            _ = backbone_ctx.cancel_signal(), if !cancelled => {
+                cancelled = true;
+                if let Err(e) = handle.cancel(CANCEL_TIMEOUT).await {
+                    eprintln!("[controller] {side} cancel_goal error: {e:?}");
                 }
             }
         }

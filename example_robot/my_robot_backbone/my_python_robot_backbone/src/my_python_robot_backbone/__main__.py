@@ -90,14 +90,22 @@ async def _run_arm_action(node_runner):
 
 async def _drive_goal(backbone_ctx, arm_handle, busy_arms, arm_id):
     side = _arm_side(arm_id)
+    # Forward feedback on a side task and treat get_result as the authoritative
+    # completion signal. Result delivery must not wait on the feedback stream
+    # draining: the end-of-stream sentinel is an ordinary feedback message and
+    # can be lost or delayed, which would otherwise wedge this goal forever
+    # (get_result would never run) and time out the client.
+    cancelled = [False]
+    pump_task = asyncio.create_task(
+        _pump_feedback(backbone_ctx, arm_handle, side, cancelled)
+    )
     try:
-        cancelled = await _pump_feedback(backbone_ctx, arm_handle, side)
         try:
             result = await arm_handle.get_result(RESULT_TIMEOUT)
             fp = result.data.final_position
             print(f"[controller] {side} arm completed at position: {fp}")
             try:
-                if cancelled:
+                if cancelled[0]:
                     await backbone_ctx.complete_cancelled(fp)
                 else:
                     await backbone_ctx.complete(fp)
@@ -110,15 +118,17 @@ async def _drive_goal(backbone_ctx, arm_handle, busy_arms, arm_id):
             except Exception:
                 pass
     finally:
+        pump_task.cancel()
         busy_arms.discard(arm_id)
 
 
-async def _pump_feedback(backbone_ctx, arm_handle, side):
-    # Drain arm feedback, forwarding to the backbone client. A parallel task
-    # watches for a backbone-side cancel and forwards it to the arm; the
-    # feedback loop ends naturally when the arm closes its stream.
-    cancelled = [False]
-
+async def _pump_feedback(backbone_ctx, arm_handle, side, cancelled):
+    # Drain arm feedback, forwarding to the backbone client, and flip the shared
+    # `cancelled` flag if the backbone client cancels (forwarding the cancel to
+    # the arm). Runs as a side task to _drive_goal, which cancels it once the
+    # result is in; the feedback loop also ends naturally when the arm closes
+    # its stream. Because this no longer gates get_result, a lost feedback
+    # end-of-stream cannot stall the goal.
     async def cancel_watcher():
         await backbone_ctx.cancel_signal()
         cancelled[0] = True
@@ -140,7 +150,6 @@ async def _pump_feedback(backbone_ctx, arm_handle, side):
                 pass
     finally:
         cancel_task.cancel()
-    return cancelled[0]
 
 
 async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Task]:
