@@ -2,11 +2,11 @@ Bootstrap: docker
 From: tuatini/peppy-rust-cargo-base:latest
 
 %labels
-    Name uvc_camera
+    Name uvc_camera_linux
     Version 0.1.0
 
 %files
-    . /opt/uvc_camera
+    . /opt/uvc_camera_linux
 
 %post
     set -eux
@@ -15,9 +15,9 @@ From: tuatini/peppy-rust-cargo-base:latest
     apt-get update
     apt-get install -y --no-install-recommends pkg-config libclang-dev
 
-    cd /opt/uvc_camera
+    cd /opt/uvc_camera_linux
     cargo build --release
 
 %runscript
-    cd /opt/uvc_camera
-    exec ./target/release/uvc_camera
+    cd /opt/uvc_camera_linux
+    exec ./target/release/uvc_camera_linux
