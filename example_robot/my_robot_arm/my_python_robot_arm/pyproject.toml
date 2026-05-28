@@ -3,17 +3,17 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "openarm01_arm"
+name = "my_python_robot_arm"
 version = "0.1.0"
-description = "openarm01_arm peppy node"
+description = "my_python_robot_arm peppy node"
 requires-python = ">=3.13,<3.14"
 dependencies = ["peppygen"]
 
 [project.scripts]
-openarm01_arm = "openarm01_arm.__main__:main"
+my_python_robot_arm = "my_python_robot_arm.__main__:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/openarm01_arm"]
+packages = ["src/my_python_robot_arm"]
 
 [dependency-groups]
 dev = []

@@ -942,7 +942,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "fake_openarm01_controller"
+name = "my_rust_robot_backbone"
 version = "0.1.0"
 dependencies = [
  "peppygen",

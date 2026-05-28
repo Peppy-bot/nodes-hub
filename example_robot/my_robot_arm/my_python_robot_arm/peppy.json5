@@ -19,7 +19,7 @@
     run_cmd: [
       "./.venv/bin/python",
       "-m",
-      "openarm01_arm"
+      "my_python_robot_arm"
     ]
   },
   interfaces: {

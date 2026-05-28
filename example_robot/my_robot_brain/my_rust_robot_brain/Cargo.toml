@@ -1,5 +1,5 @@
 [package]
-name = "robot_brain_etcher1"
+name = "my_rust_robot_brain"
 version = "0.1.0"
 edition = "2024"
 

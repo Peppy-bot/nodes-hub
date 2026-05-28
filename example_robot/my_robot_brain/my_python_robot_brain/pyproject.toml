@@ -3,17 +3,17 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "robot_brain_etcher1"
+name = "my_python_robot_brain"
 version = "0.1.0"
-description = "robot_brain_etcher1 peppy node"
+description = "my_python_robot_brain peppy node"
 requires-python = ">=3.11,<3.14"
 dependencies = ["peppygen"]
 
 [project.scripts]
-robot_brain_etcher1 = "robot_brain_etcher1.__main__:main"
+my_python_robot_brain = "my_python_robot_brain.__main__:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/robot_brain_etcher1"]
+packages = ["src/my_python_robot_brain"]
 
 [dependency-groups]
 dev = []

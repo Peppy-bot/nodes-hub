@@ -64,7 +64,7 @@ wheels = [
 ]
 
 [[package]]
-name = "robot-brain-etcher1"
+name = "my-python-robot-brain"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

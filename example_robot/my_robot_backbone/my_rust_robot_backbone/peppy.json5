@@ -29,7 +29,7 @@
       "--release"
     ],
     run_cmd: [
-      "./target/release/fake_openarm01_controller"
+      "./target/release/my_rust_robot_backbone"
     ]
   },
   interfaces: {

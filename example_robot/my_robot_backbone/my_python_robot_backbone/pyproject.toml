@@ -3,17 +3,17 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "fake_openarm01_controller"
+name = "my_python_robot_backbone"
 version = "0.1.0"
-description = "fake_openarm01_controller peppy node"
+description = "my_python_robot_backbone peppy node"
 requires-python = ">=3.11,<3.14"
 dependencies = ["peppygen"]
 
 [project.scripts]
-fake_openarm01_controller = "fake_openarm01_controller.__main__:main"
+my_python_robot_backbone = "my_python_robot_backbone.__main__:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/fake_openarm01_controller"]
+packages = ["src/my_python_robot_backbone"]
 
 [dependency-groups]
 dev = []

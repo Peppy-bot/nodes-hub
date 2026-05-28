@@ -33,7 +33,7 @@
     run_cmd: [
       "./.venv/bin/python",
       "-m",
-      "robot_brain_etcher1"
+      "my_python_robot_brain"
     ]
   },
   interfaces: {

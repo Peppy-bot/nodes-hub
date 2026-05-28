@@ -17,7 +17,7 @@
       "--release"
     ],
     run_cmd: [
-      "./target/release/openarm01_arm"
+      "./target/release/my_rust_robot_arm"
     ]
   },
   interfaces: {

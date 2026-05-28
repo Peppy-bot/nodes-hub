@@ -3,7 +3,7 @@ revision = 3
 requires-python = "==3.13.*"
 
 [[package]]
-name = "openarm01-arm"
+name = "my-python-robot-arm"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
