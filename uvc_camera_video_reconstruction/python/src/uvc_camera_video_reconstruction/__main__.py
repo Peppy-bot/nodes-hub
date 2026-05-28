@@ -20,9 +20,7 @@ async def record_video(node_runner: NodeRunner, video_duration_seconds: int):
     instance_id: str | None = None
     while camera_info is None:
         try:
-            response = await camera_video_stream_info.poll(
-                node_runner, timeout=5.0
-            )
+            response = await camera_video_stream_info.poll(node_runner, timeout=5.0)
             camera_info = response.data
             instance_id = response.instance_id
             print(

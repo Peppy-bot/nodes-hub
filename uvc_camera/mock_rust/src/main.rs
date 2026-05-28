@@ -4,15 +4,13 @@ use ffmpeg::util::frame::video::Video as VideoFrame;
 use ffmpeg_next as ffmpeg;
 use peppygen::emitted_topics::uvc_camera::v1::video_stream::{self, MessageHeader};
 use peppygen::exposed_services::uvc_camera::v1::video_stream_info;
-use peppygen::parameters::{
-    self,
-};
+use peppygen::parameters::{self};
 use peppygen::{NodeBuilder, Parameters, Result, StandaloneConfig};
 use peppylib::runtime::CancellationToken;
+use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
-use std::fs;
 
 fn get_source_video_fps(video_path: &PathBuf) -> u8 {
     let input = ffmpeg::format::input(video_path)

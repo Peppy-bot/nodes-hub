@@ -43,20 +43,45 @@
           }
         }
       ],
-      consumes: [
+    },
+    actions: {
+      exposes: [
         {
-          // No local_node_id — this is an external consumed topic
-          name: "joint_commands",
-          message_format: {
-            target_positions: {
-              $type: "array",
-              $items: "f64",
-              $length: 3
+          name: "move_arm",
+          goal_service: {
+            request_message_format: {
+              // x, y, z
+              desired_position: {
+                $type: "array",
+                $items: "i32",
+                $length: 3
+              }
             },
-            max_velocity: "f64"
+            response_message_format: {
+              accepted: "bool"
+            }
+          },
+          feedback_topic: {
+            qos_profile: "standard",
+            message_format: {
+              current_position: {
+                $type: "array",
+                $items: "i32",
+                $length: 3
+              }
+            }
+          },
+          result_service: {
+            response_message_format: {
+              final_position: {
+                $type: "array",
+                $items: "i32",
+                $length: 3
+              }
+            }
           }
         }
-      ],
+      ]
     },
   }
 }

@@ -22,11 +22,8 @@ fn main() -> Result<()> {
 
 async fn record_video(node_runner: Arc<NodeRunner>, video_duration_seconds: u32) {
     let camera_info = loop {
-        let response = camera_video_stream_info::poll(
-            &node_runner,
-            std::time::Duration::from_secs(5),
-        )
-        .await;
+        let response =
+            camera_video_stream_info::poll(&node_runner, std::time::Duration::from_secs(5)).await;
 
         match response {
             Ok(response) => {
@@ -56,8 +53,7 @@ async fn record_video(node_runner: Arc<NodeRunner>, video_duration_seconds: u32)
     let mut frames: Vec<Vec<u8>> = Vec::with_capacity(total_frames as usize);
 
     for frame_num in 0..total_frames {
-        match camera_video_stream::on_next_message_received(&node_runner, None).await
-        {
+        match camera_video_stream::on_next_message_received(&node_runner, None).await {
             Ok((_instance_id, message)) => {
                 frames.push(message.frame);
                 if (frame_num + 1) % camera_info.frames_per_second as u32 == 0 {

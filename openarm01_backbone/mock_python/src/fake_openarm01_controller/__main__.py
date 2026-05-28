@@ -1,18 +1,23 @@
 import asyncio
-import time
 
-from peppygen import NodeBuilder, NodeRunner
-from peppygen.consumed_topics import (
-    left_robot_arm_joint_states,
-    right_robot_arm_joint_states,
+from peppygen import NodeBuilder, NodeRunner, QoSProfile
+from peppygen.consumed_actions import (
+    left_robot_arm_move_arm,
+    right_robot_arm_move_arm,
 )
-from peppygen.emitted_topics import joint_positions
 from peppygen.exposed_actions import move_arm
 from peppygen.parameters import Parameters
 
 ARM_ID_LEFT = 0
 ARM_ID_RIGHT = 1
-ARM_COUNT = 2
+ARM_MODULES = {
+    ARM_ID_LEFT: left_robot_arm_move_arm,
+    ARM_ID_RIGHT: right_robot_arm_move_arm,
+}
+
+GOAL_TIMEOUT = 5.0
+CANCEL_TIMEOUT = 2.0
+RESULT_TIMEOUT = 30.0
 
 
 def _arm_side(arm_id: int) -> str:
@@ -23,34 +28,8 @@ def _arm_side(arm_id: int) -> str:
     return "Unknown"
 
 
-def _arm_slot(arm_id: int) -> int:
-    return arm_id if 0 <= arm_id < ARM_COUNT else 0
-
-
-async def _receive_joint_states(node_runner: NodeRunner, side: str, topic_module):
-    while True:
-        try:
-            _id, msg = await topic_module.on_next_message_received(node_runner, None)
-            print(
-                f"[controller] {side} joint_states update: "
-                f"positions={[round(p, 3) for p in msg.positions]} "
-                f"velocities={[round(v, 3) for v in msg.velocities]}"
-            )
-        except Exception as e:
-            print(f"[controller] {side} joint_states subscription closed: {e!r}")
-            break
-
-
 async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Task]:
-    return [
-        asyncio.create_task(
-            _receive_joint_states(node_runner, "left", left_robot_arm_joint_states)
-        ),
-        asyncio.create_task(
-            _receive_joint_states(node_runner, "right", right_robot_arm_joint_states)
-        ),
-        asyncio.create_task(_run_arm_action_safe(node_runner)),
-    ]
+    return [asyncio.create_task(_run_arm_action_safe(node_runner))]
 
 
 async def _run_arm_action_safe(node_runner):
@@ -63,18 +42,37 @@ async def _run_arm_action_safe(node_runner):
 async def _run_arm_action(node_runner):
     print("[controller] move_arm action handler started")
     action = await move_arm.ActionHandle.expose(node_runner)
-    last_positions: list[list[int]] = [[0, 0, 0] for _ in range(ARM_COUNT)]
-    # asyncio is single-threaded, so a plain set is safe here.
     busy_arms: set[int] = set()
+    # The decider pre-fires the arm goal so it can mirror the arm's
+    # accept/reject. On accept, the resulting handle lands here for drive_goal
+    # to pick up — re-firing later would just produce a different goal_id.
+    pending_handles: dict[int, object] = {}
 
-    def decide(request):
+    async def decide(request):
         arm_id = request.data.arm_id
         side = _arm_side(arm_id)
         print(f"[controller] {side} arm received goal: {request.data.desired_position}")
-        # Reject a second goal for the same arm; _drive_goal releases the slot when done.
+        if arm_id not in ARM_MODULES:
+            return move_arm.GoalResponse.reject(f"unknown arm_id {arm_id}")
         if arm_id in busy_arms:
             return move_arm.GoalResponse.reject(f"arm {arm_id} is already moving")
+        arm_module = ARM_MODULES[arm_id]
+        arm_request = arm_module.GoalRequest(
+            desired_position=request.data.desired_position
+        )
+        try:
+            arm_handle = await arm_module.ActionHandle.fire_goal(
+                node_runner, arm_request, GOAL_TIMEOUT, QoSProfile.Standard
+            )
+        except Exception as e:
+            return move_arm.GoalResponse.reject(f"{side} fire_goal error: {e!r}")
+        if not arm_handle.data.accepted:
+            reason = arm_handle.data.error_message or f"{side} arm rejected goal"
+            print(f"[controller] {side} arm rejected forwarded goal: {reason}")
+            return move_arm.GoalResponse.reject(reason)
+        print(f"[controller] {side} arm accepted forwarded goal")
         busy_arms.add(arm_id)
+        pending_handles[arm_id] = arm_handle
         return move_arm.GoalResponse.accept()
 
     while True:
@@ -82,105 +80,64 @@ async def _run_arm_action(node_runner):
         if ctx is None:
             print("[controller] move_arm action handler closed")
             break
-        asyncio.create_task(_drive_goal(node_runner, ctx, last_positions, busy_arms))
+        arm_id = ctx.request().data.arm_id
+        arm_handle = pending_handles.pop(arm_id)
+        asyncio.create_task(_drive_goal(ctx, arm_handle, busy_arms, arm_id))
 
 
-async def _drive_goal(node_runner, ctx, last_positions, busy_arms):
-    arm_id = ctx.request().data.arm_id
+async def _drive_goal(backbone_ctx, arm_handle, busy_arms, arm_id):
     side = _arm_side(arm_id)
-    slot = _arm_slot(arm_id)
-    desired_position = ctx.request().data.desired_position
-
-    cmd_positions = [float(v) for v in desired_position]
     try:
-        await joint_positions.emit(node_runner, arm_id, cmd_positions, 1.0)
-        print(
-            f"[controller] {side} published joint_positions: "
-            f"arm_id={arm_id} target={[round(p, 3) for p in cmd_positions]} "
-            f"max_vel=1.0"
-        )
-    except Exception as e:
-        print(f"[controller] {side} emit joint_positions error: {e!r}")
-
-    start_position = list(last_positions[slot])
-    duration = _choose_action_duration()
-    # _execute_goal updates this in place; the cancel branch reads the last stepped value.
-    current_position = list(start_position)
-
-    cancel_task = asyncio.ensure_future(ctx.cancel_signal())
-    work_task = asyncio.ensure_future(
-        _execute_goal(
-            node_runner,
-            ctx,
-            arm_id,
-            start_position,
-            desired_position,
-            duration,
-            current_position,
-        )
-    )
-    try:
-        done, pending = await asyncio.wait(
-            [cancel_task, work_task], return_when=asyncio.FIRST_COMPLETED
-        )
-        for task in pending:
-            task.cancel()
-        if cancel_task in done:
-            last_known = list(current_position)
-            last_positions[slot] = list(last_known)
-            print(f"[controller] {side} arm cancelled at position: {last_known}")
+        cancelled = await _pump_feedback(backbone_ctx, arm_handle, side)
+        try:
+            result = await arm_handle.get_result(RESULT_TIMEOUT)
+            fp = result.data.final_position
+            print(f"[controller] {side} arm completed at position: {fp}")
             try:
-                await ctx.complete_cancelled(last_known)
-            except Exception as e:
-                print(f"[controller] {side} complete_cancelled error: {e!r}")
-        else:
-            final_position = work_task.result()
-            last_positions[slot] = list(final_position)
-            print(f"[controller] {side} arm completed at position: {final_position}")
-            try:
-                await ctx.complete(final_position)
+                if cancelled:
+                    await backbone_ctx.complete_cancelled(fp)
+                else:
+                    await backbone_ctx.complete(fp)
             except Exception as e:
                 print(f"[controller] {side} complete error: {e!r}")
+        except Exception as e:
+            print(f"[controller] {side} get_result error: {e!r}")
+            try:
+                await backbone_ctx.complete_cancelled([0, 0, 0])
+            except Exception:
+                pass
     finally:
         busy_arms.discard(arm_id)
 
 
-async def _execute_goal(
-    node_runner, ctx, arm_id, start, target, duration, current_position
-):
-    steps, step_duration = _feedback_plan(duration)
-    for step in range(1, steps + 1):
-        await asyncio.sleep(step_duration)
-        ratio = step / steps
-        current = _interpolate_position(start, target, ratio)
-        current_position[:] = current
-        cmd_positions = [float(v) for v in current]
+async def _pump_feedback(backbone_ctx, arm_handle, side):
+    # Drain arm feedback, forwarding to the backbone client. A parallel task
+    # watches for a backbone-side cancel and forwards it to the arm; the
+    # feedback loop ends naturally when the arm closes its stream.
+    cancelled = [False]
+
+    async def cancel_watcher():
+        await backbone_ctx.cancel_signal()
+        cancelled[0] = True
         try:
-            await joint_positions.emit(node_runner, arm_id, cmd_positions, 1.0)
-        except Exception:
-            pass
-        try:
-            await ctx.publish_feedback(current)
-        except Exception:
-            pass
-    return list(target)
+            await arm_handle.cancel_goal(CANCEL_TIMEOUT)
+        except Exception as e:
+            print(f"[controller] {side} cancel_goal error: {e!r}")
 
-
-def _choose_action_duration():
-    nanos = int(time.time() * 1_000_000_000) % 1_000_000_000
-    millis = 1000 + (nanos % 2000)
-    return millis / 1000.0
-
-
-def _feedback_plan(duration):
-    total_ms = max(duration * 1000, 1)
-    steps = max(int(total_ms // 200), 1)
-    step_s = max(total_ms / steps, 1) / 1000.0
-    return steps, step_s
-
-
-def _interpolate_position(start, target, ratio):
-    return [round(s + (t - s) * ratio) for s, t in zip(start, target)]
+    cancel_task = asyncio.create_task(cancel_watcher())
+    try:
+        while True:
+            try:
+                msg = await arm_handle.on_next_feedback_message()
+            except Exception:
+                break
+            try:
+                await backbone_ctx.publish_feedback(msg.current_position)
+            except Exception:
+                pass
+    finally:
+        cancel_task.cancel()
+    return cancelled[0]
 
 
 def main():
