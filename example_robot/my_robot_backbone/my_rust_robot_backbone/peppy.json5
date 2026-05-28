@@ -9,12 +9,12 @@
     depends_on: {
       nodes: [
         {
-          name: "openarm01_arm",
+          name: "my_rust_robot_arm",
           tag: "v1",
           link_id: "right_robot_arm"
         },
         {
-          name: "openarm01_arm",
+          name: "my_rust_robot_arm",
           tag: "v1",
           link_id: "left_robot_arm"
         }
