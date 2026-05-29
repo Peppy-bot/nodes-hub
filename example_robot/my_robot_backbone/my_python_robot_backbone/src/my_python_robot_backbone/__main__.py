@@ -91,11 +91,14 @@ async def _run_arm_action(node_runner):
 async def _drive_goal(backbone_ctx, arm_handle, busy_arms, arm_id):
     side = _arm_side(arm_id)
     arm_module = ARM_MODULES[arm_id]
-    # Forward feedback on a side task; get_result is the authoritative wait. It
-    # parks until the arm reaches a terminal state and returns a typed outcome,
-    # so result delivery never depends on the feedback stream draining.
-    pump_task = asyncio.create_task(_pump_feedback(backbone_ctx, arm_handle, side))
     try:
+        # Drain feedback until the arm closes its stream (the engine guarantees
+        # closure on completion, cancel, or abandonment), forwarding any
+        # backbone-side cancel to the arm meanwhile, then fetch the
+        # authoritative typed result. Draining and get_result run sequentially:
+        # the Python action handle serializes access, so the feedback wait and
+        # the result poll must not run concurrently on the same handle.
+        await _pump_feedback(backbone_ctx, arm_handle, side)
         try:
             result = await arm_handle.get_result(RESULT_TIMEOUT)
         except Exception as e:
@@ -105,7 +108,6 @@ async def _drive_goal(backbone_ctx, arm_handle, busy_arms, arm_id):
             return
         await _relay_outcome(backbone_ctx, arm_module, side, result)
     finally:
-        pump_task.cancel()
         busy_arms.discard(arm_id)
 
 
@@ -135,10 +137,9 @@ async def _relay_outcome(backbone_ctx, arm_module, side, result):
 
 async def _pump_feedback(backbone_ctx, arm_handle, side):
     # Forward arm feedback to the backbone client, and forward a backbone-side
-    # cancel to the arm. Best-effort: this runs as a side task and never gates
-    # result delivery, so it simply ends when the arm closes its stream (on
-    # completion, cancel, or abandonment) and is cancelled by _drive_goal once
-    # the result is in.
+    # cancel to the arm. Returns when the arm closes its feedback stream (on
+    # completion, cancel, or abandonment), at which point the caller fetches the
+    # result.
     async def cancel_watcher():
         await backbone_ctx.cancel_signal()
         try:
