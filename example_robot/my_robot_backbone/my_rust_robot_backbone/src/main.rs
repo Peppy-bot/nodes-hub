@@ -11,15 +11,6 @@ const ARM_ID_RIGHT: u16 = 1;
 const GOAL_TIMEOUT: Duration = Duration::from_secs(5);
 const CANCEL_TIMEOUT: Duration = Duration::from_secs(2);
 const RESULT_TIMEOUT: Duration = Duration::from_secs(30);
-// Bound each wait for the next feedback message. The feedback end-of-stream
-// sentinel is an ordinary message that can be lost or delayed; without a bound,
-// a lost sentinel would block feedback draining forever and the result would
-// never be fetched, timing out the client. On idle/end/error we stop relaying
-// feedback and fetch the result, which parks server-side until the goal truly
-// completes — so breaking early never loses the result, it only stops relaying
-// intermediate progress. Keep this comfortably below typical client result
-// timeouts and well above the arm's feedback cadence.
-const FEEDBACK_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn arm_side(arm_id: u16) -> &'static str {
     match arm_id {
@@ -27,6 +18,16 @@ fn arm_side(arm_id: u16) -> &'static str {
         ARM_ID_RIGHT => "Right",
         _ => "Unknown",
     }
+}
+
+// The two arm modules generate distinct `ResultOutcome` enums with the same
+// shape; collapse them into one type so the forwarding loop maps the outcome
+// once. Completed/Cancelled carry the final position; Abandoned/Expired do not.
+enum ArmOutcome {
+    Completed([i32; 3]),
+    Cancelled([i32; 3]),
+    Abandoned,
+    Expired,
 }
 
 // The per-arm consumed_actions modules generate distinct types with the same
@@ -108,30 +109,47 @@ impl ArmHandle {
         }
     }
 
-    async fn final_position(&self, timeout: Duration) -> Result<[i32; 3]> {
+    async fn result(&self, timeout: Duration) -> Result<ArmOutcome> {
         match self {
-            ArmHandle::Left(h) => h.get_result(timeout).await.map(|r| r.data.final_position),
-            ArmHandle::Right(h) => h.get_result(timeout).await.map(|r| r.data.final_position),
+            ArmHandle::Left(h) => Ok(match h.get_result(timeout).await?.outcome {
+                left_robot_arm_move_arm::ResultOutcome::Completed(d) => {
+                    ArmOutcome::Completed(d.final_position)
+                }
+                left_robot_arm_move_arm::ResultOutcome::Cancelled(d) => {
+                    ArmOutcome::Cancelled(d.final_position)
+                }
+                left_robot_arm_move_arm::ResultOutcome::Abandoned => ArmOutcome::Abandoned,
+                left_robot_arm_move_arm::ResultOutcome::Expired => ArmOutcome::Expired,
+            }),
+            ArmHandle::Right(h) => Ok(match h.get_result(timeout).await?.outcome {
+                right_robot_arm_move_arm::ResultOutcome::Completed(d) => {
+                    ArmOutcome::Completed(d.final_position)
+                }
+                right_robot_arm_move_arm::ResultOutcome::Cancelled(d) => {
+                    ArmOutcome::Cancelled(d.final_position)
+                }
+                right_robot_arm_move_arm::ResultOutcome::Abandoned => ArmOutcome::Abandoned,
+                right_robot_arm_move_arm::ResultOutcome::Expired => ArmOutcome::Expired,
+            }),
         }
     }
 }
 
 async fn forward(backbone_ctx: move_arm::GoalContext, mut handle: ArmHandle, side: &str) {
     // The decider already accepted on the arm's behalf, so no accept check
-    // here — forward feedback/cancels, then complete with the arm's result.
-    // Result delivery must NOT depend on the feedback stream ending: each wait
-    // for the next feedback message is bounded (see FEEDBACK_IDLE_TIMEOUT), so a
-    // lost/delayed end-of-stream sentinel can never wedge this goal.
+    // here — forward feedback/cancels, then relay the arm's typed outcome.
+    // get_result parks until the arm reaches a terminal state, so result
+    // delivery is always definitive and never depends on feedback timing; the
+    // feedback drain just ends when the arm closes its stream (on completion,
+    // cancel, or abandonment).
     let mut cancelled = false;
     loop {
         tokio::select! {
-            fb = tokio::time::timeout(FEEDBACK_IDLE_TIMEOUT, handle.next_feedback()) => match fb {
-                Ok(Ok(fp)) => {
+            fb = handle.next_feedback() => match fb {
+                Ok(fp) => {
                     let _ = backbone_ctx.publish_feedback(fp).await;
                 }
-                // Stream ended (Err) or went idle (Elapsed): stop draining and
-                // go fetch the authoritative result.
-                Ok(Err(_)) | Err(_) => break,
+                Err(_) => break,
             },
             _ = backbone_ctx.cancel_signal(), if !cancelled => {
                 cancelled = true;
@@ -142,21 +160,30 @@ async fn forward(backbone_ctx: move_arm::GoalContext, mut handle: ArmHandle, sid
         }
     }
 
-    match handle.final_position(RESULT_TIMEOUT).await {
-        Ok(fp) => {
+    // Mirror the arm's outcome onto our own goal. For Abandoned/Expired we leave
+    // backbone_ctx uncompleted, which the engine reports to our client as
+    // Abandoned.
+    match handle.result(RESULT_TIMEOUT).await {
+        Ok(ArmOutcome::Completed(fp)) => {
             println!("[controller] {side} arm completed at position: {fp:?}");
-            let complete_result = if cancelled {
-                backbone_ctx.complete_cancelled(fp).await
-            } else {
-                backbone_ctx.complete(fp).await
-            };
-            if let Err(e) = complete_result {
+            if let Err(e) = backbone_ctx.complete(fp).await {
                 eprintln!("[controller] {side} complete error: {e:?}");
             }
         }
+        Ok(ArmOutcome::Cancelled(fp)) => {
+            println!("[controller] {side} arm cancelled at position: {fp:?}");
+            if let Err(e) = backbone_ctx.complete_cancelled(fp).await {
+                eprintln!("[controller] {side} complete error: {e:?}");
+            }
+        }
+        Ok(ArmOutcome::Abandoned) => {
+            eprintln!("[controller] {side} arm abandoned its goal; abandoning forwarded goal");
+        }
+        Ok(ArmOutcome::Expired) => {
+            eprintln!("[controller] {side} arm result expired; abandoning forwarded goal");
+        }
         Err(e) => {
             eprintln!("[controller] {side} get_result error: {e:?}");
-            let _ = backbone_ctx.complete_cancelled([0, 0, 0]).await;
         }
     }
 }

@@ -5,6 +5,27 @@ use peppylib::runtime::CancellationToken;
 use std::sync::Arc;
 use std::time::Duration;
 
+fn log_arm_result(side: &str, result: arm::ResultResponse) {
+    // get_result returns a typed terminal outcome rather than erroring.
+    // Completed/Cancelled carry the result payload; Abandoned/Expired do not.
+    match result.outcome {
+        arm::ResultOutcome::Completed(data) => println!(
+            "[brain] {side} arm completed at position: {:?}",
+            data.final_position
+        ),
+        arm::ResultOutcome::Cancelled(data) => println!(
+            "[brain] {side} arm cancelled at position: {:?}",
+            data.final_position
+        ),
+        arm::ResultOutcome::Abandoned => {
+            println!("[brain] {side} arm abandoned the goal without a result")
+        }
+        arm::ResultOutcome::Expired => {
+            println!("[brain] {side} arm result expired before it was fetched")
+        }
+    }
+}
+
 async fn ai_process(node_runner: Arc<NodeRunner>, cancel_token: CancellationToken) {
     println!("[brain] AI process started, waiting for video frames...");
     loop {
@@ -108,33 +129,21 @@ async fn ai_process(node_runner: Arc<NodeRunner>, cancel_token: CancellationToke
                 );
 
                 match left_result {
-                    Ok(result) => println!(
-                        "[brain] Left arm completed at position: {:?}",
-                        result.data.final_position
-                    ),
+                    Ok(result) => log_arm_result("Left", result),
                     Err(e) => eprintln!("[brain] Failed to get left arm result: {e}"),
                 }
 
                 match right_result {
-                    Ok(result) => println!(
-                        "[brain] Right arm completed at position: {:?}",
-                        result.data.final_position
-                    ),
+                    Ok(result) => log_arm_result("Right", result),
                     Err(e) => eprintln!("[brain] Failed to get right arm result: {e}"),
                 }
             }
             (Some(left_h), None) => match left_h.get_result(result_timeout).await {
-                Ok(result) => println!(
-                    "[brain] Left arm completed at position: {:?}",
-                    result.data.final_position
-                ),
+                Ok(result) => log_arm_result("Left", result),
                 Err(e) => eprintln!("[brain] Failed to get left arm result: {e}"),
             },
             (None, Some(right_h)) => match right_h.get_result(result_timeout).await {
-                Ok(result) => println!(
-                    "[brain] Right arm completed at position: {:?}",
-                    result.data.final_position
-                ),
+                Ok(result) => log_arm_result("Right", result),
                 Err(e) => eprintln!("[brain] Failed to get right arm result: {e}"),
             },
             (None, None) => {

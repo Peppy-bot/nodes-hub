@@ -90,48 +90,57 @@ async def _run_arm_action(node_runner):
 
 async def _drive_goal(backbone_ctx, arm_handle, busy_arms, arm_id):
     side = _arm_side(arm_id)
-    # Forward feedback on a side task and treat get_result as the authoritative
-    # completion signal. Result delivery must not wait on the feedback stream
-    # draining: the end-of-stream sentinel is an ordinary feedback message and
-    # can be lost or delayed, which would otherwise wedge this goal forever
-    # (get_result would never run) and time out the client.
-    cancelled = [False]
-    pump_task = asyncio.create_task(
-        _pump_feedback(backbone_ctx, arm_handle, side, cancelled)
-    )
+    arm_module = ARM_MODULES[arm_id]
+    # Forward feedback on a side task; get_result is the authoritative wait. It
+    # parks until the arm reaches a terminal state and returns a typed outcome,
+    # so result delivery never depends on the feedback stream draining.
+    pump_task = asyncio.create_task(_pump_feedback(backbone_ctx, arm_handle, side))
     try:
         try:
             result = await arm_handle.get_result(RESULT_TIMEOUT)
-            fp = result.data.final_position
-            print(f"[controller] {side} arm completed at position: {fp}")
-            try:
-                if cancelled[0]:
-                    await backbone_ctx.complete_cancelled(fp)
-                else:
-                    await backbone_ctx.complete(fp)
-            except Exception as e:
-                print(f"[controller] {side} complete error: {e!r}")
         except Exception as e:
+            # A genuine timeout or transport error. Abandon the forwarded goal:
+            # leaving backbone_ctx uncompleted surfaces as Abandoned upstream.
             print(f"[controller] {side} get_result error: {e!r}")
-            try:
-                await backbone_ctx.complete_cancelled([0, 0, 0])
-            except Exception:
-                pass
+            return
+        await _relay_outcome(backbone_ctx, arm_module, side, result)
     finally:
         pump_task.cancel()
         busy_arms.discard(arm_id)
 
 
-async def _pump_feedback(backbone_ctx, arm_handle, side, cancelled):
-    # Drain arm feedback, forwarding to the backbone client, and flip the shared
-    # `cancelled` flag if the backbone client cancels (forwarding the cancel to
-    # the arm). Runs as a side task to _drive_goal, which cancels it once the
-    # result is in; the feedback loop also ends naturally when the arm closes
-    # its stream. Because this no longer gates get_result, a lost feedback
-    # end-of-stream cannot stall the goal.
+async def _relay_outcome(backbone_ctx, arm_module, side, result):
+    # Mirror the arm's typed outcome onto our own goal. Completed/Cancelled carry
+    # the final position; for Abandoned/Expired we leave backbone_ctx
+    # uncompleted, which the engine reports to our client as Abandoned.
+    if result.status == arm_module.ResultStatus.COMPLETED:
+        fp = result.data.final_position
+        print(f"[controller] {side} arm completed at position: {fp}")
+        try:
+            await backbone_ctx.complete(fp)
+        except Exception as e:
+            print(f"[controller] {side} complete error: {e!r}")
+    elif result.status == arm_module.ResultStatus.CANCELLED:
+        fp = result.data.final_position
+        print(f"[controller] {side} arm cancelled at position: {fp}")
+        try:
+            await backbone_ctx.complete_cancelled(fp)
+        except Exception as e:
+            print(f"[controller] {side} complete error: {e!r}")
+    elif result.status == arm_module.ResultStatus.ABANDONED:
+        print(f"[controller] {side} arm abandoned its goal; abandoning forwarded goal")
+    else:  # ResultStatus.EXPIRED
+        print(f"[controller] {side} arm result expired; abandoning forwarded goal")
+
+
+async def _pump_feedback(backbone_ctx, arm_handle, side):
+    # Forward arm feedback to the backbone client, and forward a backbone-side
+    # cancel to the arm. Best-effort: this runs as a side task and never gates
+    # result delivery, so it simply ends when the arm closes its stream (on
+    # completion, cancel, or abandonment) and is cancelled by _drive_goal once
+    # the result is in.
     async def cancel_watcher():
         await backbone_ctx.cancel_signal()
-        cancelled[0] = True
         try:
             await arm_handle.cancel_goal(CANCEL_TIMEOUT)
         except Exception as e:

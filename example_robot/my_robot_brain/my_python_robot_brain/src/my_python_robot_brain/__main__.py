@@ -8,6 +8,20 @@ from peppygen.consumed_actions import (
 from peppygen.consumed_topics import camera_video_stream as video_stream
 
 
+def _log_arm_result(side: str, result) -> None:
+    # get_result returns a typed terminal outcome rather than raising, so map
+    # each status. Completed/Cancelled carry the result payload; Abandoned and
+    # Expired do not.
+    if result.status == arm.ResultStatus.COMPLETED:
+        print(f"[brain] {side} arm completed at position: {result.data.final_position}")
+    elif result.status == arm.ResultStatus.CANCELLED:
+        print(f"[brain] {side} arm cancelled at position: {result.data.final_position}")
+    elif result.status == arm.ResultStatus.ABANDONED:
+        print(f"[brain] {side} arm abandoned the goal without a result")
+    else:  # ResultStatus.EXPIRED
+        print(f"[brain] {side} arm result expired before it was fetched")
+
+
 async def ai_process(node_runner: NodeRunner):
     print("[brain] AI process started, waiting for video frames...")
 
@@ -77,29 +91,19 @@ async def ai_process(node_runner: NodeRunner):
             if isinstance(left_result, Exception):
                 print(f"[brain] Failed to get left arm result: {left_result}")
             else:
-                print(
-                    f"[brain] Left arm completed at position: {left_result.data.final_position}"
-                )
+                _log_arm_result("Left", left_result)
             if isinstance(right_result, Exception):
                 print(f"[brain] Failed to get right arm result: {right_result}")
             else:
-                print(
-                    f"[brain] Right arm completed at position: {right_result.data.final_position}"
-                )
+                _log_arm_result("Right", right_result)
         elif left_handle:
             try:
-                result = await left_handle.get_result(result_timeout)
-                print(
-                    f"[brain] Left arm completed at position: {result.data.final_position}"
-                )
+                _log_arm_result("Left", await left_handle.get_result(result_timeout))
             except Exception as e:
                 print(f"[brain] Failed to get left arm result: {e}")
         elif right_handle:
             try:
-                result = await right_handle.get_result(result_timeout)
-                print(
-                    f"[brain] Right arm completed at position: {result.data.final_position}"
-                )
+                _log_arm_result("Right", await right_handle.get_result(result_timeout))
             except Exception as e:
                 print(f"[brain] Failed to get right arm result: {e}")
         else:

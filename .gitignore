@@ -8,6 +8,9 @@
 *.bak
 *.orig
 
+# Python
+__pycache__
+
 # Editor-specific files
 .vscode/
 .idea/
