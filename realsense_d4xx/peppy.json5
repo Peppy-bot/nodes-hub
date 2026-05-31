@@ -1,0 +1,51 @@
+// Intel RealSense D4xx-series RGB-D camera (D405, D435, D435i, D455, ...).
+// Wraps librealsense2 via realsense-rust; publishes synchronized
+// color_stream + depth_stream with a shared frame_id. Conforms to the shared
+// rgbd_camera interface, so consumers (and sim/mock RGB-D nodes) bind against
+// the contract rather than this concrete node. The stereo IR pair that
+// depth is derived from and the IMU streams (D435i/D455) are not exposed; add a
+// node conforming to an additional interface if a consumer needs them.
+{
+  peppy_schema: "node_v1",
+  manifest: {
+    name: "realsense_d4xx",
+    tag: "v1",
+    labels: [
+      "realsense",
+      "rgbd",
+      "camera",
+    ]
+  },
+  execution: {
+    language: "rust",
+    container: {
+      def_file: "apptainer.def"
+    },
+    parameters: {
+      // Device serial (visible via `rs-enumerate-devices`). Optional ($default
+      // ""): empty binds the first device librealsense reports. Set it
+      // explicitly on multi-camera robots, where first-device is non-deterministic.
+      serial:       { $type: "string", $default: "" },
+      // Color stream config. Depth is always Z16. Pixel format is one of:
+      //   "rgb8" (universal, tensor-friendly), "bgr8" (OpenCV order),
+      //   "yuyv" (33% wire savings), "mjpeg" (~10:1 compression, JPEG-encoded).
+      // librealsense2 validates the (width, height, fps, format) tuple at
+      // pipeline start against the connected device's reported profiles.
+      color_width:  { $type: "u32" },
+      color_height: { $type: "u32" },
+      color_fps:    { $type: "u32" },
+      color_format: { $type: "string" },
+      depth_width:  { $type: "u32" },
+      depth_height: { $type: "u32" },
+      depth_fps:    { $type: "u32" }
+    }
+  },
+  interfaces: {
+    conforms_to: [
+      {
+        name: "rgbd_camera",
+        tag: "v1"
+      }
+    ]
+  }
+}

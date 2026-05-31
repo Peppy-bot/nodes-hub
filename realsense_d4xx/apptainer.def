@@ -1,0 +1,27 @@
+Bootstrap: docker
+From: tuatini/peppy-rust-cargo-base
+
+%files
+    . /opt/realsense_d4xx
+
+%post
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+
+    mkdir -p /etc/apt/keyrings
+    curl -fsSL https://librealsense.realsenseai.com/Debian/librealsenseai.asc \
+        -o /etc/apt/keyrings/librealsenseai.asc
+    echo "deb [signed-by=/etc/apt/keyrings/librealsenseai.asc] https://librealsense.realsenseai.com/Debian/apt-repo noble main" \
+        > /etc/apt/sources.list.d/librealsense.list
+
+    apt-get update -y
+    apt-get install -y --no-install-recommends libclang-dev librealsense2-dev
+
+    cd /opt/realsense_d4xx
+    cargo build --release
+    
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+%runscript
+    cd /opt/realsense_d4xx
+    exec ./target/release/realsense_d4xx "$@"
