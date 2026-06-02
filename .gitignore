@@ -3,7 +3,8 @@
 .peppy
 
 # Rust
-/target/
+# Match every node's build dir, not just one at the repo root.
+**/target/
 *.swp
 *.bak
 *.orig
