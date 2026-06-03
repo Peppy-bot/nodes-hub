@@ -3,7 +3,7 @@
 .peppy
 
 # Rust
-/target/
+**/target/
 *.swp
 *.bak
 *.orig

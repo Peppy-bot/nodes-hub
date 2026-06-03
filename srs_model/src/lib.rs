@@ -4,11 +4,11 @@
 //! - [`model`]: the SRS geometry (shoulder/elbow/wrist centers, link lengths,
 //!   joint limits) derived once from the FK chain.
 //! - [`ik`]: closed-form arm-angle (Shimizu) inverse kinematics.
-//! - [`dynamics`]: gravity / Coriolis feedforward torques for the arm control
+//! - [`gravity`] / [`coriolis`]: feedforward dynamics torques for the arm control
 //!   loop (both validated against KDL).
 //!
 //! Frames: [`fk`] and [`ik`] report poses in the **arm base frame** (the arm's
-//! own mounting link). [`dynamics`] instead computes in the **world frame**,
+//! own mounting link). [`gravity`] / [`coriolis`] instead compute in the **world frame**,
 //! because gravity is a world quantity (acts along world -Z). The fixed
 //! world <-> base mount transform relating the two is captured here and exposed
 //! via [`model::ArmModel::base_pose`] / [`world_pose`](model::ArmModel::world_pose),
@@ -27,8 +27,9 @@
 //! hardware crate, so the full IK<->FK round-trip runs under a plain `cargo test`
 //! on any host.
 
-pub mod dynamics;
+pub mod coriolis;
 pub mod fk;
+pub mod gravity;
 pub mod ik;
 pub mod model;
 

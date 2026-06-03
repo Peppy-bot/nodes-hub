@@ -249,7 +249,7 @@ caveats**, rather than an unconditional no-flip guarantee.
 
 ## 5. Dynamics
 
-`dynamics::{gravity, coriolis}` give per-joint feedforward torques for the
+The `gravity` and `coriolis` modules give per-joint feedforward torques for the
 control loop:
 
 - `gravity`: moment balance against gravity (world −Z).

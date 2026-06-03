@@ -1,10 +1,10 @@
 //! Forward kinematics for a 7-DOF SRS arm, built from a URDF via the `k` crate.
 //!
 //! `k` computes poses in the chain's root (world) frame. This type exposes both:
-//! **base-frame** accessors ([`ee_pose`](ForwardKinematics::ee_pose),
+//! **base-frame** accessors ([`ee_pose`](Posed::ee_pose),
 //! `axis_base`, `origin_base`), re-expressed in the arm's own mount link so they
 //! line up with the SRS geometry in [`crate::model`] and the IK target frame; and
-//! **world-frame** accessors used by [`crate::dynamics`], because gravity is a
+//! **world-frame** accessors used by [`crate::gravity`] / [`crate::coriolis`], because gravity is a
 //! world quantity (acts along world -Z). The fixed `world -> base` transform that
 //! relates the two is captured once at load.
 //!
@@ -155,9 +155,10 @@ impl Posed<'_> {
         }
     }
 
-    // --- World-frame accessors (gravity is world -z; used by `dynamics`). ---
-    // World == body_link0 frame (the world->body mount is identity), so these
-    // match the frame the KDL reference torques were computed in.
+    // --- World-frame accessors (gravity is world -z; used by `gravity` / `coriolis`). ---
+    // These are expressed in the URDF root/world frame used for gravity and for
+    // the KDL reference checks. In the bundled OpenArm fixture, that root also
+    // happens to coincide with `body_link0`.
 
     /// Mass of segment `i` (static; URDF parse-time).
     pub(crate) fn mass(&self, i: usize) -> f64 {

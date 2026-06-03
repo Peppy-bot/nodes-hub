@@ -20,7 +20,7 @@
 //       -I$ENV/include -I$ENV/include/eigen3 -L$ENV/lib \
 //       -lkdl_parser -lorocos-kdl -lurdfdom_model
 // Run from the crate root (so the default URDF path resolves), or pass a path:
-//   /tmp/kdl_reference [urdf/openarm_v10.urdf]
+//   /tmp/kdl_reference [tests/fixtures/openarm_v10.urdf]
 // A ROS 2 / ament build of kdl_parser also needs AMENT_PREFIX_PATH set, e.g.:
 //   AMENT_PREFIX_PATH=$ENV LD_LIBRARY_PATH=$ENV/lib /tmp/kdl_reference
 //
@@ -67,7 +67,7 @@ void print_row(const std::string& label, const KDL::JntArray& tau) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    const std::string urdf = (argc > 1) ? argv[1] : "urdf/openarm_v10.urdf";
+    const std::string urdf = (argc > 1) ? argv[1] : "tests/fixtures/openarm_v10.urdf";
 
     KDL::Tree tree;
     if (!kdl_parser::treeFromFile(urdf, tree)) {

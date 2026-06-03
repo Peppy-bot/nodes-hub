@@ -16,7 +16,7 @@
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
-use srs_model::dynamics::{coriolis, gravity};
+use srs_model::{coriolis, gravity};
 use srs_model::fk::ForwardKinematics;
 use srs_model::ik::{self, ArmAnglePolicy};
 use srs_model::model::ArmModel;

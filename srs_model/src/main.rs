@@ -26,7 +26,7 @@ use peppygen::exposed_services::srs_inverse_kinematics::v1::get_ik;
 use peppygen::{NodeBuilder, NodeRunner, Parameters, Result};
 use tracing::{error, info};
 
-use srs_model::dynamics::{coriolis, gravity};
+use srs_model::{coriolis, gravity};
 use srs_model::fk::ForwardKinematics;
 use srs_model::ik::{self, ArmAnglePolicy};
 use srs_model::model::ArmModel;
