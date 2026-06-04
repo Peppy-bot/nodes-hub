@@ -3,14 +3,10 @@
 .peppy
 
 # Rust
-# Match every node's build dir, not just one at the repo root.
 **/target/
 *.swp
 *.bak
 *.orig
-
-# Python
-__pycache__
 
 # Editor-specific files
 .vscode/

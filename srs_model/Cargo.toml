@@ -1,0 +1,23 @@
+[package]
+name = "srs_model"
+version = "0.1.0"
+edition = "2024"
+description = "Kinematics + dynamics (FK, closed-form IK, gravity/Coriolis) for a 7-DOF SRS arm, exposed as a peppy node. Robot-agnostic: all geometry derives from the configured URDF."
+license = "Apache-2.0"
+
+[dependencies]
+k = "0.32"
+urdf-rs = "0.9"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+peppygen = { path = ".peppy/libs/peppygen" }
+peppylib = { path = ".peppy/libs/peppylib" }
+
+[dev-dependencies]
+rand = "0.8"
+criterion = "0.5"
+
+[[bench]]
+name = "compute"
+harness = false

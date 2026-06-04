@@ -1,0 +1,36 @@
+// Generic kinematics + dynamics service node for a 7-DOF SRS (spherical-revolute-
+// spherical) arm. Robot-agnostic: the world frame, left/right side, mount
+// transform, joint limits and inertials all derive from the configured URDF.
+// Left vs right is a different chain in the same URDF, selected by the link names
+// (run two instances for a bimanual robot). The URDF must contain the tree from
+// the world/body root down to base_link (the mount), else gravity is mis-oriented.
+//
+// Exposes the model-based terms only (gravity, Coriolis, FK, IK). Friction needs
+// none of the model and is left to the consumer's control layer.
+{
+  peppy_schema: "node_v1",
+  manifest: {
+    name: "srs_model",
+    tag: "v1",
+    labels: ["srs", "kinematics", "dynamics", "rust"],
+  },
+  execution: {
+    language: "rust",
+    build_cmd: ["cargo", "build", "--release"],
+    run_cmd: ["./target/release/srs_model"],
+    parameters: {
+      // Path to the URDF describing the robot (must include the world->base mount).
+      urdf_path: "string",
+      // Link names bounding this arm's 7-DOF chain. Left vs right is encoded here.
+      base_link: "string", // e.g. "openarm_left_link0"
+      tip_link:  "string", // e.g. "openarm_left_link7"
+    },
+  },
+  interfaces: {
+    conforms_to: [
+      { name: "forward_kinematics", tag: "v1" },
+      { name: "srs_inverse_kinematics", tag: "v1" },
+      { name: "gravity_coriolis_compensation", tag: "v1" },
+    ],
+  },
+}
