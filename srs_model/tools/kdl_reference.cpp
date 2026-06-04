@@ -131,7 +131,12 @@ int main(int argc, char** argv) {
         for (const auto& [label, q] : gravity_cases) {
             KDL::JntArray jq(n), zero(n), tau(n);
             set_arm(jq, qnr, side, q);
-            grav_solver.CartToJnt(jq, zero, zero, f_ext, tau);
+            const int rc = grav_solver.CartToJnt(jq, zero, zero, f_ext, tau);
+            if (rc != KDL::SolverI::E_NOERROR) {
+                std::cerr << "gravity solve failed for " << side << " / " << label
+                          << ": " << grav_solver.strError(rc) << "\n";
+                return 1;
+            }
             print_arm(label, tau, qnr, side);
         }
 
@@ -140,7 +145,12 @@ int main(int argc, char** argv) {
             KDL::JntArray jq(n), jqd(n), zero(n), tau(n);
             set_arm(jq, qnr, side, q);
             set_arm(jqd, qnr, side, qd);
-            cori_solver.CartToJnt(jq, jqd, zero, f_ext, tau);
+            const int rc = cori_solver.CartToJnt(jq, jqd, zero, f_ext, tau);
+            if (rc != KDL::SolverI::E_NOERROR) {
+                std::cerr << "coriolis solve failed for " << side << " / " << label
+                          << ": " << cori_solver.strError(rc) << "\n";
+                return 1;
+            }
             print_arm(label, tau, qnr, side);
         }
         std::cout << "\n";
