@@ -1,0 +1,22 @@
+Bootstrap: docker
+From: tuatini/peppy-rust-cargo-base:latest
+
+%labels
+    Name srs_model
+    Version 0.1.0
+
+%environment
+    export PATH="/root/.cargo/bin:$PATH"
+
+%files
+    . /opt/srs_model
+
+%post
+    set -eux
+
+    cd /opt/srs_model
+    cargo build --release
+
+%runscript
+    cd /opt/srs_model
+    exec ./target/release/srs_model "$@"
