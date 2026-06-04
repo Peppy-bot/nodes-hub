@@ -5,7 +5,10 @@
 //!   joint limits) derived once from the FK chain.
 //! - [`ik`]: closed-form arm-angle (Shimizu) inverse kinematics.
 //! - [`gravity`] / [`coriolis`]: feedforward dynamics torques for the arm control
-//!   loop (both validated against KDL).
+//!   loop. Each carries the distal payload (gripper, fingers, tools) lumped into
+//!   the last segment, and is validated in tests against KDL `TreeIdSolver_RNE`
+//!   reference values (tree inverse dynamics, so the branched gripper is
+//!   included); gravity additionally against the potential-energy gradient.
 //!
 //! Frames: [`fk`] and [`ik`] report poses in the **arm base frame** (the arm's
 //! own mounting link). [`gravity`] / [`coriolis`] instead compute in the **world frame**,
@@ -17,8 +20,10 @@
 //! Robot-agnostic: geometry, joint limits and inertials are all derived from
 //! whatever URDF the caller passes, and a non-SRS chain is rejected with `Err`.
 //! There is no per-robot configuration baked in: the caller supplies the URDF and
-//! the `(base_link, tip_link)` names that bound the 7-DOF chain. Left vs right is
-//! a different chain in the same URDF, selected by the link names (the mirror is
+//! the `base_link` where the SRS chain starts; the wrist is found by walking 7
+//! revolute joints out from it, and everything past the wrist (gripper, fingers,
+//! tools) is carried as the distal payload in gravity / Coriolis. Left vs right is
+//! a different chain in the same URDF, selected by the base link (the mirror is
 //! re-derived from the URDF geometry, never sign-flipped). For gravity to point
 //! the right way, the URDF must contain the kinematic tree from the world/body
 //! root down to `base_link` (the mount), not just the bare arm chain.
@@ -32,6 +37,7 @@ pub mod fk;
 pub mod gravity;
 pub mod ik;
 pub mod model;
+mod payload;
 
 /// Degrees of freedom of the arm. The URDF chain is validated against this at
 /// load (the closed-form arm-angle redundancy resolution is specific to 7 DOF).
@@ -59,26 +65,22 @@ pub(crate) mod test_support {
     use crate::fk::ForwardKinematics;
     use crate::model::ArmModel;
 
-    /// A concrete SRS arm used only as a test fixture. Production callers pass
-    /// their own URDF via the node configuration; this is wired only under
-    /// `cfg(test)` so the agnostic core has a real chain to validate against.
-    const FIXTURE_URDF: &str = include_str!("../tests/fixtures/openarm_v10.urdf");
+    /// A concrete SRS arm used only as a test fixture: the real OpenArm V1.0
+    /// description, gripper fingers included, so the distal-payload path is
+    /// exercised by simply loading it. Production callers pass their own URDF via
+    /// the node configuration; this is wired only under `cfg(test)`.
+    pub(crate) const FIXTURE_URDF: &str = include_str!("../tests/fixtures/openarm_v10.urdf");
 
-    /// Base/tip link names bounding the fixture's 7-DOF chain for `side`.
-    fn links(side: &str) -> (String, String) {
-        (
-            format!("openarm_{side}_link0"),
-            format!("openarm_{side}_link7"),
-        )
+    /// Base link where the fixture's 7-DOF chain for `side` starts.
+    fn base(side: &str) -> String {
+        format!("openarm_{side}_link0")
     }
 
     pub(crate) fn v1_fk(side: &str) -> ForwardKinematics {
-        let (base, tip) = links(side);
-        ForwardKinematics::from_urdf(FIXTURE_URDF, &base, &tip).expect("load fixture fk")
+        ForwardKinematics::from_urdf(FIXTURE_URDF, &base(side)).expect("load fixture fk")
     }
 
     pub(crate) fn v1_model(side: &str) -> ArmModel {
-        let (base, tip) = links(side);
-        ArmModel::from_urdf(FIXTURE_URDF, &base, &tip).expect("load fixture model")
+        ArmModel::from_urdf(FIXTURE_URDF, &base(side)).expect("load fixture model")
     }
 }

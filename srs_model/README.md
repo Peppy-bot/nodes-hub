@@ -7,13 +7,15 @@ node. The library is pure Rust with no hardware dependencies, so the whole IK↔
 round-trip runs under `cargo test`.
 
 It is **robot-agnostic**: all geometry, joint limits and inertials derive from
-whatever URDF the node is configured with (`urdf_path` plus the `base_link` /
-`tip_link` bounding the 7-DOF chain), and a non-SRS chain is rejected with an
-error. Left vs right is a different chain in the same URDF, selected by the link
-names; run two instances for a bimanual robot. The URDF must include the tree
-from the world/body root down to `base_link` (the mount) so gravity is oriented
+whatever URDF the node is configured with (`urdf_path` plus the `base_link` where
+the SRS chain starts). The wrist is found by walking 7 revolute joints out from
+the base, and everything past it (gripper body, fingers, tools) is lumped into a
+distal payload carried by gravity / Coriolis; a non-SRS chain is rejected with an
+error. Left vs right is a different chain in the same URDF, selected by the base
+link; run two instances for a bimanual robot. The URDF must include the tree from
+the world/body root down to `base_link` (the mount) so gravity is oriented
 correctly. The bundled `tests/fixtures/openarm_v10.urdf` is a concrete SRS arm
-used only to exercise the tests.
+(the OpenArm V1.0, gripper fingers included) used only to exercise the tests.
 
 The library is wrapped by the node's [`main.rs`](src/main.rs), which exposes it
 as services (`compute_gravity`, `compute_coriolis`, `compute_compensation`,
@@ -256,14 +258,20 @@ control loop:
 - `coriolis`: `C(q,q̇)·q̇` via a world-frame Recursive Newton-Euler pass
   (`q̈ = 0`, gravity off); no mass matrix is formed.
 
-Both are validated against **KDL** `ChainDynParam` reference values to < 1e-3 N·m.
+Both carry the distal payload (gripper, fingers, tools), folded into the last
+segment's inertial at load. They are validated against **KDL** reference values
+via `tools/kdl_reference.cpp`, which uses KDL's `TreeIdSolver_RNE` (the *tree*
+inverse-dynamics solver, not the serial `ChainDynParam`) so the branched gripper
+is included; regenerate the `*_matches_kdl` arrays with it. Gravity is
+additionally checked against the potential-energy gradient `∂U/∂q`, an oracle
+that shares no code with the Newton-Euler implementation.
 
 Friction is intentionally absent: it is a pure per-joint velocity term that needs
 none of this rigid-body model, so the consumer computes it in its control layer.
 
 > The left and right arms are mirror images, so their gravity/Coriolis torques
 > differ at the same joint angles; configure the node with the correct side's
-> `base_link` / `tip_link` (there is no `arm_side` parameter: the side is the chain).
+> `base_link` (there is no `arm_side` parameter: the side is the chain).
 
 ---
 
@@ -279,7 +287,9 @@ none of this rigid-body model, so the consumer computes it in its control layer.
 - the independent screw forward map ≡ k-chain FK cross-check;
 - direct unit tests for the subproblems, angle wrapping, limit normalization,
   and the geometry helpers;
-- gravity/Coriolis vs KDL reference values.
+- gravity and Coriolis vs KDL `TreeIdSolver_RNE` reference values (both arms, on
+  the fingered fixture); gravity additionally vs the potential-energy gradient;
+  and the distal-payload lump (`from_distal`) against hand-computed finger values.
 
 ```bash
 cargo test            # all of the above

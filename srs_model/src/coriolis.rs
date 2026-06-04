@@ -7,8 +7,9 @@
 //! gravity = 0, so all that remains is the Coriolis/centripetal coupling.
 //! No mass matrix is materialized.
 //!
-//! Sign convention matches KDL's `ChainDynParam::JntToCoriolis`; verified
-//! by the unit tests against KDL reference values at several (q, q̇) pairs.
+//! Cross-checked by the unit tests against KDL `TreeIdSolver_RNE` reference
+//! values (tree inverse dynamics, so the branched gripper is included);
+//! regenerate with `tools/kdl_reference.cpp`.
 
 use k::nalgebra::Vector3;
 
@@ -52,6 +53,8 @@ pub fn torques(fk: &Posed, qdot: &JointVec) -> JointVec {
     // Backward pass: accumulate the inertial force and moment each parent
     // must transmit to its child, working from the tip inward. The joint
     // torque is the projection of that moment onto the joint axis.
+    // Any distal payload (gripper, fingers, tools) is folded into the last
+    // segment's inertial at load, so it is carried here.
     let mut f_child = Vector3::<f64>::zeros();
     let mut n_child = Vector3::<f64>::zeros();
     let mut tau = [0.0_f64; crate::ARM_DOF];
@@ -99,20 +102,14 @@ mod tests {
         torques(&fk.at(q), qdot)
     }
 
-    // KDL `ChainDynParam::JntToCoriolis` for the same URDF and chain
-    // (openarm_body_link0 -> tip). The left and right arms are mirror images,
-    // so their torques differ at the same (q, q_dot). Velocities are larger
-    // than human-teleop speeds so the Coriolis/centripetal torques clear the
-    // 1e-3 Nm noise floor; sub-threshold values are written 0.0. Regenerate
-    // both sides with `tools/kdl_reference.cpp`.
+    // KDL `TreeIdSolver_RNE` (gravity off, q̈ = 0) over the whole tree with the
+    // gripper fingers at home, so the distal payload is included. Velocities are
+    // larger than teleop speeds so the torques clear the 1e-3 Nm floor;
+    // sub-threshold values written 0.0. Regenerate with `tools/kdl_reference.cpp`.
     const CASES: [(JointVec, JointVec); 4] = [
-        // shoulder spin: pure centripetal load projected back via Christoffel
         ([0.0; ARM_DOF], [5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-        // elbow spin
         ([0.0; ARM_DOF], [0.0, 0.0, 0.0, 5.0, 0.0, 0.0, 0.0]),
-        // folded (q4 = pi/2), shoulder + elbow co-rotating: cross-coupling
         ([0.0, 0.0, 0.0, FRAC_PI_2, 0.0, 0.0, 0.0], [3.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0]),
-        // mixed posture and velocity
         ([0.1, -0.2, 0.3, -0.4, 0.5, -0.6, 0.7], [1.0, -1.5, 2.0, -2.5, 3.0, -3.5, 4.0]),
     ];
 
@@ -141,10 +138,10 @@ mod tests {
         assert_matches_kdl(
             "left",
             [
-                [0.0, -0.0714, 0.0, -0.0193, 0.0, 0.0740, 0.0],
-                [-0.0193, -0.0425, 0.0, 0.0, 0.0, 0.0407, 0.0],
-                [-0.7152, -0.0104, 0.0, 0.7152, 0.0131, 0.0, -0.0641],
-                [-2.0527, -0.9977, 0.4181, 0.4458, 0.0957, 0.0587, 0.1603],
+                [0.0, -0.0714, 0.0, -0.0168, 0.0, 0.0741, -0.0054],
+                [-0.0168, -0.0426, 0.0, 0.0, 0.0, 0.0408, -0.0027],
+                [-0.7638, -0.0104, 0.0, 0.7638, 0.0131, 0.0, -0.0819],
+                [-2.4372, -1.0816, 0.4952, 0.5812, 0.1273, 0.0689, 0.2063],
             ],
         );
     }
@@ -154,10 +151,10 @@ mod tests {
         assert_matches_kdl(
             "right",
             [
-                [0.0, 0.0867, 0.0, -0.0193, 0.0, -0.0740, 0.0],
-                [0.0193, 0.0430, 0.0, 0.0, 0.0, -0.0407, 0.0],
-                [-2.1456, 0.0156, 0.0619, 0.7152, -0.0129, -0.0586, 0.0644],
-                [0.0995, -0.7649, 0.1181, -0.2054, -0.0180, -0.0224, 0.0163],
+                [0.0, 0.0867, 0.0, -0.0168, 0.0, -0.0740, 0.0054],
+                [0.0168, 0.0430, 0.0, 0.0, 0.0, -0.0407, 0.0027],
+                [-2.2913, 0.0157, 0.0618, 0.7638, -0.0130, -0.0586, 0.0858],
+                [0.1017, -0.8665, 0.1347, -0.2242, -0.0224, -0.0181, 0.0163],
             ],
         );
     }

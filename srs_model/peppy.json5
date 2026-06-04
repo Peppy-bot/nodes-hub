@@ -1,7 +1,7 @@
 // Generic kinematics + dynamics service node for a 7-DOF SRS (spherical-revolute-
 // spherical) arm. Robot-agnostic: the world frame, left/right side, mount
 // transform, joint limits and inertials all derive from the configured URDF.
-// Left vs right is a different chain in the same URDF, selected by the link names
+// Left vs right is a different chain in the same URDF, selected by the base link
 // (run two instances for a bimanual robot). The URDF must contain the tree from
 // the world/body root down to base_link (the mount), else gravity is mis-oriented.
 //
@@ -21,9 +21,11 @@
     parameters: {
       // Path to the URDF describing the robot (must include the world->base mount).
       urdf_path: "string",
-      // Link names bounding this arm's 7-DOF chain. Left vs right is encoded here.
+      // Where this arm's SRS chain starts. The wrist is found by walking 7
+      // revolute joints out from here; everything past it (gripper, fingers,
+      // tools) is carried as the distal payload in gravity / Coriolis. Left vs
+      // right is encoded here.
       base_link: "string", // e.g. "openarm_left_link0"
-      tip_link:  "string", // e.g. "openarm_left_link7"
     },
   },
   interfaces: {

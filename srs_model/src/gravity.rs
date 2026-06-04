@@ -14,6 +14,8 @@ pub fn torques(fk: &Posed) -> JointVec {
     // segment i is (0, 0, -m·g_mag); its moment about joint j projected
     // onto the joint axis reduces to m·g_mag·(axis × r).z because gravity
     // has only a z component.
+    // Any distal payload (gripper, fingers, tools) is folded into the last
+    // segment's inertial at load, so it is carried here.
     std::array::from_fn(|j| {
         let origin_j = fk.origin_world(j);
         let axis_j = fk.axis_world(j);
@@ -38,16 +40,15 @@ mod tests {
         torques(&fk.at(q))
     }
 
-    // KDL `ChainDynParam::JntToGravity` for the same URDF and chain
-    // (openarm_body_link0 -> tip), gravity (0, 0, -9.81). The left and right
-    // arms are mirror images, so their torques differ at the same posture.
-    // Tolerance is 1e-3 Nm; values KDL puts below it are written 0.0.
-    // Regenerate both sides with `tools/kdl_reference.cpp`.
+    // KDL `TreeIdSolver_RNE` over the whole tree with the gripper fingers at home,
+    // so the distal payload is included (a serial `ChainDynParam` cannot). Gravity
+    // is world -Z; the mirror arms differ at the same posture. Tolerance 1e-3 Nm;
+    // sub-threshold values written 0.0. Regenerate with `tools/kdl_reference.cpp`.
     const POSTURES: [JointVec; 4] = [
-        [0.0; ARM_DOF],                            // home
-        [FRAC_PI_2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], // q1 = pi/2
-        [0.0, 0.0, 0.0, FRAC_PI_2, 0.0, 0.0, 0.0], // q4 = pi/2
-        [0.1, -0.2, 0.3, -0.4, 0.5, -0.6, 0.7],    // mixed
+        [0.0; ARM_DOF],
+        [FRAC_PI_2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, FRAC_PI_2, 0.0, 0.0, 0.0],
+        [0.1, -0.2, 0.3, -0.4, 0.5, -0.6, 0.7],
     ];
 
     fn assert_matches_kdl(side: &str, expected: [JointVec; 4]) {
@@ -69,10 +70,10 @@ mod tests {
         assert_matches_kdl(
             "left",
             [
-                [0.1029, -0.0515, 0.0, -0.0345, 0.0, 0.0594, 0.0],
-                [10.0129, 0.0, -0.0515, -3.5435, -0.0648, 0.0, 0.3178],
-                [-3.4751, -0.0515, 0.0, 3.5435, 0.0648, 0.0, -0.3178],
-                [2.4879, -2.3698, 0.2521, -2.0152, 0.0198, -0.0996, 0.2587],
+                [0.0983, -0.0515, 0.0, -0.0299, 0.0, 0.0594, -0.0049],
+                [10.4090, 0.0, -0.0515, -3.7841, -0.0648, 0.0, 0.4058],
+                [-3.7157, -0.0515, 0.0, 3.7841, 0.0648, 0.0, -0.4058],
+                [2.6572, -2.4663, 0.2762, -2.1801, 0.0351, -0.1392, 0.3296],
             ],
         );
     }
@@ -82,21 +83,20 @@ mod tests {
         assert_matches_kdl(
             "right",
             [
-                [-0.1029, 0.0780, 0.0, -0.0345, 0.0, -0.0594, 0.0],
-                [10.0129, 0.0, -0.0781, 3.5435, -0.0648, 0.0, 0.3178],
-                [3.4751, 0.0780, 0.0, 3.5435, -0.0648, 0.0, 0.3178],
-                [-0.4158, -2.0205, 0.2721, -1.1223, 0.0732, -0.1654, 0.0583],
+                [-0.0983, 0.0780, 0.0, -0.0299, 0.0, -0.0594, 0.0049],
+                [10.4090, 0.0, -0.0781, 3.7841, -0.0648, 0.0, 0.4058],
+                [3.7157, 0.0780, 0.0, 3.7841, -0.0648, 0.0, 0.4058],
+                [-0.4429, -2.0486, 0.2803, -1.1611, 0.0865, -0.1971, 0.0782],
             ],
         );
     }
 
     #[test]
     fn matches_potential_energy_gradient_both_sides() {
-        // Independent check (no KDL): gravity torque g(q) = ∂U/∂q where the
-        // potential energy U = Σ mᵢ·g·z_comᵢ. A self-consistency oracle that
-        // complements the KDL reference and covers both arms over more postures.
+        // Independent of KDL: gravity torque g(q) = ∂U/∂q with U = Σ mᵢ·g·z_comᵢ
+        // over the segments (the last one carries the folded distal payload).
         fn potential(fk: &Posed) -> f64 {
-            (0..crate::ARM_DOF)
+            (0..ARM_DOF)
                 .map(|i| fk.mass(i) * GRAVITY_MAGNITUDE * fk.com_world(i).z)
                 .sum()
         }

@@ -1,16 +1,17 @@
-// Reference generator for the gravity / Coriolis values asserted in
-// `src/dynamics/gravity.rs` and `src/dynamics/coriolis.rs`.
+// External KDL cross-check for the gravity / Coriolis modules.
 //
-// It loads the same URDF and chain the Rust crate uses and prints KDL's
-// `ChainDynParam::JntToGravity` / `JntToCoriolis` for the same (q, q_dot)
-// postures, so the hand-recorded test arrays can be regenerated and re-checked
-// whenever the URDF inertials change. The Rust RNEA must match this output to
-// the 1e-3 N*m tolerance the tests use.
+// Unlike `ChainDynParam` (serial only), KDL's `TreeIdSolver_RNE` runs inverse
+// dynamics over the whole *tree*, so it includes the parallel gripper whose two
+// jaws branch off `link7`. With the fingers held at home (q = q_dot = 0), the
+// torques it reports for the seven arm joints therefore carry the distal payload
+// exactly as the Rust crate's gravity / Coriolis do (which lump that mass into
+// the last segment). This is the reference used to regenerate the hard-coded
+// `*_matches_kdl` arrays in gravity.rs / coriolis.rs on a Linux/ROS machine.
 //
-// Chain + gravity: the crate's dynamics run in the WORLD frame (the arm base is
-// mounted with rpy = (-pi/2, 0, 0)), so the reference roots at the torso base
-// `openarm_body_link0` (== world) and applies gravity along world -Z. The seven
-// movable joints of the chain are j1..j7, matching the Rust `JointVec` order.
+// Gravity is applied along world -Z and the tree roots at `openarm_body_link0`
+// (== world), matching the crate's world-frame convention. The seven arm joints
+// are read out by name (openarm_{side}_joint1..7), in JointVec order; the gripper
+// joints are present in the tree but pinned to zero.
 //
 // Build (Orocos KDL + kdl_parser + urdfdom). With ROS or system packages:
 //   g++ -std=c++17 -O2 tools/kdl_reference.cpp -o /tmp/kdl_reference \
@@ -24,18 +25,22 @@
 // A ROS 2 / ament build of kdl_parser also needs AMENT_PREFIX_PATH set, e.g.:
 //   AMENT_PREFIX_PATH=$ENV LD_LIBRARY_PATH=$ENV/lib /tmp/kdl_reference
 //
-// Verified: this reproduces every value in gravity.rs / coriolis.rs to 4 dp.
+// On macOS (no ROS kdl_parser package): `brew install orocos-kdl urdfdom eigen`,
+// then compile this alongside a standalone kdl_parser built by copying the
+// `treeFromUrdfModel` conversion from ros/kdl_parser and parsing the URDF with
+// urdfdom's `urdf::parseURDF` (the ROS `urdf` wrapper + rcutils are not needed).
+// The reference arrays in gravity.rs / coriolis.rs were generated this way.
 
 #include <kdl_parser/kdl_parser.hpp>
-#include <kdl/chain.hpp>
-#include <kdl/chaindynparam.hpp>
 #include <kdl/jntarray.hpp>
 #include <kdl/tree.hpp>
+#include <kdl/treeidsolver_recursive_newton_euler.hpp>
 
 #include <array>
 #include <cmath>
 #include <iomanip>
 #include <iostream>
+#include <map>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -47,19 +52,37 @@ constexpr unsigned int DOF = 7;
 const double HALF_PI = std::acos(-1.0) / 2.0; // portable pi/2 (M_PI is non-standard)
 using Vec7 = std::array<double, DOF>;
 
-KDL::JntArray to_jnt(const Vec7& v) {
-    KDL::JntArray j(DOF);
-    for (unsigned int i = 0; i < DOF; ++i) j(i) = v[i];
-    return j;
+// Map every movable joint's name to its index in the tree's JntArray ordering.
+std::map<std::string, unsigned int> joint_indices(const KDL::Tree& tree) {
+    std::map<std::string, unsigned int> qnr;
+    for (const auto& entry : tree.getSegments()) {
+        const KDL::Segment& seg = GetTreeElementSegment(entry.second);
+        const KDL::Joint& jnt = seg.getJoint();
+        if (jnt.getType() != KDL::Joint::None) {
+            qnr[jnt.getName()] = GetTreeElementQNr(entry.second);
+        }
+    }
+    return qnr;
 }
 
-void print_row(const std::string& label, const KDL::JntArray& tau) {
+// Place a 7-vector onto the arm joints of `side`, leaving all other tree joints
+// (the gripper) at their existing value.
+void set_arm(KDL::JntArray& q, const std::map<std::string, unsigned int>& qnr,
+            const std::string& side, const Vec7& v) {
+    for (unsigned int i = 0; i < DOF; ++i) {
+        q(qnr.at("openarm_" + side + "_joint" + std::to_string(i + 1))) = v[i];
+    }
+}
+
+void print_arm(const std::string& label, const KDL::JntArray& tau,
+               const std::map<std::string, unsigned int>& qnr, const std::string& side) {
     std::cout << "  " << std::left << std::setw(34) << label << "[";
     std::cout << std::fixed << std::setprecision(4);
     for (unsigned int i = 0; i < DOF; ++i) {
+        double t = tau(qnr.at("openarm_" + side + "_joint" + std::to_string(i + 1)));
         // Match the test convention: values below the 1e-3 tolerance read as 0.
-        double v = (std::abs(tau(i)) < 1e-3) ? 0.0 : tau(i);
-        std::cout << (i ? ", " : "") << v;
+        if (std::abs(t) < 1e-3) t = 0.0;
+        std::cout << (i ? ", " : "") << t;
     }
     std::cout << "]\n";
 }
@@ -74,8 +97,16 @@ int main(int argc, char** argv) {
         std::cerr << "failed to parse URDF: " << urdf << "\n";
         return 1;
     }
+    const auto qnr = joint_indices(tree);
+    const unsigned int n = tree.getNrOfJoints();
 
-    // Postures must stay in sync with the gravity.rs / coriolis.rs tests.
+    // Two solvers: gravity-only (q_dot = q_ddot = 0) and gravity-free (Coriolis
+    // remains once q_ddot = 0).
+    KDL::TreeIdSolver_RNE grav_solver(tree, KDL::Vector(0.0, 0.0, -9.81));
+    KDL::TreeIdSolver_RNE cori_solver(tree, KDL::Vector(0.0, 0.0, 0.0));
+    KDL::WrenchMap f_ext; // empty: no external forces
+
+    // Postures / velocities must stay in sync with gravity.rs / coriolis.rs.
     const std::vector<std::pair<std::string, Vec7>> gravity_cases = {
         {"home", {0, 0, 0, 0, 0, 0, 0}},
         {"q1 = pi/2", {HALF_PI, 0, 0, 0, 0, 0, 0}},
@@ -92,32 +123,25 @@ int main(int argc, char** argv) {
     };
 
     // The left and right arms are mirror images: same body root and world -Z
-    // gravity, different tip chain, so their torques differ at the same posture.
+    // gravity, different chain, so their torques differ at the same posture.
     for (const std::string& side : {"left", "right"}) {
-        const std::string tip = "openarm_" + side + "_link7";
-        KDL::Chain chain;
-        if (!tree.getChain("openarm_body_link0", tip, chain)) {
-            std::cerr << "failed to extract chain openarm_body_link0 -> " << tip << "\n";
-            return 1;
-        }
-        if (chain.getNrOfJoints() != DOF) {
-            std::cerr << "expected " << DOF << " joints, chain has " << chain.getNrOfJoints() << "\n";
-            return 1;
-        }
-        KDL::ChainDynParam dyn(chain, KDL::Vector(0.0, 0.0, -9.81));
-
         std::cout << "=== " << side << " arm ===\n";
-        std::cout << "JntToGravity (gravity = world -Z):\n";
+
+        std::cout << "JntToGravity (gravity = world -Z, gripper at home):\n";
         for (const auto& [label, q] : gravity_cases) {
-            KDL::JntArray jq = to_jnt(q), tau(DOF);
-            dyn.JntToGravity(jq, tau);
-            print_row(label, tau);
+            KDL::JntArray jq(n), zero(n), tau(n);
+            set_arm(jq, qnr, side, q);
+            grav_solver.CartToJnt(jq, zero, zero, f_ext, tau);
+            print_arm(label, tau, qnr, side);
         }
-        std::cout << "JntToCoriolis:\n";
+
+        std::cout << "JntToCoriolis (gripper at home):\n";
         for (const auto& [label, q, qd] : coriolis_cases) {
-            KDL::JntArray jq = to_jnt(q), jqd = to_jnt(qd), tau(DOF);
-            dyn.JntToCoriolis(jq, jqd, tau);
-            print_row(label, tau);
+            KDL::JntArray jq(n), jqd(n), zero(n), tau(n);
+            set_arm(jq, qnr, side, q);
+            set_arm(jqd, qnr, side, qd);
+            cori_solver.CartToJnt(jq, jqd, zero, f_ext, tau);
+            print_arm(label, tau, qnr, side);
         }
         std::cout << "\n";
     }

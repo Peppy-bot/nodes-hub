@@ -143,13 +143,13 @@ impl ArmModel {
         self.base_from_world.inverse() * base
     }
 
-    /// Build the model from a URDF string and the arm's base/tip link names.
-    /// Robot-agnostic: which URDF and link names to use is the caller's concern
-    /// (a description layer maps a robot revision to these).
-    pub fn from_urdf(urdf: &str, base_link: &str, tip_link: &str) -> Result<Self, String> {
-        Self::from_fk(&mut ForwardKinematics::from_urdf(
-            urdf, base_link, tip_link,
-        )?)
+    /// Build the model from a URDF string and the arm's base link. The wrist is
+    /// found by walking 7 revolute joints out from the base (see
+    /// [`ForwardKinematics::from_urdf`]). Robot-agnostic: which URDF and base
+    /// link to use is the caller's concern (a description layer maps a robot
+    /// revision to these).
+    pub fn from_urdf(urdf: &str, base_link: &str) -> Result<Self, String> {
+        Self::from_fk(&mut ForwardKinematics::from_urdf(urdf, base_link)?)
     }
 }
 

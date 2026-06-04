@@ -24,12 +24,11 @@ use srs_model::JointVec;
 
 const URDF: &str = include_str!("../tests/fixtures/openarm_v10.urdf");
 const BASE: &str = "openarm_left_link0";
-const TIP: &str = "openarm_left_link7";
 
 fn fixture() -> (ForwardKinematics, ArmModel) {
     (
-        ForwardKinematics::from_urdf(URDF, BASE, TIP).expect("fk"),
-        ArmModel::from_urdf(URDF, BASE, TIP).expect("model"),
+        ForwardKinematics::from_urdf(URDF, BASE).expect("fk"),
+        ArmModel::from_urdf(URDF, BASE).expect("model"),
     )
 }
 

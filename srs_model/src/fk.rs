@@ -15,6 +15,7 @@
 use k::nalgebra::{Isometry3, Matrix3, Point3, Vector3};
 use k::{Chain, JointType, Node, SerialChain};
 
+use crate::payload::Payload;
 use crate::{ARM_DOF, JointVec};
 
 /// Parsed serial chain (base -> joint7) plus the constant `world -> base`
@@ -25,8 +26,8 @@ pub struct ForwardKinematics {
     chain: SerialChain<f64>,
     /// The 7 revolute joint nodes in chain order.
     joint_nodes: [Node<f64>; ARM_DOF],
-    /// The requested tip-link node (the EE frame). Resolved from `tip_link`, so
-    /// a tip past the last revolute joint (e.g. a fixed TCP frame) is honored.
+    /// The wrist (tip) node, the EE frame: the link after the 7th revolute joint,
+    /// found by walking the chain out from the base.
     tip: Node<f64>,
     /// `world -> base_link`; constant because every joint between them is fixed.
     base_from_world: Isometry3<f64>,
@@ -37,22 +38,36 @@ pub struct ForwardKinematics {
 }
 
 impl ForwardKinematics {
-    /// Build the FK chain between `base_link` and `tip_link` from a URDF string,
-    /// validating it reduces to exactly [`ARM_DOF`] revolute joints. Agnostic to
-    /// *which* 7-DOF SRS arm: any URDF + link names the caller passes (it is not a
-    /// general N-DOF or non-SRS solver).
-    pub fn from_urdf(urdf: &str, base_link: &str, tip_link: &str) -> Result<Self, String> {
+    /// Build the FK chain from a URDF string given only where the SRS arm
+    /// *starts* (`base_link`). The wrist (tip) is found by walking exactly
+    /// [`ARM_DOF`] revolute joints out from the base, so the 7-DOF SRS invariant
+    /// is enforced rather than trusting a hand-entered tip that might disagree.
+    /// Everything past the wrist (gripper, fingers, tools) becomes the distal
+    /// payload. Agnostic to *which* 7-DOF SRS arm: any URDF + base link the
+    /// caller passes (it is not a general N-DOF or non-SRS solver).
+    pub fn from_urdf(urdf: &str, base_link: &str) -> Result<Self, String> {
         let robot = urdf_rs::read_from_string(urdf).map_err(|e| format!("parse URDF: {e}"))?;
-        Self::from_chain(Chain::<f64>::from(robot), base_link, tip_link)
+        Self::from_chain(Chain::<f64>::from(robot), base_link)
     }
 
-    fn from_chain(full: Chain<f64>, base_link: &str, tip_link: &str) -> Result<Self, String> {
-        let tip = full
-            .find_link(tip_link)
-            .ok_or_else(|| format!("URDF missing tip link '{tip_link}'"))?;
-        let chain = SerialChain::from_end(tip);
+    fn from_chain(full: Chain<f64>, base_link: &str) -> Result<Self, String> {
+        let base = full
+            .find_link(base_link)
+            .ok_or_else(|| format!("URDF missing base link '{base_link}'"))?
+            .clone();
 
-        let joint_nodes = collect_revolute_nodes(&chain, tip_link)?;
+        // Pose the whole tree at home so the traversal and the frozen distal
+        // links are read off consistent world transforms.
+        full.update_transforms();
+
+        // The SRS chain is implicit: walk ARM_DOF revolute joints out from the
+        // base to find the wrist, then lump everything past it into the distal
+        // payload, before reducing to the serial base -> tip chain.
+        let tip = find_srs_tip(&base)?;
+        let payload = Payload::from_distal(&tip);
+
+        let chain = SerialChain::from_end(&tip);
+        let joint_nodes = collect_revolute_nodes(&chain)?;
         let axes_local = std::array::from_fn(|i| match joint_nodes[i].joint().joint_type {
             JointType::Rotational { axis } => *axis.as_ref(),
             _ => unreachable!("collect_revolute_nodes verified revolute"),
@@ -77,12 +92,21 @@ impl ForwardKinematics {
             inertias_local[i] = r * inertial.inertia * r.transpose();
         }
 
-        // Pose the chain at home, then read the fixed base-link world transform.
+        // Fold the distal payload into the last segment. It is rigidly attached
+        // to the wrist link, whose frame is segment ARM_DOF-1's frame (the tip is
+        // that node), so a bigger last link and a separate payload are the same
+        // rigid body. Gravity / Coriolis then carry it.
+        if payload.mass > 0.0 {
+            let last = ARM_DOF - 1;
+            let merged = payload.combined_with(masses[last], coms_local[last], inertias_local[last]);
+            masses[last] = merged.mass;
+            coms_local[last] = merged.com;
+            inertias_local[last] = merged.inertia;
+        }
+
+        // Pose the serial chain at home, then read the fixed base-link world transform.
         chain.set_joint_positions_unchecked(&[0.0; ARM_DOF]);
         chain.update_transforms();
-        let base = chain
-            .find_link(base_link)
-            .ok_or_else(|| format!("URDF missing base link '{base_link}'"))?;
         let base_world = base
             .world_transform()
             .ok_or("base link has no world transform")?;
@@ -90,7 +114,7 @@ impl ForwardKinematics {
         Ok(Self {
             chain,
             joint_nodes,
-            tip: tip.clone(),
+            tip,
             base_from_world: base_world.inverse(),
             axes_local,
             masses,
@@ -202,25 +226,67 @@ impl Posed<'_> {
     }
 }
 
-/// Collect the [`ARM_DOF`] revolute joint nodes of `side` in chain order,
+/// Walk from `base` down the unique revolute-bearing path and return the link
+/// reached after exactly [`ARM_DOF`] revolute joints: the SRS wrist (tip). The
+/// arm is serial until the wrist, so at each step exactly one child still leads
+/// to a revolute joint; a fixed sensor branch or the (prismatic) gripper is
+/// skipped, and a genuine fork (two revolute branches) is rejected as not a
+/// single SRS arm.
+fn find_srs_tip(base: &Node<f64>) -> Result<Node<f64>, String> {
+    let mut node = base.clone();
+    let mut revolute = 0;
+    while revolute < ARM_DOF {
+        // Materialize children before filtering so the parent lock is released
+        // before `subtree_has_revolute` locks each child.
+        let children: Vec<Node<f64>> = node.children().to_vec();
+        let mut arm: Vec<Node<f64>> =
+            children.into_iter().filter(subtree_has_revolute).collect();
+        node = match arm.len() {
+            1 => arm.pop().unwrap(),
+            0 => {
+                return Err(format!(
+                    "chain from base reaches only {revolute} revolute joints; \
+                     a 7-DOF SRS arm needs {ARM_DOF}"
+                ));
+            }
+            n => {
+                return Err(format!(
+                    "ambiguous arm: {n} revolute-bearing branches share one link; \
+                     not a single SRS chain"
+                ));
+            }
+        };
+        if matches!(node.joint().joint_type, JointType::Rotational { .. }) {
+            revolute += 1;
+        }
+    }
+    Ok(node)
+}
+
+/// Whether `node` or any of its descendants is reached through a revolute joint:
+/// marks the branch that continues the arm, versus a dead fixed mount or the
+/// gripper. `iter_descendants` includes `node` itself.
+fn subtree_has_revolute(node: &Node<f64>) -> bool {
+    node.iter_descendants()
+        .any(|d| matches!(d.joint().joint_type, JointType::Rotational { .. }))
+}
+
+/// Collect the [`ARM_DOF`] revolute joint nodes of the serial chain in order,
 /// rejecting any chain that does not reduce to exactly that. The fixed
 /// world/body mounting joints are skipped.
 ///
 /// A clean 7-DOF SRS arm's *only* degrees of freedom are its seven revolute
-/// joints. Any other movable joint (e.g. a prismatic DOF, or an actuated joint
-/// upstream of the mount) is rejected: it would otherwise pass the revolute
-/// count below while `base_from_world` is frozen at home, silently building the
-/// wrong model instead of returning `Err`.
-fn collect_revolute_nodes(
-    chain: &SerialChain<f64>,
-    tip_link: &str,
-) -> Result<[Node<f64>; ARM_DOF], String> {
+/// joints. Any other movable joint (e.g. a prismatic DOF interspersed on the
+/// path) is rejected: it would otherwise pass the revolute count below while
+/// `base_from_world` is frozen at home, silently building the wrong model
+/// instead of returning `Err`.
+fn collect_revolute_nodes(chain: &SerialChain<f64>) -> Result<[Node<f64>; ARM_DOF], String> {
     if let Some(extra) = chain
         .iter()
         .find(|n| !matches!(n.joint().joint_type, JointType::Fixed | JointType::Rotational { .. }))
     {
         return Err(format!(
-            "chain to {tip_link} has a non-revolute movable joint '{}': not a 7-DOF revolute SRS arm",
+            "SRS chain has a non-revolute movable joint '{}': not a 7-DOF revolute arm",
             extra.joint().name
         ));
     }
@@ -229,12 +295,9 @@ fn collect_revolute_nodes(
         .filter(|n| matches!(n.joint().joint_type, JointType::Rotational { .. }))
         .cloned()
         .collect();
-    nodes.try_into().map_err(|v: Vec<_>| {
-        format!(
-            "expected {ARM_DOF} revolute joints to {tip_link}, got {}",
-            v.len()
-        )
-    })
+    nodes
+        .try_into()
+        .map_err(|v: Vec<_>| format!("expected {ARM_DOF} revolute joints in the SRS chain, got {}", v.len()))
 }
 
 #[cfg(test)]
@@ -272,21 +335,20 @@ mod tests {
     fn rejects_urdf_missing_arm_links() {
         // A URDF without the arm links must Err, not panic.
         let urdf = r#"<?xml version="1.0"?><robot name="x"><link name="world"/></robot>"#;
-        assert!(
-            ForwardKinematics::from_urdf(urdf, "openarm_left_link0", "openarm_left_link7").is_err()
-        );
+        assert!(ForwardKinematics::from_urdf(urdf, "openarm_left_link0").is_err());
     }
 
     #[test]
     fn rejects_malformed_urdf() {
-        assert!(ForwardKinematics::from_urdf("not even xml", "a", "b").is_err());
+        assert!(ForwardKinematics::from_urdf("not even xml", "a").is_err());
     }
 
     #[test]
-    fn rejects_non_revolute_movable_joint() {
-        // A prismatic DOF on the path must Err: the model freezes the base
-        // transform at home and applies only revolute angles, so a sliding joint
-        // would silently build the wrong model.
+    fn rejects_chain_without_seven_revolute_joints() {
+        // A prismatic-only arm must Err: walking out from the base finds no
+        // revolute joints to reach the wrist, so it is not a 7-DOF SRS arm. (A
+        // prismatic joint *interspersed* among the 7 is caught separately by
+        // `collect_revolute_nodes`.)
         let urdf = r#"<?xml version="1.0"?><robot name="x">
           <link name="base"/><link name="tip"/>
           <joint name="slide" type="prismatic">
@@ -295,10 +357,10 @@ mod tests {
             <limit lower="0" upper="1" effort="1" velocity="1"/>
           </joint>
         </robot>"#;
-        let err = match ForwardKinematics::from_urdf(urdf, "base", "tip") {
+        let err = match ForwardKinematics::from_urdf(urdf, "base") {
             Ok(_) => panic!("expected Err for a prismatic joint"),
             Err(e) => e,
         };
-        assert!(err.contains("non-revolute"), "unexpected error: {err}");
+        assert!(err.contains("revolute"), "unexpected error: {err}");
     }
 }

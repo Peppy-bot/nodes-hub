@@ -38,13 +38,12 @@ use srs_model::{ARM_DOF, JointVec};
 struct Spec {
     urdf: String,
     base_link: String,
-    tip_link: String,
     model: ArmModel,
 }
 
 impl Spec {
     fn forward_kinematics(&self) -> ForwardKinematics {
-        ForwardKinematics::from_urdf(&self.urdf, &self.base_link, &self.tip_link)
+        ForwardKinematics::from_urdf(&self.urdf, &self.base_link)
             .expect("URDF already validated at startup")
     }
 }
@@ -70,11 +69,10 @@ fn main() -> Result<()> {
             .unwrap_or_else(|e| panic!("read urdf_path '{}': {e}", params.urdf_path));
 
         // Build the model once up front: this validates the chain is a clean
-        // 7-DOF SRS arm (else `Err`) and fixes the world<->base mount transform.
-        let model = ArmModel::from_urdf(&urdf, &params.base_link, &params.tip_link)
-            .unwrap_or_else(|e| {
-                panic!("load SRS model ({} -> {}): {e}", params.base_link, params.tip_link)
-            });
+        // 7-DOF SRS arm (the wrist is found by walking 7 revolute joints out from
+        // base_link, else `Err`) and fixes the world<->base mount transform.
+        let model = ArmModel::from_urdf(&urdf, &params.base_link)
+            .unwrap_or_else(|e| panic!("load SRS model from base '{}': {e}", params.base_link));
 
         // Log the resolved world->base mount so a "bare arm" URDF (one missing the
         // tree from the world root down to base_link) is caught here, where it
@@ -82,14 +80,13 @@ fn main() -> Result<()> {
         // a robot whose arm is mounted off the origin is the tell-tale sign.
         let mount = model.base_from_world.inverse();
         info!(
-            "srs_model loaded {} -> {}: arm base at world {:?} (verify this matches the mounting)",
-            params.base_link, params.tip_link, mount.translation.vector,
+            "srs_model loaded from base '{}': arm base at world {:?} (verify this matches the mounting)",
+            params.base_link, mount.translation.vector,
         );
 
         let spec = Arc::new(Spec {
             urdf,
             base_link: params.base_link,
-            tip_link: params.tip_link,
             model,
         });
 
