@@ -1,7 +1,13 @@
-//! Thin peppy node wrapping the `srs_model` library: implements the
-//! `forward_kinematics`, `srs_inverse_kinematics`, and `gravity_coriolis_compensation` interfaces
-//! (interfaces_hub). All the math lives in the library; this file loads the model
-//! from configuration and marshals requests/responses.
+//! Thin peppy node wrapping the `srs_model` library: serves `forward_kinematics`
+//! and `srs_inverse_kinematics` as request/response services, and publishes
+//! `gravity_coriolis_compensation` as a stream (the `compensation` topic) driven
+//! by the arm's `joint_state` stream. All the math lives in the library; this
+//! file loads the model from configuration and marshals the wire types.
+//!
+//! Compensation is a stream because the controller needs it every tick: the arm
+//! publishes `joint_state`, this node computes and publishes `compensation`, and
+//! the controller reads the latest sample with no round trip on its control path
+//! (which would otherwise bound its loop rate).
 //!
 //! The interfaces are DOF-generic (joint arrays are unspecified length on the
 //! wire, i.e. `Vec<f64>`), so each handler converts to the library's fixed
@@ -18,9 +24,8 @@
 
 use std::sync::{Arc, Mutex};
 
-use peppygen::exposed_services::gravity_coriolis_compensation::v1::{
-    get_compensation, get_coriolis, get_gravity,
-};
+use peppygen::consumed_topics::arm_joint_state;
+use peppygen::emitted_topics::gravity_coriolis_compensation::v1::compensation;
 use peppygen::exposed_services::forward_kinematics::v1::get_fk;
 use peppygen::exposed_services::srs_inverse_kinematics::v1::get_ik;
 use peppygen::{NodeBuilder, NodeRunner, Parameters, Result};
@@ -90,9 +95,7 @@ fn main() -> Result<()> {
             model,
         });
 
-        spawn_get_compensation(node_runner.clone(), spec.clone());
-        spawn_get_gravity(node_runner.clone(), spec.clone());
-        spawn_get_coriolis(node_runner.clone(), spec.clone());
+        spawn_compensation_stream(node_runner.clone(), spec.clone());
         spawn_get_fk(node_runner.clone(), spec.clone());
         spawn_get_ik(node_runner.clone(), spec);
 
@@ -100,65 +103,44 @@ fn main() -> Result<()> {
     })
 }
 
-/// gravity + coriolis (and their sum) in one round trip, for the per-tick control loop.
-fn spawn_get_compensation(runner: Arc<NodeRunner>, spec: Arc<Spec>) {
+/// Compensation stream: subscribe to the arm's `joint_state`, compute gravity +
+/// Coriolis for each received sample, and publish them on the `compensation`
+/// topic, so the controller reads the latest without a round trip on its control
+/// path. One task owns its own [`ForwardKinematics`] (single task, so no
+/// `Mutex`). The generated
+/// `on_next_message_received` re-subscribes per call, which naturally paces this
+/// loop to the arm's publish rate (compute one compensation per joint sample);
+/// `seq` is echoed from the sample so the consumer can correlate / detect gaps.
+fn spawn_compensation_stream(runner: Arc<NodeRunner>, spec: Arc<Spec>) {
     tokio::spawn(async move {
-        let fk = Mutex::new(spec.forward_kinematics());
+        let mut fk = spec.forward_kinematics();
+        info!("compensation stream started (subscribing to joint_state)");
         loop {
-            let result = get_compensation::handle_next_request(&runner, |req| {
-                let q = joints(&req.data.joint_positions).map_err(bad_request)?;
-                let qd = joints(&req.data.joint_velocities).map_err(bad_request)?;
-                let mut fk = fk.lock().unwrap_or_else(|e| e.into_inner());
-                let posed = fk.at(&q);
-                let gravity = gravity::torques(&posed);
-                let coriolis = coriolis::torques(&posed, &qd);
-                let total: JointVec = std::array::from_fn(|i| gravity[i] + coriolis[i]);
-                Ok(get_compensation::Response::new(
-                    gravity.to_vec(),
-                    coriolis.to_vec(),
-                    total.to_vec(),
-                ))
-            })
-            .await;
-            if let Err(e) = result {
-                error!("get_compensation: {e}");
-            }
-        }
-    });
-}
-
-fn spawn_get_gravity(runner: Arc<NodeRunner>, spec: Arc<Spec>) {
-    tokio::spawn(async move {
-        let fk = Mutex::new(spec.forward_kinematics());
-        loop {
-            let result = get_gravity::handle_next_request(&runner, |req| {
-                let q = joints(&req.data.joint_positions).map_err(bad_request)?;
-                let mut fk = fk.lock().unwrap_or_else(|e| e.into_inner());
-                let torques = gravity::torques(&fk.at(&q));
-                Ok(get_gravity::Response::new(torques.to_vec()))
-            })
-            .await;
-            if let Err(e) = result {
-                error!("get_gravity: {e}");
-            }
-        }
-    });
-}
-
-fn spawn_get_coriolis(runner: Arc<NodeRunner>, spec: Arc<Spec>) {
-    tokio::spawn(async move {
-        let fk = Mutex::new(spec.forward_kinematics());
-        loop {
-            let result = get_coriolis::handle_next_request(&runner, |req| {
-                let q = joints(&req.data.joint_positions).map_err(bad_request)?;
-                let qd = joints(&req.data.joint_velocities).map_err(bad_request)?;
-                let mut fk = fk.lock().unwrap_or_else(|e| e.into_inner());
-                let torques = coriolis::torques(&fk.at(&q), &qd);
-                Ok(get_coriolis::Response::new(torques.to_vec()))
-            })
-            .await;
-            if let Err(e) = result {
-                error!("get_coriolis: {e}");
+            let (q, qd, seq) = match arm_joint_state::on_next_message_received(&runner, None).await {
+                Ok((_instance_id, msg)) => {
+                    match (joints(&msg.joint_positions), joints(&msg.joint_velocities)) {
+                        (Ok(q), Ok(qd)) => (q, qd, msg.seq),
+                        _ => {
+                            error!(
+                                "joint_state: expected {ARM_DOF} joints, got {}/{}",
+                                msg.joint_positions.len(),
+                                msg.joint_velocities.len(),
+                            );
+                            continue;
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("joint_state recv: {e}");
+                    continue;
+                }
+            };
+            let posed = fk.at(&q);
+            let gravity = gravity::torques(&posed);
+            let coriolis = coriolis::torques(&posed, &qd);
+            if let Err(e) = compensation::emit(&runner, seq, gravity.to_vec(), coriolis.to_vec()).await
+            {
+                error!("compensation emit: {e}");
             }
         }
     });

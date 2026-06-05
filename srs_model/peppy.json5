@@ -13,6 +13,14 @@
     name: "srs_model",
     tag: "v1",
     labels: ["srs", "kinematics", "dynamics", "rust"],
+    depends_on: {
+      interfaces: [
+        // Joint state streamed from the arm. This node subscribes to it and
+        // publishes compensation back (conforms_to gravity_coriolis_compensation).
+        // The `arm` link binds (in the launcher) to the arm instance.
+        { name: "joint_state", tag: "v1", link_id: "arm" },
+      ],
+    },
   },
   execution: {
     language: "rust",
@@ -34,5 +42,10 @@
       { name: "srs_inverse_kinematics", tag: "v1" },
       { name: "gravity_coriolis_compensation", tag: "v1" },
     ],
+    topics: {
+      consumes: [
+        { link_id: "arm", name: "joint_state" },
+      ],
+    },
   },
 }
