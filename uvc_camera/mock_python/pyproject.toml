@@ -7,7 +7,7 @@ name = "uvc_camera_python_mock"
 version = "0.1.0"
 description = "uvc_camera_python_mock peppy node"
 requires-python = ">=3.11,<3.14"
-dependencies = ["peppygen", "av"]
+dependencies = ["peppygen", "peppylib", "av"]
 
 [project.scripts]
 uvc_camera_python_mock = "uvc_camera_python_mock.__main__:main"
@@ -20,3 +20,4 @@ dev = []
 
 [tool.uv.sources]
 peppygen = { path = ".peppy/libs/peppygen" }
+peppylib = { path = ".peppy/libs/peppylib" }
