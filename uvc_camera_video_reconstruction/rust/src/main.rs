@@ -3,6 +3,7 @@ use std::sync::Arc;
 use peppygen::consumed_services::camera_video_stream_info;
 use peppygen::consumed_topics::camera_video_stream;
 use peppygen::{NodeBuilder, NodeRunner, Parameters, Result};
+use peppylib::runtime::CancellationToken;
 
 use ffmpeg_next::Rational;
 use ffmpeg_next::format::Pixel;
@@ -21,9 +22,13 @@ fn main() -> Result<()> {
 }
 
 async fn record_video(node_runner: Arc<NodeRunner>, video_duration_seconds: u32) {
+    let token = node_runner.cancellation_token().clone();
+
     let camera_info = loop {
-        let response =
-            camera_video_stream_info::poll(&node_runner, std::time::Duration::from_secs(5)).await;
+        let response = tokio::select! {
+            _ = token.cancelled() => return,
+            response = camera_video_stream_info::poll(&node_runner, std::time::Duration::from_secs(5)) => response,
+        };
 
         match response {
             Ok(response) => {
@@ -39,7 +44,10 @@ async fn record_video(node_runner: Arc<NodeRunner>, video_duration_seconds: u32)
             }
             Err(e) => {
                 eprintln!("Failed to get camera info: {}, retrying...", e);
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                tokio::select! {
+                    _ = token.cancelled() => return,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                }
             }
         }
     };
@@ -53,7 +61,11 @@ async fn record_video(node_runner: Arc<NodeRunner>, video_duration_seconds: u32)
     let mut frames: Vec<Vec<u8>> = Vec::with_capacity(total_frames as usize);
 
     for frame_num in 0..total_frames {
-        match camera_video_stream::on_next_message_received(&node_runner, None).await {
+        let received = tokio::select! {
+            _ = token.cancelled() => return,
+            received = camera_video_stream::on_next_message_received(&node_runner, None) => received,
+        };
+        match received {
             Ok((_instance_id, message)) => {
                 frames.push(message.frame);
                 if (frame_num + 1) % camera_info.frames_per_second as u32 == 0 {
@@ -78,6 +90,7 @@ async fn record_video(node_runner: Arc<NodeRunner>, video_duration_seconds: u32)
         camera_info.width,
         camera_info.height,
         camera_info.frames_per_second,
+        &token,
     ) {
         Ok(path) => println!("Video saved to: {}", path),
         Err(e) => eprintln!("Failed to encode video: {}", e),
@@ -89,6 +102,7 @@ fn encode_video(
     width: u32,
     height: u32,
     fps: u8,
+    token: &CancellationToken,
 ) -> std::result::Result<String, Box<dyn std::error::Error>> {
     let output_dir = std::path::PathBuf::from("/tmp/video_reconstruction");
     std::fs::create_dir_all(&output_dir)?;
@@ -138,6 +152,14 @@ fn encode_video(
     )?;
 
     for (i, frame_data) in frames.iter().enumerate() {
+        // This synchronous encode runs as one poll on the async pool, and the
+        // tokio Runtime drop at shutdown blocks until that poll finishes — so
+        // the encode must observe the token per frame to stay well inside the
+        // shutdown grace window.
+        if token.is_cancelled() {
+            return Err("shutdown requested; aborting video encode".into());
+        }
+
         let mut rgb_frame = VideoFrame::new(Pixel::RGB24, width, height);
         rgb_frame.data_mut(0).copy_from_slice(frame_data);
 

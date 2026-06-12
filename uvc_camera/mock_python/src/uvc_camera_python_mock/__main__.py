@@ -1,6 +1,7 @@
 import av
 import asyncio
 import json
+import threading
 import time
 from importlib.resources import files
 from pathlib import Path
@@ -30,6 +31,25 @@ def get_source_video_fps(video_path: Path) -> int:
     return 30  # Default fallback
 
 
+async def wait_unless_cancelled(awaitable, token):
+    """Await `awaitable`, racing it against node shutdown.
+
+    Returns its result, or None once the cancellation token fires first, so
+    long-running loops stop working instead of relying on the runtime's
+    post-hook task cancellation.
+    """
+    task = asyncio.ensure_future(awaitable)
+    cancelled = asyncio.ensure_future(token.cancelled())
+    done, _pending = await asyncio.wait(
+        {task, cancelled}, return_when=asyncio.FIRST_COMPLETED
+    )
+    cancelled.cancel()
+    if task not in done:
+        task.cancel()
+        return None
+    return task.result()
+
+
 async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Task]:
     video_params = params.video
 
@@ -53,35 +73,33 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
     actual_fps = get_source_video_fps(video_path)
     print(f"[uvc_camera] Detected source video frame rate: {actual_fps} fps")
 
-    return [
-        # Service to expose camera info
-        asyncio.create_task(
-            listen_for_video_stream_info_requests(node_runner, video_params, actual_fps)
-        ),
-        # Video loop
-        asyncio.create_task(run_video_loop(node_runner, video_params)),
-    ]
-
-
-async def run_video_loop(node_runner: NodeRunner, video_params):
-    print("[uvc_camera] Starting video loop...")
-    video_path = ASSETS_DIR / "robot.mp4"
-
-    if not video_path.exists():
-        raise FileNotFoundError(f"Video file not found: {video_path}")
-    print(f"[uvc_camera] Video file found: {video_path}")
-
     width = video_params.resolution.width
     height = video_params.resolution.height
-    encoding = video_params.topic_encoding
-    frame_duration = 1.0 / video_params.frame_rate
-
     av_format = ENCODING_TO_AV_FORMAT[encoding]
 
     loop = asyncio.get_running_loop()
     # Bounded buffer provides backpressure: the decoder thread blocks when
     # the consumer falls behind instead of growing memory unbounded.
     frame_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=2)
+    # Stop signal for the decoder thread. Cancelling its asyncio wrapper task
+    # cannot interrupt a thread that is already running, so the thread checks
+    # this event between packets and the shutdown hook below sets it.
+    stop_decoding = threading.Event()
+
+    def put_frame(data: bytes) -> bool:
+        # Hand a decoded frame to the event loop. The bounded result waits
+        # keep the decoder thread from blocking forever once shutdown begins
+        # (queue left full by a stopped consumer, or an event loop that no
+        # longer runs the put coroutine).
+        future = asyncio.run_coroutine_threadsafe(frame_queue.put(data), loop)
+        while not stop_decoding.is_set():
+            try:
+                future.result(timeout=0.2)
+                return True
+            except TimeoutError:
+                continue
+        future.cancel()
+        return False
 
     def decode_forever():
         # PyAV's demux/decode/reformat calls are synchronous and hold the GIL
@@ -90,7 +108,7 @@ async def run_video_loop(node_runner: NodeRunner, video_params):
         # native health service to miss heartbeats and the daemon to remove
         # the node after 3 failed checks. Running the pipeline on a worker
         # thread keeps the event loop free.
-        while True:
+        while not stop_decoding.is_set():
             print("[uvc_camera] Opening video file for playback...")
             container = av.open(str(video_path))
             try:
@@ -105,6 +123,8 @@ async def run_video_loop(node_runner: NodeRunner, video_params):
                 decoder.thread_type = "NONE"
 
                 for packet in container.demux(in_stream):
+                    if stop_decoding.is_set():
+                        return
                     for frame in decoder.decode(packet):
                         rgb_frame = frame.reformat(
                             width=width, height=height, format=av_format
@@ -112,53 +132,87 @@ async def run_video_loop(node_runner: NodeRunner, video_params):
                         # Read packed bytes directly from the plane to avoid
                         # a numpy dependency.
                         data = bytes(rgb_frame.planes[0])
-                        asyncio.run_coroutine_threadsafe(
-                            frame_queue.put(data), loop
-                        ).result()
+                        if not put_frame(data):
+                            return
             finally:
                 container.close()
             print("[uvc_camera] Video ended, restarting from beginning...")
 
     decoder_task = asyncio.create_task(asyncio.to_thread(decode_forever))
 
+    async def stop_decoder():
+        # The decoder runs on asyncio's default executor, whose non-daemon
+        # worker threads are joined at interpreter exit: the thread must be
+        # told to stop and seen to finish (closing the av container) before
+        # the runtime tears the node down.
+        stop_decoding.set()
+        await decoder_task
+
+    node_runner.on_shutdown(stop_decoder)
+
+    return [
+        # Service to expose camera info
+        asyncio.create_task(
+            listen_for_video_stream_info_requests(node_runner, video_params, actual_fps)
+        ),
+        # Video loop
+        asyncio.create_task(run_video_loop(node_runner, video_params, frame_queue)),
+    ]
+
+
+async def run_video_loop(
+    node_runner: NodeRunner, video_params, frame_queue: asyncio.Queue
+):
+    print("[uvc_camera] Starting video loop...")
+
+    width = video_params.resolution.width
+    height = video_params.resolution.height
+    encoding = video_params.topic_encoding
+    frame_duration = 1.0 / video_params.frame_rate
+
+    token = node_runner.cancellation_token()
+
     frame_id = 0
     last_print_time = time.monotonic()
 
-    try:
-        while True:
-            data = await frame_queue.get()
+    while not token.is_cancelled():
+        data = await wait_unless_cancelled(frame_queue.get(), token)
+        if data is None:
+            break
 
-            header = MessageHeader(
-                stamp=time.time(),
-                frame_id=frame_id,
-            )
+        header = MessageHeader(
+            stamp=time.time(),
+            frame_id=frame_id,
+        )
 
-            await video_stream.emit(node_runner, header, encoding, width, height, data)
+        await video_stream.emit(node_runner, header, encoding, width, height, data)
 
-            if time.monotonic() - last_print_time >= 3:
-                print(f"[uvc_camera] Emitted frame {frame_id}")
-                last_print_time = time.monotonic()
+        if time.monotonic() - last_print_time >= 3:
+            print(f"[uvc_camera] Emitted frame {frame_id}")
+            last_print_time = time.monotonic()
 
-            frame_id = (frame_id + 1) % (2**32)
+        frame_id = (frame_id + 1) % (2**32)
 
-            await asyncio.sleep(frame_duration)
-    finally:
-        decoder_task.cancel()
+        await asyncio.sleep(frame_duration)
 
 
 async def listen_for_video_stream_info_requests(
     node_runner: NodeRunner, video_params, actual_fps: int
 ):
-    while True:
+    token = node_runner.cancellation_token()
+    while not token.is_cancelled():
         try:
-            await video_stream_info.handle_next_request(
-                node_runner,
-                lambda _request: video_stream_info.Response(
-                    width=video_params.resolution.width,
-                    height=video_params.resolution.height,
-                    frames_per_second=actual_fps,
-                    encoding=video_params.topic_encoding,
+            await wait_unless_cancelled(
+                video_stream_info.handle_next_request(
+                    node_runner,
+                    lambda _request: video_stream_info.Response(
+                        width=video_params.resolution.width,
+                        height=video_params.resolution.height,
+                        frames_per_second=actual_fps,
+                        encoding=video_params.topic_encoding,
+                    ),
                 ),
+                token,
             )
         except Exception as e:
             print(f"get_camera_info service error: {e}")

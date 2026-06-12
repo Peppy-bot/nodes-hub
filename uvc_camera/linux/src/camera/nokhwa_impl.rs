@@ -26,8 +26,8 @@ const V4L2_EXPOSURE_MANUAL_VALUE: i64 = 1;
 /// Nokhwa-based camera implementation
 ///
 /// Note: Camera from nokhwa doesn't implement Send, but we use it in a single-threaded
-/// context (spawn_blocking) where it's never actually sent between threads during execution.
-/// The Send bound is required only for moving into the blocking task initially.
+/// context (the dedicated capture thread) where it's never actually sent between threads
+/// during execution. The Send bound is required only for moving into the thread initially.
 pub struct NokhwaCamera {
     camera: Option<SendableCamera>,
     /// The actual camera encoding negotiated after `open_stream()`. The camera
@@ -38,8 +38,8 @@ pub struct NokhwaCamera {
 
 /// Wrapper to make Camera Send-safe
 ///
-/// SAFETY: Camera is used only within a single thread (spawn_blocking).
-/// It's never accessed from multiple threads concurrently.
+/// SAFETY: Camera is used only within a single thread (the dedicated capture
+/// thread). It's never accessed from multiple threads concurrently.
 struct SendableCamera(Camera);
 unsafe impl Send for SendableCamera {}
 

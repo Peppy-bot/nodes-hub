@@ -1,9 +1,11 @@
 use peppygen::consumed_actions::{left_robot_arm_move_arm, right_robot_arm_move_arm};
 use peppygen::exposed_actions::move_arm;
 use peppygen::{NodeBuilder, Parameters, QoSProfile, Result};
-use std::collections::{HashMap, HashSet};
+use peppylib::runtime::CancellationToken;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::sync::Mutex as AsyncMutex;
 
 const ARM_ID_LEFT: u16 = 0;
 const ARM_ID_RIGHT: u16 = 1;
@@ -135,13 +137,30 @@ impl ArmHandle {
     }
 }
 
-async fn forward(backbone_ctx: move_arm::GoalContext, mut handle: ArmHandle, side: &str) {
+/// Goals currently forwarded to the arms, keyed by arm id. Entries live from
+/// the decider's accept until `drive_goal` finishes, so the map doubles as the
+/// busy-arm set. Each handle sits behind an async mutex shared with the
+/// shutdown hook, which cancels whatever is still in flight at shutdown.
+type ActiveHandles = Arc<Mutex<HashMap<u16, Arc<AsyncMutex<ArmHandle>>>>>;
+
+async fn forward(
+    backbone_ctx: move_arm::GoalContext,
+    handle: Arc<AsyncMutex<ArmHandle>>,
+    side: &str,
+    token: CancellationToken,
+) {
     // The decider already accepted on the arm's behalf, so no accept check
     // here — forward feedback/cancels, then relay the arm's typed outcome.
     // get_result parks until the arm reaches a terminal state, so result
     // delivery is always definitive and never depends on feedback timing; the
     // feedback drain just ends when the arm closes its stream (on completion,
     // cancel, or abandonment).
+    //
+    // The handle guard is held for the whole drive. Every long await below
+    // selects on the cancellation token and returns without cleanup: that
+    // releases the guard, and the shutdown hook — the owner of cleanup —
+    // takes it to cancel the arm goal.
+    let mut handle = handle.lock().await;
     let mut cancelled = false;
     loop {
         tokio::select! {
@@ -157,13 +176,18 @@ async fn forward(backbone_ctx: move_arm::GoalContext, mut handle: ArmHandle, sid
                     eprintln!("[controller] {side} cancel_goal error: {e:?}");
                 }
             }
+            _ = token.cancelled() => return,
         }
     }
 
     // Mirror the arm's outcome onto our own goal. For Abandoned/Expired we leave
     // backbone_ctx uncompleted, which the engine reports to our client as
     // Abandoned.
-    match handle.result(RESULT_TIMEOUT).await {
+    let result = tokio::select! {
+        result = handle.result(RESULT_TIMEOUT) => result,
+        _ = token.cancelled() => return,
+    };
+    match result {
         Ok(ArmOutcome::Completed(fp)) => {
             println!("[controller] {side} arm completed at position: {fp:?}");
             if let Err(e) = backbone_ctx.complete(fp).await {
@@ -188,114 +212,172 @@ async fn forward(backbone_ctx: move_arm::GoalContext, mut handle: ArmHandle, sid
     }
 }
 
-async fn run_action(node_runner: Arc<peppygen::NodeRunner>) -> Result<()> {
+async fn run_action(
+    node_runner: Arc<peppygen::NodeRunner>,
+    active_handles: ActiveHandles,
+) -> Result<()> {
     println!("[controller] move_arm action handler started");
     let mut action = move_arm::ActionHandle::expose(&node_runner).await?;
-    let busy_arms: Arc<Mutex<HashSet<u16>>> = Arc::new(Mutex::new(HashSet::new()));
-    // Decider stashes the accepted arm handle here; drive_goal picks it up
-    // after the backbone-side accept clears.
-    let pending_handles: Arc<Mutex<HashMap<u16, ArmHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+    let token = node_runner.cancellation_token().clone();
 
     loop {
-        let busy_for_decider = Arc::clone(&busy_arms);
-        let pending_for_decider = Arc::clone(&pending_handles);
+        let active_for_decider = Arc::clone(&active_handles);
         let runner_for_decider = Arc::clone(&node_runner);
-        let next = action
-            .handle_goal_next_request(move |request| {
-                let arm_id = request.data.arm_id;
-                let side = arm_side(arm_id);
-                println!(
-                    "[controller] {side} arm received goal: {:?}",
-                    request.data.desired_position
-                );
-                if arm_id != ARM_ID_LEFT && arm_id != ARM_ID_RIGHT {
-                    return Ok(move_arm::GoalResponse::reject(format!(
-                        "unknown arm_id {arm_id}"
-                    )));
-                }
-                if busy_for_decider
-                    .lock()
-                    .expect("busy lock poisoned")
-                    .contains(&arm_id)
-                {
-                    return Ok(move_arm::GoalResponse::reject(format!(
-                        "arm {arm_id} is already moving"
-                    )));
-                }
-                // Pre-fire at the arm so we can mirror its accept/reject. The
-                // decider is sync, so bridge into async with block_in_place +
-                // block_on — safe here because NodeBuilder uses a multi-thread
-                // tokio runtime.
-                let desired = request.data.desired_position;
-                let runner = Arc::clone(&runner_for_decider);
-                let arm_handle_result = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current()
-                        .block_on(ArmHandle::fire(&runner, arm_id, desired))
-                });
-                let arm_handle = match arm_handle_result {
-                    Ok(h) => h,
-                    Err(e) => {
-                        return Ok(move_arm::GoalResponse::reject(format!(
-                            "{side} fire_goal error: {e:?}"
-                        )));
+        let token_for_decider = token.clone();
+        let next_request = action.handle_goal_next_request(move |request| {
+            let arm_id = request.data.arm_id;
+            let side = arm_side(arm_id);
+            println!(
+                "[controller] {side} arm received goal: {:?}",
+                request.data.desired_position
+            );
+            if arm_id != ARM_ID_LEFT && arm_id != ARM_ID_RIGHT {
+                return Ok(move_arm::GoalResponse::reject(format!(
+                    "unknown arm_id {arm_id}"
+                )));
+            }
+            if active_for_decider
+                .lock()
+                .expect("active lock poisoned")
+                .contains_key(&arm_id)
+            {
+                return Ok(move_arm::GoalResponse::reject(format!(
+                    "arm {arm_id} is already moving"
+                )));
+            }
+            // Pre-fire at the arm so we can mirror its accept/reject. The
+            // decider is sync, so bridge into async with block_in_place +
+            // block_on — safe here because NodeBuilder uses a multi-thread
+            // tokio runtime. The bridge must never outlive the cancellation
+            // token: after the shutdown hooks run, Runtime::drop blocks until
+            // block_in_place sections return, so an unbounded fire here would
+            // blow the shutdown grace window.
+            let desired = request.data.desired_position;
+            let runner = Arc::clone(&runner_for_decider);
+            let active = Arc::clone(&active_for_decider);
+            let token = token_for_decider.clone();
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    let arm_handle = tokio::select! {
+                        fired = ArmHandle::fire(&runner, arm_id, desired) => match fired {
+                            Ok(handle) => handle,
+                            Err(e) => {
+                                return Ok(move_arm::GoalResponse::reject(format!(
+                                    "{side} fire_goal error: {e:?}"
+                                )));
+                            }
+                        },
+                        _ = token.cancelled() => {
+                            return Ok(move_arm::GoalResponse::reject("node is shutting down"));
+                        }
+                    };
+                    if !arm_handle.accepted() {
+                        let reason = arm_handle
+                            .rejection_reason()
+                            .unwrap_or("arm rejected")
+                            .to_string();
+                        println!("[controller] {side} arm rejected forwarded goal: {reason}");
+                        return Ok(move_arm::GoalResponse::reject(reason));
                     }
-                };
-                if !arm_handle.accepted() {
-                    let reason = arm_handle
-                        .rejection_reason()
-                        .unwrap_or("arm rejected")
-                        .to_string();
-                    println!("[controller] {side} arm rejected forwarded goal: {reason}");
-                    return Ok(move_arm::GoalResponse::reject(reason));
-                }
-                println!("[controller] {side} arm accepted forwarded goal");
-                busy_for_decider
-                    .lock()
-                    .expect("busy lock poisoned")
-                    .insert(arm_id);
-                pending_for_decider
-                    .lock()
-                    .expect("pending lock poisoned")
-                    .insert(arm_id, arm_handle);
-                Ok(move_arm::GoalResponse::accept())
+                    // Register under the registry lock with a token re-check:
+                    // the shutdown hook snapshots the registry right after the
+                    // token fires, so a handle whose fire raced shutdown would
+                    // be missed by the hook and must be cancelled here instead
+                    // of registered.
+                    {
+                        let mut active = active.lock().expect("active lock poisoned");
+                        if !token.is_cancelled() {
+                            println!("[controller] {side} arm accepted forwarded goal");
+                            active.insert(arm_id, Arc::new(AsyncMutex::new(arm_handle)));
+                            return Ok(move_arm::GoalResponse::accept());
+                        }
+                    }
+                    if let Err(e) = arm_handle.cancel(CANCEL_TIMEOUT).await {
+                        eprintln!("[controller] {side} cancel_goal error: {e:?}");
+                    }
+                    Ok(move_arm::GoalResponse::reject("node is shutting down"))
+                })
             })
-            .await?;
+        });
+        let next = tokio::select! {
+            next = next_request => next?,
+            // Shutdown: stop accepting goals. In-flight forwarded goals are
+            // cancelled by the on_shutdown hook, not here.
+            _ = token.cancelled() => break,
+        };
         let Some(ctx) = next else {
             println!("[controller] move_arm action handler closed");
             break;
         };
         let arm_id = ctx.request().data.arm_id;
-        let arm_handle = pending_handles
+        let arm_handle = active_handles
             .lock()
-            .expect("pending lock poisoned")
-            .remove(&arm_id)
+            .expect("active lock poisoned")
+            .get(&arm_id)
+            .cloned()
             .expect("decider stashed handle for accepted goal");
-        let busy = Arc::clone(&busy_arms);
+        let active = Arc::clone(&active_handles);
+        let goal_token = token.clone();
         tokio::spawn(async move {
-            drive_goal(arm_handle, ctx, busy, arm_id).await;
+            drive_goal(arm_handle, ctx, active, arm_id, goal_token).await;
         });
     }
     Ok(())
 }
 
 async fn drive_goal(
-    arm_handle: ArmHandle,
+    arm_handle: Arc<AsyncMutex<ArmHandle>>,
     backbone_ctx: move_arm::GoalContext,
-    busy_arms: Arc<Mutex<HashSet<u16>>>,
+    active_handles: ActiveHandles,
     arm_id: u16,
+    token: CancellationToken,
 ) {
     let side = arm_side(arm_id);
-    forward(backbone_ctx, arm_handle, side).await;
-    busy_arms
-        .lock()
-        .expect("busy lock poisoned")
-        .remove(&arm_id);
+    forward(backbone_ctx, arm_handle, side, token.clone()).await;
+    // On shutdown the entry must stay registered: forward stopped without
+    // cleanup, and the shutdown hook cancels the arm goal via the registry.
+    if !token.is_cancelled() {
+        active_handles
+            .lock()
+            .expect("active lock poisoned")
+            .remove(&arm_id);
+    }
 }
 
 fn main() -> Result<()> {
     NodeBuilder::<Parameters>::new().run(|_args, node_runner| async move {
+        let active_handles: ActiveHandles = Arc::new(Mutex::new(HashMap::new()));
+
+        // The arms keep executing a forwarded goal even after this controller
+        // dies, so cancelling whatever is still in flight is an awaited
+        // shutdown obligation, not task cleanup: it lives in a hook, which the
+        // runtime runs while the messenger is still connected.
+        let active_for_shutdown = Arc::clone(&active_handles);
+        node_runner.on_shutdown(async move {
+            let handles: Vec<(u16, Arc<AsyncMutex<ArmHandle>>)> = active_for_shutdown
+                .lock()
+                .expect("active lock poisoned")
+                .iter()
+                .map(|(arm_id, handle)| (*arm_id, Arc::clone(handle)))
+                .collect();
+            for (arm_id, handle) in handles {
+                let side = arm_side(arm_id);
+                // forward() releases the handle guard once the token fires, so
+                // this acquire resolves promptly.
+                let handle = handle.lock().await;
+                match handle.cancel(CANCEL_TIMEOUT).await {
+                    Ok(()) => {
+                        println!("[controller] {side} arm goal cancelled at shutdown");
+                    }
+                    Err(e) => {
+                        eprintln!("[controller] {side} shutdown cancel_goal error: {e:?}");
+                    }
+                }
+            }
+        });
+
         tokio::spawn(async move {
-            if let Err(error) = run_action(node_runner).await {
+            if let Err(error) = run_action(node_runner, active_handles).await {
                 tracing::error!("move_arm action error: {error:?}");
             }
         });

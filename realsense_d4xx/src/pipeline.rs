@@ -42,9 +42,11 @@ const DEPTH_RS2_FORMAT: Rs2Format = Rs2Format::Z16;
 pub const DEPTH_TOPIC_ENCODING: &str = "z16";
 
 /// Bounds how long `Pipeline::wait` blocks before we re-check `cancel`.
-/// Safe for any fps ≥ 0.5; cancellation latency during shutdown is at most
-/// this value.
-const WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+/// A timeout just re-polls (no frame is lost), so any fps works. Kept small:
+/// cancellation latency during shutdown is at most this value, and the
+/// shutdown hook awaiting the capture loop needs most of the (default 3s)
+/// grace window left over for `rs2_pipeline_stop` itself.
+const WAIT_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Frame queue depth for the librealsense2 Align processor.
 const ALIGN_QUEUE_DEPTH: i32 = 1;
@@ -210,7 +212,9 @@ impl Capture {
             }
         }
         info!("capture loop stopped");
-        // Drops `pipeline` here, which calls `rs2_pipeline_stop` cleanly.
+        // Drops `pipeline` here, which calls `rs2_pipeline_stop` cleanly. The
+        // shutdown hook registered in main awaits this loop's completion, so
+        // the stop runs inside the bounded hook phase.
     }
 
     fn new_align(target: Rs2StreamKind) -> Align {

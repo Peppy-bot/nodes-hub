@@ -24,13 +24,25 @@ def _log_arm_result(side: str, result) -> None:
 
 async def ai_process(node_runner: NodeRunner):
     print("[brain] AI process started, waiting for video frames...")
+    token = node_runner.cancellation_token()
 
-    while True:
-        # Subscribe to video frames from the camera
+    while not token.is_cancelled():
+        # Subscribe to video frames from the camera, racing the wait against
+        # shutdown so the loop returns cleanly instead of relying on the
+        # runtime's post-hook task cancellation.
+        receive = asyncio.ensure_future(
+            video_stream.on_next_message_received(node_runner)
+        )
+        cancelled = asyncio.ensure_future(token.cancelled())
+        done, _pending = await asyncio.wait(
+            {receive, cancelled}, return_when=asyncio.FIRST_COMPLETED
+        )
+        cancelled.cancel()
+        if receive not in done:
+            receive.cancel()
+            break
         try:
-            _instance_id, frame = await video_stream.on_next_message_received(
-                node_runner
-            )
+            _instance_id, frame = receive.result()
             print("[brain] Received video frame")
         except Exception as e:
             print(f"Failed to receive video frame: {e}")
@@ -108,6 +120,8 @@ async def ai_process(node_runner: NodeRunner):
                 print(f"[brain] Failed to get right arm result: {e}")
         else:
             print("[brain] Both arm goals failed, skipping result wait")
+
+    print("[brain] AI process stopped (shutdown requested)")
 
 
 async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Task]:

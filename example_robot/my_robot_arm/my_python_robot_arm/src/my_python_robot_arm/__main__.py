@@ -5,32 +5,50 @@ from peppygen import NodeBuilder, NodeRunner
 from peppygen.emitted_topics import joint_states
 from peppygen.exposed_actions import move_arm
 from peppygen.parameters import Parameters
+from peppylib import CancellationToken
 
 
-async def publish_joint_states(node_runner: NodeRunner, current_position: list[int]):
-    while True:
-        now = time.time()
-        positions = [float(p) for p in current_position]
-        velocities = [0.0, 0.0, 0.0]
-        try:
-            await joint_states.emit(node_runner, positions, velocities, now)
-        except Exception as e:
-            print(f"[arm] emit joint_states error: {e!r}")
-            break
-        print(
-            f"[arm] published joint_states: positions={[round(p, 3) for p in positions]}"
-        )
-        await asyncio.sleep(0.5)
-
-
-async def _run_action_safe(node_runner: NodeRunner, current_position: list[int]):
+async def publish_joint_states(
+    node_runner: NodeRunner,
+    current_position: list[int],
+    token: CancellationToken,
+):
+    cancelled = asyncio.ensure_future(token.cancelled())
     try:
-        await _run_action(node_runner, current_position)
+        while not token.is_cancelled():
+            now = time.time()
+            positions = [float(p) for p in current_position]
+            velocities = [0.0, 0.0, 0.0]
+            try:
+                await joint_states.emit(node_runner, positions, velocities, now)
+            except Exception as e:
+                print(f"[arm] emit joint_states error: {e!r}")
+                break
+            print(
+                f"[arm] published joint_states: positions={[round(p, 3) for p in positions]}"
+            )
+            # Sleep between publishes, waking early when shutdown begins.
+            await asyncio.wait([cancelled], timeout=0.5)
+    finally:
+        cancelled.cancel()
+
+
+async def _run_action_safe(
+    node_runner: NodeRunner,
+    current_position: list[int],
+    token: CancellationToken,
+):
+    try:
+        await _run_action(node_runner, current_position, token)
     except Exception as error:
         print(f"move_arm action error: {error}")
 
 
-async def _run_action(node_runner: NodeRunner, current_position: list[int]):
+async def _run_action(
+    node_runner: NodeRunner,
+    current_position: list[int],
+    token: CancellationToken,
+):
     print("[arm] move_arm action handler started")
     action = await move_arm.ActionHandle.expose(node_runner)
     # Single arm per instance, so just one in-flight goal at a time.
@@ -47,14 +65,27 @@ async def _run_action(node_runner: NodeRunner, current_position: list[int]):
         busy[0] = True
         return move_arm.GoalResponse.accept()
 
-    while True:
-        ctx = await action.handle_goal_next_request(decide)
-        if ctx is None:
-            print("[arm] move_arm action handler closed")
-            break
-        task = asyncio.create_task(_drive_goal(ctx, current_position, busy))
-        drive_tasks.add(task)
-        task.add_done_callback(drive_tasks.discard)
+    cancelled = asyncio.ensure_future(token.cancelled())
+    try:
+        while not token.is_cancelled():
+            next_goal = asyncio.ensure_future(action.handle_goal_next_request(decide))
+            await asyncio.wait(
+                [cancelled, next_goal], return_when=asyncio.FIRST_COMPLETED
+            )
+            if not next_goal.done():
+                # Shutdown began; stop accepting goals. In-flight _drive_goal
+                # tasks are cancelled by the runtime's task teardown.
+                next_goal.cancel()
+                break
+            ctx = next_goal.result()
+            if ctx is None:
+                print("[arm] move_arm action handler closed")
+                break
+            task = asyncio.create_task(_drive_goal(ctx, current_position, busy))
+            drive_tasks.add(task)
+            task.add_done_callback(drive_tasks.discard)
+    finally:
+        cancelled.cancel()
 
 
 async def _drive_goal(ctx, current_position: list[int], busy: list[bool]):
@@ -123,9 +154,12 @@ def _interpolate_position(start, target, ratio):
 
 async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Task]:
     current_position: list[int] = [0, 0, 0]
+    token = node_runner.cancellation_token()
     return [
-        asyncio.create_task(publish_joint_states(node_runner, current_position)),
-        asyncio.create_task(_run_action_safe(node_runner, current_position)),
+        asyncio.create_task(
+            publish_joint_states(node_runner, current_position, token)
+        ),
+        asyncio.create_task(_run_action_safe(node_runner, current_position, token)),
     ]
 
 

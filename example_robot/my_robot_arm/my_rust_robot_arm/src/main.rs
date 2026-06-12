@@ -1,6 +1,7 @@
 use peppygen::emitted_topics::joint_states;
 use peppygen::exposed_actions::move_arm;
 use peppygen::{NodeBuilder, Parameters, Result};
+use peppylib::runtime::CancellationToken;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -8,6 +9,7 @@ async fn publish_joint_states(
     node_runner: Arc<peppygen::NodeRunner>,
     current_position: Arc<Mutex<[i32; 3]>>,
 ) {
+    let token = node_runner.cancellation_token().clone();
     loop {
         let now = SystemTime::now();
         let positions = {
@@ -22,7 +24,10 @@ async fn publish_joint_states(
             break;
         }
         println!("[arm] published joint_states: positions={positions:.3?}");
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::select! {
+            _ = token.cancelled() => break,
+            _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+        }
     }
 }
 
@@ -32,13 +37,15 @@ async fn run_action(
 ) -> Result<()> {
     println!("[arm] move_arm action handler started");
     let mut action = move_arm::ActionHandle::expose(&node_runner).await?;
+    let token = node_runner.cancellation_token().clone();
     // Single arm per instance, so just one in-flight goal at a time.
     let busy: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
 
     loop {
         let busy_for_decider = Arc::clone(&busy);
-        let next = action
-            .handle_goal_next_request(move |request| {
+        let next = tokio::select! {
+            _ = token.cancelled() => break,
+            next = action.handle_goal_next_request(move |request| {
                 println!(
                     "[arm] received move_arm goal: {:?}",
                     request.data.desired_position
@@ -52,16 +59,17 @@ async fn run_action(
                     *flag = true;
                     Ok(move_arm::GoalResponse::accept())
                 }
-            })
-            .await?;
+            }) => next?,
+        };
         let Some(ctx) = next else {
             println!("[arm] move_arm action handler closed");
             break;
         };
         let position = Arc::clone(&current_position);
         let busy_clone = Arc::clone(&busy);
+        let goal_token = token.clone();
         tokio::spawn(async move {
-            drive_goal(ctx, position, busy_clone).await;
+            drive_goal(ctx, position, busy_clone, goal_token).await;
         });
     }
     Ok(())
@@ -71,6 +79,7 @@ async fn drive_goal(
     ctx: move_arm::GoalContext,
     current_position: Arc<Mutex<[i32; 3]>>,
     busy: Arc<Mutex<bool>>,
+    token: CancellationToken,
 ) {
     let target = ctx.request().data.desired_position;
     let start = *current_position
@@ -81,6 +90,7 @@ async fn drive_goal(
     let outcome = tokio::select! {
         final_position = execute_goal(&ctx, start, target, duration, Arc::clone(&current_position)) => Some(final_position),
         _ = ctx.cancel_signal() => None,
+        _ = token.cancelled() => None,
     };
 
     match outcome {
