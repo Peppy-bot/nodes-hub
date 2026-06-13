@@ -63,10 +63,10 @@ async fn record_video(node_runner: Arc<NodeRunner>, video_duration_seconds: u32)
     for frame_num in 0..total_frames {
         let received = tokio::select! {
             _ = token.cancelled() => return,
-            received = camera_video_stream::on_next_message_received(&node_runner, None) => received,
+            received = camera_video_stream::on_next_message_received(&node_runner) => received,
         };
         match received {
-            Ok((_instance_id, message)) => {
+            Ok((_producer, message)) => {
                 frames.push(message.frame);
                 if (frame_num + 1) % camera_info.frames_per_second as u32 == 0 {
                     println!(

@@ -186,10 +186,10 @@ async fn record_seconds(node_runner: &Arc<NodeRunner>, fps: u8, seconds: u32) ->
     for frame_num in 0..frame_count {
         let received = tokio::select! {
             _ = token.cancelled() => break,
-            received = camera_video_stream::on_next_message_received(node_runner, None) => received,
+            received = camera_video_stream::on_next_message_received(node_runner) => received,
         };
         match received {
-            Ok((_instance_id, message)) => {
+            Ok((_producer, message)) => {
                 frames.push(message.frame);
                 println!("  Frame {}/{}", frame_num + 1, frame_count);
             }

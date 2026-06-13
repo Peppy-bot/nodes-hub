@@ -44,9 +44,9 @@ async fn ai_process(node_runner: Arc<NodeRunner>, cancel_token: CancellationToke
 
 async fn process_next_frame(node_runner: &NodeRunner) {
     // Subscribe to video frames from the camera
-    let frame_result = video_stream::on_next_message_received(node_runner, None).await;
+    let frame_result = video_stream::on_next_message_received(node_runner).await;
 
-    let (_instance_id, frame) = match frame_result {
+    let (_producer, frame) = match frame_result {
         Ok(msg) => {
             println!("[brain] Received video frame");
             msg

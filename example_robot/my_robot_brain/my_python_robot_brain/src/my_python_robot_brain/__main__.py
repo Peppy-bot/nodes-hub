@@ -42,7 +42,7 @@ async def ai_process(node_runner: NodeRunner):
             receive.cancel()
             break
         try:
-            _instance_id, frame = receive.result()
+            _producer, frame = receive.result()
             print("[brain] Received video frame")
         except Exception as e:
             print(f"Failed to receive video frame: {e}")

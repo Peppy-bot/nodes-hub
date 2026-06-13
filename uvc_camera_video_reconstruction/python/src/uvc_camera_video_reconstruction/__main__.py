@@ -113,7 +113,7 @@ async def record_video(
     for frame_num in range(total_frames):
         try:
             (
-                _instance_id,
+                _producer,
                 message,
             ) = await camera_video_stream.on_next_message_received(node_runner)
             if token.is_cancelled():
