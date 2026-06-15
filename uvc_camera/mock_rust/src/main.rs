@@ -96,6 +96,11 @@ fn main() -> Result<()> {
 
         // Long running tasks should always be spawned in a different thread
         let cancel_token = node_runner.cancellation_token().clone();
+        // Log when the shutdown/cancel signal is received so it is visible in
+        // the node's stdout.
+        node_runner.on_shutdown(async move {
+            println!("[uvc_camera] Shutdown signal received");
+        });
         tokio::spawn(async move {
             if let Err(e) = run_video_loop(node_runner, video_params, cancel_token).await {
                 tracing::error!("Video loop error: {e:?}");

@@ -15,6 +15,12 @@ fn main() -> Result<()> {
     NodeBuilder::new().run(|args: Parameters, node_runner| async move {
         let video_duration_seconds = args.video_duration_seconds;
 
+        // Log when the shutdown/cancel signal is received so it is visible in
+        // the node's stdout.
+        node_runner.on_shutdown(async move {
+            println!("[uvc_camera_video_reconstruction] Shutdown signal received");
+        });
+
         tokio::spawn(record_video(node_runner, video_duration_seconds));
 
         Ok(())

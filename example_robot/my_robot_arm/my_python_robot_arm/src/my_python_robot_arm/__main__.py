@@ -155,6 +155,14 @@ def _interpolate_position(start, target, ratio):
 async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Task]:
     current_position: list[int] = [0, 0, 0]
     token = node_runner.cancellation_token()
+
+    # Log when the shutdown/cancel signal is received so it is visible in the
+    # node's stdout.
+    async def announce_shutdown():
+        print("[arm] Shutdown signal received")
+
+    node_runner.on_shutdown(announce_shutdown)
+
     return [
         asyncio.create_task(
             publish_joint_states(node_runner, current_position, token)

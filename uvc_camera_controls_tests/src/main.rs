@@ -24,6 +24,11 @@ fn main() -> Result<()> {
     ffmpeg_next::init().expect("Failed to initialize FFmpeg");
 
     NodeBuilder::new().run(|_args: Parameters, node_runner| async move {
+        // Log when the shutdown/cancel signal is received so it is visible in
+        // the node's stdout.
+        node_runner.on_shutdown(async move {
+            println!("[uvc_camera_controls_tests] Shutdown signal received");
+        });
         tokio::spawn(record_video(node_runner));
         Ok(())
     })

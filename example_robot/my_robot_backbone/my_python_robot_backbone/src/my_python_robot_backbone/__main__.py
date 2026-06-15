@@ -227,6 +227,14 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
             await asyncio.wait(set(drive_tasks), timeout=CANCEL_TIMEOUT)
 
     node_runner.on_shutdown(cancel_forwarded_goals)
+
+    # Log when the shutdown/cancel signal is received so it is visible in the
+    # node's stdout.
+    async def announce_shutdown():
+        print("[controller] Shutdown signal received")
+
+    node_runner.on_shutdown(announce_shutdown)
+
     return [
         asyncio.create_task(
             _run_arm_action_safe(node_runner, token, active_handles, drive_tasks)

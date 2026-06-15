@@ -154,6 +154,11 @@ async fn process_next_frame(node_runner: &NodeRunner) {
 fn main() -> Result<()> {
     NodeBuilder::<Parameters>::new().run(|_args, node_runner| async move {
         let cancel_token = node_runner.cancellation_token().clone();
+        // Log when the shutdown/cancel signal is received so it is visible in
+        // the node's stdout.
+        node_runner.on_shutdown(async move {
+            println!("[brain] Shutdown signal received");
+        });
         tokio::spawn(async move {
             ai_process(node_runner, cancel_token).await;
         });

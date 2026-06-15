@@ -177,6 +177,12 @@ fn main() -> Result<()> {
                 tracing::error!("move_arm action error: {error:?}");
             }
         });
+
+        // Log when the shutdown/cancel signal is received so it is visible in
+        // the node's stdout.
+        node_runner.on_shutdown(async move {
+            println!("[arm] Shutdown signal received");
+        });
         Ok(())
     })
 }

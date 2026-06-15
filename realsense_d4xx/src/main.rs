@@ -92,6 +92,12 @@ fn main() -> Result<()> {
         spawn_set_depth_laser_power_mw(node_runner.clone(), handle.clone());
         spawn_set_align_mode(node_runner.clone(), handle);
 
+        // Log when the shutdown/cancel signal is received so it is visible in
+        // the node's stdout (tracing's fmt subscriber writes to stdout).
+        node_runner.on_shutdown(async move {
+            info!("[realsense_d4xx] Shutdown signal received");
+        });
+
         Ok(())
     })
 }

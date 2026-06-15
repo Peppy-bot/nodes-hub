@@ -125,6 +125,12 @@ async def ai_process(node_runner: NodeRunner):
 
 
 async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Task]:
+    # Log when the shutdown/cancel signal is received so it is visible in the
+    # node's stdout.
+    async def announce_shutdown():
+        print("[brain] Shutdown signal received")
+
+    node_runner.on_shutdown(announce_shutdown)
     return [asyncio.create_task(ai_process(node_runner))]
 
 
