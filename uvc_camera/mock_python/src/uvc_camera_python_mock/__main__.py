@@ -1,4 +1,5 @@
 import av
+from av.codec.context import ThreadType
 import asyncio
 import json
 import queue
@@ -101,15 +102,33 @@ async def run_video_loop(node_runner: NodeRunner, video_params):
     stop = threading.Event()
 
     def decode_forever():
-        # `container.decode` selects the decoder that matches the file, so the
-        # mock keeps working if the asset is ever re-encoded, and behaves the
-        # same on macOS and Linux. Decoding is paced to the target frame rate
-        # so the worker does not peg a CPU core decoding far ahead of what the
-        # consumer emits (which would only get dropped anyway).
+        # Decoding is paced to the target frame rate so the worker does not peg
+        # a CPU core decoding far ahead of what the consumer emits (which would
+        # only get dropped anyway).
         while not stop.is_set():
             print("[uvc_camera] Opening video file for playback...")
             with av.open(str(video_path)) as container:
-                for frame in container.decode(video=0):
+                stream = container.streams.video[0]
+                # Force single-threaded decoding. The asset is AV1, decoded by
+                # libdav1d, whose default multithreaded path (thread_count =
+                # logical cores, plus frame-level parallelism) can deadlock on
+                # its internal worker pool when the CPU is saturated. That is
+                # exactly what happens during a cold-start `stack launch`, where
+                # every node spins up at once on the small build VM: the decoder
+                # wedged on the very first frame, so the node never emitted and
+                # was killed for being silent (this is the hang at "Opening
+                # video file for playback...", not reproducible in isolation).
+                # Single-threaded decode removes the worker pool entirely and so
+                # the deadlock window with it; a 640x480 frame still decodes in
+                # ~6 ms even with the 1080p reformat, far inside the frame
+                # budget. Must be set before the first decode() call, while the
+                # codec context is still closed.
+                stream.codec_context.thread_type = ThreadType.NONE
+                stream.codec_context.thread_count = 1
+                # `container.decode(stream)` selects the decoder that matches the
+                # file, so the mock keeps working if the asset is ever
+                # re-encoded, and behaves the same on macOS and Linux.
+                for frame in container.decode(stream):
                     if stop.is_set():
                         return
                     rgb_frame = frame.reformat(
