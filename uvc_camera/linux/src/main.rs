@@ -1,7 +1,7 @@
 use peppygen::{NodeBuilder, Parameters, Result, StandaloneConfig};
 use std::sync::Arc;
 
-use uvc_camera_linux::camera::{create_control_channel, run_nokhwa_capture_loop};
+use uvc_camera_linux::camera::{create_control_channel, spawn_nokhwa_capture_loop};
 use uvc_camera_linux::services::{
     listen_for_set_brightness_requests, listen_for_set_contrast_requests,
     listen_for_set_exposure_requests, listen_for_set_gain_requests,
@@ -100,15 +100,28 @@ fn main() -> Result<()> {
                 listen_for_set_contrast_requests(contrast_runner, contrast_tx).await;
             });
 
-            // ── capture loop (long-running) ────────────────────────────────
+            // ── capture loop (long-running, dedicated thread) ──────────────
+            // On failure the loop cancels the token itself, shutting the node
+            // down instead of leaving it running without a capture loop.
             let cancel_token = node_runner.cancellation_token().clone();
-            tokio::spawn(async move {
-                if let Err(e) =
-                    run_nokhwa_capture_loop(camera_config, node_runner, cancel_token, control_rx)
-                        .await
-                {
-                    panic!("[uvc_camera] Camera capture loop failed: {e}");
-                }
+            let capture_done = spawn_nokhwa_capture_loop(
+                camera_config,
+                Arc::clone(&node_runner),
+                cancel_token,
+                control_rx,
+            );
+
+            // The camera (V4L2 stream + device fd) is closed when the capture
+            // thread drops it; await that here so device teardown is bounded
+            // by the shutdown grace window instead of racing process exit.
+            node_runner.on_shutdown(async move {
+                let _ = capture_done.await;
+            });
+
+            // Log when the shutdown/cancel signal is received so it is visible
+            // in the node's stdout.
+            node_runner.on_shutdown(async move {
+                println!("[uvc_camera] Shutdown signal received");
             });
 
             Ok(())

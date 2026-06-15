@@ -3,15 +3,42 @@ revision = 3
 requires-python = ">=3.11, <3.14"
 
 [[package]]
+name = "my-python-robot-brain"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "peppygen" },
+    { name = "peppylib" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "peppygen", directory = ".peppy/libs/peppygen" },
+    { name = "peppylib", directory = ".peppy/libs/peppylib" },
+]
+
+[package.metadata.requires-dev]
+dev = []
+
+[[package]]
 name = "peppygen"
 version = "0.1.0"
 source = { directory = ".peppy/libs/peppygen" }
 dependencies = [
+    { name = "peppylib" },
     { name = "pycapnp" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "pycapnp" }]
+requires-dist = [
+    { name = "peppylib", specifier = "==0.0.1+peppy" },
+    { name = "pycapnp" },
+]
+
+[[package]]
+name = "peppylib"
+version = "0.0.1+peppy"
+source = { directory = ".peppy/libs/peppylib" }
 
 [[package]]
 name = "pycapnp"
@@ -62,17 +89,3 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/be/08/42ab52a3e7e5381d8fd7ae227ae75f54454f9e339d214ebe92763bb78115/pycapnp-2.2.2-cp313-cp313-win32.whl", hash = "sha256:a25e3b3ef40d430309acc7c024aa62b1ee6b2e7a85b341a8b7a8a6f8e29d4133", size = 1046173, upload-time = "2026-01-21T01:21:18.074Z" },
     { url = "https://files.pythonhosted.org/packages/34/d4/fec2023c4709d3631fe24e09dae2badc23d613f1288b4a6b398302945984/pycapnp-2.2.2-cp313-cp313-win_amd64.whl", hash = "sha256:db65c9ec9d69bac6d19092db43b5e1f3cb2c680810418fd1e02316f7ef157fc1", size = 1184414, upload-time = "2026-01-21T01:21:19.334Z" },
 ]
-
-[[package]]
-name = "my-python-robot-brain"
-version = "0.1.0"
-source = { editable = "." }
-dependencies = [
-    { name = "peppygen" },
-]
-
-[package.metadata]
-requires-dist = [{ name = "peppygen", directory = ".peppy/libs/peppygen" }]
-
-[package.metadata.requires-dev]
-dev = []
