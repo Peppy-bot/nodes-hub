@@ -16,7 +16,11 @@ uvc_camera_python_mock = "uvc_camera_python_mock.__main__:main"
 packages = ["src/uvc_camera_python_mock"]
 
 [dependency-groups]
-dev = []
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
 
 [tool.uv.sources]
 peppygen = { path = ".peppy/libs/peppygen" }

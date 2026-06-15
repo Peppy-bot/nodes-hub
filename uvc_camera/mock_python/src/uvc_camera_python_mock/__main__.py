@@ -1,6 +1,8 @@
 import av
+from av.codec.context import ThreadType
 import asyncio
 import json
+import queue
 import threading
 import time
 from importlib.resources import files
@@ -13,12 +15,18 @@ from peppygen.emitted_topics.uvc_camera.v1 import video_stream
 from peppygen.emitted_topics.uvc_camera.v1.video_stream import MessageHeader
 from peppygen.parameters import Parameters
 
+from uvc_camera_python_mock.frames import offer_latest_frame
+
 ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 
 ENCODING_TO_AV_FORMAT = {
     "rgb8": "rgb24",
     "rgb": "rgb24",
 }
+
+# Sentinel pushed onto the frame queue at shutdown to wake the consumer if it is
+# parked in `to_thread(frame_queue.get)` waiting on a decoder that has stopped.
+_SHUTDOWN = object()
 
 
 def get_source_video_fps(video_path: Path) -> int:
@@ -76,77 +84,81 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
     width = video_params.resolution.width
     height = video_params.resolution.height
     av_format = ENCODING_TO_AV_FORMAT[encoding]
+    frame_duration = 1.0 / video_params.frame_rate
 
-    loop = asyncio.get_running_loop()
-    # Bounded buffer provides backpressure: the decoder thread blocks when
-    # the consumer falls behind instead of growing memory unbounded.
-    frame_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=2)
+    # Producer and consumer are decoupled through a small, drop-oldest queue
+    # rather than a blocking one: a slow or briefly-stalled consumer (for
+    # example, the first publish waiting on subscriber discovery during a cold
+    # start) only causes stale frames to be dropped, it can never wedge the
+    # decoder. This matches the stream's SensorData QoS, where lagging
+    # subscribers are meant to miss frames rather than apply backpressure. The
+    # handoff uses a thread-safe `queue.Queue` so the pipeline never depends on
+    # a cross-thread event-loop wake-up to make progress.
+    frame_queue: queue.Queue = queue.Queue(maxsize=2)
     # Stop signal for the decoder thread. Cancelling its asyncio wrapper task
     # cannot interrupt a thread that is already running, so the thread checks
-    # this event between packets and the shutdown hook below sets it.
-    stop_decoding = threading.Event()
-
-    def put_frame(data: bytes) -> bool:
-        # Hand a decoded frame to the event loop. The bounded result waits
-        # keep the decoder thread from blocking forever once shutdown begins
-        # (queue left full by a stopped consumer, or an event loop that no
-        # longer runs the put coroutine).
-        future = asyncio.run_coroutine_threadsafe(frame_queue.put(data), loop)
-        while not stop_decoding.is_set():
-            try:
-                future.result(timeout=0.2)
-                return True
-            except TimeoutError:
-                continue
-        future.cancel()
-        return False
+    # this event between frames and the shutdown hook below sets it.
+    stop = threading.Event()
 
     def decode_forever():
-        # PyAV's demux/decode/reformat calls are synchronous and hold the GIL
-        # for tens of milliseconds at a time — long enough on the Lima VM used
-        # on macOS to starve the asyncio event loop. That caused peppylib's
-        # native health service to miss heartbeats and the daemon to remove
-        # the node after 3 failed checks. Running the pipeline on a worker
-        # thread keeps the event loop free.
-        while not stop_decoding.is_set():
+        # PyAV's decode and reformat calls are synchronous and hold the GIL for
+        # tens of milliseconds at a time — long enough on the Lima VM used on
+        # macOS to starve the asyncio event loop and make peppylib's native
+        # health service miss heartbeats. Running the pipeline on a worker
+        # thread keeps the event loop free. Decoding is paced to the target
+        # frame rate so the worker does not peg a CPU core decoding far ahead of
+        # what the consumer emits (which would only get dropped anyway).
+        while not stop.is_set():
             print("[uvc_camera] Opening video file for playback...")
-            container = av.open(str(video_path))
-            try:
-                in_stream = container.streams.video[0]
-
-                # Use software decoder (libdav1d) with threading disabled to
-                # avoid hardware-acceleration paths that hang inside the
-                # apptainer sandbox.
-                decoder = av.codec.CodecContext.create("libdav1d", "r")
-                decoder.extradata = in_stream.codec_context.extradata
-                decoder.thread_count = 1
-                decoder.thread_type = "NONE"
-
-                for packet in container.demux(in_stream):
-                    if stop_decoding.is_set():
+            with av.open(str(video_path)) as container:
+                stream = container.streams.video[0]
+                # Force single-threaded decoding. The asset is AV1, decoded by
+                # libdav1d, whose default multithreaded path (thread_count =
+                # logical cores, plus frame-level parallelism) can deadlock on
+                # its internal worker pool when the CPU is saturated. That is
+                # exactly what happens during a cold-start `stack launch`, where
+                # every node spins up at once on the small build VM: the decoder
+                # wedged on the very first frame, so the node never emitted and
+                # was killed for being silent (this is the hang at "Opening
+                # video file for playback...", not reproducible in isolation).
+                # Single-threaded decode removes the worker pool entirely and so
+                # the deadlock window with it; a 640x480 frame still decodes in
+                # ~6 ms even with the 1080p reformat, far inside the frame
+                # budget. Must be set before the first decode() call, while the
+                # codec context is still closed.
+                stream.codec_context.thread_type = ThreadType.NONE
+                stream.codec_context.thread_count = 1
+                # `container.decode(stream)` selects the decoder that matches the
+                # file, so the mock keeps working if the asset is ever
+                # re-encoded, and behaves the same on macOS and Linux.
+                for frame in container.decode(stream):
+                    if stop.is_set():
                         return
-                    for frame in decoder.decode(packet):
-                        rgb_frame = frame.reformat(
-                            width=width, height=height, format=av_format
-                        )
-                        # Read packed bytes directly from the plane to avoid
-                        # a numpy dependency.
-                        data = bytes(rgb_frame.planes[0])
-                        if not put_frame(data):
-                            return
-            finally:
-                container.close()
+                    rgb_frame = frame.reformat(
+                        width=width, height=height, format=av_format
+                    )
+                    # Read packed bytes directly from the plane to avoid a
+                    # numpy dependency.
+                    offer_latest_frame(frame_queue, bytes(rgb_frame.planes[0]))
+                    time.sleep(frame_duration)
             print("[uvc_camera] Video ended, restarting from beginning...")
 
     decoder_task = asyncio.create_task(asyncio.to_thread(decode_forever))
 
     async def stop_decoder():
         # The decoder runs on asyncio's default executor, whose non-daemon
-        # worker threads are joined at interpreter exit: the thread must be
-        # told to stop and seen to finish (closing the av container) before
-        # the runtime tears the node down.
-        stop_decoding.set()
+        # worker threads are joined at interpreter exit: the thread must be told
+        # to stop and seen to finish (closing the av container) before the
+        # runtime tears the node down.
+        stop.set()
         await decoder_task
+        # The decoder has stopped producing, so wake the consumer if it is
+        # parked in `to_thread(frame_queue.get)`; otherwise its worker thread
+        # would block until interpreter exit.
+        try:
+            frame_queue.put_nowait(_SHUTDOWN)
+        except queue.Full:
+            pass
 
     node_runner.on_shutdown(stop_decoder)
 
@@ -161,14 +173,13 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
 
 
 async def run_video_loop(
-    node_runner: NodeRunner, video_params, frame_queue: asyncio.Queue
+    node_runner: NodeRunner, video_params, frame_queue: queue.Queue
 ):
     print("[uvc_camera] Starting video loop...")
 
     width = video_params.resolution.width
     height = video_params.resolution.height
     encoding = video_params.topic_encoding
-    frame_duration = 1.0 / video_params.frame_rate
 
     token = node_runner.cancellation_token()
 
@@ -176,8 +187,13 @@ async def run_video_loop(
     last_print_time = time.monotonic()
 
     while not token.is_cancelled():
-        data = await wait_unless_cancelled(frame_queue.get(), token)
-        if data is None:
+        # Wait for the next frame off the event loop so a blocking get never
+        # stalls other coroutines (the health service, the info service). The
+        # decoder paces production, so this returns at the target frame rate
+        # without busy-polling, and the shutdown hook pushes _SHUTDOWN to wake
+        # this get once the decoder has stopped.
+        data = await asyncio.to_thread(frame_queue.get)
+        if data is _SHUTDOWN:
             break
 
         header = MessageHeader(
@@ -192,8 +208,6 @@ async def run_video_loop(
             last_print_time = time.monotonic()
 
         frame_id = (frame_id + 1) % (2**32)
-
-        await asyncio.sleep(frame_duration)
 
 
 async def listen_for_video_stream_info_requests(
