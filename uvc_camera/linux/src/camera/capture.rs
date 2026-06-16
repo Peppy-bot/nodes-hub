@@ -114,6 +114,9 @@ fn run_camera_capture_loop<C: CameraDevice>(
     let target_frame_duration = Duration::from_nanos(frame_duration_ns);
     let mut next_frame_time = Instant::now() + target_frame_duration;
 
+    // Declare the publisher once; every publish below is then lock-free.
+    let publisher = runtime.block_on(video_stream::declare_publisher(node_runner))?;
+
     loop {
         if cancel_token.is_cancelled() {
             println!("[uvc_camera] Shutdown requested, stopping camera capture loop");
@@ -152,20 +155,28 @@ fn run_camera_capture_loop<C: CameraDevice>(
             frame_id: frame.frame_id().as_u32(),
         };
 
-        // Emit frame by blocking this dedicated thread on the async call.
-        // Racing the emit against the token keeps shutdown from stalling on
+        // Serialize off the messenger (build_message is pure), then publish.
+        let payload = match video_stream::build_message(
+            header,
+            frame.encoding().to_string(),
+            frame.width(),
+            frame.height(),
+            frame.data().to_vec(),
+        ) {
+            Ok(payload) => payload,
+            Err(e) => {
+                tracing::warn!("Failed to build frame message: {}", e);
+                continue;
+            }
+        };
+
+        // Publish by blocking this dedicated thread on the async call. Racing
+        // the publish against the token keeps shutdown from stalling on
         // messaging once cancellation has been requested.
         runtime.block_on(async {
             tokio::select! {
                 _ = cancel_token.cancelled() => {}
-                result = video_stream::emit(
-                    node_runner,
-                    header,
-                    frame.encoding().to_string(),
-                    frame.width(),
-                    frame.height(),
-                    frame.data().to_vec(),
-                ) => {
+                result = publisher.publish(payload) => {
                     if let Err(e) = result {
                         tracing::warn!("Failed to emit frame: {}", e);
                     }

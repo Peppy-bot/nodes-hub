@@ -10,6 +10,13 @@ async fn publish_joint_states(
     current_position: Arc<Mutex<[i32; 3]>>,
 ) {
     let token = node_runner.cancellation_token().clone();
+    let publisher = match joint_states::declare_publisher(&node_runner).await {
+        Ok(publisher) => publisher,
+        Err(e) => {
+            eprintln!("[arm] declare joint_states publisher error: {e:?}");
+            return;
+        }
+    };
     loop {
         let now = SystemTime::now();
         let positions = {
@@ -19,8 +26,15 @@ async fn publish_joint_states(
             [p[0] as f64, p[1] as f64, p[2] as f64]
         };
         let velocities = [0.0, 0.0, 0.0];
-        if let Err(e) = joint_states::emit(&node_runner, positions, velocities, now).await {
-            eprintln!("[arm] emit joint_states error: {e:?}");
+        let payload = match joint_states::build_message(positions, velocities, now) {
+            Ok(payload) => payload,
+            Err(e) => {
+                eprintln!("[arm] build joint_states message error: {e:?}");
+                break;
+            }
+        };
+        if let Err(e) = publisher.publish(payload).await {
+            eprintln!("[arm] publish joint_states error: {e:?}");
             break;
         }
         println!("[arm] published joint_states: positions={positions:.3?}");

@@ -7,9 +7,9 @@ use std::sync::Arc;
 
 use peppygen::emitted_topics::rgbd_camera::v1::{color_stream, depth_stream};
 use peppygen::exposed_services::rgbd_camera::v1::{
-    color_stream_info, depth_stream_info, set_align_mode, set_color_brightness,
-    set_color_contrast, set_color_exposure, set_color_gain, set_color_white_balance,
-    set_depth_gain, set_depth_laser_power_mw,
+    color_stream_info, depth_stream_info, set_align_mode, set_color_brightness, set_color_contrast,
+    set_color_exposure, set_color_gain, set_color_white_balance, set_depth_gain,
+    set_depth_laser_power_mw,
 };
 use peppygen::{NodeBuilder, NodeRunner, Parameters, Result};
 use peppylib::runtime::CancellationToken;
@@ -23,32 +23,57 @@ use crate::pipeline::{
 };
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).init();
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .init();
 
     NodeBuilder::new().run(|params: Parameters, node_runner| async move {
         let Parameters {
             serial,
-            color_width, color_height, color_fps, color_format,
-            depth_width, depth_height, depth_fps,
+            color_width,
+            color_height,
+            color_fps,
+            color_format,
+            depth_width,
+            depth_height,
+            depth_fps,
         } = params;
 
-        let color_format = ColorFormat::try_from(color_format.as_str())
-            .map_err(std::io::Error::other)?;
+        let color_format =
+            ColorFormat::try_from(color_format.as_str()).map_err(std::io::Error::other)?;
         let color_fps = parse_fps("color_fps", color_fps)?;
         let depth_fps = parse_fps("depth_fps", depth_fps)?;
 
         let cfg = PipelineConfig {
-            serial: if serial.is_empty() { None } else { Some(serial.clone()) },
-            color_width, color_height, color_fps, color_format,
-            depth_width, depth_height, depth_fps,
+            serial: if serial.is_empty() {
+                None
+            } else {
+                Some(serial.clone())
+            },
+            color_width,
+            color_height,
+            color_fps,
+            color_format,
+            depth_width,
+            depth_height,
+            depth_fps,
         };
         let color_encoding = color_format.topic_encoding().to_string();
         let depth_encoding = DEPTH_TOPIC_ENCODING.to_string();
         info!(
             "realsense_d4xx opening serial={} color={}x{}@{} {} depth={}x{}@{}",
-            if serial.is_empty() { "<first device>" } else { serial.as_str() },
-            color_width, color_height, color_fps, color_format,
-            depth_width, depth_height, depth_fps,
+            if serial.is_empty() {
+                "<first device>"
+            } else {
+                serial.as_str()
+            },
+            color_width,
+            color_height,
+            color_fps,
+            color_format,
+            depth_width,
+            depth_height,
+            depth_fps,
         );
 
         let capture = open(cfg)
@@ -77,11 +102,18 @@ fn main() -> Result<()> {
         // Services
         spawn_color_stream_info(
             node_runner.clone(),
-            color_width, color_height, color_fps.get(), color_encoding,
+            color_width,
+            color_height,
+            color_fps.get(),
+            color_encoding,
         );
         spawn_depth_stream_info(
             node_runner.clone(),
-            depth_width, depth_height, depth_fps.get(), depth_encoding, handle.depth_unit(),
+            depth_width,
+            depth_height,
+            depth_fps.get(),
+            depth_encoding,
+            handle.depth_unit(),
         );
         spawn_set_color_exposure(node_runner.clone(), handle.clone());
         spawn_set_color_white_balance(node_runner.clone(), handle.clone());
@@ -108,7 +140,9 @@ fn parse_fps(name: &str, value: u32) -> Result<NonZeroU8> {
     u8::try_from(value)
         .ok()
         .and_then(NonZeroU8::new)
-        .ok_or_else(|| std::io::Error::other(format!("{name} must be in 1..=255 (got {value})")).into())
+        .ok_or_else(|| {
+            std::io::Error::other(format!("{name} must be in 1..=255 (got {value})")).into()
+        })
 }
 
 /// Start the capture loop on a blocking thread. Returns a receiver that
@@ -144,8 +178,28 @@ fn spawn_emit_task(
     depth_encoding: String,
 ) {
     tokio::spawn(async move {
+        let color_publisher = match color_stream::declare_publisher(&runner).await {
+            Ok(publisher) => publisher,
+            Err(e) => {
+                error!("color_stream declare_publisher: {e}");
+                return;
+            }
+        };
+        let depth_publisher = match depth_stream::declare_publisher(&runner).await {
+            Ok(publisher) => publisher,
+            Err(e) => {
+                error!("depth_stream declare_publisher: {e}");
+                return;
+            }
+        };
         while let Some(frameset) = frame_rx.recv().await {
-            let FrameSet { frame_id, stamp, align_mode, color, depth } = frameset;
+            let FrameSet {
+                frame_id,
+                stamp,
+                align_mode,
+                color,
+                depth,
+            } = frameset;
             let align_mode = align_mode.as_str();
 
             let color_header = color_stream::MessageHeader {
@@ -153,17 +207,19 @@ fn spawn_emit_task(
                 frame_id,
                 align_mode: align_mode.to_string(),
             };
-            if let Err(e) = color_stream::emit(
-                &runner,
+            match color_stream::build_message(
                 color_header,
                 color_encoding.clone(),
                 color.width,
                 color.height,
                 color.bytes,
-            )
-            .await
-            {
-                error!("color_stream emit: {e}");
+            ) {
+                Ok(payload) => {
+                    if let Err(e) = color_publisher.publish(payload).await {
+                        error!("color_stream publish: {e}");
+                    }
+                }
+                Err(e) => error!("color_stream build_message: {e}"),
             }
 
             let depth_header = depth_stream::MessageHeader {
@@ -171,17 +227,19 @@ fn spawn_emit_task(
                 frame_id,
                 align_mode: align_mode.to_string(),
             };
-            if let Err(e) = depth_stream::emit(
-                &runner,
+            match depth_stream::build_message(
                 depth_header,
                 depth_encoding.clone(),
                 depth.width,
                 depth.height,
                 depth.bytes,
-            )
-            .await
-            {
-                error!("depth_stream emit: {e}");
+            ) {
+                Ok(payload) => {
+                    if let Err(e) = depth_publisher.publish(payload).await {
+                        error!("depth_stream publish: {e}");
+                    }
+                }
+                Err(e) => error!("depth_stream build_message: {e}"),
             }
         }
         info!("emit task stopped");
@@ -190,7 +248,10 @@ fn spawn_emit_task(
 
 fn spawn_color_stream_info(
     runner: Arc<NodeRunner>,
-    width: u32, height: u32, fps: u8, encoding: String,
+    width: u32,
+    height: u32,
+    fps: u8,
+    encoding: String,
 ) {
     tokio::spawn(async move {
         let cancel = runner.cancellation_token().clone();
@@ -210,7 +271,11 @@ fn spawn_color_stream_info(
 
 fn spawn_depth_stream_info(
     runner: Arc<NodeRunner>,
-    width: u32, height: u32, fps: u8, encoding: String, depth_unit: f32,
+    width: u32,
+    height: u32,
+    fps: u8,
+    encoding: String,
+    depth_unit: f32,
 ) {
     tokio::spawn(async move {
         let cancel = runner.cancellation_token().clone();
@@ -495,12 +560,18 @@ mod tests {
     #[test]
     fn parse_fps_rejects_zero() {
         let err = parse_fps("color_fps", 0).unwrap_err();
-        assert!(err.to_string().contains("color_fps must be in 1..=255 (got 0)"));
+        assert!(
+            err.to_string()
+                .contains("color_fps must be in 1..=255 (got 0)")
+        );
     }
 
     #[test]
     fn parse_fps_rejects_over_u8() {
         let err = parse_fps("depth_fps", 256).unwrap_err();
-        assert!(err.to_string().contains("depth_fps must be in 1..=255 (got 256)"));
+        assert!(
+            err.to_string()
+                .contains("depth_fps must be in 1..=255 (got 256)")
+        );
     }
 }

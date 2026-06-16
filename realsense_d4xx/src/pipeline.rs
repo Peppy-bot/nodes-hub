@@ -3,7 +3,7 @@
 //! handlers can adjust sensor options at runtime without contending with the
 //! capture thread.
 //!
-//! The capture loop runs on the caller's blocking thread; the 
+//! The capture loop runs on the caller's blocking thread; the
 //! [`PipelineHandle`] is `Send + Sync` and holds mutexed [`Sensor`]s for the
 //! color and depth halves so set_option calls from async tasks complete quickly
 //!  without locking the pipeline itself.
@@ -112,7 +112,10 @@ impl Capture {
     /// pipeline error. Frames are emitted on `tx` with backpressure: when the
     /// channel is full, the frame is dropped (matches `sensor_data` QoS).
     pub fn run(self, tx: mpsc::Sender<FrameSet>, cancel: CancellationToken) {
-        let Capture { mut pipeline, handle } = self;
+        let Capture {
+            mut pipeline,
+            handle,
+        } = self;
         let mut align_to_color: Option<Align> = None;
         let mut align_to_depth: Option<Align> = None;
         let mut frame_id: u32 = 0;
@@ -154,16 +157,16 @@ impl Capture {
             let processed = match mode {
                 AlignMode::None => frames,
                 AlignMode::DepthToColor => {
-                    let aligner = align_to_color
-                        .get_or_insert_with(|| Self::new_align(Rs2StreamKind::Color));
+                    let aligner =
+                        align_to_color.get_or_insert_with(|| Self::new_align(Rs2StreamKind::Color));
                     match Self::run_align(aligner, frames) {
                         Some(f) => f,
                         None => continue,
                     }
                 }
                 AlignMode::ColorToDepth => {
-                    let aligner = align_to_depth
-                        .get_or_insert_with(|| Self::new_align(Rs2StreamKind::Depth));
+                    let aligner =
+                        align_to_depth.get_or_insert_with(|| Self::new_align(Rs2StreamKind::Depth));
                     match Self::run_align(aligner, frames) {
                         Some(f) => f,
                         None => continue,
@@ -173,7 +176,10 @@ impl Capture {
 
             let depth_frames: Vec<DepthFrame> = processed.frames_of_type();
             let color_frames: Vec<ColorFrame> = processed.frames_of_type();
-            let (Some(depth), Some(color)) = (depth_frames.into_iter().next(), color_frames.into_iter().next()) else {
+            let (Some(depth), Some(color)) = (
+                depth_frames.into_iter().next(),
+                color_frames.into_iter().next(),
+            ) else {
                 warn!("incomplete frameset (depth or color missing)");
                 continue;
             };
@@ -254,12 +260,18 @@ impl PipelineHandle {
 
     fn set_color_option(&self, option: Rs2Option, value: f32) -> Result<(), String> {
         let mut sensors = self.sensors.lock().unwrap_or_else(|p| p.into_inner());
-        sensors.color.set_option(option, value).map_err(|e| format!("{e}"))
+        sensors
+            .color
+            .set_option(option, value)
+            .map_err(|e| format!("{e}"))
     }
 
     fn set_depth_option(&self, option: Rs2Option, value: f32) -> Result<(), String> {
         let mut sensors = self.sensors.lock().unwrap_or_else(|p| p.into_inner());
-        sensors.depth.set_option(option, value).map_err(|e| format!("{e}"))
+        sensors
+            .depth
+            .set_option(option, value)
+            .map_err(|e| format!("{e}"))
     }
 
     /// `mode = Auto` sets `EnableAutoExposure` on; `mode = Manual` sets
@@ -320,8 +332,8 @@ impl PipelineHandle {
 /// caller hands to a blocking thread.
 pub fn open(config: PipelineConfig) -> Result<Capture, String> {
     let context = Context::new().map_err(|e| format!("realsense context: {e}"))?;
-    let inactive = InactivePipeline::try_from(&context)
-        .map_err(|e| format!("create pipeline: {e}"))?;
+    let inactive =
+        InactivePipeline::try_from(&context).map_err(|e| format!("create pipeline: {e}"))?;
 
     let mut rs2_config = Config::new();
     if let Some(serial) = &config.serial {
@@ -375,12 +387,19 @@ pub fn open(config: PipelineConfig) -> Result<Capture, String> {
     let serial_log = device_serial(&device).unwrap_or_else(|| "<unknown>".into());
     info!(
         "pipeline started for device serial={serial_log} color={}x{}@{}fps depth={}x{}@{}fps depth_unit={depth_unit}",
-        config.color_width, config.color_height, config.color_fps,
-        config.depth_width, config.depth_height, config.depth_fps,
+        config.color_width,
+        config.color_height,
+        config.color_fps,
+        config.depth_width,
+        config.depth_height,
+        config.depth_fps,
     );
 
     let handle = Arc::new(PipelineHandle {
-        sensors: Mutex::new(Sensors { color: color_sensor, depth: depth_sensor }),
+        sensors: Mutex::new(Sensors {
+            color: color_sensor,
+            depth: depth_sensor,
+        }),
         align_mode: Mutex::new(AlignMode::None),
         depth_unit,
     });
@@ -445,4 +464,3 @@ mod tests {
         assert_eq!(DEPTH_TOPIC_ENCODING, "z16");
     }
 }
-

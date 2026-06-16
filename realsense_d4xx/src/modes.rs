@@ -114,7 +114,7 @@ impl fmt::Display for AlignMode {
 }
 
 /// Auto/manual toggle for sensor options that pair a mode with a numeric
-/// setpoint (exposure, white_balance, ...). 
+/// setpoint (exposure, white_balance, ...).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AutoManualMode {
     Auto,
@@ -193,7 +193,10 @@ mod tests {
     #[test]
     fn auto_manual_parses_known_strings() {
         assert_eq!(AutoManualMode::parse("auto", "x"), Ok(AutoManualMode::Auto));
-        assert_eq!(AutoManualMode::parse("manual", "x"), Ok(AutoManualMode::Manual));
+        assert_eq!(
+            AutoManualMode::parse("manual", "x"),
+            Ok(AutoManualMode::Manual)
+        );
     }
 
     #[test]

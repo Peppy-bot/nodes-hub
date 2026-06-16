@@ -24,3 +24,27 @@ def offer_latest_frame(frame_queue: "queue.Queue", data) -> None:
                 frame_queue.get_nowait()
             except queue.Empty:
                 pass
+
+
+def force_put(frame_queue: "queue.Queue", item) -> None:
+    """Enqueue `item`, first emptying the queue so the put can never be lost to
+    a `queue.Full`.
+
+    Used to hand a consumer parked in `frame_queue.get` the shutdown sentinel:
+    the consumer must be woken immediately regardless of how full the queue is,
+    so that its (non-daemon) worker thread is not left blocked at interpreter
+    exit. Dropping the queued frames is harmless: the newest frame always wins
+    for a live stream, and at shutdown they are discarded anyway.
+    """
+    while True:
+        try:
+            frame_queue.get_nowait()
+        except queue.Empty:
+            break
+    try:
+        frame_queue.put_nowait(item)
+    except queue.Full:
+        # A racing producer refilled the queue between the drain and the put.
+        # The consumer's bounded get re-checks the cancellation token, so it
+        # still exits promptly even if this sentinel is dropped.
+        pass

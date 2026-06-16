@@ -178,7 +178,13 @@ async fn record_video(node_runner: Arc<NodeRunner>) {
 
     println!("Recording complete. Encoding video...");
 
-    match encode_video(&all_frames, camera_info.width, camera_info.height, fps, token) {
+    match encode_video(
+        &all_frames,
+        camera_info.width,
+        camera_info.height,
+        fps,
+        token,
+    ) {
         Ok(path) => println!("Video saved to: {}", path),
         Err(e) => eprintln!("Failed to encode video: {}", e),
     }

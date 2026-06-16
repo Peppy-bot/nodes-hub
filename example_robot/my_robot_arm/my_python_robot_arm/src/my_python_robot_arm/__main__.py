@@ -13,6 +13,7 @@ async def publish_joint_states(
     current_position: list[int],
     token: CancellationToken,
 ):
+    publisher = await joint_states.declare_publisher(node_runner)
     cancelled = asyncio.ensure_future(token.cancelled())
     try:
         while not token.is_cancelled():
@@ -20,9 +21,11 @@ async def publish_joint_states(
             positions = [float(p) for p in current_position]
             velocities = [0.0, 0.0, 0.0]
             try:
-                await joint_states.emit(node_runner, positions, velocities, now)
+                await publisher.publish(
+                    joint_states.build_message(positions, velocities, now)
+                )
             except Exception as e:
-                print(f"[arm] emit joint_states error: {e!r}")
+                print(f"[arm] publish joint_states error: {e!r}")
                 break
             print(
                 f"[arm] published joint_states: positions={[round(p, 3) for p in positions]}"

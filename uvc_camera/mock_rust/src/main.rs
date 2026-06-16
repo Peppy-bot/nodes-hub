@@ -153,6 +153,9 @@ async fn run_video_loop(
         );
     });
 
+    // Declare the publisher once; every publish below is then lock-free.
+    let publisher = video_stream::declare_publisher(&node_runner).await?;
+
     loop {
         let data = tokio::select! {
             _ = cancel_token.cancelled() => {
@@ -171,9 +174,15 @@ async fn run_video_loop(
             frame_id,
         };
 
-        if let Err(e) =
-            video_stream::emit(&node_runner, header, encoding.clone(), width, height, data).await
-        {
+        let payload =
+            match video_stream::build_message(header, encoding.clone(), width, height, data) {
+                Ok(payload) => payload,
+                Err(e) => {
+                    tracing::error!("Failed to build frame message: {e:?}");
+                    continue;
+                }
+            };
+        if let Err(e) = publisher.publish(payload).await {
             tracing::error!("Failed to emit frame: {e:?}");
         }
         if last_print_time.elapsed().as_secs() >= 3 {
@@ -226,8 +235,9 @@ fn decode_frames(
         let codec = ffmpeg::decoder::find_by_name("libdav1d")
             .expect("libdav1d decoder not found - install libdav1d-dev");
 
-        let mut context_decoder = ffmpeg::codec::Context::from_parameters(video_stream.parameters())
-            .expect("Failed to create codec context");
+        let mut context_decoder =
+            ffmpeg::codec::Context::from_parameters(video_stream.parameters())
+                .expect("Failed to create codec context");
 
         // Disable threading to avoid potential hardware acceleration paths
         context_decoder.set_threading(ffmpeg::threading::Config::default());
