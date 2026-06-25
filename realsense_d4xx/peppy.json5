@@ -6,7 +6,7 @@
 // depth is derived from and the IMU streams (D435i/D455) are not exposed; add a
 // node conforming to an additional interface if a consumer needs them.
 {
-  peppy_schema: "node_v1",
+  peppy_schema: "node/v1",
   manifest: {
     name: "realsense_d4xx",
     tag: "v1",
