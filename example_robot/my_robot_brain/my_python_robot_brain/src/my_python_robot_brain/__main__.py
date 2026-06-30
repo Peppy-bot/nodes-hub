@@ -26,13 +26,15 @@ async def ai_process(node_runner: NodeRunner):
     print("[brain] AI process started, waiting for video frames...")
     token = node_runner.cancellation_token()
 
+    # Subscribe once and reuse the held subscription across frames; its buffer
+    # keeps frames published between iterations rather than dropping them.
+    subscription = await video_stream.subscribe(node_runner)
+
     while not token.is_cancelled():
-        # Subscribe to video frames from the camera, racing the wait against
-        # shutdown so the loop returns cleanly instead of relying on the
+        # Wait for the next frame on the held subscription, racing the wait
+        # against shutdown so the loop returns cleanly instead of relying on the
         # runtime's post-hook task cancellation.
-        receive = asyncio.ensure_future(
-            video_stream.on_next_message_received(node_runner)
-        )
+        receive = asyncio.ensure_future(subscription.next())
         cancelled = asyncio.ensure_future(token.cancelled())
         done, _pending = await asyncio.wait(
             {receive, cancelled}, return_when=asyncio.FIRST_COMPLETED
@@ -42,11 +44,14 @@ async def ai_process(node_runner: NodeRunner):
             receive.cancel()
             break
         try:
-            _producer, frame = receive.result()
-            print("[brain] Received video frame")
+            received = receive.result()
         except Exception as e:
             print(f"Failed to receive video frame: {e}")
             continue
+        if received is None:
+            break  # subscription closed
+        _producer, frame = received
+        print("[brain] Received video frame")
 
         # Process the frame and generate fake arm positions
         fake_position = [

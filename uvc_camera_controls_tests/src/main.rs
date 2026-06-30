@@ -194,16 +194,24 @@ async fn record_seconds(node_runner: &Arc<NodeRunner>, fps: u8, seconds: u32) ->
     let token = node_runner.cancellation_token();
     let frame_count = fps as u32 * seconds;
     let mut frames = Vec::with_capacity(frame_count as usize);
+    let mut subscription = match camera_video_stream::subscribe(node_runner).await {
+        Ok(subscription) => subscription,
+        Err(e) => {
+            eprintln!("Failed to subscribe to camera stream: {}", e);
+            return frames;
+        }
+    };
     for frame_num in 0..frame_count {
         let received = tokio::select! {
             _ = token.cancelled() => break,
-            received = camera_video_stream::on_next_message_received(node_runner) => received,
+            received = subscription.next() => received,
         };
         match received {
-            Ok((_producer, message)) => {
+            Ok(Some((_producer, message))) => {
                 frames.push(message.frame);
                 println!("  Frame {}/{}", frame_num + 1, frame_count);
             }
+            Ok(None) => break,
             Err(e) => {
                 eprintln!("Failed to receive frame: {}", e);
             }

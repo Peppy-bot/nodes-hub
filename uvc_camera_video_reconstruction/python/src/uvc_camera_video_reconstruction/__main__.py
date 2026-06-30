@@ -117,12 +117,16 @@ async def record_video(
         return
     encoder.open(camera_info.width, camera_info.height, camera_info.frames_per_second)
 
+    # Subscribe once; the held subscription buffers frames in order, so the
+    # recording loop never misses a frame published between iterations.
+    subscription = await camera_video_stream.subscribe(node_runner)
+
     for frame_num in range(total_frames):
         try:
-            (
-                _producer,
-                message,
-            ) = await camera_video_stream.on_next_message_received(node_runner)
+            received = await subscription.next()
+            if received is None:
+                break  # subscription closed
+            _producer, message = received
             if token.is_cancelled():
                 # Shutdown began; the finalize_video hook owns the flush/close.
                 return

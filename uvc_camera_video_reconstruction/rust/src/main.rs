@@ -66,13 +66,23 @@ async fn record_video(node_runner: Arc<NodeRunner>, video_duration_seconds: u32)
 
     let mut frames: Vec<Vec<u8>> = Vec::with_capacity(total_frames as usize);
 
+    // Subscribe once; the held subscription buffers frames in order, so the
+    // recording loop never misses a frame published between iterations.
+    let mut subscription = match camera_video_stream::subscribe(&node_runner).await {
+        Ok(subscription) => subscription,
+        Err(e) => {
+            eprintln!("Failed to subscribe to camera stream: {}", e);
+            return;
+        }
+    };
+
     for frame_num in 0..total_frames {
         let received = tokio::select! {
             _ = token.cancelled() => return,
-            received = camera_video_stream::on_next_message_received(&node_runner) => received,
+            received = subscription.next() => received,
         };
         match received {
-            Ok((_producer, message)) => {
+            Ok(Some((_producer, message))) => {
                 frames.push(message.frame);
                 if (frame_num + 1) % camera_info.frames_per_second as u32 == 0 {
                     println!(
@@ -83,6 +93,7 @@ async fn record_video(node_runner: Arc<NodeRunner>, video_duration_seconds: u32)
                     );
                 }
             }
+            Ok(None) => break,
             Err(e) => {
                 eprintln!("Failed to receive frame: {}", e);
             }

@@ -28,6 +28,15 @@ fn log_arm_result(side: &str, result: arm::ResultResponse) {
 
 async fn ai_process(node_runner: Arc<NodeRunner>, cancel_token: CancellationToken) {
     println!("[brain] AI process started, waiting for video frames...");
+    // Subscribe once and reuse the held subscription across frames; its buffer
+    // keeps frames published between iterations rather than dropping them.
+    let mut subscription = match video_stream::subscribe(&node_runner).await {
+        Ok(subscription) => subscription,
+        Err(e) => {
+            eprintln!("Failed to subscribe to video stream: {e}");
+            return;
+        }
+    };
     loop {
         // Select the token against the iteration so shutdown interrupts the
         // unbounded frame wait and the multi-second goal/result awaits, not
@@ -37,19 +46,24 @@ async fn ai_process(node_runner: Arc<NodeRunner>, cancel_token: CancellationToke
                 println!("[brain] Shutdown requested, stopping AI process");
                 return;
             }
-            _ = process_next_frame(&node_runner) => {}
+            _ = process_next_frame(&node_runner, &mut subscription) => {}
         }
     }
 }
 
-async fn process_next_frame(node_runner: &NodeRunner) {
-    // Subscribe to video frames from the camera
-    let frame_result = video_stream::on_next_message_received(node_runner).await;
-
-    let (_producer, frame) = match frame_result {
-        Ok(msg) => {
+async fn process_next_frame(
+    node_runner: &NodeRunner,
+    subscription: &mut video_stream::Subscription,
+) {
+    // Wait for the next video frame from the camera on the held subscription.
+    let frame = match subscription.next().await {
+        Ok(Some((_producer, frame))) => {
             println!("[brain] Received video frame");
-            msg
+            frame
+        }
+        Ok(None) => {
+            eprintln!("Video stream closed");
+            return;
         }
         Err(e) => {
             eprintln!("Failed to receive video frame: {e}");
