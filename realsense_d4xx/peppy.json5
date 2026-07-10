@@ -1,10 +1,10 @@
 // Intel RealSense D4xx-series RGB-D camera (D405, D435, D435i, D455, ...).
 // Wraps librealsense2 via realsense-rust; publishes synchronized
 // color_stream + depth_stream with a shared frame_id. Conforms to the shared
-// rgbd_camera interface, so consumers (and sim/mock RGB-D nodes) bind against
+// rgbd_camera contract, so consumers (and sim/mock RGB-D nodes) bind against
 // the contract rather than this concrete node. The stereo IR pair that
 // depth is derived from and the IMU streams (D435i/D455) are not exposed; add a
-// node conforming to an additional interface if a consumer needs them.
+// node conforming to an additional contract if a consumer needs them.
 {
   peppy_schema: "node/v1",
   manifest: {

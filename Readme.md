@@ -13,10 +13,10 @@ A node is a directory containing a `peppy.json5` manifest (`peppy_schema: "node/
 └── src/            # source code
 ```
 
-Nodes that implement the **same interface** are grouped under a folder named after that interface. The folder is organizational only — it has no manifest of its own; each child is a full, independent node:
+Nodes that implement the **same contract** are grouped under a folder named after that contract. The folder is organizational only — it has no manifest of its own; each child is a full, independent node:
 
 ```text
-uvc_camera/                # groups every node implementing the `uvc_camera` interface
+uvc_camera/                # groups every node implementing the `uvc_camera` contract
 ├── linux/peppy.json5      #   name: uvc_camera_linux        (rust, real)
 ├── macos/peppy.json5      #   name: uvc_camera_macos        (real)
 ├── mock_python/peppy.json5 #  name: uvc_camera_python_mock  (simulated)
@@ -25,19 +25,19 @@ uvc_camera/                # groups every node implementing the `uvc_camera` int
 
 A node with a single implementation needs no grouping folder — its `peppy.json5` sits at the node root (e.g. `realsense_d4xx/`).
 
-## Conformance interfaces
+## Conformance contracts
 
-Interchangeable nodes are connected through **conformance interfaces**, defined in [`interfaces_hub`](https://github.com/Peppy-bot/interfaces_hub). This is the mechanism that lets one node stand in for another.
+Interchangeable nodes are connected through **conformance contracts**, defined in [`interfaces_hub`](https://github.com/Peppy-bot/interfaces_hub). This is the mechanism that lets one node stand in for another.
 
 - A node claims an interface by listing it under `interfaces.conforms_to`:
   ```json5
   interfaces: { conforms_to: [{ name: "uvc_camera", tag: "v1" }] }
   ```
   Every node conforming to `uvc_camera/v1` is interchangeable with the others — a real Linux camera, a macOS camera, and a Python or Rust mock all satisfy the same contract.
-- A consumer depends on the **interface**, not a specific node, through `manifest.depends_on.interfaces`; the launcher binds it to whichever conforming node is selected. A consumer can also depend on a specific node via `manifest.depends_on.nodes`. Each dependency carries a `link_id` that wires it to the `topics`/`services`/`actions` the node consumes or produces:
+- A consumer depends on the **contract**, not a specific node, through `manifest.depends_on.contracts`; the launcher binds it to whichever conforming node is selected. A consumer can also depend on a specific node via `manifest.depends_on.nodes`. Each dependency carries a `link_id` that wires it to the `topics`/`services`/`actions` the node consumes or produces:
   ```json5
   manifest: {
-    depends_on: { interfaces: [{ name: "uvc_camera", tag: "v1", link_id: "camera" }] }
+    depends_on: { contracts: [{ name: "uvc_camera", tag: "v1", link_id: "camera" }] }
   },
   interfaces: {
     topics: { consumes: [{ link_id: "camera", name: "video_stream" }] }
@@ -55,4 +55,4 @@ interfaces:  { conforms_to?, topics?, services?, actions? }
 
 Parameters are typed (`device_path: "string"`) or typed with a default (`{ $type: "u16", $default: 30 }`).
 
-See the [Peppy documentation](https://github.com/Peppy-bot/peppy) for launcher configuration and how interface dependencies are resolved to concrete nodes.
+See the [Peppy documentation](https://github.com/Peppy-bot/peppy) for launcher configuration and how contract dependencies are resolved to concrete nodes.

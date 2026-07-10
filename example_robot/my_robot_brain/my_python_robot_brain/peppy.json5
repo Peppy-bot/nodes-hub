@@ -7,7 +7,7 @@
       "brain"
     ],
     depends_on: {
-      interfaces: [
+      contracts: [
         {
           name: "uvc_camera",
           tag: "v1",
