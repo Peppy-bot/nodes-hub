@@ -29,7 +29,7 @@ A node with a single implementation needs no grouping folder — its `peppy.json
 
 Interchangeable nodes are connected through **conformance contracts**, defined in [`interfaces_hub`](https://github.com/Peppy-bot/interfaces_hub). This is the mechanism that lets one node stand in for another.
 
-- A node claims an interface by listing it under `interfaces.conforms_to`:
+- A node claims a contract by listing it under `interfaces.conforms_to`:
   ```json5
   interfaces: { conforms_to: [{ name: "uvc_camera", tag: "v1" }] }
   ```
