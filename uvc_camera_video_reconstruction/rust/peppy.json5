@@ -4,7 +4,7 @@
     name: "uvc_camera_video_reconstruction",
     tag: "v1",
     depends_on: {
-      interfaces: [
+      contracts: [
         {
           name: "uvc_camera",
           tag: "v1",
