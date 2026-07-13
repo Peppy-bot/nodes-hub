@@ -3,6 +3,9 @@
   manifest: {
     name: "uvc_camera_python_mock",
     tag: "v1",
+    implements: [
+      { name: "uvc_camera", tag: "v1", link_id: "camera" },
+    ],
     labels: [
       "uvc",
       "camera"
@@ -46,11 +49,20 @@
     },
   },
   interfaces: {
-    conforms_to: [
-      {
-        name: "uvc_camera",
-        tag: "v1"
-      },
-    ],
+    topics: {
+      emits: [
+        { link_id: "camera", name: "video_stream" },
+      ],
+    },
+    services: {
+      exposes: [
+        { link_id: "camera", name: "video_stream_info" },
+        { link_id: "camera", name: "set_exposure" },
+        { link_id: "camera", name: "set_white_balance" },
+        { link_id: "camera", name: "set_gain" },
+        { link_id: "camera", name: "set_brightness" },
+        { link_id: "camera", name: "set_contrast" },
+      ],
+    },
   }
 }
