@@ -13,7 +13,7 @@ A node is a directory containing a `peppy.json5` manifest (`peppy_schema: "node/
 └── src/            # source code
 ```
 
-Nodes that implement the **same contract** are grouped under a folder named after that contract. The folder is organizational only — it has no manifest of its own; each child is a full, independent node:
+Nodes that implement the **same contract** are grouped under a folder named after that contract. The folder is organizational only, with no manifest of its own; each child is a full, independent node:
 
 ```text
 uvc_camera/                # groups every node implementing the `uvc_camera` contract
@@ -23,13 +23,14 @@ uvc_camera/                # groups every node implementing the `uvc_camera` con
 └── mock_rust/peppy.json5  #   name: uvc_camera_rust_mock    (simulated)
 ```
 
-A node with a single implementation needs no grouping folder — its `peppy.json5` sits at the node root (e.g. `realsense_d4xx/`).
+A node with a single implementation needs no grouping folder; its `peppy.json5` sits at the node root (e.g. `realsense_d4xx/`).
 
 ## Contract implementations
 
 Interchangeable nodes are connected through contracts defined in [`contracts-hub`](https://github.com/Peppy-bot/contracts-hub). This is the mechanism that lets one node stand in for another.
 
 - A node claims a contract under `manifest.implements` and explicitly lists each contract-backed interface member:
+
   ```json5
   manifest: {
     implements: [{ name: "uvc_camera", tag: "v1", link_id: "camera" }]
@@ -39,8 +40,10 @@ Interchangeable nodes are connected through contracts defined in [`contracts-hub
     services: { exposes: [{ link_id: "camera", name: "video_stream_info" }] }
   }
   ```
-  The implementation must list every member of the contract exactly once. Every node implementing `uvc_camera:v1` is interchangeable with the others — a real Linux camera, a macOS camera, and a Python or Rust mock all satisfy the same contract.
+
+  The implementation must list every member of the contract exactly once. Every node implementing `uvc_camera:v1` is interchangeable with the others: a real Linux camera, a macOS camera, and a Python or Rust mock all satisfy the same contract.
 - A consumer depends on the **contract**, not a specific node, through `manifest.depends_on.contracts`; the launcher binds it to whichever implementing node is selected. A consumer can also depend on a specific node via `manifest.depends_on.nodes`. Each dependency carries a `link_id` that wires it to the `topics`/`services`/`actions` the node consumes:
+
   ```json5
   manifest: {
     depends_on: { contracts: [{ name: "uvc_camera", tag: "v1", link_id: "camera" }] }
