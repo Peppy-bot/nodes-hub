@@ -33,7 +33,11 @@ async fn record_video(node_runner: Arc<NodeRunner>, video_duration_seconds: u32)
     let camera_info = loop {
         let response = tokio::select! {
             _ = token.cancelled() => return,
-            response = camera_video_stream_info::poll(&node_runner, std::time::Duration::from_secs(5)) => response,
+            response = camera_video_stream_info::poll(
+                &node_runner,
+                camera_video_stream_info::bound_producer(&node_runner),
+                std::time::Duration::from_secs(5),
+            ) => response,
         };
 
         match response {

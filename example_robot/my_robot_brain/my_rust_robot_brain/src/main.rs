@@ -95,8 +95,20 @@ async fn process_next_frame(
 
     // Fire goals to both arms concurrently
     let (left_goal_result, right_goal_result) = tokio::join!(
-        arm::ActionHandle::fire_goal(node_runner, goal_timeout, left_goal, QoSProfile::Standard),
-        arm::ActionHandle::fire_goal(node_runner, goal_timeout, right_goal, QoSProfile::Standard),
+        arm::ActionHandle::fire_goal(
+            node_runner,
+            arm::bound_producer(node_runner),
+            goal_timeout,
+            left_goal,
+            QoSProfile::Standard,
+        ),
+        arm::ActionHandle::fire_goal(
+            node_runner,
+            arm::bound_producer(node_runner),
+            goal_timeout,
+            right_goal,
+            QoSProfile::Standard,
+        ),
     );
 
     // Get the action handles from accepted goals

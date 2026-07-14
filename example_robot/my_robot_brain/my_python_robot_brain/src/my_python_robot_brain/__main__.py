@@ -71,10 +71,18 @@ async def ai_process(node_runner: NodeRunner):
 
         left_goal_result, right_goal_result = await asyncio.gather(
             arm.ActionHandle.fire_goal(
-                node_runner, left_goal, goal_timeout, QoSProfile.Standard
+                node_runner,
+                arm.bound_producer(node_runner),
+                left_goal,
+                goal_timeout,
+                QoSProfile.Standard,
             ),
             arm.ActionHandle.fire_goal(
-                node_runner, right_goal, goal_timeout, QoSProfile.Standard
+                node_runner,
+                arm.bound_producer(node_runner),
+                right_goal,
+                goal_timeout,
+                QoSProfile.Standard,
             ),
             return_exceptions=True,
         )

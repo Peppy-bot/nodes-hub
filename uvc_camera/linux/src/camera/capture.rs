@@ -115,7 +115,9 @@ fn run_camera_capture_loop<C: CameraDevice>(
     let mut next_frame_time = Instant::now() + target_frame_duration;
 
     // Declare the publisher once; every publish below is then lock-free.
-    let publisher = runtime.block_on(video_stream::declare_publisher(node_runner))?;
+    let publisher = runtime
+        .block_on(video_stream::declare_publisher(node_runner))
+        .map_err(|e| format!("Failed to declare video stream publisher: {e}"))?;
 
     loop {
         if cancel_token.is_cancelled() {
