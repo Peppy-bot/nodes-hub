@@ -95,7 +95,11 @@ async def record_video(
         if token.is_cancelled():
             return
         try:
-            response = await camera_video_stream_info.poll(node_runner, timeout=5.0)
+            response = await camera_video_stream_info.poll(
+                node_runner,
+                camera_video_stream_info.bound_producer(node_runner),
+                timeout=5.0,
+            )
             camera_info = response.data
             instance_id = response.instance_id
             print(

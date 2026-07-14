@@ -58,7 +58,11 @@ async def _run_arm_action(node_runner, token, active_handles, drive_tasks):
         )
         try:
             arm_handle = await arm_module.ActionHandle.fire_goal(
-                node_runner, arm_request, GOAL_TIMEOUT, QoSProfile.Standard
+                node_runner,
+                arm_module.bound_producer(node_runner),
+                arm_request,
+                GOAL_TIMEOUT,
+                QoSProfile.Standard,
             )
         except Exception as e:
             return move_arm.GoalResponse.reject(f"{side} fire_goal error: {e!r}")

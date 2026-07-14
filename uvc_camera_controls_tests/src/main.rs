@@ -40,7 +40,11 @@ async fn record_video(node_runner: Arc<NodeRunner>) {
     let camera_info = loop {
         let response = tokio::select! {
             _ = token.cancelled() => return,
-            response = camera_video_stream_info::poll(&node_runner, Duration::from_secs(5)) => response,
+            response = camera_video_stream_info::poll(
+                &node_runner,
+                camera_video_stream_info::bound_producer(&node_runner),
+                Duration::from_secs(5),
+            ) => response,
         };
         match response {
             Ok(response) => {
@@ -78,6 +82,7 @@ async fn record_video(node_runner: Arc<NodeRunner>) {
     });
     let _ = camera_set_exposure::poll(
         &node_runner,
+        camera_set_exposure::bound_producer(&node_runner),
         Duration::from_secs(5),
         camera_set_exposure::Request {
             mode: "manual".to_string(),
@@ -100,6 +105,7 @@ async fn record_video(node_runner: Arc<NodeRunner>) {
     });
     let _ = camera_set_white_balance::poll(
         &node_runner,
+        camera_set_white_balance::bound_producer(&node_runner),
         Duration::from_secs(5),
         camera_set_white_balance::Request {
             mode: "manual".to_string(),
@@ -122,6 +128,7 @@ async fn record_video(node_runner: Arc<NodeRunner>) {
     });
     let _ = camera_set_gain::poll(
         &node_runner,
+        camera_set_gain::bound_producer(&node_runner),
         Duration::from_secs(5),
         camera_set_gain::Request { value: 100 },
     )
@@ -141,6 +148,7 @@ async fn record_video(node_runner: Arc<NodeRunner>) {
     });
     let _ = camera_set_brightness::poll(
         &node_runner,
+        camera_set_brightness::bound_producer(&node_runner),
         Duration::from_secs(5),
         camera_set_brightness::Request { value: 100 },
     )
@@ -160,6 +168,7 @@ async fn record_video(node_runner: Arc<NodeRunner>) {
     });
     let _ = camera_set_contrast::poll(
         &node_runner,
+        camera_set_contrast::bound_producer(&node_runner),
         Duration::from_secs(5),
         camera_set_contrast::Request { value: 100 },
     )
@@ -245,6 +254,7 @@ where
 async fn restore_exposure(node_runner: &NodeRunner, timeout: Duration) -> bool {
     camera_set_exposure::poll(
         node_runner,
+        camera_set_exposure::bound_producer(node_runner),
         timeout,
         camera_set_exposure::Request {
             mode: "auto".to_string(),
@@ -258,6 +268,7 @@ async fn restore_exposure(node_runner: &NodeRunner, timeout: Duration) -> bool {
 async fn restore_white_balance(node_runner: &NodeRunner, timeout: Duration) -> bool {
     camera_set_white_balance::poll(
         node_runner,
+        camera_set_white_balance::bound_producer(node_runner),
         timeout,
         camera_set_white_balance::Request {
             mode: "auto".to_string(),
@@ -269,14 +280,20 @@ async fn restore_white_balance(node_runner: &NodeRunner, timeout: Duration) -> b
 }
 
 async fn restore_gain(node_runner: &NodeRunner, timeout: Duration) -> bool {
-    camera_set_gain::poll(node_runner, timeout, camera_set_gain::Request { value: 0 })
-        .await
-        .is_ok()
+    camera_set_gain::poll(
+        node_runner,
+        camera_set_gain::bound_producer(node_runner),
+        timeout,
+        camera_set_gain::Request { value: 0 },
+    )
+    .await
+    .is_ok()
 }
 
 async fn restore_brightness(node_runner: &NodeRunner, timeout: Duration) -> bool {
     camera_set_brightness::poll(
         node_runner,
+        camera_set_brightness::bound_producer(node_runner),
         timeout,
         camera_set_brightness::Request { value: 0 },
     )
@@ -287,6 +304,7 @@ async fn restore_brightness(node_runner: &NodeRunner, timeout: Duration) -> bool
 async fn restore_contrast(node_runner: &NodeRunner, timeout: Duration) -> bool {
     camera_set_contrast::poll(
         node_runner,
+        camera_set_contrast::bound_producer(node_runner),
         timeout,
         camera_set_contrast::Request { value: 0 },
     )

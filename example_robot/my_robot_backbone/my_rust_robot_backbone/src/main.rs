@@ -53,6 +53,7 @@ impl ArmHandle {
                 };
                 let handle = left_robot_arm_move_arm::ActionHandle::fire_goal(
                     node_runner,
+                    left_robot_arm_move_arm::bound_producer(node_runner),
                     GOAL_TIMEOUT,
                     request,
                     QoSProfile::Standard,
@@ -66,6 +67,7 @@ impl ArmHandle {
                 };
                 let handle = right_robot_arm_move_arm::ActionHandle::fire_goal(
                     node_runner,
+                    right_robot_arm_move_arm::bound_producer(node_runner),
                     GOAL_TIMEOUT,
                     request,
                     QoSProfile::Standard,
