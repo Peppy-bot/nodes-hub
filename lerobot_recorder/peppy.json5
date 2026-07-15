@@ -159,9 +159,6 @@
 
       // A source older than this at a sampler tick stops the episode (saved).
       state_staleness_s: { $type: "f64", $default: 0.25 },
-      // How long the last command stands in as the action after its stream
-      // lapses; past this, measured state is recorded as the action.
-      action_hold_s: { $type: "f64", $default: 0.5 },
       // start_episode is refused unless every bound camera produced a frame
       // within this window.
       camera_start_fresh_s: { $type: "f64", $default: 0.5 },
