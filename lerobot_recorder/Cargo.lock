@@ -2087,6 +2087,7 @@ dependencies = [
 [[package]]
 name = "lerobot_dataset"
 version = "0.1.0"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs?rev=c59dd77#c59dd7747112bea5b65387a2a6afb1364f200cee"
 dependencies = [
  "arrow",
  "parquet",

@@ -6,8 +6,7 @@ edition = "2024"
 [dependencies]
 peppygen = { path = ".peppy/libs/peppygen" }
 peppylib = { path = ".peppy/libs/peppylib" }
-# Path until public-peppy-libs feat/lerobot-dataset is pushed; then a git pin.
-lerobot_dataset = { path = "../../public-peppy-libs-recorder/lerobot_dataset" }
+lerobot_dataset = { git = "https://github.com/Peppy-bot/public-peppy-libs", rev = "c59dd77", package = "lerobot_dataset" }
 control_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", branch = "main", package = "control_core" }
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
