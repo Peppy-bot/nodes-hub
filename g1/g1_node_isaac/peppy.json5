@@ -1,0 +1,62 @@
+// g1_node_isaac: the Isaac Sim backend of the Unitree G1 triple. Implements the
+// same shared G1 contract surface as g1_node (real) and g1_node_mujoco (base
+// velocity in, set_posture, and state / IMU / joint / odometry telemetry out),
+// swapped at launch like openarm's isaac follower. Running requires the Isaac
+// Sim runtime (packaged as a container in the real deployment, mirroring
+// openarm's isaac node); the engine is the structural twin of the MuJoCo one and
+// carries the documented seam for the G1 USD load + policy.
+{
+  peppy_schema: "node/v1",
+  manifest: {
+    name: "g1_node_isaac",
+    tag: "v1",
+    labels: ["g1", "unitree", "humanoid", "isaac", "sim", "python"],
+    implements: [
+      { name: "g1_states", tag: "v1", link_id: "state" },
+      { name: "g1_imu", tag: "v1", link_id: "imu" },
+      { name: "g1_joint_states", tag: "v1", link_id: "joints" },
+      { name: "g1_odometry", tag: "v1", link_id: "odometry" },
+    ],
+    depends_on: {
+      contracts: [
+        { name: "g1_base_commands", tag: "v1", link_id: "commands", cardinality: "zero_or_more" },
+      ],
+    },
+  },
+  interfaces: {
+    topics: {
+      emits: [
+        { link_id: "state", name: "g1_state" },
+        { link_id: "imu", name: "g1_imu" },
+        { link_id: "joints", name: "g1_joint_states" },
+        { link_id: "odometry", name: "g1_odometry" },
+      ],
+      consumes: [
+        { link_id: "commands", name: "base_velocity_commands" },
+      ],
+    },
+    actions: {
+      exposes: [
+        {
+          name: "set_posture",
+          goal_service: {
+            request_message_format: { posture: "string" },
+            response_message_format: { accepted: "bool" },
+          },
+          result_service: {
+            response_message_format: { final_fsm_id: "u8" },
+          },
+        },
+      ],
+    },
+  },
+  execution: {
+    language: "python",
+    build_cmd: ["uv", "sync", "--no-editable"],
+    run_cmd: ["./.venv/bin/python", "-m", "g1_node_isaac"],
+    parameters: {
+      physics_rate_hz: { $type: "u32", $default: 200 },
+      state_rate_hz: { $type: "u32", $default: 50 },
+    },
+  },
+}

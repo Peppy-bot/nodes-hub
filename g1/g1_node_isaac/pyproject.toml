@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "g1_node_isaac"
+version = "0.1.0"
+description = "g1_node_isaac peppy node"
+requires-python = ">=3.11,<3.14"
+# Isaac Sim is provided by the Isaac runtime (not a pip wheel), so it is not
+# listed here; the engine imports it at runtime behind a guard.
+dependencies = ["peppygen", "peppylib", "numpy>=1.26"]
+
+[project.scripts]
+g1_node_isaac = "g1_node_isaac.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/g1_node_isaac"]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.uv.sources]
+peppygen = { path = ".peppy/libs/peppygen" }
+peppylib = { path = ".peppy/libs/peppylib" }
