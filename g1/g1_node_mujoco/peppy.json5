@@ -22,7 +22,9 @@
     ],
     depends_on: {
       contracts: [
-        { name: "g1_base_commands", tag: "v1", link_id: "commands" },
+        // zero_or_more so the sim boots and stands unpaired; a commander (or any
+        // base_velocity_commands producer) binds this slot to drive it.
+        { name: "g1_base_commands", tag: "v1", link_id: "commands", cardinality: "zero_or_more" },
       ],
     },
   },
