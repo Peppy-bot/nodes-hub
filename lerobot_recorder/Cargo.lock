@@ -2104,6 +2104,7 @@ dependencies = [
 name = "lerobot_recorder"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "control_core",
  "fs2",
  "lerobot_dataset",

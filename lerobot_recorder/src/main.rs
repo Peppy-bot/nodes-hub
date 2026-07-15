@@ -44,21 +44,10 @@ fn session_dir_name(now: SystemTime) -> String {
         .duration_since(UNIX_EPOCH)
         .expect("system clock after 1970")
         .as_secs();
-    let days = secs / 86_400;
-    let (h, m, s) = ((secs / 3600) % 24, (secs / 60) % 60, secs % 60);
-    // Civil date from the day count (Howard Hinnant's algorithm).
-    let z = days as i64 + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let (day, month) = (
-        doy - (153 * mp + 2) / 5 + 1,
-        if mp < 10 { mp + 3 } else { mp - 9 },
-    );
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    format!("{year:04}-{month:02}-{day:02}_{h:02}-{m:02}-{s:02}")
+    chrono::DateTime::from_timestamp(secs as i64, 0)
+        .expect("unix seconds are in range")
+        .format("%Y-%m-%d_%H-%M-%S")
+        .to_string()
 }
 
 /// Moves the camera slots named by `index` out of `pool` into a per-producer
@@ -126,6 +115,10 @@ fn main() -> Result<()> {
         let rgbd_color_route = take_route(&mut camera_pool, &plan.rgbd_color_index, false);
         let rgbd_depth_route = take_route(&mut camera_pool, &plan.rgbd_depth_index, true);
         let depth_route = take_route(&mut camera_pool, &plan.depth_index, true);
+        debug_assert!(
+            camera_pool.is_empty(),
+            "every camera slot is claimed by exactly one route"
+        );
 
         let mut tasks: JoinSet<&'static str> = JoinSet::new();
         macro_rules! supervised {
@@ -226,10 +219,15 @@ fn main() -> Result<()> {
         );
 
         tokio::spawn(async move {
-            match tasks.join_next().await {
-                Some(Ok(name)) => error!("task {name} exited; shutting down"),
-                Some(Err(e)) => error!("task panicked: {e}; shutting down"),
-                None => {}
+            let outcome = tasks.join_next().await;
+            // A task that finishes while the token is already cancelled is
+            // stopping in response to an external shutdown, not failing.
+            let clean = token.is_cancelled() && matches!(outcome, Some(Ok(_)));
+            match &outcome {
+                Some(Ok(name)) if clean => info!("task {name} stopped on shutdown"),
+                Some(Ok(name)) => error!("task {name} exited unexpectedly; shutting down"),
+                Some(Err(e)) => error!("supervised task panicked: {e}; shutting down"),
+                None => error!("no supervised tasks to join"),
             }
             token.cancel();
             let graceful = tokio::time::timeout(std::time::Duration::from_secs(120), async {
@@ -244,6 +242,11 @@ fn main() -> Result<()> {
             drop(command_tx);
             if let Err(e) = sink_thread.await {
                 error!("lerobot writer thread panicked: {e}");
+                std::process::exit(1);
+            }
+            if clean {
+                info!("shutdown complete");
+                std::process::exit(0);
             }
             std::process::exit(1);
         });

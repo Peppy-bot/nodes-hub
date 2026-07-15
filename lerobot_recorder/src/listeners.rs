@@ -4,7 +4,7 @@
 //! I/O ever runs here: the zenoh reception callback blocks when a subscription
 //! buffer fills, so a stalled drain would freeze every subscription.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,9 +23,12 @@ use crate::types::{CameraEncoding, FrameBuf, ProducerKey};
 const RECEIVE_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Loop shape shared by every drain: subscribe once, then route each
-/// `(producer, message)` with `$route`.
+/// `(producer, message)` with `$route`. Each message binds `$key`, the
+/// producer's [`ProducerKey`], which the route reuses (so it is built once).
+/// A producer is recorded into the provenance log only the first time this
+/// task sees it, keeping the steady state off the lock and the allocator.
 macro_rules! drain {
-    ($name:literal, $module:ident, $runner:expr, $token:expr, $log:expr, $producer:ident, $msg:ident, $route:block) => {{
+    ($name:literal, $module:ident, $runner:expr, $token:expr, $log:expr, $producer:ident, $key:ident, $msg:ident, $route:block) => {{
         let mut subscription = match $module::subscribe(&$runner).await {
             Ok(s) => s,
             Err(e) => {
@@ -33,6 +36,7 @@ macro_rules! drain {
                 return;
             }
         };
+        let mut seen: HashSet<ProducerKey> = HashSet::new();
         loop {
             let received = tokio::select! {
                 _ = $token.cancelled() => return,
@@ -40,7 +44,11 @@ macro_rules! drain {
             };
             match received {
                 Ok(Some(($producer, $msg))) => {
-                    $log.observe($name, &$producer.core_node, &$producer.instance_id);
+                    let $key = ProducerKey::from_ref(&$producer);
+                    if !seen.contains(&$key) {
+                        seen.insert($key.clone());
+                        $log.observe($name, &$producer.core_node, &$producer.instance_id);
+                    }
                     $route
                 }
                 Ok(None) => {
@@ -74,9 +82,10 @@ pub async fn state_sources(
         token,
         log,
         producer,
+        key,
         m,
         {
-            let Some(&slot) = index.get(&ProducerKey::from_ref(&producer)) else {
+            let Some(&slot) = index.get(&key) else {
                 continue;
             };
             if !all_finite(&m.positions) || !all_finite(&m.velocities) {
@@ -108,9 +117,10 @@ pub async fn action_sources(
         token,
         log,
         producer,
+        key,
         m,
         {
-            let Some(&slot) = index.get(&ProducerKey::from_ref(&producer)) else {
+            let Some(&slot) = index.get(&key) else {
                 continue;
             };
             if !all_finite(&m.positions) {
@@ -167,114 +177,29 @@ fn route_frame(
     }))));
 }
 
-pub async fn color_cameras(
-    runner: Arc<NodeRunner>,
-    route: CameraRoute,
-    log: ProducerLog,
-    token: CancellationToken,
-) {
-    drain!(
-        "video_stream",
-        color_cameras_video_stream,
-        runner,
-        token,
-        log,
-        producer,
-        m,
-        {
-            route_frame(
-                &route,
-                ProducerKey::from_ref(&producer),
-                &m.encoding,
-                m.width,
-                m.height,
-                m.frame,
-                "video_stream",
-            );
+/// Every camera drain has the same body: subscribe to one stream module and
+/// route each frame by producer. They differ only in the function name, the
+/// stream label, and the generated topic module.
+macro_rules! camera_drain {
+    ($fn:ident, $label:literal, $module:ident) => {
+        pub async fn $fn(
+            runner: Arc<NodeRunner>,
+            route: CameraRoute,
+            log: ProducerLog,
+            token: CancellationToken,
+        ) {
+            drain!($label, $module, runner, token, log, producer, key, m, {
+                route_frame(&route, key, &m.encoding, m.width, m.height, m.frame, $label);
+            })
         }
-    )
+    };
 }
 
-pub async fn rgbd_color(
-    runner: Arc<NodeRunner>,
-    route: CameraRoute,
-    log: ProducerLog,
-    token: CancellationToken,
-) {
-    drain!(
-        "color_stream",
-        rgbd_cameras_color_stream,
-        runner,
-        token,
-        log,
-        producer,
-        m,
-        {
-            route_frame(
-                &route,
-                ProducerKey::from_ref(&producer),
-                &m.encoding,
-                m.width,
-                m.height,
-                m.frame,
-                "color_stream",
-            );
-        }
-    )
-}
-
-pub async fn rgbd_depth(
-    runner: Arc<NodeRunner>,
-    route: CameraRoute,
-    log: ProducerLog,
-    token: CancellationToken,
-) {
-    drain!(
-        "depth_stream",
-        rgbd_cameras_depth_stream,
-        runner,
-        token,
-        log,
-        producer,
-        m,
-        {
-            route_frame(
-                &route,
-                ProducerKey::from_ref(&producer),
-                &m.encoding,
-                m.width,
-                m.height,
-                m.frame,
-                "depth_stream",
-            );
-        }
-    )
-}
-
-pub async fn depth_cameras(
-    runner: Arc<NodeRunner>,
-    route: CameraRoute,
-    log: ProducerLog,
-    token: CancellationToken,
-) {
-    drain!(
-        "depth_video_stream",
-        depth_cameras_video_stream,
-        runner,
-        token,
-        log,
-        producer,
-        m,
-        {
-            route_frame(
-                &route,
-                ProducerKey::from_ref(&producer),
-                &m.encoding,
-                m.width,
-                m.height,
-                m.frame,
-                "depth_video_stream",
-            );
-        }
-    )
-}
+camera_drain!(color_cameras, "video_stream", color_cameras_video_stream);
+camera_drain!(rgbd_color, "color_stream", rgbd_cameras_color_stream);
+camera_drain!(rgbd_depth, "depth_stream", rgbd_cameras_depth_stream);
+camera_drain!(
+    depth_cameras,
+    "depth_video_stream",
+    depth_cameras_video_stream
+);

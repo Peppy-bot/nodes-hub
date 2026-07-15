@@ -165,6 +165,11 @@ fn add_row(
     }
 
     let mut images = Vec::with_capacity(row.images.len());
+    debug_assert_eq!(
+        dataset_config.camera_ids().count(),
+        row.images.len(),
+        "row images match the dataset camera count"
+    );
     for (camera_id, frame) in dataset_config.camera_ids().zip(&row.images) {
         let spec = dataset_config.camera_spec(camera_id);
         let pixels = match frame.encoding {

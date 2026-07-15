@@ -110,6 +110,10 @@ pub struct SourceSchema {
     pub has_velocity: bool,
     /// True when there are no action sources: the action mirrors the state.
     pub action_is_state: bool,
+    /// Expected `positions.len()` per state source, indexed like `view.states`.
+    pub state_dims: Vec<usize>,
+    /// Expected `(width, height)` per camera, indexed like `view.cameras`.
+    pub camera_dims: Vec<(u32, u32)>,
 }
 
 impl SourceSchema {
@@ -120,12 +124,14 @@ impl SourceSchema {
     pub fn from_view(view: &CacheView, plan: &RecordingPlan) -> Result<SourceSchema, String> {
         let mut state_names = Vec::new();
         let mut velocity_names = Vec::new();
+        let mut state_dims = Vec::with_capacity(view.states.len());
         let mut has_velocity = true;
         for (i, slot) in view.states.iter().enumerate() {
             let s = slot
                 .as_ref()
                 .ok_or_else(|| format!("state source {i} has not produced yet"))?;
             let prefix = crate::config::sanitize_key(&plan.state_keys[i].instance_id);
+            state_dims.push(s.value.positions.len());
             for j in 0..s.value.positions.len() {
                 state_names.push(format!("{prefix}_j{j}"));
             }
@@ -139,6 +145,14 @@ impl SourceSchema {
         }
         if state_names.is_empty() {
             return Err("no state joints reported".to_string());
+        }
+
+        let mut camera_dims = Vec::with_capacity(view.cameras.len());
+        for (i, slot) in view.cameras.iter().enumerate() {
+            let c = slot
+                .as_ref()
+                .ok_or_else(|| format!("camera {i} has not produced yet"))?;
+            camera_dims.push((c.value.width, c.value.height));
         }
 
         let action_is_state = view.actions.is_empty();
@@ -168,6 +182,8 @@ impl SourceSchema {
             action_names,
             has_velocity,
             action_is_state,
+            state_dims,
+            camera_dims,
         })
     }
 }
@@ -188,6 +204,7 @@ pub enum SampleGap {
     StateShapeChanged(usize),
     CameraMissing(String),
     CameraStale(String),
+    CameraShapeChanged(String),
 }
 
 impl std::fmt::Display for SampleGap {
@@ -198,14 +215,16 @@ impl std::fmt::Display for SampleGap {
             SampleGap::StateShapeChanged(i) => write!(f, "state source {i} changed joint count"),
             SampleGap::CameraMissing(k) => write!(f, "camera {k} stopped producing"),
             SampleGap::CameraStale(k) => write!(f, "camera {k} silent past camera_timeout_s"),
+            SampleGap::CameraShapeChanged(k) => write!(f, "camera {k} changed resolution"),
         }
     }
 }
 
-/// Zero-order-hold sample of the cache onto one dataset frame. States must be
-/// present, fresh, and keep the shape the schema was built with. Commands are
-/// held last (a position command means "stay here"); with no action sources
-/// the action mirrors the state. Cameras hold their last frame up to timeout.
+/// Zero-order-hold sample of the cache onto one dataset frame. Every state
+/// source must be present, fresh, and keep the joint count captured at begin;
+/// every camera must be fresh and keep the resolution captured at begin.
+/// Commands are held last (a position command means "stay here"); with no
+/// action sources the action mirrors the state.
 pub fn sample(
     view: &CacheView,
     schema: &SourceSchema,
@@ -219,6 +238,9 @@ pub fn sample(
         let s = slot.as_ref().ok_or(SampleGap::StateMissing(i))?;
         if s.age(now) > config.state_staleness {
             return Err(SampleGap::StateStale(i));
+        }
+        if s.value.positions.len() != schema.state_dims[i] {
+            return Err(SampleGap::StateShapeChanged(i));
         }
         if schema.has_velocity && s.value.velocities.len() != s.value.positions.len() {
             return Err(SampleGap::StateShapeChanged(i));
@@ -234,23 +256,27 @@ pub fn sample(
     } else {
         let mut action = Vec::with_capacity(schema.action_names.len());
         for slot in &view.actions {
-            // Hold-last: use the latest command even if old; a start gate
-            // guaranteed each source produced at least once.
-            match slot.as_ref() {
-                Some(a) => action.extend(a.value.positions.iter().map(|&v| v as f32)),
-                None => return Err(SampleGap::StateMissing(usize::MAX)),
-            }
+            // Hold-last: use the latest command even if old. The start gate
+            // required every action source, and a watch slot never reverts to
+            // None, so an occupied slot is an invariant here.
+            let a = slot
+                .as_ref()
+                .expect("action source occupied: guaranteed by the start gate");
+            action.extend(a.value.positions.iter().map(|&v| v as f32));
         }
         action
     };
 
     let mut images = Vec::with_capacity(plan.cameras.len());
-    for (slot, entry) in view.cameras.iter().zip(&plan.cameras) {
+    for (i, (slot, entry)) in view.cameras.iter().zip(&plan.cameras).enumerate() {
         let frame = slot
             .as_ref()
             .ok_or_else(|| SampleGap::CameraMissing(entry.key.clone()))?;
         if frame.age(now) > config.camera_timeout {
             return Err(SampleGap::CameraStale(entry.key.clone()));
+        }
+        if (frame.value.width, frame.value.height) != schema.camera_dims[i] {
+            return Err(SampleGap::CameraShapeChanged(entry.key.clone()));
         }
         images.push(frame.value.clone());
     }
@@ -261,4 +287,123 @@ pub fn sample(
         action,
         images,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Config, StorageBackend};
+    use crate::plan::{CameraEntry, RecordingPlan};
+    use crate::types::CameraEncoding;
+    use lerobot_dataset::VideoCodec;
+    use std::collections::HashMap;
+    use std::num::NonZeroU32;
+    use std::path::PathBuf;
+
+    fn test_config() -> Config {
+        Config {
+            robot_type: "bot".into(),
+            fps: NonZeroU32::new(30).unwrap(),
+            output_root: PathBuf::from("/tmp"),
+            dataset_name: "d".into(),
+            default_task: "t".into(),
+            codec: VideoCodec::H264Libx264,
+            camera_keys: HashMap::new(),
+            record_depth: false,
+            depth_unit_m: 0.001,
+            storage: StorageBackend::Local,
+            state_staleness: Duration::from_secs(10),
+            camera_start_fresh: Duration::from_secs(10),
+            camera_timeout: Duration::from_secs(10),
+            max_episode_frames: 1000,
+            status_period: Duration::from_millis(500),
+        }
+    }
+
+    fn plan_with_cameras(cameras: Vec<CameraEntry>) -> RecordingPlan {
+        RecordingPlan {
+            state_keys: Vec::new(),
+            action_keys: Vec::new(),
+            cameras,
+            state_index: HashMap::new(),
+            action_index: HashMap::new(),
+            color_index: HashMap::new(),
+            rgbd_color_index: HashMap::new(),
+            rgbd_depth_index: HashMap::new(),
+            depth_index: HashMap::new(),
+        }
+    }
+
+    fn state_slot(positions: Vec<f64>) -> Option<Stamped<JointSample>> {
+        Some(Stamped::now(JointSample {
+            positions,
+            velocities: Vec::new(),
+        }))
+    }
+
+    fn camera_slot(width: u32, height: u32) -> Option<Stamped<Arc<FrameBuf>>> {
+        Some(Stamped::now(Arc::new(FrameBuf {
+            encoding: CameraEncoding::Rgb8,
+            width,
+            height,
+            bytes: vec![0; (width * height * 3) as usize],
+        })))
+    }
+
+    fn mirror_schema(state_dims: Vec<usize>, camera_dims: Vec<(u32, u32)>) -> SourceSchema {
+        let state_names: Vec<String> = state_dims
+            .iter()
+            .enumerate()
+            .flat_map(|(s, &n)| (0..n).map(move |j| format!("s{s}_j{j}")))
+            .collect();
+        SourceSchema {
+            action_names: state_names.clone(),
+            state_names,
+            velocity_names: Vec::new(),
+            has_velocity: false,
+            action_is_state: true,
+            state_dims,
+            camera_dims,
+        }
+    }
+
+    #[test]
+    fn sample_ok_on_matching_shapes() {
+        let plan = plan_with_cameras(vec![CameraEntry { key: "cam".into() }]);
+        let schema = mirror_schema(vec![7], vec![(640, 480)]);
+        let view = CacheView {
+            states: vec![state_slot(vec![0.0; 7])],
+            actions: Vec::new(),
+            cameras: vec![camera_slot(640, 480)],
+        };
+        let row = sample(&view, &schema, &plan, &test_config(), Instant::now()).unwrap();
+        assert_eq!(row.state.len(), 7);
+        assert_eq!(row.images.len(), 1);
+    }
+
+    #[test]
+    fn sample_flags_state_shape_change() {
+        let plan = plan_with_cameras(Vec::new());
+        let schema = mirror_schema(vec![7], Vec::new());
+        let view = CacheView {
+            states: vec![state_slot(vec![0.0; 8])],
+            actions: Vec::new(),
+            cameras: Vec::new(),
+        };
+        let gap = sample(&view, &schema, &plan, &test_config(), Instant::now()).unwrap_err();
+        assert_eq!(gap, SampleGap::StateShapeChanged(0));
+    }
+
+    #[test]
+    fn sample_flags_camera_shape_change() {
+        let plan = plan_with_cameras(vec![CameraEntry { key: "cam".into() }]);
+        let schema = mirror_schema(vec![1], vec![(640, 480)]);
+        let view = CacheView {
+            states: vec![state_slot(vec![0.0])],
+            actions: Vec::new(),
+            cameras: vec![camera_slot(800, 480)],
+        };
+        let gap = sample(&view, &schema, &plan, &test_config(), Instant::now()).unwrap_err();
+        assert_eq!(gap, SampleGap::CameraShapeChanged("cam".into()));
+    }
 }

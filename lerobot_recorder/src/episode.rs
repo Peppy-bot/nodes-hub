@@ -15,7 +15,7 @@ use tracing::{info, warn};
 use crate::config::Config;
 use crate::lerobot_sink::{CameraInit, SinkHandle};
 use crate::plan::RecordingPlan;
-use crate::snapshot::{CacheReader, SourceSchema, sample};
+use crate::snapshot::{CacheReader, CacheView, SourceSchema, sample};
 use crate::status::{Status, StatusState};
 
 pub struct StartReply {
@@ -50,6 +50,12 @@ enum State {
         episode_index: i64,
         task: String,
         frames: u64,
+    },
+    /// Terminal: a writer save failed. The node stays alive but refuses further
+    /// starts and reports the failure on `recorder_status`.
+    Error {
+        episode_index: i64,
+        message: String,
     },
 }
 
@@ -116,8 +122,14 @@ impl Manager {
     }
 
     fn publish_status(&self, message: &str) {
-        let (state, episode_index, frames, task) = match &self.state {
-            State::Idle => (StatusState::Idle, self.last_episode_index, 0, String::new()),
+        let (state, episode_index, frames, task, message) = match &self.state {
+            State::Idle => (
+                StatusState::Idle,
+                self.last_episode_index,
+                0,
+                String::new(),
+                message.to_string(),
+            ),
             State::Recording {
                 episode_index,
                 task,
@@ -127,6 +139,18 @@ impl Manager {
                 *episode_index,
                 *frames,
                 task.clone(),
+                message.to_string(),
+            ),
+            // The terminal error message is fixed; the caller's message is moot.
+            State::Error {
+                episode_index,
+                message,
+            } => (
+                StatusState::Error,
+                *episode_index,
+                0,
+                String::new(),
+                message.clone(),
             ),
         };
         self.status.send_replace(Status {
@@ -134,12 +158,12 @@ impl Manager {
             episode_index,
             frames,
             task,
-            message: message.to_string(),
+            message,
         });
     }
 
     /// First failed precondition at the moment of start, if any.
-    fn refuse_reason(&self) -> Option<String> {
+    fn refuse_reason(&self, view: &CacheView) -> Option<String> {
         let free = fs2::available_space(&self.config.output_root).unwrap_or(0);
         if free < DISK_FLOOR_BYTES {
             return Some(format!(
@@ -148,7 +172,6 @@ impl Manager {
             ));
         }
         let now = Instant::now();
-        let view = self.cache.view();
         for (i, slot) in view.states.iter().enumerate() {
             if slot.is_none() {
                 return Some(format!("state source {i} has not produced yet"));
@@ -170,8 +193,7 @@ impl Manager {
         None
     }
 
-    fn camera_inits(&self) -> Option<Vec<CameraInit>> {
-        let view = self.cache.view();
+    fn camera_inits(&self, view: &CacheView) -> Option<Vec<CameraInit>> {
         self.plan
             .cameras
             .iter()
@@ -194,16 +216,20 @@ impl Manager {
             episode_index: -1,
             message,
         };
+        if let State::Error { message, .. } = &self.state {
+            return refuse(format!("recorder halted after a writer failure: {message}"));
+        }
         if matches!(self.state, State::Recording { .. }) {
             return refuse("already recording".to_string());
         }
-        if let Some(reason) = self.refuse_reason() {
+        let view = self.cache.view();
+        if let Some(reason) = self.refuse_reason(&view) {
             self.publish_status(&reason);
             return refuse(reason);
         }
         let schema = match &self.schema {
             Some(schema) => schema.clone(),
-            None => match SourceSchema::from_view(&self.cache.view(), &self.plan) {
+            None => match SourceSchema::from_view(&view, &self.plan) {
                 Ok(schema) => {
                     self.schema = Some(schema.clone());
                     schema
@@ -211,7 +237,7 @@ impl Manager {
                 Err(e) => return refuse(e),
             },
         };
-        let Some(cameras) = self.camera_inits() else {
+        let Some(cameras) = self.camera_inits(&view) else {
             return refuse("a camera frame has zero dimensions".to_string());
         };
 
@@ -270,15 +296,18 @@ impl Manager {
                 }
             }
             Err(e) => {
-                self.state = State::Idle;
-                self.status.send_replace(Status {
-                    state: StatusState::Error,
+                warn!("episode {episode_index} save failed: {e}");
+                self.state = State::Error {
+                    episode_index,
+                    message: e.clone(),
+                };
+                self.publish_status("");
+                StopReply {
+                    accepted: false,
                     episode_index,
                     frames: 0,
-                    task: String::new(),
-                    message: e.clone(),
-                });
-                panic!("lerobot writer failed: {e}");
+                    message: e,
+                }
             }
         }
     }

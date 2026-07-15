@@ -30,8 +30,9 @@ impl ProducerLog {
         }
     }
 
-    /// Cheap on the hot path: a lookup, and an insert + notify only the first
-    /// time a producer is seen on a stream.
+    /// Off the steady-state path: drain tasks call this only the first time
+    /// they see a producer, so the lock and the two allocations here are paid
+    /// once per producer, not per message.
     pub fn observe(&self, stream: &'static str, core_node: &str, instance_id: &str) {
         let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let entry = map.entry(stream).or_default();

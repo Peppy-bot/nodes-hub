@@ -4,6 +4,7 @@
 //! any still-open chunks at session end. Uploading only immutable files avoids
 //! re-sending multi-GB parquet/mp4 that are still being appended.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -51,6 +52,8 @@ pub async fn run(
         },
     };
 
+    // Immutable chunks already mirrored on rollover; skipped by the final sync.
+    let mut uploaded: HashSet<PathBuf> = HashSet::new();
     loop {
         let event = tokio::select! {
             _ = token.cancelled() => break,
@@ -61,8 +64,12 @@ pub async fn run(
         };
         let Some(mirror) = &mirror else { continue };
         match event {
-            StorageEvent::Upload(rel) => mirror.upload_relative(&rel).await,
-            StorageEvent::Finalize => mirror.sync_all().await,
+            StorageEvent::Upload(rel) => {
+                if mirror.upload_relative(&rel).await {
+                    uploaded.insert(rel);
+                }
+            }
+            StorageEvent::Finalize => mirror.sync_all(&uploaded).await,
         }
     }
 }
@@ -75,17 +82,19 @@ struct Mirror {
 
 impl Mirror {
     /// `rel` is relative to the dataset dir (as reported by the writer).
-    async fn upload_relative(&self, rel: &Path) {
+    /// Returns whether the upload succeeded.
+    async fn upload_relative(&self, rel: &Path) -> bool {
         let local = self.dataset_dir.join(rel);
-        self.upload_file(&local, &rel.to_string_lossy()).await;
+        self.upload_file(&local, &rel.to_string_lossy()).await
     }
 
-    async fn upload_file(&self, local: &Path, key_suffix: &str) {
+    /// Returns whether the file was put successfully.
+    async fn upload_file(&self, local: &Path, key_suffix: &str) -> bool {
         let bytes = match tokio::fs::read(local).await {
             Ok(b) => b,
             Err(e) => {
                 warn!("mirror: reading {}: {e}", local.display());
-                return;
+                return false;
             }
         };
         let key = if self.prefix.is_empty() {
@@ -97,19 +106,23 @@ impl Mirror {
             Ok(p) => p,
             Err(e) => {
                 warn!("mirror: bad object key {key:?}: {e}");
-                return;
+                return false;
             }
         };
         if let Err(e) = self.store.put(&path, PutPayload::from(bytes)).await {
             warn!("mirror: uploading {key}: {e}");
+            return false;
         }
+        true
     }
 
-    /// Uploads every file under the dataset dir (metadata is rewritten each
-    /// episode, and the final open chunks are only complete now). Idempotent
-    /// puts overwrite already-mirrored immutable files harmlessly.
-    async fn sync_all(&self) {
+    /// Uploads the files the rollover path did not already mirror: rewritten
+    /// metadata, still-open chunks, and any immutable chunk whose earlier
+    /// upload failed. Chunks already mirrored (in `uploaded`) are skipped to
+    /// avoid re-sending multi-GB files.
+    async fn sync_all(&self, uploaded: &HashSet<PathBuf>) {
         let mut count = 0usize;
+        let mut skipped = 0usize;
         let mut stack = vec![self.dataset_dir.clone()];
         while let Some(dir) = stack.pop() {
             let mut entries = match tokio::fs::read_dir(&dir).await {
@@ -124,12 +137,16 @@ impl Mirror {
                 if path.is_dir() {
                     stack.push(path);
                 } else if let Ok(rel) = path.strip_prefix(&self.dataset_dir) {
+                    if uploaded.contains(rel) {
+                        skipped += 1;
+                        continue;
+                    }
                     self.upload_file(&path, &rel.to_string_lossy()).await;
                     count += 1;
                 }
             }
         }
-        info!("mirror: session sync complete, {count} files uploaded");
+        info!("mirror: session sync complete, {count} uploaded, {skipped} already mirrored");
     }
 }
 
