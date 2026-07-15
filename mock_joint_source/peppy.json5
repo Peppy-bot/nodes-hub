@@ -1,0 +1,56 @@
+// mock_joint_source: a synthetic joint_states + joint_commands producer for
+// smoke-testing consumers of the generic robot contracts (e.g.
+// lerobot_recorder). Publishes a configurable number of joints following slow
+// sine waves, with the command lagging the state slightly. Not for real use.
+{
+  peppy_schema: "node/v1",
+  manifest: {
+    name: "mock_joint_source",
+    tag: "v1",
+    labels: [
+      "mock",
+      "test",
+    ],
+    implements: [
+      {
+        name: "joint_states",
+        tag: "v1",
+        link_id: "states",
+      },
+      {
+        name: "joint_commands",
+        tag: "v1",
+        link_id: "commands",
+      }
+    ]
+  },
+  interfaces: {
+    topics: {
+      emits: [
+        {
+          link_id: "states",
+          name: "joint_states",
+        },
+        {
+          link_id: "commands",
+          name: "joint_commands",
+        }
+      ]
+    }
+  },
+  execution: {
+    language: "rust",
+    container: {
+      def_file: "apptainer.def"
+    },
+    parameters: {
+      // Number of joints to report.
+      joint_count: "u32",
+      // Publish rate (Hz) for both streams.
+      rate_hz: { $type: "u32", $default: 100 },
+      // Whether to report velocities (a velocity feature appears downstream
+      // only when every state source reports them).
+      report_velocities: { $type: "bool", $default: true }
+    }
+  }
+}

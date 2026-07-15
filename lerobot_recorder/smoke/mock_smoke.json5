@@ -1,0 +1,66 @@
+// Smoke launcher for lerobot_recorder using synthetic sources only (no robot,
+// no cameras). Two mock_joint_source instances are bound to both the state and
+// action slots, exercising cardinality (their positions concatenate in binding
+// order into observation.state / action). Cameras are zero_or_more and left
+// unbound, so this records a state-only LeRobot dataset.
+//
+// Run:
+//   peppy repo add <this nodes-hub checkout>
+//   peppy repo add <contracts checkout with joint_states/joint_commands/recorder>
+//   peppy stack launch ./lerobot_recorder/smoke/mock_smoke.json5
+// then drive an episode via the recorder's services (see smoke/README.md) and
+// load /tmp/lerobot_smoke/<ts>/smoke_dataset with Python lerobot.
+{
+  peppy_schema: "launcher/v1",
+  deployments: [
+    {
+      source: {
+        name: "mock_joint_source",
+        tag: "v1"
+      },
+      instances: [
+        {
+          instance_id: "left_arm",
+          arguments: {
+            joint_count: 7,
+            rate_hz: 100,
+            report_velocities: true
+          },
+        },
+        {
+          instance_id: "right_arm",
+          arguments: {
+            joint_count: 7,
+            rate_hz: 100,
+            report_velocities: true
+          },
+        }
+      ]
+    },
+    {
+      source: {
+        name: "lerobot_recorder",
+        tag: "v1"
+      },
+      instances: [
+        {
+          instance_id: "recorder",
+          arguments: {
+            robot_type: "mock_bimanual",
+            fps: 30,
+            output_root: "/tmp/lerobot_smoke",
+            dataset_name: "smoke_dataset",
+            default_task: "smoke test",
+            launcher_id: "mock_smoke"
+          },
+          bindings: {
+            // Both mock instances feed state and action; binding order defines
+            // the observation.state / action layout (left joints then right).
+            state_sources: ["left_arm", "right_arm"],
+            action_sources: ["left_arm", "right_arm"]
+          },
+        }
+      ]
+    }
+  ]
+}

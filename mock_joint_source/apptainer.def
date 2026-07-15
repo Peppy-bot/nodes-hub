@@ -1,0 +1,13 @@
+Bootstrap: docker
+From: tuatini/peppy-rust-cargo-base:latest
+
+%files
+    . /opt/mock_joint_source
+
+%post
+    cd /opt/mock_joint_source
+    cargo build --release
+
+%runscript
+    cd /opt/mock_joint_source
+    exec ./target/release/mock_joint_source "$@"
