@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "g1_node_mujoco"
+version = "0.1.0"
+description = "g1_node_mujoco peppy node"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+  "peppygen",
+  "peppylib",
+  "mujoco>=3.2",
+  "robot_descriptions>=1.11",
+  "numpy>=1.26",
+]
+
+[project.scripts]
+g1_node_mujoco = "g1_node_mujoco.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/g1_node_mujoco"]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.uv.sources]
+peppygen = { path = ".peppy/libs/peppygen" }
+peppylib = { path = ".peppy/libs/peppylib" }

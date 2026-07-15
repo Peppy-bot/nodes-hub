@@ -1,0 +1,74 @@
+// g1_node_mujoco: the MuJoCo backend of the Unitree G1 triple. Implements the
+// shared G1 contract surface (base velocity in, set_posture, and the state / IMU
+// / joint / odometry telemetry out) against a MuJoCo simulation of the G1,
+// swapped for g1_node (real) at launch exactly like openarm's sim followers.
+//
+// The onboard ai_sport controller has no low-level DDS analog, so the engine
+// supplies a stand-in controller: today a model-agnostic joint PD that holds the
+// G1 upright and previews base velocity kinematically, with a documented seam for
+// a pretrained unitree_rl_gym policy that makes it actually walk. No Unitree SDK
+// or DDS here: this is a pure sim node.
+{
+  peppy_schema: "node/v1",
+  manifest: {
+    name: "g1_node_mujoco",
+    tag: "v1",
+    labels: ["g1", "unitree", "humanoid", "mujoco", "sim", "python"],
+    implements: [
+      { name: "g1_states", tag: "v1", link_id: "state" },
+      { name: "g1_imu", tag: "v1", link_id: "imu" },
+      { name: "g1_joint_states", tag: "v1", link_id: "joints" },
+      { name: "g1_odometry", tag: "v1", link_id: "odometry" },
+    ],
+    depends_on: {
+      contracts: [
+        { name: "g1_base_commands", tag: "v1", link_id: "commands" },
+      ],
+    },
+  },
+  interfaces: {
+    topics: {
+      emits: [
+        { link_id: "state", name: "g1_state" },
+        { link_id: "imu", name: "g1_imu" },
+        { link_id: "joints", name: "g1_joint_states" },
+        { link_id: "odometry", name: "g1_odometry" },
+      ],
+      consumes: [
+        { link_id: "commands", name: "base_velocity_commands" },
+      ],
+    },
+    actions: {
+      exposes: [
+        {
+          name: "set_posture",
+          goal_service: {
+            request_message_format: { posture: "string" },
+            response_message_format: { accepted: "bool" },
+          },
+          result_service: {
+            response_message_format: { final_fsm_id: "u8" },
+          },
+        },
+      ],
+    },
+  },
+  execution: {
+    language: "python",
+    build_cmd: ["uv", "sync", "--no-editable"],
+    run_cmd: ["./.venv/bin/python", "-m", "g1_node_mujoco"],
+    parameters: {
+      // Physics integration rate (Hz). The MuJoCo timestep still comes from the
+      // model; this paces how often the engine steps per wall-clock second.
+      physics_rate_hz: { $type: "u32", $default: 200 },
+      // Telemetry publish rate (Hz).
+      state_rate_hz: { $type: "u32", $default: 50 },
+      // Stand-controller joint PD gains (torque injected via qfrc_applied).
+      pd_kp: { $type: "f64", $default: 150.0 },
+      pd_kd: { $type: "f64", $default: 5.0 },
+      // Open the MuJoCo passive viewer (needs a display). The deployment default
+      // is headless; a launcher sets this false to watch the robot locally.
+      headless: { $type: "bool", $default: true },
+    },
+  },
+}
