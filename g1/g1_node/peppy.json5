@@ -1,0 +1,80 @@
+// g1_node: the real-hardware Unitree G1 (base edition) driver. A thin wrapper
+// over the Unitree Python SDK: it consumes streamed base velocity commands and
+// forwards them to LocoClient.Move, exposes a set_posture action that switch-maps
+// to the LocoClient FSM transitions (Damp / StandUp / Start / Sit / ...), and
+// re-emits the robot's high-level state. The onboard ai_sport controller is the
+// motion authority; this node adds no control of its own. The MuJoCo and Isaac
+// backends implement the same contracts with a policy standing in for ai_sport.
+{
+  peppy_schema: "node/v1",
+  manifest: {
+    name: "g1_node",
+    tag: "v1",
+    labels: ["g1", "unitree", "humanoid", "python"],
+    implements: [
+      // The robot's measured high-level state (fsm / mode / battery).
+      { name: "g1_states", tag: "v1", link_id: "state" },
+    ],
+    depends_on: {
+      contracts: [
+        // Streamed planar base velocity setpoints, forwarded to LocoClient.Move.
+        { name: "g1_base_commands", tag: "v1", link_id: "commands" },
+      ],
+    },
+  },
+  interfaces: {
+    topics: {
+      emits: [
+        { link_id: "state", name: "g1_state" },
+      ],
+      consumes: [
+        { link_id: "commands", name: "base_velocity_commands" },
+      ],
+    },
+    actions: {
+      // Discrete FSM transitions. One enum action keeps the surface DRY; the
+      // handler switch-maps the posture to the matching LocoClient method and
+      // rejects transitions the current FSM state forbids.
+      exposes: [
+        {
+          name: "set_posture",
+          goal_service: {
+            request_message_format: {
+              // One of: damp, stand_up, start, sit, low_stand, high_stand,
+              // zero_torque.
+              posture: "string",
+            },
+            response_message_format: {
+              accepted: "bool",
+            },
+          },
+          result_service: {
+            response_message_format: {
+              // FSM id the robot settled into after the transition.
+              final_fsm_id: "u8",
+            },
+          },
+        },
+      ],
+    },
+  },
+  execution: {
+    language: "python",
+    build_cmd: ["uv", "sync", "--no-editable"],
+    run_cmd: ["./.venv/bin/python", "-m", "g1_node"],
+    parameters: {
+      // Network interface the CycloneDDS transport binds to (e.g. "enp2s0" for a
+      // wired G1, "lo" for a local sim domain).
+      network_interface: "string",
+      // CycloneDDS domain id. 0 addresses a real robot; a non-zero id isolates a
+      // local sim on the same host.
+      dds_domain_id: { $type: "u8", $default: 0 },
+      // Rate (Hz) at which g1_state is re-published from the SDK state channel.
+      state_rate_hz: { $type: "u32", $default: 50 },
+      // Deadman window (ms): if no base_velocity_commands arrive within this
+      // window while moving, command a zero velocity so a stalled stream cannot
+      // leave the robot walking.
+      velocity_timeout_ms: { $type: "u32", $default: 500 },
+    },
+  },
+}

@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "g1_node"
+version = "0.1.0"
+description = "g1_node peppy node"
+requires-python = ">=3.11,<3.14"
+dependencies = ["peppygen", "peppylib"]
+
+# The Unitree SDK (and its CycloneDDS C backend) is only needed to reach real
+# hardware. Kept out of the base build so codegen + node build do not depend on
+# the DDS toolchain; the real deployment installs it with `uv sync --extra hardware`.
+[project.optional-dependencies]
+hardware = ["unitree_sdk2py"]
+
+[project.scripts]
+g1_node = "g1_node.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/g1_node"]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.uv.sources]
+peppygen = { path = ".peppy/libs/peppygen" }
+peppylib = { path = ".peppy/libs/peppylib" }
+unitree_sdk2py = { git = "https://github.com/unitreerobotics/unitree_sdk2_python.git" }
