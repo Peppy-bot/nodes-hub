@@ -1,10 +1,13 @@
-// g1_node: the real-hardware Unitree G1 (base edition) driver. A thin wrapper
-// over the Unitree Python SDK: it consumes streamed base velocity commands and
-// forwards them to LocoClient.Move, exposes a set_posture action that switch-maps
-// to the LocoClient FSM transitions (Damp / StandUp / Start / Sit / ...), and
-// re-emits the robot's high-level state. The onboard ai_sport controller is the
+// g1_node: the real-hardware Unitree G1 (base edition) locomotion driver. Wraps
+// the Unitree Python SDK LocoClient (motion + FSM) and MotionSwitcherClient
+// (control-mode switch), and subscribes to the hg LowState for telemetry. It
+// consumes streamed base velocity commands (-> LocoClient.Move), exposes a
+// set_posture action (the FSM transitions) plus request/response services for
+// every other loco + mode-switch command, and emits the robot's high-level
+// state, IMU, and per-joint telemetry. The onboard ai_sport controller is the
 // motion authority; this node adds no control of its own. The MuJoCo and Isaac
-// backends implement the same contracts with a policy standing in for ai_sport.
+// backends implement the shared subset with a policy standing in for ai_sport.
+// Audio and arm gestures live in g1_audio_node / g1_arm_node.
 {
   peppy_schema: "node/v1",
   manifest: {
@@ -12,12 +15,12 @@
     tag: "v1",
     labels: ["g1", "unitree", "humanoid", "python"],
     implements: [
-      // The robot's measured high-level state (fsm / mode / battery).
       { name: "g1_states", tag: "v1", link_id: "state" },
+      { name: "g1_imu", tag: "v1", link_id: "imu" },
+      { name: "g1_joint_states", tag: "v1", link_id: "joints" },
     ],
     depends_on: {
       contracts: [
-        // Streamed planar base velocity setpoints, forwarded to LocoClient.Move.
         { name: "g1_base_commands", tag: "v1", link_id: "commands" },
       ],
     },
@@ -26,6 +29,8 @@
     topics: {
       emits: [
         { link_id: "state", name: "g1_state" },
+        { link_id: "imu", name: "g1_imu" },
+        { link_id: "joints", name: "g1_joint_states" },
       ],
       consumes: [
         { link_id: "commands", name: "base_velocity_commands" },
@@ -40,21 +45,72 @@
           name: "set_posture",
           goal_service: {
             request_message_format: {
-              // One of: damp, stand_up, start, sit, low_stand, high_stand,
-              // zero_torque.
+              // damp, squat_to_stand, lie_to_stand, start, sit, stand_to_squat,
+              // high_stand, low_stand, zero_torque.
               posture: "string",
             },
-            response_message_format: {
-              accepted: "bool",
-            },
+            response_message_format: { accepted: "bool" },
           },
           result_service: {
-            response_message_format: {
-              // FSM id the robot settled into after the transition.
-              final_fsm_id: "u8",
-            },
+            response_message_format: { final_fsm_id: "u8" },
           },
         },
+      ],
+    },
+    // Every other high-level loco + mode-switch command, as request/response.
+    // `ok` reports that the SDK call was issued without raising.
+    services: {
+      exposes: [
+        { name: "stop_move", response_message_format: { ok: "bool" } },
+        {
+          name: "move_timed",
+          request_message_format: { vx: "f64", vy: "f64", omega: "f64", duration: "f64" },
+          response_message_format: { ok: "bool" },
+        },
+        {
+          name: "balance_stand",
+          request_message_format: { balance_mode: "u8" },
+          response_message_format: { ok: "bool" },
+        },
+        {
+          name: "set_balance_mode",
+          request_message_format: { balance_mode: "u8" },
+          response_message_format: { ok: "bool" },
+        },
+        {
+          name: "set_stand_height",
+          request_message_format: { stand_height: "f64" },
+          response_message_format: { ok: "bool" },
+        },
+        {
+          name: "set_speed_mode",
+          request_message_format: { speed_mode: "u8" },
+          response_message_format: { ok: "bool" },
+        },
+        {
+          name: "set_fsm_id",
+          request_message_format: { fsm_id: "u8" },
+          response_message_format: { ok: "bool" },
+        },
+        { name: "get_fsm_id", response_message_format: { fsm_id: "u8" } },
+        {
+          name: "set_task_id",
+          request_message_format: { task_id: "i32" },
+          response_message_format: { ok: "bool" },
+        },
+        { name: "switch_to_user_ctrl", response_message_format: { ok: "bool" } },
+        {
+          name: "switch_to_internal_ctrl",
+          request_message_format: { mode: "u8" },
+          response_message_format: { ok: "bool" },
+        },
+        { name: "check_mode", response_message_format: { mode: "string" } },
+        {
+          name: "select_mode",
+          request_message_format: { name: "string" },
+          response_message_format: { ok: "bool" },
+        },
+        { name: "release_mode", response_message_format: { ok: "bool" } },
       ],
     },
   },
@@ -69,8 +125,11 @@
       // CycloneDDS domain id. 0 addresses a real robot; a non-zero id isolates a
       // local sim on the same host.
       dds_domain_id: { $type: "u8", $default: 0 },
-      // Rate (Hz) at which g1_state is re-published from the SDK state channel.
+      // Rate (Hz) at which the telemetry topics are published from LowState.
       state_rate_hz: { $type: "u32", $default: 50 },
+      // Rate (Hz) at which the live fsm id is refreshed via GetFsmId (decimated
+      // from the telemetry rate; the FSM changes far slower than joint state).
+      fsm_poll_hz: { $type: "u32", $default: 2 },
       // Deadman window (ms): if no base_velocity_commands arrive within this
       // window while moving, command a zero velocity so a stalled stream cannot
       // leave the robot walking.

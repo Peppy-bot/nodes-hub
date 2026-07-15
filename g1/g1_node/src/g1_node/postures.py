@@ -2,8 +2,8 @@
 
 Parse a wire posture string into a `Posture` once at the boundary; everything
 downstream works with the enum. The ordering guard encodes the SDK's hard
-requirement (Damp before StandUp before Start) as data, so an out-of-order goal
-is rejected rather than sent to the robot.
+requirement (damp before standing before locomotion) as data, so an out-of-order
+goal is rejected rather than sent to the robot.
 """
 
 from __future__ import annotations
@@ -13,11 +13,13 @@ from enum import Enum
 
 class Posture(Enum):
     DAMP = "damp"
-    STAND_UP = "stand_up"
+    SQUAT_TO_STAND = "squat_to_stand"
+    LIE_TO_STAND = "lie_to_stand"
     START = "start"
     SIT = "sit"
-    LOW_STAND = "low_stand"
+    STAND_TO_SQUAT = "stand_to_squat"
     HIGH_STAND = "high_stand"
+    LOW_STAND = "low_stand"
     ZERO_TORQUE = "zero_torque"
 
 
@@ -38,17 +40,31 @@ def parse_posture(raw: str) -> Posture:
         raise UnknownPosture(f"unknown posture {raw!r}; expected one of: {known}") from exc
 
 
-# Which postures may immediately precede a given target. `None` means "any state,
-# including a fresh boot" (Damp is always safe; the settled stands/sit are only
-# reachable from a powered stand). Encodes the SDK's Damp -> StandUp -> Start rule.
+# Standing configurations: any of these means the robot is upright and can take
+# a locomotion, sit, squat, or stance-height transition next.
+_STANDING: frozenset[Posture] = frozenset(
+    {
+        Posture.SQUAT_TO_STAND,
+        Posture.LIE_TO_STAND,
+        Posture.HIGH_STAND,
+        Posture.LOW_STAND,
+        Posture.START,
+    }
+)
+
+# Which postures may immediately precede a target. `None` means "any state,
+# including a fresh boot" (Damp is always safe). Encodes the SDK's ordering:
+# damp -> stand -> {locomotion, sit, squat, stance height}.
 _PRECONDITIONS: dict[Posture, frozenset[Posture] | None] = {
     Posture.DAMP: None,
     Posture.ZERO_TORQUE: frozenset({Posture.DAMP}),
-    Posture.STAND_UP: frozenset({Posture.DAMP}),
-    Posture.START: frozenset({Posture.STAND_UP}),
-    Posture.SIT: frozenset({Posture.STAND_UP, Posture.START}),
-    Posture.LOW_STAND: frozenset({Posture.STAND_UP, Posture.START}),
-    Posture.HIGH_STAND: frozenset({Posture.STAND_UP, Posture.START}),
+    Posture.SQUAT_TO_STAND: frozenset({Posture.DAMP}),
+    Posture.LIE_TO_STAND: frozenset({Posture.DAMP}),
+    Posture.START: _STANDING,
+    Posture.SIT: _STANDING,
+    Posture.STAND_TO_SQUAT: _STANDING,
+    Posture.HIGH_STAND: _STANDING,
+    Posture.LOW_STAND: _STANDING,
 }
 
 
@@ -74,27 +90,31 @@ def plan_transition(current: Posture | None, raw: str) -> Posture:
 
 
 # Posture -> LocoClient method name. Centralized so a method-name mismatch found
-# against a real robot is a one-line fix, not a scattered edit.
+# against a real robot is a one-line fix. Note the SDK has no StandUp(): standing
+# up is Squat2StandUp() or Lie2StandUp() depending on the start pose.
 POSTURE_METHOD: dict[Posture, str] = {
     Posture.DAMP: "Damp",
-    Posture.STAND_UP: "StandUp",
+    Posture.SQUAT_TO_STAND: "Squat2StandUp",
+    Posture.LIE_TO_STAND: "Lie2StandUp",
     Posture.START: "Start",
     Posture.SIT: "Sit",
-    Posture.LOW_STAND: "LowStand",
+    Posture.STAND_TO_SQUAT: "StandUp2Squat",
     Posture.HIGH_STAND: "HighStand",
+    Posture.LOW_STAND: "LowStand",
     Posture.ZERO_TORQUE: "ZeroTorque",
 }
 
 
-# Best-effort FSM id each posture settles into, used for the action result until
-# the robot's own state channel reports the live id. Values follow the SDK's
-# documented ids (Start -> 200); the sim backends reuse this map for parity.
+# Best-effort FSM id each posture settles into, used for the action result when
+# the live GetFsmId poll has not yet reported. Start -> 200 (active locomotion).
 POSTURE_FSM_ID: dict[Posture, int] = {
     Posture.DAMP: 1,
     Posture.ZERO_TORQUE: 0,
-    Posture.STAND_UP: 4,
+    Posture.SQUAT_TO_STAND: 4,
+    Posture.LIE_TO_STAND: 4,
     Posture.START: 200,
     Posture.SIT: 3,
-    Posture.LOW_STAND: 4,
+    Posture.STAND_TO_SQUAT: 2,
     Posture.HIGH_STAND: 4,
+    Posture.LOW_STAND: 4,
 }
