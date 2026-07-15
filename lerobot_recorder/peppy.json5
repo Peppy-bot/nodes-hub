@@ -1,0 +1,177 @@
+// lerobot_recorder: a robot-agnostic dataset recorder. Samples bound
+// joint_states and joint_commands sources plus any cameras onto a fixed fps
+// grid and writes a LeRobot v3 dataset per session, optionally mirrored to
+// S3/R2. The order producers are bound to a slot is the order their values
+// are concatenated into observation.state / action, and each joint_states
+// message names its own dimensions, so the dataset layout is defined entirely
+// by the launcher with no robot-specific code.
+{
+  peppy_schema: "node/v1",
+  manifest: {
+    name: "lerobot_recorder",
+    tag: "v1",
+    labels: [
+      "recorder",
+      "lerobot",
+      "dataset",
+    ],
+    // This node IS a recorder: it exposes the recorder contract's control
+    // surface (status topic + start/stop services).
+    implements: [
+      {
+        name: "recorder",
+        tag: "v1",
+        link_id: "control",
+      }
+    ],
+    depends_on: {
+      contracts: [
+        // Measured proprioception -> observation.state (+ velocity). At least
+        // one; concatenated in binding order.
+        {
+          name: "joint_states",
+          tag: "v1",
+          link_id: "state_sources",
+          cardinality: "one_or_more",
+        },
+        // Commanded targets -> action, concatenated in binding order. Optional:
+        // with no action source the recorder records measured state as the
+        // action (a follower holds position, so state is the effective target).
+        {
+          name: "joint_commands",
+          tag: "v1",
+          link_id: "action_sources",
+          cardinality: "zero_or_more",
+        },
+        // Color cameras -> observation.images.<key>. Optional and any number.
+        {
+          name: "uvc_camera",
+          tag: "v1",
+          link_id: "color_cameras",
+          cardinality: "zero_or_more",
+        },
+        // RGB-D cameras -> observation.images.<key> (color) and, when enabled,
+        // a depth feature. Optional and any number.
+        {
+          name: "rgbd_camera",
+          tag: "v1",
+          link_id: "rgbd_cameras",
+          cardinality: "zero_or_more",
+        },
+        // Depth-only cameras -> depth feature. Optional and any number.
+        {
+          name: "depth_camera",
+          tag: "v1",
+          link_id: "depth_cameras",
+          cardinality: "zero_or_more",
+        }
+      ]
+    }
+  },
+  interfaces: {
+    topics: {
+      emits: [
+        {
+          link_id: "control",
+          name: "recorder_status",
+        }
+      ],
+      consumes: [
+        {
+          link_id: "state_sources",
+          name: "joint_states",
+        },
+        {
+          link_id: "action_sources",
+          name: "joint_commands",
+        },
+        {
+          link_id: "color_cameras",
+          name: "video_stream",
+        },
+        {
+          link_id: "rgbd_cameras",
+          name: "color_stream",
+        },
+        {
+          link_id: "rgbd_cameras",
+          name: "depth_stream",
+        },
+        {
+          link_id: "depth_cameras",
+          name: "video_stream",
+        }
+      ]
+    },
+    services: {
+      exposes: [
+        {
+          link_id: "control",
+          name: "start_episode",
+        },
+        {
+          link_id: "control",
+          name: "stop_episode",
+        }
+      ]
+    }
+  },
+  execution: {
+    language: "rust",
+    container: {
+      def_file: "apptainer.def"
+    },
+    parameters: {
+      // Dataset identity written into meta/info.json (e.g. "openarm_bimanual").
+      robot_type: "string",
+      // Dataset rate (Hz). Frame timestamps are exactly k/fps; every source is
+      // sampled latest-value onto this grid.
+      fps: "u32",
+      // Root directory for session output; each run creates <root>/<utc_ts>/.
+      output_root: "string",
+      // LeRobot dataset directory name inside the session dir.
+      dataset_name: "string",
+      // Task string used when start_episode carries an empty task.
+      default_task: "string",
+      // The launcher names itself here; recorded into session.json so the
+      // launchers_hub history pins the stack a session ran under.
+      launcher_id: "string",
+
+      // "libx264" (default) or "libsvtav1" for color video.
+      video_codec: { $type: "string", $default: "libx264" },
+
+      // Optional "instance_id=key" overrides for camera dataset keys (comma
+      // separated). An unlisted bound camera uses its sanitized instance id.
+      camera_keys: { $type: "string", $default: "" },
+      // Record rgbd/depth camera depth streams as depth features (needs
+      // libx265). depth_unit_m is metres per z16 LSB (RealSense default 0.001).
+      record_depth: { $type: "bool", $default: true },
+      depth_unit_m: { $type: "f64", $default: 0.001 },
+
+      // Storage: "local" (default), "s3", or "r2". Non-local also mirrors the
+      // session to a bucket. Bucket/endpoint/prefix below; credentials come
+      // from the standard AWS env vars.
+      storage_backend: { $type: "string", $default: "local" },
+      storage_bucket: { $type: "string", $default: "" },
+      storage_endpoint: { $type: "string", $default: "" },
+      storage_region: { $type: "string", $default: "auto" },
+      storage_prefix: { $type: "string", $default: "" },
+
+      // A source older than this at a sampler tick stops the episode (saved).
+      state_staleness_s: { $type: "f64", $default: 0.25 },
+      // How long the last command stands in as the action after its stream
+      // lapses; past this, measured state is recorded as the action.
+      action_hold_s: { $type: "f64", $default: 0.5 },
+      // start_episode is refused unless every bound camera produced a frame
+      // within this window.
+      camera_start_fresh_s: { $type: "f64", $default: 0.5 },
+      // Mid-episode: a camera silent longer than this stops (saves) the episode.
+      camera_timeout_s: { $type: "f64", $default: 2.0 },
+      // Episodes auto-stop (saved) at this length: the float32 timestamp column
+      // loses k/fps precision past ~1800 s.
+      max_episode_s: { $type: "u32", $default: 1200 },
+      // recorder_status republish rate.
+      status_rate_hz: { $type: "u32", $default: 2 }
+    }
+  }
+}

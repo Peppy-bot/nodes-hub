@@ -1,0 +1,17 @@
+Bootstrap: docker
+From: tuatini/peppy-rust-cargo-base:latest
+
+%files
+    . /opt/lerobot_recorder
+
+%post
+    # ffmpeg + ffprobe: the LeRobot video pillar encodes through an ffmpeg
+    # subprocess (libx264 by default, libsvtav1 opt-in).
+    apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+        && rm -rf /var/lib/apt/lists/*
+    cd /opt/lerobot_recorder
+    cargo build --release
+
+%runscript
+    cd /opt/lerobot_recorder
+    exec ./target/release/lerobot_recorder "$@"
