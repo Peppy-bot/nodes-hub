@@ -1,0 +1,62 @@
+// g1_audio_node: real-only Unitree G1 VUI driver. Thin wrapper over the SDK
+// AudioClient, exposing text-to-speech, volume get/set, RGB LED control, and PCM
+// stream play/stop as request/response services. Real hardware only: there is no
+// sim analog, so this node stands beside the real/MuJoCo/Isaac locomotion triple
+// rather than inside it.
+{
+  peppy_schema: "node/v1",
+  manifest: {
+    name: "g1_audio_node",
+    tag: "v1",
+    labels: ["g1", "unitree", "audio", "python"],
+  },
+  interfaces: {
+    services: {
+      exposes: [
+        {
+          // Speak `text` with the given built-in speaker voice id.
+          name: "tts",
+          request_message_format: { text: "string", speaker_id: "i32" },
+          response_message_format: { ok: "bool" },
+        },
+        { name: "get_volume", response_message_format: { volume: "i32" } },
+        {
+          name: "set_volume",
+          request_message_format: { volume: "u8" },
+          response_message_format: { ok: "bool" },
+        },
+        {
+          // Head RGB LED.
+          name: "set_led",
+          request_message_format: { r: "u8", g: "u8", b: "u8" },
+          response_message_format: { ok: "bool" },
+        },
+        {
+          // Play a PCM stream. The 16 kHz mono PCM is carried base64-encoded in
+          // pcm_base64 so raw audio bytes ride a string field.
+          name: "play_audio",
+          request_message_format: {
+            app_name: "string",
+            stream_id: "string",
+            pcm_base64: "string",
+          },
+          response_message_format: { ok: "bool" },
+        },
+        {
+          name: "play_stop",
+          request_message_format: { app_name: "string" },
+          response_message_format: { ok: "bool" },
+        },
+      ],
+    },
+  },
+  execution: {
+    language: "python",
+    build_cmd: ["uv", "sync", "--no-editable"],
+    run_cmd: ["./.venv/bin/python", "-m", "g1_audio_node"],
+    parameters: {
+      network_interface: "string",
+      dds_domain_id: { $type: "u8", $default: 0 },
+    },
+  },
+}

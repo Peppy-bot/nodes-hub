@@ -1,0 +1,49 @@
+// g1_arm_node: real-only Unitree G1 arm-gesture driver. Thin wrapper over the
+// SDK G1ArmActionClient. Exposes an arm_gesture action (one of the 17 preset
+// gestures, executed by id) and a get_arm_actions service (the robot's action
+// list). Real hardware only: there is no sim analog, so this node stands beside
+// the real/MuJoCo/Isaac locomotion triple rather than inside it.
+{
+  peppy_schema: "node/v1",
+  manifest: {
+    name: "g1_arm_node",
+    tag: "v1",
+    labels: ["g1", "unitree", "arm", "python"],
+  },
+  interfaces: {
+    actions: {
+      exposes: [
+        {
+          // Execute one preset gesture. One enum action keeps the surface DRY;
+          // the handler maps the gesture name to its SDK action id.
+          name: "arm_gesture",
+          goal_service: {
+            request_message_format: {
+              // release_arm, clap, high_five, hug, heart, shake_hand, wave, ...
+              gesture: "string",
+            },
+            response_message_format: { accepted: "bool" },
+          },
+          result_service: {
+            response_message_format: { executed_action_id: "i32" },
+          },
+        },
+      ],
+    },
+    services: {
+      exposes: [
+        // The robot's available arm actions, as a JSON string.
+        { name: "get_arm_actions", response_message_format: { actions_json: "string" } },
+      ],
+    },
+  },
+  execution: {
+    language: "python",
+    build_cmd: ["uv", "sync", "--no-editable"],
+    run_cmd: ["./.venv/bin/python", "-m", "g1_arm_node"],
+    parameters: {
+      network_interface: "string",
+      dds_domain_id: { $type: "u8", $default: 0 },
+    },
+  },
+}
