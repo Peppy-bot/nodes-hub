@@ -5,7 +5,6 @@
 
 use std::sync::Arc;
 use std::sync::mpsc::SyncSender;
-use std::time::Instant;
 
 use control_core::Pacer;
 use peppylib::runtime::CancellationToken;
@@ -162,8 +161,9 @@ impl Manager {
         });
     }
 
-    /// First failed precondition at the moment of start, if any.
-    fn refuse_reason(&self, view: &CacheView) -> Option<String> {
+    /// First failed precondition at the moment of start, if any. `now_ns` is
+    /// the recorder's synchronized clock, compared against producer stamps.
+    fn refuse_reason(&self, view: &CacheView, now_ns: u64) -> Option<String> {
         let free = fs2::available_space(&self.config.output_root).unwrap_or(0);
         if free < DISK_FLOOR_BYTES {
             return Some(format!(
@@ -171,7 +171,6 @@ impl Manager {
                 free / (1024 * 1024)
             ));
         }
-        let now = Instant::now();
         for (i, slot) in view.states.iter().enumerate() {
             if slot.is_none() {
                 return Some(format!("state source {i} has not produced yet"));
@@ -182,10 +181,11 @@ impl Manager {
                 return Some("an action source has not produced yet".to_string());
             }
         }
+        let start_fresh_ns = self.config.camera_start_fresh.as_nanos() as u64;
         for (slot, entry) in view.cameras.iter().zip(&self.plan.cameras) {
             let fresh = slot
                 .as_ref()
-                .is_some_and(|f| f.age(now) <= self.config.camera_start_fresh);
+                .is_some_and(|f| f.age_ns(now_ns) <= start_fresh_ns);
             if !fresh {
                 return Some(format!("camera {} has no fresh frame", entry.key));
             }
@@ -222,8 +222,14 @@ impl Manager {
         if matches!(self.state, State::Recording { .. }) {
             return refuse("already recording".to_string());
         }
+        // Staleness gates compare producer stamps against the recorder's
+        // synchronized clock; without a ready clock no gate is meaningful.
+        let now_ns = match peppygen::clock::now_ns() {
+            Ok(now_ns) => now_ns,
+            Err(e) => return refuse(format!("recorder clock not ready: {e}")),
+        };
         let view = self.cache.view();
-        if let Some(reason) = self.refuse_reason(&view) {
+        if let Some(reason) = self.refuse_reason(&view, now_ns) {
             self.publish_status(&reason);
             return refuse(reason);
         }
@@ -322,9 +328,19 @@ impl Manager {
             return;
         };
         let episode_index = *episode_index;
+        // The clock was ready at start; losing it mid-episode is a gap like any
+        // other, ending the episode with a save.
+        let now_ns = match peppygen::clock::now_ns() {
+            Ok(now_ns) => now_ns,
+            Err(e) => {
+                warn!("episode {episode_index}: clock unavailable ({e}), stopping with save");
+                self.stop_with_message("recorder clock unavailable").await;
+                return;
+            }
+        };
         let view = self.cache.view();
         let schema = self.schema.as_ref().expect("schema set before recording");
-        match sample(&view, schema, &self.plan, &self.config, Instant::now()) {
+        match sample(&view, schema, &self.plan, &self.config, now_ns) {
             Ok(row) => {
                 if self.sink.try_frame(row).is_err() {
                     warn!("episode {episode_index}: encoder backpressure, stopping with save");

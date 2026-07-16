@@ -62,6 +62,8 @@ pub struct Config {
     pub record_depth: bool,
     pub depth_unit_m: f64,
     pub storage: StorageBackend,
+    /// Ages are producer-stamp age measured on the synchronized clock, not
+    /// local arrival age, so they hold across hosts.
     pub state_staleness: Duration,
     pub camera_start_fresh: Duration,
     pub camera_timeout: Duration,

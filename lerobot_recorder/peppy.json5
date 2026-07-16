@@ -157,12 +157,16 @@
       storage_region: { $type: "string", $default: "auto" },
       storage_prefix: { $type: "string", $default: "" },
 
-      // A source older than this at a sampler tick stops the episode (saved).
+      // Ages below are producer-stamp age on the synchronized clock (not local
+      // arrival age), so they hold across hosts.
+      // A source whose stamp is older than this at a sampler tick stops the
+      // episode (saved).
       state_staleness_s: { $type: "f64", $default: 0.25 },
       // start_episode is refused unless every bound camera produced a frame
-      // within this window.
+      // stamped within this window.
       camera_start_fresh_s: { $type: "f64", $default: 0.5 },
-      // Mid-episode: a camera silent longer than this stops (saves) the episode.
+      // Mid-episode: a camera whose latest stamp is older than this stops
+      // (saves) the episode.
       camera_timeout_s: { $type: "f64", $default: 2.0 },
       // Episodes auto-stop (saved) at this length: the float32 timestamp column
       // loses k/fps precision past ~1800 s.

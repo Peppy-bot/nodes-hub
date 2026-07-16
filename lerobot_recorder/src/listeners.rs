@@ -68,6 +68,15 @@ fn all_finite(values: &[f64]) -> bool {
     values.iter().all(|v| v.is_finite())
 }
 
+/// The producer stamp as nanoseconds since the Unix epoch, or `None` for a
+/// pre-epoch stamp (garbage a consumer must not anchor staleness on).
+fn stamp_ns(stamp: std::time::SystemTime) -> Option<u64> {
+    stamp
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_nanos() as u64)
+}
+
 pub async fn state_sources(
     runner: Arc<NodeRunner>,
     index: HashMap<ProducerKey, usize>,
@@ -95,10 +104,20 @@ pub async fn state_sources(
                 );
                 continue;
             }
-            slots[slot].send_replace(Some(Stamped::now(JointSample {
-                positions: m.positions,
-                velocities: m.velocities,
-            })));
+            let Some(stamp) = stamp_ns(m.stamp) else {
+                warn!(
+                    "joint_states from {}: pre-epoch stamp, dropping",
+                    producer.instance_id
+                );
+                continue;
+            };
+            slots[slot].send_replace(Some(Stamped::new(
+                JointSample {
+                    positions: m.positions,
+                    velocities: m.velocities,
+                },
+                stamp,
+            )));
         }
     )
 }
@@ -130,9 +149,19 @@ pub async fn action_sources(
                 );
                 continue;
             }
-            slots[slot].send_replace(Some(Stamped::now(CommandSample {
-                positions: m.positions,
-            })));
+            let Some(stamp) = stamp_ns(m.stamp) else {
+                warn!(
+                    "joint_commands from {}: pre-epoch stamp, dropping",
+                    producer.instance_id
+                );
+                continue;
+            };
+            slots[slot].send_replace(Some(Stamped::new(
+                CommandSample {
+                    positions: m.positions,
+                },
+                stamp,
+            )));
         }
     )
 }
@@ -146,9 +175,11 @@ pub struct CameraRoute {
     pub forced_depth: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn route_frame(
     route: &CameraRoute,
     producer_key: ProducerKey,
+    stamp: std::time::SystemTime,
     encoding: &str,
     width: u32,
     height: u32,
@@ -156,6 +187,10 @@ fn route_frame(
     label: &str,
 ) {
     let Some(slot) = route.by_producer.get(&producer_key) else {
+        return;
+    };
+    let Some(stamp) = stamp_ns(stamp) else {
+        warn!("{label}: pre-epoch stamp, dropping");
         return;
     };
     let enc = if route.forced_depth {
@@ -169,12 +204,15 @@ fn route_frame(
             }
         }
     };
-    slot.send_replace(Some(Stamped::now(Arc::new(FrameBuf {
-        encoding: enc,
-        width,
-        height,
-        bytes,
-    }))));
+    slot.send_replace(Some(Stamped::new(
+        Arc::new(FrameBuf {
+            encoding: enc,
+            width,
+            height,
+            bytes,
+        }),
+        stamp,
+    )));
 }
 
 /// Every camera drain has the same body: subscribe to one stream module and
@@ -189,7 +227,16 @@ macro_rules! camera_drain {
             token: CancellationToken,
         ) {
             drain!($label, $module, runner, token, log, producer, key, m, {
-                route_frame(&route, key, &m.encoding, m.width, m.height, m.frame, $label);
+                route_frame(
+                    &route,
+                    key,
+                    m.header.stamp,
+                    &m.encoding,
+                    m.width,
+                    m.height,
+                    m.frame,
+                    $label,
+                );
             })
         }
     };

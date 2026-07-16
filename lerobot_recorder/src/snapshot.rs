@@ -4,7 +4,6 @@
 //! waits for a fresher value, so no future leakage into the dataset).
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 
@@ -27,21 +26,24 @@ pub struct CommandSample {
     pub positions: Vec<f64>,
 }
 
+/// A cached sample tagged with its producer stamp: nanoseconds since the Unix
+/// epoch on the producer's peppy-synchronized clock. Staleness is measured
+/// against the recorder's own synchronized clock, so it reflects true sample
+/// age across hosts rather than local arrival time.
 #[derive(Debug, Clone)]
 pub struct Stamped<T> {
     pub value: T,
-    pub at: Instant,
+    pub stamp_ns: u64,
 }
 
 impl<T> Stamped<T> {
-    pub fn now(value: T) -> Self {
-        Stamped {
-            value,
-            at: Instant::now(),
-        }
+    pub fn new(value: T, stamp_ns: u64) -> Self {
+        Stamped { value, stamp_ns }
     }
-    pub fn age(&self, now: Instant) -> Duration {
-        now.saturating_duration_since(self.at)
+    /// Sample age in nanoseconds; a stamp slightly ahead of `now_ns` (residual
+    /// cross-host sync skew) reads as zero rather than wrapping.
+    pub fn age_ns(&self, now_ns: u64) -> u64 {
+        now_ns.saturating_sub(self.stamp_ns)
     }
 }
 
@@ -230,13 +232,13 @@ pub fn sample(
     schema: &SourceSchema,
     plan: &RecordingPlan,
     config: &Config,
-    now: Instant,
+    now_ns: u64,
 ) -> Result<FrameRow, SampleGap> {
     let mut state = Vec::with_capacity(schema.state_names.len());
     let mut velocity = Vec::new();
     for (i, slot) in view.states.iter().enumerate() {
         let s = slot.as_ref().ok_or(SampleGap::StateMissing(i))?;
-        if s.age(now) > config.state_staleness {
+        if s.age_ns(now_ns) > config.state_staleness.as_nanos() as u64 {
             return Err(SampleGap::StateStale(i));
         }
         if s.value.positions.len() != schema.state_dims[i] {
@@ -272,7 +274,7 @@ pub fn sample(
         let frame = slot
             .as_ref()
             .ok_or_else(|| SampleGap::CameraMissing(entry.key.clone()))?;
-        if frame.age(now) > config.camera_timeout {
+        if frame.age_ns(now_ns) > config.camera_timeout.as_nanos() as u64 {
             return Err(SampleGap::CameraStale(entry.key.clone()));
         }
         if (frame.value.width, frame.value.height) != schema.camera_dims[i] {
@@ -299,6 +301,7 @@ mod tests {
     use std::collections::HashMap;
     use std::num::NonZeroU32;
     use std::path::PathBuf;
+    use std::time::Duration;
 
     fn test_config() -> Config {
         Config {
@@ -334,20 +337,30 @@ mod tests {
         }
     }
 
+    /// The instant the tests sample at; slots are stamped at this time so a
+    /// fresh sample has zero age.
+    const TEST_NOW_NS: u64 = 1_000_000_000_000;
+
     fn state_slot(positions: Vec<f64>) -> Option<Stamped<JointSample>> {
-        Some(Stamped::now(JointSample {
-            positions,
-            velocities: Vec::new(),
-        }))
+        Some(Stamped::new(
+            JointSample {
+                positions,
+                velocities: Vec::new(),
+            },
+            TEST_NOW_NS,
+        ))
     }
 
     fn camera_slot(width: u32, height: u32) -> Option<Stamped<Arc<FrameBuf>>> {
-        Some(Stamped::now(Arc::new(FrameBuf {
-            encoding: CameraEncoding::Rgb8,
-            width,
-            height,
-            bytes: vec![0; (width * height * 3) as usize],
-        })))
+        Some(Stamped::new(
+            Arc::new(FrameBuf {
+                encoding: CameraEncoding::Rgb8,
+                width,
+                height,
+                bytes: vec![0; (width * height * 3) as usize],
+            }),
+            TEST_NOW_NS,
+        ))
     }
 
     fn mirror_schema(state_dims: Vec<usize>, camera_dims: Vec<(u32, u32)>) -> SourceSchema {
@@ -376,9 +389,29 @@ mod tests {
             actions: Vec::new(),
             cameras: vec![camera_slot(640, 480)],
         };
-        let row = sample(&view, &schema, &plan, &test_config(), Instant::now()).unwrap();
+        let row = sample(&view, &schema, &plan, &test_config(), TEST_NOW_NS).unwrap();
         assert_eq!(row.state.len(), 7);
         assert_eq!(row.images.len(), 1);
+    }
+
+    #[test]
+    fn sample_flags_stale_state_by_producer_stamp() {
+        let plan = plan_with_cameras(Vec::new());
+        let schema = mirror_schema(vec![1], Vec::new());
+        let staleness_ns = test_config().state_staleness.as_nanos() as u64;
+        let view = CacheView {
+            states: vec![Some(Stamped::new(
+                JointSample {
+                    positions: vec![0.0],
+                    velocities: Vec::new(),
+                },
+                TEST_NOW_NS - staleness_ns - 1,
+            ))],
+            actions: Vec::new(),
+            cameras: Vec::new(),
+        };
+        let gap = sample(&view, &schema, &plan, &test_config(), TEST_NOW_NS).unwrap_err();
+        assert_eq!(gap, SampleGap::StateStale(0));
     }
 
     #[test]
@@ -390,7 +423,7 @@ mod tests {
             actions: Vec::new(),
             cameras: Vec::new(),
         };
-        let gap = sample(&view, &schema, &plan, &test_config(), Instant::now()).unwrap_err();
+        let gap = sample(&view, &schema, &plan, &test_config(), TEST_NOW_NS).unwrap_err();
         assert_eq!(gap, SampleGap::StateShapeChanged(0));
     }
 
@@ -403,7 +436,7 @@ mod tests {
             actions: Vec::new(),
             cameras: vec![camera_slot(800, 480)],
         };
-        let gap = sample(&view, &schema, &plan, &test_config(), Instant::now()).unwrap_err();
+        let gap = sample(&view, &schema, &plan, &test_config(), TEST_NOW_NS).unwrap_err();
         assert_eq!(gap, SampleGap::CameraShapeChanged("cam".into()));
     }
 }

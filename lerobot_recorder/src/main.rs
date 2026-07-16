@@ -75,6 +75,10 @@ fn main() -> Result<()> {
         .init();
 
     NodeBuilder::new().run(|params: Parameters, runner| async move {
+        // The synchronized clock every staleness gate compares producer stamps
+        // against (sim time under a simulated clock).
+        peppygen::clock::init(&runner).await?;
+
         let config = Config::parse(&params).expect("invalid launch parameters");
         let session_dir = config.output_root.join(session_dir_name(SystemTime::now()));
         std::fs::create_dir_all(&session_dir).expect("output_root must be writable");
