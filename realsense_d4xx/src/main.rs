@@ -5,11 +5,11 @@ mod pipeline;
 use std::num::NonZeroU8;
 use std::sync::Arc;
 
-use peppygen::emitted_topics::rgbd_camera::v1::{color_stream, depth_stream};
+use peppygen::emitted_topics::rgbd_camera::v1::{depth_stream, video_stream};
 use peppygen::exposed_services::rgbd_camera::v1::{
-    color_stream_info, depth_stream_info, set_align_mode, set_color_brightness, set_color_contrast,
+    depth_stream_info, set_align_mode, set_color_brightness, set_color_contrast,
     set_color_exposure, set_color_gain, set_color_white_balance, set_depth_gain,
-    set_depth_laser_power_mw,
+    set_depth_laser_power_mw, video_stream_info,
 };
 use peppygen::{NodeBuilder, NodeRunner, Parameters, Result};
 use peppylib::runtime::CancellationToken;
@@ -100,7 +100,7 @@ fn main() -> Result<()> {
         );
 
         // Services
-        spawn_color_stream_info(
+        spawn_video_stream_info(
             node_runner.clone(),
             color_width,
             color_height,
@@ -178,10 +178,10 @@ fn spawn_emit_task(
     depth_encoding: String,
 ) {
     tokio::spawn(async move {
-        let color_publisher = match color_stream::declare_publisher(&runner).await {
+        let color_publisher = match video_stream::declare_publisher(&runner).await {
             Ok(publisher) => publisher,
             Err(e) => {
-                error!("color_stream declare_publisher: {e}");
+                error!("video_stream declare_publisher: {e}");
                 return;
             }
         };
@@ -202,12 +202,12 @@ fn spawn_emit_task(
             } = frameset;
             let align_mode = align_mode.as_str();
 
-            let color_header = color_stream::MessageHeader {
+            let color_header = video_stream::MessageHeader {
                 stamp,
                 frame_id,
                 align_mode: align_mode.to_string(),
             };
-            match color_stream::build_message(
+            match video_stream::build_message(
                 color_header,
                 color_encoding.clone(),
                 color.width,
@@ -216,10 +216,10 @@ fn spawn_emit_task(
             ) {
                 Ok(payload) => {
                     if let Err(e) = color_publisher.publish(payload).await {
-                        error!("color_stream publish: {e}");
+                        error!("video_stream publish: {e}");
                     }
                 }
-                Err(e) => error!("color_stream build_message: {e}"),
+                Err(e) => error!("video_stream build_message: {e}"),
             }
 
             let depth_header = depth_stream::MessageHeader {
@@ -246,7 +246,7 @@ fn spawn_emit_task(
     });
 }
 
-fn spawn_color_stream_info(
+fn spawn_video_stream_info(
     runner: Arc<NodeRunner>,
     width: u32,
     height: u32,
@@ -258,12 +258,12 @@ fn spawn_color_stream_info(
         loop {
             let result = tokio::select! {
                 _ = cancel.cancelled() => break,
-                result = color_stream_info::handle_next_request(&runner, |_req| {
-                    Ok(color_stream_info::Response::new(width, height, fps, encoding.clone()))
+                result = video_stream_info::handle_next_request(&runner, |_req| {
+                    Ok(video_stream_info::Response::new(width, height, fps, encoding.clone()))
                 }) => result,
             };
             if let Err(e) = result {
-                error!("color_stream_info: {e}");
+                error!("video_stream_info: {e}");
             }
         }
     });

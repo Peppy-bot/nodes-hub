@@ -1,4 +1,4 @@
-use peppygen::exposed_services::uvc_camera::v1::{
+use peppygen::exposed_services::rgb_camera::v1::{
     set_brightness, set_contrast, set_exposure, set_gain, set_white_balance, video_stream_info,
 };
 use std::sync::Arc;

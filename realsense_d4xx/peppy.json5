@@ -1,6 +1,6 @@
 // Intel RealSense D4xx-series RGB-D camera (D405, D435, D435i, D455, ...).
 // Wraps librealsense2 via realsense-rust; publishes synchronized
-// color_stream + depth_stream with a shared frame_id. Implements the shared
+// video_stream + depth_stream with a shared frame_id. Implements the shared
 // rgbd_camera contract, so consumers (and sim/mock RGB-D nodes) bind against
 // the contract rather than this concrete node. The stereo IR pair that
 // depth is derived from and the IMU streams (D435i/D455) are not exposed; add a
@@ -46,13 +46,13 @@
   interfaces: {
     topics: {
       emits: [
-        { link_id: "camera", name: "color_stream" },
+        { link_id: "camera", name: "video_stream" },
         { link_id: "camera", name: "depth_stream" },
       ],
     },
     services: {
       exposes: [
-        { link_id: "camera", name: "color_stream_info" },
+        { link_id: "camera", name: "video_stream_info" },
         { link_id: "camera", name: "depth_stream_info" },
         { link_id: "camera", name: "set_color_exposure" },
         { link_id: "camera", name: "set_color_white_balance" },

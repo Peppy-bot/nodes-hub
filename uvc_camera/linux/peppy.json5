@@ -4,7 +4,7 @@
     name: "uvc_camera_linux",
     tag: "v1",
     implements: [
-      { name: "uvc_camera", tag: "v1", link_id: "camera" },
+      { name: "rgb_camera", tag: "v1", link_id: "camera" },
     ],
     labels: [
       "uvc",
