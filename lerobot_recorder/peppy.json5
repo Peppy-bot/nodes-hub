@@ -61,6 +61,16 @@
                 },
             ],
         },
+        services: {
+            consumes: [
+                // depth_unit (meters per z16 LSB) queried once per bound rgbd
+                // producer at startup.
+                {
+                    link_id: "rgbd_cameras",
+                    name: "depth_stream_info"
+                },
+            ],
+        },
         actions: {
             exposes: [
                 {
@@ -71,22 +81,23 @@
                         },
                         response_message_format: {
                             accepted: "bool",
-                            // -1 when not accepted.
-                            episode_index: "i64",
-                            message: "string",
                         },
                     },
+                    // Published about once per second while recording (a
+                    // progress heartbeat, not a per-frame stream).
                     feedback_topic: {
                         qos_profile: "standard",
                         message_format: {
-                            frames: "u64",
+                            // Count of frames written so far, not image data.
+                            frames_recorded: "u64",
                             disk_free_bytes: "u64",
                         },
                     },
                     result_service: {
                         response_message_format: {
                             episode_index: "i64",
-                            frames: "u64",
+                            // Count of frames in the saved episode.
+                            frames_recorded: "u64",
                             // Why the episode ended; empty for an operator stop.
                             message: "string",
                         },
