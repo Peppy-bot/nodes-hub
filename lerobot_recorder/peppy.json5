@@ -78,13 +78,13 @@
                     goal_service: {
                         request_message_format: {
                             task: "string",
+                            feedback_period_s: "f64",
                         },
                         response_message_format: {
                             accepted: "bool",
                         },
                     },
-                    // Published about once per second while recording (a
-                    // progress heartbeat, not a per-frame stream).
+                    // Published while recording 
                     feedback_topic: {
                         qos_profile: "standard",
                         message_format: {
