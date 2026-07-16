@@ -96,7 +96,7 @@
         },
     },
     execution: {
-        language: "rust",
+        language: "python",
         container: {
             def_file: "apptainer.def",
         },
