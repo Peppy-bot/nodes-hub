@@ -1,0 +1,174 @@
+// ============================================================================
+// lerobot_recorder node manifest
+// ============================================================================
+// A robot-agnostic LeRobot recorder. Samples every bound joint_states source
+// plus any cameras onto a fixed fps grid and writes a LeRobot v3 dataset.
+// The order producers are bound to a slot is the order their values are
+// concatenated into observation.state, and dimension names derive from each
+// producer's instance id plus joint index, so the dataset layout is defined
+// entirely by the launcher with no robot-specific code.
+//
+// We could expand the parameters, types of cameras, also record joint *commands* too. 
+{
+    peppy_schema: "node/v1",
+    manifest: {
+        name: "lerobot_recorder",
+        tag: "v1",
+        depends_on: {
+            contracts: [
+                // Example listed at end of file
+                {
+                    name: "joint_states",
+                    tag: "v1",
+                    link_id: "state_sources",
+                    cardinality: "one_or_more",
+                },
+                {
+                    name: "uvc_camera",
+                    tag: "v1",
+                    link_id: "color_cameras",
+                    cardinality: "zero_or_more",
+                },
+                {
+                    name: "depth_camera",
+                    tag: "v1",
+                    link_id: "depth_cameras",
+                    cardinality: "zero_or_more",
+                },
+                // RGB-D cameras (e.g. D435) -> observation.images. (color) plus a depth
+                // feature (12-bit gray12le mp4 with lerobot's log quantization).
+                {
+                    name: "rgbd_camera",
+                    tag: "v1",
+                    link_id: "rgbd_cameras",
+                    cardinality: "zero_or_more",
+                },
+            ],
+        },
+    },
+    interfaces: {
+        topics: {
+            emits: [
+                {
+                    // Live recording state; also how auto-stops (stale source, camera
+                    // silent, max length, disk low) surface to the operator.
+                    name: "recorder_status",
+                    qos_profile: "sensor_data",
+                    message_format: {
+                        // "idle" | "recording" | "error".
+                        state: "string",
+                        // Current episode, or last completed when idle; -1 before the first.
+                        episode_index: "i64",
+                        frames: "u64",
+                        task: "string",
+                        // Why a start was refused / an episode auto-stopped; empty when nominal.
+                        message: "string",
+                        disk_free_bytes: "u64",
+                    },
+                },
+            ],
+            consumes: [
+                {
+                    link_id: "state_sources",
+                    name: "joint_states"
+                },
+                {
+                    link_id: "color_cameras",
+                    name: "video_stream"
+                },
+                {
+                    link_id: "rgbd_cameras",
+                    name: "color_stream"
+                },
+                {
+                    link_id: "rgbd_cameras",
+                    name: "depth_stream"
+                },
+                {
+                    link_id: "depth_cameras",
+                    name: "depth_stream"
+                },
+            ],
+        },
+        services: {
+            // This could later become a contract if we find that useful
+            exposes: [
+                {
+                    // accepted: false with a reason when already recording or a
+                    // precondition fails. Empty task selects default_task.
+                    name: "start_episode",
+                    request_message_format: {
+                        task: "string",
+                    },
+                    response_message_format: {
+                        accepted: "bool",
+                        // -1 when not accepted.
+                        episode_index: "i64",
+                        message: "string",
+                    },
+                },
+                {
+                    // save: false discards the episode's frames. accepted: false when idle.
+                    name: "stop_episode",
+                    request_message_format: {
+                        save: "bool",
+                        // Optional episode annotation ("human intervened", "dropped object");
+                        // stored in session metadata, not in the training task string. Marking
+                        // which frames were an intervention is a separate, later concern.
+                        reason: "string",
+                    },
+                    response_message_format: {
+                        accepted: "bool",
+                        episode_index: "i64",
+                        frames: "u64",
+                        message: "string",
+                    },
+                },
+            ],
+        },
+    },
+    execution: {
+        language: "rust",
+        container: {
+            def_file: "apptainer.def",
+        },
+        parameters: {
+            // Dataset identity written into meta/info.json (e.g. "openarm_bimanual").
+            robot_type: "string",
+            // Dataset rate (Hz). Frame timestamps are exactly k/fps; every source is
+            // sampled latest-value onto this grid.
+            fps: "u32",
+            // Root directory for session output; each run creates <root>/<utc_ts>/.
+            // The local copy is always written, whatever the storage backend.
+            output_root: "string",
+            // Storage: "local" (default), "s3", or "r2". Non-local mirrors the
+            // session to a bucket: immutable chunks (rolled-over parquet/mp4) upload
+            // in the background during recording, metadata syncs at session end.
+            // Credentials are read from the node process environment
+            // (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY), never from launch
+            // parameters, so no secret lands in a launcher file or repo history.
+            // R2 is S3-compatible: endpoint is the account URL, region stays "auto".
+            storage_backend: {
+                $type: "string",
+                $default: "local"
+            },
+            storage_bucket: {
+                $type: "string",
+                $default: ""
+            },
+            storage_endpoint: {
+                $type: "string",
+                $default: ""
+            },
+            storage_region: {
+                $type: "string",
+                $default: "auto"
+            },
+            // Key prefix inside the bucket, e.g. "openarm/sessions".
+            storage_prefix: {
+                $type: "string",
+                $default: ""
+            },
+        },
+    },
+}
