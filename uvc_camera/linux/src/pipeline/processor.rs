@@ -27,6 +27,35 @@ fn encode_jpeg(data: &[u8], width: u32, height: u32, _quality: u8) -> Result<Vec
     Ok(jpeg_data)
 }
 
+/// Decode YUYV 4:2:2 (one Y per pixel, U/V shared per pixel pair) to raw RGB8
+/// using BT.601 coefficients.
+fn yuyv_to_rgb(data: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
+    let expected = (width as usize) * (height as usize) * 2;
+    if data.len() != expected {
+        return Err(Error::EncodingError(format!(
+            "yuyv payload is {} bytes, expected {} for {}x{}",
+            data.len(),
+            expected,
+            width,
+            height
+        )));
+    }
+    let mut rgb = Vec::with_capacity((width as usize) * (height as usize) * 3);
+    for pair in data.chunks_exact(4) {
+        let [y0, u, y1, v] = [pair[0], pair[1], pair[2], pair[3]];
+        for y in [y0, y1] {
+            let y = f32::from(y);
+            let u = f32::from(u) - 128.0;
+            let v = f32::from(v) - 128.0;
+            let r = y + 1.402 * v;
+            let g = y - 0.344_136 * u - 0.714_136 * v;
+            let b = y + 1.772 * u;
+            rgb.extend([r, g, b].map(|c| c.clamp(0.0, 255.0) as u8));
+        }
+    }
+    Ok(rgb)
+}
+
 /// Decode MJPEG data to raw RGB8
 fn decode_jpeg(data: &[u8]) -> Result<Vec<u8>> {
     use image::ImageDecoder;
@@ -65,6 +94,7 @@ pub fn process_frame(frame: Frame, frame_id: FrameId, target_encoding: Encoding)
         Encoding::Rgb8 => frame.data().to_vec(),
         Encoding::Bgr8 => rgb_to_bgr(frame.data()), // BGR→RGB is the same channel swap
         Encoding::Mjpeg => decode_jpeg(frame.data())?,
+        Encoding::Yuyv => yuyv_to_rgb(frame.data(), frame.width(), frame.height())?,
     };
 
     // Step 2: encode RGB8 to target
@@ -72,6 +102,12 @@ pub fn process_frame(frame: Frame, frame_id: FrameId, target_encoding: Encoding)
         Encoding::Rgb8 => rgb_data,
         Encoding::Bgr8 => rgb_to_bgr(&rgb_data),
         Encoding::Mjpeg => encode_jpeg(&rgb_data, frame.width(), frame.height(), JPEG_QUALITY)?,
+        Encoding::Yuyv => {
+            return Err(Error::EncodingError(
+                "yuyv topic_encoding is passthrough-only: it requires yuyv camera_encoding"
+                    .to_string(),
+            ));
+        }
     };
 
     Ok(frame
@@ -115,6 +151,42 @@ mod tests {
         // Check JPEG header
         assert!(frame.data().starts_with(&[0xFF, 0xD8]));
         assert_eq!(frame.encoding(), Encoding::Mjpeg);
+    }
+
+    #[test]
+    fn test_process_frame_yuyv_to_rgb8() {
+        // Y=128, U=V=128 decodes to mid grey on both pixels of the pair.
+        let raw = Frame::from_capture(
+            vec![128, 128, 128, 128],
+            2,
+            1,
+            Instant::now(),
+            Encoding::Yuyv,
+        );
+        let frame = process_frame(raw, FrameId::default(), Encoding::Rgb8).unwrap();
+        assert_eq!(frame.encoding(), Encoding::Rgb8);
+        assert_eq!(frame.data(), &[128, 128, 128, 128, 128, 128]);
+    }
+
+    #[test]
+    fn test_yuyv_rejects_wrong_payload_size() {
+        assert!(yuyv_to_rgb(&[0u8; 5], 2, 1).is_err());
+    }
+
+    #[test]
+    fn test_process_frame_yuyv_passthrough() {
+        let data = vec![10u8, 20, 30, 40];
+        let raw = Frame::from_capture(data.clone(), 2, 1, Instant::now(), Encoding::Yuyv);
+        let frame = process_frame(raw, FrameId::default(), Encoding::Yuyv).unwrap();
+        assert_eq!(frame.data(), &data);
+        assert_eq!(frame.encoding(), Encoding::Yuyv);
+    }
+
+    #[test]
+    fn test_yuyv_target_requires_passthrough() {
+        let rgb = vec![255, 0, 0, 0, 255, 0, 0, 0, 255];
+        let raw = Frame::from_capture(rgb, 3, 1, Instant::now(), Encoding::Rgb8);
+        assert!(process_frame(raw, FrameId::default(), Encoding::Yuyv).is_err());
     }
 
     #[test]
