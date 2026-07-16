@@ -2,9 +2,9 @@
 // joint_states and joint_commands sources plus any cameras onto a fixed fps
 // grid and writes a LeRobot v3 dataset per session, optionally mirrored to
 // S3/R2. The order producers are bound to a slot is the order their values
-// are concatenated into observation.state / action, and each joint_states
-// message names its own dimensions, so the dataset layout is defined entirely
-// by the launcher with no robot-specific code.
+// are concatenated into observation.state / action, and dimension names derive
+// from each producer's instance id plus joint index, so the dataset layout is
+// defined entirely by the launcher with no robot-specific code.
 {
   peppy_schema: "node/v1",
   manifest: {
