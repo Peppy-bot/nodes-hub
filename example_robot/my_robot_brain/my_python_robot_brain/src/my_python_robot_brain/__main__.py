@@ -7,6 +7,8 @@ from peppygen.consumed_actions import (
 )
 from peppygen.consumed_topics import camera_video_stream as video_stream
 
+from my_python_robot_brain.frames import LatestValueMailbox
+
 
 def _log_arm_result(side: str, result) -> None:
     # get_result returns a typed terminal outcome rather than raising, so map
@@ -22,36 +24,38 @@ def _log_arm_result(side: str, result) -> None:
         print(f"[brain] {side} arm result expired before it was fetched")
 
 
-async def ai_process(node_runner: NodeRunner):
+async def read_video_frames(
+    node_runner: NodeRunner, latest_frame: LatestValueMailbox
+) -> None:
+    """Drain the camera continuously, retaining only its newest frame."""
+    token = node_runner.cancellation_token()
+
+    try:
+        subscription = await video_stream.subscribe(node_runner)
+        while not token.is_cancelled():
+            try:
+                received = await subscription.next()
+            except Exception as e:
+                print(f"Failed to receive video frame: {e}")
+                continue
+            if received is None:
+                break  # subscription closed
+            _producer, frame = received
+            latest_frame.offer(frame)
+    finally:
+        # Wake the worker if the subscription closes or this task is cancelled.
+        latest_frame.close()
+
+
+async def ai_process(node_runner: NodeRunner, latest_frame: LatestValueMailbox):
     print("[brain] AI process started, waiting for video frames...")
     token = node_runner.cancellation_token()
 
-    # Subscribe once and reuse the held subscription across frames; its buffer
-    # keeps frames published between iterations rather than dropping them.
-    subscription = await video_stream.subscribe(node_runner)
-
     while not token.is_cancelled():
-        # Wait for the next frame on the held subscription, racing the wait
-        # against shutdown so the loop returns cleanly instead of relying on the
-        # runtime's post-hook task cancellation.
-        receive = asyncio.ensure_future(subscription.next())
-        cancelled = asyncio.ensure_future(token.cancelled())
-        done, _pending = await asyncio.wait(
-            {receive, cancelled}, return_when=asyncio.FIRST_COMPLETED
-        )
-        cancelled.cancel()
-        if receive not in done:
-            receive.cancel()
+        frame = await latest_frame.get()
+        if frame is None:
             break
-        try:
-            received = receive.result()
-        except Exception as e:
-            print(f"Failed to receive video frame: {e}")
-            continue
-        if received is None:
-            break  # subscription closed
-        _producer, frame = received
-        print("[brain] Received video frame")
+        print("[brain] Received latest video frame")
 
         # Process the frame and generate fake arm positions
         fake_position = [
@@ -144,7 +148,14 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
         print("[brain] Shutdown signal received")
 
     node_runner.on_shutdown(announce_shutdown)
-    return [asyncio.create_task(ai_process(node_runner))]
+    latest_frame = LatestValueMailbox()
+    return [
+        # Return both tasks so the runtime supervises failures in either half of
+        # the reader/worker pipeline.  The reader prevents transport backpressure;
+        # the worker remains serial so frames cannot create overlapping goal sets.
+        asyncio.create_task(read_video_frames(node_runner, latest_frame)),
+        asyncio.create_task(ai_process(node_runner, latest_frame)),
+    ]
 
 
 def main():

@@ -4,6 +4,7 @@ use peppygen::{NodeBuilder, NodeRunner, Parameters, QoSProfile, Result};
 use peppylib::runtime::CancellationToken;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::watch;
 
 fn log_arm_result(side: &str, result: arm::ResultResponse) {
     // get_result returns a typed terminal outcome rather than erroring.
@@ -26,10 +27,14 @@ fn log_arm_result(side: &str, result: arm::ResultResponse) {
     }
 }
 
-async fn ai_process(node_runner: Arc<NodeRunner>, cancel_token: CancellationToken) {
-    println!("[brain] AI process started, waiting for video frames...");
-    // Subscribe once and reuse the held subscription across frames; its buffer
-    // keeps frames published between iterations rather than dropping them.
+async fn read_video_frames(
+    node_runner: Arc<NodeRunner>,
+    latest_frame: watch::Sender<Option<Arc<video_stream::Message>>>,
+    cancel_token: CancellationToken,
+) {
+    // Own the subscription in a dedicated task so action waits never stop the
+    // transport from being drained. The watch channel coalesces every burst to
+    // one Arc-backed latest frame instead of retaining a stale frame backlog.
     let mut subscription = match video_stream::subscribe(&node_runner).await {
         Ok(subscription) => subscription,
         Err(e) => {
@@ -37,40 +42,69 @@ async fn ai_process(node_runner: Arc<NodeRunner>, cancel_token: CancellationToke
             return;
         }
     };
-    loop {
-        // Select the token against the iteration so shutdown interrupts the
-        // unbounded frame wait and the multi-second goal/result awaits, not
-        // just the gap between iterations.
+    while !latest_frame.is_closed() {
         tokio::select! {
-            _ = cancel_token.cancelled() => {
-                println!("[brain] Shutdown requested, stopping AI process");
-                return;
-            }
-            _ = process_next_frame(&node_runner, &mut subscription) => {}
+            _ = cancel_token.cancelled() => return,
+            received = subscription.next() => match received {
+                Ok(Some((_producer, frame))) => {
+                    latest_frame.send_replace(Some(Arc::new(frame)));
+                }
+                Ok(None) => return,
+                Err(e) => eprintln!("Failed to receive video frame: {e}"),
+            },
         }
     }
 }
 
-async fn process_next_frame(
-    node_runner: &NodeRunner,
-    subscription: &mut video_stream::Subscription,
-) {
-    // Wait for the next video frame from the camera on the held subscription.
-    let frame = match subscription.next().await {
-        Ok(Some((_producer, frame))) => {
-            println!("[brain] Received video frame");
-            frame
-        }
-        Ok(None) => {
-            eprintln!("Video stream closed");
-            return;
-        }
-        Err(e) => {
-            eprintln!("Failed to receive video frame: {e}");
-            return;
-        }
-    };
+async fn ai_process(node_runner: Arc<NodeRunner>, cancel_token: CancellationToken) {
+    println!("[brain] AI process started, waiting for video frames...");
+    let (latest_frame_tx, mut latest_frame_rx) = watch::channel(None);
+    let reader_node_runner = Arc::clone(&node_runner);
+    let reader_cancel_token = cancel_token.clone();
+    let reader_task = tokio::spawn(async move {
+        read_video_frames(reader_node_runner, latest_frame_tx, reader_cancel_token).await;
+    });
 
+    loop {
+        let changed = tokio::select! {
+            _ = cancel_token.cancelled() => {
+                println!("[brain] Shutdown requested, stopping AI process");
+                break;
+            }
+            changed = latest_frame_rx.changed() => changed,
+        };
+        if changed.is_err() {
+            eprintln!("Video stream closed");
+            break;
+        }
+
+        // `borrow_and_update` marks every frame published so far as observed;
+        // if several arrived during the prior action, only the newest remains.
+        let Some(frame) = latest_frame_rx.borrow_and_update().clone() else {
+            continue;
+        };
+        println!("[brain] Received latest video frame");
+
+        // Shutdown still interrupts multi-second goal/result waits while the
+        // independent reader continues draining frames in the other branch.
+        tokio::select! {
+            _ = cancel_token.cancelled() => {
+                println!("[brain] Shutdown requested, stopping AI process");
+                break;
+            }
+            _ = process_frame(&node_runner, frame.as_ref()) => {}
+        }
+    }
+
+    reader_task.abort();
+    if let Err(e) = reader_task.await
+        && !e.is_cancelled()
+    {
+        eprintln!("Video frame reader failed: {e}");
+    }
+}
+
+async fn process_frame(node_runner: &NodeRunner, frame: &video_stream::Message) {
     // Process the frame and generate fake arm positions
     let fake_position = [
         frame.frame[0] as i32,
