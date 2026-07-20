@@ -14,6 +14,7 @@
 use std::fmt::Write as _;
 use std::time::Instant;
 
+use zed_camera::DepthSettings;
 use zed_camera::cv_depth::CvDepth;
 
 const MODES: [(&str, u32, u32); 3] = [
@@ -21,7 +22,6 @@ const MODES: [(&str, u32, u32); 3] = [
     ("hd720", 1280, 720),
     ("hd1080", 1920, 1080),
 ];
-const NUM_DISPARITIES: u32 = 96;
 const BLOCK_SIZE: u32 = 3;
 const DOWNSCALES: [u32; 2] = [1, 2];
 const FLAT_DISPARITY: f64 = 24.0;
@@ -29,6 +29,12 @@ const RAMP_MIN: f64 = 8.0;
 const RAMP_MAX: f64 = 40.0;
 const MARGIN: usize = 8;
 const IDEAL_BASELINE: f64 = 63.0;
+
+/// The floor that derives the reference 96-disparity search at this geometry
+/// (ideal fx = eye_width), keeping runs comparable across modes.
+fn min_depth_for_96_disparities(eye_width: u32, downscale: u32) -> f64 {
+    (eye_width / downscale) as f64 * IDEAL_BASELINE / 95.5 / 1000.0
+}
 
 #[derive(Clone, Copy)]
 enum Scene {
@@ -108,7 +114,18 @@ fn out_size(width: u32, height: u32, downscale: u32) -> (usize, usize) {
 }
 
 fn open(calib: &std::path::Path, width: u32, height: u32, downscale: u32) -> CvDepth {
-    CvDepth::create(calib, width, height, NUM_DISPARITIES, BLOCK_SIZE, downscale).expect("cv_depth")
+    CvDepth::create(
+        calib,
+        width,
+        height,
+        DepthSettings::new(
+            min_depth_for_96_disparities(width, downscale),
+            BLOCK_SIZE,
+            downscale,
+        )
+        .expect("settings"),
+    )
+    .expect("cv_depth")
 }
 
 fn main() {

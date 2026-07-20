@@ -1,46 +1,15 @@
-//! Per-serial factory calibration, downloaded once from Stereolabs and cached
-//! next to the node's working directory. The conf is the authoritative
-//! geometry for this exact unit; rectification is only as good as this file.
+//! Per-serial factory calibration parsing. The .conf is the authoritative
+//! geometry for one exact unit (published at
+//! `https://calib.stereolabs.com/?SN=<serial>`), provided to the node as a
+//! file; rectification is only as good as this file.
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
-
-const CALIBRATION_URL: &str = "https://calib.stereolabs.com/?SN=";
-
-/// The cached calibration file for `serial`, downloading it on first use.
-pub fn ensure_calibration(cache_dir: &Path, serial: i32) -> Result<PathBuf, String> {
-    let path = cache_dir.join(format!("zed_SN{serial}.conf"));
-    if is_valid_conf(&path) {
-        return Ok(path);
-    }
-    fs::create_dir_all(cache_dir).map_err(|e| format!("create {}: {e}", cache_dir.display()))?;
-
-    let url = format!("{CALIBRATION_URL}{serial}");
-    let body = ureq::get(&url)
-        .call()
-        .map_err(|e| format!("download {url}: {e}"))?
-        .into_string()
-        .map_err(|e| format!("read calibration body: {e}"))?;
-    if !looks_like_conf(&body) {
-        return Err(format!(
-            "calibration server returned no calibration for serial {serial}"
-        ));
-    }
-    fs::write(&path, &body).map_err(|e| format!("write {}: {e}", path.display()))?;
-    Ok(path)
-}
-
-fn is_valid_conf(path: &Path) -> bool {
-    fs::read_to_string(path).is_ok_and(|s| looks_like_conf(&s))
-}
-
-fn looks_like_conf(body: &str) -> bool {
-    body.contains("[LEFT_CAM_") && body.contains("[STEREO]")
-}
+use std::path::Path;
 
 /// One eye's pinhole intrinsics and OpenCV distortion (k1, k2, p1, p2, k3);
 /// the ZED conf carries no tangential terms, so p1/p2 stay zero.
+#[derive(Debug)]
 pub struct CamConf {
     pub fx: f64,
     pub fy: f64,
@@ -57,6 +26,7 @@ pub struct CamConf {
 /// rectification recipe reads it: per-eye intrinsics, the baseline, the
 /// resolution-suffixed translation offsets (absent in shipping confs, hence
 /// zero), and the (rx, cv, rz) inter-eye rotation vector.
+#[derive(Debug)]
 pub struct StereoConf {
     pub left: CamConf,
     pub right: CamConf,
@@ -79,9 +49,9 @@ pub fn resolution_key(eye_width: u32) -> &'static str {
 }
 
 impl StereoConf {
-    /// Parse the calibration for one resolution from a cached conf.
+    /// Parse the calibration for one resolution from a conf file.
     pub fn load(path: &Path, res_key: &str) -> Result<Self, String> {
-        let text = fs::read_to_string(path).map_err(|e| e.to_string())?;
+        let text = fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
         let ini = parse_ini(&text);
         let res = res_key.to_ascii_lowercase();
         let get = |section: &str, key: &str| -> Option<f64> {
@@ -120,19 +90,24 @@ impl StereoConf {
 
 /// Flatten an INI conf to lowercased (section, key) -> value for numeric keys.
 fn parse_ini(text: &str) -> HashMap<(String, String), f64> {
-    let mut out = HashMap::new();
-    let mut section = String::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
-            section = name.trim().to_ascii_lowercase();
-        } else if let Some((key, value)) = line.split_once('=')
-            && let Ok(value) = value.trim().parse::<f64>()
-        {
-            out.insert((section.clone(), key.trim().to_ascii_lowercase()), value);
-        }
-    }
-    out
+    text.lines()
+        .map(str::trim)
+        .fold(
+            (String::new(), HashMap::new()),
+            |(section, mut values), line| {
+                if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+                    (name.trim().to_ascii_lowercase(), values)
+                } else {
+                    if let Some((key, value)) = line.split_once('=')
+                        && let Ok(value) = value.trim().parse::<f64>()
+                    {
+                        values.insert((section.clone(), key.trim().to_ascii_lowercase()), value);
+                    }
+                    (section, values)
+                }
+            },
+        )
+        .1
 }
 
 #[cfg(test)]
@@ -140,11 +115,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn conf_sniffing_rejects_html_and_accepts_ini() {
-        assert!(!looks_like_conf("<html>301 Moved Permanently</html>"));
-        assert!(looks_like_conf(
-            "[LEFT_CAM_HD]\nfx=1\n[STEREO]\nBaseline=63\n"
-        ));
+    fn load_rejects_a_conf_missing_its_geometry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.conf");
+        fs::write(&path, "<html>301 Moved Permanently</html>").unwrap();
+        assert!(
+            StereoConf::load(&path, "HD")
+                .unwrap_err()
+                .contains("missing fx")
+        );
     }
 
     #[test]
@@ -153,9 +132,8 @@ mod tests {
                     k1=-0.03\nk2=-0.004\nk3=0.037\nk4=-0.02\n\
                     [RIGHT_CAM_HD]\nfx=770.8\nfy=770.6\ncx=644.6\ncy=345.6\nk1=-0.03\nk2=-0.004\nk3=0.02\n\
                     [STEREO]\nBaseline=62.902\nTY=0.062\nTZ=-0.0006\nRX_HD=-0.0023\nCV_HD=0.0046\nRZ_HD=-0.0005\n";
-        let dir = std::env::temp_dir().join("zed_conf_parse_test");
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("SN.conf");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("SN.conf");
         fs::write(&path, conf).unwrap();
 
         let s = StereoConf::load(&path, resolution_key(1280)).unwrap();

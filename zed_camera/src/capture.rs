@@ -1,16 +1,7 @@
 //! ZED USB capture over the `v4l` crate: side-by-side YUYV mmap streaming
-//! plus standard V4L2 controls, in safe Rust.
-//!
-//! The camera's proprietary UVC extension-unit protocol (manual exposure and
-//! gain over ISP registers, serial via SPI flash) is deliberately not used:
-//! the device runs auto exposure, and the serial that keys the factory
-//! calibration comes from the USB descriptor of the ZED's HID sibling
-//! ([`zed_serial`]); the video interface carries no serial. A hardware-validated
-//! XU port exists in project history should manual exposure ever be needed.
-//!
-//! Coexistence note: the opencv crate must enable its `clang-runtime`
-//! feature, or its binding generator fails against the `clang-sys` that
-//! `v4l`'s bindgen brings into the build graph.
+//! plus standard V4L2 controls, in safe Rust. The unit serial comes from the
+//! USB descriptor of the ZED's HID sibling ([`zed_serial`]); the video
+//! interface carries none. The device runs auto exposure.
 
 use std::io::ErrorKind;
 use std::path::Path;

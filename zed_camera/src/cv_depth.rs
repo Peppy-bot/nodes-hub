@@ -20,6 +20,7 @@ use opencv::imgproc::{
 use opencv::prelude::MatTraitConstManual;
 
 use crate::calibration::{StereoConf, resolution_key};
+use crate::depth_settings::{DepthSettings, num_disparities_for};
 
 /// Millimetre depth for a fixed geometry, backed by OpenCV.
 pub struct CvDepth {
@@ -34,6 +35,7 @@ pub struct CvDepth {
     fx: f64,
     baseline_mm: f64,
     numerator: f64,
+    num_disparities: u32,
 }
 
 impl CvDepth {
@@ -41,16 +43,13 @@ impl CvDepth {
         calib_path: &Path,
         eye_width: u32,
         eye_height: u32,
-        num_disparities: u32,
-        block_size: u32,
-        downscale: u32,
+        settings: DepthSettings,
     ) -> Result<Self, String> {
-        let block = (block_size.max(3) | 1) as i32;
-        let num_disp = num_disparities.next_multiple_of(16) as i32;
-        let downscale = downscale.max(1) as i32;
+        let block = settings.block_size() as i32;
+        let downscale = settings.downscale() as i32;
         let key = resolution_key(eye_width);
         let conf = StereoConf::load(calib_path, key)
-            .map_err(|e| format!("read calibration {}: {e}", calib_path.display()))?;
+            .map_err(|e| format!("calibration {}: {e}", calib_path.display()))?;
 
         let (w, h) = (eye_width as i32, eye_height as i32);
         let size = Size::new(w, h);
@@ -128,10 +127,17 @@ impl CvDepth {
         )
         .map_err(cv)?;
 
-        // Rectified focal length is P1(0,0); disparity to depth uses it.
+        // Rectified focal length is P1(0,0); disparity to depth uses it, and
+        // the disparity search range derives from it and the requested floor.
         let fx = *p1.at_2d::<f64>(0, 0).map_err(cv)?;
         let baseline_mm = conf.baseline;
         let numerator = fx / downscale as f64 * baseline_mm * 16.0;
+        let num_disp = num_disparities_for(
+            fx / downscale as f64,
+            baseline_mm,
+            settings.min_depth_m(),
+            (w / downscale) as u32,
+        )? as i32;
 
         let p1_penalty = 24 * block * block;
         let matcher = StereoSGBM::create(
@@ -161,11 +167,22 @@ impl CvDepth {
             fx,
             baseline_mm,
             numerator,
+            num_disparities: num_disp as u32,
         })
     }
 
     pub fn fx(&self) -> f64 {
         self.fx
+    }
+
+    /// The derived disparity search range.
+    pub fn num_disparities(&self) -> u32 {
+        self.num_disparities
+    }
+
+    /// The nearest depth the derived search range can measure.
+    pub fn min_depth_floor_mm(&self) -> f64 {
+        self.fx / self.downscale as f64 * self.baseline_mm / self.num_disparities as f64
     }
 
     pub fn baseline_mm(&self) -> f64 {
@@ -226,11 +243,15 @@ impl CvDepth {
         let mut right_gray = Mat::default();
         imgproc::cvt_color_def(&left_rect, &mut left_gray, COLOR_BGR2GRAY).map_err(cv)?;
         imgproc::cvt_color_def(&right_rect, &mut right_gray, COLOR_BGR2GRAY).map_err(cv)?;
-        if self.downscale > 1 {
+        let (left_gray, right_gray) = if self.downscale > 1 {
             let small = Size::new(w / self.downscale, h / self.downscale);
-            resize_area(&mut left_gray, small)?;
-            resize_area(&mut right_gray, small)?;
-        }
+            (
+                downscaled(&left_gray, small)?,
+                downscaled(&right_gray, small)?,
+            )
+        } else {
+            (left_gray, right_gray)
+        };
 
         let mut disparity16 = Mat::default();
         self.matcher
@@ -292,9 +313,8 @@ fn remap_linear(
     .map_err(cv)
 }
 
-fn resize_area(gray: &mut Mat, size: Size) -> Result<(), String> {
+fn downscaled(gray: &Mat, size: Size) -> Result<Mat, String> {
     let mut out = Mat::default();
     imgproc::resize(gray, &mut out, size, 0.0, 0.0, INTER_AREA).map_err(cv)?;
-    *gray = out;
-    Ok(())
+    Ok(out)
 }

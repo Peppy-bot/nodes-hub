@@ -1,15 +1,12 @@
 //! Stereolabs ZED as an rgbd_camera producer without the ZED SDK.
 //!
-//! A blocking pipeline thread owns the frame path: grab side-by-side YUYV,
-//! rectify through the per-serial factory calibration, publish the rectified
-//! left eye as video_stream and stereo-matched depth (millimeters, z16) as
-//! depth_stream. Depth lives in the rectified-left frame, so the pair is
-//! permanently color-aligned. Capture is the zed_stereo crate's v4l layer;
-//! rectification and matching run through the opencv crate (StereoSGBM)
-//! inside the pipeline thread. The pipeline loop and the control services
-//! share one capture handle behind a mutex, so a control call waits at most
-//! one frame. The camera runs auto exposure; manual exposure needs the
-//! vendor XU protocol the capture layer deliberately dropped.
+//! A blocking pipeline thread owns the frame path: grab side-by-side YUYV
+//! through the library's capture layer, rectify through the launcher-provided
+//! factory calibration, publish the rectified left eye as video_stream and
+//! stereo-matched depth (millimeters, z16) as depth_stream. Depth lives in
+//! the rectified-left frame, so the pair is permanently color-aligned. The
+//! pipeline loop and the control services share one capture handle behind a
+//! mutex, so a control call waits at most one frame.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -23,17 +20,15 @@ use peppygen::{NodeBuilder, NodeRunner, Parameters, Result};
 use peppylib::runtime::CancellationToken;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
-use zed_camera::Resolution;
-use zed_camera::calibration::ensure_calibration;
 use zed_camera::capture::{
     CID_AWB_AUTO, CID_AWB_TEMPERATURE, CID_BRIGHTNESS, CID_CONTRAST, CID_GAIN, Capture, Grab,
     device_index, zed_serial,
 };
 use zed_camera::cv_depth::CvDepth;
+use zed_camera::{DepthSettings, Resolution};
 
 const GRAB_TIMEOUT: Duration = Duration::from_millis(500);
 const EMIT_CHANNEL_CAPACITY: usize = 2;
-const CALIBRATION_DIR: &str = "calibration";
 const DEPTH_UNIT_M_PER_LSB: f32 = 0.001;
 const COLOR_ENCODING: &str = "rgb8";
 const DEPTH_ENCODING: &str = "z16";
@@ -48,15 +43,13 @@ struct PipelineConfig {
     dev_id: usize,
     resolution: Resolution,
     fps: u32,
-    num_disparities: u32,
-    block_size: u32,
-    downscale: u32,
+    calibration_path: std::path::PathBuf,
+    depth: DepthSettings,
 }
 
 /// What the pipeline thread reports back once the camera and matcher are up.
 struct Opened {
     camera: Camera,
-    serial: i32,
     eye_width: u32,
     eye_height: u32,
     depth_width: u32,
@@ -92,13 +85,18 @@ fn main() -> Result<()> {
         let fps_u8 = u8::try_from(fps).map_err(|_| {
             std::io::Error::other(format!("video.frame_rate {fps} does not fit u8"))
         })?;
+        let depth = DepthSettings::new(
+            params.depth.min_depth_m,
+            params.depth.block_size,
+            params.depth.downscale,
+        )
+        .map_err(|e| std::io::Error::other(format!("depth: {e}")))?;
         let config = PipelineConfig {
             dev_id,
             resolution,
             fps,
-            num_disparities: params.depth.num_disparities,
-            block_size: params.depth.block_size,
-            downscale: params.depth.downscale.max(1),
+            calibration_path: std::path::PathBuf::from(&params.calibration_path),
+            depth,
         };
 
         // The synchronized clock stamping every emission.
@@ -126,7 +124,6 @@ fn main() -> Result<()> {
 
         let Opened {
             camera,
-            serial,
             eye_width,
             eye_height,
             depth_width,
@@ -136,7 +133,7 @@ fn main() -> Result<()> {
             .map_err(|_| std::io::Error::other("pipeline exited before opening the camera"))?
             .map_err(std::io::Error::other)?;
         info!(
-            "zed_camera serial={serial} {resolution} ({eye_width}x{eye_height}) @ {fps} fps, \
+            "zed_camera {resolution} ({eye_width}x{eye_height}) @ {fps} fps, \
              depth {depth_width}x{depth_height}"
         );
 
@@ -225,19 +222,21 @@ fn run_pipeline(
 }
 
 fn open_pipeline(config: &PipelineConfig) -> std::result::Result<(CvDepth, Opened), String> {
-    let serial = zed_serial()?;
+    // Best-effort unit identification for the logs; calibration comes from
+    // the launcher-provided file.
+    match zed_serial() {
+        Ok(serial) => info!("zed unit serial {serial}"),
+        Err(e) => info!("zed serial unavailable: {e}"),
+    }
     let capture = Capture::open(config.dev_id, config.resolution, config.fps)?;
     let (full_width, height) = capture.frame_size();
     let (eye_width, eye_height) = (full_width / 2, height);
 
-    let calib_path = ensure_calibration(std::path::Path::new(CALIBRATION_DIR), serial)?;
     let matcher = CvDepth::create(
-        &calib_path,
+        &config.calibration_path,
         eye_width,
         eye_height,
-        config.num_disparities,
-        config.block_size,
-        config.downscale,
+        config.depth,
     )?;
     let (depth_width, depth_height) = matcher.out_size();
 
@@ -245,7 +244,6 @@ fn open_pipeline(config: &PipelineConfig) -> std::result::Result<(CvDepth, Opene
         matcher,
         Opened {
             camera: Arc::new(Mutex::new(capture)),
-            serial,
             eye_width,
             eye_height,
             depth_width,
@@ -388,9 +386,8 @@ fn apply_control(camera: &Camera, cid: u32, value: i32) -> (bool, String, i32) {
     }
 }
 
-/// The ZED exposes no exposure control over UVC: it runs auto exposure, and
-/// manual exposure lives behind the vendor XU protocol this node does not
-/// speak. The service answers honestly instead of pretending to act.
+/// The ZED runs auto exposure and exposes no exposure control over UVC; the
+/// service reports that capability honestly instead of pretending to act.
 fn spawn_set_color_exposure(runner: Arc<NodeRunner>) {
     tokio::spawn(async move {
         let cancel = runner.cancellation_token().clone();
@@ -464,65 +461,48 @@ fn spawn_set_color_white_balance(runner: Arc<NodeRunner>, camera: Camera) {
     });
 }
 
-fn spawn_set_color_gain(runner: Arc<NodeRunner>, camera: Camera) {
-    tokio::spawn(async move {
-        let cancel = runner.cancellation_token().clone();
-        loop {
-            let camera = camera.clone();
-            let result = tokio::select! {
-                _ = cancel.cancelled() => break,
-                result = set_color_gain::handle_next_request(&runner, move |req| {
-                    let (ok, mut message, current) =
-                        apply_control(&camera, CID_GAIN, req.data.value);
-                    if ok {
-                        message = "uvc gain (zed range 0..8)".to_string();
+/// One service driving a single V4L2 control by CID; a non-empty ok_message
+/// annotates successful writes (e.g. the device's value range).
+macro_rules! spawn_cid_control_service {
+    ($fn_name:ident, $service:ident, $cid:expr, $ok_message:expr) => {
+        fn $fn_name(runner: Arc<NodeRunner>, camera: Camera) {
+            tokio::spawn(async move {
+                let cancel = runner.cancellation_token().clone();
+                loop {
+                    let camera = camera.clone();
+                    let result = tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        result = $service::handle_next_request(&runner, move |req| {
+                            let (ok, message, current) =
+                                apply_control(&camera, $cid, req.data.value);
+                            let message = if ok { $ok_message.to_string() } else { message };
+                            Ok($service::Response::new(ok, message, current))
+                        }) => result,
+                    };
+                    if let Err(e) = result {
+                        error!("{}: {e}", stringify!($service));
                     }
-                    Ok(set_color_gain::Response::new(ok, message, current))
-                }) => result,
-            };
-            if let Err(e) = result {
-                error!("set_color_gain: {e}");
-            }
+                }
+            });
         }
-    });
+    };
 }
 
-fn spawn_set_color_brightness(runner: Arc<NodeRunner>, camera: Camera) {
-    tokio::spawn(async move {
-        let cancel = runner.cancellation_token().clone();
-        loop {
-            let camera = camera.clone();
-            let result = tokio::select! {
-                _ = cancel.cancelled() => break,
-                result = set_color_brightness::handle_next_request(&runner, move |req| {
-                    let (ok, message, current) =
-                        apply_control(&camera, CID_BRIGHTNESS, req.data.value);
-                    Ok(set_color_brightness::Response::new(ok, message, current))
-                }) => result,
-            };
-            if let Err(e) = result {
-                error!("set_color_brightness: {e}");
-            }
-        }
-    });
-}
-
-fn spawn_set_color_contrast(runner: Arc<NodeRunner>, camera: Camera) {
-    tokio::spawn(async move {
-        let cancel = runner.cancellation_token().clone();
-        loop {
-            let camera = camera.clone();
-            let result = tokio::select! {
-                _ = cancel.cancelled() => break,
-                result = set_color_contrast::handle_next_request(&runner, move |req| {
-                    let (ok, message, current) =
-                        apply_control(&camera, CID_CONTRAST, req.data.value);
-                    Ok(set_color_contrast::Response::new(ok, message, current))
-                }) => result,
-            };
-            if let Err(e) = result {
-                error!("set_color_contrast: {e}");
-            }
-        }
-    });
-}
+spawn_cid_control_service!(
+    spawn_set_color_gain,
+    set_color_gain,
+    CID_GAIN,
+    "uvc gain (zed range 0..8)"
+);
+spawn_cid_control_service!(
+    spawn_set_color_brightness,
+    set_color_brightness,
+    CID_BRIGHTNESS,
+    ""
+);
+spawn_cid_control_service!(
+    spawn_set_color_contrast,
+    set_color_contrast,
+    CID_CONTRAST,
+    ""
+);

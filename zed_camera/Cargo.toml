@@ -16,7 +16,6 @@ capture = ["dep:v4l"]
 cv = ["dep:opencv"]
 
 [dependencies]
-ureq = "2"
 v4l = { version = "0.14", optional = true }
 opencv = { version = "0.99", optional = true, default-features = false, features = [
     "calib3d",
