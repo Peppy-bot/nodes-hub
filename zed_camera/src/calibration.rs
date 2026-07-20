@@ -54,36 +54,52 @@ impl StereoConf {
         let text = fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
         let ini = parse_ini(&text);
         let res = res_key.to_ascii_lowercase();
-        let get = |section: &str, key: &str| -> Option<f64> {
-            ini.get(&(section.to_string(), key.to_string())).copied()
+        let get = |section: &str, key: &str| -> Result<Option<f64>, String> {
+            match ini.get(&(section.to_string(), key.to_string())) {
+                Some(v) if !v.is_finite() => {
+                    Err(format!("[{section}] {key} must be finite, got {v}"))
+                }
+                v => Ok(v.copied()),
+            }
         };
         let cam = |side: &str| -> Result<CamConf, String> {
             let section = format!("{side}_cam_{res}");
-            let required =
-                |key: &str| get(&section, key).ok_or_else(|| format!("[{section}] missing {key}"));
-            let optional = |key: &str| get(&section, key).unwrap_or(0.0);
+            let required = |key: &str| -> Result<f64, String> {
+                get(&section, key)?.ok_or_else(|| format!("[{section}] missing {key}"))
+            };
+            let optional =
+                |key: &str| -> Result<f64, String> { Ok(get(&section, key)?.unwrap_or(0.0)) };
             Ok(CamConf {
                 fx: required("fx")?,
                 fy: required("fy")?,
                 cx: required("cx")?,
                 cy: required("cy")?,
-                k1: optional("k1"),
-                k2: optional("k2"),
-                k3: optional("k3"),
-                p1: optional("p1"),
-                p2: optional("p2"),
+                k1: optional("k1")?,
+                k2: optional("k2")?,
+                k3: optional("k3")?,
+                p1: optional("p1")?,
+                p2: optional("p2")?,
             })
         };
-        let stereo_required =
-            |key: String| get("stereo", &key).ok_or(format!("[STEREO] missing {key}"));
+        let stereo_required = |key: String| -> Result<f64, String> {
+            get("stereo", &key)?.ok_or(format!("[STEREO] missing {key}"))
+        };
+        let left = cam("left")?;
+        let right = cam("right")?;
+        let baseline = stereo_required("baseline".to_string())?;
+        if baseline <= 0.0 {
+            return Err(format!(
+                "[STEREO] baseline must be positive, got {baseline}"
+            ));
+        }
         Ok(Self {
-            left: cam("left")?,
-            right: cam("right")?,
-            baseline: stereo_required("baseline".to_string())?,
+            left,
+            right,
+            baseline,
             // Suffixed translation offsets are absent in shipping confs and
             // default to zero, exactly as the reference recipe reads them.
-            ty: get("stereo", &format!("ty_{res}")).unwrap_or(0.0),
-            tz: get("stereo", &format!("tz_{res}")).unwrap_or(0.0),
+            ty: get("stereo", &format!("ty_{res}"))?.unwrap_or(0.0),
+            tz: get("stereo", &format!("tz_{res}"))?.unwrap_or(0.0),
             rx: stereo_required(format!("rx_{res}"))?,
             cv: stereo_required(format!("cv_{res}"))?,
             rz: stereo_required(format!("rz_{res}"))?,
@@ -142,6 +158,30 @@ mod tests {
                 .unwrap_err()
                 .contains("missing fx")
         );
+    }
+
+    #[test]
+    fn load_rejects_non_finite_and_non_positive_values() {
+        let base = "[LEFT_CAM_HD]\nfx=772.22\nfy=772.19\ncx=636.985\ncy=361.008\n\
+                    [RIGHT_CAM_HD]\nfx=770.8\nfy=770.6\ncx=644.6\ncy=345.6\n\
+                    [STEREO]\nBaseline=62.902\nRX_HD=-0.0023\nCV_HD=0.0046\nRZ_HD=-0.0005\n";
+        let dir = tempfile::tempdir().unwrap();
+        let cases = [
+            ("Baseline=62.902", "Baseline=NaN", "baseline must be finite"),
+            ("RX_HD=-0.0023", "RX_HD=inf", "rx_hd must be finite"),
+            ("fx=772.22", "fx=-inf", "fx must be finite"),
+            (
+                "Baseline=62.902",
+                "Baseline=-62.902",
+                "baseline must be positive",
+            ),
+        ];
+        for (valid, broken, expected_error) in cases {
+            let path = dir.path().join("poisoned.conf");
+            fs::write(&path, base.replace(valid, broken)).unwrap();
+            let err = StereoConf::load(&path, "HD").unwrap_err();
+            assert!(err.contains(expected_error), "got: {err}");
+        }
     }
 
     #[test]
