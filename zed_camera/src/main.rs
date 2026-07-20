@@ -75,16 +75,15 @@ fn main() -> Result<()> {
         .init();
 
     NodeBuilder::new().run(|params: Parameters, node_runner| async move {
-        let resolution = Resolution::parse(&params.video.resolution)
-            .map_err(|e| std::io::Error::other(format!("video.resolution: {e}")))?;
+        let resolution = Resolution::parse(&params.resolution)
+            .map_err(|e| std::io::Error::other(format!("resolution: {e}")))?;
         resolution
-            .validate_fps(params.video.frame_rate)
-            .map_err(|e| std::io::Error::other(format!("video.frame_rate: {e}")))?;
+            .validate_fps(params.frame_rate)
+            .map_err(|e| std::io::Error::other(format!("frame_rate: {e}")))?;
         let dev_id = device_index(&params.device_path).map_err(std::io::Error::other)?;
-        let fps = params.video.frame_rate;
-        let fps_u8 = u8::try_from(fps).map_err(|_| {
-            std::io::Error::other(format!("video.frame_rate {fps} does not fit u8"))
-        })?;
+        let fps = params.frame_rate;
+        let fps_u8 = u8::try_from(fps)
+            .map_err(|_| std::io::Error::other(format!("frame_rate {fps} does not fit u8")))?;
         let depth = DepthSettings::new(
             params.depth.min_depth_m,
             params.depth.block_size,

@@ -84,13 +84,12 @@
       // This unit's factory calibration .conf, published per serial at
       // https://calib.stereolabs.com/?SN=<serial>.
       calibration_path: "string",
-      video: {
-        // "vga" (2x672x376), "hd720" (2x1280x720), "hd1080" (2x1920x1080),
-        // "hd2k" (2x2208x1242). Legal rates per mode: vga 15/30/60/100,
-        // hd720 15/30/60, hd1080 15/30, hd2k 15.
-        resolution: "string",
-        frame_rate: "u32",
-      },
+      // One stereo capture feeds both streams, so geometry and rate are
+      // shared. "vga" (2x672x376), "hd720" (2x1280x720), "hd1080"
+      // (2x1920x1080), "hd2k" (2x2208x1242); legal rates per mode:
+      // vga 15/30/60/100, hd720 15/30/60, hd1080 15/30, hd2k 15.
+      resolution: "string",
+      frame_rate: "u32",
       depth: {
         // Nearest depth (m) the matcher must resolve; the disparity search
         // range derives from this and the calibration. Vendor-rated floors:
