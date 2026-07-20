@@ -23,9 +23,18 @@ opencv = { version = "0.99", optional = true, default-features = false, features
     "imgproc",
     "clang-runtime",
 ] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+peppygen = { path = ".peppy/libs/peppygen" }
+peppylib = { path = ".peppy/libs/peppylib" }
 
 [dev-dependencies]
 tempfile = "3"
+
+[[bin]]
+name = "zed_camera"
+required-features = ["capture", "cv"]
 
 [[example]]
 name = "depth_bench"

@@ -1,0 +1,77 @@
+// Stereolabs ZED stereo camera (ZED, ZED Mini, ZED 2/2i over USB3) as an
+// RGB-D source without the ZED SDK: side-by-side V4L2 capture (v4l crate),
+// rectification from the per-serial factory calibration (downloaded once and
+// cached; serial read from the camera's USB descriptor), and CPU stereo
+// matching (OpenCV StereoSGBM via the opencv crate). video_stream is the
+// rectified left eye; depth_stream is computed in that same frame, so the
+// pair is always color-aligned. The camera runs auto exposure; manual
+// exposure is not available over UVC. Depth quality and rate are bounded by
+// CPU stereo matching; tune with the depth parameters and benchmark before
+// trusting a configuration.
+{
+  peppy_schema: "node/v1",
+  manifest: {
+    name: "zed_camera",
+    tag: "v1",
+    implements: [
+      { name: "rgbd_camera", tag: "v1", link_id: "camera" },
+    ],
+    labels: [
+      "zed",
+      "stereo",
+      "rgbd",
+      "camera",
+    ]
+  },
+  interfaces: {
+    topics: {
+      emits: [
+        { link_id: "camera", name: "video_stream" },
+        { link_id: "camera", name: "depth_stream" },
+      ],
+    },
+    services: {
+      exposes: [
+        { link_id: "camera", name: "video_stream_info" },
+        { link_id: "camera", name: "depth_stream_info" },
+        { link_id: "camera", name: "set_color_exposure" },
+        { link_id: "camera", name: "set_color_white_balance" },
+        { link_id: "camera", name: "set_color_gain" },
+        { link_id: "camera", name: "set_color_brightness" },
+        { link_id: "camera", name: "set_color_contrast" },
+      ],
+    },
+  },
+  execution: {
+    language: "rust",
+    container: {
+      def_file: "apptainer.def",
+      mount_paths: [
+        // The node opens this exact device path, so the mount must expose the
+        // same V4L2 node at the same path inside the container.
+        "${parameters:device_path}:${parameters:device_path}:rw"
+      ]
+    },
+    parameters: {
+      // The ZED's V4L2 capture node, e.g. /dev/video2 (side-by-side stereo).
+      device_path: "string",
+      video: {
+        // "vga" (2x672x376), "hd720" (2x1280x720), "hd1080" (2x1920x1080),
+        // "hd2k" (2x2208x1242). Legal rates per mode: vga 15/30/60/100,
+        // hd720 15/30/60, hd1080 15/30, hd2k 15.
+        resolution: "string",
+        frame_rate: "u32",
+      },
+      depth: {
+        // Disparity search range; multiple of 16. Larger sees closer objects
+        // and costs proportionally more CPU.
+        num_disparities: { $type: "u32", $default: 96 },
+        // Matched block size; odd, 3..11.
+        block_size: { $type: "u32", $default: 3 },
+        // Depth is computed at eye_resolution / downscale and published at
+        // that reduced geometry; 1 = full resolution.
+        downscale: { $type: "u32", $default: 2 },
+      },
+    },
+  }
+}
