@@ -1,0 +1,11 @@
+[package]
+name = "zed_camera"
+version = "0.1.0"
+edition = "2024"
+description = "Stereolabs ZED as an rgbd_camera producer without the ZED SDK"
+
+[lints.rust]
+unsafe_code = "deny"
+
+[dependencies]
+ureq = "2"
