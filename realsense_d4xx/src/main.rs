@@ -7,10 +7,10 @@ use std::sync::Arc;
 
 use peppygen::emitted_topics::rgbd_camera::v1::{depth_stream, video_stream};
 use peppygen::exposed_services::rgbd_camera::v1::{
-    depth_stream_info, set_align_mode, set_color_brightness, set_color_contrast,
-    set_color_exposure, set_color_gain, set_color_white_balance, set_depth_gain,
-    set_depth_laser_power_mw, video_stream_info,
+    depth_stream_info, set_color_brightness, set_color_contrast, set_color_exposure,
+    set_color_gain, set_color_white_balance, video_stream_info,
 };
+use peppygen::exposed_services::{set_align_mode, set_depth_gain, set_depth_laser_power_mw};
 use peppygen::{NodeBuilder, NodeRunner, Parameters, Result};
 use peppylib::runtime::CancellationToken;
 use tokio::sync::{mpsc, oneshot};

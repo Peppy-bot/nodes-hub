@@ -59,9 +59,42 @@
         { link_id: "camera", name: "set_color_gain" },
         { link_id: "camera", name: "set_color_brightness" },
         { link_id: "camera", name: "set_color_contrast" },
-        { link_id: "camera", name: "set_depth_gain" },
-        { link_id: "camera", name: "set_depth_laser_power_mw" },
-        { link_id: "camera", name: "set_align_mode" },
+        // RealSense-specific hardware knobs, native to this node (the
+        // rgbd_camera contract carries only what every device can honor).
+        {
+          // Depth imager gain.
+          name: "set_depth_gain",
+          request_message_format: { value: "i32" },
+          response_message_format: {
+            success: "bool",
+            message: "string",
+            current_value: "i32",
+          },
+        },
+        {
+          // IR projector power (mW); 0 disables the projector.
+          name: "set_depth_laser_power_mw",
+          request_message_format: { value: "i32" },
+          response_message_format: {
+            success: "bool",
+            message: "string",
+            current_value: "i32",
+          },
+        },
+        {
+          // Spatial alignment between the streams: "none" emits raw sensor
+          // frames; "depth_to_color" warps depth into color's viewpoint and
+          // resolution; "color_to_depth" is the inverse.
+          name: "set_align_mode",
+          request_message_format: {
+            mode: "string",
+          },
+          response_message_format: {
+            success: "bool",
+            message: "string",
+            current_mode: "string",
+          },
+        },
       ],
     },
   }
