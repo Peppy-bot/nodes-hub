@@ -8,13 +8,25 @@ description = "Stereolabs ZED as an rgbd_camera producer without the ZED SDK"
 unsafe_code = "deny"
 
 [features]
-default = ["capture"]
+default = ["capture", "cv"]
 # V4L2 mmap streaming and controls through the v4l crate; serial via sysfs.
 capture = ["dep:v4l"]
+# Rectify + SGBM depth through the maintained opencv crate. clang-runtime is
+# required for opencv's binding generator to coexist with v4l's bindgen.
+cv = ["dep:opencv"]
 
 [dependencies]
 ureq = "2"
 v4l = { version = "0.14", optional = true }
+opencv = { version = "0.99", optional = true, default-features = false, features = [
+    "calib3d",
+    "imgproc",
+    "clang-runtime",
+] }
 
 [dev-dependencies]
 tempfile = "3"
+
+[[example]]
+name = "depth_bench"
+required-features = ["cv"]
