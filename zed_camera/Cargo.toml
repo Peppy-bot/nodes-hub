@@ -7,5 +7,14 @@ description = "Stereolabs ZED as an rgbd_camera producer without the ZED SDK"
 [lints.rust]
 unsafe_code = "deny"
 
+[features]
+default = ["capture"]
+# V4L2 mmap streaming and controls through the v4l crate; serial via sysfs.
+capture = ["dep:v4l"]
+
 [dependencies]
 ureq = "2"
+v4l = { version = "0.14", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
