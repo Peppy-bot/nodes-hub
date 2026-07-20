@@ -82,7 +82,7 @@ impl StereoConf {
             })
         };
         let stereo_required = |key: String| -> Result<f64, String> {
-            get("stereo", &key)?.ok_or(format!("[STEREO] missing {key}"))
+            get("stereo", &key)?.ok_or_else(|| format!("[STEREO] missing {key}"))
         };
         let left = cam("left")?;
         let right = cam("right")?;
