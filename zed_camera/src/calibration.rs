@@ -74,16 +74,19 @@ impl StereoConf {
                 p2: optional("p2"),
             })
         };
-        let stereo = |key: &str| get("stereo", key).unwrap_or(0.0);
+        let stereo_required =
+            |key: String| get("stereo", &key).ok_or(format!("[STEREO] missing {key}"));
         Ok(Self {
             left: cam("left")?,
             right: cam("right")?,
-            baseline: get("stereo", "baseline").ok_or("[STEREO] missing Baseline")?,
-            ty: stereo(&format!("ty_{res}")),
-            tz: stereo(&format!("tz_{res}")),
-            rx: stereo(&format!("rx_{res}")),
-            cv: stereo(&format!("cv_{res}")),
-            rz: stereo(&format!("rz_{res}")),
+            baseline: stereo_required("baseline".to_string())?,
+            // Suffixed translation offsets are absent in shipping confs and
+            // default to zero, exactly as the reference recipe reads them.
+            ty: get("stereo", &format!("ty_{res}")).unwrap_or(0.0),
+            tz: get("stereo", &format!("tz_{res}")).unwrap_or(0.0),
+            rx: stereo_required(format!("rx_{res}"))?,
+            cv: stereo_required(format!("cv_{res}"))?,
+            rz: stereo_required(format!("rz_{res}"))?,
         })
     }
 }
@@ -113,6 +116,21 @@ fn parse_ini(text: &str) -> HashMap<(String, String), f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn load_rejects_a_conf_missing_its_rotation() {
+        let conf = "[LEFT_CAM_HD]\nfx=1\nfy=1\ncx=1\ncy=1\n\
+                    [RIGHT_CAM_HD]\nfx=1\nfy=1\ncx=1\ncy=1\n\
+                    [STEREO]\nBaseline=62.902\nCV_HD=0.004\nRZ_HD=-0.0005\n";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("truncated.conf");
+        fs::write(&path, conf).unwrap();
+        assert!(
+            StereoConf::load(&path, "HD")
+                .unwrap_err()
+                .contains("missing rx_hd")
+        );
+    }
 
     #[test]
     fn load_rejects_a_conf_missing_its_geometry() {

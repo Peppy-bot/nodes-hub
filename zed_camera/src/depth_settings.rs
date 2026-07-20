@@ -54,15 +54,30 @@ pub fn num_disparities_for(
     min_depth_m: f64,
     max_disparities: u32,
 ) -> Result<u32, String> {
-    let needed = fx_at_scale * baseline_mm / (min_depth_m * 1000.0);
-    let range = 16 * (needed / 16.0).ceil().max(1.0) as u32;
-    if range > max_disparities {
+    if !(fx_at_scale.is_finite() && fx_at_scale > 0.0) {
         return Err(format!(
-            "min_depth_m {min_depth_m} needs a {range}-disparity search, beyond the \
+            "calibration focal length must be positive, got {fx_at_scale}"
+        ));
+    }
+    if !(baseline_mm.is_finite() && baseline_mm > 0.0) {
+        return Err(format!(
+            "calibration baseline must be positive, got {baseline_mm}"
+        ));
+    }
+    if !(min_depth_m.is_finite() && min_depth_m > 0.0) {
+        return Err(format!(
+            "min_depth_m must be a positive distance, got {min_depth_m}"
+        ));
+    }
+    let needed = fx_at_scale * baseline_mm / (min_depth_m * 1000.0);
+    let range = 16.0 * (needed / 16.0).ceil().max(1.0);
+    if range > f64::from(max_disparities) {
+        return Err(format!(
+            "min_depth_m {min_depth_m} needs a {range:.0}-disparity search, beyond the \
              {max_disparities} this resolution/downscale supports"
         ));
     }
-    Ok(range)
+    Ok(range as u32)
 }
 
 #[cfg(test)]
@@ -93,5 +108,15 @@ mod tests {
         assert!(num_disparities_for(386.1, 62.902, 0.05, 320).is_err());
         // A very distant floor still searches at least one 16-step.
         assert_eq!(num_disparities_for(386.1, 62.902, 100.0, 640), Ok(16));
+    }
+
+    #[test]
+    fn disparity_range_rejects_malformed_geometry() {
+        assert!(num_disparities_for(f64::NAN, 62.902, 0.3, 640).is_err());
+        assert!(num_disparities_for(-386.1, 62.902, 0.3, 640).is_err());
+        assert!(num_disparities_for(386.1, 0.0, 0.3, 640).is_err());
+        assert!(num_disparities_for(386.1, 62.902, f64::INFINITY, 640).is_err());
+        // Absurd focal lengths hit the width bound, never an overflowing cast.
+        assert!(num_disparities_for(1e300, 62.902, 0.3, 640).is_err());
     }
 }
