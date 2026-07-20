@@ -9,11 +9,7 @@
     name: "zed_camera",
     tag: "v1",
     implements: [
-      {
-        name: "rgbd_camera",
-        tag: "v1",
-        link_id: "camera"
-      },
+      { name: "rgbd_camera", tag: "v1", link_id: "camera" },
     ],
     labels: [
       "zed",
@@ -25,46 +21,19 @@
   interfaces: {
     topics: {
       emits: [
-        {
-          link_id: "camera",
-          name: "video_stream"
-        },
-        {
-          link_id: "camera",
-          name: "depth_stream"
-        },
+        { link_id: "camera", name: "video_stream" },
+        { link_id: "camera", name: "depth_stream" },
       ],
     },
     services: {
       exposes: [
-        {
-          link_id: "camera",
-          name: "video_stream_info"
-        },
-        {
-          link_id: "camera",
-          name: "depth_stream_info"
-        },
-        {
-          link_id: "camera",
-          name: "set_color_exposure"
-        },
-        {
-          link_id: "camera",
-          name: "set_color_white_balance"
-        },
-        {
-          link_id: "camera",
-          name: "set_color_gain"
-        },
-        {
-          link_id: "camera",
-          name: "set_color_brightness"
-        },
-        {
-          link_id: "camera",
-          name: "set_color_contrast"
-        },
+        { link_id: "camera", name: "video_stream_info" },
+        { link_id: "camera", name: "depth_stream_info" },
+        { link_id: "camera", name: "set_color_exposure" },
+        { link_id: "camera", name: "set_color_white_balance" },
+        { link_id: "camera", name: "set_color_gain" },
+        { link_id: "camera", name: "set_color_brightness" },
+        { link_id: "camera", name: "set_color_contrast" },
       ],
     },
   },
