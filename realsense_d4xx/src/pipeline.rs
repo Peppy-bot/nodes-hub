@@ -370,9 +370,9 @@ pub fn open(config: PipelineConfig) -> Result<Capture, String> {
         .map_err(|e| format!("start pipeline: {e}"))?;
 
     let device = pipeline.profile().device();
-    let color_sensor = find_sensor_for_stream(&device, Rs2StreamKind::Color)
+    let color_sensor = find_sensor_for_stream(device, Rs2StreamKind::Color)
         .ok_or("device has no sensor exposing the Color stream")?;
-    let depth_sensor = find_sensor_for_stream(&device, Rs2StreamKind::Depth)
+    let depth_sensor = find_sensor_for_stream(device, Rs2StreamKind::Depth)
         .ok_or("device has no sensor exposing the Depth stream")?;
 
     // Metric depth scale (meters per Z16 LSB). Static per device/config; read
@@ -384,7 +384,7 @@ pub fn open(config: PipelineConfig) -> Result<Capture, String> {
             0.001
         });
 
-    let serial_log = device_serial(&device).unwrap_or_else(|| "<unknown>".into());
+    let serial_log = device_serial(device).unwrap_or_else(|| "<unknown>".into());
     info!(
         "pipeline started for device serial={serial_log} color={}x{}@{}fps depth={}x{}@{}fps depth_unit={depth_unit}",
         config.color_width,
