@@ -8,6 +8,9 @@
 //! pipeline loop and the control services share one capture handle behind a
 //! mutex, so a control call waits at most one frame.
 
+#[cfg(not(target_os = "linux"))]
+compile_error!("zed_camera captures over V4L2 and builds for Linux only");
+
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 

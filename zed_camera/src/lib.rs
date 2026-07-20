@@ -8,7 +8,7 @@
 //! crate.
 
 pub mod calibration;
-#[cfg(feature = "capture")]
+#[cfg(all(feature = "capture", target_os = "linux"))]
 pub mod capture;
 #[cfg(feature = "cv")]
 pub mod cv_depth;
