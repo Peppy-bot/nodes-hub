@@ -1,8 +1,8 @@
 //! Stereolabs ZED as an rgbd_camera producer without the ZED SDK.
 //!
 //! A blocking pipeline thread owns the frame path: grab side-by-side YUYV
-//! through the library's capture layer, rectify through the launcher-provided
-//! factory calibration, publish the rectified left eye as video_stream and
+//! through the library's capture layer, rectify through the per-serial factory
+//! calibration fetched at startup, publish the rectified left eye as video_stream and
 //! stereo-matched depth (millimeters, z16) as depth_stream. Depth lives in
 //! the rectified-left frame, so the pair is permanently color-aligned. The
 //! pipeline loop and the control services share one capture handle behind a
@@ -23,6 +23,7 @@ use peppygen::{NodeBuilder, NodeRunner, Parameters, Result};
 use peppylib::runtime::CancellationToken;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
+use zed_camera::calibration::fetch_conf;
 use zed_camera::capture::{
     CID_AWB_AUTO, CID_AWB_TEMPERATURE, CID_BRIGHTNESS, CID_CONTRAST, CID_GAIN, Capture, Grab,
     device_index, zed_serial,
@@ -46,7 +47,6 @@ struct PipelineConfig {
     dev_id: usize,
     resolution: Resolution,
     fps: u32,
-    calibration_path: std::path::PathBuf,
     depth: DepthSettings,
 }
 
@@ -97,7 +97,6 @@ fn main() -> Result<()> {
             dev_id,
             resolution,
             fps,
-            calibration_path: std::path::PathBuf::from(&params.calibration_path),
             depth,
         };
 
@@ -224,22 +223,16 @@ fn run_pipeline(
 }
 
 fn open_pipeline(config: &PipelineConfig) -> std::result::Result<(CvDepth, Opened), String> {
-    // Best-effort unit identification for the logs; calibration comes from
-    // the launcher-provided file.
-    match zed_serial() {
-        Ok(serial) => info!("zed unit serial {serial}"),
-        Err(e) => info!("zed serial unavailable: {e}"),
-    }
+    // The serial keys the factory calibration, fetched fresh per startup.
+    let serial = zed_serial()?;
+    info!("zed unit serial {serial}");
+    let conf_text = fetch_conf(serial)?;
+
     let capture = Capture::open(config.dev_id, config.resolution, config.fps)?;
     let (full_width, height) = capture.frame_size();
     let (eye_width, eye_height) = (full_width / 2, height);
 
-    let matcher = CvDepth::create(
-        &config.calibration_path,
-        eye_width,
-        eye_height,
-        config.depth,
-    )?;
+    let matcher = CvDepth::create(&conf_text, eye_width, eye_height, config.depth)?;
     let (depth_width, depth_height) = matcher.out_size();
 
     Ok((

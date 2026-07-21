@@ -10,8 +10,6 @@
 //! disparity to millimetres. Every heavy step is a maintained OpenCV call, so
 //! the output matches the Stereolabs reference recipe.
 
-use std::path::Path;
-
 use opencv::calib3d::{self, StereoMatcherTrait, StereoSGBM, StereoSGBM_MODE_SGBM_3WAY};
 use opencv::core::{CV_32FC1, CV_64FC1, Mat, MatTraitConst, Rect, Scalar, Size, ToInputArray};
 use opencv::imgproc::{
@@ -40,7 +38,7 @@ pub struct CvDepth {
 
 impl CvDepth {
     pub fn create(
-        calib_path: &Path,
+        conf_text: &str,
         eye_width: u32,
         eye_height: u32,
         settings: DepthSettings,
@@ -48,8 +46,8 @@ impl CvDepth {
         let block = settings.block_size() as i32;
         let downscale = settings.downscale() as i32;
         let key = resolution_key(eye_width);
-        let conf = StereoConf::load(calib_path, key)
-            .map_err(|e| format!("calibration {}: {e}", calib_path.display()))?;
+        let conf =
+            StereoConf::from_conf_str(conf_text, key).map_err(|e| format!("calibration: {e}"))?;
 
         let (w, h) = (eye_width as i32, eye_height as i32);
         let size = Size::new(w, h);

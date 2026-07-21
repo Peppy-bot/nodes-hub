@@ -91,7 +91,7 @@ fn synthetic_yuyv(eye_width: usize, height: usize, scene: Scene) -> Vec<u8> {
 /// a pure-x baseline: rectification is near-identity, so a horizontally shifted
 /// synthetic scene stays epipolar-valid. k1/k2 are negligibly non-zero because
 /// the reader treats all-zero distortion as a locale parsing failure.
-fn ideal_calibration_conf() -> std::path::PathBuf {
+fn ideal_calibration_conf() -> String {
     let mut conf = format!("[STEREO]\nBaseline={IDEAL_BASELINE}\n");
     for (section, width, height) in [("VGA", 672, 376), ("HD", 1280, 720), ("FHD", 1920, 1080)] {
         for side in ["LEFT", "RIGHT"] {
@@ -104,16 +104,14 @@ fn ideal_calibration_conf() -> std::path::PathBuf {
             );
         }
     }
-    let path = std::env::temp_dir().join("zed_bench_ideal_calibration.conf");
-    std::fs::write(&path, conf).expect("write ideal calibration");
-    path
+    conf
 }
 
 fn out_size(width: u32, height: u32, downscale: u32) -> (usize, usize) {
     ((width / downscale) as usize, (height / downscale) as usize)
 }
 
-fn open(calib: &std::path::Path, width: u32, height: u32, downscale: u32) -> CvDepth {
+fn open(calib: &str, width: u32, height: u32, downscale: u32) -> CvDepth {
     CvDepth::create(
         calib,
         width,
@@ -130,13 +128,15 @@ fn open(calib: &std::path::Path, width: u32, height: u32, downscale: u32) -> CvD
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let real_calib = args
+    let real_calib_path = args
         .next()
         .expect("usage: depth_bench <calibration.conf> [frames]");
     let frames: u32 = args.next().map_or(30, |f| f.parse().expect("frames"));
+    let real_calib =
+        std::fs::read_to_string(&real_calib_path).expect("read the real calibration file");
     let ideal_calib = ideal_calibration_conf();
 
-    println!("== timing (real calibration: {real_calib}) ==");
+    println!("== timing (real calibration: {real_calib_path}) ==");
     println!("mode    downscale  ms/frame");
     for (name, width, height) in MODES {
         let yuyv = synthetic_yuyv(width as usize, height as usize, Scene::Flat);
@@ -144,7 +144,7 @@ fn main() {
             let (dw, dh) = out_size(width, height, downscale);
             let mut left_rgb = vec![0u8; (width * height * 3) as usize];
             let mut depth = vec![0u16; dw * dh];
-            let mut backend = open(real_calib.as_ref(), width, height, downscale);
+            let mut backend = open(&real_calib, width, height, downscale);
             backend
                 .process(&yuyv, &mut left_rgb, &mut depth)
                 .expect("warm"); // warm

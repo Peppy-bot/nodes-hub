@@ -1,11 +1,35 @@
-//! Per-serial factory calibration parsing. The .conf is the authoritative
-//! geometry for one exact unit (published at
-//! `https://calib.stereolabs.com/?SN=<serial>`), provided to the node as a
-//! file; rectification is only as good as this file.
+//! Per-serial factory calibration: fetch and parse. The .conf is the
+//! authoritative geometry for one exact unit, published per serial at
+//! `https://calib.stereolabs.com/?SN=<serial>` and fetched fresh at startup;
+//! rectification is only as good as it.
 
 use std::collections::HashMap;
-use std::fs;
-use std::path::Path;
+use std::time::Duration;
+
+/// Where Stereolabs publishes the per-serial factory calibration.
+const CALIBRATION_HOST: &str = "https://calib.stereolabs.com/";
+/// Time to establish the connection before giving up.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Ceiling on the whole request, including a server that accepts then stalls
+/// on the body, so a startup fetch can never hang the node.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Fetch one unit's factory calibration text by serial, bounded so it cannot
+/// hang. The conf carries every resolution; [`StereoConf::from_conf_str`]
+/// selects one.
+pub fn fetch_conf(serial: i32) -> Result<String, String> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+        .build();
+    agent
+        .get(CALIBRATION_HOST)
+        .query("SN", &serial.to_string())
+        .call()
+        .map_err(|e| format!("fetch calibration for serial {serial}: {e}"))?
+        .into_string()
+        .map_err(|e| format!("read calibration body for serial {serial}: {e}"))
+}
 
 /// One eye's pinhole intrinsics and OpenCV distortion (k1, k2, p1, p2, k3);
 /// the ZED conf carries no tangential terms, so p1/p2 stay zero.
@@ -49,10 +73,9 @@ pub fn resolution_key(eye_width: u32) -> &'static str {
 }
 
 impl StereoConf {
-    /// Parse the calibration for one resolution from a conf file.
-    pub fn load(path: &Path, res_key: &str) -> Result<Self, String> {
-        let text = fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        let ini = parse_ini(&text);
+    /// Parse the calibration for one resolution from conf text.
+    pub fn from_conf_str(text: &str, res_key: &str) -> Result<Self, String> {
+        let ini = parse_ini(text);
         let res = res_key.to_ascii_lowercase();
         let get = |section: &str, key: &str| -> Result<Option<f64>, String> {
             match ini.get(&(section.to_string(), key.to_string())) {
@@ -134,38 +157,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn load_rejects_a_conf_missing_its_rotation() {
+    fn rejects_a_conf_missing_its_rotation() {
         let conf = "[LEFT_CAM_HD]\nfx=1\nfy=1\ncx=1\ncy=1\n\
                     [RIGHT_CAM_HD]\nfx=1\nfy=1\ncx=1\ncy=1\n\
                     [STEREO]\nBaseline=62.902\nCV_HD=0.004\nRZ_HD=-0.0005\n";
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("truncated.conf");
-        fs::write(&path, conf).unwrap();
         assert!(
-            StereoConf::load(&path, "HD")
+            StereoConf::from_conf_str(conf, "HD")
                 .unwrap_err()
                 .contains("missing rx_hd")
         );
     }
 
     #[test]
-    fn load_rejects_a_conf_missing_its_geometry() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("bad.conf");
-        fs::write(&path, "<html>301 Moved Permanently</html>").unwrap();
+    fn rejects_a_body_without_calibration_geometry() {
         assert!(
-            StereoConf::load(&path, "HD")
+            StereoConf::from_conf_str("<html>301 Moved Permanently</html>", "HD")
                 .unwrap_err()
                 .contains("missing fx")
         );
     }
 
     #[test]
-    fn load_rejects_non_finite_and_non_positive_values() {
+    fn rejects_non_finite_and_non_positive_values() {
         let base = "[LEFT_CAM_HD]\nfx=772.22\nfy=772.19\ncx=636.985\ncy=361.008\n\
                     [RIGHT_CAM_HD]\nfx=770.8\nfy=770.6\ncx=644.6\ncy=345.6\n\
                     [STEREO]\nBaseline=62.902\nRX_HD=-0.0023\nCV_HD=0.0046\nRZ_HD=-0.0005\n";
-        let dir = tempfile::tempdir().unwrap();
         let cases = [
             ("Baseline=62.902", "Baseline=NaN", "baseline must be finite"),
             ("RX_HD=-0.0023", "RX_HD=inf", "rx_hd must be finite"),
@@ -177,9 +193,8 @@ mod tests {
             ),
         ];
         for (valid, broken, expected_error) in cases {
-            let path = dir.path().join("poisoned.conf");
-            fs::write(&path, base.replace(valid, broken)).unwrap();
-            let err = StereoConf::load(&path, "HD").unwrap_err();
+            let poisoned = base.replace(valid, broken);
+            let err = StereoConf::from_conf_str(&poisoned, "HD").unwrap_err();
             assert!(err.contains(expected_error), "got: {err}");
         }
     }
@@ -190,11 +205,7 @@ mod tests {
                     k1=-0.03\nk2=-0.004\nk3=0.037\nk4=-0.02\n\
                     [RIGHT_CAM_HD]\nfx=770.8\nfy=770.6\ncx=644.6\ncy=345.6\nk1=-0.03\nk2=-0.004\nk3=0.02\n\
                     [STEREO]\nBaseline=62.902\nTY=0.062\nTZ=-0.0006\nRX_HD=-0.0023\nCV_HD=0.0046\nRZ_HD=-0.0005\n";
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("SN.conf");
-        fs::write(&path, conf).unwrap();
-
-        let s = StereoConf::load(&path, resolution_key(1280)).unwrap();
+        let s = StereoConf::from_conf_str(conf, resolution_key(1280)).unwrap();
         assert_eq!(s.left.fx, 772.22);
         assert_eq!(s.left.cx, 636.985);
         assert_eq!(s.baseline, 62.902);

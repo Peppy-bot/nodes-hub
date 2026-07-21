@@ -3,6 +3,8 @@
 // left eye; depth_stream (z16, millimetres) is computed in that same frame,
 // so the pair is always color-aligned and align_mode is depth_to_color.
 // The device runs auto exposure; there is no manual exposure control.
+// Factory calibration is fetched per unit serial at startup from
+// https://calib.stereolabs.com/, so the node needs outbound network access.
 {
   peppy_schema: "node/v1",
   manifest: {
@@ -44,15 +46,11 @@
       mount_paths: [
         // The container must see the device at the path the parameter names.
         "${parameters:device_path}:${parameters:device_path}:rw",
-        "${parameters:calibration_path}:${parameters:calibration_path}:ro",
       ]
     },
     parameters: {
       // The ZED's V4L2 capture node, e.g. /dev/video2 (side-by-side stereo).
       device_path: "string",
-      // This unit's factory calibration .conf, published per serial at
-      // https://calib.stereolabs.com/?SN=<serial>.
-      calibration_path: "string",
       // One stereo capture feeds both streams, so geometry and rate are
       // shared. "vga" (2x672x376), "hd720" (2x1280x720), "hd1080"
       // (2x1920x1080), "hd2k" (2x2208x1242); legal rates per mode:
