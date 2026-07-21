@@ -22,7 +22,7 @@ const BUFFER_COUNT: u32 = 2;
 
 const ZED_VENDOR_ID: &str = "2b03";
 /// The ZED's HID (IMU) interface; its USB descriptor carries the unit serial.
-const ZED_HID_PRODUCT_ID: &str = "f681";
+const ZED_HID_PRODUCT_IDS: [&str; 3] = ["f681", "f781", "f881"];
 
 // V4L2_CID_* ids (<linux/v4l2-controls.h>) the ZED exposes, for callers
 // driving [`Capture::control`]/[`Capture::set_control`].
@@ -173,7 +173,7 @@ fn zed_serial_under(usb_devices: &Path) -> Result<i32, String> {
         .map(|entry| entry.path())
         .filter(|dir| {
             attr(dir, "idVendor").as_deref() == Some(ZED_VENDOR_ID)
-                && attr(dir, "idProduct").as_deref() == Some(ZED_HID_PRODUCT_ID)
+                && attr(dir, "idProduct").is_some_and(|p| ZED_HID_PRODUCT_IDS.contains(&p.as_str()))
         })
         .filter_map(|dir| attr(&dir, "serial"))
         .collect();
@@ -227,10 +227,20 @@ mod tests {
             root.path(),
             "1-2.3",
             ZED_VENDOR_ID,
-            ZED_HID_PRODUCT_ID,
+            ZED_HID_PRODUCT_IDS[0],
             Some("10383163"),
         );
         assert_eq!(zed_serial_under(root.path()), Ok(10_383_163));
+    }
+
+    #[test]
+    fn serial_reads_every_model_family_hid_id() {
+        for (i, product) in ZED_HID_PRODUCT_IDS.iter().enumerate() {
+            let root = tempfile::tempdir().unwrap();
+            fake_usb_device(root.path(), "2-3", "2b03", product, Some("10383163"));
+            fake_usb_device(root.path(), "2-4", "2b03", "f682", None);
+            assert_eq!(zed_serial_under(root.path()), Ok(10_383_163), "id #{i}");
+        }
     }
 
     #[test]
@@ -246,14 +256,14 @@ mod tests {
             root.path(),
             "1-2",
             ZED_VENDOR_ID,
-            ZED_HID_PRODUCT_ID,
+            ZED_HID_PRODUCT_IDS[0],
             Some("11111111"),
         );
         fake_usb_device(
             root.path(),
             "1-3",
             ZED_VENDOR_ID,
-            ZED_HID_PRODUCT_ID,
+            ZED_HID_PRODUCT_IDS[0],
             Some("22222222"),
         );
         assert!(
@@ -270,7 +280,7 @@ mod tests {
             root.path(),
             "1-2",
             ZED_VENDOR_ID,
-            ZED_HID_PRODUCT_ID,
+            ZED_HID_PRODUCT_IDS[0],
             Some("OV9782"),
         );
         assert!(
