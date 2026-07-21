@@ -1,0 +1,43 @@
+[package]
+name = "zed_camera"
+version = "0.1.0"
+edition = "2024"
+description = "Stereolabs ZED as an rgbd_camera producer without the ZED SDK"
+
+[lints.rust]
+unsafe_code = "deny"
+
+[features]
+default = ["capture", "cv"]
+# V4L2 mmap streaming and controls through the v4l crate; serial via sysfs.
+capture = ["dep:v4l"]
+# Rectify + SGBM depth through the maintained opencv crate. clang-runtime is
+# required for opencv's binding generator to coexist with v4l's bindgen.
+cv = ["dep:opencv"]
+
+[dependencies]
+opencv = { version = "0.99", optional = true, default-features = false, features = [
+    "calib3d",
+    "imgproc",
+    "clang-runtime",
+] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+ureq = "2"
+peppygen = { path = ".peppy/libs/peppygen" }
+peppylib = { path = ".peppy/libs/peppylib" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+v4l = { version = "0.14", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "zed_camera"
+required-features = ["capture", "cv"]
+
+[[example]]
+name = "depth_bench"
+required-features = ["cv"]

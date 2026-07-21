@@ -1,0 +1,26 @@
+Bootstrap: docker
+From: tuatini/peppy-rust-cargo-base
+
+%files
+    . /opt/zed_camera
+
+%post
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+
+    apt-get update -y
+    # The opencv crate (rectify + SGBM): libopencv-dev to link, clang +
+    # libclang-dev for its bindgen (the binding generator shells out to the
+    # clang binary, so libclang-dev alone is not enough). pkg-config and
+    # ca-certificates already ship in the base image.
+    apt-get install -y --no-install-recommends \
+        libopencv-dev clang libclang-dev
+
+    cd /opt/zed_camera
+    cargo build --release
+
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+%runscript
+    cd /opt/zed_camera
+    exec ./target/release/zed_camera "$@"

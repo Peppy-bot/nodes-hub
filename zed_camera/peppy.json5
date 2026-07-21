@@ -1,0 +1,72 @@
+// Stereolabs ZED stereo camera (ZED, ZED Mini, ZED 2/2i over USB3) as an
+// rgbd_camera producer without the ZED SDK. video_stream is the rectified
+// left eye; depth_stream (z16, millimetres) is computed in that same frame,
+// so the pair is always color-aligned and align_mode is depth_to_color.
+// The device runs auto exposure; there is no manual exposure control.
+// Factory calibration is fetched per unit serial at startup from
+// https://calib.stereolabs.com/, so the node needs outbound network access.
+{
+  peppy_schema: "node/v1",
+  manifest: {
+    name: "zed_camera",
+    tag: "v1",
+    implements: [
+      { name: "rgbd_camera", tag: "v1", link_id: "camera" },
+    ],
+    labels: [
+      "zed",
+      "stereo",
+      "rgbd",
+      "camera",
+    ]
+  },
+  interfaces: {
+    topics: {
+      emits: [
+        { link_id: "camera", name: "video_stream" },
+        { link_id: "camera", name: "depth_stream" },
+      ],
+    },
+    services: {
+      exposes: [
+        { link_id: "camera", name: "video_stream_info" },
+        { link_id: "camera", name: "depth_stream_info" },
+        { link_id: "camera", name: "set_color_exposure" },
+        { link_id: "camera", name: "set_color_white_balance" },
+        { link_id: "camera", name: "set_color_gain" },
+        { link_id: "camera", name: "set_color_brightness" },
+        { link_id: "camera", name: "set_color_contrast" },
+      ],
+    },
+  },
+  execution: {
+    language: "rust",
+    container: {
+      def_file: "apptainer.def",
+      mount_paths: [
+        // The container must see the device at the path the parameter names.
+        "${parameters:device_path}:${parameters:device_path}:rw",
+      ]
+    },
+    parameters: {
+      // The ZED's V4L2 capture node, e.g. /dev/video2 (side-by-side stereo).
+      device_path: "string",
+      // One stereo capture feeds both streams, so geometry and rate are
+      // shared. "vga" (2x672x376), "hd720" (2x1280x720), "hd1080"
+      // (2x1920x1080), "hd2k" (2x2208x1242); legal rates per mode:
+      // vga 15/30/60/100, hd720 15/30/60, hd1080 15/30, hd2k 15.
+      resolution: "string",
+      frame_rate: "u32",
+      depth: {
+        // Nearest depth (m) the matcher must resolve; the disparity search
+        // range derives from this and the calibration. Vendor-rated floors:
+        // ZED Mini (63 mm baseline) 0.1 m; ZED / ZED 2 / 2i (120 mm) 0.3 m.
+        min_depth_m: "f64",
+        // Depth is computed and published at eye_resolution / downscale; >= 1.
+        downscale: "u32",
+        // SGBM matched block size; odd, 3..=11.
+        block_size: "u32",
+      },
+    },
+  }
+}
