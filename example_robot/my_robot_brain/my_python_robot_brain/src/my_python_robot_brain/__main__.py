@@ -2,10 +2,8 @@ import asyncio
 
 from peppygen import NodeBuilder, NodeRunner, QoSProfile
 from peppygen.parameters import Parameters
-from peppygen.consumed_actions import (
-    robot_controller_move_arm as arm,
-)
-from peppygen.consumed_topics import camera_video_stream as video_stream
+from peppygen.consumed_actions.robot_controller import move_arm as arm
+from peppygen.consumed_topics.camera import video_stream as video_stream
 
 from my_python_robot_brain.frames import LatestValueMailbox
 

@@ -3,11 +3,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use peppygen::consumed_services::{
-    camera_set_brightness, camera_set_contrast, camera_set_exposure, camera_set_gain,
-    camera_set_white_balance, camera_video_stream_info,
+use peppygen::consumed_services::camera::{
+    set_brightness as camera_set_brightness, set_contrast as camera_set_contrast,
+    set_exposure as camera_set_exposure, set_gain as camera_set_gain,
+    set_white_balance as camera_set_white_balance, video_stream_info as camera_video_stream_info,
 };
-use peppygen::consumed_topics::camera_video_stream;
+use peppygen::consumed_topics::camera::video_stream as camera_video_stream;
 use peppygen::{NodeBuilder, NodeRunner, Parameters, Result};
 use peppylib::runtime::CancellationToken;
 

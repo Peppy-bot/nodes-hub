@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use peppygen::consumed_services::camera_video_stream_info;
-use peppygen::consumed_topics::camera_video_stream;
+use peppygen::consumed_services::camera::video_stream_info as camera_video_stream_info;
+use peppygen::consumed_topics::camera::video_stream as camera_video_stream;
 use peppygen::{NodeBuilder, NodeRunner, Parameters, Result};
 use peppylib::runtime::CancellationToken;
 
