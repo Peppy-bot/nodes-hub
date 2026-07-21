@@ -1,0 +1,75 @@
+// Stereolabs ZED stereo camera as an rgbd_camera producer through the closed
+// source ZED SDK. Unlike the SDK-free zed_camera node, depth is computed on the
+// GPU by the SDK's neural matcher, so this node needs CUDA and a Stereolabs SDK
+// install (targeted at a Jetson). video_stream is the rectified left eye; depth
+// is computed in that same frame, so the pair is always color-aligned and
+// align_mode is depth_to_color. The SDK exposes real manual exposure, gain, and
+// white balance, so the set_color_* services drive the sensor rather than
+// reporting an auto-only limitation.
+{
+  peppy_schema: "node/v1",
+  manifest: {
+    name: "zed_camera_sdk",
+    tag: "v1",
+    implements: [
+      { name: "rgbd_camera", tag: "v1", link_id: "camera" },
+    ],
+    labels: [
+      "zed",
+      "stereo",
+      "rgbd",
+      "camera",
+      "cuda",
+    ]
+  },
+  interfaces: {
+    topics: {
+      emits: [
+        { link_id: "camera", name: "video_stream" },
+        { link_id: "camera", name: "depth_stream" },
+      ],
+    },
+    services: {
+      exposes: [
+        { link_id: "camera", name: "video_stream_info" },
+        { link_id: "camera", name: "depth_stream_info" },
+        { link_id: "camera", name: "set_color_exposure" },
+        { link_id: "camera", name: "set_color_white_balance" },
+        { link_id: "camera", name: "set_color_gain" },
+        { link_id: "camera", name: "set_color_brightness" },
+        { link_id: "camera", name: "set_color_contrast" },
+      ],
+    },
+  },
+  execution: {
+    language: "python",
+    container: {
+      def_file: "apptainer.def",
+      // The ZED SDK computes depth on the GPU; --nv exposes the Jetson's
+      // NVIDIA devices and driver libraries inside the container.
+      apptainer_run_extra_args: ["--nv"],
+    },
+    parameters: {
+      // One stereo capture feeds both streams, so geometry and rate are
+      // shared. "vga" (per-eye 672x376), "hd720" (1280x720), "hd1080"
+      // (1920x1080), "hd2k" (2208x1242); legal rates per mode:
+      // vga 15/30/60/100, hd720 15/30/60, hd1080 15/30, hd2k 15.
+      resolution: "string",
+      frame_rate: "u32",
+      // GPU neural depth mode: "NEURAL", "NEURAL_LIGHT", or "NEURAL_PLUS".
+      depth_mode: {
+        $type: "string",
+        $default: "NEURAL",
+      },
+      // Nearest depth (m) the matcher resolves; maps to the SDK's
+      // depth_minimum_distance. Vendor floors: ZED Mini 0.1 m, ZED/2/2i 0.3 m.
+      min_depth_m: "f64",
+      // Pin a specific unit by factory serial when several ZEDs are attached;
+      // 0 opens the first available camera.
+      serial_number: {
+        $type: "u32",
+        $default: 0,
+      },
+    },
+  }
+}

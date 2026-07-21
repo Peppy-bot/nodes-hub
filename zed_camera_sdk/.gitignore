@@ -1,0 +1,20 @@
+
+# Peppy-specific files
+.peppy
+
+# Python
+__pycache__
+.venv
+.pytest_cache
+uv.lock
+
+# Editor-specific files
+.vscode/
+.idea/
+
+# Operating System files
+**/.DS_Store
+**/.Thumbs.db
+
+# Logs
+*.log

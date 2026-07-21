@@ -1,0 +1,42 @@
+Bootstrap: docker
+# Stereolabs publish CUDA + ZED SDK images. The tag must match the target
+# Jetson's JetPack / L4T and the desired SDK version; this is a placeholder to
+# adjust per device (see README.md for how to pick it). The node runs with
+# apptainer's --nv flag (execution.container.apptainer_run_extra_args) so the
+# host NVIDIA driver and GPU reach the container.
+From: stereolabs/zed:4.1-devel-jetson-jp6.0.0
+
+%labels
+    Name zed_camera_sdk
+    Version 0.1.0
+
+%environment
+    export PATH="/opt/zed_camera_sdk/.venv/bin:$PATH"
+
+%files
+    . /opt/zed_camera_sdk
+
+%post
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+
+    apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-dev ca-certificates curl \
+        && rm -rf /var/lib/apt/lists/*
+
+    # uv is the peppy Python toolchain driver.
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    export PATH="/root/.local/bin:$PATH"
+
+    cd /opt/zed_camera_sdk
+    uv python install
+    uv sync --no-editable
+
+    # pyzed is not on any package index: the SDK ships a builder that produces
+    # the wheel matching this image's SDK and Python and installs it into the
+    # node venv.
+    uv run python /usr/local/zed/get_python_api.py
+
+%runscript
+    cd /opt/zed_camera_sdk
+    exec ./.venv/bin/python -m zed_camera_sdk

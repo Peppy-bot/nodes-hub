@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "zed_camera_sdk"
+version = "0.1.0"
+description = "zed_camera_sdk peppy node"
+requires-python = ">=3.11,<3.14"
+# pyzed is not on an index; the ZED SDK installer builds it into the venv
+# during the container build (see apptainer.def / README.md).
+dependencies = ["peppygen", "peppylib", "numpy>=1.24"]
+
+[project.scripts]
+zed_camera_sdk = "zed_camera_sdk.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/zed_camera_sdk"]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.uv.sources]
+peppygen = { path = ".peppy/libs/peppygen" }
+peppylib = { path = ".peppy/libs/peppylib" }
