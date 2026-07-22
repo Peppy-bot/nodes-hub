@@ -1,4 +1,7 @@
-use peppygen::consumed_actions::{left_robot_arm_move_arm, right_robot_arm_move_arm};
+use peppygen::consumed_actions::{
+    left_robot_arm::move_arm as left_robot_arm_move_arm,
+    right_robot_arm::move_arm as right_robot_arm_move_arm,
+};
 use peppygen::exposed_actions::move_arm;
 use peppygen::{NodeBuilder, Parameters, QoSProfile, Result};
 use peppylib::runtime::CancellationToken;

@@ -6,8 +6,8 @@ import numpy as np
 
 from peppygen import NodeBuilder, NodeRunner
 from peppygen.parameters import Parameters
-from peppygen.consumed_services import camera_video_stream_info
-from peppygen.consumed_topics import camera_video_stream
+from peppygen.consumed_services.camera import video_stream_info as camera_video_stream_info
+from peppygen.consumed_topics.camera import video_stream as camera_video_stream
 
 
 class VideoEncoder:

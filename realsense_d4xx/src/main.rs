@@ -5,8 +5,8 @@ mod pipeline;
 use std::num::NonZeroU8;
 use std::sync::Arc;
 
-use peppygen::emitted_topics::rgbd_camera::v1::{depth_stream, video_stream};
-use peppygen::exposed_services::rgbd_camera::v1::{
+use peppygen::emitted_topics::camera::{depth_stream, video_stream};
+use peppygen::exposed_services::camera::{
     depth_stream_info, set_color_brightness, set_color_contrast, set_color_exposure,
     set_color_gain, set_color_white_balance, video_stream_info,
 };
