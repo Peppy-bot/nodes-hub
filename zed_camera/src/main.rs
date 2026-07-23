@@ -14,8 +14,8 @@ compile_error!("zed_camera captures over V4L2 and builds for Linux only");
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use peppygen::emitted_topics::rgbd_camera::v1::{depth_stream, video_stream};
-use peppygen::exposed_services::rgbd_camera::v1::{
+use peppygen::emitted_topics::camera::{depth_stream, video_stream};
+use peppygen::exposed_services::camera::{
     depth_stream_info, set_color_brightness, set_color_contrast, set_color_exposure,
     set_color_gain, set_color_white_balance, video_stream_info,
 };

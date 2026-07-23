@@ -1,4 +1,4 @@
-use peppygen::emitted_topics::rgb_camera::v1::video_stream::{self, MessageHeader};
+use peppygen::emitted_topics::camera::video_stream::{self, MessageHeader};
 use peppylib::runtime::CancellationToken;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};

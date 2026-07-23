@@ -1,10 +1,8 @@
 import asyncio
 
 from peppygen import NodeBuilder, NodeRunner, QoSProfile
-from peppygen.consumed_actions import (
-    left_robot_arm_move_arm,
-    right_robot_arm_move_arm,
-)
+from peppygen.consumed_actions.left_robot_arm import move_arm as left_robot_arm_move_arm
+from peppygen.consumed_actions.right_robot_arm import move_arm as right_robot_arm_move_arm
 from peppygen.exposed_actions import move_arm
 from peppygen.parameters import Parameters
 

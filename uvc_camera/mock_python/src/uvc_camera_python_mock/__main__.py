@@ -10,9 +10,9 @@ from pathlib import Path
 
 
 from peppygen import NodeBuilder, NodeRunner, StandaloneConfig
-from peppygen.exposed_services.uvc_camera.v1 import video_stream_info
-from peppygen.emitted_topics.uvc_camera.v1 import video_stream
-from peppygen.emitted_topics.uvc_camera.v1.video_stream import MessageHeader
+from peppygen.exposed_services.camera import video_stream_info
+from peppygen.emitted_topics.camera import video_stream
+from peppygen.emitted_topics.camera.video_stream import MessageHeader
 from peppygen.parameters import Parameters
 
 from uvc_camera_python_mock.frames import offer_latest_frame, force_put

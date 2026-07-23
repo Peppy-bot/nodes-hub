@@ -1,5 +1,5 @@
-use peppygen::consumed_actions::robot_controller_move_arm as arm;
-use peppygen::consumed_topics::camera_video_stream as video_stream;
+use peppygen::consumed_actions::robot_controller::move_arm as arm;
+use peppygen::consumed_topics::camera::video_stream as video_stream;
 use peppygen::{NodeBuilder, NodeRunner, Parameters, QoSProfile, Result};
 use peppylib::runtime::CancellationToken;
 use std::sync::Arc;
