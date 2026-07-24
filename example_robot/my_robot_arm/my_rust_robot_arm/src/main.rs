@@ -5,6 +5,14 @@ use peppylib::runtime::CancellationToken;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+fn accept_goal() -> move_arm::GoalDecision {
+    move_arm::GoalDecision::Accept(move_arm::GoalResponse::new(true, None))
+}
+
+fn reject_goal(reason: impl Into<String>) -> move_arm::GoalDecision {
+    move_arm::GoalDecision::Reject(move_arm::GoalResponse::new(false, Some(reason.into())))
+}
+
 async fn publish_joint_states(
     node_runner: Arc<peppygen::NodeRunner>,
     current_position: Arc<Mutex<[i32; 3]>>,
@@ -66,12 +74,10 @@ async fn run_action(
                 );
                 let mut flag = busy_for_decider.lock().expect("busy lock poisoned");
                 if *flag {
-                    Ok(move_arm::GoalResponse::reject(
-                        "arm is already moving".to_string(),
-                    ))
+                    Ok(reject_goal("arm is already moving"))
                 } else {
                     *flag = true;
-                    Ok(move_arm::GoalResponse::accept())
+                    Ok(accept_goal())
                 }
             }) => next?,
         };

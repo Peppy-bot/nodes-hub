@@ -8,6 +8,14 @@ from peppygen.parameters import Parameters
 from peppylib import CancellationToken
 
 
+def _accept_goal():
+    return move_arm.GoalDecision.accept(move_arm.GoalResponse(True, None))
+
+
+def _reject_goal(reason: str):
+    return move_arm.GoalDecision.reject(move_arm.GoalResponse(False, reason))
+
+
 async def publish_joint_states(
     node_runner: NodeRunner,
     current_position: list[int],
@@ -64,9 +72,9 @@ async def _run_action(
     def decide(request):
         print(f"[arm] received move_arm goal: {request.data.desired_position}")
         if busy[0]:
-            return move_arm.GoalResponse.reject("arm is already moving")
+            return _reject_goal("arm is already moving")
         busy[0] = True
-        return move_arm.GoalResponse.accept()
+        return _accept_goal()
 
     cancelled = asyncio.ensure_future(token.cancelled())
     try:

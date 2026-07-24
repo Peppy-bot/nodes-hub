@@ -25,6 +25,14 @@ fn arm_side(arm_id: u16) -> &'static str {
     }
 }
 
+fn accept_goal() -> move_arm::GoalDecision {
+    move_arm::GoalDecision::Accept(move_arm::GoalResponse::new(true, None))
+}
+
+fn reject_goal(reason: impl Into<String>) -> move_arm::GoalDecision {
+    move_arm::GoalDecision::Reject(move_arm::GoalResponse::new(false, Some(reason.into())))
+}
+
 // The two arm modules generate distinct `ResultOutcome` enums with the same
 // shape; collapse them into one type so the forwarding loop maps the outcome
 // once. Completed/Cancelled carry the final position; Abandoned/Expired do not.
@@ -237,18 +245,14 @@ async fn run_action(
                 request.data.desired_position
             );
             if arm_id != ARM_ID_LEFT && arm_id != ARM_ID_RIGHT {
-                return Ok(move_arm::GoalResponse::reject(format!(
-                    "unknown arm_id {arm_id}"
-                )));
+                return Ok(reject_goal(format!("unknown arm_id {arm_id}")));
             }
             if active_for_decider
                 .lock()
                 .expect("active lock poisoned")
                 .contains_key(&arm_id)
             {
-                return Ok(move_arm::GoalResponse::reject(format!(
-                    "arm {arm_id} is already moving"
-                )));
+                return Ok(reject_goal(format!("arm {arm_id} is already moving")));
             }
             // Pre-fire at the arm so we can mirror its accept/reject. The
             // decider is sync, so bridge into async with block_in_place +
@@ -267,13 +271,13 @@ async fn run_action(
                         fired = ArmHandle::fire(&runner, arm_id, desired) => match fired {
                             Ok(handle) => handle,
                             Err(e) => {
-                                return Ok(move_arm::GoalResponse::reject(format!(
+                                return Ok(reject_goal(format!(
                                     "{side} fire_goal error: {e:?}"
                                 )));
                             }
                         },
                         _ = token.cancelled() => {
-                            return Ok(move_arm::GoalResponse::reject("node is shutting down"));
+                            return Ok(reject_goal("node is shutting down"));
                         }
                     };
                     if !arm_handle.accepted() {
@@ -282,7 +286,7 @@ async fn run_action(
                             .unwrap_or("arm rejected")
                             .to_string();
                         println!("[controller] {side} arm rejected forwarded goal: {reason}");
-                        return Ok(move_arm::GoalResponse::reject(reason));
+                        return Ok(reject_goal(reason));
                     }
                     // Register under the registry lock with a token re-check:
                     // the shutdown hook snapshots the registry right after the
@@ -294,13 +298,13 @@ async fn run_action(
                         if !token.is_cancelled() {
                             println!("[controller] {side} arm accepted forwarded goal");
                             active.insert(arm_id, Arc::new(AsyncMutex::new(arm_handle)));
-                            return Ok(move_arm::GoalResponse::accept());
+                            return Ok(accept_goal());
                         }
                     }
                     if let Err(e) = arm_handle.cancel(CANCEL_TIMEOUT).await {
                         eprintln!("[controller] {side} cancel_goal error: {e:?}");
                     }
-                    Ok(move_arm::GoalResponse::reject("node is shutting down"))
+                    Ok(reject_goal("node is shutting down"))
                 })
             })
         });

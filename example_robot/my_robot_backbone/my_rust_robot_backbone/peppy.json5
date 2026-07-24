@@ -48,7 +48,11 @@
               }
             },
             response_message_format: {
-              accepted: "bool"
+              accepted: "bool",
+              error_message: {
+                $type: "string",
+                $optional: true
+              }
             }
           },
           feedback_topic: {
