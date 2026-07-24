@@ -146,12 +146,16 @@ fn reset_controls_to_defaults(device: &Device) {
     }
 }
 
-/// V4L2 index from a /dev/video<N> path.
+/// V4L2 index from a /dev/video<N> path. Symlinks (udev-pinned names like
+/// /dev/openarm/chest_cam) resolve to their target first.
 pub fn device_index(device_path: &str) -> Result<usize, String> {
-    device_path
+    let resolved = std::fs::canonicalize(device_path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| device_path.to_string());
+    resolved
         .strip_prefix("/dev/video")
         .and_then(|index| index.parse().ok())
-        .ok_or_else(|| format!("device_path must be /dev/video<N>, got {device_path:?}"))
+        .ok_or_else(|| format!("device_path must resolve to /dev/video<N>, got {device_path:?}"))
 }
 
 /// The unit serial that keys the factory calibration, read from the USB

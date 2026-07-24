@@ -506,9 +506,14 @@ fn frame_format_to_encoding(fmt: FrameFormat) -> Result<Encoding> {
     }
 }
 
-/// Parse camera device path into index
+/// Parse camera device path into index. Symlinks (udev-pinned names like
+/// /dev/openarm/left_wrist_cam) resolve to their /dev/video<N> target first;
+/// a path that resolves to anything else is invalid.
 fn parse_camera_index(device_path: &str) -> Result<u32> {
-    if let Some(stripped) = device_path.strip_prefix("/dev/video") {
+    let resolved = std::fs::canonicalize(device_path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| device_path.to_string());
+    if let Some(stripped) = resolved.strip_prefix("/dev/video") {
         stripped
             .parse::<u32>()
             .map_err(|_| Error::InvalidDevicePath(device_path.to_string()))
