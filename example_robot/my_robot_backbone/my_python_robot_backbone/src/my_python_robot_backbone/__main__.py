@@ -47,9 +47,9 @@ async def _run_arm_action(node_runner, token, active_handles, drive_tasks):
         side = _arm_side(arm_id)
         print(f"[controller] {side} arm received goal: {request.data.desired_position}")
         if arm_id not in ARM_MODULES:
-            return move_arm.GoalResponse.reject(f"unknown arm_id {arm_id}")
+            return move_arm.GoalDecision.reject(f"unknown arm_id {arm_id}")
         if arm_id in busy_arms:
-            return move_arm.GoalResponse.reject(f"arm {arm_id} is already moving")
+            return move_arm.GoalDecision.reject(f"arm {arm_id} is already moving")
         arm_module = ARM_MODULES[arm_id]
         arm_request = arm_module.GoalRequest(
             desired_position=request.data.desired_position
@@ -63,18 +63,18 @@ async def _run_arm_action(node_runner, token, active_handles, drive_tasks):
                 QoSProfile.Standard,
             )
         except Exception as e:
-            return move_arm.GoalResponse.reject(f"{side} fire_goal error: {e!r}")
-        if not arm_handle.data.accepted:
-            reason = arm_handle.data.error_message or f"{side} arm rejected goal"
+            return move_arm.GoalDecision.reject(f"{side} fire_goal error: {e!r}")
+        if not arm_handle.accepted:
+            reason = arm_handle.reason or f"{side} arm rejected goal"
             print(f"[controller] {side} arm rejected forwarded goal: {reason}")
-            return move_arm.GoalResponse.reject(reason)
+            return move_arm.GoalDecision.reject(reason)
         print(f"[controller] {side} arm accepted forwarded goal")
         busy_arms.add(arm_id)
         pending_handles[arm_id] = arm_handle
         # Tracked from the moment the forwarded goal exists, so the shutdown
         # hook in setup can cancel it; removed in _drive_goal's finally.
         active_handles[arm_id] = arm_handle
-        return move_arm.GoalResponse.accept()
+        return move_arm.GoalDecision.accept()
 
     cancelled = asyncio.ensure_future(token.cancelled())
     try:

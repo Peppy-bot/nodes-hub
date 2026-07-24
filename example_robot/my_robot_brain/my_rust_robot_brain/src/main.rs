@@ -147,7 +147,7 @@ async fn process_frame(node_runner: &NodeRunner, frame: &video_stream::Message) 
 
     // Get the action handles from accepted goals
     let left_handle = match left_goal_result {
-        Ok(handle) if handle.data.accepted => {
+        Ok(handle) if handle.accepted => {
             println!("[brain] Left arm goal accepted");
             Some(handle)
         }
@@ -162,7 +162,7 @@ async fn process_frame(node_runner: &NodeRunner, frame: &video_stream::Message) 
     };
 
     let right_handle = match right_goal_result {
-        Ok(handle) if handle.data.accepted => {
+        Ok(handle) if handle.accepted => {
             println!("[brain] Right arm goal accepted");
             Some(handle)
         }
