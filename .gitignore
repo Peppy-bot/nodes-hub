@@ -10,7 +10,42 @@
 *.orig
 
 # Python
-__pycache__
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Python packaging / build artifacts
+build/
+dist/
+*.egg
+*.egg-info/
+.eggs/
+wheels/
+
+# Python virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.dmypy.json
+.tox/
+.nox/
+.hypothesis/
+.ipynb_checkpoints/
+
+# Python coverage reports
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.cache/
 
 # Editor-specific files
 .vscode/
