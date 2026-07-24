@@ -54,9 +54,6 @@
                 $items: "i32",
                 $length: 3
               }
-            },
-            response_message_format: {
-              accepted: "bool"
             }
           },
           feedback_topic: {

@@ -66,12 +66,12 @@ async fn run_action(
                 );
                 let mut flag = busy_for_decider.lock().expect("busy lock poisoned");
                 if *flag {
-                    Ok(move_arm::GoalResponse::reject(
+                    Ok(move_arm::GoalDecision::reject(
                         "arm is already moving".to_string(),
                     ))
                 } else {
                     *flag = true;
-                    Ok(move_arm::GoalResponse::accept())
+                    Ok(move_arm::GoalDecision::accept())
                 }
             }) => next?,
         };

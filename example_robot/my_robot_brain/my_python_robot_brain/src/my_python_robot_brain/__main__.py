@@ -93,7 +93,7 @@ async def ai_process(node_runner: NodeRunner, latest_frame: LatestValueMailbox):
         left_handle = None
         if isinstance(left_goal_result, Exception):
             print(f"Failed to fire left arm goal: {left_goal_result}")
-        elif left_goal_result.data.accepted:
+        elif left_goal_result.accepted:
             print("[brain] Left arm goal accepted")
             left_handle = left_goal_result
         else:
@@ -102,7 +102,7 @@ async def ai_process(node_runner: NodeRunner, latest_frame: LatestValueMailbox):
         right_handle = None
         if isinstance(right_goal_result, Exception):
             print(f"Failed to fire right arm goal: {right_goal_result}")
-        elif right_goal_result.data.accepted:
+        elif right_goal_result.accepted:
             print("[brain] Right arm goal accepted")
             right_handle = right_goal_result
         else:

@@ -64,9 +64,9 @@ async def _run_action(
     def decide(request):
         print(f"[arm] received move_arm goal: {request.data.desired_position}")
         if busy[0]:
-            return move_arm.GoalResponse.reject("arm is already moving")
+            return move_arm.GoalDecision.reject("arm is already moving")
         busy[0] = True
-        return move_arm.GoalResponse.accept()
+        return move_arm.GoalDecision.accept()
 
     cancelled = asyncio.ensure_future(token.cancelled())
     try:
