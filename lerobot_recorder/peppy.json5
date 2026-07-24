@@ -1,0 +1,128 @@
+// ============================================================================
+// lerobot_recorder node manifest
+// ============================================================================
+// A robot-agnostic LeRobot recorder. Samples every bound joint_states source
+// plus any cameras onto a fixed fps grid and writes a LeRobot v3 dataset.
+// The order producers are bound to a slot is the order their values are
+// concatenated into observation.state, and dimension names derive from each
+// producer's instance id plus joint index, so the dataset layout is defined
+// entirely by the launcher with no robot-specific code.
+//
+// We could expand the parameters, types of cameras, also record joint *commands* too.
+{
+    peppy_schema: "node/v1",
+    manifest: {
+        name: "lerobot_recorder",
+        tag: "v1",
+        depends_on: {
+            contracts: [
+                // Example listed at end of file
+                {
+                    name: "joint_states",
+                    tag: "v1",
+                    link_id: "state_sources",
+                    cardinality: "one_or_more",
+                },
+                {
+                    name: "rgb_camera",
+                    tag: "v1",
+                    link_id: "color_cameras",
+                    cardinality: "zero_or_more",
+                },
+                // RGB-D cameras (e.g. D435) -> observation.images. (color) plus a depth
+                // feature (12-bit gray12le mp4 with lerobot's log quantization).
+                {
+                    name: "rgbd_camera",
+                    tag: "v1",
+                    link_id: "rgbd_cameras",
+                    cardinality: "zero_or_more",
+                },
+            ],
+        },
+    },
+    interfaces: {
+        topics: {
+            consumes: [
+                {
+                    link_id: "state_sources",
+                    name: "joint_states"
+                },
+                {
+                    link_id: "color_cameras",
+                    name: "video_stream"
+                },
+                {
+                    link_id: "rgbd_cameras",
+                    name: "video_stream"
+                },
+                {
+                    link_id: "rgbd_cameras",
+                    name: "depth_stream"
+                },
+            ],
+        },
+        services: {
+            consumes: [
+                // depth_unit (meters per z16 LSB) queried once per bound rgbd
+                // producer at startup.
+                {
+                    link_id: "rgbd_cameras",
+                    name: "depth_stream_info"
+                },
+            ],
+        },
+        actions: {
+            exposes: [
+                {
+                    name: "record_episode",
+                    goal_service: {
+                        request_message_format: {
+                            task: "string",
+                            feedback_period_s: "f64",
+                        },
+                        response_message_format: {
+                            accepted: "bool",
+                        },
+                    },
+                    // Published while recording 
+                    feedback_topic: {
+                        qos_profile: "standard",
+                        message_format: {
+                            // Count of frames written so far, not image data.
+                            frames_recorded: "u64",
+                            disk_free_bytes: "u64",
+                        },
+                    },
+                    result_service: {
+                        response_message_format: {
+                            episode_index: "i64",
+                            // Count of frames in the saved episode.
+                            frames_recorded: "u64",
+                            // Why the episode ended; empty for an operator stop.
+                            message: "string",
+                        },
+                    },
+                },
+            ],
+        },
+    },
+    execution: {
+        language: "python",
+        container: {
+            def_file: "apptainer.def",
+        },
+        parameters: {
+            // Dataset identity written into meta/info.json (e.g. "openarm_bimanual").
+            robot_type: "string",
+            // Dataset rate (Hz). Frame timestamps are exactly k/fps; every source is
+            // sampled latest-value onto this grid.
+            fps: "u32",
+            // Where sessions land: file:///data/lerobot or s3://bucket/prefix
+            // (R2 included; endpoint + credentials come from the standard AWS
+            // env vars, never from launch parameters). Each run creates
+            // <uri>/<utc_ts>/; s3 uploads stream in the background from a
+            // local staging dir.
+            storage_uri: "string",
+        },
+    },
+}
