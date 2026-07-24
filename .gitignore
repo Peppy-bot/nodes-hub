@@ -5,6 +5,8 @@
 # Rust
 # Match every node's build dir, not just one at the repo root.
 **/target/
+**/*.rs.bk
+*.pdb
 *.swp
 *.bak
 *.orig
