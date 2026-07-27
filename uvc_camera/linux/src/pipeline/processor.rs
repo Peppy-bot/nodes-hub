@@ -33,6 +33,13 @@ fn encode_jpeg(data: &[u8], width: u32, height: u32, _quality: u8) -> Result<Vec
 /// limited range for Y'CbCr; OpenCV, GStreamer, and nokhwa decode it the same
 /// way, so full-range math here would lift blacks and cap whites.
 fn yuyv_to_rgb(data: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
+    if !width.is_multiple_of(2) {
+        // YUYV packs two horizontal pixels per four bytes; an odd width would
+        // pair bytes across row boundaries and flip the chroma phase per row.
+        return Err(Error::EncodingError(format!(
+            "yuyv requires an even frame width, got {width}"
+        )));
+    }
     let expected = (width as usize) * (height as usize) * 2;
     if data.len() != expected {
         return Err(Error::EncodingError(format!(
@@ -189,6 +196,14 @@ mod tests {
     #[test]
     fn test_yuyv_rejects_wrong_payload_size() {
         assert!(yuyv_to_rgb(&[0u8; 5], 2, 1).is_err());
+    }
+
+    #[test]
+    fn test_yuyv_rejects_odd_width() {
+        // Odd widths would pair bytes across row boundaries (3x2), and an odd
+        // pixel count (3x1) would silently truncate the output buffer.
+        assert!(yuyv_to_rgb(&[0u8; 12], 3, 2).is_err());
+        assert!(yuyv_to_rgb(&[0u8; 6], 3, 1).is_err());
     }
 
     #[test]
