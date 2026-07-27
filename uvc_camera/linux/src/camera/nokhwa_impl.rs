@@ -106,10 +106,10 @@ impl CameraDevice for NokhwaCamera {
             ))
         })?;
 
-        // Read back the format actually negotiated by the driver — it may differ
+        // Read back the format actually negotiated by the driver; it may differ
         // from what was requested (e.g. hardware only supports MJPEG).
         let negotiated = camera.camera_format().format();
-        let actual_encoding = frame_format_to_encoding(negotiated);
+        let actual_encoding = frame_format_to_encoding(negotiated)?;
         println!(
             "[uvc_camera] Camera {} stream started. Requested format: {}, negotiated format: {} ({:?})",
             config.device_path, config.camera_encoding, actual_encoding, negotiated,
@@ -484,31 +484,36 @@ fn encoding_to_frame_format(encoding: Encoding) -> FrameFormat {
         Encoding::Mjpeg => FrameFormat::MJPEG,
         Encoding::Rgb8 => FrameFormat::RAWRGB,
         Encoding::Bgr8 => FrameFormat::RAWBGR,
+        Encoding::Yuyv => FrameFormat::YUYV,
     }
 }
 
 /// Map a negotiated nokhwa [`FrameFormat`] back to our [`Encoding`].
 ///
 /// Used to record what the camera driver actually settled on after `open_stream`,
-/// which may differ from what was requested.
-fn frame_format_to_encoding(fmt: FrameFormat) -> Encoding {
+/// which may differ from what was requested. A format we cannot represent is an
+/// error: labeling it with a substitute encoding would publish frames whose
+/// bytes do not match their declared layout.
+fn frame_format_to_encoding(fmt: FrameFormat) -> Result<Encoding> {
     match fmt {
-        FrameFormat::MJPEG => Encoding::Mjpeg,
-        FrameFormat::RAWRGB => Encoding::Rgb8,
-        FrameFormat::RAWBGR => Encoding::Bgr8,
-        other => {
-            tracing::warn!(
-                "Unknown camera FrameFormat {:?}, falling back to Rgb8",
-                other
-            );
-            Encoding::Rgb8
-        }
+        FrameFormat::MJPEG => Ok(Encoding::Mjpeg),
+        FrameFormat::RAWRGB => Ok(Encoding::Rgb8),
+        FrameFormat::RAWBGR => Ok(Encoding::Bgr8),
+        FrameFormat::YUYV => Ok(Encoding::Yuyv),
+        other => Err(Error::Camera(format!(
+            "camera negotiated unsupported format {other:?} (supported: mjpeg, rgb8, bgr8, yuyv)"
+        ))),
     }
 }
 
-/// Parse camera device path into index
+/// Parse camera device path into index. Symlinks (udev-pinned names like
+/// /dev/openarm/left_wrist_cam) resolve to their /dev/video<N> target first;
+/// a path that resolves to anything else is invalid.
 fn parse_camera_index(device_path: &str) -> Result<u32> {
-    if let Some(stripped) = device_path.strip_prefix("/dev/video") {
+    let resolved = std::fs::canonicalize(device_path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| device_path.to_string());
+    if let Some(stripped) = resolved.strip_prefix("/dev/video") {
         stripped
             .parse::<u32>()
             .map_err(|_| Error::InvalidDevicePath(device_path.to_string()))
@@ -535,29 +540,44 @@ mod tests {
             encoding_to_frame_format(Encoding::Mjpeg),
             FrameFormat::MJPEG
         );
+        assert_eq!(encoding_to_frame_format(Encoding::Yuyv), FrameFormat::YUYV);
     }
 
     #[test]
     fn test_frame_format_to_encoding() {
         assert_eq!(
-            frame_format_to_encoding(FrameFormat::RAWRGB),
+            frame_format_to_encoding(FrameFormat::RAWRGB).unwrap(),
             Encoding::Rgb8
         );
         assert_eq!(
-            frame_format_to_encoding(FrameFormat::RAWBGR),
+            frame_format_to_encoding(FrameFormat::RAWBGR).unwrap(),
             Encoding::Bgr8
         );
         assert_eq!(
-            frame_format_to_encoding(FrameFormat::MJPEG),
+            frame_format_to_encoding(FrameFormat::MJPEG).unwrap(),
             Encoding::Mjpeg
+        );
+        assert_eq!(
+            frame_format_to_encoding(FrameFormat::YUYV).unwrap(),
+            Encoding::Yuyv
         );
     }
 
     #[test]
+    fn test_frame_format_to_encoding_rejects_unrepresentable() {
+        assert!(frame_format_to_encoding(FrameFormat::NV12).is_err());
+    }
+
+    #[test]
     fn test_encoding_frame_format_roundtrip() {
-        for enc in [Encoding::Rgb8, Encoding::Bgr8, Encoding::Mjpeg] {
+        for enc in [
+            Encoding::Rgb8,
+            Encoding::Bgr8,
+            Encoding::Mjpeg,
+            Encoding::Yuyv,
+        ] {
             let fmt = encoding_to_frame_format(enc);
-            let back = frame_format_to_encoding(fmt);
+            let back = frame_format_to_encoding(fmt).unwrap();
             assert_eq!(back, enc, "Roundtrip failed for {enc:?}");
         }
     }

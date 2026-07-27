@@ -27,6 +27,45 @@ fn encode_jpeg(data: &[u8], width: u32, height: u32, _quality: u8) -> Result<Vec
     Ok(jpeg_data)
 }
 
+/// Decode YUYV 4:2:2 (one Y per pixel, U/V shared per pixel pair) to raw RGB8
+/// using limited-range BT.601 coefficients (Y 16..235, chroma 16..240).
+/// UVC cameras never signal quantization, and V4L2 resolves that default to
+/// limited range for Y'CbCr; OpenCV, GStreamer, and nokhwa decode it the same
+/// way, so full-range math here would lift blacks and cap whites.
+fn yuyv_to_rgb(data: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
+    if !width.is_multiple_of(2) {
+        // YUYV packs two horizontal pixels per four bytes; an odd width would
+        // pair bytes across row boundaries and flip the chroma phase per row.
+        return Err(Error::EncodingError(format!(
+            "yuyv requires an even frame width, got {width}"
+        )));
+    }
+    let expected = (width as usize) * (height as usize) * 2;
+    if data.len() != expected {
+        return Err(Error::EncodingError(format!(
+            "yuyv payload is {} bytes, expected {} for {}x{}",
+            data.len(),
+            expected,
+            width,
+            height
+        )));
+    }
+    let mut rgb = Vec::with_capacity((width as usize) * (height as usize) * 3);
+    for pair in data.chunks_exact(4) {
+        let [y0, u, y1, v] = [pair[0], pair[1], pair[2], pair[3]];
+        for y in [y0, y1] {
+            let y = 1.164_384 * (f32::from(y) - 16.0);
+            let u = f32::from(u) - 128.0;
+            let v = f32::from(v) - 128.0;
+            let r = y + 1.596_027 * v;
+            let g = y - 0.391_762 * u - 0.812_968 * v;
+            let b = y + 2.017_232 * u;
+            rgb.extend([r, g, b].map(|c| c.clamp(0.0, 255.0) as u8));
+        }
+    }
+    Ok(rgb)
+}
+
 /// Decode MJPEG data to raw RGB8
 fn decode_jpeg(data: &[u8]) -> Result<Vec<u8>> {
     use image::ImageDecoder;
@@ -65,6 +104,7 @@ pub fn process_frame(frame: Frame, frame_id: FrameId, target_encoding: Encoding)
         Encoding::Rgb8 => frame.data().to_vec(),
         Encoding::Bgr8 => rgb_to_bgr(frame.data()), // BGR→RGB is the same channel swap
         Encoding::Mjpeg => decode_jpeg(frame.data())?,
+        Encoding::Yuyv => yuyv_to_rgb(frame.data(), frame.width(), frame.height())?,
     };
 
     // Step 2: encode RGB8 to target
@@ -72,6 +112,12 @@ pub fn process_frame(frame: Frame, frame_id: FrameId, target_encoding: Encoding)
         Encoding::Rgb8 => rgb_data,
         Encoding::Bgr8 => rgb_to_bgr(&rgb_data),
         Encoding::Mjpeg => encode_jpeg(&rgb_data, frame.width(), frame.height(), JPEG_QUALITY)?,
+        Encoding::Yuyv => {
+            return Err(Error::EncodingError(
+                "yuyv topic_encoding is passthrough-only: it requires yuyv camera_encoding"
+                    .to_string(),
+            ));
+        }
     };
 
     Ok(frame
@@ -115,6 +161,65 @@ mod tests {
         // Check JPEG header
         assert!(frame.data().starts_with(&[0xFF, 0xD8]));
         assert_eq!(frame.encoding(), Encoding::Mjpeg);
+    }
+
+    #[test]
+    fn test_process_frame_yuyv_to_rgb8() {
+        // Limited-range mid grey: Y=128, U=V=128 -> 1.164384*(128-16) = 130.4.
+        let raw = Frame::from_capture(
+            vec![128, 128, 128, 128],
+            2,
+            1,
+            Instant::now(),
+            Encoding::Yuyv,
+        );
+        let frame = process_frame(raw, FrameId::default(), Encoding::Rgb8).unwrap();
+        assert_eq!(frame.encoding(), Encoding::Rgb8);
+        assert_eq!(frame.data(), &[130, 130, 130, 130, 130, 130]);
+    }
+
+    #[test]
+    fn test_yuyv_range_endpoints() {
+        // Limited-range black (Y=16) is RGB 0 and reference white (Y=235) is
+        // RGB 255; full-range math would leave them at 16 and 235.
+        let black = yuyv_to_rgb(&[16, 128, 16, 128], 2, 1).unwrap();
+        assert_eq!(black, vec![0, 0, 0, 0, 0, 0]);
+        let white = yuyv_to_rgb(&[235, 128, 235, 128], 2, 1).unwrap();
+        assert_eq!(white, vec![255, 255, 255, 255, 255, 255]);
+        // Footroom and headroom codes clamp instead of wrapping.
+        let sub_black = yuyv_to_rgb(&[0, 128, 0, 128], 2, 1).unwrap();
+        assert_eq!(sub_black, vec![0, 0, 0, 0, 0, 0]);
+        let super_white = yuyv_to_rgb(&[255, 128, 255, 128], 2, 1).unwrap();
+        assert_eq!(super_white, vec![255, 255, 255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn test_yuyv_rejects_wrong_payload_size() {
+        assert!(yuyv_to_rgb(&[0u8; 5], 2, 1).is_err());
+    }
+
+    #[test]
+    fn test_yuyv_rejects_odd_width() {
+        // Odd widths would pair bytes across row boundaries (3x2), and an odd
+        // pixel count (3x1) would silently truncate the output buffer.
+        assert!(yuyv_to_rgb(&[0u8; 12], 3, 2).is_err());
+        assert!(yuyv_to_rgb(&[0u8; 6], 3, 1).is_err());
+    }
+
+    #[test]
+    fn test_process_frame_yuyv_passthrough() {
+        let data = vec![10u8, 20, 30, 40];
+        let raw = Frame::from_capture(data.clone(), 2, 1, Instant::now(), Encoding::Yuyv);
+        let frame = process_frame(raw, FrameId::default(), Encoding::Yuyv).unwrap();
+        assert_eq!(frame.data(), &data);
+        assert_eq!(frame.encoding(), Encoding::Yuyv);
+    }
+
+    #[test]
+    fn test_yuyv_target_requires_passthrough() {
+        let rgb = vec![255, 0, 0, 0, 255, 0, 0, 0, 255];
+        let raw = Frame::from_capture(rgb, 3, 1, Instant::now(), Encoding::Rgb8);
+        assert!(process_frame(raw, FrameId::default(), Encoding::Yuyv).is_err());
     }
 
     #[test]
