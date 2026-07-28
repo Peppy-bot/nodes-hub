@@ -15,12 +15,13 @@ From: tuatini/peppy-python-uv-base:latest
     set -eux
     export DEBIAN_FRONTEND=noninteractive
 
-    # Keep the interpreter inside the image. uv installs managed Pythons under
-    # $HOME by default, and apptainer bind-mounts a home over that path while
-    # building, so the interpreter lands on the host rather than in the SIF and
-    # the venv's `python` is a symlink out of the image. That survives only as
-    # long as the same home is mounted at the same path at run time; anywhere
-    # it is not, the node builds perfectly and then dies at exec with
+    # Keep the interpreter out of the container user's home directory. uv
+    # installs managed Pythons under $HOME, so this one would land in /root
+    # inside the image. At run time apptainer mounts the home of the user
+    # running the daemon over the image's own home, taken from the image's
+    # /etc/passwd and so /root for uid 0, which covers whatever the build left
+    # there. A daemon running as root is left with a venv whose `python` points
+    # into a buried path, and the node dies at exec with
     # `./.venv/bin/python: not found`.
     export UV_PYTHON_INSTALL_DIR=/opt/uv-python
 
