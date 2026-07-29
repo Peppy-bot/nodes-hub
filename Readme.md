@@ -16,9 +16,8 @@ A node is a directory containing a `peppy.json5` manifest (`peppy_schema: "node/
 Nodes that implement the **same contract** are grouped under a folder named after that contract. The folder is organizational only, with no manifest of its own; each child is a full, independent node:
 
 ```text
-uvc_camera/                # groups every node implementing the `uvc_camera` contract
+uvc_camera/                # groups the UVC nodes implementing the `rgb_camera` contract
 ├── linux/peppy.json5      #   name: uvc_camera_linux        (rust, real)
-├── macos/peppy.json5      #   name: uvc_camera_macos        (real)
 ├── mock_python/peppy.json5 #  name: uvc_camera_python_mock  (simulated)
 └── mock_rust/peppy.json5  #   name: uvc_camera_rust_mock    (simulated)
 ```
@@ -33,7 +32,7 @@ Interchangeable nodes are connected through contracts defined in [`contracts-hub
 
   ```json5
   manifest: {
-    implements: [{ name: "uvc_camera", tag: "v1", link_id: "camera" }]
+    implements: [{ name: "rgb_camera", tag: "v1", link_id: "camera" }]
   },
   interfaces: {
     topics: { emits: [{ link_id: "camera", name: "video_stream" }] },
@@ -41,12 +40,12 @@ Interchangeable nodes are connected through contracts defined in [`contracts-hub
   }
   ```
 
-  The implementation must list every member of the contract exactly once. Every node implementing `uvc_camera:v1` is interchangeable with the others: a real Linux camera, a macOS camera, and a Python or Rust mock all satisfy the same contract.
+  The implementation must list every member of the contract exactly once. Every node implementing `rgb_camera:v1` is interchangeable with the others: a real Linux camera, a Python or Rust mock, and the sim relay all satisfy the same contract.
 - A consumer depends on the **contract**, not a specific node, through `manifest.depends_on.contracts`; the launcher binds it to whichever implementing node is selected. A consumer can also depend on a specific node via `manifest.depends_on.nodes`. Each dependency carries a `link_id` that wires it to the `topics`/`services`/`actions` the node consumes:
 
   ```json5
   manifest: {
-    depends_on: { contracts: [{ name: "uvc_camera", tag: "v1", link_id: "camera" }] }
+    depends_on: { contracts: [{ name: "rgb_camera", tag: "v1", link_id: "camera" }] }
   },
   interfaces: {
     topics: { consumes: [{ link_id: "camera", name: "video_stream" }] }
