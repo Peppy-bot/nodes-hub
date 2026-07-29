@@ -142,7 +142,6 @@ fn test_capture_color_bars() {
 #[test]
 #[ignore = "Requires v4l2loopback setup"]
 fn test_nokhwa_camera_end_to_end() {
-    use uvc_camera_linux::camera::CameraDevice;
     use uvc_camera_linux::camera::NokhwaCamera;
     use uvc_camera_linux::types::{CameraConfig, Encoding, FrameRate, Resolution};
 

@@ -10,6 +10,10 @@ use uvc_camera_linux::services::{
 use uvc_camera_linux::types::{CameraConfigBuilder, Encoding};
 
 fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .init();
+
     // Load parameters from mock file for standalone execution
     let mock_params: Parameters = serde_json::from_str(
         &std::fs::read_to_string("mock_parameters.json")
@@ -18,14 +22,13 @@ fn main() -> Result<()> {
     .expect("Failed to parse mock_parameters.json");
     let standalone_config = StandaloneConfig::new().with_parameters(&mock_params);
 
-    NodeBuilder::new()
-        .standalone(standalone_config)
-        .run(move |args: Parameters, node_runner| async move {
+    NodeBuilder::new().standalone(standalone_config).run(
+        move |args: Parameters, node_runner| async move {
             let video_params = args.video.clone();
             let device_path = args.device_path.clone();
 
-            println!(
-                "[uvc_camera] Video params: {}x{} @ {} fps, camera_encoding: {}, topic_encoding: {}",
+            tracing::info!(
+                "device {device_path}: {}x{} @ {} fps, camera_encoding {}, topic_encoding {}",
                 video_params.resolution.width,
                 video_params.resolution.height,
                 video_params.frame_rate,
@@ -33,27 +36,40 @@ fn main() -> Result<()> {
                 video_params.topic_encoding
             );
 
-            println!("[uvc_camera] Device: {device_path}");
-
-            // Parse and validate encoding formats
-            let camera_encoding = video_params.camera_encoding.parse::<Encoding>()
-                .unwrap_or_else(|e| {
-                    panic!("Invalid camera_encoding '{}': {}", video_params.camera_encoding, e)
-                });
-            let topic_encoding = video_params.topic_encoding.parse::<Encoding>()
-                .unwrap_or_else(|e| {
-                    panic!("Invalid topic_encoding '{}': {}", video_params.topic_encoding, e)
-                });
+            // Parse encodings up front: an unusable value is a misconfiguration
+            // that should fail the node, not surface later as a frame error.
+            let camera_encoding =
+                video_params
+                    .camera_encoding
+                    .parse::<Encoding>()
+                    .map_err(|e| {
+                        std::io::Error::other(format!(
+                            "Invalid camera_encoding '{}': {e}",
+                            video_params.camera_encoding
+                        ))
+                    })?;
+            let topic_encoding = video_params
+                .topic_encoding
+                .parse::<Encoding>()
+                .map_err(|e| {
+                    std::io::Error::other(format!(
+                        "Invalid topic_encoding '{}': {e}",
+                        video_params.topic_encoding
+                    ))
+                })?;
 
             // Create camera configuration
             let camera_config = CameraConfigBuilder::new()
                 .device_path(device_path.clone())
-                .resolution(video_params.resolution.width, video_params.resolution.height)
+                .resolution(
+                    video_params.resolution.width,
+                    video_params.resolution.height,
+                )
                 .frame_rate(video_params.frame_rate)
                 .camera_encoding(camera_encoding)
                 .topic_encoding(topic_encoding)
                 .build()
-                .unwrap_or_else(|e| panic!("Failed to create camera config: {}", e));
+                .map_err(std::io::Error::other)?;
 
             // Create control channel shared between service handlers and capture loop
             let (control_tx, control_rx) = create_control_channel();
@@ -101,15 +117,25 @@ fn main() -> Result<()> {
             });
 
             // ── capture loop (long-running, dedicated thread) ──────────────
-            // On failure the loop cancels the token itself, shutting the node
-            // down instead of leaving it running without a capture loop.
+            // Once streaming, the loop cancels the token on any exit, shutting
+            // the node down instead of leaving it running without a capture loop.
             let cancel_token = node_runner.cancellation_token().clone();
-            let capture_done = spawn_nokhwa_capture_loop(
+            let (camera_opened, capture_done) = spawn_nokhwa_capture_loop(
                 camera_config,
                 Arc::clone(&node_runner),
                 cancel_token,
                 control_rx,
             );
+
+            // Block readiness on the camera actually streaming. A node that
+            // cannot reach its camera has nothing to offer, so it exits
+            // non-zero here rather than idling while answering services.
+            camera_opened
+                .await
+                .map_err(|_| {
+                    std::io::Error::other("capture thread exited before reporting camera status")
+                })?
+                .map_err(std::io::Error::other)?;
 
             // The camera (V4L2 stream + device fd) is closed when the capture
             // thread drops it; await that here so device teardown is bounded
@@ -118,12 +144,11 @@ fn main() -> Result<()> {
                 let _ = capture_done.await;
             });
 
-            // Log when the shutdown/cancel signal is received so it is visible
-            // in the node's stdout.
             node_runner.on_shutdown(async move {
-                println!("[uvc_camera] Shutdown signal received");
+                tracing::info!("shutdown signal received");
             });
 
             Ok(())
-        })
+        },
+    )
 }

@@ -1,5 +1,6 @@
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 use std::os::unix::io::AsRawFd;
+use std::time::SystemTime;
 
 use nokhwa::Camera;
 use nokhwa::pixel_format::RgbFormat;
@@ -8,7 +9,6 @@ use nokhwa::utils::{
     RequestedFormat, RequestedFormatType, Resolution as NokhwaResolution,
 };
 
-use super::device::CameraDevice;
 use crate::camera::controls::{
     CameraControlRequest, ControlResult, ExposureMode, WhiteBalanceMode,
 };
@@ -23,33 +23,17 @@ const V4L2_EXPOSURE_AUTO_VALUE: i64 = 0;
 /// V4L2_EXPOSURE_MANUAL = 1 (manual exposure value via V4L2_CID_EXPOSURE_ABSOLUTE)
 const V4L2_EXPOSURE_MANUAL_VALUE: i64 = 1;
 
-/// Nokhwa-based camera implementation
+/// Nokhwa-based camera implementation.
 ///
-/// Note: Camera from nokhwa doesn't implement Send, but we use it in a single-threaded
-/// context (the dedicated capture thread) where it's never actually sent between threads
-/// during execution. The Send bound is required only for moving into the thread initially.
+/// `nokhwa::Camera` is `!Send` (its backend is an unbounded trait object), so
+/// the whole struct is built and used on the capture thread and never crosses a
+/// thread boundary. Nothing here asserts otherwise.
 pub struct NokhwaCamera {
-    camera: Option<SendableCamera>,
+    camera: Option<Camera>,
     /// The actual camera encoding negotiated after `open_stream()`. The camera
     /// driver may return a format different from what was requested, so this is
     /// read back from `camera.camera_format()` rather than taken from the config.
     actual_camera_encoding: Option<Encoding>,
-}
-
-/// Wrapper to make Camera Send-safe
-///
-/// SAFETY: Camera is used only within a single thread (the dedicated capture
-/// thread). It's never accessed from multiple threads concurrently.
-struct SendableCamera(Camera);
-unsafe impl Send for SendableCamera {}
-
-impl NokhwaCamera {
-    pub fn new() -> Self {
-        Self {
-            camera: None,
-            actual_camera_encoding: None,
-        }
-    }
 }
 
 impl Default for NokhwaCamera {
@@ -58,19 +42,24 @@ impl Default for NokhwaCamera {
     }
 }
 
-impl CameraDevice for NokhwaCamera {
-    fn open(&mut self, config: &CameraConfig) -> Result<()> {
-        println!(
-            "[uvc_camera] Opening nokhwa camera {}...",
-            config.device_path
-        );
+impl NokhwaCamera {
+    pub fn new() -> Self {
+        Self {
+            camera: None,
+            actual_camera_encoding: None,
+        }
+    }
+
+    /// Open and configure the camera.
+    pub fn open(&mut self, config: &CameraConfig) -> Result<()> {
+        tracing::debug!("opening nokhwa camera {}", config.device_path);
         let index = parse_camera_index(&config.device_path)?;
-        println!("[uvc_camera] Parsed index {}.", index);
+        tracing::debug!("parsed index {index}");
 
         // Validate the device before handing it to nokhwa, which can hang
         // indefinitely on non-capture devices (e.g. metadata nodes).
         validate_video_device(&config.device_path)?;
-        println!("[uvc_camera] Device {} validated.", config.device_path);
+        tracing::debug!("device {} validated", config.device_path);
 
         let frame_rate = config.frame_rate.as_u16();
         let requested =
@@ -80,11 +69,10 @@ impl CameraDevice for NokhwaCamera {
                 u32::from(frame_rate),
             )));
 
-        println!(
-            "[uvc_camera] Requesting format: {}x{} @ {} fps.",
+        tracing::debug!(
+            "requesting format: {}x{} @ {frame_rate} fps",
             config.resolution.width(),
             config.resolution.height(),
-            frame_rate
         );
 
         let mut camera = Camera::new(CameraIndex::Index(index), requested).map_err(|e| {
@@ -93,11 +81,6 @@ impl CameraDevice for NokhwaCamera {
                 config.device_path, e
             ))
         })?;
-
-        println!(
-            "[uvc_camera] Camera {} opened successfully.",
-            config.device_path
-        );
 
         camera.open_stream().map_err(|e| {
             Error::Camera(format!(
@@ -110,17 +93,30 @@ impl CameraDevice for NokhwaCamera {
         // from what was requested (e.g. hardware only supports MJPEG).
         let negotiated = camera.camera_format().format();
         let actual_encoding = frame_format_to_encoding(negotiated)?;
-        println!(
-            "[uvc_camera] Camera {} stream started. Requested format: {}, negotiated format: {} ({:?})",
-            config.device_path, config.camera_encoding, actual_encoding, negotiated,
+        tracing::info!(
+            "camera {} streaming: requested {}, negotiated {actual_encoding} ({negotiated:?})",
+            config.device_path,
+            config.camera_encoding,
         );
 
+        // A yuyv topic encoding is passthrough-only, so a driver that negotiated
+        // anything else would fail every single frame downstream. Refuse here
+        // instead of streaming into a loop that can never publish.
+        if config.topic_encoding == Encoding::Yuyv && actual_encoding != Encoding::Yuyv {
+            return Err(Error::Camera(format!(
+                "topic_encoding yuyv requires a yuyv camera stream, but {} negotiated {actual_encoding}; \
+                 set camera_encoding to yuyv on a camera that supports it, or pick another topic_encoding",
+                config.device_path,
+            )));
+        }
+
         self.actual_camera_encoding = Some(actual_encoding);
-        self.camera = Some(SendableCamera(camera));
+        self.camera = Some(camera);
         Ok(())
     }
 
-    fn capture_frame(&mut self) -> Result<Frame> {
+    /// Capture a single frame in the camera's negotiated encoding.
+    pub fn capture_frame(&mut self) -> Result<Frame> {
         let encoding = self
             .actual_camera_encoding
             .ok_or_else(|| Error::Camera("Camera not open".to_string()))?;
@@ -130,31 +126,31 @@ impl CameraDevice for NokhwaCamera {
             .ok_or_else(|| Error::Camera("Camera not open".to_string()))?;
 
         let frame = camera
-            .0
             .frame()
             .map_err(|e| Error::Camera(format!("Failed to capture frame: {}", e)))?;
+        let captured_at = SystemTime::now();
 
         let buffer = frame.buffer_bytes().to_vec();
         let resolution = frame.resolution();
-        let timestamp = std::time::Instant::now();
 
         Ok(Frame::from_capture(
             buffer,
             resolution.width_x,
             resolution.height_y,
-            timestamp,
+            captured_at,
             encoding,
         ))
     }
 
-    fn is_open(&self) -> bool {
+    /// Check if the camera is open.
+    pub fn is_open(&self) -> bool {
         self.camera.is_some()
     }
 
-    fn apply_control(&mut self, request: &CameraControlRequest) -> ControlResult {
-        let camera = match self.camera.as_mut() {
-            Some(c) => &mut c.0,
-            None => return ControlResult::err("Camera not open"),
+    /// Apply a camera control request, reporting the value actually taken.
+    pub fn apply_control(&mut self, request: &CameraControlRequest) -> ControlResult {
+        let Some(camera) = self.camera.as_mut() else {
+            return ControlResult::err("Camera not open");
         };
 
         match request {

@@ -8,5 +8,5 @@ pub mod parameters;
 // Re-export commonly used types
 pub use encoding::Encoding;
 pub use error::{Error, Result};
-pub use frame::{Frame, FrameId, FrameInfo};
+pub use frame::{Frame, FrameId};
 pub use parameters::{CameraConfig, CameraConfigBuilder, FrameRate, Resolution};
