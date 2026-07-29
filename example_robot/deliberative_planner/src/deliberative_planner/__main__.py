@@ -4,6 +4,14 @@ Plans over tens of seconds against a camera and an executor that typically run
 on another machine. It thinks at roughly 1 Hz, so a WAN round trip costs it a
 small fraction of its own cycle: latency is nearly free here, which is what
 makes it the half that can move to a datacenter.
+
+A mock in the shape of a large vision-language-action model: it runs no
+inference and needs no weights, so what it demonstrates is the wiring, the
+placement, and the lifecycle across a machine boundary. What it does reproduce
+faithfully is the shape of the real thing. It reads the same camera the policy
+reads, named identically, it plans two orders of magnitude slower than the
+control loop, and it has no way to touch an actuator, so nothing it does can
+stall the robot.
 """
 
 import asyncio
@@ -28,6 +36,11 @@ class Scene:
         self.frames_seen = 0
         self.executor_positions = [0.0, 0.0, 0.0]
         self.escalations = 0
+        # Which subgoal the executor last reported servoing on. Read from its
+        # own echo rather than assumed from what was published: a subgoal that
+        # was delivered is not necessarily one that was adopted, and one that was
+        # adopted can still lapse on the executor's staleness bound.
+        self.adopted_subgoal_id = 0
 
 
 async def watch_scene(node_runner: NodeRunner, scene: Scene) -> None:
@@ -50,7 +63,8 @@ async def watch_scene(node_runner: NodeRunner, scene: Scene) -> None:
             print(
                 f"[deliberative_planner] first frame received across the boundary "
                 f"from {producer.core_node}/{producer.instance_id}: "
-                f"{message.width}x{message.height} {message.encoding}"
+                f"{message.width}x{message.height} {message.encoding}",
+                flush=True,
             )
 
 
@@ -60,7 +74,8 @@ async def watch_executor(node_runner: NodeRunner, scene: Scene) -> None:
     peer = await situation.wait_paired(node_runner)
     print(
         f"[deliberative_planner] paired with executor "
-        f"{peer.producer.core_node}/{peer.producer.instance_id}"
+        f"{peer.producer.core_node}/{peer.producer.instance_id}",
+        flush=True,
     )
 
     while True:
@@ -69,6 +84,7 @@ async def watch_executor(node_runner: NodeRunner, scene: Scene) -> None:
             break
         _producer, message = received
         scene.executor_positions = list(message.joint_positions)
+        scene.adopted_subgoal_id = message.active_subgoal_id
         if message.escalated:
             scene.escalations += 1
 
@@ -87,9 +103,14 @@ async def plan(
     interval = 1.0 / params.plan_rate_hz
     print(
         f"[deliberative_planner] planning at {params.plan_rate_hz} Hz "
-        f"over a {params.horizon_s}s horizon"
+        f"over a {params.horizon_s}s horizon",
+        flush=True,
     )
 
+    # Numbered from 1 so that 0 stays available to the executor as "nothing is
+    # authoritative" in `situation.active_subgoal_id`. Consecutive subgoals
+    # always carry different ids, which is what lets a reader tell a newly
+    # adopted subgoal from a redelivery of the previous one.
     subgoal_id = 0
     while not token.is_cancelled():
         subgoal_id += 1
@@ -99,7 +120,9 @@ async def plan(
         )
         print(
             f"[deliberative_planner] subgoal {subgoal_id} target={target} "
-            f"(frames={scene.frames_seen}, escalations={scene.escalations})"
+            f"(frames={scene.frames_seen}, escalations={scene.escalations}, "
+            f"executor_on={scene.adopted_subgoal_id or 'none'})",
+            flush=True,
         )
         await asyncio.sleep(interval)
 
@@ -109,7 +132,7 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
     token = node_runner.cancellation_token()
 
     async def announce_shutdown():
-        print("[deliberative_planner] Shutdown signal received")
+        print("[deliberative_planner] Shutdown signal received", flush=True)
 
     node_runner.on_shutdown(announce_shutdown)
 

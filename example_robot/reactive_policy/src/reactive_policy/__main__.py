@@ -5,6 +5,12 @@ escalates anything it cannot resolve within its own horizon to a planner that
 may be a continent away. The uplink is an enhancement path, never a
 dependency: when subgoals stop arriving, this node keeps running on its own
 local behavior.
+
+A mock in the shape of a small onboard model. It runs no inference; it reports
+which subgoal it is currently servoing on, which is what a reader (or a test)
+needs in order to tell whether the cross-machine pairing is actually
+delivering. The one behavior here that is not scaffolding is the staleness
+watchdog below.
 """
 
 import asyncio
@@ -28,6 +34,10 @@ SITUATION_RATE_HZ = 10
 # that losing the uplink degrades behavior instead of stopping it.
 HOME_POSITION = [0.0, 0.0, 0.0]
 
+# What `situation.active_subgoal_id` carries when nothing is authoritative. The
+# planner numbers its subgoals from 1, so 0 can never collide with a real one.
+NO_SUBGOAL = 0
+
 
 class Situation:
     """Everything the control loop knows, shared across this node's tasks.
@@ -41,15 +51,24 @@ class Situation:
         self._subgoal_ttl_s = subgoal_ttl_ms / 1000.0
         self.joint_positions = list(HOME_POSITION)
         self.frames_seen = 0
+        self._subgoal_id = NO_SUBGOAL
         self._target = None
         self._adopted_at = None
 
-    def adopt(self, target: list[float], adopted_at: float) -> None:
-        self._target = list(target)
-        self._adopted_at = adopted_at
+    def adopt(self, subgoal_id: int, target: list[float]) -> None:
+        """Takes a subgoal as authoritative, starting its lifetime now.
 
-    def authoritative_target(self, now: float):
-        """The subgoal to servo toward, or None once it has gone stale.
+        The lifetime is timed from this moment on this node's own monotonic
+        clock, never from the planner's `stamp`. The two machines do not share a
+        clock, and a watchdog that trusted a remote timestamp would misjudge
+        exactly when it matters most.
+        """
+        self._subgoal_id = subgoal_id
+        self._target = list(target)
+        self._adopted_at = time.monotonic()
+
+    def authoritative_subgoal(self) -> tuple[int, list[float]] | None:
+        """The `(subgoal_id, target)` in force right now, or None if stale.
 
         This is the whole staleness watchdog. Peppy guarantees a dissolution
         notice when a peer instance dies cleanly, but an unreachable daemon
@@ -58,9 +77,9 @@ class Situation:
         """
         if self._adopted_at is None:
             return None
-        if now - self._adopted_at > self._subgoal_ttl_s:
+        if time.monotonic() - self._adopted_at > self._subgoal_ttl_s:
             return None
-        return self._target
+        return self._subgoal_id, self._target
 
 
 async def track_arm(node_runner: NodeRunner, state: Situation) -> None:
@@ -84,7 +103,8 @@ async def track_camera(node_runner: NodeRunner, state: Situation) -> None:
         if state.frames_seen == 1:
             print(
                 f"[reactive_policy] first frame from the local camera: "
-                f"{message.width}x{message.height} {message.encoding}"
+                f"{message.width}x{message.height} {message.encoding}",
+                flush=True,
             )
 
 
@@ -99,7 +119,8 @@ async def adopt_subgoals(node_runner: NodeRunner, state: Situation) -> None:
     peer = await subgoal.wait_paired(node_runner)
     print(
         f"[reactive_policy] paired with planner "
-        f"{peer.producer.core_node}/{peer.producer.instance_id}"
+        f"{peer.producer.core_node}/{peer.producer.instance_id}",
+        flush=True,
     )
 
     while True:
@@ -107,11 +128,12 @@ async def adopt_subgoals(node_runner: NodeRunner, state: Situation) -> None:
         if received is None:
             break
         _producer, message = received
-        state.adopt(message.target_position, time.time())
+        state.adopt(message.subgoal_id, message.target_position)
         print(
             f"[reactive_policy] adopted subgoal {message.subgoal_id} "
             f"target={[round(p, 3) for p in message.target_position]} "
-            f"horizon={message.horizon_s}s"
+            f"horizon={message.horizon_s}s",
+            flush=True,
         )
 
 
@@ -126,10 +148,20 @@ async def report_situation(node_runner: NodeRunner, state: Situation) -> None:
     interval = 1.0 / SITUATION_RATE_HZ
 
     while True:
-        now = time.time()
-        escalated = state.authoritative_target(now) is None
+        authoritative = state.authoritative_subgoal()
+        # Echoing the adopted subgoal back is what makes adoption observable
+        # rather than assumed: the planner learns that the subgoal it sent is
+        # the one being acted on, and so does anything observing this role.
+        active_subgoal_id = authoritative[0] if authoritative else NO_SUBGOAL
         await publisher.publish(
-            situation.build_message(now, list(state.joint_positions), escalated)
+            situation.build_message(
+                # The wall clock, deliberately: `stamp` is for the reader, while
+                # the TTL is timed monotonically inside `Situation`.
+                time.time(),
+                list(state.joint_positions),
+                active_subgoal_id,
+                authoritative is None,
+            )
         )
         await asyncio.sleep(interval)
 
@@ -144,12 +176,12 @@ async def control_loop(
     can be made slower by a bad link.
     """
     interval = 1.0 / params.control_rate_hz
-    print(f"[reactive_policy] servo loop at {params.control_rate_hz} Hz")
+    print(f"[reactive_policy] servo loop at {params.control_rate_hz} Hz", flush=True)
 
     running_on_fallback = None
     while not token.is_cancelled():
-        target = state.authoritative_target(time.time())
-        on_fallback = target is None
+        authoritative = state.authoritative_subgoal()
+        on_fallback = authoritative is None
 
         # Log only on transitions. At 200 Hz, logging per tick would bury the
         # one line that matters in tens of thousands that do not.
@@ -158,12 +190,18 @@ async def control_loop(
             if on_fallback:
                 print(
                     "[reactive_policy] no authoritative subgoal; "
-                    "falling back to local behavior"
+                    "falling back to local behavior",
+                    flush=True,
                 )
             else:
-                print("[reactive_policy] servoing to the planner's subgoal")
+                print(
+                    "[reactive_policy] servoing to the planner's subgoal",
+                    flush=True,
+                )
 
-        _ = target if target is not None else HOME_POSITION
+        # Where a real policy would drive the arm toward the target. A mock only
+        # has to be honest about which of the two it is servoing on.
+        _ = authoritative[1] if authoritative else HOME_POSITION
         await asyncio.sleep(interval)
 
 
@@ -172,7 +210,7 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
     token = node_runner.cancellation_token()
 
     async def announce_shutdown():
-        print("[reactive_policy] Shutdown signal received")
+        print("[reactive_policy] Shutdown signal received", flush=True)
 
     node_runner.on_shutdown(announce_shutdown)
 
