@@ -1,0 +1,66 @@
+// The small onboard model. Closes the servo loop at 200 Hz against hardware
+// that is one process away, and escalates anything it cannot resolve within
+// its horizon to the planner over the `deliberation` pair.
+//
+// Everything this node needs to keep the robot safe is LOCAL: the camera and
+// the arm are producer links, so placement keeps the servo path off the WAN.
+// The pairing is an enhancement path, not a dependency: a subgoal is
+// authoritative for `subgoal_ttl_ms` and then this node falls back to its own
+// behavior, which is why an unreachable planner degrades it rather than
+// stopping it.
+{
+  peppy_schema: "node/v1",
+  manifest: {
+    name: "reactive_policy",
+    tag: "v1",
+    labels: ["policy"],
+    depends_on: {
+      contracts: [
+        { name: "rgb_camera", tag: "v1", link_id: "camera" },
+      ],
+      nodes: [
+        { name: "my_python_robot_arm", tag: "v1", link_id: "arm" },
+      ],
+      pairings: [
+        // The fast side of the conversation: this node executes.
+        { name: "task_delegation", tag: "v1", role: "executor", link_id: "deliberation" },
+      ],
+    },
+  },
+  interfaces: {
+    topics: {
+      consumes: [
+        { link_id: "camera", name: "video_stream" },
+        // The planner's answers.
+        { link_id: "deliberation", name: "subgoal" },
+      ],
+      emits: [
+        // What this node is facing, and whether it needs help.
+        { link_id: "deliberation", name: "situation" },
+      ],
+    },
+    actions: {
+      consumes: [
+        { link_id: "arm", name: "move_arm" },
+      ],
+    },
+  },
+  execution: {
+    language: "python",
+    parameters: {
+      // Servo rate. The loop this node owns; nothing across a daemon boundary
+      // is allowed to gate it.
+      control_rate_hz: "u32",
+      // How long a subgoal from the planner stays authoritative before this
+      // node falls back to its own local behavior. Bounds how much a slow or
+      // severed uplink can affect the robot.
+      //
+      // This is the node's own staleness watchdog. peppy notifies a peer when
+      // an instance stops or dies, but an unreachable daemon cannot send that
+      // notification, so freshness is this node's responsibility.
+      subgoal_ttl_ms: "u32",
+    },
+    build_cmd: ["uv", "sync", "--no-editable"],
+    run_cmd: ["./.venv/bin/python", "-m", "reactive_policy"],
+  },
+}
