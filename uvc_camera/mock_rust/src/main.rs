@@ -3,7 +3,9 @@ use ffmpeg::software::scaling::{Context as ScalerContext, Flags as ScalerFlags};
 use ffmpeg::util::frame::video::Video as VideoFrame;
 use ffmpeg_next as ffmpeg;
 use peppygen::emitted_topics::camera::video_stream::{self, MessageHeader};
-use peppygen::exposed_services::camera::video_stream_info;
+use peppygen::exposed_services::camera::{
+    set_brightness, set_contrast, set_exposure, set_gain, set_white_balance, video_stream_info,
+};
 use peppygen::parameters::{self};
 use peppygen::{NodeBuilder, Parameters, Result, StandaloneConfig};
 use peppylib::runtime::CancellationToken;
@@ -93,6 +95,8 @@ fn main() -> Result<()> {
         tokio::spawn(async move {
             listen_for_video_stream_info_requests(service_node_runner, service_video_params, actual_fps, service_cancel_token).await;
         });
+
+        spawn_control_acks(&node_runner);
 
         // Long running tasks should always be spawned in a different thread
         let cancel_token = node_runner.cancellation_token().clone();
@@ -295,6 +299,44 @@ fn decode_frames(
         // Loop restarts - video will be reopened from the beginning
         println!("[uvc_camera] Video ended, restarting from beginning...");
     }
+}
+
+/// Answer the five camera control services the `rgb_camera` contract requires.
+///
+/// The mock has no hardware to adjust, so each one acknowledges the request and
+/// echoes the value back. Leaving them unanswered would hang any caller until
+/// its timeout, and a stack developed against the mock would only discover the
+/// gap when swapped onto real hardware.
+fn spawn_control_acks(node_runner: &Arc<peppygen::NodeRunner>) {
+    macro_rules! spawn_ack {
+        ($service:ident, $current:ident $(, $echoed:ident)?) => {{
+            let runner = Arc::clone(node_runner);
+            let cancel_token = node_runner.cancellation_token().clone();
+            tokio::spawn(async move {
+                loop {
+                    let result = tokio::select! {
+                        _ = cancel_token.cancelled() => break,
+                        result = $service::handle_next_request(&runner, |request| {
+                            Ok($service::Response::new(
+                                true,
+                                concat!("mock: ", stringify!($service), " acknowledged").to_string(),
+                                request.data.$current,
+                            ))
+                        }) => result,
+                    };
+                    if let Err(e) = result {
+                        tracing::error!("{} service error: {e:?}", stringify!($service));
+                    }
+                }
+            });
+        }};
+    }
+
+    spawn_ack!(set_exposure, value);
+    spawn_ack!(set_white_balance, temperature);
+    spawn_ack!(set_gain, value);
+    spawn_ack!(set_brightness, value);
+    spawn_ack!(set_contrast, value);
 }
 
 async fn listen_for_video_stream_info_requests(

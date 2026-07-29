@@ -10,7 +10,14 @@ from pathlib import Path
 
 
 from peppygen import NodeBuilder, NodeRunner, StandaloneConfig
-from peppygen.exposed_services.camera import video_stream_info
+from peppygen.exposed_services.camera import (
+    set_brightness,
+    set_contrast,
+    set_exposure,
+    set_gain,
+    set_white_balance,
+    video_stream_info,
+)
 from peppygen.emitted_topics.camera import video_stream
 from peppygen.emitted_topics.camera.video_stream import MessageHeader
 from peppygen.parameters import Parameters
@@ -208,6 +215,7 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
         ),
         # Video loop
         asyncio.create_task(run_video_loop(node_runner, frame_queue, publisher)),
+        *control_ack_tasks(node_runner),
     ]
 
 
@@ -242,6 +250,50 @@ async def run_video_loop(node_runner: NodeRunner, frame_queue: queue.Queue, publ
         if time.monotonic() - last_print_time >= 3:
             print(f"[uvc_camera] Emitted frame {emitted}")
             last_print_time = time.monotonic()
+
+
+# The five camera control services of the rgb_camera contract, paired with the
+# request field each one echoes back. The mock has no hardware to adjust, so it
+# acknowledges and returns the requested value; leaving them unanswered would
+# hang any caller until its timeout, and a stack developed against the mock
+# would only discover the gap when swapped onto real hardware.
+CONTROL_SERVICES = (
+    (set_exposure, "value", "current_value"),
+    (set_white_balance, "temperature", "current_temperature"),
+    (set_gain, "value", "current_value"),
+    (set_brightness, "value", "current_value"),
+    (set_contrast, "value", "current_value"),
+)
+
+
+def control_ack_tasks(node_runner: NodeRunner) -> list[asyncio.Task]:
+    return [
+        asyncio.create_task(
+            listen_for_control_acks(node_runner, service, request_field, response_field)
+        )
+        for service, request_field, response_field in CONTROL_SERVICES
+    ]
+
+
+async def listen_for_control_acks(
+    node_runner: NodeRunner, service, request_field: str, response_field: str
+):
+    token = node_runner.cancellation_token()
+    while not token.is_cancelled():
+        try:
+            await wait_unless_cancelled(
+                service.handle_next_request(
+                    node_runner,
+                    lambda request: service.Response(
+                        success=True,
+                        message=f"mock: {service.__name__.rsplit('.', 1)[-1]} acknowledged",
+                        **{response_field: getattr(request.data, request_field)},
+                    ),
+                ),
+                token,
+            )
+        except Exception as e:
+            print(f"{service.__name__} service error: {e}")
 
 
 async def listen_for_video_stream_info_requests(
