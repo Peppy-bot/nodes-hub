@@ -17,6 +17,13 @@ Three of the nodes above are meant to run together, deliberately split across
 machines: a fast reactive policy on the robot, a slow deliberative planner
 wherever the accelerator is, and a recorder beside the planner.
 
+They are mocks in the shape of the real components. The planner runs no
+inference and the policy servos on nothing, so what the three demonstrate is the
+wiring, the placement, and the lifecycle across a machine boundary, not
+inference quality. That is also what makes them safe to drive from peppy's
+multi-daemon E2E: no model weights, and no behavior that depends on how fast the
+host is.
+
 | Node | Runs on | Role |
 |---|---|---|
 | `reactive_policy:v1` | the robot | Closes a 200 Hz servo loop against local hardware, and escalates what it cannot resolve. |
@@ -36,6 +43,13 @@ Between them, each of the three cross-machine mechanisms appears exactly once.
 - **Observation.** The recorder taps the executor side of that pairing without
   joining it. It claims no endpoint and emits nothing, so however it behaves it
   cannot perturb control.
+
+The policy echoes the subgoal it adopted back to the planner in
+`situation.active_subgoal_id`, so adoption is reported by the side that adopts
+rather than inferred by the side that sent. Delivery is not adoption, and an
+adopted subgoal can lapse on the executor's own staleness bound without the
+planner sending anything. That field is also what lets the recorder, party to
+neither side of the pair, tell a newly adopted subgoal from a redelivery.
 
 ### Degradation
 
