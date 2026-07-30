@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "xr_commander"
+version = "0.1.0"
+description = "xr_commander peppy node"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "peppygen",
+    "peppylib",
+    # The WebXR server, its prebuilt frontend, and the WebRTC video path.
+    "teleop-xr>=1.3.5,<2",
+    # Imported directly (pose algebra, frame decode, the self-signed TLS
+    # identity), not just via teleop-xr.
+    "cryptography>=42",
+    "numpy>=1.26",
+    "opencv-python>=4.9",
+    "uvicorn>=0.30",
+]
+
+[project.scripts]
+xr_commander = "xr_commander.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/xr_commander"]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.uv.sources]
+peppygen = { path = ".peppy/libs/peppygen" }
+peppylib = { path = ".peppy/libs/peppylib" }

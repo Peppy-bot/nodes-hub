@@ -1,0 +1,94 @@
+// xr_commander: a robot-agnostic teleoperation leader driven from a WebXR
+// headset. Serves the WebXR page (teleop_xr), streams a Cartesian setpoint per
+// hand on pose_link and an opening per hand on gripper_link, and relays bound
+// cameras into the headset as WebRTC tracks. Carries no kinematics: solving a
+// pose into joints is the follower's business. The deadman is the grip button,
+// per hand; released means nothing is published and the follower holds.
+{
+  peppy_schema: "node/v1",
+  manifest: {
+    name: "xr_commander",
+    tag: "v1",
+    labels: [
+      "teleop",
+      "xr",
+      "webxr",
+      "commander",
+    ],
+    depends_on: {
+      contracts: [
+        // Operator video: each bound camera becomes one named WebRTC track,
+        // keyed by instance id. Depth of an RGB-D camera is not consumed.
+        { name: "rgb_camera", tag: "v1", link_id: "color_cameras", cardinality: "zero_or_more" },
+        { name: "rgbd_camera", tag: "v1", link_id: "rgbd_cameras", cardinality: "zero_or_more" },
+        // The whole-robot ready move, fired from the A button. Unbound leaves
+        // the button inert; with several bound, the first producer is used.
+        { name: "ready_posture", tag: "v1", link_id: "ready_posture", cardinality: "zero_or_more" },
+      ],
+      pairings: [
+        // One Cartesian command loop per operator hand; which physical arm a
+        // hand drives is the launcher's choice. Optional: an unbound hand
+        // commands nothing.
+        { name: "pose_link", tag: "v1", role: "leader", link_id: "left_arm", optional: true },
+        { name: "pose_link", tag: "v1", role: "leader", link_id: "right_arm", optional: true },
+        // The same hand's opening loop, from its analog trigger.
+        { name: "gripper_link", tag: "v1", role: "leader", link_id: "left_gripper", optional: true },
+        { name: "gripper_link", tag: "v1", role: "leader", link_id: "right_gripper", optional: true },
+      ],
+    },
+  },
+  interfaces: {
+    topics: {
+      emits: [
+        { link_id: "left_arm", name: "pose_setpoints" },
+        { link_id: "right_arm", name: "pose_setpoints" },
+        { link_id: "left_gripper", name: "gripper_setpoints" },
+        { link_id: "right_gripper", name: "gripper_setpoints" },
+      ],
+      consumes: [
+        // Measured end-effector pose: the clutch's engage snapshot.
+        { link_id: "left_arm", name: "pose_states" },
+        { link_id: "right_arm", name: "pose_states" },
+        { link_id: "color_cameras", name: "video_stream" },
+        { link_id: "rgbd_cameras", name: "video_stream" },
+      ],
+    },
+    actions: {
+      consumes: [
+        { link_id: "ready_posture", name: "move_to_ready" },
+      ],
+    },
+  },
+  execution: {
+    language: "python",
+    container: {
+      def_file: "apptainer.def",
+    },
+    parameters: {
+      // Rate (Hz, 1..=1000) the per-hand setpoint streams publish at while
+      // engaged.
+      command_rate_hz: "u32",
+      // Where the WebXR page is served (always TLS, self-generated cert).
+      https_port: { $type: "u32", $default: 4443 },
+      https_host: { $type: "string", $default: "0.0.0.0" },
+      // Hand travel to end-effector travel. Orientation is never scaled.
+      motion_scale: { $type: "f64", $default: 1.0 },
+      // Opening commanded at a released trigger; a pull spans [0, this].
+      gripper_open_fraction: { $type: "f64", $default: 1.0 },
+      // Requested duration (s) of the A button's ready move; 0 = fastest.
+      ready_move_duration_s: { $type: "f64", $default: 2.0 },
+      // Oldest headset frame still trusted (s). Older means operator input
+      // is unknown (a frozen link still shows the last buttons held), so
+      // every stream goes silent and the followers hold, grippers included.
+      // A still-held grip re-engages from a fresh snapshot when frames
+      // resume, so the gap's motion is discarded, never replayed. The same
+      // window bounds the follower's measured pose: engaging waits for a
+      // fresh one.
+      stale_timeout_s: { $type: "f64", $default: 0.25 },
+      // Camera instance id -> headset view name, "inst=view" comma-separated
+      // ("" = every camera shows under its instance id). The names
+      // "wrist_left"/"wrist_right" anchor those feeds to the controllers.
+      camera_names: { $type: "string", $default: "" },
+    },
+  },
+}
