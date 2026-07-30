@@ -138,11 +138,11 @@ fn test_capture_color_bars() {
     drop(vcam);
 }
 
-/// Integration test: Capture from virtual camera using NokhwaCamera
+/// Integration test: Capture from a virtual camera through this crate's API
 #[test]
 #[ignore = "Requires v4l2loopback setup"]
-fn test_nokhwa_camera_end_to_end() {
-    use uvc_camera_linux::camera::NokhwaCamera;
+fn test_camera_device_end_to_end() {
+    use uvc_camera_linux::camera::CameraDevice;
     use uvc_camera_linux::types::{CameraConfig, Encoding, FrameRate, Resolution};
 
     let vcam = match VirtualCamera::new(10, 640, 480, 30) {
@@ -154,7 +154,7 @@ fn test_nokhwa_camera_end_to_end() {
     };
 
     // Test end-to-end: open camera and capture frame using our API
-    let mut camera = NokhwaCamera::new();
+    let mut camera = CameraDevice::new();
     let config = CameraConfig {
         device_path: "/dev/video10".to_string(),
         resolution: Resolution::new(640, 480),

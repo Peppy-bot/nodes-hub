@@ -28,7 +28,7 @@ const V4L2_EXPOSURE_MANUAL_VALUE: i64 = 1;
 /// `nokhwa::Camera` is `!Send` (its backend is an unbounded trait object), so
 /// the whole struct is built and used on the capture thread and never crosses a
 /// thread boundary. Nothing here asserts otherwise.
-pub struct NokhwaCamera {
+pub struct CameraDevice {
     camera: Option<Camera>,
     /// The actual camera encoding negotiated after `open_stream()`. The camera
     /// driver may return a format different from what was requested, so this is
@@ -36,13 +36,13 @@ pub struct NokhwaCamera {
     actual_camera_encoding: Option<Encoding>,
 }
 
-impl Default for NokhwaCamera {
+impl Default for CameraDevice {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl NokhwaCamera {
+impl CameraDevice {
     pub fn new() -> Self {
         Self {
             camera: None,

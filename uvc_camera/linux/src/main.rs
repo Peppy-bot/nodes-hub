@@ -1,7 +1,7 @@
 use peppygen::{NodeBuilder, Parameters, Result, StandaloneConfig};
 use std::sync::Arc;
 
-use uvc_camera_linux::camera::{create_control_channel, spawn_nokhwa_capture_loop};
+use uvc_camera_linux::camera::{create_control_channel, spawn_capture_loop};
 use uvc_camera_linux::services::{
     listen_for_set_brightness_requests, listen_for_set_contrast_requests,
     listen_for_set_exposure_requests, listen_for_set_gain_requests,
@@ -84,7 +84,7 @@ fn main() -> Result<()> {
             // Once streaming, the loop cancels the token on any exit, shutting
             // the node down instead of leaving it running without a capture loop.
             let cancel_token = node_runner.cancellation_token().clone();
-            let (camera_opened, capture_done) = spawn_nokhwa_capture_loop(
+            let (camera_opened, capture_done) = spawn_capture_loop(
                 camera_config.clone(),
                 Arc::clone(&node_runner),
                 cancel_token,

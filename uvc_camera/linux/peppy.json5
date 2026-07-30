@@ -15,9 +15,6 @@
   execution: {
     language: "rust",
     container: {
-      // No device mount: host /dev is already visible in the container, and a
-      // remapped /dev bind is applied nodev, which would shadow the real
-      // device node the driver needs.
       def_file: "apptainer.def",
     },
     parameters: {

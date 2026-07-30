@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
 use crate::camera::controls::ControlReceiver;
-use crate::camera::nokhwa_impl::NokhwaCamera;
+use crate::camera::v4l_device::CameraDevice;
 use crate::pipeline;
 use crate::types::{CameraConfig, Error, FrameId, Result};
 
@@ -94,9 +94,9 @@ impl PublishWindow {
 /// `Runtime::drop` blocks until every blocking-pool task returns, so a V4L2
 /// call wedged in the driver (e.g. an untimed frame dequeue after the camera
 /// is unplugged) would hang shutdown past the grace window. A plain thread
-/// cannot outlive process exit. It also keeps the camera on a single OS
-/// thread: `nokhwa::Camera` is `!Send`, and it is built here rather than passed
-/// in so it never crosses a thread boundary at all.
+/// cannot outlive process exit. It also keeps the camera on a single OS thread:
+/// the underlying V4L2 handle is `!Send`, and it is built here rather than
+/// passed in so it never crosses a thread boundary at all.
 ///
 /// Returns two receivers:
 /// - the open outcome, so setup can fail the node when the camera is
@@ -104,7 +104,7 @@ impl PublishWindow {
 /// - a completion signal that resolves once the thread has exited and the
 ///   camera has been dropped (device closed). Await it from an `on_shutdown`
 ///   hook so device teardown is bounded by the shutdown grace window.
-pub fn spawn_nokhwa_capture_loop(
+pub fn spawn_capture_loop(
     config: CameraConfig,
     node_runner: Arc<peppygen::NodeRunner>,
     cancel_token: CancellationToken,
@@ -117,7 +117,7 @@ pub fn spawn_nokhwa_capture_loop(
     std::thread::spawn(move || {
         // The camera is dropped at the end of this closure either way, so by the
         // time `done_tx` fires the device is closed.
-        if let Some(camera) = open_camera(NokhwaCamera::new(), &config, open_tx) {
+        if let Some(camera) = open_camera(CameraDevice::new(), &config, open_tx) {
             // Armed only once the camera is streaming. Arming it any earlier
             // would race the open report: setup selects over its own future and
             // the cancellation token, so a cancel landing alongside the failure
@@ -152,10 +152,10 @@ pub fn spawn_nokhwa_capture_loop(
 /// failure into the node's exit error, which is what distinguishes a broken
 /// camera from an operator stop.
 fn open_camera(
-    mut camera: NokhwaCamera,
+    mut camera: CameraDevice,
     config: &CameraConfig,
     open_tx: oneshot::Sender<Result<()>>,
-) -> Option<NokhwaCamera> {
+) -> Option<CameraDevice> {
     match camera.open(config) {
         Ok(()) => {
             let _ = open_tx.send(Ok(()));
@@ -175,7 +175,7 @@ fn open_camera(
 /// Returns an error if the publisher cannot be declared, or if frames keep
 /// failing for longer than [`FRAME_FAILURE_GRACE`].
 fn run_camera_capture_loop(
-    mut camera: NokhwaCamera,
+    mut camera: CameraDevice,
     config: &CameraConfig,
     node_runner: &Arc<peppygen::NodeRunner>,
     runtime: &tokio::runtime::Handle,
