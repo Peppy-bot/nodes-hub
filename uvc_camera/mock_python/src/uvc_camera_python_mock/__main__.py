@@ -44,6 +44,9 @@ DECODER_STOP_TIMEOUT_SECONDS = 2.0
 # the cancellation token periodically and its (non-daemon) worker can never park
 # forever, which would otherwise stall interpreter finalization at shutdown.
 CONSUMER_GET_TIMEOUT_SECONDS = 0.5
+# Pause after a service handler raises, so a persistent failure cannot spin its
+# loop as fast as the exception can be raised.
+SERVICE_ERROR_BACKOFF_SECONDS = 0.5
 
 
 def get_source_video_fps(video_path: Path) -> int:
@@ -278,6 +281,7 @@ def control_ack_tasks(node_runner: NodeRunner) -> list[asyncio.Task]:
 async def listen_for_control_acks(
     node_runner: NodeRunner, service, request_field: str, response_field: str
 ):
+    name = service.__name__.rsplit(".", 1)[-1]
     token = node_runner.cancellation_token()
     while not token.is_cancelled():
         try:
@@ -286,14 +290,17 @@ async def listen_for_control_acks(
                     node_runner,
                     lambda request: service.Response(
                         success=True,
-                        message=f"mock: {service.__name__.rsplit('.', 1)[-1]} acknowledged",
+                        message=f"mock: {name} acknowledged",
                         **{response_field: getattr(request.data, request_field)},
                     ),
                 ),
                 token,
             )
         except Exception as e:
-            print(f"{service.__name__} service error: {e}")
+            print(f"{name} service error: {e}")
+            # Back off: a persistent failure (messenger down) would otherwise
+            # spin this loop as fast as the exception can be raised.
+            await asyncio.sleep(SERVICE_ERROR_BACKOFF_SECONDS)
 
 
 async def listen_for_video_stream_info_requests(
@@ -315,7 +322,8 @@ async def listen_for_video_stream_info_requests(
                 token,
             )
         except Exception as e:
-            print(f"get_camera_info service error: {e}")
+            print(f"video_stream_info service error: {e}")
+            await asyncio.sleep(SERVICE_ERROR_BACKOFF_SECONDS)
 
 
 def main():

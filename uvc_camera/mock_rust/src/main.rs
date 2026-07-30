@@ -32,6 +32,13 @@ fn get_source_video_fps(video_path: &PathBuf) -> u8 {
 }
 
 fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
     ffmpeg::init().expect("Failed to initialize FFmpeg");
 
     // Probe source video to get its actual frame rate
@@ -45,10 +52,7 @@ fn main() -> Result<()> {
     }
 
     let source_fps = get_source_video_fps(&video_path);
-    println!(
-        "[uvc_camera] Detected source video frame rate: {} fps",
-        source_fps
-    );
+    tracing::info!("Detected source video frame rate: {} fps", source_fps);
 
     // Load parameters from mock file for standalone execution
     let mock_params_path = std::env::current_dir()
@@ -70,8 +74,8 @@ fn main() -> Result<()> {
         .run(move |args: Parameters, node_runner| async move {
         let video_params = args.video.clone();
 
-        println!(
-            "[uvc_camera] Video params: {}x{} @ {} fps, encoding: {}",
+        tracing::info!(
+            "Video params: {}x{} @ {} fps, encoding: {}",
             video_params.resolution.width,
             video_params.resolution.height,
             video_params.frame_rate,
@@ -103,7 +107,7 @@ fn main() -> Result<()> {
         // Log when the shutdown/cancel signal is received so it is visible in
         // the node's stdout.
         node_runner.on_shutdown(async move {
-            println!("[uvc_camera] Shutdown signal received");
+            tracing::info!("Shutdown signal received");
         });
         tokio::spawn(async move {
             if let Err(e) = run_video_loop(node_runner, video_params, cancel_token).await {
@@ -120,7 +124,7 @@ async fn run_video_loop(
     video_params: parameters::video::Video,
     cancel_token: CancellationToken,
 ) -> Result<()> {
-    println!("[uvc_camera] Starting video loop...");
+    tracing::info!("Starting video loop...");
     let video_path = std::env::current_dir()
         .expect("Failed to get current working directory")
         .join("assets")
@@ -129,7 +133,7 @@ async fn run_video_loop(
     if !video_path.exists() {
         panic!("Video file not found: {}", video_path.display());
     }
-    println!("[uvc_camera] Video file found: {}", video_path.display());
+    tracing::info!("Video file found: {}", video_path.display());
 
     let mut frame_id: u32 = 0;
     let mut last_print_time = Instant::now();
@@ -163,7 +167,7 @@ async fn run_video_loop(
     loop {
         let data = tokio::select! {
             _ = cancel_token.cancelled() => {
-                println!("[uvc_camera] Shutdown requested, stopping video loop");
+                tracing::info!("Shutdown requested, stopping video loop");
                 return Ok(());
             }
             frame = frame_rx.recv() => match frame {
@@ -190,7 +194,7 @@ async fn run_video_loop(
             tracing::error!("Failed to emit frame: {e:?}");
         }
         if last_print_time.elapsed().as_secs() >= 3 {
-            println!("[uvc_camera] Emitted frame {}", frame_id);
+            tracing::info!("Emitted frame {}", frame_id);
             last_print_time = Instant::now();
         }
 
@@ -198,7 +202,7 @@ async fn run_video_loop(
 
         tokio::select! {
             _ = cancel_token.cancelled() => {
-                println!("[uvc_camera] Shutdown requested, stopping video loop");
+                tracing::info!("Shutdown requested, stopping video loop");
                 return Ok(());
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(frame_duration_ms)) => {}
@@ -224,7 +228,7 @@ fn decode_frames(
             return;
         }
 
-        println!("[uvc_camera] Opening video file for playback...");
+        tracing::info!("Opening video file for playback...");
         let mut input = ffmpeg::format::input(video_path).unwrap_or_else(|e| {
             panic!("Failed to open video file '{}': {e}", video_path.display())
         });
@@ -297,7 +301,7 @@ fn decode_frames(
         receive_and_send_frames(&mut decoder).ok();
 
         // Loop restarts - video will be reopened from the beginning
-        println!("[uvc_camera] Video ended, restarting from beginning...");
+        tracing::info!("Video ended, restarting from beginning...");
     }
 }
 
@@ -309,7 +313,7 @@ fn decode_frames(
 /// gap when swapped onto real hardware.
 fn spawn_control_acks(node_runner: &Arc<peppygen::NodeRunner>) {
     macro_rules! spawn_ack {
-        ($service:ident, $current:ident $(, $echoed:ident)?) => {{
+        ($service:ident, $request_field:ident) => {{
             let runner = Arc::clone(node_runner);
             let cancel_token = node_runner.cancellation_token().clone();
             tokio::spawn(async move {
@@ -320,7 +324,7 @@ fn spawn_control_acks(node_runner: &Arc<peppygen::NodeRunner>) {
                             Ok($service::Response::new(
                                 true,
                                 concat!("mock: ", stringify!($service), " acknowledged").to_string(),
-                                request.data.$current,
+                                request.data.$request_field,
                             ))
                         }) => result,
                     };
@@ -359,7 +363,7 @@ async fn listen_for_video_stream_info_requests(
                 ))
             }) => {
                 if let Err(e) = result {
-                    tracing::error!("get_camera_info service error: {e:?}");
+                    tracing::error!("video_stream_info service error: {e:?}");
                 }
             }
         }

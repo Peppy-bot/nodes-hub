@@ -5,8 +5,8 @@ A dependency-free `rgb_camera:v1` provider: it replays a bundled video file
 service. Use it to bring a consumer up without a camera or a sim engine.
 
 It is not a simulation. The footage has no relationship to any robot's pose, so
-anything that cares what the camera is looking at wants `openarm_camera_sim`
-instead; see [../Readme.md](../Readme.md).
+anything that cares what the camera is looking at wants the sim engine's camera
+relay instead; see [../Readme.md](../Readme.md).
 
 ## Running
 

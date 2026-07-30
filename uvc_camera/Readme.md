@@ -11,19 +11,22 @@ the contract rather than a specific node.
 | `mock_rust/` | `uvc_camera_rust_mock` | Plays a bundled video file. For developing consumers without hardware. |
 | `mock_python/` | `uvc_camera_python_mock` | Same, in Python. |
 
-The mocks answer every contract service, so a consumer that exercises the camera
-controls behaves the same against a mock and against real hardware. peppy
-enforces that an implementation covers every member of the contract it claims,
-so the services are declared either way; answering them is not optional extra.
+The mocks answer every contract service, so a consumer can exercise the whole
+surface without hanging on a missing responder. peppy enforces that an
+implementation covers every member of the contract it claims, so the services
+are declared either way; answering them is not optional extra. They acknowledge
+rather than emulate, though: the mocks echo whatever value they are given, where
+the real node validates the mode string and reports `-1` for an automatic
+setting. Do not use them to test control semantics.
 
 **These mocks are not the simulation path.** They replay a canned video with no
 relationship to any robot's pose, which makes them useful for bringing up a
 consumer with neither hardware nor a sim engine, and useless for anything that
-cares what the camera is looking at. A simulated robot uses `openarm_camera_sim`
-instead: it relays the engine's rendered wrist views through the same
-`rgb_camera:v1` contract, with real extrinsics and instance ids matching the
-hardware rig. Recording a dataset against these mocks would pair real actions
-with unrelated images, which is worse than recording no camera at all.
+cares what the camera is looking at. A simulated robot uses its engine's camera
+relay instead, which renders the robot's actual views through this same
+`rgb_camera:v1` contract with real extrinsics. Recording a dataset against these
+mocks would pair real actions with unrelated images, which is worse than
+recording no camera at all.
 
 ## Interfaces
 
