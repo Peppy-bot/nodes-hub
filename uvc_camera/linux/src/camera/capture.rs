@@ -1,5 +1,6 @@
 use peppygen::emitted_topics::camera::video_stream::{self, MessageHeader};
 use peppylib::runtime::CancellationToken;
+use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
@@ -30,6 +31,55 @@ struct CancelOnExit(CancellationToken);
 impl Drop for CancelOnExit {
     fn drop(&mut self) {
         self.0.cancel();
+    }
+}
+
+/// How long the loop has gone without publishing a frame.
+///
+/// Every step that can fail a frame (capture, conversion, serialization,
+/// publication) reports here, so one deterministic failure cannot hide behind
+/// another's retry path.
+struct PublishWindow {
+    last_publish: Instant,
+    episode_logged: bool,
+}
+
+impl PublishWindow {
+    fn new() -> Self {
+        Self {
+            last_publish: Instant::now(),
+            episode_logged: false,
+        }
+    }
+
+    fn published(&mut self) {
+        self.last_publish = Instant::now();
+        self.episode_logged = false;
+    }
+
+    /// Record a failed frame and pause before the next attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error once the grace window has elapsed with nothing
+    /// published, which ends the loop rather than retrying forever.
+    fn failed(&mut self, context: &str, error: &dyn fmt::Display) -> Result<()> {
+        let stalled = self.last_publish.elapsed();
+        if stalled > FRAME_FAILURE_GRACE {
+            return Err(Error::Camera(format!(
+                "nothing published for {stalled:?}; last failure: {context}: {error}"
+            )));
+        }
+        // Only the first failure of an episode warns; a wedged camera would
+        // otherwise emit hundreds of identical lines before the window closes.
+        if self.episode_logged {
+            tracing::debug!("{context}: {error}");
+        } else {
+            tracing::warn!("{context}: {error}");
+            self.episode_logged = true;
+        }
+        std::thread::sleep(FRAME_RETRY_DELAY);
+        Ok(())
     }
 }
 
@@ -65,22 +115,26 @@ pub fn spawn_nokhwa_capture_loop(
     let runtime = tokio::runtime::Handle::current();
 
     std::thread::spawn(move || {
-        let _cancel_on_exit = CancelOnExit(cancel_token.clone());
+        // The camera is dropped at the end of this closure either way, so by the
+        // time `done_tx` fires the device is closed.
+        if let Some(camera) = open_camera(NokhwaCamera::new(), &config, open_tx) {
+            // Armed only once the camera is streaming. Arming it any earlier
+            // would race the open report: setup selects over its own future and
+            // the cancellation token, so a cancel landing alongside the failure
+            // would be read as an operator stop and exit zero, which is exactly
+            // what reporting the failure is meant to prevent.
+            let _cancel_on_exit = CancelOnExit(cancel_token.clone());
 
-        // The camera is moved into and dropped inside `run_camera_capture_loop`,
-        // so by the time the result is back the device is closed.
-        let result = run_camera_capture_loop(
-            NokhwaCamera::new(),
-            &config,
-            &node_runner,
-            &runtime,
-            &cancel_token,
-            &control_rx,
-            open_tx,
-        );
-
-        if let Err(e) = result {
-            tracing::error!("camera capture loop failed: {e}");
+            if let Err(e) = run_camera_capture_loop(
+                camera,
+                &config,
+                &node_runner,
+                &runtime,
+                &cancel_token,
+                &control_rx,
+            ) {
+                tracing::error!("camera capture loop failed: {e}");
+            }
         }
 
         // Signal completion only after the camera has been dropped above, so
@@ -91,12 +145,35 @@ pub fn spawn_nokhwa_capture_loop(
     (open_rx, done_rx)
 }
 
+/// Open the camera and hand the outcome to setup.
+///
+/// Returns `None` once a failure has been reported, so the caller neither logs
+/// it a second time nor starts a loop with no device. Setup turns the reported
+/// failure into the node's exit error, which is what distinguishes a broken
+/// camera from an operator stop.
+fn open_camera(
+    mut camera: NokhwaCamera,
+    config: &CameraConfig,
+    open_tx: oneshot::Sender<Result<()>>,
+) -> Option<NokhwaCamera> {
+    match camera.open(config) {
+        Ok(()) => {
+            let _ = open_tx.send(Ok(()));
+            Some(camera)
+        }
+        Err(e) => {
+            let _ = open_tx.send(Err(e));
+            None
+        }
+    }
+}
+
 /// Run the camera capture loop (blocking; runs on the dedicated thread).
 ///
 /// # Errors
 ///
-/// Returns an error if the camera cannot be opened or configured, or if frames
-/// keep failing for longer than [`FRAME_FAILURE_GRACE`].
+/// Returns an error if the publisher cannot be declared, or if frames keep
+/// failing for longer than [`FRAME_FAILURE_GRACE`].
 fn run_camera_capture_loop(
     mut camera: NokhwaCamera,
     config: &CameraConfig,
@@ -104,17 +181,7 @@ fn run_camera_capture_loop(
     runtime: &tokio::runtime::Handle,
     cancel_token: &CancellationToken,
     control_rx: &ControlReceiver,
-    open_tx: oneshot::Sender<Result<()>>,
 ) -> Result<()> {
-    // Report the open outcome before streaming: setup turns a failure into a
-    // non-zero exit, which is what distinguishes a broken camera from an
-    // operator stop.
-    if let Err(e) = camera.open(config) {
-        let _ = open_tx.send(Err(e.clone()));
-        return Err(e);
-    }
-    let _ = open_tx.send(Ok(()));
-
     let topic_encoding = config.topic_encoding;
     let frame_rate = config.frame_rate.as_u16();
     tracing::info!(
@@ -125,16 +192,17 @@ fn run_camera_capture_loop(
 
     let mut frame_id = FrameId::default();
     let mut last_log_time = Instant::now();
-    let mut last_success = Instant::now();
-
-    // Calculate target frame duration using nanoseconds for high FPS support
-    let target_frame_duration = Duration::from_nanos(1_000_000_000 / u64::from(frame_rate));
-    let mut next_frame_time = Instant::now() + target_frame_duration;
 
     // Declare the publisher once; every publish below is then lock-free.
     let publisher = runtime
         .block_on(video_stream::declare_publisher(node_runner))
         .map_err(|e| format!("Failed to declare video stream publisher: {e}"))?;
+
+    // Both clocks start after the publisher is up, so a slow cold-start
+    // declaration does not count as a stall or leave the first deadline stale.
+    let mut window = PublishWindow::new();
+    let target_frame_duration = Duration::from_nanos(1_000_000_000 / u64::from(frame_rate));
+    let mut next_frame_time = Instant::now() + target_frame_duration;
 
     while !cancel_token.is_cancelled() {
         // Drain all pending camera control commands before capturing the next frame
@@ -144,40 +212,31 @@ fn run_camera_capture_loop(
             let _ = cmd.reply.send(result);
         }
 
-        let processed = camera
+        // Capture, convert and serialize as one fallible step: every failure
+        // below reaches the same grace window, so none of them can spin.
+        // `build_message` is pure, so this keeps serialization off the messenger.
+        let prepared = camera
             .capture_frame()
-            .and_then(|raw| pipeline::process_frame(raw, frame_id, topic_encoding));
+            .and_then(|raw| pipeline::process_frame(raw, frame_id, topic_encoding))
+            .and_then(|frame| {
+                let header = MessageHeader {
+                    stamp: frame.captured_at(),
+                    frame_id: frame.frame_id().as_u32(),
+                };
+                video_stream::build_message(
+                    header,
+                    frame.encoding().to_string(),
+                    frame.width(),
+                    frame.height(),
+                    frame.data().to_vec(),
+                )
+                .map_err(|e| Error::Other(format!("failed to build frame message: {e}")))
+            });
 
-        let frame = match processed {
-            Ok(frame) => frame,
-            Err(e) => {
-                if last_success.elapsed() > FRAME_FAILURE_GRACE {
-                    return Err(Error::Camera(format!(
-                        "no frame published for {FRAME_FAILURE_GRACE:?}; last failure: {e}"
-                    )));
-                }
-                tracing::warn!("frame failed: {e}");
-                std::thread::sleep(FRAME_RETRY_DELAY);
-                continue;
-            }
-        };
-
-        let header = MessageHeader {
-            stamp: frame.captured_at(),
-            frame_id: frame.frame_id().as_u32(),
-        };
-
-        // Serialize off the messenger (build_message is pure), then publish.
-        let payload = match video_stream::build_message(
-            header,
-            frame.encoding().to_string(),
-            frame.width(),
-            frame.height(),
-            frame.data().to_vec(),
-        ) {
+        let payload = match prepared {
             Ok(payload) => payload,
             Err(e) => {
-                tracing::warn!("failed to build frame message: {e}");
+                window.failed("frame failed", &e)?;
                 continue;
             }
         };
@@ -185,20 +244,26 @@ fn run_camera_capture_loop(
         // Publish by blocking this dedicated thread on the async call. Racing
         // the publish against the token keeps shutdown from stalling on
         // messaging once cancellation has been requested.
-        runtime.block_on(async {
+        let publish_outcome = runtime.block_on(async {
             tokio::select! {
-                _ = cancel_token.cancelled() => {}
-                result = publisher.publish(payload) => {
-                    if let Err(e) = result {
-                        tracing::warn!("failed to emit frame: {e}");
-                    }
-                }
+                _ = cancel_token.cancelled() => None,
+                result = publisher.publish(payload) => Some(result),
             }
         });
 
-        last_success = Instant::now();
+        match publish_outcome {
+            // Cancelled mid-publish: leave the loop rather than counting a
+            // shutdown as a failure.
+            None => break,
+            Some(Err(e)) => {
+                window.failed("failed to emit frame", &e)?;
+                continue;
+            }
+            Some(Ok(())) => window.published(),
+        }
+
         if last_log_time.elapsed() >= STATUS_LOG_INTERVAL {
-            tracing::info!("emitted frame {}", frame.frame_id().as_u32());
+            tracing::info!("emitted frame {}", frame_id.as_u32());
             last_log_time = Instant::now();
         }
 

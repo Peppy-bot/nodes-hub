@@ -10,8 +10,14 @@ use uvc_camera_linux::services::{
 use uvc_camera_linux::types::{CameraConfigBuilder, Encoding};
 
 fn main() -> Result<()> {
+    // INFO by default, but honour RUST_LOG so the device-open path's debug
+    // lines (resolved index, validation, requested format) can be turned on
+    // when a camera refuses to open.
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
         .init();
 
     // Load parameters from mock file for standalone execution
@@ -74,54 +80,12 @@ fn main() -> Result<()> {
             // Create control channel shared between service handlers and capture loop
             let (control_tx, control_rx) = create_control_channel();
 
-            // ── video_stream_info ──────────────────────────────────────────
-            let info_runner = Arc::clone(&node_runner);
-            let info_config = camera_config.clone();
-            tokio::spawn(async move {
-                listen_for_video_stream_info_requests(info_runner, info_config).await;
-            });
-
-            // ── set_exposure ───────────────────────────────────────────────
-            let exposure_runner = Arc::clone(&node_runner);
-            let exposure_tx = control_tx.clone();
-            tokio::spawn(async move {
-                listen_for_set_exposure_requests(exposure_runner, exposure_tx).await;
-            });
-
-            // ── set_white_balance ──────────────────────────────────────────
-            let wb_runner = Arc::clone(&node_runner);
-            let wb_tx = control_tx.clone();
-            tokio::spawn(async move {
-                listen_for_set_white_balance_requests(wb_runner, wb_tx).await;
-            });
-
-            // ── set_gain ───────────────────────────────────────────────────
-            let gain_runner = Arc::clone(&node_runner);
-            let gain_tx = control_tx.clone();
-            tokio::spawn(async move {
-                listen_for_set_gain_requests(gain_runner, gain_tx).await;
-            });
-
-            // ── set_brightness ─────────────────────────────────────────────
-            let brightness_runner = Arc::clone(&node_runner);
-            let brightness_tx = control_tx.clone();
-            tokio::spawn(async move {
-                listen_for_set_brightness_requests(brightness_runner, brightness_tx).await;
-            });
-
-            // ── set_contrast ───────────────────────────────────────────────
-            let contrast_runner = Arc::clone(&node_runner);
-            let contrast_tx = control_tx.clone();
-            tokio::spawn(async move {
-                listen_for_set_contrast_requests(contrast_runner, contrast_tx).await;
-            });
-
             // ── capture loop (long-running, dedicated thread) ──────────────
             // Once streaming, the loop cancels the token on any exit, shutting
             // the node down instead of leaving it running without a capture loop.
             let cancel_token = node_runner.cancellation_token().clone();
             let (camera_opened, capture_done) = spawn_nokhwa_capture_loop(
-                camera_config,
+                camera_config.clone(),
                 Arc::clone(&node_runner),
                 cancel_token,
                 control_rx,
@@ -136,6 +100,45 @@ fn main() -> Result<()> {
                     std::io::Error::other("capture thread exited before reporting camera status")
                 })?
                 .map_err(std::io::Error::other)?;
+
+            // Services come up only once the loop is draining controls. Exposing
+            // them earlier lets a control enqueue against a camera that is still
+            // opening: the caller times out after two seconds and is told the
+            // write failed, then the loop starts and applies it anyway.
+            let info_runner = Arc::clone(&node_runner);
+            tokio::spawn(async move {
+                listen_for_video_stream_info_requests(info_runner, camera_config).await;
+            });
+
+            let exposure_runner = Arc::clone(&node_runner);
+            let exposure_tx = control_tx.clone();
+            tokio::spawn(async move {
+                listen_for_set_exposure_requests(exposure_runner, exposure_tx).await;
+            });
+
+            let wb_runner = Arc::clone(&node_runner);
+            let wb_tx = control_tx.clone();
+            tokio::spawn(async move {
+                listen_for_set_white_balance_requests(wb_runner, wb_tx).await;
+            });
+
+            let gain_runner = Arc::clone(&node_runner);
+            let gain_tx = control_tx.clone();
+            tokio::spawn(async move {
+                listen_for_set_gain_requests(gain_runner, gain_tx).await;
+            });
+
+            let brightness_runner = Arc::clone(&node_runner);
+            let brightness_tx = control_tx.clone();
+            tokio::spawn(async move {
+                listen_for_set_brightness_requests(brightness_runner, brightness_tx).await;
+            });
+
+            let contrast_runner = Arc::clone(&node_runner);
+            let contrast_tx = control_tx;
+            tokio::spawn(async move {
+                listen_for_set_contrast_requests(contrast_runner, contrast_tx).await;
+            });
 
             // The camera (V4L2 stream + device fd) is closed when the capture
             // thread drops it; await that here so device teardown is bounded
