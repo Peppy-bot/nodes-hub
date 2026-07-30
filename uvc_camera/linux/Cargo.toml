@@ -10,7 +10,5 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde_json = "1.0"
-nokhwa = { version = "0.10", features = ["input-native"] }
 image = "0.25"
-v4l2-sys-mit = "0.3.0"
-libc = "0.2"
+v4l = "0.14"

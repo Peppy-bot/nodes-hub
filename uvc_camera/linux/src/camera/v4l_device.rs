@@ -1,520 +1,388 @@
-use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
-use std::os::unix::io::AsRawFd;
-use std::time::SystemTime;
+//! V4L2 capture device.
+//!
+//! Talks to the kernel through the `v4l` crate directly, matching `zed_camera`,
+//! the other V4L2 node in this hub. The mmap stream is bound to the thread that
+//! dequeues it, so the device is built and used on the capture thread and never
+//! crosses a thread boundary.
 
-use nokhwa::Camera;
-use nokhwa::pixel_format::RgbFormat;
-use nokhwa::utils::{
-    CameraFormat, CameraIndex, ControlValueSetter, FrameFormat, KnownCameraControl,
-    RequestedFormat, RequestedFormatType, Resolution as NokhwaResolution,
-};
+use std::io::ErrorKind;
+use std::os::unix::fs::MetadataExt;
+use std::time::{Duration, SystemTime};
+
+use v4l::buffer::Type;
+use v4l::capability::Flags;
+use v4l::control::{Control, Value};
+use v4l::io::traits::CaptureStream;
+use v4l::prelude::*;
+use v4l::video::Capture as _;
+use v4l::{Format, FourCC};
 
 use crate::camera::controls::{
     CameraControlRequest, ControlResult, ExposureMode, WhiteBalanceMode,
 };
 use crate::types::{CameraConfig, Encoding, Error, Frame, Result};
 
-use v4l2_sys_mit::{
-    V4L2_CID_AUTO_WHITE_BALANCE, V4L2_CID_EXPOSURE_ABSOLUTE, V4L2_CID_EXPOSURE_AUTO,
-};
+/// Control ids from `<linux/v4l2-controls.h>`. Written out rather than
+/// generated: they are stable kernel ABI, and seven constants do not justify a
+/// libclang build dependency. Pinned by `cids_match_the_kernel_abi`.
+const V4L2_CID_BASE: u32 = 0x0098_0900;
+const V4L2_CID_BRIGHTNESS: u32 = V4L2_CID_BASE;
+const V4L2_CID_CONTRAST: u32 = V4L2_CID_BASE + 1;
+const V4L2_CID_AUTO_WHITE_BALANCE: u32 = V4L2_CID_BASE + 12;
+const V4L2_CID_GAIN: u32 = V4L2_CID_BASE + 19;
+const V4L2_CID_WHITE_BALANCE_TEMPERATURE: u32 = V4L2_CID_BASE + 26;
+const V4L2_CID_CAMERA_CLASS_BASE: u32 = 0x009a_0900;
+const V4L2_CID_EXPOSURE_AUTO: u32 = V4L2_CID_CAMERA_CLASS_BASE + 1;
+const V4L2_CID_EXPOSURE_ABSOLUTE: u32 = V4L2_CID_CAMERA_CLASS_BASE + 2;
 
-/// V4L2_EXPOSURE_AUTO = 0 (camera controls exposure automatically)
+/// `V4L2_EXPOSURE_AUTO` / `V4L2_EXPOSURE_MANUAL` from `enum v4l2_exposure_auto_type`.
 const V4L2_EXPOSURE_AUTO_VALUE: i64 = 0;
-/// V4L2_EXPOSURE_MANUAL = 1 (manual exposure value via V4L2_CID_EXPOSURE_ABSOLUTE)
 const V4L2_EXPOSURE_MANUAL_VALUE: i64 = 1;
 
-/// Nokhwa-based camera implementation.
-///
-/// `nokhwa::Camera` is `!Send` (its backend is an unbounded trait object), so
-/// the whole struct is built and used on the capture thread and never crosses a
-/// thread boundary. Nothing here asserts otherwise.
-pub struct CameraDevice {
-    camera: Option<Camera>,
-    /// The actual camera encoding negotiated after `open_stream()`. The camera
-    /// driver may return a format different from what was requested, so this is
-    /// read back from `camera.camera_format()` rather than taken from the config.
-    actual_camera_encoding: Option<Encoding>,
+/// Buffers in the mmap queue: deep enough to ride out a scheduling hiccup,
+/// shallow enough that a late dequeue does not hand back a stale frame.
+const BUFFER_COUNT: u32 = 4;
+
+/// Upper bound on a single dequeue. Without it a driver that stops delivering
+/// (an unplugged camera) blocks the capture thread indefinitely; with it the
+/// loop sees an error and its stall window decides when to give up.
+const DEQUEUE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// The format the driver actually accepted, which may differ from the request.
+struct Negotiated {
+    encoding: Encoding,
+    width: u32,
+    height: u32,
 }
 
-impl Default for CameraDevice {
-    fn default() -> Self {
-        Self::new()
-    }
+/// A V4L2 capture device, streaming once [`CameraDevice::open`] returns.
+#[derive(Default)]
+pub struct CameraDevice {
+    device: Option<Device>,
+    stream: Option<MmapStream<'static>>,
+    negotiated: Option<Negotiated>,
 }
 
 impl CameraDevice {
     pub fn new() -> Self {
-        Self {
-            camera: None,
-            actual_camera_encoding: None,
-        }
+        Self::default()
     }
 
     /// Open and configure the camera.
+    ///
+    /// The path is opened directly, so a udev-pinned symlink such as
+    /// `/dev/openarm/left_wrist_cam` works without resolving it to an index.
     pub fn open(&mut self, config: &CameraConfig) -> Result<()> {
-        tracing::debug!("opening nokhwa camera {}", config.device_path);
-        let index = parse_camera_index(&config.device_path)?;
-        tracing::debug!("parsed index {index}");
+        let path = config.device_path.as_str();
+        tracing::debug!("opening {path}");
 
-        // Validate the device before handing it to nokhwa, which can hang
-        // indefinitely on non-capture devices (e.g. metadata nodes).
-        validate_video_device(&config.device_path)?;
-        tracing::debug!("device {} validated", config.device_path);
+        let device = Device::with_path(path).map_err(|e| open_error(path, &e))?;
 
-        let frame_rate = config.frame_rate.as_u16();
-        let requested =
-            RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(CameraFormat::new(
-                NokhwaResolution::new(config.resolution.width(), config.resolution.height()),
-                encoding_to_frame_format(config.camera_encoding),
-                u32::from(frame_rate),
+        let caps = device
+            .query_caps()
+            .map_err(|e| Error::Camera(format!("{path}: cannot query capabilities: {e}")))?;
+        if !caps.capabilities.contains(Flags::VIDEO_CAPTURE) {
+            return Err(Error::Camera(format!(
+                "{path} is not a video capture device (driver {}, card {})",
+                caps.driver, caps.card
             )));
-
+        }
         tracing::debug!(
-            "requesting format: {}x{} @ {frame_rate} fps",
-            config.resolution.width(),
-            config.resolution.height(),
+            "{path} validated: driver {}, card {}",
+            caps.driver,
+            caps.card
         );
 
-        let mut camera = Camera::new(CameraIndex::Index(index), requested).map_err(|e| {
+        let requested = Format::new(
+            config.resolution.width(),
+            config.resolution.height(),
+            fourcc_for(config.camera_encoding),
+        );
+        let actual = device
+            .set_format(&requested)
+            .map_err(|e| Error::Camera(format!("{path}: cannot set format: {e}")))?;
+
+        let frame_rate = u32::from(config.frame_rate.as_u16());
+        device
+            .set_params(&v4l::video::capture::Parameters::with_fps(frame_rate))
+            .map_err(|e| Error::Camera(format!("{path}: cannot set frame rate: {e}")))?;
+
+        let encoding = encoding_for(actual.fourcc).ok_or_else(|| {
             Error::Camera(format!(
-                "Failed to open camera {}: {}",
-                config.device_path, e
+                "{path} negotiated {}, which this node cannot decode",
+                actual.fourcc
             ))
         })?;
 
-        camera.open_stream().map_err(|e| {
-            Error::Camera(format!(
-                "Failed to start stream for {}: {}",
-                config.device_path, e
-            ))
-        })?;
-
-        // Read back the format actually negotiated by the driver; it may differ
-        // from what was requested (e.g. hardware only supports MJPEG).
-        let negotiated = camera.camera_format().format();
-        let actual_encoding = frame_format_to_encoding(negotiated)?;
         tracing::info!(
-            "camera {} streaming: requested {}, negotiated {actual_encoding} ({negotiated:?})",
-            config.device_path,
+            "camera {path} streaming: requested {}x{} {}, negotiated {}x{} {encoding}",
+            requested.width,
+            requested.height,
             config.camera_encoding,
+            actual.width,
+            actual.height,
         );
 
         // A yuyv topic encoding is passthrough-only, so a driver that negotiated
         // anything else would fail every single frame downstream. Refuse here
         // instead of streaming into a loop that can never publish.
-        if config.topic_encoding == Encoding::Yuyv && actual_encoding != Encoding::Yuyv {
+        if config.topic_encoding == Encoding::Yuyv && encoding != Encoding::Yuyv {
             return Err(Error::Camera(format!(
-                "topic_encoding yuyv requires a yuyv camera stream, but {} negotiated {actual_encoding}; \
-                 set camera_encoding to yuyv on a camera that supports it, or pick another topic_encoding",
-                config.device_path,
+                "topic_encoding yuyv requires a yuyv camera stream, but {path} negotiated \
+                 {encoding}; set camera_encoding to yuyv on a camera that supports it, or pick \
+                 another topic_encoding"
             )));
         }
 
-        self.actual_camera_encoding = Some(actual_encoding);
-        self.camera = Some(camera);
+        let mut stream = MmapStream::with_buffers(&device, Type::VideoCapture, BUFFER_COUNT)
+            .map_err(|e| Error::Camera(format!("{path}: cannot start mmap stream: {e}")))?;
+        stream.set_timeout(DEQUEUE_TIMEOUT);
+
+        self.negotiated = Some(Negotiated {
+            encoding,
+            width: actual.width,
+            height: actual.height,
+        });
+        self.stream = Some(stream);
+        self.device = Some(device);
         Ok(())
     }
 
     /// Capture a single frame in the camera's negotiated encoding.
     pub fn capture_frame(&mut self) -> Result<Frame> {
-        let encoding = self
-            .actual_camera_encoding
-            .ok_or_else(|| Error::Camera("Camera not open".to_string()))?;
-        let camera = self
-            .camera
-            .as_mut()
-            .ok_or_else(|| Error::Camera("Camera not open".to_string()))?;
+        let (Some(stream), Some(negotiated)) = (self.stream.as_mut(), self.negotiated.as_ref())
+        else {
+            return Err(Error::Camera("Camera not open".to_string()));
+        };
 
-        let frame = camera
-            .frame()
-            .map_err(|e| Error::Camera(format!("Failed to capture frame: {}", e)))?;
+        let (buffer, meta) = stream
+            .next()
+            .map_err(|e| Error::Camera(format!("Failed to capture frame: {e}")))?;
         let captured_at = SystemTime::now();
 
-        let buffer = frame.buffer_bytes().to_vec();
-        let resolution = frame.resolution();
+        // A short transfer is a corrupt frame, not a small one: publishing it
+        // would hand consumers a payload that disagrees with the dimensions.
+        let used = meta.bytesused as usize;
+        if used == 0 || used > buffer.len() {
+            return Err(Error::Camera(format!(
+                "driver reported {used} bytes for a {}-byte buffer",
+                buffer.len()
+            )));
+        }
 
         Ok(Frame::from_capture(
-            buffer,
-            resolution.width_x,
-            resolution.height_y,
+            buffer[..used].to_vec(),
+            negotiated.width,
+            negotiated.height,
             captured_at,
-            encoding,
+            negotiated.encoding,
         ))
     }
 
     /// Check if the camera is open.
     pub fn is_open(&self) -> bool {
-        self.camera.is_some()
+        self.device.is_some()
     }
 
     /// Apply a camera control request, reporting the value actually taken.
     pub fn apply_control(&mut self, request: &CameraControlRequest) -> ControlResult {
-        let Some(camera) = self.camera.as_mut() else {
+        let Some(device) = self.device.as_ref() else {
             return ControlResult::err("Camera not open");
         };
 
         match request {
             CameraControlRequest::SetBrightness { value } => {
-                set_integer_control(camera, KnownCameraControl::Brightness, *value)
+                set_integer_control(device, V4L2_CID_BRIGHTNESS, "brightness", *value)
             }
             CameraControlRequest::SetContrast { value } => {
-                set_integer_control(camera, KnownCameraControl::Contrast, *value)
+                set_integer_control(device, V4L2_CID_CONTRAST, "contrast", *value)
             }
             CameraControlRequest::SetGain { value } => {
-                set_integer_control(camera, KnownCameraControl::Gain, *value)
+                set_integer_control(device, V4L2_CID_GAIN, "gain", *value)
             }
-            CameraControlRequest::SetExposure { mode, value } => set_exposure(camera, mode, *value),
+            CameraControlRequest::SetExposure { mode, value } => set_exposure(device, mode, *value),
             CameraControlRequest::SetWhiteBalance { mode, temperature } => {
-                set_white_balance(camera, mode, *temperature)
+                set_white_balance(device, mode, *temperature)
             }
         }
     }
 }
 
-/// Set a simple integer camera control and read back the current value
-fn set_integer_control(camera: &mut Camera, kind: KnownCameraControl, value: i32) -> ControlResult {
-    match camera.set_camera_control(kind, ControlValueSetter::Integer(i64::from(value))) {
-        Ok(()) => {
-            let current = camera
-                .camera_control(kind)
-                .ok()
-                .and_then(|c| c.value().as_integer().copied())
-                .map(|v| v as i32)
-                .unwrap_or(value);
-            ControlResult::ok(format!("{:?} set to {}", kind, current), current)
-        }
-        Err(e) => ControlResult::err(format!("Failed to set {:?}: {}", kind, e)),
+/// Turn an open failure into something actionable, diagnosing the common
+/// container case where the process is not in the device's group.
+fn open_error(path: &str, error: &std::io::Error) -> Error {
+    match error.kind() {
+        ErrorKind::NotFound => Error::Camera(format!(
+            "Device {path} does not exist. Check that the camera is connected and the device \
+             path is correct."
+        )),
+        ErrorKind::PermissionDenied => Error::Camera(diagnose_permission_error(path)),
+        _ => Error::Camera(format!("Failed to open camera {path}: {error}")),
     }
 }
 
-/// Set exposure mode and optionally the absolute exposure value
-fn set_exposure(camera: &mut Camera, mode: &ExposureMode, value: i32) -> ControlResult {
+/// Explain a permission failure in terms of the groups actually involved.
+fn diagnose_permission_error(path: &str) -> String {
+    let mut message = format!("Permission denied opening {path}.");
+
+    let Ok(gid) = std::fs::metadata(path).map(|m| m.gid()) else {
+        return message;
+    };
+    let owner = group_name(gid).unwrap_or_else(|| gid.to_string());
+    message.push_str(&format!(" The device is owned by group {owner} ({gid})."));
+
+    // 65534 is the overflow gid: a rootless container with no mapping for the
+    // host group reports it here, and joining a group will not help.
+    if gid == 65534 {
+        message.push_str(
+            " That is the overflow gid, so the host group has no mapping inside this container.",
+        );
+        return message;
+    }
+
+    match process_groups() {
+        Some(groups) if groups.contains(&gid) => {
+            message.push_str(" This process is in that group, so the cause is elsewhere.");
+        }
+        Some(groups) => {
+            let names: Vec<String> = groups
+                .iter()
+                .map(|g| group_name(*g).unwrap_or_else(|| g.to_string()))
+                .collect();
+            message.push_str(&format!(
+                " This process is in [{}]; add it to {owner}.",
+                names.join(", ")
+            ));
+        }
+        None => {}
+    }
+    message
+}
+
+/// Resolve a gid to its name via `/etc/group`.
+fn group_name(gid: u32) -> Option<String> {
+    let contents = std::fs::read_to_string("/etc/group").ok()?;
+    contents.lines().find_map(|line| {
+        let mut fields = line.splitn(4, ':');
+        let name = fields.next()?;
+        let _password = fields.next()?;
+        (fields.next()?.parse::<u32>().ok()? == gid).then(|| name.to_string())
+    })
+}
+
+/// Supplementary gids of this process, from `/proc/self/status`.
+fn process_groups() -> Option<Vec<u32>> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|l| l.starts_with("Groups:"))?;
+    Some(
+        line.trim_start_matches("Groups:")
+            .split_whitespace()
+            .filter_map(|g| g.parse::<u32>().ok())
+            .collect(),
+    )
+}
+
+/// Set an integer control and read back what the driver kept.
+fn set_integer_control(device: &Device, cid: u32, name: &str, value: i32) -> ControlResult {
+    if let Err(e) = write_control(device, cid, i64::from(value)) {
+        return ControlResult::err(format!("Failed to set {name}: {e}"));
+    }
+    // The driver clamps to its own range, so report what it kept rather than
+    // what was asked for.
+    let current = read_control(device, cid).unwrap_or(value);
+    ControlResult::ok(format!("{name} set to {current}"), current)
+}
+
+/// Set exposure mode and, in manual mode, the absolute exposure value.
+fn set_exposure(device: &Device, mode: &ExposureMode, value: i32) -> ControlResult {
     let auto_value = match mode {
         ExposureMode::Auto => V4L2_EXPOSURE_AUTO_VALUE,
         ExposureMode::Manual => V4L2_EXPOSURE_MANUAL_VALUE,
     };
-
-    if let Err(e) = camera.set_camera_control(
-        KnownCameraControl::Other(V4L2_CID_EXPOSURE_AUTO as u128),
-        ControlValueSetter::Integer(auto_value),
-    ) {
-        return ControlResult::err(format!("Failed to set exposure mode: {}", e));
+    if let Err(e) = write_control(device, V4L2_CID_EXPOSURE_AUTO, auto_value) {
+        return ControlResult::err(format!("Failed to set exposure mode: {e}"));
     }
 
     match mode {
         ExposureMode::Auto => ControlResult::ok("Exposure set to auto mode", -1),
         ExposureMode::Manual => {
-            // Set absolute exposure value (in 100µs units for V4L2)
-            if let Err(e) = camera.set_camera_control(
-                KnownCameraControl::Other(V4L2_CID_EXPOSURE_ABSOLUTE as u128),
-                ControlValueSetter::Integer(i64::from(value)),
-            ) {
+            // Absolute exposure is in 100us units for V4L2.
+            if let Err(e) = write_control(device, V4L2_CID_EXPOSURE_ABSOLUTE, i64::from(value)) {
                 return ControlResult::err(format!(
-                    "Exposure mode set to manual but value failed: {}",
-                    e
+                    "Exposure mode set to manual but value failed: {e}"
                 ));
             }
-
-            let current = camera
-                .camera_control(KnownCameraControl::Other(
-                    V4L2_CID_EXPOSURE_ABSOLUTE as u128,
-                ))
-                .ok()
-                .and_then(|c| c.value().as_integer().copied())
-                .map(|v| v as i32)
-                .unwrap_or(value);
-
-            ControlResult::ok(
-                format!("Exposure set to manual, value {}", current),
-                current,
-            )
+            let current = read_control(device, V4L2_CID_EXPOSURE_ABSOLUTE).unwrap_or(value);
+            ControlResult::ok(format!("Exposure set to manual, value {current}"), current)
         }
     }
 }
 
-/// Set white balance mode and optionally the temperature
-fn set_white_balance(
-    camera: &mut Camera,
-    mode: &WhiteBalanceMode,
-    temperature: i32,
-) -> ControlResult {
-    let auto_bool = matches!(mode, WhiteBalanceMode::Auto);
-
-    if let Err(e) = camera.set_camera_control(
-        KnownCameraControl::Other(V4L2_CID_AUTO_WHITE_BALANCE as u128),
-        ControlValueSetter::Boolean(auto_bool),
-    ) {
-        return ControlResult::err(format!("Failed to set white balance mode: {}", e));
+/// Set white balance mode and, in manual mode, the colour temperature.
+fn set_white_balance(device: &Device, mode: &WhiteBalanceMode, temperature: i32) -> ControlResult {
+    let auto = i64::from(matches!(mode, WhiteBalanceMode::Auto));
+    if let Err(e) = write_control(device, V4L2_CID_AUTO_WHITE_BALANCE, auto) {
+        return ControlResult::err(format!("Failed to set white balance mode: {e}"));
     }
 
     match mode {
         WhiteBalanceMode::Auto => ControlResult::ok("White balance set to auto mode", -1),
         WhiteBalanceMode::Manual => {
-            if let Err(e) = camera.set_camera_control(
-                KnownCameraControl::WhiteBalance,
-                ControlValueSetter::Integer(i64::from(temperature)),
+            if let Err(e) = write_control(
+                device,
+                V4L2_CID_WHITE_BALANCE_TEMPERATURE,
+                i64::from(temperature),
             ) {
                 return ControlResult::err(format!(
-                    "White balance mode set to manual but temperature failed: {}",
-                    e
+                    "White balance mode set to manual but temperature failed: {e}"
                 ));
             }
-
-            let current = camera
-                .camera_control(KnownCameraControl::WhiteBalance)
-                .ok()
-                .and_then(|c| c.value().as_integer().copied())
-                .map(|v| v as i32)
-                .unwrap_or(temperature);
-
+            let current =
+                read_control(device, V4L2_CID_WHITE_BALANCE_TEMPERATURE).unwrap_or(temperature);
             ControlResult::ok(
-                format!("White balance set to manual, temperature {}K", current),
+                format!("White balance set to manual, temperature {current}K"),
                 current,
             )
         }
     }
 }
 
-/// Get the owning group ID of a device file via `stat()`.
-fn get_device_gid(device_path: &str) -> Option<libc::gid_t> {
-    let c_path = std::ffi::CString::new(device_path).ok()?;
-    let mut stat_buf: libc::stat = unsafe { std::mem::zeroed() };
-    let ret = unsafe { libc::stat(c_path.as_ptr(), &mut stat_buf) };
-    if ret == 0 {
-        Some(stat_buf.st_gid)
-    } else {
-        None
+fn write_control(device: &Device, cid: u32, value: i64) -> std::result::Result<(), String> {
+    device
+        .set_control(Control {
+            id: cid,
+            value: Value::Integer(value),
+        })
+        .map_err(|e| e.to_string())
+}
+
+fn read_control(device: &Device, cid: u32) -> Option<i32> {
+    match device.control(cid).ok()?.value {
+        Value::Integer(value) => Some(value as i32),
+        Value::Boolean(value) => Some(i32::from(value)),
+        _ => None,
     }
 }
 
-/// Get all group IDs the current process belongs to (effective GID + supplementary).
-fn get_process_groups() -> Vec<libc::gid_t> {
-    let mut groups = vec![unsafe { libc::getegid() }];
-
-    let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
-    if count > 0 {
-        let mut buf = vec![0 as libc::gid_t; count as usize];
-        let actual = unsafe { libc::getgroups(count, buf.as_mut_ptr()) };
-        if actual >= 0 {
-            buf.truncate(actual as usize);
-            for gid in buf {
-                if !groups.contains(&gid) {
-                    groups.push(gid);
-                }
-            }
-        }
-    }
-
-    groups
-}
-
-/// Resolve a numeric GID to its group name by parsing `/etc/group`.
-fn resolve_gid_to_name(gid: libc::gid_t) -> Option<String> {
-    let contents = std::fs::read_to_string("/etc/group").ok()?;
-    for line in contents.lines() {
-        let mut fields = line.splitn(4, ':');
-        let name = fields.next()?;
-        let _ = fields.next(); // password
-        let gid_str = fields.next()?;
-        if let Ok(parsed) = gid_str.parse::<u32>()
-            && parsed == gid
-        {
-            return Some(name.to_string());
-        }
-    }
-    None
-}
-
-/// Build a diagnostic error message for a device permission failure.
-///
-/// Stats the device to find its required GID, queries the process's actual
-/// supplementary groups, and reports the specific mismatch.
-fn diagnose_permission_error(device_path: &str) -> String {
-    let mut msg = format!("Permission denied opening {device_path}.");
-
-    let Some(device_gid) = get_device_gid(device_path) else {
-        msg.push_str(
-            " Could not stat the device to determine the required group. \
-             Ensure the device exists and your user is in the 'video' group.",
-        );
-        return msg;
-    };
-
-    // GID 65534 is the kernel's overflow GID — it means the device's real GID
-    // (e.g. 44/video on the host) is not mapped into the current user namespace.
-    // This happens when Apptainer runs in unprivileged/rootless mode.
-    const OVERFLOW_GID: libc::gid_t = 65534;
-    if device_gid == OVERFLOW_GID {
-        msg.push_str(
-            " The device's group appears as 'nogroup' (gid=65534), which means \
-             the real group (likely 'video') is not mapped into this user namespace. \
-             The container runtime must map the host 'video' group GID. \
-             On the host, run: sudo usermod -aG video $USER && newgrp video",
-        );
-        return msg;
-    }
-
-    let group_label = match resolve_gid_to_name(device_gid) {
-        Some(name) => format!("'{name}' (gid={device_gid})"),
-        None => format!("gid={device_gid}"),
-    };
-
-    let process_groups = get_process_groups();
-
-    if process_groups.contains(&device_gid) {
-        msg.push_str(&format!(
-            " The device requires group {group_label} and your process has that group, \
-             so this may be a mandatory access control (SELinux/AppArmor) issue. \
-             Check: ls -l {device_path}",
-        ));
-    } else {
-        let gids: Vec<String> = process_groups.iter().map(|g| g.to_string()).collect();
-        msg.push_str(&format!(
-            " The device requires group {group_label} but your process groups \
-             are [{gids}] — gid {device_gid} is missing. \
-             On the host, run: sudo usermod -aG video $USER && newgrp video",
-            gids = gids.join(", "),
-        ));
-    }
-
-    msg
-}
-
-/// Validate that a device path points to an accessible V4L2 video capture device.
-///
-/// Runs before handing the device to nokhwa, which can hang indefinitely on
-/// devices that exist but are not video-capture capable (e.g. metadata devices
-/// like `/dev/video1` on single-camera systems).
-fn validate_video_device(device_path: &str) -> Result<()> {
-    // Check the device exists
-    let metadata = std::fs::metadata(device_path).map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => Error::Camera(format!(
-            "Device {device_path} does not exist. Check that the camera is connected \
-             and the device path is correct."
-        )),
-        std::io::ErrorKind::PermissionDenied => {
-            Error::Camera(diagnose_permission_error(device_path))
-        }
-        _ => Error::Camera(format!("Cannot access {device_path}: {e}")),
-    })?;
-
-    // All V4L2 devices are character devices
-    if !metadata.file_type().is_char_device() {
-        return Err(Error::Camera(format!(
-            "{device_path} is not a character device — not a valid video device"
-        )));
-    }
-
-    // Open the device to verify accessibility
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(device_path)
-        .map_err(|e| match e.raw_os_error() {
-            Some(libc::EBUSY) => Error::Camera(format!(
-                "{device_path} is busy — another process may be using the camera"
-            )),
-            Some(libc::EACCES) | Some(libc::EPERM) => {
-                Error::Camera(diagnose_permission_error(device_path))
-            }
-            _ => Error::Camera(format!("Cannot open {device_path}: {e}")),
-        })?;
-
-    // Query V4L2 capabilities via VIDIOC_QUERYCAP ioctl.
-    //
-    // VIDIOC_QUERYCAP = _IOR('V', 0, struct v4l2_capability)
-    //   direction=Read(2), size=104, type='V'(0x56), nr=0
-    //   = (2 << 30) | (104 << 16) | (0x56 << 8) | 0
-    #[repr(C)]
-    struct V4l2Capability {
-        driver: [u8; 16],
-        card: [u8; 32],
-        bus_info: [u8; 32],
-        version: u32,
-        capabilities: u32,
-        device_caps: u32,
-        reserved: [u32; 3],
-    }
-
-    const VIDIOC_QUERYCAP: libc::c_ulong = 0x80685600;
-    const CAP_VIDEO_CAPTURE: u32 = 0x00000001;
-    const CAP_DEVICE_CAPS: u32 = 0x80000000;
-
-    let mut cap: V4l2Capability = unsafe { std::mem::zeroed() };
-    let ret = unsafe { libc::ioctl(file.as_raw_fd(), VIDIOC_QUERYCAP, &mut cap) };
-
-    if ret < 0 {
-        return Err(Error::Camera(format!(
-            "{device_path} is not a V4L2 video device"
-        )));
-    }
-
-    // Prefer per-node device_caps when available, fall back to global capabilities
-    let effective_caps = if cap.capabilities & CAP_DEVICE_CAPS != 0 {
-        cap.device_caps
-    } else {
-        cap.capabilities
-    };
-
-    if effective_caps & CAP_VIDEO_CAPTURE == 0 {
-        let card = std::str::from_utf8(&cap.card)
-            .unwrap_or("unknown")
-            .trim_end_matches('\0');
-        return Err(Error::Camera(format!(
-            "{device_path} ({card}) does not support video capture — \
-             it may be a metadata device. Try another /dev/videoN index."
-        )));
-    }
-
-    // Close the fd before nokhwa opens the device
-    drop(file);
-
-    Ok(())
-}
-
-/// Map an [`Encoding`] to the corresponding nokhwa [`FrameFormat`] to request
-/// from the camera hardware.
-fn encoding_to_frame_format(encoding: Encoding) -> FrameFormat {
+/// The pixel format to request for an [`Encoding`].
+fn fourcc_for(encoding: Encoding) -> FourCC {
     match encoding {
-        Encoding::Mjpeg => FrameFormat::MJPEG,
-        Encoding::Rgb8 => FrameFormat::RAWRGB,
-        Encoding::Bgr8 => FrameFormat::RAWBGR,
-        Encoding::Yuyv => FrameFormat::YUYV,
+        Encoding::Rgb8 => FourCC::new(b"RGB3"),
+        Encoding::Bgr8 => FourCC::new(b"BGR3"),
+        Encoding::Mjpeg => FourCC::new(b"MJPG"),
+        Encoding::Yuyv => FourCC::new(b"YUYV"),
     }
 }
 
-/// Map a negotiated nokhwa [`FrameFormat`] back to our [`Encoding`].
-///
-/// Used to record what the camera driver actually settled on after `open_stream`,
-/// which may differ from what was requested. A format we cannot represent is an
-/// error: labeling it with a substitute encoding would publish frames whose
-/// bytes do not match their declared layout.
-fn frame_format_to_encoding(fmt: FrameFormat) -> Result<Encoding> {
-    match fmt {
-        FrameFormat::MJPEG => Ok(Encoding::Mjpeg),
-        FrameFormat::RAWRGB => Ok(Encoding::Rgb8),
-        FrameFormat::RAWBGR => Ok(Encoding::Bgr8),
-        FrameFormat::YUYV => Ok(Encoding::Yuyv),
-        other => Err(Error::Camera(format!(
-            "camera negotiated unsupported format {other:?} (supported: mjpeg, rgb8, bgr8, yuyv)"
-        ))),
-    }
-}
-
-/// Parse camera device path into index. Symlinks (udev-pinned names like
-/// /dev/openarm/left_wrist_cam) resolve to their /dev/video<N> target first;
-/// a path that resolves to anything else is invalid.
-fn parse_camera_index(device_path: &str) -> Result<u32> {
-    let resolved = std::fs::canonicalize(device_path)
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| device_path.to_string());
-    if let Some(stripped) = resolved.strip_prefix("/dev/video") {
-        stripped
-            .parse::<u32>()
-            .map_err(|_| Error::InvalidDevicePath(device_path.to_string()))
-    } else {
-        Err(Error::InvalidDevicePath(device_path.to_string()))
+/// The [`Encoding`] a negotiated pixel format corresponds to, if this node can
+/// decode it.
+fn encoding_for(fourcc: FourCC) -> Option<Encoding> {
+    match &fourcc.repr {
+        b"RGB3" => Some(Encoding::Rgb8),
+        b"BGR3" => Some(Encoding::Bgr8),
+        b"MJPG" | b"JPEG" => Some(Encoding::Mjpeg),
+        b"YUYV" => Some(Encoding::Yuyv),
+        _ => None,
     }
 }
 
@@ -523,162 +391,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_encoding_to_frame_format() {
-        assert_eq!(
-            encoding_to_frame_format(Encoding::Rgb8),
-            FrameFormat::RAWRGB
-        );
-        assert_eq!(
-            encoding_to_frame_format(Encoding::Bgr8),
-            FrameFormat::RAWBGR
-        );
-        assert_eq!(
-            encoding_to_frame_format(Encoding::Mjpeg),
-            FrameFormat::MJPEG
-        );
-        assert_eq!(encoding_to_frame_format(Encoding::Yuyv), FrameFormat::YUYV);
+    fn cids_match_the_kernel_abi() {
+        // Values from <linux/v4l2-controls.h>, checked against the generated
+        // v4l2-sys bindings before that dependency was dropped.
+        assert_eq!(V4L2_CID_BRIGHTNESS, 0x0098_0900);
+        assert_eq!(V4L2_CID_CONTRAST, 0x0098_0901);
+        assert_eq!(V4L2_CID_AUTO_WHITE_BALANCE, 0x0098_090c);
+        assert_eq!(V4L2_CID_GAIN, 0x0098_0913);
+        assert_eq!(V4L2_CID_WHITE_BALANCE_TEMPERATURE, 0x0098_091a);
+        assert_eq!(V4L2_CID_EXPOSURE_AUTO, 0x009a_0901);
+        assert_eq!(V4L2_CID_EXPOSURE_ABSOLUTE, 0x009a_0902);
     }
 
     #[test]
-    fn test_frame_format_to_encoding() {
-        assert_eq!(
-            frame_format_to_encoding(FrameFormat::RAWRGB).unwrap(),
-            Encoding::Rgb8
-        );
-        assert_eq!(
-            frame_format_to_encoding(FrameFormat::RAWBGR).unwrap(),
-            Encoding::Bgr8
-        );
-        assert_eq!(
-            frame_format_to_encoding(FrameFormat::MJPEG).unwrap(),
-            Encoding::Mjpeg
-        );
-        assert_eq!(
-            frame_format_to_encoding(FrameFormat::YUYV).unwrap(),
-            Encoding::Yuyv
-        );
-    }
-
-    #[test]
-    fn test_frame_format_to_encoding_rejects_unrepresentable() {
-        assert!(frame_format_to_encoding(FrameFormat::NV12).is_err());
-    }
-
-    #[test]
-    fn test_encoding_frame_format_roundtrip() {
-        for enc in [
+    fn every_encoding_round_trips_through_its_fourcc() {
+        for encoding in [
             Encoding::Rgb8,
             Encoding::Bgr8,
             Encoding::Mjpeg,
             Encoding::Yuyv,
         ] {
-            let fmt = encoding_to_frame_format(enc);
-            let back = frame_format_to_encoding(fmt).unwrap();
-            assert_eq!(back, enc, "Roundtrip failed for {enc:?}");
+            assert_eq!(
+                encoding_for(fourcc_for(encoding)),
+                Some(encoding),
+                "{encoding} did not survive the fourcc mapping"
+            );
         }
     }
 
     #[test]
-    fn test_parse_camera_index_valid() {
-        assert_eq!(parse_camera_index("/dev/video0").unwrap(), 0);
-        assert_eq!(parse_camera_index("/dev/video1").unwrap(), 1);
-        assert_eq!(parse_camera_index("/dev/video42").unwrap(), 42);
-        assert_eq!(parse_camera_index("/dev/video1000").unwrap(), 1000);
-    }
-
-    #[test]
-    fn test_parse_camera_index_invalid() {
-        // Only /dev/videoN format is accepted
-        assert!(parse_camera_index("/dev/video").is_err());
-        assert!(parse_camera_index("/dev/camera0").is_err());
-        assert!(parse_camera_index("video0").is_err());
-        assert!(parse_camera_index("0").is_err());
-        assert!(parse_camera_index("").is_err());
-        assert!(parse_camera_index("invalid").is_err());
-    }
-
-    #[test]
-    fn test_validate_device_nonexistent_path() {
-        let result = validate_video_device("/dev/video_nonexistent_99999");
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("does not exist"), "Unexpected error: {err}");
-    }
-
-    #[test]
-    fn test_validate_device_regular_file() {
-        let tmp = std::env::temp_dir().join("uvc_camera_test_not_a_device");
-        std::fs::write(&tmp, b"not a device").unwrap();
-        let result = validate_video_device(tmp.to_str().unwrap());
-        let _ = std::fs::remove_file(&tmp);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("not a character device"),
-            "Unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn test_validate_device_directory() {
-        let result = validate_video_device("/tmp");
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("not a character device"),
-            "Unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn test_validate_device_not_v4l2() {
-        // /dev/null is a character device but not a V4L2 device
-        let result = validate_video_device("/dev/null");
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("not a V4L2 video device"),
-            "Unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn test_get_device_gid_dev_null() {
-        let gid = get_device_gid("/dev/null");
-        assert!(gid.is_some(), "/dev/null should be stattable");
-    }
-
-    #[test]
-    fn test_get_device_gid_nonexistent() {
-        let gid = get_device_gid("/dev/nonexistent_device_xyz");
-        assert!(gid.is_none());
-    }
-
-    #[test]
-    fn test_get_process_groups_contains_egid() {
-        let groups = get_process_groups();
-        let egid = unsafe { libc::getegid() };
-        assert!(
-            groups.contains(&egid),
-            "Process groups {groups:?} should contain effective GID {egid}"
-        );
-    }
-
-    #[test]
-    fn test_resolve_gid_to_name_root() {
-        let name = resolve_gid_to_name(0);
-        assert_eq!(name.as_deref(), Some("root"));
-    }
-
-    #[test]
-    fn test_resolve_gid_to_name_unknown() {
-        let name = resolve_gid_to_name(99999);
-        assert!(name.is_none(), "GID 99999 should not resolve to a name");
-    }
-
-    #[test]
-    fn test_diagnose_permission_error_nonexistent() {
-        let msg = diagnose_permission_error("/dev/nonexistent_device_xyz");
-        assert!(msg.contains("Could not stat"), "Unexpected message: {msg}");
+    fn unsupported_fourcc_is_rejected_rather_than_guessed() {
+        // NV12 is common on capture hardware and this node cannot decode it, so
+        // it must fail at open rather than stream bytes the pipeline would
+        // reinterpret as something else.
+        assert_eq!(encoding_for(FourCC::new(b"NV12")), None);
     }
 }
