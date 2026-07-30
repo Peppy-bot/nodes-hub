@@ -37,10 +37,11 @@ Interchangeable nodes are connected through contracts defined in [`contracts-hub
   interfaces: {
     topics: { emits: [{ link_id: "camera", name: "video_stream" }] },
     services: { exposes: [{ link_id: "camera", name: "video_stream_info" }] }
+    // abbreviated: rgb_camera:v1 also exposes the five camera control services
   }
   ```
 
-  The implementation must list every member of the contract exactly once. Every node implementing `rgb_camera:v1` is interchangeable with the others: a real Linux camera and a Python or Rust mock all satisfy the same contract, and so would a simulated camera.
+  The implementation must list every member of the contract exactly once, so a real one is longer than the excerpt above; peppy rejects a manifest that misses any member. Every node implementing `rgb_camera:v1` is interchangeable with the others: a real Linux camera and a Python or Rust mock all satisfy the same contract, and so would a simulated camera.
 - A consumer depends on the **contract**, not a specific node, through `manifest.depends_on.contracts`; the launcher binds it to whichever implementing node is selected. A consumer can also depend on a specific node via `manifest.depends_on.nodes`. Each dependency carries a `link_id` that wires it to the `topics`/`services`/`actions` the node consumes:
 
   ```json5

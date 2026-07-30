@@ -87,12 +87,18 @@ peppy node sync          # regenerate peppygen from peppy.json5
 peppy node add . -sb     # sync + build the container
 ```
 
-For a standalone run against a local camera, `linux/mock_parameters.json`
-supplies parameters (`/dev/video0`, mjpeg to rgb8, 25 fps, 1920x1080):
+### Standalone, for development only
+
+Not a deployment path: this bypasses the container and reads its parameters from
+`linux/mock_parameters.json` (`/dev/video0`, mjpeg to rgb8, 25 fps, 1920x1080)
+rather than from a launcher. Useful for bringing up a camera on a workstation.
 
 ```sh
 cd linux && cargo run
 ```
+
+Set `RUST_LOG=debug` to see the device-open sequence (resolved index, validation,
+requested format) when a camera refuses to open.
 
 ## Tests
 

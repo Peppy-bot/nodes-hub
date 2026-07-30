@@ -1,6 +1,6 @@
 # uvc_camera_python_mock
 
-A dependency-free `rgb_camera:v1` provider: it replays a bundled video file
+A hardware-free `rgb_camera:v1` provider: it replays a bundled video file
 (`assets/robot.mp4`) as a `video_stream` and acknowledges every camera control
 service. Use it to bring a consumer up without a camera or a sim engine.
 

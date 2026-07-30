@@ -65,23 +65,18 @@ fn yuyv_to_rgb(data: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
     Ok(rgb)
 }
 
-/// Decode MJPEG data to raw RGB8
+/// Decode MJPEG data to raw RGB8.
+///
+/// Decoding through `DynamicImage` rather than sizing a buffer by hand: a JPEG
+/// carries its own colour type, so a grayscale frame decodes to one byte per
+/// pixel, and `ImageDecoder::read_image` panics outright when the buffer does
+/// not match `total_bytes()`. This converts whatever the camera sent into the
+/// RGB8 the rest of the pipeline expects.
 fn decode_jpeg(data: &[u8]) -> Result<Vec<u8>> {
-    use image::ImageDecoder;
-    use image::codecs::jpeg::JpegDecoder;
-
-    let decoder = JpegDecoder::new(std::io::Cursor::new(data))
-        .map_err(|e| Error::EncodingError(format!("Failed to create JPEG decoder: {}", e)))?;
-
-    let (width, height) = decoder.dimensions();
-    // Widen before multiplying: a crafted header can carry dimensions whose
-    // u32 product overflows.
-    let mut rgb = vec![0u8; width as usize * height as usize * 3];
-    decoder
-        .read_image(&mut rgb)
+    let decoded = image::load_from_memory_with_format(data, image::ImageFormat::Jpeg)
         .map_err(|e| Error::EncodingError(format!("Failed to decode JPEG: {}", e)))?;
 
-    Ok(rgb)
+    Ok(decoded.into_rgb8().into_raw())
 }
 
 /// Process a raw frame from the camera into the target encoding.
@@ -316,6 +311,35 @@ mod tests {
             frame.data()[2] < 50,
             "R channel (index 2 in BGR) should be low"
         );
+    }
+
+    #[test]
+    fn test_process_frame_grayscale_mjpeg_to_rgb8() {
+        // A grayscale JPEG decodes to one byte per pixel, so sizing the output
+        // buffer as width*height*3 made `read_image` panic on the capture
+        // thread. Expanding to RGB8 must work for any source colour type.
+        let gray = image::GrayImage::from_raw(2, 2, vec![0, 64, 128, 255]).unwrap();
+        let mut jpeg = Vec::new();
+        image::DynamicImage::ImageLuma8(gray)
+            .write_to(
+                &mut std::io::Cursor::new(&mut jpeg),
+                image::ImageFormat::Jpeg,
+            )
+            .unwrap();
+
+        let raw = Frame::from_capture(jpeg, 2, 2, SystemTime::now(), Encoding::Mjpeg);
+        let frame = process_frame(raw, FrameId::default(), Encoding::Rgb8).unwrap();
+
+        assert_eq!(frame.encoding(), Encoding::Rgb8);
+        assert_eq!(
+            frame.data().len(),
+            2 * 2 * 3,
+            "grayscale must expand to RGB8"
+        );
+        // Grey expands to equal channels; JPEG is lossy so allow a little drift.
+        for px in frame.data().chunks_exact(3) {
+            assert!(px[0].abs_diff(px[1]) <= 2 && px[1].abs_diff(px[2]) <= 2);
+        }
     }
 
     #[test]
