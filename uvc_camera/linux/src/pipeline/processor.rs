@@ -65,16 +65,29 @@ fn yuyv_to_rgb(data: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
     Ok(rgb)
 }
 
-/// Decode MJPEG data to raw RGB8.
+/// Decode MJPEG data to raw RGB8 at the frame's declared geometry.
 ///
 /// Decoding through `DynamicImage` rather than sizing a buffer by hand: a JPEG
 /// carries its own colour type, so a grayscale frame decodes to one byte per
 /// pixel, and `ImageDecoder::read_image` panics outright when the buffer does
 /// not match `total_bytes()`. This converts whatever the camera sent into the
 /// RGB8 the rest of the pipeline expects.
-fn decode_jpeg(data: &[u8]) -> Result<Vec<u8>> {
+///
+/// The JPEG also carries its own dimensions, and the published message
+/// advertises the frame's declared ones, so a mismatch (corrupt frame, driver
+/// renegotiation mid-stream) must fail here rather than publish a payload that
+/// contradicts its geometry.
+fn decode_jpeg(data: &[u8], expected_width: u32, expected_height: u32) -> Result<Vec<u8>> {
     let decoded = image::load_from_memory_with_format(data, image::ImageFormat::Jpeg)
         .map_err(|e| Error::EncodingError(format!("Failed to decode JPEG: {}", e)))?;
+
+    if (decoded.width(), decoded.height()) != (expected_width, expected_height) {
+        return Err(Error::EncodingError(format!(
+            "decoded JPEG is {}x{}, expected {expected_width}x{expected_height}",
+            decoded.width(),
+            decoded.height(),
+        )));
+    }
 
     Ok(decoded.into_rgb8().into_raw())
 }
@@ -99,7 +112,7 @@ pub fn process_frame(frame: Frame, frame_id: FrameId, target_encoding: Encoding)
     let rgb_data = match camera_encoding {
         Encoding::Rgb8 => frame.data().to_vec(),
         Encoding::Bgr8 => rgb_to_bgr(frame.data()), // BGR→RGB is the same channel swap
-        Encoding::Mjpeg => decode_jpeg(frame.data())?,
+        Encoding::Mjpeg => decode_jpeg(frame.data(), frame.width(), frame.height())?,
         Encoding::Yuyv => yuyv_to_rgb(frame.data(), frame.width(), frame.height())?,
     };
 
@@ -340,6 +353,22 @@ mod tests {
         for px in frame.data().chunks_exact(3) {
             assert!(px[0].abs_diff(px[1]) <= 2 && px[1].abs_diff(px[2]) <= 2);
         }
+    }
+
+    #[test]
+    fn test_mjpeg_dimension_mismatch_is_rejected() {
+        // The published message advertises the frame's declared geometry, so a
+        // JPEG whose embedded dimensions disagree (corrupt frame, driver
+        // renegotiation mid-stream) must fail instead of publishing a payload
+        // that contradicts its width and height.
+        let jpeg = encode_jpeg(&[255u8, 0, 0], 1, 1, JPEG_QUALITY).unwrap();
+        let raw = Frame::from_capture(jpeg, 2, 2, SystemTime::now(), Encoding::Mjpeg);
+        let err = process_frame(raw, FrameId::default(), Encoding::Rgb8).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("decoded JPEG is 1x1, expected 2x2"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
