@@ -4036,7 +4036,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "uvc_camera_video_reconstruction"
+name = "uvc_camera_video_reconstruction_rust"
 version = "0.1.0"
 dependencies = [
  "ffmpeg-next",

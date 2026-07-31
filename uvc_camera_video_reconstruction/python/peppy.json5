@@ -1,7 +1,7 @@
 {
   peppy_schema: "node/v1",
   manifest: {
-    name: "uvc_camera_video_reconstruction",
+    name: "uvc_camera_video_reconstruction_python",
     tag: "v1",
     depends_on: {
       contracts: [

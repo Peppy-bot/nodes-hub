@@ -147,7 +147,7 @@ wheels = [
 ]
 
 [[package]]
-name = "uvc-camera-video-reconstruction"
+name = "uvc-camera-video-reconstruction-python"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
