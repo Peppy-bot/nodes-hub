@@ -1,0 +1,95 @@
+{
+  peppy_schema: "repository/v1",
+  nodes: {
+    deliberative_planner: {
+      v1: {
+        path: "example_robot/deliberative_planner/peppy.json5"
+      }
+    },
+    episode_recorder: {
+      v1: {
+        path: "example_robot/episode_recorder/peppy.json5"
+      }
+    },
+    my_python_robot_arm: {
+      v1: {
+        path: "example_robot/my_robot_arm/my_python_robot_arm/peppy.json5"
+      }
+    },
+    my_python_robot_backbone: {
+      v1: {
+        path: "example_robot/my_robot_backbone/my_python_robot_backbone/peppy.json5"
+      }
+    },
+    my_python_robot_brain: {
+      v1: {
+        path: "example_robot/my_robot_brain/my_python_robot_brain/peppy.json5"
+      }
+    },
+    my_rust_robot_arm: {
+      v1: {
+        path: "example_robot/my_robot_arm/my_rust_robot_arm/peppy.json5"
+      }
+    },
+    my_rust_robot_backbone: {
+      v1: {
+        path: "example_robot/my_robot_backbone/my_rust_robot_backbone/peppy.json5"
+      }
+    },
+    my_rust_robot_brain: {
+      v1: {
+        path: "example_robot/my_robot_brain/my_rust_robot_brain/peppy.json5"
+      }
+    },
+    reactive_policy: {
+      v1: {
+        path: "example_robot/reactive_policy/peppy.json5"
+      }
+    },
+    realsense_d4xx: {
+      v1: {
+        path: "realsense_d4xx/peppy.json5"
+      }
+    },
+    uvc_camera_controls_tests: {
+      v1: {
+        path: "uvc_camera_controls_tests/peppy.json5"
+      }
+    },
+    uvc_camera_linux: {
+      v1: {
+        path: "uvc_camera/linux/peppy.json5"
+      }
+    },
+    uvc_camera_macos: {
+      v1: {
+        path: "uvc_camera/macos/peppy.json5"
+      }
+    },
+    uvc_camera_python_mock: {
+      v1: {
+        path: "uvc_camera/mock_python/peppy.json5"
+      }
+    },
+    uvc_camera_rust_mock: {
+      v1: {
+        path: "uvc_camera/mock_rust/peppy.json5"
+      }
+    },
+    uvc_camera_video_reconstruction_python: {
+      v1: {
+        path: "uvc_camera_video_reconstruction/python/peppy.json5"
+      }
+    },
+    uvc_camera_video_reconstruction_rust: {
+      v1: {
+        path: "uvc_camera_video_reconstruction/rust/peppy.json5"
+      }
+    },
+    zed_camera: {
+      v1: {
+        path: "zed_camera/peppy.json5"
+      }
+    }
+  }
+}

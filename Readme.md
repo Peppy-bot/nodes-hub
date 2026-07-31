@@ -65,3 +65,19 @@ interfaces:  { topics?, services?, actions? }
 Parameters are typed (`device_path: "string"`) or typed with a default (`{ $type: "u16", $default: 30 }`).
 
 See the [Peppy documentation](https://github.com/Peppy-bot/peppy) for launcher configuration and how contract dependencies are resolved to concrete nodes.
+
+## Adding an item to this repository
+
+This repository publishes what `peppy_repository.json5` says it publishes, and nothing else. An item
+that is not listed there is invisible to peppy, so after adding, moving, or renaming a node, run:
+
+```sh
+peppy repo index .
+```
+
+Commit the updated `peppy_repository.json5` alongside your change. CI runs `peppy repo index --check`
+on every pull request and fails if the index has drifted from the repository, naming the file and the
+identity involved.
+
+Generation refuses, naming both files, if your change claims a `name:tag` another one already
+publishes. Rename yours: within one repository, a `name:tag` is claimed by exactly one file.
