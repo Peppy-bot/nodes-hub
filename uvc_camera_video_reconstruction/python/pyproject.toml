@@ -3,17 +3,17 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "uvc_camera_video_reconstruction"
+name = "uvc_camera_video_reconstruction_python"
 version = "0.1.0"
-description = "uvc_camera_video_reconstruction peppy node"
+description = "uvc_camera_video_reconstruction_python peppy node"
 requires-python = ">=3.11,<3.14"
 dependencies = ["peppygen", "peppylib", "av", "numpy"]
 
 [project.scripts]
-uvc_camera_video_reconstruction = "uvc_camera_video_reconstruction.__main__:main"
+uvc_camera_video_reconstruction_python = "uvc_camera_video_reconstruction_python.__main__:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/uvc_camera_video_reconstruction"]
+packages = ["src/uvc_camera_video_reconstruction_python"]
 
 [dependency-groups]
 dev = []

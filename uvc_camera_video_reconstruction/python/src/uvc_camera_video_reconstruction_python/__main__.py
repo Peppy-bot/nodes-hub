@@ -76,7 +76,7 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
     # Log when the shutdown/cancel signal is received so it is visible in the
     # node's stdout.
     async def announce_shutdown():
-        print("[uvc_camera_video_reconstruction] Shutdown signal received")
+        print("[uvc_camera_video_reconstruction_python] Shutdown signal received")
 
     node_runner.on_shutdown(announce_shutdown)
 

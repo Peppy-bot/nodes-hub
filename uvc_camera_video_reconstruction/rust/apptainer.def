@@ -2,14 +2,14 @@ Bootstrap: docker
 From: tuatini/peppy-rust-cargo-base:latest
 
 %labels
-    Name uvc_camera_video_reconstruction
+    Name uvc_camera_video_reconstruction_rust
     Version 0.1.0
 
 %environment
     export PATH="/root/.cargo/bin:$PATH"
 
 %files
-    . /opt/uvc_camera_video_reconstruction
+    . /opt/uvc_camera_video_reconstruction_rust
 
 %post
     set -eux
@@ -30,9 +30,9 @@ From: tuatini/peppy-rust-cargo-base:latest
         llvm-dev
     rm -rf /var/lib/apt/lists/*
 
-    cd /opt/uvc_camera_video_reconstruction
+    cd /opt/uvc_camera_video_reconstruction_rust
     cargo build --release
 
 %runscript
-    cd /opt/uvc_camera_video_reconstruction
-    exec ./target/release/uvc_camera_video_reconstruction
+    cd /opt/uvc_camera_video_reconstruction_rust
+    exec ./target/release/uvc_camera_video_reconstruction_rust

@@ -18,7 +18,7 @@ fn main() -> Result<()> {
         // Log when the shutdown/cancel signal is received so it is visible in
         // the node's stdout.
         node_runner.on_shutdown(async move {
-            println!("[uvc_camera_video_reconstruction] Shutdown signal received");
+            println!("[uvc_camera_video_reconstruction_rust] Shutdown signal received");
         });
 
         tokio::spawn(record_video(node_runner, video_duration_seconds));
