@@ -20,11 +20,14 @@ concurrency:
 jobs:
   check-index:
     runs-on: self-hosted
+    # The runners are shared, so a step that hangs holds one hostage. Nothing
+    # here legitimately takes minutes.
+    timeout-minutes: 15
     permissions:
       contents: read
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           # Nothing here pushes, so the job has no use for a writable
@@ -36,14 +39,25 @@ jobs:
       # and the self-hosted runners are reused, so this run must not touch a
       # shared ~/.peppy. Set the PEPPY_VERSION repository variable to pin a
       # release; it defaults to the latest.
+      #
+      # PEPPY_VERSION reaches the script through the environment rather than a
+      # `${{ }}` expansion, so its value is data the shell reads instead of
+      # source the shell parses, and the shape check turns a typo into a named
+      # failure rather than a 404 from a URL built out of it.
       - name: Install peppy
+        env:
+          PEPPY_VERSION: ${{ vars.PEPPY_VERSION }}
         run: |
           set -euo pipefail
-          version="${{ vars.PEPPY_VERSION || 'latest' }}"
-          case "$version" in
-            latest) channel="latest" ;;
-            *) channel="v${version#v}" ;;
-          esac
+          version="${PEPPY_VERSION:-latest}"
+          if [[ "$version" == "latest" ]]; then
+            channel="latest"
+          elif [[ "$version" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            channel="v${version#v}"
+          else
+            echo "PEPPY_VERSION must be 'latest' or a release such as 0.20.0, got: $version" >&2
+            exit 1
+          fi
 
           case "$(uname -m)" in
             x86_64 | amd64) arch="x86_64" ;;
@@ -53,7 +67,8 @@ jobs:
 
           dest="$RUNNER_TEMP/peppy-bin"
           mkdir -p "$dest"
-          curl -fsSL "https://peppy.bot/$channel/peppy-$arch-unknown-linux-gnu.tgz" \
+          curl -fsSL --connect-timeout 10 --max-time 300 \
+            "https://peppy.bot/$channel/peppy-$arch-unknown-linux-gnu.tgz" \
             | tar -xzf - -C "$dest" bin/peppy
           chmod +x "$dest/bin/peppy"
           echo "$dest/bin" >> "$GITHUB_PATH"
