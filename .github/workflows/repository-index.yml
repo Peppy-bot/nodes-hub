@@ -1,0 +1,67 @@
+name: Repository index
+
+# `peppy_repository.json5` states what this repository publishes. It is
+# generated, so a pull request that adds, moves, renames or deletes a node,
+# contract, pairing or launcher leaves it stale unless the author regenerates
+# it. A stale index makes an item silently invisible to every machine that
+# consumes this repository, and none of those machines can fix it. This job
+# catches that on the branch of the person who caused it.
+#
+# It runs on every pull request rather than behind a path filter: a removal or
+# a rename drifts the index just as an addition does, and the check is a
+# filesystem walk that costs seconds.
+on:
+  pull_request:
+
+concurrency:
+  group: repository-index-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  check-index:
+    runs-on: self-hosted
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          # Nothing here pushes, so the job has no use for a writable
+          # credential sitting in .git/config for every later step to inherit.
+          persist-credentials: false
+
+      # Installed under RUNNER_TEMP rather than through scripts/install.sh:
+      # `peppy repo index` needs no daemon, no container runtime and no root,
+      # and the self-hosted runners are reused, so this run must not touch a
+      # shared ~/.peppy. Set the PEPPY_VERSION repository variable to pin a
+      # release; it defaults to the latest.
+      - name: Install peppy
+        run: |
+          set -euo pipefail
+          version="${{ vars.PEPPY_VERSION || 'latest' }}"
+          case "$version" in
+            latest) channel="latest" ;;
+            *) channel="v${version#v}" ;;
+          esac
+
+          case "$(uname -m)" in
+            x86_64 | amd64) arch="x86_64" ;;
+            aarch64 | arm64) arch="aarch64" ;;
+            *) echo "unsupported runner architecture: $(uname -m)" >&2; exit 1 ;;
+          esac
+
+          dest="$RUNNER_TEMP/peppy-bin"
+          mkdir -p "$dest"
+          curl -fsSL "https://peppy.bot/$channel/peppy-$arch-unknown-linux-gnu.tgz" \
+            | tar -xzf - -C "$dest" bin/peppy
+          chmod +x "$dest/bin/peppy"
+          echo "$dest/bin" >> "$GITHUB_PATH"
+
+      # PEPPY_HOME is per-run for the same reason: every peppy invocation builds
+      # its app context before dispatching, and the runners are shared.
+      - name: Check peppy_repository.json5 matches the repository
+        run: |
+          export PEPPY_HOME="$RUNNER_TEMP/peppy-home"
+          mkdir -p "$PEPPY_HOME"
+          peppy repo index . --check
