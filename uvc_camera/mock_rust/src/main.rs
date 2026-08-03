@@ -12,7 +12,14 @@ use peppylib::runtime::CancellationToken;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// Stamp from the daemon-resolved clock; identical to the OS clock in wall
+/// mode, the simulator's time under sim time.
+fn stamp_now() -> std::result::Result<SystemTime, String> {
+    let ns = peppygen::clock::now_ns().map_err(|e| e.to_string())?;
+    Ok(UNIX_EPOCH + Duration::from_nanos(ns))
+}
 
 fn get_source_video_fps(video_path: &PathBuf) -> u8 {
     let input = ffmpeg::format::input(video_path)
@@ -102,6 +109,10 @@ fn main() -> Result<()> {
 
         spawn_control_acks(&node_runner);
 
+        // The synchronized clock stamping every emission: the OS clock in
+        // wall mode, the simulator's time under sim time.
+        peppygen::clock::init(&node_runner).await?;
+
         // Long running tasks should always be spawned in a different thread
         let cancel_token = node_runner.cancellation_token().clone();
         // Log when the shutdown/cancel signal is received so it is visible in
@@ -177,10 +188,15 @@ async fn run_video_loop(
             },
         };
 
-        let header = MessageHeader {
-            stamp: SystemTime::now(),
-            frame_id,
+        let stamp = match stamp_now() {
+            Ok(stamp) => stamp,
+            Err(e) => {
+                // Sim mode before the first tick: skip rather than mis-stamp.
+                tracing::debug!("skipping frame: {e}");
+                continue;
+            }
         };
+        let header = MessageHeader { stamp, frame_id };
 
         let payload =
             match video_stream::build_message(header, encoding.clone(), width, height, data) {

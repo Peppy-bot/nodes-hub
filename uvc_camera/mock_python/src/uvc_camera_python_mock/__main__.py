@@ -9,7 +9,7 @@ from importlib.resources import files
 from pathlib import Path
 
 
-from peppygen import NodeBuilder, NodeRunner, StandaloneConfig
+from peppygen import NodeBuilder, NodeRunner, StandaloneConfig, clock
 from peppygen.exposed_services.camera import (
     set_brightness,
     set_contrast,
@@ -115,6 +115,10 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
     # cold-start stall.
     publisher = await video_stream.declare_publisher(node_runner)
 
+    # The synchronized clock stamping every emission: the OS clock in wall
+    # mode, the simulator's time under sim time.
+    await clock.init(node_runner)
+
     # Producer and consumer are decoupled through a small, drop-oldest queue
     # rather than a blocking one: a slow or briefly-stalled consumer (for
     # example, the first publish waiting on subscriber discovery during a cold
@@ -166,7 +170,13 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
                     # Serialize on this worker thread, off the event loop. Read
                     # packed bytes directly from the plane to avoid a numpy
                     # dependency.
-                    header = MessageHeader(stamp=time.time(), frame_id=frame_id)
+                    try:
+                        stamp = clock.now_ns() / 1e9
+                    except RuntimeError:
+                        # Sim mode before the first tick: skip, never mis-stamp.
+                        time.sleep(frame_duration)
+                        continue
+                    header = MessageHeader(stamp=stamp, frame_id=frame_id)
                     payload = video_stream.build_message(
                         header, encoding, width, height, bytes(rgb_frame.planes[0])
                     )
