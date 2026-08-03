@@ -20,7 +20,7 @@ use v4l::video::Capture as _;
 use v4l::{Format, FourCC};
 
 use crate::camera::controls::{
-    CameraControlRequest, ControlResult, ExposureMode, WhiteBalanceMode,
+    CameraControlRequest, ControlResult, ExposureMode, VALUE_UNAVAILABLE, WhiteBalanceMode,
 };
 use crate::types::{CameraConfig, Encoding, Error, Frame, Result};
 
@@ -49,6 +49,10 @@ const BUFFER_COUNT: u32 = 4;
 /// (an unplugged camera) blocks the capture thread indefinitely; with it the
 /// loop sees an error and its stall window decides when to give up.
 const DEQUEUE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// The kernel's overflow gid: what a rootless container reports for a host
+/// group that has no mapping inside its user namespace.
+const OVERFLOW_GID: u32 = 65534;
 
 /// The format the driver actually accepted, which may differ from the request.
 struct Negotiated {
@@ -294,9 +298,9 @@ fn diagnose_permission_error(path: &str) -> String {
     let owner = group_name(gid).unwrap_or_else(|| gid.to_string());
     message.push_str(&format!(" The device is owned by group {owner} ({gid})."));
 
-    // 65534 is the overflow gid: a rootless container with no mapping for the
-    // host group reports it here, and joining a group will not help.
-    if gid == 65534 {
+    // Joining a group cannot help here: the host group does not exist inside
+    // the container's user namespace.
+    if gid == OVERFLOW_GID {
         message.push_str(
             " That is the overflow gid, so the host group has no mapping inside this container.",
         );
@@ -367,7 +371,7 @@ fn set_exposure(device: &Device, mode: &ExposureMode, value: i32) -> ControlResu
     }
 
     match mode {
-        ExposureMode::Auto => ControlResult::ok("Exposure set to auto mode", -1),
+        ExposureMode::Auto => ControlResult::ok("Exposure set to auto mode", VALUE_UNAVAILABLE),
         ExposureMode::Manual => {
             // Absolute exposure is in 100us units for V4L2.
             if let Err(e) = write_control(device, V4L2_CID_EXPOSURE_ABSOLUTE, i64::from(value)) {
@@ -389,7 +393,9 @@ fn set_white_balance(device: &Device, mode: &WhiteBalanceMode, temperature: i32)
     }
 
     match mode {
-        WhiteBalanceMode::Auto => ControlResult::ok("White balance set to auto mode", -1),
+        WhiteBalanceMode::Auto => {
+            ControlResult::ok("White balance set to auto mode", VALUE_UNAVAILABLE)
+        }
         WhiteBalanceMode::Manual => {
             if let Err(e) = write_control(
                 device,

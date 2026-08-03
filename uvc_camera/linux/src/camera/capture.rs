@@ -217,7 +217,7 @@ fn run_camera_capture_loop(
     // Both clocks start after the publisher is up, so a slow cold-start
     // declaration does not count as a stall or leave the first deadline stale.
     let mut window = PublishWindow::new();
-    let target_frame_duration = Duration::from_nanos(1_000_000_000 / u64::from(frame_rate));
+    let target_frame_duration = Duration::from_secs(1) / u32::from(frame_rate);
     let mut next_frame_time = Instant::now() + target_frame_duration;
 
     while !cancel_token.is_cancelled() {

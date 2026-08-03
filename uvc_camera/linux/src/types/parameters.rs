@@ -65,6 +65,9 @@ pub struct Resolution {
 }
 
 impl Resolution {
+    pub const DEFAULT_WIDTH: u32 = 640;
+    pub const DEFAULT_HEIGHT: u32 = 480;
+
     pub fn new(width: u32, height: u32) -> Self {
         Self { width, height }
     }
@@ -80,7 +83,7 @@ impl Resolution {
 
 impl Default for Resolution {
     fn default() -> Self {
-        Self::new(640, 480)
+        Self::new(Self::DEFAULT_WIDTH, Self::DEFAULT_HEIGHT)
     }
 }
 
@@ -161,7 +164,10 @@ impl CameraConfigBuilder {
             .device_path
             .ok_or_else(|| Error::Other("Device path is required".to_string()))?;
 
-        let resolution = Resolution::new(self.width.unwrap_or(640), self.height.unwrap_or(480));
+        let resolution = Resolution::new(
+            self.width.unwrap_or(Resolution::DEFAULT_WIDTH),
+            self.height.unwrap_or(Resolution::DEFAULT_HEIGHT),
+        );
 
         let frame_rate = FrameRate::new(self.frame_rate.unwrap_or(FrameRate::DEFAULT))?;
 

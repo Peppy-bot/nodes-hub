@@ -24,9 +24,7 @@ relationship to any robot's pose, which makes them useful for bringing up a
 consumer with neither hardware nor a sim engine, and useless for anything that
 cares what the camera is looking at. A simulated robot uses its engine's camera
 relay instead, which renders the robot's actual views through this same
-`rgb_camera:v1` contract with real extrinsics. Recording a dataset against these
-mocks would pair real actions with unrelated images, which is worse than
-recording no camera at all.
+`rgb_camera:v1` contract with real extrinsics. 
 
 ## Interfaces
 
@@ -80,28 +78,6 @@ node still answers services as though it were healthy.
 Device permission failures are diagnosed rather than passed through: the node
 reports the device's owning group, the groups the process is actually in, and
 flags the overflow GID that rootless containers produce.
-
-## Running
-
-Build and deploy through peppy, not bare cargo:
-
-```sh
-peppy node sync          # regenerate peppygen from peppy.json5
-peppy node add . -sb     # sync + build the container
-```
-
-### Standalone, for development only
-
-Not a deployment path: this bypasses the container and reads its parameters from
-`linux/mock_parameters.json` (`/dev/video0`, mjpeg to rgb8, 25 fps, 1920x1080)
-rather than from a launcher. Useful for bringing up a camera on a workstation.
-
-```sh
-cd linux && cargo run
-```
-
-Set `RUST_LOG=debug` to see the device-open sequence (validation, requested
-format) when a camera refuses to open.
 
 ## Tests
 

@@ -63,12 +63,17 @@ pub enum CameraControlRequest {
     SetContrast { value: i32 },
 }
 
+/// Reported when a control has no meaningful current value: the write failed,
+/// or the mode (e.g. auto exposure) leaves the driver managing it.
+pub const VALUE_UNAVAILABLE: i32 = -1;
+
 /// Result of applying a camera control
 #[derive(Debug, Clone)]
 pub struct ControlResult {
     pub success: bool,
     pub message: String,
-    /// Current value after applying the control; -1 if not applicable or unreadable
+    /// Current value after applying the control; [`VALUE_UNAVAILABLE`] if not
+    /// applicable or unreadable
     pub current_value: i32,
 }
 
@@ -85,7 +90,7 @@ impl ControlResult {
         Self {
             success: false,
             message: message.into(),
-            current_value: -1,
+            current_value: VALUE_UNAVAILABLE,
         }
     }
 }
@@ -129,6 +134,6 @@ mod tests {
     fn test_control_result_err() {
         let r = ControlResult::err("Not supported");
         assert!(!r.success);
-        assert_eq!(r.current_value, -1);
+        assert_eq!(r.current_value, VALUE_UNAVAILABLE);
     }
 }
