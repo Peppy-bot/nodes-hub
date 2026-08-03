@@ -49,7 +49,7 @@ None have defaults; a launcher must supply all of them.
 
 | Parameter | Type | Notes |
 |---|---|---|
-| `device_path` | string | `/dev/videoN`, or a udev symlink such as `/dev/openarm/left_wrist_cam`. Symlinks are resolved to a device index before opening. |
+| `device_path` | string | `/dev/videoN`, or a udev symlink such as `/dev/openarm/left_wrist_cam`, opened directly without resolving to a device index. |
 | `video.frame_rate` | u16 | Publish rate. `0` falls back to 30. |
 | `video.resolution.width` / `.height` | u32 | Requested capture size. |
 | `video.camera_encoding` | string | What to ask the camera for: `rgb8`, `bgr8`, `mjpeg`, or `yuyv`. |
@@ -63,7 +63,7 @@ failing every frame.
 
 Conversion goes through RGB8 as an intermediate, and is skipped entirely when
 `camera_encoding` already matches `topic_encoding`. YUYV is decoded as
-limited-range BT.601, matching V4L2, OpenCV, GStreamer and nokhwa.
+limited-range BT.601, matching V4L2's default, OpenCV and GStreamer.
 
 ## Failure behaviour
 
@@ -126,5 +126,6 @@ real device node the driver needs.
 The camera runs on a dedicated OS thread rather than a `spawn_blocking` task:
 `Runtime::drop` waits for every blocking-pool task, so a V4L2 call wedged in the
 driver would hang shutdown past the grace window. Device teardown is awaited from
-a shutdown hook so it stays inside that window. `nokhwa::Camera` is `!Send`, and
-it is built on that thread so it never crosses a thread boundary.
+a shutdown hook so it stays inside that window. The mmap capture stream is bound
+to the thread that dequeues it, so the device is built on that thread and never
+crosses a thread boundary.
