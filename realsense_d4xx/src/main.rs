@@ -76,6 +76,10 @@ fn main() -> Result<()> {
             depth_fps,
         );
 
+        // The synchronized clock stamping every emission: the OS clock in
+        // wall mode, the simulator's time under sim time.
+        peppygen::clock::init(&node_runner).await?;
+
         let capture = open(cfg)
             .map_err(|e| std::io::Error::other(format!("open realsense pipeline: {e}")))?;
         let handle = capture.handle();
