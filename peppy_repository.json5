@@ -61,11 +61,6 @@
         path: "uvc_camera/linux/peppy.json5"
       }
     },
-    uvc_camera_macos: {
-      v1: {
-        path: "uvc_camera/macos/peppy.json5"
-      }
-    },
     uvc_camera_python_mock: {
       v1: {
         path: "uvc_camera/mock_python/peppy.json5"
