@@ -9,7 +9,7 @@
 use std::io::ErrorKind;
 use std::os::unix::fs::MetadataExt;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use v4l::buffer::Type;
 use v4l::capability::Flags;
@@ -53,6 +53,25 @@ const DEQUEUE_TIMEOUT: Duration = Duration::from_secs(1);
 /// The kernel's overflow gid: what a rootless container reports for a host
 /// group that has no mapping inside its user namespace.
 const OVERFLOW_GID: u32 = 65534;
+
+/// Where `captured_at` stamps come from, injected so contexts without a node
+/// runtime (the loopback integration tests) can use the wall clock directly.
+pub type StampSource = fn() -> Result<SystemTime>;
+
+/// Stamp from the daemon-resolved clock: the OS clock in wall mode, the
+/// simulator's time when the stack runs under sim time. Requires
+/// `peppygen::clock::init` to have run, which setup does before the capture
+/// loop spawns.
+pub fn clock_stamp() -> Result<SystemTime> {
+    let ns =
+        peppygen::clock::now_ns().map_err(|e| Error::Other(format!("clock not ready: {e}")))?;
+    Ok(UNIX_EPOCH + Duration::from_nanos(ns))
+}
+
+/// Wall-clock stamps for contexts with no node runtime.
+pub fn wall_stamp() -> Result<SystemTime> {
+    Ok(SystemTime::now())
+}
 
 /// The format the driver actually accepted, which may differ from the request.
 struct Negotiated {
@@ -108,8 +127,8 @@ impl ControlHandle {
 }
 
 /// A V4L2 capture device, streaming once [`CameraDevice::open`] returns.
-#[derive(Default)]
 pub struct CameraDevice {
+    stamp_now: StampSource,
     device: Option<Arc<Device>>,
     stream: Option<MmapStream<'static>>,
     negotiated: Option<Negotiated>,
@@ -117,8 +136,14 @@ pub struct CameraDevice {
 }
 
 impl CameraDevice {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(stamp_now: StampSource) -> Self {
+        Self {
+            stamp_now,
+            device: None,
+            stream: None,
+            negotiated: None,
+            description: None,
+        }
     }
 
     /// Open and configure the camera.
@@ -243,7 +268,7 @@ impl CameraDevice {
         let (buffer, meta) = stream
             .next()
             .map_err(|e| Error::Camera(format!("Failed to capture frame: {e}")))?;
-        let captured_at = SystemTime::now();
+        let captured_at = (self.stamp_now)()?;
 
         // A short transfer is a corrupt frame, not a small one: publishing it
         // would hand consumers a payload that disagrees with the dimensions.
