@@ -1,8 +1,21 @@
-## How to start?
+# uvc_camera_rust_mock
 
-This is the Rust mock node (`uvc_camera_rust_mock`); it implements the `uvc_camera` contract and emulates a real camera with fake input parameters. Start it with:
-```
-peppy node start uvc_camera_rust_mock:v1 device_path="/dev/video0" video.frame_rate=30 video.resolution.width=1920 video.resolution.height=1080 video.camera_encoding="mjpeg" video.topic_encoding="rgb8"
+A hardware-free `rgb_camera:v1` provider: it replays a bundled video file
+(`assets/robot.mp4`) as a `video_stream` and acknowledges every camera control
+service. Use it to bring a consumer up without a camera or a sim engine.
+
+It is not a simulation. The footage has no relationship to any robot's pose, so
+anything that cares what the camera is looking at wants the sim engine's camera
+relay instead; see [../Readme.md](../Readme.md).
+
+## Running
+
+```sh
+peppy node add . -sb
+peppy node run uvc_camera_rust_mock:v1 video.frame_rate=30 video.topic_encoding=rgb8
 ```
 
-All parameters have defaults (see `peppy.json5`), so each is optional.
+Every parameter has a default in `peppy.json5`, so all arguments are optional.
+`device_path` and `video.camera_encoding` are declared only to mirror the real
+node's parameter shape; this node reads neither, and the frames come from the
+bundled asset regardless.
