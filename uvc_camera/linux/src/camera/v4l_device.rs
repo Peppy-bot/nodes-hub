@@ -160,23 +160,18 @@ impl CameraDevice {
             .set_params(&v4l::video::capture::Parameters::with_fps(frame_rate))
             .map_err(|e| Error::Camera(format!("{path}: cannot set frame rate: {e}")))?;
 
-        // The publish rate is the configured pace capped by what the driver
-        // will actually deliver; a driver readback it cannot express (zero
-        // terms) falls back to the request.
         let interval = accepted_params.interval;
-        let driver_fps = if interval.numerator > 0 && interval.denominator > 0 {
-            interval.denominator / interval.numerator
-        } else {
-            frame_rate
-        };
-        let publish_fps = config
-            .frame_rate
-            .as_u8()
-            .min(u8::try_from(driver_fps).unwrap_or(u8::MAX));
+        let publish_fps = effective_publish_fps(
+            config.frame_rate.as_u8(),
+            interval.numerator,
+            interval.denominator,
+        );
         if u32::from(publish_fps) != frame_rate {
             tracing::info!(
-                "{path}: driver delivers {driver_fps} fps, publishing at {publish_fps} fps \
-                 (requested {frame_rate})"
+                "{path}: driver interval {}/{}s, publishing at {publish_fps} fps \
+                 (requested {frame_rate})",
+                interval.numerator,
+                interval.denominator,
             );
         }
 
@@ -273,6 +268,23 @@ impl CameraDevice {
     pub fn is_open(&self) -> bool {
         self.device.is_some()
     }
+}
+
+/// The rate `video_stream_info` reports: the configured pace, capped by the
+/// driver-accepted frame interval (`numerator/denominator` seconds per frame).
+///
+/// Never zero: the contract cannot express it and `FrameRate` rejects it at
+/// setup, so a sub-1fps driver readback rounds up to 1 rather than collapsing
+/// the reported rate. A readback with a zero term is unusable and falls back
+/// to the configured rate.
+fn effective_publish_fps(configured_fps: u8, numerator: u32, denominator: u32) -> u8 {
+    if numerator == 0 || denominator == 0 {
+        return configured_fps;
+    }
+    let driver_fps = denominator.div_ceil(numerator);
+    configured_fps
+        .min(u8::try_from(driver_fps).unwrap_or(u8::MAX))
+        .max(1)
 }
 
 /// Turn an open failure into something actionable, diagnosing the common
@@ -458,6 +470,20 @@ fn encoding_for(fourcc: FourCC) -> Option<Encoding> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publish_fps_never_reports_zero() {
+        // A driver interval slower than one frame per second (5s per frame
+        // here) must round up to 1, not collapse to a rate the contract
+        // cannot express and consumers would divide by.
+        assert_eq!(effective_publish_fps(15, 5, 1), 1);
+        // Unusable readback falls back to the configured rate.
+        assert_eq!(effective_publish_fps(15, 0, 30), 15);
+        assert_eq!(effective_publish_fps(15, 1, 0), 15);
+        // Normal negotiation: capped by the slower of the two sides.
+        assert_eq!(effective_publish_fps(15, 1, 30), 15);
+        assert_eq!(effective_publish_fps(60, 1, 30), 30);
+    }
 
     #[test]
     fn cids_match_the_kernel_abi() {

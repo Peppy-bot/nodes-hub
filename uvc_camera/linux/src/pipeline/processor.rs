@@ -78,7 +78,17 @@ fn yuyv_to_rgb(data: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
 /// renegotiation mid-stream) must fail here rather than publish a payload that
 /// contradicts its geometry.
 fn decode_jpeg(data: &[u8], expected_width: u32, expected_height: u32) -> Result<Vec<u8>> {
-    let decoded = image::load_from_memory_with_format(data, image::ImageFormat::Jpeg)
+    // Bound the decode to the declared geometry so a crafted header fails
+    // before allocating the decoded surface, not after.
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(expected_width);
+    limits.max_image_height = Some(expected_height);
+
+    let mut reader =
+        image::ImageReader::with_format(std::io::Cursor::new(data), image::ImageFormat::Jpeg);
+    reader.limits(limits);
+    let decoded = reader
+        .decode()
         .map_err(|e| Error::EncodingError(format!("Failed to decode JPEG: {}", e)))?;
 
     if (decoded.width(), decoded.height()) != (expected_width, expected_height) {
@@ -353,6 +363,20 @@ mod tests {
         for px in frame.data().chunks_exact(3) {
             assert!(px[0].abs_diff(px[1]) <= 2 && px[1].abs_diff(px[2]) <= 2);
         }
+    }
+
+    #[test]
+    fn test_mjpeg_oversized_header_is_rejected_before_decode() {
+        // A frame larger than declared must fail at the decode limit, before
+        // the decoded surface is allocated; a hostile header cannot OOM the
+        // capture thread.
+        let big = encode_jpeg(&[0u8; 4 * 4 * 3], 4, 4, JPEG_QUALITY).unwrap();
+        let raw = Frame::from_capture(big, 2, 2, SystemTime::now(), Encoding::Mjpeg);
+        let err = process_frame(raw, FrameId::default(), Encoding::Rgb8).unwrap_err();
+        assert!(
+            err.to_string().contains("Failed to decode JPEG"),
+            "expected a decode-limit rejection, got: {err}"
+        );
     }
 
     #[test]
