@@ -18,7 +18,7 @@ fn config_for(device_path: &str) -> CameraConfig {
     CameraConfig {
         device_path: device_path.to_string(),
         resolution: Resolution::new(640, 480),
-        frame_rate: FrameRate::new(30),
+        frame_rate: FrameRate::new(30).unwrap(),
         camera_encoding: Encoding::Rgb8,
         topic_encoding: Encoding::Rgb8,
     }

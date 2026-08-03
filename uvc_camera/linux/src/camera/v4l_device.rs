@@ -2,11 +2,13 @@
 //!
 //! Talks to the kernel through the `v4l` crate directly, matching `zed_camera`,
 //! the other V4L2 node in this hub. The mmap stream is bound to the thread that
-//! dequeues it, so the device is built and used on the capture thread and never
-//! crosses a thread boundary.
+//! dequeues it, so frame capture lives on the dedicated capture thread; the
+//! device fd is shareable, and [`ControlHandle`] exposes it to service handlers
+//! so controls apply synchronously.
 
 use std::io::ErrorKind;
 use std::os::unix::fs::MetadataExt;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use v4l::buffer::Type;
@@ -55,12 +57,59 @@ struct Negotiated {
     height: u32,
 }
 
+/// What the stream actually publishes, as negotiated with the driver at open.
+/// This is what `video_stream_info` reports, so it must describe the wire, not
+/// the request.
+#[derive(Debug, Clone)]
+pub struct StreamDescription {
+    pub width: u32,
+    pub height: u32,
+    /// The effective publish rate: the configured pace, capped by what the
+    /// driver actually delivers.
+    pub frames_per_second: u8,
+}
+
+/// Shared handle for applying camera controls from service handlers.
+///
+/// Control ioctls go through the same fd the stream uses; the kernel
+/// serializes them, and a blocked dequeue does not hold the serialization lock
+/// while it waits, so controls apply promptly even mid-stream. Applying them
+/// synchronously in the handler means the caller's response always reflects
+/// what actually happened to the hardware.
+#[derive(Clone)]
+pub struct ControlHandle {
+    device: Arc<Device>,
+}
+
+impl ControlHandle {
+    /// Apply a control request, reporting the value the driver actually kept.
+    pub fn apply(&self, request: &CameraControlRequest) -> ControlResult {
+        let device = self.device.as_ref();
+        match request {
+            CameraControlRequest::SetBrightness { value } => {
+                set_integer_control(device, V4L2_CID_BRIGHTNESS, "brightness", *value)
+            }
+            CameraControlRequest::SetContrast { value } => {
+                set_integer_control(device, V4L2_CID_CONTRAST, "contrast", *value)
+            }
+            CameraControlRequest::SetGain { value } => {
+                set_integer_control(device, V4L2_CID_GAIN, "gain", *value)
+            }
+            CameraControlRequest::SetExposure { mode, value } => set_exposure(device, mode, *value),
+            CameraControlRequest::SetWhiteBalance { mode, temperature } => {
+                set_white_balance(device, mode, *temperature)
+            }
+        }
+    }
+}
+
 /// A V4L2 capture device, streaming once [`CameraDevice::open`] returns.
 #[derive(Default)]
 pub struct CameraDevice {
-    device: Option<Device>,
+    device: Option<Arc<Device>>,
     stream: Option<MmapStream<'static>>,
     negotiated: Option<Negotiated>,
+    description: Option<StreamDescription>,
 }
 
 impl CameraDevice {
@@ -103,9 +152,29 @@ impl CameraDevice {
             .map_err(|e| Error::Camera(format!("{path}: cannot set format: {e}")))?;
 
         let frame_rate = u32::from(config.frame_rate.as_u16());
-        device
+        let accepted_params = device
             .set_params(&v4l::video::capture::Parameters::with_fps(frame_rate))
             .map_err(|e| Error::Camera(format!("{path}: cannot set frame rate: {e}")))?;
+
+        // The publish rate is the configured pace capped by what the driver
+        // will actually deliver; a driver readback it cannot express (zero
+        // terms) falls back to the request.
+        let interval = accepted_params.interval;
+        let driver_fps = if interval.numerator > 0 && interval.denominator > 0 {
+            interval.denominator / interval.numerator
+        } else {
+            frame_rate
+        };
+        let publish_fps = config
+            .frame_rate
+            .as_u8()
+            .min(u8::try_from(driver_fps).unwrap_or(u8::MAX));
+        if u32::from(publish_fps) != frame_rate {
+            tracing::info!(
+                "{path}: driver delivers {driver_fps} fps, publishing at {publish_fps} fps \
+                 (requested {frame_rate})"
+            );
+        }
 
         let encoding = encoding_for(actual.fourcc).ok_or_else(|| {
             Error::Camera(format!(
@@ -143,9 +212,26 @@ impl CameraDevice {
             width: actual.width,
             height: actual.height,
         });
+        self.description = Some(StreamDescription {
+            width: actual.width,
+            height: actual.height,
+            frames_per_second: publish_fps,
+        });
         self.stream = Some(stream);
-        self.device = Some(device);
+        self.device = Some(Arc::new(device));
         Ok(())
+    }
+
+    /// The negotiated stream geometry and rate; `None` until opened.
+    pub fn stream_description(&self) -> Option<StreamDescription> {
+        self.description.clone()
+    }
+
+    /// A shareable handle for applying controls; `None` until opened.
+    pub fn control_handle(&self) -> Option<ControlHandle> {
+        self.device.as_ref().map(|device| ControlHandle {
+            device: Arc::clone(device),
+        })
     }
 
     /// Capture a single frame in the camera's negotiated encoding.
@@ -182,29 +268,6 @@ impl CameraDevice {
     /// Check if the camera is open.
     pub fn is_open(&self) -> bool {
         self.device.is_some()
-    }
-
-    /// Apply a camera control request, reporting the value actually taken.
-    pub fn apply_control(&mut self, request: &CameraControlRequest) -> ControlResult {
-        let Some(device) = self.device.as_ref() else {
-            return ControlResult::err("Camera not open");
-        };
-
-        match request {
-            CameraControlRequest::SetBrightness { value } => {
-                set_integer_control(device, V4L2_CID_BRIGHTNESS, "brightness", *value)
-            }
-            CameraControlRequest::SetContrast { value } => {
-                set_integer_control(device, V4L2_CID_CONTRAST, "contrast", *value)
-            }
-            CameraControlRequest::SetGain { value } => {
-                set_integer_control(device, V4L2_CID_GAIN, "gain", *value)
-            }
-            CameraControlRequest::SetExposure { mode, value } => set_exposure(device, mode, *value),
-            CameraControlRequest::SetWhiteBalance { mode, temperature } => {
-                set_white_balance(device, mode, *temperature)
-            }
-        }
     }
 }
 

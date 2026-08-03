@@ -5,8 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
-use crate::camera::controls::ControlReceiver;
-use crate::camera::v4l_device::CameraDevice;
+use crate::camera::v4l_device::{CameraDevice, ControlHandle, StreamDescription};
 use crate::pipeline;
 use crate::types::{CameraConfig, Error, FrameId, Result};
 
@@ -21,6 +20,13 @@ const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// retrying it forever publishes nothing while the node still answers services
 /// as though it were healthy.
 const FRAME_FAILURE_GRACE: Duration = Duration::from_secs(5);
+
+/// Everything setup needs from a successfully opened camera: what the stream
+/// actually is, and the handle services use to drive the hardware.
+pub struct CameraReadout {
+    pub description: StreamDescription,
+    pub controls: ControlHandle,
+}
 
 /// Cancels the node's token when the capture thread exits by any path,
 /// including a panic. Without a capture loop the node publishes nothing while
@@ -86,21 +92,24 @@ impl PublishWindow {
 /// Spawn the camera capture loop on a dedicated OS thread.
 ///
 /// The loop opens the camera, configures it, captures frames, processes them,
-/// and emits them to the video stream topic. Between frames, any pending
-/// camera control commands from the `control_rx` channel are drained and
-/// applied immediately.
+/// and emits them to the video stream topic. Camera controls are not routed
+/// through here: service handlers apply them synchronously via the
+/// [`ControlHandle`] returned from the open handshake.
 ///
 /// A dedicated `std::thread` is used instead of `spawn_blocking` on purpose:
 /// `Runtime::drop` blocks until every blocking-pool task returns, so a V4L2
 /// call wedged in the driver (e.g. an untimed frame dequeue after the camera
 /// is unplugged) would hang shutdown past the grace window. A plain thread
-/// cannot outlive process exit. It also keeps the camera on a single OS thread:
-/// the underlying V4L2 handle is `!Send`, and it is built here rather than
-/// passed in so it never crosses a thread boundary at all.
+/// cannot outlive process exit. It also keeps the mmap stream on a single OS
+/// thread: the stream is bound to the thread that dequeues it, and the camera
+/// is built here rather than passed in so the stream never crosses a thread
+/// boundary. The device fd itself is shareable, which is what the
+/// [`ControlHandle`] hands to services.
 ///
 /// Returns two receivers:
-/// - the open outcome, so setup can fail the node when the camera is
-///   unreachable instead of leaving it running with nothing to publish;
+/// - the open outcome: on success, the negotiated [`StreamDescription`] plus a
+///   [`ControlHandle`], so services report and act on the camera as it actually
+///   is; on failure, the error that setup turns into a non-zero exit;
 /// - a completion signal that resolves once the thread has exited and the
 ///   camera has been dropped (device closed). Await it from an `on_shutdown`
 ///   hook so device teardown is bounded by the shutdown grace window.
@@ -108,8 +117,10 @@ pub fn spawn_capture_loop(
     config: CameraConfig,
     node_runner: Arc<peppygen::NodeRunner>,
     cancel_token: CancellationToken,
-    control_rx: ControlReceiver,
-) -> (oneshot::Receiver<Result<()>>, oneshot::Receiver<()>) {
+) -> (
+    oneshot::Receiver<Result<CameraReadout>>,
+    oneshot::Receiver<()>,
+) {
     let (open_tx, open_rx) = oneshot::channel();
     let (done_tx, done_rx) = oneshot::channel();
     let runtime = tokio::runtime::Handle::current();
@@ -125,14 +136,9 @@ pub fn spawn_capture_loop(
             // what reporting the failure is meant to prevent.
             let _cancel_on_exit = CancelOnExit(cancel_token.clone());
 
-            if let Err(e) = run_camera_capture_loop(
-                camera,
-                &config,
-                &node_runner,
-                &runtime,
-                &cancel_token,
-                &control_rx,
-            ) {
+            if let Err(e) =
+                run_camera_capture_loop(camera, &config, &node_runner, &runtime, &cancel_token)
+            {
                 tracing::error!("camera capture loop failed: {e}");
             }
         }
@@ -154,12 +160,23 @@ pub fn spawn_capture_loop(
 fn open_camera(
     mut camera: CameraDevice,
     config: &CameraConfig,
-    open_tx: oneshot::Sender<Result<()>>,
+    open_tx: oneshot::Sender<Result<CameraReadout>>,
 ) -> Option<CameraDevice> {
     match camera.open(config) {
         Ok(()) => {
-            let _ = open_tx.send(Ok(()));
-            Some(camera)
+            let readout = camera
+                .stream_description()
+                .zip(camera.control_handle())
+                .map(|(description, controls)| CameraReadout {
+                    description,
+                    controls,
+                })
+                .ok_or_else(|| {
+                    Error::Camera("camera opened without a negotiated stream".to_string())
+                });
+            let failed = readout.is_err();
+            let _ = open_tx.send(readout);
+            (!failed).then_some(camera)
         }
         Err(e) => {
             let _ = open_tx.send(Err(e));
@@ -180,7 +197,6 @@ fn run_camera_capture_loop(
     node_runner: &Arc<peppygen::NodeRunner>,
     runtime: &tokio::runtime::Handle,
     cancel_token: &CancellationToken,
-    control_rx: &ControlReceiver,
 ) -> Result<()> {
     let topic_encoding = config.topic_encoding;
     let frame_rate = config.frame_rate.as_u16();
@@ -205,13 +221,6 @@ fn run_camera_capture_loop(
     let mut next_frame_time = Instant::now() + target_frame_duration;
 
     while !cancel_token.is_cancelled() {
-        // Drain all pending camera control commands before capturing the next frame
-        while let Ok(cmd) = control_rx.try_recv() {
-            let result = camera.apply_control(&cmd.request);
-            // If the receiver has gone away (service handler timed out), ignore the error
-            let _ = cmd.reply.send(result);
-        }
-
         // Capture, convert and serialize as one fallible step: every failure
         // below reaches the same grace window, so none of them can spin.
         // `build_message` is pure, so this keeps serialization off the messenger.

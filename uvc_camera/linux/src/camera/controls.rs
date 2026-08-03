@@ -1,7 +1,5 @@
-//! Camera control command types and channels
-//!
-//! This module defines the interface for sending camera control commands
-//! from async service handlers to the blocking camera capture loop.
+//! Camera control request and result types, shared between the service
+//! handlers and the device layer that applies them.
 
 /// Exposure mode for the `set_exposure` service
 #[derive(Debug, Clone, PartialEq)]
@@ -65,7 +63,7 @@ pub enum CameraControlRequest {
     SetContrast { value: i32 },
 }
 
-/// Result returned by the capture loop after applying a camera control
+/// Result of applying a camera control
 #[derive(Debug, Clone)]
 pub struct ControlResult {
     pub success: bool,
@@ -90,27 +88,6 @@ impl ControlResult {
             current_value: -1,
         }
     }
-}
-
-/// A camera control command sent from a service handler to the capture loop.
-///
-/// The outer control channel is unbounded, so the sender never blocks on
-/// enqueue.  Each command carries a `SyncSender` reply channel (capacity 1)
-/// so the capture loop can post the result without blocking even if the
-/// service handler has not yet called `recv()`.
-pub struct ControlCommand {
-    pub request: CameraControlRequest,
-    pub reply: std::sync::mpsc::SyncSender<ControlResult>,
-}
-
-/// Sender side of the control channel (service handlers hold a clone)
-pub type ControlSender = std::sync::mpsc::Sender<ControlCommand>;
-/// Receiver side of the control channel (owned by the capture loop)
-pub type ControlReceiver = std::sync::mpsc::Receiver<ControlCommand>;
-
-/// Create a new control channel pair
-pub fn create_control_channel() -> (ControlSender, ControlReceiver) {
-    std::sync::mpsc::channel()
 }
 
 #[cfg(test)]

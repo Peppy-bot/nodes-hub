@@ -1,39 +1,33 @@
 use super::Encoding;
 use super::error::{Error, Result};
+use std::num::NonZeroU8;
 
-/// Frame rate with automatic fallback to default for invalid values
+/// A validated frame rate in 1..=255.
+///
+/// The contract's `video_stream_info` reports frames per second as a `u8`, so
+/// the range is enforced here rather than clamped at the reporting site, and
+/// zero is rejected rather than silently coerced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FrameRate(u16);
+pub struct FrameRate(NonZeroU8);
 
 impl FrameRate {
     pub const DEFAULT: u16 = 30;
 
-    /// Create a new frame rate with automatic fallback to default for invalid values
-    ///
-    /// - Values of 0 fall back to DEFAULT
-    pub fn new(fps: u16) -> Self {
-        if fps == 0 {
-            tracing::warn!("Frame rate is 0, falling back to default {}", Self::DEFAULT);
-            return Self(Self::DEFAULT);
-        }
-
-        Self(fps)
+    /// Parse a frame rate, rejecting values outside 1..=255.
+    pub fn new(fps: u16) -> Result<Self> {
+        u8::try_from(fps)
+            .ok()
+            .and_then(NonZeroU8::new)
+            .map(Self)
+            .ok_or_else(|| Error::Other(format!("video.frame_rate must be in 1..=255 (got {fps})")))
     }
 
     pub fn as_u16(&self) -> u16 {
-        self.0
+        u16::from(self.0.get())
     }
-}
 
-impl Default for FrameRate {
-    fn default() -> Self {
-        Self(Self::DEFAULT)
-    }
-}
-
-impl From<u16> for FrameRate {
-    fn from(fps: u16) -> Self {
-        Self::new(fps)
+    pub fn as_u8(&self) -> u8 {
+        self.0.get()
     }
 }
 
@@ -42,39 +36,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_frame_rate_valid() {
-        let fr = FrameRate::new(30);
-        assert_eq!(fr.as_u16(), 30);
+    fn test_frame_rate_accepts_valid_range() {
+        assert_eq!(FrameRate::new(1).unwrap().as_u8(), 1);
+        assert_eq!(FrameRate::new(30).unwrap().as_u16(), 30);
+        assert_eq!(FrameRate::new(255).unwrap().as_u8(), 255);
     }
 
     #[test]
-    fn test_frame_rate_zero_falls_back() {
-        let fr = FrameRate::new(0);
-        assert_eq!(fr.as_u16(), FrameRate::DEFAULT);
+    fn test_frame_rate_rejects_zero() {
+        // The contract reports fps as u8 and a zero rate is meaningless, so
+        // both ends of the range are hard errors, not silent coercions.
+        let err = FrameRate::new(0).unwrap_err();
+        assert!(err.to_string().contains("must be in 1..=255 (got 0)"));
     }
 
     #[test]
-    fn test_frame_rate_high_value() {
-        let fr = FrameRate::new(300);
-        assert_eq!(fr.as_u16(), 300);
-    }
-
-    #[test]
-    fn test_frame_rate_from_u16() {
-        let fr = FrameRate::from(60);
-        assert_eq!(fr.as_u16(), 60);
-    }
-
-    #[test]
-    fn test_frame_rate_default() {
-        let fr = FrameRate::default();
-        assert_eq!(fr.as_u16(), 30);
-    }
-
-    #[test]
-    fn test_frame_rate_max_u16() {
-        let max_fr = FrameRate::new(u16::MAX);
-        assert_eq!(max_fr.as_u16(), u16::MAX);
+    fn test_frame_rate_rejects_over_u8() {
+        let err = FrameRate::new(300).unwrap_err();
+        assert!(err.to_string().contains("must be in 1..=255 (got 300)"));
     }
 }
 
@@ -184,7 +163,7 @@ impl CameraConfigBuilder {
 
         let resolution = Resolution::new(self.width.unwrap_or(640), self.height.unwrap_or(480));
 
-        let frame_rate = FrameRate::new(self.frame_rate.unwrap_or(FrameRate::DEFAULT));
+        let frame_rate = FrameRate::new(self.frame_rate.unwrap_or(FrameRate::DEFAULT))?;
 
         let camera_encoding = self.camera_encoding.unwrap_or(Encoding::Mjpeg);
         let topic_encoding = self.topic_encoding.unwrap_or(Encoding::Rgb8);

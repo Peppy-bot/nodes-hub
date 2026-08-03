@@ -37,7 +37,10 @@ All members sit under `link_id: "camera"`.
   hands the frame over rather than after conversion, so consumers can age
   samples on capture time.
 - **Exposes** `video_stream_info`, `set_exposure`, `set_white_balance`,
-  `set_gain`, `set_brightness`, `set_contrast`.
+  `set_gain`, `set_brightness`, `set_contrast`. `video_stream_info` reports the
+  driver-negotiated stream (geometry and effective rate), not the requested one.
+  Controls apply synchronously in the handler, so the response reflects what
+  actually happened to the hardware, including the value the driver clamped to.
 
 Control services never fail the call for a domain problem: they answer
 `success: false` with a reason and the value currently in effect. An `Err` is
@@ -50,7 +53,7 @@ None have defaults; a launcher must supply all of them.
 | Parameter | Type | Notes |
 |---|---|---|
 | `device_path` | string | `/dev/videoN`, or a udev symlink such as `/dev/openarm/left_wrist_cam`, opened directly without resolving to a device index. |
-| `video.frame_rate` | u16 | Publish rate. `0` falls back to 30. |
+| `video.frame_rate` | u16 | Publish rate, `1..=255`; anything else fails setup (the contract reports fps as `u8`). |
 | `video.resolution.width` / `.height` | u32 | Requested capture size. |
 | `video.camera_encoding` | string | What to ask the camera for: `rgb8`, `bgr8`, `mjpeg`, or `yuyv`. |
 | `video.topic_encoding` | string | What to publish: `rgb8`, `bgr8`, `mjpeg`, or `yuyv`. |
@@ -97,8 +100,8 @@ rather than from a launcher. Useful for bringing up a camera on a workstation.
 cd linux && cargo run
 ```
 
-Set `RUST_LOG=debug` to see the device-open sequence (resolved index, validation,
-requested format) when a camera refuses to open.
+Set `RUST_LOG=debug` to see the device-open sequence (validation, requested
+format) when a camera refuses to open.
 
 ## Tests
 
@@ -127,5 +130,6 @@ The camera runs on a dedicated OS thread rather than a `spawn_blocking` task:
 `Runtime::drop` waits for every blocking-pool task, so a V4L2 call wedged in the
 driver would hang shutdown past the grace window. Device teardown is awaited from
 a shutdown hook so it stays inside that window. The mmap capture stream is bound
-to the thread that dequeues it, so the device is built on that thread and never
-crosses a thread boundary.
+to the thread that dequeues it, so capture stays on that thread; the device fd
+itself is shareable, which is how service handlers apply controls synchronously
+while the stream runs.
