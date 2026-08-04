@@ -67,9 +67,13 @@ jobs:
 
           dest="$RUNNER_TEMP/peppy-bin"
           mkdir -p "$dest"
+          # The release archive stores its members with a ./ prefix, and GNU
+          # tar matches a member argument against the stored name literally,
+          # so the argument carries the prefix too. Spelled bin/peppy it
+          # selects nothing and tar exits with "Not found in archive".
           curl -fsSL --connect-timeout 10 --max-time 300 \
             "https://peppy.bot/$channel/peppy-$arch-unknown-linux-gnu.tgz" \
-            | tar -xzf - -C "$dest" bin/peppy
+            | tar -xzf - -C "$dest" ./bin/peppy
           chmod +x "$dest/bin/peppy"
           echo "$dest/bin" >> "$GITHUB_PATH"
 
