@@ -13,8 +13,8 @@
       // If the executor re-pairs to a different planner, this keeps recording;
       // if the executor restarts, this picks up the new incarnation and no
       // message from the previous run leaks across.
-      pairings: [
-        { name: "deliberation", tag: "v1", observes_role: "executor", link_id: "observed_execution" }
+      pairing_observers: [
+        { name: "deliberation", tag: "v1", role: "executor", link_id: "observed_execution" }
       ]
     },
     labels: [

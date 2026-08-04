@@ -12,7 +12,7 @@ use std::ffi::CStr;
 use std::num::NonZeroU8;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use peppylib::runtime::CancellationToken;
 use realsense_rust::{
@@ -29,6 +29,14 @@ use tracing::{error, info, warn};
 
 use crate::frame::{FrameSet, Image};
 use crate::modes::{AlignMode, AutoManualMode, ColorFormat};
+
+/// Stamp from the daemon-resolved clock: the OS clock in wall mode, the
+/// simulator's time when the stack runs under sim time. Requires
+/// `peppygen::clock::init`, which setup runs before the capture loop spawns.
+fn stamp_now() -> std::result::Result<SystemTime, String> {
+    let ns = peppygen::clock::now_ns().map_err(|e| e.to_string())?;
+    Ok(UNIX_EPOCH + Duration::from_nanos(ns))
+}
 
 /// Bounded pipeline depth between capture and emit. Deep enough to absorb a
 /// transient emit hiccup, shallow enough that backpressure-dropped frames
@@ -184,9 +192,11 @@ impl Capture {
                 continue;
             };
 
+            let Ok(stamp) = stamp_now() else {
+                continue; // clock not ready yet: skip rather than mis-stamp
+            };
             let id = frame_id;
             frame_id = frame_id.wrapping_add(1);
-            let stamp = SystemTime::now();
             latest_id_this_interval = Some(id);
 
             let frameset = FrameSet {

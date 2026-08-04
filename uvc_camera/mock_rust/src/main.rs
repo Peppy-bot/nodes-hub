@@ -3,14 +3,23 @@ use ffmpeg::software::scaling::{Context as ScalerContext, Flags as ScalerFlags};
 use ffmpeg::util::frame::video::Video as VideoFrame;
 use ffmpeg_next as ffmpeg;
 use peppygen::emitted_topics::camera::video_stream::{self, MessageHeader};
-use peppygen::exposed_services::camera::video_stream_info;
+use peppygen::exposed_services::camera::{
+    set_brightness, set_contrast, set_exposure, set_gain, set_white_balance, video_stream_info,
+};
 use peppygen::parameters::{self};
 use peppygen::{NodeBuilder, Parameters, Result, StandaloneConfig};
 use peppylib::runtime::CancellationToken;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// Stamp from the daemon-resolved clock; identical to the OS clock in wall
+/// mode, the simulator's time under sim time.
+fn stamp_now() -> std::result::Result<SystemTime, String> {
+    let ns = peppygen::clock::now_ns().map_err(|e| e.to_string())?;
+    Ok(UNIX_EPOCH + Duration::from_nanos(ns))
+}
 
 fn get_source_video_fps(video_path: &PathBuf) -> u8 {
     let input = ffmpeg::format::input(video_path)
@@ -30,6 +39,13 @@ fn get_source_video_fps(video_path: &PathBuf) -> u8 {
 }
 
 fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
     ffmpeg::init().expect("Failed to initialize FFmpeg");
 
     // Probe source video to get its actual frame rate
@@ -43,10 +59,7 @@ fn main() -> Result<()> {
     }
 
     let source_fps = get_source_video_fps(&video_path);
-    println!(
-        "[uvc_camera] Detected source video frame rate: {} fps",
-        source_fps
-    );
+    tracing::info!("Detected source video frame rate: {} fps", source_fps);
 
     // Load parameters from mock file for standalone execution
     let mock_params_path = std::env::current_dir()
@@ -68,8 +81,8 @@ fn main() -> Result<()> {
         .run(move |args: Parameters, node_runner| async move {
         let video_params = args.video.clone();
 
-        println!(
-            "[uvc_camera] Video params: {}x{} @ {} fps, encoding: {}",
+        tracing::info!(
+            "Video params: {}x{} @ {} fps, encoding: {}",
             video_params.resolution.width,
             video_params.resolution.height,
             video_params.frame_rate,
@@ -94,12 +107,18 @@ fn main() -> Result<()> {
             listen_for_video_stream_info_requests(service_node_runner, service_video_params, actual_fps, service_cancel_token).await;
         });
 
+        spawn_control_acks(&node_runner);
+
+        // The synchronized clock stamping every emission: the OS clock in
+        // wall mode, the simulator's time under sim time.
+        peppygen::clock::init(&node_runner).await?;
+
         // Long running tasks should always be spawned in a different thread
         let cancel_token = node_runner.cancellation_token().clone();
         // Log when the shutdown/cancel signal is received so it is visible in
         // the node's stdout.
         node_runner.on_shutdown(async move {
-            println!("[uvc_camera] Shutdown signal received");
+            tracing::info!("Shutdown signal received");
         });
         tokio::spawn(async move {
             if let Err(e) = run_video_loop(node_runner, video_params, cancel_token).await {
@@ -116,7 +135,7 @@ async fn run_video_loop(
     video_params: parameters::video::Video,
     cancel_token: CancellationToken,
 ) -> Result<()> {
-    println!("[uvc_camera] Starting video loop...");
+    tracing::info!("Starting video loop...");
     let video_path = std::env::current_dir()
         .expect("Failed to get current working directory")
         .join("assets")
@@ -125,7 +144,7 @@ async fn run_video_loop(
     if !video_path.exists() {
         panic!("Video file not found: {}", video_path.display());
     }
-    println!("[uvc_camera] Video file found: {}", video_path.display());
+    tracing::info!("Video file found: {}", video_path.display());
 
     let mut frame_id: u32 = 0;
     let mut last_print_time = Instant::now();
@@ -159,7 +178,7 @@ async fn run_video_loop(
     loop {
         let data = tokio::select! {
             _ = cancel_token.cancelled() => {
-                println!("[uvc_camera] Shutdown requested, stopping video loop");
+                tracing::info!("Shutdown requested, stopping video loop");
                 return Ok(());
             }
             frame = frame_rx.recv() => match frame {
@@ -169,10 +188,15 @@ async fn run_video_loop(
             },
         };
 
-        let header = MessageHeader {
-            stamp: SystemTime::now(),
-            frame_id,
+        let stamp = match stamp_now() {
+            Ok(stamp) => stamp,
+            Err(e) => {
+                // Sim mode before the first tick: skip rather than mis-stamp.
+                tracing::debug!("skipping frame: {e}");
+                continue;
+            }
         };
+        let header = MessageHeader { stamp, frame_id };
 
         let payload =
             match video_stream::build_message(header, encoding.clone(), width, height, data) {
@@ -186,7 +210,7 @@ async fn run_video_loop(
             tracing::error!("Failed to emit frame: {e:?}");
         }
         if last_print_time.elapsed().as_secs() >= 3 {
-            println!("[uvc_camera] Emitted frame {}", frame_id);
+            tracing::info!("Emitted frame {}", frame_id);
             last_print_time = Instant::now();
         }
 
@@ -194,7 +218,7 @@ async fn run_video_loop(
 
         tokio::select! {
             _ = cancel_token.cancelled() => {
-                println!("[uvc_camera] Shutdown requested, stopping video loop");
+                tracing::info!("Shutdown requested, stopping video loop");
                 return Ok(());
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(frame_duration_ms)) => {}
@@ -220,7 +244,7 @@ fn decode_frames(
             return;
         }
 
-        println!("[uvc_camera] Opening video file for playback...");
+        tracing::info!("Opening video file for playback...");
         let mut input = ffmpeg::format::input(video_path).unwrap_or_else(|e| {
             panic!("Failed to open video file '{}': {e}", video_path.display())
         });
@@ -293,8 +317,46 @@ fn decode_frames(
         receive_and_send_frames(&mut decoder).ok();
 
         // Loop restarts - video will be reopened from the beginning
-        println!("[uvc_camera] Video ended, restarting from beginning...");
+        tracing::info!("Video ended, restarting from beginning...");
     }
+}
+
+/// Answer the five camera control services the `rgb_camera` contract requires.
+///
+/// The mock has no hardware to adjust, so each one acknowledges the request and
+/// echoes the value back. Leaving them unanswered would hang any caller until
+/// its timeout, and a stack developed against the mock would only discover the
+/// gap when swapped onto real hardware.
+fn spawn_control_acks(node_runner: &Arc<peppygen::NodeRunner>) {
+    macro_rules! spawn_ack {
+        ($service:ident, $request_field:ident) => {{
+            let runner = Arc::clone(node_runner);
+            let cancel_token = node_runner.cancellation_token().clone();
+            tokio::spawn(async move {
+                loop {
+                    let result = tokio::select! {
+                        _ = cancel_token.cancelled() => break,
+                        result = $service::handle_next_request(&runner, |request| {
+                            Ok($service::Response::new(
+                                true,
+                                concat!("mock: ", stringify!($service), " acknowledged").to_string(),
+                                request.data.$request_field,
+                            ))
+                        }) => result,
+                    };
+                    if let Err(e) = result {
+                        tracing::error!("{} service error: {e:?}", stringify!($service));
+                    }
+                }
+            });
+        }};
+    }
+
+    spawn_ack!(set_exposure, value);
+    spawn_ack!(set_white_balance, temperature);
+    spawn_ack!(set_gain, value);
+    spawn_ack!(set_brightness, value);
+    spawn_ack!(set_contrast, value);
 }
 
 async fn listen_for_video_stream_info_requests(
@@ -317,7 +379,7 @@ async fn listen_for_video_stream_info_requests(
                 ))
             }) => {
                 if let Err(e) = result {
-                    tracing::error!("get_camera_info service error: {e:?}");
+                    tracing::error!("video_stream_info service error: {e:?}");
                 }
             }
         }
