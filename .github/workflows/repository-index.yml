@@ -1,0 +1,86 @@
+name: Repository index
+
+# `peppy_repository.json5` states what this repository publishes. It is
+# generated, so a pull request that adds, moves, renames or deletes a node,
+# contract, pairing or launcher leaves it stale unless the author regenerates
+# it. A stale index makes an item silently invisible to every machine that
+# consumes this repository, and none of those machines can fix it. This job
+# catches that on the branch of the person who caused it.
+#
+# It runs on every pull request rather than behind a path filter: a removal or
+# a rename drifts the index just as an addition does, and the check is a
+# filesystem walk that costs seconds.
+on:
+  pull_request:
+
+concurrency:
+  group: repository-index-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  check-index:
+    runs-on: self-hosted
+    # The runners are shared, so a step that hangs holds one hostage. Nothing
+    # here legitimately takes minutes.
+    timeout-minutes: 15
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          # Nothing here pushes, so the job has no use for a writable
+          # credential sitting in .git/config for every later step to inherit.
+          persist-credentials: false
+
+      # Installed under RUNNER_TEMP rather than through scripts/install.sh:
+      # `peppy repo index` needs no daemon, no container runtime and no root,
+      # and the self-hosted runners are reused, so this run must not touch a
+      # shared ~/.peppy. Set the PEPPY_VERSION repository variable to pin a
+      # release; it defaults to the latest.
+      #
+      # PEPPY_VERSION reaches the script through the environment rather than a
+      # `${{ }}` expansion, so its value is data the shell reads instead of
+      # source the shell parses, and the shape check turns a typo into a named
+      # failure rather than a 404 from a URL built out of it.
+      - name: Install peppy
+        env:
+          PEPPY_VERSION: ${{ vars.PEPPY_VERSION }}
+        run: |
+          set -euo pipefail
+          version="${PEPPY_VERSION:-latest}"
+          if [[ "$version" == "latest" ]]; then
+            channel="latest"
+          elif [[ "$version" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            channel="v${version#v}"
+          else
+            echo "PEPPY_VERSION must be 'latest' or a release such as 0.20.0, got: $version" >&2
+            exit 1
+          fi
+
+          case "$(uname -m)" in
+            x86_64 | amd64) arch="x86_64" ;;
+            aarch64 | arm64) arch="aarch64" ;;
+            *) echo "unsupported runner architecture: $(uname -m)" >&2; exit 1 ;;
+          esac
+
+          dest="$RUNNER_TEMP/peppy-bin"
+          mkdir -p "$dest"
+          # The release archive stores its members with a ./ prefix, and GNU
+          # tar matches a member argument against the stored name literally,
+          # so the argument carries the prefix too. Spelled bin/peppy it
+          # selects nothing and tar exits with "Not found in archive".
+          curl -fsSL --connect-timeout 10 --max-time 300 \
+            "https://peppy.bot/$channel/peppy-$arch-unknown-linux-gnu.tgz" \
+            | tar -xzf - -C "$dest" ./bin/peppy
+          chmod +x "$dest/bin/peppy"
+          echo "$dest/bin" >> "$GITHUB_PATH"
+
+      # PEPPY_HOME is per-run for the same reason: every peppy invocation builds
+      # its app context before dispatching, and the runners are shared.
+      - name: Check peppy_repository.json5 matches the repository
+        run: |
+          export PEPPY_HOME="$RUNNER_TEMP/peppy-home"
+          mkdir -p "$PEPPY_HOME"
+          peppy repo index . --check
