@@ -1,5 +1,5 @@
 Bootstrap: docker
-From: tuatini/peppy-python-uv-base:latest
+From: peppybot/python-uv-base:latest
 
 %labels
     Name uvc_camera_python_mock

@@ -1,5 +1,5 @@
 Bootstrap: docker
-From: tuatini/peppy-rust-cargo-base
+From: peppybot/rust-cargo-base
 
 %files
     . /opt/zed_camera
