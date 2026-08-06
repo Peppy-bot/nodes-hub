@@ -1,22 +1,18 @@
-"""Where sessions land, parsed from the storage_uri parameter.
+"""Where sessions land: a host directory the manifest bind-mounts into the
+container, plus an optional s3 mirror.
 
-file:// writes the dataset directly under the given root. s3:// stages the
-dataset in a local directory and mirrors it to the bucket after every saved
-episode plus once at shutdown; the staging copy is kept at shutdown as the
-local dataset (under /tmp, so it lasts until reboot). Credentials and a
-custom endpoint (R2) come from the standard AWS environment variables,
-never from launch parameters.
+`storage_root` is mounted same-path via the manifest's `mount_paths`, so
+sessions persist on the host by contract rather than by runtime accident.
+With `s3_uri` set, the same root doubles as the staging area: the dataset is
+mirrored to the bucket after every saved episode plus once at shutdown, and
+the root keeps the local copy. Credentials and a custom endpoint (R2) come
+from the standard AWS environment variables, never from launch parameters.
 """
 
 from __future__ import annotations
 
-import contextlib
 import datetime
-import hashlib
 import os
-import re
-import stat
-import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
@@ -44,88 +40,44 @@ def validate_session_name(name: str) -> None:
 
 
 @dataclass(frozen=True)
-class LocalTarget:
+class S3Destination:
+    bucket: str
+    prefix: str
+
+
+@dataclass(frozen=True)
+class StorageTarget:
+    """The mounted directory sessions are written under, and the optional s3
+    destination they mirror to."""
+
     root: Path
+    s3: S3Destination | None
 
 
-@dataclass(frozen=True)
-class S3Location:
-    """A parsed s3:// URI; carries no local state, so parsing stays pure."""
-
-    bucket: str
-    prefix: str
-
-
-@dataclass(frozen=True)
-class S3Target:
-    bucket: str
-    prefix: str
-    staging_root: Path
-
-
-ParsedTarget = LocalTarget | S3Location
-StorageTarget = LocalTarget | S3Target
+def parse_storage(storage_root: str, s3_uri: str) -> StorageTarget:
+    if not storage_root.startswith("/"):
+        raise ValueError(f"storage_root must be an absolute path, got {storage_root!r}")
+    if not s3_uri:
+        return StorageTarget(root=Path(storage_root), s3=None)
+    parsed = urlparse(s3_uri)
+    if parsed.scheme != "s3":
+        raise ValueError(f"s3_uri must be s3://bucket[/prefix], got {s3_uri!r}")
+    if not parsed.netloc:
+        raise ValueError("s3_uri has no bucket")
+    s3 = S3Destination(bucket=parsed.netloc, prefix=parsed.path.strip("/"))
+    return StorageTarget(root=Path(storage_root), s3=s3)
 
 
-def parse_storage_uri(uri: str) -> ParsedTarget:
-    parsed = urlparse(uri)
-    if parsed.scheme == "file":
-        if parsed.netloc not in ("", "localhost"):
-            raise ValueError(f"file:// URI must be local, got host {parsed.netloc!r}")
-        if not parsed.path:
-            raise ValueError("file:// URI has no path")
-        return LocalTarget(root=Path(parsed.path))
-    if parsed.scheme == "s3":
-        if not parsed.netloc:
-            raise ValueError("s3:// URI has no bucket")
-        return S3Location(bucket=parsed.netloc, prefix=parsed.path.strip("/"))
-    raise ValueError(f"unsupported storage_uri scheme {parsed.scheme!r} (file:// or s3://)")
-
-
-def staging_key(bucket: str, prefix: str) -> str:
-    """Stable directory name for one s3 destination: a sanitized readable part
-    for operators plus a short hash so prefixes that sanitize identically
-    (a/b vs a_b) still get distinct roots."""
-    readable = re.sub(r"[^a-z0-9_-]", "_", f"{bucket}_{prefix}".lower())[:60]
-    digest = hashlib.sha256(f"{bucket}\n{prefix}".encode()).hexdigest()[:8]
-    return f"{readable}_{digest}"
-
-
-def prepare_target(parsed: ParsedTarget) -> StorageTarget:
-    """Allocate the runtime side of a parsed target: an s3 location gains its
-    local staging directory here, next to the owner that cleans it up. The
-    root is stable across runs (same URI, same directory), which is what lets
-    resume_session find a previous run's sessions by name."""
-    if isinstance(parsed, S3Location):
-        base = Path(tempfile.gettempdir()) / "lerobot_recorder_staging"
-        staging = base / staging_key(parsed.bucket, parsed.prefix)
-        # Both levels are checked: a leaf created inside somebody else's base
-        # directory can be renamed out from under its owner after the check.
-        for directory in (base, staging):
-            directory.mkdir(exist_ok=True, mode=0o700)
-            _own_directory(directory)
-        return S3Target(bucket=parsed.bucket, prefix=parsed.prefix, staging_root=staging)
-    return parsed
-
-
-def _own_directory(path: Path) -> None:
-    """A stable staging path under a shared /tmp is one anybody can create
-    first, so datasets would be written through whatever they left there.
-    Recording only ever writes into a real directory this user owns. One
-    lstat answers both questions, so a symlink cannot slip in between a
-    symlink check and an ownership check."""
-    status = path.lstat()
-    if not stat.S_ISDIR(status.st_mode):
-        raise ValueError(f"staging path {path} is not a directory")
-    if status.st_uid != os.getuid():
-        raise ValueError(f"staging directory {path} belongs to another user")
-
-
-def session_root(target: StorageTarget) -> Path:
-    """The local directory this session's dataset is written under."""
-    if isinstance(target, LocalTarget):
-        return target.root
-    return target.staging_root
+def ensure_mounted(target: StorageTarget) -> None:
+    """The manifest bind-mounts storage_root into the container, and peppy
+    creates the host side before the start. A root that does not exist means
+    the mount is not in effect, and creating it here would write datasets
+    into the container's own filesystem, gone when the instance stops."""
+    if not target.root.is_dir():
+        raise ValueError(
+            f"storage_root {target.root} does not exist; it should have been "
+            f"mounted from the host before the node started"
+        )
 
 
 def resolved_endpoint() -> str:
@@ -146,26 +98,16 @@ def _boto_credentials():
 
 
 def probe_credentials(target: StorageTarget, lookup=_boto_credentials) -> None:
-    """Fail an s3 target at startup, not at the first upload mid-session.
+    """Fail an s3 mirror at startup, not at the first upload mid-session.
     The lookup is injectable so tests exercise the refusal without depending
     on botocore's full provider chain (env vars, files, IMDS)."""
-    if not isinstance(target, S3Target):
+    if target.s3 is None:
         return
     if lookup() is None:
         raise RuntimeError(
-            "s3 storage_uri needs credentials in the environment "
+            "s3_uri needs credentials in the environment "
             "(AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY)"
         )
-
-
-def cleanup_staging(target: StorageTarget) -> None:
-    """Drop an s3 target's staging root only if it holds nothing. The root is
-    stable across runs and may hold previous sessions (including the only
-    local copy of one whose final mirror pass was cut off), so a failed start
-    must never remove it recursively."""
-    if isinstance(target, S3Target):
-        with contextlib.suppress(OSError):
-            target.staging_root.rmdir()
 
 
 # The dataset library stages one image per frame here and deletes the tree
@@ -173,19 +115,21 @@ def cleanup_staging(target: StorageTarget) -> None:
 # nothing under it belongs in the mirror.
 FRAME_STAGING_DIR = "images"
 
-# Upload bounds, per attempt; without them botocore's defaults let one hung
-# endpoint consume the whole shutdown grace window.
+# Upload bounds; without them botocore's defaults let one hung endpoint
+# consume the whole shutdown grace window. total_max_attempts counts the
+# initial request, so this is three requests, not three retries.
 S3_CONNECT_TIMEOUT_S = 10
 S3_READ_TIMEOUT_S = 60
-S3_MAX_ATTEMPTS = 3
+S3_TOTAL_MAX_ATTEMPTS = 3
 
 
 @dataclass
 class Mirror:
-    """Incremental uploader for an s3 target: re-walks the session directory
-    and uploads files whose size or mtime changed since the last sync. Runs in
-    a worker thread (boto3 is blocking); best-effort, failures are retried by
-    the next sync because the manifest entry is only recorded on success.
+    """Incremental uploader to an s3 destination: re-walks the session
+    directory and uploads files whose size or mtime changed since the last
+    sync. Runs in a worker thread (boto3 is blocking); best-effort, failures
+    are retried by the next sync because the manifest entry is only recorded
+    on success.
 
     Consistency model: still-growing files (the open parquet, the current
     video chunk) re-upload after every saved episode, bounded per sync by the
@@ -194,7 +138,7 @@ class Mirror:
     that changes while its upload is in flight gets a torn remote copy whose
     signature no longer matches, so the next sync re-uploads it."""
 
-    target: S3Target
+    dest: S3Destination
     session_dir: Path
     session_name: str
     _uploaded: dict[Path, tuple[int, float]] = field(default_factory=dict)
@@ -207,14 +151,14 @@ class Mirror:
             from botocore.config import Config
 
             # Bounded: the final pass runs inside the daemon's shutdown grace
-            # window, so a hung endpoint must fail (staging kept, logged)
+            # window, so a hung endpoint must fail (local copy kept, logged)
             # rather than stall until the daemon kills the node mid-pass.
             self._client = boto3.client(
                 "s3",
                 config=Config(
                     connect_timeout=S3_CONNECT_TIMEOUT_S,
                     read_timeout=S3_READ_TIMEOUT_S,
-                    retries={"max_attempts": S3_MAX_ATTEMPTS, "mode": "standard"},
+                    retries={"total_max_attempts": S3_TOTAL_MAX_ATTEMPTS, "mode": "standard"},
                 ),
             )
         files = 0
@@ -226,15 +170,15 @@ class Mirror:
             if FRAME_STAGING_DIR in rel.parts:
                 continue
             try:
-                stat = path.stat()
-                signature = (stat.st_size, stat.st_mtime)
+                status = path.stat()
+                signature = (status.st_size, status.st_mtime)
                 if self._uploaded.get(path) == signature:
                     continue
-                key_parts = [self.target.prefix, self.session_name, str(rel)]
+                key_parts = [self.dest.prefix, self.session_name, str(rel)]
                 key = "/".join(part for part in key_parts if part)
-                self._client.upload_file(str(path), self.target.bucket, key)
+                self._client.upload_file(str(path), self.dest.bucket, key)
                 files += 1
-                size += stat.st_size
+                size += status.st_size
             except FileNotFoundError:
                 # The library deletes staged files as it encodes; a file that
                 # vanished mid-walk must not abort the rest of the pass.

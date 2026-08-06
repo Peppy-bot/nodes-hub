@@ -36,6 +36,10 @@ into its name to stay distinct. Joint counts and which optional vectors
 (velocities, efforts) a source delivers are discovered from its first message.
 See `peppy.json5` for the parameter reference.
 
+Requires peppy v0.23.0 or newer: the observed membership is read from the
+boot config the daemon stamps at spawn, and an older daemon does not stamp
+it (startup refuses with an error naming the skew).
+
 ### Sessions
 
 A session is one LeRobot dataset holding every episode recorded since the
@@ -84,34 +88,35 @@ arrives, the action follows it.
 
 ## Storage
 
-`storage_uri` selects where sessions land:
+`storage_root` is an absolute host directory, bind-mounted same-path into
+the container by the manifest's `mount_paths`, so sessions persist on the
+host by contract rather than by any default runtime bind. Each run creates
+`<storage_root>/<utc_ts>/`; a node restart with the same root finds the
+previous runs' sessions, which is what makes them resumable by name. The
+node refuses to start when the root does not exist, because a missing root
+means the mount is not in effect and datasets would die with the container.
 
-- `file:///data/lerobot` writes the dataset directly under that root.
-- `s3://bucket/prefix` stages locally and mirrors to the bucket after every
-  saved episode plus once at shutdown. Still-growing files (the open parquet,
-  the current video chunk) are unreadable in the mirror until the final sync
-  after shutdown mirrors the completed dataset. The staging copy is kept at
-  shutdown as the local dataset (under `/tmp`, so it lasts until reboot);
-  only a start that fails before recording removes it.
+With `s3_uri` set (`s3://bucket[/prefix]`), the same root doubles as the
+staging area: the dataset mirrors to the bucket after every saved episode
+plus once at shutdown, and the root keeps the local copy. Still-growing
+files (the open parquet, the current video chunk) are unreadable in the
+mirror until the final sync after shutdown mirrors the completed dataset.
 
-  Staging lives at a stable `/tmp/lerobot_recorder_staging/<bucket>_<prefix>_<hash>/`
-  (still until-reboot), so a node restart with the same `storage_uri` finds the
-  previous runs' sessions, which is what makes them resumable by name.
-
-  The shutdown finalize-and-mirror runs inside the daemon's cooperative
-  shutdown window (`shutdown_grace_secs`, 5 s by default), so a large
-  unmirrored backlog can be cut off mid-pass; the node logs
-  `final mirror pass starting` and a `mirror complete` line, and a missing
-  completion line means the remote copy is behind the local one. Prefer
-  `finish_session` before stopping the node (it runs the same finalize and
-  mirror with no time bound), raise `shutdown_grace_secs` for stacks that
-  stop mid-session, and recover an interrupted pass by re-syncing the kept
-  staging copy: `aws s3 sync <staging session dir> s3://bucket/prefix/<session>`.
+The shutdown finalize-and-mirror runs inside the daemon's cooperative
+shutdown window (`shutdown_grace_secs`, 5 s by default), so a large
+unmirrored backlog can be cut off mid-pass; the node logs
+`final mirror pass starting` and a `mirror complete` line, and a missing
+completion line means the remote copy is behind the local one. Prefer
+`finish_session` before stopping the node (it runs the same finalize and
+mirror with no time bound), raise `shutdown_grace_secs` for stacks that
+stop mid-session, and recover an interrupted pass by re-syncing the kept
+local copy: `aws s3 sync <session dir> s3://bucket/prefix/<session>`.
 
 ### S3 / R2 credentials
 
 Credentials come from the standard AWS environment variables, never from
-launch parameters. The node refuses to start an `s3://` target without them.
+launch parameters. The node refuses to start with `s3_uri` set and no
+credentials in the environment.
 
 | Variable | Required | Notes |
 |---|---|---|
@@ -134,9 +139,9 @@ export AWS_DEFAULT_REGION=auto
 Any S3-compatible store works the same way through `AWS_ENDPOINT_URL`
 (`boto3 >= 1.34` reads it natively).
 
-At startup an `s3://` target logs the fully resolved destination
+At startup a mirroring target logs the fully resolved destination
 (endpoint, bucket, prefix), so a wrong or missing endpoint environment is
-visible at launch instead of at the first upload. The `s3://` netloc is
+visible at launch instead of at the first upload. The `s3_uri` netloc is
 the bucket, never a host: the URI names a location inside whatever store
 the environment points the client at, which is the standard `s3://`
 convention (aws-cli, spark, smart_open).

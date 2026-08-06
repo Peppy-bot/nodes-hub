@@ -177,7 +177,7 @@ def _resolve_existing_session(
     validated before it touches a path, then checked against the session's
     recorded provenance."""
     storage.validate_session_name(name)
-    session_dir = storage.session_root(target) / name
+    session_dir = target.root / name
     if not session_dir.is_dir():
         raise ValueError(f"no session named {name} under this storage target")
     _check_same_links(session_dir, plan)
@@ -188,7 +188,8 @@ def _write_session_json(session_dir: Path, params: Parameters, plan: plan_mod.Re
     provenance = {
         "robot_type": params.robot_type,
         "fps": params.fps,
-        "storage_uri": params.storage_uri,
+        "storage_root": params.storage_root,
+        "s3_uri": params.s3_uri,
         **_recorded_links(plan),
         "color_cameras": ["/".join(e.key) for e in plan.color_cameras],
         "rgbd_cameras": ["/".join(e.key) for e in plan.rgbd_cameras],
@@ -204,47 +205,24 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
     # the sampler and the drains behind it.
     if params.image_writer_threads <= 0:
         raise ValueError("image_writer_threads must be positive")
-    target = storage.prepare_target(storage.parse_storage_uri(params.storage_uri))
-
-    # The rest of the start runs behind this task rather than inline: which
-    # limbs exist comes from the observer slots, and the daemon only delivers
-    # their membership once this node reaches Running, which cannot happen
-    # until setup returns. The framework watches the tasks setup returns: one
-    # that fails prints its traceback, cancels the node, and leaves the daemon
-    # a terminal Failed instance, so this does not report itself.
-    async def start_once_observed():
-        try:
-            tasks = await _start(params, node_runner, target)
-        except BaseException:
-            # The shutdown hook is registered inside _start, so a failure
-            # before that point must not leak the s3 staging directory.
-            storage.cleanup_staging(target)
-            raise
-        await asyncio.gather(*tasks)
-
-    return [asyncio.create_task(start_once_observed())]
-
-
-async def _start(
-    params: Parameters,
-    node_runner: NodeRunner,
-    target: storage.StorageTarget,
-) -> list[asyncio.Task]:
+    target = storage.parse_storage(params.storage_root, params.s3_uri)
+    storage.ensure_mounted(target)
     await asyncio.to_thread(storage.probe_credentials, target)
-    if isinstance(target, storage.S3Target):
+    if target.s3 is not None:
         # The full resolved destination, so a wrong or missing endpoint
         # environment is visible at launch instead of at the first upload.
         print(
             f"[recorder] mirroring to {storage.resolved_endpoint()}, "
-            f"bucket {target.bucket!r}, prefix {target.prefix!r}"
+            f"bucket {target.s3.bucket!r}, prefix {target.s3.prefix!r}"
         )
 
     # Staleness ages producer stamps against this daemon-resolved clock (sim
     # time under a simulated clock); producers stamp from the same clock.
     await peppygen.clock.init(node_runner)
 
-    limb_sources = await plan_mod.wait_for_sources(node_runner)
-    plan = plan_mod.discover(node_runner, limb_sources)
+    # The boot config seeds every observer slot with the launch's membership,
+    # so the robot's shape is readable right here in setup.
+    plan = plan_mod.discover(node_runner, plan_mod.read_limb_sources(node_runner))
     print(
         f"[recorder] {len(plan.state)} state link(s), "
         f"{len(plan.color_cameras)} color camera(s), {len(plan.rgbd_cameras)} rgbd camera(s)"
@@ -259,15 +237,15 @@ async def _start(
             image_writer_threads=params.image_writer_threads,
         )
         mirror = (
-            storage.Mirror(target=target, session_dir=session_dir, session_name=session_name)
-            if isinstance(target, storage.S3Target)
+            storage.Mirror(dest=target.s3, session_dir=session_dir, session_name=session_name)
+            if target.s3 is not None
             else None
         )
         return session_dir, sink, mirror
 
     def open_session():
         session_name = datetime.datetime.now(datetime.UTC).strftime(storage.SESSION_NAME_FORMAT)
-        session_dir = storage.session_root(target) / session_name
+        session_dir = target.root / session_name
         # exist_ok=False: two sessions opened in the same second must not
         # interleave into one directory.
         session_dir.mkdir(parents=True, exist_ok=False)

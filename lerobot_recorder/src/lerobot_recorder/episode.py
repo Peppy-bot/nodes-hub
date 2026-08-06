@@ -276,7 +276,7 @@ class Recorder:
     async def close_for_shutdown(self) -> None:
         """The shutdown tail: land in-flight uploads, close the writers so
         every parquet gets its footer, then the final mirror pass uploads the
-        now-valid files. The staging copy stays as the local dataset."""
+        now-valid files. The storage root keeps the local dataset."""
         await self.drain_mirror()
         try:
             await self._sink.finalize()
@@ -296,7 +296,7 @@ class Recorder:
             try:
                 files, size = await asyncio.to_thread(self._mirror.sync)
             except Exception as e:
-                print(f"[recorder] final mirror sync failed, staging kept: {e!r}", flush=True)
+                print(f"[recorder] final mirror sync failed, local copy kept: {e!r}", flush=True)
             else:
                 print(
                     f"[recorder] mirror complete ({files} files, {size >> 20} MB); "

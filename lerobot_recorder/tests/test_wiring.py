@@ -268,18 +268,21 @@ def test_a_session_json_without_links_is_refused(tmp_path):
         _check_same_links(session_with(tmp_path, {}), make_plan())
 
 
-def test_setup_defers_the_start_until_the_daemon_delivers_sources(tmp_path, monkeypatch):
-    """Observer membership is delivered only once the node reaches Running,
-    which needs setup to have returned: a setup that starts inline sees an
-    empty robot for its whole discovery timeout, every launch."""
+def test_setup_discovers_the_seeded_membership_inline(tmp_path, monkeypatch):
+    """The boot config seeds the observer slots before the process starts, so
+    setup reads the robot's shape directly and the session exists the moment
+    setup returns; nothing is deferred behind Running anymore."""
     import peppygen.clock
     from peppygen.paired_topics.commanded_joints import joint_setpoints
     from peppygen.paired_topics.observed_joints import joint_states
     from peppygen.parameters import Parameters
 
-    measured, commanded = [], []
-    monkeypatch.setattr(joint_states, "sources", lambda _r: list(measured))
-    monkeypatch.setattr(joint_setpoints, "sources", lambda _r: list(commanded))
+    monkeypatch.setattr(
+        joint_states, "sources", lambda _r: [observed((CORE, "arm_inst", "link"))]
+    )
+    monkeypatch.setattr(
+        joint_setpoints, "sources", lambda _r: [observed((CORE, "lead_inst", "arm_link"))]
+    )
 
     async def clock_ready(_runner):
         return None
@@ -288,20 +291,14 @@ def test_setup_defers_the_start_until_the_daemon_delivers_sources(tmp_path, monk
     runner = SimpleNamespace(
         cancellation_token=lambda: NeverCancelledToken(), on_shutdown=lambda _hook: None
     )
-    params = Parameters(storage_uri=f"file://{tmp_path}")
+    params = Parameters(storage_root=str(tmp_path))
 
     def session_created():
         return any((child / "session.json").is_file() for child in tmp_path.iterdir())
 
     async def run():
-        tasks = await asyncio.wait_for(main_mod.setup(params, runner), timeout=1.0)
-        assert not session_created(), "no session may exist before the robot has a shape"
-        measured.append(observed((CORE, "arm_inst", "link")))
-        commanded.append(observed((CORE, "lead_inst", "arm_link")))
-        deadline = asyncio.get_running_loop().time() + 10.0
-        while not session_created():
-            assert asyncio.get_running_loop().time() < deadline, "start never discovered"
-            await asyncio.sleep(0.02)
+        tasks = await asyncio.wait_for(main_mod.setup(params, runner), timeout=5.0)
+        assert session_created(), "the session opens during setup, from the seeded shape"
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -314,8 +311,8 @@ def test_setup_refuses_unusable_parameters(tmp_path):
 
     runner = SimpleNamespace(cancellation_token=lambda: NeverCancelledToken())
     for bad in (
-        Parameters(storage_uri=f"file://{tmp_path}", fps=0),
-        Parameters(storage_uri=f"file://{tmp_path}", image_writer_threads=0),
+        Parameters(storage_root=str(tmp_path), fps=0),
+        Parameters(storage_root=str(tmp_path), image_writer_threads=0),
     ):
         with pytest.raises(ValueError, match="must be positive"):
             asyncio.run(main_mod.setup(bad, runner))
@@ -324,9 +321,9 @@ def test_setup_refuses_unusable_parameters(tmp_path):
 def test_resolving_a_session_validates_the_operator_supplied_name(tmp_path):
     """The resume request's name is the node's only untrusted input; resolving
     it without validation would join a traversal shape onto the storage root."""
-    from lerobot_recorder.storage import LocalTarget
+    from lerobot_recorder.storage import StorageTarget
 
-    target = LocalTarget(root=tmp_path)
+    target = StorageTarget(root=tmp_path, s3=None)
     with pytest.raises(ValueError, match="is not a session name"):
         _resolve_existing_session(target, "../evil", make_plan())
 

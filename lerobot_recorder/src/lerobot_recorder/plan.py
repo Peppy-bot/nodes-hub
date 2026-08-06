@@ -19,7 +19,6 @@ recorded into LeRobot's action feature (peppy actions are unrelated).
 
 from __future__ import annotations
 
-import asyncio
 import re
 from dataclasses import dataclass
 from enum import Enum
@@ -30,17 +29,6 @@ ProducerKey = tuple[str, str]
 # sources apart when one instance leads several pairings, which is exactly
 # the backbone's shape.
 SourceKey = tuple[str, str, str]
-
-# How long the observer slots' membership must hold still before it counts as
-# fully delivered: delivery is per slot, so a set read between two slots'
-# deliveries is a partial robot.
-SOURCE_SETTLE_S = 0.5
-# How long to wait for any membership at all. A launch that bound nothing is
-# indistinguishable from one whose delivery has not landed, so discovery gets
-# to report the empty set rather than waiting forever.
-SOURCE_DELIVERY_TIMEOUT_S = 15.0
-# How often the membership is re-read while waiting for it to settle.
-SOURCE_POLL_S = 0.05
 
 
 def producer_key(producer) -> ProducerKey:
@@ -142,60 +130,14 @@ LimbSources = tuple[tuple[tuple, tuple], ...]
 
 def read_limb_sources(node_runner) -> LimbSources:
     """One read of every observer slot's member list, in limb_slots order.
-    The live sets are the daemon's to replace whole at any moment, so
-    everything downstream works from a snapshot instead of re-reading."""
+    The boot config seeds each slot with the launch's membership, so this
+    answers the robot's shape from setup onward; the sets stay live after
+    (the daemon replaces them whole when the plan changes), so everything
+    downstream works from this one snapshot instead of re-reading."""
     return tuple(
         (tuple(observed.sources(node_runner)), tuple(commanded.sources(node_runner)))
         for _kind, observed, commanded in limb_slots()
     )
-
-
-async def wait_for_sources(
-    node_runner, *, settle_s: float = SOURCE_SETTLE_S, timeout_s: float = SOURCE_DELIVERY_TIMEOUT_S
-) -> LimbSources:
-    """Wait for the daemon to finish delivering the observer slots' member
-    sets, and return the snapshot discovery should consume: a membership
-    change between settling and discovery could otherwise pair sources from
-    two different plan revisions.
-
-    Delivery is asynchronous and per slot (each carries that slot's complete
-    membership), and the framework serves it independently of node setup, so
-    reading the sets the instant setup starts sees an empty robot. An empty
-    set is also a legal steady state, and nothing distinguishes "not delivered
-    yet" from "bound to nothing", so this settles on membership holding still
-    rather than on any particular count, and gives up at `timeout_s` to let
-    discovery report what was actually bound.
-
-    Waiting here happens before the node has a shutdown hook, so a stop while
-    it runs ends the start (checked before every exit, timeout included)
-    rather than letting it build a session inside the teardown window."""
-    token = node_runner.cancellation_token()
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout_s
-    previous = None
-    settled_at = None
-    while True:
-        if token.is_cancelled():
-            raise asyncio.CancelledError
-        snapshot = read_limb_sources(node_runner)
-        keys = tuple(
-            tuple(tuple(source_key(s) for s in sources) for sources in pair) for pair in snapshot
-        )
-        if keys != previous:
-            previous, settled_at = keys, loop.time()
-        elif any(sources for pair in keys for sources in pair) and (
-            loop.time() - settled_at >= settle_s
-        ):
-            total = sum(len(sources) for pair in keys for sources in pair)
-            print(f"[recorder] observing {total} source(s)", flush=True)
-            return snapshot
-        if loop.time() >= deadline:
-            print(
-                f"[recorder] gave up waiting for observed sources after {timeout_s:g}s",
-                flush=True,
-            )
-            return snapshot
-        await asyncio.sleep(SOURCE_POLL_S)
 
 
 def limb_name(used_names: set[str], source) -> str:
@@ -252,7 +194,8 @@ def discover(node_runner, limb_sources: LimbSources) -> RecordingPlan:
     if not state:
         raise ValueError(
             "no limbs are bound; a dataset with no observation.state and no action "
-            "records nothing a policy can be trained on"
+            "records nothing a policy can be trained on. If the launcher does bind "
+            "pairings, the daemon predates observation seeding (peppy too old)"
         )
 
     used_names: set[str] = set()

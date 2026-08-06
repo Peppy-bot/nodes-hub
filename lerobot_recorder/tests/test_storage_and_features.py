@@ -1,68 +1,44 @@
 import asyncio
-import os
-import stat
-import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from lerobot_recorder import storage
 from lerobot_recorder.plan import assign_camera_names, sanitize_key
 from lerobot_recorder.recording import GRIPPER_LAYOUT, LinkLayout, SourceSchema
 from lerobot_recorder.sink import Sink, build_features, features_mismatch
 from lerobot_recorder.storage import (
     FRAME_STAGING_DIR,
-    LocalTarget,
     Mirror,
-    S3Location,
-    S3Target,
-    cleanup_staging,
-    parse_storage_uri,
-    prepare_target,
+    S3Destination,
+    StorageTarget,
+    ensure_mounted,
+    parse_storage,
     probe_credentials,
     resolved_endpoint,
-    staging_key,
     validate_session_name,
 )
 from tests.test_recording import action_entry, gripper_entry, joint_entry, make_plan
 
 
-def test_parse_file_uri():
-    target = parse_storage_uri("file:///data/lerobot")
-    assert isinstance(target, LocalTarget)
+def test_parse_local_only():
+    target = parse_storage("/data/lerobot", "")
+    assert target == StorageTarget(root=Path("/data/lerobot"), s3=None)
+
+
+def test_parse_with_s3_mirror():
+    target = parse_storage("/data/lerobot", "s3://robot-datasets/openarm/sessions")
     assert target.root == Path("/data/lerobot")
+    assert target.s3 == S3Destination(bucket="robot-datasets", prefix="openarm/sessions")
 
 
-def test_parse_s3_uri_is_pure():
-    # Parsing allocates nothing; the staging directory belongs to prepare.
-    location = parse_storage_uri("s3://robot-datasets/openarm/sessions")
-    assert location == S3Location(bucket="robot-datasets", prefix="openarm/sessions")
-
-
-def test_prepare_target_allocates_stable_staging(tmp_path, monkeypatch):
-    monkeypatch.setenv("TMPDIR", str(tmp_path))
-    # gettempdir caches its answer; clearing it forces a re-read of TMPDIR.
-    monkeypatch.setattr(tempfile, "tempdir", None)
-    first = prepare_target(parse_storage_uri("s3://robot-datasets/openarm/sessions"))
-    again = prepare_target(parse_storage_uri("s3://robot-datasets/openarm/sessions"))
-    other = prepare_target(parse_storage_uri("s3://robot-datasets/openarm/other"))
-    assert isinstance(first, S3Target)
-    assert (first.bucket, first.prefix) == ("robot-datasets", "openarm/sessions")
-    assert first.staging_root.exists()
-    # Same URI resolves to the same root across runs: resume by name depends
-    # on it. A different prefix gets its own root.
-    assert again.staging_root == first.staging_root
-    assert other.staging_root != first.staging_root
-    assert first.staging_root.is_relative_to(tmp_path)
-
-
-def test_staging_key_separates_sanitize_collisions():
-    a = staging_key("bucket", "a/b")
-    b = staging_key("bucket", "a_b")
-    assert a != b
-    # The readable part still leads for operators.
-    assert a.startswith("bucket_a_b_")
+def test_ensure_mounted_requires_the_bound_directory(tmp_path):
+    """A missing root means the manifest's bind mount is not in effect;
+    creating it would write datasets into the container's own filesystem,
+    gone when the instance stops."""
+    ensure_mounted(StorageTarget(root=tmp_path, s3=None))
+    with pytest.raises(ValueError, match="mounted"):
+        ensure_mounted(StorageTarget(root=tmp_path / "missing", s3=None))
 
 
 def test_validate_session_name():
@@ -73,15 +49,19 @@ def test_validate_session_name():
             validate_session_name(bad)
 
 
-def test_prepare_target_passes_local_through(tmp_path):
-    local = LocalTarget(root=tmp_path)
-    assert prepare_target(local) is local
-
-
-@pytest.mark.parametrize("uri", ["http://x", "s3://", "file://host/x", "plainpath"])
-def test_parse_rejects_bad_uris(uri):
+@pytest.mark.parametrize(
+    ("root", "s3_uri"),
+    [
+        ("relative/path", ""),
+        ("", ""),
+        ("/data", "http://x"),
+        ("/data", "s3://"),
+        ("/data", "plainpath"),
+    ],
+)
+def test_parse_rejects_bad_input(root, s3_uri):
     with pytest.raises(ValueError):
-        parse_storage_uri(uri)
+        parse_storage(root, s3_uri)
 
 
 def test_sanitize_key():
@@ -106,38 +86,14 @@ def test_assign_camera_names_two_rgbd_collision():
     assert len(keys) == len(set(keys))
 
 
-def test_cleanup_staging_only_removes_an_empty_root(tmp_path):
-    empty = S3Target(bucket="b", prefix="x", staging_root=tmp_path / "empty")
-    empty.staging_root.mkdir()
-    cleanup_staging(empty)
-    assert not empty.staging_root.exists()
-
-    # A root holding a past session (possibly the only local copy of one
-    # whose final mirror pass was cut off) must survive a failed start.
-    occupied = S3Target(bucket="b", prefix="x", staging_root=tmp_path / "occupied")
-    (occupied.staging_root / "2026-07-27_14-03-22").mkdir(parents=True)
-    cleanup_staging(occupied)
-    assert occupied.staging_root.exists()
+def test_probe_credentials_without_mirror_is_noop(tmp_path):
+    probe_credentials(StorageTarget(root=tmp_path, s3=None))
 
 
-def test_cleanup_staging_keeps_local_root(tmp_path):
-    cleanup_staging(LocalTarget(root=tmp_path))
-    assert tmp_path.exists()
-
-
-def test_probe_credentials_local_is_noop(tmp_path):
-    probe_credentials(LocalTarget(root=tmp_path))
-
-
-def test_probe_credentials_fails_without_creds(tmp_path, monkeypatch):
+def test_probe_credentials_fails_without_creds(tmp_path):
     """The injected lookup keeps this independent of botocore's provider
-    chain; ambient credentials (env, ~/.boto, IMDS) cannot flip the result.
-    Staging roots are stable across runs now, so this one is redirected into
-    the test's own directory rather than shared with every other run on the
-    host."""
-    monkeypatch.setenv("TMPDIR", str(tmp_path))
-    monkeypatch.setattr(tempfile, "tempdir", None)
-    target = prepare_target(parse_storage_uri("s3://bucket/x"))
+    chain; ambient credentials (env, ~/.boto, IMDS) cannot flip the result."""
+    target = parse_storage(str(tmp_path), "s3://bucket/x")
     with pytest.raises(RuntimeError, match="credentials"):
         probe_credentials(target, lookup=lambda: None)
     probe_credentials(target, lookup=lambda: object())
@@ -205,7 +161,7 @@ class StubS3:
 
 def mirror_over(tmp_path, client, prefix="pre") -> Mirror:
     mirror = Mirror(
-        target=S3Target(bucket="buck", prefix=prefix, staging_root=tmp_path),
+        dest=S3Destination(bucket="buck", prefix=prefix),
         session_dir=tmp_path,
         session_name="sess",
     )
@@ -324,50 +280,3 @@ def test_a_failed_finalize_can_be_retried(tmp_path):
     asyncio.run(sink.finalize())
     asyncio.run(sink.finalize())
     assert closes["n"] == 2, "retried after the failure, latched after the success"
-
-
-def test_staging_refuses_a_root_it_does_not_own(tmp_path, monkeypatch):
-    """The path is derivable from the storage_uri, so anyone can create it
-    first; recording through someone else's directory is refused."""
-    monkeypatch.setenv("TMPDIR", str(tmp_path))
-    monkeypatch.setattr(tempfile, "tempdir", None)
-    location = parse_storage_uri("s3://bucket/x")
-    planted = tmp_path / "lerobot_recorder_staging" / staging_key("bucket", "x")
-    planted.parent.mkdir(parents=True)
-    planted.symlink_to(tmp_path)
-    with pytest.raises(ValueError, match="not a directory"):
-        prepare_target(location)
-
-
-def test_staging_refuses_a_planted_base_directory(tmp_path, monkeypatch):
-    """The base level is as plantable as the leaf: mkdir(exist_ok=True)
-    succeeds through a symlink-to-directory, so a checked leaf inside an
-    unchecked base would still write datasets through the attacker's link."""
-    monkeypatch.setenv("TMPDIR", str(tmp_path))
-    monkeypatch.setattr(tempfile, "tempdir", None)
-    elsewhere = tmp_path / "elsewhere"
-    elsewhere.mkdir()
-    (tmp_path / "lerobot_recorder_staging").symlink_to(elsewhere)
-    with pytest.raises(ValueError, match="not a directory"):
-        prepare_target(parse_storage_uri("s3://bucket/x"))
-
-
-def test_staging_refuses_a_root_owned_by_another_user(tmp_path, monkeypatch):
-    """A symlink is not the only planting: a real directory someone else owns
-    must be refused too, and the base directory is as plantable as the leaf."""
-    monkeypatch.setenv("TMPDIR", str(tmp_path))
-    monkeypatch.setattr(tempfile, "tempdir", None)
-    not_me = os.getuid() + 1
-    monkeypatch.setattr(storage.os, "getuid", lambda: not_me)
-    with pytest.raises(ValueError, match="belongs to another user"):
-        prepare_target(parse_storage_uri("s3://bucket/x"))
-
-
-def test_staging_directories_are_private(tmp_path, monkeypatch):
-    """0o700 on both levels: the base sits in a shared /tmp, and a
-    group-readable staging tree would hand other users the datasets."""
-    monkeypatch.setenv("TMPDIR", str(tmp_path))
-    monkeypatch.setattr(tempfile, "tempdir", None)
-    target = prepare_target(parse_storage_uri("s3://bucket/x"))
-    for directory in (target.staging_root, target.staging_root.parent):
-        assert stat.S_IMODE(directory.lstat().st_mode) == 0o700, directory

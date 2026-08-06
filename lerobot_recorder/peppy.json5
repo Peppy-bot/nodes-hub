@@ -143,6 +143,12 @@
     language: "python",
     container: {
       def_file: "apptainer.def",
+      // The one place the recorder touches the host filesystem: sessions
+      // must outlive the container, so the storage root is bound explicitly
+      // instead of leaning on any default runtime binds.
+      mount_paths: [
+        "${parameters:storage_root}",
+      ],
     },
     parameters: {
       // Dataset identity written into meta/info.json (e.g. "openarm_bimanual").
@@ -150,12 +156,15 @@
       // Dataset rate (Hz). Frame timestamps are exactly k/fps; every source is
       // sampled latest-value onto this grid.
       fps: "u32",
-      // Where sessions land: file:///path/to/dir or s3://bucket/prefix
-      // (R2 included; endpoint + credentials come from the standard AWS
-      // env vars, never from launch parameters). Each run creates
-      // <uri>/<utc_ts>/; s3 uploads stream in the background from a
-      // local staging dir.
-      storage_uri: "string",
+      // Absolute host directory sessions land in, bind-mounted same-path
+      // above; each run creates <storage_root>/<utc_ts>/. Not a top-level
+      // system directory (peppy refuses those as mount sources).
+      storage_root: "string",
+      // Optional s3://bucket[/prefix] mirror (R2 included; endpoint +
+      // credentials come from the standard AWS env vars, never from launch
+      // parameters). Uploads stream in the background; storage_root keeps
+      // the local copy. Empty disables mirroring.
+      s3_uri: { $type: "string", $default: "" },
       // Encoder threads the dataset library uses per session. More keeps
       // high camera counts inside the fps grid; fewer leaves CPU for the
       // robot stack sharing the host. Must be at least 1: at zero the
