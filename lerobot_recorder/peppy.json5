@@ -1,0 +1,179 @@
+// ============================================================================
+// lerobot_recorder node manifest
+// ============================================================================
+// A LeRobot recorder for any robot built out of these pairings. It observes
+// pairing traffic read-only: per limb, the follower's measured stream
+// (observation) and the leader's setpoint stream (LeRobot's `action` feature,
+// not to be confused with the peppy action below) of the same pairing, plus
+// any bound cameras. Every source is sampled onto a fixed fps grid and written
+// as a LeRobot v3 dataset.
+//
+// The observer slots below are `zero_or_more`, so the robot's shape is the
+// launcher's to declare, not this node's: it binds as many pairings as the
+// robot has, and a limb is one measured source paired with the commanded
+// source bound at the same position in its slot. Pairing wire messages carry
+// no joint names, so dimension names derive from the follower instance
+// observed for each limb plus a joint index; joint counts and which optional
+// vectors (velocities, efforts) a source delivers are discovered from its
+// first message, so everything recorded comes from the wire with no layout
+// config.
+{
+  peppy_schema: "node/v1",
+  manifest: {
+    name: "lerobot_recorder",
+    tag: "v1",
+    depends_on: {
+      pairing_observers: [
+        // The measured back-channels: observation.state (+ velocities/efforts).
+        { name: "joint_link", tag: "v1", role: "follower", link_id: "observed_joints", cardinality: "zero_or_more" },
+        { name: "gripper_link", tag: "v1", role: "follower", link_id: "observed_grippers", cardinality: "zero_or_more" },
+        // The leader's setpoint streams of the same pairings: LeRobot's
+        // action feature.
+        { name: "joint_link", tag: "v1", role: "leader", link_id: "commanded_joints", cardinality: "zero_or_more" },
+        { name: "gripper_link", tag: "v1", role: "leader", link_id: "commanded_grippers", cardinality: "zero_or_more" },
+      ],
+      contracts: [
+        {
+          name: "rgb_camera",
+          tag: "v1",
+          link_id: "color_cameras",
+          cardinality: "zero_or_more",
+        },
+        // RGB-D cameras (e.g. D435) -> observation.images. (color) plus a depth
+        // feature (12-bit gray12le mp4 with lerobot's log quantization).
+        {
+          name: "rgbd_camera",
+          tag: "v1",
+          link_id: "rgbd_cameras",
+          cardinality: "zero_or_more",
+        },
+      ],
+    },
+  },
+  interfaces: {
+    topics: {
+      consumes: [
+        { link_id: "observed_joints", name: "joint_states" },
+        { link_id: "observed_grippers", name: "gripper_states" },
+        { link_id: "commanded_joints", name: "joint_setpoints" },
+        { link_id: "commanded_grippers", name: "gripper_setpoints" },
+        { link_id: "color_cameras", name: "video_stream" },
+        { link_id: "rgbd_cameras", name: "video_stream" },
+        { link_id: "rgbd_cameras", name: "depth_stream" },
+      ],
+    },
+    services: {
+      consumes: [
+        // depth_stream_info carries depth_unit: meters per z16 LSB.
+        { link_id: "rgbd_cameras", name: "depth_stream_info" },
+      ],
+      exposes: [
+        {
+          // Finalize and mirror the current session's dataset and open a
+          // fresh session in place; the finished directory is immediately
+          // loadable.
+          name: "finish_session",
+          response_message_format: {
+            // Directory name of the finished session; empty when refused.
+            session: "string",
+            // Why the session could not finish; absent on success.
+            error: { $type: "string", $optional: true },
+          },
+        },
+        {
+          // Record into a past session again, appending to its dataset.
+          // Refused when the live sources, rates, or source-to-limb bindings
+          // differ from what the session recorded.
+          name: "resume_session",
+          request_message_format: {
+            // Directory name of the session to resume, exactly as
+            // finish_session returned it (UTC YYYY-MM-DD_HH-MM-SS); never a
+            // path.
+            session: "string",
+          },
+          response_message_format: {
+            // Directory name of the session now recording; empty when
+            // refused.
+            session: "string",
+            // Episodes already saved in the resumed dataset; 0 when refused.
+            episodes: "u64",
+            // Why the session could not resume; absent on success.
+            error: { $type: "string", $optional: true },
+          },
+        },
+      ],
+    },
+    actions: {
+      exposes: [
+        {
+          name: "record_episode",
+          goal_service: {
+            request_message_format: {
+              task: "string",
+            },
+          },
+          feedback_topic: {
+            // One message per recorded frame.
+            qos_profile: "standard",
+            message_format: {
+              // Count of frames written so far, not image data.
+              frames_recorded: "u64",
+              // Refreshed roughly once per second; repeats the last
+              // measurement in between.
+              disk_free_bytes: "u64",
+            },
+          },
+          result_service: {
+            response_message_format: {
+              // Saved episode index; -1 when discarded.
+              episode_index: "i64",
+              // Count of frames captured during the goal.
+              frames_recorded: "u64",
+              // True when the frames were dropped instead of saved.
+              discarded: "bool",
+              // Why the episode ended; absent for an operator stop.
+              error: { $type: "string", $optional: true },
+            },
+          },
+        },
+      ],
+    },
+  },
+  execution: {
+    language: "python",
+    container: {
+      def_file: "apptainer.def",
+    },
+    parameters: {
+      // Dataset identity written into meta/info.json (e.g. "openarm_bimanual").
+      robot_type: "string",
+      // Dataset rate (Hz). Frame timestamps are exactly k/fps; every source is
+      // sampled latest-value onto this grid.
+      fps: "u32",
+      // Where sessions land: file:///path/to/dir or s3://bucket/prefix
+      // (R2 included; endpoint + credentials come from the standard AWS
+      // env vars, never from launch parameters). Each run creates
+      // <uri>/<utc_ts>/; s3 uploads stream in the background from a
+      // local staging dir.
+      storage_uri: "string",
+      // Encoder threads the dataset library uses per session. More keeps
+      // high camera counts inside the fps grid; fewer leaves CPU for the
+      // robot stack sharing the host. Must be at least 1: at zero the
+      // library encodes inline and stalls the sampling loop.
+      image_writer_threads: { $type: "u32", $default: 4 },
+      // Newest acceptable source age in seconds, links and cameras alike.
+      // A goal is refused until every source is this fresh; a source
+      // exceeding it mid-episode ends the episode with a save. Without
+      // the gate a dead source would be zero-order-held into frames
+      // that claim to be live observations.
+      max_staleness_s: { $type: "f64", $default: 0.5 },
+      // Refuse a goal, and end a running episode, below this much free
+      // space under the session directory (default 1 GB). The floor
+      // must trip before the disk actually fills: the dataset library
+      // swallows image write errors (frames go missing and shift the
+      // video against the tabular rows) and a save on a full disk can
+      // truncate previously saved video chunks.
+      min_remaining_disk_bytes: { $type: "u64", $default: 1000000000 },
+    },
+  },
+}
