@@ -11,6 +11,11 @@
         path: "example_robot/episode_recorder/peppy.json5"
       }
     },
+    lerobot_recorder: {
+      v1: {
+        path: "lerobot_recorder/peppy.json5"
+      }
+    },
     my_python_robot_arm: {
       v1: {
         path: "example_robot/my_robot_arm/my_python_robot_arm/peppy.json5"

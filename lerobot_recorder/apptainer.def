@@ -1,0 +1,31 @@
+Bootstrap: docker
+From: peppybot/python-uv-base:latest
+
+%labels
+    Name lerobot_recorder
+    Version 0.1.0
+
+%environment
+    export PATH="/opt/lerobot_recorder/.venv/bin:$PATH"
+
+%files
+    . /opt/lerobot_recorder
+
+%post
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+
+    # lerobot encodes episode video through ffmpeg.
+    apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+        && rm -rf /var/lib/apt/lists/*
+
+    cd /opt/lerobot_recorder
+    uv python install
+    # --no-dev keeps the test-only group out of the runtime image.
+    uv sync --no-editable --no-dev
+
+%runscript
+    cd /opt/lerobot_recorder
+    # -u: stdout to the daemon is a pipe, so buffered diagnostics would be
+    # lost when the shutdown grace window force-kills the process.
+    exec ./.venv/bin/python -u -m lerobot_recorder
