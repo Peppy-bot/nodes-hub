@@ -14,6 +14,10 @@ From: peppybot/python-uv-base:latest
 %post
     set -eux
     export DEBIAN_FRONTEND=noninteractive
+    # uv defaults its managed interpreter under $HOME (/root at build time);
+    # a daemon running as root mounts its home over that and the node dies
+    # with ./.venv/bin/python: not found.
+    export UV_PYTHON_INSTALL_DIR=/opt/uv-python
 
     # lerobot encodes episode video through ffmpeg.
     apt-get update && apt-get install -y --no-install-recommends ffmpeg \
