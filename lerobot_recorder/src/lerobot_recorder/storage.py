@@ -173,6 +173,12 @@ def cleanup_staging(target: StorageTarget) -> None:
 # nothing under it belongs in the mirror.
 FRAME_STAGING_DIR = "images"
 
+# Upload bounds, per attempt; without them botocore's defaults let one hung
+# endpoint consume the whole shutdown grace window.
+S3_CONNECT_TIMEOUT_S = 10
+S3_READ_TIMEOUT_S = 60
+S3_MAX_ATTEMPTS = 3
+
 
 @dataclass
 class Mirror:
@@ -198,8 +204,19 @@ class Mirror:
         """Upload everything that changed; returns (files, bytes) uploaded."""
         if self._client is None:
             import boto3
+            from botocore.config import Config
 
-            self._client = boto3.client("s3")
+            # Bounded: the final pass runs inside the daemon's shutdown grace
+            # window, so a hung endpoint must fail (staging kept, logged)
+            # rather than stall until the daemon kills the node mid-pass.
+            self._client = boto3.client(
+                "s3",
+                config=Config(
+                    connect_timeout=S3_CONNECT_TIMEOUT_S,
+                    read_timeout=S3_READ_TIMEOUT_S,
+                    retries={"max_attempts": S3_MAX_ATTEMPTS, "mode": "standard"},
+                ),
+            )
         files = 0
         size = 0
         for path in sorted(self.session_dir.rglob("*")):
