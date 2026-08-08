@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lerobot_recorder"
+version = "0.1.0"
+description = "lerobot_recorder peppy node"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "peppygen",
+    "peppylib",
+    "lerobot[dataset]>=0.6,<0.7",
+    "boto3>=1.34",
+    # Imported directly (frame assembly, mjpeg decode, reading a session's
+    # episode metadata before resuming it), not just via lerobot.
+    "numpy>=1.26",
+    "pillow>=10",
+    "pyarrow>=15",
+]
+
+[project.scripts]
+lerobot_recorder = "lerobot_recorder.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lerobot_recorder"]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.uv.sources]
+peppygen = { path = ".peppy/libs/peppygen" }
+peppylib = { path = ".peppy/libs/peppylib" }
