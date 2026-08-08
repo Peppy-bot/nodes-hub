@@ -100,7 +100,8 @@ With `s3_uri` set (`s3://bucket[/prefix]`), the same root doubles as the
 staging area: the dataset mirrors to the bucket after every saved episode
 plus once at shutdown, and the root keeps the local copy. Still-growing
 files (the open parquet, the current video chunk) are unreadable in the
-mirror until the final sync after shutdown mirrors the completed dataset.
+mirror until the dataset is finalized and mirrored, which `finish_session`
+does on demand and shutdown does once more for the session left open.
 
 The shutdown finalize-and-mirror runs inside the daemon's cooperative
 shutdown window (`shutdown_grace_secs`, 5 s by default), so a large
