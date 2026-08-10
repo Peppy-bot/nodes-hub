@@ -20,6 +20,7 @@ from lerobot_recorder.recording import (
     capture_schema,
     decode_color,
     decode_depth,
+    decode_images,
     efforts_dim_names,
     sample,
     schema_mismatch,
@@ -175,7 +176,7 @@ def test_schema_then_sample_roundtrip():
     cache.color = [rgb_frame()]
     schema = capture(cache, plan)
 
-    row = sample(cache, schema, plan, NOW_NS, STALENESS_S)
+    row = decode_images(*sample(cache, schema, plan, NOW_NS, STALENESS_S))
     assert row.state.shape == (8,)
     assert row.state.dtype == np.float32
     assert row.state[7] == pytest.approx(0.5)
@@ -192,7 +193,7 @@ def test_vectors_absent_when_wire_omits_them():
     cache.links[ARM0] = joints(2, velocities=False)
     schema = capture(cache, plan)
     assert schema.layouts == (LinkLayout(dims=2, has_velocities=False, has_efforts=False),)
-    row = sample(cache, schema, plan, NOW_NS, STALENESS_S)
+    row, _pending = sample(cache, schema, plan, NOW_NS, STALENESS_S)
     assert row.velocities is None
     assert row.efforts is None
 
@@ -204,7 +205,7 @@ def test_gripper_effort_recorded_even_without_arm_efforts():
     cache.links[GRIP0] = grip(effort=0.3)
     schema = capture(cache, plan)
     assert efforts_dim_names(plan, schema) == ("grip0_effort",)
-    row = sample(cache, schema, plan, NOW_NS, STALENESS_S)
+    row, _pending = sample(cache, schema, plan, NOW_NS, STALENESS_S)
     assert row.efforts.shape == (1,)
     assert row.efforts[0] == pytest.approx(0.3)
 
@@ -273,7 +274,7 @@ def test_sample_tolerates_future_stamps():
     cache.links[ARM0] = joints(7)
     schema = capture(cache, plan)
     cache.links[ARM0] = joints(7, stamp_ns=NOW_NS + 10_000_000_000)
-    row = sample(cache, schema, plan, NOW_NS, STALENESS_S)
+    row, _pending = sample(cache, schema, plan, NOW_NS, STALENESS_S)
     assert row.state.shape == (7,)
 
 
@@ -285,7 +286,7 @@ def test_action_holds_last_setpoint_regardless_of_age():
     cache.links[ARM0] = joints(7)
     cache.links[COMMANDED_ARM0] = joints(7, stamp_ns=NOW_NS - 600_000_000_000)
     schema = capture(cache, plan)
-    row = sample(cache, schema, plan, NOW_NS, STALENESS_S)
+    row, _pending = sample(cache, schema, plan, NOW_NS, STALENESS_S)
     assert row.action.shape == (7,)
 
 
@@ -303,7 +304,7 @@ def test_sample_flags_stale_link_by_producer_stamp():
     cache.links[ARM0] = joints(7)
     schema = capture(cache, plan)
     cache.links[ARM0] = joints(7, stamp_ns=NOW_NS - 300_000_000)
-    with pytest.raises(SampleGap, match="stale"):
+    with pytest.raises(SampleGap, match=r"stale \(0\.30s behind\)"):
         sample(cache, schema, plan, NOW_NS, STALENESS_S)
 
 
@@ -355,7 +356,7 @@ def test_sample_flags_mjpeg_payload_header_mismatch():
     ]
     schema = capture(cache, plan)
     with pytest.raises(SampleGap, match="does not match header"):
-        sample(cache, schema, plan, NOW_NS, STALENESS_S)
+        decode_images(*sample(cache, schema, plan, NOW_NS, STALENESS_S))
 
 
 def test_sample_flags_truncated_payload():
@@ -368,7 +369,27 @@ def test_sample_flags_truncated_payload():
         CameraFrame(encoding="rgb8", width=4, height=2, data=bytes(5), stamp_ns=NOW_NS)
     ]
     with pytest.raises(SampleGap, match="cam0"):
-        sample(cache, schema, plan, NOW_NS, STALENESS_S)
+        decode_images(*sample(cache, schema, plan, NOW_NS, STALENESS_S))
+
+
+def test_sample_defers_decode_to_decode_images():
+    """Camera payloads leave `sample` undecoded (the decode runs off the
+    event loop) and `decode_images` fills every image key, depth included."""
+    plan = make_plan(state=(joint_entry(),), rgbd=1)
+    cache = Cache.for_plan(plan)
+    cache.links[ARM0] = joints(2)
+    cache.rgbd_video = [rgb_frame()]
+    z16 = np.zeros((2, 4), dtype="<u2")
+    cache.rgbd_depth = [
+        CameraFrame(encoding="z16", width=4, height=2, data=z16.tobytes(), stamp_ns=NOW_NS)
+    ]
+    schema = capture(cache, plan, depth_units=(0.001,))
+    row, pending = sample(cache, schema, plan, NOW_NS, STALENESS_S)
+    assert row.images == {}
+    assert [p.name for p in pending] == ["rgbd0", "rgbd0_depth"]
+    decode_images(row, pending)
+    assert row.images["rgbd0"].shape == (2, 4, 3)
+    assert row.images["rgbd0_depth"].shape == (2, 4, 1)
 
 
 def make_schema(color=()) -> SourceSchema:
@@ -465,7 +486,7 @@ def test_action_falls_back_to_measured_until_commanded():
     schema = capture(cache, plan)
     assert [layout.dims for layout in schema.action_layouts] == [7, 1]
 
-    row = sample(cache, schema, plan, NOW_NS, STALENESS_S)
+    row, _pending = sample(cache, schema, plan, NOW_NS, STALENESS_S)
     assert row.action[:7].tolist() == pytest.approx([0.1] * 7)
     assert row.action[7] == pytest.approx(0.4)
 
@@ -474,7 +495,7 @@ def test_action_falls_back_to_measured_until_commanded():
     )
     cache.links[COMMANDED_ARM0] = commanded
     cache.links[gripper_action_entry().key] = grip(opening=0.8, effort=0.0)
-    row = sample(cache, schema, plan, NOW_NS, STALENESS_S)
+    row, _pending = sample(cache, schema, plan, NOW_NS, STALENESS_S)
     assert row.action[:7].tolist() == pytest.approx([0.9] * 7)
     assert row.action[7] == pytest.approx(0.8)
 

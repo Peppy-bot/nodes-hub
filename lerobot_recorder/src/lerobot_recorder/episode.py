@@ -53,6 +53,40 @@ def _low_disk(free: int) -> str:
     return f"only {free // (1 << 20)} MB free under the session directory"
 
 
+class _TickReport:
+    """Per-second aggregate of frame-loop overruns, printed only when a tick
+    exceeded the frame period; healthy episodes log nothing. `sample` is the
+    on-loop cache read, `append` the off-loop decode and dataset write."""
+
+    def __init__(self, period_s: float):
+        self._period_s = period_s
+        self._window_started: float | None = None
+        self._overruns = 0
+        self._worst = (0.0, 0.0, 0.0)
+
+    def record(self, now_s: float, sample_s: float, append_s: float) -> None:
+        if self._window_started is None:
+            self._window_started = now_s
+        total = sample_s + append_s
+        if total > self._period_s:
+            self._overruns += 1
+            self._worst = max(self._worst, (total, sample_s, append_s))
+        if now_s - self._window_started >= 1.0:
+            self.flush()
+            self._window_started = now_s
+
+    def flush(self) -> None:
+        if self._overruns:
+            total, sample_s, append_s = self._worst
+            print(
+                f"[recorder] {self._overruns} tick overrun(s): worst "
+                f"{total * 1000:.0f} ms (sample {sample_s * 1000:.0f} ms, "
+                f"append {append_s * 1000:.0f} ms) against {self._period_s * 1000:.0f} ms"
+            )
+        self._overruns = 0
+        self._worst = (0.0, 0.0, 0.0)
+
+
 class Recorder:
     """Single owner of the recorder state machine; only the goal loop
     touches it, so goals cannot race."""
@@ -437,6 +471,7 @@ class Recorder:
         # Due immediately: the first frame both seeds disk_free and checks the
         # floor, so a disk that filled since goal-accept trips at frame one.
         next_disk_check = loop.time()
+        report = _TickReport(period)
         cancel = asyncio.ensure_future(ctx.cancel_signal())
         shutdown = asyncio.ensure_future(token.cancelled())
         end_error: str | None = None
@@ -449,8 +484,9 @@ class Recorder:
                 if shutdown.done():
                     end_error = "recorder shutting down"
                     break
+                tick_started = loop.time()
                 try:
-                    row = recording.sample(
+                    row, pending = recording.sample(
                         self._cache,
                         self._schema,
                         self._plan,
@@ -460,8 +496,14 @@ class Recorder:
                 except (SampleGap, RuntimeError) as e:
                     end_error = str(e)
                     break
+                sampled = loop.time()
+                # Off the loop: decode and dataset writes on the loop starve
+                # the drains, age the cache, and end the episode as stale.
                 try:
-                    self._sink.add_frame(row, task)
+                    await asyncio.to_thread(self._append_frame, row, pending, task)
+                except SampleGap as e:
+                    end_error = str(e)
+                    break
                 except Exception as e:
                     self._discard()
                     await self._complete(
@@ -475,6 +517,7 @@ class Recorder:
                     return
                 frames += 1
                 now = loop.time()
+                report.record(now, sample_s=sampled - tick_started, append_s=now - sampled)
                 # The slow field rides the per-frame feedback once per
                 # DISK_CHECK_PERIOD_S and repeats in between.
                 fresh_measurement = now >= next_disk_check
@@ -502,6 +545,7 @@ class Recorder:
                 # Always yields, so the drain tasks run even on an overrun tick.
                 await asyncio.sleep(max(delay, 0.0))
         finally:
+            report.flush()
             cancel.cancel()
             shutdown.cancel()
 
@@ -530,6 +574,13 @@ class Recorder:
         await self._complete(
             ctx, cancelled, episode_index=episode_index, frames=frames, discarded=False, error=end_error
         )
+
+    def _append_frame(self, row, pending, task: str) -> None:
+        """Decode the frame's images and hand the row to the sink. Runs in a
+        worker thread; calls are sequential (one per tick), so the sink never
+        sees concurrent frames."""
+        recording.decode_images(row, pending)
+        self._sink.add_frame(row, task)
 
     def _discard(self) -> None:
         if not self._sink.created:

@@ -19,6 +19,7 @@ import io
 import math
 from dataclasses import dataclass, field
 
+import cv2
 import numpy as np
 
 from .plan import LinkKind, RecordingPlan, SourceEntry, SourceKey
@@ -227,8 +228,9 @@ def _fresh_link_sample(
     sample = cache.links[entry.key]
     if sample is None:
         raise gap(f"link {entry.label} has not produced yet")
-    if _age_s(sample.stamp_ns, now_ns) > staleness_s:
-        raise gap(f"link {entry.label} stale")
+    age_s = _age_s(sample.stamp_ns, now_ns)
+    if age_s > staleness_s:
+        raise gap(f"link {entry.label} stale ({age_s:.2f}s behind)")
     return sample
 
 
@@ -356,13 +358,29 @@ class FrameRow:
     images: dict[str, np.ndarray] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class PendingImage:
+    """One camera frame sampled fresh, awaiting decode. Kept undecoded so
+    `sample` stays cheap on the event loop; `decode_images` runs elsewhere."""
+
+    # Dataset image key this decode fills; `camera` names the source in errors.
+    name: str
+    camera: str
+    frame: CameraFrame
+    geometry: tuple[int, int]
+    # None decodes color; set, it scales z16 depth to meters.
+    depth_unit_m: float | None
+
+
 def sample(
     cache: Cache,
     schema: SourceSchema,
     plan: RecordingPlan,
     now_ns: int,
     staleness_s: float,
-) -> FrameRow:
+) -> tuple[FrameRow, tuple[PendingImage, ...]]:
+    """Assemble one frame: vectors filled, camera frames freshness-checked but
+    undecoded; `decode_images` finishes the row off the event loop."""
     state: list[float] = []
     velocities: list[float] = []
     efforts: list[float] = []
@@ -407,40 +425,60 @@ def sample(
         efforts=np.asarray(efforts, dtype=np.float32) if efforts else None,
     )
 
-    def take(frame: CameraFrame | None, geometry, entry, decode):
+    def pend(frame: CameraFrame | None, geometry, entry, name, depth_unit_m=None):
         if frame is None:
             raise SampleGap(f"camera {entry.name} stopped producing")
-        if _age_s(frame.stamp_ns, now_ns) > staleness_s:
-            raise SampleGap(f"camera {entry.name} silent")
+        age_s = _age_s(frame.stamp_ns, now_ns)
+        if age_s > staleness_s:
+            raise SampleGap(f"camera {entry.name} silent ({age_s:.2f}s behind)")
         if (frame.width, frame.height) != geometry:
             raise SampleGap(f"camera {entry.name} changed resolution")
+        return PendingImage(
+            name=name,
+            camera=entry.name,
+            frame=frame,
+            geometry=geometry,
+            depth_unit_m=depth_unit_m,
+        )
+
+    pending = [
+        pend(cache.color[i], schema.color_geometry[i], entry, entry.name)
+        for i, entry in enumerate(plan.color_cameras)
+    ]
+    for i, entry in enumerate(plan.rgbd_cameras):
+        pending.append(pend(cache.rgbd_video[i], schema.rgbd_geometry[i], entry, entry.name))
+        pending.append(
+            pend(
+                cache.rgbd_depth[i],
+                schema.depth_geometry[i],
+                entry,
+                f"{entry.name}_depth",
+                depth_unit_m=schema.depth_units[i],
+            )
+        )
+    return row, tuple(pending)
+
+
+def decode_images(row: FrameRow, pending: tuple[PendingImage, ...]) -> FrameRow:
+    """Decode the sampled camera frames into `row.images`. Split from `sample`
+    so the decode cost lands off the event loop, which must stay free for the
+    drain tasks that keep the cache fresh."""
+    for p in pending:
         try:
-            image = decode(frame)
+            if p.depth_unit_m is None:
+                image = decode_color(p.frame)
+            else:
+                image = decode_depth(p.frame, p.depth_unit_m)
         except Exception as e:
-            raise SampleGap(f"camera {entry.name}: {e}") from e
+            raise SampleGap(f"camera {p.camera}: {e}") from e
         # Self-describing payloads (mjpeg) can disagree with the header.
-        width, height = geometry
+        width, height = p.geometry
         if image.shape[:2] != (height, width):
             raise SampleGap(
-                f"camera {entry.name} payload {image.shape[1]}x{image.shape[0]} "
+                f"camera {p.camera} payload {image.shape[1]}x{image.shape[0]} "
                 f"does not match header {width}x{height}"
             )
-        return image
-
-    for i, entry in enumerate(plan.color_cameras):
-        row.images[entry.name] = take(
-            cache.color[i], schema.color_geometry[i], entry, decode_color
-        )
-    for i, entry in enumerate(plan.rgbd_cameras):
-        row.images[entry.name] = take(
-            cache.rgbd_video[i], schema.rgbd_geometry[i], entry, decode_color
-        )
-        row.images[f"{entry.name}_depth"] = take(
-            cache.rgbd_depth[i],
-            schema.depth_geometry[i],
-            entry,
-            lambda frame, unit=schema.depth_units[i]: decode_depth(frame, unit),
-        )
+        row.images[p.name] = image
     return row
 
 
@@ -470,13 +508,7 @@ def decode_depth(frame: CameraFrame, depth_unit_m: float) -> np.ndarray:
 
 
 def _yuyv_to_rgb(yuyv: np.ndarray) -> np.ndarray:
-    """Limited-range BT.601 YUYV 4:2:2 to RGB, vectorized per pixel pair.
-    UVC sources are limited range per V4L2's default quantization; the same
-    convention uvc_camera and the ZED node's OpenCV conversion use."""
-    y = 1.164384 * (yuyv[:, :, 0].astype(np.float32) - 16.0)
-    u = np.repeat(yuyv[:, 0::2, 1].astype(np.float32), 2, axis=1) - 128.0
-    v = np.repeat(yuyv[:, 1::2, 1].astype(np.float32), 2, axis=1) - 128.0
-    r = y + 1.596027 * v
-    g = y - 0.391762 * u - 0.812968 * v
-    b = y + 2.017232 * u
-    return np.clip(np.stack([r, g, b], axis=-1), 0, 255).astype(np.uint8)
+    """Limited-range BT.601 YUYV 4:2:2 to RGB via OpenCV, the conversion the
+    hub's other camera consumers apply. UVC sources are limited range per
+    V4L2's default quantization."""
+    return cv2.cvtColor(np.ascontiguousarray(yuyv), cv2.COLOR_YUV2RGB_YUY2)

@@ -442,6 +442,22 @@ def test_contain_episode_failure_completes_goal(tmp_path):
     asyncio.run(run())
 
 
+def test_tick_report_prints_only_overruns(capsys):
+    report = episode._TickReport(0.01)
+    report.record(0.0, sample_s=0.001, append_s=0.002)
+    report.flush()
+    assert capsys.readouterr().out == ""
+    report.record(0.0, sample_s=0.020, append_s=0.005)
+    report.record(0.1, sample_s=0.001, append_s=0.030)
+    report.flush()
+    out = capsys.readouterr().out
+    assert "2 tick overrun(s)" in out
+    assert "append 30 ms" in out
+    # Flushed and re-armed: a healthy stretch after the burst stays silent.
+    report.flush()
+    assert capsys.readouterr().out == ""
+
+
 def test_recorder_rejects_nonpositive_staleness(tmp_path):
     plan = arm_plan()
     for bad in (0.0, -1.0, float("nan")):

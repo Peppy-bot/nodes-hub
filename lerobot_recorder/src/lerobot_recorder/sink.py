@@ -2,9 +2,9 @@
 
 The dataset is created once every bound source has produced (the feature
 schema needs each source's first message) and lives for the session. Blocking
-library calls (create, save) run in a worker thread so the goal loop stays
-responsive; add_frame is cheap and stays on the loop, with image encoding
-handled by the library's writer threads.
+library calls (create, save) run in worker threads so the goal loop stays
+responsive; add_frame runs in the per-frame worker beside the image decode,
+with image encoding handled by the library's writer threads.
 """
 
 from __future__ import annotations
