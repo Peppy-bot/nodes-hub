@@ -1,0 +1,105 @@
+// xr_commander: a robot-agnostic teleoperation leader driven from a WebXR
+// headset. Serves the WebXR page (teleop_xr), streams a Cartesian setpoint per
+// hand on pose_link and an opening per hand on gripper_link, and relays bound
+// cameras into the headset as WebRTC tracks. Carries no kinematics: solving a
+// pose into joints is the follower's business. The deadman is the grip button,
+// per hand; released means nothing is published and the follower holds.
+{
+  peppy_schema: "node/v1",
+  manifest: {
+    name: "xr_commander",
+    tag: "v1",
+    labels: [
+      "teleop",
+      "xr",
+      "webxr",
+      "commander",
+    ],
+    depends_on: {
+      nodes: [
+        // Optional dataset recorder.
+        { name: "lerobot_recorder", tag: "v1", link_id: "recorder", cardinality: "zero_or_more" },
+      ],
+      contracts: [
+        // Operator video; depth of an RGB-D camera is not consumed.
+        { name: "rgb_camera", tag: "v1", link_id: "color_cameras", cardinality: "zero_or_more" },
+        { name: "rgbd_camera", tag: "v1", link_id: "rgbd_cameras", cardinality: "zero_or_more" },
+        // Whole-robot posture moves.
+        { name: "postures", tag: "v1", link_id: "postures", cardinality: "zero_or_more" },
+      ],
+      pairings: [
+        // One Cartesian command loop per operator hand; which follower each
+        // hand drives is the launcher's choice.
+        { name: "pose_link", tag: "v1", role: "leader", link_id: "left_arm", optional: true },
+        { name: "pose_link", tag: "v1", role: "leader", link_id: "right_arm", optional: true },
+        // The same hand's opening loop.
+        { name: "gripper_link", tag: "v1", role: "leader", link_id: "left_gripper", optional: true },
+        { name: "gripper_link", tag: "v1", role: "leader", link_id: "right_gripper", optional: true },
+      ],
+    },
+  },
+  interfaces: {
+    topics: {
+      emits: [
+        { link_id: "left_arm", name: "pose_setpoints" },
+        { link_id: "right_arm", name: "pose_setpoints" },
+        { link_id: "left_gripper", name: "gripper_setpoints" },
+        { link_id: "right_gripper", name: "gripper_setpoints" },
+      ],
+      consumes: [
+        // Measured end-effector pose.
+        { link_id: "left_arm", name: "pose_states" },
+        { link_id: "right_arm", name: "pose_states" },
+        { link_id: "color_cameras", name: "video_stream" },
+        { link_id: "rgbd_cameras", name: "video_stream" },
+      ],
+    },
+    services: {
+      consumes: [
+        // Finalizes the current dataset session and opens a fresh one.
+        { link_id: "recorder", name: "finish_session" },
+      ],
+    },
+    actions: {
+      consumes: [
+        { link_id: "postures", name: "move_to_ready" },
+        { link_id: "postures", name: "move_to_home" },
+        // One dataset episode per goal; cancelling stops and saves it.
+        { link_id: "recorder", name: "record_episode" },
+      ],
+    },
+  },
+  execution: {
+    language: "python",
+    container: {
+      def_file: "apptainer.def",
+    },
+    parameters: {
+      // Rate (Hz, 1..=1000) the per-hand setpoint streams publish at while
+      // engaged.
+      command_rate_hz: "u32",
+      // Where the WebXR page is served (always TLS, self-generated cert).
+      https_port: { $type: "u32", $default: 4443 },
+      https_host: { $type: "string", $default: "0.0.0.0" },
+      // Hand travel to end-effector travel. Orientation is never scaled.
+      motion_scale: { $type: "f64", $default: 1.0 },
+      // Opening commanded at a released trigger; a pull spans [0, this].
+      gripper_open_fraction: { $type: "f64", $default: 1.0 },
+      // Requested duration (s) of a posture move; 0 = fastest.
+      posture_move_duration_s: { $type: "f64", $default: 2.0 },
+      // Oldest headset frame or measured follower pose still trusted (s);
+      // older input reads as absent.
+      stale_timeout_s: { $type: "f64", $default: 0.25 },
+      // Widest video frame (px) relayed into the headset; 0 relays
+      // sensor-native frames.
+      view_max_width: { $type: "u32", $default: 640 },
+      // Draw a status panel in the headset (link and per-hand state) as an
+      // extra floating view. Off leaves the headset showing cameras only.
+      status_panel_enabled: { $type: "bool", $default: true },
+      // Camera instance id -> headset view name, "inst=view" comma-separated
+      // ("" = every camera shows under its instance id). The names
+      // "wrist_left"/"wrist_right" anchor those feeds to the controllers.
+      camera_names: { $type: "string", $default: "" },
+    },
+  },
+}

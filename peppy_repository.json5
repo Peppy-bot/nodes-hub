@@ -86,6 +86,11 @@
         path: "uvc_camera_video_reconstruction/rust/peppy.json5"
       }
     },
+    xr_commander: {
+      v1: {
+        path: "xr_commander/peppy.json5"
+      }
+    },
     zed_camera: {
       v1: {
         path: "zed_camera/peppy.json5"
