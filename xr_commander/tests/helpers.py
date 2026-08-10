@@ -23,7 +23,6 @@ def default_parameters(**overrides) -> SimpleNamespace:
         "stale_timeout_s": 10.0,
         "view_max_width": 640,
         "status_panel_enabled": True,
-        "camera_names": "",
     }
     values.update(overrides)
     return SimpleNamespace(**values)

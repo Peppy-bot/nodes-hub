@@ -56,10 +56,11 @@ A link value names the peer instance, plus `/slot` when the peer exposes more
 than one slot of that pairing (this backbone has one per side); the camera
 slots take a list, since any number of producers may bind.
 
-Each bound camera streams under its instance id by default. The `camera_names`
-parameter ("instance=view" pairs, comma-separated) renames tracks for the
-headset; the view names `wrist_left` and `wrist_right` are special, anchoring
-those panels to the controllers instead of floating them.
+Each bound camera streams under its instance id, so the launcher's instance
+naming is the headset's view naming. The names `wrist_left` and `wrist_right`
+are special: those panels anchor to the controllers instead of floating, so
+name the wrist camera instances exactly that to get anchoring. `status` is
+reserved for the panel.
 
 ## Operating it
 
@@ -134,9 +135,9 @@ installed.
 `command_rate_hz` sets the setpoint stream rate. The feel knobs are
 `motion_scale` (hand-to-EE travel scale) and `gripper_open_fraction` (where a
 released trigger rests). `stale_timeout_s` is the deadman on a frozen or
-disconnected headset. `camera_names` maps camera instances to headset view
-names, and `status_panel_enabled` draws the status
-panel. See `peppy.json5` for the full list and defaults.
+disconnected headset. `view_max_width` bounds what the headset encoder is fed,
+and `status_panel_enabled` draws the status panel. See `peppy.json5` for the
+full list and defaults.
 
 ## Development
 

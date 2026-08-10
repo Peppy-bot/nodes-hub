@@ -15,7 +15,6 @@ BASE = {
     "stale_timeout_s": 0.25,
     "view_max_width": 640,
     "status_panel_enabled": True,
-    "camera_names": "",
 }
 
 
@@ -68,26 +67,6 @@ def test_posture_duration_allows_zero_for_fastest_and_refuses_the_rest():
             config.from_parameters(params(posture_move_duration_s=bad))
 
 
-def test_camera_names_parse_into_a_mapping():
-    settings = config.from_parameters(
-        params(camera_names="cam_a=wrist_left, cam_b=chest")
-    )
-    assert settings.camera_names == {"cam_a": "wrist_left", "cam_b": "chest"}
-
-
-def test_empty_camera_names_mean_no_renames():
-    assert config.from_parameters(params()).camera_names == {}
-
-
-@pytest.mark.parametrize(
-    "bad",
-    ["cam_a", "=wrist_left", "cam_a=", "cam_a=x,cam_a=y", "a=same,b=same"],
-)
-def test_malformed_or_colliding_camera_names_are_refused(bad):
-    with pytest.raises(ValueError, match="camera_names"):
-        config.from_parameters(params(camera_names=bad))
-
-
 @pytest.mark.parametrize("bad", [1, 0, "true", None])
 def test_a_non_boolean_panel_flag_is_refused(bad):
     with pytest.raises(ValueError, match="status_panel_enabled"):
@@ -136,7 +115,3 @@ def test_view_max_width_bounds_and_zero_disable():
         with pytest.raises(ValueError, match="view_max_width"):
             config.from_parameters(params(view_max_width=bad))
 
-
-def test_camera_names_must_be_a_string_not_coerced():
-    with pytest.raises(ValueError, match="camera_names must be a string"):
-        config.from_parameters(params(camera_names=123))

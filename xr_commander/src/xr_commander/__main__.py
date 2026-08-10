@@ -121,9 +121,7 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
         (
             label,
             topic_module,
-            video.discover_tracks(
-                node_runner, topic_module, ExternalVideoSource, settings.camera_names
-            ),
+            video.discover_tracks(node_runner, topic_module, ExternalVideoSource),
         )
         for label, topic_module in _CAMERA_SLOTS
     ]
@@ -131,18 +129,11 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
     # The status panel rides the same WebRTC path as a camera, so it shares the
     # one headset-name space and is refused a collision like any other track.
     panel_sink = ExternalVideoSource() if settings.status_panel_enabled else None
-    track_ids = [t.track_id for t in tracks]
+    track_ids = [t.instance_id for t in tracks]
     if panel_sink is not None:
         track_ids.append(panel.TRACK_ID)
     video.assert_unique_track_ids(track_ids)
-    for unbound in settings.camera_names.keys() - {t.instance_id for t in tracks}:
-        log(f"camera_names maps {unbound!r}, which is not bound")
-    described = ", ".join(
-        t.instance_id
-        if t.track_id == t.instance_id
-        else f"{t.instance_id}={t.track_id}"
-        for t in tracks
-    )
+    described = ", ".join(t.instance_id for t in tracks)
     log(f"{len(tracks)} camera track(s): {described or 'none'}")
 
     # One certificate per machine, reused so the browser's acceptance sticks.
@@ -154,7 +145,7 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
             "cannot create the TLS identity under ~/.xr_commander/tls "
             f"(unwritable home?): {e}"
         ) from e
-    video_sources = {t.track_id: t.sink for t in tracks}
+    video_sources = {t.instance_id: t.sink for t in tracks}
     if panel_sink is not None:
         video_sources[panel.TRACK_ID] = panel_sink
     session = XrSession(

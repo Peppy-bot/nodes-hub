@@ -96,10 +96,6 @@
       // Draw a status panel in the headset (link and per-hand state) as an
       // extra floating view. Off leaves the headset showing cameras only.
       status_panel_enabled: { $type: "bool", $default: true },
-      // Camera instance id -> headset view name, "inst=view" comma-separated
-      // ("" = every camera shows under its instance id). The names
-      // "wrist_left"/"wrist_right" anchor those feeds to the controllers.
-      camera_names: { $type: "string", $default: "" },
     },
   },
 }

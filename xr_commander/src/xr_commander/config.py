@@ -8,9 +8,7 @@ from __future__ import annotations
 
 import ipaddress
 import math
-from collections.abc import Mapping
 from dataclasses import dataclass
-from types import MappingProxyType
 
 
 def _finite(name: str, value: float) -> float:
@@ -84,35 +82,6 @@ def _flag(name: str, value) -> bool:
     return value
 
 
-def _string(name: str, value) -> str:
-    if not isinstance(value, str):
-        raise ValueError(f"{name} must be a string, got {value!r}")
-    return value
-
-
-def _camera_names(raw: str) -> Mapping[str, str]:
-    """Parse `camera_names` ("instance=view,instance=view") into a mapping.
-
-    View names must be unique: they become the headset's track ids, and two
-    tracks with one id would silently drop a camera.
-    """
-    entries = [e.strip() for e in raw.split(",") if e.strip()]
-    names: dict[str, str] = {}
-    for entry in entries:
-        instance, sep, view = (p.strip() for p in entry.partition("="))
-        if not sep or not instance or not view:
-            raise ValueError(
-                f"camera_names entry must be 'instance_id=view_name', got {entry!r}"
-            )
-        if instance in names:
-            raise ValueError(f"camera_names maps {instance!r} twice")
-        names[instance] = view
-    views = list(names.values())
-    if len(set(views)) != len(views):
-        raise ValueError(f"camera_names view names must be unique, got {views}")
-    return MappingProxyType(names)
-
-
 @dataclass(frozen=True)
 class Settings:
     command_rate_hz: int
@@ -128,9 +97,6 @@ class Settings:
     view_max_width: int
     # Whether the headset shows the node's status panel.
     status_panel_enabled: bool
-    # Camera instance id -> headset view name; see peppy.json5 for the wire
-    # syntax and the reserved wrist view names.
-    camera_names: Mapping[str, str]
 
     @property
     def tick_period_s(self) -> float:
@@ -157,5 +123,4 @@ def from_parameters(params) -> Settings:
             "view_max_width", params.view_max_width, 0, _MAX_VIEW_WIDTH_PX
         ),
         status_panel_enabled=_flag("status_panel_enabled", params.status_panel_enabled),
-        camera_names=_camera_names(_string("camera_names", params.camera_names)),
     )

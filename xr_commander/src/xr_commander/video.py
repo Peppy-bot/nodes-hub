@@ -80,14 +80,10 @@ CAMERA_VIEW = {"device": 0}
 
 @dataclass(frozen=True)
 class CameraTrack:
-    """One camera's headset track.
-
-    `instance_id` routes bus frames to the sink; `track_id` is the name the
-    headset sees.
-    """
+    """One camera's headset track: the instance id is also the view name the
+    headset sees."""
 
     instance_id: str
-    track_id: str
     sink: FrameSink
 
 
@@ -102,8 +98,8 @@ def assert_unique_track_ids(track_ids: Sequence[str]) -> None:
     duplicates = sorted({name for name in track_ids if track_ids.count(name) > 1})
     if duplicates:
         raise ValueError(
-            f"headset view names collide: {duplicates}. Each camera's view name "
-            "(camera_names) and the status panel's must be unique"
+            f"headset view names collide: {duplicates}. Camera instance ids "
+            "and the status panel's name must be unique"
         )
 
 
@@ -111,7 +107,6 @@ def discover_tracks(
     node_runner,
     topic_module,
     make_sink: Callable[[], FrameSink],
-    names: Mapping[str, str],
 ) -> list[CameraTrack]:
     """A track per camera bound to one slot, in binding order.
 
@@ -119,11 +114,7 @@ def discover_tracks(
     waiting track whenever its first frame arrives.
     """
     return [
-        CameraTrack(
-            instance_id=producer.instance_id,
-            track_id=names.get(producer.instance_id, producer.instance_id),
-            sink=make_sink(),
-        )
+        CameraTrack(instance_id=producer.instance_id, sink=make_sink())
         for producer in topic_module.bound_producers(node_runner)
     ]
 
@@ -226,7 +217,7 @@ async def watch_camera_silence(
                     dark.add(track.instance_id)
                     log(f"camera {track.instance_id} went silent; blanking its track")
                     try:
-                        track.sink.put_frame(no_signal_frame(track.track_id))
+                        track.sink.put_frame(no_signal_frame(track.instance_id))
                     except Exception as e:
                         # One refusing sink must not end the watch for the rest.
                         log(f"camera {track.instance_id} blank failed: {e!r}")

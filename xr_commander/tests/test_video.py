@@ -93,7 +93,7 @@ def test_the_view_shape_satisfies_the_installed_frontend_config():
 
 
 def test_colliding_track_ids_are_refused():
-    # A camera renamed onto the status panel's name collides exactly here.
+    # A camera instance named after the status panel collides exactly here.
     with pytest.raises(ValueError, match="collide"):
         assert_unique_track_ids(["chest", "chest"])
     assert_unique_track_ids(["chest", "status"])
@@ -107,17 +107,15 @@ class FakeTopics:
         return self._producers
 
 
-def discover(instance_ids, names=None):
+def discover(instance_ids):
     producers = [SimpleNamespace(instance_id=i) for i in instance_ids]
-    return discover_tracks(None, FakeTopics(producers), RecordingSink, names or {})
+    return discover_tracks(None, FakeTopics(producers), RecordingSink)
 
 
-def test_every_bound_producer_gets_a_track_named_through_the_mapping():
-    tracks = discover(["cam_a", "cam_b"], names={"cam_a": "wrist_left"})
-    assert [(t.instance_id, t.track_id) for t in tracks] == [
-        ("cam_a", "wrist_left"),
-        ("cam_b", "cam_b"),
-    ]
+def test_every_bound_producer_gets_a_track_named_by_its_instance():
+    tracks = discover(["cam_a", "cam_b"])
+    assert [t.instance_id for t in tracks] == ["cam_a", "cam_b"]
+    assert all(isinstance(t.sink, RecordingSink) for t in tracks)
 
 
 def bgr_message(width=1, height=1):
@@ -175,7 +173,7 @@ def test_no_signal_frame_is_drawn_and_sized():
 def test_a_silent_camera_is_blanked_once_and_recovery_logged(monkeypatch, capsys):
     monkeypatch.setattr(video, "_SILENCE_POLL_S", 0.01)
     sink = RecordingSink()
-    track = CameraTrack(instance_id="cam", track_id="wrist", sink=sink)
+    track = CameraTrack(instance_id="cam", sink=sink)
     health = {"cam": time.monotonic()}
     token = FakeToken()
 
@@ -199,7 +197,7 @@ def test_a_silent_camera_is_blanked_once_and_recovery_logged(monkeypatch, capsys
 def test_a_camera_that_never_produced_is_left_alone(monkeypatch):
     monkeypatch.setattr(video, "_SILENCE_POLL_S", 0.01)
     sink = RecordingSink()
-    track = CameraTrack(instance_id="cam", track_id="wrist", sink=sink)
+    track = CameraTrack(instance_id="cam", sink=sink)
     token = FakeToken()
 
     async def run():
