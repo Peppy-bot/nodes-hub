@@ -110,6 +110,15 @@ def test_the_face_buttons_parse_and_a_short_gamepad_reads_them_released():
     assert not hands["right"].primary_button
 
 
+def test_a_non_boolean_pressed_value_reads_as_released():
+    # bool("false") is True; a squeeze must never be conjured out of a
+    # malformed payload, so only the JSON boolean counts as held.
+    device = controller("left")
+    device["gamepad"]["buttons"][1]["pressed"] = "false"
+    hands = parse_hands([device])
+    assert hands["left"].squeezing is False
+
+
 def test_a_non_controller_or_unknown_handedness_is_skipped():
     devices = [
         {"role": "hand", "handedness": "left"},

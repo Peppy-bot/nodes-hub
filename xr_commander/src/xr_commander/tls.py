@@ -16,6 +16,7 @@ import socket
 from pathlib import Path
 
 from cryptography import x509
+from cryptography.exceptions import UnsupportedAlgorithm
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
@@ -163,6 +164,6 @@ def ensure_certificate(directory: Path) -> tuple[Path, Path]:
         try:
             if _reusable(cert_path, key_path):
                 return cert_path, key_path
-        except (ValueError, TypeError, OSError):
+        except (ValueError, TypeError, OSError, UnsupportedAlgorithm):
             pass  # missing, unreadable, or unparseable material: replace it
         return _generate(directory)

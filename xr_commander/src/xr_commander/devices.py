@@ -95,10 +95,14 @@ def gripper_opening(trigger: float, open_fraction: float) -> float:
 
 
 def _pressed(buttons: list, index: int) -> bool:
-    """A button's held state, False when the gamepad does not carry it."""
+    """A button's held state, False when the gamepad does not carry it.
+
+    Only the JSON boolean counts: any other type in browser-supplied JSON
+    (`"false"`, 1) reads as released, because a squeeze must never be
+    conjured out of a malformed payload."""
     if len(buttons) <= index:
         return False
-    return bool(buttons[index].get("pressed", False))
+    return buttons[index].get("pressed") is True
 
 
 def _parse_pose(pose_data: dict) -> Pose:

@@ -65,8 +65,8 @@ reserved for the panel.
 ## Operating it
 
 Open the URL the node prints at startup in the headset's browser and press
-**Enter VR**. Without a bound camera the scene is empty; the robot view is
-whatever camera you bind.
+**Enter VR**. Without a bound camera only the status panel shows (nothing at
+all with it disabled); the robot view is whatever camera you bind.
 
 - **Grip button**: the deadman and clutch, per hand. Squeeze to engage that
   hand, release to let go. While it is released the node publishes nothing at

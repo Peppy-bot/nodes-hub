@@ -202,16 +202,15 @@ async def watch_camera_silence(
 ) -> None:
     """Blank a track whose camera stopped delivering, and say so once.
 
-    Only a camera that has produced before is watched: a track with no frame
-    yet shows nothing, which is already honest.
+    A camera that has never produced is timed from the watcher's start, so a
+    dead camera reads NO SIGNAL instead of an indistinguishable blank panel.
     """
+    started = time.monotonic()
     dark: set[str] = set()
     async for _ in ticks(_SILENCE_POLL_S, token):
         now = time.monotonic()
         for track in tracks:
-            last = health.get(track.instance_id)
-            if last is None:
-                continue
+            last = health.get(track.instance_id, started)
             if now - last > silent_after_s:
                 if track.instance_id not in dark:
                     dark.add(track.instance_id)

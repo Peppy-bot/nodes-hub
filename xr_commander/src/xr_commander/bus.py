@@ -106,6 +106,10 @@ async def ticks(period_s: float, token: CancellationToken) -> AsyncIterator[None
         else:
             deadline = time.monotonic()
             await asyncio.sleep(0)
+        # Re-checked after the sleep: a shutdown that lands mid-wait must not
+        # buy one more tick of work.
+        if token.is_cancelled():
+            return
         yield
 
 

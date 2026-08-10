@@ -28,8 +28,9 @@ From: peppybot/python-uv-base:latest
 
     cd /opt/xr_commander
     uv python install
+    # --locked fails the build on a stale lockfile instead of re-resolving;
     # --no-dev keeps the test-only group out of the runtime image.
-    uv sync --no-editable --no-dev
+    uv sync --locked --no-editable --no-dev
 
 %runscript
     cd /opt/xr_commander

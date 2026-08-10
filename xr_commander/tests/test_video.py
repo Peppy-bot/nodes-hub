@@ -194,20 +194,24 @@ def test_a_silent_camera_is_blanked_once_and_recovery_logged(monkeypatch, capsys
     assert "recovered" in out
 
 
-def test_a_camera_that_never_produced_is_left_alone(monkeypatch):
+def test_a_camera_that_never_produces_is_blanked_from_the_watcher_start(monkeypatch):
+    # A dead camera and no camera look identical as a blank panel; the timer
+    # starts with the watcher so the panel says NO SIGNAL instead.
     monkeypatch.setattr(video, "_SILENCE_POLL_S", 0.01)
     sink = RecordingSink()
     track = CameraTrack(instance_id="cam", sink=sink)
     token = FakeToken()
 
     async def run():
-        task = asyncio.create_task(watch_camera_silence([track], {}, token, silent_after_s=0.01))
-        await asyncio.sleep(0.05)
+        task = asyncio.create_task(
+            watch_camera_silence([track], {}, token, silent_after_s=0.03)
+        )
+        await asyncio.sleep(0.09)
         token.cancel()
         await asyncio.wait_for(task, 1.0)
 
     asyncio.run(run())
-    assert sink.frames == []
+    assert len(sink.frames) == 1  # blanked once, not per poll
 
 
 def test_shrink_keeps_aspect_and_caps_width():

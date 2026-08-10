@@ -210,11 +210,24 @@ async def collect_ticks(period_s, token, limit, body_s=0.0):
 
 
 def test_the_pacer_holds_its_cadence_rather_than_adding_the_body_time():
-    # A naive sleep(period) per iteration would take limit * (period + body).
+    # 20 paced ticks take ~0.40s; a naive sleep(period) per iteration would
+    # add the body and take limit * (period + body) = 0.60s. The bound sits
+    # between with margin for a loaded runner.
     _count, elapsed = asyncio.run(
-        collect_ticks(0.02, NeverCancelledToken(), 5, body_s=0.01)
+        collect_ticks(0.02, NeverCancelledToken(), 20, body_s=0.01)
     )
-    assert elapsed < 0.135, f"cadence drifted with the body: {elapsed:.3f}s"
+    assert elapsed < 0.50, f"cadence drifted with the body: {elapsed:.3f}s"
+
+
+def test_a_cancel_landing_mid_sleep_buys_no_further_tick():
+    async def scenario():
+        token = FakeToken()
+        asyncio.get_running_loop().call_later(0.005, token.cancel)
+        count, _elapsed = await collect_ticks(0.05, token, limit=5)
+        return count
+
+    # The cancel lands during the first period's sleep, before any yield.
+    assert asyncio.run(scenario()) == 0
 
 
 def test_a_slipped_tick_resyncs_instead_of_bursting():
