@@ -17,7 +17,9 @@
     ],
     depends_on: {
       nodes: [
-        // Optional dataset recorder.
+        // Optional dataset recorder, driven from the headset: the face
+        // buttons start and stop episodes and finish the session, so an
+        // operator in VR records without breaking out of it.
         { name: "lerobot_recorder", tag: "v1", link_id: "recorder", cardinality: "zero_or_more" },
       ],
       contracts: [
