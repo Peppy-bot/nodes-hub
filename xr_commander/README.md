@@ -109,7 +109,7 @@ WebXR is only available in a secure context. Public CAs do not issue
 certificates for LAN addresses, so the node generates a self-signed
 certificate on first boot (kept in `~/.xr_commander/tls/` and reused, so the
 browser's one-time acceptance sticks across restarts) and always serves HTTPS.
-Two ways in:
+Two ways in, shown for the default `https_port` of 4443:
 
 - **Over the network**: open `https://<this machine's address>:4443` in the
   headset and click through the browser warning once.
@@ -146,7 +146,7 @@ are pure of peppy; `publish` imports the generated modules, so the full suite
 needs the synced environment (and nothing served):
 
 ```bash
-peppy node sync .   # resolves the peppygen/peppylib path dependencies uv needs
+peppy node sync   # resolves the peppygen/peppylib path dependencies uv needs
 uv run pytest
 ```
 
