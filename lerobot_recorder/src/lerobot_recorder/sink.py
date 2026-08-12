@@ -174,12 +174,14 @@ class Sink:
         robot_type: str,
         fps: int,
         image_writer_threads: int,
+        streaming_encoding: bool = False,
     ):
         self._root = root
         self._repo_id = repo_id
         self._robot_type = robot_type
         self._fps = fps
         self._image_writer_threads = image_writer_threads
+        self._streaming_encoding = streaming_encoding
         self._dataset = None
         self._finalized = False
 
@@ -218,6 +220,7 @@ class Sink:
                 # an unclean death loses the tabular data written since the
                 # last chunk rotation; the videos survive.
                 metadata_buffer_size=1,
+                streaming_encoding=self._streaming_encoding,
             )
 
         self._dataset = await asyncio.to_thread(_create)
@@ -257,6 +260,10 @@ class Sink:
                 repo_id=self._repo_id,
                 root=str(self._root),
                 image_writer_threads=self._image_writer_threads,
+                # Same encoder mode as `create`: resume() defaults to the
+                # staged-PNG path, so omitting this would silently make a
+                # resumed session slower than the one it continues.
+                streaming_encoding=self._streaming_encoding,
             )
             # resume() exposes no metadata_buffer_size knob and defaults to
             # buffering 10 episodes; create() flushes per save so info.json

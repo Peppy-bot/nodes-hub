@@ -235,6 +235,7 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
             robot_type=params.robot_type,
             fps=params.fps,
             image_writer_threads=params.image_writer_threads,
+            streaming_encoding=params.streaming_encoding,
         )
         mirror = (
             storage.Mirror(dest=target.s3, session_dir=session_dir, session_name=session_name)
