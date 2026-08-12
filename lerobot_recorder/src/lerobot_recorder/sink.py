@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -154,6 +155,23 @@ def _warn_on_unreadable_tail(dataset_root: Path) -> None:
         )
 
 
+def _remove_orphaned_encoder_dirs(dataset_root: Path) -> None:
+    """Drop the per-episode encoder scratch directories a hard stop leaves
+    behind. The streaming encoder writes the open episode into a mkdtemp
+    directory under the dataset root and moves it into the chunk file at save,
+    so any that survive belong to an episode that never saved: dead weight the
+    library's own interrupted-episode cleanup (staged images only) does not
+    cover, and bytes the s3 mirror would otherwise upload."""
+    for path in sorted(dataset_root.glob("tmp*")):
+        if not path.is_dir() or not any(path.glob("*_streaming.mp4")):
+            continue
+        try:
+            shutil.rmtree(path)
+            print(f"[recorder] removed orphaned encoder scratch {path.name}", flush=True)
+        except OSError as e:
+            print(f"[recorder] could not remove {path}: {e!r}", flush=True)
+
+
 def _vector_feature(names: list[str]) -> dict:
     return {"dtype": "float32", "shape": (len(names),), "names": names}
 
@@ -174,7 +192,7 @@ class Sink:
         robot_type: str,
         fps: int,
         image_writer_threads: int,
-        streaming_encoding: bool = False,
+        streaming_encoding: bool = True,
     ):
         self._root = root
         self._repo_id = repo_id
@@ -275,6 +293,7 @@ class Sink:
             # video. The library's own cleanup routine covers every camera
             # key, depth included.
             dataset.writer.cleanup_interrupted_episode(int(dataset.meta.total_episodes))
+            _remove_orphaned_encoder_dirs(self._root)
             return dataset
 
         self._dataset = await asyncio.to_thread(_resume)
@@ -307,10 +326,34 @@ class Sink:
             frame[f"observation.images.{key}"] = image
         self._dataset.add_frame(frame)
 
-    async def save_episode(self) -> None:
+    async def save_episode(self) -> str | None:
+        """Save the open episode. Returns why its video is untrustworthy, or
+        None when it is whole."""
         assert self._dataset is not None
         assert not self._finalized, "session finalized; no further episodes"
         await asyncio.to_thread(self._dataset.save_episode)
+        return self._dropped_video_frames()
+
+    def _dropped_video_frames(self) -> str | None:
+        """Frames the encoder threads could not keep up with, per camera.
+
+        The library's encoder queue is bounded: a full queue drops the frame
+        and logs, while the tabular row for it is still written, so an episode
+        can end with fewer video frames than state rows and nothing in the
+        dataset saying so. The counters reset when the next episode starts, so
+        this reads them straight after a save. Private attributes because the
+        library exposes no accessor; absent ones mean a build that cannot
+        drop, which reads as no drops rather than an error."""
+        encoder = getattr(getattr(self._dataset, "writer", None), "_streaming_encoder", None)
+        dropped = getattr(encoder, "_dropped_frames", None) or {}
+        lost = {key: count for key, count in dropped.items() if count}
+        if not lost:
+            return None
+        detail = ", ".join(f"{key} {count}" for key, count in sorted(lost.items()))
+        return (
+            f"encoder dropped video frames ({detail}); this episode's video is "
+            f"shorter than its state rows and should not be trained on"
+        )
 
     def discard_open_frames(self) -> None:
         """Drop whatever the open episode buffered. Also the recovery path

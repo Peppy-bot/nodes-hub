@@ -306,6 +306,95 @@ def test_resume_clears_stale_frame_staging(tmp_path):
     assert asyncio.run(resume_then_close())
 
 
+def test_resume_removes_orphaned_encoder_scratch(tmp_path):
+    """A hard stop mid-episode leaves the streaming encoder's scratch
+    directory behind. Nothing in the library sweeps it, so resume does: it
+    belongs to an episode that never saved, and the s3 mirror would upload it."""
+    first = _sink(tmp_path)
+    _record_one_episode_and_finalize(first)
+    orphan = tmp_path / "dataset" / "tmpdeadbeef"
+    orphan.mkdir(parents=True)
+    (orphan / "observation.images.cam0_streaming.mp4").write_bytes(b"partial")
+    # A scratch directory without an encoder file is not ours to delete.
+    bystander = tmp_path / "dataset" / "tmpsomethingelse"
+    bystander.mkdir(parents=True)
+    (bystander / "notes.txt").write_bytes(b"keep me")
+
+    resumed = _sink(tmp_path)
+
+    async def resume_then_close():
+        await resumed.resume(await resumed.preflight_resume(), schema_with_camera(), camera_plan())
+        swept = not orphan.exists()
+        await resumed.finalize()
+        return swept
+
+    assert asyncio.run(resume_then_close())
+    assert bystander.exists(), "only the encoder's own scratch is swept"
+
+
+def test_save_episode_reports_dropped_video_frames(tmp_path):
+    """A full encoder queue drops video frames while the tabular row is still
+    written, so the episode ends with fewer video frames than state rows. The
+    save has to say so; nothing else in the dataset records it."""
+    sink = _sink(tmp_path)
+
+    async def record_with_a_drop():
+        await sink.create(schema_with_camera(), camera_plan())
+        for i in range(FRAMES):
+            sink.add_frame(row(i), task="smoke")
+        encoder = sink._dataset.writer._streaming_encoder
+        assert encoder is not None, "the default sink streams"
+        encoder._dropped_frames["observation.images.cam0"] = 3
+        dropped = await sink.save_episode()
+        await sink.finalize()
+        return dropped
+
+    reported = asyncio.run(record_with_a_drop())
+    assert reported is not None
+    assert "observation.images.cam0 3" in reported
+    assert "should not be trained on" in reported
+
+
+def test_save_episode_reports_nothing_when_no_frames_are_dropped(tmp_path):
+    sink = _sink(tmp_path)
+
+    async def record_clean():
+        await sink.create(schema_with_camera(), camera_plan())
+        for i in range(FRAMES):
+            sink.add_frame(row(i), task="smoke")
+        dropped = await sink.save_episode()
+        await sink.finalize()
+        return dropped
+
+    assert asyncio.run(record_clean()) is None
+
+
+def test_staged_encoding_has_no_streaming_encoder(tmp_path):
+    """Turning the option off puts the session back on the staged-PNG path,
+    whose writer queue is unbounded and therefore cannot drop a frame."""
+    sink = Sink(
+        root=tmp_path / "dataset",
+        repo_id="test/session",
+        robot_type="bot",
+        fps=FPS,
+        image_writer_threads=2,
+        streaming_encoding=False,
+    )
+
+    async def record_staged():
+        await sink.create(schema_with_camera(), camera_plan())
+        for i in range(FRAMES):
+            sink.add_frame(row(i), task="smoke")
+        staged = sink._dataset.writer._streaming_encoder is None
+        dropped = await sink.save_episode()
+        await sink.finalize()
+        return staged, dropped
+
+    staged, dropped = asyncio.run(record_staged())
+    assert staged
+    assert dropped is None
+
+
 def test_resume_refuses_incompatible_live_sources(tmp_path):
     first = _sink(tmp_path)
     _record_one_episode_and_finalize(first)

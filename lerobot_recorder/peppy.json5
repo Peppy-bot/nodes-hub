@@ -170,13 +170,15 @@
       // robot stack sharing the host. Must be at least 1: at zero the
       // library encodes inline and stalls the sampling loop.
       image_writer_threads: { $type: "u32", $default: 4 },
-      // Encode frames straight to video during capture instead of staging
-      // one PNG per frame and encoding at episode end. The library runs one
-      // encoder thread per camera and PyAV releases the GIL, so encoding
-      // overlaps capture and the per-episode save stops paying for the PNG
-      // round trip. An unclean death loses the open episode's video, where
-      // the staged PNGs would have survived it.
-      streaming_encoding: { $type: "bool", $default: false },
+      // Encode frames to video during capture instead of staging one PNG per
+      // frame and encoding at episode end, which costs seconds of dead time
+      // between takes. The encoder's frame queue is bounded, so a host that
+      // cannot encode at the capture rate drops video frames while the
+      // tabular rows are still written; the episode result reports any drop.
+      // Turn this off on a host that cannot keep up: the staged path queues
+      // without bound instead, so it never drops, it only makes the operator
+      // wait.
+      streaming_encoding: { $type: "bool", $default: true },
       // Newest acceptable source age in seconds, links and cameras alike.
       // A goal is refused until every source is this fresh; a source
       // exceeding it mid-episode ends the episode with a save. Without
