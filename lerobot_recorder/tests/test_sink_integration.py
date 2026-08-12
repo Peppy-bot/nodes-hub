@@ -332,46 +332,36 @@ def test_resume_removes_orphaned_encoder_scratch(tmp_path):
     assert bystander.exists(), "only the encoder's own scratch is swept"
 
 
-def test_save_episode_reports_dropped_video_frames(tmp_path):
-    """A full encoder queue drops video frames while the tabular row is still
-    written, so the episode ends with fewer video frames than state rows. The
-    save has to say so; nothing else in the dataset records it."""
+def test_save_episode_reports_a_short_video(tmp_path):
+    """A real save is checked against the metadata the library itself wrote,
+    so a genuinely recorded episode passes, and shortening that episode's
+    video span reads exactly as an encoder that dropped the difference."""
     sink = _sink(tmp_path)
+    key = "observation.images.cam0"
 
-    async def record_with_a_drop():
+    async def record_then_shorten():
         await sink.create(schema_with_camera(), camera_plan())
         for i in range(FRAMES):
             sink.add_frame(row(i), task="smoke")
-        encoder = sink._dataset.writer._streaming_encoder
-        assert encoder is not None, "the default sink streams"
-        encoder._dropped_frames["observation.images.cam0"] = 3
-        dropped = await sink.save_episode()
+        whole = await sink.save_episode()
+        latest = sink._dataset.meta.latest_episode
+        start = latest[f"videos/{key}/from_timestamp"][0]
+        latest[f"videos/{key}/to_timestamp"] = [start + (FRAMES - 3) / FPS]
+        short = sink._short_video_report()
         await sink.finalize()
-        return dropped
+        return whole, short
 
-    reported = asyncio.run(record_with_a_drop())
-    assert reported is not None
-    assert "observation.images.cam0 3" in reported
-    assert "should not be trained on" in reported
-
-
-def test_save_episode_reports_nothing_when_no_frames_are_dropped(tmp_path):
-    sink = _sink(tmp_path)
-
-    async def record_clean():
-        await sink.create(schema_with_camera(), camera_plan())
-        for i in range(FRAMES):
-            sink.add_frame(row(i), task="smoke")
-        dropped = await sink.save_episode()
-        await sink.finalize()
-        return dropped
-
-    assert asyncio.run(record_clean()) is None
+    whole, short = asyncio.run(record_then_shorten())
+    assert whole is None, "the episode as recorded covers every row"
+    assert short is not None
+    assert f"{key} 3" in short
+    assert "should not be trained on" in short
 
 
-def test_staged_encoding_has_no_streaming_encoder(tmp_path):
+def test_staged_encoding_saves_a_whole_video(tmp_path):
     """Turning the option off puts the session back on the staged-PNG path,
-    whose writer queue is unbounded and therefore cannot drop a frame."""
+    whose writer queue is unbounded and therefore cannot drop a frame. The
+    same check covers it, because it reads the saved episode either way."""
     sink = Sink(
         root=tmp_path / "dataset",
         repo_id="test/session",
@@ -386,13 +376,13 @@ def test_staged_encoding_has_no_streaming_encoder(tmp_path):
         for i in range(FRAMES):
             sink.add_frame(row(i), task="smoke")
         staged = sink._dataset.writer._streaming_encoder is None
-        dropped = await sink.save_episode()
+        report = await sink.save_episode()
         await sink.finalize()
-        return staged, dropped
+        return staged, report
 
-    staged, dropped = asyncio.run(record_staged())
+    staged, report = asyncio.run(record_staged())
     assert staged
-    assert dropped is None
+    assert report is None
 
 
 def test_resume_refuses_incompatible_live_sources(tmp_path):

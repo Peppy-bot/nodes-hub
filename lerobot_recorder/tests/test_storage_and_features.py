@@ -6,7 +6,12 @@ import pytest
 
 from lerobot_recorder.plan import assign_camera_names, sanitize_key
 from lerobot_recorder.recording import GRIPPER_LAYOUT, LinkLayout, SourceSchema
-from lerobot_recorder.sink import Sink, build_features, features_mismatch
+from lerobot_recorder.sink import (
+    Sink,
+    build_features,
+    features_mismatch,
+    missing_video_frames,
+)
 from lerobot_recorder.storage import (
     FRAME_STAGING_DIR,
     Mirror,
@@ -280,3 +285,43 @@ def test_a_failed_finalize_can_be_retried(tmp_path):
     asyncio.run(sink.finalize())
     asyncio.run(sink.finalize())
     assert closes["n"] == 2, "retried after the failure, latched after the success"
+
+
+def episode_metadata(rows: int, spans: dict[str, tuple[float, float]]) -> dict:
+    """An episode's metadata row in the shape the library buffers it: every
+    value a single-element list."""
+    meta = {"length": [rows]}
+    for key, (start, end) in spans.items():
+        meta[f"videos/{key}/from_timestamp"] = [start]
+        meta[f"videos/{key}/to_timestamp"] = [end]
+    return meta
+
+
+def test_missing_video_frames_accepts_a_whole_episode():
+    meta = episode_metadata(30, {"cam0": (0.0, 1.0)})
+    assert missing_video_frames(meta, ["cam0"], 30) == {}
+
+
+def test_missing_video_frames_counts_the_shortfall():
+    """27 frames encoded against the 30 rows written."""
+    meta = episode_metadata(30, {"cam0": (0.0, 0.9)})
+    assert missing_video_frames(meta, ["cam0"], 30) == {"cam0": 3}
+
+
+def test_missing_video_frames_measures_the_span_not_the_end():
+    """Every episode after the first starts partway into its chunk file, so
+    reading the end timestamp alone would call a whole episode short."""
+    meta = episode_metadata(30, {"cam0": (14.6, 15.6)})
+    assert missing_video_frames(meta, ["cam0"], 30) == {}
+
+
+def test_missing_video_frames_reports_each_camera_separately():
+    meta = episode_metadata(30, {"cam0": (2.0, 3.0), "cam1": (2.0, 2.8)})
+    assert missing_video_frames(meta, ["cam0", "cam1"], 30) == {"cam1": 6}
+
+
+def test_missing_video_frames_counts_an_absent_video_as_wholly_missing():
+    """A camera the save left no video metadata for is the same defect in its
+    most complete form, not a camera to skip."""
+    meta = episode_metadata(30, {"cam0": (0.0, 1.0)})
+    assert missing_video_frames(meta, ["cam0", "cam1"], 30) == {"cam1": 30}

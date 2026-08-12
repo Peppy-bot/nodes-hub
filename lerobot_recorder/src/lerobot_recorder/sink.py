@@ -172,6 +172,37 @@ def _remove_orphaned_encoder_dirs(dataset_root: Path) -> None:
             print(f"[recorder] could not remove {path}: {e!r}", flush=True)
 
 
+def missing_video_frames(latest_episode: dict, video_keys: list[str], fps: int) -> dict[str, int]:
+    """Per camera, how many of the episode's rows ended up with no video frame.
+
+    The encoder drops frames it cannot keep up with while the tabular row for
+    each one is still written, so an episode can end holding a video shorter
+    than its own state rows. The library records both numbers as it saves:
+    `length` counts the rows, and the video timestamps span the encoded file,
+    measured off the mp4 rather than derived from the row count. They disagree
+    exactly when frames went missing, whatever the cause, a full encoder queue
+    and a dead encoder thread alike.
+
+    Values arrive as single-element lists, the shape the library buffers
+    episode metadata in."""
+    rows = int(latest_episode["length"][0])
+    covered = ((key, _encoded_frame_count(latest_episode, key, fps)) for key in video_keys)
+    return {key: rows - frames for key, frames in covered if frames < rows}
+
+
+def _encoded_frame_count(latest_episode: dict, video_key: str, fps: int) -> int:
+    """Frames this episode contributed to its camera's video file. Zero when
+    the save left no video metadata at all for the camera, which is the same
+    defect in its most complete form."""
+    start = latest_episode.get(f"videos/{video_key}/from_timestamp")
+    end = latest_episode.get(f"videos/{video_key}/to_timestamp")
+    if start is None or end is None:
+        return 0
+    # Exact: the encoder timestamps frame n at n/fps, so the span a whole
+    # episode covers is its frame count over fps.
+    return round((end[0] - start[0]) * fps)
+
+
 def _vector_feature(names: list[str]) -> dict:
     return {"dtype": "float32", "shape": (len(names),), "names": names}
 
@@ -332,27 +363,21 @@ class Sink:
         assert self._dataset is not None
         assert not self._finalized, "session finalized; no further episodes"
         await asyncio.to_thread(self._dataset.save_episode)
-        return self._dropped_video_frames()
+        return self._short_video_report()
 
-    def _dropped_video_frames(self) -> str | None:
-        """Frames the encoder threads could not keep up with, per camera.
-
-        The library's encoder queue is bounded: a full queue drops the frame
-        and logs, while the tabular row for it is still written, so an episode
-        can end with fewer video frames than state rows and nothing in the
-        dataset saying so. The counters reset when the next episode starts, so
-        this reads them straight after a save. Private attributes because the
-        library exposes no accessor; absent ones mean a build that cannot
-        drop, which reads as no drops rather than an error."""
-        encoder = getattr(getattr(self._dataset, "writer", None), "_streaming_encoder", None)
-        dropped = getattr(encoder, "_dropped_frames", None) or {}
-        lost = {key: count for key, count in dropped.items() if count}
-        if not lost:
+    def _short_video_report(self) -> str | None:
+        """Name the cameras whose video came up short, or None when every one
+        of them covers the episode."""
+        meta = self._dataset.meta
+        latest = meta.latest_episode
+        assert latest is not None, "metadata_buffer_size=1 flushes the episode on every save"
+        missing = missing_video_frames(latest, meta.video_keys, meta.fps)
+        if not missing:
             return None
-        detail = ", ".join(f"{key} {count}" for key, count in sorted(lost.items()))
+        detail = ", ".join(f"{key} {count}" for key, count in sorted(missing.items()))
         return (
-            f"encoder dropped video frames ({detail}); this episode's video is "
-            f"shorter than its state rows and should not be trained on"
+            f"video is shorter than the state rows ({detail} frame(s) missing); "
+            f"this episode should not be trained on"
         )
 
     def discard_open_frames(self) -> None:

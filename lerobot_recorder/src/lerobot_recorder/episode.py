@@ -556,7 +556,7 @@ class Recorder:
             )
             return
         try:
-            dropped = await self._sink.save_episode()
+            short_video = await self._sink.save_episode()
         except Exception as e:
             # The library's buffer is unusable after a failed save; drop it
             # so the next goal starts clean.
@@ -571,16 +571,16 @@ class Recorder:
             )
             return
         self._kick_mirror()
-        # A dropped video frame outranks whatever ended the episode: the
-        # episode saved, but its video no longer lines up with its rows, and
-        # that is the one thing the operator has to know before training on it.
+        # A short video outranks whatever ended the episode: the episode
+        # saved, but its video no longer lines up with its rows, and that is
+        # the one thing the operator has to know before training on it.
         await self._complete(
             ctx,
             cancelled,
             episode_index=episode_index,
             frames=frames,
             discarded=False,
-            error=dropped or end_error,
+            error=short_video or end_error,
         )
 
     def _append_frame(self, row, pending, task: str) -> None:
