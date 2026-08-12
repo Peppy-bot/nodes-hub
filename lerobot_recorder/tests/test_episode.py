@@ -42,7 +42,15 @@ def goal_request(task="t"):
 
 
 class FakeSink:
-    def __init__(self, fps=100, fail_save=0, fail_add=False, add_delay_s=0.0, created=True):
+    def __init__(
+        self,
+        fps=100,
+        fail_save=0,
+        fail_add=False,
+        add_delay_s=0.0,
+        created=True,
+        short_video=None,
+    ):
         self.fps = fps
         self.created = created
         self.frames = 0
@@ -59,6 +67,7 @@ class FakeSink:
         self._fail_save = fail_save
         self._fail_add = fail_add
         self._add_delay_s = add_delay_s
+        self._short_video = short_video
 
     @property
     def episodes_saved(self) -> int:
@@ -80,12 +89,13 @@ class FakeSink:
             time.sleep(self._add_delay_s)
         self.frames += 1
 
-    async def save_episode(self) -> None:
+    async def save_episode(self) -> str | None:
         assert self.created and not self.finalized, "saving needs an open dataset"
         if self._fail_save > 0:
             self._fail_save -= 1
             raise OSError("disk full")
         self.saves += 1
+        return self._short_video
 
     def discard_open_frames(self) -> None:
         assert self.created, "discarding needs an open dataset"
@@ -985,3 +995,26 @@ def test_finish_session_keeps_the_session_when_finalize_fails(tmp_path):
         assert not recorder._finishing
 
     asyncio.run(run())
+
+
+def test_short_video_outranks_the_ordinary_ending_and_is_logged(tmp_path, capsys):
+    """The episode saved, so it is not discarded, but its video no longer
+    covers its rows. That outranks whatever ended the episode in the result,
+    and the run log keeps it after the panel's status line has moved on."""
+    plan = arm_plan()
+    sink = FakeSink(short_video="video is shorter than the state rows (cam0 3 frame(s) missing)")
+    recorder, cache = recorder_with(plan, sink, tmp_path)
+
+    async def run():
+        cache.links[ARM0] = fresh_joints()
+        recorder._schema = capture_now(cache, plan)
+        ctx = FakeCtx()
+        await recorder._record(ctx, FakeToken())
+        kind, index, _frames, discarded, error = ctx.completions[0]
+        assert (kind, index, discarded) == ("done", 0, False)
+        assert error is not None
+        assert "cam0 3" in error, "the short video, not the stale source that ended the episode"
+        assert sink.saves == 1, "a short video is still a saved episode"
+
+    asyncio.run(run())
+    assert "cam0 3" in capsys.readouterr().out

@@ -571,6 +571,11 @@ class Recorder:
             )
             return
         self._kick_mirror()
+        if short_video is not None:
+            # The result reaches a panel status line that the next action
+            # overwrites, so the run log is what an operator still has after
+            # the session to tell which episode came up short.
+            print(f"[recorder] episode {episode_index}: {short_video}", flush=True)
         # A short video outranks whatever ended the episode: the episode
         # saved, but its video no longer lines up with its rows, and that is
         # the one thing the operator has to know before training on it.
