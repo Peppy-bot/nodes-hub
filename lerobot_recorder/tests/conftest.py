@@ -137,6 +137,7 @@ def _install_fake_peppygen() -> None:
         storage_root: str = "/tmp/unused"
         s3_uri: str = ""
         image_writer_threads: int = 1
+        streaming_encoding: bool = True
         max_staleness_s: float = 0.5
         min_remaining_disk_bytes: int = 1
 

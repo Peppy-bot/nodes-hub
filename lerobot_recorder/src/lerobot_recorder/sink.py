@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -154,6 +155,54 @@ def _warn_on_unreadable_tail(dataset_root: Path) -> None:
         )
 
 
+def _remove_orphaned_encoder_dirs(dataset_root: Path) -> None:
+    """Drop the per-episode encoder scratch directories a hard stop leaves
+    behind. The streaming encoder writes the open episode into a mkdtemp
+    directory under the dataset root and moves it into the chunk file at save,
+    so any that survive belong to an episode that never saved: dead weight the
+    library's own interrupted-episode cleanup (staged images only) does not
+    cover, and bytes the s3 mirror would otherwise upload."""
+    for path in sorted(dataset_root.glob("tmp*")):
+        if not path.is_dir() or not any(path.glob("*_streaming.mp4")):
+            continue
+        try:
+            shutil.rmtree(path)
+            print(f"[recorder] removed orphaned encoder scratch {path.name}", flush=True)
+        except OSError as e:
+            print(f"[recorder] could not remove {path}: {e!r}", flush=True)
+
+
+def missing_video_frames(latest_episode: dict, video_keys: list[str], fps: int) -> dict[str, int]:
+    """Per camera, how many of the episode's rows ended up with no video frame.
+
+    The encoder drops frames it cannot keep up with while the tabular row for
+    each one is still written, so an episode can end holding a video shorter
+    than its own state rows. The library records both numbers as it saves:
+    `length` counts the rows, and the video timestamps span the encoded file,
+    measured off the mp4 rather than derived from the row count. They disagree
+    exactly when frames went missing, whatever the cause, a full encoder queue
+    and a dead encoder thread alike.
+
+    Values arrive as single-element lists, the shape the library buffers
+    episode metadata in."""
+    rows = int(latest_episode["length"][0])
+    covered = ((key, _encoded_frame_count(latest_episode, key, fps)) for key in video_keys)
+    return {key: rows - frames for key, frames in covered if frames < rows}
+
+
+def _encoded_frame_count(latest_episode: dict, video_key: str, fps: int) -> int:
+    """Frames this episode contributed to its camera's video file. Zero when
+    the save left no video metadata at all for the camera, which is the same
+    defect in its most complete form."""
+    start = latest_episode.get(f"videos/{video_key}/from_timestamp")
+    end = latest_episode.get(f"videos/{video_key}/to_timestamp")
+    if start is None or end is None:
+        return 0
+    # Exact: the encoder timestamps frame n at n/fps, so the span a whole
+    # episode covers is its frame count over fps.
+    return round((end[0] - start[0]) * fps)
+
+
 def _vector_feature(names: list[str]) -> dict:
     return {"dtype": "float32", "shape": (len(names),), "names": names}
 
@@ -174,12 +223,14 @@ class Sink:
         robot_type: str,
         fps: int,
         image_writer_threads: int,
+        streaming_encoding: bool,
     ):
         self._root = root
         self._repo_id = repo_id
         self._robot_type = robot_type
         self._fps = fps
         self._image_writer_threads = image_writer_threads
+        self._streaming_encoding = streaming_encoding
         self._dataset = None
         self._finalized = False
 
@@ -218,6 +269,7 @@ class Sink:
                 # an unclean death loses the tabular data written since the
                 # last chunk rotation; the videos survive.
                 metadata_buffer_size=1,
+                streaming_encoding=self._streaming_encoding,
             )
 
         self._dataset = await asyncio.to_thread(_create)
@@ -257,6 +309,10 @@ class Sink:
                 repo_id=self._repo_id,
                 root=str(self._root),
                 image_writer_threads=self._image_writer_threads,
+                # Same encoder mode as `create`: resume() defaults to the
+                # staged-PNG path, so omitting this would silently make a
+                # resumed session slower than the one it continues.
+                streaming_encoding=self._streaming_encoding,
             )
             # resume() exposes no metadata_buffer_size knob and defaults to
             # buffering 10 episodes; create() flushes per save so info.json
@@ -268,6 +324,7 @@ class Sink:
             # video. The library's own cleanup routine covers every camera
             # key, depth included.
             dataset.writer.cleanup_interrupted_episode(int(dataset.meta.total_episodes))
+            _remove_orphaned_encoder_dirs(self._root)
             return dataset
 
         self._dataset = await asyncio.to_thread(_resume)
@@ -300,10 +357,29 @@ class Sink:
             frame[f"observation.images.{key}"] = image
         self._dataset.add_frame(frame)
 
-    async def save_episode(self) -> None:
+    async def save_episode(self) -> str | None:
+        """Save the open episode. Returns the reason its video cannot be
+        trusted, an operator-grade sentence, or None when the video covers
+        every row the episode wrote."""
         assert self._dataset is not None
         assert not self._finalized, "session finalized; no further episodes"
         await asyncio.to_thread(self._dataset.save_episode)
+        return self._video_error()
+
+    def _video_error(self) -> str | None:
+        """Name the cameras whose video came up short, or None when every one
+        of them covers the episode."""
+        meta = self._dataset.meta
+        latest = meta.latest_episode
+        assert latest is not None, "metadata_buffer_size=1 flushes the episode on every save"
+        missing = missing_video_frames(latest, meta.video_keys, meta.fps)
+        if not missing:
+            return None
+        detail = ", ".join(f"{key} {count}" for key, count in sorted(missing.items()))
+        return (
+            f"video is shorter than the state rows ({detail} frame(s) missing); "
+            f"this episode should not be trained on"
+        )
 
     def discard_open_frames(self) -> None:
         """Drop whatever the open episode buffered. Also the recovery path

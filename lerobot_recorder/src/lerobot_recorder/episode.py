@@ -556,7 +556,7 @@ class Recorder:
             )
             return
         try:
-            await self._sink.save_episode()
+            video_error = await self._sink.save_episode()
         except Exception as e:
             # The library's buffer is unusable after a failed save; drop it
             # so the next goal starts clean.
@@ -571,8 +571,21 @@ class Recorder:
             )
             return
         self._kick_mirror()
+        if video_error is not None:
+            # The result reaches a panel status line that the next action
+            # overwrites, so the run log is what an operator still has after
+            # the session to tell which episode came up short.
+            print(f"[recorder] episode {episode_index}: {video_error}", flush=True)
+        # A short video outranks whatever ended the episode: the episode
+        # saved, but its video no longer lines up with its rows, and that is
+        # the one thing the operator has to know before training on it.
         await self._complete(
-            ctx, cancelled, episode_index=episode_index, frames=frames, discarded=False, error=end_error
+            ctx,
+            cancelled,
+            episode_index=episode_index,
+            frames=frames,
+            discarded=False,
+            error=video_error or end_error,
         )
 
     def _append_frame(self, row, pending, task: str) -> None:

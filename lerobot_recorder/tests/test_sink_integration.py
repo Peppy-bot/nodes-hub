@@ -69,7 +69,7 @@ def row(i: int) -> FrameRow:
 @requires_video_decode
 def test_record_two_episodes_finalize_reload(tmp_path):
     plan = camera_plan()
-    sink = Sink(root=tmp_path / "dataset", repo_id="test/session", robot_type="bot", fps=FPS, image_writer_threads=2)
+    sink = _sink(tmp_path)
 
     async def record():
         await sink.create(schema_with_camera(), plan)
@@ -98,7 +98,7 @@ def test_record_two_episodes_finalize_reload(tmp_path):
 
 def test_add_frame_refused_after_finalize(tmp_path):
     plan = camera_plan()
-    sink = Sink(root=tmp_path / "dataset", repo_id="test/session", robot_type="bot", fps=FPS, image_writer_threads=2)
+    sink = _sink(tmp_path)
 
     async def run():
         await sink.create(schema_with_camera(), plan)
@@ -116,7 +116,7 @@ def test_failed_save_recovers_via_discard(tmp_path):
     """The library's episode buffer is unusable after a failed save;
     discard_open_frames must bring the sink back for the next episode."""
     plan = camera_plan()
-    sink = Sink(root=tmp_path / "dataset", repo_id="test/session", robot_type="bot", fps=FPS, image_writer_threads=2)
+    sink = _sink(tmp_path)
 
     async def run():
         await sink.create(schema_with_camera(), plan)
@@ -150,7 +150,7 @@ def test_failed_save_recovers_via_discard(tmp_path):
 
 def test_zero_frame_episode_discards(tmp_path):
     plan = make_plan(state=(joint_entry(),))
-    sink = Sink(root=tmp_path / "dataset", repo_id="test/session", robot_type="bot", fps=FPS, image_writer_threads=2)
+    sink = _sink(tmp_path)
     schema = SourceSchema(
         layouts=(ARM_LAYOUT,),
         action_layouts=(),
@@ -173,13 +173,14 @@ async def _resume_now(sink: Sink, schema, plan) -> None:
     await sink.resume(await sink.preflight_resume(), schema, plan)
 
 
-def _sink(tmp_path) -> Sink:
+def _sink(tmp_path, streaming_encoding: bool = True) -> Sink:
     return Sink(
         root=tmp_path / "dataset",
         repo_id="test/session",
         robot_type="bot",
         fps=FPS,
         image_writer_threads=2,
+        streaming_encoding=streaming_encoding,
     )
 
 
@@ -306,6 +307,78 @@ def test_resume_clears_stale_frame_staging(tmp_path):
     assert asyncio.run(resume_then_close())
 
 
+def test_resume_removes_orphaned_encoder_scratch(tmp_path):
+    """A hard stop mid-episode leaves the streaming encoder's scratch
+    directory behind. Nothing in the library sweeps it, so resume does: it
+    belongs to an episode that never saved, and the s3 mirror would upload it."""
+    first = _sink(tmp_path)
+    _record_one_episode_and_finalize(first)
+    orphan = tmp_path / "dataset" / "tmpdeadbeef"
+    orphan.mkdir(parents=True)
+    (orphan / "observation.images.cam0_streaming.mp4").write_bytes(b"partial")
+    # A scratch directory without an encoder file is not ours to delete.
+    bystander = tmp_path / "dataset" / "tmpsomethingelse"
+    bystander.mkdir(parents=True)
+    (bystander / "notes.txt").write_bytes(b"keep me")
+
+    resumed = _sink(tmp_path)
+
+    async def resume_then_close():
+        await resumed.resume(await resumed.preflight_resume(), schema_with_camera(), camera_plan())
+        swept = not orphan.exists()
+        await resumed.finalize()
+        return swept
+
+    assert asyncio.run(resume_then_close())
+    assert bystander.exists(), "only the encoder's own scratch is swept"
+
+
+def test_save_episode_reports_a_short_video(tmp_path):
+    """A real save is checked against the metadata the library itself wrote,
+    so a genuinely recorded episode passes, and shortening that episode's
+    video span reads exactly as an encoder that dropped the difference."""
+    sink = _sink(tmp_path)
+    key = "observation.images.cam0"
+
+    async def record_then_shorten():
+        await sink.create(schema_with_camera(), camera_plan())
+        for i in range(FRAMES):
+            sink.add_frame(row(i), task="smoke")
+        whole = await sink.save_episode()
+        latest = sink._dataset.meta.latest_episode
+        start = latest[f"videos/{key}/from_timestamp"][0]
+        latest[f"videos/{key}/to_timestamp"] = [start + (FRAMES - 3) / FPS]
+        short = sink._video_error()
+        await sink.finalize()
+        return whole, short
+
+    whole, short = asyncio.run(record_then_shorten())
+    assert whole is None, "the episode as recorded covers every row"
+    assert short is not None
+    assert f"{key} 3" in short
+    assert "should not be trained on" in short
+
+
+def test_staged_encoding_saves_a_whole_video(tmp_path):
+    """Turning the option off puts the session back on the staged-PNG path,
+    whose writer queue is unbounded and therefore cannot drop a frame. The
+    same check covers it, because it reads the saved episode either way."""
+    sink = _sink(tmp_path, streaming_encoding=False)
+
+    async def record_staged():
+        await sink.create(schema_with_camera(), camera_plan())
+        for i in range(FRAMES):
+            sink.add_frame(row(i), task="smoke")
+        staged = sink._dataset.writer._streaming_encoder is None
+        report = await sink.save_episode()
+        await sink.finalize()
+        return staged, report
+
+    staged, report = asyncio.run(record_staged())
+    assert staged
+    assert report is None
+
+
 def test_resume_refuses_incompatible_live_sources(tmp_path):
     first = _sink(tmp_path)
     _record_one_episode_and_finalize(first)
@@ -326,6 +399,7 @@ def test_resume_refuses_incompatible_live_sources(tmp_path):
     wrong_robot = Sink(
         root=tmp_path / "dataset", repo_id="test/session",
         robot_type="other-bot", fps=FPS, image_writer_threads=2,
+        streaming_encoding=True,
     )
     with pytest.raises(ValueError, match="robot_type"):
         asyncio.run(_resume_now(wrong_robot, schema_with_camera(), camera_plan()))
@@ -333,6 +407,7 @@ def test_resume_refuses_incompatible_live_sources(tmp_path):
     wrong_fps = Sink(
         root=tmp_path / "dataset", repo_id="test/session",
         robot_type="bot", fps=FPS * 2, image_writer_threads=2,
+        streaming_encoding=True,
     )
     with pytest.raises(ValueError, match="fps"):
         asyncio.run(_resume_now(wrong_fps, schema_with_camera(), camera_plan()))
