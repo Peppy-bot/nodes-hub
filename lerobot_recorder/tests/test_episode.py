@@ -1002,7 +1002,8 @@ def test_short_video_outranks_the_ordinary_ending_and_is_logged(tmp_path, capsys
     covers its rows. That outranks whatever ended the episode in the result,
     and the run log keeps it after the panel's status line has moved on."""
     plan = arm_plan()
-    sink = FakeSink(video_error="video is shorter than the state rows (cam0 3 frame(s) missing)")
+    video_error = "video is shorter than the state rows (cam0 3 frame(s) missing)"
+    sink = FakeSink(video_error=video_error)
     recorder, cache = recorder_with(plan, sink, tmp_path)
 
     async def run():
@@ -1012,9 +1013,11 @@ def test_short_video_outranks_the_ordinary_ending_and_is_logged(tmp_path, capsys
         await recorder._record(ctx, FakeToken())
         kind, index, _frames, discarded, error = ctx.completions[0]
         assert (kind, index, discarded) == ("done", 0, False)
-        assert error is not None
-        assert "cam0 3" in error, "the short video, not the stale source that ended the episode"
+        # Equality, not containment: the episode ended on a stale source, and
+        # the result must carry the short video INSTEAD of that reason, not
+        # alongside it.
+        assert error == video_error
         assert sink.saves == 1, "a short video is still a saved episode"
 
     asyncio.run(run())
-    assert "cam0 3" in capsys.readouterr().out
+    assert video_error in capsys.readouterr().out
