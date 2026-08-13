@@ -49,7 +49,7 @@ class FakeSink:
         fail_add=False,
         add_delay_s=0.0,
         created=True,
-        short_video=None,
+        video_error=None,
     ):
         self.fps = fps
         self.created = created
@@ -67,7 +67,7 @@ class FakeSink:
         self._fail_save = fail_save
         self._fail_add = fail_add
         self._add_delay_s = add_delay_s
-        self._short_video = short_video
+        self._video_error = video_error
 
     @property
     def episodes_saved(self) -> int:
@@ -95,7 +95,7 @@ class FakeSink:
             self._fail_save -= 1
             raise OSError("disk full")
         self.saves += 1
-        return self._short_video
+        return self._video_error
 
     def discard_open_frames(self) -> None:
         assert self.created, "discarding needs an open dataset"
@@ -1002,7 +1002,7 @@ def test_short_video_outranks_the_ordinary_ending_and_is_logged(tmp_path, capsys
     covers its rows. That outranks whatever ended the episode in the result,
     and the run log keeps it after the panel's status line has moved on."""
     plan = arm_plan()
-    sink = FakeSink(short_video="video is shorter than the state rows (cam0 3 frame(s) missing)")
+    sink = FakeSink(video_error="video is shorter than the state rows (cam0 3 frame(s) missing)")
     recorder, cache = recorder_with(plan, sink, tmp_path)
 
     async def run():

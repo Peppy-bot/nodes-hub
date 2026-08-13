@@ -223,7 +223,7 @@ class Sink:
         robot_type: str,
         fps: int,
         image_writer_threads: int,
-        streaming_encoding: bool = True,
+        streaming_encoding: bool,
     ):
         self._root = root
         self._repo_id = repo_id
@@ -358,14 +358,15 @@ class Sink:
         self._dataset.add_frame(frame)
 
     async def save_episode(self) -> str | None:
-        """Save the open episode. Returns why its video is untrustworthy, or
-        None when it is whole."""
+        """Save the open episode. Returns the reason its video cannot be
+        trusted, an operator-grade sentence, or None when the video covers
+        every row the episode wrote."""
         assert self._dataset is not None
         assert not self._finalized, "session finalized; no further episodes"
         await asyncio.to_thread(self._dataset.save_episode)
-        return self._short_video_report()
+        return self._video_error()
 
-    def _short_video_report(self) -> str | None:
+    def _video_error(self) -> str | None:
         """Name the cameras whose video came up short, or None when every one
         of them covers the episode."""
         meta = self._dataset.meta

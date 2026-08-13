@@ -271,6 +271,7 @@ def test_a_failed_finalize_can_be_retried(tmp_path):
         robot_type="bot",
         fps=30,
         image_writer_threads=1,
+        streaming_encoding=True,
     )
     closes = {"n": 0}
 
