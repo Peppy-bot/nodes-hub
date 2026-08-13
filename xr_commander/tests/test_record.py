@@ -98,7 +98,10 @@ def settings():
     return config.from_parameters(default_parameters())
 
 
-def drive(script, *, action=None, finish=None, status=None):
+TASK = "wipe the table"
+
+
+def drive(script, *, action=None, finish=None, status=None, read_task=None):
     """Run the button task over scripted (x, y) presses, one per 30 ms; a
     None step is a headset gap (no tracked hands)."""
     log = []
@@ -118,6 +121,7 @@ def drive(script, *, action=None, finish=None, status=None):
                 session=session,
                 settings=settings(),
                 token=token,
+                read_task=read_task or (lambda: TASK),
             )
         )
         for step in script:
@@ -138,7 +142,7 @@ def drive(script, *, action=None, finish=None, status=None):
 
 def test_x_fires_one_goal_per_rising_edge_with_the_task():
     log = drive([(False, False), (True, False), (True, False)])
-    assert log == [f"fire:{record.TASK}"]
+    assert log == [f"fire:{TASK}"]
 
 
 def test_x_already_held_at_first_tracking_does_not_start():
@@ -146,7 +150,7 @@ def test_x_already_held_at_first_tracking_does_not_start():
     assert [e for e in log if e.startswith("fire")] == []
     # An observed release and then a press is the first real edge.
     log = drive([(True, False), (False, False), (True, False)])
-    assert [e for e in log if e.startswith("fire")] == [f"fire:{record.TASK}"]
+    assert [e for e in log if e.startswith("fire")] == [f"fire:{TASK}"]
 
 
 def test_one_physical_y_hold_finishes_once_across_a_gap(monkeypatch):
@@ -161,7 +165,7 @@ def test_one_physical_y_hold_finishes_once_across_a_gap(monkeypatch):
 
 def test_x_again_stops_and_saves_instead_of_firing_twice():
     log = drive([(False, False), (True, False), (False, False), (True, False)])
-    assert [e for e in log if e.startswith("fire")] == [f"fire:{record.TASK}"]
+    assert [e for e in log if e.startswith("fire")] == [f"fire:{TASK}"]
     assert "cancel" in log
     # The watcher fetched the recorder's verdict once the stream closed.
     assert "result" in log
@@ -279,7 +283,7 @@ def test_a_stale_gap_does_not_stop_a_recording_with_x_still_held():
     log = drive(
         [(False, False), (True, False), (True, False), None, None, (True, False)]
     )
-    assert [e for e in log if e.startswith("fire")] == [f"fire:{record.TASK}"]
+    assert [e for e in log if e.startswith("fire")] == [f"fire:{TASK}"]
     assert "cancel" not in log
     # A real release and press still stops it.
     log = drive(
@@ -431,6 +435,27 @@ def test_a_failed_cancel_does_not_claim_saving():
         await watcher
 
     asyncio.run(run())
+
+
+def test_each_episode_carries_the_label_live_when_it_started():
+    # The operator retitles between takes; the episode already running keeps
+    # the label it was fired with.
+    labels = ["wipe the table", "stack the blocks"]
+    log = drive(
+        [
+            (False, False),
+            (True, False),
+            (False, False),
+            (True, False),
+            (False, False),
+            (True, False),
+        ],
+        read_task=lambda: labels.pop(0) if len(labels) > 1 else labels[0],
+    )
+    assert [e for e in log if e.startswith("fire")] == [
+        "fire:wipe the table",
+        "fire:stack the blocks",
+    ]
 
 
 def test_no_bound_recorder_is_inert():

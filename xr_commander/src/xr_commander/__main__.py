@@ -55,6 +55,7 @@ from xr_commander import (
     panel,
     publish,
     record,
+    task_page,
     tls,
     video,
 )
@@ -63,6 +64,16 @@ from xr_commander.clutch import HandClutch
 from xr_commander.devices import HandSample
 from xr_commander.publish import LatestPose
 from xr_commander.xr import XrSession
+
+
+@dataclass(frozen=True)
+class _Recording:
+    """The state only a bound recorder brings: what the panel reports, and the
+    label the next episode records under. Held together so the task page and
+    the REC row can never exist one without the other."""
+
+    status: record.RecorderStatus
+    label: task_page.TaskLabel
 
 
 @dataclass(frozen=True)
@@ -111,15 +122,20 @@ _POSTURE_BUTTONS = (
 )
 
 
-def _headset_url_hint(settings: config.Settings) -> str:
-    """A URL the operator can type into the headset's browser as printed."""
-    port = settings.https_port
+def _headset_origin(settings: config.Settings) -> str:
+    """Where this node serves, as the operator would type it."""
     bound = settings.https_host
     host = tls.outbound_ip() if bound.is_unspecified else str(bound)
     if host is not None and ":" in host:
         host = f"[{host}]"
+    return f"https://{host or '<this machine>'}:{settings.https_port}"
+
+
+def _headset_url_hint(settings: config.Settings) -> str:
+    """A URL the operator can type into the headset's browser as printed."""
+    port = settings.https_port
     return (
-        f"open https://{host or '<this machine>'}:{port} in the headset's browser "
+        f"open {_headset_origin(settings)} in the headset's browser "
         "(click through the self-signed warning) and enter VR. Over USB instead: "
         f"`adb reverse tcp:{port} tcp:{port}`, then https://localhost:{port}."
     )
@@ -161,6 +177,13 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
     video_sources = {t.instance_id: t.sink for t in tracks}
     if panel_sink is not None:
         video_sources[panel.TRACK_ID] = panel_sink
+    # One gate for everything recording-related: teleoperation without a
+    # recorder bound serves no task page and reads no label.
+    recording = (
+        _Recording(record.RecorderStatus(), task_page.TaskLabel())
+        if recorder_record_episode.bound_producers(node_runner)
+        else None
+    )
     session = XrSession(
         host=str(settings.https_host),
         port=settings.https_port,
@@ -168,6 +191,7 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
         tls_key_path=key_path,
         video_sources=video_sources,
         camera_views=video.camera_views(track_ids),
+        routers=() if recording is None else (task_page.build_router(recording.label),),
     )
 
     async def stop_session() -> None:
@@ -185,10 +209,13 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
         f"{_headset_url_hint(settings)} The WebSocket carries "
         "unauthenticated motion control: trusted networks only."
     )
+    if recording is not None:
+        log(
+            f"episodes record as {task_page.UNNAMED_TASK!r} until the task is "
+            f"named at {_headset_origin(settings)}{task_page.PATH}"
+        )
 
     token = node_runner.cancellation_token()
-    recorder_bound = bool(recorder_record_episode.bound_producers(node_runner))
-    recorder_status = record.RecorderStatus() if recorder_bound else None
     # Shared by the alert listener, the status panel, and every camera drain.
     alerts_bound = bool(alerts_topic.bound_producers(node_runner))
     active_alerts = alerts.ActiveAlerts(
@@ -251,17 +278,18 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
         tasks.append(
             asyncio.create_task(video.watch_camera_silence(found, health, token))
         )
-    if recorder_status is not None:
+    if recording is not None:
         tasks.append(
             asyncio.create_task(
                 record.run_recorder_buttons(
                     node_runner,
                     action_module=recorder_record_episode,
                     finish_module=recorder_finish_session,
-                    status=recorder_status,
+                    status=recording.status,
                     session=session,
                     settings=settings,
                     token=token,
+                    read_task=recording.label.for_episode,
                 )
             )
         )
@@ -293,7 +321,8 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
                     token=token,
                     alerts=active_alerts,
                     health=motor_reports,
-                    recorder=recorder_status,
+                    recorder=None if recording is None else recording.status,
+                    read_task=None if recording is None else recording.label.current,
                 )
             )
         )

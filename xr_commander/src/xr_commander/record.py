@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from xr_commander.bus import (
@@ -23,9 +24,6 @@ from xr_commander.bus import (
 from xr_commander.config import Settings
 from xr_commander.devices import FrameSource, fresh_sample
 from xr_commander.publish import fire_goal
-
-# Every episode's task label.
-TASK = "VR Task"
 
 # The result is requested only after the goal's feedback stream has closed,
 # when it is already terminal on the recorder; the finish call is one round
@@ -82,12 +80,16 @@ async def run_recorder_buttons(
     session: FrameSource,
     settings: Settings,
     token: CancellationToken,
+    read_task: Callable[[], str],
 ) -> None:
     """Drive the bound recorder from the left controller's face buttons.
 
     One goal at a time: X while one is in flight cancels it (stop-and-save)
     rather than firing another. The goal's watcher owns `status`, so the
     panel's REC line tracks the recorder's answers, not this side's intent.
+
+    `read_task` is read per goal, so an episode carries the label that was live
+    when it started.
     """
     target = select_producer(action_module, node_runner, "recorder")
     if target is None:
@@ -114,7 +116,7 @@ async def run_recorder_buttons(
 
             if rising_x and episode is None:
                 episode = await _start_episode(
-                    node_runner, action_module, target, status
+                    node_runner, action_module, target, status, read_task()
                 )
             elif rising_x:
                 await _stop_episode(episode, status)
@@ -142,15 +144,15 @@ async def run_recorder_buttons(
 
 
 async def _start_episode(
-    node_runner, action_module, target, status: RecorderStatus
+    node_runner, action_module, target, status: RecorderStatus, task: str
 ) -> _Episode | None:
     """Fire one record_episode goal; its watcher runs it to its end."""
     handle = await fire_goal(
-        node_runner, action_module, target, "record_episode", task=TASK
+        node_runner, action_module, target, "record_episode", task=task
     )
     if handle is None:
         return None
-    log(f"recording: {TASK!r}")
+    log(f"recording: {task!r}")
     return _Episode(handle, asyncio.create_task(_watch_episode(handle, status)))
 
 

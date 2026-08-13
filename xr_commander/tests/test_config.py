@@ -116,3 +116,7 @@ def test_view_max_width_bounds_and_zero_disable():
             config.from_parameters(params(view_max_width=bad))
 
 
+def test_the_task_label_is_not_a_launch_parameter():
+    # It comes from the operator's page only, so a launcher naming one is a
+    # stale label waiting to record under.
+    assert not hasattr(config.from_parameters(params()), "task")

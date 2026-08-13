@@ -13,8 +13,9 @@ dependencies = [
     # The WebXR server, its prebuilt frontend, and the WebRTC video path.
     "teleop-xr>=1.3.5,<2",
     # Imported directly (pose algebra, frame decode, the self-signed TLS
-    # identity), not just via teleop-xr.
+    # identity, the task page's routes), not just via teleop-xr.
     "cryptography>=42",
+    "fastapi>=0.110",
     "numpy>=1.26",
     "opencv-python>=4.9",
     "uvicorn>=0.30",
