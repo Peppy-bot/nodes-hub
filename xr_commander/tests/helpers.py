@@ -23,6 +23,7 @@ def default_parameters(**overrides) -> SimpleNamespace:
         "stale_timeout_s": 10.0,
         "view_max_width": 640,
         "status_panel_enabled": True,
+        "banner_from_severity": 2,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -58,6 +59,16 @@ class FakeSubscription:
         if self._items:
             return self._items.pop(0)
         await asyncio.Event().wait()
+
+
+class ClosingSubscription:
+    """Yields queued items then closes, so a drain loop ends on its own."""
+
+    def __init__(self, items):
+        self._items = list(items)
+
+    async def next(self):
+        return self._items.pop(0) if self._items else None
 
 
 class FakeToken:

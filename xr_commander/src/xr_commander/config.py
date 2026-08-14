@@ -10,6 +10,8 @@ import ipaddress
 import math
 from dataclasses import dataclass
 
+from xr_commander.alerts import FAULT, WARNING
+
 
 def _finite(name: str, value: float) -> float:
     value = float(value)
@@ -97,6 +99,8 @@ class Settings:
     view_max_width: int
     # Whether the headset shows the node's status panel.
     status_panel_enabled: bool
+    # Lowest alert severity that burns a banner across the camera views.
+    banner_from_severity: int
 
     @property
     def tick_period_s(self) -> float:
@@ -123,4 +127,7 @@ def from_parameters(params) -> Settings:
             "view_max_width", params.view_max_width, 0, _MAX_VIEW_WIDTH_PX
         ),
         status_panel_enabled=_flag("status_panel_enabled", params.status_panel_enabled),
+        banner_from_severity=_int_in(
+            "banner_from_severity", params.banner_from_severity, WARNING, FAULT
+        ),
     )

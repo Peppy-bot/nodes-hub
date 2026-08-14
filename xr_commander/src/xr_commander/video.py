@@ -15,6 +15,7 @@ from typing import Protocol
 import cv2
 import numpy as np
 
+from xr_commander.alerts import ActiveAlerts, draw_banner
 from xr_commander.bus import CancellationToken, Latch, log, messages, ticks
 
 # The colour encodings the rgb_camera / rgbd_camera contracts declare. A camera
@@ -146,6 +147,7 @@ async def drain_frames(
     sinks: dict[str, FrameSink],
     token: CancellationToken,
     label: str,
+    alerts: ActiveAlerts,
     view_max_width: int = 0,
     health: dict[str, float] | None = None,
 ) -> None:
@@ -157,6 +159,9 @@ async def drain_frames(
     logged once and dropped, never stopping the other producers. `health`
     (instance id to monotonic seconds) is stamped per delivered frame for the
     silence watchdog.
+
+    While an alert is active it is drawn onto every frame: the video is the
+    only channel that reaches the operator's eyes in the headset.
     """
     try:
         subscription = await topic_module.subscribe(node_runner)
@@ -174,7 +179,11 @@ async def drain_frames(
         if latch is None:
             latch = unusable[producer.instance_id] = Latch()
         try:
-            sink.put_frame(await asyncio.to_thread(_decode_and_shrink, message, view_max_width))
+            frame = await asyncio.to_thread(_decode_and_shrink, message, view_max_width)
+            banner = alerts.banner()
+            if banner is not None:
+                frame = draw_banner(frame, *banner)
+            sink.put_frame(frame)
             if health is not None:
                 health[producer.instance_id] = time.monotonic()
             latch.clear()

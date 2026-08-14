@@ -25,8 +25,12 @@ from peppygen.consumed_actions.recorder import (
 from peppygen.consumed_services.recorder import (
     finish_session as recorder_finish_session,
 )
+from peppygen.consumed_topics.alerts import alerts as alerts_topic
 from peppygen.consumed_topics.color_cameras import (
     video_stream as color_cameras_video_stream,
+)
+from peppygen.consumed_topics.motor_health import (
+    motor_health as motor_health_topic,
 )
 from peppygen.consumed_topics.rgbd_cameras import (
     video_stream as rgbd_cameras_video_stream,
@@ -44,7 +48,16 @@ from peppygen.paired_topics.right_gripper import (
 from peppygen.parameters import Parameters
 from teleop_xr.video_stream import ExternalVideoSource
 
-from xr_commander import config, panel, publish, record, tls, video
+from xr_commander import (
+    alerts,
+    config,
+    motor_health,
+    panel,
+    publish,
+    record,
+    tls,
+    video,
+)
 from xr_commander.bus import log
 from xr_commander.clutch import HandClutch
 from xr_commander.devices import HandSample
@@ -176,6 +189,19 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
     token = node_runner.cancellation_token()
     recorder_bound = bool(recorder_record_episode.bound_producers(node_runner))
     recorder_status = record.RecorderStatus() if recorder_bound else None
+    # Shared by the alert listener, the status panel, and every camera drain.
+    alerts_bound = bool(alerts_topic.bound_producers(node_runner))
+    active_alerts = alerts.ActiveAlerts(
+        banner_from=settings.banner_from_severity,
+        # A stack with nothing bound to the alert slot can never receive an
+        # alert, so its quiet panel means "not wired" rather than "nothing
+        # wrong". Silence must not be rendered as health.
+        producers_bound=alerts_bound,
+    )
+    # Shared by the health listener and the status panel, on the same
+    # unwired-is-not-healthy reasoning as the alerts.
+    health_bound = bool(motor_health_topic.bound_producers(node_runner))
+    motor_reports = motor_health.MotorHealthReports(producers_bound=health_bound)
     tasks = [
         asyncio.create_task(
             publish.run_posture_button(
@@ -189,6 +215,22 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
         )
         for action_module, pressed in _POSTURE_BUTTONS
     ]
+    # Skipped when nothing is bound, like the camera drains: there is
+    # nothing to receive, and the panel already says "not wired".
+    if alerts_bound:
+        tasks.append(
+            asyncio.create_task(
+                alerts.drain_alerts(node_runner, alerts_topic, active_alerts, token)
+            )
+        )
+    if health_bound:
+        tasks.append(
+            asyncio.create_task(
+                motor_health.drain_motor_health(
+                    node_runner, motor_health_topic, motor_reports, token
+                )
+            )
+        )
     for label, topic_module, found in slot_tracks:
         if not found:
             continue
@@ -202,6 +244,7 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
                     {t.instance_id: t.sink for t in found},
                     token,
                     label,
+                    active_alerts,
                     settings.view_max_width,
                     health,
                 )
@@ -250,6 +293,8 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
                     hands=hands,
                     settings=settings,
                     token=token,
+                    alerts=active_alerts,
+                    health=motor_reports,
                     recorder=recorder_status,
                 )
             )

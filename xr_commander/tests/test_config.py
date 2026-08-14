@@ -15,6 +15,7 @@ BASE = {
     "stale_timeout_s": 0.25,
     "view_max_width": 640,
     "status_panel_enabled": True,
+    "banner_from_severity": 2,
 }
 
 
@@ -115,3 +116,20 @@ def test_view_max_width_bounds_and_zero_disable():
         with pytest.raises(ValueError, match="view_max_width"):
             config.from_parameters(params(view_max_width=bad))
 
+
+def test_an_undefined_banner_severity_is_refused():
+    # 0 is the clear encoding and 4 is off the scale; neither names a
+    # severity a banner could be drawn for.
+    for bad in (0, 4, 255):
+        with pytest.raises(ValueError, match="banner_from_severity"):
+            config.from_parameters(params(banner_from_severity=bad))
+
+
+def test_every_drawable_severity_is_accepted_as_a_banner_threshold():
+    for good in (1, 2, 3):
+        assert (
+            config.from_parameters(
+                params(banner_from_severity=good)
+            ).banner_from_severity
+            == good
+        )

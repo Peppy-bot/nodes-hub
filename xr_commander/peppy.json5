@@ -28,6 +28,14 @@
         { name: "rgbd_camera", tag: "v1", link_id: "rgbd_cameras", cardinality: "zero_or_more" },
         // Whole-robot posture moves.
         { name: "postures", tag: "v1", link_id: "postures", cardinality: "zero_or_more" },
+        // Operator alerts from any producer the launcher wires. The headset
+        // has no text channel of its own, so an active alert is drawn onto
+        // the camera tracks; unbound leaves the video untouched.
+        { name: "alert", tag: "v1", link_id: "alerts", cardinality: "zero_or_more" },
+        // Per-motor health from any motor-bearing producer the launcher
+        // wires, listed on the status panel; unbound leaves the section
+        // reading "not wired".
+        { name: "motor_health", tag: "v1", link_id: "motor_health", cardinality: "zero_or_more" },
       ],
       pairings: [
         // One Cartesian command loop per operator hand; which follower each
@@ -54,6 +62,8 @@
         { link_id: "right_arm", name: "pose_states" },
         { link_id: "color_cameras", name: "video_stream" },
         { link_id: "rgbd_cameras", name: "video_stream" },
+        { link_id: "alerts", name: "alerts" },
+        { link_id: "motor_health", name: "motor_health" },
       ],
     },
     services: {
@@ -98,6 +108,11 @@
       // Draw a status panel in the headset (link and per-hand state) as an
       // extra floating view. Off leaves the headset showing cameras only.
       status_panel_enabled: { $type: "bool", $default: true },
+      // Lowest alert severity that burns a banner across the camera views
+      // (1 warning, 2 critical, 3 fault). Which severity interrupts the
+      // operator's video is an operational threshold, so each stack
+      // declares it explicitly.
+      banner_from_severity: { $type: "u8" },
     },
   },
 }
