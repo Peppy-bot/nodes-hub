@@ -1,6 +1,11 @@
 {
   peppy_schema: "repository/v1",
   nodes: {
+    cam_consumer: {
+      v1: {
+        path: "cam_consumer/peppy.json5"
+      }
+    },
     deliberative_planner: {
       v1: {
         path: "example_robot/deliberative_planner/peppy.json5"

@@ -1,0 +1,47 @@
+{
+  peppy_schema: "node/v1",
+  manifest: {
+    name: "cam_consumer",
+    tag: "v1",
+    depends_on: {
+      contracts: [
+        {
+          name: "rgb_camera",
+          tag: "v1",
+          link_id: "camera"
+        }
+      ]
+    }
+  },
+  execution: {
+    language: "python",
+    build_cmd: [
+      "uv",
+      "sync",
+      "--no-editable"
+    ],
+    run_cmd: [
+      "./.venv/bin/python",
+      "-m",
+      "cam_consumer"
+    ]
+  },
+  interfaces: {
+    topics: {
+      consumes: [
+        {
+          link_id: "camera",
+          name: "video_stream",
+        },
+      ],
+    },
+    services: {
+      consumes: [
+        {
+          link_id: "camera",
+          name: "video_stream_info",
+        },
+      ]
+    }
+  }
+}
