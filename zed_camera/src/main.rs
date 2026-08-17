@@ -62,12 +62,12 @@ struct Opened {
 /// One processed capture: rectified left RGB plus depth, sharing a frame id.
 struct FrameSet {
     frame_id: u32,
-    stamp: SystemTime,
+    timestamp: SystemTime,
     left_rgb: Vec<u8>,
     depth_z16: Vec<u8>,
 }
 
-fn stamp_now() -> std::result::Result<SystemTime, String> {
+fn timestamp_now() -> std::result::Result<SystemTime, String> {
     let ns = peppygen::clock::now_ns().map_err(|e| e.to_string())?;
     Ok(UNIX_EPOCH + Duration::from_nanos(ns))
 }
@@ -198,7 +198,7 @@ fn run_pipeline(
             }
             Grab::Frame { .. } => {}
         }
-        let Ok(stamp) = stamp_now() else {
+        let Ok(timestamp) = timestamp_now() else {
             continue; // clock not ready yet: skip rather than mis-stamp
         };
         if let Err(e) = matcher.process(&yuyv, &mut left_rgb, &mut depth_mm) {
@@ -212,7 +212,7 @@ fn run_pipeline(
 
         let frame = FrameSet {
             frame_id,
-            stamp,
+            timestamp,
             left_rgb: left_rgb.clone(),
             depth_z16: depth_mm.iter().flat_map(|d| d.to_le_bytes()).collect(),
         };
@@ -265,12 +265,12 @@ fn spawn_emit_task(
         while let Some(frame) = frame_rx.recv().await {
             let FrameSet {
                 frame_id,
-                stamp,
+                timestamp,
                 left_rgb,
                 depth_z16,
             } = frame;
             let color_header = video_stream::MessageHeader {
-                stamp,
+                timestamp,
                 frame_id,
                 align_mode: ALIGN_MODE.to_string(),
             };
@@ -290,7 +290,7 @@ fn spawn_emit_task(
             }
 
             let depth_header = depth_stream::MessageHeader {
-                stamp,
+                timestamp,
                 frame_id,
                 align_mode: ALIGN_MODE.to_string(),
             };

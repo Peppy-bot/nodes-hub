@@ -23,7 +23,7 @@ from tests.test_recording import ARM0, STALENESS_S, joint_entry, make_plan
 
 def fresh_joints(n=2) -> JointSample:
     return JointSample(
-        positions=(0.0,) * n, velocities=(0.0,) * n, efforts=(), stamp_ns=time.time_ns()
+        positions=(0.0,) * n, velocities=(0.0,) * n, efforts=(), timestamp_ns=time.time_ns()
     )
 
 
@@ -33,7 +33,7 @@ def arm_plan(color=0):
 
 def fresh_rgb(w=4, h=2) -> CameraFrame:
     return CameraFrame(
-        encoding="rgb8", width=w, height=h, data=bytes(w * h * 3), stamp_ns=time.time_ns()
+        encoding="rgb8", width=w, height=h, data=bytes(w * h * 3), timestamp_ns=time.time_ns()
     )
 
 
@@ -388,7 +388,7 @@ def test_goal_refused_when_camera_dead_after_first_episode(tmp_path):
 
     stale = CameraFrame(
         encoding="rgb8", width=4, height=2, data=bytes(24),
-        stamp_ns=time.time_ns() - int(1.5e9),
+        timestamp_ns=time.time_ns() - int(1.5e9),
     )
     cache.color = [stale]
     reason = recorder._refuse_reason()

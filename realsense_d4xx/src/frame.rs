@@ -9,7 +9,7 @@ use crate::modes::AlignMode;
 
 pub struct FrameSet {
     pub frame_id: u32,
-    pub stamp: SystemTime,
+    pub timestamp: SystemTime,
     /// Alignment the payload was captured under, so each emitted frame is
     /// self-describing even as `set_align_mode` is toggled at runtime.
     pub align_mode: AlignMode,

@@ -247,7 +247,7 @@ class FakeStreamTopic:
     async def declare_publisher(self, _runner):
         return self._publisher
 
-    def build_message(self, stamp, *fields):
+    def build_message(self, timestamp, *fields):
         self.built.append(fields)
         return fields
 
@@ -301,7 +301,7 @@ def test_the_gripper_stream_is_silent_without_the_squeeze_deadman():
 
 
 def test_the_gripper_stream_publishes_openings_while_squeezing(monkeypatch):
-    monkeypatch.setattr(publish, "_stamp_seconds", lambda: 0.0)
+    monkeypatch.setattr(publish, "_timestamp_seconds", lambda: 0.0)
     publisher = FakePublisher()
     topic = FakeStreamTopic(publisher)
     session = FakeSession()
@@ -344,7 +344,7 @@ def test_the_pose_stream_refuses_to_engage_without_a_fresh_measured_pose():
 
 
 def test_the_pose_stream_engages_once_the_follower_reports(monkeypatch):
-    monkeypatch.setattr(publish, "_stamp_seconds", lambda: 0.0)
+    monkeypatch.setattr(publish, "_timestamp_seconds", lambda: 0.0)
     publisher = FakePublisher()
     topic = FakeStreamTopic(publisher)
     session = FakeSession()
@@ -385,7 +385,7 @@ class FrozenSession(FakeSession):
 def test_the_pose_stream_goes_silent_when_frames_stop_mid_squeeze(monkeypatch):
     """The composed deadman: an engaged hand whose headset frames age past
     the staleness window stops publishing entirely."""
-    monkeypatch.setattr(publish, "_stamp_seconds", lambda: 0.0)
+    monkeypatch.setattr(publish, "_timestamp_seconds", lambda: 0.0)
     publisher = FakePublisher()
     topic = FakeStreamTopic(publisher)
     session = FrozenSession()
