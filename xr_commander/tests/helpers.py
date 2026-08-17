@@ -23,7 +23,6 @@ def default_parameters(**overrides) -> SimpleNamespace:
         "stale_timeout_s": 10.0,
         "view_max_width": 640,
         "status_panel_enabled": True,
-        "banner_from_severity": 2,
     }
     values.update(overrides)
     return SimpleNamespace(**values)

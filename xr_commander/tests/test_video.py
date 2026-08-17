@@ -9,7 +9,6 @@ from teleop_xr.config import ViewConfig
 
 from tests.helpers import FakeSubscription, FakeToken, FakeTopic, RecordingSink
 from xr_commander import video
-from xr_commander.alerts import WARNING, ActiveAlerts
 from xr_commander.video import (
     CAMERA_VIEW,
     CameraTrack,
@@ -135,7 +134,6 @@ def run_drain(items, sinks, health=None):
                 sinks,
                 token,
                 "test",
-                ActiveAlerts(banner_from=WARNING),
                 0,
                 health,
             )
@@ -170,7 +168,7 @@ def test_a_failed_camera_subscribe_is_loud_and_fatal_to_the_drain(capsys):
     async def run():
         await asyncio.wait_for(
             drain_frames(
-                None, ExplodingTopic(), {}, FakeToken(), "camera", ActiveAlerts(banner_from=WARNING)
+                None, ExplodingTopic(), {}, FakeToken(), "camera"
             ),
             1.0,
         )

@@ -192,7 +192,6 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
     # Shared by the alert listener, the status panel, and every camera drain.
     alerts_bound = bool(alerts_topic.bound_producers(node_runner))
     active_alerts = alerts.ActiveAlerts(
-        banner_from=settings.banner_from_severity,
         # A stack with nothing bound to the alert slot can never receive an
         # alert, so its quiet panel means "not wired" rather than "nothing
         # wrong". Silence must not be rendered as health.
@@ -244,7 +243,6 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
                     {t.instance_id: t.sink for t in found},
                     token,
                     label,
-                    active_alerts,
                     settings.view_max_width,
                     health,
                 )

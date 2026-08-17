@@ -4,7 +4,7 @@ The motor_health contract carries an evaluated severity per motor plus the
 load and temperature readings behind it, one report per producing instance
 (the instance is the component). The panel is a glanceable surface: an
 all-nominal component compresses to one line and only off-nominal motors
-get detail rows; the camera-view banner stays the alert contract's alone.
+get detail rows.
 """
 
 from __future__ import annotations

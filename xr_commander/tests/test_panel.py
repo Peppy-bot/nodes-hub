@@ -28,12 +28,12 @@ POSE = Pose(np.zeros(3), IDENTITY)
 
 def quiet():
     """An alert map with nothing active."""
-    return ActiveAlerts(banner_from=CRITICAL)
+    return ActiveAlerts()
 
 
 def raised(*alerts):
     """An alert map holding each (source, severity, message)."""
-    active = ActiveAlerts(banner_from=CRITICAL)
+    active = ActiveAlerts()
     for source_name, severity, message in alerts:
         active.update(source_name, "motor_overload", severity, message)
     return active

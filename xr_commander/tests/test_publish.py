@@ -14,7 +14,6 @@ from tests.helpers import (
     default_parameters,
 )
 from xr_commander import config, publish
-from xr_commander.alerts import WARNING, ActiveAlerts
 from xr_commander.clutch import HandClutch
 from xr_commander.devices import HandSample, XrFrame
 from xr_commander.video import drain_frames
@@ -50,7 +49,6 @@ def test_drain_frames_routes_by_producer_and_skips_unknown_producers():
                 {"cam_a": sink},
                 token,
                 "test",
-                ActiveAlerts(banner_from=WARNING),
             )
         )
         await asyncio.sleep(0.05)
@@ -60,32 +58,6 @@ def test_drain_frames_routes_by_producer_and_skips_unknown_producers():
     asyncio.run(run())
     assert len(sink.frames) == 1
 
-
-def test_drain_frames_burns_an_active_warning_into_the_video():
-    # The headset has no text channel, so an active warning has to reach the
-    # operator through the frames themselves.
-    sink = RecordingSink()
-    producer = SimpleNamespace(instance_id="cam_a")
-    subscription = FakeSubscription([(producer, frame_message(width=160, height=120))])
-    token = FakeToken()
-    active = ActiveAlerts(banner_from=WARNING)
-    active.update("left arm j2", "motor_overload", 2, "holding 96% of rated torque")
-
-    async def run():
-        drain = asyncio.create_task(
-            drain_frames(
-                None, FakeTopic(subscription), {"cam_a": sink}, token, "test", active
-            )
-        )
-        await asyncio.sleep(0.05)
-        token.cancel()
-        await asyncio.wait_for(drain, 1.0)
-
-    asyncio.run(run())
-    assert len(sink.frames) == 1
-    frame = sink.frames[0]
-    assert frame[:5].any(), "a warning must be drawn onto the frame"
-    assert not frame[60:].any(), "the video below the banner is untouched"
 
 
 class FakeSession:

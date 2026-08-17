@@ -108,11 +108,6 @@
       // Draw a status panel in the headset (link and per-hand state) as an
       // extra floating view. Off leaves the headset showing cameras only.
       status_panel_enabled: { $type: "bool", $default: true },
-      // Lowest alert severity that burns a banner across the camera views
-      // (1 warning, 2 critical, 3 fault). Which severity interrupts the
-      // operator's video is an operational threshold, so each stack
-      // declares it explicitly.
-      banner_from_severity: { $type: "u8" },
     },
   },
 }
