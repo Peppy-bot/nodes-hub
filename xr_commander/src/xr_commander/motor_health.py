@@ -39,14 +39,21 @@ _LEVEL_WORDS = {
 # are in an unknown state, not a healthy one.
 HEALTH_STALE_AFTER_MS = 1500
 
-# The panel's fixed instance order. Instances outside it follow, sorted by
-# name, so a producer this node did not anticipate is still listed.
-_PANEL_INSTANCE_ORDER = ("left_arm", "right_arm", "left_gripper", "right_gripper")
+# The panel's fixed instance order, the openarm launcher family's limb
+# instance ids. Instances outside it follow, sorted by name, so a producer
+# this node did not anticipate is still listed.
+_PANEL_INSTANCE_ORDER = (
+    "left_arm_inst",
+    "right_arm_inst",
+    "left_grip_inst",
+    "right_grip_inst",
+)
 
 
 def _display_name(instance: str) -> str:
-    """The panel wording for an instance name: "left_arm" reads LEFT ARM."""
-    return instance.replace("_", " ").upper()
+    """The panel wording for an instance name: "left_grip_inst" reads
+    LEFT GRIP, with any "_inst" launcher suffix dropped."""
+    return instance.removesuffix("_inst").replace("_", " ").upper()
 
 
 @dataclass(frozen=True)

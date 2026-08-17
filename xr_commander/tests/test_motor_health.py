@@ -23,7 +23,9 @@ ARM_LEVELS = (0, 0, 0, 0, 0, 0, 0)
 
 def report(
     store,
-    instance="left_arm",
+    # The launcher family's id: display assertions downstream also pin that
+    # the "_inst" suffix drops from the panel wording.
+    instance="left_arm_inst",
     levels=ARM_LEVELS,
     **readings,
 ):
@@ -114,20 +116,25 @@ def test_an_instance_never_received_renders_nothing():
 
 
 def test_known_instances_keep_the_panel_order():
+    # right_grip_inst arrives first and sorts before right_arm_inst, so only
+    # the fixed panel order puts the arm row above it.
     store = MotorHealthReports()
-    report(store, instance="right_gripper", levels=(0,))
-    report(store, instance="left_arm")
+    report(store, instance="right_grip_inst", levels=(0,))
+    report(store, instance="right_arm_inst")
     assert [entry.instance for entry in store.by_instance()] == [
-        "left_arm",
-        "right_gripper",
+        "right_arm_inst",
+        "right_grip_inst",
     ]
 
 
 def test_an_unanticipated_instance_is_listed_after_the_known_ones():
     store = MotorHealthReports()
     report(store, instance="torso", levels=(0, 0))
-    report(store, instance="left_arm")
-    assert [entry.instance for entry in store.by_instance()] == ["left_arm", "torso"]
+    report(store, instance="left_arm_inst")
+    assert [entry.instance for entry in store.by_instance()] == [
+        "left_arm_inst",
+        "torso",
+    ]
 
 
 def test_a_stale_instance_collapses_to_one_not_reporting_row(monkeypatch):
