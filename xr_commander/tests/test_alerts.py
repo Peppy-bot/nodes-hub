@@ -31,8 +31,9 @@ def raise_alert(
     kind="motor_overload",
     severity=2,
     message="holding 96% of rated torque",
+    producer="left_arm_inst",
 ):
-    active.update(source, kind, severity, message)
+    active.update(producer, source, kind, severity, message)
 
 
 def test_an_alert_names_its_source_severity_and_message():
@@ -48,7 +49,7 @@ def test_an_undefined_severity_is_refused():
     # producer outrank a genuine fault.
     with pytest.raises(ValueError):
         ActiveAlerts().update(
-            "left arm j2", "motor_overload", 4, "boom"
+            "left_arm_inst", "left arm j2", "motor_overload", 4, "boom"
         )
 
 
@@ -56,16 +57,26 @@ def test_an_alert_without_an_identity_is_refused():
     # The commander rejects these too; a panel line " CRITICAL: ..." names
     # nothing the operator can act on.
     with pytest.raises(ValueError):
-        ActiveAlerts().update("", "motor_overload", 2, "boom")
+        ActiveAlerts().update("left_arm_inst", "", "motor_overload", 2, "boom")
     with pytest.raises(ValueError):
-        ActiveAlerts().update("left arm j2", "", 2, "boom")
+        ActiveAlerts().update("left_arm_inst", "left arm j2", "", 2, "boom")
+
+
+def test_a_producer_cannot_replace_or_clear_anothers_alert():
+    active = ActiveAlerts()
+    raise_alert(active, producer="left_arm_inst")
+    raise_alert(active, producer="imposter", severity=1, message="warm")
+    assert len(active.active()) == 2, "same wire strings, distinct producers"
+    active.update("imposter", "left arm j2", "motor_overload", 0, "recovered")
+    (alert,) = active.active()
+    assert alert.severity == 2, "the clear removed only its own entry"
 
 
 def test_a_severity_zero_clear_removes_the_alert():
     active = ActiveAlerts()
     raise_alert(active)
     assert active.active()
-    active.update("left arm j2", "motor_overload", 0, "recovered")
+    active.update("left_arm_inst", "left arm j2", "motor_overload", 0, "recovered")
     assert active.active() == ()
 
 
@@ -73,7 +84,7 @@ def test_a_clear_only_removes_its_own_identity():
     active = ActiveAlerts()
     raise_alert(active, source="left arm j2")
     raise_alert(active, source="right arm j1", severity=1, message="warm")
-    active.update("left arm j2", "motor_overload", 0, "recovered")
+    active.update("left_arm_inst", "left arm j2", "motor_overload", 0, "recovered")
     (alert,) = active.active()
     assert alert.text.startswith("RIGHT ARM J1")
     assert alert.severity == 1
@@ -208,10 +219,10 @@ def test_equal_severity_alerts_keep_their_order_when_a_reading_ticks():
     # Sorting on the rendered text swaps two rows whenever a measurement
     # changes, because the producer re-emits the live number.
     active = ActiveAlerts()
-    active.update("left arm j2", "a", 1, "80 C")
-    active.update("left arm j2", "b", 1, "79 C")
+    active.update("left_arm_inst", "left arm j2", "a", 1, "80 C")
+    active.update("left_arm_inst", "left arm j2", "b", 1, "79 C")
     before = [a.text for a in active.active()]
-    active.update("left arm j2", "b", 1, "78 C")
+    active.update("left_arm_inst", "left arm j2", "b", 1, "78 C")
     after = [a.text for a in active.active()]
     assert [t.rsplit(": ", 1)[-1] for t in before] == ["80 C", "79 C"]
     assert [t.rsplit(": ", 1)[-1] for t in after] == [
@@ -234,7 +245,7 @@ def test_an_alert_lives_through_the_whole_stale_window(monkeypatch):
     clock = {"now": 100.0}
     monkeypatch.setattr("xr_commander.alerts.time.monotonic", lambda: clock["now"])
     active = ActiveAlerts()
-    active.update("left arm j2", "motor_condition", 2, "hot")
+    active.update("left_arm_inst", "left arm j2", "motor_condition", 2, "hot")
     clock["now"] += STALE_AFTER_S
     assert len(active.active()) == 1
     clock["now"] += 0.001

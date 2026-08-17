@@ -40,9 +40,10 @@ class Alert:
 
 
 class ActiveAlerts:
-    """Latest alert per (source, kind), loop-confined: the listener writes and
-    the panel and every camera drain read, with no await between a read and
-    its purge.
+    """Latest alert per (producer, source, kind), loop-confined: the listener
+    writes and the panel reads, with no await between a read and its purge.
+    The producer is the transport-authenticated instance, so no producer can
+    replace or clear another's alert through the wire strings.
 
     A severity-0 message removes its entry, so recovery clears the alert as
     directly as it was raised. Severities above the contract's ceiling are
@@ -53,7 +54,7 @@ class ActiveAlerts:
 
     def __init__(self, *, producers_bound: bool = True) -> None:
         self._producers_bound = producers_bound
-        self._by_identity: dict[tuple[str, str], Alert] = {}
+        self._by_identity: dict[tuple[str, str, str], Alert] = {}
 
     @property
     def producers_bound(self) -> bool:
@@ -65,15 +66,17 @@ class ActiveAlerts:
         """
         return self._producers_bound
 
-    def update(self, source: str, kind: str, severity: int, message: str) -> None:
+    def update(
+        self, producer: str, source: str, kind: str, severity: int, message: str
+    ) -> None:
         if not source or not kind:
             raise ValueError("alert identity needs a source and a kind")
         if severity != CLEAR and severity not in _LEVEL_LABELS:
             raise ValueError(f"undefined severity {severity}")
         if severity == CLEAR:
-            self._by_identity.pop((source, kind), None)
+            self._by_identity.pop((producer, source, kind), None)
             return
-        self._by_identity[(source, kind)] = Alert(
+        self._by_identity[(producer, source, kind)] = Alert(
             severity=severity,
             text=f"{source.upper()} {_LEVEL_LABELS[severity]}: {message}",
             received_monotonic_s=time.monotonic(),
@@ -179,7 +182,11 @@ async def drain_alerts(
             latch = unusable[producer.instance_id] = Latch()
         try:
             active.update(
-                message.source, message.kind, message.severity, message.message
+                producer.instance_id,
+                message.source,
+                message.kind,
+                message.severity,
+                message.message,
             )
             latch.clear()
         except Exception as e:

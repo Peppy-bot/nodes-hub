@@ -35,7 +35,7 @@ def raised(*alerts):
     """An alert map holding each (source, severity, message)."""
     active = ActiveAlerts()
     for source_name, severity, message in alerts:
-        active.update(source_name, "motor_overload", severity, message)
+        active.update("left_arm_inst", source_name, "motor_overload", severity, message)
     return active
 
 
