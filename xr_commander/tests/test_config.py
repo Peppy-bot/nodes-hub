@@ -115,3 +115,4 @@ def test_view_max_width_bounds_and_zero_disable():
         with pytest.raises(ValueError, match="view_max_width"):
             config.from_parameters(params(view_max_width=bad))
 
+

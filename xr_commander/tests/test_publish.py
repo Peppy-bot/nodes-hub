@@ -43,7 +43,13 @@ def test_drain_frames_routes_by_producer_and_skips_unknown_producers():
 
     async def run():
         drain = asyncio.create_task(
-            drain_frames(None, FakeTopic(subscription), {"cam_a": sink}, token, "test")
+            drain_frames(
+                None,
+                FakeTopic(subscription),
+                {"cam_a": sink},
+                token,
+                "test",
+            )
         )
         await asyncio.sleep(0.05)
         token.cancel()
@@ -51,6 +57,7 @@ def test_drain_frames_routes_by_producer_and_skips_unknown_producers():
 
     asyncio.run(run())
     assert len(sink.frames) == 1
+
 
 
 class FakeSession:

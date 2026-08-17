@@ -11,6 +11,7 @@ import math
 from dataclasses import dataclass
 
 
+
 def _finite(name: str, value: float) -> float:
     value = float(value)
     if not math.isfinite(value):

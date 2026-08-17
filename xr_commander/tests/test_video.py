@@ -129,7 +129,13 @@ def run_drain(items, sinks, health=None):
     async def run():
         drain = asyncio.create_task(
             drain_frames(
-                None, FakeTopic(FakeSubscription(items)), sinks, token, "test", 0, health
+                None,
+                FakeTopic(FakeSubscription(items)),
+                sinks,
+                token,
+                "test",
+                0,
+                health,
             )
         )
         await asyncio.sleep(0.05)
@@ -144,7 +150,11 @@ def test_an_undecodable_frame_is_dropped_and_logged_once(capsys):
     bad = SimpleNamespace(encoding="z16", width=1, height=1, frame=b"xx")
     sink = RecordingSink()
     health: dict[str, float] = {}
-    run_drain([(producer, bad), (producer, bad), (producer, bgr_message())], {"cam": sink}, health)
+    run_drain(
+        [(producer, bad), (producer, bad), (producer, bgr_message())],
+        {"cam": sink},
+        health,
+    )
     assert len(sink.frames) == 1  # the good frame still lands
     assert capsys.readouterr().out.count("frame unusable") == 1  # latched
     assert "cam" in health  # stamped for the delivered frame only
@@ -157,7 +167,10 @@ def test_a_failed_camera_subscribe_is_loud_and_fatal_to_the_drain(capsys):
 
     async def run():
         await asyncio.wait_for(
-            drain_frames(None, ExplodingTopic(), {}, FakeToken(), "camera"), 1.0
+            drain_frames(
+                None, ExplodingTopic(), {}, FakeToken(), "camera"
+            ),
+            1.0,
         )
 
     asyncio.run(run())

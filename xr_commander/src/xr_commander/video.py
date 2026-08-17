@@ -174,7 +174,8 @@ async def drain_frames(
         if latch is None:
             latch = unusable[producer.instance_id] = Latch()
         try:
-            sink.put_frame(await asyncio.to_thread(_decode_and_shrink, message, view_max_width))
+            frame = await asyncio.to_thread(_decode_and_shrink, message, view_max_width)
+            sink.put_frame(frame)
             if health is not None:
                 health[producer.instance_id] = time.monotonic()
             latch.clear()

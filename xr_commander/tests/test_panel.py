@@ -4,13 +4,18 @@ import numpy as np
 
 from tests.helpers import IDENTITY
 from xr_commander import panel
+from xr_commander.alerts import CRITICAL, ActiveAlerts
 from xr_commander.clutch import HandClutch
 from xr_commander.devices import HandSample, XrFrame
 from xr_commander.frames import Pose
+from xr_commander.motor_health import FAULT, HealthRow, MotorHealthReports
 from xr_commander.panel import (
     HandSource,
+    PanelLine,
     PanelState,
+    alert_lines,
     hand_line,
+    health_lines,
     recorder_row,
     render,
     snapshot,
@@ -19,6 +24,41 @@ from xr_commander.publish import LatestPose
 from xr_commander.record import RecorderStatus
 
 POSE = Pose(np.zeros(3), IDENTITY)
+
+
+def quiet():
+    """An alert map with nothing active."""
+    return ActiveAlerts()
+
+
+def raised(*alerts):
+    """An alert map holding each (source, severity, message)."""
+    active = ActiveAlerts()
+    for source_name, severity, message in alerts:
+        active.update("left_arm_inst", source_name, "motor_overload", severity, message)
+    return active
+
+
+def no_health():
+    """A health store that has never received a report."""
+    return MotorHealthReports()
+
+
+def health_with(*sources):
+    """A health store holding one fully sensed report per (source, levels)."""
+    store = MotorHealthReports()
+    for source_name, levels in sources:
+        count = len(levels)
+        store.update(
+            source_name,
+            levels,
+            (0.10,) * count,
+            (0.09,) * count,
+            (0.03,) * count,
+            (33.0,) * count,
+            (31.0,) * count,
+        )
+    return store
 
 
 def states(**overrides):
@@ -105,7 +145,7 @@ def test_each_row_reads_its_own_hand_not_a_neighbours():
     # Routing every row off one hand would still render two plausible rows.
     session = FakeSession({"left": squeezing_hand()})
     hands = [source("left"), source("right")]
-    rows = snapshot(session, hands, 10.0).hands
+    rows = snapshot(session, hands, 10.0, quiet(), no_health()).hands
     assert [row.label for row in rows] == ["LEFT", "RIGHT"]
     assert rows[0].state == "re-anchoring"  # squeezing, fresh, not yet engaged
     assert rows[1].state == "no controller"  # never reported a controller
@@ -115,7 +155,9 @@ def test_an_unbound_arm_says_so_instead_of_waiting_forever():
     # An optional pairing left unbound would otherwise read "waiting for arm"
     # for the whole session.
     session = FakeSession({"left": squeezing_hand()})
-    rows = snapshot(session, [source("left", arm_bound=False)], 10.0).hands
+    rows = snapshot(
+        session, [source("left", arm_bound=False)], 10.0, quiet(), no_health()
+    ).hands
     assert rows[0].state == "no arm bound"
 
 
@@ -130,15 +172,21 @@ def test_a_pair_established_after_boot_reaches_the_panel():
         measured=LatestPose(),
         arm_paired=lambda: bool(paired),
     )
-    assert snapshot(session, [hand], 10.0).hands[0].state == "no arm bound"
+    assert (
+        snapshot(session, [hand], 10.0, quiet(), no_health()).hands[0].state
+        == "no arm bound"
+    )
     paired.append(True)
-    assert snapshot(session, [hand], 10.0).hands[0].state != "no arm bound"
+    assert (
+        snapshot(session, [hand], 10.0, quiet(), no_health()).hands[0].state
+        != "no arm bound"
+    )
 
 
 def test_a_stale_follower_is_reported_per_hand():
     session = FakeSession({"left": squeezing_hand(), "right": squeezing_hand()})
     hands = [source("left", fresh=False), source("right", fresh=True)]
-    rows = snapshot(session, hands, 10.0).hands
+    rows = snapshot(session, hands, 10.0, quiet(), no_health()).hands
     assert rows[0].state == "waiting for arm"
     assert rows[1].state != "waiting for arm"
 
@@ -146,18 +194,29 @@ def test_a_stale_follower_is_reported_per_hand():
 def test_the_link_reads_live_only_while_frames_are_fresh():
     fresh = FakeSession({"left": squeezing_hand()}, age_s=0.0)
     stale = FakeSession({"left": squeezing_hand()}, age_s=5.0)
-    assert snapshot(fresh, [source("left")], 0.25).headset_live
-    assert not snapshot(stale, [source("left")], 0.25).headset_live
+    assert snapshot(fresh, [source("left")], 0.25, quiet(), no_health()).headset_live
+    assert not snapshot(
+        stale, [source("left")], 0.25, quiet(), no_health()
+    ).headset_live
 
 
 def test_a_stale_frame_leaves_every_hand_untracked():
     stale = FakeSession({"left": squeezing_hand()}, age_s=5.0)
-    rows = snapshot(stale, [source("left")], 0.25).hands
+    rows = snapshot(stale, [source("left")], 0.25, quiet(), no_health()).hands
     assert rows[0].state == "no controller"
 
 
 def panel_state(*rows):
     return PanelState(headset_live=True, hands=tuple(rows))
+
+
+def test_an_unwired_alert_slot_renders_differently_from_a_quiet_one():
+    # "none" and "not wired" must differ in pixels, not just in state: the
+    # panel is the only place the operator can see the difference.
+    rows = (hand_line("LEFT", **states()),)
+    quiet = render(PanelState(headset_live=True, hands=rows, alerts_bound=True))
+    unwired = render(PanelState(headset_live=True, hands=rows, alerts_bound=False))
+    assert not np.array_equal(quiet, unwired)
 
 
 def test_a_rendered_frame_is_what_the_encoder_expects():
@@ -206,7 +265,9 @@ def recording_status(frames=0):
 def test_no_recorder_means_no_row():
     assert recorder_row(None) is None
     session = FakeSession({"left": squeezing_hand()})
-    assert snapshot(session, [source("left")], 10.0).recorder is None
+    assert (
+        snapshot(session, [source("left")], 10.0, quiet(), no_health()).recorder is None
+    )
 
 
 def test_the_recorder_row_reads_the_status():
@@ -267,6 +328,172 @@ def test_a_frame_count_change_changes_the_state():
     # The redraw is equality-gated, so a stale count would freeze the row.
     session = FakeSession({"left": squeezing_hand()})
     hands = [source("left")]
-    first = snapshot(session, hands, 10.0, recording_status(frames=1))
-    second = snapshot(session, hands, 10.0, recording_status(frames=2))
+    first = snapshot(
+        session, hands, 10.0, quiet(), no_health(), recording_status(frames=1)
+    )
+    second = snapshot(
+        session, hands, 10.0, quiet(), no_health(), recording_status(frames=2)
+    )
     assert first != second
+
+
+def alert(source_name="left arm j2", severity=1, message="holding 93% of rated"):
+    return (source_name, severity, message)
+
+
+def test_an_active_alert_reaches_the_panel():
+    session = FakeSession({"left": squeezing_hand()})
+    state = snapshot(session, [source("left")], 10.0, raised(alert()), no_health())
+    assert len(state.alerts) == 1
+    assert "LEFT ARM J2 WARNING" in state.alerts[0].text
+
+
+def test_a_quiet_robot_lists_no_alerts():
+    session = FakeSession({"left": squeezing_hand()})
+    assert snapshot(session, [source("left")], 10.0, quiet(), no_health()).alerts == ()
+
+
+def test_the_worst_alert_is_listed_first():
+    state = snapshot(
+        FakeSession({"left": squeezing_hand()}),
+        [source("left")],
+        10.0,
+        raised(alert("left arm j2", 1, "warm"), alert("right arm j1", 3, "limp")),
+        no_health(),
+    )
+    assert state.alerts[0].text.startswith("RIGHT ARM J1 FAULT")
+    assert state.alerts[1].text.startswith("LEFT ARM J2 WARNING")
+
+
+def test_severity_picks_the_alert_colour():
+    warning, fault = alert_lines(
+        raised(alert("a", 1, "x"), alert("b", 3, "y")).active()
+    )
+    assert warning.colour != fault.colour
+
+
+def test_alerts_past_the_canvas_are_counted_not_dropped():
+    # Silently showing three of six would read as a less broken robot than it
+    # is; the last line has to say how many are hidden.
+    lines = alert_lines(
+        raised(*[alert(f"joint {i}", 1, "warm") for i in range(6)]).active()
+    )
+    assert len(lines) == panel._MAX_ALERT_LINES
+    hidden = 6 - (panel._MAX_ALERT_LINES - 1)
+    assert lines[-1].text == f"+{hidden} more"
+
+
+def test_exactly_a_full_canvas_shows_every_alert():
+    lines = alert_lines(
+        raised(
+            *[alert(f"joint {i}", 1, "warm") for i in range(panel._MAX_ALERT_LINES)]
+        ).active()
+    )
+    assert len(lines) == panel._MAX_ALERT_LINES
+    assert not any(line.text.endswith("more") for line in lines)
+
+
+def test_the_alert_section_is_drawn_below_the_status_rows():
+    rows = (hand_line("LEFT", **states()), hand_line("RIGHT", **states()))
+    without = render(PanelState(headset_live=True, hands=rows))
+    with_alert = render(
+        PanelState(
+            headset_live=True,
+            hands=rows,
+            alerts=(PanelLine("LEFT ARM J2 WARNING: warm", (60, 200, 250)),),
+        )
+    )
+    status_area = slice(0, panel._RULE_Y)
+    assert np.array_equal(without[status_area], with_alert[status_area])
+    assert not np.array_equal(without[panel._RULE_Y :], with_alert[panel._RULE_Y :])
+
+
+def test_a_long_alert_stays_inside_the_panel():
+    # Shrunk rather than truncated: the joint and the number are at opposite
+    # ends of the message, so a clipped line loses one of them.
+    long_alert = PanelLine("RIGHT ARM J4 " + "CRITICAL: " * 8 + "99%", (70, 70, 235))
+    frame = render(PanelState(headset_live=True, hands=(), alerts=(long_alert,)))
+    lit = np.nonzero(np.any(frame != panel._BACKGROUND, axis=2).any(axis=0))[0]
+    assert lit.max() < panel._WIDTH - 1
+
+
+def test_a_snapshot_carries_health_rows():
+    session = FakeSession({"left": squeezing_hand()})
+    store = health_with(("left gripper", (1,)))
+    state = snapshot(session, [source("left")], 10.0, quiet(), store)
+    assert len(state.health) == 1
+    assert state.health[0].text.startswith("LEFT GRIPPER WARNING")
+
+
+def test_each_health_level_wears_its_own_colour():
+    rows = [HealthRow(f"row {level}", level) for level in range(5)]
+    colours = [line.colour for line in health_lines(rows)]
+    assert len(set(colours)) == len(rows)
+
+
+def test_a_health_heading_is_not_coloured_as_a_severity():
+    heading, motor = health_lines(
+        [HealthRow("LEFT ARM", None), HealthRow("j1 nominal", 0)]
+    )
+    assert heading.colour != motor.colour
+
+
+def test_health_rows_past_the_canvas_are_counted_not_dropped():
+    # The fixed four-source stack fits exactly; anything beyond it must be
+    # counted rather than silently cut.
+    rows = [HealthRow(f"j{i} nominal", 0) for i in range(panel._MAX_HEALTH_LINES + 7)]
+    lines = health_lines(rows)
+    assert len(lines) == panel._MAX_HEALTH_LINES
+    assert lines[-1].text == "+8 more"
+
+
+def test_exactly_a_full_health_canvas_shows_every_row():
+    rows = [HealthRow(f"j{i} nominal", 0) for i in range(panel._MAX_HEALTH_LINES)]
+    lines = health_lines(rows)
+    assert len(lines) == panel._MAX_HEALTH_LINES
+    assert not any(line.text.endswith("more") for line in lines)
+
+
+def test_the_collapsed_health_line_wears_the_worst_hidden_level():
+    # A fault buried past the canvas must still colour the panel; counting
+    # it in nominal grey would read as a healthy overflow.
+    nominal = [HealthRow(f"j{i} nominal", 0) for i in range(panel._MAX_HEALTH_LINES)]
+    lines = health_lines(nominal + [HealthRow("j99 FAULT", FAULT)])
+    (fault_line,) = health_lines([HealthRow("x", FAULT)])
+    assert lines[-1].colour == fault_line.colour
+
+
+def test_the_health_section_is_drawn_below_the_alerts():
+    rows = (hand_line("LEFT", **states()),)
+    without = render(PanelState(headset_live=True, hands=rows))
+    with_health = render(
+        PanelState(
+            headset_live=True,
+            hands=rows,
+            health=health_lines([HealthRow("j1 nominal peak 3%", 0)]),
+        )
+    )
+    above = slice(0, panel._MOTORS_RULE_Y)
+    assert np.array_equal(without[above], with_health[above])
+    assert not np.array_equal(
+        without[panel._MOTORS_RULE_Y :], with_health[panel._MOTORS_RULE_Y :]
+    )
+
+
+def test_an_unwired_health_slot_renders_differently_from_a_quiet_one():
+    # "no reports" and "not wired" must differ in pixels: with producers
+    # wired, a silent section is a finding, not a launcher choice.
+    rows = (hand_line("LEFT", **states()),)
+    wired = render(PanelState(headset_live=True, hands=rows, health_bound=True))
+    unwired = render(PanelState(headset_live=True, hands=rows, health_bound=False))
+    assert not np.array_equal(wired, unwired)
+
+
+def test_a_long_health_row_stays_inside_the_panel():
+    long_row = PanelLine(
+        "j7 NOT REPORTING peak 100% rated 112% sust 108% 101C/98C" + " x" * 40,
+        (230, 120, 230),
+    )
+    frame = render(PanelState(headset_live=True, hands=(), health=(long_row,)))
+    lit = np.nonzero(np.any(frame != panel._BACKGROUND, axis=2).any(axis=0))[0]
+    assert lit.max() < panel._WIDTH - 1

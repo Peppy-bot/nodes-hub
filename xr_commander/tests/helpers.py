@@ -60,6 +60,16 @@ class FakeSubscription:
         await asyncio.Event().wait()
 
 
+class ClosingSubscription:
+    """Yields queued items then closes, so a drain loop ends on its own."""
+
+    def __init__(self, items):
+        self._items = list(items)
+
+    async def next(self):
+        return self._items.pop(0) if self._items else None
+
+
 class FakeToken:
     """A cancellation token the test fires by hand."""
 
