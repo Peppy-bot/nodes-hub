@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from functools import lru_cache
 
 import cv2
 import numpy as np
@@ -153,6 +154,11 @@ _MIN_SCALE_FRACTION = 0.55
 _ELLIPSIS = "..."
 
 
+# Memoized: draw_banner refits the same text every camera frame while an
+# alert stands, and the truncation branch measures once per dropped
+# character. The result is pure in the arguments, so a standing banner
+# costs one cache lookup per frame instead.
+@lru_cache(maxsize=256)
 def fit_text(
     text: str, font: int, scale: float, thickness: int, available_px: int
 ) -> tuple[str, float]:
