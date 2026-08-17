@@ -29,7 +29,7 @@ OTHER_ARM = (CORE, "backbone_inst", "right_arm_link")
 
 def joint_message(position: float):
     return SimpleNamespace(
-        stamp=NOW_NS / 1e9, positions=[position], velocities=[], efforts=[]
+        timestamp=NOW_NS / 1e9, positions=[position], velocities=[], efforts=[]
     )
 
 
@@ -75,7 +75,7 @@ def test_an_unusable_message_leaves_the_previous_sample():
     route = _route_link(cache, LinkKind.JOINT, recording.action_sample)
     route(observed(BACKBONE), joint_message(0.5))
 
-    route(observed(BACKBONE), SimpleNamespace(stamp=0.0, positions=[9.0], velocities=[], efforts=[]))
+    route(observed(BACKBONE), SimpleNamespace(timestamp=0.0, positions=[9.0], velocities=[], efforts=[]))
 
     assert cache.links[BACKBONE].positions == (0.5,)
 
@@ -109,13 +109,13 @@ def test_each_slot_drains_through_the_parser_for_its_role():
     # does not, so the parser each slot was wired with is visible in what the
     # sample records.
     routes = {label: route for label, _, route in drained}
-    message = SimpleNamespace(stamp=NOW_NS / 1e9, opening=0.4, effort=0.9)
+    message = SimpleNamespace(timestamp=NOW_NS / 1e9, opening=0.4, effort=0.9)
 
     routes["observed_grippers"](observed(BACKBONE), message)
-    assert cache.links[BACKBONE] == GripperSample(opening=0.4, effort=0.9, stamp_ns=NOW_NS)
+    assert cache.links[BACKBONE] == GripperSample(opening=0.4, effort=0.9, timestamp_ns=NOW_NS)
 
     routes["commanded_grippers"](observed(OTHER_ARM), message)
-    assert cache.links[OTHER_ARM] == GripperSample(opening=0.4, effort=0.0, stamp_ns=NOW_NS)
+    assert cache.links[OTHER_ARM] == GripperSample(opening=0.4, effort=0.0, timestamp_ns=NOW_NS)
 
 
 class NeverCancelledToken:
@@ -189,7 +189,7 @@ def test_joint_setpoints_and_states_share_the_wire_shape():
     reading the other's message must still produce the same sample."""
     message = joint_message(0.125)
     assert recording.state_sample(LinkKind.JOINT, message) == JointSample(
-        positions=(0.125,), velocities=(), efforts=(), stamp_ns=NOW_NS
+        positions=(0.125,), velocities=(), efforts=(), timestamp_ns=NOW_NS
     )
     assert recording.action_sample(LinkKind.JOINT, message) == recording.state_sample(
         LinkKind.JOINT, message

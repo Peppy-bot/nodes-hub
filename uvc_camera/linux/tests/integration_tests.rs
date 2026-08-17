@@ -11,7 +11,7 @@ mod helpers;
 
 use helpers::virtual_camera::VirtualCamera;
 use std::time::{Duration, Instant};
-use uvc_camera_linux::camera::{CameraDevice, wall_stamp};
+use uvc_camera_linux::camera::{CameraDevice, wall_timestamp};
 use uvc_camera_linux::types::{CameraConfig, Encoding, FrameRate, Resolution};
 
 fn config_for(device_path: &str) -> CameraConfig {
@@ -36,7 +36,7 @@ fn test_open_virtual_camera() {
         }
     };
 
-    let mut camera = CameraDevice::new(wall_stamp);
+    let mut camera = CameraDevice::new(wall_timestamp);
     camera
         .open(&config_for("/dev/video10"))
         .expect("Should open the virtual camera");
@@ -58,7 +58,7 @@ fn test_capture_frames_from_virtual_camera() {
         }
     };
 
-    let mut camera = CameraDevice::new(wall_stamp);
+    let mut camera = CameraDevice::new(wall_timestamp);
     camera
         .open(&config_for("/dev/video10"))
         .expect("Failed to open camera");
@@ -87,7 +87,7 @@ fn test_capture_color_bars() {
         }
     };
 
-    let mut camera = CameraDevice::new(wall_stamp);
+    let mut camera = CameraDevice::new(wall_timestamp);
     camera
         .open(&config_for("/dev/video10"))
         .expect("Failed to open camera");
@@ -119,7 +119,7 @@ fn test_camera_device_end_to_end() {
         }
     };
 
-    let mut camera = CameraDevice::new(wall_stamp);
+    let mut camera = CameraDevice::new(wall_timestamp);
     camera
         .open(&config_for("/dev/video10"))
         .expect("Failed to open camera");
@@ -148,7 +148,7 @@ fn test_frame_rate_timing() {
         }
     };
 
-    let mut camera = CameraDevice::new(wall_stamp);
+    let mut camera = CameraDevice::new(wall_timestamp);
     camera
         .open(&config_for("/dev/video10"))
         .expect("Failed to open camera");

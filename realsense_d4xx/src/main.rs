@@ -199,7 +199,7 @@ fn spawn_emit_task(
         while let Some(frameset) = frame_rx.recv().await {
             let FrameSet {
                 frame_id,
-                stamp,
+                timestamp,
                 align_mode,
                 color,
                 depth,
@@ -207,7 +207,7 @@ fn spawn_emit_task(
             let align_mode = align_mode.as_str();
 
             let color_header = video_stream::MessageHeader {
-                stamp,
+                timestamp,
                 frame_id,
                 align_mode: align_mode.to_string(),
             };
@@ -227,7 +227,7 @@ fn spawn_emit_task(
             }
 
             let depth_header = depth_stream::MessageHeader {
-                stamp,
+                timestamp,
                 frame_id,
                 align_mode: align_mode.to_string(),
             };

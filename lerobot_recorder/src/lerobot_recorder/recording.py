@@ -1,7 +1,7 @@
 """Latest-value cache keyed by observed link, the source schema captured at
 the first episode, and the pure zero-order-hold sampler.
 
-Every cached sample carries its producer stamp; producers stamp from the
+Every cached sample carries its producer timestamp; producers stamp from the
 daemon-resolved peppy clock and staleness is measured against the recorder's
 reading of that same clock, so freshness holds across hosts and under sim
 time only when both sides honor that convention. The sampler never waits for
@@ -43,14 +43,14 @@ class JointSample:
     positions: tuple[float, ...]
     velocities: tuple[float, ...]
     efforts: tuple[float, ...]
-    stamp_ns: int
+    timestamp_ns: int
 
 
 @dataclass(frozen=True)
 class GripperSample:
     opening: float
     effort: float
-    stamp_ns: int
+    timestamp_ns: int
 
 
 LinkSample = JointSample | GripperSample
@@ -62,7 +62,7 @@ class CameraFrame:
     width: int
     height: int
     data: bytes
-    stamp_ns: int
+    timestamp_ns: int
 
 
 @dataclass
@@ -86,25 +86,25 @@ class Cache:
         )
 
 
-def stamp_to_ns(stamp_s: float) -> int | None:
-    """Producer stamp (epoch seconds) as integer nanoseconds; None for a
-    pre-epoch or non-finite stamp a consumer must not anchor staleness on."""
-    if not math.isfinite(stamp_s) or stamp_s <= 0:
+def timestamp_to_ns(timestamp_s: float) -> int | None:
+    """Producer timestamp (epoch seconds) as integer nanoseconds; None for a
+    pre-epoch or non-finite timestamp a consumer must not anchor staleness on."""
+    if not math.isfinite(timestamp_s) or timestamp_s <= 0:
         return None
-    return int(stamp_s * 1_000_000_000)
+    return int(timestamp_s * 1_000_000_000)
 
 
 def state_sample(kind: LinkKind, message) -> LinkSample | None:
     """Cacheable sample from one measured-stream message; None when it cannot
-    anchor a frame (pre-epoch stamp or non-finite values)."""
+    anchor a frame (pre-epoch timestamp or non-finite values)."""
     if kind is LinkKind.JOINT:
         return _joint_sample(message)
-    return _gripper_sample(message.stamp, message.opening, message.effort)
+    return _gripper_sample(message.timestamp, message.opening, message.effort)
 
 
 def _joint_sample(message) -> JointSample | None:
-    stamp_ns = stamp_to_ns(message.stamp)
-    if stamp_ns is None:
+    timestamp_ns = timestamp_to_ns(message.timestamp)
+    if timestamp_ns is None:
         return None
     positions = tuple(message.positions)
     velocities = tuple(message.velocities)
@@ -113,7 +113,7 @@ def _joint_sample(message) -> JointSample | None:
     if not all(math.isfinite(v) for v in values):
         return None
     return JointSample(
-        positions=positions, velocities=velocities, efforts=efforts, stamp_ns=stamp_ns
+        positions=positions, velocities=velocities, efforts=efforts, timestamp_ns=timestamp_ns
     )
 
 
@@ -123,18 +123,18 @@ def action_sample(kind: LinkKind, message) -> LinkSample | None:
     action), so the sample's effort stays 0 and is never recorded."""
     if kind is LinkKind.JOINT:
         return _joint_sample(message)
-    return _gripper_sample(message.stamp, message.opening, 0.0)
+    return _gripper_sample(message.timestamp, message.opening, 0.0)
 
 
-def _gripper_sample(stamp: float, opening: float, effort: float) -> GripperSample | None:
-    stamp_ns = stamp_to_ns(stamp)
-    if stamp_ns is None or not (math.isfinite(opening) and math.isfinite(effort)):
+def _gripper_sample(timestamp: float, opening: float, effort: float) -> GripperSample | None:
+    timestamp_ns = timestamp_to_ns(timestamp)
+    if timestamp_ns is None or not (math.isfinite(opening) and math.isfinite(effort)):
         return None
-    return GripperSample(opening=opening, effort=effort, stamp_ns=stamp_ns)
+    return GripperSample(opening=opening, effort=effort, timestamp_ns=timestamp_ns)
 
 
-def _age_s(stamp_ns: int, now_ns: int) -> float:
-    return max(0, now_ns - stamp_ns) / 1e9
+def _age_s(timestamp_ns: int, now_ns: int) -> float:
+    return max(0, now_ns - timestamp_ns) / 1e9
 
 
 @dataclass(frozen=True)
@@ -228,7 +228,7 @@ def _fresh_link_sample(
     sample = cache.links[entry.key]
     if sample is None:
         raise gap(f"link {entry.label} has not produced yet")
-    age_s = _age_s(sample.stamp_ns, now_ns)
+    age_s = _age_s(sample.timestamp_ns, now_ns)
     if age_s > staleness_s:
         raise gap(f"link {entry.label} stale ({age_s:.2f}s behind)")
     return sample
@@ -240,9 +240,9 @@ def _hold_in_place(sample: LinkSample) -> LinkSample:
     it does for a real gripper setpoint."""
     if isinstance(sample, JointSample):
         return JointSample(
-            positions=sample.positions, velocities=(), efforts=(), stamp_ns=sample.stamp_ns
+            positions=sample.positions, velocities=(), efforts=(), timestamp_ns=sample.timestamp_ns
         )
-    return GripperSample(opening=sample.opening, effort=0.0, stamp_ns=sample.stamp_ns)
+    return GripperSample(opening=sample.opening, effort=0.0, timestamp_ns=sample.timestamp_ns)
 
 
 def _held_link_sample(
@@ -318,7 +318,7 @@ def capture_schema(
     def fresh_geometry(frames, entries, what):
         geometry = []
         for entry, frame in zip(entries, frames, strict=True):
-            if frame is None or _age_s(frame.stamp_ns, now_ns) > staleness_s:
+            if frame is None or _age_s(frame.timestamp_ns, now_ns) > staleness_s:
                 raise NotReady(f"{what} {entry.name} has no fresh frame")
             if frame.width <= 0 or frame.height <= 0:
                 raise NotReady(f"{what} {entry.name} reports {frame.width}x{frame.height}")
@@ -428,7 +428,7 @@ def sample(
     def pend(frame: CameraFrame | None, geometry, entry, name, depth_unit_m=None):
         if frame is None:
             raise SampleGap(f"camera {entry.name} stopped producing")
-        age_s = _age_s(frame.stamp_ns, now_ns)
+        age_s = _age_s(frame.timestamp_ns, now_ns)
         if age_s > staleness_s:
             raise SampleGap(f"camera {entry.name} silent ({age_s:.2f}s behind)")
         if (frame.width, frame.height) != geometry:

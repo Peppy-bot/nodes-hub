@@ -30,10 +30,10 @@ use tracing::{error, info, warn};
 use crate::frame::{FrameSet, Image};
 use crate::modes::{AlignMode, AutoManualMode, ColorFormat};
 
-/// Stamp from the daemon-resolved clock: the OS clock in wall mode, the
+/// Timestamp from the daemon-resolved clock: the OS clock in wall mode, the
 /// simulator's time when the stack runs under sim time. Requires
 /// `peppygen::clock::init`, which setup runs before the capture loop spawns.
-fn stamp_now() -> std::result::Result<SystemTime, String> {
+fn timestamp_now() -> std::result::Result<SystemTime, String> {
     let ns = peppygen::clock::now_ns().map_err(|e| e.to_string())?;
     Ok(UNIX_EPOCH + Duration::from_nanos(ns))
 }
@@ -192,7 +192,7 @@ impl Capture {
                 continue;
             };
 
-            let Ok(stamp) = stamp_now() else {
+            let Ok(timestamp) = timestamp_now() else {
                 continue; // clock not ready yet: skip rather than mis-stamp
             };
             let id = frame_id;
@@ -201,7 +201,7 @@ impl Capture {
 
             let frameset = FrameSet {
                 frame_id: id,
-                stamp,
+                timestamp,
                 align_mode: mode,
                 color: Image {
                     bytes: frame_bytes(&color),

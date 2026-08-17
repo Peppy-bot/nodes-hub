@@ -69,7 +69,7 @@ class LatestPose:
         return self._value
 
 
-def _stamp_seconds() -> float:
+def _timestamp_seconds() -> float:
     """Daemon-resolved clock (sim time under a sim clock)."""
     return peppygen.clock.now_ns() / 1e9
 
@@ -154,7 +154,7 @@ async def stream_pose(
     def build():
         # Stamped first: a clock that cannot stamp must fail the tick before
         # the clutch mutates its engagement state.
-        stamp = _stamp_seconds()
+        timestamp = _timestamp_seconds()
         sample = fresh_sample(session, handedness, settings.stale_timeout_s)
         measured_ee = measured.fresh(settings.stale_timeout_s)
         if measured_ee is not None:
@@ -172,7 +172,7 @@ async def stream_pose(
         if target is None:
             return None
         position, orientation = target.as_wire()
-        return topic_module.build_message(stamp, position, orientation)
+        return topic_module.build_message(timestamp, position, orientation)
 
     await _run_stream(
         node_runner,
@@ -206,7 +206,7 @@ async def stream_gripper(
         opening = gripper_opening(sample.trigger, settings.gripper_open_fraction)
         # A trigger carries no effort intent, so max_effort rides 0 and the
         # follower's ceiling applies.
-        return topic_module.build_message(_stamp_seconds(), opening, 0.0)
+        return topic_module.build_message(_timestamp_seconds(), opening, 0.0)
 
     await _run_stream(
         node_runner,

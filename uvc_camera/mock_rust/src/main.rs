@@ -14,9 +14,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// Stamp from the daemon-resolved clock; identical to the OS clock in wall
+/// Timestamp from the daemon-resolved clock; identical to the OS clock in wall
 /// mode, the simulator's time under sim time.
-fn stamp_now() -> std::result::Result<SystemTime, String> {
+fn timestamp_now() -> std::result::Result<SystemTime, String> {
     let ns = peppygen::clock::now_ns().map_err(|e| e.to_string())?;
     Ok(UNIX_EPOCH + Duration::from_nanos(ns))
 }
@@ -188,15 +188,15 @@ async fn run_video_loop(
             },
         };
 
-        let stamp = match stamp_now() {
-            Ok(stamp) => stamp,
+        let timestamp = match timestamp_now() {
+            Ok(timestamp) => timestamp,
             Err(e) => {
                 // Sim mode before the first tick: skip rather than mis-stamp.
                 tracing::debug!("skipping frame: {e}");
                 continue;
             }
         };
-        let header = MessageHeader { stamp, frame_id };
+        let header = MessageHeader { timestamp, frame_id };
 
         let payload =
             match video_stream::build_message(header, encoding.clone(), width, height, data) {

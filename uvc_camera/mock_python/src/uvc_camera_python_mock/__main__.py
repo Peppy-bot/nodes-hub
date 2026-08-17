@@ -171,12 +171,12 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
                     # packed bytes directly from the plane to avoid a numpy
                     # dependency.
                     try:
-                        stamp = clock.now_ns() / 1e9
+                        timestamp = clock.now_ns() / 1e9
                     except RuntimeError:
-                        # Sim mode before the first tick: skip, never mis-stamp.
+                        # Sim mode before the first tick: skip, never mis-timestamp.
                         time.sleep(frame_duration)
                         continue
-                    header = MessageHeader(stamp=stamp, frame_id=frame_id)
+                    header = MessageHeader(timestamp=timestamp, frame_id=frame_id)
                     payload = video_stream.build_message(
                         header, encoding, width, height, bytes(rgb_frame.planes[0])
                     )

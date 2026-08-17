@@ -24,7 +24,7 @@ from lerobot_recorder.recording import (
     efforts_dim_names,
     sample,
     schema_mismatch,
-    stamp_to_ns,
+    timestamp_to_ns,
     state_dim_names,
     state_sample,
     validate_depth_units,
@@ -87,22 +87,22 @@ def make_plan(state=None, action=(), color=0, rgbd=0) -> RecordingPlan:
     )
 
 
-def joints(n, stamp_ns=NOW_NS, velocities=True, efforts=False) -> JointSample:
+def joints(n, timestamp_ns=NOW_NS, velocities=True, efforts=False) -> JointSample:
     return JointSample(
         positions=(0.1,) * n,
         velocities=(0.0,) * n if velocities else (),
         efforts=(0.2,) * n if efforts else (),
-        stamp_ns=stamp_ns,
+        timestamp_ns=timestamp_ns,
     )
 
 
-def grip(opening=0.5, effort=0.1, stamp_ns=NOW_NS) -> GripperSample:
-    return GripperSample(opening=opening, effort=effort, stamp_ns=stamp_ns)
+def grip(opening=0.5, effort=0.1, timestamp_ns=NOW_NS) -> GripperSample:
+    return GripperSample(opening=opening, effort=effort, timestamp_ns=timestamp_ns)
 
 
-def rgb_frame(w=4, h=2, stamp_ns=NOW_NS) -> CameraFrame:
+def rgb_frame(w=4, h=2, timestamp_ns=NOW_NS) -> CameraFrame:
     return CameraFrame(
-        encoding="rgb8", width=w, height=h, data=bytes(w * h * 3), stamp_ns=stamp_ns
+        encoding="rgb8", width=w, height=h, data=bytes(w * h * 3), timestamp_ns=timestamp_ns
     )
 
 
@@ -111,41 +111,41 @@ def capture(cache, plan, depth_units=()):
     return capture_schema(cache, plan, units, NOW_NS, STALENESS_S)
 
 
-def test_stamp_to_ns_rejects_pre_epoch_and_non_finite():
-    assert stamp_to_ns(0.0) is None
-    assert stamp_to_ns(-1.0) is None
+def test_timestamp_to_ns_rejects_pre_epoch_and_non_finite():
+    assert timestamp_to_ns(0.0) is None
+    assert timestamp_to_ns(-1.0) is None
     # int() raises on these, which would escape as a per-message route error.
-    assert stamp_to_ns(float("nan")) is None
-    assert stamp_to_ns(float("inf")) is None
-    assert stamp_to_ns(float("-inf")) is None
-    assert stamp_to_ns(1.5) == 1_500_000_000
+    assert timestamp_to_ns(float("nan")) is None
+    assert timestamp_to_ns(float("inf")) is None
+    assert timestamp_to_ns(float("-inf")) is None
+    assert timestamp_to_ns(1.5) == 1_500_000_000
 
 
-def joint_message(positions, velocities=(), efforts=(), stamp=1.5):
+def joint_message(positions, velocities=(), efforts=(), timestamp=1.5):
     return SimpleNamespace(
-        stamp=stamp, positions=list(positions), velocities=list(velocities), efforts=list(efforts)
+        timestamp=timestamp, positions=list(positions), velocities=list(velocities), efforts=list(efforts)
     )
 
 
-def gripper_message(opening=0.5, effort=0.1, stamp=1.5):
-    return SimpleNamespace(stamp=stamp, opening=opening, effort=effort)
+def gripper_message(opening=0.5, effort=0.1, timestamp=1.5):
+    return SimpleNamespace(timestamp=timestamp, opening=opening, effort=effort)
 
 
 def test_state_sample_parses_joint_message():
     parsed = state_sample(LinkKind.JOINT, joint_message([1.0, 2.0], velocities=[0.1, 0.2]))
     assert parsed == JointSample(
-        positions=(1.0, 2.0), velocities=(0.1, 0.2), efforts=(), stamp_ns=1_500_000_000
+        positions=(1.0, 2.0), velocities=(0.1, 0.2), efforts=(), timestamp_ns=1_500_000_000
     )
-    assert state_sample(LinkKind.JOINT, joint_message([1.0], stamp=0.0)) is None
+    assert state_sample(LinkKind.JOINT, joint_message([1.0], timestamp=0.0)) is None
     assert state_sample(LinkKind.JOINT, joint_message([float("nan")])) is None
     assert state_sample(LinkKind.JOINT, joint_message([1.0], efforts=[float("inf")])) is None
 
 
 def test_state_sample_parses_gripper_message():
     parsed = state_sample(LinkKind.GRIPPER, gripper_message(opening=0.7, effort=0.3))
-    assert parsed == GripperSample(opening=0.7, effort=0.3, stamp_ns=1_500_000_000)
+    assert parsed == GripperSample(opening=0.7, effort=0.3, timestamp_ns=1_500_000_000)
     assert state_sample(LinkKind.GRIPPER, gripper_message(opening=float("nan"))) is None
-    assert state_sample(LinkKind.GRIPPER, gripper_message(stamp=-1.0)) is None
+    assert state_sample(LinkKind.GRIPPER, gripper_message(timestamp=-1.0)) is None
 
 
 def test_schema_locks_layouts_and_derives_names():
@@ -221,7 +221,7 @@ def test_schema_requires_every_link():
 def test_schema_requires_fresh_links():
     plan = make_plan(state=(joint_entry(),))
     cache = Cache.for_plan(plan)
-    cache.links[ARM0] = joints(7, stamp_ns=NOW_NS - 10_000_000_000)
+    cache.links[ARM0] = joints(7, timestamp_ns=NOW_NS - 10_000_000_000)
     with pytest.raises(NotReady, match="stale"):
         capture(cache, plan)
 
@@ -229,7 +229,7 @@ def test_schema_requires_fresh_links():
 def test_layout_rejects_empty_joints():
     plan = make_plan(state=(joint_entry(),))
     cache = Cache.for_plan(plan)
-    cache.links[ARM0] = JointSample(positions=(), velocities=(), efforts=(), stamp_ns=NOW_NS)
+    cache.links[ARM0] = JointSample(positions=(), velocities=(), efforts=(), timestamp_ns=NOW_NS)
     with pytest.raises(NotReady, match="no joints"):
         capture(cache, plan)
 
@@ -238,7 +238,7 @@ def test_layout_rejects_mismatched_vector_lengths():
     plan = make_plan(state=(joint_entry(),))
     cache = Cache.for_plan(plan)
     cache.links[ARM0] = JointSample(
-        positions=(0.1,) * 7, velocities=(0.0,) * 3, efforts=(), stamp_ns=NOW_NS
+        positions=(0.1,) * 7, velocities=(0.0,) * 3, efforts=(), timestamp_ns=NOW_NS
     )
     with pytest.raises(NotReady, match="3 velocities for 7 joints"):
         capture(cache, plan)
@@ -248,7 +248,7 @@ def test_schema_requires_fresh_camera():
     plan = make_plan(state=(joint_entry(),), color=1)
     cache = Cache.for_plan(plan)
     cache.links[ARM0] = joints(7)
-    cache.color = [rgb_frame(stamp_ns=NOW_NS - 10_000_000_000)]
+    cache.color = [rgb_frame(timestamp_ns=NOW_NS - 10_000_000_000)]
     with pytest.raises(NotReady, match="no fresh frame"):
         capture(cache, plan)
 
@@ -266,14 +266,14 @@ def test_schema_mismatch_flags_layout_drift():
     assert schema_mismatch(locked, capture(cache, plan)) is None
 
 
-def test_sample_tolerates_future_stamps():
+def test_sample_tolerates_future_timestamps():
     """Producer/recorder clock skew within the gate must not read as stale:
-    a future stamp ages as zero rather than negative."""
+    a future timestamp ages as zero rather than negative."""
     plan = make_plan(state=(joint_entry(),))
     cache = Cache.for_plan(plan)
     cache.links[ARM0] = joints(7)
     schema = capture(cache, plan)
-    cache.links[ARM0] = joints(7, stamp_ns=NOW_NS + 10_000_000_000)
+    cache.links[ARM0] = joints(7, timestamp_ns=NOW_NS + 10_000_000_000)
     row, _pending = sample(cache, schema, plan, NOW_NS, STALENESS_S)
     assert row.state.shape == (7,)
 
@@ -284,7 +284,7 @@ def test_action_holds_last_setpoint_regardless_of_age():
     plan = make_plan(state=(joint_entry(),), action=(action_entry(),))
     cache = Cache.for_plan(plan)
     cache.links[ARM0] = joints(7)
-    cache.links[COMMANDED_ARM0] = joints(7, stamp_ns=NOW_NS - 600_000_000_000)
+    cache.links[COMMANDED_ARM0] = joints(7, timestamp_ns=NOW_NS - 600_000_000_000)
     schema = capture(cache, plan)
     row, _pending = sample(cache, schema, plan, NOW_NS, STALENESS_S)
     assert row.action.shape == (7,)
@@ -292,18 +292,18 @@ def test_action_holds_last_setpoint_regardless_of_age():
 
 def test_action_sample_reads_gripper_setpoints_without_effort():
     # Gripper setpoints carry no effort field; the sample must not touch one.
-    message = SimpleNamespace(stamp=NOW_NS / 1e9, opening=0.4)
+    message = SimpleNamespace(timestamp=NOW_NS / 1e9, opening=0.4)
     s = action_sample(LinkKind.GRIPPER, message)
     assert s.opening == 0.4
     assert s.effort == 0.0
 
 
-def test_sample_flags_stale_link_by_producer_stamp():
+def test_sample_flags_stale_link_by_producer_timestamp():
     plan = make_plan(state=(joint_entry(),))
     cache = Cache.for_plan(plan)
     cache.links[ARM0] = joints(7)
     schema = capture(cache, plan)
-    cache.links[ARM0] = joints(7, stamp_ns=NOW_NS - 300_000_000)
+    cache.links[ARM0] = joints(7, timestamp_ns=NOW_NS - 300_000_000)
     with pytest.raises(SampleGap, match=r"stale \(0\.30s behind\)"):
         sample(cache, schema, plan, NOW_NS, STALENESS_S)
 
@@ -352,7 +352,7 @@ def test_sample_flags_mjpeg_payload_header_mismatch():
     cache.links[ARM0] = joints(7)
     # Header claims 4x4; the embedded JPEG is 2x2.
     cache.color = [
-        CameraFrame(encoding="mjpeg", width=4, height=4, data=buffer.getvalue(), stamp_ns=NOW_NS)
+        CameraFrame(encoding="mjpeg", width=4, height=4, data=buffer.getvalue(), timestamp_ns=NOW_NS)
     ]
     schema = capture(cache, plan)
     with pytest.raises(SampleGap, match="does not match header"):
@@ -366,7 +366,7 @@ def test_sample_flags_truncated_payload():
     cache.color = [rgb_frame()]
     schema = capture(cache, plan)
     cache.color = [
-        CameraFrame(encoding="rgb8", width=4, height=2, data=bytes(5), stamp_ns=NOW_NS)
+        CameraFrame(encoding="rgb8", width=4, height=2, data=bytes(5), timestamp_ns=NOW_NS)
     ]
     with pytest.raises(SampleGap, match="cam0"):
         decode_images(*sample(cache, schema, plan, NOW_NS, STALENESS_S))
@@ -381,7 +381,7 @@ def test_sample_defers_decode_to_decode_images():
     cache.rgbd_video = [rgb_frame()]
     z16 = np.zeros((2, 4), dtype="<u2")
     cache.rgbd_depth = [
-        CameraFrame(encoding="z16", width=4, height=2, data=z16.tobytes(), stamp_ns=NOW_NS)
+        CameraFrame(encoding="z16", width=4, height=2, data=z16.tobytes(), timestamp_ns=NOW_NS)
     ]
     schema = capture(cache, plan, depth_units=(0.001,))
     row, pending = sample(cache, schema, plan, NOW_NS, STALENESS_S)
@@ -411,14 +411,14 @@ def test_schema_mismatch_reports_camera_drift():
 
 def test_decode_bgr8_swaps_channels():
     data = bytes([10, 20, 30] * 2)
-    frame = CameraFrame(encoding="bgr8", width=2, height=1, data=data, stamp_ns=NOW_NS)
+    frame = CameraFrame(encoding="bgr8", width=2, height=1, data=data, timestamp_ns=NOW_NS)
     rgb = decode_color(frame)
     assert rgb[0, 0].tolist() == [30, 20, 10]
 
 
 def test_decode_depth_scales_to_meters():
     z16 = np.array([[1000, 2000]], dtype="<u2").tobytes()
-    frame = CameraFrame(encoding="z16", width=2, height=1, data=z16, stamp_ns=NOW_NS)
+    frame = CameraFrame(encoding="z16", width=2, height=1, data=z16, timestamp_ns=NOW_NS)
     meters = decode_depth(frame, 0.001)
     assert meters.shape == (1, 2, 1)
     assert meters.dtype == np.float32
@@ -429,7 +429,7 @@ def test_decode_depth_scales_to_meters():
 def test_yuyv_decodes_grey():
     # Limited-range mid grey: Y=128, U=V=128 -> 1.164384*(128-16) = 130.4.
     frame = CameraFrame(
-        encoding="yuyv", width=2, height=1, data=bytes([128, 128, 128, 128]), stamp_ns=NOW_NS
+        encoding="yuyv", width=2, height=1, data=bytes([128, 128, 128, 128]), timestamp_ns=NOW_NS
     )
     rgb = decode_color(frame)
     assert rgb.shape == (1, 2, 3)
@@ -441,7 +441,7 @@ def test_yuyv_range_endpoints():
     # 255; footroom and headroom codes clamp instead of wrapping.
     def decode(y):
         frame = CameraFrame(
-            encoding="yuyv", width=2, height=1, data=bytes([y, 128, y, 128]), stamp_ns=NOW_NS
+            encoding="yuyv", width=2, height=1, data=bytes([y, 128, y, 128]), timestamp_ns=NOW_NS
         )
         return decode_color(frame)
 
@@ -491,7 +491,7 @@ def test_action_falls_back_to_measured_until_commanded():
     assert row.action[7] == pytest.approx(0.4)
 
     commanded = JointSample(
-        positions=(0.9,) * 7, velocities=(), efforts=(), stamp_ns=NOW_NS
+        positions=(0.9,) * 7, velocities=(), efforts=(), timestamp_ns=NOW_NS
     )
     cache.links[COMMANDED_ARM0] = commanded
     cache.links[gripper_action_entry().key] = grip(opening=0.8, effort=0.0)
@@ -555,6 +555,6 @@ def test_schema_rejects_degenerate_camera_geometry():
     plan = make_plan(state=(joint_entry(),), color=1)
     cache = Cache.for_plan(plan)
     cache.links[ARM0] = joints(2)
-    cache.color = [CameraFrame(encoding="rgb8", width=0, height=0, data=b"", stamp_ns=NOW_NS)]
+    cache.color = [CameraFrame(encoding="rgb8", width=0, height=0, data=b"", timestamp_ns=NOW_NS)]
     with pytest.raises(NotReady, match="0x0"):
         capture(cache, plan)

@@ -59,7 +59,7 @@ class Situation:
         """Takes a subgoal as authoritative, starting its lifetime now.
 
         The lifetime is timed from this moment on this node's own monotonic
-        clock, never from the planner's `stamp`. The two machines do not share a
+        clock, never from the planner's `timestamp`. The two machines do not share a
         clock, and a watchdog that trusted a remote timestamp would misjudge
         exactly when it matters most.
         """
@@ -155,7 +155,7 @@ async def report_situation(node_runner: NodeRunner, state: Situation) -> None:
         active_subgoal_id = authoritative[0] if authoritative else NO_SUBGOAL
         await publisher.publish(
             situation.build_message(
-                # The wall clock, deliberately: `stamp` is for the reader, while
+                # The wall clock, deliberately: `timestamp` is for the reader, while
                 # the TTL is timed monotonically inside `Situation`.
                 time.time(),
                 list(state.joint_positions),

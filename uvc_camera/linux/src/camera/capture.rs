@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
-use crate::camera::v4l_device::{CameraDevice, ControlHandle, StreamDescription, clock_stamp};
+use crate::camera::v4l_device::{CameraDevice, ControlHandle, StreamDescription, clock_timestamp};
 use crate::pipeline;
 use crate::types::{CameraConfig, Error, FrameId, Result};
 
@@ -128,7 +128,7 @@ pub fn spawn_capture_loop(
     std::thread::spawn(move || {
         // The camera is dropped at the end of this closure either way, so by the
         // time `done_tx` fires the device is closed.
-        if let Some(camera) = open_camera(CameraDevice::new(clock_stamp), &config, open_tx) {
+        if let Some(camera) = open_camera(CameraDevice::new(clock_timestamp), &config, open_tx) {
             // Armed only once the camera is streaming. Arming it any earlier
             // would race the open report: setup selects over its own future and
             // the cancellation token, so a cancel landing alongside the failure
@@ -229,7 +229,7 @@ fn run_camera_capture_loop(
             .and_then(|raw| pipeline::process_frame(raw, frame_id, topic_encoding))
             .and_then(|frame| {
                 let header = MessageHeader {
-                    stamp: frame.captured_at(),
+                    timestamp: frame.captured_at(),
                     frame_id: frame.frame_id().as_u32(),
                 };
                 video_stream::build_message(

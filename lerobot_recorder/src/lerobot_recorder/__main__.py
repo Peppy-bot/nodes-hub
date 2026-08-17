@@ -32,7 +32,7 @@ from peppygen.parameters import Parameters
 from . import plan as plan_mod
 from . import recording, storage
 from .episode import Recorder
-from .recording import Cache, CameraFrame, stamp_to_ns
+from .recording import Cache, CameraFrame, timestamp_to_ns
 from .sink import Sink
 
 # Backoff after a failed receive or service request, so a persistently
@@ -119,15 +119,15 @@ def _route_frames(slots: list[CameraFrame | None], index: dict[plan_mod.Producer
         slot = index.get(plan_mod.producer_key(producer))
         if slot is None:
             return
-        stamp = stamp_to_ns(m.header.stamp)
-        if stamp is None:
+        timestamp = timestamp_to_ns(m.header.timestamp)
+        if timestamp is None:
             return
         slots[slot] = CameraFrame(
             encoding=m.encoding,
             width=m.width,
             height=m.height,
             data=m.frame,
-            stamp_ns=stamp,
+            timestamp_ns=timestamp,
         )
 
     return route
@@ -216,7 +216,7 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
             f"bucket {target.s3.bucket!r}, prefix {target.s3.prefix!r}"
         )
 
-    # Staleness ages producer stamps against this daemon-resolved clock (sim
+    # Staleness ages producer timestamps against this daemon-resolved clock (sim
     # time under a simulated clock); producers stamp from the same clock.
     await peppygen.clock.init(node_runner)
 

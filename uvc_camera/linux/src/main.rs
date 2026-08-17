@@ -79,7 +79,7 @@ fn main() -> Result<()> {
 
             // The synchronized clock stamping every frame: the OS clock in
             // wall mode, the simulator's time under sim time. Must be ready
-            // before the capture loop takes its first stamp.
+            // before the capture loop takes its first timestamp.
             peppygen::clock::init(&node_runner)
                 .await
                 .map_err(std::io::Error::other)?;
