@@ -1,17 +1,26 @@
 import asyncio
 import contextlib
 import time
-from types import SimpleNamespace
 
 import numpy as np
+import pytest
+
+import peppygen.clock
+from peppygen.consumed_actions.postures import move_to_home, move_to_ready
+from peppygen.consumed_topics.color_cameras import video_stream as color_video_stream
+from peppygen.paired_topics.right_arm import pose_setpoints as right_arm_pose_setpoints
+from peppygen.paired_topics.right_arm import pose_states as right_arm_pose_states
+from peppygen.paired_topics.right_gripper import (
+    gripper_setpoints as right_gripper_setpoints,
+)
 
 from tests.helpers import (
     POSE,
-    FakeSubscription,
     FakeToken,
-    FakeTopic,
     RecordingSink,
+    boot,
     default_parameters,
+    eventually,
 )
 from xr_commander import config, publish
 from xr_commander.clutch import HandClutch
@@ -27,40 +36,61 @@ def test_latest_pose_goes_stale_rather_than_lying():
     assert holder.fresh(10.0, now_monotonic=time.monotonic() + 60.0) is None
 
 
-def frame_message(width=1, height=1):
-    data = np.zeros((height, width, 3), dtype=np.uint8).tobytes()
-    return SimpleNamespace(encoding="bgr8", width=width, height=height, frame=data)
+def posture_settings():
+    return config.from_parameters(default_parameters())
 
 
-def test_drain_frames_routes_by_producer_and_skips_unknown_producers():
-    sink = RecordingSink()
-    known = SimpleNamespace(instance_id="cam_a")
-    unknown = SimpleNamespace(instance_id="ghost")
-    subscription = FakeSubscription(
-        [(known, frame_message()), (unknown, frame_message())]
+def frame_message(width=1, height=1, encoding="bgr8", data=None):
+    if data is None:
+        data = np.zeros((height, width, 3), dtype=np.uint8).tobytes()
+    return color_video_stream.Message(
+        header=color_video_stream.MessageHeader(timestamp=0.0, frame_id=0),
+        encoding=encoding,
+        width=width,
+        height=height,
+        frame=data,
     )
-    token = FakeToken()
 
-    async def run():
+
+async def test_drain_frames_routes_by_producer_and_skips_unknown_producers():
+    async with boot(color_cameras_instances=2) as h:
+        known_mock, unknown_mock = h.mocks.deps.color_cameras
+        known_id = color_video_stream.bound_producers(h.node_runner)[0].instance_id
+        sink = RecordingSink()
+        token = FakeToken()
         drain = asyncio.create_task(
             drain_frames(
-                None,
-                FakeTopic(subscription),
-                {"cam_a": sink},
+                h.node_runner,
+                color_video_stream,
+                {known_id: sink},
                 token,
                 "test",
             )
         )
-        await asyncio.sleep(0.05)
-        token.cancel()
-        await asyncio.wait_for(drain, 1.0)
-
-    asyncio.run(run())
-    assert len(sink.frames) == 1
-
+        try:
+            # A bound producer without a sink is skipped, not fatal: the
+            # known producer's frames keep landing afterwards.
+            await unknown_mock.video_stream.publish(frame_message())
+            await known_mock.video_stream.publish(frame_message())
+            await eventually(
+                lambda: len(sink.frames) == 1, message="the known producer's frame"
+            )
+            assert not drain.done()
+            await unknown_mock.video_stream.publish(frame_message())
+            await known_mock.video_stream.publish(frame_message())
+            await eventually(
+                lambda: len(sink.frames) == 2,
+                message="the known producer's second frame",
+            )
+        finally:
+            token.cancel()
+        await asyncio.wait_for(drain, 5.0)
 
 
 class FakeSession:
+    """A scripted headset: the FrameSource seam is a device surface, not a
+    generated module, so tests feed it hand states directly."""
+
     def __init__(self):
         self.hands = {}
 
@@ -80,80 +110,53 @@ class FakeSession:
         return XrFrame(received_monotonic_s=time.monotonic(), hands=self.hands)
 
 
-class FakeHandle:
-    accepted = True
-    reason = ""
-
-    def __init__(self, log):
-        self._log = log
-
-    async def cancel_goal(self, _timeout):
-        self._log.append("cancel")
-
-    async def get_result(self, _timeout):
-        await asyncio.Event().wait()
+def _primary(sample):
+    return sample.primary_button
 
 
-class FakeActionModule:
-    """The consumed-action module surface run_posture_button drives."""
-
-    TARGET_ACTION_NAME = "move_to_home"
-
-    def __init__(self, log, handle_cls=FakeHandle):
-        self.log = log
-        self.GoalRequest = lambda duration_s: duration_s
-        outer = self
-
-        class Handle:
-            @staticmethod
-            async def fire_goal(_runner, _target, _request, _timeout, _qos):
-                outer.log.append("fire")
-                return handle_cls(outer.log)
-
-        self.ActionHandle = Handle
-
-    def bound_producers(self, _runner):
-        return [SimpleNamespace(instance_id="backbone_inst")]
+def _secondary(sample):
+    return sample.secondary_button
 
 
-def posture_settings():
-    return config.from_parameters(default_parameters())
-
-
-def drive_posture_button(
-    script, pressed=lambda sample: sample.primary_button, handle_cls=FakeHandle
-):
-    """Run the button loop over (primary, secondary, squeeze) steps; a None
-    step is a headset gap (no tracked hands). Returns the action-call log."""
-    log = []
+@contextlib.asynccontextmanager
+async def posture_button(h, *, action_module, pressed):
+    """`run_posture_button` running against the real runner; yields the
+    scripted headset session."""
     session = FakeSession()
-
-    async def run():
-        token = FakeToken()
-        task = asyncio.create_task(
-            publish.run_posture_button(
-                None,
-                action_module=FakeActionModule(log, handle_cls),
-                pressed=pressed,
-                session=session,
-                settings=posture_settings(),
-                token=token,
-            )
+    token = FakeToken()
+    task = asyncio.create_task(
+        publish.run_posture_button(
+            h.node_runner,
+            action_module=action_module,
+            pressed=pressed,
+            session=session,
+            settings=posture_settings(),
+            token=token,
         )
-        for step in script:
-            if step is None:
-                session.hands = {}
-            else:
-                session.press(right=step)
-            await asyncio.sleep(0.03)
+    )
+    try:
+        yield session
+    finally:
         token.cancel()
-        # The loop only re-checks the token each tick; cancel the task too.
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
 
-    asyncio.run(run())
-    return log
+
+async def _press_until_goal(session, mock_action, press=(True, False, False)):
+    """Release-then-press cycles until the node fires: the button re-arms
+    only once the previous goal's result waiter finishes, so the retry
+    absorbs that tail without sleeping blind."""
+    deadline = time.monotonic() + 10.0
+    while True:
+        session.press(right=(False, False, False))
+        await asyncio.sleep(0.03)
+        session.press(right=press)
+        try:
+            return await mock_action.next_goal(0.5)
+        except TimeoutError:
+            if time.monotonic() >= deadline:
+                raise
 
 
 def test_the_result_wait_scales_with_long_posture_moves():
@@ -161,111 +164,151 @@ def test_the_result_wait_scales_with_long_posture_moves():
     assert publish._result_timeout_s(100.0) == 300.0
 
 
-def test_the_button_fires_once_per_rising_edge():
-    log = drive_posture_button(
-        [(False, False, False), (True, False, False), (True, False, False)]
-    )
-    assert log == ["fire"]
+async def test_the_button_fires_once_per_rising_edge():
+    async with boot(postures_instances=1) as h:
+        mock = h.mocks.deps.postures[0].move_to_home
+        async with posture_button(
+            h, action_module=move_to_home, pressed=_primary
+        ) as session:
+            session.press(right=(False, False, False))
+            await asyncio.sleep(0.05)
+            session.press(right=(True, False, False))
+            pending = await mock.next_goal(10.0)
+            # The goal reached the real move_to_home producer, carrying the
+            # configured posture duration.
+            assert pending.request.duration_s == 2.0
+            active = await pending.accept()
+            # Still held: one edge, one goal.
+            with pytest.raises(TimeoutError):
+                await mock.next_goal(0.4)
+            await active.complete(
+                move_to_home.ResultResponseData(success=True, message="done")
+            )
 
 
-def test_squeezing_cancels_the_move_in_flight():
-    log = drive_posture_button(
-        [(False, False, False), (True, False, False), (False, False, True)]
-    )
-    assert log == ["fire", "cancel"]
+async def test_squeezing_cancels_the_move_in_flight():
+    async with boot(postures_instances=1) as h:
+        mock = h.mocks.deps.postures[0].move_to_home
+        async with posture_button(
+            h, action_module=move_to_home, pressed=_primary
+        ) as session:
+            session.press(right=(False, False, False))
+            await asyncio.sleep(0.05)
+            session.press(right=(True, False, False))
+            pending = await mock.next_goal(10.0)
+            active = await pending.accept()
+            # Taking manual control back is the cancel gesture.
+            session.press(right=(False, False, True))
+            await asyncio.wait_for(active.cancel_signal(), 10.0)
+            await active.complete_cancelled(
+                move_to_home.ResultResponseData(success=False, message="cancelled")
+            )
+            # The squeeze that cancelled must not have fired a fresh goal.
+            with pytest.raises(TimeoutError):
+                await mock.next_goal(0.4)
 
 
-def test_a_press_landing_with_a_squeeze_does_not_fire():
-    log = drive_posture_button([(False, False, False), (True, False, True)])
-    assert log == []
+async def test_a_press_landing_with_a_squeeze_does_not_fire():
+    async with boot(postures_instances=1) as h:
+        mock = h.mocks.deps.postures[0].move_to_home
+        async with posture_button(
+            h, action_module=move_to_home, pressed=_primary
+        ) as session:
+            session.press(right=(False, False, False))
+            await asyncio.sleep(0.05)
+            session.press(right=(True, False, True))
+            with pytest.raises(TimeoutError):
+                await mock.next_goal(0.4)
 
 
-class QuickResultHandle(FakeHandle):
-    async def get_result(self, _timeout):
-        return SimpleNamespace(
-            status=SimpleNamespace(name="SUCCEEDED"),
-            data=SimpleNamespace(message="done"),
-        )
+async def test_a_button_already_held_at_first_tracking_does_not_fire():
+    async with boot(postures_instances=1) as h:
+        mock = h.mocks.deps.postures[0].move_to_home
+        async with posture_button(
+            h, action_module=move_to_home, pressed=_primary
+        ) as session:
+            # A thumb already down on the first tracked frame is not a press.
+            session.press(right=(True, False, False))
+            with pytest.raises(TimeoutError):
+                await mock.next_goal(0.4)
+            # An observed release and then a press is the first real edge.
+            session.press(right=(False, False, False))
+            await asyncio.sleep(0.05)
+            session.press(right=(True, False, False))
+            pending = await mock.next_goal(10.0)
+            await (await pending.accept()).complete(
+                move_to_home.ResultResponseData(success=True, message="done")
+            )
 
 
-def test_a_button_already_held_at_first_tracking_does_not_fire():
-    held = (True, False, False)
-    assert drive_posture_button([held, held, held]) == []
-    # An observed release and then a press is the first real edge.
-    assert (
-        drive_posture_button([held, (False, False, False), held]) == ["fire"]
-    )
-
-
-def test_a_stale_gap_does_not_refire_a_held_button():
+async def test_a_stale_gap_does_not_refire_a_held_button():
     """A dropout while the thumb stays down must not read as a fresh press:
     the gap makes the input unknown, not released."""
-    held = (True, False, False)
-    log = drive_posture_button(
-        [(False, False, False), held, held, None, None, held, held],
-        handle_cls=QuickResultHandle,
-    )
-    assert log == ["fire"]
-    # A real release and press after the gap re-arms the button.
-    log = drive_posture_button(
-        [(False, False, False), held, None, held, (False, False, False), held],
-        handle_cls=QuickResultHandle,
-    )
-    assert log == ["fire", "fire"]
+    async with boot(postures_instances=1) as h:
+        mock = h.mocks.deps.postures[0].move_to_home
+        async with posture_button(
+            h, action_module=move_to_home, pressed=_primary
+        ) as session:
+            session.press(right=(False, False, False))
+            await asyncio.sleep(0.05)
+            session.press(right=(True, False, False))
+            pending = await mock.next_goal(10.0)
+            await (await pending.accept()).complete(
+                move_to_home.ResultResponseData(success=True, message="done")
+            )
+            # The headset drops out while the thumb stays down...
+            session.hands = {}
+            await asyncio.sleep(0.05)
+            # ...and comes back with the button still held: not a press.
+            session.press(right=(True, False, False))
+            with pytest.raises(TimeoutError):
+                await mock.next_goal(0.4)
+            # A real release and press after the gap re-arms the button.
+            pending = await _press_until_goal(session, mock)
+            await (await pending.accept()).complete(
+                move_to_home.ResultResponseData(success=True, message="done")
+            )
 
 
-def test_the_selector_decides_which_button_fires_the_action():
-    # Under a secondary-button selector, primary presses stay quiet and a
-    # secondary press fires.
-    def secondary(sample):
-        return sample.secondary_button
-
-    assert (
-        drive_posture_button(
-            [(False, False, False), (True, False, False)], pressed=secondary
-        )
-        == []
-    )
-    assert drive_posture_button(
-        [(False, False, False), (False, True, False)], pressed=secondary
-    ) == ["fire"]
-
-
-class FakePublisher:
-    def __init__(self):
-        self.published = []
-
-    async def publish(self, payload):
-        self.published.append(payload)
+async def test_the_selector_decides_which_button_fires_the_action():
+    # Under a secondary-button selector (the real move_to_ready wiring),
+    # primary presses stay quiet and a secondary press fires.
+    async with boot(postures_instances=1) as h:
+        ready = h.mocks.deps.postures[0].move_to_ready
+        async with posture_button(
+            h, action_module=move_to_ready, pressed=_secondary
+        ) as session:
+            session.press(right=(False, False, False))
+            await asyncio.sleep(0.05)
+            session.press(right=(True, False, False))
+            with pytest.raises(TimeoutError):
+                await ready.next_goal(0.4)
+            session.press(right=(False, False, False))
+            await asyncio.sleep(0.05)
+            session.press(right=(False, True, False))
+            pending = await ready.next_goal(10.0)
+            await (await pending.accept()).complete(
+                move_to_ready.ResultResponseData(success=True, message="done")
+            )
 
 
-class FakeStreamTopic:
-    def __init__(self, publisher):
-        self._publisher = publisher
-        self.built = []
-
-    async def declare_publisher(self, _runner):
-        return self._publisher
-
-    def build_message(self, timestamp, *fields):
-        self.built.append(fields)
-        return fields
-
-
-def run_stream_briefly(coro_factory):
-    async def run():
-        token = FakeToken()
-        task = asyncio.create_task(coro_factory(token))
-        await asyncio.sleep(0.05)
+@contextlib.asynccontextmanager
+async def _running(make_stream):
+    """One stream task under a hand-fired token, torn down on exit."""
+    token = FakeToken()
+    task = asyncio.create_task(make_stream(token))
+    try:
+        yield
+    finally:
         token.cancel()
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
 
-    asyncio.run(run())
-
 
 def test_a_failed_publisher_declaration_ends_the_stream_loudly(capsys):
+    # A broken transport cannot be scripted onto the real wire; the stub
+    # stands in for the runner refusing the declaration.
     class NoPublisherTopic:
         async def declare_publisher(self, _runner):
             raise RuntimeError("no transport")
@@ -282,89 +325,99 @@ def test_a_failed_publisher_declaration_ends_the_stream_loudly(capsys):
     assert "failed to declare" in capsys.readouterr().out
 
 
-def test_the_gripper_stream_is_silent_without_the_squeeze_deadman():
-    publisher = FakePublisher()
-    topic = FakeStreamTopic(publisher)
-    session = FakeSession()
-    session.press(right=(False, False, False))
-    run_stream_briefly(
-        lambda token: publish.stream_gripper(
-            None,
-            topic_module=topic,
-            handedness="right",
-            session=session,
-            settings=posture_settings(),
-            token=token,
-        )
-    )
-    assert publisher.published == []
+async def test_the_gripper_stream_is_silent_without_the_squeeze_deadman():
+    async with boot() as h:
+        await peppygen.clock.init(h.node_runner)
+        session = FakeSession()
+        session.press(right=(False, False, False))
+        async with _running(
+            lambda token: publish.stream_gripper(
+                h.node_runner,
+                topic_module=right_gripper_setpoints,
+                handedness="right",
+                session=session,
+                settings=posture_settings(),
+                token=token,
+            )
+        ):
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    h.mocks.pairings.right_gripper.gripper_setpoints.next(), 0.4
+                )
 
 
-def test_the_gripper_stream_publishes_openings_while_squeezing(monkeypatch):
-    monkeypatch.setattr(publish, "_timestamp_seconds", lambda: 0.0)
-    publisher = FakePublisher()
-    topic = FakeStreamTopic(publisher)
-    session = FakeSession()
-    session.press(right=(False, False, True))
-    run_stream_briefly(
-        lambda token: publish.stream_gripper(
-            None,
-            topic_module=topic,
-            handedness="right",
-            session=session,
-            settings=posture_settings(),
-            token=token,
-        )
-    )
-    assert publisher.published, "a squeezed hand must stream openings"
-    opening, max_effort = publisher.published[0]
-    assert opening == 1.0  # released trigger rests at gripper_open_fraction
-    assert max_effort == 0.0
+async def test_the_gripper_stream_publishes_openings_while_squeezing():
+    async with boot() as h:
+        await peppygen.clock.init(h.node_runner)
+        session = FakeSession()
+        session.press(right=(False, False, True))
+        async with _running(
+            lambda token: publish.stream_gripper(
+                h.node_runner,
+                topic_module=right_gripper_setpoints,
+                handedness="right",
+                session=session,
+                settings=posture_settings(),
+                token=token,
+            )
+        ):
+            message = await asyncio.wait_for(
+                h.mocks.pairings.right_gripper.gripper_setpoints.next(), 10.0
+            )
+        assert message.opening == 1.0  # released trigger rests at open_fraction
+        assert message.max_effort == 0.0
+        assert message.timestamp > 0.0  # stamped from the daemon-resolved clock
 
 
-def test_the_pose_stream_refuses_to_engage_without_a_fresh_measured_pose():
-    publisher = FakePublisher()
-    topic = FakeStreamTopic(publisher)
-    session = FakeSession()
-    session.press(right=(False, False, True))
-    clutch = HandClutch(1.0)
-    run_stream_briefly(
-        lambda token: publish.stream_pose(
-            None,
-            topic_module=topic,
-            handedness="right",
-            clutch=clutch,
-            session=session,
-            measured=publish.LatestPose(),
-            settings=posture_settings(),
-            token=token,
-        )
-    )
-    assert publisher.published == []
+async def test_the_pose_stream_refuses_to_engage_without_a_fresh_measured_pose():
+    async with boot() as h:
+        await peppygen.clock.init(h.node_runner)
+        session = FakeSession()
+        session.press(right=(False, False, True))
+        async with _running(
+            lambda token: publish.stream_pose(
+                h.node_runner,
+                topic_module=right_arm_pose_setpoints,
+                handedness="right",
+                clutch=HandClutch(1.0),
+                session=session,
+                measured=publish.LatestPose(),
+                settings=posture_settings(),
+                token=token,
+            )
+        ):
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    h.mocks.pairings.right_arm.pose_setpoints.next(), 0.4
+                )
 
 
-def test_the_pose_stream_engages_once_the_follower_reports(monkeypatch):
-    monkeypatch.setattr(publish, "_timestamp_seconds", lambda: 0.0)
-    publisher = FakePublisher()
-    topic = FakeStreamTopic(publisher)
-    session = FakeSession()
-    session.press(right=(False, False, True))
-    measured = publish.LatestPose()
-    measured.set(POSE)
-    clutch = HandClutch(1.0)
-    run_stream_briefly(
-        lambda token: publish.stream_pose(
-            None,
-            topic_module=topic,
-            handedness="right",
-            clutch=clutch,
-            session=session,
-            measured=measured,
-            settings=posture_settings(),
-            token=token,
-        )
-    )
-    assert publisher.published, "an engaged hand must stream setpoints"
+async def test_the_pose_stream_engages_once_the_follower_reports():
+    async with boot() as h:
+        await peppygen.clock.init(h.node_runner)
+        session = FakeSession()
+        session.press(right=(False, False, True))
+        measured = publish.LatestPose()
+        measured.set(POSE)
+        async with _running(
+            lambda token: publish.stream_pose(
+                h.node_runner,
+                topic_module=right_arm_pose_setpoints,
+                handedness="right",
+                clutch=HandClutch(1.0),
+                session=session,
+                measured=measured,
+                settings=posture_settings(),
+                token=token,
+            )
+        ):
+            message = await asyncio.wait_for(
+                h.mocks.pairings.right_arm.pose_setpoints.next(), 10.0
+            )
+        # The engage tick commands the measured pose: a no-op that starts the
+        # stream.
+        assert message.position == [0.0, 0.0, 0.0]
+        assert message.orientation == [0.0, 0.0, 0.0, 1.0]
 
 
 class FrozenSession(FakeSession):
@@ -382,58 +435,65 @@ class FrozenSession(FakeSession):
         return XrFrame(received_monotonic_s=self._stamp, hands=self.hands)
 
 
-def test_the_pose_stream_goes_silent_when_frames_stop_mid_squeeze(monkeypatch):
+async def test_the_pose_stream_goes_silent_when_frames_stop_mid_squeeze():
     """The composed deadman: an engaged hand whose headset frames age past
     the staleness window stops publishing entirely."""
-    monkeypatch.setattr(publish, "_timestamp_seconds", lambda: 0.0)
-    publisher = FakePublisher()
-    topic = FakeStreamTopic(publisher)
-    session = FrozenSession()
-    session.press(right=(False, False, True))
-    measured = publish.LatestPose()
-    clutch = HandClutch(1.0)
-    settings = config.from_parameters(default_parameters(stale_timeout_s=0.05))
+    async with boot() as h:
+        await peppygen.clock.init(h.node_runner)
+        session = FrozenSession()
+        session.press(right=(False, False, True))
+        measured = publish.LatestPose()
+        settings = config.from_parameters(default_parameters(stale_timeout_s=0.05))
+        token = FakeToken()
 
-    async def run():
         # Measured stays fresh throughout: only the headset link dies.
-        async def keep_measured_fresh(token):
+        async def keep_measured_fresh():
             while not token.is_cancelled():
                 measured.set(POSE)
                 await asyncio.sleep(0.01)
 
-        token = FakeToken()
-        refresher = asyncio.create_task(keep_measured_fresh(token))
+        refresher = asyncio.create_task(keep_measured_fresh())
         task = asyncio.create_task(
             publish.stream_pose(
-                None,
-                topic_module=topic,
+                h.node_runner,
+                topic_module=right_arm_pose_setpoints,
                 handedness="right",
-                clutch=clutch,
+                clutch=HandClutch(1.0),
                 session=session,
                 measured=measured,
                 settings=settings,
                 token=token,
             )
         )
-        await asyncio.sleep(0.03)
-        streamed_while_fresh = len(publisher.published)
-        await asyncio.sleep(0.1)  # the frozen frame ages past 0.05 s
-        settled = len(publisher.published)
-        await asyncio.sleep(0.05)
-        assert streamed_while_fresh > 0
-        assert len(publisher.published) == settled
-        token.cancel()
-        task.cancel()
-        refresher.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
-        with contextlib.suppress(asyncio.CancelledError):
-            await refresher
-
-    asyncio.run(run())
+        subscription = h.mocks.pairings.right_arm.pose_setpoints
+        try:
+            # Streamed while the frame was fresh.
+            await asyncio.wait_for(subscription.next(), 10.0)
+            # The frozen frame ages past 0.05 s. Drain whatever was in flight
+            # until a full window passes with nothing published: silence is
+            # the deadman.
+            deadline = time.monotonic() + 10.0
+            while True:
+                try:
+                    await asyncio.wait_for(subscription.next(), 0.35)
+                except asyncio.TimeoutError:
+                    break
+                assert time.monotonic() < deadline, (
+                    "the stream kept publishing after the headset frames went stale"
+                )
+        finally:
+            token.cancel()
+            task.cancel()
+            refresher.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            with contextlib.suppress(asyncio.CancelledError):
+                await refresher
 
 
 def test_a_failed_pose_states_subscribe_is_loud_and_fatal_to_the_drain(capsys):
+    # Same seam as the failed declaration above: a refusing runner cannot be
+    # scripted over the real wire.
     class ExplodingTopic:
         async def subscribe(self, _runner):
             raise RuntimeError("no transport")
@@ -450,18 +510,71 @@ def test_a_failed_pose_states_subscribe_is_loud_and_fatal_to_the_drain(capsys):
     assert "pose_states subscribe failed" in capsys.readouterr().out
 
 
-def test_drain_pose_states_keeps_the_holder_fresh_and_survives_garbage():
+async def test_drain_pose_states_keeps_the_holder_at_the_newest_measured_pose():
+    async with boot() as h:
+        holder = publish.LatestPose()
+        token = FakeToken()
+        drain = asyncio.create_task(
+            publish.drain_pose_states(
+                h.node_runner, right_arm_pose_states, holder, "right", token
+            )
+        )
+        try:
+            await h.mocks.pairings.right_arm.pose_states.publish(
+                right_arm_pose_states.Message(
+                    timestamp=1.0,
+                    position=[0.1, 0.2, 0.3],
+                    orientation=[0.0, 0.0, 0.0, 1.0],
+                )
+            )
+            await eventually(
+                lambda: holder.fresh(10.0) is not None, message="the first pose"
+            )
+            await h.mocks.pairings.right_arm.pose_states.publish(
+                right_arm_pose_states.Message(
+                    timestamp=2.0,
+                    position=[0.4, 0.5, 0.6],
+                    orientation=[0.0, 0.0, 0.0, 1.0],
+                )
+            )
+            await eventually(
+                lambda: (pose := holder.fresh(10.0)) is not None
+                and pose.position[0] == 0.4,
+                message="the newest pose",
+            )
+        finally:
+            token.cancel()
+        await asyncio.wait_for(drain, 5.0)
+
+
+def test_drain_pose_states_survives_garbage():
+    # Kept on a stub: every decodable wire message builds a Pose (the schema
+    # carries float lists), so the unusable-pose latch is reachable only
+    # through a hand-built message the generated modules cannot produce.
+    from types import SimpleNamespace
+
+    class StubTopic:
+        def __init__(self, items):
+            self._items = list(items)
+
+        async def subscribe(self, _runner):
+            return self
+
+        async def next(self):
+            if self._items:
+                return self._items.pop(0)
+            await asyncio.Event().wait()
+
     good = SimpleNamespace(position=[0.1, 0.2, 0.3], orientation=[0, 0, 0, 1])
     bad = SimpleNamespace(position=None, orientation=None)
     producer = SimpleNamespace(instance_id="backbone_inst")
-    subscription = FakeSubscription([(producer, bad), (producer, good)])
     holder = publish.LatestPose()
     token = FakeToken()
 
     async def run():
         drain = asyncio.create_task(
             publish.drain_pose_states(
-                None, FakeTopic(subscription), holder, "right", token
+                None, StubTopic([(producer, bad), (producer, good)]), holder, "right", token
             )
         )
         await asyncio.sleep(0.05)

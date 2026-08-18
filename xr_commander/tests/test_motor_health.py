@@ -1,11 +1,12 @@
 import asyncio
 import math
-from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 
-from tests.helpers import ClosingSubscription, FakeToken, FakeTopic
+from peppygen.consumed_topics.motor_health import motor_health as motor_health_topic
+
+from tests.helpers import FakeToken, boot, eventually
 from xr_commander.motor_health import (
     HEALTH_STALE_AFTER_MS,
     NOT_REPORTING,
@@ -50,8 +51,10 @@ def report(
 
 
 def _wire(levels=ARM_LEVELS):
+    """One real wire report, as a producer would publish it."""
     count = len(levels)
-    return SimpleNamespace(
+    return motor_health_topic.Message(
+        timestamp=0.0,
         level=bytes(levels),
         effort_fraction_rated=[0.1] * count,
         effort_fraction_rated_sustained=[0.09] * count,
@@ -263,44 +266,86 @@ def test_drain_motor_health_survives_a_slot_it_cannot_subscribe_to():
     assert store.by_instance() == ()
 
 
-def test_drain_motor_health_keys_reports_by_the_producing_instance():
-    stream = [
-        (SimpleNamespace(instance_id="left_arm"), _wire()),
-        (SimpleNamespace(instance_id="left_gripper"), _wire((0,))),
-    ]
-    store = MotorHealthReports()
-    asyncio.run(
-        drain_motor_health(
-            object(), FakeTopic(ClosingSubscription(stream)), store, FakeToken()
+async def test_drain_motor_health_keys_reports_by_the_producing_instance():
+    async with boot(motor_health_instances=2) as h:
+        arm, gripper = h.mocks.deps.motor_health
+        arm_id, gripper_id = [
+            p.instance_id
+            for p in motor_health_topic.bound_producers(h.node_runner)
+        ]
+        store = MotorHealthReports()
+        token = FakeToken()
+        drain = asyncio.create_task(
+            drain_motor_health(h.node_runner, motor_health_topic, store, token)
         )
-    )
-    assert [entry.instance for entry in store.by_instance()] == [
-        "left_arm",
-        "left_gripper",
-    ]
-
-
-def test_a_malformed_producer_is_reported_once_not_every_report():
-    # A shared latch is cleared by any other producer's good message, so one
-    # bad arm would log twice a second forever on a two-arm stack.
-    bad = SimpleNamespace(instance_id="left_arm")
-    good = SimpleNamespace(instance_id="right_arm")
-    stream = []
-    for _ in range(5):
-        stream.append((bad, _wire(levels=(9,) * 7)))
-        stream.append((good, _wire()))
-
-    logged: list[str] = []
-    store = MotorHealthReports()
-    with mock.patch("xr_commander.bus.log", side_effect=lambda m: logged.append(m)):
-        asyncio.run(
-            drain_motor_health(
-                object(), FakeTopic(ClosingSubscription(stream)), store, FakeToken()
+        try:
+            await arm.motor_health.publish(_wire())
+            await gripper.motor_health.publish(_wire((0,)))
+            await eventually(
+                lambda: [entry.instance for entry in store.by_instance()]
+                == sorted([arm_id, gripper_id]),
+                message="both producers' reports",
             )
-        )
-    unusable = [m for m in logged if "unusable" in m]
-    assert len(unusable) == 1, f"logged {len(unusable)} times: {unusable}"
-    assert [entry.instance for entry in store.by_instance()] == ["right_arm"]
+        finally:
+            token.cancel()
+        await asyncio.wait_for(drain, 5.0)
+        # Each report landed under its own transport-authenticated instance.
+        by_name = {e.instance: e.report for e in store.by_instance()}
+        assert len(by_name[arm_id].levels) == 7
+        assert len(by_name[gripper_id].levels) == 1
+
+
+async def test_a_malformed_producer_is_reported_once_not_every_report():
+    # A shared latch is cleared by any other producer's good message, so one
+    # bad arm would log twice a second forever on a two-arm stack. The good
+    # producer's report is deliberately interleaved between the bad one's,
+    # forcing exactly the arrival order that would clear a shared latch.
+    async with boot(motor_health_instances=2) as h:
+        bad, good = h.mocks.deps.motor_health
+        bad_id, good_id = [
+            p.instance_id
+            for p in motor_health_topic.bound_producers(h.node_runner)
+        ]
+        logged: list[str] = []
+        store = MotorHealthReports()
+        token = FakeToken()
+
+        def unusable():
+            return [m for m in logged if "unusable" in m]
+
+        with mock.patch(
+            "xr_commander.bus.log", side_effect=lambda m: logged.append(m)
+        ):
+            drain = asyncio.create_task(
+                drain_motor_health(h.node_runner, motor_health_topic, store, token)
+            )
+            try:
+                for _ in range(3):
+                    await bad.motor_health.publish(_wire(levels=(9,) * 7))
+                await eventually(
+                    lambda: len(unusable()) == 1, message="the first refusal"
+                )
+                await good.motor_health.publish(_wire())
+                await eventually(
+                    lambda: len(store.by_instance()) == 1, message="the good report"
+                )
+                for _ in range(2):
+                    await bad.motor_health.publish(_wire(levels=(9,) * 7))
+                # A valid report from the bad producer marks its earlier ones
+                # processed (per-producer order holds).
+                await bad.motor_health.publish(_wire())
+                await eventually(
+                    lambda: len(store.by_instance()) == 2, message="the recovery"
+                )
+            finally:
+                token.cancel()
+            await asyncio.wait_for(drain, 5.0)
+        assert len(unusable()) == 1, f"logged {len(unusable())} times: {unusable()}"
+        # The malformed reports were refused, never rendered: only the valid
+        # nominal report is stored for the bad producer.
+        by_name = {e.instance: e.report for e in store.by_instance()}
+        assert by_name[bad_id].levels == (0,) * 7
+        assert by_name[good_id].levels == (0,) * 7
 
 
 def test_an_unwired_health_slot_is_distinguishable_from_a_quiet_one():

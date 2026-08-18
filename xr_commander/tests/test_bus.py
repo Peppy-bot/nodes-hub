@@ -1,25 +1,31 @@
 import asyncio
 import contextlib
 import time
-from types import SimpleNamespace
 
 import pytest
 
-from tests.helpers import FakeSubscription, FakeToken
+from peppygen.consumed_actions.postures import move_to_home as postures_move_to_home
+from peppygen.consumed_actions.recorder import record_episode as recorder_record_episode
+
+from tests.helpers import FakeSubscription, FakeToken, boot
 from xr_commander.bus import Latch, messages, next_message, select_producer, ticks
 
 
-def test_select_producer_picks_the_first_and_reports_a_surplus(capsys):
-    producers = [SimpleNamespace(instance_id="a"), SimpleNamespace(instance_id="b")]
-    module = SimpleNamespace(bound_producers=lambda _runner: producers)
-    assert select_producer(module, None, "postures").instance_id == "a"
+async def test_select_producer_picks_the_first_and_reports_a_surplus(capsys):
+    async with boot(postures_instances=2) as h:
+        bound = postures_move_to_home.bound_producers(h.node_runner)
+        target = select_producer(postures_move_to_home, h.node_runner, "postures")
+        assert target.instance_id == bound[0].instance_id
     assert "several postures producers" in capsys.readouterr().out
 
 
-def test_select_producer_is_none_and_silent_on_an_empty_slot(capsys):
-    module = SimpleNamespace(bound_producers=lambda _runner: [])
-    assert select_producer(module, None, "postures") is None
-    assert capsys.readouterr().out == ""
+async def test_select_producer_is_none_and_silent_on_an_empty_slot(capsys):
+    async with boot() as h:  # the recorder slot boots unwired
+        assert (
+            select_producer(recorder_record_episode, h.node_runner, "recorder") is None
+        )
+    # Silent: nothing the node logs, in particular no surplus line.
+    assert "[xr_commander]" not in capsys.readouterr().out
 
 
 class HangingSubscription:

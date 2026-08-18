@@ -1,13 +1,14 @@
 import asyncio
 import time
-from types import SimpleNamespace
 
 import cv2
 import numpy as np
 import pytest
 from teleop_xr.config import ViewConfig
 
-from tests.helpers import FakeSubscription, FakeToken, FakeTopic, RecordingSink
+from peppygen.consumed_topics.color_cameras import video_stream as color_video_stream
+
+from tests.helpers import FakeToken, RecordingSink, boot, eventually
 from xr_commander import video
 from xr_commander.video import (
     CAMERA_VIEW,
@@ -99,77 +100,76 @@ def test_colliding_track_ids_are_refused():
     assert_unique_track_ids(["chest", "status"])
 
 
-class FakeTopics:
-    def __init__(self, producers):
-        self._producers = producers
-
-    def bound_producers(self, _runner):
-        return self._producers
-
-
-def discover(instance_ids):
-    producers = [SimpleNamespace(instance_id=i) for i in instance_ids]
-    return discover_tracks(None, FakeTopics(producers), RecordingSink)
-
-
-def test_every_bound_producer_gets_a_track_named_by_its_instance():
-    tracks = discover(["cam_a", "cam_b"])
-    assert [t.instance_id for t in tracks] == ["cam_a", "cam_b"]
-    assert all(isinstance(t.sink, RecordingSink) for t in tracks)
+async def test_every_bound_producer_gets_a_track_named_by_its_instance():
+    async with boot(color_cameras_instances=2) as h:
+        bound = color_video_stream.bound_producers(h.node_runner)
+        assert len(bound) == 2
+        tracks = discover_tracks(h.node_runner, color_video_stream, RecordingSink)
+        assert [t.instance_id for t in tracks] == [p.instance_id for p in bound]
+        assert len(set(t.instance_id for t in tracks)) == 2
+        assert all(isinstance(t.sink, RecordingSink) for t in tracks)
 
 
 def bgr_message(width=1, height=1):
     data = np.zeros((height, width, 3), dtype=np.uint8).tobytes()
-    return SimpleNamespace(encoding="bgr8", width=width, height=height, frame=data)
+    return color_video_stream.Message(
+        header=color_video_stream.MessageHeader(timestamp=0.0, frame_id=0),
+        encoding="bgr8",
+        width=width,
+        height=height,
+        frame=data,
+    )
 
 
-def run_drain(items, sinks, health=None):
-    token = FakeToken()
-
-    async def run():
+async def test_an_undecodable_frame_is_dropped_and_logged_once(capsys):
+    async with boot(color_cameras_instances=1) as h:
+        camera = h.mocks.deps.color_cameras[0]
+        cam_id = color_video_stream.bound_producers(h.node_runner)[0].instance_id
+        sink = RecordingSink()
+        health: dict[str, float] = {}
+        token = FakeToken()
         drain = asyncio.create_task(
             drain_frames(
-                None,
-                FakeTopic(FakeSubscription(items)),
-                sinks,
+                h.node_runner,
+                color_video_stream,
+                {cam_id: sink},
                 token,
                 "test",
                 0,
                 health,
             )
         )
-        await asyncio.sleep(0.05)
-        token.cancel()
-        await asyncio.wait_for(drain, 1.0)
-
-    asyncio.run(run())
-
-
-def test_an_undecodable_frame_is_dropped_and_logged_once(capsys):
-    producer = SimpleNamespace(instance_id="cam")
-    bad = SimpleNamespace(encoding="z16", width=1, height=1, frame=b"xx")
-    sink = RecordingSink()
-    health: dict[str, float] = {}
-    run_drain(
-        [(producer, bad), (producer, bad), (producer, bgr_message())],
-        {"cam": sink},
-        health,
-    )
-    assert len(sink.frames) == 1  # the good frame still lands
-    assert capsys.readouterr().out.count("frame unusable") == 1  # latched
-    assert "cam" in health  # stamped for the delivered frame only
+        try:
+            bad = color_video_stream.Message(
+                header=color_video_stream.MessageHeader(timestamp=0.0, frame_id=0),
+                encoding="z16",
+                width=1,
+                height=1,
+                frame=b"xx",
+            )
+            await camera.video_stream.publish(bad)
+            await camera.video_stream.publish(bad)
+            await camera.video_stream.publish(bgr_message())
+            # Per-producer order holds, so the landed good frame proves both
+            # bad ones were already processed.
+            await eventually(lambda: len(sink.frames) == 1, message="the good frame")
+        finally:
+            token.cancel()
+        await asyncio.wait_for(drain, 5.0)
+        assert capsys.readouterr().out.count("frame unusable") == 1  # latched
+        assert cam_id in health  # stamped for the delivered frame only
 
 
 def test_a_failed_camera_subscribe_is_loud_and_fatal_to_the_drain(capsys):
+    # A refusing runner cannot be scripted over the real wire; the stub
+    # stands in for the transport failing the subscribe.
     class ExplodingTopic:
         async def subscribe(self, _runner):
             raise RuntimeError("no transport")
 
     async def run():
         await asyncio.wait_for(
-            drain_frames(
-                None, ExplodingTopic(), {}, FakeToken(), "camera"
-            ),
+            drain_frames(None, ExplodingTopic(), {}, FakeToken(), "camera"),
             1.0,
         )
 

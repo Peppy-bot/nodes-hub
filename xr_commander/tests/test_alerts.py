@@ -1,11 +1,12 @@
 import asyncio
-from types import SimpleNamespace
 from unittest import mock
 
 import cv2
 import pytest
 
-from tests.helpers import ClosingSubscription, FakeToken, FakeTopic
+from peppygen.consumed_topics.alerts import alerts as alerts_topic
+
+from tests.helpers import FakeToken, boot, eventually
 from xr_commander.alerts import (
     ALERT_STALE_AFTER_MS,
     ActiveAlerts,
@@ -17,7 +18,9 @@ STALE_AFTER_S = ALERT_STALE_AFTER_MS / 1000.0
 
 
 def _wire(source, severity, kind="motor_condition", message="holding 96%"):
-    return SimpleNamespace(
+    """One real wire alert, as a producer would publish it."""
+    return alerts_topic.Message(
+        timestamp=0.0,
         source=source,
         kind=kind,
         severity=severity,
@@ -145,40 +148,69 @@ def test_drain_alerts_survives_a_slot_it_cannot_subscribe_to():
     assert active.active() == ()
 
 
-def test_drain_alerts_keeps_every_producers_alerts():
-    stream = [
-        (SimpleNamespace(instance_id="left_arm"), _wire("left arm j2", 2)),
-        (SimpleNamespace(instance_id="right_arm_inst"), _wire("right arm j5", 3)),
-    ]
-    active = ActiveAlerts()
-    asyncio.run(
-        drain_alerts(
-            object(), FakeTopic(ClosingSubscription(stream)), active, FakeToken()
+async def test_drain_alerts_keeps_every_producers_alerts():
+    async with boot(alerts_instances=2) as h:
+        left, right = h.mocks.deps.alerts
+        active = ActiveAlerts()
+        token = FakeToken()
+        drain = asyncio.create_task(
+            drain_alerts(h.node_runner, alerts_topic, active, token)
         )
-    )
-    assert [a.severity for a in active.active()] == [3, 2]
-
-
-def test_a_malformed_producer_is_reported_once_not_every_re_emit():
-    # A shared latch is cleared by any other producer's good message, so one
-    # bad arm would log on every re-emit forever on a two-arm stack.
-    bad = SimpleNamespace(instance_id="left_arm")
-    good = SimpleNamespace(instance_id="right_arm_inst")
-    stream = []
-    for _ in range(5):
-        stream.append((bad, _wire("left arm j2", 9)))
-        stream.append((good, _wire("right arm j5", 1)))
-
-    logged: list[str] = []
-    active = ActiveAlerts()
-    with mock.patch("xr_commander.bus.log", side_effect=lambda m: logged.append(m)):
-        asyncio.run(
-            drain_alerts(
-                object(), FakeTopic(ClosingSubscription(stream)), active, FakeToken()
+        try:
+            await left.alerts.publish(_wire("left arm j2", 2))
+            await right.alerts.publish(_wire("right arm j5", 3))
+            await eventually(
+                lambda: [a.severity for a in active.active()] == [3, 2],
+                message="both producers' alerts, worst first",
             )
-        )
-    unusable = [m for m in logged if "unusable" in m]
-    assert len(unusable) == 1, f"logged {len(unusable)} times: {unusable}"
+        finally:
+            token.cancel()
+        await asyncio.wait_for(drain, 5.0)
+
+
+async def test_a_malformed_producer_is_reported_once_not_every_re_emit():
+    # A shared latch is cleared by any other producer's good message, so one
+    # bad arm would log on every re-emit forever on a two-arm stack. The good
+    # producer's message is deliberately interleaved between the bad one's
+    # re-emits, forcing exactly the arrival order that would clear a shared
+    # latch.
+    async with boot(alerts_instances=2) as h:
+        bad, good = h.mocks.deps.alerts
+        logged: list[str] = []
+        active = ActiveAlerts()
+        token = FakeToken()
+
+        def unusable():
+            return [m for m in logged if "unusable" in m]
+
+        with mock.patch(
+            "xr_commander.bus.log", side_effect=lambda m: logged.append(m)
+        ):
+            drain = asyncio.create_task(
+                drain_alerts(h.node_runner, alerts_topic, active, token)
+            )
+            try:
+                for _ in range(3):
+                    await bad.alerts.publish(_wire("left arm j2", 9))
+                await eventually(
+                    lambda: len(unusable()) == 1, message="the first refusal"
+                )
+                await good.alerts.publish(_wire("right arm j5", 1))
+                await eventually(
+                    lambda: len(active.active()) == 1, message="the good alert"
+                )
+                for _ in range(2):
+                    await bad.alerts.publish(_wire("left arm j2", 9))
+                # A valid alert from the bad producer marks its re-emits
+                # processed (per-producer order holds).
+                await bad.alerts.publish(_wire("left arm j2", 2))
+                await eventually(
+                    lambda: len(active.active()) == 2, message="the recovery"
+                )
+            finally:
+                token.cancel()
+            await asyncio.wait_for(drain, 5.0)
+        assert len(unusable()) == 1, f"logged {len(unusable())} times: {unusable()}"
 
 
 def test_a_long_message_is_truncated_rather_than_shrunk_to_a_smear():
