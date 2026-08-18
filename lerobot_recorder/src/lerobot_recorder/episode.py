@@ -53,6 +53,14 @@ def _low_disk(free: int) -> str:
     return f"only {free // (1 << 20)} MB free under the session directory"
 
 
+def _too_short(frames: int, ended_because: str | None) -> str:
+    """Why a refused episode was too short, keeping whatever ended it: an
+    episode cut off by low disk needs both halves to be diagnosable."""
+    need = recording.MIN_EPISODE_FRAMES
+    reason = f"too short to save: {frames} frame(s), need {need}"
+    return f"{reason} ({ended_because})" if ended_because else reason
+
+
 class _TickReport:
     """Per-second aggregate of frame-loop overruns, printed only when a tick
     exceeded the frame period; healthy episodes log nothing. `sample` is the
@@ -549,10 +557,15 @@ class Recorder:
             cancel.cancel()
             shutdown.cancel()
 
-        if frames == 0:
+        if frames < recording.MIN_EPISODE_FRAMES:
             self._discard()
             await self._complete(
-                ctx, cancelled, episode_index=-1, frames=0, discarded=True, error=end_error
+                ctx,
+                cancelled,
+                episode_index=-1,
+                frames=frames,
+                discarded=True,
+                error=_too_short(frames, end_error),
             )
             return
         try:

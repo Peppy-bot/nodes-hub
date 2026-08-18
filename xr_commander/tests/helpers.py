@@ -28,6 +28,57 @@ def default_parameters(**overrides) -> SimpleNamespace:
     return SimpleNamespace(**values)
 
 
+def asgi_request(
+    app, method: str, path: str, *, body=b"", headers: dict | None = None
+) -> SimpleNamespace:
+    """One request through an ASGI app, without a web client library.
+
+    The node ships no HTTP client, and these routes are worth testing where
+    they are mounted: their ordering against the frontend mount is the hazard.
+    `body` takes a list of chunks to arrive as a streamed body rather than one
+    delivery.
+    """
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": method,
+        "scheme": "https",
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": b"",
+        "root_path": "",
+        "headers": [
+            (name.lower().encode(), value.encode())
+            for name, value in (headers or {}).items()
+        ],
+        "client": ("127.0.0.1", 0),
+        "server": ("127.0.0.1", 4443),
+    }
+    sent = []
+    pending = list(body) if isinstance(body, list) else [body]
+
+    async def receive():
+        if not pending:
+            return {"type": "http.disconnect"}
+        chunk = pending.pop(0)
+        return {"type": "http.request", "body": chunk, "more_body": bool(pending)}
+
+    async def send(message):
+        sent.append(message)
+
+    asyncio.run(app(scope, receive, send))
+    start = next(m for m in sent if m["type"] == "http.response.start")
+    payload = b"".join(
+        m.get("body", b"") for m in sent if m["type"] == "http.response.body"
+    )
+    return SimpleNamespace(
+        status=start["status"],
+        headers={key.decode(): value.decode() for key, value in start["headers"]},
+        body=payload.decode("utf-8", "replace"),
+    )
+
+
 class FakeTopic:
     """A consumed-topic module surface: hands out one prebuilt subscription."""
 

@@ -216,6 +216,68 @@ def test_save_failure_recovers_for_next_goal(tmp_path):
     asyncio.run(run())
 
 
+def test_a_refusal_reports_the_shortfall_and_what_ended_it():
+    # Both halves are needed: an episode cut short by a low disk is a disk
+    # problem, not a recording-technique problem.
+    assert "need 2" in episode._too_short(1, None)
+    both = episode._too_short(1, "only 12 MB free under the session directory")
+    assert "need 2" in both and "12 MB free" in both
+    # Nothing captured at all still says why it ended.
+    assert "frame write failed" in episode._too_short(0, "frame write failed")
+
+
+def test_a_one_frame_episode_is_refused_rather_than_saved(tmp_path):
+    # The library's episode stats change dtype below two samples, so saving
+    # this would write a schema every later episode is rejected against.
+    plan = arm_plan()
+    sink = FakeSink(fps=1)
+    recorder, cache = recorder_with(plan, sink, tmp_path)
+
+    async def run():
+        cache.links[ARM0] = fresh_joints()
+        recorder._schema = capture_now(cache, plan)
+        ctx = FakeCtx()
+        await recorder._record(ctx, FakeToken())
+        kind, index, frames, discarded, error = ctx.completions[0]
+        assert (kind, index, discarded) == ("done", -1, True)
+        assert frames < recording.MIN_EPISODE_FRAMES
+        assert "too short to save" in error
+        # What ended it survives alongside the refusal.
+        assert "stale" in error
+        assert sink.saves == 0
+        assert sink.discards == 1
+
+    asyncio.run(run())
+
+
+def test_a_refused_episode_leaves_the_session_recordable(tmp_path):
+    # The wedge this guards against is session-wide, so the next episode has
+    # to still be savable.
+    plan = arm_plan()
+    sink = FakeSink(fps=1)
+    recorder, cache = recorder_with(plan, sink, tmp_path)
+
+    async def run():
+        token = FakeToken()
+        cache.links[ARM0] = fresh_joints()
+        recorder._schema = capture_now(cache, plan)
+        first = FakeCtx()
+        await recorder._record(first, token)
+        assert first.completions[0][3] is True  # refused, too short
+
+        sink.fps = 100
+        cache.links[ARM0] = fresh_joints()
+        second = FakeCtx()
+        await recorder._record(second, token)
+        kind, index, frames, discarded, _error = second.completions[0]
+        # Index 0: a refusal saves nothing, so it consumes no episode index.
+        assert (kind, index, discarded) == ("done", 0, False)
+        assert frames >= recording.MIN_EPISODE_FRAMES
+        assert sink.saves == 1
+
+    asyncio.run(run())
+
+
 def test_add_frame_failure_ends_goal_with_discard(tmp_path):
     plan = arm_plan()
     sink = FakeSink(fail_add=True)
@@ -265,9 +327,15 @@ def test_schedule_lag_ends_episode_with_save(tmp_path, monkeypatch):
 
 
 def test_disk_floor_trips_on_its_own_cadence(tmp_path, monkeypatch):
+    # Roomy on the first check and empty after, so the floor can only trip on
+    # a later one: a tick-by-tick check would end the episode at frame one.
+    readings = iter([SimpleNamespace(total=0, used=0, free=1 << 40)])
     monkeypatch.setattr(
-        shutil, "disk_usage", lambda path: SimpleNamespace(total=0, used=0, free=0)
+        shutil,
+        "disk_usage",
+        lambda path: next(readings, SimpleNamespace(total=0, used=0, free=0)),
     )
+    monkeypatch.setattr(recording, "DISK_CHECK_PERIOD_S", 0.05)
     plan = arm_plan()
     sink = FakeSink(fps=100)
     recorder, cache = recorder_with(plan, sink, tmp_path)
@@ -280,7 +348,7 @@ def test_disk_floor_trips_on_its_own_cadence(tmp_path, monkeypatch):
         kind, _index, frames, discarded, error = ctx.completions[0]
         assert (kind, discarded) == ("done", False)
         assert "MB free" in error
-        assert frames > 0
+        assert frames >= recording.MIN_EPISODE_FRAMES
         assert sink.saves == 1
 
     asyncio.run(run())

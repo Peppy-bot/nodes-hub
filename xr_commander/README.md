@@ -85,10 +85,10 @@ all with it disabled); the robot view is whatever camera you bind.
   grip cancels the move in flight and takes manual control back. Inert unless
   the `postures` slot is bound.
 - **Face buttons** (left controller): the dataset recorder. **X** starts an
-  episode; the next press stops and saves it, and the panel row shows
-  `saving...` until the recorder's result lands. Holding **Y** for a second
-  finishes the session: the dataset finalizes and a fresh one opens in place.
-  Inert unless the `recorder` slot is bound.
+  episode under the current task label; the next press stops and saves it, and
+  the panel row shows `saving...` until the recorder's result lands. Holding
+  **Y** for a second finishes the session: the dataset finalizes and a fresh
+  one opens in place. Inert unless the `recorder` slot is bound.
 
 The mapping assumes you share the robot's facing (natural once your view is
 the robot's camera). Motion is relative to the squeeze, so standing elsewhere
@@ -102,6 +102,34 @@ hand whether it has a controller, a held grip, a fresh measurement from its
 follower, and an engagement. It answers "why is nothing moving" without
 taking the headset off. It is an ordinary named view, so it moves and resizes
 like a camera panel; `status_panel_enabled: false` removes it.
+
+With a recorder bound it also carries the task line: what the next episode
+records as, so the label is visible without taking the headset off.
+
+### Naming the task
+
+Every recorded frame carries a task label, which LeRobot stores once per
+distinct string and policies read back as their language instruction. It
+should name what is being demonstrated ("pick up the red block and place it in
+the bin"), not the setup.
+
+The operator sets it, and nothing else does: no launch argument, no default.
+A session starts with no label, and anything recorded before one is set goes
+down as `unnamed teleop task` rather than being refused, since a lost
+demonstration cannot be recovered while a uniform placeholder is one string to
+correct afterwards. The panel's task line reads `NOT SET (unnamed)` until then
+so an unnamed session is obvious in the headset, and the startup log names the
+placeholder and points at the page.
+
+`/task` on the same origin is that page: a plain form, so the headset's
+browser can set it before you enter VR, or a second person can set it from a
+laptop while the session runs. A change applies to the next episode; the one
+recording keeps the label it started with. Blank, over-long, and control
+characters are refused, and a refusal leaves the previous label in place, so a
+bad edit cannot unset a label episodes are already recording under.
+
+Served only when the `recorder` slot is bound; teleoperation without one has
+no page and no task line.
 
 ## Reaching it from the headset
 
