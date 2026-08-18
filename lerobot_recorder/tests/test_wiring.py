@@ -1,7 +1,7 @@
 """How messages get from the observed slots into the cache: which parser each
-slot's drain uses, and which cache slot a message lands in. The conftest fakes
-the generated modules under their real names, so the wiring resolves the same
-modules it would at runtime."""
+slot's drain uses, and which cache slot a message lands in. The wiring resolves
+the real generated modules; tests that need a specific membership monkeypatch
+the slot accessors on those modules."""
 
 import asyncio
 import json
@@ -25,6 +25,26 @@ from tests.test_recording import CORE, NOW_NS, action_entry, joint_entry, make_p
 
 BACKBONE = (CORE, "backbone_inst", "left_arm_link")
 OTHER_ARM = (CORE, "backbone_inst", "right_arm_link")
+
+
+def make_params(**overrides):
+    """The generated Parameters dataclass carries no field defaults, so the
+    schema's defaulted fields are spelled out once here (same values the
+    manifest defaults to, except the test-sized disk floor)."""
+    from peppygen.parameters import Parameters
+
+    values = dict(
+        robot_type="bot",
+        fps=30,
+        storage_root="/tmp/unused",
+        s3_uri="",
+        image_writer_threads=1,
+        streaming_encoding=True,
+        max_staleness_s=0.5,
+        min_remaining_disk_bytes=1,
+    )
+    values.update(overrides)
+    return Parameters(**values)
 
 
 def joint_message(position: float):
@@ -245,12 +265,10 @@ def test_sources_differing_only_by_core_node_stay_distinct():
 def test_resuming_the_session_this_launch_wrote_is_allowed(tmp_path):
     """Round trip through the writer, so a session.json written without its
     links cannot silently disable the check for every later resume."""
-    from peppygen.parameters import Parameters
-
     plan = two_limb_plan("arm0", "arm1")
     session_dir = tmp_path / "2026-08-06_10-00-00"
     session_dir.mkdir()
-    _write_session_json(session_dir, Parameters(), plan)
+    _write_session_json(session_dir, make_params(), plan)
     _check_same_links(session_dir, plan)
 
 
@@ -273,9 +291,16 @@ def test_setup_discovers_the_seeded_membership_inline(tmp_path, monkeypatch):
     setup reads the robot's shape directly and the session exists the moment
     setup returns; nothing is deferred behind Running anymore."""
     import peppygen.clock
+    from peppygen.consumed_topics.color_cameras import (
+        video_stream as color_cameras_video_stream,
+    )
+    from peppygen.consumed_topics.rgbd_cameras import (
+        video_stream as rgbd_cameras_video_stream,
+    )
+    from peppygen.paired_topics.commanded_grippers import gripper_setpoints
     from peppygen.paired_topics.commanded_joints import joint_setpoints
+    from peppygen.paired_topics.observed_grippers import gripper_states
     from peppygen.paired_topics.observed_joints import joint_states
-    from peppygen.parameters import Parameters
 
     monkeypatch.setattr(
         joint_states, "sources", lambda _r: [observed((CORE, "arm_inst", "link"))]
@@ -283,6 +308,12 @@ def test_setup_discovers_the_seeded_membership_inline(tmp_path, monkeypatch):
     monkeypatch.setattr(
         joint_setpoints, "sources", lambda _r: [observed((CORE, "lead_inst", "arm_link"))]
     )
+    # The real modules read the remaining slots off the runner this test has
+    # none of; this launch binds no grippers and no cameras.
+    for module in (gripper_states, gripper_setpoints):
+        monkeypatch.setattr(module, "sources", lambda _r: [])
+    for module in (color_cameras_video_stream, rgbd_cameras_video_stream):
+        monkeypatch.setattr(module, "bound_producers", lambda _r: [])
 
     async def clock_ready(_runner):
         return None
@@ -291,7 +322,7 @@ def test_setup_discovers_the_seeded_membership_inline(tmp_path, monkeypatch):
     runner = SimpleNamespace(
         cancellation_token=lambda: NeverCancelledToken(), on_shutdown=lambda _hook: None
     )
-    params = Parameters(storage_root=str(tmp_path))
+    params = make_params(storage_root=str(tmp_path))
 
     def session_created():
         return any((child / "session.json").is_file() for child in tmp_path.iterdir())
@@ -307,12 +338,10 @@ def test_setup_discovers_the_seeded_membership_inline(tmp_path, monkeypatch):
 
 
 def test_setup_refuses_unusable_parameters(tmp_path):
-    from peppygen.parameters import Parameters
-
     runner = SimpleNamespace(cancellation_token=lambda: NeverCancelledToken())
     for bad in (
-        Parameters(storage_root=str(tmp_path), fps=0),
-        Parameters(storage_root=str(tmp_path), image_writer_threads=0),
+        make_params(storage_root=str(tmp_path), fps=0),
+        make_params(storage_root=str(tmp_path), image_writer_threads=0),
     ):
         with pytest.raises(ValueError, match="must be positive"):
             asyncio.run(main_mod.setup(bad, runner))

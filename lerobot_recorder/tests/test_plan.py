@@ -11,6 +11,22 @@ from lerobot_recorder.plan import LinkKind, discover, limb_name
 CORE = "cn"
 
 
+@pytest.fixture(autouse=True)
+def no_cameras(monkeypatch):
+    """These tests discover with node_runner=None; the real generated camera
+    modules would ask that runner for the bound producer sets, so stand in
+    the empty sets a camera-less launch binds."""
+    from peppygen.consumed_topics.color_cameras import (
+        video_stream as color_cameras_video_stream,
+    )
+    from peppygen.consumed_topics.rgbd_cameras import (
+        video_stream as rgbd_cameras_video_stream,
+    )
+
+    monkeypatch.setattr(color_cameras_video_stream, "bound_producers", lambda _r: [])
+    monkeypatch.setattr(rgbd_cameras_video_stream, "bound_producers", lambda _r: [])
+
+
 def source(instance_id: str, link_id: str = "link"):
     return SimpleNamespace(
         producer=SimpleNamespace(core_node=CORE, instance_id=instance_id),

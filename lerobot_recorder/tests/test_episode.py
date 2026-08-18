@@ -1,5 +1,7 @@
-"""Recorder state-machine tests against a fake sink and goal context; the
-generated peppy layer is the conftest stand-in."""
+"""Recorder state-machine tests against a fake sink and goal context, over
+the real generated peppygen modules (no messaging: the goal context and
+cancellation token are local fakes; wire-level coverage lives in
+test_harness.py)."""
 
 import asyncio
 import shutil
@@ -19,6 +21,27 @@ from lerobot_recorder.recording import (
 )
 from lerobot_recorder.sink import ResumeManifest
 from tests.test_recording import ARM0, STALENESS_S, joint_entry, make_plan
+
+
+@pytest.fixture(autouse=True)
+def wall_clock(monkeypatch):
+    """The real generated clock raises until `peppygen.clock.init` runs under
+    a node runner; these tests have none, so pin now_ns to the wall time init
+    would resolve to in standalone mode. Tests probing the not-ready branch
+    re-patch on top."""
+    monkeypatch.setattr(episode.peppygen.clock, "now_ns", time.time_ns)
+
+
+@pytest.fixture(autouse=True)
+def no_rgbd_producers(monkeypatch):
+    """Depth-unit polling enumerates the rgbd slot's bound producers off the
+    runner these tests fake; every plan here binds no rgbd cameras, so stand
+    in the empty bound set. The depth-drift test re-patches on top."""
+    from peppygen.consumed_topics.rgbd_cameras import (
+        video_stream as rgbd_cameras_video_stream,
+    )
+
+    monkeypatch.setattr(rgbd_cameras_video_stream, "bound_producers", lambda _r: [])
 
 
 def fresh_joints(n=2) -> JointSample:
