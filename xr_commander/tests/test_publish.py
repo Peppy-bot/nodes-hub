@@ -5,7 +5,6 @@ import time
 import numpy as np
 import pytest
 
-import peppygen.clock
 from peppygen.consumed_actions.postures import move_to_home, move_to_ready
 from peppygen.consumed_topics.color_cameras import video_stream as color_video_stream
 from peppygen.paired_topics.right_arm import pose_setpoints as right_arm_pose_setpoints
@@ -16,11 +15,15 @@ from peppygen.paired_topics.right_gripper import (
 
 from tests.helpers import (
     POSE,
+    FakeSubscription,
     FakeToken,
     RecordingSink,
     boot,
+    boot_clocked,
     default_parameters,
     eventually,
+    press_until_goal,
+    running_drain,
 )
 from xr_commander import config, publish
 from xr_commander.clutch import HandClutch
@@ -40,6 +43,11 @@ def posture_settings():
     return config.from_parameters(default_parameters())
 
 
+def done(module):
+    """The action's success verdict, as each completed-goal assertion uses."""
+    return module.ResultResponseData(success=True, message="done")
+
+
 def frame_message(width=1, height=1, encoding="bgr8", data=None):
     if data is None:
         data = np.zeros((height, width, 3), dtype=np.uint8).tobytes()
@@ -57,17 +65,15 @@ async def test_drain_frames_routes_by_producer_and_skips_unknown_producers():
         known_mock, unknown_mock = h.mocks.deps.color_cameras
         known_id = color_video_stream.bound_producers(h.node_runner)[0].instance_id
         sink = RecordingSink()
-        token = FakeToken()
-        drain = asyncio.create_task(
-            drain_frames(
+        async with running_drain(
+            lambda token: drain_frames(
                 h.node_runner,
                 color_video_stream,
                 {known_id: sink},
                 token,
                 "test",
             )
-        )
-        try:
+        ) as drain:
             # A bound producer without a sink is skipped, not fatal: the
             # known producer's frames keep landing afterwards.
             await unknown_mock.video_stream.publish(frame_message())
@@ -82,9 +88,6 @@ async def test_drain_frames_routes_by_producer_and_skips_unknown_producers():
                 lambda: len(sink.frames) == 2,
                 message="the known producer's second frame",
             )
-        finally:
-            token.cancel()
-        await asyncio.wait_for(drain, 5.0)
 
 
 class FakeSession:
@@ -143,22 +146,6 @@ async def posture_button(h, *, action_module, pressed):
             await task
 
 
-async def _press_until_goal(session, mock_action, press=(True, False, False)):
-    """Release-then-press cycles until the node fires: the button re-arms
-    only once the previous goal's result waiter finishes, so the retry
-    absorbs that tail without sleeping blind."""
-    deadline = time.monotonic() + 10.0
-    while True:
-        session.press(right=(False, False, False))
-        await asyncio.sleep(0.03)
-        session.press(right=press)
-        try:
-            return await mock_action.next_goal(0.5)
-        except TimeoutError:
-            if time.monotonic() >= deadline:
-                raise
-
-
 def test_the_result_wait_scales_with_long_posture_moves():
     assert publish._result_timeout_s(2.0) == 120.0
     assert publish._result_timeout_s(100.0) == 300.0
@@ -182,7 +169,7 @@ async def test_the_button_fires_once_per_rising_edge():
             with pytest.raises(TimeoutError):
                 await mock.next_goal(0.4)
             await active.complete(
-                move_to_home.ResultResponseData(success=True, message="done")
+                done(move_to_home)
             )
 
 
@@ -237,7 +224,7 @@ async def test_a_button_already_held_at_first_tracking_does_not_fire():
             session.press(right=(True, False, False))
             pending = await mock.next_goal(10.0)
             await (await pending.accept()).complete(
-                move_to_home.ResultResponseData(success=True, message="done")
+                done(move_to_home)
             )
 
 
@@ -254,7 +241,7 @@ async def test_a_stale_gap_does_not_refire_a_held_button():
             session.press(right=(True, False, False))
             pending = await mock.next_goal(10.0)
             await (await pending.accept()).complete(
-                move_to_home.ResultResponseData(success=True, message="done")
+                done(move_to_home)
             )
             # The headset drops out while the thumb stays down...
             session.hands = {}
@@ -264,9 +251,11 @@ async def test_a_stale_gap_does_not_refire_a_held_button():
             with pytest.raises(TimeoutError):
                 await mock.next_goal(0.4)
             # A real release and press after the gap re-arms the button.
-            pending = await _press_until_goal(session, mock)
+            pending = await press_until_goal(
+                session, mock, {"right": (False, False, False)}, {"right": (True, False, False)}
+            )
             await (await pending.accept()).complete(
-                move_to_home.ResultResponseData(success=True, message="done")
+                done(move_to_home)
             )
 
 
@@ -288,7 +277,7 @@ async def test_the_selector_decides_which_button_fires_the_action():
             session.press(right=(False, True, False))
             pending = await ready.next_goal(10.0)
             await (await pending.accept()).complete(
-                move_to_ready.ResultResponseData(success=True, message="done")
+                done(move_to_ready)
             )
 
 
@@ -326,8 +315,7 @@ def test_a_failed_publisher_declaration_ends_the_stream_loudly(capsys):
 
 
 async def test_the_gripper_stream_is_silent_without_the_squeeze_deadman():
-    async with boot() as h:
-        await peppygen.clock.init(h.node_runner)
+    async with boot_clocked() as h:
         session = FakeSession()
         session.press(right=(False, False, False))
         async with _running(
@@ -347,8 +335,7 @@ async def test_the_gripper_stream_is_silent_without_the_squeeze_deadman():
 
 
 async def test_the_gripper_stream_publishes_openings_while_squeezing():
-    async with boot() as h:
-        await peppygen.clock.init(h.node_runner)
+    async with boot_clocked() as h:
         session = FakeSession()
         session.press(right=(False, False, True))
         async with _running(
@@ -370,8 +357,7 @@ async def test_the_gripper_stream_publishes_openings_while_squeezing():
 
 
 async def test_the_pose_stream_refuses_to_engage_without_a_fresh_measured_pose():
-    async with boot() as h:
-        await peppygen.clock.init(h.node_runner)
+    async with boot_clocked() as h:
         session = FakeSession()
         session.press(right=(False, False, True))
         async with _running(
@@ -393,8 +379,7 @@ async def test_the_pose_stream_refuses_to_engage_without_a_fresh_measured_pose()
 
 
 async def test_the_pose_stream_engages_once_the_follower_reports():
-    async with boot() as h:
-        await peppygen.clock.init(h.node_runner)
+    async with boot_clocked() as h:
         session = FakeSession()
         session.press(right=(False, False, True))
         measured = publish.LatestPose()
@@ -438,8 +423,7 @@ class FrozenSession(FakeSession):
 async def test_the_pose_stream_goes_silent_when_frames_stop_mid_squeeze():
     """The composed deadman: an engaged hand whose headset frames age past
     the staleness window stops publishing entirely."""
-    async with boot() as h:
-        await peppygen.clock.init(h.node_runner)
+    async with boot_clocked() as h:
         session = FrozenSession()
         session.press(right=(False, False, True))
         measured = publish.LatestPose()
@@ -513,13 +497,11 @@ def test_a_failed_pose_states_subscribe_is_loud_and_fatal_to_the_drain(capsys):
 async def test_drain_pose_states_keeps_the_holder_at_the_newest_measured_pose():
     async with boot() as h:
         holder = publish.LatestPose()
-        token = FakeToken()
-        drain = asyncio.create_task(
-            publish.drain_pose_states(
+        async with running_drain(
+            lambda token: publish.drain_pose_states(
                 h.node_runner, right_arm_pose_states, holder, "right", token
             )
-        )
-        try:
+        ):
             await h.mocks.pairings.right_arm.pose_states.publish(
                 right_arm_pose_states.Message(
                     timestamp=1.0,
@@ -542,9 +524,6 @@ async def test_drain_pose_states_keeps_the_holder_at_the_newest_measured_pose():
                 and pose.position[0] == 0.4,
                 message="the newest pose",
             )
-        finally:
-            token.cancel()
-        await asyncio.wait_for(drain, 5.0)
 
 
 def test_drain_pose_states_survives_garbage():
@@ -553,17 +532,9 @@ def test_drain_pose_states_survives_garbage():
     # through a hand-built message the generated modules cannot produce.
     from types import SimpleNamespace
 
-    class StubTopic:
-        def __init__(self, items):
-            self._items = list(items)
-
+    class StubTopic(FakeSubscription):
         async def subscribe(self, _runner):
             return self
-
-        async def next(self):
-            if self._items:
-                return self._items.pop(0)
-            await asyncio.Event().wait()
 
     good = SimpleNamespace(position=[0.1, 0.2, 0.3], orientation=[0, 0, 0, 1])
     bad = SimpleNamespace(position=None, orientation=None)

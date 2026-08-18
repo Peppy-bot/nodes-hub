@@ -558,3 +558,24 @@ def test_schema_rejects_degenerate_camera_geometry():
     cache.color = [CameraFrame(encoding="rgb8", width=0, height=0, data=b"", timestamp_ns=NOW_NS)]
     with pytest.raises(NotReady, match="0x0"):
         capture(cache, plan)
+
+
+def make_params(**overrides):
+    """The generated Parameters dataclass carries no field defaults, so the
+    schema's defaulted fields are spelled out once here (same values the
+    manifest defaults to, except the test-sized disk floor). Suites with
+    different pacing override the fields they care about."""
+    from peppygen.parameters import Parameters
+
+    values = dict(
+        robot_type="bot",
+        fps=30,
+        storage_root="/tmp/unused",
+        s3_uri="",
+        image_writer_threads=1,
+        streaming_encoding=True,
+        max_staleness_s=0.5,
+        min_remaining_disk_bytes=1,
+    )
+    values.update(overrides)
+    return Parameters(**values)

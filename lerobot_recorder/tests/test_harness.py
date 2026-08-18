@@ -26,6 +26,7 @@ from peppygen.fixtures.exposed_services import finish_session
 from peppygen.paired_topics.commanded_joints import joint_setpoints
 from peppygen.paired_topics.observed_joints import joint_states
 from peppygen.parameters import Parameters
+from tests.test_recording import make_params
 
 FPS = 10
 # The geometry the sink integration suite proves out: smaller frames stall
@@ -42,20 +43,16 @@ LIMB = "mock_observed_joints_0"
 
 
 def params(tmp_path) -> Parameters:
-    return Parameters(
-        robot_type="bot",
+    # Staged-PNG encoding: its writer queue is unbounded, so a saved
+    # episode's video deterministically covers every row (no drop-driven
+    # video_error to race the result assertions against). Staleness is
+    # generous: a loaded host importing torch mid-test must not read as a
+    # dead source.
+    return make_params(
         fps=FPS,
         storage_root=str(tmp_path),
-        s3_uri="",
-        image_writer_threads=1,
-        # Staged-PNG encoding: its writer queue is unbounded, so a saved
-        # episode's video deterministically covers every row (no drop-driven
-        # video_error to race the result assertions against).
         streaming_encoding=False,
-        # Generous: a loaded host importing torch mid-test must not read as a
-        # dead source.
         max_staleness_s=5.0,
-        min_remaining_disk_bytes=1,
     )
 
 

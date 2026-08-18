@@ -6,7 +6,7 @@ import pytest
 
 from peppygen.consumed_topics.motor_health import motor_health as motor_health_topic
 
-from tests.helpers import FakeToken, boot, eventually
+from tests.helpers import FakeToken, boot, eventually, running_drain
 from xr_commander.motor_health import (
     HEALTH_STALE_AFTER_MS,
     NOT_REPORTING,
@@ -274,11 +274,11 @@ async def test_drain_motor_health_keys_reports_by_the_producing_instance():
             for p in motor_health_topic.bound_producers(h.node_runner)
         ]
         store = MotorHealthReports()
-        token = FakeToken()
-        drain = asyncio.create_task(
-            drain_motor_health(h.node_runner, motor_health_topic, store, token)
-        )
-        try:
+        async with running_drain(
+            lambda token: drain_motor_health(
+                h.node_runner, motor_health_topic, store, token
+            )
+        ):
             await arm.motor_health.publish(_wire())
             await gripper.motor_health.publish(_wire((0,)))
             await eventually(
@@ -286,9 +286,6 @@ async def test_drain_motor_health_keys_reports_by_the_producing_instance():
                 == sorted([arm_id, gripper_id]),
                 message="both producers' reports",
             )
-        finally:
-            token.cancel()
-        await asyncio.wait_for(drain, 5.0)
         # Each report landed under its own transport-authenticated instance.
         by_name = {e.instance: e.report for e in store.by_instance()}
         assert len(by_name[arm_id].levels) == 7
@@ -308,7 +305,6 @@ async def test_a_malformed_producer_is_reported_once_not_every_report():
         ]
         logged: list[str] = []
         store = MotorHealthReports()
-        token = FakeToken()
 
         def unusable():
             return [m for m in logged if "unusable" in m]
@@ -316,10 +312,11 @@ async def test_a_malformed_producer_is_reported_once_not_every_report():
         with mock.patch(
             "xr_commander.bus.log", side_effect=lambda m: logged.append(m)
         ):
-            drain = asyncio.create_task(
-                drain_motor_health(h.node_runner, motor_health_topic, store, token)
-            )
-            try:
+            async with running_drain(
+                lambda token: drain_motor_health(
+                    h.node_runner, motor_health_topic, store, token
+                )
+            ):
                 for _ in range(3):
                     await bad.motor_health.publish(_wire(levels=(9,) * 7))
                 await eventually(
@@ -337,9 +334,6 @@ async def test_a_malformed_producer_is_reported_once_not_every_report():
                 await eventually(
                     lambda: len(store.by_instance()) == 2, message="the recovery"
                 )
-            finally:
-                token.cancel()
-            await asyncio.wait_for(drain, 5.0)
         assert len(unusable()) == 1, f"logged {len(unusable())} times: {unusable()}"
         # The malformed reports were refused, never rendered: only the valid
         # nominal report is stored for the bad producer.

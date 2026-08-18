@@ -7,7 +7,16 @@ import pytest
 from peppygen.consumed_actions.recorder import record_episode
 from peppygen.consumed_services.recorder import finish_session
 
-from tests.helpers import POSE, FakeToken, boot, default_parameters, eventually
+from tests.helpers import (
+    POSE,
+    FakeToken,
+    boot,
+    default_parameters,
+    eventually,
+    press_until_goal,
+    stop_and_save,
+    tap_x,
+)
 from xr_commander import config, publish, record
 from xr_commander.bus import select_producer
 from xr_commander.devices import HandSample, XrFrame
@@ -70,22 +79,6 @@ async def recorder_buttons(h, status=None):
             await task
 
 
-async def _press_x_until_goal(session, mock_action):
-    """Release-then-press X until the recorder mock sees a goal: the button
-    re-arms only once the previous episode's watcher finished, so the retry
-    absorbs that tail without sleeping blind."""
-    deadline = time.monotonic() + 10.0
-    while True:
-        session.press(x=False)
-        await asyncio.sleep(0.03)
-        session.press(x=True)
-        try:
-            return await mock_action.next_goal(0.5)
-        except TimeoutError:
-            if time.monotonic() >= deadline:
-                raise
-
-
 async def _fired_episode(h):
     """One accepted record_episode goal fired outside the button loop: the
     node-side handle, the mock-side active goal, and the target."""
@@ -106,9 +99,7 @@ async def test_x_fires_one_goal_per_rising_edge_with_the_task():
     async with boot(recorder_instances=1) as h:
         rec = h.mocks.deps.recorder[0].record_episode
         async with recorder_buttons(h) as (session, _task):
-            session.press(x=False)
-            await asyncio.sleep(0.05)
-            session.press(x=True)
+            await tap_x(session)
             pending = await rec.next_goal(10.0)
             assert pending.request.task == record.TASK
             await pending.accept()
@@ -125,9 +116,7 @@ async def test_x_already_held_at_first_tracking_does_not_start():
             with pytest.raises(TimeoutError):
                 await rec.next_goal(0.4)
             # An observed release and then a press is the first real edge.
-            session.press(x=False)
-            await asyncio.sleep(0.05)
-            session.press(x=True)
+            await tap_x(session)
             pending = await rec.next_goal(10.0)
             assert pending.request.task == record.TASK
             await pending.accept()
@@ -165,15 +154,11 @@ async def test_x_again_stops_and_saves_instead_of_firing_twice():
         rec = h.mocks.deps.recorder[0].record_episode
         status = record.RecorderStatus()
         async with recorder_buttons(h, status) as (session, _task):
-            session.press(x=False)
-            await asyncio.sleep(0.05)
-            session.press(x=True)
+            await tap_x(session)
             pending = await rec.next_goal(10.0)
             active = await pending.accept()
             await eventually(lambda: status.recording, message="the REC line")
-            session.press(x=False)
-            await asyncio.sleep(0.05)
-            session.press(x=True)  # stop-and-save, not a second goal
+            await tap_x(session)  # stop-and-save, not a second goal
             await asyncio.wait_for(active.cancel_signal(), 10.0)
             with pytest.raises(TimeoutError):
                 await rec.next_goal(0.4)
@@ -188,18 +173,12 @@ async def test_a_finished_episode_rearms_the_button():
     async with boot(recorder_instances=1) as h:
         rec = h.mocks.deps.recorder[0].record_episode
         async with recorder_buttons(h) as (session, _task):
-            session.press(x=False)
-            await asyncio.sleep(0.05)
-            session.press(x=True)
+            await tap_x(session)
             pending = await rec.next_goal(10.0)
             active = await pending.accept()
-            session.press(x=False)
-            await asyncio.sleep(0.05)
-            session.press(x=True)
-            await asyncio.wait_for(active.cancel_signal(), 10.0)
-            await active.complete_cancelled(SAVED)
+            await stop_and_save(session, active, SAVED)
             # The finished episode re-arms X for a second one.
-            pending = await _press_x_until_goal(session, rec)
+            pending = await press_until_goal(session, rec, {"x": False}, {"x": True})
             assert pending.request.task == record.TASK
             await pending.accept()
 
@@ -209,13 +188,11 @@ async def test_a_rejected_goal_leaves_the_panel_idle_and_rearms():
         rec = h.mocks.deps.recorder[0].record_episode
         status = record.RecorderStatus()
         async with recorder_buttons(h, status) as (session, _task):
-            session.press(x=False)
-            await asyncio.sleep(0.05)
-            session.press(x=True)
+            await tap_x(session)
             pending = await rec.next_goal(10.0)
             await pending.reject("busy")
             # The refused goal re-arms the button immediately.
-            pending = await _press_x_until_goal(session, rec)
+            pending = await press_until_goal(session, rec, {"x": False}, {"x": True})
             await pending.reject("busy")
             assert not status.recording
 
@@ -225,9 +202,7 @@ async def test_feedback_reaches_the_panel_and_clears_at_the_end():
         rec = h.mocks.deps.recorder[0].record_episode
         status = record.RecorderStatus()
         async with recorder_buttons(h, status) as (session, _task):
-            session.press(x=False)
-            await asyncio.sleep(0.05)
-            session.press(x=True)
+            await tap_x(session)
             pending = await rec.next_goal(10.0)
             active = await pending.accept()
             await eventually(lambda: status.recording, message="the REC line")
@@ -242,11 +217,7 @@ async def test_feedback_reaches_the_panel_and_clears_at_the_end():
                 lambda: status.frames == 3 and status.recording,
                 message="the frame counter",
             )
-            session.press(x=False)
-            await asyncio.sleep(0.05)
-            session.press(x=True)
-            await asyncio.wait_for(active.cancel_signal(), 10.0)
-            await active.complete_cancelled(SAVED)
+            await stop_and_save(session, active, SAVED)
             await eventually(
                 lambda: not status.recording and status.frames == 0,
                 message="the cleared row",
@@ -280,16 +251,10 @@ async def test_outcomes_reach_the_panel_as_notes(monkeypatch):
         rec = h.mocks.deps.recorder[0]
         status = record.RecorderStatus()
         async with recorder_buttons(h, status) as (session, _task):
-            session.press(x=False)
-            await asyncio.sleep(0.05)
-            session.press(x=True)
+            await tap_x(session)
             pending = await rec.record_episode.next_goal(10.0)
             active = await pending.accept()
-            session.press(x=False)
-            await asyncio.sleep(0.05)
-            session.press(x=True)
-            await asyncio.wait_for(active.cancel_signal(), 10.0)
-            await active.complete_cancelled(SAVED)
+            await stop_and_save(session, active, SAVED)
             await eventually(
                 lambda: status.note() == "saved episode 0", message="the saved note"
             )
@@ -351,9 +316,7 @@ async def test_a_stale_gap_does_not_stop_a_recording_with_x_still_held():
     async with boot(recorder_instances=1) as h:
         rec = h.mocks.deps.recorder[0].record_episode
         async with recorder_buttons(h) as (session, _task):
-            session.press(x=False)
-            await asyncio.sleep(0.05)
-            session.press(x=True)
+            await tap_x(session)
             pending = await rec.next_goal(10.0)
             active = await pending.accept()
             # The headset drops out with X still down, then comes back held.
@@ -363,11 +326,7 @@ async def test_a_stale_gap_does_not_stop_a_recording_with_x_still_held():
             await asyncio.sleep(0.2)
             assert not active.is_cancelled()
             # A real release and press still stops it.
-            session.press(x=False)
-            await asyncio.sleep(0.05)
-            session.press(x=True)
-            await asyncio.wait_for(active.cancel_signal(), 10.0)
-            await active.complete_cancelled(SAVED)
+            await stop_and_save(session, active, SAVED)
 
 
 async def test_a_stop_racing_a_finished_watcher_does_not_claim_saving():

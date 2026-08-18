@@ -21,30 +21,17 @@ from lerobot_recorder.__main__ import (
 )
 from lerobot_recorder.plan import LinkKind, SourceEntry
 from lerobot_recorder.recording import Cache, GripperSample, JointSample
-from tests.test_recording import CORE, NOW_NS, action_entry, joint_entry, make_plan
+from tests.test_recording import (
+    CORE,
+    NOW_NS,
+    action_entry,
+    joint_entry,
+    make_params,
+    make_plan,
+)
 
 BACKBONE = (CORE, "backbone_inst", "left_arm_link")
 OTHER_ARM = (CORE, "backbone_inst", "right_arm_link")
-
-
-def make_params(**overrides):
-    """The generated Parameters dataclass carries no field defaults, so the
-    schema's defaulted fields are spelled out once here (same values the
-    manifest defaults to, except the test-sized disk floor)."""
-    from peppygen.parameters import Parameters
-
-    values = dict(
-        robot_type="bot",
-        fps=30,
-        storage_root="/tmp/unused",
-        s3_uri="",
-        image_writer_threads=1,
-        streaming_encoding=True,
-        max_staleness_s=0.5,
-        min_remaining_disk_bytes=1,
-    )
-    values.update(overrides)
-    return Parameters(**values)
 
 
 def joint_message(position: float):

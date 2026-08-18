@@ -6,7 +6,7 @@ import pytest
 
 from peppygen.consumed_topics.alerts import alerts as alerts_topic
 
-from tests.helpers import FakeToken, boot, eventually
+from tests.helpers import FakeToken, boot, eventually, running_drain
 from xr_commander.alerts import (
     ALERT_STALE_AFTER_MS,
     ActiveAlerts,
@@ -152,20 +152,15 @@ async def test_drain_alerts_keeps_every_producers_alerts():
     async with boot(alerts_instances=2) as h:
         left, right = h.mocks.deps.alerts
         active = ActiveAlerts()
-        token = FakeToken()
-        drain = asyncio.create_task(
-            drain_alerts(h.node_runner, alerts_topic, active, token)
-        )
-        try:
+        async with running_drain(
+            lambda token: drain_alerts(h.node_runner, alerts_topic, active, token)
+        ) as drain:
             await left.alerts.publish(_wire("left arm j2", 2))
             await right.alerts.publish(_wire("right arm j5", 3))
             await eventually(
                 lambda: [a.severity for a in active.active()] == [3, 2],
                 message="both producers' alerts, worst first",
             )
-        finally:
-            token.cancel()
-        await asyncio.wait_for(drain, 5.0)
 
 
 async def test_a_malformed_producer_is_reported_once_not_every_re_emit():
@@ -178,7 +173,6 @@ async def test_a_malformed_producer_is_reported_once_not_every_re_emit():
         bad, good = h.mocks.deps.alerts
         logged: list[str] = []
         active = ActiveAlerts()
-        token = FakeToken()
 
         def unusable():
             return [m for m in logged if "unusable" in m]
@@ -186,10 +180,11 @@ async def test_a_malformed_producer_is_reported_once_not_every_re_emit():
         with mock.patch(
             "xr_commander.bus.log", side_effect=lambda m: logged.append(m)
         ):
-            drain = asyncio.create_task(
-                drain_alerts(h.node_runner, alerts_topic, active, token)
-            )
-            try:
+            async with running_drain(
+                lambda token: drain_alerts(
+                    h.node_runner, alerts_topic, active, token
+                )
+            ):
                 for _ in range(3):
                     await bad.alerts.publish(_wire("left arm j2", 9))
                 await eventually(
@@ -207,9 +202,6 @@ async def test_a_malformed_producer_is_reported_once_not_every_re_emit():
                 await eventually(
                     lambda: len(active.active()) == 2, message="the recovery"
                 )
-            finally:
-                token.cancel()
-            await asyncio.wait_for(drain, 5.0)
         assert len(unusable()) == 1, f"logged {len(unusable())} times: {unusable()}"
 
 

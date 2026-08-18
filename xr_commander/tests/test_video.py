@@ -8,7 +8,7 @@ from teleop_xr.config import ViewConfig
 
 from peppygen.consumed_topics.color_cameras import video_stream as color_video_stream
 
-from tests.helpers import FakeToken, RecordingSink, boot, eventually
+from tests.helpers import FakeToken, RecordingSink, boot, eventually, running_drain
 from xr_commander import video
 from xr_commander.video import (
     CAMERA_VIEW,
@@ -127,9 +127,8 @@ async def test_an_undecodable_frame_is_dropped_and_logged_once(capsys):
         cam_id = color_video_stream.bound_producers(h.node_runner)[0].instance_id
         sink = RecordingSink()
         health: dict[str, float] = {}
-        token = FakeToken()
-        drain = asyncio.create_task(
-            drain_frames(
+        async with running_drain(
+            lambda token: drain_frames(
                 h.node_runner,
                 color_video_stream,
                 {cam_id: sink},
@@ -138,8 +137,7 @@ async def test_an_undecodable_frame_is_dropped_and_logged_once(capsys):
                 0,
                 health,
             )
-        )
-        try:
+        ):
             bad = color_video_stream.Message(
                 header=color_video_stream.MessageHeader(timestamp=0.0, frame_id=0),
                 encoding="z16",
@@ -153,9 +151,6 @@ async def test_an_undecodable_frame_is_dropped_and_logged_once(capsys):
             # Per-producer order holds, so the landed good frame proves both
             # bad ones were already processed.
             await eventually(lambda: len(sink.frames) == 1, message="the good frame")
-        finally:
-            token.cancel()
-        await asyncio.wait_for(drain, 5.0)
         assert capsys.readouterr().out.count("frame unusable") == 1  # latched
         assert cam_id in health  # stamped for the delivered frame only
 
