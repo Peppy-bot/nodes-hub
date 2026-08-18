@@ -19,14 +19,9 @@ import asyncio
 import contextlib
 import math
 import shutil
+from dataclasses import dataclass
 
 import peppygen.clock
-from peppygen.consumed_services.rgbd_cameras import (
-    depth_stream_info as rgbd_cameras_depth_stream_info,
-)
-from peppygen.consumed_topics.rgbd_cameras import (
-    video_stream as rgbd_cameras_video_stream,
-)
 from peppygen.exposed_actions import record_episode
 
 from . import recording
@@ -37,8 +32,39 @@ from .sink import Sink
 # Generous for one local service round-trip; a camera that cannot answer
 # depth_stream_info in this long is not going to stream either.
 DEPTH_INFO_TIMEOUT_S = 5.0
-# Cadence for retrying eager dataset creation while sources come up.
-WARMUP_RETRY_S = 1.0
+
+
+@dataclass(frozen=True)
+class Timing:
+    """The recorder's pacing, injectable so tests can tighten a bound
+    without waiting out the production value."""
+
+    # Cadence for retrying eager dataset creation while sources come up.
+    warmup_retry_s: float = 1.0
+    max_episode_s: float = recording.MAX_EPISODE_S
+    disk_check_period_s: float = recording.DISK_CHECK_PERIOD_S
+    max_schedule_lag_s: float = recording.MAX_SCHEDULE_LAG_S
+
+
+async def poll_depth_units(node_runner, plan: RecordingPlan) -> list[float]:
+    """Each bound rgbd camera's current depth unit, from the wire."""
+    from peppygen.consumed_services.rgbd_cameras import (
+        depth_stream_info as rgbd_cameras_depth_stream_info,
+    )
+    from peppygen.consumed_topics.rgbd_cameras import (
+        video_stream as rgbd_cameras_video_stream,
+    )
+
+    units = [
+        (
+            await rgbd_cameras_depth_stream_info.poll(
+                node_runner, producer, DEPTH_INFO_TIMEOUT_S
+            )
+        ).data.depth_unit
+        for producer in rgbd_cameras_video_stream.bound_producers(node_runner)
+    ]
+    recording.validate_depth_units(plan, units)
+    return units
 
 
 def _log_sync_failure(task: asyncio.Task) -> None:
@@ -102,6 +128,11 @@ class Recorder:
         mirror=None,
         open_session=None,
         open_existing=None,
+        *,
+        now_ns=peppygen.clock.now_ns,
+        disk_usage=shutil.disk_usage,
+        depth_probe=poll_depth_units,
+        timing: Timing = Timing(),
     ):
         if not math.isfinite(max_staleness_s) or max_staleness_s <= 0:
             raise ValueError(f"max_staleness_s must be positive, got {max_staleness_s}")
@@ -119,6 +150,10 @@ class Recorder:
         # raising ValueError for a bad or unknown name; None disables
         # resume_session.
         self._open_existing = open_existing
+        self._now_ns = now_ns
+        self._disk_usage = disk_usage
+        self._depth_probe = depth_probe
+        self._timing = timing
         self._finishing = False
         self._resuming = False
         # Set between a session's successful finalize and the roll to its
@@ -180,7 +215,7 @@ class Recorder:
         last_reason: str | None = None
         while not token.is_cancelled():
             if self._schema is not None:
-                await asyncio.sleep(WARMUP_RETRY_S)
+                await asyncio.sleep(self._timing.warmup_retry_s)
                 continue
             try:
                 await self._ensure_created(node_runner)
@@ -192,7 +227,7 @@ class Recorder:
                 if repr(e) != last_reason:
                     last_reason = repr(e)
                     print(f"[recorder] dataset not ready yet: {last_reason}")
-                await asyncio.sleep(WARMUP_RETRY_S)
+                await asyncio.sleep(self._timing.warmup_retry_s)
 
     async def _ensure_created(self, node_runner) -> None:
         """Capture the schema and create the dataset exactly once; callers
@@ -374,10 +409,10 @@ class Recorder:
 
     def _refuse_reason(self) -> str | None:
         try:
-            now_ns = peppygen.clock.now_ns()
+            now_ns = self._now_ns()
         except RuntimeError as e:
             return f"recorder clock not ready: {e}"
-        free = shutil.disk_usage(self._session_dir).free
+        free = self._disk_usage(self._session_dir).free
         if free < self._min_remaining_disk_bytes:
             return _low_disk(free)
         # Probed on every goal, so a refusal names the first unmet
@@ -415,7 +450,7 @@ class Recorder:
             # Re-probed each episode: a camera re-profiled between episodes
             # would otherwise silently mis-scale every depth frame.
             try:
-                depth_units = await self._poll_depth_units(node_runner)
+                depth_units = await self._depth_probe(node_runner, self._plan)
             except Exception as e:
                 await self._complete(
                     ctx,
@@ -438,24 +473,12 @@ class Recorder:
                 return
         await self._record(ctx, token)
 
-    async def _poll_depth_units(self, node_runner) -> list[float]:
-        units = [
-            (
-                await rgbd_cameras_depth_stream_info.poll(
-                    node_runner, producer, DEPTH_INFO_TIMEOUT_S
-                )
-            ).data.depth_unit
-            for producer in rgbd_cameras_video_stream.bound_producers(node_runner)
-        ]
-        recording.validate_depth_units(self._plan, units)
-        return units
-
     async def _capture_schema(self, node_runner) -> SourceSchema:
         return recording.capture_schema(
             self._cache,
             self._plan,
-            await self._poll_depth_units(node_runner),
-            peppygen.clock.now_ns(),
+            await self._depth_probe(node_runner, self._plan),
+            self._now_ns(),
             self._max_staleness_s,
         )
 
@@ -464,7 +487,7 @@ class Recorder:
         task = ctx.request().data.task
         episode_index = self._sink.episodes_saved
         period = 1.0 / self._sink.fps
-        max_frames = recording.MAX_EPISODE_S * self._sink.fps
+        max_frames = self._timing.max_episode_s * self._sink.fps
         frames = 0
         loop = asyncio.get_running_loop()
         next_tick = loop.time()
@@ -490,7 +513,7 @@ class Recorder:
                         self._cache,
                         self._schema,
                         self._plan,
-                        peppygen.clock.now_ns(),
+                        self._now_ns(),
                         self._max_staleness_s,
                     )
                 except (SampleGap, RuntimeError) as e:
@@ -522,8 +545,8 @@ class Recorder:
                 # DISK_CHECK_PERIOD_S and repeats in between.
                 fresh_measurement = now >= next_disk_check
                 if fresh_measurement:
-                    next_disk_check = now + recording.DISK_CHECK_PERIOD_S
-                    disk_free = shutil.disk_usage(self._session_dir).free
+                    next_disk_check = now + self._timing.disk_check_period_s
+                    disk_free = self._disk_usage(self._session_dir).free
                 # Progress reporting is best-effort: a subscriber that went
                 # away must not end the episode.
                 with contextlib.suppress(Exception):
@@ -536,7 +559,7 @@ class Recorder:
                     break
                 next_tick += period
                 delay = next_tick - loop.time()
-                if delay < -recording.MAX_SCHEDULE_LAG_S:
+                if delay < -self._timing.max_schedule_lag_s:
                     end_error = (
                         f"cannot sustain {self._sink.fps} fps "
                         f"(sampling {-delay:.2f}s behind)"

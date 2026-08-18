@@ -233,9 +233,12 @@ def test_resume_appends_to_a_finalized_session(tmp_path):
     assert float(ds[0]["action"][0]) >= ACTION_OFFSET
 
 
-def test_resume_refuses_a_session_without_episodes(tmp_path, monkeypatch):
+def test_resume_refuses_a_session_without_episodes(tmp_path):
     """A zero-episode dataset must be refused BEFORE the library's metadata
-    loader runs: its missing-table fallback is a Hugging Face Hub download."""
+    loader runs: its missing-table fallback is a Hugging Face Hub download.
+    The suite runs with HF_HUB_OFFLINE=1 (conftest), so a preflight that
+    reached the loader would raise the hub's offline error here instead of
+    the recorder's own refusal."""
     sink = _sink(tmp_path)
 
     async def create_only():
@@ -244,10 +247,6 @@ def test_resume_refuses_a_session_without_episodes(tmp_path, monkeypatch):
 
     asyncio.run(create_only())
 
-    def explode(*args, **kwargs):
-        raise AssertionError("resume preflight must not reach the HF Hub")
-
-    monkeypatch.setattr("huggingface_hub.snapshot_download", explode)
     fresh = _sink(tmp_path)
     with pytest.raises(ValueError, match="no saved episodes"):
         asyncio.run(fresh.preflight_resume())

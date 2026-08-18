@@ -1,7 +1,7 @@
 """How messages get from the observed slots into the cache: which parser each
 slot's drain uses, and which cache slot a message lands in. The wiring resolves
-the real generated modules; tests that need a specific membership monkeypatch
-the slot accessors on those modules."""
+the real generated modules; the setup test hands `setup` a scripted membership
+through its injection points instead of touching those modules."""
 
 import asyncio
 import json
@@ -13,7 +13,7 @@ import lerobot_recorder.__main__ as main_mod
 from lerobot_recorder import recording
 from lerobot_recorder.__main__ import (
     _check_same_links,
-    _link_drains,
+    _link_routes,
     _recorded_links,
     _resolve_existing_session,
     _route_link,
@@ -94,18 +94,12 @@ def test_each_slot_drains_through_the_parser_for_its_role():
     exercised here are the ones the wiring built, not ones this test paired
     up itself."""
     cache = cache_with(BACKBONE, OTHER_ARM)
-    drained = []
+    wired = [
+        (label, topic_module.TOPIC_NAME, route)
+        for topic_module, route, label in _link_routes(cache)
+    ]
 
-    def fake_drain(topic_module, route, _token, label):
-        drained.append((label, topic_module.TOPIC_NAME, route))
-
-    original, main_mod._drain = main_mod._drain, fake_drain
-    try:
-        _link_drains(token=None, cache=cache)
-    finally:
-        main_mod._drain = original
-
-    assert [(label, topic) for label, topic, _ in drained] == [
+    assert [(label, topic) for label, topic, _ in wired] == [
         ("observed_joints", "joint_states"),
         ("commanded_joints", "joint_setpoints"),
         ("observed_grippers", "gripper_states"),
@@ -115,7 +109,7 @@ def test_each_slot_drains_through_the_parser_for_its_role():
     # A gripper's measured stream carries an effort and its setpoint stream
     # does not, so the parser each slot was wired with is visible in what the
     # sample records.
-    routes = {label: route for label, _, route in drained}
+    routes = {label: route for label, _, route in wired}
     message = SimpleNamespace(timestamp=NOW_NS / 1e9, opening=0.4, effort=0.9)
 
     routes["observed_grippers"](observed(BACKBONE), message)
@@ -162,7 +156,7 @@ def test_a_closed_subscription_ends_the_drain():
     assert cache.links[BACKBONE].positions == (0.5,)
 
 
-def test_a_service_handler_error_does_not_end_the_loop(monkeypatch):
+def test_a_service_handler_error_does_not_end_the_loop():
     """One raising handler must not leave the service unanswered for the
     node's whole life."""
     calls = {"n": 0}
@@ -177,8 +171,7 @@ def test_a_service_handler_error_does_not_end_the_loop(monkeypatch):
     node_runner = SimpleNamespace(
         cancellation_token=lambda: SimpleNamespace(is_cancelled=lambda: calls["n"] >= 3)
     )
-    monkeypatch.setattr(main_mod, "SERVICE_RETRY_S", 0)
-    asyncio.run(main_mod._serve(node_runner, Svc, handler=None, label="svc"))
+    asyncio.run(main_mod._serve(node_runner, Svc, handler=None, label="svc", retry_s=0))
     assert calls["n"] == 3
 
 
@@ -273,39 +266,30 @@ def test_a_session_json_without_links_is_refused(tmp_path):
         _check_same_links(session_with(tmp_path, {}), make_plan())
 
 
-def test_setup_discovers_the_seeded_membership_inline(tmp_path, monkeypatch):
+def test_setup_discovers_the_seeded_membership_inline(tmp_path):
     """The boot config seeds the observer slots before the process starts, so
     setup reads the robot's shape directly and the session exists the moment
-    setup returns; nothing is deferred behind Running anymore."""
-    import peppygen.clock
-    from peppygen.consumed_topics.color_cameras import (
-        video_stream as color_cameras_video_stream,
-    )
-    from peppygen.consumed_topics.rgbd_cameras import (
-        video_stream as rgbd_cameras_video_stream,
-    )
-    from peppygen.paired_topics.commanded_grippers import gripper_setpoints
-    from peppygen.paired_topics.commanded_joints import joint_setpoints
-    from peppygen.paired_topics.observed_grippers import gripper_states
-    from peppygen.paired_topics.observed_joints import joint_states
+    setup returns; nothing is deferred behind Running anymore. The scripted
+    membership arrives through setup's injection points: one arm pairing,
+    no grippers, no cameras."""
+    from lerobot_recorder.plan import BoundSources, LinkKind
 
-    monkeypatch.setattr(
-        joint_states, "sources", lambda _r: [observed((CORE, "arm_inst", "link"))]
+    bound = BoundSources(
+        limbs=(
+            (
+                LinkKind.JOINT,
+                (observed((CORE, "arm_inst", "link")),),
+                (observed((CORE, "lead_inst", "arm_link")),),
+            ),
+            (LinkKind.GRIPPER, (), ()),
+        ),
+        color_producers=(),
+        rgbd_producers=(),
     )
-    monkeypatch.setattr(
-        joint_setpoints, "sources", lambda _r: [observed((CORE, "lead_inst", "arm_link"))]
-    )
-    # The real modules read the remaining slots off the runner this test has
-    # none of; this launch binds no grippers and no cameras.
-    for module in (gripper_states, gripper_setpoints):
-        monkeypatch.setattr(module, "sources", lambda _r: [])
-    for module in (color_cameras_video_stream, rgbd_cameras_video_stream):
-        monkeypatch.setattr(module, "bound_producers", lambda _r: [])
 
     async def clock_ready(_runner):
         return None
 
-    monkeypatch.setattr(peppygen.clock, "init", clock_ready)
     runner = SimpleNamespace(
         cancellation_token=lambda: NeverCancelledToken(), on_shutdown=lambda _hook: None
     )
@@ -315,7 +299,12 @@ def test_setup_discovers_the_seeded_membership_inline(tmp_path, monkeypatch):
         return any((child / "session.json").is_file() for child in tmp_path.iterdir())
 
     async def run():
-        tasks = await asyncio.wait_for(main_mod.setup(params, runner), timeout=5.0)
+        tasks = await asyncio.wait_for(
+            main_mod.setup(
+                params, runner, read_sources=lambda _r: bound, clock_init=clock_ready
+            ),
+            timeout=5.0,
+        )
         assert session_created(), "the session opens during setup, from the seeded shape"
         for task in tasks:
             task.cancel()

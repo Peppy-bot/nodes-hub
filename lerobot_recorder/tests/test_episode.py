@@ -1,17 +1,19 @@
 """Recorder state-machine tests against a fake sink and goal context, over
 the real generated peppygen modules (no messaging: the goal context and
 cancellation token are local fakes; wire-level coverage lives in
-test_harness.py)."""
+test_harness.py). The recorder's environment reads (clock, disk, depth
+probe, pacing) are injected through its constructor: the wall clock stands
+in for the daemon-resolved clock these tests run without, and no plan here
+binds rgbd cameras unless a test says so."""
 
 import asyncio
-import shutil
 import time
 from types import SimpleNamespace
 
 import pytest
 
 from lerobot_recorder import episode, recording
-from lerobot_recorder.episode import Recorder
+from lerobot_recorder.episode import Recorder, Timing
 from lerobot_recorder.recording import (
     Cache,
     CameraFrame,
@@ -23,25 +25,13 @@ from lerobot_recorder.sink import ResumeManifest
 from tests.test_recording import ARM0, STALENESS_S, joint_entry, make_plan
 
 
-@pytest.fixture(autouse=True)
-def wall_clock(monkeypatch):
-    """The real generated clock raises until `peppygen.clock.init` runs under
-    a node runner; these tests have none, so pin now_ns to the wall time init
-    would resolve to in standalone mode. Tests probing the not-ready branch
-    re-patch on top."""
-    monkeypatch.setattr(episode.peppygen.clock, "now_ns", time.time_ns)
+async def no_depth_units(_node_runner, _plan):
+    return []
 
 
-@pytest.fixture(autouse=True)
-def no_rgbd_producers(monkeypatch):
-    """Depth-unit polling enumerates the rgbd slot's bound producers off the
-    runner these tests fake; every plan here binds no rgbd cameras, so stand
-    in the empty bound set. The depth-drift test re-patches on top."""
-    from peppygen.consumed_topics.rgbd_cameras import (
-        video_stream as rgbd_cameras_video_stream,
-    )
-
-    monkeypatch.setattr(rgbd_cameras_video_stream, "bound_producers", lambda _r: [])
+def free_disk(free: int):
+    """A disk_usage whose only read field reports `free` bytes."""
+    return lambda _path: SimpleNamespace(total=0, used=0, free=free)
 
 
 def fresh_joints(n=2) -> JointSample:
@@ -191,9 +181,12 @@ class FakeToken:
         await self._event.wait()
 
 
-def recorder_with(plan, sink, tmp_path) -> tuple[Recorder, Cache]:
+def recorder_with(plan, sink, tmp_path, **overrides) -> tuple[Recorder, Cache]:
     cache = Cache.for_plan(plan)
-    return Recorder(plan, cache, sink, tmp_path, STALENESS_S, 1 << 30), cache
+    overrides.setdefault("now_ns", time.time_ns)
+    overrides.setdefault("depth_probe", no_depth_units)
+    recorder = Recorder(plan, cache, sink, tmp_path, STALENESS_S, 1 << 30, **overrides)
+    return recorder, cache
 
 
 async def _until(predicate, *, tick=None, poll_s=0.005):
@@ -258,12 +251,13 @@ def test_add_frame_failure_ends_goal_with_discard(tmp_path):
     asyncio.run(run())
 
 
-def test_schedule_lag_ends_episode_with_save(tmp_path, monkeypatch):
-    monkeypatch.setattr(recording, "MAX_SCHEDULE_LAG_S", 0.15)
+def test_schedule_lag_ends_episode_with_save(tmp_path):
     plan = arm_plan()
     # 20 ms per frame against a 10 ms period: lag grows every tick.
     sink = FakeSink(fps=100, add_delay_s=0.02)
-    recorder, cache = recorder_with(plan, sink, tmp_path)
+    recorder, cache = recorder_with(
+        plan, sink, tmp_path, timing=Timing(max_schedule_lag_s=0.15)
+    )
 
     async def run():
         cache.links[ARM0] = fresh_joints()
@@ -287,13 +281,10 @@ def test_schedule_lag_ends_episode_with_save(tmp_path, monkeypatch):
     asyncio.run(run())
 
 
-def test_disk_floor_trips_on_its_own_cadence(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        shutil, "disk_usage", lambda path: SimpleNamespace(total=0, used=0, free=0)
-    )
+def test_disk_floor_trips_on_its_own_cadence(tmp_path):
     plan = arm_plan()
     sink = FakeSink(fps=100)
-    recorder, cache = recorder_with(plan, sink, tmp_path)
+    recorder, cache = recorder_with(plan, sink, tmp_path, disk_usage=free_disk(0))
 
     async def run():
         cache.links[ARM0] = fresh_joints()
@@ -309,16 +300,16 @@ def test_disk_floor_trips_on_its_own_cadence(tmp_path, monkeypatch):
     asyncio.run(run())
 
 
-def test_feedback_per_frame_with_slow_disk_field(tmp_path, monkeypatch):
+def test_feedback_per_frame_with_slow_disk_field(tmp_path):
     # Disk stays above the floor; the episode ends on state staleness.
-    monkeypatch.setattr(
-        shutil,
-        "disk_usage",
-        lambda path: SimpleNamespace(total=0, used=0, free=1 << 40),
-    )
-    monkeypatch.setattr(recording, "DISK_CHECK_PERIOD_S", 60.0)
     plan = arm_plan()
-    recorder, cache = recorder_with(plan, FakeSink(fps=100), tmp_path)
+    recorder, cache = recorder_with(
+        plan,
+        FakeSink(fps=100),
+        tmp_path,
+        disk_usage=free_disk(1 << 40),
+        timing=Timing(disk_check_period_s=60.0),
+    )
 
     async def run():
         cache.links[ARM0] = fresh_joints()
@@ -365,38 +356,35 @@ def test_decide_rejects_while_finishing(tmp_path):
     assert not recorder._recording
 
 
-def test_decide_rejects_instead_of_raising(tmp_path, monkeypatch):
+def test_decide_rejects_instead_of_raising(tmp_path):
     """A decider that raises would kill the goal server for the node's life,
     leaving every later goal undecided."""
-    recorder, _ = recorder_with(arm_plan(), FakeSink(), tmp_path)
 
     def exploding_disk_usage(path):
         raise OSError("session directory is gone")
 
-    monkeypatch.setattr(shutil, "disk_usage", exploding_disk_usage)
+    recorder, _ = recorder_with(
+        arm_plan(), FakeSink(), tmp_path, disk_usage=exploding_disk_usage
+    )
     decision = recorder._decide(goal_request())
     assert not decision.accepted
     assert "cannot start an episode" in decision.reason
     assert not recorder._recording
 
 
-def test_goal_refused_below_the_disk_floor(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        shutil, "disk_usage", lambda path: SimpleNamespace(total=0, used=0, free=1)
-    )
-    recorder, _ = recorder_with(arm_plan(), FakeSink(), tmp_path)
+def test_goal_refused_below_the_disk_floor(tmp_path):
+    recorder, _ = recorder_with(arm_plan(), FakeSink(), tmp_path, disk_usage=free_disk(1))
     decision = recorder._decide(goal_request())
     assert not decision.accepted
     assert "MB free" in decision.reason
     assert not recorder._recording
 
 
-def test_goal_refused_before_the_clock_is_ready(tmp_path, monkeypatch):
+def test_goal_refused_before_the_clock_is_ready(tmp_path):
     def unstarted_clock():
         raise RuntimeError("peppy clock not initialized")
 
-    monkeypatch.setattr(episode.peppygen.clock, "now_ns", unstarted_clock)
-    recorder, _ = recorder_with(arm_plan(), FakeSink(), tmp_path)
+    recorder, _ = recorder_with(arm_plan(), FakeSink(), tmp_path, now_ns=unstarted_clock)
     decision = recorder._decide(goal_request())
     assert not decision.accepted
     assert "clock not ready" in decision.reason
@@ -498,12 +486,11 @@ def test_recorder_rejects_nonpositive_staleness(tmp_path):
             Recorder(plan, Cache.for_plan(plan), FakeSink(), tmp_path, bad, 1 << 30)
 
 
-def test_max_episode_length_ends_with_save(tmp_path, monkeypatch):
+def test_max_episode_length_ends_with_save(tmp_path):
     # 5 frames at fps=100: the bound trips within the first fresh window.
-    monkeypatch.setattr(recording, "MAX_EPISODE_S", 0.05)
     plan = arm_plan()
     sink = FakeSink(fps=100)
-    recorder, cache = recorder_with(plan, sink, tmp_path)
+    recorder, cache = recorder_with(plan, sink, tmp_path, timing=Timing(max_episode_s=0.05))
 
     async def run():
         cache.links[ARM0] = fresh_joints()
@@ -535,17 +522,13 @@ def test_create_failure_reports_cancellation(tmp_path):
     asyncio.run(run())
 
 
-def test_depth_unit_drift_ends_goal_before_recording(tmp_path, monkeypatch):
-    from peppygen.consumed_services.rgbd_cameras import (
-        depth_stream_info as rgbd_cameras_depth_stream_info,
-    )
-    from peppygen.consumed_topics.rgbd_cameras import (
-        video_stream as rgbd_cameras_video_stream,
-    )
+def test_depth_unit_drift_ends_goal_before_recording(tmp_path):
+    async def drifted_probe(_node_runner, _plan):
+        return [0.002]
 
     plan = make_plan(state=(joint_entry(),), rgbd=1)
     sink = FakeSink()
-    recorder, _cache = recorder_with(plan, sink, tmp_path)
+    recorder, _cache = recorder_with(plan, sink, tmp_path, depth_probe=drifted_probe)
     recorder._schema = SourceSchema(
         layouts=(LinkLayout(dims=2, has_velocities=True, has_efforts=False),),
         action_layouts=(),
@@ -553,14 +536,6 @@ def test_depth_unit_drift_ends_goal_before_recording(tmp_path, monkeypatch):
         rgbd_geometry=((4, 2),),
         depth_geometry=((4, 2),),
         depth_units=(0.001,),
-    )
-
-    async def drifted_poll(_runner, _producer, _timeout):
-        return SimpleNamespace(data=SimpleNamespace(depth_unit=0.002))
-
-    monkeypatch.setattr(rgbd_cameras_depth_stream_info, "poll", drifted_poll)
-    monkeypatch.setattr(
-        rgbd_cameras_video_stream, "bound_producers", lambda _runner: [object()]
     )
 
     async def run():
@@ -574,11 +549,11 @@ def test_depth_unit_drift_ends_goal_before_recording(tmp_path, monkeypatch):
     asyncio.run(run())
 
 
-def resume_recorder(tmp_path, current=None, existing=None):
+def resume_recorder(tmp_path, current=None, existing=None, **overrides):
     """A recorder with an empty current session and a resumable target."""
     plan = arm_plan()
     current = current or FakeSink(created=False)
-    recorder, cache = recorder_with(plan, current, tmp_path)
+    recorder, cache = recorder_with(plan, current, tmp_path, **overrides)
     if existing is not None:
         target_dir = tmp_path / "2026-07-27_10-00-00"
 
@@ -733,12 +708,13 @@ class DelayedCreateSink(FakeSink):
         await super().create(schema, plan)
 
 
-def test_resume_serializes_against_a_warmup_create_in_flight(tmp_path, monkeypatch):
-    monkeypatch.setattr(episode, "WARMUP_RETRY_S", 0.005)
+def test_resume_serializes_against_a_warmup_create_in_flight(tmp_path):
     current = DelayedCreateSink()
     existing = FakeSink(created=False)
     existing.preflight_episodes = 1
-    recorder, cache = resume_recorder(tmp_path, current=current, existing=existing)
+    recorder, cache = resume_recorder(
+        tmp_path, current=current, existing=existing, timing=Timing(warmup_retry_s=0.005)
+    )
     token = FakeToken()
     runner = SimpleNamespace(cancellation_token=lambda: token)
 
@@ -791,11 +767,10 @@ def test_warmup_creates_dataset_before_any_goal(tmp_path):
     asyncio.run(run())
 
 
-def test_warmup_waits_for_a_live_source_then_creates(tmp_path, monkeypatch):
-    monkeypatch.setattr(episode, "WARMUP_RETRY_S", 0.005)
+def test_warmup_waits_for_a_live_source_then_creates(tmp_path):
     plan = arm_plan()
     sink = FakeSink(created=False)
-    recorder, cache = recorder_with(plan, sink, tmp_path)
+    recorder, cache = recorder_with(plan, sink, tmp_path, timing=Timing(warmup_retry_s=0.005))
     token = FakeToken()
     runner = SimpleNamespace(cancellation_token=lambda: token)
 
@@ -814,11 +789,10 @@ def test_warmup_waits_for_a_live_source_then_creates(tmp_path, monkeypatch):
     asyncio.run(run())
 
 
-def test_warmup_rearms_the_session_finish_session_rolls_to(tmp_path, monkeypatch):
-    monkeypatch.setattr(episode, "WARMUP_RETRY_S", 0.005)
+def test_warmup_rearms_the_session_finish_session_rolls_to(tmp_path):
     plan = arm_plan()
     first_sink = FakeSink(created=False)
-    recorder, cache = recorder_with(plan, first_sink, tmp_path)
+    recorder, cache = recorder_with(plan, first_sink, tmp_path, timing=Timing(warmup_retry_s=0.005))
     second_sink = FakeSink(created=False)
     next_dir = tmp_path / "next"
     token = FakeToken()

@@ -9,7 +9,6 @@ from teleop_xr.config import ViewConfig
 from peppygen.consumed_topics.color_cameras import video_stream as color_video_stream
 
 from tests.helpers import FakeToken, RecordingSink, boot, eventually, running_drain
-from xr_commander import video
 from xr_commander.video import (
     CAMERA_VIEW,
     CameraTrack,
@@ -178,8 +177,7 @@ def test_no_signal_frame_is_drawn_and_sized():
     assert frame.any()  # the text actually rendered
 
 
-def test_a_silent_camera_is_blanked_once_and_recovery_logged(monkeypatch, capsys):
-    monkeypatch.setattr(video, "_SILENCE_POLL_S", 0.01)
+def test_a_silent_camera_is_blanked_once_and_recovery_logged(capsys):
     sink = RecordingSink()
     track = CameraTrack(instance_id="cam", sink=sink)
     health = {"cam": time.monotonic()}
@@ -187,7 +185,9 @@ def test_a_silent_camera_is_blanked_once_and_recovery_logged(monkeypatch, capsys
 
     async def run():
         task = asyncio.create_task(
-            watch_camera_silence([track], health, token, silent_after_s=0.03)
+            watch_camera_silence(
+                [track], health, token, silent_after_s=0.03, poll_s=0.01
+            )
         )
         await asyncio.sleep(0.09)
         assert len(sink.frames) == 1  # blanked once, not per poll
@@ -202,17 +202,16 @@ def test_a_silent_camera_is_blanked_once_and_recovery_logged(monkeypatch, capsys
     assert "recovered" in out
 
 
-def test_a_camera_that_never_produces_is_blanked_from_the_watcher_start(monkeypatch):
+def test_a_camera_that_never_produces_is_blanked_from_the_watcher_start():
     # A dead camera and no camera look identical as a blank panel; the timer
     # starts with the watcher so the panel says NO SIGNAL instead.
-    monkeypatch.setattr(video, "_SILENCE_POLL_S", 0.01)
     sink = RecordingSink()
     track = CameraTrack(instance_id="cam", sink=sink)
     token = FakeToken()
 
     async def run():
         task = asyncio.create_task(
-            watch_camera_silence([track], {}, token, silent_after_s=0.03)
+            watch_camera_silence([track], {}, token, silent_after_s=0.03, poll_s=0.01)
         )
         await asyncio.sleep(0.09)
         token.cancel()

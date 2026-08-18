@@ -111,11 +111,11 @@ _POSTURE_BUTTONS = (
 )
 
 
-def _headset_url_hint(settings: config.Settings) -> str:
+def _headset_url_hint(settings: config.Settings, *, outbound_ip=tls.outbound_ip) -> str:
     """A URL the operator can type into the headset's browser as printed."""
     port = settings.https_port
     bound = settings.https_host
-    host = tls.outbound_ip() if bound.is_unspecified else str(bound)
+    host = outbound_ip() if bound.is_unspecified else str(bound)
     if host is not None and ":" in host:
         host = f"[{host}]"
     return (

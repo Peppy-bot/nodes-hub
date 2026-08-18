@@ -72,7 +72,7 @@ def _write_private(path: Path, data: bytes) -> None:
     os.replace(scratch, path)
 
 
-def _generate(directory: Path) -> tuple[Path, Path]:
+def _generate(directory: Path, valid_for: datetime.timedelta) -> tuple[Path, Path]:
     key = ec.generate_private_key(ec.SECP256R1())
     name = x509.Name(
         [x509.NameAttribute(NameOID.COMMON_NAME, "xr_commander teleop server")]
@@ -89,7 +89,7 @@ def _generate(directory: Path) -> tuple[Path, Path]:
         .public_key(key.public_key())
         .serial_number(x509.random_serial_number())
         .not_valid_before(now)
-        .not_valid_after(now + _VALID_FOR)
+        .not_valid_after(now + valid_for)
         .add_extension(san, critical=False)
         # A TLS server leaf, said outright for any validator that checks.
         .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
@@ -150,7 +150,9 @@ def _reusable(cert_path: Path, key_path: Path) -> bool:
     return certificate.not_valid_after_utc - now >= _RENEW_MARGIN
 
 
-def ensure_certificate(directory: Path) -> tuple[Path, Path]:
+def ensure_certificate(
+    directory: Path, *, valid_for: datetime.timedelta = _VALID_FOR
+) -> tuple[Path, Path]:
     """The (cert, key) pair under `directory`, regenerated when absent,
     unreadable, mismatched, or near expiry. Reuse keeps the browser's
     acceptance valid. Locked: two instances sharing the directory must not
@@ -166,4 +168,4 @@ def ensure_certificate(directory: Path) -> tuple[Path, Path]:
                 return cert_path, key_path
         except (ValueError, TypeError, OSError, UnsupportedAlgorithm):
             pass  # missing, unreadable, or unparseable material: replace it
-        return _generate(directory)
+        return _generate(directory, valid_for)

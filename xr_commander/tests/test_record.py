@@ -54,7 +54,7 @@ def settings():
 
 
 @contextlib.asynccontextmanager
-async def recorder_buttons(h, status=None):
+async def recorder_buttons(h, status=None, timing=None):
     """`run_recorder_buttons` running against the real runner and the real
     recorder modules; yields the scripted headset session and the task."""
     session = FakeSession()
@@ -68,6 +68,7 @@ async def recorder_buttons(h, status=None):
             session=session,
             settings=settings(),
             token=token,
+            timing=timing or record.Timing(),
         )
     )
     try:
@@ -122,13 +123,12 @@ async def test_x_already_held_at_first_tracking_does_not_start():
             await pending.accept()
 
 
-async def test_one_physical_y_hold_finishes_once_across_a_gap(monkeypatch):
-    monkeypatch.setattr(record, "_FINISH_HOLD_S", 0.05)
+async def test_one_physical_y_hold_finishes_once_across_a_gap():
     async with boot(recorder_instances=1) as h:
         fin = h.mocks.deps.recorder[0].finish_session
         fin.enqueue_response(finish_session.ResponseData(session="s1", error=None))
         fin.enqueue_response(finish_session.ResponseData(session="s2", error=None))
-        async with recorder_buttons(h) as (session, _task):
+        async with recorder_buttons(h, timing=record.Timing(finish_hold_s=0.05)) as (session, _task):
             session.press(y=True)
             await eventually(
                 lambda: fin.captured_count() == 1, message="the held finish"
@@ -224,12 +224,11 @@ async def test_feedback_reaches_the_panel_and_clears_at_the_end():
             )
 
 
-async def test_y_must_be_held_to_finish(monkeypatch):
-    monkeypatch.setattr(record, "_FINISH_HOLD_S", 0.3)
+async def test_y_must_be_held_to_finish():
     async with boot(recorder_instances=1) as h:
         fin = h.mocks.deps.recorder[0].finish_session
         fin.enqueue_response(finish_session.ResponseData(session="s1", error=None))
-        async with recorder_buttons(h) as (session, _task):
+        async with recorder_buttons(h, timing=record.Timing(finish_hold_s=0.3)) as (session, _task):
             # A graze: released well before the hold threshold.
             session.press(y=True)
             await asyncio.sleep(0.05)
@@ -245,12 +244,13 @@ async def test_y_must_be_held_to_finish(monkeypatch):
             assert fin.captured_count() == 1
 
 
-async def test_outcomes_reach_the_panel_as_notes(monkeypatch):
-    monkeypatch.setattr(record, "_FINISH_HOLD_S", 0.05)
+async def test_outcomes_reach_the_panel_as_notes():
     async with boot(recorder_instances=1) as h:
         rec = h.mocks.deps.recorder[0]
         status = record.RecorderStatus()
-        async with recorder_buttons(h, status) as (session, _task):
+        async with recorder_buttons(
+            h, status, timing=record.Timing(finish_hold_s=0.05)
+        ) as (session, _task):
             await tap_x(session)
             pending = await rec.record_episode.next_goal(10.0)
             active = await pending.accept()
@@ -270,15 +270,16 @@ async def test_outcomes_reach_the_panel_as_notes(monkeypatch):
             )
 
 
-async def test_a_refused_finish_notes_the_refusal(monkeypatch):
-    monkeypatch.setattr(record, "_FINISH_HOLD_S", 0.05)
+async def test_a_refused_finish_notes_the_refusal():
     async with boot(recorder_instances=1) as h:
         fin = h.mocks.deps.recorder[0].finish_session
         fin.enqueue_response(
             finish_session.ResponseData(session="", error="an episode is recording")
         )
         status = record.RecorderStatus()
-        async with recorder_buttons(h, status) as (session, _task):
+        async with recorder_buttons(
+            h, status, timing=record.Timing(finish_hold_s=0.05)
+        ) as (session, _task):
             session.press(y=True)
             await eventually(
                 lambda: status.note() == "finish refused", message="the refusal note"
@@ -292,14 +293,13 @@ def test_notes_expire():
     assert status.note(now_monotonic=time.monotonic() + record._NOTE_S + 1) == ""
 
 
-async def test_a_refused_finish_is_survived(monkeypatch):
-    monkeypatch.setattr(record, "_FINISH_HOLD_S", 0.05)
+async def test_a_refused_finish_is_survived():
     async with boot(recorder_instances=1) as h:
         fin = h.mocks.deps.recorder[0].finish_session
         fin.enqueue_response(
             finish_session.ResponseData(session="", error="an episode is recording")
         )
-        async with recorder_buttons(h) as (session, task):
+        async with recorder_buttons(h, timing=record.Timing(finish_hold_s=0.05)) as (session, task):
             session.press(y=True)
             await eventually(
                 lambda: fin.captured_count() == 1, message="the refused finish"
@@ -342,14 +342,15 @@ async def test_a_stop_racing_a_finished_watcher_does_not_claim_saving():
         assert not status.saving
 
 
-async def test_a_recorder_death_mid_episode_is_reported(capsys, monkeypatch):
+async def test_a_recorder_death_mid_episode_is_reported(capsys):
     # The producer-gone result concludes only at the result deadline; keep
     # the test bounded without weakening the production value.
-    monkeypatch.setattr(record, "_RESULT_TIMEOUT_S", 2.0)
     async with boot(recorder_instances=1) as h:
         status = record.RecorderStatus()
         handle, _active = await _fired_episode(h)
-        watcher = asyncio.create_task(record._watch_episode(handle, status))
+        watcher = asyncio.create_task(
+            record._watch_episode(handle, status, record.Timing(result_timeout_s=2.0))
+        )
         await eventually(lambda: status.recording, message="the REC line")
         # The recorder process dies with the goal still active.
         await h.mocks.deps.recorder[0].stop()
@@ -358,14 +359,15 @@ async def test_a_recorder_death_mid_episode_is_reported(capsys, monkeypatch):
     assert not status.recording
 
 
-async def test_a_result_without_data_notes_the_goal_status(monkeypatch):
+async def test_a_result_without_data_notes_the_goal_status():
     # The one real terminal status that carries no data is ABANDONED (a
     # producer that died mid-goal); the note must still name it.
-    monkeypatch.setattr(record, "_RESULT_TIMEOUT_S", 2.0)
     async with boot(recorder_instances=1) as h:
         status = record.RecorderStatus()
         handle, _active = await _fired_episode(h)
-        watcher = asyncio.create_task(record._watch_episode(handle, status))
+        watcher = asyncio.create_task(
+            record._watch_episode(handle, status, record.Timing(result_timeout_s=2.0))
+        )
         await eventually(lambda: status.recording, message="the REC line")
         await h.mocks.deps.recorder[0].stop()
         await asyncio.wait_for(watcher, 20.0)
@@ -399,12 +401,12 @@ class SpyStatus(record.RecorderStatus):
         self.__dict__["value"] = value
 
 
-async def test_a_grazed_y_never_shows_finishing(monkeypatch):
-    monkeypatch.setattr(record, "_FINISH_HOLD_S", 0.3)
+async def test_a_grazed_y_never_shows_finishing():
+    hold = record.Timing(finish_hold_s=0.3)
     async with boot(recorder_instances=1) as h:
         fin = h.mocks.deps.recorder[0].finish_session
         grazed = SpyStatus()
-        async with recorder_buttons(h, grazed) as (session, _task):
+        async with recorder_buttons(h, grazed, timing=hold) as (session, _task):
             session.press(y=True)
             await asyncio.sleep(0.05)
             session.press(y=False)
@@ -412,7 +414,7 @@ async def test_a_grazed_y_never_shows_finishing(monkeypatch):
         assert True not in grazed.__dict__["seen"]
         fin.enqueue_response(finish_session.ResponseData(session="s1", error=None))
         held = SpyStatus()
-        async with recorder_buttons(h, held) as (session, _task):
+        async with recorder_buttons(h, held, timing=hold) as (session, _task):
             session.press(y=True)
             await eventually(
                 lambda: True in held.__dict__.get("seen", []),
@@ -437,18 +439,17 @@ async def test_x_stop_shows_saving_until_the_result():
         assert status.note() == "saved episode 0"
 
 
-async def test_a_failed_cancel_does_not_claim_saving(monkeypatch):
-    monkeypatch.setattr(record, "GOAL_CANCEL_TIMEOUT_S", 0.5)
-    monkeypatch.setattr(record, "_RESULT_TIMEOUT_S", 2.0)
+async def test_a_failed_cancel_does_not_claim_saving():
+    timing = record.Timing(cancel_timeout_s=0.5, result_timeout_s=2.0)
     async with boot(recorder_instances=1) as h:
         status = record.RecorderStatus()
         handle, _active = await _fired_episode(h)
-        watcher = asyncio.create_task(record._watch_episode(handle, status))
+        watcher = asyncio.create_task(record._watch_episode(handle, status, timing))
         await eventually(lambda: status.recording, message="the REC line")
         # The recorder dies before the stop: the cancel cannot be delivered,
         # so the row must not claim a save is in progress.
         await h.mocks.deps.recorder[0].stop()
-        await record._stop_episode(record._Episode(handle, watcher), status)
+        await record._stop_episode(record._Episode(handle, watcher), status, timing)
         assert not status.saving
         await asyncio.wait_for(watcher, 20.0)
 

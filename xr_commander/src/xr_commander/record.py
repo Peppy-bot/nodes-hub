@@ -27,18 +27,24 @@ from xr_commander.publish import fire_goal
 # Every episode's task label.
 TASK = "VR Task"
 
-# The result is requested only after the goal's feedback stream has closed,
-# when it is already terminal on the recorder; the finish call is one round
-# trip that may sit behind an in-flight save.
-_RESULT_TIMEOUT_S = 30.0
-_FINISH_TIMEOUT_S = 30.0
-
-# Y must be held this long to finish the session: finishing rolls the dataset,
-# so a graze must not trigger it.
-_FINISH_HOLD_S = 1.0
-
 # How long an outcome (saved, finished, refused) stays on the panel row.
 _NOTE_S = 3.0
+
+
+@dataclass(frozen=True)
+class Timing:
+    """The button loop's deadlines and holds, injectable so tests can
+    tighten one without waiting out the production value."""
+
+    # Y must be held this long to finish the session: finishing rolls the
+    # dataset, so a graze must not trigger it.
+    finish_hold_s: float = 1.0
+    # The result is requested only after the goal's feedback stream has
+    # closed, when it is already terminal on the recorder; the finish call is
+    # one round trip that may sit behind an in-flight save.
+    result_timeout_s: float = 30.0
+    finish_timeout_s: float = 30.0
+    cancel_timeout_s: float = GOAL_CANCEL_TIMEOUT_S
 
 
 class RecorderStatus:
@@ -82,6 +88,7 @@ async def run_recorder_buttons(
     session: FrameSource,
     settings: Settings,
     token: CancellationToken,
+    timing: Timing = Timing(),
 ) -> None:
     """Drive the bound recorder from the left controller's face buttons.
 
@@ -114,10 +121,10 @@ async def run_recorder_buttons(
 
             if rising_x and episode is None:
                 episode = await _start_episode(
-                    node_runner, action_module, target, status
+                    node_runner, action_module, target, status, timing
                 )
             elif rising_x:
-                await _stop_episode(episode, status)
+                await _stop_episode(episode, status, timing)
 
             if left is None:
                 # Unknown frames cannot extend a hold, but one physical hold
@@ -127,13 +134,14 @@ async def run_recorder_buttons(
                 held_y_since, finish_fired = None, False
             elif held_y_since is None:
                 held_y_since = loop_now
-            elif not finish_fired and loop_now - held_y_since >= _FINISH_HOLD_S:
+            elif not finish_fired and loop_now - held_y_since >= timing.finish_hold_s:
                 finish_fired = True
-                await _finish_session(node_runner, finish_module, target, status)
+                await _finish_session(node_runner, finish_module, target, status, timing)
             # Shown only once the hold is long enough: a graze that will not
             # finish anything must not say it is finishing.
             status.finish_held = (
-                held_y_since is not None and loop_now - held_y_since >= _FINISH_HOLD_S
+                held_y_since is not None
+                and loop_now - held_y_since >= timing.finish_hold_s
             )
             prev_x = x
     finally:
@@ -142,7 +150,7 @@ async def run_recorder_buttons(
 
 
 async def _start_episode(
-    node_runner, action_module, target, status: RecorderStatus
+    node_runner, action_module, target, status: RecorderStatus, timing: Timing
 ) -> _Episode | None:
     """Fire one record_episode goal; its watcher runs it to its end."""
     handle = await fire_goal(
@@ -151,15 +159,17 @@ async def _start_episode(
     if handle is None:
         return None
     log(f"recording: {TASK!r}")
-    return _Episode(handle, asyncio.create_task(_watch_episode(handle, status)))
+    return _Episode(handle, asyncio.create_task(_watch_episode(handle, status, timing)))
 
 
-async def _stop_episode(episode: _Episode, status: RecorderStatus) -> None:
+async def _stop_episode(
+    episode: _Episode, status: RecorderStatus, timing: Timing = Timing()
+) -> None:
     """Ask the recorder to stop and save; the watcher reports the outcome.
     Only a delivered stop flips the row to saving: a failed cancel leaves
     the episode recording."""
     try:
-        await episode.handle.cancel_goal(GOAL_CANCEL_TIMEOUT_S)
+        await episode.handle.cancel_goal(timing.cancel_timeout_s)
     except Exception as e:
         log(f"record_episode cancel failed: {e!r}")
         return
@@ -170,12 +180,12 @@ async def _stop_episode(episode: _Episode, status: RecorderStatus) -> None:
 
 
 async def _finish_session(
-    node_runner, finish_module, target, status: RecorderStatus
+    node_runner, finish_module, target, status: RecorderStatus, timing: Timing
 ) -> None:
     """Roll the session over; the recorder owns every refusal (it refuses
     mid-episode) and the answer is relayed either way."""
     try:
-        response = await finish_module.poll(node_runner, target, _FINISH_TIMEOUT_S)
+        response = await finish_module.poll(node_runner, target, timing.finish_timeout_s)
     except Exception as e:
         log(f"finish_session failed: {e!r}")
         status.set_note("finish failed")
@@ -189,7 +199,9 @@ async def _finish_session(
         status.set_note("session finished")
 
 
-async def _watch_episode(handle, status: RecorderStatus) -> None:
+async def _watch_episode(
+    handle, status: RecorderStatus, timing: Timing = Timing()
+) -> None:
     """Track one goal from acceptance to its result, feeding the panel."""
     status.recording, status.frames = True, 0
     try:
@@ -205,7 +217,7 @@ async def _watch_episode(handle, status: RecorderStatus) -> None:
                 break
             status.frames = feedback.frames_recorded
         try:
-            result = await handle.get_result(_RESULT_TIMEOUT_S)
+            result = await handle.get_result(timing.result_timeout_s)
         except Exception as e:
             log(f"record_episode result: {e!r}")
             return

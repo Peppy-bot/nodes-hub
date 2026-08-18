@@ -17,3 +17,7 @@ os.environ["ARROW_DEFAULT_MEMORY_POOL"] = "system"
 # it at a per-run temp dir keeps the suite from growing ~/.cache/huggingface.
 # Must be set before huggingface_hub first loads, hence here.
 os.environ["HF_HOME"] = tempfile.mkdtemp(prefix="lerobot_recorder_tests_hf_")
+# Every dataset in the suite is local; a code path that reaches for the Hub
+# is a bug (the library's missing-table fallback is a download), and offline
+# mode turns it into a loud OfflineModeIsEnabled instead of a network wait.
+os.environ["HF_HUB_OFFLINE"] = "1"

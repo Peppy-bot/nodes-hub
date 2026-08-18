@@ -4,7 +4,6 @@ from cryptography import x509
 from cryptography.hazmat.primitives import serialization
 from cryptography.x509.oid import ExtendedKeyUsageOID
 
-from xr_commander import tls
 from xr_commander.tls import ensure_certificate
 
 
@@ -31,12 +30,10 @@ def test_garbage_material_is_replaced_not_served(tmp_path):
     assert parsed.not_valid_after_utc > datetime.datetime.now(datetime.timezone.utc)
 
 
-def test_a_near_expiry_certificate_is_renewed(tmp_path, monkeypatch):
-    monkeypatch.setattr(tls, "_VALID_FOR", datetime.timedelta(days=1))
-    short_cert, _ = ensure_certificate(tmp_path)
+def test_a_near_expiry_certificate_is_renewed(tmp_path):
+    short_cert, _ = ensure_certificate(tmp_path, valid_for=datetime.timedelta(days=1))
     short_bytes = short_cert.read_bytes()
-    monkeypatch.setattr(tls, "_VALID_FOR", datetime.timedelta(days=3650))
-    renewed, _ = ensure_certificate(tmp_path)
+    renewed, _ = ensure_certificate(tmp_path, valid_for=datetime.timedelta(days=3650))
     assert renewed.read_bytes() != short_bytes
 
 

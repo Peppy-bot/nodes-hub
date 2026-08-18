@@ -200,6 +200,7 @@ async def watch_camera_silence(
     health: Mapping[str, float],
     token: CancellationToken,
     silent_after_s: float = _CAMERA_SILENT_S,
+    poll_s: float = _SILENCE_POLL_S,
 ) -> None:
     """Blank a track whose camera stopped delivering, and say so once.
 
@@ -208,7 +209,7 @@ async def watch_camera_silence(
     """
     started = time.monotonic()
     dark: set[str] = set()
-    async for _ in ticks(_SILENCE_POLL_S, token):
+    async for _ in ticks(poll_s, token):
         now = time.monotonic()
         for track in tracks:
             last = health.get(track.instance_id, started)

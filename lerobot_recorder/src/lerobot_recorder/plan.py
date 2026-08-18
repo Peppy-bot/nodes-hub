@@ -124,19 +124,47 @@ def limb_slots():
     )
 
 
-# Per limb_slots entry, the (measured, commanded) member lists read together.
-LimbSources = tuple[tuple[tuple, tuple], ...]
+@dataclass(frozen=True)
+class BoundSources:
+    """One read of everything the launcher bound, the only input `discover`
+    consumes. The boot config seeds every slot with the launch's membership,
+    so this answers the robot's shape from setup onward; the live sets are
+    materialized into tuples here (the daemon replaces them whole when the
+    plan changes), so everything downstream works from this one snapshot
+    instead of re-reading."""
+
+    # Per pairing kind, the (kind, measured, commanded) member lists read
+    # together.
+    limbs: tuple[tuple[LinkKind, tuple, tuple], ...]
+    color_producers: tuple
+    rgbd_producers: tuple
 
 
-def read_limb_sources(node_runner) -> LimbSources:
-    """One read of every observer slot's member list, in limb_slots order.
-    The boot config seeds each slot with the launch's membership, so this
-    answers the robot's shape from setup onward; the sets stay live after
-    (the daemon replaces them whole when the plan changes), so everything
-    downstream works from this one snapshot instead of re-reading."""
-    return tuple(
-        (tuple(observed.sources(node_runner)), tuple(commanded.sources(node_runner)))
-        for _kind, observed, commanded in limb_slots()
+def snapshot_sources(node_runner, slots, color_module, rgbd_module) -> BoundSources:
+    """One read of every slot's member list into an immutable snapshot; the
+    slot and camera modules arrive as arguments so the read is testable
+    against scripted slots."""
+    return BoundSources(
+        limbs=tuple(
+            (kind, tuple(observed.sources(node_runner)), tuple(commanded.sources(node_runner)))
+            for kind, observed, commanded in slots
+        ),
+        color_producers=tuple(color_module.bound_producers(node_runner)),
+        rgbd_producers=tuple(rgbd_module.bound_producers(node_runner)),
+    )
+
+
+def read_bound_sources(node_runner) -> BoundSources:
+    """`snapshot_sources` over the real generated modules."""
+    from peppygen.consumed_topics.color_cameras import (
+        video_stream as color_cameras_video_stream,
+    )
+    from peppygen.consumed_topics.rgbd_cameras import (
+        video_stream as rgbd_cameras_video_stream,
+    )
+
+    return snapshot_sources(
+        node_runner, limb_slots(), color_cameras_video_stream, rgbd_cameras_video_stream
     )
 
 
@@ -154,24 +182,12 @@ def limb_name(used_names: set[str], source) -> str:
     return name
 
 
-def discover(node_runner, limb_sources: LimbSources) -> RecordingPlan:
-    from peppygen.consumed_topics.color_cameras import (
-        video_stream as color_cameras_video_stream,
-    )
-    from peppygen.consumed_topics.rgbd_cameras import (
-        video_stream as rgbd_cameras_video_stream,
-    )
-
-    color_producers = color_cameras_video_stream.bound_producers(node_runner)
-    rgbd_producers = rgbd_cameras_video_stream.bound_producers(node_runner)
-
+def discover(bound: BoundSources) -> RecordingPlan:
     limb_names: set[str] = set()
     state: list[SourceEntry] = []
     action: list[SourceEntry] = []
     action_fallback: dict[SourceKey, SourceKey] = {}
-    for (kind, _observed, _commanded), (measured_sources, commanded_sources) in zip(
-        limb_slots(), limb_sources, strict=True
-    ):
+    for kind, measured_sources, commanded_sources in bound.limbs:
         if len(measured_sources) != len(commanded_sources):
             raise ValueError(
                 f"{kind.value} limbs are bound {len(measured_sources)} measured to "
@@ -208,8 +224,8 @@ def discover(node_runner, limb_sources: LimbSources) -> RecordingPlan:
             for p, name in zip(producers, names, strict=True)
         )
 
-    color = camera_entries(color_producers, with_depth=False)
-    rgbd = camera_entries(rgbd_producers, with_depth=True)
+    color = camera_entries(bound.color_producers, with_depth=False)
+    rgbd = camera_entries(bound.rgbd_producers, with_depth=True)
 
     return RecordingPlan(
         state=tuple(state),

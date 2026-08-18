@@ -1,6 +1,5 @@
 import asyncio
 import math
-from unittest import mock
 
 import pytest
 
@@ -140,14 +139,11 @@ def test_an_unanticipated_instance_is_listed_after_the_known_ones():
     ]
 
 
-def test_a_stale_instance_collapses_to_one_not_reporting_row(monkeypatch):
+def test_a_stale_instance_collapses_to_one_not_reporting_row():
     # A quiet producer's motors are unknown, not healthy: seven current-
     # looking rows off a dead feed would be the panel lying at a glance.
     clock = {"now": 100.0}
-    monkeypatch.setattr(
-        "xr_commander.motor_health.time.monotonic", lambda: clock["now"]
-    )
-    store = MotorHealthReports()
+    store = MotorHealthReports(monotonic=lambda: clock["now"])
     report(store)
     clock["now"] += STALE_AFTER_S
     assert len(health_rows(store.by_instance())) == 1
@@ -157,12 +153,9 @@ def test_a_stale_instance_collapses_to_one_not_reporting_row(monkeypatch):
     assert rows[0].level == NOT_REPORTING
 
 
-def test_a_re_emit_refreshes_the_staleness_clock(monkeypatch):
+def test_a_re_emit_refreshes_the_staleness_clock():
     clock = {"now": 100.0}
-    monkeypatch.setattr(
-        "xr_commander.motor_health.time.monotonic", lambda: clock["now"]
-    )
-    store = MotorHealthReports()
+    store = MotorHealthReports(monotonic=lambda: clock["now"])
     report(store)
     clock["now"] += STALE_AFTER_S - 0.1
     report(store)  # a contract-cadence re-emit
@@ -292,11 +285,12 @@ async def test_drain_motor_health_keys_reports_by_the_producing_instance():
         assert len(by_name[gripper_id].levels) == 1
 
 
-async def test_a_malformed_producer_is_reported_once_not_every_report():
+async def test_a_malformed_producer_is_reported_once_not_every_report(capsys):
     # A shared latch is cleared by any other producer's good message, so one
     # bad arm would log twice a second forever on a two-arm stack. The good
     # producer's report is deliberately interleaved between the bad one's,
     # forcing exactly the arrival order that would clear a shared latch.
+    # The refusals go to the captured log, read incrementally.
     async with boot(motor_health_instances=2) as h:
         bad, good = h.mocks.deps.motor_health
         bad_id, good_id = [
@@ -307,33 +301,35 @@ async def test_a_malformed_producer_is_reported_once_not_every_report():
         store = MotorHealthReports()
 
         def unusable():
-            return [m for m in logged if "unusable" in m]
+            logged.extend(
+                line
+                for line in capsys.readouterr().out.splitlines()
+                if "unusable" in line
+            )
+            return logged
 
-        with mock.patch(
-            "xr_commander.bus.log", side_effect=lambda m: logged.append(m)
+        async with running_drain(
+            lambda token: drain_motor_health(
+                h.node_runner, motor_health_topic, store, token
+            )
         ):
-            async with running_drain(
-                lambda token: drain_motor_health(
-                    h.node_runner, motor_health_topic, store, token
-                )
-            ):
-                for _ in range(3):
-                    await bad.motor_health.publish(_wire(levels=(9,) * 7))
-                await eventually(
-                    lambda: len(unusable()) == 1, message="the first refusal"
-                )
-                await good.motor_health.publish(_wire())
-                await eventually(
-                    lambda: len(store.by_instance()) == 1, message="the good report"
-                )
-                for _ in range(2):
-                    await bad.motor_health.publish(_wire(levels=(9,) * 7))
-                # A valid report from the bad producer marks its earlier ones
-                # processed (per-producer order holds).
-                await bad.motor_health.publish(_wire())
-                await eventually(
-                    lambda: len(store.by_instance()) == 2, message="the recovery"
-                )
+            for _ in range(3):
+                await bad.motor_health.publish(_wire(levels=(9,) * 7))
+            await eventually(
+                lambda: len(unusable()) == 1, message="the first refusal"
+            )
+            await good.motor_health.publish(_wire())
+            await eventually(
+                lambda: len(store.by_instance()) == 1, message="the good report"
+            )
+            for _ in range(2):
+                await bad.motor_health.publish(_wire(levels=(9,) * 7))
+            # A valid report from the bad producer marks its earlier ones
+            # processed (per-producer order holds).
+            await bad.motor_health.publish(_wire())
+            await eventually(
+                lambda: len(store.by_instance()) == 2, message="the recovery"
+            )
         assert len(unusable()) == 1, f"logged {len(unusable())} times: {unusable()}"
         # The malformed reports were refused, never rendered: only the valid
         # nominal report is stored for the bad producer.

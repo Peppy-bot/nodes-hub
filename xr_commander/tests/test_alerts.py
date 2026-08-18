@@ -1,5 +1,4 @@
 import asyncio
-from unittest import mock
 
 import cv2
 import pytest
@@ -93,10 +92,9 @@ def test_a_clear_only_removes_its_own_identity():
     assert alert.severity == 1
 
 
-def test_a_re_emit_refreshes_the_staleness_clock(monkeypatch):
+def test_a_re_emit_refreshes_the_staleness_clock():
     clock = {"now": 100.0}
-    monkeypatch.setattr("xr_commander.alerts.time.monotonic", lambda: clock["now"])
-    active = ActiveAlerts()
+    active = ActiveAlerts(monotonic=lambda: clock["now"])
     raise_alert(active)
     clock["now"] += STALE_AFTER_S - 0.1
     raise_alert(active)  # a contract-cadence re-emit
@@ -125,12 +123,11 @@ def test_equal_severities_keep_a_stable_order():
     assert listed() == listed()
 
 
-def test_a_stale_alert_leaves_the_list_too(monkeypatch):
+def test_a_stale_alert_leaves_the_list_too():
     # The panel purges dead producers' entries, so a quiet producer cannot
     # leave a line the operator reads as current.
     clock = {"now": 100.0}
-    monkeypatch.setattr("xr_commander.alerts.time.monotonic", lambda: clock["now"])
-    active = ActiveAlerts()
+    active = ActiveAlerts(monotonic=lambda: clock["now"])
     raise_alert(active)
     clock["now"] += STALE_AFTER_S + 0.1
     assert active.active() == ()
@@ -163,45 +160,45 @@ async def test_drain_alerts_keeps_every_producers_alerts():
             )
 
 
-async def test_a_malformed_producer_is_reported_once_not_every_re_emit():
+async def test_a_malformed_producer_is_reported_once_not_every_re_emit(capsys):
     # A shared latch is cleared by any other producer's good message, so one
     # bad arm would log on every re-emit forever on a two-arm stack. The good
     # producer's message is deliberately interleaved between the bad one's
     # re-emits, forcing exactly the arrival order that would clear a shared
-    # latch.
+    # latch. The refusals go to the captured log, read incrementally.
     async with boot(alerts_instances=2) as h:
         bad, good = h.mocks.deps.alerts
         logged: list[str] = []
         active = ActiveAlerts()
 
         def unusable():
-            return [m for m in logged if "unusable" in m]
+            logged.extend(
+                line
+                for line in capsys.readouterr().out.splitlines()
+                if "unusable" in line
+            )
+            return logged
 
-        with mock.patch(
-            "xr_commander.bus.log", side_effect=lambda m: logged.append(m)
+        async with running_drain(
+            lambda token: drain_alerts(h.node_runner, alerts_topic, active, token)
         ):
-            async with running_drain(
-                lambda token: drain_alerts(
-                    h.node_runner, alerts_topic, active, token
-                )
-            ):
-                for _ in range(3):
-                    await bad.alerts.publish(_wire("left arm j2", 9))
-                await eventually(
-                    lambda: len(unusable()) == 1, message="the first refusal"
-                )
-                await good.alerts.publish(_wire("right arm j5", 1))
-                await eventually(
-                    lambda: len(active.active()) == 1, message="the good alert"
-                )
-                for _ in range(2):
-                    await bad.alerts.publish(_wire("left arm j2", 9))
-                # A valid alert from the bad producer marks its re-emits
-                # processed (per-producer order holds).
-                await bad.alerts.publish(_wire("left arm j2", 2))
-                await eventually(
-                    lambda: len(active.active()) == 2, message="the recovery"
-                )
+            for _ in range(3):
+                await bad.alerts.publish(_wire("left arm j2", 9))
+            await eventually(
+                lambda: len(unusable()) == 1, message="the first refusal"
+            )
+            await good.alerts.publish(_wire("right arm j5", 1))
+            await eventually(
+                lambda: len(active.active()) == 1, message="the good alert"
+            )
+            for _ in range(2):
+                await bad.alerts.publish(_wire("left arm j2", 9))
+            # A valid alert from the bad producer marks its re-emits
+            # processed (per-producer order holds).
+            await bad.alerts.publish(_wire("left arm j2", 2))
+            await eventually(
+                lambda: len(active.active()) == 2, message="the recovery"
+            )
         assert len(unusable()) == 1, f"logged {len(unusable())} times: {unusable()}"
 
 
@@ -263,12 +260,11 @@ def test_an_unwired_alert_slot_is_distinguishable_from_a_quiet_robot():
     assert wired.producers_bound
 
 
-def test_an_alert_lives_through_the_whole_stale_window(monkeypatch):
+def test_an_alert_lives_through_the_whole_stale_window():
     # The window is inclusive: an alert dies after it, not at it, so an
     # arrival landing exactly on the boundary tick never flickers.
     clock = {"now": 100.0}
-    monkeypatch.setattr("xr_commander.alerts.time.monotonic", lambda: clock["now"])
-    active = ActiveAlerts()
+    active = ActiveAlerts(monotonic=lambda: clock["now"])
     active.update("left_arm_inst", "left arm j2", "motor_condition", 2, "hot")
     clock["now"] += STALE_AFTER_S
     assert len(active.active()) == 1
