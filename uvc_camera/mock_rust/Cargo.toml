@@ -11,3 +11,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ffmpeg-next = "8"
 serde_json = "1"
+
+[dev-dependencies]
+peppygen = { path = ".peppy/libs/peppygen", features = ["testing"] }

@@ -8,3 +8,6 @@ peppygen = { path = ".peppy/libs/peppygen" }
 peppylib = { path = ".peppy/libs/peppylib" }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
+
+[dev-dependencies]
+peppygen = { path = ".peppy/libs/peppygen", features = ["testing"] }
