@@ -175,6 +175,43 @@ async def test_boot_pairs_one_limb_and_refuses_goals_while_sources_are_silent(tm
         assert provenance["rgbd_cameras"] == []
 
 
+async def test_sim_time_gates_admission_until_the_test_ticks_the_clock(tmp_path):
+    """Booted under sim time the recorder reads the harness clock through
+    `peppygen.clock`, so the clock-not-ready admission gate is exercised over
+    the real wire: before the test publishes any instant a goal is refused
+    with the node's own clock reason, and the first driven tick moves the
+    refusal on to the next unmet precondition (the still-silent sources)."""
+    async with harness.start(
+        setup,
+        parameters=params(tmp_path),
+        use_sim_time=True,
+        observed_joints_instances=1,
+        commanded_joints_instances=1,
+        color_cameras_instances=1,
+    ) as h:
+        goal = await record_episode.send_goal(
+            h,
+            record_episode.GoalRequestData(task="no-time-yet"),
+            peppylib.QoSProfile.Standard,
+            30.0,
+        )
+        assert not goal.accepted
+        assert "clock not ready" in goal.reason
+
+        # The test is the simulator: tick() waits for the node's clock
+        # subscription (opened by the setup's clock init), publishes the
+        # instant, and from here on now_ns() reads exactly this value.
+        await h.clock.tick(1_000_000_000)
+        goal = await record_episode.send_goal(
+            h,
+            record_episode.GoalRequestData(task="time-but-no-sources"),
+            peppylib.QoSProfile.Standard,
+            30.0,
+        )
+        assert not goal.accepted
+        assert "has not produced yet" in goal.reason
+
+
 async def test_record_episode_feedback_flows_and_cancel_saves(tmp_path):
     """The full record_episode lifecycle over the real action engine: the
     goal is admitted once every source has produced, per-frame feedback flows
