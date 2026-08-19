@@ -1,0 +1,57 @@
+// sim_rgbd_camera: the sim RGB-D camera, a relay between the engine's
+// sim_rgbd_camera_link pairing and the rgbd_camera contract surface. Toward
+// consumers it is a camera exactly like the real rgbd nodes (color + depth
+// frames out, stream infos and control services answered); toward the sim
+// engine it views the matching camera slot. Frames relay timestamps, frame_ids
+// and align_mode untouched, so consumers age samples on the capture time and
+// correlate pairs on the shared frame_id. One instance per camera; the engine
+// slot carries the camera's identity, so there is no id anywhere.
+{
+  peppy_schema: "node/v1",
+  manifest: {
+    name: "sim_rgbd_camera",
+    tag: "v1",
+    implements: [
+      { name: "rgbd_camera", tag: "v1", link_id: "camera" },
+    ],
+    depends_on: {
+      pairings: [
+        // The engine's matching camera slot: this relay views, the engine
+        // streams. Required: a relay without an engine is a misconfiguration,
+        // so the launch fails loudly instead.
+        { name: "sim_rgbd_camera_link", tag: "v1", role: "viewer", link_id: "engine" },
+      ],
+    },
+  },
+  interfaces: {
+    topics: {
+      emits: [
+        { link_id: "camera", name: "video_stream" },
+        { link_id: "camera", name: "depth_stream" },
+      ],
+      consumes: [
+        { link_id: "engine", name: "video_stream" },
+        { link_id: "engine", name: "depth_stream" },
+        { link_id: "engine", name: "stream_info" },
+      ],
+    },
+    services: {
+      exposes: [
+        { link_id: "camera", name: "video_stream_info" },
+        { link_id: "camera", name: "depth_stream_info" },
+        { link_id: "camera", name: "set_color_exposure" },
+        { link_id: "camera", name: "set_color_white_balance" },
+        { link_id: "camera", name: "set_color_gain" },
+        { link_id: "camera", name: "set_color_brightness" },
+        { link_id: "camera", name: "set_color_contrast" },
+      ],
+    },
+  },
+  execution: {
+    language: "rust",
+    container: {
+      def_file: "apptainer.def",
+    },
+    parameters: {},
+  },
+}

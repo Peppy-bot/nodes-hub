@@ -56,6 +56,16 @@
         path: "realsense_d4xx/peppy.json5"
       }
     },
+    sim_rgb_camera: {
+      v1: {
+        path: "sim_rgb_camera/peppy.json5"
+      }
+    },
+    sim_rgbd_camera: {
+      v1: {
+        path: "sim_rgbd_camera/peppy.json5"
+      }
+    },
     uvc_camera_controls_tests: {
       v1: {
         path: "uvc_camera_controls_tests/peppy.json5"
