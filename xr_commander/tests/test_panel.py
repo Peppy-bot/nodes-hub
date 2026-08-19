@@ -22,6 +22,7 @@ from xr_commander.panel import (
 )
 from xr_commander.publish import LatestPose
 from xr_commander.record import RecorderStatus
+from xr_commander.task_page import UNNAMED_TASK
 
 POSE = Pose(np.zeros(3), IDENTITY)
 
@@ -495,5 +496,78 @@ def test_a_long_health_row_stays_inside_the_panel():
         (230, 120, 230),
     )
     frame = render(PanelState(headset_live=True, hands=(), health=(long_row,)))
+    lit = np.nonzero(np.any(frame != panel._BACKGROUND, axis=2).any(axis=0))[0]
+    assert lit.max() < panel._WIDTH - 1
+
+
+def test_no_recorder_means_no_task_line():
+    session = FakeSession({"left": squeezing_hand()})
+    state = snapshot(session, [source("left")], 10.0, quiet(), no_health())
+    assert state.task is None
+
+
+def test_a_bound_recorder_with_no_label_still_draws_the_line():
+    # An unnamed session records anyway, so the panel is where the operator
+    # can notice it before the dataset has to be sorted out later.
+    session = FakeSession({"left": squeezing_hand()})
+    state = snapshot(
+        session, [source("left")], 10.0, quiet(), no_health(), RecorderStatus(), None
+    )
+    assert state.task == panel.task_line(None)
+    assert "NOT SET" in state.task
+
+
+def test_the_unset_line_does_not_pass_the_placeholder_off_as_a_task():
+    # Drawing the placeholder like any other label would read as a named
+    # session at a glance.
+    assert UNNAMED_TASK not in panel.task_line(None)
+
+
+def test_a_relabelled_task_redraws_the_panel():
+    # Equality-gated like the frame count: a stale label would show the last
+    # take's task while the next one records.
+    session = FakeSession({"left": squeezing_hand()})
+    hands = [source("left")]
+    first = snapshot(
+        session, hands, 10.0, quiet(), no_health(), RecorderStatus(), "wipe the table"
+    )
+    second = snapshot(
+        session, hands, 10.0, quiet(), no_health(), RecorderStatus(), "stack the blocks"
+    )
+    assert first != second
+    assert not np.array_equal(render(first), render(second))
+
+
+def test_naming_the_first_task_redraws_the_panel():
+    session = FakeSession({"left": squeezing_hand()})
+    hands = [source("left")]
+    unset = snapshot(
+        session, hands, 10.0, quiet(), no_health(), RecorderStatus(), None
+    )
+    named = snapshot(
+        session, hands, 10.0, quiet(), no_health(), RecorderStatus(), "wipe the table"
+    )
+    assert unset != named
+    assert not np.array_equal(render(unset), render(named))
+
+
+def test_the_task_shares_the_link_line_instead_of_taking_a_status_row():
+    # The row band is full at _MAX_STATUS_ROWS and every section below is laid
+    # out from it, so a task must not push the rows down.
+    rows = (hand_line("LEFT", **states()), hand_line("RIGHT", **states()))
+    without = render(PanelState(headset_live=True, hands=rows))
+    with_task = render(
+        PanelState(headset_live=True, hands=rows, task=panel.task_line("wipe the table"))
+    )
+    row_band = slice(panel._FIRST_ROW_BASELINE - 30, panel._RULE_Y)
+    assert np.array_equal(without[row_band], with_task[row_band])
+
+    link_band = slice(panel._LINK_BASELINE - 30, panel._LINK_BASELINE + 6)
+    assert not np.array_equal(without[link_band], with_task[link_band])
+
+
+def test_a_task_too_long_for_its_column_stays_inside_the_canvas():
+    long_task = panel.task_line("wipe the table " * 20)
+    frame = render(PanelState(headset_live=True, hands=(), task=long_task))
     lit = np.nonzero(np.any(frame != panel._BACKGROUND, axis=2).any(axis=0))[0]
     assert lit.max() < panel._WIDTH - 1

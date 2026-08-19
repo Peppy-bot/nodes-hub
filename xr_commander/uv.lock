@@ -1035,6 +1035,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
+    { name = "fastapi" },
     { name = "numpy" },
     { name = "opencv-python" },
     { name = "peppygen" },
@@ -1052,6 +1053,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "cryptography", specifier = ">=42" },
+    { name = "fastapi", specifier = ">=0.110" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "opencv-python", specifier = ">=4.9" },
     { name = "peppygen", directory = ".peppy/libs/peppygen" },

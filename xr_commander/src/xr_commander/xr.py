@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import uvicorn
+from fastapi import APIRouter, FastAPI
 from teleop_xr import Teleop
 from teleop_xr.config import TeleopSettings
 from teleop_xr.video_stream import VideoSource
@@ -21,6 +22,19 @@ from xr_commander.devices import XrFrame, parse_hands
 
 _SERVER_START_TIMEOUT_S = 5.0
 _SERVER_STOP_TIMEOUT_S = 2.0
+
+
+def include_router_first(app: FastAPI, router: APIRouter) -> None:
+    """Add `router` ahead of every route the app already has.
+
+    teleop_xr mounts its frontend at '/', which matches every path, so routes
+    appended after it are unreachable.
+    """
+    appended_from = len(app.router.routes)
+    app.include_router(router)
+    appended = app.router.routes[appended_from:]
+    del app.router.routes[appended_from:]
+    app.router.routes[:0] = appended
 
 
 def wait_until_started(
@@ -56,6 +70,7 @@ class XrSession:
         tls_key_path: Path,
         video_sources: dict[str, VideoSource],
         camera_views: dict[str, dict],
+        routers: Sequence[APIRouter] = (),
     ) -> None:
         self._lock = threading.Lock()
         self._latest: XrFrame | None = None
@@ -74,6 +89,8 @@ class XrSession:
         )
         self._teleop = Teleop(settings, video_sources=video_sources)
         self._teleop.subscribe(self._on_xr_update)
+        for router in routers:
+            include_router_first(self._teleop.app, router)
 
         self._server = uvicorn.Server(
             uvicorn.Config(

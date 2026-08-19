@@ -164,6 +164,9 @@ class PanelState:
     health_bound: bool = True
     # The recorder's row; None when no recorder is bound.
     recorder: Row | None = None
+    # The task line as drawn; None when no recorder is bound. With one bound
+    # it always draws, so an unset label is visible rather than absent.
+    task: str | None = None
 
 
 def alert_lines(active: Sequence[Alert]) -> tuple[PanelLine, ...]:
@@ -247,6 +250,13 @@ def recorder_row(status: RecorderStatus | None) -> Row | None:
     return Row("REC", "idle", _RESTING)
 
 
+def task_line(label: str | None) -> str:
+    """The task line for a bound recorder. An unset label reads as missing
+    rather than showing the placeholder like a chosen one, so the operator
+    can tell an unnamed session from a named one at a glance."""
+    return f"task: {label}" if label is not None else "task: NOT SET (unnamed)"
+
+
 def snapshot(
     session: FrameSource,
     hands: Sequence[HandSource],
@@ -254,6 +264,7 @@ def snapshot(
     alerts: ActiveAlerts,
     health: motor_health.MotorHealthReports,
     recorder: RecorderStatus | None = None,
+    task: str | None = None,
 ) -> PanelState:
     """This tick's panel content, read from the sources the streams read."""
     frame = fresh_frame(session, stale_timeout_s)
@@ -280,6 +291,9 @@ def snapshot(
         health=health_lines(motor_health.health_rows(health.by_instance())),
         health_bound=health.producers_bound,
         recorder=recorder_line,
+        # The recorder's presence is what decides the line exists; the label's
+        # own absence is a state drawn on it.
+        task=task_line(task) if recorder is not None else None,
     )
 
 
@@ -309,6 +323,12 @@ def render(state: PanelState) -> np.ndarray:
     live = state.headset_live
     link, colour = ("headset live", _DRIVING) if live else ("headset stale", _WAITING)
     _text(frame, link, (_MARGIN_X, _LINK_BASELINE), _BODY_SCALE, colour)
+    # Session-wide context like the link state, so it shares that line rather
+    # than a status row: the row band is full at _MAX_STATUS_ROWS, and the
+    # sections below are laid out from it.
+    if state.task is not None:
+        fitted, scale = _fitted(state.task, _BODY_SCALE, _WIDTH - _MARGIN_X - _STATE_X)
+        _text(frame, fitted, (_STATE_X, _LINK_BASELINE), scale, _HEADING)
     rows = state.hands + ((state.recorder,) if state.recorder else ())
     for index, row in enumerate(rows):
         baseline = _FIRST_ROW_BASELINE + index * _ROW_STEP
@@ -389,6 +409,7 @@ async def stream_status(
     alerts: ActiveAlerts,
     health: motor_health.MotorHealthReports,
     recorder: RecorderStatus | None = None,
+    read_task: Callable[[], str] | None = None,
 ) -> None:
     """Publish the panel until shutdown, re-drawing only on a change.
 
@@ -400,8 +421,9 @@ async def stream_status(
     frame: np.ndarray | None = None
     async for _ in ticks(1.0 / _PUBLISH_HZ, token):
         try:
+            task = read_task() if read_task is not None else None
             state = snapshot(
-                session, hands, settings.stale_timeout_s, alerts, health, recorder
+                session, hands, settings.stale_timeout_s, alerts, health, recorder, task
             )
             if state != drawn or frame is None:
                 frame, drawn = render(state), state

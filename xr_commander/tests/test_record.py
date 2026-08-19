@@ -53,8 +53,12 @@ def settings():
     return config.from_parameters(default_parameters())
 
 
+# The label the task page hands the button loop unless a test scripts its own.
+TASK = "wipe the table"
+
+
 @contextlib.asynccontextmanager
-async def recorder_buttons(h, status=None, timing=None):
+async def recorder_buttons(h, status=None, timing=None, read_task=None):
     """`run_recorder_buttons` running against the real runner and the real
     recorder modules; yields the scripted headset session and the task."""
     session = FakeSession()
@@ -68,6 +72,7 @@ async def recorder_buttons(h, status=None, timing=None):
             session=session,
             settings=settings(),
             token=token,
+            read_task=read_task or (lambda: TASK),
             timing=timing or record.Timing(),
         )
     )
@@ -86,7 +91,7 @@ async def _fired_episode(h):
     target = select_producer(record_episode, h.node_runner, "recorder")
     fire = asyncio.create_task(
         publish.fire_goal(
-            h.node_runner, record_episode, target, "record_episode", task=record.TASK
+            h.node_runner, record_episode, target, "record_episode", task=TASK
         )
     )
     pending = await h.mocks.deps.recorder[0].record_episode.next_goal(10.0)
@@ -102,7 +107,7 @@ async def test_x_fires_one_goal_per_rising_edge_with_the_task():
         async with recorder_buttons(h) as (session, _task):
             await tap_x(session)
             pending = await rec.next_goal(10.0)
-            assert pending.request.task == record.TASK
+            assert pending.request.task == TASK
             await pending.accept()
             # Still held: one edge, one goal.
             with pytest.raises(TimeoutError):
@@ -119,7 +124,7 @@ async def test_x_already_held_at_first_tracking_does_not_start():
             # An observed release and then a press is the first real edge.
             await tap_x(session)
             pending = await rec.next_goal(10.0)
-            assert pending.request.task == record.TASK
+            assert pending.request.task == TASK
             await pending.accept()
 
 
@@ -179,7 +184,7 @@ async def test_a_finished_episode_rearms_the_button():
             await stop_and_save(session, active, SAVED)
             # The finished episode re-arms X for a second one.
             pending = await press_until_goal(session, rec, {"x": False}, {"x": True})
-            assert pending.request.task == record.TASK
+            assert pending.request.task == TASK
             await pending.accept()
 
 
@@ -454,6 +459,26 @@ async def test_a_failed_cancel_does_not_claim_saving():
         await asyncio.wait_for(watcher, 20.0)
 
 
+async def test_each_episode_carries_the_label_live_when_it_started():
+    # The operator retitles between takes; the episode already running keeps
+    # the label it was fired with.
+    labels = ["wipe the table", "stack the blocks"]
+    async with boot(recorder_instances=1) as h:
+        rec = h.mocks.deps.recorder[0].record_episode
+        async with recorder_buttons(
+            h, read_task=lambda: labels.pop(0) if len(labels) > 1 else labels[0]
+        ) as (session, _task):
+            await tap_x(session)
+            pending = await rec.next_goal(10.0)
+            assert pending.request.task == "wipe the table"
+            active = await pending.accept()
+            await stop_and_save(session, active, SAVED)
+            # The next take is fired with the label live by then.
+            pending = await press_until_goal(session, rec, {"x": False}, {"x": True})
+            assert pending.request.task == "stack the blocks"
+            await pending.accept()
+
+
 async def test_no_bound_recorder_is_inert():
     async with boot() as h:  # recorder_instances defaults to zero: unwired
         task = asyncio.create_task(
@@ -465,6 +490,7 @@ async def test_no_bound_recorder_is_inert():
                 session=FakeSession(),
                 settings=settings(),
                 token=FakeToken(),
+                read_task=lambda: TASK,
             )
         )
         # Nothing bound: the task returns on its own without firing.

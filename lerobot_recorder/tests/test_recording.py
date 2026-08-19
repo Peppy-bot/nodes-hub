@@ -8,6 +8,7 @@ from lerobot_recorder.plan import CameraEntry, LinkKind, RecordingPlan, SourceEn
 from lerobot_recorder.recording import (
     GRIPPER_LAYOUT,
     MAX_EPISODE_S,
+    MIN_EPISODE_FRAMES,
     Cache,
     CameraFrame,
     GripperSample,
@@ -558,6 +559,23 @@ def test_schema_rejects_degenerate_camera_geometry():
     cache.color = [CameraFrame(encoding="rgb8", width=0, height=0, data=b"", timestamp_ns=NOW_NS)]
     with pytest.raises(NotReady, match="0x0"):
         capture(cache, plan)
+
+
+def test_the_minimum_frame_count_closes_the_librarys_stats_fork():
+    # MIN_EPISODE_FRAMES exists only to keep every saved episode on one side
+    # of the library's two-sample stats fork, which otherwise writes integer
+    # columns as int64 below it and float64 at or above it, and a dataset
+    # cannot hold both. Pinned against the library so this fails if it stops
+    # forking (drop the guard) or moves the boundary (retune the constant).
+    from lerobot.datasets.compute_stats import get_feature_stats
+
+    def min_dtype(rows: int):
+        column = np.arange(rows, dtype=np.int64).reshape(rows, 1)
+        return get_feature_stats(column, axis=0, keepdims=True)["min"].dtype
+
+    assert min_dtype(MIN_EPISODE_FRAMES - 1) != min_dtype(MIN_EPISODE_FRAMES)
+    # Every length the guard admits agrees with every other one.
+    assert min_dtype(MIN_EPISODE_FRAMES) == min_dtype(MIN_EPISODE_FRAMES + 8)
 
 
 def make_params(**overrides):

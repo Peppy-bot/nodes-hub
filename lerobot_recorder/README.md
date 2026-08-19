@@ -157,3 +157,9 @@ ends the episode with a save and the reason in the goal result; episodes
 also auto-stop at the length where LeRobot's float32 timestamps would stop
 loading. Feedback carries one message per recorded frame with
 `disk_free_bytes` riding along about once per second.
+
+An episode of fewer than two frames is discarded instead of saved. LeRobot
+computes episode stats differently below two samples and the two branches
+disagree on dtype for the integer columns, so a one-frame episode writes a
+dataset schema every later episode is rejected against, which wedges the
+session past rescue by `finish_session`.
