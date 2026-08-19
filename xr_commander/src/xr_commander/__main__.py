@@ -122,20 +122,21 @@ _POSTURE_BUTTONS = (
 )
 
 
-def _headset_origin(settings: config.Settings) -> str:
+def _headset_origin(settings: config.Settings, *, outbound_ip=tls.outbound_ip) -> str:
     """Where this node serves, as the operator would type it."""
     bound = settings.https_host
-    host = tls.outbound_ip() if bound.is_unspecified else str(bound)
+    host = outbound_ip() if bound.is_unspecified else str(bound)
     if host is not None and ":" in host:
         host = f"[{host}]"
     return f"https://{host or '<this machine>'}:{settings.https_port}"
 
 
-def _headset_url_hint(settings: config.Settings) -> str:
+def _headset_url_hint(settings: config.Settings, *, outbound_ip=tls.outbound_ip) -> str:
     """A URL the operator can type into the headset's browser as printed."""
     port = settings.https_port
+    origin = _headset_origin(settings, outbound_ip=outbound_ip)
     return (
-        f"open {_headset_origin(settings)} in the headset's browser "
+        f"open {origin} in the headset's browser "
         "(click through the self-signed warning) and enter VR. Over USB instead: "
         f"`adb reverse tcp:{port} tcp:{port}`, then https://localhost:{port}."
     )

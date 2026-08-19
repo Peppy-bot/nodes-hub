@@ -103,9 +103,12 @@ def _route_link(cache: Cache, kind: plan_mod.LinkKind, parse_sample):
     return route
 
 
-def _link_drains(token: _DrainToken, cache: Cache) -> list:
+def _link_routes(cache: Cache) -> list:
+    """Per observed slot, the (topic module, route, label) its drain runs
+    with; built as data so tests can check which parser each slot was wired
+    to without running a drain."""
     return [
-        _drain(topic_module, _route_link(cache, kind, parse), token, topic_module.LINK_ID)
+        (topic_module, _route_link(cache, kind, parse), topic_module.LINK_ID)
         for kind, observed, commanded in plan_mod.limb_slots()
         for topic_module, parse in (
             (observed, recording.state_sample),
@@ -197,7 +200,13 @@ def _write_session_json(session_dir: Path, params: Parameters, plan: plan_mod.Re
     (session_dir / "session.json").write_text(json.dumps(provenance, indent=2) + "\n")
 
 
-async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Task]:
+async def setup(
+    params: Parameters,
+    node_runner: NodeRunner,
+    *,
+    read_sources=plan_mod.read_bound_sources,
+    clock_init=peppygen.clock.init,
+) -> list[asyncio.Task]:
     if params.fps <= 0:
         raise ValueError("fps must be positive")
     # add_frame runs on the event loop, so the library must encode images on
@@ -218,11 +227,11 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
 
     # Staleness ages producer timestamps against this daemon-resolved clock (sim
     # time under a simulated clock); producers stamp from the same clock.
-    await peppygen.clock.init(node_runner)
+    await clock_init(node_runner)
 
     # The boot config seeds every observer slot with the launch's membership,
     # so the robot's shape is readable right here in setup.
-    plan = plan_mod.discover(node_runner, plan_mod.read_limb_sources(node_runner))
+    plan = plan_mod.discover(read_sources(node_runner))
     print(
         f"[recorder] {len(plan.state)} state link(s), "
         f"{len(plan.color_cameras)} color camera(s), {len(plan.rgbd_cameras)} rgbd camera(s)"
@@ -312,13 +321,18 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
             (rgbd_cameras_depth_stream, cache.rgbd_depth, plan.rgbd_index, "rgbd depth"),
         )
     ]
+    link_drains = [
+        _drain(topic_module, route, token, label)
+        for topic_module, route, label in _link_routes(cache)
+    ]
     return [
-        asyncio.create_task(coro)
-        for coro in _link_drains(token, cache) + camera_drains
+        asyncio.create_task(coro) for coro in link_drains + camera_drains
     ] + [recorder_task]
 
 
-async def _serve(node_runner: NodeRunner, svc, handler, label: str) -> None:
+async def _serve(
+    node_runner: NodeRunner, svc, handler, label: str, retry_s: float = SERVICE_RETRY_S
+) -> None:
     """Answer one exposed service until the node shuts down. A handler that
     raises must not end the loop: the service would then never answer again."""
     token = node_runner.cancellation_token()
@@ -328,7 +342,7 @@ async def _serve(node_runner: NodeRunner, svc, handler, label: str) -> None:
         except Exception as e:
             # CancelledError is a BaseException, so shutdown's cancel passes.
             print(f"[recorder] {label} service error: {e!r}")
-            await asyncio.sleep(SERVICE_RETRY_S)
+            await asyncio.sleep(retry_s)
 
 
 def _resume_session_handler(node_runner: NodeRunner, recorder: Recorder):

@@ -16,7 +16,12 @@ my_python_robot_brain = "my_python_robot_brain.__main__:main"
 packages = ["src/my_python_robot_brain"]
 
 [dependency-groups]
-dev = []
+dev = ["pytest>=8", "pytest-asyncio>=0.25"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src"]
 
 [tool.uv.sources]
 peppygen = { path = ".peppy/libs/peppygen" }

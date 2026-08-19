@@ -121,8 +121,10 @@ class MotorHealthReports:
     instead of dropping the rows as if the motors were fine.
     """
 
-    def __init__(self, *, producers_bound: bool = True) -> None:
+    def __init__(self, *, producers_bound: bool = True, monotonic=time.monotonic) -> None:
         self._producers_bound = producers_bound
+        # Injectable so staleness tests can move time instead of sleeping.
+        self._monotonic = monotonic
         self._by_instance: dict[str, HealthReport] = {}
 
     @property
@@ -165,7 +167,7 @@ class MotorHealthReports:
             ),
             driver_temp_c=_readings("driver_temp_c", driver_temp_c, count),
             winding_temp_c=_readings("winding_temp_c", winding_temp_c, count),
-            received_monotonic_s=time.monotonic(),
+            received_monotonic_s=self._monotonic(),
         )
 
     def by_instance(self) -> tuple[InstanceHealth, ...]:
@@ -176,7 +178,7 @@ class MotorHealthReports:
         wire it, and rows for it would name motors this node knows nothing
         about.
         """
-        now = time.monotonic()
+        now = self._monotonic()
 
         def entry(report: HealthReport) -> InstanceHealth:
             live = now - report.received_monotonic_s <= HEALTH_STALE_AFTER_MS / 1000.0

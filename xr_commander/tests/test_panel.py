@@ -498,6 +498,8 @@ def test_a_long_health_row_stays_inside_the_panel():
     frame = render(PanelState(headset_live=True, hands=(), health=(long_row,)))
     lit = np.nonzero(np.any(frame != panel._BACKGROUND, axis=2).any(axis=0))[0]
     assert lit.max() < panel._WIDTH - 1
+
+
 def test_no_recorder_means_no_task_line():
     session = FakeSession({"left": squeezing_hand()})
     state = snapshot(session, [source("left")], 10.0, quiet(), no_health())

@@ -75,7 +75,15 @@ jobs:
       # run summary, so a scoped run never silently reads as full coverage.
       - name: Discover the tests this change reaches
         id: discover
+        # Byte collation throughout: under a UTF-8 locale the runner's sort
+        # weighs letters over separators, so uvc_camera/linux and
+        # uvc_camera_controls_tests compare equal and whichever order find
+        # produced survives, which comm's bytewise check then rejects with
+        # "not in sorted order". Every list this step builds is sorted and
+        # consumed inside this step alone, so C collation is self-consistent
+        # whatever locale the runner itself runs under.
         env:
+          LC_ALL: C
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
@@ -402,6 +410,14 @@ jobs:
       # its first test file is run by CI whether or not it also declared a test
       # dependency group.
       #
+      # The peppy distribution is bound in and its zenohd named outright, the
+      # same way the Rust step names it: a suite that boots its node through
+      # the generated harness starts an ephemeral router of its own, and
+      # nothing in the container can find the binary to start it with.
+      # --cleanenv keeps the runner's PATH out, so the `zenohd` beside the
+      # `peppy` on it — the fallback the resolver would otherwise reach — is
+      # not visible here, and a node's own image has no reason to ship one.
+      #
       # Every selected project runs even after one fails, so a red run names
       # every failing node instead of the first.
       - name: Run the selected Python tests in their build containers
@@ -425,10 +441,12 @@ jobs:
                 --bind "$GITHUB_WORKSPACE:/work" \
                 --bind "$CI_CACHE_DIR/uv:/uv" \
                 --bind "$RUNNER_TEMP/uv-environments:/environments" \
+                --bind "$RUNNER_TEMP/peppy-dist:/peppy-dist" \
                 --env HOME=/uv/home \
                 --env UV_CACHE_DIR=/uv/cache \
                 --env UV_PYTHON_INSTALL_DIR=/uv/python \
                 --env UV_PROJECT_ENVIRONMENT="/environments/${project//\//.}" \
+                --env PEPPY_ZENOHD_PATH=/peppy-dist/bin/zenohd \
                 "$image" uv run --locked --with pytest pytest "${tests[@]}"; then
               echo "::endgroup::"
             else

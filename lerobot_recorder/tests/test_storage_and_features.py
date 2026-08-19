@@ -137,18 +137,20 @@ def test_build_features_shapes():
     assert depth["info"] == {"is_depth_map": True}
 
 
-def test_resolved_endpoint_prefers_service_scoped_var(monkeypatch):
-    monkeypatch.setenv("AWS_ENDPOINT_URL", "https://generic.example")
-    monkeypatch.setenv("AWS_ENDPOINT_URL_S3", "https://scoped.example")
-    assert resolved_endpoint() == "https://scoped.example"
+def test_resolved_endpoint_prefers_service_scoped_var():
+    both = {
+        "AWS_ENDPOINT_URL": "https://generic.example",
+        "AWS_ENDPOINT_URL_S3": "https://scoped.example",
+    }
+    assert resolved_endpoint(both) == "https://scoped.example"
 
 
-def test_resolved_endpoint_falls_back_to_generic_then_default(monkeypatch):
-    monkeypatch.delenv("AWS_ENDPOINT_URL_S3", raising=False)
-    monkeypatch.setenv("AWS_ENDPOINT_URL", "https://generic.example")
-    assert resolved_endpoint() == "https://generic.example"
-    monkeypatch.delenv("AWS_ENDPOINT_URL", raising=False)
-    assert resolved_endpoint() == "AWS default endpoints"
+def test_resolved_endpoint_falls_back_to_generic_then_default():
+    assert (
+        resolved_endpoint({"AWS_ENDPOINT_URL": "https://generic.example"})
+        == "https://generic.example"
+    )
+    assert resolved_endpoint({}) == "AWS default endpoints"
 
 
 class StubS3:

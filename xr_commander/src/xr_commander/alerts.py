@@ -52,8 +52,10 @@ class ActiveAlerts:
     genuine fault nor render as an unnamed one.
     """
 
-    def __init__(self, *, producers_bound: bool = True) -> None:
+    def __init__(self, *, producers_bound: bool = True, monotonic=time.monotonic) -> None:
         self._producers_bound = producers_bound
+        # Injectable so staleness tests can move time instead of sleeping.
+        self._monotonic = monotonic
         self._by_identity: dict[tuple[str, str, str], Alert] = {}
 
     @property
@@ -79,7 +81,7 @@ class ActiveAlerts:
         self._by_identity[(producer, source, kind)] = Alert(
             severity=severity,
             text=f"{source.upper()} {_LEVEL_LABELS[severity]}: {message}",
-            received_monotonic_s=time.monotonic(),
+            received_monotonic_s=self._monotonic(),
         )
 
     def active(self) -> tuple[Alert, ...]:
@@ -90,7 +92,7 @@ class ActiveAlerts:
         cannot leave its alert on screen, and the map stays bounded when
         sources vary.
         """
-        now = time.monotonic()
+        now = self._monotonic()
         self._by_identity = {
             identity: alert
             for identity, alert in self._by_identity.items()

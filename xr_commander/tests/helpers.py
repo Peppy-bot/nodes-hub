@@ -1,7 +1,13 @@
 import asyncio
+import contextlib
+import time
 from types import SimpleNamespace
 
 import numpy as np
+
+import peppygen.clock
+from peppygen.fixtures import harness
+from peppygen.parameters import Parameters
 
 from xr_commander.frames import Pose
 
@@ -26,6 +32,15 @@ def default_parameters(**overrides) -> SimpleNamespace:
     }
     values.update(overrides)
     return SimpleNamespace(**values)
+
+
+async def idle_setup(_params, _node_runner):
+    """A setup that starts nothing: the real `setup` raises TLS, an HTTPS
+    server, and a WebXR session, none of which belongs in a test. Harness
+    tests boot the node's runtime (ephemeral router, generated mocks, seeded
+    slots) under this no-op and drive the production functions directly
+    against the real runner and real generated modules."""
+    return []
 
 
 def asgi_request(
@@ -79,14 +94,74 @@ def asgi_request(
     )
 
 
-class FakeTopic:
-    """A consumed-topic module surface: hands out one prebuilt subscription."""
+def boot(**kwargs):
+    """The generated harness under `idle_setup`: awaitable or an async
+    context manager. Keyword arguments are `harness.start`'s: per-slot mock
+    counts (`<link_id>_instances`) and the usual overrides."""
+    kwargs.setdefault("parameters", Parameters(**vars(default_parameters())))
+    return harness.start(idle_setup, **kwargs)
 
-    def __init__(self, subscription):
-        self._subscription = subscription
 
-    async def subscribe(self, _runner):
-        return self._subscription
+@contextlib.asynccontextmanager
+async def boot_clocked(**kwargs):
+    """[`boot`] with the node's clock initialized: for tests that await
+    time-based node behavior. Shuts down on exit, like `boot`'s context
+    form."""
+    h = await boot(**kwargs)
+    try:
+        await peppygen.clock.init(h.node_runner)
+        yield h
+    finally:
+        await h.shutdown()
+
+
+async def eventually(predicate, message="condition"):
+    """Poll until `predicate()` is truthy; AssertionError past 10s.
+
+    The bounded-wait primitive for harness tests: wire delivery is ordered
+    but not instant, so state assertions converge instead of sleeping blind.
+    """
+    timeout = 10.0
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"{message}: not met within {timeout}s")
+        await asyncio.sleep(0.005)
+
+
+async def press_until_goal(session, mock_action, release, press):
+    """Release-then-press cycles until the node fires: buttons re-arm only
+    once the previous goal's watcher finished, so the retry absorbs that tail
+    without sleeping blind. `release`/`press` are the two `session.press`
+    kwargs dicts."""
+    deadline = time.monotonic() + 10.0
+    while True:
+        session.press(**release)
+        await asyncio.sleep(0.03)
+        session.press(**press)
+        try:
+            return await mock_action.next_goal(0.5)
+        except TimeoutError:
+            if time.monotonic() >= deadline:
+                raise
+
+
+async def tap_x(session, *, settle=0.05):
+    """One observed X press edge: release, let the tracker see it, press.
+    The sleep spans the tracker's frame cadence, not a node wait."""
+    session.press(x=False)
+    await asyncio.sleep(settle)
+    session.press(x=True)
+
+
+async def stop_and_save(session, active, cancelled_result, *, settle=0.05):
+    """The second X press of an episode: stop-and-save, not a fresh goal —
+    cancels the active goal and completes it with the recorder's verdict."""
+    session.press(x=False)
+    await asyncio.sleep(settle)
+    session.press(x=True)
+    await asyncio.wait_for(active.cancel_signal(), 10.0)
+    await active.complete_cancelled(cancelled_result)
 
 
 class RecordingSink:
@@ -100,7 +175,11 @@ class RecordingSink:
 
 
 class FakeSubscription:
-    """Yields queued items, then pends forever like the generated one."""
+    """Yields queued items, then pends forever like the generated one.
+
+    Kept for the pure bus-plumbing tests (`messages`/`next_message`), which
+    exercise receive-loop edge cases no real subscription can be scripted
+    into (mid-stream exceptions, self-cancelling receives)."""
 
     def __init__(self, items):
         self._items = list(items)
@@ -111,18 +190,29 @@ class FakeSubscription:
         await asyncio.Event().wait()
 
 
-class ClosingSubscription:
-    """Yields queued items then closes, so a drain loop ends on its own."""
-
-    def __init__(self, items):
-        self._items = list(items)
-
-    async def next(self):
-        return self._items.pop(0) if self._items else None
+@contextlib.asynccontextmanager
+async def running_drain(make_drain):
+    """One drain task for the body's duration: a hand-fired token cancels it
+    on exit (never the runner's real token, which would converge the whole
+    node), and the task is awaited bounded so a hung drain fails the test
+    instead of leaking."""
+    token = FakeToken()
+    drain = asyncio.create_task(make_drain(token))
+    try:
+        yield drain
+    finally:
+        token.cancel()
+        await asyncio.wait_for(drain, 5.0)
 
 
 class FakeToken:
-    """A cancellation token the test fires by hand."""
+    """A cancellation token the test fires by hand.
+
+    Kept deliberately alongside the harness: the production tasks accept any
+    token with the CancellationToken shape, and a test must be able to end
+    one drain without cancelling the runner's real token (which would
+    converge the whole node mid-test). The pure loop tests have no runner at
+    all."""
 
     def __init__(self):
         self._event = asyncio.Event()

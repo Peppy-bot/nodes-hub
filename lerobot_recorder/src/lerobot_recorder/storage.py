@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import datetime
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
@@ -80,13 +81,13 @@ def ensure_mounted(target: StorageTarget) -> None:
         )
 
 
-def resolved_endpoint() -> str:
+def resolved_endpoint(env: Mapping[str, str] = os.environ) -> str:
     """The S3 endpoint boto3 will use, for the startup destination log.
     The service-scoped variable wins over the generic one, mirroring boto3's
     own precedence; with neither set boto3 talks to AWS proper."""
     return (
-        os.environ.get("AWS_ENDPOINT_URL_S3")
-        or os.environ.get("AWS_ENDPOINT_URL")
+        env.get("AWS_ENDPOINT_URL_S3")
+        or env.get("AWS_ENDPOINT_URL")
         or "AWS default endpoints"
     )
 

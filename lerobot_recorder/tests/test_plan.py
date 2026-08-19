@@ -5,8 +5,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from lerobot_recorder import plan as plan_mod
-from lerobot_recorder.plan import LinkKind, discover, limb_name
+from lerobot_recorder.plan import (
+    BoundSources,
+    LinkKind,
+    discover,
+    limb_name,
+    snapshot_sources,
+)
 
 CORE = "cn"
 
@@ -18,32 +23,21 @@ def source(instance_id: str, link_id: str = "link"):
     )
 
 
-def discover_bound():
-    """Discover from one read of the bound slots, as setup does; the boot
-    config seeds them, so the read answers the launch's membership."""
-    return discover(node_runner=None, limb_sources=plan_mod.read_limb_sources(None))
-
-
-def slot(sources):
-    return SimpleNamespace(sources=lambda _runner: list(sources))
-
-
-def bind(monkeypatch, *, joints=((), ()), grippers=((), ())):
-    """Stand in for the generated slot modules with the sources a launcher
-    would have bound: (measured, commanded) per pairing kind."""
-    monkeypatch.setattr(
-        plan_mod,
-        "limb_slots",
-        lambda: (
-            (LinkKind.JOINT, slot(joints[0]), slot(joints[1])),
-            (LinkKind.GRIPPER, slot(grippers[0]), slot(grippers[1])),
+def bind(*, joints=((), ()), grippers=((), ())) -> BoundSources:
+    """The snapshot a launcher's bindings would read as: (measured,
+    commanded) per pairing kind, no cameras."""
+    return BoundSources(
+        limbs=(
+            (LinkKind.JOINT, tuple(joints[0]), tuple(joints[1])),
+            (LinkKind.GRIPPER, tuple(grippers[0]), tuple(grippers[1])),
         ),
+        color_producers=(),
+        rgbd_producers=(),
     )
 
 
-def bimanual(monkeypatch):
-    bind(
-        monkeypatch,
+def bimanual() -> BoundSources:
+    return bind(
         joints=(
             [source("left_arm_inst"), source("right_arm_inst")],
             [source("backbone_inst", "left_arm_link"), source("backbone_inst", "right_arm_link")],
@@ -58,9 +52,8 @@ def bimanual(monkeypatch):
     )
 
 
-def test_limbs_are_named_after_their_follower_joints_first(monkeypatch):
-    bimanual(monkeypatch)
-    plan = discover_bound()
+def test_limbs_are_named_after_their_follower_joints_first():
+    plan = discover(bimanual())
     assert [e.feature_key for e in plan.state] == [
         "left_arm_inst",
         "right_arm_inst",
@@ -83,11 +76,10 @@ def test_limbs_are_named_after_their_follower_joints_first(monkeypatch):
     ]
 
 
-def test_commanded_sources_sharing_an_instance_stay_distinct(monkeypatch):
+def test_commanded_sources_sharing_an_instance_stay_distinct():
     """Every openarm pairing is led by the one backbone instance, so the
     observed link is the only thing telling the two arms apart."""
-    bimanual(monkeypatch)
-    plan = discover_bound()
+    plan = discover(bimanual())
     assert [e.key for e in plan.action] == [
         (CORE, "backbone_inst", "left_arm_link"),
         (CORE, "backbone_inst", "right_arm_link"),
@@ -96,9 +88,8 @@ def test_commanded_sources_sharing_an_instance_stay_distinct(monkeypatch):
     ]
 
 
-def test_action_falls_back_to_the_measured_source_of_its_own_limb(monkeypatch):
-    bimanual(monkeypatch)
-    plan = discover_bound()
+def test_action_falls_back_to_the_measured_source_of_its_own_limb():
+    plan = discover(bimanual())
     assert plan.action_fallback == {
         (CORE, "backbone_inst", "left_arm_link"): (CORE, "left_arm_inst", "link"),
         (CORE, "backbone_inst", "right_arm_link"): (CORE, "right_arm_inst", "link"),
@@ -107,32 +98,29 @@ def test_action_falls_back_to_the_measured_source_of_its_own_limb(monkeypatch):
     }
 
 
-def test_a_robot_the_launcher_bound_differently_records_what_it_has(monkeypatch):
+def test_a_robot_the_launcher_bound_differently_records_what_it_has():
     """One arm, no gripper: the manifest fixes nothing about the robot."""
-    bind(
-        monkeypatch,
-        joints=([source("arm_inst")], [source("leader_inst", "arm_link")]),
+    plan = discover(
+        bind(joints=([source("arm_inst")], [source("leader_inst", "arm_link")]))
     )
-    plan = discover_bound()
     assert [e.feature_key for e in plan.state] == ["arm_inst"]
     assert [e.feature_key for e in plan.action] == ["arm_inst"]
 
 
-def test_unpairable_bindings_are_refused(monkeypatch):
+def test_unpairable_bindings_are_refused():
     """A measured source with no commanded source of its own has no action to
     record, and nothing here can guess which one it should have been."""
-    bind(
-        monkeypatch,
+    bound = bind(
         joints=(
             [source("left_arm_inst"), source("right_arm_inst")],
             [source("backbone_inst", "left_arm_link")],
         ),
     )
     with pytest.raises(ValueError, match="joint limbs are bound 2 measured to 1 commanded"):
-        discover_bound()
+        discover(bound)
 
 
-def test_one_instance_following_two_pairings_names_both(monkeypatch):
+def test_one_instance_following_two_pairings_names_both():
     used: set[str] = set()
     first = limb_name(used, source("arm_inst", "left"))
     second = limb_name(used, source("arm_inst", "right"))
@@ -145,27 +133,26 @@ def test_a_name_that_cannot_be_made_unique_is_refused():
         limb_name(used, source("arm_inst", "left"))
 
 
-def test_a_launch_with_no_limbs_is_refused(monkeypatch):
+def test_a_launch_with_no_limbs_is_refused():
     """Cameras alone are not a robot dataset: nothing would fill
     observation.state or action."""
-    bind(monkeypatch)
     with pytest.raises(ValueError, match="no limbs are bound"):
-        discover_bound()
+        discover(bind())
 
 
-def test_one_source_bound_to_two_limbs_is_refused(monkeypatch):
+def test_one_source_bound_to_two_limbs_is_refused():
     """Two limbs sharing an identity would share one cache slot, so both would
     record whichever message landed last."""
     twice = source("arm_inst", "arm_link")
-    bind(monkeypatch, joints=([twice, twice], [source("lead", "a"), source("lead", "b")]))
+    bound = bind(joints=([twice, twice], [source("lead", "a"), source("lead", "b")]))
     with pytest.raises(ValueError, match="bound to two limbs"):
-        discover_bound()
+        discover(bound)
 
 
-def test_discovery_consumes_the_snapshot_not_the_live_sets(monkeypatch):
-    """The sets stay live after boot, so the plan must come from the one
-    snapshot read, or a replan mid-discovery could pair sources from two
-    plan revisions."""
+def test_the_snapshot_is_immune_to_the_live_sets_moving_on():
+    """The sets stay live after boot, so the snapshot must materialize its
+    one read, or a replan mid-discovery could pair sources from two plan
+    revisions."""
     deliveries = {
         "joints": [source("arm_inst")],
         "joints_cmd": [source("lead", "arm_link")],
@@ -174,19 +161,20 @@ def test_discovery_consumes_the_snapshot_not_the_live_sets(monkeypatch):
     }
 
     def live_slot(bucket):
-        return SimpleNamespace(sources=lambda _runner: list(deliveries[bucket]))
+        return SimpleNamespace(sources=lambda _runner: deliveries[bucket])
 
-    monkeypatch.setattr(
-        plan_mod,
-        "limb_slots",
-        lambda: (
+    no_cameras = SimpleNamespace(bound_producers=lambda _runner: [])
+    snapshot = snapshot_sources(
+        None,
+        (
             (LinkKind.JOINT, live_slot("joints"), live_slot("joints_cmd")),
             (LinkKind.GRIPPER, live_slot("grippers"), live_slot("grippers_cmd")),
         ),
+        no_cameras,
+        no_cameras,
     )
-    snapshot = plan_mod.read_limb_sources(None)
-    deliveries["joints"] = []
-    deliveries["joints_cmd"] = []
+    deliveries["joints"].clear()
+    deliveries["joints_cmd"].clear()
 
-    plan = discover(node_runner=None, limb_sources=snapshot)
+    plan = discover(snapshot)
     assert [e.feature_key for e in plan.state] == ["arm_inst"]
