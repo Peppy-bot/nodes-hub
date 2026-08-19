@@ -75,7 +75,15 @@ jobs:
       # run summary, so a scoped run never silently reads as full coverage.
       - name: Discover the tests this change reaches
         id: discover
+        # Byte collation throughout: under a UTF-8 locale the runner's sort
+        # weighs letters over separators, so uvc_camera/linux and
+        # uvc_camera_controls_tests compare equal and whichever order find
+        # produced survives, which comm's bytewise check then rejects with
+        # "not in sorted order". Every list this step builds is sorted and
+        # consumed inside this step alone, so C collation is self-consistent
+        # whatever locale the runner itself runs under.
         env:
+          LC_ALL: C
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
