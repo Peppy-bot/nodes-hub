@@ -13,3 +13,6 @@ tracing = "0.1"
 serde = "1"
 ffmpeg-next = "8"
 tempfile = "3"
+
+[dev-dependencies]
+peppygen = { path = ".peppy/libs/peppygen", features = ["testing"] }
