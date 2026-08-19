@@ -33,6 +33,7 @@ v4l = { version = "0.14", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+peppygen = { path = ".peppy/libs/peppygen", features = ["testing"] }
 
 [[bin]]
 name = "zed_camera"
