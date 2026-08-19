@@ -31,7 +31,7 @@ env:
 jobs:
   discover-and-run:
     name: Every Rust and Python test the change reaches
-    runs-on: self-hosted
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     # A cold run compiles nine crates' full dependency trees and resolves
     # lerobot's, torch included. The caches below keep warm runs far under
     # this, but the first run on a fresh runner is legitimately slow.
