@@ -443,15 +443,26 @@ fn decode_frames(
                 return Ok(());
             }
             if stream.index() == video_stream_index {
-                // EAGAIN is the decoder asking to be drained first; every
-                // other failure would repeat on each packet, decoding the
+                // FFmpeg's send/receive contract: EAGAIN from send_packet
+                // means drain the pending output, then resend the same
+                // packet; dropping it would silently skip its frames. Any
+                // other failure would repeat on every packet, decoding the
                 // file at full speed forever while publishing nothing.
-                match decoder.send_packet(&packet) {
-                    Ok(())
-                    | Err(ffmpeg::Error::Other {
-                        errno: ffmpeg::util::error::EAGAIN,
-                    }) => {}
-                    Err(source) => return Err(NodeError::Decoder(source)),
+                loop {
+                    match decoder.send_packet(&packet) {
+                        Ok(()) => break,
+                        Err(ffmpeg::Error::Other {
+                            errno: ffmpeg::util::error::EAGAIN,
+                        }) => {
+                            // The drain helper returns early once the node is
+                            // stopping, which would otherwise spin this retry.
+                            if cancel_token.is_cancelled() || frame_tx.is_closed() {
+                                return Ok(());
+                            }
+                            receive_and_send_frames(&mut decoder).map_err(NodeError::Decoder)?;
+                        }
+                        Err(source) => return Err(NodeError::Decoder(source)),
+                    }
                 }
                 receive_and_send_frames(&mut decoder).map_err(NodeError::Decoder)?;
             }
