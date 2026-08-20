@@ -17,11 +17,29 @@ const GOAL_TIMEOUT: Duration = Duration::from_secs(5);
 const CANCEL_TIMEOUT: Duration = Duration::from_secs(2);
 const RESULT_TIMEOUT: Duration = Duration::from_secs(30);
 
-fn arm_side(arm_id: u16) -> &'static str {
-    match arm_id {
-        ARM_ID_LEFT => "Left",
-        ARM_ID_RIGHT => "Right",
-        _ => "Unknown",
+/// Which arm a goal addresses. The wire carries a `u16`; it is parsed into this
+/// once, at the decider, so everything downstream matches exhaustively and no
+/// path has to describe what an unknown id would mean.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Arm {
+    Left,
+    Right,
+}
+
+impl Arm {
+    fn from_id(arm_id: u16) -> Option<Self> {
+        match arm_id {
+            ARM_ID_LEFT => Some(Self::Left),
+            ARM_ID_RIGHT => Some(Self::Right),
+            _ => None,
+        }
+    }
+
+    fn side(self) -> &'static str {
+        match self {
+            Self::Left => "Left",
+            Self::Right => "Right",
+        }
     }
 }
 
@@ -44,13 +62,9 @@ enum ArmHandle {
 }
 
 impl ArmHandle {
-    async fn fire(
-        node_runner: &peppygen::NodeRunner,
-        arm_id: u16,
-        desired: [i32; 3],
-    ) -> Result<Self> {
-        match arm_id {
-            ARM_ID_LEFT => {
+    async fn fire(node_runner: &peppygen::NodeRunner, arm: Arm, desired: [i32; 3]) -> Result<Self> {
+        match arm {
+            Arm::Left => {
                 let request = left_robot_arm_move_arm::GoalRequest {
                     desired_position: desired,
                 };
@@ -64,7 +78,7 @@ impl ArmHandle {
                 .await?;
                 Ok(ArmHandle::Left(handle))
             }
-            ARM_ID_RIGHT => {
+            Arm::Right => {
                 let request = right_robot_arm_move_arm::GoalRequest {
                     desired_position: desired,
                 };
@@ -78,7 +92,6 @@ impl ArmHandle {
                 .await?;
                 Ok(ArmHandle::Right(handle))
             }
-            _ => unreachable!("decider rejects unknown arm_id before fire"),
         }
     }
 
@@ -146,7 +159,7 @@ impl ArmHandle {
 /// the decider's accept until `drive_goal` finishes, so the map doubles as the
 /// busy-arm set. Each handle sits behind an async mutex shared with the
 /// shutdown hook, which cancels whatever is still in flight at shutdown.
-type ActiveHandles = Arc<Mutex<HashMap<u16, Arc<AsyncMutex<ArmHandle>>>>>;
+type ActiveHandles = Arc<Mutex<HashMap<Arm, Arc<AsyncMutex<ArmHandle>>>>>;
 
 async fn forward(
     backbone_ctx: move_arm::GoalContext,
@@ -231,23 +244,23 @@ async fn run_action(
         let token_for_decider = token.clone();
         let next_request = action.handle_goal_next_request(move |request| {
             let arm_id = request.data.arm_id;
-            let side = arm_side(arm_id);
+            let Some(arm) = Arm::from_id(arm_id) else {
+                return Ok(move_arm::GoalDecision::reject(format!(
+                    "unknown arm_id {arm_id}"
+                )));
+            };
+            let side = arm.side();
             println!(
                 "[controller] {side} arm received goal: {:?}",
                 request.data.desired_position
             );
-            if arm_id != ARM_ID_LEFT && arm_id != ARM_ID_RIGHT {
-                return Ok(move_arm::GoalDecision::reject(format!(
-                    "unknown arm_id {arm_id}"
-                )));
-            }
             if active_for_decider
                 .lock()
                 .expect("active lock poisoned")
-                .contains_key(&arm_id)
+                .contains_key(&arm)
             {
                 return Ok(move_arm::GoalDecision::reject(format!(
-                    "arm {arm_id} is already moving"
+                    "{side} arm is already moving"
                 )));
             }
             // Pre-fire at the arm so we can mirror its accept/reject. The
@@ -264,7 +277,7 @@ async fn run_action(
             tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async {
                     let arm_handle = tokio::select! {
-                        fired = ArmHandle::fire(&runner, arm_id, desired) => match fired {
+                        fired = ArmHandle::fire(&runner, arm, desired) => match fired {
                             Ok(handle) => handle,
                             Err(e) => {
                                 return Ok(move_arm::GoalDecision::reject(format!(
@@ -293,7 +306,7 @@ async fn run_action(
                         let mut active = active.lock().expect("active lock poisoned");
                         if !token.is_cancelled() {
                             println!("[controller] {side} arm accepted forwarded goal");
-                            active.insert(arm_id, Arc::new(AsyncMutex::new(arm_handle)));
+                            active.insert(arm, Arc::new(AsyncMutex::new(arm_handle)));
                             return Ok(move_arm::GoalDecision::accept());
                         }
                     }
@@ -314,17 +327,29 @@ async fn run_action(
             println!("[controller] move_arm action handler closed");
             break;
         };
+        // A goal the decider did not register cannot be driven. Skip it rather
+        // than stop serving the action.
         let arm_id = ctx.request().data.arm_id;
-        let arm_handle = active_handles
+        let Some(arm) = Arm::from_id(arm_id) else {
+            println!("[controller] unknown arm_id {arm_id}; skipping goal");
+            continue;
+        };
+        let stashed = active_handles
             .lock()
             .expect("active lock poisoned")
-            .get(&arm_id)
-            .cloned()
-            .expect("decider stashed handle for accepted goal");
+            .get(&arm)
+            .cloned();
+        let Some(arm_handle) = stashed else {
+            println!(
+                "[controller] no active handle for the {} arm; skipping goal",
+                arm.side()
+            );
+            continue;
+        };
         let active = Arc::clone(&active_handles);
         let goal_token = token.clone();
         tokio::spawn(async move {
-            drive_goal(arm_handle, ctx, active, arm_id, goal_token).await;
+            drive_goal(arm_handle, ctx, active, arm, goal_token).await;
         });
     }
     Ok(())
@@ -334,10 +359,10 @@ async fn drive_goal(
     arm_handle: Arc<AsyncMutex<ArmHandle>>,
     backbone_ctx: move_arm::GoalContext,
     active_handles: ActiveHandles,
-    arm_id: u16,
+    arm: Arm,
     token: CancellationToken,
 ) {
-    let side = arm_side(arm_id);
+    let side = arm.side();
     forward(backbone_ctx, arm_handle, side, token.clone()).await;
     // On shutdown the entry must stay registered: forward stopped without
     // cleanup, and the shutdown hook cancels the arm goal via the registry.
@@ -345,7 +370,7 @@ async fn drive_goal(
         active_handles
             .lock()
             .expect("active lock poisoned")
-            .remove(&arm_id);
+            .remove(&arm);
     }
 }
 
@@ -359,14 +384,14 @@ fn main() -> Result<()> {
         // runtime runs while the messenger is still connected.
         let active_for_shutdown = Arc::clone(&active_handles);
         node_runner.on_shutdown(async move {
-            let handles: Vec<(u16, Arc<AsyncMutex<ArmHandle>>)> = active_for_shutdown
+            let handles: Vec<(Arm, Arc<AsyncMutex<ArmHandle>>)> = active_for_shutdown
                 .lock()
                 .expect("active lock poisoned")
                 .iter()
-                .map(|(arm_id, handle)| (*arm_id, Arc::clone(handle)))
+                .map(|(arm, handle)| (*arm, Arc::clone(handle)))
                 .collect();
-            for (arm_id, handle) in handles {
-                let side = arm_side(arm_id);
+            for (arm, handle) in handles {
+                let side = arm.side();
                 // forward() releases the handle guard once the token fires, so
                 // this acquire resolves promptly.
                 let handle = handle.lock().await;
