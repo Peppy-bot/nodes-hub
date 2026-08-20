@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Prints the path of a container image the given node's tests run in, building
-# and caching it on this runner first when it is not there yet.
+# and caching it under $CI_CACHE_DIR first when it is not there yet.
 #
 # A node's `apptainer.def` builds the image the node ships in: it prepares
 # whatever the node needs to compile, copies the source tree in through
