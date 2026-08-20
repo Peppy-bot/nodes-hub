@@ -12,10 +12,13 @@ name: Tests
 # Every node depends on generated code (its gitignored `.peppy/libs`) that only
 # a running peppy daemon can produce, since `peppy node sync` calls the daemon's
 # node_generate service and resolves contracts through the daemon's repository
-# registry. So this job boots a daemon of its own, isolated from the machine's
-# daemon and from concurrent runs, generates the tested nodes' interfaces, and
-# runs each node's tests inside a container derived from its `apptainer.def`.
-# The runner host provides none of the nodes' build dependencies.
+# registry. So this job installs a peppy release, readies its bundled apptainer
+# for unprivileged use, boots a daemon of its own, generates the tested nodes'
+# interfaces, and runs each node's tests inside a container derived from its
+# `apptainer.def`. The runner image provides none of the nodes' build
+# dependencies. The runner is an ephemeral Blacksmith VM, so everything worth
+# keeping between runs (test images, cargo registries, per-crate target dirs,
+# uv's downloads) lives on a sticky disk mounted below.
 on:
   push:
     branches: [main]
@@ -31,17 +34,15 @@ env:
 jobs:
   discover-and-run:
     name: Every Rust and Python test the change reaches
-    # Stays self-hosted while the rest of this repository's CI moves to
-    # Blacksmith: this job needs two things only a reused machine has. The
-    # daemon boots against the apptainer install `peppy container setup`
-    # blesses once per machine, and the caches named below (container images,
-    # cargo registries, per-crate target dirs, uv's downloads) live on the host
-    # so a warm run is minutes rather than the better part of an hour an
-    # ephemeral runner would spend rebuilding all of it.
-    runs-on: self-hosted
+    # x86 rather than the -arm label: the base images and the librealsense apt
+    # repository are published for both, and the sticky disk key below carries
+    # the architecture, so switching is a label change that starts from an
+    # empty disk rather than a wrong-arch one.
+    runs-on: blacksmith-16vcpu-ubuntu-2404
     # A cold run compiles nine crates' full dependency trees and resolves
-    # lerobot's, torch included. The caches below keep warm runs far under
-    # this, but the first run on a fresh runner is legitimately slow.
+    # lerobot's, torch included. The sticky disk keeps warm runs far under
+    # this, but the first run after the disk is evicted (7 idle days) or its
+    # key changes is legitimately slow.
     timeout-minutes: 120
     permissions:
       contents: read
@@ -58,9 +59,27 @@ jobs:
           persist-credentials: false
 
       # Container images, cargo registries, crate build outputs and uv's
-      # download cache outlive the run: they are what makes a warm run cheap.
-      # They sit outside the workspace because `actions/checkout` cleans that,
-      # ignored files included, at the start of every run.
+      # download cache outlive the run on a Blacksmith sticky disk: they are
+      # what makes a warm run cheap, and the runner's own disk is discarded
+      # with the job. Every run mounts a clone of the disk's last committed
+      # snapshot, so nothing stored here may be state one run depends on
+      # another having written — only caches apptainer, cargo and uv can
+      # rebuild from scratch. Only pushes to main commit their clone: the
+      # concurrency group serialises those, so commits never race, and a pull
+      # request (possibly from a fork) reads the cache but cannot write into
+      # what every later run builds on. A pull request therefore recompiles
+      # just its own delta against main's warm snapshot. The key carries the
+      # architecture because the cached .sif images are built for the host
+      # that built them.
+      - name: Mount the build caches
+        uses: useblacksmith/stickydisk@35ba2e331a80056a42af053ee54968511de2b7c7 # v1.5.0
+        with:
+          key: ${{ github.repository }}-tests-${{ runner.arch }}
+          path: ~/.cache/nodes-hub-ci
+          commit: ${{ github.event_name == 'push' }}
+
+      # The path the disk is mounted at: the later steps and
+      # derive-test-image.sh reach the caches through this variable.
       - name: Name the caches this run reuses
         run: echo "CI_CACHE_DIR=$HOME/.cache/nodes-hub-ci" >> "$GITHUB_ENV"
 
@@ -69,8 +88,8 @@ jobs:
       # directory holding a Cargo.toml. Python tests are discovered per file by
       # the pytest naming conventions. `.peppy` is excluded because the
       # generated libs vendored there carry manifests and tests of their own
-      # that are peppy's to run, not this repository's; on a reused runner,
-      # stale `target/` and virtualenv trees are excluded for the same reason.
+      # that are peppy's to run, not this repository's; any `target/` or
+      # virtualenv tree in the checkout is excluded for the same reason.
       #
       # A project is a directory holding a crate or a node, at whatever depth
       # the layout puts it: `realsense_d4xx`, `uvc_camera/linux` and
@@ -224,15 +243,16 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # Installed under RUNNER_TEMP rather than through scripts/install.sh: the
-      # self-hosted runners are reused, so this run must not touch a shared
-      # ~/.peppy. Unlike the repository-index workflow this extracts the whole
-      # archive, not just bin/peppy, because `service serve` needs the bundled
-      # layout around the binary (zenohd). Set the PEPPY_VERSION repository
-      # variable to pin a release; it defaults to the latest. The generator
-      # inside peppy must match what the crates' committed Cargo.tomls expect of
-      # peppygen, so bump the pin together with peppy releases that change
-      # generated code.
+      # Installed by extracting the release under RUNNER_TEMP rather than
+      # through scripts/install.sh: nothing here wants a ~/.peppy, and the
+      # whole job lives in the checkout and its own temp dir. Unlike the
+      # repository-index workflow this extracts the whole archive, not just
+      # bin/peppy, because `service serve` needs the bundled layout around the
+      # binary (zenohd, and the apptainer install under bin/apptainer that the
+      # next step readies). Set the PEPPY_VERSION repository variable to pin a
+      # release; it defaults to the latest. The generator inside peppy must
+      # match what the crates' committed Cargo.tomls expect of peppygen, so
+      # bump the pin together with peppy releases that change generated code.
       #
       # PEPPY_VERSION reaches the script through the environment rather than a
       # `${{ }}` expansion, so its value is data the shell reads instead of
@@ -268,40 +288,59 @@ jobs:
           chmod +x "$dest/bin/peppy"
           echo "$dest/bin" >> "$GITHUB_PATH"
 
-      # The daemon gets a per-run data root and port so it shares nothing with
-      # the machine's own daemon or a concurrent run: the CLI finds it through
-      # PEPPY_HOME/daemon_state.json5, so isolation and discovery are the same
-      # mechanism. The name carries the run id because core-node names must be
-      # unique among daemons that can reach each other.
+      # The daemon refuses to boot unless the apptainer install it resolves
+      # is ready for unprivileged use: `newuidmap` on PATH, and on a kernel
+      # that restricts unprivileged user namespaces through AppArmor (Ubuntu
+      # 24.04's default) a root-installed profile keyed to the canonical path
+      # of that install's `starter` binary. The VM is fresh, so every run
+      # readies the install it just extracted: `peppy container setup` applies
+      # whatever its fix script needs through sudo when stdin is not a
+      # terminal, and rechecks before exiting 0. Today's Blacksmith image
+      # mounts no AppArmor securityfs, so it needs nothing; the step is what
+      # keeps that an observation rather than an assumption. The daemon would
+      # find bin/apptainer beside bin/peppy by itself; it is exported because
+      # the test steps and derive-test-image.sh run the same install directly.
       #
-      # The daemon refuses to boot without a ready apptainer install, and on
-      # Ubuntu 24.04+ ready means an AppArmor profile keyed to the install's
-      # path, installed by root. A fresh extract under RUNNER_TEMP can never
-      # have one, so this reuses the runner's own blessed install, present on
-      # any machine that has run `peppy container setup` once, which is a
-      # standing prerequisite of these runners.
+      # `apptainer build` runs a def's %post as fakeroot, which needs a
+      # subordinate id range for the runner user besides newuidmap. The
+      # runner image ships one; should it ever not, this allocates one past
+      # the highest range in use rather than failing in a def's apt-get a
+      # cold build later.
+      - name: Ready the bundled apptainer for unprivileged use
+        if: steps.discover.outputs.any == 'true'
+        run: |
+          set -euo pipefail
+          PEPPY_APPTAINER_DIR="$RUNNER_TEMP/peppy-dist/bin/apptainer"
+          echo "PEPPY_APPTAINER_DIR=$PEPPY_APPTAINER_DIR" >> "$GITHUB_ENV"
+          export PEPPY_APPTAINER_DIR
+          peppy container setup < /dev/null
+
+          user=$(id -un)
+          for kind in subuid subgid; do
+            if ! grep -qs "^$user:" "/etc/$kind"; then
+              start=$(awk -F: 'BEGIN { m = 100000 } { e = $2 + $3; if (e > m) m = e } END { print m }' \
+                "/etc/$kind" 2>/dev/null || echo 100000)
+              sudo usermod "--add-${kind}s" "$start-$((start + 65535))" "$user"
+            fi
+          done
+
+      # The daemon gets its own data root and port under RUNNER_TEMP: the CLI
+      # finds it through PEPPY_HOME/daemon_state.json5, so pointing PEPPY_HOME
+      # at the run's directory is discovery and isolation from any other
+      # daemon in one. The name carries the run id because core-node names
+      # must be unique among daemons that can reach each other.
       - name: Start an isolated peppy daemon
         if: steps.discover.outputs.any == 'true'
         run: |
           set -euo pipefail
-          apptainer_dir=""
-          for d in "$HOME"/.peppy/tmp/apptainer-*; do
-            if [ -x "$d/bin/apptainer" ]; then apptainer_dir="$d"; break; fi
-          done
-          if [ -z "$apptainer_dir" ]; then
-            echo "no apptainer install under ~/.peppy/tmp; run 'peppy container setup' on this runner once" >&2
-            exit 1
-          fi
-
           PEPPY_HOME="$RUNNER_TEMP/peppy-home"
           mkdir -p "$PEPPY_HOME"
           PEPPY_MESSAGING_PORT=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
           {
             echo "PEPPY_HOME=$PEPPY_HOME"
             echo "PEPPY_MESSAGING_PORT=$PEPPY_MESSAGING_PORT"
-            echo "PEPPY_APPTAINER_DIR=$apptainer_dir"
           } >> "$GITHUB_ENV"
-          export PEPPY_HOME PEPPY_MESSAGING_PORT PEPPY_APPTAINER_DIR="$apptainer_dir"
+          export PEPPY_HOME PEPPY_MESSAGING_PORT
 
           nohup peppy service serve --core-node-name "ci-tests-$GITHUB_RUN_ID" \
             > "$RUNNER_TEMP/peppy-serve.log" 2>&1 &
@@ -347,18 +386,21 @@ jobs:
       # librealsense2-dev that only its own def knows the apt repository for.
       # A crate whose node ships no def, like the example_robot ones, gets the
       # base image peppy scaffolds for a Rust node. Build and exec both run
-      # unprivileged through the same user-namespace apptainer install the
-      # daemon preflight resolved.
+      # unprivileged through the same user-namespace apptainer install readied
+      # above.
       #
       # Inside the container the workspace is /work and the daemon's data root
       # is bound at its host path, because each node's .peppy/libs entries are
       # absolute symlinks into it. The base image's rustup lives under /root
       # (its docker build ran as root) with no env set, hence the explicit
-      # RUSTUP_HOME; CARGO_HOME and the per-crate target dirs are persistent
-      # host paths so registries and builds warm across runs. The target dirs
+      # RUSTUP_HOME; CARGO_HOME and the per-crate target dirs are on the sticky
+      # disk so registries and builds warm across runs. The target dirs
       # are per crate, never shared: every crate vendors a generated
       # `peppygen 0.1.0` with different contents, and in a shared target dir
-      # cargo reuses one crate's peppygen artifact for another.
+      # cargo reuses one crate's peppygen artifact for another. Incremental
+      # compilation is off: its caches are much of a debug target dir and the
+      # sticky disk is billed per gigabyte, while all it would save is the
+      # seconds a warm rebuild of a crate's own code takes.
       #
       # Every selected crate runs even after one fails, so a red run names
       # every failing crate instead of the first. --locked proves the build
@@ -386,6 +428,7 @@ jobs:
                 --env CARGO_HOME=/cargo \
                 --env RUSTUP_HOME=/root/.rustup \
                 --env CARGO_TARGET_DIR=/target \
+                --env CARGO_INCREMENTAL=0 \
                 --env PEPPY_ZENOHD_PATH=/peppy-dist/bin/zenohd \
                 --env CARGO_TERM_COLOR=always \
                 "$image" cargo test --locked; then
@@ -407,8 +450,8 @@ jobs:
       # to an ffmpeg only its own def installs. A node shipping no def gets the
       # base image peppy scaffolds for a Python node.
       #
-      # uv's download cache and its managed interpreters are persistent host
-      # paths, so a warm run installs a torch it already has instead of
+      # uv's download cache and its managed interpreters are on the sticky
+      # disk, so a warm run installs a torch it already has instead of
       # fetching lerobot's tree again. The environments built out of them are
       # per run, because uv locks its cache but not a project environment, and
       # two runs sharing one would corrupt it. --locked proves the environment
@@ -479,17 +522,3 @@ jobs:
           git diff --exit-code -- \
             ':(glob)**/Cargo.toml' ':(glob)**/Cargo.lock' \
             ':(glob)**/pyproject.toml' ':(glob)**/uv.lock'
-
-      # Reclaim the per-run daemon, its data root and the virtualenvs, so none
-      # of them survives into the next run on this runner. The environments
-      # alone are several gigabytes once lerobot has pulled torch in. Runs even
-      # when a test step failed.
-      - name: Stop the daemon and reclaim what the run allocated
-        if: always()
-        run: |
-          state="${PEPPY_HOME:-}/daemon_state.json5"
-          if [ -n "${PEPPY_HOME:-}" ] && [ -f "$state" ]; then
-            pid=$(sed -n 's/.*daemon_pid: *\([0-9]*\),.*/\1/p' "$state")
-            if [ -n "$pid" ]; then kill "$pid" 2>/dev/null || true; fi
-          fi
-          rm -rf "$RUNNER_TEMP/peppy-home" "$RUNNER_TEMP/uv-environments"
