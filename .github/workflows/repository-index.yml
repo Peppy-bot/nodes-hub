@@ -19,9 +19,9 @@ concurrency:
 
 jobs:
   check-index:
-    runs-on: self-hosted
-    # The runners are shared, so a step that hangs holds one hostage. Nothing
-    # here legitimately takes minutes.
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    # Nothing here legitimately takes minutes; a hung step should fail fast
+    # rather than hold a runner for the default six hours.
     timeout-minutes: 15
     permissions:
       contents: read
@@ -36,9 +36,9 @@ jobs:
 
       # Installed under RUNNER_TEMP rather than through scripts/install.sh:
       # `peppy repo index` needs no daemon, no container runtime and no root,
-      # and the self-hosted runners are reused, so this run must not touch a
-      # shared ~/.peppy. Set the PEPPY_VERSION repository variable to pin a
-      # release; it defaults to the latest.
+      # so one binary in the job's own temp dir is all this run wants. Set the
+      # PEPPY_VERSION repository variable to pin a release; it defaults to the
+      # latest.
       #
       # PEPPY_VERSION reaches the script through the environment rather than a
       # `${{ }}` expansion, so its value is data the shell reads instead of
@@ -77,8 +77,9 @@ jobs:
           chmod +x "$dest/bin/peppy"
           echo "$dest/bin" >> "$GITHUB_PATH"
 
-      # PEPPY_HOME is per-run for the same reason: every peppy invocation builds
-      # its app context before dispatching, and the runners are shared.
+      # PEPPY_HOME is set for the same reason: every peppy invocation builds
+      # its app context before dispatching, and it belongs in the job's own
+      # temp dir rather than a ~/.peppy nothing here asked for.
       - name: Check peppy_repository.json5 matches the repository
         run: |
           export PEPPY_HOME="$RUNNER_TEMP/peppy-home"
