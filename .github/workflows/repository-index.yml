@@ -19,7 +19,7 @@ concurrency:
 
 jobs:
   check-index:
-    runs-on: self-hosted
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     # The runners are shared, so a step that hangs holds one hostage. Nothing
     # here legitimately takes minutes.
     timeout-minutes: 15

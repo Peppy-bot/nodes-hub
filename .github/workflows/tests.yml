@@ -31,6 +31,13 @@ env:
 jobs:
   discover-and-run:
     name: Every Rust and Python test the change reaches
+    # Stays self-hosted while the rest of this repository's CI moves to
+    # Blacksmith: this job needs two things only a reused machine has. The
+    # daemon boots against the apptainer install `peppy container setup`
+    # blesses once per machine, and the caches named below (container images,
+    # cargo registries, per-crate target dirs, uv's downloads) live on the host
+    # so a warm run is minutes rather than the better part of an hour an
+    # ephemeral runner would spend rebuilding all of it.
     runs-on: self-hosted
     # A cold run compiles nine crates' full dependency trees and resolves
     # lerobot's, torch included. The caches below keep warm runs far under
