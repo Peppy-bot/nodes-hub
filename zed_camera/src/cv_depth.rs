@@ -196,6 +196,10 @@ impl CvDepth {
 
     /// Rectify + match one side-by-side YUYV frame. `left_rgb` is
     /// eye_width*eye_height*3; `depth_mm` matches `out_size()`.
+    ///
+    /// A buffer that is not that size is refused rather than asserted: `yuyv`
+    /// carries whatever the V4L2 driver handed the caller, and a short frame
+    /// on the capture path must degrade to a dropped frame, not an unwind.
     pub fn process(
         &mut self,
         yuyv: &[u8],
@@ -203,8 +207,10 @@ impl CvDepth {
         depth_mm: &mut [u16],
     ) -> Result<(), String> {
         let (w, h) = (self.eye_width, self.eye_height);
-        assert_eq!(yuyv.len(), (2 * w * h * 2) as usize);
-        assert_eq!(left_rgb.len(), (w * h * 3) as usize);
+        let (dw, dh) = (w / self.downscale, h / self.downscale);
+        require_len("yuyv", yuyv.len(), (2 * w * h * 2) as usize)?;
+        require_len("left_rgb", left_rgb.len(), (w * h * 3) as usize)?;
+        require_len("depth_mm", depth_mm.len(), (dw * dh) as usize)?;
 
         // Side-by-side YUYV -> full BGR -> per-eye views.
         let yuyv_mat = Mat::from_slice(yuyv)
@@ -257,8 +263,12 @@ impl CvDepth {
             .map_err(cv)?;
 
         // depth_mm = (fx / downscale) * baseline_mm * 16 / disparity16.
-        let (dw, dh) = (w / self.downscale, h / self.downscale);
+        // The matcher's output is the one length not fixed by the caller, and
+        // zip would silently stop at the shorter side: with the output buffer
+        // reused across frames, a short disparity map would leave the tail
+        // holding the previous frame's depth, published as current.
         let disp = disparity16.data_typed::<i16>().map_err(cv)?;
+        require_len("disparity", disp.len(), depth_mm.len())?;
         for (out, &d) in depth_mm.iter_mut().zip(disp.iter()) {
             *out = 0;
             if d > 0 {
@@ -268,13 +278,21 @@ impl CvDepth {
                 }
             }
         }
-        debug_assert_eq!(depth_mm.len(), (dw * dh) as usize);
         Ok(())
     }
 }
 
 fn cv(e: opencv::Error) -> String {
     format!("opencv: {e}")
+}
+
+/// Refuse a frame buffer that is not the length the geometry calls for, naming
+/// the buffer and both lengths so the log identifies the mismatch. Lengths are
+/// element counts, which differ between the u8 and u16 buffers.
+fn require_len(what: &str, got: usize, want: usize) -> Result<(), String> {
+    (got == want)
+        .then_some(())
+        .ok_or_else(|| format!("{what} length is {got}, expected {want}"))
 }
 
 fn matrix_3x3(fx: f64, cx: f64, fy: f64, cy: f64) -> Result<Mat, String> {
