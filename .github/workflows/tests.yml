@@ -5,9 +5,11 @@ name: Tests
 # test file starts running in CI on the pull request that adds it, and a pull
 # request runs only the nodes its diff touches: nineteen nodes' suites are too
 # expensive to rerun for a one-node change. A change outside every node (this
-# workflow, the repository index, a grouping folder's Readme, ...) and every
-# push to main still run the full suite, so anything a scoped run could miss is
-# caught on the integration branch.
+# workflow, the repository index, ...) and every push to main still run the
+# full suite, so anything a scoped run could miss is caught on the integration
+# branch. Documentation is the one exception: a Markdown file outside every
+# node, a grouping folder's Readme say, is built and tested by nothing, so it
+# selects nothing and triggers nothing.
 #
 # Every node depends on generated code (its gitignored `.peppy/libs`) that only
 # a running peppy daemon can produce, since `peppy node sync` calls the daemon's
@@ -97,8 +99,10 @@ jobs:
       # while the folders grouping interchangeable nodes are not. On a pull
       # request only the projects the diff touches are selected; a file changed
       # outside every project falls back to the full suite, because nothing
-      # narrower can be proven safe for it. Every skipped crate is named in the
-      # run summary, so a scoped run never silently reads as full coverage.
+      # narrower can be proven safe for it — except a Markdown file, which
+      # nothing builds or tests, so it is skipped rather than escalated. Every
+      # skipped crate is named in the run summary, so a scoped run never
+      # silently reads as full coverage.
       - name: Discover the tests this change reaches
         id: discover
         # Byte collation throughout: under a UTF-8 locale the runner's sort
@@ -151,13 +155,19 @@ jobs:
               scope="the projects this pull request touches"
               while IFS= read -r file; do
                 project=$(owning_project "$file" "$RUNNER_TEMP/projects.txt")
-                if [ -z "$project" ]; then
+                if [ -n "$project" ]; then
+                  echo "$project" >> "$RUNNER_TEMP/selected-projects.txt"
+                elif [[ "${file,,}" == *.md ]]; then
+                  continue
+                else
                   run_all=true
                   scope="the full suite ($file is outside every project)"
                   break
                 fi
-                echo "$project" >> "$RUNNER_TEMP/selected-projects.txt"
               done <<< "$changed"
+              if [ "$run_all" = false ] && [ ! -s "$RUNNER_TEMP/selected-projects.txt" ]; then
+                scope="nothing: this pull request changes only documentation outside every project"
+              fi
             else
               echo "could not diff against the pull request base; running the full suite" >&2
             fi
