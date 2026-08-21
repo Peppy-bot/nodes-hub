@@ -64,6 +64,31 @@ fn depth_unit_is_valid(depth_unit: f32) -> bool {
     depth_unit.is_finite() && depth_unit > 0.0
 }
 
+/// Logs the first error of a run and suppresses the rest until something
+/// succeeds, then waits out the backoff. A loop whose only outcome is an error
+/// retries at the backoff interval, so without this it writes ten lines a
+/// second for the life of the node.
+#[derive(Default)]
+struct RepeatedError {
+    reported: bool,
+}
+
+impl RepeatedError {
+    /// Reports one failure, then backs off before the caller retries.
+    async fn report(&mut self, what: &str, error: impl std::fmt::Display) {
+        if !self.reported {
+            self.reported = true;
+            error!("{what} failing, suppressing repeats: {error}");
+        }
+        tokio::time::sleep(RECEIVE_ERROR_BACKOFF).await;
+    }
+
+    /// Ends the run, so the next failure is reported again.
+    fn clear(&mut self) {
+        self.reported = false;
+    }
+}
+
 /// Forward one engine stream to its contract twin; color and depth legs are
 /// the same conversation over different topics.
 macro_rules! relay_stream {
@@ -80,6 +105,7 @@ macro_rules! relay_stream {
             let mut failing = false;
             let mut dropping = false;
             let mut first = true;
+            let mut receive_errors = RepeatedError::default();
             loop {
                 let received = tokio::select! {
                     _ = token.cancelled() => return,
@@ -89,11 +115,13 @@ macro_rules! relay_stream {
                     Ok(Some((_, msg))) => msg,
                     Ok(None) => return,
                     Err(e) => {
-                        error!(concat!("engine ", $label, " receive: {}"), e);
-                        tokio::time::sleep(RECEIVE_ERROR_BACKOFF).await;
+                        receive_errors
+                            .report(concat!("engine ", $label, " receive"), e)
+                            .await;
                         continue;
                     }
                 };
+                receive_errors.clear();
                 if !timestamp_is_valid(msg.header.timestamp) {
                     if !dropping {
                         dropping = true;
@@ -160,6 +188,7 @@ async fn track_stream_info(
         Err(e) => return error!("engine stream_info subscribe: {e}"),
     };
     let mut rejecting = false;
+    let mut receive_errors = RepeatedError::default();
     loop {
         let received = tokio::select! {
             _ = token.cancelled() => return,
@@ -193,8 +222,7 @@ async fn track_stream_info(
             }
             Ok(None) => return,
             Err(e) => {
-                error!("engine stream_info receive: {e}");
-                tokio::time::sleep(RECEIVE_ERROR_BACKOFF).await;
+                receive_errors.report("engine stream_info receive", e).await;
             }
         }
     }
@@ -207,6 +235,7 @@ macro_rules! spawn_info_service {
         let description = $description.clone();
         tokio::spawn(async move {
             let cancel = runner.cancellation_token().clone();
+            let mut service_errors = RepeatedError::default();
             loop {
                 let result = tokio::select! {
                     _ = cancel.cancelled() => break,
@@ -218,9 +247,9 @@ macro_rules! spawn_info_service {
                         Ok($respond(d))
                     }) => result,
                 };
-                if let Err(e) = result {
-                    error!(concat!(stringify!($service), ": {}"), e);
-                    tokio::time::sleep(RECEIVE_ERROR_BACKOFF).await;
+                match result {
+                    Ok(()) => service_errors.clear(),
+                    Err(e) => service_errors.report(stringify!($service), e).await,
                 }
             }
         });
@@ -233,6 +262,7 @@ macro_rules! spawn_refusing_control {
         let runner = $runner.clone();
         tokio::spawn(async move {
             let cancel = runner.cancellation_token().clone();
+            let mut service_errors = RepeatedError::default();
             loop {
                 let result = tokio::select! {
                     _ = cancel.cancelled() => break,
@@ -244,9 +274,9 @@ macro_rules! spawn_refusing_control {
                         ))
                     }) => result,
                 };
-                if let Err(e) = result {
-                    error!(concat!(stringify!($service), ": {}"), e);
-                    tokio::time::sleep(RECEIVE_ERROR_BACKOFF).await;
+                match result {
+                    Ok(()) => service_errors.clear(),
+                    Err(e) => service_errors.report(stringify!($service), e).await,
                 }
             }
         });
