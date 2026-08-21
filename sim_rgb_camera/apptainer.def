@@ -1,0 +1,20 @@
+Bootstrap: docker
+From: tuatini/peppy-rust-cargo-base:latest
+
+%labels
+    Name sim-rgb-camera
+    Version v1
+
+%files
+    . /opt/sim_rgb_camera
+
+%post
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+
+    cd /opt/sim_rgb_camera
+    cargo build --release
+
+%runscript
+    cd /opt/sim_rgb_camera
+    exec ./target/release/sim_rgb_camera "$@"

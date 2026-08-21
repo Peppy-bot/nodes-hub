@@ -1,0 +1,18 @@
+[package]
+name = "sim_rgbd_camera"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+peppygen = { path = ".peppy/libs/peppygen" }
+peppylib = { path = ".peppy/libs/peppylib" }
+
+[[bin]]
+name = "sim_rgbd_camera"
+path = "src/main.rs"
+
+[dev-dependencies]
+peppygen = { path = ".peppy/libs/peppygen", features = ["testing"] }
