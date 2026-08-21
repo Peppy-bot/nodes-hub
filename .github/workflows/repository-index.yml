@@ -77,7 +77,14 @@ jobs:
           chmod +x "$dest/bin/peppy"
           echo "$dest/bin" >> "$GITHUB_PATH"
 
-      # PEPPY_HOME is set for the same reason: every peppy invocation builds
+          # The binary answers `--version` before building any app context,
+          # so no PEPPY_HOME is needed here. `latest` resolves to a different
+          # release over time, so the log and the run summary both record
+          # which release this run actually executed.
+          installed="Installed $("$dest/bin/peppy" --version) (channel: $channel)"
+          printf '\n%s\n' "$installed" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # PEPPY_HOME is set for the same reason: every peppy command builds
       # its app context before dispatching, and it belongs in the job's own
       # temp dir rather than a ~/.peppy nothing here asked for.
       - name: Check peppy_repository.json5 matches the repository

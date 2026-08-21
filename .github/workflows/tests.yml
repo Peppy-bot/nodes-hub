@@ -298,6 +298,13 @@ jobs:
           chmod +x "$dest/bin/peppy"
           echo "$dest/bin" >> "$GITHUB_PATH"
 
+          # The binary answers `--version` before building any app context,
+          # so no PEPPY_HOME is needed here. `latest` resolves to a different
+          # release over time, so the log and the run summary both record
+          # which release this run actually executed.
+          installed="Installed $("$dest/bin/peppy" --version) (channel: $channel)"
+          printf '\n%s\n' "$installed" | tee -a "$GITHUB_STEP_SUMMARY"
+
       # The daemon refuses to boot unless the apptainer install it resolves
       # is ready for unprivileged use: `newuidmap` on PATH, and on a kernel
       # that restricts unprivileged user namespaces through AppArmor (Ubuntu
