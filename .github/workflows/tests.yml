@@ -411,10 +411,10 @@ jobs:
       #
       # Resolution runs in the crate's own image, the one the step below is
       # about to build it in, because which versions satisfy a manifest is a
-      # question about the toolchain resolving it: two of these nodes build on
-      # a different base image, and a verdict reached under a rustc nothing
-      # here runs is a verdict about a build nothing here runs. Every image is
-      # cached by the time that step reaches it, so none is built twice.
+      # question about the toolchain resolving it: a def is free to prepare
+      # one of its own, and a verdict reached under a rustc nothing here runs
+      # is a verdict about a build nothing here runs. Every image is cached by
+      # the time that step reaches it, so none is built twice.
       #
       # uv reports this same drift by naming the lockfile and the command that
       # fixes it, so nothing here translates for it, and one

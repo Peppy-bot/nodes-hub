@@ -1,5 +1,5 @@
 Bootstrap: docker
-From: tuatini/peppy-rust-cargo-base:latest
+From: peppybot/rust-cargo-base:latest
 
 %labels
     Name sim-rgbd-camera
