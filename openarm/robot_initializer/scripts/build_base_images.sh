@@ -175,8 +175,8 @@ sync_def_from() {
     echo "    $(basename "$(dirname "${def_file}")")/apptainer.def -> ${image}"
 }
 echo "==> Syncing sim node apptainer.def From: tags..."
-sync_def_from "${NODES_DIR}/openarm_sim_isaac/apptainer.def" "${ISAAC_IMAGE}"
-sync_def_from "${NODES_DIR}/openarm_sim_mujoco/apptainer.def" "${MUJOCO_IMAGE}"
+sync_def_from "${NODES_DIR}/sim_isaac/apptainer.def" "${ISAAC_IMAGE}"
+sync_def_from "${NODES_DIR}/sim_mujoco/apptainer.def" "${MUJOCO_IMAGE}"
 
 echo "==> Done."
 echo "    Pushed and synced:"
@@ -185,5 +185,5 @@ echo "      ${MUJOCO_IMAGE}   (${MUJOCO_PLATFORMS})"
 echo "    Commit the updated apptainer.def files, then restage + rebuild each sim"
 echo "    node. A bare 'peppy node build' reuses the snapshot staged by the last"
 echo "    'peppy node add', which predates the From: restamp above:"
-echo "      (cd \"${NODES_DIR}/openarm_sim_mujoco\" && peppy node add . -sb)"
-echo "      (cd \"${NODES_DIR}/openarm_sim_isaac\" && peppy node add . -sb)"
+echo "      (cd \"${NODES_DIR}/sim_mujoco\" && peppy node add . -sb)"
+echo "      (cd \"${NODES_DIR}/sim_isaac\" && peppy node add . -sb)"

@@ -1,10 +1,7 @@
 """Tests for the camera plumbing: config parsing, slot validation, z16
 conversion, and pacing. Pure python against camera_common; no engine import.
 
-Run inside a base image carrying numpy and pyjson5, e.g.
-
-    docker run --rm -v <openarm-nodes>:/repo peppybot/openarm-mujoco-sim:3.10.0-20 \\
-      bash -c "pip install -q pytest && cd /repo/<engine-node> && python3 -m pytest tests/"
+Run them from this directory with `uv run pytest`.
 """
 
 import struct

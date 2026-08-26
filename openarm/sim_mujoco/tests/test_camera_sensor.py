@@ -9,7 +9,6 @@ import logging
 import struct
 import sys
 import threading
-import time
 from pathlib import Path
 
 import mujoco
@@ -23,6 +22,7 @@ sys.path.insert(0, str(_ROBOT_DIR / "exts"))
 import camera_sensor
 from camera_common import CameraConfig, DepthSpec
 from camera_sensor import (
+    _HEARTBEAT_TIMEOUT_S,
     _LATE_REPORT_PERIOD_S,
     MujocoCameraSensor,
     _PoseSnapshot,
@@ -34,9 +34,6 @@ _WELDED_LINK = "openarm_body_link0"
 _COLOR = (8, 4)  # width, height
 _DEPTH = (4, 2)
 _FPS = 10
-# Heartbeat bound this suite patches in, small enough that waiting it out costs
-# a fraction of a second rather than the module's real five.
-_PATCHED_HEARTBEAT_S = 0.2
 
 
 @pytest.fixture(name="scene")
@@ -548,7 +545,7 @@ def test_background_depth_publishes_as_invalid(scene, clock):
     assert set(struct.unpack(f"<{_DEPTH[0] * _DEPTH[1]}H", payload)) == {0}
 
 
-def test_a_wedged_renderer_surfaces_on_the_physics_thread(scene, monkeypatch):
+def test_a_wedged_renderer_surfaces_on_the_physics_thread(scene, monkeypatch, clock):
     """A renderer that blocks raises nothing, so only the heartbeat catches it."""
     model = compile_model_with_cameras(scene, [color_camera()])
     sensor = MujocoCameraSensor(model, [color_camera()], FakeIO())
@@ -562,14 +559,15 @@ def test_a_wedged_renderer_surfaces_on_the_physics_thread(scene, monkeypatch):
             return super().render()
 
     monkeypatch.setattr(mujoco, "Renderer", lambda _model, h, w: WedgedRenderer(h, w))
-    # Patch the bound the sensor reads and sleep that same value: sleeping the
-    # module's real 5s bound would pass while making the patch pointless.
-    monkeypatch.setattr(camera_sensor, "_HEARTBEAT_TIMEOUT_S", _PATCHED_HEARTBEAT_S)
     try:
         sensor.snapshot(np.zeros(model.nq))
         sensor.start()
+        # The thread takes its beat at the top of the iteration that then
+        # blocks inside render(), so the renderer reaching WedgedRenderer is
+        # the point after which no further beat can land, whatever the host
+        # does next. Aging the clock past the bound from there is the wedge.
         assert wedged.wait(timeout=5.0)
-        time.sleep(_PATCHED_HEARTBEAT_S * 2)
+        clock.set(_HEARTBEAT_TIMEOUT_S + 1.0)
         with pytest.raises(RuntimeError, match="stopped responding"):
             sensor.raise_if_failed()
     finally:
@@ -617,7 +615,7 @@ def test_stop_closes_every_renderer_it_opened(scene, monkeypatch):
 
 
 def test_stop_clears_the_heartbeat_so_shutdown_is_not_a_wedged_renderer(
-    scene, monkeypatch
+    scene, monkeypatch, clock
 ):
     """A stopped thread stops beating on purpose. If stop() left the last beat
     behind, any raise_if_failed() more than the bound after a deliberate stop
@@ -625,12 +623,11 @@ def test_stop_clears_the_heartbeat_so_shutdown_is_not_a_wedged_renderer(
     step, so an orderly shutdown would surface as a renderer fault."""
     model = compile_model_with_cameras(scene, [color_camera()])
     monkeypatch.setattr(mujoco, "Renderer", lambda _model, h, w: FakeRenderer(h, w))
-    monkeypatch.setattr(camera_sensor, "_HEARTBEAT_TIMEOUT_S", _PATCHED_HEARTBEAT_S)
     sensor = MujocoCameraSensor(model, [color_camera()], FakeIO())
     sensor.snapshot(np.zeros(model.nq))
     sensor.start()
     sensor.stop()
 
     # Well past the bound a beating thread would have to meet.
-    time.sleep(_PATCHED_HEARTBEAT_S * 2)
+    clock.set(_HEARTBEAT_TIMEOUT_S * 2)
     sensor.raise_if_failed()

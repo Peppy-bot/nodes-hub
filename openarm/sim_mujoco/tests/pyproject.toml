@@ -1,0 +1,32 @@
+# The camera suites are their own uv project rather than part of the node
+# above them. The node manages nothing through uv: its python runs on the
+# interpreter its image ships, against the dependencies baked into that image.
+#
+# CI runs a python test project inside the image built from the apptainer.def
+# beside it, and gives a project with no def the scaffolded python base image.
+# There is no def here, which is what these suites want: they render nothing,
+# so a mujoco wheel and a compiled MJCF are the whole of what they need from
+# the engine.
+[project]
+name = "openarm-sim-mujoco-tests"
+version = "0.1.0"
+description = "Tests for the openarm_sim_mujoco camera plumbing"
+# The interpreter the node's base image is built on
+# (robot_initializer/scripts/Dockerfile.mujoco: python:3.11-slim).
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    # The versions the node's base image installs
+    # (robot_initializer/scripts/requirements.mujoco.txt), so the scene these
+    # suites compile is compiled by the mujoco the node runs on.
+    "mujoco==3.10.0",
+    "numpy==2.4.4",
+    "pyjson5==2.0.0",
+]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.uv]
+# The suites reach the node's modules through sys.path, so this project has
+# nothing importable of its own and no wheel to build.
+package = false
