@@ -120,15 +120,46 @@ class HandSource:
     """Everything the panel reads for one hand, in display order.
 
     Carried together so a hand cannot be described from another hand's clutch,
-    and so an unbound arm is a state rather than a silent wait. arm_paired is
-    read live each snapshot: at setup time the daemon may still be
-    establishing the launcher's pairs, so a boot-time read races.
+    and so an unbound arm is a state rather than a silent wait. The paired
+    callables are read live each snapshot: at setup time the daemon may still
+    be establishing the launcher's pairs, so a boot-time read races.
     """
 
     handedness: str
     clutch: HandClutch
     measured: LatestPose
     arm_paired: Callable[[], bool]
+    gripper_paired: Callable[[], bool]
+
+    def bound(self) -> HandBinding:
+        """This tick's view of what listens to the hand. Read once and
+        carried, because the paired callables go live to the daemon and a
+        second read could describe a row the filter would not have admitted."""
+        return HandBinding(
+            hand=self, arm=self.arm_paired(), gripper=self.gripper_paired()
+        )
+
+
+@dataclass(frozen=True)
+class HandBinding:
+    """One hand with the pairing state read for this snapshot."""
+
+    hand: HandSource
+    arm: bool
+    gripper: bool
+
+    @property
+    def wired(self) -> bool:
+        """Whether anything downstream listens. A side with a gripper but no
+        pose_link still grips, so either slot counts."""
+        return self.arm or self.gripper
+
+    def label(self, *, lone: bool) -> str:
+        """The row's name. A single wired hand is the robot's one limb, so it
+        drops the handedness and says which slot it actually drives."""
+        if not lone:
+            return self.hand.handedness.upper()
+        return "ARM" if self.arm else "GRIPPER"
 
 
 @dataclass(frozen=True)
@@ -204,21 +235,26 @@ def hand_line(
     label: str,
     *,
     arm_bound: bool,
+    gripper_bound: bool,
     tracked: bool,
     squeezing: bool,
     follower_fresh: bool,
     engaged: bool,
 ) -> Row:
     """Read one hand's row off the same conditions the clutch gates on, in the
-    order the operator hits them: a bound arm, a controller, a grip, a
+    order the operator hits them: a bound slot, a controller, a grip, a
     follower, a snapshot. The earliest unmet one is what to fix.
     """
-    if not arm_bound:
-        return Row(label, "no arm bound", _RESTING)
+    if not arm_bound and not gripper_bound:
+        return Row(label, "nothing bound", _RESTING)
     if not tracked:
         return Row(label, "no controller", _RESTING)
     if not squeezing:
         return Row(label, "grip released", _RESTING)
+    if not arm_bound:
+        # A gripper-only hand's grip is the whole story: no pose to anchor,
+        # so the clutch's follower and engagement gates do not apply.
+        return Row(label, "gripping", _DRIVING)
     if not follower_fresh:
         return Row(label, "waiting for arm", _WAITING)
     if not engaged:
@@ -268,13 +304,20 @@ def snapshot(
 ) -> PanelState:
     """This tick's panel content, read from the sources the streams read."""
     frame = fresh_frame(session, stale_timeout_s)
+    # Only hands something listens to get a row; with nothing wired at all,
+    # every hand shows so a misconfigured stack says why nothing drives.
+    bound = [hand.bound() for hand in hands]
+    wired = [binding for binding in bound if binding.wired]
+    shown = wired if wired else bound
     rows = []
-    for hand in hands:
+    for binding in shown:
+        hand = binding.hand
         sample = frame.hand(hand.handedness) if frame else None
         rows.append(
             hand_line(
-                hand.handedness.upper(),
-                arm_bound=hand.arm_paired(),
+                binding.label(lone=len(wired) == 1),
+                arm_bound=binding.arm,
+                gripper_bound=binding.gripper,
                 tracked=sample is not None,
                 squeezing=bool(sample and sample.squeezing),
                 follower_fresh=hand.measured.fresh(stale_timeout_s) is not None,
