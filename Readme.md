@@ -104,3 +104,22 @@ lockfiles must be committed current; CI supplies pytest, and a node needs no tes
 its own to be covered. CI runs `peppy node sync` before the tests and fails if it rewrites a manifest,
 which means the repository lags the peppy release CI installs: run the sync locally and commit the
 result.
+
+## Relocking against a peppy release
+
+The `peppylib` and `peppygen` a node builds against are generated into its gitignored `.peppy/libs`
+by the peppy release installed on the machine, and both are path dependencies, so what they require
+is an input to resolution. A release that changes those requirements leaves every lockfile in the
+repository stale at once, whichever node the release touched. CI checks this before it builds
+anything and names the release and every crate involved.
+
+The fix is one command, run against the same release, with a daemon up and this checkout registered
+as a repository (`peppy repo add .`):
+
+```sh
+scripts/relock.sh
+```
+
+It syncs every node that locks something, refreshes each `Cargo.lock` and `uv.lock` against the
+interfaces it just generated, and prints what to commit. Only what the manifests now demand moves:
+every version the committed lockfile still satisfies stays where it is.
