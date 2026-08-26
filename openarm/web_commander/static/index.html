@@ -1,0 +1,1496 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>OpenArm Commander</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@600;700&family=Inter+Tight:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg-soft: #edeff2;
+    --card: #e8eaed;
+    --ink: #1a1d22;
+    --ink-70: rgba(26, 29, 34, 0.72);
+    --ink-50: rgba(26, 29, 34, 0.5);
+    --ink-15: rgba(26, 29, 34, 0.13);
+    --hi: rgba(255, 255, 255, 0.95);
+    --lo: rgba(158, 166, 178, 0.5);
+    --dead: #b4bac4;
+    --dark: #0b0c0e;
+    --w: #f3f5f8;
+    --ok: #2e7d4f;
+    --warn: #a8741f;
+    --err: #9b3535;
+    /* Severity scale, indexed by the wire level (0 nominal .. 4 not
+       reporting, purple: an unheard motor outranks a fault). */
+    --sev0: var(--ok);
+    --sev1: var(--warn);
+    --sev2: #e67e22;
+    --sev3: var(--err);
+    --sev4: #8e44ad;
+  }
+  /* Elements carry data-sev, which resolves --sev for the classes below;
+     the script only sets classes and data-sev, never inline colors. */
+  [data-sev="0"] { --sev: var(--sev0); }
+  [data-sev="1"] { --sev: var(--sev1); }
+  [data-sev="2"] { --sev: var(--sev2); }
+  [data-sev="3"] { --sev: var(--sev3); }
+  [data-sev="4"] { --sev: var(--sev4); }
+  .sev-text { color: var(--sev); }
+  .sev-fill { background: var(--sev); color: var(--w); }
+  .dim { color: var(--ink-50); }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 28px 32px 36px;
+    background: linear-gradient(165deg, #fcfcfd 0%, #eceef1 42%, #dadde2 100%) fixed;
+    color: var(--ink);
+    font: 14px/1.45 'Inter Tight', -apple-system, system-ui, sans-serif;
+  }
+  h1 {
+    font-family: 'Big Shoulders Display', 'Inter Tight', sans-serif;
+    font-size: 26px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase;
+    margin: 0 0 20px; display: flex; align-items: baseline; gap: 14px;
+  }
+  .conn {
+    font: 600 11px/1 'Inter Tight', sans-serif; letter-spacing: 0.08em; text-transform: uppercase;
+    padding: 5px 12px; border-radius: 999px; color: var(--w);
+    background: var(--ink-50);
+    box-shadow: inset 1px 1px 3px rgba(0,0,0,0.25);
+  }
+  .conn.open { background: var(--ok); }
+  .conn.closed { background: var(--err); }
+
+  .row { display: flex; gap: 22px; margin-bottom: 22px; flex-wrap: wrap; }
+  .panel {
+    flex: 1; min-width: 380px;
+    background: var(--card);
+    border-radius: 18px; padding: 18px 20px 16px;
+    box-shadow: -6px -6px 12px var(--hi), 6px 6px 14px var(--lo);
+  }
+  .panel-head {
+    display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;
+  }
+  .panel-head span:first-child {
+    font-family: 'Big Shoulders Display', 'Inter Tight', sans-serif;
+    font-size: 17px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase;
+    color: var(--ink-70);
+  }
+  .badge {
+    font: 600 10px/1 'Inter Tight', sans-serif; letter-spacing: 0.08em; text-transform: uppercase;
+    padding: 5px 11px; border-radius: 999px; color: var(--ink-50);
+    background: var(--bg-soft);
+    box-shadow: inset 2px 2px 4px var(--lo), inset -2px -2px 4px var(--hi);
+  }
+  .badge.flight { color: var(--w); background: var(--warn); box-shadow: inset 1px 1px 3px rgba(0,0,0,0.25); }
+  .badge.stream { color: var(--w); background: var(--ok); box-shadow: inset 1px 1px 3px rgba(0,0,0,0.25); }
+  button.enabled { color: var(--w); background: var(--err); box-shadow: -3px -3px 7px var(--hi), 4px 4px 9px rgba(0,0,0,0.35); }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  .joint {
+    display: grid; grid-template-columns: 30px 1fr 66px 66px; gap: 10px;
+    align-items: center; margin: 7px 0; font-variant-numeric: tabular-nums;
+  }
+  .joint .name { color: var(--ink-50); font-weight: 600; font-size: 12px; }
+  .joint .target { text-align: right; font-weight: 500; }
+  .joint .fb, .gripper .fb { text-align: right; color: var(--ink-50); }
+
+  /* Slider + actual-position shadow overlay. The caret marks the measured value
+     on the same track as the commanded thumb, so a commanded/actual gap reads at
+     a glance. Inset by the thumb radius so 0% and 100% line up with the thumb. */
+  .srow { position: relative; display: flex; align-items: center; }
+  .ghost {
+    position: absolute; left: 10px; right: 10px; top: 50%; height: 8px;
+    transform: translateY(-50%); pointer-events: none; z-index: 2;
+  }
+  .ghost::after {
+    content: ''; position: absolute; top: -4px; width: 3px; height: 16px;
+    border-radius: 2px; background: var(--warn);
+    box-shadow: 0 0 0 1px var(--hi);
+    left: var(--at, 0%); transform: translateX(-50%); transition: left 0.08s linear;
+  }
+  .ghost.off::after { display: none; }
+
+  .gripper {
+    display: grid; grid-template-columns: 1fr 84px 130px; gap: 10px;
+    align-items: center; margin: 10px 0 4px; font-variant-numeric: tabular-nums;
+  }
+
+  /* Section labels: "pose · joints" over the joint sliders, "pose · world" over the
+     world-frame controls. The x/y/z rows reuse the joint slider layout above. */
+  .pose-head {
+    margin: 16px 0 8px; font: 600 11px/1 'Inter Tight', sans-serif;
+    letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-50);
+  }
+
+  /* World-orientation arcball: drag the sphere to aim the hand (spin about the in-plane
+     axes) and drag near the rim to roll about the view axis. The bright triad is the
+     target orientation, the faint one is measured; z (blue) is the gripper approach. */
+  .arcball { display: flex; flex-direction: column; align-items: center; gap: 5px; margin: 14px 0 2px; }
+  .arcball svg { width: 128px; height: 128px; touch-action: none; cursor: grab; }
+  .arcball svg:active { cursor: grabbing; }
+  .ab-rim { fill: var(--bg-soft); stroke: var(--lo); stroke-width: 2.5; }
+  .ab-t { stroke-width: 3.5; stroke-linecap: round; }
+  .ab-m { stroke-width: 2.5; stroke-linecap: round; }
+  .ab-x { stroke: #c0392b; }
+  .ab-y { stroke: #2e7d4f; }
+  .ab-z { stroke: #2c5aa0; }
+  .ab-knob { fill: #d8dbe0; stroke: var(--hi); stroke-width: 1; }
+  .ab-hint {
+    font: 600 10px/1 'Inter Tight', sans-serif; letter-spacing: 0.06em;
+    text-transform: uppercase; color: var(--ink-50);
+  }
+  /* The arcball takes no input in gestures mode, so its drag hint hides too. */
+  body.gestures-mode .ab-hint { display: none; }
+
+  /* Every track is full width on a shared axis; the ends outside the slider's
+     reachable [lo, hi] are painted dead-gray. set_reachable drives the stops,
+     placed on the thumb-center scale (10px inset, like the .ghost caret). */
+  input[type=range] {
+    -webkit-appearance: none; appearance: none;
+    width: 100%; height: 8px; border-radius: 999px; outline: none;
+    --lo-x: 0%; --hi-x: 100%;
+    background: linear-gradient(to right,
+      var(--dead) 0 var(--lo-x),
+      var(--bg-soft) var(--lo-x) var(--hi-x),
+      var(--dead) var(--hi-x) 100%);
+    box-shadow: inset 2px 2px 4px var(--lo), inset -2px -2px 4px var(--hi);
+  }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none;
+    width: 20px; height: 20px; border-radius: 50%; cursor: pointer;
+    background: radial-gradient(circle at 34% 28%, #ffffff 0%, #e4e7ec 45%, #c2c7cf 100%);
+    box-shadow: -2px -2px 5px var(--hi), 3px 3px 6px var(--lo), inset 0 0 0 1px var(--ink-15);
+  }
+  input[type=range]::-moz-range-thumb {
+    width: 20px; height: 20px; border: none; border-radius: 50%; cursor: pointer;
+    background: radial-gradient(circle at 34% 28%, #ffffff 0%, #e4e7ec 45%, #c2c7cf 100%);
+    box-shadow: -2px -2px 5px var(--hi), 3px 3px 6px var(--lo), inset 0 0 0 1px var(--ink-15);
+  }
+  /* Read-only track (the elbow slider in actions): drop the draggable thumb, leaving
+     just the track and the measured caret as a current-position indicator. */
+  input[type=range].readonly-track::-webkit-slider-thumb { opacity: 0; width: 0; cursor: default; }
+  input[type=range].readonly-track::-moz-range-thumb { opacity: 0; width: 0; cursor: default; }
+
+  .actions {
+    display: flex; gap: 10px; margin-top: 14px; justify-content: flex-end; align-items: center;
+  }
+  /* Slider column: the full-width track (with its actual-position caret) over the
+     limit readouts, each pinned under the gray boundary it marks. */
+  .scol { display: flex; flex-direction: column; gap: 3px; }
+  .lim {
+    position: relative; height: 10px;
+    font: 500 10px/1 'Inter Tight', sans-serif; font-variant-numeric: tabular-nums;
+    color: var(--ink-50);
+  }
+  .lim span { position: absolute; transform: translateX(-50%); white-space: nowrap; }
+
+  button {
+    font: 600 12px/1 'Inter Tight', sans-serif; letter-spacing: 0.05em; text-transform: uppercase;
+    color: var(--ink-70); cursor: pointer;
+    padding: 10px 16px; border: none; border-radius: 12px;
+    background: var(--card);
+    box-shadow: -3px -3px 7px var(--hi), 3px 3px 7px var(--lo);
+    transition: box-shadow 0.12s ease, transform 0.12s ease;
+  }
+  button:hover { color: var(--ink); }
+  button:active {
+    box-shadow: inset 2px 2px 5px var(--lo), inset -2px -2px 5px var(--hi);
+    transform: translateY(1px);
+  }
+  button.primary {
+    color: var(--w); background: var(--dark);
+    box-shadow: -3px -3px 7px var(--hi), 4px 4px 9px rgba(0, 0, 0, 0.35);
+  }
+  button.primary:active {
+    box-shadow: inset 2px 2px 6px rgba(0, 0, 0, 0.6);
+  }
+
+  /* Streaming | Actions segmented toggle. */
+  .modeseg {
+    display: inline-flex; padding: 4px; border-radius: 12px;
+    background: var(--bg-soft);
+    box-shadow: inset 2px 2px 4px var(--lo), inset -2px -2px 4px var(--hi);
+  }
+  .seg {
+    background: transparent; box-shadow: none; color: var(--ink-50);
+    padding: 8px 22px; border-radius: 9px;
+  }
+  .seg:hover { color: var(--ink-70); }
+  .seg:active { transform: none; box-shadow: none; }
+  .seg.on {
+    color: var(--ink); background: var(--card);
+    box-shadow: -2px -2px 5px var(--hi), 2px 2px 5px var(--lo);
+  }
+
+  .status {
+    padding: 13px 18px; border-radius: 14px;
+    background: var(--bg-soft);
+    box-shadow: inset 2px 2px 5px var(--lo), inset -2px -2px 5px var(--hi);
+    font: 12.5px/1.4 ui-monospace, 'SF Mono', Menlo, monospace;
+    color: var(--ink-70);
+  }
+
+  /* Health surfaces: the banner, the per-side chips, the alert lines, and
+     the Motors tab tables, all colored through the shared --sev scale. */
+  .health-banner {
+    text-align: center; font-weight: 700; padding: 8px 12px;
+    border-radius: 6px; margin-bottom: 12px;
+  }
+  .health-chip { font-weight: 600; padding: 2px 10px; border-radius: 4px; }
+  /* Critical and above (silence included) tints the chip background so it
+     reads at a walk-past glance. */
+  .health-chip:is([data-sev="2"], [data-sev="3"], [data-sev="4"]) { background: rgba(155, 53, 53, 0.12); }
+  .health-chip .dot { padding: 0 1px; }
+  .alert-line { font-weight: 600; padding: 2px 10px; border-radius: 4px; }
+  /* The Motors tab label tints at the overall worst level. */
+  #mode_motors[data-sev] { color: var(--sev); font-weight: 700; }
+  .motor-table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  .motor-table th, .motor-table td { text-align: right; padding: 3px 6px; border-top: 1px solid var(--ink-15); }
+  .motor-table thead th { border-top: none; font-size: 11px; color: var(--ink-50); font-weight: 500; }
+  .motor-table thead th.group { text-align: center; }
+  .motor-table tbody tr[data-sev] { color: var(--sev); }
+  .motors-note { color: var(--ink-50); padding: 8px 2px; }
+  /* A closed connection stops updating the tables; fade them rather than
+     let them read as current. */
+  .panel.stale { opacity: 0.45; }
+
+  #record_btn.recording { background:#c0392b; color:#fff; border-color:#c0392b; }
+  #record_btn.saving, #finish_btn.saving { background:#e67e22; color:#fff; border-color:#e67e22; animation: record_saving 1.1s ease-in-out infinite; }
+  @keyframes record_saving { 50% { opacity: 0.55; } }
+</style>
+</head>
+<body>
+  <h1>OpenArm Commander <span id="conn" class="conn closed">disconnected</span></h1>
+
+  <div id="health_banner" class="health-banner sev-fill" hidden></div>
+
+  <div class="row" style="justify-content:center; margin-bottom:20px;">
+    <div class="modeseg">
+      <button class="seg on" id="mode_streaming" onclick="set_ui_mode('streaming')">Streaming</button>
+      <button class="seg" id="mode_actions" onclick="set_ui_mode('actions')">Actions</button>
+      <button class="seg" id="mode_gestures" onclick="set_ui_mode('gestures')">Gestures</button>
+      <button class="seg" id="mode_motors" onclick="set_ui_mode('motors')">Motors</button>
+    </div>
+  </div>
+
+  <div class="row" id="motors_row" style="display:none;">
+    <div class="panel" id="left_motors"></div>
+    <div class="panel" id="right_motors"></div>
+  </div>
+
+  <div class="row" id="gesture_row" style="display:none; justify-content:center;">
+    <div class="panel" style="flex:0 1 720px;">
+      <div class="panel-head"><span>gesture library</span><span class="badge" id="gesture_badge">idle</span></div>
+      <div class="actions" id="gesture_buttons" style="justify-content:center; flex-wrap:wrap;"></div>
+      <div class="actions" style="justify-content:center;">
+        <button id="gesture_stop" onclick="stop_gesture()" disabled>Stop</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="row" id="arm_row">
+    <div class="panel" id="left_arm"></div>
+    <div class="panel" id="right_arm"></div>
+  </div>
+  <div class="row" id="gripper_row">
+    <div class="panel" id="left_gripper"></div>
+    <div class="panel" id="right_gripper"></div>
+  </div>
+  <div class="row" id="governor_row" style="justify-content:center; gap:18px; align-items:center; flex-wrap:wrap;">
+    <label style="display:flex; align-items:center; gap:8px;">
+      <input type="checkbox" id="collision_chk" onchange="set_collision(this.checked)" checked>
+      Collision avoidance
+    </label>
+    <span style="opacity:0.7; font-size:0.85em;" title="The barrier band, in force only while collision avoidance is on.">band</span>
+    <label style="display:flex; align-items:center; gap:6px;">
+      Stop d (m)
+      <input type="number" id="gov_d_stop" step="0.001" min="0.001" style="width:5.5em;" onchange="send_governor_params()">
+    </label>
+    <label style="display:flex; align-items:center; gap:6px;">
+      Safe d (m)
+      <input type="number" id="gov_d_safe" step="0.001" min="0.001" style="width:5.5em;" onchange="send_governor_params()">
+    </label>
+    <span style="opacity:0.5;">|</span>
+    <span style="opacity:0.7; font-size:0.85em;" title="Speed limits are applied on every tick whether or not collision avoidance is on. The toggle and the band above govern the collision barrier only.">always active</span>
+    <label style="display:flex; align-items:center; gap:6px;">
+      Max EE speed (m/s)
+      <input type="number" id="gov_max_ee" step="0.05" min="0.01" style="width:5.5em;" onchange="send_governor_params()">
+    </label>
+    <label style="display:flex; align-items:center; gap:6px;">
+      Gripper opening rate (/s)
+      <input type="number" id="gov_grip_rate" step="0.5" min="0.01" style="width:5.5em;" onchange="send_governor_params()">
+    </label>
+  </div>
+  <div class="row" id="record_row" style="display:none; justify-content:center; gap:10px; align-items:center;">
+    <input type="text" id="record_task" placeholder="task, e.g. pick up the cube" style="width:22em;">
+    <button id="record_btn" onclick="toggle_recording()">Record</button>
+    <button id="finish_btn" onclick="finish_session()">Finish session</button>
+    <span id="record_frames" style="font-weight:600;"></span>
+  </div>
+  <div class="row" id="proximity_row" style="justify-content:center;">
+    <div id="proximity" style="font-weight:600; padding:4px 10px; border-radius:4px;">closest pair: n/a</div>
+  </div>
+  <div class="row" style="justify-content:center; gap:18px;">
+    <div id="health_left" class="health-chip dim">left health: n/a</div>
+    <div id="health_right" class="health-chip dim">right health: n/a</div>
+  </div>
+  <div id="alerts" style="display:flex; flex-direction:column; align-items:center; gap:2px;"></div>
+  <div class="status" id="status">connecting…</div>
+
+<script>
+const PI = Math.PI;
+const ARM_DOF = 7;
+// Gripper axis is the unitless opening fraction: 0 closed, 1 fully open.
+const GRIPPER_MAX = 1;
+// Shared full-width axis for every angular track (joints and the elbow swivel):
+// +-200deg exactly spans the widest joint on both hardware generations, so all
+// rows align and the grayed ends mark each joint's own limits.
+const JOINT_AXIS = 200 * PI / 180;
+// World-frame position controls: x/y/z sliders bound to indices 0..2 of the arm view's
+// `pose`/`pose_feedback`. That pose is the gripper's grasp point (between the pads),
+// not the wrist it mounts on, so dialling an object's centre puts the pads around it.
+// Orientation (indices 3..5, euler) is not shown directly; the arcball composes it on
+// quaternions instead. Each slider's band comes from the snapshot's per-side
+// `pos_bounds`, applied each frame like the joint limits, so v1 and v2 both work. That
+// band is each axis's true limit with the other two at their best case, so a target
+// dialled inside it can still be refused by the backbone's IK: reaching a given x may
+// need a y and z the operator did not ask for.
+const POS_AXES = [
+  {i: 0, label: 'x'},
+  {i: 1, label: 'y'},
+  {i: 2, label: 'z'},
+];
+// Target end-effector orientation each side's arcball composes, in the camera frame
+// (see VQ): quaternion [x, y, z, w]. Snapshots sync it from the setpoint when not
+// composing; the drag updates it directly.
+const quatTargetCam = { left: [0, 0, 0, 1], right: [0, 0, 0, 1] };
+let arcballDrag = { side: null, p0: null, start: null, pid: null };
+// Interaction mode: 'streaming' follows controls live (deadman-gated); 'actions'
+// composes a target and fires it as a discrete backbone move on Execute;
+// 'gestures' plays baked choreography from the server's library while the
+// per-arm controls become read-only viewers.
+const UI_MODES = ['streaming', 'actions', 'gestures', 'motors'];
+// Motors is a read-only readout, so it replaces the control surfaces rather
+// than sitting alongside them; alerts and the health summary stay on screen
+// in every mode.
+const CONTROL_ROWS = ['arm_row', 'gripper_row', 'governor_row', 'proximity_row'];
+let uiMode = 'streaming';
+// Which sides the playing gesture holds (from the snapshot); those sides'
+// Enable/Execute controls are disabled everywhere while it plays.
+const gestureHeld = { left: false, right: false };
+// Last control space the operator touched per side; picks what Execute fires.
+const touched = { left: 'joints', right: 'joints' };
+let ws = null;
+let latestSnap = null;
+// One streaming deadman per side, shared by that side's arm and gripper.
+const enabled = { left: false, right: false };
+
+function fmt(x) { return (x >= 0 ? '+' : '') + x.toFixed(3); }
+// Angular readouts show degrees for legibility; the sliders, the wire, and the
+// kinematics stay in radians (so nothing on the control path changes units), and this
+// converts a radian value to a signed degree string at display time only.
+function fmtRadAsDeg(rad) { return (rad >= 0 ? '+' : '') + (rad * 180 / PI).toFixed(1) + '°'; }
+function $(id) { return document.getElementById(id); }
+
+// Mark one slider's reachable [lo, hi] on its full-width [axisMin, axisMax] track:
+// gray the ends outside the range (the --lo-x/--hi-x gradient stops), pin the limit
+// labels under the boundaries, and record the range for clamp_slider. Positions use
+// the thumb-center scale (10px thumb-radius inset), matching the .ghost caret.
+function set_reachable(id, lo, hi, axisMin, axisMax, fmtFn) {
+  const el = $(id);
+  el.dataset.lo = lo;
+  el.dataset.hi = hi;
+  const span = (axisMax - axisMin) || 1;
+  const at = v => `calc(10px + (100% - 20px) * ${((v - axisMin) / span).toFixed(4)})`;
+  el.style.setProperty('--lo-x', at(lo));
+  el.style.setProperty('--hi-x', at(hi));
+  for (const [labelId, v] of [[`${id}_lo`, lo], [`${id}_hi`, hi]]) {
+    const label = $(labelId);
+    label.style.left = at(v);
+    label.textContent = fmtFn(v);
+  }
+}
+
+// Keep the commanded thumb out of the grayed ends: snap the value back into the
+// slider's reachable [lo, hi] before anything reads or streams it. Assigning the
+// exact limit is not enough: browsers round assignments to the nearest step-grid
+// point (anchored at min), which can overshoot the limit by up to half a step, so
+// clamp to the outermost grid point inside the range instead.
+function clamp_slider(el) {
+  const lo = parseFloat(el.dataset.lo);
+  const hi = parseFloat(el.dataset.hi);
+  if (!Number.isFinite(lo) || !Number.isFinite(hi)) return;
+  const v = parseFloat(el.value);
+  if (v >= lo && v <= hi) return;
+  const min = parseFloat(el.min);
+  const step = parseFloat(el.step);
+  const steps = v > hi
+    ? Math.floor((hi - min) / step + 1e-6)
+    : Math.ceil((lo - min) / step - 1e-6);
+  el.value = min + steps * step;
+}
+
+// Place a slider's measured caret at v on its [axisMin, axisMax] track (the same
+// thumb-center scale set_reachable uses for the gradient stops and labels), or
+// hide it when nothing is measured or the axis is degenerate.
+function place_caret(id, v, axisMin, axisMax) {
+  const ghost = $(`${id}_ghost`);
+  if (v == null || !(axisMax > axisMin)) { ghost.classList.add('off'); return; }
+  const pct = Math.max(0, Math.min(1, (v - axisMin) / (axisMax - axisMin)));
+  ghost.style.setProperty('--at', (pct * 100) + '%');
+  ghost.classList.remove('off');
+}
+
+function build_arm(side, label) {
+  const root = $(`${side}_arm`);
+  root.innerHTML = `
+    <div class="panel-head"><span>${label}</span><span class="badge" id="${side}_arm_badge">idle</span></div>
+    <div class="pose-head">pose · joints</div>
+    <div id="${side}_arm_joints"></div>
+    <div class="pose-head">pose · world</div>
+    <div id="${side}_arm_pos"></div>
+    <div id="${side}_arm_psi"></div>
+    <div id="${side}_arm_orient"></div>
+    <div class="actions">
+      <label id="${side}_dur_l" style="display:none; align-items:center; gap:5px; margin-right:auto; text-transform:none; letter-spacing:0; font-size:11px; color:var(--ink-50);">
+        move (s)<input type="number" id="${side}_dur" value="2" min="0" step="0.5" style="width:3.8em;">
+      </label>
+      <button id="${side}_home_btn" style="display:none" onclick="reset_arm('${side}')">Home Pose</button>
+      <button id="${side}_ready_btn" style="display:none" onclick="ready_arm('${side}')">Ready Pose</button>
+      <button class="primary" id="${side}_arm_btn" onclick="primary_arm('${side}')">Enable</button>
+    </div>`;
+  const joints = $(`${side}_arm_joints`);
+  for (let i = 0; i < ARM_DOF; i++) {
+    joints.appendChild(slider_row(`${side}_j${i}`, `j${i+1}`, -JOINT_AXIS, JOINT_AXIS, 0.01,
+      `on_joint_input('${side}', ${i})`));
+  }
+  const pos = $(`${side}_arm_pos`);
+  for (const ax of POS_AXES) {
+    // Placeholder axis; apply_snapshot sets the cross-side world axis and each
+    // axis's reachable band from pos_bounds.
+    pos.appendChild(slider_row(`${side}_p${ax.i}`, ax.label, -1, 1.2, 0.002,
+      `on_pose_input('${side}', 'position', ${ax.i})`));
+  }
+  $(`${side}_arm_orient`).appendChild(arcball_widget(side));
+  // Elbow (arm-angle) slider: swivels the elbow through the null space, holding the
+  // hand pose. Streaming-only (the backbone plans the elbow for actions-mode moves).
+  $(`${side}_arm_psi`).appendChild(slider_row(`${side}_psi`, 'ψ', -JOINT_AXIS, JOINT_AXIS, 0.01,
+    `on_arm_angle_input('${side}')`));
+  // The elbow swivel's reach is fixed at +-pi; apply_snapshot refreshes the joints
+  // and x/y/z from live limits, but never touches this one.
+  set_reachable(`${side}_psi`, -PI, PI, -JOINT_AXIS, JOINT_AXIS, fmtRadAsDeg);
+}
+
+// A joint-style slider row: name, full-width track with a measured caret over the
+// limit readouts, then the commanded and measured numeric columns. Shared by the
+// joints, the elbow swivel, and the world-frame x/y/z so all read exactly the same.
+// Sub-elements derive their ids from the slider's: `_ghost` (measured caret),
+// `_lo`/`_hi` (limit labels, filled by set_reachable), `_t` (target), `_f` (measured).
+function slider_row(id, name, min, max, step, oninput) {
+  const row = document.createElement('div');
+  row.className = 'joint';
+  row.innerHTML = `
+    <span class="name">${name}</span>
+    <div class="scol">
+      <div class="srow">
+        <input type="range" min="${min}" max="${max}" step="${step}" value="0" id="${id}" oninput="${oninput}" />
+        <div class="ghost off" id="${id}_ghost"></div>
+      </div>
+      <div class="lim"><span id="${id}_lo"></span><span id="${id}_hi"></span></div>
+    </div>
+    <span class="target" id="${id}_t">+0.000</span>
+    <span class="fb" id="${id}_f">---</span>`;
+  return row;
+}
+
+// One roll/pitch/yaw dial: an SVG knob you drag around to set the angle. The viewBox
+// is centred at 0,0; the hand points at the commanded angle and the orange tick marks
+// the measured angle. Angles use the math convention (0 at 3 o'clock, CCW positive).
+// The orientation arcball: a sphere showing the target hand frame (bright triad) over
+// the measured frame (faint), which you drag to reorient. Measured lines are drawn
+// first so the target renders on top.
+function arcball_widget(side) {
+  const d = document.createElement('div');
+  d.className = 'arcball';
+  d.innerHTML = `
+    <svg viewBox="-50 -50 100 100" id="${side}_ab">
+      <circle class="ab-rim" cx="0" cy="0" r="40" />
+      <line class="ab-m ab-x" id="${side}_abmx" x1="0" y1="0" x2="0" y2="0" />
+      <line class="ab-m ab-y" id="${side}_abmy" x1="0" y1="0" x2="0" y2="0" />
+      <line class="ab-m ab-z" id="${side}_abmz" x1="0" y1="0" x2="0" y2="0" />
+      <line class="ab-t ab-x" id="${side}_abtx" x1="0" y1="0" x2="0" y2="0" />
+      <line class="ab-t ab-y" id="${side}_abty" x1="0" y1="0" x2="0" y2="0" />
+      <line class="ab-t ab-z" id="${side}_abtz" x1="0" y1="0" x2="0" y2="0" />
+      <circle class="ab-knob" cx="0" cy="0" r="4" />
+    </svg>
+    <span class="ab-hint">drag to aim · rim to roll</span>`;
+  const svg = d.querySelector('svg');
+  svg.addEventListener('pointerdown', e => arcball_down(side, e));
+  svg.addEventListener('pointermove', e => arcball_move(side, e));
+  svg.addEventListener('pointerup', arcball_up);
+  svg.addEventListener('pointercancel', arcball_up);
+  return d;
+}
+
+function build_gripper(side, label) {
+  // No discrete buttons: the gripper is driven entirely by the streamed slider
+  // (closed at 0, fully open at 1), and the side's single Enable lives on the arm
+  // card. The slider carries the same measured-position caret as the arm joints.
+  const root = $(`${side}_gripper`);
+  root.innerHTML = `
+    <div class="panel-head"><span>${label}</span><span class="badge" id="${side}_g_badge">idle</span></div>
+    <div class="gripper">
+      <div class="scol">
+        <div class="srow">
+          <input type="range" min="0" max="${GRIPPER_MAX}" step="0.005" value="0" id="${side}_g"
+                 oninput="on_gripper_input('${side}')" />
+          <div class="ghost off" id="${side}_g_ghost"></div>
+        </div>
+        <div class="lim"><span id="${side}_g_lo"></span><span id="${side}_g_hi"></span></div>
+      </div>
+      <span class="target" id="${side}_gt">0.000</span>
+      <span class="fb" id="${side}_gf">---</span>
+    </div>
+    <div class="gripper" id="${side}_ge_row" style="display:none">
+      <div class="scol">
+        <div class="srow">
+          <input type="range" id="${side}_ge" aria-label="${label} max effort"
+                 oninput="on_gripper_effort_input('${side}')" />
+        </div>
+        <div class="lim"><span id="${side}_ge_lo"></span><span id="${side}_ge_hi"></span></div>
+      </div>
+      <span class="target" id="${side}_get">---</span>
+      <span class="fb">max effort (shaft N&middot;m)</span>
+    </div>
+    <div class="actions">
+      <button class="primary" id="${side}_g_btn" style="display:none" onclick="execute_gripper('${side}')">Execute · gripper</button>
+    </div>`;
+}
+
+// Compose a joint target from the latest server floats, overriding only the
+// joint being dragged: untouched values never round-trip through the sliders'
+// step grid, so a one-joint drag cannot nudge the other six.
+function read_joints(side, overrideIdx) {
+  const snap = latestSnap && latestSnap[`${side}_arm`];
+  const joints = [];
+  for (let i = 0; i < ARM_DOF; i++) {
+    joints.push(i === overrideIdx || !snap
+      ? parseFloat($(`${side}_j${i}`).value)
+      : snap.joints[i]);
+  }
+  return joints;
+}
+
+// Slider moved: clamp out of the grayed ends, update the readout, and while
+// enabled stream the new setpoint.
+function on_joint_input(side, i) {
+  const el = $(`${side}_j${i}`);
+  clamp_slider(el);
+  $(`${side}_j${i}_t`).textContent = fmtRadAsDeg(parseFloat(el.value));
+  touched[side] = 'joints';
+  if (uiMode === 'streaming') {
+    if (enabled[side]) send_arm_target(side, i);
+  } else {
+    refresh_primary(side);
+  }
+}
+
+function send_arm_target(side, overrideIdx) {
+  if (!ws || ws.readyState !== 1) return;
+  throttled(`${side}_joints`, () =>
+    ws.send(JSON.stringify({cmd: 'set_arm_target', side, joints: read_joints(side, overrideIdx)})));
+}
+
+// Compose the desired pose from the latest server floats plus the control being
+// dragged: only the touched axis takes the DOM value, so the sliders' step grid
+// never feeds 1 mm parasitic jogs back on the other axes.
+function read_pose(side, overrideAxis) {
+  const snap = latestSnap && latestSnap[`${side}_arm`];
+  const position = POS_AXES.map(ax =>
+    ax.i === overrideAxis || !snap
+      ? parseFloat($(`${side}_p${ax.i}`).value)
+      : snap.pose[ax.i]);
+  const orientation = qnorm(qmul(qconj(VQ), quatTargetCam[side]));  // camera -> world
+  const arm_angle = parseFloat($(`${side}_psi`).value);
+  return {position, orientation, arm_angle};
+}
+
+// Stream the composed pose to the server's jog. `mode` = the component the touched
+// control drives (position / orientation / arm_angle); the rest is held.
+function send_arm_pose(side, mode, overrideAxis) {
+  if (!enabled[side] || !ws || ws.readyState !== 1) return;
+  const {position, orientation, arm_angle} = read_pose(side, overrideAxis);
+  if (![...position, ...orientation, arm_angle].every(Number.isFinite)) return;
+  throttled(`${side}_pose`, () =>
+    ws.send(JSON.stringify({cmd: 'set_arm_pose', side, position, orientation, arm_angle, mode})));
+}
+
+// Pose control moved (an x/y/z slider or the arcball): refresh the x/y/z target
+// readouts, then while streaming-enabled arm the server's jog. The touched control
+// leads; the rest is softly held.
+function on_pose_input(side, lead, overrideAxis) {
+  if (lead === 'position') clamp_slider($(`${side}_p${overrideAxis}`));
+  for (const ax of POS_AXES) $(`${side}_p${ax.i}_t`).textContent = fmt(parseFloat($(`${side}_p${ax.i}`).value));
+  touched[side] = 'pose';
+  if (uiMode !== 'streaming') { refresh_primary(side); return; }
+  send_arm_pose(side, lead, overrideAxis);
+}
+
+// Elbow slider moved: swivel the elbow through the null space (streaming-only; the backbone
+// plans the elbow for actions-mode moves, so the slider is read-only there).
+function on_arm_angle_input(side) {
+  const el = $(`${side}_psi`);
+  clamp_slider(el);
+  $(`${side}_psi_t`).textContent = fmtRadAsDeg(parseFloat(el.value));
+  touched[side] = 'pose';
+  if (uiMode !== 'streaming') { refresh_primary(side); return; }
+  send_arm_pose(side, 'arm_angle', undefined);
+}
+
+// Trailing-edge throttle per channel: input events fire per pixel, but one jog
+// re-arm per interval is plenty and keeps the WS/command load flat.
+const THROTTLE_MS = 33;
+const throttles = {};
+function throttled(key, send) {
+  const t = throttles[key] || (throttles[key] = {last: 0, timer: null, fn: null});
+  t.fn = send;
+  const now = performance.now();
+  if (now - t.last >= THROTTLE_MS) {
+    t.last = now;
+    t.fn();
+  } else if (!t.timer) {
+    t.timer = setTimeout(() => {
+      t.timer = null;
+      t.last = performance.now();
+      t.fn();
+    }, THROTTLE_MS - (now - t.last));
+  }
+}
+
+// --- Quaternion helpers ([x, y, z, w]) and the arcball ---------------------------
+// World -> camera rotation: the operator faces the robot's front, so screen x = world
+// +Y, screen y (up) = world +Z, screen z (toward viewer) = world +X. As a quaternion
+// that is [0.5, 0.5, 0.5, -0.5]. The arcball works entirely in this camera frame (drags
+// are view-space rotations) and converts to/from world only at the wire.
+const VQ = [0.5, 0.5, 0.5, -0.5];
+
+function qmul(a, b) {
+  return [
+    a[3]*b[0] + a[0]*b[3] + a[1]*b[2] - a[2]*b[1],
+    a[3]*b[1] - a[0]*b[2] + a[1]*b[3] + a[2]*b[0],
+    a[3]*b[2] + a[0]*b[1] - a[1]*b[0] + a[2]*b[3],
+    a[3]*b[3] - a[0]*b[0] - a[1]*b[1] - a[2]*b[2],
+  ];
+}
+function qnorm(q) {
+  const n = Math.hypot(q[0], q[1], q[2], q[3]) || 1;
+  return [q[0]/n, q[1]/n, q[2]/n, q[3]/n];
+}
+function qconj(q) { return [-q[0], -q[1], -q[2], q[3]]; }
+// Rotate vector v by quaternion q.
+function qrot(q, v) {
+  const [x, y, z, w] = q;
+  const tx = 2*(y*v[2] - z*v[1]);
+  const ty = 2*(z*v[0] - x*v[2]);
+  const tz = 2*(x*v[1] - y*v[0]);
+  return [
+    v[0] + w*tx + (y*tz - z*ty),
+    v[1] + w*ty + (z*tx - x*tz),
+    v[2] + w*tz + (x*ty - y*tx),
+  ];
+}
+
+// Map a normalized screen point (cam frame, y up) onto the arcball sphere: inside the
+// unit circle it lifts to the near hemisphere; outside it clamps to the rim (z = 0), so
+// a rim drag becomes a pure roll about the view axis.
+function arcball_point(nx, ny) {
+  const r2 = nx*nx + ny*ny;
+  if (r2 <= 1) return [nx, ny, Math.sqrt(1 - r2)];
+  const s = 1 / Math.sqrt(r2);
+  return [nx*s, ny*s, 0];
+}
+// The rotation taking sphere point p0 to p1: [cross(p0,p1), dot(p0,p1)], normalized.
+function arcball_quat(p0, p1) {
+  return qnorm([
+    p0[1]*p1[2] - p0[2]*p1[1],
+    p0[2]*p1[0] - p0[0]*p1[2],
+    p0[0]*p1[1] - p0[1]*p1[0],
+    p0[0]*p1[0] + p0[1]*p1[1] + p0[2]*p1[2],
+  ]);
+}
+
+// Pointer -> normalized cam-frame coords (rim = radius 1). The rim (viewBox r=40 in a
+// 100-unit box) sits at 0.4 of the pixel width; SVG y is down, so negate for y-up.
+function arcball_xy(side, e) {
+  const r = $(`${side}_ab`).getBoundingClientRect();
+  const rim = 0.4 * r.width;
+  return [(e.clientX - (r.left + r.width/2)) / rim, -(e.clientY - (r.top + r.height/2)) / rim];
+}
+function arcball_down(side, e) {
+  if (uiMode === 'gestures') return;
+  $(`${side}_ab`).setPointerCapture(e.pointerId);
+  const [nx, ny] = arcball_xy(side, e);
+  arcballDrag = { side, p0: arcball_point(nx, ny), start: quatTargetCam[side].slice(), pid: e.pointerId };
+}
+function arcball_move(side, e) {
+  if (arcballDrag.side !== side || arcballDrag.pid !== e.pointerId) return;
+  const [nx, ny] = arcball_xy(side, e);
+  const delta = arcball_quat(arcballDrag.p0, arcball_point(nx, ny));
+  quatTargetCam[side] = qnorm(qmul(delta, arcballDrag.start));
+  render_arcball(side);
+  on_pose_input(side, 'orientation');
+}
+function arcball_up(e) {
+  if (arcballDrag.pid === e.pointerId) arcballDrag = { side: null, p0: null, start: null, pid: null };
+}
+
+// Draw the target frame (bright) and, beneath it, the measured frame (faint), each a
+// projected XYZ triad (z/blue is the gripper approach axis). Axes pointing away from
+// the viewer (cam z < 0) are dimmed, a depth cue that disambiguates toward vs away.
+function render_arcball(side) {
+  const R = 40;
+  const setAxis = (id, camQuat, axis, base) => {
+    const el = $(id);
+    if (!camQuat) { el.style.opacity = 0; return; }
+    const v = qrot(camQuat, axis);
+    el.setAttribute('x2', (R * v[0]).toFixed(2));
+    el.setAttribute('y2', (-R * v[1]).toFixed(2));
+    el.style.opacity = (v[2] >= 0 ? base : base * 0.4).toFixed(2);
+  };
+  const t = quatTargetCam[side];
+  setAxis(`${side}_abtx`, t, [1,0,0], 1);
+  setAxis(`${side}_abty`, t, [0,1,0], 1);
+  setAxis(`${side}_abtz`, t, [0,0,1], 1);
+  const a = latestSnap && latestSnap[`${side}_arm`];
+  const m = (a && a.orientation_feedback) ? qmul(VQ, a.orientation_feedback) : null;
+  setAxis(`${side}_abmx`, m, [1,0,0], 0.5);
+  setAxis(`${side}_abmy`, m, [0,1,0], 0.5);
+  setAxis(`${side}_abmz`, m, [0,0,1], 0.5);
+}
+
+function ready_arm(side) {
+  // Like Home, but to the Ready workspace pose: disable so the stream stops, then
+  // drive to the preset as a discrete, time-bounded move. The pose comes from the
+  // snapshot (its one definition lives server-side, shared with the gestures).
+  const preset = latestSnap && latestSnap[`${side}_arm`].ready;
+  if (!preset) return;
+  if (enabled[side] && ws && ws.readyState === 1) ws.send(JSON.stringify({cmd: 'set_enabled', side, on: false}));
+  for (let i = 0; i < ARM_DOF; i++) {
+    $(`${side}_j${i}`).value = preset[i];
+    $(`${side}_j${i}_t`).textContent = fmtRadAsDeg(preset[i]);
+  }
+  // A joint-space action: mark joints as the composed space so the pose controls
+  // (arcball, x/y/z) track the FK of the preset instead of staying frozen.
+  touched[side] = 'joints';
+  fire_arm(side, arm_duration(side));
+}
+
+// Enable: snap both the arm sliders and the gripper slider to the measured pose
+// first so streaming starts where the side already is, then flip the deadman.
+// Disable just flips it back. One deadman per side drives arm + gripper together.
+function toggle_enable(side) {
+  if (!ws || ws.readyState !== 1) return;
+  const next = !enabled[side];
+  if (next && latestSnap) {
+    const armFb = latestSnap[`${side}_arm`].feedback;
+    if (armFb) for (let i = 0; i < ARM_DOF; i++) {
+      $(`${side}_j${i}`).value = armFb[i];
+      $(`${side}_j${i}_t`).textContent = fmtRadAsDeg(armFb[i]);
+    }
+    const gFb = latestSnap[`${side}_gripper`].feedback;
+    if (gFb != null) {
+      $(`${side}_g`).value = gFb;
+      $(`${side}_gt`).textContent = gFb.toFixed(3);
+    }
+  }
+  ws.send(JSON.stringify({cmd: 'set_enabled', side, on: next}));
+}
+
+function reset_arm(side) {
+  // Home parks the arm: disable so the stream stops, then drive to the home pose
+  // as a discrete, time-bounded move. The pose comes from the snapshot (its one
+  // definition lives server-side, shared with move_to_home). The jaw closes
+  // alongside as its own discrete goal; the backbone governs the arm and the
+  // opening together, so the close rides the same collision-governed descent and
+  // an open jaw never parks splayed against the torso.
+  const preset = latestSnap && latestSnap[`${side}_arm`].home;
+  if (!preset) return;
+  if (enabled[side] && ws && ws.readyState === 1) ws.send(JSON.stringify({cmd: 'set_enabled', side, on: false}));
+  for (let i = 0; i < ARM_DOF; i++) {
+    $(`${side}_j${i}`).value = preset[i];
+    $(`${side}_j${i}_t`).textContent = fmtRadAsDeg(preset[i]);
+  }
+  touched[side] = 'joints';
+  fire_arm(side, arm_duration(side));
+  $(`${side}_g`).value = 0;
+  $(`${side}_gt`).textContent = '0.000';
+  execute_gripper(side);
+}
+
+// Read all seven joint sliders directly. Used by the discrete fires (Home, Ready,
+// Execute), where every slider is a deliberate operator/preset value - unlike the
+// streaming read_joints, which composes from the snapshot and overrides only the one
+// joint being dragged.
+function slider_joints(side) {
+  const joints = [];
+  for (let i = 0; i < ARM_DOF; i++) joints.push(parseFloat($(`${side}_j${i}`).value));
+  return joints;
+}
+
+function fire_arm(side, duration_s) {
+  if (!ws || ws.readyState !== 1) return;
+  ws.send(JSON.stringify({cmd: 'fire_arm', side, joints: slider_joints(side), duration_s}));
+}
+
+// Slider moved: update the readout, and while enabled stream the new opening.
+function on_gripper_input(side) {
+  $(`${side}_gt`).textContent = parseFloat($(`${side}_g`).value).toFixed(3);
+  if (enabled[side]) send_gripper_target(side);
+}
+
+function send_gripper_target(side) {
+  if (!ws || ws.readyState !== 1) return;
+  ws.send(JSON.stringify({cmd: 'set_gripper_target', side, position: parseFloat($(`${side}_g`).value)}));
+}
+
+// Effort slider moved: send the cap immediately. Not deadman-gated: the cap
+// also applies to Actions-mode discrete moves.
+function on_gripper_effort_input(side) {
+  const v = parseFloat($(`${side}_ge`).value);
+  $(`${side}_get`).textContent = v.toFixed(2);
+  if (!ws || ws.readyState !== 1) return;
+  ws.send(JSON.stringify({cmd: 'set_gripper_effort', side, max_effort: v}));
+}
+
+// The arm card's primary button: Enable/Disable in streaming, Execute in actions.
+function primary_arm(side) {
+  if (uiMode === 'streaming') toggle_enable(side);
+  else execute_arm(side);
+}
+
+// Fire the composed target for one side as a discrete governed backbone move. The last
+// control space the operator touched picks which: the x/y/z sliders + dials fire a
+// straight-line Cartesian move_arm; the joint sliders fire move_arm_joints. Refused
+// server-side while a side streams, but actions mode holds both deadmen down.
+function execute_arm(side) {
+  if (!ws || ws.readyState !== 1) return;
+  if (touched[side] === 'pose') {
+    const position = POS_AXES.map(ax => parseFloat($(`${side}_p${ax.i}`).value));
+    const orientation = qnorm(qmul(qconj(VQ), quatTargetCam[side]));
+    if (![...position, ...orientation].every(Number.isFinite)) return;
+    ws.send(JSON.stringify({cmd: 'fire_arm_pose', side, position, orientation, duration_s: arm_duration(side)}));
+  } else {
+    ws.send(JSON.stringify({cmd: 'fire_arm', side, joints: slider_joints(side), duration_s: arm_duration(side)}));
+  }
+}
+
+// Fire the composed gripper opening as a discrete governed move_gripper (Actions
+// mode only; the streaming slider drives the gripper in Streaming mode).
+function execute_gripper(side) {
+  if (!ws || ws.readyState !== 1) return;
+  const position = parseFloat($(`${side}_g`).value);
+  if (!Number.isFinite(position)) return;
+  ws.send(JSON.stringify({cmd: 'fire_gripper', side, position}));
+}
+
+// Switch interaction mode. Actions and Gestures both run discrete/served motion,
+// which the server refuses while a side streams, so entering either drops both
+// deadmen; actions additionally resets the composed spaces. The mode also gates
+// whether control input streams live (streaming) or is held for Execute (actions),
+// or is read-only (gestures).
+// Whether the deployment binds a recorder, so the row's two owners (the
+// snapshot and the mode) agree on one answer instead of overwriting each
+// other's display value every frame.
+let recorderBound = false;
+
+// The single owner of which rows are on screen.
+function refresh_row_visibility() {
+  const controls = uiMode !== 'motors';
+  for (const id of CONTROL_ROWS) $(id).style.display = controls ? '' : 'none';
+  $('motors_row').style.display = controls ? 'none' : '';
+  $('gesture_row').style.display = uiMode === 'gestures' ? '' : 'none';
+  $('record_row').style.display = controls && recorderBound ? '' : 'none';
+}
+
+function set_ui_mode(mode) {
+  if (mode === uiMode) return;
+  uiMode = mode;
+  for (const m of UI_MODES) $(`mode_${m}`).classList.toggle('on', mode === m);
+  refresh_row_visibility();
+  if (mode !== 'streaming') {
+    for (const side of ['left', 'right']) {
+      if (enabled[side] && ws && ws.readyState === 1) {
+        ws.send(JSON.stringify({cmd: 'set_enabled', side, on: false}));
+      }
+      // Nothing composed yet: both spaces track the setpoint (where the arm is held)
+      // until the operator drags a control, which then freezes that space.
+      touched[side] = null;
+    }
+  }
+  for (const side of ['left', 'right']) { refresh_primary(side); refresh_mode_buttons(side); }
+}
+
+function run_gesture(name) {
+  if (!ws || ws.readyState !== 1) return;
+  ws.send(JSON.stringify({cmd: 'run_gesture', name}));
+}
+
+function stop_gesture() {
+  if (!ws || ws.readyState !== 1) return;
+  ws.send(JSON.stringify({cmd: 'stop_gesture'}));
+}
+
+// Reflect the gesture library and playback state: one button per gesture from
+// the server's roster (rebuilt only when the roster changes), a badge showing
+// lead-in / playing progress, and all buttons locked while one plays.
+function update_gesture_panel(snap) {
+  const box = $('gesture_buttons');
+  const roster = snap.gestures.map(g => g.name).join();
+  if (box.dataset.roster !== roster) {
+    box.dataset.roster = roster;
+    box.innerHTML = '';
+    for (const g of snap.gestures) {
+      const btn = document.createElement('button');
+      btn.id = `gesture_btn_${g.name}`;
+      btn.textContent = g.label;
+      btn.onclick = () => run_gesture(g.name);
+      box.appendChild(btn);
+    }
+  }
+  const active = snap.gesture;
+  const involved = active && snap.gestures.find(g => g.name === active.name);
+  gestureHeld.left = !!(involved && involved.left);
+  gestureHeld.right = !!(involved && involved.right);
+  const badge = $('gesture_badge');
+  if (active) {
+    const pct = Math.round(active.progress * 100);
+    badge.textContent = active.phase === 'lead_in' ? `lead-in ${pct}%` : `playing ${pct}%`;
+    badge.className = 'badge stream';
+  } else {
+    badge.textContent = 'idle';
+    badge.className = 'badge';
+  }
+  for (const g of snap.gestures) {
+    const btn = $(`gesture_btn_${g.name}`);
+    if (btn) {
+      btn.disabled = !!active;
+      btn.classList.toggle('primary', !!active && active.name === g.name);
+    }
+  }
+  $('gesture_stop').disabled = !active;
+}
+
+// Set the arm card's primary button to its role for the current mode: the streaming
+// deadman toggle (Enable/Disable) or the actions Execute (labelled with the space it
+// will fire).
+function refresh_primary(side) {
+  const btn = $(`${side}_arm_btn`);
+  if (uiMode === 'streaming') {
+    const on = enabled[side];
+    btn.textContent = on ? 'Disable' : 'Enable';
+    btn.classList.toggle('enabled', on);
+  } else {
+    btn.textContent = touched[side] === 'pose' ? 'Execute · pose' : 'Execute · joints';
+    btn.classList.remove('enabled');
+  }
+}
+
+// Home / Ready are discrete joint-space actions, so they show only in actions
+// mode; the per-arm primary button hides in gestures mode, where the gesture
+// panel owns motion.
+function refresh_mode_buttons(side) {
+  const on = uiMode === 'actions';
+  $(`${side}_home_btn`).style.display = on ? '' : 'none';
+  $(`${side}_ready_btn`).style.display = on ? '' : 'none';
+  $(`${side}_dur_l`).style.display = on ? 'inline-flex' : 'none';
+  $(`${side}_g_btn`).style.display = on ? '' : 'none';
+  $(`${side}_arm_btn`).style.display = uiMode === 'gestures' ? 'none' : '';
+}
+
+// Requested duration (s) for this arm's discrete moves; 0 = as fast as the EE-speed
+// cap allows. Read by Home, Ready, and Execute.
+function arm_duration(side) {
+  const v = parseFloat($(`${side}_dur`).value);
+  return Number.isFinite(v) && v >= 0 ? v : 0;
+}
+
+function apply_snapshot(snap) {
+  latestSnap = snap;
+  update_gesture_panel(snap);
+  // In gestures mode the per-arm controls are viewers: the sliders mirror the
+  // played setpoints but take no input.
+  const viewing = uiMode === 'gestures';
+  document.body.classList.toggle('gestures-mode', viewing);
+  // Shared world-position axis across both arms: every x/y/z track spans it, so
+  // the six rows align; each side's reachable band is grayed per axis below.
+  const posBounds = ['left', 'right'].flatMap(s => snap[`${s}_arm`].pos_bounds);
+  const posMin = Math.min(...posBounds.map(b => b[0]));
+  const posMax = Math.max(...posBounds.map(b => b[1]));
+  for (const side of ['left', 'right']) {
+    const on = snap[`${side}_enabled`];
+    enabled[side] = on;
+    const held = gestureHeld[side];
+    const a = snap[`${side}_arm`];
+    const b = $(`${side}_arm_badge`);
+    b.textContent = held ? 'gesture' : on ? 'streaming' : (a.in_flight ? 'in flight' : 'idle');
+    b.className = 'badge' + (held || on ? ' stream' : (a.in_flight ? ' flight' : ''));
+    refresh_primary(side);
+    // A held side cannot be enabled or fired from any mode (the server refuses
+    // anyway; the disabled buttons say why without a round trip).
+    $(`${side}_arm_btn`).disabled = held;
+    $(`${side}_home_btn`).disabled = held;
+    $(`${side}_ready_btn`).disabled = held;
+    $(`${side}_g_btn`).disabled = held;
+    for (let i = 0; i < ARM_DOF; i++) {
+      $(`${side}_j${i}_f`).textContent = a.feedback ? fmtRadAsDeg(a.feedback[i]) : '---';
+      const el = $(`${side}_j${i}`);
+      el.disabled = viewing;
+      el.classList.toggle('readonly-track', viewing);
+      // The track spans the fixed +-JOINT_AXIS; joint_limits gray its dead ends,
+      // bound the thumb, and place the min/max readout.
+      if (a.limits) {
+        const [lo, hi] = a.limits[i];
+        set_reachable(`${side}_j${i}`, lo, hi, -JOINT_AXIS, JOINT_AXIS, fmtRadAsDeg);
+      }
+      // The slider mirrors the held target, so a pose-field edit (solved to
+      // joints server-side) shows on the sliders too - except the joint the
+      // operator is actively dragging, which we must not fight. The caret and
+      // the grey column carry the measured pose.
+      // Freeze only the space being composed in actions mode; the other space keeps
+      // tracking the setpoint, so a pose Execute's IK shows on the joint sliders (and
+      // a joint Execute's FK shows on the pose controls). The sliders mirror the
+      // setpoint; the caret and the grey column carry the measured pose.
+      const composingJoints = uiMode === 'actions' && touched[side] === 'joints';
+      if (!composingJoints && document.activeElement !== el) {
+        const src = a.joints;
+        if (src) {
+          el.value = src[i];
+          $(`${side}_j${i}_t`).textContent = fmtRadAsDeg(src[i]);
+        }
+      }
+      place_caret(`${side}_j${i}`, a.feedback ? a.feedback[i] : null, -JOINT_AXIS, JOINT_AXIS);
+    }
+
+    // World position: the x/y/z sliders mirror the FK of the joint target while enabled
+    // (so a joint move updates them) or the measured pose while disabled, each with the
+    // measured value marked. Skip a control being edited.
+    for (const ax of POS_AXES) {
+      const i = ax.i;
+      // The track spans the shared cross-side axis; this side's reach on this axis
+      // (pos_bounds, per generation) grays the dead ends and bounds the thumb.
+      const [pmin, pmax] = a.pos_bounds[i];
+      const el = $(`${side}_p${i}`);
+      el.disabled = viewing;
+      el.classList.toggle('readonly-track', viewing);
+      if (el.min != posMin) el.min = posMin;
+      if (el.max != posMax) el.max = posMax;
+      set_reachable(`${side}_p${i}`, pmin, pmax, posMin, posMax, fmt);
+      $(`${side}_p${i}_f`).textContent = a.pose_feedback ? fmt(a.pose_feedback[i]) : '---';
+      const composingPose = uiMode === 'actions' && touched[side] === 'pose';
+      if (!composingPose && document.activeElement !== el) {
+        const src = a.pose;
+        if (src) { el.value = src[i]; $(`${side}_p${i}_t`).textContent = fmt(src[i]); }
+      }
+      place_caret(`${side}_p${i}`, a.pose_feedback ? a.pose_feedback[i] : null, posMin, posMax);
+    }
+    // Orientation arcball: sync the target from the setpoint's orientation
+    // quaternion unless composing orientation or mid-drag; render always, so
+    // the measured frame shows beneath the target.
+    const composingOrient = uiMode === 'actions' && touched[side] === 'pose';
+    if (!composingOrient && arcballDrag.side !== side) {
+      const src = a.orientation;
+      if (src) quatTargetCam[side] = qmul(VQ, src);
+    }
+    render_arcball(side);
+
+    // Elbow (arm angle): streaming-only. The slider shows the target psi, the
+    // caret shows measured; disabled in actions, where the backbone plans the
+    // elbow for straight-line moves.
+    const psiEl = $(`${side}_psi`);
+    // Live slider in streaming; in actions drop the thumb (readonly-track) so it reads
+    // as a current-position indicator (red tick only), not a dead slider.
+    psiEl.disabled = uiMode !== 'streaming';
+    psiEl.classList.toggle('readonly-track', uiMode !== 'streaming');
+    if (document.activeElement !== psiEl) {
+      const src = a.arm_angle;
+      if (src != null) { psiEl.value = src; $(`${side}_psi_t`).textContent = fmtRadAsDeg(src); }
+    }
+    $(`${side}_psi_f`).textContent = a.arm_angle_feedback != null ? fmtRadAsDeg(a.arm_angle_feedback) : '---';
+    place_caret(`${side}_psi`, a.arm_angle_feedback, -JOINT_AXIS, JOINT_AXIS);
+
+    const g = snap[`${side}_gripper`];
+    const gb = $(`${side}_g_badge`);
+    gb.textContent = held ? 'gesture' : on ? 'streaming' : (g.in_flight ? 'in flight' : 'idle');
+    gb.className = 'badge' + (held || on ? ' stream' : (g.in_flight ? ' flight' : ''));
+    const gs = $(`${side}_g`);
+    gs.disabled = viewing;
+    gs.classList.toggle('readonly-track', viewing);
+    if (gs.min != g.min) gs.min = g.min;
+    if (gs.max != g.max) gs.max = g.max;
+    // The slider holds the commanded opening (the composed value an Execute
+    // fires in actions). Gestures: it mirrors the played opening.
+    if (viewing) {
+      gs.value = g.position;
+      $(`${side}_gt`).textContent = g.position.toFixed(3);
+    }
+    $(`${side}_gf`).textContent = g.feedback != null
+      ? g.feedback.toFixed(3)
+      : '---';
+    // Measured-opening caret on the track, matching the arm joints.
+    place_caret(`${side}_g`, g.feedback, g.min, g.max);
+    // Effort cap slider: shown only for a gripper that reports effort control,
+    // bounded by its reported ceiling (the largest effort it will exert). The
+    // floor is 1% of the ceiling, not 0: a 0 on the wire means "no preference"
+    // (full ceiling), which is not what a slider dragged to its bottom asks for.
+    const geRow = $(`${side}_ge_row`);
+    if (g.effort_ceiling != null && g.effort_ceiling > 0) {
+      geRow.style.display = '';
+      const ge = $(`${side}_ge`);
+      // Assigned independently every refresh: a guard on ge.max alone left
+      // min/step at browser defaults when the ceiling equaled the default
+      // max of 100, letting the slider submit 0.
+      ge.min = g.effort_ceiling / 100;
+      ge.max = g.effort_ceiling;
+      ge.step = g.effort_ceiling / 100;
+      set_reachable(`${side}_ge`, ge.min, ge.max, ge.min, ge.max, v => (+v).toFixed(2));
+      // No operator preference yet renders at the ceiling: that is what the
+      // gripper applies. Never fight an in-progress drag.
+      const cap = g.max_effort != null ? g.max_effort : g.effort_ceiling;
+      if (document.activeElement !== ge) {
+        ge.value = cap;
+        $(`${side}_get`).textContent = cap.toFixed(2);
+      }
+    } else {
+      geRow.style.display = 'none';
+    }
+  }
+  // Reflect the backbone collision toggle, but never fight the operator mid-click.
+  const cc = $('collision_chk');
+  if (cc && document.activeElement !== cc) cc.checked = snap.collision_enabled;
+  // Seed the governor inputs from the snapshot unless the operator is editing one.
+  reflect_governor_input('gov_d_stop', snap.d_stop);
+  reflect_governor_input('gov_d_safe', snap.d_safe);
+  reflect_governor_input('gov_max_ee', snap.max_ee_velocity_m_s);
+  reflect_governor_input('gov_grip_rate', snap.max_gripper_rate_frac_s);
+  update_proximity(snap);
+  update_recorder(snap);
+  update_health_chips(snap);
+  update_health_attention(snap);
+  update_motors(snap);
+  update_alerts(snap);
+  $('status').textContent = snap.status;
+}
+
+// The recorder panel: hidden when the deployment binds no recorder; while an
+// episode records, the button turns Stop and the live frame count shows.
+let recording = false;
+function update_recorder(snap) {
+  recorderBound = Boolean(snap.recorder);
+  refresh_row_visibility();
+  if (!snap.recorder) { recording = false; return; }
+  recording = snap.recorder.recording;
+  const saving = snap.recorder.saving;
+  const finishing = snap.recorder.finishing;
+  const finishBtn = $('finish_btn');
+  finishBtn.textContent = finishing ? 'Finishing\u2026' : 'Finish session';
+  finishBtn.disabled = recording || finishing;
+  finishBtn.classList.toggle('saving', finishing);
+  const btn = $('record_btn');
+  btn.textContent = saving ? 'Saving\u2026' : recording ? 'Stop' : 'Record';
+  btn.disabled = saving || finishing;
+  btn.classList.toggle('recording', recording && !saving);
+  btn.classList.toggle('saving', saving);
+  $('record_task').disabled = recording;
+  $('record_frames').textContent = saving
+    ? `encoding ${snap.recorder.frames} frames\u2026`
+    : recording ? `${snap.recorder.frames} frames` : '';
+}
+
+function finish_session() {
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({cmd: 'finish_session'}));
+}
+
+function toggle_recording() {
+  if (!ws || ws.readyState !== 1) return;
+  if (recording) ws.send(JSON.stringify({cmd: 'stop_recording'}));
+  else ws.send(JSON.stringify({cmd: 'start_recording', task: $('record_task').value}));
+}
+
+// Active operator alerts, one line each, already sorted most severe first
+// server-side; each line colors through the shared --sev scale.
+function update_alerts(snap) {
+  const el = $('alerts');
+  el.replaceChildren();
+  if (!snap.alerts_bound) {
+    // An unwired slot can never raise anything; silence from it must not
+    // read as all clear.
+    const line = document.createElement('div');
+    line.className = 'dim';
+    line.textContent = 'alerts: not wired';
+    el.append(line);
+    return;
+  }
+  for (const a of snap.alerts) {
+    const line = document.createElement('div');
+    line.className = 'alert-line sev-fill';
+    line.dataset.sev = a.severity;
+    line.textContent = `${a.source}: ${a.message}`;
+    el.append(line);
+  }
+}
+
+// Level labels, indexed by the wire level the server sends; the last entry
+// is a motor nobody has heard from, which outranks a fault.
+const HEALTH_LABELS = ['nominal', 'WARNING', 'CRITICAL', 'FAULT', 'NOT REPORTING'];
+// Chip and panel wording for the non-live side states the server sends.
+const SIDE_STATUS_TEXT = {not_wired: 'not wired', pending: 'pending', not_reporting: 'not reporting'};
+
+// One tooltip per motor dot: its state plus whichever readings it senses,
+// labelled like the Motors table columns.
+function motor_tooltip(m) {
+  const parts = [`${m.name}: ${m.level == null ? 'pending' : HEALTH_LABELS[m.level]}`];
+  if (m.effort_fraction_peak != null) parts.push(`mech ${(m.effort_fraction_peak * 100).toFixed(0)}%`);
+  if (m.effort_fraction_rated != null) parts.push(`thermal ${(m.effort_fraction_rated * 100).toFixed(0)}%`);
+  if (m.effort_fraction_rated_sustained != null) parts.push(`sustained ${(m.effort_fraction_rated_sustained * 100).toFixed(0)}%`);
+  if (m.driver_temp_c != null) parts.push(`driver ${m.driver_temp_c.toFixed(0)}°C`);
+  if (m.winding_temp_c != null) parts.push(`winding ${m.winding_temp_c.toFixed(0)}°C`);
+  return parts.join(', ');
+}
+
+// The per-side health chips: one dot per motor (the diamond is the gripper)
+// colored by the server-sent level, with the side's worst label appended.
+// A non-live side renders the server's status word instead of dots.
+function update_health_chips(snap) {
+  for (const side of ['left', 'right']) {
+    const chip = $(`health_${side}`);
+    const view = snap.health[side];
+    if (view.status !== 'live') {
+      const quiet = view.status === 'not_reporting';
+      chip.className = quiet ? 'health-chip sev-text' : 'health-chip dim';
+      if (quiet) chip.dataset.sev = 4; else delete chip.dataset.sev;
+      chip.replaceChildren(`${side} health: ${SIDE_STATUS_TEXT[view.status]}`);
+      continue;
+    }
+    chip.className = 'health-chip' + (view.worst > 0 ? ' sev-text' : '');
+    if (view.worst > 0) chip.dataset.sev = view.worst; else delete chip.dataset.sev;
+    chip.replaceChildren(`${side} health: `);
+    for (const m of view.motors) {
+      const dot = document.createElement('span');
+      dot.textContent = m.name === 'gripper' ? '◆' : '●';
+      dot.className = 'dot' + (m.level == null ? ' dim' : ' sev-text');
+      if (m.level != null) dot.dataset.sev = m.level;
+      dot.title = motor_tooltip(m);
+      chip.append(dot);
+    }
+    if (view.worst > 0) chip.append(` ${HEALTH_LABELS[view.worst]}`);
+  }
+}
+
+// The walk-past surfaces, drawn from the server-computed severity: the
+// Motors tab label tints at the overall worst level, and the banner shows
+// the problems list (already sorted most severe first, so the banner colors
+// on the first entry).
+function update_health_attention(snap) {
+  const tab = $('mode_motors');
+  const worst = snap.health.worst;
+  if (worst != null && worst > 0) tab.dataset.sev = worst; else delete tab.dataset.sev;
+  const banner = $('health_banner');
+  const problems = snap.health.problems;
+  banner.hidden = !problems.length;
+  if (!problems.length) return;
+  banner.dataset.sev = problems[0].level;
+  banner.textContent = `${problems.map(p => p.text).join('; ')} (see Motors tab)`;
+}
+
+// One display row per motor, arm joint and gripper alike (the server sends
+// both as the same row shape). Rounding here rather than at draw time means
+// the redraw gate below fires only when a displayed digit moves, not on
+// every reading that jitters below it. Absent readings render '---'.
+function motor_row(m) {
+  const pct = v => v != null ? `${(v * 100).toFixed(0)}%` : '---';
+  const deg = v => v != null ? v.toFixed(0) : '---';
+  return {
+    sev: m.level,
+    cells: [
+      m.name,
+      m.level == null ? 'pending' : HEALTH_LABELS[m.level],
+      pct(m.effort_fraction_peak),
+      pct(m.effort_fraction_rated),
+      pct(m.effort_fraction_rated_sustained),
+      deg(m.driver_temp_c),
+      deg(m.winding_temp_c),
+    ],
+  };
+}
+
+// The Motors tab: rows and severity come from the server; a non-live side
+// shows its status note instead of a table.
+function update_motors(snap) {
+  for (const side of ['left', 'right']) {
+    const panel = $(`${side}_motors`);
+    panel.classList.remove('stale');
+    const view = snap.health[side];
+    const rows = view.motors.map(motor_row);
+    // Re-drawn a few times a second: rebuilding an unchanged table would
+    // drop the operator's selection every frame.
+    const readout = JSON.stringify({status: view.status, worst: view.worst, rows});
+    if (panel.dataset.readout === readout) continue;
+    panel.dataset.readout = readout;
+    panel.replaceChildren(
+      motor_head(side, view),
+      rows.length ? motor_table(rows) : motors_note(view.status),
+    );
+  }
+}
+
+// The panel head: the badge shows the side's worst label while live and the
+// status word otherwise, so an unwired panel says "not wired" and a
+// wired-but-quiet one "not reporting", matching the chips.
+function motor_head(side, view) {
+  const head = document.createElement('div');
+  head.className = 'panel-head';
+  const label = document.createElement('span');
+  label.textContent = `${side} motors`;
+  const badge = document.createElement('span');
+  badge.className = 'badge';
+  badge.textContent = view.status === 'live' ? HEALTH_LABELS[view.worst] : SIDE_STATUS_TEXT[view.status];
+  if (view.worst != null && view.worst > 0) {
+    badge.classList.add('sev-text');
+    badge.dataset.sev = view.worst;
+  }
+  head.append(label, badge);
+  return head;
+}
+
+function motors_note(status) {
+  const note = document.createElement('div');
+  note.className = 'motors-note';
+  note.textContent = {
+    not_wired: 'motor health not wired in this deployment',
+    pending: 'waiting for the first motor health report',
+    not_reporting: 'motor health not reporting',
+  }[status];
+  return note;
+}
+
+// The readings table under a two-row grouped header: torque spans its three
+// renderings of the same measurement, temperature its two probes, and the
+// torque units carry tooltips naming the line each divides by.
+function motor_table(rows) {
+  const table = document.createElement('table');
+  table.className = 'motor-table';
+  const th = (row, text, props) => {
+    const cell = document.createElement('th');
+    cell.textContent = text;
+    Object.assign(cell, props);
+    row.append(cell);
+  };
+  const thead = table.createTHead();
+  const groups = thead.insertRow();
+  th(groups, 'joint', {rowSpan: 2});
+  th(groups, 'state', {rowSpan: 2});
+  th(groups, 'torque', {colSpan: 3, className: 'group'});
+  th(groups, 'temperature', {colSpan: 2, className: 'group'});
+  const units = thead.insertRow();
+  th(units, '% mechanical rated', {title: "instantaneous torque over the datasheet peak (or the motor's configured trip, if lower); 100% is the cutout line"});
+  th(units, '% thermal rated', {title: 'instantaneous torque over the continuous (thermal) rating; above 100% the motor is on a time budget'});
+  th(units, '% sustained', {title: 'the filtered value the warning level judges (EWMA over seconds), against the thermal rating'});
+  th(units, 'driver °C');
+  th(units, 'winding °C');
+  const body = table.createTBody();
+  for (const row of rows) {
+    const tr = body.insertRow();
+    if (row.sev != null && row.sev > 0) tr.dataset.sev = row.sev;
+    if (row.sev == null) tr.className = 'dim';
+    for (const text of row.cells) tr.insertCell().textContent = text;
+  }
+  return table;
+}
+
+// Closest self-collision pair: distance in mm + the two links, colored black
+// (clear, d >= d_safe) -> orange (inside d_safe) -> red (inside d_stop), with
+// the governor's disposition (THROTTLED / STOPPED) appended while it restricts.
+function update_proximity(snap) {
+  const el = $('proximity');
+  const p = snap.proximity;
+  if (!p) { el.textContent = 'closest pair: n/a'; el.style.color = '#888'; el.style.background = 'transparent'; return; }
+  const mm = (p.distance * 1000).toFixed(1);
+  const short = s => s.replace(/^openarm_/, '');
+  let color = '#000', bg = 'transparent';
+  if (p.distance < snap.d_stop) { color = '#fff'; bg = '#c0392b'; }       // red: inside stop
+  else if (p.distance < snap.d_safe) { color = '#fff'; bg = '#e67e22'; }  // orange: inside safe
+  const disposition = p.stopped ? '   STOPPED' : p.throttled ? '   THROTTLED' : '';
+  el.textContent = `closest pair: ${mm} mm   ${short(p.link_a)} ↔ ${short(p.link_b)}${disposition}`;
+  el.style.color = color;
+  el.style.background = bg;
+}
+
+function reflect_governor_input(id, value) {
+  const el = $(id);
+  if (el && document.activeElement !== el && value != null) el.value = value;
+}
+
+// Stream the operator's self-collision-avoidance toggle to the backbone.
+function set_collision(on) {
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({cmd: 'set_collision', enabled: !!on}));
+}
+
+// Stream the operator's governor band + EE speed cap to the backbone. The backbone re-checks
+// and ignores a degenerate band (d_stop must stay below d_safe).
+function send_governor_params() {
+  if (!ws || ws.readyState !== 1) return;
+  const d_stop = parseFloat($('gov_d_stop').value);
+  const d_safe = parseFloat($('gov_d_safe').value);
+  const max_ee_velocity_m_s = parseFloat($('gov_max_ee').value);
+  const max_gripper_rate_frac_s = parseFloat($('gov_grip_rate').value);
+  // A blur on a half-edited field parses to NaN, which JSON.stringify serializes as
+  // null; drop the update rather than send a null the backbone would reject.
+  if (![d_stop, d_safe, max_ee_velocity_m_s, max_gripper_rate_frac_s].every(Number.isFinite)) return;
+  ws.send(JSON.stringify({
+    cmd: 'set_governor_params', d_stop, d_safe, max_ee_velocity_m_s, max_gripper_rate_frac_s,
+  }));
+}
+
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${proto}//${location.host}/ws`);
+  const conn = $('conn');
+  ws.onopen = () => { conn.className = 'conn open'; conn.textContent = 'connected'; };
+  ws.onclose = () => {
+    conn.className = 'conn closed'; conn.textContent = 'disconnected';
+    // The server drops deadmen and kills any playing gesture on disconnect;
+    // clear the frozen panel state to match until the reconnect snapshot.
+    gestureHeld.left = gestureHeld.right = false;
+    const badge = $('gesture_badge');
+    badge.textContent = 'idle';
+    badge.className = 'badge';
+    $('gesture_stop').disabled = true;
+    // Health would latch its last snapshot otherwise: gray the chips, drop
+    // the banner and alerts, and fade the motors tables until reconnect.
+    for (const side of ['left', 'right']) {
+      const chip = $(`health_${side}`);
+      chip.className = 'health-chip dim';
+      delete chip.dataset.sev;
+      chip.replaceChildren(`${side} health: disconnected`);
+      $(`${side}_motors`).classList.add('stale');
+    }
+    $('health_banner').hidden = true;
+    delete $('mode_motors').dataset.sev;
+    $('alerts').replaceChildren();
+    setTimeout(connect, 1000);
+  };
+  ws.onmessage = (e) => {
+    try { apply_snapshot(JSON.parse(e.data)); }
+    catch (err) { console.error('snapshot render failed', err); }
+  };
+}
+
+build_arm('left', 'left arm');
+build_arm('right', 'right arm');
+build_gripper('left', 'left gripper');
+build_gripper('right', 'right gripper');
+connect();
+</script>
+</body>
+</html>

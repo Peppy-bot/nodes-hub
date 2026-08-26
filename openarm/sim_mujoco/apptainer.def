@@ -1,0 +1,27 @@
+Bootstrap: docker
+From: peppybot/openarm-mujoco-sim:3.10.0-20
+
+%labels
+    Name openarm-sim-mujoco
+    Version v1
+
+%environment
+    export PYTHONPATH="/opt/openarm_sim_mujoco/.peppy/libs/peppygen:/opt/openarm_sim_mujoco/.peppy/libs/peppylib:$PYTHONPATH"
+    export PEPPYGEN_OUTPUT_PATH="/opt/openarm_sim_mujoco/.peppy/libs/peppygen"
+    export PEPPY_BRIDGE_HEADLESS=${PEPPY_BRIDGE_HEADLESS:-1}
+    export PEPPY_BRIDGE_NODE_NAME=sim
+    export MUJOCO_GL=${MUJOCO_GL:-egl}
+    export WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-}
+    export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+    export DISPLAY=${DISPLAY:-}
+    export PEPPY_ROBOT_ASSETS_DIR=${PEPPY_ROBOT_ASSETS_DIR:-/opt/robot_assets/openarm/mujoco}
+
+%files
+    peppy.json5 /opt/openarm_sim_mujoco/peppy.json5
+    robots /opt/openarm_sim_mujoco/robots
+    .peppy/libs/peppygen /opt/openarm_sim_mujoco/.peppy/libs/peppygen
+    .peppy/libs/peppylib /opt/openarm_sim_mujoco/.peppy/libs/peppylib
+
+%runscript
+    cd /opt/openarm_sim_mujoco
+    exec python3 /opt/openarm_sim_mujoco/robots/openarm/openarm/launch.py "$@"

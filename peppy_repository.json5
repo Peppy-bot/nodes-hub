@@ -46,6 +46,66 @@
         path: "example_robot/my_robot_brain/my_rust_robot_brain/peppy.json5"
       }
     },
+    openarm_arm: {
+      v1: {
+        path: "openarm/arm/peppy.json5"
+      }
+    },
+    openarm_arm_sim: {
+      v1: {
+        path: "openarm/arm_sim/peppy.json5"
+      }
+    },
+    openarm_backbone: {
+      v1: {
+        path: "openarm/backbone/peppy.json5"
+      }
+    },
+    openarm_gripper: {
+      v1: {
+        path: "openarm/gripper/peppy.json5"
+      }
+    },
+    openarm_gripper_sim: {
+      v1: {
+        path: "openarm/gripper_sim/peppy.json5"
+      }
+    },
+    openarm_isaac_webviewer: {
+      v1: {
+        path: "openarm/isaac_webviewer/peppy.json5"
+      }
+    },
+    openarm_ker: {
+      v1: {
+        path: "openarm/ker/peppy.json5"
+      }
+    },
+    openarm_robot_initializer: {
+      v1: {
+        path: "openarm/robot_initializer/peppy.json5"
+      }
+    },
+    openarm_scene_commander: {
+      v1: {
+        path: "openarm/scene_commander/peppy.json5"
+      }
+    },
+    openarm_sim_isaac: {
+      v1: {
+        path: "openarm/sim_isaac/peppy.json5"
+      }
+    },
+    openarm_sim_mujoco: {
+      v1: {
+        path: "openarm/sim_mujoco/peppy.json5"
+      }
+    },
+    openarm_web_commander: {
+      v1: {
+        path: "openarm/web_commander/peppy.json5"
+      }
+    },
     reactive_policy: {
       v1: {
         path: "example_robot/reactive_policy/peppy.json5"

@@ -1,0 +1,61 @@
+// openarm_arm_sim: the sim arm follower, an engine-agnostic relay between two
+// joint_link pairings. Toward the backbone it plays the follower role exactly
+// like the real arm (governed setpoints in, measured state back); toward the
+// sim engine it plays the leader role of the same pairing (setpoints down to
+// the engine's matching limb slot, the engine's measured state back up).
+// Stamps pass through unchanged, so consumers age samples on the original
+// capture time. One instance per limb; the slots carry the side for the
+// command loop, and the health heartbeat is attributed to this instance by
+// the transport.
+{
+  peppy_schema: "node/v1",
+  manifest: {
+    name: "openarm_arm_sim",
+    tag: "v1",
+    implements: [
+      // Per-component readiness the robot_initializer aggregates, exactly like
+      // the real follower: ready once the engine's first state has been
+      // relayed (this limb's physics is live and serving).
+      { name: "component_ready", tag: "v1", link_id: "ready" },
+      // Same health surface as the real arm, published as "present, not
+      // sensed": nominal levels, empty reading vectors (the engine reports no
+      // effort or temperature).
+      { name: "motor_health", tag: "v1", link_id: "motor_health" },
+    ],
+    depends_on: {
+      pairings: [
+        // The exclusive command loop with the backbone, identical to the real
+        // arm's slot: optional, established at the backbone's start.
+        { name: "joint_link", tag: "v1", role: "follower", link_id: "backbone", optional: true },
+        // The same pairing toward the sim engine's matching limb slot: this
+        // relay leads, the engine follows. Required: a relay without an engine
+        // is a misconfiguration, so the launch fails loudly instead.
+        { name: "joint_link", tag: "v1", role: "leader", link_id: "engine" }
+      ]
+    }
+  },
+  interfaces: {
+    topics: {
+      emits: [
+        { link_id: "backbone", name: "joint_states" },
+        { link_id: "engine", name: "joint_setpoints" },
+        { link_id: "motor_health", name: "motor_health" },
+      ],
+      consumes: [
+        { link_id: "backbone", name: "joint_setpoints" },
+        { link_id: "engine", name: "joint_states" },
+      ],
+    },
+    services: {
+      exposes: [
+        { link_id: "ready", name: "is_ready" },
+      ],
+    },
+  },
+  execution: {
+    language: "rust",
+    container: {
+      def_file: "apptainer.def"
+    }
+  }
+}

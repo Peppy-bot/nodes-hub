@@ -1,0 +1,21 @@
+Bootstrap: docker
+From: peppybot/rust-cargo-base
+
+%files
+    . /opt/openarm_ker
+
+%post
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+
+    apt-get update -y
+    apt-get install -y --no-install-recommends libusb-1.0-0-dev libudev-dev pkg-config
+
+    cd /opt/openarm_ker
+    cargo build --release
+
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+%runscript
+    cd /opt/openarm_ker
+    exec ./target/release/openarm_ker "$@"

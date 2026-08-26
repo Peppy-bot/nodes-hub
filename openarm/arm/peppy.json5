@@ -1,0 +1,93 @@
+// One arm of the openarm robot (real hardware); instantiate twice, one per
+// side, with a distinct `arm_id`. A follower of the bimanual backbone: it owns the
+// hardware control loop (gravity/Coriolis/friction feedforward from the
+// in-process srs_model, plus MIT control) and tracks the backbone's governed
+// setpoint, reporting measured state on the pairing's always-on `joint_states` stream. The
+// backbone (openarm_backbone) owns all trajectory generation, stream following, and
+// self-collision governing, so the arm carries no motion logic of its own.
+{
+  peppy_schema: "node/v1",
+  manifest: {
+    name: "openarm_arm",
+    tag: "v1",
+    implements: [
+      // Per-component readiness the real robot_initializer aggregates: ready once
+      // motors are enabled and the control loop is serving.
+      { name: "component_ready", tag: "v1", link_id: "ready" },
+      // Per-motor health telemetry: severity, effort fraction, and
+      // temperatures, naming this arm as its source.
+      { name: "motor_health", tag: "v1", link_id: "motor_health" },
+      // Operator alerts: a motor running hot, overloaded, or faulted. Any
+      // alert consumer renders these without knowing this node exists.
+      { name: "alert", tag: "v1", link_id: "alerts" },
+    ],
+    depends_on: {
+      pairings: [
+        // The exclusive command loop with the backbone: governed setpoints stream in
+        // and the measured state streams back, both scoped to the pair (no
+        // arm_id demux). Optional: the arm boots and holds with no backbone paired,
+        // and the pair is established at the backbone's start (launcher `links:`).
+        { name: "joint_link", tag: "v1", role: "follower", link_id: "backbone", optional: true },
+      ],
+    },
+  },
+  interfaces: {
+    topics: {
+      emits: [
+        // The `backbone` pairing slot: the topic this role emits.
+        { link_id: "backbone", name: "joint_states" },
+        { link_id: "motor_health", name: "motor_health" },
+        { link_id: "alerts", name: "alerts" },
+      ],
+      consumes: [
+        // The counterpart role's topic on the same slot.
+        { link_id: "backbone", name: "joint_setpoints" },
+      ],
+    },
+    services: {
+      exposes: [
+        { link_id: "ready", name: "is_ready" },
+      ],
+    },
+  },
+  execution: {
+    language: "rust",
+    container: {
+      def_file: "apptainer.def"
+    },
+    parameters: {
+      arm_id: "u8",
+      can_interface: "string",
+      // Which OpenArm hardware generation this arm drives: "v1" or "v2". Selects the
+      // embedded description (URDF, joint limits, elbow margin) the in-process model is
+      // built from. Required, not defaulted: running the wrong generation's model on the
+      // hardware would mis-compensate gravity/Coriolis, so the launcher must be explicit.
+      hardware_version: "string",
+      // Hardware-loop rate (Hz). Required: pick deliberately per deployment. The
+      // stack currently unifies on 100 Hz (backbone stream rate and arm loop rate match);
+      // confirm `overruns=0` at the target rate during bring-up.
+      control_rate_hz: "u32",
+      // Per-cycle CAN read deadline (μs). Must fit the cycle budget (10 ms at 100 Hz).
+      recv_timeout_us: { $type: "u32", $default: 1000 },
+      // MIT-control gains applied every control tick, one per joint (1-indexed).
+      // Match the openarm teleop config (Kp/Kd).
+      kp1: { $type: "f64", $default: 240.0 },
+      kp2: { $type: "f64", $default: 240.0 },
+      kp3: { $type: "f64", $default: 240.0 },
+      kp4: { $type: "f64", $default: 240.0 },
+      kp5: { $type: "f64", $default: 24.0 },
+      kp6: { $type: "f64", $default: 31.0 },
+      kp7: { $type: "f64", $default: 25.0 },
+      kd1: { $type: "f64", $default: 3.0 },
+      kd2: { $type: "f64", $default: 3.0 },
+      kd3: { $type: "f64", $default: 3.0 },
+      kd4: { $type: "f64", $default: 3.0 },
+      kd5: { $type: "f64", $default: 0.2 },
+      kd6: { $type: "f64", $default: 0.2 },
+      kd7: { $type: "f64", $default: 0.2 },
+      // Rate (Hz) of the always-on measured-state stream (`joint_states`), which the
+      // backbone consumes. Required: consumers' needs vary too much for a default.
+      state_rate_hz: "u32",
+    }
+  },
+}

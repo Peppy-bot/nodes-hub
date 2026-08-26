@@ -1,0 +1,18 @@
+{
+  peppy_schema: "node/v1",
+
+  manifest: {
+    name: "openarm_isaac_webviewer",
+    tag: "v1",
+  },
+
+  execution: {
+    language: "python",
+
+    container: {
+      def_file: "apptainer.def",
+    },
+
+    parameters: {},
+  },
+}

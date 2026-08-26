@@ -1,0 +1,21 @@
+Bootstrap: docker
+From: peppybot/openarm-isaac-webviewer:2
+
+%labels
+    Name openarm-isaac-webviewer
+    Version v1
+    Description "OpenArm Isaac Sim browser WebRTC viewer"
+
+%environment
+    export PYTHONPATH="/opt/openarm_isaac_webviewer/.peppy/libs/peppygen:/opt/openarm_isaac_webviewer/.peppy/libs/peppylib:$PYTHONPATH"
+    export PEPPYGEN_OUTPUT_PATH="/opt/openarm_isaac_webviewer/.peppy/libs/peppygen"
+
+%files
+    peppy.json5 /opt/openarm_isaac_webviewer/peppy.json5
+    launch.py /opt/openarm_isaac_webviewer/launch.py
+    .peppy/libs/peppygen /opt/openarm_isaac_webviewer/.peppy/libs/peppygen
+    .peppy/libs/peppylib /opt/openarm_isaac_webviewer/.peppy/libs/peppylib
+
+%runscript
+    cd /opt/openarm_isaac_webviewer
+    exec python3 /opt/openarm_isaac_webviewer/launch.py "$@"

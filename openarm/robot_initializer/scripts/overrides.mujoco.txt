@@ -1,0 +1,12 @@
+# Dependency overrides for the MuJoCo base image install (uv --overrides).
+# An entry here replaces every requirement on that package, wherever in the
+# dependency graph it comes from.
+#
+# embreex is Intel Embree's ray-tracing accelerator for trimesh and ships
+# x86_64 wheels only — no linux/arm64 wheel and no sdist, so there is nothing
+# to install or build on arm64. trimesh's "easy" extra requires it with no
+# platform marker, and viser -> yourdfpy -> trimesh[easy] drags it in, which
+# makes the whole arm64 resolution unsatisfiable without this override.
+# Restricting it to x86_64 leaves the amd64 image unchanged; on arm64 trimesh
+# imports it lazily and falls back to its pure-Python ray tracer.
+embreex; platform_machine == "x86_64"

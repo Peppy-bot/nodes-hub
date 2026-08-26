@@ -1,0 +1,19 @@
+[package]
+name = "openarm_ker"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+peppygen = { path = ".peppy/libs/peppygen" }
+peppylib = { path = ".peppy/libs/peppylib" }
+control_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", branch = "main", package = "control_core" }
+openarm_description = { git = "https://github.com/Peppy-bot/public-peppy-libs", branch = "main", package = "openarm_description" }
+rusb = "0.9"
+serialport = "4"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+peppygen = { path = ".peppy/libs/peppygen", features = ["testing"] }

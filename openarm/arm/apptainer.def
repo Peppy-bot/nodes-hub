@@ -1,0 +1,14 @@
+Bootstrap: docker
+From: peppybot/rust-cargo-base
+
+%files
+    . /opt/openarm_arm
+
+%post
+    set -eux
+    cd /opt/openarm_arm
+    cargo build --release
+
+%runscript
+    cd /opt/openarm_arm
+    exec ./target/release/openarm_arm "$@"

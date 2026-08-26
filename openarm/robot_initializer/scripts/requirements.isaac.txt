@@ -1,0 +1,3 @@
+pycapnp==2.2.2
+pyjson5==2.0.0
+sim_ext_core @ git+https://github.com/Peppy-bot/public-peppy-libs.git@main#subdirectory=sim_ext_core

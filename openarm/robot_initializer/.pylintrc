@@ -1,0 +1,18 @@
+[MAIN]
+ignore-paths = ^.*/\.peppy/.*
+
+[MESSAGES CONTROL]
+disable =
+    C0114,
+    C0115,
+    C0116,
+    C0415,
+    E0401,
+    E0611,
+    E1120,
+    E1121,
+    I1101,
+    R0801,
+    W0212,
+    W0718,
+    W1203,

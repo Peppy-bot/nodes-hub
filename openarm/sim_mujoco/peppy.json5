@@ -1,0 +1,100 @@
+// The MuJoCo engine node. It
+// plays the follower role of every limb's joint_link / gripper_link
+// pairing: the sim relays lead each pair and the engine's measured state
+// streams back on it. Sim peripherals attach to this node by node name for
+// engine-internal coupling.
+{
+  peppy_schema: "node/v1",
+  manifest: {
+    name: "openarm_sim_mujoco",
+    tag: "v1",
+    depends_on: {
+      pairings: [
+        // The engine plays the follower role of every limb's pairing directly,
+        // one slot per limb (the slot is the side, so no id demux): governed
+        // setpoints stream in, measured engine state streams back. Optional:
+        // the engine boots unpaired and each pair is established at the
+        // backbone's start (launcher `links:`).
+        { name: "joint_link", tag: "v1", role: "follower", link_id: "left_arm", optional: true },
+        { name: "joint_link", tag: "v1", role: "follower", link_id: "right_arm", optional: true },
+        { name: "gripper_link", tag: "v1", role: "follower", link_id: "left_gripper", optional: true },
+        { name: "gripper_link", tag: "v1", role: "follower", link_id: "right_gripper", optional: true },
+        // Robot-mounted cameras rendered from the live scene, one slot per
+        // camera (the slot is the camera, so no id demux). The engine plays the
+        // camera role; a per-camera relay presents the rgb/rgbd contract.
+        // Optional: slots stay unbound (and rendering stays off) outside record
+        // stacks; frames flow only when cameras_enabled is set.
+        { name: "sim_rgb_camera_link", tag: "v1", role: "camera", link_id: "wrist_left", optional: true },
+        { name: "sim_rgb_camera_link", tag: "v1", role: "camera", link_id: "wrist_right", optional: true },
+        { name: "sim_rgbd_camera_link", tag: "v1", role: "camera", link_id: "chest", optional: true },
+      ],
+    },
+  },
+  interfaces: {
+    topics: {
+      emits: [
+        { link_id: "left_arm", name: "joint_states" },
+        { link_id: "right_arm", name: "joint_states" },
+        { link_id: "left_gripper", name: "gripper_states" },
+        { link_id: "right_gripper", name: "gripper_states" },
+        { link_id: "wrist_left", name: "video_stream" },
+        { link_id: "wrist_left", name: "stream_info" },
+        { link_id: "wrist_right", name: "video_stream" },
+        { link_id: "wrist_right", name: "stream_info" },
+        { link_id: "chest", name: "video_stream" },
+        { link_id: "chest", name: "depth_stream" },
+        { link_id: "chest", name: "stream_info" },
+      ],
+      consumes: [
+        { link_id: "left_arm", name: "joint_setpoints" },
+        { link_id: "right_arm", name: "joint_setpoints" },
+        { link_id: "left_gripper", name: "gripper_setpoints" },
+        { link_id: "right_gripper", name: "gripper_setpoints" },
+      ],
+    },
+  },
+  execution: {
+    language: "python",
+    container: {
+      def_file: "apptainer.def",
+      // The image ships only the mesa EGL vendor, so without this hook
+      // MUJOCO_GL=egl renders camera frames on whatever the host exposes
+      // through /dev/dri: measured on one machine, the integrated GPU at
+      // 24ms per capture cycle against the NVIDIA card's 3ms, and a software
+      // rasterizer where there is no integrated GPU either. On a host with no
+      // NVIDIA libraries at all (a Mac, where peppy runs apptainer inside a
+      // Lima VM) the hook costs one "could not find any nv files" warning per
+      // run and rendering falls back to the same path as before.
+      apptainer_run_extra_args: ["--nv"],
+    },
+    parameters: {
+      // Which OpenArm generation to simulate: "v1" or "v2". Selects the scene file
+      // (openarm_bimanual_{v1,v2}.xml) and the meshes materialized into the asset dir.
+      // Required so the sim matches the real deployment it stands in for.
+      hardware_version: "string",
+      // Rate (Hz) of the measured-state streams (joint_states / gripper_states).
+      state_rate_hz: "u32",
+      // Run without a native viewer window (the deployment default). "Headless"
+      // here means no local GUI window, not no viewer: this mode serves the
+      // viser viewer to a browser on viewer_host:viewer_port, which is how the
+      // sim is watched in a deployment and the only viewer that works inside a
+      // container.
+      //
+      // Set false to open a native MuJoCo GLFW window instead — and note that
+      // mode serves no viser viewer, so nothing is reachable over the network.
+      // It also needs a display socket bound into the container and MUJOCO_GL
+      // overridden off the apptainer.def default of egl. Neither applies on macOS, where peppy runs apptainer inside a Lima
+      // VM with no display: keep headless true there and use the browser.
+      headless: { $type: "bool", $default: true },
+      // Viser viewer bind address + port, used when headless is true. All
+      // interfaces by default so the viewer is reachable from other machines.
+      viewer_host: { $type: "string", $default: "0.0.0.0" },
+      viewer_port: { $type: "u32", $default: 8080 },
+      // Render and stream the robot-mounted cameras (config/cameras.json5) on
+      // their pairing slots. No default: whether a stack renders cameras is
+      // the launcher's decision, and a launcher that leaves it unsaid fails
+      // here rather than coming up quietly camera-less.
+      cameras_enabled: "bool",
+    },
+  },
+}

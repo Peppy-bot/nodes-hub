@@ -1,0 +1,40 @@
+FROM python:3.11-slim
+
+RUN apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true update \
+    && apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true install -y --no-install-recommends \
+        ca-certificates \
+        git \
+        rclone \
+        libgl1 \
+        libgl1-mesa-dri \
+        libglib2.0-0 \
+        libgomp1 \
+        libosmesa6 \
+        libwayland-client0 \
+        libwayland-cursor0 \
+        libwayland-egl1 \
+        libxkbcommon0 \
+        libegl1 \
+        libegl-mesa0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# uv, not pip: the arm64 leg needs a dependency override (embreex — see
+# overrides.mujoco.txt) and pip has no override mechanism. uv is installed and
+# removed inside the same layer so it does not ship in the image.
+COPY scripts/requirements.mujoco.txt /tmp/requirements.txt
+COPY scripts/overrides.mujoco.txt /tmp/overrides.txt
+RUN pip install --no-cache-dir --retries 5 --timeout 180 uv==0.11.19 \
+    && UV_HTTP_TIMEOUT=180 uv pip install --system --no-cache \
+        --overrides /tmp/overrides.txt \
+        -r /tmp/requirements.txt \
+    && pip uninstall -y uv
+
+COPY scripts/download_assets.sh /tmp/download_assets.sh
+RUN --mount=type=secret,id=rclone_key \
+    --mount=type=secret,id=rclone_secret \
+    RCLONE_S3_ACCESS_KEY_ID="$(cat /run/secrets/rclone_key)" \
+    RCLONE_S3_SECRET_ACCESS_KEY="$(cat /run/secrets/rclone_secret)" \
+    bash /tmp/download_assets.sh --variant mujoco \
+    && mkdir -p /opt/robot_assets/openarm/mujoco \
+    && cp -r /tmp/.peppy_robot_initializer_mujoco/. /opt/robot_assets/openarm/mujoco/ \
+    && rm -rf /tmp/.peppy_robot_initializer_mujoco

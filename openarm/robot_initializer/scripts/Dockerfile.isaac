@@ -1,0 +1,23 @@
+ARG ISAAC_VERSION=5.1.0
+FROM nvcr.io/nvidia/isaac-sim:${ISAAC_VERSION}
+
+USER root
+RUN apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true update \
+    && apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true install -y --no-install-recommends \
+        ca-certificates \
+        git \
+        rclone \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY scripts/requirements.isaac.txt /tmp/requirements.txt
+RUN /isaac-sim/python.sh -m pip install --no-cache-dir --retries 5 --timeout 180 -r /tmp/requirements.txt
+
+COPY scripts/download_assets.sh /tmp/download_assets.sh
+RUN --mount=type=secret,id=rclone_key \
+    --mount=type=secret,id=rclone_secret \
+    RCLONE_S3_ACCESS_KEY_ID="$(cat /run/secrets/rclone_key)" \
+    RCLONE_S3_SECRET_ACCESS_KEY="$(cat /run/secrets/rclone_secret)" \
+    bash /tmp/download_assets.sh --variant isaac \
+    && mkdir -p /opt/robot_assets/openarm/isaac \
+    && cp -r /tmp/.peppy_robot_initializer_isaac/. /opt/robot_assets/openarm/isaac/ \
+    && rm -rf /tmp/.peppy_robot_initializer_isaac

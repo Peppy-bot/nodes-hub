@@ -1,0 +1,20 @@
+Bootstrap: docker
+From: peppybot/rust-cargo-base:latest
+
+%labels
+    Name openarm-arm-sim
+    Version v1
+
+%files
+    . /opt/openarm_arm_sim
+
+%post
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+
+    cd /opt/openarm_arm_sim
+    cargo build --release
+
+%runscript
+    cd /opt/openarm_arm_sim
+    exec ./target/release/openarm_arm_sim "$@"

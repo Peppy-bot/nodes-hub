@@ -1,0 +1,20 @@
+[package]
+name = "openarm_arm"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+openarm_can = { git = "https://github.com/Peppy-bot/public-peppy-libs", branch = "main", package = "openarm_can" }
+# Kinematics + dynamics library (FK + gravity/Coriolis), computed in-process.
+srs_model = { git = "https://github.com/Peppy-bot/public-peppy-libs", branch = "main", package = "srs_model" }
+openarm_description = { git = "https://github.com/Peppy-bot/public-peppy-libs", branch = "main", package = "openarm_description" }
+control_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", branch = "main", package = "control_core" }
+peppygen = { path = ".peppy/libs/peppygen" }
+peppylib = { path = ".peppy/libs/peppylib" }
+
+[dev-dependencies]
+peppygen = { path = ".peppy/libs/peppygen", features = ["testing"] }
