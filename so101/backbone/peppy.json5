@@ -1,0 +1,152 @@
+// so101_backbone: the single-arm motion authority between the commander
+// (so101_leader, xr_commander, a policy runner) and the so101_follower.
+// "Leader" and "follower" below name pairing roles, not the lerobot arms:
+// this node plays the follower role toward the commander (raw setpoints
+// stream in on the leader_* slots and the measured state relays back up
+// them) and the leader role toward the arm. Exposes the joint /
+// Cartesian / gripper move actions and executes them itself; drives the arm
+// and gripper over the downstream pairings (leader role). Everything the
+// follower executes leaves through arm_link / gripper_link, so a recorder
+// observing those slots captures teleop and actions identically.
+//
+// The upstream command is joints (joint_link) or an end-effector pose
+// (pose_link), never both: `upstream_mode` picks one per instance and only
+// that slot kind is subscribed. Poses are solved with lerobot's placo-based
+// kinematics against so101_description's embedded kinematics URDF, the same
+// bytes its postures and limits are verified against.
+{
+  peppy_schema: "node/v1",
+  manifest: {
+    name: "so101_backbone",
+    tag: "v1",
+    implements: [
+      // Whole-robot state snapshots for consumers that hold no pairing:
+      // joint positions, the end-effector pose, and the gripper opening.
+      // Every pose here names the URDF's fixed gripper_frame_link TCP; on
+      // this single-moving-jaw gripper the pad midpoint shifts with the
+      // opening, so no static frame is exactly the contracts' grasp point.
+      { name: "limb_state", tag: "v1", link_id: "limb_state" },
+      // The per-limb moves: the arm to a joint target or an end-effector
+      // pose, the gripper to an opening. This robot's limb names are "arm"
+      // and "gripper".
+      { name: "limb_motion", tag: "v1", link_id: "limb_motion" },
+      // Whole-robot posture moves, executed through the same admission and
+      // trajectory path as move_arm_joints.
+      { name: "postures", tag: "v1", link_id: "postures" },
+    ],
+    depends_on: {
+      pairings: [
+        // Upstream: the exclusive command loop with the one leading node.
+        // Optional: action-only sessions boot with these unbound.
+        // Subscribed only under upstream_mode "joints".
+        { name: "joint_link", tag: "v1", role: "follower", link_id: "leader_arm", optional: true },
+        // The Cartesian alternative: a world-frame end-effector pose streams
+        // in and the measured pose relays back. Subscribed only under
+        // upstream_mode "pose".
+        { name: "pose_link", tag: "v1", role: "follower", link_id: "leader_pose", optional: true },
+        { name: "gripper_link", tag: "v1", role: "follower", link_id: "leader_gripper", optional: true },
+        // Downstream: the exclusive command loops with the follower. The
+        // slots scope both directions, so no id demux and no other producer
+        // can pose as the arm.
+        { name: "joint_link", tag: "v1", role: "leader", link_id: "arm_link", optional: true },
+        { name: "gripper_link", tag: "v1", role: "leader", link_id: "gripper_link", optional: true },
+      ],
+    },
+  },
+  interfaces: {
+    actions: {
+      // The backbone's move actions. The backbone runs each move itself
+      // (trajectory + velocity caps + streamed setpoints); progress is
+      // observed on the state streams. Discrete goals that return a result,
+      // distinct from the streamed setpoints on the upstream pairing slots.
+      exposes: [
+        // The postures contract's actions; formats come from the contract.
+        { link_id: "postures", name: "move_to_ready" },
+        { link_id: "postures", name: "move_to_home" },
+        // The limb_motion contract's actions; formats come from the
+        // contract. An SO-101 arm has five joints, so the joint move's
+        // generic joint vectors are pinned to that length: a goal carrying
+        // any other count is refused before the handler runs.
+        {
+          link_id: "limb_motion",
+          name: "move_arm_joints",
+          refine: {
+            goal_service: {
+              request_message_format: { joint_positions: { $length: 5 } },
+            },
+            result_service: {
+              response_message_format: { final_joint_positions: { $length: 5 } },
+            },
+          },
+        },
+        // Best effort orientation on a 5-DOF arm: the solution is verified
+        // against the target position; orientation is a soft objective.
+        { link_id: "limb_motion", name: "move_arm" },
+        { link_id: "limb_motion", name: "move_gripper" },
+      ]
+    },
+    topics: {
+      emits: [
+        // The leader role's topic on each downstream slot.
+        { link_id: "arm_link", name: "joint_setpoints" },
+        { link_id: "gripper_link", name: "gripper_setpoints" },
+        // The follower role's state back-channel on each upstream slot: the
+        // measured state relayed from the matching downstream pair.
+        { link_id: "leader_arm", name: "joint_states" },
+        { link_id: "leader_gripper", name: "gripper_states" },
+        // The measured end-effector pose (FK of the measured joints).
+        // Published only under upstream_mode "pose".
+        { link_id: "leader_pose", name: "pose_states" },
+        // The contract-backed whole-robot readout; format comes from the
+        // contract.
+        { link_id: "limb_state", name: "limb_states" },
+      ],
+      consumes: [
+        { link_id: "arm_link", name: "joint_states" },
+        { link_id: "gripper_link", name: "gripper_states" },
+        { link_id: "leader_arm", name: "joint_setpoints" },
+        { link_id: "leader_pose", name: "pose_setpoints" },
+        { link_id: "leader_gripper", name: "gripper_setpoints" },
+      ],
+    },
+  },
+  execution: {
+    language: "python",
+    container: {
+      def_file: "apptainer.def",
+    },
+    parameters: {
+      // Which upstream command kind this instance follows: "joints"
+      // (joint_link: so101_leader, a policy runner) or "pose" (pose_link:
+      // xr_commander, a keyboard teleop). Only the named kind is subscribed;
+      // a leader linked to the other kind streams into a slot nothing reads.
+      upstream_mode: "string",
+      // Coordination loop rate (Hz, 1..=1000): the rate setpoints stream
+      // downstream. 60 is the validated rate; in pose mode the streaming IK
+      // runs inside the tick, so higher rates are untested there.
+      control_rate_hz: "u32",
+      // Per-joint peak velocity (rad/s), shoulder_pan..wrist_roll: sizes the
+      // action trajectories (postures, move_arm) and bounds the per-tick
+      // joint steps of the pose stream's machine-generated IK output. Never
+      // shapes a joints-led teleop stream, which passes through under the
+      // end-effector governor alone. Universal control constants for this
+      // arm, so they keep node defaults like gains.
+      max_joint_velocity_rad_s_1: { $type: "f64", $default: 2.0 },
+      max_joint_velocity_rad_s_2: { $type: "f64", $default: 2.0 },
+      max_joint_velocity_rad_s_3: { $type: "f64", $default: 2.0 },
+      max_joint_velocity_rad_s_4: { $type: "f64", $default: 2.0 },
+      max_joint_velocity_rad_s_5: { $type: "f64", $default: 2.0 },
+      // The joints-led stream's one sanctioned limiter: max end-effector
+      // speed. A streamed sample within the caps passes through untouched;
+      // one that would exceed them moves the end effector at cap speed
+      // along the same path. Operational choices with no safe universal
+      // value, so the launcher states them (openarm's backbone holds the
+      // same pair).
+      max_ee_velocity_m_s: "f64",
+      max_ee_angular_velocity_rad_s: "f64",
+      // Peak gripper travel rate (fraction of full travel per second);
+      // within one tick's step the leader's opening passes through exactly.
+      max_gripper_rate_frac_s: "f64",
+    },
+  },
+}

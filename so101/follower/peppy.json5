@@ -1,0 +1,88 @@
+// One SO-101 follower arm (real hardware): five revolute joints plus the
+// gripper, six Feetech STS3215 servos on one half-duplex serial bus, so one
+// node owns the whole device. A pure follower of the so101_backbone:
+// setpoints stream in on the two pairing slots and the measured state streams
+// back on them; the node carries no motion logic of its own.
+//
+// The servos run position control in firmware (the STS3215 has no torque or
+// current mode), so there is no dynamics model, no gravity or friction
+// feedforward, and any setpoint carrying a non-empty efforts vector is
+// dropped with a logged refusal. The write path is the lerobot reference
+// teleop's own: goals reach the bus unclamped and unfiltered; the servo
+// EPROM position limits (written by lerobot calibration) are the guard.
+{
+  peppy_schema: "node/v1",
+  manifest: {
+    name: "so101_follower",
+    tag: "v1",
+    implements: [
+      // Ready once the bus is connected, calibration is verified, and the
+      // first full position read has landed.
+      { name: "component_ready", tag: "v1", link_id: "ready" },
+      // Per-motor temperature, load, and torque-enable telemetry, six
+      // motors in bus order (five joints then the gripper), matching the
+      // joint_link order. A motor whose torque drops out mid-run reports
+      // the fault level: silently disabled motors must never read healthy.
+      { name: "motor_health", tag: "v1", link_id: "motor_health" },
+      // Operator alerts: a motor running hot, overloaded, faulted,
+      // silently disabled, or not reporting.
+      { name: "alert", tag: "v1", link_id: "alerts" },
+    ],
+    depends_on: {
+      pairings: [
+        // The exclusive command loops with the backbone. Optional: the arm
+        // boots, holds position, and reports health with nothing paired.
+        { name: "joint_link", tag: "v1", role: "follower", link_id: "arm", optional: true },
+        { name: "gripper_link", tag: "v1", role: "follower", link_id: "gripper", optional: true },
+      ],
+    },
+  },
+  interfaces: {
+    topics: {
+      emits: [
+        { link_id: "arm", name: "joint_states" },
+        { link_id: "gripper", name: "gripper_states" },
+        { link_id: "motor_health", name: "motor_health" },
+        { link_id: "alerts", name: "alerts" },
+      ],
+      consumes: [
+        { link_id: "arm", name: "joint_setpoints" },
+        { link_id: "gripper", name: "gripper_setpoints" },
+      ],
+    },
+    services: {
+      exposes: [
+        { link_id: "ready", name: "is_ready" },
+      ],
+    },
+  },
+  execution: {
+    language: "python",
+    container: {
+      def_file: "apptainer.def",
+      mount_paths: [
+        "${parameters:device_path}:${parameters:device_path}:rw",
+        "${parameters:calibration_dir}",
+      ],
+    },
+    parameters: {
+      // Serial device of the motor bus; point launchers at a stable udev
+      // symlink, the two SO-101 adapters are otherwise identical.
+      device_path: "string",
+      // Host directory of lerobot calibration JSONs; the file used is
+      // <calibration_dir>/<robot_id>.json, written by lerobot-calibrate.
+      // The node refuses to start uncalibrated.
+      calibration_dir: "string",
+      // Calibration identity (file stem) of this arm.
+      robot_id: "string",
+      // Hardware-loop rate (Hz, 5..=1000): one goal write plus one position
+      // read per tick, and the loop the health reads decimate from, which is
+      // what sets the lower bound. Required: pick deliberately per
+      // deployment; 60 is lerobot's validated teleop rate for this bus.
+      control_rate_hz: "u32",
+      // Rate (Hz, 1..=1000) of the measured-state streams. Ticks the
+      // hardware loop did not refresh are skipped, so this is an upper bound.
+      state_rate_hz: "u32",
+    },
+  },
+}
