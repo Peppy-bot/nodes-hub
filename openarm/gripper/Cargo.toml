@@ -1,0 +1,20 @@
+[package]
+name = "openarm_gripper"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+openarm_can = { git = "https://github.com/Peppy-bot/public-peppy-libs", branch = "main", package = "openarm_can" }
+control_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", branch = "main", package = "control_core" }
+# Supplies the HardwareVersion/Side parse the arm node uses, so both limbs
+# accept the same generation names.
+openarm_description = { git = "https://github.com/Peppy-bot/public-peppy-libs", branch = "main", package = "openarm_description" }
+peppygen = { path = ".peppy/libs/peppygen" }
+peppylib = { path = ".peppy/libs/peppylib" }
+
+[dev-dependencies]
+peppygen = { path = ".peppy/libs/peppygen", features = ["testing"] }

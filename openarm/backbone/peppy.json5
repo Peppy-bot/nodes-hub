@@ -1,0 +1,238 @@
+// openarm_backbone: the bimanual coordination node. Plays the follower role
+// toward the one leading node (panel, KER, or headset): raw setpoints stream in
+// on those pairs and the measured state relays back up them. Exposes the joint /
+// Cartesian / gripper move actions and executes them itself; emits
+// collision_status; and drives each arm and each gripper over its own downstream
+// pairing (leader role): governed setpoints stream down each pair and the
+// measured state streams back on it. See src/main.rs.
+//
+// An arm's upstream command is joints (joint_link) or an end-effector pose
+// (pose_link), never both: `upstream_mode` picks one per instance and only
+// that slot kind is subscribed.
+//
+// Every end-effector pose here, commanded or reported, is the gripper's grasp
+// point: on the jaw closing axis midway between the pads, not the wrist flange
+// they mount on. Commanding an object's centre puts the pads around it.
+{
+  peppy_schema: "node/v1",
+  manifest: {
+    name: "openarm_backbone",
+    tag: "v1",
+    implements: [
+      // Whole-robot state snapshots for consumers that hold no pairing:
+      // joint positions, grasp-point poses, and gripper openings.
+      { name: "limb_state", tag: "v1", link_id: "limb_state" },
+      // The per-limb moves: one arm to a joint target or a grasp-point pose
+      // (run by that arm's planner), one gripper to an opening (run by the
+      // coordinator). arm_name and gripper_name address the side: left_arm /
+      // right_arm and left_gripper / right_gripper.
+      { name: "limb_motion", tag: "v1", link_id: "limb_motion" },
+      // The governor proximity readout, published for any consumer that
+      // binds the capability (the panel's readout, an MCP resource).
+      { name: "collision_status", tag: "v1", link_id: "collision_status" },
+      // The whole-robot posture moves: both arms to Ready or Home through
+      // the same admission and planner path as move_arm_joints.
+      { name: "postures", tag: "v1", link_id: "postures" },
+    ],
+    depends_on: {
+      contracts: [
+        { name: "robot_ready", tag: "v1", link_id: "robot_init" },
+        // Runtime governor controls: an optional backbone feature, since not
+        // every leader can produce them. A vacant slot leaves the launch-time
+        // band standing.
+        { name: "openarm_governor_control", tag: "v1", link_id: "collision_ctrl", cardinality: "zero_or_one" }
+      ],
+      pairings: [
+        // The exclusive command loop with the one leading node (panel or
+        // KER), one slot per driven limb: the backbone plays the follower
+        // role, consumes the raw setpoint stream each slot carries, governs it,
+        // and relays that limb's measured state back up the same slot. Optional:
+        // ungoverned deployments and monitors boot with these unbound.
+        // Subscribed only under `upstream_mode: "joints"`.
+        { name: "joint_link", tag: "v1", role: "follower", link_id: "leader_left_arm", optional: true },
+        { name: "joint_link", tag: "v1", role: "follower", link_id: "leader_right_arm", optional: true },
+        // The Cartesian alternative, one slot per arm: a world-frame
+        // end-effector pose streams in and the measured pose relays back.
+        // Subscribed only under `upstream_mode: "pose"`.
+        { name: "pose_link", tag: "v1", role: "follower", link_id: "leader_left_arm_pose", optional: true },
+        { name: "pose_link", tag: "v1", role: "follower", link_id: "leader_right_arm_pose", optional: true },
+        { name: "gripper_link", tag: "v1", role: "follower", link_id: "leader_left_gripper", optional: true },
+        { name: "gripper_link", tag: "v1", role: "follower", link_id: "leader_right_gripper", optional: true },
+        // The exclusive command loop with each arm: the backbone plays the leader
+        // role, streams the governed joint setpoint down each slot's
+        // joint_setpoints, and reads that arm's measured state back on the slot's
+        // joint_states (the governor's d_now and the trajectory anchor); the slot
+        // scopes both directions, so no per-side demux and no other producer can
+        // drive an arm or pose as its state. Optional like the gripper slots
+        // below, established at this instance's start (launcher `links:`).
+        { name: "joint_link", tag: "v1", role: "leader", link_id: "left_arm_link", optional: true },
+        { name: "joint_link", tag: "v1", role: "leader", link_id: "right_arm_link", optional: true },
+        // The exclusive command loop with each gripper: the backbone plays the
+        // leader role, streams the governed opening down each slot's
+        // gripper_setpoints, and reads that gripper's measured aperture back on
+        // the slot's gripper_states; the slot scopes both directions, so no
+        // per-side demux and no other producer can pose as the fingers.
+        // Optional: the backbone boots with either gripper unpaired (that side's
+        // governed openings go nowhere and no aperture arrives, so streaming
+        // stays gated) and each pair is established at this instance's start
+        // (launcher `links:`).
+        { name: "gripper_link", tag: "v1", role: "leader", link_id: "left_gripper_link", optional: true },
+        { name: "gripper_link", tag: "v1", role: "leader", link_id: "right_gripper_link", optional: true }
+      ]
+    }
+  },
+  interfaces: {
+    actions: {
+      // The backbone's move actions: the per-arm and gripper moves are
+      // addressed by side name, the posture moves take the whole robot. The
+      // backbone runs each move itself (trajectory + governor + governed
+      // stream); progress is observed on the state streams. Discrete goals
+      // that return a result, distinct from the streamed setpoints on the
+      // upstream pairing slots.
+      exposes: [
+        // The postures contract's actions; formats come from the contract.
+        { link_id: "postures", name: "move_to_ready" },
+        { link_id: "postures", name: "move_to_home" },
+        // The limb_motion contract's actions; formats come from the contract.
+        // An OpenArm arm has seven joints, so the joint move's generic joint
+        // vectors are pinned to that length: a goal carrying any other count
+        // is refused before the handler runs.
+        {
+          link_id: "limb_motion",
+          name: "move_arm_joints",
+          refine: {
+            goal_service: {
+              request_message_format: { joint_positions: { $length: 7 } },
+            },
+            result_service: {
+              response_message_format: { final_joint_positions: { $length: 7 } },
+            },
+          },
+        },
+        { link_id: "limb_motion", name: "move_arm" },
+        { link_id: "limb_motion", name: "move_gripper" },
+      ]
+    },
+    topics: {
+      emits: [
+        // The leader role's topic on each pairing slot: the governed
+        // setpoint this node streams down to the paired arm or gripper. The
+        // pairing document owns the shape and QoS, so these entries carry
+        // only the reference. Emit coverage is exact: every topic the
+        // leader role emits needs exactly one entry per slot.
+        { link_id: "left_arm_link", name: "joint_setpoints" },
+        { link_id: "right_arm_link", name: "joint_setpoints" },
+        { link_id: "left_gripper_link", name: "gripper_setpoints" },
+        { link_id: "right_gripper_link", name: "gripper_setpoints" },
+        // The follower role's state back-channel on each upstream slot: the
+        // measured state relayed from the matching downstream pair.
+        { link_id: "leader_left_arm", name: "joint_states" },
+        { link_id: "leader_right_arm", name: "joint_states" },
+        { link_id: "leader_left_gripper", name: "gripper_states" },
+        { link_id: "leader_right_gripper", name: "gripper_states" },
+        // The Cartesian state back-channel on each pose_link slot: the
+        // measured end-effector pose, world frame. Published only under
+        // upstream_mode "pose".
+        { link_id: "leader_left_arm_pose", name: "pose_states" },
+        { link_id: "leader_right_arm_pose", name: "pose_states" },
+        // The contract-backed readouts; formats come from the contracts.
+        { link_id: "collision_status", name: "collision_status" },
+        { link_id: "limb_state", name: "limb_states" },
+      ],
+      consumes: [
+        // The counterpart-role topic of each pairing slot: the measured state
+        // each paired arm and gripper streams back. One entry per slot, so
+        // each stays addressable as peppygen.paired_topics.<slot>.<topic>.
+        { link_id: "left_arm_link", name: "joint_states" },
+        { link_id: "right_arm_link", name: "joint_states" },
+        { link_id: "left_gripper_link", name: "gripper_states" },
+        { link_id: "right_gripper_link", name: "gripper_states" },
+        // The leading node's raw setpoints, one slot per limb (the slot is
+        // the side, so no id demux). Only the kind `upstream_mode` names is
+        // subscribed.
+        { link_id: "leader_left_arm", name: "joint_setpoints" },
+        { link_id: "leader_right_arm", name: "joint_setpoints" },
+        { link_id: "leader_left_arm_pose", name: "pose_setpoints" },
+        { link_id: "leader_right_arm_pose", name: "pose_setpoints" },
+        { link_id: "leader_left_gripper", name: "gripper_setpoints" },
+        { link_id: "leader_right_gripper", name: "gripper_setpoints" },
+        { link_id: "collision_ctrl", name: "governor_control" }
+      ]
+    },
+    services: {
+      consumes: [
+        { link_id: "robot_init", name: "is_ready" }
+      ]
+    }
+  },
+  execution: {
+    language: "rust",
+    container: {
+      def_file: "apptainer.def"
+    },
+    parameters: {
+      // Which OpenArm hardware generation the arms are: "v1" or "v2". Selects the embedded
+      // description (openarm_description) the srs_model arms and the bimanual collision
+      // model are built from. The wrong generation mis-models the arms, so the
+      // launcher says which. The torso proxy is shared across generations (the
+      // bimanual stand is unchanged).
+      hardware_version: "string",
+      // Which upstream command kind this instance follows: "joints"
+      // (joint_link: panel, KER) or "pose" (pose_link: a Cartesian leader).
+      // Only the named kind is subscribed; a leader linked to the other kind
+      // streams into a slot nothing reads.
+      upstream_mode: "string",
+      // Coordination loop rate (Hz): the rate governed setpoints are streamed at.
+      control_rate_hz: "u32",
+      // Self-collision governor band (m), signed surface distance between the two
+      // arms. At/under d_stop_m motion toward contact is fully stopped; at/over
+      // d_safe_m it is unthrottled; between, it ramps linearly. Separating motion
+      // is never throttled (recovery from a tangle is always allowed). Require
+      // 0 < d_stop_m < d_safe_m. The collision model was validated against
+      // d_stop_m=0.005, d_safe_m=0.02: the rest-pose clearance (~24 mm of the nearest
+      // checked pair) sits just above d_safe_m, so the home pose is unthrottled and
+      // an approach throttles within ~2 cm.
+      d_stop_m: "f64",
+      d_safe_m: "f64",
+      // Governor state at launch, before the first governor_control message.
+      collision_governor_enabled: "bool",
+      // Per-joint peak velocity (rad/s) sizing the quintic trajectories and the
+      // stream chase. URDF joint velocity limits, identical for both hardware
+      // generations (the v2 URDF states the same values at lower precision); the
+      // backbone is the sole owner of motion sizing.
+      max_joint_velocity_rad_s_1: { $type: "f64", $default: 16.754666 },
+      max_joint_velocity_rad_s_2: { $type: "f64", $default: 16.754666 },
+      max_joint_velocity_rad_s_3: { $type: "f64", $default: 5.445426 },
+      max_joint_velocity_rad_s_4: { $type: "f64", $default: 5.445426 },
+      max_joint_velocity_rad_s_5: { $type: "f64", $default: 20.943946 },
+      max_joint_velocity_rad_s_6: { $type: "f64", $default: 20.943946 },
+      max_joint_velocity_rad_s_7: { $type: "f64", $default: 20.943946 },
+      // End-effector angular-speed cap (rad/s) for streamed poses and the
+      // servo reference. Require > 0. An operational governor cap like
+      // max_ee_velocity_m_s, so the launcher decides it (0.8 is MoveIt
+      // Servo's scale.rotational).
+      max_ee_angular_velocity_rad_s: "f64",
+      // End-effector linear-speed cap (m/s) for the stream chase, used only until
+      // the first governor_control message; after that the commander's streamed cap
+      // (openarm_commander) governs. Require > 0. The sim launchers set a
+      // permissive value; the real arm a conservative one.
+      max_ee_velocity_m_s: "f64",
+      // Largest rate (opening fraction per second) a gripper opening is driven at:
+      // 6.0 drives a full open or close in ~1/6 s. Used until the first
+      // governor_control message; after that the commander's streamed rate governs.
+      // Require finite and >= 0.01. The gripper node and its motor own the real
+      // opening speed, which is the lower of the two; this bounds the step the
+      // collision floor scan has to probe, so raising it costs probes per tick.
+      max_gripper_rate_frac_s: { $type: "f64", $default: 6.0 },
+      // Cutoff (Hz) for the first-order low-pass on each published desired velocity.
+      // Desired velocity is a per-tick position delta scaled by the control rate, so it
+      // amplifies setpoint noise; filtering it keeps the arm's Kd term from buzzing on a
+      // noisy stream without touching the desired position. At the 100 Hz control rate
+      // (Nyquist 50 Hz) this must sit well below Nyquist to attenuate; ~15 Hz matches the
+      // enactic reference's one-pole (its 90 rad/s constant is ~14.3 Hz) and adds about one
+      // tick of group delay. A universal control constant (same across generations and
+      // sim/real), so it keeps a node default like the gains.
+      velocity_filter_cutoff_hz: { $type: "f64", $default: 15.0 },
+    }
+  }
+}

@@ -1,0 +1,163 @@
+// openarm_commander: the browser-based commander. Serves a
+// control panel (HTTP + WebSocket on PEPPY_JC_PORT, default 8765) that streams
+// arm and gripper setpoints to the backbone over the joint_link / gripper_link
+// pairings (the backbone governs and re-streams them), reads live state by
+// observing the backbone's downstream pairings, jogs the arm in joint or
+// Cartesian (world-frame IK) space, and fires move_arm_joints / move_arm /
+// move_gripper goals through the limb_motion contract slot (the backbone).
+{
+  peppy_schema: "node/v1",
+  manifest: {
+    name: "openarm_web_commander",
+    tag: "v1",
+    implements: [
+      // Runtime on/off for the backbone's self-collision governor, driven by the UI.
+      { name: "openarm_governor_control", tag: "v1", link_id: "governor" },
+    ],
+    depends_on: {
+      nodes: [
+        // The dataset recorder behind the panel's record button. zero_or_more:
+        // a deployment without a recorder leaves the slot unbound and the
+        // panel hides the recording controls.
+        { name: "lerobot_recorder", tag: "v1", link_id: "recorder", cardinality: "zero_or_more" }
+      ],
+      contracts: [
+        // The discrete moves the panel fires in Actions mode (move_arm_joints
+        // is the "Send" button): one slot, bound by the launcher to the
+        // backbone instance.
+        { name: "limb_motion", tag: "v1", link_id: "limb_motion" },
+        // The proximity feed behind the readout, from whichever instance runs
+        // the collision governor: one slot, bound by the launcher to the
+        // backbone instance.
+        { name: "collision_status", tag: "v1", link_id: "collision_status" },
+        // Per-motor health from every motor-bearing follower the launcher
+        // wires, demuxed by the report's source. Zero producers is legal: a
+        // stack without health producers just renders n/a.
+        { name: "motor_health", tag: "v1", link_id: "motor_health", cardinality: "zero_or_more" },
+        // Operator alerts from any producer the launcher wires; the panel
+        // renders them without knowing what any producer measures.
+        { name: "alert", tag: "v1", link_id: "alerts", cardinality: "zero_or_more" }
+      ],
+      pairings: [
+        // The exclusive command loop with the backbone, one slot per driven
+        // limb: this panel plays the leader role and streams the operator's
+        // raw setpoints; the backbone governs them before anything reaches a
+        // follower. Optional: a monitor-only deployment (the leader owns the
+        // command loop) boots with these unbound and the panel is read-only.
+        { name: "joint_link", tag: "v1", role: "leader", link_id: "left_arm", optional: true },
+        { name: "joint_link", tag: "v1", role: "leader", link_id: "right_arm", optional: true },
+        { name: "gripper_link", tag: "v1", role: "leader", link_id: "left_gripper", optional: true },
+        { name: "gripper_link", tag: "v1", role: "leader", link_id: "right_gripper", optional: true },
+      ],
+      // Live readouts: observe each backbone<->follower pairing's state
+      // back-channel (positions for the sliders, gripper opening and effort
+      // ceiling for the aperture and effort controls). Observing works in
+      // every deployment, including ones where another node commands.
+      pairing_observers: [
+        { name: "joint_link", tag: "v1", role: "follower", link_id: "observed_left_arm" },
+        { name: "joint_link", tag: "v1", role: "follower", link_id: "observed_right_arm" },
+        { name: "gripper_link", tag: "v1", role: "follower", link_id: "observed_left_gripper" },
+        { name: "gripper_link", tag: "v1", role: "follower", link_id: "observed_right_gripper" },
+      ]
+    }
+  },
+  interfaces: {
+    services: {
+      consumes: [
+        // The panel's Finish-session button: the recorder finalizes and
+        // mirrors the current dataset and opens a fresh session in place.
+        { link_id: "recorder", name: "finish_session" }
+      ]
+    },
+    actions: {
+      // Goals fired by the operator land on the limb_motion producer, which runs
+      // the move itself for the side whose id matches.
+      consumes: [
+        // The panel drives OpenArm's seven-joint arms, so the joint move's
+        // generic joint vectors are pinned to that length, as on the backbone.
+        {
+          link_id: "limb_motion",
+          name: "move_arm_joints",
+          refine: {
+            goal_service: {
+              request_message_format: { joint_positions: { $length: 7 } },
+            },
+            result_service: {
+              response_message_format: { final_joint_positions: { $length: 7 } },
+            },
+          },
+        },
+        // Cartesian point-to-point: Execute-pose in the panel's Actions mode fires
+        // the producer's planned straight-line move rather than jogging there.
+        { link_id: "limb_motion", name: "move_arm" },
+        // Gripper open/close as a discrete governed action (Actions mode), rather
+        // than the streamed opening used in Streaming mode.
+        { link_id: "limb_motion", name: "move_gripper" },
+        // One dataset episode per goal: fired by the panel's record button,
+        // frame-count feedback while running, cancel = stop and save.
+        { link_id: "recorder", name: "record_episode" }
+      ]
+    },
+    topics: {
+      // Streams operator setpoints to the backbone on the per-limb pairing
+      // slots. Producing these is what lets the panel drive an enabled
+      // arm/gripper continuously instead of one move at a time; the backbone
+      // governs each and re-streams the governed value, so a follower clamps
+      // and rate-limits on its side. The governor control is re-published
+      // periodically (lossy QoS) so a dropped toggle cannot strand the backbone.
+      emits: [
+        { link_id: "left_arm", name: "joint_setpoints" },
+        { link_id: "right_arm", name: "joint_setpoints" },
+        { link_id: "left_gripper", name: "gripper_setpoints" },
+        { link_id: "right_gripper", name: "gripper_setpoints" },
+        { link_id: "governor", name: "governor_control" },
+      ],
+      consumes: [
+        { link_id: "collision_status", name: "collision_status" },
+        { link_id: "motor_health", name: "motor_health" },
+        { link_id: "alerts", name: "alerts" },
+        // The observed pairings' state back-channels.
+        { link_id: "observed_left_arm", name: "joint_states" },
+        { link_id: "observed_right_arm", name: "joint_states" },
+        { link_id: "observed_left_gripper", name: "gripper_states" },
+        { link_id: "observed_right_gripper", name: "gripper_states" },
+      ]
+    }
+  },
+  execution: {
+    language: "rust",
+    container: {
+      def_file: "apptainer.def"
+    },
+    parameters: {
+      // Rate (Hz) at which enabled targets are re-published on the arm and
+      // gripper pairing slots, which the backbone consumes.
+      command_rate_hz: "u32",
+      // Robot generation ("v1" or "v2"): picks the panel's arm joint ranges
+      // (URDF limits), so the launcher must be explicit. The gripper axis is
+      // the unitless opening fraction on every generation.
+      hardware_version: "string",
+      // Operator's launch end-effector speed cap (m/s), streamed live to the backbone on
+      // governor_control and retunable from the UI. Require > 0. The sim launchers
+      // set a permissive value; the real arm a conservative one.
+      max_ee_velocity_m_s: "f64",
+      // Operator's launch opening rate (fraction per second), streamed live to the
+      // backbone on governor_control and retunable from the UI: 6.0 drives a full open
+      // or close in ~1/6 s. Require > 0. Kept in step with the backbone's default; the
+      // gripper's own speed_rad_s is the other limit and the lower of the two wins.
+      max_gripper_rate_frac_s: { $type: "f64", $default: 6.0 },
+      // Joint-slider jog feel: the acceleration (rad/s^2) the streamed target ramps toward
+      // the slider under. The whole jog is acceleration-limited (ramp up, brake to rest),
+      // so this alone sets the smoothness. A node parameter so it can be tuned per
+      // deployment without a rebuild; the backbone still governs the final motion. Lower is
+      // gentler.
+      joint_jog_acceleration_rad_s2: { $type: "f64", $default: 10.0 },
+      // Launch state for the rest of the governor controls the commander streams live
+      // on governor_control, set per deployment in step with openarm_backbone. The
+      // band requires 0 < d_stop < d_safe.
+      collision_governor_enabled: "bool",
+      d_stop: "f64",
+      d_safe: "f64"
+    }
+  }
+}

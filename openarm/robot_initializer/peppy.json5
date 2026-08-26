@@ -1,0 +1,44 @@
+// Aggregates the component_ready signals from both arms
+// and grippers into the robot-level is_ready the backbone gates on. Returns
+// ready:true only once every bound component reports ready. Engine-agnostic:
+// the hardware drivers and the sim bridge nodes implement the same per-limb
+// contract, so one initializer serves every backend.
+{
+  peppy_schema: "node/v1",
+  manifest: {
+    name: "openarm_robot_initializer",
+    tag: "v1",
+    implements: [
+      { name: "robot_ready", tag: "v1", link_id: "robot_ready" },
+    ],
+    depends_on: {
+      // Per-side link_ids mirror backbone: the launcher pins each to the concrete
+      // arm/gripper instance whose readiness this node aggregates.
+      contracts: [
+        { name: "component_ready", tag: "v1", link_id: "left_arm" },
+        { name: "component_ready", tag: "v1", link_id: "right_arm" },
+        { name: "component_ready", tag: "v1", link_id: "left_gripper" },
+        { name: "component_ready", tag: "v1", link_id: "right_gripper" }
+      ]
+    }
+  },
+  interfaces: {
+    services: {
+      exposes: [
+        { link_id: "robot_ready", name: "is_ready" },
+      ],
+      consumes: [
+        { link_id: "left_arm", name: "is_ready" },
+        { link_id: "right_arm", name: "is_ready" },
+        { link_id: "left_gripper", name: "is_ready" },
+        { link_id: "right_gripper", name: "is_ready" }
+      ]
+    }
+  },
+  execution: {
+    language: "rust",
+    container: {
+      def_file: "apptainer.def",
+    },
+  },
+}

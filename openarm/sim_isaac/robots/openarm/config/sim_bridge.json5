@@ -1,0 +1,55 @@
+// Engine wiring for the Isaac openarm scene: the joint layout the bridge splits
+// measured state by and maps sim-passthrough setpoints onto, plus the MIT servo
+// gains and motor torque caps. Transport is typed peppygen (joint_states /
+// gripper_states out, arm_sim_passthrough / gripper_sim_passthrough in); no topic
+// names live here.
+{
+  // Per-arm joints, j1..j7, in order. arm_id matches the passthrough / state
+  // messages (0 = left, 1 = right). Names must match USD dof_names verbatim.
+  arms: [
+    {
+      arm_id: 0,
+      joints: [
+        "openarm_left_joint1", "openarm_left_joint2", "openarm_left_joint3",
+        "openarm_left_joint4", "openarm_left_joint5", "openarm_left_joint6",
+        "openarm_left_joint7",
+      ],
+    },
+    {
+      arm_id: 1,
+      joints: [
+        "openarm_right_joint1", "openarm_right_joint2", "openarm_right_joint3",
+        "openarm_right_joint4", "openarm_right_joint5", "openarm_right_joint6",
+        "openarm_right_joint7",
+      ],
+    },
+  ],
+
+  // Per-gripper finger joints; the bridge maps the commanded opening fraction
+  // onto each finger's own model travel and averages the travel fractions back
+  // into the measured opening.
+  grippers: [
+    { gripper_id: 0, fingers: ["openarm_left_finger_joint1", "openarm_left_finger_joint2"] },
+    { gripper_id: 1, fingers: ["openarm_right_finger_joint1", "openarm_right_finger_joint2"] },
+  ],
+
+  // Explicit PhysX finger drives. Without these the fingers can free-float
+  // when the arm moves if the imported USD has weak/default drive gains.
+  gripper_gains: {
+    kp: [80.0, 80.0],
+    kd: [2.0, 2.0],
+    max_efforts: [5.0, 5.0],
+  },
+
+  // MIT servo gains (j1..j7) applied to each arm's PhysX joint drives so sim
+  // dynamics match the real driver, plus the motor torque caps (DM8009/4340/4310)
+  // applied as max_efforts. gravity_compensation mirrors the real driver's
+  // in-process gravity feedforward by disabling gravity on the robot links.
+  // Fingers keep their USD drive defaults.
+  arm_gains: {
+    kp: [240.0, 240.0, 240.0, 240.0, 24.0, 31.0, 25.0],
+    kd: [3.0, 3.0, 3.0, 3.0, 0.2, 0.2, 0.2],
+    max_efforts: [40.0, 40.0, 27.0, 27.0, 7.0, 7.0, 7.0],
+    gravity_compensation: true,
+  },
+}

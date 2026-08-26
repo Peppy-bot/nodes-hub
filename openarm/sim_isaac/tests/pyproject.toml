@@ -1,0 +1,32 @@
+# The camera suites are their own uv project rather than part of the node
+# above them. The node manages nothing through uv: its python runs on the
+# interpreter its image ships, against the dependencies baked into that image.
+#
+# CI runs a python test project inside the image built from the apptainer.def
+# beside it, and gives a project with no def the scaffolded python base image.
+# There is no def here, which is what these suites want: they import no engine
+# module, so pulling the multi-gigabyte Isaac Sim image to run pure-python
+# assertions would buy them nothing.
+[project]
+name = "openarm-sim-isaac-tests"
+version = "0.1.0"
+description = "Tests for the openarm_sim_isaac camera plumbing"
+# One minor, so every run resolves the same interpreter.
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    # What camera_common reaches for: pyjson5 to read the checked-in camera
+    # config, numpy to pack depth. The pyjson5 pin is the one the node's base
+    # image installs (robot_initializer/scripts/requirements.isaac.txt), so
+    # the parser under test is the parser the node runs on. That file leaves
+    # numpy to Isaac Sim, which is free to move it, hence the floor here.
+    "numpy>=1.26",
+    "pyjson5==2.0.0",
+]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.uv]
+# The suites reach the node's modules through sys.path, so this project has
+# nothing importable of its own and no wheel to build.
+package = false

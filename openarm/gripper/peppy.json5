@@ -1,0 +1,98 @@
+// One gripper of the openarm robot (real hardware); instantiate twice, one per
+// side, with a distinct `gripper_id`. Both hardware generations run through this
+// node, selected by `hardware_version`: the v1.0 prismatic parallel jaws (MIT
+// position hold, no force control) and the v2.0 revolute pinch fingers
+// (POS_FORCE, with a speed limit, a grip-force ceiling, and force feedback).
+// This is a root component node; openarm_backbone depends on it, not the other
+// way around. It carries no motion logic: it relays the backbone's governed
+// opening to the motor and reports the measured opening, grip effort, and
+// effort ceiling back.
+{
+  peppy_schema: "node/v1",
+  manifest: {
+    name: "openarm_gripper",
+    tag: "v1",
+    implements: [
+      // Per-component readiness for the real robot_initializer.
+      { name: "component_ready", tag: "v1", link_id: "ready" },
+      // Per-motor condition telemetry: the gripper is the same DM motor as
+      // every arm joint, with the same fault behaviour mid-grasp.
+      { name: "motor_health", tag: "v1", link_id: "motor_health" },
+      // Operator alerts raised from that condition.
+      { name: "alert", tag: "v1", link_id: "alerts" },
+    ],
+    depends_on: {
+      pairings: [
+        // The exclusive control conversation with ONE backbone instance:
+        // streamed opening setpoints in, measured aperture back, both scoped
+        // to the pair (no gripper_id demux). Optional: the gripper boots
+        // unpaired (moves still work via backbone goals) and is paired at
+        // the backbone's start.
+        { name: "gripper_link", tag: "v1", role: "follower", link_id: "backbone", optional: true },
+      ],
+    },
+  },
+  interfaces: {
+    topics: {
+      emits: [
+        // The `backbone` pairing slot: the topic this role emits.
+        { link_id: "backbone", name: "gripper_states" },
+        { link_id: "motor_health", name: "motor_health" },
+        { link_id: "alerts", name: "alerts" },
+      ],
+      consumes: [
+        // The counterpart role's topic on the same slot.
+        { link_id: "backbone", name: "gripper_setpoints" },
+      ],
+    },
+    services: {
+      exposes: [
+        { link_id: "ready", name: "is_ready" },
+      ],
+    },
+  },
+  execution: {
+    language: "rust",
+    container: {
+      def_file: "apptainer.def"
+    },
+    parameters: {
+      gripper_id: "u8",
+      can_interface: "string",
+      // Which OpenArm hardware generation this gripper drives: "v1" or "v2". Selects
+      // the motor's control mode and this side's opening geometry (the v2 fingers are
+      // mechanically mirrored, the v1 jaws are not). Required, not defaulted: the wrong
+      // generation would command the motor in the wrong mode and the wrong direction,
+      // so the launcher must be explicit. Same values the arm's `hardware_version` takes.
+      hardware_version: "string",
+      // Hardware-loop rate (Hz), in 1..=1_000_000. Pick deliberately per deployment;
+      // the stack currently unifies on 100 Hz across arms and grippers.
+      control_rate_hz: "u32",
+      // Per-cycle CAN read deadline (μs), in 1..=100_000. Should fit the cycle budget
+      // (10 ms at 100 Hz); the ceiling exists so a typo cannot park recv_all in a long
+      // ppoll holding the CAN mutex the shutdown hooks need.
+      recv_timeout_us: { $type: "u32", $default: 1000 },
+      // POS_FORCE absolute speed limit (rad/s at the motor), read by the v2 command
+      // path. Must be in [0.01, 100]: the wire's speed field spans that range and clamps
+      // above it, so a larger value would be silently reduced rather than applied, and
+      // carries hundredths and truncates, so a smaller one would command a full stop.
+      // Default matches enactic's reference (test_gripper_posforce).
+      speed_rad_s: { $type: "f64", $default: 25.0 },
+      // Largest grip force the gripper applies, N*m at the motor shaft, in [0.001, 7.0]
+      // on the DM4310 both generations drive. Read by the v2 command path; a commanded
+      // max_effort only lowers a tick's cap beneath it, and this is what gripper_states
+      // reports as the effort ceiling. The floor is the wire's resolution: anything the
+      // torque-current field truncates to zero would grip nothing while publishing the
+      // ceiling the gripper_link contract reserves for "no effort control". The bound is
+      // the motor's datasheet peak, which it may only produce in bursts; a grip that is
+      // held belongs at or below the 3.0 N*m continuous rating. Operational, so the
+      // launcher names it; the default is the motor's continuous rating, the strongest
+      // grip it can hold indefinitely. The v1 MIT mode carries no per-command force
+      // limit and reports a 0 ceiling.
+      max_effort_nm: { $type: "f64", $default: 3.0 },
+      // Rate (Hz) of the always-on measured-state stream (`gripper_states`), in
+      // 1..=1_000_000; consumers' needs vary too much for a default to be meaningful.
+      state_rate_hz: "u32"
+    }
+  },
+}

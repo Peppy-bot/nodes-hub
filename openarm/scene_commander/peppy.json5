@@ -1,0 +1,96 @@
+{
+  peppy_schema: "node/v1",
+
+  manifest: {
+    name: "openarm_scene_commander",
+    tag: "v1",
+
+    labels: [
+      "openarm",
+      "isaac",
+      "scene",
+      "commander",
+      "web",
+    ],
+
+    depends_on: {
+      nodes: [
+        {
+          name: "openarm_sim_isaac",
+          tag: "v1",
+          link_id: "simulation",
+          cardinality: "one",
+        },
+      ],
+    },
+  },
+
+  interfaces: {
+    services: {
+      consumes: [
+        {
+          link_id: "simulation",
+          name: "get_assets_list",
+        },
+        {
+          link_id: "simulation",
+          name: "get_objects_list",
+        },
+      ],
+    },
+
+    actions: {
+      consumes: [
+        {
+          link_id: "simulation",
+          name: "load_scene",
+        },
+        {
+          link_id: "simulation",
+          name: "clear_scene",
+        },
+        {
+          link_id: "simulation",
+          name: "spawn_object",
+        },
+        {
+          link_id: "simulation",
+          name: "move_object",
+        },
+        {
+          link_id: "simulation",
+          name: "remove_object",
+        },
+        {
+          link_id: "simulation",
+          name: "apply_force",
+        },
+
+        {
+          link_id: "simulation",
+          name: "move_robot",
+        },
+      ],
+    },
+  },
+
+  execution: {
+    language: "python",
+
+    container: {
+      def_file: "apptainer.def",
+    },
+
+    parameters: {
+      http_host: {
+        $type: "string",
+        $default: "0.0.0.0",
+      },
+
+      http_port: {
+        $type: "u32",
+        $default: 8766,
+      },
+    },
+  },
+}

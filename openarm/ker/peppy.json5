@@ -1,0 +1,99 @@
+// openarm_ker: commander entry point driven by the OpenArm KER (Kinematic
+// Equivalent Replica), enactic's motorless bimanual leader arm. Reads the
+// KER's encoder frames from its M5Stack CoreS3 over USB vendor mode (or
+// serial CDC), maps the channels to per-side joint radians and the triggers
+// to gripper opening fractions, and streams both to the backbone over the
+// joint_link / gripper_link pairings exactly like openarm_commander (the
+// backbone governs everything before it reaches a follower). The KER's thumb
+// button is the engage deadman: while disengaged the node emits nothing and
+// the robot holds at its last setpoints.
+// KER's joint structure matches OpenArm v2 1:1 (links scaled to 70%), so no
+// coordinate transform is involved; v1 followers accept the same joint-space
+// stream but are not geometrically equivalent.
+{
+  peppy_schema: "node/v1",
+  manifest: {
+    name: "openarm_ker",
+    tag: "v1",
+    depends_on: {
+      pairings: [
+        // The exclusive command loop with the backbone, one slot per driven
+        // limb: this leader plays the leader role and streams the raw
+        // setpoints; the backbone governs them. The state back-channels are
+        // not consumed (the leader is open loop). Optional so a bring-up
+        // launch can boot the leader unbound.
+        { name: "joint_link", tag: "v1", role: "leader", link_id: "left_arm", optional: true },
+        { name: "joint_link", tag: "v1", role: "leader", link_id: "right_arm", optional: true },
+        { name: "gripper_link", tag: "v1", role: "leader", link_id: "left_gripper", optional: true },
+        { name: "gripper_link", tag: "v1", role: "leader", link_id: "right_gripper", optional: true },
+      ],
+    },
+  },
+  interfaces: {
+    // Streams both arms' leader setpoints and both trigger openings to the
+    // backbone on the per-limb pairing slots. governor_control stays owned by
+    // the openarm_commander panel: this node produces motion, not governor
+    // tuning.
+    topics: {
+      emits: [
+        { link_id: "left_arm", name: "joint_setpoints" },
+        { link_id: "right_arm", name: "joint_setpoints" },
+        { link_id: "left_gripper", name: "gripper_setpoints" },
+        { link_id: "right_gripper", name: "gripper_setpoints" },
+      ],
+    },
+  },
+  execution: {
+    language: "rust",
+    container: {
+      def_file: "apptainer.def"
+    },
+    parameters: {
+      // "usb" reads the M5Stack in vendor mode (VID 0x303A, PID 0x4002, bulk
+      // endpoints); "serial" reads the CDC device at serial_port/serial_baud.
+      transport: { $type: "string", $default: "usb" },
+      serial_port: { $type: "string", $default: "/dev/m5_ker_485" },
+      serial_baud: { $type: "u32", $default: 2000000 },
+      // Follower generation ("v1" or "v2"): picks the joint clamp ranges (URDF
+      // limits). Required, not defaulted: KER mirrors v2, so the launcher
+      // states the target explicitly.
+      hardware_version: "string",
+      // Rate (Hz) at which engaged setpoints are re-published on the arm and
+      // gripper pairing slots.
+      command_rate_hz: "u32",
+      // KER channel wiring and calibration, CSV strings parsed once at
+      // startup. Channels are the device's 1-based CH indices; each side lists
+      // its 7 joint channels in j1..j7 order. Signs are +-1 per joint;
+      // offsets_deg are added after the sign, in the follower's joint frame.
+      // Required, never defaulted: these are physical facts of one KER unit
+      // pinned during bring-up, and a wrong guess streams a miscalibrated
+      // pose.
+      left_channels: "string",
+      right_channels: "string",
+      left_signs: "string",
+      right_signs: "string",
+      left_offsets_deg: "string",
+      right_offsets_deg: "string",
+      // Trigger (J8) channels and their angle (deg) at closed (opening 0) and
+      // fully open (opening 1); openings interpolate linearly and clamp to
+      // [0, 1]. Per side: the mirrored trigger mechanisms may read opposite
+      // directions.
+      left_trigger_channel: "u32",
+      right_trigger_channel: "u32",
+      left_trigger_closed_deg: "f64",
+      left_trigger_open_deg: "f64",
+      right_trigger_closed_deg: "f64",
+      right_trigger_open_deg: "f64",
+      // "toggle": the thumb button's rising edge toggles engaged/disengaged
+      // for the whole device. "always": engaged whenever frames are fresh
+      // (the escape hatch if a unit's button reads unreliably).
+      engage_mode: { $type: "string", $default: "toggle" },
+      // Stop publishing when the newest KER frame is older than this (s); the
+      // followers then hold their last setpoints. Must exceed the device's
+      // frame period.
+      stale_timeout_s: { $type: "f64", $default: 0.25 },
+      // Bring-up aid: log the raw channel table (degrees, unmapped) at 1 Hz.
+      log_raw: { $type: "bool", $default: false }
+    }
+  }
+}

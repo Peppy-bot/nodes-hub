@@ -1,0 +1,358 @@
+// The Isaac Sim engine node.
+//
+// It plays the follower role of every limb's joint_link / gripper_link
+// pairing: governed arm/gripper setpoints arrive from the simulation relay
+// nodes and measured state streams back.
+//
+// The node also exposes runtime scene/object services and actions intended to
+// be consumed by higher-level tools such as openarm_scene_commander.
+//
+// Public Peppy interfaces use stable asset_id and object_id identifiers rather
+// than exposing Isaac USD paths directly. The existing TCP runtime commander
+// remains available as a developer/debug path for raw USD/path operations.
+{
+  peppy_schema: "node/v1",
+
+  manifest: {
+    name: "openarm_sim_isaac",
+    tag: "v1",
+
+    depends_on: {
+      pairings: [
+        // The engine plays the follower role of every limb's pairing directly,
+        // one slot per limb. The slot identifies the side, so no arm_id or
+        // gripper_id demultiplexing is required.
+        //
+        // These pairings are optional so Isaac can also run standalone.
+        { name: "joint_link", tag: "v1", role: "follower", link_id: "left_arm", optional: true },
+        { name: "joint_link", tag: "v1", role: "follower", link_id: "right_arm", optional: true },
+        { name: "gripper_link", tag: "v1", role: "follower", link_id: "left_gripper", optional: true },
+        { name: "gripper_link", tag: "v1", role: "follower", link_id: "right_gripper", optional: true },
+        // Robot-mounted cameras rendered from the live scene, one slot per
+        // camera (the slot is the camera, so no id demux). The engine plays the
+        // camera role; a per-camera relay presents the rgb/rgbd contract.
+        // Optional: slots stay unbound (and rendering stays off) outside record
+        // stacks; frames flow only when cameras_enabled is set.
+        { name: "sim_rgb_camera_link", tag: "v1", role: "camera", link_id: "wrist_left", optional: true },
+        { name: "sim_rgb_camera_link", tag: "v1", role: "camera", link_id: "wrist_right", optional: true },
+        { name: "sim_rgbd_camera_link", tag: "v1", role: "camera", link_id: "chest", optional: true },
+      ],
+    },
+  },
+
+  interfaces: {
+    // ------------------------------------------------------------------
+    // Runtime scene/object discovery services
+    // ------------------------------------------------------------------
+    services: {
+      exposes: [
+        {
+          // Return the Isaac-side asset catalogue.
+          //
+          // assets_json is a JSON-encoded array whose entries contain
+          // application-facing metadata such as:
+          //
+          //   asset_id
+          //   display_name
+          //   kind
+          //
+          // The catalogue keeps raw Isaac USD paths private to this node.
+          name: "get_assets_list",
+
+          response_message_format: {
+            success: "bool",
+            message: "string",
+            assets_json: "string",
+          },
+        },
+
+        {
+          // Return currently spawned runtime objects.
+          //
+          // objects_json is a JSON-encoded array whose entries contain
+          // runtime metadata such as:
+          //
+          //   object_id
+          //   asset_id
+          //   position
+          //
+          // This allows clients to rediscover scene state after reconnecting.
+          name: "get_objects_list",
+
+          response_message_format: {
+            success: "bool",
+            message: "string",
+            objects_json: "string",
+          },
+        },
+      ],
+    },
+
+    // ------------------------------------------------------------------
+    // Runtime scene/object actions
+    // ------------------------------------------------------------------
+    //
+    // These are discrete operations rather than continuously streamed
+    // topics. The action implementation enqueues the requested command onto
+    // the Isaac simulation thread and reuses
+    // SimLauncher.execute_runtime_command().
+    actions: {
+      exposes: [
+        {
+          // Load or replace /World/RuntimeScene using an asset from the
+          // Isaac-side catalogue.
+          //
+          // asset_id is obtained from get_assets_list().
+          name: "load_scene",
+
+          goal_service: {
+            request_message_format: {
+              asset_id: "string",
+              scale: "f64",
+            },
+          },
+
+          result_service: {
+            response_message_format: {
+              success: "bool",
+              message: "string",
+            },
+          },
+        },
+
+        {
+          // Remove the currently loaded /World/RuntimeScene and clear runtime
+          // scene state managed by the scene commander.
+          name: "clear_scene",
+
+          goal_service: {},
+
+          result_service: {
+            response_message_format: {
+              success: "bool",
+              message: "string",
+            },
+          },
+        },
+
+        {
+          // Spawn one instance of an asset from the Isaac-side catalogue.
+          //
+          // asset_id is obtained from get_assets_list().
+          //
+          // Isaac owns runtime object identity and returns a unique object_id
+          // for the newly created instance.
+          //
+          // physics:
+          //   "none"
+          //   "static"
+          //   "dynamic"
+          //
+          // mass is interpreted in kilograms when dynamic physics is used.
+          name: "spawn_object",
+
+          goal_service: {
+            request_message_format: {
+              asset_id: "string",
+
+              position: {
+                $type: "array",
+                $items: "f64",
+                $length: 3,
+              },
+
+              scale: "f64",
+              physics: "string",
+              mass: "f64",
+            },
+          },
+
+          result_service: {
+            response_message_format: {
+              success: "bool",
+              message: "string",
+
+              // Unique runtime instance identifier.
+              // Empty when spawning fails.
+              object_id: "string",
+            },
+          },
+        },
+
+        {
+          // Move one particular runtime object instance.
+          //
+          // object_id is returned by spawn_object() or discovered through
+          // get_objects_list().
+          name: "move_object",
+
+          goal_service: {
+            request_message_format: {
+              object_id: "string",
+
+              position: {
+                $type: "array",
+                $items: "f64",
+                $length: 3,
+              },
+            },
+          },
+
+          result_service: {
+            response_message_format: {
+              success: "bool",
+              message: "string",
+            },
+          },
+        },
+
+        {
+          // Remove one particular runtime object instance.
+          //
+          // object_id is returned by spawn_object() or discovered through
+          // get_objects_list().
+          name: "remove_object",
+
+          goal_service: {
+            request_message_format: {
+              object_id: "string",
+            },
+          },
+
+          result_service: {
+            response_message_format: {
+              success: "bool",
+              message: "string",
+            },
+          },
+        },
+
+        {
+          // Apply a world-frame force to a spawned dynamic object.
+          //
+          // force = [Fx, Fy, Fz] in Newtons.
+          // duration_s controls how long PhysX keeps the force enabled.
+          name: "apply_force",
+
+          goal_service: {
+            request_message_format: {
+              object_id: "string",
+
+              force: {
+                $type: "array",
+                $items: "f64",
+                $length: 3,
+              },
+
+              duration_s: "f64",
+            },
+          },
+
+          result_service: {
+            response_message_format: {
+              success: "bool",
+              message: "string",
+            },
+          },
+        },
+
+        {
+          // Move the OpenArm robot root in the Isaac world frame.
+          //
+          // position = [x, y, z] in metres.
+          name: "move_robot",
+
+          goal_service: {
+            request_message_format: {
+              position: {
+                $type: "array",
+                $items: "f64",
+                $length: 3,
+              },
+            },
+          },
+
+          result_service: {
+            response_message_format: {
+              success: "bool",
+              message: "string",
+            },
+          },
+        },
+      ],
+    },
+
+    // ------------------------------------------------------------------
+    // Arm / gripper simulation streams
+    // ------------------------------------------------------------------
+    topics: {
+      emits: [
+        { link_id: "left_arm", name: "joint_states" },
+        { link_id: "right_arm", name: "joint_states" },
+        { link_id: "left_gripper", name: "gripper_states" },
+        { link_id: "right_gripper", name: "gripper_states" },
+        { link_id: "wrist_left", name: "video_stream" },
+        { link_id: "wrist_left", name: "stream_info" },
+        { link_id: "wrist_right", name: "video_stream" },
+        { link_id: "wrist_right", name: "stream_info" },
+        { link_id: "chest", name: "video_stream" },
+        { link_id: "chest", name: "depth_stream" },
+        { link_id: "chest", name: "stream_info" },
+      ],
+
+      consumes: [
+        { link_id: "left_arm", name: "joint_setpoints" },
+        { link_id: "right_arm", name: "joint_setpoints" },
+        { link_id: "left_gripper", name: "gripper_setpoints" },
+        { link_id: "right_gripper", name: "gripper_setpoints" },
+      ],
+    },
+  },
+
+  execution: {
+    language: "python",
+
+    container: {
+      def_file: "apptainer.def",
+
+      apptainer_run_extra_args: [
+        "--nv",
+      ],
+
+      mount_paths: [
+        "/run/user",
+        "~/.cache/isaac-sim/kit/cache:/isaac-sim/kit/cache:rw",
+        "~/.cache/isaac-sim/kit/data:/isaac-sim/kit/data:rw",
+        "~/.cache/isaac-sim-6/kit-logs:/isaac-sim/kit/logs:rw",
+      ],
+    },
+
+    parameters: {
+      // Which OpenArm generation to simulate:
+      //
+      //   "v1"
+      //   "v2"
+      //
+      // This selects the matching OpenArm USD and robot configuration.
+      hardware_version: "string",
+
+      // Rate in Hz of the measured joint_states / gripper_states streams.
+      state_rate_hz: "u32",
+
+      // Run Isaac Sim headless.
+      //
+      // WebRTC livestream addressing and ports are handled by the Isaac
+      // streaming configuration rather than node parameters here.
+      headless: {
+        $type: "bool",
+        $default: true,
+      },
+
+      // Render and stream the robot-mounted cameras (config/cameras.json5) on
+      // their pairing slots. No default: whether a stack renders cameras is
+      // the launcher's decision, and a launcher that leaves it unsaid fails
+      // here rather than coming up quietly camera-less.
+      cameras_enabled: "bool",
+    },
+  },
+}

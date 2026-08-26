@@ -1,0 +1,43 @@
+{
+  peppy_schema: "node/v1",
+
+  manifest: {
+    name: "openarm_arm_commander",
+    tag: "v1",
+
+    depends_on: {
+      pairings: [
+        {
+          name: "joint_link",
+          tag: "v1",
+          role: "leader",
+          link_id: "arm"
+        }
+      ]
+    }
+  },
+
+  interfaces: {
+    topics: {
+      emits: [
+        {
+          link_id: "arm",
+          name: "joint_setpoints"
+        }
+      ],
+
+      consumes: [
+        {
+          link_id: "arm",
+          name: "joint_states"
+        }
+      ]
+    }
+  },
+
+  execution: {
+    language: "python",
+
+    parameters: {}
+  }
+}
