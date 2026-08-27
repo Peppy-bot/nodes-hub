@@ -1,7 +1,8 @@
 //! The Cartesian arm move end to end over the panel's WebSocket: firing a pose
 //! must land a `move_arm` goal on the limb_motion mock carrying the panel's
-//! plan tolerances, and the arrival re-check must judge the returned pose
-//! against the separate, wider result bar.
+//! plan tolerances, the arrival re-check must judge the returned pose against
+//! the separate, wider result bar, and a pose the panel's own exact IK cannot
+//! solve must still reach the backbone, whose refusal surfaces as the status.
 //!
 //! One booting test per binary: `ui::init_limits` is once-per-process.
 
@@ -147,6 +148,40 @@ async fn firing_a_pose_carries_the_plan_tolerances_and_judges_arrival_separately
             && s["status"]
                 .as_str()
                 .is_some_and(|t| t.contains("move_arm (left): success"))
+    })
+    .await;
+
+    // --- no exact solution still fires; the backbone's refusal surfaces -----
+    // Two metres out has no exact IK solution, so the preview cannot be
+    // solved; the goal must reach the backbone anyway, and its decision, the
+    // one naming the plan tolerance, must come back as the operator status.
+    ws.send_text(
+        &serde_json::json!({
+            "cmd": "fire_arm_pose",
+            "side": "left",
+            "position": [position[0] + 2.0, position[1], position[2]],
+            "orientation": [rotation.i, rotation.j, rotation.k, rotation.w],
+            "duration_s": 0.0,
+        })
+        .to_string(),
+    )
+    .await
+    .expect("send far fire_arm_pose");
+
+    let pending = mocks
+        .deps
+        .limb_motion
+        .move_arm
+        .next_goal(Duration::from_secs(10))
+        .await?;
+    pending
+        .reject(Some("goal pose unreachable within 5.0 mm / 5.0 deg"))
+        .await?;
+    ws.snapshot_until(Duration::from_secs(15), "backbone refusal surfaced", |s| {
+        s["left_arm"]["in_flight"] == false
+            && s["status"].as_str().is_some_and(|t| {
+                t.contains("backbone rejected the pose goal") && t.contains("5.0 mm")
+            })
     })
     .await;
 

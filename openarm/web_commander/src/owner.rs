@@ -397,15 +397,19 @@ impl Owner {
                     return;
                 };
                 let seed = self.state.arms[side].joints;
-                // Preview the pose as joints (seeded from the current target) so both the
-                // sliders and the FK readout show where it is going, and reject an
-                // unreachable pose up front rather than firing a goal the backbone refuses.
-                let Some(mut target_joints) = self.models.solve_ik(side, position, rotation, &seed)
-                else {
-                    self.status(side, "pose unreachable, not firing");
-                    return;
+                // Preview the pose as joints (seeded from the current target) so both
+                // the sliders and the FK readout show where it is going. A pose with no
+                // exact solution still fires: the backbone plans within the goal's
+                // tolerances and can serve poses only approximately reachable, so its
+                // decision is the refusal that matters. Without a solution the preview
+                // holds the current joints, since there is no configuration to show.
+                let target_joints = match self.models.solve_ik(side, position, rotation, &seed) {
+                    Some(mut solved) => {
+                        clamp_to_limits(&mut solved, side);
+                        solved
+                    }
+                    None => seed,
                 };
-                clamp_to_limits(&mut target_joints, side);
                 let duration_s = self.floored_duration(side, position, duration_s);
                 // Send the backbone the normalized quaternion, not the raw wire values.
                 let orientation = [rotation.i, rotation.j, rotation.k, rotation.w];
