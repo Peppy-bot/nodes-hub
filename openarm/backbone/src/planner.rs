@@ -27,7 +27,7 @@ use tracing::{error, info};
 
 use crate::chase::{chase_step, clamp_to_limits};
 use crate::motion::{MOTION_TIMEOUT_FACTOR, MoveBudget};
-use crate::servo::{EeCaps, ServoState, ServoStep, rate_step_toward};
+use crate::servo::{EeCaps, ServoState, ServoStep, servo_from};
 use crate::trajectory::{
     ARM_ANGLE_STEP_PER_BLEND_RAD, CartesianPlan, CartesianTrajectory, JointTrajectory, PlanLimits,
     plan_cartesian, subdivided_blends,
@@ -218,6 +218,8 @@ struct ServoTrack {
     /// Boxed: [`ServoState`] carries a per-joint filter bank, so inlining it
     /// would bloat every [`Mode`] variant. One heap alloc per servo move.
     servo: Box<ServoState>,
+    /// The caller's arrival slack, judged by each tick's step.
+    tolerance: PlanTolerance,
     started: Instant,
     prev_sample_at: Instant,
     /// The plan-time rollout duration. The runtime aborts once the move runs
@@ -465,14 +467,14 @@ impl Planner {
             Some(Upstream::Pose(pose)) => {
                 let q = self.setpoint;
                 let ee = self.ee_pose_world(&q);
-                rate_step_toward(
-                    &mut self.model,
+                srs_model::chain_kinematics::rate_step_toward(
+                    self.model.chain(),
                     &q,
                     &ee,
                     pose,
-                    &self.cfg.max_joint_velocity_rad_s,
-                    self.cfg.ee,
-                    self.cfg.cycle_period.as_secs_f64(),
+                    &self
+                        .plan_limits()
+                        .servo_at(self.cfg.cycle_period, PlanTolerance::default()),
                 )
             }
         };
@@ -612,6 +614,17 @@ impl Planner {
         }
     }
 
+    /// The motion budgets a plan is sized against and a servo tick runs under,
+    /// read off one config so acceptance and execution cannot disagree.
+    fn plan_limits(&self) -> PlanLimits<'_> {
+        PlanLimits {
+            max_joint_velocity_rad_s: &self.cfg.max_joint_velocity_rad_s,
+            ee: self.cfg.ee,
+            control_period: self.cfg.cycle_period,
+            smoothing: self.cfg.smoothing,
+        }
+    }
+
     /// Run the guarded servo: one damped resolved-rate step toward the leashed
     /// line reference, the law the plan's rollout validated. Its steps are
     /// velocity-clamped by construction; the budget ceiling terminates a move
@@ -636,11 +649,9 @@ impl Planner {
             .budget
             .after_rate_change(elapsed, self.cfg.ee.linear_m_s);
         let step = track.servo.step(
-            &mut self.model,
+            self.model.chain(),
             &governed_q,
-            &self.cfg.max_joint_velocity_rad_s,
-            self.cfg.ee,
-            dt,
+            &self.plan_limits().servo_at(dt, track.tolerance),
         );
         match step {
             ServoStep::Converged(q) => PathStep::To {
@@ -652,7 +663,7 @@ impl Planner {
                 complete: false,
             },
             ServoStep::Stepped(_) => {
-                let short_m = track.servo.position_err_m(&mut self.model, &governed_q);
+                let short_m = track.servo.position_err_m(self.model.chain(), &governed_q);
                 PathStep::Failed(format!(
                     "servo overran {MOTION_TIMEOUT_FACTOR:.0}x its {:.1}s rollout, {:.0} mm short of the goal",
                     track.budget.seconds(),
@@ -740,16 +751,11 @@ impl Planner {
         let ee_base = self.model.at(&self.setpoint).ee_pose();
         let start_world = self.model.world_pose(&ee_base);
         let plan = plan_cartesian(
-            &mut self.model,
+            &self.model,
             &start_world,
             &target,
             self.setpoint,
-            &PlanLimits {
-                max_joint_velocity_rad_s: &self.cfg.max_joint_velocity_rad_s,
-                ee: self.cfg.ee,
-                control_period: self.cfg.cycle_period,
-                smoothing: self.cfg.smoothing,
-            },
+            &self.plan_limits(),
             duration_s,
             tolerance,
         );
@@ -812,12 +818,8 @@ impl Planner {
                     self.side.label()
                 );
                 MovePath::Servo(ServoTrack {
-                    servo: Box::new(ServoState::new(
-                        start_world,
-                        target,
-                        tolerance,
-                        self.cfg.smoothing,
-                    )),
+                    servo: Box::new(servo_from(start_world, target, self.cfg.smoothing)),
+                    tolerance,
                     started: now,
                     prev_sample_at: now,
                     budget: MoveBudget::new(duration_s, self.cfg.ee.linear_m_s),
@@ -947,12 +949,8 @@ mod tests {
         let start = planner.ee_pose_world(&POSE_TEST_Q);
         let now = Instant::now();
         let mut track = ServoTrack {
-            servo: Box::new(ServoState::new(
-                start,
-                start,
-                PlanTolerance::from_wire(0.0, 0.0).expect("the zero sentinel is valid"),
-                planner.cfg.smoothing,
-            )),
+            servo: Box::new(servo_from(start, start, planner.cfg.smoothing)),
+            tolerance: PlanTolerance::default(),
             started: now,
             prev_sample_at: now,
             budget: MoveBudget::new(1.0, planner.cfg.ee.linear_m_s),

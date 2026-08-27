@@ -61,9 +61,19 @@ pub struct PlanTolerance {
     pub orientation_rad: f64,
 }
 
+impl Default for PlanTolerance {
+    /// The node's own slack: what the wire's zero sentinel resolves to.
+    fn default() -> Self {
+        Self {
+            position_m: control_core::servo::POSITION_TOLERANCE_M,
+            orientation_rad: control_core::servo::ORIENTATION_TOLERANCE_RAD,
+        }
+    }
+}
+
 impl PlanTolerance {
-    /// Parse the wire pair: 0 resolves to the `control_core` default for that
-    /// axis; non-finite and negative values are refused.
+    /// Parse the wire pair: 0 resolves to the default for that axis; non-finite
+    /// and negative values are refused.
     pub fn from_wire(position_m: f64, orientation_rad: f64) -> Result<Self, &'static str> {
         if !(position_m.is_finite() && position_m >= 0.0) {
             return Err("an invalid position tolerance");
@@ -71,12 +81,10 @@ impl PlanTolerance {
         if !(orientation_rad.is_finite() && orientation_rad >= 0.0) {
             return Err("an invalid orientation tolerance");
         }
+        let defaults = Self::default();
         Ok(Self {
-            position_m: non_zero_or(position_m, control_core::servo::POSITION_TOLERANCE_M),
-            orientation_rad: non_zero_or(
-                orientation_rad,
-                control_core::servo::ORIENTATION_TOLERANCE_RAD,
-            ),
+            position_m: non_zero_or(position_m, defaults.position_m),
+            orientation_rad: non_zero_or(orientation_rad, defaults.orientation_rad),
         })
     }
 }

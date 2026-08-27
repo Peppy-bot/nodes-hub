@@ -1324,7 +1324,7 @@ max={} us | over budget {over}/{}",
         // whole-loop picture: the Jacobian a streamed tick hands out.
         {
             let version = openarm_description::HardwareVersion::V2;
-            let mut arm =
+            let arm =
                 crate::arm_model(version, openarm_description::Side::Left).expect("arm model");
             let q = [0.1, -0.2, 0.3, 0.5, 0.1, -0.1, 0.2];
             time_us(
