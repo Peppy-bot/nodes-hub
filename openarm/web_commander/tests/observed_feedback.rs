@@ -31,10 +31,9 @@ fn joints_of(value: &serde_json::Value) -> Option<Vec<f64>> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn observed_states_feed_the_panel_and_gate_streaming() -> peppygen::Result<()> {
-    helpers::set_panel_env(PANEL_PORT);
     let (harness, mut mocks) = Harness::start_with(
         Config {
-            parameters: Some(helpers::test_parameters()),
+            parameters: Some(helpers::test_parameters(PANEL_PORT)),
             ..Config::default()
         },
         openarm_commander::setup,

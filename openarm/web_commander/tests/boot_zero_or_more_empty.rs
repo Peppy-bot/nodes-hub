@@ -16,10 +16,9 @@ const PANEL_PORT: u16 = 18631;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn boots_clean_with_empty_zero_or_more_slots() -> peppygen::Result<()> {
-    helpers::set_panel_env(PANEL_PORT);
     let (mut harness, mut mocks) = Harness::start_with(
         Config {
-            parameters: Some(helpers::test_parameters()),
+            parameters: Some(helpers::test_parameters(PANEL_PORT)),
             ..Config::default()
         },
         openarm_commander::setup,

@@ -23,10 +23,9 @@ const TARGET_JOINTS: [f64; 7] = [0.1, 0.1, -0.2, 0.9, 0.1, -0.1, 0.0];
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn panel_commands_drive_backbone_and_recorder() -> peppygen::Result<()> {
-    helpers::set_panel_env(PANEL_PORT);
     let (harness, mut mocks) = Harness::start_with(
         Config {
-            parameters: Some(helpers::test_parameters()),
+            parameters: Some(helpers::test_parameters(PANEL_PORT)),
             recorder_instances: 1,
             ..Config::default()
         },

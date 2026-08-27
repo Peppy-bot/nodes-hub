@@ -1,8 +1,7 @@
-//! Shared plumbing for the integration tests: launch parameters, the panel's
-//! port selection, and a minimal WebSocket client for the commander's real
-//! operator surface (the HTTP+WS panel). No WS client crate is in the node's
-//! dependency set, so this speaks just enough RFC 6455 for the panel's
-//! unfragmented text frames.
+//! Shared plumbing for the integration tests: launch parameters and a minimal
+//! WebSocket client for the commander's real operator surface (the HTTP+WS
+//! panel). No WS client crate is in the node's dependency set, so this speaks
+//! just enough RFC 6455 for the panel's unfragmented text frames.
 //!
 //! NOTE: each test binary boots the node at most once. `ui::init_limits`
 //! asserts it runs exactly once per process, so a second `Harness::start` in
@@ -17,30 +16,21 @@ use tokio::net::TcpStream;
 
 /// Valid launch parameters (every required field of the manifest schema):
 /// governor on with the 0.005/0.02 band, a 0.5 m/s speed cap, v2 ranges, and
-/// a 50 Hz command tick.
-pub fn test_parameters() -> peppygen::Parameters {
+/// a 50 Hz command tick. The panel serves loopback on the caller's port, one
+/// per test binary (the production default 8765 could collide with anything
+/// on the host).
+pub fn test_parameters(port: u16) -> peppygen::Parameters {
     peppygen::Parameters {
         collision_governor_enabled: true,
         command_rate_hz: 50,
         d_safe: 0.02,
         d_stop: 0.005,
         hardware_version: "v2".to_string(),
+        http_host: "127.0.0.1".to_string(),
+        http_port: port,
         joint_jog_acceleration_rad_s2: 10.0,
         max_ee_velocity_m_s: 0.5,
         max_gripper_rate_frac_s: 6.0,
-    }
-}
-
-/// Point the panel at loopback on a per-test-binary port (the production
-/// default 8765 could collide with anything on the host). Must run before
-/// `Harness::start`, which spawns the server task that reads these.
-pub fn set_panel_env(port: u16) {
-    // SAFETY: called at the very start of the test, before the harness boots
-    // the node; nothing else in this process reads or writes the environment
-    // concurrently at that point.
-    unsafe {
-        std::env::set_var("PEPPY_JC_PORT", port.to_string());
-        std::env::set_var("PEPPY_JC_BIND_IP", "127.0.0.1");
     }
 }
 

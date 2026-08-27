@@ -88,10 +88,9 @@ where
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn consumed_topics_surface_on_the_panel() -> peppygen::Result<()> {
-    helpers::set_panel_env(PANEL_PORT);
     let (harness, mocks) = Harness::start_with(
         Config {
-            parameters: Some(helpers::test_parameters()),
+            parameters: Some(helpers::test_parameters(PANEL_PORT)),
             // The node attributes reports by producer instance name
             // (`classify` wants exactly one of left/right and one of
             // arm/grip): one mock wears a classifiable identity, one an
