@@ -16,6 +16,7 @@ from so101_backbone.actions import (
     PendingSlot,
     PoseGoal,
     Rejection,
+    _orientation_note,
 )
 from so101_backbone.coordinator import Coordinator
 
@@ -293,3 +294,58 @@ async def test_pose_solver_surprise_still_reaches_a_terminal_result():
     assert success is False
     assert "pose solve failed" in message
     assert coordinator.try_claim_arm()
+
+
+IDENTITY_QUAT = (0.0, 0.0, 0.0, 1.0)
+
+
+def quat_about_x(degrees: float):
+    half = math.radians(degrees) / 2.0
+    return (math.sin(half), 0.0, 0.0, math.cos(half))
+
+
+def test_a_pose_result_says_how_far_the_orientation_landed_from_the_request():
+    # Five joints underactuate three rotational degrees of freedom, so a move
+    # can reach its position and still be turned well away from the pose that
+    # was asked for. Reporting a bare success would hide exactly that.
+    note = _orientation_note(quat_about_x(44.0), IDENTITY_QUAT)
+    assert "44 degrees" in note
+    assert "underactuate" in note
+
+
+def test_an_orientation_that_landed_where_it_was_asked_earns_no_caveat():
+    # A caveat on every result is a caveat nobody reads.
+    assert _orientation_note(IDENTITY_QUAT, IDENTITY_QUAT) == ""
+    assert _orientation_note(quat_about_x(0.5), IDENTITY_QUAT) == ""
+
+
+async def test_a_turned_landing_carries_its_caveat_into_the_pose_result():
+    # The caveat is only worth computing if it reaches the operator, so drive a
+    # real pose goal whose arm lands turned away from the request and read the
+    # message the action actually completes with.
+    class TurnedKinematics(FakeKinematics):
+        def forward_kinematics(self, positions_rad):
+            return (0.1, 0.0, 0.2), quat_about_x(44.0)
+
+    kinematics = TurnedKinematics()
+    coordinator, layer = make_layer(kinematics)
+    coordinator.measured_joints.set((0.0,) * 5)
+    goal = layer._admit_pose_move((0.1, 0.0, 0.2), IDENTITY_QUAT, 0.0)
+
+    async def run_plan_to_completion():
+        while True:
+            coordinator.measured_joints.set((0.0,) * 5)
+            sample = coordinator.arm_tick(time.monotonic())
+            if sample is not None:
+                coordinator.arm_published(True, sample)
+                if coordinator._arm_plan is None:
+                    return
+            await asyncio.sleep(0.001)
+
+    ctx = FakeGoalContext()
+    runner = asyncio.create_task(run_plan_to_completion())
+    await layer.drive_pose(ctx, goal, kinematics, kinematics)
+    runner.cancel()
+    success, message, _position, _orientation, _t = ctx.completed
+    assert success is True
+    assert "44 degrees" in message

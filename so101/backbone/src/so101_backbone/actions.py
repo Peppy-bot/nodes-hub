@@ -420,7 +420,10 @@ class ActionLayer:
             def results(action_time):
                 positions, note = self._final_arm_positions(plan)
                 position, orientation = kinematics.forward_kinematics(positions)
-                return note, (list(position), list(orientation), action_time)
+                return (
+                    _join(note, _orientation_note(orientation, goal.orientation)),
+                    (list(position), list(orientation), action_time),
+                )
 
             await self._finish_plan(
                 ctx, plan, self._coordinator.abort_arm_plan, results, started
@@ -508,6 +511,25 @@ def _terminal(plan: ArmPlan | GripperPlan, note: str) -> tuple[bool, str]:
     if plan.failed is not None:
         return False, _join(plan.failed, note)
     return True, note
+
+
+# Beyond this the arm landed somewhere an operator would not call the pose
+# they asked for, so the result says so rather than reporting a bare success.
+_ORIENTATION_NOTE_FLOOR_RAD = math.radians(2.0)
+
+
+def _orientation_note(reached, requested) -> str:
+    """What to say about the orientation actually achieved. Five joints
+    underactuate three rotational degrees of freedom, so a move that reached
+    its position can still be turned well away from the requested pose; a
+    result that reported only success would hide that."""
+    error_rad = relative_rotation_rad(reached, requested)
+    if error_rad < _ORIENTATION_NOTE_FLOOR_RAD:
+        return ""
+    return (
+        f"orientation reached within {math.degrees(error_rad):.0f} degrees of the "
+        "request: five joints underactuate three rotational degrees of freedom"
+    )
 
 
 def _no_pose() -> tuple[list[float], list[float]]:
