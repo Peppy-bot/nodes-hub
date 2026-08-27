@@ -1,13 +1,12 @@
-// HTTP+WS UI on 0.0.0.0:PEPPY_JC_PORT (default 8765). The WS exposes
-// unauthenticated motion control, so only run on a trusted network; set
-// PEPPY_JC_BIND_IP=127.0.0.1 to restrict to loopback.
+// HTTP+WS UI on the address the launcher gives (http_host:http_port). The WS
+// exposes unauthenticated motion control, so only run on a trusted network;
+// bind http_host to 127.0.0.1 to restrict it to loopback.
 //
 // This is only the transport: every text frame is decoded to a [`Command`] and sent to
 // the state owner, and every snapshot the owner publishes is forwarded to the browser.
 // The owner (see [`crate::owner`]) is the sole reader/writer of `UiState`.
 
-use std::env;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use axum::Router;
@@ -51,7 +50,6 @@ use crate::state::{
     Proximity, Side, UiState,
 };
 
-const DEFAULT_PORT: u16 = 8765;
 // The backbone publishes the proximity readout at ~20 Hz; treat it as stale after this
 // long with no update (a dead backbone) so the panel falls back to n/a instead of
 // latching the last distance.
@@ -128,20 +126,11 @@ struct AppState {
 }
 
 pub async fn run(
+    addr: SocketAddr,
     command_tx: mpsc::Sender<UiMsg>,
     snapshot_rx: watch::Receiver<String>,
     token: CancellationToken,
 ) -> std::result::Result<(), UiError> {
-    let port = env::var("PEPPY_JC_PORT")
-        .ok()
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(DEFAULT_PORT);
-    let bind_ip = env::var("PEPPY_JC_BIND_IP")
-        .ok()
-        .and_then(|s| s.parse::<IpAddr>().ok())
-        .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-    let addr = SocketAddr::new(bind_ip, port);
-
     let app_state = AppState {
         command_tx,
         snapshot_rx,
@@ -155,7 +144,7 @@ pub async fn run(
     let listener = TcpListener::bind(addr)
         .await
         .map_err(|source| UiError::Bind { addr, source })?;
-    info!("commander UI at http://localhost:{port}");
+    info!("commander UI at http://{addr}");
 
     let shutdown_token = token.clone();
     axum::serve(listener, app)

@@ -3,6 +3,7 @@
 // publisher, and UI server together. All the real logic lives in the sibling
 // modules; this is only the assembly.
 
+use std::net::{AddrParseError, IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use control_core::positive_finite::{NotPositiveFinite, PositiveFinite};
@@ -48,6 +49,12 @@ static UI_FAILED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 pub enum NodeError {
     #[error("parameter command_rate_hz")]
     CommandRate(#[source] RateOutOfRange),
+
+    #[error("parameter http_host is not an IP address")]
+    HttpHost(#[source] AddrParseError),
+
+    #[error("parameter http_port must name a port to serve on, not 0")]
+    HttpPort,
 
     #[error("parameter max_ee_velocity_m_s")]
     EeVelocity(#[source] NotPositiveFinite),
@@ -157,6 +164,11 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     let command_period =
         period_from_hz(params.command_rate_hz, MAX_RATE_HZ).map_err(NodeError::CommandRate)?;
 
+    // Where the panel listens. Resolved before anything is spawned so a
+    // mistyped address is a refusal naming the parameter, not a bind failure
+    // from a task the daemon has already called ready.
+    let panel_addr = panel_address(&params)?;
+
     // The state owner is the one task that touches UiState; everything else holds a
     // channel end. Commands flow in from the WS, feedback in from the state streams
     // and the goal tasks, and the owner publishes the browser snapshot and the
@@ -229,7 +241,7 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     // reach the owner. Record the fault and cancel the node so the daemon
     // restarts it, instead of standing ready with nothing listening.
     tokio::spawn(async move {
-        if let Err(e) = ui::run(command_tx, snapshot_rx, token.clone()).await {
+        if let Err(e) = ui::run(panel_addr, command_tx, snapshot_rx, token.clone()).await {
             error!("operator panel stopped: {e}; cancelling the node");
             let _ = UI_FAILED.set(e.to_string());
             token.cancel();
@@ -238,9 +250,75 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     Ok(())
 }
 
+/// The panel's listen address. Port 0 is refused: an operator panel on an
+/// ephemeral port is one nobody can reach at the address they were given.
+fn panel_address(params: &Parameters) -> NodeResult<SocketAddr> {
+    let host: IpAddr = params.http_host.parse().map_err(NodeError::HttpHost)?;
+    (params.http_port != 0)
+        .then(|| SocketAddr::new(host, params.http_port))
+        .ok_or(NodeError::HttpPort)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A launch the node accepts, for the cases that spoil one field of it.
+    fn params() -> Parameters {
+        Parameters {
+            collision_governor_enabled: true,
+            command_rate_hz: 50,
+            d_safe: 0.02,
+            d_stop: 0.005,
+            hardware_version: "v2".to_string(),
+            http_host: "0.0.0.0".to_string(),
+            http_port: 8765,
+            joint_jog_acceleration_rad_s2: 10.0,
+            max_ee_velocity_m_s: 0.5,
+            max_gripper_rate_frac_s: 6.0,
+        }
+    }
+
+    #[test]
+    fn the_panel_serves_the_launcher_s_address() {
+        let addr = panel_address(&Parameters {
+            http_host: "127.0.0.1".to_string(),
+            http_port: 18765,
+            ..params()
+        })
+        .expect("a host and port the launcher may set must be accepted");
+        assert_eq!(addr.to_string(), "127.0.0.1:18765");
+    }
+
+    #[test]
+    fn a_host_that_is_not_an_ip_is_refused_by_name() {
+        // A hostname would resolve to any number of addresses, none of them a
+        // choice this node gets to make.
+        let refused = panel_address(&Parameters {
+            http_host: "localhost".to_string(),
+            ..params()
+        })
+        .expect_err("only an IP address can be bound");
+        assert!(
+            refused.to_string().contains("http_host"),
+            "the refusal must name http_host, got: {refused}"
+        );
+    }
+
+    #[test]
+    fn port_zero_is_refused_by_name() {
+        // Port 0 binds an ephemeral port: the panel would come up somewhere
+        // the operator was never told about.
+        let refused = panel_address(&Parameters {
+            http_port: 0,
+            ..params()
+        })
+        .expect_err("an ephemeral panel port must be refused");
+        assert!(
+            refused.to_string().contains("http_port"),
+            "the refusal must name http_port, got: {refused}"
+        );
+    }
 
     #[test]
     fn init_limits_refuses_a_second_call() {

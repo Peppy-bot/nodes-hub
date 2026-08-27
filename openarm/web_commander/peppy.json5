@@ -1,5 +1,5 @@
-// openarm_commander: the browser-based commander. Serves a
-// control panel (HTTP + WebSocket on PEPPY_JC_PORT, default 8765) that streams
+// openarm_web_commander: the browser-based commander. Serves a
+// control panel (HTTP + WebSocket on http_host:http_port) that streams
 // arm and gripper setpoints to the backbone over the joint_link / gripper_link
 // pairings (the backbone governs and re-streams them), reads live state by
 // observing the backbone's downstream pairings, jogs the arm in joint or
@@ -130,6 +130,11 @@
       def_file: "apptainer.def"
     },
     parameters: {
+      // Where the operator panel is served. The WebSocket carries
+      // unauthenticated motion control, so a deployment on an untrusted
+      // network binds 127.0.0.1 and reaches the panel over a tunnel.
+      http_host: { $type: "string", $default: "0.0.0.0" },
+      http_port: { $type: "u16", $default: 8765 },
       // Rate (Hz) at which enabled targets are re-published on the arm and
       // gripper pairing slots, which the backbone consumes.
       command_rate_hz: "u32",

@@ -59,7 +59,7 @@ drivers on real hardware). The required parameters have no defaults, so they
 are supplied too:
 
 ```sh
-peppy node run openarm_commander:v1 \
+peppy node run openarm_web_commander:v1 \
     command_rate_hz=100 hardware_version=v2 max_ee_velocity_m_s=0.5 \
     joint_jog_acceleration_rad_s2=10.0 \
     collision_governor_enabled=true d_stop=0.005 d_safe=0.02 \
@@ -76,9 +76,10 @@ peppy node run openarm_commander:v1 \
 ```
 
 Then open **http://localhost:8765**. The page reconnects automatically if the
-node restarts; the port can be changed with `PEPPY_JC_PORT` and the bind address
-restricted with `PEPPY_JC_BIND_IP`. A gripper that reports effort control
-(v2's POS_FORCE force cap) adds a **max effort** slider under its opening
+node restarts; the `http_port` parameter moves the panel and
+`http_host=127.0.0.1` restricts it to loopback (they default to 8765 on every
+interface). A gripper that reports effort control (v2's POS_FORCE force cap)
+adds a **max effort** slider under its opening
 slider, bounded by the gripper's reported ceiling and applied to both streamed
 openings and discrete moves; grippers without effort control (v1, the sims)
 hide it.
@@ -99,5 +100,5 @@ involved arms and wait for state feedback to arrive.
 
 **Port 8765 is already in use**
 A previous instance is still running. Find it with `peppy stack list` and stop
-it with `peppy node stop <instance_id>`, or set `PEPPY_JC_PORT` to a different
-port.
+it with `peppy node stop <instance_id>`, or launch this instance with a
+different `http_port`.
