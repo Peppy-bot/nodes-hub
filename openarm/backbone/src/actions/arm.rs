@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 use tracing::error;
 
 use crate::planner::{Goal, JointReply};
-use crate::types::{ARM_DOF, JointVec, Side, pose_from_wire};
+use crate::types::{ARM_DOF, JointVec, PlanTolerance, Side, pose_from_wire};
 
 use crate::actions::claim;
 
@@ -104,6 +104,12 @@ pub async fn run_move_arm(
                         "goal pose has {reason}"
                     )));
                 }
+                if let Err(reason) = PlanTolerance::from_wire(
+                    d.plan_position_tolerance_m,
+                    d.plan_orientation_tolerance_rad,
+                ) {
+                    return Ok(move_arm::GoalDecision::reject(format!("goal has {reason}")));
+                }
                 if !(d.duration_s.is_finite() && d.duration_s >= 0.0) {
                     return Ok(move_arm::GoalDecision::reject("invalid duration"));
                 }
@@ -121,10 +127,16 @@ pub async fn run_move_arm(
             .expect("validated on accept");
         let target = pose_from_wire(ctx.request().data.position, ctx.request().data.orientation)
             .expect("validated on accept");
+        let tolerance = PlanTolerance::from_wire(
+            ctx.request().data.plan_position_tolerance_m,
+            ctx.request().data.plan_orientation_tolerance_rad,
+        )
+        .expect("validated on accept");
         let duration_s = ctx.request().data.duration_s;
         if goal_txs[idx]
             .send(Goal::Cartesian {
                 target,
+                tolerance,
                 duration_s,
                 ctx: Box::new(ctx),
             })

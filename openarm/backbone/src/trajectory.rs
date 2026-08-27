@@ -5,7 +5,7 @@ use srs_model::nalgebra::{Isometry3, Translation3};
 use srs_model::{Arm, ArmAnglePolicy};
 
 use crate::servo::EeCaps;
-use crate::types::{ARM_DOF, JointVec};
+use crate::types::{ARM_DOF, JointVec, PlanTolerance};
 
 /// Quintic minimum-jerk trajectory in joint space.
 pub struct JointTrajectory {
@@ -296,6 +296,7 @@ pub fn plan_cartesian(
     seed: JointVec,
     limits: &PlanLimits,
     requested_duration_secs: f64,
+    tolerance: PlanTolerance,
 ) -> Option<CartesianPlan> {
     let duration_cap = line_duration_cap(requested_duration_secs);
     let tiers = [
@@ -338,8 +339,9 @@ pub fn plan_cartesian(
             });
         }
     }
-    // No line tracks: prove the servo law reaches the pose before accepting it.
-    crate::servo::rollout(model, start, end, seed, limits)
+    // No line tracks: prove the servo law reaches the pose, to the caller's
+    // slack, before accepting it.
+    crate::servo::rollout(model, start, end, seed, limits, tolerance)
         .map(|duration_s| CartesianPlan::Servo { duration_s })
 }
 
@@ -374,6 +376,11 @@ mod tests {
 
     const V_MAX: JointVec = [1.0; ARM_DOF];
     const EPS: f64 = 1e-9;
+
+    /// The slack a goal that states no preference is planned against.
+    fn default_tolerance() -> PlanTolerance {
+        PlanTolerance::from_wire(0.0, 0.0).expect("the zero sentinel is valid")
+    }
 
     // The launcher-default per-joint velocity limits (peppy.json5), j1..j7.
     const V_MAX_V2: JointVec = [
@@ -452,16 +459,19 @@ mod tests {
     ];
 
     /// Run the servo law to convergence, asserting every step stays inside the
-    /// per-joint velocity budget, and return the converged configuration.
+    /// per-joint velocity budget and that the pose it lands on honours
+    /// `tolerance`, and return the converged configuration.
     fn run_servo_to_convergence(
         model: &mut Arm,
         start: &Isometry3<f64>,
         end: &Isometry3<f64>,
         seed: JointVec,
+        tolerance: PlanTolerance,
     ) -> JointVec {
         let mut state = crate::servo::ServoState::new(
             *start,
             *end,
+            tolerance,
             crate::servo::smoothing_for(TEST_DT).unwrap(),
         );
         let mut q = seed;
@@ -485,13 +495,17 @@ mod tests {
                 crate::servo::ServoStep::Converged(q) => {
                     let ee = model.at(&q).ee_pose();
                     let got = model.world_pose(&ee);
+                    let position_err = (got.translation.vector - end.translation.vector).norm();
+                    let orientation_err = got.rotation.angle_to(&end.rotation);
                     assert!(
-                        (got.translation.vector - end.translation.vector).norm() < 2e-3,
-                        "servo must land on the target position"
+                        position_err <= tolerance.position_m,
+                        "servo landed {position_err:.6} m out, past the {:.6} m it was planned to",
+                        tolerance.position_m
                     );
                     assert!(
-                        got.rotation.angle_to(&end.rotation) < 1e-2,
-                        "servo must land on the target orientation"
+                        orientation_err <= tolerance.orientation_rad,
+                        "servo landed {orientation_err:.6} rad out, past the {:.6} rad it was planned to",
+                        tolerance.orientation_rad
                     );
                     return q;
                 }
@@ -526,8 +540,16 @@ mod tests {
             )
             .expect("start pose reachable from ready")
             .q;
-        let plan = plan_cartesian(&mut model, &start, &end, seed, &v2_limits(), 2.0)
-            .expect("servo reaches the pose");
+        let plan = plan_cartesian(
+            &mut model,
+            &start,
+            &end,
+            seed,
+            &v2_limits(),
+            2.0,
+            default_tolerance(),
+        )
+        .expect("servo reaches the pose");
         let CartesianPlan::Servo { duration_s } = plan else {
             panic!("an untrackable line must fall through to the servo");
         };
@@ -535,7 +557,7 @@ mod tests {
             duration_s < crate::servo::MAX_SERVO_S,
             "servo rollout should finish inside the ceiling, took {duration_s:.1}s"
         );
-        run_servo_to_convergence(&mut model, &start, &end, seed);
+        run_servo_to_convergence(&mut model, &start, &end, seed, default_tolerance());
     }
 
     // The user-reported gap made a regression test: pulling x back to -0.2 from
@@ -552,11 +574,19 @@ mod tests {
         end_tip.translation.vector.x = -0.2;
         let tool = model.tool();
         let (start, end) = (start_tip * tool, end_tip * tool);
-        let plan = plan_cartesian(&mut model, &start, &end, READY, &v2_limits(), 2.0)
-            .expect("the pull must be reachable, as streaming proves live");
+        let plan = plan_cartesian(
+            &mut model,
+            &start,
+            &end,
+            READY,
+            &v2_limits(),
+            2.0,
+            default_tolerance(),
+        )
+        .expect("the pull must be reachable, as streaming proves live");
         if let CartesianPlan::Servo { duration_s } = plan {
             assert!(duration_s < crate::servo::MAX_SERVO_S);
-            run_servo_to_convergence(&mut model, &start, &end, READY);
+            run_servo_to_convergence(&mut model, &start, &end, READY, default_tolerance());
         }
         // A Line verdict is equally acceptable: the pose is reached on the line.
     }
@@ -573,8 +603,16 @@ mod tests {
         };
         let mut end = start;
         end.translation.vector.z += 0.05;
-        let plan = plan_cartesian(&mut model, &start, &end, READY, &v2_limits(), 2.0)
-            .expect("small lift from ready is reachable");
+        let plan = plan_cartesian(
+            &mut model,
+            &start,
+            &end,
+            READY,
+            &v2_limits(),
+            2.0,
+            default_tolerance(),
+        )
+        .expect("small lift from ready is reachable");
         let CartesianPlan::Line {
             duration_s,
             steer_elbow,
@@ -646,7 +684,7 @@ mod tests {
         };
         let mut end = start;
         end.rotation = UnitQuaternion::from_axis_angle(&Vector3::x_axis(), 0.7) * end.rotation;
-        run_servo_to_convergence(&mut model, &start, &end, READY);
+        run_servo_to_convergence(&mut model, &start, &end, READY, default_tolerance());
     }
 
     // The incident regression: after a servo move parks the arm at an unusual
@@ -675,7 +713,7 @@ mod tests {
             )
             .expect("start pose reachable from ready")
             .q;
-        let parked = run_servo_to_convergence(&mut model, &start, &end, seed);
+        let parked = run_servo_to_convergence(&mut model, &start, &end, seed, default_tolerance());
         // From the parked posture, nudge 3 cm in +x: an ordinary move.
         let nudge_start = {
             let ee = model.at(&parked).ee_pose();
@@ -690,6 +728,7 @@ mod tests {
             parked,
             &v2_limits(),
             2.0,
+            default_tolerance(),
         )
         .expect("nudge from the parked posture is reachable");
         let CartesianPlan::Line {
@@ -836,9 +875,15 @@ mod tests {
         let mut goal = start;
         goal.translation.vector.z += 0.05; // a small reachable move
 
-        let Some(CartesianPlan::Line { duration_s, .. }) =
-            plan_cartesian(&mut arm, &start, &goal, seed, &v1_limits(), 0.0)
-        else {
+        let Some(CartesianPlan::Line { duration_s, .. }) = plan_cartesian(
+            &mut arm,
+            &start,
+            &goal,
+            seed,
+            &v1_limits(),
+            0.0,
+            default_tolerance(),
+        ) else {
             panic!("an in-workspace move should plan a line");
         };
         assert!(
@@ -849,7 +894,15 @@ mod tests {
         let Some(CartesianPlan::Line {
             duration_s: floored,
             ..
-        }) = plan_cartesian(&mut arm, &start, &goal, seed, &v1_limits(), 5.0)
+        }) = plan_cartesian(
+            &mut arm,
+            &start,
+            &goal,
+            seed,
+            &v1_limits(),
+            5.0,
+            default_tolerance(),
+        )
         else {
             panic!("reachable");
         };
@@ -883,9 +936,15 @@ mod tests {
             control_period: TEST_DT,
             smoothing: crate::servo::smoothing_for(TEST_DT).unwrap(),
         };
-        let Some(CartesianPlan::Line { duration_s, .. }) =
-            plan_cartesian(&mut arm, &start, &goal, seed, &limits, 0.0)
-        else {
+        let Some(CartesianPlan::Line { duration_s, .. }) = plan_cartesian(
+            &mut arm,
+            &start,
+            &goal,
+            seed,
+            &limits,
+            0.0,
+            default_tolerance(),
+        ) else {
             panic!("a small lift should plan as a line");
         };
         assert!(
@@ -907,9 +966,15 @@ mod tests {
         let mut goal = start;
         goal.translation.vector.z += 0.05;
 
-        let Some(CartesianPlan::Line { start_q, .. }) =
-            plan_cartesian(&mut arm, &start, &goal, seed, &v1_limits(), 0.0)
-        else {
+        let Some(CartesianPlan::Line { start_q, .. }) = plan_cartesian(
+            &mut arm,
+            &start,
+            &goal,
+            seed,
+            &v1_limits(),
+            0.0,
+            default_tolerance(),
+        ) else {
             panic!("a small lift should plan as a line");
         };
         let normalized = arm
@@ -957,7 +1022,183 @@ mod tests {
         let start = arm.world_pose(&ee);
         let mut unreachable = start;
         unreachable.translation.vector.x += 10.0; // 10 m away: no IK solution
-        assert!(plan_cartesian(&mut arm, &start, &unreachable, seed, &v1_limits(), 0.0).is_none());
+        assert!(
+            plan_cartesian(
+                &mut arm,
+                &start,
+                &unreachable,
+                seed,
+                &v1_limits(),
+                0.0,
+                default_tolerance()
+            )
+            .is_none()
+        );
+    }
+
+    /// A pose the sub-millimetre default refuses and a 5 mm / 5 deg request
+    /// admits, found by sweeping the workspace around Ready: the servo rollout
+    /// stalls against the tight bar and converges against the loose one.
+    /// Offsets are from the Ready grasp point, in world metres.
+    const TOLERANCE_SENSITIVE_OFFSET: [f64; 3] = [-0.32, -0.16, 0.08];
+
+    /// What the panel asks for: 5 mm and 5 degrees.
+    fn panel_tolerance() -> PlanTolerance {
+        PlanTolerance::from_wire(0.005, 5.0 * std::f64::consts::PI / 180.0)
+            .expect("the panel's tolerance is valid")
+    }
+
+    fn ready_pose(model: &mut Arm) -> Isometry3<f64> {
+        let ee = model.at(&READY).ee_pose();
+        model.world_pose(&ee)
+    }
+
+    fn tolerance_sensitive_goal(model: &mut Arm) -> (Isometry3<f64>, Isometry3<f64>) {
+        let start = ready_pose(model);
+        let mut end = start;
+        end.translation.vector.x += TOLERANCE_SENSITIVE_OFFSET[0];
+        end.translation.vector.y += TOLERANCE_SENSITIVE_OFFSET[1];
+        end.translation.vector.z += TOLERANCE_SENSITIVE_OFFSET[2];
+        (start, end)
+    }
+
+    // The feature itself: the caller's slack decides admission. The same goal,
+    // the same arm, the same seed - refused at the default bar and planned at
+    // the panel's. Without this the whole change is unobservable.
+    #[test]
+    fn a_loose_tolerance_admits_a_goal_the_default_refuses() {
+        let mut model = v2_right_arm();
+        let (start, end) = tolerance_sensitive_goal(&mut model);
+
+        assert!(
+            plan_cartesian(
+                &mut model,
+                &start,
+                &end,
+                READY,
+                &v2_limits(),
+                2.0,
+                default_tolerance()
+            )
+            .is_none(),
+            "this goal is chosen because the default tolerance refuses it"
+        );
+
+        let plan = plan_cartesian(
+            &mut model,
+            &start,
+            &end,
+            READY,
+            &v2_limits(),
+            2.0,
+            panel_tolerance(),
+        )
+        .expect("the panel's slack must admit it");
+        let CartesianPlan::Servo { duration_s } = plan else {
+            panic!("a goal no line tracks must be admitted through the servo");
+        };
+        assert!(duration_s < crate::servo::MAX_SERVO_S);
+    }
+
+    // The promise the caller is sold: a goal admitted at a tolerance is planned
+    // to within that tolerance. Admission changing is not the same claim, and
+    // only this asserts the endpoint itself.
+    #[test]
+    fn an_admitted_goal_is_planned_within_the_tolerance_it_was_admitted_at() {
+        let mut model = v2_right_arm();
+        let (start, end) = tolerance_sensitive_goal(&mut model);
+        let tolerance = panel_tolerance();
+
+        plan_cartesian(
+            &mut model,
+            &start,
+            &end,
+            READY,
+            &v2_limits(),
+            2.0,
+            tolerance,
+        )
+        .expect("admitted at the panel's slack");
+        // Asserts the landed pose against `tolerance` on both axes.
+        run_servo_to_convergence(&mut model, &start, &end, READY, tolerance);
+    }
+
+    // Convergence is judged against the caller's bar, so a wider bar is met
+    // strictly sooner than a narrower one on the same goal. Equal durations
+    // would mean the bar was never read.
+    #[test]
+    fn a_wider_tolerance_converges_no_later_than_a_narrower_one() {
+        let mut model = v2_right_arm();
+        let start = ready_pose(&mut model);
+        let mut end = start;
+        end.translation.vector.x -= 0.2;
+
+        let tight = crate::servo::rollout(
+            &mut model,
+            &start,
+            &end,
+            READY,
+            &v2_limits(),
+            default_tolerance(),
+        )
+        .expect("the pull converges at the default bar");
+        let loose = crate::servo::rollout(
+            &mut model,
+            &start,
+            &end,
+            READY,
+            &v2_limits(),
+            panel_tolerance(),
+        )
+        .expect("a wider bar cannot refuse what a narrower one accepted");
+        // Strict: an equal duration would mean the bar was never consulted.
+        // The rollout is deterministic, so the gap is reproducible.
+        assert!(
+            loose < tight,
+            "wider bar took {loose:.3}s against the narrower bar's {tight:.3}s; \
+             equal means convergence ignored the caller's slack"
+        );
+    }
+
+    // The zero-length-line detector measures geometry, not acceptance, so it
+    // stays on the control_core constant: a pure reorientation must still start
+    // its reference fully advanced no matter how wide the caller's position
+    // slack is, or the servo would walk a line that does not exist.
+    #[test]
+    fn a_pure_reorientation_is_unaffected_by_a_wide_position_tolerance() {
+        let mut model = v2_right_arm();
+        let start = ready_pose(&mut model);
+        let mut end = start;
+        end.rotation = UnitQuaternion::from_axis_angle(&Vector3::z_axis(), 0.2) * start.rotation;
+
+        // A metre of position slack: far past the zero-length-line threshold.
+        let sloppy = PlanTolerance::from_wire(1.0, 1e-3).expect("valid");
+        let mut state = crate::servo::ServoState::new(
+            start,
+            end,
+            sloppy,
+            crate::servo::smoothing_for(TEST_DT).unwrap(),
+        );
+        let caps = EeCaps {
+            linear_m_s: TEST_EE_CAP_M_S,
+            angular_rad_s: TEST_EE_CAP_RAD_S,
+        };
+        // One step is enough: the detector runs before any reference walk, so a
+        // zero-length line is fully advanced immediately and the step resolves
+        // the rotation rather than chasing a phantom line.
+        match state.step(&mut model, &READY, &V_MAX_V2, caps, TEST_DT) {
+            crate::servo::ServoStep::Stepped(next) => {
+                assert!(
+                    next.iter()
+                        .zip(READY.iter())
+                        .any(|(a, b)| (a - b).abs() > 0.0),
+                    "a pure reorientation must still command motion"
+                );
+            }
+            crate::servo::ServoStep::Converged(_) => {
+                panic!("a 0.2 rad reorientation is not converged at a 1e-3 rad bar")
+            }
+        }
     }
 
     // --- CartesianTrajectory ---------------------------------------------
@@ -1090,7 +1331,15 @@ mod tests {
         // ...so the planner selects the steered line (and it stays under the cap).
         let Some(CartesianPlan::Line {
             steer_elbow: true, ..
-        }) = plan_cartesian(&mut model, &start, &end, seed, &v2_limits(), 2.0)
+        }) = plan_cartesian(
+            &mut model,
+            &start,
+            &end,
+            seed,
+            &v2_limits(),
+            2.0,
+            default_tolerance(),
+        )
         else {
             panic!("expected a steered-elbow line");
         };
@@ -1111,9 +1360,15 @@ mod tests {
                 UnitQuaternion::from_axis_angle(&Vector3::z_axis(), turn_rad),
             );
 
-        let Some(CartesianPlan::Line { duration_s, .. }) =
-            plan_cartesian(&mut model, &start, &end, seed, &v2_limits(), 0.1)
-        else {
+        let Some(CartesianPlan::Line { duration_s, .. }) = plan_cartesian(
+            &mut model,
+            &start,
+            &end,
+            seed,
+            &v2_limits(),
+            0.1,
+            default_tolerance(),
+        ) else {
             panic!("expected a line for a pure reorientation");
         };
         let peak_rad_s = QUINTIC_PEAK_VELOCITY * turn_rad / duration_s;

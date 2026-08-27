@@ -22,12 +22,28 @@ use crate::state::{ARM_DOF, Side};
 /// radians): the form the panel edits and displays.
 pub type Pose = [f64; 6];
 
-/// A discrete move counts as "arrived" within this position / angle slack. The backbone
-/// reports success once its setpoints finish streaming, which a governor stop satisfies
-/// without the arm following, so the move handlers re-check the measured final pose
-/// against these. One angle slack serves both joint error and orientation error.
+const DEG: f64 = std::f64::consts::PI / 180.0;
+
+/// The slack the panel asks the backbone to plan a pose move within, sent as
+/// `move_arm`'s `plan_*` tolerances; a goal it cannot plan this closely is refused.
+pub const PLAN_POS_TOL_M: f64 = 0.005;
+pub const PLAN_ANGLE_TOL_RAD: f64 = 5.0 * DEG;
+
+/// A discrete move counts as "arrived" within this slack. The backbone reports
+/// success once its setpoints finish streaming, which a governor stop satisfies
+/// without the arm following, so the move handlers re-check the measured final
+/// pose against these.
 pub const REACHED_POS_TOL_M: f64 = 0.02;
-pub const REACHED_ANGLE_TOL_RAD: f64 = 5.0 * std::f64::consts::PI / 180.0; // 5 degrees
+pub const REACHED_ORIENTATION_TOL_RAD: f64 = 20.0 * DEG;
+
+/// Worst per-joint error a `move_arm_joints` move may end with and still count
+/// as arrived; backs no plan bar, since a joint target is exactly reachable.
+pub const REACHED_JOINT_TOL_RAD: f64 = 5.0 * DEG;
+
+// The arrival bars exist to catch a governor stop, which they cannot do if a
+// legitimately planned move already sits on them.
+const _: () = assert!(PLAN_POS_TOL_M < REACHED_POS_TOL_M);
+const _: () = assert!(PLAN_ANGLE_TOL_RAD < REACHED_ORIENTATION_TOL_RAD);
 
 /// The two per-side arm models (FK/Jacobian/limits) behind mutexes, plus each
 /// side's URDF joint velocity limits for step clamping.
