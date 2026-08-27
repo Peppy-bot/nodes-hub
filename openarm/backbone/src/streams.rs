@@ -36,7 +36,7 @@ pub(crate) const THROTTLED_WARN_PERIOD: Duration = Duration::from_secs(1);
 /// Pause after a receive error before retrying, so a persistently broken
 /// subscription cannot spin the listener at full CPU or flood the log at the stream
 /// rate. Transient errors still recover; a genuinely dead stream just idles.
-const RECEIVE_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+pub(crate) const RECEIVE_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
 /// The latest commanded opening for one gripper, fed by the upstream
 /// pairing's `gripper_setpoints`: the raw wire opening fraction, clamped into

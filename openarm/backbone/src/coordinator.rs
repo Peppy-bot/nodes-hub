@@ -31,6 +31,7 @@ use crate::chase::rate_limited;
 use crate::governor::{GovState, Governor, Guard};
 use crate::liveness::{self, Admission, Liveness};
 use crate::motion::{MOTION_TIMEOUT_FACTOR, MoveBudget};
+use crate::obstacles::ObstacleRequest;
 use crate::planner::{self, BusyGuard, Goal, Planner};
 use crate::publish::{LimbStateSnapshot, Publishers};
 use crate::streams::{ArmState, GovernorConfig, GripperCommand, GripperState};
@@ -61,6 +62,17 @@ pub struct ArmChannels {
     pub busy: Arc<AtomicBool>,
     pub gripper_goals: mpsc::Receiver<GripperGoal>,
     pub gripper_busy: Arc<AtomicBool>,
+}
+
+/// The node-wide inbound channels the loop drains, as opposed to the per-arm
+/// [`ArmChannels`]: both carry what an operator asks of the governor, which is
+/// why they arrive together and are read in the same tick.
+pub struct ControlChannels {
+    /// The operator's live governor controls (toggle, band, speed cap), read
+    /// every tick.
+    pub governor_config: watch::Receiver<GovernorConfig>,
+    /// Workspace-obstacle requests from the services, answered every tick.
+    pub obstacles: mpsc::Receiver<ObstacleRequest>,
 }
 
 /// The coordinator's run parameters. A *leading node* that stops streaming gets
@@ -135,10 +147,14 @@ pub async fn run(
     mut governor: Governor,
     mut planners: ArmPair<Planner>,
     mut channels: ArmPair<ArmChannels>,
-    governor_config: watch::Receiver<GovernorConfig>,
+    controls: ControlChannels,
     config: RunConfig,
     token: CancellationToken,
 ) -> peppygen::Result<()> {
+    let ControlChannels {
+        governor_config,
+        obstacles: mut obstacle_requests,
+    } = controls;
     let RunConfig {
         cycle_period,
         velocity_filter_cutoff_hz,
@@ -148,7 +164,15 @@ pub async fn run(
 
     // Hold each arm's real pose, not a neutral zero: wait for the first measured
     // state from both arms and seed the held setpoints there before publishing.
-    if seed_all(&mut channels, &mut planners).await.is_err() {
+    if seed_all(
+        &mut channels,
+        &mut planners,
+        &mut obstacle_requests,
+        &mut governor,
+    )
+    .await
+    .is_err()
+    {
         return Ok(());
     }
     info!("bimanual backbone: both arms reporting; governed streaming begins");
@@ -185,6 +209,9 @@ pub async fn run(
     // The proximity readout is for human eyes, so publish it at ~20 Hz rather than
     // the control rate: one extra distance query every `readout_every` ticks.
     let readout_every = (0.05 / dt).round().max(1.0) as u64;
+    // The obstacle cost line is for tuning, not monitoring, so it is rare: one
+    // extra query every five seconds, and none at all with no obstacles.
+    let obstacle_cost_every = (5.0 / dt).round().max(1.0) as u64;
     let mut tick: u64 = 0;
     let mut pacer = Pacer::new(cycle_period).expect("control_rate_hz is asserted > 0 at startup");
     // Both arms are seeded from their first measurement above, which is the
@@ -261,6 +288,12 @@ pub async fn run(
             ),
         );
         let measured = measured_config(&channels, &prev, measured_grippers);
+        // Before governing, so an obstacle admitted this tick shapes this tick's
+        // step rather than the next one. A stale side's measured pose is one the
+        // backbone has stopped vouching for, so no insertion is weighed against
+        // it; the other request kinds need no configuration at all.
+        let basis = insertion_basis(arm_admission, gripper_admission, &prev, &measured);
+        serve_obstacle_requests(&mut obstacle_requests, &mut governor, basis.as_ref());
         let governed = governor.govern(&prev, &cand, &measured, &hands, dt);
         governed_grippers = governed.grippers;
 
@@ -329,6 +362,23 @@ pub async fn run(
             upstream_mode,
         )
         .await;
+
+        // What the live obstacle set costs this machine. Nothing caps the set:
+        // obstacles slow the loop, and a slow loop issues the same clipped
+        // setpoints further apart rather than letting the arms approach any
+        // closer, so the operator is given the cost to judge instead of a limit
+        // guessed on their behalf. The pacer reports the overruns if they
+        // overreach.
+        if tick.is_multiple_of(obstacle_cost_every) && governor.obstacle_count() > 0 {
+            let started = Instant::now();
+            let _ = governor.proximity(&prev);
+            info!(
+                "{} obstacle(s) live; collision scan {:.0} us of the {:.0} us tick",
+                governor.obstacle_count(),
+                started.elapsed().as_secs_f64() * 1e6,
+                dt * 1e6,
+            );
+        }
 
         // Operator readouts (rate-limited), sharing one cadence: the proximity
         // feed and the whole-robot state snapshot.
@@ -630,6 +680,8 @@ const STALE_REFUSAL: &str = "the follower stopped reporting";
 async fn seed_all(
     channels: &mut ArmPair<ArmChannels>,
     planners: &mut ArmPair<Planner>,
+    obstacle_requests: &mut mpsc::Receiver<ObstacleRequest>,
+    governor: &mut Governor,
 ) -> Result<(), Shutdown> {
     loop {
         tokio::select! {
@@ -656,6 +708,13 @@ async fn seed_all(
             Some(goal) = channels.right.gripper_goals.recv() => {
                 refuse_seed_gripper_goal(goal, &channels.right).await;
             }
+            // Served here too, so an obstacle request during the seed wait gets
+            // an answer rather than a silence its caller has to time out on.
+            // An insertion is refused: with no measured state there is nothing
+            // to weigh the arms' clearance against.
+            Some(request) = obstacle_requests.recv() => {
+                answer_obstacle_request(request, governor, None);
+            }
         }
     }
     for (channels, planner) in [
@@ -679,6 +738,97 @@ async fn refuse_seed_arm_goal(goal: Goal, channels: &ArmChannels, planner: &mut 
     let _release = BusyGuard(channels.busy.clone());
     let reported = measured.map_or_else(|| planner.setpoint(), |m| m.positions);
     goal.refuse(SEED_REFUSAL, reported, planner).await;
+}
+
+/// Why an insertion is refused when the arms are not reporting. Covers both
+/// occasions there is no configuration to weigh one against: before the first
+/// measured state arrives, and after a follower has gone stale, whose last
+/// reported pose the backbone no longer vouches for.
+const NO_BASIS_REFUSAL: &str =
+    "the arms are not reporting, so there is nothing to weigh the obstacle against";
+
+/// What an insertion is weighed against: the last governed setpoint the
+/// barrier keys on, and the measured pose the monitor keys on. Only an
+/// insertion needs it, and it exists only while the whole robot is reporting.
+struct InsertionBasis<'a> {
+    prev: &'a GovState,
+    measured: &'a GovState,
+}
+
+/// The configurations to weigh an insertion against, or `None` when any limb
+/// has gone stale. Every limb counts, grippers included: an obstacle's
+/// clearance is measured to the fingers as much as to the arms, and the
+/// fingers are the outermost geometry the arms carry, so a stale gripper is a
+/// stale answer about exactly the part nearest the obstacle.
+fn insertion_basis<'a>(
+    arms: ArmPair<Admission>,
+    grippers: ArmPair<Admission>,
+    prev: &'a GovState,
+    measured: &'a GovState,
+) -> Option<InsertionBasis<'a>> {
+    let live = |a: &ArmPair<Admission>| a.left != Admission::Stale && a.right != Admission::Stale;
+    (live(&arms) && live(&grippers)).then_some(InsertionBasis { prev, measured })
+}
+
+/// Answer every queued obstacle request against the governor at this tick's
+/// configuration. Drained rather than awaited, so a request costs the loop
+/// nothing when there are none and waits at most one tick when there are.
+///
+/// The whole queue is served, insertions included, because the queue itself is
+/// what bounds their cost: it holds eight, and a refused insertion is rolled
+/// back rather than counted against the obstacle cap, so the cap alone would
+/// not bound the work. `obstacle_tick_cost_report` measures a full queue of
+/// eight at ~0.5 ms of insertions, and at ~1.8 ms of refusals, which are the
+/// dearer of the two because each pays a measurement at both configurations
+/// and a rollback. Even that worst case leaves a 10 ms tick most of its budget
+/// for the governing it precedes.
+fn serve_obstacle_requests(
+    requests: &mut mpsc::Receiver<ObstacleRequest>,
+    governor: &mut Governor,
+    basis: Option<&InsertionBasis>,
+) {
+    while let Ok(request) = requests.try_recv() {
+        answer_obstacle_request(request, governor, basis);
+    }
+}
+
+/// Answer one obstacle request. `basis` is `None` while the arms are not
+/// reporting, which only an insertion needs: its whole admission is the arms'
+/// clearance to the new obstacle, so with nothing to weigh it against it is
+/// refused rather than guessed at. A dropped reply channel means the caller
+/// stopped waiting, which is its prerogative and not a failure here.
+fn answer_obstacle_request(
+    request: ObstacleRequest,
+    governor: &mut Governor,
+    basis: Option<&InsertionBasis>,
+) {
+    match request {
+        ObstacleRequest::Add { obstacle, reply } => {
+            let name = obstacle.name().to_string();
+            let outcome = match basis {
+                Some(basis) => governor.add_obstacle(*obstacle, basis.prev, basis.measured),
+                None => Err(NO_BASIS_REFUSAL.to_string()),
+            };
+            let admitted = outcome.is_ok();
+            // An insertion whose answer cannot be delivered is taken back out.
+            // The caller was told the request failed, or gave up waiting and
+            // was told nothing; either way it must not be left governing
+            // against an obstacle it does not know is there.
+            if reply.send(outcome).is_err() && admitted {
+                warn!("obstacle '{name}' rolled back: nothing was waiting for the answer");
+                let _ = governor.remove_obstacle(&name);
+            }
+        }
+        ObstacleRequest::Remove { name, reply } => {
+            let _ = reply.send(governor.remove_obstacle(&name));
+        }
+        ObstacleRequest::Clear { reply } => {
+            let _ = reply.send(governor.clear_obstacles());
+        }
+        ObstacleRequest::List { reply } => {
+            let _ = reply.send(governor.obstacle_names());
+        }
+    }
 }
 
 /// Refuse one gripper goal during the seed wait, reporting the measured
@@ -901,6 +1051,7 @@ fn filtered_velocity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_fixtures::{front_wall, obstacle, swallowing_box};
 
     fn cmd(opening: f64) -> Option<GripperCommand> {
         Some(GripperCommand {
@@ -1134,5 +1285,283 @@ mod tests {
         assert!(!busy.load(Ordering::Acquire), "refusal releases the claim");
         assert_eq!(tick.candidate, planner.setpoint(), "a stale side holds");
         assert!(tick.streamed_hand.is_none(), "a stale side streams nothing");
+    }
+
+    /// A governor over the bundled v1 description, the same fixture the
+    /// governor's own tests use, so a request can be answered for real rather
+    /// than against a stub.
+    fn test_governor() -> Governor {
+        let version = openarm_description::HardwareVersion::V1;
+        let meshes = tempfile::tempdir().expect("scratch dir for collision meshes");
+        version
+            .write_meshes_to(meshes.path())
+            .expect("materialize collision meshes");
+        Governor::build(
+            version.urdf(),
+            meshes
+                .path()
+                .to_str()
+                .expect("meshes dir path is valid UTF-8"),
+            version.base_link(openarm_description::Side::Left),
+            version.base_link(openarm_description::Side::Right),
+            0.005,
+            0.02,
+            1000.0,
+            0.5,
+            1.0,
+            true,
+        )
+        .expect("build governor from bundled description")
+    }
+
+    /// Both arms at an in-limit home (the elbow's lower limit is 0.05) with the
+    /// grippers open: the configuration an insertion is weighed at.
+    fn measured_home() -> GovState {
+        GovState::new(
+            ArmPair::new(
+                [0.0, 0.0, 0.0, 0.05, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.05, 0.0, 0.0, 0.0],
+            ),
+            ArmPair::new(1.0, 1.0),
+        )
+    }
+
+    /// The request variants carry a boxed obstacle; the fixtures do not.
+    fn boxed(o: bimanual_collision_model::Obstacle) -> Box<bimanual_collision_model::Obstacle> {
+        Box::new(o)
+    }
+
+    /// Answer one request through the loop's own entry point and read the reply
+    /// the caller would have got.
+    fn answer<T>(
+        governor: &mut Governor,
+        basis: Option<&InsertionBasis>,
+        request: impl FnOnce(std::sync::mpsc::SyncSender<T>) -> ObstacleRequest,
+    ) -> T {
+        let (reply, answer) = std::sync::mpsc::sync_channel(1);
+        answer_obstacle_request(request(reply), governor, basis);
+        answer.recv().expect("the loop always answers")
+    }
+
+    fn at(state: &GovState) -> InsertionBasis<'_> {
+        InsertionBasis {
+            prev: state,
+            measured: state,
+        }
+    }
+
+    #[test]
+    fn an_insertion_is_answered_against_the_tick_configuration() {
+        let mut g = test_governor();
+        let home = measured_home();
+        let outcome = answer(&mut g, Some(&at(&home)), |reply| ObstacleRequest::Add {
+            obstacle: boxed(front_wall()),
+            reply,
+        });
+        assert!(outcome.is_ok(), "a wall clear of the arms: {outcome:?}");
+        assert_eq!(g.obstacle_names(), ["wall"]);
+
+        let refused = answer(&mut g, Some(&at(&home)), |reply| ObstacleRequest::Add {
+            obstacle: boxed(swallowing_box("swallows")),
+            reply,
+        });
+        assert!(
+            refused.is_err_and(|reason| reason.contains("stop distance")),
+            "an obstacle over the arms must come back refused"
+        );
+        assert_eq!(g.obstacle_names(), ["wall"], "a refusal changed the set");
+    }
+
+    #[test]
+    fn an_insertion_weighs_the_commanded_pose_as_well_as_the_measured_one() {
+        // The barrier and the floor scan key on the last governed setpoint, the
+        // monitor on the measured pose. An obstacle clear of one and not the
+        // other holds the arms either way, so it must be refused.
+        let mut g = test_governor();
+        let home = measured_home();
+        let mut reached = home;
+        reached.arms.left[3] = 1.2; // elbow through the front wall
+        for (label, basis) in [
+            (
+                "commanded pose in breach",
+                InsertionBasis {
+                    prev: &reached,
+                    measured: &home,
+                },
+            ),
+            (
+                "measured pose in breach",
+                InsertionBasis {
+                    prev: &home,
+                    measured: &reached,
+                },
+            ),
+        ] {
+            let outcome = answer(&mut g, Some(&basis), |reply| ObstacleRequest::Add {
+                obstacle: boxed(front_wall()),
+                reply,
+            });
+            assert!(
+                outcome.is_err_and(|reason| reason.contains("stop distance")),
+                "{label}: expected a refusal"
+            );
+            assert!(g.obstacle_names().is_empty(), "{label}: left a trace");
+        }
+    }
+
+    #[test]
+    fn an_insertion_without_a_configuration_is_refused_not_guessed() {
+        // Before the arms report, and whenever a follower has gone stale, there
+        // is nothing to weigh an insertion against.
+        let mut g = test_governor();
+        let outcome = answer(&mut g, None, |reply| ObstacleRequest::Add {
+            obstacle: boxed(front_wall()),
+            reply,
+        });
+        assert_eq!(outcome, Err(NO_BASIS_REFUSAL.to_string()));
+        assert!(g.obstacle_names().is_empty());
+    }
+
+    #[test]
+    fn the_other_requests_are_answered_with_or_without_a_configuration() {
+        let mut g = test_governor();
+        let home = measured_home();
+        answer(&mut g, Some(&at(&home)), |reply| ObstacleRequest::Add {
+            obstacle: boxed(front_wall()),
+            reply,
+        })
+        .expect("clear of the arms");
+
+        assert_eq!(
+            answer(&mut g, None, |reply| ObstacleRequest::List { reply }),
+            ["wall"]
+        );
+        assert!(
+            answer(&mut g, None, |reply| ObstacleRequest::Remove {
+                name: "never_added".to_string(),
+                reply,
+            })
+            .is_err()
+        );
+        assert!(
+            answer(&mut g, None, |reply| ObstacleRequest::Remove {
+                name: "wall".to_string(),
+                reply,
+            })
+            .is_ok()
+        );
+        assert_eq!(
+            answer(&mut g, None, |reply| ObstacleRequest::Clear { reply }),
+            "0 obstacle(s) removed",
+            "clearing an empty set is not a failure"
+        );
+        assert!(answer(&mut g, None, |reply| ObstacleRequest::List { reply }).is_empty());
+    }
+
+    #[test]
+    fn a_stale_limb_withholds_the_basis_for_an_insertion() {
+        // Grippers count as much as arms: an obstacle's clearance is measured
+        // to the fingers, which are the outermost bodies the arms carry.
+        let live = ArmPair::new(Admission::Live, Admission::Live);
+        let home = measured_home();
+        assert!(insertion_basis(live, live, &home, &home).is_some());
+        for (label, arms, grippers) in [
+            (
+                "left arm",
+                ArmPair::new(Admission::Stale, Admission::Live),
+                live,
+            ),
+            (
+                "right arm",
+                ArmPair::new(Admission::Live, Admission::Stale),
+                live,
+            ),
+            (
+                "left gripper",
+                live,
+                ArmPair::new(Admission::Stale, Admission::Live),
+            ),
+            (
+                "right gripper",
+                live,
+                ArmPair::new(Admission::Live, Admission::Stale),
+            ),
+        ] {
+            assert!(
+                insertion_basis(arms, grippers, &home, &home).is_none(),
+                "a stale {label} still admitted an insertion"
+            );
+        }
+        // Re-anchoring is not staleness: the pose is fresh, and the planner has
+        // already been seeded from it by the time the basis is taken.
+        let reanchor = ArmPair::new(Admission::Reanchor, Admission::Live);
+        assert!(insertion_basis(reanchor, live, &home, &home).is_some());
+    }
+
+    #[test]
+    fn an_insertion_nobody_is_waiting_for_is_rolled_back() {
+        // The caller gave up, so it will never learn the obstacle went in. It
+        // must not be left governing against one it does not know about.
+        let mut g = test_governor();
+        let (reply, answer) = std::sync::mpsc::sync_channel(1);
+        drop(answer);
+        answer_obstacle_request(
+            ObstacleRequest::Add {
+                obstacle: boxed(front_wall()),
+                reply,
+            },
+            &mut g,
+            Some(&at(&measured_home())),
+        );
+        assert!(
+            g.obstacle_names().is_empty(),
+            "an obstacle nobody was told about is still in force"
+        );
+    }
+
+    #[test]
+    fn a_whole_queued_burst_is_served_on_one_tick() {
+        // Every queued request is answered on the tick that drains it, and no
+        // count refuses the surplus: the set grows to whatever the operator
+        // needs, and its cost is reported rather than capped.
+        let mut g = test_governor();
+        let home = measured_home();
+        let queued = 12;
+        let (tx, mut rx) = mpsc::channel(queued + 1);
+        let mut adds = Vec::new();
+        for i in 0..queued {
+            let (reply, answer) = std::sync::mpsc::sync_channel(1);
+            adds.push(answer);
+            let base = 2.0 + i as f64;
+            tx.try_send(ObstacleRequest::Add {
+                obstacle: boxed(obstacle(
+                    &format!("wall{i}"),
+                    [base, 0.0, 0.0],
+                    [base + 0.5, 1.0, 1.0],
+                )),
+                reply,
+            })
+            .expect("queued");
+        }
+        let (list_reply, list_answer) = std::sync::mpsc::sync_channel(1);
+        tx.try_send(ObstacleRequest::List { reply: list_reply })
+            .expect("queued");
+
+        serve_obstacle_requests(&mut rx, &mut g, Some(&at(&home)));
+
+        let admitted = adds
+            .into_iter()
+            .map(|answer| answer.try_recv().expect("every request is answered"))
+            .filter(Result::is_ok)
+            .count();
+        assert_eq!(
+            admitted, queued,
+            "an obstacle clear of the arms was refused"
+        );
+        assert_eq!(
+            list_answer.try_recv().expect("answered").len(),
+            queued,
+            "a request queued behind the burst was not served"
+        );
     }
 }

@@ -33,6 +33,11 @@
       // The whole-robot posture moves: both arms to Ready or Home through
       // the same admission and planner path as move_arm_joints.
       { name: "postures", tag: "v1", link_id: "postures" },
+      // Runtime workspace obstacles: convex bodies the governor keeps the arms
+      // off, on top of the robot's own geometry. Served from the coordination
+      // loop, which owns the collision model and the measured state an
+      // insertion is weighed against.
+      { name: "openarm_obstacles", tag: "v1", link_id: "obstacles" },
     ],
     depends_on: {
       contracts: [
@@ -160,6 +165,12 @@
       ]
     },
     services: {
+      exposes: [
+        { link_id: "obstacles", name: "add_obstacle" },
+        { link_id: "obstacles", name: "remove_obstacle" },
+        { link_id: "obstacles", name: "clear_obstacles" },
+        { link_id: "obstacles", name: "list_obstacles" }
+      ],
       consumes: [
         { link_id: "robot_init", name: "is_ready" }
       ]

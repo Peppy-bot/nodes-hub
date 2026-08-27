@@ -14,7 +14,9 @@
 
 use std::time::Instant;
 
-use bimanual_collision_model::{BimanualCollisionModel, CollisionError, DistanceGradient};
+use bimanual_collision_model::{
+    BimanualCollisionModel, CollisionError, DistanceGradient, Obstacle,
+};
 use tracing::warn;
 
 use crate::streams::warn_throttled;
@@ -78,6 +80,52 @@ impl ConfiguredModel {
         self.inner
             .set_gripper_openings(s.grippers.left, s.grippers.right);
         self.inner.distance_gradient(&s.arms.left, &s.arms.right)
+    }
+
+    /// Put a fitted obstacle in the arms' way for the rest of the run, or until
+    /// it is removed. Errors if its name is already a body's.
+    pub fn add_obstacle(&mut self, obstacle: Obstacle) -> Result<(), CollisionError> {
+        self.inner.add_obstacle(obstacle)
+    }
+
+    /// Take one obstacle back out. Errors on a name that is not a live
+    /// obstacle's.
+    pub fn remove_obstacle(&mut self, name: &str) -> Result<(), CollisionError> {
+        self.inner.remove_obstacle(name)
+    }
+
+    /// Take every obstacle out, returning how many there were.
+    pub fn clear_obstacles(&mut self) -> usize {
+        self.inner.clear_obstacles()
+    }
+
+    /// How many obstacles are in force, without naming them.
+    pub fn obstacle_count(&self) -> usize {
+        self.inner.obstacle_count()
+    }
+
+    /// The obstacles in force, in the order they were added.
+    pub fn obstacle_names(&self) -> Vec<String> {
+        self.inner
+            .obstacle_names()
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Clearance from one obstacle to the arms at a governed configuration,
+    /// ignoring every pair it is not in. Errors on a name that is not a live
+    /// obstacle's.
+    pub fn obstacle_clearance(
+        &mut self,
+        name: &str,
+        q: &[f64; GOV_DOF],
+    ) -> Result<f64, CollisionError> {
+        let s = split(q);
+        self.inner
+            .set_gripper_openings(s.grippers.left, s.grippers.right);
+        self.inner
+            .obstacle_clearance(name, &s.arms.left, &s.arms.right)
     }
 
     /// Upper bound (m) on how much the clearance can change over a step.

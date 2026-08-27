@@ -24,11 +24,14 @@ mod governor;
 mod liveness;
 mod motion;
 mod node;
+mod obstacles;
 mod planner;
 mod publish;
 mod servo;
 mod startup;
 mod streams;
+#[cfg(test)]
+mod test_fixtures;
 mod torso;
 mod trajectory;
 mod types;

@@ -352,6 +352,12 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         Arc::new(AtomicBool::new(false)),
         Arc::new(AtomicBool::new(false)),
     ];
+    // Obstacle requests from the four services into the coordination loop,
+    // which owns the collision model. Deep enough that a handful of requests
+    // arriving inside one tick all land, shallow enough that a caller learns
+    // the loop is not draining rather than queueing behind an unbounded
+    // backlog.
+    let (obstacle_tx, obstacle_rx) = mpsc::channel(8);
     let (config_tx, config_rx) = watch::channel(streams::GovernorConfig {
         enabled: params.collision_governor_enabled,
         d_stop: params.d_stop_m,
@@ -400,7 +406,10 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
             governor,
             planners,
             channels,
-            config_rx,
+            coordinator::ControlChannels {
+                governor_config: config_rx,
+                obstacles: obstacle_rx,
+            },
             coordinator::RunConfig {
                 cycle_period,
                 velocity_filter_cutoff_hz: params.velocity_filter_cutoff_hz,
@@ -428,6 +437,26 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
             runner.clone(),
             [goal_tx0, goal_tx1],
             [goal_busy[0].clone(), goal_busy[1].clone()],
+        ));
+        set.spawn(crate::obstacles::run_add_obstacle(
+            runner.clone(),
+            obstacle_tx.clone(),
+            token.clone(),
+        ));
+        set.spawn(crate::obstacles::run_remove_obstacle(
+            runner.clone(),
+            obstacle_tx.clone(),
+            token.clone(),
+        ));
+        set.spawn(crate::obstacles::run_clear_obstacles(
+            runner.clone(),
+            obstacle_tx.clone(),
+            token.clone(),
+        ));
+        set.spawn(crate::obstacles::run_list_obstacles(
+            runner.clone(),
+            obstacle_tx,
+            token.clone(),
         ));
         set.spawn(actions::gripper::run_move_gripper(
             runner.clone(),

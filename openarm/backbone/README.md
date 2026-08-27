@@ -143,6 +143,72 @@ commanded motion with a
 how close it landed (the governor may have held it short, and that is not a
 failure of the move machinery).
 
+## Services
+
+The `openarm_obstacles` contract: convex world-frame bodies the governor keeps
+both arms off, on top of the robot's own geometry. An obstacle is one convex
+hull fitted from a point cloud, sent either as flat `[x, y, z, ...]` vertices or
+as a binary STL (only its vertex cloud is read, so a concave mesh is filled in
+by the fit). Every response carries `success` and an operator-facing `message`.
+
+| Service | Request | Refused when |
+|---|---|---|
+| `add_obstacle` | `name`, `tolerance_m`, and exactly one of `vertices` (flat metre triples) or `stl` (binary STL bytes) | name empty, over 64 characters, or already a body's; neither or both geometry forms sent; a coordinate non-finite; the tolerance outside 0.1 mm to 100 mm, or too tight for the shape's curvature; the cloud bounds no solid or is outside the fittable 1 mm to 1 km extents; over 100k points; the arms are not clear of it at either the commanded or the measured pose, or any limb is not reporting |
+| `remove_obstacle` | `name` | the name is not a live obstacle's (the robot's own geometry included) |
+| `clear_obstacles` | | never; clearing an empty set succeeds |
+| `list_obstacles` | | never; returns `names` in the order added |
+
+An insertion is admitted only when the arms are clear of the new obstacle by
+more than `d_stop` at **both** the commanded setpoint and the measured pose:
+the barrier and the floor scan key on the former, the measured-state monitor on
+the latter, and an obstacle inserted in breach of either holds every closing
+command from its first tick. Such a state is escapable (separating motion is
+never throttled, and the monitor frees the side that opens the gap), but it is
+not a workspace an operator asked to be put in, so it is refused instead. An
+insertion is likewise refused while any limb has gone stale, grippers included,
+since a stale reading is a stale answer about the fingers, which are the
+outermost bodies the arms carry. A refusal leaves the model exactly as it was,
+as does an insertion whose caller stopped waiting for the answer.
+
+That test is an admission check, not a standing guarantee. It says the arms are
+clear when the obstacle goes in; it cannot keep them clear afterwards, and two
+ordinary operator actions can put an admitted obstacle in breach: driving into
+it with avoidance switched off, and raising `d_stop` past the clearance it was
+admitted at. Both behave exactly as they would against the robot's own
+geometry, so neither is special-cased here. The admission itself does not
+consult the avoidance toggle: a disabled governor still carries the obstacle,
+and switching avoidance on is not the moment to discover the arms are inside
+one.
+
+`tolerance_m` is how far the fitted hull may stand off the cloud, and the
+caller states it rather than inheriting a default, because it is a cost the
+robot carries on every tick the obstacle is live. The fit adds supporting planes
+until the hull is within it, and every plane is work in the collision scan. A
+flat-faced body hulls to its corners and pays nothing for a tight fit; a curved
+one needs roughly a hundredth of its radius, so a 20 cm ball wants 0.002 and a
+1 m ball 0.01. Too tight for the shape is refused by name. Looser is the
+conservative direction, since the hull contains the cloud either way and only
+grows.
+
+Nothing caps how many obstacles the set holds. Each one costs the collision scan
+on every tick, but the barrier clips setpoints to configurations that hold the
+clearance floor, so a loop running late issues those same configurations further
+apart rather than letting the arms approach any closer: the cost is
+responsiveness, not clearance. So the node reports it instead of guessing a
+limit. With any obstacle live it logs the set size and the measured scan cost
+against the tick period every five seconds, and the pacer reports overruns if
+the loop does fall behind. Both are measured on the machine it is running on,
+which is the only place that number means anything.
+
+Once admitted, an obstacle is an ordinary checked pair: the barrier, the floor
+scan, the tripwire and the proximity readout all treat it exactly as they treat
+the arms' own bodies, and `collision_status` names it when it is the nearest
+pair.
+
+The set is **not persisted**. It dies with the node, so a caller that needs an
+obstacle to outlive a restart adds it again; `list_obstacles` is how that caller
+sees what is actually in force.
+
 ## Module map
 
 | Module | Owns | Why it lives here |
@@ -164,6 +230,7 @@ failure of the move machinery).
 | `governor/limiters/` | the `Limiter` trait, one module per limiter, and `allowance.rs` (the `Allowance`/`Limits` currency they speak) | everything expressible as a per-DOF fraction lives together |
 | `governor/barrier.rs` | the projection and the floor scan | the two stages that are not per-DOF fractions |
 | `torso.rs` | the torso clip regions the URDF does not carry | geometry facts, versioned with the node |
+| `obstacles.rs` | the four obstacle services: parse, fit, hand to the tick | fitting a hull is far too slow for the tick, and only the loop holds the model and the measured state an insertion is weighed against |
 | `actions/` | goal admission (validate + claim), nothing else | execution belongs to the planner/coordinator that owns the state |
 | `types.rs`, `arm_pair.rs` | `ARM_DOF`, `JointVec`, `Side`, the motion-timeout rule, `ArmPair` | shared primitives |
 
