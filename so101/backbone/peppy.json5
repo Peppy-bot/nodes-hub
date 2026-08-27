@@ -79,8 +79,19 @@
             },
           },
         },
-        // Best effort orientation on a 5-DOF arm: the solution is verified
-        // against the target position; orientation is a soft objective.
+        // Refuses a share of reachable poses. The solver is lerobot's, a
+        // single QP step iterated until forward kinematics verifies the
+        // position, so the search is a local descent from the arm's current
+        // posture and finds only what that branch reaches. Measured on poses
+        // that are reachable by construction: 14% refused from the ready
+        // posture, 39% from an arbitrary posture, concentrated near the base
+        // (25% within 0.23 m, 7% beyond 0.45 m). A refusal means this branch
+        // did not reach the pose, not that the arm cannot; the same target
+        // often solves from a different starting posture. See so101/README.md.
+        //
+        // Orientation is best effort on a 5-DOF arm: only position is
+        // verified, against IK_POSITION_TOLERANCE_M. Orientation is a soft,
+        // low-weight objective and is not gated.
         { link_id: "limb_motion", name: "move_arm" },
         { link_id: "limb_motion", name: "move_gripper" },
       ]

@@ -72,6 +72,53 @@ region. On this single-moving-jaw gripper the pad midpoint shifts with the
 opening, so poses name that fixed frame rather than the contracts' exact
 grasp point; measure any offset that matters during hardware bring-up.
 
+## Inverse kinematics, and what it refuses
+
+The backbone solves with lerobot's placo-based `RobotKinematics`.
+`RobotKinematics.inverse_kinematics` is **one linearised QP step**, sized for
+streaming small deltas rather than for reaching a pose from anywhere.
+`so101_description.kinematics` wraps it: a point-to-point solve iterates that
+step up to `IK_MAX_ITERATIONS` and accepts only when forward kinematics puts
+the end effector within `IK_POSITION_TOLERANCE_M` of the target, so a
+`move_arm` never moves the arm to a pose it did not actually reach.
+
+That verification makes refusals honest, not rare. The search stays a local
+descent from the arm's current posture, so it finds solutions on that branch
+and no others. Measured against poses that are reachable by construction (a
+joint vector drawn inside the model's limits, and its forward kinematics taken
+as the target, so a solution provably exists):
+
+| Seed posture | Refused |
+|---|---|
+| `ready` (the calibration middle) | 14% (n=400) |
+| An arbitrary in-limits posture, which is what `move_arm` seeds from | 39% (n=300) |
+
+Refusals concentrate near the base rather than at the rim: 25% within 0.23 m
+of the base against 7% beyond 0.45 m. The gap between the seed posture and the
+target posture shows no such gradient, so distance from the seed is not what
+predicts a refusal.
+
+Read a refusal as *this branch did not reach the pose*, not as *the arm cannot
+reach it*. The same target frequently solves from a different starting posture,
+which is why the seed posture dominates the table above. A caller that hits a
+refusal can move the arm somewhere else and ask again.
+
+Two further limits worth knowing:
+
+- **Orientation is not verified.** Five joints underactuate three rotational
+  degrees of freedom, so orientation is a soft, low-weight objective of the QP
+  and only position is gated. A successful `move_arm` reports the orientation
+  it actually reached; check it if it matters.
+- **The reach ball bounds outward extent only.** Streamed pose targets are
+  clamped into a ball fitted to the sampled reachable set
+  (`backbone/src/so101_backbone/reach.py`) so the streaming solver is never
+  asked for a far-out-of-reach pose. Points near the base sit inside that ball
+  and are not clamped, which is the region where refusals cluster.
+
+This is accepted for now. Teleop through `xr_commander` drives the streaming
+path, which is best effort and unverified by design, and is unaffected. The
+cost falls on scripted `move_arm` goals.
+
 ## Serial devices
 
 The follower and leader adapters are identical USB serial bridges. Install
