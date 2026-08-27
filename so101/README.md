@@ -103,6 +103,38 @@ reach it*. The same target frequently solves from a different starting posture,
 which is why the seed posture dominates the table above. A caller that hits a
 refusal can move the arm somewhere else and ask again.
 
+### The path between the endpoints is not planned
+
+`move_arm` plans endpoints only. It runs one IK solve for the goal pose and
+then blends from the current joints to the solution with a minimum-jerk
+quintic **in joint space**. Nothing constrains where the end effector goes in
+between, and nothing verifies it. The arm does not walk the straight line
+between start and goal; it walks whatever curve the joint blend traces.
+
+Measured over 200 solved pose moves, the end effector's greatest departure
+from the straight line between the endpoints:
+
+| | Departure |
+|---|---|
+| Median | 91 mm |
+| p90 | 240 mm |
+| Worst seen | 472 mm |
+
+On an arm whose whole reach is about 0.54 m, that is not a small bow. 6% of
+moves dip more than 20 mm below *both* endpoints, so a move between two points
+above the table can pass below the lower of them.
+
+This also makes `max_ee_velocity_m_s` a nominal cap rather than a guarantee.
+`_ee_floor_s` sizes the move's minimum duration from the straight-line chord,
+but the path actually flown is longer than the chord, so the real end-effector
+speed exceeds the cap by that ratio: median 1.20x, p90 1.51x, worst seen 2.88x.
+The same applies to `max_ee_angular_velocity_rad_s`, sized from the relative
+rotation between the endpoints.
+
+Practically: keep the volume clear around more than the straight line, and
+treat the speed cap as nominal. Teleop is unaffected, since the streaming path
+follows the commanded stream tick by tick and never plans between two poses.
+
 Two further limits worth knowing:
 
 - **Orientation is not verified.** Five joints underactuate three rotational

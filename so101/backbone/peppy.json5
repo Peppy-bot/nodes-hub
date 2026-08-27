@@ -92,6 +92,14 @@
         // Orientation is best effort on a 5-DOF arm: only position is
         // verified, against IK_POSITION_TOLERANCE_M. Orientation is a soft,
         // low-weight objective and is not gated.
+        //
+        // Endpoints only: one solve for the goal, then a minimum-jerk blend
+        // in joint space. The end effector does not walk the straight line
+        // between the poses and nothing verifies the path it does walk
+        // (median 91 mm off that line, worst seen 472 mm). Because the
+        // duration floor is sized from the straight-line chord while the
+        // path flown is longer, max_ee_velocity_m_s is a nominal cap the
+        // move can exceed (median 1.20x, worst seen 2.88x).
         { link_id: "limb_motion", name: "move_arm" },
         { link_id: "limb_motion", name: "move_gripper" },
       ]
