@@ -24,3 +24,6 @@ mod state;
 mod ui;
 
 pub use node::{NodeError, setup, ui_failed};
+
+// Re-exported so the integration test pins the wire values instead of restating them.
+pub use pose::{PLAN_ANGLE_TOL_RAD, PLAN_POS_TOL_M, REACHED_ORIENTATION_TOL_RAD};

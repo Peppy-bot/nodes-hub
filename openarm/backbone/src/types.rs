@@ -1,5 +1,6 @@
 //! Shared primitives for the bimanual backbone: arm DOF, the joint vector, the
-//! arm side identifier, and the world-pose wire decomposition.
+//! arm side identifier, the world-pose wire decomposition, and the pose slack a
+//! Cartesian goal is planned against.
 
 use srs_model::nalgebra::{Isometry3, Quaternion, Translation3, UnitQuaternion};
 
@@ -50,6 +51,39 @@ pub fn pose_from_wire(
         Translation3::new(position[0], position[1], position[2]),
         rotation,
     ))
+}
+
+/// The slack a `move_arm` goal is planned against: a goal that cannot be planned
+/// this well is refused. Judged against the goal pose alone, never the path.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PlanTolerance {
+    pub position_m: f64,
+    pub orientation_rad: f64,
+}
+
+impl PlanTolerance {
+    /// Parse the wire pair: 0 resolves to the `control_core` default for that
+    /// axis; non-finite and negative values are refused.
+    pub fn from_wire(position_m: f64, orientation_rad: f64) -> Result<Self, &'static str> {
+        if !(position_m.is_finite() && position_m >= 0.0) {
+            return Err("an invalid position tolerance");
+        }
+        if !(orientation_rad.is_finite() && orientation_rad >= 0.0) {
+            return Err("an invalid orientation tolerance");
+        }
+        Ok(Self {
+            position_m: non_zero_or(position_m, control_core::servo::POSITION_TOLERANCE_M),
+            orientation_rad: non_zero_or(
+                orientation_rad,
+                control_core::servo::ORIENTATION_TOLERANCE_RAD,
+            ),
+        })
+    }
+}
+
+/// `requested` unless it is the zero sentinel, in which case `default`.
+fn non_zero_or(requested: f64, default: f64) -> f64 {
+    if requested == 0.0 { default } else { requested }
 }
 
 /// One joint-space vector (positions, velocities, or torques), j1..j7.
@@ -154,5 +188,56 @@ mod tests {
         let rebuilt = pose_from_wire(position, orientation).expect("round trip");
         assert!((rebuilt.translation.vector - pose.translation.vector).norm() < 1e-12);
         assert!(rebuilt.rotation.angle_to(&pose.rotation) < 1e-12);
+    }
+
+    // --- PlanTolerance ---------------------------------------------------
+
+    // Zero is the contract's "no preference" sentinel on each axis
+    // independently, so a caller may pin one and defer the other.
+    #[test]
+    fn zero_tolerances_resolve_to_the_control_core_defaults() {
+        let both = PlanTolerance::from_wire(0.0, 0.0).expect("zero is the default sentinel");
+        assert_eq!(both.position_m, control_core::servo::POSITION_TOLERANCE_M);
+        assert_eq!(
+            both.orientation_rad,
+            control_core::servo::ORIENTATION_TOLERANCE_RAD
+        );
+
+        let position_pinned = PlanTolerance::from_wire(0.02, 0.0).expect("one axis pinned");
+        assert_eq!(position_pinned.position_m, 0.02);
+        assert_eq!(
+            position_pinned.orientation_rad,
+            control_core::servo::ORIENTATION_TOLERANCE_RAD
+        );
+
+        let orientation_pinned = PlanTolerance::from_wire(0.0, 0.1).expect("one axis pinned");
+        assert_eq!(
+            orientation_pinned.position_m,
+            control_core::servo::POSITION_TOLERANCE_M
+        );
+        assert_eq!(orientation_pinned.orientation_rad, 0.1);
+    }
+
+    #[test]
+    fn positive_tolerances_pass_through_untouched() {
+        let parsed = PlanTolerance::from_wire(0.005, 0.087).expect("positive is honored");
+        assert_eq!(parsed.position_m, 0.005);
+        assert_eq!(parsed.orientation_rad, 0.087);
+    }
+
+    // A tolerance that is not a slack cannot be silently read as a default:
+    // the caller asked for something the planner cannot honor, on either axis.
+    #[test]
+    fn non_finite_and_negative_tolerances_are_refused() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1e-9, -1.0] {
+            assert!(
+                PlanTolerance::from_wire(bad, 0.0).is_err(),
+                "position tolerance {bad} must be refused"
+            );
+            assert!(
+                PlanTolerance::from_wire(0.0, bad).is_err(),
+                "orientation tolerance {bad} must be refused"
+            );
+        }
     }
 }

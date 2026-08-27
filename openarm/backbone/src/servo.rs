@@ -16,9 +16,12 @@
 //! servo needs, so the runtime just runs the law and trusts the plan, with
 //! [`MAX_SERVO_S`] as its lone backstop.
 //!
+//! Convergence is judged against the caller's [`PlanTolerance`]; the reference
+//! walk, its leash, and the per-step deadband stay on their own constants.
+//!
 //! Tuning constants are anchored to MoveIt Servo's defaults (`servo_parameters.yaml`)
-//! where the mechanism is the same: the smoothing cutoff and the convergence
-//! tolerances. The singularity strategy is deliberately the opposite of MoveIt's,
+//! where the mechanism is the same, such as the smoothing cutoff.
+//! The singularity strategy is deliberately the opposite of MoveIt's,
 //! which halts at a singularity (a plain pseudo-inverse with velocity scaled to zero
 //! by the Jacobian condition number); this servo damps (DLS) to pass THROUGH one,
 //! which is the reason the guarded servo exists, so it takes no condition-number
@@ -27,13 +30,13 @@
 use std::time::Duration;
 
 use control_core::filters::ButterworthFilter;
-use control_core::servo::{ORIENTATION_TOLERANCE_RAD, POSITION_TOLERANCE_M};
+use control_core::servo::POSITION_TOLERANCE_M;
 use srs_model::nalgebra::{Isometry3, Rotation3, Vector3};
 use srs_model::{Arm, DEFAULT_DLS_LAMBDA};
 
 use crate::chase::rate_limited;
 use crate::trajectory::{PlanLimits, interpolate_pose};
-use crate::types::{ARM_DOF, JointVec};
+use crate::types::{ARM_DOF, JointVec, PlanTolerance};
 
 /// The reference stops walking while the arm is farther than this from it, so a
 /// wall crossing is ground through instead of the reference running away. Bespoke
@@ -117,6 +120,8 @@ pub fn rate_step_toward(
 pub struct ServoState {
     start: Isometry3<f64>,
     end: Isometry3<f64>,
+    /// The caller's slack around `end`; decides convergence and nothing else.
+    tolerance: PlanTolerance,
     /// Reference progress along the line, 0..=1.
     reference_s: f64,
     /// Butterworth smoother per joint, bounding the jerk of the command. Run in both
@@ -142,10 +147,16 @@ impl ServoState {
         (self.end.translation.vector - ee.translation.vector).norm()
     }
 
-    pub fn new(start: Isometry3<f64>, end: Isometry3<f64>, smoothing: ButterworthFilter) -> Self {
+    pub fn new(
+        start: Isometry3<f64>,
+        end: Isometry3<f64>,
+        tolerance: PlanTolerance,
+        smoothing: ButterworthFilter,
+    ) -> Self {
         Self {
             start,
             end,
+            tolerance,
             reference_s: 0.0,
             smoothing: [smoothing; ARM_DOF],
         }
@@ -170,8 +181,8 @@ impl ServoState {
         let goal_pos_err = (self.end.translation.vector - ee.translation.vector).norm();
         let goal_rot_err = ee.rotation.angle_to(&self.end.rotation);
         if self.reference_s >= 1.0
-            && goal_pos_err < POSITION_TOLERANCE_M
-            && goal_rot_err < ORIENTATION_TOLERANCE_RAD
+            && goal_pos_err < self.tolerance.position_m
+            && goal_rot_err < self.tolerance.orientation_rad
         {
             return ServoStep::Converged(*q);
         }
@@ -222,8 +233,9 @@ pub fn rollout(
     end: &Isometry3<f64>,
     seed: JointVec,
     limits: &PlanLimits,
+    tolerance: PlanTolerance,
 ) -> Option<f64> {
-    let mut state = ServoState::new(*start, *end, limits.smoothing);
+    let mut state = ServoState::new(*start, *end, tolerance, limits.smoothing);
     let mut q = seed;
     let dt = limits.control_period;
     let steps = (MAX_SERVO_S / dt.as_secs_f64()).ceil() as usize;

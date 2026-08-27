@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::owner::{Feedback, PREEMPT_GRACE};
-use crate::pose::REACHED_ANGLE_TOL_RAD;
+use crate::pose::REACHED_JOINT_TOL_RAD;
 use crate::result_wait::{RESULT_POLL, RESULT_RETRY_DELAY, result_poll_retryable};
 use crate::state::{ARM_DOF, Side};
 
@@ -157,7 +157,7 @@ async fn run(
                     let max_err = (0..ARM_DOF)
                         .map(|i| (data.final_joint_positions[i] - joint_positions[i]).abs())
                         .fold(0.0_f64, f64::max);
-                    if max_err <= REACHED_ANGLE_TOL_RAD {
+                    if max_err <= REACHED_JOINT_TOL_RAD {
                         (
                             true,
                             format!(

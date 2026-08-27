@@ -15,7 +15,10 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::owner::{Feedback, PREEMPT_GRACE};
-use crate::pose::{REACHED_ANGLE_TOL_RAD, REACHED_POS_TOL_M, dist3, quat_angle};
+use crate::pose::{
+    PLAN_ANGLE_TOL_RAD, PLAN_POS_TOL_M, REACHED_ORIENTATION_TOL_RAD, REACHED_POS_TOL_M, dist3,
+    quat_angle,
+};
 use crate::result_wait::{RESULT_POLL, RESULT_RETRY_DELAY, result_poll_retryable};
 use crate::state::Side;
 
@@ -76,6 +79,8 @@ async fn run(
         position,
         orientation,
         duration_s,
+        plan_position_tolerance_m: PLAN_POS_TOL_M,
+        plan_orientation_tolerance_rad: PLAN_ANGLE_TOL_RAD,
     };
 
     let downstream = match limb_motion_move_arm::ActionHandle::fire_goal(
@@ -156,7 +161,7 @@ async fn run(
                     // the trajectory finished (a governor stop finishes it too).
                     let pos_err = dist3(data.final_position, position);
                     let rot_err = quat_angle(data.final_orientation, orientation);
-                    if pos_err <= REACHED_POS_TOL_M && rot_err <= REACHED_ANGLE_TOL_RAD {
+                    if pos_err <= REACHED_POS_TOL_M && rot_err <= REACHED_ORIENTATION_TOL_RAD {
                         (
                             true,
                             format!("move_arm ({label}): success in {:.2}s", data.action_time),

@@ -32,7 +32,7 @@ use crate::trajectory::{
     ARM_ANGLE_STEP_PER_BLEND_RAD, CartesianPlan, CartesianTrajectory, JointTrajectory, PlanLimits,
     plan_cartesian, subdivided_blends,
 };
-use crate::types::{ARM_DOF, JointVec, Side, world_pose_arrays};
+use crate::types::{ARM_DOF, JointVec, PlanTolerance, Side, world_pose_arrays};
 use crate::upstream::Upstream;
 
 /// Slack the runtime per-tick Cartesian velocity check allows over the planned
@@ -130,6 +130,7 @@ pub enum Goal {
     },
     Cartesian {
         target: Isometry3<f64>,
+        tolerance: PlanTolerance,
         duration_s: f64,
         ctx: Box<move_arm::GoalContext>,
     },
@@ -710,10 +711,11 @@ impl Planner {
             }
             Goal::Cartesian {
                 target,
+                tolerance,
                 duration_s,
                 ctx,
             } => {
-                self.start_cartesian(target, duration_s, ctx, busy, now)
+                self.start_cartesian(target, tolerance, duration_s, ctx, busy, now)
                     .await
             }
         }
@@ -729,6 +731,7 @@ impl Planner {
     async fn start_cartesian(
         &mut self,
         target: Isometry3<f64>,
+        tolerance: PlanTolerance,
         duration_s: f64,
         ctx: Box<move_arm::GoalContext>,
         busy: BusyGuard,
@@ -748,13 +751,19 @@ impl Planner {
                 smoothing: self.cfg.smoothing,
             },
             duration_s,
+            tolerance,
         );
         let Some(plan) = plan else {
             let (pos, quat) = world_pose_arrays(&start_world);
             if let Err(e) = ctx
                 .complete(
                     false,
-                    "goal pose unreachable (no line tracks and the servo rollout stalls)".into(),
+                    format!(
+                        "goal pose unreachable within {:.1} mm / {:.1} deg \
+                         (no line tracks and the servo rollout stalls)",
+                        tolerance.position_m * 1000.0,
+                        tolerance.orientation_rad.to_degrees()
+                    ),
                     pos,
                     quat,
                     0.0,
@@ -803,7 +812,12 @@ impl Planner {
                     self.side.label()
                 );
                 MovePath::Servo(ServoTrack {
-                    servo: Box::new(ServoState::new(start_world, target, self.cfg.smoothing)),
+                    servo: Box::new(ServoState::new(
+                        start_world,
+                        target,
+                        tolerance,
+                        self.cfg.smoothing,
+                    )),
                     started: now,
                     prev_sample_at: now,
                     budget: MoveBudget::new(duration_s, self.cfg.ee.linear_m_s),
@@ -933,7 +947,12 @@ mod tests {
         let start = planner.ee_pose_world(&POSE_TEST_Q);
         let now = Instant::now();
         let mut track = ServoTrack {
-            servo: Box::new(ServoState::new(start, start, planner.cfg.smoothing)),
+            servo: Box::new(ServoState::new(
+                start,
+                start,
+                PlanTolerance::from_wire(0.0, 0.0).expect("the zero sentinel is valid"),
+                planner.cfg.smoothing,
+            )),
             started: now,
             prev_sample_at: now,
             budget: MoveBudget::new(1.0, planner.cfg.ee.linear_m_s),
