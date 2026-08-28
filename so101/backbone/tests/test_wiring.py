@@ -226,30 +226,38 @@ async def test_move_arm_joints_completes_and_reports():
 async def test_second_goal_is_rejected_while_busy():
     async with harness.start(setup, parameters=make_parameters()) as h:
         await publish_measured(h)
-        slow = await move_arm_joints_fx.send_goal(
-            h,
-            move_arm_joints_prod.GoalRequestData(
-                arm_name="arm", joint_positions=[p + 0.5 for p in MEASURED], duration_s=5.0
-            ),
-            peppylib.QoSProfile.Reliable,
-            TIMEOUT_S,
-        )
-        assert slow.accepted
-        second = await move_arm_joints_fx.send_goal(
-            h,
-            move_arm_joints_prod.GoalRequestData(
-                arm_name="arm", joint_positions=MEASURED, duration_s=0.0
-            ),
-            peppylib.QoSProfile.Reliable,
-            TIMEOUT_S,
-        )
-        assert not second.accepted
-        assert "in flight" in second.reason
-        cancel = await slow.cancel_goal(TIMEOUT_S)
-        assert cancel.state == move_arm_joints_fx.CancelState.SIGNALLED
-        result = await slow.get_result(TIMEOUT_S)
-        assert result.status == move_arm_joints_fx.ResultStatus.CANCELLED
-        assert not result.data.success
+        # The in-flight goal outlives STALE_FOLLOWER_TIMEOUT_S, and a plan
+        # failed for staleness would cancel before cancel_goal ever runs.
+        feeder = asyncio.create_task(keep_measured_fresh(h))
+        try:
+            slow = await move_arm_joints_fx.send_goal(
+                h,
+                move_arm_joints_prod.GoalRequestData(
+                    arm_name="arm",
+                    joint_positions=[p + 0.5 for p in MEASURED],
+                    duration_s=5.0,
+                ),
+                peppylib.QoSProfile.Reliable,
+                TIMEOUT_S,
+            )
+            assert slow.accepted
+            second = await move_arm_joints_fx.send_goal(
+                h,
+                move_arm_joints_prod.GoalRequestData(
+                    arm_name="arm", joint_positions=MEASURED, duration_s=0.0
+                ),
+                peppylib.QoSProfile.Reliable,
+                TIMEOUT_S,
+            )
+            assert not second.accepted
+            assert "in flight" in second.reason
+            cancel = await slow.cancel_goal(TIMEOUT_S)
+            assert cancel.state == move_arm_joints_fx.CancelState.SIGNALLED
+            result = await slow.get_result(TIMEOUT_S)
+            assert result.status == move_arm_joints_fx.ResultStatus.CANCELLED
+            assert not result.data.success
+        finally:
+            feeder.cancel()
 
 
 async def test_goal_without_follower_state_is_rejected():
@@ -342,6 +350,8 @@ async def test_malformed_pose_goal_is_rejected_and_the_server_survives():
                     position=[0.1, 0.0, 0.2],
                     orientation=[0.0, 0.0, 0.0, 0.0],
                     duration_s=0.0,
+                    plan_position_tolerance_m=0.0,
+                    plan_orientation_tolerance_rad=0.0,
                 ),
                 peppylib.QoSProfile.Reliable,
                 TIMEOUT_S,
@@ -357,6 +367,8 @@ async def test_malformed_pose_goal_is_rejected_and_the_server_survives():
                     position=[0.0, 0.0, 0.42],
                     orientation=[0.0, 0.0, 0.0, 1.0],
                     duration_s=0.0,
+                    plan_position_tolerance_m=0.0,
+                    plan_orientation_tolerance_rad=0.0,
                 ),
                 peppylib.QoSProfile.Reliable,
                 TIMEOUT_S,

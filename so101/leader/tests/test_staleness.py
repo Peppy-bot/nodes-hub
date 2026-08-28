@@ -74,10 +74,10 @@ def test_unplugged_leader_reconnects_and_streams_again(fake_hardware, monkeypatc
         loop.stop()
 
 
-def test_lerobot_leader_rebuilds_a_stale_teleop_before_reconnecting():
+def test_lerobot_leader_rebuilds_a_stale_teleop_before_reconnecting(tmp_path):
     from so101_leader.device import LerobotLeader
 
-    leader = LerobotLeader("/dev/null", "/tmp/so101_calibration", "leader")
+    leader = LerobotLeader("/dev/null", str(tmp_path), "leader")
     # A dead fd leaves lerobot's connected flag standing; the wrapper must
     # hand connect a fresh instance instead of tripping the guard.
     leader._teleop.bus.port_handler.is_open = True

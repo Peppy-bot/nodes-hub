@@ -86,7 +86,13 @@ def test_abort_freezes_where_the_trajectory_stands(fake_kinematics):
     start = time.monotonic()
     sample = None
     while time.monotonic() - start < 0.05:
+        # The live follower keeps streaming; without this the loop can outrun
+        # STALE_FOLLOWER_TIMEOUT_S under a scheduling pause, arm_tick fails the
+        # plan, and the test dies on a delivery assertion instead of the
+        # timing it means to check.
+        c.measured_joints.set(MEASURED)
         sample = c.arm_tick(time.monotonic())
+        assert sample is not None
         c.arm_published(True, sample)
     assert sample is not None
     c.abort_arm_plan(adopted)

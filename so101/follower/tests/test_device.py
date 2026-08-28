@@ -1,3 +1,4 @@
+import asyncio
 import time
 
 import pytest
@@ -196,19 +197,26 @@ async def test_bus_watchdog_terminates_after_the_exit_horizon(fake_hardware, mon
         terminated = []
 
         class Token:
+            """The real token wakes its waiters; an Event does the same here
+            without a poll that could outlast the watchdog it is watching."""
+
+            def __init__(self):
+                self.stopped = asyncio.Event()
+
             def is_cancelled(self):
-                return bool(terminated)
+                return self.stopped.is_set()
 
             async def cancelled(self):
-                import asyncio
+                await self.stopped.wait()
 
-                while not terminated:
-                    await asyncio.sleep(0.01)
+        token = Token()
 
-        import asyncio
+        def terminate(code):
+            terminated.append(code)
+            token.stopped.set()
 
         await asyncio.wait_for(
-            main_mod._watch_bus(loop, Token(), terminate=terminated.append), 5.0
+            main_mod._watch_bus(loop, token, terminate=terminate), 5.0
         )
         assert terminated == [1]
         # The watchdog released the hardware before dying.

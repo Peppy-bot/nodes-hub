@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 from so101_backbone import params as params_mod
-from so101_backbone.params import UpstreamMode
+from so101_backbone.params import MAX_RATE_HZ, UpstreamMode
 
 GOOD = {
     "upstream_mode": "joints",
@@ -42,6 +42,9 @@ def test_pose_mode_parses():
         ("max_gripper_rate_frac_s", -1.0),
         ("max_ee_velocity_m_s", 0.0),
         ("max_ee_angular_velocity_rad_s", -2.0),
+        # The ceiling, not just the floor: one past MAX_RATE_HZ, so raising
+        # the bound without revisiting this row cannot pass unnoticed.
+        ("control_rate_hz", MAX_RATE_HZ + 1),
     ],
 )
 def test_bad_config_is_refused(field, value):

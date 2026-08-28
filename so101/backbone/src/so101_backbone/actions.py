@@ -11,6 +11,7 @@ goal and abandons anything admission installed.
 from __future__ import annotations
 
 import asyncio
+import functools
 import math
 import time
 from dataclasses import dataclass
@@ -57,6 +58,10 @@ class PoseGoal:
     position: tuple[float, ...]
     orientation: tuple[float, ...]
     duration_s: float
+    # The caller's planning slack, or None where the wire's 0 asked for this
+    # planner's default. Judged against the goal pose alone, never the path.
+    position_tolerance_m: float | None
+    orientation_tolerance_rad: float | None
 
 
 class PendingSlot:
@@ -191,7 +196,14 @@ class ActionLayer:
             self._coordinator.release_gripper()
             raise
 
-    def _admit_pose_move(self, position, orientation, duration_s: float) -> PoseGoal:
+    def _admit_pose_move(
+        self,
+        position,
+        orientation,
+        duration_s: float,
+        position_tolerance_m: float,
+        orientation_tolerance_rad: float,
+    ) -> PoseGoal:
         """Validate and claim the arm; the verified IK solve runs in the
         drive task so a hard pose never stalls the event loop inside the
         goal decide callback, failing the accepted goal when no solution
@@ -201,12 +213,22 @@ class ActionLayer:
         except PoseError as e:
             raise Rejection(str(e)) from e
         _require_duration(duration_s)
+        # Parsed before the claim: a rejection past this point would strand
+        # the arm slot and teleop with it.
+        position_bar = _stated_tolerance(position_tolerance_m, "plan_position_tolerance_m")
+        orientation_bar = _stated_tolerance(
+            orientation_tolerance_rad, "plan_orientation_tolerance_rad"
+        )
         if self._coordinator.arm_anchor() is None:
             raise Rejection("no fresh follower state to anchor the move from")
         if not self._coordinator.try_claim_arm():
             raise Rejection("another arm goal is in flight")
         return PoseGoal(
-            position=tuple(position), orientation=tuple(orientation), duration_s=duration_s
+            position=tuple(position),
+            orientation=tuple(orientation),
+            duration_s=duration_s,
+            position_tolerance_m=position_bar,
+            orientation_tolerance_rad=orientation_bar,
         )
 
     def _admit_posture(self, target: tuple[float, ...], duration_s: float) -> ArmPlan:
@@ -242,6 +264,8 @@ class ActionLayer:
                     tuple(request.data.position),
                     tuple(request.data.orientation),
                     request.data.duration_s,
+                    request.data.plan_position_tolerance_m,
+                    request.data.plan_orientation_tolerance_rad,
                 )
 
             return self._decide(module, admit, pending)
@@ -395,12 +419,19 @@ class ActionLayer:
                 return
             try:
                 solution = await asyncio.to_thread(
-                    solver.inverse_kinematics, seed, goal.position, goal.orientation
+                    functools.partial(
+                        solver.inverse_kinematics,
+                        seed,
+                        goal.position,
+                        goal.orientation,
+                        position_tolerance_m=goal.position_tolerance_m,
+                        orientation_tolerance_rad=goal.orientation_tolerance_rad,
+                    )
                 )
                 if solution is None or not self._limits.contains(solution):
                     position, orientation = kinematics.forward_kinematics(seed)
                     await _complete_guarded(
-                        ctx, False, "pose unreachable within tolerance and joint limits",
+                        ctx, False, _unreached(goal),
                         list(position), list(orientation), time.monotonic() - started,
                     )
                     return
@@ -507,6 +538,33 @@ def _require_duration(duration_s: float) -> None:
         raise Rejection("duration_s must be finite and non-negative")
     if duration_s > MAX_REQUESTED_DURATION_S:
         raise Rejection(f"duration_s must not exceed {MAX_REQUESTED_DURATION_S:.0f}")
+
+
+def _unreached(goal: PoseGoal) -> str:
+    """Why a solve refused, naming the bars it was judged against so the
+    caller can tell its own slack from this planner's default."""
+    bars = []
+    if goal.position_tolerance_m is not None:
+        bars.append(f"{goal.position_tolerance_m * 1000:.0f} mm")
+    if goal.orientation_tolerance_rad is not None:
+        bars.append(f"{math.degrees(goal.orientation_tolerance_rad):.0f} deg")
+    slack = f" within {' and '.join(bars)}" if bars else ""
+    return (
+        f"no solution reaches this pose{slack} from where the arm is now, "
+        "inside the joint limits; the search is a local descent, so the same "
+        "pose may solve from a different posture"
+    )
+
+
+def _stated_tolerance(value: float, field: str) -> float | None:
+    """The caller's bar, or None where the wire's 0 asked for the planner's
+    default. Anything that is neither is a rejected goal, not a silent
+    fallback to the default."""
+    if value == 0.0:
+        return None
+    if not math.isfinite(value) or value < 0.0:
+        raise Rejection(f"{field} must be finite and non-negative")
+    return value
 
 
 def _require_arm_name(arm_name: str) -> None:

@@ -47,7 +47,10 @@ def make_layer(kinematics=None, **config_overrides):
 
 async def installed_plan(coordinator):
     async def poll():
-        while coordinator._arm_plan is None:
+        # The coordinator installs a plan synchronously and owns no event to
+        # wait on; adding one to production code for a test's benefit would
+        # be the wrong trade, so this polls under a timeout.
+        while coordinator._arm_plan is None:  # noqa: ASYNC110
             await asyncio.sleep(0.001)
         return coordinator._arm_plan
 
@@ -147,7 +150,7 @@ def test_pose_admission_rejects_busy_before_solving():
     coordinator.measured_joints.set((0.0,) * 5)
     layer._admit_arm_move((0.1,) * 5, 0.0)
     with pytest.raises(Rejection, match="another arm goal"):
-        layer._admit_pose_move((0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0)
+        layer._admit_pose_move((0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, 0.0, 0.0)
     # The expensive verified solve never ran for the doomed goal.
     assert kinematics.solve_calls == []
 
@@ -187,7 +190,7 @@ async def test_pose_goal_solves_in_drive_and_streams_a_plan():
     kinematics = FakeKinematics()
     coordinator, layer = make_layer(kinematics)
     coordinator.measured_joints.set((0.0,) * 5)
-    goal = layer._admit_pose_move((0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0)
+    goal = layer._admit_pose_move((0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, 0.0, 0.0)
     assert isinstance(goal, PoseGoal)
     assert kinematics.solve_calls == [], "admission must not pay the solve"
 
@@ -217,7 +220,7 @@ async def test_pose_move_duration_floors_at_the_linear_ee_cap():
     kinematics = FakeKinematics()
     coordinator, layer = make_layer(kinematics, max_ee_velocity_m_s=0.5)
     coordinator.measured_joints.set((0.0,) * 5)
-    goal = layer._admit_pose_move((1.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0)
+    goal = layer._admit_pose_move((1.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, 0.0, 0.0)
     ctx = FakeGoalContext()
     task = asyncio.create_task(layer.drive_pose(ctx, goal, kinematics, kinematics))
     plan = await installed_plan(coordinator)
@@ -232,7 +235,7 @@ async def test_pose_move_duration_floors_at_the_angular_ee_cap():
     kinematics = FakeKinematics()
     coordinator, layer = make_layer(kinematics, max_ee_angular_velocity_rad_s=1.0)
     coordinator.measured_joints.set((0.0,) * 5)
-    goal = layer._admit_pose_move((0.1, 0.0, 0.2), (0.0, 0.0, 1.0, 0.0), 0.0)
+    goal = layer._admit_pose_move((0.1, 0.0, 0.2), (0.0, 0.0, 1.0, 0.0), 0.0, 0.0, 0.0)
     ctx = FakeGoalContext()
     task = asyncio.create_task(layer.drive_pose(ctx, goal, kinematics, kinematics))
     plan = await installed_plan(coordinator)
@@ -246,12 +249,15 @@ async def test_unreachable_pose_completes_failed_and_releases():
     kinematics.corrupted = True  # solve returns None
     coordinator, layer = make_layer(kinematics)
     coordinator.measured_joints.set((0.0,) * 5)
-    goal = layer._admit_pose_move((5.0, 5.0, 5.0), (0.0, 0.0, 0.0, 1.0), 0.0)
+    goal = layer._admit_pose_move((5.0, 5.0, 5.0), (0.0, 0.0, 0.0, 1.0), 0.0, 0.0, 0.0)
     ctx = FakeGoalContext()
     await layer.drive_pose(ctx, goal, kinematics, kinematics)
     success, message, _position, _orientation, _t = ctx.completed
     assert success is False
-    assert "unreachable" in message
+    assert "no solution reaches this pose" in message
+    # The refusal must say the search was local, so a caller knows to retry
+    # from elsewhere rather than read it as the pose being out of reach.
+    assert "local descent" in message
     assert coordinator.try_claim_arm()
 
 
@@ -259,7 +265,7 @@ async def test_abandoned_pose_admission_releases_the_claim():
     coordinator, layer = make_layer()
     coordinator.measured_joints.set((0.0,) * 5)
     pending = PendingSlot()
-    pending.plan = layer._admit_pose_move((0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0)
+    pending.plan = layer._admit_pose_move((0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, 0.0, 0.0)
     layer.abandon(pending)
     assert coordinator.try_claim_arm()
 
@@ -287,7 +293,7 @@ async def test_pose_solver_surprise_still_reaches_a_terminal_result():
     kinematics = BoomKinematics()
     coordinator, layer = make_layer(kinematics)
     coordinator.measured_joints.set((0.0,) * 5)
-    goal = layer._admit_pose_move((0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0)
+    goal = layer._admit_pose_move((0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, 0.0, 0.0)
     ctx = FakeGoalContext()
     await layer.drive_pose(ctx, goal, kinematics, kinematics)
     success, message, _position, _orientation, _t = ctx.completed
@@ -330,7 +336,7 @@ async def test_a_turned_landing_carries_its_caveat_into_the_pose_result():
     kinematics = TurnedKinematics()
     coordinator, layer = make_layer(kinematics)
     coordinator.measured_joints.set((0.0,) * 5)
-    goal = layer._admit_pose_move((0.1, 0.0, 0.2), IDENTITY_QUAT, 0.0)
+    goal = layer._admit_pose_move((0.1, 0.0, 0.2), IDENTITY_QUAT, 0.0, 0.0, 0.0)
 
     async def run_plan_to_completion():
         while True:
@@ -349,3 +355,73 @@ async def test_a_turned_landing_carries_its_caveat_into_the_pose_result():
     success, message, _position, _orientation, _t = ctx.completed
     assert success is True
     assert "44 degrees" in message
+
+
+async def test_the_callers_slack_reaches_the_solver():
+    # The bug this guards: move_arm carried both tolerance fields and the
+    # node dropped them, so a caller's stated slack changed nothing.
+    kinematics = FakeKinematics()
+    # Refused rather than solved: the bars are recorded before the solve
+    # answers, and a refusal terminates without a control loop to run a plan.
+    kinematics.corrupted = True
+    coordinator, layer = make_layer(kinematics)
+    coordinator.measured_joints.set((0.0,) * 5)
+    goal = layer._admit_pose_move((0.1, 0.0, 0.2), IDENTITY_QUAT, 0.0, 0.004, 0.05)
+    assert goal.position_tolerance_m == 0.004
+    assert goal.orientation_tolerance_rad == 0.05
+    await layer.drive_pose(FakeGoalContext(), goal, kinematics, kinematics)
+    assert kinematics.bars == [(0.004, 0.05)]
+
+
+async def test_a_wire_zero_asks_for_the_planners_own_bars():
+    kinematics = FakeKinematics()
+    # Refused rather than solved: the bars are recorded before the solve
+    # answers, and a refusal terminates without a control loop to run a plan.
+    kinematics.corrupted = True
+    coordinator, layer = make_layer(kinematics)
+    coordinator.measured_joints.set((0.0,) * 5)
+    goal = layer._admit_pose_move((0.1, 0.0, 0.2), IDENTITY_QUAT, 0.0, 0.0, 0.0)
+    assert goal.position_tolerance_m is None
+    assert goal.orientation_tolerance_rad is None
+    await layer.drive_pose(FakeGoalContext(), goal, kinematics, kinematics)
+    assert kinematics.bars == [(None, None)]
+
+
+@pytest.mark.parametrize("bad", [-0.001, math.nan, math.inf])
+async def test_an_unusable_tolerance_is_rejected_rather_than_defaulted(bad):
+    kinematics = FakeKinematics()
+    coordinator, layer = make_layer(kinematics)
+    coordinator.measured_joints.set((0.0,) * 5)
+    with pytest.raises(Rejection):
+        layer._admit_pose_move((0.1, 0.0, 0.2), IDENTITY_QUAT, 0.0, bad, 0.0)
+    with pytest.raises(Rejection):
+        layer._admit_pose_move((0.1, 0.0, 0.2), IDENTITY_QUAT, 0.0, 0.0, bad)
+    assert coordinator.try_claim_arm(), "a rejected tolerance must not hold the slot"
+
+
+async def test_a_refused_tolerance_names_the_bar_it_was_judged_against():
+    kinematics = FakeKinematics()
+    kinematics.corrupted = True
+    coordinator, layer = make_layer(kinematics)
+    coordinator.measured_joints.set((0.0,) * 5)
+    goal = layer._admit_pose_move((0.1, 0.0, 0.2), IDENTITY_QUAT, 0.0, 0.004, 0.05)
+    ctx = FakeGoalContext()
+    await layer.drive_pose(ctx, goal, kinematics, kinematics)
+    success, message, _p, _o, _t = ctx.completed
+    assert success is False
+    assert "4 mm" in message and "3 deg" in message
+
+
+async def test_the_ee_caps_cannot_pin_the_slot_past_the_duration_ceiling():
+    # A move admitted under the ceiling can still need longer than it once
+    # the end-effector speed caps are applied; that must refuse, not stretch.
+    kinematics = FakeKinematics()
+    coordinator, layer = make_layer(kinematics, max_ee_velocity_m_s=1e-4)
+    coordinator.measured_joints.set((0.0,) * 5)
+    goal = layer._admit_pose_move((5.0, 0.0, 0.2), IDENTITY_QUAT, 0.0, 0.0, 0.0)
+    ctx = FakeGoalContext()
+    await layer.drive_pose(ctx, goal, kinematics, kinematics)
+    success, message, _p, _o, _t = ctx.completed
+    assert success is False
+    assert "ceiling" in message
+    assert coordinator.try_claim_arm(), "a refused move must release the arm"

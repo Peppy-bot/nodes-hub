@@ -20,9 +20,21 @@ class FakeKinematics:
         self.solution = (0.1, 0.2, 0.3, 0.4, 0.5)
         self.corrupted = False
         self.solve_calls: list[tuple] = []
+        # The (position, orientation) bars each solve was handed, so a test
+        # can prove the caller's slack reached the solver.
+        self.bars: list[tuple] = []
 
-    def inverse_kinematics(self, seed, position, orientation):
+    def inverse_kinematics(
+        self,
+        seed,
+        position,
+        orientation,
+        *,
+        position_tolerance_m=None,
+        orientation_tolerance_rad=None,
+    ):
         self.solve_calls.append(("solve", seed, position, orientation))
+        self.bars.append((position_tolerance_m, orientation_tolerance_rad))
         return None if self.corrupted else self.solution
 
     def inverse_kinematics_streaming(self, seed, position, orientation):
@@ -30,7 +42,16 @@ class FakeKinematics:
         return None if self.corrupted else self.solution
 
     def forward_kinematics(self, positions_rad):
-        return (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0)
+        """Deterministic, and dependent on every joint. A fake that answered
+        a constant would let a readout publishing a stale pose pass."""
+        return (
+            (
+                0.1 + sum(positions_rad) * 0.01,
+                positions_rad[0] * 0.02,
+                0.2 + positions_rad[1] * 0.03,
+            ),
+            (0.0, 0.0, 0.0, 1.0),
+        )
 
 
 def make_config(**overrides) -> Config:
