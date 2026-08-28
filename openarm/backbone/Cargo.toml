@@ -27,6 +27,9 @@ opt-level = 3
 [profile.dev.package.srs_model]
 opt-level = 3
 
+[profile.dev.package.chain_kinematics]
+opt-level = 3
+
 [profile.dev.package.nalgebra]
 opt-level = 3
 

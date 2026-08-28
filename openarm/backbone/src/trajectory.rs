@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
 use control_core::minimum_jerk::{quintic, velocity_limited_duration};
+use srs_model::chain_kinematics::{ServoTolerances, ToleranceError};
 use srs_model::nalgebra::{Isometry3, Translation3};
 use srs_model::{Arm, ArmAnglePolicy};
 
@@ -193,7 +194,44 @@ pub struct PlanLimits<'a> {
     pub smoothing: control_core::filters::ButterworthFilter,
 }
 
+/// Why no plan reached the goal pose. Named where the decision is taken rather
+/// than reconstructed from the request afterwards, so the operator is told which
+/// limit refused the move and not the one that happened to be easiest to guess.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PlanRejection {
+    /// No line was usable - none tracks the pose continuously, or the ones that
+    /// do overrun the duration this request allows - and the guarded servo's
+    /// rollout did not converge within its ceiling either.
+    Unreachable,
+    /// No line was usable, and the guarded servo that would take over cannot
+    /// arrive within the slack asked for.
+    ServoCannotArrive(ToleranceError),
+    /// The velocity budget did not size a duration, which takes a finite
+    /// non-negative limit and request.
+    UnusableBudget,
+}
+
+impl std::fmt::Display for PlanRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unreachable => write!(
+                f,
+                "no line plan fits the limits and the servo rollout stalls"
+            ),
+            Self::ServoCannotArrive(refusal) => write!(
+                f,
+                "no line plan fits the limits, and the guarded servo that would take \
+                 over cannot arrive that tightly ({refusal})"
+            ),
+            Self::UnusableBudget => {
+                write!(f, "the velocity budget does not size a duration")
+            }
+        }
+    }
+}
+
 /// How an accepted move_arm goal executes, decided by [`plan_cartesian`].
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CartesianPlan {
     /// The straight line is continuously trackable: track it over this duration,
     /// resolving the elbow the same way the plan did (`steer_elbow` on means the
@@ -209,8 +247,14 @@ pub enum CartesianPlan {
     /// untrackably slow, or leaves reach mid-path. Reach the pose with the
     /// guarded servo law instead (the streaming jog's damped resolved-rate
     /// follow, which crosses the singular surface a discrete branch choice
-    /// cannot), validated by an offline rollout that took about this long.
-    Servo { duration_s: f64 },
+    /// cannot), validated by an offline rollout that took about this long, to
+    /// the `tolerance` that rollout ran at: this tier arrives no tighter than
+    /// the law's tracking floor, and carries the slack it proved it can meet so
+    /// the runtime cannot be given another.
+    Servo {
+        duration_s: f64,
+        tolerance: ServoTolerances,
+    },
 }
 
 /// One policy's walk along the line: the velocity-sizing peak if the line is
@@ -290,14 +334,14 @@ fn walk_line(
 /// analytically. Poses are in the world frame; IK runs in the arm base frame,
 /// so each sample is converted with [`Arm::base_pose`].
 pub fn plan_cartesian(
-    model: &mut Arm,
+    model: &Arm,
     start: &Isometry3<f64>,
     end: &Isometry3<f64>,
     seed: JointVec,
     limits: &PlanLimits,
     requested_duration_secs: f64,
     tolerance: PlanTolerance,
-) -> Option<CartesianPlan> {
+) -> Result<CartesianPlan, PlanRejection> {
     let duration_cap = line_duration_cap(requested_duration_secs);
     let tiers = [
         (ArmAnglePolicy::FromSeed, false),
@@ -327,22 +371,30 @@ pub fn plan_cartesian(
         ) else {
             continue;
         };
-        // A budget that cannot size a duration cannot be planned as a line.
+        // A budget that cannot size a duration cannot be planned at all.
         let duration_s =
             velocity_limited_duration(walk.peak_ratio.max(ee_ratio), requested_duration_secs)
-                .ok()?;
+                .map_err(|_| PlanRejection::UnusableBudget)?;
         if duration_s <= duration_cap {
-            return Some(CartesianPlan::Line {
+            return Ok(CartesianPlan::Line {
                 duration_s,
                 steer_elbow,
                 start_q: walk.start_q,
             });
         }
     }
-    // No line tracks: prove the servo law reaches the pose, to the caller's
-    // slack, before accepting it.
+    // No line is usable: prove the servo law reaches the pose, to the caller's
+    // slack, before accepting it. A slack the law cannot reach rules the tier
+    // out rather than rolling it out to a foregone refusal.
+    let tolerance = tolerance
+        .servo()
+        .map_err(PlanRejection::ServoCannotArrive)?;
     crate::servo::rollout(model, start, end, seed, limits, tolerance)
-        .map(|duration_s| CartesianPlan::Servo { duration_s })
+        .map(|duration_s| CartesianPlan::Servo {
+            duration_s,
+            tolerance,
+        })
+        .ok_or(PlanRejection::Unreachable)
 }
 
 /// Interpolate between two poses at blend parameter `s` ∈ [0,1]: position by a
@@ -382,6 +434,13 @@ mod tests {
         PlanTolerance::from_wire(0.0, 0.0).expect("the zero sentinel is valid")
     }
 
+    /// The same, as the guarded servo's arrival bar.
+    fn default_servo_tolerance() -> ServoTolerances {
+        default_tolerance()
+            .servo()
+            .expect("the default is reachable")
+    }
+
     // The launcher-default per-joint velocity limits (peppy.json5), j1..j7.
     const V_MAX_V2: JointVec = [
         16.754666, 16.754666, 5.445426, 5.445426, 20.943946, 20.943946, 20.943946,
@@ -415,7 +474,7 @@ mod tests {
 
     /// World-frame chain-tip pose at `q`: the frame the field readouts below are
     /// recorded in.
-    fn tip_world(model: &mut Arm, q: &JointVec) -> Isometry3<f64> {
+    fn tip_world(model: &Arm, q: &JointVec) -> Isometry3<f64> {
         let tip = model.at(q).tip_pose();
         model.world_pose(&tip)
     }
@@ -424,9 +483,9 @@ mod tests {
     const TEST_EE_CAP_RAD_S: f64 = 0.8;
     const TEST_DT: Duration = Duration::from_millis(10);
 
-    fn v2_limits() -> PlanLimits<'static> {
+    fn limits_for(max_joint_velocity_rad_s: &'static JointVec) -> PlanLimits<'static> {
         PlanLimits {
-            max_joint_velocity_rad_s: &V_MAX_V2,
+            max_joint_velocity_rad_s,
             ee: EeCaps {
                 linear_m_s: TEST_EE_CAP_M_S,
                 angular_rad_s: TEST_EE_CAP_RAD_S,
@@ -436,16 +495,12 @@ mod tests {
         }
     }
 
+    fn v2_limits() -> PlanLimits<'static> {
+        limits_for(&V_MAX_V2)
+    }
+
     fn v1_limits() -> PlanLimits<'static> {
-        PlanLimits {
-            max_joint_velocity_rad_s: &V_MAX,
-            ee: EeCaps {
-                linear_m_s: TEST_EE_CAP_M_S,
-                angular_rad_s: TEST_EE_CAP_RAD_S,
-            },
-            control_period: TEST_DT,
-            smoothing: crate::servo::smoothing_for(TEST_DT).unwrap(),
-        }
+        limits_for(&V_MAX)
     }
 
     const READY: JointVec = [0.1537, 0.39547, -0.4808, 0.95, -0.0008, 0.0046, -0.0008];
@@ -462,26 +517,19 @@ mod tests {
     /// per-joint velocity budget and that the pose it lands on honours
     /// `tolerance`, and return the converged configuration.
     fn run_servo_to_convergence(
-        model: &mut Arm,
+        model: &Arm,
         start: &Isometry3<f64>,
         end: &Isometry3<f64>,
         seed: JointVec,
         tolerance: PlanTolerance,
     ) -> JointVec {
-        let mut state = crate::servo::ServoState::new(
-            *start,
-            *end,
-            tolerance,
-            crate::servo::smoothing_for(TEST_DT).unwrap(),
-        );
+        let mut state =
+            crate::servo::servo_from(*start, *end, crate::servo::smoothing_for(TEST_DT).unwrap());
+        let servo_limits = v2_limits().servo_at(TEST_DT, tolerance.servo().expect("reachable"));
         let mut q = seed;
         let steps = (crate::servo::MAX_SERVO_S / TEST_DT.as_secs_f64()).ceil() as usize;
         for _ in 0..steps {
-            let caps = EeCaps {
-                linear_m_s: TEST_EE_CAP_M_S,
-                angular_rad_s: TEST_EE_CAP_RAD_S,
-            };
-            match state.step(model, &q, &V_MAX_V2, caps, TEST_DT) {
+            match state.step(model.chain(), &q, &servo_limits) {
                 crate::servo::ServoStep::Stepped(next) => {
                     for i in 0..ARM_DOF {
                         let v = (next[i] - q[i]).abs() / TEST_DT.as_secs_f64();
@@ -521,7 +569,7 @@ mod tests {
     // damped law crosses the wall the way the streaming jog does.
     #[test]
     fn cross_body_pull_runs_the_guarded_servo() {
-        let mut model = v2_right_arm();
+        let model = v2_right_arm();
         let start = recorded_tip_pose(
             &model,
             [0.0715597403410507, -0.179708420505458, 0.448631054180598],
@@ -541,7 +589,7 @@ mod tests {
             .expect("start pose reachable from ready")
             .q;
         let plan = plan_cartesian(
-            &mut model,
+            &model,
             &start,
             &end,
             seed,
@@ -550,14 +598,14 @@ mod tests {
             default_tolerance(),
         )
         .expect("servo reaches the pose");
-        let CartesianPlan::Servo { duration_s } = plan else {
+        let CartesianPlan::Servo { duration_s, .. } = plan else {
             panic!("an untrackable line must fall through to the servo");
         };
         assert!(
             duration_s < crate::servo::MAX_SERVO_S,
             "servo rollout should finish inside the ceiling, took {duration_s:.1}s"
         );
-        run_servo_to_convergence(&mut model, &start, &end, seed, default_tolerance());
+        run_servo_to_convergence(&model, &start, &end, seed, default_tolerance());
     }
 
     // The user-reported gap made a regression test: pulling x back to -0.2 from
@@ -566,16 +614,16 @@ mod tests {
     // never a rejection.
     #[test]
     fn pull_from_ready_to_x_minus_02_reaches_via_servo() {
-        let mut model = v2_right_arm();
+        let model = v2_right_arm();
         // The recorded pull is a tip coordinate, so -0.2 is placed there and carried
         // to the tool: the same physical motion, in the frame commanded.
-        let start_tip = tip_world(&mut model, &READY);
+        let start_tip = tip_world(&model, &READY);
         let mut end_tip = start_tip;
         end_tip.translation.vector.x = -0.2;
         let tool = model.tool();
         let (start, end) = (start_tip * tool, end_tip * tool);
         let plan = plan_cartesian(
-            &mut model,
+            &model,
             &start,
             &end,
             READY,
@@ -584,9 +632,9 @@ mod tests {
             default_tolerance(),
         )
         .expect("the pull must be reachable, as streaming proves live");
-        if let CartesianPlan::Servo { duration_s } = plan {
+        if let CartesianPlan::Servo { duration_s, .. } = plan {
             assert!(duration_s < crate::servo::MAX_SERVO_S);
-            run_servo_to_convergence(&mut model, &start, &end, READY, default_tolerance());
+            run_servo_to_convergence(&model, &start, &end, READY, default_tolerance());
         }
         // A Line verdict is equally acceptable: the pose is reached on the line.
     }
@@ -596,7 +644,7 @@ mod tests {
     // trackable lines must never degrade to the servo.
     #[test]
     fn easy_move_plans_the_line_at_the_requested_duration() {
-        let mut model = v2_right_arm();
+        let model = v2_right_arm();
         let start = {
             let ee = model.at(&READY).ee_pose();
             model.world_pose(&ee)
@@ -604,7 +652,7 @@ mod tests {
         let mut end = start;
         end.translation.vector.z += 0.05;
         let plan = plan_cartesian(
-            &mut model,
+            &model,
             &start,
             &end,
             READY,
@@ -637,7 +685,7 @@ mod tests {
     // under the guard from a well-conditioned pose, the justification for 2.0.
     #[test]
     fn elbow_budget_step_stays_under_the_branch_guard() {
-        let mut model = v2_right_arm();
+        let model = v2_right_arm();
         let base = {
             let ee = model.at(&READY).ee_pose();
             model.base_pose(&model.world_pose(&ee))
@@ -677,14 +725,14 @@ mod tests {
     // under test is the same one either side of that bound.
     #[test]
     fn pure_reorientation_converges_in_the_servo_law() {
-        let mut model = v2_right_arm();
+        let model = v2_right_arm();
         let start = {
             let ee = model.at(&READY).ee_pose();
             model.world_pose(&ee)
         };
         let mut end = start;
         end.rotation = UnitQuaternion::from_axis_angle(&Vector3::x_axis(), 0.7) * end.rotation;
-        run_servo_to_convergence(&mut model, &start, &end, READY, default_tolerance());
+        run_servo_to_convergence(&model, &start, &end, READY, default_tolerance());
     }
 
     // The incident regression: after a servo move parks the arm at an unusual
@@ -694,7 +742,7 @@ mod tests {
     // walk tracks cleanly, so the quiet tier must be tried first).
     #[test]
     fn small_nudge_after_a_servo_move_stays_a_quiet_line() {
-        let mut model = v2_right_arm();
+        let model = v2_right_arm();
         let start = recorded_tip_pose(
             &model,
             [0.0715597403410507, -0.179708420505458, 0.448631054180598],
@@ -713,7 +761,7 @@ mod tests {
             )
             .expect("start pose reachable from ready")
             .q;
-        let parked = run_servo_to_convergence(&mut model, &start, &end, seed, default_tolerance());
+        let parked = run_servo_to_convergence(&model, &start, &end, seed, default_tolerance());
         // From the parked posture, nudge 3 cm in +x: an ordinary move.
         let nudge_start = {
             let ee = model.at(&parked).ee_pose();
@@ -722,7 +770,7 @@ mod tests {
         let mut nudge_end = nudge_start;
         nudge_end.translation.vector.x += 0.03;
         let plan = plan_cartesian(
-            &mut model,
+            &model,
             &nudge_start,
             &nudge_end,
             parked,
@@ -868,15 +916,15 @@ mod tests {
 
     #[test]
     fn plan_cartesian_sizes_in_workspace_and_floors_at_request() {
-        let mut arm = left_arm();
+        let arm = left_arm();
         let seed = [0.0, 0.3, 0.0, 0.8, 0.0, 0.5, 0.0];
         let ee = arm.at(&seed).ee_pose();
         let start = arm.world_pose(&ee);
         let mut goal = start;
         goal.translation.vector.z += 0.05; // a small reachable move
 
-        let Some(CartesianPlan::Line { duration_s, .. }) = plan_cartesian(
-            &mut arm,
+        let Ok(CartesianPlan::Line { duration_s, .. }) = plan_cartesian(
+            &arm,
             &start,
             &goal,
             seed,
@@ -891,11 +939,11 @@ mod tests {
             "an in-workspace move should plan a positive duration"
         );
         // The request floors the velocity-limited duration.
-        let Some(CartesianPlan::Line {
+        let Ok(CartesianPlan::Line {
             duration_s: floored,
             ..
         }) = plan_cartesian(
-            &mut arm,
+            &arm,
             &start,
             &goal,
             seed,
@@ -918,7 +966,7 @@ mod tests {
     // floor at QUINTIC_PEAK_VELOCITY * line_length / max_ee_velocity.
     #[test]
     fn line_duration_respects_the_ee_speed_cap() {
-        let mut arm = left_arm();
+        let arm = left_arm();
         let seed = [0.0, 0.3, 0.0, 0.8, 0.0, 0.5, 0.0];
         let ee = arm.at(&seed).ee_pose();
         let start = arm.world_pose(&ee);
@@ -936,15 +984,9 @@ mod tests {
             control_period: TEST_DT,
             smoothing: crate::servo::smoothing_for(TEST_DT).unwrap(),
         };
-        let Some(CartesianPlan::Line { duration_s, .. }) = plan_cartesian(
-            &mut arm,
-            &start,
-            &goal,
-            seed,
-            &limits,
-            0.0,
-            default_tolerance(),
-        ) else {
+        let Ok(CartesianPlan::Line { duration_s, .. }) =
+            plan_cartesian(&arm, &start, &goal, seed, &limits, 0.0, default_tolerance())
+        else {
             panic!("a small lift should plan as a line");
         };
         assert!(
@@ -959,15 +1001,15 @@ mod tests {
     // differs from the raw seed - exactly the case the propagation guards against.
     #[test]
     fn line_plan_carries_the_normalized_start() {
-        let mut arm = left_arm();
+        let arm = left_arm();
         let seed = [0.0, 0.3, 0.0, 0.8, 0.0, 0.5, 0.0];
         let ee = arm.at(&seed).ee_pose();
         let start = arm.world_pose(&ee);
         let mut goal = start;
         goal.translation.vector.z += 0.05;
 
-        let Some(CartesianPlan::Line { start_q, .. }) = plan_cartesian(
-            &mut arm,
+        let Ok(CartesianPlan::Line { start_q, .. }) = plan_cartesian(
+            &arm,
             &start,
             &goal,
             seed,
@@ -1016,23 +1058,24 @@ mod tests {
 
     #[test]
     fn plan_cartesian_rejects_an_unreachable_goal() {
-        let mut arm = left_arm();
+        let arm = left_arm();
         let seed = [0.0, 0.3, 0.0, 0.8, 0.0, 0.5, 0.0];
         let ee = arm.at(&seed).ee_pose();
         let start = arm.world_pose(&ee);
         let mut unreachable = start;
         unreachable.translation.vector.x += 10.0; // 10 m away: no IK solution
-        assert!(
+        assert_eq!(
             plan_cartesian(
-                &mut arm,
+                &arm,
                 &start,
                 &unreachable,
                 seed,
                 &v1_limits(),
                 0.0,
                 default_tolerance()
-            )
-            .is_none()
+            ),
+            Err(PlanRejection::Unreachable),
+            "10 m away is out of reach, not merely slow or too tightly toleranced"
         );
     }
 
@@ -1048,12 +1091,12 @@ mod tests {
             .expect("the panel's tolerance is valid")
     }
 
-    fn ready_pose(model: &mut Arm) -> Isometry3<f64> {
+    fn ready_pose(model: &Arm) -> Isometry3<f64> {
         let ee = model.at(&READY).ee_pose();
         model.world_pose(&ee)
     }
 
-    fn tolerance_sensitive_goal(model: &mut Arm) -> (Isometry3<f64>, Isometry3<f64>) {
+    fn tolerance_sensitive_goal(model: &Arm) -> (Isometry3<f64>, Isometry3<f64>) {
         let start = ready_pose(model);
         let mut end = start;
         end.translation.vector.x += TOLERANCE_SENSITIVE_OFFSET[0];
@@ -1067,12 +1110,12 @@ mod tests {
     // the panel's. Without this the whole change is unobservable.
     #[test]
     fn a_loose_tolerance_admits_a_goal_the_default_refuses() {
-        let mut model = v2_right_arm();
-        let (start, end) = tolerance_sensitive_goal(&mut model);
+        let model = v2_right_arm();
+        let (start, end) = tolerance_sensitive_goal(&model);
 
         assert!(
             plan_cartesian(
-                &mut model,
+                &model,
                 &start,
                 &end,
                 READY,
@@ -1080,12 +1123,12 @@ mod tests {
                 2.0,
                 default_tolerance()
             )
-            .is_none(),
+            .is_err(),
             "this goal is chosen because the default tolerance refuses it"
         );
 
         let plan = plan_cartesian(
-            &mut model,
+            &model,
             &start,
             &end,
             READY,
@@ -1094,7 +1137,7 @@ mod tests {
             panel_tolerance(),
         )
         .expect("the panel's slack must admit it");
-        let CartesianPlan::Servo { duration_s } = plan else {
+        let CartesianPlan::Servo { duration_s, .. } = plan else {
             panic!("a goal no line tracks must be admitted through the servo");
         };
         assert!(duration_s < crate::servo::MAX_SERVO_S);
@@ -1105,22 +1148,14 @@ mod tests {
     // only this asserts the endpoint itself.
     #[test]
     fn an_admitted_goal_is_planned_within_the_tolerance_it_was_admitted_at() {
-        let mut model = v2_right_arm();
-        let (start, end) = tolerance_sensitive_goal(&mut model);
+        let model = v2_right_arm();
+        let (start, end) = tolerance_sensitive_goal(&model);
         let tolerance = panel_tolerance();
 
-        plan_cartesian(
-            &mut model,
-            &start,
-            &end,
-            READY,
-            &v2_limits(),
-            2.0,
-            tolerance,
-        )
-        .expect("admitted at the panel's slack");
+        plan_cartesian(&model, &start, &end, READY, &v2_limits(), 2.0, tolerance)
+            .expect("admitted at the panel's slack");
         // Asserts the landed pose against `tolerance` on both axes.
-        run_servo_to_convergence(&mut model, &start, &end, READY, tolerance);
+        run_servo_to_convergence(&model, &start, &end, READY, tolerance);
     }
 
     // Convergence is judged against the caller's bar, so a wider bar is met
@@ -1128,27 +1163,29 @@ mod tests {
     // would mean the bar was never read.
     #[test]
     fn a_wider_tolerance_converges_no_later_than_a_narrower_one() {
-        let mut model = v2_right_arm();
-        let start = ready_pose(&mut model);
+        let model = v2_right_arm();
+        let start = ready_pose(&model);
         let mut end = start;
         end.translation.vector.x -= 0.2;
 
         let tight = crate::servo::rollout(
-            &mut model,
+            &model,
             &start,
             &end,
             READY,
             &v2_limits(),
-            default_tolerance(),
+            default_servo_tolerance(),
         )
         .expect("the pull converges at the default bar");
         let loose = crate::servo::rollout(
-            &mut model,
+            &model,
             &start,
             &end,
             READY,
             &v2_limits(),
-            panel_tolerance(),
+            panel_tolerance()
+                .servo()
+                .expect("the panel's slack is reachable"),
         )
         .expect("a wider bar cannot refuse what a narrower one accepted");
         // Strict: an equal duration would mean the bar was never consulted.
@@ -1160,33 +1197,32 @@ mod tests {
         );
     }
 
-    // The zero-length-line detector measures geometry, not acceptance, so it
-    // stays on the control_core constant: a pure reorientation must still start
-    // its reference fully advanced no matter how wide the caller's position
-    // slack is, or the servo would walk a line that does not exist.
+    // The zero-length-line detector measures geometry, not acceptance: it is
+    // the law's own floor, so a pure reorientation must still start its
+    // reference fully advanced no matter how wide the caller's position slack
+    // is, or the servo would walk a line that does not exist.
     #[test]
     fn a_pure_reorientation_is_unaffected_by_a_wide_position_tolerance() {
-        let mut model = v2_right_arm();
-        let start = ready_pose(&mut model);
+        let model = v2_right_arm();
+        let start = ready_pose(&model);
         let mut end = start;
         end.rotation = UnitQuaternion::from_axis_angle(&Vector3::z_axis(), 0.2) * start.rotation;
 
         // A metre of position slack: far past the zero-length-line threshold.
-        let sloppy = PlanTolerance::from_wire(1.0, 1e-3).expect("valid");
-        let mut state = crate::servo::ServoState::new(
-            start,
-            end,
-            sloppy,
-            crate::servo::smoothing_for(TEST_DT).unwrap(),
-        );
-        let caps = EeCaps {
-            linear_m_s: TEST_EE_CAP_M_S,
-            angular_rad_s: TEST_EE_CAP_RAD_S,
-        };
+        let sloppy = PlanTolerance::from_wire(1.0, 1e-3)
+            .expect("valid")
+            .servo()
+            .expect("a metre of slack is reachable");
+        let mut state =
+            crate::servo::servo_from(start, end, crate::servo::smoothing_for(TEST_DT).unwrap());
         // One step is enough: the detector runs before any reference walk, so a
         // zero-length line is fully advanced immediately and the step resolves
         // the rotation rather than chasing a phantom line.
-        match state.step(&mut model, &READY, &V_MAX_V2, caps, TEST_DT) {
+        match state.step(
+            model.chain(),
+            &READY,
+            &v2_limits().servo_at(TEST_DT, sloppy),
+        ) {
             crate::servo::ServoStep::Stepped(next) => {
                 assert!(
                     next.iter()
@@ -1294,24 +1330,25 @@ mod tests {
         assert!(traj.is_complete(traj.motion_start + traj.duration));
     }
 
-    // The steered-elbow tier must actually be reachable: from the Ready seed
-    // (EE at world (0.208, -0.212, 0.376), quat [x,y,z,w] =
-    // [-0.0865, -0.4576, 0.2891, 0.8364]), a constant-orientation reach up and
-    // across to this target has no continuously trackable held-elbow line (the
-    // seed elbow drives a mid-path branch jump), but steering the elbow toward
+    // The steered-elbow tier must actually be reachable: from the Ready seed, a
+    // constant-orientation reach across the body to this target has no
+    // continuously trackable held-elbow line, but steering the elbow toward
     // higher manipulability keeps the line alive. Pins the middle tier: held
-    // fails, steered wins.
+    // fails, steered wins. The target sits in the interior of a measured cluster
+    // of such poses (its +/-4 cm neighbours on every axis graze the same way),
+    // so the pin does not ride the tracking boundary.
+
     #[test]
     fn steered_elbow_tier_engages_on_a_graze() {
-        let mut model = v2_right_arm();
+        let model = v2_right_arm();
         let seed = READY;
         // The graze is a tip coordinate, so the target is placed there and carried to
         // the tool: the same line through the same near-singular posture.
-        let start_tip = tip_world(&mut model, &seed);
+        let start_tip = tip_world(&model, &seed);
         let mut end_tip = start_tip;
-        end_tip.translation.vector.x = 0.0325;
-        end_tip.translation.vector.y = -0.3125;
-        end_tip.translation.vector.z = 0.6900;
+        end_tip.translation.vector.x = -0.16;
+        end_tip.translation.vector.y = -0.12;
+        end_tip.translation.vector.z = 0.36;
         let tool = model.tool();
         let (start, end) = (start_tip * tool, end_tip * tool);
 
@@ -1329,10 +1366,10 @@ mod tests {
             "held-elbow line should not track this graze"
         );
         // ...so the planner selects the steered line (and it stays under the cap).
-        let Some(CartesianPlan::Line {
+        let Ok(CartesianPlan::Line {
             steer_elbow: true, ..
         }) = plan_cartesian(
-            &mut model,
+            &model,
             &start,
             &end,
             seed,
@@ -1350,9 +1387,9 @@ mod tests {
     // as the joint limits allow.
     #[test]
     fn a_pure_reorientation_is_sized_by_the_angular_cap() {
-        let mut model = v2_right_arm();
+        let model = v2_right_arm();
         let seed = READY;
-        let start = tip_world(&mut model, &seed) * model.tool();
+        let start = tip_world(&model, &seed) * model.tool();
         let turn_rad = 0.6;
         let end = start
             * Isometry3::from_parts(
@@ -1360,8 +1397,8 @@ mod tests {
                 UnitQuaternion::from_axis_angle(&Vector3::z_axis(), turn_rad),
             );
 
-        let Some(CartesianPlan::Line { duration_s, .. }) = plan_cartesian(
-            &mut model,
+        let Ok(CartesianPlan::Line { duration_s, .. }) = plan_cartesian(
+            &model,
             &start,
             &end,
             seed,
