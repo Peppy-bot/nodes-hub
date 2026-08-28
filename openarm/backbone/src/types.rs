@@ -2,6 +2,7 @@
 //! arm side identifier, the world-pose wire decomposition, and the pose slack a
 //! Cartesian goal is planned against.
 
+use srs_model::chain_kinematics::{ServoTolerances, ToleranceError};
 use srs_model::nalgebra::{Isometry3, Quaternion, Translation3, UnitQuaternion};
 
 /// Degrees of freedom of one arm, from the description that also supplies the
@@ -72,6 +73,14 @@ impl Default for PlanTolerance {
 }
 
 impl PlanTolerance {
+    /// The same slack as the guarded servo's arrival bar, or a refusal when the
+    /// servo law could not reach it. The line tiers plan by exact IK and can meet
+    /// a tolerance tighter than the law's tracking floor, so the refusal belongs
+    /// to that tier alone and not to the goal.
+    pub fn servo(&self) -> Result<ServoTolerances, ToleranceError> {
+        ServoTolerances::new(self.position_m, self.orientation_rad)
+    }
+
     /// Parse the wire pair: 0 resolves to the default for that axis; non-finite
     /// and negative values are refused.
     pub fn from_wire(position_m: f64, orientation_rad: f64) -> Result<Self, &'static str> {
@@ -199,6 +208,15 @@ mod tests {
     }
 
     // --- PlanTolerance ---------------------------------------------------
+
+    #[test]
+    fn the_default_slack_is_one_the_guarded_servo_can_reach() {
+        // Every streaming step runs at the default, which the servo law must be
+        // able to arrive within; it is the tightest that qualifies.
+        PlanTolerance::default()
+            .servo()
+            .expect("the node's default slack is reachable");
+    }
 
     // Zero is the contract's "no preference" sentinel on each axis
     // independently, so a caller may pin one and defer the other.

@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
 use control_core::minimum_jerk::{quintic, velocity_limited_duration};
+use srs_model::chain_kinematics::ServoTolerances;
 use srs_model::nalgebra::{Isometry3, Translation3};
 use srs_model::{Arm, ArmAnglePolicy};
 
@@ -209,8 +210,14 @@ pub enum CartesianPlan {
     /// untrackably slow, or leaves reach mid-path. Reach the pose with the
     /// guarded servo law instead (the streaming jog's damped resolved-rate
     /// follow, which crosses the singular surface a discrete branch choice
-    /// cannot), validated by an offline rollout that took about this long.
-    Servo { duration_s: f64 },
+    /// cannot), validated by an offline rollout that took about this long, to
+    /// the `tolerance` that rollout ran at: this tier arrives no tighter than
+    /// the law's tracking floor, and carries the slack it proved it can meet so
+    /// the runtime cannot be given another.
+    Servo {
+        duration_s: f64,
+        tolerance: ServoTolerances,
+    },
 }
 
 /// One policy's walk along the line: the velocity-sizing peak if the line is
@@ -340,9 +347,15 @@ pub fn plan_cartesian(
         }
     }
     // No line tracks: prove the servo law reaches the pose, to the caller's
-    // slack, before accepting it.
-    crate::servo::rollout(model, start, end, seed, limits, tolerance)
-        .map(|duration_s| CartesianPlan::Servo { duration_s })
+    // slack, before accepting it. A slack the law cannot reach rules the tier
+    // out rather than rolling it out to a foregone refusal.
+    let tolerance = tolerance.servo().ok()?;
+    crate::servo::rollout(model, start, end, seed, limits, tolerance).map(|duration_s| {
+        CartesianPlan::Servo {
+            duration_s,
+            tolerance,
+        }
+    })
 }
 
 /// Interpolate between two poses at blend parameter `s` ∈ [0,1]: position by a
@@ -380,6 +393,13 @@ mod tests {
     /// The slack a goal that states no preference is planned against.
     fn default_tolerance() -> PlanTolerance {
         PlanTolerance::from_wire(0.0, 0.0).expect("the zero sentinel is valid")
+    }
+
+    /// The same, as the guarded servo's arrival bar.
+    fn default_servo_tolerance() -> ServoTolerances {
+        default_tolerance()
+            .servo()
+            .expect("the default is reachable")
     }
 
     // The launcher-default per-joint velocity limits (peppy.json5), j1..j7.
@@ -466,7 +486,7 @@ mod tests {
     ) -> JointVec {
         let mut state =
             crate::servo::servo_from(*start, *end, crate::servo::smoothing_for(TEST_DT).unwrap());
-        let servo_limits = v2_limits().servo_at(TEST_DT, tolerance);
+        let servo_limits = v2_limits().servo_at(TEST_DT, tolerance.servo().expect("reachable"));
         let mut q = seed;
         let steps = (crate::servo::MAX_SERVO_S / TEST_DT.as_secs_f64()).ceil() as usize;
         for _ in 0..steps {
@@ -539,7 +559,7 @@ mod tests {
             default_tolerance(),
         )
         .expect("servo reaches the pose");
-        let CartesianPlan::Servo { duration_s } = plan else {
+        let CartesianPlan::Servo { duration_s, .. } = plan else {
             panic!("an untrackable line must fall through to the servo");
         };
         assert!(
@@ -573,7 +593,7 @@ mod tests {
             default_tolerance(),
         )
         .expect("the pull must be reachable, as streaming proves live");
-        if let CartesianPlan::Servo { duration_s } = plan {
+        if let CartesianPlan::Servo { duration_s, .. } = plan {
             assert!(duration_s < crate::servo::MAX_SERVO_S);
             run_servo_to_convergence(&model, &start, &end, READY, default_tolerance());
         }
@@ -1077,7 +1097,7 @@ mod tests {
             panel_tolerance(),
         )
         .expect("the panel's slack must admit it");
-        let CartesianPlan::Servo { duration_s } = plan else {
+        let CartesianPlan::Servo { duration_s, .. } = plan else {
             panic!("a goal no line tracks must be admitted through the servo");
         };
         assert!(duration_s < crate::servo::MAX_SERVO_S);
@@ -1114,12 +1134,20 @@ mod tests {
             &end,
             READY,
             &v2_limits(),
-            default_tolerance(),
+            default_servo_tolerance(),
         )
         .expect("the pull converges at the default bar");
-        let loose =
-            crate::servo::rollout(&model, &start, &end, READY, &v2_limits(), panel_tolerance())
-                .expect("a wider bar cannot refuse what a narrower one accepted");
+        let loose = crate::servo::rollout(
+            &model,
+            &start,
+            &end,
+            READY,
+            &v2_limits(),
+            panel_tolerance()
+                .servo()
+                .expect("the panel's slack is reachable"),
+        )
+        .expect("a wider bar cannot refuse what a narrower one accepted");
         // Strict: an equal duration would mean the bar was never consulted.
         // The rollout is deterministic, so the gap is reproducible.
         assert!(
@@ -1141,7 +1169,10 @@ mod tests {
         end.rotation = UnitQuaternion::from_axis_angle(&Vector3::z_axis(), 0.2) * start.rotation;
 
         // A metre of position slack: far past the zero-length-line threshold.
-        let sloppy = PlanTolerance::from_wire(1.0, 1e-3).expect("valid");
+        let sloppy = PlanTolerance::from_wire(1.0, 1e-3)
+            .expect("valid")
+            .servo()
+            .expect("a metre of slack is reachable");
         let mut state =
             crate::servo::servo_from(start, end, crate::servo::smoothing_for(TEST_DT).unwrap());
         // One step is enough: the detector runs before any reference walk, so a

@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use peppygen::exposed_actions::limb_motion::{move_arm, move_arm_joints};
+use srs_model::chain_kinematics::ServoTolerances;
 use srs_model::nalgebra::Isometry3;
 use srs_model::{Arm, ArmAnglePolicy, Jacobian, Limit};
 use tokio::sync::mpsc;
@@ -39,6 +40,25 @@ use crate::upstream::Upstream;
 /// limit before aborting (mirrors the arm's backstop over the up-front plan,
 /// as [`MOTION_TIMEOUT_FACTOR`] does over the rollout's duration).
 const VELOCITY_GUARD_MARGIN: f64 = 1.5;
+
+/// Why no plan reached the goal pose, told apart so the operator is not sent
+/// looking for a reach problem that is a tolerance problem: every line tier
+/// failed to track, and either the guarded servo rolled out without converging
+/// or the slack asked for is tighter than that law can arrive.
+fn unreachable_reason(tolerance: PlanTolerance) -> String {
+    let (mm, deg) = (
+        tolerance.position_m * 1000.0,
+        tolerance.orientation_rad.to_degrees(),
+    );
+    match tolerance.servo() {
+        Ok(_) => format!(
+            "goal pose unreachable within {mm:.1} mm / {deg:.1} deg              (no line tracks and the servo rollout stalls)"
+        ),
+        Err(refusal) => format!(
+            "goal pose unreachable within {mm:.1} mm / {deg:.1} deg: no line tracks it,              and the guarded servo that would take over cannot arrive that tightly              ({refusal})"
+        ),
+    }
+}
 
 /// Per-arm static configuration for the planner (the motion limits relocated
 /// from the arm). Cloned per side.
@@ -218,8 +238,9 @@ struct ServoTrack {
     /// Boxed: [`ServoState`] carries a per-joint filter bank, so inlining it
     /// would bloat every [`Mode`] variant. One heap alloc per servo move.
     servo: Box<ServoState>,
-    /// The caller's arrival slack, judged by each tick's step.
-    tolerance: PlanTolerance,
+    /// The caller's arrival slack, judged by each tick's step. Parsed at
+    /// planning time, so a track exists only for a slack the law can reach.
+    tolerance: ServoTolerances,
     started: Instant,
     prev_sample_at: Instant,
     /// The plan-time rollout duration. The runtime aborts once the move runs
@@ -472,9 +493,12 @@ impl Planner {
                     &q,
                     &ee,
                     pose,
-                    &self
-                        .plan_limits()
-                        .servo_at(self.cfg.cycle_period, PlanTolerance::default()),
+                    &self.plan_limits().servo_at(
+                        self.cfg.cycle_period,
+                        PlanTolerance::default()
+                            .servo()
+                            .expect("the node's default slack is reachable"),
+                    ),
                 )
             }
         };
@@ -762,18 +786,7 @@ impl Planner {
         let Some(plan) = plan else {
             let (pos, quat) = world_pose_arrays(&start_world);
             if let Err(e) = ctx
-                .complete(
-                    false,
-                    format!(
-                        "goal pose unreachable within {:.1} mm / {:.1} deg \
-                         (no line tracks and the servo rollout stalls)",
-                        tolerance.position_m * 1000.0,
-                        tolerance.orientation_rad.to_degrees()
-                    ),
-                    pos,
-                    quat,
-                    0.0,
-                )
+                .complete(false, unreachable_reason(tolerance), pos, quat, 0.0)
                 .await
             {
                 error!("{}: move_arm complete: {e}", self.side.label());
@@ -812,7 +825,10 @@ impl Planner {
             // No continuous joint path tracks the line: run the guarded servo
             // the rollout just validated, the same damped law the operator's
             // streaming jog crosses these walls with.
-            CartesianPlan::Servo { duration_s } => {
+            CartesianPlan::Servo {
+                duration_s,
+                tolerance,
+            } => {
                 info!(
                     "{}: move_arm start (servo-guided), rollout={duration_s:.3}s",
                     self.side.label()
@@ -950,7 +966,9 @@ mod tests {
         let now = Instant::now();
         let mut track = ServoTrack {
             servo: Box::new(servo_from(start, start, planner.cfg.smoothing)),
-            tolerance: PlanTolerance::default(),
+            tolerance: PlanTolerance::default()
+                .servo()
+                .expect("the node's default slack is reachable"),
             started: now,
             prev_sample_at: now,
             budget: MoveBudget::new(1.0, planner.cfg.ee.linear_m_s),

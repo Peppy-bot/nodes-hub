@@ -18,8 +18,8 @@
 //!
 //! The law itself is [`chain_kinematics::servo`], which knows nothing about an
 //! SRS arm. What stays here is what is this robot's: the smoothing filter, the
-//! move budget, the leash length, and the caller's [`PlanTolerance`], which the
-//! law judges arrival against.
+//! move budget, the leash length, and the caller's arrival slack, which the law
+//! judges arrival against.
 //!
 //! Tuning constants are anchored to MoveIt Servo's defaults (`servo_parameters.yaml`)
 //! where the mechanism is the same: the smoothing cutoff and the convergence
@@ -37,7 +37,7 @@ use srs_model::chain_kinematics::{ServoLimits, ServoTolerances, Smoother};
 use srs_model::nalgebra::Isometry3;
 
 use crate::trajectory::PlanLimits;
-use crate::types::{ARM_DOF, JointVec, PlanTolerance};
+use crate::types::{ARM_DOF, JointVec};
 
 /// The end-effector speed budget a Cartesian step runs under: the launcher's
 /// linear cap and the angular slew cap.
@@ -104,16 +104,13 @@ impl PlanLimits<'_> {
     /// and the runtime that executes it cannot be given different numbers. `dt`
     /// is the tick's own: the rollout steps at the nominal control period, the
     /// runtime at the period it measured, and each velocity-scales by what it used.
-    /// `tolerance` is the caller's arrival slack, which decides convergence and
-    /// nothing else.
-    pub fn servo_at(&self, dt: Duration, tolerance: PlanTolerance) -> ServoLimits<ARM_DOF> {
+    /// `tolerance` is the caller's arrival slack, already parsed against what the
+    /// law can reach ([`PlanTolerance::servo`]), and decides convergence alone.
+    pub fn servo_at(&self, dt: Duration, tolerance: ServoTolerances) -> ServoLimits<ARM_DOF> {
         ServoLimits {
             max_joint_velocity: *self.max_joint_velocity_rad_s,
             ee: self.ee,
-            tolerances: ServoTolerances {
-                position_m: tolerance.position_m,
-                orientation_rad: tolerance.orientation_rad,
-            },
+            tolerances: tolerance,
             dt_s: dt.as_secs_f64(),
         }
     }
@@ -131,12 +128,11 @@ pub fn rollout(
     end: &Isometry3<f64>,
     seed: JointVec,
     limits: &PlanLimits,
-    tolerance: PlanTolerance,
+    tolerance: ServoTolerances,
 ) -> Option<f64> {
-    let mut state = servo_from(*start, *end, limits.smoothing);
     srs_model::chain_kinematics::rollout(
         model.chain(),
-        &mut state,
+        servo_from(*start, *end, limits.smoothing),
         seed,
         &limits.servo_at(limits.control_period, tolerance),
         MAX_SERVO_S,
