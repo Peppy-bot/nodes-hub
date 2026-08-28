@@ -21,6 +21,7 @@ from peppygen.fixtures.exposed_actions.limb_motion import (
 )
 from peppygen.fixtures.exposed_actions.postures import move_to_ready as move_to_ready_fx
 from peppygen.paired_topics.arm_link import joint_states as arm_states_topic
+from peppygen.paired_topics.leader_arm import joint_states as upstream_states_topic
 from peppygen.paired_topics.gripper_link import gripper_states as gripper_states_topic
 from peppygen.paired_topics.leader_arm import joint_setpoints as leader_setpoints_topic
 from peppygen.paired_topics.leader_pose import pose_setpoints as leader_pose_topic
@@ -100,11 +101,12 @@ async def test_the_joints_stream_passes_through_unchanged_and_relays_state():
 
 
 async def test_malformed_follower_state_neither_anchors_nor_relays():
-    # Measured state is a trust boundary: a NaN or wrong-length vector must
-    # not become a governor anchor, and must not be relayed upstream as if
-    # the follower had said something coherent.
+    # Measured state is a trust boundary: a NaN vector must not become a
+    # governor anchor, and must not be relayed upstream as if the follower
+    # had said something coherent. Wrong-length vectors are the contract's
+    # job now and cannot even be built; see the cardinality test below.
     async with harness.start(setup, parameters=make_parameters()) as h:
-        for positions in ([float("nan")] * 5, [0.0] * 4):
+        for positions in ([float("nan")] * 5,):
             await h.mocks.pairings.arm_link.joint_states.publish(
                 arm_states_topic.Message(
                     timestamp=time.time(), positions=positions, velocities=[], efforts=[]
@@ -431,3 +433,14 @@ async def test_stale_timestamped_leader_input_is_dropped():
                 )
         finally:
             feeder.cancel()
+
+
+async def test_the_wire_refuses_a_joint_vector_of_the_wrong_width():
+    """The manifest pins joint_link positions to five, so a wrong-width
+    vector cannot be put on the wire at all. Asserted here because a refine
+    block is easy to drop from a manifest by accident, and its loss would be
+    invisible: the node would simply go back to trusting whatever arrived."""
+    with pytest.raises(ValueError, match="expected 5"):
+        upstream_states_topic.build_message(
+            timestamp=time.time(), positions=[0.0] * 4, velocities=[], efforts=[]
+        )

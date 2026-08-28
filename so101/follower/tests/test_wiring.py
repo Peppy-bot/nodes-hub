@@ -7,6 +7,7 @@ import time
 
 import pytest
 from conftest import FakeHardware
+from peppygen.paired_topics.arm import joint_states as arm_wire
 from peppygen.fixtures import harness
 from peppygen.fixtures.exposed_services.ready import is_ready as is_ready_fx
 from peppygen.paired_topics.arm import joint_setpoints as arm_setpoints_topic
@@ -191,3 +192,14 @@ async def test_dead_bus_revokes_readiness():
                 break
             await asyncio.sleep(0.2)
         assert not response.ready
+
+
+def test_the_wire_refuses_a_joint_vector_of_the_wrong_width():
+    """The manifest pins joint_link positions to five. Asserted here because
+    a refine block is easy to drop from a manifest by accident, and its loss
+    would be invisible: this node would go back to putting whatever width it
+    was handed onto the wire."""
+    with pytest.raises(ValueError, match="expected 5"):
+        arm_wire.build_message(
+            timestamp=0.0, positions=[0.0] * 4, velocities=[], efforts=[]
+        )

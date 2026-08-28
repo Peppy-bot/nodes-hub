@@ -107,11 +107,11 @@
     topics: {
       emits: [
         // The leader role's topic on each downstream slot.
-        { link_id: "arm_link", name: "joint_setpoints" },
+        { link_id: "arm_link", name: "joint_setpoints", refine: { message_format: { positions: { $length: 5 } } } },
         { link_id: "gripper_link", name: "gripper_setpoints" },
         // The follower role's state back-channel on each upstream slot: the
         // measured state relayed from the matching downstream pair.
-        { link_id: "leader_arm", name: "joint_states" },
+        { link_id: "leader_arm", name: "joint_states", refine: { message_format: { positions: { $length: 5 } } } },
         { link_id: "leader_gripper", name: "gripper_states" },
         // The measured end-effector pose (FK of the measured joints).
         // Published only under upstream_mode "pose".
@@ -121,9 +121,9 @@
         { link_id: "limb_state", name: "limb_states" },
       ],
       consumes: [
-        { link_id: "arm_link", name: "joint_states" },
+        { link_id: "arm_link", name: "joint_states", refine: { message_format: { positions: { $length: 5 } } } },
         { link_id: "gripper_link", name: "gripper_states" },
-        { link_id: "leader_arm", name: "joint_setpoints" },
+        { link_id: "leader_arm", name: "joint_setpoints", refine: { message_format: { positions: { $length: 5 } } } },
         { link_id: "leader_pose", name: "pose_setpoints" },
         { link_id: "leader_gripper", name: "gripper_setpoints" },
       ],

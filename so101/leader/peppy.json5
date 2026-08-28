@@ -26,7 +26,7 @@
   interfaces: {
     topics: {
       emits: [
-        { link_id: "arm", name: "joint_setpoints" },
+        { link_id: "arm", name: "joint_setpoints", refine: { message_format: { positions: { $length: 5 } } } },
         { link_id: "gripper", name: "gripper_setpoints" },
       ],
     },

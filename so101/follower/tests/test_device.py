@@ -194,7 +194,7 @@ async def test_bus_watchdog_terminates_after_the_exit_horizon(fake_hardware, mon
         monkeypatch.setattr(main_mod, "_BUS_DEAD_EXIT_S", 0.05)
         monkeypatch.setattr(main_mod, "_BUS_WATCH_PERIOD_S", 0.01)
         fake_hardware.fail_position_reads = 10_000_000
-        terminated = []
+        shutdown_requests = []
 
         class Token:
             """The real token wakes its waiters; an Event does the same here
@@ -209,16 +209,17 @@ async def test_bus_watchdog_terminates_after_the_exit_horizon(fake_hardware, mon
             async def cancelled(self):
                 await self.stopped.wait()
 
+            def cancel(self):
+                shutdown_requests.append(True)
+                self.stopped.set()
+
         token = Token()
-
-        def terminate(code):
-            terminated.append(code)
-            token.stopped.set()
-
         await asyncio.wait_for(
-            main_mod._watch_bus(loop, token, terminate=terminate), 5.0
+            main_mod._watch_bus(loop, token, token.cancel), 5.0
         )
-        assert terminated == [1]
+        # Shutdown is requested, never taken: a hard exit here would skip the
+        # hook that releases the arm.
+        assert shutdown_requests == [True]
         # The watchdog released the hardware before dying.
         assert fake_hardware.disconnected
     finally:

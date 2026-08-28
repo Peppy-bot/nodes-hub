@@ -6,6 +6,7 @@ import math
 
 import pytest
 from conftest import FakeHardware
+from peppygen.paired_topics.arm import joint_setpoints as arm_wire
 from peppygen.fixtures import harness
 from peppygen.parameters import Parameters
 from so101_description.units import GRIPPER_NAME, JOINT_NAMES
@@ -68,3 +69,14 @@ def test_lerobot_leader_constructs(tmp_path):
         device_path="/dev/null", calibration_dir=str(tmp_path), teleop_id="smoke"
     )
     assert "gripper" in leader._teleop.bus.motors
+
+
+def test_the_wire_refuses_a_joint_vector_of_the_wrong_width():
+    """The manifest pins joint_link positions to five. Asserted here because
+    a refine block is easy to drop from a manifest by accident, and its loss
+    would be invisible: this node would go back to putting whatever width it
+    was handed onto the wire."""
+    with pytest.raises(ValueError, match="expected 5"):
+        arm_wire.build_message(
+            timestamp=0.0, positions=[0.0] * 4, velocities=[], efforts=[]
+        )

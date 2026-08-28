@@ -3,8 +3,9 @@ stream: measured state out, setpoints in, health and alerts out, readiness."""
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import asyncio
-import os
 import time
 
 import peppygen.clock
@@ -204,18 +205,24 @@ def _bus_age_s(device: DeviceLoop) -> float:
     return time.monotonic() - snapshot.captured_monotonic
 
 
-async def _watch_bus(device: DeviceLoop, token: CancellationToken, terminate=None):
-    """Die loudly once the bus stays dead past the exit horizon. The torque
-    release is attempted first; on a dead bus it can only fail fast."""
-    terminate = terminate if terminate is not None else os._exit
+async def _watch_bus(
+    device: DeviceLoop, token: CancellationToken, request_shutdown: Callable[[], None]
+):
+    """Stop the node once the bus stays dead past the exit horizon. The torque
+    release is attempted first; on a dead bus it can only fail fast.
+
+    Shutdown is requested, not taken: the runtime owns process lifecycle, and
+    exiting from here would skip the shutdown hooks and the task teardown that
+    release the arm. A cancelled token still leaves the node in a terminal
+    state for supervision to act on."""
     async for _ in runtime.ticks(_BUS_WATCH_PERIOD_S, token):
         if _bus_age_s(device) > _BUS_DEAD_EXIT_S:
             runtime.log(
                 f"serial bus has served no state read for {_BUS_DEAD_EXIT_S:.0f}s; "
-                "exiting for supervised restart"
+                "requesting shutdown for supervised restart"
             )
             await asyncio.to_thread(device.stop)
-            terminate(1)
+            request_shutdown()
             return
 
 
@@ -318,7 +325,7 @@ def make_setup(hardware_factory=_lerobot_hardware):
             asyncio.create_task(
                 runtime.serve(node_runner, is_ready_svc, ready_handler, "is_ready")
             ),
-            asyncio.create_task(_watch_bus(device, token)),
+            asyncio.create_task(_watch_bus(device, token, token.cancel)),
         ]
 
     return setup
