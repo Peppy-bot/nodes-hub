@@ -1,9 +1,13 @@
 //! Fixtures shared by the backbone's integration tests.
 
 /// Control rate for the tests: 20 ms cycle (Nyquist 25 Hz, above the 15 Hz
-/// velocity-filter default) and an 80 ms stale limit, comfortably above the
-/// 10 ms state pumps even on a loaded machine.
+/// velocity-filter default).
 const CONTROL_RATE_HZ: u32 = 50;
+
+/// Declared follower rate for the tests: four of its periods make an 80 ms
+/// stale window, comfortably above the 10 ms state pumps even on a loaded
+/// machine.
+const FOLLOWER_STATE_RATE_HZ: u32 = 50;
 
 /// The node's full parameter set (most have no schema default, so every test
 /// passes them explicitly): v1 hardware, joints-mode upstream, the validated
@@ -14,6 +18,7 @@ pub fn params() -> peppygen::Parameters {
         control_rate_hz: CONTROL_RATE_HZ,
         d_safe_m: 0.02,
         d_stop_m: 0.005,
+        follower_state_rate_hz: FOLLOWER_STATE_RATE_HZ,
         hardware_version: "v1".to_string(),
         max_ee_angular_velocity_rad_s: 0.8,
         max_ee_velocity_m_s: 2.0,

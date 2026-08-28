@@ -184,6 +184,14 @@
       upstream_mode: "string",
       // Coordination loop rate (Hz): the rate governed setpoints are streamed at.
       control_rate_hz: "u32",
+      // Rate (Hz) the followers' measured-state streams (joint_states and
+      // gripper_states; the slowest of them) are delivered at: the arm and gripper
+      // nodes' state_rate_hz, or the sim engine's. A limb silent for four of these
+      // periods is frozen and any move on it fails; a follower delivering under three
+      // quarters of this rate over a second is warned about. Require a window of at
+      // least one control period and at most 0.5 s, i.e. a rate within
+      // [8, 4 x control_rate_hz].
+      follower_state_rate_hz: "u32",
       // Self-collision governor band (m), signed surface distance between the two
       // arms. At/under d_stop_m motion toward contact is fully stopped; at/over
       // d_safe_m it is unthrottled; between, it ramps linearly. Separating motion

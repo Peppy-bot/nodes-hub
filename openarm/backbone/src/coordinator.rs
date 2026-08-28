@@ -29,7 +29,7 @@ use control_core::pacer::Pacer;
 use crate::arm_pair::ArmPair;
 use crate::chase::rate_limited;
 use crate::governor::{GovState, Governor, Guard};
-use crate::liveness::{self, Admission, Liveness};
+use crate::liveness::{Admission, Cadence, CadenceChange, Liveness};
 use crate::motion::{MOTION_TIMEOUT_FACTOR, MoveBudget};
 use crate::planner::{self, BusyGuard, Goal, Planner};
 use crate::publish::{LimbStateSnapshot, Publishers};
@@ -67,10 +67,15 @@ pub struct ArmChannels {
 /// no deadman: joints mode holds the last governed setpoint where it is, and
 /// pose mode keeps converging to the last received pose, rate-capped and
 /// governed (the planner documents that choice). A *follower* that stops
-/// delivering is the opposite case and does have one, keyed to the control
-/// period rather than configured here (see [`crate::liveness`]).
+/// delivering is the opposite case and does have one, `stale_limit` (see
+/// [`crate::liveness`]).
 pub struct RunConfig {
     pub cycle_period: Duration,
+    /// Silence a follower is allowed before its limb is frozen.
+    pub stale_limit: Duration,
+    /// The rate the followers were launched to report at; a follower running
+    /// well under it is warned about ahead of the stale limit.
+    pub follower_state_rate_hz: u32,
     /// Cutoff (Hz) for the low-pass on each published desired velocity. `dq` is a
     /// per-tick position difference scaled by `1/dt`, so it amplifies any setpoint noise
     /// by the control rate; filtering it keeps the arm's Kd term from buzzing on a noisy
@@ -141,6 +146,8 @@ pub async fn run(
 ) -> peppygen::Result<()> {
     let RunConfig {
         cycle_period,
+        stale_limit,
+        follower_state_rate_hz,
         velocity_filter_cutoff_hz,
         upstream_mode,
     } = config;
@@ -189,12 +196,14 @@ pub async fn run(
     let mut pacer = Pacer::new(cycle_period).expect("control_rate_hz is asserted > 0 at startup");
     // Both arms are seeded from their first measurement above, which is the
     // anchor a recovery would re-establish, so they start live.
-    let stale_limit = liveness::stale_limit(cycle_period);
-    let (mut arm_liveness, mut gripper_liveness) = {
+    let (mut arm_liveness, mut gripper_liveness, mut arm_cadence, mut gripper_cadence) = {
         let seeded = Instant::now();
+        let cadence = || Cadence::new(follower_state_rate_hz, seeded);
         (
             ArmPair::new(Liveness::seeded(seeded), Liveness::seeded(seeded)),
             ArmPair::new(Liveness::seeded(seeded), Liveness::seeded(seeded)),
+            ArmPair::new(cadence(), cadence()),
+            ArmPair::new(cadence(), cadence()),
         )
     };
     // The grippers chase their target at the gripper rate exactly as the planner
@@ -211,9 +220,20 @@ pub async fn run(
         let gripper_rate = governor.max_gripper_rate_frac_s();
         let now = Instant::now();
 
-        let arm_admission = admit_arms(&mut arm_liveness, &channels, now, stale_limit);
-        let gripper_admission =
-            admit_grippers(&mut gripper_liveness, &mut channels, now, stale_limit);
+        let arm_admission = admit_arms(
+            &mut arm_liveness,
+            &mut arm_cadence,
+            &channels,
+            now,
+            stale_limit,
+        );
+        let gripper_admission = admit_grippers(
+            &mut gripper_liveness,
+            &mut gripper_cadence,
+            &mut channels,
+            now,
+            stale_limit,
+        );
         let arm_ticks = advance_arms(&mut channels, &mut planners, arm_admission, now).await;
         let arm_candidate = ArmPair::new(arm_ticks.left.candidate, arm_ticks.right.candidate);
         let hands = ArmPair::new(arm_ticks.left.streamed_hand, arm_ticks.right.streamed_hand);
@@ -408,22 +428,39 @@ fn apply_controls(governor: &mut Governor, planners: &mut ArmPair<Planner>, cfg:
 /// by the drift it accumulated unseen.
 fn admit_arms(
     liveness: &mut ArmPair<Liveness>,
+    cadence: &mut ArmPair<Cadence>,
     channels: &ArmPair<ArmChannels>,
     now: Instant,
     stale_limit: Duration,
 ) -> ArmPair<Admission> {
+    let delivered_left = channels.left.measured.has_changed().unwrap_or(false);
+    let delivered_right = channels.right.measured.has_changed().unwrap_or(false);
+    report_cadence("left arm", cadence.left.observe(delivered_left, now));
+    report_cadence("right arm", cadence.right.observe(delivered_right, now));
     ArmPair::new(
-        liveness.left.admit(
-            channels.left.measured.has_changed().unwrap_or(false),
-            now,
-            stale_limit,
-        ),
-        liveness.right.admit(
-            channels.right.measured.has_changed().unwrap_or(false),
-            now,
-            stale_limit,
-        ),
+        liveness.left.admit(delivered_left, now, stale_limit),
+        liveness.right.admit(delivered_right, now, stale_limit),
     )
+}
+
+/// Log a follower's delivery cadence crossing the threshold under its declared
+/// rate: the signal that the launcher's follower_state_rate_hz is a promise
+/// the follower is not keeping, ahead of the stale limit freezing the limb.
+fn report_cadence(limb: &str, change: Option<CadenceChange>) {
+    match change {
+        Some(CadenceChange::Degraded {
+            delivered,
+            expected,
+        }) => warn!(
+            "{limb} follower delivered {delivered} states in the last second, \
+             under its declared {expected}"
+        ),
+        Some(CadenceChange::Recovered {
+            delivered,
+            expected,
+        }) => info!("{limb} follower delivery back to {delivered} of its declared {expected}"),
+        None => {}
+    }
 }
 
 /// Judge each gripper follower's delivery, the opening analog of
@@ -436,6 +473,7 @@ fn admit_arms(
 /// than drifting away unseen the way an uncommanded arm does.
 fn admit_grippers(
     liveness: &mut ArmPair<Liveness>,
+    cadence: &mut ArmPair<Cadence>,
     channels: &mut ArmPair<ArmChannels>,
     now: Instant,
     stale_limit: Duration,
@@ -447,6 +485,8 @@ fn admit_grippers(
     let _ = channels.left.gripper.borrow_and_update();
     let delivered_right = channels.right.gripper.has_changed().unwrap_or(false);
     let _ = channels.right.gripper.borrow_and_update();
+    report_cadence("left gripper", cadence.left.observe(delivered_left, now));
+    report_cadence("right gripper", cadence.right.observe(delivered_right, now));
     ArmPair::new(
         liveness.left.admit(delivered_left, now, stale_limit),
         liveness.right.admit(delivered_right, now, stale_limit),

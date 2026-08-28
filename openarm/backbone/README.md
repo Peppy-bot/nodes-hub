@@ -173,6 +173,11 @@ See `peppy.json5` for the full commented list. The operational governor
 parameters (`d_stop_m`, `d_safe_m`, `collision_governor_enabled`,
 `max_ee_velocity_m_s`) are required launcher arguments with no node defaults,
 and the commander's `governor_control` stream retunes them live.
+`follower_state_rate_hz` is required too: the rate the followers deliver
+measured state at, of which four silent periods freeze the limb, and under
+three quarters of which draws a warning (100 for the real arms and MuJoCo;
+the Isaac fragment declares its 60 fps frame rate, since that engine reports
+once per rendered frame).
 `upstream_mode` is likewise required: `"joints"` follows the joint_link
 leader slots, `"pose"` the pose_link ones, and only the named kind is
 subscribed. Link the leader into the slots that kind names, or nothing it

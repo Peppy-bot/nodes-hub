@@ -22,6 +22,7 @@ use tracing::{error, info};
 use crate::actions;
 use crate::coordinator::{self, ArmChannels};
 use crate::governor;
+use crate::liveness;
 use crate::planner::{PlanConfig, Planner};
 use crate::servo::EeCaps;
 use crate::startup;
@@ -43,6 +44,9 @@ const MAX_RATE_HZ: u32 = 1_000;
 pub enum NodeError {
     #[error("parameter control_rate_hz")]
     ControlRate(#[source] RateOutOfRange),
+
+    #[error("parameter follower_state_rate_hz")]
+    FollowerStateRate(#[source] liveness::StaleLimitOutOfRange),
 
     #[error(
         "control_rate_hz ({rate_hz}) is too slow for the servo's command smoothing; \
@@ -176,6 +180,12 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     // anything downstream is built from the value.
     let cycle_period =
         period_from_hz(params.control_rate_hz, MAX_RATE_HZ).map_err(NodeError::ControlRate)?;
+    let stale_limit = liveness::stale_limit(params.follower_state_rate_hz, cycle_period)
+        .map_err(NodeError::FollowerStateRate)?;
+    info!(
+        "a follower silent for over {:?} is frozen (followers report at {} Hz, control loop {} Hz)",
+        stale_limit, params.follower_state_rate_hz, params.control_rate_hz
+    );
     // Built here, where a rate that cannot carry the cutoff is a refusal by
     // name; every servo move copies the value instead of rebuilding it.
     let servo_smoothing =
@@ -403,6 +413,8 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
             config_rx,
             coordinator::RunConfig {
                 cycle_period,
+                stale_limit,
+                follower_state_rate_hz: params.follower_state_rate_hz,
                 velocity_filter_cutoff_hz: params.velocity_filter_cutoff_hz,
                 upstream_mode,
             },

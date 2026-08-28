@@ -9,7 +9,7 @@
 //!   so every test pumps that mock service.
 //! - `coordinator::seed_all` then gates streaming on a first measured state
 //!   from BOTH arms and BOTH grippers, and `liveness` freezes a limb that goes
-//!   silent for 4 control periods. The harness pins every pairing slot to a
+//!   silent for four periods of `follower_state_rate_hz`. The harness pins every pairing slot to a
 //!   mock (only the `collision_ctrl` dependency slot has a `_vacant` knob), so
 //!   each test pumps all four follower back-channels at a rate inside the
 //!   stale limit. The unselected slots (pose pairs, upstream gripper pairs,
@@ -28,12 +28,15 @@ use tokio::sync::watch;
 const PUMP_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Control rate for the tests: 20 ms cycle (Nyquist 25 Hz, above the 15 Hz
-/// velocity-filter default) and an 80 ms stale limit, comfortably above the
-/// 10 ms state pumps even on a loaded machine.
+/// velocity-filter default).
 const CONTROL_RATE_HZ: u32 = 50;
 
-/// Follower back-channel period; must stay well inside the 4-cycle (80 ms)
-/// liveness stale limit or the coordinator freezes that limb.
+/// Declared follower rate for the tests: four of its periods make an 80 ms
+/// stale window, comfortably above the state pumps even on a loaded machine.
+const FOLLOWER_STATE_RATE_HZ: u32 = 50;
+
+/// Follower back-channel period; must stay well inside the 80 ms follower
+/// stale window or the coordinator freezes that limb.
 const STATE_PUMP_PERIOD: Duration = Duration::from_millis(10);
 
 /// Rest pose both arms are seeded at: elbow (j4) exactly at the description's
@@ -58,6 +61,7 @@ fn params() -> peppygen::Parameters {
         control_rate_hz: CONTROL_RATE_HZ,
         d_safe_m: 0.02,
         d_stop_m: 0.005,
+        follower_state_rate_hz: FOLLOWER_STATE_RATE_HZ,
         hardware_version: "v1".to_string(),
         max_ee_angular_velocity_rad_s: 0.8,
         max_ee_velocity_m_s: 2.0,
