@@ -393,7 +393,7 @@ wheels = [
 [[package]]
 name = "control-core-py"
 version = "0.1.0"
-source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=control_core_py&branch=main#9a7b320b7885c4db69cd8284c3a6d17595d3c3c0" }
+source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=control_core_py&branch=main#5df98a7d93311103e91cb488f73c45dca1b850da" }
 
 [[package]]
 name = "cuda-bindings"
@@ -1530,7 +1530,7 @@ dev = [
 [[package]]
 name = "so101-description"
 version = "0.1.0"
-source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=so101_description&branch=main#9a7b320b7885c4db69cd8284c3a6d17595d3c3c0" }
+source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=so101_description&branch=main#5df98a7d93311103e91cb488f73c45dca1b850da" }
 dependencies = [
     { name = "control-core-py" },
     { name = "numpy" },

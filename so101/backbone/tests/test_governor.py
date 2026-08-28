@@ -1,5 +1,6 @@
 import math
 
+import numpy as np
 import pytest
 
 from so101_backbone.governor import EEGovernor, rate_step
@@ -15,6 +16,20 @@ class LinearKinematics:
         half = positions_rad[3] / 2.0
         orientation = (0.0, 0.0, math.sin(half), math.cos(half))
         return position, orientation
+
+    def jacobian(self, positions_rad):
+        # Constant, because this chain is linear: the first three joints
+        # translate the tool one for one and the fourth spins it about z.
+        return np.array(
+            [
+                [1.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0, 0.0],
+            ]
+        )
 
 
 def make_governor(max_linear=1.0, max_angular=10.0, period_s=0.1):
@@ -83,10 +98,10 @@ def test_rate_step_lands_exactly_and_caps_beyond():
 
 
 class PlanarArmKinematics:
-    """Two revolute links in the xy-plane: the end effector rides a circle,
-    so joint-space interpolation bows away from the straight line between
-    endpoints. LinearKinematics above cannot show this, which is why the
-    chord-scaling defect survived every test in this file."""
+    """Two revolute links in the xy-plane: the tool rides a circle, so
+    joint-space interpolation bows away from the straight line between
+    endpoints. LinearKinematics cannot show that, which is why chord scaling
+    survived every test in this file."""
 
     L1 = 0.4
     L2 = 0.3
@@ -97,12 +112,24 @@ class PlanarArmKinematics:
         y = self.L1 * math.sin(q0) + self.L2 * math.sin(q0 + q1)
         return (x, y, 0.0), (0.0, 0.0, 0.0, 1.0)
 
+    def jacobian(self, positions_rad):
+        q0, q1 = positions_rad[0], positions_rad[1]
+        tip = self.L2 * math.sin(q0 + q1), self.L2 * math.cos(q0 + q1)
+        jacobian = np.zeros((6, 5))
+        jacobian[0, 0] = -self.L1 * math.sin(q0) - tip[0]
+        jacobian[1, 0] = self.L1 * math.cos(q0) + tip[1]
+        jacobian[0, 1] = -tip[0]
+        jacobian[1, 1] = tip[1]
+        # Orientation is constant in this double, so its angular rows are zero
+        # and the double stays consistent with its own forward kinematics.
+        return jacobian
 
-def test_a_bowing_path_is_governed_by_measurement_not_by_the_chord():
-    # The chord between two joint configurations is not a bound on the path
-    # the joints trace between them. Scaling by cap/chord therefore leaves a
-    # step whose real displacement is larger, and on the one limiter this
-    # stream has, larger means faster than the operator asked for.
+
+def test_a_curved_path_is_capped_on_speed_not_on_the_endpoint_chord():
+    # The chord between two joint configurations is not proportional to the
+    # step that joins them, so scaling by cap/chord leaves a step that moves
+    # the tool faster than asked. The Jacobian is proportional by
+    # construction, which is why the cap is met by one division.
     kinematics = PlanarArmKinematics()
     cap_m_s, period_s = 1.0, 0.1
     cap = cap_m_s * period_s
@@ -115,15 +142,30 @@ def test_a_bowing_path_is_governed_by_measurement_not_by_the_chord():
 
     here = kinematics.forward_kinematics(current)[0]
     chord = math.dist(here, kinematics.forward_kinematics(target)[0])
-    naive = tuple(c + (cap / chord) * (t - c) for c, t in zip(current, target, strict=True))
-    naive_step = math.dist(here, kinematics.forward_kinematics(naive)[0])
-    assert naive_step > cap * 1.5, (
+    naive = tuple(
+        c + (cap / chord) * (t - c) for c, t in zip(current, target, strict=True)
+    )
+    naive_speed = np.linalg.norm(
+        (kinematics.jacobian(current) @ (np.array(naive) - np.array(current)))[:3]
+    )
+    assert naive_speed > cap * 1.5, (
         "this case must actually defeat chord scaling, or it guards nothing"
     )
 
     governed = governor.govern(current, target)
-    stepped = math.dist(here, kinematics.forward_kinematics(governed)[0])
-    assert stepped <= cap + 1e-9
-    # And not so conservative that the arm crawls: the search keeps most of
-    # the budget it is allowed to spend.
-    assert stepped > cap * 0.9
+    delta = np.array(governed) - np.array(current)
+    speed = np.linalg.norm((kinematics.jacobian(current) @ delta)[:3])
+    # The capped quantity is met exactly, with no search.
+    assert speed == pytest.approx(cap, rel=1e-12)
+    # And the distance actually travelled cannot exceed it either: a chord is
+    # never longer than the arc the joints trace to it.
+    assert math.dist(here, kinematics.forward_kinematics(governed)[0]) <= cap + 1e-12
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_a_step_that_cannot_be_measured_freezes_rather_than_passing_through(bad):
+    # min(1.0, nan) is 1.0 in Python, so a governor that scales by a computed
+    # fraction lets a non-finite target through untouched. A basis that
+    # cannot be evaluated is not a licence to run uncapped.
+    governor = make_governor(max_linear=1.0, period_s=0.1)
+    current = (0.0, 0.0, 0.0, 0.0, 0.0)
+    governed = governor.govern(current, (bad, 0.0, 0.0, 0.0, 0.0))
+    assert governed == current

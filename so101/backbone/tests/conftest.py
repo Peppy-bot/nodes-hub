@@ -41,6 +41,17 @@ class FakeKinematics:
         self.solve_calls.append(("stream", seed, position, orientation))
         return None if self.corrupted else self.solution
 
+    def jacobian(self, positions_rad):
+        """The exact derivative of this fake's own forward kinematics, so the
+        governor's speed measure and the pose it reports agree."""
+        import numpy as np
+
+        jacobian = np.zeros((6, 5))
+        jacobian[0, :] = 0.01
+        jacobian[1, 0] = 0.02
+        jacobian[2, 1] = 0.03
+        return jacobian
+
     def forward_kinematics(self, positions_rad):
         """Deterministic, and dependent on every joint. A fake that answered
         a constant would let a readout publishing a stale pose pass."""

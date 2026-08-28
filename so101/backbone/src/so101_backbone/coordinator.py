@@ -135,9 +135,9 @@ class Coordinator:
         # Per-tick joint steps for the pose-mode stream only: the IK output is
         # machine-generated, and near the workspace boundary the solver can
         # flip configurations tick to tick with joint swings the EE governor
-        # cannot see (or, past its linearization, bound). Stepping the anchor
-        # toward each solution also seeds the next solve nearby, keeping the
-        # solver in one basin. The joints-led stream is never shaped by this.
+        # cannot see. Stepping the anchor toward each solution also seeds the
+        # next solve nearby, keeping the solver in one basin. The joints-led
+        # stream is never shaped by this: it must match lerobot's.
         self._pose_joint_tick_caps = tuple(
             v * period_s for v in config.max_joint_velocity_rad_s
         )
