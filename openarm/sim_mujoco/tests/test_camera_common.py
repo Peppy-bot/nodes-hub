@@ -333,3 +333,19 @@ class TestFramePacer:
         # 50 missed frames.
         assert not pacer.take_if_due(105.05)
         assert pacer.take_if_due(105.1)
+
+    def test_ticks_jittered_around_the_period_are_all_taken(self):
+        # A 60 Hz request over a 60 fps loop whose frames alternate 16.2 and
+        # 17.2 ms: one early tick skips, and the grid must absorb the late
+        # one that follows rather than resync onto it, or the pair locks
+        # into taking every other tick.
+        pacer = FramePacer(60)
+        ticks = [100.0 + (i // 2) * 0.0334 + (i % 2) * 0.0162 for i in range(600)]
+        taken = [pacer.take_if_due(t) for t in ticks]
+        assert sum(taken) >= 598
+
+    def test_ticks_slightly_faster_than_the_period_skip_at_most_one_in_a_row(self):
+        pacer = FramePacer(60)
+        taken = [pacer.take_if_due(100.0 + i * 0.0165) for i in range(600)]
+        assert sum(taken) >= 594
+        assert all(a or b for a, b in zip(taken, taken[1:]))

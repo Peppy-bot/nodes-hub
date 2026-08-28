@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pyjson5
 
-from camera_common import CameraConfig
+from camera_common import CameraConfig, FramePacer
 from sim_topics import SimTopicIO
 from exts import (
     MujocoActuatorCtrl,
@@ -61,13 +61,12 @@ class MujocoBridgeExtension:
         self._model = model
         self._data = data
         self._io = io
-        # Telemetry is throttled to state_rate_hz: serializing every reader at
-        # the ~500 Hz physics tick saturates the single sim thread. Writers and
-        # the physics step still run every tick.
+        # State publishes ride an absolute grid at state_rate_hz: serializing
+        # every reader at the ~500 Hz physics tick saturates the single sim
+        # thread. Writers and the physics step still run every tick.
         if state_rate_hz <= 0:
             raise ValueError(f"state_rate_hz must be positive, got {state_rate_hz}")
-        self._telemetry_period_s = 1.0 / state_rate_hz
-        self._last_publish_s = 0.0
+        self._state_pacer = FramePacer(state_rate_hz)
         # Signed full-open travel per finger joint, read from the model at
         # setup; commanded opening fractions scale onto it.
         self._gripper_travels: dict[int, list[float]] = {}
@@ -160,10 +159,8 @@ class MujocoBridgeExtension:
             self._camera_sensor.snapshot(self._data.qpos)
             self._camera_sensor.raise_if_failed()
 
-        now = time.monotonic()
-        if now - self._last_publish_s < self._telemetry_period_s:
+        if not self._state_pacer.take_if_due(time.monotonic()):
             return
-        self._last_publish_s = now
         self._publish_state()
 
     def _apply_commands(self) -> None:
