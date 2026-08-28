@@ -80,3 +80,50 @@ def test_rate_step_lands_exactly_and_caps_beyond():
     assert rate_step(0.9, 1.0, 0.25) == 1.0
     third = 0.1 + 0.2  # 0.30000000000000004: adversarial float target
     assert rate_step(0.3, third, 1.0) == third
+
+
+class PlanarArmKinematics:
+    """Two revolute links in the xy-plane: the end effector rides a circle,
+    so joint-space interpolation bows away from the straight line between
+    endpoints. LinearKinematics above cannot show this, which is why the
+    chord-scaling defect survived every test in this file."""
+
+    L1 = 0.4
+    L2 = 0.3
+
+    def forward_kinematics(self, positions_rad):
+        q0, q1 = positions_rad[0], positions_rad[1]
+        x = self.L1 * math.cos(q0) + self.L2 * math.cos(q0 + q1)
+        y = self.L1 * math.sin(q0) + self.L2 * math.sin(q0 + q1)
+        return (x, y, 0.0), (0.0, 0.0, 0.0, 1.0)
+
+
+def test_a_bowing_path_is_governed_by_measurement_not_by_the_chord():
+    # The chord between two joint configurations is not a bound on the path
+    # the joints trace between them. Scaling by cap/chord therefore leaves a
+    # step whose real displacement is larger, and on the one limiter this
+    # stream has, larger means faster than the operator asked for.
+    kinematics = PlanarArmKinematics()
+    cap_m_s, period_s = 1.0, 0.1
+    cap = cap_m_s * period_s
+    governor = EEGovernor(
+        kinematics, max_linear_m_s=cap_m_s, max_angular_rad_s=1e9, period_s=period_s
+    )
+    # Half a turn of the shoulder: endpoints near each other, path a wide arc.
+    current = (0.0, 2.4, 0.0, 0.0, 0.0)
+    target = (math.pi, 2.4, 0.0, 0.0, 0.0)
+
+    here = kinematics.forward_kinematics(current)[0]
+    chord = math.dist(here, kinematics.forward_kinematics(target)[0])
+    naive = tuple(c + (cap / chord) * (t - c) for c, t in zip(current, target, strict=True))
+    naive_step = math.dist(here, kinematics.forward_kinematics(naive)[0])
+    assert naive_step > cap * 1.5, (
+        "this case must actually defeat chord scaling, or it guards nothing"
+    )
+
+    governed = governor.govern(current, target)
+    stepped = math.dist(here, kinematics.forward_kinematics(governed)[0])
+    assert stepped <= cap + 1e-9
+    # And not so conservative that the arm crawls: the search keeps most of
+    # the budget it is allowed to spend.
+    assert stepped > cap * 0.9
