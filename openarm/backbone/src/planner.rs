@@ -41,25 +41,6 @@ use crate::upstream::Upstream;
 /// as [`MOTION_TIMEOUT_FACTOR`] does over the rollout's duration).
 const VELOCITY_GUARD_MARGIN: f64 = 1.5;
 
-/// Why no plan reached the goal pose, told apart so the operator is not sent
-/// looking for a reach problem that is a tolerance problem: every line tier
-/// failed to track, and either the guarded servo rolled out without converging
-/// or the slack asked for is tighter than that law can arrive.
-fn unreachable_reason(tolerance: PlanTolerance) -> String {
-    let (mm, deg) = (
-        tolerance.position_m * 1000.0,
-        tolerance.orientation_rad.to_degrees(),
-    );
-    match tolerance.servo() {
-        Ok(_) => format!(
-            "goal pose unreachable within {mm:.1} mm / {deg:.1} deg              (no line tracks and the servo rollout stalls)"
-        ),
-        Err(refusal) => format!(
-            "goal pose unreachable within {mm:.1} mm / {deg:.1} deg: no line tracks it,              and the guarded servo that would take over cannot arrive that tightly              ({refusal})"
-        ),
-    }
-}
-
 /// Per-arm static configuration for the planner (the motion limits relocated
 /// from the arm). Cloned per side.
 #[derive(Clone)]
@@ -783,16 +764,29 @@ impl Planner {
             duration_s,
             tolerance,
         );
-        let Some(plan) = plan else {
-            let (pos, quat) = world_pose_arrays(&start_world);
-            if let Err(e) = ctx
-                .complete(false, unreachable_reason(tolerance), pos, quat, 0.0)
-                .await
-            {
-                error!("{}: move_arm complete: {e}", self.side.label());
+        let plan = match plan {
+            Ok(plan) => plan,
+            Err(rejection) => {
+                let (pos, quat) = world_pose_arrays(&start_world);
+                if let Err(e) = ctx
+                    .complete(
+                        false,
+                        format!(
+                            "goal pose not planned within {:.1} mm / {:.1} deg: {rejection}",
+                            tolerance.position_m * 1000.0,
+                            tolerance.orientation_rad.to_degrees()
+                        ),
+                        pos,
+                        quat,
+                        0.0,
+                    )
+                    .await
+                {
+                    error!("{}: move_arm complete: {e}", self.side.label());
+                }
+                // `busy` drops here: the slot is released even on this early exit.
+                return Mode::Follow;
             }
-            // `busy` drops here: the slot is released even on this early exit.
-            return Mode::Follow;
         };
         let path = match plan {
             CartesianPlan::Line {

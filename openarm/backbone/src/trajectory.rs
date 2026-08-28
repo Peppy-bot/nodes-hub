@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use control_core::minimum_jerk::{quintic, velocity_limited_duration};
-use srs_model::chain_kinematics::ServoTolerances;
+use srs_model::chain_kinematics::{ServoTolerances, ToleranceError};
 use srs_model::nalgebra::{Isometry3, Translation3};
 use srs_model::{Arm, ArmAnglePolicy};
 
@@ -194,7 +194,44 @@ pub struct PlanLimits<'a> {
     pub smoothing: control_core::filters::ButterworthFilter,
 }
 
+/// Why no plan reached the goal pose. Named where the decision is taken rather
+/// than reconstructed from the request afterwards, so the operator is told which
+/// limit refused the move and not the one that happened to be easiest to guess.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PlanRejection {
+    /// No line was usable - none tracks the pose continuously, or the ones that
+    /// do overrun the duration this request allows - and the guarded servo's
+    /// rollout did not converge within its ceiling either.
+    Unreachable,
+    /// No line was usable, and the guarded servo that would take over cannot
+    /// arrive within the slack asked for.
+    ServoCannotArrive(ToleranceError),
+    /// The velocity budget did not size a duration, which takes a finite
+    /// non-negative limit and request.
+    UnusableBudget,
+}
+
+impl std::fmt::Display for PlanRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unreachable => write!(
+                f,
+                "no line plan fits the limits and the servo rollout stalls"
+            ),
+            Self::ServoCannotArrive(refusal) => write!(
+                f,
+                "no line plan fits the limits, and the guarded servo that would take \
+                 over cannot arrive that tightly ({refusal})"
+            ),
+            Self::UnusableBudget => {
+                write!(f, "the velocity budget does not size a duration")
+            }
+        }
+    }
+}
+
 /// How an accepted move_arm goal executes, decided by [`plan_cartesian`].
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CartesianPlan {
     /// The straight line is continuously trackable: track it over this duration,
     /// resolving the elbow the same way the plan did (`steer_elbow` on means the
@@ -304,7 +341,7 @@ pub fn plan_cartesian(
     limits: &PlanLimits,
     requested_duration_secs: f64,
     tolerance: PlanTolerance,
-) -> Option<CartesianPlan> {
+) -> Result<CartesianPlan, PlanRejection> {
     let duration_cap = line_duration_cap(requested_duration_secs);
     let tiers = [
         (ArmAnglePolicy::FromSeed, false),
@@ -334,28 +371,30 @@ pub fn plan_cartesian(
         ) else {
             continue;
         };
-        // A budget that cannot size a duration cannot be planned as a line.
+        // A budget that cannot size a duration cannot be planned at all.
         let duration_s =
             velocity_limited_duration(walk.peak_ratio.max(ee_ratio), requested_duration_secs)
-                .ok()?;
+                .map_err(|_| PlanRejection::UnusableBudget)?;
         if duration_s <= duration_cap {
-            return Some(CartesianPlan::Line {
+            return Ok(CartesianPlan::Line {
                 duration_s,
                 steer_elbow,
                 start_q: walk.start_q,
             });
         }
     }
-    // No line tracks: prove the servo law reaches the pose, to the caller's
+    // No line is usable: prove the servo law reaches the pose, to the caller's
     // slack, before accepting it. A slack the law cannot reach rules the tier
     // out rather than rolling it out to a foregone refusal.
-    let tolerance = tolerance.servo().ok()?;
-    crate::servo::rollout(model, start, end, seed, limits, tolerance).map(|duration_s| {
-        CartesianPlan::Servo {
+    let tolerance = tolerance
+        .servo()
+        .map_err(PlanRejection::ServoCannotArrive)?;
+    crate::servo::rollout(model, start, end, seed, limits, tolerance)
+        .map(|duration_s| CartesianPlan::Servo {
             duration_s,
             tolerance,
-        }
-    })
+        })
+        .ok_or(PlanRejection::Unreachable)
 }
 
 /// Interpolate between two poses at blend parameter `s` ∈ [0,1]: position by a
@@ -884,7 +923,7 @@ mod tests {
         let mut goal = start;
         goal.translation.vector.z += 0.05; // a small reachable move
 
-        let Some(CartesianPlan::Line { duration_s, .. }) = plan_cartesian(
+        let Ok(CartesianPlan::Line { duration_s, .. }) = plan_cartesian(
             &arm,
             &start,
             &goal,
@@ -900,7 +939,7 @@ mod tests {
             "an in-workspace move should plan a positive duration"
         );
         // The request floors the velocity-limited duration.
-        let Some(CartesianPlan::Line {
+        let Ok(CartesianPlan::Line {
             duration_s: floored,
             ..
         }) = plan_cartesian(
@@ -945,7 +984,7 @@ mod tests {
             control_period: TEST_DT,
             smoothing: crate::servo::smoothing_for(TEST_DT).unwrap(),
         };
-        let Some(CartesianPlan::Line { duration_s, .. }) =
+        let Ok(CartesianPlan::Line { duration_s, .. }) =
             plan_cartesian(&arm, &start, &goal, seed, &limits, 0.0, default_tolerance())
         else {
             panic!("a small lift should plan as a line");
@@ -969,7 +1008,7 @@ mod tests {
         let mut goal = start;
         goal.translation.vector.z += 0.05;
 
-        let Some(CartesianPlan::Line { start_q, .. }) = plan_cartesian(
+        let Ok(CartesianPlan::Line { start_q, .. }) = plan_cartesian(
             &arm,
             &start,
             &goal,
@@ -1025,7 +1064,7 @@ mod tests {
         let start = arm.world_pose(&ee);
         let mut unreachable = start;
         unreachable.translation.vector.x += 10.0; // 10 m away: no IK solution
-        assert!(
+        assert_eq!(
             plan_cartesian(
                 &arm,
                 &start,
@@ -1034,8 +1073,9 @@ mod tests {
                 &v1_limits(),
                 0.0,
                 default_tolerance()
-            )
-            .is_none()
+            ),
+            Err(PlanRejection::Unreachable),
+            "10 m away is out of reach, not merely slow or too tightly toleranced"
         );
     }
 
@@ -1083,7 +1123,7 @@ mod tests {
                 2.0,
                 default_tolerance()
             )
-            .is_none(),
+            .is_err(),
             "this goal is chosen because the default tolerance refuses it"
         );
 
@@ -1326,7 +1366,7 @@ mod tests {
             "held-elbow line should not track this graze"
         );
         // ...so the planner selects the steered line (and it stays under the cap).
-        let Some(CartesianPlan::Line {
+        let Ok(CartesianPlan::Line {
             steer_elbow: true, ..
         }) = plan_cartesian(
             &model,
@@ -1357,7 +1397,7 @@ mod tests {
                 UnitQuaternion::from_axis_angle(&Vector3::z_axis(), turn_rad),
             );
 
-        let Some(CartesianPlan::Line { duration_s, .. }) = plan_cartesian(
+        let Ok(CartesianPlan::Line { duration_s, .. }) = plan_cartesian(
             &model,
             &start,
             &end,
