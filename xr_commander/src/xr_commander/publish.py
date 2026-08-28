@@ -1,7 +1,9 @@
 """The command streams, one task per hand per pairing slot.
 
-Silence is the deadman: a disengaged hand publishes nothing at all and the
-follower holds. One task per stream.
+Silence is the deadman: a disengaged hand stops commanding and the follower
+holds. Releasing the arm clutch first streams a short burst of the measured
+pose, so the follower stops where the robot is rather than at the last hand
+target. One task per stream.
 """
 
 from __future__ import annotations
@@ -72,6 +74,50 @@ class LatestPose:
 def _timestamp_seconds() -> float:
     """Daemon-resolved clock (sim time under a sim clock)."""
     return peppygen.clock.now_ns() / 1e9
+
+
+# How long the release freeze streams the measured pose after the clutch
+# disengages. The follower's motion authority may keep converging to the
+# last command it heard (openarm's backbone documents that choice), so the
+# release explicitly commands "stay where the robot is"; a burst rather
+# than a single message, so one dropped sample cannot lose the stop.
+RELEASE_HOLD_S = 0.25
+# The burst's own floor in messages, so a slow command rate cannot reduce it
+# to the single sample the burst exists to avoid depending on.
+RELEASE_HOLD_MESSAGES = 3
+
+
+class ReleaseHold:
+    """The release freeze: when a driving hand disengages, the last fresh
+    measured pose becomes the streamed target for a short burst, stopping
+    the follower where the robot is instead of at the last hand pose."""
+
+    def __init__(self, tick_period_s: float, hold_s: float = RELEASE_HOLD_S):
+        self._hold_s = max(hold_s, RELEASE_HOLD_MESSAGES * tick_period_s)
+        self._driving = False
+        self._pose: Pose | None = None
+        self._until = 0.0
+
+    def step(
+        self, *, target: Pose | None, measured_ee: Pose | None, now_s: float
+    ) -> Pose | None:
+        """This tick's pose to stream, or None for silence: the clutch's
+        target while driving, then the latched measured pose for the burst
+        that follows release. One call per tick, so no caller can arm the
+        burst without also being able to void it. Without a fresh measured
+        pose at release there is nothing truthful to freeze on, so silence."""
+        if target is not None:
+            self._driving = True
+            self._until = 0.0
+            return target
+        if self._driving:
+            self._driving = False
+            if measured_ee is not None:
+                self._pose = measured_ee
+                self._until = now_s + self._hold_s
+        if now_s < self._until:
+            return self._pose
+        return None
 
 
 async def drain_pose_states(
@@ -146,10 +192,14 @@ async def stream_pose(
     settings: Settings,
     token: CancellationToken,
 ) -> None:
-    """Drive one hand's pose_link slot from the clutch."""
+    """Drive one hand's pose_link slot from the clutch. Releasing the
+    clutch streams a short freeze burst of the measured pose, so the
+    follower stops where the robot is instead of walking on to the last
+    hand pose."""
     # The one refusal an operator cannot see coming: squeezing while the
     # follower's measured pose is absent or stale does nothing. Say so once.
     waiting = Latch()
+    hold = ReleaseHold(settings.tick_period_s)
 
     def build():
         # Stamped first: a clock that cannot stamp must fail the tick before
@@ -169,9 +219,12 @@ async def stream_pose(
             hand=sample.pose if sample else None,
             measured_ee=measured_ee,
         )
-        if target is None:
+        commanded = hold.step(
+            target=target, measured_ee=measured_ee, now_s=time.monotonic()
+        )
+        if commanded is None:
             return None
-        position, orientation = target.as_wire()
+        position, orientation = commanded.as_wire()
         return topic_module.build_message(timestamp, position, orientation)
 
     await _run_stream(

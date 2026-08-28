@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "so101_leader"
+version = "0.1.0"
+description = "so101_leader peppy node"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "peppygen",
+    "peppylib",
+    "control_core_py",
+    "so101_description",
+    "lerobot[feetech]>=0.6,<0.7",
+]
+
+[project.scripts]
+so101_leader = "so101_leader.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/so101_leader"]
+
+[dependency-groups]
+dev = ["pytest>=8", "pytest-asyncio>=0.24"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+asyncio_mode = "auto"
+
+[tool.uv.sources]
+peppygen = { path = ".peppy/libs/peppygen" }
+peppylib = { path = ".peppy/libs/peppylib" }
+# The shared libs ride main, like the Rust nodes' control_core.
+control_core_py = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "control_core_py", branch = "main" }
+so101_description = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "so101_description", branch = "main" }

@@ -126,6 +126,21 @@
         path: "sim_rgbd_camera/peppy.json5"
       }
     },
+    so101_backbone: {
+      v1: {
+        path: "so101/backbone/peppy.json5"
+      }
+    },
+    so101_follower: {
+      v1: {
+        path: "so101/follower/peppy.json5"
+      }
+    },
+    so101_leader: {
+      v1: {
+        path: "so101/leader/peppy.json5"
+      }
+    },
     uvc_camera_controls_tests: {
       v1: {
         path: "uvc_camera_controls_tests/peppy.json5"

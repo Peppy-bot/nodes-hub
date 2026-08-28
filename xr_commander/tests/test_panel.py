@@ -65,6 +65,7 @@ def health_with(*sources):
 def states(**overrides):
     conditions = {
         "arm_bound": True,
+        "gripper_bound": True,
         "tracked": True,
         "squeezing": True,
         "follower_fresh": True,
@@ -80,7 +81,7 @@ def state_of(**overrides):
 def test_each_gate_the_operator_hits_gets_its_own_wording():
     # The panel exists to answer "why is nothing moving", so every refusal
     # must read differently.
-    assert state_of(arm_bound=False) == "no arm bound"
+    assert state_of(arm_bound=False, gripper_bound=False) == "nothing bound"
     assert state_of(tracked=False) == "no controller"
     assert state_of(squeezing=False) == "grip released"
     assert state_of(follower_fresh=False) == "waiting for arm"
@@ -88,10 +89,30 @@ def test_each_gate_the_operator_hits_gets_its_own_wording():
     assert state_of() == "driving"
 
 
+def test_a_gripper_only_hand_reports_its_grip_instead_of_a_missing_arm():
+    # Either slot makes a hand wired, so a hand that only drives a gripper
+    # gets a row; that row must describe the grip it actually does, not sit
+    # forever on an arm it was never given.
+    assert state_of(arm_bound=False) == "gripping"
+    assert state_of(arm_bound=False, squeezing=False) == "grip released"
+    # An absent arm has no pose to anchor, so the arm-only gates cannot
+    # strand the row.
+    assert state_of(arm_bound=False, follower_fresh=False) == "gripping"
+    assert state_of(arm_bound=False, engaged=False) == "gripping"
+
+
+def test_a_lone_wired_hand_is_named_for_the_slot_it_drives():
+    session = FakeSession({"left": squeezing_hand()})
+    for gripper_only, expected in ((False, "ARM"), (True, "GRIPPER")):
+        hand = source("left", arm_bound=not gripper_only, gripper_bound=True)
+        rows = snapshot(session, [hand], 10.0, quiet(), no_health()).hands
+        assert [row.label for row in rows] == [expected]
+
+
 def test_the_earliest_unmet_gate_wins_over_every_later_one():
     # Pin each adjacent pair: reordering any two checks would report a later
     # problem than the one the operator has to fix first.
-    assert state_of(arm_bound=False, tracked=False) == "no arm bound"
+    assert state_of(arm_bound=False, gripper_bound=False, tracked=False) == "nothing bound"
     assert state_of(tracked=False, squeezing=False) == "no controller"
     assert state_of(squeezing=False, follower_fresh=False) == "grip released"
     assert state_of(follower_fresh=False, engaged=False) == "waiting for arm"
@@ -127,18 +148,20 @@ def squeezing_hand():
     return HandSample(pose=POSE, squeezing=True, trigger=0.0)
 
 
-def source(handedness, *, arm_bound=True, fresh=True, engaged=False):
+def source(handedness, *, arm_bound=True, gripper_bound=None, fresh=True, engaged=False):
     measured = LatestPose()
     if fresh:
         measured.set(POSE)
     clutch = HandClutch(1.0)
     if engaged:
         clutch.step(squeezing=True, hand=POSE, measured_ee=POSE)
+    gripper = arm_bound if gripper_bound is None else gripper_bound
     return HandSource(
         handedness=handedness,
         clutch=clutch,
         measured=measured,
         arm_paired=lambda: arm_bound,
+        gripper_paired=lambda: gripper,
     )
 
 
@@ -159,12 +182,12 @@ def test_an_unbound_arm_says_so_instead_of_waiting_forever():
     rows = snapshot(
         session, [source("left", arm_bound=False)], 10.0, quiet(), no_health()
     ).hands
-    assert rows[0].state == "no arm bound"
+    assert rows[0].state == "nothing bound"
 
 
 def test_a_pair_established_after_boot_reaches_the_panel():
     # The daemon may finish establishing the launcher's pairs after setup, so
-    # a boot-time read would report "no arm bound" for the whole session.
+    # a boot-time read would report "nothing bound" for the whole session.
     session = FakeSession({"left": squeezing_hand()})
     paired = []
     hand = HandSource(
@@ -172,16 +195,43 @@ def test_a_pair_established_after_boot_reaches_the_panel():
         clutch=HandClutch(1.0),
         measured=LatestPose(),
         arm_paired=lambda: bool(paired),
+        gripper_paired=lambda: False,
     )
     assert (
         snapshot(session, [hand], 10.0, quiet(), no_health()).hands[0].state
-        == "no arm bound"
+        == "nothing bound"
     )
     paired.append(True)
     assert (
         snapshot(session, [hand], 10.0, quiet(), no_health()).hands[0].state
-        != "no arm bound"
+        != "nothing bound"
     )
+
+
+def test_only_wired_hands_get_rows_and_a_lone_one_reads_arm():
+    # A single-arm robot pairs one hand; the other side's "nothing bound" row
+    # is noise, and the survivor needs no handedness to disambiguate it.
+    session = FakeSession({"right": squeezing_hand()})
+    hands = [source("left", arm_bound=False), source("right")]
+    rows = snapshot(session, hands, 10.0, quiet(), no_health()).hands
+    assert [row.label for row in rows] == ["ARM"]
+
+
+def test_a_gripper_only_hand_keeps_its_row():
+    # A side with a gripper but no pose_link still grips, so it still shows.
+    session = FakeSession({})
+    hands = [source("left", arm_bound=False, gripper_bound=True), source("right")]
+    rows = snapshot(session, hands, 10.0, quiet(), no_health()).hands
+    assert [row.label for row in rows] == ["LEFT", "RIGHT"]
+
+
+def test_nothing_wired_shows_every_hand():
+    # A stack with no pairs at all must say why nothing drives, per hand.
+    session = FakeSession({})
+    hands = [source("left", arm_bound=False), source("right", arm_bound=False)]
+    rows = snapshot(session, hands, 10.0, quiet(), no_health()).hands
+    assert [row.label for row in rows] == ["LEFT", "RIGHT"]
+    assert all(row.state == "nothing bound" for row in rows)
 
 
 def test_a_stale_follower_is_reported_per_hand():

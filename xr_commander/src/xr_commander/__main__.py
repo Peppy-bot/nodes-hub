@@ -297,7 +297,7 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
 
     # Shared with the status panel, which reports the same state the pose
     # streams act on.
-    def arm_paired(topic_module):
+    def slot_paired(topic_module):
         return lambda: topic_module.paired(node_runner) is not None
 
     hands = tuple(
@@ -305,7 +305,8 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
             handedness=handedness,
             clutch=HandClutch(settings.motion_scale),
             measured=LatestPose(),
-            arm_paired=arm_paired(wiring.pose_setpoints),
+            arm_paired=slot_paired(wiring.pose_setpoints),
+            gripper_paired=slot_paired(wiring.gripper_setpoints),
         )
         for handedness, wiring in _HANDS.items()
     )
