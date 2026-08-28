@@ -182,14 +182,14 @@ class DeviceLoop(DeviceThread):
         # can re-disable it), and a disabled motor still answers position
         # reads. A launch must not report ready around a limp joint.
         temps_c, load_fractions, torque_enabled, fault_bits = self._read_health_validated()
-        disabled = [name for name, on in zip(MOTOR_NAMES, torque_enabled) if not on]
+        disabled = [name for name, on in zip(MOTOR_NAMES, torque_enabled, strict=True) if not on]
         if disabled:
             raise RuntimeError(f"torque did not enable at bringup: {', '.join(disabled)}")
         # A latched servo fault (e.g. overload) survives reconnects and cuts
         # output while Torque_Enable stays 1; refuse to report ready over it.
         faulted = [
             f"{name} ({describe_faults(bits)})"
-            for name, bits in zip(MOTOR_NAMES, fault_bits)
+            for name, bits in zip(MOTOR_NAMES, fault_bits, strict=True)
             if bits != 0
         ]
         if faulted:
@@ -209,7 +209,7 @@ class DeviceLoop(DeviceThread):
         goals: dict[str, float] = {}
         arm = self._arm_target.fresh(self._stale_timeout_s)
         if arm is not None:
-            goals.update(zip(JOINT_NAMES, arm))
+            goals.update(zip(JOINT_NAMES, arm, strict=True))
         gripper = self._gripper_target.fresh(self._stale_timeout_s)
         if gripper is not None:
             goals[GRIPPER_NAME] = gripper

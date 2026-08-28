@@ -129,7 +129,13 @@ def test_servo_fault_bits_fault_the_motor_with_a_decoded_alert():
 def test_describe_faults_decodes_known_bits_and_falls_back():
     assert describe_faults(32) == "overload"
     assert describe_faults(1 | 8) == "voltage, overcurrent"
-    assert describe_faults(64) == "code 64"
+    assert describe_faults(64) == "unknown bits 0x40"
+    # The bug this guards: an unnamed bit arriving beside a named one used to
+    # vanish, reporting a motor as merely overheating.
+    assert describe_faults(4 | 64) == "overheating, unknown bits 0x40"
+    # Bit 16 has no name in the table and must not be silently dropped.
+    assert describe_faults(16) == "unknown bits 0x10"
+    assert describe_faults(0) == "no fault"
 
 
 def test_silent_bus_reports_no_fault_bits():

@@ -244,11 +244,11 @@ async def _publish_readouts(
         measured = coordinator.measured_joints.fresh(state_timeout_s)
         if measured is None:
             continue
-        timestamp = coordinator.measured_joints.wire_timestamp_s
-        assert timestamp is not None, (
-            "the relay sets the capture stamp with the value it belongs to"
-        )
         try:
+            timestamp = coordinator.measured_joints.wire_timestamp_s
+            assert timestamp is not None, (
+                "the relay sets the capture stamp with the value it belongs to"
+            )
             position, orientation = kinematics.forward_kinematics(measured)
             if pose_publisher is not None:
                 await pose_publisher.publish(

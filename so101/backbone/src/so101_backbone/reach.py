@@ -53,7 +53,7 @@ class ReachBall:
         if distance <= self.radius:
             return position
         scale = self.radius / distance
-        return tuple(c + (p - c) * scale for c, p in zip(self.center, position))
+        return tuple(c + (p - c) * scale for c, p in zip(self.center, position, strict=True))
 
 
 def _pan_axis_xy(kinematics) -> tuple[float, float]:

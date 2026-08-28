@@ -452,5 +452,5 @@ class Coordinator:
         clamped = self._limits.clamp(solution)
         return tuple(
             rate_step(anchor, target, cap)
-            for anchor, target, cap in zip(seed, clamped, self._pose_joint_tick_caps)
+            for anchor, target, cap in zip(seed, clamped, self._pose_joint_tick_caps, strict=True)
         )

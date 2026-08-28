@@ -90,9 +90,6 @@ async def serve(
             await asyncio.wait([cancelled, next_goal], return_when=asyncio.FIRST_COMPLETED)
             if not next_goal.done():
                 next_goal.cancel()
-                # A decide may have claimed just before shutdown cancelled
-                # the accept round-trip.
-                layer.abandon(pending)
                 return
             try:
                 ctx = next_goal.result()
@@ -119,6 +116,12 @@ async def serve(
             task.add_done_callback(drive_tasks.discard)
     finally:
         cancelled.cancel()
+        # Every exit from the loop above can leave an admission claimed: a
+        # decide that landed just before shutdown, or a closed handler
+        # returning mid-round-trip. Unwalked, the limb stays claimed and
+        # teleop is ignored for good. Idempotent, so the paths that walk it
+        # back and carry on stay correct.
+        layer.abandon(pending)
         # A goal in flight at shutdown waits on a plan the stopped control
         # loop will never finish; its finally releases the claimed slot.
         for task in drive_tasks:
@@ -402,6 +405,19 @@ class ActionLayer:
                     )
                     return
                 duration_s = max(goal.duration_s, self._ee_floor_s(kinematics, seed, goal))
+                if duration_s > MAX_REQUESTED_DURATION_S:
+                    # The requested duration was admitted against this ceiling,
+                    # but the EE speed caps can raise it past one. Stretching
+                    # anyway would hold the arm slot for longer than any goal
+                    # is allowed to, so the move is refused instead.
+                    position, orientation = kinematics.forward_kinematics(seed)
+                    await _complete_guarded(
+                        ctx, False,
+                        f"the end-effector speed caps need {duration_s:.0f}s for this "
+                        f"move, beyond the {MAX_REQUESTED_DURATION_S:.0f}s ceiling",
+                        list(position), list(orientation), time.monotonic() - started,
+                    )
+                    return
                 profile = minimum_jerk.plan(
                     seed, solution, duration_s, self._config.max_joint_velocity_rad_s
                 )

@@ -54,10 +54,21 @@ _FAULT_BIT_NAMES = (
 )
 
 
+# Every bit the table above can name. A Status value carrying anything else
+# is a fault this build does not know about, and dropping it would report a
+# motor as merely overheating when it also raised something unrecognised.
+_NAMED_FAULT_BITS = sum(bit for bit, _ in _FAULT_BIT_NAMES)
+
+
 def describe_faults(bits: int) -> str:
-    """Human name(s) for a nonzero Status register value."""
+    """Human name(s) for a Status register value. Bits with no name are
+    reported as themselves rather than dropped, so a fault this build does
+    not recognise still reaches the operator."""
     names = [name for bit, name in _FAULT_BIT_NAMES if bits & bit]
-    return ", ".join(names) if names else f"code {bits}"
+    unnamed = bits & ~_NAMED_FAULT_BITS
+    if unnamed:
+        names.append(f"unknown bits 0x{unnamed:02x}")
+    return ", ".join(names) if names else "no fault"
 
 
 class SustainedLoads:
@@ -74,7 +85,7 @@ class SustainedLoads:
             return self._values
         alpha = 1.0 - math.exp(-max(dt_s, 0.0) / self._tau_s)
         self._values = tuple(
-            prev + alpha * (now - prev) for prev, now in zip(self._values, loads)
+            prev + alpha * (now - prev) for prev, now in zip(self._values, loads, strict=True)
         )
         return self._values
 
@@ -177,7 +188,7 @@ class AlertTracker:
         call, where a condition is the level plus its fault bits (a fault
         that changes cause re-alerts at the same level)."""
         changed = []
-        for motor, level, bits in zip(MOTOR_NAMES, report.levels, report.fault_bits):
+        for motor, level, bits in zip(MOTOR_NAMES, report.levels, report.fault_bits, strict=True):
             if self._conditions.get(motor, (LEVEL_NOMINAL, 0)) != (level, bits):
                 self._conditions[motor] = (level, bits)
                 changed.append(self._alert(motor, level, bits))

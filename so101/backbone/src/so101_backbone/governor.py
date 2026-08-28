@@ -54,4 +54,4 @@ class EEGovernor:
         )
         if scale >= 1.0:
             return target
-        return tuple(c + scale * (t - c) for c, t in zip(current, target))
+        return tuple(c + scale * (t - c) for c, t in zip(current, target, strict=True))
