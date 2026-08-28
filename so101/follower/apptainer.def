@@ -1,0 +1,36 @@
+Bootstrap: docker
+From: peppybot/python-uv-base:latest
+
+%labels
+    Name so101_follower
+    Version 0.1.0
+
+%environment
+    export PATH="/opt/so101_follower/.venv/bin:$PATH"
+
+%files
+    . /opt/so101_follower
+
+%post
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+    # uv resolves the shared libs as git dependencies; the base image has no git.
+    apt-get update -qq
+    apt-get install -qqy --no-install-recommends git
+    rm -rf /var/lib/apt/lists/*
+    # uv defaults its managed interpreter under $HOME (/root at build time);
+    # a daemon running as root mounts its home over that and the node dies
+    # with ./.venv/bin/python: not found.
+    export UV_PYTHON_INSTALL_DIR=/opt/uv-python
+
+    cd /opt/so101_follower
+    uv python install
+    # --no-dev keeps the test-only group out of the runtime image.
+    # --locked fails the build on a stale lockfile instead of re-resolving.
+    uv sync --locked --no-editable --no-dev
+
+%runscript
+    cd /opt/so101_follower
+    # -u: stdout to the daemon is a pipe, so buffered diagnostics would be
+    # lost when the shutdown grace window force-kills the process.
+    exec ./.venv/bin/python -u -m so101_follower

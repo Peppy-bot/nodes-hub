@@ -1,0 +1,60 @@
+// so101_leader: commander entry point driven by the SO-101 leader arm,
+// lerobot's name for the passive twin of the follower (same six STS3215
+// servos, mixed gearing for light feel, torque disabled throughout). The
+// node is named after that hardware; on the wire it is one commander among
+// several, playing the leader role of the joint_link / gripper_link
+// pairings into the backbone exactly like xr_commander plays it on
+// pose_link. Reads joint positions off the serial bus, maps them to radians
+// and the gripper to an opening fraction, and streams both. The state
+// back-channels are not consumed (this commander is open loop).
+//
+// The SO-101 leader has no engage button, so the default deadman is
+// staleness alone: a silent or unplugged device stops the stream within
+// stale_timeout_s and the follower holds.
+{
+  peppy_schema: "node/v1",
+  manifest: {
+    name: "so101_leader",
+    tag: "v1",
+    depends_on: {
+      pairings: [
+        { name: "joint_link", tag: "v1", role: "leader", link_id: "arm", optional: true },
+        { name: "gripper_link", tag: "v1", role: "leader", link_id: "gripper", optional: true },
+      ],
+    },
+  },
+  interfaces: {
+    topics: {
+      emits: [
+        { link_id: "arm", name: "joint_setpoints", refine: { message_format: { positions: { $length: 5 } } } },
+        { link_id: "gripper", name: "gripper_setpoints" },
+      ],
+    },
+  },
+  execution: {
+    language: "python",
+    container: {
+      def_file: "apptainer.def",
+      mount_paths: [
+        "${parameters:device_path}:${parameters:device_path}:rw",
+        "${parameters:calibration_dir}",
+      ],
+    },
+    parameters: {
+      // Serial device of the leader's motor bus (stable udev symlink).
+      device_path: "string",
+      // Host directory of lerobot calibration JSONs; the file used is
+      // <calibration_dir>/<teleop_id>.json, written by lerobot-calibrate.
+      // The node refuses to start uncalibrated.
+      calibration_dir: "string",
+      // Calibration identity (file stem) of this leader arm.
+      teleop_id: "string",
+      // Rate (Hz) the device is read and fresh setpoints are published at.
+      command_rate_hz: "u32",
+      // Stop publishing when the newest read is older than this (s); the
+      // follower then holds. Must be at least two read periods, or the
+      // phase-independent publish ticks would flap.
+      stale_timeout_s: { $type: "f64", $default: 0.25 },
+    },
+  },
+}
