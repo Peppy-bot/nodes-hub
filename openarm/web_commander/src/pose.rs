@@ -87,7 +87,7 @@ impl ArmModels {
 
     /// World-frame end-effector pose of `joints` for `side`.
     pub fn ee_pose_world(&self, side: Side, joints: &[f64; ARM_DOF]) -> Pose {
-        let mut model = self.get(side).lock().unwrap_or_else(|p| p.into_inner());
+        let model = self.get(side).lock().unwrap_or_else(|p| p.into_inner());
         let base = model.at(joints).ee_pose();
         decompose(&model.world_pose(&base))
     }
@@ -95,7 +95,7 @@ impl ArmModels {
     /// World-frame end-effector orientation of `joints` as a quaternion `[x, y, z, w]`,
     /// for the panel's arcball (which composes orientation on quaternions, never euler).
     pub fn ee_quat_world(&self, side: Side, joints: &[f64; ARM_DOF]) -> [f64; 4] {
-        let mut model = self.get(side).lock().unwrap_or_else(|p| p.into_inner());
+        let model = self.get(side).lock().unwrap_or_else(|p| p.into_inner());
         let base = model.at(joints).ee_pose();
         let q = model.world_pose(&base).rotation;
         [q.i, q.j, q.k, q.w]
@@ -196,7 +196,7 @@ impl ArmModels {
             RateTask::Angular(dx) => (Vector3::zeros(), dx),
         };
         let q = {
-            let mut model = self.get(side).lock().unwrap_or_else(|p| p.into_inner());
+            let model = self.get(side).lock().unwrap_or_else(|p| p.into_inner());
             model.rate_step(
                 joints,
                 dp_world,
