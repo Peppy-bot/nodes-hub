@@ -62,6 +62,21 @@ def _scene_path(hardware_version: str) -> Path:
 
 _ROBOTS_DIR = Path(__file__).resolve().parents[1]
 
+# State is published once per rendered frame, so the frame cost bounds the
+# state cadence the backbone sees. Measured on an RTX 5090 laptop with the
+# warehouse scene: path tracing at 2 spp with the denoiser is both faster and
+# cleaner than ray-traced lighting, and 1920x1080 costs 60 to 80 ms per frame
+# while the arms move, past the backbone's stale window; this size stays inside
+# it. The livestream shows this frame.
+_RENDER_CONFIG = {
+    "renderer": "PathTracing",
+    "width": 1280,
+    "height": 720,
+    "samples_per_pixel_per_frame": 2,
+    "denoiser": True,
+    "max_bounces": 2,
+}
+
 _ready = threading.Event()
 _stop = threading.Event()
 
@@ -277,12 +292,7 @@ def main() -> None:
 
     launch_config = {
         "headless": handoff.headless,
-        "renderer": "PathTracing",
-        "width": 1920,
-        "height": 1080,
-        "samples_per_pixel_per_frame": 2,
-        "denoiser": True,
-        "max_bounces": 2,
+        **_RENDER_CONFIG,
     }
 
     if handoff.headless:

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -14,6 +15,10 @@ from bridge_extension import IsaacBridgeExtension
 from runtime_commander_server import RuntimeCommanderServer
 
 logger = logging.getLogger(__name__)
+
+# A loop iteration longer than this is logged with its phase breakdown: the
+# state stream rides the loop, so a long iteration is a gap the backbone sees.
+_SLOW_ITERATION_S = 0.05
 
 _WARMUP_STEPS = 100
 
@@ -2352,7 +2357,9 @@ class SimLauncher:
                 # bridge step on the same thread (Articulation reads require
                 # Isaac's main thread). The extension defers its own setup until
                 # the stage is live, so early steps are cheap no-ops.
+                iteration_start = time.monotonic()
                 self._sim_app.update()
+                update_s = time.monotonic() - iteration_start
 
                 if self._extension is not None:
                     self._extension.step()
@@ -2383,6 +2390,15 @@ class SimLauncher:
                 self._update_runtime_forces()
 
                 self._apply_runtime_arm_targets()
+
+                iteration_s = time.monotonic() - iteration_start
+                if iteration_s > _SLOW_ITERATION_S:
+                    logger.warning(
+                        "slow loop iteration %.1f ms (update %.1f ms, bridge and runtime %.1f ms)",
+                        iteration_s * 1e3,
+                        update_s * 1e3,
+                        (iteration_s - update_s) * 1e3,
+                    )
 
     def _shutdown(self) -> None:
         self._ready.clear()
