@@ -36,7 +36,7 @@ Between them, each of the three cross-machine mechanisms appears exactly once.
   instance the policy reads locally. Both name it identically; neither records
   which machine it runs on.
 - **Pairing.** `deliberation` (in
-  [`contracts-hub`](https://github.com/Peppy-bot/contracts-hub), roles `planner`
+  [`pairings-hub`](https://github.com/Peppy-bot/pairings-hub), roles `planner`
   and `executor`) connects the policy and the planner. It is a pairing rather
   than two producer links because the relationship is bidirectional and
   exclusive: each side holds a pinned view of exactly one counterpart.
