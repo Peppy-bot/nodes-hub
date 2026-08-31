@@ -136,6 +136,9 @@
       hardware_version: "string",
 
       // Rate in Hz of the measured joint_states / gripper_states streams.
+      // On a launch that declares this engine its source of simulated time, the
+      // same rate is how often the fleet's clock advances, so it also sets how
+      // finely every machine of that launch can read time.
       state_rate_hz: "u32",
 
       // Run Isaac Sim headless.

@@ -73,6 +73,9 @@
       // Required so the sim matches the real deployment it stands in for.
       hardware_version: "string",
       // Rate (Hz) of the measured-state streams (joint_states / gripper_states).
+      // On a launch that declares this engine its source of simulated time, the
+      // same rate is how often the fleet's clock advances, so it also sets how
+      // finely every machine of that launch can read time.
       state_rate_hz: "u32",
       // Run without a native viewer window (the deployment default). "Headless"
       // here means no local GUI window, not no viewer: this mode serves the

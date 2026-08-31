@@ -3,9 +3,9 @@
 """IsaacBridgeExtension owns the per-step bridge for the openarm Isaac scene.
 Isaac's sim_app.update() advances physics on the main thread; each step this
 extension applies the latest sim-passthrough setpoint per side, reads the
-measured joint and gripper state, and (throttled to state_rate_hz) publishes it.
-Transport is typed peppygen via SimTopicIO; there is no JSON and no raw
-peppylib on the path.
+measured joint and gripper state, and (throttled to state_rate_hz) publishes
+Isaac's own timeline clock followed by the state it stamps. Transport is typed
+peppygen via SimTopicIO; there is no JSON and no raw peppylib on the path.
 """
 from __future__ import annotations
 
@@ -193,12 +193,25 @@ class IsaacBridgeExtension:
             return
 
         self._apply_commands()
+        # The timeline is Isaac's own clock, advanced by sim_app.update(), so
+        # a stopped timeline stops advancing it. Recorded ahead of every
+        # stamp of this step, the camera captures included.
+        self._io.record_engine_time(self._engine_time_s())
         if self._camera_sensor is not None:
             self._camera_sensor.step()
 
         if not self._state_pacer.take_if_due(time.monotonic()):
             return
+        # Published before the state it stamps; a stopped timeline stops the
+        # fleet's time with it.
+        self._io.publish_sim_time()
         self._publish_state()
+
+    def _engine_time_s(self) -> float:
+        """Isaac's simulated time, in seconds since the timeline started."""
+        import omni.timeline  # pylint: disable=C0415
+
+        return float(omni.timeline.get_timeline_interface().get_current_time())
 
     def _apply_commands(self) -> None:
         for arm in self._arms:
