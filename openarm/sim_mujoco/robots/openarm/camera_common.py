@@ -239,9 +239,11 @@ class FrameIdCounter:
 
 class FramePacer:
     """Absolute-deadline pacing at a fixed fps against a monotonic clock.
-    Deadlines advance by exact periods so the long-run rate holds; after a
-    stall longer than one period the schedule resyncs to now instead of
-    bursting to catch up."""
+    Deadlines advance by exact periods so the long-run rate holds. The grid
+    may trail the clock by under one period, so ticks arriving at the paced
+    rate with jitter are all taken rather than every other one; once it
+    trails by a full period the schedule resyncs to now instead of bursting
+    to catch up."""
 
     def __init__(self, fps: int) -> None:
         if fps <= 0:
@@ -258,6 +260,6 @@ class FramePacer:
         if now < self._deadline:
             return False
         self._deadline += self._period
-        if now >= self._deadline:
+        if now - self._deadline >= self._period:
             self._deadline = now + self._period
         return True

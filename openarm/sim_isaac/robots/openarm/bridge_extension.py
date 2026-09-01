@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pyjson5
 
-from camera_common import load_camera_configs, validate_camera_slots
+from camera_common import FramePacer, load_camera_configs, validate_camera_slots
 from sim_topics import COLOR_CAMERA_SLOT_NAMES, RGBD_CAMERA_SLOT_NAMES, SimTopicIO
 from exts import IsaacActuatorCtrl, IsaacArticulation, IsaacCameraSensor, IsaacGripperSensor
 
@@ -62,18 +62,18 @@ class IsaacBridgeExtension:
 
     def __init__(self, io: SimTopicIO, state_rate_hz: int, cameras_enabled: bool) -> None:
         self._io = io
-        # Telemetry is throttled to state_rate_hz: serializing every reader at
-        # the physics tick saturates the single sim thread. Writers and the
-        # physics step still run every tick.
+        # State publishes ride an absolute grid at state_rate_hz, evaluated once
+        # per rendered frame: physics advances inside sim_app.update(), so a
+        # frame is the finest cadence there is, and a request at or above the
+        # frame rate publishes every frame.
         if state_rate_hz <= 0:
             raise ValueError(f"state_rate_hz must be positive, got {state_rate_hz}")
+        self._state_pacer = FramePacer(state_rate_hz)
         # Signed full-open travel per finger joint, read from the articulation's
         # DOF limits at setup; commanded opening fractions scale onto it.
         self._gripper_travels: dict[int, list[float]] = {}
         # Last force limit written per gripper, so the cap is not re-sent per tick.
         self._applied_effort: dict[int, float] = {}
-        self._telemetry_period_s = 1.0 / state_rate_hz
-        self._last_publish_s = 0.0
 
         cfg = pyjson5.loads(_CONFIG_PATH.read_text())
         self._arms: list[dict] = cfg["arms"]
@@ -188,7 +188,7 @@ class IsaacBridgeExtension:
 
     def step(self) -> None:
         """Physics has already advanced in sim_app.update(); apply the latest
-        commands and (throttled) publish measured state."""
+        commands and, when the state grid is due, publish measured state."""
         if not self._try_setup():
             return
 
@@ -196,10 +196,8 @@ class IsaacBridgeExtension:
         if self._camera_sensor is not None:
             self._camera_sensor.step()
 
-        now = time.monotonic()
-        if now - self._last_publish_s < self._telemetry_period_s:
+        if not self._state_pacer.take_if_due(time.monotonic()):
             return
-        self._last_publish_s = now
         self._publish_state()
 
     def _apply_commands(self) -> None:

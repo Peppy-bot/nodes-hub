@@ -71,6 +71,30 @@ async fn a_zero_control_rate_is_refused_by_name() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_zero_follower_rate_is_refused_by_name() {
+    // Four periods of a zero rate is an infinite window: the watchdog would
+    // never fire and an unseen limb would be driven indefinitely.
+    refusal_names("follower_state_rate_hz", |p| p.follower_state_rate_hz = 0).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_follower_rate_whose_window_is_under_one_control_period_is_refused_by_name() {
+    // Deliveries are observed once per tick, so a follower delivering every
+    // tick would still read as stale.
+    refusal_names("follower_state_rate_hz", |p| {
+        p.follower_state_rate_hz = 8 * p.control_rate_hz
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_follower_rate_whose_window_passes_the_ceiling_is_refused_by_name() {
+    // Four periods at 1 Hz is a 4 s window, which disarms the deadman rather
+    // than tuning it.
+    refusal_names("follower_state_rate_hz", |p| p.follower_state_rate_hz = 1).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_non_finite_joint_velocity_cap_is_refused_by_name() {
     // NaN reaches the chase as a clamp bound, where it disables the clamp
     // silently rather than tripping anything.

@@ -12,7 +12,6 @@ From: peppybot/openarm-isaac-sim:6.0.1-1
     export PEPPYGEN_OUTPUT_PATH="/opt/openarm_sim_isaac/.peppy/libs/peppygen"
     export PEPPY_BRIDGE_NODE_NAME=sim
     export PEPPY_BRIDGE_HEADLESS=${PEPPY_BRIDGE_HEADLESS:-1}
-    export PEPPY_ISAAC_RENDERER=${PEPPY_ISAAC_RENDERER:-RayTracedLighting}
     export PEPPY_ROBOT_ASSETS_DIR=${PEPPY_ROBOT_ASSETS_DIR:-/opt/robot_assets/openarm/isaac}
 
 %files
