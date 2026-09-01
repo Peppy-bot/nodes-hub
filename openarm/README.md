@@ -28,11 +28,12 @@ This guide takes you from a fresh machine to a moving arm. MuJoCo is the quickes
 - Docker, running
 - For Isaac only: an NVIDIA GPU with the [Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) configured
 
-Clone this repo together with [contracts-hub](https://github.com/Peppy-bot/contracts-hub) (the contracts) and [launchers-hub](https://github.com/Peppy-bot/launchers-hub) (the stack launchers) so the paths below line up:
+Clone this repo together with [contracts-hub](https://github.com/Peppy-bot/contracts-hub) (the contracts), [pairings-hub](https://github.com/Peppy-bot/pairings-hub) (the pairings), and [launchers-hub](https://github.com/Peppy-bot/launchers-hub) (the stack launchers) so the paths below line up:
 
 ```text
 ws/
 ├── contracts-hub/
+├── pairings-hub/
 ├── launchers-hub/
 └── openarm-nodes/
 ```
@@ -45,6 +46,7 @@ The daemon builds, runs, and connects every node. Registering the repos is what 
 peppy service serve &
 
 peppy repo add /path/to/ws/contracts-hub
+peppy repo add /path/to/ws/pairings-hub
 peppy repo add /path/to/ws/openarm-nodes
 peppy repo add /path/to/ws/nodes-hub
 peppy repo add /path/to/ws/launchers-hub

@@ -23,7 +23,7 @@ Implement these and bind them in a launcher. No code here changes.
 | `rgbd_camera/v1` | contract | implementer | `rgbd_cameras` (any number, colour half only) |
 | `postures/v1` | contract | implementer | `postures` (any number; the first bound producer takes the face buttons) |
 
-Both pairings are defined in `contracts-hub` (`robot/pose_link.json5`,
+Both pairings are defined in `pairings-hub` (`robot/pose_link.json5`,
 `robot/gripper_link.json5`). On the wire: positions are metres, orientations
 are unit quaternions `[x, y, z, w]` (scalar last), and both directions of
 `pose_link` speak the follower's world frame. A gripper opening is a fraction
