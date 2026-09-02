@@ -1,6 +1,6 @@
 # openarm Nodes
 
-[Peppy](https://github.com/Peppy-bot/peppy) nodes for the OpenArm bimanual robot (v1.0 and v2.0). The full stack lets you drive two 7-DOF arms and two grippers from your browser, against the real robot, Isaac Sim, or MuJoCo. The nodes and the UI stay the same; only the launcher changes.
+[Peppy](https://github.com/Peppy-bot/peppy) nodes for the OpenArm bimanual robot (v1.0 and v2.0). The full stack lets you drive two 7-DOF arms and two grippers from your browser, against the real robot, Isaac Sim, MuJoCo, or Waldo. The nodes and the UI stay the same; only the launcher changes.
 
 | Component | What it does |
 |---|---|
@@ -11,13 +11,16 @@
 | [`openarm_gripper_sim`](./openarm_gripper_sim) | relays one gripper side between the backbone and a sim engine |
 | [`openarm_sim_mujoco`](./openarm_sim_mujoco) | MuJoCo engine: the physics behind the relays |
 | [`openarm_sim_isaac`](./openarm_sim_isaac) | Isaac Sim engine: the physics behind the relays |
+| `waldo` | Waldo engine: the physics behind the relays, with a Bevy browser viewer; lives in the separate `private-nodes-hub` repository, not in this hub |
 | [`openarm_backbone`](./openarm_backbone) | routes goals to the correct side |
 | [`openarm_commander`](./openarm_commander) | browser control panel |
 | [`openarm_ker`](./openarm_ker) | streams joint setpoints from a physical leader arm |
 | [`openarm_isaac_webviewer`](./openarm_isaac_webviewer) | serves the Isaac Sim WebRTC browser viewer |
-| [`openarm_scene_commander`](./openarm_scene_commander) | browser scene/object/physics control for Isaac Sim |
+| [`openarm_scene_commander`](./openarm_scene_commander) | browser scene/object/physics control for any engine implementing the `scene_control` contract (the Isaac Sim engine and the Waldo engine) |
 
-Sim support splits into engine-agnostic relays plus one node per engine: `openarm_arm_sim` and `openarm_gripper_sim` face the backbone exactly like the real nodes and lead the matching limb slot on the engine node (`openarm_sim_mujoco` or `openarm_sim_isaac`), which owns the physics and models v1.0 or v2.0 hardware via its `hardware_version` parameter. The launcher decides which nodes fill each slot, so the backbone and the UI never know which engine is underneath.
+Sim support splits into engine-agnostic relays plus one node per engine: `openarm_arm_sim` and `openarm_gripper_sim` face the backbone exactly like the real nodes and lead the matching limb slot on the engine node (`openarm_sim_mujoco` or `openarm_sim_isaac`, which model v1.0 or v2.0 hardware via their `hardware_version` parameter, or `waldo`, which names its world via `world`), which owns the physics. The launcher decides which nodes fill each slot, so the backbone and the UI never know which engine is underneath.
+
+The third engine, `waldo`, is published by the `private-nodes-hub` repository rather than this hub. Its launcher option is `waldo`, and its Bevy browser viewer is served over https on port 8080 with a self-signed certificate.
 
 This guide takes you from a fresh machine to a moving arm. MuJoCo is the quickest way to see everything working. The Isaac browser stack (WebRTC viewer plus Scene Commander) is covered in its own section below.
 
@@ -97,7 +100,13 @@ For Isaac, swap the engine node; the relays, initializer, backbone, and commande
 peppy node add /path/to/ws/openarm-nodes/openarm_sim_isaac -sb --idle-timeout 18000
 ```
 
-The `sim_cameras` launcher option, on either engine, additionally needs the camera relay nodes, which live in the separate [nodes-hub](https://github.com/Peppy-bot/nodes-hub) repo because nothing in them is OpenArm-specific:
+For Waldo, the engine node comes from the `private-nodes-hub` repository: register it with `peppy repo add /path/to/ws/private-nodes-hub` (then `peppy repo refresh`) and build it with the same larger timeout:
+
+```sh
+peppy node add /path/to/ws/private-nodes-hub/waldo -sb --idle-timeout 18000
+```
+
+The `sim_cameras` launcher option, on any engine, additionally needs the camera relay nodes, which live in the separate [nodes-hub](https://github.com/Peppy-bot/nodes-hub) repo because nothing in them is OpenArm-specific:
 
 ```sh
 peppy node add /path/to/ws/nodes-hub/sim_rgb_camera -sb --idle-timeout 1800
@@ -135,13 +144,16 @@ The `--with=` selection names the engine, so pick the one matching the nodes bui
 peppy stack launch openarm_v2 --with=mujoco
 # Isaac
 peppy stack launch openarm_v2 --with=isaac_sim
+# Waldo
+peppy stack launch openarm_v2 --with=waldo
 ```
 
 The launcher starts the instances in dependency order (sim first, then arms and grippers, then backbone, then the UI) and wires them together. Once it prints `Launch complete`:
 
 - open **http://localhost:8765** for the control panel, one slider per joint
 - MuJoCo: open **http://localhost:8080** for the browser viewer
-- Isaac: open **http://<ISAAC_HOST_IP>:8210** for the WebRTC browser viewer (see the [Isaac browser stack](#isaac-browser-stack--webrtc-viewer-and-scene-commander) section below)
+- Waldo: open **https://localhost:8080** for the Bevy browser viewer (accept the self-signed certificate once)
+- Isaac: open **http://<ISAAC_HOST_IP>:8210** for the WebRTC browser viewer (see the [Isaac browser stack](#isaac-browser-stack-webrtc-viewer-and-scene-commander) section below)
 
 Move a slider, press **Send**, and watch the arm follow in the viewer. The launchers themselves are documented in [launchers-hub/openarm](https://github.com/Peppy-bot/launchers-hub/tree/main/openarm). Check the stack's health any time:
 
@@ -157,7 +169,7 @@ peppy node stop commander_inst
 
 ---
 
-# Isaac browser stack — WebRTC viewer and Scene Commander
+# Isaac browser stack: WebRTC viewer and Scene Commander
 
 The Isaac stack streams to a plain browser over WebRTC and adds two browser tools on top of the sim: the **Isaac viewer** (live video at `:8210`) and the **Scene Commander** (scene/object/physics control at `:8766`). This section covers the WebRTC configuration and what each tool does.
 
@@ -241,7 +253,7 @@ When working directly on the Isaac machine:
 http://127.0.0.1:8766
 ```
 
-Scene Commander is used to construct and modify the Isaac environment while the simulator is running.
+Scene Commander is used to construct and modify the simulated environment while the simulator is running. It drives any engine implementing the `scene_control` contract: the Isaac Sim engine and the Waldo engine (`peppy stack launch openarm_v2 --with=waldo,scene_commander`).
 
 ### Scene controls
 

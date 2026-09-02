@@ -4,8 +4,9 @@
 // pairing: governed arm/gripper setpoints arrive from the simulation relay
 // nodes and measured state streams back.
 //
-// The node also exposes runtime scene/object services and actions intended to
-// be consumed by higher-level tools such as openarm_scene_commander.
+// The node also implements the scene_control contract on its scene slot:
+// runtime scene/object services and actions consumed by higher-level tools
+// such as openarm_scene_commander.
 //
 // Public Peppy interfaces use stable asset_id and object_id identifiers rather
 // than exposing Isaac USD paths directly. The existing TCP runtime commander
@@ -16,6 +17,12 @@
   manifest: {
     name: "openarm_sim_isaac",
     tag: "v1",
+
+    // The scene-editing contract, implemented on the scene slot: any
+    // commander that speaks scene_control can drive this engine.
+    implements: [
+      { name: "scene_control", tag: "v1", link_id: "scene" },
+    ],
 
     depends_on: {
       pairings: [
@@ -44,47 +51,14 @@
     // ------------------------------------------------------------------
     // Runtime scene/object discovery services
     // ------------------------------------------------------------------
+    //
+    // Formats and field semantics are defined by scene_control:v1 in
+    // contracts-hub. asset_id and object_id are stable identifiers; the
+    // catalogue keeps raw Isaac USD paths private to this node.
     services: {
       exposes: [
-        {
-          // Return the Isaac-side asset catalogue.
-          //
-          // assets_json is a JSON-encoded array whose entries contain
-          // application-facing metadata such as:
-          //
-          //   asset_id
-          //   display_name
-          //   kind
-          //
-          // The catalogue keeps raw Isaac USD paths private to this node.
-          name: "get_assets_list",
-
-          response_message_format: {
-            success: "bool",
-            message: "string",
-            assets_json: "string",
-          },
-        },
-
-        {
-          // Return currently spawned runtime objects.
-          //
-          // objects_json is a JSON-encoded array whose entries contain
-          // runtime metadata such as:
-          //
-          //   object_id
-          //   asset_id
-          //   position
-          //
-          // This allows clients to rediscover scene state after reconnecting.
-          name: "get_objects_list",
-
-          response_message_format: {
-            success: "bool",
-            message: "string",
-            objects_json: "string",
-          },
-        },
+        { link_id: "scene", name: "get_assets_list" },
+        { link_id: "scene", name: "get_objects_list" },
       ],
     },
 
@@ -92,193 +66,18 @@
     // Runtime scene/object actions
     // ------------------------------------------------------------------
     //
-    // These are discrete operations rather than continuously streamed
-    // topics. The action implementation enqueues the requested command onto
-    // the Isaac simulation thread and reuses
-    // SimLauncher.execute_runtime_command().
+    // Formats and field semantics are defined by scene_control:v1 in
+    // contracts-hub. Each action enqueues its command onto the Isaac
+    // simulation thread through SimLauncher.execute_runtime_command().
     actions: {
       exposes: [
-        {
-          // Load or replace /World/RuntimeScene using an asset from the
-          // Isaac-side catalogue.
-          //
-          // asset_id is obtained from get_assets_list().
-          name: "load_scene",
-
-          goal_service: {
-            request_message_format: {
-              asset_id: "string",
-              scale: "f64",
-            },
-          },
-
-          result_service: {
-            response_message_format: {
-              success: "bool",
-              message: "string",
-            },
-          },
-        },
-
-        {
-          // Remove the currently loaded /World/RuntimeScene and clear runtime
-          // scene state managed by the scene commander.
-          name: "clear_scene",
-
-          goal_service: {},
-
-          result_service: {
-            response_message_format: {
-              success: "bool",
-              message: "string",
-            },
-          },
-        },
-
-        {
-          // Spawn one instance of an asset from the Isaac-side catalogue.
-          //
-          // asset_id is obtained from get_assets_list().
-          //
-          // Isaac owns runtime object identity and returns a unique object_id
-          // for the newly created instance.
-          //
-          // physics:
-          //   "none"
-          //   "static"
-          //   "dynamic"
-          //
-          // mass is interpreted in kilograms when dynamic physics is used.
-          name: "spawn_object",
-
-          goal_service: {
-            request_message_format: {
-              asset_id: "string",
-
-              position: {
-                $type: "array",
-                $items: "f64",
-                $length: 3,
-              },
-
-              scale: "f64",
-              physics: "string",
-              mass: "f64",
-            },
-          },
-
-          result_service: {
-            response_message_format: {
-              success: "bool",
-              message: "string",
-
-              // Unique runtime instance identifier.
-              // Empty when spawning fails.
-              object_id: "string",
-            },
-          },
-        },
-
-        {
-          // Move one particular runtime object instance.
-          //
-          // object_id is returned by spawn_object() or discovered through
-          // get_objects_list().
-          name: "move_object",
-
-          goal_service: {
-            request_message_format: {
-              object_id: "string",
-
-              position: {
-                $type: "array",
-                $items: "f64",
-                $length: 3,
-              },
-            },
-          },
-
-          result_service: {
-            response_message_format: {
-              success: "bool",
-              message: "string",
-            },
-          },
-        },
-
-        {
-          // Remove one particular runtime object instance.
-          //
-          // object_id is returned by spawn_object() or discovered through
-          // get_objects_list().
-          name: "remove_object",
-
-          goal_service: {
-            request_message_format: {
-              object_id: "string",
-            },
-          },
-
-          result_service: {
-            response_message_format: {
-              success: "bool",
-              message: "string",
-            },
-          },
-        },
-
-        {
-          // Apply a world-frame force to a spawned dynamic object.
-          //
-          // force = [Fx, Fy, Fz] in Newtons.
-          // duration_s controls how long PhysX keeps the force enabled.
-          name: "apply_force",
-
-          goal_service: {
-            request_message_format: {
-              object_id: "string",
-
-              force: {
-                $type: "array",
-                $items: "f64",
-                $length: 3,
-              },
-
-              duration_s: "f64",
-            },
-          },
-
-          result_service: {
-            response_message_format: {
-              success: "bool",
-              message: "string",
-            },
-          },
-        },
-
-        {
-          // Move the OpenArm robot root in the Isaac world frame.
-          //
-          // position = [x, y, z] in metres.
-          name: "move_robot",
-
-          goal_service: {
-            request_message_format: {
-              position: {
-                $type: "array",
-                $items: "f64",
-                $length: 3,
-              },
-            },
-          },
-
-          result_service: {
-            response_message_format: {
-              success: "bool",
-              message: "string",
-            },
-          },
-        },
+        { link_id: "scene", name: "load_scene" },
+        { link_id: "scene", name: "clear_scene" },
+        { link_id: "scene", name: "spawn_object" },
+        { link_id: "scene", name: "move_object" },
+        { link_id: "scene", name: "remove_object" },
+        { link_id: "scene", name: "apply_force" },
+        { link_id: "scene", name: "move_robot" },
       ],
     },
 

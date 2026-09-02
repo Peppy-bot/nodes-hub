@@ -7,20 +7,17 @@
 
     labels: [
       "openarm",
-      "isaac",
+      "simulation",
       "scene",
       "commander",
       "web",
     ],
 
     depends_on: {
-      nodes: [
-        {
-          name: "openarm_sim_isaac",
-          tag: "v1",
-          link_id: "simulation",
-          cardinality: "one",
-        },
+      // The scene editing surface of whichever simulation engine the
+      // launcher binds here.
+      contracts: [
+        { name: "scene_control", tag: "v1", link_id: "simulation" },
       ],
     },
   },

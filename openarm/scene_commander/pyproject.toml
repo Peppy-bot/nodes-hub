@@ -1,7 +1,7 @@
 [project]
 name = "openarm-scene-commander"
 version = "0.1.0"
-description = "Peppy web scene commander for OpenArm Isaac Sim"
+description = "Peppy web scene commander for OpenArm simulation engines"
 requires-python = ">=3.11"
 dependencies = [
     "aiohttp",
