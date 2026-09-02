@@ -2,9 +2,9 @@
 # pylint: disable=C0413
 """MujocoBridgeExtension owns the physics tick for the openarm scene. Each step
 it applies the latest sim-passthrough setpoint per side, advances physics, and
-(throttled to state_rate_hz) publishes the measured joint and gripper state.
-Transport is typed peppygen via SimTopicIO; there is no JSON and no raw
-peppylib on the path.
+(throttled to state_rate_hz) publishes MuJoCo's own clock followed by the
+measured joint and gripper state it stamps. Transport is typed peppygen via
+SimTopicIO; there is no JSON and no raw peppylib on the path.
 """
 from __future__ import annotations
 
@@ -155,12 +155,19 @@ class MujocoBridgeExtension:
 
         self._apply_commands()
         mujoco.mj_step(self._model, self._data)
+        # `data.time` is MuJoCo's own clock, advanced by mj_step above, so a
+        # paused engine stops advancing it. Recorded ahead of every stamp of
+        # this step, the camera snapshot included.
+        self._io.record_engine_time(float(self._data.time))
         if self._camera_sensor is not None:
             self._camera_sensor.snapshot(self._data.qpos)
             self._camera_sensor.raise_if_failed()
 
         if not self._state_pacer.take_if_due(time.monotonic()):
             return
+        # Published before the state it stamps; a stopped engine stops the
+        # fleet's time with it.
+        self._io.publish_sim_time()
         self._publish_state()
 
     def _apply_commands(self) -> None:
