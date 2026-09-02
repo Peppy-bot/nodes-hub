@@ -12,7 +12,7 @@ from concurrent.futures import Future
 from dataclasses import dataclass
 from queue import Empty, Queue
 
-from peppygen.exposed_actions import (
+from peppygen.exposed_actions.scene import (
     apply_force,
     clear_scene,
     load_scene,
@@ -21,7 +21,7 @@ from peppygen.exposed_actions import (
     remove_object,
     spawn_object,
 )
-from peppygen.exposed_services import (
+from peppygen.exposed_services.scene import (
     get_assets_list,
     get_objects_list,
 )
