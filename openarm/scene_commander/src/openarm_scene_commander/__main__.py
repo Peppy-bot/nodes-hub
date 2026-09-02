@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Web commander for OpenArm Isaac scenes through Peppy APIs."""
+"""Web commander for OpenArm simulation scenes through the scene_control contract."""
 
 from __future__ import annotations
 
@@ -799,7 +799,7 @@ HTML = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>OpenArm Isaac Scene Commander</title>
+<title>OpenArm Scene Commander</title>
 
 <style>
 :root {
@@ -929,7 +929,7 @@ button.danger {
 <body>
 
 <header>
-<h1>OpenArm Isaac Scene Commander</h1>
+<h1>OpenArm Scene Commander</h1>
 <p>Peppy-native runtime scene and object control</p>
 </header>
 
@@ -1090,7 +1090,7 @@ async function refreshAssets() {
 
     renderAssets();
 
-    status(`Loaded ${assets.length} Isaac assets`);
+    status(`Loaded ${assets.length} assets`);
 }
 
 function renderAssets() {
@@ -1620,7 +1620,7 @@ async def setup(
     )
 
     logger.info(
-        "Connected to Isaac provider: %d assets, %d runtime objects",
+        "Connected to scene provider: %d assets, %d runtime objects",
         len(assets),
         len(objects),
     )
