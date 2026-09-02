@@ -55,6 +55,13 @@ from peppygen.paired_topics.wrist_right import video_stream as wrist_right_video
 
 logger = logging.getLogger(__name__)
 
+# The clock topic reserves zero for "no tick observed yet", so the smallest
+# instant an engine can carry is one nanosecond. A timeline still sitting at
+# zero is a real instant rather than a fault, so it is floored to that
+# minimum: the states this engine stamps and the ticks the fleet reads then
+# carry the same instant instead of differing by the wire's own clamp.
+_MIN_ENGINE_TIME_S = 1e-9
+
 # Left = 0, right = 1: the slot layout mirrors the arm_id / gripper_id
 # convention the rest of the stack uses for sides.
 _ARM_SLOTS = {0: (left_arm_setpoints, left_arm_states), 1: (right_arm_setpoints, right_arm_states)}
@@ -298,7 +305,7 @@ class SimTopicIO:
             raise ValueError(
                 f"the engine clock produced a non-publishable instant: {engine_time_s!r}"
             )
-        self._engine_time_s = engine_time_s
+        self._engine_time_s = max(engine_time_s, _MIN_ENGINE_TIME_S)
 
     def publish_sim_time(self) -> None:
         """Publish the recorded engine clock to every machine of the launch,

@@ -144,6 +144,17 @@ def test_a_diverged_engine_clock_is_rejected_at_the_boundary(io, bad):
         io.record_engine_time(bad)
 
 
+@pytest.mark.parametrize("engine_time_s", [0.0, 5e-10])
+def test_an_engine_clock_below_one_nanosecond_still_carries_an_instant(io, loop, engine_time_s):
+    """Zero is the clock topic's not-ready sentinel, so an engine sitting at or
+    below one nanosecond is floored rather than refused: the stamp and the tick
+    carry the same instant, and neither is zero."""
+    io.record_engine_time(engine_time_s)
+    assert io._timestamp_s() > 0.0
+    io.publish_sim_time()
+    loop.run_until_complete(_drain())
+    assert io._sim_clock.published == [1]
+
 def test_publish_lands_the_recorded_instant_in_nanoseconds(io, loop):
     io.record_engine_time(2.5)
     io.publish_sim_time()
