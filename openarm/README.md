@@ -255,6 +255,10 @@ http://127.0.0.1:8766
 
 Scene Commander is used to construct and modify the simulated environment while the simulator is running. It drives any engine implementing the `scene_control` contract: the Isaac Sim engine and the Waldo engine (`peppy stack launch openarm_v2 --with=waldo,scene_commander`).
 
+### Robot menu
+
+On an engine that also implements the `world_control` contract (the Waldo engine), a **Robot** section lists the worlds the engine can run (each a robot with the pairing slots mapped onto its limbs, the running one marked) and **Switch Robot** restarts the simulation on the selected one, from the OpenArm v2 on its pedestal to the Aloha 2 on its table say. The switch is a restart: the new robot starts at its own pose in an empty scene (spawned objects are gone, the asset and object lists refresh), the engine's limb slots carry the new robot's joints, and the Waldo viewer page reloads itself on the new world. The section is absent on the Isaac Sim engine, which keeps one world for its life: the launcher leaves the panel's `worlds` slot vacant there and binds it under the `waldo` option.
+
 ### Scene controls
 
 The **Scene** section allows you to:

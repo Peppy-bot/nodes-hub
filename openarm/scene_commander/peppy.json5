@@ -14,10 +14,15 @@
     ],
 
     depends_on: {
-      // The scene editing surface of whichever simulation engine the
-      // launcher binds here.
       contracts: [
+        // The scene editing surface of whichever simulation engine the
+        // launcher binds here.
         { name: "scene_control", tag: "v1", link_id: "simulation" },
+        // The same engine's world selection (the robots it can stand up
+        // and the switch between them), when it has one: only the Waldo
+        // engine implements it, so the slot may run vacant and the panel
+        // then shows no robot menu.
+        { name: "world_control", tag: "v1", link_id: "worlds", cardinality: "zero_or_one" },
       ],
     },
   },
@@ -33,11 +38,19 @@
           link_id: "simulation",
           name: "get_objects_list",
         },
+        {
+          link_id: "worlds",
+          name: "get_worlds_list",
+        },
       ],
     },
 
     actions: {
       consumes: [
+        {
+          link_id: "worlds",
+          name: "load_world",
+        },
         {
           link_id: "simulation",
           name: "load_scene",

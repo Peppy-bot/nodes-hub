@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Web commander for OpenArm simulation scenes through the scene_control contract."""
+"""Web commander for OpenArm simulation scenes through the scene_control
+contract, with a robot menu on an engine that also implements world_control
+(the worlds slot; vacant on an engine that keeps one world for its life)."""
 
 from __future__ import annotations
 
@@ -27,6 +29,9 @@ from peppygen.consumed_services.simulation import (
     get_assets_list,
     get_objects_list,
 )
+
+from peppygen.consumed_actions.worlds import load_world
+from peppygen.consumed_services.worlds import get_worlds_list
 
 
 logger = logging.getLogger(__name__)
@@ -117,6 +122,37 @@ async def _fetch_objects(
 
     return json.loads(
         data.objects_json
+    )
+
+
+async def _fetch_worlds(
+    node_runner: NodeRunner,
+) -> list[dict] | None:
+    """The engine's worlds, or None when the worlds slot is vacant (the
+    engine keeps one world for its life and the panel shows no menu)."""
+
+    producer = get_worlds_list.bound_producer(
+        node_runner
+    )
+
+    if producer is None:
+        return None
+
+    response = await get_worlds_list.poll(
+        node_runner,
+        producer,
+        timeout=SERVICE_TIMEOUT_S,
+    )
+
+    data = response.data
+
+    if not data.success:
+        raise RuntimeError(
+            data.message
+        )
+
+    return json.loads(
+        data.worlds_json
     )
 
 
@@ -476,6 +512,56 @@ async def _action_move_robot(
     }
 
 
+async def _action_load_world(
+    node_runner: NodeRunner,
+    world_id: str,
+) -> dict:
+    """Restarts the engine on another world; the goal completes once the
+    new robot is on the engine's slots. Refused when the worlds slot is
+    vacant."""
+
+    producer = load_world.bound_producer(
+        node_runner
+    )
+
+    if producer is None:
+        raise RuntimeError(
+            "This engine keeps one world for its life: "
+            "it does not implement world_control"
+        )
+
+    request = load_world.GoalRequest(
+        world_id=world_id,
+    )
+
+    handle = await load_world.ActionHandle.fire_goal(
+        node_runner,
+        producer,
+        request,
+        timeout=ACTION_TIMEOUT_S,
+        feedback_qos=peppylib.QoSProfile.Standard,
+    )
+
+    if not handle.accepted:
+        raise RuntimeError(
+            f"load_world rejected: {handle.reason}"
+        )
+
+    result = await handle.get_result(
+        timeout=ACTION_TIMEOUT_S
+    )
+
+    data = _require_completed(
+        load_world,
+        result,
+    )
+
+    return {
+        "success": True,
+        "message": data.message,
+    }
+
+
 # ---------------------------------------------------------------------------
 # HTTP utilities
 # ---------------------------------------------------------------------------
@@ -605,6 +691,56 @@ async def _api_objects(
             exc,
             status=500,
         )
+
+
+async def _api_worlds(
+    request: web.Request,
+) -> web.Response:
+    """The robot menu's entries: `supported` is false, with no worlds, on
+    an engine whose worlds slot is vacant."""
+
+    try:
+        node_runner = request.app["node_runner"]
+
+        worlds = await _fetch_worlds(
+            node_runner
+        )
+
+        return web.json_response(
+            {
+                "success": True,
+                "supported": worlds is not None,
+                "worlds": worlds or [],
+                "count": len(worlds or []),
+            }
+        )
+
+    except Exception as exc:
+        return _json_error(
+            exc,
+            status=500,
+        )
+
+
+async def _api_load_world(
+    request: web.Request,
+) -> web.Response:
+    try:
+        payload = await _request_json(
+            request
+        )
+
+        result = await _action_load_world(
+            request.app["node_runner"],
+            str(payload["world_id"]),
+        )
+
+        return web.json_response(
+            result
+        )
+
+    except Exception as exc:
+        return _json_error(exc)
 
 
 async def _api_load_scene(
@@ -919,9 +1055,14 @@ button.danger {
 }
 
 #assetCount,
-#objectCount {
+#objectCount,
+#worldCount {
     font-size: 12px;
     color: #aeb7c4;
+}
+
+.hidden {
+    display: none;
 }
 </style>
 </head>
@@ -934,6 +1075,23 @@ button.danger {
 </header>
 
 <main>
+
+<section class="card hidden" id="robotCard">
+<h2>Robot</h2>
+
+<label>World</label>
+<select id="worldSelect"></select>
+
+<div id="worldCount"></div>
+
+<button onclick="loadWorld()">Switch Robot</button>
+
+<div class="small">
+Restarts the simulation on the selected world: the new robot starts at
+its own pose in an empty scene, and the viewer page reloads on it.
+</div>
+</section>
+
 
 <section class="card">
 <h2>Scene</h2>
@@ -1028,6 +1186,7 @@ button.danger {
 <script>
 let assets = [];
 let objectList = [];
+let worldList = [];
 
 const el = id => document.getElementById(id);
 
@@ -1064,6 +1223,58 @@ async function api(path, options={}) {
     }
 
     return data;
+}
+
+async function refreshWorlds() {
+    const data = await api("/api/worlds");
+
+    worldList = data.worlds || [];
+
+    // No robot menu on an engine that keeps one world for its life.
+    el("robotCard").classList.toggle("hidden", !data.supported);
+
+    if (!data.supported) return;
+
+    el("worldSelect").innerHTML = worldList.map(w =>
+        `<option value="${w.world_id}"${w.current ? " selected" : ""}>
+            ${w.display_name}${w.current ? " (running)" : ""}
+        </option>`
+    ).join("");
+
+    const running = worldList.find(w => w.current);
+
+    el("worldCount").textContent =
+        `${worldList.length} worlds` +
+        (running ? `, running ${running.display_name}` : "");
+}
+
+async function loadWorld() {
+    try {
+        const worldId = el("worldSelect").value;
+
+        if (!worldId) {
+            throw new Error("Select a world first");
+        }
+
+        status(`Switching to ${worldId}...`);
+
+        const data = await api("/api/world/load", {
+            method: "POST",
+            body: JSON.stringify({
+                world_id: worldId
+            })
+        });
+
+        // Another robot, an empty scene: refresh everything shown.
+        await refreshWorlds();
+        await refreshAssets();
+        await refreshObjects();
+
+        status(data.message);
+    }
+    catch (err) {
+        status(err.message, true);
+    }
 }
 
 async function refreshAssets() {
@@ -1477,6 +1688,7 @@ async function moveRobot() {
 
 async function startup() {
     try {
+        await refreshWorlds();
         await refreshAssets();
         await refreshObjects();
     }
@@ -1571,6 +1783,16 @@ async def _run_http_server(
         _api_move_robot,
     )
 
+    app.router.add_get(
+        "/api/worlds",
+        _api_worlds,
+    )
+
+    app.router.add_post(
+        "/api/world/load",
+        _api_load_world,
+    )
+
     runner = web.AppRunner(
         app
     )
@@ -1594,8 +1816,13 @@ async def _run_http_server(
     try:
         await asyncio.Event().wait()
 
-    finally:
+    except asyncio.CancelledError:
+        # Cancelled with the node: close the server before the loop goes.
+        # (Only on cancellation: a coroutine closed by the garbage collector
+        # cannot await, and the process is ending then anyway.)
         await runner.cleanup()
+
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -1619,10 +1846,19 @@ async def setup(
         node_runner
     )
 
+    worlds = await _fetch_worlds(
+        node_runner
+    )
+
     logger.info(
-        "Connected to scene provider: %d assets, %d runtime objects",
+        "Connected to scene provider: %d assets, %d runtime objects, %s",
         len(assets),
         len(objects),
+        (
+            f"{len(worlds)} worlds to switch between"
+            if worlds is not None
+            else "no world switching (worlds slot vacant)"
+        ),
     )
 
     host = str(
