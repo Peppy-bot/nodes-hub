@@ -2,14 +2,14 @@ Bootstrap: docker
 From: peppybot/python-uv-base:latest
 
 %labels
-    Name ai_brain
+    Name openarm_ai_brain
     Version v1
 
 %environment
-    export PATH="/opt/ai_brain/.venv/bin:$PATH"
+    export PATH="/opt/openarm_ai_brain/.venv/bin:$PATH"
 
 %files
-    . /opt/ai_brain
+    . /opt/openarm_ai_brain
 
 %post
     set -eux
@@ -22,10 +22,10 @@ From: peppybot/python-uv-base:latest
     # builds fine and then dies at exec with `./.venv/bin/python: not found`.
     export UV_PYTHON_INSTALL_DIR=/opt/uv-python
 
-    cd /opt/ai_brain
+    cd /opt/openarm_ai_brain
     uv python install
-    uv sync --no-editable
+    uv sync --no-editable --no-dev
 
 %runscript
-    cd /opt/ai_brain
-    exec ./.venv/bin/python -m ai_brain
+    cd /opt/openarm_ai_brain
+    exec ./.venv/bin/python -u -m openarm_ai_brain

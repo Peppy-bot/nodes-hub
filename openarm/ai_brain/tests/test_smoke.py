@@ -1,14 +1,14 @@
-"""Smoke test scaffolded by `peppy node init`: boots the node in-process
-under the generated test harness (ephemeral router + seeded standalone
-config + readiness barriers) and converges cleanly. Extend it, or add
-sibling files, as the node grows interfaces; `peppy node sync` regenerates
-typed mocks for every dependency under `peppygen.mock`."""
+"""Boots the node in-process under the generated test harness, with the one
+parameter its manifest requires, and checks that it comes up and shuts down
+cleanly."""
 
 from peppygen.fixtures import harness
+from peppygen.parameters import Parameters
 
-from ai_brain.__main__ import setup
+from openarm_ai_brain.__main__ import setup
 
 
 async def test_node_boots_and_shuts_down_cleanly():
-    async with harness.start(setup) as h:
+    params = Parameters.from_dict({"gripper_names": "left_gripper,right_gripper"})
+    async with harness.start(setup, parameters=params) as h:
         assert h.instance_id

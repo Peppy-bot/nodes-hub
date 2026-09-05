@@ -1,9 +1,10 @@
-// openarm_ai_brain: the environment-aware action layer for OpenArm. It serves
-// basic_actions, the contract that finds an item, picks it up, and puts it
-// down, and it depends on limb_motion for the discrete arm and gripper moves
-// those sequences are built from. The launcher binds the limb_motion slot to
-// the instance that governs the arms, so every move this node asks for is
-// collision governed on the way down.
+// openarm_ai_brain: the OpenArm implementer of basic_actions, the contract
+// that finds an item, picks it up, and puts it down. This manifest claims
+// every member of that contract and depends on limb_motion, the backbone's
+// discrete arm and gripper moves; the launcher binds that slot to the
+// instance that governs the arms, so any move sent through it is collision
+// governed on the way down. The node boots and reports health; it registers
+// no handler for any of the members it claims.
 {
   peppy_schema: "node/v1",
   manifest: {
