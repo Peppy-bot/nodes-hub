@@ -46,6 +46,11 @@
         path: "example_robot/my_robot_brain/my_rust_robot_brain/peppy.json5"
       }
     },
+    openarm_ai_brain: {
+      v1: {
+        path: "openarm/ai_brain/peppy.json5"
+      }
+    },
     openarm_arm: {
       v1: {
         path: "openarm/arm/peppy.json5"
