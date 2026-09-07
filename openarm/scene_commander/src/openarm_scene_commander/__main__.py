@@ -961,8 +961,9 @@ button.danger {
 <label>Category</label>
 <select id="categorySelect" onchange="renderAssets()"></select>
 
-<label>Asset</label>
-<select id="assetSelect" onchange="selectAsset()"></select>
+<label for="assetSelect">Asset</label>
+<select id="assetSelect" aria-describedby="assetDescription" onchange="selectAsset()"></select>
+<p id="assetDescription" class="small" aria-live="polite" hidden></p>
 
 <div id="assetCount"></div>
 
@@ -1089,13 +1090,18 @@ async function refreshAssets() {
         props.map(a => a.category).filter(Boolean)
     )].sort();
 
-    el("categorySelect").innerHTML =
-        `<option value="">All categories</option>` +
-        categories.map(c =>
-            `<option value="${c}">${c}</option>`
-        ).join("");
+    const categorySelect = el("categorySelect");
+    const previousCategory = categorySelect.value;
+    categorySelect.replaceChildren(
+        new Option("All categories", ""),
+        ...categories.map(c => new Option(c, c))
+    );
+    if (categories.includes(previousCategory)) {
+        categorySelect.value = previousCategory;
+    }
 
     renderAssets();
+    renderObjectDescriptions();
 
     status(`Loaded ${assets.length} assets`);
 }
@@ -1104,16 +1110,25 @@ function selectScene() {
     const scene = assets.find(a =>
         a.kind === "scene" && a.asset_id === el("sceneSelect").value
     );
-    const description = el("sceneDescription");
-    description.textContent = scene?.description || "";
+    showDescription("sceneDescription", scene);
+}
+
+function showDescription(id, asset) {
+    const description = el(id);
+    description.textContent = asset?.description || "";
     description.hidden = !description.textContent;
 }
 
-function selectAsset() {
-    const asset = assets.find(a => a.asset_id === el("assetSelect").value);
-    const mass = Number(asset?.default_mass);
-    el("spawnMass").value = Number.isFinite(mass) && mass > 0 ? mass : 0.1;
-    el("spawnPhysics").value = "dynamic";
+function selectAsset(resetDefaults = true) {
+    const asset = assets.find(a =>
+        a.kind === "object" && a.asset_id === el("assetSelect").value
+    );
+    showDescription("assetDescription", asset);
+    if (resetDefaults) {
+        const mass = Number(asset?.default_mass);
+        el("spawnMass").value = Number.isFinite(mass) && mass > 0 ? mass : 0.1;
+        el("spawnPhysics").value = "dynamic";
+    }
 }
 
 function renderAssets() {
@@ -1132,22 +1147,19 @@ function renderAssets() {
             return (
                 a.display_name.toLowerCase().includes(search) ||
                 a.asset_id.toLowerCase().includes(search) ||
-                (a.category || "").toLowerCase().includes(search)
+                (a.category || "").toLowerCase().includes(search) ||
+                (a.description || "").toLowerCase().includes(search)
             );
         });
 
-    el("assetSelect").innerHTML = filtered.map(a =>
-        `<option value="${a.asset_id}">
-            ${a.display_name} — ${a.category}
-        </option>`
-    ).join("");
+    el("assetSelect").replaceChildren(...filtered.map(a =>
+        new Option([a.display_name, a.category].filter(Boolean).join(" - "), a.asset_id)
+    ));
 
     if (filtered.some(a => a.asset_id === previous)) {
         el("assetSelect").value = previous;
     }
-    if (el("assetSelect").value !== previous) {
-        selectAsset();
-    }
+    selectAsset(el("assetSelect").value !== previous);
 
     el("assetCount").textContent =
         `${filtered.length} matching assets`;
@@ -1238,6 +1250,15 @@ async function refreshObjects() {
     }
 }
 
+function renderObjectDescriptions() {
+    const catalogue = new Map(
+        assets.filter(a => a.kind === "object").map(a => [a.asset_id, a])
+    );
+    objectList.forEach((obj, index) => {
+        showDescription(`objectDescription${index}`, catalogue.get(obj.asset_id));
+    });
+}
+
 function renderObjects() {
     const container = el("objects");
 
@@ -1265,6 +1286,7 @@ function renderObjects() {
                 &nbsp;|&nbsp;
                 mass=${obj.mass ?? "-"} kg
             </div>
+            <p id="objectDescription${index}" class="small" hidden></p>
 
             <label>Position</label>
 
@@ -1353,6 +1375,7 @@ function renderObjects() {
             }
         </div>`;
     }).join("");
+    renderObjectDescriptions();
 }
 
 async function applyForce(
