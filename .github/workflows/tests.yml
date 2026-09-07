@@ -54,7 +54,9 @@ jobs:
           set -euo pipefail
           # Native Node tests can use JavaScript or erasable TypeScript. Match
           # test/spec files at any depth, including the repository root.
-          git ls-files -z -- \
+          # The job container and checkout can have different owners. Trust only
+          # this workspace, for this read-only discovery command.
+          git -c safe.directory="$GITHUB_WORKSPACE" ls-files -z -- \
             ':(glob)**/*.test.[jt]s' ':(glob)**/*.test.[cm][jt]s' \
             ':(glob)**/*.spec.[jt]s' ':(glob)**/*.spec.[cm][jt]s' \
             > "$RUNNER_TEMP/node-test-files"
