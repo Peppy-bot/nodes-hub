@@ -1,6 +1,8 @@
 name: Tests
 
-# Runs the repository's Rust and Python tests. The inventory is discovered from
+# Runs the repository's Rust, Python, JavaScript and TypeScript tests.
+# The Node test job discovers standalone suites across the whole repository.
+# The Rust/Python inventory is discovered from
 # the filesystem on each run rather than maintained by hand, so a new crate or
 # test file starts running in CI on the pull request that adds it, and a pull
 # request runs only the nodes its diff touches: nineteen nodes' suites are too
@@ -34,6 +36,44 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  javascript-typescript:
+    name: JavaScript and TypeScript tests
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    container: node:24
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Discover and run Node test suites
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Native Node tests can use JavaScript or erasable TypeScript. Match
+          # test/spec files at any depth, including the repository root.
+          git ls-files -z -- \
+            ':(glob)**/*.test.[jt]s' ':(glob)**/*.test.[cm][jt]s' \
+            ':(glob)**/*.spec.[jt]s' ':(glob)**/*.spec.[cm][jt]s' \
+            > "$RUNNER_TEMP/node-test-files"
+          tests=()
+          while IFS= read -r -d '' file; do
+            case "/$file" in
+              */node_modules/*|*/.peppy/*|*/target/*|*/dist/*|*/build/*|*/.venv/*|*/venv/*) continue ;;
+            esac
+            tests+=("./$file")
+          done < "$RUNNER_TEMP/node-test-files"
+          # Bare node --test performs its own discovery; never invoke it when
+          # this inventory is empty.
+          if [ "${#tests[@]}" -eq 0 ]; then
+            echo 'No JavaScript or TypeScript Node test suites found.'
+            exit 0
+          fi
+          printf 'Running %s\n' "${tests[@]}"
+          node --test "${tests[@]}"
+
   discover-and-run:
     name: Every Rust and Python test the change reaches
     # x86 rather than the -arm label: the base images and the librealsense apt
