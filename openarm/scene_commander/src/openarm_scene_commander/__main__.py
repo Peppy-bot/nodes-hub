@@ -938,8 +938,9 @@ button.danger {
 <section class="card">
 <h2>Scene</h2>
 
-<label>Scene</label>
-<select id="sceneSelect"></select>
+<label for="sceneSelect">Scene</label>
+<select id="sceneSelect" aria-describedby="sceneDescription" onchange="selectScene()"></select>
+<p id="sceneDescription" class="small" aria-live="polite" hidden></p>
 
 <label>Scale</label>
 <input id="sceneScale" type="number" step="0.1" value="1.0">
@@ -1074,9 +1075,15 @@ async function refreshAssets() {
     const scenes = assets.filter(a => a.kind === "scene");
     const props = assets.filter(a => a.kind === "object");
 
-    el("sceneSelect").innerHTML = scenes.map(a =>
-        `<option value="${a.asset_id}">${a.display_name}</option>`
-    ).join("");
+    const sceneSelect = el("sceneSelect");
+    const previousScene = sceneSelect.value;
+    sceneSelect.replaceChildren(...scenes.map(a =>
+        new Option(a.display_name, a.asset_id)
+    ));
+    if (scenes.some(a => a.asset_id === previousScene)) {
+        sceneSelect.value = previousScene;
+    }
+    selectScene();
 
     const categories = [...new Set(
         props.map(a => a.category).filter(Boolean)
@@ -1091,6 +1098,15 @@ async function refreshAssets() {
     renderAssets();
 
     status(`Loaded ${assets.length} assets`);
+}
+
+function selectScene() {
+    const scene = assets.find(a =>
+        a.kind === "scene" && a.asset_id === el("sceneSelect").value
+    );
+    const description = el("sceneDescription");
+    description.textContent = scene?.description || "";
+    description.hidden = !description.textContent;
 }
 
 function selectAsset() {
