@@ -9,6 +9,7 @@
 | [`openarm_gripper`](./gripper) | drives one gripper side (v1.0 prismatic or v2.0 pinch, by `hardware_version`) |
 | [`openarm_sim_arm`](./sim_arm) | relays one arm side between the backbone and a simulation |
 | [`openarm_sim_gripper`](./sim_gripper) | relays one gripper side between the backbone and a simulation |
+| [`openarm_sim_attachment`](./sim_attachment) | holds this robot's seat in a simulation that hosts several |
 | [`openarm_sim_mujoco`](./sim_mujoco) | MuJoCo simulation: the physics behind the relays |
 | [`openarm_sim_isaac`](./sim_isaac) | Isaac Sim simulation: the physics behind the relays |
 | `waldo` | Waldo simulation: the physics behind the relays, with a Bevy browser viewer; lives in the separate `private-nodes-hub` repository, not in this hub |
@@ -18,7 +19,9 @@
 | [`isaac_webviewer`](../isaac_webviewer) | serves the Isaac Sim WebRTC browser viewer |
 | [`scene_commander`](../scene_commander) | browser scene/object/physics control for any simulation implementing the `scene_control` contract (the Isaac Sim simulation and the Waldo simulation) |
 
-Sim support splits into simulation-agnostic relays plus one node per simulation: `openarm_sim_arm` and `openarm_sim_gripper` face the backbone exactly like the real nodes and lead the matching limb slot on the simulation node (`openarm_sim_mujoco` or `openarm_sim_isaac`, which model v1.0 or v2.0 hardware via their `hardware_version` parameter, or `waldo`, which names its world via `world`), which owns the physics. The launcher decides which nodes fill each slot, so the backbone and the UI never know which simulation is underneath.
+Sim support splits into simulation-agnostic relays plus one node per simulation: `openarm_sim_arm` and `openarm_sim_gripper` face the backbone exactly like the real nodes and lead the matching limb slot underneath, which owns the physics. The launcher decides which nodes fill each slot, so the backbone and the UI never know which simulation is underneath.
+
+Where the limb slot lands depends on the simulation. `openarm_sim_mujoco` and `openarm_sim_isaac` carry one robot each, modelling v1.0 or v2.0 hardware through their `hardware_version` parameter, and the relays lead their slots directly. `waldo` hosts any number of robots in one world, and each robot deploys an `openarm_sim_attachment` that holds its seat there: the attachment offers the same four limb slots to the relays, attaches the robot with its own model, and carries its setpoints and measured state across the `simulation_robot` contract. The seat is what lets several OpenArms, of either generation, share one simulation.
 
 The third simulation, `waldo`, is published by the `private-nodes-hub` repository. Its launcher option is `waldo`, and its Bevy browser viewer is served over https on port 8080 with a self-signed certificate.
 

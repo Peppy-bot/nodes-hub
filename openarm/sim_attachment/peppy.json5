@@ -1,6 +1,7 @@
 // openarm_sim_attachment: one OpenArm's seat in a shared simulation. Toward
-// the robot it plays the follower role of every limb's pairing, exactly like
-// the engine used to, so the relays above it are wired as they always were.
+// the robot it plays the follower role of every limb's pairing, the surface
+// a simulation offers a robot it hosts alone, so the relays above it bind to
+// it as they bind to such a simulation.
 // Toward the simulation it holds one seat of the simulation_robot contract:
 // it attaches this robot with its model and placement, streams the limbs'
 // setpoints as one command, and publishes the state that comes back on each

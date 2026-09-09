@@ -25,7 +25,7 @@ use crate::limbs::{ARMS, GRIPPERS, Seat, arm_command, gripper_command, model_of}
 /// takes a moment.
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long one command may take. Well under a command period at the rates
-/// a robot runs, so a lost reply is retried rather than queued behind.
+/// a robot runs, so a lost reply is retried on the next tick.
 const COMMAND_TIMEOUT: Duration = Duration::from_millis(250);
 /// How long the robot waits for the engine to acknowledge that it left.
 const LEAVE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -37,8 +37,8 @@ fn refused(message: impl Into<String>) -> peppygen::Error {
     peppygen::Error::Node(std::io::Error::other(message.into()).into())
 }
 
-/// The node's entry point: the exact closure `NodeBuilder::run` used to get,
-/// named so the test harness can boot the node in-process.
+/// The node's entry point: the closure `NodeBuilder::run` takes, named so
+/// the test harness can boot the node in-process.
 pub async fn setup(params: Parameters, node_runner: Arc<NodeRunner>) -> Result<()> {
     peppygen::clock::init(&node_runner).await?;
     let token = node_runner.cancellation_token().clone();
@@ -99,8 +99,8 @@ pub async fn setup(params: Parameters, node_runner: Arc<NodeRunner>) -> Result<(
     ));
 
     // Shutting this robot down takes it out of the scene: the wind-down
-    // gives its seat back, and the node waits for that rather than leaving
-    // a body standing there until the lease lapses.
+    // gives its seat back, and the node waits for that, so the body leaves
+    // with the robot.
     let shutdown_token = token.clone();
     node_runner.on_shutdown(async move {
         shutdown_token.cancel();
