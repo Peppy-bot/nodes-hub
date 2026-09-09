@@ -13,7 +13,7 @@
 | [`openarm_sim_isaac`](./sim_isaac) | Isaac Sim engine: the physics behind the relays |
 | `waldo` | Waldo engine: the physics behind the relays, with a Bevy browser viewer; lives in the separate `private-nodes-hub` repository, not in this hub |
 | [`openarm_backbone`](./backbone) | routes goals to the correct side |
-| [`openarm_commander`](./web_commander) | browser control panel |
+| [`openarm_web_commander`](./web_commander) | browser control panel |
 | [`openarm_ker`](./ker) | streams joint setpoints from a physical leader arm |
 | [`openarm_isaac_webviewer`](./../isaac_webviewer) | serves the Isaac Sim WebRTC browser viewer |
 | [`openarm_scene_commander`](./../scene_commander) | browser scene/object/physics control for any engine implementing the `scene_control` contract (the Isaac Sim engine and the Waldo engine) |
@@ -22,15 +22,15 @@ Sim support splits into engine-agnostic relays plus one node per engine: `openar
 
 The third engine, `waldo`, is published by the `private-nodes-hub` repository rather than this hub. Its launcher option is `waldo`, and its Bevy browser viewer is served over https on port 8080 with a self-signed certificate.
 
-The [OpenArm fleet launcher](https://github.com/Peppy-bot/launchers-hub/blob/main/openarm/openarm_fleet.json5)
-requires matching Peppy and nodes-hub releases with named-fragment support.
-Each simulated robot owns its engine. The current stack supports one simulated
-robot alongside physical robots in wall-time mode.
+The [OpenArm launchers](https://github.com/Peppy-bot/launchers-hub/tree/main/openarm)
+run robots as named copies: `openarm_sim_fleet` runs one engine and simulated
+robots, `openarm_real_fleet` physical ones. The engines above pair with one
+simulated robot; physical robots join beside it in wall-time mode.
 
 ## 1. Prerequisites
 
 - Ubuntu 22.04 or 24.04
-- [Peppy](https://peppy.bot) with FRAMEWORK-203, installed with `curl -fsSL https://peppy.bot/install.sh | sh`
+- [Peppy](https://peppy.bot), installed with `curl -fsSL https://peppy.bot/install.sh | sh`
 - Docker, running
 - For Isaac only: an NVIDIA GPU with the [Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) configured
 
@@ -41,7 +41,7 @@ ws/
 ├── contracts-hub/
 ├── pairings-hub/
 ├── launchers-hub/
-└── openarm-nodes/
+└── nodes-hub/
 ```
 
 ## 2. Start the daemon and register the repos
@@ -53,7 +53,6 @@ peppy service serve &
 
 peppy repo add /path/to/ws/contracts-hub
 peppy repo add /path/to/ws/pairings-hub
-peppy repo add /path/to/ws/openarm-nodes
 peppy repo add /path/to/ws/nodes-hub
 peppy repo add /path/to/ws/launchers-hub
 peppy repo refresh
@@ -65,7 +64,7 @@ To run a development branch instead of main, register the repositories by git UR
 
 ```sh
 peppy repo add \
-  https://github.com/Peppy-bot/openarm-nodes.git \
+  https://github.com/Peppy-bot/nodes-hub.git \
   --ref feature/isaacsim-6.0.1-clean \
   --top
 
@@ -140,28 +139,32 @@ Every node you added should show `Stage: Ready`. If one is stuck at an earlier s
 
 ## 4. Launch the stack
 
-Select a complete robot in one command. These are separate sessions:
+Each fleet file deploys one copy, `alpha`, a v2 with the web commander. The
+engine is selected at launch. These are separate sessions:
 
 ```sh
 # Physical v2 with the web commander.
-peppy stack launch openarm_fleet -i alpha --with openarm_v2,web_commander
+peppy stack launch openarm_real_fleet
 
 # Simulated v2 with the web commander.
-peppy stack launch openarm_fleet -i alpha --with openarm_v2_sim,mujoco,web_commander
-peppy stack launch openarm_fleet -i alpha --with openarm_v2_sim,isaac_sim,web_commander
-peppy stack launch openarm_fleet -i alpha --with openarm_v2_sim,waldo,web_commander
+peppy stack launch openarm_sim_fleet                  # Waldo
+peppy stack launch openarm_sim_fleet --with mujoco
+peppy stack launch openarm_sim_fleet --with isaac_sim
 ```
 
-MuJoCo and Isaac Sim also accept `openarm_v1_sim`. Waldo supplies the v2 world.
-Add `lerobot_recorder` to record, and `sim_cameras` for rendered v2 cameras.
-Use `xr_commander` or `mcp_commander` to select another command surface.
-Simulation and scene control belong to the stack. Removing a robot leaves the
-engine and its preloaded model running; `stack reset` stops everything. Select
-the engine, generation, and rendered-camera configuration at initial launch.
-A second simulated robot is rejected. Additional physical robots can join:
+MuJoCo and Isaac Sim also simulate `openarm_v1_sim`. Waldo supplies the v2
+world. A copy selects its own recorder (`lerobot_recorder`), camera rig
+(`sim_cameras` for rendered v2 cameras) and robot commander (`xr_commander`,
+`mcp_commander`) with `with:` in the file or `--with` on join. Its ids carry
+its name, `alpha_backbone_inst`; the engine and scene control belong to the
+stack. Removing a copy leaves the engine and its preloaded model running;
+`stack reset` stops everything. The engine, generation, and rendered-camera
+configuration are selected at launch; a second simulated robot is rejected.
+Physical robots can join a fleet:
 
 ```sh
-peppy stack join -i bravo --with openarm_v1 --place bravo@jetson-2
+peppy stack launch openarm_real_fleet --place alpha@jetson-1
+peppy stack join openarm_v1 -i bravo --place bravo@jetson-2
 peppy stack list
 peppy stack remove bravo
 peppy stack reset --federated
@@ -247,7 +250,7 @@ When working directly on the Isaac machine:
 http://127.0.0.1:8766
 ```
 
-Scene Commander is used to construct and modify the simulated environment while the simulator is running. It drives any engine implementing the `scene_control` contract: the Isaac Sim engine and the Waldo engine (`peppy stack launch openarm_fleet -i alpha --with openarm_v2_sim,waldo,scene_commander`).
+Scene Commander is used to construct and modify the simulated environment while the simulator is running. It drives any engine implementing the `scene_control` contract: the Isaac Sim engine and the Waldo engine (`peppy stack launch openarm_sim_fleet --with isaac_sim,web_scene_commander`).
 
 ### Scene controls
 
@@ -605,7 +608,7 @@ The base image download outlived the daemon's idle timeout. Re-run the add with 
 **A node won't reach `Stage: Ready`**
 Rebuild it and read the build log peppy prints on failure:
 ```sh
-peppy node add /path/to/ws/openarm-nodes/<node> -sb --force --idle-timeout 1800
+peppy node add /path/to/ws/nodes-hub/openarm/<node> -sb --force --idle-timeout 1800
 ```
 
 **The stack launches but the arms don't respond**

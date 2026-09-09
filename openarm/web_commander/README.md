@@ -1,4 +1,4 @@
-# openarm_commander
+# openarm_web_commander
 
 The browser control panel for the OpenArm (either hardware generation). It serves
 a page on port 8765 with three interaction modes:
@@ -48,7 +48,7 @@ It needs a running backbone, so the usual way is through a launcher; the
 [top-level README](../README.md) has the complete sequence:
 
 ```sh
-peppy stack launch openarm_fleet -i alpha --with openarm_v2_sim,mujoco,web_commander
+peppy stack launch openarm_sim_fleet --with mujoco
 ```
 
 You can also run it against a manually assembled stack. Every declared slot

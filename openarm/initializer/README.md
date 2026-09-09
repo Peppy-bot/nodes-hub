@@ -6,15 +6,15 @@ and exposes the robot-level `is_ready` service the backbone gates on, true only
 once every limb reports ready. A component that dies or becomes unreachable
 flips the robot back to not-ready on the next poll.
 
-The node is engine-agnostic: the hardware drivers and the sim bridge nodes
-implement the same per-limb contract, so this one initializer serves every
-backend. Loading the simulated world is the sim engine nodes' business
+The hardware drivers and the simulation relays implement the same per-limb
+contract, so this one initializer serves the real robot and every simulation.
+Loading the simulated world is the simulation nodes' business
 (`openarm_sim_mujoco` / `openarm_sim_isaac`).
 
 ## Build
 
 ```sh
-peppy node add /path/to/ws/openarm-nodes/openarm_initializer -sb
+peppy node add /path/to/ws/nodes-hub/openarm/initializer -sb
 ```
 
 Rebuild after code changes by re-running with `--force`. When the build
@@ -30,7 +30,7 @@ do exactly that; the [top-level README](../README.md) walks through the whole
 sequence:
 
 ```sh
-peppy stack launch /path/to/ws/launchers-hub/openarm/openarm_v2_teleop_mujoco.json5
+peppy stack launch openarm_sim_fleet --with mujoco
 ```
 
 Watch it come up with:
