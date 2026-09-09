@@ -47,7 +47,6 @@ jobs:
   javascript-typescript:
     name: JavaScript and TypeScript tests
     runs-on: blacksmith-4vcpu-ubuntu-2404
-    container: node:24
     timeout-minutes: 15
     permissions:
       contents: read
@@ -57,9 +56,13 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
       - name: Discover and run Node test suites
-        shell: bash
-        run: bash .github/scripts/run-node-tests.sh
+        run: python3 .github/scripts/run-node-tests.py
 
   discover-and-run:
     name: All Rust and Python tests
@@ -105,43 +108,41 @@ jobs:
           commit: ${{ github.event_name == 'push' }}
 
       - name: Name the caches this run reuses
-        run: bash .github/scripts/configure-build-cache.sh
+        run: python3 .github/scripts/configure-build-cache.py
 
       - name: Discover all Rust and Python tests
         id: discover
-        env:
-          LC_ALL: C
-        run: bash .github/scripts/discover-tests.sh
+        run: python3 .github/scripts/discover-tests.py
 
       - name: Install peppy
         if: steps.discover.outputs.any == 'true'
         env:
           PEPPY_VERSION: ${{ vars.PEPPY_VERSION }}
-        run: bash .github/scripts/install-peppy.sh
+        run: python3 .github/scripts/install-peppy.py
 
       - name: Ready the bundled apptainer for unprivileged use
         if: steps.discover.outputs.any == 'true'
-        run: bash .github/scripts/setup-apptainer.sh
+        run: python3 .github/scripts/setup-apptainer.py
 
       - name: Start an isolated peppy daemon
         if: steps.discover.outputs.any == 'true'
-        run: bash .github/scripts/start-peppy-daemon.sh
+        run: python3 .github/scripts/start-peppy-daemon.py
 
       - name: Generate the tested nodes' interface code
         if: steps.discover.outputs.any == 'true'
-        run: bash .github/scripts/sync-test-nodes.sh
+        run: python3 .github/scripts/sync-test-nodes.py
 
       - name: Prove the committed lockfiles resolve against the generated interfaces
         if: steps.discover.outputs.any == 'true'
-        run: bash .github/scripts/check-lockfiles.sh
+        run: python3 .github/scripts/check-lockfiles.py
 
       - name: Run all Rust tests in their build containers
         if: steps.discover.outputs.any == 'true'
-        run: bash .github/scripts/run-rust-tests.sh
+        run: python3 .github/scripts/run-rust-tests.py
 
       - name: Run all Python tests in their build containers
         if: steps.discover.outputs.any == 'true'
-        run: bash .github/scripts/run-python-tests.sh
+        run: python3 .github/scripts/run-python-tests.py
 
       - name: Prove CI tested the committed manifests and lockfiles
-        run: bash .github/scripts/check-tested-manifests.sh
+        run: python3 .github/scripts/check-tested-manifests.py
