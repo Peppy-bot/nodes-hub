@@ -88,13 +88,26 @@ pub async fn setup(params: Parameters, node_runner: Arc<NodeRunner>) -> Result<(
 
     spawn_arm_consumers(&node_runner, &seat, &token).await?;
     spawn_gripper_consumers(&node_runner, &seat, &token).await?;
-    let states = spawn_state_publishers(&node_runner, seat.clone(), goal, token.clone()).await?;
+    let (left, has_left) = tokio::sync::oneshot::channel();
+    let states =
+        spawn_state_publishers(&node_runner, seat.clone(), goal, left, token.clone()).await?;
     let commands = tokio::spawn(command_loop(
         node_runner.clone(),
         seat,
         period,
         token.clone(),
     ));
+
+    // Shutting this robot down takes it out of the scene: the wind-down
+    // gives its seat back, and the node waits for that rather than leaving
+    // a body standing there until the lease lapses.
+    let shutdown_token = token.clone();
+    node_runner.on_shutdown(async move {
+        shutdown_token.cancel();
+        if tokio::time::timeout(LEAVE_TIMEOUT, has_left).await.is_err() {
+            warn!("this robot did not leave the scene within {LEAVE_TIMEOUT:?}");
+        }
+    });
 
     // The robot's stay is over when either half of the seat ends: cancel the
     // node so the runtime restarts it and it rejoins.
@@ -158,6 +171,7 @@ async fn spawn_state_publishers(
     runner: &Arc<NodeRunner>,
     seat: Seat,
     mut goal: attach::ActionHandle,
+    left: tokio::sync::oneshot::Sender<()>,
     token: CancellationToken,
 ) -> Result<tokio::task::JoinHandle<()>> {
     let arms = vec![
@@ -243,6 +257,7 @@ async fn spawn_state_publishers(
         if let Err(e) = goal.cancel_goal(LEAVE_TIMEOUT).await {
             warn!("this robot could not tell the simulation it is leaving: {e}");
         }
+        let _ = left.send(());
         drop(runner);
     }))
 }
