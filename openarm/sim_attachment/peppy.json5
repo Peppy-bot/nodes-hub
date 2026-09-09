@@ -1,0 +1,79 @@
+// openarm_sim_attachment: one OpenArm's seat in a shared simulation. Toward
+// the robot it plays the follower role of every limb's pairing, exactly like
+// the engine used to, so the relays above it are wired as they always were.
+// Toward the simulation it holds one seat of the simulation_robot contract:
+// it attaches this robot with its model and placement, streams the limbs'
+// setpoints as one command, and publishes the state that comes back on each
+// limb's pair. The engine tells robots apart by the caller, so one engine
+// hosts as many of these as there are robots.
+{
+  peppy_schema: "node/v1",
+  manifest: {
+    name: "openarm_sim_attachment",
+    tag: "v1",
+    depends_on: {
+      contracts: [
+        // The simulation this robot joins.
+        { name: "simulation_robot", tag: "v1", link_id: "engine" },
+      ],
+      pairings: [
+        // One slot per limb, the same surface a sim engine offers: governed
+        // setpoints stream in, measured state streams back. Optional: the
+        // attachment joins the scene whether or not a robot is driving it,
+        // and each pair is established at the backbone's start.
+        { name: "joint_link", tag: "v1", role: "follower", link_id: "left_arm", optional: true },
+        { name: "joint_link", tag: "v1", role: "follower", link_id: "right_arm", optional: true },
+        { name: "gripper_link", tag: "v1", role: "follower", link_id: "left_gripper", optional: true },
+        { name: "gripper_link", tag: "v1", role: "follower", link_id: "right_gripper", optional: true },
+      ],
+    },
+  },
+  interfaces: {
+    topics: {
+      emits: [
+        { link_id: "left_arm", name: "joint_states" },
+        { link_id: "right_arm", name: "joint_states" },
+        { link_id: "left_gripper", name: "gripper_states" },
+        { link_id: "right_gripper", name: "gripper_states" },
+      ],
+      consumes: [
+        { link_id: "left_arm", name: "joint_setpoints" },
+        { link_id: "right_arm", name: "joint_setpoints" },
+        { link_id: "left_gripper", name: "gripper_setpoints" },
+        { link_id: "right_gripper", name: "gripper_setpoints" },
+      ],
+    },
+    services: {
+      consumes: [{ link_id: "engine", name: "command" }],
+    },
+    actions: {
+      consumes: [{ link_id: "engine", name: "attach" }],
+    },
+  },
+  execution: {
+    language: "rust",
+    container: {
+      def_file: "apptainer.def",
+    },
+    parameters: {
+      // Which OpenArm the simulation stands for this robot, "v1" or "v2".
+      // The engine loads that model; nothing else about the robot reaches it.
+      hardware_version: "string",
+      // How often the limbs' setpoints go to the engine. The engine holds the
+      // last command until the next one, and a robot whose commands stop for
+      // the engine's lease leaves the scene, so this is also the heartbeat.
+      command_rate_hz: { $type: "u32", $default: 100 },
+      // Where the robot stands. `auto` lets the engine park it on a free spot
+      // of its own, which is what a fleet of robots wants; turn it off to
+      // stand this robot at x, y, z (metres) turned yaw (radians) about the
+      // world's vertical.
+      placement: {
+        auto: { $type: "bool", $default: true },
+        x: { $type: "f64", $default: 0 },
+        y: { $type: "f64", $default: 0 },
+        z: { $type: "f64", $default: 0 },
+        yaw: { $type: "f64", $default: 0 },
+      },
+    },
+  },
+}
