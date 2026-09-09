@@ -84,26 +84,41 @@ publishes. Rename yours: within one repository, a `name:tag` is claimed by exact
 
 ## Tests
 
-CI runs this repository's Rust and Python tests on every pull request and on every push to `main`.
-Nothing lists them: each run discovers every directory holding a `Cargo.toml` and every
-`test_*.py` / `*_test.py` file from the filesystem, so a node's first test starts running in CI on
-the pull request that adds it.
+CI runs Rust, Python, JavaScript and TypeScript tests on every pull request and push to `main`.
 
-A pull request runs only the nodes its diff touches, since nineteen nodes' suites are too expensive
-to rerun for a one-node change. A change that lands outside every node, a grouping folder's Readme
-or `peppy_repository.json5` for instance, runs the full suite instead, and so does every push to
-`main`. The run summary names the crates and test files that ran and the crates that were skipped.
+CI helpers live in `.github/scripts` and use only the Python standard library. The workflow
+contains configuration and script calls; the helpers invoke tools such as Cargo and Apptainer
+with explicit argument lists.
 
-Each node's tests run inside a container built from its `apptainer.def`: the base image plus
+An independent Python 3.13 job checks the syntax of every tracked `.py` file, including launchers
+and modules that no test imports. It checks syntax without importing modules, installing their
+dependencies or starting a simulator. Untracked files are omitted. Run the same check locally with `python3.13 .github/scripts/check-python-syntax.py`.
+
+An independent Node 24 job runs every tracked `*.test.*` and `*.spec.*` suite with a `.js`, `.mjs`,
+`.cjs`, `.ts`, `.mts` or `.cts` extension, at any depth in the repository. It excludes dependencies,
+generated interfaces, virtual environments and build outputs. These suites use Node's built-in
+`node:test` runner and require no node-specific workflow entries. TypeScript runs with Node's
+native type stripping; this executes tests without type-checking. Run a suite locally with
+`node --test path/to/example.test.ts` (or its JavaScript filename).
+
+Rust and Python tests are also discovered automatically: each run discovers every directory holding
+a `Cargo.toml` and every `test_*.py` / `*_test.py` file, including projects at the repository root.
+Generated interfaces, dependencies, virtual environments and build outputs are excluded. Every
+pull request and push to `main` runs the full discovered inventory, so a project's first test starts
+running in CI on the pull request that adds it. The run summary lists the crates and Python test
+files. Each Python test runs under its nearest `pyproject.toml`, including nested projects.
+
+Each node's Rust and Python tests run inside a container built from its `apptainer.def`: the base image plus
 everything the def prepares before it enters the copied source and builds it. So a test that needs a
 system library gets it the same way the node itself does, by declaring it in the def, and the runner
 host needs nothing. A node with no def runs in the base image peppy scaffolds for its language.
 
-Rust tests run as `cargo test --locked` and Python tests as `uv run --locked pytest`, so both
-lockfiles must be committed current; CI supplies pytest, and a node needs no test dependency group of
-its own to be covered. CI runs `peppy node sync` before the tests and fails if it rewrites a manifest,
-which means the repository lags the peppy release CI installs: run the sync locally and commit the
-result.
+Rust tests run as `cargo test --locked --workspace`, including unit, integration and documentation
+tests for every workspace member. Python tests run as `uv run --locked --with pytest pytest` with
+all discovered files owned by that project. Both lockfiles must be committed current; CI supplies
+pytest, and a node needs no test dependency group of its own to be covered. CI runs `peppy node sync`
+before the tests and fails if it rewrites a manifest, which means the repository lags the peppy
+release CI installs: run the sync locally and commit the result.
 
 ## Relocking against a peppy release
 
