@@ -1,4 +1,4 @@
-//! Bringup gate: the backbone waits for the launcher-bound robot_initializer
+//! Bringup gate: the backbone waits for the launcher-bound openarm_initializer
 //! before exposing actions or streaming, so it never commands an arm whose
 //! driver has not finished coming up.
 
@@ -12,7 +12,7 @@ use tracing::{info, warn};
 const IS_READY_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const SERVICE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Block until the launcher-bound robot_initializer reports ready, then return
+/// Block until the launcher-bound openarm_initializer reports ready, then return
 /// so the backbone can expose its own actions. Left/right arm and gripper
 /// identity is launcher-pinned via link_ids, so no runtime discovery is needed.
 pub async fn wait_until_ready(runner: &NodeRunner, token: &CancellationToken) {
@@ -25,7 +25,7 @@ pub async fn wait_until_ready(runner: &NodeRunner, token: &CancellationToken) {
         .await
         {
             Ok(resp) if resp.data.ready => {
-                info!("robot_initializer reported ready");
+                info!("openarm_initializer reported ready");
                 return;
             }
             Ok(_) => {}

@@ -4,8 +4,8 @@
 #
 # CI runs a python test project inside the image built from the apptainer.def
 # beside it, and gives a project with no def the scaffolded python base image.
-# There is no def here, which is what these suites want: they import no engine
-# module, so pulling the multi-gigabyte Isaac Sim image to run pure-python
+# There is no def here, which is what these suites want: they import nothing
+# from Isaac Sim, so pulling its multi-gigabyte image to run pure-python
 # assertions would buy them nothing.
 [project]
 name = "openarm-sim-isaac-tests"
@@ -16,7 +16,7 @@ requires-python = ">=3.11,<3.12"
 dependencies = [
     # What camera_common reaches for: pyjson5 to read the checked-in camera
     # config, numpy to pack depth. The pyjson5 pin is the one the node's base
-    # image installs (robot_initializer/scripts/requirements.isaac.txt), so
+    # image installs (scripts/requirements.isaac.txt), so
     # the parser under test is the parser the node runs on. That file leaves
     # numpy to Isaac Sim, which is free to move it, hence the floor here.
     "numpy>=1.26",

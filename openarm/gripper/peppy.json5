@@ -13,7 +13,7 @@
     name: "openarm_gripper",
     tag: "v1",
     implements: [
-      // Per-component readiness for the real robot_initializer.
+      // Per-component readiness for the real openarm_initializer.
       { name: "component_ready", tag: "v1", link_id: "ready" },
       // Per-motor condition telemetry: the gripper is the same DM motor as
       // every arm joint, with the same fault behaviour mid-grasp.

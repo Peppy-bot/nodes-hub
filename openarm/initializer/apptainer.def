@@ -1,0 +1,20 @@
+Bootstrap: docker
+From: peppybot/rust-cargo-base:latest
+
+%labels
+    Name openarm_initializer
+    Version v1
+
+%files
+    . /opt/openarm_initializer
+
+%post
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+
+    cd /opt/openarm_initializer
+    cargo build --release
+
+%runscript
+    cd /opt/openarm_initializer
+    exec ./target/release/openarm_initializer

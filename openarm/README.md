@@ -4,30 +4,33 @@
 
 | Component | What it does |
 |---|---|
-| [`openarm_robot_initializer`](./openarm_robot_initializer) | aggregates per-limb readiness into `is_ready` |
-| [`openarm_arm`](./openarm_arm) | drives one arm side (7 joints) |
-| [`openarm_gripper`](./openarm_gripper) | drives one gripper side (v1.0 prismatic or v2.0 pinch, by `hardware_version`) |
-| [`openarm_arm_sim`](./openarm_arm_sim) | relays one arm side between the backbone and a sim engine |
-| [`openarm_gripper_sim`](./openarm_gripper_sim) | relays one gripper side between the backbone and a sim engine |
-| [`openarm_sim_mujoco`](./openarm_sim_mujoco) | MuJoCo engine: the physics behind the relays |
-| [`openarm_sim_isaac`](./openarm_sim_isaac) | Isaac Sim engine: the physics behind the relays |
+| [`openarm_initializer`](./initializer) | aggregates per-limb readiness into `is_ready` |
+| [`openarm_arm`](./arm) | drives one arm side (7 joints) |
+| [`openarm_gripper`](./gripper) | drives one gripper side (v1.0 prismatic or v2.0 pinch, by `hardware_version`) |
+| [`openarm_sim_arm`](./sim_arm) | relays one arm side between the backbone and a sim engine |
+| [`openarm_sim_gripper`](./sim_gripper) | relays one gripper side between the backbone and a sim engine |
+| [`openarm_sim_mujoco`](./sim_mujoco) | MuJoCo engine: the physics behind the relays |
+| [`openarm_sim_isaac`](./sim_isaac) | Isaac Sim engine: the physics behind the relays |
 | `waldo` | Waldo engine: the physics behind the relays, with a Bevy browser viewer; lives in the separate `private-nodes-hub` repository, not in this hub |
-| [`openarm_backbone`](./openarm_backbone) | routes goals to the correct side |
-| [`openarm_commander`](./openarm_commander) | browser control panel |
-| [`openarm_ker`](./openarm_ker) | streams joint setpoints from a physical leader arm |
-| [`openarm_isaac_webviewer`](./openarm_isaac_webviewer) | serves the Isaac Sim WebRTC browser viewer |
-| [`openarm_scene_commander`](./openarm_scene_commander) | browser scene/object/physics control for any engine implementing the `scene_control` contract (the Isaac Sim engine and the Waldo engine) |
+| [`openarm_backbone`](./backbone) | routes goals to the correct side |
+| [`openarm_commander`](./web_commander) | browser control panel |
+| [`openarm_ker`](./ker) | streams joint setpoints from a physical leader arm |
+| [`openarm_isaac_webviewer`](./../isaac_webviewer) | serves the Isaac Sim WebRTC browser viewer |
+| [`openarm_scene_commander`](./../scene_commander) | browser scene/object/physics control for any engine implementing the `scene_control` contract (the Isaac Sim engine and the Waldo engine) |
 
-Sim support splits into engine-agnostic relays plus one node per engine: `openarm_arm_sim` and `openarm_gripper_sim` face the backbone exactly like the real nodes and lead the matching limb slot on the engine node (`openarm_sim_mujoco` or `openarm_sim_isaac`, which model v1.0 or v2.0 hardware via their `hardware_version` parameter, or `waldo`, which names its world via `world`), which owns the physics. The launcher decides which nodes fill each slot, so the backbone and the UI never know which engine is underneath.
+Sim support splits into engine-agnostic relays plus one node per engine: `openarm_sim_arm` and `openarm_sim_gripper` face the backbone exactly like the real nodes and lead the matching limb slot on the engine node (`openarm_sim_mujoco` or `openarm_sim_isaac`, which model v1.0 or v2.0 hardware via their `hardware_version` parameter, or `waldo`, which names its world via `world`), which owns the physics. The launcher decides which nodes fill each slot, so the backbone and the UI never know which engine is underneath.
 
 The third engine, `waldo`, is published by the `private-nodes-hub` repository rather than this hub. Its launcher option is `waldo`, and its Bevy browser viewer is served over https on port 8080 with a self-signed certificate.
 
-This guide takes you from a fresh machine to a moving arm. MuJoCo is the quickest way to see everything working. The Isaac browser stack (WebRTC viewer plus Scene Commander) is covered in its own section below.
+The [OpenArm fleet launcher](https://github.com/Peppy-bot/launchers-hub/blob/main/openarm/openarm_fleet.json5)
+requires matching Peppy and nodes-hub releases with named-fragment support.
+Each simulated robot owns its engine. The current stack supports one simulated
+robot alongside physical robots in wall-time mode.
 
 ## 1. Prerequisites
 
 - Ubuntu 22.04 or 24.04
-- [Peppy](https://peppy.bot) 0.16 or newer, installed with `curl -fsSL https://peppy.bot/install.sh | sh`
+- [Peppy](https://peppy.bot) with FRAMEWORK-203, installed with `curl -fsSL https://peppy.bot/install.sh | sh`
 - Docker, running
 - For Isaac only: an NVIDIA GPU with the [Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) configured
 
@@ -86,18 +89,18 @@ Each `peppy node add <path> -sb` registers the node in the stack, generates its 
 MuJoCo stack:
 
 ```sh
-peppy node add /path/to/ws/openarm-nodes/openarm_sim_mujoco -sb --idle-timeout 18000
-peppy node add /path/to/ws/openarm-nodes/openarm_arm_sim -sb --idle-timeout 1800
-peppy node add /path/to/ws/openarm-nodes/openarm_gripper_sim -sb --idle-timeout 1800
-peppy node add /path/to/ws/openarm-nodes/openarm_robot_initializer -sb --idle-timeout 1800
-peppy node add /path/to/ws/openarm-nodes/openarm_backbone -sb --idle-timeout 1800
-peppy node add /path/to/ws/openarm-nodes/openarm_commander -sb --idle-timeout 1800
+peppy node add /path/to/ws/nodes-hub/openarm/sim_mujoco -sb --idle-timeout 18000
+peppy node add /path/to/ws/nodes-hub/openarm/sim_arm -sb --idle-timeout 1800
+peppy node add /path/to/ws/nodes-hub/openarm/sim_gripper -sb --idle-timeout 1800
+peppy node add /path/to/ws/nodes-hub/openarm/initializer -sb --idle-timeout 1800
+peppy node add /path/to/ws/nodes-hub/openarm/backbone -sb --idle-timeout 1800
+peppy node add /path/to/ws/nodes-hub/openarm/web_commander -sb --idle-timeout 1800
 ```
 
 For Isaac, swap the engine node; the relays, initializer, backbone, and commander are engine-agnostic and don't need rebuilding:
 
 ```sh
-peppy node add /path/to/ws/openarm-nodes/openarm_sim_isaac -sb --idle-timeout 18000
+peppy node add /path/to/ws/nodes-hub/openarm/sim_isaac -sb --idle-timeout 18000
 ```
 
 For Waldo, the engine node comes from the `private-nodes-hub` repository: register it with `peppy repo add /path/to/ws/private-nodes-hub` (then `peppy repo refresh`) and build it with the same larger timeout:
@@ -116,9 +119,9 @@ peppy node add /path/to/ws/nodes-hub/sim_rgbd_camera -sb --idle-timeout 1800
 Real robot:
 
 ```sh
-peppy node add /path/to/ws/openarm-nodes/openarm_robot_initializer -sb --idle-timeout 1800
-peppy node add /path/to/ws/openarm-nodes/openarm_arm -sb --idle-timeout 1800
-peppy node add /path/to/ws/openarm-nodes/openarm_gripper -sb --idle-timeout 1800
+peppy node add /path/to/ws/nodes-hub/openarm/initializer -sb --idle-timeout 1800
+peppy node add /path/to/ws/nodes-hub/openarm/arm -sb --idle-timeout 1800
+peppy node add /path/to/ws/nodes-hub/openarm/gripper -sb --idle-timeout 1800
 ```
 
 Both hardware generations run the same nodes; the launcher's `hardware_version` argument selects which one each arm and gripper drives.
@@ -137,41 +140,32 @@ Every node you added should show `Stage: Ready`. If one is stuck at an earlier s
 
 ## 4. Launch the stack
 
-The `--with=` selection names the engine, so pick the one matching the nodes built above:
+Select a complete robot in one command. These are separate sessions:
 
 ```sh
-# MuJoCo
-peppy stack launch openarm_v2 --with=mujoco
-# Isaac
-peppy stack launch openarm_v2 --with=isaac_sim
-# Waldo
-peppy stack launch openarm_v2 --with=waldo
+# Physical v2 with the web commander.
+peppy stack launch openarm_fleet -i alpha --with openarm_v2,web_commander
+
+# Simulated v2 with the web commander.
+peppy stack launch openarm_fleet -i alpha --with openarm_v2_sim,mujoco,web_commander
+peppy stack launch openarm_fleet -i alpha --with openarm_v2_sim,isaac_sim,web_commander
+peppy stack launch openarm_fleet -i alpha --with openarm_v2_sim,waldo,web_commander
 ```
 
-The launcher starts the instances in dependency order (sim first, then arms and grippers, then backbone, then the UI) and wires them together. Once it prints `Launch complete`:
-
-- open **http://localhost:8765** for the control panel, one slider per joint
-- MuJoCo: open **http://localhost:8080** for the browser viewer
-- Waldo: open **https://localhost:8080** for the Bevy browser viewer (accept the self-signed certificate once)
-- Isaac: open **http://<ISAAC_HOST_IP>:8210** for the WebRTC browser viewer (see the [Isaac browser stack](#isaac-browser-stack-webrtc-viewer-and-scene-commander) section below)
-
-Move a slider, press **Send**, and watch the arm follow in the viewer. The launchers themselves are documented in [launchers-hub/openarm](https://github.com/Peppy-bot/launchers-hub/tree/main/openarm). Check the stack's health any time:
+MuJoCo and Isaac Sim also accept `openarm_v1_sim`. Waldo supplies the v2 world.
+Add `lerobot_recorder` to record, and `sim_cameras` for rendered v2 cameras.
+Use `xr_commander` or `mcp_commander` to select another command surface.
+Simulation and scene control belong to the stack. Removing a robot leaves the
+engine and its preloaded model running; `stack reset` stops everything. Select
+the engine, generation, and rendered-camera configuration at initial launch.
+A second simulated robot is rejected. Additional physical robots can join:
 
 ```sh
+peppy stack join -i bravo --with openarm_v1 --place bravo@jetson-2
 peppy stack list
+peppy stack remove bravo
+peppy stack reset --federated
 ```
-
-Every instance should be `running` and `healthy`. To stop everything, Ctrl-C the launch terminal, or stop instances individually:
-
-```sh
-peppy node stop commander_inst
-```
-
----
-
-# Isaac browser stack: WebRTC viewer and Scene Commander
-
-The Isaac stack streams to a plain browser over WebRTC and adds two browser tools on top of the sim: the **Isaac viewer** (live video at `:8210`) and the **Scene Commander** (scene/object/physics control at `:8766`). This section covers the WebRTC configuration and what each tool does.
 
 ## Configure Isaac WebRTC
 
@@ -253,7 +247,7 @@ When working directly on the Isaac machine:
 http://127.0.0.1:8766
 ```
 
-Scene Commander is used to construct and modify the simulated environment while the simulator is running. It drives any engine implementing the `scene_control` contract: the Isaac Sim engine and the Waldo engine (`peppy stack launch openarm_v2 --with=waldo,scene_commander`).
+Scene Commander is used to construct and modify the simulated environment while the simulator is running. It drives any engine implementing the `scene_control` contract: the Isaac Sim engine and the Waldo engine (`peppy stack launch openarm_fleet -i alpha --with openarm_v2_sim,waldo,scene_commander`).
 
 ### Scene controls
 

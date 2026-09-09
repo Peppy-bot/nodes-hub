@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Isaac Sim SimLauncher for openarm_robot_initializer."""
+"""Isaac Sim SimLauncher for openarm_initializer."""
 
 # pylint: disable=R0903
 
