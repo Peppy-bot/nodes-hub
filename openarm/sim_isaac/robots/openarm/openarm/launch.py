@@ -69,7 +69,6 @@ _ROBOTS_DIR = Path(__file__).resolve().parents[1]
 # while the arms move, past the backbone's stale window; this size stays inside
 # it. The livestream shows this frame.
 _RENDER_CONFIG = {
-CONFIG = {
     "renderer": "PathTracing",
     "width": 1280,
     "height": 720,
