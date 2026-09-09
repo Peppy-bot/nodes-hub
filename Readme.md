@@ -84,17 +84,25 @@ publishes. Rename yours: within one repository, a `name:tag` is claimed by exact
 
 ## Tests
 
-CI runs this repository's Rust and Python tests on every pull request and on every push to `main`.
-Nothing lists them: each run discovers every directory holding a `Cargo.toml` and every
+CI runs Rust, Python, JavaScript and TypeScript tests on every pull request and push to `main`.
+
+An independent Node 24 job runs every tracked `*.test.*` and `*.spec.*` suite with a `.js`, `.mjs`,
+`.cjs`, `.ts`, `.mts` or `.cts` extension, at any depth in the repository. It excludes dependencies,
+generated interfaces, virtual environments and build outputs. These suites use Node's built-in
+`node:test` runner and require no node-specific workflow entries. TypeScript runs with Node's
+native type stripping; this executes tests without type-checking. Run a suite locally with
+`node --test path/to/example.test.ts` (or its JavaScript filename).
+
+Rust and Python tests are also discovered automatically: each run discovers every directory holding a `Cargo.toml` and every
 `test_*.py` / `*_test.py` file from the filesystem, so a node's first test starts running in CI on
 the pull request that adds it.
 
-A pull request runs only the nodes its diff touches, since nineteen nodes' suites are too expensive
+For Rust and Python, a pull request runs only the nodes its diff touches, since their suites are too expensive
 to rerun for a one-node change. A change that lands outside every node, a grouping folder's Readme
 or `peppy_repository.json5` for instance, runs the full suite instead, and so does every push to
 `main`. The run summary names the crates and test files that ran and the crates that were skipped.
 
-Each node's tests run inside a container built from its `apptainer.def`: the base image plus
+Each node's Rust and Python tests run inside a container built from its `apptainer.def`: the base image plus
 everything the def prepares before it enters the copied source and builds it. So a test that needs a
 system library gets it the same way the node itself does, by declaring it in the def, and the runner
 host needs nothing. A node with no def runs in the base image peppy scaffolds for its language.
