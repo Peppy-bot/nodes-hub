@@ -1,17 +1,8 @@
 name: Tests
 
-# Runs the repository's Rust, Python, JavaScript and TypeScript tests.
-# The Node test job discovers standalone suites across the whole repository.
-# The Rust/Python inventory is discovered from
-# the filesystem on each run rather than maintained by hand, so a new crate or
-# test file starts running in CI on the pull request that adds it, and a pull
-# request runs only the nodes its diff touches: nineteen nodes' suites are too
-# expensive to rerun for a one-node change. A change outside every node (this
-# workflow, the repository index, ...) and every push to main still run the
-# full suite, so anything a scoped run could miss is caught on the integration
-# branch. Documentation is the one exception: a Markdown file outside every
-# node, a grouping folder's Readme say, is built and tested by nothing, so it
-# selects nothing and triggers nothing.
+# Runs every repository Rust, Python, JavaScript and TypeScript test on each
+# pull request and push to main. Test discovery follows filesystem conventions
+# at every depth, so new projects and suites need no workflow entries.
 #
 # Every node depends on generated code (its gitignored `.peppy/libs`) that only
 # a running peppy daemon can produce, since `peppy node sync` calls the daemon's
@@ -36,10 +27,26 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  python-syntax:
+    name: Python syntax
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    # Use the newest Python minor required by repository projects. This is a
+    # syntax gate; each project's tests still use its own Python requirements.
+    container: python:3.13
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Compile every tracked Python file
+        run: python .github/scripts/check-python-syntax.py
+
   javascript-typescript:
     name: JavaScript and TypeScript tests
     runs-on: blacksmith-4vcpu-ubuntu-2404
-    container: node:24
     timeout-minutes: 15
     permissions:
       contents: read
@@ -48,36 +55,17 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
       - name: Discover and run Node test suites
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Native Node tests can use JavaScript or erasable TypeScript. Match
-          # test/spec files at any depth, including the repository root.
-          # The job container and checkout can have different owners. Trust only
-          # this workspace, for this read-only discovery command.
-          git -c safe.directory="$GITHUB_WORKSPACE" ls-files -z -- \
-            ':(glob)**/*.test.[jt]s' ':(glob)**/*.test.[cm][jt]s' \
-            ':(glob)**/*.spec.[jt]s' ':(glob)**/*.spec.[cm][jt]s' \
-            > "$RUNNER_TEMP/node-test-files"
-          tests=()
-          while IFS= read -r -d '' file; do
-            case "/$file" in
-              */node_modules/*|*/.peppy/*|*/target/*|*/dist/*|*/build/*|*/.venv/*|*/venv/*) continue ;;
-            esac
-            tests+=("./$file")
-          done < "$RUNNER_TEMP/node-test-files"
-          # Bare node --test performs its own discovery; never invoke it when
-          # this inventory is empty.
-          if [ "${#tests[@]}" -eq 0 ]; then
-            echo 'No JavaScript or TypeScript Node test suites found.'
-            exit 0
-          fi
-          printf 'Running %s\n' "${tests[@]}"
-          node --test "${tests[@]}"
+        run: python3 .github/scripts/run-node-tests.py
 
   discover-and-run:
-    name: Every Rust and Python test the change reaches
+    name: All Rust and Python tests
     # x86 rather than the -arm label: the base images and the librealsense apt
     # repository are published for both, and the sticky disk key below carries
     # the architecture, so switching is a label change that starts from an
@@ -95,9 +83,6 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          # Full history: the discovery step diffs the pull request against its
-          # base to decide which nodes' tests to run.
-          fetch-depth: 0
           # Nothing here pushes, so the job has no use for a writable
           # credential sitting in .git/config for every later step to inherit.
           persist-credentials: false
@@ -122,528 +107,42 @@ jobs:
           path: ~/.cache/nodes-hub-ci
           commit: ${{ github.event_name == 'push' }}
 
-      # The path the disk is mounted at: the later steps and
-      # derive-test-image.sh reach the caches through this variable.
       - name: Name the caches this run reuses
-        run: echo "CI_CACHE_DIR=$HOME/.cache/nodes-hub-ci" >> "$GITHUB_ENV"
+        run: python3 .github/scripts/configure-build-cache.py
 
-      # Rust tests are discovered per crate, since cargo itself finds every
-      # #[test] and tests/ target inside one, so the unit of the Rust list is a
-      # directory holding a Cargo.toml. Python tests are discovered per file by
-      # the pytest naming conventions. `.peppy` is excluded because the
-      # generated libs vendored there carry manifests and tests of their own
-      # that are peppy's to run, not this repository's; any `target/` or
-      # virtualenv tree in the checkout is excluded for the same reason.
-      #
-      # A project is a directory holding a crate or a node, at whatever depth
-      # the layout puts it: `realsense_d4xx`, `uvc_camera/linux` and
-      # `example_robot/my_robot_brain/my_python_robot_brain` are all projects,
-      # while the folders grouping interchangeable nodes are not. On a pull
-      # request only the projects the diff touches are selected; a file changed
-      # outside every project falls back to the full suite, because nothing
-      # narrower can be proven safe for it — except a Markdown file, which
-      # nothing builds or tests, so it is skipped rather than escalated. Every
-      # skipped crate is named in the run summary, so a scoped run never
-      # silently reads as full coverage.
-      - name: Discover the tests this change reaches
+      - name: Discover all Rust and Python tests
         id: discover
-        # Byte collation throughout: under a UTF-8 locale the runner's sort
-        # weighs letters over separators, so uvc_camera/linux and
-        # uvc_camera_controls_tests compare equal and whichever order find
-        # produced survives, which comm's bytewise check then rejects with
-        # "not in sorted order". Every list this step builds is sorted and
-        # consumed inside this step alone, so C collation is self-consistent
-        # whatever locale the runner itself runs under.
-        env:
-          LC_ALL: C
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: |
-          set -euo pipefail
-          find . -name Cargo.toml \
-            -not -path '*/target/*' -not -path '*/.peppy/*' \
-            -printf '%h\n' | sed 's|^\./||' | sort \
-            > "$RUNNER_TEMP/all-rust-dirs.txt"
-          find . -type f \( -name 'test_*.py' -o -name '*_test.py' \) \
-            -not -path '*/target/*' -not -path '*/.peppy/*' \
-            -not -path '*/.venv/*' -not -path '*/venv/*' \
-            | sed 's|^\./||' | sort \
-            > "$RUNNER_TEMP/all-python-tests.txt"
-          {
-            cat "$RUNNER_TEMP/all-rust-dirs.txt"
-            find . -name peppy.json5 -not -path '*/.peppy/*' \
-              -printf '%h\n' | sed 's|^\./||'
-          } | sort -u > "$RUNNER_TEMP/projects.txt"
+        run: python3 .github/scripts/discover-tests.py
 
-          # The project a path belongs to is the longest of its ancestors, or
-          # itself, that is one. Prints nothing for a path outside every
-          # project, which is what sends a root-level change to the full suite.
-          owning_project() {
-            local path=$1 projects=$2
-            while [ "$path" != "." ]; do
-              if grep -qxF "$path" "$projects"; then
-                printf '%s\n' "$path"
-                return
-              fi
-              path=$(dirname "$path")
-            done
-          }
-
-          run_all=true
-          scope="the full suite"
-          : > "$RUNNER_TEMP/selected-projects.txt"
-          if [ "$GITHUB_EVENT_NAME" = "pull_request" ] && [ -n "${BASE_SHA:-}" ]; then
-            if changed=$(git diff --name-only "$BASE_SHA...HEAD") && [ -n "$changed" ]; then
-              run_all=false
-              scope="the projects this pull request touches"
-              while IFS= read -r file; do
-                project=$(owning_project "$file" "$RUNNER_TEMP/projects.txt")
-                if [ -n "$project" ]; then
-                  echo "$project" >> "$RUNNER_TEMP/selected-projects.txt"
-                elif [[ "${file,,}" == *.md ]]; then
-                  continue
-                else
-                  run_all=true
-                  scope="the full suite ($file is outside every project)"
-                  break
-                fi
-              done <<< "$changed"
-              if [ "$run_all" = false ] && [ ! -s "$RUNNER_TEMP/selected-projects.txt" ]; then
-                scope="nothing: this pull request changes only documentation outside every project"
-              fi
-            else
-              echo "could not diff against the pull request base; running the full suite" >&2
-            fi
-          fi
-
-          if [ "$run_all" = true ]; then
-            cp "$RUNNER_TEMP/projects.txt" "$RUNNER_TEMP/selected-projects.txt"
-            cp "$RUNNER_TEMP/all-rust-dirs.txt" "$RUNNER_TEMP/rust-test-dirs.txt"
-            cp "$RUNNER_TEMP/all-python-tests.txt" "$RUNNER_TEMP/python-test-files.txt"
-          else
-            sort -u -o "$RUNNER_TEMP/selected-projects.txt" "$RUNNER_TEMP/selected-projects.txt"
-            : > "$RUNNER_TEMP/rust-test-dirs.txt"
-            : > "$RUNNER_TEMP/python-test-files.txt"
-            while IFS= read -r crate_dir; do
-              if [ -n "$(owning_project "$crate_dir" "$RUNNER_TEMP/selected-projects.txt")" ]; then
-                echo "$crate_dir" >> "$RUNNER_TEMP/rust-test-dirs.txt"
-              fi
-            done < "$RUNNER_TEMP/all-rust-dirs.txt"
-            while IFS= read -r test_file; do
-              if [ -n "$(owning_project "$test_file" "$RUNNER_TEMP/selected-projects.txt")" ]; then
-                echo "$test_file" >> "$RUNNER_TEMP/python-test-files.txt"
-              fi
-            done < "$RUNNER_TEMP/all-python-tests.txt"
-          fi
-
-          # pytest runs once per project uv manages, over that project's
-          # selected files, because each one locks and installs its own
-          # dependencies. The project is the nearest ancestor of a test file
-          # holding the pyproject.toml uv reads.
-          : > "$RUNNER_TEMP/python-test-projects.txt"
-          while IFS= read -r test_file; do
-            project=$(dirname "$test_file")
-            while [ "$project" != "." ] && [ ! -f "$project/pyproject.toml" ]; do
-              project=$(dirname "$project")
-            done
-            if [ "$project" = "." ]; then
-              echo "::error::$test_file has no pyproject.toml above it to run pytest from"
-              exit 1
-            fi
-            echo "$project" >> "$RUNNER_TEMP/python-test-projects.txt"
-          done < "$RUNNER_TEMP/python-test-files.txt"
-          sort -u -o "$RUNNER_TEMP/python-test-projects.txt" "$RUNNER_TEMP/python-test-projects.txt"
-
-          # Only a selected project that is a node and actually has tests needs
-          # its interface code generated. A tested node's dependency on another
-          # node resolves through the daemon's repository registry, which reads
-          # that node's manifest straight from the checkout, so the dependency
-          # itself needs no sync.
-          : > "$RUNNER_TEMP/sync-dirs.txt"
-          while IFS= read -r project; do
-            if [ -f "$project/peppy.json5" ]; then
-              echo "$project" >> "$RUNNER_TEMP/sync-dirs.txt"
-            fi
-          done < <(sort -u "$RUNNER_TEMP/rust-test-dirs.txt" "$RUNNER_TEMP/python-test-projects.txt")
-
-          any=false
-          if [ -s "$RUNNER_TEMP/rust-test-dirs.txt" ] || [ -s "$RUNNER_TEMP/python-test-files.txt" ]; then
-            any=true
-          fi
-          echo "any=$any" >> "$GITHUB_OUTPUT"
-
-          {
-            echo "Running ${scope}."
-            echo
-            echo "### Rust test crates"
-            if [ -s "$RUNNER_TEMP/rust-test-dirs.txt" ]; then
-              sed 's/^/- /' "$RUNNER_TEMP/rust-test-dirs.txt"
-            else
-              echo "_none selected_"
-            fi
-            echo
-            echo "### Python test files"
-            if [ -s "$RUNNER_TEMP/python-test-files.txt" ]; then
-              sed 's/^/- /' "$RUNNER_TEMP/python-test-files.txt"
-            else
-              echo "_none selected_"
-            fi
-            skipped=$(comm -23 "$RUNNER_TEMP/all-rust-dirs.txt" "$RUNNER_TEMP/rust-test-dirs.txt")
-            if [ -n "$skipped" ]; then
-              echo
-              echo "### Skipped crates (untouched by this change)"
-              echo "$skipped" | sed 's/^/- /'
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      # Installed by extracting the release under RUNNER_TEMP rather than
-      # through scripts/install.sh: nothing here wants a ~/.peppy, and the
-      # whole job lives in the checkout and its own temp dir. Unlike the
-      # repository-index workflow this extracts the whole archive, not just
-      # bin/peppy, because `service serve` needs the bundled layout around the
-      # binary (zenohd, and the apptainer install under bin/apptainer that the
-      # next step readies). Set the PEPPY_VERSION repository variable to pin a
-      # release; it defaults to the latest. The generator inside peppy must
-      # match what the crates' committed Cargo.tomls expect of peppygen, so
-      # bump the pin together with peppy releases that change generated code.
-      #
-      # PEPPY_VERSION reaches the script through the environment rather than a
-      # `${{ }}` expansion, so its value is data the shell reads instead of
-      # source the shell parses, and the shape check turns a typo into a named
-      # failure rather than a 404 from a URL built out of it.
       - name: Install peppy
         if: steps.discover.outputs.any == 'true'
         env:
           PEPPY_VERSION: ${{ vars.PEPPY_VERSION }}
-        run: |
-          set -euo pipefail
-          version="${PEPPY_VERSION:-latest}"
-          if [[ "$version" == "latest" ]]; then
-            channel="latest"
-          elif [[ "$version" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            channel="v${version#v}"
-          else
-            echo "PEPPY_VERSION must be 'latest' or a release such as 0.25.0, got: $version" >&2
-            exit 1
-          fi
+        run: python3 .github/scripts/install-peppy.py
 
-          case "$(uname -m)" in
-            x86_64 | amd64) arch="x86_64" ;;
-            aarch64 | arm64) arch="aarch64" ;;
-            *) echo "unsupported runner architecture: $(uname -m)" >&2; exit 1 ;;
-          esac
-
-          dest="$RUNNER_TEMP/peppy-dist"
-          mkdir -p "$dest"
-          curl -fsSL --connect-timeout 10 --max-time 300 \
-            "https://peppy.bot/$channel/peppy-$arch-unknown-linux-gnu.tgz" \
-            | tar -xzf - -C "$dest"
-          chmod +x "$dest/bin/peppy"
-          echo "$dest/bin" >> "$GITHUB_PATH"
-
-          # The binary answers `--version` before building any app context,
-          # so no PEPPY_HOME is needed here. `latest` resolves to a different
-          # release over time, so the log and the run summary both record
-          # which release this run actually executed, and the lockfile check
-          # below names it as the cause when the interfaces it generates have
-          # moved out from under the committed lockfiles.
-          installed=$("$dest/bin/peppy" --version)
-          echo "PEPPY_INSTALLED=$installed" >> "$GITHUB_ENV"
-          printf '\nInstalled %s (channel: %s)\n' "$installed" "$channel" \
-            | tee -a "$GITHUB_STEP_SUMMARY"
-
-      # The daemon refuses to boot unless the apptainer install it resolves
-      # is ready for unprivileged use: `newuidmap` on PATH, and on a kernel
-      # that restricts unprivileged user namespaces through AppArmor (Ubuntu
-      # 24.04's default) a root-installed profile keyed to the canonical path
-      # of that install's `starter` binary. The VM is fresh, so every run
-      # readies the install it just extracted: `peppy container setup` applies
-      # whatever its fix script needs through sudo when stdin is not a
-      # terminal, and rechecks before exiting 0. Today's Blacksmith image
-      # mounts no AppArmor securityfs, so it needs nothing; the step is what
-      # keeps that an observation rather than an assumption. The daemon would
-      # find bin/apptainer beside bin/peppy by itself; it is exported because
-      # the test steps and derive-test-image.sh run the same install directly.
-      #
-      # `apptainer build` runs a def's %post as fakeroot, which needs a
-      # subordinate id range for the runner user besides newuidmap. The
-      # runner image ships one; should it ever not, this allocates one past
-      # the highest range in use rather than failing in a def's apt-get a
-      # cold build later.
       - name: Ready the bundled apptainer for unprivileged use
         if: steps.discover.outputs.any == 'true'
-        run: |
-          set -euo pipefail
-          PEPPY_APPTAINER_DIR="$RUNNER_TEMP/peppy-dist/bin/apptainer"
-          echo "PEPPY_APPTAINER_DIR=$PEPPY_APPTAINER_DIR" >> "$GITHUB_ENV"
-          export PEPPY_APPTAINER_DIR
-          peppy container setup < /dev/null
+        run: python3 .github/scripts/setup-apptainer.py
 
-          user=$(id -un)
-          for kind in subuid subgid; do
-            if ! grep -qs "^$user:" "/etc/$kind"; then
-              start=$(awk -F: 'BEGIN { m = 100000 } { e = $2 + $3; if (e > m) m = e } END { print m }' \
-                "/etc/$kind" 2>/dev/null || echo 100000)
-              sudo usermod "--add-${kind}s" "$start-$((start + 65535))" "$user"
-            fi
-          done
-
-      # The daemon gets its own data root and port under RUNNER_TEMP: the CLI
-      # finds it through PEPPY_HOME/daemon_state.json5, so pointing PEPPY_HOME
-      # at the run's directory is discovery and isolation from any other
-      # daemon in one. The name carries the run id because core-node names
-      # must be unique among daemons that can reach each other.
       - name: Start an isolated peppy daemon
         if: steps.discover.outputs.any == 'true'
-        run: |
-          set -euo pipefail
-          PEPPY_HOME="$RUNNER_TEMP/peppy-home"
-          mkdir -p "$PEPPY_HOME"
-          PEPPY_MESSAGING_PORT=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
-          {
-            echo "PEPPY_HOME=$PEPPY_HOME"
-            echo "PEPPY_MESSAGING_PORT=$PEPPY_MESSAGING_PORT"
-          } >> "$GITHUB_ENV"
-          export PEPPY_HOME PEPPY_MESSAGING_PORT
+        run: python3 .github/scripts/start-peppy-daemon.py
 
-          nohup peppy service serve --core-node-name "ci-tests-$GITHUB_RUN_ID" \
-            > "$RUNNER_TEMP/peppy-serve.log" 2>&1 &
-          for _ in $(seq 1 30); do
-            if [ -f "$PEPPY_HOME/daemon_state.json5" ]; then exit 0; fi
-            sleep 1
-          done
-          echo "daemon did not come up; serve log:" >&2
-          cat "$RUNNER_TEMP/peppy-serve.log" >&2
-          exit 1
-
-      # The bundled defaults register the GitHub copy of this repository. With
-      # it present, one node's dependency on another node changed by this pull
-      # request could resolve to the stale main-branch copy instead of the
-      # checkout, so it is removed and the checkout registered in its place.
-      # The other hub repositories stay: the contracts these nodes implement
-      # genuinely live there.
       - name: Generate the tested nodes' interface code
         if: steps.discover.outputs.any == 'true'
-        run: |
-          set -euo pipefail
-          repo_id=$(grep -B 3 'Peppy-bot/nodes-hub' "$PEPPY_HOME/conf/repositories.json5" \
-            | sed -n 's/.*id: *\([0-9]*\),.*/\1/p' | head -1)
-          if [ -n "$repo_id" ]; then
-            peppy repo remove "$repo_id"
-          fi
-          peppy repo add "$GITHUB_WORKSPACE"
-          peppy repo refresh
+        run: python3 .github/scripts/sync-test-nodes.py
 
-          # Only the nodes whose tests were selected; the generated code is
-          # gitignored and per-node. --include-repositories lets a node's
-          # dependency on a contract or another node resolve through the
-          # registered repositories; nothing is in the node stack here.
-          while IFS= read -r node_dir; do
-            echo "::group::peppy node sync $node_dir"
-            peppy node sync "$node_dir" --include-repositories
-            echo "::endgroup::"
-          done < "$RUNNER_TEMP/sync-dirs.txt"
-
-      # `cargo test --locked` reports a stale lockfile by naming the lockfile
-      # and nothing else, once per crate, so a peppy release that changes what
-      # the generated `.peppy/libs` require reads as every crate in the
-      # repository failing for no stated reason: the release moves peppylib's
-      # own dependencies, and every committed lockfile pins what the release
-      # before it asked for. This resolves every selected crate before any of
-      # them is compiled, and names the release and the fix when one cannot.
-      #
-      # Resolution runs in the crate's own image, the one the step below is
-      # about to build it in, because which versions satisfy a manifest is a
-      # question about the toolchain resolving it: a def is free to prepare
-      # one of its own, and a verdict reached under a rustc nothing here runs
-      # is a verdict about a build nothing here runs. Every image is cached by
-      # the time that step reaches it, so none is built twice.
-      #
-      # uv reports this same drift by naming the lockfile and the command that
-      # fixes it, so nothing here translates for it, and one
-      # `scripts/relock.sh` refreshes both languages anyway.
       - name: Prove the committed lockfiles resolve against the generated interfaces
         if: steps.discover.outputs.any == 'true'
-        run: |
-          set -euo pipefail
-          mkdir -p "$CI_CACHE_DIR/cargo-home"
-          stale=()
-          reports="$RUNNER_TEMP/stale-lockfiles.txt"
-          : > "$reports"
-          # cargo's own account of each refusal is captured rather than logged
-          # as it happens: read in a row they are the noise this step exists to
-          # replace, and they belong under the error that explains them.
-          while IFS= read -r crate_dir <&3; do
-            image=$("$GITHUB_WORKSPACE/.github/scripts/derive-test-image.sh" \
-              "$crate_dir" peppybot/rust-cargo-base:latest)
-            if ! report=$("$PEPPY_APPTAINER_DIR/bin/apptainer" exec --cleanenv --no-home \
-                --pwd "/work/$crate_dir" \
-                --bind "$GITHUB_WORKSPACE:/work" \
-                --bind "$CI_CACHE_DIR/cargo-home:/cargo" \
-                --bind "$PEPPY_HOME" \
-                --env CARGO_HOME=/cargo \
-                --env RUSTUP_HOME=/root/.rustup \
-                "$image" cargo metadata --locked --format-version 1 2>&1 > /dev/null); then
-              stale+=("$crate_dir")
-              printf '%s:\n%s\n\n' "$crate_dir" "$report" >> "$reports"
-            fi
-          done 3< "$RUNNER_TEMP/rust-test-dirs.txt"
-          if [ "${#stale[@]}" -eq 0 ]; then
-            exit 0
-          fi
-          echo "::group::what cargo reported"
-          cat "$reports"
-          echo "::endgroup::"
-          {
-            echo
-            echo "### Lockfiles do not resolve against the generated interfaces"
-            echo
-            echo "\`$PEPPY_INSTALLED\` generates a \`.peppy/libs\` these lockfiles cannot resolve against:"
-            printf -- '- %s\n' "${stale[@]}"
-            echo
-            echo "Run \`scripts/relock.sh\` against that release and commit what it rewrites."
-          } >> "$GITHUB_STEP_SUMMARY"
-          echo "::error::${#stale[@]} committed lockfile(s) do not resolve against $PEPPY_INSTALLED's generated interfaces: run scripts/relock.sh and commit what it rewrites"
-          exit 1
+        run: python3 .github/scripts/check-lockfiles.py
 
-      # Each selected crate's tests run inside the container image its node's
-      # apptainer.def declares, so the runner host needs none of the crates'
-      # system build dependencies: realsense_d4xx builds against a
-      # librealsense2-dev that only its own def knows the apt repository for.
-      # A crate whose node ships no def, like the example_robot ones, gets the
-      # base image peppy scaffolds for a Rust node. Build and exec both run
-      # unprivileged through the same user-namespace apptainer install readied
-      # above.
-      #
-      # Inside the container the workspace is /work and the daemon's data root
-      # is bound at its host path, because each node's .peppy/libs entries are
-      # absolute symlinks into it. The base image's rustup lives under /root
-      # (its docker build ran as root) with no env set, hence the explicit
-      # RUSTUP_HOME; CARGO_HOME and the per-crate target dirs are on the sticky
-      # disk so registries and builds warm across runs. The target dirs
-      # are per crate, never shared: every crate vendors a generated
-      # `peppygen 0.1.0` with different contents, and in a shared target dir
-      # cargo reuses one crate's peppygen artifact for another. Incremental
-      # compilation is off: its caches are much of a debug target dir and the
-      # sticky disk is billed per gigabyte, while all it would save is the
-      # seconds a warm rebuild of a crate's own code takes.
-      #
-      # Every selected crate runs even after one fails, so a red run names
-      # every failing crate instead of the first. --locked proves the build
-      # consumed each committed lockfile rather than re-resolving it; the diff
-      # check at the end proves nothing rewrote them.
-      - name: Run the selected Rust tests in their build containers
+      - name: Run all Rust tests in their build containers
         if: steps.discover.outputs.any == 'true'
-        run: |
-          set -euo pipefail
-          failed=()
-          # The lists are read on fd 3, so a test that reads stdin cannot eat
-          # the crates queued behind it.
-          while IFS= read -r crate_dir <&3; do
-            image=$("$GITHUB_WORKSPACE/.github/scripts/derive-test-image.sh" \
-              "$crate_dir" peppybot/rust-cargo-base:latest)
-            mkdir -p "$CI_CACHE_DIR/cargo-home" "$CI_CACHE_DIR/target/$crate_dir"
-            echo "::group::cargo test: $crate_dir"
-            if "$PEPPY_APPTAINER_DIR/bin/apptainer" exec --cleanenv --no-home \
-                --pwd "/work/$crate_dir" \
-                --bind "$GITHUB_WORKSPACE:/work" \
-                --bind "$CI_CACHE_DIR/cargo-home:/cargo" \
-                --bind "$CI_CACHE_DIR/target/$crate_dir:/target" \
-                --bind "$RUNNER_TEMP/peppy-dist:/peppy-dist" \
-                --bind "$PEPPY_HOME" \
-                --env CARGO_HOME=/cargo \
-                --env RUSTUP_HOME=/root/.rustup \
-                --env CARGO_TARGET_DIR=/target \
-                --env CARGO_INCREMENTAL=0 \
-                --env PEPPY_ZENOHD_PATH=/peppy-dist/bin/zenohd \
-                --env CARGO_TERM_COLOR=always \
-                "$image" cargo test --locked; then
-              echo "::endgroup::"
-            else
-              echo "::endgroup::"
-              echo "::error::cargo test failed in $crate_dir"
-              failed+=("$crate_dir")
-            fi
-          done 3< "$RUNNER_TEMP/rust-test-dirs.txt"
-          if [ "${#failed[@]}" -gt 0 ]; then
-            echo "failing crates: ${failed[*]}" >&2
-            exit 1
-          fi
+        run: python3 .github/scripts/run-rust-tests.py
 
-      # pytest runs in the same container the node ships in, for the same
-      # reason cargo does: xr_commander imports an opencv that links a libGL
-      # only its def installs, and lerobot_recorder's dataset writer shells out
-      # to an ffmpeg only its own def installs. A node shipping no def gets the
-      # base image peppy scaffolds for a Python node.
-      #
-      # uv's download cache and its managed interpreters are on the sticky
-      # disk, so a warm run installs a torch it already has instead of
-      # fetching lerobot's tree again. The environments built out of them are
-      # per run, because uv locks its cache but not a project environment, and
-      # two runs sharing one would corrupt it. --locked proves the environment
-      # came from the committed uv.lock rather than a fresh resolution. pytest
-      # is supplied here rather than required of each node, so a node that adds
-      # its first test file is run by CI whether or not it also declared a test
-      # dependency group.
-      #
-      # The peppy distribution is bound in and its zenohd named outright, the
-      # same way the Rust step names it: a suite that boots its node through
-      # the generated harness starts an ephemeral router of its own, and
-      # nothing in the container can find the binary to start it with.
-      # --cleanenv keeps the runner's PATH out, so the `zenohd` beside the
-      # `peppy` on it — the fallback the resolver would otherwise reach — is
-      # not visible here, and a node's own image has no reason to ship one.
-      #
-      # Every selected project runs even after one fails, so a red run names
-      # every failing node instead of the first.
-      - name: Run the selected Python tests in their build containers
+      - name: Run all Python tests in their build containers
         if: steps.discover.outputs.any == 'true'
-        run: |
-          set -euo pipefail
-          failed=()
-          # The list is read on fd 3, so a test that reads stdin cannot eat the
-          # projects queued behind it.
-          while IFS= read -r project <&3; do
-            image=$("$GITHUB_WORKSPACE/.github/scripts/derive-test-image.sh" \
-              "$project" peppybot/python-uv-base:latest)
-            mkdir -p "$CI_CACHE_DIR/uv/cache" "$CI_CACHE_DIR/uv/python" \
-              "$CI_CACHE_DIR/uv/home" "$RUNNER_TEMP/uv-environments"
-            mapfile -t tests < <(awk -v prefix="$project/" \
-              'index($0, prefix) == 1 { print substr($0, length(prefix) + 1) }' \
-              "$RUNNER_TEMP/python-test-files.txt")
-            echo "::group::pytest: $project"
-            if "$PEPPY_APPTAINER_DIR/bin/apptainer" exec --cleanenv --no-home \
-                --pwd "/work/$project" \
-                --bind "$GITHUB_WORKSPACE:/work" \
-                --bind "$CI_CACHE_DIR/uv:/uv" \
-                --bind "$RUNNER_TEMP/uv-environments:/environments" \
-                --bind "$RUNNER_TEMP/peppy-dist:/peppy-dist" \
-                --env HOME=/uv/home \
-                --env UV_CACHE_DIR=/uv/cache \
-                --env UV_PYTHON_INSTALL_DIR=/uv/python \
-                --env UV_PROJECT_ENVIRONMENT="/environments/${project//\//.}" \
-                --env PEPPY_ZENOHD_PATH=/peppy-dist/bin/zenohd \
-                "$image" uv run --locked --with pytest pytest "${tests[@]}"; then
-              echo "::endgroup::"
-            else
-              echo "::endgroup::"
-              echo "::error::pytest failed in $project"
-              failed+=("$project")
-            fi
-          done 3< "$RUNNER_TEMP/python-test-projects.txt"
-          if [ "${#failed[@]}" -gt 0 ]; then
-            echo "failing projects: ${failed[*]}" >&2
-            exit 1
-          fi
+        run: python3 .github/scripts/run-python-tests.py
 
-      # Proves what was tested is what is committed. The lock half proves the
-      # builds consumed the committed lockfiles rather than re-resolving them;
-      # the manifest half catches `peppy node sync` rewriting a Cargo.toml or a
-      # pyproject.toml, which happens whenever the repository lags the
-      # installed generator's scaffolding, and the fix is to run the sync
-      # locally and commit the result. Must stay after the test steps: placed
-      # before them, it proves nothing.
       - name: Prove CI tested the committed manifests and lockfiles
-        run: |
-          git diff --exit-code -- \
-            ':(glob)**/Cargo.toml' ':(glob)**/Cargo.lock' \
-            ':(glob)**/pyproject.toml' ':(glob)**/uv.lock'
+        run: python3 .github/scripts/check-tested-manifests.py
