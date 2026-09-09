@@ -36,7 +36,7 @@ and stops any playing gesture.
 ## Build
 
 ```sh
-peppy node add /path/to/ws/openarm-nodes/openarm_commander -sb --idle-timeout 1800
+peppy node add /path/to/ws/nodes-hub/openarm/web_commander -sb --idle-timeout 1800
 ```
 
 Re-run with `--force` after code changes. The node shows up at `Stage: Ready` in
@@ -48,10 +48,10 @@ It needs a running backbone, so the usual way is through a launcher; the
 [top-level README](../README.md) has the complete sequence:
 
 ```sh
-peppy stack launch /path/to/ws/launchers-hub/openarm/openarm_v2_teleop_mujoco.json5
+peppy stack launch openarm_fleet -i alpha --with openarm_v2_sim,mujoco,web_commander
 ```
 
-You can also run it alone against an already-running stack. Every declared slot
+You can also run it against a manually assembled stack. Every declared slot
 must be linked at start: the `limb_motion` and `collision_status` slots to the
 backbone instance (the discrete moves and the proximity feed), and each per-side
 state slot to that side's arm or gripper instance (sim followers here, the
@@ -71,8 +71,8 @@ peppy node run openarm_web_commander:v1 \
     --link right_gripper@backbone_inst/leader_right_gripper \
     --link observed_left_arm@left_arm_inst \
     --link observed_right_arm@right_arm_inst \
-    --link observed_left_gripper@left_grip_inst \
-    --link observed_right_gripper@right_grip_inst
+    --link observed_left_gripper@left_gripper_inst \
+    --link observed_right_gripper@right_gripper_inst
 ```
 
 Then open **http://localhost:8765**. The page reconnects automatically if the

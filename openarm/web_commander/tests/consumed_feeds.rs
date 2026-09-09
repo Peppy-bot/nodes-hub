@@ -3,10 +3,8 @@
 //! proximity readout, the alerts mock's alert must render in the alerts list,
 //! and both contract slots must report as bound.
 //!
-//! motor_health is bound with explicitly named mock producers: a
-//! classifiable identity renders its side live (the node attributes reports
-//! by producing-instance name — `classify` wants left/right + arm/grip
-//! tokens), and an unclassifiable one is dropped at the parse boundary.
+//! motor_health uses the same producer identity as the observed left arm.
+//! An unrelated producer's reports are dropped at the parse boundary.
 //!
 //! One booting test per binary: `ui::init_limits` is once-per-process.
 
@@ -18,6 +16,7 @@ use peppygen::consumed_topics::alerts::alerts;
 use peppygen::consumed_topics::collision_status::collision_status;
 use peppygen::consumed_topics::motor_health::motor_health;
 use peppygen::fixtures::harness::{Config, Harness};
+use peppygen::mock::observed::observed_left_arm;
 
 const PANEL_PORT: u16 = 18633;
 
@@ -42,8 +41,7 @@ fn alert_msg() -> alerts::Message {
     }
 }
 
-/// A well-formed 7-motor arm report; whether it renders is decided purely by
-/// the producing instance's name.
+/// A well-formed 7-motor arm report, attributed through its observed slot.
 fn arm_health_msg() -> motor_health::Message {
     motor_health::Message {
         timestamp: SystemTime::now(),
@@ -91,13 +89,9 @@ async fn consumed_topics_surface_on_the_panel() -> peppygen::Result<()> {
     let (harness, mocks) = Harness::start_with(
         Config {
             parameters: Some(helpers::test_parameters(PANEL_PORT)),
-            // The node attributes reports by producer instance name
-            // (`classify` wants exactly one of left/right and one of
-            // arm/grip): one mock wears a classifiable identity, one an
-            // unclassifiable one.
             motor_health_instance_ids: vec![
-                "left_arm_motors".to_string(),
-                "mystery_motors".to_string(),
+                observed_left_arm::MOCK_INSTANCE_ID.to_string(),
+                "alpha_right_arm_inst".to_string(),
             ],
             alerts_instances: 1,
             ..Config::default()
@@ -154,8 +148,7 @@ async fn consumed_topics_surface_on_the_panel() -> peppygen::Result<()> {
     assert_eq!(alert["severity"], 2);
     assert_eq!(alert["message"], "holding 93% of rated torque");
 
-    // motor_health, classifiable producer: reports from `left_arm_motors`
-    // render the left side live with one row per motor.
+    // The observed left arm's health renders one row per motor.
     let live = republish_until(
         &mut ws,
         "left health never went live",
@@ -178,9 +171,7 @@ async fn consumed_topics_surface_on_the_panel() -> peppygen::Result<()> {
         "seven arm motor rows plus the gripper placeholder"
     );
 
-    // motor_health, unclassifiable producer: `mystery_motors` names neither
-    // side, so its reports are dropped at the parse boundary and the right
-    // side must never render off them (bounded check across ~10 passes).
+    // A producer outside the observed limbs must leave the right side empty.
     for _ in 0..10 {
         mocks.deps.motor_health[1]
             .motor_health
@@ -194,7 +185,7 @@ async fn consumed_topics_surface_on_the_panel() -> peppygen::Result<()> {
             .expect("right status");
         assert!(
             status == "pending" || status == "not_reporting",
-            "right health must never go live off an unclassifiable producer, got {status}"
+            "right health must stay empty for an unobserved producer, got {status}"
         );
         assert!(
             snapshot["health"]["right"]["motors"]

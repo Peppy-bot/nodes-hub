@@ -43,7 +43,7 @@ def bimanual() -> BoundSources:
             [source("backbone_inst", "left_arm_link"), source("backbone_inst", "right_arm_link")],
         ),
         grippers=(
-            [source("left_grip_inst"), source("right_grip_inst")],
+            [source("left_gripper_inst"), source("right_gripper_inst")],
             [
                 source("backbone_inst", "left_gripper_link"),
                 source("backbone_inst", "right_gripper_link"),
@@ -57,8 +57,8 @@ def test_limbs_are_named_after_their_follower_joints_first():
     assert [e.feature_key for e in plan.state] == [
         "left_arm_inst",
         "right_arm_inst",
-        "left_grip_inst",
-        "right_grip_inst",
+        "left_gripper_inst",
+        "right_gripper_inst",
     ]
     assert [e.kind for e in plan.state] == [
         LinkKind.JOINT,
@@ -71,8 +71,8 @@ def test_limbs_are_named_after_their_follower_joints_first():
     assert [e.feature_key for e in plan.action] == [
         "left_arm_inst",
         "right_arm_inst",
-        "left_grip_inst",
-        "right_grip_inst",
+        "left_gripper_inst",
+        "right_gripper_inst",
     ]
 
 
@@ -93,8 +93,8 @@ def test_action_falls_back_to_the_measured_source_of_its_own_limb():
     assert plan.action_fallback == {
         (CORE, "backbone_inst", "left_arm_link"): (CORE, "left_arm_inst", "link"),
         (CORE, "backbone_inst", "right_arm_link"): (CORE, "right_arm_inst", "link"),
-        (CORE, "backbone_inst", "left_gripper_link"): (CORE, "left_grip_inst", "link"),
-        (CORE, "backbone_inst", "right_gripper_link"): (CORE, "right_grip_inst", "link"),
+        (CORE, "backbone_inst", "left_gripper_link"): (CORE, "left_gripper_inst", "link"),
+        (CORE, "backbone_inst", "right_gripper_link"): (CORE, "right_gripper_inst", "link"),
     }
 
 
@@ -105,6 +105,20 @@ def test_a_robot_the_launcher_bound_differently_records_what_it_has():
     )
     assert [e.feature_key for e in plan.state] == ["arm_inst"]
     assert [e.feature_key for e in plan.action] == ["arm_inst"]
+
+
+def test_copies_keep_separate_dataset_dimensions_and_fallbacks():
+    for name in ["alpha", "bravo"]:
+        follower = f"{name}_left_gripper_inst"
+        backbone = f"{name}_backbone_inst"
+        plan = discover(bind(grippers=(
+            [source(follower)], [source(backbone, "left_gripper_link")],
+        )))
+        assert [entry.feature_key for entry in plan.state] == [follower]
+        assert [entry.feature_key for entry in plan.action] == [follower]
+        assert plan.action_fallback == {
+            (CORE, backbone, "left_gripper_link"): (CORE, follower, "link"),
+        }
 
 
 def test_unpairable_bindings_are_refused():
