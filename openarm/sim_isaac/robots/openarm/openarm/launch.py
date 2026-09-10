@@ -300,7 +300,7 @@ def main() -> None:
             launch_config,
             experience=(
                 "/isaac-sim/apps/"
-                "isaacsim.exp.full.streaming.kit"
+                "isaacsim.exp.viewer.streaming.kit"
             ),
         )
 
@@ -332,3 +332,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
