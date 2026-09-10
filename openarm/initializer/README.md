@@ -24,13 +24,13 @@ finishes, `peppy stack list` shows the node at `Stage: Ready`.
 
 Every declared slot must be bound when an instance starts, so the node starts
 through a launcher, which links its four slots to the concrete arm and gripper
-instances. The launchers in
-[launchers-hub/openarm](https://github.com/Peppy-bot/launchers-hub/tree/main/openarm)
+instances. The OpenArm fragments in
+[launchers-hub](https://github.com/Peppy-bot/launchers-hub/tree/main/openarm/fragments)
 do exactly that; the [top-level README](../README.md) walks through the whole
 sequence:
 
 ```sh
-peppy stack launch openarm_sim_fleet --with mujoco
+peppy stack launch simulation --with mujoco
 ```
 
 Watch it come up with:

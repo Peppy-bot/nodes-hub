@@ -48,7 +48,7 @@ It needs a running backbone, so the usual way is through a launcher; the
 [top-level README](../README.md) has the complete sequence:
 
 ```sh
-peppy stack launch openarm_sim_fleet --with mujoco
+peppy stack launch simulation --with mujoco
 ```
 
 You can also run it against a manually assembled stack. Every declared slot
