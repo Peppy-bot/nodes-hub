@@ -1,0 +1,56 @@
+// openarm_ai_brain: the OpenArm implementer of item_perception and
+// item_manipulation, the contracts that find an item, pick it up, and put it
+// down. This manifest claims every member of both and depends on
+// limb_motion, the backbone's discrete arm and gripper moves; the launcher
+// binds that slot to the instance that governs the arms, so any move sent
+// through it is collision governed on the way down. The node boots and
+// reports health; it registers no handler for any of the members it claims.
+{
+  peppy_schema: "node/v1",
+  manifest: {
+    name: "openarm_ai_brain",
+    tag: "v1",
+    implements: [
+      { name: "item_perception", tag: "v1", link_id: "item_perception" },
+      { name: "item_manipulation", tag: "v1", link_id: "item_manipulation" },
+    ],
+    depends_on: {
+      contracts: [
+        { name: "limb_motion", tag: "v1", link_id: "limb_motion" },
+      ],
+    },
+  },
+  interfaces: {
+    actions: {
+      exposes: [
+        { link_id: "item_perception", name: "identify_item" },
+        { link_id: "item_manipulation", name: "grab_item" },
+        { link_id: "item_manipulation", name: "drop_item" },
+        { link_id: "item_manipulation", name: "place_item" },
+        { link_id: "item_manipulation", name: "abort" },
+      ],
+      consumes: [
+        { link_id: "limb_motion", name: "move_arm" },
+        { link_id: "limb_motion", name: "move_gripper" },
+      ],
+    },
+    services: {
+      exposes: [
+        { link_id: "item_manipulation", name: "get_state" },
+      ],
+    },
+  },
+  execution: {
+    language: "python",
+    container: {
+      def_file: "apptainer.def",
+    },
+    parameters: {
+      // The grippers this instance serves, comma separated and in the order
+      // get_state reports them (e.g. "left_gripper,right_gripper"). They are
+      // the names limb_motion addresses, so the launcher names the set the
+      // robot actually has rather than the node assuming a pair.
+      gripper_names: "string",
+    },
+  },
+}
