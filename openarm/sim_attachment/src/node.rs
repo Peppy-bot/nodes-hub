@@ -10,8 +10,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use peppygen::consumed_actions::engine::attach;
-use peppygen::consumed_services::engine::command;
+use peppygen::consumed_actions::simulation::attach;
+use peppygen::consumed_services::simulation::command;
 use peppygen::paired_topics::{left_arm, left_gripper, right_arm, right_gripper};
 use peppygen::{NodeRunner, Parameters, QoSProfile, Result};
 use peppylib::runtime::CancellationToken;

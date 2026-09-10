@@ -7,12 +7,12 @@
 use std::time::{Duration, SystemTime};
 
 use peppygen::Parameters;
-use peppygen::consumed_actions::engine::attach::{
+use peppygen::consumed_actions::simulation::attach::{
     SimulationRobotAttachActionFeedbackMessageArmsItem as ArmState,
     SimulationRobotAttachActionFeedbackMessageGrippersItem as GripperState,
 };
 use peppygen::fixtures::harness::{Config, Harness};
-use peppygen::mock::deps::engine::{attach, command};
+use peppygen::mock::deps::simulation::{attach, command};
 use peppygen::mock::pairings::{left_arm, right_gripper};
 use peppygen::parameters::placement::Placement;
 
@@ -92,14 +92,14 @@ async fn the_robot_takes_its_seat_and_drives_its_limbs_through_it() -> peppygen:
     .await?;
 
     // The node attaches as its model, on a spot of the engine's choosing.
-    let goal = mocks.deps.engine.attach.next_goal(WIRE).await?;
+    let goal = mocks.deps.simulation.attach.next_goal(WIRE).await?;
     assert_eq!(goal.request.model, "openarm_v2");
     assert!(goal.request.placement.is_none());
     let seat = goal.accept(seated()).await?;
 
     // Its commands arrive at the command rate, holding every limb until a
     // relay says otherwise.
-    let (request, responder) = mocks.deps.engine.command.next_request(WIRE).await?;
+    let (request, responder) = mocks.deps.simulation.command.next_request(WIRE).await?;
     assert_eq!(request.arms.len(), 2);
     assert!(request.arms.iter().all(|arm| arm.positions.is_empty()));
     assert!(request.grippers.iter().all(|gripper| !gripper.commanded));
@@ -142,7 +142,7 @@ async fn the_robot_takes_its_seat_and_drives_its_limbs_through_it() -> peppygen:
         .await?;
     let mut landed = false;
     for _ in 0..COMMANDS_TO_LAND {
-        let (request, responder) = mocks.deps.engine.command.next_request(WIRE).await?;
+        let (request, responder) = mocks.deps.simulation.command.next_request(WIRE).await?;
         responder.respond(accepted()).await?;
         if request.arms[1].positions == vec![0.5; ARM_DOF] && request.grippers[0].commanded {
             assert!(
@@ -184,7 +184,7 @@ async fn a_refused_robot_never_commands_the_engine() -> peppygen::Result<()> {
         openarm_sim_attachment::setup,
     )
     .await?;
-    let goal = mocks.deps.engine.attach.next_goal(WIRE).await?;
+    let goal = mocks.deps.simulation.attach.next_goal(WIRE).await?;
     assert_eq!(goal.request.model, "openarm_v1");
     goal.reject(Some("robot 'other' stands within 1.5 m"), None)
         .await?;
@@ -198,7 +198,7 @@ async fn a_refused_robot_never_commands_the_engine() -> peppygen::Result<()> {
     assert!(
         mocks
             .deps
-            .engine
+            .simulation
             .command
             .next_request(Duration::from_millis(500))
             .await

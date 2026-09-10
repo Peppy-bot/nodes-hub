@@ -15,7 +15,7 @@
     depends_on: {
       contracts: [
         // The simulation this robot joins.
-        { name: "simulation_robot", tag: "v1", link_id: "engine" },
+        { name: "simulation_robot", tag: "v1", link_id: "simulation" },
       ],
       pairings: [
         // One slot per limb, the same surface a sim engine offers: governed
@@ -45,10 +45,10 @@
       ],
     },
     services: {
-      consumes: [{ link_id: "engine", name: "command" }],
+      consumes: [{ link_id: "simulation", name: "command" }],
     },
     actions: {
-      consumes: [{ link_id: "engine", name: "attach" }],
+      consumes: [{ link_id: "simulation", name: "attach" }],
     },
   },
   execution: {

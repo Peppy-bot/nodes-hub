@@ -8,8 +8,8 @@
 
 use std::sync::{Arc, Mutex};
 
-use peppygen::consumed_actions::engine::attach;
-use peppygen::consumed_services::engine::command;
+use peppygen::consumed_actions::simulation::attach;
+use peppygen::consumed_services::simulation::command;
 
 /// The arms of an OpenArm, by the slot that drives each and the name its
 /// model gives it.
