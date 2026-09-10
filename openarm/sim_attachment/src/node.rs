@@ -5,8 +5,7 @@
 //! The node's life is the robot's stay in the scene. It fails to start when
 //! the simulation refuses the robot, and it stops when the seat ends (the
 //! engine took the robot out, or the goal could no longer be driven), so
-//! the runtime restarts it and the robot rejoins rather than standing there
-//! unattached.
+//! the runtime restarts it and the robot rejoins.
 
 use std::sync::Arc;
 use std::time::Duration;
