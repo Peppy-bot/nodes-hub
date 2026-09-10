@@ -110,6 +110,17 @@ impl Seat {
             .map(|arm| index(&response.arm_names, arm))
             .into_iter()
             .collect::<Result<Vec<_>, _>>()?;
+        for (&index, (slot, name)) in arms.iter().zip(ARMS) {
+            let joints = *response
+                .arm_joints
+                .get(index)
+                .ok_or_else(|| format!("the simulation named no joint count for arm '{name}'"))?;
+            if joints as usize != ARM_DOF {
+                return Err(format!(
+                    "slot '{slot}' drives an OpenArm arm of {ARM_DOF} joints, and the simulation seats this robot with a '{name}' of {joints}"
+                ));
+            }
+        }
         let grippers = GRIPPERS
             .map(|gripper| index(&response.gripper_names, gripper))
             .into_iter()
@@ -222,14 +233,36 @@ mod tests {
     use super::*;
 
     fn seated(arms: &[&str], grippers: &[&str]) -> Result<Seat, String> {
+        seated_with(arms, &vec![ARM_DOF as u32; arms.len()], grippers)
+    }
+
+    fn seated_with(arms: &[&str], joints: &[u32], grippers: &[&str]) -> Result<Seat, String> {
         Seat::of(&attach::GoalResponseData::new(
             arms.iter().map(|s| (*s).to_owned()).collect(),
+            joints.to_vec(),
             grippers.iter().map(|s| (*s).to_owned()).collect(),
         ))
     }
 
     fn positions() -> Vec<f64> {
         (0..ARM_DOF).map(|j| j as f64 / 10.0).collect()
+    }
+
+    #[test]
+    fn a_seat_refuses_a_model_whose_arms_carry_other_joints() {
+        let refused =
+            seated_with(&["left", "right"], &[ARM_DOF as u32, 6], &["left", "right"]).unwrap_err();
+        assert!(
+            refused.contains("slot 'right_arm' drives an OpenArm arm of 7 joints")
+                && refused.contains("a 'right' of 6"),
+            "{refused}"
+        );
+        let missing =
+            seated_with(&["left", "right"], &[ARM_DOF as u32], &["left", "right"]).unwrap_err();
+        assert!(
+            missing.contains("no joint count for arm 'right'"),
+            "{missing}"
+        );
     }
 
     #[test]

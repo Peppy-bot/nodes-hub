@@ -24,11 +24,19 @@ use crate::limbs::{ARMS, GRIPPERS, Seat, arm_command, gripper_command, model_of}
 /// rebuilds its world around the joining robot, which on a mesh-heavy model
 /// takes a moment.
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long one command may take. Well under a command period at the rates
-/// a robot runs, so a lost reply is retried on the next tick.
+/// How long one command may take. The loop waits for the reply before its
+/// next tick, so a simulation that stops answering costs this much before
+/// the robot tries again.
 const COMMAND_TIMEOUT: Duration = Duration::from_millis(250);
-/// How long the robot waits for the engine to acknowledge that it left.
-const LEAVE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the robot waits for the engine to take it out of the scene, or
+/// to say why it did.
+const LEAVE_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long the shutdown hook waits for the seat to come back, inside
+/// peppy's shutdown grace (5 s by default, `lifecycle.shutdown_grace_secs`).
+const SEAT_RELEASE_TIMEOUT: Duration = Duration::from_secs(3);
+// The wait outlasts what it waits for, so a robot that does leave is not
+// reported as one that did not.
+const _: () = assert!(SEAT_RELEASE_TIMEOUT.as_millis() > LEAVE_TIMEOUT.as_millis());
 /// Pause after a receive error before retrying, so a persistently broken
 /// subscription cannot hot-spin a consumer or flood the log.
 const RECEIVE_ERROR_BACKOFF: Duration = Duration::from_millis(100);
@@ -57,7 +65,8 @@ pub async fn setup(params: Parameters, node_runner: Arc<NodeRunner>) -> Result<(
         });
 
     // The seat: the simulation stands this robot and says which limbs it
-    // gave it. Feedback is a state stream, so it is read latest-wins.
+    // gave it. Feedback is a state stream the engine publishes on its own
+    // grid without waiting for anyone, so it is read as sensor data.
     let goal = attach::ActionHandle::fire_goal(
         &node_runner,
         attach::bound_producer(&node_runner),
@@ -104,8 +113,11 @@ pub async fn setup(params: Parameters, node_runner: Arc<NodeRunner>) -> Result<(
     let shutdown_token = token.clone();
     node_runner.on_shutdown(async move {
         shutdown_token.cancel();
-        if tokio::time::timeout(LEAVE_TIMEOUT, has_left).await.is_err() {
-            warn!("this robot did not leave the scene within {LEAVE_TIMEOUT:?}");
+        if tokio::time::timeout(SEAT_RELEASE_TIMEOUT, has_left)
+            .await
+            .is_err()
+        {
+            warn!("this robot did not leave the scene within {SEAT_RELEASE_TIMEOUT:?}");
         }
     });
 
@@ -194,10 +206,10 @@ async fn spawn_state_publishers(
             right_gripper::gripper_states::declare_publisher(runner).await?,
         ),
     ];
-    let runner = runner.clone();
     Ok(tokio::spawn(async move {
         let mut failing = false;
         let mut first = true;
+        let mut ended_by_engine = false;
         loop {
             let feedback = tokio::select! {
                 _ = token.cancelled() => break,
@@ -205,10 +217,12 @@ async fn spawn_state_publishers(
             };
             let feedback = match feedback {
                 Ok(feedback) => feedback,
-                // The stay is over: the engine completed the goal, or it is
-                // gone. Either way this robot is no longer in the scene.
+                // The stay is over on the engine's side: it completed the
+                // goal, or it is gone. Its own account of why comes from
+                // the goal's result.
                 Err(e) => {
                     info!("this robot's seat in the simulation ended: {e}");
+                    ended_by_engine = true;
                     break;
                 }
             };
@@ -252,14 +266,44 @@ async fn spawn_state_publishers(
                 Err(_) => {}
             }
         }
-        // Leaving on the way out frees the robot's seat at once, rather
-        // than when its lease lapses.
-        if let Err(e) = goal.cancel_goal(LEAVE_TIMEOUT).await {
+        if ended_by_engine {
+            report_removal(&goal).await;
+        } else if let Err(e) = goal.cancel_goal(LEAVE_TIMEOUT).await {
+            // Leaving on the way out frees the robot's seat at once, rather
+            // than when its lease lapses.
             warn!("this robot could not tell the simulation it is leaving: {e}");
         }
         let _ = left.send(());
-        drop(runner);
     }))
+}
+
+/// Reports the engine's own account of why this robot left the scene.
+async fn report_removal(goal: &attach::ActionHandle) {
+    let outcome = match goal.get_result(LEAVE_TIMEOUT).await {
+        Ok(result) => result.outcome,
+        Err(e) => {
+            warn!("the simulation did not say why this robot left: {e}");
+            return;
+        }
+    };
+    match outcome {
+        attach::ResultOutcome::Completed(data) | attach::ResultOutcome::Cancelled(data)
+            if data.success =>
+        {
+            info!(
+                "the simulation took this robot out of the scene: {}",
+                data.message
+            );
+        }
+        attach::ResultOutcome::Completed(data) | attach::ResultOutcome::Cancelled(data) => {
+            warn!(
+                "the simulation took this robot out of the scene: {}",
+                data.message
+            );
+        }
+        attach::ResultOutcome::Abandoned => warn!("the simulation abandoned this robot's seat"),
+        attach::ResultOutcome::Expired => warn!("this robot's seat expired before it was read"),
+    }
 }
 
 async fn publish(
@@ -281,6 +325,7 @@ async fn spawn_arm_consumers(
             let mut sub = $slot::joint_setpoints::subscribe(runner).await?;
             let (seat, token) = (seat.clone(), token.clone());
             tokio::spawn(async move {
+                let mut unusable = false;
                 loop {
                     let received = tokio::select! {
                         _ = token.cancelled() => return,
@@ -288,7 +333,13 @@ async fn spawn_arm_consumers(
                     };
                     let message = match received {
                         Ok(Some((_, message))) => message,
-                        Ok(None) => return,
+                        Ok(None) => {
+                            warn!(
+                                "{} joint_setpoints ended, so nothing drives this limb",
+                                stringify!($slot)
+                            );
+                            return;
+                        }
                         Err(e) => {
                             error!("{} joint_setpoints receive: {e}", stringify!($slot));
                             tokio::time::sleep(RECEIVE_ERROR_BACKOFF).await;
@@ -296,8 +347,18 @@ async fn spawn_arm_consumers(
                         }
                     };
                     match arm_command(message.positions, message.velocities) {
-                        Some(command) => seat.set_arm(stringify!($slot), command),
-                        None => warn!("dropping unusable {} setpoints", stringify!($slot)),
+                        Some(command) => {
+                            unusable = false;
+                            seat.set_arm(stringify!($slot), command);
+                        }
+                        None if !unusable => {
+                            unusable = true;
+                            warn!(
+                                "dropping unusable {} setpoints, suppressing repeats",
+                                stringify!($slot)
+                            );
+                        }
+                        None => {}
                     }
                 }
             });
@@ -319,6 +380,7 @@ async fn spawn_gripper_consumers(
             let mut sub = $slot::gripper_setpoints::subscribe(runner).await?;
             let (seat, token) = (seat.clone(), token.clone());
             tokio::spawn(async move {
+                let mut unusable = false;
                 loop {
                     let received = tokio::select! {
                         _ = token.cancelled() => return,
@@ -326,7 +388,13 @@ async fn spawn_gripper_consumers(
                     };
                     let message = match received {
                         Ok(Some((_, message))) => message,
-                        Ok(None) => return,
+                        Ok(None) => {
+                            warn!(
+                                "{} gripper_setpoints ended, so nothing drives this limb",
+                                stringify!($slot)
+                            );
+                            return;
+                        }
                         Err(e) => {
                             error!("{} gripper_setpoints receive: {e}", stringify!($slot));
                             tokio::time::sleep(RECEIVE_ERROR_BACKOFF).await;
@@ -334,8 +402,18 @@ async fn spawn_gripper_consumers(
                         }
                     };
                     match gripper_command(message.opening, message.max_effort) {
-                        Some(command) => seat.set_gripper(stringify!($slot), command),
-                        None => warn!("dropping unusable {} setpoints", stringify!($slot)),
+                        Some(command) => {
+                            unusable = false;
+                            seat.set_gripper(stringify!($slot), command);
+                        }
+                        None if !unusable => {
+                            unusable = true;
+                            warn!(
+                                "dropping unusable {} setpoints, suppressing repeats",
+                                stringify!($slot)
+                            );
+                        }
+                        None => {}
                     }
                 }
             });
