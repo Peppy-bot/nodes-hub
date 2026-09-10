@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use control_core::motor_health::{HEALTH_PERIOD, STATE_STALE_AFTER};
 use peppygen::fixtures::harness::{Config, Harness};
 use peppygen::mock::pairings::backbone::gripper_setpoints as backbone_setpoints;
-use peppygen::mock::pairings::engine::gripper_states as engine_states;
+use peppygen::mock::pairings::simulation::gripper_states as simulation_states;
 
 /// Motors per gripper, matching the node's health `level` vector length.
 const MOTORS: usize = 1;
@@ -29,8 +29,8 @@ fn instant(ns: u64) -> SystemTime {
     UNIX_EPOCH + Duration::from_nanos(ns)
 }
 
-fn gripper_state(timestamp: SystemTime) -> engine_states::Message {
-    engine_states::Message {
+fn gripper_state(timestamp: SystemTime) -> simulation_states::Message {
+    simulation_states::Message {
         timestamp,
         opening: 0.5,
         effort: 0.25,
@@ -62,19 +62,21 @@ async fn sim_time_stamps_the_heartbeat_and_bounds_the_recency_gate() -> peppygen
             max_effort: 2.5,
         })
         .await?;
-    let relayed =
-        tokio::time::timeout(RECV_TIMEOUT, mocks.pairings.engine.gripper_setpoints.next())
-            .await
-            .expect("the engine should receive the relayed setpoint before any tick")?
-            .expect("engine setpoints subscription should be open");
+    let relayed = tokio::time::timeout(
+        RECV_TIMEOUT,
+        mocks.pairings.simulation.gripper_setpoints.next(),
+    )
+    .await
+    .expect("the simulation should receive the relayed setpoint before any tick")?
+    .expect("simulation setpoints subscription should be open");
     assert_eq!(relayed.timestamp, setpoint_ts);
 
-    // First driven instant: the engine speaks, stamped with the same sim
+    // First driven instant: the simulation speaks, stamped with the same sim
     // time the node reads.
     harness.clock.tick(T1_NS).await?;
     mocks
         .pairings
-        .engine
+        .simulation
         .gripper_states
         .publish(&gripper_state(instant(T1_NS)))
         .await?;
@@ -139,7 +141,7 @@ async fn sim_time_stamps_the_heartbeat_and_bounds_the_recency_gate() -> peppygen
     // and no new instant can race the state's delivery.
     mocks
         .pairings
-        .engine
+        .simulation
         .gripper_states
         .publish(&gripper_state(instant(T2_NS)))
         .await?;

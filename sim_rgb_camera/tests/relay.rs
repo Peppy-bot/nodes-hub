@@ -1,5 +1,5 @@
 //! Integration tests over the generated harness: the node in-process, the
-//! engine peer played by the generated pairing mock over the real wire, and
+//! simulation peer played by the generated pairing mock over the real wire, and
 //! the contract surface observed the way a consumer sees it.
 
 use std::time::{Duration, SystemTime};
@@ -8,8 +8,10 @@ use peppygen::fixtures::exposed_services::camera::{
     set_brightness, set_contrast, set_exposure, set_gain, set_white_balance, video_stream_info,
 };
 use peppygen::fixtures::harness::Harness;
-use peppygen::mock::pairings::engine::{stream_info as engine_info, video_stream as engine_video};
-use peppygen::paired_topics::engine::video_stream::MessageHeader;
+use peppygen::mock::pairings::simulation::{
+    stream_info as simulation_info, video_stream as simulation_video,
+};
+use peppygen::paired_topics::simulation::video_stream::MessageHeader;
 
 /// Bounds every poll and every wait for a relayed frame. Generous: the
 /// assertions are about what arrives, never about how fast.
@@ -19,8 +21,8 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 /// a reading, matching what the uvc and zed nodes answer.
 const NO_CURRENT_VALUE: i32 = -1;
 
-fn frame(timestamp: SystemTime, frame_id: u32, fill: u8) -> engine_video::Message {
-    engine_video::Message {
+fn frame(timestamp: SystemTime, frame_id: u32, fill: u8) -> simulation_video::Message {
+    simulation_video::Message {
         header: MessageHeader {
             timestamp,
             frame_id,
@@ -36,20 +38,25 @@ fn frame(timestamp: SystemTime, frame_id: u32, fill: u8) -> engine_video::Messag
 async fn relays_frames_verbatim_and_drops_invalid_timestamps() -> peppygen::Result<()> {
     let (mut harness, mocks) = Harness::start(sim_rgb_camera::setup).await?;
 
-    // A frame stamped at the epoch is what an engine publishes before its
+    // A frame stamped at the epoch is what a simulation publishes before its
     // clock resolves; the relay must drop it rather than forward a sample no
     // consumer can age. The two publishes share one mock publisher, so their
     // order holds: the first frame to surface proves both the drop and the
     // relay.
     mocks
         .pairings
-        .engine
+        .simulation
         .video_stream
         .publish(&frame(SystemTime::UNIX_EPOCH, 7, 0x11))
         .await?;
     let timestamp = SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_000_000);
     let sent = frame(timestamp, 42, 0xA5);
-    mocks.pairings.engine.video_stream.publish(&sent).await?;
+    mocks
+        .pairings
+        .simulation
+        .video_stream
+        .publish(&sent)
+        .await?;
 
     let relayed = tokio::time::timeout(TIMEOUT, harness.emitted.camera_video_stream.next())
         .await
@@ -57,7 +64,7 @@ async fn relays_frames_verbatim_and_drops_invalid_timestamps() -> peppygen::Resu
         .expect("video_stream subscription should be open");
 
     // Verbatim: a relay that restamped or renumbered would make consumers age
-    // samples on the relay's clock instead of the engine's capture time.
+    // samples on the relay's clock instead of the simulation's capture time.
     assert_eq!(relayed.header.timestamp, timestamp);
     assert_eq!(relayed.header.frame_id, 42);
     assert_eq!(relayed.encoding, sent.encoding);
@@ -69,10 +76,10 @@ async fn relays_frames_verbatim_and_drops_invalid_timestamps() -> peppygen::Resu
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stream_info_service_answers_from_the_engine_description() -> peppygen::Result<()> {
+async fn stream_info_service_answers_from_the_simulation_description() -> peppygen::Result<()> {
     let (harness, mocks) = Harness::start(sim_rgb_camera::setup).await?;
 
-    // Before the engine describes its stream there is nothing to report, and
+    // Before the simulation describes its stream there is nothing to report, and
     // the relay says so with zeros rather than a guess: a consumer gating on
     // a usable size refuses, which is the correct answer this early.
     let response = video_stream_info::poll(&harness, TIMEOUT).await?;
@@ -83,9 +90,9 @@ async fn stream_info_service_answers_from_the_engine_description() -> peppygen::
 
     mocks
         .pairings
-        .engine
+        .simulation
         .stream_info
-        .publish(&engine_info::Message {
+        .publish(&simulation_info::Message {
             width: 960,
             height: 600,
             frames_per_second: 15,
@@ -107,7 +114,7 @@ async fn stream_info_service_answers_from_the_engine_description() -> peppygen::
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "the engine's stream description never reached the info service"
+            "the simulation's stream description never reached the info service"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

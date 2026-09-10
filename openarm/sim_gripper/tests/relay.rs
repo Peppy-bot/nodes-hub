@@ -1,5 +1,5 @@
 //! Integration tests over the generated harness: the node in-process, both
-//! gripper_link peers (backbone leader, engine follower) played by generated
+//! gripper_link peers (backbone leader, simulation follower) played by generated
 //! pairing mocks over the real wire.
 
 use std::time::{Duration, SystemTime};
@@ -8,7 +8,7 @@ use control_core::motor_health::{HEALTH_PERIOD, STATE_STALE_AFTER};
 use peppygen::fixtures::exposed_services::ready::is_ready;
 use peppygen::fixtures::harness::Harness;
 use peppygen::mock::pairings::backbone::gripper_setpoints as backbone_setpoints;
-use peppygen::mock::pairings::engine::gripper_states as engine_states;
+use peppygen::mock::pairings::simulation::gripper_states as simulation_states;
 
 /// Motors per gripper, matching the node's health `level` vector length.
 const MOTORS: usize = 1;
@@ -31,8 +31,8 @@ async fn poll_until(harness: &Harness, want: bool, deadline: Duration) -> peppyg
     }
 }
 
-fn engine_state(timestamp: SystemTime) -> engine_states::Message {
-    engine_states::Message {
+fn simulation_state(timestamp: SystemTime) -> simulation_states::Message {
+    simulation_states::Message {
         timestamp,
         opening: 0.03,
         effort: 1.25,
@@ -41,13 +41,13 @@ fn engine_state(timestamp: SystemTime) -> engine_states::Message {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn relays_setpoints_and_states_between_backbone_and_engine() -> peppygen::Result<()> {
+async fn relays_setpoints_and_states_between_backbone_and_simulation() -> peppygen::Result<()> {
     let (harness, mut mocks) = Harness::start(openarm_sim_gripper::setup).await?;
 
-    // Backbone -> engine: a non-finite setpoint first, which the relay must
+    // Backbone -> simulation: a non-finite setpoint first, which the relay must
     // drop, then a finite one that must arrive verbatim, timestamp untouched.
     // The two publishes share one mock publisher, so their order holds and the
-    // engine peer's first delivery proves both the relay and the drop.
+    // simulation peer's first delivery proves both the relay and the drop.
     let setpoint_ts = SystemTime::now();
     mocks
         .pairings
@@ -71,22 +71,22 @@ async fn relays_setpoints_and_states_between_backbone_and_engine() -> peppygen::
         .await?;
     let relayed = mocks
         .pairings
-        .engine
+        .simulation
         .gripper_setpoints
         .next()
         .await?
-        .expect("engine setpoints subscription should be open");
+        .expect("simulation setpoints subscription should be open");
     assert_eq!(relayed.opening, 0.07);
     assert_eq!(relayed.max_effort, 6.5);
     assert_eq!(relayed.timestamp, setpoint_ts);
 
-    // Engine -> backbone: the measured state forwards back unchanged.
+    // Simulation -> backbone: the measured state forwards back unchanged.
     let state_ts = SystemTime::now();
     mocks
         .pairings
-        .engine
+        .simulation
         .gripper_states
-        .publish(&engine_states::Message {
+        .publish(&simulation_states::Message {
             timestamp: state_ts,
             opening: 0.045,
             effort: -0.75,
@@ -112,18 +112,18 @@ async fn relays_setpoints_and_states_between_backbone_and_engine() -> peppygen::
 async fn ready_latches_on_first_state_and_health_flows_only_while_fresh() -> peppygen::Result<()> {
     let (mut harness, mut mocks) = Harness::start(openarm_sim_gripper::setup).await?;
 
-    // Before any engine state, nothing is known about the limb: not ready.
+    // Before any simulation state, nothing is known about the limb: not ready.
     let response = is_ready::poll(&harness, Duration::from_secs(10)).await?;
     assert!(!response.ready);
 
-    // One engine state flows through; the backbone peer receiving the relayed
+    // One simulation state flows through; the backbone peer receiving the relayed
     // copy proves the node ingested it.
     let state_ts = SystemTime::now();
     mocks
         .pairings
-        .engine
+        .simulation
         .gripper_states
-        .publish(&engine_state(state_ts))
+        .publish(&simulation_state(state_ts))
         .await?;
     let relayed = mocks
         .pairings
@@ -193,7 +193,8 @@ async fn ready_latches_on_first_state_and_health_flows_only_while_fresh() -> pep
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn serves_ready_and_ingests_engine_states_without_backbone_peer() -> peppygen::Result<()> {
+async fn serves_ready_and_ingests_simulation_states_without_backbone_peer() -> peppygen::Result<()>
+{
     // The manifest marks the backbone slot optional: boot it truly unpaired.
     // The peer pin is never seeded, so the node's own `paired()` stays None
     // and its publishes into the slot are legal no-ops.
@@ -211,13 +212,13 @@ async fn serves_ready_and_ingests_engine_states_without_backbone_peer() -> peppy
     let response = is_ready::poll(&harness, Duration::from_secs(10)).await?;
     assert!(!response.ready);
 
-    // Engine states still flow: the relay publishes into the unpaired
+    // Simulation states still flow: the relay publishes into the unpaired
     // backbone slot (a legal no-op), records the state, and latches ready.
     mocks
         .pairings
-        .engine
+        .simulation
         .gripper_states
-        .publish(&engine_state(SystemTime::now()))
+        .publish(&simulation_state(SystemTime::now()))
         .await?;
     poll_until(&harness, true, Duration::from_secs(10)).await?;
 

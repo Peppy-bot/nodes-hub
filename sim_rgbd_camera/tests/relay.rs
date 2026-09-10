@@ -1,5 +1,5 @@
 //! Integration tests over the generated harness: the node in-process, the
-//! engine peer played by the generated pairing mock over the real wire, and
+//! simulation peer played by the generated pairing mock over the real wire, and
 //! the contract surface observed the way a consumer sees it.
 
 use std::time::{Duration, SystemTime};
@@ -9,10 +9,11 @@ use peppygen::fixtures::exposed_services::camera::{
     set_color_gain, set_color_white_balance, video_stream_info,
 };
 use peppygen::fixtures::harness::Harness;
-use peppygen::mock::pairings::engine::{
-    depth_stream as engine_depth, stream_info as engine_info, video_stream as engine_video,
+use peppygen::mock::pairings::simulation::{
+    depth_stream as simulation_depth, stream_info as simulation_info,
+    video_stream as simulation_video,
 };
-use peppygen::paired_topics::engine::{
+use peppygen::paired_topics::simulation::{
     depth_stream::MessageHeader as DepthHeader, video_stream::MessageHeader as ColorHeader,
 };
 
@@ -24,11 +25,11 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 /// a reading, matching what the uvc and zed nodes answer.
 const NO_CURRENT_VALUE: i32 = -1;
 
-/// The engine renders one camera, so color and depth are aligned by
+/// The simulation renders one camera, so color and depth are aligned by
 /// construction and say so.
 const ALIGN_MODE: &str = "depth_to_color";
 
-/// Metres per depth LSB on the wire, the value the engine publishes and the
+/// Metres per depth LSB on the wire, the value the simulation publishes and the
 /// depth info service must hand back unrounded.
 const DEPTH_UNIT: f32 = 0.001;
 
@@ -41,8 +42,8 @@ const REJECTED_WIDTH: u32 = 999;
 /// the delivery it waits out, not a guess at it.
 const REJECTION_SETTLE: Duration = Duration::from_millis(500);
 
-fn description(depth_unit: f32) -> engine_info::Message {
-    engine_info::Message {
+fn description(depth_unit: f32) -> simulation_info::Message {
+    simulation_info::Message {
         width: 1280,
         height: 720,
         frames_per_second: 15,
@@ -68,7 +69,7 @@ macro_rules! poll_until {
                 tokio::time::Instant::now() < deadline,
                 concat!(
                     stringify!($service),
-                    " never reflected the engine's description"
+                    " never reflected the simulation's description"
                 )
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -80,7 +81,7 @@ macro_rules! poll_until {
 async fn relays_both_streams_verbatim_and_drops_invalid_timestamps() -> peppygen::Result<()> {
     let (mut harness, mocks) = Harness::start(sim_rgbd_camera::setup).await?;
 
-    // A frame stamped at the epoch is what an engine publishes before its
+    // A frame stamped at the epoch is what a simulation publishes before its
     // clock resolves; both legs must drop it rather than forward a sample no
     // consumer can age. Each leg publishes its bad frame first through the
     // same mock publisher, so the first frame to surface proves the drop.
@@ -88,9 +89,9 @@ async fn relays_both_streams_verbatim_and_drops_invalid_timestamps() -> peppygen
 
     mocks
         .pairings
-        .engine
+        .simulation
         .video_stream
-        .publish(&engine_video::Message {
+        .publish(&simulation_video::Message {
             header: ColorHeader {
                 timestamp: SystemTime::UNIX_EPOCH,
                 frame_id: 7,
@@ -102,7 +103,7 @@ async fn relays_both_streams_verbatim_and_drops_invalid_timestamps() -> peppygen
             frame: vec![0x11; 4 * 2 * 3],
         })
         .await?;
-    let color = engine_video::Message {
+    let color = simulation_video::Message {
         header: ColorHeader {
             timestamp,
             frame_id: 42,
@@ -113,13 +114,18 @@ async fn relays_both_streams_verbatim_and_drops_invalid_timestamps() -> peppygen
         height: 2,
         frame: vec![0xA5; 4 * 2 * 3],
     };
-    mocks.pairings.engine.video_stream.publish(&color).await?;
+    mocks
+        .pairings
+        .simulation
+        .video_stream
+        .publish(&color)
+        .await?;
 
     mocks
         .pairings
-        .engine
+        .simulation
         .depth_stream
-        .publish(&engine_depth::Message {
+        .publish(&simulation_depth::Message {
             header: DepthHeader {
                 timestamp: SystemTime::UNIX_EPOCH,
                 frame_id: 7,
@@ -133,7 +139,7 @@ async fn relays_both_streams_verbatim_and_drops_invalid_timestamps() -> peppygen
         .await?;
     // Depth carries the same frame_id as the color frame it was captured
     // with, which is what lets a consumer pair them.
-    let depth = engine_depth::Message {
+    let depth = simulation_depth::Message {
         header: DepthHeader {
             timestamp,
             frame_id: 42,
@@ -144,7 +150,12 @@ async fn relays_both_streams_verbatim_and_drops_invalid_timestamps() -> peppygen
         height: 2,
         frame: vec![0x34, 0x12, 0x78, 0x56, 0xBC, 0x9A, 0xF0, 0xDE],
     };
-    mocks.pairings.engine.depth_stream.publish(&depth).await?;
+    mocks
+        .pairings
+        .simulation
+        .depth_stream
+        .publish(&depth)
+        .await?;
 
     let relayed_color = tokio::time::timeout(TIMEOUT, harness.emitted.camera_video_stream.next())
         .await
@@ -176,10 +187,10 @@ async fn relays_both_streams_verbatim_and_drops_invalid_timestamps() -> peppygen
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn both_info_services_answer_from_the_engine_description() -> peppygen::Result<()> {
+async fn both_info_services_answer_from_the_simulation_description() -> peppygen::Result<()> {
     let (harness, mocks) = Harness::start(sim_rgbd_camera::setup).await?;
 
-    // Before the engine describes its stream, depth_unit is zero: a recorder
+    // Before the simulation describes its stream, depth_unit is zero: a recorder
     // reading it refuses rather than scaling every depth reading by a guess.
     let depth = depth_stream_info::poll(&harness, TIMEOUT).await?;
     assert_eq!(depth.depth_unit, 0.0);
@@ -187,7 +198,7 @@ async fn both_info_services_answer_from_the_engine_description() -> peppygen::Re
 
     mocks
         .pairings
-        .engine
+        .simulation
         .stream_info
         .publish(&description(DEPTH_UNIT))
         .await?;
@@ -227,7 +238,7 @@ async fn a_description_with_an_unusable_depth_unit_is_ignored() -> peppygen::Res
     // from never having had one.
     mocks
         .pairings
-        .engine
+        .simulation
         .stream_info
         .publish(&description(DEPTH_UNIT))
         .await?;
@@ -245,9 +256,9 @@ async fn a_description_with_an_unusable_depth_unit_is_ignored() -> peppygen::Res
     for unusable in [0.0, -0.001, f32::NAN, f32::INFINITY] {
         mocks
             .pairings
-            .engine
+            .simulation
             .stream_info
-            .publish(&engine_info::Message {
+            .publish(&simulation_info::Message {
                 width: REJECTED_WIDTH,
                 depth_unit: unusable,
                 ..description(DEPTH_UNIT)
@@ -274,9 +285,9 @@ async fn a_description_with_an_unusable_depth_unit_is_ignored() -> peppygen::Res
     // alive through the rejections rather than having ended.
     mocks
         .pairings
-        .engine
+        .simulation
         .stream_info
-        .publish(&engine_info::Message {
+        .publish(&simulation_info::Message {
             depth_unit: 0.002,
             ..description(DEPTH_UNIT)
         })

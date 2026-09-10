@@ -1,4 +1,4 @@
-// The relay loops and their assembly: setpoints forward to the engine, states
+// The relay loops and their assembly: setpoints forward to the simulation, states
 // forward back to the backbone, the health heartbeat vouches for the limb, and
 // `setup` wires the three together.
 
@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use control_core::motor_health::{HEALTH_PERIOD, STATE_STALE_AFTER};
 use peppygen::emitted_topics::motor_health::motor_health;
 use peppygen::exposed_services::ready::is_ready;
-use peppygen::paired_topics::{backbone, engine};
+use peppygen::paired_topics::{backbone, simulation};
 use peppygen::{NodeRunner, Parameters, Result};
 use peppylib::runtime::CancellationToken;
 use tracing::{error, info, warn};
@@ -24,15 +24,15 @@ fn all_finite(vecs: &[&[f64]]) -> bool {
     vecs.iter().all(|v| v.iter().all(|x| x.is_finite()))
 }
 
-/// Forward the backbone's governed joint_setpoints to the engine.
+/// Forward the backbone's governed joint_setpoints to the simulation.
 async fn relay_setpoints(runner: Arc<NodeRunner>, token: CancellationToken) {
     let mut sub = match backbone::joint_setpoints::subscribe(&runner).await {
         Ok(s) => s,
         Err(e) => return error!("joint_setpoints subscribe: {e}"),
     };
-    let publisher = match engine::joint_setpoints::declare_publisher(&runner).await {
+    let publisher = match simulation::joint_setpoints::declare_publisher(&runner).await {
         Ok(p) => p,
-        Err(e) => return error!("declare engine joint_setpoints publisher: {e}"),
+        Err(e) => return error!("declare simulation joint_setpoints publisher: {e}"),
     };
     let mut failing = false;
     let mut first = true;
@@ -54,7 +54,7 @@ async fn relay_setpoints(runner: Arc<NodeRunner>, token: CancellationToken) {
             warn!("dropping non-finite joint_setpoints");
             continue;
         }
-        let result = match engine::joint_setpoints::build_message(
+        let result = match simulation::joint_setpoints::build_message(
             msg.timestamp,
             msg.positions,
             msg.velocities,
@@ -68,22 +68,22 @@ async fn relay_setpoints(runner: Arc<NodeRunner>, token: CancellationToken) {
                 failing = false;
                 if first {
                     first = false;
-                    info!("first setpoint relayed to the engine");
+                    info!("first setpoint relayed to the simulation");
                 }
             }
             Err(e) if !failing => {
                 failing = true;
-                warn!("engine joint_setpoints publish failing, suppressing repeats: {e}");
+                warn!("simulation joint_setpoints publish failing, suppressing repeats: {e}");
             }
             Err(_) => {}
         }
     }
 }
 
-/// Forward the engine's measured joint_states to the backbone, recording the
+/// Forward the simulation's measured joint_states to the backbone, recording the
 /// timestamp of each relayed one in `relayed`: the first marks this limb's physics
 /// live, and recency is what lets the health heartbeat vouch for the limb.
-/// The timestamp is the engine's daemon-clock capture time, the same clock the
+/// The timestamp is the simulation's daemon-clock capture time, the same clock the
 /// heartbeat stamps with, so the recency gate holds under a simulated clock
 /// that does not advance at wall rate.
 async fn relay_states(
@@ -91,9 +91,9 @@ async fn relay_states(
     relayed: Arc<Mutex<Option<SystemTime>>>,
     token: CancellationToken,
 ) {
-    let mut sub = match engine::joint_states::subscribe(&runner).await {
+    let mut sub = match simulation::joint_states::subscribe(&runner).await {
         Ok(s) => s,
-        Err(e) => return error!("engine joint_states subscribe: {e}"),
+        Err(e) => return error!("simulation joint_states subscribe: {e}"),
     };
     let publisher = match backbone::joint_states::declare_publisher(&runner).await {
         Ok(p) => p,
@@ -110,7 +110,7 @@ async fn relay_states(
             Ok(Some((_, msg))) => msg,
             Ok(None) => return,
             Err(e) => {
-                error!("engine joint_states receive: {e}");
+                error!("simulation joint_states receive: {e}");
                 tokio::time::sleep(RECEIVE_ERROR_BACKOFF).await;
                 continue;
             }
@@ -148,15 +148,15 @@ async fn relay_states(
 }
 
 /// Emit the "present, not sensed" motor_health heartbeat: nominal levels and
-/// empty reading vectors, because the engine reports no effort or
+/// empty reading vectors, because the simulation reports no effort or
 /// temperature for this limb.
 ///
 /// Held while `relayed` is empty or stale. Nothing is known about the limb
-/// before the first engine state, and nothing current is known once states
+/// before the first simulation state, and nothing current is known once states
 /// stop arriving, so vouching in either case would report a limb whose
 /// physics is absent as a healthy one. A held heartbeat is what lets
 /// consumers age the last report out and name this producer dead.
-/// Staleness is judged on the daemon clock, the base both the engine's
+/// Staleness is judged on the daemon clock, the base both the simulation's
 /// timestamps and this heartbeat's timestamps come from.
 async fn publish_health(
     runner: Arc<NodeRunner>,
@@ -234,7 +234,7 @@ pub async fn setup(_params: Parameters, node_runner: Arc<NodeRunner>) -> Result<
     // simulated clock), like every producer-side timestamp in the stack.
     peppygen::clock::init(&node_runner).await?;
     let token = node_runner.cancellation_token().clone();
-    // When the engine last relayed a state. Readiness latches on the
+    // When the simulation last relayed a state. Readiness latches on the
     // first (like the real follower's motors-enabled-and-serving gate,
     // and deliberately never unlatches: mid-session recovery is the
     // runtime's restart, not a ready flap); the health heartbeat asks

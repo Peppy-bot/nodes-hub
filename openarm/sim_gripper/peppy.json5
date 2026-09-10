@@ -1,7 +1,7 @@
-// openarm_sim_gripper: the sim gripper follower, an engine-agnostic relay
+// openarm_sim_gripper: the sim gripper follower, a simulation-agnostic relay
 // between two gripper_link pairings. Toward the backbone it plays the follower
 // role exactly like the real gripper (opening setpoints and effort cap in,
-// measured opening/effort/ceiling back); toward the sim engine it plays the
+// measured opening/effort/ceiling back); toward the simulation it plays the
 // leader role of the same pairing. Stamps pass through unchanged. One instance
 // per side; the slots carry the side for the control conversation, and the
 // health heartbeat is attributed to this instance by the transport.
@@ -11,12 +11,12 @@
     name: "openarm_sim_gripper",
     tag: "v1",
     implements: [
-      // Per-component readiness the robot_initializer aggregates, exactly like
-      // the real follower: ready once the engine's first state has been
+      // Per-component readiness openarm_initializer aggregates, exactly like
+      // the real follower: ready once the simulation's first state has been
       // relayed (this limb's physics is live and serving).
       { name: "component_ready", tag: "v1", link_id: "ready" },
       // Same health surface as the real gripper, published as "present, not
-      // sensed": nominal level, empty reading vectors (the engine reports no
+      // sensed": nominal level, empty reading vectors (the simulation reports no
       // effort or temperature).
       { name: "motor_health", tag: "v1", link_id: "motor_health" },
     ],
@@ -26,10 +26,10 @@
         // the real gripper's slot: optional, established at the backbone's
         // start.
         { name: "gripper_link", tag: "v1", role: "follower", link_id: "backbone", optional: true },
-        // The same pairing toward the sim engine's matching limb slot: this
-        // relay leads, the engine follows. Required: a relay without an engine
+        // The same pairing toward the simulation's matching limb slot: this
+        // relay leads, the simulation follows. Required: a relay without a simulation
         // is a misconfiguration, so the launch fails loudly instead.
-        { name: "gripper_link", tag: "v1", role: "leader", link_id: "engine" }
+        { name: "gripper_link", tag: "v1", role: "leader", link_id: "simulation" }
       ]
     }
   },
@@ -37,12 +37,12 @@
     topics: {
       emits: [
         { link_id: "backbone", name: "gripper_states" },
-        { link_id: "engine", name: "gripper_setpoints" },
+        { link_id: "simulation", name: "gripper_setpoints" },
         { link_id: "motor_health", name: "motor_health" },
       ],
       consumes: [
         { link_id: "backbone", name: "gripper_setpoints" },
-        { link_id: "engine", name: "gripper_states" },
+        { link_id: "simulation", name: "gripper_states" },
       ],
     },
     services: {
