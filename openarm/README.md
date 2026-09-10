@@ -27,8 +27,10 @@ The third simulation, `waldo`, is published by the `private-nodes-hub` repositor
 
 The [launchers](https://github.com/Peppy-bot/launchers-hub)
 run robots as named copies: `simulation` runs one simulation and simulated
-robots, `fleet` any mix of physical and simulated ones. The simulations above pair with one
-simulated robot; physical robots join beside it in wall-time mode.
+robots, `fleet` any mix of physical and simulated ones. MuJoCo and Isaac Sim
+pair with one simulated robot, and physical robots join beside it in
+wall-time mode; Waldo seats as many robots, of either generation, as there
+are machines to run them.
 
 ## 1. Prerequisites
 
@@ -150,10 +152,11 @@ simulation is selected at launch. These are separate sessions:
 peppy stack launch fleet
 peppy stack join openarm_v2 -i alpha
 
-# Simulated v2 with the web commander.
+# Simulated v2 with the web commander; more robots join the same simulation.
 peppy stack launch openarm_simulation                 # Waldo
 peppy stack launch openarm_simulation --with mujoco
 peppy stack launch openarm_simulation --with isaac_sim
+peppy stack join openarm_v1_sim -i bravo --set-arguments commander_inst.http_port=8766
 ```
 
 MuJoCo and Isaac Sim also simulate `openarm_v1_sim`. Waldo supplies the v2
@@ -161,9 +164,10 @@ world. A copy selects its own recorder (`lerobot_recorder`), camera rig
 (`cameras_sim` for rendered v2 cameras) and robot commander (`xr_commander`,
 `mcp_commander`) with `with:` in the file or `--with` on join. Its ids carry
 its name, `alpha_backbone_inst`; the simulation and scene control belong to the
-stack. Removing a copy leaves the simulation and its preloaded model running;
-`stack reset` stops everything. The simulation, generation, and rendered-camera
-configuration are selected at launch; a second simulated robot is rejected.
+stack. Removing a copy takes its robot out of the world and leaves the
+simulation running; `stack reset` stops everything. Waldo seats every robot
+that joins, of either generation; MuJoCo and Isaac Sim carry the one robot
+they stand.
 Physical robots can join a fleet:
 
 ```sh
