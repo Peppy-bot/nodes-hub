@@ -96,7 +96,7 @@ async fn consumed_topics_surface_on_the_panel() -> peppygen::Result<()> {
             alerts_instances: 1,
             ..Config::default()
         },
-        openarm_commander::setup,
+        openarm_web_commander::setup,
     )
     .await?;
 
