@@ -1,8 +1,8 @@
-// The MuJoCo engine node. It
+// The MuJoCo simulation node. It
 // plays the follower role of every limb's joint_link / gripper_link
-// pairing: the sim relays lead each pair and the engine's measured state
+// pairing: the sim relays lead each pair and the simulation's measured state
 // streams back on it. Sim peripherals attach to this node by node name for
-// engine-internal coupling.
+// simulation-internal coupling.
 {
   peppy_schema: "node/v1",
   manifest: {
@@ -10,17 +10,17 @@
     tag: "v1",
     depends_on: {
       pairings: [
-        // The engine plays the follower role of every limb's pairing directly,
+        // The simulation plays the follower role of every limb's pairing directly,
         // one slot per limb (the slot is the side, so no id demux): governed
-        // setpoints stream in, measured engine state streams back. Optional:
-        // the engine boots unpaired and each pair is established at the
+        // setpoints stream in, measured simulation state streams back. Optional:
+        // the simulation boots unpaired and each pair is established at the
         // backbone's start (launcher `links:`).
         { name: "joint_link", tag: "v1", role: "follower", link_id: "left_arm", optional: true },
         { name: "joint_link", tag: "v1", role: "follower", link_id: "right_arm", optional: true },
         { name: "gripper_link", tag: "v1", role: "follower", link_id: "left_gripper", optional: true },
         { name: "gripper_link", tag: "v1", role: "follower", link_id: "right_gripper", optional: true },
         // Robot-mounted cameras rendered from the live scene, one slot per
-        // camera (the slot is the camera, so no id demux). The engine plays the
+        // camera (the slot is the camera, so no id demux). The simulation plays the
         // camera role; a per-camera relay presents the rgb/rgbd contract.
         // Optional: slots stay unbound (and rendering stays off) outside record
         // stacks; frames flow only when cameras_enabled is set.
@@ -73,7 +73,7 @@
       // Required so the sim matches the real deployment it stands in for.
       hardware_version: "string",
       // Rate (Hz) of the measured-state streams (joint_states / gripper_states).
-      // On a launch that declares this engine its source of simulated time, the
+      // On a launch that declares this simulation its source of simulated time, the
       // same rate is how often the fleet's clock advances, so it also sets how
       // finely every machine of that launch can read time.
       state_rate_hz: "u32",

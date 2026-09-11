@@ -13,8 +13,8 @@ use peppygen::exposed_services::camera::{
     depth_stream_info, set_color_brightness, set_color_contrast, set_color_exposure,
     set_color_gain, set_color_white_balance, video_stream_info,
 };
-use peppygen::paired_topics::engine::{
-    depth_stream as engine_depth, stream_info, video_stream as engine_video,
+use peppygen::paired_topics::simulation::{
+    depth_stream as simulation_depth, stream_info, video_stream as simulation_video,
 };
 use peppygen::{NodeRunner, Parameters, Result};
 use peppylib::runtime::CancellationToken;
@@ -41,7 +41,7 @@ const UNSUPPORTED_MESSAGE: &str = "not adjustable in sim";
 /// zed answer when no usable hardware value exists.
 const NO_CURRENT_VALUE: i32 = -1;
 
-/// The engine's latest stream description; zeros until the first one arrives.
+/// The simulation's latest stream description; zeros until the first one arrives.
 #[derive(Clone, Default)]
 struct StreamDescription {
     width: u32,
@@ -89,14 +89,14 @@ impl RepeatedError {
     }
 }
 
-/// Forward one engine stream to its contract twin; color and depth legs are
+/// Forward one simulation stream to its contract twin; color and depth legs are
 /// the same conversation over different topics.
 macro_rules! relay_stream {
     ($fn_name:ident, $consume:ident, $emit:ident, $label:literal) => {
         async fn $fn_name(runner: Arc<NodeRunner>, token: CancellationToken) {
             let mut sub = match $consume::subscribe(&runner).await {
                 Ok(s) => s,
-                Err(e) => return error!(concat!("engine ", $label, " subscribe: {}"), e),
+                Err(e) => return error!(concat!("simulation ", $label, " subscribe: {}"), e),
             };
             let publisher = match $emit::declare_publisher(&runner).await {
                 Ok(p) => p,
@@ -116,7 +116,7 @@ macro_rules! relay_stream {
                     Ok(None) => return,
                     Err(e) => {
                         receive_errors
-                            .report(concat!("engine ", $label, " receive"), e)
+                            .report(concat!("simulation ", $label, " receive"), e)
                             .await;
                         continue;
                     }
@@ -157,7 +157,11 @@ macro_rules! relay_stream {
                         failing = false;
                         if first {
                             first = false;
-                            info!(concat!("first ", $label, " frame relayed from the engine"));
+                            info!(concat!(
+                                "first ",
+                                $label,
+                                " frame relayed from the simulation"
+                            ));
                         }
                     }
                     Err(e) if !failing => {
@@ -174,10 +178,10 @@ macro_rules! relay_stream {
     };
 }
 
-relay_stream!(relay_video, engine_video, camera_video, "video_stream");
-relay_stream!(relay_depth, engine_depth, camera_depth, "depth_stream");
+relay_stream!(relay_video, simulation_video, camera_video, "video_stream");
+relay_stream!(relay_depth, simulation_depth, camera_depth, "depth_stream");
 
-/// Track the engine's latest stream description for the info services.
+/// Track the simulation's latest stream description for the info services.
 async fn track_stream_info(
     runner: Arc<NodeRunner>,
     description: SharedDescription,
@@ -185,7 +189,7 @@ async fn track_stream_info(
 ) {
     let mut sub = match stream_info::subscribe(&runner).await {
         Ok(s) => s,
-        Err(e) => return error!("engine stream_info subscribe: {e}"),
+        Err(e) => return error!("simulation stream_info subscribe: {e}"),
     };
     let mut rejecting = false;
     let mut receive_errors = RepeatedError::default();
@@ -222,7 +226,9 @@ async fn track_stream_info(
             }
             Ok(None) => return,
             Err(e) => {
-                receive_errors.report("engine stream_info receive", e).await;
+                receive_errors
+                    .report("simulation stream_info receive", e)
+                    .await;
             }
         }
     }

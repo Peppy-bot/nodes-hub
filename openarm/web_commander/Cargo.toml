@@ -1,5 +1,5 @@
 [package]
-name = "openarm_commander"
+name = "openarm_web_commander"
 version = "0.1.0"
 edition = "2024"
 

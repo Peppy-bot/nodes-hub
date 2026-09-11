@@ -39,20 +39,10 @@ _LEVEL_WORDS = {
 # are in an unknown state, not a healthy one.
 HEALTH_STALE_AFTER_MS = 1500
 
-# The panel's fixed instance order, the openarm launcher family's limb
-# instance ids. Instances outside it follow, sorted by name, so a producer
-# this node did not anticipate is still listed.
-_PANEL_INSTANCE_ORDER = (
-    "left_arm_inst",
-    "right_arm_inst",
-    "left_grip_inst",
-    "right_grip_inst",
-)
-
 
 def _display_name(instance: str) -> str:
-    """The panel wording for an instance name: "left_grip_inst" reads
-    LEFT GRIP, with any "_inst" launcher suffix dropped."""
+    """The panel wording for an instance name: the trailing "_inst" dropped,
+    underscores as spaces, upper case."""
     return instance.removesuffix("_inst").replace("_", " ").upper()
 
 
@@ -121,8 +111,8 @@ class MotorHealthReports:
     instead of dropping the rows as if the motors were fine.
     """
 
-    def __init__(self, *, producers_bound: bool = True, monotonic=time.monotonic) -> None:
-        self._producers_bound = producers_bound
+    def __init__(self, *, producers: Sequence[str] = (), monotonic=time.monotonic) -> None:
+        self._producer_order = {name: index for index, name in enumerate(producers)}
         # Injectable so staleness tests can move time instead of sleeping.
         self._monotonic = monotonic
         self._by_instance: dict[str, HealthReport] = {}
@@ -135,7 +125,7 @@ class MotorHealthReports:
         looks exactly like one whose producers all died. A surface that
         renders silence has to be able to say which of the two it is showing.
         """
-        return self._producers_bound
+        return bool(self._producer_order)
 
     def update(
         self,
@@ -171,7 +161,7 @@ class MotorHealthReports:
         )
 
     def by_instance(self) -> tuple[InstanceHealth, ...]:
-        """Every instance ever received, panel order first and the rest
+        """Every instance ever received, configured producer order first and the rest
         sorted; a report older than the staleness window reads as None.
 
         An instance never received is absent entirely: the launcher may not
@@ -187,8 +177,9 @@ class MotorHealthReports:
             )
 
         known = self._by_instance
-        ordered = [name for name in _PANEL_INSTANCE_ORDER if name in known] + sorted(
-            name for name in known if name not in _PANEL_INSTANCE_ORDER
+        ordered = sorted(
+            known,
+            key=lambda name: (self._producer_order.get(name, len(self._producer_order)), name),
         )
         return tuple(entry(known[name]) for name in ordered)
 

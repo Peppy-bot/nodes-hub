@@ -3,9 +3,9 @@
 The bimanual motion authority. One node sits between whatever leads (the
 commander panel or a leader arm rig) and the four followers (two arms, two
 grippers), and everything that reaches a follower has passed through one
-governed pipeline against one self-collision model. The node is
-engine-agnostic: the same binary drives hardware, MuJoCo, and Isaac, because
-the launcher decides what pairs into each slot.
+governed pipeline against one self-collision model. The same binary drives
+hardware, MuJoCo, and Isaac, because the launcher decides what pairs into
+each slot.
 
 ```text
         leader_left_arm . leader_right_arm             [joints mode]
@@ -148,7 +148,7 @@ failure of the move machinery).
 | Module | Owns | Why it lives here |
 |---|---|---|
 | `main.rs` | bringup: params, models, channels, task supervision | first task exit is fatal; the daemon restarts a clean process |
-| `startup.rs` | the robot_initializer gate | nothing streams before the robot is ready |
+| `startup.rs` | the openarm_initializer gate | nothing streams before the robot is ready |
 | `streams.rs` | every subscription + parse-at-the-boundary types (`GripperCommand`, `ArmState`, `GripperState`) | one receive policy (`subscribe_pair` + `accept`); a malformed message is dropped with a reason, never driven |
 | `upstream.rs` | `UpstreamMode` (which upstream slot kind is followed) + `Upstream` (the parsed joint or pose command) | one command authority per arm is unrepresentable, not checked per tick |
 | `publish.rs` | every publisher (`Publishers`), one stamp/build/publish/log path | peppy vocabulary: a publisher on a slot; "wire" means the transport encoding only |
@@ -176,8 +176,8 @@ and the commander's `governor_control` stream retunes them live.
 `follower_state_rate_hz` is required too: the rate the followers deliver
 measured state at, of which four silent periods freeze the limb, and under
 three quarters of which draws a warning (100 for the real arms and MuJoCo;
-the Isaac fragment declares its 60 fps frame rate, since that engine reports
-once per rendered frame).
+the Isaac fragment declares its 60 fps frame rate, since that simulation
+reports once per rendered frame).
 `upstream_mode` is likewise required: `"joints"` follows the joint_link
 leader slots, `"pose"` the pose_link ones, and only the named kind is
 subscribed. Link the leader into the slots that kind names, or nothing it
@@ -195,11 +195,11 @@ no-op, so partial deployments and monitors boot cleanly.
 
 ```sh
 # Build into the node stack (never plain cargo for deployment):
-peppy node add /path/to/openarm-nodes/openarm_backbone -sb
+peppy node add /path/to/nodes-hub/openarm/backbone -sb
 
 # Launch the whole stack (sim shown; the backbone and commander pair
 # mutually, so cold starts go through a launcher):
-peppy stack launch /path/to/launchers-hub/openarm/openarm_v2_teleop_mujoco.json5
+peppy stack launch simulation --with mujoco
 
 # Unit tests run directly; both hardware generations' models are exercised:
 cargo test

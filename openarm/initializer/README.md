@@ -1,0 +1,47 @@
+# openarm_initializer
+
+The robot's readiness gate. It polls the per-limb `is_ready` of the four
+`openarm_hardware_ready` producers the launcher binds (two arms, two grippers)
+and exposes the robot-level `is_ready` service the backbone gates on, true only
+once every limb reports ready. A component that dies or becomes unreachable
+flips the robot back to not-ready on the next poll.
+
+The hardware drivers and the simulation relays implement the same per-limb
+contract, so this one initializer serves the real robot and every simulation.
+Loading the simulated world is the simulation nodes' business
+(`openarm_sim_mujoco` / `openarm_sim_isaac`).
+
+## Build
+
+```sh
+peppy node add /path/to/ws/nodes-hub/openarm/initializer -sb
+```
+
+Rebuild after code changes by re-running with `--force`. When the build
+finishes, `peppy stack list` shows the node at `Stage: Ready`.
+
+## Run
+
+Every declared slot must be bound when an instance starts, so the node starts
+through a launcher, which links its four slots to the concrete arm and gripper
+instances. The OpenArm fragments in
+[launchers-hub](https://github.com/Peppy-bot/launchers-hub/tree/main/openarm/fragments)
+do exactly that; the [top-level README](../README.md) walks through the whole
+sequence:
+
+```sh
+peppy stack launch simulation --with mujoco
+```
+
+Watch it come up with:
+
+```sh
+peppy node info openarm_initializer:v1
+```
+
+## Troubleshooting
+
+**`is_ready` never becomes true**
+One of the four limbs is not reporting ready, and an unreachable component
+counts as not ready. This node reports only the aggregate; find the holdout in
+the limb instances' own logs (`peppy node info <node>:v1` per limb node).

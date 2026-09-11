@@ -36,7 +36,7 @@ async fn observed_states_feed_the_panel_and_gate_streaming() -> peppygen::Result
             parameters: Some(helpers::test_parameters(PANEL_PORT)),
             ..Config::default()
         },
-        openarm_commander::setup,
+        openarm_web_commander::setup,
     )
     .await?;
 

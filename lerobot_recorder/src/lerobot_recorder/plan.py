@@ -9,7 +9,7 @@ binding order load-bearing.
 
 Pairing wire messages carry no joint names, so dataset dimension names derive
 from each limb's name plus joint index (left_arm_inst_j0,
-left_grip_inst_opening); a limb is named after the follower instance observed
+left_gripper_inst_opening); a limb is named after the follower instance observed
 for it. Joint counts and which optional vectors a source delivers are
 discovered from its first message and locked into the schema at the first
 episode. Each camera producer becomes one dataset image key derived from its

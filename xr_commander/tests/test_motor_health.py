@@ -117,15 +117,14 @@ def test_an_instance_never_received_renders_nothing():
     assert health_rows(MotorHealthReports().by_instance()) == ()
 
 
-def test_known_instances_keep_the_panel_order():
-    # right_grip_inst arrives first and sorts before right_arm_inst, so only
-    # the fixed panel order puts the arm row above it.
-    store = MotorHealthReports()
-    report(store, instance="right_grip_inst", levels=(0,))
-    report(store, instance="right_arm_inst")
+@pytest.mark.parametrize("prefix", ["", "alpha_", "right_"])
+def test_instances_follow_configured_producer_order(prefix):
+    store = MotorHealthReports(producers=(f"{prefix}right_arm_inst", f"{prefix}left_gripper_inst"))
+    report(store, instance=f"{prefix}left_gripper_inst", levels=(0,))
+    report(store, instance=f"{prefix}right_arm_inst")
     assert [entry.instance for entry in store.by_instance()] == [
-        "right_arm_inst",
-        "right_grip_inst",
+        f"{prefix}right_arm_inst",
+        f"{prefix}left_gripper_inst",
     ]
 
 
@@ -339,8 +338,8 @@ async def test_a_malformed_producer_is_reported_once_not_every_report(capsys):
 
 
 def test_an_unwired_health_slot_is_distinguishable_from_a_quiet_one():
-    unwired = MotorHealthReports(producers_bound=False)
-    wired = MotorHealthReports(producers_bound=True)
+    unwired = MotorHealthReports(producers=())
+    wired = MotorHealthReports(producers=("motor_inst",))
     assert unwired.by_instance() == wired.by_instance() == ()
     assert not unwired.producers_bound
     assert wired.producers_bound

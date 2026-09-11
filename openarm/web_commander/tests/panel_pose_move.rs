@@ -10,7 +10,7 @@ mod helpers;
 
 use std::time::Duration;
 
-use openarm_commander::{PLAN_ANGLE_TOL_RAD, PLAN_POS_TOL_M, REACHED_ORIENTATION_TOL_RAD};
+use openarm_web_commander::{PLAN_ANGLE_TOL_RAD, PLAN_POS_TOL_M, REACHED_ORIENTATION_TOL_RAD};
 use peppygen::fixtures::harness::{Config, Harness};
 use peppygen::mock::deps::limb_motion::{move_arm, move_arm_joints};
 use srs_model::nalgebra::{Quaternion, UnitQuaternion};
@@ -31,7 +31,7 @@ async fn firing_a_pose_carries_the_plan_tolerances_and_judges_arrival_separately
             parameters: Some(helpers::test_parameters(PANEL_PORT)),
             ..Config::default()
         },
-        openarm_commander::setup,
+        openarm_web_commander::setup,
     )
     .await?;
 
