@@ -165,8 +165,8 @@ Physical robots can join a fleet:
 
 ```sh
 peppy stack launch fleet
-peppy stack join openarm_v2 -i alpha --place alpha@jetson-1
-peppy stack join openarm_v1 -i bravo --place bravo@jetson-2
+peppy stack join openarm_v2 -i alpha --place jetson-1
+peppy stack join openarm_v1 -i bravo --place jetson-2
 peppy stack list
 peppy stack remove bravo
 peppy stack reset --federated
