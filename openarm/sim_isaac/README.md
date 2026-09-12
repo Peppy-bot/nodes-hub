@@ -82,6 +82,45 @@ peppy node run \
   headless=true
 ```
 
+## Runtime and Performance
+
+Both headless and windowed launches use the packaged
+`robots/openarm/config/openarm.sim.kit` experience with physics, USD/RTX rendering
+and viewport controls. Headless mode enables WebRTC; `cameras_enabled=true`
+enables Replicator for robot camera capture. Extensions resolve from the Isaac Sim
+installation, with settings persistence and extension-registry lookup disabled.
+Runtime scenes and props use `isaacsim.storage.native`'s default Isaac 6.0 asset
+root; `PEPPY_ROBOT_ASSETS_DIR` selects the robot USD directory.
+
+The node targets 60 Hz using wall-monotonic absolute deadlines. Each due iteration
+runs one Isaac update, one bridge step, queued runtime and scene commands, then
+force expiry and arm targets. All that work counts toward the frame period;
+waiting is interruptible by shutdown and long stalls resynchronize the schedule
+without unbounded catch-up. Kit's main limiter and global sync-to-present are
+disabled so the Python loop owns pacing in both headless and windowed modes.
+The streamer can re-enable the main limiter at startup or on connection and
+reconnection. Before each due update, the loop checks that setting and clears it
+only if enabled, preventing an extra app-only wait that excludes bridge work.
+`state_rate_hz` only limits state and clock publications, not physics or bridge
+stepping.
+
+The node selects RTX Real-Time 2.0 (`RealTimePathTracing`) with DLSS anti-aliasing
+(`anti_aliasing=3`) and an initial viewport render resolution of 1280x720. This
+profile requires the host NVIDIA NGX driver library (`libnvidia-ngx.so`) to be
+exposed inside the container by Peppy's GPU runtime through normal dynamic-library
+lookup. WebRTC captures the app window, not just the viewport, and allows dynamic
+resizing; the encoded stream resolution can therefore differ from 1280x720.
+WebRTC targets 60 fps. DLSS frame generation is explicitly disabled with
+`/rtx-transient/dlssg/enabled=false` so displayed frames represent real rendered
+output, not generated intermediate frames.
+
+Fixed timeline stepping and synchronous rendering keep camera reads aligned with
+engine updates. The focused experience limits extension overhead, but 60 Hz is a
+target, not a guarantee: scene loading, camera capture and moving-view rendering
+can exceed the frame budget and reduce state cadence and the
+simulation-time/wall-time ratio. Slow-loop logs measure work only, excluding
+deliberate pacing waits.
+
 ## Runtime Commander
 
 From the repository root:
