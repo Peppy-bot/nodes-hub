@@ -62,19 +62,22 @@ def _scene_path(hardware_version: str) -> Path:
 
 _ROBOTS_DIR = Path(__file__).resolve().parents[1]
 
-# State is published once per rendered frame, so the frame cost bounds the
-# state cadence the backbone sees. Measured on an RTX 5090 laptop with the
-# warehouse scene: path tracing at 2 spp with the denoiser is both faster and
-# cleaner than ray-traced lighting, and 1920x1080 costs 60 to 80 ms per frame
-# while the arms move, past the backbone's stale window; this size stays inside
-# it. The livestream shows this frame.
+# The loop and livestream share a target independent of state publication limits.
+_FRAME_RATE_HZ = 60
+_EXPERIENCE_PATH = _ROBOTS_DIR / "config" / "openarm.sim.kit"
+
+# The viewport renders with RTX Real-Time 2.0 (`RealTimePathTracing`) and DLSS
+# at 720p. That renderer denoises only through DLSS Ray Reconstruction, which
+# runs on the NGX core library the base image carries (see
+# robot_initializer/scripts/Dockerfile.isaac); Peppy's `--nv` binding does not
+# bring the host's copy in. Kit falls back to TAA without a word when the
+# library is missing and streams raw path-tracing noise, so the launcher checks
+# the effective profile once the first frames have rendered.
 _RENDER_CONFIG = {
-    "renderer": "PathTracing",
+    "renderer": "RealTimePathTracing",
+    "anti_aliasing": 3,
     "width": 1280,
     "height": 720,
-    "samples_per_pixel_per_frame": 2,
-    "denoiser": True,
-    "max_bounces": 2,
 }
 
 _ready = threading.Event()
@@ -255,6 +258,13 @@ def main() -> None:
         )
 
         streaming_args = [
+            "--enable",
+            "omni.kit.livestream.app",
+            (
+                "--/exts/omni.kit.livestream.app/"
+                "primaryStream/targetFps="
+                f"{_FRAME_RATE_HZ}"
+            ),
             (
                 "--/exts/omni.kit.livestream.app/"
                 "primaryStream/signalPort="
@@ -280,9 +290,11 @@ def main() -> None:
             streaming_args
         )
 
+    if handoff.cameras_enabled:
+        sys.argv.extend(["--enable", "omni.replicator.core"])
+
     # SimulationApp must be imported only after all launch arguments
     # have been prepared.
-    
     sys.argv.extend([
         "--/log/channels/omni.usd.multitick.render=warn",
         "--/log/fileLogLevel=warn",
@@ -295,19 +307,10 @@ def main() -> None:
         **_RENDER_CONFIG,
     }
 
-    if handoff.headless:
-        simulation_app = SimulationApp(
-            launch_config,
-            experience=(
-                "/isaac-sim/apps/"
-                "isaacsim.exp.full.streaming.kit"
-            ),
-        )
-
-    else:
-        simulation_app = SimulationApp(
-            launch_config
-        )
+    simulation_app = SimulationApp(
+        launch_config,
+        experience=str(_EXPERIENCE_PATH),
+    )
 
     sys.path.insert(
         0,
@@ -327,6 +330,9 @@ def main() -> None:
         handoff.scene_actions,
         handoff.state_rate_hz,
         handoff.cameras_enabled,
+        frame_rate_hz=_FRAME_RATE_HZ,
+        render_mode=_RENDER_CONFIG["renderer"],
+        anti_aliasing=_RENDER_CONFIG["anti_aliasing"],
     ).run()
 
 

@@ -1,5 +1,40 @@
-ARG ISAAC_VERSION=5.1.0
+ARG ISAAC_VERSION=6.0.1
+
+# DLSS runs on the NGX core library, libnvidia-ngx.so.1, which ships with the
+# NVIDIA driver and which Peppy's Apptainer `--nv` binding does not carry into
+# the container. Isaac Sim 6.0 renders with RTX Real-Time 2.0, whose only
+# denoiser is DLSS Ray Reconstruction, so without the core the stream is raw
+# path-tracing noise. The core is not tied to the driver it shipped with: it
+# reads the running driver's version through NVML and each DLSS snippet checks
+# that against its own minimum. The image therefore carries the core from the
+# driver Isaac Sim 6.0 was tested with, 595.58.03, and every supported host
+# driver is at least that new. NVIDIA's apt repository for Ubuntu 24.04 stops
+# at the 580 series, so the package comes from the Ubuntu 26.04 repository;
+# only the core library is taken from it, and that file depends on glibc alone.
+# Bump the three values together.
+ARG NGX_DRIVER_VERSION=595.58.03
+ARG NGX_DEB_URL=https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2604/x86_64/libnvidia-gl_595.58.03-1ubuntu1_amd64.deb
+ARG NGX_DEB_SHA256=dfdcf78ede4f4215ec3358faee5951149a29934875fd2a3725ed28b711385063
+
+FROM ubuntu:24.04 AS ngx
+ARG NGX_DRIVER_VERSION
+ARG NGX_DEB_URL
+ARG NGX_DEB_SHA256
+RUN apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true update \
+    && apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -fsSL --retry 5 -o /tmp/nvidia-gl.deb "${NGX_DEB_URL}" \
+    && echo "${NGX_DEB_SHA256}  /tmp/nvidia-gl.deb" | sha256sum -c - \
+    && mkdir -p /ngx \
+    && dpkg-deb --fsys-tarfile /tmp/nvidia-gl.deb \
+        | tar -x -C /ngx --strip-components=4 \
+            "./usr/lib/x86_64-linux-gnu/libnvidia-ngx.so.${NGX_DRIVER_VERSION}" \
+    && rm /tmp/nvidia-gl.deb
+
 FROM nvcr.io/nvidia/isaac-sim:${ISAAC_VERSION}
+ARG NGX_DRIVER_VERSION
 
 USER root
 RUN apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true update \
@@ -8,6 +43,11 @@ RUN apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true update \
         git \
         rclone \
     && rm -rf /var/lib/apt/lists/*
+
+# Kit opens the core by soname from the loader's search path.
+COPY --from=ngx /ngx/libnvidia-ngx.so.${NGX_DRIVER_VERSION} /usr/lib/x86_64-linux-gnu/
+RUN ln -s "libnvidia-ngx.so.${NGX_DRIVER_VERSION}" /usr/lib/x86_64-linux-gnu/libnvidia-ngx.so.1 \
+    && ldconfig
 
 COPY scripts/requirements.isaac.txt /tmp/requirements.txt
 RUN /isaac-sim/python.sh -m pip install --no-cache-dir --retries 5 --timeout 180 -r /tmp/requirements.txt

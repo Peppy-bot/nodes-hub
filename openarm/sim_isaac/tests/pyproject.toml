@@ -1,16 +1,16 @@
-# The camera suites are their own uv project rather than part of the node
+# The GPU-free suites are their own uv project rather than part of the node
 # above them. The node manages nothing through uv: its python runs on the
 # interpreter its image ships, against the dependencies baked into that image.
 #
 # CI runs a python test project inside the image built from the apptainer.def
 # beside it, and gives a project with no def the scaffolded python base image.
-# There is no def here, which is what these suites want: they import no engine
-# module, so pulling the multi-gigabyte Isaac Sim image to run pure-python
+# There is no def here, which is what these suites want: they fake engine
+# runtimes, so pulling the multi-gigabyte Isaac Sim image to run pure-python
 # assertions would buy them nothing.
 [project]
 name = "openarm-sim-isaac-tests"
 version = "0.1.0"
-description = "Tests for the openarm_sim_isaac camera plumbing"
+description = "GPU-free tests for openarm_sim_isaac startup, loop pacing, cameras and clock"
 # One minor, so every run resolves the same interpreter.
 requires-python = ">=3.11,<3.12"
 dependencies = [

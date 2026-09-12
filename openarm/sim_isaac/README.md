@@ -24,7 +24,7 @@ This branch is intended for reproducibility testing and community feedback. It p
 Recommended host setup:
 
 - Ubuntu 24.04 LTS
-- NVIDIA GPU with a compatible proprietary driver
+- NVIDIA GPU with the proprietary driver, 595.58.03 or newer
 - Peppy
 - Git LFS
 - 32 GB RAM recommended
@@ -34,6 +34,10 @@ Isaac Sim base image:
 ```text
 nvcr.io/nvidia/isaac-sim:6.0.1
 ```
+
+The node builds on `peppybot/openarm-isaac-sim`, which
+`openarm/robot_initializer/scripts/build_base_images.sh` produces from that
+image with the robot assets and the NGX core library baked in.
 
 Systems with less RAM may require additional swap during image build or startup.
 
@@ -81,6 +85,55 @@ peppy node run \
   state_rate_hz=50 \
   headless=true
 ```
+
+## Runtime and Performance
+
+Both headless and windowed launches use the packaged
+`robots/openarm/config/openarm.sim.kit` experience with physics, USD/RTX rendering
+and viewport controls. Headless mode enables WebRTC; `cameras_enabled=true`
+enables Replicator for robot camera capture. Extensions resolve from the Isaac Sim
+installation, with settings persistence and extension-registry lookup disabled.
+Runtime scenes and props use `isaacsim.storage.native`'s default Isaac 6.0 asset
+root; `PEPPY_ROBOT_ASSETS_DIR` selects the robot USD directory.
+
+The node targets 60 Hz using wall-monotonic absolute deadlines. Each due iteration
+runs one Isaac update, one bridge step, queued runtime and scene commands, then
+force expiry and arm targets. All that work counts toward the frame period;
+waiting is interruptible by shutdown and long stalls resynchronize the schedule
+without unbounded catch-up. Kit's main limiter and global sync-to-present are
+disabled so the Python loop owns pacing in both headless and windowed modes.
+The streamer can re-enable the main limiter at startup or on connection and
+reconnection. Before each due update, the loop checks that setting and clears it
+only if enabled, preventing an extra app-only wait that excludes bridge work.
+`state_rate_hz` only limits state and clock publications, not physics or bridge
+stepping.
+
+The node renders with RTX Real-Time 2.0 (`RealTimePathTracing`), DLSS
+(`anti_aliasing=3`) and an initial viewport render resolution of 1280x720. That
+renderer denoises only through DLSS Ray Reconstruction, which runs on the NGX
+core library shipped with the NVIDIA driver, and Peppy's `--nv` GPU binding does
+not carry the host's copy into the container. The base image therefore carries
+the core itself: `robot_initializer/scripts/Dockerfile.isaac` takes
+`libnvidia-ngx.so.1` from the driver Isaac Sim 6.0 was tested with, 595.58.03,
+pinned by version and checksum. The core reads the running driver through NVML
+and the DLSS snippets check that version against their own minimum, so the host
+needs a driver at least that new, not that exact version. Kit falls back to TAA
+without a word when the core is missing and streams raw path-tracing noise, so
+after the warmup the launcher reads the effective `/rtx/rendermode` and
+`/rtx/post/aa/op` and refuses to run on anything but the requested profile.
+WebRTC captures
+the app window, not just the viewport, and allows dynamic resizing; the encoded
+stream resolution can therefore differ from 1280x720. WebRTC targets 60 fps. DLSS
+frame generation stays explicitly disabled with `/rtx-transient/dlssg/enabled=false`
+so displayed frames represent real rendered output, not generated intermediate
+frames.
+
+Fixed timeline stepping and synchronous rendering keep camera reads aligned with
+engine updates. The focused experience limits extension overhead, but 60 Hz is a
+target, not a guarantee: scene loading, camera capture and moving-view rendering
+can exceed the frame budget and reduce state cadence and the
+simulation-time/wall-time ratio. Slow-loop logs measure work only, excluding
+deliberate pacing waits.
 
 ## Runtime Commander
 
