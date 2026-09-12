@@ -32,28 +32,13 @@ def startup(monkeypatch):
     monkeypatch.setitem(sys.modules, "peppylib", ModuleType("peppylib"))
     monkeypatch.setitem(sys.modules, "peppylib.runtime", runtime)
 
-    state = SimpleNamespace(
-        constructed=False, trace=[], argv=[], app=Mock(), rendermode="RaytracedLighting",
-    )
+    state = SimpleNamespace(constructed=False, trace=[], argv=[], app=Mock())
 
     def construct(config, *, experience):
         state.constructed = True
         state.trace.append("app")
         state.argv = sys.argv.copy()
         return state.app
-
-    # Kit reports the renderer it actually runs; the launch must read it only
-    # once the app exists and must stop on a substituted mode.
-    def get_setting(key):
-        assert key == "/rtx/rendermode"
-        state.trace.append("render mode")
-        return state.rendermode
-
-    carb = ModuleType("carb")
-    carb.settings = ModuleType("carb.settings")
-    carb.settings.get_settings = Mock(return_value=SimpleNamespace(get=get_setting))
-    monkeypatch.setitem(sys.modules, "carb", carb)
-    monkeypatch.setitem(sys.modules, "carb.settings", carb.settings)
 
     isaacsim = ModuleType("isaacsim")
     isaacsim.SimulationApp = Mock(side_effect=construct)
@@ -117,8 +102,8 @@ def test_launch_selects_extensions_before_construction_and_preserves_handoff(
     state.simulation_app.assert_called_once_with(
         {
             "headless": headless,
-            "renderer": "RaytracedLighting",
-            "anti_aliasing": 1,
+            "renderer": "RealTimePathTracing",
+            "anti_aliasing": 3,
             "width": 1280,
             "height": 720,
         },
@@ -155,31 +140,23 @@ def test_launch_selects_extensions_before_construction_and_preserves_handoff(
         17,
         cameras_enabled,
         frame_rate_hz=60,
+        render_mode="RealTimePathTracing",
+        anti_aliasing=3,
     )
     state.thread.assert_called_once_with(target=state.module._run_node_builder, daemon=True)
     state.thread.return_value.start.assert_called_once_with()
     assert state.trace == [
-        "node thread", "import isaacsim", "app", "render mode", "import launcher", "run",
+        "node thread", "import isaacsim", "app", "import launcher", "run",
     ]
 
 
-def test_render_profile_needs_no_ngx_driver_library(startup):
-    # DLSS (3) and DLAA (4) run on NGX, which the stock GPU binding does not
-    # carry; the real-time path tracer has no denoiser without it either.
+def test_render_profile_is_real_time_2_with_dlss(startup):
+    # RTX Real-Time 2.0 denoises only through DLSS Ray Reconstruction, which
+    # runs on the NGX core library the base image carries; the launcher checks
+    # after its warmup that Kit kept the profile.
     config = startup().module._RENDER_CONFIG
-    assert config["renderer"] == "RaytracedLighting"
-    assert config["anti_aliasing"] in (0, 1, 2)
-
-
-def test_substituted_render_mode_aborts_before_the_launcher(startup):
-    state = startup()
-    state.rendermode = "RealTimePathTracing"
-    with pytest.raises(RuntimeError, match="'RealTimePathTracing' instead of the requested 'RaytracedLighting'"):
-        state.module.main()
-
-    state.simulation_app.assert_called_once()
-    state.sim_launcher.assert_not_called()
-    assert state.trace == ["node thread", "import isaacsim", "app", "render mode"]
+    assert config["renderer"] == "RealTimePathTracing"
+    assert config["anti_aliasing"] == 3
 
 
 def test_blank_public_ip_leaves_ice_address_selection_automatic(startup, monkeypatch):
@@ -284,16 +261,13 @@ def test_kit_drives_sensor_annotator_frame_gates_from_the_timeline(kit):
     assert settings["persistent"]["omni"]["replicator"]["captureOnPlay"] is True
 
 
-def test_kit_enables_the_real_time_pipeline_kit_ships_disabled(kit):
-    assert kit["settings"]["persistent"]["rtx"]["modes"]["rt"]["enabled"] is True
-
-
-def test_kit_denoises_sampled_lighting_without_ngx(kit):
-    sampled = kit["settings"]["rtx"]["directLighting"]["sampledLighting"]
-    # 0 is no denoiser (grain everywhere) and 1 is OptiX, which faults the CUDA
-    # context on Isaac 6.0; 2 is the built-in real-time denoiser.
-    assert sampled == {"denoisingTechnique": 2, "enforceDenoiser": True}
-    assert kit["settings"]["ngx"]["enabled"] is False
+def test_kit_leaves_renderer_and_ngx_to_the_launch_config(kit):
+    # SimulationApp's launch config selects the renderer and anti-aliasing;
+    # the experience neither overrides them nor touches NGX initialization.
+    settings = kit["settings"]
+    assert "rtx" not in settings
+    assert "ngx" not in settings
+    assert "rtx" not in settings["persistent"]
 
 
 def test_kit_disables_dlss_frame_generation(kit):

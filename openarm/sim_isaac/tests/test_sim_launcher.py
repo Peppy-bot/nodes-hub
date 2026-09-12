@@ -13,6 +13,8 @@ _ROBOT_DIR = Path(__file__).resolve().parents[1] / "robots" / "openarm"
 _PERIOD = 1.0 / 60
 _PHASES = ["update", "bridge", "runtime", "scene", "forces", "targets"]
 _MAIN_RATE_LIMIT_ENABLED = "/app/runLoops/main/rateLimitEnabled"
+_RENDER_MODE = "/rtx/rendermode"
+_ANTI_ALIASING_OP = "/rtx/post/aa/op"
 
 
 @pytest.fixture
@@ -43,8 +45,10 @@ def loop(monkeypatch):
         commander=Mock(),
         scene=Mock(),
         timeline=Mock(),
-        settings=Mock(spec=["get_as_bool", "set_bool"]),
+        settings=Mock(spec=["get", "get_as_bool", "set_bool"]),
         settings_values={_MAIN_RATE_LIMIT_ENABLED: False},
+        # What Kit reports it renders with; the launch asked for exactly this.
+        render_values={_RENDER_MODE: "RealTimePathTracing", _ANTI_ALIASING_OP: 3},
         settings_trace=[],
         settings_threads=[],
     )
@@ -71,6 +75,7 @@ def loop(monkeypatch):
     state.get_settings = carb.settings.get_settings
     state.settings.get_as_bool.side_effect = get_as_bool
     state.settings.set_bool.side_effect = set_bool
+    state.settings.get.side_effect = lambda key: state.render_values[key]
 
     monkeypatch.setattr(module.time, "monotonic", lambda: state.now)
     monkeypatch.setattr(module.time, "sleep", Mock(side_effect=AssertionError("use Event.wait")))
@@ -121,6 +126,8 @@ def loop(monkeypatch):
         state_rate_hz=17,
         cameras_enabled=False,
         frame_rate_hz=60,
+        render_mode="RealTimePathTracing",
+        anti_aliasing=3,
     )
     monkeypatch.setattr(state.launcher, "_update_runtime_forces", lambda: phase("forces"))
     monkeypatch.setattr(state.launcher, "_apply_runtime_arm_targets", lambda: phase("targets"))
@@ -180,7 +187,8 @@ def test_streamer_limiter_resets_are_cleared_before_the_next_update(loop, reset_
             expected.append(("write", False))
         expected.append(("update",))
     assert loop.settings_trace == expected
-    loop.get_settings.assert_called_once_with()
+    # The render check before the loop fetches the interface; the loop once more.
+    assert loop.settings_threads == [threading.main_thread()] * 2
     assert loop.settings.set_bool.call_count == len(reset_after_frames)
     loop.settings.set_bool.assert_called_with(_MAIN_RATE_LIMIT_ENABLED, False)
     assert loop.starts == pytest.approx([100.0 + i * _PERIOD for i in range(loop.frames)])
@@ -358,3 +366,41 @@ def test_bridge_failure_still_closes_the_app(loop):
     assert not loop.ready.is_set()
     loop.commander.process_pending.assert_not_called()
     loop.scene.process_pending.assert_not_called()
+
+
+def test_render_profile_is_read_after_the_warmup_and_before_the_timeline(loop, monkeypatch):
+    # Kit swaps the renderer or anti-aliasing on the first rendered frames, so
+    # a read before the warmup would pass on a launch that then streams noise.
+    order = []
+    loop.launcher._warmup.side_effect = lambda: order.append("warmup")
+    loop.settings.get.side_effect = lambda key: (order.append(key), loop.render_values[key])[1]
+    start_timeline = loop.launcher._start_timeline
+
+    def traced_start_timeline():
+        order.append("timeline")
+        start_timeline()
+
+    monkeypatch.setattr(loop.launcher, "_start_timeline", traced_start_timeline)
+    loop.launcher.run()
+
+    assert order == ["warmup", _RENDER_MODE, _ANTI_ALIASING_OP, "timeline"]
+    assert loop.bridge.step.call_count == loop.frames
+
+
+@pytest.mark.parametrize(
+    "reported",
+    [{_ANTI_ALIASING_OP: 1}, {_RENDER_MODE: "PathTracing"}],
+    ids=["dlss-dropped-for-taa", "renderer-substituted"],
+)
+def test_substituted_render_profile_stops_before_the_timeline_and_closes_isaac(loop, reported):
+    loop.render_values.update(reported)
+    with pytest.raises(RuntimeError, match="NGX core library") as failure:
+        loop.launcher.run()
+
+    assert "'RealTimePathTracing' and 3" in str(failure.value)
+    assert loop.launcher._timeline is None
+    loop.app.update.assert_not_called()
+    loop.bridge.step.assert_not_called()
+    assert loop.trace[-3:] == ["commander.stop", "bridge.shutdown", "app.close"]
+    loop.app.close.assert_called_once_with()
+    assert not loop.ready.is_set()

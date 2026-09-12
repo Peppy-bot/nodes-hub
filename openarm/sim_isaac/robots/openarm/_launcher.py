@@ -23,6 +23,10 @@ _SLOW_ITERATION_S = 0.05
 
 _WARMUP_STEPS = 100
 _MAIN_RATE_LIMIT_ENABLED = "/app/runLoops/main/rateLimitEnabled"
+# The renderer and anti-aliasing Kit actually runs; both are requested through
+# SimulationApp's launch config and both can be changed by Kit afterwards.
+_RENDER_MODE = "/rtx/rendermode"
+_ANTI_ALIASING_OP = "/rtx/post/aa/op"
 
 
 class SimLauncher:
@@ -37,6 +41,8 @@ class SimLauncher:
         state_rate_hz: int,
         cameras_enabled: bool,
         frame_rate_hz: int,
+        render_mode: str,
+        anti_aliasing: int,
     ) -> None:
         self._sim_app = sim_app
         self._usd_path = usd_path
@@ -45,6 +51,8 @@ class SimLauncher:
         self._io = io
         self._scene_actions = scene_actions
         self._frame_rate_hz = frame_rate_hz
+        self._render_mode = render_mode
+        self._anti_aliasing = anti_aliasing
         self._state_rate_hz = state_rate_hz
         self._cameras_enabled = cameras_enabled
         self._timeline = None
@@ -206,6 +214,7 @@ class SimLauncher:
                 self._configure_camera_rendering()
 
             self._warmup()
+            self._require_render_profile()
             self._start_timeline()
 
             self._extension = IsaacBridgeExtension(
@@ -272,6 +281,30 @@ class SimLauncher:
     def _warmup(self) -> None:
         for _ in range(_WARMUP_STEPS):
             self._sim_app.update()
+
+    def _require_render_profile(self) -> None:
+        """Refuse a render profile Kit changed underneath the launch.
+
+        Kit keeps the requested renderer and anti-aliasing only while it can
+        run them, and it swaps them without a word on the first rendered
+        frames: DLSS needs the NGX core library, and without it Kit falls
+        back to TAA and streams raw path-tracing noise at full frame rate.
+        The check therefore runs after the warmup, once those frames are in.
+        """
+        import carb.settings
+
+        settings = carb.settings.get_settings()
+        actual = (settings.get(_RENDER_MODE), settings.get(_ANTI_ALIASING_OP))
+        expected = (self._render_mode, self._anti_aliasing)
+
+        if actual != expected:
+            raise RuntimeError(
+                f"Isaac is rendering with mode {actual[0]!r} and anti-aliasing "
+                f"{actual[1]!r} instead of the requested {expected[0]!r} and "
+                f"{expected[1]!r}; DLSS runs on the NGX core library "
+                "(libnvidia-ngx.so.1) that the base image carries, see "
+                "robot_initializer/scripts/Dockerfile.isaac"
+            )
 
     def _start_timeline(self) -> None:
         import omni.timeline

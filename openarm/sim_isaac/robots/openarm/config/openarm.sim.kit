@@ -43,20 +43,6 @@ app.asyncRenderingLowLatency = false
 # Sensor annotator frame gates follow the playing timeline synchronously.
 omni.replicator.asyncRendering = false
 persistent.omni.replicator.captureOnPlay = true
-# Kit ships the RTX Real-Time pipeline switched off and, given a disabled
-# mode, renders with RTX Real-Time 2.0 without a word; that renderer only
-# denoises through DLSS Ray Reconstruction on the host NGX library, which the
-# stock GPU binding does not carry. launch.py refuses to run on the fallback.
-persistent.rtx.modes.rt.enabled = true
-# With more than a few lights RTX Real-Time samples direct lighting, and its
-# default denoising technique for that is none (0), which leaves grain over
-# every surface. Technique 1 (OptiX) faults the CUDA context on Isaac 6.0;
-# technique 2 is the built-in real-time denoiser, which needs no NGX. Enforce
-# it so the automatic denoiser toggle cannot switch it back off.
-rtx.directLighting.sampledLighting.denoisingTechnique = 2
-rtx.directLighting.sampledLighting.enforceDenoiser = true
-# Nothing in this profile runs on NGX, so do not initialize the driver library.
-ngx.enabled = false
 # Display real rendered frames, not generated intermediate frames.
 rtx-transient.dlssg.enabled = false
 app.renderer.skipWhileMinimized = false

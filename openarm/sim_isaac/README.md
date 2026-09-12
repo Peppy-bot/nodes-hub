@@ -24,7 +24,7 @@ This branch is intended for reproducibility testing and community feedback. It p
 Recommended host setup:
 
 - Ubuntu 24.04 LTS
-- NVIDIA GPU with a compatible proprietary driver
+- NVIDIA GPU with the proprietary driver, 595.58.03 or newer
 - Peppy
 - Git LFS
 - 32 GB RAM recommended
@@ -34,6 +34,10 @@ Isaac Sim base image:
 ```text
 nvcr.io/nvidia/isaac-sim:6.0.1
 ```
+
+The node builds on `peppybot/openarm-isaac-sim`, which
+`openarm/robot_initializer/scripts/build_base_images.sh` produces from that
+image with the robot assets and the NGX core library baked in.
 
 Systems with less RAM may require additional swap during image build or startup.
 
@@ -104,22 +108,20 @@ only if enabled, preventing an extra app-only wait that excludes bridge work.
 `state_rate_hz` only limits state and clock publications, not physics or bridge
 stepping.
 
-The node renders with RTX Real-Time (`RaytracedLighting`), TAA (`anti_aliasing=1`)
-and an initial viewport render resolution of 1280x720. The profile runs on nothing
-beyond Peppy's ordinary `--nv` GPU binding. Isaac Sim 6.0 defaults to RTX Real-Time
-2.0 (`RealTimePathTracing`), whose only denoiser is DLSS Ray Reconstruction; that
-runs on the host driver's NGX library, which `--nv` does not carry into the
-container, and without it the stream is raw path-tracing noise at full frame rate.
-Two Kit defaults stand in the way of the classic renderer and the experience file
-overrides both: the RTX Real-Time pipeline ships switched off
-(`persistent.rtx.modes.rt.enabled`), and a disabled mode falls back to RTX
-Real-Time 2.0 silently, so `launch.py` reads the effective `/rtx/rendermode` after
-startup and refuses to run on a substituted renderer; and RTX Real-Time samples
-direct lighting once a scene has more than a few lights with no denoiser selected
-for it (`rtx.directLighting.sampledLighting.denoisingTechnique`), which leaves
-grain over every surface. The experience selects and enforces the built-in
-real-time denoiser and disables NGX initialization outright, so the frame does not
-change with whatever driver libraries a host happens to expose. WebRTC captures
+The node renders with RTX Real-Time 2.0 (`RealTimePathTracing`), DLSS
+(`anti_aliasing=3`) and an initial viewport render resolution of 1280x720. That
+renderer denoises only through DLSS Ray Reconstruction, which runs on the NGX
+core library shipped with the NVIDIA driver, and Peppy's `--nv` GPU binding does
+not carry the host's copy into the container. The base image therefore carries
+the core itself: `robot_initializer/scripts/Dockerfile.isaac` takes
+`libnvidia-ngx.so.1` from the driver Isaac Sim 6.0 was tested with, 595.58.03,
+pinned by version and checksum. The core reads the running driver through NVML
+and the DLSS snippets check that version against their own minimum, so the host
+needs a driver at least that new, not that exact version. Kit falls back to TAA
+without a word when the core is missing and streams raw path-tracing noise, so
+after the warmup the launcher reads the effective `/rtx/rendermode` and
+`/rtx/post/aa/op` and refuses to run on anything but the requested profile.
+WebRTC captures
 the app window, not just the viewport, and allows dynamic resizing; the encoded
 stream resolution can therefore differ from 1280x720. WebRTC targets 60 fps. DLSS
 frame generation stays explicitly disabled with `/rtx-transient/dlssg/enabled=false`
