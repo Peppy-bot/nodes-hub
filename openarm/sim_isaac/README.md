@@ -104,15 +104,27 @@ only if enabled, preventing an extra app-only wait that excludes bridge work.
 `state_rate_hz` only limits state and clock publications, not physics or bridge
 stepping.
 
-The node selects RTX Real-Time 2.0 (`RealTimePathTracing`) with DLSS anti-aliasing
-(`anti_aliasing=3`) and an initial viewport render resolution of 1280x720. This
-profile requires the host NVIDIA NGX driver library (`libnvidia-ngx.so`) to be
-exposed inside the container by Peppy's GPU runtime through normal dynamic-library
-lookup. WebRTC captures the app window, not just the viewport, and allows dynamic
-resizing; the encoded stream resolution can therefore differ from 1280x720.
-WebRTC targets 60 fps. DLSS frame generation is explicitly disabled with
-`/rtx-transient/dlssg/enabled=false` so displayed frames represent real rendered
-output, not generated intermediate frames.
+The node renders with RTX Real-Time (`RaytracedLighting`), TAA (`anti_aliasing=1`)
+and an initial viewport render resolution of 1280x720. The profile runs on nothing
+beyond Peppy's ordinary `--nv` GPU binding. Isaac Sim 6.0 defaults to RTX Real-Time
+2.0 (`RealTimePathTracing`), whose only denoiser is DLSS Ray Reconstruction; that
+runs on the host driver's NGX library, which `--nv` does not carry into the
+container, and without it the stream is raw path-tracing noise at full frame rate.
+Two Kit defaults stand in the way of the classic renderer and the experience file
+overrides both: the RTX Real-Time pipeline ships switched off
+(`persistent.rtx.modes.rt.enabled`), and a disabled mode falls back to RTX
+Real-Time 2.0 silently, so `launch.py` reads the effective `/rtx/rendermode` after
+startup and refuses to run on a substituted renderer; and RTX Real-Time samples
+direct lighting once a scene has more than a few lights with no denoiser selected
+for it (`rtx.directLighting.sampledLighting.denoisingTechnique`), which leaves
+grain over every surface. The experience selects and enforces the built-in
+real-time denoiser and disables NGX initialization outright, so the frame does not
+change with whatever driver libraries a host happens to expose. WebRTC captures
+the app window, not just the viewport, and allows dynamic resizing; the encoded
+stream resolution can therefore differ from 1280x720. WebRTC targets 60 fps. DLSS
+frame generation stays explicitly disabled with `/rtx-transient/dlssg/enabled=false`
+so displayed frames represent real rendered output, not generated intermediate
+frames.
 
 Fixed timeline stepping and synchronous rendering keep camera reads aligned with
 engine updates. The focused experience limits extension overhead, but 60 Hz is a

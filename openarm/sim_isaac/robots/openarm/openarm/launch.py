@@ -66,10 +66,18 @@ _ROBOTS_DIR = Path(__file__).resolve().parents[1]
 _FRAME_RATE_HZ = 60
 _EXPERIENCE_PATH = _ROBOTS_DIR / "config" / "openarm.sim.kit"
 
-# The viewport uses RTX Real-Time 2.0 with DLSS at 720p.
+# The viewport renders with RTX Real-Time (`RaytracedLighting`) and TAA at
+# 720p. Isaac Sim 6.0 defaults to RTX Real-Time 2.0, whose only denoiser is
+# DLSS Ray Reconstruction; that runs on the host driver's NGX library, which
+# Peppy's stock `--nv` binding does not carry into the container, and without
+# it the stream is raw path-tracing noise. RTX Real-Time denoises on its own,
+# so this profile needs nothing beyond the ordinary GPU binding. Kit ships the
+# pipeline switched off (config/openarm.sim.kit turns it on) and renders a
+# disabled mode with RTX Real-Time 2.0 without a word, hence the check in
+# `_require_render_mode`.
 _RENDER_CONFIG = {
-    "renderer": "RealTimePathTracing",
-    "anti_aliasing": 3,
+    "renderer": "RaytracedLighting",
+    "anti_aliasing": 1,
     "width": 1280,
     "height": 720,
 }
@@ -184,6 +192,25 @@ def _run_node_builder() -> None:
 
     finally:
         _stop.set()
+
+
+def _require_render_mode(expected: str) -> None:
+    """Refuse a renderer Kit substituted for the requested one.
+
+    Kit only honours `/rtx/rendermode` values whose pipeline is enabled and
+    falls back to RTX Real-Time 2.0 otherwise, silently. That fallback needs
+    NGX to denoise, so a launch on it would stream noise at full frame rate.
+    """
+    import carb.settings
+
+    actual = carb.settings.get_settings().get("/rtx/rendermode")
+
+    if actual != expected:
+        raise RuntimeError(
+            f"Isaac is rendering with {actual!r} instead of the requested "
+            f"{expected!r}; the pipeline must be enabled through "
+            "persistent.rtx.modes in config/openarm.sim.kit"
+        )
 
 
 def main() -> None:
@@ -304,6 +331,10 @@ def main() -> None:
     simulation_app = SimulationApp(
         launch_config,
         experience=str(_EXPERIENCE_PATH),
+    )
+
+    _require_render_mode(
+        _RENDER_CONFIG["renderer"]
     )
 
     sys.path.insert(
