@@ -13,6 +13,23 @@ class Option {
     constructor(text, value) {
         this.textContent = String(text);
         this.value = String(value);
+        this.disabled = false;
+    }
+}
+
+class ClassList {
+    constructor(names) {
+        this.names = new Set(names);
+    }
+
+    add(name) { this.names.add(name); }
+    remove(name) { this.names.delete(name); }
+    contains(name) { return this.names.has(name); }
+
+    toggle(name, force) {
+        const on = force === undefined ? !this.names.has(name) : force;
+        on ? this.names.add(name) : this.names.delete(name);
+        return on;
     }
 }
 
@@ -25,6 +42,8 @@ class Element {
         this.value = attributes.value || '';
         this.textContent = '';
         this.hidden = Object.hasOwn(attributes, 'hidden');
+        this.disabled = Object.hasOwn(attributes, 'disabled');
+        this.classList = new ClassList((attributes.class || '').split(/\s+/).filter(Boolean));
         this.style = {};
         this.children = [];
     }
@@ -80,19 +99,45 @@ const block = {
     description: 'Small red cube for grasping and stacking.',
 };
 
-async function page(catalogue = [staticScene, dynamicScene, cage], objects = []) {
+const PROVIDER_BUSY = 'Isaac is still discovering its asset catalogue';
+
+// unavailable: how many catalogue requests the provider refuses first, as the
+// node answers while the engine has no catalogue yet (HTTP 503).
+async function page(catalogue = [staticScene, dynamicScene, cage], objects = [], { unavailable = 0 } = {}) {
     const elements = new Map();
     registerElements(html, elements);
     const requests = [];
+    const waits = [];
     let currentCatalogue = catalogue;
+    let refusals = unavailable;
+    const snapshot = () => ({
+        status: elements.get('status').textContent,
+        loading: elements.get('status').classList.contains('loading'),
+        assetCount: elements.get('assetCount').textContent,
+        selects: Object.fromEntries(['sceneSelect', 'categorySelect', 'assetSelect'].map(id => {
+            const select = elements.get(id);
+            return [id, {
+                disabled: select.disabled,
+                options: select.children.map(o => ({ text: o.textContent, disabled: o.disabled })),
+            }];
+        })),
+    });
     const context = vm.createContext({
         Option,
         document: { getElementById: id => {
             assert.ok(elements.has(id), `page contains #${id}`);
             return elements.get(id);
         } },
+        setTimeout: (callback, delay) => {
+            waits.push({ delay, ...snapshot() });
+            callback();
+        },
         fetch: async (path, options) => {
             requests.push({ path, body: options.body && JSON.parse(options.body) });
+            if (path === '/api/assets' && refusals > 0) {
+                refusals -= 1;
+                return { ok: false, status: 503, json: async () => ({ success: false, message: PROVIDER_BUSY }) };
+            }
             const data = path === '/api/assets' ? { assets: currentCatalogue }
                 : path === '/api/objects' ? { objects }
                 : { message: 'Scene loaded' };
@@ -102,7 +147,7 @@ async function page(catalogue = [staticScene, dynamicScene, cage], objects = [])
     await vm.runInContext(script, context);
     const element = id => elements.get(id);
     return {
-        element, requests,
+        element, requests, waits,
         run: expression => vm.runInContext(expression, context),
         selectScene: async id => {
             element('sceneSelect').value = id;
@@ -130,9 +175,58 @@ test('fetched scenes expose their catalogue names and selected descriptions', as
     assert.equal(ui.element('sceneDescription').hidden, false);
     ui.element('sceneScale').value = '1.5';
     await ui.run('loadScene()');
-    assert.deepEqual(ui.requests.at(-1), {
+    assert.deepEqual(ui.requests.at(-2), {
         path: '/api/scene/load', body: { asset_id: dynamicScene.asset_id, scale: 1.5 },
     });
+});
+
+test('the page opens in its loading state before any script runs', () => {
+    const elements = new Map();
+    registerElements(html, elements);
+    assert.equal(elements.get('status').classList.contains('loading'), true);
+    for (const id of ['sceneSelect', 'categorySelect', 'assetSelect']) {
+        assert.equal(elements.get(id).disabled, true, `#${id} starts disabled`);
+    }
+    assert.match(html, /<select id="sceneSelect"[^>]*>\s*<option value="" disabled>Loading assets\.\.\.<\/option>/);
+});
+
+test('the page keeps asking the provider for its catalogue and shows why it waits', async () => {
+    const ui = await page([staticScene, cage], [], { unavailable: 2 });
+    assert.deepEqual(ui.requests.map(r => r.path),
+        ['/api/assets', '/api/assets', '/api/assets', '/api/objects']);
+    assert.equal(ui.waits.length, 2);
+    for (const wait of ui.waits) {
+        assert.equal(wait.delay, 3000);
+        assert.equal(wait.status, `Waiting for the scene provider: ${PROVIDER_BUSY}`);
+        assert.equal(wait.loading, true);
+        assert.equal(wait.assetCount, 'Loading assets...');
+        for (const [id, select] of Object.entries(wait.selects)) {
+            assert.equal(select.disabled, true, `#${id} disabled while waiting`);
+            assert.deepEqual(select.options, [{ text: 'Loading assets...', disabled: true }]);
+        }
+    }
+    assert.equal(ui.element('status').textContent, 'Loaded 2 assets');
+    assert.equal(ui.element('status').classList.contains('loading'), false);
+    for (const id of ['sceneSelect', 'categorySelect', 'assetSelect']) {
+        assert.equal(ui.element(id).disabled, false, `#${id} enabled once loaded`);
+    }
+    assert.equal(ui.element('sceneSelect').value, staticScene.asset_id);
+    assert.equal(ui.element('assetSelect').value, cage.asset_id);
+    assert.equal(ui.element('assetCount').textContent, '1 matching assets');
+});
+
+test('an available catalogue is loaded without waiting', async () => {
+    const ui = await page();
+    assert.deepEqual(ui.waits, []);
+    assert.equal(ui.element('status').classList.contains('loading'), false);
+    assert.equal(ui.element('status').textContent, 'Loaded 3 assets');
+});
+
+test('loading a scene refreshes the runtime objects the provider removed', async () => {
+    const ui = await page();
+    await ui.run('loadScene()');
+    assert.deepEqual(ui.requests.slice(-2).map(r => r.path), ['/api/scene/load', '/api/objects']);
+    assert.equal(ui.element('status').textContent, 'Scene loaded');
 });
 
 test('refresh retains the chosen scene and replaces its description from the provider', async () => {

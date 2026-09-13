@@ -28,6 +28,10 @@ _MAIN_RATE_LIMIT_ENABLED = "/app/runLoops/main/rateLimitEnabled"
 _RENDER_MODE = "/rtx/rendermode"
 _ANTI_ALIASING_OP = "/rtx/post/aa/op"
 
+# The one prim a runtime scene (an Isaac environment or any USD) is referenced
+# under. Loading a scene replaces whatever is there.
+_RUNTIME_SCENE_PATH = "/World/RuntimeScene"
+
 
 class SimLauncher:
     def __init__(
@@ -662,10 +666,7 @@ class SimLauncher:
 
         root_path = "/World/RuntimeObjects/Tabletop"
 
-        existing = stage.GetPrimAtPath(root_path)
-
-        if existing.IsValid():
-            stage.RemovePrim(root_path)
+        self._remove_prim(stage, root_path)
 
         stage.DefinePrim(
             Sdf.Path(root_path),
@@ -1044,10 +1045,7 @@ class SimLauncher:
 
         root_path = "/World/RuntimeObjects/ShelfReach"
 
-        existing = stage.GetPrimAtPath(root_path)
-
-        if existing.IsValid():
-            stage.RemovePrim(root_path)
+        self._remove_prim(stage, root_path)
 
         stage.DefinePrim(
             Sdf.Path(root_path),
@@ -1503,21 +1501,91 @@ class SimLauncher:
             root_prim.GetPath(),
         )
 
+    # ------------------------------------------------------------------
+    # Stage edits
+    # ------------------------------------------------------------------
+
+    def _remove_prim(self, stage, path: str) -> bool:
+        """Remove a prim if it exists and drop every cached physics view.
+
+        PhysX rebuilds its tensor views when a prim leaves the stage, and the
+        Articulation handles the bridge and the runtime commander hold keep
+        failing afterwards ('Articulation' object has no attribute
+        '_physics_view') until they are created again. Every removal goes
+        through here so those handles are re-created on the next step.
+        Adding prims leaves them intact.
+        """
+
+        if not stage.GetPrimAtPath(path).IsValid():
+            return False
+
+        stage.RemovePrim(path)
+
+        self._runtime_robot = None
+
+        if self._extension is not None:
+            self._extension.invalidate_physics_views()
+
+        return True
+
+    def _reference_runtime_scene(self, stage, usd_path: str, scale) -> None:
+        """Replace the runtime scene with a reference to usd_path at scale."""
+
+        from pxr import Gf, Sdf, UsdGeom
+
+        if len(scale) != 3:
+            raise ValueError(
+                "Runtime scene scale requires exactly 3 values"
+            )
+
+        if self._remove_prim(stage, _RUNTIME_SCENE_PATH):
+            logger.info(
+                "Replacing runtime scene %s",
+                _RUNTIME_SCENE_PATH,
+            )
+
+        prim = stage.DefinePrim(
+            Sdf.Path(_RUNTIME_SCENE_PATH),
+            "Xform",
+        )
+
+        prim.GetReferences().AddReference(
+            usd_path
+        )
+
+        xformable = UsdGeom.Xformable(prim)
+
+        scale_op = next(
+            (
+                op
+                for op in xformable.GetOrderedXformOps()
+                if op.GetOpType() == UsdGeom.XformOp.TypeScale
+            ),
+            None,
+        )
+
+        if scale_op is None:
+            scale_op = xformable.AddScaleOp()
+
+        scale_op.Set(
+            Gf.Vec3f(
+                float(scale[0]),
+                float(scale[1]),
+                float(scale[2]),
+            )
+        )
+
     def _runtime_clear_scene(self) -> None:
-        """Remove only the currently loaded runtime USD scene."""
+        """Remove the currently loaded runtime scene."""
 
         import omni.usd
 
         stage = omni.usd.get_context().get_stage()
 
-        scene_path = "/World/RuntimeScene"
-
-        if stage.GetPrimAtPath(scene_path).IsValid():
-            stage.RemovePrim(scene_path)
-
+        if self._remove_prim(stage, _RUNTIME_SCENE_PATH):
             logger.info(
                 "Removed runtime scene %s",
-                scene_path,
+                _RUNTIME_SCENE_PATH,
             )
         else:
             logger.info(
@@ -1531,8 +1599,6 @@ class SimLauncher:
         """Replace the current runtime scene with an arbitrary USD."""
 
         import omni.usd
-
-        from pxr import Gf, Sdf, UsdGeom
 
         usd_path = str(
             Path(command["path"])
@@ -1550,48 +1616,9 @@ class SimLauncher:
             [1.0, 1.0, 1.0],
         )
 
-        if len(scale) != 3:
-            raise ValueError(
-                "Runtime scene scale requires exactly 3 values"
-            )
-
         stage = omni.usd.get_context().get_stage()
 
-        scene_path = "/World/RuntimeScene"
-
-        if stage.GetPrimAtPath(scene_path).IsValid():
-            stage.RemovePrim(scene_path)
-
-        prim = stage.DefinePrim(
-            Sdf.Path(scene_path),
-            "Xform",
-        )
-
-        prim.GetReferences().AddReference(
-            usd_path
-        )
-
-        xformable = UsdGeom.Xformable(
-            prim
-        )
-
-        scale_op = None
-
-        for op in xformable.GetOrderedXformOps():
-            if op.GetOpType() == UsdGeom.XformOp.TypeScale:
-                scale_op = op
-                break
-
-        if scale_op is None:
-            scale_op = xformable.AddScaleOp()
-
-        scale_op.Set(
-            Gf.Vec3f(
-                float(scale[0]),
-                float(scale[1]),
-                float(scale[2]),
-            )
-        )
+        self._reference_runtime_scene(stage, usd_path, scale)
 
         logger.info(
             "Loaded runtime USD scene %s at scale %s",
@@ -1822,11 +1849,9 @@ class SimLauncher:
         self,
         command: dict,
     ) -> None:
-        """Load a scene from NVIDIA's configured Isaac asset root."""
+        """Replace the runtime scene with one from Isaac's asset root."""
 
         import omni.usd
-
-        from pxr import Gf, Sdf, UsdGeom
 
         usd_path = self._resolve_isaac_asset_path(
             command["path"]
@@ -1839,51 +1864,7 @@ class SimLauncher:
 
         stage = omni.usd.get_context().get_stage()
 
-        scene_path = "/World/RuntimeScene"
-
-        existing_prim = stage.GetPrimAtPath(scene_path)
-
-        # Do not destroy/recreate RuntimeScene if it already exists.
-        # Replacing it while PhysX tensor views are active can invalidate
-        # the OpenArm articulation physics view.
-        if existing_prim.IsValid():
-            logger.info(
-                "Runtime scene already exists at %s; "
-                "skipping duplicate scene load request",
-                scene_path,
-            )
-            return
-
-        prim = stage.DefinePrim(
-            Sdf.Path(scene_path),
-            "Xform",
-        )
-
-        prim.GetReferences().AddReference(
-            usd_path
-        )
-
-        xformable = UsdGeom.Xformable(
-            prim
-        )
-
-        scale_op = None
-
-        for op in xformable.GetOrderedXformOps():
-            if op.GetOpType() == UsdGeom.XformOp.TypeScale:
-                scale_op = op
-                break
-
-        if scale_op is None:
-            scale_op = xformable.AddScaleOp()
-
-        scale_op.Set(
-            Gf.Vec3f(
-                float(scale[0]),
-                float(scale[1]),
-                float(scale[2]),
-            )
-        )
+        self._reference_runtime_scene(stage, usd_path, scale)
 
         logger.info(
             "Isaac scene reference added %s at scale %s",
@@ -1973,14 +1954,7 @@ class SimLauncher:
             f"{runtime_root}/{name}"
         )
 
-        existing = stage.GetPrimAtPath(
-            prim_path
-        )
-
-        if existing.IsValid():
-            stage.RemovePrim(
-                prim_path
-            )
+        self._remove_prim(stage, prim_path)
 
         prim = stage.DefinePrim(
             Sdf.Path(prim_path),
@@ -2354,30 +2328,14 @@ class SimLauncher:
 
         name = command["name"]
 
-        stage = (
-            omni.usd
-            .get_context()
-            .get_stage()
-        )
+        stage = omni.usd.get_context().get_stage()
 
-        prim_path = (
-            f"/World/RuntimeObjects/{name}"
-        )
-
-        prim = stage.GetPrimAtPath(
-            prim_path
-        )
-
-        if not prim.IsValid():
+        if not self._remove_prim(stage, f"/World/RuntimeObjects/{name}"):
             logger.warning(
                 "Runtime object '%s' does not exist",
                 name,
             )
             return
-
-        stage.RemovePrim(
-            prim_path
-        )
 
         logger.info(
             "Removed runtime object '%s'",

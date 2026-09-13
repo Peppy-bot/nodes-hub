@@ -10,31 +10,6 @@ The viewer and simulator are separate nodes. Serving the page successfully does
 not establish that Isaac's GPU renderer or streaming server is running. The
 browser shows `WAITING FOR STREAM...` while the client attempts to connect.
 
-## Browser diagnostics
-
-The viewer sends its page-open event, JavaScript console warnings and errors,
-uncaught errors, and unhandled promise rejections to a same-origin endpoint. The
-node writes these reports through Python logging, which Peppy captures in its
-normal run log. For an instance named `isaac_webviewer_inst` and
-`PEPPY_HOME=/tmp/.peppy`, that file is:
-
-```text
-/tmp/.peppy/logs/run/isaac_webviewer_inst.log
-```
-
-Reports include the browser address, severity, page origin/path, and message.
-Query strings are excluded from the page field. Browser messages are bounded and
-JSON-escaped onto a single log line. The NVIDIA client's handled connection
-errors, including `Stream start error: Session start failed...`, are reported
-without suppressing the browser console or changing its connection behavior.
-Browser-generated networking messages are not JavaScript console calls; the
-client's corresponding retry and failure callbacks supply the node diagnostics.
-
-Reporting is best-effort, with a bounded number of outstanding requests and no
-retry queue. If the viewer HTTP server cannot be reached, consult the browser's
-own developer console. The viewer's HTTP and logging endpoints are intended for
-a trusted network and do not provide authentication.
-
 ## Signaling failures
 
 `Error occurred during sign-in request to signaling server` describes WebRTC
@@ -67,19 +42,31 @@ session signaling, not a request to log in to Peppy or NVIDIA.
    over the intended network interface. Keep the simulator's ports consistent
    with the compiled viewer's 49100/47998 configuration.
 
+## Node log
+
+The node log holds the node's own lifecycle: the listening address at startup
+and the shutdown. Browser requests are not written to it, and the browser's
+console stays in the browser. For an instance named `isaac_webviewer_inst` and
+`PEPPY_HOME=/tmp/.peppy`, that file is:
+
+```text
+/tmp/.peppy/logs/run/isaac_webviewer_inst.log
+```
+
+The viewer's HTTP endpoint is intended for a trusted network and does not
+provide authentication.
+
 ## Packaging and tests
 
-The Apptainer recipe packages the Python server and browser diagnostics script
-alongside the node launcher. Rebuilding the node artifact picks up these files;
-no rebuild of `peppybot/openarm-isaac-webviewer:2` is required.
+The Apptainer recipe packages the Python server alongside the node launcher.
+Rebuilding the node artifact picks up these files; no rebuild of
+`peppybot/openarm-isaac-webviewer:2` is required.
 
 From the `nodes-hub` repository root:
 
 ```sh
 uv run --project openarm/isaac_webviewer/tests --locked pytest openarm/isaac_webviewer/tests
-node --test openarm/isaac_webviewer/tests/browser_logs.test.js
 ```
 
-The Python tests use temporary static assets and ephemeral local ports. The
-JavaScript tests execute the production diagnostics script with controlled
-browser events and HTTP promises. Neither suite requires a GPU or Isaac.
+The tests use temporary static assets and ephemeral local ports. They require
+neither a GPU nor Isaac.
