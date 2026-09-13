@@ -1,6 +1,7 @@
 """Exercise startup through fake runtimes and parse the packaged Kit experience."""
 
 import builtins
+import ctypes
 import importlib.util
 import json
 import logging
@@ -35,6 +36,22 @@ def startup(monkeypatch):
 
     state = SimpleNamespace(constructed=False, trace=[], argv=[], app=Mock())
 
+    def nvml_init():
+        state.trace.append("nvml init")
+        return state.nvml.nvmlInit_v2.return_value
+
+    def nvml_shutdown():
+        state.trace.append("nvml shutdown")
+        return state.nvml.nvmlShutdown.return_value
+
+    state.nvml = SimpleNamespace(
+        nvmlInit_v2=Mock(side_effect=nvml_init, return_value=0),
+        nvmlErrorString=Mock(return_value=b"Unknown Error"),
+        nvmlShutdown=Mock(side_effect=nvml_shutdown, return_value=0),
+    )
+    state.cdll = Mock(return_value=state.nvml)
+    monkeypatch.setattr(ctypes, "CDLL", state.cdll)
+
     def construct(config, *, experience):
         state.constructed = True
         state.trace.append("app")
@@ -68,7 +85,8 @@ def startup(monkeypatch):
         module = importlib.util.module_from_spec(spec)
         monkeypatch.setitem(sys.modules, spec.name, module)
         spec.loader.exec_module(module)
-        assert state.trace == [], "importing launch must not initialize Isaac"
+        assert state.trace == [], "importing launch must not initialize NVML or Isaac"
+        state.cdll.assert_not_called()
         module._handoff["value"] = module._SimHandoff(
             io=object(),
             scene_actions=object(),
@@ -147,8 +165,106 @@ def test_launch_selects_extensions_before_construction_and_preserves_handoff(
     state.thread.assert_called_once_with(target=state.module._run_node_builder, daemon=True)
     state.thread.return_value.start.assert_called_once_with()
     assert state.trace == [
-        "node thread", "import isaacsim", "app", "import launcher", "run",
+        "nvml init", "nvml shutdown", "node thread", "import isaacsim", "app",
+        "import launcher", "run",
     ]
+    state.cdll.assert_called_once_with("libnvidia-ml.so.1")
+    for operation in (state.nvml.nvmlInit_v2, state.nvml.nvmlShutdown):
+        operation.assert_called_once_with()
+        assert operation.argtypes == []
+        assert operation.restype is ctypes.c_int
+    assert state.nvml.nvmlErrorString.argtypes == [ctypes.c_int]
+    assert state.nvml.nvmlErrorString.restype is ctypes.c_char_p
+    state.nvml.nvmlErrorString.assert_not_called()
+
+
+def _assert_no_startup(state):
+    state.thread.assert_not_called()
+    state.simulation_app.assert_not_called()
+    state.sim_launcher.assert_not_called()
+    assert "import isaacsim" not in state.trace
+
+
+@pytest.mark.parametrize(
+    ("init_result", "shutdown_result", "detail"),
+    [
+        (18, 0, b"Driver/library version mismatch"),
+        (9, 0, b"Driver Not Loaded"),
+        (0, 999, b"Unknown Error"),
+        (999, 0, None),
+    ],
+)
+def test_nvml_failure_stops_before_startup(startup, init_result, shutdown_result, detail):
+    state = startup()
+    state.nvml.nvmlInit_v2.return_value = init_result
+    state.nvml.nvmlShutdown.return_value = shutdown_result
+    state.nvml.nvmlErrorString.return_value = detail
+
+    with pytest.raises(RuntimeError) as raised:
+        state.module.main()
+
+    message = str(raised.value)
+    operation = "nvmlInit_v2" if init_result else "nvmlShutdown"
+    result = init_result or shutdown_result
+    expected_detail = detail.decode("utf-8") if detail else "unknown NVML error"
+    assert f"{operation} returned NVML error {result} ({expected_detail})" in message
+    assert "nvidia-smi" in message
+    assert "host NVIDIA driver" in message
+    assert "--nv" in message
+    if result == 18:
+        assert "user-space library and loaded kernel driver do not match" in message
+        assert "Reboot the host after a driver update" in message
+    else:
+        assert "Reboot" not in message
+    state.cdll.assert_called_once_with("libnvidia-ml.so.1")
+    state.nvml.nvmlInit_v2.assert_called_once_with()
+    state.nvml.nvmlErrorString.assert_called_once_with(result)
+    if init_result:
+        state.nvml.nvmlShutdown.assert_not_called()
+        assert state.trace == ["nvml init"]
+    else:
+        state.nvml.nvmlShutdown.assert_called_once_with()
+        assert state.trace == ["nvml init", "nvml shutdown"]
+    _assert_no_startup(state)
+
+
+def test_missing_nvml_library_stops_before_startup(startup):
+    state = startup()
+    failure = OSError("libnvidia-ml.so.1: cannot open shared object file")
+    state.cdll.side_effect = failure
+
+    with pytest.raises(RuntimeError, match="cannot load libnvidia-ml.so.1") as raised:
+        state.module.main()
+
+    assert raised.value.__cause__ is failure
+    assert str(failure) in str(raised.value)
+    assert "host NVIDIA driver" in str(raised.value)
+    assert "--nv" in str(raised.value)
+    state.cdll.assert_called_once_with("libnvidia-ml.so.1")
+    for operation in vars(state.nvml).values():
+        operation.assert_not_called()
+    assert state.trace == []
+    _assert_no_startup(state)
+
+
+@pytest.mark.parametrize("symbol", ["nvmlInit_v2", "nvmlErrorString", "nvmlShutdown"])
+def test_missing_nvml_api_symbol_stops_before_initialization(startup, symbol):
+    state = startup()
+    operations = list(vars(state.nvml).values())
+    delattr(state.nvml, symbol)
+
+    with pytest.raises(RuntimeError, match="missing required NVML API symbol") as raised:
+        state.module.main()
+
+    assert isinstance(raised.value.__cause__, AttributeError)
+    assert symbol in str(raised.value)
+    assert "host NVIDIA driver" in str(raised.value)
+    assert "--nv" in str(raised.value)
+    state.cdll.assert_called_once_with("libnvidia-ml.so.1")
+    for operation in operations:
+        operation.assert_not_called()
+    assert state.trace == []
+    _assert_no_startup(state)
 
 
 def test_render_profile_is_real_time_2_with_dlss(startup):

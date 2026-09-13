@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import logging
 import os
 import sys
@@ -186,8 +187,59 @@ def _run_node_builder() -> None:
         _stop.set()
 
 
+def _preflight_nvidia_driver() -> None:
+    """Check NVML access to the host driver, not Vulkan renderer health."""
+
+    guidance = (
+        "Verify nvidia-smi works on the host, check the host NVIDIA driver, "
+        "and launch the container with --nv."
+    )
+    try:
+        nvml = ctypes.CDLL("libnvidia-ml.so.1")
+    except OSError as exc:
+        raise RuntimeError(
+            f"NVIDIA driver preflight failed: cannot load libnvidia-ml.so.1: {exc}. "
+            f"{guidance}"
+        ) from exc
+
+    try:
+        nvml_init = nvml.nvmlInit_v2
+        nvml_error_string = nvml.nvmlErrorString
+        nvml_shutdown = nvml.nvmlShutdown
+    except AttributeError as exc:
+        raise RuntimeError(
+            f"NVIDIA driver preflight failed: missing required NVML API symbol: {exc}. "
+            f"{guidance}"
+        ) from exc
+
+    nvml_init.argtypes = []
+    nvml_init.restype = ctypes.c_int
+    nvml_error_string.argtypes = [ctypes.c_int]
+    nvml_error_string.restype = ctypes.c_char_p
+    nvml_shutdown.argtypes = []
+    nvml_shutdown.restype = ctypes.c_int
+
+    # Shutdown is called only after init succeeds, and must also succeed.
+    for name, operation in (("nvmlInit_v2", nvml_init), ("nvmlShutdown", nvml_shutdown)):
+        result = operation()
+        if result != 0:
+            detail = nvml_error_string(result)
+            detail = detail.decode("utf-8", errors="replace") if detail else "unknown NVML error"
+            mismatch_guidance = (
+                " The NVIDIA user-space library and loaded kernel driver do not match. "
+                "Reboot the host after a driver update."
+                if result == 18 else ""
+            )
+            raise RuntimeError(
+                f"NVIDIA driver preflight failed: {name} returned NVML error {result} "
+                f"({detail}).{mismatch_guidance} {guidance}"
+            )
+
+
 def main() -> None:
     """Launch Peppy and Isaac Sim."""
+
+    _preflight_nvidia_driver()
 
     threading.Thread(
         target=_run_node_builder,
