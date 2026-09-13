@@ -134,14 +134,40 @@ class IsaacBridgeExtension:
             "gravity_compensation": self._gains.get("gravity_compensation", False),
         }
 
-    def _all_exts(self) -> list:
+    def _physics_exts(self) -> list:
+        """The exts backed by PhysX articulation views."""
         return [
             self._articulation,
             *self._arm_actuators.values(),
             *self._gripper_actuators.values(),
             *self._gripper_sensors.values(),
-            *([self._camera_sensor] if self._camera_sensor is not None else []),
         ]
+
+    def _all_exts(self) -> list:
+        return self._physics_exts() + (
+            [self._camera_sensor] if self._camera_sensor is not None else []
+        )
+
+    def invalidate_physics_views(self) -> None:
+        """Drop every articulation handle; the next step() creates them again.
+
+        PhysX rebuilds its tensor views when a prim leaves the stage, and a
+        handle created before that keeps failing afterwards. The launcher
+        calls this on every removal. Camera render products ride USD prims,
+        not PhysX views, so they stay. The actuator setup re-applies the
+        configured gains and effort ceilings, so the cached ceilings go too
+        and the next gripper command re-sends its limit.
+        """
+        for ext in self._physics_exts():
+            ext.teardown()
+        self._joint_index = {}
+        self._gripper_travels = {}
+        self._applied_effort = {}
+        if self._ready:
+            self._ready = False
+            logger.info(
+                "Physics views invalidated; the bridge re-initialises on its next step"
+            )
 
     def _try_setup(self) -> bool:
         """Attempt to initialise every ext against the live stage. Returns True

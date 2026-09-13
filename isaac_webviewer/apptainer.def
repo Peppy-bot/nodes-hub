@@ -13,6 +13,8 @@ From: peppybot/openarm-isaac-webviewer:2
 %files
     peppy.json5 /opt/isaac_webviewer/peppy.json5
     launch.py /opt/isaac_webviewer/launch.py
+    viewer_server.py /opt/isaac_webviewer/viewer_server.py
+    browser_logs.js /opt/isaac_webviewer/browser_logs.js
     .peppy/libs/peppygen /opt/isaac_webviewer/.peppy/libs/peppygen
     .peppy/libs/peppylib /opt/isaac_webviewer/.peppy/libs/peppylib
 

@@ -5,9 +5,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import signal
+import threading
 
 from peppylib.runtime import NodeBuilder
+from viewer_server import ViewerServer
 
 
 logging.basicConfig(
@@ -20,62 +21,36 @@ logger = logging.getLogger(__name__)
 
 
 async def setup(params, node_runner) -> list:
-    """Start and supervise the Vite WebRTC viewer."""
+    """Serve the WebRTC viewer and log its browser diagnostics."""
 
     del params
+    server = ViewerServer(("0.0.0.0", 8210))
+    try:
+        thread = threading.Thread(target=server.serve_forever, name="isaac-viewer", daemon=True)
+        thread.start()
+    except Exception:
+        server.server_close()
+        raise
 
-    logger.info(
-        "Starting Isaac Sim browser WebRTC viewer on 0.0.0.0:8210"
-    )
-
-    process = await asyncio.create_subprocess_exec(
-        "npx",
-        "vite",
-        "preview",
-        "--host",
-        "0.0.0.0",
-        "--port",
-        "8210",
-        cwd="/app",
-    )
-
-    logger.info(
-        "Isaac Sim browser viewer started with PID %s",
-        process.pid,
-    )
+    def stop_server() -> None:
+        server.shutdown()
+        server.server_close()
+        thread.join()
 
     async def shutdown() -> None:
-        if process.returncode is not None:
-            return
-
         logger.info("Stopping Isaac Sim browser viewer")
+        await asyncio.to_thread(stop_server)
 
-        process.send_signal(signal.SIGTERM)
+    try:
+        node_runner.on_shutdown(shutdown)
+    except Exception:
+        await shutdown()
+        raise
 
-        try:
-            await asyncio.wait_for(
-                process.wait(),
-                timeout=5.0,
-            )
-        except asyncio.TimeoutError:
-            logger.warning(
-                "Viewer did not terminate gracefully; killing it"
-            )
-            process.kill()
-            await process.wait()
-
-    node_runner.on_shutdown(shutdown)
-
-    async def watch_process() -> None:
-        return_code = await process.wait()
-
-        logger.info(
-            "Isaac Sim browser viewer exited with code %s",
-            return_code,
-        )
-
-    asyncio.create_task(watch_process())
-
+    logger.info(
+        "Isaac Sim browser WebRTC viewer listening on 0.0.0.0:8210; "
+        "browser warnings and errors are forwarded to this node log"
+    )
     return []
 
 

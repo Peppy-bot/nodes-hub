@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Optional
 
 from bridge_extension import IsaacBridgeExtension
+from camera_common import FramePacer
 from runtime_commander_server import RuntimeCommanderServer
 
 logger = logging.getLogger(__name__)
@@ -21,6 +22,15 @@ logger = logging.getLogger(__name__)
 _SLOW_ITERATION_S = 0.05
 
 _WARMUP_STEPS = 100
+_MAIN_RATE_LIMIT_ENABLED = "/app/runLoops/main/rateLimitEnabled"
+# The renderer and anti-aliasing Kit actually runs; both are requested through
+# SimulationApp's launch config and both can be changed by Kit afterwards.
+_RENDER_MODE = "/rtx/rendermode"
+_ANTI_ALIASING_OP = "/rtx/post/aa/op"
+
+# The one prim a runtime scene (an Isaac environment or any USD) is referenced
+# under. Loading a scene replaces whatever is there.
+_RUNTIME_SCENE_PATH = "/World/RuntimeScene"
 
 
 class SimLauncher:
@@ -34,6 +44,9 @@ class SimLauncher:
         scene_actions,
         state_rate_hz: int,
         cameras_enabled: bool,
+        frame_rate_hz: int,
+        render_mode: str,
+        anti_aliasing: int,
     ) -> None:
         self._sim_app = sim_app
         self._usd_path = usd_path
@@ -41,6 +54,9 @@ class SimLauncher:
         self._stop = stop
         self._io = io
         self._scene_actions = scene_actions
+        self._frame_rate_hz = frame_rate_hz
+        self._render_mode = render_mode
+        self._anti_aliasing = anti_aliasing
         self._state_rate_hz = state_rate_hz
         self._cameras_enabled = cameras_enabled
         self._timeline = None
@@ -202,6 +218,7 @@ class SimLauncher:
                 self._configure_camera_rendering()
 
             self._warmup()
+            self._require_render_profile()
             self._start_timeline()
 
             self._extension = IsaacBridgeExtension(
@@ -268,6 +285,30 @@ class SimLauncher:
     def _warmup(self) -> None:
         for _ in range(_WARMUP_STEPS):
             self._sim_app.update()
+
+    def _require_render_profile(self) -> None:
+        """Refuse a render profile Kit changed underneath the launch.
+
+        Kit keeps the requested renderer and anti-aliasing only while it can
+        run them, and it swaps them without a word on the first rendered
+        frames: DLSS needs the NGX core library, and without it Kit falls
+        back to TAA and streams raw path-tracing noise at full frame rate.
+        The check therefore runs after the warmup, once those frames are in.
+        """
+        import carb.settings
+
+        settings = carb.settings.get_settings()
+        actual = (settings.get(_RENDER_MODE), settings.get(_ANTI_ALIASING_OP))
+        expected = (self._render_mode, self._anti_aliasing)
+
+        if actual != expected:
+            raise RuntimeError(
+                f"Isaac is rendering with mode {actual[0]!r} and anti-aliasing "
+                f"{actual[1]!r} instead of the requested {expected[0]!r} and "
+                f"{expected[1]!r}; DLSS runs on the NGX core library "
+                "(libnvidia-ngx.so.1) that the base image carries, see "
+                "scripts/Dockerfile.isaac"
+            )
 
     def _start_timeline(self) -> None:
         import omni.timeline
@@ -625,10 +666,7 @@ class SimLauncher:
 
         root_path = "/World/RuntimeObjects/Tabletop"
 
-        existing = stage.GetPrimAtPath(root_path)
-
-        if existing.IsValid():
-            stage.RemovePrim(root_path)
+        self._remove_prim(stage, root_path)
 
         stage.DefinePrim(
             Sdf.Path(root_path),
@@ -1007,10 +1045,7 @@ class SimLauncher:
 
         root_path = "/World/RuntimeObjects/ShelfReach"
 
-        existing = stage.GetPrimAtPath(root_path)
-
-        if existing.IsValid():
-            stage.RemovePrim(root_path)
+        self._remove_prim(stage, root_path)
 
         stage.DefinePrim(
             Sdf.Path(root_path),
@@ -1466,21 +1501,91 @@ class SimLauncher:
             root_prim.GetPath(),
         )
 
+    # ------------------------------------------------------------------
+    # Stage edits
+    # ------------------------------------------------------------------
+
+    def _remove_prim(self, stage, path: str) -> bool:
+        """Remove a prim if it exists and drop every cached physics view.
+
+        PhysX rebuilds its tensor views when a prim leaves the stage, and the
+        Articulation handles the bridge and the runtime commander hold keep
+        failing afterwards ('Articulation' object has no attribute
+        '_physics_view') until they are created again. Every removal goes
+        through here so those handles are re-created on the next step.
+        Adding prims leaves them intact.
+        """
+
+        if not stage.GetPrimAtPath(path).IsValid():
+            return False
+
+        stage.RemovePrim(path)
+
+        self._runtime_robot = None
+
+        if self._extension is not None:
+            self._extension.invalidate_physics_views()
+
+        return True
+
+    def _reference_runtime_scene(self, stage, usd_path: str, scale) -> None:
+        """Replace the runtime scene with a reference to usd_path at scale."""
+
+        from pxr import Gf, Sdf, UsdGeom
+
+        if len(scale) != 3:
+            raise ValueError(
+                "Runtime scene scale requires exactly 3 values"
+            )
+
+        if self._remove_prim(stage, _RUNTIME_SCENE_PATH):
+            logger.info(
+                "Replacing runtime scene %s",
+                _RUNTIME_SCENE_PATH,
+            )
+
+        prim = stage.DefinePrim(
+            Sdf.Path(_RUNTIME_SCENE_PATH),
+            "Xform",
+        )
+
+        prim.GetReferences().AddReference(
+            usd_path
+        )
+
+        xformable = UsdGeom.Xformable(prim)
+
+        scale_op = next(
+            (
+                op
+                for op in xformable.GetOrderedXformOps()
+                if op.GetOpType() == UsdGeom.XformOp.TypeScale
+            ),
+            None,
+        )
+
+        if scale_op is None:
+            scale_op = xformable.AddScaleOp()
+
+        scale_op.Set(
+            Gf.Vec3f(
+                float(scale[0]),
+                float(scale[1]),
+                float(scale[2]),
+            )
+        )
+
     def _runtime_clear_scene(self) -> None:
-        """Remove only the currently loaded runtime USD scene."""
+        """Remove the currently loaded runtime scene."""
 
         import omni.usd
 
         stage = omni.usd.get_context().get_stage()
 
-        scene_path = "/World/RuntimeScene"
-
-        if stage.GetPrimAtPath(scene_path).IsValid():
-            stage.RemovePrim(scene_path)
-
+        if self._remove_prim(stage, _RUNTIME_SCENE_PATH):
             logger.info(
                 "Removed runtime scene %s",
-                scene_path,
+                _RUNTIME_SCENE_PATH,
             )
         else:
             logger.info(
@@ -1494,8 +1599,6 @@ class SimLauncher:
         """Replace the current runtime scene with an arbitrary USD."""
 
         import omni.usd
-
-        from pxr import Gf, Sdf, UsdGeom
 
         usd_path = str(
             Path(command["path"])
@@ -1513,48 +1616,9 @@ class SimLauncher:
             [1.0, 1.0, 1.0],
         )
 
-        if len(scale) != 3:
-            raise ValueError(
-                "Runtime scene scale requires exactly 3 values"
-            )
-
         stage = omni.usd.get_context().get_stage()
 
-        scene_path = "/World/RuntimeScene"
-
-        if stage.GetPrimAtPath(scene_path).IsValid():
-            stage.RemovePrim(scene_path)
-
-        prim = stage.DefinePrim(
-            Sdf.Path(scene_path),
-            "Xform",
-        )
-
-        prim.GetReferences().AddReference(
-            usd_path
-        )
-
-        xformable = UsdGeom.Xformable(
-            prim
-        )
-
-        scale_op = None
-
-        for op in xformable.GetOrderedXformOps():
-            if op.GetOpType() == UsdGeom.XformOp.TypeScale:
-                scale_op = op
-                break
-
-        if scale_op is None:
-            scale_op = xformable.AddScaleOp()
-
-        scale_op.Set(
-            Gf.Vec3f(
-                float(scale[0]),
-                float(scale[1]),
-                float(scale[2]),
-            )
-        )
+        self._reference_runtime_scene(stage, usd_path, scale)
 
         logger.info(
             "Loaded runtime USD scene %s at scale %s",
@@ -1785,11 +1849,9 @@ class SimLauncher:
         self,
         command: dict,
     ) -> None:
-        """Load a scene from NVIDIA's configured Isaac asset root."""
+        """Replace the runtime scene with one from Isaac's asset root."""
 
         import omni.usd
-
-        from pxr import Gf, Sdf, UsdGeom
 
         usd_path = self._resolve_isaac_asset_path(
             command["path"]
@@ -1802,51 +1864,7 @@ class SimLauncher:
 
         stage = omni.usd.get_context().get_stage()
 
-        scene_path = "/World/RuntimeScene"
-
-        existing_prim = stage.GetPrimAtPath(scene_path)
-
-        # Do not destroy/recreate RuntimeScene if it already exists.
-        # Replacing it while PhysX tensor views are active can invalidate
-        # the OpenArm articulation physics view.
-        if existing_prim.IsValid():
-            logger.info(
-                "Runtime scene already exists at %s; "
-                "skipping duplicate scene load request",
-                scene_path,
-            )
-            return
-
-        prim = stage.DefinePrim(
-            Sdf.Path(scene_path),
-            "Xform",
-        )
-
-        prim.GetReferences().AddReference(
-            usd_path
-        )
-
-        xformable = UsdGeom.Xformable(
-            prim
-        )
-
-        scale_op = None
-
-        for op in xformable.GetOrderedXformOps():
-            if op.GetOpType() == UsdGeom.XformOp.TypeScale:
-                scale_op = op
-                break
-
-        if scale_op is None:
-            scale_op = xformable.AddScaleOp()
-
-        scale_op.Set(
-            Gf.Vec3f(
-                float(scale[0]),
-                float(scale[1]),
-                float(scale[2]),
-            )
-        )
+        self._reference_runtime_scene(stage, usd_path, scale)
 
         logger.info(
             "Isaac scene reference added %s at scale %s",
@@ -1936,14 +1954,7 @@ class SimLauncher:
             f"{runtime_root}/{name}"
         )
 
-        existing = stage.GetPrimAtPath(
-            prim_path
-        )
-
-        if existing.IsValid():
-            stage.RemovePrim(
-                prim_path
-            )
+        self._remove_prim(stage, prim_path)
 
         prim = stage.DefinePrim(
             Sdf.Path(prim_path),
@@ -2317,30 +2328,14 @@ class SimLauncher:
 
         name = command["name"]
 
-        stage = (
-            omni.usd
-            .get_context()
-            .get_stage()
-        )
+        stage = omni.usd.get_context().get_stage()
 
-        prim_path = (
-            f"/World/RuntimeObjects/{name}"
-        )
-
-        prim = stage.GetPrimAtPath(
-            prim_path
-        )
-
-        if not prim.IsValid():
+        if not self._remove_prim(stage, f"/World/RuntimeObjects/{name}"):
             logger.warning(
                 "Runtime object '%s' does not exist",
                 name,
             )
             return
-
-        stage.RemovePrim(
-            prim_path
-        )
 
         logger.info(
             "Removed runtime object '%s'",
@@ -2352,53 +2347,69 @@ class SimLauncher:
     # ------------------------------------------------------------------
 
     def _run_loop(self) -> None:
+        import carb.settings
+
+        # Cache the interface on Isaac's main thread, after SimulationApp exists.
+        settings = carb.settings.get_settings()
+        pacer = FramePacer(self._frame_rate_hz)
         while self._sim_app.is_running() and not self._stop.is_set():
-                # Isaac advances physics inside update(); we then drive the
-                # bridge step on the same thread (Articulation reads require
-                # Isaac's main thread). The extension defers its own setup until
-                # the stage is live, so early steps are cheap no-ops.
-                iteration_start = time.monotonic()
-                self._sim_app.update()
-                update_s = time.monotonic() - iteration_start
+            # Pace from the start of the whole iteration on the wall clock.
+            # Recheck both shutdown and the deadline whenever a wait returns.
+            iteration_start = time.monotonic()
+            if not pacer.take_if_due(iteration_start):
+                self._stop.wait(pacer.seconds_until_due(iteration_start))
+                continue
 
-                if self._extension is not None:
-                    self._extension.step()
+            # Streaming startup and (re)connection can enable an app-only
+            # limiter. In both window modes, Python owns whole-iteration pacing.
+            if settings.get_as_bool(_MAIN_RATE_LIMIT_ENABLED):
+                settings.set_bool(_MAIN_RATE_LIMIT_ENABLED, False)
 
-                    if (
-                        self._extension.is_ready
-                        and not self._ready.is_set()
-                    ):
-                        self._ready.set()
+            # Isaac advances physics inside update(); we then drive the
+            # bridge step on the same thread (Articulation reads require
+            # Isaac's main thread). The extension defers its own setup until
+            # the stage is live, so early steps are cheap no-ops.
+            self._sim_app.update()
+            update_s = time.monotonic() - iteration_start
 
-                        logger.info(
-                            "Scene loaded; states will flow"
-                        )
+            if self._extension is not None:
+                self._extension.step()
 
-                # Execute commands received by commander.py.
-                #
-                # This deliberately happens in the Isaac simulation
-                # thread rather than the TCP listener thread.
-                self._runtime_commander.process_pending(
-                    self
-                )
+                if (
+                    self._extension.is_ready
+                    and not self._ready.is_set()
+                ):
+                    self._ready.set()
 
-                # Execute Peppy scene actions on the Isaac thread.
-                self._scene_actions.process_pending(
-                    self
-                )
-
-                self._update_runtime_forces()
-
-                self._apply_runtime_arm_targets()
-
-                iteration_s = time.monotonic() - iteration_start
-                if iteration_s > _SLOW_ITERATION_S:
-                    logger.warning(
-                        "slow loop iteration %.1f ms (update %.1f ms, bridge and runtime %.1f ms)",
-                        iteration_s * 1e3,
-                        update_s * 1e3,
-                        (iteration_s - update_s) * 1e3,
+                    logger.info(
+                        "Scene loaded; states will flow"
                     )
+
+            # Execute commands received by commander.py.
+            #
+            # This deliberately happens in the Isaac simulation
+            # thread rather than the TCP listener thread.
+            self._runtime_commander.process_pending(
+                self
+            )
+
+            # Execute Peppy scene actions on the Isaac thread.
+            self._scene_actions.process_pending(
+                self
+            )
+
+            self._update_runtime_forces()
+
+            self._apply_runtime_arm_targets()
+
+            iteration_s = time.monotonic() - iteration_start
+            if iteration_s > _SLOW_ITERATION_S:
+                logger.warning(
+                    "slow loop iteration %.1f ms (update %.1f ms, bridge and runtime %.1f ms)",
+                    iteration_s * 1e3,
+                    update_s * 1e3,
+                    (iteration_s - update_s) * 1e3,
+                )
 
     def _shutdown(self) -> None:
         self._ready.clear()

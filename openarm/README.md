@@ -266,10 +266,10 @@ The **Scene** section allows you to:
 
 - Select an Isaac environment
 - Set the scene scale
-- Load the selected scene
+- Load the selected scene, replacing the one currently loaded and removing every spawned object
 - Clear the runtime scene
 
-Scene assets are provided by the Isaac-side asset catalogue, so the exact catalogue can evolve without changing the web application.
+Scene assets are provided by the Isaac-side asset catalogue, so the exact catalogue can evolve without changing the web application. Isaac discovers that catalogue once its stage has loaded, a few minutes after launch, and the page shows a loading state and keeps asking until the catalogue is there.
 
 Examples include warehouse and grid environments.
 

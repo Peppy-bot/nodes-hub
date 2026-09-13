@@ -1,0 +1,85 @@
+[package]
+title = "OpenArm Simulation"
+version = "1.0.0"
+
+[dependencies]
+"omni.kit.loop-isaac" = {}
+# Articulation imports Torch through the Isaac ML archive.
+"omni.isaac.ml_archive" = {}
+"isaacsim.core.prims" = {}
+# Supplies the default Isaac 6.1 asset root for runtime scenes and props.
+"isaacsim.storage.native" = {}
+"isaacsim.core.simulation_manager" = {}
+"omni.physics.physx" = {}
+"omni.physics.stageupdate" = {}
+"omni.physx.tensors" = {}
+"omni.usd" = {}
+"omni.hydra.rtx" = {}
+"omni.hydra.rtx.shadercache.vulkan" = {}
+"omni.gpu_foundation.shadercache.vulkan" = {}
+"omni.kit.renderer.core" = {}
+"omni.kit.mainwindow" = {}
+"omni.kit.viewport.window" = {}
+"omni.kit.viewport.utility" = {}
+"omni.kit.manipulator.camera" = {}
+"omni.kit.manipulator.selection" = {}
+"omni.kit.manipulator.prim" = {}
+
+[settings]
+app.name = "OpenArm Simulation"
+app.version = "1.0.0"
+app.vulkan = true
+app.content.emptyStageOnStart = true
+app.file.ignoreUnsavedStage = true
+app.settings.persistent = false
+app.extensions.registryEnabled = false
+app.useFabricSceneDelegate = true
+app.settings.fabricDefaultStageFrameHistoryCount = 3
+app.gatherRenderResults = true
+app.runLoops.main.manualModeEnabled = true
+app.player.useFixedTimeStepping = true
+app.asyncRendering = false
+app.asyncRenderingLowLatency = false
+# Sensor annotator frame gates follow the playing timeline synchronously.
+omni.replicator.asyncRendering = false
+persistent.omni.replicator.captureOnPlay = true
+# Display real rendered frames, not generated intermediate frames.
+rtx-transient.dlssg.enabled = false
+app.renderer.skipWhileMinimized = false
+app.renderer.skipWhileInvisible = false
+app.renderer.sleepMsOnFocus = 0
+app.renderer.sleepMsOutOfFocus = 0
+app.viewport.defaults.fillViewport = true
+# Camera navigation and clipping use the robot stage's meter scale.
+persistent.app.viewport.camMoveVelocity = 0.05
+persistent.app.viewport.camVelocityMin = 0.0001
+persistent.app.viewport.camVelocityMax = 0.2
+persistent.app.primCreation.typedDefaults.camera.clippingRange = [0.01, 10000000.0]
+# Python paces the entire iteration, including bridge and scene work.
+app.runLoops.main.rateLimitEnabled = false
+app.runLoopsGlobal.syncToPresent = false
+app.runLoops.main.syncToPresent = true
+app.runLoops.rendering_0.rateLimitEnabled = true
+app.runLoops.rendering_0.rateLimitFrequency = 120
+app.runLoops.rendering_0.syncToPresent = true
+app.runLoops.rendering_1.rateLimitEnabled = true
+app.runLoops.rendering_1.rateLimitFrequency = 120
+app.runLoops.rendering_1.syncToPresent = true
+app.runLoops.present.rateLimitEnabled = true
+app.runLoops.present.rateLimitFrequency = 60
+exts."omni.kit.renderer.core".present.enabled = true
+exts."omni.kit.renderer.core".present.presentAfterRendering = true
+exts."omni.kit.livestream.app".primaryStream.allowDynamicResize = true
+app.livestream.allowResize = true
+
+[settings.app.exts.folders]
+"++" = [
+    "/isaac-sim/apps",
+    "/isaac-sim/exts",
+    "/isaac-sim/extscache",
+    "/isaac-sim/extsDeprecated",
+]
+
+[settings.exts."omni.kit.viewport.window"]
+windowMenu.entryCount = 1
+startup.showOnLaunch = [true]

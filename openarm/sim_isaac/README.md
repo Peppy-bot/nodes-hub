@@ -1,12 +1,12 @@
-# OpenArm Isaac Sim 6.0 Integration
+# OpenArm Isaac Sim 6.1 Integration
 
-Experimental Isaac Sim 6.0.1 integration for OpenArm bimanual robot using Peppy.
+Experimental Isaac Sim 6.1.0 integration for OpenArm bimanual robot using Peppy.
 
 This branch is intended for reproducibility testing and community feedback. It provides headless Isaac Sim startup, WebRTC streaming, OpenArm runtime control, custom USD loading and reusable manipulation scenarios.
 
 ## Features
 
-- Isaac Sim 6.0.1
+- Isaac Sim 6.1.0
 - OpenArm v2 bimanual robot
 - Peppy runtime integration
 - Headless WebRTC streaming
@@ -17,23 +17,26 @@ This branch is intended for reproducibility testing and community feedback. It p
 - Runtime task scenes:
   - `tabletop`
   - `shelf_reach`
-- OpenArm USD assets tracked with Git LFS
+- Detailed OpenArm v2 visual meshes with their embedded materials
 
 ## Requirements
 
 Recommended host setup:
 
 - Ubuntu 24.04 LTS
-- NVIDIA GPU with a compatible proprietary driver
+- NVIDIA GPU with the proprietary driver, 595.58.03 or newer
 - Peppy
-- Git LFS
 - 32 GB RAM recommended
 
 Isaac Sim base image:
 
 ```text
-nvcr.io/nvidia/isaac-sim:6.0.1
+nvcr.io/nvidia/isaac-sim:6.1.0
 ```
+
+The node builds on `peppybot/openarm-isaac-sim`, which
+`openarm/scripts/build_base_images.sh` produces from that
+image with the robot assets and the NGX core library baked in.
 
 Systems with less RAM may require additional swap during image build or startup.
 
@@ -81,6 +84,55 @@ peppy node run \
   state_rate_hz=50 \
   headless=true
 ```
+
+## Runtime and Performance
+
+Both headless and windowed launches use the packaged
+`robots/openarm/config/openarm.sim.kit` experience with physics, USD/RTX rendering
+and viewport controls. Headless mode enables WebRTC; `cameras_enabled=true`
+enables Replicator for robot camera capture. Extensions resolve from the Isaac Sim
+installation, with settings persistence and extension-registry lookup disabled.
+Runtime scenes and props use `isaacsim.storage.native`'s default Isaac 6.1 asset
+root; `PEPPY_ROBOT_ASSETS_DIR` selects the robot USD directory.
+
+The node targets 60 Hz using wall-monotonic absolute deadlines. Each due iteration
+runs one Isaac update, one bridge step, queued runtime and scene commands, then
+force expiry and arm targets. All that work counts toward the frame period;
+waiting is interruptible by shutdown and long stalls resynchronize the schedule
+without unbounded catch-up. Kit's main limiter and global sync-to-present are
+disabled so the Python loop owns pacing in both headless and windowed modes.
+The streamer can re-enable the main limiter at startup or on connection and
+reconnection. Before each due update, the loop checks that setting and clears it
+only if enabled, preventing an extra app-only wait that excludes bridge work.
+`state_rate_hz` only limits state and clock publications, not physics or bridge
+stepping.
+
+The node renders with RTX Real-Time 2.0 (`RealTimePathTracing`), DLSS
+(`anti_aliasing=3`) and an initial viewport render resolution of 1280x720. That
+renderer denoises only through DLSS Ray Reconstruction, which runs on the NGX
+core library shipped with the NVIDIA driver, and Peppy's `--nv` GPU binding does
+not carry the host's copy into the container. The base image therefore carries
+the core itself: `scripts/Dockerfile.isaac` takes
+`libnvidia-ngx.so.1` from the driver Isaac Sim 6.1 was tested with, 595.58.03,
+pinned by version and checksum. The core reads the running driver through NVML
+and the DLSS snippets check that version against their own minimum, so the host
+needs a driver at least that new, not that exact version. Kit falls back to TAA
+without a word when the core is missing and streams raw path-tracing noise, so
+after the warmup the launcher reads the effective `/rtx/rendermode` and
+`/rtx/post/aa/op` and refuses to run on anything but the requested profile.
+WebRTC captures
+the app window, not just the viewport, and allows dynamic resizing; the encoded
+stream resolution can therefore differ from 1280x720. WebRTC targets 60 fps. DLSS
+frame generation stays explicitly disabled with `/rtx-transient/dlssg/enabled=false`
+so displayed frames represent real rendered output, not generated intermediate
+frames.
+
+Fixed timeline stepping and synchronous rendering keep camera reads aligned with
+engine updates. The focused experience limits extension overhead, but 60 Hz is a
+target, not a guarantee: scene loading, camera capture and moving-view rendering
+can exceed the frame budget and reduce state cadence and the
+simulation-time/wall-time ratio. Slow-loop logs measure work only, excluding
+deliberate pacing waits.
 
 ## Runtime Commander
 
@@ -190,25 +242,107 @@ openarm_sim_isaac/robots/openarm/_launcher.py
 
 Runtime task scenes are loaded on top of the base environment.
 
-## Git LFS
+## Robot visual assets
 
-The OpenArm USD assets are tracked with Git LFS:
+The Isaac base image downloads one complete, prepared bundle from the
+`isaac-sim-assets` R2 bucket. Its immutable versioned key and SHA-256 are pinned in
+`openarm/scripts/isaac_assets.env`. The Docker build copies
+that file before downloading, so a pin change invalidates the asset layer's
+cache. It verifies the archive checksum before extraction and never falls back
+to a mutable asset directory. Node image builds and robot startup use only the
+baked files, with no GitHub access, asset conversion or conversion dependencies.
+
+The bundle contains:
+
+- `openarm_bimanual_v2.usd`, with its repaired visual references.
+- `openarm_v2_visuals.usdc`, referenced through relative paths by all 21 v2 links.
+- `openarm_bimanual.usd` and its three `configuration/` layers for v1.
+- `openarm_visual_sources.json`, with the upstream revision, input checksums and
+  original robot image digest.
+- `openarm_description.LICENSE.txt`, the upstream Apache-2.0 license.
+- `bundle_manifest.json`, with output checksums, tool versions, converter script
+  hashes and validation results.
+
+Each material-bearing mesh region keeps its source color, triangle topology,
+normals and scene transform. The body scale, mirrored left-arm frames and gripper
+offsets are retained. Link poses, joints, drives, masses and collision geometry
+are unchanged. Robot stage dependencies resolve within the bundle; the
+`OmniPBR.mdl` shader module is supplied locally by Isaac Sim.
+
+### Asset maintenance
+
+`scripts/build_visuals.py` and `scripts/prepare_assets.py` are CPU-only maintenance
+tools, not image-build steps. Preparation verifies every source stage, COLLADA
+mesh and the license, converts only the v2 visuals, and checks USD composition,
+material bindings, unchanged nonvisual specs and all attachment transforms.
+Archives have sorted entries and fixed timestamps, ownership and permissions.
+Preparation refuses to overwrite an existing output.
+
+From the repository root, extract the source stages from the digest pinned in
+`scripts/visual_sources.json`. Creating the source container does not run Isaac
+or require a GPU:
 
 ```bash
-git lfs install
-git lfs track 'openarm_sim_isaac/robot_assets/**/*.usd'
-git add .gitattributes
-git add openarm_sim_isaac/robot_assets
-git lfs ls-files
+source_image=$(python3 -c 'import json; print(json.load(open("openarm/sim_isaac/scripts/visual_sources.json"))["robot"]["image"])')
+source_container=$(docker create --platform linux/amd64 "$source_image")
+mkdir -p /tmp/openarm-isaac-source
+docker cp "$source_container:/opt/robot_assets/openarm/isaac/." /tmp/openarm-isaac-source/
+docker rm "$source_container"
+
+uv run --no-project --python 3.11 --with usd-core==26.5 \
+  --with-requirements openarm/sim_isaac/scripts/requirements-visuals.txt \
+  python openarm/sim_isaac/scripts/prepare_assets.py \
+  --source-dir /tmp/openarm-isaac-source \
+  --output /tmp/openarm-isaac-assets.tar.gz
 ```
 
-Expected `.gitattributes` rule:
+The tool downloads checksum-pinned DAEs from the immutable upstream revision.
+`--mesh-source-dir <directory>` instead accepts an offline directory containing
+`<mesh-name>.dae` files and verifies the same checksums. Only the five pinned
+source stages are copied; backup files are not bundled.
 
-```text
-openarm_sim_isaac/robot_assets/**/*.usd filter=lfs diff=lfs merge=lfs -text
+Publish the complete archive, not the visual library alone. Assign a bundle
+version and retain the archive's checksum in its object key. Conditional creation
+prevents overwriting an existing object:
+
+```bash
+bundle=/tmp/openarm-isaac-assets.tar.gz
+version=2
+checksum=$(sha256sum "$bundle" | cut -d ' ' -f 1)
+key="openarm/${version}/${checksum}.tar.gz"
+AWS_ACCESS_KEY_ID="$WALDO_R2_ACCESS_KEY_ID" \
+AWS_SECRET_ACCESS_KEY="$WALDO_R2_SECRET_ACCESS_KEY" \
+aws --endpoint-url "$WALDO_R2_JURISDICTION_ENDPOINT" s3api put-object \
+  --bucket isaac-sim-assets --key "$key" --body "$bundle" \
+  --if-none-match '*' --content-type application/gzip \
+  --cache-control 'public, max-age=31536000, immutable'
 ```
 
-`git lfs ls-files` may be empty until the matching USD files are staged or committed.
+Download the published object and verify its SHA-256 before setting
+`ISAAC_ASSETS_KEY` and `ISAAC_ASSETS_SHA256` in `isaac_assets.env`. Bump
+`ISAAC_IMAGE_REV` in `build_base_images.sh`, then use an authenticated Docker
+builder to publish the base image:
+
+```bash
+RCLONE_S3_ACCESS_KEY_ID="$WALDO_R2_ACCESS_KEY_ID" \
+RCLONE_S3_SECRET_ACCESS_KEY="$WALDO_R2_SECRET_ACCESS_KEY" \
+bash openarm/scripts/build_base_images.sh --isaac-only
+```
+
+The publisher stamps the node's `From:` tag. Commit the pin and tag together,
+then restage the node with `peppy node add openarm/sim_isaac -sb --force`.
+
+Run the GPU-free regression suites from the repository root:
+
+```bash
+uv run --project openarm/sim_isaac/tests --locked --group dev \
+  pytest openarm/sim_isaac/tests
+```
+
+On Linux ARM64, PyPI has no `usd-core` distribution. The USD-specific test module
+is skipped there; the installer, camera, startup and timing suites still run.
+A native OpenUSD installation from conda-forge supports asset preparation and
+the USD tests on ARM64 without Isaac Sim or a GPU.
 
 ## Troubleshooting
 

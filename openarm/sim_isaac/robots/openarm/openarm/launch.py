@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import logging
 import os
 import sys
@@ -46,35 +47,32 @@ def _version(hardware_version: str) -> str:
 
 
 def _scene_path(hardware_version: str) -> Path:
-    # The v1 and v2 scenes are separate USD files:
-    #
-    # openarm_bimanual_v1.usd
-    # openarm_bimanual_v2.usd
-    #
-    # A missing scene fails loudly rather than silently
-    # simulating a different hardware version.
-
-    return (
-        _ASSETS_DIR
-        / f"openarm_bimanual_{_version(hardware_version)}.usd"
-    )
+    # Each hardware version selects its own entrypoint in the prepared bundle.
+    filename = {
+        "v1": "openarm_bimanual.usd",
+        "v2": "openarm_bimanual_v2.usd",
+    }[_version(hardware_version)]
+    return _ASSETS_DIR / filename
 
 
 _ROBOTS_DIR = Path(__file__).resolve().parents[1]
 
-# State is published once per rendered frame, so the frame cost bounds the
-# state cadence the backbone sees. Measured on an RTX 5090 laptop with the
-# warehouse scene: path tracing at 2 spp with the denoiser is both faster and
-# cleaner than ray-traced lighting, and 1920x1080 costs 60 to 80 ms per frame
-# while the arms move, past the backbone's stale window; this size stays inside
-# it. The livestream shows this frame.
+# The loop and livestream share a target independent of state publication limits.
+_FRAME_RATE_HZ = 60
+_EXPERIENCE_PATH = _ROBOTS_DIR / "config" / "openarm.sim.kit"
+
+# The viewport renders with RTX Real-Time 2.0 (`RealTimePathTracing`) and DLSS
+# at 720p. That renderer denoises only through DLSS Ray Reconstruction, which
+# runs on the NGX core library the base image carries (see
+# scripts/Dockerfile.isaac); Peppy's `--nv` binding does not
+# bring the host's copy in. Kit falls back to TAA without a word when the
+# library is missing and streams raw path-tracing noise, so the launcher checks
+# the effective profile once the first frames have rendered.
 _RENDER_CONFIG = {
-    "renderer": "PathTracing",
+    "renderer": "RealTimePathTracing",
+    "anti_aliasing": 3,
     "width": 1280,
     "height": 720,
-    "samples_per_pixel_per_frame": 2,
-    "denoiser": True,
-    "max_bounces": 2,
 }
 
 _ready = threading.Event()
@@ -189,8 +187,59 @@ def _run_node_builder() -> None:
         _stop.set()
 
 
+def _preflight_nvidia_driver() -> None:
+    """Check NVML access to the host driver, not Vulkan renderer health."""
+
+    guidance = (
+        "Verify nvidia-smi works on the host, check the host NVIDIA driver, "
+        "and launch the container with --nv."
+    )
+    try:
+        nvml = ctypes.CDLL("libnvidia-ml.so.1")
+    except OSError as exc:
+        raise RuntimeError(
+            f"NVIDIA driver preflight failed: cannot load libnvidia-ml.so.1: {exc}. "
+            f"{guidance}"
+        ) from exc
+
+    try:
+        nvml_init = nvml.nvmlInit_v2
+        nvml_error_string = nvml.nvmlErrorString
+        nvml_shutdown = nvml.nvmlShutdown
+    except AttributeError as exc:
+        raise RuntimeError(
+            f"NVIDIA driver preflight failed: missing required NVML API symbol: {exc}. "
+            f"{guidance}"
+        ) from exc
+
+    nvml_init.argtypes = []
+    nvml_init.restype = ctypes.c_int
+    nvml_error_string.argtypes = [ctypes.c_int]
+    nvml_error_string.restype = ctypes.c_char_p
+    nvml_shutdown.argtypes = []
+    nvml_shutdown.restype = ctypes.c_int
+
+    # Shutdown is called only after init succeeds, and must also succeed.
+    for name, operation in (("nvmlInit_v2", nvml_init), ("nvmlShutdown", nvml_shutdown)):
+        result = operation()
+        if result != 0:
+            detail = nvml_error_string(result)
+            detail = detail.decode("utf-8", errors="replace") if detail else "unknown NVML error"
+            mismatch_guidance = (
+                " The NVIDIA user-space library and loaded kernel driver do not match. "
+                "Reboot the host after a driver update."
+                if result == 18 else ""
+            )
+            raise RuntimeError(
+                f"NVIDIA driver preflight failed: {name} returned NVML error {result} "
+                f"({detail}).{mismatch_guidance} {guidance}"
+            )
+
+
 def main() -> None:
     """Launch Peppy and Isaac Sim."""
+
+    _preflight_nvidia_driver()
 
     threading.Thread(
         target=_run_node_builder,
@@ -255,6 +304,13 @@ def main() -> None:
         )
 
         streaming_args = [
+            "--enable",
+            "omni.kit.livestream.app",
+            (
+                "--/exts/omni.kit.livestream.app/"
+                "primaryStream/targetFps="
+                f"{_FRAME_RATE_HZ}"
+            ),
             (
                 "--/exts/omni.kit.livestream.app/"
                 "primaryStream/signalPort="
@@ -280,9 +336,11 @@ def main() -> None:
             streaming_args
         )
 
+    if handoff.cameras_enabled:
+        sys.argv.extend(["--enable", "omni.replicator.core"])
+
     # SimulationApp must be imported only after all launch arguments
     # have been prepared.
-    
     sys.argv.extend([
         "--/log/channels/omni.usd.multitick.render=warn",
         "--/log/fileLogLevel=warn",
@@ -295,19 +353,10 @@ def main() -> None:
         **_RENDER_CONFIG,
     }
 
-    if handoff.headless:
-        simulation_app = SimulationApp(
-            launch_config,
-            experience=(
-                "/isaac-sim/apps/"
-                "isaacsim.exp.full.streaming.kit"
-            ),
-        )
-
-    else:
-        simulation_app = SimulationApp(
-            launch_config
-        )
+    simulation_app = SimulationApp(
+        launch_config,
+        experience=str(_EXPERIENCE_PATH),
+    )
 
     sys.path.insert(
         0,
@@ -327,6 +376,9 @@ def main() -> None:
         handoff.scene_actions,
         handoff.state_rate_hz,
         handoff.cameras_enabled,
+        frame_rate_hz=_FRAME_RATE_HZ,
+        render_mode=_RENDER_CONFIG["renderer"],
+        anti_aliasing=_RENDER_CONFIG["anti_aliasing"],
     ).run()
 
 

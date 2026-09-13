@@ -251,6 +251,12 @@ class FramePacer:
         self._period = 1.0 / fps
         self._deadline: Optional[float] = None
 
+    def seconds_until_due(self, now: float) -> float:
+        """Return the remaining wait without claiming a frame or moving the deadline."""
+        if self._deadline is None:
+            return 0.0
+        return max(0.0, self._deadline - now)
+
     def take_if_due(self, now: float) -> bool:
         """Claim the slot due at time now, advancing the schedule: True exactly
         once per period, and the caller owes that period a frame."""

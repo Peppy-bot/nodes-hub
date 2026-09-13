@@ -49,7 +49,10 @@ class SceneActionIO:
 
         self._lock = threading.Lock()
 
+        # Empty until the launcher hands over the discovered catalogue;
+        # get_assets_list says so rather than answering with nothing.
         self._assets: dict[str, dict] = {}
+        self._assets_ready = False
         self._objects: dict[str, dict] = {}
 
         self._pending: Queue[_PendingCommand] = Queue()
@@ -129,6 +132,7 @@ class SceneActionIO:
                 asset_id: dict(asset)
                 for asset_id, asset in assets.items()
             }
+            self._assets_ready = True
 
         logger.info(
             "SceneActionIO received %d Isaac assets",
@@ -237,6 +241,19 @@ class SceneActionIO:
         self,
         _request,
     ) -> get_assets_list.Response:
+        with self._lock:
+            ready = self._assets_ready
+
+        if not ready:
+            return get_assets_list.Response(
+                success=False,
+                message=(
+                    "Isaac is still discovering its asset catalogue; "
+                    "it is available once the stage has loaded"
+                ),
+                assets_json="[]",
+            )
+
         assets = self._public_assets()
 
         return get_assets_list.Response(
@@ -348,6 +365,10 @@ class SceneActionIO:
                     "scale must be greater than zero"
                 )
 
+            # scene_control: spawned objects go first, then the scene is
+            # replaced.
+            self._remove_spawned_objects(launcher)
+
             launcher._runtime_load_isaac_scene(
                 {
                     "path": asset["path"],
@@ -361,22 +382,9 @@ class SceneActionIO:
             }
 
         if operation == "clear_scene":
-            with self._lock:
-                object_ids = list(
-                    self._objects
-                )
-
-            for object_id in object_ids:
-                launcher._runtime_remove(
-                    {
-                        "name": object_id,
-                    }
-                )
+            self._remove_spawned_objects(launcher)
 
             launcher._runtime_clear_scene()
-
-            with self._lock:
-                self._objects.clear()
 
             return {
                 "success": True,
@@ -626,6 +634,22 @@ class SceneActionIO:
         raise ValueError(
             f"Unsupported scene operation: {operation}"
         )
+
+    def _remove_spawned_objects(self, launcher) -> None:
+        """Remove every spawned object, as load_scene and clear_scene promise."""
+
+        with self._lock:
+            object_ids = list(self._objects)
+
+        for object_id in object_ids:
+            launcher._runtime_remove(
+                {
+                    "name": object_id,
+                }
+            )
+
+            with self._lock:
+                self._objects.pop(object_id, None)
 
     async def _finish_simple(
         self,

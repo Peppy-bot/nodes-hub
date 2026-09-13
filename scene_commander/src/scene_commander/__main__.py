@@ -35,34 +35,29 @@ SERVICE_TIMEOUT_S = 10.0
 ACTION_TIMEOUT_S = 60.0
 
 
+class SceneCatalogueUnavailable(RuntimeError):
+    """The scene provider answered get_assets_list without a catalogue.
+
+    An engine answers this way while it is still discovering its assets, and
+    its message says so. The page waits it out and asks again.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Parameter helpers
 # ---------------------------------------------------------------------------
 
 
-def _param(
-    params: Any,
-    name: str,
-    default: Any,
-) -> Any:
+def _param(params: Any, name: str, default: Any) -> Any:
     """Read a Peppy parameter from dict-like or attribute-like params."""
 
     if params is None:
         return default
 
     if isinstance(params, dict):
-        return params.get(
-            name,
-            default,
-        )
+        return params.get(name, default)
 
-    value = getattr(
-        params,
-        name,
-        default,
-    )
-
-    return value
+    return getattr(params, name, default)
 
 
 # ---------------------------------------------------------------------------
@@ -70,12 +65,8 @@ def _param(
 # ---------------------------------------------------------------------------
 
 
-async def _fetch_assets(
-    node_runner: NodeRunner,
-) -> list[dict]:
-    producer = get_assets_list.bound_producer(
-        node_runner
-    )
+async def _fetch_assets(node_runner: NodeRunner) -> list[dict]:
+    producer = get_assets_list.bound_producer(node_runner)
 
     response = await get_assets_list.poll(
         node_runner,
@@ -86,21 +77,13 @@ async def _fetch_assets(
     data = response.data
 
     if not data.success:
-        raise RuntimeError(
-            data.message
-        )
+        raise SceneCatalogueUnavailable(data.message)
 
-    return json.loads(
-        data.assets_json
-    )
+    return json.loads(data.assets_json)
 
 
-async def _fetch_objects(
-    node_runner: NodeRunner,
-) -> list[dict]:
-    producer = get_objects_list.bound_producer(
-        node_runner
-    )
+async def _fetch_objects(node_runner: NodeRunner) -> list[dict]:
+    producer = get_objects_list.bound_producer(node_runner)
 
     response = await get_objects_list.poll(
         node_runner,
@@ -111,369 +94,177 @@ async def _fetch_objects(
     data = response.data
 
     if not data.success:
-        raise RuntimeError(
-            data.message
-        )
+        raise RuntimeError(data.message)
 
-    return json.loads(
-        data.objects_json
+    return json.loads(data.objects_json)
+
+
+class _CatalogueWatch:
+    """Log the provider's catalogue state when it changes, not on every poll."""
+
+    def __init__(self) -> None:
+        self._state: tuple | None = None
+
+    def unavailable(self, message: str) -> None:
+        if self._state != ("unavailable", message):
+            self._state = ("unavailable", message)
+            logger.info("Scene provider has no catalogue yet: %s", message)
+
+    def ready(self, count: int) -> None:
+        if self._state != ("ready",):
+            self._state = ("ready",)
+            logger.info("Scene provider catalogue ready: %d assets", count)
+
+
+# ---------------------------------------------------------------------------
+# Actions
+# ---------------------------------------------------------------------------
+
+
+async def _run_action(action, node_runner: NodeRunner, request=None, **fields):
+    """Fire one scene_control goal and return its result data.
+
+    Every goal that completes leaves one log line naming what was asked and
+    what the provider answered. Rejections and failures raise with the
+    provider's reason; the HTTP layer logs them.
+    """
+
+    name = action.__name__.rsplit(".", 1)[-1]
+    summary = f"{name}({', '.join(f'{key}={value}' for key, value in fields.items())})"
+
+    producer = action.bound_producer(node_runner)
+    goal = (request,) if request is not None else ()
+
+    handle = await action.ActionHandle.fire_goal(
+        node_runner,
+        producer,
+        *goal,
+        timeout=ACTION_TIMEOUT_S,
+        feedback_qos=peppylib.QoSProfile.Standard,
     )
 
+    if not handle.accepted:
+        raise RuntimeError(f"{name} rejected: {handle.reason}")
 
-# ---------------------------------------------------------------------------
-# Action helpers
-# ---------------------------------------------------------------------------
+    result = await handle.get_result(timeout=ACTION_TIMEOUT_S)
 
-
-def _require_completed(
-    module,
-    result,
-):
-    if result.status != module.ResultStatus.COMPLETED:
-        raise RuntimeError(
-            f"Action did not complete: {result.status.name}"
-        )
+    if result.status != action.ResultStatus.COMPLETED:
+        raise RuntimeError(f"{name} did not complete: {result.status.name}")
 
     if result.data is None:
-        raise RuntimeError(
-            "Action completed without result data"
-        )
+        raise RuntimeError(f"{name} completed without result data")
 
     if not result.data.success:
-        raise RuntimeError(
-            result.data.message
-        )
+        raise RuntimeError(result.data.message)
+
+    logger.info("%s: %s", summary, result.data.message)
 
     return result.data
 
 
-async def _action_load_scene(
-    node_runner: NodeRunner,
-    asset_id: str,
-    scale: float,
-) -> dict:
-    producer = load_scene.bound_producer(
-        node_runner
-    )
-
-    request = load_scene.GoalRequest(
+async def _action_load_scene(node_runner: NodeRunner, asset_id: str, scale: float) -> dict:
+    data = await _run_action(
+        load_scene,
+        node_runner,
+        load_scene.GoalRequest(asset_id=asset_id, scale=float(scale)),
         asset_id=asset_id,
         scale=float(scale),
     )
 
-    handle = await load_scene.ActionHandle.fire_goal(
-        node_runner,
-        producer,
-        request,
-        timeout=ACTION_TIMEOUT_S,
-        feedback_qos=peppylib.QoSProfile.Standard,
-    )
-
-    if not handle.accepted:
-        raise RuntimeError(
-            f"load_scene rejected: {handle.reason}"
-        )
-
-    result = await handle.get_result(
-        timeout=ACTION_TIMEOUT_S
-    )
-
-    data = _require_completed(
-        load_scene,
-        result,
-    )
-
-    return {
-        "success": True,
-        "message": data.message,
-    }
+    return {"success": True, "message": data.message}
 
 
-async def _action_clear_scene(
-    node_runner: NodeRunner,
-) -> dict:
-    producer = clear_scene.bound_producer(
-        node_runner
-    )
+async def _action_clear_scene(node_runner: NodeRunner) -> dict:
+    data = await _run_action(clear_scene, node_runner)
 
-    handle = await clear_scene.ActionHandle.fire_goal(
-        node_runner,
-        producer,
-        timeout=ACTION_TIMEOUT_S,
-        feedback_qos=peppylib.QoSProfile.Standard,
-    )
-
-    if not handle.accepted:
-        raise RuntimeError(
-            f"clear_scene rejected: {handle.reason}"
-        )
-
-    result = await handle.get_result(
-        timeout=ACTION_TIMEOUT_S
-    )
-
-    data = _require_completed(
-        clear_scene,
-        result,
-    )
-
-    return {
-        "success": True,
-        "message": data.message,
-    }
+    return {"success": True, "message": data.message}
 
 
-async def _action_spawn_object(
-    node_runner: NodeRunner,
-    payload: dict,
-) -> dict:
-    producer = spawn_object.bound_producer(
-        node_runner
-    )
-
+async def _action_spawn_object(node_runner: NodeRunner, payload: dict) -> dict:
     request = spawn_object.GoalRequest(
-        asset_id=str(
-            payload["asset_id"]
-        ),
-        position=[
-            float(value)
-            for value in payload["position"]
-        ],
-        scale=float(
-            payload.get(
-                "scale",
-                1.0,
-            )
-        ),
-        physics=str(
-            payload.get(
-                "physics",
-                "none",
-            )
-        ),
-        mass=float(
-            payload.get(
-                "mass",
-                0.1,
-            )
-        ),
+        asset_id=str(payload["asset_id"]),
+        position=[float(value) for value in payload["position"]],
+        scale=float(payload.get("scale", 1.0)),
+        physics=str(payload.get("physics", "none")),
+        mass=float(payload.get("mass", 0.1)),
     )
 
-    handle = await spawn_object.ActionHandle.fire_goal(
-        node_runner,
-        producer,
-        request,
-        timeout=ACTION_TIMEOUT_S,
-        feedback_qos=peppylib.QoSProfile.Standard,
-    )
-
-    if not handle.accepted:
-        raise RuntimeError(
-            f"spawn_object rejected: {handle.reason}"
-        )
-
-    result = await handle.get_result(
-        timeout=ACTION_TIMEOUT_S
-    )
-
-    data = _require_completed(
+    data = await _run_action(
         spawn_object,
-        result,
+        node_runner,
+        request,
+        asset_id=request.asset_id,
+        position=request.position,
+        physics=request.physics,
+        mass=request.mass,
     )
 
-    return {
-        "success": True,
-        "message": data.message,
-        "object_id": data.object_id,
-    }
+    return {"success": True, "message": data.message, "object_id": data.object_id}
 
 
-async def _action_apply_force(
-    node_runner: NodeRunner,
-    payload: dict,
-) -> dict:
-    producer = apply_force.bound_producer(
-        node_runner
-    )
-
-    force = [
-        float(value)
-        for value in payload["force"]
-    ]
+async def _action_apply_force(node_runner: NodeRunner, payload: dict) -> dict:
+    force = [float(value) for value in payload["force"]]
 
     if len(force) != 3:
-        raise ValueError(
-            "force must contain exactly 3 values"
-        )
+        raise ValueError("force must contain exactly 3 values")
 
     request = apply_force.GoalRequest(
-        object_id=str(
-            payload["object_id"]
-        ),
+        object_id=str(payload["object_id"]),
         force=force,
-        duration_s=float(
-            payload.get(
-                "duration_s",
-                0.5,
-            )
-        ),
+        duration_s=float(payload.get("duration_s", 0.5)),
     )
 
-    handle = await apply_force.ActionHandle.fire_goal(
-        node_runner,
-        producer,
-        request,
-        timeout=ACTION_TIMEOUT_S,
-        feedback_qos=peppylib.QoSProfile.Standard,
-    )
-
-    if not handle.accepted:
-        raise RuntimeError(
-            f"apply_force rejected: {handle.reason}"
-        )
-
-    result = await handle.get_result(
-        timeout=ACTION_TIMEOUT_S
-    )
-
-    data = _require_completed(
+    data = await _run_action(
         apply_force,
-        result,
-    )
-
-    return {
-        "success": True,
-        "message": data.message,
-    }
-
-
-async def _action_move_object(
-    node_runner: NodeRunner,
-    payload: dict,
-) -> dict:
-    producer = move_object.bound_producer(
-        node_runner
-    )
-
-    request = move_object.GoalRequest(
-        object_id=str(
-            payload["object_id"]
-        ),
-        position=[
-            float(value)
-            for value in payload["position"]
-        ],
-    )
-
-    handle = await move_object.ActionHandle.fire_goal(
         node_runner,
-        producer,
         request,
-        timeout=ACTION_TIMEOUT_S,
-        feedback_qos=peppylib.QoSProfile.Standard,
+        object_id=request.object_id,
+        force=force,
+        duration_s=request.duration_s,
     )
 
-    if not handle.accepted:
-        raise RuntimeError(
-            f"move_object rejected: {handle.reason}"
-        )
+    return {"success": True, "message": data.message}
 
-    result = await handle.get_result(
-        timeout=ACTION_TIMEOUT_S
+
+async def _action_move_object(node_runner: NodeRunner, payload: dict) -> dict:
+    request = move_object.GoalRequest(
+        object_id=str(payload["object_id"]),
+        position=[float(value) for value in payload["position"]],
     )
 
-    data = _require_completed(
+    data = await _run_action(
         move_object,
-        result,
+        node_runner,
+        request,
+        object_id=request.object_id,
+        position=request.position,
     )
 
-    return {
-        "success": True,
-        "message": data.message,
-    }
+    return {"success": True, "message": data.message}
 
 
-async def _action_remove_object(
-    node_runner: NodeRunner,
-    object_id: str,
-) -> dict:
-    producer = remove_object.bound_producer(
-        node_runner
-    )
-
-    request = remove_object.GoalRequest(
+async def _action_remove_object(node_runner: NodeRunner, object_id: str) -> dict:
+    data = await _run_action(
+        remove_object,
+        node_runner,
+        remove_object.GoalRequest(object_id=object_id),
         object_id=object_id,
     )
 
-    handle = await remove_object.ActionHandle.fire_goal(
-        node_runner,
-        producer,
-        request,
-        timeout=ACTION_TIMEOUT_S,
-        feedback_qos=peppylib.QoSProfile.Standard,
-    )
-
-    if not handle.accepted:
-        raise RuntimeError(
-            f"remove_object rejected: {handle.reason}"
-        )
-
-    result = await handle.get_result(
-        timeout=ACTION_TIMEOUT_S
-    )
-
-    data = _require_completed(
-        remove_object,
-        result,
-    )
-
-    return {
-        "success": True,
-        "message": data.message,
-    }
+    return {"success": True, "message": data.message}
 
 
-async def _action_move_robot(
-    node_runner: NodeRunner,
-    position: list[float],
-) -> dict:
-    producer = move_robot.bound_producer(
-        node_runner
-    )
+async def _action_move_robot(node_runner: NodeRunner, position: list[float]) -> dict:
+    position = [float(value) for value in position]
 
-    request = move_robot.GoalRequest(
-        position=[
-            float(value)
-            for value in position
-        ],
-    )
-
-    handle = await move_robot.ActionHandle.fire_goal(
-        node_runner,
-        producer,
-        request,
-        timeout=ACTION_TIMEOUT_S,
-        feedback_qos=peppylib.QoSProfile.Standard,
-    )
-
-    if not handle.accepted:
-        raise RuntimeError(
-            f"move_robot rejected: {handle.reason}"
-        )
-
-    result = await handle.get_result(
-        timeout=ACTION_TIMEOUT_S
-    )
-
-    data = _require_completed(
+    data = await _run_action(
         move_robot,
-        result,
+        node_runner,
+        move_robot.GoalRequest(position=position),
+        position=position,
     )
 
-    return {
-        "success": True,
-        "message": data.message,
-    }
+    return {"success": True, "message": data.message}
 
 
 # ---------------------------------------------------------------------------
@@ -481,64 +272,49 @@ async def _action_move_robot(
 # ---------------------------------------------------------------------------
 
 
-def _json_error(
-    exc: Exception,
-    status: int = 400,
-) -> web.Response:
-    logger.exception(
-        "Scene commander request failed"
+_NODE_RUNNER = web.AppKey("node_runner", NodeRunner)
+_CATALOGUE = web.AppKey("catalogue", _CatalogueWatch)
+
+
+def _json_error(request: web.Request, exc: Exception, status: int = 400) -> web.Response:
+    # Bad input and provider refusals are one line each; anything else is a
+    # bug in this node and keeps its traceback.
+    expected = isinstance(exc, (ValueError, KeyError, RuntimeError, TimeoutError))
+
+    logger.warning(
+        "%s %s failed: %s",
+        request.method,
+        request.path,
+        exc,
+        exc_info=None if expected else exc,
     )
 
     return web.json_response(
-        {
-            "success": False,
-            "message": str(exc),
-        },
+        {"success": False, "message": str(exc)},
         status=status,
     )
 
 
-async def _request_json(
-    request: web.Request,
-) -> dict:
+async def _request_json(request: web.Request) -> dict:
     try:
         data = await request.json()
 
     except Exception as exc:
-        raise ValueError(
-            "Request body must contain valid JSON"
-        ) from exc
+        raise ValueError("Request body must contain valid JSON") from exc
 
-    if not isinstance(
-        data,
-        dict,
-    ):
-        raise ValueError(
-            "JSON request body must be an object"
-        )
+    if not isinstance(data, dict):
+        raise ValueError("JSON request body must be an object")
 
     return data
 
 
-def _position(
-    payload: dict,
-) -> list[float]:
-    position = payload.get(
-        "position"
-    )
+def _position(payload: dict) -> list[float]:
+    position = payload.get("position")
 
-    if (
-        not isinstance(position, list)
-        or len(position) != 3
-    ):
-        raise ValueError(
-            "position must be [x, y, z]"
-        )
+    if not isinstance(position, list) or len(position) != 3:
+        raise ValueError("position must be [x, y, z]")
 
-    return [
-        float(value)
-        for value in position
-    ]
+    return [float(value) for value in position]
 
 
 # ---------------------------------------------------------------------------
@@ -546,247 +322,146 @@ def _position(
 # ---------------------------------------------------------------------------
 
 
-async def _api_health(
-    request: web.Request,
-) -> web.Response:
+async def _api_health(request: web.Request) -> web.Response:
+    return web.json_response({"success": True, "service": "scene_commander"})
+
+
+async def _api_assets(request: web.Request) -> web.Response:
+    catalogue = request.app[_CATALOGUE]
+
+    try:
+        assets = await _fetch_assets(request.app[_NODE_RUNNER])
+
+    except SceneCatalogueUnavailable as exc:
+        catalogue.unavailable(str(exc))
+
+        return web.json_response(
+            {"success": False, "message": str(exc)},
+            status=503,
+        )
+
+    except Exception as exc:
+        return _json_error(request, exc, status=500)
+
+    catalogue.ready(len(assets))
+
     return web.json_response(
-        {
-            "success": True,
-            "service": "scene_commander",
-        }
+        {"success": True, "assets": assets, "count": len(assets)}
     )
 
 
-async def _api_assets(
-    request: web.Request,
-) -> web.Response:
+async def _api_objects(request: web.Request) -> web.Response:
     try:
-        node_runner = request.app["node_runner"]
-
-        assets = await _fetch_assets(
-            node_runner
-        )
-
-        return web.json_response(
-            {
-                "success": True,
-                "assets": assets,
-                "count": len(assets),
-            }
-        )
+        objects = await _fetch_objects(request.app[_NODE_RUNNER])
 
     except Exception as exc:
-        return _json_error(
-            exc,
-            status=500,
-        )
+        return _json_error(request, exc, status=500)
+
+    return web.json_response(
+        {"success": True, "objects": objects, "count": len(objects)}
+    )
 
 
-async def _api_objects(
-    request: web.Request,
-) -> web.Response:
+async def _api_load_scene(request: web.Request) -> web.Response:
     try:
-        node_runner = request.app["node_runner"]
-
-        objects = await _fetch_objects(
-            node_runner
-        )
-
-        return web.json_response(
-            {
-                "success": True,
-                "objects": objects,
-                "count": len(objects),
-            }
-        )
-
-    except Exception as exc:
-        return _json_error(
-            exc,
-            status=500,
-        )
-
-
-async def _api_load_scene(
-    request: web.Request,
-) -> web.Response:
-    try:
-        payload = await _request_json(
-            request
-        )
+        payload = await _request_json(request)
 
         result = await _action_load_scene(
-            request.app["node_runner"],
+            request.app[_NODE_RUNNER],
             str(payload["asset_id"]),
-            float(
-                payload.get(
-                    "scale",
-                    1.0,
-                )
-            ),
-        )
-
-        return web.json_response(
-            result
+            float(payload.get("scale", 1.0)),
         )
 
     except Exception as exc:
-        return _json_error(exc)
+        return _json_error(request, exc)
+
+    return web.json_response(result)
 
 
-async def _api_clear_scene(
-    request: web.Request,
-) -> web.Response:
+async def _api_clear_scene(request: web.Request) -> web.Response:
     try:
-        result = await _action_clear_scene(
-            request.app["node_runner"]
-        )
-
-        return web.json_response(
-            result
-        )
+        result = await _action_clear_scene(request.app[_NODE_RUNNER])
 
     except Exception as exc:
-        return _json_error(exc)
+        return _json_error(request, exc)
+
+    return web.json_response(result)
 
 
-async def _api_spawn_object(
-    request: web.Request,
-) -> web.Response:
+async def _api_spawn_object(request: web.Request) -> web.Response:
     try:
-        payload = await _request_json(
-            request
-        )
+        payload = await _request_json(request)
+        payload["position"] = _position(payload)
 
-        payload["position"] = _position(
-            payload
-        )
-
-        result = await _action_spawn_object(
-            request.app["node_runner"],
-            payload,
-        )
-
-        return web.json_response(
-            result
-        )
+        result = await _action_spawn_object(request.app[_NODE_RUNNER], payload)
 
     except Exception as exc:
-        return _json_error(exc)
+        return _json_error(request, exc)
+
+    return web.json_response(result)
 
 
-async def _api_apply_force(
-    request: web.Request,
-) -> web.Response:
+async def _api_apply_force(request: web.Request) -> web.Response:
     try:
-        payload = await _request_json(
-            request
-        )
+        payload = await _request_json(request)
 
-        force = payload.get(
-            "force",
-            [],
-        )
+        force = payload.get("force", [])
 
-        if (
-            not isinstance(force, list)
-            or len(force) != 3
-        ):
-            raise ValueError(
-                "force must contain exactly "
-                "3 values [Fx, Fy, Fz]"
-            )
+        if not isinstance(force, list) or len(force) != 3:
+            raise ValueError("force must contain exactly 3 values [Fx, Fy, Fz]")
 
-        payload["force"] = [
-            float(value)
-            for value in force
-        ]
+        payload["force"] = [float(value) for value in force]
+        payload["duration_s"] = float(payload.get("duration_s", 0.5))
 
-        payload["duration_s"] = float(
-            payload.get(
-                "duration_s",
-                0.5,
-            )
-        )
-
-        result = await _action_apply_force(
-            request.app["node_runner"],
-            payload,
-        )
-
-        return web.json_response(
-            result
-        )
+        result = await _action_apply_force(request.app[_NODE_RUNNER], payload)
 
     except Exception as exc:
-        return _json_error(exc)
+        return _json_error(request, exc)
+
+    return web.json_response(result)
 
 
-async def _api_move_object(
-    request: web.Request,
-) -> web.Response:
+async def _api_move_object(request: web.Request) -> web.Response:
     try:
-        payload = await _request_json(
-            request
-        )
+        payload = await _request_json(request)
+        payload["position"] = _position(payload)
 
-        payload["position"] = _position(
-            payload
-        )
-
-        result = await _action_move_object(
-            request.app["node_runner"],
-            payload,
-        )
-
-        return web.json_response(
-            result
-        )
+        result = await _action_move_object(request.app[_NODE_RUNNER], payload)
 
     except Exception as exc:
-        return _json_error(exc)
+        return _json_error(request, exc)
+
+    return web.json_response(result)
 
 
-async def _api_remove_object(
-    request: web.Request,
-) -> web.Response:
+async def _api_remove_object(request: web.Request) -> web.Response:
     try:
-        payload = await _request_json(
-            request
-        )
+        payload = await _request_json(request)
 
         result = await _action_remove_object(
-            request.app["node_runner"],
+            request.app[_NODE_RUNNER],
             str(payload["object_id"]),
         )
 
-        return web.json_response(
-            result
-        )
-
     except Exception as exc:
-        return _json_error(exc)
+        return _json_error(request, exc)
+
+    return web.json_response(result)
 
 
-async def _api_move_robot(
-    request: web.Request,
-) -> web.Response:
+async def _api_move_robot(request: web.Request) -> web.Response:
     try:
-        payload = await _request_json(
-            request
-        )
+        payload = await _request_json(request)
 
         result = await _action_move_robot(
-            request.app["node_runner"],
+            request.app[_NODE_RUNNER],
             _position(payload),
         )
 
-        return web.json_response(
-            result
-        )
-
     except Exception as exc:
-        return _json_error(exc)
+        return _json_error(request, exc)
+
+    return web.json_response(result)
 
 
 # ---------------------------------------------------------------------------
@@ -923,6 +598,27 @@ button.danger {
     font-size: 12px;
     color: #aeb7c4;
 }
+
+select:disabled {
+    color: #aeb7c4;
+}
+
+#status.loading::before {
+    content: "";
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    margin-right: 8px;
+    vertical-align: -2px;
+    border: 2px solid #aeb7c4;
+    border-top-color: transparent;
+    border-radius: 50%;
+    animation: spin 0.9s linear infinite;
+}
+
+@keyframes spin {
+    to { transform: rotate(360deg); }
+}
 </style>
 </head>
 
@@ -939,7 +635,9 @@ button.danger {
 <h2>Scene</h2>
 
 <label for="sceneSelect">Scene</label>
-<select id="sceneSelect" aria-describedby="sceneDescription" onchange="selectScene()"></select>
+<select id="sceneSelect" aria-describedby="sceneDescription" onchange="selectScene()" disabled>
+<option value="" disabled>Loading assets...</option>
+</select>
 <p id="sceneDescription" class="small" aria-live="polite" hidden></p>
 
 <label>Scale</label>
@@ -959,13 +657,17 @@ button.danger {
 <input id="assetSearch" placeholder="red block, table, drill..." oninput="renderAssets()">
 
 <label>Category</label>
-<select id="categorySelect" onchange="renderAssets()"></select>
+<select id="categorySelect" onchange="renderAssets()" disabled>
+<option value="" disabled>Loading assets...</option>
+</select>
 
 <label for="assetSelect">Asset</label>
-<select id="assetSelect" aria-describedby="assetDescription" onchange="selectAsset()"></select>
+<select id="assetSelect" aria-describedby="assetDescription" onchange="selectAsset()" disabled>
+<option value="" disabled>Loading assets...</option>
+</select>
 <p id="assetDescription" class="small" aria-live="polite" hidden></p>
 
-<div id="assetCount"></div>
+<div id="assetCount">Loading assets...</div>
 
 <label>Position</label>
 <div class="row">
@@ -1024,12 +726,16 @@ button.danger {
 
 </main>
 
-<div id="status">Connecting...</div>
+<div id="status" class="loading">Loading assets...</div>
 
 
 <script>
 let assets = [];
 let objectList = [];
+
+// The provider may still be discovering its assets (Isaac lists its props
+// once the stage has loaded); ask again at this interval until it has them.
+const CATALOGUE_RETRY_MS = 3000;
 
 const el = id => document.getElementById(id);
 
@@ -1048,6 +754,24 @@ function position(prefix) {
 function status(message, error=false) {
     el("status").textContent = message;
     el("status").style.borderColor = error ? "#9b424c" : "#303741";
+}
+
+function setLoading(loading) {
+    el("status").classList.toggle("loading", loading);
+
+    for (const id of ["sceneSelect", "categorySelect", "assetSelect"]) {
+        const select = el(id);
+        select.disabled = loading;
+        if (loading) {
+            const placeholder = new Option("Loading assets...", "");
+            placeholder.disabled = true;
+            select.replaceChildren(placeholder);
+        }
+    }
+
+    if (loading) {
+        el("assetCount").textContent = "Loading assets...";
+    }
 }
 
 async function api(path, options={}) {
@@ -1072,6 +796,7 @@ async function refreshAssets() {
     const data = await api("/api/assets");
 
     assets = data.assets || [];
+    setLoading(false);
 
     const scenes = assets.filter(a => a.kind === "scene");
     const props = assets.filter(a => a.kind === "object");
@@ -1104,6 +829,21 @@ async function refreshAssets() {
     renderObjectDescriptions();
 
     status(`Loaded ${assets.length} assets`);
+}
+
+async function loadCatalogue() {
+    setLoading(true);
+
+    for (;;) {
+        try {
+            await refreshAssets();
+            return;
+        }
+        catch (err) {
+            status(`Waiting for the scene provider: ${err.message}`);
+            await new Promise(resolve => setTimeout(resolve, CATALOGUE_RETRY_MS));
+        }
+    }
 }
 
 function selectScene() {
@@ -1176,6 +916,8 @@ async function loadScene() {
                 scale: number("sceneScale")
             })
         });
+
+        await refreshObjects();
 
         status(data.message);
     }
@@ -1530,13 +1272,8 @@ async function moveRobot() {
 }
 
 async function startup() {
-    try {
-        await refreshAssets();
-        await refreshObjects();
-    }
-    catch (err) {
-        status(err.message, true);
-    }
+    await loadCatalogue();
+    await refreshObjects();
 }
 
 startup();
@@ -1547,13 +1284,8 @@ startup();
 """
 
 
-async def _index(
-    _request: web.Request,
-) -> web.Response:
-    return web.Response(
-        text=HTML,
-        content_type="text/html",
-    )
+async def _index(_request: web.Request) -> web.Response:
+    return web.Response(text=HTML, content_type="text/html")
 
 
 # ---------------------------------------------------------------------------
@@ -1561,81 +1293,40 @@ async def _index(
 # ---------------------------------------------------------------------------
 
 
+def _build_app(node_runner: NodeRunner, catalogue: _CatalogueWatch) -> web.Application:
+    app = web.Application()
+
+    app[_NODE_RUNNER] = node_runner
+    app[_CATALOGUE] = catalogue
+
+    app.router.add_get("/", _index)
+    app.router.add_get("/api/health", _api_health)
+    app.router.add_get("/api/assets", _api_assets)
+    app.router.add_get("/api/objects", _api_objects)
+    app.router.add_post("/api/scene/load", _api_load_scene)
+    app.router.add_post("/api/scene/clear", _api_clear_scene)
+    app.router.add_post("/api/objects/spawn", _api_spawn_object)
+    app.router.add_post("/api/objects/force", _api_apply_force)
+    app.router.add_post("/api/objects/move", _api_move_object)
+    app.router.add_post("/api/objects/remove", _api_remove_object)
+    app.router.add_post("/api/robot/move", _api_move_robot)
+
+    return app
+
+
 async def _run_http_server(
     node_runner: NodeRunner,
     host: str,
     port: int,
+    catalogue: _CatalogueWatch,
 ) -> None:
-    app = web.Application()
-
-    app["node_runner"] = node_runner
-
-    app.router.add_get(
-        "/",
-        _index,
-    )
-
-    app.router.add_get(
-        "/api/health",
-        _api_health,
-    )
-
-    app.router.add_get(
-        "/api/assets",
-        _api_assets,
-    )
-
-    app.router.add_get(
-        "/api/objects",
-        _api_objects,
-    )
-
-    app.router.add_post(
-        "/api/scene/load",
-        _api_load_scene,
-    )
-
-    app.router.add_post(
-        "/api/scene/clear",
-        _api_clear_scene,
-    )
-
-    app.router.add_post(
-        "/api/objects/spawn",
-        _api_spawn_object,
-    )
-
-    app.router.add_post(
-        "/api/objects/force",
-        _api_apply_force,
-    )
-
-    app.router.add_post(
-        "/api/objects/move",
-        _api_move_object,
-    )
-
-    app.router.add_post(
-        "/api/objects/remove",
-        _api_remove_object,
-    )
-
-    app.router.add_post(
-        "/api/robot/move",
-        _api_move_robot,
-    )
-
-    runner = web.AppRunner(
-        app
-    )
+    # Browser requests stay out of the node log: what the log records is the
+    # Peppy traffic, one line per goal and per catalogue state change.
+    runner = web.AppRunner(_build_app(node_runner, catalogue), access_log=None)
 
     await runner.setup()
 
-    site = web.TCPSite(
-        runner,
-        host=host,
-        port=port,
-    )
+    site = web.TCPSite(runner, host=host, port=port)
 
     await site.start()
 
@@ -1657,70 +1348,43 @@ async def _run_http_server(
 # ---------------------------------------------------------------------------
 
 
-async def setup(
-    params,
-    node_runner: NodeRunner,
-) -> list[asyncio.Task]:
-    logger.info(
-        "Scene commander starting"
-    )
+async def setup(params, node_runner: NodeRunner) -> list[asyncio.Task]:
+    logger.info("Scene commander starting")
 
-    assets = await _fetch_assets(
-        node_runner
-    )
+    catalogue = _CatalogueWatch()
 
-    objects = await _fetch_objects(
-        node_runner
-    )
+    # The provider must answer; whether it has its catalogue yet is a state
+    # the page polls for.
+    try:
+        assets = await _fetch_assets(node_runner)
 
-    logger.info(
-        "Connected to scene provider: %d assets, %d runtime objects",
-        len(assets),
-        len(objects),
-    )
+    except SceneCatalogueUnavailable as exc:
+        catalogue.unavailable(str(exc))
 
-    host = str(
-        _param(
-            params,
-            "http_host",
-            "0.0.0.0",
-        )
-    )
+    else:
+        catalogue.ready(len(assets))
 
-    port = int(
-        _param(
-            params,
-            "http_port",
-            8766,
-        )
-    )
+    objects = await _fetch_objects(node_runner)
+
+    logger.info("Scene provider reachable: %d runtime objects", len(objects))
+
+    host = str(_param(params, "http_host", "0.0.0.0"))
+    port = int(_param(params, "http_port", 8766))
 
     server_task = asyncio.create_task(
-        _run_http_server(
-            node_runner,
-            host,
-            port,
-        )
+        _run_http_server(node_runner, host, port, catalogue)
     )
 
-    return [
-        server_task,
-    ]
+    return [server_task]
 
 
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
-        format=(
-            "%(asctime)s - "
-            "%(levelname)s - "
-            "%(message)s"
-        ),
+        format="%(asctime)s - %(levelname)s - %(message)s",
     )
 
-    NodeBuilder().run(
-        setup
-    )
+    NodeBuilder().run(setup)
 
 
 if __name__ == "__main__":

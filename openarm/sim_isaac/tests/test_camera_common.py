@@ -319,6 +319,23 @@ class TestFrameIdCounter:
 
 
 class TestFramePacer:
+    def test_remaining_wait_does_not_initialize_the_schedule(self):
+        pacer = FramePacer(10)
+        assert pacer.seconds_until_due(0.0) == 0.0
+        assert pacer.seconds_until_due(100.0) == 0.0
+        assert pacer.take_if_due(100.0)
+        assert pacer.seconds_until_due(100.0) == pytest.approx(0.1)
+
+    def test_remaining_wait_does_not_claim_or_advance_a_deadline(self):
+        pacer = FramePacer(10)
+        assert pacer.take_if_due(100.0)
+        for _ in range(2):
+            assert pacer.seconds_until_due(100.04) == pytest.approx(0.06)
+            assert pacer.seconds_until_due(100.1) == 0.0
+            assert pacer.seconds_until_due(105.0) == 0.0
+        assert pacer.take_if_due(100.1)
+        assert pacer.seconds_until_due(100.1) == pytest.approx(0.1)
+
     def test_first_call_is_due(self):
         pacer = FramePacer(10)
         assert pacer.take_if_due(100.0)

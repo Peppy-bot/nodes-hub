@@ -1,0 +1,66 @@
+{
+  "repository": "enactic/openarm_description",
+  "revision": "14ff67b638ff1c738a1b9a6be8aaa5ce5ed2c831",
+  "license": {
+    "path": "LICENSE.txt",
+    "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+  },
+  "robot": {
+    "image": "peppybot/openarm-isaac-sim@sha256:9f211611ca550299cd8ae2c755a3f2cedd654bb453e5ed328e23f15518ebe195",
+    "layer_sha256": "134b50f295e6987db05dc5a5e875d9891ef239b7e7ae88771ed82741c1758668",
+    "directory": "/opt/robot_assets/openarm/isaac",
+    "files": {
+      "openarm_bimanual.usd": "a5b18e8292d70b7d7767c49137c7f4bc9eea2d697466be7d34bbb335f2b3478e",
+      "openarm_bimanual_v2.usd": "ba8e346c99e89d53680292248c2f182a1cd65a4c4dd67b024ee7ed1642db0173",
+      "configuration/openarm_bimanual_base.usd": "55d129950a453f859f1e795ab06b2c2d810f71e66051ca6d4f57ef0f0e887532",
+      "configuration/openarm_bimanual_physics.usd": "33f73a2426e232a514aad09139da527a4c645822a4fd59c851725567377fad94",
+      "configuration/openarm_bimanual_sensor.usd": "be7bed93ad1d4950223434004ffba28637f3bafaa47a746cafd4fd71ab60a8f0"
+    }
+  },
+  "meshes": {
+    "body_link0": {
+      "path": "assets/robot/openarm_v2.0/meshes/body/visual/body_link0.dae",
+      "sha256": "a05f59379dcf694e5ff336b1ee3a47ea504a2425a2fa774af1b14e096d9a239a"
+    },
+    "base_link": {
+      "path": "assets/robot/openarm_v2.0/meshes/arm/visual/base_link.dae",
+      "sha256": "91045167f515bf3f444411da1a39f07ccbccf28c14d5d2b023747f52dd247747"
+    },
+    "link1": {
+      "path": "assets/robot/openarm_v2.0/meshes/arm/visual/link1.dae",
+      "sha256": "f71982250a659b5739ad89c58d20b9e0c62b9ae20abe4a7139396fc0893567bc"
+    },
+    "link2": {
+      "path": "assets/robot/openarm_v2.0/meshes/arm/visual/link2.dae",
+      "sha256": "b456c646126e554d901bf7c1fd6e4f2e86a1a3ec15d8417d009a79ae9df55343"
+    },
+    "link3": {
+      "path": "assets/robot/openarm_v2.0/meshes/arm/visual/link3.dae",
+      "sha256": "7820857943ad07c50ab625c90a080d3333c14a71bc462fc1c49aca0875b5a74f"
+    },
+    "link4": {
+      "path": "assets/robot/openarm_v2.0/meshes/arm/visual/link4.dae",
+      "sha256": "60e8bc2f19163029b96f23c4a0573c88b83dec0f4e38dce41d1873702f3230c9"
+    },
+    "link5": {
+      "path": "assets/robot/openarm_v2.0/meshes/arm/visual/link5.dae",
+      "sha256": "ce0a6f4db874b540224298f90b04d504fa7ad91be6413dc861d55dbcb8f93863"
+    },
+    "link6": {
+      "path": "assets/robot/openarm_v2.0/meshes/arm/visual/link6.dae",
+      "sha256": "2d6d7d9352faf332b1668a034eb1550806cf738bcfcf08db0e5c9de58a381e11"
+    },
+    "ee_base_link": {
+      "path": "assets/end_effector/pinch_gripper/meshes/visual/ee_base_link.dae",
+      "sha256": "3b53e50a972320616bfa26067023346c2f596e1fd4608c5577f064c43240d344"
+    },
+    "finger_inner": {
+      "path": "assets/end_effector/pinch_gripper/meshes/visual/finger_inner.dae",
+      "sha256": "3b489024ffa2a6a0fd0e646da871cc88798d16756dcbd1322e3a617a9d556b04"
+    },
+    "finger_outer": {
+      "path": "assets/end_effector/pinch_gripper/meshes/visual/finger_outer.dae",
+      "sha256": "38ed7a80a8c7c21ef2a0adbf015d0747470c54d19a53adf12b6a41e2b2f97354"
+    }
+  }
+}
