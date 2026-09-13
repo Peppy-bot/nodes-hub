@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 async def setup(params, node_runner) -> list:
-    """Serve the WebRTC viewer for the node's lifetime."""
+    """Serve the WebRTC viewer and log its browser diagnostics."""
 
     del params
     server = ViewerServer(("0.0.0.0", 8210))
@@ -47,7 +47,10 @@ async def setup(params, node_runner) -> list:
         await shutdown()
         raise
 
-    logger.info("Isaac Sim browser WebRTC viewer listening on 0.0.0.0:8210")
+    logger.info(
+        "Isaac Sim browser WebRTC viewer listening on 0.0.0.0:8210; "
+        "browser warnings and errors are forwarded to this node log"
+    )
     return []
 
 

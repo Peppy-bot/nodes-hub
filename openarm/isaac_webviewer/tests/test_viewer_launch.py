@@ -189,11 +189,11 @@ def test_main_passes_setup_to_node_builder_and_configures_stream_logging(startup
     )
 
 
-def test_container_packages_the_server_beside_launch():
+def test_container_packages_server_and_browser_diagnostics_beside_launch():
     recipe = (_VIEWER_DIR / "apptainer.def").read_text()
     files_section = recipe.split("\n%files\n", 1)[1].split("\n%", 1)[0]
     packaged_files = {tuple(line.split()) for line in files_section.splitlines() if line.strip()}
-    for filename in ("launch.py", "viewer_server.py"):
+    for filename in ("launch.py", "viewer_server.py", "browser_logs.js"):
         assert (filename, f"/opt/openarm_isaac_webviewer/{filename}") in packaged_files
         assert (_VIEWER_DIR / filename).is_file()
     runscript = recipe.split("\n%runscript\n", 1)[1].split("\n%", 1)[0]
