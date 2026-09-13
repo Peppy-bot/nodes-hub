@@ -17,7 +17,7 @@ This branch is intended for reproducibility testing and community feedback. It p
 - Runtime task scenes:
   - `tabletop`
   - `shelf_reach`
-- OpenArm USD assets tracked with Git LFS
+- Detailed OpenArm v2 visual meshes with their embedded materials
 
 ## Requirements
 
@@ -26,7 +26,6 @@ Recommended host setup:
 - Ubuntu 24.04 LTS
 - NVIDIA GPU with the proprietary driver, 595.58.03 or newer
 - Peppy
-- Git LFS
 - 32 GB RAM recommended
 
 Isaac Sim base image:
@@ -243,25 +242,107 @@ openarm_sim_isaac/robots/openarm/_launcher.py
 
 Runtime task scenes are loaded on top of the base environment.
 
-## Git LFS
+## Robot visual assets
 
-The OpenArm USD assets are tracked with Git LFS:
+The Isaac base image downloads one complete, prepared bundle from the
+`isaac-sim-assets` R2 bucket. Its immutable versioned key and SHA-256 are pinned in
+`openarm/robot_initializer/scripts/isaac_assets.env`. The Docker build copies
+that file before downloading, so a pin change invalidates the asset layer's
+cache. It verifies the archive checksum before extraction and never falls back
+to a mutable asset directory. Node image builds and robot startup use only the
+baked files, with no GitHub access, asset conversion or conversion dependencies.
+
+The bundle contains:
+
+- `openarm_bimanual_v2.usd`, with its repaired visual references.
+- `openarm_v2_visuals.usdc`, referenced through relative paths by all 21 v2 links.
+- `openarm_bimanual.usd` and its three `configuration/` layers for v1.
+- `openarm_visual_sources.json`, with the upstream revision, input checksums and
+  original robot image digest.
+- `openarm_description.LICENSE.txt`, the upstream Apache-2.0 license.
+- `bundle_manifest.json`, with output checksums, tool versions, converter script
+  hashes and validation results.
+
+Each material-bearing mesh region keeps its source color, triangle topology,
+normals and scene transform. The body scale, mirrored left-arm frames and gripper
+offsets are retained. Link poses, joints, drives, masses and collision geometry
+are unchanged. Robot stage dependencies resolve within the bundle; the
+`OmniPBR.mdl` shader module is supplied locally by Isaac Sim.
+
+### Asset maintenance
+
+`scripts/build_visuals.py` and `scripts/prepare_assets.py` are CPU-only maintenance
+tools, not image-build steps. Preparation verifies every source stage, COLLADA
+mesh and the license, converts only the v2 visuals, and checks USD composition,
+material bindings, unchanged nonvisual specs and all attachment transforms.
+Archives have sorted entries and fixed timestamps, ownership and permissions.
+Preparation refuses to overwrite an existing output.
+
+From the repository root, extract the source stages from the digest pinned in
+`scripts/visual_sources.json`. Creating the source container does not run Isaac
+or require a GPU:
 
 ```bash
-git lfs install
-git lfs track 'openarm_sim_isaac/robot_assets/**/*.usd'
-git add .gitattributes
-git add openarm_sim_isaac/robot_assets
-git lfs ls-files
+source_image=$(python3 -c 'import json; print(json.load(open("openarm/sim_isaac/scripts/visual_sources.json"))["robot"]["image"])')
+source_container=$(docker create --platform linux/amd64 "$source_image")
+mkdir -p /tmp/openarm-isaac-source
+docker cp "$source_container:/opt/robot_assets/openarm/isaac/." /tmp/openarm-isaac-source/
+docker rm "$source_container"
+
+uv run --no-project --python 3.11 --with usd-core==26.5 \
+  --with-requirements openarm/sim_isaac/scripts/requirements-visuals.txt \
+  python openarm/sim_isaac/scripts/prepare_assets.py \
+  --source-dir /tmp/openarm-isaac-source \
+  --output /tmp/openarm-isaac-assets.tar.gz
 ```
 
-Expected `.gitattributes` rule:
+The tool downloads checksum-pinned DAEs from the immutable upstream revision.
+`--mesh-source-dir <directory>` instead accepts an offline directory containing
+`<mesh-name>.dae` files and verifies the same checksums. Only the five pinned
+source stages are copied; backup files are not bundled.
 
-```text
-openarm_sim_isaac/robot_assets/**/*.usd filter=lfs diff=lfs merge=lfs -text
+Publish the complete archive, not the visual library alone. Assign a bundle
+version and retain the archive's checksum in its object key. Conditional creation
+prevents overwriting an existing object:
+
+```bash
+bundle=/tmp/openarm-isaac-assets.tar.gz
+version=2
+checksum=$(sha256sum "$bundle" | cut -d ' ' -f 1)
+key="openarm/${version}/${checksum}.tar.gz"
+AWS_ACCESS_KEY_ID="$WALDO_R2_ACCESS_KEY_ID" \
+AWS_SECRET_ACCESS_KEY="$WALDO_R2_SECRET_ACCESS_KEY" \
+aws --endpoint-url "$WALDO_R2_JURISDICTION_ENDPOINT" s3api put-object \
+  --bucket isaac-sim-assets --key "$key" --body "$bundle" \
+  --if-none-match '*' --content-type application/gzip \
+  --cache-control 'public, max-age=31536000, immutable'
 ```
 
-`git lfs ls-files` may be empty until the matching USD files are staged or committed.
+Download the published object and verify its SHA-256 before setting
+`ISAAC_ASSETS_KEY` and `ISAAC_ASSETS_SHA256` in `isaac_assets.env`. Bump
+`ISAAC_IMAGE_REV` in `build_base_images.sh`, then use an authenticated Docker
+builder to publish the base image:
+
+```bash
+RCLONE_S3_ACCESS_KEY_ID="$WALDO_R2_ACCESS_KEY_ID" \
+RCLONE_S3_SECRET_ACCESS_KEY="$WALDO_R2_SECRET_ACCESS_KEY" \
+bash openarm/robot_initializer/scripts/build_base_images.sh --isaac-only
+```
+
+The publisher stamps the node's `From:` tag. Commit the pin and tag together,
+then restage the node with `peppy node add openarm/sim_isaac -sb --force`.
+
+Run the GPU-free regression suites from the repository root:
+
+```bash
+uv run --project openarm/sim_isaac/tests --locked --group dev \
+  pytest openarm/sim_isaac/tests
+```
+
+On Linux ARM64, PyPI has no `usd-core` distribution. The USD-specific test module
+is skipped there; the installer, camera, startup and timing suites still run.
+A native OpenUSD installation from conda-forge supports asset preparation and
+the USD tests on ARM64 without Isaac Sim or a GPU.
 
 ## Troubleshooting
 

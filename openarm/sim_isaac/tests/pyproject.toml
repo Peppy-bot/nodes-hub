@@ -4,13 +4,12 @@
 #
 # CI runs a python test project inside the image built from the apptainer.def
 # beside it, and gives a project with no def the scaffolded python base image.
-# There is no def here, which is what these suites want: they fake engine
-# runtimes, so pulling the multi-gigabyte Isaac Sim image to run pure-python
-# assertions would buy them nothing.
+# These suites use small USD fixtures and fake engine runtimes, without
+# pulling the multi-gigabyte Isaac Sim image or requiring a GPU.
 [project]
 name = "openarm-sim-isaac-tests"
 version = "0.1.0"
-description = "GPU-free tests for openarm_sim_isaac startup, loop pacing, cameras and clock"
+description = "GPU-free tests for openarm_sim_isaac visuals, startup, loop pacing, cameras and clock"
 # One minor, so every run resolves the same interpreter.
 requires-python = ">=3.11,<3.12"
 dependencies = [
@@ -24,7 +23,13 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["pytest>=8"]
+dev = [
+    "pytest>=8",
+    "pycollada==0.9.3",
+    # PyPI provides no USD wheel or source distribution for Linux ARM64.
+    # That platform runs the runtime suites without the USD-specific tests.
+    "usd-core==26.5; platform_machine == 'x86_64' or platform_machine == 'AMD64' or sys_platform == 'darwin'",
+]
 
 [tool.uv]
 # The suites reach the node's modules through sys.path, so this project has

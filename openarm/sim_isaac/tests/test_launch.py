@@ -3,6 +3,7 @@
 import builtins
 import ctypes
 import importlib.util
+import json
 import logging
 import sys
 import tomllib
@@ -283,15 +284,33 @@ def test_blank_public_ip_leaves_ice_address_selection_automatic(startup, monkeyp
     assert not any(arg.startswith(_STREAM_PREFIX + "publicIp=") for arg in state.argv)
 
 
-@pytest.mark.parametrize("hardware_version", ["v1", "v2"])
-def test_robot_asset_root_override_is_preserved(startup, monkeypatch, hardware_version):
+@pytest.mark.parametrize(
+    "hardware_version, filename",
+    [
+        ("v1", "openarm_bimanual.usd"),
+        ("V1", "openarm_bimanual.usd"),
+        ("v2", "openarm_bimanual_v2.usd"),
+    ],
+)
+def test_robot_asset_root_override_selects_a_bundled_stage(
+    startup, monkeypatch, hardware_version, filename
+):
     monkeypatch.setenv("PEPPY_ROBOT_ASSETS_DIR", "/opt/robot_assets/openarm/isaac")
     state = startup(hardware_version=hardware_version)
     state.module.main()
 
     assert state.sim_launcher.call_args.args[1] == Path(
-        f"/opt/robot_assets/openarm/isaac/openarm_bimanual_{hardware_version}.usd"
+        "/opt/robot_assets/openarm/isaac"
+    ) / filename
+    manifest = json.loads(
+        (_ROBOT_DIR.parents[1] / "scripts/visual_sources.json").read_text()
     )
+    assert filename in manifest["robot"]["files"]
+
+
+def test_scene_selection_rejects_unknown_hardware_without_a_fallback(startup):
+    with pytest.raises(ValueError, match="hardware_version"):
+        startup().module._scene_path("v3")
 
 
 def test_setup_failure_does_not_construct_isaac(startup):

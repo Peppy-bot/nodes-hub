@@ -47,18 +47,12 @@ def _version(hardware_version: str) -> str:
 
 
 def _scene_path(hardware_version: str) -> Path:
-    # The v1 and v2 scenes are separate USD files:
-    #
-    # openarm_bimanual_v1.usd
-    # openarm_bimanual_v2.usd
-    #
-    # A missing scene fails loudly rather than silently
-    # simulating a different hardware version.
-
-    return (
-        _ASSETS_DIR
-        / f"openarm_bimanual_{_version(hardware_version)}.usd"
-    )
+    # Each hardware version selects its own entrypoint in the prepared bundle.
+    filename = {
+        "v1": "openarm_bimanual.usd",
+        "v2": "openarm_bimanual_v2.usd",
+    }[_version(hardware_version)]
+    return _ASSETS_DIR / filename
 
 
 _ROBOTS_DIR = Path(__file__).resolve().parents[1]

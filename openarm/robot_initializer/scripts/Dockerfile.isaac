@@ -52,7 +52,7 @@ RUN ln -s "libnvidia-ngx.so.${NGX_DRIVER_VERSION}" /usr/lib/x86_64-linux-gnu/lib
 COPY scripts/requirements.isaac.txt /tmp/requirements.txt
 RUN /isaac-sim/python.sh -m pip install --no-cache-dir --retries 5 --timeout 180 -r /tmp/requirements.txt
 
-COPY scripts/download_assets.sh /tmp/download_assets.sh
+COPY scripts/download_assets.sh scripts/isaac_assets.env /tmp/
 RUN --mount=type=secret,id=rclone_key \
     --mount=type=secret,id=rclone_secret \
     RCLONE_S3_ACCESS_KEY_ID="$(cat /run/secrets/rclone_key)" \

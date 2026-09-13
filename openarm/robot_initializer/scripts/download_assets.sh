@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
-# Download robot assets from R2 into /tmp staging dirs.
-# Usage: download_assets.sh --variant <isaac|mujoco>
-# Called by Dockerfile.isaac and Dockerfile.mujoco during base image builds — not for contributors.
+# Download robot assets from R2 into staging directories.
+# Usage: download_assets.sh --variant <isaac|mujoco> [--output-dir <path>]
+# Called by Dockerfile.isaac and Dockerfile.mujoco during base image builds.
 # To rebuild base images: RCLONE_S3_ACCESS_KEY_ID=<key> RCLONE_S3_SECRET_ACCESS_KEY=<secret> bash scripts/build_base_images.sh
 set -euo pipefail
 
 VARIANT=""
+OUTPUT_DIR=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --variant) VARIANT="$2"; shift 2 ;;
+        --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
         *) echo "ERROR: unknown argument: $1" >&2; exit 1 ;;
     esac
 done
@@ -37,9 +39,31 @@ _rclone() {
     rclone "$@"
 }
 
+OUTPUT_DIR="${OUTPUT_DIR:-/tmp/.peppy_robot_initializer_${VARIANT}}"
 echo "==> Downloading ${VARIANT} assets..."
-rm -rf "/tmp/.peppy_robot_initializer_${VARIANT}"
-mkdir -p "/tmp/.peppy_robot_initializer_${VARIANT}"
-_rclone copy "r2:${BUCKET}/openarm01/${VARIANT}/assets/" "/tmp/.peppy_robot_initializer_${VARIANT}/" --progress
+if [[ "$VARIANT" == "isaac" ]]; then
+    source "$(dirname "${BASH_SOURCE[0]}")/isaac_assets.env"
+    BUCKET="${ISAAC_ASSETS_BUCKET:?ISAAC_ASSETS_BUCKET must be set}"
+    ENDPOINT="${ISAAC_ASSETS_ENDPOINT:?ISAAC_ASSETS_ENDPOINT must be set}"
+    if [[ "${ISAAC_ASSETS_KEY:?ISAAC_ASSETS_KEY must be set}" != *.tar.gz \
+        || ! "${ISAAC_ASSETS_SHA256:?ISAAC_ASSETS_SHA256 must be set}" =~ ^[0-9a-f]{64}$ ]]; then
+        echo "ERROR: Isaac assets require a pinned .tar.gz key and SHA-256 checksum" >&2
+        exit 1
+    fi
+
+    SCRATCH="$(mktemp -d)"
+    trap 'rm -rf "$SCRATCH"' EXIT
+    ARCHIVE="${SCRATCH}/isaac-assets.tar.gz"
+    _rclone copyto "r2:${BUCKET}/${ISAAC_ASSETS_KEY}" "$ARCHIVE" --progress
+    printf '%s  %s\n' "$ISAAC_ASSETS_SHA256" "$ARCHIVE" | sha256sum -c -
+
+    rm -rf "$OUTPUT_DIR"
+    mkdir -p "$OUTPUT_DIR"
+    tar -xzf "$ARCHIVE" -C "$OUTPUT_DIR"
+else
+    rm -rf "$OUTPUT_DIR"
+    mkdir -p "$OUTPUT_DIR"
+    _rclone copy "r2:${BUCKET}/openarm01/${VARIANT}/assets/" "${OUTPUT_DIR}/" --progress
+fi
 
 echo "==> Done."
