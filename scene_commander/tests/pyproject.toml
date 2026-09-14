@@ -13,3 +13,7 @@ dev = ["pytest>=8"]
 
 [tool.uv]
 package = false
+
+[tool.pytest.ini_options]
+# The commander's own modules, imported from the source tree.
+pythonpath = ["../src"]

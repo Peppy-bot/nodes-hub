@@ -78,13 +78,18 @@
     },
 
     parameters: {
+      // Where the scene panel is served. http_host is a literal IP address,
+      // not a hostname. http_port is the port the panel prefers: a copy whose
+      // port another process already holds serves on one the operating system
+      // picks and logs the address it took, so two copies on a host both come
+      // up.
       http_host: {
         $type: "string",
         $default: "0.0.0.0",
       },
 
       http_port: {
-        $type: "u32",
+        $type: "u16",
         $default: 8766,
       },
     },

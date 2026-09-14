@@ -104,6 +104,20 @@ def commander(monkeypatch):
     return SimpleNamespace(module=module, services=services, actions=actions)
 
 
+class _FakeListener:
+    """A bound socket, for the wiring around it; the real one is in test_http_port."""
+
+    def __init__(self, host, port):
+        self._name = (host, port)
+
+    def getsockname(self):
+        return self._name
+
+
+def _parameters(http_port, http_host="0.0.0.0"):
+    return SimpleNamespace(http_host=http_host, http_port=http_port)
+
+
 def _busy():
     return SimpleNamespace(success=False, message=_BUSY, assets_json="[]")
 
@@ -251,28 +265,51 @@ def test_invalid_input_is_a_400_that_never_reaches_the_provider(commander, caplo
 def test_setup_tolerates_a_provider_without_catalogue_but_not_an_unreachable_one(commander, caplog, monkeypatch):
     caplog.set_level(logging.INFO)
     served = []
+    # The socket reports a different port from the one configured, which is
+    # what a fallback looks like: the log must follow the socket.
+    listener = _FakeListener("127.0.0.1", 9100)
 
-    async def fake_server(node_runner, host, port, catalogue):
-        served.append((host, port, type(catalogue)))
+    monkeypatch.setattr(commander.module.listen, "bind_listener", lambda *bound: listener)
 
-    monkeypatch.setattr(commander.module, "_run_http_server", fake_server)
+    async def fake_server(app, bound):
+        served.append((bound, {route.resource.canonical for route in app.router.routes()}))
+        return asyncio.create_task(asyncio.sleep(0))
+
+    monkeypatch.setattr(commander.module.listen, "start_serving", fake_server)
     commander.services.get_assets_list.answers = [_busy()]
 
     async def run():
-        await asyncio.gather(*await commander.module.setup({"http_port": 9000}, object()))
+        await asyncio.gather(*await commander.module.setup(_parameters(9000, "127.0.0.1"), object()))
 
     asyncio.run(run())
-    assert served == [("0.0.0.0", 9000, commander.module._CatalogueWatch)]
+    [(bound, routes)] = served
+    assert bound is listener
+    assert routes >= {"/", "/api/assets", "/api/scene/load"}
     assert _node_log(commander, caplog) == [
         (logging.INFO, "Scene commander starting", None),
+        # The bound address reaches the operator here and nowhere else, and
+        # the socket is taken before the provider is waited on.
+        (logging.INFO, "Scene panel at http://127.0.0.1:9100 (bound 127.0.0.1:9100)", None),
         (logging.INFO, f"Scene provider has no catalogue yet: {_BUSY}", None),
         (logging.INFO, "Scene provider reachable: 0 runtime objects", None),
     ]
 
     commander.services.get_objects_list.answers = [TimeoutError("get_objects_list timed out")]
     with pytest.raises(TimeoutError, match="get_objects_list timed out"):
-        asyncio.run(commander.module.setup({}, object()))
+        asyncio.run(commander.module.setup(_parameters(9000, "127.0.0.1"), object()))
     assert len(served) == 1
+
+
+def test_setup_refuses_a_launch_it_cannot_serve_and_starts_no_server(commander, monkeypatch):
+    # A node that never binds must fail its launch, not stand ready with
+    # nothing listening.
+    served = []
+    monkeypatch.setattr(commander.module.listen, "start_serving", lambda *started: served.append(started))
+
+    with pytest.raises(ValueError, match="http_host"):
+        asyncio.run(commander.module.setup(_parameters(9000, http_host="localhost"), object()))
+
+    assert served == [], "a commander that cannot serve must start no server"
 
 
 def test_http_server_keeps_browser_requests_out_of_the_log(commander, monkeypatch):
@@ -292,20 +329,21 @@ def test_http_server_keeps_browser_requests_out_of_the_log(commander, monkeypatc
             self.cleaned = True
 
     class FakeSite:
-        def __init__(self, runner, host, port):
-            sites.append((runner, host, port))
+        def __init__(self, runner, sock):
+            sites.append((runner, sock))
 
         async def start(self):
             started.set()
 
+    listener = _FakeListener("127.0.0.1", 8766)
     monkeypatch.setattr(commander.module.web, "AppRunner", FakeRunner)
-    monkeypatch.setattr(commander.module.web, "TCPSite", FakeSite)
+    monkeypatch.setattr(commander.module.web, "SockSite", FakeSite)
 
     async def run():
-        task = asyncio.create_task(commander.module._run_http_server(
-            object(), "127.0.0.1", 8766, commander.module._CatalogueWatch(),
-        ))
-        await started.wait()
+        task = await commander.module.listen.start_serving(
+            commander.module._build_app(object(), commander.module._CatalogueWatch()), listener,
+        )
+        assert started.is_set(), "serving starts before the node is reported ready"
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -314,6 +352,6 @@ def test_http_server_keeps_browser_requests_out_of_the_log(commander, monkeypatc
     [(app, options)] = runners
     assert options == {"access_log": None}
     assert {route.resource.canonical for route in app.router.routes()} >= {"/", "/api/assets", "/api/scene/load"}
-    [(runner, host, port)] = sites
-    assert (host, port) == ("127.0.0.1", 8766)
+    [(runner, sock)] = sites
+    assert sock is listener
     assert runner.cleaned
