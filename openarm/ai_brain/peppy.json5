@@ -1,6 +1,6 @@
 // openarm_ai_brain: the OpenArm implementer of item_perception and
-// item_manipulation, the contracts that find an item, pick it up, and put it
-// down. This manifest claims every member of both and depends on
+// item_manipulation, the contracts that scan for items, find one, pick it
+// up, and put it down. This manifest claims every member of both and depends on
 // limb_motion, the backbone's discrete arm and gripper moves; the launcher
 // binds that slot to the instance that governs the arms, so any move sent
 // through it is collision governed on the way down. The node boots and
@@ -23,6 +23,7 @@
   interfaces: {
     actions: {
       exposes: [
+        { link_id: "item_perception", name: "scan_items" },
         { link_id: "item_perception", name: "identify_item" },
         { link_id: "item_manipulation", name: "grab_item" },
         { link_id: "item_manipulation", name: "drop_item" },
