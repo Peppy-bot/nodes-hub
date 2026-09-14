@@ -1,7 +1,7 @@
 # openarm_web_commander
 
 The browser control panel for the OpenArm (either hardware generation). It serves
-a page on port 8765 with three interaction modes:
+a page on port 8765 by default, with three interaction modes:
 
 - **Streaming**: deadman-gated live control. Enabling a side streams its arm and
   gripper setpoints continuously on that side's joint_link / gripper_link
@@ -75,10 +75,15 @@ peppy node run openarm_web_commander:v1 \
     --link observed_right_gripper@right_gripper_inst
 ```
 
-Then open **http://localhost:8765**. The page reconnects automatically if the
-node restarts; the `http_port` parameter moves the panel and
-`http_host=127.0.0.1` restricts it to loopback (they default to 8765 on every
-interface). A gripper that reports effort control (v2's POS_FORCE force cap)
+Then open **http://localhost:8765**. `http_port` is the port the panel
+prefers: when another process already holds it, as a second copy of this
+commander on one host does, the panel takes a port from the operating system
+and logs the address it is serving on. `http_host` is a literal IP address;
+set it to `127.0.0.1` to restrict the panel to loopback. The page reconnects
+automatically if the node restarts on the same port, and shows `disconnected`
+if it came back on another one (see **The panel is not on port 8765**).
+
+A gripper that reports effort control (v2's POS_FORCE force cap)
 adds a **max effort** slider under its opening
 slider, bounded by the gripper's reported ceiling and applied to both streamed
 openings and discrete moves; grippers without effort control (v1, the sims)
@@ -98,7 +103,15 @@ for the badge to flip back to idle (or press Stop) before firing again.
 Its sides must be disabled, idle, and measured: turn off streaming for the
 involved arms and wait for state feedback to arrive.
 
-**Port 8765 is already in use**
-A previous instance is still running. Find it with `peppy stack list` and stop
-it with `peppy node stop <instance_id>`, or launch this instance with a
-different `http_port`.
+**The panel is not on port 8765**
+Another process holds it, so the panel took one from the operating system. Its
+startup log names the address:
+
+```bash
+peppy node info openarm_web_commander:v1     # prints each instance's run log path
+grep 'operator panel at' ~/.peppy/logs/run/<instance_id>.log
+```
+
+To put it back on a fixed port, find whatever holds 8765 (`peppy stack list`
+for another instance, and `peppy node stop <instance_id>` to stop it) or launch
+this instance with a different `http_port`.
