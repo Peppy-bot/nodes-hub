@@ -575,8 +575,8 @@ A normal interactive session is:
 | Service | Port | Purpose |
 |---|---:|---|
 | Isaac Viewer | 8210/TCP | Browser interface |
-| `openarm_web_commander` | 8765/TCP | Arm and gripper control |
-| Scene Commander | 8766/TCP | Scene/object/physics control |
+| `openarm_web_commander` | 8765/TCP (preferred) | Arm and gripper control |
+| Scene Commander | 8766/TCP (preferred) | Scene/object/physics control |
 | WebRTC Signalling | 49100/TCP | Isaac WebRTC signalling |
 | WebRTC Stream | 47998/UDP | Isaac WebRTC media |
 
@@ -632,8 +632,18 @@ Not an error. The requested angle was beyond that joint's physical range, so the
 **The Isaac stream is a black screen**
 Stop the stack, clear the shader cache with `rm -rf ~/.cache/isaac-sim`, and launch again.
 
-**Port 8765 or 8080 is already in use**
+**Port 8080 is already in use**
 An older instance is still running. Find it with `peppy stack list` and stop it with `peppy node stop <instance_id>`.
+
+**A commander panel is not on 8765 or 8766**
+Both commanders prefer their configured port and take one from the operating
+system when another process holds it, so a second copy on a host comes up on a
+port of its own. Each logs the address it took:
+
+```bash
+peppy node info openarm_web_commander:v1     # or scene_commander:v1
+grep 'panel at' ~/.peppy/logs/run/<instance_id>.log
+```
 
 ## Adding an item to this repository
 
