@@ -1,11 +1,13 @@
-// HTTP+WS UI on the address the launcher gives (http_host:http_port). The WS
-// exposes unauthenticated motion control, so only run on a trusted network;
-// bind http_host to 127.0.0.1 to restrict it to loopback.
+// HTTP+WS UI on http_host, on http_port when it is free and on an
+// operating-system port otherwise. The WS exposes unauthenticated motion
+// control, so only run on a trusted network; bind http_host to 127.0.0.1 to
+// restrict it to loopback.
 //
 // This is only the transport: every text frame is decoded to a [`Command`] and sent to
 // the state owner, and every snapshot the owner publishes is forwarded to the browser.
 // The owner (see [`crate::owner`]) is the sole reader/writer of `UiState`.
 
+use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
@@ -19,11 +21,15 @@ use peppylib::runtime::CancellationToken;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
-use tracing::{info, warn};
+use tracing::warn;
 
 use crate::gestures::Registry;
 use crate::owner::UiMsg;
 use crate::pose::{ArmModels, JogMode, Pose};
+use crate::state::{
+    ARM_DOF, Alert, ArmTarget, Disposition, GesturePhase, GripperTarget, HealthLevel, HealthReport,
+    Proximity, Side, UiState,
+};
 
 /// A second `init_limits` call, which would be a second generation's ranges
 /// arriving after the first were already handed out.
@@ -31,24 +37,36 @@ use crate::pose::{ArmModels, JogMode, Pose};
 #[error("init_limits must run exactly once")]
 pub struct LimitsAlreadySet;
 
-/// Why the operator panel stopped serving. Both are `io::Error`, so each names
-/// which of the two steps produced it rather than sharing one label.
+/// Why the operator panel never opened, or stopped serving. Every variant
+/// wraps an `io::Error` and names the step that produced it.
 #[derive(Debug, thiserror::Error)]
 pub enum UiError {
-    #[error("bind the commander UI to {addr}: {source}")]
+    #[error(
+        "bind the operator panel to {addr}: {source}. Set http_host and http_port to an address this machine can serve."
+    )]
     Bind {
         addr: SocketAddr,
         #[source]
         source: std::io::Error,
     },
 
-    #[error("serve the commander UI: {0}")]
+    #[error(
+        "bind the operator panel to a port chosen by the operating system, after {preferred} was already in use: {source}. Free ports on this host, or set http_port to one this machine can bind."
+    )]
+    Fallback {
+        preferred: SocketAddr,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error(
+        "read back the address the operator panel bound: {0}. Set http_host and http_port to an address this machine can serve."
+    )]
+    BoundAddress(#[source] std::io::Error),
+
+    #[error("serve the operator panel: {0}")]
     Serve(#[source] std::io::Error),
 }
-use crate::state::{
-    ARM_DOF, Alert, ArmTarget, Disposition, GesturePhase, GripperTarget, HealthLevel, HealthReport,
-    Proximity, Side, UiState,
-};
 
 // The backbone publishes the proximity readout at ~20 Hz; treat it as stale after this
 // long with no update (a dead backbone) so the panel falls back to n/a instead of
@@ -61,6 +79,10 @@ const PROXIMITY_STALE_AFTER: Duration = Duration::from_millis(500);
 const STARTUP_GRACE: Duration = Duration::from_secs(3);
 
 const INDEX_HTML: &str = include_str!("../static/index.html");
+
+// Binding this port has the operating system choose a free one, which is what
+// the panel falls back to when the launcher's port is already taken.
+pub const ANY_PORT: u16 = 0;
 
 // Joint ranges from the generation's bundled URDF plus the unitless gripper
 // opening range; the single source for slider bounds (via the WS snapshot) and
@@ -125,33 +147,87 @@ struct AppState {
     token: CancellationToken,
 }
 
-pub async fn run(
-    addr: SocketAddr,
-    command_tx: mpsc::Sender<UiMsg>,
-    snapshot_rx: watch::Receiver<String>,
-    token: CancellationToken,
-) -> std::result::Result<(), UiError> {
-    let app_state = AppState {
-        command_tx,
-        snapshot_rx,
-        token: token.clone(),
-    };
-    let app = Router::new()
-        .route("/", get(index))
-        .route("/ws", get(ws_upgrade))
-        .with_state(app_state);
+/// The address an operator opens to reach a panel bound to `address`.
+///
+/// A panel bound to every interface answers on loopback too, which is the
+/// name that works in a browser on every platform.
+pub fn panel_url(address: SocketAddr) -> String {
+    if address.ip().to_canonical().is_unspecified() {
+        return format!("http://localhost:{}", address.port());
+    }
 
-    let listener = TcpListener::bind(addr)
-        .await
-        .map_err(|source| UiError::Bind { addr, source })?;
-    info!("commander UI at http://{addr}");
+    format!("http://{address}")
+}
 
-    let shutdown_token = token.clone();
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move { shutdown_token.cancelled().await })
-        .await
-        .map_err(UiError::Serve)?;
-    Ok(())
+/// The panel's listening socket, and the address it answers on.
+///
+/// Holding the bound socket is what makes the address true: it is taken before
+/// the node reports ready and stays owned until [`Panel::serve`] returns, so
+/// nothing between the two can claim the port the operator was told about.
+#[derive(Debug)]
+pub struct Panel {
+    listener: TcpListener,
+    address: SocketAddr,
+}
+
+impl Panel {
+    /// Take `preferred`, or a port the operating system picks on the same host
+    /// address when another process already holds `preferred`. [`ANY_PORT`]
+    /// asks for an operating-system port outright; the node refuses it as a
+    /// launch parameter, in [`crate::node`], before it reaches here.
+    ///
+    /// Only a port conflict falls back. A mistyped host, a privileged port, or
+    /// any other bind failure is returned, so it reaches the operator as a
+    /// refusal naming what to fix.
+    pub async fn bind(preferred: SocketAddr) -> std::result::Result<Self, UiError> {
+        let listener = match TcpListener::bind(preferred).await {
+            Ok(listener) => listener,
+            Err(source) if source.kind() == ErrorKind::AddrInUse => {
+                warn!("{preferred} is already in use; taking a port from the operating system");
+                TcpListener::bind(SocketAddr::new(preferred.ip(), ANY_PORT))
+                    .await
+                    .map_err(|source| UiError::Fallback { preferred, source })?
+            }
+            Err(source) => {
+                return Err(UiError::Bind {
+                    addr: preferred,
+                    source,
+                });
+            }
+        };
+        let address = listener.local_addr().map_err(UiError::BoundAddress)?;
+        Ok(Self { listener, address })
+    }
+
+    /// Where the panel is answering: the address every log line and browser URL
+    /// is built from.
+    pub fn address(&self) -> SocketAddr {
+        self.address
+    }
+
+    /// Serve the panel on the bound socket until the token is cancelled.
+    pub async fn serve(
+        self,
+        command_tx: mpsc::Sender<UiMsg>,
+        snapshot_rx: watch::Receiver<String>,
+        token: CancellationToken,
+    ) -> std::result::Result<(), UiError> {
+        let app_state = AppState {
+            command_tx,
+            snapshot_rx,
+            token: token.clone(),
+        };
+        let app = Router::new()
+            .route("/", get(index))
+            .route("/ws", get(ws_upgrade))
+            .with_state(app_state);
+
+        axum::serve(self.listener, app)
+            .with_graceful_shutdown(async move { token.cancelled().await })
+            .await
+            .map_err(UiError::Serve)?;
+        Ok(())
+    }
 }
 
 async fn index() -> impl IntoResponse {
@@ -857,6 +933,12 @@ mod tests {
         ArmHealth, GripperHealth, HEALTH_STALE_AFTER, MotorHealthReading, Validity,
     };
 
+    // A panel that has not answered within this is not going to.
+    const REPLY_BUDGET: Duration = Duration::from_secs(5);
+
+    // Copies of one robot, all preferring one port.
+    const COPIES: usize = 4;
+
     /// Tests have no main() to run init_limits, so resolve the v2 limits on
     /// first use; concurrent tests settle benignly through get_or_init.
     fn init_limits_for_tests() {
@@ -1271,5 +1353,277 @@ mod tests {
         }
         let [lo, hi] = joint_limits().gripper;
         assert!(lo < hi, "gripper range [{lo}, {hi}] must be non-empty");
+    }
+
+    // -- the panel's socket ------------------------------------------------
+
+    /// A listener on a free port, standing in for whatever else on the host
+    /// holds the port a launcher asked for.
+    async fn holder() -> (TcpListener, SocketAddr) {
+        let listener = TcpListener::bind(loopback(ANY_PORT))
+            .await
+            .expect("an operating-system port is always available");
+        let addr = listener
+            .local_addr()
+            .expect("a bound listener has an address");
+        (listener, addr)
+    }
+
+    fn loopback(port: u16) -> SocketAddr {
+        SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port)
+    }
+
+    /// The panel answers a plain GET on its bound address, so a port is only
+    /// reported once something is actually serving there.
+    async fn get_index(addr: SocketAddr) -> String {
+        tokio::time::timeout(REPLY_BUDGET, get_index_inner(addr))
+            .await
+            .unwrap_or_else(|_| panic!("the panel at {addr} must answer a GET"))
+    }
+
+    async fn get_index_inner(addr: SocketAddr) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("the panel accepts connections on the address it reports");
+        stream
+            .write_all(
+                format!("GET / HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes(),
+            )
+            .await
+            .expect("write the request");
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .await
+            .expect("read the response");
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    /// A panel serving until [`Serving::shut_down`] is awaited. The channel
+    /// senders ride along so the panel's receivers stay open under test.
+    struct Serving {
+        address: SocketAddr,
+        token: CancellationToken,
+        server: tokio::task::JoinHandle<std::result::Result<(), UiError>>,
+        _command_rx: mpsc::Receiver<UiMsg>,
+        _snapshot_tx: watch::Sender<String>,
+    }
+
+    impl Serving {
+        fn start(panel: Panel) -> Self {
+            let (command_tx, _command_rx) = mpsc::channel(1);
+            let (_snapshot_tx, snapshot_rx) = watch::channel(String::new());
+            let token = CancellationToken::new();
+            let address = panel.address();
+            let server = tokio::spawn(panel.serve(command_tx, snapshot_rx, token.clone()));
+            Self {
+                address,
+                token,
+                server,
+                _command_rx,
+                _snapshot_tx,
+            }
+        }
+
+        /// Stop serving and wait for the server to finish, which is when the
+        /// socket is released.
+        async fn shut_down(self) {
+            self.token.cancel();
+            self.server
+                .await
+                .expect("the server task runs")
+                .expect("a cancelled panel stops cleanly");
+        }
+    }
+
+    #[test]
+    fn a_panel_on_every_interface_is_reported_on_localhost() {
+        // 0.0.0.0 is what the manifest defaults to, and it is not an address
+        // a browser opens.
+        assert_eq!(
+            panel_url(SocketAddr::new(
+                std::net::Ipv4Addr::UNSPECIFIED.into(),
+                8765
+            )),
+            "http://localhost:8765"
+        );
+        assert_eq!(
+            panel_url(SocketAddr::new(
+                std::net::Ipv6Addr::UNSPECIFIED.into(),
+                8765
+            )),
+            "http://localhost:8765"
+        );
+        assert_eq!(
+            panel_url(SocketAddr::new("::ffff:0.0.0.0".parse().unwrap(), 8765)),
+            "http://localhost:8765",
+            "an IPv4-mapped wildcard is a wildcard"
+        );
+        assert_eq!(
+            panel_url(loopback(8765)),
+            "http://127.0.0.1:8765",
+            "an address the operator chose is reported as it was given"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn copies_racing_for_a_free_port_all_survive() {
+        // No holder: the copies contend for the preferred port with each
+        // other, so whoever loses the bind must fall back rather than fail.
+        let preferred = {
+            let (listener, addr) = holder().await;
+            drop(listener);
+            addr
+        };
+
+        let panels = bind_concurrently(COPIES, preferred).await;
+        let ports: std::collections::BTreeSet<u16> =
+            panels.iter().map(|p| p.address().port()).collect();
+        assert_eq!(
+            ports.len(),
+            COPIES,
+            "every copy needs its own socket: {ports:?}"
+        );
+        assert!(
+            ports.contains(&preferred.port()),
+            "one copy must win the port they all prefer: {ports:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_preferred_port_is_the_one_taken() {
+        // Free a port this process just held, so the preference under test is
+        // a port this host allowed a moment ago.
+        let (listener, addr) = holder().await;
+        drop(listener);
+
+        let panel = Panel::bind(addr).await.expect("a free port binds");
+        assert_eq!(panel.address(), addr);
+    }
+
+    #[tokio::test]
+    async fn a_held_port_moves_the_panel_and_leaves_the_holder_serving() {
+        let (listener, addr) = holder().await;
+
+        let panel = Panel::bind(addr).await.expect("a held port falls back");
+        assert_ne!(
+            panel.address().port(),
+            addr.port(),
+            "the panel must not claim the port another process holds"
+        );
+        assert_eq!(panel.address().ip(), addr.ip(), "only the port moves");
+
+        // The panel answers where it moved to.
+        let serving = Serving::start(panel);
+        assert!(get_index(serving.address).await.starts_with("HTTP/1.1 200"));
+
+        // The holder is untouched: it still accepts on the port it owns.
+        let connected = tokio::net::TcpStream::connect(addr);
+        let accepted = tokio::time::timeout(REPLY_BUDGET, listener.accept());
+        let (accepted, connected) = tokio::join!(accepted, connected);
+        accepted
+            .expect("the holder must still be accepting on its port")
+            .expect("the holder still owns its port");
+        connected.expect("and still accepts connections");
+
+        serving.shut_down().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_copies_each_serve_their_own_socket() {
+        let (_listener, addr) = holder().await;
+
+        // Every copy prefers the held port, as copies of one robot launcher do.
+        let panels = bind_concurrently(COPIES, addr).await;
+        let ports: std::collections::BTreeSet<u16> =
+            panels.iter().map(|p| p.address().port()).collect();
+        assert_eq!(
+            ports.len(),
+            COPIES,
+            "every copy needs its own socket: {ports:?}"
+        );
+        assert!(
+            !ports.contains(&addr.port()),
+            "no copy may take the held port"
+        );
+
+        for panel in panels {
+            let serving = Serving::start(panel);
+            assert!(
+                get_index(serving.address).await.starts_with("HTTP/1.1 200"),
+                "every copy serves its own panel at {}",
+                serving.address
+            );
+            serving.shut_down().await;
+        }
+    }
+
+    /// Bind `count` panels at once, all preferring `addr`.
+    async fn bind_concurrently(count: usize, addr: SocketAddr) -> Vec<Panel> {
+        let together = std::sync::Arc::new(tokio::sync::Barrier::new(count));
+        let binds: Vec<_> = (0..count)
+            .map(|_| {
+                let together = together.clone();
+                tokio::spawn(async move {
+                    together.wait().await;
+                    Panel::bind(addr).await
+                })
+            })
+            .collect();
+        let mut panels = Vec::with_capacity(count);
+        for bind in binds {
+            panels.push(
+                bind.await
+                    .expect("the bind task runs")
+                    .expect("a held port falls back"),
+            );
+        }
+        panels
+    }
+
+    #[tokio::test]
+    async fn a_failure_that_is_not_a_conflict_is_refused() {
+        // TEST-NET-1 is not an address of this host, so the bind fails for a
+        // reason no other port can fix.
+        let unbindable = SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1)),
+            34567,
+        );
+        if TcpListener::bind(unbindable).await.is_ok() {
+            panic!(
+                "this host permits binding {unbindable} (ip_nonlocal_bind), so the refusal path cannot be exercised here"
+            );
+        }
+        let refused = Panel::bind(unbindable)
+            .await
+            .expect_err("an address this host does not hold cannot be served");
+        assert!(
+            matches!(refused, UiError::Bind { addr, .. } if addr == unbindable),
+            "the refusal must name the address that failed, got: {refused}"
+        );
+        assert!(
+            refused.to_string().contains("http_host and http_port"),
+            "the refusal must name the parameters to change, got: {refused}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stopped_panel_releases_its_port() {
+        let panel = Panel::bind(loopback(ANY_PORT))
+            .await
+            .expect("an operating-system port is always available");
+        let serving = Serving::start(panel);
+        let served = serving.address;
+        assert!(get_index(served).await.starts_with("HTTP/1.1 200"));
+
+        serving.shut_down().await;
+
+        // A copy that leaves the stack gives its port back, so the one that
+        // rejoins can take it.
+        let rebound = Panel::bind(served)
+            .await
+            .expect("the released port binds again");
+        assert_eq!(rebound.address(), served);
     }
 }

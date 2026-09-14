@@ -11,7 +11,7 @@ use control_core::time::{RateOutOfRange, period_from_hz};
 use openarm_description::HardwareVersion;
 use peppygen::{NodeRunner, Parameters, Result};
 use tokio::sync::{mpsc, watch};
-use tracing::error;
+use tracing::{error, info};
 
 use crate::alerts;
 use crate::collision_status;
@@ -50,8 +50,12 @@ pub enum NodeError {
     #[error("parameter command_rate_hz")]
     CommandRate(#[source] RateOutOfRange),
 
-    #[error("parameter http_host is not an IP address")]
-    HttpHost(#[source] AddrParseError),
+    #[error("parameter http_host must be an IP address, not {value:?}")]
+    HttpHost {
+        value: String,
+        #[source]
+        source: AddrParseError,
+    },
 
     #[error("parameter http_port must name a port to serve on, not 0")]
     HttpPort,
@@ -73,6 +77,9 @@ pub enum NodeError {
 
     #[error("the operator panel stopped: {0}")]
     Ui(&'static str),
+
+    #[error(transparent)]
+    Panel(#[from] ui::UiError),
 
     #[error("governor band must satisfy 0 < d_stop ({d_stop}) < d_safe ({d_safe}), both finite")]
     GovernorBand { d_stop: f64, d_safe: f64 },
@@ -164,10 +171,16 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     let command_period =
         period_from_hz(params.command_rate_hz, MAX_RATE_HZ).map_err(NodeError::CommandRate)?;
 
-    // Where the panel listens. Resolved before anything is spawned so a
-    // mistyped address is a refusal naming the parameter, not a bind failure
-    // from a task the daemon has already called ready.
-    let panel_addr = panel_address(&params)?;
+    // The panel's socket, owned before anything is spawned: a launch this
+    // node cannot serve is refused here, while the daemon is still waiting for
+    // setup. The launcher's port is preferred; a copy whose port another
+    // process holds serves on one the operating system picks.
+    let panel = ui::Panel::bind(panel_address(&params)?).await?;
+    info!(
+        "operator panel at {} (bound {})",
+        ui::panel_url(panel.address()),
+        panel.address()
+    );
 
     // The state owner is the one task that touches UiState; everything else holds a
     // channel end. Commands flow in from the WS, feedback in from the state streams
@@ -233,7 +246,7 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         },
     ));
 
-    // ui::run is the long-lived HTTP + WebSocket server. It must be spawned rather
+    // Panel::serve is the long-lived HTTP + WebSocket server. It must be spawned rather
     // than awaited here: peppylib registers `node_health` only after the setup
     // closure returns, so awaiting a forever-task starves the health probe and the
     // daemon SIGKILLs the instance after ~10s.
@@ -241,7 +254,7 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     // reach the owner. Record the fault and cancel the node so the daemon
     // restarts it, instead of standing ready with nothing listening.
     tokio::spawn(async move {
-        if let Err(e) = ui::run(panel_addr, command_tx, snapshot_rx, token.clone()).await {
+        if let Err(e) = panel.serve(command_tx, snapshot_rx, token.clone()).await {
             error!("operator panel stopped: {e}; cancelling the node");
             let _ = UI_FAILED.set(e.to_string());
             token.cancel();
@@ -250,11 +263,18 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     Ok(())
 }
 
-/// The panel's listen address. Port 0 is refused: an operator panel on an
-/// ephemeral port is one nobody can reach at the address they were given.
+/// The panel's preferred listen address. Port 0 is refused: the launcher names
+/// the port operators are sent to, and [`ui::Panel::bind`] takes one from the
+/// operating system only when that port is already held.
 fn panel_address(params: &Parameters) -> NodeResult<SocketAddr> {
-    let host: IpAddr = params.http_host.parse().map_err(NodeError::HttpHost)?;
-    (params.http_port != 0)
+    let host: IpAddr = params
+        .http_host
+        .parse()
+        .map_err(|source| NodeError::HttpHost {
+            value: params.http_host.clone(),
+            source,
+        })?;
+    (params.http_port != ui::ANY_PORT)
         .then(|| SocketAddr::new(host, params.http_port))
         .ok_or(NodeError::HttpPort)
 }
@@ -280,7 +300,7 @@ mod tests {
     }
 
     #[test]
-    fn the_panel_serves_the_launcher_s_address() {
+    fn the_panel_prefers_the_launcher_s_address() {
         let addr = panel_address(&Parameters {
             http_host: "127.0.0.1".to_string(),
             http_port: 18765,
@@ -307,8 +327,9 @@ mod tests {
 
     #[test]
     fn port_zero_is_refused_by_name() {
-        // Port 0 binds an ephemeral port: the panel would come up somewhere
-        // the operator was never told about.
+        // Port 0 asks for an operating-system port on every launch. The node
+        // takes one only when the launcher's port is already held, and logs
+        // where it landed.
         let refused = panel_address(&Parameters {
             http_port: 0,
             ..params()

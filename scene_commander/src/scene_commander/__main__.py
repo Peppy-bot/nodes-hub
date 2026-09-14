@@ -6,7 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any
+from typing import TYPE_CHECKING
 
 import peppylib
 from aiohttp import web
@@ -28,6 +28,11 @@ from peppygen.consumed_services.simulation import (
     get_objects_list,
 )
 
+from scene_commander import listen
+
+if TYPE_CHECKING:
+    from peppygen.parameters import Parameters
+
 
 logger = logging.getLogger(__name__)
 
@@ -41,23 +46,6 @@ class SceneCatalogueUnavailable(RuntimeError):
     An engine answers this way while it is still discovering its assets, and
     its message says so. The page waits it out and asks again.
     """
-
-
-# ---------------------------------------------------------------------------
-# Parameter helpers
-# ---------------------------------------------------------------------------
-
-
-def _param(params: Any, name: str, default: Any) -> Any:
-    """Read a Peppy parameter from dict-like or attribute-like params."""
-
-    if params is None:
-        return default
-
-    if isinstance(params, dict):
-        return params.get(name, default)
-
-    return getattr(params, name, default)
 
 
 # ---------------------------------------------------------------------------
@@ -1314,44 +1302,26 @@ def _build_app(node_runner: NodeRunner, catalogue: _CatalogueWatch) -> web.Appli
     return app
 
 
-async def _run_http_server(
-    node_runner: NodeRunner,
-    host: str,
-    port: int,
-    catalogue: _CatalogueWatch,
-) -> None:
-    # Browser requests stay out of the node log: what the log records is the
-    # Peppy traffic, one line per goal and per catalogue state change.
-    runner = web.AppRunner(_build_app(node_runner, catalogue), access_log=None)
-
-    await runner.setup()
-
-    site = web.TCPSite(runner, host=host, port=port)
-
-    await site.start()
-
-    logger.info(
-        "Scene commander web UI ready at http://%s:%d",
-        host,
-        port,
-    )
-
-    try:
-        await asyncio.Event().wait()
-
-    finally:
-        await runner.cleanup()
-
-
 # ---------------------------------------------------------------------------
 # Peppy entry point
 # ---------------------------------------------------------------------------
 
 
-async def setup(params, node_runner: NodeRunner) -> list[asyncio.Task]:
+async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Task]:
     logger.info("Scene commander starting")
 
     catalogue = _CatalogueWatch()
+
+    # The scene panel's socket, owned before the provider is waited on: a
+    # launch this node cannot serve is refused first, and which copy holds the
+    # preferred port follows launch order.
+    listener = listen.bind_listener(params.http_host, params.http_port)
+
+    logger.info(
+        "Scene panel at %s (bound %s)",
+        listen.served_url(listener),
+        listen.bound_address(listener),
+    )
 
     # The provider must answer; whether it has its catalogue yet is a state
     # the page polls for.
@@ -1368,11 +1338,8 @@ async def setup(params, node_runner: NodeRunner) -> list[asyncio.Task]:
 
     logger.info("Scene provider reachable: %d runtime objects", len(objects))
 
-    host = str(_param(params, "http_host", "0.0.0.0"))
-    port = int(_param(params, "http_port", 8766))
-
-    server_task = asyncio.create_task(
-        _run_http_server(node_runner, host, port, catalogue)
+    server_task = await listen.start_serving(
+        _build_app(node_runner, catalogue), listener
     )
 
     return [server_task]

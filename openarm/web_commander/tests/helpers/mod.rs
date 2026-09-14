@@ -14,6 +14,9 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+/// How long one handshake attempt may take before it is retried.
+const HANDSHAKE_BUDGET: Duration = Duration::from_secs(5);
+
 /// Valid launch parameters (every required field of the manifest schema):
 /// governor on with the 0.005/0.02 band, a 0.5 m/s speed cap, v2 ranges, and
 /// a 50 Hz command tick. The panel serves loopback on the caller's port, one
@@ -44,6 +47,16 @@ pub struct WsClient {
 }
 
 impl WsClient {
+    async fn connect_attempt(port: u16) -> std::io::Result<Self> {
+        tokio::time::timeout(HANDSHAKE_BUDGET, Self::connect_once(port))
+            .await
+            .unwrap_or_else(|_| {
+                Err(other(format!(
+                    "no websocket handshake from port {port} within {HANDSHAKE_BUDGET:?}"
+                )))
+            })
+    }
+
     async fn connect_once(port: u16) -> std::io::Result<Self> {
         let mut stream = TcpStream::connect(("127.0.0.1", port)).await?;
         // A fixed Sec-WebSocket-Key is legal: the server only needs it to
@@ -76,12 +89,16 @@ impl WsClient {
         Ok(Self { stream })
     }
 
-    /// Connects to the panel, retrying while the spawned server task is still
-    /// binding its listener. Bounded: panics if the panel never accepts.
+    /// Connects to the panel, retrying while its server task is still coming
+    /// up on the already-bound socket. Bounded: panics if it never accepts.
+    ///
+    /// Each attempt is bounded too. A process that accepts the connection and
+    /// then says nothing is what a panel moved off this port looks like from
+    /// here, and the handshake read would otherwise block past the deadline.
     pub async fn connect(port: u16) -> Self {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
-            match Self::connect_once(port).await {
+            match Self::connect_attempt(port).await {
                 Ok(ws) => return ws,
                 Err(e) => {
                     assert!(

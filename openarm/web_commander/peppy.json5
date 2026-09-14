@@ -1,6 +1,7 @@
-// openarm_web_commander: the browser-based commander. Serves a
-// control panel (HTTP + WebSocket on http_host:http_port) that streams
-// arm and gripper setpoints to the backbone over the joint_link / gripper_link
+// openarm_web_commander: the browser-based commander. Serves a control
+// panel (HTTP + WebSocket on http_host, on http_port when it is free and on
+// an operating-system port otherwise) that streams arm and gripper setpoints
+// to the backbone over the joint_link / gripper_link
 // pairings (the backbone governs and re-streams them), reads live state by
 // observing the backbone's downstream pairings, jogs the arm in joint or
 // Cartesian (world-frame IK) space, and fires move_arm_joints / move_arm /
@@ -130,9 +131,13 @@
       def_file: "apptainer.def"
     },
     parameters: {
-      // Where the operator panel is served. The WebSocket carries
-      // unauthenticated motion control, so a deployment on an untrusted
-      // network binds 127.0.0.1 and reaches the panel over a tunnel.
+      // Where the operator panel is served. http_host is a literal IP
+      // address, not a hostname. The WebSocket carries unauthenticated motion
+      // control, so a deployment on an untrusted network binds 127.0.0.1 and
+      // reaches the panel over a tunnel.
+      // http_port is the port the panel prefers: a copy whose port another
+      // process already holds serves on one the operating system picks and
+      // logs the address it took, so two copies on a host both come up.
       http_host: { $type: "string", $default: "0.0.0.0" },
       http_port: { $type: "u16", $default: 8765 },
       // Rate (Hz) at which enabled targets are re-published on the arm and
