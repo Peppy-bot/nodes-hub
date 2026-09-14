@@ -1,39 +1,41 @@
-//! The seat over the wire, the engine played by its generated mock: the
-//! node attaches as its model, publishes every state the engine feeds back
-//! on the limb it measures, carries the relays' setpoints across in its
-//! commands, reads why the engine ended its stay, and never commands an
-//! engine that refused it.
+//! The seat over the wire, the engine played by its generated mock: the node
+//! attaches as its model, publishes every state the engine feeds back on the
+//! limb it measures, carries the relays' setpoints across in its commands,
+//! reads why the engine ended its stay, and never commands an engine that
+//! refused it.
+//!
+//! Readiness comes after the seat, never before it: the robot serves no
+//! `is_ready` until the simulation has stood it in the scene.
 
 use std::time::{Duration, SystemTime};
 
-use peppygen::Parameters;
 use peppygen::consumed_actions::simulation::attach::{
     SimulationRobotAttachActionFeedbackMessageArmsItem as ArmState,
     SimulationRobotAttachActionFeedbackMessageGrippersItem as GripperState,
 };
+use peppygen::fixtures::exposed_services::robot_ready::is_ready as robot_is_ready;
 use peppygen::fixtures::harness::{Config, Harness};
 use peppygen::mock::deps::simulation::{attach, command};
-use peppygen::mock::pairings::{left_arm, right_gripper};
-use peppygen::parameters::placement::Placement;
+use peppygen::mock::pairings::{left_arm_link, right_gripper_link};
+
+mod common;
 
 /// How long the wire may take for any one exchange.
 const WIRE: Duration = Duration::from_secs(10);
+/// How long a service that nothing serves is waited on before concluding it
+/// is not being served.
+const UNSERVED: Duration = Duration::from_millis(500);
 /// Joints of one OpenArm arm, as the engine reports them.
 const ARM_DOF: usize = 7;
 /// Commands drained while a setpoint published beside a tick lands in one.
 const COMMANDS_TO_LAND: usize = 50;
 
-fn parameters(hardware_version: &str) -> Parameters {
-    Parameters {
-        command_rate_hz: 50,
-        hardware_version: hardware_version.into(),
-        placement: Placement {
-            auto: true,
-            x: 0.0,
-            y: 0.0,
-            z: 0.0,
-            yaw: 0.0,
-        },
+/// A robot that joins a simulation: the `simulation` slot is bound, so the
+/// node takes its seat before it does anything else.
+fn joining_a_simulation(hardware_version: &str) -> Config {
+    Config {
+        parameters: Some(common::parameters(hardware_version)),
+        ..Config::default()
     }
 }
 
@@ -82,48 +84,62 @@ async fn next_state<T>(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_robot_takes_its_seat_and_drives_its_limbs_through_it() -> peppygen::Result<()> {
-    let (harness, mut mocks) = Harness::start_with(
-        Config {
-            parameters: Some(parameters("v2")),
-            ..Config::default()
-        },
-        openarm_sim_attachment::setup,
-    )
-    .await?;
+    let (harness, mut mocks) =
+        Harness::start_with(joining_a_simulation("v2"), openarm_initializer::setup).await?;
+
+    let mut simulation = mocks
+        .deps
+        .simulation
+        .take()
+        .expect("a robot joining a simulation has one bound");
 
     // The node attaches as its model, on a spot of the engine's choosing.
-    let goal = mocks.deps.simulation.attach.next_goal(WIRE).await?;
+    let goal = simulation.attach.next_goal(WIRE).await?;
     assert_eq!(goal.request.model, "openarm_v2");
     assert!(goal.request.placement.is_none());
+
+    // Readiness waits on the seat, so a robot the engine has not stood yet
+    // answers nothing: the limbs it would aggregate cannot be live either.
+    assert!(
+        robot_is_ready::poll(&harness, UNSERVED).await.is_err(),
+        "an unseated robot serves no readiness"
+    );
     let seat = goal.accept(seated()).await?;
 
     // Its commands arrive at the command rate, holding every limb until a
     // relay says otherwise.
-    let (request, responder) = mocks.deps.simulation.command.next_request(WIRE).await?;
+    let (request, responder) = simulation.command.next_request(WIRE).await?;
     assert_eq!(request.arms.len(), 2);
     assert!(request.arms.iter().all(|arm| arm.positions.is_empty()));
     assert!(request.grippers.iter().all(|gripper| !gripper.commanded));
     responder.respond(accepted()).await?;
 
+    // Seated, the robot serves readiness, and reports not-ready while its
+    // limbs are the silent mocks the seat's own test leaves them.
+    assert!(
+        !robot_is_ready::poll(&harness, WIRE).await?.ready,
+        "a seated robot whose limbs are not up is not ready"
+    );
+
     // A state fed back lands on the limb it measures, whichever position
     // the engine listed that limb at.
     seat.publish_feedback(&state(0.1, 0.9)).await?;
-    let left = next_state(mocks.pairings.left_arm.joint_states.next()).await?;
+    let left = next_state(mocks.pairings.left_arm_link.joint_states.next()).await?;
     assert_eq!(left.positions, vec![0.1; ARM_DOF]);
-    let right = next_state(mocks.pairings.right_arm.joint_states.next()).await?;
+    let right = next_state(mocks.pairings.right_arm_link.joint_states.next()).await?;
     assert_eq!(right.positions, vec![0.9; ARM_DOF]);
-    let left_gripper = next_state(mocks.pairings.left_gripper.gripper_states.next()).await?;
+    let left_gripper = next_state(mocks.pairings.left_gripper_link.gripper_states.next()).await?;
     assert_eq!(left_gripper.opening, 0.75);
-    let right_gripper = next_state(mocks.pairings.right_gripper.gripper_states.next()).await?;
+    let right_gripper = next_state(mocks.pairings.right_gripper_link.gripper_states.next()).await?;
     assert_eq!(right_gripper.opening, 0.25);
 
     // A relay's setpoint goes out in a command, at the engine's index for
     // that limb.
     mocks
         .pairings
-        .left_arm
+        .left_arm_link
         .joint_setpoints
-        .publish(&left_arm::joint_setpoints::Message {
+        .publish(&left_arm_link::joint_setpoints::Message {
             timestamp: SystemTime::now(),
             positions: vec![0.5; ARM_DOF],
             velocities: Vec::new(),
@@ -132,9 +148,9 @@ async fn the_robot_takes_its_seat_and_drives_its_limbs_through_it() -> peppygen:
         .await?;
     mocks
         .pairings
-        .right_gripper
+        .right_gripper_link
         .gripper_setpoints
-        .publish(&right_gripper::gripper_setpoints::Message {
+        .publish(&right_gripper_link::gripper_setpoints::Message {
             timestamp: SystemTime::now(),
             opening: 0.3,
             max_effort: 2.0,
@@ -142,7 +158,7 @@ async fn the_robot_takes_its_seat_and_drives_its_limbs_through_it() -> peppygen:
         .await?;
     let mut landed = false;
     for _ in 0..COMMANDS_TO_LAND {
-        let (request, responder) = mocks.deps.simulation.command.next_request(WIRE).await?;
+        let (request, responder) = simulation.command.next_request(WIRE).await?;
         responder.respond(accepted()).await?;
         if request.arms[1].positions == vec![0.5; ARM_DOF] && request.grippers[0].commanded {
             assert!(
@@ -176,15 +192,14 @@ async fn the_robot_takes_its_seat_and_drives_its_limbs_through_it() -> peppygen:
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refused_robot_never_commands_the_engine() -> peppygen::Result<()> {
-    let (harness, mut mocks) = Harness::start_with(
-        Config {
-            parameters: Some(parameters("v1")),
-            ..Config::default()
-        },
-        openarm_sim_attachment::setup,
-    )
-    .await?;
-    let goal = mocks.deps.simulation.attach.next_goal(WIRE).await?;
+    let (harness, mut mocks) =
+        Harness::start_with(joining_a_simulation("v1"), openarm_initializer::setup).await?;
+    let mut simulation = mocks
+        .deps
+        .simulation
+        .take()
+        .expect("a robot joining a simulation has one bound");
+    let goal = simulation.attach.next_goal(WIRE).await?;
     assert_eq!(goal.request.model, "openarm_v1");
     goal.reject(Some("robot 'other' stands within 1.5 m"), None)
         .await?;
@@ -196,14 +211,13 @@ async fn a_refused_robot_never_commands_the_engine() -> peppygen::Result<()> {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(
-        mocks
-            .deps
-            .simulation
-            .command
-            .next_request(Duration::from_millis(500))
-            .await
-            .is_err(),
+        simulation.command.next_request(UNSERVED).await.is_err(),
         "a refused robot sends no command"
+    );
+    // A robot the simulation would not stand reports no readiness either.
+    assert!(
+        robot_is_ready::poll(&harness, UNSERVED).await.is_err(),
+        "a refused robot serves no readiness"
     );
     // The node's failure carries the engine's reason.
     let failure = harness

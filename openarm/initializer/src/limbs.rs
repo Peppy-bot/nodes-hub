@@ -13,9 +13,12 @@ use peppygen::consumed_services::simulation::command;
 
 /// The arms of an OpenArm, by the slot that drives each and the name its
 /// model gives it.
-pub const ARMS: [(&str, &str); 2] = [("left_arm", "left"), ("right_arm", "right")];
+pub const ARMS: [(&str, &str); 2] = [("left_arm_link", "left"), ("right_arm_link", "right")];
 /// The grippers, likewise.
-pub const GRIPPERS: [(&str, &str); 2] = [("left_gripper", "left"), ("right_gripper", "right")];
+pub const GRIPPERS: [(&str, &str); 2] = [
+    ("left_gripper_link", "left"),
+    ("right_gripper_link", "right"),
+];
 /// Joints of one OpenArm arm.
 pub const ARM_DOF: usize = 7;
 
@@ -253,7 +256,7 @@ mod tests {
         let refused =
             seated_with(&["left", "right"], &[ARM_DOF as u32, 6], &["left", "right"]).unwrap_err();
         assert!(
-            refused.contains("slot 'right_arm' drives an OpenArm arm of 7 joints")
+            refused.contains("slot 'right_arm_link' drives an OpenArm arm of 7 joints")
                 && refused.contains("a 'right' of 6"),
             "{refused}"
         );
@@ -270,8 +273,11 @@ mod tests {
         // The engine lists the model's limbs in its own order, which is not
         // the order of this robot's slots.
         let seat = seated(&["right", "left"], &["right", "left"]).unwrap();
-        seat.set_arm("left_arm", arm_command(positions(), Vec::new()).unwrap());
-        seat.set_gripper("right_gripper", gripper_command(0.5, 1.0).unwrap());
+        seat.set_arm(
+            "left_arm_link",
+            arm_command(positions(), Vec::new()).unwrap(),
+        );
+        seat.set_gripper("right_gripper_link", gripper_command(0.5, 1.0).unwrap());
         let request = seat.request();
         assert_eq!(
             request.arms[1].positions,
@@ -307,21 +313,25 @@ mod tests {
             ],
         };
         assert_eq!(
-            seat.arm_state("left_arm", &feedback).unwrap().positions,
+            seat.arm_state("left_arm_link", &feedback)
+                .unwrap()
+                .positions,
             positions()
         );
         assert_eq!(
-            seat.arm_state("right_arm", &feedback).unwrap().positions,
+            seat.arm_state("right_arm_link", &feedback)
+                .unwrap()
+                .positions,
             vec![1.0; ARM_DOF]
         );
         assert_eq!(
-            seat.gripper_state("left_gripper", &feedback)
+            seat.gripper_state("left_gripper_link", &feedback)
                 .unwrap()
                 .opening,
             0.25
         );
         assert_eq!(
-            seat.gripper_state("right_gripper", &feedback)
+            seat.gripper_state("right_gripper_link", &feedback)
                 .unwrap()
                 .opening,
             0.5
@@ -332,9 +342,15 @@ mod tests {
     #[test]
     fn a_model_without_this_robots_limbs_is_refused() {
         let err = seated(&["left"], &["left", "right"]).unwrap_err();
-        assert!(err.contains("no 'right' for slot 'right_arm'"), "{err}");
+        assert!(
+            err.contains("no 'right' for slot 'right_arm_link'"),
+            "{err}"
+        );
         let err = seated(&["left", "right"], &["left"]).unwrap_err();
-        assert!(err.contains("no 'right' for slot 'right_gripper'"), "{err}");
+        assert!(
+            err.contains("no 'right' for slot 'right_gripper_link'"),
+            "{err}"
+        );
     }
 
     #[test]

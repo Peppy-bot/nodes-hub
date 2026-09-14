@@ -1,23 +1,27 @@
-//! Taking the seat and holding it: the robot attaches, its limbs' setpoints
-//! go out as one command at the command rate, and every state that comes
-//! back is published on the limb it measures.
+//! Taking this robot's seat in a simulation and holding it: the robot
+//! attaches, its limbs' setpoints go out as one command at the command rate,
+//! and every state that comes back is published on the limb it measures.
 //!
-//! The node's life is the robot's stay in the scene. It fails to start when
-//! the simulation refuses the robot, and it stops when the seat ends (the
-//! engine took the robot out, or the goal could no longer be driven), so
-//! the runtime restarts it and the robot rejoins.
+//! The seat lasts as long as the robot's stay in the scene. Taking it fails
+//! when the simulation refuses the robot, so the robot reports no readiness
+//! it cannot back; losing it stops the node, so the runtime restarts it and
+//! the robot rejoins.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use peppygen::consumed_actions::simulation::attach;
 use peppygen::consumed_services::simulation::command;
-use peppygen::paired_topics::{left_arm, left_gripper, right_arm, right_gripper};
+use peppygen::paired_topics::{
+    left_arm_link, left_gripper_link, right_arm_link, right_gripper_link,
+};
 use peppygen::{NodeRunner, Parameters, QoSProfile, Result};
+use peppylib::messaging::ProducerRef;
 use peppylib::runtime::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::limbs::{ARMS, GRIPPERS, Seat, arm_command, gripper_command, model_of};
+use crate::limbs::{ARMS, GRIPPERS, Seat, arm_command, gripper_command};
+use crate::refused;
 
 /// How long the robot waits for the simulation to seat it. The engine
 /// rebuilds its world around the joining robot, which on a mesh-heavy model
@@ -39,21 +43,47 @@ const _: () = assert!(SEAT_RELEASE_TIMEOUT.as_millis() > LEAVE_TIMEOUT.as_millis
 /// Pause after a receive error before retrying, so a persistently broken
 /// subscription cannot hot-spin a consumer or flood the log.
 const RECEIVE_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+/// The command rates the engine can be driven at, the upper end being the
+/// fastest loop any OpenArm runs.
+const COMMAND_RATE_HZ: std::ops::RangeInclusive<u32> = 1..=1000;
 
-fn refused(message: impl Into<String>) -> peppygen::Error {
-    peppygen::Error::Node(std::io::Error::other(message.into()).into())
+/// The simulation that seats this robot: where its attachment goes and where
+/// its commands go. Both address the one `simulation` slot, so a robot that
+/// drives its own hardware resolves neither and takes no seat.
+struct Simulation {
+    attach_to: ProducerRef,
+    command_to: ProducerRef,
 }
 
-/// The node's entry point: the closure `NodeBuilder::run` takes, named so
-/// the test harness can boot the node in-process.
-pub async fn setup(params: Parameters, node_runner: Arc<NodeRunner>) -> Result<()> {
-    peppygen::clock::init(&node_runner).await?;
-    let token = node_runner.cancellation_token().clone();
-    let model = model_of(&params.hardware_version).map_err(refused)?;
+impl Simulation {
+    fn bound(runner: &NodeRunner) -> Option<Self> {
+        let (attach_to, command_to) = (
+            attach::bound_producer(runner)?,
+            command::bound_producer(runner)?,
+        );
+        Some(Self {
+            attach_to: attach_to.clone(),
+            command_to: command_to.clone(),
+        })
+    }
+}
+
+/// Takes this robot's seat in the simulation the launcher bound it to. A
+/// robot with no simulation bound drives the limbs the launcher gave it and
+/// returns without a seat.
+pub async fn take(model: String, params: &Parameters, runner: &Arc<NodeRunner>) -> Result<()> {
+    let Some(simulation) = Simulation::bound(runner) else {
+        info!("no simulation seats this robot, so it takes no seat");
+        return Ok(());
+    };
+    peppygen::clock::init(runner).await?;
+    let token = runner.cancellation_token().clone();
     let rate = params.command_rate_hz;
-    if !(1..=1000).contains(&rate) {
+    if !COMMAND_RATE_HZ.contains(&rate) {
         return Err(refused(format!(
-            "command_rate_hz must be between 1 and 1000, and this robot's is {rate}"
+            "command_rate_hz must be between {} and {}, and this robot's is {rate}",
+            COMMAND_RATE_HZ.start(),
+            COMMAND_RATE_HZ.end()
         )));
     }
     let period = Duration::from_secs_f64(1.0 / f64::from(rate));
@@ -67,8 +97,8 @@ pub async fn setup(params: Parameters, node_runner: Arc<NodeRunner>) -> Result<(
     // gave it. Feedback is a state stream the engine publishes on its own
     // grid without waiting for anyone, so it is read as sensor data.
     let goal = attach::ActionHandle::fire_goal(
-        &node_runner,
-        attach::bound_producer(&node_runner),
+        runner,
+        &simulation.attach_to,
         ATTACH_TIMEOUT,
         attach::GoalRequest {
             model: model.clone(),
@@ -94,13 +124,13 @@ pub async fn setup(params: Parameters, node_runner: Arc<NodeRunner>) -> Result<(
         seated.gripper_names.join(", ")
     );
 
-    spawn_arm_consumers(&node_runner, &seat, &token).await?;
-    spawn_gripper_consumers(&node_runner, &seat, &token).await?;
+    spawn_arm_consumers(runner, &seat, &token).await?;
+    spawn_gripper_consumers(runner, &seat, &token).await?;
     let (left, has_left) = tokio::sync::oneshot::channel();
-    let states =
-        spawn_state_publishers(&node_runner, seat.clone(), goal, left, token.clone()).await?;
+    let states = spawn_state_publishers(runner, seat.clone(), goal, left, token.clone()).await?;
     let commands = tokio::spawn(command_loop(
-        node_runner.clone(),
+        runner.clone(),
+        simulation.command_to,
         seat,
         period,
         token.clone(),
@@ -110,7 +140,7 @@ pub async fn setup(params: Parameters, node_runner: Arc<NodeRunner>) -> Result<(
     // gives its seat back, and the node waits for that, so the body leaves
     // with the robot.
     let shutdown_token = token.clone();
-    node_runner.on_shutdown(async move {
+    runner.on_shutdown(async move {
         shutdown_token.cancel();
         if tokio::time::timeout(SEAT_RELEASE_TIMEOUT, has_left)
             .await
@@ -137,6 +167,7 @@ pub async fn setup(params: Parameters, node_runner: Arc<NodeRunner>) -> Result<(
 /// setpoint changed.
 async fn command_loop(
     runner: Arc<NodeRunner>,
+    command_to: ProducerRef,
     seat: Seat,
     period: Duration,
     token: CancellationToken,
@@ -149,13 +180,7 @@ async fn command_loop(
             _ = token.cancelled() => return,
             _ = ticker.tick() => {}
         }
-        let answered = command::poll(
-            &runner,
-            command::bound_producer(&runner),
-            COMMAND_TIMEOUT,
-            seat.request(),
-        )
-        .await;
+        let answered = command::poll(&runner, &command_to, COMMAND_TIMEOUT, seat.request()).await;
         let outcome = match answered {
             Ok(response) if response.data.success => Ok(()),
             // The engine is still standing this robot: its first commands
@@ -176,6 +201,12 @@ async fn command_loop(
     }
 }
 
+/// Encodes one arm's measured state for the slot that publishes it.
+type ArmStateBuilder =
+    fn(std::time::SystemTime, Vec<f64>, Vec<f64>, Vec<f64>) -> Result<peppylib::Payload>;
+/// Encodes one gripper's measured state for the slot that publishes it.
+type GripperStateBuilder = fn(std::time::SystemTime, f64, f64, f64) -> Result<peppylib::Payload>;
+
 /// Publishes every state the simulation sends back on the limb it measures,
 /// and ends when the robot's stay does.
 async fn spawn_state_publishers(
@@ -185,24 +216,28 @@ async fn spawn_state_publishers(
     left: tokio::sync::oneshot::Sender<()>,
     token: CancellationToken,
 ) -> Result<tokio::task::JoinHandle<()>> {
-    let arms = vec![
+    let arms = [
         (
             ARMS[0].0,
-            left_arm::joint_states::declare_publisher(runner).await?,
+            left_arm_link::joint_states::declare_publisher(runner).await?,
+            left_arm_link::joint_states::build_message as ArmStateBuilder,
         ),
         (
             ARMS[1].0,
-            right_arm::joint_states::declare_publisher(runner).await?,
+            right_arm_link::joint_states::declare_publisher(runner).await?,
+            right_arm_link::joint_states::build_message as ArmStateBuilder,
         ),
     ];
-    let grippers = vec![
+    let grippers = [
         (
             GRIPPERS[0].0,
-            left_gripper::gripper_states::declare_publisher(runner).await?,
+            left_gripper_link::gripper_states::declare_publisher(runner).await?,
+            left_gripper_link::gripper_states::build_message as GripperStateBuilder,
         ),
         (
             GRIPPERS[1].0,
-            right_gripper::gripper_states::declare_publisher(runner).await?,
+            right_gripper_link::gripper_states::declare_publisher(runner).await?,
+            right_gripper_link::gripper_states::build_message as GripperStateBuilder,
         ),
     ];
     Ok(tokio::spawn(async move {
@@ -226,11 +261,11 @@ async fn spawn_state_publishers(
                 }
             };
             let mut published = Ok(());
-            for (slot, publisher) in &arms {
+            for (slot, publisher, build) in &arms {
                 let Some(state) = seat.arm_state(slot, &feedback) else {
                     continue;
                 };
-                let message = left_arm::joint_states::build_message(
+                let message = build(
                     feedback.timestamp,
                     state.positions.clone(),
                     state.velocities.clone(),
@@ -238,16 +273,11 @@ async fn spawn_state_publishers(
                 );
                 published = published.and(publish(publisher, message).await);
             }
-            for (slot, publisher) in &grippers {
+            for (slot, publisher, build) in &grippers {
                 let Some(state) = seat.gripper_state(slot, &feedback) else {
                     continue;
                 };
-                let message = left_gripper::gripper_states::build_message(
-                    feedback.timestamp,
-                    state.opening,
-                    state.effort,
-                    0.0,
-                );
+                let message = build(feedback.timestamp, state.opening, state.effort, 0.0);
                 published = published.and(publish(publisher, message).await);
             }
             match published {
@@ -363,8 +393,8 @@ async fn spawn_arm_consumers(
             });
         }};
     }
-    arm_consumer!(left_arm);
-    arm_consumer!(right_arm);
+    arm_consumer!(left_arm_link);
+    arm_consumer!(right_arm_link);
     Ok(())
 }
 
@@ -418,7 +448,7 @@ async fn spawn_gripper_consumers(
             });
         }};
     }
-    gripper_consumer!(left_gripper);
-    gripper_consumer!(right_gripper);
+    gripper_consumer!(left_gripper_link);
+    gripper_consumer!(right_gripper_link);
     Ok(())
 }

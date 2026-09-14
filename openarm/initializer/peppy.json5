@@ -1,8 +1,20 @@
-// Aggregates the component_ready signals from both arms
-// and grippers into the robot-level is_ready the backbone gates on. Returns
-// ready:true only once every bound component reports ready. The hardware
-// drivers and the simulation relays implement the same per-limb contract, so
-// one initializer serves the real robot and every simulation.
+// openarm_initializer: the node that brings one OpenArm into being and says
+// when it is ready.
+//
+// In a simulation that seats robots it holds this robot's seat: it attaches
+// the robot with its own model and placement, streams its limbs' setpoints
+// to the engine as one command, and publishes the state that comes back on
+// each limb's pair. The engine tells its robots apart by the seat that
+// commands them, so one engine hosts as many robots as there are seats, and
+// nothing on a limb carries a robot id. Toward the robot the seat plays the
+// follower role of every limb's pairing, the surface a simulation offers a
+// robot it hosts alone, so the relays above it bind to it unchanged.
+//
+// Whether or not it holds a seat, it polls the component_ready of the four
+// limbs the launcher binds and exposes the robot-level is_ready the backbone
+// gates on, true only once every limb reports ready. The hardware drivers
+// and the simulation relays implement the same per-limb contract, so one
+// initializer serves the real robot and every simulation.
 {
   peppy_schema: "node/v1",
   manifest: {
@@ -18,11 +30,38 @@
         { name: "component_ready", tag: "v1", link_id: "left_arm" },
         { name: "component_ready", tag: "v1", link_id: "right_arm" },
         { name: "component_ready", tag: "v1", link_id: "left_gripper" },
-        { name: "component_ready", tag: "v1", link_id: "right_gripper" }
-      ]
-    }
+        { name: "component_ready", tag: "v1", link_id: "right_gripper" },
+        // The simulation this robot joins. Vacant on a robot that drives its
+        // own hardware, and on one whose relays pair into a simulation's own
+        // limb slots; bound only when this robot takes a seat.
+        { name: "simulation_robot", tag: "v1", link_id: "simulation", cardinality: "zero_or_one" },
+      ],
+      pairings: [
+        // The seat's limbs, one slot per limb, the same surface a simulation
+        // offers: governed setpoints stream in, measured state streams back.
+        // Optional, and vacant unless this robot holds a seat.
+        { name: "joint_link", tag: "v1", role: "follower", link_id: "left_arm_link", optional: true },
+        { name: "joint_link", tag: "v1", role: "follower", link_id: "right_arm_link", optional: true },
+        { name: "gripper_link", tag: "v1", role: "follower", link_id: "left_gripper_link", optional: true },
+        { name: "gripper_link", tag: "v1", role: "follower", link_id: "right_gripper_link", optional: true },
+      ],
+    },
   },
   interfaces: {
+    topics: {
+      emits: [
+        { link_id: "left_arm_link", name: "joint_states" },
+        { link_id: "right_arm_link", name: "joint_states" },
+        { link_id: "left_gripper_link", name: "gripper_states" },
+        { link_id: "right_gripper_link", name: "gripper_states" },
+      ],
+      consumes: [
+        { link_id: "left_arm_link", name: "joint_setpoints" },
+        { link_id: "right_arm_link", name: "joint_setpoints" },
+        { link_id: "left_gripper_link", name: "gripper_setpoints" },
+        { link_id: "right_gripper_link", name: "gripper_setpoints" },
+      ],
+    },
     services: {
       exposes: [
         { link_id: "robot_ready", name: "is_ready" },
@@ -31,14 +70,38 @@
         { link_id: "left_arm", name: "is_ready" },
         { link_id: "right_arm", name: "is_ready" },
         { link_id: "left_gripper", name: "is_ready" },
-        { link_id: "right_gripper", name: "is_ready" }
-      ]
-    }
+        { link_id: "right_gripper", name: "is_ready" },
+        { link_id: "simulation", name: "command" },
+      ],
+    },
+    actions: {
+      consumes: [{ link_id: "simulation", name: "attach" }],
+    },
   },
   execution: {
     language: "rust",
     container: {
       def_file: "apptainer.def",
+    },
+    parameters: {
+      // Which OpenArm this robot is, "v1" or "v2". A simulation stands the
+      // matching model for it; nothing else about the robot reaches the engine.
+      hardware_version: "string",
+      // How often the limbs' setpoints go to the engine. The engine holds the
+      // last command until the next one, and a robot whose commands stop for
+      // the engine's lease leaves the scene, so this is also the heartbeat.
+      command_rate_hz: { $type: "u32", $default: 100 },
+      // Where the robot stands. `auto` lets the engine park it on a free spot
+      // of its own, which is what a fleet of robots wants; turn it off to
+      // stand this robot at x, y, z (metres) turned yaw (radians) about the
+      // world's vertical.
+      placement: {
+        auto: { $type: "bool", $default: true },
+        x: { $type: "f64", $default: 0 },
+        y: { $type: "f64", $default: 0 },
+        z: { $type: "f64", $default: 0 },
+        yaw: { $type: "f64", $default: 0 },
+      },
     },
   },
 }

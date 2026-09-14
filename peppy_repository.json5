@@ -61,11 +61,6 @@
         path: "openarm/arm/peppy.json5"
       }
     },
-    openarm_sim_attachment: {
-      v1: {
-        path: "openarm/sim_attachment/peppy.json5"
-      }
-    },
     openarm_backbone: {
       v1: {
         path: "openarm/backbone/peppy.json5"
