@@ -81,5 +81,12 @@ the limb instances' own logs (`peppy node info <node>:v1` per limb node).
 **the node stops right after it starts, saying the simulation refused it**
 The engine would not stand this robot, and its reason is in the message: a
 model its catalogue does not carry, or a placement another robot occupies.
-Fix the robot's `hardware_version` or its `placement`, or make room in the
-world, and the runtime's restart rejoins it.
+`peppy stack list` reports the instance failed. Fix the robot's
+`hardware_version` or its `placement`, or make room in the world, then
+`peppy stack join` the copy again.
+
+**the robot left the scene and its node is failed**
+A seat ends when the engine takes the robot out or its commands stop for the
+engine's lease, and the node stops with it rather than serving a readiness
+the scene no longer backs. Nothing brings the copy back on its own:
+`peppy stack join` it again.

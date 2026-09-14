@@ -4,8 +4,8 @@
 //!
 //! The seat lasts as long as the robot's stay in the scene. Taking it fails
 //! when the simulation refuses the robot, so the robot reports no readiness
-//! it cannot back; losing it stops the node, so the runtime restarts it and
-//! the robot rejoins.
+//! it cannot back. Losing the seat stops the node, which `peppy stack list`
+//! then reports failed; `peppy stack join` puts the copy back.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -150,8 +150,9 @@ pub async fn take(model: String, params: &Parameters, runner: &Arc<NodeRunner>) 
         }
     });
 
-    // The robot's stay is over when either half of the seat ends: cancel the
-    // node so the runtime restarts it and it rejoins.
+    // The robot's stay is over when either half of the seat ends: stop the
+    // node, so a robot with no seat stops serving the readiness that stands
+    // for one.
     tokio::spawn(async move {
         tokio::select! {
             _ = states => {}
