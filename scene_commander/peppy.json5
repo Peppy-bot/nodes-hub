@@ -32,6 +32,10 @@
           link_id: "simulation",
           name: "get_objects_list",
         },
+        {
+          link_id: "simulation",
+          name: "get_robots_list",
+        },
       ],
     },
 
