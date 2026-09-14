@@ -199,7 +199,7 @@ peppy node add /path/to/nodes-hub/openarm/backbone -sb
 
 # Launch the whole stack (sim shown; the backbone and commander pair
 # mutually, so cold starts go through a launcher):
-peppy stack launch simulation --with mujoco
+peppy stack launch openarm_simulation --with mujoco
 
 # Unit tests run directly; both hardware generations' models are exercised:
 cargo test

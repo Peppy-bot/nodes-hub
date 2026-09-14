@@ -30,7 +30,7 @@ do exactly that; the [top-level README](../README.md) walks through the whole
 sequence:
 
 ```sh
-peppy stack launch simulation --with mujoco
+peppy stack launch openarm_simulation --with mujoco
 ```
 
 Watch it come up with:

@@ -148,9 +148,9 @@ peppy stack launch fleet
 peppy stack join openarm_v2 -i alpha
 
 # Simulated v2 with the web commander.
-peppy stack launch simulation                         # Waldo
-peppy stack launch simulation --with mujoco
-peppy stack launch simulation --with isaac_sim
+peppy stack launch openarm_simulation                 # Waldo
+peppy stack launch openarm_simulation --with mujoco
+peppy stack launch openarm_simulation --with isaac_sim
 ```
 
 MuJoCo and Isaac Sim also simulate `openarm_v1_sim`. Waldo supplies the v2
@@ -258,7 +258,7 @@ When working directly on the Isaac machine:
 http://127.0.0.1:8766
 ```
 
-Scene Commander is used to construct and modify the simulated environment while the simulator is running. It drives any simulation implementing the `scene_control` contract: the Isaac Sim simulation and the Waldo simulation (`peppy stack launch simulation --with isaac_sim,web_scene_commander`).
+Scene Commander is used to construct and modify the simulated environment while the simulator is running. It drives any simulation implementing the `scene_control` contract: the Isaac Sim simulation and the Waldo simulation (`peppy stack launch openarm_simulation --with isaac_sim,web_scene_commander`).
 
 ### Scene controls
 
