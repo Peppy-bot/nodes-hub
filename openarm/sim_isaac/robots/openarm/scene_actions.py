@@ -24,9 +24,14 @@ from peppygen.exposed_actions.scene import (
 from peppygen.exposed_services.scene import (
     get_assets_list,
     get_objects_list,
+    get_robots_list,
 )
 
 logger = logging.getLogger(__name__)
+
+# The name this simulation's one robot stands under, which is its root prim
+# in the stage. Scene commands address it by this name.
+ROBOT_NAME = "openarm"
 
 
 @dataclass
@@ -43,9 +48,15 @@ class SceneActionIO:
         self,
         node_runner,
         loop: asyncio.AbstractEventLoop,
+        model: str,
     ) -> None:
         self._node_runner = node_runner
         self._loop = loop
+
+        # The catalogue model this simulation stands its robot as, reported
+        # by get_robots_list. This simulation carries one robot.
+        self._model = model
+        self._robot_position = [0.0, 0.0, 0.0]
 
         self._lock = threading.Lock()
 
@@ -94,6 +105,7 @@ class SceneActionIO:
             ),
             asyncio.create_task(self._serve_assets()),
             asyncio.create_task(self._serve_objects()),
+            asyncio.create_task(self._serve_robots()),
             asyncio.create_task(self._serve_load_scene()),
             asyncio.create_task(self._serve_clear_scene()),
             asyncio.create_task(self._serve_spawn_object()),
@@ -276,6 +288,31 @@ class SceneActionIO:
             message=f"{len(objects)} runtime objects",
             objects_json=json.dumps(
                 objects,
+                separators=(",", ":"),
+            ),
+        )
+
+    def _handle_get_robots(
+        self,
+        _request,
+    ) -> get_robots_list.Response:
+        with self._lock:
+            robots = [
+                {
+                    "robot": ROBOT_NAME,
+                    "model": self._model,
+                    "position": list(
+                        self._robot_position
+                    ),
+                    "attached": False,
+                }
+            ]
+
+        return get_robots_list.Response(
+            success=True,
+            message=f"{len(robots)} robots standing",
+            robots_json=json.dumps(
+                robots,
                 separators=(",", ":"),
             ),
         )
@@ -610,6 +647,14 @@ class SceneActionIO:
             }
 
         if operation == "move_robot":
+            robot = payload["robot"]
+
+            if robot != ROBOT_NAME:
+                raise ValueError(
+                    f"no robot stands as {robot!r} in this "
+                    f"simulation, which stands {ROBOT_NAME!r}"
+                )
+
             position = [
                 float(value)
                 for value in payload["position"]
@@ -625,6 +670,9 @@ class SceneActionIO:
                     "position": position,
                 }
             )
+
+            with self._lock:
+                self._robot_position = position
 
             return {
                 "success": True,
@@ -707,6 +755,23 @@ class SceneActionIO:
             except Exception:
                 logger.exception(
                     "get_objects_list service failed"
+                )
+                await asyncio.sleep(1.0)
+
+    async def _serve_robots(self) -> None:
+        while True:
+            try:
+                await get_robots_list.handle_next_request(
+                    self._node_runner,
+                    self._handle_get_robots,
+                )
+
+            except asyncio.CancelledError:
+                raise
+
+            except Exception:
+                logger.exception(
+                    "get_robots_list service failed"
                 )
                 await asyncio.sleep(1.0)
 
@@ -931,6 +996,7 @@ class SceneActionIO:
             result = await self._submit(
                 "move_robot",
                 {
+                    "robot": request.robot,
                     "position": list(
                         request.position
                     ),

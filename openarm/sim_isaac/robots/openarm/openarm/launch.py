@@ -145,6 +145,7 @@ async def _node_setup(params, node_runner) -> list:
     scene_actions = SceneActionIO(
         node_runner,
         loop,
+        model=f"openarm_{_version(params.hardware_version)}",
     )
 
     await scene_actions.start()

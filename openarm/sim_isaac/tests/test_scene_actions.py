@@ -12,7 +12,7 @@ import pytest
 
 _ROBOT_DIR = Path(__file__).resolve().parents[1] / "robots" / "openarm"
 _ACTIONS = ("apply_force", "clear_scene", "load_scene", "move_object", "move_robot", "remove_object", "spawn_object")
-_SERVICES = ("get_assets_list", "get_objects_list")
+_SERVICES = ("get_assets_list", "get_objects_list", "get_robots_list")
 
 
 @pytest.fixture
@@ -38,7 +38,7 @@ def provider(monkeypatch):
     # Its dataclass resolves postponed annotations through sys.modules.
     monkeypatch.setitem(sys.modules, spec.name, module)
     spec.loader.exec_module(module)
-    io = module.SceneActionIO(object(), Mock())
+    io = module.SceneActionIO(object(), Mock(), model="openarm_v2")
     launcher = Mock()
     return SimpleNamespace(io=io, launcher=launcher)
 
@@ -130,3 +130,33 @@ def test_load_scene_rejects_unknown_or_non_scene_assets_before_touching_the_stag
         provider.io._execute(provider.launcher, "load_scene", {"asset_id": asset_id, "scale": 1.0})
     assert provider.launcher.mock_calls == []
     assert len(provider.io._public_objects()) == 1
+
+
+def test_the_listing_names_the_one_robot_this_simulation_stands(provider):
+    listed = json.loads(provider.io._handle_get_robots(None).robots_json)
+
+    assert listed == [
+        {"robot": "openarm", "model": "openarm_v2", "position": [0.0, 0.0, 0.0], "attached": False}
+    ]
+
+
+def test_moving_a_robot_by_name_moves_it_and_the_listing_follows(provider):
+    result = provider.io._execute(
+        provider.launcher, "move_robot", {"robot": "openarm", "position": [1.0, -2.0, 0.0]}
+    )
+
+    assert result["success"] is True
+    assert provider.launcher.mock_calls == [
+        call._runtime_move_robot_root({"position": [1.0, -2.0, 0.0]})
+    ]
+    listed = json.loads(provider.io._handle_get_robots(None).robots_json)
+    assert listed[0]["position"] == [1.0, -2.0, 0.0]
+
+
+def test_a_robot_this_simulation_does_not_stand_is_refused_before_the_stage(provider):
+    with pytest.raises(ValueError, match="no robot stands as 'bravo'"):
+        provider.io._execute(
+            provider.launcher, "move_robot", {"robot": "bravo", "position": [1.0, 0.0, 0.0]}
+        )
+
+    assert provider.launcher.mock_calls == []

@@ -59,6 +59,7 @@
       exposes: [
         { link_id: "scene", name: "get_assets_list" },
         { link_id: "scene", name: "get_objects_list" },
+        { link_id: "scene", name: "get_robots_list" },
       ],
     },
 

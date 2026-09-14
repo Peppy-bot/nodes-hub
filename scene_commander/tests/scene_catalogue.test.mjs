@@ -103,7 +103,7 @@ const PROVIDER_BUSY = 'Isaac is still discovering its asset catalogue';
 
 // unavailable: how many catalogue requests the provider refuses first, as the
 // node answers while the engine has no catalogue yet (HTTP 503).
-async function page(catalogue = [staticScene, dynamicScene, cage], objects = [], { unavailable = 0 } = {}) {
+async function page(catalogue = [staticScene, dynamicScene, cage], objects = [], { unavailable = 0, robots = [] } = {}) {
     const elements = new Map();
     registerElements(html, elements);
     const requests = [];
@@ -140,6 +140,7 @@ async function page(catalogue = [staticScene, dynamicScene, cage], objects = [],
             }
             const data = path === '/api/assets' ? { assets: currentCatalogue }
                 : path === '/api/objects' ? { objects }
+                : path === '/api/robots' ? { robots, count: robots.length }
                 : { message: 'Scene loaded' };
             return { ok: true, json: async () => ({ success: true, ...data }) };
         },
@@ -163,7 +164,7 @@ async function page(catalogue = [staticScene, dynamicScene, cage], objects = [],
 
 test('fetched scenes expose their catalogue names and selected descriptions', async () => {
     const ui = await page();
-    assert.deepEqual(ui.requests.map(r => r.path), ['/api/assets', '/api/objects']);
+    assert.deepEqual(ui.requests.map(r => r.path), ['/api/assets', '/api/objects', '/api/robots']);
     assert.deepEqual(Array.from(ui.element('sceneSelect').children, o => o.textContent),
         [staticScene.display_name, dynamicScene.display_name]);
     assert.equal(ui.element('sceneDescription').textContent, staticScene.description);
@@ -193,7 +194,7 @@ test('the page opens in its loading state before any script runs', () => {
 test('the page keeps asking the provider for its catalogue and shows why it waits', async () => {
     const ui = await page([staticScene, cage], [], { unavailable: 2 });
     assert.deepEqual(ui.requests.map(r => r.path),
-        ['/api/assets', '/api/assets', '/api/assets', '/api/objects']);
+        ['/api/assets', '/api/assets', '/api/assets', '/api/objects', '/api/robots']);
     assert.equal(ui.waits.length, 2);
     for (const wait of ui.waits) {
         assert.equal(wait.delay, 3000);
@@ -380,4 +381,42 @@ test('runtime objects show their asset descriptions and refresh them without los
     await ui.run('refreshAssets()');
     assert.equal(ui.element('objectDescription0').textContent, '');
     assert.equal(ui.element('objectDescription0').hidden, true);
+});
+
+test('the robot picker lists what the scene stands and a move carries the one chosen', async () => {
+    const robots = [
+        { robot: 'alpha_init_inst', model: 'openarm_v2', position: [0, 0, 0], attached: true },
+        { robot: 'bravo_init_inst', model: 'openarm_v1', position: [0, -1.5, 0], attached: true },
+    ];
+    const ui = await page([cage], [], { robots });
+
+    const select = ui.element('robotSelect');
+    assert.deepEqual(select.children.map(o => o.textContent), [
+        'alpha_init_inst (openarm_v2)',
+        'bravo_init_inst (openarm_v1)',
+    ]);
+    assert.equal(select.disabled, false);
+    assert.equal(ui.element('robotCount').textContent, '2 robots standing');
+
+    // Choosing a robot offers that robot's own position, not the last one's.
+    select.value = 'bravo_init_inst';
+    await ui.run('selectRobot()');
+    assert.deepEqual(
+        ['robotX', 'robotY', 'robotZ'].map(id => String(ui.element(id).value)),
+        ['0', '-1.5', '0'],
+    );
+
+    ui.element('robotX').value = '1';
+    await ui.run('moveRobot()');
+    const move = ui.requests.find(r => r.path === '/api/robot/move');
+    assert.deepEqual(move.body, { robot: 'bravo_init_inst', position: [1, -1.5, 0] });
+});
+
+test('a move waits for a robot to be chosen', async () => {
+    const ui = await page([cage], [], { robots: [] });
+
+    assert.equal(ui.element('robotSelect').disabled, true);
+    await ui.run('moveRobot()');
+    assert.equal(ui.requests.some(r => r.path === '/api/robot/move'), false);
+    assert.equal(ui.element('status').textContent, 'select a robot to move');
 });
