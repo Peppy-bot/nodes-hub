@@ -1,15 +1,21 @@
 //! Per-component motor health for the UI. Consumes every producer bound to
 //! the motor_health slot (zero_or_more; the launcher wires the arm and
-//! gripper instances), attributes each report to a side and component by the
-//! producing instance's name, parses it into per-motor readings, and hands
-//! it to the owner keyed by side, so the panel can badge each motor and
-//! banner an overloading component.
+//! gripper instances), attributes each report through the observed limb
+//! slots, parses it into per-motor readings, and hands it to the owner keyed
+//! by side, so the panel can badge each motor and banner an overloading
+//! component.
 
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
 use peppygen::NodeRunner;
 use peppygen::consumed_topics::motor_health::motor_health;
+use peppygen::paired_topics::{
+    observed_left_arm::joint_states as left_arm,
+    observed_left_gripper::gripper_states as left_gripper,
+    observed_right_arm::joint_states as right_arm,
+    observed_right_gripper::gripper_states as right_gripper,
+};
 use peppylib::messaging::ProducerRef;
 use peppylib::runtime::CancellationToken;
 use tokio::sync::mpsc;
@@ -39,6 +45,16 @@ pub async fn run(
     feedback: mpsc::Sender<Feedback>,
     token: CancellationToken,
 ) {
+    // The limbs this panel attributes reports to, resolved once: they are
+    // fixed for the run, and a slot that cannot resolve ends this task at
+    // startup.
+    let sources = match observed_sources(&runner) {
+        Ok(sources) => sources,
+        Err(e) => {
+            error!(error = %e, "motor_health observed limbs");
+            return;
+        }
+    };
     let subscription = match motor_health::subscribe(&runner).await {
         Ok(subscription) => subscription,
         Err(e) => {
@@ -53,7 +69,15 @@ pub async fn run(
         subscription,
         // An unresolved daemon clock cannot certify a timestamp's age, so the
         // report drops on the same throttled-warn path as a malformed one.
-        |producer, msg| parse_report(producer, msg, consumer::clock_now()?, Instant::now()),
+        move |producer, msg| {
+            parse_report(
+                &sources,
+                producer,
+                msg,
+                consumer::clock_now()?,
+                Instant::now(),
+            )
+        },
     )
     .await;
 }
@@ -65,31 +89,39 @@ enum Kind {
     Gripper,
 }
 
-/// Which panel slot a producer's reports belong to, read from the instance
-/// name the launcher chose: the side from a "left"/"right" token and the
-/// kind from an "arm"/"grip" token ("left_arm_inst", "right_grip_inst",
-/// "left_gripper"). A name carrying neither or both of either pair is
-/// refused by name rather than guessed at.
-fn classify(instance: &str) -> Result<(Side, Kind), String> {
-    let side = match (instance.contains("left"), instance.contains("right")) {
-        (true, false) => Side::Left,
-        (false, true) => Side::Right,
-        _ => {
-            return Err(format!(
-                "instance {instance:?} does not name exactly one of left/right"
-            ));
-        }
+type HealthSources = [(ProducerRef, Side, Kind); 4];
+
+fn observed_sources(runner: &NodeRunner) -> peppygen::Result<HealthSources> {
+    Ok([
+        (left_arm::source(runner)?.producer, Side::Left, Kind::Arm),
+        (right_arm::source(runner)?.producer, Side::Right, Kind::Arm),
+        (
+            left_gripper::source(runner)?.producer,
+            Side::Left,
+            Kind::Gripper,
+        ),
+        (
+            right_gripper::source(runner)?.producer,
+            Side::Right,
+            Kind::Gripper,
+        ),
+    ])
+}
+
+/// Match the full wire identity to exactly one observed limb.
+fn classify(sources: &HealthSources, producer: &ProducerRef) -> Result<(Side, Kind), String> {
+    let mut matches = sources.iter().filter(|(source, _, _)| source == producer);
+    let Some((_, side, kind)) = matches.next() else {
+        return Err(format!(
+            "producer {producer:?} is outside this panel's observed limbs; wire motor_health to the observed followers"
+        ));
     };
-    let kind = match (instance.contains("arm"), instance.contains("grip")) {
-        (true, false) => Kind::Arm,
-        (false, true) => Kind::Gripper,
-        _ => {
-            return Err(format!(
-                "instance {instance:?} does not name exactly one of arm/grip"
-            ));
-        }
-    };
-    Ok((side, kind))
+    if matches.next().is_some() {
+        return Err(format!(
+            "producer {producer:?} fills multiple observed limbs; bind each limb to its own follower"
+        ));
+    }
+    Ok((*side, *kind))
 }
 
 /// Parse one wire report into the owner feedback it routes to: a producing
@@ -98,18 +130,16 @@ fn classify(instance: &str) -> Result<(Side, Kind), String> {
 /// motor-count-length with finite values, and a timestamp not already past the
 /// aging window.
 ///
-/// The producing instance is the component, so a report from hardware this
-/// panel does not render (another robot's limb) is dropped here rather than
-/// shown in the wrong slot. The kind comes from the instance name, and the
-/// vector length is validated against it, so an arm-shaped report from a
-/// gripper instance cannot masquerade as the arm.
+/// The observed slot supplies the side and kind; its producer must match the
+/// report's machine and instance. Vector lengths must match that limb's kind.
 fn parse_report(
+    sources: &HealthSources,
     producer: &ProducerRef,
     msg: &motor_health::Message,
     clock_now: SystemTime,
     received_at: Instant,
 ) -> Result<Feedback, String> {
-    let (side, kind) = classify(&producer.instance_id)?;
+    let (side, kind) = classify(sources, producer)?;
     match kind {
         Kind::Arm => Ok(Feedback::MotorHealth {
             side,
@@ -201,7 +231,28 @@ mod tests {
     /// only routing and shape can fail.
     fn parse_fresh(instance: &str, msg: &motor_health::Message) -> Result<Feedback, String> {
         let producer = ProducerRef::new("core", instance);
-        parse_report(&producer, msg, msg.timestamp, Instant::now())
+        parse_report(&sources(), &producer, msg, msg.timestamp, Instant::now())
+    }
+
+    fn sources() -> HealthSources {
+        [
+            (ProducerRef::new("core", "left_arm"), Side::Left, Kind::Arm),
+            (
+                ProducerRef::new("core", "right_arm"),
+                Side::Right,
+                Kind::Arm,
+            ),
+            (
+                ProducerRef::new("core", "left_gripper"),
+                Side::Left,
+                Kind::Gripper,
+            ),
+            (
+                ProducerRef::new("core", "right_gripper"),
+                Side::Right,
+                Kind::Gripper,
+            ),
+        ]
     }
 
     /// Unwrap an arm parse, panicking on any other routing.
@@ -220,36 +271,33 @@ mod tests {
     }
 
     #[test]
-    fn instances_classify_by_their_side_and_kind_tokens() {
-        assert_eq!(classify("left_arm").unwrap(), (Side::Left, Kind::Arm));
-        assert_eq!(
-            classify("right_gripper").unwrap(),
-            (Side::Right, Kind::Gripper)
-        );
-        // Substring semantics: a decorated launcher name still classifies.
-        // The last two pin the openarm launcher family's instance ids.
-        assert_eq!(classify("left_arm_v2").unwrap(), (Side::Left, Kind::Arm));
-        assert_eq!(
-            classify("right_arm_inst").unwrap(),
-            (Side::Right, Kind::Arm)
-        );
-        assert_eq!(
-            classify("left_grip_inst").unwrap(),
-            (Side::Left, Kind::Gripper)
-        );
+    fn an_instance_named_after_an_observed_limb_is_not_that_limb() {
+        // Attribution is the whole wire identity, so another copy's limb,
+        // whose id carries the same fragment name under its own prefix,
+        // stays outside this panel's limbs.
+        let bound = sources();
+        for prefix in ["alpha", "left", "right_arm", "gripper_robot"] {
+            for (producer, _, _) in &bound {
+                let other_copy = ProducerRef::new(
+                    "jetson-1",
+                    format!("{prefix}_{}_inst", producer.instance_id),
+                );
+                assert!(classify(&bound, &other_copy).is_err());
+            }
+        }
     }
 
     #[test]
-    fn an_instance_without_exactly_one_side_and_kind_is_refused() {
-        for instance in [
-            "arm",
-            "left",
-            "left_right_arm",
-            "left_arm_gripper",
-            "camera01",
+    fn unknown_remote_and_ambiguous_producers_are_refused() {
+        let mut bound = sources();
+        for producer in [
+            ProducerRef::new("core", "unknown"),
+            ProducerRef::new("another_robot", "left_arm"),
         ] {
-            assert!(classify(instance).is_err(), "{instance:?} must refuse");
+            assert!(classify(&bound, &producer).is_err());
         }
+        bound[1].0 = bound[0].0.clone();
+        assert!(classify(&bound, &bound[0].0).is_err());
     }
 
     #[test]
@@ -339,9 +387,9 @@ mod tests {
         let m = msg();
         let producer = ProducerRef::new("core", "left_arm");
         let just_inside = m.timestamp + HEALTH_STALE_AFTER + TIMESTAMP_SKEW_ALLOWANCE;
-        assert!(parse_report(&producer, &m, just_inside, Instant::now()).is_ok());
+        assert!(parse_report(&sources(), &producer, &m, just_inside, Instant::now()).is_ok());
         let past = just_inside + Duration::from_millis(1);
-        assert!(parse_report(&producer, &m, past, Instant::now()).is_err());
+        assert!(parse_report(&sources(), &producer, &m, past, Instant::now()).is_err());
     }
 
     #[test]
@@ -412,9 +460,7 @@ mod tests {
 
     #[test]
     fn a_gripper_report_with_arm_shaped_vectors_rejects() {
-        // The kind comes from the instance name and the vector length is
-        // validated against it: seven levels from a gripper instance are a
-        // producer bug, not an arm report to reroute.
+        // A bound gripper must report exactly one motor's readings.
         let mut m = msg();
         assert!(parse_fresh("right_gripper", &m).is_err());
         m.level = vec![0];

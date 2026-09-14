@@ -64,7 +64,7 @@ _EXPERIENCE_PATH = _ROBOTS_DIR / "config" / "openarm.sim.kit"
 # The viewport renders with RTX Real-Time 2.0 (`RealTimePathTracing`) and DLSS
 # at 720p. That renderer denoises only through DLSS Ray Reconstruction, which
 # runs on the NGX core library the base image carries (see
-# robot_initializer/scripts/Dockerfile.isaac); Peppy's `--nv` binding does not
+# scripts/Dockerfile.isaac); Peppy's `--nv` binding does not
 # bring the host's copy in. Kit falls back to TAA without a word when the
 # library is missing and streams raw path-tracing noise, so the launcher checks
 # the effective profile once the first frames have rendered.

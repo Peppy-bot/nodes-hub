@@ -6,17 +6,17 @@
 # beside it, and gives a project with no def the scaffolded python base image.
 # There is no def here, which is what these suites want: they render nothing,
 # so a mujoco wheel and a compiled MJCF are the whole of what they need from
-# the engine.
+# the simulation.
 [project]
 name = "openarm-sim-mujoco-tests"
 version = "0.1.0"
 description = "Tests for the openarm_sim_mujoco camera plumbing"
 # The interpreter the node's base image is built on
-# (robot_initializer/scripts/Dockerfile.mujoco: python:3.11-slim).
+# (scripts/Dockerfile.mujoco: python:3.11-slim).
 requires-python = ">=3.11,<3.12"
 dependencies = [
     # The versions the node's base image installs
-    # (robot_initializer/scripts/requirements.mujoco.txt), so the scene these
+    # (scripts/requirements.mujoco.txt), so the scene these
     # suites compile is compiled by the mujoco the node runs on.
     "mujoco==3.10.0",
     "numpy==2.4.4",

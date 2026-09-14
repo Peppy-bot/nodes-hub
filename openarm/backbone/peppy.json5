@@ -222,7 +222,7 @@
       max_ee_angular_velocity_rad_s: "f64",
       // End-effector linear-speed cap (m/s) for the stream chase, used only until
       // the first governor_control message; after that the commander's streamed cap
-      // (openarm_commander) governs. Require > 0. The sim launchers set a
+      // (openarm_web_commander) governs. Require > 0. The sim launchers set a
       // permissive value; the real arm a conservative one.
       max_ee_velocity_m_s: "f64",
       // Largest rate (opening fraction per second) a gripper opening is driven at:

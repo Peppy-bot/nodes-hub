@@ -29,7 +29,7 @@ async fn panel_commands_drive_backbone_and_recorder() -> peppygen::Result<()> {
             recorder_instances: 1,
             ..Config::default()
         },
-        openarm_commander::setup,
+        openarm_web_commander::setup,
     )
     .await?;
 

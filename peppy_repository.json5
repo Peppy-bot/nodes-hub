@@ -11,6 +11,11 @@
         path: "example_robot/episode_recorder/peppy.json5"
       }
     },
+    isaac_webviewer: {
+      v1: {
+        path: "isaac_webviewer/peppy.json5"
+      }
+    },
     lerobot_recorder: {
       v1: {
         path: "lerobot_recorder/peppy.json5"
@@ -56,11 +61,6 @@
         path: "openarm/arm/peppy.json5"
       }
     },
-    openarm_arm_sim: {
-      v1: {
-        path: "openarm/arm_sim/peppy.json5"
-      }
-    },
     openarm_backbone: {
       v1: {
         path: "openarm/backbone/peppy.json5"
@@ -71,14 +71,9 @@
         path: "openarm/gripper/peppy.json5"
       }
     },
-    openarm_gripper_sim: {
+    openarm_initializer: {
       v1: {
-        path: "openarm/gripper_sim/peppy.json5"
-      }
-    },
-    openarm_isaac_webviewer: {
-      v1: {
-        path: "openarm/isaac_webviewer/peppy.json5"
+        path: "openarm/initializer/peppy.json5"
       }
     },
     openarm_ker: {
@@ -86,14 +81,14 @@
         path: "openarm/ker/peppy.json5"
       }
     },
-    openarm_robot_initializer: {
+    openarm_sim_arm: {
       v1: {
-        path: "openarm/robot_initializer/peppy.json5"
+        path: "openarm/sim_arm/peppy.json5"
       }
     },
-    openarm_scene_commander: {
+    openarm_sim_gripper: {
       v1: {
-        path: "openarm/scene_commander/peppy.json5"
+        path: "openarm/sim_gripper/peppy.json5"
       }
     },
     openarm_sim_isaac: {
@@ -119,6 +114,11 @@
     realsense_d4xx: {
       v1: {
         path: "realsense_d4xx/peppy.json5"
+      }
+    },
+    scene_commander: {
+      v1: {
+        path: "scene_commander/peppy.json5"
       }
     },
     sim_rgb_camera: {

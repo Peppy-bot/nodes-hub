@@ -6,7 +6,7 @@ OpenArm v2 1:1 (link lengths scaled to 70%), so leader joint angles map to
 follower joint targets with no coordinate transform. The node reads the KER's
 M5Stack CoreS3 over USB vendor mode (or serial CDC), maps encoder channels
 through the calibration parameters to clamped joint radians and trigger
-openings, and streams them exactly like `openarm_commander`: each limb on its
+openings, and streams them exactly like `openarm_web_commander`: each limb on its
 own joint_link / gripper_link pairing slot (the backbone governs them all).
 
 The thumb button is the engage deadman: a press toggles streaming for the
@@ -46,8 +46,8 @@ To pin them:
    leader joint one at a time to identify its channel and sign against the
    follower's j1..j7 convention; sweep each trigger for its closed/open
    angles.
-4. Record the values in the launcher (`launchers-hub/openarm/
-   openarm_v2_ker_teleop*.json5`) and turn `log_raw` back off.
+4. Record the values as the KER instance's `arguments` in the launcher that
+   deploys it, and turn `log_raw` back off.
 
 First engaged run: keep the backbone's `max_ee_velocity_m_s` conservative;
 engaging with the leader far from the follower pose is governed into a

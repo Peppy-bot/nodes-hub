@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 _NODE_DIR = Path(__file__).resolve().parents[1]
-_SCRIPTS_DIR = _NODE_DIR.parent / "robot_initializer" / "scripts"
+_SCRIPTS_DIR = _NODE_DIR.parent / "scripts"
 
 
 def _shell_value(script: str, name: str) -> str:

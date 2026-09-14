@@ -2396,7 +2396,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
-name = "openarm_commander"
+name = "openarm_description"
+version = "0.1.0"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs?branch=main#acc4fa7a2723b7b321ef0e683076291f82ee2c3f"
+dependencies = [
+ "urdf-rs",
+]
+
+[[package]]
+name = "openarm_web_commander"
 version = "0.1.0"
 dependencies = [
  "axum",
@@ -2412,14 +2420,6 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
- "urdf-rs",
-]
-
-[[package]]
-name = "openarm_description"
-version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs?branch=main#acc4fa7a2723b7b321ef0e683076291f82ee2c3f"
-dependencies = [
  "urdf-rs",
 ]
 

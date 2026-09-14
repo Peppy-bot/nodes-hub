@@ -35,7 +35,7 @@ nvcr.io/nvidia/isaac-sim:6.1.0
 ```
 
 The node builds on `peppybot/openarm-isaac-sim`, which
-`openarm/robot_initializer/scripts/build_base_images.sh` produces from that
+`openarm/scripts/build_base_images.sh` produces from that
 image with the robot assets and the NGX core library baked in.
 
 Systems with less RAM may require additional swap during image build or startup.
@@ -112,7 +112,7 @@ The node renders with RTX Real-Time 2.0 (`RealTimePathTracing`), DLSS
 renderer denoises only through DLSS Ray Reconstruction, which runs on the NGX
 core library shipped with the NVIDIA driver, and Peppy's `--nv` GPU binding does
 not carry the host's copy into the container. The base image therefore carries
-the core itself: `robot_initializer/scripts/Dockerfile.isaac` takes
+the core itself: `scripts/Dockerfile.isaac` takes
 `libnvidia-ngx.so.1` from the driver Isaac Sim 6.1 was tested with, 595.58.03,
 pinned by version and checksum. The core reads the running driver through NVML
 and the DLSS snippets check that version against their own minimum, so the host
@@ -246,7 +246,7 @@ Runtime task scenes are loaded on top of the base environment.
 
 The Isaac base image downloads one complete, prepared bundle from the
 `isaac-sim-assets` R2 bucket. Its immutable versioned key and SHA-256 are pinned in
-`openarm/robot_initializer/scripts/isaac_assets.env`. The Docker build copies
+`openarm/scripts/isaac_assets.env`. The Docker build copies
 that file before downloading, so a pin change invalidates the asset layer's
 cache. It verifies the archive checksum before extraction and never falls back
 to a mutable asset directory. Node image builds and robot startup use only the
@@ -326,7 +326,7 @@ builder to publish the base image:
 ```bash
 RCLONE_S3_ACCESS_KEY_ID="$WALDO_R2_ACCESS_KEY_ID" \
 RCLONE_S3_SECRET_ACCESS_KEY="$WALDO_R2_SECRET_ACCESS_KEY" \
-bash openarm/robot_initializer/scripts/build_base_images.sh --isaac-only
+bash openarm/scripts/build_base_images.sh --isaac-only
 ```
 
 The publisher stamps the node's `From:` tag. Commit the pin and tag together,

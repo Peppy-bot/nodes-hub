@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Isaac Sim SimLauncher for openarm_robot_initializer."""
+"""Isaac Sim SimLauncher for openarm_initializer."""
 
 # pylint: disable=R0903
 
@@ -307,7 +307,7 @@ class SimLauncher:
                 f"{actual[1]!r} instead of the requested {expected[0]!r} and "
                 f"{expected[1]!r}; DLSS runs on the NGX core library "
                 "(libnvidia-ngx.so.1) that the base image carries, see "
-                "robot_initializer/scripts/Dockerfile.isaac"
+                "scripts/Dockerfile.isaac"
             )
 
     def _start_timeline(self) -> None:

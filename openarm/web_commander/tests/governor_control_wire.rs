@@ -30,7 +30,7 @@ async fn every_governor_control_reaches_the_field_it_names() -> peppygen::Result
             parameters: Some(helpers::test_parameters(PANEL_PORT)),
             ..Config::default()
         },
-        openarm_commander::setup,
+        openarm_web_commander::setup,
     )
     .await?;
 

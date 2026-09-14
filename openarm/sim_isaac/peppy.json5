@@ -1,4 +1,4 @@
-// The Isaac Sim engine node.
+// The Isaac Sim simulation node.
 //
 // It plays the follower role of every limb's joint_link / gripper_link
 // pairing: governed arm/gripper setpoints arrive from the simulation relay
@@ -6,7 +6,7 @@
 //
 // The node also implements the scene_control contract on its scene slot:
 // runtime scene/object services and actions consumed by higher-level tools
-// such as openarm_scene_commander.
+// such as scene_commander.
 //
 // Public Peppy interfaces use stable asset_id and object_id identifiers rather
 // than exposing Isaac USD paths directly. The existing TCP runtime commander
@@ -19,14 +19,14 @@
     tag: "v1",
 
     // The scene-editing contract, implemented on the scene slot: any
-    // commander that speaks scene_control can drive this engine.
+    // commander that speaks scene_control can drive this simulation.
     implements: [
       { name: "scene_control", tag: "v1", link_id: "scene" },
     ],
 
     depends_on: {
       pairings: [
-        // The engine plays the follower role of every limb's pairing directly,
+        // The simulation plays the follower role of every limb's pairing directly,
         // one slot per limb. The slot identifies the side, so no arm_id or
         // gripper_id demultiplexing is required.
         //
@@ -36,7 +36,7 @@
         { name: "gripper_link", tag: "v1", role: "follower", link_id: "left_gripper", optional: true },
         { name: "gripper_link", tag: "v1", role: "follower", link_id: "right_gripper", optional: true },
         // Robot-mounted cameras rendered from the live scene, one slot per
-        // camera (the slot is the camera, so no id demux). The engine plays the
+        // camera (the slot is the camera, so no id demux). The simulation plays the
         // camera role; a per-camera relay presents the rgb/rgbd contract.
         // Optional: slots stay unbound (and rendering stays off) outside record
         // stacks; frames flow only when cameras_enabled is set.
@@ -136,7 +136,7 @@
       hardware_version: "string",
 
       // Rate in Hz of the measured joint_states / gripper_states streams.
-      // On a launch that declares this engine its source of simulated time, the
+      // On a launch that declares this simulation its source of simulated time, the
       // same rate is how often the fleet's clock advances, so it also sets how
       // finely every machine of that launch can read time.
       state_rate_hz: "u32",

@@ -1,0 +1,30 @@
+Bootstrap: docker
+From: peppybot/python-uv-base:latest
+
+%labels
+    Name scene_commander
+    Version 0.1.0
+
+%environment
+    export PATH="/opt/scene_commander/.venv/bin:$PATH"
+    export PYTHONPATH="/opt/scene_commander/.peppy/libs/peppygen:/opt/scene_commander/.peppy/libs/peppylib:$PYTHONPATH"
+    export PEPPYGEN_OUTPUT_PATH="/opt/scene_commander/.peppy/libs/peppygen"
+
+%files
+    . /opt/scene_commander
+
+%post
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+
+    # Keep the managed Python installation outside $HOME because
+    # Apptainer may mount the runtime user's home over the image's.
+    export UV_PYTHON_INSTALL_DIR=/opt/uv-python
+
+    cd /opt/scene_commander
+    uv python install
+    uv sync --no-editable --no-dev
+
+%runscript
+    cd /opt/scene_commander
+    exec ./.venv/bin/python -u -m scene_commander 2>&1

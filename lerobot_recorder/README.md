@@ -30,7 +30,7 @@ instance drive every limb, which is the shape the openarm backbone has.
 A limb is named after the follower instance observed for it, and dimension
 names are that name plus a joint index (`left_arm_inst_j0`); a gripper's
 single dimension names the quantity its feature carries
-(`left_grip_inst_opening` in state, `left_grip_inst_effort` in efforts). An
+(`left_gripper_inst_opening` in state, `left_gripper_inst_effort` in efforts). An
 instance that follows several pairings of one kind takes the observed link
 into its name to stay distinct. Joint counts and which optional vectors
 (velocities, efforts) a source delivers are discovered from its first message.

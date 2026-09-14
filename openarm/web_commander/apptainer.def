@@ -2,12 +2,12 @@ Bootstrap: docker
 From: peppybot/rust-cargo-base:latest
 
 %files
-    . /opt/openarm_commander
+    . /opt/openarm_web_commander
 
 %post
-    cd /opt/openarm_commander
+    cd /opt/openarm_web_commander
     cargo build --release
 
 %runscript
-    cd /opt/openarm_commander
-    exec ./target/release/openarm_commander "$@"
+    cd /opt/openarm_web_commander
+    exec ./target/release/openarm_web_commander "$@"

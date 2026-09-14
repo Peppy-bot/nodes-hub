@@ -227,8 +227,9 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
     )
     # Shared by the health listener and the status panel, on the same
     # unwired-is-not-healthy reasoning as the alerts.
-    health_bound = bool(motor_health_topic.bound_producers(node_runner))
-    motor_reports = motor_health.MotorHealthReports(producers_bound=health_bound)
+    motor_reports = motor_health.MotorHealthReports(
+        producers=tuple(p.instance_id for p in motor_health_topic.bound_producers(node_runner)),
+    )
     tasks = [
         asyncio.create_task(
             publish.run_posture_button(
@@ -250,7 +251,7 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
                 alerts.drain_alerts(node_runner, alerts_topic, active_alerts, token)
             )
         )
-    if health_bound:
+    if motor_reports.producers_bound:
         tasks.append(
             asyncio.create_task(
                 motor_health.drain_motor_health(

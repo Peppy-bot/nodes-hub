@@ -10,7 +10,7 @@ use peppygen::emitted_topics::camera::video_stream as camera_video;
 use peppygen::exposed_services::camera::{
     set_brightness, set_contrast, set_exposure, set_gain, set_white_balance, video_stream_info,
 };
-use peppygen::paired_topics::engine::{stream_info, video_stream as engine_video};
+use peppygen::paired_topics::simulation::{stream_info, video_stream as simulation_video};
 use peppygen::{NodeRunner, Parameters, Result};
 use peppylib::runtime::CancellationToken;
 use tracing::{error, info, warn};
@@ -36,7 +36,7 @@ const UNSUPPORTED_MESSAGE: &str = "not adjustable in sim";
 /// zed answer when no usable hardware value exists.
 const NO_CURRENT_VALUE: i32 = -1;
 
-/// The engine's latest stream description; zeros until the first one arrives.
+/// The simulation's latest stream description; zeros until the first one arrives.
 #[derive(Clone, Default)]
 struct StreamDescription {
     width: u32,
@@ -72,11 +72,11 @@ impl RepeatedError {
     }
 }
 
-/// Forward the engine's frames to the contract video_stream.
+/// Forward the simulation's frames to the contract video_stream.
 async fn relay_frames(runner: Arc<NodeRunner>, token: CancellationToken) {
-    let mut sub = match engine_video::subscribe(&runner).await {
+    let mut sub = match simulation_video::subscribe(&runner).await {
         Ok(s) => s,
-        Err(e) => return error!("engine video_stream subscribe: {e}"),
+        Err(e) => return error!("simulation video_stream subscribe: {e}"),
     };
     let publisher = match camera_video::declare_publisher(&runner).await {
         Ok(p) => p,
@@ -96,7 +96,7 @@ async fn relay_frames(runner: Arc<NodeRunner>, token: CancellationToken) {
             Ok(None) => return,
             Err(e) => {
                 receive_errors
-                    .report("engine video_stream receive", e)
+                    .report("simulation video_stream receive", e)
                     .await;
                 continue;
             }
@@ -132,7 +132,7 @@ async fn relay_frames(runner: Arc<NodeRunner>, token: CancellationToken) {
                 failing = false;
                 if first {
                     first = false;
-                    info!("first frame relayed from the engine");
+                    info!("first frame relayed from the simulation");
                 }
             }
             Err(e) if !failing => {
@@ -148,7 +148,7 @@ fn timestamp_is_valid(timestamp: std::time::SystemTime) -> bool {
     timestamp > std::time::SystemTime::UNIX_EPOCH
 }
 
-/// Track the engine's latest stream description for the info service.
+/// Track the simulation's latest stream description for the info service.
 async fn track_stream_info(
     runner: Arc<NodeRunner>,
     description: SharedDescription,
@@ -156,7 +156,7 @@ async fn track_stream_info(
 ) {
     let mut sub = match stream_info::subscribe(&runner).await {
         Ok(s) => s,
-        Err(e) => return error!("engine stream_info subscribe: {e}"),
+        Err(e) => return error!("simulation stream_info subscribe: {e}"),
     };
     let mut receive_errors = RepeatedError::default();
     loop {
@@ -177,7 +177,9 @@ async fn track_stream_info(
             }
             Ok(None) => return,
             Err(e) => {
-                receive_errors.report("engine stream_info receive", e).await;
+                receive_errors
+                    .report("simulation stream_info receive", e)
+                    .await;
             }
         }
     }
