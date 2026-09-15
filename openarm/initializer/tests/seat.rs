@@ -132,6 +132,11 @@ async fn the_robot_takes_its_seat_and_drives_its_limbs_through_it() -> peppygen:
     assert_eq!(left_gripper.opening, 0.75);
     let right_gripper = next_state(mocks.pairings.right_gripper_link.gripper_states.next()).await?;
     assert_eq!(right_gripper.opening, 0.25);
+    assert_eq!(
+        (left_gripper.max_effort, right_gripper.max_effort),
+        (0.0, 0.0),
+        "a gripper nothing has commanded is under no effort control"
+    );
 
     // A relay's setpoint goes out in a command, at the engine's index for
     // that limb.
@@ -176,6 +181,14 @@ async fn the_robot_takes_its_seat_and_drives_its_limbs_through_it() -> peppygen:
         }
     }
     assert!(landed, "the setpoints went out in a command");
+
+    // The ceiling the engine now holds reaches the leader that set it, and
+    // the gripper nobody capped still reports none.
+    seat.publish_feedback(&state(0.1, 0.9)).await?;
+    let right_gripper = next_state(mocks.pairings.right_gripper_link.gripper_states.next()).await?;
+    assert_eq!(right_gripper.max_effort, 2.0);
+    let left_gripper = next_state(mocks.pairings.left_gripper_link.gripper_states.next()).await?;
+    assert_eq!(left_gripper.max_effort, 0.0);
 
     // The engine ends the stay: the node's life ends with its seat.
     seat.complete(&attach::ResultResponseData {

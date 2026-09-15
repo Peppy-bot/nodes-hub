@@ -278,7 +278,12 @@ async fn spawn_state_publishers(
                 let Some(state) = seat.gripper_state(slot, &feedback) else {
                     continue;
                 };
-                let message = build(feedback.timestamp, state.opening, state.effort, 0.0);
+                let message = build(
+                    feedback.timestamp,
+                    state.opening,
+                    state.effort,
+                    seat.gripper_max_effort(slot),
+                );
                 published = published.and(publish(publisher, message).await);
             }
             match published {

@@ -163,6 +163,15 @@ impl Seat {
         self.lock().grippers[index] = Some(command);
     }
 
+    /// The effort ceiling this robot last set on a gripper slot, which the
+    /// engine holds until the next command replaces it. 0 while nothing has
+    /// commanded one, the value the contract reserves for no effort control.
+    pub fn gripper_max_effort(&self, slot: &str) -> f64 {
+        self.gripper_index(slot)
+            .and_then(|index| self.lock().grippers[index])
+            .map_or(0.0, |gripper| gripper.max_effort)
+    }
+
     fn arm_index(&self, slot: &str) -> Option<usize> {
         ARMS.iter()
             .position(|(name, _)| *name == slot)
