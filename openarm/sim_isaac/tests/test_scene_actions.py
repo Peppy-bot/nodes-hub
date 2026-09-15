@@ -192,6 +192,18 @@ def test_load_scene_rejects_unknown_or_non_scene_assets_before_touching_the_stag
     assert _spawned_ids(provider) == [object_id]
 
 
+def test_it_owns_exactly_the_objects_it_spawned_and_has_not_removed(provider):
+    provider.io.set_assets(_CATALOGUE)
+    first, second = _spawn(provider), _spawn(provider)
+    assert (provider.io.owns(first), provider.io.owns(second), provider.io.owns("MyObject")) == (True, True, False)
+
+    provider.io._execute(provider.launcher, "remove_object", {"object_id": first})
+    assert (provider.io.owns(first), provider.io.owns(second)) == (False, True)
+
+    provider.io._execute(provider.launcher, "clear_scene", {})
+    assert not provider.io.owns(second)
+
+
 def _assert_unavailable(response, reason):
     assert response.success is False
     assert reason in response.message

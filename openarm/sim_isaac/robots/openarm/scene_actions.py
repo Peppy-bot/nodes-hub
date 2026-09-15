@@ -178,6 +178,17 @@ class SceneActionIO:
 
             return dict(obj)
 
+    def owns(self, object_id) -> bool:
+        """Whether object_id names an object spawned through scene_control.
+
+        The registry and the stage only stay in step through scene_control,
+        so the runtime commander asks before it removes or replaces a
+        runtime object.
+        """
+
+        with self._lock:
+            return object_id in self._objects
+
     def _public_assets(self) -> list:
         """Return catalogue metadata without exposing raw Isaac paths."""
 
