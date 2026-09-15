@@ -14,8 +14,9 @@
     },
 
     parameters: {
-      // The port the viewer page is served on. One viewer per machine takes
-      // the default; a second names a port of its own.
+      // The port the viewer page is preferred on. A viewer whose port
+      // another process already holds takes one of its own, so two run on
+      // one host without being told apart.
       http_port: { $type: "u16", $default: 8210 },
     },
   },

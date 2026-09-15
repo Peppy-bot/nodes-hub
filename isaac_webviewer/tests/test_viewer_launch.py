@@ -8,7 +8,7 @@ import sys
 import threading
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, call
 
 import pytest
 
@@ -18,8 +18,10 @@ _VIEWER_DIR = Path(__file__).resolve().parents[1]
 @pytest.fixture
 def startup(monkeypatch):
     state = SimpleNamespace(
-        events=[], bind_error=None, thread_error=None,
+        events=[], bind_errors=[], thread_error=None,
         start_error=None, registration_error=None,
+        # The port a launcher prefers for this viewer.
+        params=SimpleNamespace(http_port=8210),
     )
 
     def record(event):
@@ -27,8 +29,9 @@ def startup(monkeypatch):
 
     def bind(address):
         record("bind")
-        if state.bind_error is not None:
-            raise state.bind_error
+        if state.bind_errors:
+            raise state.bind_errors.pop(0)
+        state.server.server_address = address
         return state.server
 
     def make_thread(**kwargs):
@@ -47,7 +50,7 @@ def startup(monkeypatch):
         if state.registration_error is not None:
             raise state.registration_error
 
-    state.server = Mock(spec=["serve_forever", "shutdown", "server_close"])
+    state.server = Mock(spec=["serve_forever", "shutdown", "server_close", "server_address"])
     state.server.shutdown.side_effect = lambda: record("shutdown")
     state.server.server_close.side_effect = lambda: record("close")
     state.server_factory = Mock(side_effect=bind)
@@ -97,7 +100,7 @@ def test_setup_registers_shutdown_after_start_and_cleans_up_off_event_loop(start
     loop_thread = threading.get_ident()
 
     async def run():
-        assert await startup.module.setup({}, startup.runner) == []
+        assert await startup.module.setup(startup.params, startup.runner) == []
         assert [event for event, _ in startup.events] == ["bind", "thread", "start", "register"]
         startup.server.shutdown.assert_not_called()
         startup.server.server_close.assert_not_called()
@@ -121,14 +124,35 @@ def test_setup_registers_shutdown_after_start_and_cleans_up_off_event_loop(start
     assert any("Stopping Isaac Sim browser viewer" in message for message in messages)
 
 
-def test_bind_failure_does_not_start_a_thread_or_register_shutdown(startup, caplog):
+def test_a_taken_port_is_not_a_failure_but_a_port_of_its_own(startup, caplog):
+    """Two viewers run on one host: the configured port is a preference, and a
+    copy whose port is held takes one the operating system picks."""
     caplog.set_level(logging.INFO, logger=startup.module.logger.name)
-    startup.bind_error = OSError(errno.EADDRINUSE, "port occupied")
+    startup.bind_errors = [OSError(errno.EADDRINUSE, "port occupied")]
+
+    async def run():
+        assert await startup.module.setup(startup.params, startup.runner) == []
+
+    asyncio.run(run())
+
+    assert startup.server_factory.call_args_list == [
+        call(("0.0.0.0", 8210)),
+        call(("0.0.0.0", 0)),
+    ]
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("8210 is already taken" in message for message in messages)
+    startup.thread.start.assert_called_once_with()
+
+
+def test_a_bind_failure_that_is_not_a_taken_port_reaches_the_operator(startup, caplog):
+    caplog.set_level(logging.INFO, logger=startup.module.logger.name)
+    refusal = OSError(errno.EADDRNOTAVAIL, "address unavailable")
+    startup.bind_errors = [refusal]
 
     with pytest.raises(OSError) as raised:
-        asyncio.run(startup.module.setup({}, startup.runner))
+        asyncio.run(startup.module.setup(startup.params, startup.runner))
 
-    assert raised.value is startup.bind_error
+    assert raised.value is refusal
     assert [event for event, _ in startup.events] == ["bind"]
     startup.thread_factory.assert_not_called()
     startup.server.shutdown.assert_not_called()
@@ -145,7 +169,7 @@ def test_thread_failure_closes_listener_without_shutting_down_unstarted_server(s
     setattr(startup, failure, error)
 
     with pytest.raises(RuntimeError) as raised:
-        asyncio.run(startup.module.setup({}, startup.runner))
+        asyncio.run(startup.module.setup(startup.params, startup.runner))
 
     assert raised.value is error
     expected = ["bind", "thread"]
@@ -166,7 +190,7 @@ def test_registration_failure_awaits_off_loop_cleanup_before_propagating(startup
     startup.registration_error = RuntimeError("shutdown callback rejected")
 
     with pytest.raises(RuntimeError) as raised:
-        asyncio.run(startup.module.setup({}, startup.runner))
+        asyncio.run(startup.module.setup(startup.params, startup.runner))
 
     assert raised.value is startup.registration_error
     assert [event for event, _ in startup.events] == [

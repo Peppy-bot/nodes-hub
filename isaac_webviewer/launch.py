@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import logging
 import threading
 
@@ -19,11 +20,34 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
+# Binding this port has the operating system choose a free one, which is what
+# the viewer falls back to when the launcher's port is already taken.
+ANY_PORT = 0
+
+
+def _serve(preferred_port: int) -> ViewerServer:
+    """The viewer's server on `preferred_port`, or on a port the operating
+    system picks when another process already holds it.
+
+    Only a port conflict falls back, so two viewers on one host each get one;
+    any other bind failure reaches the operator naming what to fix.
+    """
+    try:
+        return ViewerServer(("0.0.0.0", preferred_port))
+    except OSError as error:
+        if error.errno != errno.EADDRINUSE:
+            raise
+        logger.info(
+            "port %s is already taken; the viewer takes one of its own",
+            preferred_port,
+        )
+        return ViewerServer(("0.0.0.0", ANY_PORT))
+
 
 async def setup(params, node_runner) -> list:
     """Serve the WebRTC viewer and log its browser diagnostics."""
 
-    server = ViewerServer(("0.0.0.0", params.http_port))
+    server = _serve(params.http_port)
     try:
         thread = threading.Thread(target=server.serve_forever, name="isaac-viewer", daemon=True)
         thread.start()
@@ -49,7 +73,7 @@ async def setup(params, node_runner) -> list:
     logger.info(
         "Isaac Sim browser WebRTC viewer listening on 0.0.0.0:%s; "
         "browser warnings and errors are forwarded to this node log",
-        params.http_port,
+        server.server_address[1],
     )
     return []
 
