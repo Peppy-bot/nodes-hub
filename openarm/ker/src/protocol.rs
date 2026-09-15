@@ -19,6 +19,7 @@ use std::fmt;
 
 pub const CMD_PING: u8 = 0x00;
 pub const CMD_STANDBY: u8 = 0x01;
+pub const CMD_STREAM: u8 = 0x02;
 pub const PING_HEADER: [u8; 2] = [0xA5, 0x50];
 pub const STREAM_HEADER: [u8; 2] = [0xA5, 0x5A];
 
@@ -319,16 +320,12 @@ fn padded_str(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod fixtures {
+    //! Device-side byte builders shared by this crate's tests.
+
     use super::*;
 
-    /// The layout the reader builds; deframer sizing goes through it here too,
-    /// so the tests exercise the single derivation production uses.
-    fn layout_of(schema: &Schema) -> FrameLayout {
-        FrameLayout::try_new(schema).expect("layout")
-    }
-
-    fn padded(s: &str, len: usize) -> Vec<u8> {
+    pub(crate) fn padded(s: &str, len: usize) -> Vec<u8> {
         let mut v = s.as_bytes().to_vec();
         assert!(v.len() <= len);
         v.resize(len, 0);
@@ -338,7 +335,7 @@ mod tests {
     /// A ping response for the reference schema: timestamp u32, angles f32 x
     /// `channels`, then encoder_value i32 and encoder_button bool, which this
     /// node skips by size.
-    fn ping_response(channels: u8) -> Vec<u8> {
+    pub(crate) fn ping_response(channels: u8) -> Vec<u8> {
         let mut v = PING_HEADER.to_vec();
         v.extend(padded("v1.0.0", FW_LEN));
         v.extend(padded("KER-v1.0.0", HW_LEN));
@@ -357,15 +354,13 @@ mod tests {
         v
     }
 
-    fn reference_schema(channels: u8) -> Schema {
-        match Schema::parse_ping(&ping_response(channels)) {
-            PingParse::Parsed { schema, .. } => schema,
-            other => panic!("expected parse, got {other:?}"),
-        }
-    }
-
     /// A stream packet for the reference schema, with a valid checksum.
-    fn stream_packet(timestamp: u32, angles: &[f32], encoder: i32, button: bool) -> Vec<u8> {
+    pub(crate) fn stream_packet(
+        timestamp: u32,
+        angles: &[f32],
+        encoder: i32,
+        button: bool,
+    ) -> Vec<u8> {
         let mut payload = timestamp.to_le_bytes().to_vec();
         for a in angles {
             payload.extend(a.to_le_bytes());
@@ -376,6 +371,25 @@ mod tests {
         packet.push(xor_checksum(&payload));
         packet.splice(2..2, payload);
         packet
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixtures::*;
+    use super::*;
+
+    /// The layout the reader builds; deframer sizing goes through it here too,
+    /// so the tests exercise the single derivation production uses.
+    fn layout_of(schema: &Schema) -> FrameLayout {
+        FrameLayout::try_new(schema).expect("layout")
+    }
+
+    fn reference_schema(channels: u8) -> Schema {
+        match Schema::parse_ping(&ping_response(channels)) {
+            PingParse::Parsed { schema, .. } => schema,
+            other => panic!("expected parse, got {other:?}"),
+        }
     }
 
     #[test]

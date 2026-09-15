@@ -19,8 +19,10 @@ use tokio::sync::{oneshot, watch};
 use tracing::{error, info, warn};
 
 use crate::mapping::Calibration;
-use crate::protocol::{CMD_PING, CMD_STANDBY, Deframer, FrameLayout, KerFrame, PingParse, Schema};
-use crate::transport::{self, TransportConfig};
+use crate::protocol::{
+    CMD_PING, CMD_STANDBY, CMD_STREAM, Deframer, FrameLayout, KerFrame, PingParse, Schema,
+};
+use crate::transport::{self, KerTransport, TransportConfig};
 
 /// A launcher `engage_opening` outside [0, 1).
 #[derive(Debug, thiserror::Error)]
@@ -38,6 +40,36 @@ const SILENCE_RECONNECT: Duration = Duration::from_secs(5);
 /// This many corrupt frames in a row means framing is lost; reconnect.
 const MAX_CONSECUTIVE_BAD_CHECKSUMS: u32 = 50;
 const RAW_LOG_INTERVAL: Duration = Duration::from_secs(1);
+
+/// A launcher `gripper_open_fraction` outside (0, 1].
+#[derive(Debug, thiserror::Error)]
+#[error("gripper_open_fraction must be in (0, 1], got {0}")]
+pub struct GripperOpenFractionOutOfRange(pub f64);
+
+/// The gripper opening a released trigger commands; a full squeeze closes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GripperOpenFraction(f64);
+
+impl GripperOpenFraction {
+    pub fn fraction(self) -> f64 {
+        self.0
+    }
+
+    /// The opening commanded for a trigger opening (1 released, 0 squeezed).
+    fn opening(self, trigger_opening: f64) -> f64 {
+        self.0 * trigger_opening
+    }
+}
+
+impl TryFrom<f64> for GripperOpenFraction {
+    type Error = GripperOpenFractionOutOfRange;
+
+    fn try_from(fraction: f64) -> Result<Self, Self::Error> {
+        (fraction > 0.0 && fraction <= 1.0)
+            .then_some(Self(fraction))
+            .ok_or(GripperOpenFractionOutOfRange(fraction))
+    }
+}
 
 /// The trigger opening at or below which a squeeze engages its arm; strictly
 /// below 1 (fully open).
@@ -78,7 +110,7 @@ impl Engaged {
 }
 
 /// One calibrated bimanual sample: what the publish tasks stream for each
-/// engaged arm while fresh.
+/// engaged arm while fresh. Openings are the commanded gripper openings.
 #[derive(Debug, Clone)]
 pub struct KerSample {
     pub left_joints: [f64; ARM_DOF],
@@ -109,6 +141,7 @@ pub struct ReaderConfig {
     pub transport: TransportConfig,
     pub calibration: Calibration,
     pub engage_opening: EngageOpening,
+    pub gripper_open_fraction: GripperOpenFraction,
     pub stale_timeout: Duration,
     pub log_raw: bool,
 }
@@ -190,12 +223,20 @@ fn session(
     tx: &watch::Sender<Option<KerSample>>,
     token: &CancellationToken,
 ) -> SessionEnd {
-    let mut transport = match transport::open(&cfg.transport) {
-        Ok(t) => t,
-        Err(e) => return SessionEnd::Transient(format!("open: {e}")),
-    };
+    match transport::open(&cfg.transport) {
+        Ok(mut transport) => run_session(transport.as_mut(), cfg, tx, token),
+        Err(e) => SessionEnd::Transient(format!("open: {e}")),
+    }
+}
 
-    let (schema, leftover) = match handshake(transport.as_mut(), token) {
+/// Handshake, start the stream, and map frames until the link breaks.
+fn run_session(
+    transport: &mut dyn KerTransport,
+    cfg: &ReaderConfig,
+    tx: &watch::Sender<Option<KerSample>>,
+    token: &CancellationToken,
+) -> SessionEnd {
+    let (schema, leftover) = match handshake(transport, token) {
         Ok(parsed) => parsed,
         Err(end) => return end,
     };
@@ -217,6 +258,10 @@ fn session(
         schema.metadata.updated,
         layout.angle_count()
     );
+    // The firmware answers PING in standby; frames flow once STREAM arrives.
+    if let Err(e) = transport.write_all(&[CMD_STREAM]) {
+        return SessionEnd::Transient(format!("start stream: {e}"));
+    }
 
     let mut deframer = Deframer::new(layout.payload_len());
     deframer.push(&leftover);
@@ -259,7 +304,12 @@ fn session(
                 last_raw_log = Instant::now();
                 info!("KER raw: {}", format_raw(&frame));
             }
-            match map_sample(&cfg.calibration, &frame, &mut engage) {
+            match map_sample(
+                &cfg.calibration,
+                cfg.gripper_open_fraction,
+                &frame,
+                &mut engage,
+            ) {
                 Ok(sample) => {
                     mapping_warned = false;
                     if tx.send(Some(sample)).is_err() {
@@ -284,7 +334,7 @@ fn session(
 /// STANDBY, flush, then ping until the schema arrives (or the deadline).
 /// Returns the schema and any stream bytes read past it.
 fn handshake(
-    transport: &mut dyn transport::KerTransport,
+    transport: &mut dyn KerTransport,
     token: &CancellationToken,
 ) -> Result<(Schema, Vec<u8>), SessionEnd> {
     let transient = |e| SessionEnd::Transient(format!("handshake: {e}"));
@@ -368,22 +418,25 @@ impl EngageLatch {
     }
 }
 
+/// Engagement reads the trigger's own travel; the gripper is commanded that
+/// travel scaled by the open fraction.
 fn map_sample(
     calibration: &Calibration,
+    gripper_open_fraction: GripperOpenFraction,
     frame: &KerFrame,
     engage: &mut EngageLatch,
 ) -> Result<KerSample, crate::mapping::MapError> {
     let left_joints = calibration.left.joint_radians(&frame.angles_deg)?;
     let right_joints = calibration.right.joint_radians(&frame.angles_deg)?;
-    let left_opening = calibration.left_trigger.opening(&frame.angles_deg)?;
-    let right_opening = calibration.right_trigger.opening(&frame.angles_deg)?;
+    let left_trigger = calibration.left_trigger.opening(&frame.angles_deg)?;
+    let right_trigger = calibration.right_trigger.opening(&frame.angles_deg)?;
     let received_at = Instant::now();
     Ok(KerSample {
         left_joints,
         right_joints,
-        left_opening,
-        right_opening,
-        engaged: engage.update(left_opening, right_opening, received_at),
+        left_opening: gripper_open_fraction.opening(left_trigger),
+        right_opening: gripper_open_fraction.opening(right_trigger),
+        engaged: engage.update(left_trigger, right_trigger, received_at),
         received_at,
     })
 }
@@ -429,6 +482,157 @@ mod tests {
 
     fn latch() -> EngageLatch {
         EngageLatch::new(EngageOpening::try_from(ENGAGE_AT).expect("in range"), STALE)
+    }
+
+    /// A KER that answers PING with the reference schema and sends frames
+    /// only once STREAM arrives, as firmware 2.0.0 does.
+    struct FakeKer {
+        writes: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        pending: Vec<u8>,
+        streaming: bool,
+    }
+
+    impl KerTransport for FakeKer {
+        fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+            self.writes.lock().unwrap().extend_from_slice(bytes);
+            match bytes {
+                [CMD_PING] => self
+                    .pending
+                    .extend(crate::protocol::fixtures::ping_response(16)),
+                [CMD_STREAM] => self.streaming = true,
+                _ => {}
+            }
+            Ok(())
+        }
+
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.pending.is_empty() && self.streaming {
+                self.pending
+                    .extend(crate::protocol::fixtures::stream_packet(
+                        1, &[0.0; 16], 0, false,
+                    ));
+            }
+            if self.pending.is_empty() {
+                std::thread::sleep(Duration::from_millis(1));
+                return Ok(0);
+            }
+            let n = self.pending.len().min(buf.len());
+            buf[..n].copy_from_slice(&self.pending[..n]);
+            self.pending.drain(..n);
+            Ok(n)
+        }
+
+        fn flush_input(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_session_starts_the_stream_after_the_handshake() {
+        const SAMPLE_DEADLINE: Duration = Duration::from_secs(2);
+        let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut ker = FakeKer {
+            writes: writes.clone(),
+            pending: Vec::new(),
+            streaming: false,
+        };
+        let cfg = ReaderConfig {
+            transport: TransportConfig::Usb,
+            calibration: calibration(),
+            engage_opening: EngageOpening::try_from(ENGAGE_AT).expect("in range"),
+            gripper_open_fraction: GripperOpenFraction::try_from(0.5).expect("in range"),
+            stale_timeout: STALE,
+            log_raw: false,
+        };
+        let (tx, rx) = watch::channel(None);
+        let token = CancellationToken::new();
+        let session = {
+            let token = token.clone();
+            std::thread::spawn(move || run_session(&mut ker, &cfg, &tx, &token))
+        };
+
+        let deadline = Instant::now() + SAMPLE_DEADLINE;
+        while rx.borrow().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let sampled = rx.borrow().is_some();
+        token.cancel();
+        assert!(matches!(session.join().unwrap(), SessionEnd::Stop));
+
+        assert!(sampled, "no frame reached the sample channel");
+        let writes = writes.lock().unwrap();
+        let ping = writes.iter().position(|&b| b == CMD_PING).expect("pinged");
+        let stream = writes
+            .iter()
+            .position(|&b| b == CMD_STREAM)
+            .expect("stream started");
+        assert!(ping < stream, "STREAM follows the handshake: {writes:?}");
+        assert_eq!(writes.last(), Some(&CMD_STANDBY), "leaves the device quiet");
+    }
+
+    #[test]
+    fn gripper_open_fraction_accepts_only_fractions_in_zero_exclusive_to_one() {
+        for fraction in [0.01, 0.5, 1.0] {
+            assert!(
+                GripperOpenFraction::try_from(fraction).is_ok(),
+                "{fraction}"
+            );
+        }
+        for fraction in [0.0, -0.5, 1.01, f64::NAN, f64::INFINITY] {
+            assert!(
+                GripperOpenFraction::try_from(fraction).is_err(),
+                "{fraction}"
+            );
+        }
+    }
+
+    /// Identity wiring with both triggers closed at 60 deg and open at 0.
+    fn calibration() -> Calibration {
+        Calibration::parse(
+            openarm_description::HardwareVersion::V2,
+            &crate::mapping::CalibrationParams {
+                left_channels: "1,2,3,4,5,6,7",
+                left_signs: "1,1,1,1,1,1,1",
+                left_offsets_deg: "0,0,0,0,0,0,0",
+                right_channels: "9,10,11,12,13,14,15",
+                right_signs: "1,1,1,1,1,1,1",
+                right_offsets_deg: "0,0,0,0,0,0,0",
+                left_trigger_channel: 8,
+                left_trigger_closed_deg: 60.0,
+                left_trigger_open_deg: 0.0,
+                right_trigger_channel: 16,
+                right_trigger_closed_deg: 60.0,
+                right_trigger_open_deg: 0.0,
+            },
+        )
+        .expect("valid calibration")
+    }
+
+    fn frame(left_trigger_deg: f32, right_trigger_deg: f32) -> KerFrame {
+        let mut angles_deg = vec![0.0; 16];
+        angles_deg[7] = left_trigger_deg;
+        angles_deg[15] = right_trigger_deg;
+        KerFrame {
+            timestamp: 0,
+            angles_deg,
+        }
+    }
+
+    #[test]
+    fn the_gripper_is_commanded_the_scaled_trigger_but_engage_reads_the_trigger() {
+        let half = GripperOpenFraction::try_from(0.5).expect("in range");
+        let mut latch = latch();
+        // Released: the gripper rests at the open fraction.
+        let released = map_sample(&calibration(), half, &frame(0.0, 0.0), &mut latch).unwrap();
+        assert_eq!((released.left_opening, released.right_opening), (0.5, 0.5));
+        // Trigger travel 0.3 commands 0.15, below ENGAGE_AT, yet engages nothing.
+        let partial = map_sample(&calibration(), half, &frame(42.0, 0.0), &mut latch).unwrap();
+        assert!((partial.left_opening - 0.15).abs() < 1e-9);
+        assert_eq!(partial.engaged, Engaged::default());
+        // A full squeeze closes the gripper and engages that arm.
+        let squeezed = map_sample(&calibration(), half, &frame(60.0, 0.0), &mut latch).unwrap();
+        assert_eq!(squeezed.left_opening, 0.0);
+        assert_eq!(squeezed.engaged, LEFT);
     }
 
     #[test]

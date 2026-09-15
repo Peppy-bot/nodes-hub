@@ -14,7 +14,7 @@ use tracing::{error, info, warn};
 
 use crate::mapping::{Calibration, CalibrationParams};
 use crate::publish;
-use crate::reader::{self, EngageOpening, ReaderConfig};
+use crate::reader::{self, EngageOpening, GripperOpenFraction, ReaderConfig};
 use crate::transport::TransportConfig;
 
 const DATASTORE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -52,6 +52,9 @@ pub enum NodeError {
 
     #[error(transparent)]
     EngageOpening(#[from] crate::reader::EngageOpeningOutOfRange),
+
+    #[error(transparent)]
+    GripperOpenFraction(#[from] crate::reader::GripperOpenFractionOutOfRange),
 
     #[error("calibration")]
     Calibration(#[from] crate::mapping::MapError),
@@ -119,6 +122,7 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     let transport =
         TransportConfig::parse(&params.transport, &params.serial_port, params.serial_baud)?;
     let engage_opening = EngageOpening::try_from(params.engage_opening)?;
+    let gripper_open_fraction = GripperOpenFraction::try_from(params.gripper_open_fraction)?;
     let calibration = Calibration::parse(
         version,
         &CalibrationParams {
@@ -139,9 +143,10 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
 
     info!(
         "config: {version} follower, transport {transport:?}, {} Hz, engage at trigger \
-         opening <= {}, {} channels required",
+         opening <= {}, released gripper opening {}, {} channels required",
         params.command_rate_hz,
         engage_opening.fraction(),
+        gripper_open_fraction.fraction(),
         calibration.required_channels()
     );
 
@@ -183,6 +188,7 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
             transport,
             calibration,
             engage_opening,
+            gripper_open_fraction,
             stale_timeout,
             log_raw: params.log_raw,
         },

@@ -91,6 +91,8 @@
       // reconnects. Required: how deep a squeeze starts motion is a deployment
       // choice.
       engage_opening: "f64",
+      // Opening commanded at a released trigger; a squeeze spans [0, this].
+      gripper_open_fraction: { $type: "f64", $default: 1.0 },
       // Stop publishing when the newest KER frame is older than this (s); the
       // followers then hold their last setpoints, and both arms disengage.
       // Must exceed the device's frame period.

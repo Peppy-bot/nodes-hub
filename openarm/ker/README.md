@@ -10,7 +10,9 @@ openings, and streams them exactly like `openarm_web_commander`: each limb on it
 own joint_link / gripper_link pairing slot (the backbone governs them all).
 
 Each arm engages on its first trigger squeeze (an opening at or below
-`engage_opening`); from then on that arm and its gripper track the KER. A
+`engage_opening`); from then on that arm and its gripper track the KER. The
+trigger drives the gripper: released commands `gripper_open_fraction`, and a
+full squeeze closes it. A
 leader whose frames stop for `stale_timeout_s`, or that reconnects,
 disengages both arms and publishes nothing, so every consumer's stream
 timeout holds the robot. Squeeze again to re-engage.
