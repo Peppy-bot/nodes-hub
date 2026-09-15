@@ -18,7 +18,7 @@ use peppylib::runtime::CancellationToken;
 use tokio::sync::{oneshot, watch};
 use tracing::{error, info, warn};
 
-use crate::mapping::Calibration;
+use crate::mapping::{Calibration, REQUIRED_CHANNELS, check_hardware};
 use crate::protocol::{
     CMD_PING, CMD_STANDBY, CMD_STREAM, Deframer, FrameLayout, KerFrame, PingParse, Schema,
 };
@@ -177,6 +177,7 @@ pub fn spawn(
     Ok(exited_rx)
 }
 
+#[derive(Debug)]
 enum SessionEnd {
     /// The token was cancelled, or the sample channel closed; `run` reads the
     /// token to tell the two apart.
@@ -244,10 +245,12 @@ fn run_session(
         Ok(layout) => layout,
         Err(e) => return SessionEnd::Fatal(e.to_string()),
     };
-    let required = cfg.calibration.required_channels();
-    if layout.angle_count() < required {
+    if let Err(e) = check_hardware(&schema.metadata.hardware) {
+        return SessionEnd::Fatal(e.to_string());
+    }
+    if layout.angle_count() < REQUIRED_CHANNELS {
         return SessionEnd::Fatal(format!(
-            "calibration references CH{required:02} but the device streams only {} channels",
+            "the channel map reads CH{REQUIRED_CHANNELS:02} but the device streams only {} channels",
             layout.angle_count()
         ));
     }
@@ -487,9 +490,32 @@ mod tests {
     /// A KER that answers PING with the reference schema and sends frames
     /// only once STREAM arrives, as firmware 2.0.0 does.
     struct FakeKer {
+        hardware: &'static str,
         writes: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
         pending: Vec<u8>,
         streaming: bool,
+    }
+
+    impl FakeKer {
+        fn new(hardware: &'static str, writes: std::sync::Arc<std::sync::Mutex<Vec<u8>>>) -> Self {
+            Self {
+                hardware,
+                writes,
+                pending: Vec::new(),
+                streaming: false,
+            }
+        }
+    }
+
+    fn reader_config() -> ReaderConfig {
+        ReaderConfig {
+            transport: TransportConfig::Usb,
+            calibration: calibration(),
+            engage_opening: EngageOpening::try_from(ENGAGE_AT).expect("in range"),
+            gripper_open_fraction: GripperOpenFraction::try_from(0.5).expect("in range"),
+            stale_timeout: STALE,
+            log_raw: false,
+        }
     }
 
     impl KerTransport for FakeKer {
@@ -498,7 +524,10 @@ mod tests {
             match bytes {
                 [CMD_PING] => self
                     .pending
-                    .extend(crate::protocol::fixtures::ping_response(16)),
+                    .extend(crate::protocol::fixtures::ping_response_for(
+                        self.hardware,
+                        16,
+                    )),
                 [CMD_STREAM] => self.streaming = true,
                 _ => {}
             }
@@ -531,19 +560,8 @@ mod tests {
     fn a_session_starts_the_stream_after_the_handshake() {
         const SAMPLE_DEADLINE: Duration = Duration::from_secs(2);
         let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let mut ker = FakeKer {
-            writes: writes.clone(),
-            pending: Vec::new(),
-            streaming: false,
-        };
-        let cfg = ReaderConfig {
-            transport: TransportConfig::Usb,
-            calibration: calibration(),
-            engage_opening: EngageOpening::try_from(ENGAGE_AT).expect("in range"),
-            gripper_open_fraction: GripperOpenFraction::try_from(0.5).expect("in range"),
-            stale_timeout: STALE,
-            log_raw: false,
-        };
+        let mut ker = FakeKer::new("2.0.0", writes.clone());
+        let cfg = reader_config();
         let (tx, rx) = watch::channel(None);
         let token = CancellationToken::new();
         let session = {
@@ -571,6 +589,24 @@ mod tests {
     }
 
     #[test]
+    fn a_session_refuses_a_device_of_another_hardware_generation() {
+        let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut ker = FakeKer::new("3.0.0", writes.clone());
+        let cfg = reader_config();
+        let (tx, rx) = watch::channel(None);
+        let token = CancellationToken::new();
+
+        let end = run_session(&mut ker, &cfg, &tx, &token);
+
+        assert!(matches!(end, SessionEnd::Fatal(_)), "{end:?}");
+        assert!(rx.borrow().is_none(), "a refused device streams nothing");
+        assert!(
+            !writes.lock().unwrap().contains(&CMD_STREAM),
+            "a refused device is never started"
+        );
+    }
+
+    #[test]
     fn gripper_open_fraction_accepts_only_fractions_in_zero_exclusive_to_one() {
         for fraction in [0.01, 0.5, 1.0] {
             assert!(
@@ -586,32 +622,16 @@ mod tests {
         }
     }
 
-    /// Identity wiring with both triggers closed at 60 deg and open at 0.
     fn calibration() -> Calibration {
-        Calibration::parse(
-            openarm_description::HardwareVersion::V2,
-            &crate::mapping::CalibrationParams {
-                left_channels: "1,2,3,4,5,6,7",
-                left_signs: "1,1,1,1,1,1,1",
-                left_offsets_deg: "0,0,0,0,0,0,0",
-                right_channels: "9,10,11,12,13,14,15",
-                right_signs: "1,1,1,1,1,1,1",
-                right_offsets_deg: "0,0,0,0,0,0,0",
-                left_trigger_channel: 8,
-                left_trigger_closed_deg: 60.0,
-                left_trigger_open_deg: 0.0,
-                right_trigger_channel: 16,
-                right_trigger_closed_deg: 60.0,
-                right_trigger_open_deg: 0.0,
-            },
-        )
-        .expect("valid calibration")
+        Calibration::for_follower(openarm_description::HardwareVersion::V2)
     }
 
-    fn frame(left_trigger_deg: f32, right_trigger_deg: f32) -> KerFrame {
+    /// Trigger angles in degrees: released reads 0, a full squeeze -60 on the
+    /// right (CH08) and +60 on the left (CH16).
+    fn frame(right_trigger_deg: f32, left_trigger_deg: f32) -> KerFrame {
         let mut angles_deg = vec![0.0; 16];
-        angles_deg[7] = left_trigger_deg;
-        angles_deg[15] = right_trigger_deg;
+        angles_deg[7] = right_trigger_deg;
+        angles_deg[15] = left_trigger_deg;
         KerFrame {
             timestamp: 0,
             angles_deg,
@@ -626,13 +646,13 @@ mod tests {
         let released = map_sample(&calibration(), half, &frame(0.0, 0.0), &mut latch).unwrap();
         assert_eq!((released.left_opening, released.right_opening), (0.5, 0.5));
         // Trigger travel 0.3 commands 0.15, below ENGAGE_AT, yet engages nothing.
-        let partial = map_sample(&calibration(), half, &frame(42.0, 0.0), &mut latch).unwrap();
-        assert!((partial.left_opening - 0.15).abs() < 1e-9);
+        let partial = map_sample(&calibration(), half, &frame(-42.0, 0.0), &mut latch).unwrap();
+        assert!((partial.right_opening - 0.15).abs() < 1e-9);
         assert_eq!(partial.engaged, Engaged::default());
         // A full squeeze closes the gripper and engages that arm.
-        let squeezed = map_sample(&calibration(), half, &frame(60.0, 0.0), &mut latch).unwrap();
-        assert_eq!(squeezed.left_opening, 0.0);
-        assert_eq!(squeezed.engaged, LEFT);
+        let squeezed = map_sample(&calibration(), half, &frame(-60.0, 0.0), &mut latch).unwrap();
+        assert_eq!(squeezed.right_opening, 0.0);
+        assert_eq!(squeezed.engaged, RIGHT);
     }
 
     #[test]

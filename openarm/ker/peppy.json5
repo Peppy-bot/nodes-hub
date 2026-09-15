@@ -62,29 +62,6 @@
       // Rate (Hz) at which engaged setpoints are re-published on the arm and
       // gripper pairing slots.
       command_rate_hz: "u32",
-      // KER channel wiring and calibration, CSV strings parsed once at
-      // startup. Channels are the device's 1-based CH indices; each side lists
-      // its 7 joint channels in j1..j7 order. Signs are +-1 per joint;
-      // offsets_deg are added after the sign, in the follower's joint frame.
-      // Required, never defaulted: these are physical facts of one KER unit
-      // pinned during bring-up, and a wrong guess streams a miscalibrated
-      // pose.
-      left_channels: "string",
-      right_channels: "string",
-      left_signs: "string",
-      right_signs: "string",
-      left_offsets_deg: "string",
-      right_offsets_deg: "string",
-      // Trigger (J8) channels and their angle (deg) at closed (opening 0) and
-      // fully open (opening 1); openings interpolate linearly and clamp to
-      // [0, 1]. Per side: the mirrored trigger mechanisms may read opposite
-      // directions.
-      left_trigger_channel: "u32",
-      right_trigger_channel: "u32",
-      left_trigger_closed_deg: "f64",
-      left_trigger_open_deg: "f64",
-      right_trigger_closed_deg: "f64",
-      right_trigger_open_deg: "f64",
       // Trigger opening fraction in [0, 1) at or below which a squeeze engages
       // that arm: from its first such frame the arm and its gripper track the
       // KER, until usable frames stop for stale_timeout_s or the device

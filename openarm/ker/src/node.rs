@@ -12,7 +12,7 @@ use peppylib::datastore::{self, Encoding};
 use tokio::sync::watch;
 use tracing::{error, info, warn};
 
-use crate::mapping::{Calibration, CalibrationParams};
+use crate::mapping::Calibration;
 use crate::publish;
 use crate::reader::{self, EngageOpening, GripperOpenFraction, ReaderConfig};
 use crate::transport::TransportConfig;
@@ -55,9 +55,6 @@ pub enum NodeError {
 
     #[error(transparent)]
     GripperOpenFraction(#[from] crate::reader::GripperOpenFractionOutOfRange),
-
-    #[error("calibration")]
-    Calibration(#[from] crate::mapping::MapError),
 
     #[error("instance lock {key} held by {holder}")]
     LockHeld { key: String, holder: String },
@@ -123,31 +120,14 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         TransportConfig::parse(&params.transport, &params.serial_port, params.serial_baud)?;
     let engage_opening = EngageOpening::try_from(params.engage_opening)?;
     let gripper_open_fraction = GripperOpenFraction::try_from(params.gripper_open_fraction)?;
-    let calibration = Calibration::parse(
-        version,
-        &CalibrationParams {
-            left_channels: &params.left_channels,
-            left_signs: &params.left_signs,
-            left_offsets_deg: &params.left_offsets_deg,
-            right_channels: &params.right_channels,
-            right_signs: &params.right_signs,
-            right_offsets_deg: &params.right_offsets_deg,
-            left_trigger_channel: params.left_trigger_channel,
-            left_trigger_closed_deg: params.left_trigger_closed_deg,
-            left_trigger_open_deg: params.left_trigger_open_deg,
-            right_trigger_channel: params.right_trigger_channel,
-            right_trigger_closed_deg: params.right_trigger_closed_deg,
-            right_trigger_open_deg: params.right_trigger_open_deg,
-        },
-    )?;
+    let calibration = Calibration::for_follower(version);
 
     info!(
         "config: {version} follower, transport {transport:?}, {} Hz, engage at trigger \
-         opening <= {}, released gripper opening {}, {} channels required",
+         opening <= {}, released gripper opening {}",
         params.command_rate_hz,
         engage_opening.fraction(),
         gripper_open_fraction.fraction(),
-        calibration.required_channels()
     );
 
     // Instance lock: refuse to start if another instance is running. Held in the

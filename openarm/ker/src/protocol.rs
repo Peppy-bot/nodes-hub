@@ -336,10 +336,15 @@ pub(crate) mod fixtures {
     /// `channels`, then encoder_value i32 and encoder_button bool, which this
     /// node skips by size.
     pub(crate) fn ping_response(channels: u8) -> Vec<u8> {
+        ping_response_for("2.0.0", channels)
+    }
+
+    /// The same response for a chosen hardware version.
+    pub(crate) fn ping_response_for(hardware: &str, channels: u8) -> Vec<u8> {
         let mut v = PING_HEADER.to_vec();
-        v.extend(padded("v1.0.0", FW_LEN));
-        v.extend(padded("KER-v1.0.0", HW_LEN));
-        v.extend(padded("2026-05-25", UPDATED_LEN));
+        v.extend(padded("2.0.0", FW_LEN));
+        v.extend(padded(hardware, HW_LEN));
+        v.extend(padded("2026-06-22", UPDATED_LEN));
         v.push(4);
         for (key, type_id, count) in [
             ("timestamp", 0u8, 1u8),
@@ -399,9 +404,9 @@ mod tests {
             panic!("expected parse");
         };
         assert_eq!(consumed, response.len());
-        assert_eq!(schema.metadata.firmware, "v1.0.0");
-        assert_eq!(schema.metadata.hardware, "KER-v1.0.0");
-        assert_eq!(schema.metadata.updated, "2026-05-25");
+        assert_eq!(schema.metadata.firmware, "2.0.0");
+        assert_eq!(schema.metadata.hardware, "2.0.0");
+        assert_eq!(schema.metadata.updated, "2026-06-22");
         assert_eq!(schema.fields.len(), 4);
         assert_eq!(schema.fields[1].key, "angles");
         assert_eq!(schema.fields[1].ty, FieldType::F32);
