@@ -1,5 +1,6 @@
 """The bridge drops its articulation handles on request and re-creates them on
-the next step, keeping the camera render products."""
+the next step, keeping the camera render products; its state tick carries the
+spawned objects' snapshot."""
 
 import importlib.util
 import logging
@@ -28,7 +29,7 @@ def bridge(monkeypatch):
     monkeypatch.setattr(bridge_extension, "IsaacCameraSensor", Mock())
     monkeypatch.setattr(bridge_extension, "load_camera_configs", Mock(return_value=[]))
     monkeypatch.setattr(bridge_extension, "validate_camera_slots", Mock())
-    extension = bridge_extension.IsaacBridgeExtension(Mock(), state_rate_hz=60, cameras_enabled=True)
+    extension = bridge_extension.IsaacBridgeExtension(Mock(), Mock(), state_rate_hz=60, cameras_enabled=True)
 
     joints = [j for arm in extension._arms for j in arm["joints"]] + [
         f for g in extension._grippers for f in g["fingers"]
@@ -103,3 +104,35 @@ def test_invalidation_before_readiness_is_silent_and_still_drops_partial_handles
     for ext in _physics_exts(bridge):
         ext.teardown.assert_called_once_with()
     assert caplog.records == []
+
+
+def test_each_state_tick_publishes_the_object_snapshot_it_captured(bridge):
+    bridge._state_pacer = Mock(take_if_due=Mock(side_effect=[False, True, True, False]))
+    captured = Mock(name="snapshot")
+    bridge._objects.capture_object_states.side_effect = [captured, None]
+    bridge._objects.reset_mock()
+    bridge._io.reset_mock()
+
+    for _ in range(4):
+        bridge.step()
+
+    assert bridge._objects.capture_object_states.call_count == 2, "once per state tick, never between"
+    # A tick without a snapshot publishes none; the clock goes out ahead of
+    # the state it stamps.
+    bridge._io.publish_object_states.assert_called_once_with(captured)
+    assert [name for name, _, _ in bridge._io.mock_calls if name in ("publish_sim_time", "publish_object_states")] == [
+        "publish_sim_time", "publish_object_states", "publish_sim_time",
+    ]
+
+
+def test_the_engine_clock_is_recorded_while_the_bridge_sets_up_again(bridge):
+    bridge.invalidate_physics_views()
+    bridge._articulation.setup.return_value = False
+    bridge._objects.reset_mock()
+    bridge._io.reset_mock()
+
+    bridge.step()
+
+    assert not bridge.is_ready
+    bridge._io.record_engine_time.assert_called_once_with(0.0)
+    bridge._objects.capture_object_states.assert_not_called()

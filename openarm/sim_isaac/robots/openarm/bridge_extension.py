@@ -4,7 +4,8 @@
 Isaac's sim_app.update() advances physics on the main thread; each step this
 extension applies the latest sim-passthrough setpoint per side, reads the
 measured joint and gripper state, and (throttled to state_rate_hz) publishes
-Isaac's own timeline clock followed by the state it stamps. Transport is typed
+Isaac's own timeline clock followed by the state it stamps: the joint and
+gripper states and a snapshot of every spawned object. Transport is typed
 peppygen via SimTopicIO; there is no JSON and no raw peppylib on the path.
 """
 from __future__ import annotations
@@ -57,11 +58,15 @@ class IsaacBridgeExtension:
     Articulation setup is deferred to the first step() that succeeds: the
     Articulation views cannot initialise until the USD stage has loaded and the
     timeline is playing, which races the bridge's construction. Until every ext
-    is ready, step() is a no-op except for the setup retry.
+    is ready, step() only records the engine clock and retries the setup.
     """
 
-    def __init__(self, io: SimTopicIO, state_rate_hz: int, cameras_enabled: bool) -> None:
+    def __init__(
+        self, io: SimTopicIO, objects, state_rate_hz: int, cameras_enabled: bool
+    ) -> None:
         self._io = io
+        # Captures the spawned objects' snapshot each state tick publishes.
+        self._objects = objects
         # State publishes ride an absolute grid at state_rate_hz, evaluated once
         # per rendered frame: physics advances inside sim_app.update(), so a
         # frame is the finest cadence there is, and a request at or above the
@@ -215,14 +220,16 @@ class IsaacBridgeExtension:
     def step(self) -> None:
         """Physics has already advanced in sim_app.update(); apply the latest
         commands and, when the state grid is due, publish measured state."""
+        # The timeline is Isaac's own clock, advanced by sim_app.update(), so
+        # a stopped timeline stops advancing it. Recorded ahead of every
+        # stamp of this step, the camera captures included, and ahead of the
+        # setup gate: an object-state capture after a scene edit stamps from
+        # it while the articulation views are being created again.
+        self._io.record_engine_time(self._engine_time_s())
         if not self._try_setup():
             return
 
         self._apply_commands()
-        # The timeline is Isaac's own clock, advanced by sim_app.update(), so
-        # a stopped timeline stops advancing it. Recorded ahead of every
-        # stamp of this step, the camera captures included.
-        self._io.record_engine_time(self._engine_time_s())
         if self._camera_sensor is not None:
             self._camera_sensor.step()
 
@@ -302,6 +309,12 @@ class IsaacBridgeExtension:
                 self._io.publish_gripper_states(
                     gripper_id, sum(fractions) / len(fractions)
                 )
+
+        # A full snapshot of the spawned objects rides the same tick; it is
+        # the one get_object_states answers until the next capture.
+        snapshot = self._objects.capture_object_states()
+        if snapshot is not None:
+            self._io.publish_object_states(snapshot)
 
     def shutdown(self) -> None:
         logger.info("IsaacBridgeExtension shutting down.")

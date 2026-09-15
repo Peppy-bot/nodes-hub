@@ -312,7 +312,7 @@ def test_shutdown_during_wait_prevents_an_extra_frame_and_closes_orderly(loop, e
     assert not loop.ready.is_set()
     assert loop.trace[-4:] == ["commander.stop", "bridge.shutdown", "timeline.stop", "app.close"]
     loop.app.close.assert_called_once_with()
-    loop.module.IsaacBridgeExtension.assert_called_once_with(loop.launcher._io, 17, False)
+    loop.module.IsaacBridgeExtension.assert_called_once_with(loop.launcher._io, loop.scene, 17, False)
     assert loop.settings_trace == [("read", False), ("update",)]
     assert loop.settings_values[_MAIN_RATE_LIMIT_ENABLED] is True
     loop.settings.set_bool.assert_not_called()

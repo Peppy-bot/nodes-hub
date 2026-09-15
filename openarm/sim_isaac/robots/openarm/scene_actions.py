@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Peppy scene services/actions bridge for Isaac Sim."""
+"""Peppy scene_control and object_state bridge for Isaac Sim."""
 
 from __future__ import annotations
 
@@ -21,12 +21,18 @@ from peppygen.exposed_actions.scene import (
     remove_object,
     spawn_object,
 )
-from peppygen.exposed_services.scene import (
-    get_assets_list,
-    get_objects_list,
-)
+from peppygen.exposed_services.objects import get_object_states
+from peppygen.exposed_services.scene import get_assets_list
+
+from object_state import IsaacObjectReader, ObjectStateSnapshot
 
 logger = logging.getLogger(__name__)
+
+# What get_object_states answers until the first capture: not an empty scene.
+_NOT_CAPTURED = (
+    "Isaac has not captured its object state yet; it captures once the "
+    "stage has loaded and the simulation is stepping"
+)
 
 
 @dataclass
@@ -37,15 +43,23 @@ class _PendingCommand:
 
 
 class SceneActionIO:
-    """Bridge Peppy scene APIs to the Isaac simulation thread."""
+    """Bridge scene_control and object_state to the Isaac simulation thread.
+
+    Scene edits run on the Isaac thread in submission order. Object state is
+    captured there too, from the registry of spawned objects and the engine,
+    and get_object_states answers the latest capture.
+    """
 
     def __init__(
         self,
         node_runner,
         loop: asyncio.AbstractEventLoop,
+        io,
     ) -> None:
         self._node_runner = node_runner
         self._loop = loop
+        # Stamps every object-state capture on the joint states' timeline.
+        self._io = io
 
         self._lock = threading.Lock()
 
@@ -53,7 +67,14 @@ class SceneActionIO:
         # get_assets_list says so rather than answering with nothing.
         self._assets: dict[str, dict] = {}
         self._assets_ready = False
+        # The spawned objects in spawn order: what each was spawned from and
+        # with. Where each one is comes from the engine at capture.
         self._objects: dict[str, dict] = {}
+
+        self._object_reader = IsaacObjectReader()
+        # The latest capture, and why there is none while it is None.
+        self._snapshot: ObjectStateSnapshot | None = None
+        self._unavailable: str | None = _NOT_CAPTURED
 
         self._pending: Queue[_PendingCommand] = Queue()
 
@@ -93,7 +114,7 @@ class SceneActionIO:
                 self._serve_apply_force()
             ),
             asyncio.create_task(self._serve_assets()),
-            asyncio.create_task(self._serve_objects()),
+            asyncio.create_task(self._serve_object_states()),
             asyncio.create_task(self._serve_load_scene()),
             asyncio.create_task(self._serve_clear_scene()),
             asyncio.create_task(self._serve_spawn_object()),
@@ -219,24 +240,6 @@ class SceneActionIO:
 
         return public
 
-    def _public_objects(self) -> list:
-        """Return currently spawned runtime-object metadata."""
-
-        with self._lock:
-            objects = [
-                dict(obj)
-                for obj in self._objects.values()
-            ]
-
-        objects.sort(
-            key=lambda item: item.get(
-                "object_id",
-                ""
-            )
-        )
-
-        return objects
-
     def _handle_get_assets(
         self,
         _request,
@@ -265,19 +268,89 @@ class SceneActionIO:
             ),
         )
 
-    def _handle_get_objects(
+    def invalidate_physics_views(self) -> None:
+        """Drop the object reader's rigid-body view after a prim removal; the
+        next capture creates it again."""
+
+        self._object_reader.invalidate()
+
+    def capture_object_states(self) -> ObjectStateSnapshot | None:
+        """Capture every spawned object on the Isaac main thread.
+
+        The capture becomes the snapshot get_object_states answers and is
+        returned for the stream to publish. None when there is no snapshot:
+        a capture that cannot be stamped yet is not one, and a failed read
+        leaves the state unavailable with its reason rather than answering an
+        older capture that may predate an edit.
+        """
+
+        timestamp_s = self._io.capture_timestamp_s()
+
+        if timestamp_s is None:
+            return None
+
+        with self._lock:
+            spawned = [
+                dict(obj)
+                for obj in self._objects.values()
+            ]
+
+        try:
+            records = self._object_reader.read(spawned)
+
+        except Exception as exc:
+            reason = f"Isaac could not capture its object state: {exc}"
+
+            with self._lock:
+                repeated = self._unavailable == reason
+                self._snapshot = None
+                self._unavailable = reason
+
+            # One line per distinct failure, not one per capture.
+            if not repeated:
+                logger.warning(reason)
+
+            return None
+
+        snapshot = ObjectStateSnapshot(
+            timestamp_s=timestamp_s,
+            objects=tuple(records),
+        )
+
+        with self._lock:
+            self._snapshot = snapshot
+            self._unavailable = None
+
+        return snapshot
+
+    def _handle_get_object_states(
         self,
         _request,
-    ) -> get_objects_list.Response:
-        objects = self._public_objects()
+    ) -> get_object_states.Response:
+        with self._lock:
+            snapshot = self._snapshot
+            unavailable = self._unavailable
 
-        return get_objects_list.Response(
+        if snapshot is None:
+            # Unavailable is not an empty scene: the timestamp and objects
+            # carry nothing.
+            return get_object_states.Response(
+                success=False,
+                message=unavailable,
+                timestamp=0.0,
+                objects=[],
+            )
+
+        return get_object_states.Response(
             success=True,
-            message=f"{len(objects)} runtime objects",
-            objects_json=json.dumps(
-                objects,
-                separators=(",", ":"),
-            ),
+            message=f"{len(snapshot.objects)} objects",
+            timestamp=snapshot.timestamp_s,
+            objects=[
+                get_object_states.ResponseObjectsItem(
+                    **record.fields()
+                )
+                for record in snapshot.objects
+            ],
         )
 
     async def _submit(
@@ -304,7 +377,21 @@ class SceneActionIO:
         launcher,
         max_commands: int = 32,
     ) -> None:
-        """Execute queued scene commands on the Isaac main thread."""
+        """Execute queued scene commands on the Isaac main thread.
+
+        Each command's goal completes after a fresh object-state capture, so
+        a read once it has completed observes its edit. Until the first
+        stamped capture, every frame tries one, so reads are answered from
+        the first frame on, ahead of the stream's first tick. After that the
+        state tick and the capture after each edit keep the snapshot current,
+        and bring it back after a failed read.
+        """
+
+        with self._lock:
+            never_captured = self._unavailable == _NOT_CAPTURED
+
+        if never_captured:
+            self.capture_object_states()
 
         for _ in range(max_commands):
             try:
@@ -330,6 +417,10 @@ class SceneActionIO:
                     "success": False,
                     "message": str(exc),
                 }
+
+            # Succeeded or failed partway, whatever the command did to the
+            # scene is in the snapshot before its goal completes.
+            self.capture_object_states()
 
             if not pending.future.done():
                 pending.future.set_result(
@@ -468,7 +559,6 @@ class SceneActionIO:
                 self._objects[object_id] = {
                     "object_id": object_id,
                     "asset_id": asset_id,
-                    "position": position,
                     "scale": scale,
                     "physics": physics,
                     "mass": mass,
@@ -504,11 +594,6 @@ class SceneActionIO:
                     "position": position,
                 }
             )
-
-            with self._lock:
-                self._objects[
-                    object_id
-                ]["position"] = position
 
             return {
                 "success": True,
@@ -693,12 +778,12 @@ class SceneActionIO:
                 )
                 await asyncio.sleep(1.0)
 
-    async def _serve_objects(self) -> None:
+    async def _serve_object_states(self) -> None:
         while True:
             try:
-                await get_objects_list.handle_next_request(
+                await get_object_states.handle_next_request(
                     self._node_runner,
-                    self._handle_get_objects,
+                    self._handle_get_object_states,
                 )
 
             except asyncio.CancelledError:
@@ -706,7 +791,7 @@ class SceneActionIO:
 
             except Exception:
                 logger.exception(
-                    "get_objects_list service failed"
+                    "get_object_states service failed"
                 )
                 await asyncio.sleep(1.0)
 

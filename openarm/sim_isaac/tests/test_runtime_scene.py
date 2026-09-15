@@ -97,15 +97,16 @@ def scene(monkeypatch):
     spec.loader.exec_module(module)
     monkeypatch.setattr(module, "RuntimeCommanderServer", Mock())
 
+    scene_actions = Mock()
     launcher = module.SimLauncher(
-        Mock(), Path("/robot.usd"), Mock(), Mock(), object(), Mock(),
+        Mock(), Path("/robot.usd"), Mock(), Mock(), object(), scene_actions,
         state_rate_hz=60, cameras_enabled=False, frame_rate_hz=60,
         render_mode="RealTimePathTracing", anti_aliasing=3,
     )
     bridge = Mock()
     launcher._extension = bridge
     launcher._runtime_robot = object()
-    return SimpleNamespace(launcher=launcher, stage=stage, bridge=bridge)
+    return SimpleNamespace(launcher=launcher, stage=stage, bridge=bridge, scene_actions=scene_actions)
 
 
 def _load(scene, path, scale=None):
@@ -179,3 +180,15 @@ def test_removals_before_the_bridge_exists_only_drop_the_commander_robot(scene):
     scene.launcher._runtime_clear_scene()
     assert scene.stage.removed == [_SCENE]
     assert scene.launcher._runtime_robot is None
+
+
+def test_every_removal_drops_the_rigid_body_view_the_object_state_reads(scene):
+    scene.stage.DefinePrim("/World/RuntimeObjects/obj_1", "Xform")
+    scene.launcher._runtime_remove({"name": "obj_1"})
+    scene.launcher._runtime_remove({"name": "obj_missing"})
+    assert scene.scene_actions.invalidate_physics_views.call_count == 1
+
+    scene.launcher._extension = None
+    _load(scene, "Isaac/Environments/Office/office.usd")
+    scene.launcher._runtime_clear_scene()
+    assert scene.scene_actions.invalidate_physics_views.call_count == 2
