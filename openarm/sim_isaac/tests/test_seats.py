@@ -88,46 +88,48 @@ class TestCommands:
         seats = Registry()
         held = caller()
         seats.reserve(held, "openarm_v2", 0.0)
-        taken, message = seats.command(held, arms([0.0] * 7, [0.0] * 7), grippers(0.0, 0.0), 1.0)
+        taken, joining, message = seats.command(held, arms([0.0] * 7, [0.0] * 7), grippers(0.0, 0.0), 1.0)
         assert not taken
+        assert joining, "a robot the engine is still standing is joining"
         assert "still joining" in message
 
     def test_a_caller_with_no_seat_is_told_so(self) -> None:
         seats = Registry()
-        taken, message = seats.command(caller(), [], [], 1.0)
+        taken, joining, message = seats.command(caller(), [], [], 1.0)
         assert not taken
+        assert not joining, "a caller with no seat is not joining one"
         assert "holds no seat" in message
 
     def test_a_command_of_every_limb_is_taken(self) -> None:
         seats, held = standing()
         assert seats.command(
             held, arms([0.1] * 7, [0.2] * 7), grippers(0.5, 0.5), 1.0
-        ) == (True, "")
+        ) == (True, False, "")
         setpoints = seats.seat_of(held).take()
         assert setpoints.arms[0].positions == (0.1,) * 7
         assert setpoints.grippers[1].opening == 0.5
 
     def test_an_arm_of_the_wrong_length_is_refused_by_name(self) -> None:
         seats, held = standing()
-        taken, message = seats.command(held, arms([0.0] * 7, [0.0] * 6), grippers(0.0, 0.0), 1.0)
+        taken, joining, message = seats.command(held, arms([0.0] * 7, [0.0] * 6), grippers(0.0, 0.0), 1.0)
         assert not taken
         assert "arm 'right' has 7 joints, the command carries 6 positions" == message
 
     def test_too_few_arms_is_refused(self) -> None:
         seats, held = standing()
-        taken, message = seats.command(held, arms([0.0] * 7), grippers(0.0, 0.0), 1.0)
+        taken, joining, message = seats.command(held, arms([0.0] * 7), grippers(0.0, 0.0), 1.0)
         assert not taken
         assert "this robot has 2 arms, the command carries 1" == message
 
     def test_too_few_grippers_is_refused(self) -> None:
         seats, held = standing()
-        taken, message = seats.command(held, arms([0.0] * 7, [0.0] * 7), grippers(0.0), 1.0)
+        taken, joining, message = seats.command(held, arms([0.0] * 7, [0.0] * 7), grippers(0.0), 1.0)
         assert not taken
         assert "this robot has 2 grippers, the command carries 1" == message
 
     def test_velocities_of_the_wrong_length_are_refused(self) -> None:
         seats, held = standing()
-        taken, message = seats.command(
+        taken, joining, message = seats.command(
             held, [Arm([0.0] * 7, [0.0] * 3), Arm([0.0] * 7)], grippers(0.0, 0.0), 1.0
         )
         assert not taken
@@ -136,7 +138,7 @@ class TestCommands:
     @pytest.mark.parametrize("bad", [float("nan"), float("inf")])
     def test_a_position_that_is_not_a_number_is_refused(self, bad: float) -> None:
         seats, held = standing()
-        taken, message = seats.command(
+        taken, joining, message = seats.command(
             held, [Arm([bad] + [0.0] * 6), Arm([0.0] * 7)], grippers(0.0, 0.0), 1.0
         )
         assert not taken
@@ -144,7 +146,7 @@ class TestCommands:
 
     def test_an_opening_that_is_not_a_number_is_refused(self) -> None:
         seats, held = standing()
-        taken, message = seats.command(
+        taken, joining, message = seats.command(
             held,
             arms([0.0] * 7, [0.0] * 7),
             [Gripper(opening=float("nan")), Gripper(opening=0.0)],
@@ -155,7 +157,7 @@ class TestCommands:
 
     def test_a_negative_force_limit_is_refused(self) -> None:
         seats, held = standing()
-        taken, message = seats.command(
+        taken, joining, message = seats.command(
             held,
             arms([0.0] * 7, [0.0] * 7),
             [Gripper(opening=0.5, max_effort=-1.0), Gripper(opening=0.0)],
@@ -229,7 +231,7 @@ class TestLeases:
         seats.reserve(held, "openarm_v2", 0.0)
 
         for now in (1.0, 2.0, 3.0, 4.0):
-            answered, message = seats.command(
+            answered, joining, message = seats.command(
                 held, arms([0.0] * 7, [0.0] * 7), grippers(0.0, 0.0), now_s=now
             )
             assert not answered and "still joining" in message

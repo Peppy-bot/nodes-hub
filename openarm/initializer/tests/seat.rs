@@ -69,7 +69,18 @@ fn state(left_joint: f64, right_joint: f64) -> attach::FeedbackMessage {
 fn accepted() -> command::ResponseData {
     command::ResponseData {
         success: true,
+        joining: false,
         message: String::new(),
+    }
+}
+
+/// The engine is still standing this robot, so it wrote no limb. A robot
+/// commanding through its own join reads the flag, not the wording.
+fn joining() -> command::ResponseData {
+    command::ResponseData {
+        success: false,
+        joining: true,
+        message: "the engine has not stood this robot yet".into(),
     }
 }
 
@@ -165,9 +176,14 @@ async fn the_robot_takes_its_seat_and_drives_its_limbs_through_it() -> peppygen:
         })
         .await?;
     let mut landed = false;
-    for _ in 0..COMMANDS_TO_LAND {
+    for tick in 0..COMMANDS_TO_LAND {
         let (request, responder) = simulation.command.next_request(WIRE).await?;
-        responder.respond(accepted()).await?;
+        // The engine answers the first command as still standing this robot.
+        // The robot keeps commanding through that, so the setpoints below
+        // still land.
+        responder
+            .respond(if tick == 0 { joining() } else { accepted() })
+            .await?;
         if request.arms[1].positions == vec![0.5; ARM_DOF] && request.grippers[0].commanded {
             assert!(
                 request.arms[0].positions.is_empty(),

@@ -3,7 +3,7 @@
 
 A seat is reserved when an attach goal is admitted and holds its limbs once
 the engine has stood the robot, so a command that arrives while the scene is
-still recompiling is answered "still joining". A seated robot's setpoints
+still recompiling is refused as still joining. A seated robot's setpoints
 live in its seat until the physics thread picks them up, and every command
 renews the seat's lease: a robot silent past the lease leaves the scene.
 """
@@ -13,6 +13,16 @@ from __future__ import annotations
 import math
 import threading
 from dataclasses import dataclass, field
+from typing import NamedTuple
+
+
+class Answer(NamedTuple):
+    """How a command was answered: whether the robot took it, whether the
+    engine is still standing that robot, and what to say."""
+
+    taken: bool
+    joining: bool
+    message: str
 
 
 @dataclass(frozen=True)
@@ -154,12 +164,12 @@ class Registry:
                 seat.caller.instance: seat for seat in self._seats.values() if seat.standing()
             }
 
-    def command(self, caller: Caller, arms, grippers, now_s: float) -> tuple[bool, str]:
+    def command(self, caller: Caller, arms, grippers, now_s: float) -> Answer:
         """Writes one command into a robot's limbs and renews its lease. A
         command carrying a limb the robot cannot take changes nothing."""
         seat = self.seat_of(caller)
         if seat is None:
-            return False, f"{caller} holds no seat in this scene"
+            return Answer(False, False, f"{caller} holds no seat in this scene")
         with seat.lock:
             if seat.limbs is None:
                 # The heartbeat counts while the robot is still joining:
@@ -168,12 +178,14 @@ class Registry:
                 # it. What the command carries cannot be judged until the robot
                 # has limbs to judge it against.
                 seat.last_command_s = now_s
-                return False, f"'{caller.instance}' is still joining the scene"
+                return Answer(
+                    False, True, f"'{caller.instance}' is still joining the scene"
+                )
             try:
                 arm_setpoints = _arm_setpoints(seat.limbs, arms)
                 gripper_setpoints = _gripper_setpoints(seat.limbs, grippers)
             except ValueError as error:
-                return False, str(error)
+                return Answer(False, False, str(error))
             for index, setpoint in enumerate(arm_setpoints):
                 if setpoint is not None:
                     seat.setpoints.arms[index] = setpoint
@@ -181,7 +193,7 @@ class Registry:
                 if setpoint is not None:
                     seat.setpoints.grippers[index] = setpoint
             seat.last_command_s = now_s
-            return True, ""
+            return Answer(True, False, "")
 
     def renew(self, now_s: float) -> None:
         """Gives every robot in the scene its lease back. The scene takes no

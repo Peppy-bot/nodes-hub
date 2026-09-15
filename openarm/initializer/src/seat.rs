@@ -215,7 +215,7 @@ async fn command_loop(
             // The engine is still standing this robot: its first commands
             // land once it is seated, and the robot holds its start pose
             // meanwhile.
-            Ok(response) if response.data.message.contains("still joining") => Ok(()),
+            Ok(response) if response.data.joining => Ok(()),
             Ok(response) => Err(response.data.message),
             Err(e) => Err(e.to_string()),
         };

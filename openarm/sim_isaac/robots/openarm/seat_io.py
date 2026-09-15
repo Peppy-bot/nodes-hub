@@ -320,7 +320,9 @@ class SeatIO:
 
     def _command(self, request: command.Request) -> command.Response:
         caller = Caller(core_node=request.core_node, instance_id=request.instance_id)
-        taken, message = self._seats.command(
+        answer = self._seats.command(
             caller, request.data.arms, request.data.grippers, self._loop.time()
         )
-        return command.Response(success=taken, message=message)
+        return command.Response(
+            success=answer.taken, joining=answer.joining, message=answer.message
+        )
