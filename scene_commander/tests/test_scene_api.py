@@ -16,7 +16,10 @@ from aiohttp.test_utils import TestClient, TestServer
 _SOURCE = Path(__file__).resolve().parents[1] / "src" / "scene_commander" / "__main__.py"
 _ACTIONS = ("apply_force", "clear_scene", "load_scene", "move_object", "move_robot", "remove_object", "spawn_object")
 _BUSY = "Isaac is still discovering its asset catalogue"
+_NOT_READY = "Isaac has not loaded its stage yet"
 _SCENE = {"asset_id": "scene/full_warehouse", "display_name": "Full Warehouse", "kind": "scene", "category": "Scenes"}
+# A snapshot's capture time, as the generated binding decodes it: epoch seconds.
+_CAPTURED = 1_757_944_800.25
 
 
 class Status(enum.Enum):
@@ -27,8 +30,8 @@ class Status(enum.Enum):
 class FakeService(ModuleType):
     """A consumed service: poll() answers the next queued response, the last one forever."""
 
-    def __init__(self, name):
-        super().__init__(f"peppygen.consumed_services.simulation.{name}")
+    def __init__(self, link, name):
+        super().__init__(f"peppygen.consumed_services.{link}.{name}")
         self.answers = []
 
     def bound_producer(self, node_runner):
@@ -76,10 +79,11 @@ class FakeAction(ModuleType):
 @pytest.fixture
 def commander(monkeypatch):
     services = ModuleType("peppygen.consumed_services.simulation")
-    services.get_assets_list = FakeService("get_assets_list")
+    services.get_assets_list = FakeService("simulation", "get_assets_list")
     services.get_assets_list.answers = [_catalogue(_SCENE)]
-    services.get_objects_list = FakeService("get_objects_list")
-    services.get_objects_list.answers = [SimpleNamespace(success=True, message="0 runtime objects", objects_json="[]")]
+    objects = ModuleType("peppygen.consumed_services.objects")
+    objects.get_object_states = FakeService("objects", "get_object_states")
+    objects.get_object_states.answers = [_snapshot()]
     actions = ModuleType("peppygen.consumed_actions.simulation")
     for name in _ACTIONS:
         setattr(actions, name, FakeAction(name))
@@ -95,13 +99,14 @@ def commander(monkeypatch):
         "peppygen.consumed_actions.simulation": actions,
         "peppygen.consumed_services": ModuleType("peppygen.consumed_services"),
         "peppygen.consumed_services.simulation": services,
+        "peppygen.consumed_services.objects": objects,
     }.items():
         monkeypatch.setitem(sys.modules, name, module)
     spec = importlib.util.spec_from_file_location("_scene_commander_under_test", _SOURCE)
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, spec.name, module)
     spec.loader.exec_module(module)
-    return SimpleNamespace(module=module, services=services, actions=actions)
+    return SimpleNamespace(module=module, services=services, objects=objects, actions=actions)
 
 
 class _FakeListener:
@@ -126,14 +131,32 @@ def _catalogue(*assets):
     return SimpleNamespace(success=True, message=f"{len(assets)} assets available", assets_json=json.dumps(list(assets)))
 
 
+def _record(object_id, asset_id, physics, mass, scale, position, orientation, linear_velocity, angular_velocity):
+    """One spawned object, with the field names of the generated response item."""
+    return SimpleNamespace(
+        object_id=object_id, asset_id=asset_id, physics=physics, mass=mass, scale=scale, position=position,
+        orientation=orientation, linear_velocity=linear_velocity, angular_velocity=angular_velocity,
+    )
+
+
+def _snapshot(*records):
+    return SimpleNamespace(
+        success=True, message=f"{len(records)} objects", timestamp=_CAPTURED, objects=list(records),
+    )
+
+
+def _no_object_state():
+    # An unavailable answer carries no snapshot: zero time, no objects.
+    return SimpleNamespace(success=False, message=_NOT_READY, timestamp=0.0, objects=[])
+
+
 def _node_log(commander, caplog):
     return [(r.levelno, r.getMessage(), r.exc_info) for r in caplog.records if r.name == commander.module.logger.name]
 
 
-def _call(commander, scenario):
+def _call(commander, scenario, app=None):
     async def run():
-        app = commander.module._build_app(object(), commander.module._CatalogueWatch())
-        async with TestClient(TestServer(app)) as client:
+        async with TestClient(TestServer(app or commander.module._build_app(object()))) as client:
             return await scenario(client)
 
     return asyncio.run(run())
@@ -161,20 +184,89 @@ def test_assets_answer_503_with_the_provider_reason_until_the_catalogue_arrives(
     assert second == first
     assert third == (200, {"success": True, "assets": [_SCENE], "count": 1})
     assert _node_log(commander, caplog) == [
-        (logging.INFO, f"Scene provider has no catalogue yet: {_BUSY}", None),
+        (logging.INFO, f"Scene provider has no catalogue: {_BUSY}", None),
         (logging.INFO, "Scene provider catalogue ready: 1 assets", None),
     ]
 
 
-def test_provider_transport_failures_are_server_errors_logged_in_one_line(commander, caplog):
+def test_an_empty_scene_is_a_snapshot_with_no_objects_and_its_capture_time(commander, caplog):
     caplog.set_level(logging.INFO)
-    commander.services.get_assets_list.answers = [TimeoutError("get_assets_list timed out")]
 
-    assert _call(commander, lambda client: _get(client, "/api/assets")) == (
-        500, {"success": False, "message": "get_assets_list timed out"},
+    assert _call(commander, lambda client: _get(client, "/api/objects")) == (
+        200, {"success": True, "objects": [], "count": 0, "timestamp": _CAPTURED},
     )
     assert _node_log(commander, caplog) == [
-        (logging.WARNING, "GET /api/assets failed: get_assets_list timed out", None),
+        (logging.INFO, "Scene provider object state ready: 0 runtime objects", None),
+    ]
+
+
+def test_objects_answer_503_with_the_provider_reason_while_it_has_no_object_state(commander, caplog):
+    caplog.set_level(logging.INFO)
+    commander.objects.get_object_states.answers = [_no_object_state(), _no_object_state(), _snapshot()]
+
+    async def scenario(client):
+        return [await _get(client, "/api/objects") for _ in range(3)]
+
+    first, second, third = _call(commander, scenario)
+    assert first == (503, {"success": False, "message": _NOT_READY})
+    assert second == first
+    assert third == (200, {"success": True, "objects": [], "count": 0, "timestamp": _CAPTURED})
+    assert _node_log(commander, caplog) == [
+        (logging.INFO, f"Scene provider has no object state: {_NOT_READY}", None),
+        (logging.INFO, "Scene provider object state ready: 0 runtime objects", None),
+    ]
+
+
+def test_object_records_reach_the_page_with_every_field_as_spawned(commander):
+    commander.objects.get_object_states.answers = [_snapshot(
+        _record("obj_1", "props/blocks/red_block", "dynamic", 0.2, 1.5,
+                [0.5, 0.0, 0.81], [0.0, 0.0, 0.38, 0.92], [0.1, 0.0, -0.2], [0.0, 1.5, 0.0]),
+        _record("obj_2", "object/warehouse_cage", "static", 40.0, 1.0,
+                [2.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]),
+        _record("obj_3", "object/warehouse_carton", "none", 2.0, 0.5,
+                [1.0, -1.0, 0.4], [0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]),
+    )]
+
+    status, body = _call(commander, lambda client: _get(client, "/api/objects"))
+
+    assert status == 200
+    assert body == {
+        "success": True,
+        "count": 3,
+        "timestamp": _CAPTURED,
+        "objects": [
+            {
+                "object_id": "obj_1", "asset_id": "props/blocks/red_block", "physics": "dynamic",
+                "mass": 0.2, "scale": 1.5, "position": [0.5, 0.0, 0.81], "orientation": [0.0, 0.0, 0.38, 0.92],
+                "linear_velocity": [0.1, 0.0, -0.2], "angular_velocity": [0.0, 1.5, 0.0],
+            },
+            {
+                "object_id": "obj_2", "asset_id": "object/warehouse_cage", "physics": "static",
+                "mass": 40.0, "scale": 1.0, "position": [2.0, 1.0, 0.0], "orientation": [0.0, 0.0, 0.0, 1.0],
+                "linear_velocity": [0.0, 0.0, 0.0], "angular_velocity": [0.0, 0.0, 0.0],
+            },
+            {
+                "object_id": "obj_3", "asset_id": "object/warehouse_carton", "physics": "none",
+                "mass": 2.0, "scale": 0.5, "position": [1.0, -1.0, 0.4], "orientation": [0.0, 0.0, 0.0, 1.0],
+                "linear_velocity": [0.0, 0.0, 0.0], "angular_velocity": [0.0, 0.0, 0.0],
+            },
+        ],
+    }
+
+
+@pytest.mark.parametrize(("path", "service"), [
+    ("/api/assets", lambda commander: commander.services.get_assets_list),
+    ("/api/objects", lambda commander: commander.objects.get_object_states),
+], ids=["assets", "objects"])
+def test_provider_transport_failures_are_server_errors_logged_in_one_line(commander, caplog, path, service):
+    caplog.set_level(logging.INFO)
+    service(commander).answers = [TimeoutError("the service timed out")]
+
+    assert _call(commander, lambda client: _get(client, path)) == (
+        500, {"success": False, "message": "the service timed out"},
+    )
+    assert _node_log(commander, caplog) == [
+        (logging.WARNING, f"GET {path} failed: the service timed out", None),
     ]
 
 
@@ -290,14 +382,41 @@ def test_setup_tolerates_a_provider_without_catalogue_but_not_an_unreachable_one
         # The bound address reaches the operator here and nowhere else, and
         # the socket is taken before the provider is waited on.
         (logging.INFO, "Scene panel at http://127.0.0.1:9100 (bound 127.0.0.1:9100)", None),
-        (logging.INFO, f"Scene provider has no catalogue yet: {_BUSY}", None),
-        (logging.INFO, "Scene provider reachable: 0 runtime objects", None),
+        (logging.INFO, f"Scene provider has no catalogue: {_BUSY}", None),
+        (logging.INFO, "Scene provider object state ready: 0 runtime objects", None),
     ]
 
-    commander.services.get_objects_list.answers = [TimeoutError("get_objects_list timed out")]
-    with pytest.raises(TimeoutError, match="get_objects_list timed out"):
+    commander.objects.get_object_states.answers = [TimeoutError("get_object_states timed out")]
+    with pytest.raises(TimeoutError, match="get_object_states timed out"):
         asyncio.run(commander.module.setup(_parameters(9000, "127.0.0.1"), object()))
     assert len(served) == 1
+
+
+def test_setup_tolerates_a_provider_without_object_state_and_the_page_asks_again(commander, caplog, monkeypatch):
+    caplog.set_level(logging.INFO)
+    served = []
+    monkeypatch.setattr(commander.module.listen, "bind_listener", lambda *bound: _FakeListener("127.0.0.1", 9000))
+
+    async def fake_server(app, bound):
+        served.append(app)
+        return asyncio.create_task(asyncio.sleep(0))
+
+    monkeypatch.setattr(commander.module.listen, "start_serving", fake_server)
+    commander.objects.get_object_states.answers = [_no_object_state()]
+
+    async def run():
+        await asyncio.gather(*await commander.module.setup(_parameters(9000, "127.0.0.1"), object()))
+
+    asyncio.run(run())
+    [app] = served
+    # The served page reads the same unavailable state, which is logged once.
+    assert _call(commander, lambda client: _get(client, "/api/objects"), app) == (
+        503, {"success": False, "message": _NOT_READY},
+    )
+    assert _node_log(commander, caplog)[2:] == [
+        (logging.INFO, "Scene provider catalogue ready: 1 assets", None),
+        (logging.INFO, f"Scene provider has no object state: {_NOT_READY}", None),
+    ]
 
 
 def test_setup_refuses_a_launch_it_cannot_serve_and_starts_no_server(commander, monkeypatch):
@@ -341,7 +460,7 @@ def test_http_server_keeps_browser_requests_out_of_the_log(commander, monkeypatc
 
     async def run():
         task = await commander.module.listen.start_serving(
-            commander.module._build_app(object(), commander.module._CatalogueWatch()), listener,
+            commander.module._build_app(object()), listener,
         )
         assert started.is_set(), "serving starts before the node is reported ready"
         task.cancel()

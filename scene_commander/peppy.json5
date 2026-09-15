@@ -13,10 +13,12 @@
     ],
 
     depends_on: {
-      // The scene editing surface of whichever simulation the
-      // launcher binds here.
+      // The scene editing surface of whichever simulation the launcher
+      // binds here, and the object state of that same simulation, which
+      // the panel reads on demand to list what is spawned.
       contracts: [
         { name: "scene_control", tag: "v1", link_id: "simulation" },
+        { name: "object_state", tag: "v1", link_id: "objects" },
       ],
     },
   },
@@ -29,8 +31,8 @@
           name: "get_assets_list",
         },
         {
-          link_id: "simulation",
-          name: "get_objects_list",
+          link_id: "objects",
+          name: "get_object_states",
         },
       ],
     },
