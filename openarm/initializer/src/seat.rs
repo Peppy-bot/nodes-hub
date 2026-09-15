@@ -4,8 +4,9 @@
 //!
 //! The seat lasts as long as the robot's stay in the scene. Taking it fails
 //! when the simulation refuses the robot, so the robot reports no readiness
-//! it cannot back. Losing the seat stops the node, which `peppy stack list`
-//! then reports failed; `peppy stack join` puts the copy back.
+//! it cannot back. Losing the seat stops the node, so it serves no readiness
+//! the scene no longer backs; `peppy stack list` reports the instance
+//! finished, and `peppy stack join` puts the copy back.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,6 +21,7 @@ use peppylib::messaging::ProducerRef;
 use peppylib::runtime::CancellationToken;
 use tracing::{error, info, warn};
 
+use crate::limbs;
 use crate::limbs::{ARMS, GRIPPERS, Seat, arm_command, gripper_command};
 use crate::refused;
 
@@ -34,6 +36,9 @@ const COMMAND_TIMEOUT: Duration = Duration::from_millis(250);
 /// How long the robot waits for the engine to take it out of the scene, or
 /// to say why it did.
 const LEAVE_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long the robot waits after a state frame it could not read, so a
+/// stream it cannot decode at all cannot spin this loop.
+const FEEDBACK_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 /// How long the shutdown hook waits for the seat to come back, inside
 /// peppy's shutdown grace (5 s by default, `lifecycle.shutdown_grace_secs`).
 const SEAT_RELEASE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -68,6 +73,28 @@ impl Simulation {
     }
 }
 
+/// Where the launcher asks this robot to stand, as the engine takes it.
+/// `auto` leaves the spot to the engine. A spot that is not a number is
+/// refused here rather than encoded onto the wire.
+fn spot_of(
+    placement: &peppygen::parameters::placement::Placement,
+) -> std::result::Result<Option<attach::SimulationRobotAttachActionGoalPlacement>, String> {
+    if placement.auto {
+        return Ok(None);
+    }
+    let parts = [placement.x, placement.y, placement.z, placement.yaw];
+    if !parts.iter().all(|part| part.is_finite()) {
+        let [x, y, z, yaw] = parts;
+        return Err(format!(
+            "placement x, y, z and yaw must each be a finite number, and this robot's are {x}, {y}, {z} and {yaw}"
+        ));
+    }
+    Ok(Some(attach::SimulationRobotAttachActionGoalPlacement {
+        position: [placement.x, placement.y, placement.z],
+        yaw: placement.yaw,
+    }))
+}
+
 /// Takes this robot's seat in the simulation the launcher bound it to. A
 /// robot with no simulation bound drives the limbs the launcher gave it and
 /// returns without a seat.
@@ -82,7 +109,6 @@ pub async fn take(params: &Parameters, runner: &Arc<NodeRunner>) -> Result<()> {
             "this robot takes a seat in a simulation and names no model for it to stand: set `model` to an id of that simulation's robot catalogue, such as openarm_v2",
         ));
     }
-    peppygen::clock::init(runner).await?;
     let token = runner.cancellation_token().clone();
     let rate = params.command_rate_hz;
     if !COMMAND_RATE_HZ.contains(&rate) {
@@ -93,11 +119,7 @@ pub async fn take(params: &Parameters, runner: &Arc<NodeRunner>) -> Result<()> {
         )));
     }
     let period = Duration::from_secs_f64(1.0 / f64::from(rate));
-    let placement =
-        (!params.placement.auto).then_some(attach::SimulationRobotAttachActionGoalPlacement {
-            position: [params.placement.x, params.placement.y, params.placement.z],
-            yaw: params.placement.yaw,
-        });
+    let placement = spot_of(&params.placement).map_err(refused)?;
 
     // The seat: the simulation stands this robot and says which limbs it
     // gave it. Feedback is a state stream the engine publishes on its own
@@ -249,6 +271,7 @@ async fn spawn_state_publishers(
     ];
     Ok(tokio::spawn(async move {
         let mut failing = false;
+        let mut unreadable = false;
         let mut first = true;
         let mut ended_by_engine = false;
         loop {
@@ -261,38 +284,69 @@ async fn spawn_state_publishers(
                 // The stay is over on the engine's side: it completed the
                 // goal, or it is gone. Its own account of why comes from
                 // the goal's result.
-                Err(e) => {
+                Err(
+                    e @ (peppygen::Error::ActionFeedbackChannelClosed
+                    | peppygen::Error::ActionFeedbackProducerGone { .. }),
+                ) => {
                     info!("this robot's seat in the simulation ended: {e}");
                     ended_by_engine = true;
                     break;
                 }
+                // A frame this robot cannot read is one frame. The engine
+                // publishes the next on its own grid, and the robot holds
+                // the state it last measured until then.
+                Err(e) => {
+                    if !unreadable {
+                        unreadable = true;
+                        warn!(
+                            "reading this robot's simulated state is failing, suppressing repeats: {e}"
+                        );
+                    }
+                    tokio::time::sleep(FEEDBACK_ERROR_BACKOFF).await;
+                    continue;
+                }
             };
+            unreadable = false;
             let mut published = Ok(());
+            let mut dropped = false;
             for (slot, publisher, build) in &arms {
                 let Some(state) = seat.arm_state(slot, &feedback) else {
                     continue;
                 };
-                let message = build(
-                    feedback.timestamp,
-                    state.positions.clone(),
-                    state.velocities.clone(),
-                    Vec::new(),
-                );
+                let Some((positions, velocities)) =
+                    limbs::measured_arm(state.positions.clone(), state.velocities.clone())
+                else {
+                    dropped = true;
+                    continue;
+                };
+                let message = build(feedback.timestamp, positions, velocities, Vec::new());
                 published = published.and(publish(publisher, message).await);
             }
             for (slot, publisher, build) in &grippers {
                 let Some(state) = seat.gripper_state(slot, &feedback) else {
                     continue;
                 };
+                let Some((opening, effort)) = limbs::measured_gripper(state.opening, state.effort)
+                else {
+                    dropped = true;
+                    continue;
+                };
                 let message = build(
                     feedback.timestamp,
-                    state.opening,
-                    state.effort,
+                    opening,
+                    effort,
                     seat.gripper_max_effort(slot),
                 );
                 published = published.and(publish(publisher, message).await);
             }
+            if dropped && !failing {
+                failing = true;
+                warn!(
+                    "the simulation is measuring this robot's limbs with values it cannot publish, suppressing repeats"
+                );
+            }
             match published {
+                Ok(()) if dropped => {}
                 Ok(()) => {
                     failing = false;
                     if first {
@@ -463,4 +517,43 @@ async fn spawn_gripper_consumers(
     gripper_consumer!(left_gripper_link);
     gripper_consumer!(right_gripper_link);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use peppygen::parameters::placement::Placement;
+
+    fn at(x: f64, y: f64, z: f64, yaw: f64) -> Placement {
+        Placement {
+            auto: false,
+            x,
+            y,
+            z,
+            yaw,
+        }
+    }
+
+    #[test]
+    fn a_spot_is_four_finite_numbers_or_the_engines_to_choose() {
+        let auto = Placement {
+            auto: true,
+            ..at(1.0, 2.0, 3.0, 0.5)
+        };
+        assert!(spot_of(&auto).unwrap().is_none());
+        let spot = spot_of(&at(1.0, -2.0, 0.0, 0.5)).unwrap().unwrap();
+        assert_eq!((spot.position, spot.yaw), ([1.0, -2.0, 0.0], 0.5));
+        for bad in [
+            at(f64::NAN, 0.0, 0.0, 0.0),
+            at(0.0, f64::INFINITY, 0.0, 0.0),
+            at(0.0, 0.0, f64::NEG_INFINITY, 0.0),
+            at(0.0, 0.0, 0.0, f64::NAN),
+        ] {
+            let refused = spot_of(&bad).unwrap_err();
+            assert!(
+                refused.contains("placement x, y, z and yaw must each be a finite number"),
+                "{refused}"
+            );
+        }
+    }
 }

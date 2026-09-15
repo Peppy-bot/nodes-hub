@@ -221,6 +221,19 @@ pub fn arm_command(positions: Vec<f64>, velocities: Vec<f64>) -> Option<ArmComma
     })
 }
 
+/// One arm's measured state, as this robot publishes it: one finite
+/// position per joint, the velocities only when they match too. A state the
+/// robot cannot stand behind is dropped rather than forwarded as the arm's
+/// own measurement.
+pub fn measured_arm(positions: Vec<f64>, velocities: Vec<f64>) -> Option<(Vec<f64>, Vec<f64>)> {
+    arm_command(positions, velocities).map(|arm| (arm.positions, arm.velocities))
+}
+
+/// One gripper's measured state: a finite opening and effort.
+pub fn measured_gripper(opening: f64, effort: f64) -> Option<(f64, f64)> {
+    (opening.is_finite() && effort.is_finite()).then_some((opening, effort))
+}
+
 /// A gripper setpoint the engine can use: a finite opening and a finite,
 /// non-negative effort cap.
 pub fn gripper_command(opening: f64, max_effort: f64) -> Option<GripperCommand> {
@@ -248,6 +261,25 @@ mod tests {
 
     fn positions() -> Vec<f64> {
         (0..ARM_DOF).map(|j| j as f64 / 10.0).collect()
+    }
+
+    #[test]
+    fn a_measured_state_the_robot_cannot_stand_behind_is_dropped() {
+        assert_eq!(
+            measured_arm(positions(), vec![0.0; ARM_DOF]),
+            Some((positions(), vec![0.0; ARM_DOF]))
+        );
+        assert!(measured_arm(vec![f64::NAN; ARM_DOF], Vec::new()).is_none());
+        assert!(measured_arm(vec![0.0; ARM_DOF - 1], Vec::new()).is_none());
+        // Velocities the engine did not measure leave the arm's positions
+        // standing, the way an unmeasured velocity reaches a setpoint.
+        assert_eq!(
+            measured_arm(positions(), vec![f64::INFINITY; ARM_DOF]),
+            Some((positions(), Vec::new()))
+        );
+        assert_eq!(measured_gripper(0.5, 1.0), Some((0.5, 1.0)));
+        assert!(measured_gripper(f64::NAN, 1.0).is_none());
+        assert!(measured_gripper(0.5, f64::NEG_INFINITY).is_none());
     }
 
     #[test]

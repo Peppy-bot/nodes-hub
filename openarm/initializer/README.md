@@ -6,8 +6,8 @@ The node that brings one OpenArm into being and says when it is ready.
 
 A robot whose launcher binds a simulation to this node's `simulation` slot
 takes its seat there before it does anything else. It attaches as the model
-its `hardware_version` names, at the placement it was given or on a free spot
-the engine picks, and the engine answers with the limbs it gave the robot.
+`model` names, at the placement it was given or on a free spot the engine
+picks, and the engine answers with the limbs it gave the robot.
 From then on the four limb pairings above this node carry the robot: the
 relays' setpoints go out as one command at `command_rate_hz`, and every
 measured state the engine feeds back is published on the limb it measures.
@@ -81,12 +81,13 @@ the limb instances' own logs (`peppy node info <node>:v1` per limb node).
 **the node stops right after it starts, saying the simulation refused it**
 The engine would not stand this robot, and its reason is in the message: a
 model its catalogue does not carry, or a placement another robot occupies.
-`peppy stack list` reports the instance failed. Fix the robot's
-`hardware_version` or its `placement`, or make room in the world, then
-`peppy stack join` the copy again.
+`peppy stack list` reports the instance failed. Fix the robot's `model` or
+its `placement`, or make room in the world, then `peppy stack join` the copy
+again.
 
-**the robot left the scene and its node is failed**
+**the robot left the scene and its node stopped**
 A seat ends when the engine takes the robot out or its commands stop for the
 engine's lease, and the node stops with it rather than serving a readiness
-the scene no longer backs. Nothing brings the copy back on its own:
-`peppy stack join` it again.
+the scene no longer backs. `peppy stack list` reports the instance finished,
+with the engine's own account of why in the node's run log. Nothing brings
+the copy back on its own: `peppy stack join` it again.
