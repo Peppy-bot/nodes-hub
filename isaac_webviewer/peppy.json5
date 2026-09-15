@@ -13,6 +13,11 @@
       def_file: "apptainer.def",
     },
 
-    parameters: {},
+    parameters: {
+      // The port the viewer page is preferred on. A viewer whose port
+      // another process already holds takes one of its own, so two run on
+      // one host without being told apart.
+      http_port: { $type: "u16", $default: 8210 },
+    },
   },
 }

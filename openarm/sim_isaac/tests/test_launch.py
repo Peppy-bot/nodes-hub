@@ -9,7 +9,7 @@ import sys
 import tomllib
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import ANY, Mock
 
 import pytest
 
@@ -80,7 +80,7 @@ def startup(monkeypatch):
 
     monkeypatch.setattr(builtins, "__import__", guarded_import)
 
-    def load(*, headless=True, cameras_enabled=False, hardware_version="v2"):
+    def load(*, headless=True, cameras_enabled=False, model="openarm_v2"):
         spec = importlib.util.spec_from_file_location("_openarm_launch_under_test", _LAUNCH_PATH)
         module = importlib.util.module_from_spec(spec)
         monkeypatch.setitem(sys.modules, spec.name, module)
@@ -90,10 +90,16 @@ def startup(monkeypatch):
         module._handoff["value"] = module._SimHandoff(
             io=object(),
             scene_actions=object(),
+            seats=object(),
+            seat_io=Mock(),
+            world=Mock(),
+            edits=Mock(),
+            layout=Mock(),
             state_rate_hz=17,
             headless=headless,
-            hardware_version=hardware_version,
-            cameras_enabled=cameras_enabled,
+            # A camera the sensor can actually pace: its fps is read on
+            # construction.
+            cameras=[Mock(name="wrist_left", fps=30)] if cameras_enabled else [],
         )
         module._handoff_ready.set()
         state.thread = Mock()
@@ -151,12 +157,15 @@ def test_launch_selects_extensions_before_construction_and_preserves_handoff(
     handoff = state.module._handoff["value"]
     state.sim_launcher.assert_called_once_with(
         state.app,
-        _LAUNCH_PATH.parent / "assets" / "openarm_bimanual_v2.usd",
+        handoff.world,
+        handoff.edits,
+        # The bridge the node builds around the world; which object it is
+        # belongs to the bridge's own tests.
+        ANY,
         state.module._ready,
         state.module._stop,
         handoff.io,
         handoff.scene_actions,
-        17,
         cameras_enabled,
         frame_rate_hz=60,
         render_mode="RealTimePathTracing",
@@ -285,21 +294,26 @@ def test_blank_public_ip_leaves_ice_address_selection_automatic(startup, monkeyp
 
 
 @pytest.mark.parametrize(
-    "hardware_version, filename",
+    "model, filename",
     [
-        ("v1", "openarm_bimanual.usd"),
-        ("V1", "openarm_bimanual.usd"),
-        ("v2", "openarm_bimanual_v2.usd"),
+        ("openarm_v1", "openarm_bimanual.usd"),
+        ("openarm_v2", "openarm_bimanual_v2.usd"),
     ],
 )
-def test_robot_asset_root_override_selects_a_bundled_stage(
-    startup, monkeypatch, hardware_version, filename
+def test_every_model_the_catalogue_carries_is_a_stage_the_image_bakes(
+    monkeypatch, model, filename
 ):
+    """The catalogue names a stage per model, and the image is built to carry
+    exactly those files."""
     monkeypatch.setenv("PEPPY_ROBOT_ASSETS_DIR", "/opt/robot_assets/openarm/isaac")
-    state = startup(hardware_version=hardware_version)
-    state.module.main()
+    sys.path.insert(0, str(_ROBOT_DIR))
+    import importlib
 
-    assert state.sim_launcher.call_args.args[1] == Path(
+    import world as world_module
+
+    importlib.reload(world_module)
+
+    assert world_module.Catalogue.baked()._stages[model] == Path(
         "/opt/robot_assets/openarm/isaac"
     ) / filename
     manifest = json.loads(
@@ -308,9 +322,12 @@ def test_robot_asset_root_override_selects_a_bundled_stage(
     assert filename in manifest["robot"]["files"]
 
 
-def test_scene_selection_rejects_unknown_hardware_without_a_fallback(startup):
-    with pytest.raises(ValueError, match="hardware_version"):
-        startup().module._scene_path("v3")
+def test_a_model_the_catalogue_does_not_carry_names_the_ones_it_does():
+    sys.path.insert(0, str(_ROBOT_DIR))
+    import world as world_module
+
+    with pytest.raises(ValueError, match="openarm_v1, openarm_v2"):
+        world_module.Catalogue.baked().scene("openarm_v3")
 
 
 def test_setup_failure_does_not_construct_isaac(startup):

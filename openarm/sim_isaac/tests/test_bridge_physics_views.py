@@ -1,8 +1,13 @@
-"""The bridge drops its articulation handles on request and re-creates them on
-the next step, keeping the camera render products."""
+"""Letting go of the stage and taking it up again.
+
+A view of a prim that is edited under it stops reading, so the bridge drops
+every view before the stage changes and builds them again after. These cover
+that the drop reaches every view of every robot, that what a view cached goes
+with it, and that the camera's render products, which ride USD prims rather
+than PhysX views, are left alone.
+"""
 
 import importlib.util
-import logging
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -11,6 +16,26 @@ from unittest.mock import Mock
 import pytest
 
 _ROBOT_DIR = Path(__file__).resolve().parents[1] / "robots" / "openarm"
+
+
+def _view():
+    """One PhysX-backed view, ready the moment it is asked."""
+    ext = Mock(spec=["setup", "teardown", "write_targets", "set_force_limit",
+                     "get_gripper_state"])
+    ext.setup.return_value = True
+    ext.get_gripper_state.return_value = None
+    return ext
+
+
+def _limbs_of(module, instance):
+    """One robot's views, standing in for what RobotLimbs builds from a stage."""
+    limbs = Mock(spec=["exts", "teardown", "setup", "ready", "robot"])
+    views = [_view() for _ in range(4)]
+    limbs.exts.return_value = views
+    limbs.setup.return_value = True
+    limbs.ready = True
+    limbs.robot = Mock(instance=instance)
+    return limbs
 
 
 @pytest.fixture
@@ -22,84 +47,67 @@ def bridge(monkeypatch):
     topics.SimTopicIO = object
     monkeypatch.setitem(sys.modules, "sim_topics", topics)
     monkeypatch.syspath_prepend(str(_ROBOT_DIR))
-    spec = importlib.util.spec_from_file_location("_bridge_under_test", _ROBOT_DIR / "bridge_extension.py")
+    spec = importlib.util.spec_from_file_location(
+        "_bridge_under_test", _ROBOT_DIR / "bridge_extension.py"
+    )
     bridge_extension = importlib.util.module_from_spec(spec)
+    # Its dataclasses resolve postponed annotations through sys.modules.
+    monkeypatch.setitem(sys.modules, spec.name, bridge_extension)
     spec.loader.exec_module(bridge_extension)
     monkeypatch.setattr(bridge_extension, "IsaacCameraSensor", Mock())
-    monkeypatch.setattr(bridge_extension, "load_camera_configs", Mock(return_value=[]))
-    monkeypatch.setattr(bridge_extension, "validate_camera_slots", Mock())
-    extension = bridge_extension.IsaacBridgeExtension(Mock(), state_rate_hz=60, cameras_enabled=True)
 
-    joints = [j for arm in extension._arms for j in arm["joints"]] + [
-        f for g in extension._grippers for f in g["fingers"]
-    ]
-    articulation = Mock(spec=["setup", "teardown", "get_joint_names", "get_joint_limits", "get_joint_states"])
-    articulation.setup.return_value = True
-    articulation.get_joint_names.return_value = joints
-    articulation.get_joint_limits.return_value = ([-0.01] * len(joints), [0.05] * len(joints))
-    articulation.get_joint_states.return_value = None
-    extension._articulation = articulation
-    for table in (extension._arm_actuators, extension._gripper_actuators, extension._gripper_sensors):
-        for key in table:
-            ext = Mock(spec=["setup", "teardown", "write_targets", "set_force_limit", "get_gripper_state"])
-            ext.setup.return_value = True
-            ext.get_gripper_state.return_value = None
-            table[key] = ext
+    extension = bridge_extension.IsaacBridgeExtension(
+        Mock(), Mock(), Mock(), Mock(), Mock(), state_rate_hz=60, cameras=[Mock()]
+    )
+    # Two robots on the stage, each with views of its own.
+    extension._limbs = {
+        "alpha": _limbs_of(bridge_extension, "alpha"),
+        "bravo": _limbs_of(bridge_extension, "bravo"),
+    }
     camera = Mock(spec=["setup", "teardown", "step"])
     camera.setup.return_value = True
     extension._camera_sensor = camera
-    extension._io.latest_arm_command.return_value = None
-    extension._io.latest_gripper_command.return_value = None
-    monkeypatch.setattr(extension, "_engine_time_s", lambda: 0.0)
-    assert extension.step() is None
-    assert extension.is_ready
     return extension
 
 
-def _physics_exts(extension):
-    return [
-        extension._articulation,
-        *extension._arm_actuators.values(),
-        *extension._gripper_actuators.values(),
-        *extension._gripper_sensors.values(),
-    ]
+def test_letting_go_drops_every_view_of_every_robot(bridge):
+    held = list(bridge._limbs.values())
+    assert bridge.is_ready
 
-
-def test_invalidation_tears_down_articulation_handles_and_the_next_step_recreates_them(bridge, caplog):
-    caplog.set_level(logging.INFO)
-    bridge._applied_effort = {1: 5.0}
-    for ext in _physics_exts(bridge):
-        ext.setup.reset_mock()
-
-    bridge.invalidate_physics_views()
+    bridge.unbind()
 
     assert not bridge.is_ready
-    for ext in _physics_exts(bridge):
-        ext.teardown.assert_called_once_with()
+    assert bridge._limbs == {}
+    for limbs in held:
+        limbs.teardown.assert_called_once_with()
+
+
+def test_the_cameras_outlive_the_views_they_stand_beside(bridge):
+    bridge.unbind()
+
+    # Render products ride USD prims, not PhysX views, so a stage edit does
+    # not cost them.
     bridge._camera_sensor.teardown.assert_not_called()
-    assert bridge._applied_effort == {}
-    assert bridge._joint_index == {}
-    assert bridge._gripper_travels == {}
-    assert "re-initialises on its next step" in caplog.text
-
-    bridge.step()
-
-    assert bridge.is_ready
-    for ext in _physics_exts(bridge):
-        ext.setup.assert_called_once_with()
-    assert bridge._joint_index
-    assert set(bridge._gripper_travels) == {g["gripper_id"] for g in bridge._grippers}
 
 
-def test_invalidation_before_readiness_is_silent_and_still_drops_partial_handles(bridge, caplog):
-    caplog.set_level(logging.INFO)
-    bridge.invalidate_physics_views()
-    for ext in _physics_exts(bridge):
-        ext.teardown.reset_mock()
-    caplog.clear()
+def test_taking_the_stage_up_again_builds_a_view_of_every_robot_on_it(bridge, monkeypatch):
+    # What a robot's views are made of is RobotLimbs' business; this covers
+    # that bind builds one set per robot the stage stands.
+    built = []
 
-    bridge.invalidate_physics_views()
+    def limbs_for(robot, layout):
+        built.append(robot.instance)
+        return _limbs_of(None, robot.instance)
 
-    for ext in _physics_exts(bridge):
-        ext.teardown.assert_called_once_with()
-    assert caplog.records == []
+    monkeypatch.setattr(
+        sys.modules["_bridge_under_test"], "RobotLimbs", limbs_for
+    )
+    bridge._world.robots.return_value = [
+        Mock(instance="alpha"), Mock(instance="bravo"), Mock(instance="charlie")
+    ]
+    bridge.unbind()
+
+    bridge.bind()
+
+    assert built == ["alpha", "bravo", "charlie"]
+    assert sorted(bridge._limbs) == ["alpha", "bravo", "charlie"]

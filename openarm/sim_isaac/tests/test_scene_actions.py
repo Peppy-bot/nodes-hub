@@ -12,7 +12,36 @@ import pytest
 
 _ROBOT_DIR = Path(__file__).resolve().parents[1] / "robots" / "openarm"
 _ACTIONS = ("apply_force", "clear_scene", "load_scene", "move_object", "move_robot", "remove_object", "spawn_object")
-_SERVICES = ("get_assets_list", "get_objects_list")
+_SERVICES = ("get_assets_list", "get_objects_list", "get_robots_list")
+
+
+class _Robot(SimpleNamespace):
+    """A robot as world.py reports it: the name it stands under, its model,
+    and where. The engine's own robot has an empty instance."""
+
+    def prim(self):
+        return f"/World/{self.instance}" if self.instance else "/openarm"
+
+
+class _World:
+    """The stage's robots, as SceneActionIO reads them."""
+
+    def __init__(self, robots):
+        self._robots = list(robots)
+
+    def robots(self):
+        return list(self._robots)
+
+
+def _world(*robots):
+    return _World(
+        _Robot(
+            instance=instance,
+            model=model,
+            placement=SimpleNamespace(position=position),
+        )
+        for instance, model, position in robots
+    )
 
 
 @pytest.fixture
@@ -38,9 +67,10 @@ def provider(monkeypatch):
     # Its dataclass resolves postponed annotations through sys.modules.
     monkeypatch.setitem(sys.modules, spec.name, module)
     spec.loader.exec_module(module)
-    io = module.SceneActionIO(object(), Mock())
+    world = _world(("", "openarm_v2", (0.0, 0.0, 0.0)))
+    io = module.SceneActionIO(object(), Mock(), world)
     launcher = Mock()
-    return SimpleNamespace(io=io, launcher=launcher)
+    return SimpleNamespace(io=io, launcher=launcher, world=world)
 
 
 _CATALOGUE = {
@@ -130,3 +160,51 @@ def test_load_scene_rejects_unknown_or_non_scene_assets_before_touching_the_stag
         provider.io._execute(provider.launcher, "load_scene", {"asset_id": asset_id, "scale": 1.0})
     assert provider.launcher.mock_calls == []
     assert len(provider.io._public_objects()) == 1
+
+
+def test_the_listing_names_every_robot_the_stage_stands(provider):
+    listed = json.loads(provider.io._handle_get_robots(None).robots_json)
+
+    assert listed == [
+        {"robot": "openarm", "model": "openarm_v2", "position": [0.0, 0.0, 0.0],
+         "attached": False}
+    ]
+
+
+def test_the_listing_follows_the_robots_that_take_a_seat(provider):
+    provider.io._world = _world(
+        ("", "openarm_v2", (0.0, 0.0, 0.0)),
+        ("bravo", "openarm_v1", (0.0, -1.5, 0.0)),
+    )
+
+    listed = json.loads(provider.io._handle_get_robots(None).robots_json)
+
+    assert [r["robot"] for r in listed] == ["openarm", "bravo"]
+    assert [r["attached"] for r in listed] == [False, True]
+    assert listed[1]["model"] == "openarm_v1"
+    assert listed[1]["position"] == [0.0, -1.5, 0.0]
+
+
+def test_moving_a_robot_by_name_moves_that_robot(provider):
+    provider.io._world = _world(
+        ("", "openarm_v2", (0.0, 0.0, 0.0)),
+        ("bravo", "openarm_v1", (0.0, -1.5, 0.0)),
+    )
+
+    result = provider.io._execute(
+        provider.launcher, "move_robot", {"robot": "bravo", "position": [1.0, -2.0, 0.0]}
+    )
+
+    assert result["success"] is True
+    assert provider.launcher.mock_calls == [
+        call._runtime_move_robot_root({"robot": "bravo", "position": [1.0, -2.0, 0.0]})
+    ]
+
+
+def test_a_robot_the_stage_does_not_stand_is_refused_before_the_stage(provider):
+    with pytest.raises(ValueError, match="no robot stands as 'ghost'"):
+        provider.io._execute(
+            provider.launcher, "move_robot", {"robot": "ghost", "position": [1.0, 0.0, 0.0]}
+        )
+
+    assert provider.launcher.mock_calls == []

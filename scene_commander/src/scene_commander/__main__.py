@@ -26,6 +26,7 @@ from peppygen.consumed_actions.simulation import (
 from peppygen.consumed_services.simulation import (
     get_assets_list,
     get_objects_list,
+    get_robots_list,
 )
 
 from scene_commander import listen
@@ -85,6 +86,23 @@ async def _fetch_objects(node_runner: NodeRunner) -> list[dict]:
         raise RuntimeError(data.message)
 
     return json.loads(data.objects_json)
+
+
+async def _fetch_robots(node_runner: NodeRunner) -> list[dict]:
+    producer = get_robots_list.bound_producer(node_runner)
+
+    response = await get_robots_list.poll(
+        node_runner,
+        producer,
+        timeout=SERVICE_TIMEOUT_S,
+    )
+
+    data = response.data
+
+    if not data.success:
+        raise RuntimeError(data.message)
+
+    return json.loads(data.robots_json)
 
 
 class _CatalogueWatch:
@@ -242,13 +260,16 @@ async def _action_remove_object(node_runner: NodeRunner, object_id: str) -> dict
     return {"success": True, "message": data.message}
 
 
-async def _action_move_robot(node_runner: NodeRunner, position: list[float]) -> dict:
+async def _action_move_robot(
+    node_runner: NodeRunner, robot: str, position: list[float]
+) -> dict:
     position = [float(value) for value in position]
 
     data = await _run_action(
         move_robot,
         node_runner,
-        move_robot.GoalRequest(position=position),
+        move_robot.GoalRequest(robot=robot, position=position),
+        robot=robot,
         position=position,
     )
 
@@ -303,6 +324,15 @@ def _position(payload: dict) -> list[float]:
         raise ValueError("position must be [x, y, z]")
 
     return [float(value) for value in position]
+
+
+def _robot(payload: dict) -> str:
+    robot = payload.get("robot")
+
+    if not isinstance(robot, str) or not robot:
+        raise ValueError("robot must be the name of a robot, as /api/robots lists them")
+
+    return robot
 
 
 # ---------------------------------------------------------------------------
@@ -437,12 +467,25 @@ async def _api_remove_object(request: web.Request) -> web.Response:
     return web.json_response(result)
 
 
+async def _api_robots(request: web.Request) -> web.Response:
+    try:
+        robots = await _fetch_robots(request.app[_NODE_RUNNER])
+
+    except Exception as exc:
+        return _json_error(request, exc, status=500)
+
+    return web.json_response(
+        {"success": True, "robots": robots, "count": len(robots)}
+    )
+
+
 async def _api_move_robot(request: web.Request) -> web.Response:
     try:
         payload = await _request_json(request)
 
         result = await _action_move_robot(
             request.app[_NODE_RUNNER],
+            _robot(payload),
             _position(payload),
         )
 
@@ -689,6 +732,13 @@ select:disabled {
 
 <section class="card">
 <h2>Robot Root</h2>
+
+<label>Robot</label>
+<div class="row">
+<select id="robotSelect" onchange="selectRobot()" disabled></select>
+<button onclick="refreshRobots()">Refresh</button>
+</div>
+<div id="robotCount"></div>
 
 <label>Position</label>
 <div class="row">
@@ -1243,14 +1293,63 @@ async function removeObject(index) {
     }
 }
 
+let robotList = [];
+
+async function refreshRobots() {
+    try {
+        const data = await api("/api/robots");
+        robotList = data.robots;
+
+        const select = el("robotSelect");
+        const previous = select.value;
+        select.replaceChildren(...robotList.map(r =>
+            new Option(`${r.robot} (${r.model})`, r.robot)
+        ));
+        select.disabled = robotList.length === 0;
+        if (robotList.some(r => r.robot === previous)) {
+            select.value = previous;
+        }
+        selectRobot();
+
+        el("robotCount").textContent =
+            `${robotList.length} robots standing`;
+    }
+    catch (err) {
+        status(err.message, true);
+    }
+}
+
+// The selected robot's own position fills the boxes, so a move starts from
+// where that robot stands rather than from the last robot's numbers.
+function selectRobot() {
+    const robot = robotList.find(r => r.robot === el("robotSelect").value);
+    if (!robot) {
+        return;
+    }
+    const [x, y, z] = robot.position;
+    el("robotX").value = x;
+    el("robotY").value = y;
+    el("robotZ").value = z;
+}
+
 async function moveRobot() {
     try {
+        const robot = el("robotSelect").value;
+
+        if (!robot) {
+            status("select a robot to move", true);
+            return;
+        }
+
         const data = await api("/api/robot/move", {
             method: "POST",
             body: JSON.stringify({
+                robot: robot,
                 position: position("robot")
             })
         });
+
+        await refreshRobots();
 
         status(data.message);
     }
@@ -1262,6 +1361,7 @@ async function moveRobot() {
 async function startup() {
     await loadCatalogue();
     await refreshObjects();
+    await refreshRobots();
 }
 
 startup();
@@ -1291,6 +1391,7 @@ def _build_app(node_runner: NodeRunner, catalogue: _CatalogueWatch) -> web.Appli
     app.router.add_get("/api/health", _api_health)
     app.router.add_get("/api/assets", _api_assets)
     app.router.add_get("/api/objects", _api_objects)
+    app.router.add_get("/api/robots", _api_robots)
     app.router.add_post("/api/scene/load", _api_load_scene)
     app.router.add_post("/api/scene/clear", _api_clear_scene)
     app.router.add_post("/api/objects/spawn", _api_spawn_object)

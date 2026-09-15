@@ -1,8 +1,10 @@
 // The Isaac Sim simulation node.
 //
-// It plays the follower role of every limb's joint_link / gripper_link
-// pairing: governed arm/gripper setpoints arrive from the simulation relay
-// nodes and measured state streams back.
+// It hosts any number of robots on one stage: the robot named by the `model`
+// parameter stands from the start and is driven through the limb pairings
+// below, and any number of others take a seat through the simulation_robot
+// contract, each bringing its own model and driven by the attachment that
+// holds the seat.
 //
 // The node also implements the scene_control contract on its scene slot:
 // runtime scene/object services and actions consumed by higher-level tools
@@ -22,6 +24,11 @@
     // commander that speaks scene_control can drive this simulation.
     implements: [
       { name: "scene_control", tag: "v1", link_id: "scene" },
+      // The seat a robot takes on this stage: it attaches with its model and
+      // placement, streams the setpoints of its limbs and receives its own
+      // measured state. Any number of robots hold one at a time; the engine
+      // tells them apart by the caller.
+      { name: "simulation_robot", tag: "v1", link_id: "robots" },
     ],
 
     depends_on: {
@@ -59,6 +66,8 @@
       exposes: [
         { link_id: "scene", name: "get_assets_list" },
         { link_id: "scene", name: "get_objects_list" },
+        { link_id: "scene", name: "get_robots_list" },
+        { link_id: "robots", name: "command" },
       ],
     },
 
@@ -78,6 +87,7 @@
         { link_id: "scene", name: "remove_object" },
         { link_id: "scene", name: "apply_force" },
         { link_id: "scene", name: "move_robot" },
+        { link_id: "robots", name: "attach" },
       ],
     },
 
@@ -127,13 +137,12 @@
     },
 
     parameters: {
-      // Which OpenArm generation to simulate:
-      //
-      //   "v1"
-      //   "v2"
-      //
-      // This selects the matching OpenArm USD and robot configuration.
-      hardware_version: "string",
+      // The robot the engine stands from the start, driven through the limb
+      // pairings: an id of its catalogue, "openarm_v1" or "openarm_v2", each
+      // a USD baked into the base image, and the same id a robot attaches
+      // with. Empty stands none, and the stage holds the robots that take a
+      // seat.
+      model: { $type: "string", $default: "" },
 
       // Rate in Hz of the measured joint_states / gripper_states streams.
       // On a launch that declares this simulation its source of simulated time, the
@@ -153,8 +162,14 @@
       // Render and stream the robot-mounted cameras (config/cameras.json5) on
       // their pairing slots. No default: whether a stack renders cameras is
       // the launcher's decision, and a launcher that leaves it unsaid fails
-      // here rather than coming up quietly camera-less.
+      // here rather than coming up quietly camera-less. The rig mounts on the
+      // robot the engine stands, so this needs `model` set to openarm_v2.
       cameras_enabled: "bool",
+      // How long a robot that took a seat stays on the stage after its last
+      // command. An attachment commands at its own rate whether or not
+      // anything changed, so a robot whose process is gone leaves the stage
+      // within this window.
+      robot_lease_ms: { $type: "u32", $default: 2000 },
     },
   },
 }

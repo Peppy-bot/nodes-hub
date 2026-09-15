@@ -1,3 +1,7 @@
+//! The robot's readiness gate: the four limbs the launcher bound are polled
+//! for their own readiness, and the robot is ready only while every one of
+//! them is.
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -15,7 +19,13 @@ use peppylib::runtime::CancellationToken;
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const POLL_TIMEOUT: Duration = Duration::from_secs(2);
 
-pub async fn run(runner: Arc<NodeRunner>, token: CancellationToken) {
+/// Starts serving the robot-level `is_ready`, for as long as the node runs.
+pub fn serve(runner: Arc<NodeRunner>) {
+    let token = runner.cancellation_token().clone();
+    tokio::spawn(run(runner, token));
+}
+
+async fn run(runner: Arc<NodeRunner>, token: CancellationToken) {
     // The generated is_ready handler closure is synchronous, so it cannot poll
     // the components itself. A background task caches their aggregate readiness
     // here and the handler just reads it.

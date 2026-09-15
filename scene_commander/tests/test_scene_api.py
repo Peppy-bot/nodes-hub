@@ -17,6 +17,10 @@ _SOURCE = Path(__file__).resolve().parents[1] / "src" / "scene_commander" / "__m
 _ACTIONS = ("apply_force", "clear_scene", "load_scene", "move_object", "move_robot", "remove_object", "spawn_object")
 _BUSY = "Isaac is still discovering its asset catalogue"
 _SCENE = {"asset_id": "scene/full_warehouse", "display_name": "Full Warehouse", "kind": "scene", "category": "Scenes"}
+_ROBOTS = [
+    {"robot": "alpha_init_inst", "model": "openarm_v2", "position": [0.0, 0.0, 0.0], "attached": True},
+    {"robot": "bravo_init_inst", "model": "openarm_v1", "position": [0.0, -1.5, 0.0], "attached": True},
+]
 
 
 class Status(enum.Enum):
@@ -80,6 +84,10 @@ def commander(monkeypatch):
     services.get_assets_list.answers = [_catalogue(_SCENE)]
     services.get_objects_list = FakeService("get_objects_list")
     services.get_objects_list.answers = [SimpleNamespace(success=True, message="0 runtime objects", objects_json="[]")]
+    services.get_robots_list = FakeService("get_robots_list")
+    services.get_robots_list.answers = [SimpleNamespace(
+        success=True, message="2 robots standing", robots_json=json.dumps(_ROBOTS)
+    )]
     actions = ModuleType("peppygen.consumed_actions.simulation")
     for name in _ACTIONS:
         setattr(actions, name, FakeAction(name))
@@ -355,3 +363,36 @@ def test_http_server_keeps_browser_requests_out_of_the_log(commander, monkeypatc
     [(runner, sock)] = sites
     assert sock is listener
     assert runner.cleaned
+
+
+
+def test_the_robot_listing_names_what_the_scene_stands(commander):
+    status, body = _call(commander, lambda client: _get(client, "/api/robots"))
+
+    assert status == 200
+    assert body["success"] is True
+    assert body["count"] == 2
+    assert [robot["robot"] for robot in body["robots"]] == [
+        "alpha_init_inst",
+        "bravo_init_inst",
+    ]
+
+
+def test_a_move_carries_the_robot_it_addresses(commander):
+    status, _ = _call(commander, lambda client: _post(
+        client, "/api/robot/move", {"robot": "bravo_init_inst", "position": [1.0, -1.5, 0.0]}
+    ))
+
+    assert status == 200
+    goal = commander.actions.move_robot.goals[-1]
+    assert goal.robot == "bravo_init_inst"
+    assert goal.position == [1.0, -1.5, 0.0]
+
+
+def test_a_move_naming_no_robot_is_refused_before_the_simulation(commander):
+    status, _ = _call(commander, lambda client: _post(
+        client, "/api/robot/move", {"position": [1.0, 0.0, 0.0]}
+    ))
+
+    assert status == 400
+    assert commander.actions.move_robot.goals == []

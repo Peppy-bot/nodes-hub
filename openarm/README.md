@@ -4,7 +4,7 @@
 
 | Component | What it does |
 |---|---|
-| [`openarm_initializer`](./initializer) | aggregates per-limb readiness into `is_ready` |
+| [`openarm_initializer`](./initializer) | holds this robot's seat in a simulation, and aggregates per-limb readiness into `is_ready` |
 | [`openarm_arm`](./arm) | drives one arm side (7 joints) |
 | [`openarm_gripper`](./gripper) | drives one gripper side (v1.0 prismatic or v2.0 pinch, by `hardware_version`) |
 | [`openarm_sim_arm`](./sim_arm) | relays one arm side between the backbone and a simulation |
@@ -18,14 +18,18 @@
 | [`isaac_webviewer`](../isaac_webviewer) | serves the Isaac Sim WebRTC browser viewer |
 | [`scene_commander`](../scene_commander) | browser scene/object/physics control for any simulation implementing the `scene_control` contract (the Isaac Sim simulation and the Waldo simulation) |
 
-Sim support splits into simulation-agnostic relays plus one node per simulation: `openarm_sim_arm` and `openarm_sim_gripper` face the backbone exactly like the real nodes and lead the matching limb slot on the simulation node (`openarm_sim_mujoco` or `openarm_sim_isaac`, which model v1.0 or v2.0 hardware via their `hardware_version` parameter, or `waldo`, which names its world via `world`), which owns the physics. The launcher decides which nodes fill each slot, so the backbone and the UI never know which simulation is underneath.
+Sim support splits into simulation-agnostic relays plus one node per simulation: `openarm_sim_arm` and `openarm_sim_gripper` face the backbone exactly like the real nodes and lead the matching limb slot underneath, which owns the physics. The launcher decides which nodes fill each slot, so the backbone and the UI never know which simulation is underneath.
+
+Where the limb slot lands depends on the simulation. `openarm_sim_mujoco` and `openarm_sim_isaac` carry one robot each, modelling v1.0 or v2.0 hardware through their `hardware_version` parameter, and the relays lead their slots directly. `waldo` hosts any number of robots in one world, and each robot takes a seat there through its own `openarm_initializer`: the seat offers the same four limb slots to the relays, attaches the robot with the model its `hardware_version` names, and carries its setpoints and measured state across the `simulation_robot` contract. The engine tells its robots apart by the seat that commands them, which is what lets several OpenArms, of either generation, share one simulation.
 
 The third simulation, `waldo`, is published by the `private-nodes-hub` repository. Its launcher option is `waldo`, and its Bevy browser viewer is served over https on port 8080 with a self-signed certificate.
 
 The [launchers](https://github.com/Peppy-bot/launchers-hub)
 run robots as named copies: `simulation` runs one simulation and simulated
-robots, `fleet` any mix of physical and simulated ones. The simulations above pair with one
-simulated robot; physical robots join beside it in wall-time mode.
+robots, `fleet` any mix of physical and simulated ones. MuJoCo and Isaac Sim
+pair with one simulated robot, and physical robots join beside it in
+wall-time mode; Waldo seats as many robots, of either generation, as there
+are machines to run them.
 
 ## 1. Prerequisites
 
@@ -147,10 +151,11 @@ simulation is selected at launch. These are separate sessions:
 peppy stack launch fleet
 peppy stack join openarm_v2 -i alpha
 
-# Simulated v2 with the web commander.
+# Simulated v2 with the web commander; more robots join the same simulation.
 peppy stack launch openarm_simulation                 # Waldo
 peppy stack launch openarm_simulation --with mujoco
 peppy stack launch openarm_simulation --with isaac_sim
+peppy stack join openarm_v1_sim -i bravo --set-arguments commander_inst.http_port=8766
 ```
 
 MuJoCo and Isaac Sim also simulate `openarm_v1_sim`. Waldo supplies the v2
@@ -158,9 +163,10 @@ world. A copy selects its own recorder (`lerobot_recorder`), camera rig
 (`cameras_sim` for rendered v2 cameras) and robot commander (`xr_commander`,
 `mcp_commander`) with `with:` in the file or `--with` on join. Its ids carry
 its name, `alpha_backbone_inst`; the simulation and scene control belong to the
-stack. Removing a copy leaves the simulation and its preloaded model running;
-`stack reset` stops everything. The simulation, generation, and rendered-camera
-configuration are selected at launch; a second simulated robot is rejected.
+stack. Removing a copy takes its robot out of the world and leaves the
+simulation running; `stack reset` stops everything. Waldo seats every robot
+that joins, of either generation; MuJoCo and Isaac Sim carry the one robot
+they stand.
 Physical robots can join a fleet:
 
 ```sh

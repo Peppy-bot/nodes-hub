@@ -26,33 +26,29 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-_ASSETS_DIR = Path(
-    os.environ.get(
-        "PEPPY_ROBOT_ASSETS_DIR",
-        str(Path(__file__).parent / "assets"),
-    )
-)
+# The model whose links the camera rig mounts on.
+_CAMERA_MODEL = "openarm_v2"
 
 
-def _version(hardware_version: str) -> str:
-    version = hardware_version.lower()
-
-    if version not in ("v1", "v2"):
+def _camera_configs(params) -> list:
+    """The cameras this launch renders, empty when the parameter is off.
+    Parsed here so a bad config fails node setup, before the stage is opened
+    around it."""
+    if not params.cameras_enabled:
+        return []
+    if params.model != _CAMERA_MODEL:
         raise ValueError(
-            "hardware_version must be v1 or v2, "
-            f"got {hardware_version!r}"
+            f"cameras_enabled needs model set to {_CAMERA_MODEL}: the camera geometry "
+            "in config/cameras.json5 mounts on that model's links, and it is rendered "
+            "from the robot this engine stands"
         )
+    sys.path.insert(0, str(_ROBOTS_DIR))
+    from camera_common import load_camera_configs, validate_camera_slots
+    from sim_topics import COLOR_CAMERA_SLOT_NAMES, RGBD_CAMERA_SLOT_NAMES
 
-    return version
-
-
-def _scene_path(hardware_version: str) -> Path:
-    # Each hardware version selects its own entrypoint in the prepared bundle.
-    filename = {
-        "v1": "openarm_bimanual.usd",
-        "v2": "openarm_bimanual_v2.usd",
-    }[_version(hardware_version)]
-    return _ASSETS_DIR / filename
+    cameras = load_camera_configs(_ROBOTS_DIR / "config" / "cameras.json5")
+    validate_camera_slots(cameras, COLOR_CAMERA_SLOT_NAMES, RGBD_CAMERA_SLOT_NAMES)
+    return cameras
 
 
 _ROBOTS_DIR = Path(__file__).resolve().parents[1]
@@ -92,10 +88,14 @@ class _SimHandoff:
 
     io: object
     scene_actions: object
+    seats: object
+    seat_io: object
+    world: object
+    edits: object
+    layout: object
     state_rate_hz: int
     headless: bool
-    hardware_version: str
-    cameras_enabled: bool
+    cameras: list
 
 
 _handoff: dict[str, _SimHandoff] = {}
@@ -124,14 +124,29 @@ async def _node_setup(params, node_runner) -> list:
         0,
         str(_ROBOTS_DIR),
     )
-    from sim_topics import SimTopicIO
+    from bridge_extension import Layout
+    from edits import Edits
     from scene_actions import SceneActionIO
+    from seat_io import SeatIO
+    from seats import Limbs, Registry
+    from sim_topics import SimTopicIO
+    from world import Catalogue, Placement, Robot, World
 
-    if params.cameras_enabled and _version(params.hardware_version) != "v2":
-        raise ValueError(
-            "cameras_enabled requires hardware_version v2: the camera geometry "
-            "in config/cameras.json5 mounts on v2 links only"
+    cameras = _camera_configs(params)
+
+    catalogue = Catalogue.baked()
+    standing = None
+    if params.model:
+        catalogue.scene(params.model)
+        standing = Robot(
+            instance="",
+            model=params.model,
+            placement=Placement.of((0.0, 0.0, 0.0), 0.0),
         )
+    layout = Layout.read()
+    world = World(catalogue, standing)
+    seats = Registry()
+    edits = Edits()
 
     loop = asyncio.get_running_loop()
 
@@ -145,17 +160,37 @@ async def _node_setup(params, node_runner) -> list:
     scene_actions = SceneActionIO(
         node_runner,
         loop,
+        world,
     )
 
     await scene_actions.start()
 
+    seat_io = SeatIO(
+        node_runner,
+        loop,
+        world,
+        seats,
+        edits,
+        Limbs(
+            arm_names=tuple(layout.arm_names()),
+            arm_joints=tuple(layout.arm_joint_counts()),
+            gripper_names=tuple(layout.gripper_names()),
+        ),
+        params.robot_lease_ms / 1000.0,
+    )
+    await seat_io.start()
+
     _handoff["value"] = _SimHandoff(
         io=io,
         scene_actions=scene_actions,
+        seats=seats,
+        seat_io=seat_io,
+        world=world,
+        edits=edits,
+        layout=layout,
         state_rate_hz=params.state_rate_hz,
         headless=params.headless,
-        hardware_version=params.hardware_version,
-        cameras_enabled=params.cameras_enabled,
+        cameras=cameras,
     )
 
     _handoff_ready.set()
@@ -165,6 +200,7 @@ async def _node_setup(params, node_runner) -> list:
         # then stop Peppy topic IO.
 
         _stop.set()
+        await seat_io.stop()
         await scene_actions.stop()
         await io.stop()
 
@@ -336,7 +372,7 @@ def main() -> None:
             streaming_args
         )
 
-    if handoff.cameras_enabled:
+    if handoff.cameras:
         sys.argv.extend(["--enable", "omni.replicator.core"])
 
     # SimulationApp must be imported only after all launch arguments
@@ -364,22 +400,36 @@ def main() -> None:
     )
 
     from _launcher import SimLauncher
+    from bridge_extension import IsaacBridgeExtension
 
-    SimLauncher(
+    extension = IsaacBridgeExtension(
+        handoff.world,
+        handoff.io,
+        handoff.seats,
+        handoff.seat_io,
+        handoff.layout,
+        handoff.state_rate_hz,
+        handoff.cameras,
+    )
+
+    launcher = SimLauncher(
         simulation_app,
-        _scene_path(
-            handoff.hardware_version
-        ),
+        handoff.world,
+        handoff.edits,
+        extension,
         _ready,
         _stop,
         handoff.io,
         handoff.scene_actions,
-        handoff.state_rate_hz,
-        handoff.cameras_enabled,
+        bool(handoff.cameras),
         frame_rate_hz=_FRAME_RATE_HZ,
         render_mode=_RENDER_CONFIG["renderer"],
         anti_aliasing=_RENDER_CONFIG["anti_aliasing"],
-    ).run()
+    )
+    # A robot that attached before now waits in the edits queue, and the loop
+    # below stands it on this thread, which is the only one that may.
+    handoff.seat_io.binds_with(launcher.rebind, launcher.unbind)
+    launcher.run()
 
 
 if __name__ == "__main__":

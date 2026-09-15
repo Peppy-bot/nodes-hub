@@ -1,12 +1,17 @@
 //! Integration tests over the generated harness: the node in-process, the
 //! four hardware components played by generated mocks over the real wire.
+//!
+//! No simulation is bound here, which is the robot that drives its own
+//! hardware: it takes no seat, and all it does is aggregate its limbs.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use peppygen::fixtures::exposed_services::robot_ready::is_ready as robot_is_ready;
-use peppygen::fixtures::harness::Harness;
+use peppygen::fixtures::harness::{Config, Harness};
+
+mod common;
 
 /// How long each mock waits parked for the node's next poll. The node polls
 /// every 500ms, so this only expires once the harness is gone.
@@ -48,9 +53,20 @@ async fn poll_until(harness: &Harness, want: bool, deadline: Duration) -> peppyg
     }
 }
 
+/// A robot with no simulation bound: the `simulation` slot is vacant, so the
+/// node takes no seat and serves readiness alone.
+fn on_its_own_hardware() -> Config {
+    Config {
+        parameters: Some(common::parameters("openarm_v2")),
+        simulation_vacant: true,
+        ..Config::default()
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reports_ready_only_when_every_component_is() -> peppygen::Result<()> {
-    let (harness, mocks) = Harness::start(openarm_initializer::setup).await?;
+    let (harness, mocks) =
+        Harness::start_with(on_its_own_hardware(), openarm_initializer::setup).await?;
 
     let left_arm = Arc::new(AtomicBool::new(true));
     let right_arm = Arc::new(AtomicBool::new(true));
@@ -96,7 +112,8 @@ async fn reports_ready_only_when_every_component_is() -> peppygen::Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn losing_a_component_flips_back_to_not_ready() -> peppygen::Result<()> {
-    let (harness, mocks) = Harness::start(openarm_initializer::setup).await?;
+    let (harness, mocks) =
+        Harness::start_with(on_its_own_hardware(), openarm_initializer::setup).await?;
 
     let always = Arc::new(AtomicBool::new(true));
     pump_is_ready!(
