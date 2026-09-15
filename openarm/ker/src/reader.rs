@@ -1,17 +1,16 @@
 // The device thread: owns the transport, handshakes, decodes and maps frames,
 // and keeps the newest calibrated sample on a watch channel for the publish
-// tasks. Device I/O is blocking, so this runs on a dedicated OS thread rather
-// than inside the tokio runtime.
+// tasks. Device I/O is blocking, so this runs on a dedicated OS thread.
 //
 // Failure policy: configuration-vs-device mismatches found at handshake (too
-// few channels, no button in toggle mode) cancel the node so the launch fails
-// loudly; everything transient (unplug, bad checksums, silence) clears the
-// sample, backs off and reconnects. Engage state lives here because only this
-// thread sees every frame (edge detection would be lossy on the coalescing
-// watch channel), and it resets to disengaged on every reconnect so a
-// returning device never resumes motion on its own.
+// few channels) cancel the node so the launch fails loudly; everything
+// transient (unplug, bad checksums, silence) clears the sample, backs off and
+// reconnects. Engagement lives here because only this thread sees every
+// frame: an arm engages on the first frame its trigger is squeezed to the
+// engage opening, and both arms disengage when usable frames stop for the
+// stale timeout or the device reconnects, so a returning device never resumes
+// motion on its own.
 
-use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use openarm_description::{ARM_DOF, Side};
@@ -23,10 +22,10 @@ use crate::mapping::Calibration;
 use crate::protocol::{CMD_PING, CMD_STANDBY, Deframer, FrameLayout, KerFrame, PingParse, Schema};
 use crate::transport::{self, TransportConfig};
 
-/// A launcher `engage_mode` this node has no engagement rule for.
+/// A launcher `engage_opening` outside [0, 1).
 #[derive(Debug, thiserror::Error)]
-#[error("engage_mode must be 'toggle' or 'always', got '{0}'")]
-pub struct UnknownEngageMode(pub String);
+#[error("engage_opening must be a trigger opening fraction in [0, 1), got {0}")]
+pub struct EngageOpeningOutOfRange(pub f64);
 
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(3);
 const PING_INTERVAL: Duration = Duration::from_millis(500);
@@ -40,15 +39,53 @@ const SILENCE_RECONNECT: Duration = Duration::from_secs(5);
 const MAX_CONSECUTIVE_BAD_CHECKSUMS: u32 = 50;
 const RAW_LOG_INTERVAL: Duration = Duration::from_secs(1);
 
-/// One calibrated bimanual sample: what the publish tasks stream while fresh
-/// and engaged.
+/// The trigger opening at or below which a squeeze engages its arm; strictly
+/// below 1 (fully open).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EngageOpening(f64);
+
+impl EngageOpening {
+    pub fn fraction(self) -> f64 {
+        self.0
+    }
+}
+
+impl TryFrom<f64> for EngageOpening {
+    type Error = EngageOpeningOutOfRange;
+
+    fn try_from(fraction: f64) -> Result<Self, Self::Error> {
+        (0.0..1.0)
+            .contains(&fraction)
+            .then_some(Self(fraction))
+            .ok_or(EngageOpeningOutOfRange(fraction))
+    }
+}
+
+/// Which arms track the KER.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Engaged {
+    pub left: bool,
+    pub right: bool,
+}
+
+impl Engaged {
+    pub fn side(self, side: Side) -> bool {
+        match side {
+            Side::Left => self.left,
+            Side::Right => self.right,
+        }
+    }
+}
+
+/// One calibrated bimanual sample: what the publish tasks stream for each
+/// engaged arm while fresh.
 #[derive(Debug, Clone)]
 pub struct KerSample {
     pub left_joints: [f64; ARM_DOF],
     pub right_joints: [f64; ARM_DOF],
     pub left_opening: f64,
     pub right_opening: f64,
-    pub engaged: bool,
+    pub engaged: Engaged,
     pub received_at: Instant,
 }
 
@@ -68,30 +105,11 @@ impl KerSample {
     }
 }
 
-/// What arms the streams: the thumb button as a toggle deadman, or always-on
-/// for a unit whose button is absent or unreliable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EngageMode {
-    Toggle,
-    Always,
-}
-
-impl FromStr for EngageMode {
-    type Err = UnknownEngageMode;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "toggle" => Ok(Self::Toggle),
-            "always" => Ok(Self::Always),
-            other => Err(UnknownEngageMode(other.to_string())),
-        }
-    }
-}
-
 pub struct ReaderConfig {
     pub transport: TransportConfig,
     pub calibration: Calibration,
-    pub engage_mode: EngageMode,
+    pub engage_opening: EngageOpening,
+    pub stale_timeout: Duration,
     pub log_raw: bool,
 }
 
@@ -192,13 +210,6 @@ fn session(
             layout.angle_count()
         ));
     }
-    if cfg.engage_mode == EngageMode::Toggle && !layout.has_button() {
-        return SessionEnd::Fatal(
-            "engage_mode 'toggle' needs the encoder_button field, which this schema lacks; \
-             use engage_mode 'always'"
-                .into(),
-        );
-    }
     info!(
         "KER connected: fw {} hw {} updated {} ({} channels)",
         schema.metadata.firmware,
@@ -209,7 +220,7 @@ fn session(
 
     let mut deframer = Deframer::new(layout.payload_len());
     deframer.push(&leftover);
-    let mut engage = EngageLatch::new(cfg.engage_mode);
+    let mut engage = EngageLatch::new(cfg.engage_opening, cfg.stale_timeout);
     let mut chunk = [0u8; 4096];
     let mut last_frame_at = Instant::now();
     let mut last_raw_log = Instant::now();
@@ -248,8 +259,7 @@ fn session(
                 last_raw_log = Instant::now();
                 info!("KER raw: {}", format_raw(&frame));
             }
-            let engaged = engage.update(&frame);
-            match map_sample(&cfg.calibration, &frame, engaged) {
+            match map_sample(&cfg.calibration, &frame, &mut engage) {
                 Ok(sample) => {
                     mapping_warned = false;
                     if tx.send(Some(sample)).is_err() {
@@ -308,71 +318,84 @@ fn handshake(
     ))
 }
 
-/// The device-wide engage deadman. In toggle mode a button rising edge flips
-/// it; frame-exact because this runs on every decoded frame.
+/// Per-arm engagement over the stream of usable frames. A trigger squeezed to
+/// the engage opening engages its arm; a gap between usable frames of at least
+/// the stale timeout disengages both. Each session starts a fresh latch, so a
+/// reconnect disengages too.
 struct EngageLatch {
-    mode: EngageMode,
-    engaged: bool,
-    button_was_down: bool,
+    engage_opening: EngageOpening,
+    stale_timeout: Duration,
+    engaged: Engaged,
+    last_frame_at: Option<Instant>,
 }
 
 impl EngageLatch {
-    fn new(mode: EngageMode) -> Self {
+    fn new(engage_opening: EngageOpening, stale_timeout: Duration) -> Self {
         Self {
-            mode,
-            engaged: mode == EngageMode::Always,
-            button_was_down: false,
+            engage_opening,
+            stale_timeout,
+            engaged: Engaged::default(),
+            last_frame_at: None,
         }
     }
 
-    fn update(&mut self, frame: &KerFrame) -> bool {
-        if self.mode == EngageMode::Always {
-            return true;
+    /// Fold in one usable frame's trigger openings, captured at `at`.
+    fn update(&mut self, left_opening: f64, right_opening: f64, at: Instant) -> Engaged {
+        let stalled = self
+            .last_frame_at
+            .is_some_and(|last| at.duration_since(last) >= self.stale_timeout);
+        if stalled && self.engaged != Engaged::default() {
+            info!("KER frames stalled; both arms disengaged, squeeze a trigger to re-engage");
         }
-        if frame.encoder_button && !self.button_was_down {
-            self.engaged = !self.engaged;
-            info!(
-                "KER {}",
-                if self.engaged {
-                    "ENGAGED, streaming"
-                } else {
-                    "disengaged, holding"
-                }
-            );
+        let held = if stalled {
+            Engaged::default()
+        } else {
+            self.engaged
+        };
+        let threshold = self.engage_opening.fraction();
+        let next = Engaged {
+            left: held.left || left_opening <= threshold,
+            right: held.right || right_opening <= threshold,
+        };
+        for side in [Side::Left, Side::Right] {
+            if next.side(side) && !held.side(side) {
+                info!("KER {side:?} arm engaged, tracking the leader");
+            }
         }
-        self.button_was_down = frame.encoder_button;
-        self.engaged
+        self.engaged = next;
+        self.last_frame_at = Some(at);
+        next
     }
 }
 
 fn map_sample(
     calibration: &Calibration,
     frame: &KerFrame,
-    engaged: bool,
+    engage: &mut EngageLatch,
 ) -> Result<KerSample, crate::mapping::MapError> {
+    let left_joints = calibration.left.joint_radians(&frame.angles_deg)?;
+    let right_joints = calibration.right.joint_radians(&frame.angles_deg)?;
+    let left_opening = calibration.left_trigger.opening(&frame.angles_deg)?;
+    let right_opening = calibration.right_trigger.opening(&frame.angles_deg)?;
+    let received_at = Instant::now();
     Ok(KerSample {
-        left_joints: calibration.left.joint_radians(&frame.angles_deg)?,
-        right_joints: calibration.right.joint_radians(&frame.angles_deg)?,
-        left_opening: calibration.left_trigger.opening(&frame.angles_deg)?,
-        right_opening: calibration.right_trigger.opening(&frame.angles_deg)?,
-        engaged,
-        received_at: Instant::now(),
+        left_joints,
+        right_joints,
+        left_opening,
+        right_opening,
+        engaged: engage.update(left_opening, right_opening, received_at),
+        received_at,
     })
 }
 
 fn format_raw(frame: &KerFrame) -> String {
-    let channels: Vec<String> = frame
+    frame
         .angles_deg
         .iter()
         .enumerate()
         .map(|(i, a)| format!("CH{:02}={a:.2}", i + 1))
-        .collect();
-    format!(
-        "{} enc={} btn={}",
-        channels.join(" "),
-        frame.encoder_value,
-        frame.encoder_button
-    )
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn sleep_cancellable(total: Duration, token: &CancellationToken) {
@@ -386,30 +409,73 @@ fn sleep_cancellable(total: Duration, token: &CancellationToken) {
 mod tests {
     use super::*;
 
-    fn frame(button: bool) -> KerFrame {
-        KerFrame {
-            timestamp: 0,
-            angles_deg: vec![],
-            encoder_value: 0,
-            encoder_button: button,
+    const STALE: Duration = Duration::from_millis(250);
+    const FRAME: Duration = Duration::from_millis(5);
+    const ENGAGE_AT: f64 = 0.1;
+    const OPEN: f64 = 1.0;
+    const SQUEEZED: f64 = 0.02;
+    const LEFT: Engaged = Engaged {
+        left: true,
+        right: false,
+    };
+    const RIGHT: Engaged = Engaged {
+        left: false,
+        right: true,
+    };
+    const BOTH: Engaged = Engaged {
+        left: true,
+        right: true,
+    };
+
+    fn latch() -> EngageLatch {
+        EngageLatch::new(EngageOpening::try_from(ENGAGE_AT).expect("in range"), STALE)
+    }
+
+    #[test]
+    fn engage_opening_accepts_only_fractions_below_fully_open() {
+        for fraction in [0.0, ENGAGE_AT, 0.999] {
+            assert!(EngageOpening::try_from(fraction).is_ok(), "{fraction}");
+        }
+        for fraction in [-0.01, 1.0, 1.5, f64::NAN, f64::INFINITY] {
+            assert!(EngageOpening::try_from(fraction).is_err(), "{fraction}");
         }
     }
 
     #[test]
-    fn toggle_flips_only_on_the_rising_edge() {
-        let mut latch = EngageLatch::new(EngageMode::Toggle);
-        assert!(!latch.update(&frame(false)), "starts disengaged");
-        assert!(latch.update(&frame(true)), "press engages");
-        assert!(latch.update(&frame(true)), "holding does not retoggle");
-        assert!(latch.update(&frame(false)), "release keeps engaged");
-        assert!(!latch.update(&frame(true)), "second press disengages");
-        assert!(!latch.update(&frame(false)));
+    fn a_squeeze_engages_only_its_own_arm_and_release_keeps_it_tracking() {
+        let mut latch = latch();
+        let t0 = Instant::now();
+        assert_eq!(latch.update(OPEN, OPEN, t0), Engaged::default());
+        assert_eq!(latch.update(OPEN, SQUEEZED, t0 + FRAME), RIGHT);
+        assert_eq!(latch.update(OPEN, OPEN, t0 + FRAME * 2), RIGHT);
+        assert_eq!(latch.update(SQUEEZED, OPEN, t0 + FRAME * 3), BOTH);
+        assert_eq!(latch.update(OPEN, OPEN, t0 + FRAME * 4), BOTH);
     }
 
     #[test]
-    fn always_mode_is_always_engaged() {
-        let mut latch = EngageLatch::new(EngageMode::Always);
-        assert!(latch.update(&frame(false)));
-        assert!(latch.update(&frame(true)));
+    fn the_engage_opening_itself_engages() {
+        let mut latch = latch();
+        assert_eq!(latch.update(ENGAGE_AT, OPEN, Instant::now()), LEFT);
+    }
+
+    #[test]
+    fn a_frame_gap_of_the_stale_timeout_disengages_both_arms() {
+        let mut latch = latch();
+        let t0 = Instant::now();
+        latch.update(SQUEEZED, SQUEEZED, t0);
+        let just_inside = t0 + STALE - FRAME;
+        assert_eq!(latch.update(OPEN, OPEN, just_inside), BOTH);
+        assert_eq!(
+            latch.update(OPEN, OPEN, just_inside + STALE),
+            Engaged::default()
+        );
+    }
+
+    #[test]
+    fn a_squeeze_on_the_frame_after_a_stall_engages_only_that_arm() {
+        let mut latch = latch();
+        let t0 = Instant::now();
+        latch.update(SQUEEZED, SQUEEZED, t0);
+        assert_eq!(latch.update(OPEN, SQUEEZED, t0 + STALE), RIGHT);
     }
 }

@@ -177,22 +177,17 @@ pub struct KerFrame {
     pub timestamp: u32,
     /// All encoder channels (deg), CH01 at index 0.
     pub angles_deg: Vec<f32>,
-    pub encoder_value: i64,
-    pub encoder_button: bool,
 }
 
 /// Byte offsets of the fields this node consumes, resolved from a [`Schema`]
-/// once at handshake. `angles` is required; the rest degrade to defaults so a
-/// newer firmware can drop or retype them without breaking arm streaming
-/// (the reader refuses button-gated engage separately when the button is absent).
+/// once at handshake. `angles` is required; `timestamp` decodes to 0 when the
+/// schema lacks it, and every other field is skipped by its packed size.
 #[derive(Debug, Clone)]
 pub struct FrameLayout {
     payload_len: usize,
     angles_at: usize,
     angle_count: usize,
     timestamp_at: Option<usize>,
-    encoder_value_at: Option<(usize, FieldType)>,
-    encoder_button_at: Option<usize>,
 }
 
 impl FrameLayout {
@@ -200,8 +195,6 @@ impl FrameLayout {
         let mut offset = 0;
         let mut angles = None;
         let mut timestamp_at = None;
-        let mut encoder_value_at = None;
-        let mut encoder_button_at = None;
         for field in &schema.fields {
             match (field.key.as_str(), field.ty) {
                 ("angles", FieldType::F32) => angles = Some((offset, field.count)),
@@ -214,12 +207,6 @@ impl FrameLayout {
                 ("timestamp", FieldType::U32) if field.count == 1 => {
                     timestamp_at = Some(offset);
                 }
-                ("encoder_value", ty) if field.count == 1 && ty != FieldType::F32 => {
-                    encoder_value_at = Some((offset, ty));
-                }
-                ("encoder_button", FieldType::Bool | FieldType::U8) if field.count == 1 => {
-                    encoder_button_at = Some(offset);
-                }
                 _ => {}
             }
             offset += field.ty.size() * field.count;
@@ -230,8 +217,6 @@ impl FrameLayout {
             angles_at,
             angle_count,
             timestamp_at,
-            encoder_value_at,
-            encoder_button_at,
         })
     }
 
@@ -244,11 +229,6 @@ impl FrameLayout {
 
     pub fn angle_count(&self) -> usize {
         self.angle_count
-    }
-
-    /// Whether the schema carries the thumb button (required for toggle engage).
-    pub fn has_button(&self) -> bool {
-        self.encoder_button_at.is_some()
     }
 
     /// Decode one checksum-verified payload of exactly [`Self::payload_len`]
@@ -264,36 +244,10 @@ impl FrameLayout {
             .timestamp_at
             .map(|at| u32::from_le_bytes(payload[at..at + 4].try_into().expect("4 bytes")))
             .unwrap_or(0);
-        let encoder_value = self
-            .encoder_value_at
-            .map(|(at, ty)| read_int(payload, at, ty))
-            .unwrap_or(0);
-        let encoder_button = self
-            .encoder_button_at
-            .map(|at| payload[at] != 0)
-            .unwrap_or(false);
         KerFrame {
             timestamp,
             angles_deg,
-            encoder_value,
-            encoder_button,
         }
-    }
-}
-
-fn read_int(payload: &[u8], at: usize, ty: FieldType) -> i64 {
-    let le = |n: usize| -> [u8; 8] {
-        let mut b = [0u8; 8];
-        b[..n].copy_from_slice(&payload[at..at + n]);
-        b
-    };
-    match ty {
-        FieldType::U32 => u32::from_le_bytes(le(4)[..4].try_into().expect("4 bytes")) as i64,
-        FieldType::U16 => u16::from_le_bytes(le(2)[..2].try_into().expect("2 bytes")) as i64,
-        FieldType::U8 | FieldType::Bool => payload[at] as i64,
-        FieldType::I32 => i32::from_le_bytes(le(4)[..4].try_into().expect("4 bytes")) as i64,
-        FieldType::I16 => i16::from_le_bytes(le(2)[..2].try_into().expect("2 bytes")) as i64,
-        FieldType::F32 => unreachable!("layout never selects f32 for an integer field"),
     }
 }
 
@@ -382,7 +336,8 @@ mod tests {
     }
 
     /// A ping response for the reference schema: timestamp u32, angles f32 x
-    /// `channels`, encoder_value i32, encoder_button bool.
+    /// `channels`, then encoder_value i32 and encoder_button bool, which this
+    /// node skips by size.
     fn ping_response(channels: u8) -> Vec<u8> {
         let mut v = PING_HEADER.to_vec();
         v.extend(padded("v1.0.0", FW_LEN));
@@ -478,7 +433,6 @@ mod tests {
         let schema = reference_schema(3);
         let layout = layout_of(&schema);
         assert_eq!(layout.angle_count(), 3);
-        assert!(layout.has_button());
 
         let packet = stream_packet(7, &[10.0, -20.5, 30.25], -4, true);
         let mut deframer = Deframer::new(layout.payload_len());
@@ -489,8 +443,6 @@ mod tests {
             KerFrame {
                 timestamp: 7,
                 angles_deg: vec![10.0, -20.5, 30.25],
-                encoder_value: -4,
-                encoder_button: true,
             }
         );
     }
@@ -542,12 +494,9 @@ mod tests {
             }],
         };
         let layout = layout_of(&schema);
-        assert!(!layout.has_button());
         let frame = layout.parse(&[0, 0, 128, 63, 0, 0, 0, 64]);
         assert_eq!(frame.angles_deg, vec![1.0, 2.0]);
         assert_eq!(frame.timestamp, 0);
-        assert_eq!(frame.encoder_value, 0);
-        assert!(!frame.encoder_button);
     }
 
     #[test]
@@ -578,8 +527,7 @@ mod tests {
     fn a_reordered_schema_deframes_and_decodes_at_the_same_length() {
         // The reader sizes the deframer from the layout, so a firmware that
         // orders or types its fields differently from the reference still hands
-        // `parse` exactly the bytes it decodes. This is the invariant that used
-        // to be an assertion inside `parse`.
+        // `parse` exactly the bytes it decodes.
         let schema = Schema {
             metadata: reference_schema(1).metadata,
             fields: vec![
@@ -598,7 +546,7 @@ mod tests {
                     ty: FieldType::I16,
                     count: 1,
                 },
-                // A field this node does not consume still occupies its bytes.
+                // Fields this node does not consume still occupy their bytes.
                 FieldDesc {
                     key: "spare".into(),
                     ty: FieldType::U32,
@@ -632,8 +580,6 @@ mod tests {
                 // Absent from this schema, so it decodes to the documented default.
                 timestamp: 0,
                 angles_deg: vec![1.5, -2.5],
-                encoder_value: -7,
-                encoder_button: true,
             }
         );
     }
@@ -678,7 +624,7 @@ mod tests {
         assert!(deframer.buf.is_empty(), "garbage must not accumulate");
         deframer.push(&stream_packet(3, &[0.5, -0.5], 9, true));
         let payload = deframer.next_payload().expect("frame").expect("valid");
-        assert_eq!(layout.parse(&payload).encoder_value, 9);
+        assert_eq!(layout.parse(&payload).timestamp, 3);
     }
 
     #[test]

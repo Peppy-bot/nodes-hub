@@ -14,7 +14,7 @@ use tracing::{error, info, warn};
 
 use crate::mapping::{Calibration, CalibrationParams};
 use crate::publish;
-use crate::reader::{self, EngageMode, ReaderConfig};
+use crate::reader::{self, EngageOpening, ReaderConfig};
 use crate::transport::TransportConfig;
 
 const DATASTORE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -51,7 +51,7 @@ pub enum NodeError {
     Transport(#[from] crate::transport::UnknownTransport),
 
     #[error(transparent)]
-    EngageMode(#[from] crate::reader::UnknownEngageMode),
+    EngageOpening(#[from] crate::reader::EngageOpeningOutOfRange),
 
     #[error("calibration")]
     Calibration(#[from] crate::mapping::MapError),
@@ -118,7 +118,7 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         duration_from_secs(params.stale_timeout_s).map_err(NodeError::StaleTimeout)?;
     let transport =
         TransportConfig::parse(&params.transport, &params.serial_port, params.serial_baud)?;
-    let engage_mode: EngageMode = params.engage_mode.parse()?;
+    let engage_opening = EngageOpening::try_from(params.engage_opening)?;
     let calibration = Calibration::parse(
         version,
         &CalibrationParams {
@@ -138,9 +138,10 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     )?;
 
     info!(
-        "config: {version} follower, transport {transport:?}, {} Hz, engage {engage_mode:?}, \
-         {} channels required",
+        "config: {version} follower, transport {transport:?}, {} Hz, engage at trigger \
+         opening <= {}, {} channels required",
         params.command_rate_hz,
+        engage_opening.fraction(),
         calibration.required_channels()
     );
 
@@ -181,7 +182,8 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         ReaderConfig {
             transport,
             calibration,
-            engage_mode,
+            engage_opening,
+            stale_timeout,
             log_raw: params.log_raw,
         },
         sample_tx,

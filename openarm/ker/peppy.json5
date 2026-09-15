@@ -4,9 +4,10 @@
 // serial CDC), maps the channels to per-side joint radians and the triggers
 // to gripper opening fractions, and streams both to the backbone over the
 // joint_link / gripper_link pairings exactly like openarm_web_commander (the
-// backbone governs everything before it reaches a follower). The KER's thumb
-// button is the engage deadman: while disengaged the node emits nothing and
-// the robot holds at its last setpoints.
+// backbone governs everything before it reaches a follower). Each arm engages
+// on its first trigger squeeze and then tracks the KER; for an unengaged arm,
+// a stale KER, or a disconnected one the node emits nothing and those limbs
+// hold at their last setpoints.
 // KER's joint structure matches OpenArm v2 1:1 (links scaled to 70%), so no
 // coordinate transform is involved; v1 followers accept the same joint-space
 // stream but are not geometrically equivalent.
@@ -84,13 +85,15 @@
       left_trigger_open_deg: "f64",
       right_trigger_closed_deg: "f64",
       right_trigger_open_deg: "f64",
-      // "toggle": the thumb button's rising edge toggles engaged/disengaged
-      // for the whole device. "always": engaged whenever frames are fresh
-      // (the escape hatch if a unit's button reads unreliably).
-      engage_mode: { $type: "string", $default: "toggle" },
+      // Trigger opening fraction in [0, 1) at or below which a squeeze engages
+      // that arm: from its first such frame the arm and its gripper track the
+      // KER, until usable frames stop for stale_timeout_s or the device
+      // reconnects. Required: how deep a squeeze starts motion is a deployment
+      // choice.
+      engage_opening: "f64",
       // Stop publishing when the newest KER frame is older than this (s); the
-      // followers then hold their last setpoints. Must exceed the device's
-      // frame period.
+      // followers then hold their last setpoints, and both arms disengage.
+      // Must exceed the device's frame period.
       stale_timeout_s: { $type: "f64", $default: 0.25 },
       // Bring-up aid: log the raw channel table (degrees, unmapped) at 1 Hz.
       log_raw: { $type: "bool", $default: false }

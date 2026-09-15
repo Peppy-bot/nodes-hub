@@ -3,8 +3,8 @@
 // joint_link pairing slot and one streams the trigger opening on its
 // gripper_link slot (the slot is the side, so no id demux); the backbone
 // governs everything before it reaches a follower. A tick publishes nothing
-// when the newest sample is missing, stale, or disengaged, so the robot holds
-// at its last governed setpoints: skipping is the deadman. Re-publishing an
+// when the newest sample is missing or stale, or its arm is not engaged, so
+// that limb holds at its last governed setpoints: skipping is the deadman. Re-publishing an
 // unchanged sample every tick keeps the stream trivially fresh for a backbone
 // that starts mid-session.
 //
@@ -101,15 +101,14 @@ pub async fn run(
             token.clone(),
             format!("{} arm", label(side)),
             move || {
-                let target = streamable(&sample_rx, stale_timeout)?.joints(side);
+                let target = streamable(&sample_rx, stale_timeout, side)?.joints(side);
                 Some(pairing_timestamp().and_then(|timestamp| {
                     build_arm(timestamp, target.to_vec(), Vec::new(), Vec::new())
                         .map_err(|e| e.to_string())
                 }))
             },
         ));
-        // Gripper: stream the trigger opening fraction while streamable (mirror
-        // of the arm stream above). The leader trigger carries no effort
+        // Gripper: stream the trigger opening fraction while its arm streams. The leader trigger carries no effort
         // source: max_effort 0 (no preference) leaves the follower's ceiling
         // in charge.
         let sample_rx = rx.clone();
@@ -119,7 +118,7 @@ pub async fn run(
             token.clone(),
             format!("{} gripper", label(side)),
             move || {
-                let opening = streamable(&sample_rx, stale_timeout)?.opening(side);
+                let opening = streamable(&sample_rx, stale_timeout, side)?.opening(side);
                 Some(pairing_timestamp().and_then(|timestamp| {
                     build_gripper(timestamp, opening, 0.0).map_err(|e| e.to_string())
                 }))
@@ -135,14 +134,15 @@ pub async fn run(
     Ok(())
 }
 
-/// The newest sample if it should stream: present, engaged, and fresher than
-/// the stale timeout. `None` skips the tick, which is what holds the robot.
+/// The newest sample if `side` should stream: present, that arm engaged, and
+/// fresher than the stale timeout. `None` skips the tick, which holds the limb.
 fn streamable(
     rx: &watch::Receiver<Option<KerSample>>,
     stale_timeout: Duration,
+    side: Side,
 ) -> Option<KerSample> {
     let sample = rx.borrow().clone()?;
-    (sample.engaged && sample.received_at.elapsed() < stale_timeout).then_some(sample)
+    (sample.engaged.side(side) && sample.received_at.elapsed() < stale_timeout).then_some(sample)
 }
 
 // Publish the latest setpoint from `next_message` every `period`, skipping a
@@ -192,8 +192,15 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+    use crate::reader::Engaged;
 
-    fn sample(engaged: bool, age: Duration) -> KerSample {
+    const STALE: Duration = Duration::from_millis(250);
+    const RIGHT_ONLY: Engaged = Engaged {
+        left: false,
+        right: true,
+    };
+
+    fn sample(engaged: Engaged, age: Duration) -> KerSample {
         KerSample {
             left_joints: [0.0; 7],
             right_joints: [0.0; 7],
@@ -205,21 +212,27 @@ mod tests {
     }
 
     #[test]
-    fn streams_only_fresh_engaged_samples() {
-        let stale = Duration::from_millis(250);
+    fn streams_only_fresh_samples_for_an_engaged_arm() {
         let (tx, rx) = watch::channel(None);
-        assert!(streamable(&rx, stale).is_none(), "no sample yet");
+        assert!(
+            streamable(&rx, STALE, Side::Right).is_none(),
+            "no sample yet"
+        );
 
-        tx.send(Some(sample(true, Duration::ZERO))).unwrap();
-        assert!(streamable(&rx, stale).is_some());
+        tx.send(Some(sample(RIGHT_ONLY, Duration::ZERO))).unwrap();
+        assert!(streamable(&rx, STALE, Side::Right).is_some());
+        assert!(
+            streamable(&rx, STALE, Side::Left).is_none(),
+            "an unengaged arm holds"
+        );
 
-        tx.send(Some(sample(false, Duration::ZERO))).unwrap();
-        assert!(streamable(&rx, stale).is_none(), "disengaged holds");
-
-        tx.send(Some(sample(true, Duration::from_secs(1)))).unwrap();
-        assert!(streamable(&rx, stale).is_none(), "stale holds");
+        tx.send(Some(sample(RIGHT_ONLY, STALE))).unwrap();
+        assert!(streamable(&rx, STALE, Side::Right).is_none(), "stale holds");
 
         tx.send(None).unwrap();
-        assert!(streamable(&rx, stale).is_none(), "device loss holds");
+        assert!(
+            streamable(&rx, STALE, Side::Right).is_none(),
+            "device loss holds"
+        );
     }
 }
