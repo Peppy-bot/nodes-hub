@@ -86,23 +86,30 @@ class SeatIO:
         whose joints are not the ones this engine drives) is taken back out,
         so one robot that cannot join never takes the scene down."""
         self._unbind()
-        self._world.add(instance, model, placement)
         try:
-            self._rebind()
+            self._world.add(instance, model, placement)
+            try:
+                self._rebind()
+            except Exception:
+                self._world.remove(instance)
+                raise
         except Exception:
-            self._unbind()
-            self._world.remove(instance)
+            # Standing let go of the stage before it changed it. Whatever went
+            # wrong, the stage is taken up again here, so a robot that cannot
+            # join leaves the scene running rather than stopped.
             self._rebind()
-            self._seats.renew(self._loop.time())
             raise
-        self._seats.renew(self._loop.time())
+        finally:
+            self._seats.renew(self._loop.time())
 
     def unstand(self, instance: str) -> None:
         """Takes a robot out and resolves the scene around it."""
         self._unbind()
-        self._world.remove(instance)
-        self._rebind()
-        self._seats.renew(self._loop.time())
+        try:
+            self._world.remove(instance)
+        finally:
+            self._rebind()
+            self._seats.renew(self._loop.time())
 
     async def start(self) -> None:
         """Exposes the contract and spawns its loops. Runs on the node loop

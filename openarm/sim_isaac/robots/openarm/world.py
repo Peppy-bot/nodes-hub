@@ -33,6 +33,10 @@ ASSETS_DIR = Path(
 # stands at, which is the default prim of every model's stage.
 WORLD_PRIM = "/World"
 STANDING_PRIM = "/openarm"
+# The name a scene command addresses the robot the engine stands by. A seat's
+# robot answers to the name of the attachment that took it; this one has none
+# of its own.
+STANDING_NAME = "openarm"
 
 # Side of the square the engine parks robots on when a seat asks for no
 # placement of its own: far enough apart that two OpenArms cannot touch.

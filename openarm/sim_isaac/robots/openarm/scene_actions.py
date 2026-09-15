@@ -27,11 +27,11 @@ from peppygen.exposed_services.scene import (
     get_robots_list,
 )
 
+from world import STANDING_NAME
+
 logger = logging.getLogger(__name__)
 
-# The name the robot the engine stands answers to. A seat's robot answers to
-# the name of the attachment that took it.
-STANDING_NAME = "openarm"
+
 
 
 @dataclass

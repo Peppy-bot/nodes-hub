@@ -102,7 +102,9 @@ def scene(monkeypatch):
         cameras_enabled=False, frame_rate_hz=60,
         render_mode="RealTimePathTracing", anti_aliasing=3,
     )
-    bridge = Mock()
+    # Specced against the real bridge: a bare Mock invents any attribute, so a
+    # call to a method the bridge no longer has would pass silently.
+    bridge = Mock(spec=["bind", "unbind", "step", "shutdown", "is_ready"])
     launcher._extension = bridge
     launcher._runtime_robot = object()
     return SimpleNamespace(launcher=launcher, stage=stage, bridge=bridge)
@@ -122,7 +124,7 @@ def test_first_scene_load_references_the_asset_and_keeps_the_physics_views(scene
     assert prim.references == [f"{_ASSET_ROOT}/Isaac/Environments/Simple_Warehouse/warehouse.usd"]
     assert prim.scale == (2.0, 2.0, 2.0)
     assert scene.stage.removed == []
-    scene.bridge.invalidate_physics_views.assert_not_called()
+    scene.bridge.unbind.assert_not_called()
     assert scene.launcher._runtime_robot is not None
 
 
@@ -135,7 +137,7 @@ def test_loading_another_scene_replaces_the_current_one_and_invalidates_the_view
     assert prim.references == [f"{_ASSET_ROOT}/Isaac/Environments/Simple_Warehouse/full_warehouse.usd"]
     assert prim.scale == (1.0, 1.0, 1.0)
     assert scene.stage.removed == [_SCENE]
-    scene.bridge.invalidate_physics_views.assert_called_once_with()
+    scene.bridge.unbind.assert_called_once_with()
     assert scene.launcher._runtime_robot is None
     assert f"Replacing runtime scene {_SCENE}" in caplog.text
 
@@ -149,13 +151,13 @@ def test_scene_scale_needs_three_values(scene):
 def test_clear_scene_invalidates_the_views_only_when_a_scene_was_loaded(scene, caplog):
     caplog.set_level(logging.INFO)
     scene.launcher._runtime_clear_scene()
-    scene.bridge.invalidate_physics_views.assert_not_called()
+    scene.bridge.unbind.assert_not_called()
     assert "No runtime scene to remove" in caplog.text
 
     _load(scene, "Isaac/Environments/Office/office.usd")
     scene.launcher._runtime_clear_scene()
     assert _SCENE not in scene.stage.prims
-    scene.bridge.invalidate_physics_views.assert_called_once_with()
+    scene.bridge.unbind.assert_called_once_with()
     assert scene.launcher._runtime_robot is None
     assert f"Removed runtime scene {_SCENE}" in caplog.text
 
@@ -163,13 +165,13 @@ def test_clear_scene_invalidates_the_views_only_when_a_scene_was_loaded(scene, c
 def test_removing_a_runtime_object_invalidates_the_views_but_a_missing_one_does_not(scene, caplog):
     caplog.set_level(logging.INFO)
     scene.launcher._runtime_remove({"name": "obj_missing"})
-    scene.bridge.invalidate_physics_views.assert_not_called()
+    scene.bridge.unbind.assert_not_called()
     assert "Runtime object 'obj_missing' does not exist" in caplog.text
 
     scene.stage.DefinePrim("/World/RuntimeObjects/obj_1", "Xform")
     scene.launcher._runtime_remove({"name": "obj_1"})
     assert "/World/RuntimeObjects/obj_1" not in scene.stage.prims
-    scene.bridge.invalidate_physics_views.assert_called_once_with()
+    scene.bridge.unbind.assert_called_once_with()
     assert "Removed runtime object 'obj_1'" in caplog.text
 
 

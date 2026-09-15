@@ -524,25 +524,41 @@ class SimLauncher:
         self,
         command: dict,
     ) -> None:
-        """Translate the whole OpenArm root prim in the live stage."""
+        """Translate one robot's root prim in the live stage, leaving every
+        other robot standing where it is."""
 
         import omni.usd
 
         from pxr import Gf, UsdGeom
 
         position = command["position"]
+        name = command["robot"]
 
         if len(position) != 3:
             raise ValueError(
                 "Robot root position requires exactly 3 values: x y z"
             )
 
+        path = next(
+            (
+                robot.prim()
+                for robot in self._world.robots()
+                if (robot.instance or STANDING_NAME) == name
+            ),
+            None,
+        )
+
+        if path is None:
+            raise RuntimeError(
+                f"no robot stands as {name!r} in this stage"
+            )
+
         stage = omni.usd.get_context().get_stage()
-        prim = stage.GetPrimAtPath("/openarm")
+        prim = stage.GetPrimAtPath(path)
 
         if not prim.IsValid():
             raise RuntimeError(
-                "OpenArm root prim /openarm does not exist"
+                f"the prim {path} of robot {name!r} does not exist"
             )
 
         xformable = UsdGeom.Xformable(prim)
@@ -565,7 +581,8 @@ class SimLauncher:
         )
 
         logger.info(
-            "Moved OpenArm root to %s",
+            "Moved robot %r to %s",
+            name,
             position,
         )
 
@@ -1531,7 +1548,9 @@ class SimLauncher:
         self._runtime_robot = None
 
         if self._extension is not None:
-            self._extension.invalidate_physics_views()
+            # A view of a prim that left the stage stops reading, so the
+            # views go and the next bind takes them again.
+            self._extension.unbind()
 
         return True
 
