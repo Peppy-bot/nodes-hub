@@ -13,6 +13,10 @@
       def_file: "apptainer.def",
     },
 
-    parameters: {},
+    parameters: {
+      // The port the viewer page is served on. One viewer per machine takes
+      // the default; a second names a port of its own.
+      http_port: { $type: "u16", $default: 8210 },
+    },
   },
 }

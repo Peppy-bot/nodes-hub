@@ -23,8 +23,7 @@ logger = logging.getLogger(__name__)
 async def setup(params, node_runner) -> list:
     """Serve the WebRTC viewer and log its browser diagnostics."""
 
-    del params
-    server = ViewerServer(("0.0.0.0", 8210))
+    server = ViewerServer(("0.0.0.0", params.http_port))
     try:
         thread = threading.Thread(target=server.serve_forever, name="isaac-viewer", daemon=True)
         thread.start()
@@ -48,8 +47,9 @@ async def setup(params, node_runner) -> list:
         raise
 
     logger.info(
-        "Isaac Sim browser WebRTC viewer listening on 0.0.0.0:8210; "
-        "browser warnings and errors are forwarded to this node log"
+        "Isaac Sim browser WebRTC viewer listening on 0.0.0.0:%s; "
+        "browser warnings and errors are forwarded to this node log",
+        params.http_port,
     )
     return []
 
