@@ -204,16 +204,6 @@ impl Seat {
     }
 }
 
-/// The catalogue model of an OpenArm generation.
-pub fn model_of(hardware_version: &str) -> Result<String, String> {
-    match hardware_version {
-        "v1" | "v2" => Ok(format!("openarm_{hardware_version}")),
-        other => Err(format!(
-            "hardware_version must be v1 or v2, and this robot's is '{other}'"
-        )),
-    }
-}
-
 /// A setpoint the engine can use: one finite position per joint, the
 /// velocities only when they match too.
 pub fn arm_command(positions: Vec<f64>, velocities: Vec<f64>) -> Option<ArmCommand> {
@@ -393,12 +383,5 @@ mod tests {
         );
         assert!(gripper_command(f64::NAN, 1.0).is_none());
         assert!(gripper_command(0.5, -1.0).is_none());
-    }
-
-    #[test]
-    fn the_model_follows_the_hardware_generation() {
-        assert_eq!(model_of("v1").unwrap(), "openarm_v1");
-        assert_eq!(model_of("v2").unwrap(), "openarm_v2");
-        assert!(model_of("v3").unwrap_err().contains("must be v1 or v2"));
     }
 }

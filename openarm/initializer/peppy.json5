@@ -84,9 +84,10 @@
       def_file: "apptainer.def",
     },
     parameters: {
-      // Which OpenArm this robot is, "v1" or "v2". A simulation stands the
-      // matching model for it; nothing else about the robot reaches the engine.
-      hardware_version: "string",
+      // The model a simulation stands for this robot, an id of the engine's
+      // robot catalogue such as "openarm_v2". Read only by a robot that takes
+      // a seat; nothing else about the robot reaches the engine.
+      model: { $type: "string", $default: "" },
       // How often the limbs' setpoints go to the engine. The engine holds the
       // last command until the next one, and a robot whose commands stop for
       // the engine's lease leaves the scene, so this is also the heartbeat.

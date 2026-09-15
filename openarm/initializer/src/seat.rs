@@ -71,11 +71,17 @@ impl Simulation {
 /// Takes this robot's seat in the simulation the launcher bound it to. A
 /// robot with no simulation bound drives the limbs the launcher gave it and
 /// returns without a seat.
-pub async fn take(model: String, params: &Parameters, runner: &Arc<NodeRunner>) -> Result<()> {
+pub async fn take(params: &Parameters, runner: &Arc<NodeRunner>) -> Result<()> {
     let Some(simulation) = Simulation::bound(runner) else {
         info!("no simulation seats this robot, so it takes no seat");
         return Ok(());
     };
+    let model = params.model.clone();
+    if model.is_empty() {
+        return Err(refused(
+            "this robot takes a seat in a simulation and names no model for it to stand: set `model` to an id of that simulation's robot catalogue, such as openarm_v2",
+        ));
+    }
     peppygen::clock::init(runner).await?;
     let token = runner.cancellation_token().clone();
     let rate = params.command_rate_hz;

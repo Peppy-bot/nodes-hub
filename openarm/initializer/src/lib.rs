@@ -26,8 +26,7 @@ pub(crate) fn refused(message: impl Into<String>) -> peppygen::Error {
 }
 
 pub async fn setup(params: Parameters, runner: Arc<NodeRunner>) -> Result<()> {
-    let model = limbs::model_of(&params.hardware_version).map_err(refused)?;
-    seat::take(model, &params, &runner).await?;
+    seat::take(&params, &runner).await?;
     readiness::serve(runner);
     Ok(())
 }

@@ -3,12 +3,11 @@
 use peppygen::Parameters;
 use peppygen::parameters::placement::Placement;
 
-/// A robot of the given OpenArm generation, standing wherever a simulation
-/// parks it.
-pub fn parameters(hardware_version: &str) -> Parameters {
+/// A robot that a simulation stands as `model`, wherever it parks it.
+pub fn parameters(model: &str) -> Parameters {
     Parameters {
         command_rate_hz: 50,
-        hardware_version: hardware_version.into(),
+        model: model.into(),
         placement: Placement {
             auto: true,
             x: 0.0,

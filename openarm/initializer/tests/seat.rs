@@ -32,9 +32,9 @@ const COMMANDS_TO_LAND: usize = 50;
 
 /// A robot that joins a simulation: the `simulation` slot is bound, so the
 /// node takes its seat before it does anything else.
-fn joining_a_simulation(hardware_version: &str) -> Config {
+fn joining_a_simulation(model: &str) -> Config {
     Config {
-        parameters: Some(common::parameters(hardware_version)),
+        parameters: Some(common::parameters(model)),
         ..Config::default()
     }
 }
@@ -85,7 +85,7 @@ async fn next_state<T>(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_robot_takes_its_seat_and_drives_its_limbs_through_it() -> peppygen::Result<()> {
     let (harness, mut mocks) =
-        Harness::start_with(joining_a_simulation("v2"), openarm_initializer::setup).await?;
+        Harness::start_with(joining_a_simulation("openarm_v2"), openarm_initializer::setup).await?;
 
     let mut simulation = mocks
         .deps
@@ -204,9 +204,35 @@ async fn the_robot_takes_its_seat_and_drives_its_limbs_through_it() -> peppygen:
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_seated_robot_names_the_model_the_simulation_stands() -> peppygen::Result<()> {
+    let (harness, mut mocks) =
+        Harness::start_with(joining_a_simulation(""), openarm_initializer::setup).await?;
+    let mut simulation = mocks
+        .deps
+        .simulation
+        .take()
+        .expect("a robot joining a simulation has one bound");
+    assert!(
+        simulation.attach.next_goal(UNSERVED).await.is_err(),
+        "a robot with no model to stand never attaches"
+    );
+    let failure = harness
+        .shutdown()
+        .await
+        .expect_err("a robot with no model fails to start")
+        .to_string();
+    assert!(
+        failure.contains("names no model for it to stand")
+            && failure.contains("such as openarm_v2"),
+        "{failure}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refused_robot_never_commands_the_engine() -> peppygen::Result<()> {
     let (harness, mut mocks) =
-        Harness::start_with(joining_a_simulation("v1"), openarm_initializer::setup).await?;
+        Harness::start_with(joining_a_simulation("openarm_v1"), openarm_initializer::setup).await?;
     let mut simulation = mocks
         .deps
         .simulation

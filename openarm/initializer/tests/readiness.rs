@@ -57,7 +57,7 @@ async fn poll_until(harness: &Harness, want: bool, deadline: Duration) -> peppyg
 /// node takes no seat and serves readiness alone.
 fn on_its_own_hardware() -> Config {
     Config {
-        parameters: Some(common::parameters("v2")),
+        parameters: Some(common::parameters("openarm_v2")),
         simulation_vacant: true,
         ..Config::default()
     }
