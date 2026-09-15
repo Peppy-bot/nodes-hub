@@ -16,7 +16,7 @@
 | [`openarm_web_commander`](./web_commander) | browser control panel |
 | [`openarm_ker`](./ker) | streams joint setpoints from a physical leader arm |
 | [`isaac_webviewer`](../isaac_webviewer) | serves the Isaac Sim WebRTC browser viewer |
-| [`scene_commander`](../scene_commander) | browser scene/object/physics control for any simulation implementing the `scene_control` contract (the Isaac Sim simulation and the Waldo simulation) |
+| [`scene_commander`](../scene_commander) | browser scene/object/physics control for any simulation implementing the `scene_control` and `object_state` contracts (the Isaac Sim simulation and the Waldo simulation): it edits the scene through `scene_control` and reads the spawned objects through `object_state` |
 
 Sim support splits into simulation-agnostic relays plus one node per simulation: `openarm_sim_arm` and `openarm_sim_gripper` face the backbone exactly like the real nodes and lead the matching limb slot on the simulation node (`openarm_sim_mujoco` or `openarm_sim_isaac`, which model v1.0 or v2.0 hardware via their `hardware_version` parameter, or `waldo`, which names its world via `world`), which owns the physics. The launcher decides which nodes fill each slot, so the backbone and the UI never know which simulation is underneath.
 
@@ -258,7 +258,7 @@ When working directly on the Isaac machine:
 http://127.0.0.1:8766
 ```
 
-Scene Commander is used to construct and modify the simulated environment while the simulator is running. It drives any simulation implementing the `scene_control` contract: the Isaac Sim simulation and the Waldo simulation (`peppy stack launch openarm_simulation --with isaac_sim,web_scene_commander`).
+Scene Commander is used to construct and modify the simulated environment while the simulator is running. It drives any simulation implementing the `scene_control` contract and reads what is spawned there through that simulation's `object_state` contract: the Isaac Sim simulation and the Waldo simulation (`peppy stack launch openarm_simulation --with isaac_sim,web_scene_commander`).
 
 ### Scene controls
 
@@ -383,7 +383,7 @@ Mass = 0.5 kg
 
 ## Runtime Object controls
 
-Every spawned object appears in the **Runtime Objects** section.
+Every spawned object appears in the **Runtime Objects** section. The list is the simulation's `object_state` snapshot, which Scene Commander reads on demand and again after each edit, so a spawned, moved or removed object shows there once its action completes. A position is where the object was in that snapshot: a dynamic object shows where physics has carried it, not where it was spawned.
 
 The object entry shows information such as:
 
@@ -392,6 +392,7 @@ object_id
 asset_id
 physics mode
 mass
+scale
 position
 ```
 

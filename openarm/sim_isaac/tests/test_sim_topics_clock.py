@@ -1,5 +1,6 @@
 """Tests for the sim-time half of SimTopicIO: recording the engine clock,
-stamping from it, and the guarded fan-out chain. peppylib and peppygen exist
+stamping from it (object-state captures included), the guarded fan-out
+chain, and the guarded object-state stream. peppylib and peppygen exist
 only inside the node's image, so minimal fakes are installed before the
 import; everything under test is pure python.
 """
@@ -49,11 +50,18 @@ def _install_runtime_fakes() -> None:
     peppygen_clock.now_ns = lambda: 0
     peppygen.clock = peppygen_clock
     paired = types.ModuleType("peppygen.paired_topics")
+    emitted = types.ModuleType("peppygen.emitted_topics")
+    emitted.objects = types.ModuleType("peppygen.emitted_topics.objects")
+    emitted.objects.object_states = types.ModuleType("peppygen.emitted_topics.objects.object_states")
+    emitted.objects.object_states.TOPIC_NAME = "object_states"
     modules = {
         "peppylib": peppylib,
         "peppylib.clock": peppylib_clock,
         "peppygen": peppygen,
         "peppygen.clock": peppygen_clock,
+        "peppygen.emitted_topics": emitted,
+        "peppygen.emitted_topics.objects": emitted.objects,
+        "peppygen.emitted_topics.objects.object_states": emitted.objects.object_states,
         "peppygen.paired_topics": paired,
     }
     for slot in _PAIRED_SLOTS:
@@ -69,6 +77,7 @@ def _install_runtime_fakes() -> None:
 
 _install_runtime_fakes()
 
+import object_state  # noqa: E402  (beside sim_topics on the robot path)
 import sim_topics  # noqa: E402  (needs the fakes above)
 
 
@@ -196,3 +205,62 @@ def test_fan_out_failures_are_latched_to_one_line_each_way(io, loop, caplog):
     recovered = [r for r in caplog.records if "reaching the whole fleet again" in r.message]
     assert len(down) == 1, "two consecutive failures log one line"
     assert len(recovered) == 1, "recovery logs one line"
+
+
+def test_a_capture_is_stamped_on_the_state_timeline_or_not_at_all(io, loop, monkeypatch):
+    # A time source that has not recorded a step has no instant to give.
+    assert io.capture_timestamp_s() is None
+    io.record_engine_time(3.25)
+    assert io.capture_timestamp_s() == 3.25
+
+    follower = sim_topics.SimTopicIO(node_runner=object(), loop=loop)
+    monkeypatch.setattr(sim_topics.clock, "now_ns", lambda: 7_000_000_000)
+    assert follower.capture_timestamp_s() == 7.0
+
+
+class _GatedPublisher:
+    """A topic publisher whose publishes stay in flight until the gate opens."""
+
+    def __init__(self) -> None:
+        self.payloads = []
+        self.gate = None
+
+    async def publish(self, payload) -> None:
+        self.payloads.append(payload)
+        await self.gate.wait()
+
+
+def test_object_snapshots_publish_whole_and_drop_while_one_is_in_flight(io, loop, monkeypatch):
+    topic = sim_topics.object_states
+    monkeypatch.setattr(topic, "MessageObjectsItem", lambda **fields: fields, raising=False)
+    monkeypatch.setattr(topic, "build_message", lambda timestamp, objects: (timestamp, objects), raising=False)
+    publisher = _GatedPublisher()
+    io._object_states_pub = publisher
+
+    def snapshot(timestamp_s, *object_ids):
+        return object_state.ObjectStateSnapshot(timestamp_s=timestamp_s, objects=tuple(
+            object_state.ObjectRecord(
+                object_id=object_id, asset_id="props/blocks/red_block", physics="dynamic", mass=0.1, scale=1.0,
+                position=(0.5, 0.0, 0.8), orientation=(0.0, 0.0, 0.0, 1.0),
+                linear_velocity=(0.0, 0.0, -0.2), angular_velocity=(0.0, 0.0, 0.0),
+            )
+            for object_id in object_ids
+        ))
+
+    first, second, third = snapshot(1.5, "obj_a", "obj_b"), snapshot(1.6, "obj_a"), snapshot(1.7)
+
+    async def scenario():
+        publisher.gate = asyncio.Event()
+        assert io.publish_object_states(first) is True
+        await _drain()
+        assert io.publish_object_states(second) is False, "the first is still in flight"
+        publisher.gate.set()
+        await _drain()
+        assert io.publish_object_states(third) is True
+        await _drain()
+
+    loop.run_until_complete(scenario())
+    assert publisher.payloads == [
+        (1.5, [record.fields() for record in first.objects]),
+        (1.7, []),
+    ]

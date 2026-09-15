@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Web commander for simulation scenes through the scene_control contract."""
+"""Web commander for a simulation scene.
+
+The panel edits the scene through scene_control and reads object state
+through object_state, both of the same simulation.
+"""
 
 from __future__ import annotations
 
@@ -23,10 +27,9 @@ from peppygen.consumed_actions.simulation import (
     spawn_object,
 )
 
-from peppygen.consumed_services.simulation import (
-    get_assets_list,
-    get_objects_list,
-)
+from peppygen.consumed_services.objects import get_object_states
+
+from peppygen.consumed_services.simulation import get_assets_list
 
 from scene_commander import listen
 
@@ -45,6 +48,15 @@ class SceneCatalogueUnavailable(RuntimeError):
 
     An engine answers this way while it is still discovering its assets, and
     its message says so. The page waits it out and asks again.
+    """
+
+
+class ObjectStateUnavailable(RuntimeError):
+    """The object state provider answered get_object_states without a snapshot.
+
+    An engine answers this way when it does not inspect its scene or is not
+    ready yet, and its message says why. An empty scene is a snapshot with
+    no objects, never this.
     """
 
 
@@ -70,10 +82,12 @@ async def _fetch_assets(node_runner: NodeRunner) -> list[dict]:
     return json.loads(data.assets_json)
 
 
-async def _fetch_objects(node_runner: NodeRunner) -> list[dict]:
-    producer = get_objects_list.bound_producer(node_runner)
+async def _fetch_objects(node_runner: NodeRunner) -> dict:
+    """The provider's object state snapshot: its capture time and records."""
 
-    response = await get_objects_list.poll(
+    producer = get_object_states.bound_producer(node_runner)
+
+    response = await get_object_states.poll(
         node_runner,
         producer,
         timeout=SERVICE_TIMEOUT_S,
@@ -82,26 +96,50 @@ async def _fetch_objects(node_runner: NodeRunner) -> list[dict]:
     data = response.data
 
     if not data.success:
-        raise RuntimeError(data.message)
+        raise ObjectStateUnavailable(data.message)
 
-    return json.loads(data.objects_json)
+    return {
+        "timestamp": data.timestamp,
+        "objects": [_object_record(record) for record in data.objects],
+    }
 
 
-class _CatalogueWatch:
-    """Log the provider's catalogue state when it changes, not on every poll."""
+def _object_record(record) -> dict:
+    return {
+        "object_id": record.object_id,
+        "asset_id": record.asset_id,
+        "physics": record.physics,
+        "mass": record.mass,
+        "scale": record.scale,
+        "position": list(record.position),
+        "orientation": list(record.orientation),
+        "linear_velocity": list(record.linear_velocity),
+        "angular_velocity": list(record.angular_velocity),
+    }
 
-    def __init__(self) -> None:
+
+class _StateWatch:
+    """Log whether the provider has one of its states when that changes, not
+    on every read.
+
+    name is the state (its catalogue, its object state), unit what its count
+    counts.
+    """
+
+    def __init__(self, name: str, unit: str) -> None:
+        self._name = name
+        self._unit = unit
         self._state: tuple | None = None
 
     def unavailable(self, message: str) -> None:
         if self._state != ("unavailable", message):
             self._state = ("unavailable", message)
-            logger.info("Scene provider has no catalogue yet: %s", message)
+            logger.info("Scene provider has no %s: %s", self._name, message)
 
     def ready(self, count: int) -> None:
         if self._state != ("ready",):
             self._state = ("ready",)
-            logger.info("Scene provider catalogue ready: %d assets", count)
+            logger.info("Scene provider %s ready: %d %s", self._name, count, self._unit)
 
 
 # ---------------------------------------------------------------------------
@@ -261,7 +299,8 @@ async def _action_move_robot(node_runner: NodeRunner, position: list[float]) -> 
 
 
 _NODE_RUNNER = web.AppKey("node_runner", NodeRunner)
-_CATALOGUE = web.AppKey("catalogue", _CatalogueWatch)
+_CATALOGUE = web.AppKey("catalogue", _StateWatch)
+_OBJECT_STATE = web.AppKey("object_state", _StateWatch)
 
 
 def _json_error(request: web.Request, exc: Exception, status: int = 400) -> web.Response:
@@ -339,14 +378,32 @@ async def _api_assets(request: web.Request) -> web.Response:
 
 
 async def _api_objects(request: web.Request) -> web.Response:
+    object_state = request.app[_OBJECT_STATE]
+
     try:
-        objects = await _fetch_objects(request.app[_NODE_RUNNER])
+        snapshot = await _fetch_objects(request.app[_NODE_RUNNER])
+
+    except ObjectStateUnavailable as exc:
+        object_state.unavailable(str(exc))
+
+        return web.json_response(
+            {"success": False, "message": str(exc)},
+            status=503,
+        )
 
     except Exception as exc:
         return _json_error(request, exc, status=500)
 
+    objects = snapshot["objects"]
+    object_state.ready(len(objects))
+
     return web.json_response(
-        {"success": True, "objects": objects, "count": len(objects)}
+        {
+            "success": True,
+            "objects": objects,
+            "count": len(objects),
+            "timestamp": snapshot["timestamp"],
+        }
     )
 
 
@@ -976,8 +1033,24 @@ async function refreshObjects() {
         renderObjects();
     }
     catch (err) {
-        status(err.message, true);
+        // Without a snapshot the objects are unknown: none of them keeps
+        // its controls, and the panel says why instead of an empty scene.
+        const message = `Object state unavailable: ${err.message}`;
+
+        objectList = [];
+
+        el("objectCount").textContent = "unavailable";
+
+        renderObjectsUnavailable(message);
+
+        status(message, true);
     }
+}
+
+function renderObjectsUnavailable(message) {
+    el("objects").innerHTML =
+        `<p id="objectsUnavailable" class="small"></p>`;
+    el("objectsUnavailable").textContent = message;
 }
 
 function renderObjectDescriptions() {
@@ -1015,6 +1088,8 @@ function renderObjects() {
                 physics=${obj.physics || "none"}
                 &nbsp;|&nbsp;
                 mass=${obj.mass ?? "-"} kg
+                &nbsp;|&nbsp;
+                scale=${obj.scale ?? "-"}
             </div>
             <p id="objectDescription${index}" class="small" hidden></p>
 
@@ -1281,11 +1356,12 @@ async def _index(_request: web.Request) -> web.Response:
 # ---------------------------------------------------------------------------
 
 
-def _build_app(node_runner: NodeRunner, catalogue: _CatalogueWatch) -> web.Application:
+def _build_app(node_runner: NodeRunner) -> web.Application:
     app = web.Application()
 
     app[_NODE_RUNNER] = node_runner
-    app[_CATALOGUE] = catalogue
+    app[_CATALOGUE] = _StateWatch("catalogue", "assets")
+    app[_OBJECT_STATE] = _StateWatch("object state", "runtime objects")
 
     app.router.add_get("/", _index)
     app.router.add_get("/api/health", _api_health)
@@ -1310,8 +1386,6 @@ def _build_app(node_runner: NodeRunner, catalogue: _CatalogueWatch) -> web.Appli
 async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Task]:
     logger.info("Scene commander starting")
 
-    catalogue = _CatalogueWatch()
-
     # The scene panel's socket, owned before the provider is waited on: a
     # launch this node cannot serve is refused first, and which copy holds the
     # preferred port follows launch order.
@@ -1323,24 +1397,29 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
         listen.bound_address(listener),
     )
 
-    # The provider must answer; whether it has its catalogue yet is a state
-    # the page polls for.
+    app = _build_app(node_runner)
+
+    # The provider must answer both reads; whether it has its catalogue and
+    # its object state yet is a state the page asks for again.
     try:
         assets = await _fetch_assets(node_runner)
 
     except SceneCatalogueUnavailable as exc:
-        catalogue.unavailable(str(exc))
+        app[_CATALOGUE].unavailable(str(exc))
 
     else:
-        catalogue.ready(len(assets))
+        app[_CATALOGUE].ready(len(assets))
 
-    objects = await _fetch_objects(node_runner)
+    try:
+        snapshot = await _fetch_objects(node_runner)
 
-    logger.info("Scene provider reachable: %d runtime objects", len(objects))
+    except ObjectStateUnavailable as exc:
+        app[_OBJECT_STATE].unavailable(str(exc))
 
-    server_task = await listen.start_serving(
-        _build_app(node_runner, catalogue), listener
-    )
+    else:
+        app[_OBJECT_STATE].ready(len(snapshot["objects"]))
+
+    server_task = await listen.start_serving(app, listener)
 
     return [server_task]
 

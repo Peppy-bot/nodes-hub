@@ -145,6 +145,7 @@ async def _node_setup(params, node_runner) -> list:
     scene_actions = SceneActionIO(
         node_runner,
         loop,
+        io,
     )
 
     await scene_actions.start()

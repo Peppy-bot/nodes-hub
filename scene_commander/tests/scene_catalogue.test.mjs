@@ -53,7 +53,12 @@ class Element {
         if (this.tag === 'select') this.value = children[0]?.value || '';
     }
 
+    get innerHTML() {
+        return this.markup || '';
+    }
+
     set innerHTML(value) {
+        this.markup = value;
         for (const id of this.generatedIds) this.elements.delete(id);
         const children = registerElements(value, this.elements);
         this.generatedIds = children.map(child => child.attributes.id);
@@ -100,15 +105,22 @@ const block = {
 };
 
 const PROVIDER_BUSY = 'Isaac is still discovering its asset catalogue';
+const NO_OBJECT_STATE = 'Isaac has not loaded its stage yet';
+const CAPTURED = 1757944800.25;
 
 // unavailable: how many catalogue requests the provider refuses first, as the
 // node answers while the engine has no catalogue yet (HTTP 503).
-async function page(catalogue = [staticScene, dynamicScene, cage], objects = [], { unavailable = 0 } = {}) {
+// objectState: the provider's reason while it has no object state, which the
+// node answers with HTTP 503; null once it has a snapshot.
+async function page(catalogue = [staticScene, dynamicScene, cage], objects = [],
+    { unavailable = 0, objectState = null } = {}) {
     const elements = new Map();
     registerElements(html, elements);
     const requests = [];
     const waits = [];
     let currentCatalogue = catalogue;
+    let currentObjects = objects;
+    let objectStateReason = objectState;
     let refusals = unavailable;
     const snapshot = () => ({
         status: elements.get('status').textContent,
@@ -138,8 +150,12 @@ async function page(catalogue = [staticScene, dynamicScene, cage], objects = [],
                 refusals -= 1;
                 return { ok: false, status: 503, json: async () => ({ success: false, message: PROVIDER_BUSY }) };
             }
+            if (path === '/api/objects' && objectStateReason !== null) {
+                return { ok: false, status: 503, json: async () => ({ success: false, message: objectStateReason }) };
+            }
             const data = path === '/api/assets' ? { assets: currentCatalogue }
-                : path === '/api/objects' ? { objects }
+                : path === '/api/objects'
+                    ? { objects: currentObjects, count: currentObjects.length, timestamp: CAPTURED }
                 : { message: 'Scene loaded' };
             return { ok: true, json: async () => ({ success: true, ...data }) };
         },
@@ -158,6 +174,8 @@ async function page(catalogue = [staticScene, dynamicScene, cage], objects = [],
             await vm.runInContext(element('assetSelect').attributes.onchange, context);
         },
         setCatalogue: assets => { currentCatalogue = assets; },
+        setObjects: list => { currentObjects = list; objectStateReason = null; },
+        setObjectStateUnavailable: reason => { objectStateReason = reason; },
     };
 }
 
@@ -380,4 +398,92 @@ test('runtime objects show their asset descriptions and refresh them without los
     await ui.run('refreshAssets()');
     assert.equal(ui.element('objectDescription0').textContent, '');
     assert.equal(ui.element('objectDescription0').hidden, true);
+});
+
+const redBlock = {
+    object_id: 'obj_1', asset_id: block.asset_id, physics: 'dynamic', mass: 0.2, scale: 1.5,
+    position: [0.5, 0, 0.8], orientation: [0, 0, 0, 1], linear_velocity: [0, 0, 0], angular_velocity: [0, 0, 0],
+};
+const staticCarton = {
+    ...redBlock, object_id: 'obj_2', asset_id: carton.asset_id, physics: 'static', mass: 2, scale: 1,
+};
+
+// The ids the objects panel holds right now; the page source names every id
+// its templates can render, so the element map alone cannot tell.
+const panel = ui => ui.element('objects').children.map(child => child.attributes.id);
+
+test('an empty scene lists no runtime objects', async () => {
+    const ui = await page([block], []);
+    assert.equal(ui.element('objectCount').textContent, '0 objects');
+    assert.match(ui.element('objects').innerHTML, /No runtime objects\./);
+    assert.deepEqual(panel(ui), []);
+});
+
+test('runtime objects show their physics, mass and scale as spawned', async () => {
+    const ui = await page([block, carton], [redBlock, staticCarton]);
+    assert.equal(ui.element('objectCount').textContent, '2 objects');
+    const markup = ui.element('objects').innerHTML;
+    assert.match(markup, /physics=dynamic\s*&nbsp;\|&nbsp;\s*mass=0\.2 kg\s*&nbsp;\|&nbsp;\s*scale=1\.5/);
+    assert.match(markup, /physics=static\s*&nbsp;\|&nbsp;\s*mass=2 kg\s*&nbsp;\|&nbsp;\s*scale=1\b/);
+    assert.equal(ui.element('ox0').value, '0.5');
+    assert.ok(ui.element('forceMag0'), 'a dynamic object keeps its force controls');
+    assert.equal(ui.element('forceMag1'), undefined, 'a static object has no force controls');
+});
+
+test('unavailable object state is shown as such, never as an empty scene', async () => {
+    const ui = await page([block], [], { objectState: NO_OBJECT_STATE });
+    assert.deepEqual(ui.requests.map(r => r.path), ['/api/assets', '/api/objects']);
+    assert.equal(ui.element('objectCount').textContent, 'unavailable');
+    assert.deepEqual(panel(ui), ['objectsUnavailable']);
+    assert.equal(ui.element('objectsUnavailable').textContent, `Object state unavailable: ${NO_OBJECT_STATE}`);
+    assert.doesNotMatch(ui.element('objects').innerHTML, /No runtime objects/);
+    assert.equal(ui.element('status').textContent, `Object state unavailable: ${NO_OBJECT_STATE}`);
+    assert.equal(ui.element('status').style.borderColor, '#9b424c');
+
+    ui.setObjects([]);
+    await ui.run('refreshObjects()');
+    assert.equal(ui.element('objectCount').textContent, '0 objects');
+    assert.match(ui.element('objects').innerHTML, /No runtime objects\./);
+    assert.deepEqual(panel(ui), []);
+});
+
+test('object state that becomes unavailable drops the controls of the objects it listed', async () => {
+    const ui = await page([block], [redBlock]);
+    assert.ok(ui.element('ox0'));
+
+    const markup = '<img src=x onerror="globalThis.injected = true">';
+    ui.setObjectStateUnavailable(markup);
+    await ui.run('refreshObjects()');
+    assert.equal(ui.run('objectList.length'), 0);
+    for (const id of ['ox0', 'oy0', 'oz0', 'forceMag0', 'forceDuration0', 'objectDescription0']) {
+        assert.equal(ui.element(id), undefined, `#${id} is gone with the state it showed`);
+    }
+    assert.doesNotMatch(ui.element('objects').innerHTML, /Move|Remove|obj_1/);
+    assert.equal(ui.element('objectCount').textContent, 'unavailable');
+    // The provider's reason stays literal text.
+    assert.equal(ui.element('objectsUnavailable').textContent, `Object state unavailable: ${markup}`);
+    assert.doesNotMatch(ui.element('objects').innerHTML, /<img/);
+    assert.equal(ui.run('globalThis.injected'), undefined);
+
+    // A catalogue refresh finds no stale objects to describe.
+    await ui.run('refreshAssets()');
+    assert.equal(ui.element('objectDescription0'), undefined);
+});
+
+test('every scene edit reads the runtime objects again once its goal completes', async () => {
+    const ui = await page([block], [redBlock]);
+    const since = ui.requests.length;
+    await ui.run('clearScene()');
+    await ui.run('spawnObject()');
+    await ui.run('moveObject(0)');
+    await ui.run('removeObject(0)');
+    assert.deepEqual(ui.requests.slice(since).map(r => r.path), [
+        '/api/scene/clear', '/api/objects',
+        '/api/objects/spawn', '/api/objects',
+        '/api/objects/move', '/api/objects',
+        '/api/objects/remove', '/api/objects',
+    ]);
+    assert.equal(ui.requests[since + 2].body.asset_id, block.asset_id);
+    assert.deepEqual(ui.requests[since + 4].body, { object_id: 'obj_1', position: [0.5, 0, 0.8] });
+    assert.deepEqual(ui.requests[since + 6].body, { object_id: 'obj_1' });
 });

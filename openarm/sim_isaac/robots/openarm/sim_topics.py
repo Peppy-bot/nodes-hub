@@ -13,6 +13,10 @@ dropping a frame instead of queueing when its stream's previous publish is
 still in flight. Every hop is a generated peppygen pairing topic: no JSON, no
 raw peppylib.
 
+Beside the pairings, the engine emits object_state's object_states topic: a
+full snapshot of every spawned object on the state tick, dropped instead of
+queued while the previous one is still in flight, as a camera frame is.
+
 When the launch declares this engine its source of simulated time, the physics
 thread records its engine clock each step (`record_engine_time`, ahead of every
 stamp of that step) and publishes it to every machine of the launch on each
@@ -37,6 +41,7 @@ from typing import Optional
 import peppylib
 from peppygen import clock
 from peppylib.clock import SimTimePublisher
+from peppygen.emitted_topics.objects import object_states
 from peppygen.paired_topics.chest import depth_stream as chest_depth
 from peppygen.paired_topics.chest import stream_info as chest_info
 from peppygen.paired_topics.chest import video_stream as chest_video
@@ -115,11 +120,12 @@ _PUBLISH_STALL_S = 5.0
 
 
 class _PublishGuard:
-    """At most one in-flight publish batch per camera surface: acquired on the
-    render thread when a capture is scheduled, released on the loop when every
-    publish task of the batch finishes. A camera that can't keep up drops
-    whole captures instead of piling publish tasks onto the loop, and an rgbd
-    color + depth pair shares one guard so a pair is never half-dropped."""
+    """At most one in-flight publish batch per surface (a camera's frames or
+    stream info, the object-state stream): acquired on the physics thread
+    when a sample is scheduled, released on the loop when every publish task
+    of the batch finishes. A surface that can't keep up drops whole samples
+    instead of piling publish tasks onto the loop, and an rgbd color + depth
+    pair shares one guard so a pair is never half-dropped."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -170,6 +176,9 @@ class SimTopicIO:
         # Camera publishers and their in-flight guards, keyed by (slot, topic).
         self._camera_pubs: dict[tuple[str, str], peppylib.TopicPublisher] = {}
         self._camera_guards: dict[tuple[str, str], _PublishGuard] = {}
+        # The object_states publisher and its in-flight guard.
+        self._object_states_pub: Optional[peppylib.TopicPublisher] = None
+        self._object_states_guard = _PublishGuard()
         self._tasks: list[asyncio.Task] = []
         # Set in start() when the launch declared this engine its time source.
         self._sim_clock: Optional[SimTimePublisher] = None
@@ -205,6 +214,7 @@ class SimTopicIO:
             self._arm_pubs[side] = await states.declare_publisher(self._node_runner)
         for side, (_, states) in _GRIPPER_SLOTS.items():
             self._gripper_pubs[side] = await states.declare_publisher(self._node_runner)
+        self._object_states_pub = await object_states.declare_publisher(self._node_runner)
         for name, (video, info) in _COLOR_CAMERA_SLOTS.items():
             await self._declare_camera_publishers(
                 name, [(_VIDEO_STREAM, video), (_STREAM_INFO, info)]
@@ -481,6 +491,30 @@ class SimTopicIO:
         )
         self._publish_guarded(name, _INFO_SURFACE, [(_STREAM_INFO, payload)])
 
+    def capture_timestamp_s(self) -> Optional[float]:
+        """The instant of a state capture taken now, on the timeline the
+        joint states are stamped on. None while this engine is a time source
+        that has not recorded a step: such a capture has no instant yet, so
+        it is not a snapshot."""
+        if self._sim_clock is not None and self._engine_time_s is None:
+            return None
+        return self._timestamp_s()
+
+    def publish_object_states(self, snapshot) -> bool:
+        """Publish one object-state snapshot, stamped with the instant it was
+        captured. False when the previous snapshot is still in flight: this
+        one is dropped, and the next replaces it."""
+        pub = self._object_states_pub
+        if pub is None:
+            return False
+        payload = object_states.build_message(
+            snapshot.timestamp_s,
+            [object_states.MessageObjectsItem(**record.fields()) for record in snapshot.objects],
+        )
+        return self._publish_batch(
+            self._object_states_guard, object_states.TOPIC_NAME, [(pub, payload)]
+        )
+
     async def _declare_camera_publishers(
         self, name: str, topics: list[tuple[str, object]]
     ) -> None:
@@ -494,15 +528,25 @@ class SimTopicIO:
     def _publish_guarded(
         self, name: str, surface: str, topic_payloads: list[tuple[str, bytes]]
     ) -> bool:
-        """False when this surface's previous batch is still in flight, so the
-        caller knows the sample never reached a consumer."""
-        guard = self._camera_guards[(name, surface)]
-        if not guard.try_acquire(f"{name} {surface}"):
-            return False
+        """One camera surface's batch, behind that surface's guard."""
         publishes = [
             (self._camera_pubs[(name, topic_name)], payload)
             for topic_name, payload in topic_payloads
         ]
+        return self._publish_batch(
+            self._camera_guards[(name, surface)], f"{name} {surface}", publishes
+        )
+
+    def _publish_batch(
+        self,
+        guard: _PublishGuard,
+        surface: str,
+        publishes: list[tuple[peppylib.TopicPublisher, bytes]],
+    ) -> bool:
+        """False when this surface's previous batch is still in flight, so the
+        caller knows the sample never reached a consumer."""
+        if not guard.try_acquire(surface):
+            return False
 
         def _publish() -> None:
             # Runs on the loop, so the counter needs no lock; the guard is

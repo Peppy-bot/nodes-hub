@@ -13,6 +13,7 @@ from typing import Optional
 
 from bridge_extension import IsaacBridgeExtension
 from camera_common import FramePacer
+from object_state import RUNTIME_OBJECTS_PATH, object_prim_path
 from runtime_commander_server import RuntimeCommanderServer
 
 logger = logging.getLogger(__name__)
@@ -31,6 +32,10 @@ _ANTI_ALIASING_OP = "/rtx/post/aa/op"
 # The one prim a runtime scene (an Isaac environment or any USD) is referenced
 # under. Loading a scene replaces whatever is there.
 _RUNTIME_SCENE_PATH = "/World/RuntimeScene"
+
+# The runtime commands that remove or replace the prim at a runtime object's
+# path. Each refuses a name scene_control spawned; a move keeps the prim.
+_PRIM_REPLACING_COMMANDS = frozenset({"spawn_usd", "spawn_isaac_asset", "remove"})
 
 
 class SimLauncher:
@@ -223,6 +228,7 @@ class SimLauncher:
 
             self._extension = IsaacBridgeExtension(
                 self._io,
+                self._scene_actions,
                 self._state_rate_hz,
                 self._cameras_enabled,
             )
@@ -335,6 +341,20 @@ class SimLauncher:
             "Runtime command received: %s",
             command,
         )
+
+        # Every object-state capture reads each scene_control object at its
+        # prim. Removing or replacing one here would leave the registry
+        # naming a prim that is gone or swapped, and every capture would
+        # fail until a scene_control edit. scene_control itself calls the
+        # _runtime_* methods directly, past this check.
+        if (
+            cmd in _PRIM_REPLACING_COMMANDS
+            and self._scene_actions.owns(command.get("name"))
+        ):
+            raise ValueError(
+                f"Runtime command '{cmd}' refused: '{command['name']}' is "
+                "a scene_control object; edit it through scene_control"
+            )
 
         if cmd == "move_arm":
             self._runtime_move_arm(command)
@@ -664,7 +684,7 @@ class SimLauncher:
         # Scene root.
         # --------------------------------------------------------------
 
-        root_path = "/World/RuntimeObjects/Tabletop"
+        root_path = f"{RUNTIME_OBJECTS_PATH}/Tabletop"
 
         self._remove_prim(stage, root_path)
 
@@ -1043,7 +1063,7 @@ class SimLauncher:
         else:
             lateral.Normalize()
 
-        root_path = "/World/RuntimeObjects/ShelfReach"
+        root_path = f"{RUNTIME_OBJECTS_PATH}/ShelfReach"
 
         self._remove_prim(stage, root_path)
 
@@ -1511,9 +1531,10 @@ class SimLauncher:
         PhysX rebuilds its tensor views when a prim leaves the stage, and the
         Articulation handles the bridge and the runtime commander hold keep
         failing afterwards ('Articulation' object has no attribute
-        '_physics_view') until they are created again. Every removal goes
-        through here so those handles are re-created on the next step.
-        Adding prims leaves them intact.
+        '_physics_view') until they are created again, as does the
+        rigid-body view the object state reads. Every removal goes through
+        here so those handles are re-created on their next use. Adding
+        prims leaves them intact.
         """
 
         if not stage.GetPrimAtPath(path).IsValid():
@@ -1525,6 +1546,8 @@ class SimLauncher:
 
         if self._extension is not None:
             self._extension.invalidate_physics_views()
+
+        self._scene_actions.invalidate_physics_views()
 
         return True
 
@@ -1938,21 +1961,15 @@ class SimLauncher:
             .get_stage()
         )
 
-        runtime_root = (
-            "/World/RuntimeObjects"
-        )
-
         if not stage.GetPrimAtPath(
-            runtime_root
+            RUNTIME_OBJECTS_PATH
         ).IsValid():
             stage.DefinePrim(
-                Sdf.Path(runtime_root),
+                Sdf.Path(RUNTIME_OBJECTS_PATH),
                 "Xform",
             )
 
-        prim_path = (
-            f"{runtime_root}/{name}"
-        )
+        prim_path = object_prim_path(name)
 
         self._remove_prim(stage, prim_path)
 
@@ -2079,9 +2096,7 @@ class SimLauncher:
             .get_stage()
         )
 
-        prim_path = (
-            f"/World/RuntimeObjects/{name}"
-        )
+        prim_path = object_prim_path(name)
 
         prim = stage.GetPrimAtPath(
             prim_path
@@ -2273,9 +2288,7 @@ class SimLauncher:
             .get_stage()
         )
 
-        prim_path = (
-            f"/World/RuntimeObjects/{name}"
-        )
+        prim_path = object_prim_path(name)
 
         prim = stage.GetPrimAtPath(
             prim_path
@@ -2330,7 +2343,7 @@ class SimLauncher:
 
         stage = omni.usd.get_context().get_stage()
 
-        if not self._remove_prim(stage, f"/World/RuntimeObjects/{name}"):
+        if not self._remove_prim(stage, object_prim_path(name)):
             logger.warning(
                 "Runtime object '%s' does not exist",
                 name,
