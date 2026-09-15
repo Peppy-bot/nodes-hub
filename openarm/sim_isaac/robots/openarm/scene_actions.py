@@ -29,9 +29,9 @@ from peppygen.exposed_services.scene import (
 
 logger = logging.getLogger(__name__)
 
-# The name this simulation's one robot stands under, which is its root prim
-# in the stage. Scene commands address it by this name.
-ROBOT_NAME = "openarm"
+# The name the robot the engine stands answers to. A seat's robot answers to
+# the name of the attachment that took it.
+STANDING_NAME = "openarm"
 
 
 @dataclass
@@ -48,15 +48,14 @@ class SceneActionIO:
         self,
         node_runner,
         loop: asyncio.AbstractEventLoop,
-        model: str,
+        world=None,
     ) -> None:
         self._node_runner = node_runner
         self._loop = loop
 
-        # The catalogue model this simulation stands its robot as, reported
-        # by get_robots_list. This simulation carries one robot.
-        self._model = model
-        self._robot_position = [0.0, 0.0, 0.0]
+        # The stage's own account of which robots stand in it, which
+        # get_robots_list reports and move_robot resolves a name against.
+        self._world = world
 
         self._lock = threading.Lock()
 
@@ -292,21 +291,28 @@ class SceneActionIO:
             ),
         )
 
+    def _robot_name(self, robot) -> str:
+        """The name a scene command addresses this robot by."""
+        return robot.instance or STANDING_NAME
+
     def _handle_get_robots(
         self,
         _request,
     ) -> get_robots_list.Response:
-        with self._lock:
-            robots = [
-                {
-                    "robot": ROBOT_NAME,
-                    "model": self._model,
-                    "position": list(
-                        self._robot_position
-                    ),
-                    "attached": False,
-                }
-            ]
+        standing = (
+            self._world.robots() if self._world is not None else []
+        )
+        robots = [
+            {
+                "robot": self._robot_name(robot),
+                "model": robot.model,
+                "position": list(
+                    robot.placement.position
+                ),
+                "attached": bool(robot.instance),
+            }
+            for robot in standing
+        ]
 
         return get_robots_list.Response(
             success=True,
@@ -648,11 +654,21 @@ class SceneActionIO:
 
         if operation == "move_robot":
             robot = payload["robot"]
+            standing = (
+                self._world.robots()
+                if self._world is not None
+                else []
+            )
+            names = [
+                self._robot_name(each)
+                for each in standing
+            ]
 
-            if robot != ROBOT_NAME:
+            if robot not in names:
                 raise ValueError(
                     f"no robot stands as {robot!r} in this "
-                    f"simulation, which stands {ROBOT_NAME!r}"
+                    f"simulation, which stands "
+                    f"{', '.join(names) or 'none'}"
                 )
 
             position = [
@@ -667,12 +683,10 @@ class SceneActionIO:
 
             launcher._runtime_move_robot_root(
                 {
+                    "robot": robot,
                     "position": position,
                 }
             )
-
-            with self._lock:
-                self._robot_position = position
 
             return {
                 "success": True,

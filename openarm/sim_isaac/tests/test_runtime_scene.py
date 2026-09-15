@@ -98,8 +98,8 @@ def scene(monkeypatch):
     monkeypatch.setattr(module, "RuntimeCommanderServer", Mock())
 
     launcher = module.SimLauncher(
-        Mock(), Path("/robot.usd"), Mock(), Mock(), object(), Mock(),
-        state_rate_hz=60, cameras_enabled=False, frame_rate_hz=60,
+        Mock(), Mock(), Mock(), Mock(), Mock(), Mock(), object(), Mock(),
+        cameras_enabled=False, frame_rate_hz=60,
         render_mode="RealTimePathTracing", anti_aliasing=3,
     )
     bridge = Mock()

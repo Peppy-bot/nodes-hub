@@ -11,7 +11,7 @@ import pytest
 
 _ROBOT_DIR = Path(__file__).resolve().parents[1] / "robots" / "openarm"
 _PERIOD = 1.0 / 60
-_PHASES = ["update", "bridge", "runtime", "scene", "forces", "targets"]
+_PHASES = ["update", "bridge", "runtime", "scene", "edits", "forces", "targets"]
 _MAIN_RATE_LIMIT_ENABLED = "/app/runLoops/main/rateLimitEnabled"
 _RENDER_MODE = "/rtx/rendermode"
 _ANTI_ALIASING_OP = "/rtx/post/aa/op"
@@ -116,14 +116,21 @@ def loop(monkeypatch):
     bridge.step.side_effect = step
     state.commander.process_pending.side_effect = lambda launcher: phase("runtime")
     state.scene.process_pending.side_effect = lambda launcher: phase("scene")
+    # The stage and the robots that join it are the world's business; the
+    # launcher is handed one, along with the queue of joins and departures it
+    # drains on its own thread.
+    state.world = Mock()
+    state.edits = Mock()
+    state.edits.drain.side_effect = lambda: phase("edits")
     state.launcher = module.SimLauncher(
         state.app,
-        Path("/robot.usd"),
+        state.world,
+        state.edits,
+        bridge,
         state.ready,
         state.stop,
         object(),
         state.scene,
-        state_rate_hz=17,
         cameras_enabled=False,
         frame_rate_hz=60,
         render_mode="RealTimePathTracing",
@@ -201,7 +208,9 @@ def test_initial_frame_is_immediate_and_orders_readiness_before_queues(loop):
 
     assert loop.starts == [100.0]
     assert loop.waits == []
-    assert loop.trace == ["update", "bridge", "ready", "runtime", "scene", "forces", "targets"]
+    assert loop.trace == [
+        "update", "bridge", "ready", "runtime", "scene", "edits", "forces", "targets"
+    ]
     loop.bridge.step.assert_called_once_with()
     loop.commander.process_pending.assert_called_once_with(loop.launcher)
     loop.scene.process_pending.assert_called_once_with(loop.launcher)
@@ -226,7 +235,8 @@ def test_readiness_waits_for_bridge_setup_but_queues_run_each_frame(loop):
     loop.launcher._run_loop()
 
     assert loop.trace == (
-        _PHASES + ["wait", "update", "bridge", "ready", "runtime", "scene", "forces", "targets"]
+        _PHASES
+        + ["wait", "update", "bridge", "ready", "runtime", "scene", "edits", "forces", "targets"]
         + ["wait"] + _PHASES
     )
     loop.ready.set.assert_called_once_with()
@@ -246,7 +256,7 @@ def test_stalled_frame_resynchronizes_without_replaying_missed_steps(loop, stall
     assert loop.starts == pytest.approx([100.0, 100.25, 100.25 + _PERIOD])
     assert loop.waits == pytest.approx([_PERIOD])
     assert loop.bridge.step.call_count == 3
-    assert loop.trace[6:8] == ["targets", "update"], "overdue work does not wait"
+    assert loop.trace[7:9] == ["targets", "update"], "overdue work does not wait"
 
 
 def test_early_wait_return_rechecks_the_deadline(loop):
@@ -269,7 +279,7 @@ def test_early_wait_return_rechecks_the_deadline(loop):
 
     assert loop.starts == pytest.approx([100.0, 100.0 + _PERIOD])
     assert loop.waits == pytest.approx([_PERIOD, _PERIOD * 3 / 4])
-    assert loop.trace[6:10] == ["targets", "wait", "wait", "update"]
+    assert loop.trace[7:11] == ["targets", "wait", "wait", "update"]
     assert loop.bridge.step.call_count == 2
     assert loop.settings_trace == [
         ("read", False), ("update",), ("read", True), ("write", False), ("update",),
@@ -312,7 +322,9 @@ def test_shutdown_during_wait_prevents_an_extra_frame_and_closes_orderly(loop, e
     assert not loop.ready.is_set()
     assert loop.trace[-4:] == ["commander.stop", "bridge.shutdown", "timeline.stop", "app.close"]
     loop.app.close.assert_called_once_with()
-    loop.module.IsaacBridgeExtension.assert_called_once_with(loop.launcher._io, 17, False)
+    # The bridge is the one the node built around the world, so the launcher
+    # binds it rather than making one of its own.
+    loop.bridge.bind.assert_called_once_with()
     assert loop.settings_trace == [("read", False), ("update",)]
     assert loop.settings_values[_MAIN_RATE_LIMIT_ENABLED] is True
     loop.settings.set_bool.assert_not_called()

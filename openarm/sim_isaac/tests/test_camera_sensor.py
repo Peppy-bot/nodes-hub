@@ -52,7 +52,7 @@ class FakeIO:
         self.depth_payloads = []
         self.delivers = delivers
 
-    def camera_timestamp_s(self):
+    def timestamp_s(self):
         return 123.0
 
     def publish_color_frame(self, name, timestamp_s, frame_id, *rest):

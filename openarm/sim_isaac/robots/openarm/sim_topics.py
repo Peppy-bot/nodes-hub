@@ -62,12 +62,16 @@ logger = logging.getLogger(__name__)
 # carry the same instant instead of differing by the wire's own clamp.
 _MIN_ENGINE_TIME_S = 1e-9
 
-# Left = 0, right = 1: the slot layout mirrors the arm_id / gripper_id
-# convention the rest of the stack uses for sides.
-_ARM_SLOTS = {0: (left_arm_setpoints, left_arm_states), 1: (right_arm_setpoints, right_arm_states)}
+# Limb slots are keyed by the name the model gives the limb, which is the
+# name the seat contract orders its arrays by and the name sim_bridge.json5
+# writes.
+_ARM_SLOTS = {
+    "left": (left_arm_setpoints, left_arm_states),
+    "right": (right_arm_setpoints, right_arm_states),
+}
 _GRIPPER_SLOTS = {
-    0: (left_gripper_setpoints, left_gripper_states),
-    1: (right_gripper_setpoints, right_gripper_states),
+    "left": (left_gripper_setpoints, left_gripper_states),
+    "right": (right_gripper_setpoints, right_gripper_states),
 }
 # Camera slots are keyed by slot name (the camera's identity end to end: pairing
 # link_id here, relay instance_id and dataset key downstream).
@@ -163,8 +167,8 @@ class SimTopicIO:
     def __init__(self, node_runner: peppylib.NodeRunner, loop: asyncio.AbstractEventLoop) -> None:
         self._node_runner = node_runner
         self._loop = loop
-        self._arm_pubs: dict[int, peppylib.TopicPublisher] = {}
-        self._gripper_pubs: dict[int, peppylib.TopicPublisher] = {}
+        self._arm_pubs: dict[str, peppylib.TopicPublisher] = {}
+        self._gripper_pubs: dict[str, peppylib.TopicPublisher] = {}
         self._arm_cmd = {side: _LatestSlot() for side in _ARM_SLOTS}
         self._gripper_cmd = {side: _LatestSlot() for side in _GRIPPER_SLOTS}
         # Camera publishers and their in-flight guards, keyed by (slot, topic).
@@ -286,12 +290,12 @@ class SimTopicIO:
 
     # --- called from the physics thread ---
 
-    def latest_arm_command(self, arm_id: int) -> Optional[tuple[list[float], list[float]]]:
-        slot = self._arm_cmd.get(arm_id)
+    def latest_arm_command(self, arm: str) -> Optional[tuple[list[float], list[float]]]:
+        slot = self._arm_cmd.get(arm)
         return slot.get() if slot is not None else None
 
-    def latest_gripper_command(self, gripper_id: int) -> Optional[tuple[float, float]]:
-        slot = self._gripper_cmd.get(gripper_id)
+    def latest_gripper_command(self, gripper: str) -> Optional[tuple[float, float]]:
+        slot = self._gripper_cmd.get(gripper)
         return slot.get() if slot is not None else None
 
     def record_engine_time(self, engine_time_s: float) -> None:
@@ -355,7 +359,7 @@ class SimTopicIO:
         if latched_ns is not None:
             self._publish_sim_time_on_loop(latched_ns)
 
-    def _timestamp_s(self) -> float:
+    def timestamp_s(self) -> float:
         """The instant this engine stamps its own state with: its engine clock
         when it is the launch's time source, the daemon-resolved clock
         otherwise. A time source reading its own tick back off the wire would
@@ -370,29 +374,26 @@ class SimTopicIO:
             )
         return engine_time_s
 
-    def publish_arm_states(self, arm_id: int, positions: list[float], velocities: list[float]) -> None:
-        pub = self._arm_pubs.get(arm_id)
+    def publish_arm_states(
+        self, arm: str, positions: list[float], velocities: list[float]
+    ) -> None:
+        pub = self._arm_pubs.get(arm)
         if pub is not None:
             # Efforts are empty: the engine measures no joint torques.
-            payload = _ARM_SLOTS[arm_id][1].build_message(
-                self._timestamp_s(), positions, velocities, []
+            payload = _ARM_SLOTS[arm][1].build_message(
+                self.timestamp_s(), positions, velocities, []
             )
             self._schedule_publish(pub, payload)
 
-    def publish_gripper_states(self, gripper_id: int, opening: float, force: float = 0.0) -> None:
-        pub = self._gripper_pubs.get(gripper_id)
+    def publish_gripper_states(self, gripper: str, opening: float, force: float = 0.0) -> None:
+        pub = self._gripper_pubs.get(gripper)
         if pub is not None:
             # The engine torque rides as the pairing effort; the ceiling is 0
             # (no effort control).
-            payload = _GRIPPER_SLOTS[gripper_id][1].build_message(
-                self._timestamp_s(), opening, force, 0.0
+            payload = _GRIPPER_SLOTS[gripper][1].build_message(
+                self.timestamp_s(), opening, force, 0.0
             )
             self._schedule_publish(pub, payload)
-
-    def camera_timestamp_s(self) -> float:
-        """Capture timestamp on this engine's timeline, taken once per capture
-        so an rgbd color + depth pair shares one timestamp."""
-        return self._timestamp_s()
 
     def publish_color_frame(
         self,

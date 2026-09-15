@@ -280,7 +280,7 @@ class IsaacCameraSensor:
         rgb = self._as_rgb(rgba, camera)
         if rgb is None:
             return CaptureOutcome.NO_FRAME
-        timestamp_s = self._io.camera_timestamp_s()
+        timestamp_s = self._io.timestamp_s()
         frame_id = self._frame_ids[camera.name].next()
         if camera.depth is None:
             return _delivery(

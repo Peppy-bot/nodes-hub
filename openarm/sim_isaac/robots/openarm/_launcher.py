@@ -22,6 +22,11 @@ logger = logging.getLogger(__name__)
 _SLOW_ITERATION_S = 0.05
 
 _WARMUP_STEPS = 100
+
+# Frames given to the stage after a robot joins or leaves, before the
+# timeline plays again and after it does: the prim has to load and physics
+# has to pick it up before a view of it can read.
+_STAGE_SETTLE_STEPS = 30
 _MAIN_RATE_LIMIT_ENABLED = "/app/runLoops/main/rateLimitEnabled"
 # The renderer and anti-aliasing Kit actually runs; both are requested through
 # SimulationApp's launch config and both can be changed by Kit afterwards.
@@ -37,19 +42,21 @@ class SimLauncher:
     def __init__(
         self,
         sim_app,
-        usd_path: Path,
+        world: World,
+        edits: Edits,
+        extension: IsaacBridgeExtension,
         ready: threading.Event,
         stop: threading.Event,
         io,
         scene_actions,
-        state_rate_hz: int,
         cameras_enabled: bool,
         frame_rate_hz: int,
         render_mode: str,
         anti_aliasing: int,
     ) -> None:
         self._sim_app = sim_app
-        self._usd_path = usd_path
+        self._world = world
+        self._edits = edits
         self._ready = ready
         self._stop = stop
         self._io = io
@@ -57,10 +64,9 @@ class SimLauncher:
         self._frame_rate_hz = frame_rate_hz
         self._render_mode = render_mode
         self._anti_aliasing = anti_aliasing
-        self._state_rate_hz = state_rate_hz
         self._cameras_enabled = cameras_enabled
         self._timeline = None
-        self._extension: Optional[IsaacBridgeExtension] = None
+        self._extension: Optional[IsaacBridgeExtension] = extension
 
         self._runtime_robot = None
 
@@ -221,11 +227,7 @@ class SimLauncher:
             self._require_render_profile()
             self._start_timeline()
 
-            self._extension = IsaacBridgeExtension(
-                self._io,
-                self._state_rate_hz,
-                self._cameras_enabled,
-            )
+            self._extension.bind()
 
             self._runtime_commander.start()
 
@@ -250,22 +252,27 @@ class SimLauncher:
             self._shutdown()
 
     def _load_stage(self) -> None:
-        import omni.usd
+        self._world.open()
 
-        if not self._usd_path.exists():
-            raise FileNotFoundError(
-                f"USD not found at {self._usd_path}"
-                " — assets should be baked into the container image"
-            )
+    def unbind(self) -> None:
+        """Lets go of the stage so it can be changed: every view on an
+        articulation stops reading, and the timeline stops so the prims can
+        move under it."""
+        self._extension.unbind()
+        if self._timeline is not None:
+            self._timeline.stop()
 
-        logger.info(
-            "Loading stage: %s",
-            self._usd_path,
-        )
-
-        omni.usd.get_context().open_stage(
-            str(self._usd_path)
-        )
+    def rebind(self) -> None:
+        """Plays the stage again and takes a view of every robot on it. The
+        views read on the frames that follow, and a robot that was commanded
+        servos back to its setpoint as soon as they do."""
+        for _ in range(_STAGE_SETTLE_STEPS):
+            self._sim_app.update()
+        if self._timeline is not None:
+            self._timeline.play()
+        for _ in range(_STAGE_SETTLE_STEPS):
+            self._sim_app.update()
+        self._extension.bind()
 
     def _setup_environment(self) -> None:
         """Environment is loaded on demand by the scene commander."""
@@ -2397,6 +2404,10 @@ class SimLauncher:
             self._scene_actions.process_pending(
                 self
             )
+
+            # Stand the robots that joined and take out the ones that left,
+            # on this thread, which is the only one that may touch the stage.
+            self._edits.drain()
 
             self._update_runtime_forces()
 
