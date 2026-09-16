@@ -503,10 +503,10 @@ def test_invalid_input_is_a_400_that_never_reaches_the_provider(commander, caplo
 
     assert _call(commander, lambda client: _post(
         client, "/api/objects/spawn", {"asset_id": "props/blocks/red_block", "position": [1, 2]},
-    )) == (400, {"success": False, "message": "position must be [x, y, z]"})
+    )) == (400, {"success": False, "message": "position must be 3 finite numbers"})
     assert commander.actions.spawn_object.goals == []
     assert _node_log(commander, caplog) == [
-        (logging.WARNING, "POST /api/objects/spawn failed: position must be [x, y, z]", None),
+        (logging.WARNING, "POST /api/objects/spawn failed: position must be 3 finite numbers", None),
     ]
 
 

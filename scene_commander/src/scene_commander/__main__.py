@@ -15,6 +15,7 @@ import json
 import logging
 import math
 from dataclasses import dataclass
+from functools import partial
 from types import ModuleType
 from typing import TYPE_CHECKING, Callable
 
@@ -275,7 +276,7 @@ def _probe_capabilities(node_runner: NodeRunner) -> _Capabilities:
 
     for kind, stream_info in _STREAM_INFO.items():
         for producer in stream_info.bound_producers(node_runner):
-            profile = next((candidate for candidate in profiles if candidate == producer), None)
+            profile = producer if producer in profiles else None
             cameras.append(_Camera(producer.instance_id, kind, producer, profile))
 
     return _Capabilities(
@@ -332,29 +333,18 @@ def _result(data) -> dict:
     return {"success": True, "message": data.message, **_current(data)}
 
 
-async def _fetch_lighting(node_runner: NodeRunner, producer) -> dict:
-    """The provider's lighting: the loaded scene, its ambient and fill
-    levels, and every light with its properties."""
+async def _fetch_json(service, node_runner: NodeRunner, producer, field: str) -> tuple[dict, str]:
+    """A provider's state as the JSON it carries in `field` (a scene's
+    lighting, its materials, a camera's profile), and the message it came
+    with."""
 
-    response = await get_lighting.poll(node_runner, producer, timeout=SERVICE_TIMEOUT_S)
+    response = await service.poll(node_runner, producer, timeout=SERVICE_TIMEOUT_S)
     data = response.data
 
     if not data.success:
         raise StateUnavailable(data.message)
 
-    return json.loads(data.lighting_json)
-
-
-async def _fetch_materials(node_runner: NodeRunner, producer) -> dict:
-    """The provider's materials, each with its scope and its properties."""
-
-    response = await get_materials.poll(node_runner, producer, timeout=SERVICE_TIMEOUT_S)
-    data = response.data
-
-    if not data.success:
-        raise StateUnavailable(data.message)
-
-    return json.loads(data.materials_json)
+    return json.loads(getattr(data, field)), data.message
 
 
 async def _fetch_stream_info(node_runner: NodeRunner, camera: _Camera) -> dict:
@@ -374,101 +364,9 @@ async def _fetch_stream_info(node_runner: NodeRunner, camera: _Camera) -> dict:
     }
 
 
-async def _fetch_profile(node_runner: NodeRunner, producer) -> tuple[dict, str]:
-    """A camera's profile and the message it came with."""
-
-    response = await get_camera_profile.poll(node_runner, producer, timeout=SERVICE_TIMEOUT_S)
-    data = response.data
-
-    if not data.success:
-        raise StateUnavailable(data.message)
-
-    return json.loads(data.profile_json), data.message
-
-
 # ---------------------------------------------------------------------------
-# Setter requests
+# Camera controls
 # ---------------------------------------------------------------------------
-#
-# Each builder checks the page's payload in full before any provider is
-# called: a value that is not a finite number, a vector of the wrong length
-# or a mode the contract does not name is refused here.
-
-
-def _light_intensity(payload: dict):
-    return set_light_intensity.Request(
-        light_id=_name(payload, "light_id"),
-        value=_number(payload, "value"),
-    )
-
-
-def _light_color(payload: dict):
-    return set_light_color.Request(
-        light_id=_name(payload, "light_id"),
-        color=_vector(payload, "color", 3),
-    )
-
-
-def _light_position(payload: dict):
-    return set_light_position.Request(
-        light_id=_name(payload, "light_id"),
-        position=_vector(payload, "position", 3),
-    )
-
-
-def _light_direction(payload: dict):
-    return set_light_direction.Request(
-        light_id=_name(payload, "light_id"),
-        direction=_vector(payload, "direction", 3),
-    )
-
-
-def _light_cone(payload: dict):
-    return set_light_cone.Request(
-        light_id=_name(payload, "light_id"),
-        inner_angle=_number(payload, "inner_angle"),
-        outer_angle=_number(payload, "outer_angle"),
-    )
-
-
-def _light_orientation(payload: dict):
-    return set_light_orientation.Request(
-        light_id=_name(payload, "light_id"),
-        orientation=_vector(payload, "orientation", 4),
-    )
-
-
-# The lighting setters by the route the page posts to.
-_LIGHT_SETTERS = {
-    "intensity": (set_light_intensity, _light_intensity),
-    "color": (set_light_color, _light_color),
-    "position": (set_light_position, _light_position),
-    "direction": (set_light_direction, _light_direction),
-    "cone": (set_light_cone, _light_cone),
-    "orientation": (set_light_orientation, _light_orientation),
-}
-
-
-def _material_color(payload: dict):
-    return set_material_color.Request(
-        material_id=_name(payload, "material_id"),
-        color=_vector(payload, "color", 3),
-    )
-
-
-def _material_finish(payload: dict):
-    return set_material_finish.Request(
-        material_id=_name(payload, "material_id"),
-        metallic=_number(payload, "metallic"),
-        roughness=_number(payload, "roughness"),
-    )
-
-
-# The material setters by the route the page posts to.
-_MATERIAL_SETTERS = {
-    "color": (set_material_color, _material_color),
-    "finish": (set_material_finish, _material_finish),
-}
 
 
 @dataclass(frozen=True)
@@ -481,7 +379,7 @@ class _CameraControl:
     request: Callable[[ModuleType, dict], object]
 
     def service(self, kind: str) -> ModuleType:
-        return self.rgb if kind == "rgb" else self.rgbd
+        return getattr(self, kind)
 
 
 def _exposure(service: ModuleType, payload: dict):
@@ -675,8 +573,6 @@ _NODE_RUNNER = web.AppKey("node_runner", NodeRunner)
 _CAPABILITIES = web.AppKey("capabilities", _Capabilities)
 _CATALOGUE = web.AppKey("catalogue", _StateWatch)
 _OBJECT_STATE = web.AppKey("object_state", _StateWatch)
-_LIGHTING = web.AppKey("lighting", _StateWatch)
-_MATERIALS = web.AppKey("materials", _StateWatch)
 # One profile watch per bound camera, by camera id.
 _PROFILES = web.AppKey("profiles", dict)
 
@@ -714,15 +610,6 @@ async def _request_json(request: web.Request) -> dict:
         raise ValueError("JSON request body must be an object")
 
     return data
-
-
-def _position(payload: dict) -> list[float]:
-    position = payload.get("position")
-
-    if not isinstance(position, list) or len(position) != 3:
-        raise ValueError("position must be [x, y, z]")
-
-    return [float(value) for value in position]
 
 
 def _is_finite(value) -> bool:
@@ -775,22 +662,106 @@ def _name(payload: dict, key: str) -> str:
     return value
 
 
-def _lighting_producer(app: web.Application):
-    producer = app[_CAPABILITIES].lighting
+# ---------------------------------------------------------------------------
+# Panels: lighting and materials
+# ---------------------------------------------------------------------------
+#
+# The two panels share one shape, as the page's PANELS table has it: a
+# getter answering the targets as JSON, setters by the route the page posts
+# to, each naming the target by its id field and taking the fields its
+# parser checks, and a reset. Every payload is checked in full before any
+# provider is called: a value that is not a finite number, a vector of the
+# wrong length or a mode the contract does not name is refused here.
 
-    if producer is None:
-        raise CapabilityUnbound("lighting is not bound in this launch")
 
-    return producer
+def _vector3(payload: dict, key: str) -> list[float]:
+    return _vector(payload, key, 3)
 
 
-def _materials_producer(app: web.Application):
-    producer = app[_CAPABILITIES].materials
+def _vector4(payload: dict, key: str) -> list[float]:
+    return _vector(payload, key, 4)
 
-    if producer is None:
-        raise CapabilityUnbound("materials are not bound in this launch")
 
-    return producer
+@dataclass(frozen=True)
+class _Panel:
+    """One panel of the page: the capability slot it needs (a field of
+    _Capabilities, and the refusal when the launch left it vacant), what a
+    property belongs to in a refusal, the getter with the response field
+    carrying its JSON and the key listing its targets, the id field its
+    setters address a target by, the setters by route with the fields each
+    takes, the reset, and the watch logging whether the provider has the
+    state."""
+
+    name: str
+    unbound: str
+    owner: str
+    get: ModuleType
+    json_field: str
+    list_key: str
+    id_field: str
+    setters: dict[str, tuple[ModuleType, dict[str, Callable[[dict, str], object]]]]
+    reset: ModuleType
+    watch: web.AppKey
+
+    def producer(self, app: web.Application):
+        producer = getattr(app[_CAPABILITIES], self.name)
+
+        if producer is None:
+            raise CapabilityUnbound(self.unbound)
+
+        return producer
+
+    def request(self, route: str, payload: dict):
+        """The setter answering `route` and its request, built from the
+        page's payload: the target's id and every field the setter takes."""
+
+        service, fields = self.setters[route]
+        target = {self.id_field: _name(payload, self.id_field)}
+
+        return service, service.Request(
+            **target, **{key: parse(payload, key) for key, parse in fields.items()}
+        )
+
+
+_LIGHTING = web.AppKey("lighting", _StateWatch)
+_MATERIALS = web.AppKey("materials", _StateWatch)
+
+_PANELS = (
+    _Panel(
+        name="lighting",
+        unbound="lighting is not bound in this launch",
+        owner="lighting",
+        get=get_lighting,
+        json_field="lighting_json",
+        list_key="lights",
+        id_field="light_id",
+        setters={
+            "intensity": (set_light_intensity, {"value": _number}),
+            "color": (set_light_color, {"color": _vector3}),
+            "position": (set_light_position, {"position": _vector3}),
+            "direction": (set_light_direction, {"direction": _vector3}),
+            "cone": (set_light_cone, {"inner_angle": _number, "outer_angle": _number}),
+            "orientation": (set_light_orientation, {"orientation": _vector4}),
+        },
+        reset=reset_lighting,
+        watch=_LIGHTING,
+    ),
+    _Panel(
+        name="materials",
+        unbound="materials are not bound in this launch",
+        owner="material",
+        get=get_materials,
+        json_field="materials_json",
+        list_key="materials",
+        id_field="material_id",
+        setters={
+            "color": (set_material_color, {"color": _vector3}),
+            "finish": (set_material_finish, {"metallic": _number, "roughness": _number}),
+        },
+        reset=reset_materials,
+        watch=_MATERIALS,
+    ),
+)
 
 
 def _profile_producer(camera: _Camera):
@@ -892,7 +863,7 @@ async def _api_clear_scene(request: web.Request) -> web.Response:
 async def _api_spawn_object(request: web.Request) -> web.Response:
     try:
         payload = await _request_json(request)
-        payload["position"] = _position(payload)
+        payload["position"] = _vector(payload, "position", 3)
 
         result = await _action_spawn_object(request.app[_NODE_RUNNER], payload)
 
@@ -925,7 +896,7 @@ async def _api_apply_force(request: web.Request) -> web.Response:
 async def _api_move_object(request: web.Request) -> web.Response:
     try:
         payload = await _request_json(request)
-        payload["position"] = _position(payload)
+        payload["position"] = _vector(payload, "position", 3)
 
         result = await _action_move_object(request.app[_NODE_RUNNER], payload)
 
@@ -956,7 +927,7 @@ async def _api_move_robot(request: web.Request) -> web.Response:
 
         result = await _action_move_robot(
             request.app[_NODE_RUNNER],
-            _position(payload),
+            _vector(payload, "position", 3),
         )
 
     except Exception as exc:
@@ -986,16 +957,20 @@ async def _api_capabilities(request: web.Request) -> web.Response:
     )
 
 
-async def _api_lighting(request: web.Request) -> web.Response:
-    watch = request.app[_LIGHTING]
+async def _api_panel(panel: _Panel, request: web.Request) -> web.Response:
+    """The panel's targets as the provider lists them."""
+
+    watch = request.app[panel.watch]
 
     try:
-        lighting = await _fetch_lighting(
+        state, _ = await _fetch_json(
+            panel.get,
             request.app[_NODE_RUNNER],
-            _lighting_producer(request.app),
+            panel.producer(request.app),
+            panel.json_field,
         )
 
-        count = len(lighting["lights"])
+        count = len(state[panel.list_key])
 
     except CapabilityUnbound as exc:
         return _json_error(request, exc, status=404)
@@ -1013,29 +988,42 @@ async def _api_lighting(request: web.Request) -> web.Response:
 
     watch.ready(count)
 
-    return web.json_response({"success": True, "lighting": lighting})
+    return web.json_response({"success": True, panel.name: state})
 
 
-async def _api_set_lighting(request: web.Request) -> web.Response:
-    setter = _LIGHT_SETTERS.get(request.match_info["property"])
+async def _api_set_panel(panel: _Panel, request: web.Request) -> web.Response:
+    """One property of one target, posted to the setter's route."""
 
-    if setter is None:
+    route = request.match_info["property"]
+
+    if route not in panel.setters:
         return _json_error(
             request,
-            ValueError(f"unknown lighting property: {request.match_info['property']}"),
+            ValueError(f"unknown {panel.owner} property: {route}"),
             status=404,
         )
 
-    service, build = setter
-
     try:
-        payload = await _request_json(request)
+        producer = panel.producer(request.app)
+        service, built = panel.request(route, await _request_json(request))
 
+        data = await _call_service(service, request.app[_NODE_RUNNER], producer, built)
+
+    except CapabilityUnbound as exc:
+        return _json_error(request, exc, status=404)
+
+    except Exception as exc:
+        return _json_error(request, exc)
+
+    return web.json_response(_result(data))
+
+
+async def _api_reset_panel(panel: _Panel, request: web.Request) -> web.Response:
+    try:
         data = await _call_service(
-            service,
+            panel.reset,
             request.app[_NODE_RUNNER],
-            _lighting_producer(request.app),
-            build(payload),
+            panel.producer(request.app),
         )
 
     except CapabilityUnbound as exc:
@@ -1047,127 +1035,37 @@ async def _api_set_lighting(request: web.Request) -> web.Response:
     return web.json_response(_result(data))
 
 
-async def _api_reset_lighting(request: web.Request) -> web.Response:
+async def _describe_profile(app: web.Application, camera: _Camera) -> tuple[dict | None, str]:
+    """A camera's profile and the message it came with, or None and why
+    there is none: no profile bound for it, or the provider has none yet."""
+
+    watch = app[_PROFILES][camera.id]
+
     try:
-        data = await _call_service(
-            reset_lighting,
-            request.app[_NODE_RUNNER],
-            _lighting_producer(request.app),
+        profile, message = await _fetch_json(
+            get_camera_profile, app[_NODE_RUNNER], _profile_producer(camera), "profile_json"
         )
 
     except CapabilityUnbound as exc:
-        return _json_error(request, exc, status=404)
-
-    except Exception as exc:
-        return _json_error(request, exc)
-
-    return web.json_response(_result(data))
-
-
-async def _api_materials(request: web.Request) -> web.Response:
-    watch = request.app[_MATERIALS]
-
-    try:
-        materials = await _fetch_materials(
-            request.app[_NODE_RUNNER],
-            _materials_producer(request.app),
-        )
-
-        count = len(materials["materials"])
-
-    except CapabilityUnbound as exc:
-        return _json_error(request, exc, status=404)
+        return None, str(exc)
 
     except StateUnavailable as exc:
         watch.unavailable(str(exc))
 
-        return web.json_response(
-            {"success": False, "message": str(exc)},
-            status=503,
-        )
+        return None, str(exc)
 
-    except Exception as exc:
-        return _json_error(request, exc, status=500)
+    watch.ready(sum(1 for control in profile["controls"].values() if control.get("supported")))
 
-    watch.ready(count)
-
-    return web.json_response({"success": True, "materials": materials})
-
-
-async def _api_set_material(request: web.Request) -> web.Response:
-    setter = _MATERIAL_SETTERS.get(request.match_info["property"])
-
-    if setter is None:
-        return _json_error(
-            request,
-            ValueError(f"unknown material property: {request.match_info['property']}"),
-            status=404,
-        )
-
-    service, build = setter
-
-    try:
-        payload = await _request_json(request)
-
-        data = await _call_service(
-            service,
-            request.app[_NODE_RUNNER],
-            _materials_producer(request.app),
-            build(payload),
-        )
-
-    except CapabilityUnbound as exc:
-        return _json_error(request, exc, status=404)
-
-    except Exception as exc:
-        return _json_error(request, exc)
-
-    return web.json_response(_result(data))
-
-
-async def _api_reset_materials(request: web.Request) -> web.Response:
-    try:
-        data = await _call_service(
-            reset_materials,
-            request.app[_NODE_RUNNER],
-            _materials_producer(request.app),
-        )
-
-    except CapabilityUnbound as exc:
-        return _json_error(request, exc, status=404)
-
-    except Exception as exc:
-        return _json_error(request, exc)
-
-    return web.json_response(_result(data))
+    return profile, message
 
 
 async def _describe_camera(app: web.Application, camera: _Camera) -> dict:
     """One camera as the page lists it: its stream, and its profile when a
-    profile producer is bound for it and answers."""
+    profile producer is bound for it and answers. A stream the relay cannot
+    describe fails the camera before its profile is asked for."""
 
-    node_runner = app[_NODE_RUNNER]
-    info = await _fetch_stream_info(node_runner, camera)
-
-    if camera.profile is None:
-        profile = None
-        message = f"no camera profile is bound for {camera.id} in this launch"
-
-    else:
-        watch = app[_PROFILES][camera.id]
-
-        try:
-            profile, message = await _fetch_profile(node_runner, camera.profile)
-
-        except StateUnavailable as exc:
-            watch.unavailable(str(exc))
-            profile = None
-            message = str(exc)
-
-        else:
-            watch.ready(
-                sum(1 for control in profile["controls"].values() if control.get("supported"))
-            )
+    info = await _fetch_stream_info(app[_NODE_RUNNER], camera)
+    profile, message = await _describe_profile(app, camera)
 
     return {
         "id": camera.id,
@@ -1179,11 +1077,13 @@ async def _describe_camera(app: web.Application, camera: _Camera) -> dict:
 
 
 async def _api_cameras(request: web.Request) -> web.Response:
+    """Every bound camera, described together: one camera's round trips
+    never wait on another's."""
+
     try:
-        cameras = [
-            await _describe_camera(request.app, camera)
-            for camera in request.app[_CAPABILITIES].cameras
-        ]
+        cameras = await asyncio.gather(
+            *(_describe_camera(request.app, camera) for camera in request.app[_CAPABILITIES].cameras)
+        )
 
     except Exception as exc:
         return _json_error(request, exc, status=500)
@@ -2471,9 +2371,11 @@ function anyCapability() {
 }
 
 async function refreshPanels() {
-    if (capabilities.lighting) await refreshPanel(LIGHTING);
-    if (capabilities.materials) await refreshPanel(MATERIALS);
-    if (capabilities.cameras.length) await refreshCameras();
+    const refreshes = [];
+    if (capabilities.lighting) refreshes.push(refreshPanel(LIGHTING));
+    if (capabilities.materials) refreshes.push(refreshPanel(MATERIALS));
+    if (capabilities.cameras.length) refreshes.push(refreshCameras());
+    await Promise.all(refreshes);
 }
 
 async function startup() {
@@ -2535,12 +2437,10 @@ def _build_app(node_runner: NodeRunner) -> web.Application:
     app.router.add_post("/api/objects/move", _api_move_object)
     app.router.add_post("/api/objects/remove", _api_remove_object)
     app.router.add_post("/api/robot/move", _api_move_robot)
-    app.router.add_get("/api/lighting", _api_lighting)
-    app.router.add_post("/api/lighting/reset", _api_reset_lighting)
-    app.router.add_post("/api/lighting/{property}", _api_set_lighting)
-    app.router.add_get("/api/materials", _api_materials)
-    app.router.add_post("/api/materials/reset", _api_reset_materials)
-    app.router.add_post("/api/materials/{property}", _api_set_material)
+    for panel in _PANELS:
+        app.router.add_get(f"/api/{panel.name}", partial(_api_panel, panel))
+        app.router.add_post(f"/api/{panel.name}/reset", partial(_api_reset_panel, panel))
+        app.router.add_post(f"/api/{panel.name}/{{property}}", partial(_api_set_panel, panel))
     app.router.add_get("/api/cameras", _api_cameras)
     app.router.add_post("/api/cameras/{camera_id}/reset", _api_reset_camera)
     app.router.add_post("/api/cameras/{camera_id}/{control}", _api_set_camera)

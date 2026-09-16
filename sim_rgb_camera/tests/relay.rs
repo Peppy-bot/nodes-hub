@@ -27,7 +27,7 @@ const NO_CURRENT_VALUE: i32 = -1;
 /// The refusal the node answers on every control while the control slot is
 /// vacant, verbatim: a caller reads it to learn there is no model to adjust.
 const NO_RESPONSE_MODEL_MESSAGE: &str =
-    "not adjustable in this simulation: no camera response model is linked";
+    "no camera response model is linked: nothing to adjust, describe or reset";
 
 /// The profile the control mock describes the camera with; opaque to the
 /// relay, which must hand it over untouched.

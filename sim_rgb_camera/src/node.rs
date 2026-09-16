@@ -43,18 +43,12 @@ const RECEIVE_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 /// refusal carrying the timeout rather than a service that hangs.
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The refusal every control answers while the control slot is vacant: the
-/// launch linked this relay to a simulation without a camera response model,
-/// so there is nothing behind the controls to adjust.
+/// The refusal every forwarded call (a control, the profile, the reset)
+/// answers while the control slot is vacant: the launch linked this relay
+/// to a simulation without a camera response model, so there is nothing
+/// behind the controls to adjust, describe or reset.
 const NO_RESPONSE_MODEL_MESSAGE: &str =
-    "not adjustable in this simulation: no camera response model is linked";
-
-/// The refusal get_camera_profile answers while the control slot is vacant.
-const NO_PROFILE_MESSAGE: &str =
-    "no camera profile is available: no camera response model is linked";
-
-/// The refusal reset_camera answers while the control slot is vacant.
-const NO_RESET_MESSAGE: &str = "nothing to reset: no camera response model is linked";
+    "no camera response model is linked: nothing to adjust, describe or reset";
 
 /// The refusal every control and profile call answers while the simulation
 /// pairing is not established: the camera slot a forwarded request must name
@@ -159,14 +153,13 @@ impl ControlRoute {
     fn forward<T, Fut>(
         &self,
         bound: Option<&ProducerRef>,
-        vacant_message: &str,
         call: impl FnOnce(String, ProducerRef) -> Fut,
     ) -> Forwarded<T>
     where
         Fut: Future<Output = Result<T>>,
     {
         let Some(target) = bound else {
-            return Err(vacant_message.to_string());
+            return Err(NO_RESPONSE_MODEL_MESSAGE.to_string());
         };
         let camera = camera_slot(&self.runner)?;
         match wait_for(call(camera, target.clone())) {
@@ -357,21 +350,21 @@ macro_rules! spawn_forwarding_service {
 /// One camera control forwarded to its response-model twin: the request's
 /// fields go through under the camera slot's name and the model's answer
 /// relays verbatim, success or not; a call that never reached the model
-/// answers false, the reason, and the no-value sentinel. `$reading` names the
-/// response's reading field, a temperature for white balance and a value for
-/// the rest.
+/// answers false and the reason. `$reading` names the response's reading
+/// field beside the fallback a refusal carries in it: a temperature for
+/// white balance, a value for the other controls, the profile JSON for
+/// get_camera_profile; reset_camera carries none.
 macro_rules! spawn_forwarding_control {
-    ($route:expr, $service:ident => $control:ident, [$($field:ident),+], $reading:ident) => {
+    ($route:expr, $service:ident => $control:ident, [$($field:ident),*] $(, $reading:ident = $fallback:expr)?) => {
         spawn_forwarding_service!(
             $route,
             $service,
-            |route: &ControlRoute, request: $service::Request| {
-                let data = request.data;
+            |route: &ControlRoute, _request: $service::Request| {
+                $(let $field = _request.data.$field;)*
                 let answer = route.forward(
                     $control::bound_producer(&route.runner),
-                    NO_RESPONSE_MODEL_MESSAGE,
                     |camera, target| async move {
-                        let request = $control::Request::new(camera, $(data.$field),+);
+                        let request = $control::Request::new(camera $(, $field)*);
                         $control::poll(&route.runner, &target, CONTROL_TIMEOUT, request)
                             .await
                             .map(|response| response.data)
@@ -379,60 +372,13 @@ macro_rules! spawn_forwarding_control {
                 );
                 match answer {
                     Ok(answer) => {
-                        $service::Response::new(answer.success, answer.message, answer.$reading)
+                        $service::Response::new(answer.success, answer.message $(, answer.$reading)?)
                     }
-                    Err(message) => $service::Response::new(false, message, NO_CURRENT_VALUE),
+                    Err(message) => $service::Response::new(false, message $(, $fallback)?),
                 }
             }
         )
     };
-}
-
-/// get_camera_profile forwards to describe_camera: the profile is the
-/// simulation's description of the device this camera stands for, so only
-/// the response model can give it.
-fn answer_get_camera_profile(
-    route: &ControlRoute,
-    _request: get_camera_profile::Request,
-) -> get_camera_profile::Response {
-    let answer = route.forward(
-        describe_camera::bound_producer(&route.runner),
-        NO_PROFILE_MESSAGE,
-        |camera, target| async move {
-            let request = describe_camera::Request::new(camera);
-            describe_camera::poll(&route.runner, &target, CONTROL_TIMEOUT, request)
-                .await
-                .map(|response| response.data)
-        },
-    );
-    match answer {
-        Ok(answer) => {
-            get_camera_profile::Response::new(answer.success, answer.message, answer.profile_json)
-        }
-        Err(message) => get_camera_profile::Response::new(false, message, String::new()),
-    }
-}
-
-/// reset_camera forwards to the response model's reset_camera, which puts
-/// every control of this camera back to its device defaults.
-fn answer_reset_camera(
-    route: &ControlRoute,
-    _request: reset_camera::Request,
-) -> reset_camera::Response {
-    let answer = route.forward(
-        control_reset_camera::bound_producer(&route.runner),
-        NO_RESET_MESSAGE,
-        |camera, target| async move {
-            let request = control_reset_camera::Request::new(camera);
-            control_reset_camera::poll(&route.runner, &target, CONTROL_TIMEOUT, request)
-                .await
-                .map(|response| response.data)
-        },
-    );
-    match answer {
-        Ok(answer) => reset_camera::Response::new(answer.success, answer.message),
-        Err(message) => reset_camera::Response::new(false, message),
-    }
 }
 
 /// The node's entry point: the exact closure `NodeBuilder::run` used to get,
@@ -455,18 +401,26 @@ pub async fn setup(_params: Parameters, node_runner: Arc<NodeRunner>) -> Result<
             video_stream_info::Response::new(d.width, d.height, d.frames_per_second, d.encoding)
         }
     );
-    spawn_forwarding_control!(route, set_exposure => set_camera_exposure, [mode, value], current_value);
+    spawn_forwarding_control!(route, set_exposure => set_camera_exposure, [mode, value], current_value = NO_CURRENT_VALUE);
     spawn_forwarding_control!(
         route,
         set_white_balance => set_camera_white_balance,
         [mode, temperature],
-        current_temperature
+        current_temperature = NO_CURRENT_VALUE
     );
-    spawn_forwarding_control!(route, set_gain => set_camera_gain, [value], current_value);
-    spawn_forwarding_control!(route, set_brightness => set_camera_brightness, [value], current_value);
-    spawn_forwarding_control!(route, set_contrast => set_camera_contrast, [value], current_value);
-    spawn_forwarding_service!(route, get_camera_profile, answer_get_camera_profile);
-    spawn_forwarding_service!(route, reset_camera, answer_reset_camera);
+    spawn_forwarding_control!(route, set_gain => set_camera_gain, [value], current_value = NO_CURRENT_VALUE);
+    spawn_forwarding_control!(route, set_brightness => set_camera_brightness, [value], current_value = NO_CURRENT_VALUE);
+    spawn_forwarding_control!(route, set_contrast => set_camera_contrast, [value], current_value = NO_CURRENT_VALUE);
+    // The profile is the simulation's description of the device this camera
+    // stands for, and the reset puts every control back to its defaults:
+    // both live with the response model, so both forward to it.
+    spawn_forwarding_control!(
+        route,
+        get_camera_profile => describe_camera,
+        [],
+        profile_json = String::new()
+    );
+    spawn_forwarding_control!(route, reset_camera => control_reset_camera, []);
 
     let frames = tokio::spawn(relay_frames(node_runner.clone(), token.clone()));
     let info = tokio::spawn(track_stream_info(
