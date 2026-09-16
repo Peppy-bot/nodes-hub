@@ -73,9 +73,9 @@
       // Required so the sim matches the real deployment it stands in for.
       hardware_version: "string",
       // Rate (Hz) of the measured-state streams (joint_states / gripper_states).
-      // On a launch that declares this simulation its source of simulated time, the
-      // same rate is how often the fleet's clock advances, so it also sets how
-      // finely every machine of that launch can read time.
+      // Where the deployment names this simulation its clock domain's
+      // publisher, the same rate is how often that domain advances, so it
+      // also sets how finely every instance bound to it can read time.
       state_rate_hz: "u32",
       // Run without a native viewer window (the deployment default). "Headless"
       // here means no local GUI window, not no viewer: this mode serves the
@@ -83,8 +83,8 @@
       // sim is watched in a deployment and the only viewer that works inside a
       // container.
       //
-      // Set false to open a native MuJoCo GLFW window instead — and note that
-      // mode serves no viser viewer, so nothing is reachable over the network.
+      // Set false to open a native MuJoCo GLFW window instead. That mode
+      // serves no viser viewer, so nothing is reachable over the network.
       // It also needs a display socket bound into the container and MUJOCO_GL
       // overridden off the apptainer.def default of egl. Neither applies on macOS, where peppy runs apptainer inside a Lima
       // VM with no display: keep headless true there and use the browser.

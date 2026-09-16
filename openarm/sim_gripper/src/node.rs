@@ -227,8 +227,8 @@ async fn publish_health(
 /// The node's entry point: the exact closure `NodeBuilder::run` used to get,
 /// named so the test harness can boot the node in-process.
 pub async fn setup(_params: Parameters, node_runner: Arc<NodeRunner>) -> Result<()> {
-    // Health timestamps read the daemon-resolved clock (sim time under a
-    // simulated clock), like every producer-side timestamp in the stack.
+    // Health timestamps read this instance's bound clock, like every
+    // producer-side timestamp in the stack.
     peppygen::clock::init(&node_runner).await?;
     let token = node_runner.cancellation_token().clone();
     // When the simulation last relayed a state. Readiness latches on the

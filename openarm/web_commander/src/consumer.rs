@@ -17,11 +17,11 @@ use crate::state::REJECT_WARN_PERIOD;
 /// subscription cannot hot-spin its task or flood the log.
 const RECEIVE_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
-/// The daemon-resolved time (sim time under a simulated clock), for judging
-/// a wire timestamp's age on the timeline it was written from. Errs until the
-/// clock resolves (in sim mode, until the first tick is observed).
+/// This instance's bound clock, for judging a wire timestamp's age on the
+/// timeline it was written from. Errs until the clock resolves: on a clock
+/// domain, until its first tick is observed.
 pub fn clock_now() -> Result<SystemTime, String> {
-    let ns = peppygen::clock::now_ns().map_err(|e| format!("daemon clock unavailable: {e}"))?;
+    let ns = peppygen::clock::now_ns().map_err(|e| format!("clock not ready: {e}"))?;
     Ok(SystemTime::UNIX_EPOCH + Duration::from_nanos(ns))
 }
 
