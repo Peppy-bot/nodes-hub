@@ -29,9 +29,9 @@ use tracing::{error, warn};
 use crate::owner::CommandFrame;
 use crate::state::Side;
 
-/// Pairing timestamp from the daemon-resolved clock (sim time under a simulated
-/// clock), so the backbone ages setpoints on the same timeline it reads.
-/// Errors until the clock delivers its first tick.
+/// Pairing timestamp from this instance's bound clock, so the backbone ages
+/// setpoints on the same timeline it reads. Errors until the clock delivers
+/// its first tick.
 fn pairing_timestamp() -> Result<SystemTime, String> {
     let ns = peppygen::clock::now_ns().map_err(|e| format!("clock not ready: {e}"))?;
     Ok(UNIX_EPOCH + Duration::from_nanos(ns))

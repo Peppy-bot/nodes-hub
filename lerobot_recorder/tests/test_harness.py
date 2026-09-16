@@ -175,8 +175,8 @@ async def test_boot_pairs_one_limb_and_refuses_goals_while_sources_are_silent(tm
         assert provenance["rgbd_cameras"] == []
 
 
-async def test_sim_time_gates_admission_until_the_test_ticks_the_clock(tmp_path):
-    """Booted under sim time the recorder reads the harness clock through
+async def test_a_driven_clock_gates_admission_until_the_test_ticks_it(tmp_path):
+    """Bound to the harness's clock domain the recorder reads it through
     `peppygen.clock`, so the clock-not-ready admission gate is exercised over
     the real wire: before the test publishes any instant a goal is refused
     with the node's own clock reason, and the first driven tick moves the
@@ -184,7 +184,7 @@ async def test_sim_time_gates_admission_until_the_test_ticks_the_clock(tmp_path)
     async with harness.start(
         setup,
         parameters=params(tmp_path),
-        use_sim_time=True,
+        clock="consumer",
         observed_joints_instances=1,
         commanded_joints_instances=1,
         color_cameras_instances=1,

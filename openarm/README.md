@@ -25,7 +25,7 @@ The third simulation, `waldo`, is published by the `private-nodes-hub` repositor
 The [launchers](https://github.com/Peppy-bot/launchers-hub)
 run robots as named copies: `simulation` runs one simulation and simulated
 robots, `fleet` any mix of physical and simulated ones. The simulations above pair with one
-simulated robot; physical robots join beside it in wall-time mode.
+simulated robot; physical robots join beside it on wall time.
 
 ## 1. Prerequisites
 

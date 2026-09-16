@@ -30,8 +30,8 @@ use tracing::{error, info, warn};
 use crate::frame::{FrameSet, Image};
 use crate::modes::{AlignMode, AutoManualMode, ColorFormat};
 
-/// Timestamp from the daemon-resolved clock: the OS clock in wall mode, the
-/// simulator's time when the stack runs under sim time. Requires
+/// Timestamp from this instance's bound clock: the OS clock under wall time,
+/// the domain's instant under a clock domain. Requires
 /// `peppygen::clock::init`, which setup runs before the capture loop spawns.
 fn timestamp_now() -> std::result::Result<SystemTime, String> {
     let ns = peppygen::clock::now_ns().map_err(|e| e.to_string())?;

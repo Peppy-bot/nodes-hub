@@ -76,8 +76,8 @@ fn main() -> Result<()> {
             depth_fps,
         );
 
-        // The synchronized clock stamping every emission: the OS clock in
-        // wall mode, the simulator's time under sim time.
+        // The clock stamping every emission: the OS clock under wall time,
+        // the domain's instant under a clock domain.
         peppygen::clock::init(&node_runner).await?;
 
         let capture = open(cfg)

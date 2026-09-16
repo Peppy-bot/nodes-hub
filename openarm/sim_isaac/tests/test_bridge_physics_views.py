@@ -120,8 +120,8 @@ def test_each_state_tick_publishes_the_object_snapshot_it_captured(bridge):
     # A tick without a snapshot publishes none; the clock goes out ahead of
     # the state it stamps.
     bridge._io.publish_object_states.assert_called_once_with(captured)
-    assert [name for name, _, _ in bridge._io.mock_calls if name in ("publish_sim_time", "publish_object_states")] == [
-        "publish_sim_time", "publish_object_states", "publish_sim_time",
+    assert [name for name, _, _ in bridge._io.mock_calls if name in ("publish_clock_tick", "publish_object_states")] == [
+        "publish_clock_tick", "publish_object_states", "publish_clock_tick",
     ]
 
 

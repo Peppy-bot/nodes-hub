@@ -151,8 +151,8 @@ pub async fn setup(params: Parameters, node_runner: Arc<NodeRunner>) -> Result<(
 }
 
 async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResult {
-    // Pairing timestamps read the daemon-resolved clock (sim time under a
-    // simulated clock), so state consumers age samples on one timeline.
+    // Pairing timestamps read this instance's bound clock, so state
+    // consumers age samples on one timeline.
     peppygen::clock::init(&node_runner).await?;
 
     let gripper_id = params.gripper_id;

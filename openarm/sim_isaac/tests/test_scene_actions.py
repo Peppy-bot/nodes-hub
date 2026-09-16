@@ -214,7 +214,7 @@ def _assert_unavailable(response, reason):
 def test_object_state_is_unavailable_with_a_reason_until_a_stamped_capture(provider):
     _assert_unavailable(provider.io._handle_get_object_states(None), "has not captured its object state yet")
 
-    # A time source that has not stepped cannot stamp: no snapshot, no read.
+    # A publisher that has not stepped cannot stamp: no snapshot, no read.
     provider.stamps.now_s = None
     assert provider.io.capture_object_states() is None
     provider.io.process_pending(provider.launcher)

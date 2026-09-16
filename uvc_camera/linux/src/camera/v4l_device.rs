@@ -58,8 +58,8 @@ const OVERFLOW_GID: u32 = 65534;
 /// runtime (the loopback integration tests) can use the wall clock directly.
 pub type TimestampSource = fn() -> Result<SystemTime>;
 
-/// Timestamp from the daemon-resolved clock: the OS clock in wall mode, the
-/// simulator's time when the stack runs under sim time. Requires
+/// Timestamp from this instance's bound clock: the OS clock under wall time,
+/// the domain's instant under a clock domain. Requires
 /// `peppygen::clock::init` to have run, which setup does before the capture
 /// loop spawns.
 pub fn clock_timestamp() -> Result<SystemTime> {

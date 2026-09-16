@@ -115,8 +115,8 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
     # cold-start stall.
     publisher = await video_stream.declare_publisher(node_runner)
 
-    # The synchronized clock stamping every emission: the OS clock in wall
-    # mode, the simulator's time under sim time.
+    # The clock stamping every emission: the OS clock under wall time, the
+    # domain's instant under a clock domain.
     await clock.init(node_runner)
 
     # Producer and consumer are decoupled through a small, drop-oldest queue
