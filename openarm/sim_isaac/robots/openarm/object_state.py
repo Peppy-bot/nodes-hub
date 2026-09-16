@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Object state of the objects spawned through scene_control, read on
+"""Object state of the objects spawned through scene_manipulation, read on
 Isaac's main thread.
 
 A snapshot is one capture of every spawned object, stamped on the timeline
@@ -18,7 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 # The stage root of runtime objects. The launcher spawns, moves and removes
-# each scene_control object at object_prim_path(object_id), the path the
+# each scene_manipulation object at object_prim_path(object_id), the path the
 # reader reads it from.
 RUNTIME_OBJECTS_PATH = "/World/RuntimeObjects"
 

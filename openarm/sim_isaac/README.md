@@ -224,10 +224,10 @@ python3 commander.py remove MyObject
 
 The USD path must be accessible from the running Isaac Sim container.
 
-Objects spawned through scene_control (`obj_...` ids) belong to it: the
+Objects spawned through scene_manipulation (`obj_...` ids) belong to it: the
 commander refuses to `spawn`, `spawn-isaac` or `remove` one of those names, and
 the node logs the refusal as a failed runtime command. Remove or replace them
-through scene_control, which keeps their object state; `move` stays allowed.
+through scene_manipulation, which keeps their object state; `move` stays allowed.
 
 ## Isaac Sim Environments
 
