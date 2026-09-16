@@ -1,0 +1,98 @@
+// openarm_ai_brain_vla: the OpenArm implementer of item_perception and
+// item_manipulation, the contracts that scan for items, find one, pick it
+// up, and put it down. This manifest claims every member of both and depends on
+// limb_motion, the backbone's discrete arm and gripper moves; the launcher
+// binds that slot to the instance that governs the arms, so any move sent
+// through it is collision governed on the way down. The node boots and
+// reports health; it registers no handler for any of the members it claims.
+{
+  peppy_schema: "node/v1",
+  manifest: {
+    name: "openarm_ai_brain_vla",
+    tag: "v1",
+    implements: [
+      { name: "item_perception", tag: "v1", link_id: "item_perception" },
+      { name: "item_manipulation", tag: "v1", link_id: "item_manipulation" },
+    ],
+    depends_on: {
+      contracts: [
+        { name: "limb_motion", tag: "v1", link_id: "limb_motion" },
+        // The camera the brain looks through: colour and depth from one
+        // rgbd producer, so a detection's pixel becomes a world position
+        // through the depth at that pixel and the camera model below.
+        // Optional: without a camera the brain still serves every member,
+        // and both searches are refused with "no perception source".
+        { name: "rgbd_camera", tag: "v1", link_id: "camera", cardinality: "zero_or_one" },
+      ],
+    },
+  },
+  interfaces: {
+    actions: {
+      exposes: [
+        { link_id: "item_perception", name: "scan_items" },
+        { link_id: "item_perception", name: "identify_item" },
+        { link_id: "item_manipulation", name: "grab_item" },
+        { link_id: "item_manipulation", name: "drop_item" },
+        { link_id: "item_manipulation", name: "place_item" },
+        { link_id: "item_manipulation", name: "abort" },
+      ],
+      consumes: [
+        { link_id: "limb_motion", name: "move_arm" },
+        { link_id: "limb_motion", name: "move_gripper" },
+      ],
+    },
+    topics: {
+      consumes: [
+        { link_id: "camera", name: "video_stream" },
+        { link_id: "camera", name: "depth_stream" },
+      ],
+    },
+    services: {
+      exposes: [
+        { link_id: "item_manipulation", name: "get_state" },
+      ],
+      consumes: [
+        { link_id: "camera", name: "depth_stream_info" },
+      ],
+    },
+  },
+  execution: {
+    language: "python",
+    container: {
+      def_file: "apptainer.def",
+    },
+    parameters: {
+      // The grippers this instance serves, comma separated and in the order
+      // get_state reports them (e.g. "left_gripper,right_gripper"). They are
+      // the names limb_motion addresses, so the launcher names the set the
+      // robot actually has rather than the node assuming a pair.
+      gripper_names: "string",
+      // Which perception backend serves scan_items and identify_item, by the
+      // name it is registered under in the node's perception registry.
+      // "none" runs no model: every search is refused with "no perception
+      // source", which is what the contract asks for when the brain cannot
+      // see. A launcher selects a model per launch without a code change.
+      perception_backend: { $type: "string", $default: "none" },
+      // The model identifier the perception backend loads (a weights name
+      // or path); its meaning belongs to the backend. Empty is the
+      // backend's default.
+      perception_model: { $type: "string", $default: "" },
+      // Which manipulation backend runs grab_item, drop_item and place_item.
+      // "none" moves nothing: every sequence is refused with a message
+      // naming the missing backend, while abort and get_state still work.
+      manipulation_backend: { $type: "string", $default: "none" },
+      // The camera model, which the camera contracts do not carry: what
+      // turns a pixel and its depth into a world position. Vertical field
+      // of view of the colour stream, degrees.
+      camera_fovy_deg: { $type: "f64", $default: 52.0 },
+      // Pose of the camera's optical frame in the world frame limb_motion
+      // uses, as "x y z qx qy qz qw" (meters, unit quaternion), the camera
+      // looking along its -Z with +Y up. The default is the OpenArm v2 chest
+      // camera with the robot mounted at the world origin, from the
+      // engines' config/cameras.json5. A camera that moves with an arm needs
+      // the arm pose at capture time instead, which this parameter cannot
+      // express: the brain reads a fixed camera.
+      camera_pose: { $type: "string", $default: "0.065 0.0315 0.8218 0.1710647 -0.1710647 -0.6861027 0.6861027" },
+    },
+  },
+}
