@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// Timestamp from the daemon-resolved clock; identical to the OS clock in wall
-/// mode, the simulator's time under sim time.
+/// Timestamp from this instance's bound clock: the OS clock under wall time,
+/// the domain's instant under a clock domain.
 fn timestamp_now() -> Result<SystemTime> {
     let ns = peppygen::clock::now_ns()?;
     Ok(UNIX_EPOCH + Duration::from_nanos(ns))
@@ -233,8 +233,8 @@ fn main() -> Result<()> {
 
             spawn_control_acks(&node_runner);
 
-            // The synchronized clock stamping every emission: the OS clock in
-            // wall mode, the simulator's time under sim time.
+            // The clock stamping every emission: the OS clock under wall
+            // time, the domain's instant under a clock domain.
             peppygen::clock::init(&node_runner).await?;
 
             // Long running tasks should always be spawned in a different thread

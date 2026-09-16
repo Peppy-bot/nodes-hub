@@ -236,8 +236,8 @@ class IsaacBridgeExtension:
         if not self._state_pacer.take_if_due(time.monotonic()):
             return
         # Published before the state it stamps; a stopped timeline stops the
-        # fleet's time with it.
-        self._io.publish_sim_time()
+        # domain's clock with it.
+        self._io.publish_clock_tick()
         self._publish_state()
 
     def _engine_time_s(self) -> float:
