@@ -39,17 +39,17 @@
         // Upstream: the exclusive command loop with the one leading node.
         // Optional: action-only sessions boot with these unbound.
         // Subscribed only under upstream_mode "joints".
-        { name: "joint_link", tag: "v1", role: "follower", link_id: "leader_arm", optional: true },
+        { name: "joint_link", tag: "v1", role: "follower", link_id: "leader_arm", cardinality: "zero_or_one" },
         // The Cartesian alternative: a world-frame end-effector pose streams
         // in and the measured pose relays back. Subscribed only under
         // upstream_mode "pose".
-        { name: "pose_link", tag: "v1", role: "follower", link_id: "leader_pose", optional: true },
-        { name: "gripper_link", tag: "v1", role: "follower", link_id: "leader_gripper", optional: true },
+        { name: "pose_link", tag: "v1", role: "follower", link_id: "leader_pose", cardinality: "zero_or_one" },
+        { name: "gripper_link", tag: "v1", role: "follower", link_id: "leader_gripper", cardinality: "zero_or_one" },
         // Downstream: the exclusive command loops with the follower. The
         // slots scope both directions, so no id demux and no other producer
         // can pose as the arm.
-        { name: "joint_link", tag: "v1", role: "leader", link_id: "arm_link", optional: true },
-        { name: "gripper_link", tag: "v1", role: "leader", link_id: "gripper_link", optional: true },
+        { name: "joint_link", tag: "v1", role: "leader", link_id: "arm_link", cardinality: "zero_or_one" },
+        { name: "gripper_link", tag: "v1", role: "leader", link_id: "gripper_link", cardinality: "zero_or_one" },
       ],
     },
   },

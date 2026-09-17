@@ -27,7 +27,7 @@
         // and the measured state streams back, both scoped to the pair (no
         // arm_id demux). Optional: the arm boots and holds with no backbone paired,
         // and the pair is established at the backbone's start (launcher `links:`).
-        { name: "joint_link", tag: "v1", role: "follower", link_id: "backbone", optional: true },
+        { name: "joint_link", tag: "v1", role: "follower", link_id: "backbone", cardinality: "zero_or_one" },
       ],
     },
   },
