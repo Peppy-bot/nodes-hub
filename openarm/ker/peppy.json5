@@ -1,13 +1,14 @@
-// openarm_ker: commander entry point driven by the OpenArm KER (Kinematic
+// openarm_ker: the commander driven by the OpenArm KER (Kinematic
 // Equivalent Replica), enactic's motorless bimanual leader arm. Reads the
 // KER's encoder frames from its M5Stack CoreS3 over USB vendor mode (or
-// serial CDC), maps the channels to per-side joint radians and the triggers
-// to gripper opening fractions, and streams both to the backbone over the
+// serial CDC), maps the channels to per-side joint radians and commanded
+// gripper openings, and streams both to the backbone over the
 // joint_link / gripper_link pairings exactly like openarm_web_commander (the
-// backbone governs everything before it reaches a follower). Each arm engages
-// on its first trigger squeeze and then tracks the KER; for an unengaged arm,
-// a stale KER, or a disconnected one the node emits nothing and those limbs
-// hold at their last setpoints.
+// backbone governs everything before it reaches a follower). An arm engages
+// when its trigger is squeezed to engage_trigger_opening, having read back
+// above it first, and then tracks the KER; for an unengaged arm, a stale KER,
+// or a disconnected one the node emits nothing and those limbs hold at their
+// last setpoints.
 // KER's joint structure matches OpenArm v2 1:1 (links scaled to 70%), so no
 // coordinate transform is involved; v1 followers accept the same joint-space
 // stream but are not geometrically equivalent.
@@ -48,15 +49,12 @@
     language: "rust",
     container: {
       def_file: "apptainer.def",
-      // The CDC device the serial transport opens; the USB transport reads the
-      // vendor-mode device through the shared /dev.
-      mount_paths: [
-        "${parameters:device_path}:${parameters:device_path}:rw",
-      ],
     },
     parameters: {
       // "usb" reads the M5Stack in vendor mode (VID 0x303A, PID 0x4002, bulk
-      // endpoints); "serial" reads its CDC device at device_path/serial_baud.
+      // endpoints), which is what enactic's released firmware streams.
+      // "serial" reads a CDC device at device_path/serial_baud, which a
+      // firmware built without USE_USB streams instead.
       transport: { $type: "string", $default: "usb" },
       device_path: { $type: "string", $default: "/dev/openarm/ker" },
       serial_baud: { $type: "u32", $default: 2000000 },
@@ -68,18 +66,18 @@
       command_rate_hz: "u32",
       // Engage an arm when its trigger opening (1 released, 0 fully squeezed)
       // reaches this value or below; a smaller value demands a deeper squeeze.
-      // The trigger must read open once before it engages, so a device
-      // returning under a held trigger stays put. From the engaging frame the
-      // arm and its gripper track the KER. That same squeeze commands the
-      // gripper, so an arm engages with its gripper near shut. Required: how
-      // deep a squeeze starts motion is a deployment choice.
-      engage_opening: "f64",
+      // The trigger must first read back above this value for a few frames, so
+      // a device returning under a held trigger stays put. From the engaging
+      // frame the arm and its gripper track the KER. That same squeeze
+      // commands the gripper, so an arm engages with its gripper near shut.
+      // Required: how deep a squeeze starts motion is a deployment choice.
+      engage_trigger_opening: "f64",
       // Opening commanded at a released trigger; a squeeze spans [0, this].
       gripper_open_fraction: { $type: "f64", $default: 1.0 },
       // Stop publishing when the newest KER frame is older than this (s); the
       // followers then hold their last setpoints. A frame arriving after a gap
-      // this long also disengages both arms. Must exceed the device's frame
-      // period (the KER streams at 1 kHz) and the command period.
+      // this long also disengages both arms. Refused below 0.005, which is the
+      // room a 1 kHz stream needs.
       stale_timeout_s: { $type: "f64", $default: 0.25 },
       // Bring-up aid: log the raw channel table (degrees, unmapped) at 1 Hz.
       log_raw: { $type: "bool", $default: false }

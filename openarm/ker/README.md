@@ -9,43 +9,49 @@ clamped joint radians and gripper openings, and streams them exactly like
 `openarm_web_commander`: each limb on its own joint_link / gripper_link pairing
 slot (the backbone governs them all).
 
-An arm engages when its trigger is squeezed to `engage_opening` or deeper,
-having read open at least once first, so a device returning under a held
-trigger never resumes motion. From that frame the arm and its gripper track
-the KER.
+An arm engages when its trigger is squeezed to `engage_trigger_opening` or
+deeper, having first read back above it for a few frames, so a device
+returning under a held trigger never resumes motion. From that frame the arm
+and its gripper track the KER, and releasing the trigger keeps it tracking.
 
 The trigger drives the gripper too: released commands `gripper_open_fraction`,
 a full squeeze closes it, and the squeeze that engages an arm therefore
 commands its gripper near shut. Releasing the trigger opens that gripper and
 leaves the arm tracking.
 
-To stop, unplug the KER or stop the stack. Frames arriving after a gap of
-`stale_timeout_s` disengage both arms, and while no frames arrive the node
-publishes nothing, so every consumer's stream timeout holds the robot. After
-that, release a trigger and squeeze it again to re-engage.
+To stop, unplug the KER, or stop the copy running it: `peppy stack remove
+<copy>` for one robot, `peppy stack reset` for everything. Frames arriving
+after a gap of `stale_timeout_s` disengage both arms, and while no frames
+arrive the node publishes nothing, so every consumer's stream timeout holds
+the robot. After that, release a trigger and squeeze it again to re-engage.
 
 ## Connect
 
-Plug the KER's M5Stack CoreS3 into a USB port with a data cable. Its screen
-lights up and shows the channel bar chart. `lsusb -d 303a:` then lists it:
+Plug the KER's M5Stack CoreS3 into a USB port with a data cable, and switch
+the controller on. `lsusb -d 303a:` then lists one device:
 
-    Bus 001 Device 027: ID 303a:4002 Enactic, Inc. OpenArm KER 2.0.0
+- `303a:4002` is vendor mode, which enactic's released firmware streams and
+  this node reads by default.
+- `303a:1001` is the ESP32's own USB serial device, which the controller
+  shows while its firmware is being flashed. A firmware built without
+  `USE_USB` streams over that device instead, which is what
+  `transport: "serial"` reads.
 
-`303a:4002` is vendor mode, which this node reads by default. `303a:1001` is
-the CDC device, which appears while the firmware is being flashed and which
-`transport: "serial"` reads.
+Apptainer shares the host `/dev`, so the container reaches whichever device
+the rule below covers without any bind of its own.
 
 ## Host setup (once)
 
 Install [the KER udev rule](https://github.com/Peppy-bot/launchers-hub/blob/main/openarm/rules/60-openarm-ker.rules)
-from launchers-hub, following its header. Without it the node reports the
-device as attached but unopenable, once per reconnect attempt.
+from launchers-hub, following its header. Without it the node logs "KER
+connection lost (open: ... attached but cannot be opened ...)" once and
+retries every second, logging again only when the reason changes.
 
-Verify the link with enactic's CLI, whose pip package `openarm_ker` is
-theirs, unrelated to this node:
+Verify the link with enactic's CLI. They ship it on PyPI as `openarm_ker`,
+the same name as this node and no relation to it, and it runs without being
+installed:
 
-    uv pip install openarm_ker
-    openarm-ker-cli ping
+    uvx --from openarm_ker openarm-ker-cli ping
 
 It prints the firmware and hardware versions. Stop this node first: it claims
 the USB interface exclusively, so the two cannot read the device at once.

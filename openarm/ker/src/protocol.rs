@@ -34,6 +34,12 @@ const KEY_LEN: usize = 16;
 const FIELD_ENTRY_LEN: usize = KEY_LEN + 2;
 /// header + metadata strings + field count
 const PING_FIXED_LEN: usize = 2 + FW_LEN + HW_LEN + UPDATED_LEN + 1;
+/// The longest response the device can describe: every field a `u8` count
+/// can name.
+pub const MAX_PING_RESPONSE_LEN: usize = PING_FIXED_LEN + u8::MAX as usize * FIELD_ENTRY_LEN;
+/// The field every stream packet carries, and the one a candidate response
+/// must name to be one.
+const REQUIRED_FIELD: &str = "angles";
 
 /// What one candidate header position turned out to be.
 enum Candidate {
@@ -138,20 +144,17 @@ impl Schema {
     /// still found.
     pub fn parse_ping(buf: &[u8]) -> PingParse {
         let mut from = 0;
-        loop {
-            let Some(offset) = find_header(&buf[from..], PING_HEADER) else {
-                return PingParse::NeedMore;
-            };
+        while let Some(offset) = find_header(&buf[from..], PING_HEADER) {
             let start = from + offset;
-            match Self::parse_at(buf, start) {
-                Candidate::Parsed { schema, consumed } => {
-                    return PingParse::Parsed { schema, consumed };
-                }
-                // Undecidable until more bytes arrive, so the whole scan waits.
-                Candidate::NeedMore => return PingParse::NeedMore,
-                Candidate::NotAResponse => from = start + 1,
+            // A candidate that overruns the buffer is undecidable, and a
+            // complete response can sit inside the length it claims, so the
+            // scan carries on past both it and outright noise.
+            if let Candidate::Parsed { schema, consumed } = Self::parse_at(buf, start) {
+                return PingParse::Parsed { schema, consumed };
             }
+            from = start + 1;
         }
+        PingParse::NeedMore
     }
 
     /// Read one candidate response at `start`.
@@ -182,6 +185,12 @@ impl Schema {
                 count: entry[KEY_LEN + 1] as usize,
             });
         }
+        // Stream payload carrying the header parses this far whenever its
+        // field bytes happen to read as a table, including an empty one, so
+        // the required field is what tells a response from noise.
+        if !fields.iter().any(|field| field.key == REQUIRED_FIELD) {
+            return Candidate::NotAResponse;
+        }
         Candidate::Parsed {
             schema: Schema {
                 metadata: Metadata {
@@ -199,27 +208,24 @@ impl Schema {
 /// One decoded stream packet, still device-shaped: raw channels in degrees.
 #[derive(Debug, PartialEq)]
 pub struct KerFrame {
-    pub timestamp: u32,
     /// All encoder channels (deg), CH01 at index 0.
     pub angles_deg: Vec<f32>,
 }
 
 /// Byte offsets of the fields this node consumes, resolved from a [`Schema`]
-/// once at handshake. `angles` is required; `timestamp` decodes to 0 when the
-/// schema lacks it, and every other field is skipped by its packed size.
+/// once at handshake. `angles` is required; every other field the device
+/// streams is skipped by its packed size.
 #[derive(Debug)]
 pub struct FrameLayout {
     payload_len: usize,
     angles_at: usize,
     angle_count: usize,
-    timestamp_at: Option<usize>,
 }
 
 impl FrameLayout {
     pub fn try_new(schema: &Schema) -> Result<Self, ProtocolError> {
         let mut offset = 0;
         let mut angles = None;
-        let mut timestamp_at = None;
         for field in &schema.fields {
             match (field.key.as_str(), field.ty) {
                 ("angles", FieldType::F32) => angles = Some((offset, field.count)),
@@ -229,19 +235,15 @@ impl FrameLayout {
                         expected: "f32",
                     });
                 }
-                ("timestamp", FieldType::U32) if field.count == 1 => {
-                    timestamp_at = Some(offset);
-                }
                 _ => {}
             }
             offset += field.ty.size() * field.count;
         }
-        let (angles_at, angle_count) = angles.ok_or(ProtocolError::MissingField("angles"))?;
+        let (angles_at, angle_count) = angles.ok_or(ProtocolError::MissingField(REQUIRED_FIELD))?;
         Ok(Self {
             payload_len: offset,
             angles_at,
             angle_count,
-            timestamp_at,
         })
     }
 
@@ -270,14 +272,7 @@ impl FrameLayout {
                 f32::from_le_bytes(payload[at..at + 4].try_into().expect("4 bytes"))
             })
             .collect();
-        let timestamp = self
-            .timestamp_at
-            .map(|at| u32::from_le_bytes(payload[at..at + 4].try_into().expect("4 bytes")))
-            .unwrap_or(0);
-        KerFrame {
-            timestamp,
-            angles_deg,
-        }
+        KerFrame { angles_deg }
     }
 }
 
@@ -308,6 +303,13 @@ impl Deframer {
 
     pub fn push(&mut self, bytes: &[u8]) {
         self.buf.extend_from_slice(bytes);
+    }
+
+    /// Bytes held back for a packet that has yet to complete, which is what
+    /// proves garbage cannot accumulate.
+    #[cfg(test)]
+    pub(crate) fn buffered(&self) -> usize {
+        self.buf.len()
     }
 
     /// The next payload, `Some(Err)` for a corrupt frame, or `None` when no
@@ -456,6 +458,37 @@ mod tests {
     }
 
     #[test]
+    fn a_false_ping_header_reading_as_an_empty_table_is_skipped() {
+        // Zero bytes are the common case in stream payload: a released
+        // channel, a zero encoder value, a small timestamp's high bytes. A
+        // candidate whose field count reads 0 carries no angles, so it is
+        // payload, not a response.
+        let mut buf = PING_HEADER.to_vec();
+        buf.extend([0x00; PING_FIXED_LEN * 2]);
+        let response = ping_response(16);
+        buf.extend(&response);
+        let PingParse::Parsed { schema, consumed } = Schema::parse_ping(&buf) else {
+            panic!("expected the real response to parse");
+        };
+        assert_eq!(schema.metadata.hardware, "2.0.0");
+        assert_eq!(consumed, buf.len());
+    }
+
+    #[test]
+    fn a_candidate_claiming_more_bytes_than_arrived_does_not_hide_a_response() {
+        // A false header whose count byte claims a long table is undecidable
+        // on its own; the complete response behind it must still be found.
+        let mut buf = PING_HEADER.to_vec();
+        buf.push(0xFF);
+        buf.extend([0x01; PING_FIXED_LEN]);
+        buf.extend(ping_response(16));
+        let PingParse::Parsed { schema, .. } = Schema::parse_ping(&buf) else {
+            panic!("expected the real response to parse");
+        };
+        assert_eq!(schema.metadata.hardware, "2.0.0");
+    }
+
+    #[test]
     fn a_false_ping_header_in_stream_bytes_is_skipped() {
         // Stream payload that happens to carry the ping header, with a type id
         // the schema never uses: the response behind it must still be found.
@@ -495,7 +528,6 @@ mod tests {
         assert_eq!(
             layout.parse(&payload),
             KerFrame {
-                timestamp: 7,
                 angles_deg: vec![10.0, -20.5, 30.25],
             }
         );
@@ -550,7 +582,6 @@ mod tests {
         let layout = layout_of(&schema);
         let frame = layout.parse(&[0, 0, 128, 63, 0, 0, 0, 64]);
         assert_eq!(frame.angles_deg, vec![1.0, 2.0]);
-        assert_eq!(frame.timestamp, 0);
     }
 
     #[test]
@@ -631,8 +662,6 @@ mod tests {
         assert_eq!(
             layout.parse(&delivered),
             KerFrame {
-                // Absent from this schema, so it decodes to the documented default.
-                timestamp: 0,
                 angles_deg: vec![1.5, -2.5],
             }
         );
@@ -665,7 +694,7 @@ mod tests {
         deframer.push(&stream_packet(2, &[3.0, 4.0], 0, false));
         assert_eq!(deframer.next_payload(), Some(Err(BadChecksum)));
         let payload = deframer.next_payload().expect("frame").expect("valid");
-        assert_eq!(layout.parse(&payload).timestamp, 2);
+        assert_eq!(layout.parse(&payload).angles_deg, vec![3.0, 4.0]);
     }
 
     #[test]
@@ -675,10 +704,10 @@ mod tests {
         let mut deframer = Deframer::new(layout.payload_len());
         deframer.push(&[0x00, 0xA5, 0x00, 0xFF]);
         assert!(deframer.next_payload().is_none());
-        assert!(deframer.buf.is_empty(), "garbage must not accumulate");
+        assert_eq!(deframer.buffered(), 0, "garbage must not accumulate");
         deframer.push(&stream_packet(3, &[0.5, -0.5], 9, true));
         let payload = deframer.next_payload().expect("frame").expect("valid");
-        assert_eq!(layout.parse(&payload).timestamp, 3);
+        assert_eq!(layout.parse(&payload).angles_deg, vec![0.5, -0.5]);
     }
 
     #[test]

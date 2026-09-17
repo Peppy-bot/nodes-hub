@@ -13,6 +13,7 @@
 // would leave Right permanently second (zenoh publish resolves synchronously),
 // so independent tasks avoid that bias.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -25,8 +26,8 @@ use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 use tracing::warn;
 
-use crate::label;
 use crate::reader::KerSample;
+use crate::side::label;
 
 /// Pairing timestamp from the daemon-resolved clock, so the backbone ages
 /// setpoints on the same timeline it reads. Errors until the clock delivers
@@ -90,7 +91,7 @@ pub async fn run(
         // velocity feedforward over the governed stream.
         let sample_rx = rx.clone();
         tasks.spawn(stream_setpoints(
-            arm_pub,
+            publish_with(arm_pub),
             command_period,
             token.clone(),
             format!("{} arm", label(side)),
@@ -107,7 +108,7 @@ pub async fn run(
         // preference) leaves the follower's ceiling in charge.
         let sample_rx = rx.clone();
         tasks.spawn(stream_setpoints(
-            gripper_pub,
+            publish_with(gripper_pub),
             command_period,
             token.clone(),
             format!("{} gripper", label(side)),
@@ -139,17 +140,31 @@ fn streamable(
     (sample.engaged.side(side) && sample.received_at.elapsed() < stale_timeout).then_some(sample)
 }
 
+/// A send for one pairing slot's publisher, so the stream loop can be driven
+/// without one in a test.
+fn publish_with(publisher: TopicPublisher) -> impl Fn(Payload) -> BoxFuture<Result<(), String>> {
+    move |payload| {
+        let publisher = publisher.clone();
+        Box::pin(async move { publisher.publish(payload).await.map_err(|e| e.to_string()) })
+    }
+}
+
+type BoxFuture<T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>;
+
 // Publish the latest setpoint from `next_message` every `period`, skipping a
 // tick whenever it returns None. Failures latch so a stuck channel warns once,
 // not every tick. The period arrives already validated, so this side never
 // divides by a rate it has to trust.
-async fn stream_setpoints(
-    publisher: TopicPublisher,
+async fn stream_setpoints<M, S, F>(
+    send: S,
     period: Duration,
     token: CancellationToken,
     label: String,
-    mut next_message: impl FnMut() -> Option<Result<Payload, String>>,
-) {
+    mut next_message: impl FnMut() -> Option<Result<M, String>>,
+) where
+    S: Fn(M) -> F,
+    F: Future<Output = Result<(), String>>,
+{
     // interval (not sleep) so the publish cadence holds at the commanded rate
     // instead of drifting by the per-tick work time; Delay avoids a catch-up
     // burst after a scheduling hiccup.
@@ -167,7 +182,7 @@ async fn stream_setpoints(
             continue;
         };
         let result = match built {
-            Ok(msg) => publisher.publish(msg).await.map_err(|e| e.to_string()),
+            Ok(msg) => send(msg).await,
             Err(e) => Err(e),
         };
         match result {
@@ -182,11 +197,116 @@ async fn stream_setpoints(
 }
 
 #[cfg(test)]
+mod loop_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    const PERIOD: Duration = Duration::from_millis(5);
+    /// Ticks to let run before judging what was published.
+    const TICKS: u32 = 20;
+
+    #[tokio::test]
+    async fn a_tick_with_nothing_to_stream_is_skipped_and_the_stream_lives_on() {
+        let sent = Arc::new(AtomicUsize::new(0));
+        let asked = Arc::new(AtomicUsize::new(0));
+        let token = CancellationToken::new();
+
+        let stream = {
+            let (sent, asked, token) = (sent.clone(), asked.clone(), token.clone());
+            tokio::spawn(async move {
+                stream_setpoints(
+                    move |_: u8| {
+                        let sent = sent.clone();
+                        async move {
+                            sent.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        }
+                    },
+                    PERIOD,
+                    token,
+                    "test".to_string(),
+                    move || {
+                        // Only every third tick has something to stream, as a
+                        // disengaged arm does: the rest must skip, not end the
+                        // task and not repeat the last message.
+                        let tick = asked.fetch_add(1, Ordering::SeqCst);
+                        (tick % 3 == 2).then_some(Ok(1u8))
+                    },
+                )
+                .await
+            })
+        };
+
+        tokio::time::sleep(PERIOD * TICKS).await;
+        let asked_count = asked.load(Ordering::SeqCst);
+        let sent_count = sent.load(Ordering::SeqCst);
+        assert!(asked_count > 3, "the stream kept ticking: {asked_count}");
+        assert!(
+            sent_count < asked_count,
+            "skipped ticks publish nothing: {sent_count} of {asked_count}"
+        );
+        assert!(sent_count > 0, "ticks with a message publish");
+        assert!(
+            !stream.is_finished(),
+            "a skipped tick must not end the task"
+        );
+
+        token.cancel();
+        tokio::time::timeout(PERIOD * TICKS, stream)
+            .await
+            .expect("cancellation ends the task")
+            .expect("task");
+    }
+
+    #[tokio::test]
+    async fn a_failing_send_keeps_the_stream_running() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let token = CancellationToken::new();
+        let stream = {
+            let (attempts, token) = (attempts.clone(), token.clone());
+            tokio::spawn(async move {
+                stream_setpoints(
+                    move |_: u8| {
+                        let attempts = attempts.clone();
+                        async move {
+                            attempts.fetch_add(1, Ordering::SeqCst);
+                            Err("publisher is down".to_string())
+                        }
+                    },
+                    PERIOD,
+                    token,
+                    "test".to_string(),
+                    || Some(Ok(1u8)),
+                )
+                .await
+            })
+        };
+
+        tokio::time::sleep(PERIOD * TICKS).await;
+        assert!(
+            attempts.load(Ordering::SeqCst) > 1,
+            "a failed publish is retried on the next tick"
+        );
+        assert!(
+            !stream.is_finished(),
+            "a failing publisher must not end the task"
+        );
+        token.cancel();
+        tokio::time::timeout(PERIOD * TICKS, stream)
+            .await
+            .expect("cancellation ends the task")
+            .expect("task");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::time::Instant;
 
     use super::*;
-    use crate::reader::SideFlags;
+    use crate::side::SideFlags;
 
     const STALE: Duration = Duration::from_millis(250);
     const RIGHT_ONLY: SideFlags = SideFlags {

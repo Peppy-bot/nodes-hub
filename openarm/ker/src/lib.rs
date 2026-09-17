@@ -10,22 +10,13 @@
 
 #![forbid(unsafe_code)]
 
-use openarm_description::Side;
-
+mod engage;
 mod mapping;
 mod node;
 mod protocol;
 mod publish;
 mod reader;
+mod side;
 mod transport;
 
 pub use node::{NodeError, setup, task_failed};
-
-/// One arm's name for the operator log, the spelling every line in this node
-/// uses.
-pub(crate) fn label(side: Side) -> &'static str {
-    match side {
-        Side::Left => "left",
-        Side::Right => "right",
-    }
-}

@@ -12,10 +12,11 @@ use peppylib::datastore::{self, Encoding};
 use tokio::sync::watch;
 use tracing::{error, info, warn};
 
-use crate::mapping::{ChannelMap, GripperOpenFraction, GripperOpenFractionOutOfRange};
+use crate::engage::{EngageOpening, EngageOpeningOutOfRange};
+use crate::mapping::{GripperOpenFraction, GripperOpenFractionOutOfRange};
 use crate::publish;
-use crate::reader::{self, EngageOpening, ReaderConfig};
-use crate::transport::TransportConfig;
+use crate::reader::{self, ReaderConfig};
+use crate::transport::{TransportConfig, TransportError};
 
 const DATASTORE_TIMEOUT: Duration = Duration::from_secs(3);
 const LOCK_REMOVE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -25,6 +26,12 @@ const LOCK_KEY: &str = "openarm_ker_instance_lock";
 /// The fastest this node streams the leader's pose. The KER reference loop
 /// runs at 1 kHz; nothing downstream consumes faster.
 const MAX_RATE_HZ: u32 = 1_000;
+/// The shortest stale window that can hold a KER frame: the device streams at
+/// 1 kHz, so anything tighter ages every frame out on arrival. Both consumers
+/// of the window (the engage latch and the publisher) age against frame
+/// arrival, so this is the quantity that binds.
+const MIN_STALE_TIMEOUT_S: f64 = 0.005;
+const MIN_STALE_TIMEOUT_S_DURATION: Duration = Duration::from_millis(5);
 
 /// Latched when a task stopped on its own rather than in reaction to shutdown.
 static TASK_FAILED: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
@@ -47,24 +54,20 @@ pub enum NodeError {
     StaleTimeout(#[source] DurationError),
 
     #[error(
-        "stale_timeout_s {stale_timeout_s} is at or under the {command_rate_hz} Hz command \
-         period: a limb would age out between its own ticks. Raise stale_timeout_s above \
-         {command_period_s} s"
+        "stale_timeout_s {0} is under {MIN_STALE_TIMEOUT_S} s, the window a KER frame has to \
+         arrive in at the device's 1 kHz stream: every frame would read as stale and no arm \
+         would ever engage"
     )]
-    StaleTimeoutUnderCommandPeriod {
-        stale_timeout_s: f64,
-        command_rate_hz: u32,
-        command_period_s: f64,
-    },
+    StaleTimeoutUnderFramePeriod(f64),
 
     #[error(transparent)]
     HardwareVersion(#[from] openarm_description::UnknownHardwareVersion),
 
     #[error(transparent)]
-    Transport(#[from] crate::transport::TransportError),
+    Transport(#[from] TransportError),
 
     #[error(transparent)]
-    EngageOpening(#[from] crate::reader::EngageOpeningOutOfRange),
+    EngageOpening(#[from] EngageOpeningOutOfRange),
 
     #[error(transparent)]
     GripperOpenFraction(#[from] GripperOpenFractionOutOfRange),
@@ -121,12 +124,10 @@ fn parse_config(params: &Parameters) -> NodeResult<Config> {
         period_from_hz(params.command_rate_hz, MAX_RATE_HZ).map_err(NodeError::CommandRate)?;
     let stale_timeout =
         duration_from_secs(params.stale_timeout_s).map_err(NodeError::StaleTimeout)?;
-    if stale_timeout <= command_period {
-        return Err(NodeError::StaleTimeoutUnderCommandPeriod {
-            stale_timeout_s: params.stale_timeout_s,
-            command_rate_hz: params.command_rate_hz,
-            command_period_s: command_period.as_secs_f64(),
-        });
+    if stale_timeout < MIN_STALE_TIMEOUT_S_DURATION {
+        return Err(NodeError::StaleTimeoutUnderFramePeriod(
+            params.stale_timeout_s,
+        ));
     }
     Ok(Config {
         version: params.hardware_version.parse()?,
@@ -137,7 +138,7 @@ fn parse_config(params: &Parameters) -> NodeResult<Config> {
             &params.device_path,
             params.serial_baud,
         )?,
-        engage_opening: EngageOpening::try_from(params.engage_opening)?,
+        engage_opening: EngageOpening::try_from(params.engage_trigger_opening)?,
         gripper_open_fraction: GripperOpenFraction::try_from(params.gripper_open_fraction)?,
     })
 }
@@ -208,14 +209,20 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     // promptly matters: peppylib registers node_health only after this
     // closure returns, so the device connect must not be awaited here.
     let (sample_tx, sample_rx) = watch::channel(None);
-    let stale_timeout = config.stale_timeout;
-    let command_period = config.command_period;
+    let Config {
+        version,
+        command_period,
+        stale_timeout,
+        transport,
+        engage_opening,
+        gripper_open_fraction,
+    } = config;
     let reader_exited = reader::spawn(
         ReaderConfig {
-            transport: config.transport,
-            channels: ChannelMap::for_follower(config.version),
-            engage_opening: config.engage_opening,
-            gripper_open_fraction: config.gripper_open_fraction,
+            transport,
+            version,
+            engage_opening,
+            gripper_open_fraction,
             stale_timeout,
             log_raw: params.log_raw,
         },
@@ -276,7 +283,7 @@ mod tests {
         Parameters {
             command_rate_hz: 100,
             device_path: "/dev/openarm/ker".to_string(),
-            engage_opening: 0.2,
+            engage_trigger_opening: 0.2,
             gripper_open_fraction: 0.5,
             hardware_version: "v2".to_string(),
             log_raw: false,
@@ -359,9 +366,9 @@ mod tests {
                 },
             ),
             (
-                "engage_opening",
+                "engage_trigger_opening",
                 Parameters {
-                    engage_opening: 1.0,
+                    engage_trigger_opening: 1.0,
                     ..params()
                 },
             ),
@@ -383,32 +390,34 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_timeout_inside_the_command_period_is_refused() {
-        // 100 Hz commands with a 5 ms stale window: every tick would age out.
+    fn a_stale_timeout_under_the_device_frame_period_is_refused() {
+        // A 1 ms window against a 1 kHz stream ages every frame out on arrival.
         let refused = refusal(Parameters {
-            stale_timeout_s: 0.005,
+            stale_timeout_s: 0.001,
             ..params()
         });
         assert!(refused.contains("stale_timeout_s"), "{refused}");
         assert!(
-            refused.contains("0.01"),
-            "names the command period: {refused}"
+            refused.contains("1 kHz"),
+            "names the device rate: {refused}"
         );
 
-        // One period is still too short; anything past it parses.
+        // The floor itself parses, and a slow command rate stays legal: the
+        // window is about frame arrival, not the publisher's tick.
         assert!(
             parse_config(&Parameters {
-                stale_timeout_s: 0.01,
-                ..params()
-            })
-            .is_err()
-        );
-        assert!(
-            parse_config(&Parameters {
-                stale_timeout_s: 0.011,
+                stale_timeout_s: MIN_STALE_TIMEOUT_S,
                 ..params()
             })
             .is_ok()
+        );
+        assert!(
+            parse_config(&Parameters {
+                command_rate_hz: 1,
+                ..params()
+            })
+            .is_ok(),
+            "a 1 Hz command rate with the default window is a legal launch"
         );
     }
 }

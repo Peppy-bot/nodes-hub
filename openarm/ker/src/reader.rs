@@ -15,16 +15,17 @@
 
 use std::time::{Duration, Instant};
 
-use openarm_description::{ARM_DOF, Side};
+use openarm_description::{ARM_DOF, HardwareVersion, Side};
 use peppylib::runtime::CancellationToken;
 use tokio::sync::{oneshot, watch};
 use tracing::{error, info, warn};
 
-use crate::label;
+use crate::engage::{EngageLatch, EngageOpening};
 use crate::mapping::{ChannelMap, GripperOpenFraction, MapError};
 use crate::protocol::{
     CMD_PING, CMD_STANDBY, CMD_STREAM, Deframer, FrameLayout, KerFrame, PingParse, Schema,
 };
+use crate::side::{SideFlags, SideValues};
 use crate::transport::{self, KerTransport, TransportConfig};
 
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(3);
@@ -39,69 +40,10 @@ const SILENCE_RECONNECT: Duration = Duration::from_secs(5);
 const MAX_CONSECUTIVE_BAD_CHECKSUMS: u32 = 50;
 const RAW_LOG_INTERVAL: Duration = Duration::from_secs(1);
 /// Handshake bytes kept while scanning for a PING response. A device left
-/// streaming by a previous session fills this between pings; a response spans
-/// far less than this, so trimming the front never splits one.
+/// streaming by a previous session fills this between pings.
 const MAX_HANDSHAKE_BUFFER: usize = 8192;
-
-/// A launcher `engage_opening` outside [0, 1).
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "engage_opening is the trigger opening a squeeze must reach: at least 0 and below 1, \
-     since a released trigger reads 1 and would engage on connect. Try 0.2, got {0}"
-)]
-pub struct EngageOpeningOutOfRange(pub f64);
-
-/// The trigger opening at or below which a squeeze engages its arm; strictly
-/// below 1 (fully open).
-#[derive(Debug, Clone, Copy)]
-pub struct EngageOpening(f64);
-
-impl EngageOpening {
-    pub fn fraction(self) -> f64 {
-        self.0
-    }
-}
-
-impl TryFrom<f64> for EngageOpening {
-    type Error = EngageOpeningOutOfRange;
-
-    fn try_from(fraction: f64) -> Result<Self, Self::Error> {
-        (0.0..1.0)
-            .contains(&fraction)
-            .then_some(Self(fraction))
-            .ok_or(EngageOpeningOutOfRange(fraction))
-    }
-}
-
-/// One flag per arm: which arms track the KER, and inside the latch, which
-/// triggers have been seen released.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct SideFlags {
-    pub left: bool,
-    pub right: bool,
-}
-
-impl SideFlags {
-    /// Neither side set.
-    pub const NONE: Self = Self {
-        left: false,
-        right: false,
-    };
-
-    pub fn side(self, side: Side) -> bool {
-        match side {
-            Side::Left => self.left,
-            Side::Right => self.right,
-        }
-    }
-
-    fn set(&mut self, side: Side, value: bool) {
-        match side {
-            Side::Left => self.left = value,
-            Side::Right => self.right = value,
-        }
-    }
-}
+/// Trimming the front of that buffer cannot split the newest response.
+const _: () = assert!(MAX_HANDSHAKE_BUFFER > crate::protocol::MAX_PING_RESPONSE_LEN);
 
 /// One mapped bimanual sample: what the publish tasks stream for each engaged
 /// arm while fresh.
@@ -133,7 +75,7 @@ impl KerSample {
 
 pub struct ReaderConfig {
     pub transport: TransportConfig,
-    pub channels: ChannelMap,
+    pub version: HardwareVersion,
     pub engage_opening: EngageOpening,
     pub gripper_open_fraction: GripperOpenFraction,
     pub stale_timeout: Duration,
@@ -185,11 +127,19 @@ fn run(
     tx: watch::Sender<Option<KerSample>>,
     token: CancellationToken,
 ) -> ReaderExit {
-    // Latched per reason: an unplugged KER retries every second, and each
-    // attempt fails the same way until something changes.
+    // Latched per reason while a run of attempts keeps failing the same way,
+    // and cleared by a connection, so every episode warns once.
     let mut warned: Option<String> = None;
     while !token.is_cancelled() {
-        match session(&cfg, &tx, &token) {
+        let mut connected = false;
+        let end = match transport::open(&cfg.transport) {
+            Ok(mut transport) => run_session(transport.as_mut(), &cfg, &tx, &token, &mut connected),
+            Err(e) => SessionEnd::Transient(format!("open: {e}")),
+        };
+        if connected {
+            warned = None;
+        }
+        match end {
             SessionEnd::Stop => break,
             SessionEnd::Transient(reason) => {
                 let _ = tx.send(None);
@@ -218,26 +168,16 @@ fn run(
     }
 }
 
-/// One connection lifetime: connect, handshake, stream until it breaks.
-fn session(
-    cfg: &ReaderConfig,
-    tx: &watch::Sender<Option<KerSample>>,
-    token: &CancellationToken,
-) -> SessionEnd {
-    match transport::open(&cfg.transport) {
-        Ok(mut transport) => run_session(transport.as_mut(), cfg, tx, token),
-        Err(e) => SessionEnd::Transient(format!("open: {e}")),
-    }
-}
-
-/// Handshake, start the stream, and map frames until the link breaks. Every
-/// exit past the handshake leaves the device in standby, so the next session
-/// handshakes against a quiet device.
+/// One connection lifetime: handshake, start the stream, map frames until the
+/// link breaks. `connected` reports whether the handshake reached a device
+/// this node can read. The stream is stopped on the way out, so the next
+/// session handshakes against a quiet device.
 fn run_session(
     transport: &mut dyn KerTransport,
     cfg: &ReaderConfig,
     tx: &watch::Sender<Option<KerSample>>,
     token: &CancellationToken,
+    connected: &mut bool,
 ) -> SessionEnd {
     let (schema, leftover) = match handshake(transport, token) {
         Ok(parsed) => parsed,
@@ -247,9 +187,11 @@ fn run_session(
         Ok(layout) => layout,
         Err(e) => return SessionEnd::Fatal(e.to_string()),
     };
-    if let Err(e) = ChannelMap::accepts(&schema.metadata, layout.angle_count()) {
-        return SessionEnd::Fatal(e.to_string());
-    }
+    let channels = match ChannelMap::for_device(cfg.version, &schema.metadata, layout.angle_count())
+    {
+        Ok(channels) => channels,
+        Err(e) => return SessionEnd::Fatal(e.to_string()),
+    };
     info!(
         "KER connected: fw {} hw {} updated {} ({} channels)",
         schema.metadata.firmware,
@@ -257,26 +199,29 @@ fn run_session(
         schema.metadata.updated,
         layout.angle_count()
     );
-    // The firmware answers PING in standby; frames flow once STREAM arrives.
-    if let Err(e) = transport.write_all(&[CMD_STREAM]) {
-        return SessionEnd::Transient(format!("start stream: {e}"));
-    }
+    *connected = true;
 
-    let end = stream_frames(transport, cfg, tx, token, &layout, leftover);
-    // Best effort: leave the device quiet on the way out.
+    let end = stream_frames(transport, cfg, &channels, tx, token, &layout, leftover);
+    // Best effort: stop the stream on the way out, whether or not it started.
     let _ = transport.write_all(&[CMD_STANDBY]);
     end
 }
 
 /// Decode and map frames until the link breaks or the node stops.
+#[allow(clippy::too_many_arguments)]
 fn stream_frames(
     transport: &mut dyn KerTransport,
     cfg: &ReaderConfig,
+    channels: &ChannelMap,
     tx: &watch::Sender<Option<KerSample>>,
     token: &CancellationToken,
     layout: &FrameLayout,
     leftover: Vec<u8>,
 ) -> SessionEnd {
+    // The firmware answers PING in standby; frames flow once STREAM arrives.
+    if let Err(e) = transport.write_all(&[CMD_STREAM]) {
+        return SessionEnd::Transient(format!("start stream: {e}"));
+    }
     let mut deframer = Deframer::new(layout.payload_len());
     deframer.push(&leftover);
     let mut engage = EngageLatch::new(cfg.engage_opening, cfg.stale_timeout);
@@ -315,7 +260,7 @@ fn stream_frames(
                 last_raw_log = Instant::now();
                 info!("KER raw: {}", format_raw(&frame));
             }
-            match map_frame(&cfg.channels, cfg.gripper_open_fraction, &frame) {
+            match map_frame(channels, cfg.gripper_open_fraction, &frame) {
                 Ok(mapped) => {
                     mapping_warned = false;
                     let received_at = Instant::now();
@@ -388,75 +333,6 @@ fn handshake(
     )))
 }
 
-/// Per-arm engagement over the stream of usable frames. A trigger squeezed to
-/// the engage opening engages its arm, once that trigger has been seen
-/// released; a gap between usable frames of at least the stale timeout
-/// disengages both and requires a release again. Each session starts a fresh
-/// latch, so a reconnect does too.
-struct EngageLatch {
-    engage_opening: EngageOpening,
-    stale_timeout: Duration,
-    engaged: SideFlags,
-    /// Per side: the trigger has read open since the last reset, so the next
-    /// squeeze is a new one and not a hand that never let go.
-    released: SideFlags,
-    last_frame_at: Option<Instant>,
-}
-
-impl EngageLatch {
-    fn new(engage_opening: EngageOpening, stale_timeout: Duration) -> Self {
-        Self {
-            engage_opening,
-            stale_timeout,
-            engaged: SideFlags::NONE,
-            released: SideFlags::NONE,
-            last_frame_at: None,
-        }
-    }
-
-    /// Fold in one usable frame's trigger openings, captured at `at`.
-    fn update(&mut self, triggers: SideValues, at: Instant) -> SideFlags {
-        let stalled = self
-            .last_frame_at
-            .is_some_and(|last| at.duration_since(last) >= self.stale_timeout);
-        if stalled {
-            if self.engaged != SideFlags::NONE {
-                info!("KER frames stalled; both arms disengaged, release and squeeze to re-engage");
-            }
-            self.engaged = SideFlags::NONE;
-            self.released = SideFlags::NONE;
-        }
-        let threshold = self.engage_opening.fraction();
-        for side in [Side::Left, Side::Right] {
-            let opening = triggers.side(side);
-            if opening > threshold {
-                self.released.set(side, true);
-            } else if self.released.side(side) && !self.engaged.side(side) {
-                self.engaged.set(side, true);
-                info!("KER {} arm engaged, tracking the leader", label(side));
-            }
-        }
-        self.last_frame_at = Some(at);
-        self.engaged
-    }
-}
-
-/// One value per arm.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct SideValues {
-    pub left: f64,
-    pub right: f64,
-}
-
-impl SideValues {
-    fn side(self, side: Side) -> f64 {
-        match side {
-            Side::Left => self.left,
-            Side::Right => self.right,
-        }
-    }
-}
-
 /// One frame's mapped values, before engagement decides what streams.
 struct MappedFrame {
     left_joints: [f64; ARM_DOF],
@@ -486,21 +362,15 @@ fn map_frame(
     frame: &KerFrame,
 ) -> Result<MappedFrame, MapError> {
     let angles = &frame.angles_deg;
+    let triggers = SideValues {
+        left: channels.left_trigger.opening(angles)?,
+        right: channels.right_trigger.opening(angles)?,
+    };
     Ok(MappedFrame {
         left_joints: channels.left.joint_radians(angles)?,
         right_joints: channels.right.joint_radians(angles)?,
-        triggers: SideValues {
-            left: channels.left_trigger.opening(angles)?,
-            right: channels.right_trigger.opening(angles)?,
-        },
-        gripper_openings: SideValues {
-            left: channels
-                .left_trigger
-                .gripper_opening(angles, open_fraction)?,
-            right: channels
-                .right_trigger
-                .gripper_opening(angles, open_fraction)?,
-        },
+        gripper_openings: triggers.scaled(open_fraction.fraction()),
+        triggers,
     })
 }
 
@@ -525,143 +395,27 @@ fn sleep_cancellable(total: Duration, token: &CancellationToken) {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use openarm_description::HardwareVersion;
-
     use super::*;
-    use crate::mapping::tests::channel_map;
+    use crate::mapping::fixtures::{
+        CHANNELS, LEFT_SQUEEZE_DEG, LEFT_TRIGGER, RIGHT_SQUEEZE_DEG, RIGHT_TRIGGER, numbered_frame,
+        probe_radians,
+    };
     use crate::protocol::fixtures::{ping_response_for, stream_packet};
 
     const STALE: Duration = Duration::from_millis(250);
-    const FRAME: Duration = Duration::from_millis(5);
     const ENGAGE_AT: f64 = 0.2;
-    const OPEN: f64 = 1.0;
-    const SQUEEZED: f64 = 0.02;
-    const CHANNELS: u8 = 16;
-    /// Trigger angles (deg): a released trigger reads 0, a full squeeze -60 on
-    /// the right (CH08) and +60 on the left (CH16).
-    const SQUEEZE_DEG: f32 = 60.0;
-    /// How long a session test waits for the device to deliver a sample.
+    const OPEN_FRACTION: f64 = 0.5;
+    /// How long a session test waits for a sample, and then for the session
+    /// thread to notice cancellation.
     const SESSION_DEADLINE: Duration = Duration::from_secs(30);
-    const LEFT: SideFlags = SideFlags {
-        left: true,
-        right: false,
-    };
-    const RIGHT: SideFlags = SideFlags {
-        left: false,
-        right: true,
-    };
-    const BOTH: SideFlags = SideFlags {
-        left: true,
-        right: true,
-    };
-
-    fn latch() -> EngageLatch {
-        EngageLatch::new(EngageOpening::try_from(ENGAGE_AT).expect("in range"), STALE)
-    }
-
-    fn triggers(left: f64, right: f64) -> SideValues {
-        SideValues { left, right }
-    }
-
-    /// Engage a latch the documented way: a released frame, then a squeeze.
-    fn engage_both(latch: &mut EngageLatch, at: Instant) -> Instant {
-        latch.update(triggers(OPEN, OPEN), at);
-        latch.update(triggers(SQUEEZED, SQUEEZED), at + FRAME);
-        at + FRAME
-    }
-
-    #[test]
-    fn engage_opening_accepts_only_fractions_below_fully_open() {
-        for fraction in [0.0, ENGAGE_AT, 0.999] {
-            assert!(EngageOpening::try_from(fraction).is_ok(), "{fraction}");
-        }
-        for fraction in [-0.01, 1.0, 1.5, f64::NAN, f64::INFINITY] {
-            let refused = EngageOpening::try_from(fraction)
-                .expect_err("out of range")
-                .to_string();
-            assert!(refused.contains("engage_opening"), "{refused}");
-        }
-    }
-
-    #[test]
-    fn a_squeeze_engages_only_its_own_arm_and_release_keeps_it_tracking() {
-        let mut latch = latch();
-        let t0 = Instant::now();
-        assert_eq!(latch.update(triggers(OPEN, OPEN), t0), SideFlags::NONE);
-        assert_eq!(latch.update(triggers(OPEN, SQUEEZED), t0 + FRAME), RIGHT);
-        assert_eq!(latch.update(triggers(OPEN, OPEN), t0 + FRAME * 2), RIGHT);
-        assert_eq!(latch.update(triggers(SQUEEZED, OPEN), t0 + FRAME * 3), BOTH);
-        assert_eq!(latch.update(triggers(OPEN, OPEN), t0 + FRAME * 4), BOTH);
-    }
-
-    #[test]
-    fn the_engage_opening_itself_engages() {
-        let mut latch = latch();
-        let t0 = Instant::now();
-        latch.update(triggers(OPEN, OPEN), t0);
-        assert_eq!(latch.update(triggers(ENGAGE_AT, OPEN), t0 + FRAME), LEFT);
-    }
-
-    #[test]
-    fn a_trigger_held_from_the_first_frame_engages_nothing() {
-        let mut latch = latch();
-        let t0 = Instant::now();
-        for tick in 0..5 {
-            assert_eq!(
-                latch.update(triggers(SQUEEZED, SQUEEZED), t0 + FRAME * tick),
-                SideFlags::NONE,
-                "tick {tick}: a hand already on the trigger must not engage"
-            );
-        }
-        // Releasing arms it; the next squeeze engages.
-        latch.update(triggers(OPEN, OPEN), t0 + FRAME * 5);
-        assert_eq!(
-            latch.update(triggers(SQUEEZED, SQUEEZED), t0 + FRAME * 6),
-            BOTH
-        );
-    }
-
-    #[test]
-    fn a_frame_gap_of_the_stale_timeout_disengages_both_arms() {
-        let mut latch = latch();
-        let engaged_at = engage_both(&mut latch, Instant::now());
-        let just_inside = engaged_at + STALE - FRAME;
-        assert_eq!(latch.update(triggers(OPEN, OPEN), just_inside), BOTH);
-        assert_eq!(
-            latch.update(triggers(OPEN, OPEN), just_inside + STALE),
-            SideFlags::NONE
-        );
-    }
-
-    #[test]
-    fn a_held_trigger_after_a_stall_stays_disengaged_until_released() {
-        let mut latch = latch();
-        let engaged_at = engage_both(&mut latch, Instant::now());
-        // Frames return with the hand still on both triggers.
-        let returned = engaged_at + STALE;
-        assert_eq!(
-            latch.update(triggers(SQUEEZED, SQUEEZED), returned),
-            SideFlags::NONE
-        );
-        assert_eq!(
-            latch.update(triggers(SQUEEZED, SQUEEZED), returned + FRAME),
-            SideFlags::NONE
-        );
-        // Only a release, then a fresh squeeze, engages again.
-        latch.update(triggers(OPEN, SQUEEZED), returned + FRAME * 2);
-        assert_eq!(
-            latch.update(triggers(SQUEEZED, SQUEEZED), returned + FRAME * 3),
-            LEFT
-        );
-    }
 
     /// A KER that answers PING with the reference schema and sends frames only
     /// once STREAM arrives, as firmware 2.0.0 does.
     struct FakeKer {
         hardware: &'static str,
-        channels: u8,
-        /// Trigger angle (deg) both triggers report on every frame.
-        squeeze_deg: f32,
+        channels: usize,
+        /// Angles every frame reports, CH01 at index 0.
+        angles: Vec<f32>,
         /// Bytes delivered per read, so a caller can force partial reads.
         chunk_size: usize,
         writes: Arc<Mutex<Vec<u8>>>,
@@ -670,34 +424,41 @@ mod tests {
     }
 
     impl FakeKer {
-        fn new(writes: Arc<Mutex<Vec<u8>>>) -> Self {
+        fn new() -> Self {
             Self {
                 hardware: "2.0.0",
                 channels: CHANNELS,
-                squeeze_deg: 0.0,
+                angles: numbered_frame(),
                 chunk_size: usize::MAX,
-                writes,
+                writes: Arc::new(Mutex::new(Vec::new())),
                 pending: Vec::new(),
                 streaming: false,
             }
         }
 
-        fn frame(&self) -> Vec<u8> {
-            let mut angles = [0.0f32; CHANNELS as usize];
-            // CH08 squeezes negative, CH16 positive.
-            angles[7] = -self.squeeze_deg;
-            angles[15] = self.squeeze_deg;
-            stream_packet(1, &angles[..self.channels as usize], 0, false)
+        /// Both triggers squeezed to their stops, the rest of the channels as
+        /// they were.
+        fn squeezing(mut self) -> Self {
+            self.angles[RIGHT_TRIGGER] = RIGHT_SQUEEZE_DEG as f32;
+            self.angles[LEFT_TRIGGER] = LEFT_SQUEEZE_DEG as f32;
+            self
+        }
+
+        /// Both triggers released, which is what a resting KER reports.
+        fn released(mut self) -> Self {
+            self.angles[RIGHT_TRIGGER] = 0.0;
+            self.angles[LEFT_TRIGGER] = 0.0;
+            self
         }
     }
 
     impl KerTransport for FakeKer {
         fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-            self.writes.lock().unwrap().extend_from_slice(bytes);
+            self.writes.lock().expect("writes").extend_from_slice(bytes);
             match bytes {
                 [CMD_PING] => self
                     .pending
-                    .extend(ping_response_for(self.hardware, self.channels)),
+                    .extend(ping_response_for(self.hardware, self.channels as u8)),
                 [CMD_STREAM] => self.streaming = true,
                 [CMD_STANDBY] => self.streaming = false,
                 _ => {}
@@ -707,7 +468,8 @@ mod tests {
 
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
             if self.pending.is_empty() && self.streaming {
-                self.pending.extend(self.frame());
+                self.pending
+                    .extend(stream_packet(1, &self.angles[..self.channels], 0, false));
             }
             if self.pending.is_empty() {
                 std::thread::sleep(Duration::from_millis(1));
@@ -727,24 +489,39 @@ mod tests {
     fn reader_config() -> ReaderConfig {
         ReaderConfig {
             transport: TransportConfig::Usb,
-            channels: channel_map(),
+            version: HardwareVersion::V2,
             engage_opening: EngageOpening::try_from(ENGAGE_AT).expect("in range"),
-            gripper_open_fraction: GripperOpenFraction::try_from(0.5).expect("in range"),
+            gripper_open_fraction: GripperOpenFraction::try_from(OPEN_FRACTION).expect("in range"),
             stale_timeout: STALE,
             log_raw: false,
         }
     }
 
-    /// Run one session against `ker` until it delivers a sample (or the
-    /// deadline passes), then cancel it and hand back what it streamed.
-    fn first_sample(mut ker: FakeKer) -> (Option<KerSample>, SessionEnd, Vec<u8>) {
+    struct SessionRun {
+        sample: Option<KerSample>,
+        end: SessionEnd,
+        writes: Vec<u8>,
+        connected: bool,
+    }
+
+    /// Run one session against `ker` until it delivers a sample or stops, then
+    /// cancel it. A session that ignores cancellation fails the test instead of
+    /// wedging the suite.
+    fn run_one(mut ker: FakeKer) -> SessionRun {
         let writes = ker.writes.clone();
         let cfg = reader_config();
         let (tx, rx) = watch::channel(None);
         let token = CancellationToken::new();
+        let connected = Arc::new(Mutex::new(false));
         let session = {
             let token = token.clone();
-            std::thread::spawn(move || run_session(&mut ker, &cfg, &tx, &token))
+            let connected = connected.clone();
+            std::thread::spawn(move || {
+                let mut flag = false;
+                let end = run_session(&mut ker, &cfg, &tx, &token, &mut flag);
+                *connected.lock().expect("connected") = flag;
+                end
+            })
         };
 
         let deadline = Instant::now() + SESSION_DEADLINE;
@@ -753,69 +530,76 @@ mod tests {
         }
         let sample = rx.borrow().clone();
         token.cancel();
-        let end = session.join().expect("session thread");
-        let writes = writes.lock().unwrap().clone();
-        (sample, end, writes)
-    }
 
-    /// Run a session that is expected to refuse the device, with a watchdog so
-    /// a regression fails the test rather than wedging it.
-    fn refusal(ker: FakeKer) -> (SessionEnd, Vec<u8>) {
-        let (sample, end, writes) = first_sample(ker);
-        assert!(sample.is_none(), "a refused device streams nothing");
-        (end, writes)
+        let stop_by = Instant::now() + SESSION_DEADLINE;
+        while !session.is_finished() && Instant::now() < stop_by {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            session.is_finished(),
+            "the session ignored cancellation and would hang the suite"
+        );
+        SessionRun {
+            sample,
+            end: session.join().expect("session thread"),
+            writes: writes.lock().expect("writes").clone(),
+            connected: *connected.lock().expect("connected"),
+        }
     }
 
     #[test]
     fn a_session_starts_the_stream_and_maps_the_first_frame() {
-        let writes = Arc::new(Mutex::new(Vec::new()));
-        let (sample, end, writes) = first_sample(FakeKer::new(writes));
+        let run = run_one(FakeKer::new().released());
 
-        assert!(matches!(end, SessionEnd::Stop), "{end:?}");
-        let sample = sample.expect("a frame reached the sample channel");
+        assert!(matches!(run.end, SessionEnd::Stop), "{:?}", run.end);
+        assert!(run.connected, "a readable device counts as connected");
+        assert_eq!(
+            run.writes,
+            vec![CMD_STANDBY, CMD_PING, CMD_STREAM, CMD_STANDBY],
+            "standby and ping to handshake, stream to start, standby to stop"
+        );
+
+        let sample = run.sample.expect("a frame reached the sample channel");
         // Released triggers: nothing engages, and each gripper rests at the
         // open fraction.
         assert_eq!(sample.engaged, SideFlags::NONE);
-        assert_eq!(sample.left_gripper_opening, 0.5);
-        assert_eq!(sample.right_gripper_opening, 0.5);
-        // All-zero angles clamp into the follower's limits, so j4 sits on the
-        // elbow floor rather than at 0.
-        for side in [Side::Left, Side::Right] {
-            let limits = HardwareVersion::V2.joint_limits(side);
-            let joints = sample.joints(side);
-            for (j, (joint, [lo, hi])) in joints.into_iter().zip(limits).enumerate() {
-                assert_eq!(joint, 0.0f64.clamp(lo, hi), "{side:?} j{}", j + 1);
+        assert_eq!(sample.left_gripper_opening, OPEN_FRACTION);
+        assert_eq!(sample.right_gripper_opening, OPEN_FRACTION);
+        // Each arm reads its own channels, end to end through the session.
+        let frame = numbered_frame();
+        for (side, first_channel) in [(Side::Right, 0), (Side::Left, 8)] {
+            for (j, expected) in probe_radians(&frame, first_channel).into_iter().enumerate() {
+                assert!(
+                    (sample.joints(side)[j] - expected).abs() < 1e-12,
+                    "{side:?} j{}: {} != {expected}",
+                    j + 1,
+                    sample.joints(side)[j]
+                );
             }
         }
-
-        let ping = writes.iter().position(|&b| b == CMD_PING).expect("pinged");
-        let stream = writes
-            .iter()
-            .position(|&b| b == CMD_STREAM)
-            .expect("stream started");
-        assert!(ping < stream, "STREAM follows the handshake: {writes:?}");
-        assert_eq!(writes.last(), Some(&CMD_STANDBY), "leaves the device quiet");
     }
 
     #[test]
     fn a_session_delivers_a_frame_split_across_reads() {
-        let mut ker = FakeKer::new(Arc::new(Mutex::new(Vec::new())));
+        let mut ker = FakeKer::new().released();
         ker.chunk_size = 7;
-        let (sample, end, _) = first_sample(ker);
-        assert!(matches!(end, SessionEnd::Stop), "{end:?}");
-        assert!(
-            sample.is_some(),
-            "a packet arriving in pieces still reaches the sample channel"
-        );
+        let run = run_one(ker);
+
+        assert!(matches!(run.end, SessionEnd::Stop), "{:?}", run.end);
+        let sample = run
+            .sample
+            .expect("a split packet still reaches the channel");
+        assert_eq!(sample.left_gripper_opening, OPEN_FRACTION);
+        let frame = numbered_frame();
+        let expected = probe_radians(&frame, 0);
+        assert!((sample.joints(Side::Right)[0] - expected[0]).abs() < 1e-12);
     }
 
     #[test]
-    fn a_held_trigger_does_not_re_engage_on_a_new_session() {
-        let mut ker = FakeKer::new(Arc::new(Mutex::new(Vec::new())));
-        ker.squeeze_deg = SQUEEZE_DEG;
-        let (sample, _, _) = first_sample(ker);
+    fn a_held_trigger_does_not_engage_on_a_new_session() {
+        let run = run_one(FakeKer::new().squeezing());
         assert_eq!(
-            sample.expect("a frame arrived").engaged,
+            run.sample.expect("a frame arrived").engaged,
             SideFlags::NONE,
             "a session that opens under a held trigger must not resume motion"
         );
@@ -823,30 +607,35 @@ mod tests {
 
     #[test]
     fn a_session_refuses_a_device_of_another_hardware_generation() {
-        let mut ker = FakeKer::new(Arc::new(Mutex::new(Vec::new())));
+        let mut ker = FakeKer::new();
         ker.hardware = "3.0.0";
-        let (end, writes) = refusal(ker);
-        let SessionEnd::Fatal(reason) = end else {
-            panic!("expected a fatal refusal, got {end:?}");
+        let run = run_one(ker);
+
+        let SessionEnd::Fatal(reason) = run.end else {
+            panic!("expected a fatal refusal, got {:?}", run.end);
         };
         assert!(reason.contains("3.0.0"), "{reason}");
+        assert!(run.sample.is_none(), "a refused device streams nothing");
+        assert!(!run.connected, "a refused device is not a connection");
         assert!(
-            !writes.contains(&CMD_STREAM),
+            !run.writes.contains(&CMD_STREAM),
             "a refused device is never started"
         );
     }
 
     #[test]
     fn a_session_refuses_a_device_streaming_too_few_channels() {
-        let mut ker = FakeKer::new(Arc::new(Mutex::new(Vec::new())));
+        let mut ker = FakeKer::new();
         ker.channels = CHANNELS - 1;
-        let (end, writes) = refusal(ker);
-        let SessionEnd::Fatal(reason) = end else {
-            panic!("expected a fatal refusal, got {end:?}");
+        let run = run_one(ker);
+
+        let SessionEnd::Fatal(reason) = run.end else {
+            panic!("expected a fatal refusal, got {:?}", run.end);
         };
         assert!(reason.contains("15 channels"), "{reason}");
+        assert!(run.sample.is_none(), "a refused device streams nothing");
         assert!(
-            !writes.contains(&CMD_STREAM),
+            !run.writes.contains(&CMD_STREAM),
             "a refused device is never started"
         );
     }
