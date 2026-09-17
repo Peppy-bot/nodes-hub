@@ -15,11 +15,10 @@ name: Tests
 # keeping between runs (test images, cargo registries, per-crate target dirs,
 # uv's downloads) simply outlives the job in the cache directory named below.
 #
-# Every job runs on that self-hosted runner, except on a pull request from a
-# fork: fork code must not run on a box that persists between jobs and holds
-# every repository's build caches, so those runs go to a GitHub-hosted runner,
-# which starts from a cold cache. `github.event.pull_request.head.repo.fork` is
-# null on push, which the expression reads as false.
+# Every job runs on that self-hosted runner; no job uses a GitHub-hosted one.
+# A pull request from a fork lands there too, so what keeps fork code off the
+# box is the repository's fork-PR approval gate, not the runner it is
+# scheduled on.
 on:
   push:
     branches: [main]
@@ -35,7 +34,7 @@ env:
 jobs:
   python-syntax:
     name: Python syntax
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-24.04' || 'self-hosted' }}
+    runs-on: self-hosted
     # Use the newest Python minor required by repository projects. This is a
     # syntax gate; each project's tests still use its own Python requirements.
     container: python:3.13
@@ -52,7 +51,7 @@ jobs:
 
   javascript-typescript:
     name: JavaScript and TypeScript tests
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-24.04' || 'self-hosted' }}
+    runs-on: self-hosted
     timeout-minutes: 15
     permissions:
       contents: read
@@ -76,11 +75,11 @@ jobs:
     # carries the architecture, so moving this repository onto an arm runner
     # starts from an empty cache rather than a wrong-arch one. The base images
     # and the librealsense apt repository are published for both.
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-24.04' || 'self-hosted' }}
+    runs-on: self-hosted
     # A cold run compiles nine crates' full dependency trees and resolves
     # lerobot's, torch included. The persistent cache keeps warm runs far under
-    # this, but a run that cannot reuse it (a fork's pull request, or the first
-    # run after the directory is cleared) is legitimately slow.
+    # this, but the first run after the directory is cleared is legitimately
+    # slow.
     timeout-minutes: 120
     permissions:
       contents: read
@@ -104,8 +103,7 @@ jobs:
       # apptainer, cargo and uv can rebuild from scratch. The runner executes
       # one job at a time, so concurrent writers are not a concern today; a
       # second runner would make these directories shared mutable state and
-      # is a reason to revisit this. A fork's pull request runs on a
-      # GitHub-hosted runner and so neither reads nor writes the cache.
+      # is a reason to revisit this.
       - name: Name the caches this run reuses
         run: python3 .github/scripts/configure-build-cache.py
 

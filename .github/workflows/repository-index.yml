@@ -19,10 +19,11 @@ concurrency:
 
 jobs:
   check-index:
-    # The self-hosted runner, except on a pull request from a fork: fork code
-    # must not run on a box that persists between jobs, so those runs go to a
-    # GitHub-hosted one. `head.repo.fork` is null on push, read as false.
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-24.04' || 'self-hosted' }}
+    # Every job runs on the self-hosted runner; no job uses a GitHub-hosted
+    # one. A pull request from a fork lands here too, so what keeps fork code
+    # off the box is the repository's fork-PR approval gate, not the runner it
+    # is scheduled on.
+    runs-on: self-hosted
     # Nothing here legitimately takes minutes; a hung step should fail fast
     # rather than hold a runner for the default six hours.
     timeout-minutes: 15
