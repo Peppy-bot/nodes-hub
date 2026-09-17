@@ -160,6 +160,7 @@ async def _node_setup(params, node_runner) -> list:
     scene_actions = SceneActionIO(
         node_runner,
         loop,
+        io,
         world,
     )
 
@@ -405,6 +406,7 @@ def main() -> None:
     extension = IsaacBridgeExtension(
         handoff.world,
         handoff.io,
+        handoff.scene_actions,
         handoff.seats,
         handoff.seat_io,
         handoff.layout,

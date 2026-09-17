@@ -1,17 +1,24 @@
 // The relay loops and their assembly: frames forward to the contract
-// surface, the stream descriptions feed the info services, the hardware
-// controls refuse, and `setup` wires them together.
+// surface, the stream descriptions feed the info service, the camera
+// controls and the profile forward to the simulation's camera response model
+// under the camera slot this relay views, and `setup` wires them together.
 
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use peppygen::consumed_services::control::{
+    describe_camera, reset_camera as control_reset_camera, set_camera_brightness,
+    set_camera_contrast, set_camera_exposure, set_camera_gain, set_camera_white_balance,
+};
 use peppygen::emitted_topics::camera::video_stream as camera_video;
 use peppygen::exposed_services::camera::{
     set_brightness, set_contrast, set_exposure, set_gain, set_white_balance, video_stream_info,
 };
+use peppygen::exposed_services::profile::{get_camera_profile, reset_camera};
 use peppygen::paired_topics::simulation::{stream_info, video_stream as simulation_video};
-use peppygen::{NodeRunner, Parameters, Result};
+use peppygen::{NodeRunner, Parameters, ProducerRef, Result};
 use peppylib::runtime::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -30,7 +37,23 @@ pub fn leg_died() -> bool {
 /// subscription cannot hot-spin the relay or flood the log.
 const RECEIVE_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
-const UNSUPPORTED_MESSAGE: &str = "not adjustable in sim";
+/// Bounds every call forwarded to the simulation's camera response model. A
+/// control is one round trip through the simulation's device model, so an
+/// answer later than this means the model is gone, and the caller gets a
+/// refusal carrying the timeout rather than a service that hangs.
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The refusal every forwarded call (a control, the profile, the reset)
+/// answers while the control slot is vacant: the launch linked this relay
+/// to a simulation without a camera response model, so there is nothing
+/// behind the controls to adjust, describe or reset.
+const NO_RESPONSE_MODEL_MESSAGE: &str =
+    "no camera response model is linked: nothing to adjust, describe or reset";
+
+/// The refusal every control and profile call answers while the simulation
+/// pairing is not established: the camera slot a forwarded request must name
+/// is the pairing peer's link id, and there is no peer yet.
+const NOT_PAIRED_MESSAGE: &str = "not paired to its simulation camera yet";
 
 /// current_value in a refused control response: the no-value sentinel uvc and
 /// zed answer when no usable hardware value exists.
@@ -69,6 +92,92 @@ impl RepeatedError {
     /// Ends the run, so the next failure is reported again.
     fn clear(&mut self) {
         self.reported = false;
+    }
+}
+
+/// The outcome of routing one call to the simulation's camera response
+/// model: the model's answer, relayed verbatim, or the message the caller
+/// gets for why the call never reached a model.
+type Forwarded<T> = std::result::Result<T, String>;
+
+/// The camera slot this relay views, as the simulation names it: the link id
+/// of the peer slot on the simulation pairing. The simulation renders each
+/// camera on a slot of its own and its response model keys every control on
+/// that slot's name, so the pairing peer is the camera's whole identity and
+/// the relay carries no id of its own.
+fn camera_slot(runner: &NodeRunner) -> Forwarded<String> {
+    match simulation_video::paired(runner) {
+        Ok(Some(peer)) => Ok(peer.peer_link_id),
+        Ok(None) => Err(NOT_PAIRED_MESSAGE.to_string()),
+        Err(e) => Err(format!("simulation pairing state unavailable: {e}")),
+    }
+}
+
+/// Runs a forwarded poll to completion from inside a synchronous service
+/// handler. The generated handlers take a plain closure, while a poll is
+/// awaitable; `block_in_place` hands this worker's queue to another runtime
+/// thread for the duration, so the relay legs and the other services keep
+/// running while this one waits on the simulation. Legal only on a
+/// multi-thread runtime, which `NodeBuilder::run` and the harness both
+/// provide.
+fn wait_for<T>(future: impl Future<Output = T>) -> T {
+    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(future))
+}
+
+/// The route from a contract call to the simulation's camera response model,
+/// shared by every forwarding service task.
+struct ControlRoute {
+    runner: Arc<NodeRunner>,
+    /// Whether the last forwarded call failed in transport. The first failure
+    /// is logged and the rest are suppressed until a call goes through: a
+    /// caller retrying against a simulation that is gone would otherwise
+    /// write a line per attempt.
+    transport_failing: AtomicBool,
+}
+
+impl ControlRoute {
+    fn new(runner: Arc<NodeRunner>) -> Self {
+        Self {
+            runner,
+            transport_failing: AtomicBool::new(false),
+        }
+    }
+
+    /// Forwards one call. `bound` is the control slot's producer, `call`
+    /// polls the response model for the camera slot on it, and the model's
+    /// answer relays verbatim. Every way the call cannot reach the model is
+    /// an `Err` carrying the caller's message: the vacant slot first, since
+    /// the binding is fixed for the life of the node and no pairing changes
+    /// it; then the pairing, which is the transient condition; then the
+    /// transport.
+    fn forward<T, Fut>(
+        &self,
+        bound: Option<&ProducerRef>,
+        call: impl FnOnce(String, ProducerRef) -> Fut,
+    ) -> Forwarded<T>
+    where
+        Fut: Future<Output = Result<T>>,
+    {
+        let Some(target) = bound else {
+            return Err(NO_RESPONSE_MODEL_MESSAGE.to_string());
+        };
+        let camera = camera_slot(&self.runner)?;
+        match wait_for(call(camera, target.clone())) {
+            Ok(answer) => {
+                self.transport_failing.store(false, Ordering::SeqCst);
+                Ok(answer)
+            }
+            Err(e) => {
+                if !self.transport_failing.swap(true, Ordering::SeqCst) {
+                    warn!(
+                        "forwarding to the camera response model failing, suppressing repeats: {e}"
+                    );
+                }
+                Err(format!(
+                    "forwarding to the simulation's camera response model failed: {e}"
+                ))
+            }
+        }
     }
 }
 
@@ -213,22 +322,20 @@ macro_rules! spawn_info_service {
     }};
 }
 
-/// Every hardware control refuses: a rendered stream has no sensor to adjust.
-macro_rules! spawn_refusing_control {
-    ($runner:expr, $service:ident) => {{
-        let runner = $runner.clone();
+/// One service whose every request routes through the control route:
+/// `$answer` maps the request to the response, forwarding inside.
+macro_rules! spawn_forwarding_service {
+    ($route:expr, $service:ident, $answer:expr) => {{
+        let route: Arc<ControlRoute> = $route.clone();
         tokio::spawn(async move {
+            let runner = route.runner.clone();
             let cancel = runner.cancellation_token().clone();
             let mut service_errors = RepeatedError::default();
             loop {
                 let result = tokio::select! {
                     _ = cancel.cancelled() => break,
-                    result = $service::handle_next_request(&runner, |_req| {
-                        Ok($service::Response::new(
-                            false,
-                            UNSUPPORTED_MESSAGE.to_string(),
-                            NO_CURRENT_VALUE,
-                        ))
+                    result = $service::handle_next_request(&runner, |request| {
+                        Ok(($answer)(&route, request))
                     }) => result,
                 };
                 match result {
@@ -240,11 +347,51 @@ macro_rules! spawn_refusing_control {
     }};
 }
 
+/// One camera control forwarded to its response-model twin: the request's
+/// fields go through under the camera slot's name and the model's answer
+/// relays verbatim, success or not; a call that never reached the model
+/// answers false and the reason. `$reading` names the response's reading
+/// field beside the fallback a refusal carries in it: a temperature for
+/// white balance, a value for the other controls, the profile JSON for
+/// get_camera_profile; reset_camera carries none.
+macro_rules! spawn_forwarding_control {
+    ($route:expr, $service:ident => $control:ident, [$($field:ident),*] $(, $reading:ident = $fallback:expr)?) => {
+        spawn_forwarding_service!(
+            $route,
+            $service,
+            |route: &ControlRoute, _request: $service::Request| {
+                $(let $field = _request.data.$field;)*
+                let answer = route.forward(
+                    $control::bound_producer(&route.runner),
+                    |camera, target| async move {
+                        let request = $control::Request::new(camera $(, $field)*);
+                        $control::poll(&route.runner, &target, CONTROL_TIMEOUT, request)
+                            .await
+                            .map(|response| response.data)
+                    },
+                );
+                match answer {
+                    Ok(answer) => {
+                        $service::Response::new(answer.success, answer.message $(, answer.$reading)?)
+                    }
+                    Err(message) => $service::Response::new(false, message $(, $fallback)?),
+                }
+            }
+        )
+    };
+}
+
 /// The node's entry point: the exact closure `NodeBuilder::run` used to get,
 /// named so the test harness can boot the node in-process.
 pub async fn setup(_params: Parameters, node_runner: Arc<NodeRunner>) -> Result<()> {
     let token = node_runner.cancellation_token().clone();
     let description: SharedDescription = Arc::new(Mutex::new(StreamDescription::default()));
+    let route = Arc::new(ControlRoute::new(node_runner.clone()));
+    if describe_camera::bound_producer(&node_runner).is_some() {
+        info!("camera response model linked: controls forward to the simulation");
+    } else {
+        info!("no camera response model linked: every control refuses");
+    }
 
     spawn_info_service!(
         node_runner,
@@ -254,11 +401,26 @@ pub async fn setup(_params: Parameters, node_runner: Arc<NodeRunner>) -> Result<
             video_stream_info::Response::new(d.width, d.height, d.frames_per_second, d.encoding)
         }
     );
-    spawn_refusing_control!(node_runner, set_exposure);
-    spawn_refusing_control!(node_runner, set_white_balance);
-    spawn_refusing_control!(node_runner, set_gain);
-    spawn_refusing_control!(node_runner, set_brightness);
-    spawn_refusing_control!(node_runner, set_contrast);
+    spawn_forwarding_control!(route, set_exposure => set_camera_exposure, [mode, value], current_value = NO_CURRENT_VALUE);
+    spawn_forwarding_control!(
+        route,
+        set_white_balance => set_camera_white_balance,
+        [mode, temperature],
+        current_temperature = NO_CURRENT_VALUE
+    );
+    spawn_forwarding_control!(route, set_gain => set_camera_gain, [value], current_value = NO_CURRENT_VALUE);
+    spawn_forwarding_control!(route, set_brightness => set_camera_brightness, [value], current_value = NO_CURRENT_VALUE);
+    spawn_forwarding_control!(route, set_contrast => set_camera_contrast, [value], current_value = NO_CURRENT_VALUE);
+    // The profile is the simulation's description of the device this camera
+    // stands for, and the reset puts every control back to its defaults:
+    // both live with the response model, so both forward to it.
+    spawn_forwarding_control!(
+        route,
+        get_camera_profile => describe_camera,
+        [],
+        profile_json = String::new()
+    );
+    spawn_forwarding_control!(route, reset_camera => control_reset_camera, []);
 
     let frames = tokio::spawn(relay_frames(node_runner.clone(), token.clone()));
     let info = tokio::spawn(track_stream_info(

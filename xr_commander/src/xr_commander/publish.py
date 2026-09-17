@@ -72,7 +72,7 @@ class LatestPose:
 
 
 def _timestamp_seconds() -> float:
-    """Daemon-resolved clock (sim time under a sim clock)."""
+    """This instance's bound clock."""
     return peppygen.clock.now_ns() / 1e9
 
 

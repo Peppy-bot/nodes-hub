@@ -6,9 +6,10 @@
 // contract, each bringing its own model and driven by the attachment that
 // holds the seat.
 //
-// The node also implements the scene_control contract on its scene slot:
+// The node also implements the scene_manipulation contract on its scene slot:
 // runtime scene/object services and actions consumed by higher-level tools
-// such as scene_commander.
+// such as scene_commander. The object_state contract on its objects slot
+// reports what those tools spawned, streamed and on demand.
 //
 // Public Peppy interfaces use stable asset_id and object_id identifiers rather
 // than exposing Isaac USD paths directly. The existing TCP runtime commander
@@ -21,9 +22,13 @@
     tag: "v1",
 
     // The scene-editing contract, implemented on the scene slot: any
-    // commander that speaks scene_control can drive this simulation.
+    // commander that speaks scene_manipulation can drive this simulation. The
+    // object state of what it spawned, implemented on the objects slot:
+    // the pose and velocities of every spawned object, streamed at
+    // state_rate_hz and answered on demand from the same snapshot.
     implements: [
-      { name: "scene_control", tag: "v1", link_id: "scene" },
+      { name: "scene_manipulation", tag: "v1", link_id: "scene" },
+      { name: "object_state", tag: "v1", link_id: "objects" },
       // The seat a robot takes on this stage: it attaches with its model and
       // placement, streams the setpoints of its limbs and receives its own
       // measured state. Any number of robots hold one at a time; the engine
@@ -59,14 +64,15 @@
     // Runtime scene/object discovery services
     // ------------------------------------------------------------------
     //
-    // Formats and field semantics are defined by scene_control:v1 in
-    // contracts-hub. asset_id and object_id are stable identifiers; the
-    // catalogue keeps raw Isaac USD paths private to this node.
+    // Formats and field semantics are defined by scene_manipulation:v1 and
+    // object_state:v1 in contracts-hub. asset_id and object_id are stable
+    // identifiers; the catalogue keeps raw Isaac USD paths private to this
+    // node.
     services: {
       exposes: [
         { link_id: "scene", name: "get_assets_list" },
-        { link_id: "scene", name: "get_objects_list" },
         { link_id: "scene", name: "get_robots_list" },
+        { link_id: "objects", name: "get_object_states" },
         { link_id: "robots", name: "command" },
       ],
     },
@@ -75,7 +81,7 @@
     // Runtime scene/object actions
     // ------------------------------------------------------------------
     //
-    // Formats and field semantics are defined by scene_control:v1 in
+    // Formats and field semantics are defined by scene_manipulation:v1 in
     // contracts-hub. Each action enqueues its command onto the Isaac
     // simulation thread through SimLauncher.execute_runtime_command().
     actions: {
@@ -107,6 +113,7 @@
         { link_id: "chest", name: "video_stream" },
         { link_id: "chest", name: "depth_stream" },
         { link_id: "chest", name: "stream_info" },
+        { link_id: "objects", name: "object_states" },
       ],
 
       consumes: [
@@ -145,9 +152,9 @@
       model: { $type: "string", $default: "" },
 
       // Rate in Hz of the measured joint_states / gripper_states streams.
-      // On a launch that declares this simulation its source of simulated time, the
-      // same rate is how often the fleet's clock advances, so it also sets how
-      // finely every machine of that launch can read time.
+      // Where the deployment names this simulation its clock domain's
+      // publisher, the same rate is how often that domain advances, so it
+      // also sets how finely every instance bound to it can read time.
       state_rate_hz: "u32",
 
       // Run Isaac Sim headless.

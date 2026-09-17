@@ -4,7 +4,8 @@
 sim_app.update() advances physics on the main thread; each step this
 extension applies the latest setpoint of every robot's limbs, reads the
 measured joint and gripper state, and (throttled to state_rate_hz) publishes
-Isaac's own timeline clock followed by the state it stamps.
+Isaac's own timeline clock followed by the state it stamps: the joint and
+gripper states and a snapshot of every spawned object.
 
 The robot the engine stands is commanded through the limb pairings and
 publishes on them; a robot in a seat is commanded through its seat and its
@@ -222,12 +223,14 @@ class IsaacBridgeExtension:
     A robot's views cannot initialise until the stage has loaded and the
     timeline is playing, which races both the bridge's construction and every
     robot that joins later, so setup is retried on the steps that follow.
+    Until a robot's views read, step() only records the engine clock.
     """
 
     def __init__(
         self,
         world: World,
         io: "SimTopicIO",
+        objects,
         seats: Registry,
         seat_io,
         layout: Layout,
@@ -236,6 +239,8 @@ class IsaacBridgeExtension:
     ) -> None:
         self._world = world
         self._io = io
+        # Captures the spawned objects' snapshot each state tick publishes.
+        self._objects = objects
         self._seats = seats
         self._seat_io = seat_io
         self._layout = layout
@@ -277,23 +282,25 @@ class IsaacBridgeExtension:
     def step(self) -> None:
         """Physics has already advanced in sim_app.update(); apply the latest
         commands and, when the state grid is due, publish measured state."""
+        # The timeline is Isaac's own clock, advanced by sim_app.update(), so
+        # a stopped timeline stops advancing it. Recorded ahead of every
+        # stamp of this step, the camera captures included, and ahead of the
+        # readiness gate: an object-state capture after a scene edit stamps
+        # from it while the robots' views are being built again.
+        self._io.record_engine_time(self._engine_time_s())
         ready = [limbs for limbs in self._limbs.values() if limbs.setup()]
         if not ready:
             return
 
         self._apply_commands(ready)
-        # The timeline is Isaac's own clock, advanced by sim_app.update(), so
-        # a stopped timeline stops advancing it. Recorded ahead of every
-        # stamp of this step, the camera captures included.
-        self._io.record_engine_time(self._engine_time_s())
         if self._camera_sensor is not None and self._camera_sensor.setup():
             self._camera_sensor.step()
 
         if not self._state_pacer.take_if_due(time.monotonic()):
             return
         # Published before the state it stamps; a stopped timeline stops the
-        # fleet's time with it.
-        self._io.publish_sim_time()
+        # domain's clock with it.
+        self._io.publish_clock_tick()
         self._publish_state(ready)
 
     def _engine_time_s(self) -> float:
@@ -393,6 +400,12 @@ class IsaacBridgeExtension:
                 self._publish_pairings(arms, grippers)
             elif self._seat_io is not None:
                 self._seat_io.publish_state(seat, self._io.timestamp_s(), arms, grippers)
+
+        # A full snapshot of the spawned objects rides the same tick; it is
+        # the one get_object_states answers until the next capture.
+        snapshot = self._objects.capture_object_states()
+        if snapshot is not None:
+            self._io.publish_object_states(snapshot)
 
     def _publish_pairings(self, arms, grippers) -> None:
         for arm, (positions, velocities) in zip(self._layout.arms, arms):

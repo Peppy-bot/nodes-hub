@@ -104,8 +104,8 @@ pub async fn setup(params: Parameters, node_runner: Arc<NodeRunner>) -> Result<(
 }
 
 async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResult {
-    // Pairing timestamps read the daemon-resolved clock (sim time under a
-    // simulated clock), so the backbone ages setpoints on one timeline.
+    // Pairing timestamps read this instance's bound clock, so the backbone
+    // ages setpoints on one timeline.
     peppygen::clock::init(&node_runner).await?;
     let token = node_runner.cancellation_token().clone();
 

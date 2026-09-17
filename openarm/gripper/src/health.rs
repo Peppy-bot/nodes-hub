@@ -51,9 +51,9 @@ impl LatchedWarn {
     }
 }
 
-/// Capture timestamp from the daemon-resolved clock (sim time under a simulated
-/// clock), so consumers age samples on the same timeline they read. Errors
-/// until the clock delivers its first tick.
+/// Capture timestamp from this instance's bound clock, so consumers age
+/// samples on the same timeline they read. Errors until the clock delivers
+/// its first tick.
 pub(crate) fn capture_timestamp() -> Result<SystemTime, String> {
     let ns = peppygen::clock::now_ns().map_err(|e| format!("clock not ready: {e}"))?;
     Ok(UNIX_EPOCH + Duration::from_nanos(ns))
@@ -141,11 +141,11 @@ pub async fn run(
             _ = token.cancelled() => final_round = true,
             _ = ticker.tick() => {}
         }
-        // One daemon-clock read per round serves both the filter interval
-        // and the published timestamp, so the filter's timeline is the one the
-        // timestamps are read on (sim time under a simulated clock). A backward
-        // step falls back to the cadence; a paused clock yields dt 0, which
-        // the filter takes as no elapsed time.
+        // One clock read per round serves both the filter interval and the
+        // published timestamp, so the filter's timeline is the one the
+        // timestamps are read on. A backward step falls back to the cadence;
+        // a paused clock yields dt 0, which the filter takes as no elapsed
+        // time.
         let timestamp = match capture_timestamp() {
             Ok(timestamp) => timestamp,
             Err(e) => {

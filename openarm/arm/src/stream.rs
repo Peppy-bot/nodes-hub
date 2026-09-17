@@ -51,9 +51,9 @@ impl LatchedWarn {
     }
 }
 
-/// Capture timestamp from the daemon-resolved clock (sim time under a simulated
-/// clock), so consumers age samples on the same timeline they read. Errors
-/// until the clock delivers its first tick.
+/// Capture timestamp from this instance's bound clock, so consumers age
+/// samples on the same timeline they read. Errors until the clock delivers
+/// its first tick.
 pub(crate) fn capture_timestamp() -> Result<SystemTime, String> {
     let ns = peppygen::clock::now_ns().map_err(|e| format!("clock not ready: {e}"))?;
     Ok(UNIX_EPOCH + Duration::from_nanos(ns))

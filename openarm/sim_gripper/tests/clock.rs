@@ -1,20 +1,20 @@
-//! Sim-time integration tests over the generated harness: the test drives
-//! the daemon-clock stand-in (`Config::use_sim_time` plus `harness.clock`),
-//! so the node's clock decisions are asserted at exact virtual instants.
-//! Wall-mode relay behavior is covered in `tests/relay.rs`; this file covers
-//! only what needs a driven clock.
+//! Clock-domain integration tests over the generated harness: the test
+//! drives the node's clock with `harness.clock`, so the node's clock
+//! decisions are asserted at exact instants. Wall-mode relay behavior is
+//! covered in `tests/relay.rs`; this file covers only what needs a driven
+//! clock.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use control_core::motor_health::{HEALTH_PERIOD, STATE_STALE_AFTER};
 use peppygen::fixtures::harness::{Config, Harness};
-use peppygen::mock::pairings::backbone::joint_setpoints as backbone_setpoints;
-use peppygen::mock::pairings::simulation::joint_states as simulation_states;
+use peppygen::mock::pairings::backbone::gripper_setpoints as backbone_setpoints;
+use peppygen::mock::pairings::simulation::gripper_states as simulation_states;
 
-/// Joints per arm, matching the node's health `level` vector length.
-const DOF: usize = 7;
+/// Motors per gripper, matching the node's health `level` vector length.
+const MOTORS: usize = 1;
 
-/// The first sim instant the test drives.
+/// The first instant the test drives.
 const T1_NS: u64 = 1_000_000_000;
 
 /// Exactly one staleness window past T1: the earliest instant at which a
@@ -29,59 +29,59 @@ fn instant(ns: u64) -> SystemTime {
     UNIX_EPOCH + Duration::from_nanos(ns)
 }
 
-fn simulation_state(timestamp: SystemTime) -> simulation_states::Message {
+fn gripper_state(timestamp: SystemTime) -> simulation_states::Message {
     simulation_states::Message {
         timestamp,
-        positions: vec![0.5; DOF],
-        velocities: vec![0.0; DOF],
-        efforts: vec![0.25; DOF],
+        opening: 0.5,
+        effort: 0.25,
+        max_effort: 1.0,
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sim_time_stamps_the_heartbeat_and_bounds_the_recency_gate() -> peppygen::Result<()> {
+async fn a_driven_clock_stamps_the_heartbeat_and_bounds_the_recency_gate()
+-> peppygen::Result<()> {
     let (mut harness, mut mocks) = Harness::start_with(
         Config {
-            use_sim_time: true,
+            clock: peppylib::testing::HarnessClock::Consumer,
             ..Default::default()
         },
-        openarm_sim_arm::setup,
+        openarm_sim_gripper::setup,
     )
     .await?;
 
-    // Before the first tick the sim clock has no time at all, yet the
+    // Before the first tick the clock has no instant at all, yet the
     // setpoint leg relays: the passthrough takes no clock read.
     let setpoint_ts = instant(500_000_000);
     mocks
         .pairings
         .backbone
-        .joint_setpoints
+        .gripper_setpoints
         .publish(&backbone_setpoints::Message {
             timestamp: setpoint_ts,
-            positions: vec![0.1; DOF],
-            velocities: vec![0.0; DOF],
-            efforts: vec![0.0; DOF],
+            opening: 0.75,
+            max_effort: 2.5,
         })
         .await?;
     let relayed = tokio::time::timeout(
         RECV_TIMEOUT,
-        mocks.pairings.simulation.joint_setpoints.next(),
+        mocks.pairings.simulation.gripper_setpoints.next(),
     )
     .await
     .expect("the simulation should receive the relayed setpoint before any tick")?
     .expect("simulation setpoints subscription should be open");
     assert_eq!(relayed.timestamp, setpoint_ts);
 
-    // First driven instant: the simulation speaks, stamped with the same sim
-    // time the node reads.
+    // First driven instant: the simulation speaks, stamped with the same
+    // instant the node reads.
     harness.clock.tick(T1_NS).await?;
     mocks
         .pairings
         .simulation
-        .joint_states
-        .publish(&simulation_state(instant(T1_NS)))
+        .gripper_states
+        .publish(&gripper_state(instant(T1_NS)))
         .await?;
-    let relayed = tokio::time::timeout(RECV_TIMEOUT, mocks.pairings.backbone.joint_states.next())
+    let relayed = tokio::time::timeout(RECV_TIMEOUT, mocks.pairings.backbone.gripper_states.next())
         .await
         .expect("the backbone should receive the relayed state")?
         .expect("backbone states subscription should be open");
@@ -98,7 +98,7 @@ async fn sim_time_stamps_the_heartbeat_and_bounds_the_recency_gate() -> peppygen
     .expect("the heartbeat should start after the first state")?
     .expect("motor_health subscription should be open");
     assert_eq!(health.timestamp, instant(T1_NS));
-    assert_eq!(health.level, vec![0u8; DOF]);
+    assert_eq!(health.level, vec![0u8; MOTORS]);
 
     // The gate's boundary, exactly. At T2 the T1 state is one whole
     // STATE_STALE_AFTER old and the gate is a strict `age <
@@ -143,8 +143,8 @@ async fn sim_time_stamps_the_heartbeat_and_bounds_the_recency_gate() -> peppygen
     mocks
         .pairings
         .simulation
-        .joint_states
-        .publish(&simulation_state(instant(T2_NS)))
+        .gripper_states
+        .publish(&gripper_state(instant(T2_NS)))
         .await?;
     let health = tokio::time::timeout(
         RECV_TIMEOUT,

@@ -13,16 +13,17 @@ dropping a frame instead of queueing when its stream's previous publish is
 still in flight. Every hop is a generated peppygen pairing topic: no JSON, no
 raw peppylib.
 
-When the launch declares this engine its source of simulated time, the physics
-thread records its engine clock each step (`record_engine_time`, ahead of every
-stamp of that step) and publishes it to every machine of the launch on each
-telemetry tick (`publish_sim_time`). The fleet's clock granularity therefore
-follows `state_rate_hz` while this engine's own stamps stay step-fresh. A time
-source must not read its own time back off the wire, so the stamps come
-straight from the recorded engine clock rather than through `peppygen.clock`;
-every follower reads the published tick, which is the point. On a wall-time
-launch nothing is declared, nothing is published, and the stamps read the
-daemon-resolved clock as before.
+Beside the pairings, the engine emits object_state's object_states topic: a
+full snapshot of every spawned object on the state tick, dropped instead of
+queued while the previous one is still in flight, as a camera frame is.
+
+When the deployment names this instance the publisher of a clock domain, the
+physics thread records its engine clock each step (`record_engine_time`, ahead
+of every stamp of that step) and this node publishes it on each telemetry tick
+(`publish_clock_tick`). The domain's granularity therefore follows
+`state_rate_hz` while this engine's own stamps stay step-fresh. A publisher
+reads back the instant it committed, so the stamps come straight from the
+recorded engine clock.
 """
 
 from __future__ import annotations
@@ -36,7 +37,8 @@ from typing import Optional
 
 import peppylib
 from peppygen import clock
-from peppylib.clock import SimTimePublisher
+from peppylib.clock import ClockPublisher
+from peppygen.emitted_topics.objects import object_states
 from peppygen.paired_topics.chest import depth_stream as chest_depth
 from peppygen.paired_topics.chest import stream_info as chest_info
 from peppygen.paired_topics.chest import video_stream as chest_video
@@ -58,8 +60,8 @@ logger = logging.getLogger(__name__)
 # The clock topic reserves zero for "no tick observed yet", so the smallest
 # instant an engine can carry is one nanosecond. A timeline still sitting at
 # zero is a real instant rather than a fault, so it is floored to that
-# minimum: the states this engine stamps and the ticks the fleet reads then
-# carry the same instant instead of differing by the wire's own clamp.
+# minimum: the states this engine stamps and the domain's ticks then carry
+# the same instant instead of differing by the wire's own clamp.
 _MIN_ENGINE_TIME_S = 1e-9
 
 # Limb slots are keyed by the name the model gives the limb, which is the
@@ -119,11 +121,12 @@ _PUBLISH_STALL_S = 5.0
 
 
 class _PublishGuard:
-    """At most one in-flight publish batch per camera surface: acquired on the
-    render thread when a capture is scheduled, released on the loop when every
-    publish task of the batch finishes. A camera that can't keep up drops
-    whole captures instead of piling publish tasks onto the loop, and an rgbd
-    color + depth pair shares one guard so a pair is never half-dropped."""
+    """At most one in-flight publish batch per surface (a camera's frames or
+    stream info, the object-state stream): acquired on the physics thread
+    when a sample is scheduled, released on the loop when every publish task
+    of the batch finishes. A surface that can't keep up drops whole samples
+    instead of piling publish tasks onto the loop, and an rgbd color + depth
+    pair shares one guard so a pair is never half-dropped."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -174,41 +177,40 @@ class SimTopicIO:
         # Camera publishers and their in-flight guards, keyed by (slot, topic).
         self._camera_pubs: dict[tuple[str, str], peppylib.TopicPublisher] = {}
         self._camera_guards: dict[tuple[str, str], _PublishGuard] = {}
+        # The object_states publisher and its in-flight guard.
+        self._object_states_pub: Optional[peppylib.TopicPublisher] = None
+        self._object_states_guard = _PublishGuard()
         self._tasks: list[asyncio.Task] = []
-        # Set in start() when the launch declared this engine its time source.
-        self._sim_clock: Optional[SimTimePublisher] = None
+        # Set in start() when the deployment names this instance the
+        # publisher of a clock domain.
+        self._clock_publisher: Optional[ClockPublisher] = None
         # The engine clock this instance stamps its own state with. Written
-        # and read on the physics thread only; used only while _sim_clock is
-        # set (otherwise stamps read the daemon clock).
+        # and read on the physics thread only, while _clock_publisher is set.
         self._engine_time_s: Optional[float] = None
-        # Clock fan-out state, node loop only: whether a publish is in
+        # Clock publish state, node loop only: whether a publish is in
         # flight, the newest tick that arrived while one was, and whether the
-        # last completed fan-out failed (logged once per transition).
+        # last completed publish failed (logged once per transition).
         self._clock_in_flight = False
         self._clock_latched_ns: Optional[int] = None
-        self._clock_fanout_failed = False
+        self._clock_publish_failed = False
 
     async def start(self) -> None:
         """Declare publishers and spawn the setpoint-consume loops. Runs on the
         node loop before the sim thread starts. Publishing while a slot is
         unpaired is a legal no-op, so bringup order never matters."""
-        # State timestamps read the daemon-resolved clock, the same source every
-        # follower uses, so consumers age samples on one timeline.
+        # State timestamps read this instance's bound clock, the one its
+        # consumers read too, so samples age on one timeline.
         await clock.init(self._node_runner)
-        # An engine the launch declared its time source drives that clock
-        # instead of reading it. The machine list is resolved by the daemon
-        # from the launch's own placement, so nothing here names one; on a
-        # wall-time launch there is no source to be and this stays None.
-        self._sim_clock = await SimTimePublisher.for_node(self._node_runner)
-        if self._sim_clock is not None:
-            logger.info(
-                "publishing simulated time to "
-                f"{', '.join(self._sim_clock.participants)}"
-            )
+        # A deployment names one instance of a clock domain its publisher, and
+        # holding a publisher is that answer.
+        self._clock_publisher = await ClockPublisher.for_node(self._node_runner)
+        if self._clock_publisher is not None:
+            logger.info(f"publishing clock domain {self._clock_publisher.domain}")
         for side, (_, states) in _ARM_SLOTS.items():
             self._arm_pubs[side] = await states.declare_publisher(self._node_runner)
         for side, (_, states) in _GRIPPER_SLOTS.items():
             self._gripper_pubs[side] = await states.declare_publisher(self._node_runner)
+        self._object_states_pub = await object_states.declare_publisher(self._node_runner)
         for name, (video, info) in _COLOR_CAMERA_SLOTS.items():
             await self._declare_camera_publishers(
                 name, [(_VIDEO_STREAM, video), (_STREAM_INFO, info)]
@@ -301,9 +303,9 @@ class SimTopicIO:
     def record_engine_time(self, engine_time_s: float) -> None:
         """Adopt this step's engine clock for every stamp this engine emits.
         Called from the physics thread once physics has advanced, ahead of
-        every state and camera stamp of the step; a no-op on a wall-time
-        launch, where stamps read the daemon-resolved clock instead."""
-        if self._sim_clock is None:
+        every state and camera stamp of the step. Records while this instance
+        publishes a clock domain; a consumer stamps from its bound clock."""
+        if self._clock_publisher is None:
             return
         if not math.isfinite(engine_time_s) or engine_time_s < 0.0:
             raise ValueError(
@@ -311,66 +313,65 @@ class SimTopicIO:
             )
         self._engine_time_s = max(engine_time_s, _MIN_ENGINE_TIME_S)
 
-    def publish_sim_time(self) -> None:
-        """Publish the recorded engine clock to every machine of the launch,
-        on the telemetry cadence. At most one fan-out is in flight; a tick
-        arriving while one is out is latched and sent when it completes, so a
-        slow machine can delay the fleet's clock but never reorder it.
+    def publish_clock_tick(self) -> None:
+        """Publish the recorded engine clock on the telemetry cadence. At most
+        one publish is in flight; a tick arriving while one is out is latched
+        and sent when it completes, so a slow send can delay the domain's clock
+        but never reorder it.
 
         Called from the physics thread, which must never block on messaging,
         so the publish is handed to the node loop like every other."""
-        if self._sim_clock is None:
+        if self._clock_publisher is None:
             return
         engine_time_s = self._engine_time_s
         if engine_time_s is None:
             raise RuntimeError(
-                "a declared time source must record an engine step before publishing"
+                "a domain's publisher must record an engine step before publishing"
             )
         time_ns = int(engine_time_s * 1e9)
         try:
-            self._loop.call_soon_threadsafe(self._publish_sim_time_on_loop, time_ns)
+            self._loop.call_soon_threadsafe(self._publish_clock_tick_on_loop, time_ns)
         except RuntimeError:
             # Loop closed during shutdown; the tick is dropped with the rest.
             pass
 
-    def _publish_sim_time_on_loop(self, time_ns: int) -> None:
+    def _publish_clock_tick_on_loop(self, time_ns: int) -> None:
         if self._clock_in_flight:
             self._clock_latched_ns = time_ns
             return
         self._clock_in_flight = True
-        task = asyncio.ensure_future(self._sim_clock.publish(time_ns))
-        task.add_done_callback(self._on_sim_time_published)
+        task = asyncio.ensure_future(self._clock_publisher.publish(time_ns))
+        task.add_done_callback(self._on_clock_tick_published)
 
-    def _on_sim_time_published(self, task: asyncio.Task) -> None:
-        """Fan-out failures are latched, not repeated: one error line when the
-        fleet stops being reached (naming the machines), one line when it
-        recovers, never a warning per tick."""
+    def _on_clock_tick_published(self, task: asyncio.Task) -> None:
+        """Publish failures are latched, not repeated: one error line when the
+        domain stops being published, one line when it recovers, never a
+        warning per tick."""
         self._clock_in_flight = False
         if not task.cancelled():
             error = task.exception()
-            if error is not None and not self._clock_fanout_failed:
-                self._clock_fanout_failed = True
-                logger.error(f"sim time is not reaching the whole fleet: {error}")
-            elif error is None and self._clock_fanout_failed:
-                self._clock_fanout_failed = False
-                logger.info("sim time is reaching the whole fleet again")
+            if error is not None and not self._clock_publish_failed:
+                self._clock_publish_failed = True
+                logger.error(f"the clock domain is not being published: {error}")
+            elif error is None and self._clock_publish_failed:
+                self._clock_publish_failed = False
+                logger.info("the clock domain is being published again")
         latched_ns = self._clock_latched_ns
         self._clock_latched_ns = None
         if latched_ns is not None:
-            self._publish_sim_time_on_loop(latched_ns)
+            self._publish_clock_tick_on_loop(latched_ns)
 
     def timestamp_s(self) -> float:
         """The instant this engine stamps its own state with: its engine clock
-        when it is the launch's time source, the daemon-resolved clock
-        otherwise. A time source reading its own tick back off the wire would
-        round-trip through its own subscription and read not-ready until the
-        first tick it published came back."""
-        if self._sim_clock is None:
+        while it publishes a clock domain, its bound clock otherwise. A
+        publisher's stamp is the instant it committed, which is the instant
+        its tick carries."""
+        if self._clock_publisher is None:
             return clock.now_ns() / 1e9
         engine_time_s = self._engine_time_s
         if engine_time_s is None:
             raise RuntimeError(
-                "a declared time source must record an engine step before stamping"
+                "a domain's publisher must record an engine step before stamping"
             )
         return engine_time_s
 
@@ -482,6 +483,30 @@ class SimTopicIO:
         )
         self._publish_guarded(name, _INFO_SURFACE, [(_STREAM_INFO, payload)])
 
+    def capture_timestamp_s(self) -> Optional[float]:
+        """The instant of a state capture taken now, on the timeline the
+        joint states are stamped on. None while this engine publishes a clock
+        domain and has not recorded a step: such a capture has no instant yet,
+        so it is not a snapshot."""
+        if self._clock_publisher is not None and self._engine_time_s is None:
+            return None
+        return self.timestamp_s()
+
+    def publish_object_states(self, snapshot) -> bool:
+        """Publish one object-state snapshot, stamped with the instant it was
+        captured. False when the previous snapshot is still in flight: this
+        one is dropped, and the next replaces it."""
+        pub = self._object_states_pub
+        if pub is None:
+            return False
+        payload = object_states.build_message(
+            snapshot.timestamp_s,
+            [object_states.MessageObjectsItem(**record.fields()) for record in snapshot.objects],
+        )
+        return self._publish_batch(
+            self._object_states_guard, object_states.TOPIC_NAME, [(pub, payload)]
+        )
+
     async def _declare_camera_publishers(
         self, name: str, topics: list[tuple[str, object]]
     ) -> None:
@@ -495,15 +520,25 @@ class SimTopicIO:
     def _publish_guarded(
         self, name: str, surface: str, topic_payloads: list[tuple[str, bytes]]
     ) -> bool:
-        """False when this surface's previous batch is still in flight, so the
-        caller knows the sample never reached a consumer."""
-        guard = self._camera_guards[(name, surface)]
-        if not guard.try_acquire(f"{name} {surface}"):
-            return False
+        """One camera surface's batch, behind that surface's guard."""
         publishes = [
             (self._camera_pubs[(name, topic_name)], payload)
             for topic_name, payload in topic_payloads
         ]
+        return self._publish_batch(
+            self._camera_guards[(name, surface)], f"{name} {surface}", publishes
+        )
+
+    def _publish_batch(
+        self,
+        guard: _PublishGuard,
+        surface: str,
+        publishes: list[tuple[peppylib.TopicPublisher, bytes]],
+    ) -> bool:
+        """False when this surface's previous batch is still in flight, so the
+        caller knows the sample never reached a consumer."""
+        if not guard.try_acquire(surface):
+            return False
 
         def _publish() -> None:
             # Runs on the loop, so the counter needs no lock; the guard is
