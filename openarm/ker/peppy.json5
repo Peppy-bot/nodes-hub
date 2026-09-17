@@ -22,10 +22,10 @@
         // setpoints; the backbone governs them. The state back-channels are
         // not consumed (the leader is open loop). Optional so a bring-up
         // launch can boot the leader unbound.
-        { name: "joint_link", tag: "v1", role: "leader", link_id: "left_arm", optional: true },
-        { name: "joint_link", tag: "v1", role: "leader", link_id: "right_arm", optional: true },
-        { name: "gripper_link", tag: "v1", role: "leader", link_id: "left_gripper", optional: true },
-        { name: "gripper_link", tag: "v1", role: "leader", link_id: "right_gripper", optional: true },
+        { name: "joint_link", tag: "v1", role: "leader", link_id: "left_arm", cardinality: "zero_or_one" },
+        { name: "joint_link", tag: "v1", role: "leader", link_id: "right_arm", cardinality: "zero_or_one" },
+        { name: "gripper_link", tag: "v1", role: "leader", link_id: "left_gripper", cardinality: "zero_or_one" },
+        { name: "gripper_link", tag: "v1", role: "leader", link_id: "right_gripper", cardinality: "zero_or_one" },
       ],
     },
   },

@@ -26,7 +26,7 @@
       pairings: [
         // The exclusive command loop with the backbone, identical to the real
         // arm's slot: optional, established at the backbone's start.
-        { name: "joint_link", tag: "v1", role: "follower", link_id: "backbone", optional: true },
+        { name: "joint_link", tag: "v1", role: "follower", link_id: "backbone", cardinality: "zero_or_one" },
         // The same pairing toward the simulation's matching limb slot: this
         // relay leads, the simulation follows. Required: a relay without a
         // simulation is a misconfiguration, so the launch fails loudly instead.
