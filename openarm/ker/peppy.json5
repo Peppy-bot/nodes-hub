@@ -68,8 +68,8 @@
       // reaches this value or below (at least 0, under 1); a smaller value
       // demands a deeper squeeze.
       // The trigger must first read back above this value for three frames in
-      // a row, so a device returning under a held trigger stays put. From the engaging
-      // frame the arm and its gripper track the KER. That same squeeze
+      // a row, so a device returning under a held trigger stays put. From the
+      // engaging frame the arm and its gripper track the KER. That same squeeze
       // commands the gripper, so an arm engages with its gripper near shut.
       // Required: how deep a squeeze starts motion is a deployment choice.
       engage_trigger_opening: "f64",

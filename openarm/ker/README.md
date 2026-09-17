@@ -23,8 +23,9 @@ To pause, unplug the KER: both arms disengage and the followers hold their
 last setpoints, still energized. To end the session, stop the copy running
 it: `peppy stack remove echo` for one robot, `peppy stack reset` for this
 machine's stack. Ending a session disables the motors, so the arms go limp
-where they are: bring them low first. While no frames arrive the node publishes nothing, so every
-consumer's stream timeout holds the robot; a frame arriving after a gap of
+where they are: bring them low first. While no frames arrive the node
+publishes nothing, so every consumer's stream timeout holds the robot; a
+frame arriving after a gap of
 `stale_timeout_s` disengages both arms. After a pause, plug the KER back in,
 then release a trigger and squeeze it again to re-engage.
 
@@ -41,9 +42,9 @@ the controller on. `lsusb -d 303a:` then shows the controller in one of two mode
   `transport: "serial"` reads.
 
 Apptainer shares the host `/dev`, so the container reaches whichever device
-the rule below covers without any bind of its own.
+the udev rule covers without any bind of its own.
 
-## Host setup (once)
+## Host setup (once, on the machine the KER plugs into)
 
 Install [the KER udev rule](https://github.com/Peppy-bot/launchers-hub/blob/main/openarm/rules/60-openarm-ker.rules)
 from launchers-hub, following its header. Without it the node logs "KER

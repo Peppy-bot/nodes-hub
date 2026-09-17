@@ -1,5 +1,5 @@
 // Blocking byte transports to the KER's M5Stack CoreS3: USB vendor mode
-// (rusb) or serial CDC (serialport). Both poll reads with a short timeout so
+// (rusb) or the ESP32's serial device (serialport). Both poll reads with a short timeout so
 // the reader thread can check cancellation between reads; a timeout surfaces
 // as `Ok(0)`, device loss as `Err`.
 
@@ -99,9 +99,12 @@ impl UsbTransport {
                     io::ErrorKind::PermissionDenied,
                     format!(
                         "USB device {USB_VID:04x}:{USB_PID:04x} is attached but cannot be \
-                         opened: copy openarm/rules/60-openarm-ker.rules from \
-                         launchers-hub into /etc/udev/rules.d/, then `sudo udevadm control \
-                         --reload-rules && sudo udevadm trigger` and replug it"
+                         opened: install openarm/rules/60-openarm-ker.rules from \
+                         launchers-hub into /etc/udev/rules.d/ per its header, then `sudo \
+                         udevadm control --reload-rules && sudo udevadm trigger` and replug \
+                         it. On a host with no local login the rule's uaccess tag grants \
+                         nobody: uncomment its group matchers and add this node's user to \
+                         that group"
                     ),
                 )
             } else {

@@ -1,5 +1,6 @@
 // KER wire protocol: pure byte parsing, no transport. The device (an M5Stack
-// CoreS3) speaks a small framed protocol over USB vendor mode or serial CDC:
+// CoreS3) speaks a small framed protocol over USB vendor mode or the ESP32's
+// serial device:
 //
 // - Host commands are single bytes (`CMD_*`).
 // - The PING response (`PING_HEADER`) carries device metadata and a
@@ -75,7 +76,7 @@ impl std::error::Error for ProtocolError {}
 
 /// A stream field's element type, from the schema's type id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FieldType {
+enum FieldType {
     U32,
     U16,
     U8,
@@ -99,7 +100,7 @@ impl FieldType {
         }
     }
 
-    pub(crate) fn size(self) -> usize {
+    fn size(self) -> usize {
         match self {
             Self::U32 | Self::I32 | Self::F32 => 4,
             Self::U16 | Self::I16 => 2,
@@ -110,10 +111,10 @@ impl FieldType {
 
 /// One field of the device's stream packet layout.
 #[derive(Debug, Clone)]
-pub struct FieldDesc {
-    pub key: String,
-    pub ty: FieldType,
-    pub count: usize,
+struct FieldDesc {
+    key: String,
+    ty: FieldType,
+    count: usize,
 }
 
 /// Device identity strings from the PING response.
@@ -140,7 +141,7 @@ impl Metadata {
 #[derive(Debug)]
 pub struct Schema {
     pub metadata: Metadata,
-    pub fields: Vec<FieldDesc>,
+    fields: Vec<FieldDesc>,
 }
 
 /// Outcome of feeding handshake bytes to [`Schema::parse_ping`].
@@ -651,7 +652,7 @@ mod tests {
             metadata: reference_schema(1).metadata,
             fields: vec![
                 FieldDesc {
-                    key: "encoder_button".into(),
+                    key: "charging".into(),
                     ty: FieldType::Bool,
                     count: 1,
                 },
@@ -661,7 +662,7 @@ mod tests {
                     count: 2,
                 },
                 FieldDesc {
-                    key: "encoder_value".into(),
+                    key: "temperature_c".into(),
                     ty: FieldType::I16,
                     count: 1,
                 },
