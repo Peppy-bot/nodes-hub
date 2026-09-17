@@ -11,9 +11,15 @@ name: Tests
 # for unprivileged use, boots a daemon of its own, generates the tested nodes'
 # interfaces, and runs each node's tests inside a container derived from its
 # `apptainer.def`. The runner image provides none of the nodes' build
-# dependencies. The runner is an ephemeral Blacksmith VM, so everything worth
+# dependencies. The runner is self-hosted and reused, so everything worth
 # keeping between runs (test images, cargo registries, per-crate target dirs,
-# uv's downloads) lives on a sticky disk mounted below.
+# uv's downloads) simply outlives the job in the cache directory named below.
+#
+# Every job runs on that self-hosted runner, except on a pull request from a
+# fork: fork code must not run on a box that persists between jobs and holds
+# every repository's build caches, so those runs go to a GitHub-hosted runner,
+# which starts from a cold cache. `github.event.pull_request.head.repo.fork` is
+# null on push, which the expression reads as false.
 on:
   push:
     branches: [main]
@@ -29,7 +35,7 @@ env:
 jobs:
   python-syntax:
     name: Python syntax
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-24.04' || 'self-hosted' }}
     # Use the newest Python minor required by repository projects. This is a
     # syntax gate; each project's tests still use its own Python requirements.
     container: python:3.13
@@ -46,7 +52,7 @@ jobs:
 
   javascript-typescript:
     name: JavaScript and TypeScript tests
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-24.04' || 'self-hosted' }}
     timeout-minutes: 15
     permissions:
       contents: read
@@ -66,15 +72,15 @@ jobs:
 
   discover-and-run:
     name: All Rust and Python tests
-    # x86 rather than the -arm label: the base images and the librealsense apt
-    # repository are published for both, and the sticky disk key below carries
-    # the architecture, so switching is a label change that starts from an
-    # empty disk rather than a wrong-arch one.
-    runs-on: blacksmith-16vcpu-ubuntu-2404
+    # The self-hosted runner is x86, and the cache directory named below
+    # carries the architecture, so moving this repository onto an arm runner
+    # starts from an empty cache rather than a wrong-arch one. The base images
+    # and the librealsense apt repository are published for both.
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-24.04' || 'self-hosted' }}
     # A cold run compiles nine crates' full dependency trees and resolves
-    # lerobot's, torch included. The sticky disk keeps warm runs far under
-    # this, but the first run after the disk is evicted (7 idle days) or its
-    # key changes is legitimately slow.
+    # lerobot's, torch included. The persistent cache keeps warm runs far under
+    # this, but a run that cannot reuse it (a fork's pull request, or the first
+    # run after the directory is cleared) is legitimately slow.
     timeout-minutes: 120
     permissions:
       contents: read
@@ -88,25 +94,18 @@ jobs:
           persist-credentials: false
 
       # Container images, cargo registries, crate build outputs and uv's
-      # download cache outlive the run on a Blacksmith sticky disk: they are
-      # what makes a warm run cheap, and the runner's own disk is discarded
-      # with the job. Every run mounts a clone of the disk's last committed
-      # snapshot, so nothing stored here may be state one run depends on
-      # another having written — only caches apptainer, cargo and uv can
-      # rebuild from scratch. Only pushes to main commit their clone: the
-      # concurrency group serialises those, so commits never race, and a pull
-      # request (possibly from a fork) reads the cache but cannot write into
-      # what every later run builds on. A pull request therefore recompiles
-      # just its own delta against main's warm snapshot. The key carries the
-      # architecture because the cached .sif images are built for the host
-      # that built them.
-      - name: Mount the build caches
-        uses: useblacksmith/stickydisk@35ba2e331a80056a42af053ee54968511de2b7c7 # v1.5.0
-        with:
-          key: ${{ github.repository }}-tests-${{ runner.arch }}
-          path: ~/.cache/nodes-hub-ci
-          commit: ${{ github.event_name == 'push' }}
-
+      # download cache outlive the run in a directory on the self-hosted
+      # runner: they are what makes a warm run cheap. Nothing mounts or
+      # uploads it — the box is reused, so the directory the step below names
+      # is simply still there. The directory is live rather than a snapshot,
+      # so a run reads what the previous run left and a pull request writes
+      # into what later runs build on; nothing stored here may therefore be
+      # state one run depends on another having written, only caches
+      # apptainer, cargo and uv can rebuild from scratch. The runner executes
+      # one job at a time, so concurrent writers are not a concern today; a
+      # second runner would make these directories shared mutable state and
+      # is a reason to revisit this. A fork's pull request runs on a
+      # GitHub-hosted runner and so neither reads nor writes the cache.
       - name: Name the caches this run reuses
         run: python3 .github/scripts/configure-build-cache.py
 
