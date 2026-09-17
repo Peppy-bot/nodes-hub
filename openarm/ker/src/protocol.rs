@@ -212,20 +212,20 @@ impl Schema {
         if !metadata.is_plausible() {
             return Candidate::NotAResponse;
         }
-        // The reply ends with one snapshot entry per angle channel, so the
-        // bytes it spans are the table plus that block.
+        // The reply ends with one snapshot entry per angle channel. The
+        // firmware writes it in packets of its own, so the response counts as
+        // read at the end of the table and the block is consumed as far as it
+        // has arrived; a tail landing later reaches the deframer, which
+        // resyncs on the next packet header.
+        let table_end = start + PING_FIXED_LEN + field_count * FIELD_ENTRY_LEN;
         let angles = fields
             .iter()
             .find(|field| field.key == REQUIRED_FIELD)
             .map_or(0, |field| field.count);
-        let consumed =
-            start + PING_FIXED_LEN + field_count * FIELD_ENTRY_LEN + angles * SNAPSHOT_ENTRY_LEN;
-        if buf.len() < consumed {
-            return Candidate::NeedMore;
-        }
+        let snapshot = (angles * SNAPSHOT_ENTRY_LEN).min(buf.len() - table_end);
         Candidate::Parsed {
             schema: Schema { metadata, fields },
-            consumed,
+            consumed: table_end + snapshot,
         }
     }
 }
@@ -479,9 +479,30 @@ mod tests {
     }
 
     #[test]
+    fn a_reply_whose_snapshot_block_is_still_in_flight_still_connects() {
+        // The firmware sends the reply in packets of its own, so the block
+        // after the schema can lag. Everything through the table is what the
+        // node needs.
+        let response = ping_response(16);
+        let table_end = response.len() - 16 * SNAPSHOT_ENTRY_LEN;
+        for arrived in [table_end, table_end + 7, response.len()] {
+            let PingParse::Parsed { schema, consumed } = Schema::parse_ping(&response[..arrived])
+            else {
+                panic!("a complete table parses with {arrived} bytes in hand");
+            };
+            assert_eq!(schema.metadata.hardware, "2.0.0");
+            assert_eq!(
+                consumed, arrived,
+                "the block is consumed as far as it arrived"
+            );
+        }
+    }
+
+    #[test]
     fn ping_needs_more_on_every_truncation() {
         let response = ping_response(16);
-        for len in 0..response.len() {
+        let table_end = response.len() - 16 * SNAPSHOT_ENTRY_LEN;
+        for len in 0..table_end {
             assert!(
                 matches!(Schema::parse_ping(&response[..len]), PingParse::NeedMore),
                 "truncation at {len} must ask for more"
