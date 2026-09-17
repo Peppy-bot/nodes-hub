@@ -65,7 +65,8 @@
       // the arm and gripper pairing slots.
       command_rate_hz: "u32",
       // Engage an arm when its trigger opening (1 released, 0 fully squeezed)
-      // reaches this value or below; a smaller value demands a deeper squeeze.
+      // reaches this value or below (at least 0, under 1); a smaller value
+      // demands a deeper squeeze.
       // The trigger must first read back above this value for a few frames, so
       // a device returning under a held trigger stays put. From the engaging
       // frame the arm and its gripper track the KER. That same squeeze
@@ -76,8 +77,8 @@
       gripper_open_fraction: { $type: "f64", $default: 1.0 },
       // Stop publishing when the newest KER frame is older than this (s); the
       // followers then hold their last setpoints. A frame arriving after a gap
-      // this long also disengages both arms. Refused below 0.005, which is the
-      // room a 1 kHz stream needs.
+      // this long also disengages both arms. Refused below 0.005 s, five frame
+      // periods of the KER's 1 kHz stream.
       stale_timeout_s: { $type: "f64", $default: 0.25 },
       // Bring-up aid: log the raw channel table (degrees, unmapped) at 1 Hz.
       log_raw: { $type: "bool", $default: false }

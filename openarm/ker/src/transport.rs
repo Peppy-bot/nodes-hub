@@ -99,16 +99,19 @@ impl UsbTransport {
                     io::ErrorKind::PermissionDenied,
                     format!(
                         "USB device {USB_VID:04x}:{USB_PID:04x} is attached but cannot be \
-                         opened: install the KER udev rule, then `sudo udevadm control \
-                         --reload-rules && sudo udevadm trigger` and replug it"
+                         opened: install openarm/rules/60-openarm-ker.rules from \
+                         launchers-hub, then `sudo udevadm control --reload-rules && sudo \
+                         udevadm trigger` and replug it"
                     ),
                 )
             } else {
                 io::Error::new(
                     io::ErrorKind::NotFound,
                     format!(
-                        "no USB device {USB_VID:04x}:{USB_PID:04x} attached: `lsusb -d 303a:` \
-                         lists what is, and transport \"serial\" reads the KER's CDC device"
+                        "no USB device {USB_VID:04x}:{USB_PID:04x} attached: switch the \
+                         controller on and check the cable; `lsusb -d 303a:` lists what is \
+                         attached. Set transport \"serial\" only for a KER whose firmware \
+                         streams over its serial device"
                     ),
                 )
             }

@@ -12,7 +12,7 @@ use peppylib::datastore::{self, Encoding};
 use tokio::sync::watch;
 use tracing::{error, info, warn};
 
-use crate::engage::{EngageOpening, EngageOpeningOutOfRange};
+use crate::engage::{EngageTriggerOpening, EngageTriggerOpeningOutOfRange};
 use crate::mapping::{GripperOpenFraction, GripperOpenFractionOutOfRange};
 use crate::publish;
 use crate::reader::{self, ReaderConfig};
@@ -26,12 +26,11 @@ const LOCK_KEY: &str = "openarm_ker_instance_lock";
 /// The fastest this node streams the leader's pose. The KER reference loop
 /// runs at 1 kHz; nothing downstream consumes faster.
 const MAX_RATE_HZ: u32 = 1_000;
-/// The shortest stale window that can hold a KER frame: the device streams at
-/// 1 kHz, so anything tighter ages every frame out on arrival. Both consumers
-/// of the window (the engage latch and the publisher) age against frame
-/// arrival, so this is the quantity that binds.
-const MIN_STALE_TIMEOUT_S: f64 = 0.005;
-const MIN_STALE_TIMEOUT_S_DURATION: Duration = Duration::from_millis(5);
+/// The shortest stale window worth running: five frame periods of the KER's
+/// 1 kHz stream. Both consumers of the window (the engage latch and the
+/// publisher) age against frame arrival, so this is the quantity that binds,
+/// and a window this tight already disengages on a five-frame hiccup.
+const MIN_STALE_TIMEOUT: Duration = Duration::from_millis(5);
 
 /// Latched when a task stopped on its own rather than in reaction to shutdown.
 static TASK_FAILED: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
@@ -54,11 +53,11 @@ pub enum NodeError {
     StaleTimeout(#[source] DurationError),
 
     #[error(
-        "stale_timeout_s {0} is under {MIN_STALE_TIMEOUT_S} s, the window a KER frame has to \
-         arrive in at the device's 1 kHz stream: every frame would read as stale and no arm \
-         would ever engage"
+        "stale_timeout_s {given} is under the {floor} s floor, five frame periods of the \
+         KER's 1 kHz stream: a tighter window ages frames out as they arrive and no arm ever \
+         engages. Raise it to at least {floor}, or leave the 0.25 default"
     )]
-    StaleTimeoutUnderFramePeriod(f64),
+    StaleTimeoutUnderFloor { given: f64, floor: f64 },
 
     #[error(transparent)]
     HardwareVersion(#[from] openarm_description::UnknownHardwareVersion),
@@ -67,7 +66,7 @@ pub enum NodeError {
     Transport(#[from] TransportError),
 
     #[error(transparent)]
-    EngageOpening(#[from] EngageOpeningOutOfRange),
+    EngageTriggerOpening(#[from] EngageTriggerOpeningOutOfRange),
 
     #[error(transparent)]
     GripperOpenFraction(#[from] GripperOpenFractionOutOfRange),
@@ -114,7 +113,7 @@ struct Config {
     command_period: Duration,
     stale_timeout: Duration,
     transport: TransportConfig,
-    engage_opening: EngageOpening,
+    engage_trigger_opening: EngageTriggerOpening,
     gripper_open_fraction: GripperOpenFraction,
 }
 
@@ -124,10 +123,11 @@ fn parse_config(params: &Parameters) -> NodeResult<Config> {
         period_from_hz(params.command_rate_hz, MAX_RATE_HZ).map_err(NodeError::CommandRate)?;
     let stale_timeout =
         duration_from_secs(params.stale_timeout_s).map_err(NodeError::StaleTimeout)?;
-    if stale_timeout < MIN_STALE_TIMEOUT_S_DURATION {
-        return Err(NodeError::StaleTimeoutUnderFramePeriod(
-            params.stale_timeout_s,
-        ));
+    if stale_timeout < MIN_STALE_TIMEOUT {
+        return Err(NodeError::StaleTimeoutUnderFloor {
+            given: params.stale_timeout_s,
+            floor: MIN_STALE_TIMEOUT.as_secs_f64(),
+        });
     }
     Ok(Config {
         version: params.hardware_version.parse()?,
@@ -138,7 +138,7 @@ fn parse_config(params: &Parameters) -> NodeResult<Config> {
             &params.device_path,
             params.serial_baud,
         )?,
-        engage_opening: EngageOpening::try_from(params.engage_trigger_opening)?,
+        engage_trigger_opening: EngageTriggerOpening::try_from(params.engage_trigger_opening)?,
         gripper_open_fraction: GripperOpenFraction::try_from(params.gripper_open_fraction)?,
     })
 }
@@ -172,7 +172,7 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         config.version,
         config.transport,
         params.command_rate_hz,
-        config.engage_opening.fraction(),
+        config.engage_trigger_opening.fraction(),
         config.gripper_open_fraction.fraction(),
     );
 
@@ -214,14 +214,14 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         command_period,
         stale_timeout,
         transport,
-        engage_opening,
+        engage_trigger_opening,
         gripper_open_fraction,
     } = config;
     let reader_exited = reader::spawn(
         ReaderConfig {
             transport,
             version,
-            engage_opening,
+            engage_trigger_opening,
             gripper_open_fraction,
             stale_timeout,
             log_raw: params.log_raw,
@@ -303,11 +303,21 @@ mod tests {
     }
 
     #[test]
+    fn the_command_rate_ceiling_is_the_devices_own() {
+        let config = parse_config(&Parameters {
+            command_rate_hz: MAX_RATE_HZ,
+            ..params()
+        })
+        .expect("the ceiling itself parses");
+        assert_eq!(config.command_period, Duration::from_millis(1));
+    }
+
+    #[test]
     fn a_launch_with_every_parameter_set_parses() {
         let config = parse_config(&params()).expect("parses");
         assert_eq!(config.command_period, Duration::from_millis(10));
         assert_eq!(config.stale_timeout, Duration::from_millis(250));
-        assert_eq!(config.engage_opening.fraction(), 0.2);
+        assert_eq!(config.engage_trigger_opening.fraction(), 0.2);
         assert_eq!(config.gripper_open_fraction.fraction(), 0.5);
         assert_eq!(config.transport.to_string(), "usb (303a:4002)");
     }
@@ -406,7 +416,7 @@ mod tests {
         // window is about frame arrival, not the publisher's tick.
         assert!(
             parse_config(&Parameters {
-                stale_timeout_s: MIN_STALE_TIMEOUT_S,
+                stale_timeout_s: MIN_STALE_TIMEOUT.as_secs_f64(),
                 ..params()
             })
             .is_ok()

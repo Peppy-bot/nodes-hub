@@ -91,7 +91,7 @@ pub async fn run(
         // velocity feedforward over the governed stream.
         let sample_rx = rx.clone();
         tasks.spawn(stream_setpoints(
-            publish_with(arm_pub),
+            arm_pub,
             command_period,
             token.clone(),
             format!("{} arm", label(side)),
@@ -108,7 +108,7 @@ pub async fn run(
         // preference) leaves the follower's ceiling in charge.
         let sample_rx = rx.clone();
         tasks.spawn(stream_setpoints(
-            publish_with(gripper_pub),
+            gripper_pub,
             command_period,
             token.clone(),
             format!("{} gripper", label(side)),
@@ -140,31 +140,33 @@ fn streamable(
     (sample.engaged.side(side) && sample.received_at.elapsed() < stale_timeout).then_some(sample)
 }
 
-/// A send for one pairing slot's publisher, so the stream loop can be driven
-/// without one in a test.
-fn publish_with(publisher: TopicPublisher) -> impl Fn(Payload) -> BoxFuture<Result<(), String>> {
-    move |payload| {
-        let publisher = publisher.clone();
-        Box::pin(async move { publisher.publish(payload).await.map_err(|e| e.to_string()) })
-    }
+/// One pairing slot's setpoint sink, so the stream loop can be driven without
+/// a publisher in a test.
+trait SetpointSink {
+    type Message;
+
+    fn send(&self, message: Self::Message) -> impl Future<Output = Result<(), String>> + Send;
 }
 
-type BoxFuture<T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>;
+impl SetpointSink for TopicPublisher {
+    type Message = Payload;
+
+    async fn send(&self, message: Payload) -> Result<(), String> {
+        self.publish(message).await.map_err(|e| e.to_string())
+    }
+}
 
 // Publish the latest setpoint from `next_message` every `period`, skipping a
 // tick whenever it returns None. Failures latch so a stuck channel warns once,
 // not every tick. The period arrives already validated, so this side never
 // divides by a rate it has to trust.
-async fn stream_setpoints<M, S, F>(
-    send: S,
+async fn stream_setpoints<S: SetpointSink>(
+    sink: S,
     period: Duration,
     token: CancellationToken,
     label: String,
-    mut next_message: impl FnMut() -> Option<Result<M, String>>,
-) where
-    S: Fn(M) -> F,
-    F: Future<Output = Result<(), String>>,
-{
+    mut next_message: impl FnMut() -> Option<Result<S::Message, String>>,
+) {
     // interval (not sleep) so the publish cadence holds at the commanded rate
     // instead of drifting by the per-tick work time; Delay avoids a catch-up
     // burst after a scheduling hiccup.
@@ -182,7 +184,7 @@ async fn stream_setpoints<M, S, F>(
             continue;
         };
         let result = match built {
-            Ok(msg) => send(msg).await,
+            Ok(msg) => sink.send(msg).await,
             Err(e) => Err(e),
         };
         match result {
@@ -206,33 +208,44 @@ mod loop_tests {
     const PERIOD: Duration = Duration::from_millis(5);
     /// Ticks to let run before judging what was published.
     const TICKS: u32 = 20;
+    /// Only every third tick has something to stream, as a disengaged arm
+    /// does: the rest must skip.
+    const TICKS_PER_MESSAGE: usize = 3;
 
-    #[tokio::test]
+    /// A sink that counts what reached it, and can refuse every send.
+    struct Recorder {
+        sent: Arc<AtomicUsize>,
+        fails: bool,
+    }
+
+    impl SetpointSink for Recorder {
+        type Message = u8;
+
+        async fn send(&self, _message: u8) -> Result<(), String> {
+            self.sent.fetch_add(1, Ordering::SeqCst);
+            if self.fails {
+                return Err("publisher is down".to_string());
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_tick_with_nothing_to_stream_is_skipped_and_the_stream_lives_on() {
         let sent = Arc::new(AtomicUsize::new(0));
         let asked = Arc::new(AtomicUsize::new(0));
         let token = CancellationToken::new();
-
         let stream = {
             let (sent, asked, token) = (sent.clone(), asked.clone(), token.clone());
             tokio::spawn(async move {
                 stream_setpoints(
-                    move |_: u8| {
-                        let sent = sent.clone();
-                        async move {
-                            sent.fetch_add(1, Ordering::SeqCst);
-                            Ok(())
-                        }
-                    },
+                    Recorder { sent, fails: false },
                     PERIOD,
                     token,
                     "test".to_string(),
                     move || {
-                        // Only every third tick has something to stream, as a
-                        // disengaged arm does: the rest must skip, not end the
-                        // task and not repeat the last message.
                         let tick = asked.fetch_add(1, Ordering::SeqCst);
-                        (tick % 3 == 2).then_some(Ok(1u8))
+                        (tick % TICKS_PER_MESSAGE == TICKS_PER_MESSAGE - 1).then_some(Ok(1u8))
                     },
                 )
                 .await
@@ -242,12 +255,15 @@ mod loop_tests {
         tokio::time::sleep(PERIOD * TICKS).await;
         let asked_count = asked.load(Ordering::SeqCst);
         let sent_count = sent.load(Ordering::SeqCst);
-        assert!(asked_count > 3, "the stream kept ticking: {asked_count}");
         assert!(
-            sent_count < asked_count,
-            "skipped ticks publish nothing: {sent_count} of {asked_count}"
+            asked_count >= TICKS as usize,
+            "every tick asks for a message: {asked_count}"
         );
-        assert!(sent_count > 0, "ticks with a message publish");
+        assert_eq!(
+            sent_count,
+            asked_count / TICKS_PER_MESSAGE,
+            "only the ticks with a message publish, and none repeats"
+        );
         assert!(
             !stream.is_finished(),
             "a skipped tick must not end the task"
@@ -260,21 +276,15 @@ mod loop_tests {
             .expect("task");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_failing_send_keeps_the_stream_running() {
-        let attempts = Arc::new(AtomicUsize::new(0));
+        let sent = Arc::new(AtomicUsize::new(0));
         let token = CancellationToken::new();
         let stream = {
-            let (attempts, token) = (attempts.clone(), token.clone());
+            let (sent, token) = (sent.clone(), token.clone());
             tokio::spawn(async move {
                 stream_setpoints(
-                    move |_: u8| {
-                        let attempts = attempts.clone();
-                        async move {
-                            attempts.fetch_add(1, Ordering::SeqCst);
-                            Err("publisher is down".to_string())
-                        }
-                    },
+                    Recorder { sent, fails: true },
                     PERIOD,
                     token,
                     "test".to_string(),
@@ -286,7 +296,7 @@ mod loop_tests {
 
         tokio::time::sleep(PERIOD * TICKS).await;
         assert!(
-            attempts.load(Ordering::SeqCst) > 1,
+            sent.load(Ordering::SeqCst) >= TICKS as usize,
             "a failed publish is retried on the next tick"
         );
         assert!(
@@ -360,14 +370,14 @@ mod tests {
     #[test]
     fn the_stale_window_holds_at_its_own_edge() {
         let (tx, rx) = watch::channel(None);
-        tx.send(Some(sample(BOTH, STALE - Duration::from_millis(20))))
+        tx.send(Some(sample(BOTH, STALE - Duration::from_millis(100))))
             .unwrap();
         assert!(
             streamable(&rx, STALE, Side::Left).is_some(),
             "inside the window still streams"
         );
 
-        tx.send(Some(sample(BOTH, STALE + Duration::from_millis(20))))
+        tx.send(Some(sample(BOTH, STALE + Duration::from_millis(100))))
             .unwrap();
         assert!(
             streamable(&rx, STALE, Side::Left).is_none(),

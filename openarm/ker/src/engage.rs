@@ -9,11 +9,11 @@ use std::time::{Duration, Instant};
 use openarm_description::Side;
 use tracing::info;
 
-use crate::side::{SideFlags, SideValues, label};
+use crate::side::{SideFlags, SideValues, index, label};
 
 /// Consecutive frames a trigger must read open before a squeeze can engage
-/// its arm. A checksum-passing frame can still carry a wrong angle, and one
-/// spurious open reading beside a held trigger would otherwise arm the latch.
+/// its arm. A checksum-passing frame can still carry a wrong angle, so the
+/// run has to be unbroken: a squeezed reading starts the count again.
 const FRAMES_TO_ARM: u8 = 3;
 
 /// A launcher `engage_trigger_opening` outside [0, 1).
@@ -23,45 +23,45 @@ const FRAMES_TO_ARM: u8 = 3;
      below 1. A released trigger reads 1, so a threshold of 1 never arms and no squeeze \
      engages. Try 0.2, got {0}"
 )]
-pub struct EngageOpeningOutOfRange(pub f64);
+pub struct EngageTriggerOpeningOutOfRange(pub f64);
 
 /// The trigger opening at or below which a squeeze engages its arm; strictly
 /// below 1 (fully open).
 #[derive(Debug, Clone, Copy)]
-pub struct EngageOpening(f64);
+pub struct EngageTriggerOpening(f64);
 
-impl EngageOpening {
+impl EngageTriggerOpening {
     pub fn fraction(self) -> f64 {
         self.0
     }
 }
 
-impl TryFrom<f64> for EngageOpening {
-    type Error = EngageOpeningOutOfRange;
+impl TryFrom<f64> for EngageTriggerOpening {
+    type Error = EngageTriggerOpeningOutOfRange;
 
     fn try_from(fraction: f64) -> Result<Self, Self::Error> {
         (0.0..1.0)
             .contains(&fraction)
             .then_some(Self(fraction))
-            .ok_or(EngageOpeningOutOfRange(fraction))
+            .ok_or(EngageTriggerOpeningOutOfRange(fraction))
     }
 }
 
 /// Per-arm engagement over the stream of usable frames.
 pub struct EngageLatch {
-    engage_opening: EngageOpening,
+    engage_trigger_opening: EngageTriggerOpening,
     stale_timeout: Duration,
     engaged: SideFlags,
-    /// Consecutive frames each trigger has read open for, counted up to
-    /// [`FRAMES_TO_ARM`] and reset by a stall.
+    /// Consecutive frames each trigger has read open for, held at
+    /// [`FRAMES_TO_ARM`] once armed and cleared by a squeeze or a stall.
     open_frames: [u8; 2],
     last_frame_at: Option<Instant>,
 }
 
 impl EngageLatch {
-    pub fn new(engage_opening: EngageOpening, stale_timeout: Duration) -> Self {
+    pub fn new(engage_trigger_opening: EngageTriggerOpening, stale_timeout: Duration) -> Self {
         Self {
-            engage_opening,
+            engage_trigger_opening,
             stale_timeout,
             engaged: SideFlags::NONE,
             open_frames: [0; 2],
@@ -78,14 +78,19 @@ impl EngageLatch {
             self.engaged = SideFlags::NONE;
             self.open_frames = [0; 2];
         }
-        let threshold = self.engage_opening.fraction();
-        for (index, side) in [Side::Left, Side::Right].into_iter().enumerate() {
+        let threshold = self.engage_trigger_opening.fraction();
+        for side in [Side::Left, Side::Right] {
+            let open_frames = &mut self.open_frames[index(side)];
             if triggers.side(side) > threshold {
-                self.open_frames[index] = self.open_frames[index].saturating_add(1);
-            } else if self.open_frames[index] >= FRAMES_TO_ARM && !self.engaged.side(side) {
+                *open_frames = open_frames.saturating_add(1).min(FRAMES_TO_ARM);
+                continue;
+            }
+            if *open_frames >= FRAMES_TO_ARM && !self.engaged.side(side) {
                 self.engaged.set(side, true);
                 info!("KER {} arm engaged, tracking the leader", label(side));
             }
+            // A squeeze ends the run of open frames, armed or not.
+            *open_frames = 0;
         }
         self.last_frame_at = Some(at);
         self.engaged
@@ -116,31 +121,42 @@ mod tests {
     };
 
     fn latch() -> EngageLatch {
-        EngageLatch::new(EngageOpening::try_from(ENGAGE_AT).expect("in range"), STALE)
+        EngageLatch::new(
+            EngageTriggerOpening::try_from(ENGAGE_AT).expect("in range"),
+            STALE,
+        )
     }
 
     fn triggers(left: f64, right: f64) -> SideValues {
         SideValues { left, right }
     }
 
-    /// Arm both triggers the documented way, returning the time of the last
-    /// frame fed in.
-    fn arm_both(latch: &mut EngageLatch, from: Instant) -> Instant {
+    /// Feed `frames` open frames to both triggers, returning the time of the
+    /// next frame to send.
+    fn open_for(latch: &mut EngageLatch, from: Instant, frames: u8) -> Instant {
         let mut at = from;
-        for _ in 0..FRAMES_TO_ARM {
+        for _ in 0..frames {
             latch.update(triggers(OPEN, OPEN), at);
             at += FRAME;
         }
         at
     }
 
+    /// Arm both triggers the documented way.
+    fn arm_both(latch: &mut EngageLatch, from: Instant) -> Instant {
+        open_for(latch, from, FRAMES_TO_ARM)
+    }
+
     #[test]
     fn engage_trigger_opening_accepts_only_fractions_below_fully_open() {
         for fraction in [0.0, ENGAGE_AT, 0.999] {
-            assert!(EngageOpening::try_from(fraction).is_ok(), "{fraction}");
+            assert!(
+                EngageTriggerOpening::try_from(fraction).is_ok(),
+                "{fraction}"
+            );
         }
         for fraction in [-0.01, 1.0, 1.5, f64::NAN, f64::INFINITY] {
-            let refused = EngageOpening::try_from(fraction)
+            let refused = EngageTriggerOpening::try_from(fraction)
                 .expect_err("out of range")
                 .to_string();
             assert!(refused.contains("engage_trigger_opening"), "{refused}");
@@ -209,6 +225,38 @@ mod tests {
     }
 
     #[test]
+    fn open_frames_scattered_between_squeezes_never_arm() {
+        let mut latch = latch();
+        let mut at = Instant::now();
+        // Twice as many open frames as arming takes, none of them in a run.
+        for _ in 0..FRAMES_TO_ARM * 2 {
+            latch.update(triggers(OPEN, OPEN), at);
+            at += FRAME;
+            assert_eq!(
+                latch.update(triggers(SQUEEZED, SQUEEZED), at),
+                SideFlags::NONE,
+                "a squeeze between open frames restarts the run"
+            );
+            at += FRAME;
+        }
+    }
+
+    #[test]
+    fn arming_takes_the_whole_run_of_open_frames() {
+        let mut one_short = latch();
+        let at = open_for(&mut one_short, Instant::now(), FRAMES_TO_ARM - 1);
+        assert_eq!(
+            one_short.update(triggers(SQUEEZED, SQUEEZED), at),
+            SideFlags::NONE,
+            "one frame short of the run must not engage"
+        );
+
+        let mut whole_run = latch();
+        let at = open_for(&mut whole_run, Instant::now(), FRAMES_TO_ARM);
+        assert_eq!(whole_run.update(triggers(SQUEEZED, SQUEEZED), at), BOTH);
+    }
+
+    #[test]
     fn a_frame_gap_of_the_stale_timeout_disengages_both_arms() {
         let mut latch = latch();
         let at = arm_both(&mut latch, Instant::now());
@@ -238,7 +286,7 @@ mod tests {
             );
         }
         // Only the left trigger is released, so only the left arm can engage.
-        let mut at = returned + FRAME * 8;
+        let mut at = returned + FRAME * (FRAMES_TO_ARM as u32 + 2);
         for _ in 0..FRAMES_TO_ARM {
             latch.update(triggers(OPEN, SQUEEZED), at);
             at += FRAME;

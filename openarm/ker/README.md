@@ -19,11 +19,13 @@ a full squeeze closes it, and the squeeze that engages an arm therefore
 commands its gripper near shut. Releasing the trigger opens that gripper and
 leaves the arm tracking.
 
-To stop, unplug the KER, or stop the copy running it: `peppy stack remove
-<copy>` for one robot, `peppy stack reset` for everything. Frames arriving
-after a gap of `stale_timeout_s` disengage both arms, and while no frames
-arrive the node publishes nothing, so every consumer's stream timeout holds
-the robot. After that, release a trigger and squeeze it again to re-engage.
+To pause, unplug the KER: both arms disengage and the followers hold their
+last setpoints, still energized. To end the session, stop the copy running
+it: `peppy stack remove echo` for one robot, `peppy stack reset` for this
+machine's stack. While no frames arrive the node publishes nothing, so every
+consumer's stream timeout holds the robot; a frame arriving after a gap of
+`stale_timeout_s` disengages both arms. After a pause, release a trigger and
+squeeze it again to re-engage.
 
 ## Connect
 
@@ -45,7 +47,8 @@ the rule below covers without any bind of its own.
 Install [the KER udev rule](https://github.com/Peppy-bot/launchers-hub/blob/main/openarm/rules/60-openarm-ker.rules)
 from launchers-hub, following its header. Without it the node logs "KER
 connection lost (open: ... attached but cannot be opened ...)" once and
-retries every second, logging again only when the reason changes.
+retries every second, logging again when the reason changes or after a
+reconnect.
 
 Verify the link with enactic's CLI. They ship it on PyPI as `openarm_ker`,
 the same name as this node and no relation to it, and it runs without being
@@ -77,4 +80,7 @@ table (`CH01=.. CH02=..`, degrees) at 1 Hz:
 
 First engaged run: keep the backbone's `max_ee_velocity_m_s` conservative. An
 arm engaged far from the follower's pose streams that distant target at once,
-and the backbone's rate-limited follow chase moves the follower toward it.
+and the backbone's rate-limited follow chase moves the follower toward it:
+
+    peppy stack join openarm_v2 -i echo --with ker_commander \
+      --set-arguments 'backbone_inst.max_ee_velocity_m_s=0.1'

@@ -23,8 +23,8 @@ use std::fmt;
 pub const CMD_PING: u8 = 0x00;
 pub const CMD_STANDBY: u8 = 0x01;
 pub const CMD_STREAM: u8 = 0x02;
-pub const PING_HEADER: [u8; 2] = [0xA5, 0x50];
-pub const STREAM_HEADER: [u8; 2] = [0xA5, 0x5A];
+pub(crate) const PING_HEADER: [u8; 2] = [0xA5, 0x50];
+pub(crate) const STREAM_HEADER: [u8; 2] = [0xA5, 0x5A];
 
 const FW_LEN: usize = 16;
 const HW_LEN: usize = 16;
@@ -36,9 +36,8 @@ const FIELD_ENTRY_LEN: usize = KEY_LEN + 2;
 const PING_FIXED_LEN: usize = 2 + FW_LEN + HW_LEN + UPDATED_LEN + 1;
 /// The longest response the device can describe: every field a `u8` count
 /// can name.
-pub const MAX_PING_RESPONSE_LEN: usize = PING_FIXED_LEN + u8::MAX as usize * FIELD_ENTRY_LEN;
-/// The field every stream packet carries, and the one a candidate response
-/// must name to be one.
+pub(crate) const MAX_PING_RESPONSE_LEN: usize = PING_FIXED_LEN + u8::MAX as usize * FIELD_ENTRY_LEN;
+/// The field every stream packet carries.
 const REQUIRED_FIELD: &str = "angles";
 
 /// What one candidate header position turned out to be.
@@ -48,7 +47,7 @@ enum Candidate {
     NotAResponse,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum ProtocolError {
     MissingField(&'static str),
     WrongFieldType {
@@ -96,7 +95,7 @@ impl FieldType {
         }
     }
 
-    pub fn size(self) -> usize {
+    pub(crate) fn size(self) -> usize {
         match self {
             Self::U32 | Self::I32 | Self::F32 => 4,
             Self::U16 | Self::I16 => 2,
@@ -119,6 +118,18 @@ pub struct Metadata {
     pub firmware: String,
     pub hardware: String,
     pub updated: String,
+}
+
+impl Metadata {
+    /// Whether these strings read as a device's own: a firmware and a
+    /// hardware version, printable and NUL-padded. Stream payload decoded at
+    /// a false header fails this, which is what keeps noise out of a
+    /// handshake.
+    fn is_plausible(&self) -> bool {
+        [&self.firmware, &self.hardware]
+            .into_iter()
+            .all(|field| !field.is_empty() && field.chars().all(|c| c.is_ascii_graphic()))
+    }
 }
 
 /// The device's self-described stream layout, parsed once at handshake.
@@ -185,21 +196,19 @@ impl Schema {
                 count: entry[KEY_LEN + 1] as usize,
             });
         }
+        let metadata = Metadata {
+            firmware,
+            hardware,
+            updated,
+        };
         // Stream payload carrying the header parses this far whenever its
         // field bytes happen to read as a table, including an empty one, so
-        // the required field is what tells a response from noise.
-        if !fields.iter().any(|field| field.key == REQUIRED_FIELD) {
+        // what tells a response from noise is metadata a device would send.
+        if !metadata.is_plausible() {
             return Candidate::NotAResponse;
         }
         Candidate::Parsed {
-            schema: Schema {
-                metadata: Metadata {
-                    firmware,
-                    hardware,
-                    updated,
-                },
-                fields,
-            },
+            schema: Schema { metadata, fields },
             consumed: start + PING_FIXED_LEN + field_count * FIELD_ENTRY_LEN,
         }
     }
@@ -277,7 +286,7 @@ impl FrameLayout {
 }
 
 /// XOR of every payload byte: the device's stream packet checksum.
-pub fn xor_checksum(payload: &[u8]) -> u8 {
+pub(crate) fn xor_checksum(payload: &[u8]) -> u8 {
     payload.iter().fold(0, |acc, b| acc ^ b)
 }
 
@@ -476,11 +485,13 @@ mod tests {
 
     #[test]
     fn a_candidate_claiming_more_bytes_than_arrived_does_not_hide_a_response() {
-        // A false header whose count byte claims a long table is undecidable
-        // on its own; the complete response behind it must still be found.
+        // The count byte sits at PING_FIXED_LEN - 1 of the candidate: a false
+        // header claiming 255 fields needs 4637 bytes, far more than arrive,
+        // so it is undecidable. The complete response behind it must still be
+        // found.
         let mut buf = PING_HEADER.to_vec();
+        buf.extend([0x01; PING_FIXED_LEN - 3]);
         buf.push(0xFF);
-        buf.extend([0x01; PING_FIXED_LEN]);
         buf.extend(ping_response(16));
         let PingParse::Parsed { schema, .. } = Schema::parse_ping(&buf) else {
             panic!("expected the real response to parse");
@@ -570,7 +581,7 @@ mod tests {
     }
 
     #[test]
-    fn layout_defaults_the_optional_fields() {
+    fn a_schema_of_angles_alone_decodes() {
         let schema = Schema {
             metadata: reference_schema(1).metadata,
             fields: vec![FieldDesc {

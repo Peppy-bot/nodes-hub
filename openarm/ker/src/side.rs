@@ -24,7 +24,7 @@ impl SideFlags {
         }
     }
 
-    pub(crate) fn set(&mut self, side: Side, value: bool) {
+    pub fn set(&mut self, side: Side, value: bool) {
         match side {
             Side::Left => self.left = value,
             Side::Right => self.right = value,
@@ -40,7 +40,7 @@ pub struct SideValues {
 }
 
 impl SideValues {
-    pub(crate) fn side(self, side: Side) -> f64 {
+    pub fn side(self, side: Side) -> f64 {
         match side {
             Side::Left => self.left,
             Side::Right => self.right,
@@ -49,7 +49,7 @@ impl SideValues {
 
     /// Both values scaled, which is how a trigger opening becomes the gripper
     /// opening commanded from it.
-    pub(crate) fn scaled(self, factor: f64) -> Self {
+    pub fn scaled(self, factor: f64) -> Self {
         Self {
             left: self.left * factor,
             right: self.right * factor,
@@ -57,9 +57,17 @@ impl SideValues {
     }
 }
 
+/// Index into a left-then-right `[T; 2]`.
+pub fn index(side: Side) -> usize {
+    match side {
+        Side::Left => 0,
+        Side::Right => 1,
+    }
+}
+
 /// One arm's name for the operator log, the spelling every line in this node
 /// uses.
-pub(crate) fn label(side: Side) -> &'static str {
+pub fn label(side: Side) -> &'static str {
     match side {
         Side::Left => "left",
         Side::Right => "right",

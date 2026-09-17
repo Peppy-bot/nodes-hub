@@ -12,7 +12,8 @@
 
 use openarm_description::{ARM_DOF, HardwareVersion, Side};
 
-use crate::protocol::Metadata;
+use crate::protocol::{KerFrame, Metadata};
+use crate::side::SideValues;
 
 /// CH01-CH07: the right arm's j1..j7, from firmware 2.0.0's ENCODER_CONFIG.
 const RIGHT_JOINT_CHANNELS: [usize; ARM_DOF] = [0, 1, 2, 3, 4, 5, 6];
@@ -56,13 +57,14 @@ pub enum DeviceMismatch {
     #[error(
         "KER reports hardware '{found}'; this node maps the hardware \
          {SUPPORTED_HARDWARE_MAJOR}.x channel layout. Connect a \
-         {SUPPORTED_HARDWARE_MAJOR}.x KER; `openarm-ker-cli ping` prints what a device reports"
+         {SUPPORTED_HARDWARE_MAJOR}.x KER; `uvx --from openarm_ker openarm-ker-cli ping` \
+         prints what a device reports"
     )]
     Hardware { found: String },
 
     #[error(
         "KER streams {found} channels; this node reads CH01-CH{REQUIRED_CHANNELS:02}. \
-         `openarm-ker-cli ping` prints the schema the device reports"
+         `uvx --from openarm_ker openarm-ker-cli ping` prints the schema the device reports"
     )]
     Channels { found: usize },
 }
@@ -110,7 +112,7 @@ pub struct ArmMap {
 
 impl ArmMap {
     /// Map one frame's channels to this side's clamped joint radians.
-    pub fn joint_radians(&self, angles_deg: &[f32]) -> Result<[f64; ARM_DOF], MapError> {
+    fn joint_radians(&self, angles_deg: &[f32]) -> Result<[f64; ARM_DOF], MapError> {
         let mut joints = [0.0; ARM_DOF];
         for (i, joint) in joints.iter_mut().enumerate() {
             let [lo, hi] = self.limits[i];
@@ -131,7 +133,7 @@ pub struct TriggerMap {
 
 impl TriggerMap {
     /// This frame's trigger opening: 1 released, 0 at a full squeeze.
-    pub fn opening(&self, angles_deg: &[f32]) -> Result<f64, MapError> {
+    fn opening(&self, angles_deg: &[f32]) -> Result<f64, MapError> {
         let angle = angle_at(angles_deg, self.channel)?;
         Ok((1.0 - angle / self.closed_deg).clamp(0.0, 1.0))
     }
@@ -140,10 +142,10 @@ impl TriggerMap {
 /// The device's channel map: both arms and both triggers.
 #[derive(Debug)]
 pub struct ChannelMap {
-    pub left: ArmMap,
-    pub right: ArmMap,
-    pub left_trigger: TriggerMap,
-    pub right_trigger: TriggerMap,
+    left: ArmMap,
+    right: ArmMap,
+    left_trigger: TriggerMap,
+    right_trigger: TriggerMap,
 }
 
 impl ChannelMap {
@@ -165,6 +167,26 @@ impl ChannelMap {
             return Err(DeviceMismatch::Channels { found: angle_count });
         }
         Ok(Self::for_follower(version))
+    }
+
+    /// Map one frame's channels: joints clamped into the follower's limits,
+    /// each trigger's opening, and the gripper opening each one commands.
+    pub fn map(
+        &self,
+        frame: &KerFrame,
+        open_fraction: GripperOpenFraction,
+    ) -> Result<MappedFrame, MapError> {
+        let angles = &frame.angles_deg;
+        let triggers = SideValues {
+            left: self.left_trigger.opening(angles)?,
+            right: self.right_trigger.opening(angles)?,
+        };
+        Ok(MappedFrame {
+            left_joints: self.left.joint_radians(angles)?,
+            right_joints: self.right.joint_radians(angles)?,
+            gripper_openings: triggers.scaled(open_fraction.fraction()),
+            triggers,
+        })
     }
 
     /// The map alone, for a follower generation.
@@ -190,6 +212,15 @@ impl ChannelMap {
     }
 }
 
+/// One frame's mapped values, before engagement decides what streams.
+pub struct MappedFrame {
+    pub left_joints: [f64; ARM_DOF],
+    pub right_joints: [f64; ARM_DOF],
+    /// Trigger openings, which engagement reads unscaled.
+    pub triggers: SideValues,
+    pub gripper_openings: SideValues,
+}
+
 fn angle_at(angles_deg: &[f32], channel: usize) -> Result<f64, MapError> {
     // The reader accepted the schema's channel count at handshake, so a miss
     // here means the device changed its schema mid-connection.
@@ -210,6 +241,11 @@ fn angle_at(angles_deg: &[f32], channel: usize) -> Result<f64, MapError> {
 pub(crate) mod fixtures {
     use super::*;
 
+    /// The angle a probe frame's first channel carries, and the step between
+    /// channels: a window inside every joint limit this map clamps to.
+    const PROBE_BASE_DEG: f32 = 3.0;
+    const PROBE_STEP_DEG: f32 = 0.3;
+
     /// The channel count a fake device must stream.
     pub(crate) const CHANNELS: usize = REQUIRED_CHANNELS;
     /// A trigger angle (deg) at a full squeeze, per side.
@@ -225,8 +261,8 @@ pub(crate) mod fixtures {
 
     /// Every channel carries a distinct angle derived from its own 1-based CH
     /// number, inside the tightest joint window this map clamps to (the elbow
-    /// floor below, the left shoulder's upper limit above), so a joint reading
-    /// the wrong channel reads a different number rather than a shared bound.
+    /// floor below, the left shoulder's upper limit above), so every joint
+    /// maps to a value of its own and nothing clamps.
     pub(crate) fn numbered_frame() -> Vec<f32> {
         (1..=CHANNELS)
             .map(|c| PROBE_BASE_DEG + c as f32 * PROBE_STEP_DEG)
@@ -237,9 +273,6 @@ pub(crate) mod fixtures {
     pub(crate) fn probe_radians(frame: &[f32], first_channel: usize) -> [f64; ARM_DOF] {
         std::array::from_fn(|j| (frame[first_channel + j] as f64).to_radians())
     }
-
-    pub(crate) const PROBE_BASE_DEG: f32 = 3.0;
-    pub(crate) const PROBE_STEP_DEG: f32 = 0.3;
 }
 
 #[cfg(test)]
@@ -363,9 +396,19 @@ mod tests {
     }
 
     #[test]
-    fn required_channels_covers_the_highest_channel_read() {
-        assert_eq!(REQUIRED_CHANNELS, LEFT_TRIGGER_CHANNEL + 1);
-        assert_eq!(REQUIRED_CHANNELS, 16);
+    fn required_channels_covers_every_channel_read() {
+        for channel in LEFT_JOINT_CHANNELS
+            .iter()
+            .chain(&RIGHT_JOINT_CHANNELS)
+            .chain([&LEFT_TRIGGER_CHANNEL, &RIGHT_TRIGGER_CHANNEL])
+        {
+            assert!(
+                REQUIRED_CHANNELS > *channel,
+                "CH{:02} is read but not required",
+                channel + 1
+            );
+        }
+        assert_eq!(REQUIRED_CHANNELS, 16, "firmware 2.x streams sixteen");
     }
 
     #[test]
@@ -375,7 +418,7 @@ mod tests {
             ChannelMap::for_device(HardwareVersion::V2, &metadata("2.1.3"), CHANNELS + 4).is_ok()
         );
 
-        // "20.0.0" proves the major is compared, not a prefix.
+        // "20.0.0" holds the comparison to the whole major version.
         for found in ["3.0.0", "1.0.0", "20.0.0", "KER-v2.0.0", ""] {
             let refused = ChannelMap::for_device(HardwareVersion::V2, &metadata(found), CHANNELS)
                 .expect_err("unsupported hardware")

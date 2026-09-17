@@ -7,11 +7,9 @@
 // node so the launch fails loudly; everything transient (unplug, bad
 // checksums, silence) clears the sample, backs off and reconnects.
 //
-// Engagement lives here because one owner has to hold it: four publish tasks
-// read it, and a latch per task would let a side's arm and gripper disagree.
-// An arm engages when its trigger is squeezed to the engage opening, having
-// been seen released first, so a device returning mid-teleop under a held
-// trigger never resumes motion on its own.
+// One EngageLatch per session is constructed here: the four publish tasks all
+// read the engagement it folds into each sample, so a side's arm and gripper
+// always agree. The policy itself lives in engage.
 
 use std::time::{Duration, Instant};
 
@@ -20,12 +18,12 @@ use peppylib::runtime::CancellationToken;
 use tokio::sync::{oneshot, watch};
 use tracing::{error, info, warn};
 
-use crate::engage::{EngageLatch, EngageOpening};
-use crate::mapping::{ChannelMap, GripperOpenFraction, MapError};
+use crate::engage::{EngageLatch, EngageTriggerOpening};
+use crate::mapping::{ChannelMap, GripperOpenFraction, MappedFrame};
 use crate::protocol::{
     CMD_PING, CMD_STANDBY, CMD_STREAM, Deframer, FrameLayout, KerFrame, PingParse, Schema,
 };
-use crate::side::{SideFlags, SideValues};
+use crate::side::SideFlags;
 use crate::transport::{self, KerTransport, TransportConfig};
 
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(3);
@@ -58,6 +56,18 @@ pub struct KerSample {
 }
 
 impl KerSample {
+    /// One mapped frame plus the engagement the latch folded in.
+    fn from_mapped(mapped: MappedFrame, engaged: SideFlags, received_at: Instant) -> Self {
+        Self {
+            left_joints: mapped.left_joints,
+            right_joints: mapped.right_joints,
+            left_gripper_opening: mapped.gripper_openings.left,
+            right_gripper_opening: mapped.gripper_openings.right,
+            engaged,
+            received_at,
+        }
+    }
+
     pub fn joints(&self, side: Side) -> [f64; ARM_DOF] {
         match side {
             Side::Left => self.left_joints,
@@ -76,7 +86,7 @@ impl KerSample {
 pub struct ReaderConfig {
     pub transport: TransportConfig,
     pub version: HardwareVersion,
-    pub engage_opening: EngageOpening,
+    pub engage_trigger_opening: EngageTriggerOpening,
     pub gripper_open_fraction: GripperOpenFraction,
     pub stale_timeout: Duration,
     pub log_raw: bool,
@@ -131,15 +141,16 @@ fn run(
     // and cleared by a connection, so every episode warns once.
     let mut warned: Option<String> = None;
     while !token.is_cancelled() {
-        let mut connected = false;
-        let end = match transport::open(&cfg.transport) {
-            Ok(mut transport) => run_session(transport.as_mut(), &cfg, &tx, &token, &mut connected),
-            Err(e) => SessionEnd::Transient(format!("open: {e}")),
+        let report = match transport::open(&cfg.transport) {
+            Ok(mut transport) => run_session(transport.as_mut(), &cfg, &tx, &token),
+            Err(e) => SessionReport::refused(SessionEnd::Transient(format!("open: {e}"))),
         };
-        if connected {
+        // A session that delivered frames is a link that worked, so the next
+        // failure is a new episode and warns again.
+        if report.streamed {
             warned = None;
         }
-        match end {
+        match report.end {
             SessionEnd::Stop => break,
             SessionEnd::Transient(reason) => {
                 let _ = tx.send(None);
@@ -168,30 +179,59 @@ fn run(
     }
 }
 
+/// What a session did: how it ended, and whether it ever delivered a frame.
+struct SessionReport {
+    end: SessionEnd,
+    streamed: bool,
+}
+
+impl SessionReport {
+    /// A session that never reached a readable device.
+    fn refused(end: SessionEnd) -> Self {
+        Self {
+            end,
+            streamed: false,
+        }
+    }
+}
+
+/// A handshaken device this node can read.
+struct Connected {
+    layout: FrameLayout,
+    channels: ChannelMap,
+    /// Bytes read past the PING response, which may already hold frames.
+    leftover: Vec<u8>,
+}
+
 /// One connection lifetime: handshake, start the stream, map frames until the
-/// link breaks. `connected` reports whether the handshake reached a device
-/// this node can read. The stream is stopped on the way out, so the next
-/// session handshakes against a quiet device.
+/// link breaks. The stream is stopped on the way out, so the next session
+/// handshakes against a quiet device.
 fn run_session(
     transport: &mut dyn KerTransport,
     cfg: &ReaderConfig,
     tx: &watch::Sender<Option<KerSample>>,
     token: &CancellationToken,
-    connected: &mut bool,
-) -> SessionEnd {
-    let (schema, leftover) = match handshake(transport, token) {
-        Ok(parsed) => parsed,
-        Err(end) => return end,
+) -> SessionReport {
+    let device = match connect(transport, cfg, token) {
+        Ok(device) => device,
+        Err(end) => return SessionReport::refused(end),
     };
-    let layout = match FrameLayout::try_new(&schema) {
-        Ok(layout) => layout,
-        Err(e) => return SessionEnd::Fatal(e.to_string()),
-    };
-    let channels = match ChannelMap::for_device(cfg.version, &schema.metadata, layout.angle_count())
-    {
-        Ok(channels) => channels,
-        Err(e) => return SessionEnd::Fatal(e.to_string()),
-    };
+    let (end, streamed) = stream_frames(transport, cfg, &device, tx, token);
+    // Best effort: stop the stream on the way out, whether or not it started.
+    let _ = transport.write_all(&[CMD_STANDBY]);
+    SessionReport { end, streamed }
+}
+
+/// Handshake and check the device against the channel map this node reads.
+fn connect(
+    transport: &mut dyn KerTransport,
+    cfg: &ReaderConfig,
+    token: &CancellationToken,
+) -> Result<Connected, SessionEnd> {
+    let (schema, leftover) = handshake(transport, token)?;
+    let layout = FrameLayout::try_new(&schema).map_err(|e| SessionEnd::Fatal(e.to_string()))?;
+    let channels = ChannelMap::for_device(cfg.version, &schema.metadata, layout.angle_count())
+        .map_err(|e| SessionEnd::Fatal(e.to_string()))?;
     info!(
         "KER connected: fw {} hw {} updated {} ({} channels)",
         schema.metadata.firmware,
@@ -199,42 +239,40 @@ fn run_session(
         schema.metadata.updated,
         layout.angle_count()
     );
-    *connected = true;
-
-    let end = stream_frames(transport, cfg, &channels, tx, token, &layout, leftover);
-    // Best effort: stop the stream on the way out, whether or not it started.
-    let _ = transport.write_all(&[CMD_STANDBY]);
-    end
+    Ok(Connected {
+        layout,
+        channels,
+        leftover,
+    })
 }
 
-/// Decode and map frames until the link breaks or the node stops.
-#[allow(clippy::too_many_arguments)]
+/// Decode and map frames until the link breaks or the node stops, reporting
+/// whether any frame reached the sample channel.
 fn stream_frames(
     transport: &mut dyn KerTransport,
     cfg: &ReaderConfig,
-    channels: &ChannelMap,
+    device: &Connected,
     tx: &watch::Sender<Option<KerSample>>,
     token: &CancellationToken,
-    layout: &FrameLayout,
-    leftover: Vec<u8>,
-) -> SessionEnd {
+) -> (SessionEnd, bool) {
     // The firmware answers PING in standby; frames flow once STREAM arrives.
     if let Err(e) = transport.write_all(&[CMD_STREAM]) {
-        return SessionEnd::Transient(format!("start stream: {e}"));
+        return (SessionEnd::Transient(format!("start stream: {e}")), false);
     }
-    let mut deframer = Deframer::new(layout.payload_len());
-    deframer.push(&leftover);
-    let mut engage = EngageLatch::new(cfg.engage_opening, cfg.stale_timeout);
+    let mut deframer = Deframer::new(device.layout.payload_len());
+    deframer.push(&device.leftover);
+    let mut engage = EngageLatch::new(cfg.engage_trigger_opening, cfg.stale_timeout);
     let mut chunk = [0u8; 4096];
     let mut last_frame_at = Instant::now();
     let mut last_raw_log = Instant::now();
     let mut consecutive_bad = 0u32;
     let mut mapping_warned = false;
+    let mut streamed = false;
 
     while !token.is_cancelled() {
         let read = match transport.read(&mut chunk) {
             Ok(n) => n,
-            Err(e) => return SessionEnd::Transient(format!("read: {e}")),
+            Err(e) => return (SessionEnd::Transient(format!("read: {e}")), streamed),
         };
         // Pushed before the silence check, so bytes that arrive after a long
         // quiet spell count as the recovery they are.
@@ -246,31 +284,35 @@ fn stream_frames(
                 Err(_) => {
                     consecutive_bad += 1;
                     if consecutive_bad >= MAX_CONSECUTIVE_BAD_CHECKSUMS {
-                        return SessionEnd::Transient(format!(
-                            "{consecutive_bad} corrupt frames in a row"
-                        ));
+                        return (
+                            SessionEnd::Transient(format!(
+                                "{consecutive_bad} corrupt frames in a row"
+                            )),
+                            streamed,
+                        );
                     }
                     continue;
                 }
             };
             consecutive_bad = 0;
-            let frame = layout.parse(&payload);
+            let frame = device.layout.parse(&payload);
             last_frame_at = Instant::now();
             if cfg.log_raw && last_raw_log.elapsed() >= RAW_LOG_INTERVAL {
                 last_raw_log = Instant::now();
                 info!("KER raw: {}", format_raw(&frame));
             }
-            match map_frame(channels, cfg.gripper_open_fraction, &frame) {
+            match device.channels.map(&frame, cfg.gripper_open_fraction) {
                 Ok(mapped) => {
                     mapping_warned = false;
                     let received_at = Instant::now();
                     let engaged = engage.update(mapped.triggers, received_at);
                     if tx
-                        .send(Some(mapped.into_sample(engaged, received_at)))
+                        .send(Some(KerSample::from_mapped(mapped, engaged, received_at)))
                         .is_err()
                     {
-                        return SessionEnd::Stop;
+                        return (SessionEnd::Stop, streamed);
                     }
+                    streamed = true;
                 }
                 // A non-finite reading is a frame to skip, not a stream to
                 // kill; latch the warning so a flaky encoder cannot spam.
@@ -283,12 +325,15 @@ fn stream_frames(
         }
 
         if last_frame_at.elapsed() > SILENCE_RECONNECT {
-            return SessionEnd::Transient(format!(
-                "no valid frames for {SILENCE_RECONNECT:?} while connected"
-            ));
+            return (
+                SessionEnd::Transient(format!(
+                    "no valid frames for {SILENCE_RECONNECT:?} while connected"
+                )),
+                streamed,
+            );
         }
     }
-    SessionEnd::Stop
+    (SessionEnd::Stop, streamed)
 }
 
 /// STANDBY, flush, then ping until the schema arrives (or the deadline).
@@ -333,47 +378,6 @@ fn handshake(
     )))
 }
 
-/// One frame's mapped values, before engagement decides what streams.
-struct MappedFrame {
-    left_joints: [f64; ARM_DOF],
-    right_joints: [f64; ARM_DOF],
-    /// Trigger openings, which engagement reads unscaled.
-    triggers: SideValues,
-    gripper_openings: SideValues,
-}
-
-impl MappedFrame {
-    fn into_sample(self, engaged: SideFlags, received_at: Instant) -> KerSample {
-        KerSample {
-            left_joints: self.left_joints,
-            right_joints: self.right_joints,
-            left_gripper_opening: self.gripper_openings.left,
-            right_gripper_opening: self.gripper_openings.right,
-            engaged,
-            received_at,
-        }
-    }
-}
-
-/// Map one frame's channels. Pure: engagement is folded in by the caller.
-fn map_frame(
-    channels: &ChannelMap,
-    open_fraction: GripperOpenFraction,
-    frame: &KerFrame,
-) -> Result<MappedFrame, MapError> {
-    let angles = &frame.angles_deg;
-    let triggers = SideValues {
-        left: channels.left_trigger.opening(angles)?,
-        right: channels.right_trigger.opening(angles)?,
-    };
-    Ok(MappedFrame {
-        left_joints: channels.left.joint_radians(angles)?,
-        right_joints: channels.right.joint_radians(angles)?,
-        gripper_openings: triggers.scaled(open_fraction.fraction()),
-        triggers,
-    })
-}
-
 fn format_raw(frame: &KerFrame) -> String {
     frame
         .angles_deg
@@ -405,50 +409,81 @@ mod tests {
     const STALE: Duration = Duration::from_millis(250);
     const ENGAGE_AT: f64 = 0.2;
     const OPEN_FRACTION: f64 = 0.5;
-    /// How long a session test waits for a sample, and then for the session
-    /// thread to notice cancellation.
-    const SESSION_DEADLINE: Duration = Duration::from_secs(30);
+    /// How long a session test waits for what it expects, and then for the
+    /// session thread to notice cancellation.
+    const SESSION_DEADLINE: Duration = Duration::from_secs(5);
+
+    /// A frame with both triggers released, every other channel numbered.
+    fn released_frame() -> Vec<f32> {
+        let mut angles = numbered_frame();
+        angles[RIGHT_TRIGGER] = 0.0;
+        angles[LEFT_TRIGGER] = 0.0;
+        angles
+    }
+
+    /// A frame with both triggers at their stops.
+    fn squeezed_frame() -> Vec<f32> {
+        let mut angles = released_frame();
+        angles[RIGHT_TRIGGER] = RIGHT_SQUEEZE_DEG as f32;
+        angles[LEFT_TRIGGER] = LEFT_SQUEEZE_DEG as f32;
+        angles
+    }
 
     /// A KER that answers PING with the reference schema and sends frames only
     /// once STREAM arrives, as firmware 2.0.0 does.
     struct FakeKer {
         hardware: &'static str,
         channels: usize,
-        /// Angles every frame reports, CH01 at index 0.
-        angles: Vec<f32>,
+        /// One entry per frame; the last repeats once the script runs out.
+        script: Vec<Vec<f32>>,
+        frames_sent: usize,
         /// Bytes delivered per read, so a caller can force partial reads.
         chunk_size: usize,
+        /// Reads to fail after, as an unplugged cable does.
+        fail_read_after: Option<usize>,
+        reads: usize,
         writes: Arc<Mutex<Vec<u8>>>,
         pending: Vec<u8>,
         streaming: bool,
     }
 
     impl FakeKer {
-        fn new() -> Self {
+        fn new(script: Vec<Vec<f32>>) -> Self {
             Self {
                 hardware: "2.0.0",
                 channels: CHANNELS,
-                angles: numbered_frame(),
+                script,
+                frames_sent: 0,
                 chunk_size: usize::MAX,
+                fail_read_after: None,
+                reads: 0,
                 writes: Arc::new(Mutex::new(Vec::new())),
                 pending: Vec::new(),
                 streaming: false,
             }
         }
 
-        /// Both triggers squeezed to their stops, the rest of the channels as
-        /// they were.
-        fn squeezing(mut self) -> Self {
-            self.angles[RIGHT_TRIGGER] = RIGHT_SQUEEZE_DEG as f32;
-            self.angles[LEFT_TRIGGER] = LEFT_SQUEEZE_DEG as f32;
+        /// A device already streaming when this node connects, as one left
+        /// running by a previous session is. It honours STANDBY only after
+        /// `standby_after` more frames, so its bytes land in the handshake.
+        fn already_streaming(mut self, standby_after: usize) -> Self {
+            self.streaming = true;
+            self.fill(standby_after);
             self
         }
 
-        /// Both triggers released, which is what a resting KER reports.
-        fn released(mut self) -> Self {
-            self.angles[RIGHT_TRIGGER] = 0.0;
-            self.angles[LEFT_TRIGGER] = 0.0;
-            self
+        fn fill(&mut self, frames: usize) {
+            for _ in 0..frames {
+                let angles = self.next_angles();
+                self.pending
+                    .extend(stream_packet(1, &angles[..self.channels], 0, false));
+            }
+        }
+
+        fn next_angles(&mut self) -> Vec<f32> {
+            let index = self.frames_sent.min(self.script.len() - 1);
+            self.frames_sent += 1;
+            self.script[index].clone()
         }
     }
 
@@ -467,9 +502,12 @@ mod tests {
         }
 
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.reads += 1;
+            if self.fail_read_after.is_some_and(|after| self.reads > after) {
+                return Err(std::io::Error::other("the cable came out"));
+            }
             if self.pending.is_empty() && self.streaming {
-                self.pending
-                    .extend(stream_packet(1, &self.angles[..self.channels], 0, false));
+                self.fill(1);
             }
             if self.pending.is_empty() {
                 std::thread::sleep(Duration::from_millis(1));
@@ -490,7 +528,7 @@ mod tests {
         ReaderConfig {
             transport: TransportConfig::Usb,
             version: HardwareVersion::V2,
-            engage_opening: EngageOpening::try_from(ENGAGE_AT).expect("in range"),
+            engage_trigger_opening: EngageTriggerOpening::try_from(ENGAGE_AT).expect("in range"),
             gripper_open_fraction: GripperOpenFraction::try_from(OPEN_FRACTION).expect("in range"),
             stale_timeout: STALE,
             log_raw: false,
@@ -499,41 +537,37 @@ mod tests {
 
     struct SessionRun {
         sample: Option<KerSample>,
-        end: SessionEnd,
+        report: SessionReport,
         writes: Vec<u8>,
-        connected: bool,
     }
 
-    /// Run one session against `ker` until it delivers a sample or stops, then
-    /// cancel it. A session that ignores cancellation fails the test instead of
-    /// wedging the suite.
-    fn run_one(mut ker: FakeKer) -> SessionRun {
+    /// Run one session until `wanted` holds of a delivered sample, or the
+    /// session stops, then cancel it. A session that ignores cancellation
+    /// fails the test instead of wedging the suite.
+    fn run_until(mut ker: FakeKer, wanted: impl Fn(&KerSample) -> bool) -> SessionRun {
         let writes = ker.writes.clone();
         let cfg = reader_config();
         let (tx, rx) = watch::channel(None);
         let token = CancellationToken::new();
-        let connected = Arc::new(Mutex::new(false));
         let session = {
             let token = token.clone();
-            let connected = connected.clone();
-            std::thread::spawn(move || {
-                let mut flag = false;
-                let end = run_session(&mut ker, &cfg, &tx, &token, &mut flag);
-                *connected.lock().expect("connected") = flag;
-                end
-            })
+            std::thread::spawn(move || run_session(&mut ker, &cfg, &tx, &token))
         };
 
         let deadline = Instant::now() + SESSION_DEADLINE;
-        while rx.borrow().is_none() && Instant::now() < deadline && !session.is_finished() {
-            std::thread::sleep(Duration::from_millis(5));
+        let mut sample = None;
+        while Instant::now() < deadline {
+            sample = rx.borrow().clone();
+            if sample.as_ref().is_some_and(&wanted) || session.is_finished() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
         }
-        let sample = rx.borrow().clone();
         token.cancel();
 
         let stop_by = Instant::now() + SESSION_DEADLINE;
         while !session.is_finished() && Instant::now() < stop_by {
-            std::thread::sleep(Duration::from_millis(5));
+            std::thread::sleep(Duration::from_millis(2));
         }
         assert!(
             session.is_finished(),
@@ -541,18 +575,26 @@ mod tests {
         );
         SessionRun {
             sample,
-            end: session.join().expect("session thread"),
+            report: session.join().expect("session thread"),
             writes: writes.lock().expect("writes").clone(),
-            connected: *connected.lock().expect("connected"),
         }
+    }
+
+    /// Run one session until it delivers any sample.
+    fn run_one(ker: FakeKer) -> SessionRun {
+        run_until(ker, |_| true)
     }
 
     #[test]
     fn a_session_starts_the_stream_and_maps_the_first_frame() {
-        let run = run_one(FakeKer::new().released());
+        let run = run_one(FakeKer::new(vec![released_frame()]));
 
-        assert!(matches!(run.end, SessionEnd::Stop), "{:?}", run.end);
-        assert!(run.connected, "a readable device counts as connected");
+        assert!(
+            matches!(run.report.end, SessionEnd::Stop),
+            "{:?}",
+            run.report.end
+        );
+        assert!(run.report.streamed, "a mapped frame counts as streaming");
         assert_eq!(
             run.writes,
             vec![CMD_STANDBY, CMD_PING, CMD_STREAM, CMD_STANDBY],
@@ -566,7 +608,7 @@ mod tests {
         assert_eq!(sample.left_gripper_opening, OPEN_FRACTION);
         assert_eq!(sample.right_gripper_opening, OPEN_FRACTION);
         // Each arm reads its own channels, end to end through the session.
-        let frame = numbered_frame();
+        let frame = released_frame();
         for (side, first_channel) in [(Side::Right, 0), (Side::Left, 8)] {
             for (j, expected) in probe_radians(&frame, first_channel).into_iter().enumerate() {
                 assert!(
@@ -580,43 +622,123 @@ mod tests {
     }
 
     #[test]
+    fn each_gripper_follows_its_own_trigger() {
+        // Left half squeezed, right released: the two openings must differ, so
+        // a side swap anywhere from the channel to the sample fails here.
+        let mut angles = released_frame();
+        angles[LEFT_TRIGGER] = LEFT_SQUEEZE_DEG as f32 / 2.0;
+        let run = run_one(FakeKer::new(vec![angles]));
+
+        let sample = run.sample.expect("a frame arrived");
+        assert!(
+            (sample.left_gripper_opening - OPEN_FRACTION * 0.5).abs() < 1e-12,
+            "left: {}",
+            sample.left_gripper_opening
+        );
+        assert_eq!(sample.right_gripper_opening, OPEN_FRACTION);
+    }
+
+    #[test]
+    fn a_release_then_a_squeeze_engages_through_the_session() {
+        // Enough released frames to arm, then a squeeze on both triggers.
+        let mut script = vec![released_frame(); 8];
+        script.push(squeezed_frame());
+        let run = run_until(FakeKer::new(script), |sample| {
+            sample.engaged != SideFlags::NONE
+        });
+
+        let sample = run.sample.expect("a frame arrived");
+        assert_eq!(
+            sample.engaged,
+            SideFlags {
+                left: true,
+                right: true
+            },
+            "a squeeze after a run of open frames engages both arms"
+        );
+        assert_eq!(sample.left_gripper_opening, 0.0, "a full squeeze closes");
+    }
+
+    #[test]
     fn a_session_delivers_a_frame_split_across_reads() {
-        let mut ker = FakeKer::new().released();
+        let mut ker = FakeKer::new(vec![released_frame()]);
         ker.chunk_size = 7;
         let run = run_one(ker);
 
-        assert!(matches!(run.end, SessionEnd::Stop), "{:?}", run.end);
+        assert!(
+            matches!(run.report.end, SessionEnd::Stop),
+            "{:?}",
+            run.report.end
+        );
         let sample = run
             .sample
             .expect("a split packet still reaches the channel");
         assert_eq!(sample.left_gripper_opening, OPEN_FRACTION);
-        let frame = numbered_frame();
-        let expected = probe_radians(&frame, 0);
-        assert!((sample.joints(Side::Right)[0] - expected[0]).abs() < 1e-12);
     }
 
     #[test]
-    fn a_held_trigger_does_not_engage_on_a_new_session() {
-        let run = run_one(FakeKer::new().squeezing());
-        assert_eq!(
-            run.sample.expect("a frame arrived").engaged,
-            SideFlags::NONE,
-            "a session that opens under a held trigger must not resume motion"
+    fn a_device_still_streaming_is_handshaken_through_its_own_frames() {
+        // The case a previous session left behind: frames arrive before and
+        // during the handshake, so the ping response lands behind them.
+        let run = run_one(FakeKer::new(vec![released_frame()]).already_streaming(40));
+
+        assert!(
+            matches!(run.report.end, SessionEnd::Stop),
+            "{:?}",
+            run.report.end
+        );
+        assert!(
+            run.sample.is_some(),
+            "the response must be found among the device's own bytes"
+        );
+    }
+
+    #[test]
+    fn a_read_error_ends_the_session_for_a_retry() {
+        let mut ker = FakeKer::new(vec![released_frame()]);
+        ker.fail_read_after = Some(3);
+        let run = run_one(ker);
+
+        let SessionEnd::Transient(reason) = run.report.end else {
+            panic!(
+                "an unplugged cable must be retried, got {:?}",
+                run.report.end
+            );
+        };
+        assert!(reason.contains("read"), "{reason}");
+    }
+
+    #[test]
+    fn a_frame_this_node_cannot_map_does_not_end_the_session() {
+        // One encoder reading arrives non-finite, then the device recovers.
+        let mut poisoned = released_frame();
+        poisoned[3] = f32::NAN;
+        let script = vec![poisoned, released_frame()];
+        let run = run_one(FakeKer::new(script));
+
+        assert!(
+            matches!(run.report.end, SessionEnd::Stop),
+            "{:?}",
+            run.report.end
+        );
+        assert!(
+            run.sample.is_some(),
+            "the frame after an unmappable one still streams"
         );
     }
 
     #[test]
     fn a_session_refuses_a_device_of_another_hardware_generation() {
-        let mut ker = FakeKer::new();
+        let mut ker = FakeKer::new(vec![released_frame()]);
         ker.hardware = "3.0.0";
         let run = run_one(ker);
 
-        let SessionEnd::Fatal(reason) = run.end else {
-            panic!("expected a fatal refusal, got {:?}", run.end);
+        let SessionEnd::Fatal(reason) = run.report.end else {
+            panic!("expected a fatal refusal, got {:?}", run.report.end);
         };
         assert!(reason.contains("3.0.0"), "{reason}");
         assert!(run.sample.is_none(), "a refused device streams nothing");
-        assert!(!run.connected, "a refused device is not a connection");
+        assert!(!run.report.streamed, "a refused device never streamed");
         assert!(
             !run.writes.contains(&CMD_STREAM),
             "a refused device is never started"
@@ -625,15 +747,14 @@ mod tests {
 
     #[test]
     fn a_session_refuses_a_device_streaming_too_few_channels() {
-        let mut ker = FakeKer::new();
+        let mut ker = FakeKer::new(vec![released_frame()]);
         ker.channels = CHANNELS - 1;
         let run = run_one(ker);
 
-        let SessionEnd::Fatal(reason) = run.end else {
-            panic!("expected a fatal refusal, got {:?}", run.end);
+        let SessionEnd::Fatal(reason) = run.report.end else {
+            panic!("expected a fatal refusal, got {:?}", run.report.end);
         };
         assert!(reason.contains("15 channels"), "{reason}");
-        assert!(run.sample.is_none(), "a refused device streams nothing");
         assert!(
             !run.writes.contains(&CMD_STREAM),
             "a refused device is never started"
