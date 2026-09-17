@@ -3,13 +3,19 @@
 // the reader thread can check cancellation between reads; a timeout surfaces
 // as `Ok(0)`, device loss as `Err`.
 
+use std::fmt;
 use std::io;
 use std::time::{Duration, Instant};
 
-/// A launcher `transport` this node has no link for.
+/// A launcher link this node cannot open.
 #[derive(Debug, thiserror::Error)]
-#[error("transport must be 'usb' or 'serial', got '{0}'")]
-pub struct UnknownTransport(pub String);
+pub enum TransportError {
+    #[error("transport must be 'usb' or 'serial', got '{0}'")]
+    Unknown(String),
+
+    #[error("serial_baud must be a positive bit rate, got {0}")]
+    ZeroBaud(u32),
+}
 
 /// Espressif's vendor id; the CoreS3's native USB.
 const USB_VID: u16 = 0x303A;
@@ -23,21 +29,32 @@ const FLUSH_WINDOW: Duration = Duration::from_millis(200);
 const FLUSH_READ_TIMEOUT: Duration = Duration::from_millis(10);
 
 /// Which link to the device to open, parsed once from the node parameters.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum TransportConfig {
     Usb,
-    Serial { port: String, baud: u32 },
+    Serial { path: String, baud: u32 },
 }
 
 impl TransportConfig {
-    pub fn parse(transport: &str, port: &str, baud: u32) -> Result<Self, UnknownTransport> {
+    pub fn parse(transport: &str, device_path: &str, baud: u32) -> Result<Self, TransportError> {
         match transport {
             "usb" => Ok(Self::Usb),
+            "serial" if baud == 0 => Err(TransportError::ZeroBaud(baud)),
             "serial" => Ok(Self::Serial {
-                port: port.to_string(),
+                path: device_path.to_string(),
                 baud,
             }),
-            other => Err(UnknownTransport(other.to_string())),
+            other => Err(TransportError::Unknown(other.to_string())),
+        }
+    }
+}
+
+impl fmt::Display for TransportConfig {
+    /// The words the launcher wrote, so the startup log echoes the arguments.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Usb => write!(f, "usb ({USB_VID:04x}:{USB_PID:04x})"),
+            Self::Serial { path, baud } => write!(f, "serial {path} at {baud} baud"),
         }
     }
 }
@@ -53,7 +70,7 @@ pub trait KerTransport: Send {
 pub fn open(cfg: &TransportConfig) -> io::Result<Box<dyn KerTransport>> {
     match cfg {
         TransportConfig::Usb => Ok(Box::new(UsbTransport::open()?)),
-        TransportConfig::Serial { port, baud } => Ok(Box::new(SerialTransport::open(port, *baud)?)),
+        TransportConfig::Serial { path, baud } => Ok(Box::new(SerialTransport::open(path, *baud)?)),
     }
 }
 
@@ -65,11 +82,36 @@ struct UsbTransport {
 
 impl UsbTransport {
     fn open() -> io::Result<Self> {
+        // `open_device_with_vid_pid` answers None for a device that is present
+        // but unopenable too, so the two cases are told apart before opening:
+        // the remedy for each is different.
+        let attached = rusb::devices()
+            .map_err(io::Error::other)?
+            .iter()
+            .any(|device| {
+                device
+                    .device_descriptor()
+                    .is_ok_and(|d| d.vendor_id() == USB_VID && d.product_id() == USB_PID)
+            });
         let handle = rusb::open_device_with_vid_pid(USB_VID, USB_PID).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("USB device {USB_VID:04x}:{USB_PID:04x} not found (KER unplugged, or in serial mode?)"),
-            )
+            if attached {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "USB device {USB_VID:04x}:{USB_PID:04x} is attached but cannot be \
+                         opened: install the KER udev rule, then `sudo udevadm control \
+                         --reload-rules && sudo udevadm trigger` and replug it"
+                    ),
+                )
+            } else {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "no USB device {USB_VID:04x}:{USB_PID:04x} attached: `lsusb -d 303a:` \
+                         lists what is, and transport \"serial\" reads the KER's CDC device"
+                    ),
+                )
+            }
         })?;
         // Endpoints are discovered, not hardcoded: take the first interface
         // exposing a bulk pair, which is the vendor-mode data interface.
@@ -153,11 +195,13 @@ struct SerialTransport {
 }
 
 impl SerialTransport {
-    fn open(port: &str, baud: u32) -> io::Result<Self> {
-        let port = serialport::new(port, baud)
+    fn open(path: &str, baud: u32) -> io::Result<Self> {
+        // serialport's error carries only the errno text, so the path and rate
+        // the launcher set are named here.
+        let port = serialport::new(path, baud)
             .timeout(READ_TIMEOUT)
             .open()
-            .map_err(io::Error::other)?;
+            .map_err(|e| io::Error::other(format!("open {path} at {baud} baud: {e}")))?;
         Ok(Self { port })
     }
 }
@@ -179,5 +223,39 @@ impl KerTransport for SerialTransport {
         self.port
             .clear(serialport::ClearBuffer::Input)
             .map_err(io::Error::other)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_two_links_parse_and_a_refusal_names_the_parameter() {
+        assert!(matches!(
+            TransportConfig::parse("usb", "/dev/openarm/ker", 2_000_000),
+            Ok(TransportConfig::Usb)
+        ));
+        let serial =
+            TransportConfig::parse("serial", "/dev/openarm/ker", 2_000_000).expect("serial parses");
+        assert!(matches!(
+            &serial,
+            TransportConfig::Serial { path, baud } if path == "/dev/openarm/ker" && *baud == 2_000_000
+        ));
+        assert_eq!(
+            serial.to_string(),
+            "serial /dev/openarm/ker at 2000000 baud"
+        );
+
+        let refused = TransportConfig::parse("spi", "/dev/openarm/ker", 2_000_000)
+            .expect_err("unknown transport")
+            .to_string();
+        assert!(refused.contains("'usb' or 'serial'"), "{refused}");
+        assert!(refused.contains("spi"), "{refused}");
+
+        let refused = TransportConfig::parse("serial", "/dev/openarm/ker", 0)
+            .expect_err("zero baud")
+            .to_string();
+        assert!(refused.contains("serial_baud"), "{refused}");
     }
 }

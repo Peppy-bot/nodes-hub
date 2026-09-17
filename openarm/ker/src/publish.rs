@@ -1,7 +1,7 @@
 // Always-on command publisher, the same shape as the commander's: for each
 // side, one task streams the arm setpoint at command_rate_hz on that limb's
-// joint_link pairing slot and one streams the trigger opening on its
-// gripper_link slot (the slot is the side, so no id demux); the backbone
+// joint_link pairing slot and one streams the commanded gripper opening on
+// its gripper_link slot (the slot is the side, so no id demux); the backbone
 // governs everything before it reaches a follower. A tick publishes nothing
 // when the newest sample is missing or stale, or its arm is not engaged, so
 // that limb holds at its last governed setpoints: skipping is the deadman. Re-publishing an
@@ -25,6 +25,7 @@ use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 use tracing::warn;
 
+use crate::label;
 use crate::reader::KerSample;
 
 /// Pairing timestamp from the daemon-resolved clock, so the backbone ages
@@ -37,13 +38,6 @@ fn pairing_timestamp() -> Result<SystemTime, String> {
 
 type BuildJointSetpoint = fn(SystemTime, Vec<f64>, Vec<f64>, Vec<f64>) -> peppygen::Result<Payload>;
 type BuildGripperSetpoint = fn(SystemTime, f64, f64) -> peppygen::Result<Payload>;
-
-fn label(side: Side) -> &'static str {
-    match side {
-        Side::Left => "left",
-        Side::Right => "right",
-    }
-}
 
 /// Why the publisher stopped commanding. The supervisor decides what that
 /// means for the node; this only reports.
@@ -108,9 +102,9 @@ pub async fn run(
                 }))
             },
         ));
-        // Gripper: stream the trigger opening fraction while its arm streams. The leader trigger carries no effort
-        // source: max_effort 0 (no preference) leaves the follower's ceiling
-        // in charge.
+        // Gripper: stream the commanded opening while its arm streams. The
+        // leader trigger carries no effort source: max_effort 0 (no
+        // preference) leaves the follower's ceiling in charge.
         let sample_rx = rx.clone();
         tasks.spawn(stream_setpoints(
             gripper_pub,
@@ -118,7 +112,7 @@ pub async fn run(
             token.clone(),
             format!("{} gripper", label(side)),
             move || {
-                let opening = streamable(&sample_rx, stale_timeout, side)?.opening(side);
+                let opening = streamable(&sample_rx, stale_timeout, side)?.gripper_opening(side);
                 Some(pairing_timestamp().and_then(|timestamp| {
                     build_gripper(timestamp, opening, 0.0).map_err(|e| e.to_string())
                 }))
@@ -192,20 +186,27 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
-    use crate::reader::Engaged;
+    use crate::reader::SideFlags;
 
     const STALE: Duration = Duration::from_millis(250);
-    const RIGHT_ONLY: Engaged = Engaged {
+    const RIGHT_ONLY: SideFlags = SideFlags {
         left: false,
         right: true,
     };
+    const BOTH: SideFlags = SideFlags {
+        left: true,
+        right: true,
+    };
+    /// Distinguishable per side, so a swapped accessor cannot pass.
+    const LEFT_OPENING: f64 = 0.25;
+    const RIGHT_OPENING: f64 = 0.75;
 
-    fn sample(engaged: Engaged, age: Duration) -> KerSample {
+    fn sample(engaged: SideFlags, age: Duration) -> KerSample {
         KerSample {
-            left_joints: [0.0; 7],
-            right_joints: [0.0; 7],
-            left_opening: 0.0,
-            right_opening: 0.0,
+            left_joints: [0.1; 7],
+            right_joints: [0.2; 7],
+            left_gripper_opening: LEFT_OPENING,
+            right_gripper_opening: RIGHT_OPENING,
             engaged,
             received_at: Instant::now() - age,
         }
@@ -234,5 +235,35 @@ mod tests {
             streamable(&rx, STALE, Side::Right).is_none(),
             "device loss holds"
         );
+    }
+
+    #[test]
+    fn the_stale_window_holds_at_its_own_edge() {
+        let (tx, rx) = watch::channel(None);
+        tx.send(Some(sample(BOTH, STALE - Duration::from_millis(20))))
+            .unwrap();
+        assert!(
+            streamable(&rx, STALE, Side::Left).is_some(),
+            "inside the window still streams"
+        );
+
+        tx.send(Some(sample(BOTH, STALE + Duration::from_millis(20))))
+            .unwrap();
+        assert!(
+            streamable(&rx, STALE, Side::Left).is_none(),
+            "past the window holds"
+        );
+    }
+
+    #[test]
+    fn each_side_reads_its_own_values() {
+        let (tx, rx) = watch::channel(None);
+        tx.send(Some(sample(BOTH, Duration::ZERO))).unwrap();
+        let left = streamable(&rx, STALE, Side::Left).expect("engaged");
+        let right = streamable(&rx, STALE, Side::Right).expect("engaged");
+        assert_eq!(left.gripper_opening(Side::Left), LEFT_OPENING);
+        assert_eq!(right.gripper_opening(Side::Right), RIGHT_OPENING);
+        assert_eq!(left.joints(Side::Left), [0.1; 7]);
+        assert_eq!(right.joints(Side::Right), [0.2; 7]);
     }
 }

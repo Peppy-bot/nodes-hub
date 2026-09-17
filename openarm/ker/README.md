@@ -5,35 +5,50 @@ enactic's motorless bimanual leader arm. The KER's joint structure matches
 OpenArm v2 1:1 (link lengths scaled to 70%), so leader joint angles map to
 follower joint targets with no coordinate transform. The node reads the KER's
 M5Stack CoreS3 over USB vendor mode (or serial CDC), maps its channels to
-clamped joint radians and trigger openings, and streams them exactly like
+clamped joint radians and gripper openings, and streams them exactly like
 `openarm_web_commander`: each limb on its own joint_link / gripper_link pairing
 slot (the backbone governs them all).
 
-Each arm engages on its first trigger squeeze (an opening at or below
-`engage_opening`); from then on that arm and its gripper track the KER. The
-trigger drives the gripper: released commands `gripper_open_fraction`, and a
-full squeeze closes it. A leader whose frames stop for `stale_timeout_s`, or
-that reconnects, disengages both arms and publishes nothing, so every
-consumer's stream timeout holds the robot. Squeeze again to re-engage.
+An arm engages when its trigger is squeezed to `engage_opening` or deeper,
+having read open at least once first, so a device returning under a held
+trigger never resumes motion. From that frame the arm and its gripper track
+the KER.
+
+The trigger drives the gripper too: released commands `gripper_open_fraction`,
+a full squeeze closes it, and the squeeze that engages an arm therefore
+commands its gripper near shut. Releasing the trigger opens that gripper and
+leaves the arm tracking.
+
+To stop, unplug the KER or stop the stack. Frames arriving after a gap of
+`stale_timeout_s` disengage both arms, and while no frames arrive the node
+publishes nothing, so every consumer's stream timeout holds the robot. After
+that, release a trigger and squeeze it again to re-engage.
+
+## Connect
+
+Plug the KER's M5Stack CoreS3 into a USB port with a data cable. Its screen
+lights up and shows the channel bar chart. `lsusb -d 303a:` then lists it:
+
+    Bus 001 Device 027: ID 303a:4002 Enactic, Inc. OpenArm KER 2.0.0
+
+`303a:4002` is vendor mode, which this node reads by default. `303a:1001` is
+the CDC device, which appears while the firmware is being flashed and which
+`transport: "serial"` reads.
 
 ## Host setup (once)
 
-The vendor-mode device (VID 0x303A, PID 0x4002) needs a udev rule so the node
-can claim it without root; the serial fallback needs the tty readable:
+Install [the KER udev rule](https://github.com/Peppy-bot/launchers-hub/blob/main/openarm/rules/60-openarm-ker.rules)
+from launchers-hub, following its header. Without it the node reports the
+device as attached but unopenable, once per reconnect attempt.
 
-```bash
-sudo tee /etc/udev/rules.d/99-openarm-ker.rules << 'EOF'
-# KER vendor mode (normal operation)
-SUBSYSTEM=="usb", ATTRS{idVendor}=="303a", ATTRS{idProduct}=="4002", MODE="0666"
-# KER serial mode, with a stable device name for the serial_port parameter
-SUBSYSTEM=="tty", ATTRS{idVendor}=="303a", MODE="0666", SYMLINK+="m5_ker_485"
-EOF
-sudo udevadm control --reload-rules && sudo udevadm trigger
-```
+Verify the link with enactic's CLI, whose pip package `openarm_ker` is
+theirs, unrelated to this node:
 
-Apptainer shares the host `/dev` by default, so no container flags are needed
-beyond the rule; if the deployment runs containers with a restricted `/dev`,
-use `transport: "serial"` with the tty bound in.
+    uv pip install openarm_ker
+    openarm-ker-cli ping
+
+It prints the firmware and hardware versions. Stop this node first: it claims
+the USB interface exclusively, so the two cannot read the device at once.
 
 ## Bring-up
 
@@ -46,10 +61,13 @@ reads channels straight: CH01-CH07 the right arm, CH08 its trigger, CH09-CH15
 the left arm, CH16 its trigger.
 
 That layout belongs to hardware 2.x, so the node refuses a KER reporting any
-other generation. Check the link and the reported version with enactic's CLI:
-`openarm-ker-cli ping` (from the `openarm_ker` pip package). `log_raw: true`
-logs the raw channel table (`CH01=.. CH02=..`, degrees) at 1 Hz, which is how
-to see what the device sends without a stack.
+other generation, naming what it reported.
+
+To watch the channels a running node reads, set `log_raw`, which logs the raw
+table (`CH01=.. CH02=..`, degrees) at 1 Hz:
+
+    peppy stack join openarm_v2 -i echo --with ker_commander \
+      --set-arguments 'commander_inst.log_raw=true'
 
 First engaged run: keep the backbone's `max_ee_velocity_m_s` conservative. An
 arm engaged far from the follower's pose streams that distant target at once,

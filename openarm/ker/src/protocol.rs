@@ -14,6 +14,9 @@
 // resolves the field offsets this node consumes once (failing loudly on an
 // incompatible schema), and per packet only `Deframer` + [`FrameLayout::parse`]
 // run, both infallible on checksum-verified payloads.
+//
+// Under `cfg(test)` this module also carries `fixtures`, the device-side byte
+// builders this crate's tests share (they need the field widths above).
 
 use std::fmt;
 
@@ -32,9 +35,15 @@ const FIELD_ENTRY_LEN: usize = KEY_LEN + 2;
 /// header + metadata strings + field count
 const PING_FIXED_LEN: usize = 2 + FW_LEN + HW_LEN + UPDATED_LEN + 1;
 
+/// What one candidate header position turned out to be.
+enum Candidate {
+    Parsed { schema: Schema, consumed: usize },
+    NeedMore,
+    NotAResponse,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProtocolError {
-    UnknownTypeId(u8),
     MissingField(&'static str),
     WrongFieldType {
         key: &'static str,
@@ -45,7 +54,6 @@ pub enum ProtocolError {
 impl fmt::Display for ProtocolError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnknownTypeId(id) => write!(f, "schema field with unknown type id {id}"),
             Self::MissingField(key) => write!(f, "schema is missing the '{key}' field"),
             Self::WrongFieldType { key, expected } => {
                 write!(f, "schema field '{key}' is not {expected}")
@@ -108,7 +116,7 @@ pub struct Metadata {
 }
 
 /// The device's self-described stream layout, parsed once at handshake.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Schema {
     pub metadata: Metadata,
     pub fields: Vec<FieldDesc>,
@@ -120,37 +128,53 @@ pub enum PingParse {
     /// No complete response buffered yet; keep the buffer and read more.
     NeedMore,
     /// Parsed; `consumed` bytes (up to and including the response) are spent.
-    Parsed {
-        schema: Schema,
-        consumed: usize,
-    },
-    Invalid(ProtocolError),
+    Parsed { schema: Schema, consumed: usize },
 }
 
 impl Schema {
     /// Scan `buf` for a PING response and parse it. Bytes before the header are
-    /// ignored (the device may still be flushing stream packets).
+    /// ignored (the device may still be streaming), and a header byte pair that
+    /// turns out to be stream payload is skipped so the response behind it is
+    /// still found.
     pub fn parse_ping(buf: &[u8]) -> PingParse {
-        let Some(start) = find_header(buf, PING_HEADER) else {
-            return PingParse::NeedMore;
-        };
+        let mut from = 0;
+        loop {
+            let Some(offset) = find_header(&buf[from..], PING_HEADER) else {
+                return PingParse::NeedMore;
+            };
+            let start = from + offset;
+            match Self::parse_at(buf, start) {
+                Candidate::Parsed { schema, consumed } => {
+                    return PingParse::Parsed { schema, consumed };
+                }
+                // Undecidable until more bytes arrive, so the whole scan waits.
+                Candidate::NeedMore => return PingParse::NeedMore,
+                Candidate::NotAResponse => from = start + 1,
+            }
+        }
+    }
+
+    /// Read one candidate response at `start`.
+    fn parse_at(buf: &[u8], start: usize) -> Candidate {
         let b = &buf[start..];
         if b.len() < PING_FIXED_LEN {
-            return PingParse::NeedMore;
+            return Candidate::NeedMore;
         }
         let firmware = padded_str(&b[2..2 + FW_LEN]);
         let hardware = padded_str(&b[2 + FW_LEN..2 + FW_LEN + HW_LEN]);
         let updated = padded_str(&b[2 + FW_LEN + HW_LEN..2 + FW_LEN + HW_LEN + UPDATED_LEN]);
         let field_count = b[PING_FIXED_LEN - 1] as usize;
         if b.len() < PING_FIXED_LEN + field_count * FIELD_ENTRY_LEN {
-            return PingParse::NeedMore;
+            return Candidate::NeedMore;
         }
         let mut fields = Vec::with_capacity(field_count);
         for i in 0..field_count {
             let entry = &b[PING_FIXED_LEN + i * FIELD_ENTRY_LEN..];
             let type_id = entry[KEY_LEN];
+            // A type id the schema never uses means these bytes are stream
+            // payload that happened to carry the header.
             let Some(ty) = FieldType::from_id(type_id) else {
-                return PingParse::Invalid(ProtocolError::UnknownTypeId(type_id));
+                return Candidate::NotAResponse;
             };
             fields.push(FieldDesc {
                 key: padded_str(&entry[..KEY_LEN]),
@@ -158,7 +182,7 @@ impl Schema {
                 count: entry[KEY_LEN + 1] as usize,
             });
         }
-        PingParse::Parsed {
+        Candidate::Parsed {
             schema: Schema {
                 metadata: Metadata {
                     firmware,
@@ -173,7 +197,7 @@ impl Schema {
 }
 
 /// One decoded stream packet, still device-shaped: raw channels in degrees.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct KerFrame {
     pub timestamp: u32,
     /// All encoder channels (deg), CH01 at index 0.
@@ -183,7 +207,7 @@ pub struct KerFrame {
 /// Byte offsets of the fields this node consumes, resolved from a [`Schema`]
 /// once at handshake. `angles` is required; `timestamp` decodes to 0 when the
 /// schema lacks it, and every other field is skipped by its packed size.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct FrameLayout {
     payload_len: usize,
     angles_at: usize,
@@ -235,6 +259,11 @@ impl FrameLayout {
     /// Decode one checksum-verified payload of exactly [`Self::payload_len`]
     /// bytes, which is what the deframer this layout sized delivers.
     pub fn parse(&self, payload: &[u8]) -> KerFrame {
+        debug_assert_eq!(
+            payload.len(),
+            self.payload_len,
+            "the deframer delivers exactly the payload this layout decodes"
+        );
         let angles_deg = (0..self.angle_count)
             .map(|i| {
                 let at = self.angles_at + i * 4;
@@ -266,7 +295,7 @@ pub struct Deframer {
 }
 
 /// A stream packet whose checksum did not match; the frame is discarded.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct BadChecksum;
 
 impl Deframer {
@@ -325,7 +354,7 @@ pub(crate) mod fixtures {
 
     use super::*;
 
-    pub(crate) fn padded(s: &str, len: usize) -> Vec<u8> {
+    fn padded(s: &str, len: usize) -> Vec<u8> {
         let mut v = s.as_bytes().to_vec();
         assert!(v.len() <= len);
         v.resize(len, 0);
@@ -416,16 +445,6 @@ mod tests {
     }
 
     #[test]
-    fn ping_parses_mid_garbage_and_reports_consumed() {
-        let mut buf = vec![0x11, 0xA5, 0x22];
-        buf.extend(ping_response(8));
-        let PingParse::Parsed { consumed, .. } = Schema::parse_ping(&buf) else {
-            panic!("expected parse");
-        };
-        assert_eq!(consumed, buf.len());
-    }
-
-    #[test]
     fn ping_needs_more_on_every_truncation() {
         let response = ping_response(16);
         for len in 0..response.len() {
@@ -437,14 +456,30 @@ mod tests {
     }
 
     #[test]
-    fn ping_rejects_an_unknown_type_id() {
-        let mut response = ping_response(16);
-        let angles_entry = PING_FIXED_LEN + FIELD_ENTRY_LEN;
-        response[angles_entry + KEY_LEN] = 7;
-        assert!(matches!(
-            Schema::parse_ping(&response),
-            PingParse::Invalid(ProtocolError::UnknownTypeId(7))
-        ));
+    fn a_false_ping_header_in_stream_bytes_is_skipped() {
+        // Stream payload that happens to carry the ping header, with a type id
+        // the schema never uses: the response behind it must still be found.
+        let mut buf = PING_HEADER.to_vec();
+        buf.extend([0x07; PING_FIXED_LEN * 2]);
+        let response = ping_response(16);
+        buf.extend(&response);
+        let PingParse::Parsed { schema, consumed } = Schema::parse_ping(&buf) else {
+            panic!("expected the real response to parse");
+        };
+        assert_eq!(schema.metadata.hardware, "2.0.0");
+        assert_eq!(consumed, buf.len());
+    }
+
+    #[test]
+    fn a_ping_response_behind_garbage_keeps_its_metadata() {
+        let mut buf = vec![0x11, 0xA5, 0x22];
+        buf.extend(ping_response(8));
+        let PingParse::Parsed { schema, consumed } = Schema::parse_ping(&buf) else {
+            panic!("expected parse");
+        };
+        assert_eq!(schema.metadata.firmware, "2.0.0");
+        assert_eq!(schema.metadata.hardware, "2.0.0");
+        assert_eq!(consumed, buf.len());
     }
 
     #[test]

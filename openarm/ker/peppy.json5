@@ -47,32 +47,39 @@
   execution: {
     language: "rust",
     container: {
-      def_file: "apptainer.def"
+      def_file: "apptainer.def",
+      // The CDC device the serial transport opens; the USB transport reads the
+      // vendor-mode device through the shared /dev.
+      mount_paths: [
+        "${parameters:device_path}:${parameters:device_path}:rw",
+      ],
     },
     parameters: {
       // "usb" reads the M5Stack in vendor mode (VID 0x303A, PID 0x4002, bulk
-      // endpoints); "serial" reads the CDC device at serial_port/serial_baud.
+      // endpoints); "serial" reads its CDC device at device_path/serial_baud.
       transport: { $type: "string", $default: "usb" },
-      serial_port: { $type: "string", $default: "/dev/m5_ker_485" },
+      device_path: { $type: "string", $default: "/dev/openarm/ker" },
       serial_baud: { $type: "u32", $default: 2000000 },
       // Follower generation ("v1" or "v2"): picks the joint clamp ranges (URDF
-      // limits). Required, not defaulted: KER mirrors v2, so the launcher
-      // states the target explicitly.
+      // limits). Required so a launch clamps to the arm it actually drives.
       hardware_version: "string",
-      // Rate (Hz) at which engaged setpoints are re-published on the arm and
-      // gripper pairing slots.
+      // Rate (Hz, 1..=1000) at which engaged setpoints are re-published on
+      // the arm and gripper pairing slots.
       command_rate_hz: "u32",
-      // Trigger opening fraction in [0, 1) at or below which a squeeze engages
-      // that arm: from its first such frame the arm and its gripper track the
-      // KER, until usable frames stop for stale_timeout_s or the device
-      // reconnects. Required: how deep a squeeze starts motion is a deployment
-      // choice.
+      // Engage an arm when its trigger opening (1 released, 0 fully squeezed)
+      // reaches this value or below; a smaller value demands a deeper squeeze.
+      // The trigger must read open once before it engages, so a device
+      // returning under a held trigger stays put. From the engaging frame the
+      // arm and its gripper track the KER. That same squeeze commands the
+      // gripper, so an arm engages with its gripper near shut. Required: how
+      // deep a squeeze starts motion is a deployment choice.
       engage_opening: "f64",
       // Opening commanded at a released trigger; a squeeze spans [0, this].
       gripper_open_fraction: { $type: "f64", $default: 1.0 },
       // Stop publishing when the newest KER frame is older than this (s); the
-      // followers then hold their last setpoints, and both arms disengage.
-      // Must exceed the device's frame period.
+      // followers then hold their last setpoints. A frame arriving after a gap
+      // this long also disengages both arms. Must exceed the device's frame
+      // period (the KER streams at 1 kHz) and the command period.
       stale_timeout_s: { $type: "f64", $default: 0.25 },
       // Bring-up aid: log the raw channel table (degrees, unmapped) at 1 Hz.
       log_raw: { $type: "bool", $default: false }

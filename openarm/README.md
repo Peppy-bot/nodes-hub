@@ -12,7 +12,7 @@
 | `waldo` | Waldo simulation: stands any number of robots' limbs in one world, with a Bevy browser viewer; lives in the separate `private-nodes-hub` repository, not in this hub |
 | [`openarm_backbone`](./backbone) | routes goals to the correct side |
 | [`openarm_web_commander`](./web_commander) | browser control panel |
-| [`openarm_ker`](./ker) | streams joint setpoints from a physical leader arm |
+| [`openarm_ker`](./ker) | streams joint setpoints from a real leader arm |
 | [`isaac_webviewer`](../isaac_webviewer) | serves the Isaac Sim WebRTC browser viewer |
 | [`scene_commander`](../scene_commander) | browser scene/object/physics control for any simulation implementing the `scene_manipulation` and `object_state` contracts (the Isaac Sim simulation and the Waldo simulation): it edits the scene through `scene_manipulation` and reads the spawned objects through `object_state` |
 
@@ -155,7 +155,7 @@ peppy stack join openarm_v2_sim -i bravo --set-arguments commander_inst.http_por
 MuJoCo and Isaac Sim also simulate `openarm_v1_sim`; Waldo's catalogue
 carries the v2. A copy selects its own recorder (`lerobot_recorder`), camera rig
 (`cameras_sim` for rendered v2 cameras) and robot commander (`xr_commander`,
-`mcp_commander`) with `with:` in the file or `--with` on join. Its ids carry
+`mcp_commander`, `ker_commander`) with `with:` in the file or `--with` on join. Its ids carry
 its name, `alpha_backbone_inst`; the simulation and scene control belong to the
 stack. Removing a copy takes its robot out of the scene and leaves the
 simulation running; `stack reset` stops everything. Isaac Sim stands every
