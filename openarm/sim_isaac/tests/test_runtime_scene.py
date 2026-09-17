@@ -1,6 +1,6 @@
 """Runtime scene edits on a fake USD stage: replacing the scene, clearing it,
 removing objects, what each does to the cached physics views, and which
-runtime commands may touch an object scene_control spawned."""
+runtime commands may touch an object scene_manipulation spawned."""
 
 import importlib.util
 import logging
@@ -235,8 +235,8 @@ class StageReader:
 
 
 @pytest.fixture
-def scene_control(scene, monkeypatch):
-    """The real scene_control provider as the launcher's, reading the fake stage."""
+def scene_manipulation(scene, monkeypatch):
+    """The real scene_manipulation provider as the launcher's, reading the fake stage."""
     actions = ModuleType("peppygen.exposed_actions.scene")
     for name in _ACTIONS:
         setattr(actions, name, ModuleType(f"{actions.__name__}.{name}"))
@@ -252,7 +252,7 @@ def scene_control(scene, monkeypatch):
         modules[services.__name__] = services
     for name, module in modules.items():
         monkeypatch.setitem(sys.modules, name, module)
-    spec = importlib.util.spec_from_file_location("_scene_control_under_test", _ROBOT_DIR / "scene_actions.py")
+    spec = importlib.util.spec_from_file_location("_scene_manipulation_under_test", _ROBOT_DIR / "scene_actions.py")
     module = importlib.util.module_from_spec(spec)
     # Its dataclass resolves postponed annotations through sys.modules.
     monkeypatch.setitem(sys.modules, spec.name, module)
@@ -265,17 +265,17 @@ def scene_control(scene, monkeypatch):
     return io
 
 
-def _spawn(scene, scene_control):
-    result = scene_control._execute(scene.launcher, "spawn_object", {
+def _spawn(scene, scene_manipulation):
+    result = scene_manipulation._execute(scene.launcher, "spawn_object", {
         "asset_id": "props/blocks/red_block", "position": [0.5, 0.0, 0.8], "scale": 1.0, "physics": "none", "mass": 0.1,
     })
     assert result["success"]
     return result["object_id"]
 
 
-def _captured(scene_control):
-    snapshot = scene_control.capture_object_states()
-    assert snapshot is not None, scene_control._unavailable
+def _captured(scene_manipulation):
+    snapshot = scene_manipulation.capture_object_states()
+    assert snapshot is not None, scene_manipulation._unavailable
     return list(snapshot.objects)
 
 
@@ -284,31 +284,31 @@ def _captured(scene_control):
     {"command": "spawn_usd", "path": "/elsewhere/prop.usd", "position": [1.0, 0.0, 0.8]},
     {"command": "spawn_isaac_asset", "path": "Isaac/Props/Blocks/blue_block.usd", "position": [1.0, 0.0, 0.8]},
 ], ids=["remove", "spawn_usd", "spawn_isaac_asset"])
-def test_the_runtime_commander_refuses_to_remove_or_replace_a_scene_control_object(scene, scene_control, command):
-    object_id = _spawn(scene, scene_control)
+def test_the_runtime_commander_refuses_to_remove_or_replace_a_scene_manipulation_object(scene, scene_manipulation, command):
+    object_id = _spawn(scene, scene_manipulation)
     spawned = [(object_id, [f"{_ASSET_ROOT}/Isaac/Props/Blocks/red_block.usd"], (0.5, 0.0, 0.8))]
-    assert _captured(scene_control) == spawned
+    assert _captured(scene_manipulation) == spawned
 
-    with pytest.raises(ValueError, match=f"'{object_id}' is a scene_control object; edit it through scene_control"):
+    with pytest.raises(ValueError, match=f"'{object_id}' is a scene_manipulation object; edit it through scene_manipulation"):
         scene.launcher.execute_runtime_command({**command, "name": object_id})
 
     # Nothing left the stage or the registry, so the capture still lists it.
     assert scene.stage.removed == []
     scene.bridge.invalidate_physics_views.assert_not_called()
-    assert scene_control.owns(object_id)
-    assert _captured(scene_control) == spawned
+    assert scene_manipulation.owns(object_id)
+    assert _captured(scene_manipulation) == spawned
 
 
-def test_the_runtime_commander_still_moves_a_scene_control_object(scene, scene_control):
-    object_id = _spawn(scene, scene_control)
+def test_the_runtime_commander_still_moves_a_scene_manipulation_object(scene, scene_manipulation):
+    object_id = _spawn(scene, scene_manipulation)
 
     scene.launcher.execute_runtime_command({"command": "move_object", "name": object_id, "position": [0.2, 0.3, 0.9]})
 
-    assert [(record[0], record[2]) for record in _captured(scene_control)] == [(object_id, (0.2, 0.3, 0.9))]
+    assert [(record[0], record[2]) for record in _captured(scene_manipulation)] == [(object_id, (0.2, 0.3, 0.9))]
 
 
-def test_the_runtime_commander_still_spawns_and_removes_other_names(scene, scene_control, tmp_path):
-    object_id = _spawn(scene, scene_control)
+def test_the_runtime_commander_still_spawns_and_removes_other_names(scene, scene_manipulation, tmp_path):
+    object_id = _spawn(scene, scene_manipulation)
     usd = tmp_path / "prop.usd"
     usd.write_text("#usda 1.0\n")
 
@@ -321,15 +321,15 @@ def test_the_runtime_commander_still_spawns_and_removes_other_names(scene, scene
     scene.launcher.execute_runtime_command({"command": "remove", "name": "MyObject"})
     assert f"{_OBJECTS}/MyObject" not in scene.stage.prims
     # The commander's own objects never enter the object state.
-    assert [record[0] for record in _captured(scene_control)] == [object_id]
+    assert [record[0] for record in _captured(scene_manipulation)] == [object_id]
 
 
-def test_scene_control_still_removes_its_own_objects(scene, scene_control):
-    object_id = _spawn(scene, scene_control)
+def test_scene_manipulation_still_removes_its_own_objects(scene, scene_manipulation):
+    object_id = _spawn(scene, scene_manipulation)
 
-    result = scene_control._execute(scene.launcher, "remove_object", {"object_id": object_id})
+    result = scene_manipulation._execute(scene.launcher, "remove_object", {"object_id": object_id})
 
     assert result == {"success": True, "message": f"Removed {object_id}"}
     assert scene.stage.removed == [f"{_OBJECTS}/{object_id}"]
-    assert not scene_control.owns(object_id)
-    assert _captured(scene_control) == []
+    assert not scene_manipulation.owns(object_id)
+    assert _captured(scene_manipulation) == []

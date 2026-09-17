@@ -4,7 +4,7 @@
 // pairing: governed arm/gripper setpoints arrive from the simulation relay
 // nodes and measured state streams back.
 //
-// The node also implements the scene_control contract on its scene slot:
+// The node also implements the scene_manipulation contract on its scene slot:
 // runtime scene/object services and actions consumed by higher-level tools
 // such as scene_commander. The object_state contract on its objects slot
 // reports what those tools spawned, streamed and on demand.
@@ -20,12 +20,12 @@
     tag: "v1",
 
     // The scene-editing contract, implemented on the scene slot: any
-    // commander that speaks scene_control can drive this simulation. The
+    // commander that speaks scene_manipulation can drive this simulation. The
     // object state of what it spawned, implemented on the objects slot:
     // the pose and velocities of every spawned object, streamed at
     // state_rate_hz and answered on demand from the same snapshot.
     implements: [
-      { name: "scene_control", tag: "v1", link_id: "scene" },
+      { name: "scene_manipulation", tag: "v1", link_id: "scene" },
       { name: "object_state", tag: "v1", link_id: "objects" },
     ],
 
@@ -57,7 +57,7 @@
     // Runtime scene/object discovery services
     // ------------------------------------------------------------------
     //
-    // Formats and field semantics are defined by scene_control:v1 and
+    // Formats and field semantics are defined by scene_manipulation:v1 and
     // object_state:v1 in contracts-hub. asset_id and object_id are stable
     // identifiers; the catalogue keeps raw Isaac USD paths private to this
     // node.
@@ -72,7 +72,7 @@
     // Runtime scene/object actions
     // ------------------------------------------------------------------
     //
-    // Formats and field semantics are defined by scene_control:v1 in
+    // Formats and field semantics are defined by scene_manipulation:v1 in
     // contracts-hub. Each action enqueues its command onto the Isaac
     // simulation thread through SimLauncher.execute_runtime_command().
     actions: {

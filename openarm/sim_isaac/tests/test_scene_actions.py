@@ -1,4 +1,4 @@
-"""The scene_control and object_state provider: what get_assets_list answers
+"""The scene_manipulation and object_state provider: what get_assets_list answers
 before and after discovery, what load_scene and clear_scene do to spawned
 objects, and what get_object_states answers: nothing until a capture, then
 the latest capture under its own stamp, every completed edit included."""

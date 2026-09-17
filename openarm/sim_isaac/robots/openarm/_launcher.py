@@ -34,7 +34,7 @@ _ANTI_ALIASING_OP = "/rtx/post/aa/op"
 _RUNTIME_SCENE_PATH = "/World/RuntimeScene"
 
 # The runtime commands that remove or replace the prim at a runtime object's
-# path. Each refuses a name scene_control spawned; a move keeps the prim.
+# path. Each refuses a name scene_manipulation spawned; a move keeps the prim.
 _PRIM_REPLACING_COMMANDS = frozenset({"spawn_usd", "spawn_isaac_asset", "remove"})
 
 
@@ -342,10 +342,10 @@ class SimLauncher:
             command,
         )
 
-        # Every object-state capture reads each scene_control object at its
+        # Every object-state capture reads each scene_manipulation object at its
         # prim. Removing or replacing one here would leave the registry
         # naming a prim that is gone or swapped, and every capture would
-        # fail until a scene_control edit. scene_control itself calls the
+        # fail until a scene_manipulation edit. scene_manipulation itself calls the
         # _runtime_* methods directly, past this check.
         if (
             cmd in _PRIM_REPLACING_COMMANDS
@@ -353,7 +353,7 @@ class SimLauncher:
         ):
             raise ValueError(
                 f"Runtime command '{cmd}' refused: '{command['name']}' is "
-                "a scene_control object; edit it through scene_control"
+                "a scene_manipulation object; edit it through scene_manipulation"
             )
 
         if cmd == "move_arm":

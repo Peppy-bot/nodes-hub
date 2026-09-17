@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Peppy scene_control and object_state bridge for Isaac Sim."""
+"""Peppy scene_manipulation and object_state bridge for Isaac Sim."""
 
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ class _PendingCommand:
 
 
 class SceneActionIO:
-    """Bridge scene_control and object_state to the Isaac simulation thread.
+    """Bridge scene_manipulation and object_state to the Isaac simulation thread.
 
     Scene edits run on the Isaac thread in submission order. Object state is
     captured there too, from the registry of spawned objects and the engine,
@@ -179,9 +179,9 @@ class SceneActionIO:
             return dict(obj)
 
     def owns(self, object_id) -> bool:
-        """Whether object_id names an object spawned through scene_control.
+        """Whether object_id names an object spawned through scene_manipulation.
 
-        The registry and the stage only stay in step through scene_control,
+        The registry and the stage only stay in step through scene_manipulation,
         so the runtime commander asks before it removes or replaces a
         runtime object.
         """
@@ -467,7 +467,7 @@ class SceneActionIO:
                     "scale must be greater than zero"
                 )
 
-            # scene_control: spawned objects go first, then the scene is
+            # scene_manipulation: spawned objects go first, then the scene is
             # replaced.
             self._remove_spawned_objects(launcher)
 
