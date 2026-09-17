@@ -40,11 +40,11 @@
       pairings: [
         // One Cartesian command loop per operator hand; which follower each
         // hand drives is the launcher's choice.
-        { name: "pose_link", tag: "v1", role: "leader", link_id: "left_arm", optional: true },
-        { name: "pose_link", tag: "v1", role: "leader", link_id: "right_arm", optional: true },
+        { name: "pose_link", tag: "v1", role: "leader", link_id: "left_arm", cardinality: "zero_or_one" },
+        { name: "pose_link", tag: "v1", role: "leader", link_id: "right_arm", cardinality: "zero_or_one" },
         // The same hand's opening loop.
-        { name: "gripper_link", tag: "v1", role: "leader", link_id: "left_gripper", optional: true },
-        { name: "gripper_link", tag: "v1", role: "leader", link_id: "right_gripper", optional: true },
+        { name: "gripper_link", tag: "v1", role: "leader", link_id: "left_gripper", cardinality: "zero_or_one" },
+        { name: "gripper_link", tag: "v1", role: "leader", link_id: "right_gripper", cardinality: "zero_or_one" },
       ],
     },
   },

@@ -28,7 +28,7 @@
         // to the pair (no gripper_id demux). Optional: the gripper boots
         // unpaired (moves still work via backbone goals) and is paired at
         // the backbone's start.
-        { name: "gripper_link", tag: "v1", role: "follower", link_id: "backbone", optional: true },
+        { name: "gripper_link", tag: "v1", role: "follower", link_id: "backbone", cardinality: "zero_or_one" },
       ],
     },
   },

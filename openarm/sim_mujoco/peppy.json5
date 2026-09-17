@@ -15,18 +15,18 @@
         // setpoints stream in, measured simulation state streams back. Optional:
         // the simulation boots unpaired and each pair is established at the
         // backbone's start (launcher `links:`).
-        { name: "joint_link", tag: "v1", role: "follower", link_id: "left_arm", optional: true },
-        { name: "joint_link", tag: "v1", role: "follower", link_id: "right_arm", optional: true },
-        { name: "gripper_link", tag: "v1", role: "follower", link_id: "left_gripper", optional: true },
-        { name: "gripper_link", tag: "v1", role: "follower", link_id: "right_gripper", optional: true },
+        { name: "joint_link", tag: "v1", role: "follower", link_id: "left_arm", cardinality: "zero_or_one" },
+        { name: "joint_link", tag: "v1", role: "follower", link_id: "right_arm", cardinality: "zero_or_one" },
+        { name: "gripper_link", tag: "v1", role: "follower", link_id: "left_gripper", cardinality: "zero_or_one" },
+        { name: "gripper_link", tag: "v1", role: "follower", link_id: "right_gripper", cardinality: "zero_or_one" },
         // Robot-mounted cameras rendered from the live scene, one slot per
         // camera (the slot is the camera, so no id demux). The simulation plays the
         // camera role; a per-camera relay presents the rgb/rgbd contract.
         // Optional: slots stay unbound (and rendering stays off) outside record
         // stacks; frames flow only when cameras_enabled is set.
-        { name: "sim_rgb_camera_link", tag: "v1", role: "camera", link_id: "wrist_left", optional: true },
-        { name: "sim_rgb_camera_link", tag: "v1", role: "camera", link_id: "wrist_right", optional: true },
-        { name: "sim_rgbd_camera_link", tag: "v1", role: "camera", link_id: "chest", optional: true },
+        { name: "sim_rgb_camera_link", tag: "v1", role: "camera", link_id: "wrist_left", cardinality: "zero_or_one" },
+        { name: "sim_rgb_camera_link", tag: "v1", role: "camera", link_id: "wrist_right", cardinality: "zero_or_one" },
+        { name: "sim_rgbd_camera_link", tag: "v1", role: "camera", link_id: "chest", cardinality: "zero_or_one" },
       ],
     },
   },
