@@ -416,14 +416,12 @@ mod tests {
             "names the floor to type: {refused}"
         );
 
-        // A window under the floor is refused whatever the command rate.
-        assert!(
-            parse_config(&Parameters {
-                stale_timeout_s: 0.004,
-                ..params()
-            })
-            .is_err()
-        );
+        // Just under the floor is refused, and says which parameter.
+        let refused = refusal(Parameters {
+            stale_timeout_s: 0.004,
+            ..params()
+        });
+        assert!(refused.contains("stale_timeout_s"), "{refused}");
 
         // The floor itself parses, and a slow command rate stays legal: the
         // window is about frame arrival, not the publisher's tick.

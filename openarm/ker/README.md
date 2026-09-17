@@ -10,9 +10,10 @@ clamped joint radians and gripper openings, and streams them exactly like
 slot (the backbone governs them all).
 
 An arm engages when its trigger is squeezed to `engage_trigger_opening` or
-deeper, having first read back above it for a few frames, so a device
-returning under a held trigger never resumes motion. From that frame the arm
-and its gripper track the KER, and releasing the trigger keeps it tracking.
+deeper, having first read back above it for three frames in a row, so a
+device returning under a held trigger never resumes motion. From that frame
+the arm and its gripper track the KER, and releasing the trigger keeps it
+tracking.
 
 The trigger drives the gripper too: released commands `gripper_open_fraction`,
 a full squeeze closes it, and the squeeze that engages an arm therefore
@@ -23,11 +24,12 @@ To pause, unplug the KER: both arms disengage and the followers hold their
 last setpoints, still energized. To end the session, stop the copy running
 it: `peppy stack remove echo` for one robot, `peppy stack reset` for this
 machine's stack. Ending a session disables the motors, so the arms go limp
-where they are: bring them low first. While no frames arrive the node
-publishes nothing, so every consumer's stream timeout holds the robot; a
-frame arriving after a gap of
-`stale_timeout_s` disengages both arms. After a pause, plug the KER back in,
-then release a trigger and squeeze it again to re-engage.
+where they are: bring them low first.
+
+While no frames arrive the node publishes nothing, so every consumer's stream
+timeout holds the robot; a frame arriving after a gap of `stale_timeout_s`
+disengages both arms. After a pause, plug the KER back in, then release a
+trigger and squeeze it again to re-engage.
 
 ## Connect
 

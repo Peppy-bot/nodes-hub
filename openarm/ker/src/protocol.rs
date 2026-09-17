@@ -253,7 +253,10 @@ impl FrameLayout {
         let mut angles = None;
         for field in &schema.fields {
             match (field.key.as_str(), field.ty) {
-                (REQUIRED_FIELD, FieldType::F32) => angles = Some((offset, field.count)),
+                // The first match wins, as the response scan reads it.
+                (REQUIRED_FIELD, FieldType::F32) if angles.is_none() => {
+                    angles = Some((offset, field.count))
+                }
                 (REQUIRED_FIELD, _) => {
                     return Err(ProtocolError::WrongFieldType {
                         key: REQUIRED_FIELD,

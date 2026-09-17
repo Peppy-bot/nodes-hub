@@ -719,9 +719,9 @@ mod tests {
     }
 
     #[test]
-    fn a_trigger_held_across_a_reconnect_does_not_engage_on_the_new_session() {
-        // The session a returning device opens starts its own latch, so a hand
-        // that never let go cannot resume motion.
+    fn a_session_opening_under_a_held_trigger_does_not_engage() {
+        // Every session builds its own latch, so a hand that never let go
+        // cannot resume motion when a device returns.
         let run = run_one(FakeKer::new(vec![squeezed_frame()]));
 
         let sample = run.sample.expect("a frame arrived");
