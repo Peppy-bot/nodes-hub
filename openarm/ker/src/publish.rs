@@ -113,7 +113,9 @@ pub async fn run(
             token.clone(),
             format!("{} gripper", label(side)),
             move || {
-                let opening = streamable(&sample_rx, stale_timeout, side)?.gripper_opening(side);
+                let opening = streamable(&sample_rx, stale_timeout, side)?
+                    .gripper_openings
+                    .side(side);
                 Some(pairing_timestamp().and_then(|timestamp| {
                     build_gripper(timestamp, opening, 0.0).map_err(|e| e.to_string())
                 }))
@@ -316,7 +318,7 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
-    use crate::side::SideFlags;
+    use crate::side::{SideFlags, SideValues};
 
     const STALE: Duration = Duration::from_millis(250);
     const RIGHT_ONLY: SideFlags = SideFlags {
@@ -335,8 +337,10 @@ mod tests {
         KerSample {
             left_joints: [0.1; 7],
             right_joints: [0.2; 7],
-            left_gripper_opening: LEFT_OPENING,
-            right_gripper_opening: RIGHT_OPENING,
+            gripper_openings: SideValues {
+                left: LEFT_OPENING,
+                right: RIGHT_OPENING,
+            },
             engaged,
             received_at: Instant::now() - age,
         }
@@ -391,8 +395,8 @@ mod tests {
         tx.send(Some(sample(BOTH, Duration::ZERO))).unwrap();
         let left = streamable(&rx, STALE, Side::Left).expect("engaged");
         let right = streamable(&rx, STALE, Side::Right).expect("engaged");
-        assert_eq!(left.gripper_opening(Side::Left), LEFT_OPENING);
-        assert_eq!(right.gripper_opening(Side::Right), RIGHT_OPENING);
+        assert_eq!(left.gripper_openings.side(Side::Left), LEFT_OPENING);
+        assert_eq!(right.gripper_openings.side(Side::Right), RIGHT_OPENING);
         assert_eq!(left.joints(Side::Left), [0.1; 7]);
         assert_eq!(right.joints(Side::Right), [0.2; 7]);
     }

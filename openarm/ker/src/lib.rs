@@ -1,7 +1,7 @@
 //! openarm_ker: operator entry point driven by the OpenArm KER (Kinematic
 //! Equivalent Replica), enactic's motorless bimanual leader arm. A dedicated
 //! reader thread speaks the M5Stack's framed protocol (USB vendor mode or
-//! serial CDC), maps its channels to clamped joint radians and commanded
+//! its serial device), maps its channels to clamped joint radians and commanded
 //! gripper openings, and the publish tasks stream each limb on its joint_link
 //! or gripper_link pairing slot (the backbone governs them). An arm engages on
 //! a trigger squeeze, the trigger having read open first; for an unengaged

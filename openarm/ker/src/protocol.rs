@@ -23,8 +23,8 @@ use std::fmt;
 pub const CMD_PING: u8 = 0x00;
 pub const CMD_STANDBY: u8 = 0x01;
 pub const CMD_STREAM: u8 = 0x02;
-pub(crate) const PING_HEADER: [u8; 2] = [0xA5, 0x50];
-pub(crate) const STREAM_HEADER: [u8; 2] = [0xA5, 0x5A];
+const PING_HEADER: [u8; 2] = [0xA5, 0x50];
+const STREAM_HEADER: [u8; 2] = [0xA5, 0x5A];
 
 const FW_LEN: usize = 16;
 const HW_LEN: usize = 16;
@@ -34,9 +34,13 @@ const KEY_LEN: usize = 16;
 const FIELD_ENTRY_LEN: usize = KEY_LEN + 2;
 /// header + metadata strings + field count
 const PING_FIXED_LEN: usize = 2 + FW_LEN + HW_LEN + UPDATED_LEN + 1;
-/// The longest response the device can describe: every field a `u8` count
-/// can name.
-pub(crate) const MAX_PING_RESPONSE_LEN: usize = PING_FIXED_LEN + u8::MAX as usize * FIELD_ENTRY_LEN;
+/// Bytes the response carries per sensor after its field table: the sensor's
+/// angle and one status byte, which the firmware appends to every PING reply.
+const SNAPSHOT_ENTRY_LEN: usize = 5;
+/// The longest response the device can describe: every field a `u8` count can
+/// name, and a snapshot entry for every channel one of them can carry.
+pub(crate) const MAX_PING_RESPONSE_LEN: usize =
+    PING_FIXED_LEN + u8::MAX as usize * FIELD_ENTRY_LEN + u8::MAX as usize * SNAPSHOT_ENTRY_LEN;
 /// The field every stream packet carries.
 const REQUIRED_FIELD: &str = "angles";
 
@@ -207,9 +211,20 @@ impl Schema {
         if !metadata.is_plausible() {
             return Candidate::NotAResponse;
         }
+        // The reply ends with one snapshot entry per angle channel, so the
+        // bytes it spans are the table plus that block.
+        let angles = fields
+            .iter()
+            .find(|field| field.key == REQUIRED_FIELD)
+            .map_or(0, |field| field.count);
+        let consumed =
+            start + PING_FIXED_LEN + field_count * FIELD_ENTRY_LEN + angles * SNAPSHOT_ENTRY_LEN;
+        if buf.len() < consumed {
+            return Candidate::NeedMore;
+        }
         Candidate::Parsed {
             schema: Schema { metadata, fields },
-            consumed: start + PING_FIXED_LEN + field_count * FIELD_ENTRY_LEN,
+            consumed,
         }
     }
 }
@@ -237,10 +252,10 @@ impl FrameLayout {
         let mut angles = None;
         for field in &schema.fields {
             match (field.key.as_str(), field.ty) {
-                ("angles", FieldType::F32) => angles = Some((offset, field.count)),
-                ("angles", _) => {
+                (REQUIRED_FIELD, FieldType::F32) => angles = Some((offset, field.count)),
+                (REQUIRED_FIELD, _) => {
                     return Err(ProtocolError::WrongFieldType {
-                        key: "angles",
+                        key: REQUIRED_FIELD,
                         expected: "f32",
                     });
                 }
@@ -286,7 +301,7 @@ impl FrameLayout {
 }
 
 /// XOR of every payload byte: the device's stream packet checksum.
-pub(crate) fn xor_checksum(payload: &[u8]) -> u8 {
+fn xor_checksum(payload: &[u8]) -> u8 {
     payload.iter().fold(0, |acc, b| acc ^ b)
 }
 
@@ -317,7 +332,7 @@ impl Deframer {
     /// Bytes held back for a packet that has yet to complete, which is what
     /// proves garbage cannot accumulate.
     #[cfg(test)]
-    pub(crate) fn buffered(&self) -> usize {
+    fn buffered(&self) -> usize {
         self.buf.len()
     }
 
@@ -365,6 +380,11 @@ pub(crate) mod fixtures {
 
     use super::*;
 
+    /// A schema key, NUL-padded the way the device writes one.
+    pub(crate) fn padded_key(key: &str) -> Vec<u8> {
+        padded(key, KEY_LEN)
+    }
+
     fn padded(s: &str, len: usize) -> Vec<u8> {
         let mut v = s.as_bytes().to_vec();
         assert!(v.len() <= len);
@@ -372,9 +392,8 @@ pub(crate) mod fixtures {
         v
     }
 
-    /// A ping response for the reference schema: timestamp u32, angles f32 x
-    /// `channels`, then encoder_value i32 and encoder_button bool, which this
-    /// node skips by size.
+    /// A ping response shaped like firmware 2.0.0's: the schema it registers,
+    /// followed by the snapshot block every reply carries.
     pub(crate) fn ping_response(channels: u8) -> Vec<u8> {
         ping_response_for("2.0.0", channels)
     }
@@ -385,33 +404,32 @@ pub(crate) mod fixtures {
         v.extend(padded("2.0.0", FW_LEN));
         v.extend(padded(hardware, HW_LEN));
         v.extend(padded("2026-06-22", UPDATED_LEN));
-        v.push(4);
+        v.push(3);
         for (key, type_id, count) in [
             ("timestamp", 0u8, 1u8),
             ("angles", 5, channels),
-            ("encoder_value", 3, 1),
-            ("encoder_button", 6, 1),
+            ("errors", 6, channels),
         ] {
             v.extend(padded(key, KEY_LEN));
             v.push(type_id);
             v.push(count);
         }
+        // One angle and one status byte per channel, as the firmware appends.
+        for channel in 0..channels {
+            v.extend((channel as f32).to_le_bytes());
+            v.push(1);
+        }
         v
     }
 
-    /// A stream packet for the reference schema, with a valid checksum.
-    pub(crate) fn stream_packet(
-        timestamp: u32,
-        angles: &[f32],
-        encoder: i32,
-        button: bool,
-    ) -> Vec<u8> {
+    /// A stream packet for the reference schema: timestamp, the angles, and
+    /// one error flag per channel, with a valid checksum.
+    pub(crate) fn stream_packet(timestamp: u32, angles: &[f32]) -> Vec<u8> {
         let mut payload = timestamp.to_le_bytes().to_vec();
         for a in angles {
             payload.extend(a.to_le_bytes());
         }
-        payload.extend(encoder.to_le_bytes());
-        payload.push(button as u8);
+        payload.extend(std::iter::repeat_n(0u8, angles.len()));
         let mut packet = STREAM_HEADER.to_vec();
         packet.push(xor_checksum(&payload));
         packet.splice(2..2, payload);
@@ -447,12 +465,13 @@ mod tests {
         assert_eq!(schema.metadata.firmware, "2.0.0");
         assert_eq!(schema.metadata.hardware, "2.0.0");
         assert_eq!(schema.metadata.updated, "2026-06-22");
-        assert_eq!(schema.fields.len(), 4);
+        assert_eq!(schema.fields.len(), 3);
         assert_eq!(schema.fields[1].key, "angles");
         assert_eq!(schema.fields[1].ty, FieldType::F32);
         assert_eq!(schema.fields[1].count, 16);
         let layout = layout_of(&schema);
-        assert_eq!(layout.payload_len(), 4 + 16 * 4 + 4 + 1);
+        // timestamp, sixteen angles, sixteen error flags.
+        assert_eq!(layout.payload_len(), 4 + 16 * 4 + 16);
     }
 
     #[test]
@@ -469,9 +488,8 @@ mod tests {
     #[test]
     fn a_false_ping_header_reading_as_an_empty_table_is_skipped() {
         // Zero bytes are the common case in stream payload: a released
-        // channel, a zero encoder value, a small timestamp's high bytes. A
-        // candidate whose field count reads 0 carries no angles, so it is
-        // payload, not a response.
+        // channel, a small timestamp's high bytes, a cleared error flag. Such
+        // a candidate carries no version strings, so it reads as payload.
         let mut buf = PING_HEADER.to_vec();
         buf.extend([0x00; PING_FIXED_LEN * 2]);
         let response = ping_response(16);
@@ -501,10 +519,15 @@ mod tests {
 
     #[test]
     fn a_false_ping_header_in_stream_bytes_is_skipped() {
-        // Stream payload that happens to carry the ping header, with a type id
-        // the schema never uses: the response behind it must still be found.
+        // Stream payload that happens to carry the ping header, with metadata
+        // that reads like a device's but a type id the schema never uses: the
+        // response behind it must still be found.
         let mut buf = PING_HEADER.to_vec();
-        buf.extend([0x07; PING_FIXED_LEN * 2]);
+        buf.extend([b'A'; PING_FIXED_LEN - 3]);
+        buf.push(1);
+        buf.extend(fixtures::padded_key("angles"));
+        buf.push(7);
+        buf.push(16);
         let response = ping_response(16);
         buf.extend(&response);
         let PingParse::Parsed { schema, consumed } = Schema::parse_ping(&buf) else {
@@ -532,7 +555,7 @@ mod tests {
         let layout = layout_of(&schema);
         assert_eq!(layout.angle_count(), 3);
 
-        let packet = stream_packet(7, &[10.0, -20.5, 30.25], -4, true);
+        let packet = stream_packet(7, &[10.0, -20.5, 30.25]);
         let mut deframer = Deframer::new(layout.payload_len());
         deframer.push(&packet);
         let payload = deframer.next_payload().expect("one frame").expect("valid");
@@ -683,7 +706,7 @@ mod tests {
         let schema = reference_schema(2);
         let layout = layout_of(&schema);
         let mut deframer = Deframer::new(layout.payload_len());
-        let packet = stream_packet(1, &[1.0, 2.0], 0, false);
+        let packet = stream_packet(1, &[1.0, 2.0]);
         for (i, byte) in packet.iter().enumerate() {
             deframer.push(&[*byte]);
             if i < packet.len() - 1 {
@@ -698,11 +721,11 @@ mod tests {
         let schema = reference_schema(2);
         let layout = layout_of(&schema);
         let mut deframer = Deframer::new(layout.payload_len());
-        let mut corrupted = stream_packet(1, &[1.0, 2.0], 0, false);
+        let mut corrupted = stream_packet(1, &[1.0, 2.0]);
         let last = corrupted.len() - 1;
         corrupted[last] ^= 0xFF;
         deframer.push(&corrupted);
-        deframer.push(&stream_packet(2, &[3.0, 4.0], 0, false));
+        deframer.push(&stream_packet(2, &[3.0, 4.0]));
         assert_eq!(deframer.next_payload(), Some(Err(BadChecksum)));
         let payload = deframer.next_payload().expect("frame").expect("valid");
         assert_eq!(layout.parse(&payload).angles_deg, vec![3.0, 4.0]);
@@ -716,7 +739,7 @@ mod tests {
         deframer.push(&[0x00, 0xA5, 0x00, 0xFF]);
         assert!(deframer.next_payload().is_none());
         assert_eq!(deframer.buffered(), 0, "garbage must not accumulate");
-        deframer.push(&stream_packet(3, &[0.5, -0.5], 9, true));
+        deframer.push(&stream_packet(3, &[0.5, -0.5]));
         let payload = deframer.next_payload().expect("frame").expect("valid");
         assert_eq!(layout.parse(&payload).angles_deg, vec![0.5, -0.5]);
     }
@@ -726,7 +749,7 @@ mod tests {
         let schema = reference_schema(2);
         let layout = layout_of(&schema);
         let mut deframer = Deframer::new(layout.payload_len());
-        let packet = stream_packet(4, &[1.0, 1.0], 0, false);
+        let packet = stream_packet(4, &[1.0, 1.0]);
         deframer.push(&[0x33, STREAM_HEADER[0]]);
         assert!(deframer.next_payload().is_none());
         // The 0xA5 tail must survive so a packet split right after it still parses.

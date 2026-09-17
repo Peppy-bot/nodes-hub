@@ -4,7 +4,7 @@ Operator entry point driven by the OpenArm KER (Kinematic Equivalent Replica),
 enactic's motorless bimanual leader arm. The KER's joint structure matches
 OpenArm v2 1:1 (link lengths scaled to 70%), so leader joint angles map to
 follower joint targets with no coordinate transform. The node reads the KER's
-M5Stack CoreS3 over USB vendor mode (or serial CDC), maps its channels to
+M5Stack CoreS3 over USB vendor mode (or its serial device), maps its channels to
 clamped joint radians and gripper openings, and streams them exactly like
 `openarm_web_commander`: each limb on its own joint_link / gripper_link pairing
 slot (the backbone governs them all).
@@ -22,15 +22,16 @@ leaves the arm tracking.
 To pause, unplug the KER: both arms disengage and the followers hold their
 last setpoints, still energized. To end the session, stop the copy running
 it: `peppy stack remove echo` for one robot, `peppy stack reset` for this
-machine's stack. While no frames arrive the node publishes nothing, so every
+machine's stack. Ending a session disables the motors, so the arms go limp
+where they are: bring them low first. While no frames arrive the node publishes nothing, so every
 consumer's stream timeout holds the robot; a frame arriving after a gap of
-`stale_timeout_s` disengages both arms. After a pause, release a trigger and
-squeeze it again to re-engage.
+`stale_timeout_s` disengages both arms. After a pause, plug the KER back in,
+then release a trigger and squeeze it again to re-engage.
 
 ## Connect
 
 Plug the KER's M5Stack CoreS3 into a USB port with a data cable, and switch
-the controller on. `lsusb -d 303a:` then lists one device:
+the controller on. `lsusb -d 303a:` then shows the controller in one of two modes:
 
 - `303a:4002` is vendor mode, which enactic's released firmware streams and
   this node reads by default.
@@ -47,8 +48,8 @@ the rule below covers without any bind of its own.
 Install [the KER udev rule](https://github.com/Peppy-bot/launchers-hub/blob/main/openarm/rules/60-openarm-ker.rules)
 from launchers-hub, following its header. Without it the node logs "KER
 connection lost (open: ... attached but cannot be opened ...)" once and
-retries every second, logging again when the reason changes or after a
-reconnect.
+retries every second, logging again when the reason changes or after the link
+streams again.
 
 Verify the link with enactic's CLI. They ship it on PyPI as `openarm_ker`,
 the same name as this node and no relation to it, and it runs without being

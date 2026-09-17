@@ -23,7 +23,7 @@ use crate::mapping::{ChannelMap, GripperOpenFraction, MappedFrame};
 use crate::protocol::{
     CMD_PING, CMD_STANDBY, CMD_STREAM, Deframer, FrameLayout, KerFrame, PingParse, Schema,
 };
-use crate::side::SideFlags;
+use crate::side::{SideFlags, SideValues};
 use crate::transport::{self, KerTransport, TransportConfig};
 
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(3);
@@ -49,8 +49,7 @@ const _: () = assert!(MAX_HANDSHAKE_BUFFER > crate::protocol::MAX_PING_RESPONSE_
 pub struct KerSample {
     pub left_joints: [f64; ARM_DOF],
     pub right_joints: [f64; ARM_DOF],
-    pub left_gripper_opening: f64,
-    pub right_gripper_opening: f64,
+    pub gripper_openings: SideValues,
     pub engaged: SideFlags,
     pub received_at: Instant,
 }
@@ -61,8 +60,7 @@ impl KerSample {
         Self {
             left_joints: mapped.left_joints,
             right_joints: mapped.right_joints,
-            left_gripper_opening: mapped.gripper_openings.left,
-            right_gripper_opening: mapped.gripper_openings.right,
+            gripper_openings: mapped.gripper_openings,
             engaged,
             received_at,
         }
@@ -72,13 +70,6 @@ impl KerSample {
         match side {
             Side::Left => self.left_joints,
             Side::Right => self.right_joints,
-        }
-    }
-
-    pub fn gripper_opening(&self, side: Side) -> f64 {
-        match side {
-            Side::Left => self.left_gripper_opening,
-            Side::Right => self.right_gripper_opening,
         }
     }
 }
@@ -463,12 +454,12 @@ mod tests {
             }
         }
 
-        /// A device already streaming when this node connects, as one left
-        /// running by a previous session is. It honours STANDBY only after
-        /// `standby_after` more frames, so its bytes land in the handshake.
-        fn already_streaming(mut self, standby_after: usize) -> Self {
-            self.streaming = true;
-            self.fill(standby_after);
+        /// A device whose frames are already in flight when this node
+        /// connects, as one left running by a previous session is: the queued
+        /// bytes arrive before the PING response, so the handshake has to scan
+        /// past them.
+        fn already_streaming(mut self, queued_frames: usize) -> Self {
+            self.fill(queued_frames);
             self
         }
 
@@ -476,7 +467,7 @@ mod tests {
             for _ in 0..frames {
                 let angles = self.next_angles();
                 self.pending
-                    .extend(stream_packet(1, &angles[..self.channels], 0, false));
+                    .extend(stream_packet(1, &angles[..self.channels]));
             }
         }
 
@@ -605,8 +596,8 @@ mod tests {
         // Released triggers: nothing engages, and each gripper rests at the
         // open fraction.
         assert_eq!(sample.engaged, SideFlags::NONE);
-        assert_eq!(sample.left_gripper_opening, OPEN_FRACTION);
-        assert_eq!(sample.right_gripper_opening, OPEN_FRACTION);
+        assert_eq!(sample.gripper_openings.left, OPEN_FRACTION);
+        assert_eq!(sample.gripper_openings.right, OPEN_FRACTION);
         // Each arm reads its own channels, end to end through the session.
         let frame = released_frame();
         for (side, first_channel) in [(Side::Right, 0), (Side::Left, 8)] {
@@ -631,11 +622,11 @@ mod tests {
 
         let sample = run.sample.expect("a frame arrived");
         assert!(
-            (sample.left_gripper_opening - OPEN_FRACTION * 0.5).abs() < 1e-12,
+            (sample.gripper_openings.left - OPEN_FRACTION * 0.5).abs() < 1e-12,
             "left: {}",
-            sample.left_gripper_opening
+            sample.gripper_openings.left
         );
-        assert_eq!(sample.right_gripper_opening, OPEN_FRACTION);
+        assert_eq!(sample.gripper_openings.right, OPEN_FRACTION);
     }
 
     #[test]
@@ -656,7 +647,7 @@ mod tests {
             },
             "a squeeze after a run of open frames engages both arms"
         );
-        assert_eq!(sample.left_gripper_opening, 0.0, "a full squeeze closes");
+        assert_eq!(sample.gripper_openings.left, 0.0, "a full squeeze closes");
     }
 
     #[test]
@@ -673,7 +664,7 @@ mod tests {
         let sample = run
             .sample
             .expect("a split packet still reaches the channel");
-        assert_eq!(sample.left_gripper_opening, OPEN_FRACTION);
+        assert_eq!(sample.gripper_openings.left, OPEN_FRACTION);
     }
 
     #[test]
@@ -724,6 +715,24 @@ mod tests {
         assert!(
             run.sample.is_some(),
             "the frame after an unmappable one still streams"
+        );
+    }
+
+    #[test]
+    fn a_trigger_held_across_a_reconnect_does_not_engage_on_the_new_session() {
+        // The session a returning device opens starts its own latch, so a hand
+        // that never let go cannot resume motion.
+        let run = run_one(FakeKer::new(vec![squeezed_frame()]));
+
+        let sample = run.sample.expect("a frame arrived");
+        assert_eq!(
+            sample.engaged,
+            SideFlags::NONE,
+            "a session opening under a held trigger must not engage"
+        );
+        assert_eq!(
+            sample.gripper_openings.left, 0.0,
+            "the gripper still follows"
         );
     }
 

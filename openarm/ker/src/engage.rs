@@ -82,7 +82,7 @@ impl EngageLatch {
         for side in [Side::Left, Side::Right] {
             let open_frames = &mut self.open_frames[index(side)];
             if triggers.side(side) > threshold {
-                *open_frames = open_frames.saturating_add(1).min(FRAMES_TO_ARM);
+                *open_frames = (*open_frames + 1).min(FRAMES_TO_ARM);
                 continue;
             }
             if *open_frames >= FRAMES_TO_ARM && !self.engaged.side(side) {

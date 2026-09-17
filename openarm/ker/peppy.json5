@@ -1,7 +1,7 @@
 // openarm_ker: the commander driven by the OpenArm KER (Kinematic
 // Equivalent Replica), enactic's motorless bimanual leader arm. Reads the
 // KER's encoder frames from its M5Stack CoreS3 over USB vendor mode (or
-// serial CDC), maps the channels to per-side joint radians and commanded
+// its serial device), maps the channels to per-side joint radians and commanded
 // gripper openings, and streams both to the backbone over the
 // joint_link / gripper_link pairings exactly like openarm_web_commander (the
 // backbone governs everything before it reaches a follower). An arm engages
@@ -53,8 +53,8 @@
     parameters: {
       // "usb" reads the M5Stack in vendor mode (VID 0x303A, PID 0x4002, bulk
       // endpoints), which is what enactic's released firmware streams.
-      // "serial" reads a CDC device at device_path/serial_baud, which a
-      // firmware built without USE_USB streams instead.
+      // "serial" reads the ESP32's serial device at device_path/serial_baud,
+      // which a firmware built without USE_USB streams over instead.
       transport: { $type: "string", $default: "usb" },
       device_path: { $type: "string", $default: "/dev/openarm/ker" },
       serial_baud: { $type: "u32", $default: 2000000 },
@@ -67,13 +67,14 @@
       // Engage an arm when its trigger opening (1 released, 0 fully squeezed)
       // reaches this value or below (at least 0, under 1); a smaller value
       // demands a deeper squeeze.
-      // The trigger must first read back above this value for a few frames, so
-      // a device returning under a held trigger stays put. From the engaging
+      // The trigger must first read back above this value for three frames in
+      // a row, so a device returning under a held trigger stays put. From the engaging
       // frame the arm and its gripper track the KER. That same squeeze
       // commands the gripper, so an arm engages with its gripper near shut.
       // Required: how deep a squeeze starts motion is a deployment choice.
       engage_trigger_opening: "f64",
-      // Opening commanded at a released trigger; a squeeze spans [0, this].
+      // Opening commanded at a released trigger (greater than 0, at most 1);
+      // a squeeze spans [0, this].
       gripper_open_fraction: { $type: "f64", $default: 1.0 },
       // Stop publishing when the newest KER frame is older than this (s); the
       // followers then hold their last setpoints. A frame arriving after a gap

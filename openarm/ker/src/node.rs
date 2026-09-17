@@ -54,8 +54,8 @@ pub enum NodeError {
 
     #[error(
         "stale_timeout_s {given} is under the {floor} s floor, five frame periods of the \
-         KER's 1 kHz stream: a tighter window ages frames out as they arrive and no arm ever \
-         engages. Raise it to at least {floor}, or leave the 0.25 default"
+         KER's 1 kHz stream: a window this tight disengages both arms on ordinary frame \
+         jitter. Raise it to at least {floor}, or leave the 0.25 default"
     )]
     StaleTimeoutUnderFloor { given: f64, floor: f64 },
 
@@ -410,6 +410,19 @@ mod tests {
         assert!(
             refused.contains("1 kHz"),
             "names the device rate: {refused}"
+        );
+        assert!(
+            refused.contains("0.005"),
+            "names the floor to type: {refused}"
+        );
+
+        // A window under the floor is refused whatever the command rate.
+        assert!(
+            parse_config(&Parameters {
+                stale_timeout_s: 0.004,
+                ..params()
+            })
+            .is_err()
         );
 
         // The floor itself parses, and a slow command rate stays legal: the

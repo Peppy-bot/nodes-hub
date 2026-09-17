@@ -71,7 +71,10 @@ pub enum DeviceMismatch {
 
 /// A launcher `gripper_open_fraction` outside (0, 1].
 #[derive(Debug, thiserror::Error)]
-#[error("gripper_open_fraction must be greater than 0 and at most 1, got {0}")]
+#[error(
+    "gripper_open_fraction is the opening a released trigger commands: greater than 0 and \
+     at most 1. Try 0.5, or leave the 1.0 default; got {0}"
+)]
 pub struct GripperOpenFractionOutOfRange(pub f64);
 
 /// The gripper opening a released trigger commands; a full squeeze closes.
@@ -105,7 +108,7 @@ pub enum MapError {
 
 /// One side's channel wiring and the follower's clamp limits.
 #[derive(Debug)]
-pub struct ArmMap {
+struct ArmMap {
     channels: [usize; ARM_DOF],
     limits: [[f64; 2]; ARM_DOF],
 }
@@ -126,7 +129,7 @@ impl ArmMap {
 
 /// One trigger's channel and its angle-to-opening travel.
 #[derive(Debug)]
-pub struct TriggerMap {
+struct TriggerMap {
     channel: usize,
     closed_deg: f64,
 }

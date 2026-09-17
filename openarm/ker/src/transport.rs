@@ -99,9 +99,9 @@ impl UsbTransport {
                     io::ErrorKind::PermissionDenied,
                     format!(
                         "USB device {USB_VID:04x}:{USB_PID:04x} is attached but cannot be \
-                         opened: install openarm/rules/60-openarm-ker.rules from \
-                         launchers-hub, then `sudo udevadm control --reload-rules && sudo \
-                         udevadm trigger` and replug it"
+                         opened: copy openarm/rules/60-openarm-ker.rules from \
+                         launchers-hub into /etc/udev/rules.d/, then `sudo udevadm control \
+                         --reload-rules && sudo udevadm trigger` and replug it"
                     ),
                 )
             } else {
