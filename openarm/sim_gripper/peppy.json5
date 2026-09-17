@@ -25,7 +25,7 @@
         // The exclusive control conversation with the backbone, identical to
         // the real gripper's slot: optional, established at the backbone's
         // start.
-        { name: "gripper_link", tag: "v1", role: "follower", link_id: "backbone", optional: true },
+        { name: "gripper_link", tag: "v1", role: "follower", link_id: "backbone", cardinality: "zero_or_one" },
         // The same pairing toward the simulation's matching limb slot: this
         // relay leads, the simulation follows. Required: a relay without a simulation
         // is a misconfiguration, so the launch fails loudly instead.
