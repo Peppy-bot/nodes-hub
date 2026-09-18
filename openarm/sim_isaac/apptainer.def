@@ -21,9 +21,14 @@ From: peppybot/openarm-isaac-sim:6.1.0-2
     .peppy/libs/peppylib /opt/openarm_sim_isaac/.peppy/libs/peppylib
 
 %post
+    set -e
     /isaac-sim/python.sh -m pip install --no-cache-dir \
         pycapnp \
         pyjson5
+    # The OpenArm v2 head camera pack from the public waldo-assets store,
+    # pinned by its digest in head_camera.py and checked file by file.
+    /isaac-sim/python.sh /opt/openarm_sim_isaac/robots/openarm/head_camera.py fetch \
+        /opt/openarm_sim_isaac/robots/openarm/openarm/assets/head_camera
 
 %runscript
     cd /opt/openarm_sim_isaac

@@ -35,6 +35,17 @@ def _scene_path(hardware_version: str) -> Path:
     return _ASSETS_DIR / f"openarm_bimanual_{_version(hardware_version)}.xml"
 
 
+# The head camera pack apptainer.def stages at image build (head_camera.py
+# fetch), beside the node's code rather than in the baked scene, which is
+# upstream's robot without it.
+_HEAD_CAMERA_DIR = Path(__file__).parent / "assets" / "head_camera"
+
+
+def _head_camera_pack(hardware_version: str) -> Path | None:
+    # The head camera seats on the v2 pedestal; a v1 robot has none.
+    return _HEAD_CAMERA_DIR if _version(hardware_version) == "v2" else None
+
+
 _MUJOCO_DIR = Path(__file__).resolve().parents[1]
 
 sys.path.insert(0, str(_MUJOCO_DIR))
@@ -86,6 +97,7 @@ async def _run_sim(params, node_runner) -> list:
                     params.viewer_host,
                     params.viewer_port,
                     cameras,
+                    _head_camera_pack(params.hardware_version),
                 ).run,
             )
         finally:

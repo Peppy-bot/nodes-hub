@@ -55,6 +55,17 @@ def _scene_path(hardware_version: str) -> Path:
     return _ASSETS_DIR / filename
 
 
+# The head camera pack apptainer.def stages at image build (head_camera.py
+# fetch), beside the node's code rather than in the robot bundle, which is
+# upstream's robot without it.
+_HEAD_CAMERA_DIR = Path(__file__).parent / "assets" / "head_camera"
+
+
+def _head_camera_pack(hardware_version: str) -> Path | None:
+    # The head camera seats on the v2 pedestal; a v1 robot has none.
+    return _HEAD_CAMERA_DIR if _version(hardware_version) == "v2" else None
+
+
 _ROBOTS_DIR = Path(__file__).resolve().parents[1]
 
 # The loop and livestream share a target independent of state publication limits.
@@ -380,6 +391,9 @@ def main() -> None:
         frame_rate_hz=_FRAME_RATE_HZ,
         render_mode=_RENDER_CONFIG["renderer"],
         anti_aliasing=_RENDER_CONFIG["anti_aliasing"],
+        head_camera_pack=_head_camera_pack(
+            handoff.hardware_version
+        ),
     ).run()
 
 

@@ -26,7 +26,7 @@ from camera_sensor import (
     _LATE_REPORT_PERIOD_S,
     MujocoCameraSensor,
     _PoseSnapshot,
-    compile_model_with_cameras,
+    add_cameras,
 )
 
 _SCENE_OFFSCREEN = (320, 240)
@@ -86,6 +86,13 @@ def rgbd_camera(name="chest", parent=_WELDED_LINK, fps=_FPS):
             width=_DEPTH[0], height=_DEPTH[1], min_depth_m=0.1, max_range_m=10.0
         ),
     )
+
+
+def compile_model_with_cameras(path, cameras):
+    """The scene at path compiled with the cameras on, as the launcher loads it."""
+    spec = mujoco.MjSpec.from_file(str(path))
+    add_cameras(spec, cameras, path)
+    return spec.compile()
 
 
 def camera_body(model, name):
