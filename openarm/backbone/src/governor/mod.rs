@@ -714,6 +714,100 @@ mod tests {
         governor_for(openarm_description::HardwareVersion::V2, enabled)
     }
 
+    /// Both arms in the Ready posture, the resting posture a bring-up moves to.
+    fn ready() -> ArmPair<JointVec> {
+        ArmPair::new(
+            openarm_description::ready(openarm_description::Side::Left),
+            openarm_description::ready(openarm_description::Side::Right),
+        )
+    }
+
+    /// The left wrist swung up and back over the pedestal's head, the right arm
+    /// left at Ready. A sweep of the shoulder and elbow ranges puts the deepest
+    /// overlap with the head camera here: 52 mm of wrist inside the camera when
+    /// nothing governs it.
+    fn over_the_head() -> ArmPair<JointVec> {
+        let mut arms = ready();
+        arms.left = [
+            -2.8798,
+            -0.6981,
+            std::f64::consts::FRAC_PI_2,
+            2.4435,
+            0.0,
+            0.0,
+            0.0,
+        ];
+        arms
+    }
+
+    #[test]
+    fn the_v2_head_camera_leaves_the_resting_postures_free() {
+        // The camera stands where the arms rest below it, so it must not become
+        // the binding body at Home or Ready, and a bring-up must still reach
+        // Ready with it modeled.
+        let mut g = v2_governor(true);
+        for (name, arms) in [("home", home()), ("ready", ready())] {
+            let p = g.proximity(&at(arms)).expect("query");
+            let names = format!("{} <-> {}", p.link_a, p.link_b);
+            assert!(
+                !names.contains("head_camera"),
+                "{name}: the head camera binds a resting posture at {:+.4} ({names})",
+                p.distance
+            );
+        }
+        let arrived = drive(&mut g, at(home()), &at(ready()), 300);
+        for side in [arrived.arms.left, arrived.arms.right] {
+            assert!(
+                side.iter()
+                    .zip(openarm_description::READY_R)
+                    .all(|(q, r)| (q.abs() - r.abs()).abs() < 1e-3),
+                "the governed move to Ready stalled at {side:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_v2_head_camera_stops_an_arm_reaching_over_the_head() {
+        let mut g = v2_governor(true);
+        let target = over_the_head();
+
+        let reach = g.proximity(&at(target)).expect("query");
+        let names = format!("{} <-> {}", reach.link_a, reach.link_b);
+        assert!(
+            reach.distance < 0.0 && names.contains("head_camera"),
+            "setup: the reach should drive into the head camera, got {:+.4} on {names}",
+            reach.distance
+        );
+
+        // From Ready: at Home the v2's own open jaws sit 3.5 mm off the torso,
+        // under this band's floor, and that clearance belongs to the torso.
+        let mut q = at(ready());
+        for _ in 0..250 {
+            let prev = q;
+            let cand = at(chase(&prev.arms, &target, 0.02));
+            q = g.govern(&prev, &cand, &prev, NO_HANDS, DT);
+            let d = distance(&mut g, &q);
+            assert!(
+                d >= D_STOP,
+                "the head camera barrier was breached: d={d:+.5}"
+            );
+            assert!(
+                segment_min(&mut g, &prev, &q, 16) >= D_STOP - 1e-3,
+                "the prev->governed path dipped below the stop"
+            );
+        }
+        let held = g.proximity(&q).expect("query");
+        let names = format!("{} <-> {}", held.link_a, held.link_b);
+        assert!(
+            names.contains("head_camera"),
+            "the reach should come to rest on the head camera, got {names}"
+        );
+        assert!(
+            distance(&mut g, &q) < D_STOP + 4e-3,
+            "did not settle near the stop distance"
+        );
+    }
+
     #[test]
     fn v2_governor_builds_with_the_revolute_gripper() {
         // The v2 revolute finger joints must parse into live-placed finger
