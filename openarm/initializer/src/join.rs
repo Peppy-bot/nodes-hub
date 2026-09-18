@@ -261,11 +261,7 @@ fn ending(stood: bool, outcome: std::result::Result<attach::ResultOutcome, Strin
 
 /// Reports how this robot's stay ended: a robot that stood was taken out of
 /// the scene, and one that never stood could not be stood.
-fn report(
-    robot: &str,
-    stood: bool,
-    outcome: std::result::Result<attach::ResultOutcome, String>,
-) {
+fn report(robot: &str, stood: bool, outcome: std::result::Result<attach::ResultOutcome, String>) {
     match ending(stood, outcome) {
         Ending::NeverStood(why) => error!("the simulation did not stand '{robot}': {why}"),
         Ending::TakenOut(why) => {
@@ -292,11 +288,17 @@ mod tests {
         // A goal the engine ends before the robot stands: the scene could
         // not stand it, whatever the engine's own verdict on the goal.
         assert_eq!(
-            ending(false, Ok(attach::ResultOutcome::Completed(said(false, "no files")))),
+            ending(
+                false,
+                Ok(attach::ResultOutcome::Completed(said(false, "no files")))
+            ),
             Ending::NeverStood("no files".to_owned())
         );
         assert_eq!(
-            ending(false, Ok(attach::ResultOutcome::Completed(said(true, "cleared")))),
+            ending(
+                false,
+                Ok(attach::ResultOutcome::Completed(said(true, "cleared")))
+            ),
             Ending::NeverStood("cleared".to_owned())
         );
         assert_eq!(
@@ -307,11 +309,17 @@ mod tests {
         // A robot that stood: the engine took it out as asked, or for a
         // reason of its own.
         assert_eq!(
-            ending(true, Ok(attach::ResultOutcome::Cancelled(said(true, "left")))),
+            ending(
+                true,
+                Ok(attach::ResultOutcome::Cancelled(said(true, "left")))
+            ),
             Ending::TakenOut("left".to_owned())
         );
         assert_eq!(
-            ending(true, Ok(attach::ResultOutcome::Completed(said(false, "lapsed")))),
+            ending(
+                true,
+                Ok(attach::ResultOutcome::Completed(said(false, "lapsed")))
+            ),
             Ending::Dropped("lapsed".to_owned())
         );
         assert_eq!(
