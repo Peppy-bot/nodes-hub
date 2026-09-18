@@ -122,23 +122,14 @@ _POSTURE_BUTTONS = (
 )
 
 
-def _headset_origin(settings: config.Settings, *, outbound_ip=tls.outbound_ip) -> str:
-    """Where this node serves, as the operator would type it."""
-    bound = settings.https_host
-    host = outbound_ip() if bound.is_unspecified else str(bound)
-    if host is not None and ":" in host:
-        host = f"[{host}]"
-    return f"https://{host or '<this machine>'}:{settings.https_port}"
-
-
-def _headset_url_hint(settings: config.Settings, *, outbound_ip=tls.outbound_ip) -> str:
-    """A URL the operator can type into the headset's browser as printed."""
-    port = settings.https_port
-    origin = _headset_origin(settings, outbound_ip=outbound_ip)
+def _headset_url_hint(port: int) -> str:
+    """How the operator reaches the page: the URLs the launch prints under
+    `Web pages:`, or the USB route through `adb reverse`."""
     return (
-        f"open {origin} in the headset's browser "
-        "(click through the self-signed warning) and enter VR. Over USB instead: "
-        f"`adb reverse tcp:{port} tcp:{port}`, then https://localhost:{port}."
+        "open one of the page URLs the launch printed under `Web pages:` in the "
+        "headset's browser (click through the self-signed warning) and enter VR. "
+        f"Over USB instead: `adb reverse tcp:{port} tcp:{port}`, then "
+        f"https://localhost:{port}."
     )
 
 
@@ -205,15 +196,19 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
 
     # start() blocks until the server is up (or raises); keep it off the loop.
     await asyncio.to_thread(session.start)
+    # The daemon renders the URLs an operator opens from this announcement,
+    # one per address of the machine.
+    bound_host, bound_port = session.bound_address()
+    node_runner.announce_endpoint("page", "https", bound_host, bound_port)
 
     log(
-        f"{_headset_url_hint(settings)} The WebSocket carries "
+        f"{_headset_url_hint(bound_port)} The WebSocket carries "
         "unauthenticated motion control: trusted networks only."
     )
     if recording is not None:
         log(
             f"episodes record as {task_page.UNNAMED_TASK!r} until the task is "
-            f"named at {_headset_origin(settings)}{task_page.PATH}"
+            f"named at the page's {task_page.PATH} route"
         )
 
     token = node_runner.cancellation_token()

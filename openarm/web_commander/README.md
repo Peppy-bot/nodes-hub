@@ -75,13 +75,15 @@ peppy node run openarm_web_commander:v1 \
     --link observed_right_gripper@right_gripper_inst
 ```
 
-Then open **http://localhost:8765**. `http_port` is the port the panel
-prefers: when another process already holds it, as a second copy of this
-commander on one host does, the panel takes a port from the operating system
-and logs the address it is serving on. `http_host` is a literal IP address;
-set it to `127.0.0.1` to restrict the panel to loopback. The page reconnects
-automatically if the node restarts on the same port, and shows `disconnected`
-if it came back on another one (see **The panel is not on port 8765**).
+Then open the panel at one of the URLs the command prints under `Web pages:`
+(`peppy stack list` shows them again under `Instance endpoints`). `http_port`
+is the port the panel prefers: when another process already holds it, as a
+second copy of this commander on one host does, the panel takes a port from
+the operating system, and the printed URLs carry that port. `http_host` is a
+literal IP address; set it to `127.0.0.1` to restrict the panel to loopback.
+The page reconnects automatically if the node restarts on the same port, and
+shows `disconnected` if it came back on another one (see **The panel is not
+on port 8765**).
 
 A gripper that reports effort control (v2's POS_FORCE force cap)
 adds a **max effort** slider under its opening
@@ -104,12 +106,12 @@ Its sides must be disabled, idle, and measured: turn off streaming for the
 involved arms and wait for state feedback to arrive.
 
 **The panel is not on port 8765**
-Another process holds it, so the panel took one from the operating system. Its
-startup log names the address:
+Another process holds it, so the panel took one from the operating system. The
+URLs the launch printed carry the port it took, and so do `peppy stack list`
+and `peppy node info`:
 
 ```bash
-peppy node info openarm_web_commander:v1     # prints each instance's run log path
-grep 'operator panel at' ~/.peppy/logs/run/<instance_id>.log
+peppy node info openarm_web_commander:v1     # lists each instance's panel URLs
 ```
 
 To put it back on a fixed port, find whatever holds 8765 (`peppy stack list`

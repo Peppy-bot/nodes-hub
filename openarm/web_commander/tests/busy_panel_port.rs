@@ -1,7 +1,8 @@
 //! A launch whose panel port another process already holds: the node must come
-//! up, serve its panel on a port it could take, and say in its log where that
-//! is. The log line is the only place the bound address is reported, so this
-//! test reads the panel's address the way an operator has to.
+//! up, serve its panel on a port it could take, announce that port as its
+//! `panel` endpoint, and say in its log that the launcher's port was taken.
+//! The announcement is what the daemon turns into the URLs an operator opens,
+//! so this test reads the panel's address the way the daemon does.
 //!
 //! One booting test per binary: `ui::init_limits` is once-per-process.
 
@@ -11,6 +12,7 @@ use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use peppygen::NodeRunner;
 use peppygen::fixtures::harness::{Config, Harness};
 use tokio::net::TcpListener;
 
@@ -39,29 +41,25 @@ impl io::Write for Capture {
     }
 }
 
-/// The port from the node's `operator panel at http://127.0.0.1:<port>` line.
-fn announced_port(log: &str) -> Option<u16> {
-    log.split_once("operator panel at http://127.0.0.1:")?
-        .1
-        .split(|c: char| !c.is_ascii_digit())
-        .next()?
-        .parse()
-        .ok()
-}
-
-/// Waits for the node to announce its panel, which `setup` does once it holds
-/// the socket. The harness runs `setup` in the background, so the announcement
-/// is the readiness signal the operator gets too.
-async fn await_announcement(capture: &Capture) -> (String, u16) {
+/// Waits for the node to announce its `panel` endpoint, which `setup` does
+/// once it holds the socket. The harness runs `setup` in the background, so
+/// the announcement is the readiness signal the daemon gets too. Answers the
+/// announced socket address.
+async fn await_announcement(node_runner: &NodeRunner) -> std::net::SocketAddr {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
-        let log = capture.text();
-        if let Some(port) = announced_port(&log) {
-            return (log, port);
+        if let Some(endpoint) = node_runner
+            .announced_endpoints()
+            .into_iter()
+            .find(|endpoint| endpoint.label == "panel")
+        {
+            assert_eq!(endpoint.binding.scheme, "http");
+            assert_eq!(endpoint.binding.path, "");
+            return endpoint.binding.address;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "the node must announce its panel address; log:\n{log}"
+            "the node must announce its panel endpoint"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -97,12 +95,23 @@ async fn a_held_panel_port_moves_the_panel_and_the_log_says_where() -> peppygen:
     )
     .await?;
 
-    let (log, served) = await_announcement(&capture).await;
+    let bound = await_announcement(harness.node_runner()).await;
+    let log = capture.text();
     assert!(
         log.contains(&format!("{taken} is already in use")),
         "the operator must be told the launcher's port was taken; log:\n{log}"
     );
+    assert!(
+        log.contains(&format!("operator panel bound at {bound}")),
+        "the log names the address the panel took; log:\n{log}"
+    );
 
+    assert_eq!(
+        bound.ip(),
+        taken.ip(),
+        "the fallback stays on the launcher's host address"
+    );
+    let served = bound.port();
     assert_ne!(
         served,
         taken.port(),

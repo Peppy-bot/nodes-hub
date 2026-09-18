@@ -9,7 +9,7 @@ use std::sync::Arc;
 use control_core::positive_finite::{NotPositiveFinite, PositiveFinite};
 use control_core::time::{RateOutOfRange, period_from_hz};
 use openarm_description::HardwareVersion;
-use peppygen::{NodeRunner, Parameters, Result};
+use peppygen::{EndpointBinding, NodeRunner, Parameters, Result};
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info};
 
@@ -176,11 +176,18 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     // setup. The launcher's port is preferred; a copy whose port another
     // process holds serves on one the operating system picks.
     let panel = ui::Panel::bind(panel_address(&params)?).await?;
-    info!(
-        "operator panel at {} (bound {})",
-        ui::panel_url(panel.address()),
-        panel.address()
-    );
+    // The daemon renders the URLs an operator opens from this announcement,
+    // one per address of the machine, so the fallback port reaches the
+    // operator too.
+    node_runner.announce_endpoint(
+        "panel",
+        EndpointBinding {
+            scheme: "http".to_string(),
+            address: panel.address(),
+            path: String::new(),
+        },
+    )?;
+    info!("operator panel bound at {}", panel.address());
 
     // The state owner is the one task that touches UiState; everything else holds a
     // channel end. Commands flow in from the WS, feedback in from the state streams
