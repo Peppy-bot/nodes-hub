@@ -100,12 +100,47 @@ jobs:
       # so a run reads what the previous run left and a pull request writes
       # into what later runs build on; nothing stored here may therefore be
       # state one run depends on another having written, only caches
-      # apptainer, cargo and uv can rebuild from scratch. The runner executes
-      # one job at a time, so concurrent writers are not a concern today; a
-      # second runner would make these directories shared mutable state and
-      # is a reason to revisit this.
+      # apptainer, cargo and uv can rebuild from scratch. Each self-hosted
+      # runner is its own machine with its own $HOME, so this directory is
+      # per-box rather than shared: every box pays its own cold start, and
+      # whether a run is warm depends on which one it lands on. A box runs one
+      # job at a time, so nothing races inside these directories; two runner
+      # agents on a single box would, and is the thing to revisit.
       - name: Name the caches this run reuses
         run: python3 .github/scripts/configure-build-cache.py
+
+      # Every node image bootstraps from a public `peppybot/*` base on Docker
+      # Hub, and an anonymous pull is charged against a quota tied to the
+      # address it comes from. On Blacksmith each job pulled from its own
+      # short-lived address, so the quota was never close. The self-hosted
+      # boxes are few and every repository's jobs share their addresses, so a
+      # run that has to build images the cache does not hold yet exhausts it
+      # partway through — and Docker Hub reports the overage by refusing a
+      # token with `unauthorized: incorrect username or password`, which reads
+      # like a credential fault but is a quota. Authenticating raises the
+      # ceiling and charges it to the account instead of the box.
+      #
+      # Apptainer reads these two variables for every `docker://` bootstrap,
+      # the pulls the daemon makes on its own included. They are exported only
+      # when both secrets carry a value: a pull request from a fork is given
+      # no secrets, and an empty username would have apptainer send empty
+      # credentials and be refused outright, which is worse than the anonymous
+      # pull it would otherwise have made.
+      - name: Authenticate the base image pulls against Docker Hub
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_TOKEN: ${{ secrets.DOCKER_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -n "${DOCKER_USERNAME:-}" ] && [ -n "${DOCKER_TOKEN:-}" ]; then
+            {
+              echo "APPTAINER_DOCKER_USERNAME=$DOCKER_USERNAME"
+              echo "APPTAINER_DOCKER_PASSWORD=$DOCKER_TOKEN"
+            } >> "$GITHUB_ENV"
+            echo "Base image pulls authenticate as $DOCKER_USERNAME."
+          else
+            echo "No Docker Hub credentials in scope; pulls stay anonymous and share the box's quota."
+          fi
 
       - name: Discover all Rust and Python tests
         id: discover
