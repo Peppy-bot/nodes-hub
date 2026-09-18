@@ -11,11 +11,18 @@
 
 use std::time::Duration;
 
+use peppygen::fixtures::harness::Harness;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 /// How long one handshake attempt may take before it is retried.
 const HANDSHAKE_BUDGET: Duration = Duration::from_secs(5);
+
+/// How long a test waits for the node's `setup` to return.
+const SETUP_BUDGET: Duration = Duration::from_secs(30);
+
+/// How often a test checks whether the node's `setup` has returned.
+const SETUP_POLL: Duration = Duration::from_millis(50);
 
 /// Valid launch parameters (every required field of the manifest schema):
 /// governor on with the 0.005/0.02 band, a 0.5 m/s speed cap, v2 ranges, and
@@ -225,4 +232,25 @@ pub fn approx_eq(actual: &[f64], expected: &[f64]) -> bool {
             .iter()
             .zip(expected)
             .all(|(a, b)| (a - b).abs() < 1e-9)
+}
+
+/// Waits for the node's `setup` to return, failing the test after
+/// `SETUP_BUDGET`.
+pub async fn await_setup_return(harness: &Harness) {
+    let deadline = tokio::time::Instant::now() + SETUP_BUDGET;
+    while !harness.setup_finished() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "setup must return within {SETUP_BUDGET:?}"
+        );
+        tokio::time::sleep(SETUP_POLL).await;
+    }
+}
+
+/// Tears the harness down once the node's `setup` has returned, so a setup
+/// error reaches the caller. Teardown aborts a setup still running after the
+/// shutdown grace and reports it as a clean stop.
+pub async fn shutdown_once_setup_returns(harness: Harness) -> peppygen::Result<()> {
+    await_setup_return(&harness).await;
+    harness.shutdown().await
 }

@@ -3,12 +3,21 @@
 //! the other.
 #![allow(dead_code)]
 
+use std::time::Duration;
+
 use peppygen::Parameters;
+use peppygen::fixtures::harness::Harness;
 use peppygen::mock::deps::simulation::attach;
 use peppygen::parameters::placement::Placement;
 
 /// Joints of one OpenArm arm, as the engine reports them.
 const ARM_DOF: u32 = 7;
+
+/// How long a test waits for the node's `setup` to return.
+const SETUP_BUDGET: Duration = Duration::from_secs(30);
+
+/// How often a test checks whether the node's `setup` has returned.
+const SETUP_POLL: Duration = Duration::from_millis(50);
 
 /// A robot of the OpenArm generation `hardware_version`, standing wherever
 /// a simulation parks it.
@@ -58,4 +67,25 @@ pub fn simulation_of(
         .simulation
         .take()
         .expect("a robot joining a simulation has one bound")
+}
+
+/// Waits for the node's `setup` to return, failing the test after
+/// `SETUP_BUDGET`.
+pub async fn await_setup_return(harness: &Harness) {
+    let deadline = tokio::time::Instant::now() + SETUP_BUDGET;
+    while !harness.setup_finished() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "setup must return within {SETUP_BUDGET:?}"
+        );
+        tokio::time::sleep(SETUP_POLL).await;
+    }
+}
+
+/// Tears the harness down once the node's `setup` has returned, so a setup
+/// error reaches the caller. Teardown aborts a setup still running after the
+/// shutdown grace and reports it as a clean stop.
+pub async fn shutdown_once_setup_returns(harness: Harness) -> peppygen::Result<()> {
+    await_setup_return(&harness).await;
+    harness.shutdown().await
 }

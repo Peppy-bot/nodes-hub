@@ -38,8 +38,7 @@ async fn a_panel_address_this_host_cannot_serve_fails_the_launch() {
     .await
     .expect("the harness starts the node");
 
-    let refused = harness
-        .shutdown()
+    let refused = helpers::shutdown_once_setup_returns(harness)
         .await
         .expect_err("a commander that cannot serve must fail its launch")
         .to_string();

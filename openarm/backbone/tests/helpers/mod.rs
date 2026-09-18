@@ -1,5 +1,9 @@
 //! Fixtures shared by the backbone's integration tests.
 
+use std::time::Duration;
+
+use peppygen::fixtures::harness::Harness;
+
 /// Control rate for the tests: 20 ms cycle (Nyquist 25 Hz, above the 15 Hz
 /// velocity-filter default).
 const CONTROL_RATE_HZ: u32 = 50;
@@ -8,6 +12,12 @@ const CONTROL_RATE_HZ: u32 = 50;
 /// stale window, comfortably above the 10 ms state pumps even on a loaded
 /// machine.
 const FOLLOWER_STATE_RATE_HZ: u32 = 50;
+
+/// How long a test waits for the node's `setup` to return.
+const SETUP_BUDGET: Duration = Duration::from_secs(30);
+
+/// How often a test checks whether the node's `setup` has returned.
+const SETUP_POLL: Duration = Duration::from_millis(50);
 
 /// The node's full parameter set (most have no schema default, so every test
 /// passes them explicitly): v1 hardware, joints-mode upstream, the validated
@@ -33,4 +43,25 @@ pub fn params() -> peppygen::Parameters {
         upstream_mode: "joints".to_string(),
         velocity_filter_cutoff_hz: 15.0,
     }
+}
+
+/// Waits for the node's `setup` to return, failing the test after
+/// `SETUP_BUDGET`.
+pub async fn await_setup_return(harness: &Harness) {
+    let deadline = tokio::time::Instant::now() + SETUP_BUDGET;
+    while !harness.setup_finished() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "setup must return within {SETUP_BUDGET:?}"
+        );
+        tokio::time::sleep(SETUP_POLL).await;
+    }
+}
+
+/// Tears the harness down once the node's `setup` has returned, so a setup
+/// error reaches the caller. Teardown aborts a setup still running after the
+/// shutdown grace and reports it as a clean stop.
+pub async fn shutdown_once_setup_returns(harness: Harness) -> peppygen::Result<()> {
+    await_setup_return(&harness).await;
+    harness.shutdown().await
 }
