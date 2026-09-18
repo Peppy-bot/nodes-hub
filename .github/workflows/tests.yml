@@ -11,9 +11,14 @@ name: Tests
 # for unprivileged use, boots a daemon of its own, generates the tested nodes'
 # interfaces, and runs each node's tests inside a container derived from its
 # `apptainer.def`. The runner image provides none of the nodes' build
-# dependencies. The runner is an ephemeral Blacksmith VM, so everything worth
+# dependencies. The runner is self-hosted and reused, so everything worth
 # keeping between runs (test images, cargo registries, per-crate target dirs,
-# uv's downloads) lives on a sticky disk mounted below.
+# uv's downloads) simply outlives the job in the cache directory named below.
+#
+# Every job runs on that self-hosted runner; no job uses a GitHub-hosted one.
+# A pull request from a fork lands there too, so what keeps fork code off the
+# box is the repository's fork-PR approval gate, not the runner it is
+# scheduled on.
 on:
   push:
     branches: [main]
@@ -29,10 +34,7 @@ env:
 jobs:
   python-syntax:
     name: Python syntax
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    # Use the newest Python minor required by repository projects. This is a
-    # syntax gate; each project's tests still use its own Python requirements.
-    container: python:3.13
+    runs-on: self-hosted
     timeout-minutes: 5
     permissions:
       contents: read
@@ -41,12 +43,30 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+
+      # Use the newest Python minor required by repository projects. This is a
+      # syntax gate; each project's tests still use its own Python
+      # requirements.
+      #
+      # Through setup-python rather than the `container: python:3.13` this job
+      # used to declare. A container job has the runner pull the image with
+      # docker, and docker is not installed on every self-hosted box — this job
+      # failed with `docker: command not found` before reaching a single step
+      # of its own. setup-python wants nothing but the runner's tool cache, so
+      # it works the same on every box, and it drops a Docker Hub pull from
+      # every run, which matters because the anonymous pull quota those boxes
+      # share is the tightest thing about them. It is what the other
+      # repositories here already reach for.
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+
       - name: Compile every tracked Python file
         run: python .github/scripts/check-python-syntax.py
 
   javascript-typescript:
     name: JavaScript and TypeScript tests
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: self-hosted
     timeout-minutes: 15
     permissions:
       contents: read
@@ -66,15 +86,15 @@ jobs:
 
   discover-and-run:
     name: All Rust and Python tests
-    # x86 rather than the -arm label: the base images and the librealsense apt
-    # repository are published for both, and the sticky disk key below carries
-    # the architecture, so switching is a label change that starts from an
-    # empty disk rather than a wrong-arch one.
-    runs-on: blacksmith-16vcpu-ubuntu-2404
+    # The self-hosted runner is x86, and the cache directory named below
+    # carries the architecture, so moving this repository onto an arm runner
+    # starts from an empty cache rather than a wrong-arch one. The base images
+    # and the librealsense apt repository are published for both.
+    runs-on: self-hosted
     # A cold run compiles nine crates' full dependency trees and resolves
-    # lerobot's, torch included. The sticky disk keeps warm runs far under
-    # this, but the first run after the disk is evicted (7 idle days) or its
-    # key changes is legitimately slow.
+    # lerobot's, torch included. The persistent cache keeps warm runs far under
+    # this, but the first run after the directory is cleared is legitimately
+    # slow.
     timeout-minutes: 120
     permissions:
       contents: read
@@ -88,27 +108,54 @@ jobs:
           persist-credentials: false
 
       # Container images, cargo registries, crate build outputs and uv's
-      # download cache outlive the run on a Blacksmith sticky disk: they are
-      # what makes a warm run cheap, and the runner's own disk is discarded
-      # with the job. Every run mounts a clone of the disk's last committed
-      # snapshot, so nothing stored here may be state one run depends on
-      # another having written — only caches apptainer, cargo and uv can
-      # rebuild from scratch. Only pushes to main commit their clone: the
-      # concurrency group serialises those, so commits never race, and a pull
-      # request (possibly from a fork) reads the cache but cannot write into
-      # what every later run builds on. A pull request therefore recompiles
-      # just its own delta against main's warm snapshot. The key carries the
-      # architecture because the cached .sif images are built for the host
-      # that built them.
-      - name: Mount the build caches
-        uses: useblacksmith/stickydisk@35ba2e331a80056a42af053ee54968511de2b7c7 # v1.5.0
-        with:
-          key: ${{ github.repository }}-tests-${{ runner.arch }}
-          path: ~/.cache/nodes-hub-ci
-          commit: ${{ github.event_name == 'push' }}
-
+      # download cache outlive the run in a directory on the self-hosted
+      # runner: they are what makes a warm run cheap. Nothing mounts or
+      # uploads it — the box is reused, so the directory the step below names
+      # is simply still there. The directory is live rather than a snapshot,
+      # so a run reads what the previous run left and a pull request writes
+      # into what later runs build on; nothing stored here may therefore be
+      # state one run depends on another having written, only caches
+      # apptainer, cargo and uv can rebuild from scratch. Each self-hosted
+      # runner is its own machine with its own $HOME, so this directory is
+      # per-box rather than shared: every box pays its own cold start, and
+      # whether a run is warm depends on which one it lands on. A box runs one
+      # job at a time, so nothing races inside these directories; two runner
+      # agents on a single box would, and is the thing to revisit.
       - name: Name the caches this run reuses
         run: python3 .github/scripts/configure-build-cache.py
+
+      # Every node image bootstraps from a public `peppybot/*` base on Docker
+      # Hub, and an anonymous pull is charged against a quota tied to the
+      # address it comes from. On Blacksmith each job pulled from its own
+      # short-lived address, so the quota was never close. The self-hosted
+      # boxes are few and every repository's jobs share their addresses, so a
+      # run that has to build images the cache does not hold yet exhausts it
+      # partway through — and Docker Hub reports the overage by refusing a
+      # token with `unauthorized: incorrect username or password`, which reads
+      # like a credential fault but is a quota. Authenticating raises the
+      # ceiling and charges it to the account instead of the box.
+      #
+      # Apptainer reads these two variables for every `docker://` bootstrap,
+      # the pulls the daemon makes on its own included. They are exported only
+      # when both secrets carry a value: a pull request from a fork is given
+      # no secrets, and an empty username would have apptainer send empty
+      # credentials and be refused outright, which is worse than the anonymous
+      # pull it would otherwise have made.
+      - name: Authenticate the base image pulls against Docker Hub
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_TOKEN: ${{ secrets.DOCKER_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -n "${DOCKER_USERNAME:-}" ] && [ -n "${DOCKER_TOKEN:-}" ]; then
+            {
+              echo "APPTAINER_DOCKER_USERNAME=$DOCKER_USERNAME"
+              echo "APPTAINER_DOCKER_PASSWORD=$DOCKER_TOKEN"
+            } >> "$GITHUB_ENV"
+            echo "Base image pulls authenticate as $DOCKER_USERNAME."
+          else
+            echo "No Docker Hub credentials in scope; pulls stay anonymous and share the box's quota."
+          fi
 
       - name: Discover all Rust and Python tests
         id: discover

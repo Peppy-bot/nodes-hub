@@ -19,7 +19,11 @@ concurrency:
 
 jobs:
   check-index:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    # Every job runs on the self-hosted runner; no job uses a GitHub-hosted
+    # one. A pull request from a fork lands here too, so what keeps fork code
+    # off the box is the repository's fork-PR approval gate, not the runner it
+    # is scheduled on.
+    runs-on: self-hosted
     # Nothing here legitimately takes minutes; a hung step should fail fast
     # rather than hold a runner for the default six hours.
     timeout-minutes: 15
