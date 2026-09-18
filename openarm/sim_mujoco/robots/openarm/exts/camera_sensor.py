@@ -65,16 +65,14 @@ _LATE_REPORT_PERIOD_S = 1.0
 _HEARTBEAT_TIMEOUT_S = 5.0
 
 
-def compile_model_with_cameras(xml_path: Path, cameras: list[CameraConfig]):
-    """Compile the scene with one camera per config entry, an offscreen
+def add_cameras(spec, cameras: list[CameraConfig], xml_path: Path) -> None:
+    """Add to the scene's spec one camera per config entry, an offscreen
     buffer large enough for the widest stream, and the camera light rig.
 
-    The baked MJCF is never modified: the cameras are added to an mjSpec parsed
-    from it, so a plain (camera-less) launch compiles the file as written.
+    The baked MJCF is never modified: the cameras go on an mjSpec parsed from
+    it, so a camera-less launch compiles the scene without them.
     """
     import mujoco  # pylint: disable=C0415
-
-    spec = mujoco.MjSpec.from_file(str(xml_path))
 
     # Offscreen framebuffer must cover every render size, color and depth; the
     # scene's own values stand if they are already larger.
@@ -111,13 +109,11 @@ def compile_model_with_cameras(xml_path: Path, cameras: list[CameraConfig]):
         light.specular = [_LIGHT_SPECULAR] * 3
         light.castshadow = False
 
-    model = spec.compile()
     logger.info(
-        "Scene compiled with cameras: "
+        "Scene carries cameras: "
         + ", ".join(f"{c.name}@{c.parent_link}" for c in cameras)
         + f"; offscreen buffer {global_.offwidth}x{global_.offheight}"
     )
-    return model
 
 
 def _parent_body(spec, camera: CameraConfig, xml_path: Path):

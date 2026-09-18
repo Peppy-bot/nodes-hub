@@ -22,6 +22,13 @@ From: peppybot/openarm-mujoco-sim:3.10.0-20
     .peppy/libs/peppygen /opt/openarm_sim_mujoco/.peppy/libs/peppygen
     .peppy/libs/peppylib /opt/openarm_sim_mujoco/.peppy/libs/peppylib
 
+%post
+    set -e
+    # The OpenArm v2 head camera pack from the public waldo-assets store,
+    # pinned by its digest in head_camera.py and checked file by file.
+    python3 /opt/openarm_sim_mujoco/robots/openarm/head_camera.py fetch \
+        /opt/openarm_sim_mujoco/robots/openarm/openarm/assets/head_camera
+
 %runscript
     cd /opt/openarm_sim_mujoco
     exec python3 /opt/openarm_sim_mujoco/robots/openarm/openarm/launch.py "$@"
