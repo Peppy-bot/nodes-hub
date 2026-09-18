@@ -140,11 +140,15 @@ def pack(tmp_path, monkeypatch):
 
 
 def _store(pack, served=None, requests=None):
-    """An opener serving the pack's files from the store's URL layout."""
+    """An opener serving the pack's files from the store's URL layout, to a
+    request that names its agent (the store's Cloudflare front refuses
+    urllib's default one)."""
     served = pack.served if served is None else served
     base = f"{head_camera.STORE_URL}/{head_camera.PACK_PREFIX}/{pack.digest}/"
 
-    def open_url(url, timeout):
+    def open_url(request, timeout):
+        assert request.get_header("User-agent") == head_camera.USER_AGENT
+        url = request.full_url
         assert url.startswith(base) and timeout > 0
         name = url[len(base):]
         if requests is not None:

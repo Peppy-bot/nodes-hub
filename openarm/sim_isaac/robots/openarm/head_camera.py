@@ -32,13 +32,16 @@ import shutil
 import sys
 import tempfile
 from typing import Optional
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
 STORE_URL = "https://waldo-assets.peppy.bot"
+# The store sits behind Cloudflare, which answers urllib's default agent with
+# 403; a named one gets through.
+USER_AGENT = "openarm_sim_isaac/head_camera.py"
 PACK_PREFIX = "sources/openarm_v2_head_camera"
 # The derivation of 2026-09-17 from the STEP at openarm_hardware eefc9fa: the
 # pack Waldo's openarm_v2 robot names as the overlay of its head_camera/
@@ -143,7 +146,8 @@ def fetch(
     base = f"{store_url}/{PACK_PREFIX}/{digest}/"
 
     def get(name: str) -> bytes:
-        with open_url(base + name, timeout=120) as response:
+        request = Request(base + name, headers={"User-Agent": USER_AGENT})
+        with open_url(request, timeout=120) as response:
             return response.read()
 
     index_data = get(INDEX_FILE)
