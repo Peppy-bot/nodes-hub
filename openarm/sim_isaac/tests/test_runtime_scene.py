@@ -119,7 +119,7 @@ def scene(monkeypatch):
     launcher = module.SimLauncher(
         Mock(), Path("/robot.usd"), Mock(), Mock(), object(), scene_actions,
         state_rate_hz=60, cameras_enabled=False, frame_rate_hz=60,
-        render_mode="RealTimePathTracing", anti_aliasing=3,
+        render_mode="RealTimePathTracing", anti_aliasing=3, head_camera_pack=None,
     )
     bridge = Mock()
     launcher._extension = bridge

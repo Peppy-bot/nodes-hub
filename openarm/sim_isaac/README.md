@@ -18,6 +18,8 @@ This branch is intended for reproducibility testing and community feedback. It p
   - `tabletop`
   - `shelf_reach`
 - Detailed OpenArm v2 visual meshes with their embedded materials
+- The OpenArm v2 head camera, the ZED Mini on its bracket under the head cover,
+  from Enactic's CAD
 
 ## Requirements
 
@@ -254,8 +256,9 @@ The Isaac base image downloads one complete, prepared bundle from the
 `openarm/scripts/isaac_assets.env`. The Docker build copies
 that file before downloading, so a pin change invalidates the asset layer's
 cache. It verifies the archive checksum before extraction and never falls back
-to a mutable asset directory. Node image builds and robot startup use only the
-baked files, with no GitHub access, asset conversion or conversion dependencies.
+to a mutable asset directory. Robot startup uses only the baked files and the
+head camera pack below, with no GitHub access, asset conversion or conversion
+dependencies.
 
 The bundle contains:
 
@@ -273,6 +276,37 @@ normals and scene transform. The body scale, mirrored left-arm frames and grippe
 offsets are retained. Link poses, joints, drives, masses and collision geometry
 are unchanged. Robot stage dependencies resolve within the bundle; the
 `OmniPBR.mdl` shader module is supplied locally by Isaac Sim.
+
+### Head camera
+
+The bundle is upstream's robot, which has no head camera. The ZED Mini on its
+bracket under the head cover, as Enactic's `OpenArm_2.0_w_Head_Camera` CAD
+assembly seats it on the pedestal, comes from the pack Waldo's
+`tools/openarm_head_camera` (private-nodes-hub) derives from that CAD and
+publishes to the public `waldo-assets` store: three OBJ meshes and one convex
+collision hull in the frame of the CAD mount's origin, the stereo rig read off
+the lens barrels, and provenance. A pack is immutable, keyed by the SHA-256 of
+its inventory, and `robots/openarm/head_camera.py` pins that digest. The
+`apptainer.def` stages the pack at image build into
+`robots/openarm/openarm/assets/head_camera`, the index checked against the
+digest and every file against the index, and the launcher checks it again at
+every start. At stage load the launcher puts the meshes under
+`openarm_body_link0`, the chest camera's parent, in the same matte black as the
+arm links, with the hull as that link's collider. The chest camera of
+`config/cameras.json5` must sit at the pack's left lens front, the eye the real
+ZED's rectified stream comes from, and the launcher refuses to start otherwise.
+A v1 robot has no head camera.
+
+A native run stages the pack by hand:
+
+```bash
+python3 openarm/sim_isaac/robots/openarm/head_camera.py fetch \
+  openarm/sim_isaac/robots/openarm/openarm/assets/head_camera
+```
+
+A new derivation is a new pack: pin its digest in `head_camera.py`, move the
+chest camera in `config/cameras.json5` to the rig it prints, and restage the
+node with `peppy node add openarm/sim_isaac -sb --force`.
 
 ### Asset maintenance
 
