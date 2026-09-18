@@ -2,6 +2,11 @@
 # Peppy-specific files
 .peppy
 
+# The OpenArm v2 head camera pack the Isaac and MuJoCo nodes stage at image
+# build (robots/openarm/head_camera.py fetch), or a native run stages by hand.
+openarm/sim_isaac/robots/openarm/openarm/assets/head_camera/
+openarm/sim_mujoco/robots/openarm/openarm/assets/head_camera/
+
 # Rust
 # Match every node's build dir, not just one at the repo root.
 **/target/

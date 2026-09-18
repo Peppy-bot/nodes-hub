@@ -128,6 +128,7 @@ def loop(monkeypatch):
         frame_rate_hz=60,
         render_mode="RealTimePathTracing",
         anti_aliasing=3,
+        head_camera_pack=None,
     )
     monkeypatch.setattr(state.launcher, "_update_runtime_forces", lambda: phase("forces"))
     monkeypatch.setattr(state.launcher, "_apply_runtime_arm_targets", lambda: phase("targets"))
@@ -148,6 +149,44 @@ def loop(monkeypatch):
     state.timeline.stop.side_effect = lambda: state.trace.append("timeline.stop")
     state.app.close.side_effect = lambda: state.trace.append("app.close")
     return state
+
+
+def test_stage_load_attaches_the_head_camera_pack_to_the_opened_robot(loop, monkeypatch, tmp_path):
+    # The stage load is the real method here: it opens the robot USD, then puts
+    # the staged pack under the robot's pedestal link, checked against the
+    # chest camera config; a robot without a pack opens its stage alone.
+    monkeypatch.delattr(loop.launcher, "_load_stage")
+    usd = tmp_path / "robot.usd"
+    usd.write_bytes(b"stage")
+    trace = []
+    stage = object()
+    context = Mock()
+    context.get_stage.return_value = stage
+    context.open_stage.side_effect = lambda path: trace.append(("open", path))
+    omni = ModuleType("omni")
+    omni.usd = ModuleType("omni.usd")
+    omni.usd.get_context = Mock(return_value=context)
+    monkeypatch.setitem(sys.modules, "omni", omni)
+    monkeypatch.setitem(sys.modules, "omni.usd", omni.usd)
+
+    def attach(*args):
+        trace.append(("attach",) + args)
+        return "/openarm/openarm_body_link0/openarm_head_camera"
+
+    monkeypatch.setattr(loop.module.head_camera, "attach", Mock(side_effect=attach))
+    loop.launcher._usd_path = usd
+    loop.launcher._head_camera_pack = tmp_path / "head_camera"
+
+    loop.launcher._load_stage()
+    assert trace == [
+        ("open", str(usd)),
+        ("attach", stage, "/openarm", tmp_path / "head_camera", _ROBOT_DIR / "config" / "cameras.json5"),
+    ]
+
+    trace.clear()
+    loop.launcher._head_camera_pack = None
+    loop.launcher._load_stage()
+    assert trace == [("open", str(usd))]
 
 
 def test_settings_interface_is_cached_on_the_loop_thread_without_redundant_writes(loop):

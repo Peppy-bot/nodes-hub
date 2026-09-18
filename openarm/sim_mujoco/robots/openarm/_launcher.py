@@ -8,12 +8,18 @@ import logging
 import threading
 import time
 from pathlib import Path
+from typing import Optional
 
+import head_camera
 from bridge_extension import MujocoBridgeExtension
 from camera_common import CameraConfig
-from exts.camera_sensor import compile_model_with_cameras
+from exts.camera_sensor import add_cameras
 
 logger = logging.getLogger(__name__)
+
+# The chest camera, whose pose the sensor renders from, is what the head
+# camera pack is checked against.
+_CAMERAS_CONFIG_PATH = Path(__file__).resolve().parent / "config" / "cameras.json5"
 
 
 class SimLauncher:
@@ -28,8 +34,12 @@ class SimLauncher:
         viewer_host: str,
         viewer_port: int,
         cameras: list[CameraConfig],
+        head_camera_pack: Optional[Path],
     ) -> None:
         self._xml_path = xml_path
+        # The staged head camera pack the robot draws (see head_camera.py);
+        # None for a robot that has no head camera.
+        self._head_camera_pack = head_camera_pack
         self._ready = ready
         # Set by the asyncio caller on cancel (SIGTERM, peppy node stop). The
         # sim loop runs in run_in_executor and cannot observe asyncio
@@ -79,12 +89,17 @@ class SimLauncher:
             self._ready.clear()
 
     def _load_model(self):
-        """The scene as baked, or the scene plus the configured cameras."""
+        """The scene as baked, plus the head camera on a robot that has one
+        and the configured cameras when they render."""
         import mujoco
 
-        if not self._cameras:
-            return mujoco.MjModel.from_xml_path(str(self._xml_path))
-        return compile_model_with_cameras(self._xml_path, self._cameras)
+        spec = mujoco.MjSpec.from_file(str(self._xml_path))
+        if self._head_camera_pack is not None:
+            head_camera.attach(spec, self._head_camera_pack, _CAMERAS_CONFIG_PATH)
+            logger.info("Head camera attached from %s", self._head_camera_pack)
+        if self._cameras:
+            add_cameras(spec, self._cameras, self._xml_path)
+        return spec.compile()
 
     def _run_streamed(self, model, data, extension: MujocoBridgeExtension) -> None:
         import mujoco as _mujoco

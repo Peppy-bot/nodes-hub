@@ -161,6 +161,7 @@ def test_launch_selects_extensions_before_construction_and_preserves_handoff(
         frame_rate_hz=60,
         render_mode="RealTimePathTracing",
         anti_aliasing=3,
+        head_camera_pack=_LAUNCH_PATH.parent / "assets" / "head_camera",
     )
     state.thread.assert_called_once_with(target=state.module._run_node_builder, daemon=True)
     state.thread.return_value.start.assert_called_once_with()
@@ -176,6 +177,16 @@ def test_launch_selects_extensions_before_construction_and_preserves_handoff(
     assert state.nvml.nvmlErrorString.argtypes == [ctypes.c_int]
     assert state.nvml.nvmlErrorString.restype is ctypes.c_char_p
     state.nvml.nvmlErrorString.assert_not_called()
+
+
+def test_a_v1_robot_loads_its_own_stage_without_a_head_camera(startup):
+    # The head camera seats on the v2 pedestal; v1 draws upstream's robot alone.
+    state = startup(hardware_version="v1")
+    state.module.main()
+
+    args, kwargs = state.sim_launcher.call_args
+    assert args[1] == _LAUNCH_PATH.parent / "assets" / "openarm_bimanual.usd"
+    assert kwargs["head_camera_pack"] is None
 
 
 def _assert_no_startup(state):

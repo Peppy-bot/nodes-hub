@@ -15,17 +15,21 @@
 //   -+21deg, 13deg, -90deg as the equivalent quaternion). The pair mirrors
 //   about Y, image-up pointing back toward the arm on both sides.
 // - Chest camera: the OpenArm_2.0_w_Head_Camera CAD assembly in
-//   openarm_hardware, whose ZED Mini mount sits 65mm forward of and 123.8mm
-//   above the shoulder-mount plane (z=0.698 here, 697mm in CAD), tilted
-//   28deg off vertical. Its tilt constants match openarm_mujoco v2/cell.xml
-//   exactly, though that file's head camera belongs to the Cell's separate
-//   world-mounted lifter rig, so only its orientation corroborates.
+//   openarm_hardware (Google Drive file 1mP0gDFgGaX6Ufobr8ocyg71ccsYgfBDw,
+//   listed by dev/google-drive-files/file-ids.tsv at commit eefc9fa), read
+//   by Waldo's tools/openarm_head_camera: the pinhole sits at the centre of
+//   the ZED Mini's lens front, on a lens axis tilted 28deg off vertical,
+//   with the two lens barrels 63.0mm apart. The same numbers place the
+//   camera_head_left camera of Waldo's openarm_v2 pedestal wrapper. The
+//   tilt matches openarm_mujoco v2/cell.xml exactly, though that file's head
+//   camera belongs to the Cell's separate world-mounted lifter rig, so only
+//   its orientation corroborates.
 //
-// Neither source publishes an optical-frame calibration: CAD part origins are
-// bracket references, and Enactic's own commented-out description example says
-// to tune from CAD or calibration before trusting a pose on hardware. Stream
-// geometry mirrors the real v2 record rig (960x600 wrists, hd720 chest with
-// depth at downscale 2, all at 15fps).
+// Neither source publishes an optical-frame calibration: the lens front is
+// the CAD's simplified barrel, and Enactic's own commented-out description
+// example says to tune from CAD or calibration before trusting a pose on
+// hardware. Stream geometry mirrors the real v2 record rig (960x600 wrists,
+// hd720 chest with depth at downscale 2, all at 15fps).
 {
   cameras: [
     {
@@ -49,10 +53,9 @@
     {
       name: "chest",
       parent_link: "openarm_body_link0",
-      // Shoulder-mount plane plus the CAD mount offset, at the ZED Mini's
-      // left eye (+Y by half the 62.9mm baseline): the rgbd stream is the
-      // rectified left eye.
-      pos: [0.065, 0.0315, 0.8218],
+      // The centre of the ZED Mini's left lens front (+Y by half the 63.0mm
+      // baseline): the rgbd stream is the rectified left eye.
+      pos: [0.0792, 0.0315, 0.7941],
       // Faces the robot's front (world +X, where j1 pitches the arms) 62deg
       // below the horizon, image-up leaning forward.
       quat_wxyz: [0.6861027, 0.1710647, -0.1710647, -0.6861027],

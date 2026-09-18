@@ -43,6 +43,10 @@ class TestLoadCameraConfigs:
         chest = by_name["chest"]
         assert (chest.width, chest.height) == (1280, 720)
         assert chest.parent_link == "openarm_body_link0"
+        # The ZED Mini's left lens front as Waldo's head camera derivation
+        # reads it off Enactic's CAD, looking 62 degrees below the horizon.
+        assert chest.pos == pytest.approx((0.0792, 0.0315, 0.7941))
+        assert chest.quat_wxyz == pytest.approx((0.6861027, 0.1710647, -0.1710647, -0.6861027))
         assert chest.depth is not None
         assert (chest.depth.width, chest.depth.height) == (640, 360)
 

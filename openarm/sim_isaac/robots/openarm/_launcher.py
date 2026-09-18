@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
+import head_camera
 from bridge_extension import IsaacBridgeExtension
 from camera_common import FramePacer
 from object_state import RUNTIME_OBJECTS_PATH, object_prim_path
@@ -33,6 +34,12 @@ _ANTI_ALIASING_OP = "/rtx/post/aa/op"
 # under. Loading a scene replaces whatever is there.
 _RUNTIME_SCENE_PATH = "/World/RuntimeScene"
 
+# The robot USD's defaultPrim, the articulation every ext targets; the head
+# camera seats on its pedestal link. Its chest camera, whose pose the sensor
+# renders from, is what the head camera pack is checked against.
+_ROBOT_PRIM = "/openarm"
+_CAMERAS_CONFIG_PATH = Path(__file__).resolve().parent / "config" / "cameras.json5"
+
 # The runtime commands that remove or replace the prim at a runtime object's
 # path. Each refuses a name scene_manipulation spawned; a move keeps the prim.
 _PRIM_REPLACING_COMMANDS = frozenset({"spawn_usd", "spawn_isaac_asset", "remove"})
@@ -52,9 +59,13 @@ class SimLauncher:
         frame_rate_hz: int,
         render_mode: str,
         anti_aliasing: int,
+        head_camera_pack: Optional[Path],
     ) -> None:
         self._sim_app = sim_app
         self._usd_path = usd_path
+        # The staged head camera pack the robot draws (see head_camera.py);
+        # None for a robot that has no head camera.
+        self._head_camera_pack = head_camera_pack
         self._ready = ready
         self._stop = stop
         self._io = io
@@ -272,6 +283,19 @@ class SimLauncher:
         omni.usd.get_context().open_stage(
             str(self._usd_path)
         )
+
+        if self._head_camera_pack is not None:
+            body = head_camera.attach(
+                omni.usd.get_context().get_stage(),
+                _ROBOT_PRIM,
+                self._head_camera_pack,
+                _CAMERAS_CONFIG_PATH,
+            )
+            logger.info(
+                "Head camera attached at %s from %s",
+                body,
+                self._head_camera_pack,
+            )
 
     def _setup_environment(self) -> None:
         """Environment is loaded on demand by the scene commander."""
