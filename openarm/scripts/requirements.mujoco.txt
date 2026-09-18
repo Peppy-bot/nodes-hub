@@ -12,4 +12,4 @@ PyOpenGL-accelerate==3.1.10; platform_machine == "x86_64"
 pycapnp==2.2.2
 pyjson5==2.0.0
 viser==1.0.27
-sim_ext_core @ git+https://github.com/Peppy-bot/public-peppy-libs.git@main#subdirectory=sim_ext_core
+sim_ext_core @ git+https://github.com/Peppy-bot/peppy.git@dev#subdirectory=public-peppy-libs/sim_ext_core

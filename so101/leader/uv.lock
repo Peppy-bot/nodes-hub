@@ -145,7 +145,7 @@ wheels = [
 [[package]]
 name = "control-core-py"
 version = "0.1.0"
-source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=control_core_py&branch=main#5df98a7d93311103e91cb488f73c45dca1b850da" }
+source = { git = "https://github.com/Peppy-bot/peppy?subdirectory=public-peppy-libs%2Fcontrol_core_py#47f02eb66db864473892d60be0a107e69b4031de" }
 
 [[package]]
 name = "cuda-bindings"
@@ -959,7 +959,7 @@ wheels = [
 [[package]]
 name = "so101-description"
 version = "0.1.0"
-source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=so101_description&branch=main#5df98a7d93311103e91cb488f73c45dca1b850da" }
+source = { git = "https://github.com/Peppy-bot/peppy?subdirectory=public-peppy-libs%2Fso101_description#47f02eb66db864473892d60be0a107e69b4031de" }
 dependencies = [
     { name = "control-core-py" },
     { name = "numpy" },
@@ -985,11 +985,11 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "control-core-py", git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=control_core_py&branch=main" },
+    { name = "control-core-py", git = "https://github.com/Peppy-bot/peppy?subdirectory=public-peppy-libs%2Fcontrol_core_py" },
     { name = "lerobot", extras = ["feetech"], specifier = ">=0.6,<0.7" },
     { name = "peppygen", directory = ".peppy/libs/peppygen" },
     { name = "peppylib", directory = ".peppy/libs/peppylib" },
-    { name = "so101-description", git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=so101_description&branch=main" },
+    { name = "so101-description", git = "https://github.com/Peppy-bot/peppy?subdirectory=public-peppy-libs%2Fso101_description" },
 ]
 
 [package.metadata.requires-dev]

@@ -6,8 +6,8 @@ edition = "2024"
 [dependencies]
 peppygen = { path = ".peppy/libs/peppygen" }
 peppylib = { path = ".peppy/libs/peppylib" }
-control_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", branch = "main", package = "control_core" }
-openarm_description = { git = "https://github.com/Peppy-bot/public-peppy-libs", branch = "main", package = "openarm_description" }
+control_core = { git = "https://github.com/Peppy-bot/peppy", package = "control_core" }
+openarm_description = { git = "https://github.com/Peppy-bot/peppy", package = "openarm_description" }
 rusb = "0.9"
 serialport = "4"
 thiserror = "2"

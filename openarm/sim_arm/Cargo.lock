@@ -516,7 +516,7 @@ dependencies = [
 [[package]]
 name = "control_core"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs?branch=main#f2fffbb6409072329131e87da4816105123c5e33"
+source = "git+https://github.com/Peppy-bot/peppy#47f02eb66db864473892d60be0a107e69b4031de"
 dependencies = [
  "thiserror 2.0.20",
  "tokio",
