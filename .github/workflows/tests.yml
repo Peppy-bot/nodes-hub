@@ -35,9 +35,6 @@ jobs:
   python-syntax:
     name: Python syntax
     runs-on: self-hosted
-    # Use the newest Python minor required by repository projects. This is a
-    # syntax gate; each project's tests still use its own Python requirements.
-    container: python:3.13
     timeout-minutes: 5
     permissions:
       contents: read
@@ -46,6 +43,24 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+
+      # Use the newest Python minor required by repository projects. This is a
+      # syntax gate; each project's tests still use its own Python
+      # requirements.
+      #
+      # Through setup-python rather than the `container: python:3.13` this job
+      # used to declare. A container job has the runner pull the image with
+      # docker, and docker is not installed on every self-hosted box — this job
+      # failed with `docker: command not found` before reaching a single step
+      # of its own. setup-python wants nothing but the runner's tool cache, so
+      # it works the same on every box, and it drops a Docker Hub pull from
+      # every run, which matters because the anonymous pull quota those boxes
+      # share is the tightest thing about them. It is what the other
+      # repositories here already reach for.
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+
       - name: Compile every tracked Python file
         run: python .github/scripts/check-python-syntax.py
 
