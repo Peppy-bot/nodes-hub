@@ -11,7 +11,6 @@ import time
 from pathlib import Path
 from typing import Optional
 
-import head_camera
 from bridge_extension import IsaacBridgeExtension
 from camera_common import FramePacer
 from object_state import RUNTIME_OBJECTS_PATH, object_prim_path
@@ -24,6 +23,11 @@ logger = logging.getLogger(__name__)
 _SLOW_ITERATION_S = 0.05
 
 _WARMUP_STEPS = 100
+
+# Frames given to the stage after a robot joins or leaves, before the
+# timeline plays again and after it does: the prim has to load and physics
+# has to pick it up before a view of it can read.
+_STAGE_SETTLE_STEPS = 30
 _MAIN_RATE_LIMIT_ENABLED = "/app/runLoops/main/rateLimitEnabled"
 # The renderer and anti-aliasing Kit actually runs; both are requested through
 # SimulationApp's launch config and both can be changed by Kit afterwards.
@@ -34,12 +38,6 @@ _ANTI_ALIASING_OP = "/rtx/post/aa/op"
 # under. Loading a scene replaces whatever is there.
 _RUNTIME_SCENE_PATH = "/World/RuntimeScene"
 
-# The robot USD's defaultPrim, the articulation every ext targets; the head
-# camera seats on its pedestal link. Its chest camera, whose pose the sensor
-# renders from, is what the head camera pack is checked against.
-_ROBOT_PRIM = "/openarm"
-_CAMERAS_CONFIG_PATH = Path(__file__).resolve().parent / "config" / "cameras.json5"
-
 # The runtime commands that remove or replace the prim at a runtime object's
 # path. Each refuses a name scene_manipulation spawned; a move keeps the prim.
 _PRIM_REPLACING_COMMANDS = frozenset({"spawn_usd", "spawn_isaac_asset", "remove"})
@@ -49,23 +47,20 @@ class SimLauncher:
     def __init__(
         self,
         sim_app,
-        usd_path: Path,
+        world: World,
+        edits: Edits,
+        extension: IsaacBridgeExtension,
         ready: threading.Event,
         stop: threading.Event,
         io,
         scene_actions,
-        state_rate_hz: int,
-        cameras_enabled: bool,
         frame_rate_hz: int,
         render_mode: str,
         anti_aliasing: int,
-        head_camera_pack: Optional[Path],
     ) -> None:
         self._sim_app = sim_app
-        self._usd_path = usd_path
-        # The staged head camera pack the robot draws (see head_camera.py);
-        # None for a robot that has no head camera.
-        self._head_camera_pack = head_camera_pack
+        self._world = world
+        self._edits = edits
         self._ready = ready
         self._stop = stop
         self._io = io
@@ -73,20 +68,13 @@ class SimLauncher:
         self._frame_rate_hz = frame_rate_hz
         self._render_mode = render_mode
         self._anti_aliasing = anti_aliasing
-        self._state_rate_hz = state_rate_hz
-        self._cameras_enabled = cameras_enabled
         self._timeline = None
-        self._extension: Optional[IsaacBridgeExtension] = None
+        self._extension: Optional[IsaacBridgeExtension] = extension
 
-        self._runtime_robot = None
 
         # Runtime-discovered NVIDIA Isaac prop catalogue.
         self._isaac_assets = {}
 
-        self._runtime_arm_targets = {
-            "left": None,
-            "right": None,
-        }
 
         self._runtime_commander = RuntimeCommanderServer(
             host="0.0.0.0",
@@ -230,19 +218,15 @@ class SimLauncher:
                 self._isaac_assets
             )
 
-            if self._cameras_enabled:
-                self._configure_camera_rendering()
+            # The rig is rendered for each robot that pairs a camera, and
+            # the settings below are what a capture needs from the renderer.
+            self._configure_camera_rendering()
 
             self._warmup()
             self._require_render_profile()
             self._start_timeline()
 
-            self._extension = IsaacBridgeExtension(
-                self._io,
-                self._scene_actions,
-                self._state_rate_hz,
-                self._cameras_enabled,
-            )
+            self._extension.bind()
 
             self._runtime_commander.start()
 
@@ -267,35 +251,29 @@ class SimLauncher:
             self._shutdown()
 
     def _load_stage(self) -> None:
-        import omni.usd
+        self._world.open()
 
-        if not self._usd_path.exists():
-            raise FileNotFoundError(
-                f"USD not found at {self._usd_path}"
-                " — assets should be baked into the container image"
-            )
+    def unbind(self) -> None:
+        """Lets go of the stage so it can be changed: every view on an
+        articulation stops reading, and the timeline stops so the prims can
+        move under it."""
+        self._extension.unbind()
+        if self._timeline is not None:
+            self._timeline.stop()
 
-        logger.info(
-            "Loading stage: %s",
-            self._usd_path,
-        )
-
-        omni.usd.get_context().open_stage(
-            str(self._usd_path)
-        )
-
-        if self._head_camera_pack is not None:
-            body = head_camera.attach(
-                omni.usd.get_context().get_stage(),
-                _ROBOT_PRIM,
-                self._head_camera_pack,
-                _CAMERAS_CONFIG_PATH,
-            )
-            logger.info(
-                "Head camera attached at %s from %s",
-                body,
-                self._head_camera_pack,
-            )
+    def rebind(self) -> None:
+        """Plays the stage again, takes a view of every robot on it and
+        resolves the views against the live stage, so a robot the engine
+        cannot drive raises out of the stand that put it there. A robot that
+        was commanded servos back to its setpoint as soon as its views read."""
+        for _ in range(_STAGE_SETTLE_STEPS):
+            self._sim_app.update()
+        if self._timeline is not None:
+            self._timeline.play()
+        for _ in range(_STAGE_SETTLE_STEPS):
+            self._sim_app.update()
+        self._extension.bind()
+        self._extension.resolve(self._sim_app.update, _STAGE_SETTLE_STEPS)
 
     def _setup_environment(self) -> None:
         """Environment is loaded on demand by the scene commander."""
@@ -380,13 +358,7 @@ class SimLauncher:
                 "a scene_manipulation object; edit it through scene_manipulation"
             )
 
-        if cmd == "move_arm":
-            self._runtime_move_arm(command)
-
-        elif cmd == "release_arm":
-            self._runtime_release_arm(command)
-
-        elif cmd == "move_robot_root":
+        if cmd == "move_robot_root":
             self._runtime_move_robot_root(command)
 
         elif cmd == "spawn_usd":
@@ -397,15 +369,6 @@ class SimLauncher:
 
         elif cmd == "remove":
             self._runtime_remove(command)
-
-        elif cmd == "list_joints":
-            self._runtime_list_joints()
-
-        elif cmd == "load_tabletop_scene":
-            self._runtime_load_tabletop_scene(command)
-
-        elif cmd == "load_shelf_reach_scene":
-            self._runtime_load_shelf_reach_scene(command)
 
         elif cmd == "load_usd_scene":
             self._runtime_load_usd_scene(command)
@@ -428,1003 +391,19 @@ class SimLauncher:
     # Robot control
     # ------------------------------------------------------------------
 
-    def _get_runtime_robot(self):
-        """Return the runtime OpenArm articulation."""
-
-        if self._runtime_robot is not None:
-            return self._runtime_robot
-
-        from isaacsim.core.prims import Articulation
-
-        self._runtime_robot = Articulation(
-            "/openarm"
-        )
-
-        self._runtime_robot.initialize()
-
-        logger.info(
-            "Runtime OpenArm articulation initialized"
-        )
-
-        logger.info(
-            "Runtime OpenArm DOFs: %s",
-            list(self._runtime_robot.dof_names),
-        )
-
-        return self._runtime_robot
-
-    def _runtime_list_joints(self) -> None:
-        robot = self._get_runtime_robot()
-
-        logger.info(
-            "OPENARM JOINTS: %s",
-            list(robot.dof_names),
-        )
-
-    def _runtime_move_arm(
-        self,
-        command: dict,
-    ) -> None:
-        """Store a 7-DOF arm target for persistent runtime control."""
-
-        side = str(
-            command["side"]
-        ).lower()
-
-        if side not in ("left", "right"):
-            raise ValueError(
-                "side must be 'left' or 'right'"
-            )
-
-        targets = [
-            float(value)
-            for value in command["positions"]
-        ]
-
-        if len(targets) != 7:
-            raise ValueError(
-                "Arm command requires exactly 7 joint positions"
-            )
-
-        self._runtime_arm_targets[side] = targets
-
-        logger.info(
-            "Runtime %s arm override enabled: %s",
-            side,
-            targets,
-        )
-
-    def _runtime_release_arm(
-        self,
-        command: dict,
-    ) -> None:
-        """Release a runtime arm override back to the Peppy bridge."""
-
-        side = str(
-            command["side"]
-        ).lower()
-
-        if side not in ("left", "right"):
-            raise ValueError(
-                "side must be 'left' or 'right'"
-            )
-
-        self._runtime_arm_targets[side] = None
-
-        logger.info(
-            "Runtime %s arm override released",
-            side,
-        )
-
-    def _apply_runtime_arm_targets(self) -> None:
-        """Re-apply active arm targets every simulation frame."""
-
-        import numpy as np
-
-        if not any(
-            target is not None
-            for target in self._runtime_arm_targets.values()
-        ):
-            return
-
-        robot = self._get_runtime_robot()
-        joint_names = list(robot.dof_names)
-
-        for side in ("left", "right"):
-            targets = self._runtime_arm_targets[side]
-
-            if targets is None:
-                continue
-
-            arm_joint_names = [
-                f"openarm_{side}_joint{i}"
-                for i in range(1, 8)
-            ]
-
-            indices = np.array(
-                [
-                    joint_names.index(name)
-                    for name in arm_joint_names
-                ],
-                dtype=np.int32,
-            )
-
-            robot.set_joint_position_targets(
-                np.array(
-                    targets,
-                    dtype=np.float32,
-                ),
-                joint_indices=indices,
-            )
-
     def _runtime_move_robot_root(
         self,
         command: dict,
     ) -> None:
-        """Translate the whole OpenArm root prim in the live stage."""
-
-        import omni.usd
-
-        from pxr import Gf, UsdGeom
-
-        position = command["position"]
-
-        if len(position) != 3:
-            raise ValueError(
-                "Robot root position requires exactly 3 values: x y z"
-            )
-
-        stage = omni.usd.get_context().get_stage()
-        prim = stage.GetPrimAtPath("/openarm")
-
-        if not prim.IsValid():
-            raise RuntimeError(
-                "OpenArm root prim /openarm does not exist"
-            )
-
-        xformable = UsdGeom.Xformable(prim)
-        translate_op = None
-
-        for op in xformable.GetOrderedXformOps():
-            if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
-                translate_op = op
-                break
-
-        if translate_op is None:
-            translate_op = xformable.AddTranslateOp()
-
-        translate_op.Set(
-            Gf.Vec3d(
-                float(position[0]),
-                float(position[1]),
-                float(position[2]),
-            )
-        )
-
-        logger.info(
-            "Moved OpenArm root to %s",
-            position,
-        )
+        """Puts one robot somewhere else in the live stage, leaving every
+        other robot standing where it is. The world's record moves with it,
+        so the scene reports where the robot now stands and the next robot
+        the engine places is given room from there."""
+        self._world.move(command["robot"], command["position"])
 
     # ------------------------------------------------------------------
     # Runtime scene control
     # ------------------------------------------------------------------
-
-    def _runtime_load_tabletop_scene(self) -> None:
-        """Create an amber table, red cube, and blue tray in front of OpenArm."""
-
-        import omni.usd
-
-        from pxr import Gf, Sdf, UsdGeom, UsdShade
-
-        stage = omni.usd.get_context().get_stage()
-
-        # --------------------------------------------------------------
-        # Read the current OpenArm world pose.
-        # --------------------------------------------------------------
-
-        robot_prim = stage.GetPrimAtPath("/openarm")
-
-        if not robot_prim.IsValid():
-            raise RuntimeError(
-                "OpenArm root prim /openarm does not exist"
-            )
-
-        robot_xform = UsdGeom.Xformable(robot_prim)
-
-        world_transform = robot_xform.ComputeLocalToWorldTransform(
-            0.0
-        )
-
-        robot_position = world_transform.ExtractTranslation()
-
-        robot_x = float(robot_position[0])
-        robot_y = float(robot_position[1])
-        robot_z = float(robot_position[2])
-
-        # Treat OpenArm local +X as forward and local +Y as its lateral
-        # direction. Using the robot transform makes the placement follow
-        # the current robot pose rather than fixed warehouse coordinates.
-        forward = world_transform.TransformDir(
-            Gf.Vec3d(1.0, 0.0, 0.0)
-        )
-
-        lateral = world_transform.TransformDir(
-            Gf.Vec3d(0.0, 1.0, 0.0)
-        )
-
-        if forward.GetLength() < 1e-6:
-            forward = Gf.Vec3d(1.0, 0.0, 0.0)
-        else:
-            forward.Normalize()
-
-        if lateral.GetLength() < 1e-6:
-            lateral = Gf.Vec3d(0.0, 1.0, 0.0)
-        else:
-            lateral.Normalize()
-
-        logger.info(
-            "Current OpenArm root: "
-            "(%.3f, %.3f, %.3f), "
-            "forward=(%.3f, %.3f, %.3f)",
-            robot_x,
-            robot_y,
-            robot_z,
-            float(forward[0]),
-            float(forward[1]),
-            float(forward[2]),
-        )
-
-        # --------------------------------------------------------------
-        # Workcell placement.
-        #
-        # The table centre is 0.90 m forward from the current robot root.
-        # The red cube is slightly nearer and to one side.
-        # The blue tray is slightly farther and on the opposite side.
-        # --------------------------------------------------------------
-
-        forward_offset = 0.90
-
-        table_center = (
-            Gf.Vec3d(
-                robot_x,
-                robot_y,
-                robot_z,
-            )
-            + forward * forward_offset
-        )
-
-        table_x = float(table_center[0])
-        table_y = float(table_center[1])
-
-        # Table geometry:
-        # centre Z = root Z + 0.72
-        # height    = 0.08 m
-        # top Z     = root Z + 0.76
-        table_center_z = robot_z + 0.72
-        table_top_z = robot_z + 0.76
-
-        # --------------------------------------------------------------
-        # Scene root.
-        # --------------------------------------------------------------
-
-        root_path = f"{RUNTIME_OBJECTS_PATH}/Tabletop"
-
-        self._remove_prim(stage, root_path)
-
-        stage.DefinePrim(
-            Sdf.Path(root_path),
-            "Xform",
-        )
-
-        # --------------------------------------------------------------
-        # Materials.
-        # --------------------------------------------------------------
-
-        def create_material(
-            path,
-            color,
-            roughness=0.4,
-        ):
-            material = UsdShade.Material.Define(
-                stage,
-                path,
-            )
-
-            shader = UsdShade.Shader.Define(
-                stage,
-                path + "/Shader",
-            )
-
-            shader.CreateIdAttr(
-                "UsdPreviewSurface"
-            )
-
-            shader.CreateInput(
-                "diffuseColor",
-                Sdf.ValueTypeNames.Color3f,
-            ).Set(
-                Gf.Vec3f(
-                    float(color[0]),
-                    float(color[1]),
-                    float(color[2]),
-                )
-            )
-
-            shader.CreateInput(
-                "roughness",
-                Sdf.ValueTypeNames.Float,
-            ).Set(
-                float(roughness)
-            )
-
-            material.CreateSurfaceOutput().ConnectToSource(
-                shader.ConnectableAPI(),
-                "surface",
-            )
-
-            return material
-
-        def bind_material(
-            prim,
-            material,
-        ):
-            UsdShade.MaterialBindingAPI(
-                prim
-            ).Bind(
-                material
-            )
-
-        amber = create_material(
-            root_path + "/Materials/Amber",
-            (0.95, 0.52, 0.08),
-            roughness=0.35,
-        )
-
-        red = create_material(
-            root_path + "/Materials/Red",
-            (0.90, 0.03, 0.03),
-            roughness=0.30,
-        )
-
-        blue = create_material(
-            root_path + "/Materials/Blue",
-            (0.03, 0.15, 0.90),
-            roughness=0.30,
-        )
-
-        # --------------------------------------------------------------
-        # Amber table.
-        # --------------------------------------------------------------
-
-        table = UsdGeom.Cube.Define(
-            stage,
-            root_path + "/Table",
-        )
-
-        table.CreateSizeAttr(1.0)
-
-        table_xform = UsdGeom.Xformable(
-            table.GetPrim()
-        )
-
-        table_xform.AddTranslateOp().Set(
-            Gf.Vec3d(
-                table_x,
-                table_y,
-                table_center_z,
-            )
-        )
-
-        table_xform.AddScaleOp().Set(
-            Gf.Vec3f(
-                0.75,
-                1.20,
-                0.08,
-            )
-        )
-
-        bind_material(
-            table.GetPrim(),
-            amber,
-        )
-
-        # --------------------------------------------------------------
-        # Red pick cube.
-        # --------------------------------------------------------------
-
-        cube_center = (
-            Gf.Vec3d(
-                table_x,
-                table_y,
-                table_top_z + 0.04,
-            )
-            - forward * 0.18
-            - lateral * 0.20
-        )
-
-        cube = UsdGeom.Cube.Define(
-            stage,
-            root_path + "/RedCube",
-        )
-
-        cube.CreateSizeAttr(1.0)
-
-        cube_xform = UsdGeom.Xformable(
-            cube.GetPrim()
-        )
-
-        cube_xform.AddTranslateOp().Set(
-            Gf.Vec3d(
-                float(cube_center[0]),
-                float(cube_center[1]),
-                table_top_z + 0.04,
-            )
-        )
-
-        cube_xform.AddScaleOp().Set(
-            Gf.Vec3f(
-                0.08,
-                0.08,
-                0.08,
-            )
-        )
-
-        bind_material(
-            cube.GetPrim(),
-            red,
-        )
-
-        # --------------------------------------------------------------
-        # Blue tray.
-        # --------------------------------------------------------------
-
-        tray_center = (
-            Gf.Vec3d(
-                table_x,
-                table_y,
-                table_top_z + 0.0125,
-            )
-            + forward * 0.08
-            + lateral * 0.25
-        )
-
-        tray_center_x = float(tray_center[0])
-        tray_center_y = float(tray_center[1])
-        tray_z = table_top_z + 0.0125
-
-        tray_root = root_path + "/BlueTray"
-
-        stage.DefinePrim(
-            tray_root,
-            "Xform",
-        )
-
-        floor = UsdGeom.Cube.Define(
-            stage,
-            tray_root + "/Floor",
-        )
-
-        floor.CreateSizeAttr(1.0)
-
-        floor_xform = UsdGeom.Xformable(
-            floor.GetPrim()
-        )
-
-        floor_xform.AddTranslateOp().Set(
-            Gf.Vec3d(
-                tray_center_x,
-                tray_center_y,
-                tray_z,
-            )
-        )
-
-        floor_xform.AddScaleOp().Set(
-            Gf.Vec3f(
-                0.30,
-                0.40,
-                0.025,
-            )
-        )
-
-        bind_material(
-            floor.GetPrim(),
-            blue,
-        )
-
-        wall_height = 0.07
-        wall_thickness = 0.025
-
-        # The robot is currently only translated by commander.py, so the
-        # tray remains world-axis aligned. Its centre still follows the
-        # current robot pose.
-        walls = [
-            (
-                "LeftWall",
-                (
-                    tray_center_x,
-                    tray_center_y - 0.20,
-                    tray_z + wall_height / 2.0,
-                ),
-                (
-                    0.30,
-                    wall_thickness,
-                    wall_height,
-                ),
-            ),
-            (
-                "RightWall",
-                (
-                    tray_center_x,
-                    tray_center_y + 0.20,
-                    tray_z + wall_height / 2.0,
-                ),
-                (
-                    0.30,
-                    wall_thickness,
-                    wall_height,
-                ),
-            ),
-            (
-                "FrontWall",
-                (
-                    tray_center_x - 0.15,
-                    tray_center_y,
-                    tray_z + wall_height / 2.0,
-                ),
-                (
-                    wall_thickness,
-                    0.40,
-                    wall_height,
-                ),
-            ),
-            (
-                "BackWall",
-                (
-                    tray_center_x + 0.15,
-                    tray_center_y,
-                    tray_z + wall_height / 2.0,
-                ),
-                (
-                    wall_thickness,
-                    0.40,
-                    wall_height,
-                ),
-            ),
-        ]
-
-        for wall_name, wall_position, wall_scale in walls:
-            wall = UsdGeom.Cube.Define(
-                stage,
-                f"{tray_root}/{wall_name}",
-            )
-
-            wall.CreateSizeAttr(1.0)
-
-            wall_xform = UsdGeom.Xformable(
-                wall.GetPrim()
-            )
-
-            wall_xform.AddTranslateOp().Set(
-                Gf.Vec3d(
-                    float(wall_position[0]),
-                    float(wall_position[1]),
-                    float(wall_position[2]),
-                )
-            )
-
-            wall_xform.AddScaleOp().Set(
-                Gf.Vec3f(
-                    float(wall_scale[0]),
-                    float(wall_scale[1]),
-                    float(wall_scale[2]),
-                )
-            )
-
-            bind_material(
-                wall.GetPrim(),
-                blue,
-            )
-
-        logger.info(
-            "Runtime tabletop created in front of OpenArm: "
-            "robot=(%.3f, %.3f, %.3f), "
-            "table=(%.3f, %.3f, %.3f), "
-            "forward_offset=%.2f m",
-            robot_x,
-            robot_y,
-            robot_z,
-            table_x,
-            table_y,
-            table_center_z,
-            forward_offset,
-        )
-
-    def _runtime_load_shelf_reach_scene(self) -> None:
-        """Create a reachability shelf with coloured cubes in front of OpenArm."""
-
-        import omni.usd
-
-        from pxr import Gf, Sdf, UsdGeom, UsdShade
-
-        stage = omni.usd.get_context().get_stage()
-
-        robot_prim = stage.GetPrimAtPath("/openarm")
-
-        if not robot_prim.IsValid():
-            raise RuntimeError(
-                "OpenArm root prim /openarm does not exist"
-            )
-
-        robot_xform = UsdGeom.Xformable(robot_prim)
-
-        world_transform = robot_xform.ComputeLocalToWorldTransform(
-            0.0
-        )
-
-        robot_position = world_transform.ExtractTranslation()
-
-        robot_x = float(robot_position[0])
-        robot_y = float(robot_position[1])
-        robot_z = float(robot_position[2])
-
-        # OpenArm local +X is treated as forward and +Y as lateral.
-        forward = world_transform.TransformDir(
-            Gf.Vec3d(1.0, 0.0, 0.0)
-        )
-
-        lateral = world_transform.TransformDir(
-            Gf.Vec3d(0.0, 1.0, 0.0)
-        )
-
-        if forward.GetLength() < 1e-6:
-            forward = Gf.Vec3d(1.0, 0.0, 0.0)
-        else:
-            forward.Normalize()
-
-        if lateral.GetLength() < 1e-6:
-            lateral = Gf.Vec3d(0.0, 1.0, 0.0)
-        else:
-            lateral.Normalize()
-
-        root_path = f"{RUNTIME_OBJECTS_PATH}/ShelfReach"
-
-        self._remove_prim(stage, root_path)
-
-        stage.DefinePrim(
-            Sdf.Path(root_path),
-            "Xform",
-        )
-
-        # --------------------------------------------------------------
-        # Helpers
-        # --------------------------------------------------------------
-
-        def create_material(
-            path,
-            color,
-            roughness=0.4,
-        ):
-            material = UsdShade.Material.Define(
-                stage,
-                path,
-            )
-
-            shader = UsdShade.Shader.Define(
-                stage,
-                path + "/Shader",
-            )
-
-            shader.CreateIdAttr(
-                "UsdPreviewSurface"
-            )
-
-            shader.CreateInput(
-                "diffuseColor",
-                Sdf.ValueTypeNames.Color3f,
-            ).Set(
-                Gf.Vec3f(
-                    float(color[0]),
-                    float(color[1]),
-                    float(color[2]),
-                )
-            )
-
-            shader.CreateInput(
-                "roughness",
-                Sdf.ValueTypeNames.Float,
-            ).Set(
-                float(roughness)
-            )
-
-            material.CreateSurfaceOutput().ConnectToSource(
-                shader.ConnectableAPI(),
-                "surface",
-            )
-
-            return material
-
-        def bind_material(
-            prim,
-            material,
-        ):
-            UsdShade.MaterialBindingAPI(
-                prim
-            ).Bind(
-                material
-            )
-
-        def add_cube(
-            path,
-            center,
-            size,
-            material,
-        ):
-            cube = UsdGeom.Cube.Define(
-                stage,
-                path,
-            )
-
-            cube.CreateSizeAttr(1.0)
-
-            xform = UsdGeom.Xformable(
-                cube.GetPrim()
-            )
-
-            xform.AddTranslateOp().Set(
-                Gf.Vec3d(
-                    float(center[0]),
-                    float(center[1]),
-                    float(center[2]),
-                )
-            )
-
-            xform.AddScaleOp().Set(
-                Gf.Vec3f(
-                    float(size[0]),
-                    float(size[1]),
-                    float(size[2]),
-                )
-            )
-
-            bind_material(
-                cube.GetPrim(),
-                material,
-            )
-
-            return cube
-
-        # --------------------------------------------------------------
-        # Materials
-        # --------------------------------------------------------------
-
-        shelf_material = create_material(
-            root_path + "/Materials/Shelf",
-            (0.18, 0.20, 0.24),
-            roughness=0.45,
-        )
-
-        red = create_material(
-            root_path + "/Materials/Red",
-            (0.90, 0.03, 0.03),
-            roughness=0.30,
-        )
-
-        blue = create_material(
-            root_path + "/Materials/Blue",
-            (0.03, 0.15, 0.90),
-            roughness=0.30,
-        )
-
-        green = create_material(
-            root_path + "/Materials/Green",
-            (0.04, 0.65, 0.10),
-            roughness=0.30,
-        )
-
-        yellow = create_material(
-            root_path + "/Materials/Yellow",
-            (0.95, 0.75, 0.05),
-            roughness=0.30,
-        )
-
-        # --------------------------------------------------------------
-        # Shelf placement relative to robot.
-        # --------------------------------------------------------------
-
-        shelf_forward_offset = 0.95
-
-        shelf_center = (
-            Gf.Vec3d(
-                robot_x,
-                robot_y,
-                robot_z,
-            )
-            + forward * shelf_forward_offset
-        )
-
-        shelf_x = float(shelf_center[0])
-        shelf_y = float(shelf_center[1])
-
-        # Overall shelf dimensions.
-        shelf_width = 1.00
-        shelf_depth = 0.30
-        shelf_height = 1.35
-        board_thickness = 0.04
-
-        # The shelf is centred around the robot's torso workspace.
-        shelf_base_z = robot_z + 0.20
-        shelf_top_z = shelf_base_z + shelf_height
-
-        # Side uprights.
-        left_center = (
-            Gf.Vec3d(
-                shelf_x,
-                shelf_y,
-                shelf_base_z + shelf_height / 2.0,
-            )
-            - lateral * (shelf_width / 2.0)
-        )
-
-        right_center = (
-            Gf.Vec3d(
-                shelf_x,
-                shelf_y,
-                shelf_base_z + shelf_height / 2.0,
-            )
-            + lateral * (shelf_width / 2.0)
-        )
-
-        add_cube(
-            root_path + "/Shelf/LeftUpright",
-            left_center,
-            (
-                shelf_depth,
-                board_thickness,
-                shelf_height,
-            ),
-            shelf_material,
-        )
-
-        add_cube(
-            root_path + "/Shelf/RightUpright",
-            right_center,
-            (
-                shelf_depth,
-                board_thickness,
-                shelf_height,
-            ),
-            shelf_material,
-        )
-
-        # Shelf levels.
-        shelf_levels = [
-            shelf_base_z + 0.25,
-            shelf_base_z + 0.60,
-            shelf_base_z + 0.95,
-            shelf_base_z + 1.30,
-        ]
-
-        for index, level_z in enumerate(
-            shelf_levels
-        ):
-            add_cube(
-                root_path + f"/Shelf/Level{index}",
-                (
-                    shelf_x,
-                    shelf_y,
-                    level_z,
-                ),
-                (
-                    shelf_depth,
-                    shelf_width,
-                    board_thickness,
-                ),
-                shelf_material,
-            )
-
-        # Back panel.
-        back_center = (
-            Gf.Vec3d(
-                shelf_x,
-                shelf_y,
-                shelf_base_z + shelf_height / 2.0,
-            )
-            + forward * (shelf_depth / 2.0)
-        )
-
-        add_cube(
-            root_path + "/Shelf/BackPanel",
-            back_center,
-            (
-                board_thickness,
-                shelf_width,
-                shelf_height,
-            ),
-            shelf_material,
-        )
-
-        # --------------------------------------------------------------
-        # Reach cubes.
-        #
-        # Cube centres are arranged at different heights and laterals
-        # to create easy / medium / high reach targets.
-        # --------------------------------------------------------------
-
-        cube_size = 0.09
-
-        cube_specs = [
-            (
-                "RedCube",
-                red,
-                shelf_levels[2] + board_thickness / 2.0 + cube_size / 2.0,
-                -0.28,
-                -0.04,
-            ),
-            (
-                "BlueCube",
-                blue,
-                shelf_levels[2] + board_thickness / 2.0 + cube_size / 2.0,
-                0.28,
-                0.02,
-            ),
-            (
-                "GreenCube",
-                green,
-                shelf_levels[1] + board_thickness / 2.0 + cube_size / 2.0,
-                0.05,
-                -0.03,
-            ),
-            (
-                "YellowCube",
-                yellow,
-                shelf_levels[0] + board_thickness / 2.0 + cube_size / 2.0,
-                -0.25,
-                0.03,
-            ),
-        ]
-
-        for (
-            cube_name,
-            cube_material,
-            cube_z,
-            lateral_offset,
-            depth_offset,
-        ) in cube_specs:
-
-            cube_center = (
-                Gf.Vec3d(
-                    shelf_x,
-                    shelf_y,
-                    cube_z,
-                )
-                + lateral * lateral_offset
-                - forward * depth_offset
-            )
-
-            add_cube(
-                root_path + f"/Objects/{cube_name}",
-                cube_center,
-                (
-                    cube_size,
-                    cube_size,
-                    cube_size,
-                ),
-                cube_material,
-            )
-
-        logger.info(
-            "Shelf-reach scene created in front of OpenArm: "
-            "robot=(%.3f, %.3f, %.3f), "
-            "shelf=(%.3f, %.3f), "
-            "forward_offset=%.2f m",
-            robot_x,
-            robot_y,
-            robot_z,
-            shelf_x,
-            shelf_y,
-            shelf_forward_offset,
-        )
 
     def _runtime_apply_physics(
         self,
@@ -1550,28 +529,33 @@ class SimLauncher:
     # ------------------------------------------------------------------
 
     def _remove_prim(self, stage, path: str) -> bool:
-        """Remove a prim if it exists and drop every cached physics view.
+        """Remove a prim if it exists and take every cached physics view again.
 
         PhysX rebuilds its tensor views when a prim leaves the stage, and the
         Articulation handles the bridge and the runtime commander hold keep
         failing afterwards ('Articulation' object has no attribute
         '_physics_view') until they are created again, as does the
         rigid-body view the object state reads. Every removal goes through
-        here so those handles are re-created on their next use. Adding
-        prims leaves them intact.
+        here: the bridge's views are dropped before the prim goes and taken
+        again after, and the commander's are re-created on their next use.
+        Adding prims leaves them intact.
         """
 
         if not stage.GetPrimAtPath(path).IsValid():
             return False
 
+        # A view of a prim that is edited under it stops reading, so the
+        # views go before the prim does and are taken again after; they read
+        # on the steps that follow.
+        if self._extension is not None:
+            self._extension.unbind()
+
         stage.RemovePrim(path)
 
-        self._runtime_robot = None
+        self._scene_actions.invalidate_physics_views()
 
         if self._extension is not None:
-            self._extension.invalidate_physics_views()
-
-        self._scene_actions.invalidate_physics_views()
+            self._extension.bind()
 
         return True
 
@@ -2435,9 +1419,11 @@ class SimLauncher:
                 self
             )
 
-            self._update_runtime_forces()
+            # Stand the robots that joined and take out the ones that left,
+            # on this thread, which is the only one that may touch the stage.
+            self._edits.drain()
 
-            self._apply_runtime_arm_targets()
+            self._update_runtime_forces()
 
             iteration_s = time.monotonic() - iteration_start
             if iteration_s > _SLOW_ITERATION_S:
@@ -2450,6 +1436,11 @@ class SimLauncher:
 
     def _shutdown(self) -> None:
         self._ready.clear()
+
+        # Nothing drains the queue once this loop is over, and a robot
+        # joining or leaving waits on its edit with no deadline, so every
+        # one still queued is failed here.
+        self._edits.cancel_all("the simulation is shutting down")
 
         try:
             self._runtime_commander.stop()

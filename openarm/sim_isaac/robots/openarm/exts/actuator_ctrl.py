@@ -6,21 +6,27 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-_ARTICULATION_NAME = "peppy_actuator_ctrl"
-
 
 class IsaacActuatorCtrl:
     """Resolves joint names to indices on a target articulation and writes
     position (and optional velocity) targets via the Articulation view. One
-    instance per articulation (one gripper, one arm side, etc).
+    instance per limb of one robot, each with a view name of its own, since
+    Isaac registers views by name.
 
     When the config entry carries per-joint MIT gains (kp/kd) and torque caps,
     setup() applies them to the PhysX joint drives so the sim servo runs the
     real driver's torque law: tau = kp*(q_des - q) + kd*(dq_des - dq).
     """
 
-    def __init__(self, prim_path: str, joint_names: list[str], params: dict | None = None) -> None:
+    def __init__(
+        self,
+        prim_path: str,
+        joint_names: list[str],
+        name: str,
+        params: dict | None = None,
+    ) -> None:
         self._prim_path = prim_path
+        self._name = name
         self._joint_names = list(joint_names)
         self._params = params or {}
         self._view = None
@@ -37,7 +43,7 @@ class IsaacActuatorCtrl:
 
             self._view = Articulation(
                 prim_paths_expr=self._prim_path,
-                name=_ARTICULATION_NAME,
+                name=self._name,
             )
             self._view.initialize()
             dof_names = list(self._view.dof_names)

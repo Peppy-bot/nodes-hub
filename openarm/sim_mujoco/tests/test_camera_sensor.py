@@ -130,6 +130,10 @@ class FakeRenderer:
         self.closed = True
 
 
+# The robot every fake frame is published for.
+ROBOT = "alpha"
+
+
 class FakeIO:
     def __init__(self, delivers=True):
         self.frames = []
@@ -138,26 +142,30 @@ class FakeIO:
         self.delivers = delivers
         self.now_s = 123.0
 
-    def camera_timestamp_s(self):
+    def timestamp_s(self):
         return self.now_s
 
     def publish_color_frame(
-        self, name, timestamp_s, frame_id, encoding, width, height, frame
+        self, robot, name, timestamp_s, frame_id, encoding, width, height, frame
     ):
+        assert robot == ROBOT
         self.frames.append((name, frame_id, encoding, width, height, frame, timestamp_s))
         return self.delivers
 
-    def publish_rgbd_frames(self, name, timestamp_s, frame_id, align_mode, color, depth):
+    def publish_rgbd_frames(self, robot, name, timestamp_s, frame_id, align_mode, color, depth):
+        assert robot == ROBOT
         self.rgbd.append((name, frame_id, align_mode, color, depth, timestamp_s))
         return self.delivers
 
-    def publish_color_stream_info(self, name, width, height, fps, encoding):
+    def publish_color_stream_info(self, robot, name, width, height, fps, encoding):
+        assert robot == ROBOT
         self.infos.append((name, width, height, fps, encoding))
 
     def publish_rgbd_stream_info(
-        self, name, width, height, fps, encoding,
+        self, robot, name, width, height, fps, encoding,
         depth_width, depth_height, depth_encoding, depth_unit,
     ):
+        assert robot == ROBOT
         self.infos.append((name, width, height, fps, encoding,
                            depth_width, depth_height, depth_encoding, depth_unit))
 
@@ -182,7 +190,7 @@ def clock_fixture(monkeypatch):
 
 def sensor_with_fakes(model, cameras, io, depth_m=1.5):
     """A sensor plus the renderer dicts its render loop would have built."""
-    sensor = MujocoCameraSensor(model, cameras, io)
+    sensor = MujocoCameraSensor(model, cameras, io, ROBOT)
     color = {(c.height, c.width): FakeRenderer(c.height, c.width) for c in cameras}
     depth = {
         (c.depth.height, c.depth.width): FakeRenderer(
@@ -495,7 +503,7 @@ def test_renderers_open_at_each_streams_own_size(scene, monkeypatch):
     non-square stream sideways and nothing downstream would notice."""
     cameras = [color_camera(), rgbd_camera()]
     model = compile_model_with_cameras(scene, cameras)
-    sensor = MujocoCameraSensor(model, cameras, FakeIO())
+    sensor = MujocoCameraSensor(model, cameras, FakeIO(), ROBOT)
     opened = []
 
     def fake_renderer(_model, height, width):
@@ -518,7 +526,7 @@ def test_renderers_open_at_each_streams_own_size(scene, monkeypatch):
 def test_a_renderer_opened_before_a_failure_is_still_closed(scene, monkeypatch):
     cameras = [color_camera(), rgbd_camera()]
     model = compile_model_with_cameras(scene, cameras)
-    sensor = MujocoCameraSensor(model, cameras, FakeIO())
+    sensor = MujocoCameraSensor(model, cameras, FakeIO(), ROBOT)
     opened = []
 
     def fail_on_the_second(_model, height, width):
@@ -555,7 +563,7 @@ def test_background_depth_publishes_as_invalid(scene, clock):
 def test_a_wedged_renderer_surfaces_on_the_physics_thread(scene, monkeypatch, clock):
     """A renderer that blocks raises nothing, so only the heartbeat catches it."""
     model = compile_model_with_cameras(scene, [color_camera()])
-    sensor = MujocoCameraSensor(model, [color_camera()], FakeIO())
+    sensor = MujocoCameraSensor(model, [color_camera()], FakeIO(), ROBOT)
     wedged = threading.Event()
     release = threading.Event()
 
@@ -584,7 +592,7 @@ def test_a_wedged_renderer_surfaces_on_the_physics_thread(scene, monkeypatch, cl
 
 def test_a_dead_renderer_surfaces_on_the_physics_thread(scene, monkeypatch):
     model = compile_model_with_cameras(scene, [color_camera()])
-    sensor = MujocoCameraSensor(model, [color_camera()], FakeIO())
+    sensor = MujocoCameraSensor(model, [color_camera()], FakeIO(), ROBOT)
 
     def explode(*_args, **_kwargs):
         raise RuntimeError("no GL context")
@@ -600,7 +608,7 @@ def test_a_dead_renderer_surfaces_on_the_physics_thread(scene, monkeypatch):
 def test_stop_closes_every_renderer_it_opened(scene, monkeypatch):
     cameras = [color_camera(), rgbd_camera()]
     model = compile_model_with_cameras(scene, cameras)
-    sensor = MujocoCameraSensor(model, cameras, FakeIO())
+    sensor = MujocoCameraSensor(model, cameras, FakeIO(), ROBOT)
     opened = []
     running = threading.Event()
 
@@ -630,7 +638,7 @@ def test_stop_clears_the_heartbeat_so_shutdown_is_not_a_wedged_renderer(
     step, so an orderly shutdown would surface as a renderer fault."""
     model = compile_model_with_cameras(scene, [color_camera()])
     monkeypatch.setattr(mujoco, "Renderer", lambda _model, h, w: FakeRenderer(h, w))
-    sensor = MujocoCameraSensor(model, [color_camera()], FakeIO())
+    sensor = MujocoCameraSensor(model, [color_camera()], FakeIO(), ROBOT)
     sensor.snapshot(np.zeros(model.nq))
     sensor.start()
     sensor.stop()

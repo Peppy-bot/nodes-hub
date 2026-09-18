@@ -27,12 +27,15 @@ because nothing here can guess which leader a follower was missing. Pairing
 the two sides by position (rather than by instance) is what lets one leader
 instance drive every limb, which is the shape the openarm backbone has.
 
-A limb is named after the follower instance observed for it, and dimension
-names are that name plus a joint index (`left_arm_inst_j0`); a gripper's
-single dimension names the quantity its feature carries
-(`left_gripper_inst_opening` in state, `left_gripper_inst_effort` in efforts). An
-instance that follows several pairings of one kind takes the observed link
-into its name to stay distinct. Joint counts and which optional vectors
+A limb is named after the link of the pairing its command travels on, the
+backbone's end, and dimension names are that name plus a joint index
+(`left_arm_link_j0`); a gripper's single dimension names the quantity its
+feature carries (`left_gripper_link_opening` in state,
+`left_gripper_link_effort` in efforts).
+What answers for a limb plays no part in its name: a physical OpenArm answers
+from a driver per limb and a simulated one from one simulation for all four,
+and both record the same columns. Two limbs commanded on one link are
+refused at startup. Joint counts and which optional vectors
 (velocities, efforts) a source delivers are discovered from its first message.
 See `peppy.json5` for the parameter reference.
 

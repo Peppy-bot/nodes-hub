@@ -18,17 +18,14 @@
       // the panel reads on demand to list what is spawned. The rest are
       // capabilities a launch may leave vacant: the panel shows a lighting
       // panel, a materials panel and a camera panel only for the
-      // capabilities that are bound, and lists in the camera panel the
-      // cameras whose relays are linked here, matching each camera to its
-      // profile by the instance that serves both.
+      // capabilities that are bound, and lists in the camera panel every
+      // camera the simulation renders, of every robot standing in it.
       contracts: [
         { name: "scene_manipulation", tag: "v1", link_id: "simulation" },
         { name: "object_state", tag: "v1", link_id: "objects" },
         { name: "scene_lighting", tag: "v1", link_id: "lighting", cardinality: "zero_or_one" },
         { name: "scene_materials", tag: "v1", link_id: "materials", cardinality: "zero_or_one" },
-        { name: "rgb_camera", tag: "v1", link_id: "color_cameras", cardinality: "zero_or_more" },
-        { name: "rgbd_camera", tag: "v1", link_id: "rgbd_cameras", cardinality: "zero_or_more" },
-        { name: "camera_profile", tag: "v1", link_id: "camera_profiles", cardinality: "zero_or_more" },
+        { name: "sim_camera_control", tag: "v1", link_id: "cameras", cardinality: "zero_or_one" },
       ],
     },
   },
@@ -44,6 +41,10 @@
           link_id: "objects",
           name: "get_object_states",
         },
+        {
+          link_id: "simulation",
+          name: "get_robots_list",
+        },
         { link_id: "lighting", name: "get_lighting" },
         { link_id: "lighting", name: "set_light_intensity" },
         { link_id: "lighting", name: "set_light_color" },
@@ -56,20 +57,14 @@
         { link_id: "materials", name: "set_material_color" },
         { link_id: "materials", name: "set_material_finish" },
         { link_id: "materials", name: "reset_materials" },
-        { link_id: "color_cameras", name: "video_stream_info" },
-        { link_id: "color_cameras", name: "set_exposure" },
-        { link_id: "color_cameras", name: "set_white_balance" },
-        { link_id: "color_cameras", name: "set_gain" },
-        { link_id: "color_cameras", name: "set_brightness" },
-        { link_id: "color_cameras", name: "set_contrast" },
-        { link_id: "rgbd_cameras", name: "video_stream_info" },
-        { link_id: "rgbd_cameras", name: "set_color_exposure" },
-        { link_id: "rgbd_cameras", name: "set_color_white_balance" },
-        { link_id: "rgbd_cameras", name: "set_color_gain" },
-        { link_id: "rgbd_cameras", name: "set_color_brightness" },
-        { link_id: "rgbd_cameras", name: "set_color_contrast" },
-        { link_id: "camera_profiles", name: "get_camera_profile" },
-        { link_id: "camera_profiles", name: "reset_camera" },
+        { link_id: "cameras", name: "get_cameras" },
+        { link_id: "cameras", name: "describe_camera" },
+        { link_id: "cameras", name: "set_camera_exposure" },
+        { link_id: "cameras", name: "set_camera_white_balance" },
+        { link_id: "cameras", name: "set_camera_gain" },
+        { link_id: "cameras", name: "set_camera_brightness" },
+        { link_id: "cameras", name: "set_camera_contrast" },
+        { link_id: "cameras", name: "reset_camera" },
       ],
     },
 

@@ -11,7 +11,7 @@ import pytest
 
 _ROBOT_DIR = Path(__file__).resolve().parents[1] / "robots" / "openarm"
 _PERIOD = 1.0 / 60
-_PHASES = ["update", "bridge", "runtime", "scene", "forces", "targets"]
+_PHASES = ["update", "bridge", "runtime", "scene", "edits", "forces"]
 _MAIN_RATE_LIMIT_ENABLED = "/app/runLoops/main/rateLimitEnabled"
 _RENDER_MODE = "/rtx/rendermode"
 _ANTI_ALIASING_OP = "/rtx/post/aa/op"
@@ -45,7 +45,7 @@ def loop(monkeypatch):
         commander=Mock(),
         scene=Mock(),
         timeline=Mock(),
-        settings=Mock(spec=["get", "get_as_bool", "set_bool"]),
+        settings=Mock(spec=["get", "get_as_bool", "set", "set_bool"]),
         settings_values={_MAIN_RATE_LIMIT_ENABLED: False},
         # What Kit reports it renders with; the launch asked for exactly this.
         render_values={_RENDER_MODE: "RealTimePathTracing", _ANTI_ALIASING_OP: 3},
@@ -76,6 +76,11 @@ def loop(monkeypatch):
     state.settings.get_as_bool.side_effect = get_as_bool
     state.settings.set_bool.side_effect = set_bool
     state.settings.get.side_effect = lambda key: state.render_values[key]
+    # Camera capture reads its annotators right after each update, so the
+    # launch turns async rendering off for every run.
+    state.settings.set.side_effect = lambda key, value: state.settings_values.__setitem__(
+        key, value
+    )
 
     monkeypatch.setattr(module.time, "monotonic", lambda: state.now)
     monkeypatch.setattr(module.time, "sleep", Mock(side_effect=AssertionError("use Event.wait")))
@@ -116,22 +121,26 @@ def loop(monkeypatch):
     bridge.step.side_effect = step
     state.commander.process_pending.side_effect = lambda launcher: phase("runtime")
     state.scene.process_pending.side_effect = lambda launcher: phase("scene")
+    # The stage and the robots that join it are the world's business; the
+    # launcher is handed one, along with the queue of joins and departures it
+    # drains on its own thread.
+    state.world = Mock()
+    state.edits = Mock()
+    state.edits.drain.side_effect = lambda: phase("edits")
     state.launcher = module.SimLauncher(
         state.app,
-        Path("/robot.usd"),
+        state.world,
+        state.edits,
+        bridge,
         state.ready,
         state.stop,
         object(),
         state.scene,
-        state_rate_hz=17,
-        cameras_enabled=False,
         frame_rate_hz=60,
         render_mode="RealTimePathTracing",
         anti_aliasing=3,
-        head_camera_pack=None,
     )
     monkeypatch.setattr(state.launcher, "_update_runtime_forces", lambda: phase("forces"))
-    monkeypatch.setattr(state.launcher, "_apply_runtime_arm_targets", lambda: phase("targets"))
     state.launcher._extension = bridge
 
     # Stub engine startup, not the loop or its cleanup path. No sockets or
@@ -149,44 +158,6 @@ def loop(monkeypatch):
     state.timeline.stop.side_effect = lambda: state.trace.append("timeline.stop")
     state.app.close.side_effect = lambda: state.trace.append("app.close")
     return state
-
-
-def test_stage_load_attaches_the_head_camera_pack_to_the_opened_robot(loop, monkeypatch, tmp_path):
-    # The stage load is the real method here: it opens the robot USD, then puts
-    # the staged pack under the robot's pedestal link, checked against the
-    # chest camera config; a robot without a pack opens its stage alone.
-    monkeypatch.delattr(loop.launcher, "_load_stage")
-    usd = tmp_path / "robot.usd"
-    usd.write_bytes(b"stage")
-    trace = []
-    stage = object()
-    context = Mock()
-    context.get_stage.return_value = stage
-    context.open_stage.side_effect = lambda path: trace.append(("open", path))
-    omni = ModuleType("omni")
-    omni.usd = ModuleType("omni.usd")
-    omni.usd.get_context = Mock(return_value=context)
-    monkeypatch.setitem(sys.modules, "omni", omni)
-    monkeypatch.setitem(sys.modules, "omni.usd", omni.usd)
-
-    def attach(*args):
-        trace.append(("attach",) + args)
-        return "/openarm/openarm_body_link0/openarm_head_camera"
-
-    monkeypatch.setattr(loop.module.head_camera, "attach", Mock(side_effect=attach))
-    loop.launcher._usd_path = usd
-    loop.launcher._head_camera_pack = tmp_path / "head_camera"
-
-    loop.launcher._load_stage()
-    assert trace == [
-        ("open", str(usd)),
-        ("attach", stage, "/openarm", tmp_path / "head_camera", _ROBOT_DIR / "config" / "cameras.json5"),
-    ]
-
-    trace.clear()
-    loop.launcher._head_camera_pack = None
-    loop.launcher._load_stage()
-    assert trace == [("open", str(usd))]
 
 
 def test_settings_interface_is_cached_on_the_loop_thread_without_redundant_writes(loop):
@@ -226,8 +197,9 @@ def test_streamer_limiter_resets_are_cleared_before_the_next_update(loop, reset_
             expected.append(("write", False))
         expected.append(("update",))
     assert loop.settings_trace == expected
-    # The render check before the loop fetches the interface; the loop once more.
-    assert loop.settings_threads == [threading.main_thread()] * 2
+    # Camera capture and the render check each fetch the interface before the
+    # loop; the loop fetches it once more.
+    assert loop.settings_threads == [threading.main_thread()] * 3
     assert loop.settings.set_bool.call_count == len(reset_after_frames)
     loop.settings.set_bool.assert_called_with(_MAIN_RATE_LIMIT_ENABLED, False)
     assert loop.starts == pytest.approx([100.0 + i * _PERIOD for i in range(loop.frames)])
@@ -240,7 +212,7 @@ def test_initial_frame_is_immediate_and_orders_readiness_before_queues(loop):
 
     assert loop.starts == [100.0]
     assert loop.waits == []
-    assert loop.trace == ["update", "bridge", "ready", "runtime", "scene", "forces", "targets"]
+    assert loop.trace == ["update", "bridge", "ready", "runtime", "scene", "edits", "forces"]
     loop.bridge.step.assert_called_once_with()
     loop.commander.process_pending.assert_called_once_with(loop.launcher)
     loop.scene.process_pending.assert_called_once_with(loop.launcher)
@@ -248,16 +220,16 @@ def test_initial_frame_is_immediate_and_orders_readiness_before_queues(loop):
 
 
 def test_whole_iteration_work_is_deducted_from_the_period(loop):
-    loop.costs.update(update=0.004, bridge=0.003, runtime=0.001, scene=0.002, forces=0.001, targets=0.001)
+    loop.costs.update(update=0.004, bridge=0.003, runtime=0.001, scene=0.002, forces=0.001)
     loop.launcher._run_loop()
 
     assert loop.starts == pytest.approx([100.0 + i * _PERIOD for i in range(3)])
-    assert loop.waits == pytest.approx([_PERIOD - 0.012] * 2)
+    assert loop.waits == pytest.approx([_PERIOD - 0.011] * 2)
     assert loop.bridge.step.call_count == 3
     loop.ready.set.assert_called_once_with()
     for phase in _PHASES:
         assert loop.trace.count(phase) == 3
-    assert loop.trace[-1] == "targets", "no sleep is appended to a finished frame"
+    assert loop.trace[-1] == "forces", "no sleep is appended to a finished frame"
 
 
 def test_readiness_waits_for_bridge_setup_but_queues_run_each_frame(loop):
@@ -265,7 +237,8 @@ def test_readiness_waits_for_bridge_setup_but_queues_run_each_frame(loop):
     loop.launcher._run_loop()
 
     assert loop.trace == (
-        _PHASES + ["wait", "update", "bridge", "ready", "runtime", "scene", "forces", "targets"]
+        _PHASES
+        + ["wait", "update", "bridge", "ready", "runtime", "scene", "edits", "forces"]
         + ["wait"] + _PHASES
     )
     loop.ready.set.assert_called_once_with()
@@ -285,7 +258,7 @@ def test_stalled_frame_resynchronizes_without_replaying_missed_steps(loop, stall
     assert loop.starts == pytest.approx([100.0, 100.25, 100.25 + _PERIOD])
     assert loop.waits == pytest.approx([_PERIOD])
     assert loop.bridge.step.call_count == 3
-    assert loop.trace[6:8] == ["targets", "update"], "overdue work does not wait"
+    assert loop.trace[6:8] == ["forces", "update"], "overdue work does not wait"
 
 
 def test_early_wait_return_rechecks_the_deadline(loop):
@@ -308,7 +281,7 @@ def test_early_wait_return_rechecks_the_deadline(loop):
 
     assert loop.starts == pytest.approx([100.0, 100.0 + _PERIOD])
     assert loop.waits == pytest.approx([_PERIOD, _PERIOD * 3 / 4])
-    assert loop.trace[6:10] == ["targets", "wait", "wait", "update"]
+    assert loop.trace[6:10] == ["forces", "wait", "wait", "update"]
     assert loop.bridge.step.call_count == 2
     assert loop.settings_trace == [
         ("read", False), ("update",), ("read", True), ("write", False), ("update",),
@@ -351,7 +324,9 @@ def test_shutdown_during_wait_prevents_an_extra_frame_and_closes_orderly(loop, e
     assert not loop.ready.is_set()
     assert loop.trace[-4:] == ["commander.stop", "bridge.shutdown", "timeline.stop", "app.close"]
     loop.app.close.assert_called_once_with()
-    loop.module.IsaacBridgeExtension.assert_called_once_with(loop.launcher._io, loop.scene, 17, False)
+    # The bridge is the one the node built around the world, and the
+    # launcher binds that bridge.
+    loop.bridge.bind.assert_called_once_with()
     assert loop.settings_trace == [("read", False), ("update",)]
     assert loop.settings_values[_MAIN_RATE_LIMIT_ENABLED] is True
     loop.settings.set_bool.assert_not_called()

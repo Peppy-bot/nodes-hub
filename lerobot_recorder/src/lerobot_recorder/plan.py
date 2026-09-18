@@ -8,13 +8,15 @@ source at the same position in its slot, which is what makes the launcher's
 binding order load-bearing.
 
 Pairing wire messages carry no joint names, so dataset dimension names derive
-from each limb's name plus joint index (left_arm_inst_j0,
-left_gripper_inst_opening); a limb is named after the follower instance observed
-for it. Joint counts and which optional vectors a source delivers are
-discovered from its first message and locked into the schema at the first
-episode. Each camera producer becomes one dataset image key derived from its
-instance id, in binding order. The plan's `action` entries name the sources
-recorded into LeRobot's action feature (peppy actions are unrelated).
+from each limb's name plus joint index (left_arm_link_j0,
+left_gripper_link_opening); a limb is named after the link of the pairing its
+command travels on, the backbone's end, which a physical robot and a simulated
+one share, so their datasets carry the same columns. Joint counts and which
+optional vectors a source delivers are discovered from its first message and
+locked into the schema at the first episode. Each camera producer becomes one
+dataset image key derived from its instance id, in binding order. The plan's
+`action` entries name the sources recorded into LeRobot's action feature
+(peppy actions are unrelated).
 """
 
 from __future__ import annotations
@@ -168,16 +170,18 @@ def read_bound_sources(node_runner) -> BoundSources:
     )
 
 
-def limb_name(used_names: set[str], source) -> str:
-    """Dataset name for one limb, from the follower instance observed for it.
-    An instance that follows several pairings of one kind takes the observed
-    link into the name, so the two limbs stay distinct."""
-    _core_node, instance_id, link_id = source_key(source)
-    name = sanitize_key(instance_id)
+def limb_name(used_names: set[str], command) -> str:
+    """Dataset name for one limb: the link of the pairing its command travels
+    on, the backbone's end. What answers for the limb (a driver per limb on a
+    physical robot, one simulation for all of a simulated robot's) plays no
+    part, so the two record the same columns. Two limbs commanded on one link
+    are refused."""
+    name = sanitize_key(command.source_link_id)
     if name in used_names:
-        name = sanitize_key(f"{instance_id}_{link_id}")
-    if name in used_names:
-        raise ValueError(f"two limbs both name themselves {name!r}")
+        raise ValueError(
+            f"two limbs both name themselves {name!r}: each limb's command needs a "
+            "pairing of its own"
+        )
     used_names.add(name)
     return name
 
@@ -195,7 +199,7 @@ def discover(bound: BoundSources) -> RecordingPlan:
                 f"commanded source of its own pairing, bound in the same order"
             )
         for measured, command in zip(measured_sources, commanded_sources, strict=True):
-            name = limb_name(limb_names, measured)
+            name = limb_name(limb_names, command)
             measured_entry = SourceEntry(key=source_key(measured), kind=kind, feature_key=name)
             command_entry = SourceEntry(key=source_key(command), kind=kind, feature_key=name)
             state.append(measured_entry)

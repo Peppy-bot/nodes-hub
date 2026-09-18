@@ -52,15 +52,15 @@ class FakeIO:
         self.depth_payloads = []
         self.delivers = delivers
 
-    def camera_timestamp_s(self):
+    def timestamp_s(self):
         return 123.0
 
-    def publish_color_frame(self, name, timestamp_s, frame_id, *rest):
-        self.frames.append((name, frame_id))
+    def publish_color_frame(self, robot, name, timestamp_s, frame_id, *rest):
+        self.frames.append((robot, name, frame_id))
         return self.delivers
 
-    def publish_rgbd_frames(self, name, timestamp_s, frame_id, align_mode, color, depth):
-        self.frames.append((name, frame_id))
+    def publish_rgbd_frames(self, robot, name, timestamp_s, frame_id, align_mode, color, depth):
+        self.frames.append((robot, name, frame_id))
         self.depth_payloads.append(depth)
         return self.delivers
 
@@ -91,7 +91,7 @@ def _sensor(throttled=True):
         depth=None,
     )
     io = FakeIO()
-    sensor = IsaacCameraSensor("/openarm", [camera], io)
+    sensor = IsaacCameraSensor("alpha", "/openarm", [camera], io)
     annotator = FakeAnnotator()
     render_product = FakeRenderProduct()
     sensor._annotators[("cam", "color")] = annotator
@@ -114,7 +114,7 @@ class TestThrottledCycle:
         assert io.frames == []
 
         sensor.step()
-        assert io.frames == [("cam", 0)]
+        assert io.frames == [("alpha", "cam", 0)]
         assert render_product.updates == [True, False]
 
     def test_empty_annotator_keeps_camera_armed(self, clock):
@@ -127,7 +127,7 @@ class TestThrottledCycle:
 
         annotator.make_valid()
         sensor.step()
-        assert io.frames == [("cam", 0)]
+        assert io.frames == [("alpha", "cam", 0)]
         assert render_product.updates == [True, False]
 
     def test_next_cycle_waits_for_the_pacer(self, clock):
@@ -135,7 +135,7 @@ class TestThrottledCycle:
         annotator.make_valid()
         for _ in range(3):
             sensor.step()
-        assert io.frames == [("cam", 0)]
+        assert io.frames == [("alpha", "cam", 0)]
 
         sensor.step()
         assert render_product.updates == [True, False]
@@ -143,7 +143,7 @@ class TestThrottledCycle:
         clock["t"] += 1.0 / _FPS
         for _ in range(3):
             sensor.step()
-        assert io.frames == [("cam", 0), ("cam", 1)]
+        assert io.frames == [("alpha", "cam", 0), ("alpha", "cam", 1)]
         assert render_product.updates == [True, False, True, False]
 
     def test_deadline_during_capture_does_not_double_arm(self, clock):
@@ -205,7 +205,7 @@ class TestUnthrottled:
         annotator.make_valid()
 
         sensor.step()
-        assert io.frames == [("cam", 0)]
+        assert io.frames == [("alpha", "cam", 0)]
         assert render_product.updates == []
         assert sensor._armed == set() and sensor._warming == set()
 
@@ -226,7 +226,7 @@ class TestRgbdCapture:
             ),
         )
         io = FakeIO()
-        sensor = IsaacCameraSensor("/openarm", [camera], io)
+        sensor = IsaacCameraSensor("alpha", "/openarm", [camera], io)
         color = FakeAnnotator()
         color.make_valid()
         depth = FakeAnnotator()
@@ -240,7 +240,7 @@ class TestRgbdCapture:
 
         for _ in range(3):
             sensor.step()
-        assert io.frames == [("rgbd", 0)]
+        assert io.frames == [("alpha", "rgbd", 0)]
         assert render_product.updates == [True, False]
         (_, _, _, payload) = io.depth_payloads[0]
         assert len(payload) == (_WIDTH // 2) * (_HEIGHT // 2) * 2

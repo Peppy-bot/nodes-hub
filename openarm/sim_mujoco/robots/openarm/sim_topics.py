@@ -3,15 +3,17 @@
 Bridges the physics thread (sync, runs the engine step in an executor) to the
 node_runner's asyncio loop, where peppygen pairing pub/sub lives. The engine
 plays the follower role of every limb's joint_link / gripper_link pairing, one
-slot per limb, so there is no id demux: consume tasks on the loop each hold one
-generated `subscribe()` subscription (gap-free, in-order) and keep the latest
-governed setpoint per limb in thread-safe slots; the physics thread reads those
-and publishes stamped measured state back up the same pair. The engine also
-plays the camera role of one sim_rgb_camera_link / sim_rgbd_camera_link
-pairing per robot-mounted camera, handing finished frames to the same loop and
-dropping a frame instead of queueing when its stream's previous publish is
-still in flight. Every hop is a generated peppygen pairing topic: no JSON, no
-raw peppylib.
+slot per limb: consume tasks on the loop each hold one generated
+`subscribe()` subscription (gap-free, in-order) and keep the latest governed
+setpoint per limb of the robot in thread-safe slots; the physics thread reads
+those and publishes the robot's stamped measured state back on its own pair.
+A pair carries the copy its robot attached under, which is what tells one
+robot's limbs from another's, and a pair of a robot the engine does not stand
+is left alone. The engine also plays the camera role of one
+sim_rgb_camera_link / sim_rgbd_camera_link pairing per robot-mounted camera,
+handing finished frames to the same loop and dropping a frame whose stream's
+previous publish is still in flight. Every hop is a generated peppygen
+pairing topic.
 
 When the deployment names this instance the publisher of a clock domain, the
 physics thread records its engine clock each step (`record_engine_time`, ahead
@@ -59,12 +61,16 @@ logger = logging.getLogger(__name__)
 # the same instant instead of differing by the wire's own clamp.
 _MIN_ENGINE_TIME_S = 1e-9
 
-# Left = 0, right = 1: the slot layout mirrors the arm_id / gripper_id
-# convention the rest of the stack uses for sides.
-_ARM_SLOTS = {0: (left_arm_setpoints, left_arm_states), 1: (right_arm_setpoints, right_arm_states)}
+# Limb slots are keyed by the name the model gives the limb, which is the
+# name the engine lists a robot's limbs under when it attaches and the name
+# sim_bridge.json5 writes.
+_ARM_SLOTS = {
+    "left": (left_arm_setpoints, left_arm_states),
+    "right": (right_arm_setpoints, right_arm_states),
+}
 _GRIPPER_SLOTS = {
-    0: (left_gripper_setpoints, left_gripper_states),
-    1: (right_gripper_setpoints, right_gripper_states),
+    "left": (left_gripper_setpoints, left_gripper_states),
+    "right": (right_gripper_setpoints, right_gripper_states),
 }
 # Camera slots are keyed by slot name (the camera's identity end to end: pairing
 # link_id here, relay instance_id and dataset key downstream).
@@ -80,7 +86,7 @@ COLOR_CAMERA_SLOT_NAMES = frozenset(_COLOR_CAMERA_SLOTS)
 RGBD_CAMERA_SLOT_NAMES = frozenset(_RGBD_CAMERA_SLOTS)
 
 # Publisher and guard keys, spelled once: a publisher is keyed by
-# (camera, topic) and a guard by (camera, surface).
+# (camera, topic) and a guard by (robot, camera, surface).
 _VIDEO_STREAM = "video_stream"
 _DEPTH_STREAM = "depth_stream"
 _STREAM_INFO = "stream_info"
@@ -157,16 +163,27 @@ class SimTopicIO:
     """Owns the typed pairing publishers + setpoint-consume tasks on the node
     loop, and exposes thread-safe accessors the physics thread calls each step."""
 
-    def __init__(self, node_runner: peppylib.NodeRunner, loop: asyncio.AbstractEventLoop) -> None:
+    def __init__(
+        self,
+        node_runner: peppylib.NodeRunner,
+        loop: asyncio.AbstractEventLoop,
+        robots,
+    ) -> None:
         self._node_runner = node_runner
         self._loop = loop
-        self._arm_pubs: dict[int, peppylib.TopicPublisher] = {}
-        self._gripper_pubs: dict[int, peppylib.TopicPublisher] = {}
-        self._arm_cmd = {side: _LatestSlot() for side in _ARM_SLOTS}
-        self._gripper_cmd = {side: _LatestSlot() for side in _GRIPPER_SLOTS}
-        # Camera publishers and their in-flight guards, keyed by (slot, topic).
-        self._camera_pubs: dict[tuple[str, str], peppylib.TopicPublisher] = {}
-        self._camera_guards: dict[tuple[str, str], _PublishGuard] = {}
+        # The robots in the scene, which is what a pair's copy names.
+        self._robots = robots
+        self._arm_pubs: dict[str, peppylib.PeerPublisher] = {}
+        self._gripper_pubs: dict[str, peppylib.PeerPublisher] = {}
+        # The latest setpoint of one limb of one robot, keyed by (limb, robot).
+        self._arm_cmd: dict[tuple[str, str], _LatestSlot] = {}
+        self._gripper_cmd: dict[tuple[str, str], _LatestSlot] = {}
+        self._cmd_lock = threading.Lock()
+        # Camera publishers and their in-flight guards, keyed by (slot, topic)
+        # and (robot, slot, surface); a publisher reaches every robot's camera
+        # on its slot, so the guard is per robot as well.
+        self._camera_pubs: dict[tuple[str, str], peppylib.PeerPublisher] = {}
+        self._camera_guards: dict[tuple[str, str, str], _PublishGuard] = {}
         self._tasks: list[asyncio.Task] = []
         # Set in start() when the deployment names this instance the
         # publisher of a clock domain.
@@ -183,8 +200,8 @@ class SimTopicIO:
 
     async def start(self) -> None:
         """Declare publishers and spawn the setpoint-consume loops. Runs on the
-        node loop before the sim thread starts. Publishing while a slot is
-        unpaired is a legal no-op, so bringup order never matters."""
+        node loop before the sim thread starts. A publish to a robot holding
+        no pair is dropped, so bringup order never matters."""
         # State timestamps read this instance's bound clock, the one its
         # consumers read too, so samples age on one timeline.
         await clock.init(self._node_runner)
@@ -219,7 +236,7 @@ class SimTopicIO:
         # Let the cancellations land so the consume loops exit before teardown.
         await asyncio.gather(*self._tasks, return_exceptions=True)
 
-    async def _consume_arm(self, topic, side: int) -> None:
+    async def _consume_arm(self, topic, side: str) -> None:
         subscription = await topic.subscribe(self._node_runner)
         while True:
             try:
@@ -235,18 +252,24 @@ class SimTopicIO:
                 logger.warning(f"{topic.LINK_ID} setpoint consume error: {exc}")
                 await asyncio.sleep(0.1)
                 continue
-            _peer, msg = pair
+            peer, msg = pair
+            robot = self._robot_of(topic, peer)
+            if robot is None:
+                continue
             # Drop a poisoned setpoint rather than writing NaN/Inf into the sim.
             if not all(math.isfinite(v) for v in msg.positions) or not all(
                 math.isfinite(v) for v in msg.velocities
             ):
-                logger.warning(f"dropping non-finite arm setpoint on {topic.LINK_ID}")
+                logger.warning(
+                    f"dropping non-finite arm setpoint for '{robot}' on {topic.LINK_ID}"
+                )
                 continue
-            if self._arm_cmd[side].get() is None:
-                logger.info(f"first arm setpoint on {topic.LINK_ID}")
-            self._arm_cmd[side].set((msg.positions, msg.velocities))
+            slot = self._command_slot(self._arm_cmd, side, robot)
+            if slot.get() is None:
+                logger.info(f"first arm setpoint for '{robot}' on {topic.LINK_ID}")
+            slot.set((msg.positions, msg.velocities))
 
-    async def _consume_gripper(self, topic, side: int) -> None:
+    async def _consume_gripper(self, topic, side: str) -> None:
         subscription = await topic.subscribe(self._node_runner)
         while True:
             try:
@@ -262,29 +285,96 @@ class SimTopicIO:
                 logger.warning(f"{topic.LINK_ID} setpoint consume error: {exc}")
                 await asyncio.sleep(0.1)
                 continue
-            _peer, msg = pair
+            peer, msg = pair
+            robot = self._robot_of(topic, peer)
+            if robot is None:
+                continue
             if not (
                 math.isfinite(msg.opening)
                 and math.isfinite(msg.max_effort)
                 and msg.max_effort >= 0.0
             ):
-                logger.warning(f"dropping unusable gripper setpoint on {topic.LINK_ID}")
+                logger.warning(
+                    f"dropping unusable gripper setpoint for '{robot}' on {topic.LINK_ID}"
+                )
                 continue
             # max_effort caps the finger drive effort in engine units; 0
             # (unset on the wire) leaves the engine's own force ceiling.
-            if self._gripper_cmd[side].get() is None:
-                logger.info(f"first gripper setpoint on {topic.LINK_ID}")
-            self._gripper_cmd[side].set((msg.opening, msg.max_effort))
+            slot = self._command_slot(self._gripper_cmd, side, robot)
+            if slot.get() is None:
+                logger.info(f"first gripper setpoint for '{robot}' on {topic.LINK_ID}")
+            slot.set((msg.opening, msg.max_effort))
+
+    # --- the robot a pair belongs to ---
+
+    def _robot_of(self, module, peer) -> Optional[str]:
+        """The robot whose limb this pair drives: the copy the pair carries,
+        which is the name that robot attached under. A pair with no copy is a
+        robot launched outside one, and outside a copy there is one robot in
+        the scene for it to belong to."""
+        for member in module.peers(self._node_runner):
+            if member.info == peer:
+                return member.copy or self._robots.sole_name()
+        return None
+
+    def _peer_of(self, module, robot: str):
+        """The pair this robot's limb reaches, or None while it holds none."""
+        for member in module.peers(self._node_runner):
+            if (member.copy or self._robots.sole_name()) == robot:
+                return member.info
+        return None
+
+    def _command_slot(self, slots: dict, limb: str, robot: str) -> "_LatestSlot":
+        with self._cmd_lock:
+            return slots.setdefault((limb, robot), _LatestSlot())
+
+    def paired_robots(self) -> dict[str, set[str]]:
+        """The robots holding a pair on each limb slot, by limb slot. Read on
+        the node loop and on the physics thread, which is what keeps a robot
+        in the scene."""
+        held: dict[str, set[str]] = {}
+        for side, (setpoints, _) in (*_ARM_SLOTS.items(), *_GRIPPER_SLOTS.items()):
+            names = set()
+            for member in setpoints.peers(self._node_runner):
+                name = member.copy or self._robots.sole_name()
+                if name is not None:
+                    names.add(name)
+            held[setpoints.LINK_ID] = names
+        return held
+
+    def robots_with_every_limb(self) -> set[str]:
+        """The robots holding a pair on every limb slot: their setpoints
+        reach the engine and their state reaches them, which is what a robot
+        asks about when it asks whether it is ready."""
+        held = list(self.paired_robots().values())
+        if not held:
+            return set()
+        return set.intersection(*held)
+
+    def robots_with_any_limb(self) -> set[str]:
+        """Every robot holding at least one limb pair."""
+        held = list(self.paired_robots().values())
+        return set().union(*held) if held else set()
 
     # --- called from the physics thread ---
 
-    def latest_arm_command(self, arm_id: int) -> Optional[tuple[list[float], list[float]]]:
-        slot = self._arm_cmd.get(arm_id)
+    def latest_arm_command(
+        self, robot: str, arm: str
+    ) -> Optional[tuple[list[float], list[float]]]:
+        slot = self._arm_cmd.get((arm, robot))
         return slot.get() if slot is not None else None
 
-    def latest_gripper_command(self, gripper_id: int) -> Optional[tuple[float, float]]:
-        slot = self._gripper_cmd.get(gripper_id)
+    def latest_gripper_command(self, robot: str, gripper: str) -> Optional[tuple[float, float]]:
+        slot = self._gripper_cmd.get((gripper, robot))
         return slot.get() if slot is not None else None
+
+    def forget(self, robot: str) -> None:
+        """Drops what a robot that left the scene had commanded, so a robot
+        rejoining under the same name starts from its model's pose."""
+        with self._cmd_lock:
+            for slots in (self._arm_cmd, self._gripper_cmd):
+                for key in [key for key in slots if key[1] == robot]:
+                    del slots[key]
 
     def record_engine_time(self, engine_time_s: float) -> None:
         """Adopt this step's engine clock for every stamp this engine emits.
@@ -347,7 +437,7 @@ class SimTopicIO:
         if latched_ns is not None:
             self._publish_clock_tick_on_loop(latched_ns)
 
-    def _timestamp_s(self) -> float:
+    def timestamp_s(self) -> float:
         """The instant this engine stamps its own state with: its engine clock
         while it publishes a clock domain, its bound clock otherwise. A
         publisher's stamp is the instant it committed, which is the instant
@@ -361,32 +451,32 @@ class SimTopicIO:
             )
         return engine_time_s
 
-    def publish_arm_states(self, arm_id: int, positions: list[float], velocities: list[float]) -> None:
-        pub = self._arm_pubs.get(arm_id)
+    def publish_arm_states(
+        self, robot: str, arm: str, positions: list[float], velocities: list[float]
+    ) -> None:
+        pub = self._arm_pubs.get(arm)
         if pub is not None:
             # Efforts are empty: the engine measures no joint torques.
-            payload = _ARM_SLOTS[arm_id][1].build_message(
-                self._timestamp_s(), positions, velocities, []
+            payload = _ARM_SLOTS[arm][1].build_message(
+                self.timestamp_s(), positions, velocities, []
             )
-            self._schedule_publish(pub, payload)
+            self._schedule_publish(pub, _ARM_SLOTS[arm][0], robot, payload)
 
-    def publish_gripper_states(self, gripper_id: int, opening: float, force: float = 0.0) -> None:
-        pub = self._gripper_pubs.get(gripper_id)
+    def publish_gripper_states(
+        self, robot: str, gripper: str, opening: float, force: float = 0.0
+    ) -> None:
+        pub = self._gripper_pubs.get(gripper)
         if pub is not None:
             # The engine torque rides as the pairing effort; the ceiling is 0
             # (no effort control).
-            payload = _GRIPPER_SLOTS[gripper_id][1].build_message(
-                self._timestamp_s(), opening, force, 0.0
+            payload = _GRIPPER_SLOTS[gripper][1].build_message(
+                self.timestamp_s(), opening, force, 0.0
             )
-            self._schedule_publish(pub, payload)
-
-    def camera_timestamp_s(self) -> float:
-        """Capture timestamp on this engine's timeline, taken once per capture
-        so an rgbd color + depth pair shares one timestamp."""
-        return self._timestamp_s()
+            self._schedule_publish(pub, _GRIPPER_SLOTS[gripper][0], robot, payload)
 
     def publish_color_frame(
         self,
+        robot: str,
         name: str,
         timestamp_s: float,
         frame_id: int,
@@ -403,17 +493,24 @@ class SimTopicIO:
             height,
             frame,
         )
-        return self._publish_guarded(name, _FRAMES_SURFACE, [(_VIDEO_STREAM, payload)])
+        return self._publish_guarded(robot, name, _FRAMES_SURFACE, [(_VIDEO_STREAM, payload)])
 
     def publish_color_stream_info(
-        self, name: str, width: int, height: int, frames_per_second: int, encoding: str
+        self,
+        robot: str,
+        name: str,
+        width: int,
+        height: int,
+        frames_per_second: int,
+        encoding: str,
     ) -> None:
         _, info = _COLOR_CAMERA_SLOTS[name]
         payload = info.build_message(width, height, frames_per_second, encoding)
-        self._publish_guarded(name, _INFO_SURFACE, [(_STREAM_INFO, payload)])
+        self._publish_guarded(robot, name, _INFO_SURFACE, [(_STREAM_INFO, payload)])
 
     def publish_rgbd_frames(
         self,
+        robot: str,
         name: str,
         timestamp_s: float,
         frame_id: int,
@@ -442,6 +539,7 @@ class SimTopicIO:
             depth_frame,
         )
         return self._publish_guarded(
+            robot,
             name,
             _FRAMES_SURFACE,
             [(_VIDEO_STREAM, color_payload), (_DEPTH_STREAM, depth_payload)],
@@ -449,6 +547,7 @@ class SimTopicIO:
 
     def publish_rgbd_stream_info(
         self,
+        robot: str,
         name: str,
         width: int,
         height: int,
@@ -470,7 +569,7 @@ class SimTopicIO:
             depth_encoding,
             depth_unit,
         )
-        self._publish_guarded(name, _INFO_SURFACE, [(_STREAM_INFO, payload)])
+        self._publish_guarded(robot, name, _INFO_SURFACE, [(_STREAM_INFO, payload)])
 
     async def _declare_camera_publishers(
         self, name: str, topics: list[tuple[str, object]]
@@ -479,21 +578,44 @@ class SimTopicIO:
             self._camera_pubs[(name, topic_name)] = await module.declare_publisher(
                 self._node_runner
             )
-        for surface in (_FRAMES_SURFACE, _INFO_SURFACE):
-            self._camera_guards[(name, surface)] = _PublishGuard()
+
+    def _camera_guard(self, robot: str, name: str, surface: str) -> "_PublishGuard":
+        with self._cmd_lock:
+            return self._camera_guards.setdefault((robot, name, surface), _PublishGuard())
 
     def _publish_guarded(
-        self, name: str, surface: str, topic_payloads: list[tuple[str, bytes]]
+        self, robot: str, name: str, surface: str, topic_payloads: list[tuple[str, bytes]]
     ) -> bool:
-        """False when this surface's previous batch is still in flight, so the
-        caller knows the sample never reached a consumer."""
-        guard = self._camera_guards[(name, surface)]
-        if not guard.try_acquire(f"{name} {surface}"):
+        """One robot's camera batch, behind that robot's own guard on this
+        surface. False when the robot holds no pair on this camera's slot, so
+        there is nothing to publish to."""
+        camera = _COLOR_CAMERA_SLOTS.get(name) or _RGBD_CAMERA_SLOTS[name]
+        peer = self._peer_of(camera[0], robot)
+        if peer is None:
             return False
         publishes = [
             (self._camera_pubs[(name, topic_name)], payload)
             for topic_name, payload in topic_payloads
         ]
+        return self._publish_batch(
+            self._camera_guard(robot, name, surface),
+            f"'{robot}' {name} {surface}",
+            publishes,
+            peer=peer,
+        )
+
+    def _publish_batch(
+        self,
+        guard: _PublishGuard,
+        surface: str,
+        publishes: list[tuple[peppylib.TopicPublisher, bytes]],
+        peer=None,
+    ) -> bool:
+        """False when this surface's previous batch is still in flight, so the
+        caller knows the sample never reached a consumer. `peer` is the pair a
+        pairing publisher addresses; the scene's own streams have none."""
+        if not guard.try_acquire(surface):
+            return False
 
         def _publish() -> None:
             # Runs on the loop, so the counter needs no lock; the guard is
@@ -508,7 +630,9 @@ class SimTopicIO:
 
             for index, (pub, payload) in enumerate(publishes):
                 try:
-                    task = asyncio.ensure_future(pub.publish(payload))
+                    task = asyncio.ensure_future(
+                        pub.publish_to(peer, payload) if peer is not None else pub.publish(payload)
+                    )
                 except BaseException:
                     # This publish and every unscheduled one after it are over.
                     for _ in range(len(publishes) - index):
@@ -529,11 +653,22 @@ class SimTopicIO:
             return False
         return True
 
-    def _schedule_publish(self, publisher: peppylib.TopicPublisher, payload: bytes) -> None:
+    def _schedule_publish(
+        self,
+        publisher: peppylib.PeerPublisher,
+        module,
+        robot: str,
+        payload: bytes,
+    ) -> None:
         # Hand the publish to the node loop and return immediately; the physics
-        # thread must never block on messaging.
+        # thread must never block on messaging. The pair this robot's limb
+        # reaches is read on the loop, so a publish to a robot whose pair ended
+        # between the step and the publish is dropped.
         def _publish() -> None:
-            task = asyncio.ensure_future(publisher.publish(payload))
+            peer = self._peer_of(module, robot)
+            if peer is None:
+                return
+            task = asyncio.ensure_future(publisher.publish_to(peer, payload))
             task.add_done_callback(_log_publish_error)
 
         try:

@@ -102,9 +102,10 @@ type Forwarded<T> = std::result::Result<T, String>;
 
 /// The camera slot this relay views, as the simulation names it: the link id
 /// of the peer slot on the simulation pairing. The simulation renders each
-/// camera on a slot of its own and its response model keys every control on
-/// that slot's name, so the pairing peer is the camera's whole identity and
-/// the relay carries no id of its own.
+/// robot's camera on a pair of that slot and its response model keys every
+/// control on the slot and the pair the caller holds, so the pairing is the
+/// camera's whole identity and the relay carries no id of its own: its
+/// requests name no robot.
 fn camera_slot(runner: &NodeRunner) -> Forwarded<String> {
     match simulation_video::paired(runner) {
         Ok(Some(peer)) => Ok(peer.peer_link_id),
@@ -364,7 +365,8 @@ macro_rules! spawn_forwarding_control {
                 let answer = route.forward(
                     $control::bound_producer(&route.runner),
                     |camera, target| async move {
-                        let request = $control::Request::new(camera $(, $field)*);
+                        let request =
+                            $control::Request::new(String::new(), camera $(, $field)*);
                         $control::poll(&route.runner, &target, CONTROL_TIMEOUT, request)
                             .await
                             .map(|response| response.data)

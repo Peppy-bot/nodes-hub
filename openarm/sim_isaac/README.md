@@ -12,11 +12,7 @@ This branch is intended for reproducibility testing and community feedback. It p
 - Headless WebRTC streaming
 - Runtime TCP commander on port `5556`
 - Whole-robot root repositioning
-- Runtime 7-DOF arm targets
 - Runtime USD spawn / move / remove
-- Runtime task scenes:
-  - `tabletop`
-  - `shelf_reach`
 - Detailed OpenArm v2 visual meshes with their embedded materials
 - The OpenArm v2 head camera, the ZED Mini on its bracket under the head cover,
   from Enactic's CAD
@@ -82,17 +78,19 @@ peppy node run \
   --idle-timeout 1800 \
   --max-timeout 7200 \
   openarm_sim_isaac:v1 \
-  hardware_version=v2 \
+  cameras_enabled=false \
   state_rate_hz=50 \
   headless=true
 ```
+
+A robot names its generation on its own initializer when it joins.
 
 ## Runtime and Performance
 
 Both headless and windowed launches use the packaged
 `robots/openarm/config/openarm.sim.kit` experience with physics, USD/RTX rendering
-and viewport controls. Headless mode enables WebRTC; `cameras_enabled=true`
-enables Replicator for robot camera capture. Extensions resolve from the Isaac Sim
+and viewport controls. Headless mode enables WebRTC; a robot that pairs a
+camera has one rendered for it through Replicator. Extensions resolve from the Isaac Sim
 installation, with settings persistence and extension-registry lookup disabled.
 Runtime scenes and props use `isaacsim.storage.native`'s default Isaac 6.1 asset
 root; `PEPPY_ROBOT_ASSETS_DIR` selects the robot USD directory.
@@ -138,90 +136,24 @@ deliberate pacing waits.
 
 ## Runtime Commander
 
-From the repository root:
+The TCP commander on port `5556` takes one JSON command per line. A robot
+is moved by the name it joined under:
 
-```bash
-python3 commander.py --help
+```json
+{"command": "move_robot_root", "robot": "alpha", "position": [1.5, 0.0, 0.0]}
 ```
 
-List joints:
-
-```bash
-python3 commander.py joints
-```
-
-Move the complete OpenArm root:
-
-```bash
-python3 commander.py robot 1.5 0.0 0.0
-```
-
-Command one arm with seven joint targets in radians:
-
-```bash
-python3 commander.py arm left 0 -0.10 0 -0.15 0 0.10 0
-python3 commander.py arm right 0 0.10 0 0.15 0 -0.10 0
-```
-
-Release runtime arm override:
-
-```bash
-python3 commander.py release left
-python3 commander.py release right
-```
-
-## Runtime Scenes
-
-### Tabletop
-
-```bash
-python3 commander.py scene tabletop
-```
-
-Creates an amber table, red cube end blue tray relative to the current OpenArm pose.
-
-Remove it:
-
-```bash
-python3 commander.py remove Tabletop
-```
-
-### Shelf Reach
-
-```bash
-python3 commander.py scene shelf_reach
-```
-
-Creates a multi-level reachability shelf with coloured cubes positioned in front of the current OpenArm pose.
-
-Remove it:
-
-```bash
-python3 commander.py remove ShelfReach
-```
+A robot's arms are driven through its own backbone over the limb pairings;
+the scene commander's `move_robot` reaches the same command.
 
 ## Runtime USD Loading
 
-Spawn arbitrary USD asset:
+Spawn a USD asset, move it, remove it, over the TCP commander:
 
-```bash
-python3 commander.py spawn \
-  MyObject \
-  /absolute/path/to/object.usd \
-  1.0 0.0 0.8 \
-  --scale 1.0
-```
-
-Move it:
-
-```bash
-python3 commander.py move MyObject 1.2 0.2 0.8
-```
-
-Remove it:
-
-```bash
-python3 commander.py remove MyObject
+```json
+{"command": "spawn_usd", "name": "MyObject", "path": "/absolute/path/to/object.usd", "position": [1.0, 0.0, 0.8], "scale": 1.0}
+{"command": "move_object", "name": "MyObject", "position": [1.2, 0.2, 0.8]}
+{"command": "remove", "name": "MyObject"}
 ```
 
 The USD path must be accessible from the running Isaac Sim container.
@@ -289,13 +221,13 @@ the lens barrels, and provenance. A pack is immutable, keyed by the SHA-256 of
 its inventory, and `robots/openarm/head_camera.py` pins that digest. The
 `apptainer.def` stages the pack at image build into
 `robots/openarm/openarm/assets/head_camera`, the index checked against the
-digest and every file against the index, and the launcher checks it again at
-every start. At stage load the launcher puts the meshes under
-`openarm_body_link0`, the chest camera's parent, in the same matte black as the
-arm links, with the hull as that link's collider. The chest camera of
-`config/cameras.json5` must sit at the pack's left lens front, the eye the real
-ZED's rectified stream comes from, and the launcher refuses to start otherwise.
-A v1 robot has no head camera.
+digest and every file against the index, and node setup checks it again and
+reads its meshes at every start. Each v2 robot that joins gets the meshes
+under its own `openarm_body_link0`, the chest camera's parent, in the same
+matte black as the arm links, with the hull as that link's collider. The
+chest camera of `config/cameras.json5` must sit at the pack's left lens front,
+the eye the real ZED's rectified stream comes from, and the node refuses to
+start otherwise. A v1 robot has no head camera.
 
 A native run stages the pack by hand:
 

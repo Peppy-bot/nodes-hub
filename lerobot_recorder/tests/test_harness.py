@@ -39,7 +39,7 @@ FRAME = bytes([64, 96, 128]) * (W * H)  # bgr8: raw on the wire, no encoder need
 OBSERVED = "mock-core/mock-observed_joints-0/mock_source"
 COMMANDED = "mock-core/mock-commanded_joints-0/mock_source"
 CAMERA = "mock-core/mock-color_cameras-0"
-LIMB = "mock_observed_joints_0"
+LIMB = "mock_source"
 
 
 def params(tmp_path) -> Parameters:
@@ -165,8 +165,8 @@ async def test_boot_pairs_one_limb_and_refuses_goals_while_sources_are_silent(tm
         assert "has not produced yet" in goal.reason
 
         # The session opened during setup, from the seeded membership: the
-        # provenance names the limb after the follower instance and maps both
-        # of the pairing's sources onto it.
+        # provenance names the limb after the link its command travels on and
+        # maps both of the pairing's sources onto it.
         (session_dir,) = session_dirs(tmp_path)
         provenance = json.loads((session_dir / "session.json").read_text())
         assert provenance["state_links"] == {OBSERVED: LIMB}

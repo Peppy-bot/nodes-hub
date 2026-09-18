@@ -52,13 +52,13 @@ def bimanual() -> BoundSources:
     )
 
 
-def test_limbs_are_named_after_their_follower_joints_first():
+def test_limbs_are_named_after_the_pairing_their_command_travels_on():
     plan = discover(bimanual())
     assert [e.feature_key for e in plan.state] == [
-        "left_arm_inst",
-        "right_arm_inst",
-        "left_gripper_inst",
-        "right_gripper_inst",
+        "left_arm_link",
+        "right_arm_link",
+        "left_gripper_link",
+        "right_gripper_link",
     ]
     assert [e.kind for e in plan.state] == [
         LinkKind.JOINT,
@@ -69,11 +69,32 @@ def test_limbs_are_named_after_their_follower_joints_first():
     # The action records the same limbs under the same names, so a dataset's
     # state and action dimensions line up.
     assert [e.feature_key for e in plan.action] == [
-        "left_arm_inst",
-        "right_arm_inst",
-        "left_gripper_inst",
-        "right_gripper_inst",
+        "left_arm_link",
+        "right_arm_link",
+        "left_gripper_link",
+        "right_gripper_link",
     ]
+
+
+def test_a_simulated_robot_records_the_columns_a_physical_one_does():
+    """A simulated robot's four limbs all answer from one simulation instance,
+    each on its own slot; a physical robot's answer from a driver each. Both
+    are commanded on the backbone's four limb links, so both datasets carry
+    the same columns, which is what lets a policy trained on one run on the
+    other."""
+    simulated = discover(bind(
+        joints=(
+            [source("simulation_inst", "left_arm"), source("simulation_inst", "right_arm")],
+            [source("backbone_inst", "left_arm_link"), source("backbone_inst", "right_arm_link")],
+        ),
+        grippers=(
+            [source("simulation_inst", "left_gripper"), source("simulation_inst", "right_gripper")],
+            [source("backbone_inst", "left_gripper_link"), source("backbone_inst", "right_gripper_link")],
+        ),
+    ))
+    physical = discover(bimanual())
+    assert [e.feature_key for e in simulated.state] == [e.feature_key for e in physical.state]
+    assert [e.feature_key for e in simulated.action] == [e.feature_key for e in physical.action]
 
 
 def test_commanded_sources_sharing_an_instance_stay_distinct():
@@ -103,8 +124,8 @@ def test_a_robot_the_launcher_bound_differently_records_what_it_has():
     plan = discover(
         bind(joints=([source("arm_inst")], [source("leader_inst", "arm_link")]))
     )
-    assert [e.feature_key for e in plan.state] == ["arm_inst"]
-    assert [e.feature_key for e in plan.action] == ["arm_inst"]
+    assert [e.feature_key for e in plan.state] == ["arm_link"]
+    assert [e.feature_key for e in plan.action] == ["arm_link"]
 
 
 def test_copies_keep_separate_dataset_dimensions_and_fallbacks():
@@ -114,8 +135,9 @@ def test_copies_keep_separate_dataset_dimensions_and_fallbacks():
         plan = discover(bind(grippers=(
             [source(follower)], [source(backbone, "left_gripper_link")],
         )))
-        assert [entry.feature_key for entry in plan.state] == [follower]
-        assert [entry.feature_key for entry in plan.action] == [follower]
+        # A copy records its own dataset, so the columns carry no copy name.
+        assert [entry.feature_key for entry in plan.state] == ["left_gripper_link"]
+        assert [entry.feature_key for entry in plan.action] == ["left_gripper_link"]
         assert plan.action_fallback == {
             (CORE, backbone, "left_gripper_link"): (CORE, follower, "link"),
         }
@@ -134,17 +156,17 @@ def test_unpairable_bindings_are_refused():
         discover(bound)
 
 
-def test_one_instance_following_two_pairings_names_both():
+def test_limbs_commanded_on_one_backbone_are_told_apart_by_link():
     used: set[str] = set()
-    first = limb_name(used, source("arm_inst", "left"))
-    second = limb_name(used, source("arm_inst", "right"))
-    assert (first, second) == ("arm_inst", "arm_inst_right")
+    first = limb_name(used, source("backbone_inst", "left_arm_link"))
+    second = limb_name(used, source("backbone_inst", "right_arm_link"))
+    assert (first, second) == ("left_arm_link", "right_arm_link")
 
 
-def test_a_name_that_cannot_be_made_unique_is_refused():
-    used = {"arm_inst", "arm_inst_left"}
-    with pytest.raises(ValueError, match="both name themselves"):
-        limb_name(used, source("arm_inst", "left"))
+def test_two_limbs_commanded_on_one_link_are_refused():
+    used = {"left_arm_link"}
+    with pytest.raises(ValueError, match="both name themselves 'left_arm_link'"):
+        limb_name(used, source("backbone_inst", "left_arm_link"))
 
 
 def test_a_launch_with_no_limbs_is_refused():
@@ -191,4 +213,4 @@ def test_the_snapshot_is_immune_to_the_live_sets_moving_on():
     deliveries["joints_cmd"].clear()
 
     plan = discover(snapshot)
-    assert [e.feature_key for e in plan.state] == ["arm_inst"]
+    assert [e.feature_key for e in plan.state] == ["arm_link"]

@@ -139,6 +139,12 @@ def pack(tmp_path, monkeypatch):
     return SimpleNamespace(directory=directory, files=files, digest=digest, served=served)
 
 
+@pytest.fixture
+def loaded(pack):
+    """The staged pack as setup reads it."""
+    return head_camera.load(pack.directory, _CAMERAS_CONFIG)
+
+
 def _store(pack, served=None, requests=None):
     """An opener serving the pack's files from the store's URL layout, to a
     request that names its agent (the store's Cloudflare front refuses
@@ -305,6 +311,45 @@ class TestChestCamera:
             head_camera.check_chest_camera(_RIG, config)
 
 
+class TestLoad:
+    def test_reads_the_mount_origin_and_every_mesh(self, pack):
+        loaded = head_camera.load(pack.directory, _CAMERAS_CONFIG)
+        assert loaded.directory == pack.directory
+        assert loaded.body_position == (0.0315, 0.0, 0.743)
+        assert [name for name, _ in loaded.visuals] == list(head_camera.VISUAL_MESHES)
+        for i, (_, (positions, normals, triangles)) in enumerate(loaded.visuals):
+            assert positions == pytest.approx(_QUAD + i * 0.01)
+            assert [tuple(n) for n in normals] == _QUAD_NORMALS
+            assert triangles.tolist() == _QUAD_TRIANGLES
+        points, triangles = loaded.collision
+        assert (len(points), len(triangles)) == (4, 4)
+
+    def test_refuses_an_unstaged_pack(self, tmp_path):
+        with pytest.raises(FileNotFoundError, match="fetch"):
+            head_camera.load(tmp_path / "head_camera", _CAMERAS_CONFIG)
+
+    def test_refuses_a_pack_that_is_not_the_pinned_one(self, pack):
+        (pack.directory / "cover.obj").write_bytes(b"v 0 0 0\n")
+        with pytest.raises(ValueError, match="does not match the pack index"):
+            head_camera.load(pack.directory, _CAMERAS_CONFIG)
+
+    def test_refuses_a_pack_the_chest_camera_is_off(self, tmp_path, monkeypatch):
+        rig = copy.deepcopy(_RIG)
+        rig["cameras"]["left"]["position_m"] = [0.0794, 0.031497, 0.794103]
+        directory = tmp_path / "head_camera"
+        monkeypatch.setattr(head_camera, "PACK_DIGEST", _stage(directory, _pack_files(rig)))
+        with pytest.raises(RuntimeError, match="left lens front"):
+            head_camera.load(directory, _CAMERAS_CONFIG)
+
+    def test_refuses_a_pack_framed_in_another_body(self, tmp_path, monkeypatch):
+        rig = copy.deepcopy(_RIG)
+        rig["body"]["name"] = "head"
+        directory = tmp_path / "head_camera"
+        monkeypatch.setattr(head_camera, "PACK_DIGEST", _stage(directory, _pack_files(rig)))
+        with pytest.raises(ValueError, match="not 'openarm_head_camera'"):
+            head_camera.load(directory, _CAMERAS_CONFIG)
+
+
 @pytest.fixture
 def stage():
     pytest.importorskip("pxr", reason="USD Python wheels are unavailable on this platform")
@@ -318,10 +363,10 @@ def stage():
 
 
 class TestAttach:
-    def test_puts_the_pack_under_the_pedestal_link(self, stage, pack):
+    def test_puts_the_pack_under_the_pedestal_link(self, stage, loaded):
         from pxr import Gf, UsdGeom, UsdPhysics, UsdShade
 
-        body = head_camera.attach(stage, "/openarm", pack.directory, _CAMERAS_CONFIG)
+        body = head_camera.attach(stage, "/openarm", loaded)
 
         assert body == f"{_LINK}/openarm_head_camera"
         prim = stage.GetPrimAtPath(body)
@@ -357,36 +402,14 @@ class TestAttach:
         assert list(UsdGeom.Mesh(hull).GetFaceVertexCountsAttr().Get()) == [3] * 4
         assert not UsdShade.MaterialBindingAPI(hull).ComputeBoundMaterial()[0]
 
-    def test_refuses_a_robot_without_the_pedestal_link(self, stage, pack):
+    def test_refuses_a_robot_without_the_pedestal_link(self, stage, loaded):
         stage.RemovePrim(_LINK)
         with pytest.raises(RuntimeError, match="openarm_body_link0"):
-            head_camera.attach(stage, "/openarm", pack.directory, _CAMERAS_CONFIG)
+            head_camera.attach(stage, "/openarm", loaded)
         with pytest.raises(RuntimeError, match="openarm_body_link0"):
-            head_camera.attach(stage, "/elsewhere", pack.directory, _CAMERAS_CONFIG)
+            head_camera.attach(stage, "/elsewhere", loaded)
 
-    def test_refuses_an_unstaged_pack(self, stage, tmp_path):
-        with pytest.raises(FileNotFoundError, match="fetch"):
-            head_camera.attach(stage, "/openarm", tmp_path / "head_camera", _CAMERAS_CONFIG)
-        assert not stage.GetPrimAtPath(f"{_LINK}/openarm_head_camera")
-
-    def test_refuses_a_pack_the_chest_camera_is_off_and_authors_nothing(self, stage, tmp_path, monkeypatch):
-        rig = copy.deepcopy(_RIG)
-        rig["cameras"]["left"]["position_m"] = [0.0794, 0.031497, 0.794103]
-        directory = tmp_path / "head_camera"
-        monkeypatch.setattr(head_camera, "PACK_DIGEST", _stage(directory, _pack_files(rig)))
-        with pytest.raises(RuntimeError, match="left lens front"):
-            head_camera.attach(stage, "/openarm", directory, _CAMERAS_CONFIG)
-        assert not stage.GetPrimAtPath(f"{_LINK}/openarm_head_camera")
-
-    def test_refuses_a_pack_framed_in_another_body(self, stage, tmp_path, monkeypatch):
-        rig = copy.deepcopy(_RIG)
-        rig["body"]["name"] = "head"
-        directory = tmp_path / "head_camera"
-        monkeypatch.setattr(head_camera, "PACK_DIGEST", _stage(directory, _pack_files(rig)))
-        with pytest.raises(ValueError, match="not 'openarm_head_camera'"):
-            head_camera.attach(stage, "/openarm", directory, _CAMERAS_CONFIG)
-
-    def test_refuses_a_second_attach(self, stage, pack):
-        head_camera.attach(stage, "/openarm", pack.directory, _CAMERAS_CONFIG)
+    def test_refuses_a_second_attach(self, stage, loaded):
+        head_camera.attach(stage, "/openarm", loaded)
         with pytest.raises(RuntimeError, match="already on the stage"):
-            head_camera.attach(stage, "/openarm", pack.directory, _CAMERAS_CONFIG)
+            head_camera.attach(stage, "/openarm", loaded)

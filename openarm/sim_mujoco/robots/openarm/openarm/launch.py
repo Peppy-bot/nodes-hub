@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import sys
 import threading
 from pathlib import Path
@@ -18,58 +17,35 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-_ASSETS_DIR = Path(
-    os.environ.get("PEPPY_ROBOT_ASSETS_DIR", str(Path(__file__).parent / "assets"))
-)
-def _version(hardware_version: str) -> str:
-    version = hardware_version.lower()
-    if version not in ("v1", "v2"):
-        raise ValueError(f"hardware_version must be v1 or v2, got {hardware_version!r}")
-    return version
-
-
-def _scene_path(hardware_version: str) -> Path:
-    # The v1 and v2 scenes are separate MJCF files (openarm_bimanual_v1.xml /
-    # _v2.xml) in the base image's assets dir. A missing scene fails loudly at
-    # load rather than silently simulating the other geometry.
-    return _ASSETS_DIR / f"openarm_bimanual_{_version(hardware_version)}.xml"
-
-
-# The head camera pack apptainer.def stages at image build (head_camera.py
-# fetch), beside the node's code rather than in the baked scene, which is
-# upstream's robot without it.
-_HEAD_CAMERA_DIR = Path(__file__).parent / "assets" / "head_camera"
-
-
-def _head_camera_pack(hardware_version: str) -> Path | None:
-    # The head camera seats on the v2 pedestal; a v1 robot has none.
-    return _HEAD_CAMERA_DIR if _version(hardware_version) == "v2" else None
-
-
 _MUJOCO_DIR = Path(__file__).resolve().parents[1]
 
 sys.path.insert(0, str(_MUJOCO_DIR))
+import head_camera
 from _launcher import SimLauncher
+from bridge_extension import Layout
 from camera_common import CameraConfig, load_camera_configs, validate_camera_slots
+from robots import Limbs, Registry
+from robots_io import RobotsIO
+from scenes import Catalogue
 from sim_topics import COLOR_CAMERA_SLOT_NAMES, RGBD_CAMERA_SLOT_NAMES, SimTopicIO
+from stands import Stands
 
 _CAMERAS_CONFIG_PATH = _MUJOCO_DIR / "config" / "cameras.json5"
 
-_ready = threading.Event()
+# The head camera pack apptainer.def stages at image build (head_camera.py
+# fetch), beside the node's code. Setup reads it, and a robot standing as a
+# model that carries the head camera draws it.
+_HEAD_CAMERA_DIR = Path(__file__).parent / "assets" / "head_camera"
+
 _stop = threading.Event()
 
 
 def _camera_configs(params) -> list[CameraConfig]:
     """The cameras this launch renders, empty when the parameter is off. Parsed
-    here so a bad config fails node setup, before the scene is compiled around
+    here so a bad config fails node setup, before a scene is compiled around
     it."""
     if not params.cameras_enabled:
         return []
-    if _version(params.hardware_version) != "v2":
-        raise ValueError(
-            "cameras_enabled requires hardware_version v2: the camera geometry "
-            "in config/cameras.json5 mounts on v2 links only"
-        )
     cameras = load_camera_configs(_CAMERAS_CONFIG_PATH)
     validate_camera_slots(cameras, COLOR_CAMERA_SLOT_NAMES, RGBD_CAMERA_SLOT_NAMES)
     return cameras
@@ -79,27 +55,44 @@ async def _run_sim(params, node_runner) -> list:
     # Typed peppygen pub/sub lives on this loop; declare publishers and start the
     # command-consume tasks before the sim thread starts reading from them.
     cameras = _camera_configs(params)
+    head_camera_pack = head_camera.load(_HEAD_CAMERA_DIR, _CAMERAS_CONFIG_PATH)
+    layout = Layout.read()
     loop = asyncio.get_running_loop()
-    io = SimTopicIO(node_runner, loop)
+    robots = Registry()
+    stands = Stands()
+    io = SimTopicIO(node_runner, loop, robots)
     await io.start()
+    robots_io = RobotsIO(
+        node_runner,
+        loop,
+        Catalogue.baked(head_camera_pack=head_camera_pack),
+        robots,
+        stands,
+        io,
+        Limbs(
+            arm_names=tuple(layout.arm_names()),
+            arm_joints=tuple(layout.arm_joint_counts()),
+            gripper_names=tuple(layout.gripper_names()),
+        ),
+        params.robot_lease_ms / 1000.0,
+        renders=bool(cameras),
+    )
+    await robots_io.start()
+    launcher = SimLauncher(
+        stands,
+        _stop,
+        io,
+        layout,
+        params.state_rate_hz,
+        params.headless,
+        params.viewer_host,
+        params.viewer_port,
+        cameras,
+    )
 
     async def _run_sim_task() -> None:
         try:
-            await loop.run_in_executor(
-                None,
-                SimLauncher(
-                    _scene_path(params.hardware_version),
-                    _ready,
-                    _stop,
-                    io,
-                    params.state_rate_hz,
-                    params.headless,
-                    params.viewer_host,
-                    params.viewer_port,
-                    cameras,
-                    _head_camera_pack(params.hardware_version),
-                ).run,
-            )
+            await loop.run_in_executor(None, launcher.run)
         finally:
             # Belt-and-braces against asyncio cancellation paths that race the
             # on_shutdown hook below; idempotent.
@@ -107,16 +100,15 @@ async def _run_sim(params, node_runner) -> list:
 
     async def _shutdown_hook() -> None:
         # Drive the sim executor to exit inside the runtime grace window so
-        # SimLauncher's finally runs extension.shutdown(), then cancel the
-        # consume tasks.
+        # the standing scene is shut down, then end the robot's stay and
+        # cancel the consume tasks.
         _stop.set()
+        await robots_io.stop()
         await io.stop()
 
     node_runner.on_shutdown(_shutdown_hook)
 
-    return [
-        asyncio.create_task(_run_sim_task()),
-    ]
+    return [asyncio.create_task(_run_sim_task())]
 
 
 def main() -> None:
