@@ -34,12 +34,15 @@ def default_parameters(**overrides) -> SimpleNamespace:
     return SimpleNamespace(**values)
 
 
-async def idle_setup(_params, _node_runner):
+async def idle_setup(params, node_runner):
     """A setup that starts nothing: the real `setup` raises TLS, an HTTPS
     server, and a WebXR session, none of which belongs in a test. Harness
     tests boot the node's runtime (ephemeral router, generated mocks, seeded
     slots) under this no-op and drive the production functions directly
-    against the real runner and real generated modules."""
+    against the real runner and real generated modules. The manifest's
+    `page` endpoint is announced with the launch address so the runtime's
+    seal, which the harness runs when setup returns, finds it."""
+    node_runner.announce_endpoint("page", "https", params.https_host, params.https_port)
     return []
 
 

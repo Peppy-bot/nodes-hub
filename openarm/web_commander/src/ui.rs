@@ -147,18 +147,6 @@ struct AppState {
     token: CancellationToken,
 }
 
-/// The address an operator opens to reach a panel bound to `address`.
-///
-/// A panel bound to every interface answers on loopback too, which is the
-/// name that works in a browser on every platform.
-pub fn panel_url(address: SocketAddr) -> String {
-    if address.ip().to_canonical().is_unspecified() {
-        return format!("http://localhost:{}", address.port());
-    }
-
-    format!("http://{address}")
-}
-
 /// The panel's listening socket, and the address it answers on.
 ///
 /// Holding the bound socket is what makes the address true: it is taken before
@@ -1435,36 +1423,6 @@ mod tests {
                 .expect("the server task runs")
                 .expect("a cancelled panel stops cleanly");
         }
-    }
-
-    #[test]
-    fn a_panel_on_every_interface_is_reported_on_localhost() {
-        // 0.0.0.0 is what the manifest defaults to, and it is not an address
-        // a browser opens.
-        assert_eq!(
-            panel_url(SocketAddr::new(
-                std::net::Ipv4Addr::UNSPECIFIED.into(),
-                8765
-            )),
-            "http://localhost:8765"
-        );
-        assert_eq!(
-            panel_url(SocketAddr::new(
-                std::net::Ipv6Addr::UNSPECIFIED.into(),
-                8765
-            )),
-            "http://localhost:8765"
-        );
-        assert_eq!(
-            panel_url(SocketAddr::new("::ffff:0.0.0.0".parse().unwrap(), 8765)),
-            "http://localhost:8765",
-            "an IPv4-mapped wildcard is a wildcard"
-        );
-        assert_eq!(
-            panel_url(loopback(8765)),
-            "http://127.0.0.1:8765",
-            "an address the operator chose is reported as it was given"
-        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

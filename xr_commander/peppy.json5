@@ -86,6 +86,11 @@
     container: {
       def_file: "apptainer.def",
     },
+    // The socket the WebXR server binds during setup. The label is announced
+    // with the address the server took; the daemon reports the URLs.
+    endpoints: {
+      page: { kind: "page", description: "The WebXR page, HTTPS with the node's self-signed certificate." },
+    },
     parameters: {
       // Rate (Hz, 1..=1000) the per-hand setpoint streams publish at while
       // engaged.

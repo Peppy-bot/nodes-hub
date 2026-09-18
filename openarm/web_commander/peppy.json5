@@ -130,6 +130,11 @@
     container: {
       def_file: "apptainer.def"
     },
+    // The socket the panel binds during setup. The label is announced with
+    // the address the panel took; the daemon reports the URLs.
+    endpoints: {
+      panel: { kind: "page", description: "The operator panel, HTTP and WebSocket." },
+    },
     parameters: {
       // Where the operator panel is served. http_host is a literal IP
       // address, not a hostname. The WebSocket carries unauthenticated motion

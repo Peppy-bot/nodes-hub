@@ -13,6 +13,7 @@ from xr_commander import __main__ as wiring
 async def test_setup_starts_health_drain_only_for_its_configured_producers(monkeypatch, producers):
     runner = MagicMock()
     session = MagicMock()
+    session.bound_address.return_value = ("0.0.0.0", 4443)
     monkeypatch.setattr(wiring.peppygen.clock, "init", AsyncMock())
     monkeypatch.setattr(wiring.video, "discover_tracks", lambda *_: [])
     monkeypatch.setattr(wiring.tls, "ensure_certificate", lambda _: ("cert", "key"))
@@ -30,6 +31,9 @@ async def test_setup_starts_health_drain_only_for_its_configured_producers(monke
     try:
         await asyncio.gather(*tasks)
         session.start.assert_called_once()
+        # The page is announced with the address the server bound, after the
+        # server is up, so the daemon reports a socket that answers.
+        runner.announce_endpoint.assert_called_once_with("page", "https", "0.0.0.0", 4443)
         assert health.await_count == bool(producers)
         if producers:
             assert health.call_args.args[2].producers_bound

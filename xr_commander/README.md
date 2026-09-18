@@ -139,14 +139,13 @@ certificate on first boot (kept in `~/.xr_commander/tls/` and reused, so the
 browser's one-time acceptance sticks across restarts) and always serves HTTPS.
 Two ways in, shown for the default `https_port` of 4443:
 
-- **Over the network**: open `https://<this machine's address>:4443` in the
-  headset and click through the browser warning once.
+- **Over the network**: open one of the page URLs the launch prints under
+  `Web pages:` (`peppy stack list` shows them again under `Instance
+  endpoints`) in the headset and click through the browser warning once.
 - **Over USB** (lowest latency). Needs `adb` on this machine and the headset
   in developer mode (free Meta developer account, toggled in the Meta Horizon
   phone app; accept the in-headset USB-debugging prompt). Then
   `adb reverse tcp:4443 tcp:4443` and open `https://localhost:4443`.
-
-The startup log prints the exact URLs.
 
 The WebSocket carries unauthenticated motion control, exactly as the browser
 control panels in this ecosystem do. Trusted networks only.

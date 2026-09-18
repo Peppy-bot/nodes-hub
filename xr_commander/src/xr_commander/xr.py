@@ -142,6 +142,13 @@ class XrSession:
             "(port already in use, or unreadable TLS material?)"
         )
 
+    def bound_address(self) -> tuple[str, int]:
+        """The address the server's listener bound, as the operating system
+        reports it: what the node announces as its page endpoint. Valid once
+        `start` returned."""
+        host, port = self._server.servers[0].sockets[0].getsockname()[:2]
+        return host, port
+
     def stop(self) -> None:
         self._server.should_exit = True
         if self._thread is not None:

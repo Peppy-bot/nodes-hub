@@ -43,13 +43,19 @@ async def setup(params, node_runner) -> list:
 
     try:
         node_runner.on_shutdown(shutdown)
+        # The daemon renders the URLs an operator opens from this
+        # announcement, one per address of the machine.
+        host, port = server.server_address[:2]
+        node_runner.announce_endpoint("viewer", "http", host, port)
     except Exception:
         await shutdown()
         raise
 
     logger.info(
-        "Isaac Sim browser WebRTC viewer listening on 0.0.0.0:8210; "
-        "browser warnings and errors are forwarded to this node log"
+        "Isaac Sim browser WebRTC viewer listening on %s:%d; "
+        "browser warnings and errors are forwarded to this node log",
+        host,
+        port,
     )
     return []
 

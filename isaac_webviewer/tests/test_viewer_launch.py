@@ -47,7 +47,14 @@ def startup(monkeypatch):
         if state.registration_error is not None:
             raise state.registration_error
 
-    state.server = Mock(spec=["serve_forever", "shutdown", "server_close"])
+    def announce(label, scheme, host, port):
+        record("announce")
+        if state.announce_error is not None:
+            raise state.announce_error
+
+    state.announce_error = None
+    state.server = Mock(spec=["serve_forever", "shutdown", "server_close", "server_address"])
+    state.server.server_address = ("0.0.0.0", 8210)
     state.server.shutdown.side_effect = lambda: record("shutdown")
     state.server.server_close.side_effect = lambda: record("close")
     state.server_factory = Mock(side_effect=bind)
@@ -55,8 +62,9 @@ def startup(monkeypatch):
     state.thread.start.side_effect = start
     state.thread.join.side_effect = lambda: record("join")
     state.thread_factory = Mock(side_effect=make_thread)
-    state.runner = Mock(spec=["on_shutdown"])
+    state.runner = Mock(spec=["on_shutdown", "announce_endpoint"])
     state.runner.on_shutdown.side_effect = register
+    state.runner.announce_endpoint.side_effect = announce
 
     runtime = ModuleType("peppylib.runtime")
     state.node_builder = runtime.NodeBuilder = Mock()
@@ -98,11 +106,18 @@ def test_setup_registers_shutdown_after_start_and_cleans_up_off_event_loop(start
 
     async def run():
         assert await startup.module.setup({}, startup.runner) == []
-        assert [event for event, _ in startup.events] == ["bind", "thread", "start", "register"]
+        assert [event for event, _ in startup.events] == [
+            "bind", "thread", "start", "register", "announce",
+        ]
         startup.server.shutdown.assert_not_called()
         startup.server.server_close.assert_not_called()
         startup.thread.join.assert_not_called()
         startup.runner.on_shutdown.assert_called_once()
+        # The viewer is announced with the address the server bound, after
+        # the server is up, so the daemon reports a socket that answers.
+        startup.runner.announce_endpoint.assert_called_once_with(
+            "viewer", "http", "0.0.0.0", 8210,
+        )
         shutdown = startup.runner.on_shutdown.call_args.args[0]
         await shutdown()
 
@@ -113,7 +128,7 @@ def test_setup_registers_shutdown_after_start_and_cleans_up_off_event_loop(start
     )
     startup.thread.start.assert_called_once_with()
     assert [event for event, _ in startup.events] == [
-        "bind", "thread", "start", "register", "shutdown", "close", "join",
+        "bind", "thread", "start", "register", "announce", "shutdown", "close", "join",
     ]
     _assert_cleanup_off_loop(startup, loop_thread)
     messages = [record.getMessage() for record in caplog.records]
@@ -171,6 +186,22 @@ def test_registration_failure_awaits_off_loop_cleanup_before_propagating(startup
     assert raised.value is startup.registration_error
     assert [event for event, _ in startup.events] == [
         "bind", "thread", "start", "register", "shutdown", "close", "join",
+    ]
+    _assert_cleanup_off_loop(startup, loop_thread)
+    assert not any("listening" in record.getMessage() for record in caplog.records)
+
+
+def test_a_refused_announcement_awaits_off_loop_cleanup_before_propagating(startup, caplog):
+    caplog.set_level(logging.INFO, logger=startup.module.logger.name)
+    loop_thread = threading.get_ident()
+    startup.announce_error = ValueError("endpoint `viewer` is not declared")
+
+    with pytest.raises(ValueError) as raised:
+        asyncio.run(startup.module.setup({}, startup.runner))
+
+    assert raised.value is startup.announce_error
+    assert [event for event, _ in startup.events] == [
+        "bind", "thread", "start", "register", "announce", "shutdown", "close", "join",
     ]
     _assert_cleanup_off_loop(startup, loop_thread)
     assert not any("listening" in record.getMessage() for record in caplog.records)

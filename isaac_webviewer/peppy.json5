@@ -13,6 +13,12 @@
       def_file: "apptainer.def",
     },
 
+    // The socket the viewer binds during setup. The label is announced with
+    // the address the server took; the daemon reports the URLs.
+    endpoints: {
+      viewer: { kind: "page", description: "The Isaac Sim web viewer." },
+    },
+
     parameters: {},
   },
 }
