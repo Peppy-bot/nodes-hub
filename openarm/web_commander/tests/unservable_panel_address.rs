@@ -6,11 +6,15 @@
 
 mod helpers;
 
+use std::time::Duration;
+
 use peppygen::fixtures::harness::{Config, Harness};
 
 // An address of TEST-NET-1 (RFC 5737), which no host holds.
 const UNSERVABLE_HOST: &str = "192.0.2.1";
 const UNSERVABLE_PORT: u16 = 18765;
+const SETUP_BUDGET: Duration = Duration::from_secs(30);
+const SETUP_POLL: Duration = Duration::from_millis(50);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_panel_address_this_host_cannot_serve_fails_the_launch() {
@@ -27,7 +31,9 @@ async fn a_panel_address_this_host_cannot_serve_fails_the_launch() {
     parameters.http_host = UNSERVABLE_HOST.to_string();
 
     // The harness runs `setup` in the background and hands its error back at
-    // teardown, so the refusal surfaces there.
+    // teardown, so the refusal surfaces there. Teardown cancels the node and
+    // aborts a setup still running after the shutdown grace, so the test holds
+    // teardown until setup has returned.
     let (harness, _mocks) = Harness::start_with(
         Config {
             parameters: Some(parameters),
@@ -37,6 +43,15 @@ async fn a_panel_address_this_host_cannot_serve_fails_the_launch() {
     )
     .await
     .expect("the harness starts the node");
+
+    let deadline = tokio::time::Instant::now() + SETUP_BUDGET;
+    while !harness.setup_finished() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "setup must return within {SETUP_BUDGET:?}"
+        );
+        tokio::time::sleep(SETUP_POLL).await;
+    }
 
     let refused = harness
         .shutdown()
