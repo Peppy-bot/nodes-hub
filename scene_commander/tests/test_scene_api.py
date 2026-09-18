@@ -23,18 +23,21 @@ _OPTIONAL_LINKS = {
         "set_light_cone", "set_light_orientation", "reset_lighting",
     ),
     "materials": ("get_materials", "set_material_color", "set_material_finish", "reset_materials"),
-    "color_cameras": ("video_stream_info", "set_exposure", "set_white_balance", "set_gain", "set_brightness", "set_contrast"),
-    "rgbd_cameras": (
-        "video_stream_info", "set_color_exposure", "set_color_white_balance", "set_color_gain", "set_color_brightness",
-        "set_color_contrast",
+    "cameras": (
+        "get_cameras", "describe_camera", "set_camera_exposure", "set_camera_white_balance", "set_camera_gain",
+        "set_camera_brightness", "set_camera_contrast", "reset_camera",
     ),
-    "camera_profiles": ("get_camera_profile", "reset_camera"),
 }
 _BUSY = "Isaac is still discovering its asset catalogue"
 _NOT_READY = "Isaac has not loaded its stage yet"
 _NO_SCENE = "no scene is loaded"
 _NOT_ATTACHED = "the camera is not attached to its simulation yet"
 _SCENE = {"asset_id": "scene/full_warehouse", "display_name": "Full Warehouse", "kind": "scene", "category": "Scenes"}
+_ROBOTS = [
+    {"robot": "alpha", "model": "openarm_v2", "position": [0.0, 0.0, 0.0], "attached": True},
+    {"robot": "bravo", "model": "openarm_v1", "position": [0.0, -1.5, 0.0], "attached": True},
+]
+
 # A snapshot's capture time, as the generated binding decodes it: epoch seconds.
 _CAPTURED = 1_757_944_800.25
 # The simulation instance serving the scene, its lighting and its materials.
@@ -154,8 +157,13 @@ class FakeAction(ModuleType):
 
 @pytest.fixture
 def commander(monkeypatch):
-    services = _link("simulation", ["get_assets_list"], producers=["producer"])
+    services = _link("simulation", ["get_assets_list", "get_robots_list"], producers=["producer"])
     services.get_assets_list.answers = [_catalogue(_SCENE)]
+    services.get_robots_list.answers = [SimpleNamespace(
+        success=True,
+        message="2 robots standing",
+        robots=[SimpleNamespace(**robot) for robot in _ROBOTS],
+    )]
     objects = _link("objects", ["get_object_states"], producers=["producer"])
     objects.get_object_states.answers = [_snapshot()]
     # The optional links start vacant; a test binds what its launch has.
@@ -165,9 +173,10 @@ def commander(monkeypatch):
             getattr(optional[name], member).answers = [_done(member)]
     optional["lighting"].get_lighting.answers = [_lighting(_SUN)]
     optional["materials"].get_materials.answers = [_materials(_STEEL)]
-    optional["color_cameras"].video_stream_info.answers = [_stream(1280, 720, 30, "rgb8")]
-    optional["rgbd_cameras"].video_stream_info.answers = [_stream(640, 480, 15, "rgb8")]
-    optional["camera_profiles"].get_camera_profile.answers = [_profile()]
+    optional["cameras"].get_cameras.answers = [_cameras(
+        _listed("alpha", "wrist_left", "rgb", 1280, 720, 30), _listed("bravo", "chest", "rgbd", 640, 480, 15),
+    )]
+    optional["cameras"].describe_camera.answers = [_profile()]
     actions = ModuleType("peppygen.consumed_actions.simulation")
     for name in _ACTIONS:
         setattr(actions, name, FakeAction(name))
@@ -198,17 +207,15 @@ def commander(monkeypatch):
     def bind_materials():
         optional["materials"].producers.append(FakeProducer(*_SIMULATION))
 
-    def bind_camera(instance_id, kind, profile=True):
-        """Link a camera relay of `kind` here and, with `profile`, the profile the same instance serves."""
-        producer = FakeProducer("alpha", instance_id)
-        optional["color_cameras" if kind == "rgb" else "rgbd_cameras"].producers.append(producer)
-        if profile:
-            optional["camera_profiles"].producers.append(producer)
+    def bind_cameras():
+        """Link the simulation's cameras here, the way it links its lighting and materials."""
+        producer = FakeProducer(*_SIMULATION)
+        optional["cameras"].producers.append(producer)
         return producer
 
     return SimpleNamespace(
         module=module, services=services, objects=objects, actions=actions,
-        bind_lighting=bind_lighting, bind_materials=bind_materials, bind_camera=bind_camera, **optional,
+        bind_lighting=bind_lighting, bind_materials=bind_materials, bind_cameras=bind_cameras, **optional,
     )
 
 
@@ -284,8 +291,16 @@ def _materials(*materials):
     )
 
 
-def _stream(width, height, frames_per_second, encoding):
-    return SimpleNamespace(width=width, height=height, frames_per_second=frames_per_second, encoding=encoding)
+def _listed(robot, camera, kind, width, height, frames_per_second):
+    """One camera as the simulation lists it."""
+    return SimpleNamespace(
+        robot=robot, camera=camera, kind=kind, width=width, height=height,
+        frames_per_second=frames_per_second, encoding="rgb8",
+    )
+
+
+def _cameras(*listed):
+    return SimpleNamespace(success=True, message=f"{len(listed)} cameras rendered", cameras=list(listed))
 
 
 def _profile():
@@ -633,6 +648,36 @@ def test_http_server_keeps_browser_requests_out_of_the_log(commander, monkeypatc
     assert runner.cleaned
 
 
+
+def test_the_robot_listing_names_what_the_scene_stands(commander):
+    status, body = _call(commander, lambda client: _get(client, "/api/robots"))
+
+    assert status == 200
+    assert body["success"] is True
+    assert body["count"] == 2
+    assert [robot["robot"] for robot in body["robots"]] == ["alpha", "bravo"]
+
+
+def test_a_move_carries_the_robot_it_addresses(commander):
+    status, _ = _call(commander, lambda client: _post(
+        client, "/api/robot/move", {"robot": "bravo_init_inst", "position": [1.0, -1.5, 0.0]}
+    ))
+
+    assert status == 200
+    goal = commander.actions.move_robot.goals[-1]
+    assert goal.robot == "bravo_init_inst"
+    assert goal.position == [1.0, -1.5, 0.0]
+
+
+def test_a_move_naming_no_robot_is_refused_before_the_simulation(commander):
+    status, _ = _call(commander, lambda client: _post(
+        client, "/api/robot/move", {"position": [1.0, 0.0, 0.0]}
+    ))
+
+    assert status == 400
+    assert commander.actions.move_robot.goals == []
+
+
 # ---------------------------------------------------------------------------
 # Lighting, materials and cameras: what the launch bound decides the panels
 # ---------------------------------------------------------------------------
@@ -650,22 +695,21 @@ def test_with_only_the_scene_bound_the_capabilities_are_absent_and_their_routes_
             await _get(client, "/api/materials"),
             await _post(client, "/api/materials/color", {"material_id": "steel", "color": [1, 1, 1]}),
             await _get(client, "/api/cameras"),
-            await _post(client, "/api/cameras/alpha_wrist_left/gain", {"value": 1}),
+            await _post(client, "/api/cameras/alpha/wrist_left/gain", {"value": 1}),
         )
 
     capabilities, lighting, intensity, reset, materials, color, cameras, gain = _call(commander, scenario)
-    assert capabilities == (200, {"success": True, "lighting": False, "materials": False, "cameras": []})
+    assert capabilities == (200, {"success": True, "lighting": False, "materials": False, "cameras": False})
     assert lighting == (404, {"success": False, "message": "lighting is not bound in this launch"})
     assert intensity == lighting
     assert reset == lighting
     assert materials == (404, {"success": False, "message": "materials are not bound in this launch"})
     assert color == materials
-    assert cameras == (200, {"success": True, "cameras": [], "count": 0})
-    assert gain == (404, {"success": False, "message": "no camera alpha_wrist_left is bound in this launch"})
+    assert cameras == (404, {"success": False, "message": "cameras are not bound in this launch"})
+    assert gain == cameras
     # No provider of a vacant slot is ever called.
-    assert _requests(commander, commander.lighting, commander.materials, commander.color_cameras,
-                     commander.rgbd_cameras, commander.camera_profiles) == {}
-    assert [level for level, _, _ in _node_log(commander, caplog)] == [logging.WARNING] * 6
+    assert _requests(commander, commander.lighting, commander.materials, commander.cameras) == {}
+    assert [level for level, _, _ in _node_log(commander, caplog)] == [logging.WARNING] * 7
 
 
 def test_the_page_carries_the_capability_cards_hidden_until_the_capabilities_say_otherwise(commander):
@@ -702,7 +746,7 @@ def test_bound_lighting_reaches_the_page_parsed_and_its_state_is_logged_once(com
         return capabilities, [await _get(client, "/api/lighting") for _ in range(4)]
 
     capabilities, (first, second, third, fourth) = _call(commander, scenario)
-    assert capabilities == (200, {"success": True, "lighting": True, "materials": False, "cameras": []})
+    assert capabilities == (200, {"success": True, "lighting": True, "materials": False, "cameras": False})
     assert first == (503, {"success": False, "message": _NO_SCENE})
     assert second == first
     assert third == (200, {"success": True, "lighting": _lighting_json(_SUN)})
@@ -785,18 +829,18 @@ def test_reset_lighting_calls_the_provider_once_and_answers_its_message(commande
 def test_a_refused_setter_answers_400_with_the_reason_and_what_stands(commander, caplog):
     caplog.set_level(logging.INFO)
     commander.bind_lighting()
-    commander.bind_camera("alpha_wrist_left", "rgb")
+    commander.bind_cameras()
     commander.lighting.set_light_intensity.answers = [
         _refused("value 500000 is above the max of 200000 lx", current_value=1000.0),
     ]
-    commander.color_cameras.set_white_balance.answers = [
+    commander.cameras.set_camera_white_balance.answers = [
         _refused("temperature 12000 K is outside 2000-8000 K", current_temperature=4500),
     ]
 
     async def scenario(client):
         return (
             await _post(client, "/api/lighting/intensity", {"light_id": "sun", "value": 500000}),
-            await _post(client, "/api/cameras/alpha_wrist_left/white_balance", {"mode": "manual", "temperature": 12000}),
+            await _post(client, "/api/cameras/alpha/wrist_left/white_balance", {"mode": "manual", "temperature": 12000}),
         )
 
     intensity, white_balance = _call(commander, scenario)
@@ -810,7 +854,7 @@ def test_a_refused_setter_answers_400_with_the_reason_and_what_stands(commander,
         (logging.WARNING, "POST /api/lighting/intensity failed: value 500000 is above the max of 200000 lx", None),
         (
             logging.WARNING,
-            "POST /api/cameras/alpha_wrist_left/white_balance failed: temperature 12000 K is outside 2000-8000 K",
+            "POST /api/cameras/alpha/wrist_left/white_balance failed: temperature 12000 K is outside 2000-8000 K",
             None,
         ),
     ]
@@ -832,37 +876,35 @@ def test_a_refused_setter_answers_400_with_the_reason_and_what_stands(commander,
     ("/api/materials/color", {"material_id": "steel", "color": [0.5, 0.5, 0.5, 1]}, "color must be 3 finite numbers"),
     ("/api/materials/finish", {"material_id": "steel", "metallic": True, "roughness": 0.3}, "metallic must be a finite number"),
     ("/api/materials/finish", {"material_id": 7, "metallic": 0.5, "roughness": 0.3}, "material_id must be a non-empty string"),
-    ("/api/cameras/alpha_wrist_left/exposure", {"mode": "sometimes", "value": 8000}, 'mode must be "auto" or "manual"'),
-    ("/api/cameras/alpha_wrist_left/exposure", {"value": 8000}, 'mode must be "auto" or "manual"'),
-    ("/api/cameras/alpha_wrist_left/exposure", {"mode": "manual", "value": 8000.5}, "value must be a whole number"),
-    ("/api/cameras/alpha_wrist_left/white_balance", {"mode": "manual"}, "temperature must be a finite number"),
-    ("/api/cameras/alpha_chest/gain", {"value": "12"}, "value must be a finite number"),
-    ("/api/cameras/alpha_chest/brightness", {"value": 1e400}, "value must be a finite number"),
-    ("/api/cameras/alpha_chest/contrast", {"value": [1]}, "value must be a finite number"),
+    ("/api/cameras/alpha/wrist_left/exposure", {"mode": "sometimes", "value": 8000}, 'mode must be "auto" or "manual"'),
+    ("/api/cameras/alpha/wrist_left/exposure", {"value": 8000}, 'mode must be "auto" or "manual"'),
+    ("/api/cameras/alpha/wrist_left/exposure", {"mode": "manual", "value": 8000.5}, "value must be a whole number"),
+    ("/api/cameras/alpha/wrist_left/white_balance", {"mode": "manual"}, "temperature must be a finite number"),
+    ("/api/cameras/bravo/chest/gain", {"value": "12"}, "value must be a finite number"),
+    ("/api/cameras/bravo/chest/brightness", {"value": 1e400}, "value must be a finite number"),
+    ("/api/cameras/bravo/chest/contrast", {"value": [1]}, "value must be a finite number"),
 ])
 def test_invalid_capability_input_answers_400_and_never_reaches_a_provider(commander, caplog, path, payload, message):
     caplog.set_level(logging.INFO)
     commander.bind_lighting()
     commander.bind_materials()
-    commander.bind_camera("alpha_wrist_left", "rgb")
-    commander.bind_camera("alpha_chest", "rgbd")
+    commander.bind_cameras()
 
     assert _call(commander, lambda client: _post(client, path, payload)) == (400, {"success": False, "message": message})
-    assert _requests(commander, commander.lighting, commander.materials, commander.color_cameras,
-                     commander.rgbd_cameras, commander.camera_profiles) == {}
+    assert _requests(commander, commander.lighting, commander.materials, commander.cameras) == {}
     assert _node_log(commander, caplog) == [(logging.WARNING, f"POST {path} failed: {message}", None)]
 
 
 def test_an_unknown_property_or_control_is_404_and_reaches_no_provider(commander):
     commander.bind_lighting()
     commander.bind_materials()
-    commander.bind_camera("alpha_wrist_left", "rgb")
+    commander.bind_cameras()
 
     async def scenario(client):
         return (
             await _post(client, "/api/lighting/temperature", {"light_id": "sun", "value": 1}),
             await _post(client, "/api/materials/opacity", {"material_id": "steel", "value": 1}),
-            await _post(client, "/api/cameras/alpha_wrist_left/zoom", {"value": 1}),
+            await _post(client, "/api/cameras/alpha/wrist_left/zoom", {"value": 1}),
         )
 
     assert _call(commander, scenario) == (
@@ -870,7 +912,7 @@ def test_an_unknown_property_or_control_is_404_and_reaches_no_provider(commander
         (404, {"success": False, "message": "unknown material property: opacity"}),
         (404, {"success": False, "message": "unknown camera control: zoom"}),
     )
-    assert _requests(commander, commander.lighting, commander.materials, commander.color_cameras) == {}
+    assert _requests(commander, commander.lighting, commander.materials, commander.cameras) == {}
 
 
 def test_bound_materials_reach_the_page_and_their_setters_address_the_material(commander, caplog):
@@ -893,7 +935,7 @@ def test_bound_materials_reach_the_page_and_their_setters_address_the_material(c
         )
 
     capabilities, materials, coloured, finished, restored = _call(commander, scenario)
-    assert capabilities == (200, {"success": True, "lighting": False, "materials": True, "cameras": []})
+    assert capabilities == (200, {"success": True, "lighting": False, "materials": True, "cameras": False})
     assert materials == (200, {"success": True, "materials": {"materials": [_STEEL]}})
     assert coloured == (200, {"success": True, "message": "Brushed steel coloured", "current_color": [0.2, 0.2, 0.8]})
     assert finished == (
@@ -932,133 +974,148 @@ def test_materials_answer_503_with_the_provider_reason_until_a_scene_is_loaded(c
     ]
 
 
-def test_cameras_list_their_stream_and_profile_and_route_each_control_by_kind(commander, caplog):
+def test_the_simulation_lists_every_robots_cameras_and_each_control_names_its_camera(commander, caplog):
     caplog.set_level(logging.INFO)
-    wrist = commander.bind_camera("alpha_wrist_left", "rgb")
-    chest = commander.bind_camera("alpha_chest", "rgbd")
-    commander.color_cameras.set_exposure.answers = [_set("Wrist exposure 8000 us", current_value=8000)]
-    commander.rgbd_cameras.set_color_exposure.answers = [_set("Chest exposure auto", current_value=8300)]
-    commander.rgbd_cameras.set_color_white_balance.answers = [_set("Chest white balance 4500 K", current_temperature=4500)]
-    commander.color_cameras.set_gain.answers = [_set("Wrist gain 12", current_value=12)]
-    commander.rgbd_cameras.set_color_brightness.answers = [_set("Chest brightness 100", current_value=100)]
-    commander.color_cameras.set_contrast.answers = [_set("Wrist contrast 40", current_value=40)]
-    commander.camera_profiles.reset_camera.answers = [_set("Wrist camera reset")]
+    simulation = commander.bind_cameras()
+    commander.cameras.set_camera_exposure.answers = [
+        _set("alpha/wrist_left exposure set to 8000", current_value=8000),
+        _set("bravo/chest exposure set to auto", current_value=8300),
+    ]
+    commander.cameras.set_camera_white_balance.answers = [
+        _set("bravo/chest white balance set to 4500", current_temperature=4500),
+    ]
+    commander.cameras.set_camera_gain.answers = [_set("alpha/wrist_left gain set to 12", current_value=12)]
+    commander.cameras.set_camera_brightness.answers = [_set("bravo/chest brightness set to 100", current_value=100)]
+    commander.cameras.set_camera_contrast.answers = [_set("alpha/wrist_left contrast set to 40", current_value=40)]
+    commander.cameras.reset_camera.answers = [_set("alpha/wrist_left restored to its device defaults")]
 
     async def scenario(client):
         return (
             await _get(client, "/api/capabilities"),
             await _get(client, "/api/cameras"),
-            await _post(client, "/api/cameras/alpha_wrist_left/exposure", {"mode": "manual", "value": 8000}),
-            await _post(client, "/api/cameras/alpha_chest/exposure", {"mode": "auto", "value": 0}),
-            await _post(client, "/api/cameras/alpha_chest/white_balance", {"mode": "manual", "temperature": 4500}),
-            await _post(client, "/api/cameras/alpha_wrist_left/gain", {"value": 12}),
-            await _post(client, "/api/cameras/alpha_chest/brightness", {"value": 100}),
-            await _post(client, "/api/cameras/alpha_wrist_left/contrast", {"value": 40}),
-            await _post(client, "/api/cameras/alpha_wrist_left/reset", {}),
-            await _post(client, "/api/cameras/alpha_head/gain", {"value": 1}),
+            await _post(client, "/api/cameras/alpha/wrist_left/exposure", {"mode": "manual", "value": 8000}),
+            await _post(client, "/api/cameras/bravo/chest/exposure", {"mode": "auto", "value": 0}),
+            await _post(client, "/api/cameras/bravo/chest/white_balance", {"mode": "manual", "temperature": 4500}),
+            await _post(client, "/api/cameras/alpha/wrist_left/gain", {"value": 12}),
+            await _post(client, "/api/cameras/bravo/chest/brightness", {"value": 100}),
+            await _post(client, "/api/cameras/alpha/wrist_left/contrast", {"value": 40}),
+            await _post(client, "/api/cameras/alpha/wrist_left/reset", {}),
         )
 
     capabilities, cameras, *answers = _call(commander, scenario)
-    assert capabilities == (200, {"success": True, "lighting": False, "materials": False, "cameras": [
-        {"id": "alpha_wrist_left", "kind": "rgb", "profile": True},
-        {"id": "alpha_chest", "kind": "rgbd", "profile": True},
-    ]})
-    assert cameras == (200, {"success": True, "count": 2, "cameras": [
+    assert capabilities == (200, {"success": True, "lighting": False, "materials": False, "cameras": True})
+    # Every robot's cameras, as the simulation lists them, each with the
+    # profile the simulation describes for it.
+    assert cameras == (200, {"success": True, "message": "2 cameras rendered", "count": 2, "cameras": [
         {
-            "id": "alpha_wrist_left", "kind": "rgb",
+            "id": "alpha/wrist_left", "robot": "alpha", "camera": "wrist_left", "kind": "rgb",
             "info": {"width": 1280, "height": 720, "frames_per_second": 30, "encoding": "rgb8"},
             "profile": _PROFILE, "profile_message": "profile of Logitech C920",
         },
         {
-            "id": "alpha_chest", "kind": "rgbd",
+            "id": "bravo/chest", "robot": "bravo", "camera": "chest", "kind": "rgbd",
             "info": {"width": 640, "height": 480, "frames_per_second": 15, "encoding": "rgb8"},
             "profile": _PROFILE, "profile_message": "profile of Logitech C920",
         },
     ]})
     assert answers == [
-        (200, {"success": True, "message": "Wrist exposure 8000 us", "current_value": 8000}),
-        (200, {"success": True, "message": "Chest exposure auto", "current_value": 8300}),
-        (200, {"success": True, "message": "Chest white balance 4500 K", "current_temperature": 4500}),
-        (200, {"success": True, "message": "Wrist gain 12", "current_value": 12}),
-        (200, {"success": True, "message": "Chest brightness 100", "current_value": 100}),
-        (200, {"success": True, "message": "Wrist contrast 40", "current_value": 40}),
-        (200, {"success": True, "message": "Wrist camera reset"}),
-        (404, {"success": False, "message": "no camera alpha_head is bound in this launch"}),
+        (200, {"success": True, "message": "alpha/wrist_left exposure set to 8000", "current_value": 8000}),
+        (200, {"success": True, "message": "bravo/chest exposure set to auto", "current_value": 8300}),
+        (200, {"success": True, "message": "bravo/chest white balance set to 4500", "current_temperature": 4500}),
+        (200, {"success": True, "message": "alpha/wrist_left gain set to 12", "current_value": 12}),
+        (200, {"success": True, "message": "bravo/chest brightness set to 100", "current_value": 100}),
+        (200, {"success": True, "message": "alpha/wrist_left contrast set to 40", "current_value": 40}),
+        (200, {"success": True, "message": "alpha/wrist_left restored to its device defaults"}),
     ]
-    # Each control went to the service set of the camera's kind, on that
-    # camera's instance, and nowhere else.
-    assert _requests(commander, commander.color_cameras, commander.rgbd_cameras, commander.camera_profiles) == {
-        "color_cameras.video_stream_info": [(wrist, None)],
-        "color_cameras.set_exposure": [(wrist, SimpleNamespace(mode="manual", value=8000))],
-        "color_cameras.set_gain": [(wrist, SimpleNamespace(value=12))],
-        "color_cameras.set_contrast": [(wrist, SimpleNamespace(value=40))],
-        "rgbd_cameras.video_stream_info": [(chest, None)],
-        "rgbd_cameras.set_color_exposure": [(chest, SimpleNamespace(mode="auto", value=0))],
-        "rgbd_cameras.set_color_white_balance": [(chest, SimpleNamespace(mode="manual", temperature=4500))],
-        "rgbd_cameras.set_color_brightness": [(chest, SimpleNamespace(value=100))],
-        "camera_profiles.get_camera_profile": [(wrist, None), (chest, None)],
-        "camera_profiles.reset_camera": [(wrist, None)],
+    # Every call went to the simulation, naming the camera by its robot and
+    # slot.
+    assert _requests(commander, commander.cameras) == {
+        "cameras.get_cameras": [(simulation, None)],
+        "cameras.describe_camera": [
+            (simulation, SimpleNamespace(robot="alpha", camera="wrist_left")),
+            (simulation, SimpleNamespace(robot="bravo", camera="chest")),
+        ],
+        "cameras.set_camera_exposure": [
+            (simulation, SimpleNamespace(robot="alpha", camera="wrist_left", mode="manual", value=8000)),
+            (simulation, SimpleNamespace(robot="bravo", camera="chest", mode="auto", value=0)),
+        ],
+        "cameras.set_camera_white_balance": [
+            (simulation, SimpleNamespace(robot="bravo", camera="chest", mode="manual", temperature=4500)),
+        ],
+        "cameras.set_camera_gain": [(simulation, SimpleNamespace(robot="alpha", camera="wrist_left", value=12))],
+        "cameras.set_camera_brightness": [(simulation, SimpleNamespace(robot="bravo", camera="chest", value=100))],
+        "cameras.set_camera_contrast": [(simulation, SimpleNamespace(robot="alpha", camera="wrist_left", value=40))],
+        "cameras.reset_camera": [(simulation, SimpleNamespace(robot="alpha", camera="wrist_left"))],
     }
     assert _node_log(commander, caplog) == [
-        (logging.INFO, "Camera alpha_wrist_left profile ready: 1 controls", None),
-        (logging.INFO, "Camera alpha_chest profile ready: 1 controls", None),
-        (logging.INFO, "set_exposure(camera=alpha_wrist_left, mode=manual, value=8000): Wrist exposure 8000 us", None),
-        (logging.INFO, "set_color_exposure(camera=alpha_chest, mode=auto, value=0): Chest exposure auto", None),
+        (logging.INFO, "Camera alpha/wrist_left profile ready: 1 controls", None),
+        (logging.INFO, "Camera bravo/chest profile ready: 1 controls", None),
         (
             logging.INFO,
-            "set_color_white_balance(camera=alpha_chest, mode=manual, temperature=4500): Chest white balance 4500 K",
+            "set_camera_exposure(robot=alpha, camera=wrist_left, mode=manual, value=8000): "
+            "alpha/wrist_left exposure set to 8000",
             None,
         ),
-        (logging.INFO, "set_gain(camera=alpha_wrist_left, value=12): Wrist gain 12", None),
-        (logging.INFO, "set_color_brightness(camera=alpha_chest, value=100): Chest brightness 100", None),
-        (logging.INFO, "set_contrast(camera=alpha_wrist_left, value=40): Wrist contrast 40", None),
-        (logging.INFO, "reset_camera(camera=alpha_wrist_left): Wrist camera reset", None),
-        (logging.WARNING, "POST /api/cameras/alpha_head/gain failed: no camera alpha_head is bound in this launch", None),
+        (
+            logging.INFO,
+            "set_camera_exposure(robot=bravo, camera=chest, mode=auto, value=0): bravo/chest exposure set to auto",
+            None,
+        ),
+        (
+            logging.INFO,
+            "set_camera_white_balance(robot=bravo, camera=chest, mode=manual, temperature=4500): "
+            "bravo/chest white balance set to 4500",
+            None,
+        ),
+        (logging.INFO, "set_camera_gain(robot=alpha, camera=wrist_left, value=12): alpha/wrist_left gain set to 12", None),
+        (
+            logging.INFO,
+            "set_camera_brightness(robot=bravo, camera=chest, value=100): bravo/chest brightness set to 100",
+            None,
+        ),
+        (
+            logging.INFO,
+            "set_camera_contrast(robot=alpha, camera=wrist_left, value=40): alpha/wrist_left contrast set to 40",
+            None,
+        ),
+        (
+            logging.INFO,
+            "reset_camera(robot=alpha, camera=wrist_left): alpha/wrist_left restored to its device defaults",
+            None,
+        ),
     ]
 
 
-def test_a_camera_without_a_profile_lists_its_stream_and_has_no_reset(commander, caplog):
+def test_a_camera_the_simulation_does_not_render_is_refused_with_its_reason(commander, caplog):
     caplog.set_level(logging.INFO)
-    wrist = commander.bind_camera("alpha_wrist_left", "rgb", profile=False)
-    commander.color_cameras.set_gain.answers = [_set("Wrist gain 12", current_value=12)]
+    commander.bind_cameras()
+    commander.cameras.set_camera_gain.answers = [
+        _refused("robot 'charlie' renders no camera 'wrist_left'; get_cameras lists the cameras rendered",
+                 current_value=-1),
+    ]
+    commander.cameras.get_cameras.answers = [_cameras()]
 
     async def scenario(client):
         return (
-            await _get(client, "/api/capabilities"),
             await _get(client, "/api/cameras"),
-            await _post(client, "/api/cameras/alpha_wrist_left/gain", {"value": 12}),
-            await _post(client, "/api/cameras/alpha_wrist_left/reset", {}),
+            await _post(client, "/api/cameras/charlie/wrist_left/gain", {"value": 12}),
         )
 
-    capabilities, cameras, gain, reset = _call(commander, scenario)
-    assert capabilities[1]["cameras"] == [{"id": "alpha_wrist_left", "kind": "rgb", "profile": False}]
-    assert cameras == (200, {"success": True, "count": 1, "cameras": [{
-        "id": "alpha_wrist_left", "kind": "rgb",
-        "info": {"width": 1280, "height": 720, "frames_per_second": 30, "encoding": "rgb8"},
-        "profile": None, "profile_message": "no camera profile is bound for alpha_wrist_left in this launch",
-    }]})
-    # The controls are the camera contract's own: they work without a profile.
-    assert gain == (200, {"success": True, "message": "Wrist gain 12", "current_value": 12})
-    assert reset == (404, {"success": False, "message": "no camera profile is bound for alpha_wrist_left in this launch"})
-    assert _requests(commander, commander.color_cameras, commander.camera_profiles) == {
-        "color_cameras.video_stream_info": [(wrist, None)],
-        "color_cameras.set_gain": [(wrist, SimpleNamespace(value=12))],
-    }
-    assert _node_log(commander, caplog) == [
-        (logging.INFO, "set_gain(camera=alpha_wrist_left, value=12): Wrist gain 12", None),
-        (
-            logging.WARNING,
-            "POST /api/cameras/alpha_wrist_left/reset failed: "
-            "no camera profile is bound for alpha_wrist_left in this launch",
-            None,
-        ),
-    ]
+    cameras, gain = _call(commander, scenario)
+    # No robot standing holds a camera pair: the list is empty, not refused.
+    assert cameras == (200, {"success": True, "message": "0 cameras rendered", "cameras": [], "count": 0})
+    assert gain == (400, {
+        "success": False,
+        "message": "robot 'charlie' renders no camera 'wrist_left'; get_cameras lists the cameras rendered",
+        "current_value": -1,
+    })
 
 
 def test_a_profile_the_camera_cannot_give_yet_is_reported_with_its_reason(commander, caplog):
     caplog.set_level(logging.INFO)
-    commander.bind_camera("alpha_chest", "rgbd")
-    commander.camera_profiles.get_camera_profile.answers = [_no_profile(), _no_profile(), _profile()]
+    commander.bind_cameras()
+    commander.cameras.get_cameras.answers = [_cameras(_listed("alpha", "chest", "rgbd", 640, 480, 15))]
+    commander.cameras.describe_camera.answers = [_no_profile(), _no_profile(), _profile()]
 
     async def scenario(client):
         return [await _get(client, "/api/cameras") for _ in range(3)]
@@ -1066,28 +1123,28 @@ def test_a_profile_the_camera_cannot_give_yet_is_reported_with_its_reason(comman
     first, second, third = _call(commander, scenario)
     assert first[0] == 200
     assert first[1]["cameras"] == [{
-        "id": "alpha_chest", "kind": "rgbd",
+        "id": "alpha/chest", "robot": "alpha", "camera": "chest", "kind": "rgbd",
         "info": {"width": 640, "height": 480, "frames_per_second": 15, "encoding": "rgb8"},
         "profile": None, "profile_message": _NOT_ATTACHED,
     }]
     assert second == first
     assert third[1]["cameras"][0]["profile"] == _PROFILE
     assert _node_log(commander, caplog) == [
-        (logging.INFO, f"Camera alpha_chest has no profile: {_NOT_ATTACHED}", None),
-        (logging.INFO, "Camera alpha_chest profile ready: 1 controls", None),
+        (logging.INFO, f"Camera alpha/chest has no profile: {_NOT_ATTACHED}", None),
+        (logging.INFO, "Camera alpha/chest profile ready: 1 controls", None),
     ]
 
 
 def test_a_camera_transport_failure_is_a_server_error_logged_in_one_line(commander, caplog):
     caplog.set_level(logging.INFO)
-    commander.bind_camera("alpha_wrist_left", "rgb")
-    commander.color_cameras.video_stream_info.answers = [TimeoutError("video_stream_info timed out")]
+    commander.bind_cameras()
+    commander.cameras.get_cameras.answers = [TimeoutError("get_cameras timed out")]
 
     assert _call(commander, lambda client: _get(client, "/api/cameras")) == (
-        500, {"success": False, "message": "video_stream_info timed out"},
+        500, {"success": False, "message": "get_cameras timed out"},
     )
     assert _node_log(commander, caplog) == [
-        (logging.WARNING, "GET /api/cameras failed: video_stream_info timed out", None),
+        (logging.WARNING, "GET /api/cameras failed: get_cameras timed out", None),
     ]
 
 
@@ -1095,8 +1152,7 @@ def test_setup_logs_the_bound_capabilities_and_calls_none_of_them(commander, cap
     caplog.set_level(logging.INFO)
     commander.bind_lighting()
     commander.bind_materials()
-    commander.bind_camera("alpha_wrist_left", "rgb")
-    commander.bind_camera("alpha_chest", "rgbd", profile=False)
+    commander.bind_cameras()
     monkeypatch.setattr(commander.module.listen, "bind_listener", lambda *bound: _FakeListener("127.0.0.1", 9000))
 
     async def fake_server(app, bound):
@@ -1111,10 +1167,9 @@ def test_setup_logs_the_bound_capabilities_and_calls_none_of_them(commander, cap
     assert _node_log(commander, caplog) == [
         (logging.INFO, "Scene commander starting", None),
         (logging.INFO, "Scene panel at http://127.0.0.1:9000 (bound 127.0.0.1:9000)", None),
-        (logging.INFO, "Capabilities: lighting, materials, cameras: alpha_wrist_left (rgb), alpha_chest (rgbd)", None),
+        (logging.INFO, "Capabilities: lighting, materials, cameras", None),
         (logging.INFO, "Scene provider catalogue ready: 1 assets", None),
         (logging.INFO, "Scene provider object state ready: 0 runtime objects", None),
     ]
     # The slots say what is bound; the providers are asked once the page asks.
-    assert _requests(commander, commander.lighting, commander.materials, commander.color_cameras,
-                     commander.rgbd_cameras, commander.camera_profiles) == {}
+    assert _requests(commander, commander.lighting, commander.materials, commander.cameras) == {}

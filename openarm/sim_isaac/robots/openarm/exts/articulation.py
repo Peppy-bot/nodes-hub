@@ -7,14 +7,15 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-_ARTICULATION_NAME = "peppy_bridge_articulation"
-
 
 class IsaacArticulation:
-    """Read joint states and send position commands to an articulated prim."""
+    """Read joint states from an articulated prim. Isaac registers a view
+    under a name, so a stage holding several robots names each view after the
+    robot it reads."""
 
-    def __init__(self, prim_path: str) -> None:
+    def __init__(self, prim_path: str, name: str) -> None:
         self._prim_path = prim_path
+        self._name = name
         self._view = None
         self._num_dof: int = 0
         self._ready: bool = False
@@ -28,7 +29,7 @@ class IsaacArticulation:
 
             self._view = Articulation(
                 prim_paths_expr=self._prim_path,
-                name=_ARTICULATION_NAME,
+                name=self._name,
             )
             self._view.initialize()
             self._num_dof = self._view.num_dof
@@ -91,20 +92,6 @@ class IsaacArticulation:
         except Exception as exc:
             logger.warning(f"Could not read joint states: {exc}")
             return None
-
-        if len(positions) != self._num_dof:
-            logger.warning(
-                f"Command length {len(positions)} does not match "
-                f"robot DOF {self._num_dof} — dropped."
-            )
-            return False
-        try:
-            targets = np.array([positions], dtype=np.float32)
-            self._view.set_joint_position_targets(targets)
-            return True
-        except Exception as exc:
-            logger.warning(f"Could not apply joint command: {exc}")
-            return False
 
     @property
     def num_dof(self) -> int:

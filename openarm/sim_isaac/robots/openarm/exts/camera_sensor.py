@@ -66,7 +66,10 @@ class IsaacCameraSensor:
     half-resolution depth.
     """
 
-    def __init__(self, root_prim: str, cameras: list[CameraConfig], io) -> None:
+    def __init__(self, robot: str, root_prim: str, cameras: list[CameraConfig], io) -> None:
+        # The robot this rig is mounted on: every frame it publishes goes to
+        # that robot's own camera pair.
+        self._robot = robot
         self._root = root_prim
         self._cameras = {camera.name: camera for camera in cameras}
         self._io = io
@@ -280,11 +283,12 @@ class IsaacCameraSensor:
         rgb = self._as_rgb(rgba, camera)
         if rgb is None:
             return CaptureOutcome.NO_FRAME
-        timestamp_s = self._io.camera_timestamp_s()
+        timestamp_s = self._io.timestamp_s()
         frame_id = self._frame_ids[camera.name].next()
         if camera.depth is None:
             return _delivery(
                 self._io.publish_color_frame(
+                    self._robot,
                     camera.name,
                     timestamp_s,
                     frame_id,
@@ -303,6 +307,7 @@ class IsaacCameraSensor:
         depth_m = depth_m[:: camera.height // camera.depth.height, :: camera.width // camera.depth.width]
         return _delivery(
             self._io.publish_rgbd_frames(
+                self._robot,
                 camera.name,
                 timestamp_s,
                 frame_id,
@@ -335,10 +340,11 @@ class IsaacCameraSensor:
     def _publish_stream_info(self, camera: CameraConfig) -> None:
         if camera.depth is None:
             self._io.publish_color_stream_info(
-                camera.name, camera.width, camera.height, camera.fps, COLOR_ENCODING
+                self._robot, camera.name, camera.width, camera.height, camera.fps, COLOR_ENCODING
             )
         else:
             self._io.publish_rgbd_stream_info(
+                self._robot,
                 camera.name,
                 camera.width,
                 camera.height,

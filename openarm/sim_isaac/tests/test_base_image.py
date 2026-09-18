@@ -90,8 +90,8 @@ def test_node_installs_runtime_dependencies_without_asset_conversion():
 def test_node_stages_the_head_camera_pack_where_launch_reads_it():
     # The robot bundle is upstream's robot without its head camera; the node
     # stages Waldo's head camera pack at image build, after the %files copy
-    # that brings head_camera.py in, at the directory launch.py hands the
-    # launcher. The staged pack is generated, so git ignores it.
+    # that brings head_camera.py in, at the directory launch.py reads at
+    # setup. The staged pack is generated, so git ignores it.
     definition = (_NODE_DIR / "apptainer.def").read_text()
     module = "/opt/openarm_sim_isaac/robots/openarm/head_camera.py"
     directory = "/opt/openarm_sim_isaac/robots/openarm/openarm/assets/head_camera"

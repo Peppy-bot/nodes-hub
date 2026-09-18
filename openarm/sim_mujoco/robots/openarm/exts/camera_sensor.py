@@ -195,10 +195,13 @@ class MujocoCameraSensor:
     construction with no resampling.
     """
 
-    def __init__(self, model, cameras: list[CameraConfig], io) -> None:
+    def __init__(self, model, cameras: list[CameraConfig], io, robot: str) -> None:
         self._model = model
         self._streams = {camera.name: _CameraStream(camera) for camera in cameras}
         self._io = io
+        # The robot this rig is mounted on: every frame it publishes goes to
+        # that robot's own camera pair.
+        self._robot = robot
         self._pose = _PoseSnapshot(model.nq)
         self._late_deliveries = 0
         self._worst_late: Optional[tuple[float, str]] = None
@@ -228,7 +231,7 @@ class MujocoCameraSensor:
         """Publish the just-stepped pose, and the time it holds for, to the
         render thread. Called every physics tick; rendering picks up whichever
         pose is current when a camera's frame is due."""
-        self._pose.write(qpos, self._io.camera_timestamp_s())
+        self._pose.write(qpos, self._io.timestamp_s())
 
     def raise_if_failed(self) -> None:
         """Re-raise a render-thread failure on the physics thread, whose
@@ -395,6 +398,7 @@ class MujocoCameraSensor:
         frame_id = stream.frame_ids.next()
         if camera.depth is None:
             return self._io.publish_color_frame(
+                self._robot,
                 camera.name,
                 timestamp_s,
                 frame_id,
@@ -407,6 +411,7 @@ class MujocoCameraSensor:
         depth_renderer.update_scene(data, camera=camera.name)
         depth_m = depth_renderer.render()
         return self._io.publish_rgbd_frames(
+            self._robot,
             camera.name,
             timestamp_s,
             frame_id,
@@ -423,10 +428,11 @@ class MujocoCameraSensor:
     def _publish_stream_info(self, camera: CameraConfig) -> None:
         if camera.depth is None:
             self._io.publish_color_stream_info(
-                camera.name, camera.width, camera.height, camera.fps, COLOR_ENCODING
+                self._robot, camera.name, camera.width, camera.height, camera.fps, COLOR_ENCODING
             )
             return
         self._io.publish_rgbd_stream_info(
+            self._robot,
             camera.name,
             camera.width,
             camera.height,

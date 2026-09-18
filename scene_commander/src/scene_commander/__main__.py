@@ -34,9 +34,16 @@ from peppygen.consumed_actions.simulation import (
     spawn_object,
 )
 
-from peppygen.consumed_services import color_cameras, rgbd_cameras
-
-from peppygen.consumed_services.camera_profiles import get_camera_profile, reset_camera
+from peppygen.consumed_services.cameras import (
+    describe_camera,
+    get_cameras,
+    reset_camera,
+    set_camera_brightness,
+    set_camera_contrast,
+    set_camera_exposure,
+    set_camera_gain,
+    set_camera_white_balance,
+)
 
 from peppygen.consumed_services.lighting import (
     get_lighting,
@@ -58,7 +65,7 @@ from peppygen.consumed_services.materials import (
 
 from peppygen.consumed_services.objects import get_object_states
 
-from peppygen.consumed_services.simulation import get_assets_list
+from peppygen.consumed_services.simulation import get_assets_list, get_robots_list
 
 from scene_commander import listen
 
@@ -162,6 +169,31 @@ async def _fetch_objects(node_runner: NodeRunner) -> dict:
     }
 
 
+async def _fetch_robots(node_runner: NodeRunner) -> list[dict]:
+    producer = get_robots_list.bound_producer(node_runner)
+
+    response = await get_robots_list.poll(
+        node_runner,
+        producer,
+        timeout=SERVICE_TIMEOUT_S,
+    )
+
+    data = response.data
+
+    if not data.success:
+        raise RuntimeError(data.message)
+
+    return [
+        {
+            "robot": robot.robot,
+            "model": robot.model,
+            "position": list(robot.position),
+            "attached": robot.attached,
+        }
+        for robot in data.robots
+    ]
+
+
 def _object_record(record) -> dict:
     return {
         "object_id": record.object_id,
@@ -207,82 +239,39 @@ class _StateWatch:
 
 
 @dataclass(frozen=True)
-class _Camera:
-    """One camera relay bound in this launch, with the profile bound for the
-    same instance when the launch linked both here."""
-
-    id: str
-    kind: str
-    producer: peppylib.ProducerRef
-    profile: peppylib.ProducerRef | None
-
-
-@dataclass(frozen=True)
 class _Capabilities:
     """What the launch bound beside the scene, fixed when the node starts.
 
-    A vacant slot is a capability the page never asks for. A camera is known
-    by the instance id of the relay serving it, which is also what matches
-    it to its profile.
+    A vacant slot is a capability the page never asks for. The cameras are
+    the simulation's: it lists the ones it renders, each named by its robot
+    and camera.
     """
 
     lighting: peppylib.ProducerRef | None
     materials: peppylib.ProducerRef | None
-    cameras: tuple[_Camera, ...]
-
-    def camera(self, camera_id: str) -> _Camera:
-        for camera in self.cameras:
-            if camera.id == camera_id:
-                return camera
-
-        raise CapabilityUnbound(f"no camera {camera_id} is bound in this launch")
+    cameras: peppylib.ProducerRef | None
 
     def summary(self) -> str:
-        parts = []
-
-        if self.lighting is not None:
-            parts.append("lighting")
-
-        if self.materials is not None:
-            parts.append("materials")
-
-        if self.cameras:
-            parts.append(
-                "cameras: "
-                + ", ".join(f"{camera.id} ({camera.kind})" for camera in self.cameras)
+        parts = [
+            name
+            for name, producer in (
+                ("lighting", self.lighting),
+                ("materials", self.materials),
+                ("cameras", self.cameras),
             )
+            if producer is not None
+        ]
 
         return ", ".join(parts) or "scene manipulation only"
 
 
-# The stream description of each camera kind; the instance answering it is
-# the one answering the kind's control setters.
-_STREAM_INFO = {
-    "rgb": color_cameras.video_stream_info,
-    "rgbd": rgbd_cameras.video_stream_info,
-}
-
-
 def _probe_capabilities(node_runner: NodeRunner) -> _Capabilities:
-    """Read the optional slots as the launch bound them, calling no provider.
-
-    A camera's profile is the camera_profile producer of the same instance:
-    a camera linked here without one keeps its stream and its controls, with
-    nothing describing them and no reset.
-    """
-
-    profiles = get_camera_profile.bound_producers(node_runner)
-    cameras = []
-
-    for kind, stream_info in _STREAM_INFO.items():
-        for producer in stream_info.bound_producers(node_runner):
-            profile = producer if producer in profiles else None
-            cameras.append(_Camera(producer.instance_id, kind, producer, profile))
+    """Read the optional slots as the launch bound them, calling no provider."""
 
     return _Capabilities(
         lighting=get_lighting.bound_producer(node_runner),
         materials=get_materials.bound_producer(node_runner),
-        cameras=tuple(cameras),
+        cameras=get_cameras.bound_producer(node_runner),
     )
 
 
@@ -347,23 +336,6 @@ async def _fetch_json(service, node_runner: NodeRunner, producer, field: str) ->
     return json.loads(getattr(data, field)), data.message
 
 
-async def _fetch_stream_info(node_runner: NodeRunner, camera: _Camera) -> dict:
-    response = await _STREAM_INFO[camera.kind].poll(
-        node_runner,
-        camera.producer,
-        timeout=SERVICE_TIMEOUT_S,
-    )
-
-    data = response.data
-
-    return {
-        "width": data.width,
-        "height": data.height,
-        "frames_per_second": data.frames_per_second,
-        "encoding": data.encoding,
-    }
-
-
 # ---------------------------------------------------------------------------
 # Camera controls
 # ---------------------------------------------------------------------------
@@ -371,45 +343,32 @@ async def _fetch_stream_info(node_runner: NodeRunner, camera: _Camera) -> dict:
 
 @dataclass(frozen=True)
 class _CameraControl:
-    """One control of the camera contracts: the setter of each camera kind
-    and the request it takes, built from the page's payload."""
+    """One camera control: its service on the simulation, and the fields
+    the page's payload gives its request beside the camera's name."""
 
-    rgb: ModuleType
-    rgbd: ModuleType
-    request: Callable[[ModuleType, dict], object]
-
-    def service(self, kind: str) -> ModuleType:
-        return getattr(self, kind)
+    service: ModuleType
+    fields: Callable[[dict], dict]
 
 
-def _exposure(service: ModuleType, payload: dict):
-    return service.Request(mode=_mode(payload), value=_whole(payload, "value"))
+def _exposure(payload: dict) -> dict:
+    return {"mode": _mode(payload), "value": _whole(payload, "value")}
 
 
-def _white_balance(service: ModuleType, payload: dict):
-    return service.Request(mode=_mode(payload), temperature=_whole(payload, "temperature"))
+def _white_balance(payload: dict) -> dict:
+    return {"mode": _mode(payload), "temperature": _whole(payload, "temperature")}
 
 
-def _level(service: ModuleType, payload: dict):
-    return service.Request(value=_whole(payload, "value"))
+def _level(payload: dict) -> dict:
+    return {"value": _whole(payload, "value")}
 
 
-# The camera controls by the route the page posts to. An rgb_camera names
-# its setters plainly; an rgbd_camera names them after its colour stream.
+# The camera controls by the route the page posts to.
 _CAMERA_CONTROLS = {
-    "exposure": _CameraControl(
-        color_cameras.set_exposure, rgbd_cameras.set_color_exposure, _exposure
-    ),
-    "white_balance": _CameraControl(
-        color_cameras.set_white_balance, rgbd_cameras.set_color_white_balance, _white_balance
-    ),
-    "gain": _CameraControl(color_cameras.set_gain, rgbd_cameras.set_color_gain, _level),
-    "brightness": _CameraControl(
-        color_cameras.set_brightness, rgbd_cameras.set_color_brightness, _level
-    ),
-    "contrast": _CameraControl(
-        color_cameras.set_contrast, rgbd_cameras.set_color_contrast, _level
-    ),
+    "exposure": _CameraControl(set_camera_exposure, _exposure),
+    "white_balance": _CameraControl(set_camera_white_balance, _white_balance),
+    "gain": _CameraControl(set_camera_gain, _level),
+    "brightness": _CameraControl(set_camera_brightness, _level),
+    "contrast": _CameraControl(set_camera_contrast, _level),
 }
 
 
@@ -551,13 +510,16 @@ async def _action_remove_object(node_runner: NodeRunner, object_id: str) -> dict
     return {"success": True, "message": data.message}
 
 
-async def _action_move_robot(node_runner: NodeRunner, position: list[float]) -> dict:
+async def _action_move_robot(
+    node_runner: NodeRunner, robot: str, position: list[float]
+) -> dict:
     position = [float(value) for value in position]
 
     data = await _run_action(
         move_robot,
         node_runner,
-        move_robot.GoalRequest(position=position),
+        move_robot.GoalRequest(robot=robot, position=position),
+        robot=robot,
         position=position,
     )
 
@@ -764,11 +726,22 @@ _PANELS = (
 )
 
 
-def _profile_producer(camera: _Camera):
-    if camera.profile is None:
-        raise CapabilityUnbound(f"no camera profile is bound for {camera.id} in this launch")
+def _camera_producer(app: web.Application):
+    producer = app[_CAPABILITIES].cameras
 
-    return camera.profile
+    if producer is None:
+        raise CapabilityUnbound("cameras are not bound in this launch")
+
+    return producer
+
+
+def _robot(payload: dict) -> str:
+    robot = payload.get("robot")
+
+    if not isinstance(robot, str) or not robot:
+        raise ValueError("robot must be the name of a robot, as /api/robots lists them")
+
+    return robot
 
 
 # ---------------------------------------------------------------------------
@@ -921,12 +894,25 @@ async def _api_remove_object(request: web.Request) -> web.Response:
     return web.json_response(result)
 
 
+async def _api_robots(request: web.Request) -> web.Response:
+    try:
+        robots = await _fetch_robots(request.app[_NODE_RUNNER])
+
+    except Exception as exc:
+        return _json_error(request, exc, status=500)
+
+    return web.json_response(
+        {"success": True, "robots": robots, "count": len(robots)}
+    )
+
+
 async def _api_move_robot(request: web.Request) -> web.Response:
     try:
         payload = await _request_json(request)
 
         result = await _action_move_robot(
             request.app[_NODE_RUNNER],
+            _robot(payload),
             _vector(payload, "position", 3),
         )
 
@@ -949,10 +935,7 @@ async def _api_capabilities(request: web.Request) -> web.Response:
             "success": True,
             "lighting": capabilities.lighting is not None,
             "materials": capabilities.materials is not None,
-            "cameras": [
-                {"id": camera.id, "kind": camera.kind, "profile": camera.profile is not None}
-                for camera in capabilities.cameras
-            ],
+            "cameras": capabilities.cameras is not None,
         }
     )
 
@@ -1035,60 +1018,70 @@ async def _api_reset_panel(panel: _Panel, request: web.Request) -> web.Response:
     return web.json_response(_result(data))
 
 
-async def _describe_profile(app: web.Application, camera: _Camera) -> tuple[dict | None, str]:
-    """A camera's profile and the message it came with, or None and why
-    there is none: no profile bound for it, or the provider has none yet."""
+async def _describe_camera(app: web.Application, listed) -> dict:
+    """One camera as the page lists it: its stream from the simulation's
+    listing, and its device profile when the simulation describes one."""
 
-    watch = app[_PROFILES][camera.id]
+    camera_id = f"{listed.robot}/{listed.camera}"
+    watch = app[_PROFILES].setdefault(
+        camera_id, _StateWatch("profile", "controls", provider=f"Camera {camera_id}")
+    )
+    response = await describe_camera.poll(
+        app[_NODE_RUNNER],
+        _camera_producer(app),
+        describe_camera.Request(robot=listed.robot, camera=listed.camera),
+        timeout=SERVICE_TIMEOUT_S,
+    )
+    data = response.data
+    profile = json.loads(data.profile_json) if data.success else None
 
-    try:
-        profile, message = await _fetch_json(
-            get_camera_profile, app[_NODE_RUNNER], _profile_producer(camera), "profile_json"
-        )
-
-    except CapabilityUnbound as exc:
-        return None, str(exc)
-
-    except StateUnavailable as exc:
-        watch.unavailable(str(exc))
-
-        return None, str(exc)
-
-    watch.ready(sum(1 for control in profile["controls"].values() if control.get("supported")))
-
-    return profile, message
-
-
-async def _describe_camera(app: web.Application, camera: _Camera) -> dict:
-    """One camera as the page lists it: its stream, and its profile when a
-    profile producer is bound for it and answers. A stream the relay cannot
-    describe fails the camera before its profile is asked for."""
-
-    info = await _fetch_stream_info(app[_NODE_RUNNER], camera)
-    profile, message = await _describe_profile(app, camera)
+    if profile is None:
+        watch.unavailable(data.message)
+    else:
+        watch.ready(sum(1 for control in profile["controls"].values() if control.get("supported")))
 
     return {
-        "id": camera.id,
-        "kind": camera.kind,
-        "info": info,
+        "id": camera_id,
+        "robot": listed.robot,
+        "camera": listed.camera,
+        "kind": listed.kind,
+        "info": {
+            "width": listed.width,
+            "height": listed.height,
+            "frames_per_second": listed.frames_per_second,
+            "encoding": listed.encoding,
+        },
         "profile": profile,
-        "profile_message": message,
+        "profile_message": data.message,
     }
 
 
 async def _api_cameras(request: web.Request) -> web.Response:
-    """Every bound camera, described together: one camera's round trips
-    never wait on another's."""
+    """Every camera the simulation renders, described together: one
+    camera's round trips never wait on another's."""
 
     try:
-        cameras = await asyncio.gather(
-            *(_describe_camera(request.app, camera) for camera in request.app[_CAPABILITIES].cameras)
+        response = await get_cameras.poll(
+            request.app[_NODE_RUNNER], _camera_producer(request.app), timeout=SERVICE_TIMEOUT_S
         )
+        listing = response.data
+
+        if not listing.success:
+            raise StateUnavailable(listing.message)
+
+        cameras = await asyncio.gather(
+            *(_describe_camera(request.app, listed) for listed in listing.cameras)
+        )
+
+    except CapabilityUnbound as exc:
+        return _json_error(request, exc, status=404)
 
     except Exception as exc:
         return _json_error(request, exc, status=500)
 
-    return web.json_response({"success": True, "cameras": cameras, "count": len(cameras)})
+    return web.json_response(
+        {"success": True, "message": listing.message, "cameras": cameras, "count": len(cameras)}
+    )
 
 
 async def _api_set_camera(request: web.Request) -> web.Response:
@@ -1102,16 +1095,17 @@ async def _api_set_camera(request: web.Request) -> web.Response:
         )
 
     try:
-        camera = request.app[_CAPABILITIES].camera(request.match_info["camera_id"])
-        service = control.service(camera.kind)
         payload = await _request_json(request)
 
         data = await _call_service(
-            service,
+            control.service,
             request.app[_NODE_RUNNER],
-            camera.producer,
-            control.request(service, payload),
-            camera=camera.id,
+            _camera_producer(request.app),
+            control.service.Request(
+                robot=request.match_info["robot"],
+                camera=request.match_info["camera"],
+                **control.fields(payload),
+            ),
         )
 
     except CapabilityUnbound as exc:
@@ -1125,13 +1119,13 @@ async def _api_set_camera(request: web.Request) -> web.Response:
 
 async def _api_reset_camera(request: web.Request) -> web.Response:
     try:
-        camera = request.app[_CAPABILITIES].camera(request.match_info["camera_id"])
-
         data = await _call_service(
             reset_camera,
             request.app[_NODE_RUNNER],
-            _profile_producer(camera),
-            camera=camera.id,
+            _camera_producer(request.app),
+            reset_camera.Request(
+                robot=request.match_info["robot"], camera=request.match_info["camera"]
+            ),
         )
 
     except CapabilityUnbound as exc:
@@ -1388,6 +1382,13 @@ select:disabled {
 
 <section class="card">
 <h2>Robot Root</h2>
+
+<label>Robot</label>
+<div class="row">
+<select id="robotSelect" onchange="selectRobot()" disabled></select>
+<button onclick="refreshRobots()">Refresh</button>
+</div>
+<div id="robotCount"></div>
 
 <label>Position</label>
 <div class="row">
@@ -1993,14 +1994,63 @@ async function removeObject(index) {
     }
 }
 
+let robotList = [];
+
+async function refreshRobots() {
+    try {
+        const data = await api("/api/robots");
+        robotList = data.robots;
+
+        const select = el("robotSelect");
+        const previous = select.value;
+        select.replaceChildren(...robotList.map(r =>
+            new Option(`${r.robot} (${r.model})`, r.robot)
+        ));
+        select.disabled = robotList.length === 0;
+        if (robotList.some(r => r.robot === previous)) {
+            select.value = previous;
+        }
+        selectRobot();
+
+        el("robotCount").textContent =
+            `${robotList.length} robots standing`;
+    }
+    catch (err) {
+        status(err.message, true);
+    }
+}
+
+// The selected robot's own position fills the boxes, so a move starts from
+// where that robot stands.
+function selectRobot() {
+    const robot = robotList.find(r => r.robot === el("robotSelect").value);
+    if (!robot) {
+        return;
+    }
+    const [x, y, z] = robot.position;
+    el("robotX").value = x;
+    el("robotY").value = y;
+    el("robotZ").value = z;
+}
+
 async function moveRobot() {
     try {
+        const robot = el("robotSelect").value;
+
+        if (!robot) {
+            status("select a robot to move", true);
+            return;
+        }
+
         const data = await api("/api/robot/move", {
             method: "POST",
             body: JSON.stringify({
+                robot: robot,
                 position: position("robot")
             })
         });
+
+        await refreshRobots();
 
         status(data.message);
     }
@@ -2015,7 +2065,7 @@ async function moveRobot() {
 
 // Read once at startup; a card is shown only for a capability that is
 // bound and whose provider lists something to edit.
-let capabilities = { lighting: false, materials: false, cameras: [] };
+let capabilities = { lighting: false, materials: false, cameras: false };
 
 // A change made from elsewhere (an MCP client, another copy of this page)
 // shows within this interval while the tab is visible.
@@ -2238,6 +2288,11 @@ const CAMERA_CONTROLS = {
 let cameras = [];
 let cameraShape = "";
 
+// A camera's route: its robot and its camera, each a path segment.
+function cameraPath(camera) {
+    return `${encodeURIComponent(camera.robot)}/${encodeURIComponent(camera.camera)}`;
+}
+
 function supportedControls(camera) {
     const controls = (camera.profile && camera.profile.controls) || {};
     return Object.keys(CAMERA_CONTROLS).filter(name => controls[name] && controls[name].supported);
@@ -2320,7 +2375,7 @@ async function applyCamera(index, name) {
             body.mode = el(`camera${index}_${name}_mode`).value;
         }
 
-        const data = await api(`/api/cameras/${encodeURIComponent(camera.id)}/${name}`, {
+        const data = await api(`/api/cameras/${cameraPath(camera)}/${name}`, {
             method: "POST",
             body: JSON.stringify(body)
         });
@@ -2338,7 +2393,7 @@ async function resetCamera(index) {
     try {
         const camera = cameras[index];
 
-        const data = await api(`/api/cameras/${encodeURIComponent(camera.id)}/reset`, {
+        const data = await api(`/api/cameras/${cameraPath(camera)}/reset`, {
             method: "POST",
             body: "{}"
         });
@@ -2358,7 +2413,7 @@ async function loadCapabilities() {
         capabilities = {
             lighting: Boolean(data.lighting),
             materials: Boolean(data.materials),
-            cameras: data.cameras || []
+            cameras: Boolean(data.cameras)
         };
     }
     catch (err) {
@@ -2367,14 +2422,14 @@ async function loadCapabilities() {
 }
 
 function anyCapability() {
-    return capabilities.lighting || capabilities.materials || capabilities.cameras.length > 0;
+    return capabilities.lighting || capabilities.materials || capabilities.cameras;
 }
 
 async function refreshPanels() {
     const refreshes = [];
     if (capabilities.lighting) refreshes.push(refreshPanel(LIGHTING));
     if (capabilities.materials) refreshes.push(refreshPanel(MATERIALS));
-    if (capabilities.cameras.length) refreshes.push(refreshCameras());
+    if (capabilities.cameras) refreshes.push(refreshCameras());
     await Promise.all(refreshes);
 }
 
@@ -2382,6 +2437,7 @@ async function startup() {
     await loadCapabilities();
     await loadCatalogue();
     await refreshObjects();
+    await refreshRobots();
 
     if (anyCapability()) {
         await refreshPanels();
@@ -2420,16 +2476,14 @@ def _build_app(node_runner: NodeRunner) -> web.Application:
     app[_OBJECT_STATE] = _StateWatch("object state", "runtime objects")
     app[_LIGHTING] = _StateWatch("lighting", "lights")
     app[_MATERIALS] = _StateWatch("materials", "materials")
-    app[_PROFILES] = {
-        camera.id: _StateWatch("profile", "controls", provider=f"Camera {camera.id}")
-        for camera in capabilities.cameras
-    }
+    app[_PROFILES] = {}
 
     app.router.add_get("/", _index)
     app.router.add_get("/api/health", _api_health)
     app.router.add_get("/api/capabilities", _api_capabilities)
     app.router.add_get("/api/assets", _api_assets)
     app.router.add_get("/api/objects", _api_objects)
+    app.router.add_get("/api/robots", _api_robots)
     app.router.add_post("/api/scene/load", _api_load_scene)
     app.router.add_post("/api/scene/clear", _api_clear_scene)
     app.router.add_post("/api/objects/spawn", _api_spawn_object)
@@ -2442,8 +2496,8 @@ def _build_app(node_runner: NodeRunner) -> web.Application:
         app.router.add_post(f"/api/{panel.name}/reset", partial(_api_reset_panel, panel))
         app.router.add_post(f"/api/{panel.name}/{{property}}", partial(_api_set_panel, panel))
     app.router.add_get("/api/cameras", _api_cameras)
-    app.router.add_post("/api/cameras/{camera_id}/reset", _api_reset_camera)
-    app.router.add_post("/api/cameras/{camera_id}/{control}", _api_set_camera)
+    app.router.add_post("/api/cameras/{robot}/{camera}/reset", _api_reset_camera)
+    app.router.add_post("/api/cameras/{robot}/{camera}/{control}", _api_set_camera)
 
     return app
 

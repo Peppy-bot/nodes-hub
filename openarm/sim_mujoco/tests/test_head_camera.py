@@ -144,6 +144,12 @@ def pack(tmp_path, monkeypatch):
     return SimpleNamespace(directory=directory, files=files, digest=digest, served=served)
 
 
+@pytest.fixture
+def loaded(pack):
+    """The staged pack as setup reads it."""
+    return head_camera.load(pack.directory, _CAMERAS_CONFIG)
+
+
 def _store(pack, served=None, requests=None):
     """An opener serving the pack's files from the store's URL layout, to a
     request that names its agent (the store's Cloudflare front refuses
@@ -299,10 +305,41 @@ def _geom(model, name):
     return mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, name)
 
 
+class TestLoad:
+    def test_reads_the_staged_pack_and_its_mount_origin(self, pack):
+        loaded = head_camera.load(pack.directory, _CAMERAS_CONFIG)
+        assert loaded == head_camera.Pack(directory=pack.directory, body_position=(0.0315, 0.0, 0.743))
+
+    def test_refuses_an_unstaged_pack(self, tmp_path):
+        with pytest.raises(FileNotFoundError, match="fetch"):
+            head_camera.load(tmp_path / "head_camera", _CAMERAS_CONFIG)
+
+    def test_refuses_a_pack_that_is_not_the_pinned_one(self, pack):
+        (pack.directory / "cover.obj").write_bytes(b"v 0 0 0\n")
+        with pytest.raises(ValueError, match="does not match the pack index"):
+            head_camera.load(pack.directory, _CAMERAS_CONFIG)
+
+    def test_refuses_a_pack_the_chest_camera_is_off(self, tmp_path, monkeypatch):
+        rig = copy.deepcopy(_RIG)
+        rig["cameras"]["left"]["position_m"] = [0.0794, 0.031497, 0.794103]
+        directory = tmp_path / "head_camera"
+        monkeypatch.setattr(head_camera, "PACK_DIGEST", _stage(directory, _pack_files(rig)))
+        with pytest.raises(RuntimeError, match="left lens front"):
+            head_camera.load(directory, _CAMERAS_CONFIG)
+
+    def test_refuses_a_pack_framed_in_another_body(self, tmp_path, monkeypatch):
+        rig = copy.deepcopy(_RIG)
+        rig["body"]["name"] = "head"
+        directory = tmp_path / "head_camera"
+        monkeypatch.setattr(head_camera, "PACK_DIGEST", _stage(directory, _pack_files(rig)))
+        with pytest.raises(ValueError, match="not 'openarm_head_camera'"):
+            head_camera.load(directory, _CAMERAS_CONFIG)
+
+
 class TestAttach:
-    def test_puts_waldos_head_camera_block_on_the_pedestal(self, pack):
+    def test_puts_waldos_head_camera_block_on_the_pedestal(self, loaded):
         spec = _spec()
-        body = head_camera.attach(spec, pack.directory, _CAMERAS_CONFIG)
+        body = head_camera.attach(spec, loaded)
         model = spec.compile()
         data = mujoco.MjData(model)
         mujoco.mj_forward(model, data)
@@ -343,57 +380,33 @@ class TestAttach:
         assert model.geom_friction[hull] == pytest.approx((1, 0.01, 0.01))
         assert model.geom_matid[hull] == -1
 
-    def test_seats_on_the_pedestal_body_where_the_scene_keeps_one(self, pack):
+    def test_seats_on_the_pedestal_body_where_the_scene_keeps_one(self, loaded):
         spec = _spec(_SCENE.replace(
             '<geom name="openarm_body_link0_collision_column"',
             '<body name="openarm_body_link0" pos="0 0 0.01"><geom name="column"',
         ).replace('pos="0 0 0.3"/>', 'pos="0 0 0.3"/></body>'))
-        head_camera.attach(spec, pack.directory, _CAMERAS_CONFIG)
+        head_camera.attach(spec, loaded)
         model = spec.compile()
         body = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "openarm_head_camera")
         pedestal = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "openarm_body_link0")
         assert model.body_parentid[body] == pedestal
 
-    def test_refuses_a_scene_without_the_pedestal(self, pack):
+    def test_refuses_a_scene_without_the_pedestal(self, loaded):
         spec = _spec(_SCENE.replace("openarm_body_link0_collision_column", "column"))
         with pytest.raises(RuntimeError, match="openarm_body_link0"):
-            head_camera.attach(spec, pack.directory, _CAMERAS_CONFIG)
+            head_camera.attach(spec, loaded)
 
-    def test_refuses_a_scene_without_matte_black(self, pack):
+    def test_refuses_a_scene_without_matte_black(self, loaded):
         spec = _spec(_SCENE.replace('name="matte_black"', 'name="glossy"'))
         with pytest.raises(RuntimeError, match="matte_black"):
-            head_camera.attach(spec, pack.directory, _CAMERAS_CONFIG)
+            head_camera.attach(spec, loaded)
         assert spec.body("openarm_head_camera") is None
 
-    def test_refuses_an_unstaged_pack(self, tmp_path):
+    def test_refuses_a_second_attach(self, loaded):
         spec = _spec()
-        with pytest.raises(FileNotFoundError, match="fetch"):
-            head_camera.attach(spec, tmp_path / "head_camera", _CAMERAS_CONFIG)
-        assert spec.body("openarm_head_camera") is None
-
-    def test_refuses_a_pack_the_chest_camera_is_off_and_adds_nothing(self, tmp_path, monkeypatch):
-        rig = copy.deepcopy(_RIG)
-        rig["cameras"]["left"]["position_m"] = [0.0794, 0.031497, 0.794103]
-        directory = tmp_path / "head_camera"
-        monkeypatch.setattr(head_camera, "PACK_DIGEST", _stage(directory, _pack_files(rig)))
-        spec = _spec()
-        with pytest.raises(RuntimeError, match="left lens front"):
-            head_camera.attach(spec, directory, _CAMERAS_CONFIG)
-        assert spec.body("openarm_head_camera") is None
-
-    def test_refuses_a_pack_framed_in_another_body(self, tmp_path, monkeypatch):
-        rig = copy.deepcopy(_RIG)
-        rig["body"]["name"] = "head"
-        directory = tmp_path / "head_camera"
-        monkeypatch.setattr(head_camera, "PACK_DIGEST", _stage(directory, _pack_files(rig)))
-        with pytest.raises(ValueError, match="not 'openarm_head_camera'"):
-            head_camera.attach(_spec(), directory, _CAMERAS_CONFIG)
-
-    def test_refuses_a_second_attach(self, pack):
-        spec = _spec()
-        head_camera.attach(spec, pack.directory, _CAMERAS_CONFIG)
+        head_camera.attach(spec, loaded)
         with pytest.raises(RuntimeError, match="already has"):
-            head_camera.attach(spec, pack.directory, _CAMERAS_CONFIG)
+            head_camera.attach(spec, loaded)
 
 
 @pytest.fixture
@@ -402,6 +415,7 @@ def launcher_module(monkeypatch):
     modules) faked out; the scene loading under test is real."""
     bridge = types.ModuleType("bridge_extension")
     bridge.MujocoBridgeExtension = object
+    bridge.Layout = object
     monkeypatch.setitem(sys.modules, "bridge_extension", bridge)
     monkeypatch.delitem(sys.modules, "_launcher", raising=False)
     import _launcher  # pylint: disable=C0415
@@ -409,8 +423,48 @@ def launcher_module(monkeypatch):
     return _launcher
 
 
+def test_the_head_camera_is_the_v2_models(loaded):
+    """The head camera seats on the v2 pedestal, so a robot standing as that
+    model draws it and a v1 draws none; a model the engine does not carry
+    has no answer."""
+    from scenes import Catalogue  # pylint: disable=C0415
+
+    catalogue = Catalogue.baked(head_camera_pack=loaded)
+    assert catalogue.head_camera_pack("openarm_v2") is loaded
+    assert catalogue.head_camera_pack("openarm_v1") is None
+    with pytest.raises(ValueError, match="this engine stands openarm_v1, openarm_v2"):
+        catalogue.head_camera_pack("openarm_v3")
+
+
 class TestLauncher:
-    def test_loads_the_scene_with_the_head_camera_and_the_rendered_cameras(self, launcher_module, tmp_path, pack):
+    def test_a_stand_loads_its_scene_with_the_pack_it_carries(self, launcher_module, loaded):
+        """The thread loads each stand's scene with the head camera pack the
+        stand carries; a scene that cannot load fails that stand alone."""
+        from stands import Stands  # pylint: disable=C0415
+
+        stands = Stands()
+        stop = threading.Event()
+        launcher = launcher_module.SimLauncher(
+            stands, stop, None, None, 100, True, "0.0.0.0", 8080, [],
+        )
+        asked = []
+
+        def load_model(scene, head_camera_pack):
+            asked.append((scene, head_camera_pack))
+            stop.set()
+            raise RuntimeError("this test loads no scene")
+
+        launcher._load_model = load_model
+        scene = Path("/opt/robot_assets/openarm_bimanual_v2.xml")
+        standing = stands.stand(scene, "alpha", head_camera_pack=loaded)
+
+        launcher.run()
+
+        assert asked == [(scene, loaded)]
+        with pytest.raises(RuntimeError, match="this test loads no scene"):
+            standing.result(timeout=0)
+
+    def test_loads_the_scene_with_the_head_camera_and_the_rendered_cameras(self, launcher_module, tmp_path, loaded):
         from camera_common import load_camera_configs  # pylint: disable=C0415
 
         scene = tmp_path / "openarm_bimanual_v2.xml"
@@ -418,17 +472,16 @@ class TestLauncher:
 
         def model(head_camera_pack, cameras):
             return launcher_module.SimLauncher(
-                scene, threading.Event(), threading.Event(), None, 100, True, "0.0.0.0", 8080,
-                cameras, head_camera_pack,
-            )._load_model()
+                None, threading.Event(), None, None, 100, True, "0.0.0.0", 8080, cameras,
+            )._load_model(scene, head_camera_pack)
 
         chest = [c for c in load_camera_configs(_CAMERAS_CONFIG) if c.name == "chest"]
-        rendered = model(pack.directory, chest)
+        rendered = model(loaded, chest)
         assert _geom(rendered, "head_camera_cover") >= 0
         assert mujoco.mj_name2id(rendered, mujoco.mjtObj.mjOBJ_CAMERA, "chest") >= 0
 
         # The head camera is drawn whether or not the cameras render.
-        drawn = model(pack.directory, [])
+        drawn = model(loaded, [])
         assert _geom(drawn, "head_camera_cover") >= 0
         assert drawn.ncam == 0
 
@@ -441,8 +494,8 @@ class TestLauncher:
 def test_node_stages_the_head_camera_pack_where_launch_reads_it():
     # The baked scene is upstream's robot without its head camera; the node
     # stages Waldo's head camera pack at image build, after the %files copy
-    # that brings head_camera.py in, at the directory launch.py hands the
-    # launcher. The staged pack is generated, so git ignores it.
+    # that brings head_camera.py in, at the directory launch.py reads at
+    # setup. The staged pack is generated, so git ignores it.
     definition = (_NODE_DIR / "apptainer.def").read_text()
     module = "/opt/openarm_sim_mujoco/robots/openarm/head_camera.py"
     directory = "/opt/openarm_sim_mujoco/robots/openarm/openarm/assets/head_camera"
@@ -456,6 +509,7 @@ def test_node_stages_the_head_camera_pack_where_launch_reads_it():
     assert re.search(r"^%post\n\s*set -e$", definition, re.MULTILINE)
     launch = (_ROBOT_DIR / "openarm" / "launch.py").read_text()
     assert '_HEAD_CAMERA_DIR = Path(__file__).parent / "assets" / "head_camera"' in launch
-    assert "_head_camera_pack(params.hardware_version)" in launch
+    assert "head_camera.load(_HEAD_CAMERA_DIR, _CAMERAS_CONFIG_PATH)" in launch
+    assert "Catalogue.baked(head_camera_pack=head_camera_pack)" in launch
     ignored = (_NODE_DIR.parents[1] / ".gitignore").read_text().splitlines()
     assert "openarm/sim_mujoco/robots/openarm/openarm/assets/head_camera/" in ignored

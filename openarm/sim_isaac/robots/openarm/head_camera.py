@@ -12,9 +12,9 @@ lens barrels, and provenance. A pack is keyed by the SHA-256 of its
 inventory, so the digest pinned here names one exact set of files for good.
 
 `fetch` stages that pack into the node image (apptainer.def runs it at
-build) and `attach` puts its meshes under the pedestal link of the loaded
-robot, so the Isaac robot carries the same head camera as Waldo's
-openarm_v2 wrapper. The chest camera of config/cameras.json5, whose pose
+build), `load` reads the staged pack once at node setup, and `attach` puts
+its meshes under the pedestal link of a robot on the stage, so the Isaac
+robot carries the same head camera as Waldo's openarm_v2 wrapper. The chest camera of config/cameras.json5, whose pose
 the camera sensor renders from, is checked to sit at the pack's left lens
 front, the eye the real ZED's rectified stream comes from.
 
@@ -27,6 +27,7 @@ import argparse
 import hashlib
 import json
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 import shutil
 import sys
@@ -269,18 +270,44 @@ def check_chest_camera(rig: dict, cameras_config: Path) -> None:
         )
 
 
-def attach(stage, root: str, pack: Path, cameras_config: Path) -> str:
+@dataclass(frozen=True, eq=False)
+class Pack:
+    """A staged pack, read and checked: its directory, its mount origin in
+    the pedestal link's frame, each visual mesh by name as (positions,
+    normals, triangles), and the collision hull as (points, triangles)."""
+
+    directory: Path
+    body_position: tuple[float, float, float]
+    visuals: tuple[tuple[str, tuple[np.ndarray, np.ndarray, np.ndarray]], ...]
+    collision: tuple[np.ndarray, np.ndarray]
+
+
+def load(directory: Path, cameras_config: Path) -> Pack:
+    """The pack staged at `directory`, verified against the pinned digest,
+    with the chest camera of `cameras_config` checked against its rig and
+    its meshes read. The node reads it once at setup, so a pack that is not
+    staged or not the pinned one, a mesh it cannot read, or a chest camera
+    config that has drifted off the pack's left eye stops the node before
+    any robot stands."""
+    verify(directory)
+    rig = json.loads((directory / RIG_FILE).read_text())
+    check_chest_camera(rig, cameras_config)
+    return Pack(
+        directory=directory,
+        body_position=body_position(rig),
+        visuals=tuple((name, read_obj(directory / f"{name}.obj")) for name in VISUAL_MESHES),
+        collision=read_stl(directory / COLLISION_FILE),
+    )
+
+
+def attach(stage, root: str, pack: Pack) -> str:
     """Puts the head camera under the pedestal link of the robot at `root`:
     the body at the pack's mount origin, its three meshes in matte black
     shaded by the pack's own normals, and the convex hull as the link's collider,
     a guide so it is never drawn. Returns the body's path. Raises on a link
-    the robot lacks, a pack that is not the pinned one, or a chest camera
-    config that has drifted off the pack's left eye."""
+    the robot lacks or a head camera already under it."""
     from pxr import Gf, Usd, UsdGeom, UsdPhysics, UsdShade, Vt
 
-    verify(pack)
-    rig = json.loads((pack / RIG_FILE).read_text())
-    check_chest_camera(rig, cameras_config)
     root_prim = stage.GetPrimAtPath(root)
     link = None
     if root_prim and root_prim.IsValid():
@@ -292,10 +319,9 @@ def attach(stage, root: str, pack: Path, cameras_config: Path) -> str:
         raise RuntimeError(f"{body_path} is already on the stage")
 
     body = UsdGeom.Xform.Define(stage, body_path)
-    body.AddTranslateOp().Set(Gf.Vec3d(*body_position(rig)))
+    body.AddTranslateOp().Set(Gf.Vec3d(*pack.body_position))
     material = _material(stage, body_path.AppendChild("Looks").AppendChild("matte_black"))
-    for name in VISUAL_MESHES:
-        positions, normals, triangles = read_obj(pack / f"{name}.obj")
+    for name, (positions, normals, triangles) in pack.visuals:
         mesh = _mesh(stage, body_path.AppendChild(name), positions, triangles)
         # One normal per face corner, the layout the bundle's own visuals
         # use and the one Kit's renderer takes without complaint; the pack's
@@ -304,7 +330,7 @@ def attach(stage, root: str, pack: Path, cameras_config: Path) -> str:
         mesh.SetNormalsInterpolation(UsdGeom.Tokens.faceVarying)
         mesh.CreateDisplayColorAttr(Vt.Vec3fArray([Gf.Vec3f(*COLOR)]))
         UsdShade.MaterialBindingAPI.Apply(mesh.GetPrim()).Bind(material)
-    points, triangles = read_stl(pack / COLLISION_FILE)
+    points, triangles = pack.collision
     hull = _mesh(stage, body_path.AppendChild("collision"), points, triangles)
     hull.CreatePurposeAttr(UsdGeom.Tokens.guide)
     UsdPhysics.CollisionAPI.Apply(hull.GetPrim())

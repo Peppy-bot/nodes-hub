@@ -251,6 +251,9 @@ async fn every_control_forwards_to_the_response_model_under_the_camera_slot() ->
             let captured = control.$twin.captured()?;
             assert_eq!(captured.len(), 1, stringify!($twin));
             assert_eq!(captured[0].camera, simulation_mock::PEER_LINK_ID);
+            // The relay names no robot: the simulation tells its robot by
+            // the pair the relay holds.
+            assert_eq!(captured[0].robot, "");
             $expect(&captured[0]);
         }};
     }

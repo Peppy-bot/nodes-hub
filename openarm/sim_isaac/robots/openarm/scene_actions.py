@@ -22,9 +22,10 @@ from peppygen.exposed_actions.scene import (
     spawn_object,
 )
 from peppygen.exposed_services.objects import get_object_states
-from peppygen.exposed_services.scene import get_assets_list
+from peppygen.exposed_services.scene import get_assets_list, get_robots_list
 
 from object_state import IsaacObjectReader, ObjectStateSnapshot
+
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,8 @@ _NOT_CAPTURED = (
     "Isaac has not captured its object state yet; it captures once the "
     "stage has loaded and the simulation is stepping"
 )
+
+
 
 
 @dataclass
@@ -55,11 +58,16 @@ class SceneActionIO:
         node_runner,
         loop: asyncio.AbstractEventLoop,
         io,
+        world,
     ) -> None:
         self._node_runner = node_runner
         self._loop = loop
         # Stamps every object-state capture on the joint states' timeline.
         self._io = io
+
+        # The stage's own account of which robots stand in it, which
+        # get_robots_list reports and move_robot resolves a name against.
+        self._world = world
 
         self._lock = threading.Lock()
 
@@ -115,6 +123,7 @@ class SceneActionIO:
             ),
             asyncio.create_task(self._serve_assets()),
             asyncio.create_task(self._serve_object_states()),
+            asyncio.create_task(self._serve_robots()),
             asyncio.create_task(self._serve_load_scene()),
             asyncio.create_task(self._serve_clear_scene()),
             asyncio.create_task(self._serve_spawn_object()),
@@ -362,6 +371,28 @@ class SceneActionIO:
                 )
                 for record in snapshot.objects
             ],
+        )
+
+    def _handle_get_robots(
+        self,
+        _request,
+    ) -> get_robots_list.Response:
+        standing = self._world.robots()
+        robots = [
+            get_robots_list.ResponseRobotsItem(
+                robot=robot.instance,
+                model=robot.model,
+                position=list(robot.placement.position),
+                # Every robot on this stage joined it by attaching.
+                attached=True,
+            )
+            for robot in standing
+        ]
+        plural = "" if len(robots) == 1 else "s"
+        return get_robots_list.Response(
+            success=True,
+            message=f"{len(robots)} robot{plural} standing",
+            robots=robots,
         )
 
     async def _submit(
@@ -706,6 +737,20 @@ class SceneActionIO:
             }
 
         if operation == "move_robot":
+            robot = payload["robot"]
+            standing = self._world.robots()
+            names = [
+                each.instance
+                for each in standing
+            ]
+
+            if robot not in names:
+                raise ValueError(
+                    f"no robot stands as {robot!r} in this "
+                    f"simulation, which stands "
+                    f"{', '.join(names) or 'none'}"
+                )
+
             position = [
                 float(value)
                 for value in payload["position"]
@@ -718,6 +763,7 @@ class SceneActionIO:
 
             launcher._runtime_move_robot_root(
                 {
+                    "robot": robot,
                     "position": position,
                 }
             )
@@ -803,6 +849,23 @@ class SceneActionIO:
             except Exception:
                 logger.exception(
                     "get_object_states service failed"
+                )
+                await asyncio.sleep(1.0)
+
+    async def _serve_robots(self) -> None:
+        while True:
+            try:
+                await get_robots_list.handle_next_request(
+                    self._node_runner,
+                    self._handle_get_robots,
+                )
+
+            except asyncio.CancelledError:
+                raise
+
+            except Exception:
+                logger.exception(
+                    "get_robots_list service failed"
                 )
                 await asyncio.sleep(1.0)
 
@@ -1027,6 +1090,7 @@ class SceneActionIO:
             result = await self._submit(
                 "move_robot",
                 {
+                    "robot": request.robot,
                     "position": list(
                         request.position
                     ),

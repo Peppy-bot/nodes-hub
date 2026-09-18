@@ -1,12 +1,14 @@
 # Isaac Sim browser viewer
 
-The `isaac_webviewer` node serves the compiled NVIDIA WebRTC client on port
-8210, at the URLs the launch prints under `Web pages:` (`peppy stack list`
+The `isaac_webviewer` node serves the compiled NVIDIA WebRTC client on the
+`http_port` its launcher prefers (8210 by default), at the URLs the launch
+prints under `Web pages:` (`peppy stack list`
 shows them again under `Instance endpoints`). It serves the frontend from the
 base image's `/app/dist` with a Python HTTP server. The browser connects
 directly to the same hostname on TCP **49100** for signaling and UDP **47998**
 for media. These ports must be reachable from the browser, not just from the
-viewer container.
+viewer container. A viewer whose port another process already holds takes
+one of its own and announces the address it took.
 
 The viewer and simulator are separate nodes. Serving the page successfully does
 not establish that Isaac's GPU renderer or streaming server is running. The

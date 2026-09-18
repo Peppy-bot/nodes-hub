@@ -12,12 +12,12 @@ pack is keyed by the SHA-256 of its inventory, so the digest pinned here
 names one exact set of files for good.
 
 `fetch` stages that pack into the node image (apptainer.def runs it at
-build) and `attach` adds its meshes to the scene's spec on the pedestal,
-the same body Waldo's openarm_v2 wrapper carries, so the MuJoCo robot draws
-and collides with the head camera the way Waldo's does. The chest camera of
-config/cameras.json5, whose pose the camera sensor renders from, is checked
-to sit at the pack's left lens front, the eye the real ZED's rectified
-stream comes from.
+build), `load` reads the staged pack once at node setup, and `attach` adds
+its meshes to a scene's spec on the pedestal, the same body Waldo's
+openarm_v2 wrapper carries, so the MuJoCo robot draws and collides with the
+head camera the way Waldo's does. The chest camera of config/cameras.json5,
+whose pose the camera sensor renders from, is checked to sit at the pack's
+left lens front, the eye the real ZED's rectified stream comes from.
 
     python3 head_camera.py fetch <directory>
 """
@@ -28,6 +28,7 @@ import argparse
 import hashlib
 import json
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 import shutil
 import sys
@@ -225,16 +226,33 @@ def check_chest_camera(rig: dict, cameras_config: Path) -> None:
         )
 
 
-def attach(spec, pack: Path, cameras_config: Path):
+@dataclass(frozen=True)
+class Pack:
+    """A staged pack, checked: the directory its meshes are read from and
+    its mount origin in the pedestal link's frame."""
+
+    directory: Path
+    body_position: tuple[float, float, float]
+
+
+def load(directory: Path, cameras_config: Path) -> Pack:
+    """The pack staged at `directory`, verified against the pinned digest,
+    with the chest camera of `cameras_config` checked against its rig. The
+    node reads it once at setup, so a pack that is not staged or not the
+    pinned one, or a chest camera config that has drifted off the pack's
+    left eye, stops the node before any robot stands."""
+    verify(directory)
+    rig = json.loads((directory / RIG_FILE).read_text())
+    check_chest_camera(rig, cameras_config)
+    return Pack(directory=directory, body_position=body_position(rig))
+
+
+def attach(spec, pack: Pack):
     """Adds the head camera to the scene's spec: the body at the pack's mount
     origin on the pedestal, its three meshes in the scene's matte black, and
     the convex hull as a collider in the collision group, Waldo's wrapper
     block geom for geom. Returns the body. Raises on a scene without the
-    pedestal or its material, a pack that is not the pinned one, or a chest
-    camera config that has drifted off the pack's left eye."""
-    verify(pack)
-    rig = json.loads((pack / RIG_FILE).read_text())
-    check_chest_camera(rig, cameras_config)
+    pedestal or its material, or one that has the head camera already."""
     parent = _pedestal(spec)
     if spec.body(BODY_NAME) is not None:
         raise RuntimeError(f"the scene already has a {BODY_NAME!r} body")
@@ -243,14 +261,14 @@ def attach(spec, pack: Path, cameras_config: Path):
 
     body = parent.add_body()
     body.name = BODY_NAME
-    body.pos = list(body_position(rig))
+    body.pos = list(pack.body_position)
     for name in VISUAL_MESHES:
-        geom = _mesh_geom(spec, body, name, pack / f"{name}.obj", "model/obj")
+        geom = _mesh_geom(spec, body, name, pack.directory / f"{name}.obj", "model/obj")
         geom.material = MATERIAL
         geom.contype = 0
         geom.conaffinity = 0
         geom.group = _VISUAL_GROUP
-    hull = _mesh_geom(spec, body, "collision", pack / COLLISION_FILE, "model/stl")
+    hull = _mesh_geom(spec, body, "collision", pack.directory / COLLISION_FILE, "model/stl")
     hull.condim = _COLLISION_CONDIM
     hull.conaffinity = 1
     hull.priority = _COLLISION_PRIORITY

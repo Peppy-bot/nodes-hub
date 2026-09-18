@@ -109,9 +109,17 @@ def loop_fixture():
     loop.close()
 
 
+class _Robots:
+    """The scene's robots, which a pair's copy names. The clock half of the
+    bridge never reads one."""
+
+    def sole_name(self):
+        return None
+
+
 @pytest.fixture(name="io")
 def io_fixture(loop):
-    io = sim_topics.SimTopicIO(node_runner=object(), loop=loop)
+    io = sim_topics.SimTopicIO(node_runner=object(), loop=loop, robots=_Robots())
     io._clock_publisher = _FakeClockPublisher()
     return io
 
@@ -124,25 +132,25 @@ async def _drain(loop_turns: int = 10) -> None:
 
 
 def test_a_consumer_stamps_from_its_bound_clock(loop, monkeypatch):
-    io = sim_topics.SimTopicIO(node_runner=object(), loop=loop)
+    io = sim_topics.SimTopicIO(node_runner=object(), loop=loop, robots=_Robots())
     monkeypatch.setattr(sim_topics.clock, "now_ns", lambda: 5_000_000_000)
-    assert io._timestamp_s() == 5.0
+    assert io.timestamp_s() == 5.0
     # And the publisher paths are inert: nothing declared, nothing recorded.
     io.record_engine_time(1.0)
     io.publish_clock_tick()
-    assert io._timestamp_s() == 5.0
+    assert io.timestamp_s() == 5.0
 
 
 def test_a_publisher_stamps_from_its_recorded_engine_clock(io):
     io.record_engine_time(1.25)
-    assert io._timestamp_s() == 1.25
+    assert io.timestamp_s() == 1.25
     io.record_engine_time(1.5)
-    assert io._timestamp_s() == 1.5
+    assert io.timestamp_s() == 1.5
 
 
 def test_a_publisher_must_record_before_stamping_or_publishing(io):
     with pytest.raises(RuntimeError, match="record an engine step"):
-        io._timestamp_s()
+        io.timestamp_s()
     with pytest.raises(RuntimeError, match="record an engine step"):
         io.publish_clock_tick()
 
@@ -159,7 +167,7 @@ def test_an_engine_clock_below_one_nanosecond_still_carries_an_instant(io, loop,
     below one nanosecond is floored rather than refused: the stamp and the tick
     carry the same instant, and neither is zero."""
     io.record_engine_time(engine_time_s)
-    assert io._timestamp_s() > 0.0
+    assert io.timestamp_s() > 0.0
     io.publish_clock_tick()
     loop.run_until_complete(_drain())
     assert io._clock_publisher.published == [1]
@@ -213,7 +221,7 @@ def test_a_capture_is_stamped_on_the_state_timeline_or_not_at_all(io, loop, monk
     io.record_engine_time(3.25)
     assert io.capture_timestamp_s() == 3.25
 
-    follower = sim_topics.SimTopicIO(node_runner=object(), loop=loop)
+    follower = sim_topics.SimTopicIO(node_runner=object(), loop=loop, robots=_Robots())
     monkeypatch.setattr(sim_topics.clock, "now_ns", lambda: 7_000_000_000)
     assert follower.capture_timestamp_s() == 7.0
 

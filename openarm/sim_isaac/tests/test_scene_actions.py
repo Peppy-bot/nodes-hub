@@ -17,7 +17,39 @@ import pytest
 
 _ROBOT_DIR = Path(__file__).resolve().parents[1] / "robots" / "openarm"
 _ACTIONS = ("apply_force", "clear_scene", "load_scene", "move_object", "move_robot", "remove_object", "spawn_object")
-_SERVICES = {"scene": ("get_assets_list",), "objects": ("get_object_states",)}
+_SERVICES = {
+    "scene": ("get_assets_list", "get_robots_list"),
+    "objects": ("get_object_states",),
+}
+
+
+class _Robot(SimpleNamespace):
+    """A robot as world.py reports it: the name it stands under, its model,
+    and where."""
+
+    def prim(self):
+        return f"/World/{self.instance}"
+
+
+class _World:
+    """The stage's robots, as SceneActionIO reads them."""
+
+    def __init__(self, robots):
+        self._robots = list(robots)
+
+    def robots(self):
+        return list(self._robots)
+
+
+def _world(*robots):
+    return _World(
+        _Robot(
+            instance=instance,
+            model=model,
+            placement=SimpleNamespace(position=position),
+        )
+        for instance, model, position in robots
+    )
 
 
 class FakeStamps:
@@ -71,6 +103,8 @@ def provider(monkeypatch):
             module = ModuleType(f"{services.__name__}.{name}")
             module.Response = lambda **fields: SimpleNamespace(**fields)
             module.ResponseObjectsItem = lambda **fields: SimpleNamespace(**fields)
+            # The generated record of one robot in a get_robots_list answer.
+            module.ResponseRobotsItem = lambda **fields: SimpleNamespace(**fields)
             setattr(services, name, module)
         modules[services.__name__] = services
     for name, module in modules.items():
@@ -83,7 +117,8 @@ def provider(monkeypatch):
     spec.loader.exec_module(module)
 
     stamps = FakeStamps()
-    io = module.SceneActionIO(object(), Mock(), stamps)
+    world = _world(("alpha", "openarm_v2", (0.0, 0.0, 0.0)))
+    io = module.SceneActionIO(object(), Mock(), stamps, world)
     # The stage by object_id: where the launcher put each object.
     stage = {}
     reader = FakeReader(stage, importlib.import_module("object_state").ObjectRecord)
@@ -92,7 +127,10 @@ def provider(monkeypatch):
     launcher._runtime_spawn_isaac_asset.side_effect = lambda command: stage.__setitem__(command["name"], command["position"])
     launcher._runtime_move_object.side_effect = lambda command: stage.__setitem__(command["name"], command["position"])
     launcher._runtime_remove.side_effect = lambda command: stage.pop(command["name"], None)
-    return SimpleNamespace(module=module, io=io, launcher=launcher, stamps=stamps, reader=reader, stage=stage)
+    return SimpleNamespace(
+        module=module, io=io, launcher=launcher, stamps=stamps, reader=reader,
+        stage=stage, world=world,
+    )
 
 
 _CATALOGUE = {
@@ -190,6 +228,54 @@ def test_load_scene_rejects_unknown_or_non_scene_assets_before_touching_the_stag
         provider.io._execute(provider.launcher, "load_scene", {"asset_id": asset_id, "scale": 1.0})
     assert provider.launcher.mock_calls == []
     assert _spawned_ids(provider) == [object_id]
+
+
+def test_the_listing_names_every_robot_the_stage_stands(provider):
+    listed = provider.io._handle_get_robots(None).robots
+
+    assert len(listed) == 1
+    assert (listed[0].robot, listed[0].model) == ("alpha", "openarm_v2")
+    assert listed[0].position == [0.0, 0.0, 0.0]
+    assert listed[0].attached
+
+
+def test_the_listing_follows_the_robots_that_join(provider):
+    provider.io._world = _world(
+        ("alpha", "openarm_v2", (0.0, 0.0, 0.0)),
+        ("bravo", "openarm_v1", (0.0, -1.5, 0.0)),
+    )
+
+    listed = provider.io._handle_get_robots(None).robots
+
+    assert [r.robot for r in listed] == ["alpha", "bravo"]
+    assert [r.attached for r in listed] == [True, True]
+    assert listed[1].model == "openarm_v1"
+    assert listed[1].position == [0.0, -1.5, 0.0]
+
+
+def test_moving_a_robot_by_name_moves_that_robot(provider):
+    provider.io._world = _world(
+        ("alpha", "openarm_v2", (0.0, 0.0, 0.0)),
+        ("bravo", "openarm_v1", (0.0, -1.5, 0.0)),
+    )
+
+    result = provider.io._execute(
+        provider.launcher, "move_robot", {"robot": "bravo", "position": [1.0, -2.0, 0.0]}
+    )
+
+    assert result["success"] is True
+    assert provider.launcher.mock_calls == [
+        call._runtime_move_robot_root({"robot": "bravo", "position": [1.0, -2.0, 0.0]})
+    ]
+
+
+def test_a_robot_the_stage_does_not_stand_is_refused_before_the_stage(provider):
+    with pytest.raises(ValueError, match="no robot stands as 'ghost'"):
+        provider.io._execute(
+            provider.launcher, "move_robot", {"robot": "ghost", "position": [1.0, 0.0, 0.0]}
+        )
+
+    assert provider.launcher.mock_calls == []
 
 
 def test_it_owns_exactly_the_objects_it_spawned_and_has_not_removed(provider):

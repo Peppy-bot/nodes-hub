@@ -116,9 +116,9 @@ const CAPTURED = 1757944800.25;
 // capabilities: what /api/capabilities reports bound beside the scene.
 // lighting, materials: what their providers list; null while no scene is
 // loaded, which the node answers with HTTP 503. cameras: what /api/cameras
-// lists.
+// lists, every camera the simulation renders.
 async function page(catalogue = [staticScene, dynamicScene, cage], objects = [],
-    { unavailable = 0, objectState = null, capabilities = {}, lighting = null, materials = null, cameras = [] } = {}) {
+    { unavailable = 0, objectState = null, robots = [], capabilities = {}, lighting = null, materials = null, cameras = [] } = {}) {
     const elements = new Map();
     registerElements(html, elements);
     const requests = [];
@@ -180,11 +180,13 @@ async function page(catalogue = [staticScene, dynamicScene, cage], objects = [],
             const data = path === '/api/assets' ? { assets: currentCatalogue }
                 : path === '/api/objects'
                     ? { objects: currentObjects, count: currentObjects.length, timestamp: CAPTURED }
+                : path === '/api/robots' ? { robots, count: robots.length }
                 : path === '/api/capabilities'
-                    ? { lighting: false, materials: false, cameras: [], ...capabilities }
+                    ? { lighting: false, materials: false, cameras: false, ...capabilities }
                 : path === '/api/lighting' ? { lighting: currentLighting }
                 : path === '/api/materials' ? { materials: currentMaterials }
-                : path === '/api/cameras' ? { cameras: currentCameras, count: currentCameras.length }
+                : path === '/api/cameras'
+                    ? { message: `${currentCameras.length} cameras rendered`, cameras: currentCameras, count: currentCameras.length }
                 : { message: 'Scene loaded' };
             return { ok: true, json: async () => ({ success: true, ...data }) };
         },
@@ -213,7 +215,7 @@ async function page(catalogue = [staticScene, dynamicScene, cage], objects = [],
 
 test('fetched scenes expose their catalogue names and selected descriptions', async () => {
     const ui = await page();
-    assert.deepEqual(ui.requests.map(r => r.path), ['/api/capabilities', '/api/assets', '/api/objects']);
+    assert.deepEqual(ui.requests.map(r => r.path), ['/api/capabilities', '/api/assets', '/api/objects', '/api/robots']);
     assert.deepEqual(Array.from(ui.element('sceneSelect').children, o => o.textContent),
         [staticScene.display_name, dynamicScene.display_name]);
     assert.equal(ui.element('sceneDescription').textContent, staticScene.description);
@@ -243,7 +245,7 @@ test('the page opens in its loading state before any script runs', () => {
 test('the page keeps asking the provider for its catalogue and shows why it waits', async () => {
     const ui = await page([staticScene, cage], [], { unavailable: 2 });
     assert.deepEqual(ui.requests.map(r => r.path),
-        ['/api/capabilities', '/api/assets', '/api/assets', '/api/assets', '/api/objects']);
+        ['/api/capabilities', '/api/assets', '/api/assets', '/api/assets', '/api/objects', '/api/robots']);
     assert.equal(ui.waits.length, 2);
     for (const wait of ui.waits) {
         assert.equal(wait.delay, 3000);
@@ -432,6 +434,44 @@ test('runtime objects show their asset descriptions and refresh them without los
     assert.equal(ui.element('objectDescription0').hidden, true);
 });
 
+test('the robot picker lists what the scene stands and a move carries the one chosen', async () => {
+    const robots = [
+        { robot: 'alpha', model: 'openarm_v2', position: [0, 0, 0], attached: true },
+        { robot: 'bravo', model: 'openarm_v1', position: [0, -1.5, 0], attached: true },
+    ];
+    const ui = await page([cage], [], { robots });
+
+    const select = ui.element('robotSelect');
+    assert.deepEqual(select.children.map(o => o.textContent), [
+        'alpha (openarm_v2)',
+        'bravo (openarm_v1)',
+    ]);
+    assert.equal(select.disabled, false);
+    assert.equal(ui.element('robotCount').textContent, '2 robots standing');
+
+    // Choosing a robot offers that robot's own position, not the last one's.
+    select.value = 'bravo';
+    await ui.run('selectRobot()');
+    assert.deepEqual(
+        ['robotX', 'robotY', 'robotZ'].map(id => String(ui.element(id).value)),
+        ['0', '-1.5', '0'],
+    );
+
+    ui.element('robotX').value = '1';
+    await ui.run('moveRobot()');
+    const move = ui.requests.find(r => r.path === '/api/robot/move');
+    assert.deepEqual(move.body, { robot: 'bravo', position: [1, -1.5, 0] });
+});
+
+test('a move waits for a robot to be chosen', async () => {
+    const ui = await page([cage], [], { robots: [] });
+
+    assert.equal(ui.element('robotSelect').disabled, true);
+    await ui.run('moveRobot()');
+    assert.equal(ui.requests.some(r => r.path === '/api/robot/move'), false);
+    assert.equal(ui.element('status').textContent, 'select a robot to move');
+});
+
 const redBlock = {
     object_id: 'obj_1', asset_id: block.asset_id, physics: 'dynamic', mass: 0.2, scale: 1.5,
     position: [0.5, 0, 0.8], orientation: [0, 0, 0, 1], linear_velocity: [0, 0, 0], angular_velocity: [0, 0, 0],
@@ -464,7 +504,7 @@ test('runtime objects show their physics, mass and scale as spawned', async () =
 
 test('unavailable object state is shown as such, never as an empty scene', async () => {
     const ui = await page([block], [], { objectState: NO_OBJECT_STATE });
-    assert.deepEqual(ui.requests.map(r => r.path), ['/api/capabilities', '/api/assets', '/api/objects']);
+    assert.deepEqual(ui.requests.map(r => r.path), ['/api/capabilities', '/api/assets', '/api/objects', '/api/robots']);
     assert.equal(ui.element('objectCount').textContent, 'unavailable');
     assert.deepEqual(panel(ui), ['objectsUnavailable']);
     assert.equal(ui.element('objectsUnavailable').textContent, `Object state unavailable: ${NO_OBJECT_STATE}`);
@@ -558,7 +598,7 @@ const steel = {
     },
 };
 const wrist = {
-    id: 'alpha_wrist_left', kind: 'rgb',
+    id: 'alpha/wrist_left', robot: 'alpha', camera: 'wrist_left', kind: 'rgb',
     info: { width: 1280, height: 720, frames_per_second: 30, encoding: 'rgb8' },
     profile: {
         device: 'c920', label: 'Logitech C920', encoding: 'mjpeg',
@@ -577,16 +617,16 @@ const wrist = {
     profile_message: 'profile of Logitech C920',
 };
 const chest = {
-    id: 'alpha_chest', kind: 'rgbd',
+    id: 'alpha/chest', robot: 'alpha', camera: 'chest', kind: 'rgbd',
     info: { width: 640, height: 480, frames_per_second: 15, encoding: 'rgb8' },
     profile: null,
-    profile_message: 'no camera profile is bound for alpha_chest in this launch',
+    profile_message: 'the simulation describes no profile for alpha/chest',
 };
 const cards = ['lightingCard', 'materialsCard', 'camerasCard'];
 
 test('with only scene manipulation bound the capability cards stay hidden and nothing polls', async () => {
     const ui = await page();
-    assert.deepEqual(ui.requests.map(r => r.path), ['/api/capabilities', '/api/assets', '/api/objects']);
+    assert.deepEqual(ui.requests.map(r => r.path), ['/api/capabilities', '/api/assets', '/api/objects', '/api/robots']);
     assert.deepEqual(ui.intervals, []);
     for (const id of cards) {
         assert.equal(ui.element(id).hidden, true, `#${id} stays hidden`);
@@ -607,7 +647,7 @@ test('the capability cards open hidden before any script runs', () => {
 test('bound lighting renders one control per listed property and applies a route as one request', async () => {
     const ui = await page([staticScene], [], { capabilities: { lighting: true }, lighting: warehouseLighting });
     assert.deepEqual(ui.requests.map(r => r.path),
-        ['/api/capabilities', '/api/assets', '/api/objects', '/api/lighting']);
+        ['/api/capabilities', '/api/assets', '/api/objects', '/api/robots', '/api/lighting']);
     assert.deepEqual(ui.intervals, [3000]);
     assert.equal(ui.element('lightingCard').hidden, false);
     assert.equal(ui.element('materialsCard').hidden, true);
@@ -718,13 +758,10 @@ test('bound materials show their scope and defaults and post colour and finish b
     assert.deepEqual(ui.requests.slice(-2).map(r => r.path), ['/api/materials/reset', '/api/materials']);
 });
 
-test('bound cameras render the controls their profile supports and route by camera id', async () => {
-    const ui = await page([staticScene], [], {
-        capabilities: { cameras: [{ id: wrist.id, kind: 'rgb', profile: true }, { id: chest.id, kind: 'rgbd', profile: false }] },
-        cameras: [wrist, chest],
-    });
+test('bound cameras render the controls their profile supports and route by robot and camera', async () => {
+    const ui = await page([staticScene], [], { capabilities: { cameras: true }, cameras: [wrist, chest] });
     assert.deepEqual(ui.requests.map(r => r.path),
-        ['/api/capabilities', '/api/assets', '/api/objects', '/api/cameras']);
+        ['/api/capabilities', '/api/assets', '/api/objects', '/api/robots', '/api/cameras']);
     assert.equal(ui.element('camerasCard').hidden, false);
     assert.equal(ui.element('camera0_info').textContent, 'rgb | 1280x720 @ 30 fps | rgb8');
     assert.equal(ui.element('camera0_profile').textContent, 'profile of Logitech C920');
@@ -749,21 +786,21 @@ test('bound cameras render the controls their profile supports and route by came
     ui.element('camera0_exposure_mode').value = 'manual';
     ui.element('camera0_exposure_0').value = '8000';
     await ui.run("applyCamera(0, 'exposure')");
-    assert.deepEqual(ui.requests.slice(-2).map(r => r.path), ['/api/cameras/alpha_wrist_left/exposure', '/api/cameras']);
+    assert.deepEqual(ui.requests.slice(-2).map(r => r.path), ['/api/cameras/alpha/wrist_left/exposure', '/api/cameras']);
     assert.deepEqual(ui.requests.at(-2).body, { value: 8000, mode: 'manual' });
 
     ui.element('camera0_brightness_0').value = '200';
     await ui.run("applyCamera(0, 'brightness')");
-    assert.deepEqual(ui.requests.at(-2), { path: '/api/cameras/alpha_wrist_left/brightness', body: { value: 200 } });
+    assert.deepEqual(ui.requests.at(-2), { path: '/api/cameras/alpha/wrist_left/brightness', body: { value: 200 } });
 
     await ui.run('resetCamera(0)');
-    assert.deepEqual(ui.requests.slice(-2).map(r => r.path), ['/api/cameras/alpha_wrist_left/reset', '/api/cameras']);
+    assert.deepEqual(ui.requests.slice(-2).map(r => r.path), ['/api/cameras/alpha/wrist_left/reset', '/api/cameras']);
 });
 
 test('provider text in the capability cards stays literal', async () => {
     const markup = '<img src=x onerror="globalThis.injected = true">';
     const ui = await page([staticScene], [], {
-        capabilities: { lighting: true, materials: true, cameras: [{ id: markup, kind: 'rgb', profile: true }] },
+        capabilities: { lighting: true, materials: true, cameras: true },
         lighting: { ...warehouseLighting, lights: [{ ...sun, label: markup, kind: markup }] },
         materials: { materials: [{ ...steel, label: markup, scope: { ...steel.scope, bodies: [markup] } }] },
         cameras: [{ ...wrist, id: markup, profile_message: markup }],

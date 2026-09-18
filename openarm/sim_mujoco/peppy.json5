@@ -1,36 +1,56 @@
-// The MuJoCo simulation node. It
-// plays the follower role of every limb's joint_link / gripper_link
-// pairing: the sim relays lead each pair and the simulation's measured state
-// streams back on it. Sim peripherals attach to this node by node name for
-// simulation-internal coupling.
+// The MuJoCo simulation node. It stands one robot, which joins by attaching
+// over the simulation_robot contract, naming the copy it runs as and the
+// model it is; the engine loads that model's scene and steps it for as long
+// as the robot stays. The engine plays the follower role of every one of
+// the robot's limb pairings: the robot's backbone leads each pair and the
+// simulation's measured state streams back on it. Whether the robot stands
+// with every limb paired is its readiness, answered on the same contract.
 {
   peppy_schema: "node/v1",
   manifest: {
     name: "openarm_sim_mujoco",
     tag: "v1",
+    implements: [
+      // How a robot joins this scene: it attaches with the copy it runs as
+      // and its model, and stays for as long as its goal runs. One robot
+      // stands at a time, where its scene puts it. Whether it stands with
+      // every limb paired is its readiness.
+      { name: "simulation_robot", tag: "v1", link_id: "robots" },
+    ],
     depends_on: {
       pairings: [
-        // The simulation plays the follower role of every limb's pairing directly,
-        // one slot per limb (the slot is the side, so no id demux): governed
-        // setpoints stream in, measured simulation state streams back. Optional:
-        // the simulation boots unpaired and each pair is established at the
-        // backbone's start (launcher `links:`).
-        { name: "joint_link", tag: "v1", role: "follower", link_id: "left_arm", cardinality: "zero_or_one" },
-        { name: "joint_link", tag: "v1", role: "follower", link_id: "right_arm", cardinality: "zero_or_one" },
-        { name: "gripper_link", tag: "v1", role: "follower", link_id: "left_gripper", cardinality: "zero_or_one" },
-        { name: "gripper_link", tag: "v1", role: "follower", link_id: "right_gripper", cardinality: "zero_or_one" },
+        // The engine plays the follower role of every limb's pairing, one
+        // slot per limb: governed setpoints stream in, the robot's measured
+        // state streams back on the same pair. The slot is the limb and the
+        // pair's copy is the robot, so nothing on the wire carries an arm_id
+        // or a robot id; a pair of a robot this engine does not stand
+        // carries nothing.
+        { name: "joint_link", tag: "v1", role: "follower", link_id: "left_arm", cardinality: "zero_or_more" },
+        { name: "joint_link", tag: "v1", role: "follower", link_id: "right_arm", cardinality: "zero_or_more" },
+        { name: "gripper_link", tag: "v1", role: "follower", link_id: "left_gripper", cardinality: "zero_or_more" },
+        { name: "gripper_link", tag: "v1", role: "follower", link_id: "right_gripper", cardinality: "zero_or_more" },
         // Robot-mounted cameras rendered from the live scene, one slot per
-        // camera (the slot is the camera, so no id demux). The simulation plays the
-        // camera role; a per-camera relay presents the rgb/rgbd contract.
-        // Optional: slots stay unbound (and rendering stays off) outside record
-        // stacks; frames flow only when cameras_enabled is set.
-        { name: "sim_rgb_camera_link", tag: "v1", role: "camera", link_id: "wrist_left", cardinality: "zero_or_one" },
-        { name: "sim_rgb_camera_link", tag: "v1", role: "camera", link_id: "wrist_right", cardinality: "zero_or_one" },
-        { name: "sim_rgbd_camera_link", tag: "v1", role: "camera", link_id: "chest", cardinality: "zero_or_one" },
+        // camera: the engine plays the camera role and a per-camera relay
+        // presents the rgb/rgbd contract. A camera is rendered for the
+        // robot of its pair, so a stack that pairs no camera renders none
+        // and pays for none.
+        { name: "sim_rgb_camera_link", tag: "v1", role: "camera", link_id: "wrist_left", cardinality: "zero_or_more" },
+        { name: "sim_rgb_camera_link", tag: "v1", role: "camera", link_id: "wrist_right", cardinality: "zero_or_more" },
+        { name: "sim_rgbd_camera_link", tag: "v1", role: "camera", link_id: "chest", cardinality: "zero_or_more" },
       ],
     },
   },
   interfaces: {
+    services: {
+      exposes: [
+        { link_id: "robots", name: "is_ready" },
+      ],
+    },
+    actions: {
+      exposes: [
+        { link_id: "robots", name: "attach" },
+      ],
+    },
     topics: {
       emits: [
         { link_id: "left_arm", name: "joint_states" },
@@ -68,10 +88,6 @@
       apptainer_run_extra_args: ["--nv"],
     },
     parameters: {
-      // Which OpenArm generation to simulate: "v1" or "v2". Selects the scene file
-      // (openarm_bimanual_{v1,v2}.xml) and the meshes materialized into the asset dir.
-      // Required so the sim matches the real deployment it stands in for.
-      hardware_version: "string",
       // Rate (Hz) of the measured-state streams (joint_states / gripper_states).
       // Where the deployment names this simulation its clock domain's
       // publisher, the same rate is how often that domain advances, so it
@@ -94,10 +110,16 @@
       viewer_host: { $type: "string", $default: "0.0.0.0" },
       viewer_port: { $type: "u32", $default: 8080 },
       // Render and stream the robot-mounted cameras (config/cameras.json5) on
-      // their pairing slots. No default: whether a stack renders cameras is
-      // the launcher's decision, and a launcher that leaves it unsaid fails
-      // here rather than coming up quietly camera-less.
+      // their pairing slots. The rig mounts on openarm_v2's links, so with
+      // this set the engine stands that model only. Required: the launcher
+      // states whether cameras are rendered.
       cameras_enabled: "bool",
+      // How long the standing robot may hold none of its limb pairs before
+      // it leaves the scene. A robot's pairs dissolve when its nodes stop,
+      // so a robot whose process is gone leaves within this window; the
+      // same window is how long a robot that has just attached has to pair
+      // its limbs.
+      robot_lease_ms: { $type: "u32", $default: 2000 },
     },
   },
 }
