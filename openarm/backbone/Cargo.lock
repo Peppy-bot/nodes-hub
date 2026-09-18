@@ -249,7 +249,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 [[package]]
 name = "bimanual_collision_model"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/peppy#47f02eb66db864473892d60be0a107e69b4031de"
+source = "git+https://github.com/Peppy-bot/peppy#41e9ddf0337ebd3da1c51762c0cf9d25068747e5"
 dependencies = [
  "srs_model",
  "thiserror 2.0.20",
@@ -431,7 +431,7 @@ dependencies = [
 [[package]]
 name = "chain_kinematics"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/peppy#47f02eb66db864473892d60be0a107e69b4031de"
+source = "git+https://github.com/Peppy-bot/peppy#41e9ddf0337ebd3da1c51762c0cf9d25068747e5"
 dependencies = [
  "nalgebra",
  "thiserror 2.0.20",
@@ -563,7 +563,7 @@ dependencies = [
 [[package]]
 name = "control_core"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/peppy#47f02eb66db864473892d60be0a107e69b4031de"
+source = "git+https://github.com/Peppy-bot/peppy#41e9ddf0337ebd3da1c51762c0cf9d25068747e5"
 dependencies = [
  "thiserror 2.0.20",
  "tokio",
@@ -2353,7 +2353,7 @@ dependencies = [
 [[package]]
 name = "openarm_description"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/peppy#47f02eb66db864473892d60be0a107e69b4031de"
+source = "git+https://github.com/Peppy-bot/peppy#41e9ddf0337ebd3da1c51762c0cf9d25068747e5"
 dependencies = [
  "urdf-rs",
 ]
@@ -3644,7 +3644,7 @@ dependencies = [
 [[package]]
 name = "srs_model"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/peppy#47f02eb66db864473892d60be0a107e69b4031de"
+source = "git+https://github.com/Peppy-bot/peppy#41e9ddf0337ebd3da1c51762c0cf9d25068747e5"
 dependencies = [
  "chain_kinematics",
  "nalgebra",
