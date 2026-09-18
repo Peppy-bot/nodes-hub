@@ -11,7 +11,7 @@ use peppygen::fixtures::harness::{Config, Harness};
 use peppygen::mock::deps::simulation::attach;
 
 mod common;
-use common::{simulation_of, stood};
+use common::{await_setup_return, shutdown_once_setup_returns, simulation_of, stood};
 
 /// How long the wire may take for any one exchange.
 const WIRE: Duration = Duration::from_secs(10);
@@ -247,8 +247,7 @@ async fn a_robot_of_no_known_generation_is_refused() -> peppygen::Result<()> {
         simulation.attach.next_goal(UNSERVED).await.is_err(),
         "a robot of no known generation never attaches"
     );
-    let failure = harness
-        .shutdown()
+    let failure = shutdown_once_setup_returns(harness)
         .await
         .expect_err("a robot of no known generation fails to start")
         .to_string();
@@ -270,11 +269,7 @@ async fn a_refused_robot_serves_no_readiness() -> peppygen::Result<()> {
         .await?;
 
     // Setup fails, so the readiness service never starts.
-    let deadline = tokio::time::Instant::now() + WIRE;
-    while !harness.setup_finished() {
-        assert!(tokio::time::Instant::now() < deadline, "setup returned");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    await_setup_return(&harness).await;
     assert!(
         robot_is_ready::poll(&harness, UNSERVED).await.is_err(),
         "a refused robot serves no readiness"

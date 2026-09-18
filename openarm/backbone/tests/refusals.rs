@@ -9,7 +9,7 @@
 use peppygen::fixtures::harness::{Config, Harness};
 
 mod helpers;
-use helpers::params;
+use helpers::{params, shutdown_once_setup_returns};
 
 /// Boot the node with one parameter spoiled and return the refusal as an
 /// operator reads it: the whole Display chain, since a wrapping variant names
@@ -47,8 +47,7 @@ async fn refusal_error(spoil: impl FnOnce(&mut peppygen::Parameters)) -> peppyge
     .await;
     match started {
         Err(e) => e,
-        Ok((harness, _mocks)) => harness
-            .shutdown()
+        Ok((harness, _mocks)) => shutdown_once_setup_returns(harness)
             .await
             .expect_err("the backbone accepted a parameter it must refuse"),
     }

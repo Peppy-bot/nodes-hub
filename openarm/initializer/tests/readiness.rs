@@ -14,7 +14,7 @@ use peppygen::mock::deps::simulation::attach;
 use peppygen::mock::deps::simulation::is_ready::ResponseData as SimulationReady;
 
 mod common;
-use common::{simulation_of, stood};
+use common::{shutdown_once_setup_returns, simulation_of, stood};
 
 /// How long each mock waits parked for the node's next poll. The node polls
 /// every 500ms, so this only expires once the harness is gone.
@@ -194,8 +194,7 @@ async fn a_robot_nothing_answers_for_is_refused() -> peppygen::Result<()> {
         ..on_its_own_hardware()
     };
     let (harness, _mocks) = Harness::start_with(unanswered, openarm_initializer::setup).await?;
-    let failure = harness
-        .shutdown()
+    let failure = shutdown_once_setup_returns(harness)
         .await
         .expect_err("a robot nothing answers for fails to start")
         .to_string();
