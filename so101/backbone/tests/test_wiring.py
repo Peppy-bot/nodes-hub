@@ -68,6 +68,22 @@ async def keep_measured_fresh(h, positions=MEASURED, opening=0.0):
         await asyncio.sleep(0.01)
 
 
+async def feeding_measured(h, positions=MEASURED, opening=0.0) -> asyncio.Task:
+    """Keeps the follower's measured state fresh and returns the feeder once
+    the node holds it. The node refuses a goal until it has adopted the
+    follower's state as its anchor, and it relays a sample up the leader
+    slots only after adopting it, so one relayed arm state and one relayed
+    gripper state gate every goal."""
+    feeder = asyncio.create_task(keep_measured_fresh(h, positions, opening))
+    try:
+        await asyncio.wait_for(h.mocks.pairings.leader_arm.joint_states.next(), TIMEOUT_S)
+        await asyncio.wait_for(h.mocks.pairings.leader_gripper.gripper_states.next(), TIMEOUT_S)
+    except BaseException:
+        feeder.cancel()
+        raise
+    return feeder
+
+
 async def test_the_joints_stream_passes_through_unchanged_and_relays_state():
     async with harness.start(setup, parameters=make_parameters()) as h:
         feeder = asyncio.create_task(keep_measured_fresh(h))
@@ -195,7 +211,7 @@ async def _stream_leader_target(h, target, stamps: list[float]):
 
 async def test_move_arm_joints_completes_and_reports():
     async with harness.start(setup, parameters=make_parameters()) as h:
-        feeder = asyncio.create_task(keep_measured_fresh(h))
+        feeder = await feeding_measured(h)
         try:
             target = [p + 0.2 for p in MEASURED]
             goal = await move_arm_joints_fx.send_goal(
@@ -227,10 +243,9 @@ async def test_move_arm_joints_completes_and_reports():
 
 async def test_second_goal_is_rejected_while_busy():
     async with harness.start(setup, parameters=make_parameters()) as h:
-        await publish_measured(h)
         # The in-flight goal outlives STALE_FOLLOWER_TIMEOUT_S, and a plan
         # failed for staleness would cancel before cancel_goal ever runs.
-        feeder = asyncio.create_task(keep_measured_fresh(h))
+        feeder = await feeding_measured(h)
         try:
             slow = await move_arm_joints_fx.send_goal(
                 h,
@@ -278,7 +293,7 @@ async def test_goal_without_follower_state_is_rejected():
 
 async def test_posture_and_gripper_actions():
     async with harness.start(setup, parameters=make_parameters()) as h:
-        feeder = asyncio.create_task(keep_measured_fresh(h))
+        feeder = await feeding_measured(h)
         try:
             posture = await move_to_ready_fx.send_goal(
                 h,
@@ -323,7 +338,7 @@ async def test_nonzero_max_effort_is_accepted_and_ignored():
     # implementer may ignore; both the stream and the action run the
     # opening, so generic limb_motion clients work unmodified.
     async with harness.start(setup, parameters=make_parameters()) as h:
-        feeder = asyncio.create_task(keep_measured_fresh(h))
+        feeder = await feeding_measured(h)
         try:
             goal = await move_gripper_fx.send_goal(
                 h,
@@ -342,7 +357,7 @@ async def test_nonzero_max_effort_is_accepted_and_ignored():
 
 async def test_malformed_pose_goal_is_rejected_and_the_server_survives():
     async with harness.start(setup, parameters=make_parameters()) as h:
-        feeder = asyncio.create_task(keep_measured_fresh(h))
+        feeder = await feeding_measured(h)
         try:
             # A zero quaternion once killed the move_arm server permanently.
             bad = await move_arm_fx.send_goal(
@@ -413,7 +428,7 @@ async def test_unknown_arm_name_is_refused():
 
 async def test_stale_timestamped_leader_input_is_dropped():
     async with harness.start(setup, parameters=make_parameters()) as h:
-        feeder = asyncio.create_task(keep_measured_fresh(h))
+        feeder = await feeding_measured(h)
         try:
             # Legal shape, ancient capture stamp: the age gate must drop it,
             # so nothing streams downstream.
