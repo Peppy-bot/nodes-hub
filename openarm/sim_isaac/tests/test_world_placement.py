@@ -16,7 +16,7 @@ QUARTER_TURN = math.pi / 2
 
 @pytest.fixture(name="place")
 def _place():
-    return _world_module().World._place
+    return _world_module().World.place
 
 
 def _prim(carries_orient: bool):
@@ -107,21 +107,29 @@ def test_a_move_carries_the_record_with_the_prim(monkeypatch, place):
     # `import omni.usd` then reads it off the parent package.
     monkeypatch.setattr(sys.modules["omni"], "usd", fake_usd, raising=False)
 
-    moved = world.move("alpha", (2.0, -1.0, 0.0))
+    moved = world.move("alpha", (2.0, -1.0, 0.0), QUARTER_TURN)
 
-    # The listing follows the prim, so the scene does not report a stale spot.
-    assert moved.placement.position == (2.0, -1.0, 0.0)
-    assert world._robots["alpha"].placement.position == (2.0, -1.0, 0.0)
+    # The listing follows the prim, so the scene does not report a stale spot
+    # or a stale heading.
+    assert moved.placement == world_module.Placement.of((2.0, -1.0, 0.0), QUARTER_TURN)
+    assert world._robots["alpha"].placement == moved.placement
     assert _base_of(alpha)[0] == pytest.approx(2.0, abs=1e-6)
-    # The robot that was not asked to move stands where it was.
-    assert world._robots["bravo"].placement.position == (0.0, 0.0, 0.0)
+    assert _base_of(alpha)[1] == pytest.approx(-1.0, abs=1e-6)
+    # The prim faces the yaw it was moved to: a point a metre ahead of the
+    # base swings to a metre to its left.
+    local = UsdGeom.Xformable(alpha).GetLocalTransformation(Usd.TimeCode.Default())
+    ahead = local.Transform(Gf.Vec3d(1, 0, 0))
+    assert ahead[0] == pytest.approx(2.0, abs=1e-6), ahead
+    assert ahead[1] == pytest.approx(0.0, abs=1e-6), ahead
+    # The robot that was not asked to move stands where it was, as it was.
+    assert world._robots["bravo"].placement == at
 
 
 def test_moving_a_robot_that_does_not_stand_says_so(monkeypatch):
     world_module = _world_module()
     world = world_module.World(catalogue=object())
     with pytest.raises(KeyError, match="charlie"):
-        world.move("charlie", (0.0, 0.0, 0.0))
+        world.move("charlie", (0.0, 0.0, 0.0), 0.0)
 
 
 def test_a_spot_promised_to_an_admitted_robot_is_not_offered_twice():

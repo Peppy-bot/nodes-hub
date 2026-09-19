@@ -26,7 +26,7 @@ def _world(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "omni.usd", usd)
     # `import omni.usd` binds the package, so the submodule rides on it.
     monkeypatch.setattr(sys.modules["omni"], "usd", usd, raising=False)
-    monkeypatch.setattr(module.World, "_place", staticmethod(lambda prim, position, yaw: None))
+    monkeypatch.setattr(module.World, "place", staticmethod(lambda prim, position, yaw: None))
     attach = calls.attach
     attach.side_effect = lambda stage, root, pack: f"{root}/openarm_body_link0/openarm_head_camera"
     monkeypatch.setattr(module.head_camera, "attach", attach)

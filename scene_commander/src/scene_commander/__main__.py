@@ -188,6 +188,7 @@ async def _fetch_robots(node_runner: NodeRunner) -> list[dict]:
             "robot": robot.robot,
             "model": robot.model,
             "position": list(robot.position),
+            "yaw": robot.yaw,
             "attached": robot.attached,
         }
         for robot in data.robots
@@ -440,6 +441,7 @@ async def _action_spawn_object(node_runner: NodeRunner, payload: dict) -> dict:
     request = spawn_object.GoalRequest(
         asset_id=str(payload["asset_id"]),
         position=[float(value) for value in payload["position"]],
+        yaw=float(payload.get("yaw", 0.0)),
         scale=float(payload.get("scale", 1.0)),
         physics=str(payload.get("physics", "none")),
         mass=float(payload.get("mass", 0.1)),
@@ -451,6 +453,7 @@ async def _action_spawn_object(node_runner: NodeRunner, payload: dict) -> dict:
         request,
         asset_id=request.asset_id,
         position=request.position,
+        yaw=request.yaw,
         physics=request.physics,
         mass=request.mass,
     )
@@ -511,16 +514,17 @@ async def _action_remove_object(node_runner: NodeRunner, object_id: str) -> dict
 
 
 async def _action_move_robot(
-    node_runner: NodeRunner, robot: str, position: list[float]
+    node_runner: NodeRunner, robot: str, position: list[float], yaw: float
 ) -> dict:
     position = [float(value) for value in position]
 
     data = await _run_action(
         move_robot,
         node_runner,
-        move_robot.GoalRequest(robot=robot, position=position),
+        move_robot.GoalRequest(robot=robot, position=position, yaw=yaw),
         robot=robot,
         position=position,
+        yaw=yaw,
     )
 
     return {"success": True, "message": data.message}
@@ -837,6 +841,8 @@ async def _api_spawn_object(request: web.Request) -> web.Response:
     try:
         payload = await _request_json(request)
         payload["position"] = _vector(payload, "position", 3)
+        if "yaw" in payload:
+            payload["yaw"] = _number(payload, "yaw")
 
         result = await _action_spawn_object(request.app[_NODE_RUNNER], payload)
 
@@ -914,6 +920,7 @@ async def _api_move_robot(request: web.Request) -> web.Response:
             request.app[_NODE_RUNNER],
             _robot(payload),
             _vector(payload, "position", 3),
+            _number(payload, "yaw"),
         )
 
     except Exception as exc:
@@ -1357,6 +1364,9 @@ select:disabled {
 <input id="spawnZ" type="number" step="0.05" value="0.8">
 </div>
 
+<label>Yaw (rad, about +Z)</label>
+<input id="spawnYaw" type="number" step="0.05" value="0">
+
 <div class="two">
 <div>
 <label>Scale</label>
@@ -1396,6 +1406,9 @@ select:disabled {
 <input id="robotY" type="number" step="0.05" value="0">
 <input id="robotZ" type="number" step="0.05" value="0">
 </div>
+
+<label>Yaw (rad, about +Z)</label>
+<input id="robotYaw" type="number" step="0.05" value="0">
 
 <button onclick="moveRobot()">Move Robot</button>
 </section>
@@ -1680,6 +1693,7 @@ async function spawnObject() {
             body: JSON.stringify({
                 asset_id: assetId,
                 position: position("spawn"),
+                yaw: number("spawnYaw"),
                 scale: number("spawnScale"),
                 physics: el("spawnPhysics").value,
                 mass: number("spawnMass")
@@ -2020,8 +2034,8 @@ async function refreshRobots() {
     }
 }
 
-// The selected robot's own position fills the boxes, so a move starts from
-// where that robot stands.
+// The selected robot's own position and yaw fill the boxes, so a move starts
+// from where that robot stands, facing as it does.
 function selectRobot() {
     const robot = robotList.find(r => r.robot === el("robotSelect").value);
     if (!robot) {
@@ -2031,6 +2045,7 @@ function selectRobot() {
     el("robotX").value = x;
     el("robotY").value = y;
     el("robotZ").value = z;
+    el("robotYaw").value = robot.yaw;
 }
 
 async function moveRobot() {
@@ -2046,7 +2061,8 @@ async function moveRobot() {
             method: "POST",
             body: JSON.stringify({
                 robot: robot,
-                position: position("robot")
+                position: position("robot"),
+                yaw: number("robotYaw")
             })
         });
 

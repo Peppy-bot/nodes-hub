@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import threading
 import uuid
 from concurrent.futures import Future
@@ -36,6 +37,20 @@ _NOT_CAPTURED = (
 )
 
 
+
+
+def _yaw_of(payload: dict) -> float:
+    """The heading a goal names, in radians about +z. A prim turned by a yaw
+    that is not a number reports no error and simulates nothing, so one is
+    refused here."""
+    yaw = float(payload["yaw"])
+
+    if not math.isfinite(yaw):
+        raise ValueError(
+            "yaw must be a finite number of radians"
+        )
+
+    return yaw
 
 
 @dataclass
@@ -383,6 +398,7 @@ class SceneActionIO:
                 robot=robot.instance,
                 model=robot.model,
                 position=list(robot.placement.position),
+                yaw=robot.placement.yaw,
                 # Every robot on this stage joined it by attaching.
                 attached=True,
             )
@@ -548,6 +564,8 @@ class SceneActionIO:
                     "position must contain exactly 3 values"
                 )
 
+            yaw = _yaw_of(payload)
+
             scale = float(payload["scale"])
 
             if scale <= 0.0:
@@ -587,6 +605,7 @@ class SceneActionIO:
                     "name": object_id,
                     "path": asset["path"],
                     "position": position,
+                    "yaw": yaw,
                     "scale": [
                         scale,
                         scale,
@@ -765,6 +784,7 @@ class SceneActionIO:
                 {
                     "robot": robot,
                     "position": position,
+                    "yaw": _yaw_of(payload),
                 }
             )
 
@@ -945,6 +965,7 @@ class SceneActionIO:
                     "position": list(
                         request.position
                     ),
+                    "yaw": request.yaw,
                     "scale": request.scale,
                     "physics": request.physics,
                     "mass": request.mass,
@@ -1094,6 +1115,7 @@ class SceneActionIO:
                     "position": list(
                         request.position
                     ),
+                    "yaw": request.yaw,
                 },
             )
 

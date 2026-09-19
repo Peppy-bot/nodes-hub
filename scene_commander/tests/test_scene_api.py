@@ -34,8 +34,8 @@ _NO_SCENE = "no scene is loaded"
 _NOT_ATTACHED = "the camera is not attached to its simulation yet"
 _SCENE = {"asset_id": "scene/full_warehouse", "display_name": "Full Warehouse", "kind": "scene", "category": "Scenes"}
 _ROBOTS = [
-    {"robot": "alpha", "model": "openarm_v2", "position": [0.0, 0.0, 0.0], "attached": True},
-    {"robot": "bravo", "model": "openarm_v1", "position": [0.0, -1.5, 0.0], "attached": True},
+    {"robot": "alpha", "model": "openarm_v2", "position": [0.0, 0.0, 0.0], "yaw": 0.0, "attached": True},
+    {"robot": "bravo", "model": "openarm_v1", "position": [0.0, -1.5, 0.0], "yaw": 1.25, "attached": True},
 ]
 
 # A snapshot's capture time, as the generated binding decodes it: epoch seconds.
@@ -502,15 +502,34 @@ def test_spawn_object_reports_the_minted_object_id(commander, caplog):
     }))
 
     assert (status, body) == (200, {"success": True, "message": "spawn_object done", "object_id": "obj_42"})
+    # A spawn naming no yaw stands as authored.
     assert spawn.goals == [SimpleNamespace(
-        asset_id="props/blocks/red_block", position=[0.5, 0.0, 0.8], scale=1.0, physics="dynamic", mass=0.2,
+        asset_id="props/blocks/red_block", position=[0.5, 0.0, 0.8], yaw=0.0, scale=1.0, physics="dynamic",
+        mass=0.2,
     )]
     assert _node_log(commander, caplog) == [(
         logging.INFO,
-        "spawn_object(asset_id=props/blocks/red_block, position=[0.5, 0.0, 0.8], physics=dynamic, mass=0.2): "
-        "spawn_object done",
+        "spawn_object(asset_id=props/blocks/red_block, position=[0.5, 0.0, 0.8], yaw=0.0, physics=dynamic, "
+        "mass=0.2): spawn_object done",
         None,
     )]
+
+
+def test_a_spawn_carries_the_yaw_it_names(commander):
+    status, _ = _call(commander, lambda client: _post(client, "/api/objects/spawn", {
+        "asset_id": "props/furniture/desk", "position": [1.0, 0.0, 0.0], "yaw": -1.5,
+    }))
+
+    assert status == 200
+    assert commander.actions.spawn_object.goals[-1].yaw == -1.5
+
+
+@pytest.mark.parametrize("yaw", ["north", None, [0.0], True])
+def test_a_spawn_yaw_that_is_no_number_is_refused_before_the_simulation(commander, yaw):
+    assert _call(commander, lambda client: _post(client, "/api/objects/spawn", {
+        "asset_id": "props/furniture/desk", "position": [1.0, 0.0, 0.0], "yaw": yaw,
+    })) == (400, {"success": False, "message": "yaw must be a finite number"})
+    assert commander.actions.spawn_object.goals == []
 
 
 def test_invalid_input_is_a_400_that_never_reaches_the_provider(commander, caplog):
@@ -656,25 +675,40 @@ def test_the_robot_listing_names_what_the_scene_stands(commander):
     assert body["success"] is True
     assert body["count"] == 2
     assert [robot["robot"] for robot in body["robots"]] == ["alpha", "bravo"]
+    # Each stands where the simulation lists it, facing the way it lists.
+    assert body["robots"] == _ROBOTS
 
 
-def test_a_move_carries_the_robot_it_addresses(commander):
+def test_a_move_carries_the_robot_it_addresses_and_the_way_it_faces(commander):
     status, _ = _call(commander, lambda client: _post(
-        client, "/api/robot/move", {"robot": "bravo_init_inst", "position": [1.0, -1.5, 0.0]}
+        client, "/api/robot/move", {"robot": "bravo_init_inst", "position": [1.0, -1.5, 0.0], "yaw": 1.25}
     ))
 
     assert status == 200
     goal = commander.actions.move_robot.goals[-1]
     assert goal.robot == "bravo_init_inst"
     assert goal.position == [1.0, -1.5, 0.0]
+    assert goal.yaw == 1.25
 
 
 def test_a_move_naming_no_robot_is_refused_before_the_simulation(commander):
     status, _ = _call(commander, lambda client: _post(
-        client, "/api/robot/move", {"position": [1.0, 0.0, 0.0]}
+        client, "/api/robot/move", {"position": [1.0, 0.0, 0.0], "yaw": 0.0}
     ))
 
     assert status == 400
+    assert commander.actions.move_robot.goals == []
+
+
+@pytest.mark.parametrize("payload", [
+    {"robot": "bravo", "position": [1.0, 0.0, 0.0]},
+    {"robot": "bravo", "position": [1.0, 0.0, 0.0], "yaw": "north"},
+    {"robot": "bravo", "position": [1.0, 0.0, 0.0], "yaw": None},
+])
+def test_a_move_naming_no_yaw_is_refused_before_the_simulation(commander, payload):
+    assert _call(commander, lambda client: _post(client, "/api/robot/move", payload)) == (
+        400, {"success": False, "message": "yaw must be a finite number"},
+    )
     assert commander.actions.move_robot.goals == []
 
 

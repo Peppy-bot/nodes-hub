@@ -436,8 +436,8 @@ test('runtime objects show their asset descriptions and refresh them without los
 
 test('the robot picker lists what the scene stands and a move carries the one chosen', async () => {
     const robots = [
-        { robot: 'alpha', model: 'openarm_v2', position: [0, 0, 0], attached: true },
-        { robot: 'bravo', model: 'openarm_v1', position: [0, -1.5, 0], attached: true },
+        { robot: 'alpha', model: 'openarm_v2', position: [0, 0, 0], yaw: 0, attached: true },
+        { robot: 'bravo', model: 'openarm_v1', position: [0, -1.5, 0], yaw: 1.25, attached: true },
     ];
     const ui = await page([cage], [], { robots });
 
@@ -449,18 +449,27 @@ test('the robot picker lists what the scene stands and a move carries the one ch
     assert.equal(select.disabled, false);
     assert.equal(ui.element('robotCount').textContent, '2 robots standing');
 
-    // Choosing a robot offers that robot's own position, not the last one's.
+    // Choosing a robot offers that robot's own position and yaw, not the
+    // last one's.
     select.value = 'bravo';
     await ui.run('selectRobot()');
     assert.deepEqual(
-        ['robotX', 'robotY', 'robotZ'].map(id => String(ui.element(id).value)),
-        ['0', '-1.5', '0'],
+        ['robotX', 'robotY', 'robotZ', 'robotYaw'].map(id => String(ui.element(id).value)),
+        ['0', '-1.5', '0', '1.25'],
     );
 
+    // A move that only translates sends the yaw the robot is listed at, so
+    // the robot keeps facing as it did.
     ui.element('robotX').value = '1';
     await ui.run('moveRobot()');
-    const move = ui.requests.find(r => r.path === '/api/robot/move');
-    assert.deepEqual(move.body, { robot: 'bravo', position: [1, -1.5, 0] });
+    const moves = () => ui.requests.filter(r => r.path === '/api/robot/move');
+    assert.deepEqual(moves().at(-1).body, { robot: 'bravo', position: [1, -1.5, 0], yaw: 1.25 });
+
+    // A yaw the form names is the one sent. The move before re-read the
+    // listing, so the boxes hold where the scene lists the robot again.
+    ui.element('robotYaw').value = '-0.5';
+    await ui.run('moveRobot()');
+    assert.deepEqual(moves().at(-1).body, { robot: 'bravo', position: [0, -1.5, 0], yaw: -0.5 });
 });
 
 test('a move waits for a robot to be chosen', async () => {
@@ -556,6 +565,7 @@ test('every scene edit reads the runtime objects again once its goal completes',
         '/api/objects/remove', '/api/objects',
     ]);
     assert.equal(ui.requests[since + 2].body.asset_id, block.asset_id);
+    assert.equal(ui.requests[since + 2].body.yaw, 0, 'a spawn stands as authored unless the form names a yaw');
     assert.deepEqual(ui.requests[since + 4].body, { object_id: 'obj_1', position: [0.5, 0, 0.8] });
     assert.deepEqual(ui.requests[since + 6].body, { object_id: 'obj_1' });
 });

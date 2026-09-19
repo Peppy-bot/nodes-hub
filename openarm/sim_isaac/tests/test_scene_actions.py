@@ -42,13 +42,14 @@ class _World:
 
 
 def _world(*robots):
+    """The stage's robots, each as (instance, model, position, yaw)."""
     return _World(
         _Robot(
             instance=instance,
             model=model,
-            placement=SimpleNamespace(position=position),
+            placement=SimpleNamespace(position=position, yaw=yaw),
         )
-        for instance, model, position in robots
+        for instance, model, position, yaw in robots
     )
 
 
@@ -117,7 +118,7 @@ def provider(monkeypatch):
     spec.loader.exec_module(module)
 
     stamps = FakeStamps()
-    world = _world(("alpha", "openarm_v2", (0.0, 0.0, 0.0)))
+    world = _world(("alpha", "openarm_v2", (0.0, 0.0, 0.0), 0.0))
     io = module.SceneActionIO(object(), Mock(), stamps, world)
     # The stage by object_id: where the launcher put each object.
     stage = {}
@@ -172,7 +173,8 @@ def test_assets_are_refused_with_a_reason_until_discovery_hands_them_over(provid
 
 def _spawn(provider, asset_id="props/blocks/red_block"):
     result = provider.io._execute(provider.launcher, "spawn_object", {
-        "asset_id": asset_id, "position": [0.5, 0.0, 0.8], "scale": 1.0, "physics": "dynamic", "mass": 0.1,
+        "asset_id": asset_id, "position": [0.5, 0.0, 0.8], "yaw": 0.0, "scale": 1.0, "physics": "dynamic",
+        "mass": 0.1,
     })
     assert result["success"]
     return result["object_id"]
@@ -236,13 +238,14 @@ def test_the_listing_names_every_robot_the_stage_stands(provider):
     assert len(listed) == 1
     assert (listed[0].robot, listed[0].model) == ("alpha", "openarm_v2")
     assert listed[0].position == [0.0, 0.0, 0.0]
+    assert listed[0].yaw == 0.0
     assert listed[0].attached
 
 
 def test_the_listing_follows_the_robots_that_join(provider):
     provider.io._world = _world(
-        ("alpha", "openarm_v2", (0.0, 0.0, 0.0)),
-        ("bravo", "openarm_v1", (0.0, -1.5, 0.0)),
+        ("alpha", "openarm_v2", (0.0, 0.0, 0.0), 0.0),
+        ("bravo", "openarm_v1", (0.0, -1.5, 0.0), 1.25),
     )
 
     listed = provider.io._handle_get_robots(None).robots
@@ -251,31 +254,70 @@ def test_the_listing_follows_the_robots_that_join(provider):
     assert [r.attached for r in listed] == [True, True]
     assert listed[1].model == "openarm_v1"
     assert listed[1].position == [0.0, -1.5, 0.0]
+    # Each faces the way it was placed.
+    assert [r.yaw for r in listed] == [0.0, 1.25]
 
 
-def test_moving_a_robot_by_name_moves_that_robot(provider):
+def test_moving_a_robot_by_name_moves_that_robot_to_face_the_yaw_it_names(provider):
     provider.io._world = _world(
-        ("alpha", "openarm_v2", (0.0, 0.0, 0.0)),
-        ("bravo", "openarm_v1", (0.0, -1.5, 0.0)),
+        ("alpha", "openarm_v2", (0.0, 0.0, 0.0), 0.0),
+        ("bravo", "openarm_v1", (0.0, -1.5, 0.0), 1.25),
     )
 
     result = provider.io._execute(
-        provider.launcher, "move_robot", {"robot": "bravo", "position": [1.0, -2.0, 0.0]}
+        provider.launcher, "move_robot", {"robot": "bravo", "position": [1.0, -2.0, 0.0], "yaw": -0.5}
     )
 
     assert result["success"] is True
     assert provider.launcher.mock_calls == [
-        call._runtime_move_robot_root({"robot": "bravo", "position": [1.0, -2.0, 0.0]})
+        call._runtime_move_robot_root({"robot": "bravo", "position": [1.0, -2.0, 0.0], "yaw": -0.5})
     ]
 
 
 def test_a_robot_the_stage_does_not_stand_is_refused_before_the_stage(provider):
     with pytest.raises(ValueError, match="no robot stands as 'ghost'"):
         provider.io._execute(
-            provider.launcher, "move_robot", {"robot": "ghost", "position": [1.0, 0.0, 0.0]}
+            provider.launcher, "move_robot", {"robot": "ghost", "position": [1.0, 0.0, 0.0], "yaw": 0.0}
         )
 
     assert provider.launcher.mock_calls == []
+
+
+@pytest.mark.parametrize("yaw", [float("nan"), float("inf"), float("-inf")])
+def test_a_move_to_a_yaw_that_is_no_number_is_refused_before_the_stage(provider, yaw):
+    with pytest.raises(ValueError, match="yaw must be a finite number of radians"):
+        provider.io._execute(
+            provider.launcher, "move_robot", {"robot": "alpha", "position": [1.0, 0.0, 0.0], "yaw": yaw}
+        )
+
+    assert provider.launcher.mock_calls == []
+
+
+def test_a_spawn_reaches_the_stage_with_the_yaw_it_names(provider):
+    provider.io.set_assets(_CATALOGUE)
+
+    result = provider.io._execute(provider.launcher, "spawn_object", {
+        "asset_id": "props/blocks/red_block", "position": [0.5, 0.0, 0.8], "yaw": 1.5, "scale": 1.0,
+        "physics": "static", "mass": 0.1,
+    })
+
+    assert result["success"]
+    (spawned,) = provider.launcher._runtime_spawn_isaac_asset.call_args.args
+    assert (spawned["name"], spawned["position"], spawned["yaw"]) == (result["object_id"], [0.5, 0.0, 0.8], 1.5)
+
+
+@pytest.mark.parametrize("yaw", [float("nan"), float("inf"), float("-inf")])
+def test_a_spawn_at_a_yaw_that_is_no_number_is_refused_and_mints_nothing(provider, yaw):
+    provider.io.set_assets(_CATALOGUE)
+
+    with pytest.raises(ValueError, match="yaw must be a finite number of radians"):
+        provider.io._execute(provider.launcher, "spawn_object", {
+            "asset_id": "props/blocks/red_block", "position": [0.5, 0.0, 0.8], "yaw": yaw, "scale": 1.0,
+            "physics": "static", "mass": 0.1,
+        })
+
+    assert provider.launcher.mock_calls == []
+    assert _spawned_ids(provider) == []
 
 
 def test_it_owns_exactly_the_objects_it_spawned_and_has_not_removed(provider):
@@ -331,7 +373,8 @@ def test_records_carry_what_each_object_was_spawned_with_in_spawn_order(provider
     object_ids = []
     for index, (asset_id, physics, mass, scale) in enumerate(spawned):
         result = provider.io._execute(provider.launcher, "spawn_object", {
-            "asset_id": asset_id, "position": [float(index), 0.0, 0.8], "scale": scale, "physics": physics, "mass": mass,
+            "asset_id": asset_id, "position": [float(index), 0.0, 0.8], "yaw": 0.0, "scale": scale,
+            "physics": physics, "mass": mass,
         })
         object_ids.append(result["object_id"])
 
@@ -377,7 +420,8 @@ def test_a_read_once_an_edit_completes_observes_it(provider):
 
     provider.stamps.now_s = 11.0
     spawned = _submit(provider, "spawn_object", {
-        "asset_id": "props/blocks/red_block", "position": [0.5, 0.0, 0.8], "scale": 1.0, "physics": "dynamic", "mass": 0.1,
+        "asset_id": "props/blocks/red_block", "position": [0.5, 0.0, 0.8], "yaw": 0.0, "scale": 1.0,
+        "physics": "dynamic", "mass": 0.1,
     })
     provider.io.process_pending(provider.launcher)
     ((result, response),) = spawned

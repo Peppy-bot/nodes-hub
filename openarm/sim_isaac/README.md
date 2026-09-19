@@ -137,10 +137,11 @@ deliberate pacing waits.
 ## Runtime Commander
 
 The TCP commander on port `5556` takes one JSON command per line. A robot
-is moved by the name it joined under:
+is moved by the name it joined under, to a position in metres facing a `yaw`
+in radians about +Z:
 
 ```json
-{"command": "move_robot_root", "robot": "alpha", "position": [1.5, 0.0, 0.0]}
+{"command": "move_robot_root", "robot": "alpha", "position": [1.5, 0.0, 0.0], "yaw": 1.57}
 ```
 
 A robot's arms are driven through its own backbone over the limb pairings;
@@ -151,12 +152,14 @@ the scene commander's `move_robot` reaches the same command.
 Spawn a USD asset, move it, remove it, over the TCP commander:
 
 ```json
-{"command": "spawn_usd", "name": "MyObject", "path": "/absolute/path/to/object.usd", "position": [1.0, 0.0, 0.8], "scale": 1.0}
+{"command": "spawn_usd", "name": "MyObject", "path": "/absolute/path/to/object.usd", "position": [1.0, 0.0, 0.8], "yaw": 0.5, "scale": 1.0}
 {"command": "move_object", "name": "MyObject", "position": [1.2, 0.2, 0.8]}
 {"command": "remove", "name": "MyObject"}
 ```
 
-The USD path must be accessible from the running Isaac Sim container.
+The USD path must be accessible from the running Isaac Sim container. `yaw`
+turns the object about +Z in radians; a spawn that names none stands as
+authored.
 
 Objects spawned through scene_manipulation (`obj_...` ids) belong to it: the
 commander refuses to `spawn`, `spawn-isaac` or `remove` one of those names, and

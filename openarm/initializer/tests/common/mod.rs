@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use peppygen::Parameters;
-use peppygen::fixtures::harness::Harness;
+use peppygen::fixtures::harness::{Config, Harness};
 use peppygen::mock::deps::simulation::attach;
 use peppygen::parameters::placement::Placement;
 
@@ -18,6 +18,9 @@ const SETUP_BUDGET: Duration = Duration::from_secs(30);
 
 /// How often a test checks whether the node's `setup` has returned.
 const SETUP_POLL: Duration = Duration::from_millis(50);
+
+/// The four limbs of an OpenArm, each answering for itself.
+pub const LIMBS: usize = 4;
 
 /// A robot of the OpenArm generation `hardware_version`, standing wherever
 /// a simulation parks it.
@@ -45,6 +48,27 @@ pub fn standing_at(hardware_version: &str, x: f64, y: f64, z: f64, yaw: f64) -> 
             yaw,
         },
         ..parameters(hardware_version)
+    }
+}
+
+/// A robot that joins a simulation: the `simulation` slot is bound and the
+/// robot has no drivers of its own, so the node attaches before it does
+/// anything else and the simulation answers for its readiness.
+pub fn joining_a_simulation(hardware_version: &str) -> Config {
+    Config {
+        parameters: Some(parameters(hardware_version)),
+        ..Config::default()
+    }
+}
+
+/// A robot with no simulation bound: the `simulation` slot is vacant, so the
+/// node joins no scene and serves readiness alone, over four limb instances.
+pub fn on_its_own_hardware() -> Config {
+    Config {
+        parameters: Some(parameters("v2")),
+        simulation_vacant: true,
+        limbs_instances: LIMBS,
+        ..Config::default()
     }
 }
 

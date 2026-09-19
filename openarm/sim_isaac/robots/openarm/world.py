@@ -263,9 +263,9 @@ class World:
         )
         return robot
 
-    def move(self, name: str, position) -> Robot:
-        """Puts a robot somewhere else in the stage, at the turn it already
-        stands at. The record moves with the prim, so what the scene reports
+    def move(self, name: str, position, yaw: float) -> Robot:
+        """Puts a robot somewhere else in the stage, turned `yaw` radians
+        about +z. The record moves with the prim, so what the scene reports
         and where the next robot is given room both follow it."""
         robot = next((one for one in self.robots() if one.instance == name), None)
         if robot is None:
@@ -273,7 +273,7 @@ class World:
         moved = Robot(
             instance=robot.instance,
             model=robot.model,
-            placement=Placement.of(position, robot.placement.yaw),
+            placement=Placement.of(position, yaw),
         )
 
         import omni.usd  # pylint: disable=C0415
@@ -283,11 +283,16 @@ class World:
             raise RuntimeError(
                 f"the prim {moved.prim()} of robot {name!r} does not exist"
             )
-        World._place(prim, moved.placement.position, moved.placement.yaw)
+        World.place(prim, moved.placement.position, moved.placement.yaw)
 
         with self._lock:
             self._robots[moved.instance] = moved
-        logger.info("robot '%s' moves to %s", name, list(moved.placement.position))
+        logger.info(
+            "robot '%s' moves to %s at a yaw of %s rad",
+            name,
+            list(moved.placement.position),
+            moved.placement.yaw,
+        )
         return moved
 
     def remove(self, instance: str) -> None:
@@ -324,7 +329,7 @@ class World:
         prim = stage.DefinePrim(robot.prim(), "Xform")
         prim.GetReferences().AddReference(str(stage_path))
 
-        World._place(prim, robot.placement.position, robot.placement.yaw)
+        World.place(prim, robot.placement.position, robot.placement.yaw)
 
         if head_camera_pack is not None:
             body = head_camera.attach(stage, robot.prim(), head_camera_pack)
@@ -336,12 +341,13 @@ class World:
             )
 
     @staticmethod
-    def _place(prim, position, yaw) -> None:
-        """Stands a robot at its placement. USD applies an xform's ops in the
-        order they are listed and a referenced model brings its own, so the
-        order is pinned here: the robot turns about its own base and is then
-        moved. Left to the order the reference happened to leave, a robot
-        asked for (1, 0, 0) at a quarter turn stands at (0, 1, 0)."""
+    def place(prim, position, yaw) -> None:
+        """Stands a prim, a robot or a spawned object, at `position` turned
+        `yaw` radians about +z. USD applies an xform's ops in the order they
+        are listed and a referenced model brings its own, so the order is
+        pinned here: the prim turns about its own origin and is then moved.
+        Left to the order the reference happened to leave, a robot asked for
+        (1, 0, 0) at a quarter turn stands at (0, 1, 0)."""
         from pxr import Gf, UsdGeom  # pylint: disable=C0415
 
         xform = UsdGeom.Xformable(prim)

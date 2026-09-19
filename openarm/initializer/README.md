@@ -1,6 +1,7 @@
 # openarm_initializer
 
-The node that brings one OpenArm into being and says when it is ready.
+The node that brings one OpenArm into being, says who it is and says when it
+is ready.
 
 ## Joining a simulation
 
@@ -39,6 +40,17 @@ the next poll, and a launcher that binds neither slot is refused at start.
 Readiness comes after joining: a robot the simulation refused never serves
 `is_ready` at all, so the backbone never gates on a readiness the scene
 cannot back.
+
+## Who the robot is
+
+The node exposes `get_identity`, which answers the name the robot stands
+under, the model it is and the core node hosting it. The name is the copy the
+launch put the robot in, or the node's own instance id for a robot launched
+outside one, and the model is the one of its generation (`openarm_v1` or
+`openarm_v2`). It is the name and the model the node attaches under, so the
+entry a simulation lists for this robot carries the same `robot`. The answer
+is fixed when the node starts and is served from then on, before the robot
+joins a scene and whether or not it is ready.
 
 ## Build
 
