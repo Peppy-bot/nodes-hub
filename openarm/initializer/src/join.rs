@@ -30,6 +30,7 @@ use peppygen::{NodeRunner, QoSProfile, Result};
 use peppylib::runtime::CancellationToken;
 use tracing::{error, info, warn};
 
+use crate::identity::Identity;
 use crate::refused;
 
 /// How long the robot waits for the simulation to admit it. The engine
@@ -72,22 +73,12 @@ fn spot_of(
     }))
 }
 
-/// The name this robot stands under in the scene: the copy the launch put it
-/// in, or its own instance id for a robot launched outside one. It is the
-/// name the engine reads on every one of this robot's limb pairs, which is
-/// how it tells one robot's limbs from another's.
-fn robot_name(runner: &NodeRunner) -> String {
-    runner
-        .copy()
-        .unwrap_or_else(|| runner.processor().bound_instance_id())
-        .to_string()
-}
-
 /// Joins the simulation the launcher bound this robot to, standing the
-/// model of the robot's generation. A robot with no simulation bound drives
-/// its own hardware and returns without joining.
+/// model of the robot's generation under the name `identity` gives it. A
+/// robot with no simulation bound drives its own hardware and returns
+/// without joining.
 pub async fn scene(
-    generation: &str,
+    identity: &Identity,
     placement: &Placement,
     runner: &Arc<NodeRunner>,
 ) -> Result<()> {
@@ -95,9 +86,8 @@ pub async fn scene(
         info!("no simulation stands this robot, so it joins none");
         return Ok(());
     };
-    let model = format!("openarm_{generation}");
+    let Identity { robot, model, .. } = identity.clone();
     let placement = spot_of(placement).map_err(refused)?;
-    let robot = robot_name(runner);
 
     let goal = attach::ActionHandle::fire_goal(
         runner,

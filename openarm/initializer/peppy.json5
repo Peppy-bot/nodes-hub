@@ -7,6 +7,10 @@
 // which answers for every limb of the robot it stands. One initializer
 // serves the real robot and every simulation.
 //
+// It also says who the robot is: get_identity answers the name the robot
+// stands under, the model it is and the core node hosting it, for as long as
+// the node runs.
+//
 // In a simulation it also joins the scene: it attaches as this robot, naming
 // the copy it runs as, the model to stand and where, and holds that goal for
 // as long as the robot is in the scene; the robot's limbs pair to the engine
@@ -18,6 +22,7 @@
     tag: "v1",
     implements: [
       { name: "robot_ready", tag: "v1", link_id: "robot_ready" },
+      { name: "robot_identity", tag: "v1", link_id: "robot_identity" },
     ],
     depends_on: {
       contracts: [
@@ -34,6 +39,7 @@
     services: {
       exposes: [
         { link_id: "robot_ready", name: "is_ready" },
+        { link_id: "robot_identity", name: "get_identity" },
       ],
       consumes: [
         { link_id: "limbs", name: "is_ready" },

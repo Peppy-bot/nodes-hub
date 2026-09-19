@@ -11,7 +11,9 @@ use peppygen::fixtures::harness::{Config, Harness};
 use peppygen::mock::deps::simulation::attach;
 
 mod common;
-use common::{await_setup_return, shutdown_once_setup_returns, simulation_of, stood};
+use common::{
+    await_setup_return, joining_a_simulation, shutdown_once_setup_returns, simulation_of, stood,
+};
 
 /// How long the wire may take for any one exchange.
 const WIRE: Duration = Duration::from_secs(10);
@@ -24,15 +26,6 @@ const A_LONG_STAY: Duration = Duration::from_secs(3);
 /// How long the engine takes to take a robot out, shorter than the node waits
 /// for its result, so a node that stops without waiting shows.
 const TAKING_OUT: Duration = Duration::from_secs(1);
-
-/// A robot that joins a simulation: the `simulation` slot is bound, so the
-/// node attaches before it does anything else.
-fn joining_a_simulation(hardware_version: &str) -> Config {
-    Config {
-        parameters: Some(common::parameters(hardware_version)),
-        ..Config::default()
-    }
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_robot_joins_the_scene_under_its_own_name() -> peppygen::Result<()> {

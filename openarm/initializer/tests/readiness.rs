@@ -14,13 +14,14 @@ use peppygen::mock::deps::simulation::attach;
 use peppygen::mock::deps::simulation::is_ready::ResponseData as SimulationReady;
 
 mod common;
-use common::{shutdown_once_setup_returns, simulation_of, stood};
+use common::{
+    LIMBS, joining_a_simulation, on_its_own_hardware, shutdown_once_setup_returns, simulation_of,
+    stood,
+};
 
 /// How long each mock waits parked for the node's next poll. The node polls
 /// every 500ms, so this only expires once the harness is gone.
 const PUMP_TIMEOUT: Duration = Duration::from_secs(60);
-/// The four limbs of an OpenArm, each answering for itself.
-const LIMBS: usize = 4;
 
 /// Answers every `is_ready` poll from the node with the current value of
 /// `flag`, until the mock's session closes.
@@ -70,26 +71,6 @@ async fn poll_until(harness: &Harness, want: bool, deadline: Duration) -> peppyg
             "node never reported ready={want}"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
-/// A robot with no simulation bound: the `simulation` slot is vacant, so the
-/// node joins no scene and serves readiness alone, over four limb instances.
-fn on_its_own_hardware() -> Config {
-    Config {
-        parameters: Some(common::parameters("v2")),
-        simulation_vacant: true,
-        limbs_instances: LIMBS,
-        ..Config::default()
-    }
-}
-
-/// A robot a simulation stands: the `simulation` slot is bound and the
-/// robot has no drivers of its own, so the simulation answers for it.
-fn in_a_simulation() -> Config {
-    Config {
-        parameters: Some(common::parameters("v2")),
-        ..Config::default()
     }
 }
 
@@ -154,7 +135,7 @@ async fn losing_a_limb_flips_back_to_not_ready() -> peppygen::Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_simulated_robot_is_as_ready_as_its_simulation_says() -> peppygen::Result<()> {
     let (harness, mut mocks) =
-        Harness::start_with(in_a_simulation(), openarm_initializer::setup).await?;
+        Harness::start_with(joining_a_simulation("v2"), openarm_initializer::setup).await?;
     let mut simulation = simulation_of(&mut mocks);
     let stay = simulation
         .attach
