@@ -395,11 +395,12 @@ class SimLauncher:
         self,
         command: dict,
     ) -> None:
-        """Puts one robot somewhere else in the live stage, leaving every
-        other robot standing where it is. The world's record moves with it,
-        so the scene reports where the robot now stands and the next robot
-        the engine places is given room from there."""
-        self._world.move(command["robot"], command["position"])
+        """Puts one robot somewhere else in the live stage, facing the yaw
+        the command names, leaving every other robot standing where it is.
+        The world's record moves with it, so the scene reports where the
+        robot now stands and the next robot the engine places is given room
+        from there."""
+        self._world.move(command["robot"], command["position"], command["yaw"])
 
     # ------------------------------------------------------------------
     # Runtime scene control
@@ -953,6 +954,14 @@ class SimLauncher:
             [0.0, 0.0, 0.0],
         )
 
+        # Rotation about +z in radians; 0 = as authored.
+        yaw = float(
+            command.get(
+                "yaw",
+                0.0,
+            )
+        )
+
         scale = command.get(
             "scale",
             [1.0, 1.0, 1.0],
@@ -995,41 +1004,16 @@ class SimLauncher:
         )
 
         # Converted OBJ -> USD assets commonly already contain
-        # translate/orient/scale xform ops. Reuse existing ops
-        # instead of trying to create duplicates.
-        translate_op = None
-        scale_op = None
-
-        for op in xformable.GetOrderedXformOps():
-            if (
-                op.GetOpType()
-                == UsdGeom.XformOp.TypeTranslate
-            ):
-                translate_op = op
-
-            elif (
-                op.GetOpType()
-                == UsdGeom.XformOp.TypeScale
-            ):
-                scale_op = op
-
-        if translate_op is None:
-            translate_op = (
-                xformable.AddTranslateOp()
-            )
-
-        if scale_op is None:
-            scale_op = (
-                xformable.AddScaleOp()
-            )
-
-        translate_op.Set(
-            Gf.Vec3d(
-                float(position[0]),
-                float(position[1]),
-                float(position[2]),
-            )
-        )
+        # translate/orient/scale xform ops. Reuse an existing scale op
+        # instead of trying to create a duplicate.
+        scale_op = next(
+            (
+                op
+                for op in xformable.GetOrderedXformOps()
+                if op.GetOpType() == UsdGeom.XformOp.TypeScale
+            ),
+            None,
+        ) or xformable.AddScaleOp()
 
         scale_op.Set(
             Gf.Vec3f(
@@ -1051,6 +1035,14 @@ class SimLauncher:
             )
         )
 
+        # The object stands where a robot would: turned about its own
+        # origin, then moved, with its scale applied before both.
+        self._world.place(
+            prim,
+            [float(value) for value in position],
+            yaw,
+        )
+
         self._runtime_apply_physics(
             prim,
             physics_mode,
@@ -1058,10 +1050,11 @@ class SimLauncher:
         )
 
         logger.info(
-            "Spawned runtime object '%s' from %s at %s",
+            "Spawned runtime object '%s' from %s at %s, at a yaw of %s rad",
             name,
             usd_path,
             position,
+            yaw,
         )
 
     def _runtime_apply_force(

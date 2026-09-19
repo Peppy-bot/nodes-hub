@@ -31,6 +31,7 @@ class FakePrim:
         self.valid = valid
         self.references = []
         self.translate = None
+        self.yaw = None
         self.scale = None
 
     def IsValid(self):
@@ -62,6 +63,13 @@ class FakeStage:
         for existing in list(self.prims):
             if existing == path or existing.startswith(path + "/"):
                 del self.prims[existing]
+
+
+def _stand(prim, position, yaw):
+    """World.place on the fake stage: the prim records where it was stood
+    and the way it was turned."""
+    prim.translate = tuple(position)
+    prim.yaw = yaw
 
 
 class FakeXformOp:
@@ -116,15 +124,19 @@ def scene(monkeypatch):
     monkeypatch.setattr(module, "RuntimeCommanderServer", Mock())
 
     scene_actions = Mock()
+    world = Mock()
+    world.place.side_effect = _stand
     launcher = module.SimLauncher(
-        Mock(), Mock(), Mock(), Mock(), Mock(), Mock(), object(), scene_actions, frame_rate_hz=60,
+        Mock(), world, Mock(), Mock(), Mock(), Mock(), object(), scene_actions, frame_rate_hz=60,
         render_mode="RealTimePathTracing", anti_aliasing=3,
     )
     # Specced against the real bridge, so a call to a method the bridge
     # lacks raises.
     bridge = Mock(spec=["bind", "unbind", "step", "shutdown", "is_ready"])
     launcher._extension = bridge
-    return SimpleNamespace(launcher=launcher, stage=stage, bridge=bridge, scene_actions=scene_actions)
+    return SimpleNamespace(
+        launcher=launcher, stage=stage, bridge=bridge, scene_actions=scene_actions, world=world,
+    )
 
 
 def _load(scene, path, scale=None):
@@ -270,9 +282,10 @@ def scene_manipulation(scene, monkeypatch):
     return io
 
 
-def _spawn(scene, scene_manipulation):
+def _spawn(scene, scene_manipulation, yaw=0.0, scale=1.0):
     result = scene_manipulation._execute(scene.launcher, "spawn_object", {
-        "asset_id": "props/blocks/red_block", "position": [0.5, 0.0, 0.8], "scale": 1.0, "physics": "none", "mass": 0.1,
+        "asset_id": "props/blocks/red_block", "position": [0.5, 0.0, 0.8], "yaw": yaw, "scale": scale,
+        "physics": "none", "mass": 0.1,
     })
     assert result["success"]
     return result["object_id"]
@@ -328,6 +341,48 @@ def test_the_runtime_commander_still_spawns_and_removes_other_names(scene, scene
     assert f"{_OBJECTS}/MyObject" not in scene.stage.prims
     # The commander's own objects never enter the object state.
     assert [record[0] for record in _captured(scene_manipulation)] == [object_id]
+
+
+def test_a_spawned_object_stands_where_it_was_asked_turned_by_its_yaw_at_its_scale(scene, scene_manipulation):
+    object_id = _spawn(scene, scene_manipulation, yaw=1.5, scale=2.0)
+
+    prim = scene.stage.prims[f"{_OBJECTS}/{object_id}"]
+    assert (prim.translate, prim.yaw, prim.scale) == ((0.5, 0.0, 0.8), 1.5, (2.0, 2.0, 2.0))
+    # The world stands it, as it stands a robot, once its scale is in place.
+    scene.world.place.assert_called_once_with(prim, [0.5, 0.0, 0.8], 1.5)
+
+
+def test_a_runtime_spawn_naming_no_yaw_stands_as_authored(scene, scene_manipulation, tmp_path):
+    # scene_manipulation owns neither name, so the commander spawns both.
+    usd = tmp_path / "prop.usd"
+    usd.write_text("#usda 1.0\n")
+
+    scene.launcher.execute_runtime_command({
+        "command": "spawn_usd", "name": "Authored", "path": str(usd), "position": [1.0, 0.0, 0.8],
+    })
+    scene.launcher.execute_runtime_command({
+        "command": "spawn_usd", "name": "Turned", "path": str(usd), "position": [1.0, 1.0, 0.8], "yaw": -0.75,
+    })
+
+    assert scene.stage.prims[f"{_OBJECTS}/Authored"].yaw == 0.0
+    assert scene.stage.prims[f"{_OBJECTS}/Turned"].yaw == -0.75
+
+
+def test_a_runtime_robot_move_hands_the_world_the_position_and_the_yaw(scene):
+    scene.launcher.execute_runtime_command({
+        "command": "move_robot_root", "robot": "alpha", "position": [1.5, 0.0, 0.0], "yaw": 0.5,
+    })
+
+    scene.world.move.assert_called_once_with("alpha", [1.5, 0.0, 0.0], 0.5)
+
+
+def test_a_runtime_robot_move_naming_no_yaw_is_refused(scene):
+    with pytest.raises(KeyError, match="yaw"):
+        scene.launcher.execute_runtime_command({
+            "command": "move_robot_root", "robot": "alpha", "position": [1.5, 0.0, 0.0],
+        })
+
+    scene.world.move.assert_not_called()
 
 
 def test_scene_manipulation_still_removes_its_own_objects(scene, scene_manipulation):
