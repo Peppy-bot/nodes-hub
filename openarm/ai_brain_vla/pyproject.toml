@@ -3,17 +3,24 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "openarm_ai_brain"
+name = "openarm_ai_brain_vla"
 version = "0.1.0"
-description = "openarm_ai_brain peppy node"
+description = "openarm_ai_brain_vla peppy node"
 requires-python = ">=3.11,<3.14"
-dependencies = ["peppygen", "peppylib"]
+dependencies = [
+    "peppygen",
+    "peppylib",
+    # Frames as arrays for the detector and the depth lookup; Pillow decodes
+    # the mjpeg colour encoding the camera contracts allow.
+    "numpy>=1.26",
+    "pillow>=10",
+]
 
 [project.scripts]
-openarm_ai_brain = "openarm_ai_brain.__main__:main"
+openarm_ai_brain_vla = "openarm_ai_brain_vla.__main__:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/openarm_ai_brain"]
+packages = ["src/openarm_ai_brain_vla"]
 
 [dependency-groups]
 dev = ["pytest>=8", "pytest-asyncio>=0.25"]
