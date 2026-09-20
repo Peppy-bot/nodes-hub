@@ -15,12 +15,12 @@ from peppygen import NodeBuilder, NodeRunner
 from peppygen.emitted_topics.limb_state import limb_states
 from peppygen.exposed_actions.limb_motion import move_arm, move_arm_joints, move_gripper
 from peppygen.exposed_actions.postures import move_to_home, move_to_ready
-from peppygen.paired_topics.arm_link import joint_setpoints as down_joint_setpoints
-from peppygen.paired_topics.arm_link import joint_states as down_joint_states
-from peppygen.paired_topics.gripper_link import (
+from peppygen.paired_topics.arm import joint_setpoints as down_joint_setpoints
+from peppygen.paired_topics.arm import joint_states as down_joint_states
+from peppygen.paired_topics.gripper import (
     gripper_setpoints as down_gripper_setpoints,
 )
-from peppygen.paired_topics.gripper_link import gripper_states as down_gripper_states
+from peppygen.paired_topics.gripper import gripper_states as down_gripper_states
 from peppygen.paired_topics.leader_arm import joint_setpoints as up_joint_setpoints
 from peppygen.paired_topics.leader_arm import joint_states as up_joint_states
 from peppygen.paired_topics.leader_gripper import (

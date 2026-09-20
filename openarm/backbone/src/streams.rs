@@ -19,8 +19,7 @@ use peppygen::NodeRunner;
 use peppygen::consumed_topics::collision_ctrl::governor_control as collision_ctrl_governor_control;
 use peppygen::paired_topics::{
     leader_left_arm, leader_left_arm_pose, leader_left_gripper, leader_right_arm,
-    leader_right_arm_pose, leader_right_gripper, left_arm_link, left_gripper_link, right_arm_link,
-    right_gripper_link,
+    leader_right_arm_pose, leader_right_gripper, left_arm, left_gripper, right_arm, right_gripper,
 };
 use tokio::sync::watch;
 use tracing::{error, warn};
@@ -340,8 +339,8 @@ pub async fn run_joint_state_listener(
     const WHAT: &str = "joint_states";
     let Some((mut left, mut right)) = subscribe_pair(
         WHAT,
-        left_arm_link::joint_states::subscribe(&runner),
-        right_arm_link::joint_states::subscribe(&runner),
+        left_arm::joint_states::subscribe(&runner),
+        right_arm::joint_states::subscribe(&runner),
     )
     .await
     else {
@@ -379,8 +378,8 @@ pub async fn run_gripper_state_listener(
     const WHAT: &str = "gripper_states";
     let Some((mut left, mut right)) = subscribe_pair(
         WHAT,
-        left_gripper_link::gripper_states::subscribe(&runner),
-        right_gripper_link::gripper_states::subscribe(&runner),
+        left_gripper::gripper_states::subscribe(&runner),
+        right_gripper::gripper_states::subscribe(&runner),
     )
     .await
     else {

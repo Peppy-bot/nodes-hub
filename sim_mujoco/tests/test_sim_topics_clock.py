@@ -1,0 +1,144 @@
+"""Tests for the clock half of SimTopicIO: recording the engine clock,
+stamping from it, and the guarded publish chain. peppylib and peppygen exist
+only inside the node's image, so runtime_fakes installs minimal ones before
+the import; everything under test is pure python.
+"""
+
+import asyncio
+import sys
+from pathlib import Path
+
+import pytest
+from sim_robot_core.registry import Registry
+
+import runtime_fakes  # noqa: F401  pylint: disable=W0611  (installs the runtime sim_topics imports)
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "engine"))
+
+import sim_topics  # noqa: E402  (needs the runtime fakes)
+
+
+class _FakeClockPublisher:
+    """Stands in for peppylib's ClockPublisher: records every publish, can
+    hold publishes open behind a gate, and can fail specific instants."""
+
+    def __init__(self) -> None:
+        self.published = []
+        self.gate = None
+        self.failing = set()
+
+    @property
+    def domain(self):
+        return "harness@cn-a"
+
+    async def publish(self, time_ns: int) -> None:
+        self.published.append(time_ns)
+        if self.gate is not None:
+            await self.gate.wait()
+        if time_ns in self.failing:
+            raise RuntimeError("the domain's tick was not sent")
+
+
+@pytest.fixture(name="loop")
+def loop_fixture():
+    loop = asyncio.new_event_loop()
+    yield loop
+    loop.close()
+
+
+@pytest.fixture(name="io")
+def io_fixture(loop):
+    io = sim_topics.SimTopicIO(node_runner=object(), loop=loop, robots=Registry())
+    io._clock_publisher = _FakeClockPublisher()
+    return io
+
+
+async def _drain(loop_turns: int = 10) -> None:
+    """Let scheduled callbacks and done-callbacks run: pure scheduling, no
+    wall-clock dependence."""
+    for _ in range(loop_turns):
+        await asyncio.sleep(0)
+
+
+def test_a_consumer_stamps_from_its_bound_clock(loop, monkeypatch):
+    io = sim_topics.SimTopicIO(node_runner=object(), loop=loop, robots=Registry())
+    monkeypatch.setattr(sim_topics.clock, "now_ns", lambda: 5_000_000_000)
+    assert io.timestamp_s() == 5.0
+    # And the publisher paths are inert: nothing declared, nothing recorded.
+    io.record_engine_time(1.0)
+    io.publish_clock_tick()
+    assert io.timestamp_s() == 5.0
+
+
+def test_a_publisher_stamps_from_its_recorded_engine_clock(io):
+    io.record_engine_time(1.25)
+    assert io.timestamp_s() == 1.25
+    io.record_engine_time(1.5)
+    assert io.timestamp_s() == 1.5
+
+
+def test_a_publisher_must_record_before_stamping_or_publishing(io):
+    with pytest.raises(RuntimeError, match="record an engine step"):
+        io.timestamp_s()
+    with pytest.raises(RuntimeError, match="record an engine step"):
+        io.publish_clock_tick()
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf"), -0.001])
+def test_a_diverged_engine_clock_is_rejected_at_the_boundary(io, bad):
+    with pytest.raises(ValueError, match="non-publishable instant"):
+        io.record_engine_time(bad)
+
+
+@pytest.mark.parametrize("engine_time_s", [0.0, 5e-10])
+def test_an_engine_clock_below_one_nanosecond_still_carries_an_instant(io, loop, engine_time_s):
+    """Zero is the clock topic's not-ready sentinel, so an engine sitting at or
+    below one nanosecond is floored rather than refused: the stamp and the tick
+    carry the same instant, and neither is zero."""
+    io.record_engine_time(engine_time_s)
+    assert io.timestamp_s() > 0.0
+    io.publish_clock_tick()
+    loop.run_until_complete(_drain())
+    assert io._clock_publisher.published == [1]
+
+def test_publish_lands_the_recorded_instant_in_nanoseconds(io, loop):
+    io.record_engine_time(2.5)
+    io.publish_clock_tick()
+    loop.run_until_complete(_drain())
+    assert io._clock_publisher.published == [2_500_000_000]
+
+
+def test_a_tick_arriving_mid_flight_is_latched_never_reordered(io, loop):
+    publisher = io._clock_publisher
+
+    async def scenario():
+        publisher.gate = asyncio.Event()
+        io._publish_clock_tick_on_loop(100)
+        await _drain()
+        # Two more while the first is out: only the newest survives.
+        io._publish_clock_tick_on_loop(200)
+        io._publish_clock_tick_on_loop(300)
+        assert publisher.published == [100]
+        publisher.gate.set()
+        await _drain()
+        assert publisher.published == [100, 300]
+
+    loop.run_until_complete(scenario())
+
+
+def test_publish_failures_are_latched_to_one_line_each_way(io, loop, caplog):
+    publisher = io._clock_publisher
+    publisher.failing = {1_000_000_000, 2_000_000_000}
+
+    async def scenario():
+        for instant in [1_000_000_000, 2_000_000_000, 3_000_000_000]:
+            io._publish_clock_tick_on_loop(instant)
+            await _drain()
+
+    with caplog.at_level("INFO"):
+        loop.run_until_complete(scenario())
+    assert publisher.published == [1_000_000_000, 2_000_000_000, 3_000_000_000]
+    down = [r for r in caplog.records if "is not being published" in r.message]
+    recovered = [r for r in caplog.records if "is being published again" in r.message]
+    assert len(down) == 1, "two consecutive failures log one line"
+    assert len(recovered) == 1, "recovery logs one line"

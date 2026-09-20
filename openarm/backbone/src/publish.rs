@@ -23,8 +23,7 @@ use peppygen::emitted_topics::collision_status::collision_status;
 use peppygen::emitted_topics::limb_state::limb_states;
 use peppygen::paired_topics::{
     leader_left_arm, leader_left_arm_pose, leader_left_gripper, leader_right_arm,
-    leader_right_arm_pose, leader_right_gripper, left_arm_link, left_gripper_link, right_arm_link,
-    right_gripper_link,
+    leader_right_arm_pose, leader_right_gripper, left_arm, left_gripper, right_arm, right_gripper,
 };
 use peppylib::{Payload, TopicPublisher};
 use srs_model::nalgebra::Isometry3;
@@ -257,28 +256,28 @@ impl Publishers {
             arm_setpoints: ArmPair::new(
                 Publisher::declare(
                     "left joint_setpoints",
-                    left_arm_link::joint_setpoints::declare_publisher(runner),
-                    left_arm_link::joint_setpoints::build_message as JointBuild,
+                    left_arm::joint_setpoints::declare_publisher(runner),
+                    left_arm::joint_setpoints::build_message as JointBuild,
                 )
                 .await?,
                 Publisher::declare(
                     "right joint_setpoints",
-                    right_arm_link::joint_setpoints::declare_publisher(runner),
-                    right_arm_link::joint_setpoints::build_message as JointBuild,
+                    right_arm::joint_setpoints::declare_publisher(runner),
+                    right_arm::joint_setpoints::build_message as JointBuild,
                 )
                 .await?,
             ),
             gripper_setpoints: ArmPair::new(
                 Publisher::declare(
                     "left gripper_setpoints",
-                    left_gripper_link::gripper_setpoints::declare_publisher(runner),
-                    left_gripper_link::gripper_setpoints::build_message as OpeningBuild,
+                    left_gripper::gripper_setpoints::declare_publisher(runner),
+                    left_gripper::gripper_setpoints::build_message as OpeningBuild,
                 )
                 .await?,
                 Publisher::declare(
                     "right gripper_setpoints",
-                    right_gripper_link::gripper_setpoints::declare_publisher(runner),
-                    right_gripper_link::gripper_setpoints::build_message as OpeningBuild,
+                    right_gripper::gripper_setpoints::declare_publisher(runner),
+                    right_gripper::gripper_setpoints::build_message as OpeningBuild,
                 )
                 .await?,
             ),

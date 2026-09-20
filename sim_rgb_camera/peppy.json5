@@ -2,13 +2,15 @@
 // sim_rgb_camera_link pairing and the rgb_camera contract surface. Toward
 // consumers it is a camera exactly like the real uvc nodes (frames out,
 // stream info and control services answered) that also describes itself
-// through camera_profile; toward the simulation it views the matching camera
-// slot and, when a launch links its control slot to the simulation, forwards
-// every camera control there under the slot's name, so the simulation's
-// device model answers them. Without that link every control refuses.
-// Frames relay timestamps and frame_ids untouched, so consumers age samples
-// on the capture time. One instance per camera; the simulation slot carries
-// the camera's identity, so there is no id anywhere.
+// through camera_profile; toward the simulation it views a pair of the
+// simulation's colour camera slot and, when a launch links its control slot
+// to the simulation, forwards every camera control there under the camera's
+// name, so the simulation's device model answers them. Without that link
+// every control refuses. Frames relay timestamps and frame_ids untouched, so
+// consumers age samples on the capture time. One instance per camera, and
+// the camera's name is the instance's own in its copy: relay
+// alpha_wrist_left of copy alpha is camera wrist_left, and a relay launched
+// outside a copy is the camera its instance id names.
 {
   peppy_schema: "node/v1",
   manifest: {
@@ -20,15 +22,16 @@
     ],
     depends_on: {
       pairings: [
-        // The simulation's matching camera slot: this relay views, the
-        // simulation streams. Required: a relay without a simulation is a
+        // The simulation's colour camera slot, which holds a pair per
+        // camera: this relay views, the simulation streams the camera this
+        // relay's name says. Required: a relay without a simulation is a
         // misconfiguration, so the launch fails loudly instead.
         { name: "sim_rgb_camera_link", tag: "v1", role: "viewer", link_id: "simulation" },
       ],
       contracts: [
         // The simulation's camera response model, when it has one: the
-        // controls a consumer sets on this camera go there, named by the
-        // slot this relay views. A launch on a simulation without one
+        // controls a consumer sets on this camera go there, under this
+        // relay's name in its copy. A launch on a simulation without one
         // writes the slot vacant, and every control refuses.
         { name: "sim_camera_control", tag: "v1", link_id: "control", cardinality: "zero_or_one" },
       ],

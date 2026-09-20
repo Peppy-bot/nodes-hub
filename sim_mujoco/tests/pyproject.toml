@@ -1,0 +1,43 @@
+# The suites are their own uv project rather than part of the node above
+# them. The node manages nothing through uv: its python runs on the
+# interpreter its image ships, against the dependencies baked into that image.
+#
+# CI runs a python test project inside the image built from the apptainer.def
+# beside it, and gives a project with no def the scaffolded python base image.
+# There is no def here, which is what these suites want: they render nothing,
+# so a mujoco wheel and a compiled MJCF are the whole of what they need from
+# the simulation.
+[project]
+name = "sim-mujoco-tests"
+version = "0.1.0"
+description = "Tests for the sim_mujoco node: its model entries, pair routing, robot stays, bridge and camera plumbing"
+# The interpreter the node's base image is built on
+# (sim_base_images/Dockerfile.mujoco: python:3.12-slim).
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    # The versions the node's base image installs
+    # (sim_base_images/requirements.mujoco.txt), so the scene these
+    # suites compile is compiled by the mujoco the node runs on.
+    "mujoco==3.10.0",
+    "numpy==2.4.4",
+    "pyjson5==2.0.0",
+    # What the engine shares with every other one: the registry, the four
+    # slots, the model entries and the camera configuration.
+    "sim_robot_core",
+    # The hardware's source of truth the SO-101 model is held to
+    # (test_so101_model.py): joint names, URDF limits, the tool frame, the
+    # start posture and the front camera.
+    "so101_description",
+]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.uv]
+# The suites reach the node's modules through sys.path, so this project has
+# nothing importable of its own and no wheel to build.
+package = false
+
+[tool.uv.sources]
+sim_robot_core = { git = "https://github.com/Peppy-bot/peppy", subdirectory = "public-peppy-libs/sim_robot_core", rev = "9dde20f5b014dd7fd16487e6e0071b0c9c0fb0cc" }
+so101_description = { git = "https://github.com/Peppy-bot/peppy", subdirectory = "public-peppy-libs/so101_description", rev = "9dde20f5b014dd7fd16487e6e0071b0c9c0fb0cc" }

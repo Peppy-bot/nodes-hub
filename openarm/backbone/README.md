@@ -20,7 +20,7 @@ each slot.
                     +--------------------------------+
                            v             v
                   joint_setpoints        |    gripper_setpoints  [pairing slots, follower side]
- (streams out) left_arm_link . right_arm_link . left_gripper_link . right_gripper_link
+ (streams out) left_arm . right_arm . left_gripper . right_gripper
                         ^    joint_states / gripper_states (measured, relayed back up)
 ```
 
@@ -148,7 +148,7 @@ failure of the move machinery).
 | Module | Owns | Why it lives here |
 |---|---|---|
 | `main.rs` | bringup: params, models, channels, task supervision | first task exit is fatal; the daemon restarts a clean process |
-| `startup.rs` | the openarm_initializer gate | nothing streams before the robot is ready |
+| `startup.rs` | the robot_initializer gate | nothing streams before the robot is ready |
 | `streams.rs` | every subscription + parse-at-the-boundary types (`GripperCommand`, `ArmState`, `GripperState`) | one receive policy (`subscribe_pair` + `accept`); a malformed message is dropped with a reason, never driven |
 | `upstream.rs` | `UpstreamMode` (which upstream slot kind is followed) + `Upstream` (the parsed joint or pose command) | one command authority per arm is unrepresentable, not checked per tick |
 | `publish.rs` | every publisher (`Publishers`), one stamp/build/publish/log path | peppy vocabulary: a publisher on a slot; "wire" means the transport encoding only |

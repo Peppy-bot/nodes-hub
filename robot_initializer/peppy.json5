@@ -1,0 +1,80 @@
+// robot_initializer: the node that brings one robot into being and says when
+// it is ready. It serves a robot of any model, an OpenArm and an SO-101
+// alike: the model is a parameter, and nothing else here is about one.
+//
+// It exposes the robot-level is_ready the backbone gates on, true only once
+// everything that answers for the robot reports ready: the drivers of its
+// limbs on a real robot, and the simulation on a simulated one, which answers
+// for every limb of the robot it stands. One initializer serves the real
+// robot and every simulation.
+//
+// It also says who the robot is: get_identity answers the name the robot
+// stands under, the model it is and the core node hosting it, for as long as
+// the node runs.
+//
+// In a simulation it also joins the scene: it attaches as this robot, naming
+// the copy it runs as, the model to stand and where, and holds that goal for
+// as long as the robot is in the scene; the robot's limbs pair to the engine
+// through the backbone.
+{
+  peppy_schema: "node/v1",
+  manifest: {
+    name: "robot_initializer",
+    tag: "v1",
+    implements: [
+      { name: "robot_ready", tag: "v1", link_id: "robot_ready" },
+      { name: "robot_identity", tag: "v1", link_id: "robot_identity" },
+    ],
+    depends_on: {
+      contracts: [
+        // Whatever drivers answer for this robot's limbs: one per limb on an
+        // OpenArm, the single so101_follower on an SO-101. A robot a
+        // simulation stands has none.
+        { name: "component_ready", tag: "v1", link_id: "limbs", cardinality: "zero_or_more" },
+        // The simulation this robot joins, which answers for every limb it
+        // stands. Vacant on a robot that drives its own hardware.
+        { name: "simulation_robot", tag: "v1", link_id: "simulation", cardinality: "zero_or_one" },
+      ],
+    },
+  },
+  interfaces: {
+    services: {
+      exposes: [
+        { link_id: "robot_ready", name: "is_ready" },
+        { link_id: "robot_identity", name: "get_identity" },
+      ],
+      consumes: [
+        { link_id: "limbs", name: "is_ready" },
+        { link_id: "simulation", name: "is_ready" },
+      ],
+    },
+    actions: {
+      consumes: [{ link_id: "simulation", name: "attach" }],
+    },
+  },
+  execution: {
+    language: "rust",
+    container: {
+      def_file: "apptainer.def",
+    },
+    parameters: {
+      // The robot's model id, as a simulation's catalogue names it, for
+      // example "openarm_v2" or "so101". It is the model get_identity answers
+      // and the one the attach goal names, verbatim. A simulation refuses a
+      // model it does not stand, naming the ones it does; on a robot that
+      // drives its own hardware the model is identity only.
+      model: "string",
+      // Where the robot stands. `auto` lets the engine park it on a free spot
+      // of its own, which is what a fleet of robots wants; turn it off to
+      // stand this robot at x, y, z (metres) turned yaw (radians) about the
+      // world's vertical.
+      placement: {
+        auto: { $type: "bool", $default: true },
+        x: { $type: "f64", $default: 0 },
+        y: { $type: "f64", $default: 0 },
+        z: { $type: "f64", $default: 0 },
+        yaw: { $type: "f64", $default: 0 },
+      },
+    },
+  },
+}
