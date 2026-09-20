@@ -7,8 +7,13 @@
 // every camera control there under the slot's name, so the simulation's
 // device model answers them. Without that link every control refuses.
 // Frames relay timestamps and frame_ids untouched, so consumers age samples
-// on the capture time. One instance per camera; the simulation slot carries
-// the camera's identity, so there is no id anywhere.
+// on the capture time. It also says where its pixels point, through
+// camera_geometry: the simulation publishes the stream's pinhole model on
+// the pairing's geometry topic, and get_color_intrinsics answers from the
+// latest one, refusing until the first arrives. A colour camera has no
+// depth stream, so the contract's two depth services always refuse and say
+// so. One instance per camera; the simulation slot carries the camera's
+// identity, so there is no id anywhere.
 {
   peppy_schema: "node/v1",
   manifest: {
@@ -17,6 +22,7 @@
     implements: [
       { name: "rgb_camera", tag: "v1", link_id: "camera" },
       { name: "camera_profile", tag: "v1", link_id: "profile" },
+      { name: "camera_geometry", tag: "v1", link_id: "geometry" },
     ],
     depends_on: {
       pairings: [
@@ -42,6 +48,7 @@
       consumes: [
         { link_id: "simulation", name: "video_stream" },
         { link_id: "simulation", name: "stream_info" },
+        { link_id: "simulation", name: "geometry" },
       ],
     },
     services: {
@@ -54,6 +61,9 @@
         { link_id: "camera", name: "set_contrast" },
         { link_id: "profile", name: "get_camera_profile" },
         { link_id: "profile", name: "reset_camera" },
+        { link_id: "geometry", name: "get_color_intrinsics" },
+        { link_id: "geometry", name: "get_depth_intrinsics" },
+        { link_id: "geometry", name: "get_depth_to_color_extrinsics" },
       ],
       consumes: [
         { link_id: "control", name: "describe_camera" },

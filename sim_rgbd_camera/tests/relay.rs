@@ -9,12 +9,15 @@ use peppygen::fixtures::exposed_services::camera::{
     depth_stream_info, set_color_brightness, set_color_contrast, set_color_exposure,
     set_color_gain, set_color_white_balance, video_stream_info,
 };
+use peppygen::fixtures::exposed_services::geometry::{
+    get_color_intrinsics, get_depth_intrinsics, get_depth_to_color_extrinsics,
+};
 use peppygen::fixtures::exposed_services::profile::{get_camera_profile, reset_camera};
 use peppygen::fixtures::harness::{Config, Harness};
 use peppygen::mock::deps::control as control_mock;
 use peppygen::mock::pairings::simulation::{
-    self as simulation_mock, depth_stream as simulation_depth, stream_info as simulation_info,
-    video_stream as simulation_video,
+    self as simulation_mock, depth_stream as simulation_depth, geometry as simulation_geometry,
+    stream_info as simulation_info, video_stream as simulation_video,
 };
 use peppygen::paired_topics::simulation::{
     depth_stream::MessageHeader as DepthHeader, video_stream::MessageHeader as ColorHeader,
@@ -50,6 +53,10 @@ const DEPTH_UNIT: f32 = 0.001;
 /// rejected, so adopting one is visible on a second field.
 const REJECTED_WIDTH: u32 = 999;
 
+/// The refusal every geometry service answers before the simulation's first
+/// geometry, verbatim: a consumer reads it to learn it is early, not broken.
+const NO_GEOMETRY_MESSAGE: &str = "no camera geometry received from the simulation yet";
+
 /// How long to let rejected descriptions settle before reading the served one
 /// back. The harness wire delivers in-process, so this is a wide margin over
 /// the delivery it waits out, not a guess at it.
@@ -65,6 +72,36 @@ fn description(depth_unit: f32) -> simulation_info::Message {
         depth_height: 360,
         depth_encoding: "z16".to_string(),
         depth_unit,
+    }
+}
+
+/// The chest camera as the engines publish it: 1280x720 colour and 640x360
+/// depth from one 52 degree view, so the depth model is half the colour one
+/// and the two streams are aligned.
+fn geometry() -> simulation_geometry::Message {
+    simulation_geometry::Message {
+        width: 1280,
+        height: 720,
+        fx: 738.1094,
+        fy: 738.1094,
+        cx: 639.5,
+        cy: 359.5,
+        distortion_model: "none".to_string(),
+        distortion: Vec::new(),
+        depth_width: 640,
+        depth_height: 360,
+        depth_fx: 369.0547,
+        depth_fy: 369.0547,
+        depth_cx: 319.5,
+        depth_cy: 179.5,
+        depth_distortion_model: "none".to_string(),
+        depth_distortion: Vec::new(),
+        depth_model: "z".to_string(),
+        min_depth_m: 0.1,
+        max_depth_m: 10.0,
+        align_mode: ALIGN_MODE.to_string(),
+        depth_to_color_position: [0.0, 0.0, 0.0],
+        depth_to_color_orientation: [0.0, 0.0, 0.0, 1.0],
     }
 }
 
@@ -603,6 +640,203 @@ async fn a_response_model_failure_answers_a_refusal_with_the_error() -> peppygen
         response.message
     );
     assert_eq!(response.current_value, NO_CURRENT_VALUE);
+
+    harness.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_geometry_services_answer_from_the_simulation_geometry() -> peppygen::Result<()> {
+    let (harness, mocks) = Harness::start(sim_rgbd_camera::setup).await?;
+
+    // Before the simulation says where the pixels point there is no model to
+    // hand over. Zeros under success would have a consumer divide by a focal
+    // length of zero, so every service refuses and says why.
+    let color = get_color_intrinsics::poll(&harness, TIMEOUT).await?;
+    assert!(!color.success);
+    assert_eq!(color.message, NO_GEOMETRY_MESSAGE);
+    assert_eq!(color.fx, 0.0);
+    let depth = get_depth_intrinsics::poll(&harness, TIMEOUT).await?;
+    assert!(!depth.success);
+    assert_eq!(depth.message, NO_GEOMETRY_MESSAGE);
+    let pose = get_depth_to_color_extrinsics::poll(&harness, TIMEOUT).await?;
+    assert!(!pose.success);
+    assert_eq!(pose.message, NO_GEOMETRY_MESSAGE);
+
+    mocks
+        .pairings
+        .simulation
+        .geometry
+        .publish(&geometry())
+        .await?;
+
+    let color = poll_until!(
+        get_color_intrinsics,
+        &harness,
+        |r: &get_color_intrinsics::Response| r.success
+    );
+    assert_eq!((color.width, color.height), (1280, 720));
+    assert_eq!((color.fx, color.fy), (738.1094, 738.1094));
+    assert_eq!((color.cx, color.cy), (639.5, 359.5));
+    assert_eq!(color.distortion_model, "none");
+    assert!(color.distortion.is_empty());
+
+    // The depth service describes the depth grid, not the colour one: with
+    // the colour numbers a consumer would place every point at twice its
+    // distance from the optical axis.
+    let depth = poll_until!(
+        get_depth_intrinsics,
+        &harness,
+        |r: &get_depth_intrinsics::Response| r.success
+    );
+    assert_eq!((depth.width, depth.height), (640, 360));
+    assert_eq!((depth.fx, depth.fy), (369.0547, 369.0547));
+    assert_eq!((depth.cx, depth.cy), (319.5, 179.5));
+    assert_eq!(depth.distortion_model, "none");
+    assert!(depth.distortion.is_empty());
+    assert_eq!(depth.depth_model, "z");
+    assert_eq!((depth.min_depth_m, depth.max_depth_m), (0.1, 10.0));
+    assert_eq!(depth.align_mode, ALIGN_MODE);
+
+    let pose = poll_until!(
+        get_depth_to_color_extrinsics,
+        &harness,
+        |r: &get_depth_to_color_extrinsics::Response| r.success
+    );
+    assert_eq!(pose.align_mode, ALIGN_MODE);
+    assert_eq!(pose.depth_to_color_position, [0.0, 0.0, 0.0]);
+    assert_eq!(pose.depth_to_color_orientation, [0.0, 0.0, 0.0, 1.0]);
+
+    // A camera that stops aligning publishes a different geometry, and the
+    // answers follow it: the pose is the simulation's, not an identity the
+    // relay assumes, and both depth answers name the alignment they hold
+    // under.
+    // Ten degrees about the optical axis, as a unit quaternion.
+    let half_angle = 5f64.to_radians();
+    let unaligned = simulation_geometry::Message {
+        align_mode: "none".to_string(),
+        depth_cx: 322.25,
+        depth_to_color_position: [-0.015, 0.0005, 0.0],
+        depth_to_color_orientation: [0.0, 0.0, half_angle.sin(), half_angle.cos()],
+        ..geometry()
+    };
+    mocks
+        .pairings
+        .simulation
+        .geometry
+        .publish(&unaligned)
+        .await?;
+    let pose = poll_until!(
+        get_depth_to_color_extrinsics,
+        &harness,
+        |r: &get_depth_to_color_extrinsics::Response| r.align_mode == "none"
+    );
+    assert_eq!(
+        pose.depth_to_color_position,
+        unaligned.depth_to_color_position
+    );
+    assert_eq!(
+        pose.depth_to_color_orientation,
+        unaligned.depth_to_color_orientation
+    );
+    let depth = get_depth_intrinsics::poll(&harness, TIMEOUT).await?;
+    assert_eq!(depth.align_mode, "none");
+    assert_eq!(depth.cx, 322.25);
+
+    harness.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unusable_geometry_is_ignored() -> peppygen::Result<()> {
+    let (harness, mocks) = Harness::start(sim_rgbd_camera::setup).await?;
+
+    // Establish a usable geometry first, so a rejection can be told apart
+    // from never having had one.
+    mocks
+        .pairings
+        .simulation
+        .geometry
+        .publish(&geometry())
+        .await?;
+    let accepted = poll_until!(
+        get_color_intrinsics,
+        &harness,
+        |r: &get_color_intrinsics::Response| r.success
+    );
+    assert_eq!(accepted.width, 1280);
+
+    // Each of these spoils every position a consumer would compute. The
+    // relay must ignore the whole geometry rather than adopt it, so each bad
+    // one also carries a width the good one does not.
+    let unusable = [
+        simulation_geometry::Message {
+            fx: 0.0,
+            ..geometry()
+        },
+        simulation_geometry::Message {
+            fy: f64::NAN,
+            ..geometry()
+        },
+        simulation_geometry::Message {
+            depth_fx: -369.0547,
+            ..geometry()
+        },
+        simulation_geometry::Message {
+            depth_height: 0,
+            ..geometry()
+        },
+        simulation_geometry::Message {
+            max_depth_m: 0.05,
+            ..geometry()
+        },
+        simulation_geometry::Message {
+            depth_to_color_orientation: [0.0; 4],
+            ..geometry()
+        },
+        simulation_geometry::Message {
+            depth_to_color_orientation: [0.0, 0.0, 0.0, 2.0],
+            ..geometry()
+        },
+    ];
+    for bad in unusable {
+        mocks
+            .pairings
+            .simulation
+            .geometry
+            .publish(&simulation_geometry::Message {
+                width: REJECTED_WIDTH,
+                ..bad
+            })
+            .await?;
+    }
+
+    // These are the last messages on the leg, so whatever the services hold
+    // after the settle is what the rejections left them.
+    tokio::time::sleep(REJECTION_SETTLE).await;
+    let after = get_color_intrinsics::poll(&harness, TIMEOUT).await?;
+    assert!(after.success);
+    assert_ne!(
+        after.width, REJECTED_WIDTH,
+        "an unusable geometry was adopted"
+    );
+    assert_eq!(after.fx, 738.1094);
+
+    // A later good geometry must still land, which proves the loop stayed
+    // alive through the rejections rather than having ended.
+    mocks
+        .pairings
+        .simulation
+        .geometry
+        .publish(&simulation_geometry::Message {
+            width: 1920,
+            ..geometry()
+        })
+        .await?;
+    let settled = poll_until!(
+        get_color_intrinsics,
+        &harness,
+        |r: &get_color_intrinsics::Response| r.width == 1920
+    );
+    assert_eq!(settled.width, 1920);
 
     harness.shutdown().await
 }
