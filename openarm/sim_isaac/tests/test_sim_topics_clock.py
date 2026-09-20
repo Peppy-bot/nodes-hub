@@ -26,6 +26,7 @@ _PAIRED_SLOTS = [
 ]
 _PAIRED_TOPICS = [
     "depth_stream",
+    "geometry",
     "stream_info",
     "video_stream",
     "joint_setpoints",

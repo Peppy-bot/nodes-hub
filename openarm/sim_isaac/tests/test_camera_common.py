@@ -21,6 +21,7 @@ from camera_common import (
     FramePacer,
     depth_to_z16,
     load_camera_configs,
+    pinhole,
     validate_camera_slots,
 )
 
@@ -370,3 +371,16 @@ class TestFramePacer:
         taken = [pacer.take_if_due(100.0 + i * 0.0165) for i in range(600)]
         assert sum(taken) >= 594
         assert all(a or b for a, b in zip(taken, taken[1:]))
+
+
+def test_the_chest_cameras_pinhole_follows_its_field_of_view():
+    # The shipped chest camera: 52 degrees of vertical field of view.
+    color = pinhole(52.0, 1280, 720)
+    assert color.fx == pytest.approx(738.1, abs=0.05)
+    assert color.fy == color.fx
+    # Pixel centres sit on whole numbers, so the middle of 1280 is 639.5.
+    assert (color.cx, color.cy) == (639.5, 359.5)
+    # The same camera rendered at the depth stream's own size.
+    depth = pinhole(52.0, 640, 360)
+    assert depth.fx == pytest.approx(369.06, abs=0.05)
+    assert (depth.cx, depth.cy) == (319.5, 179.5)

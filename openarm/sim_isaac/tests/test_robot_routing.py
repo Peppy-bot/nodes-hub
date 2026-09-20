@@ -27,6 +27,7 @@ _TOPICS = [
     "video_stream",
     "depth_stream",
     "stream_info",
+    "geometry",
 ]
 
 

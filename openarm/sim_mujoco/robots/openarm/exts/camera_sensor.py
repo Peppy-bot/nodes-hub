@@ -12,11 +12,15 @@ from camera_common import (
     ALIGN_MODE,
     COLOR_ENCODING,
     DEPTH_ENCODING,
+    DEPTH_MODEL,
+    DEPTH_TO_COLOR_ORIENTATION,
+    DEPTH_TO_COLOR_POSITION,
     DEPTH_UNIT_M_PER_LSB,
     CameraConfig,
     FrameIdCounter,
     FramePacer,
     depth_to_z16,
+    pinhole,
 )
 
 logger = logging.getLogger(__name__)
@@ -327,6 +331,7 @@ class MujocoCameraSensor:
         for stream in self._streams.values():
             if stream.info.take_if_due(now):
                 self._publish_stream_info(stream.config)
+                self._publish_geometry(stream.config)
 
         due = [s for s in self._streams.values() if s.frames.take_if_due(now)]
         if not due:
@@ -423,6 +428,28 @@ class MujocoCameraSensor:
                 camera.depth.height,
                 depth_to_z16(depth_m, camera.depth),
             ),
+        )
+
+    def _publish_geometry(self, camera: CameraConfig) -> None:
+        """Where this camera's pixels point, in the camera_geometry contract's
+        terms. Depth renders from the
+        same camera at the depth stream's own size, so its grid is a pinhole of
+        the same field of view, centred like the colour one."""
+        color = pinhole(camera.fovy_deg, camera.width, camera.height)
+        if camera.depth is None:
+            self._io.publish_color_geometry(self._robot, camera.name, color)
+            return
+        self._io.publish_rgbd_geometry(
+            self._robot,
+            camera.name,
+            color,
+            pinhole(camera.fovy_deg, camera.depth.width, camera.depth.height),
+            DEPTH_MODEL,
+            camera.depth.min_depth_m,
+            camera.depth.max_range_m,
+            ALIGN_MODE,
+            DEPTH_TO_COLOR_POSITION,
+            DEPTH_TO_COLOR_ORIENTATION,
         )
 
     def _publish_stream_info(self, camera: CameraConfig) -> None:

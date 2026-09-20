@@ -11,11 +11,15 @@ from camera_common import (
     ALIGN_MODE,
     COLOR_ENCODING,
     DEPTH_ENCODING,
+    DEPTH_MODEL,
+    DEPTH_TO_COLOR_ORIENTATION,
+    DEPTH_TO_COLOR_POSITION,
     DEPTH_UNIT_M_PER_LSB,
     CameraConfig,
     FrameIdCounter,
     FramePacer,
     depth_to_z16,
+    pinhole,
 )
 
 logger = logging.getLogger(__name__)
@@ -214,6 +218,7 @@ class IsaacCameraSensor:
         for name, pacer in self._info_pacers.items():
             if pacer.take_if_due(now):
                 self._publish_stream_info(self._cameras[name])
+                self._publish_geometry(self._cameras[name])
 
         # An armed camera stays armed (render product updates on) until a
         # capture actually lands: the annotator yields empty data until the
@@ -336,6 +341,31 @@ class IsaacCameraSensor:
             )
             return None
         return np.ascontiguousarray(rgba[..., :3])
+
+    def _publish_geometry(self, camera: CameraConfig) -> None:
+        """Where this camera's pixels point, in the camera_geometry contract's
+        terms. Depth rides the colour
+        render product and is subsampled to the depth stream's size at capture.
+        Measured on real frames against the engine's ground truth, a spawned
+        block rebuilds to its true size and place with the depth grid taken as
+        a centred pinhole of the same field of view, which is also what the
+        other two engines publish."""
+        color = pinhole(camera.fovy_deg, camera.width, camera.height)
+        if camera.depth is None:
+            self._io.publish_color_geometry(self._robot, camera.name, color)
+            return
+        self._io.publish_rgbd_geometry(
+            self._robot,
+            camera.name,
+            color,
+            pinhole(camera.fovy_deg, camera.depth.width, camera.depth.height),
+            DEPTH_MODEL,
+            camera.depth.min_depth_m,
+            camera.depth.max_range_m,
+            ALIGN_MODE,
+            DEPTH_TO_COLOR_POSITION,
+            DEPTH_TO_COLOR_ORIENTATION,
+        )
 
     def _publish_stream_info(self, camera: CameraConfig) -> None:
         if camera.depth is None:

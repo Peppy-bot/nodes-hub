@@ -37,6 +37,7 @@ import peppylib
 from peppygen import clock
 from peppylib.clock import ClockPublisher
 from peppygen.paired_topics.chest import depth_stream as chest_depth
+from peppygen.paired_topics.chest import geometry as chest_geometry
 from peppygen.paired_topics.chest import stream_info as chest_info
 from peppygen.paired_topics.chest import video_stream as chest_video
 from peppygen.paired_topics.left_arm import joint_setpoints as left_arm_setpoints
@@ -47,8 +48,10 @@ from peppygen.paired_topics.right_arm import joint_setpoints as right_arm_setpoi
 from peppygen.paired_topics.right_arm import joint_states as right_arm_states
 from peppygen.paired_topics.right_gripper import gripper_setpoints as right_gripper_setpoints
 from peppygen.paired_topics.right_gripper import gripper_states as right_gripper_states
+from peppygen.paired_topics.wrist_left import geometry as wrist_left_geometry
 from peppygen.paired_topics.wrist_left import stream_info as wrist_left_info
 from peppygen.paired_topics.wrist_left import video_stream as wrist_left_video
+from peppygen.paired_topics.wrist_right import geometry as wrist_right_geometry
 from peppygen.paired_topics.wrist_right import stream_info as wrist_right_info
 from peppygen.paired_topics.wrist_right import video_stream as wrist_right_video
 
@@ -81,6 +84,12 @@ _COLOR_CAMERA_SLOTS = {
 _RGBD_CAMERA_SLOTS = {
     "chest": (chest_video, chest_depth, chest_info),
 }
+# The geometry topic of every camera slot, colour and rgbd alike.
+_CAMERA_GEOMETRY = {
+    "wrist_left": wrist_left_geometry,
+    "wrist_right": wrist_right_geometry,
+    "chest": chest_geometry,
+}
 # The slot names as sets, for validating a camera config against the manifest.
 COLOR_CAMERA_SLOT_NAMES = frozenset(_COLOR_CAMERA_SLOTS)
 RGBD_CAMERA_SLOT_NAMES = frozenset(_RGBD_CAMERA_SLOTS)
@@ -90,8 +99,12 @@ RGBD_CAMERA_SLOT_NAMES = frozenset(_RGBD_CAMERA_SLOTS)
 _VIDEO_STREAM = "video_stream"
 _DEPTH_STREAM = "depth_stream"
 _STREAM_INFO = "stream_info"
+_GEOMETRY = "geometry"
 _FRAMES_SURFACE = "frames"
 _INFO_SURFACE = "info"
+# Geometry goes out on the same tick as the stream info, so it takes a guard
+# of its own: sharing the info one would drop whichever was scheduled second.
+_GEOMETRY_SURFACE = "geometry"
 
 
 class _LatestSlot:
@@ -115,6 +128,9 @@ class _LatestSlot:
 # is reported. Well past any real batch at these frame rates, so reaching it
 # means the publish is not going to complete on its own.
 _PUBLISH_STALL_S = 5.0
+
+# A rendered image is an ideal pinhole: the camera_geometry contract's "none".
+_RENDERED_DISTORTION = "none"
 
 
 class _PublishGuard:
@@ -216,11 +232,22 @@ class SimTopicIO:
             self._gripper_pubs[side] = await states.declare_publisher(self._node_runner)
         for name, (video, info) in _COLOR_CAMERA_SLOTS.items():
             await self._declare_camera_publishers(
-                name, [(_VIDEO_STREAM, video), (_STREAM_INFO, info)]
+                name,
+                [
+                    (_VIDEO_STREAM, video),
+                    (_STREAM_INFO, info),
+                    (_GEOMETRY, _CAMERA_GEOMETRY[name]),
+                ],
             )
         for name, (video, depth, info) in _RGBD_CAMERA_SLOTS.items():
             await self._declare_camera_publishers(
-                name, [(_VIDEO_STREAM, video), (_DEPTH_STREAM, depth), (_STREAM_INFO, info)]
+                name,
+                [
+                    (_VIDEO_STREAM, video),
+                    (_DEPTH_STREAM, depth),
+                    (_STREAM_INFO, info),
+                    (_GEOMETRY, _CAMERA_GEOMETRY[name]),
+                ],
             )
         self._tasks = [
             asyncio.create_task(self._consume_arm(mod, side))
@@ -570,6 +597,64 @@ class SimTopicIO:
             depth_unit,
         )
         self._publish_guarded(robot, name, _INFO_SURFACE, [(_STREAM_INFO, payload)])
+
+    def publish_color_geometry(self, robot: str, name: str, color) -> None:
+        """Where a colour camera's pixels point: `color` is the pinhole model
+        of its stream (width, height, fx, fy, cx, cy), rendered and so without
+        distortion."""
+        payload = _CAMERA_GEOMETRY[name].build_message(
+            width=color.width,
+            height=color.height,
+            fx=color.fx,
+            fy=color.fy,
+            cx=color.cx,
+            cy=color.cy,
+            distortion_model=_RENDERED_DISTORTION,
+            distortion=[],
+        )
+        self._publish_guarded(robot, name, _GEOMETRY_SURFACE, [(_GEOMETRY, payload)])
+
+    def publish_rgbd_geometry(
+        self,
+        robot: str,
+        name: str,
+        color,
+        depth,
+        depth_model: str,
+        min_depth_m: float,
+        max_depth_m: float,
+        align_mode: str,
+        depth_to_color_position: tuple[float, float, float],
+        depth_to_color_orientation: tuple[float, float, float, float],
+    ) -> None:
+        """Where an rgbd camera's pixels point and how its depth sits against
+        its colour: `color` and `depth` are the pinhole models of the two
+        streams, each at its own published size."""
+        payload = _CAMERA_GEOMETRY[name].build_message(
+            width=color.width,
+            height=color.height,
+            fx=color.fx,
+            fy=color.fy,
+            cx=color.cx,
+            cy=color.cy,
+            distortion_model=_RENDERED_DISTORTION,
+            distortion=[],
+            depth_width=depth.width,
+            depth_height=depth.height,
+            depth_fx=depth.fx,
+            depth_fy=depth.fy,
+            depth_cx=depth.cx,
+            depth_cy=depth.cy,
+            depth_distortion_model=_RENDERED_DISTORTION,
+            depth_distortion=[],
+            depth_model=depth_model,
+            min_depth_m=min_depth_m,
+            max_depth_m=max_depth_m,
+            align_mode=align_mode,
+            depth_to_color_position=list(depth_to_color_position),
+            depth_to_color_orientation=list(depth_to_color_orientation),
+        )
+        self._publish_guarded(robot, name, _GEOMETRY_SURFACE, [(_GEOMETRY, payload)])
 
     async def _declare_camera_publishers(
         self, name: str, topics: list[tuple[str, object]]
