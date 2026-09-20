@@ -528,7 +528,7 @@ dependencies = [
 [[package]]
 name = "control_core"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/peppy#eadc5dce0b23d3bf46866badee448de5a3b65208"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#016ebb17a4889c1519926806dc7258e59fad4c64"
 dependencies = [
  "thiserror 2.0.20",
  "tokio",
@@ -2299,7 +2299,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 [[package]]
 name = "openarm_description"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/peppy#eadc5dce0b23d3bf46866badee448de5a3b65208"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#016ebb17a4889c1519926806dc7258e59fad4c64"
 dependencies = [
  "urdf-rs",
 ]

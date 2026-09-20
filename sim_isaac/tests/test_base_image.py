@@ -98,9 +98,9 @@ def test_base_image_installs_the_package_the_engines_share():
     # configuration come from sim_robot_core, pinned to one commit.
     requirements = (_IMAGES_DIR / "requirements.isaac.txt").read_text().splitlines()
     assert [line for line in requirements if line.startswith("sim_")] == [
-        "sim_robot_core @ git+https://github.com/Peppy-bot/peppy.git"
-        "@9dde20f5b014dd7fd16487e6e0071b0c9c0fb0cc"
-        "#subdirectory=public-peppy-libs/sim_robot_core"
+        "sim_robot_core @ git+https://github.com/Peppy-bot/public-peppy-libs.git"
+        "@960ed472252acbb5766a1e604b337d511d31700b"
+        "#subdirectory=sim_robot_core"
     ]
 
 

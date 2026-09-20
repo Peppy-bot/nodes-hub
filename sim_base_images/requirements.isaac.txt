@@ -1,3 +1,3 @@
 pycapnp==2.2.2
 pyjson5==2.0.0
-sim_robot_core @ git+https://github.com/Peppy-bot/peppy.git@9dde20f5b014dd7fd16487e6e0071b0c9c0fb0cc#subdirectory=public-peppy-libs/sim_robot_core
+sim_robot_core @ git+https://github.com/Peppy-bot/public-peppy-libs.git@960ed472252acbb5766a1e604b337d511d31700b#subdirectory=sim_robot_core

@@ -14,4 +14,4 @@ pyjson5==2.0.0
 viser==1.0.27
 # What the node knows about the robots it stands, whatever its physics, pinned
 # to one commit so the image is reproducible.
-sim_robot_core @ git+https://github.com/Peppy-bot/peppy.git@9dde20f5b014dd7fd16487e6e0071b0c9c0fb0cc#subdirectory=public-peppy-libs/sim_robot_core
+sim_robot_core @ git+https://github.com/Peppy-bot/public-peppy-libs.git@960ed472252acbb5766a1e604b337d511d31700b#subdirectory=sim_robot_core

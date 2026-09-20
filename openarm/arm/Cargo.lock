@@ -421,7 +421,7 @@ dependencies = [
 [[package]]
 name = "chain_kinematics"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/peppy#eadc5dce0b23d3bf46866badee448de5a3b65208"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#016ebb17a4889c1519926806dc7258e59fad4c64"
 dependencies = [
  "nalgebra",
  "thiserror 2.0.20",
@@ -553,7 +553,7 @@ dependencies = [
 [[package]]
 name = "control_core"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/peppy#eadc5dce0b23d3bf46866badee448de5a3b65208"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#016ebb17a4889c1519926806dc7258e59fad4c64"
 dependencies = [
  "thiserror 2.0.20",
  "tokio",
@@ -2402,7 +2402,7 @@ dependencies = [
 [[package]]
 name = "openarm_can"
 version = "0.2.0"
-source = "git+https://github.com/Peppy-bot/peppy#eadc5dce0b23d3bf46866badee448de5a3b65208"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#016ebb17a4889c1519926806dc7258e59fad4c64"
 dependencies = [
  "control_core",
  "nix",
@@ -2414,7 +2414,7 @@ dependencies = [
 [[package]]
 name = "openarm_description"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/peppy#eadc5dce0b23d3bf46866badee448de5a3b65208"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#016ebb17a4889c1519926806dc7258e59fad4c64"
 dependencies = [
  "urdf-rs",
 ]
@@ -3723,7 +3723,7 @@ dependencies = [
 [[package]]
 name = "srs_model"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/peppy#eadc5dce0b23d3bf46866badee448de5a3b65208"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#016ebb17a4889c1519926806dc7258e59fad4c64"
 dependencies = [
  "chain_kinematics",
  "nalgebra",
