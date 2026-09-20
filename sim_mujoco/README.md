@@ -13,7 +13,7 @@ The engine plays the follower role of the robot's limb pairings and the camera r
 | `rgb_cameras` | `sim_rgb_camera_link`, camera | one pair per colour camera a relay views |
 | `rgbd_cameras` | `sim_rgbd_camera_link`, camera | one pair per depth camera a relay views |
 
-A pair's robot is the copy it carries. A limb pair's limb is the link it comes from on the robot's side, so a backbone names its downstream links after its limbs and a launcher reads `left_arm: "simulation_inst/arms"` for an OpenArm and `arm: "simulation_inst/arms"` for an SO-101. A camera pair's camera is its relay's name in the copy (`wrist_left`, `front`). The reading is [`sim_robot_core`](https://github.com/Peppy-bot/peppy/tree/dev/public-peppy-libs/sim_robot_core)'s, which the Isaac Sim node shares.
+A pair's robot is the copy it carries. A limb pair's limb is the link it comes from on the robot's side, so a backbone names its downstream links after its limbs and a launcher reads `left_arm: "simulation_inst/arms"` for an OpenArm and `arm: "simulation_inst/arms"` for an SO-101. A camera pair's camera is its relay's name in the copy (`wrist_left`, `front`). The reading is [`sim_robot_core`](https://github.com/Peppy-bot/public-peppy-libs/tree/main/sim_robot_core)'s, which the Isaac Sim node shares.
 
 A robot keeps its place while its pairs are its model's: a pair for every limb the model has and none for a limb or a camera it lacks. A camera the model has may go unpaired, and is then not rendered. A robot whose pairs differ for `robot_lease_ms` has its stay ended, told which differ with both lists named, and a robot is ready once it holds a pair for every limb of its own model.
 

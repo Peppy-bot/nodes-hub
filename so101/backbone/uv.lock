@@ -390,7 +390,7 @@ wheels = [
 [[package]]
 name = "control-core-py"
 version = "0.1.0"
-source = { git = "https://github.com/Peppy-bot/peppy?subdirectory=public-peppy-libs%2Fcontrol_core_py#eadc5dce0b23d3bf46866badee448de5a3b65208" }
+source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=control_core_py&rev=960ed472252acbb5766a1e604b337d511d31700b#960ed472252acbb5766a1e604b337d511d31700b" }
 
 [[package]]
 name = "cuda-bindings"
@@ -1503,10 +1503,10 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "control-core-py", git = "https://github.com/Peppy-bot/peppy?subdirectory=public-peppy-libs%2Fcontrol_core_py" },
+    { name = "control-core-py", git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=control_core_py&rev=960ed472252acbb5766a1e604b337d511d31700b" },
     { name = "peppygen", directory = ".peppy/libs/peppygen" },
     { name = "peppylib", directory = ".peppy/libs/peppylib" },
-    { name = "so101-description", extras = ["kinematics"], git = "https://github.com/Peppy-bot/peppy?subdirectory=public-peppy-libs%2Fso101_description" },
+    { name = "so101-description", extras = ["kinematics"], git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=so101_description&rev=960ed472252acbb5766a1e604b337d511d31700b" },
 ]
 
 [package.metadata.requires-dev]
@@ -1518,7 +1518,7 @@ dev = [
 [[package]]
 name = "so101-description"
 version = "0.1.0"
-source = { git = "https://github.com/Peppy-bot/peppy?subdirectory=public-peppy-libs%2Fso101_description#eadc5dce0b23d3bf46866badee448de5a3b65208" }
+source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=so101_description&rev=960ed472252acbb5766a1e604b337d511d31700b#960ed472252acbb5766a1e604b337d511d31700b" }
 dependencies = [
     { name = "control-core-py" },
     { name = "numpy" },

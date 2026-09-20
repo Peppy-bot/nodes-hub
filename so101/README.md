@@ -171,9 +171,9 @@ The follower and leader adapters are identical USB serial bridges. Install
 ## Shared libraries
 
 Two libs in the
-[public-peppy-libs](https://github.com/Peppy-bot/peppy/tree/dev/public-peppy-libs)
-tree of the `peppy` repository, consumed as uv git dependencies exactly like
-the Rust nodes consume `control_core`:
+[public-peppy-libs](https://github.com/Peppy-bot/public-peppy-libs)
+repository, consumed as uv git dependencies exactly like the Rust nodes
+consume `control_core`:
 
 - `control_core_py`: generic Python node plumbing (asyncio stream helpers,
   parameter validators, the hardware device-thread skeleton). Nothing
