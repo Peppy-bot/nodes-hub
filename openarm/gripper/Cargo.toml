@@ -8,11 +8,11 @@ thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
-openarm_can = { git = "https://github.com/Peppy-bot/public-peppy-libs", rev = "960ed472252acbb5766a1e604b337d511d31700b", package = "openarm_can" }
-control_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", rev = "960ed472252acbb5766a1e604b337d511d31700b", package = "control_core" }
+openarm_can = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "openarm_can" }
+control_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "control_core" }
 # Supplies the HardwareVersion/Side parse the arm node uses, so both limbs
 # accept the same generation names.
-openarm_description = { git = "https://github.com/Peppy-bot/public-peppy-libs", rev = "960ed472252acbb5766a1e604b337d511d31700b", package = "openarm_description" }
+openarm_description = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "openarm_description" }
 peppygen = { path = ".peppy/libs/peppygen" }
 peppylib = { path = ".peppy/libs/peppylib" }
 

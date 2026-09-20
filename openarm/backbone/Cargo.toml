@@ -11,10 +11,10 @@ tracing-subscriber = "0.3"
 tempfile = "3"
 peppygen = { path = ".peppy/libs/peppygen" }
 peppylib = { path = ".peppy/libs/peppylib" }
-srs_model = { git = "https://github.com/Peppy-bot/public-peppy-libs", rev = "960ed472252acbb5766a1e604b337d511d31700b", package = "srs_model" }
-bimanual_collision_model = { git = "https://github.com/Peppy-bot/public-peppy-libs", rev = "960ed472252acbb5766a1e604b337d511d31700b", package = "bimanual_collision_model" }
-openarm_description = { git = "https://github.com/Peppy-bot/public-peppy-libs", rev = "960ed472252acbb5766a1e604b337d511d31700b", package = "openarm_description", features = ["meshes"] }
-control_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", rev = "960ed472252acbb5766a1e604b337d511d31700b", package = "control_core" }
+srs_model = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "srs_model" }
+bimanual_collision_model = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "bimanual_collision_model" }
+openarm_description = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "openarm_description", features = ["meshes"] }
+control_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "control_core" }
 
 # The collision narrowphase (GJK/EPA over convex hulls) and forward kinematics
 # are dense nalgebra f64 kernels. At the dev profile's opt-level 0 the governor's
