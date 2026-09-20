@@ -40,13 +40,13 @@ def bimanual() -> BoundSources:
     return bind(
         joints=(
             [source("left_arm_inst"), source("right_arm_inst")],
-            [source("backbone_inst", "left_arm_link"), source("backbone_inst", "right_arm_link")],
+            [source("backbone_inst", "left_arm"), source("backbone_inst", "right_arm")],
         ),
         grippers=(
             [source("left_gripper_inst"), source("right_gripper_inst")],
             [
-                source("backbone_inst", "left_gripper_link"),
-                source("backbone_inst", "right_gripper_link"),
+                source("backbone_inst", "left_gripper"),
+                source("backbone_inst", "right_gripper"),
             ],
         ),
     )
@@ -55,10 +55,10 @@ def bimanual() -> BoundSources:
 def test_limbs_are_named_after_the_pairing_their_command_travels_on():
     plan = discover(bimanual())
     assert [e.feature_key for e in plan.state] == [
-        "left_arm_link",
-        "right_arm_link",
-        "left_gripper_link",
-        "right_gripper_link",
+        "left_arm",
+        "right_arm",
+        "left_gripper",
+        "right_gripper",
     ]
     assert [e.kind for e in plan.state] == [
         LinkKind.JOINT,
@@ -69,10 +69,10 @@ def test_limbs_are_named_after_the_pairing_their_command_travels_on():
     # The action records the same limbs under the same names, so a dataset's
     # state and action dimensions line up.
     assert [e.feature_key for e in plan.action] == [
-        "left_arm_link",
-        "right_arm_link",
-        "left_gripper_link",
-        "right_gripper_link",
+        "left_arm",
+        "right_arm",
+        "left_gripper",
+        "right_gripper",
     ]
 
 
@@ -85,11 +85,11 @@ def test_a_simulated_robot_records_the_columns_a_physical_one_does():
     simulated = discover(bind(
         joints=(
             [source("simulation_inst", "left_arm"), source("simulation_inst", "right_arm")],
-            [source("backbone_inst", "left_arm_link"), source("backbone_inst", "right_arm_link")],
+            [source("backbone_inst", "left_arm"), source("backbone_inst", "right_arm")],
         ),
         grippers=(
             [source("simulation_inst", "left_gripper"), source("simulation_inst", "right_gripper")],
-            [source("backbone_inst", "left_gripper_link"), source("backbone_inst", "right_gripper_link")],
+            [source("backbone_inst", "left_gripper"), source("backbone_inst", "right_gripper")],
         ),
     ))
     physical = discover(bimanual())
@@ -102,30 +102,30 @@ def test_commanded_sources_sharing_an_instance_stay_distinct():
     observed link is the only thing telling the two arms apart."""
     plan = discover(bimanual())
     assert [e.key for e in plan.action] == [
-        (CORE, "backbone_inst", "left_arm_link"),
-        (CORE, "backbone_inst", "right_arm_link"),
-        (CORE, "backbone_inst", "left_gripper_link"),
-        (CORE, "backbone_inst", "right_gripper_link"),
+        (CORE, "backbone_inst", "left_arm"),
+        (CORE, "backbone_inst", "right_arm"),
+        (CORE, "backbone_inst", "left_gripper"),
+        (CORE, "backbone_inst", "right_gripper"),
     ]
 
 
 def test_action_falls_back_to_the_measured_source_of_its_own_limb():
     plan = discover(bimanual())
     assert plan.action_fallback == {
-        (CORE, "backbone_inst", "left_arm_link"): (CORE, "left_arm_inst", "link"),
-        (CORE, "backbone_inst", "right_arm_link"): (CORE, "right_arm_inst", "link"),
-        (CORE, "backbone_inst", "left_gripper_link"): (CORE, "left_gripper_inst", "link"),
-        (CORE, "backbone_inst", "right_gripper_link"): (CORE, "right_gripper_inst", "link"),
+        (CORE, "backbone_inst", "left_arm"): (CORE, "left_arm_inst", "link"),
+        (CORE, "backbone_inst", "right_arm"): (CORE, "right_arm_inst", "link"),
+        (CORE, "backbone_inst", "left_gripper"): (CORE, "left_gripper_inst", "link"),
+        (CORE, "backbone_inst", "right_gripper"): (CORE, "right_gripper_inst", "link"),
     }
 
 
 def test_a_robot_the_launcher_bound_differently_records_what_it_has():
     """One arm, no gripper: the manifest fixes nothing about the robot."""
     plan = discover(
-        bind(joints=([source("arm_inst")], [source("leader_inst", "arm_link")]))
+        bind(joints=([source("arm_inst")], [source("leader_inst", "arm")]))
     )
-    assert [e.feature_key for e in plan.state] == ["arm_link"]
-    assert [e.feature_key for e in plan.action] == ["arm_link"]
+    assert [e.feature_key for e in plan.state] == ["arm"]
+    assert [e.feature_key for e in plan.action] == ["arm"]
 
 
 def test_copies_keep_separate_dataset_dimensions_and_fallbacks():
@@ -133,13 +133,13 @@ def test_copies_keep_separate_dataset_dimensions_and_fallbacks():
         follower = f"{name}_left_gripper_inst"
         backbone = f"{name}_backbone_inst"
         plan = discover(bind(grippers=(
-            [source(follower)], [source(backbone, "left_gripper_link")],
+            [source(follower)], [source(backbone, "left_gripper")],
         )))
         # A copy records its own dataset, so the columns carry no copy name.
-        assert [entry.feature_key for entry in plan.state] == ["left_gripper_link"]
-        assert [entry.feature_key for entry in plan.action] == ["left_gripper_link"]
+        assert [entry.feature_key for entry in plan.state] == ["left_gripper"]
+        assert [entry.feature_key for entry in plan.action] == ["left_gripper"]
         assert plan.action_fallback == {
-            (CORE, backbone, "left_gripper_link"): (CORE, follower, "link"),
+            (CORE, backbone, "left_gripper"): (CORE, follower, "link"),
         }
 
 
@@ -149,7 +149,7 @@ def test_unpairable_bindings_are_refused():
     bound = bind(
         joints=(
             [source("left_arm_inst"), source("right_arm_inst")],
-            [source("backbone_inst", "left_arm_link")],
+            [source("backbone_inst", "left_arm")],
         ),
     )
     with pytest.raises(ValueError, match="joint limbs are bound 2 measured to 1 commanded"):
@@ -158,15 +158,15 @@ def test_unpairable_bindings_are_refused():
 
 def test_limbs_commanded_on_one_backbone_are_told_apart_by_link():
     used: set[str] = set()
-    first = limb_name(used, source("backbone_inst", "left_arm_link"))
-    second = limb_name(used, source("backbone_inst", "right_arm_link"))
-    assert (first, second) == ("left_arm_link", "right_arm_link")
+    first = limb_name(used, source("backbone_inst", "left_arm"))
+    second = limb_name(used, source("backbone_inst", "right_arm"))
+    assert (first, second) == ("left_arm", "right_arm")
 
 
 def test_two_limbs_commanded_on_one_link_are_refused():
-    used = {"left_arm_link"}
-    with pytest.raises(ValueError, match="both name themselves 'left_arm_link'"):
-        limb_name(used, source("backbone_inst", "left_arm_link"))
+    used = {"left_arm"}
+    with pytest.raises(ValueError, match="both name themselves 'left_arm'"):
+        limb_name(used, source("backbone_inst", "left_arm"))
 
 
 def test_a_launch_with_no_limbs_is_refused():
@@ -179,7 +179,7 @@ def test_a_launch_with_no_limbs_is_refused():
 def test_one_source_bound_to_two_limbs_is_refused():
     """Two limbs sharing an identity would share one cache slot, so both would
     record whichever message landed last."""
-    twice = source("arm_inst", "arm_link")
+    twice = source("arm_inst", "arm")
     bound = bind(joints=([twice, twice], [source("lead", "a"), source("lead", "b")]))
     with pytest.raises(ValueError, match="bound to two limbs"):
         discover(bound)
@@ -191,7 +191,7 @@ def test_the_snapshot_is_immune_to_the_live_sets_moving_on():
     revisions."""
     deliveries = {
         "joints": [source("arm_inst")],
-        "joints_cmd": [source("lead", "arm_link")],
+        "joints_cmd": [source("lead", "arm")],
         "grippers": [],
         "grippers_cmd": [],
     }
@@ -213,4 +213,4 @@ def test_the_snapshot_is_immune_to_the_live_sets_moving_on():
     deliveries["joints_cmd"].clear()
 
     plan = discover(snapshot)
-    assert [e.feature_key for e in plan.state] == ["arm_link"]
+    assert [e.feature_key for e in plan.state] == ["arm"]

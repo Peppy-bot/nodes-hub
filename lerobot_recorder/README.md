@@ -29,9 +29,8 @@ instance drive every limb, which is the shape the openarm backbone has.
 
 A limb is named after the link of the pairing its command travels on, the
 backbone's end, and dimension names are that name plus a joint index
-(`left_arm_link_j0`); a gripper's single dimension names the quantity its
-feature carries (`left_gripper_link_opening` in state,
-`left_gripper_link_effort` in efforts).
+(`left_arm_j0`); a gripper's single dimension names the quantity its feature
+carries (`left_gripper_opening` in state, `left_gripper_effort` in efforts).
 What answers for a limb plays no part in its name: a physical OpenArm answers
 from a driver per limb and a simulated one from one simulation for all four,
 and both record the same columns. Two limbs commanded on one link are

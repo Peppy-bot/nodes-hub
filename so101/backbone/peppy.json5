@@ -6,7 +6,7 @@
 // them) and the leader role toward the arm. Exposes the joint /
 // Cartesian / gripper move actions and executes them itself; drives the arm
 // and gripper over the downstream pairings (leader role). Everything the
-// follower executes leaves through arm_link / gripper_link, so a recorder
+// follower executes leaves through the arm / gripper slots, so a recorder
 // observing those slots captures teleop and actions identically.
 //
 // The upstream command is joints (joint_link) or an end-effector pose
@@ -47,9 +47,12 @@
         { name: "gripper_link", tag: "v1", role: "follower", link_id: "leader_gripper", cardinality: "zero_or_one" },
         // Downstream: the exclusive command loops with the follower. The
         // slots scope both directions, so no id demux and no other producer
-        // can pose as the arm.
-        { name: "joint_link", tag: "v1", role: "leader", link_id: "arm_link", cardinality: "zero_or_one" },
-        { name: "gripper_link", tag: "v1", role: "leader", link_id: "gripper_link", cardinality: "zero_or_one" },
+        // can pose as the arm. Each slot takes its limb's own name, the one
+        // the robot answers to in limb_motion and limb_state: a simulation
+        // engine learns which limb a pair drives from the name of the link on
+        // this side.
+        { name: "joint_link", tag: "v1", role: "leader", link_id: "arm", cardinality: "zero_or_one" },
+        { name: "gripper_link", tag: "v1", role: "leader", link_id: "gripper", cardinality: "zero_or_one" },
       ],
     },
   },
@@ -107,8 +110,8 @@
     topics: {
       emits: [
         // The leader role's topic on each downstream slot.
-        { link_id: "arm_link", name: "joint_setpoints", refine: { message_format: { positions: { $length: 5 } } } },
-        { link_id: "gripper_link", name: "gripper_setpoints" },
+        { link_id: "arm", name: "joint_setpoints", refine: { message_format: { positions: { $length: 5 } } } },
+        { link_id: "gripper", name: "gripper_setpoints" },
         // The follower role's state back-channel on each upstream slot: the
         // measured state relayed from the matching downstream pair.
         { link_id: "leader_arm", name: "joint_states", refine: { message_format: { positions: { $length: 5 } } } },
@@ -121,8 +124,8 @@
         { link_id: "limb_state", name: "limb_states" },
       ],
       consumes: [
-        { link_id: "arm_link", name: "joint_states", refine: { message_format: { positions: { $length: 5 } } } },
-        { link_id: "gripper_link", name: "gripper_states" },
+        { link_id: "arm", name: "joint_states", refine: { message_format: { positions: { $length: 5 } } } },
+        { link_id: "gripper", name: "gripper_states" },
         { link_id: "leader_arm", name: "joint_setpoints", refine: { message_format: { positions: { $length: 5 } } } },
         { link_id: "leader_pose", name: "pose_setpoints" },
         { link_id: "leader_gripper", name: "gripper_setpoints" },

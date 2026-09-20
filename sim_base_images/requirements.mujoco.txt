@@ -1,0 +1,17 @@
+mujoco==3.10.0
+mjviser==0.0.14
+numpy==2.4.4
+# PyOpenGL is pulled in by mujoco; the accelerate package must match its
+# version or PyOpenGL logs "No OpenGL_accelerate module loaded" at startup.
+# accelerate is x86_64-only: it publishes no linux/arm64 wheel and its sdist
+# needs a C toolchain the slim image does not carry, so the arm64 leg of the
+# multi-arch build goes without it. Cost there is that one startup log line —
+# PyOpenGL is only used to create the EGL context, MuJoCo renders in C.
+PyOpenGL==3.1.10
+PyOpenGL-accelerate==3.1.10; platform_machine == "x86_64"
+pycapnp==2.2.2
+pyjson5==2.0.0
+viser==1.0.27
+# What the node knows about the robots it stands, whatever its physics, pinned
+# to one commit so the image is reproducible.
+sim_robot_core @ git+https://github.com/Peppy-bot/peppy.git@9dde20f5b014dd7fd16487e6e0071b0c9c0fb0cc#subdirectory=public-peppy-libs/sim_robot_core

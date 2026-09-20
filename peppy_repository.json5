@@ -71,24 +71,9 @@
         path: "openarm/gripper/peppy.json5"
       }
     },
-    openarm_initializer: {
-      v1: {
-        path: "openarm/initializer/peppy.json5"
-      }
-    },
     openarm_ker: {
       v1: {
         path: "openarm/ker/peppy.json5"
-      }
-    },
-    openarm_sim_isaac: {
-      v1: {
-        path: "openarm/sim_isaac/peppy.json5"
-      }
-    },
-    openarm_sim_mujoco: {
-      v1: {
-        path: "openarm/sim_mujoco/peppy.json5"
       }
     },
     openarm_web_commander: {
@@ -106,9 +91,24 @@
         path: "realsense_d4xx/peppy.json5"
       }
     },
+    robot_initializer: {
+      v1: {
+        path: "robot_initializer/peppy.json5"
+      }
+    },
     scene_commander: {
       v1: {
         path: "scene_commander/peppy.json5"
+      }
+    },
+    sim_isaac: {
+      v1: {
+        path: "sim_isaac/peppy.json5"
+      }
+    },
+    sim_mujoco: {
+      v1: {
+        path: "sim_mujoco/peppy.json5"
       }
     },
     sim_rgb_camera: {

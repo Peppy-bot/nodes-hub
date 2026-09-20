@@ -8,10 +8,10 @@ source at the same position in its slot, which is what makes the launcher's
 binding order load-bearing.
 
 Pairing wire messages carry no joint names, so dataset dimension names derive
-from each limb's name plus joint index (left_arm_link_j0,
-left_gripper_link_opening); a limb is named after the link of the pairing its
-command travels on, the backbone's end, which a physical robot and a simulated
-one share, so their datasets carry the same columns. Joint counts and which
+from each limb's name plus joint index (left_arm_j0, left_gripper_opening); a
+limb is named after the link of the pairing its command travels on, the
+backbone's end, which a physical robot and a simulated one share, so their
+datasets carry the same columns. Joint counts and which
 optional vectors a source delivers are discovered from its first message and
 locked into the schema at the first episode. Each camera producer becomes one
 dataset image key derived from its instance id, in binding order. The plan's

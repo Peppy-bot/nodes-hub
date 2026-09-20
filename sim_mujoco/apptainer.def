@@ -1,0 +1,34 @@
+Bootstrap: docker
+From: peppybot/sim-mujoco:3.10.0-1
+
+%labels
+    Name sim-mujoco
+    Version v1
+
+%environment
+    export PYTHONPATH="/opt/sim_mujoco/.peppy/libs/peppygen:/opt/sim_mujoco/.peppy/libs/peppylib:$PYTHONPATH"
+    export PEPPYGEN_OUTPUT_PATH="/opt/sim_mujoco/.peppy/libs/peppygen"
+    export PEPPY_BRIDGE_HEADLESS=${PEPPY_BRIDGE_HEADLESS:-1}
+    export PEPPY_BRIDGE_NODE_NAME=sim
+    export MUJOCO_GL=${MUJOCO_GL:-egl}
+    export WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-}
+    export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+    export DISPLAY=${DISPLAY:-}
+    export PEPPY_ROBOT_ASSETS_DIR=${PEPPY_ROBOT_ASSETS_DIR:-/opt/robot_assets}
+
+%files
+    peppy.json5 /opt/sim_mujoco/peppy.json5
+    engine /opt/sim_mujoco/engine
+    .peppy/libs/peppygen /opt/sim_mujoco/.peppy/libs/peppygen
+    .peppy/libs/peppylib /opt/sim_mujoco/.peppy/libs/peppylib
+
+%post
+    set -e
+    # The OpenArm v2 head camera pack from the public waldo-assets store,
+    # pinned by its digest in head_camera.py and checked file by file.
+    python3 /opt/sim_mujoco/engine/head_camera.py fetch \
+        /opt/sim_mujoco/engine/assets/head_camera
+
+%runscript
+    cd /opt/sim_mujoco
+    exec python3 /opt/sim_mujoco/engine/launch.py "$@"

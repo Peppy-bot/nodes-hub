@@ -1,0 +1,28 @@
+// What this engine alone knows about an OpenArm v2. Its limbs, joints and
+// cameras are sim_robot_core's entry of the same name.
+{
+  // The robot's MJCF, which is the whole world it stands in, under
+  // PEPPY_ROBOT_ASSETS_DIR.
+  scene: "openarm/openarm_bimanual_v2.xml",
+
+  // The MJCF compiler folds the fixed pedestal link into the world body, so a
+  // camera hanging from it hangs from the world.
+  world_links: ["openarm_body_link0"],
+
+  // MIT servo gains (j1..j7) applied to every arm's position actuators so sim
+  // dynamics match the real driver. Fingers keep their MJCF defaults.
+  arm_gains: {
+    kp: [240.0, 240.0, 240.0, 240.0, 24.0, 31.0, 25.0],
+    kd: [3.0, 3.0, 3.0, 3.0, 0.2, 0.2, 0.2],
+  },
+
+  // Mirrors the real driver's in-process gravity feedforward.
+  gravity_compensation: true,
+
+  // The scene ships no light, so rendering adds the engine's light rig.
+  camera_lights: true,
+
+  // The robot draws the head camera pack on its pedestal (head_camera.py),
+  // whose left eye its chest camera renders from.
+  head_camera: true,
+}

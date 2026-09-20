@@ -30,8 +30,8 @@ from tests.test_recording import (
     make_plan,
 )
 
-BACKBONE = (CORE, "backbone_inst", "left_arm_link")
-OTHER_ARM = (CORE, "backbone_inst", "right_arm_link")
+BACKBONE = (CORE, "backbone_inst", "left_arm")
+OTHER_ARM = (CORE, "backbone_inst", "right_arm")
 
 
 def joint_message(position: float):
@@ -279,7 +279,7 @@ def test_setup_discovers_the_seeded_membership_inline(tmp_path):
             (
                 LinkKind.JOINT,
                 (observed((CORE, "arm_inst", "link")),),
-                (observed((CORE, "lead_inst", "arm_link")),),
+                (observed((CORE, "lead_inst", "arm")),),
             ),
             (LinkKind.GRIPPER, (), ()),
         ),

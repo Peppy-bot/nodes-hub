@@ -1,0 +1,23 @@
+// What this engine alone knows about an SO-101. Its limbs, joints, camera and
+// start posture are sim_robot_core's entry of the same name.
+{
+  // MuJoCo Menagerie's robotstudio_so101 scene, a floor and the arm, baked
+  // into the base image at one commit (sim_base_images/so101_model.py), under
+  // PEPPY_ROBOT_ASSETS_DIR. The arm is driven by upstream's STS3215 servo
+  // model, so this entry carries no gains, and the servos hold the arm
+  // against gravity as the real ones do.
+  scene: "so101/scene.xml",
+
+  // The URDF's base link is upstream's `base` body.
+  link_bodies: { base_link: "base" },
+
+  // Where upstream and so101_description differ the description wins:
+  // upstream stops wrist_roll short of the URDF's upper limit, and puts its
+  // tool site 19.9 mm off the URDF's gripper_frame_link, turned a quarter
+  // turn from it. tests/test_so101_model.py holds the compiled model to the
+  // description.
+  joint_ranges: { wrist_roll: [-2.74385, 2.84121] },
+  site_poses: {
+    gripperframe: { pos: [-0.0079, -0.000218121, -0.0981274], quat_wxyz: [0.0, 0.0, 1.0, 0.0] },
+  },
+}

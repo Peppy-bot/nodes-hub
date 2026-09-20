@@ -1,0 +1,35 @@
+Bootstrap: docker
+From: peppybot/sim-isaac:6.1.0-1
+
+%labels
+    Name sim-isaac
+    Version v1
+
+%environment
+    export ACCEPT_EULA=Y
+    export PRIVACY_CONSENT=N
+    export PYTHONPATH="/opt/sim_isaac/.peppy/libs/peppygen:/opt/sim_isaac/.peppy/libs/peppylib:$PYTHONPATH"
+    export PEPPYGEN_OUTPUT_PATH="/opt/sim_isaac/.peppy/libs/peppygen"
+    export PEPPY_BRIDGE_NODE_NAME=sim
+    export PEPPY_BRIDGE_HEADLESS=${PEPPY_BRIDGE_HEADLESS:-1}
+    export PEPPY_ROBOT_ASSETS_DIR=${PEPPY_ROBOT_ASSETS_DIR:-/opt/robot_assets}
+
+%files
+    peppy.json5 /opt/sim_isaac/peppy.json5
+    engine /opt/sim_isaac/engine
+    .peppy/libs/peppygen /opt/sim_isaac/.peppy/libs/peppygen
+    .peppy/libs/peppylib /opt/sim_isaac/.peppy/libs/peppylib
+
+%post
+    set -e
+    /isaac-sim/python.sh -m pip install --no-cache-dir \
+        pycapnp \
+        pyjson5
+    # The OpenArm v2 head camera pack from the public waldo-assets store,
+    # pinned by its digest in head_camera.py and checked file by file.
+    /isaac-sim/python.sh /opt/sim_isaac/engine/head_camera.py fetch \
+        /opt/sim_isaac/engine/assets/head_camera
+
+%runscript
+    cd /opt/sim_isaac
+    exec /isaac-sim/python.sh /opt/sim_isaac/engine/launch.py "$@"

@@ -153,16 +153,16 @@ macro_rules! pump_gripper_half_open {
 macro_rules! pump_right_arm_and_grippers {
     ($mocks:ident) => {
         pump_arm_at_home!(
-            $mocks.pairings.right_arm_link.joint_states,
-            peppygen::paired_topics::right_arm_link::joint_states
+            $mocks.pairings.right_arm.joint_states,
+            peppygen::paired_topics::right_arm::joint_states
         );
         pump_gripper_half_open!(
-            $mocks.pairings.left_gripper_link.gripper_states,
-            peppygen::paired_topics::left_gripper_link::gripper_states
+            $mocks.pairings.left_gripper.gripper_states,
+            peppygen::paired_topics::left_gripper::gripper_states
         );
         pump_gripper_half_open!(
-            $mocks.pairings.right_gripper_link.gripper_states,
-            peppygen::paired_topics::right_gripper_link::gripper_states
+            $mocks.pairings.right_gripper.gripper_states,
+            peppygen::paired_topics::right_gripper::gripper_states
         );
     };
 }
@@ -185,8 +185,8 @@ fn leader_command(
 /// streams down as the new measurement. The returned watch carries the latest
 /// adopted position, so a test can assert what motion the arm mock observed.
 fn spawn_left_arm_follower(
-    states: peppygen::mock::pairings::left_arm_link::joint_states::Publisher,
-    mut setpoints: peppygen::mock::pairings::left_arm_link::joint_setpoints::Subscription,
+    states: peppygen::mock::pairings::left_arm::joint_states::Publisher,
+    mut setpoints: peppygen::mock::pairings::left_arm::joint_setpoints::Subscription,
 ) -> watch::Receiver<[f64; 7]> {
     let (tx, rx) = watch::channel(HOME);
     tokio::spawn(async move {
@@ -198,7 +198,7 @@ fn spawn_left_arm_follower(
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    let message = peppygen::paired_topics::left_arm_link::joint_states::Message {
+                    let message = peppygen::paired_topics::left_arm::joint_states::Message {
                         timestamp: SystemTime::now(),
                         positions: positions.to_vec(),
                         velocities: vec![0.0; 7],
@@ -260,13 +260,13 @@ async fn a_leader_command_fans_through_to_the_governed_arm_wire() -> peppygen::R
         Arc::new(AtomicBool::new(true)),
     );
     pump_arm_at_home!(
-        mocks.pairings.left_arm_link.joint_states,
-        peppygen::paired_topics::left_arm_link::joint_states
+        mocks.pairings.left_arm.joint_states,
+        peppygen::paired_topics::left_arm::joint_states
     );
     pump_right_arm_and_grippers!(mocks);
 
-    let mut left_wire = mocks.pairings.left_arm_link.joint_setpoints;
-    let mut right_wire = mocks.pairings.right_arm_link.joint_setpoints;
+    let mut left_wire = mocks.pairings.left_arm.joint_setpoints;
+    let mut right_wire = mocks.pairings.right_arm.joint_setpoints;
     let leader = mocks.pairings.leader_left_arm.joint_setpoints;
 
     // Streaming begins (both arms + both grippers seeded): before any command,
@@ -340,8 +340,8 @@ async fn move_arm_joints_streams_a_trajectory_the_arm_follows_to_the_target() ->
         Arc::new(AtomicBool::new(true)),
     );
     let followed = spawn_left_arm_follower(
-        mocks.pairings.left_arm_link.joint_states,
-        mocks.pairings.left_arm_link.joint_setpoints,
+        mocks.pairings.left_arm.joint_states,
+        mocks.pairings.left_arm.joint_setpoints,
     );
     pump_right_arm_and_grippers!(mocks);
 
@@ -349,7 +349,7 @@ async fn move_arm_joints_streams_a_trajectory_the_arm_follows_to_the_target() ->
     // coordinator while `seed_all` still waits for first states is refused
     // ("the follower has not reported its first state yet"), so wait for the
     // first governed setpoint on the (uncommanded) right wire first.
-    let mut right_wire = mocks.pairings.right_arm_link.joint_setpoints;
+    let mut right_wire = mocks.pairings.right_arm.joint_setpoints;
     tokio::time::timeout(DEADLINE, right_wire.next())
         .await
         .expect("streaming never began before the goal")?
@@ -416,8 +416,8 @@ async fn the_coordinator_holds_everything_until_robot_init_reports_ready() -> pe
     pump_is_ready(mocks.deps.robot_init.is_ready, ready.clone());
     // The follower pumps park on wait_for_subscriber while the gate holds.
     pump_arm_at_home!(
-        mocks.pairings.left_arm_link.joint_states,
-        peppygen::paired_topics::left_arm_link::joint_states
+        mocks.pairings.left_arm.joint_states,
+        peppygen::paired_topics::left_arm::joint_states
     );
     pump_right_arm_and_grippers!(mocks);
 
@@ -429,7 +429,7 @@ async fn the_coordinator_holds_everything_until_robot_init_reports_ready() -> pe
         "the backbone subscribed to the leader stream before the robot was ready"
     );
     // And the downstream wire stays silent: no publisher, no setpoints.
-    let mut left_wire = mocks.pairings.left_arm_link.joint_setpoints;
+    let mut left_wire = mocks.pairings.left_arm.joint_setpoints;
     assert!(
         tokio::time::timeout(READ_WINDOW, left_wire.next())
             .await
@@ -475,8 +475,8 @@ async fn a_closing_command_inside_d_stop_reads_stopped_on_collision_status() -> 
         Arc::new(AtomicBool::new(true)),
     );
     pump_arm_at_home!(
-        mocks.pairings.left_arm_link.joint_states,
-        peppygen::paired_topics::left_arm_link::joint_states
+        mocks.pairings.left_arm.joint_states,
+        peppygen::paired_topics::left_arm::joint_states
     );
     pump_right_arm_and_grippers!(mocks);
 
@@ -553,8 +553,8 @@ async fn limb_states_snapshots_carry_names_counts_and_measured_state() -> peppyg
         Arc::new(AtomicBool::new(true)),
     );
     pump_arm_at_home!(
-        mocks.pairings.left_arm_link.joint_states,
-        peppygen::paired_topics::left_arm_link::joint_states
+        mocks.pairings.left_arm.joint_states,
+        peppygen::paired_topics::left_arm::joint_states
     );
     pump_right_arm_and_grippers!(mocks);
 
@@ -600,14 +600,14 @@ async fn goals_for_unknown_limb_names_are_refused() -> peppygen::Result<()> {
         Arc::new(AtomicBool::new(true)),
     );
     pump_arm_at_home!(
-        mocks.pairings.left_arm_link.joint_states,
-        peppygen::paired_topics::left_arm_link::joint_states
+        mocks.pairings.left_arm.joint_states,
+        peppygen::paired_topics::left_arm::joint_states
     );
     pump_right_arm_and_grippers!(mocks);
 
     // Wait for streaming so the refusal below is the name check, not the
     // seed gate's blanket refusal.
-    let mut right_wire = mocks.pairings.right_arm_link.joint_setpoints;
+    let mut right_wire = mocks.pairings.right_arm.joint_setpoints;
     tokio::time::timeout(DEADLINE, right_wire.next())
         .await
         .expect("streaming never began")?
