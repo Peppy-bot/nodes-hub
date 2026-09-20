@@ -7,9 +7,12 @@ from pathlib import Path
 import sys
 
 
+# `.github` holds the workflow's own scripts and their tests, which the syntax
+# job runs directly: they belong to no node, so there is no image to run them
+# in and no pyproject.toml above them to resolve them from.
 EXCLUDED_DIRECTORIES = {
-    ".git", ".peppy", "target", "node_modules", ".venv", "venv", "dist", "build",
-    "__pycache__",
+    ".git", ".github", ".peppy", "target", "node_modules", ".venv", "venv",
+    "dist", "build", "__pycache__",
 }
 
 

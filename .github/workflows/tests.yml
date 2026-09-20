@@ -32,8 +32,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  python-syntax:
-    name: Python syntax
+  python-checks:
+    name: Python syntax and CI script tests
     runs-on: self-hosted
     timeout-minutes: 5
     permissions:
@@ -63,6 +63,14 @@ jobs:
 
       - name: Compile every tracked Python file
         run: python .github/scripts/check-python-syntax.py
+
+      # The workflow's own scripts, tested where the whole repository's Python
+      # is gated rather than inside the container suites: they run on the
+      # runner, not in a node's image, and the disk reclaim among them deletes
+      # caches off the box, so what it takes and what it leaves is held to
+      # cases rather than to a reading.
+      - name: Test the CI scripts
+        run: python -m unittest discover -s .github/scripts -p 'test_*.py' --verbose
 
   javascript-typescript:
     name: JavaScript and TypeScript tests
@@ -123,6 +131,17 @@ jobs:
       # agents on a single box would, and is the thing to revisit.
       - name: Name the caches this run reuses
         run: python3 .github/scripts/configure-build-cache.py
+
+      # Nothing in the directory named above ever shrinks: a def change adds a
+      # test image beside the one it replaces, cargo keeps every artifact a
+      # dependency bump superseded, and uv's built-wheel cache never evicts.
+      # The boxes are reused and shared with every other repository here, so
+      # the disk fills and a later job dies partway through with no space left
+      # on device. This evicts the coldest entries under ~/.cache, wherever
+      # they came from, until a quarter of the filesystem is free again, and
+      # only when it is not.
+      - name: Reclaim disk from the runner's caches
+        run: python3 .github/scripts/prune_ci_cache.py
 
       # Every node image bootstraps from a public `peppybot/*` base on Docker
       # Hub, and an anonymous pull is charged against a quota tied to the
