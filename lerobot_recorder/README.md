@@ -33,9 +33,14 @@ backbone's end, and dimension names are that name plus a joint index
 carries (`left_gripper_opening` in state, `left_gripper_effort` in efforts).
 What answers for a limb plays no part in its name: a physical OpenArm answers
 from a driver per limb and a simulated one from one simulation for all four,
-and both record the same columns. Two limbs commanded on one link are
-refused at startup. Joint counts and which optional vectors
-(velocities, efforts) a source delivers are discovered from its first message.
+and both record the same columns. A source is identified by the pair it is
+observed on, the end it publishes from plus the far end when the launcher
+named the pair by it (`simulation_inst/arms->backbone_inst/left_arm`): one
+simulation answers for every arm it stands on its one `arms` slot, and the
+far end is what keeps its limbs in separate cache slots. Two limbs commanded
+on one link, or one source bound to two limbs, are refused at startup. Joint
+counts and which optional vectors (velocities, efforts) a source delivers are
+discovered from its first message.
 See `peppy.json5` for the parameter reference.
 
 Requires peppy v0.23.0 or newer: the observed membership is read from the

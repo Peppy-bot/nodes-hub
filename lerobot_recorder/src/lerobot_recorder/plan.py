@@ -5,7 +5,9 @@ The observer slots are `zero_or_more`, so the robot's shape comes from the
 launcher rather than this node: each pairing kind contributes as many limbs as
 the launcher bound. A limb is one measured source paired with the commanded
 source at the same position in its slot, which is what makes the launcher's
-binding order load-bearing.
+binding order load-bearing. A source is identified by the pair it is observed
+on, not by its instance alone: one backbone leads every limb of its robot, and
+one simulation answers for every limb it stands on a single slot.
 
 Pairing wire messages carry no joint names, so dataset dimension names derive
 from each limb's name plus joint index (left_arm_j0, left_gripper_opening); a
@@ -26,19 +28,73 @@ from dataclasses import dataclass
 from enum import Enum
 
 ProducerKey = tuple[str, str]
-# An observed source's identity: its instance's wire address plus the
-# producer-side link of the observed pairing. The link is what keeps two
-# sources apart when one instance leads several pairings, which is exactly
-# the backbone's shape.
-SourceKey = tuple[str, str, str]
 
 
 def producer_key(producer) -> ProducerKey:
     return (producer.core_node, producer.instance_id)
 
 
+@dataclass(frozen=True)
+class PairingEnd:
+    """One end of a pairing: an instance's wire address and the link of the
+    slot it holds the pair on."""
+
+    core_node: str
+    instance_id: str
+    link_id: str
+
+    def __str__(self) -> str:
+        return f"{self.core_node}/{self.instance_id}/{self.link_id}"
+
+    @property
+    def label(self) -> str:
+        """The end without its core node, for operator-facing messages."""
+        return f"{self.instance_id}/{self.link_id}"
+
+
+@dataclass(frozen=True)
+class SourceKey:
+    """An observed source's identity, what every message is tagged with and a
+    cache slot is keyed on: the end the source publishes from, and the end it
+    publishes to when the launcher named the pair by that far end. The link
+    keeps two sources apart when one instance leads several pairings, the
+    backbone's shape; the peer keeps them apart when one slot holds several
+    pairs, a simulation's shape, which answers for every limb of a robot on
+    one slot, each on the pair its backbone link opened. `None` is a source
+    named directly, observed across every pair its slot holds."""
+
+    source: PairingEnd
+    peer: PairingEnd | None
+
+    def __str__(self) -> str:
+        """`core/instance/link`, then `->core/instance/link` of the peer when
+        the pair was named by it; how `session.json` records a source."""
+        if self.peer is None:
+            return str(self.source)
+        return f"{self.source}->{self.peer}"
+
+    @property
+    def label(self) -> str:
+        if self.peer is None:
+            return self.source.label
+        return f"{self.source.label}->{self.peer.label}"
+
+
+def peer_end(peer) -> PairingEnd | None:
+    """The far end of the pair a source was named by; None for a source named
+    directly."""
+    if peer is None:
+        return None
+    return PairingEnd(peer.producer.core_node, peer.producer.instance_id, peer.peer_link_id)
+
+
 def source_key(source) -> SourceKey:
-    return (source.producer.core_node, source.producer.instance_id, source.source_link_id)
+    return SourceKey(
+        source=PairingEnd(
+            source.producer.core_node, source.producer.instance_id, source.source_link_id
+        ),
+        peer=peer_end(source.peer),
+    )
 
 
 class LinkKind(Enum):
@@ -57,8 +113,7 @@ class SourceEntry:
     @property
     def label(self) -> str:
         """How this source is named in operator-facing messages."""
-        _core_node, instance_id, link_id = self.key
-        return f"{instance_id}/{link_id}"
+        return self.key.label
 
 
 def sanitize_key(instance_id: str) -> str:

@@ -19,19 +19,23 @@ from lerobot_recorder.__main__ import (
     _route_link,
     _write_session_json,
 )
-from lerobot_recorder.plan import LinkKind, SourceEntry
+from lerobot_recorder.plan import LinkKind, PairingEnd, SourceEntry, SourceKey
 from lerobot_recorder.recording import Cache, GripperSample, JointSample
 from tests.test_recording import (
-    CORE,
     NOW_NS,
     action_entry,
     joint_entry,
+    key,
     make_params,
     make_plan,
 )
 
-BACKBONE = (CORE, "backbone_inst", "left_arm")
-OTHER_ARM = (CORE, "backbone_inst", "right_arm")
+BACKBONE = key("backbone_inst", "left_arm")
+OTHER_ARM = key("backbone_inst", "right_arm")
+# The simulation's one `arms` slot answers both arms, each pair named by the
+# backbone link that opened it.
+SIM_LEFT_ARM = key("simulation_inst", "arms", BACKBONE.source)
+SIM_RIGHT_ARM = key("simulation_inst", "arms", OTHER_ARM.source)
 
 
 def joint_message(position: float):
@@ -44,11 +48,20 @@ def cache_with(*keys) -> Cache:
     return Cache(links=dict.fromkeys(keys), color=[], rgbd_video=[], rgbd_depth=[])
 
 
-def observed(key):
-    core_node, instance_id, link_id = key
+def producer_of(end: PairingEnd):
+    return SimpleNamespace(core_node=end.core_node, instance_id=end.instance_id)
+
+
+def observed(key: SourceKey):
+    """The `ObservedSource` a message arrives tagged with, in the runtime's
+    field names."""
+    peer = key.peer
     return SimpleNamespace(
-        producer=SimpleNamespace(core_node=core_node, instance_id=instance_id),
-        source_link_id=link_id,
+        producer=producer_of(key.source),
+        source_link_id=key.source.link_id,
+        peer=None
+        if peer is None
+        else SimpleNamespace(producer=producer_of(peer), peer_link_id=peer.link_id),
     )
 
 
@@ -64,6 +77,20 @@ def test_two_sources_on_one_instance_cache_separately():
 
     assert cache.links[BACKBONE].positions == (0.25,)
     assert cache.links[OTHER_ARM].positions == (-0.75,)
+
+
+def test_two_pairs_on_one_slot_cache_separately():
+    """A simulation answers both arms from one instance on one slot, so
+    routing on the source end alone would collapse them; the pair's far end
+    is what lands each measured stream in its own cache slot."""
+    cache = cache_with(SIM_LEFT_ARM, SIM_RIGHT_ARM)
+    route = _route_link(cache, LinkKind.JOINT, recording.state_sample)
+
+    route(observed(SIM_LEFT_ARM), joint_message(0.25))
+    route(observed(SIM_RIGHT_ARM), joint_message(-0.75))
+
+    assert cache.links[SIM_LEFT_ARM].positions == (0.25,)
+    assert cache.links[SIM_RIGHT_ARM].positions == (-0.75,)
 
 
 def test_a_member_that_joined_after_discovery_is_dropped():
@@ -204,7 +231,7 @@ def session_with(tmp_path, links: dict):
 
 
 def leader_entry(link_id: str, feature_key: str) -> SourceEntry:
-    return SourceEntry(key=(CORE, "backbone", link_id), kind=LinkKind.JOINT, feature_key=feature_key)
+    return SourceEntry(key=key("backbone", link_id), kind=LinkKind.JOINT, feature_key=feature_key)
 
 
 def two_limb_plan(left_feeds: str, right_feeds: str):
@@ -232,7 +259,11 @@ def test_sources_differing_only_by_core_node_stay_distinct():
     plan = make_plan(
         state=(joint_entry(0), joint_entry(1)),
         action=tuple(
-            SourceEntry(key=(core, "arm", "link"), kind=LinkKind.JOINT, feature_key=feature)
+            SourceEntry(
+                key=SourceKey(source=PairingEnd(core, "arm", "link"), peer=None),
+                kind=LinkKind.JOINT,
+                feature_key=feature,
+            )
             for core, feature in (("cnA", "arm0"), ("cnB", "arm1"))
         ),
     )
@@ -240,6 +271,34 @@ def test_sources_differing_only_by_core_node_stay_distinct():
         "cnA/arm/link": "arm0",
         "cnB/arm/link": "arm1",
     }
+
+
+def test_sources_differing_only_by_their_pair_stay_distinct():
+    """Both arms of a simulated robot answer from the simulation's one `arms`
+    slot, so the provenance names the pair each was observed on: the source
+    end, then the far end it publishes to."""
+    plan = make_plan(
+        state=(
+            SourceEntry(key=SIM_LEFT_ARM, kind=LinkKind.JOINT, feature_key="left_arm"),
+            SourceEntry(key=SIM_RIGHT_ARM, kind=LinkKind.JOINT, feature_key="right_arm"),
+        ),
+    )
+    assert _recorded_links(plan)["state_links"] == {
+        "cn/simulation_inst/arms->cn/backbone_inst/left_arm": "left_arm",
+        "cn/simulation_inst/arms->cn/backbone_inst/right_arm": "right_arm",
+    }
+
+
+def test_a_source_is_labelled_by_the_pair_it_is_observed_on():
+    """Operator-facing messages name a source without its core node; a source
+    observed on a named pair carries that pair's far end, or two arms of one
+    simulation would read the same."""
+    assert SourceEntry(key=BACKBONE, kind=LinkKind.JOINT, feature_key="left_arm").label == (
+        "backbone_inst/left_arm"
+    )
+    assert SourceEntry(key=SIM_LEFT_ARM, kind=LinkKind.JOINT, feature_key="left_arm").label == (
+        "simulation_inst/arms->backbone_inst/left_arm"
+    )
 
 
 def test_resuming_the_session_this_launch_wrote_is_allowed(tmp_path):
@@ -278,8 +337,8 @@ def test_setup_discovers_the_seeded_membership_inline(tmp_path):
         limbs=(
             (
                 LinkKind.JOINT,
-                (observed((CORE, "arm_inst", "link")),),
-                (observed((CORE, "lead_inst", "arm")),),
+                (observed(key("arm_inst")),),
+                (observed(key("lead_inst", "arm")),),
             ),
             (LinkKind.GRIPPER, (), ()),
         ),
