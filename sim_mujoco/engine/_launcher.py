@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 from bridge_extension import MujocoBridgeExtension
 from edits import Edits
@@ -86,7 +86,7 @@ class SimLauncher:
                         "an engine holding no scene steps nothing: this node stops, and "
                         "the robots standing in it join the engine that comes back"
                     )
-                self._view.step()
+                self._view.step(self._scene_is_changing)
         except Exception:
             # Otherwise asyncio.run_in_executor captures the traceback in a
             # Future that may never be awaited and the process exits silently.
@@ -95,6 +95,13 @@ class SimLauncher:
         finally:
             self._edits.cancel_all("the engine stopped")
             self.unbind()
+
+    def _scene_is_changing(self) -> bool:
+        """True once the engine stops or a change to the scene (a robot
+        standing, a robot leaving) waits for this thread. Either one ends the
+        steps the view is taking, so the change is made before the scene
+        takes another step."""
+        return self._stop.is_set() or self._edits.pending()
 
     def unbind(self) -> None:
         """Lets go of the scene so it can be composed again: the view closes
@@ -222,12 +229,13 @@ class _NoView:
         self._extension = extension
         self._pacer = _StepPacer(model.opt.timestep) if model is not None else None
 
-    def step(self) -> None:
+    def step(self, scene_is_changing: Callable[[], bool]) -> None:
         if self._extension is None or self._pacer is None:
             time.sleep(_IDLE_POLL_S)
             return
-        for _ in range(self._pacer.due(time.monotonic())):
-            self._extension.step()
+        _take_due_steps(
+            self._pacer.due(time.monotonic()), self._extension.step, scene_is_changing
+        )
         time.sleep(_IDLE_POLL_S)
 
     def close(self) -> None:
@@ -264,12 +272,13 @@ class _WindowView:
         self._viewer = mujoco.viewer.launch_passive(model, data)
         self._pacer = _StepPacer(model.opt.timestep)
 
-    def step(self) -> None:
+    def step(self, scene_is_changing: Callable[[], bool]) -> None:
         if not self._viewer.is_running():
             time.sleep(_IDLE_POLL_S)
             return
-        for _ in range(self._pacer.due(time.monotonic())):
-            self._extension.step()
+        _take_due_steps(
+            self._pacer.due(time.monotonic()), self._extension.step, scene_is_changing
+        )
         self._viewer.sync()
         time.sleep(_IDLE_POLL_S)
 
@@ -359,7 +368,7 @@ class _BrowserView:
         self._viewer._render()  # pylint: disable=W0212
         logger.info(f"MuJoCo viewer available: open http://{host}:{port} in a browser")
 
-    def step(self) -> None:
+    def step(self, scene_is_changing: Callable[[], bool]) -> None:
         import mujoco  # pylint: disable=C0415
 
         if self._reset_requested.is_set():
@@ -370,8 +379,9 @@ class _BrowserView:
             mujoco.mj_forward(self._model, self._data)
             logger.info("Scene objects reset to spawn poses")
         now = time.monotonic()
-        for _ in range(self._pacer.due(now)):
-            self._viewer._tick()  # pylint: disable=W0212
+        _take_due_steps(
+            self._pacer.due(now), self._viewer._tick, scene_is_changing  # pylint: disable=W0212
+        )
         if now >= self._next_render_s:
             self._viewer._render()  # pylint: disable=W0212
             self._next_render_s = now + _RENDER_PERIOD_S
@@ -382,6 +392,21 @@ class _BrowserView:
         # explicit stop the process can't exit after the sim loop ends, and
         # the next scene's server takes the address back.
         self._server.stop()
+
+
+def _take_due_steps(
+    steps: int, step: Callable[[], None], scene_is_changing: Callable[[], bool]
+) -> None:
+    """Takes the steps the scene owes the wall clock, and no further once the
+    scene is changing: the steps not taken are lost time, like the ones past
+    `_MAX_CATCHUP_STEPS`. A scene stepped slower than real time spends
+    seconds on the whole of them (a browser view's tick steps for up to a
+    frame of wall time before it returns), so a robot leaving is answered
+    after the step during which it asked, not after the last one owed."""
+    for _ in range(steps):
+        if scene_is_changing():
+            return
+        step()
 
 
 def _carry(into, model, joint: int, out_of, previous_model, previous: int, kind: str) -> None:

@@ -34,6 +34,11 @@ class Edits:
         self._queue.put(Edit(work=work, future=future))
         return future
 
+    def pending(self) -> bool:
+        """Whether a change waits for the thread that steps the scene, which
+        asks before every step it takes."""
+        return not self._queue.empty()
+
     def drain(self) -> int:
         """Runs everything waiting, on the calling thread, and answers with
         how many changes were made."""
