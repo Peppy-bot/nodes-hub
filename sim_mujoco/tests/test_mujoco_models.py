@@ -55,7 +55,7 @@ class TestTheShippedEntries:
 
     def test_an_so101_runs_its_files_servos_corrected_to_its_description(self):
         known = MujocoModels.read().of("so101")
-        assert known.scene == "so101/scene.xml"
+        assert known.scene == "so101/so101.xml"
         assert known.arm_gains is None
         assert (known.gravity_compensation, known.camera_lights, known.head_camera) == (
             False,
@@ -109,6 +109,69 @@ class TestStrictParsing:
     def test_an_entry_names_its_scene(self, scene):
         with pytest.raises(RuntimeError, match="scene must name the model's MJCF"):
             parse(EngineModel(entry=shipped_entry("so101"), engine={"scene": scene}))
+
+    @pytest.mark.parametrize(
+        "solver",
+        [
+            7,
+            ["<option/>"],
+            "<optionally this is prose>",
+            "a note about the <option we want",
+            "<option garbage",
+            '<option integrator="nonsense"/>',
+            "",
+            "<!-- nothing -->",
+            # An element that is not the one the key names.
+            '<compiler angle="degree"/>',
+            '<statistic meansize="0.05"/>',
+            '<option timestep="0.004"/><size memory="10M"/>',
+            '<option timestep="0.004"/><option timestep="0.009"/>',
+        ],
+    )
+    def test_a_solver_mujoco_will_not_take_is_refused_at_the_entry(self, solver):
+        """Every entry is read at node setup, so an element MuJoCo will not
+        take is answered for there and not by the first robot to attach as
+        this model."""
+        with pytest.raises(
+            RuntimeError,
+            match=r"models/so101\.json5: solver (must be an|is no|is one) MJCF",
+        ):
+            _parse("so101", solver=solver)
+
+    @pytest.mark.parametrize("timestep", ["0", "-1"])
+    def test_a_solver_that_steps_nowhere_is_refused_at_the_entry(self, timestep):
+        """A scene paces on its timestep: zero divides by it and a negative
+        one never comes due, and both take until the first step to show."""
+        with pytest.raises(RuntimeError, match=r"solver steps a timestep above zero"):
+            _parse("so101", solver=f'<option timestep="{timestep}"/>')
+
+    @pytest.mark.parametrize(
+        "setting",
+        [
+            'timestep="nan"',
+            'timestep="inf"',
+            'gravity="0 0 nan"',
+            'wind="nan 0 0"',
+            'magnetic="nan 0 0"',
+            'density="nan"',
+            'impratio="nan"',
+            'tolerance="nan"',
+        ],
+    )
+    def test_a_solver_that_is_not_finite_is_refused_at_the_entry(self, setting):
+        """A scene steps every setting of its `<option>`, so a value that is
+        no number steps every robot standing in it to NaN and publishes
+        that, from the first step on."""
+        with pytest.raises(RuntimeError, match=r"solver is finite in every setting"):
+            _parse("so101", solver=f"<option {setting}/>")
+
+    def test_the_solver_an_entry_names_is_what_the_model_stands_under(self):
+        known = _parse("so101", solver='<option integrator="implicitfast" timestep="0.007"/>')
+
+        assert known.solver.timestep == pytest.approx(0.007)
+
+    def test_an_entry_naming_no_solver_stands_under_its_own_file(self):
+        assert _parse("so101").solver is None
 
     @pytest.mark.parametrize("key", ["gravity_compensation", "camera_lights", "head_camera"])
     def test_a_flag_is_true_or_false(self, key):

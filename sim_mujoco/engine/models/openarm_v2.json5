@@ -1,8 +1,8 @@
 // What this engine alone knows about an OpenArm v2. Its limbs, joints and
 // cameras are sim_robot_core's entry of the same name.
 {
-  // The robot's MJCF, which is the whole world it stands in, under
-  // PEPPY_ROBOT_ASSETS_DIR.
+  // The robot's MJCF, under PEPPY_ROBOT_ASSETS_DIR. It brings the robot,
+  // and the scene it is attached into carries the floor and the light.
   scene: "openarm/openarm_bimanual_v2.xml",
 
   // The MJCF compiler folds the fixed pedestal link into the world body, so a

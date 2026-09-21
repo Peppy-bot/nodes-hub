@@ -149,6 +149,146 @@ def test_a_spot_promised_to_an_admitted_robot_is_not_offered_twice():
     assert not world.occupied(second, promised=(first,))
 
 
+@pytest.mark.parametrize("position", [(float("nan"), 0.0, 0.0), (0.0, float("inf"), 0.0)])
+def test_a_placement_that_is_not_finite_is_refused(position):
+    """A prim placed at NaN reports no error and simulates nothing."""
+    world_module = _world_module()
+
+    with pytest.raises(ValueError, match="finite in every coordinate"):
+        world_module.Placement.of(position, 0.0)
+
+
+def test_a_placement_of_the_wrong_width_is_refused():
+    world_module = _world_module()
+
+    with pytest.raises(ValueError, match="3 coordinates"):
+        world_module.Placement.of((0.0, 0.0), 0.0)
+
+
+def test_a_yaw_that_is_not_finite_is_refused():
+    world_module = _world_module()
+
+    with pytest.raises(ValueError, match="finite in every coordinate"):
+        world_module.Placement.of((0.0, 0.0, 0.0), float("nan"))
+
+
+def test_a_robot_with_no_name_is_refused():
+    world_module = _world_module()
+
+    with pytest.raises(ValueError, match="stands under the name of the copy it runs as"):
+        world_module.name_in_the_stage("")
+
+
+def test_a_name_standing_twice_is_refused():
+    """Admission has already found the caller a name, so a second robot
+    under it is the stage saying what the registry did not."""
+    world_module = _world_module()
+    world = world_module.World(head_camera_pack=None)
+    spot = world_module.Placement.of((0.0, 0.0, 0.0), 0.0)
+    world._robots["alpha"] = world_module.Robot(  # pylint: disable=W0212
+        instance="alpha", known=known("openarm_v2"), placement=spot
+    )
+
+    with pytest.raises(ValueError, match=r"'alpha' is still on the stage"):
+        world.add("alpha", known("openarm_v2"), spot)
+
+
+def test_taking_out_a_robot_that_stands_nowhere_changes_nothing():
+    """A take-out that raced a stage the robot never reached leaves the
+    robots standing alone."""
+    world_module = _world_module()
+    world = world_module.World(head_camera_pack=None)
+    world._robots["alpha"] = world_module.Robot(  # pylint: disable=W0212
+        instance="alpha",
+        known=known("openarm_v2"),
+        placement=world_module.Placement.of((0.0, 0.0, 0.0), 0.0),
+    )
+
+    world.remove("ghost")
+
+    assert [robot.instance for robot in world.robots()] == ["alpha"]
+
+
+def test_the_robots_of_a_stage_are_listed_in_the_order_they_joined():
+    """Every name a robot answers to carries its own, so the order is what
+    a reader of `stack list` and of this engine's log sees."""
+    world_module = _world_module()
+    world = world_module.World(head_camera_pack=None)
+    for name, spot in (("alpha", 0.0), ("bravo", 1.5), ("charlo", 3.0)):
+        world._robots[name] = world_module.Robot(  # pylint: disable=W0212
+            instance=name,
+            known=known("openarm_v2"),
+            placement=world_module.Placement.of((spot, 0.0, 0.0), 0.0),
+        )
+
+    assert [robot.instance for robot in world.robots()] == ["alpha", "bravo", "charlo"]
+
+
+def test_a_robot_nearer_than_the_lattice_leaves_them_counts_as_on_the_spot():
+    """It is the distance between two placements that counts, not which
+    lattice square each falls in: two robots nearer together than the lattice
+    leaves them resolve their overlap by throwing each other."""
+    world_module = _world_module()
+    world = world_module.World(head_camera_pack=None)
+    pitch = world_module.SPOT_PITCH_M
+    promised = world_module.Placement.of((pitch * 0.49, 0.0, 0.0), 0.0)
+
+    # Hand-picked spots either side of a lattice line, 2 cm apart.
+    beside = world_module.Placement.of((pitch * 0.51, 0.0, 0.0), 0.0)
+
+    assert world.occupied(beside, promised=(promised,))
+    # A spot a whole pitch from the one promised is free, wherever the
+    # lattice's own lines fall between them.
+    clear = world_module.Placement.of((pitch * 0.49 + pitch, 0.0, 0.0), 0.0)
+    assert not world.occupied(clear, promised=(promised,))
+
+
+def test_the_robot_standing_in_the_way_is_the_one_named():
+    """A spot is held by a robot standing on it as much as by one promised
+    it, and which of the two decides what the caller is told."""
+    world_module = _world_module()
+    world = world_module.World(head_camera_pack=None)
+    spot = world_module.Placement.of((0.0, 0.0, 0.0), 0.0)
+    world._robots["alpha"] = world_module.Robot(  # pylint: disable=W0212
+        instance="alpha", known=known("openarm_v2"), placement=spot
+    )
+
+    assert world.standing_within(spot).instance == "alpha"
+    assert world.occupied(spot)
+    assert world.standing_within(
+        world_module.Placement.of((world_module.SPOT_PITCH_M, 0.0, 0.0), 0.0)
+    ) is None
+
+
+def test_a_name_carrying_the_prim_separator_is_refused():
+    """Every robot is a prim of the stage under its own name, so a name
+    carrying the separator nests one robot inside another's path."""
+    world_module = _world_module()
+
+    with pytest.raises(ValueError, match=r"peppy stack join LAUNCHER -i left_arm"):
+        world_module.name_in_the_stage("left/arm")
+
+    assert world_module.name_in_the_stage("alpha") == "alpha"
+
+
+def test_a_full_stage_is_refused_the_way_a_taken_spot_is(monkeypatch):
+    """Admission answers the goal with the reason its robot was refused, and
+    reads every one of those reasons off a ValueError. Two rings put a robot
+    on the origin and on the eight spots around it."""
+    world_module = _world_module()
+    monkeypatch.setattr(world_module, "_MAX_RINGS", 2)
+    world = world_module.World(head_camera_pack=None)
+    pitch = world_module.SPOT_PITCH_M
+    taken = tuple(
+        world_module.Placement.of((row * pitch, column * pitch, 0.0), 0.0)
+        for row in (-1, 0, 1)
+        for column in (-1, 0, 1)
+    )
+
+    with pytest.raises(ValueError, match=r"every spot this stage lays out is taken"):
+        world.free_spot(taken)
+
+
 def test_the_listing_waits_while_a_robot_is_being_stood():
     """Robots are stood on the thread that steps the scene and listed on the
     one serving the contracts, and the listing waits for a stand to finish
