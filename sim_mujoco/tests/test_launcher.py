@@ -13,6 +13,7 @@ import types
 from pathlib import Path
 
 import mujoco
+import mujoco.viewer
 import pytest
 from sim_robot_core.models import EngineModel, parse_entry
 
@@ -168,7 +169,7 @@ class TestTheSceneAsRobotsComeAndGo:
         launcher.rebind()
 
         assert launcher._model.njnt == 0  # pylint: disable=W0212
-        launcher._view.step()  # pylint: disable=W0212
+        launcher._view.step(lambda: False)  # pylint: disable=W0212
 
     def test_a_robot_that_joins_starts_in_its_models_posture(self):
         world = World(head_camera_pack=None, renders=False)
@@ -332,7 +333,9 @@ class TestTheThreadThatStepsTheScene:
         # A run that keeps stepping ends this test at its first step, so the
         # suite answers for it in the time one step takes.
         monkeypatch.setattr(
-            launcher_module._NoView, "step", lambda _self: launcher._stop.set()  # pylint: disable=W0212
+            launcher_module._NoView,  # pylint: disable=W0212
+            "step",
+            lambda _self, _scene_is_changing: launcher._stop.set(),  # pylint: disable=W0212
         )
 
         with pytest.raises(RuntimeError, match="steps nothing"):
@@ -502,3 +505,137 @@ class TestTheThreadThatStepsTheScene:
         assert float(moved.actuator_biasprm[moved.actuator("alpha/lift").id][2]) == pytest.approx(
             tuned
         )
+
+
+class _CountingScene:
+    """The bridge extension as a view steps it: each step is counted, then
+    handed to `after_step` with the count so far."""
+
+    def __init__(self, after_step=lambda _steps: None) -> None:
+        self.steps = 0
+        self._after_step = after_step
+
+    def step(self) -> None:
+        self.steps += 1
+        self._after_step(self.steps)
+
+
+class _Window:
+    """MuJoCo's passive window, open and shown to nobody."""
+
+    def is_running(self) -> bool:
+        return True
+
+    def sync(self) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+
+class _Server:
+    """viser's server as the browser view uses it, serving nobody."""
+
+    def __init__(self, host, port) -> None:
+        self.host, self.port = host, port
+        self.gui = types.SimpleNamespace(
+            add_button=lambda _label: types.SimpleNamespace(on_click=lambda handler: handler)
+        )
+
+    def on_client_connect(self, handler):
+        return handler
+
+    def stop(self) -> None:
+        return None
+
+
+class _Viewer:
+    """mjviser's viewer as the browser view drives it: a tick steps the scene
+    through the callback the view handed it, and nothing is drawn."""
+
+    def __init__(self, model, data, server, step_fn) -> None:
+        self._model, self._data, self._server, self._step_fn = model, data, server, step_fn
+
+    def _tick(self) -> None:
+        self._step_fn(self._model, self._data)
+
+    def _setup_gui(self) -> None:
+        return None
+
+    def _render(self) -> None:
+        return None
+
+    def _refresh_scene_from_gui(self) -> None:
+        return None
+
+
+def _open_view(kind: str, scene: _CountingScene, monkeypatch):
+    """A view of `kind` on a scene one robot stands in, stepping `scene`,
+    with its window or its browser server faked."""
+    world = World(head_camera_pack=None, renders=False)
+    world.add("alpha", _known(), world.free_spot())
+    model = world.compose().compile()
+    data = mujoco.MjData(model)
+    if kind == "none":
+        return launcher_module._NoView(model, scene)  # pylint: disable=W0212
+    if kind == "window":
+        monkeypatch.setattr(mujoco.viewer, "launch_passive", lambda _model, _data: _Window())
+        return launcher_module._WindowView(model, data, scene)  # pylint: disable=W0212
+    monkeypatch.setitem(sys.modules, "viser", types.SimpleNamespace(ViserServer=_Server))
+    monkeypatch.setitem(sys.modules, "mjviser", types.SimpleNamespace(Viewer=_Viewer))
+    return launcher_module._BrowserView(  # pylint: disable=W0212
+        model, data, scene, "0.0.0.0", 8080
+    )
+
+
+def _owe_a_whole_turn(view) -> None:
+    """Puts the view's scene an hour behind the wall clock, far more than one
+    turn of the loop may catch up, so the next turn owes exactly
+    `_MAX_CATCHUP_STEPS` steps whatever the host's speed."""
+    view._pacer._stepped_to_s -= 3600.0  # pylint: disable=W0212
+
+
+@pytest.mark.parametrize("kind", ["none", "window", "browser"])
+class TestTheStepsAViewOwes:
+    """A view takes the steps its scene owes the wall clock one at a time,
+    and stops before the first one the scene is changing at. On a box that
+    steps the scene slower than real time the whole of them lasts seconds,
+    so a robot leaving waits for one step, not for all of them."""
+
+    def test_every_step_owed_is_taken_while_the_scene_stands_as_it_is(self, kind, monkeypatch):
+        launcher = _launcher(World(head_camera_pack=None, renders=False))
+        scene = _CountingScene()
+        view = _open_view(kind, scene, monkeypatch)
+        _owe_a_whole_turn(view)
+
+        view.step(launcher._scene_is_changing)  # pylint: disable=W0212
+
+        assert scene.steps == launcher_module._MAX_CATCHUP_STEPS  # pylint: disable=W0212
+
+    def test_a_change_asked_during_the_steps_owed_ends_them_at_the_next_one(
+        self, kind, monkeypatch
+    ):
+        launcher = _launcher(World(head_camera_pack=None, renders=False))
+
+        def ask_for_a_change(steps: int) -> None:
+            if steps == 3:
+                launcher._edits.submit(lambda: None)  # pylint: disable=W0212
+
+        scene = _CountingScene(after_step=ask_for_a_change)
+        view = _open_view(kind, scene, monkeypatch)
+        _owe_a_whole_turn(view)
+
+        view.step(launcher._scene_is_changing)  # pylint: disable=W0212
+
+        assert scene.steps == 3
+
+    def test_an_engine_stopping_takes_no_step_owed(self, kind, monkeypatch):
+        launcher = _launcher(World(head_camera_pack=None, renders=False))
+        launcher._stop.set()  # pylint: disable=W0212
+        scene = _CountingScene()
+        view = _open_view(kind, scene, monkeypatch)
+        _owe_a_whole_turn(view)
+
+        view.step(launcher._scene_is_changing)  # pylint: disable=W0212
+
+        assert scene.steps == 0

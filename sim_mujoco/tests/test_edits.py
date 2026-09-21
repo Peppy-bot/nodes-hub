@@ -64,3 +64,25 @@ def test_an_edit_cancelled_before_it_is_drained_is_never_made(edits):
     assert withdrawn.cancel()
     assert edits.drain() == 0
     assert made == []
+
+
+def test_a_change_is_pending_from_its_submit_until_it_is_drained(edits):
+    """The thread that steps the scene asks before every step, so a change
+    waiting is made before the scene steps again."""
+    assert not edits.pending()
+
+    edits.submit(lambda: "stood")
+
+    assert edits.pending()
+    edits.drain()
+    assert not edits.pending()
+
+
+def test_a_withdrawn_change_is_pending_until_a_drain_drops_it(edits):
+    """A withdrawn stand still sits in the queue: it ends the steps the view
+    is taking once, and the drain that follows drops it unmade."""
+    edits.submit(lambda: "stood").cancel()
+
+    assert edits.pending()
+    assert edits.drain() == 0
+    assert not edits.pending()
