@@ -1,5 +1,5 @@
 Bootstrap: docker
-From: peppybot/sim-mujoco:3.10.0-1
+From: peppybot/sim-mujoco:3.10.0-2
 
 %labels
     Name sim-mujoco

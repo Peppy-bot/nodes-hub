@@ -55,7 +55,7 @@ def scene_fixture():
 
 
 def _admit(scene, name: str, model: str) -> None:
-    scene.robots.admit(name, shipped_entry(model), Caller("sim16", f"{name}_init"), 0.0)
+    scene.robots.admit(name, shipped_entry(model), Caller("sim16", f"{name}_init"))
 
 
 def _arm_setpoint(sender, positions, velocities=()):

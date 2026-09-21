@@ -177,7 +177,7 @@ def test_a_copy_admitted_while_its_robot_leaves_is_stood_afresh():
     there."""
     io = _robots_io(_stage(("alpha", "openarm_v2", ORIGIN)))
     assert io._admit(_request()).accepted
-    io._robots.stand("alpha", now_s=0.0)
+    io._robots.stand("alpha")
     joined = []
 
     def attach_the_copy(_change):
@@ -225,9 +225,8 @@ def test_withdrawing_again_leaves_the_copy_that_took_the_name_alone():
         "alpha",
         MODELS.of("openarm_v2").entry,
         Caller(core_node=CORE_NODE, instance_id="alpha_init_2"),
-        0.0,
     )
-    io._robots.stand("alpha", now_s=0.0)
+    io._robots.stand("alpha")
     io._withdraw()
 
     assert io._robots.of_name("alpha").standing()
@@ -267,7 +266,7 @@ def test_a_handover_that_never_reached_its_stay_leaves_the_robot_standing():
     never reaches its stay."""
     io = _robots_io(_stage(("alpha", "openarm_v2", ORIGIN)))
     assert io._admit(_request()).accepted
-    io._robots.stand("alpha", now_s=0.0)
+    io._robots.stand("alpha")
     promised = io._placements["alpha"]
 
     assert io._admit(_request()).accepted
@@ -284,7 +283,7 @@ def test_a_copy_re_registering_its_own_robot_takes_it_over_where_it_stands():
     until the stay taking it over exists."""
     io = _robots_io(_stage(("alpha", "openarm_v2", ORIGIN)))
     assert io._admit(_request()).accepted
-    io._robots.stand("alpha", now_s=0.0)
+    io._robots.stand("alpha")
     hosted = io._handover("alpha")
 
     decision = io._admit(_request())
@@ -433,7 +432,7 @@ def test_the_stay_taking_a_robot_over_ends_the_one_hosting_it_and_not_itself():
     the one the handover leaves behind and keeps hosting the robot."""
     io = _robots_io(_stage(("alpha", "openarm_v2", ORIGIN)))
     assert io._admit(_request()).accepted
-    io._robots.stand("alpha", now_s=0.0)
+    io._robots.stand("alpha")
     io._lease_s = 2.0
     io._io = _HoldsEverything()
     io._stopping = asyncio.Event()

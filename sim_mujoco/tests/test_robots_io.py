@@ -10,6 +10,7 @@ import concurrent.futures
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Optional
 from unittest.mock import Mock
 
 import pytest
@@ -182,7 +183,7 @@ def test_a_copy_re_registering_its_own_robot_is_admitted():
     robot it stands is accepted, and the robot is never stood again."""
     io = _robots_io()
     assert io._admit(_request()).accepted
-    io._robots.stand("alpha", now_s=1.0)
+    io._robots.stand("alpha")
 
     decision = io._admit(_request())
 
@@ -195,7 +196,7 @@ def test_a_copy_re_registering_its_own_robot_is_admitted():
 def test_a_re_registration_naming_another_model_is_refused():
     io = _robots_io()
     assert io._admit(_request()).accepted
-    io._robots.stand("alpha", now_s=1.0)
+    io._robots.stand("alpha")
     decision = io._admit(_request(model="so101"))
     assert not decision.accepted
     assert "stands 'alpha' as openarm_v2" in decision.payload
@@ -249,18 +250,25 @@ def _caller(robot: str) -> Caller:
     return Caller(core_node="sim16", instance_id=f"{robot}_init_inst")
 
 
-def _leasing(now_s: float, held: Held, model: str = "openarm_v2") -> RobotsIO:
-    """A RobotsIO whose robot `alpha` of `model` last renewed its lease at
-    0 s and holds `held`, read at `now_s` with the lease this scene gives."""
-    return _leasing_fleet(now_s, {"alpha": (model, held)})
+def _leasing(
+    now_s: float, held: Held, model: str = "openarm_v2", reached_s: Optional[float] = 0.0
+) -> RobotsIO:
+    """A RobotsIO whose robot `alpha` of `model` holds `held`, read at `now_s`
+    with the lease this scene gives. Its lease runs from `reached_s`, when a
+    limb first reached it, and not at all when that is None."""
+    return _leasing_fleet(now_s, {"alpha": (model, held)}, reached_s)
 
 
-def _leasing_fleet(now_s: float, fleet: dict) -> RobotsIO:
+def _leasing_fleet(now_s: float, fleet: dict, reached_s: Optional[float] = 0.0) -> RobotsIO:
     """A RobotsIO whose robots, each given as name: (model, what it holds),
-    last renewed their leases at 0 s, read at `now_s`."""
+    are read at `now_s` with the lease this scene gives. Their leases run
+    from `reached_s`, when a limb first reached each, and not at all when
+    that is None."""
     io = _robots_io()
     for name, (model, _held) in fleet.items():
-        io._robots.admit(name, MODELS.of(model).entry, _caller(name), 0.0)
+        io._robots.admit(name, MODELS.of(model).entry, _caller(name))
+        if reached_s is not None:
+            io._robots.note_limbs_reached(name, reached_s)
     io._loop = SimpleNamespace(time=lambda: now_s)
     io._io = _Pairs({name: held for name, (_model, held) in fleet.items()})
     io._lease_s = LEASE_S
@@ -317,7 +325,7 @@ def test_a_scene_that_cannot_stand_the_robot_answers_its_own_goal(model):
     back."""
     io = _robots_io()
     io._io = Mock(spec=["forget"])
-    io._robots.admit("alpha", MODELS.of(model).entry, CALLER, 0.0)
+    io._robots.admit("alpha", MODELS.of(model).entry, CALLER)
     io._placements["alpha"] = Placement.of((0.0, 0.0, 0.0), 0.0)
     refused: concurrent.futures.Future = concurrent.futures.Future()
     refused.set_exception(RuntimeError("the test scene stands nothing"))
@@ -452,12 +460,43 @@ class TestLease:
             f"none of this robot's limbs were paired for {LEASE}"
         )
 
-    def test_a_robot_has_the_lease_to_pair_its_limbs(self):
+    def test_a_robot_whose_limbs_left_keeps_its_place_for_the_lease(self):
         io = _leasing(now_s=LEASE_S, held=Held())
         robot = io._robots.of_name("alpha")
 
         assert io._lapse(robot) is None
         assert robot.last_paired_s == 0.0, "a lease still running is not a renewed one"
+
+    def test_a_robot_no_limb_reached_keeps_its_place_however_long_its_nodes_take(self):
+        """Its stay is its goal's until a limb reaches it, so a backbone slow
+        to come up finds the robot standing."""
+        io = _leasing(now_s=1_000_000.0, held=Held(), reached_s=None)
+        robot = io._robots.of_name("alpha")
+
+        assert io._lapse(robot) is None
+        assert robot.last_paired_s is None
+
+    def test_the_first_limb_to_reach_a_robot_starts_its_lease(self):
+        """Limbs of another model reach it: not its own, so from their
+        arrival on it has the lease to be paired as its model."""
+        io = _leasing(now_s=10.0, held=OPENARM_LIMBS, model="so101", reached_s=None)
+        robot = io._robots.of_name("alpha")
+
+        assert io._lapse(robot) is None
+        assert robot.last_paired_s == 10.0
+        io._loop = SimpleNamespace(time=lambda: 10.0 + LEASE_S + 0.1)
+        assert io._lapse(robot).startswith(
+            f"this robot's pairs were not its model's for {LEASE}"
+        )
+
+    def test_a_camera_reaching_a_robot_starts_no_lease(self):
+        io = _leasing(
+            now_s=10.0, held=Held(rgb_cameras=frozenset({"wrist_left"})), reached_s=None
+        )
+        robot = io._robots.of_name("alpha")
+
+        assert io._lapse(robot) is None
+        assert robot.last_paired_s is None
 
     def test_a_robot_missing_a_limb_lapses_naming_both_lists(self):
         held = Held(arms=OPENARM_LIMBS.arms, grippers=frozenset({"left_gripper"}))
@@ -482,8 +521,9 @@ class TestLease:
         )
 
     def test_a_robot_paired_as_another_model_has_its_stay_ended_naming_both_lists(self):
-        """It joined as an SO-101 and its backbone leads an OpenArm's limbs:
-        no pair of its own ever drives it, so its lease is never renewed."""
+        """It joined as an SO-101 and its backbone leads an OpenArm's limbs,
+        which reached it at 0 s: no pair of its own ever drives it, so its
+        lease is never renewed."""
         io = _leasing(now_s=10.0, held=OPENARM_LIMBS, model="so101")
         # The lease is read at once instead of after a share of it.
         io._lease_check_period = lambda: 0.0
@@ -614,7 +654,7 @@ class TestAFleetsLeases:
             fleet={"alpha": ("openarm_v2", OPENARM_LIMBS), "bravo": ("openarm_v2", Held())},
         )
         for name in ("alpha", "bravo"):
-            io._robots.stand(name, now_s=0.0)
+            io._robots.stand(name)
 
         assert self._ready(io, "alpha") is True
         assert self._ready(io, "bravo") is False
@@ -659,7 +699,7 @@ def _standing_io() -> RobotsIO:
     io = _robots_io()
     io._edits = Edits()
     io._io = Mock(spec=["forget"])
-    io._robots.admit("alpha", MODELS.of("openarm_v2").entry, CALLER, 0.0)
+    io._robots.admit("alpha", MODELS.of("openarm_v2").entry, CALLER)
     io._placements["alpha"] = Placement.of((0.0, 0.0, 0.0), 0.0)
     io._admitted = None
     return io
@@ -876,7 +916,7 @@ class TestReadiness:
     def _ready(held: Held, model: str = "openarm_v2", standing: bool = True, caller: Caller = CALLER) -> bool:
         io = _leasing(now_s=1.0, held=held, model=model)
         if standing:
-            io._robots.stand("alpha", now_s=1.0)
+            io._robots.stand("alpha")
         request = SimpleNamespace(core_node=caller.core_node, instance_id=caller.instance_id)
         return io._ready(request).ready
 
@@ -1010,7 +1050,7 @@ def test_a_copy_that_comes_straight_back_is_stood_afresh():
     own robot to be handed over, and this robot is already on its way out, so
     everything its joining held goes back before the scene is asked."""
     io = _ending_io()
-    io._robots.admit("alpha", MODELS.of("openarm_v2").entry, CALLER, 0.0)
+    io._robots.admit("alpha", MODELS.of("openarm_v2").entry, CALLER)
     held_when_the_scene_was_asked = []
 
     def take_the_robot_out(_change):
@@ -1108,8 +1148,8 @@ def test_withdrawing_again_leaves_the_copy_that_took_the_name_alone():
     io._withdraw()
 
     # The name the withdrawal freed is taken by a copy of its own.
-    io._robots.admit("alpha", MODELS.of("openarm_v2").entry, _caller("alpha_2"), 0.0)
-    io._robots.stand("alpha", now_s=0.0)
+    io._robots.admit("alpha", MODELS.of("openarm_v2").entry, _caller("alpha_2"))
+    io._robots.stand("alpha")
     io._withdraw()
 
     assert io._robots.of_name("alpha").standing()
@@ -1155,7 +1195,7 @@ def test_the_stay_taking_a_robot_over_ends_the_one_hosting_it_and_not_itself():
     Ending it takes the signal this stay then waits on, so the stay reads
     the one the handover leaves behind and keeps hosting the robot."""
     io = _leasing_fleet(now_s=0.0, fleet={"alpha": ("openarm_v2", OPENARM_LIMBS)})
-    io._robots.stand("alpha", now_s=0.0)
+    io._robots.stand("alpha")
     io._stopping = asyncio.Event()
     hosted = io._handover("alpha")
     goal = _Hosting()
@@ -1185,7 +1225,7 @@ def test_adopting_a_robot_reserves_nothing_and_ends_nobody():
     has is the one watching its lease throughout."""
     io = _robots_io()
     assert io._admit(_request()).accepted
-    io._robots.stand("alpha", now_s=0.0)
+    io._robots.stand("alpha")
     hosted = io._handover("alpha")
 
     assert io._admit(_request()).accepted
@@ -1211,7 +1251,7 @@ def test_a_spot_the_robot_coming_back_stands_on_is_its_own():
 def test_a_goal_whose_spot_was_taken_back_gives_its_name_back():
     io = _robots_io()
     io._io = Mock(spec=["forget"])
-    io._robots.admit("alpha", MODELS.of("openarm_v2").entry, CALLER, 0.0)
+    io._robots.admit("alpha", MODELS.of("openarm_v2").entry, CALLER)
     goal = _Goal(_request())
 
     asyncio.run(io._stay(goal))

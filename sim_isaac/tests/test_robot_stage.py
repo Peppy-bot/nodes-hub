@@ -17,6 +17,7 @@ import sys
 import threading
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Optional
 from unittest.mock import Mock
 
 import pytest
@@ -258,7 +259,7 @@ def test_a_robot_that_leaves_while_the_stage_stands_it_is_stood_first():
     assert stood is True
     assert goal.answers == []
     assert goal.feedback == [], "the stay tells the holder, once, that it stands"
-    io._robots.stand.assert_called_once_with("alpha", 0.0)
+    io._robots.stand.assert_called_once_with("alpha")
     io._robots.release.assert_not_called()
 
 
@@ -366,15 +367,18 @@ def _caller(robot: str) -> Caller:
     return Caller(core_node="sim16", instance_id=f"{robot}_init_inst")
 
 
-def _leasing(now_s: float, fleet: dict) -> RobotsIO:
+def _leasing(now_s: float, fleet: dict, reached_s: Optional[float] = 0.0) -> RobotsIO:
     """A RobotsIO whose robots, each given as name: (model, what it holds),
-    last renewed their leases at 0 s, read at `now_s` with the lease this
-    scene gives."""
+    are read at `now_s` with the lease this scene gives. Their leases run
+    from `reached_s`, when a limb first reached each, and not at all when
+    that is None."""
     io = RobotsIO.__new__(RobotsIO)
     io._models = MODELS
     io._robots = Registry()
     for name, (model, _held) in fleet.items():
-        io._robots.admit(name, MODELS.of(model).entry, _caller(name), 0.0)
+        io._robots.admit(name, MODELS.of(model).entry, _caller(name))
+        if reached_s is not None:
+            io._robots.note_limbs_reached(name, reached_s)
     io._loop = SimpleNamespace(time=lambda: now_s)
     io._io = _Pairs({name: held for name, (_model, held) in fleet.items()})
     io._lease_s = LEASE_S
@@ -452,7 +456,7 @@ def test_a_robot_that_stood_is_recorded_as_standing():
         return await standing
 
     assert asyncio.run(stand_and_drain()) is True
-    io._robots.stand.assert_called_once_with("alpha", 0.0)
+    io._robots.stand.assert_called_once_with("alpha")
 
 
 def test_a_stopping_engine_ends_every_stay_and_every_loop():
@@ -695,7 +699,7 @@ class TestReadiness:
     def _standing(self, fleet: dict) -> RobotsIO:
         io = _leasing(now_s=1.0, fleet=fleet)
         for name in fleet:
-            io._robots.stand(name, now_s=1.0)
+            io._robots.stand(name)
         return io
 
     def test_a_robot_holding_every_limb_of_its_model_is_ready(self):
