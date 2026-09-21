@@ -14,6 +14,7 @@ kinematics module.
 |---|---|
 | `so101_follower` | The real arm. Pure follower: `joint_link` + `gripper_link` follower slots on one node (one process must own the serial port), `component_ready`, `motor_health`, `alert`. No motion logic. |
 | `so101_leader` | The passive leader arm as a teleop device. Open-loop `joint_link` + `gripper_link` leader; staleness is the deadman (the hardware has no engage button). |
+| [`robot_initializer`](../robot_initializer) | The node every robot uses, run with `model: "so101"`: answers who the robot is on `get_identity` and whether it is ready on `is_ready`, from the follower's readiness on hardware and from the simulation standing it in a simulation, which it joins as the `so101` model. |
 | `so101_backbone` | The motion authority in between. Follower role toward whatever leads (joint, pose, or gripper streams), leader role toward the follower; exposes the `limb_motion` and `postures` move actions and the `limb_state` readout. A joints-led stream passes through under the end-effector-speed governor, its only limiter; a pose-led stream is reach-clipped, solved, and rate-stepped per joint before that same governor. Move actions run minimum-jerk plans sized by the per-joint velocity caps, and Cartesian moves additionally by the EE speed caps. Everything gates on fresh follower state. |
 
 ```text
@@ -21,6 +22,16 @@ so101_leader ──joint+gripper──▶ so101_backbone ──joint+gripper─�
 xr_commander ──pose+gripper──▶ (same backbone, upstream_mode="pose")
 lerobot_recorder observes the follower pairings and the backbone's leader slots
 ```
+
+The backbone's two downstream links carry its limbs' names, `arm` and
+`gripper`, the names it answers to in `limb_motion` and `limb_state`. In a
+simulation there is no follower node: the engine plays the follower role, the
+same backbone leads `simulation_inst/arms` and `simulation_inst/grippers`
+through those links, and the link a pair comes from is how the engine knows
+which limb it drives. [`sim_mujoco`](../sim_mujoco), [`sim_isaac`](../sim_isaac)
+and Waldo all stand the `so101` model, with its `front` camera. The backbone
+does not wait on `robot_ready`: it holds still while its limbs report
+nothing, which is what a robot not yet admitted looks like.
 
 There is no gravity or friction compensation anywhere in this family, by
 design rather than omission: the STS3215 has no torque or current control
@@ -160,9 +171,9 @@ The follower and leader adapters are identical USB serial bridges. Install
 ## Shared libraries
 
 Two libs in the
-[public-peppy-libs](https://github.com/Peppy-bot/peppy/tree/dev/public-peppy-libs)
-tree of the `peppy` repository, consumed as uv git dependencies exactly like
-the Rust nodes consume `control_core`:
+[public-peppy-libs](https://github.com/Peppy-bot/public-peppy-libs)
+repository, consumed as uv git dependencies exactly like the Rust nodes
+consume `control_core`:
 
 - `control_core_py`: generic Python node plumbing (asyncio stream helpers,
   parameter validators, the hardware device-thread skeleton). Nothing

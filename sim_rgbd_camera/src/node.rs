@@ -1,8 +1,8 @@
 // The relay loops and their assembly: frames forward to the contract
 // surface, the stream descriptions feed the info services, the camera
 // geometry feeds the geometry services, the colour controls and the profile
-// forward to the simulation's camera response model under the camera slot
-// this relay views, and `setup` wires them together.
+// forward to the simulation's camera response model under the camera's name,
+// which is this relay's name in its copy, and `setup` wires them together.
 
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -59,11 +59,6 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 /// behind the controls to adjust, describe or reset.
 const NO_RESPONSE_MODEL_MESSAGE: &str =
     "no camera response model is linked: nothing to adjust, describe or reset";
-
-/// The refusal every control and profile call answers while the simulation
-/// pairing is not established: the camera slot a forwarded request must name
-/// is the pairing peer's link id, and there is no peer yet.
-const NOT_PAIRED_MESSAGE: &str = "not paired to its simulation camera yet";
 
 /// current_value in a refused control response: the no-value sentinel uvc and
 /// zed answer when no usable hardware value exists.
@@ -292,19 +287,28 @@ impl RepeatedError {
 /// gets for why the call never reached a model.
 type Forwarded<T> = std::result::Result<T, String>;
 
-/// The camera slot this relay views, as the simulation names it: the link id
-/// of the peer slot on the simulation pairing. The simulation renders each
-/// robot's camera on a pair of that slot and its response model keys every
-/// control on the slot and the pair the caller holds, so the pairing is the
-/// camera's whole identity and the relay carries no id of its own: its
-/// requests name no robot. The colour and depth streams share the one
-/// pairing, so either topic's pin names the same peer.
-fn camera_slot(runner: &NodeRunner) -> Forwarded<String> {
-    match simulation_video::paired(runner) {
-        Ok(Some(peer)) => Ok(peer.peer_link_id),
-        Ok(None) => Err(NOT_PAIRED_MESSAGE.to_string()),
-        Err(e) => Err(format!("simulation pairing state unavailable: {e}")),
-    }
+/// The camera this relay is, as the simulation names it: the relay's name
+/// in its copy. A launch mints a copy's instance ids as `<copy>_<id>`, so
+/// relay `alpha_wrist_left` of copy `alpha` is camera `wrist_left`, and a
+/// relay launched outside a copy runs under the id the launcher wrote, which
+/// is the camera's name as it is. The simulation's slot holds a pair per
+/// camera of its kind, so the slot says nothing of which camera a pair is;
+/// the relay's requests name no robot, which the simulation tells by the
+/// pair the relay holds.
+fn camera_name(copy: Option<&str>, instance_id: &str) -> Forwarded<String> {
+    let Some(copy) = copy else {
+        return Ok(instance_id.to_owned());
+    };
+    instance_id
+        .strip_prefix(copy)
+        .and_then(|rest| rest.strip_prefix('_'))
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            format!(
+                "this relay names no camera: its instance id {instance_id:?} is not `{copy}_` followed by the camera's name in copy {copy:?}"
+            )
+        })
 }
 
 /// Runs a forwarded poll to completion from inside a synchronous service
@@ -322,6 +326,9 @@ fn wait_for<T>(future: impl Future<Output = T>) -> T {
 /// shared by every forwarding service task.
 struct ControlRoute {
     runner: Arc<NodeRunner>,
+    /// The camera every forwarded request names, worked out once: the copy
+    /// and the instance id are fixed for the life of the node.
+    camera: Forwarded<String>,
     /// Whether the last forwarded call failed in transport. The first failure
     /// is logged and the rest are suppressed until a call goes through: a
     /// caller retrying against a simulation that is gone would otherwise
@@ -331,19 +338,23 @@ struct ControlRoute {
 
 impl ControlRoute {
     fn new(runner: Arc<NodeRunner>) -> Self {
+        let camera = camera_name(runner.copy(), runner.processor().bound_instance_id());
         Self {
             runner,
+            camera,
             transport_failing: AtomicBool::new(false),
         }
     }
 
     /// Forwards one call. `bound` is the control slot's producer, `call`
-    /// polls the response model for the camera slot on it, and the model's
-    /// answer relays verbatim. Every way the call cannot reach the model is
-    /// an `Err` carrying the caller's message: the vacant slot first, since
-    /// the binding is fixed for the life of the node and no pairing changes
-    /// it; then the pairing, which is the transient condition; then the
-    /// transport.
+    /// polls the response model for this relay's camera on it, and the
+    /// model's answer relays verbatim. Every way the call cannot reach the
+    /// model is an `Err` carrying the caller's message: the vacant slot
+    /// first, then a relay whose id names no camera, both fixed for the life
+    /// of the node; then the transport. The pairing is no condition here:
+    /// the model tells the relay's robot by the pair the relay holds, so a
+    /// relay holding none gets the model's own refusal, relayed like any
+    /// other answer.
     fn forward<T, Fut>(
         &self,
         bound: Option<&ProducerRef>,
@@ -355,7 +366,7 @@ impl ControlRoute {
         let Some(target) = bound else {
             return Err(NO_RESPONSE_MODEL_MESSAGE.to_string());
         };
-        let camera = camera_slot(&self.runner)?;
+        let camera = self.camera.clone()?;
         match wait_for(call(camera, target.clone())) {
             Ok(answer) => {
                 self.transport_failing.store(false, Ordering::SeqCst);
@@ -617,7 +628,7 @@ macro_rules! spawn_forwarding_service {
 }
 
 /// One colour control forwarded to its response-model twin: the request's
-/// fields go through under the camera slot's name and the model's answer
+/// fields go through under the camera's name and the model's answer
 /// relays verbatim, success or not; a call that never reached the model
 /// answers false and the reason. `$reading` names the response's reading
 /// field beside the fallback a refusal carries in it: a temperature for
@@ -658,6 +669,10 @@ pub async fn setup(_params: Parameters, node_runner: Arc<NodeRunner>) -> Result<
     let description: SharedDescription = Arc::new(Mutex::new(StreamDescription::default()));
     let geometry: SharedGeometry = Arc::new(Mutex::new(None));
     let route = Arc::new(ControlRoute::new(node_runner.clone()));
+    match &route.camera {
+        Ok(camera) => info!("this relay is camera '{camera}'"),
+        Err(unnamed) => warn!("every forwarded call refuses: {unnamed}"),
+    }
     if describe_camera::bound_producer(&node_runner).is_some() {
         info!("camera response model linked: colour controls forward to the simulation");
     } else {
@@ -769,6 +784,42 @@ pub async fn setup(_params: Parameters, node_runner: Arc<NodeRunner>) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_relay_in_a_copy_is_the_camera_its_id_names_after_the_copy() {
+        assert_eq!(
+            camera_name(Some("alpha"), "alpha_wrist_left"),
+            Ok("wrist_left".to_owned())
+        );
+        // Only the copy's own prefix comes off: a camera may carry the
+        // copy's name in its own.
+        assert_eq!(
+            camera_name(Some("alpha"), "alpha_alpha_front"),
+            Ok("alpha_front".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_relay_outside_a_copy_is_the_camera_its_id_names() {
+        assert_eq!(camera_name(None, "wrist_left"), Ok("wrist_left".to_owned()));
+        assert_eq!(
+            camera_name(None, "alpha_wrist_left"),
+            Ok("alpha_wrist_left".to_owned())
+        );
+    }
+
+    #[test]
+    fn an_id_that_is_no_name_in_its_copy_names_no_camera() {
+        // Another copy's prefix, the copy's name run into the camera's, the
+        // copy's name alone, and the bare prefix.
+        for instance_id in ["bravo_wrist_left", "alphawrist_left", "alpha", "alpha_"] {
+            let unnamed = camera_name(Some("alpha"), instance_id).unwrap_err();
+            assert!(
+                unnamed.contains("names no camera") && unnamed.contains(instance_id),
+                "{unnamed}"
+            );
+        }
+    }
 
     #[test]
     fn timestamp_guard_rejects_epoch_and_earlier() {

@@ -9,10 +9,9 @@
 //! the pinhole model of each stream and the depth stream's pose against the
 //! colour one, relayed as it came; until the first arrives they refuse.
 //! The colour controls, the profile and the reset forward to the simulation's
-//! camera response model on the optional control slot, named by the camera
-//! slot this relay views (the pairing peer's link id), and answer what the
-//! model answers; with the slot vacant, or while the pairing is not
-//! established, every one of them refuses.
+//! camera response model on the optional control slot, named by this relay's
+//! name in its copy (its instance id without the copy's prefix), and answer
+//! what the model answers; with the slot vacant every one of them refuses.
 
 #![forbid(unsafe_code)]
 

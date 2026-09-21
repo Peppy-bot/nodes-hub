@@ -16,7 +16,7 @@ use peppygen::fixtures::exposed_services::profile::{get_camera_profile, reset_ca
 use peppygen::fixtures::harness::{Config, Harness};
 use peppygen::mock::deps::control as control_mock;
 use peppygen::mock::pairings::simulation::{
-    self as simulation_mock, depth_stream as simulation_depth, geometry as simulation_geometry,
+    depth_stream as simulation_depth, geometry as simulation_geometry,
     stream_info as simulation_info, video_stream as simulation_video,
 };
 use peppygen::paired_topics::simulation::{
@@ -26,6 +26,11 @@ use peppygen::paired_topics::simulation::{
 /// Bounds every poll and every wait for a relayed frame. Generous: the
 /// assertions are about what arrives, never about how fast.
 const TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The id the forwarding test runs the relay under. The harness runs a node
+/// outside any copy, so the id is the camera's name as it is; a copy's prefix
+/// coming off is covered by the node's own tests.
+const CAMERA: &str = "wrist_left";
 
 /// A refused control answers with the no-value sentinel rather than inventing
 /// a reading, matching what the uvc and zed nodes answer.
@@ -442,12 +447,16 @@ async fn every_control_refuses_without_a_response_model() -> peppygen::Result<()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn every_control_forwards_to_the_response_model_under_the_camera_slot() -> peppygen::Result<()>
+async fn every_control_forwards_to_the_response_model_under_the_camera_name() -> peppygen::Result<()>
 {
-    // The default boot binds the control slot to the mock model and seeds
-    // the simulation pairing, so `paired()` names the mock peer's slot from
-    // the first request on.
-    let (harness, mocks) = Harness::start(sim_rgbd_camera::setup).await?;
+    // The default boot binds the control slot to the mock model, and the
+    // relay runs under the camera's name, which is all a request's `camera`
+    // comes from: the slot the relay views says nothing of it.
+    let config = Config {
+        instance_id: Some(CAMERA.to_string()),
+        ..Default::default()
+    };
+    let (harness, mocks) = Harness::start_with(config, sim_rgbd_camera::setup).await?;
     let control = mocks
         .deps
         .control
@@ -455,7 +464,7 @@ async fn every_control_forwards_to_the_response_model_under_the_camera_slot() ->
         .expect("the default boot binds the control slot");
 
     // Each colour control goes to its twin on the model with the request's
-    // own fields under the camera slot's name, and the model's answer comes
+    // own fields under the camera's name, and the model's answer comes
     // back verbatim: a relay that rewrote the message or the reading would
     // hide what the device model decided. The scripted answers are served by
     // the mock as the requests arrive, and every request is captured before
@@ -472,7 +481,7 @@ async fn every_control_forwards_to_the_response_model_under_the_camera_slot() ->
             assert_eq!(response.$reading, $answer.$reading);
             let captured = control.$twin.captured()?;
             assert_eq!(captured.len(), 1, stringify!($twin));
-            assert_eq!(captured[0].camera, simulation_mock::PEER_LINK_ID);
+            assert_eq!(captured[0].camera, CAMERA);
             // The relay names no robot: the simulation tells its robot by
             // the pair the relay holds.
             assert_eq!(captured[0].robot, "");
@@ -556,7 +565,7 @@ async fn every_control_forwards_to_the_response_model_under_the_camera_slot() ->
     assert_eq!(profile.profile_json, PROFILE_JSON);
     let described = control.describe_camera.captured()?;
     assert_eq!(described.len(), 1);
-    assert_eq!(described[0].camera, simulation_mock::PEER_LINK_ID);
+    assert_eq!(described[0].camera, CAMERA);
 
     control
         .reset_camera
@@ -569,7 +578,7 @@ async fn every_control_forwards_to_the_response_model_under_the_camera_slot() ->
     assert_eq!(reset.message, "defaults restored");
     let resets = control.reset_camera.captured()?;
     assert_eq!(resets.len(), 1);
-    assert_eq!(resets[0].camera, simulation_mock::PEER_LINK_ID);
+    assert_eq!(resets[0].camera, CAMERA);
 
     harness.shutdown().await
 }
@@ -627,7 +636,7 @@ async fn a_response_model_failure_answers_a_refusal_with_the_error() -> peppygen
         ),
         async {
             let (request, responder) = control.set_camera_contrast.next_request(TIMEOUT).await?;
-            assert_eq!(request.camera, simulation_mock::PEER_LINK_ID);
+            assert_eq!(request.camera, harness.instance_id());
             responder.respond_error("device model crashed").await
         }
     );
