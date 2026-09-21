@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -68,22 +69,14 @@ _HEARTBEAT_TIMEOUT_S = 5.0
 
 
 def add_cameras(spec, known, xml_path: Path) -> None:
-    """Add to the scene's spec one camera per camera of the model's entry, an
-    offscreen buffer large enough for the widest stream, and the camera light
-    rig where the model's entry asks for one.
+    """Add to one model's spec a camera per camera of its entry, on the body
+    its entry hangs it from. The robot is attached into the scene under its
+    own prefix, so these are the cameras of that robot alone.
 
     The baked MJCF is never modified: the cameras go on an mjSpec parsed from
     it, so a camera-less launch compiles the scene without them.
     """
     cameras = list(known.entry.cameras)
-    # Offscreen framebuffer must cover every render size, color and depth; the
-    # scene's own values stand if they are already larger.
-    global_ = spec.visual.global_
-    # Depth never exceeds color: the config parser rejects a depth grid that is
-    # not an integer decimation of it.
-    global_.offwidth = max([global_.offwidth, *(c.width for c in cameras)])
-    global_.offheight = max([global_.offheight, *(c.height for c in cameras)])
-
     taken = {camera.name for camera in spec.cameras}
     for camera in cameras:
         if camera.name in taken:
@@ -97,17 +90,28 @@ def add_cameras(spec, known, xml_path: Path) -> None:
         mjcf_camera.quat = list(camera.quat_wxyz)
         mjcf_camera.fovy = camera.fovy_deg
 
-    if known.camera_lights:
-        _add_light_rig(spec)
-
     logger.info(
-        "Scene carries cameras: "
+        f"{known.model} carries cameras: "
         + ", ".join(f"{c.name}@{c.parent_link}" for c in cameras)
-        + f"; offscreen buffer {global_.offwidth}x{global_.offheight}"
     )
 
 
-def _add_light_rig(spec) -> None:
+def widen_offscreen(spec, cameras) -> None:
+    """Widen the scene's offscreen framebuffer to cover every render size it
+    holds, colour and depth. The scene's own values stand where they are
+    already larger, and a scene rendering nothing keeps them."""
+    sizes = list(cameras)
+    if not sizes:
+        return
+    global_ = spec.visual.global_
+    # Depth never exceeds color: the config parser rejects a depth grid that is
+    # not an integer decimation of it.
+    global_.offwidth = max([global_.offwidth, *(camera.width for camera in sizes)])
+    global_.offheight = max([global_.offheight, *(camera.height for camera in sizes)])
+    logger.info(f"offscreen buffer {global_.offwidth}x{global_.offheight}")
+
+
+def add_light_rig(spec) -> None:
     import mujoco  # pylint: disable=C0415
 
     headlight = spec.visual.headlight
@@ -167,16 +171,33 @@ class _PoseSnapshot:
             return self._timestamp_s
 
 
-class _CameraStream:
-    """One camera's schedules and identity: when its next frame and next
-    description are due, its capture counter, and when it last put a frame on
-    the wire."""
+@dataclass(frozen=True)
+class Rig:
+    """The cameras one standing robot renders: the robot they publish for,
+    and the prefix its names carry in the composed scene."""
 
-    def __init__(self, config: CameraConfig) -> None:
+    robot: str
+    prefix: str
+    cameras: tuple[CameraConfig, ...]
+
+
+class _CameraStream:
+    """One camera's schedules and identity: the robot it renders for and the
+    camera it is in the scene, when its next frame and next description are
+    due, its capture counter, and when it last put a frame on the wire."""
+
+    def __init__(
+        self, config: CameraConfig, robot: str, scene_name: str, frame_ids=None
+    ) -> None:
         self.config = config
+        # The robot whose camera pair carries these frames.
+        self.robot = robot
+        # What this camera is called in the composed scene, which is the
+        # robot's prefix and the camera's own name.
+        self.scene_name = scene_name
         self.frames = FramePacer(config.fps)
         self.info = FramePacer(_STREAM_INFO_HZ)
-        self.frame_ids = FrameIdCounter()
+        self.frame_ids = frame_ids or FrameIdCounter()
         self.last_delivery_s: Optional[float] = None
 
     def gap_s(self, now: float) -> Optional[float]:
@@ -208,19 +229,35 @@ class MujocoCameraSensor:
     construction with no resampling.
     """
 
-    def __init__(self, model, cameras: list[CameraConfig], io, robot: str) -> None:
+    def __init__(self, model, rigs: "list[Rig]", io, counters=None) -> None:
         self._model = model
-        self._streams = {camera.name: _CameraStream(camera) for camera in cameras}
+        # Every camera of every robot standing, keyed by the robot it belongs
+        # to and the camera it is: two robots of one model carry the same
+        # camera names, and each publishes on its own pair. A camera that was
+        # already streaming keeps counting its frames from where it was, so
+        # what a consumer pairs a frame by runs on across a scene composed
+        # again around it.
+        kept = counters or {}
+        self._streams = {
+            (rig.robot, camera.name): _CameraStream(
+                camera,
+                rig.robot,
+                f"{rig.prefix}{camera.name}",
+                kept.get((rig.robot, camera.name)),
+            )
+            for rig in rigs
+            for camera in rig.cameras
+        }
         self._io = io
-        # The robot this rig is mounted on: every frame it publishes goes to
-        # that robot's own camera pair.
-        self._robot = robot
         self._pose = _PoseSnapshot(model.nq)
         self._late_deliveries = 0
         self._worst_late: Optional[tuple[float, str]] = None
         self._next_late_report_s: Optional[float] = None
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        # Whether a render thread is still running after its stop gave up
+        # waiting for it, which is what the frame counters may not outlive.
+        self._outlived_its_stop = False
         self._failure: Optional[Exception] = None
         self._heartbeat_s: Optional[float] = None
 
@@ -235,10 +272,19 @@ class MujocoCameraSensor:
         logger.info(
             "MujocoCameraSensor started: "
             + ", ".join(
-                f"{s.config.name} {s.config.width}x{s.config.height}@{s.config.fps}"
+                f"{s.robot}/{s.config.name} {s.config.width}x{s.config.height}@{s.config.fps}"
                 for s in self._streams.values()
             )
         )
+
+    def counters(self) -> dict:
+        """Each camera's frame counter, for the scene composed next. A render
+        thread that outlived its stop is still counting on these, so a scene
+        it may still be rendering hands none of them on and the cameras of
+        the next one count from zero."""
+        if self._outlived_its_stop:
+            return {}
+        return {key: stream.frame_ids for key, stream in self._streams.items()}
 
     def snapshot(self, qpos: np.ndarray) -> None:
         """Publish the just-stepped pose, and the time it holds for, to the
@@ -269,6 +315,7 @@ class MujocoCameraSensor:
             return
         self._thread.join(timeout=_JOIN_TIMEOUT_S)
         if self._thread.is_alive():
+            self._outlived_its_stop = True
             logger.warning("camera render thread did not exit within the join timeout")
         self._thread = None
         # A stopped thread stops beating on purpose. Leaving the last beat in
@@ -339,8 +386,8 @@ class MujocoCameraSensor:
         self._report_late_deliveries(now)
         for stream in self._streams.values():
             if stream.info.take_if_due(now):
-                self._publish_stream_info(stream.config)
-                self._publish_geometry(stream.config)
+                self._publish_stream_info(stream)
+                self._publish_geometry(stream)
 
         due = [s for s in self._streams.values() if s.frames.take_if_due(now)]
         if not due:
@@ -369,7 +416,7 @@ class MujocoCameraSensor:
             return
         self._late_deliveries += 1
         if self._worst_late is None or gap > self._worst_late[0]:
-            self._worst_late = (gap, stream.config.name)
+            self._worst_late = (gap, f"{stream.robot}/{stream.config.name}")
 
     def _report_late_deliveries(self, now: float) -> None:
         """Aggregate per second: a machine that cannot keep up would otherwise
@@ -407,12 +454,12 @@ class MujocoCameraSensor:
         sees that frame, so it counts against the camera's delivery rate."""
         camera = stream.config
         renderer = color_renderers[(camera.height, camera.width)]
-        renderer.update_scene(data, camera=camera.name)
+        renderer.update_scene(data, camera=stream.scene_name)
         rgb = renderer.render()
         frame_id = stream.frame_ids.next()
         if camera.depth is None:
             return self._io.publish_color_frame(
-                self._robot,
+                stream.robot,
                 camera.name,
                 timestamp_s,
                 frame_id,
@@ -422,10 +469,10 @@ class MujocoCameraSensor:
                 rgb.tobytes(),
             )
         depth_renderer = depth_renderers[(camera.depth.height, camera.depth.width)]
-        depth_renderer.update_scene(data, camera=camera.name)
+        depth_renderer.update_scene(data, camera=stream.scene_name)
         depth_m = depth_renderer.render()
         return self._io.publish_rgbd_frames(
-            self._robot,
+            stream.robot,
             camera.name,
             timestamp_s,
             frame_id,
@@ -439,17 +486,18 @@ class MujocoCameraSensor:
             ),
         )
 
-    def _publish_geometry(self, camera: CameraConfig) -> None:
+    def _publish_geometry(self, stream: _CameraStream) -> None:
         """Where this camera's pixels point, in the camera_geometry contract's
         terms. Depth renders from the
         same camera at the depth stream's own size, so its grid is a pinhole of
         the same field of view, centred like the colour one."""
+        camera = stream.config
         color = pinhole(camera.fovy_deg, camera.width, camera.height)
         if camera.depth is None:
-            self._io.publish_color_geometry(self._robot, camera.name, color)
+            self._io.publish_color_geometry(stream.robot, camera.name, color)
             return
         self._io.publish_rgbd_geometry(
-            self._robot,
+            stream.robot,
             camera.name,
             color,
             pinhole(camera.fovy_deg, camera.depth.width, camera.depth.height),
@@ -461,14 +509,15 @@ class MujocoCameraSensor:
             DEPTH_TO_COLOR_ORIENTATION,
         )
 
-    def _publish_stream_info(self, camera: CameraConfig) -> None:
+    def _publish_stream_info(self, stream: _CameraStream) -> None:
+        camera = stream.config
         if camera.depth is None:
             self._io.publish_color_stream_info(
-                self._robot, camera.name, camera.width, camera.height, camera.fps, COLOR_ENCODING
+                stream.robot, camera.name, camera.width, camera.height, camera.fps, COLOR_ENCODING
             )
             return
         self._io.publish_rgbd_stream_info(
-            self._robot,
+            stream.robot,
             camera.name,
             camera.width,
             camera.height,

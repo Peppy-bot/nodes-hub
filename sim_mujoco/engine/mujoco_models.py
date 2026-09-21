@@ -33,9 +33,11 @@ _ENTRY_KEYS = frozenset(
         "arm_gains",
         "gravity_compensation",
         "camera_lights",
+        "floor",
         "head_camera",
         "joint_ranges",
         "site_poses",
+        "solver",
     }
 )
 _GAIN_KEYS = frozenset({"kp", "kd"})
@@ -64,8 +66,8 @@ class MujocoModel:
     """One model this engine stands."""
 
     entry: ModelEntry
-    # The robot's MJCF, relative to the baked assets. It is the whole world
-    # the robot stands in.
+    # The robot's MJCF, relative to the baked assets. It brings the robot;
+    # the scene it is attached into is composed from every model standing.
     scene: str
     # URDF links the MJCF compiler folds into the world body, so whatever
     # hangs from one hangs from the world.
@@ -78,11 +80,17 @@ class MujocoModel:
     # Whether rendering adds the engine's light rig, for a scene that ships
     # no light of its own.
     camera_lights: bool
+    # Whether the robot works against a floor, which the scene lays once for
+    # every robot standing that asks for one.
+    floor: bool
     # Whether the robot draws the OpenArm v2 head camera pack.
     head_camera: bool
     # Where the file is corrected to the robot's description.
     joint_ranges: dict
     site_poses: dict
+    # The solver settings the model stands under, read from the entry's
+    # `<option>` element. None leaves the ones its file asks for.
+    solver: object = None
 
     @property
     def model(self) -> str:
@@ -220,10 +228,64 @@ def parse(known: EngineModel) -> MujocoModel:
         arm_gains=_arm_gains(model, entry, raw.get("arm_gains")),
         gravity_compensation=_flag(model, raw, "gravity_compensation"),
         camera_lights=_flag(model, raw, "camera_lights"),
+        floor=_flag(model, raw, "floor"),
         head_camera=_flag(model, raw, "head_camera"),
         joint_ranges=_joint_ranges(model, entry, raw.get("joint_ranges", {})),
         site_poses=_site_poses(model, raw.get("site_poses", {})),
+        solver=_solver(model, raw.get("solver")),
     )
+
+
+def _solver(model: str, raw):
+    """The solver settings a model stands under, from the one MJCF
+    `<option>` element its entry names. What the scene steps is read here,
+    where every entry is read, so a model whose settings a scene cannot take
+    is answered for with the file that names them and not by the first robot
+    to attach as it.
+
+    The element replaces the settings the model's own file asks for, so it
+    is held to being exactly that: one `<option>`, with attributes MuJoCo
+    takes, stepping a timestep a scene can pace on."""
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise _fail(model, f"solver must be an MJCF `<option>` element, got {raw!r}")
+    import xml.etree.ElementTree as ElementTree  # pylint: disable=C0415
+
+    import mujoco  # pylint: disable=C0415,E0401
+
+    try:
+        element = ElementTree.fromstring(raw)
+    except ElementTree.ParseError as error:
+        raise _fail(model, f"solver is no MJCF `<option>` element: {error}") from error
+    if element.tag != "option":
+        raise _fail(model, f"solver is one MJCF `<option>` element, and this is <{element.tag}>")
+    try:
+        option = mujoco.MjSpec.from_string(f"<mujoco>{raw}<worldbody/></mujoco>").option
+    except Exception as error:  # pylint: disable=W0718
+        raise _fail(model, f"solver is no MJCF `<option>` element: {error}") from error
+    for setting, value in _unsettled(option):
+        raise _fail(model, f"solver is finite in every setting, and {setting} is {value}")
+    if option.timestep <= 0.0:
+        raise _fail(model, f"solver steps a timestep above zero, got {option.timestep:g}")
+    return option
+
+
+def _unsettled(option):
+    """The settings of an `<option>` that are not finite numbers. A scene
+    steps every one of them, and a NaN among them steps every robot standing
+    in it to NaN and publishes that."""
+    import numpy as np  # pylint: disable=C0415
+
+    for setting in dir(option):
+        if setting.startswith("_"):
+            continue
+        value = getattr(option, setting)
+        if callable(value):
+            continue
+        numbers = np.asarray(value)
+        if numbers.dtype.kind in "fc" and not np.all(np.isfinite(numbers)):
+            yield setting, value
 
 
 class MujocoModels:

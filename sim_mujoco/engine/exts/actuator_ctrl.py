@@ -5,6 +5,22 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def home_inertia(model) -> "list[float]":
+    """Each dof's inertia at the scene's home configuration: the diagonal of
+    the mass matrix at qpos0, which every robot standing in the scene shares
+    however it is posed. A robot carried onto a scene composed around a robot
+    that joined keeps the gains it was tuned with, and the scene builds this
+    once for all of them."""
+    import mujoco  # pylint: disable=E0401
+    import numpy as np
+
+    home = mujoco.MjData(model)
+    mujoco.mj_forward(model, home)
+    full_m = np.zeros((model.nv, model.nv))
+    mujoco.mj_fullM(model, home, full_m)
+    return [float(full_m[dof, dof]) for dof in range(model.nv)]
+
+
 class MujocoActuatorCtrl:
     """Resolves MJCF actuator names to ctrl indices and writes targets into
     data.ctrl[]. Used by ActuatorCtrlBridge to translate raw set_ctrl messages
@@ -25,11 +41,11 @@ class MujocoActuatorCtrl:
         self._kd_over_kp: dict[str, float] = {}
         self._ready: bool = False
 
-    def setup(self) -> bool:
+    def setup(self, inertia: "list[float]") -> bool:
         """Build the name → ctrl-id map. Indexes by both actuator name and the
         joint name the actuator drives: the joint-name alias is the cross-engine
         canonical key (matches Isaac dof_names), so components ship one payload
-        for both engines.
+        for both engines. `inertia` is the scene's own, from `home_inertia`.
         """
         try:
             import mujoco  # pylint: disable=E0401
@@ -57,7 +73,7 @@ class MujocoActuatorCtrl:
                     joint_aliases += 1
             self._name_to_id = name_to_id
             self._default_forcerange = self._model.actuator_forcerange.copy()
-            self._apply_gains()
+            self._apply_gains(inertia)
             self._ready = True
         except Exception:
             logger.exception("Failed to setup MujocoActuatorCtrl")
@@ -70,15 +86,12 @@ class MujocoActuatorCtrl:
         )
         return True
 
-    def _apply_gains(self) -> None:
+    def _apply_gains(self, inertia: "list[float]") -> None:
         """Overwrite actuator gain/bias from config so the sim servo runs the
         real driver's MIT gains. Position actuator torque is
         gainprm[0]*ctrl + biasprm[1]*q + biasprm[2]*dq, so kp/kd map to
         (kp, -kp, -kd). Joints without configured gains keep the MJCF values.
         """
-        import mujoco  # pylint: disable=E0401
-        import numpy as np
-
         joint_names = self._params.get("joint_names") or []
         kps = self._params.get("kp") or []
         kds = self._params.get("kd") or []
@@ -89,14 +102,11 @@ class MujocoActuatorCtrl:
                 f"gain config mismatch: {len(joint_names)} joint_names, "
                 f"{len(kps)} kp, {len(kds)} kd"
             )
-        # Per-dof inertia from the sim's own mass matrix (home config). The
-        # real gearbox/motor adds damping the sim plant lacks; without it the
-        # real driver's gains ring badly (~0.14 damping ratio). Raise the
-        # servo damping to critical: the dq_des feedforward cancels it along
-        # the trajectory, so tracking is unaffected while deviations damp.
-        mujoco.mj_forward(self._model, self._data)
-        full_m = np.zeros((self._model.nv, self._model.nv))
-        mujoco.mj_fullM(self._model, self._data, full_m)
+        # The real gearbox and motor add damping the sim plant lacks; without
+        # it the real driver's gains ring badly (~0.14 damping ratio). Raise
+        # the servo damping to critical: the dq_des feedforward cancels it
+        # along the trajectory, so tracking is unaffected while deviations
+        # damp.
         for name, kp, kd in zip(joint_names, kps, kds):
             ctrl_id = self._name_to_id.get(name)
             if ctrl_id is None:
@@ -104,8 +114,7 @@ class MujocoActuatorCtrl:
                 continue
             jid = int(self._model.actuator_trnid[ctrl_id, 0])
             dof = int(self._model.jnt_dofadr[jid])
-            inertia = float(full_m[dof, dof])
-            kv = max(float(kd), 2.0 * (float(kp) * inertia) ** 0.5)
+            kv = max(float(kd), 2.0 * (float(kp) * inertia[dof]) ** 0.5)
             self._model.actuator_gainprm[ctrl_id][0] = float(kp)
             self._model.actuator_biasprm[ctrl_id][1] = -float(kp)
             self._model.actuator_biasprm[ctrl_id][2] = -kv

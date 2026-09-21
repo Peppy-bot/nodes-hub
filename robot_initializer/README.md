@@ -17,14 +17,13 @@ naming the ones it does. The goal stays open for as long as the robot is in
 the scene,
 and shutting the node down takes the robot out, within peppy's shutdown
 grace. A `placement` names where the robot's base stands; the default lets
-the engine choose a free spot, which is what MuJoCo, whose scene places its
-one robot, takes.
+the engine choose a free spot on the lattice it parks robots on.
 
 The robot's limbs reach the engine through the backbone's pairings, one pair
 per limb on the engine's slots, and the engine tells one robot's limbs from
 another's by the copy each pair belongs to, which is the name this node
-attached under. Isaac Sim and Waldo stand as many robots as their machines
-can run; MuJoCo stands one.
+attached under. Every simulation stands as many robots as its machine
+can run.
 
 A robot that drives its own hardware leaves the `simulation` slot vacant; its
 `model` is identity only, the one `get_identity` answers.
@@ -95,10 +94,12 @@ info <node>:v1` per limb node) or the simulation's.
 
 **the node stops right after it starts, saying the simulation refused it**
 The engine refused to stand this robot, and its reason is in the message: a
-model its catalogue does not carry, a placement another robot occupies, or
-a name that already stands. `peppy stack list` reports the instance failed.
-Fix the robot's `model` or its `placement`, or make room in the world, then
-`peppy stack join` the copy again.
+model its catalogue does not carry, a name that already stands, a name
+carrying a `/`, a placement within reach of a robot standing or of one
+admitted and still on its way in, or a simulation with no spot left in it.
+`peppy stack list` reports the instance failed. Fix the robot's `model`, its
+name or its `placement`, or make room in the world, then `peppy stack join`
+the copy again.
 
 **the node stops right after it starts, saying `model` names the robot's model**
 The launcher left `model` empty. Give it the id the simulation's catalogue
