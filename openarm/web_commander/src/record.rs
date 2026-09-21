@@ -55,7 +55,8 @@ async fn run(
     info!(task, "fire record_episode");
 
     // The owner gates spawning on `available`, so the slot has a producer.
-    let Some(target) = record_episode::bound_producers(&runner).first() else {
+    let recorders = record_episode::bound_producers(&runner);
+    let Some(target) = recorders.first() else {
         finalize(&feedback, false, "no recorder bound").await;
         return;
     };
@@ -167,7 +168,8 @@ async fn run(
 /// place) and report the outcome to the owner.
 pub fn spawn_finish(runner: Arc<NodeRunner>, feedback: mpsc::Sender<Feedback>) {
     tokio::spawn(async move {
-        let Some(target) = finish_session::bound_producers(&runner).first() else {
+        let recorders = finish_session::bound_producers(&runner);
+        let Some(target) = recorders.first() else {
             finish_done(&feedback, "no recorder bound".to_string()).await;
             return;
         };
