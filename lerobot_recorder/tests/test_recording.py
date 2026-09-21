@@ -4,7 +4,14 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from lerobot_recorder.plan import CameraEntry, LinkKind, RecordingPlan, SourceEntry
+from lerobot_recorder.plan import (
+    CameraEntry,
+    LinkKind,
+    PairingEnd,
+    RecordingPlan,
+    SourceEntry,
+    SourceKey,
+)
 from lerobot_recorder.recording import (
     GRIPPER_LAYOUT,
     MAX_EPISODE_S,
@@ -39,22 +46,23 @@ STALENESS_S = 0.25
 CORE = "cn"
 
 
+def key(instance_id: str, link_id: str = "link", peer: PairingEnd | None = None) -> SourceKey:
+    """A source on `CORE`, named directly unless a peer names its pair."""
+    return SourceKey(source=PairingEnd(CORE, instance_id, link_id), peer=peer)
+
+
 def joint_entry(i=0) -> SourceEntry:
-    return SourceEntry(key=(CORE, f"arm{i}", "link"), kind=LinkKind.JOINT, feature_key=f"arm{i}")
+    return SourceEntry(key=key(f"arm{i}"), kind=LinkKind.JOINT, feature_key=f"arm{i}")
 
 
 def gripper_entry(i=0) -> SourceEntry:
-    return SourceEntry(
-        key=(CORE, f"grip{i}", "link"), kind=LinkKind.GRIPPER, feature_key=f"grip{i}"
-    )
+    return SourceEntry(key=key(f"grip{i}"), kind=LinkKind.GRIPPER, feature_key=f"grip{i}")
 
 
 # The commanded source of a limb sits on its own instance but records under
 # the limb's name, exactly as discovery pairs them.
 def action_entry(i=0) -> SourceEntry:
-    return SourceEntry(
-        key=(CORE, f"commanded_arm{i}", "link"), kind=LinkKind.JOINT, feature_key=f"arm{i}"
-    )
+    return SourceEntry(key=key(f"commanded_arm{i}"), kind=LinkKind.JOINT, feature_key=f"arm{i}")
 
 
 ARM0 = joint_entry().key
@@ -468,7 +476,7 @@ def test_max_episode_cap_stays_within_float32_timestamp_tolerance():
 
 def gripper_action_entry(i=0) -> SourceEntry:
     return SourceEntry(
-        key=(CORE, f"commanded_grip{i}", "link"), kind=LinkKind.GRIPPER, feature_key=f"grip{i}"
+        key=key(f"commanded_grip{i}"), kind=LinkKind.GRIPPER, feature_key=f"grip{i}"
     )
 
 
@@ -519,9 +527,7 @@ def test_action_without_command_or_paired_state_still_refuses():
         state=(joint_entry(),),
         action=(
             action_entry(),
-            SourceEntry(
-                key=(CORE, "commanded_arm9", "link"), kind=LinkKind.JOINT, feature_key="arm9"
-            ),
+            SourceEntry(key=key("commanded_arm9"), kind=LinkKind.JOINT, feature_key="arm9"),
         ),
     )
     cache = Cache.for_plan(plan)

@@ -8,6 +8,8 @@ import pytest
 from lerobot_recorder.plan import (
     BoundSources,
     LinkKind,
+    PairingEnd,
+    SourceKey,
     discover,
     limb_name,
     snapshot_sources,
@@ -16,11 +18,24 @@ from lerobot_recorder.plan import (
 CORE = "cn"
 
 
-def source(instance_id: str, link_id: str = "link"):
+def peer(instance_id: str, link_id: str):
+    """The far end a launcher names a pair by, as the runtime tags it."""
+    return SimpleNamespace(
+        producer=SimpleNamespace(core_node=CORE, instance_id=instance_id),
+        peer_link_id=link_id,
+    )
+
+
+def source(instance_id: str, link_id: str = "link", peer=None):
     return SimpleNamespace(
         producer=SimpleNamespace(core_node=CORE, instance_id=instance_id),
         source_link_id=link_id,
+        peer=peer,
     )
+
+
+def key(instance_id: str, link_id: str = "link", peer: PairingEnd | None = None) -> SourceKey:
+    return SourceKey(source=PairingEnd(CORE, instance_id, link_id), peer=peer)
 
 
 def bind(*, joints=((), ()), grippers=((), ())) -> BoundSources:
@@ -76,25 +91,52 @@ def test_limbs_are_named_after_the_pairing_their_command_travels_on():
     ]
 
 
-def test_a_simulated_robot_records_the_columns_a_physical_one_does():
-    """A simulated robot's four limbs all answer from one simulation instance,
-    each on its own slot; a physical robot's answer from a driver each. Both
-    are commanded on the backbone's four limb links, so both datasets carry
-    the same columns, which is what lets a policy trained on one run on the
-    other."""
-    simulated = discover(bind(
+def simulated_bimanual() -> BoundSources:
+    """The engines' shape: one simulation answers for every limb it stands
+    on a single slot per kind of limb, `arms` and `grippers`, each pair
+    named by the backbone link that opened it."""
+    return bind(
         joints=(
-            [source("simulation_inst", "left_arm"), source("simulation_inst", "right_arm")],
+            [
+                source("simulation_inst", "arms", peer("backbone_inst", "left_arm")),
+                source("simulation_inst", "arms", peer("backbone_inst", "right_arm")),
+            ],
             [source("backbone_inst", "left_arm"), source("backbone_inst", "right_arm")],
         ),
         grippers=(
-            [source("simulation_inst", "left_gripper"), source("simulation_inst", "right_gripper")],
+            [
+                source("simulation_inst", "grippers", peer("backbone_inst", "left_gripper")),
+                source("simulation_inst", "grippers", peer("backbone_inst", "right_gripper")),
+            ],
             [source("backbone_inst", "left_gripper"), source("backbone_inst", "right_gripper")],
         ),
-    ))
+    )
+
+
+def test_a_simulated_robot_records_the_columns_a_physical_one_does():
+    """A simulated robot's four limbs all answer from one simulation instance
+    on one slot per kind; a physical robot's answer from a driver each. Both
+    are commanded on the backbone's four limb links, so both datasets carry
+    the same columns, which is what lets a policy trained on one run on the
+    other."""
+    simulated = discover(simulated_bimanual())
     physical = discover(bimanual())
     assert [e.feature_key for e in simulated.state] == [e.feature_key for e in physical.state]
     assert [e.feature_key for e in simulated.action] == [e.feature_key for e in physical.action]
+
+
+def test_measured_sources_sharing_a_slot_are_told_apart_by_their_pair():
+    """A simulation stands both arms on its one `arms` slot, so the pair's
+    far end, the backbone link it was opened from, is the only thing telling
+    the two measured sources apart; without it both arms would share one
+    cache slot. Each command still falls back to the measured source of its
+    own limb."""
+    plan = discover(simulated_bimanual())
+    left = key("simulation_inst", "arms", PairingEnd(CORE, "backbone_inst", "left_arm"))
+    right = key("simulation_inst", "arms", PairingEnd(CORE, "backbone_inst", "right_arm"))
+    assert [e.key for e in plan.state[:2]] == [left, right]
+    assert plan.action_fallback[key("backbone_inst", "left_arm")] == left
+    assert plan.action_fallback[key("backbone_inst", "right_arm")] == right
 
 
 def test_commanded_sources_sharing_an_instance_stay_distinct():
@@ -102,20 +144,20 @@ def test_commanded_sources_sharing_an_instance_stay_distinct():
     observed link is the only thing telling the two arms apart."""
     plan = discover(bimanual())
     assert [e.key for e in plan.action] == [
-        (CORE, "backbone_inst", "left_arm"),
-        (CORE, "backbone_inst", "right_arm"),
-        (CORE, "backbone_inst", "left_gripper"),
-        (CORE, "backbone_inst", "right_gripper"),
+        key("backbone_inst", "left_arm"),
+        key("backbone_inst", "right_arm"),
+        key("backbone_inst", "left_gripper"),
+        key("backbone_inst", "right_gripper"),
     ]
 
 
 def test_action_falls_back_to_the_measured_source_of_its_own_limb():
     plan = discover(bimanual())
     assert plan.action_fallback == {
-        (CORE, "backbone_inst", "left_arm"): (CORE, "left_arm_inst", "link"),
-        (CORE, "backbone_inst", "right_arm"): (CORE, "right_arm_inst", "link"),
-        (CORE, "backbone_inst", "left_gripper"): (CORE, "left_gripper_inst", "link"),
-        (CORE, "backbone_inst", "right_gripper"): (CORE, "right_gripper_inst", "link"),
+        key("backbone_inst", "left_arm"): key("left_arm_inst"),
+        key("backbone_inst", "right_arm"): key("right_arm_inst"),
+        key("backbone_inst", "left_gripper"): key("left_gripper_inst"),
+        key("backbone_inst", "right_gripper"): key("right_gripper_inst"),
     }
 
 
@@ -139,7 +181,7 @@ def test_copies_keep_separate_dataset_dimensions_and_fallbacks():
         assert [entry.feature_key for entry in plan.state] == ["left_gripper"]
         assert [entry.feature_key for entry in plan.action] == ["left_gripper"]
         assert plan.action_fallback == {
-            (CORE, backbone, "left_gripper"): (CORE, follower, "link"),
+            key(backbone, "left_gripper"): key(follower),
         }
 
 

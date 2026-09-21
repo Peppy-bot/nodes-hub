@@ -142,8 +142,8 @@ def _recorded_links(plan: plan_mod.RecordingPlan) -> dict:
     sources differing only there would collapse into one entry and hide a
     swap between them."""
     links = {
-        "state_links": {"/".join(e.key): e.feature_key for e in plan.state},
-        "action_links": {"/".join(e.key): e.feature_key for e in plan.action},
+        "state_links": {str(e.key): e.feature_key for e in plan.state},
+        "action_links": {str(e.key): e.feature_key for e in plan.action},
     }
     assert len(links["state_links"]) == len(plan.state)
     assert len(links["action_links"]) == len(plan.action)
