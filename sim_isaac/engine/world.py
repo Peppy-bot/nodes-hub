@@ -28,6 +28,13 @@ WORLD_PRIM = "/World"
 # this engine stands can touch.
 SPOT_PITCH_M = 1.5
 
+# How far the lattice is walked before a fleet is told the stage is full.
+_MAX_RINGS = 64
+
+# What stands between a robot's name and the stage path it is a prim of:
+# `/World/alpha` is alpha's.
+PRIM_SEPARATOR = "/"
+
 # How brightly an empty stage is lit, in the units UsdLux reads: enough to
 # read a robot's shape without washing out its materials.
 DOME_LIGHT_INTENSITY = 1000.0
@@ -81,6 +88,30 @@ class Placement:
         return math.degrees(self.yaw)
 
 
+def name_in_the_stage(instance: str) -> str:
+    """The name a robot stands under. Every robot is a prim of the stage
+    under this name, so a name carrying the separator nests one robot inside
+    another's path."""
+    if not instance:
+        raise ValueError("a robot stands under the name of the copy it runs as")
+    if PRIM_SEPARATOR in instance:
+        plain = instance.replace(PRIM_SEPARATOR, "_")
+        raise ValueError(
+            f"a robot stands under a name carrying no {PRIM_SEPARATOR!r}, and "
+            f"'{instance}' carries one: join under a name without it, "
+            f"`peppy stack join LAUNCHER -i {plain}`"
+        )
+    return instance
+
+
+def within_one_spot(one: Placement, other: Placement) -> bool:
+    """Whether two placements are too close for a robot to stand on both. It
+    is the distance between them that counts: two robots closer together than
+    the lattice leaves them resolve their overlap by throwing each other,
+    wherever the lattice's own lines happen to fall."""
+    return math.dist(one.position, other.position) < SPOT_PITCH_M
+
+
 @dataclass(frozen=True)
 class Robot:
     """One robot in the stage: the name it stands under, the model it is,
@@ -125,14 +156,14 @@ class World:
         with self._lock:
             return list(self._robots.values())
 
-    def free_spot(self, promised: "tuple[Placement, ...]" = ()) -> Placement:
+    def free_spot(
+        self, promised: "tuple[Placement, ...]" = (), leaving: Optional[str] = None
+    ) -> Placement:
         """A spot no robot stands on and none has been promised, walked out
         from the origin on a square lattice, so a fleet fills the floor. A
         robot admitted a moment ago has a spot and does not stand on it yet,
         so its placement is passed in here."""
-        taken = {self._rounded(robot.placement.position) for robot in self.robots()}
-        taken |= {self._rounded(placement.position) for placement in promised}
-        for ring in range(0, 64):
+        for ring in range(0, _MAX_RINGS):
             square = [
                 (row, column)
                 for row in range(-ring, ring + 1)
@@ -142,22 +173,42 @@ class World:
             # Along the axes before the diagonals, so a small fleet stands in
             # a cross around the origin.
             for row, column in sorted(square, key=lambda spot: (abs(spot[0]) + abs(spot[1]), spot)):
-                spot = (row * SPOT_PITCH_M, column * SPOT_PITCH_M, 0.0)
-                if self._rounded(spot) not in taken:
-                    return Placement.of(spot, 0.0)
-        raise RuntimeError("the stage has no free spot left")
+                spot = Placement.of((row * SPOT_PITCH_M, column * SPOT_PITCH_M, 0.0), 0.0)
+                if not self.occupied(spot, promised, leaving):
+                    return spot
+        raise ValueError(
+            "every spot this stage lays out is taken: take a robot out with "
+            "`peppy stack remove NAME` before standing another"
+        )
+
+    def standing_within(
+        self, placement: Placement, leaving: Optional[str] = None
+    ) -> Optional[Robot]:
+        """The robot standing within a spot of this placement, if one does.
+        The robot named by `leaving` is on its way out, so the spot it stands
+        on is free for whoever is asking."""
+        return next(
+            (
+                robot
+                for robot in self.robots()
+                if robot.instance != leaving and within_one_spot(placement, robot.placement)
+            ),
+            None,
+        )
 
     def occupied(
-        self, placement: Placement, promised: "tuple[Placement, ...]" = ()
+        self,
+        placement: Placement,
+        promised: "tuple[Placement, ...]" = (),
+        leaving: Optional[str] = None,
     ) -> bool:
         """Whether a robot stands within a spot of this placement, or has
-        been promised one there."""
-        wanted = self._rounded(placement.position)
-        standing = (robot.placement for robot in self.robots())
-        return any(
-            self._rounded(other.position) == wanted
-            for other in (*standing, *promised)
+        been promised one there. The robot named by `leaving` is on its way
+        out, so the spot it stands on is free."""
+        standing = (
+            robot.placement for robot in self.robots() if robot.instance != leaving
         )
+        return any(within_one_spot(placement, other) for other in (*standing, *promised))
 
     def open(self) -> None:
         """Opens the empty stage the robots join, which carries the physics
@@ -201,11 +252,14 @@ class World:
         """Stands a robot of the model `known` in the stage. Admission has
         already found the caller a name and a spot, so this raises on
         either."""
+        instance = name_in_the_stage(instance)
         with self._lock:
             if instance in self._robots:
-                raise ValueError(f"{instance} already stands in the stage")
-        if not instance:
-            raise ValueError("a robot stands under the name of the copy it runs as")
+                raise ValueError(
+                    f"'{instance}' is still on the stage, which a robot that could not be "
+                    "taken out is until this simulation restarts: `peppy stack list` says "
+                    "whether its copy still runs"
+                )
         robot = Robot(instance=instance, known=known, placement=placement)
         try:
             self._reference(robot, self._head_camera_pack)
@@ -412,9 +466,3 @@ class World:
             not in (UsdGeom.XformOp.TypeTranslate, UsdGeom.XformOp.TypeOrient)
         ]
         xform.SetXformOpOrder([translate, orient, *rest])
-
-    @staticmethod
-    def _rounded(position) -> tuple[int, int, int]:
-        """A placement as a spot on the lattice, so a robot that asked for a
-        spot by hand still counts as standing on it."""
-        return tuple(int(round(value / SPOT_PITCH_M)) for value in position)

@@ -1,8 +1,8 @@
 // What this engine alone knows about an OpenArm v1. Its limbs and joints are
 // sim_robot_core's entry of the same name.
 {
-  // The robot's MJCF, which is the whole world it stands in, under
-  // PEPPY_ROBOT_ASSETS_DIR.
+  // The robot's MJCF, under PEPPY_ROBOT_ASSETS_DIR. It brings the robot,
+  // and the scene it is attached into carries the floor and the light.
   scene: "openarm/openarm_bimanual_v1.xml",
 
   // MIT servo gains (j1..j7) applied to every arm's position actuators so sim

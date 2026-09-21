@@ -101,48 +101,50 @@ def test_a_robot_that_cannot_be_taken_out_leaves_the_stage_taken_up():
     io._bind.assert_called_once_with()
 
 
-def test_a_name_is_free_the_moment_nothing_stands_under_it():
-    """Taking the robot out and giving its name back are one change, so a
-    robot that comes straight back is neither refused its own name nor stood
-    twice."""
+def test_taking_a_robot_out_is_all_the_stage_is_asked_for():
+    """What a robot's joining held went back when its stay ended, before the
+    stage was asked to let the robot go, so a copy that comes straight back
+    finds its name free and is stood afresh."""
     world = Mock(spec=["add", "remove"])
     io = _robots_io(world)
     order = []
     world.remove.side_effect = lambda *_: order.append("left the stage")
-    io._robots.release.side_effect = lambda *_: order.append("name given back")
     io._io.forget.side_effect = lambda *_: order.append("setpoints dropped")
 
     io._rebind = Mock(side_effect=lambda: order.append("scene resolved"))
 
     io.unstand("alpha")
 
-    assert order == [
-        "left the stage",
-        "name given back",
-        "setpoints dropped",
-        "scene resolved",
-    ]
+    assert order == ["left the stage", "setpoints dropped", "scene resolved"]
+    io._robots.release.assert_not_called()
 
 
-def test_a_removal_that_fails_keeps_the_name():
-    """The robot is still standing, so its name stays taken."""
+def test_a_removal_that_fails_takes_the_stage_back_up():
+    """The stage is let go of inside the change that asks for it, so a robot
+    that cannot be taken out leaves the robots beside it stepping."""
     world = Mock(spec=["add", "remove"])
     world.remove.side_effect = KeyError("alpha")
     io = _robots_io(world)
+    resolved = []
+    io._rebind = Mock(side_effect=lambda: resolved.append("scene resolved"))
 
     with pytest.raises(KeyError):
         io.unstand("alpha")
 
-    io._robots.release.assert_not_called()
+    assert resolved == ["scene resolved"]
 
 
 class _Goal:
     """The parts of an attach goal a robot's stand reads and answers."""
 
-    def __init__(self):
+    def __init__(self, request=None):
         self.leave = asyncio.Event()
         self.answers = []
         self.feedback = []
+        self._request = request
+
+    def request(self):
+        return self._request
 
     async def cancel_signal(self):
         await self.leave.wait()
@@ -164,12 +166,42 @@ def _joining_io():
     io._edits = Edits()
     io._placements = {"alpha": Mock()}
     io._handovers = {}
-    io._admit_lock = threading.Lock()
     io._robots = Mock(spec=["release", "stand"])
     io._models = MODELS
     io._loop = Mock()
     io._loop.time.return_value = 0.0
     return io
+
+
+def test_a_stand_whose_spot_was_taken_back_gives_the_name_back():
+    """Whatever took the spot back took the name with it, and this goal is
+    the one holding it: a name nothing gives back is a name no copy can
+    ever join under again."""
+    io = _joining_io()
+    io._placements = {}
+    goal = _Goal()
+
+    assert asyncio.run(io._stand(goal, "alpha", "openarm_v2")) is False
+
+    io._robots.release.assert_called_once_with("alpha")
+    assert goal.answers == [
+        ("completed", False, "the name was given back before the robot stood")
+    ]
+
+
+def test_a_stay_whose_name_went_back_before_it_began_answers_its_own_goal():
+    """The stay reads the robot it was admitted for, and a name given back
+    under it leaves nothing to stand."""
+    io = _joining_io()
+    io._robots = Mock(spec=["release", "stand", "of_name"])
+    io._robots.of_name.return_value = None
+    goal = _Goal(_request("alpha", "openarm_v2"))
+
+    asyncio.run(io._stay(goal))
+
+    assert goal.answers == [
+        ("completed", False, "the name was given back before the robot stood")
+    ]
 
 
 def test_a_robot_that_leaves_before_the_stage_takes_it_up_never_stands():
@@ -357,6 +389,180 @@ class _Staying(_Goal):
         await asyncio.Event().wait()
 
 
+class _Withdrawing(_Goal):
+    """A goal whose holder lets go while its robot still waits for the
+    thread that steps the scene."""
+
+    async def cancel_signal(self):
+        return None
+
+
+def test_a_robot_that_left_before_it_stood_gives_back_its_name_and_its_spot():
+    """Its stand still waits for the thread that steps the scene, so the
+    stand is withdrawn: nothing stood, and the next copy takes the name."""
+    io = _joining_io()
+    io._io = Mock(spec=["forget"])
+
+    stood = asyncio.run(io._stand(_Withdrawing(), "alpha", "openarm_v2"))
+
+    assert stood is False
+    io._robots.release.assert_called_once_with("alpha")
+    assert io._placements == {}
+
+
+def test_a_robot_the_stage_refused_gives_back_its_name_and_its_spot():
+    """The stage answered the stand with why it will not take the robot, so
+    what the admission held goes back with the answer."""
+    io = _joining_io()
+    io._io = Mock(spec=["forget"])
+    io._robots = Mock(spec=["release", "stand", "renew"])
+    io._unbind = lambda: None
+    io._rebind = lambda: None
+    io._world = Mock(spec=["add", "remove"])
+    io._world.add.side_effect = RuntimeError("the stage will not take it")
+    goal = _Goal()
+
+    async def stand_and_drain():
+        standing = asyncio.create_task(io._stand(goal, "alpha", "openarm_v2"))
+        await asyncio.sleep(0)
+        io._edits.drain()
+        return await standing
+
+    assert asyncio.run(stand_and_drain()) is False
+    io._robots.release.assert_called_once_with("alpha")
+    assert io._placements == {}
+    assert "the stage will not take it" in goal.answers[0][2]
+
+
+def test_a_robot_that_stood_is_recorded_as_standing():
+    """What marks it standing is what tells a copy re-registering that its
+    own robot is there to be handed over."""
+    io = _joining_io()
+    io._io = Mock(spec=["forget"])
+    io._robots = Mock(spec=["release", "stand", "renew"])
+    io._unbind = lambda: None
+    io._rebind = lambda: None
+    io._world = Mock(spec=["add", "remove"])
+    goal = _Goal()
+
+    async def stand_and_drain():
+        standing = asyncio.create_task(io._stand(goal, "alpha", "openarm_v2"))
+        await asyncio.sleep(0)
+        io._edits.drain()
+        return await standing
+
+    assert asyncio.run(stand_and_drain()) is True
+    io._robots.stand.assert_called_once_with("alpha", 0.0)
+
+
+def test_a_stopping_engine_ends_every_stay_and_every_loop():
+    """A robot whose engine is going down is told so on its own goal, and
+    nothing of this engine is left running behind it."""
+    io = RobotsIO.__new__(RobotsIO)
+    io._stopping = asyncio.Event()
+
+    async def run_and_stop():
+        io._tasks = [asyncio.create_task(asyncio.Event().wait())]
+        io._stays = {asyncio.create_task(asyncio.Event().wait())}
+        watched = list(io._tasks) + list(io._stays)
+        await io.stop()
+        return watched
+
+    watched = asyncio.run(run_and_stop())
+
+    assert io._stopping.is_set()
+    assert all(task.cancelled() for task in watched)
+
+
+class _Leaving(_Goal):
+    """A goal whose holder lets go the moment the stay waits on it."""
+
+    def __init__(self):
+        super().__init__()
+        self.let_go = asyncio.Event()
+
+    async def cancel_signal(self):
+        await self.let_go.wait()
+
+
+class TestHowAStayEnds:
+    """A stay waits for one of the ways it can end and says which it was.
+    Every one of them answers the goal differently, and the answer is what
+    the copy holding the robot reads."""
+
+    @staticmethod
+    def _watching() -> RobotsIO:
+        io = _leasing(now_s=0.0, fleet={"alpha": ("openarm_v2", OPENARM_LIMBS)})
+        io._stopping = asyncio.Event()
+        return io
+
+    def test_a_robot_handed_over_ends_its_stay_where_it_stands(self):
+        """The signal the goal taking the robot over sets is what this stay
+        is waiting on."""
+        io = self._watching()
+        handover = io._handover("alpha")
+        handover.set()
+
+        ending, why = asyncio.run(io._watch(_Leaving(), "alpha", handover))
+
+        assert ending is Ending.HANDED_OVER
+        assert why == "this robot is hosted by another goal of this copy"
+
+    def test_a_holder_that_lets_go_ends_its_stay(self):
+        """`peppy stack remove` cancels the goal, which is how a copy takes
+        its robot off the stage."""
+        io = self._watching()
+        goal = _Leaving()
+
+        async def let_go():
+            goal.let_go.set()
+            return await io._watch(goal, "alpha", io._handover("alpha"))
+
+        ending, why = asyncio.run(let_go())
+
+        assert ending is Ending.LEFT
+        assert why == "the robot left the scene"
+
+    def test_a_stopping_engine_ends_every_stay(self):
+        io = self._watching()
+        io._stopping.set()
+        io._lease_check_period = lambda: 0.0
+
+        ending, why = asyncio.run(io._watch(_Leaving(), "alpha", io._handover("alpha")))
+
+        assert ending is Ending.STOPPED
+        assert why == "the engine stopped"
+
+    def test_a_name_given_back_under_a_stay_ends_it(self):
+        """Whatever gave the name back took the robot with it, so the stay
+        has nothing left to watch."""
+        io = self._watching()
+        io._robots.release("alpha")
+        io._lease_check_period = lambda: 0.0
+
+        ending, why = asyncio.run(io._watch(_Leaving(), "alpha", io._handover("alpha")))
+
+        assert ending is Ending.STOPPED
+        assert why == "the name was given back"
+
+    def test_a_stay_that_ends_leaves_nothing_waiting_behind_it(self):
+        """Its two waiters are a task each, and a stay that ends without
+        them leaks one per robot that ever stood."""
+        io = self._watching()
+        handover = io._handover("alpha")
+        handover.set()
+
+        async def watch_and_count():
+            await io._watch(_Leaving(), "alpha", handover)
+            await asyncio.sleep(0)
+            watching = asyncio.current_task()
+            return [
+                task for task in asyncio.all_tasks() if task is not watching and not task.done()
+            ]
+
+        assert asyncio.run(watch_and_count()) == []
+
+
 class TestLease:
     def test_a_robot_holding_its_models_pairs_keeps_its_place_however_stale_its_lease(self):
         """The watcher's tick renews a lease from the pairs it reads, and a
@@ -537,7 +743,7 @@ class TestReadiness:
 class _Spots:
     """The stage's spots, every one of them free."""
 
-    def free_spot(self, promised=()):
+    def free_spot(self, promised=(), leaving=None):
         return SimpleNamespace(position=(1.5 * len(promised), 0.0, 0.0), yaw=0.0)
 
 
@@ -551,7 +757,6 @@ def _admitting() -> RobotsIO:
     io._loop = SimpleNamespace(time=lambda: 0.0)
     io._handovers = {}
     io._placements = {}
-    io._admit_lock = threading.Lock()
     return io
 
 

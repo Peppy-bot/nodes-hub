@@ -1,21 +1,22 @@
-// The MuJoCo simulation node. It stands one robot, which joins by attaching
-// over the simulation_robot contract, naming the copy it runs as and the
-// model it is; the engine loads that model's scene and steps it for as long
-// as the robot stays. The engine plays the follower role of every one of
-// the robot's limb pairings: the robot's backbone leads each pair and the
-// simulation's measured state streams back on it. Whether the robot stands
-// with a pair for every limb of its model is its readiness, answered on the
-// same contract.
+// The MuJoCo simulation node. It stands any number of robots, each joining
+// by attaching over the simulation_robot contract, naming the copy it runs
+// as, the model it is and where it stands; the engine composes its scene
+// from the models standing in it and steps them for as long as they stay.
+// The engine plays the follower role of every limb pairing of every robot:
+// a robot's backbone leads each pair and the simulation's measured state
+// streams back on it. Whether a robot stands with a pair for every limb of
+// its model is its readiness, answered on the same contract.
 {
   peppy_schema: "node/v1",
   manifest: {
     name: "sim_mujoco",
     tag: "v1",
     implements: [
-      // How a robot joins this scene: it attaches with the copy it runs as
-      // and its model, and stays for as long as its goal runs. One robot
-      // stands at a time, where its scene puts it. Whether it stands with
-      // every limb paired is its readiness.
+      // How a robot joins this scene: it attaches with the copy it runs as,
+      // its model and the spot it stands on, and stays for as long as its
+      // goal runs. A robot that asks for no spot takes a free one of the
+      // engine's own. Whether it stands with every limb paired is its
+      // readiness.
       { name: "simulation_robot", tag: "v1", link_id: "robots" },
     ],
     depends_on: {

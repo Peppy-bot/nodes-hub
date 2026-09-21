@@ -28,8 +28,11 @@ from camera_sensor import (
     _HEARTBEAT_TIMEOUT_S,
     _LATE_REPORT_PERIOD_S,
     MujocoCameraSensor,
+    Rig,
     _PoseSnapshot,
     add_cameras,
+    add_light_rig,
+    widen_offscreen,
 )
 from mujoco_models import MujocoModel
 
@@ -106,6 +109,7 @@ def known_model(cameras, world_links=(_WELDED_LINK,), link_bodies=None, camera_l
         arm_gains=None,
         gravity_compensation=False,
         camera_lights=camera_lights,
+        floor=False,
         head_camera=False,
         joint_ranges={},
         site_poses={},
@@ -225,9 +229,15 @@ def clock_fixture(monkeypatch):
     return clock
 
 
+def rig(cameras, robot=ROBOT, prefix=""):
+    """One robot's rig. These scenes are compiled from a single model rather
+    than composed, so their cameras carry no prefix."""
+    return Rig(robot=robot, prefix=prefix, cameras=tuple(cameras))
+
+
 def sensor_with_fakes(model, cameras, io, depth_m=1.5):
     """A sensor plus the renderer dicts its render loop would have built."""
-    sensor = MujocoCameraSensor(model, cameras, io, ROBOT)
+    sensor = MujocoCameraSensor(model, [rig(cameras)], io)
     color = {(c.height, c.width): FakeRenderer(c.height, c.width) for c in cameras}
     depth = {
         (c.depth.height, c.depth.width): FakeRenderer(
@@ -291,14 +301,25 @@ def test_compile_rejects_a_camera_name_the_scene_already_uses(scene):
         compile_model_with_cameras(scene, [color_camera(name="scene_cam")])
 
 
-def test_compile_grows_the_offscreen_buffer_to_cover_every_stream(scene):
+def test_the_offscreen_buffer_grows_to_cover_every_stream_of_the_scene(scene):
     wide = dataclasses.replace(color_camera(), width=640, height=480)
-    model = compile_model_with_cameras(scene, [wide])
+    spec = mujoco.MjSpec.from_file(str(scene))
+    widen_offscreen(spec, [color_camera(), wide])
+    model = spec.compile()
     assert (model.vis.global_.offwidth, model.vis.global_.offheight) == (640, 480)
 
 
-def test_compile_keeps_an_offscreen_buffer_already_large_enough(scene):
-    model = compile_model_with_cameras(scene, [color_camera(), rgbd_camera()])
+def test_an_offscreen_buffer_already_large_enough_is_left_alone(scene):
+    spec = mujoco.MjSpec.from_file(str(scene))
+    widen_offscreen(spec, [color_camera(), rgbd_camera()])
+    model = spec.compile()
+    assert (model.vis.global_.offwidth, model.vis.global_.offheight) == _SCENE_OFFSCREEN
+
+
+def test_a_scene_rendering_nothing_keeps_its_own_buffer(scene):
+    spec = mujoco.MjSpec.from_file(str(scene))
+    widen_offscreen(spec, [])
+    model = spec.compile()
     assert (model.vis.global_.offwidth, model.vis.global_.offheight) == _SCENE_OFFSCREEN
 
 
@@ -443,8 +464,8 @@ def test_a_stalled_camera_is_reported_while_it_is_still_stalled(scene, clock, ca
             clock.set(period * _LATE_REPORT_PERIOD_S)
             render_due(sensor, model, color, depth, pose=pose)
     assert caplog.messages == [
-        "1 late frame interval(s): worst 1000 ms on wrist",
-        "1 late frame interval(s): worst 2000 ms on wrist",
+        "1 late frame interval(s): worst 1000 ms on alpha/wrist",
+        "1 late frame interval(s): worst 2000 ms on alpha/wrist",
     ]
 
 
@@ -457,7 +478,7 @@ def test_a_dropped_publish_is_not_a_delivery(scene, clock):
 
     # The frame was rendered and handed to the transport, which dropped it.
     assert len(io.frames) == 1
-    assert sensor._streams["wrist"].last_delivery_s is None  # pylint: disable=W0212
+    assert sensor._streams[(ROBOT, "wrist")].last_delivery_s is None  # pylint: disable=W0212
 
 
 def test_every_camera_in_a_cycle_is_stamped_with_the_pose_it_shows(scene, clock):
@@ -530,8 +551,10 @@ def test_camera_placement_reaches_the_compiled_model(scene):
     assert model.cam_fovy[index] == pytest.approx(camera.fovy_deg)
 
 
-def test_the_camera_light_rig_reaches_the_compiled_model_of_an_entry_that_asks_for_it(scene):
-    model = compile_model_with_cameras(scene, [color_camera()], camera_lights=True)
+def test_the_camera_light_rig_reaches_the_compiled_model_of_the_scene_it_lights(scene):
+    spec = mujoco.MjSpec.from_file(str(scene))
+    add_light_rig(spec)
+    model = spec.compile()
 
     assert model.nlight == len(camera_sensor._LIGHT_DIRECTIONS)
     assert not model.light_castshadow.any()
@@ -540,9 +563,9 @@ def test_the_camera_light_rig_reaches_the_compiled_model_of_an_entry_that_asks_f
     )
 
 
-def test_an_entry_that_asks_for_no_light_rig_leaves_the_scenes_lighting_alone(scene):
+def test_a_scene_no_model_asks_to_light_keeps_its_own_lighting(scene):
     baked = mujoco.MjModel.from_xml_path(str(scene))
-    model = compile_model_with_cameras(scene, [color_camera()], camera_lights=False)
+    model = compile_model_with_cameras(scene, [color_camera()])
 
     assert model.nlight == baked.nlight == 0
     assert model.vis.headlight.ambient.tolist() == baked.vis.headlight.ambient.tolist()
@@ -568,7 +591,7 @@ def test_renderers_open_at_each_streams_own_size(scene, monkeypatch):
     non-square stream sideways and nothing downstream would notice."""
     cameras = [color_camera(), rgbd_camera()]
     model = compile_model_with_cameras(scene, cameras)
-    sensor = MujocoCameraSensor(model, cameras, FakeIO(), ROBOT)
+    sensor = MujocoCameraSensor(model, [rig(cameras)], FakeIO())
     opened = []
 
     def fake_renderer(_model, height, width):
@@ -591,7 +614,7 @@ def test_renderers_open_at_each_streams_own_size(scene, monkeypatch):
 def test_a_renderer_opened_before_a_failure_is_still_closed(scene, monkeypatch):
     cameras = [color_camera(), rgbd_camera()]
     model = compile_model_with_cameras(scene, cameras)
-    sensor = MujocoCameraSensor(model, cameras, FakeIO(), ROBOT)
+    sensor = MujocoCameraSensor(model, [rig(cameras)], FakeIO())
     opened = []
 
     def fail_on_the_second(_model, height, width):
@@ -628,7 +651,7 @@ def test_background_depth_publishes_as_invalid(scene, clock):
 def test_a_wedged_renderer_surfaces_on_the_physics_thread(scene, monkeypatch, clock):
     """A renderer that blocks raises nothing, so only the heartbeat catches it."""
     model = compile_model_with_cameras(scene, [color_camera()])
-    sensor = MujocoCameraSensor(model, [color_camera()], FakeIO(), ROBOT)
+    sensor = MujocoCameraSensor(model, [rig([color_camera()])], FakeIO())
     wedged = threading.Event()
     release = threading.Event()
 
@@ -657,7 +680,7 @@ def test_a_wedged_renderer_surfaces_on_the_physics_thread(scene, monkeypatch, cl
 
 def test_a_dead_renderer_surfaces_on_the_physics_thread(scene, monkeypatch):
     model = compile_model_with_cameras(scene, [color_camera()])
-    sensor = MujocoCameraSensor(model, [color_camera()], FakeIO(), ROBOT)
+    sensor = MujocoCameraSensor(model, [rig([color_camera()])], FakeIO())
 
     def explode(*_args, **_kwargs):
         raise RuntimeError("no GL context")
@@ -673,7 +696,7 @@ def test_a_dead_renderer_surfaces_on_the_physics_thread(scene, monkeypatch):
 def test_stop_closes_every_renderer_it_opened(scene, monkeypatch):
     cameras = [color_camera(), rgbd_camera()]
     model = compile_model_with_cameras(scene, cameras)
-    sensor = MujocoCameraSensor(model, cameras, FakeIO(), ROBOT)
+    sensor = MujocoCameraSensor(model, [rig(cameras)], FakeIO())
     opened = []
     running = threading.Event()
 
@@ -694,6 +717,36 @@ def test_stop_closes_every_renderer_it_opened(scene, monkeypatch):
     sensor.raise_if_failed()
 
 
+def test_a_render_thread_that_outlived_its_stop_hands_on_no_counters(scene, monkeypatch):
+    """A stop that gave up waiting leaves the thread rendering and counting
+    on these counters. The scene composed next counts its own frames, so no
+    two threads hand out one frame id between them."""
+    monkeypatch.setattr(camera_sensor, "_JOIN_TIMEOUT_S", 0.01)
+    cameras = [color_camera(name="wrist")]
+    model = compile_model_with_cameras(scene, cameras)
+    sensor = MujocoCameraSensor(model, [rig(cameras)], FakeIO())
+    still_rendering = threading.Event()
+    sensor._thread = threading.Thread(target=still_rendering.wait)  # pylint: disable=W0212
+    sensor._thread.start()  # pylint: disable=W0212
+
+    try:
+        sensor.stop()
+
+        assert sensor.counters() == {}
+    finally:
+        still_rendering.set()
+
+
+def test_a_render_thread_that_stopped_hands_its_counters_on(scene):
+    cameras = [color_camera(name="wrist")]
+    model = compile_model_with_cameras(scene, cameras)
+    sensor = MujocoCameraSensor(model, [rig(cameras)], FakeIO())
+
+    sensor.stop()
+
+    assert list(sensor.counters()) == [(ROBOT, "wrist")]
+
+
 def test_stop_clears_the_heartbeat_so_shutdown_is_not_a_wedged_renderer(
     scene, monkeypatch, clock
 ):
@@ -703,7 +756,7 @@ def test_stop_clears_the_heartbeat_so_shutdown_is_not_a_wedged_renderer(
     step, so an orderly shutdown would surface as a renderer fault."""
     model = compile_model_with_cameras(scene, [color_camera()])
     monkeypatch.setattr(mujoco, "Renderer", lambda _model, h, w: FakeRenderer(h, w))
-    sensor = MujocoCameraSensor(model, [color_camera()], FakeIO(), ROBOT)
+    sensor = MujocoCameraSensor(model, [rig([color_camera()])], FakeIO())
     sensor.snapshot(np.zeros(model.nq))
     sensor.start()
     sensor.stop()
@@ -757,3 +810,48 @@ def test_an_rgbd_camera_says_how_its_depth_sits_against_its_colour(scene, clock)
     ]
     depth_model = io.geometries[0][2]
     assert (depth_model.cx, depth_model.cy) == ((_DEPTH[0] - 1) / 2, (_DEPTH[1] - 1) / 2)
+
+
+def test_each_robots_cameras_render_under_its_own_prefix_and_publish_for_it(scene, clock):
+    """Two robots of one model carry the same camera name. The scene names
+    them apart by their prefixes, and each robot's frames go out on its own
+    pair under the name its model gives the camera."""
+
+    class FleetIO(FakeIO):
+        def __init__(self):
+            super().__init__()
+            self.published = []
+
+        def publish_color_frame(
+            self, robot, name, timestamp_s, frame_id, encoding, width, height, frame
+        ):
+            self.published.append((robot, name))
+            return True
+
+        def publish_color_stream_info(self, robot, name, width, height, fps, encoding):
+            return None
+
+        def publish_color_geometry(self, robot, name, color):
+            return None
+
+    spec = mujoco.MjSpec.from_file(str(scene))
+    for prefix in ("alpha/", "bravo/"):
+        camera = spec.body("link_a").add_camera()
+        camera.name = f"{prefix}wrist"
+    model = spec.compile()
+
+    io = FleetIO()
+    sensor = MujocoCameraSensor(
+        model,
+        [
+            rig([color_camera()], robot="alpha", prefix="alpha/"),
+            rig([color_camera()], robot="bravo", prefix="bravo/"),
+        ],
+        io,
+    )
+    color = {(_COLOR[1], _COLOR[0]): FakeRenderer(_COLOR[1], _COLOR[0])}
+    clock.set(1.0)
+    render_due(sensor, model, color, {}, pose=np.zeros(model.nq))
+
+    assert io.published == [("alpha", "wrist"), ("bravo", "wrist")]
+    assert color[(_COLOR[1], _COLOR[0])].rendered == ["alpha/wrist", "bravo/wrist"]
