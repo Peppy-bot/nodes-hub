@@ -206,9 +206,11 @@ class TestJoints:
 
 
 class TestTheSolverItStandsUnder:
-    """A scene steps one set of solver settings, so every model standing in
-    one asks for the same. The OpenArms ask for MuJoCo's defaults with an
-    implicit-fast integrator, and this entry stands the SO-101 under them."""
+    """Menagerie tunes the solver for the arm, and a scene steps one set of
+    settings for every model standing in it. The arm keeps upstream's tuning
+    while it has a scene to itself, and the entry names what it accepts in
+    company: what the OpenArms ask for, MuJoCo's defaults with an
+    implicit-fast integrator."""
 
     def test_upstream_tunes_the_solver_for_a_scene_it_has_to_itself(self, upstream):
         assert upstream.opt.timestep == pytest.approx(0.005)
@@ -217,17 +219,31 @@ class TestTheSolverItStandsUnder:
         assert upstream.opt.ls_iterations == 20
         assert upstream.opt.impratio == pytest.approx(10.0)
 
-    def test_the_entry_stands_it_under_what_the_openarms_stand_under(self, model):
+    def test_the_arm_keeps_that_tuning_in_a_scene_of_its_own(self, model, upstream):
+        """The grip upstream tuned for is what a scene standing the SO-101
+        alone steps, which is every scene an SO-101 stood in before a scene
+        could stand two robots."""
+        assert model.opt.timestep == pytest.approx(upstream.opt.timestep)
+        assert model.opt.cone == upstream.opt.cone
+        assert model.opt.iterations == upstream.opt.iterations
+        assert model.opt.ls_iterations == upstream.opt.ls_iterations
+        assert model.opt.impratio == pytest.approx(upstream.opt.impratio)
+
+    def test_the_entry_names_what_it_accepts_in_company(self):
+        """A scene it shares with an OpenArm steps what the OpenArms ask
+        for, which the entry carries as the settings the arm gives way to."""
         openarm = mujoco.MjModel.from_xml_string(
             '<mujoco><option integrator="implicitfast"/><worldbody/></mujoco>'
         )
+        accepted = MujocoModels.read().of("so101").solver
 
-        assert model.opt.integrator == openarm.opt.integrator
-        assert model.opt.timestep == pytest.approx(openarm.opt.timestep)
-        assert model.opt.cone == openarm.opt.cone
-        assert model.opt.iterations == openarm.opt.iterations
-        assert model.opt.ls_iterations == openarm.opt.ls_iterations
-        assert model.opt.impratio == pytest.approx(openarm.opt.impratio)
+        assert accepted is not None
+        assert accepted.integrator == openarm.opt.integrator
+        assert accepted.timestep == pytest.approx(openarm.opt.timestep)
+        assert accepted.cone == openarm.opt.cone
+        assert accepted.iterations == openarm.opt.iterations
+        assert accepted.ls_iterations == openarm.opt.ls_iterations
+        assert accepted.impratio == pytest.approx(openarm.opt.impratio)
 
 
 class TestActuators:

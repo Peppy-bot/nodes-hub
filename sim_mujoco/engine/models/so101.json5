@@ -14,12 +14,14 @@
   // closing on the floor pushes against it.
   floor: true,
 
-  // A scene steps one set of solver settings, and the OpenArm models ask
-  // for MuJoCo's defaults with an implicit-fast integrator. Upstream's file
-  // asks for Menagerie's own tuning of them (a 5 ms step, an elliptic
-  // friction cone, ten solver iterations and an impedance ratio of ten), so
-  // the arm stands here under the settings the OpenArms stand under and an
-  // SO-101 joins a scene one of them already stands in.
+  // A scene steps one set of solver settings. Upstream's file asks for
+  // Menagerie's own tuning of them (a 5 ms step, an elliptic friction cone,
+  // ten solver iterations and an impedance ratio of ten), which the arm
+  // keeps in a scene of its own. This is what it accepts to share one: what
+  // the OpenArm models ask for, MuJoCo's defaults with an implicit-fast
+  // integrator, so an SO-101 joins a scene an OpenArm already stands in.
+  // The elliptic cone is what carries the jaw's grip, so the arm holds less
+  // in company than it does alone.
   solver: '<option integrator="implicitfast"/>',
 
   // The URDF's base link is upstream's `base` body.

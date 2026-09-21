@@ -319,22 +319,42 @@ def _lay_floor(stage) -> None:
 def _shared_settings(children: "list[tuple[Robot, object]]"):
     """The `<option>` and `<statistic>` every standing model asks for, or
     None while nothing stands. MuJoCo drops a model's settings when it is
-    attached and steps it under the scene's, so two models that ask for
-    different ones are refused here: what a scene runs is what its models
-    asked for."""
+    attached and steps it under the scene's, so a scene runs one set of them.
+
+    A model stands under the settings its own MJCF asks for. Where two models
+    disagree, one whose entry names a `solver` takes those settings instead,
+    which is that model saying what it accepts in company, and the scene runs
+    what they then agree on. A model alone in a scene keeps its own settings
+    whatever its entry names, so sharing a scene is the only thing that costs
+    a model its own tuning."""
     if not children:
         return None
-    first_robot, first_spec = children[0]
-    for robot, spec in children[1:]:
-        differences = _settings_differences(first_spec, spec)
+    if not _disagreement(children):
+        return children[0][1].option, children[0][1].stat
+    for robot, spec in children:
+        if robot.known.solver is not None:
+            spec.option = robot.known.solver
+    disagreement = _disagreement(children)
+    if disagreement is None:
+        return children[0][1].option, children[0][1].stat
+    (first_robot, _), (robot, _), differences = disagreement
+    raise RuntimeError(
+        f"the models '{first_robot.model}' and '{robot.model}' ask for different "
+        f"simulation settings ({', '.join(differences)}), and a scene steps one set "
+        f"of them: give both models the same settings, or stand the {robot.model} "
+        "in a simulation of its own"
+    )
+
+
+def _disagreement(children: "list[tuple[Robot, object]]"):
+    """The first pair of standing models whose settings differ, with the
+    fields they differ on. None while every model asks for the same."""
+    first = children[0]
+    for child in children[1:]:
+        differences = _settings_differences(first[1], child[1])
         if differences:
-            raise RuntimeError(
-                f"the models '{first_robot.model}' and '{robot.model}' ask for different "
-                f"simulation settings ({', '.join(differences)}), and a scene steps one set "
-                f"of them: give both models the same settings, or stand the {robot.model} "
-                "in a simulation of its own"
-            )
-    return first_spec.option, first_spec.stat
+            return first, child, differences
+    return None
 
 
 def _settings_differences(one, other) -> list[str]:
@@ -370,16 +390,15 @@ def _settings_fields(settings) -> list[str]:
 
 
 def compile_spec(known: MujocoModel):
-    """The spec of a model's MJCF, with the joint ranges, site poses and
-    solver settings its entry corrects to the scene the robot stands in, and
-    the robot's weight compensated where its entry asks for it. A correction
+    """The spec of a model's MJCF, with the joint ranges and site poses its
+    entry corrects, and the robot's weight compensated where its entry asks
+    for it. The model keeps the solver settings its own file asks for, which
+    a scene it shares can take off it. A correction
     naming a joint or a site the file lacks is refused, so an upstream rename
     is caught at the first stand."""
     import mujoco  # pylint: disable=C0415
 
     spec = mujoco.MjSpec.from_file(str(known.scene_path()))
-    if known.solver is not None:
-        spec.option = known.solver
     for name, (lower, upper) in known.joint_ranges.items():
         joint = spec.joint(name)
         if joint is None:

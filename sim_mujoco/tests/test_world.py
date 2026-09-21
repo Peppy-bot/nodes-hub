@@ -405,6 +405,40 @@ class TestTheSettingsTheModelsShare:
 
         assert model.njnt > 0
 
+    def test_a_model_alone_keeps_its_own_tuning_whatever_its_entry_accepts(self):
+        """An entry's `solver` is what the model gives way to in company, so
+        a scene standing it alone steps the settings its own file asks for:
+        a model upstream tuned keeps that tuning until it shares a scene."""
+        tuned = _known(solver='<option timestep="0.004" integrator="implicitfast"/>')
+        world = _world()
+        world.add("alpha", tuned, world.free_spot())
+
+        model = world.compose().compile()
+
+        assert model.opt.timestep == pytest.approx(0.002)
+
+    def test_a_model_takes_the_settings_its_entry_accepts_to_share_a_scene(self):
+        """Two models that disagree agree on what the entry of one names, so
+        the join stands."""
+        other = _ARM.replace('timestep="0.002"', 'timestep="0.004"')
+        (mujoco_models.ASSETS_DIR / "arm" / "other.xml").write_text(other)
+        yielding = parse(
+            EngineModel(
+                entry=parse_entry("fast_arm", "fast_arm.json5", _ARM_ENTRY),
+                engine={
+                    "scene": "arm/other.xml",
+                    "solver": '<option timestep="0.002" integrator="implicitfast"/>',
+                },
+            )
+        )
+        world = _world()
+        world.add("alpha", _known(), world.free_spot())
+        world.add("bravo", yielding, world.free_spot())
+
+        model = world.compose().compile()
+
+        assert model.opt.timestep == pytest.approx(0.002)
+
 
 class TestFittingOutTheScene:
     def test_a_rendering_engine_hangs_each_robots_cameras_under_its_prefix(self):
