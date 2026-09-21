@@ -4,7 +4,7 @@ posture and the front camera.
 
 The model is MuJoCo Menagerie's robotstudio_so101 at the commit
 sim_base_images/so101_model.lock.json pins, read from the baked assets
-(PEPPY_ROBOT_ASSETS_DIR, as <dir>/so101/scene.xml). Where that directory
+(PEPPY_ROBOT_ASSETS_DIR, as <dir>/so101/so101.xml). Where that directory
 holds no SO-101 the suite stages the pinned model itself, which needs the
 network. Either way every file is checked against the lock, so what is
 compared with the description is the model the image carries.
@@ -31,10 +31,13 @@ _ENGINE_DIR = _NODES_HUB / "sim_mujoco" / "engine"
 sys.path.insert(0, str(_ENGINE_DIR))
 
 import mujoco_models  # noqa: E402  pylint: disable=C0413
-from _launcher import compile_spec  # noqa: E402  pylint: disable=C0413
 from bridge_extension import MujocoBridgeExtension  # noqa: E402  pylint: disable=C0413
 from exts.camera_sensor import add_cameras  # noqa: E402  pylint: disable=C0413
 from mujoco_models import MujocoModels  # noqa: E402  pylint: disable=C0413
+from world import World, compile_spec  # noqa: E402  pylint: disable=C0413
+
+# The name this robot stands under, which every name it answers to carries.
+ROBOT = "charlo"
 
 MOTOR_JOINTS = (*JOINT_NAMES, GRIPPER_NAME)
 # The URDF rounds its limits to five decimals and upstream writes seven.
@@ -106,10 +109,11 @@ def upstream_fixture(known):
 
 @pytest.fixture(name="rendered", scope="module")
 def rendered_fixture(known):
-    """The scene as a rendering engine compiles it."""
-    spec = compile_spec(known)
-    add_cameras(spec, known, known.scene_path())
-    return spec.compile()
+    """The scene as a rendering engine composes it, with this robot standing
+    in it."""
+    world = World(head_camera_pack=None, renders=True)
+    world.add(ROBOT, known, world.free_spot())
+    return world.compose().compile()
 
 
 @pytest.fixture(name="urdf", scope="module")
@@ -201,6 +205,31 @@ class TestJoints:
         assert _off_the_urdf(model) == {}
 
 
+class TestTheSolverItStandsUnder:
+    """A scene steps one set of solver settings, so every model standing in
+    one asks for the same. The OpenArms ask for MuJoCo's defaults with an
+    implicit-fast integrator, and this entry stands the SO-101 under them."""
+
+    def test_upstream_tunes_the_solver_for_a_scene_it_has_to_itself(self, upstream):
+        assert upstream.opt.timestep == pytest.approx(0.005)
+        assert upstream.opt.cone == mujoco.mjtCone.mjCONE_ELLIPTIC
+        assert upstream.opt.iterations == 10
+        assert upstream.opt.ls_iterations == 20
+        assert upstream.opt.impratio == pytest.approx(10.0)
+
+    def test_the_entry_stands_it_under_what_the_openarms_stand_under(self, model):
+        openarm = mujoco.MjModel.from_xml_string(
+            '<mujoco><option integrator="implicitfast"/><worldbody/></mujoco>'
+        )
+
+        assert model.opt.integrator == openarm.opt.integrator
+        assert model.opt.timestep == pytest.approx(openarm.opt.timestep)
+        assert model.opt.cone == openarm.opt.cone
+        assert model.opt.iterations == openarm.opt.iterations
+        assert model.opt.ls_iterations == openarm.opt.ls_iterations
+        assert model.opt.impratio == pytest.approx(openarm.opt.impratio)
+
+
 class TestActuators:
     def test_a_position_servo_drives_every_motor_joint(self, model):
         for name in MOTOR_JOINTS:
@@ -271,32 +300,43 @@ class TestToolPoint:
 class TestStartPosture:
     @pytest.fixture(name="standing")
     def standing_fixture(self, known):
-        """The scene started the way a stand starts it."""
-        model = compile_spec(known).compile()
+        """The scene composed and started the way a stand starts it."""
+        world = World(head_camera_pack=None, renders=False)
+        robot = world.add(ROBOT, known, world.free_spot())
+        model = world.compose().compile()
         data = mujoco.MjData(model)
         mujoco.mj_forward(model, data)
-        MujocoBridgeExtension(model, data, None, "charlo", known, 50, False, 0.0).startup()
+        MujocoBridgeExtension(
+            model, data, None, [robot], 50, renders=False, time_base_s=0.0
+        ).startup(posture_for=[robot])
+        mujoco.mj_forward(model, data)
         return model, data
 
     def test_every_joint_starts_where_the_description_says(self, standing):
         """The arm in its start posture and the jaw closed."""
         model, data = standing
         described = simulation.start_positions_rad()
-        started = {name: float(data.qpos[model.joint(name).qposadr[0]]) for name in described}
+        started = {
+            name: float(data.qpos[model.joint(f"{ROBOT}/{name}").qposadr[0]]) for name in described
+        }
 
         assert list(described) == [*JOINT_NAMES, GRIPPER_NAME]
         assert started == pytest.approx(described)
 
     def test_the_start_posture_is_inside_the_urdfs_limits(self, standing):
         model, data = standing
-        started = tuple(float(data.qpos[model.joint(name).qposadr[0]]) for name in JOINT_NAMES)
+        started = tuple(
+            float(data.qpos[model.joint(f"{ROBOT}/{name}").qposadr[0]]) for name in JOINT_NAMES
+        )
 
         assert limits.from_urdf(KINEMATICS_URDF_PATH).contains(started)
 
     def test_the_servos_hold_every_joint_where_it_starts(self, standing):
         model, data = standing
         described = simulation.start_positions_rad()
-        targets = {name: float(data.ctrl[model.actuator(name).id]) for name in described}
+        targets = {
+            name: float(data.ctrl[model.actuator(f"{ROBOT}/{name}").id]) for name in described
+        }
 
         assert targets == pytest.approx(described)
 
@@ -304,10 +344,10 @@ class TestStartPosture:
 class TestFrontCamera:
     def test_it_hangs_from_the_base_at_the_descriptions_pose(self, rendered):
         described = simulation.front_camera()
-        camera = rendered.camera(described.name)
+        camera = rendered.camera(f"{ROBOT}/{described.name}")
         orientation = np.array(described.quat_wxyz) / np.linalg.norm(described.quat_wxyz)
 
-        assert rendered.body(int(camera.bodyid[0])).name == BASE_BODY
+        assert rendered.body(int(camera.bodyid[0])).name == f"{ROBOT}/{BASE_BODY}"
         assert camera.pos == pytest.approx(described.pos)
         assert camera.quat == pytest.approx(orientation)
         assert camera.fovy[0] == pytest.approx(described.fovy_deg)
@@ -315,9 +355,11 @@ class TestFrontCamera:
     def test_the_base_body_is_the_urdfs_base_link(self, known, rendered):
         """The camera's pose is written in the URDF's base link frame, so the
         body it hangs from has to be that frame."""
+        base = rendered.body(f"{ROBOT}/{BASE_BODY}")
+
         assert known.body_of(simulation.front_camera().parent_link) == BASE_BODY
-        assert rendered.body(BASE_BODY).pos.tolist() == [0.0, 0.0, 0.0]
-        assert rendered.body(BASE_BODY).quat.tolist() == [1.0, 0.0, 0.0, 0.0]
+        assert base.pos.tolist() == [0.0, 0.0, 0.0]
+        assert base.quat.tolist() == [1.0, 0.0, 0.0, 0.0]
 
     def test_it_streams_the_descriptions_resolution(self, known, rendered):
         described = simulation.front_camera()
@@ -334,6 +376,10 @@ class TestFrontCamera:
         assert rendered.vis.global_.offwidth >= described.width
         assert rendered.vis.global_.offheight >= described.height
 
-    def test_the_scene_keeps_its_own_light(self, known, rendered, upstream):
+    def test_the_scene_lights_the_floor_it_lays_for_the_arm(self, known, rendered, upstream):
+        """The arm brings no light of its own, and the scene lights the floor
+        it works against, once however many arms stand on it."""
         assert not known.camera_lights
-        assert rendered.nlight == upstream.nlight == 1
+        assert known.floor
+        assert upstream.nlight == 0
+        assert rendered.nlight == 1

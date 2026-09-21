@@ -13,7 +13,6 @@ import json
 import re
 import struct
 import sys
-import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -30,8 +29,8 @@ sys.path.insert(0, str(_ENGINE_DIR))
 
 import head_camera  # noqa: E402
 import mujoco_models  # noqa: E402
-from _launcher import SimLauncher  # noqa: E402
 from mujoco_models import MujocoModels  # noqa: E402
+from world import World  # noqa: E402
 
 # The model that draws the pack, whose chest camera is checked against its rig.
 _OPENARM_V2 = shipped_entry("openarm_v2")
@@ -445,56 +444,52 @@ class TestLoadFor:
             head_camera.load_for(MujocoModels.read(), directory)
 
 
-class TestLauncher:
-    @pytest.fixture(name="load")
-    def load_fixture(self, tmp_path, monkeypatch):
-        """Loads the pedestal scene the way a stand does, as a model that
+class TestTheSceneItIsDrawnIn:
+    """The robot draws its head camera in the scene it stands in, under its
+    own name like everything else it carries."""
+
+    ROBOT = "alpha"
+
+    @pytest.fixture(name="stand")
+    def stand_fixture(self, tmp_path, monkeypatch):
+        """Composes the pedestal scene the way a stand does, for a model that
         carries the OpenArm v2's chest camera."""
         monkeypatch.setattr(mujoco_models, "ASSETS_DIR", tmp_path)
         (tmp_path / "openarm_bimanual_v2.xml").write_text(_SCENE)
         chest = tuple(c for c in _OPENARM_V2.cameras if c.name == head_camera.CHEST_CAMERA)
         entry = dataclasses.replace(_OPENARM_V2, cameras=chest)
 
-        def load(head_camera_pack, renders: bool, draws: bool = True):
+        def stand(head_camera_pack, renders: bool, draws: bool = True):
             engine = {
                 "scene": "openarm_bimanual_v2.xml",
                 "world_links": [head_camera.PEDESTAL_LINK],
                 "head_camera": draws,
             }
             known = mujoco_models.parse(EngineModel(entry=entry, engine=engine))
-            launcher = SimLauncher(
-                None,
-                threading.Event(),
-                None,
-                100,
-                True,
-                "0.0.0.0",
-                8080,
-                renders=renders,
-                head_camera_pack=head_camera_pack,
-            )
-            return launcher._load_model(known)  # pylint: disable=W0212
+            world = World(head_camera_pack=head_camera_pack, renders=renders)
+            world.add(TestTheSceneItIsDrawnIn.ROBOT, known, world.free_spot())
+            return world.compose().compile()
 
-        return load
+        return stand
 
-    def test_loads_the_scene_with_the_head_camera_and_the_rendered_cameras(self, load, loaded):
-        rendered = load(loaded, renders=True)
-        assert _geom(rendered, "head_camera_cover") >= 0
-        assert mujoco.mj_name2id(rendered, mujoco.mjtObj.mjOBJ_CAMERA, "chest") >= 0
+    def test_the_scene_carries_the_head_camera_and_the_rendered_cameras(self, stand, loaded):
+        rendered = stand(loaded, renders=True)
+        assert _geom(rendered, f"{self.ROBOT}/head_camera_cover") >= 0
+        assert mujoco.mj_name2id(rendered, mujoco.mjtObj.mjOBJ_CAMERA, f"{self.ROBOT}/chest") >= 0
 
-    def test_the_head_camera_is_drawn_whether_or_not_the_cameras_render(self, load, loaded):
-        drawn = load(loaded, renders=False)
-        assert _geom(drawn, "head_camera_cover") >= 0
+    def test_the_head_camera_is_drawn_whether_or_not_the_cameras_render(self, stand, loaded):
+        drawn = stand(loaded, renders=False)
+        assert _geom(drawn, f"{self.ROBOT}/head_camera_cover") >= 0
         assert drawn.ncam == 0
 
-    def test_a_model_that_draws_no_head_camera_loads_the_scene_as_baked(self, load, loaded):
-        bare = load(loaded, renders=False, draws=False)
-        assert _geom(bare, "head_camera_cover") == -1
+    def test_a_model_that_draws_no_head_camera_stands_as_baked(self, stand, loaded):
+        bare = stand(loaded, renders=False, draws=False)
+        assert _geom(bare, f"{self.ROBOT}/head_camera_cover") == -1
         assert bare.ngeom == 2
 
-    def test_a_model_that_draws_it_is_refused_while_no_pack_is_staged(self, load):
+    def test_a_model_that_draws_it_is_refused_while_no_pack_is_staged(self, stand):
         with pytest.raises(RuntimeError, match="draws the head camera, and no pack was staged"):
-            load(None, renders=False)
+            stand(None, renders=False)
 
 
 def test_node_stages_the_head_camera_pack_where_launch_reads_it():
@@ -516,6 +511,6 @@ def test_node_stages_the_head_camera_pack_where_launch_reads_it():
     launch = (_ENGINE_DIR / "launch.py").read_text()
     assert '_HEAD_CAMERA_DIR = Path(__file__).parent / "assets" / "head_camera"' in launch
     assert "head_camera.load_for(models, _HEAD_CAMERA_DIR)" in launch
-    assert "head_camera_pack=head_camera_pack" in launch
+    assert "World(head_camera_pack, renders=params.cameras_enabled)" in launch
     ignored = (_NODE_DIR.parent / ".gitignore").read_text().splitlines()
     assert "sim_mujoco/engine/assets/head_camera/" in ignored

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """The changes to the scene that the thread stepping it has to make.
 
-Standing a robot recompiles the scene, which no other thread may do while
-physics reads it, so the contract server hands the work over here and waits for
-the answer.
+Standing a robot composes and compiles the scene again, which no other
+thread may do while physics reads it, so the contract server hands the work
+over here and waits for the answer.
 """
 
 from __future__ import annotations
@@ -23,9 +23,7 @@ class Edit:
 
 
 class Edits:
-    """The changes waiting for the thread that steps the scene. Standing a
-    robot recompiles the scene, which no other thread may do while physics
-    reads it."""
+    """The changes waiting for the thread that steps the scene."""
 
     def __init__(self) -> None:
         self._queue: queue.Queue[Edit] = queue.Queue()

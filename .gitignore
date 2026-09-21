@@ -64,3 +64,6 @@ htmlcov/
 
 # Logs
 *.log
+
+# MuJoCo writes this beside whatever runs it.
+MUJOCO_LOG.TXT

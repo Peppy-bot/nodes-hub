@@ -16,7 +16,6 @@ from __future__ import annotations
 import asyncio
 import enum
 import logging
-import threading
 from typing import Optional
 
 from peppygen.exposed_actions.robots import attach
@@ -26,7 +25,7 @@ from sim_robot_core.registry import Caller, Registry, Robot
 
 from edits import Edits
 from isaac_models import IsaacModel, IsaacModels
-from world import Placement, World
+from world import SPOT_PITCH_M, Placement, World, name_in_the_stage, within_one_spot
 
 # How long a robot's stay waits between checks of its own lease, as a share
 # of the lease: a robot whose limbs are gone leaves within a quarter of a
@@ -69,8 +68,8 @@ class RobotsIO:
         node_runner,
         loop: asyncio.AbstractEventLoop,
         models: IsaacModels,
-        world: World,
         robots: Registry,
+        world: World,
         edits: Edits,
         io,
         lease_s: float,
@@ -94,16 +93,21 @@ class RobotsIO:
         # it through handles it cannot keep lets go of them first.
         self._rebind = lambda: None
         self._unbind = lambda: None
+        # Where the robots admitted but not standing yet were promised to
+        # stand, beside the name the admission in flight reserved. The node
+        # loop admits, stands and forgets, so one admission finishes with
+        # both before the next reads either.
         self._placements: dict[str, Placement] = {}
-        # Guards the placements promised to robots that have not stood yet.
-        self._admit_lock = threading.Lock()
         self._tasks: list[asyncio.Task] = []
         self._stays: set[asyncio.Task] = set()
         # The signal that ends each robot's stay without taking the robot
         # out of the scene, which is how a re-registering copy takes its own
         # robot over. Node loop only.
         self._handovers: dict[str, asyncio.Event] = {}
-        self._stopping = threading.Event()
+        self._stopping = asyncio.Event()
+        # The name an admission reserved, until the goal it was reserved for
+        # reaches its stay. Node loop only.
+        self._admitted: Optional[str] = None
 
     def _lease_check_period(self) -> float:
         """How often a stay checks its lease: a share of the lease, floored."""
@@ -122,8 +126,8 @@ class RobotsIO:
         resolve (a model whose stage lacks the joints its entry names) is
         taken back out, so one robot that cannot join never takes the scene
         down."""
-        self._unbind()
         try:
+            self._unbind()
             self._world.add(name, known, placement)
             try:
                 self._rebind()
@@ -140,20 +144,17 @@ class RobotsIO:
             self._robots.renew(self._loop.time())
 
     def unstand(self, name: str) -> None:
-        """Takes a robot out, gives its name back, and resolves the scene
-        around the robots that remain, on the thread that steps the scene.
-        The name goes back the moment nothing stands under it: the resolve
-        that follows takes most of a second, and a robot that comes straight
-        back is asking for its own name inside it. A removal that raises
-        keeps the name, because the robot is still standing."""
-        self._unbind()
+        """Takes a robot out and resolves the scene around the robots that
+        remain, on the thread that steps the scene.
+        What the robot's joining held went back before this was asked for,
+        so the stage is all that is left to change."""
         try:
+            self._unbind()
             self._world.remove(name)
-            self._robots.release(name)
             self._io.forget(name)
         finally:
             self._rebind()
-            self._robots.renew(self._loop.time())
+        self._robots.renew(self._loop.time())
 
     async def start(self) -> None:
         """Exposes both contracts and spawns their loops. Runs on the node
@@ -204,15 +205,34 @@ class RobotsIO:
             try:
                 context = await handle.handle_goal_next_request(self._admit)
                 if context is None:
+                    self._withdraw()
                     return
+                self._admitted = None
                 stay = asyncio.create_task(self._stay(context))
                 self._stays.add(stay)
                 stay.add_done_callback(self._stays.discard)
             except asyncio.CancelledError:
                 raise
             except Exception:  # pylint: disable=W0718
+                self._withdraw()
                 logger.exception("attach failed")
                 await asyncio.sleep(_RETRY_BACKOFF_S)
+
+    def _withdraw(self) -> None:
+        """Gives back what an admission reserved for a goal that never
+        reached its stay. A goal is accepted on a hop of its own after this
+        engine has answered for it, and a robot with no stay has nothing
+        watching its lease, so its name and its spot are held by nobody."""
+        name, self._admitted = self._admitted, None
+        if name is None:
+            return
+        self._forget(name)
+        self._robots.release(name)
+        logger.warning(
+            "the robot admitted as '%s' never reached its stay: its name and its spot "
+            "are free again",
+            name,
+        )
 
     def _admit(self, request: attach.GoalRequest) -> attach.GoalDecision:
         """Whether a robot may join, and the limbs it will drive, under the
@@ -221,7 +241,9 @@ class RobotsIO:
         already this caller's own robot. Admitting reserves the name, or
         hands this caller's standing robot over to the goal being admitted."""
         caller = Caller(core_node=request.core_node, instance_id=request.instance_id)
+        self._admitted = None
         try:
+            robot_name = name_in_the_stage(request.data.robot)
             entry = self._models.of(request.data.model).entry
         except ValueError as error:
             return attach.GoalDecision.reject(str(error))
@@ -230,23 +252,22 @@ class RobotsIO:
             arm_joints=entry.arm_joint_counts(),
             gripper_names=entry.gripper_names(),
         )
-        with self._admit_lock:
-            try:
-                adopted = self._robots.admit(
-                    request.data.robot, entry, caller, self._loop.time()
-                )
-            except ValueError as error:
-                return attach.GoalDecision.reject(str(error))
-            if adopted:
-                # The robot stands where it stands; only its host changes.
-                self._hand_over(request.data.robot)
-                return attach.GoalDecision.accept(limbs)
-            try:
-                placement = self._placement(request.data.placement)
-            except ValueError as error:
-                self._robots.release(request.data.robot)
-                return attach.GoalDecision.reject(str(error))
-            self._placements[request.data.robot] = placement
+        try:
+            adopted = self._robots.admit(robot_name, entry, caller, self._loop.time())
+        except ValueError as error:
+            return attach.GoalDecision.reject(str(error))
+        if adopted:
+            # The robot stands where it stands; only its host changes,
+            # and the stay taking it over is what ends the one hosting
+            # it now.
+            return attach.GoalDecision.accept(limbs)
+        try:
+            placement = self._placement(request.data.placement, robot_name)
+        except ValueError as error:
+            self._robots.release(robot_name)
+            return attach.GoalDecision.reject(str(error))
+        self._placements[robot_name] = placement
+        self._admitted = robot_name
         return attach.GoalDecision.accept(limbs)
 
     def _handover(self, name: str) -> asyncio.Event:
@@ -260,7 +281,7 @@ class RobotsIO:
         self._handover(name).set()
         self._handovers[name] = asyncio.Event()
 
-    def _placement(self, asked) -> Placement:
+    def _placement(self, asked, name: str) -> Placement:
         """Where the robot stands: what it asked for, or a spot of the
         engine's own. A spot another robot stands on is refused, because two
         robots in one place resolve their overlap by throwing each other.
@@ -268,14 +289,35 @@ class RobotsIO:
         so the spots already promised count as taken too."""
         promised = tuple(self._placements.values())
         if asked is None:
-            return self._world.free_spot(promised)
+            return self._world.free_spot(promised, name)
         placement = Placement.of(asked.position, asked.yaw)
-        if self._world.occupied(placement, promised):
+        holder = self._whoever_holds(placement, name)
+        if holder is not None:
             raise ValueError(
-                f"a robot already stands within a spot of {list(placement.position)}; join "
-                "with placement { auto: true } to take a free spot"
+                f"{holder} within {SPOT_PITCH_M:g} m of {list(placement.position)}: stand "
+                "this robot further off, or turn its `placement.auto` on and take the spot "
+                "this stage gives it"
             )
         return placement
+
+    def _whoever_holds(self, placement: Placement, name: str) -> Optional[str]:
+        """Who is in the way of a robot joining as `name`: the robot standing
+        there, or the copy promised the spot while it waits to stand. None
+        while the spot is free. A robot standing under `name` itself is the
+        one coming back: its name went back when its stay ended, and the
+        scene has yet to let it go."""
+        standing = self._world.standing_within(placement, name)
+        if standing is not None:
+            return f"'{standing.instance}' stands"
+        promised = next(
+            (
+                held
+                for held, spot in self._placements.items()
+                if within_one_spot(placement, spot)
+            ),
+            None,
+        )
+        return None if promised is None else f"'{promised}' is about to stand"
 
     async def _stay(self, context: attach.GoalContext) -> None:
         """One robot's stay in the scene: it joins, it is driven through its
@@ -289,14 +331,20 @@ class RobotsIO:
         request = context.request()
         name = request.data.robot
         model = request.data.model
-        handover = self._handover(name)
         robot = self._robots.of_name(name)
         if robot is None:
             await context.complete(False, "the name was given back before the robot stood")
             return
-        if robot.standing():
+        adopted = robot.standing()
+        if adopted:
+            # The goal that hosted this robot ends here, where the goal
+            # taking it over exists and is about to watch the robot's lease.
+            # Ending it takes the signal this stay then waits on, so the two
+            # happen in this order.
+            self._hand_over(name)
             logger.info("robot '%s' (%s) is hosted by its new goal", name, model)
-        elif not await self._stand(context, name, model):
+        handover = self._handover(name)
+        if not adopted and not await self._stand(context, name, model):
             return
         if not await self._standing(context, name):
             return
@@ -325,21 +373,24 @@ class RobotsIO:
             logger.info("robot '%s' is hosted by another goal of its copy", name)
             await context.complete(False, why)
             return
-        if ending is Ending.STOPPED:
-            self._robots.release(name)
-        else:
+        # Everything this robot's joining held goes back before the stage is
+        # asked to let it go. Taking a robot out waits for the thread that
+        # steps the scene, which is most of a second of resolve, and a copy
+        # that comes straight back is admitted inside that window: it finds
+        # its name free, so it is stood afresh, under the name and on the
+        # spot it is promised then.
+        self._forget(name)
+        self._robots.release(name)
+        if ending is not Ending.STOPPED:
             try:
                 await asyncio.wrap_future(self._edits.submit(lambda: self.unstand(name)))
             except Exception as error:  # pylint: disable=W0718
-                # The name stays taken, because the robot is still standing:
-                # the stage kept it when taking it out failed.
                 logger.error(
-                    "robot '%s' could not be taken out: %s. It stands with no host, "
-                    "and its name stays taken until this simulation restarts",
+                    "robot '%s' could not be taken out: %s. It stands with no host "
+                    "until this simulation restarts",
                     name,
                     error,
                 )
-        self._forget(name)
         if ending is Ending.LEFT:
             await context.complete_cancelled(True, why)
         else:
@@ -353,6 +404,9 @@ class RobotsIO:
         never stood."""
         placement = self._placements.get(name)
         if placement is None:
+            # Whatever took the spot back took the name with it, and this
+            # goal is the one holding it now.
+            self._robots.release(name)
             await context.complete(False, "the name was given back before the robot stood")
             return False
         known = self._models.of(model)
@@ -363,7 +417,7 @@ class RobotsIO:
             await asyncio.wait({standing, leaving}, return_when=asyncio.FIRST_COMPLETED)
         finally:
             leaving.cancel()
-        if not standing.done() and edit.cancel():
+        if edit.cancel():
             self._forget(name)
             self._robots.release(name)
             logger.info("robot '%s' left before it stood", name)
@@ -449,8 +503,7 @@ class RobotsIO:
     def _forget(self, name: str) -> None:
         """Drops what this robot's joining held, leaving the scene alone."""
         self._handovers.pop(name, None)
-        with self._admit_lock:
-            self._placements.pop(name, None)
+        self._placements.pop(name, None)
 
     async def _serve_ready(self) -> None:
         while True:

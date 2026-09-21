@@ -459,7 +459,7 @@ then restage the node with `peppy node add sim_isaac -sb --force`.
 built from its upstream geometry: MuJoCo Menagerie's `robotstudio_so101`
 (Apache-2.0) at the commit `sim_base_images/so101_model.lock.json` pins, the
 same files the MuJoCo node bakes and Waldo's catalogue names, so the three
-engines stand one robot. `scripts/build_so101.py` compiles the upstream MJCF
+engines stand the same robot. `scripts/build_so101.py` compiles the upstream MJCF
 with MuJoCo and writes the stage from the compiled model: one link prim per
 URDF link, with its mass, visual meshes and collision shapes, one revolute
 joint per hinge with a position drive, the base fixed to the world by the

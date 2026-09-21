@@ -5,7 +5,7 @@ so101_description, the hardware's source of truth, carries a kinematics-only
 URDF: no meshes, no collision, no inertia. The geometry comes from MuJoCo
 Menagerie's robotstudio_so101 (Apache-2.0) at the commit
 sim_base_images/so101_model.lock.json pins, the same files the MuJoCo node
-bakes and Waldo's catalogue names, so the three engines stand one robot.
+bakes and Waldo's catalogue names, so the three engines stand the same robot.
 
 MuJoCo compiles the upstream MJCF, and the stage is written from the
 compiled model: every body that carries a joint becomes a link prim under
