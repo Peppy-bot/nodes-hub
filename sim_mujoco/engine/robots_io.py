@@ -184,7 +184,7 @@ class RobotsIO:
                 "already: remove it first, or run a second simulation"
             )
         try:
-            adopted = self._robots.admit(request.data.robot, entry, caller, self._loop.time())
+            adopted = self._robots.admit(request.data.robot, entry, caller)
         except ValueError as error:
             return attach.GoalDecision.reject(str(error))
         if adopted:
@@ -231,7 +231,7 @@ class RobotsIO:
                 self._handovers.pop(name, None)
                 await context.complete(False, f"the scene could not stand the robot: {error}")
                 return
-            self._robots.stand(name, self._loop.time())
+            self._robots.stand(name)
             logger.info("robot '%s' (%s) is in the scene", name, model)
         if not await self._standing(context, name):
             return
@@ -318,17 +318,19 @@ class RobotsIO:
         are not its model's now, and were not for the lease. They are read
         here as well as on the watcher's tick, so a robot still holding them
         keeps its place however long the node loop went without renewing its
-        lease. A robot holding no pair is told its limbs were gone, and any
-        other which of its pairs and its model's limbs and cameras differ."""
+        lease, and a robot no limb reached yet keeps its place for as long as
+        its goal runs. A robot holding no pair is told its limbs were gone,
+        and any other which of its pairs and its model's limbs and cameras
+        differ."""
         now = self._loop.time()
         held = self._io.held_by(robot.name)
         mismatch = robot.entry.mismatch(held)
         if mismatch is None:
             self._robots.note_paired({robot.name}, now)
             return None
-        with robot.lock:
-            last = robot.last_paired_s
-        if now - last <= self._lease_s:
+        if held.holds_a_limb():
+            self._robots.note_limbs_reached(robot.name, now)
+        if not robot.lease_ran_out(now, self._lease_s):
             return None
         if held.is_empty():
             return (

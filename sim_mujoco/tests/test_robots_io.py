@@ -9,6 +9,7 @@ import concurrent.futures
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Optional
 from unittest.mock import Mock
 
 import pytest
@@ -140,7 +141,7 @@ def test_a_copy_re_registering_its_own_robot_is_admitted():
     robot it stands is accepted, and the robot is never stood again."""
     io = _robots_io()
     assert io._admit(_request()).accepted
-    io._robots.stand("alpha", now_s=1.0)
+    io._robots.stand("alpha")
 
     decision = io._admit(_request())
 
@@ -153,7 +154,7 @@ def test_a_copy_re_registering_its_own_robot_is_admitted():
 def test_a_re_registration_naming_another_model_is_refused():
     io = _robots_io()
     assert io._admit(_request()).accepted
-    io._robots.stand("alpha", now_s=1.0)
+    io._robots.stand("alpha")
     decision = io._admit(_request(model="so101"))
     assert not decision.accepted
     assert "stands 'alpha' as openarm_v2" in decision.payload
@@ -174,11 +175,16 @@ class _Pairs:
         self.forgotten.append(robot)
 
 
-def _leasing(now_s: float, held: Held, model: str = "openarm_v2") -> RobotsIO:
-    """A RobotsIO whose robot `alpha` of `model` last renewed its lease at
-    0 s and holds `held`, read at `now_s` with the lease this scene gives."""
+def _leasing(
+    now_s: float, held: Held, model: str = "openarm_v2", reached_s: Optional[float] = 0.0
+) -> RobotsIO:
+    """A RobotsIO whose robot `alpha` of `model` holds `held`, read at `now_s`
+    with the lease this scene gives. Its lease runs from `reached_s`, when a
+    limb first reached it, and not at all when that is None."""
     io = _robots_io()
-    io._robots.admit("alpha", MODELS.of(model).entry, CALLER, 0.0)
+    io._robots.admit("alpha", MODELS.of(model).entry, CALLER)
+    if reached_s is not None:
+        io._robots.note_limbs_reached("alpha", reached_s)
     io._loop = SimpleNamespace(time=lambda: now_s)
     io._io = _Pairs(held)
     io._lease_s = LEASE_S
@@ -222,7 +228,7 @@ class _Goal(_Answers):
 @pytest.mark.parametrize("model", ["openarm_v2", "so101"])
 def test_a_stand_asks_the_scene_for_the_robots_model(model):
     io = _robots_io()
-    io._robots.admit("alpha", MODELS.of(model).entry, CALLER, 0.0)
+    io._robots.admit("alpha", MODELS.of(model).entry, CALLER)
     refused = concurrent.futures.Future()
     refused.set_exception(RuntimeError("the test scene stands nothing"))
     io._stands = Mock(spec=["stand"])
@@ -318,12 +324,43 @@ class TestLease:
             f"none of this robot's limbs were paired for {LEASE}"
         )
 
-    def test_a_robot_has_the_lease_to_pair_its_limbs(self):
+    def test_a_robot_whose_limbs_left_keeps_its_place_for_the_lease(self):
         io = _leasing(now_s=LEASE_S, held=Held())
         robot = io._robots.of_name("alpha")
 
         assert io._lapse(robot) is None
         assert robot.last_paired_s == 0.0, "a lease still running is not a renewed one"
+
+    def test_a_robot_no_limb_reached_keeps_its_place_however_long_its_nodes_take(self):
+        """Its stay is its goal's until a limb reaches it, so a backbone slow
+        to come up finds the robot standing."""
+        io = _leasing(now_s=1_000_000.0, held=Held(), reached_s=None)
+        robot = io._robots.of_name("alpha")
+
+        assert io._lapse(robot) is None
+        assert robot.last_paired_s is None
+
+    def test_the_first_limb_to_reach_a_robot_starts_its_lease(self):
+        """Limbs of another model reach it: not its own, so from their
+        arrival on it has the lease to be paired as its model."""
+        io = _leasing(now_s=10.0, held=OPENARM_LIMBS, model="so101", reached_s=None)
+        robot = io._robots.of_name("alpha")
+
+        assert io._lapse(robot) is None
+        assert robot.last_paired_s == 10.0
+        io._loop = SimpleNamespace(time=lambda: 10.0 + LEASE_S + 0.1)
+        assert io._lapse(robot).startswith(
+            f"this robot's pairs were not its model's for {LEASE}"
+        )
+
+    def test_a_camera_reaching_a_robot_starts_no_lease(self):
+        io = _leasing(
+            now_s=10.0, held=Held(rgb_cameras=frozenset({"wrist_left"})), reached_s=None
+        )
+        robot = io._robots.of_name("alpha")
+
+        assert io._lapse(robot) is None
+        assert robot.last_paired_s is None
 
     def test_a_robot_missing_a_limb_lapses_naming_both_lists(self):
         held = Held(arms=OPENARM_LIMBS.arms, grippers=frozenset({"left_gripper"}))
@@ -348,8 +385,9 @@ class TestLease:
         )
 
     def test_a_robot_paired_as_another_model_has_its_stay_ended_naming_both_lists(self):
-        """It joined as an SO-101 and its backbone leads an OpenArm's limbs:
-        no pair of its own ever drives it, so its lease is never renewed."""
+        """It joined as an SO-101 and its backbone leads an OpenArm's limbs,
+        which reached it at 0 s: no pair of its own ever drives it, so its
+        lease is never renewed."""
         io = _leasing(now_s=10.0, held=OPENARM_LIMBS, model="so101")
         # The lease is read at once instead of after a share of it.
         io._lease_check_period = lambda: 0.0
@@ -399,7 +437,7 @@ class TestReadiness:
     def _ready(held: Held, model: str = "openarm_v2", standing: bool = True, caller: Caller = CALLER) -> bool:
         io = _leasing(now_s=1.0, held=held, model=model)
         if standing:
-            io._robots.stand("alpha", now_s=1.0)
+            io._robots.stand("alpha")
         request = SimpleNamespace(core_node=caller.core_node, instance_id=caller.instance_id)
         return io._ready(request).ready
 

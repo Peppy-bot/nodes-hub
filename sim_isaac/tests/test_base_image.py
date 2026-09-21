@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -95,11 +96,14 @@ def test_base_image_bakes_one_directory_per_robot_where_the_node_looks_stages_up
 
 def test_base_image_installs_the_package_the_engines_share():
     # The registry, the four slots, the model entries and the camera
-    # configuration come from sim_robot_core, pinned to one commit.
+    # configuration come from sim_robot_core, pinned to the commit these
+    # suites run the engine against.
+    pinned = tomllib.loads((Path(__file__).parent / "pyproject.toml").read_text())
+    rev = pinned["tool"]["uv"]["sources"]["sim_robot_core"]["rev"]
     requirements = (_IMAGES_DIR / "requirements.isaac.txt").read_text().splitlines()
     assert [line for line in requirements if line.startswith("sim_")] == [
         "sim_robot_core @ git+https://github.com/Peppy-bot/public-peppy-libs.git"
-        "@960ed472252acbb5766a1e604b337d511d31700b"
+        f"@{rev}"
         "#subdirectory=sim_robot_core"
     ]
 

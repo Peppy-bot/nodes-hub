@@ -161,11 +161,11 @@
       },
 
       // How long a robot may go without holding the pairs its model asks
-      // for before it leaves the stage. A robot's pairs dissolve when its
-      // nodes stop, so a robot whose process is gone leaves within this
-      // window; the same window is how long a robot that has just attached
-      // has to pair its limbs, and how long one paired as another model
-      // stays before its stay ends naming both lists.
+      // for before it leaves the stage, once a limb first reached it. A
+      // robot's pairs dissolve when its nodes stop, so a robot whose process
+      // is gone leaves within this window, and one paired as another model
+      // stays this long before its stay ends naming both lists; a robot no
+      // limb reached yet stays for as long as its goal does.
       robot_lease_ms: { $type: "u32", $default: 2000 },
 
       // Render and stream the cameras of each robot's own model on the
