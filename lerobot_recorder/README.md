@@ -7,7 +7,9 @@ read-only observer: it attaches to each pairing's measured back-channel
 pairing's leader setpoint stream (LeRobot's `action` feature: commanded
 positions and gripper openings) without claiming either endpoint, samples
 every source onto a fixed fps grid, and writes episodes driven by the
-`record_episode` peppy action. The two "action"s are unrelated: LeRobot's is
+`record_episode` peppy action of the `episode_recording:v1` contract the node
+implements, beside its `finish_session` and `resume_session` services. The
+two "action"s are unrelated: LeRobot's is
 a per-frame dataset feature, peppy's is a goal/feedback/result RPC. A
 setpoint is a latest-wins command, so the action feature holds the last
 commanded value between messages rather than aging out the way state

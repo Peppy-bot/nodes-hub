@@ -25,8 +25,8 @@ from peppygen.consumed_topics.rgbd_cameras import (
 from peppygen.consumed_topics.rgbd_cameras import (
     video_stream as rgbd_cameras_video_stream,
 )
-from peppygen.exposed_services import finish_session as finish_session_svc
-from peppygen.exposed_services import resume_session as resume_session_svc
+from peppygen.exposed_services.recording import finish_session as finish_session_svc
+from peppygen.exposed_services.recording import resume_session as resume_session_svc
 from peppygen.parameters import Parameters
 
 from . import plan as plan_mod
