@@ -98,7 +98,8 @@ async fn simulation_ready(runner: &NodeRunner) -> bool {
 /// Whether every driver of this robot's limbs reports ready. True for a
 /// robot with no drivers of its own.
 async fn every_limb_ready(runner: &NodeRunner) -> bool {
-    let polls = limb_is_ready::bound_producers(runner)
+    let limbs = limb_is_ready::bound_producers(runner);
+    let polls = limbs
         .iter()
         .map(|limb| async move {
             matches!(
