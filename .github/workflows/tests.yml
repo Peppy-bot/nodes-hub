@@ -1,8 +1,14 @@
 name: Tests
 
-# Runs every repository Rust, Python, JavaScript and TypeScript test on each
+# Runs this repository's Rust, Python, JavaScript and TypeScript tests on each
 # pull request and push to main. Test discovery follows filesystem conventions
 # at every depth, so new projects and suites need no workflow entries.
+#
+# A push to main runs every suite. A pull request runs the suites of the
+# projects it touches, and anything it changes that no project holds (this
+# file, the scripts it runs, anything at the root) puts every project back in
+# scope. Every project a run leaves out is named in its summary, so a scoped
+# run never reads as full coverage.
 #
 # Every node depends on generated code (its gitignored `.peppy/libs`) that only
 # a running peppy daemon can produce, since `peppy node sync` calls the daemon's
@@ -103,6 +109,10 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          # Full history: discovery diffs a pull request against its base to
+          # decide which projects' suites to run, and a shallow checkout holds
+          # neither the base commit nor the merge base with it.
+          fetch-depth: 0
           # Nothing here pushes, so the job has no use for a writable
           # credential sitting in .git/config for every later step to inherit.
           persist-credentials: false
@@ -157,8 +167,16 @@ jobs:
             echo "No Docker Hub credentials in scope; pulls stay anonymous and share the box's quota."
           fi
 
-      - name: Discover all Rust and Python tests
+      # Discovery decides what the rest of this job runs, so its own suite runs
+      # first: a selection bug is the one kind that goes unnoticed, because it
+      # reports success over the suites it never selected.
+      - name: Run the discovery script's own tests
+        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
+
+      - name: Discover the tests this change reaches
         id: discover
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: python3 .github/scripts/discover-tests.py
 
       - name: Install peppy
@@ -183,11 +201,11 @@ jobs:
         if: steps.discover.outputs.any == 'true'
         run: python3 .github/scripts/check-lockfiles.py
 
-      - name: Run all Rust tests in their build containers
+      - name: Run the selected Rust tests in their build containers
         if: steps.discover.outputs.any == 'true'
         run: python3 .github/scripts/run-rust-tests.py
 
-      - name: Run all Python tests in their build containers
+      - name: Run the selected Python tests in their build containers
         if: steps.discover.outputs.any == 'true'
         run: python3 .github/scripts/run-python-tests.py
 
