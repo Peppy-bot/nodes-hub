@@ -43,9 +43,11 @@ from peppygen.paired_topics.arms import joint_setpoints as arm_setpoints
 from peppygen.paired_topics.arms import joint_states as arm_states
 from peppygen.paired_topics.grippers import gripper_setpoints
 from peppygen.paired_topics.grippers import gripper_states
+from peppygen.paired_topics.rgb_cameras import geometry as rgb_geometry
 from peppygen.paired_topics.rgb_cameras import stream_info as rgb_info
 from peppygen.paired_topics.rgb_cameras import video_stream as rgb_video
 from peppygen.paired_topics.rgbd_cameras import depth_stream as rgbd_depth
+from peppygen.paired_topics.rgbd_cameras import geometry as rgbd_geometry
 from peppygen.paired_topics.rgbd_cameras import stream_info as rgbd_info
 from peppygen.paired_topics.rgbd_cameras import video_stream as rgbd_video
 from sim_robot_core.pairs import ARMS, GRIPPERS, RGB_CAMERAS, RGBD_CAMERAS, Held, PairTable
@@ -64,8 +66,12 @@ _MIN_ENGINE_TIME_S = 1e-9
 _VIDEO_STREAM = "video_stream"
 _DEPTH_STREAM = "depth_stream"
 _STREAM_INFO = "stream_info"
+_GEOMETRY = "geometry"
 _FRAMES_SURFACE = "frames"
 _INFO_SURFACE = "info"
+# Geometry goes out on the same tick as the stream info, so it takes a guard
+# of its own: sharing the info one would drop whichever was scheduled second.
+_GEOMETRY_SURFACE = "geometry"
 
 
 class _LatestSlot:
@@ -89,6 +95,9 @@ class _LatestSlot:
 # is reported. Well past any real batch at these frame rates, so reaching it
 # means the publish is not going to complete on its own.
 _PUBLISH_STALL_S = 5.0
+
+# A rendered image is an ideal pinhole: the camera_geometry contract's "none".
+_RENDERED_DISTORTION = "none"
 
 
 class _PublishGuard:
@@ -195,11 +204,17 @@ class SimTopicIO:
         self._arm_pub = await arm_states.declare_publisher(self._node_runner)
         self._gripper_pub = await gripper_states.declare_publisher(self._node_runner)
         await self._declare_camera_publishers(
-            RGB_CAMERAS, [(_VIDEO_STREAM, rgb_video), (_STREAM_INFO, rgb_info)]
+            RGB_CAMERAS,
+            [(_VIDEO_STREAM, rgb_video), (_STREAM_INFO, rgb_info), (_GEOMETRY, rgb_geometry)],
         )
         await self._declare_camera_publishers(
             RGBD_CAMERAS,
-            [(_VIDEO_STREAM, rgbd_video), (_DEPTH_STREAM, rgbd_depth), (_STREAM_INFO, rgbd_info)],
+            [
+                (_VIDEO_STREAM, rgbd_video),
+                (_DEPTH_STREAM, rgbd_depth),
+                (_STREAM_INFO, rgbd_info),
+                (_GEOMETRY, rgbd_geometry),
+            ],
         )
         self._tasks = [
             asyncio.create_task(self._consume_arms()),
@@ -505,6 +520,68 @@ class SimTopicIO:
         )
         self._publish_guarded(
             RGBD_CAMERAS, robot, name, _INFO_SURFACE, [(_STREAM_INFO, payload)]
+        )
+
+    def publish_color_geometry(self, robot: str, name: str, color) -> None:
+        """Where a colour camera's pixels point: `color` is the pinhole model
+        of its stream (width, height, fx, fy, cx, cy), rendered and so without
+        distortion."""
+        payload = rgb_geometry.build_message(
+            width=color.width,
+            height=color.height,
+            fx=color.fx,
+            fy=color.fy,
+            cx=color.cx,
+            cy=color.cy,
+            distortion_model=_RENDERED_DISTORTION,
+            distortion=[],
+        )
+        self._publish_guarded(
+            RGB_CAMERAS, robot, name, _GEOMETRY_SURFACE, [(_GEOMETRY, payload)]
+        )
+
+    def publish_rgbd_geometry(
+        self,
+        robot: str,
+        name: str,
+        color,
+        depth,
+        depth_model: str,
+        min_depth_m: float,
+        max_depth_m: float,
+        align_mode: str,
+        depth_to_color_position: tuple[float, float, float],
+        depth_to_color_orientation: tuple[float, float, float, float],
+    ) -> None:
+        """Where an rgbd camera's pixels point and how its depth sits against
+        its colour: `color` and `depth` are the pinhole models of the two
+        streams, each at its own published size."""
+        payload = rgbd_geometry.build_message(
+            width=color.width,
+            height=color.height,
+            fx=color.fx,
+            fy=color.fy,
+            cx=color.cx,
+            cy=color.cy,
+            distortion_model=_RENDERED_DISTORTION,
+            distortion=[],
+            depth_width=depth.width,
+            depth_height=depth.height,
+            depth_fx=depth.fx,
+            depth_fy=depth.fy,
+            depth_cx=depth.cx,
+            depth_cy=depth.cy,
+            depth_distortion_model=_RENDERED_DISTORTION,
+            depth_distortion=[],
+            depth_model=depth_model,
+            min_depth_m=min_depth_m,
+            max_depth_m=max_depth_m,
+            align_mode=align_mode,
+            depth_to_color_position=list(depth_to_color_position),
+            depth_to_color_orientation=list(depth_to_color_orientation),
+        )
+        self._publish_guarded(
+            RGBD_CAMERAS, robot, name, _GEOMETRY_SURFACE, [(_GEOMETRY, payload)]
         )
 
     async def _declare_camera_publishers(

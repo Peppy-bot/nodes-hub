@@ -1,8 +1,8 @@
 // The relay loops and their assembly: frames forward to the contract
 // surface, the stream descriptions feed the info service, the camera
-// controls and the profile forward to the simulation's camera response model
-// under the camera's name, which is this relay's name in its copy, and
-// `setup` wires them together.
+// geometry feeds the geometry services, the camera controls and the profile
+// forward to the simulation's camera response model under the camera's name,
+// which is this relay's name in its copy, and `setup` wires them together.
 
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,8 +17,13 @@ use peppygen::emitted_topics::camera::video_stream as camera_video;
 use peppygen::exposed_services::camera::{
     set_brightness, set_contrast, set_exposure, set_gain, set_white_balance, video_stream_info,
 };
+use peppygen::exposed_services::geometry::{
+    get_color_intrinsics, get_depth_intrinsics, get_depth_to_color_extrinsics,
+};
 use peppygen::exposed_services::profile::{get_camera_profile, reset_camera};
-use peppygen::paired_topics::simulation::{stream_info, video_stream as simulation_video};
+use peppygen::paired_topics::simulation::{
+    geometry as simulation_geometry, stream_info, video_stream as simulation_video,
+};
 use peppygen::{NodeRunner, Parameters, ProducerRef, Result};
 use peppylib::runtime::CancellationToken;
 use tracing::{error, info, warn};
@@ -55,6 +60,20 @@ const NO_RESPONSE_MODEL_MESSAGE: &str =
 /// zed answer when no usable hardware value exists.
 const NO_CURRENT_VALUE: i32 = -1;
 
+/// The refusal get_color_intrinsics answers until the simulation's first
+/// geometry arrives. The relay has no camera model of its own, and zeros
+/// handed over as a pinhole model would have a consumer divide by them.
+const NO_GEOMETRY_MESSAGE: &str = "no camera geometry received from the simulation yet";
+
+/// What get_color_intrinsics says beside the numbers it hands over: they are
+/// the simulation's, relayed as they came.
+const GEOMETRY_MESSAGE: &str = "geometry as published by the simulation";
+
+/// The refusal the two depth services of camera_geometry always answer. The
+/// contract requires them of every camera, and a colour camera has no depth
+/// stream to describe or to place against its colour one.
+const NO_DEPTH_STREAM_MESSAGE: &str = "a colour camera has no depth stream";
+
 /// The simulation's latest stream description; zeros until the first one arrives.
 #[derive(Clone, Default)]
 struct StreamDescription {
@@ -65,6 +84,10 @@ struct StreamDescription {
 }
 
 type SharedDescription = Arc<Mutex<StreamDescription>>;
+
+/// The simulation's latest camera geometry, kept as it came; none until the
+/// first one arrives.
+type SharedGeometry = Arc<Mutex<Option<simulation_geometry::Message>>>;
 
 /// Logs the first error of a run and suppresses the rest until something
 /// succeeds, then waits out the backoff. A loop whose only outcome is an error
@@ -271,6 +294,89 @@ fn timestamp_is_valid(timestamp: std::time::SystemTime) -> bool {
     timestamp > std::time::SystemTime::UNIX_EPOCH
 }
 
+/// A pinhole model a consumer can use: an image with a size, focal lengths it
+/// can divide by and a principal point that is a number.
+fn pinhole_is_valid(width: u32, height: u32, fx: f64, fy: f64, cx: f64, cy: f64) -> bool {
+    width > 0
+        && height > 0
+        && fx.is_finite()
+        && fx > 0.0
+        && fy.is_finite()
+        && fy > 0.0
+        && cx.is_finite()
+        && cy.is_finite()
+}
+
+/// get_color_intrinsics: the stream's pinhole model as the simulation
+/// published it, or the refusal while no geometry has arrived.
+fn color_intrinsics(
+    geometry: Option<simulation_geometry::Message>,
+) -> get_color_intrinsics::Response {
+    match geometry {
+        Some(g) => get_color_intrinsics::Response::new(
+            true,
+            GEOMETRY_MESSAGE.to_string(),
+            g.width,
+            g.height,
+            g.fx,
+            g.fy,
+            g.cx,
+            g.cy,
+            g.distortion_model,
+            g.distortion,
+        ),
+        None => get_color_intrinsics::Response::new(
+            false,
+            NO_GEOMETRY_MESSAGE.to_string(),
+            0,
+            0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            String::new(),
+            Vec::new(),
+        ),
+    }
+}
+
+/// get_depth_intrinsics on a colour camera: there is no depth stream to
+/// describe, whatever the simulation has said.
+fn depth_intrinsics(
+    _geometry: Option<simulation_geometry::Message>,
+) -> get_depth_intrinsics::Response {
+    get_depth_intrinsics::Response::new(
+        false,
+        NO_DEPTH_STREAM_MESSAGE.to_string(),
+        0,
+        0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        String::new(),
+        Vec::new(),
+        String::new(),
+        0.0,
+        0.0,
+        String::new(),
+    )
+}
+
+/// get_depth_to_color_extrinsics on a colour camera: with no depth stream
+/// there is nothing to place against the colour one.
+fn depth_to_color_extrinsics(
+    _geometry: Option<simulation_geometry::Message>,
+) -> get_depth_to_color_extrinsics::Response {
+    get_depth_to_color_extrinsics::Response::new(
+        false,
+        NO_DEPTH_STREAM_MESSAGE.to_string(),
+        String::new(),
+        [0.0; 3],
+        [0.0; 4],
+    )
+}
+
 /// Track the simulation's latest stream description for the info service.
 async fn track_stream_info(
     runner: Arc<NodeRunner>,
@@ -308,7 +414,54 @@ async fn track_stream_info(
     }
 }
 
-/// Answer one stream-info service from the shared stream description.
+/// Track the simulation's latest camera geometry for get_color_intrinsics.
+async fn track_geometry(
+    runner: Arc<NodeRunner>,
+    geometry: SharedGeometry,
+    token: CancellationToken,
+) {
+    let mut sub = match simulation_geometry::subscribe(&runner).await {
+        Ok(s) => s,
+        Err(e) => return error!("simulation geometry subscribe: {e}"),
+    };
+    let mut rejecting = false;
+    let mut receive_errors = RepeatedError::default();
+    loop {
+        let received = tokio::select! {
+            _ = token.cancelled() => return,
+            received = sub.next() => received,
+        };
+        match received {
+            Ok(Some((_, msg))) => {
+                // A consumer turns a pixel into a ray with these numbers, so
+                // a model it cannot divide by is ignored whole.
+                if !pinhole_is_valid(msg.width, msg.height, msg.fx, msg.fy, msg.cx, msg.cy) {
+                    if !rejecting {
+                        rejecting = true;
+                        warn!(
+                            "ignoring geometry with an unusable pinhole model, suppressing repeats"
+                        );
+                    }
+                    continue;
+                }
+                rejecting = false;
+                *geometry
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(msg);
+            }
+            Ok(None) => return,
+            Err(e) => {
+                receive_errors
+                    .report("simulation geometry receive", e)
+                    .await;
+            }
+        }
+    }
+}
+
+/// Answer one service from what the simulation last said: the stream-info
+/// service from the shared stream description, a geometry service from the
+/// shared geometry.
 macro_rules! spawn_info_service {
     ($runner:expr, $description:expr, $service:ident, $respond:expr) => {{
         let runner = $runner.clone();
@@ -401,6 +554,7 @@ macro_rules! spawn_forwarding_control {
 pub async fn setup(_params: Parameters, node_runner: Arc<NodeRunner>) -> Result<()> {
     let token = node_runner.cancellation_token().clone();
     let description: SharedDescription = Arc::new(Mutex::new(StreamDescription::default()));
+    let geometry: SharedGeometry = Arc::new(Mutex::new(None));
     let route = Arc::new(ControlRoute::new(node_runner.clone()));
     match &route.camera {
         Ok(camera) => info!("this relay is camera '{camera}'"),
@@ -419,6 +573,24 @@ pub async fn setup(_params: Parameters, node_runner: Arc<NodeRunner>) -> Result<
         |d: StreamDescription| {
             video_stream_info::Response::new(d.width, d.height, d.frames_per_second, d.encoding)
         }
+    );
+    spawn_info_service!(
+        node_runner,
+        geometry,
+        get_color_intrinsics,
+        color_intrinsics
+    );
+    spawn_info_service!(
+        node_runner,
+        geometry,
+        get_depth_intrinsics,
+        depth_intrinsics
+    );
+    spawn_info_service!(
+        node_runner,
+        geometry,
+        get_depth_to_color_extrinsics,
+        depth_to_color_extrinsics
     );
     spawn_forwarding_control!(route, set_exposure => set_camera_exposure, [mode, value], current_value = NO_CURRENT_VALUE);
     spawn_forwarding_control!(
@@ -447,6 +619,7 @@ pub async fn setup(_params: Parameters, node_runner: Arc<NodeRunner>) -> Result<
         description,
         token.clone(),
     ));
+    let geometry = tokio::spawn(track_geometry(node_runner.clone(), geometry, token.clone()));
     // A dead relay leg would hold its direction silently while the node
     // reports healthy; flag it and cancel, so the process exits with a
     // failure the stack shows instead of a clean finish.
@@ -454,6 +627,7 @@ pub async fn setup(_params: Parameters, node_runner: Arc<NodeRunner>) -> Result<
         tokio::select! {
             _ = frames => {}
             _ = info => {}
+            _ = geometry => {}
         }
         if !token.is_cancelled() {
             LEG_DIED.store(true, Ordering::SeqCst);
@@ -514,5 +688,75 @@ mod tests {
         assert!(!timestamp_is_valid(
             SystemTime::UNIX_EPOCH - Duration::from_secs(1)
         ));
+    }
+
+    /// A wrist camera as the engines publish it: 960x600 from a 66 degree
+    /// view.
+    fn wrist_geometry() -> simulation_geometry::Message {
+        simulation_geometry::Message {
+            width: 960,
+            height: 600,
+            fx: 461.9595,
+            fy: 461.9595,
+            cx: 479.5,
+            cy: 299.5,
+            distortion_model: "none".to_string(),
+            distortion: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn pinhole_guard_wants_a_size_and_focal_lengths_to_divide_by() {
+        assert!(pinhole_is_valid(960, 600, 461.9, 461.9, 479.5, 299.5));
+        // A principal point off the image is still a camera: a cropped or
+        // shifted sensor has one.
+        assert!(pinhole_is_valid(960, 600, 461.9, 461.9, -12.0, 900.0));
+        assert!(!pinhole_is_valid(0, 600, 461.9, 461.9, 479.5, 299.5));
+        assert!(!pinhole_is_valid(960, 0, 461.9, 461.9, 479.5, 299.5));
+        for focal in [0.0, -461.9, f64::NAN, f64::INFINITY] {
+            assert!(!pinhole_is_valid(960, 600, focal, 461.9, 479.5, 299.5));
+            assert!(!pinhole_is_valid(960, 600, 461.9, focal, 479.5, 299.5));
+        }
+        assert!(!pinhole_is_valid(960, 600, 461.9, 461.9, f64::NAN, 299.5));
+        assert!(!pinhole_is_valid(
+            960,
+            600,
+            461.9,
+            461.9,
+            479.5,
+            f64::INFINITY
+        ));
+    }
+
+    #[test]
+    fn color_intrinsics_refuse_until_a_geometry_arrives() {
+        let refused = color_intrinsics(None);
+        assert!(!refused.success);
+        assert_eq!(refused.message, NO_GEOMETRY_MESSAGE);
+        assert_eq!((refused.width, refused.height), (0, 0));
+
+        let answered = color_intrinsics(Some(wrist_geometry()));
+        assert!(answered.success);
+        assert_eq!((answered.width, answered.height), (960, 600));
+        assert_eq!(
+            (answered.fx, answered.cx, answered.cy),
+            (461.9595, 479.5, 299.5)
+        );
+        assert_eq!(answered.distortion_model, "none");
+    }
+
+    #[test]
+    fn the_depth_answers_refuse_whatever_the_simulation_said() {
+        for geometry in [None, Some(wrist_geometry())] {
+            let depth = depth_intrinsics(geometry.clone());
+            assert!(!depth.success);
+            assert_eq!(depth.message, NO_DEPTH_STREAM_MESSAGE);
+            assert_eq!((depth.width, depth.height), (0, 0));
+
+            let pose = depth_to_color_extrinsics(geometry);
+            assert!(!pose.success);
+            assert_eq!(pose.message, NO_DEPTH_STREAM_MESSAGE);
+            assert_eq!(pose.depth_to_color_orientation, [0.0; 4]);
+        }
     }
 }

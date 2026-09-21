@@ -111,9 +111,11 @@
         { link_id: "grippers", name: "gripper_states" },
         { link_id: "rgb_cameras", name: "video_stream" },
         { link_id: "rgb_cameras", name: "stream_info" },
+        { link_id: "rgb_cameras", name: "geometry" },
         { link_id: "rgbd_cameras", name: "video_stream" },
         { link_id: "rgbd_cameras", name: "depth_stream" },
         { link_id: "rgbd_cameras", name: "stream_info" },
+        { link_id: "rgbd_cameras", name: "geometry" },
         { link_id: "objects", name: "object_states" },
       ],
 

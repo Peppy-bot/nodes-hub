@@ -23,6 +23,7 @@ sys.path.insert(0, str(_ENGINE_DIR))
 sys.path.insert(0, str(_ENGINE_DIR / "exts"))
 
 import camera_sensor
+from camera_geometry import pinhole
 from camera_sensor import (
     _HEARTBEAT_TIMEOUT_S,
     _LATE_REPORT_PERIOD_S,
@@ -162,6 +163,7 @@ class FakeIO:
         self.frames = []
         self.rgbd = []
         self.infos = []
+        self.geometries = []
         self.delivers = delivers
         self.now_s = 123.0
 
@@ -191,6 +193,18 @@ class FakeIO:
         assert robot == ROBOT
         self.infos.append((name, width, height, fps, encoding,
                            depth_width, depth_height, depth_encoding, depth_unit))
+
+    def publish_color_geometry(self, robot, name, color):
+        assert robot == ROBOT
+        self.geometries.append((name, color))
+
+    def publish_rgbd_geometry(
+        self, robot, name, color, depth, depth_model, min_depth_m, max_depth_m,
+        align_mode, depth_to_color_position, depth_to_color_orientation,
+    ):
+        assert robot == ROBOT
+        self.geometries.append((name, color, depth, depth_model, min_depth_m, max_depth_m,
+                                align_mode, depth_to_color_position, depth_to_color_orientation))
 
 
 @pytest.fixture(name="clock")
@@ -697,3 +711,49 @@ def test_stop_clears_the_heartbeat_so_shutdown_is_not_a_wedged_renderer(
     # Well past the bound a beating thread would have to meet.
     clock.set(_HEARTBEAT_TIMEOUT_S * 2)
     sensor.raise_if_failed()
+
+
+def test_geometry_goes_out_with_the_stream_info(scene, clock):
+    camera = color_camera()
+    model = compile_model_with_cameras(scene, [camera])
+    io = FakeIO()
+    sensor, color, depth = sensor_with_fakes(model, [camera], io)
+    pose = np.zeros(model.nq)
+
+    # The same slow cadence as the stream description: once on opening, then
+    # the 1 Hz repeat.
+    for tick in range(_FPS + 1):
+        clock.set(tick / _FPS)
+        render_due(sensor, model, color, depth, pose=pose)
+
+    assert [geometry[0] for geometry in io.geometries] == ["wrist", "wrist"]
+    assert io.geometries[0] == ("wrist", pinhole(camera.fovy_deg, _COLOR[0], _COLOR[1]))
+    assert len(io.infos) == len(io.geometries)
+
+
+def test_an_rgbd_camera_says_how_its_depth_sits_against_its_colour(scene, clock):
+    camera = rgbd_camera()
+    model = compile_model_with_cameras(scene, [camera])
+    io = FakeIO()
+    sensor, color, depth = sensor_with_fakes(model, [camera], io)
+
+    render_due(sensor, model, color, depth, pose=np.zeros(model.nq))
+
+    # Depth has a renderer of its own at the depth stream's size, so its grid
+    # is a centred pinhole of the same field of view, seen from the colour
+    # camera's own frame.
+    assert io.geometries == [
+        (
+            "chest",
+            pinhole(camera.fovy_deg, _COLOR[0], _COLOR[1]),
+            pinhole(camera.fovy_deg, _DEPTH[0], _DEPTH[1]),
+            "z",
+            0.1,
+            10.0,
+            "depth_to_color",
+            (0.0, 0.0, 0.0),
+            (0.0, 0.0, 0.0, 1.0),
+        )
+    ]
+    depth_model = io.geometries[0][2]
+    assert (depth_model.cx, depth_model.cy) == ((_DEPTH[0] - 1) / 2, (_DEPTH[1] - 1) / 2)

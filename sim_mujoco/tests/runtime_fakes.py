@@ -23,8 +23,8 @@ from typing import Optional
 SLOT_TOPICS = {
     "arms": ("joint_setpoints", "joint_states"),
     "grippers": ("gripper_setpoints", "gripper_states"),
-    "rgb_cameras": ("video_stream", "stream_info"),
-    "rgbd_cameras": ("video_stream", "depth_stream", "stream_info"),
+    "rgb_cameras": ("video_stream", "stream_info", "geometry"),
+    "rgbd_cameras": ("video_stream", "depth_stream", "stream_info", "geometry"),
 }
 
 # The core node every fake instance runs on.

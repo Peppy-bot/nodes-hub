@@ -15,6 +15,7 @@ sys.path.insert(0, str(_ENGINE_DIR / "exts"))
 
 import camera_sensor
 import isaac_models
+from camera_geometry import pinhole
 from camera_sensor import _MAX_CAPTURE_FAILURES, IsaacCameraSensor
 from sim_robot_core.cameras import CameraConfig, DepthSpec
 from sim_robot_core.models import Arm, EngineModel, ModelEntry, shipped_entry
@@ -52,6 +53,7 @@ class FakeIO:
     def __init__(self, delivers=True):
         self.frames = []
         self.infos = []
+        self.geometries = []
         self.depth_payloads = []
         self.delivers = delivers
 
@@ -72,6 +74,12 @@ class FakeIO:
 
     def publish_rgbd_stream_info(self, *args):
         self.infos.append(args)
+
+    def publish_color_geometry(self, *args):
+        self.geometries.append(args)
+
+    def publish_rgbd_geometry(self, *args):
+        self.geometries.append(args)
 
 
 def _known(*cameras, **engine):
@@ -260,6 +268,43 @@ class TestRgbdCapture:
         assert render_product.updates == [True, False]
         (_, _, _, payload) = io.depth_payloads[0]
         assert len(payload) == (_WIDTH // 2) * (_HEIGHT // 2) * 2
+
+
+class TestGeometry:
+    def test_geometry_goes_out_with_the_stream_info(self, clock):
+        sensor, _, _, io = _sensor()
+        sensor.step()
+        assert len(io.infos) == 1
+        assert io.geometries == [("alpha", "cam", pinhole(60.0, _WIDTH, _HEIGHT))]
+
+    def test_an_rgbd_cameras_depth_grid_is_a_centred_pinhole(self, clock):
+        camera = CameraConfig(
+            name="rgbd",
+            parent_link="link",
+            pos=(0.0, 0.0, 0.0),
+            quat_wxyz=(1.0, 0.0, 0.0, 0.0),
+            fovy_deg=60.0,
+            width=_WIDTH,
+            height=_HEIGHT,
+            fps=_FPS,
+            depth=DepthSpec(
+                width=_WIDTH // 2, height=_HEIGHT // 2, min_depth_m=0.1, max_range_m=1.0
+            ),
+        )
+        io = FakeIO()
+        sensor = IsaacCameraSensor("alpha", "/World/alpha", _known(camera), io)
+
+        sensor._publish_geometry(camera)
+
+        color = pinhole(60.0, _WIDTH, _HEIGHT)
+        depth = pinhole(60.0, _WIDTH // 2, _HEIGHT // 2)
+        assert io.geometries == [
+            ("alpha", "rgbd", color, depth, "z", 0.1, 1.0, "depth_to_color",
+             (0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
+        ]
+        # The same field of view at the depth stream's size, centred.
+        assert depth.fx == pytest.approx(color.fx / 2)
+        assert (depth.cx, depth.cy) == ((_WIDTH // 2 - 1) / 2, (_HEIGHT // 2 - 1) / 2)
 
 
 class TestWhereAModelsCamerasHang:
