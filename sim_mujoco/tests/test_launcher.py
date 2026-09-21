@@ -253,6 +253,44 @@ class TestLoadingAScene:
             _launcher()._load_model(known)  # pylint: disable=W0212
 
 
+class TestTickingWhileStanding:
+    """A burst of ticks ends at the tick after which the scene is over, so a
+    robot leaving a scene stepped behind real time is answered within one
+    tick of the ask, not one burst."""
+
+    def test_a_burst_runs_whole_while_the_robot_stands(self):
+        launcher = _launcher(Stands(), threading.Event())
+        ticks = []
+
+        launcher._tick_while_standing(lambda: ticks.append(1), 200)  # pylint: disable=W0212
+
+        assert len(ticks) == 200
+
+    def test_an_unstand_asked_during_a_burst_ends_it_at_the_next_tick(self):
+        stands = Stands()
+        launcher = _launcher(stands, threading.Event())
+        ticks = []
+
+        def tick():
+            ticks.append(1)
+            if len(ticks) == 3:
+                stands.unstand()
+
+        launcher._tick_while_standing(tick, 200)  # pylint: disable=W0212
+
+        assert len(ticks) == 3
+
+    def test_an_engine_stopping_ticks_no_further(self):
+        stop = threading.Event()
+        launcher = _launcher(Stands(), stop)
+        ticks = []
+        stop.set()
+
+        launcher._tick_while_standing(lambda: ticks.append(1), 200)  # pylint: disable=W0212
+
+        assert ticks == []
+
+
 def test_a_stand_whose_scene_cannot_load_fails_that_stand_alone():
     """The thread loads each stand's model, answers a scene that cannot load
     on that stand's own future, and goes on serving."""

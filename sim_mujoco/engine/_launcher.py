@@ -198,6 +198,17 @@ class SimLauncher:
         that stands here is leaving."""
         return self._stop.is_set() or self._stands.unstand_pending()
 
+    def _tick_while_standing(self, tick, ticks: int) -> None:
+        """Ticks the viewer up to `ticks` times, and no further once the
+        scene is over. A tick paces itself against wall time: on a box that
+        cannot step the scene in real time, every tick spends a whole frame
+        stepping, so a burst of them lasts seconds, and a robot leaving is
+        answered by the tick after the ask, not the burst after it."""
+        for _ in range(ticks):
+            if self._scene_over():
+                return
+            tick()
+
     def _run_streamed(self, model, data, extension: MujocoBridgeExtension) -> None:
         import mujoco as _mujoco
         import viser
@@ -273,8 +284,7 @@ class SimLauncher:
                     # stall recovery the sim falls behind real time
                     # permanently rather than catching up.
                     n = min(n, 200)
-                    for _ in range(n):
-                        viewer._tick()  # pylint: disable=W0212
+                    self._tick_while_standing(viewer._tick, n)  # pylint: disable=W0212
                     _last_phys_wall += n * _dt
                 if now - _last_render >= _render_period:
                     viewer._render()  # pylint: disable=W0212
