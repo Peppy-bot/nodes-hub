@@ -17,3 +17,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 peppygen = { path = ".peppy/libs/peppygen", features = ["testing"] }
+tokio = { version = "1", features = ["test-util"] }
