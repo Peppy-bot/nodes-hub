@@ -19,15 +19,17 @@ use realsense_rust::{
     config::Config,
     context::Context,
     frame::{ColorFrame, DepthFrame, ImageFrame},
-    kind::{Rs2Format, Rs2Option, Rs2StreamKind},
+    kind::{Rs2DistortionModel, Rs2Format, Rs2Option, Rs2StreamKind},
     pipeline::{ActivePipeline, FrameWaitError, InactivePipeline},
     processing_blocks::align::Align,
     sensor::Sensor,
+    stream_profile::StreamProfile,
 };
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use crate::frame::{FrameSet, Image};
+use crate::geometry::{Calibration, Distortion, Published, StreamExtrinsics, StreamIntrinsics};
 use crate::modes::{AlignMode, AutoManualMode, ColorFormat};
 
 /// Timestamp from this instance's bound clock: the OS clock under wall time,
@@ -84,6 +86,8 @@ pub struct PipelineConfig {
     pub depth_width: u32,
     pub depth_height: u32,
     pub depth_fps: NonZeroU8,
+    /// The align mode the capture loop starts in.
+    pub align_mode: AlignMode,
 }
 
 /// Owns the [`ActivePipeline`] and the Align processors. Consumed by
@@ -109,6 +113,10 @@ pub struct PipelineHandle {
     /// Meters per Z16 depth sample, read from the device at open(). Static for
     /// the session; surfaced to consumers via `depth_stream_info`.
     depth_unit: f32,
+    /// The device's calibration for the two opened streams, read at open(),
+    /// or why it could not be read. Static for the session; the geometry
+    /// services answer from it without touching the device.
+    calibration: Result<Calibration, String>,
 }
 
 impl Capture {
@@ -268,6 +276,17 @@ impl PipelineHandle {
         self.depth_unit
     }
 
+    /// The geometry of the streams as the current align mode publishes them,
+    /// or why the device's calibration could not be read. The mode is read
+    /// here, once per answer, so every part of one answer describes the same
+    /// mode.
+    pub fn published_geometry(&self) -> Result<Published, String> {
+        self.calibration
+            .as_ref()
+            .map(|calibration| calibration.published(self.align_mode()))
+            .map_err(Clone::clone)
+    }
+
     fn set_color_option(&self, option: Rs2Option, value: f32) -> Result<(), String> {
         let mut sensors = self.sensors.lock().unwrap_or_else(|p| p.into_inner());
         sensors
@@ -405,16 +424,102 @@ pub fn open(config: PipelineConfig) -> Result<Capture, String> {
         config.depth_fps,
     );
 
+    let calibration = read_calibration(pipeline.profile().streams(), depth_unit);
+    match &calibration {
+        Ok(c) => info!(
+            "calibration: colour {}x{} fx {} fy {} ppx {} ppy {} {:?}, depth {}x{} fx {} fy {} ppx {} ppy {} {:?}, depth to colour t {:?}",
+            c.color.width,
+            c.color.height,
+            c.color.fx,
+            c.color.fy,
+            c.color.ppx,
+            c.color.ppy,
+            c.color.distortion,
+            c.depth.width,
+            c.depth.height,
+            c.depth.fx,
+            c.depth.fy,
+            c.depth.ppx,
+            c.depth.ppy,
+            c.depth.distortion,
+            c.depth_to_color.translation,
+        ),
+        Err(e) => warn!("no calibration read, the geometry services refuse: {e}"),
+    }
+
     let handle = Arc::new(PipelineHandle {
         sensors: Mutex::new(Sensors {
             color: color_sensor,
             depth: depth_sensor,
         }),
-        align_mode: Mutex::new(AlignMode::None),
+        align_mode: Mutex::new(config.align_mode),
         depth_unit,
+        calibration,
     });
 
     Ok(Capture { pipeline, handle })
+}
+
+/// Copy the device's calibration for the opened colour and depth streams out
+/// of librealsense's types. The streams do not depend on it, so a read that
+/// fails costs the geometry services their answer, not the node its frames.
+fn read_calibration(streams: &[StreamProfile], depth_unit: f32) -> Result<Calibration, String> {
+    let stream = |kind: Rs2StreamKind| {
+        streams
+            .iter()
+            .find(|profile| profile.kind() == kind)
+            .ok_or_else(|| format!("the started pipeline has no {kind:?} stream profile"))
+    };
+    let (color, depth) = (stream(Rs2StreamKind::Color)?, stream(Rs2StreamKind::Depth)?);
+    let depth_to_color = depth
+        .extrinsics(color)
+        .map_err(|e| format!("read the depth-to-colour extrinsics: {e}"))?;
+    Ok(Calibration {
+        color: read_intrinsics(color)?,
+        depth: read_intrinsics(depth)?,
+        depth_to_color: StreamExtrinsics {
+            rotation: depth_to_color.rotation(),
+            translation: depth_to_color.translation(),
+        },
+        depth_unit,
+    })
+}
+
+fn read_intrinsics(profile: &StreamProfile) -> Result<StreamIntrinsics, String> {
+    let intrinsics = profile
+        .intrinsics()
+        .map_err(|e| format!("read the {:?} intrinsics: {e}", profile.kind()))?;
+    Ok(StreamIntrinsics {
+        width: intrinsics.width() as u32,
+        height: intrinsics.height() as u32,
+        fx: intrinsics.fx(),
+        fy: intrinsics.fy(),
+        ppx: intrinsics.ppx(),
+        ppy: intrinsics.ppy(),
+        // Read from the raw value: `Rs2Intrinsics::distortion` unwraps the
+        // model, and a value a newer librealsense adds would panic there.
+        distortion: distortion_of(intrinsics.0.model as i32),
+        coeffs: intrinsics.0.coeffs,
+    })
+}
+
+/// librealsense's distortion model value under this node's own name for it.
+fn distortion_of(model: i32) -> Distortion {
+    const NONE: i32 = Rs2DistortionModel::None as i32;
+    const BROWN_CONRADY: i32 = Rs2DistortionModel::BrownConrady as i32;
+    const MODIFIED: i32 = Rs2DistortionModel::BrownConradyModified as i32;
+    const INVERSE: i32 = Rs2DistortionModel::BrownConradyInverse as i32;
+    const FTHETA: i32 = Rs2DistortionModel::FThetaFisheye as i32;
+    const KANNALA_BRANDT: i32 = Rs2DistortionModel::KannalaBrandt as i32;
+    match model {
+        NONE => Distortion::None,
+        BROWN_CONRADY => Distortion::BrownConrady,
+        MODIFIED => Distortion::ModifiedBrownConrady,
+        INVERSE => Distortion::InverseBrownConrady,
+        FTHETA => Distortion::FTheta,
+        KANNALA_BRANDT => Distortion::KannalaBrandt4,
+        other => Distortion::Unknown(other),
+    }
 }
 
 /// Bulk-copy a librealsense2 [`ImageFrame`]'s raw byte buffer into an owned
@@ -472,5 +577,36 @@ mod tests {
     fn pinned_depth_formats_match() {
         assert_eq!(DEPTH_RS2_FORMAT, Rs2Format::Z16);
         assert_eq!(DEPTH_TOPIC_ENCODING, "z16");
+    }
+
+    /// Every model librealsense names maps to this node's name for it, and a
+    /// value it does not name is kept as it came instead of panicking.
+    #[test]
+    fn every_sdk_distortion_model_has_a_name_here() {
+        assert_eq!(
+            distortion_of(Rs2DistortionModel::None as i32),
+            Distortion::None
+        );
+        assert_eq!(
+            distortion_of(Rs2DistortionModel::BrownConrady as i32),
+            Distortion::BrownConrady
+        );
+        assert_eq!(
+            distortion_of(Rs2DistortionModel::BrownConradyModified as i32),
+            Distortion::ModifiedBrownConrady
+        );
+        assert_eq!(
+            distortion_of(Rs2DistortionModel::BrownConradyInverse as i32),
+            Distortion::InverseBrownConrady
+        );
+        assert_eq!(
+            distortion_of(Rs2DistortionModel::FThetaFisheye as i32),
+            Distortion::FTheta
+        );
+        assert_eq!(
+            distortion_of(Rs2DistortionModel::KannalaBrandt as i32),
+            Distortion::KannalaBrandt4
+        );
+        assert_eq!(distortion_of(9001), Distortion::Unknown(9001));
     }
 }
