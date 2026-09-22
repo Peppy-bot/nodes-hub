@@ -1,0 +1,16 @@
+[package]
+name = "camera_geometry_check"
+version = "0.1.0"
+edition = "2024"
+description = "Bench tool: turns one depth pixel of a camera_geometry:v1 camera into a point to measure against"
+
+[lints.rust]
+unsafe_code = "deny"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+peppygen = { path = ".peppy/libs/peppygen" }
+peppylib = { path = ".peppy/libs/peppylib" }
+
+[dev-dependencies]
+peppygen = { path = ".peppy/libs/peppygen", features = ["testing"] }

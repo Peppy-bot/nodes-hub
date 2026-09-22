@@ -1,6 +1,11 @@
 {
   peppy_schema: "repository/v1",
   nodes: {
+    camera_geometry_check: {
+      v1: {
+        path: "camera_geometry_check/peppy.json5"
+      }
+    },
     deliberative_planner: {
       v1: {
         path: "example_robot/deliberative_planner/peppy.json5"
