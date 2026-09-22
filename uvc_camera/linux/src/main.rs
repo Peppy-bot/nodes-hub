@@ -2,6 +2,10 @@ use peppygen::{NodeBuilder, Parameters, Result, StandaloneConfig};
 use std::sync::Arc;
 
 use uvc_camera_linux::camera::spawn_capture_loop;
+use uvc_camera_linux::geometry::{
+    listen_for_get_color_intrinsics_requests, listen_for_get_depth_intrinsics_requests,
+    listen_for_get_depth_to_color_extrinsics_requests,
+};
 use uvc_camera_linux::services::{
     listen_for_set_brightness_requests, listen_for_set_contrast_requests,
     listen_for_set_exposure_requests, listen_for_set_gain_requests,
@@ -143,6 +147,18 @@ fn main() -> Result<()> {
             tokio::spawn(async move {
                 listen_for_set_contrast_requests(contrast_runner, controls).await;
             });
+
+            // camera_geometry: a UVC device carries no calibration, so each
+            // member answers its refusal.
+            tokio::spawn(listen_for_get_color_intrinsics_requests(Arc::clone(
+                &node_runner,
+            )));
+            tokio::spawn(listen_for_get_depth_intrinsics_requests(Arc::clone(
+                &node_runner,
+            )));
+            tokio::spawn(listen_for_get_depth_to_color_extrinsics_requests(
+                Arc::clone(&node_runner),
+            ));
 
             // The camera (V4L2 stream + device fd) is closed when the capture
             // thread drops it; await that here so device teardown is bounded
