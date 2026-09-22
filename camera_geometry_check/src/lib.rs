@@ -6,9 +6,21 @@
 
 #![forbid(unsafe_code)]
 
-/// Iterations of the fixed-point inverse of "plumb_bob". OpenCV's
-/// undistortPoints runs a handful; the lenses this meets converge long before.
+/// Iterations of the fixed-point inverse of the Brown-Conrady polynomial,
+/// whichever way a model runs it. OpenCV's undistortPoints runs a handful;
+/// the lenses this meets converge long before.
 const UNDISTORT_ITERATIONS: usize = 20;
+
+/// The lens of a stream, as camera_geometry:v1 names it: none; "plumb_bob",
+/// OpenCV's polynomial taking an ideal point to the distorted one; or
+/// "inverse_plumb_bob", the same polynomial run from the distorted point to
+/// the ideal one.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Lens {
+    None,
+    PlumbBob([f64; 5]),
+    InversePlumbBob([f64; 5]),
+}
 
 /// One stream's pinhole model, as a camera_geometry:v1 intrinsics answer
 /// carries it.
@@ -34,12 +46,15 @@ pub struct Pose {
 }
 
 impl Pinhole {
-    /// The five "plumb_bob" coefficients k1, k2, p1, p2, k3, or none for an
-    /// ideal pinhole. Anything else is a model this tool cannot apply.
-    fn coefficients(&self) -> Result<Option<[f64; 5]>, String> {
+    /// The lens this stream's answer names, with its k1, k2, p1, p2, k3.
+    /// Anything else is a model this tool cannot apply, refused by name.
+    fn lens(&self) -> Result<Lens, String> {
         match (self.distortion_model.as_str(), self.distortion.as_slice()) {
-            ("none", []) => Ok(None),
-            ("plumb_bob", &[k1, k2, p1, p2, k3]) => Ok(Some([k1, k2, p1, p2, k3])),
+            ("none", []) => Ok(Lens::None),
+            ("plumb_bob", &[k1, k2, p1, p2, k3]) => Ok(Lens::PlumbBob([k1, k2, p1, p2, k3])),
+            ("inverse_plumb_bob", &[k1, k2, p1, p2, k3]) => {
+                Ok(Lens::InversePlumbBob([k1, k2, p1, p2, k3]))
+            }
             (model, coefficients) => Err(format!(
                 "distortion model {model:?} with {} coefficients is not one camera_geometry names",
                 coefficients.len()
@@ -51,19 +66,15 @@ impl Pinhole {
     /// the pixel through fx, fy, cx, cy, then the distortion taken off.
     pub fn ray(&self, u: f64, v: f64) -> Result<(f64, f64), String> {
         let (xd, yd) = ((u - self.cx) / self.fx, (v - self.cy) / self.fy);
-        let Some(k) = self.coefficients()? else {
-            return Ok((xd, yd));
-        };
-        // The model maps an ideal point to the distorted one in closed form;
-        // the other way is found by iterating it, starting from the
-        // distorted point.
-        let (mut x, mut y) = (xd, yd);
-        for _ in 0..UNDISTORT_ITERATIONS {
-            let (radial, dx, dy) = distortion_terms(&k, x, y);
-            x = (xd - dx) / radial;
-            y = (yd - dy) / radial;
-        }
-        Ok((x, y))
+        Ok(match self.lens()? {
+            Lens::None => (xd, yd),
+            // The polynomial runs from the distorted point to the ideal one:
+            // one application, nothing to invert.
+            Lens::InversePlumbBob(k) => apply(&k, xd, yd),
+            // It runs the other way, so the ideal point is found by
+            // iterating it from the distorted one.
+            Lens::PlumbBob(k) => invert(&k, xd, yd),
+        })
     }
 
     /// The pixel that shows a point of this camera's optical frame.
@@ -73,12 +84,12 @@ impl Pinhole {
             return Err(format!("the point is not in front of the camera: z {pz}"));
         }
         let (x, y) = (px / pz, py / pz);
-        let (x, y) = match self.coefficients()? {
-            None => (x, y),
-            Some(k) => {
-                let (radial, dx, dy) = distortion_terms(&k, x, y);
-                (x * radial + dx, y * radial + dy)
-            }
+        let (x, y) = match self.lens()? {
+            Lens::None => (x, y),
+            Lens::PlumbBob(k) => apply(&k, x, y),
+            // Under the inverse model the polynomial undistorts, so the
+            // distorted point is the iteration, from the ideal one.
+            Lens::InversePlumbBob(k) => invert(&k, x, y),
         };
         Ok((self.fx * x + self.cx, self.fy * y + self.cy))
     }
@@ -108,8 +119,26 @@ impl Pinhole {
     }
 }
 
-/// The radial factor and the tangential shift "plumb_bob" applies to the
-/// ideal point (x, y), as OpenCV does.
+/// The Brown-Conrady polynomial applied once to (x, y).
+fn apply(k: &[f64; 5], x: f64, y: f64) -> (f64, f64) {
+    let (radial, dx, dy) = distortion_terms(k, x, y);
+    (x * radial + dx, y * radial + dy)
+}
+
+/// The point the polynomial takes to (xd, yd), found by iterating it from
+/// there: the fixed point of x = (xd - tangential) / radial.
+fn invert(k: &[f64; 5], xd: f64, yd: f64) -> (f64, f64) {
+    let (mut x, mut y) = (xd, yd);
+    for _ in 0..UNDISTORT_ITERATIONS {
+        let (radial, dx, dy) = distortion_terms(k, x, y);
+        x = (xd - dx) / radial;
+        y = (yd - dy) / radial;
+    }
+    (x, y)
+}
+
+/// The radial factor and the tangential shift the polynomial applies to the
+/// point (x, y), with k1, k2, p1, p2, k3 as OpenCV orders them.
 fn distortion_terms(k: &[f64; 5], x: f64, y: f64) -> (f64, f64, f64) {
     let [k1, k2, p1, p2, k3] = *k;
     let r2 = x * x + y * y;
@@ -210,6 +239,13 @@ mod tests {
         }
     }
 
+    fn inverse() -> Pinhole {
+        Pinhole {
+            distortion_model: "inverse_plumb_bob".to_string(),
+            ..distorted()
+        }
+    }
+
     fn close(a: [f64; 3], b: [f64; 3], tolerance: f64) -> bool {
         (0..3).all(|i| (a[i] - b[i]).abs() < tolerance)
     }
@@ -244,7 +280,7 @@ mod tests {
 
     #[test]
     fn deprojecting_what_was_projected_returns_the_point() {
-        for camera in [ideal(), distorted()] {
+        for camera in [ideal(), distorted(), inverse()] {
             for point in [[0.3, -0.2, 1.5], [-0.6, 0.35, 0.9], [0.0, 0.0, 3.0]] {
                 let (u, v) = camera.project(point).unwrap();
                 let back = camera.deproject(u, v, point[2], "z").unwrap();
@@ -263,6 +299,61 @@ mod tests {
         let centre = ideal.project([0.0, 0.0, 1.0]).unwrap();
         let (u, v) = distorted.project([0.0, 0.0, 1.0]).unwrap();
         assert!((centre.0 - u).abs() < 1e-12 && (centre.1 - v).abs() < 1e-12);
+    }
+
+    #[test]
+    fn the_inverse_model_applies_the_polynomial_once_from_the_distorted_point() {
+        // inverse_plumb_bob is one application to the distorted point, so
+        // the ray is the closed form, and the same numbers under plumb_bob
+        // give a different ray, because that model has to be inverted.
+        let camera = inverse();
+        let (u, v) = (camera.cx + 0.3 * camera.fx, camera.cy - 0.2 * camera.fy);
+        let k = [-0.055, 0.066, -0.0007, 0.0005, -0.021];
+        let expected = apply(&k, 0.3, -0.2);
+        let (x, y) = camera.ray(u, v).unwrap();
+        assert!((x - expected.0).abs() < 1e-12 && (y - expected.1).abs() < 1e-12);
+        let (xf, yf) = distorted().ray(u, v).unwrap();
+        assert!((x - xf).abs() > 1e-4 || (y - yf).abs() > 1e-4);
+    }
+
+    #[test]
+    fn the_inverse_and_forward_models_agree_for_a_small_lens() {
+        // To first order the inverse of the polynomial with coefficients c
+        // is the polynomial with -c, so for a small lens the direct inverse
+        // model with -c and the iterated forward model with c agree on a
+        // ray, and a lens ten times smaller agrees a hundred times better.
+        let lens = |scale: f64| {
+            [
+                -0.5 * scale,
+                0.6 * scale,
+                -0.07 * scale,
+                0.05 * scale,
+                -0.2 * scale,
+            ]
+        };
+        let mut gaps = Vec::new();
+        for scale in [0.01, 0.001] {
+            let forward = Pinhole {
+                distortion_model: "plumb_bob".to_string(),
+                distortion: lens(scale).to_vec(),
+                ..ideal()
+            };
+            let direct = Pinhole {
+                distortion_model: "inverse_plumb_bob".to_string(),
+                distortion: lens(-scale).to_vec(),
+                ..ideal()
+            };
+            let (u, v) = (
+                ideal().cx + 0.8 * ideal().fx,
+                ideal().cy + 0.45 * ideal().fy,
+            );
+            let (xf, yf) = forward.ray(u, v).unwrap();
+            let (xd, yd) = direct.ray(u, v).unwrap();
+            let gap = ((xf - xd).powi(2) + (yf - yd).powi(2)).sqrt();
+            assert!(gap < 20.0 * scale * scale, "scale {scale}: gap {gap}");
+            gaps.push(gap);
+        }
+        assert!(gaps[0] / gaps[1] > 50.0, "{gaps:?}");
     }
 
     #[test]
