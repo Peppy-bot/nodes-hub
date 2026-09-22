@@ -5,6 +5,11 @@
 // the contract rather than this concrete node. The stereo IR pair that
 // depth is derived from and the IMU streams (D435i/D455) are not exposed; add a
 // node implementing an additional contract if a consumer needs them.
+// camera_geometry answers from the device's own calibration, read from
+// librealsense at startup, for the streams as the current align mode
+// publishes them: unaligned, each stream has its own pinhole model and the
+// depth-to-colour transform is the device's; aligned, both streams share the
+// target stream's model and the transform is the identity.
 {
   peppy_schema: "node/v1",
   manifest: {
@@ -12,6 +17,7 @@
     tag: "v1",
     implements: [
       { name: "rgbd_camera", tag: "v1", link_id: "camera" },
+      { name: "camera_geometry", tag: "v1", link_id: "geometry" },
     ],
     labels: [
       "realsense",
@@ -40,7 +46,12 @@
       color_format: { $type: "string" },
       depth_width:  { $type: "u32" },
       depth_height: { $type: "u32" },
-      depth_fps:    { $type: "u32" }
+      depth_fps:    { $type: "u32" },
+      // The align mode the node starts in: "none", "depth_to_color" or
+      // "color_to_depth"; set_align_mode changes it while running. A robot
+      // whose consumers expect depth in the colour image, as the ZED gives
+      // it, launches with "depth_to_color".
+      align_mode:   { $type: "string", $default: "none" }
     }
   },
   interfaces: {
@@ -59,6 +70,9 @@
         { link_id: "camera", name: "set_color_gain" },
         { link_id: "camera", name: "set_color_brightness" },
         { link_id: "camera", name: "set_color_contrast" },
+        { link_id: "geometry", name: "get_color_intrinsics" },
+        { link_id: "geometry", name: "get_depth_intrinsics" },
+        { link_id: "geometry", name: "get_depth_to_color_extrinsics" },
         // RealSense-specific hardware knobs, native to this node (the
         // rgbd_camera contract carries only what every device can honor).
         {

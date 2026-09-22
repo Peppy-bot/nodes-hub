@@ -5,6 +5,11 @@
     tag: "v1",
     implements: [
       { name: "rgb_camera", tag: "v1", link_id: "camera" },
+      // A UVC device carries no calibration, so every member refuses and
+      // says why. It is implemented so a consumer of a wrist camera meets
+      // the same surface on hardware as in simulation; the intrinsics
+      // arrive with calibration-file loading, a change of its own.
+      { name: "camera_geometry", tag: "v1", link_id: "geometry" },
     ],
     labels: [
       "uvc",
@@ -44,6 +49,9 @@
         { link_id: "camera", name: "set_gain" },
         { link_id: "camera", name: "set_brightness" },
         { link_id: "camera", name: "set_contrast" },
+        { link_id: "geometry", name: "get_color_intrinsics" },
+        { link_id: "geometry", name: "get_depth_intrinsics" },
+        { link_id: "geometry", name: "get_depth_to_color_extrinsics" },
       ],
     },
   }
