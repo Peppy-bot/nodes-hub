@@ -113,17 +113,21 @@ fn main() -> Result<()> {
         );
 
         // Services
+        let configured = StreamSizes {
+            color: (color_width, color_height),
+            depth: (depth_width, depth_height),
+        };
         spawn_video_stream_info(
             node_runner.clone(),
-            color_width,
-            color_height,
+            handle.clone(),
+            configured,
             color_fps.get(),
             color_encoding,
         );
         spawn_depth_stream_info(
             node_runner.clone(),
-            depth_width,
-            depth_height,
+            handle.clone(),
+            configured,
             depth_fps.get(),
             depth_encoding,
             handle.depth_unit(),
@@ -262,10 +266,39 @@ fn spawn_emit_task(
     });
 }
 
+/// The sizes the two streams were opened at, (width, height) each.
+#[derive(Clone, Copy)]
+struct StreamSizes {
+    color: (u32, u32),
+    depth: (u32, u32),
+}
+
+impl StreamSizes {
+    /// The sizes the streams are published at under `mode`: librealsense
+    /// warps an aligned stream into the other's viewpoint and resolution,
+    /// so the aligned stream takes the target's size.
+    fn published(self, mode: AlignMode) -> StreamSizes {
+        match mode {
+            AlignMode::None => self,
+            AlignMode::DepthToColor => StreamSizes {
+                color: self.color,
+                depth: self.color,
+            },
+            AlignMode::ColorToDepth => StreamSizes {
+                color: self.depth,
+                depth: self.depth,
+            },
+        }
+    }
+}
+
+/// video_stream_info answers the size the colour frames have under the
+/// current align mode, worked out per request because set_align_mode
+/// changes it while the node runs.
 fn spawn_video_stream_info(
     runner: Arc<NodeRunner>,
-    width: u32,
-    height: u32,
+    handle: Arc<PipelineHandle>,
+    configured: StreamSizes,
     fps: u8,
     encoding: String,
 ) {
@@ -275,6 +308,7 @@ fn spawn_video_stream_info(
             let result = tokio::select! {
                 _ = cancel.cancelled() => break,
                 result = video_stream_info::handle_next_request(&runner, |_req| {
+                    let (width, height) = configured.published(handle.align_mode()).color;
                     Ok(video_stream_info::Response::new(width, height, fps, encoding.clone()))
                 }) => result,
             };
@@ -285,10 +319,12 @@ fn spawn_video_stream_info(
     });
 }
 
+/// depth_stream_info answers the size the depth frames have under the
+/// current align mode, as video_stream_info does for colour.
 fn spawn_depth_stream_info(
     runner: Arc<NodeRunner>,
-    width: u32,
-    height: u32,
+    handle: Arc<PipelineHandle>,
+    configured: StreamSizes,
     fps: u8,
     encoding: String,
     depth_unit: f32,
@@ -299,6 +335,7 @@ fn spawn_depth_stream_info(
             let result = tokio::select! {
                 _ = cancel.cancelled() => break,
                 result = depth_stream_info::handle_next_request(&runner, |_req| {
+                    let (width, height) = configured.published(handle.align_mode()).depth;
                     Ok(depth_stream_info::Response::new(width, height, fps, encoding.clone(), depth_unit))
                 }) => result,
             };
@@ -872,6 +909,37 @@ mod tests {
         assert!(depth_to_color_extrinsics(&unaligned).success);
         // Warped into the colour image, depth carries the colour distortion.
         assert!(!depth_intrinsics(&Ok(distorted.published(AlignMode::DepthToColor))).success);
+    }
+
+    #[test]
+    fn the_stream_infos_take_the_targets_size_under_alignment() {
+        // What the geometry answers say of the aligned streams, the stream
+        // infos say too: a consumer comparing the two never sees a depth
+        // answer of 1280x720 beside a depth_stream_info of 848x480.
+        let configured = StreamSizes {
+            color: (1280, 720),
+            depth: (848, 480),
+        };
+        let unaligned = configured.published(AlignMode::None);
+        assert_eq!(
+            (unaligned.color, unaligned.depth),
+            ((1280, 720), (848, 480))
+        );
+        let to_color = configured.published(AlignMode::DepthToColor);
+        assert_eq!((to_color.color, to_color.depth), ((1280, 720), (1280, 720)));
+        let to_depth = configured.published(AlignMode::ColorToDepth);
+        assert_eq!((to_depth.color, to_depth.depth), ((848, 480), (848, 480)));
+        for mode in [
+            AlignMode::None,
+            AlignMode::DepthToColor,
+            AlignMode::ColorToDepth,
+        ] {
+            let sizes = configured.published(mode);
+            let published = calibration().published(mode);
+            let (color, depth) = (published.color.unwrap(), published.depth.unwrap());
+            assert_eq!(sizes.color, (color.width, color.height), "{mode}");
+            assert_eq!(sizes.depth, (depth.width, depth.height), "{mode}");
+        }
     }
 
     #[test]
