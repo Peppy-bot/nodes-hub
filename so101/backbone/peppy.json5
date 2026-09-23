@@ -131,6 +131,14 @@
         { link_id: "leader_gripper", name: "gripper_setpoints" },
       ],
     },
+    services: {
+      exposes: [
+        // The robot's limb vocabulary, answered from the same names that
+        // label limb_states, so a consumer can address a limb before a
+        // snapshot has been published.
+        { link_id: "limb_state", name: "get_limb_names" },
+      ],
+    },
   },
   execution: {
     language: "python",

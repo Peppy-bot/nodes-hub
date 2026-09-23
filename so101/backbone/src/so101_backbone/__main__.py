@@ -1,6 +1,6 @@
 """Wiring: parse parameters, build the kinematics, limits, and coordinator,
-and run the control tick, the upstream consumers, the state relays, and one
-server per exposed action."""
+and run the control tick, the upstream consumers, the state relays, the limb
+name service, and one server per exposed action."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from peppygen import NodeBuilder, NodeRunner
 from peppygen.emitted_topics.limb_state import limb_states
 from peppygen.exposed_actions.limb_motion import move_arm, move_arm_joints, move_gripper
 from peppygen.exposed_actions.postures import move_to_home, move_to_ready
+from peppygen.exposed_services.limb_state import get_limb_names
 from peppygen.paired_topics.arm import joint_setpoints as down_joint_setpoints
 from peppygen.paired_topics.arm import joint_states as down_joint_states
 from peppygen.paired_topics.gripper import (
@@ -53,9 +54,25 @@ runtime.configure("so101_backbone")
 # loop; their only consumers are panels and monitors.
 _READOUT_PERIOD_S = 0.05
 
+# This robot's limb tables as limb_state carries them, one arm and one
+# gripper: the labels on every snapshot and the answer get_limb_names gives.
+_ARM_NAMES = [ARM_LIMB]
+_JOINTS_PER_ARM = [units.NUM_JOINTS]
+_GRIPPER_NAMES = [GRIPPER_LIMB]
+
 
 def _now_s() -> float:
     return peppygen.clock.now_ns() / 1e9
+
+
+def _limb_names(_request) -> get_limb_names.Response:
+    """The limb vocabulary this robot answers to, held whatever its limbs are
+    measuring and whoever is leading."""
+    return get_limb_names.Response(
+        arm_names=_ARM_NAMES,
+        joints_per_arm=_JOINTS_PER_ARM,
+        gripper_names=_GRIPPER_NAMES,
+    )
 
 
 async def _run_control(
@@ -259,12 +276,12 @@ async def _publish_readouts(
                 await limb_publisher.publish(
                     limb_states.build_message(
                         timestamp,
-                        [ARM_LIMB],
-                        [units.NUM_JOINTS],
+                        _ARM_NAMES,
+                        _JOINTS_PER_ARM,
                         list(measured),
                         list(position),
                         list(orientation),
-                        [GRIPPER_LIMB],
+                        _GRIPPER_NAMES,
                         [opening],
                     )
                 )
@@ -359,6 +376,9 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
                 node_runner, up_gripper_setpoints, STALE_WIRE_TIMEOUT_S, token,
                 "leader gripper_setpoints", on_gripper_setpoints,
             )
+        ),
+        asyncio.create_task(
+            runtime.serve(node_runner, get_limb_names, _limb_names, "get_limb_names")
         ),
     ]
     # Only the mode's slot kind is subscribed: a leader linked to the other
