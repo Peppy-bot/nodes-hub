@@ -15,8 +15,8 @@ each slot.
                            v             v
  collision_ctrl --> +--------------------------------+ --> collision_status, limb_states
  (governor_control) |          coordinator           |     (readout topics)
- move_arm[_joints]  |  planners --> GOVERNOR --> pub |
- move_gripper ----> |  (per arm)    (16 DOF)         |
+ move_arm[_joints]  |  planners --> GOVERNOR --> pub | --> get_limb_names (service)
+ move_gripper ----> |  (per arm)    (16 DOF)         |     (answered from bringup)
                     +--------------------------------+
                            v             v
                   joint_setpoints        |    gripper_setpoints  [pairing slots, follower side]
