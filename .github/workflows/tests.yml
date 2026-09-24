@@ -44,7 +44,7 @@ env:
 jobs:
   python-syntax:
     name: Python syntax
-    runs-on: runs-on=${{ github.run_id }}/runner=peppy-ci-ubuntu-24.04-x86_64/image=peppy-ubuntu24/cpu=2/ram=4+8  # custom Peppy AMI
+    runs-on: runs-on=${{ github.run_id }}/runner=peppy-ci-ubuntu-24.04-x86_64/image=peppy-ubuntu24/cpu=2/ram=4+8/family=c8a+c7a+m8a+m7a  # custom Peppy AMI
     timeout-minutes: 5
     permissions:
       contents: read
@@ -71,7 +71,7 @@ jobs:
 
   javascript-typescript:
     name: JavaScript and TypeScript tests
-    runs-on: runs-on=${{ github.run_id }}/runner=peppy-ci-ubuntu-24.04-x86_64/image=peppy-ubuntu24/cpu=2/ram=4+8  # custom Peppy AMI
+    runs-on: runs-on=${{ github.run_id }}/runner=peppy-ci-ubuntu-24.04-x86_64/image=peppy-ubuntu24/cpu=2/ram=4+8/family=c8a+c7a+m8a+m7a  # custom Peppy AMI
     timeout-minutes: 15
     permissions:
       contents: read
@@ -91,15 +91,18 @@ jobs:
 
   discover-and-run:
     name: All Rust and Python tests
-    # 16 vCPU with 2 GB each for the containerized cargo builds and lerobot's
-    # resolution (a full run peaks near 5 GB), on the current AMD and Intel
-    # compute-optimized families, a root disk with room for the run's uv
-    # environments, and the sticky disk that holds the caches named below
-    # (a cold full run fills about 77 GB of it). RunsOn keeps a sticky disk per
-    # architecture, so moving this job onto an arm runner starts from an empty
-    # cache rather than a wrong-arch one. The base images and the librealsense
-    # apt repository are published for both.
-    runs-on: runs-on=${{ github.run_id }}/runner=peppy-ci-ubuntu-24.04-x86_64/image=peppy-ubuntu24/cpu=16/ram=32/family=c7a+c7i+c8a+c8i/volume=150gb:gp3:500mbs:6000iops/sticky=node-tests:200gb  # custom Peppy AMI
+    # 8 vCPU with 16 or 32 GB on the AMD families c8a, c7a, m8a and m7a, where
+    # one vCPU is a full core. The nodes build and test one after the other,
+    # and a full run keeps fewer than 8 cores busy (a warm run uses 3 on
+    # average) and peaks near 7 GB. The root disk holds the run's uv
+    # environments (a full run writes near 27 GB there), and the sticky disk
+    # holds the caches named below (a cold full run fills about 77 GB of it).
+    # Four families in each zone give enough spot pools that a spot instance is
+    # found at once. RunsOn keeps a sticky disk per architecture, so moving
+    # this job onto an arm runner starts from an empty cache rather than a
+    # wrong-arch one. The base images and the librealsense apt repository are
+    # published for both.
+    runs-on: runs-on=${{ github.run_id }}/runner=peppy-ci-ubuntu-24.04-x86_64/image=peppy-ubuntu24/cpu=8/ram=16+32/family=c8a+c7a+m8a+m7a/volume=60gb:gp3:500mbs:6000iops/sticky=node-tests:200gb  # custom Peppy AMI
     # A cold run compiles nine crates' full dependency trees and resolves
     # lerobot's, torch included. The sticky disk keeps warm runs far under
     # this, but a run that starts from an empty disk is legitimately slow.
