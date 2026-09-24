@@ -1,6 +1,6 @@
 //! Shared primitives for the bimanual backbone: arm DOF, the joint vector, the
-//! arm side identifier, the world-pose wire decomposition, and the pose slack a
-//! Cartesian goal is planned against.
+//! arm side identifier, this robot's limb tables, the world-pose wire
+//! decomposition, and the pose slack a Cartesian goal is planned against.
 
 use srs_model::chain_kinematics::{ServoTolerances, ToleranceError};
 use srs_model::nalgebra::{Isometry3, Quaternion, Translation3, UnitQuaternion};
@@ -165,6 +165,24 @@ impl Side {
             Side::Left => "left",
             Side::Right => "right",
         }
+    }
+}
+
+/// This robot's limb tables as the limb_state contract carries them, wire
+/// shaped and in [`Side::ARM_NAMES`] order.
+pub struct LimbNames {
+    pub arm_names: Vec<String>,
+    pub joints_per_arm: Vec<u32>,
+    pub gripper_names: Vec<String>,
+}
+
+/// The one reading of the name tables: the labels on every limb_states
+/// snapshot and the answer get_limb_names gives.
+pub fn limb_names() -> LimbNames {
+    LimbNames {
+        arm_names: Side::ARM_NAMES.map(String::from).to_vec(),
+        joints_per_arm: vec![ARM_DOF as u32; Side::ARM_NAMES.len()],
+        gripper_names: Side::GRIPPER_NAMES.map(String::from).to_vec(),
     }
 }
 

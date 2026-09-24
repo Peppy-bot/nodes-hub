@@ -1,11 +1,11 @@
 // Node composition: validates every parameter up front, builds the arm models
 // and the self-collision governor, wires the channels, and spawns the
-// readiness-gated coordination loop plus every action handler and stream
-// listener. All motion and stream logic lives in the sibling modules; this is
-// only the assembly.
+// limb-name responder plus the readiness-gated coordination loop, every action
+// handler and every stream listener. All motion and stream logic lives in the
+// sibling modules; this is only the assembly.
 
 use crate::arm_pair::ArmPair;
-use crate::types::{JointVec, Side};
+use crate::types::{JointVec, Side, limb_names};
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -14,6 +14,7 @@ use control_core::positive_finite::{NotPositiveFinite, PositiveFinite};
 use control_core::time::{RateOutOfRange, period_from_hz};
 use openarm_description::HardwareVersion;
 use peppygen::consumed_topics::collision_ctrl::governor_control;
+use peppygen::exposed_services::limb_state::get_limb_names;
 use peppygen::{NodeRunner, Parameters, Result};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
@@ -165,8 +166,9 @@ pub(crate) fn arm_model(
 
 /// The node's whole runtime, in the exact shape `NodeBuilder::run` (and the
 /// test harness) take: validate the parameters, build the models and the
-/// governor, wire the channels, and spawn the readiness-gated coordination
-/// loop plus every action handler and stream listener.
+/// governor, wire the channels, and spawn the limb-name responder plus the
+/// readiness-gated coordination loop, every action handler and every stream
+/// listener.
 pub async fn setup(params: Parameters, node_runner: Arc<NodeRunner>) -> Result<()> {
     assemble(params, node_runner).await.map_err(Into::into)
 }
@@ -392,6 +394,30 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
             gripper_busy: gripper_busy[1].clone(),
         },
     );
+
+    // The limb name tables, answered for the life of the node and ahead of the
+    // readiness gate below: they are fixed, so a consumer learns which limbs
+    // this robot has well before it can move one.
+    {
+        let runner = node_runner.clone();
+        let token = node_runner.cancellation_token().clone();
+        tokio::spawn(async move {
+            while !token.is_cancelled() {
+                if let Err(e) = get_limb_names::handle_next_request(&runner, |_req| {
+                    let names = limb_names();
+                    Ok(get_limb_names::Response::new(
+                        names.arm_names,
+                        names.joints_per_arm,
+                        names.gripper_names,
+                    ))
+                })
+                .await
+                {
+                    error!("get_limb_names: {e}");
+                }
+            }
+        });
+    }
 
     // Gate exposing actions + streaming on the robot being ready, in a spawned
     // task so this setup closure returns promptly for the health probe.

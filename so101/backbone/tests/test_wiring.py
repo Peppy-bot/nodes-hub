@@ -20,6 +20,9 @@ from peppygen.fixtures.exposed_actions.limb_motion import (
     move_gripper as move_gripper_fx,
 )
 from peppygen.fixtures.exposed_actions.postures import move_to_ready as move_to_ready_fx
+from peppygen.fixtures.exposed_services.limb_state import (
+    get_limb_names as get_limb_names_fx,
+)
 from peppygen.paired_topics.arm import joint_states as arm_states_topic
 from peppygen.paired_topics.leader_arm import joint_states as upstream_states_topic
 from peppygen.paired_topics.gripper import gripper_states as gripper_states_topic
@@ -114,6 +117,16 @@ async def test_the_joints_stream_passes_through_unchanged_and_relays_state():
                 streamer.cancel()
         finally:
             feeder.cancel()
+
+
+async def test_the_limb_names_are_answered_before_any_snapshot():
+    # No follower reports here, so no readout has been published: the names
+    # and the joint count behind them come from the robot itself.
+    async with harness.start(setup, parameters=make_parameters()) as h:
+        names = await get_limb_names_fx.poll(h, TIMEOUT_S)
+        assert names.arm_names == ["arm"]
+        assert names.joints_per_arm == [5]
+        assert names.gripper_names == ["gripper"]
 
 
 async def test_malformed_follower_state_neither_anchors_nor_relays():

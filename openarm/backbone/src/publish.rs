@@ -31,7 +31,7 @@ use tracing::{error, warn};
 
 use crate::arm_pair::ArmPair;
 use crate::streams::{GripperState, warn_throttled};
-use crate::types::{ARM_DOF, JointVec, Side, world_pose_arrays};
+use crate::types::{JointVec, limb_names, world_pose_arrays};
 
 /// Pairing timestamp from this instance's bound clock, so consumers age
 /// samples on the same timeline they read. Errors until the clock delivers
@@ -188,15 +188,16 @@ impl Publisher<LimbStateBuild> {
     pub async fn send(&self, s: &LimbStateSnapshot) {
         let (left_position, left_orientation) = world_pose_arrays(&s.poses.left);
         let (right_position, right_orientation) = world_pose_arrays(&s.poses.right);
+        let names = limb_names();
         self.emit(move |timestamp| {
             (self.build)(
                 timestamp,
-                Side::ARM_NAMES.map(String::from).to_vec(),
-                vec![ARM_DOF as u32; 2],
+                names.arm_names,
+                names.joints_per_arm,
                 [s.joints.left, s.joints.right].concat(),
                 [left_position, right_position].concat(),
                 [left_orientation, right_orientation].concat(),
-                Side::GRIPPER_NAMES.map(String::from).to_vec(),
+                names.gripper_names,
                 vec![s.openings.left, s.openings.right],
             )
         })

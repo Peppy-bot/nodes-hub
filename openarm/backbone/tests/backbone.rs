@@ -4,9 +4,10 @@
 //!
 //! Fixture notes, from what the node actually does:
 //!
-//! - `startup::wait_until_ready` gates everything (subscriptions, publishers,
-//!   actions, the coordinator) on `robot_init/is_ready` answering `ready: true`,
-//!   so every test pumps that mock service.
+//! - `startup::wait_until_ready` gates the subscriptions, publishers, actions
+//!   and the coordinator on `robot_init/is_ready` answering `ready: true`, so
+//!   every test pumps that mock service. The `get_limb_names` service stands
+//!   outside that gate and answers from bringup.
 //! - `coordinator::seed_all` then gates streaming on a first measured state
 //!   from BOTH arms and BOTH grippers, and `liveness` freezes a limb that goes
 //!   silent for four periods of `follower_state_rate_hz`. The harness pins every pairing slot to a
@@ -586,6 +587,28 @@ async fn limb_states_snapshots_carry_names_counts_and_measured_state() -> peppyg
     assert_eq!(snapshot.gripper_names, ["left_gripper", "right_gripper"]);
     assert_eq!(snapshot.gripper_openings, [0.5, 0.5]);
     Ok(())
+}
+
+/// The same name tables, answered on demand with the robot reporting
+/// not-ready and every follower silent: the service is the source a consumer
+/// reads a robot's limbs from, and it carries the joint counts that size the
+/// snapshot's arrays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn limb_names_are_answered_before_the_robot_is_ready() -> peppygen::Result<()> {
+    use peppygen::fixtures::exposed_services::limb_state::get_limb_names;
+
+    let (harness, mocks) = start_ready_vacant(params()).await?;
+    pump_is_ready(
+        mocks.deps.robot_init.is_ready,
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    let names = get_limb_names::poll(&harness, DEADLINE).await?;
+
+    assert_eq!(names.arm_names, ["left_arm", "right_arm"]);
+    assert_eq!(names.joints_per_arm, [7, 7]);
+    assert_eq!(names.gripper_names, ["left_gripper", "right_gripper"]);
+    harness.shutdown().await
 }
 
 /// A goal naming no limb of this robot is refused at admission with the name

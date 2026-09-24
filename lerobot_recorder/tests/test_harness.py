@@ -21,8 +21,8 @@ import pytest
 from lerobot_recorder.__main__ import setup
 from peppygen.consumed_topics.color_cameras import video_stream
 from peppygen.fixtures import harness
-from peppygen.fixtures.exposed_actions import record_episode
-from peppygen.fixtures.exposed_services import finish_session
+from peppygen.fixtures.exposed_actions.recording import record_episode
+from peppygen.fixtures.exposed_services.recording import finish_session
 from peppygen.paired_topics.commanded_joints import joint_setpoints
 from peppygen.paired_topics.observed_joints import joint_states
 from peppygen.parameters import Parameters

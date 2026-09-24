@@ -163,6 +163,13 @@
       ]
     },
     services: {
+      exposes: [
+        // The robot's limb vocabulary, answered from the same name tables
+        // that label limb_states. Served from bringup, ahead of the
+        // readiness gate the moves wait on: the names are fixed, so a
+        // consumer can address a limb before the robot can move one.
+        { link_id: "limb_state", name: "get_limb_names" }
+      ],
       consumes: [
         { link_id: "robot_init", name: "is_ready" }
       ]
