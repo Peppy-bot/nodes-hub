@@ -19,11 +19,10 @@ concurrency:
 
 jobs:
   check-index:
-    # Every job runs on the self-hosted runner; no job uses a GitHub-hosted
-    # one. A pull request from a fork lands here too, so what keeps fork code
-    # off the box is the repository's fork-PR approval gate, not the runner it
-    # is scheduled on.
-    runs-on: self-hosted
+    # The smallest RunsOn runner: the check is a filesystem walk. A pull
+    # request from a fork runs on the same runners, so what holds fork code is
+    # the repository's fork-PR approval gate.
+    runs-on: runs-on=${{ github.run_id }}/runner=peppy-ci-ubuntu-24.04-x86_64/image=peppy-ubuntu24/cpu=2/ram=4+8  # custom Peppy AMI
     # Nothing here legitimately takes minutes; a hung step should fail fast
     # rather than hold a runner for the default six hours.
     timeout-minutes: 15
