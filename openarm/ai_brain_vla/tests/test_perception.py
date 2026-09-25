@@ -1,6 +1,7 @@
 """The camera model and the core Perceiver: pixels to world positions,
 duplicate boxes, and the ways a scan is refused."""
 
+import asyncio
 import math
 
 import pytest
@@ -192,3 +193,69 @@ async def test_a_scan_is_refused_without_a_detector_or_without_frames():
     fake = Perceiver(FakeDetector(), frames, IDENTITY)
     with pytest.raises(Refusal, match="no camera frame received"):
         await fake.scan([], CancelToken(), 0.0)
+
+
+async def test_a_backend_loads_in_the_background_and_searches_wait_on_it():
+    # The node's start must not wait on a model that takes a minute to
+    # load, so the load runs beside it and a search meanwhile is refused as
+    # still loading, not as no backend.
+    class SlowDetector(FakeDetector):
+        def __init__(self) -> None:
+            super().__init__()
+            self.ready = False
+            self.release = threading.Event()
+
+        @property
+        def available(self) -> bool:
+            return self.ready
+
+        def load(self, model: str) -> None:
+            self.release.wait(5.0)
+            self.loaded = model
+            self.ready = True
+
+    import threading
+
+    detector = SlowDetector()
+    frames = FrameStore()
+    perceiver = Perceiver(detector, frames, IDENTITY)
+    task = perceiver.start_loading("gallery")
+    await asyncio.sleep(0.05)
+    assert not task.done()
+    assert perceiver.why_unavailable() == "no perception source: perception_backend 'fake' is still loading"
+    with pytest.raises(Refusal, match="still loading"):
+        await perceiver.scan([], CancelToken(), timeout_s=0.0)
+    detector.release.set()
+    await perceiver.loaded()
+    assert detector.loaded == "gallery" and detector.available
+    assert perceiver.why_unavailable() == "no perception source: no camera frame received"
+
+
+async def test_a_load_that_fails_becomes_the_reason_every_search_is_refused_with():
+    class BrokenDetector(FakeDetector):
+        @property
+        def available(self) -> bool:
+            return False
+
+        def load(self, model: str) -> None:
+            raise ValueError(f"no gallery at {model}")
+
+    perceiver = Perceiver(BrokenDetector(), FrameStore(), IDENTITY)
+    await perceiver.start_loading("/nowhere")
+    assert perceiver.why_unavailable() == (
+        "no perception source: perception_backend 'fake' could not load '/nowhere': no gallery at /nowhere"
+    )
+    with pytest.raises(Refusal, match="could not load '/nowhere'"):
+        await perceiver.scan([], CancelToken(), timeout_s=0.0)
+
+
+def test_registries_import_only_the_chosen_backend_and_refuse_unknown_names():
+    from openarm_ai_brain_vla.manipulation import make_manipulator
+    from openarm_ai_brain_vla.perception import make_detector
+
+    assert make_detector("none").name == "none"
+    assert make_manipulator("none").name == "none"
+    with pytest.raises(ValueError, match="unknown perception_backend 'sam9'"):
+        make_detector("sam9")
+    with pytest.raises(ValueError, match="unknown manipulation_backend"):
+        make_manipulator("policy")

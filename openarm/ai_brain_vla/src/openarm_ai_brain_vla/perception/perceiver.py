@@ -11,7 +11,7 @@ afterwards (`state.best_match`), so no detector implements selection.
 from __future__ import annotations
 
 import asyncio
-from typing import Sequence
+from typing import Optional, Sequence
 
 from ..ports import Box, CancelToken, Detection, Detector, Refusal
 from .camera import CameraModel
@@ -26,6 +26,8 @@ class Perceiver:
         self.detector = detector
         self.frames = frames
         self.camera = camera
+        self._loading: Optional[asyncio.Task] = None
+        self._load_error = ""
 
     @property
     def available(self) -> bool:
@@ -33,13 +35,43 @@ class Perceiver:
 
     def why_unavailable(self) -> str:
         if not self.detector.available:
+            if self._loading is not None and not self._loading.done():
+                return f"no perception source: perception_backend '{self.detector.name}' is still loading"
+            if self._load_error:
+                return f"no perception source: {self._load_error}"
             return f"no perception source: perception_backend is '{self.detector.name}'"
         if not self.frames.available:
             return "no perception source: no camera frame received"
         return ""
 
     async def load(self, model: str) -> None:
-        await asyncio.to_thread(self.detector.load, model)
+        """Loads the backend's model. A failure is raised, and kept as the
+        reason every search is refused with from then on."""
+        try:
+            await asyncio.to_thread(self.detector.load, model)
+        except Exception as error:
+            self._load_error = f"perception_backend '{self.detector.name}' could not load {model!r}: {error}"
+            raise
+
+    def start_loading(self, model: str) -> asyncio.Task:
+        """Begins the load in the background and returns its task. A backend
+        that takes a minute to load must not hold the node's start: the node
+        is healthy at once and refuses searches as still loading until the
+        load ends, or with the failure if it fails."""
+
+        async def run() -> None:
+            try:
+                await self.load(model)
+            except Exception:
+                print(f"[brain] {self._load_error}")
+
+        self._loading = asyncio.create_task(run())
+        return self._loading
+
+    async def loaded(self) -> None:
+        """Waits for a load begun with `start_loading` to end."""
+        if self._loading is not None:
+            await self._loading
 
     async def scan(self, phrases: Sequence[str], cancel: CancelToken, timeout_s: float) -> list[Detection]:
         """Looks once at the latest frame for `phrases`, or for everything

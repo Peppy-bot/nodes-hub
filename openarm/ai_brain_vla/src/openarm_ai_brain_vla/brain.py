@@ -55,8 +55,11 @@ class Brain:
         return self._now()
 
     async def start(self) -> None:
-        """Loads the model and hands the manipulator the robot, once."""
-        await self.perceiver.load(self.params.perception_model)
+        """Hands the manipulator the robot and begins loading the perception
+        model, once. The load runs in the background, since a backend that
+        takes a minute to load must not hold the node's start; searches are
+        refused as still loading until it ends."""
+        self.perceiver.start_loading(self.params.perception_model)
         await self.manipulator.start(self.robot)
 
     def background(self, token) -> list[asyncio.Task]:
