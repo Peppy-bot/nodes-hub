@@ -13,11 +13,20 @@ name: Tests
 # Every node depends on generated code (its gitignored `.peppy/libs`) that only
 # a running peppy daemon can produce, since `peppy node sync` calls the daemon's
 # node_generate service and resolves contracts through the daemon's repository
-# registry. So this job installs a peppy release, readies its bundled apptainer
-# for unprivileged use, boots a daemon of its own, generates the tested nodes'
+# registry. So this job installs peppy, readies its bundled apptainer for
+# unprivileged use, boots a daemon of its own, generates the tested nodes'
 # interfaces, and runs each node's tests inside a container derived from its
 # `apptainer.def`. The runner image provides none of the nodes' build
 # dependencies.
+#
+# peppy and the daemon's repository registry come from the shared hub-ci-peppy
+# action of the peppy repository, the one the CI of every hub installs peppy
+# with. The registry holds this checkout as the nodes-hub entry, so a node's
+# dependency on another node here resolves to the working tree, and pins every
+# sibling hub at the commit of its branch named like the pull request's head
+# branch where it has one, and at its main otherwise, so a node is generated
+# against the contracts of a contracts-hub change made on a branch of the same
+# name. The job summary names the hub commits that ran.
 #
 # Every job runs on a RunsOn runner: an EC2 instance of its own, booted from
 # the peppy-ubuntu24 image for the job and discarded after it, sized by the
@@ -179,11 +188,14 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: python3 .github/scripts/discover-tests.py
 
-      - name: Install peppy
+      # The action unpacks the whole peppy release archive into
+      # RUNNER_TEMP/peppy-dist, whose bundled zenohd and apptainer the steps
+      # below use, puts its bin on PATH, and exports the PEPPY_HOME holding
+      # the registry the daemon reads.
+      - name: Install peppy and register the hub repositories
+        id: peppy
         if: steps.discover.outputs.any == 'true'
-        env:
-          PEPPY_VERSION: ${{ vars.PEPPY_VERSION }}
-        run: python3 .github/scripts/install-peppy.py
+        uses: Peppy-bot/peppy/.github/actions/hub-ci-peppy@dev
 
       - name: Ready the bundled apptainer for unprivileged use
         if: steps.discover.outputs.any == 'true'
@@ -197,8 +209,12 @@ jobs:
         if: steps.discover.outputs.any == 'true'
         run: python3 .github/scripts/sync-test-nodes.py
 
+      # A lockfile that does not resolve is named with the peppy version that
+      # generated the interfaces it was checked against.
       - name: Prove the committed lockfiles resolve against the generated interfaces
         if: steps.discover.outputs.any == 'true'
+        env:
+          PEPPY_INSTALLED: ${{ steps.peppy.outputs.peppy-version }}
         run: python3 .github/scripts/check-lockfiles.py
 
       - name: Run the selected Rust tests in their build containers

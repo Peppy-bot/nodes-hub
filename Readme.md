@@ -87,8 +87,10 @@ publishes. Rename yours: within one repository, a `name:tag` is claimed by exact
 CI runs Rust, Python, JavaScript and TypeScript tests on every pull request and push to `main`.
 
 CI helpers live in `.github/scripts` and use only the Python standard library. The workflow
-contains configuration and script calls; the helpers invoke tools such as Cargo and Apptainer
-with explicit argument lists.
+contains configuration, script calls and the shared `hub-ci-peppy` action of the peppy repository,
+which installs peppy and writes the daemon's repository registry: this checkout, and every sibling
+hub pinned at its branch named like the pull request's head branch where it has one, and at its
+`main` otherwise. The helpers invoke tools such as Cargo and Apptainer with explicit argument lists.
 
 An independent Python 3.13 job checks the syntax of every tracked `.py` file, including launchers
 and modules that no test imports. It checks syntax without importing modules, installing their
