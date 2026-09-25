@@ -20,6 +20,9 @@ REGISTRY: dict[str, str] = {
     # YOLOE-11M with the gallery's crops as visual prompts: the study's
     # real-time pipeline, 21 ms a frame. Needs the yoloe extra; a GPU helps.
     "yoloe_vp": "openarm_ai_brain_vla.perception.yoloe_vp:YoloeVpDetector",
+    # Gemini Robotics-ER over Google's API: no GPU, no gallery, a key and
+    # the network. Needs the gemini extra.
+    "gemini_er": "openarm_ai_brain_vla.perception.gemini_er:GeminiErDetector",
 }
 
 

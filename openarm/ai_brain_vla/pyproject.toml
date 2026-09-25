@@ -36,6 +36,10 @@ yoloe = [
     "torchvision>=0.22",
     "ultralytics>=8.4.150,<9",
 ]
+# The gemini_er perception backend: Google's API client, no torch.
+gemini = [
+    "google-genai>=2.25,<3",
+]
 
 [project.scripts]
 openarm_ai_brain_vla = "openarm_ai_brain_vla.__main__:main"

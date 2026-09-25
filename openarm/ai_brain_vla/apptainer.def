@@ -32,9 +32,10 @@ From: peppybot/python-uv-base:latest
     uv python install
     # The brain whose models run beside the robot: the sam3-siglip and yoloe
     # extras bring torch, transformers and ultralytics into the image, and
-    # the manifest passes --nv so they see the host's GPU. Both backends are
-    # installed so a launcher can choose one without a rebuild.
-    uv sync --no-editable --no-dev --extra sam3-siglip --extra yoloe
+    # the manifest passes --nv so they see the host's GPU; gemini brings the
+    # API client. Every backend is installed so a launcher can choose one
+    # without a rebuild.
+    uv sync --no-editable --no-dev --extra sam3-siglip --extra yoloe --extra gemini
 
 %runscript
     cd /opt/openarm_ai_brain_vla
