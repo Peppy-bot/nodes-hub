@@ -24,7 +24,10 @@ From: peppybot/python-uv-base:latest
 
     cd /opt/openarm_ai_brain_vla
     uv python install
-    uv sync --no-editable --no-dev
+    # The brain whose models run beside the robot: the sam3-siglip extra
+    # brings torch and transformers into the image, and the manifest passes
+    # --nv so they see the host's GPU.
+    uv sync --no-editable --no-dev --extra sam3-siglip
 
 %runscript
     cd /opt/openarm_ai_brain_vla

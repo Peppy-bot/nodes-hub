@@ -16,6 +16,20 @@ dependencies = [
     "pillow>=10",
 ]
 
+[project.optional-dependencies]
+# The sam3_siglip perception backend: SAM 3 and SigLIP through transformers on
+# torch. An extra, so a checkout that runs the unit tests or another backend
+# never installs them; the container installs it (apptainer.def).
+sam3-siglip = [
+    "torch>=2.7,<3",
+    # SAM 3's image processor is built on torchvision's transforms.
+    "torchvision>=0.22",
+    "transformers>=5.17,<5.18",
+    # SigLIP's tokenizer.
+    "sentencepiece>=0.2",
+    "protobuf>=5",
+]
+
 [project.scripts]
 openarm_ai_brain_vla = "openarm_ai_brain_vla.__main__:main"
 

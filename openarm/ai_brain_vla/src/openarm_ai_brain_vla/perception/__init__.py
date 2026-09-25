@@ -14,6 +14,9 @@ from ..ports import Detector
 
 REGISTRY: dict[str, str] = {
     "none": "openarm_ai_brain_vla.perception.none:NoneDetector",
+    # SAM 3 to find and SigLIP against a gallery to name: the most accurate
+    # pipeline of the perception study. Needs the sam3-siglip extra and a GPU.
+    "sam3_siglip": "openarm_ai_brain_vla.perception.sam3_siglip:Sam3SiglipDetector",
 }
 
 
