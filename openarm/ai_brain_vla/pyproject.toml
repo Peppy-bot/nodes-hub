@@ -29,6 +29,13 @@ sam3-siglip = [
     "sentencepiece>=0.2",
     "protobuf>=5",
 ]
+# The yoloe_vp perception backend: YOLOE through Ultralytics on torch, at the
+# version the study ran. Ultralytics is AGPL-3.0 unless licensed otherwise.
+yoloe = [
+    "torch>=2.7,<3",
+    "torchvision>=0.22",
+    "ultralytics>=8.4.150,<9",
+]
 
 [project.scripts]
 openarm_ai_brain_vla = "openarm_ai_brain_vla.__main__:main"

@@ -22,12 +22,19 @@ From: peppybot/python-uv-base:latest
     # builds fine and then dies at exec with `./.venv/bin/python: not found`.
     export UV_PYTHON_INSTALL_DIR=/opt/uv-python
 
+    # OpenCV, which ultralytics imports for the yoloe_vp backend, links the
+    # GL, glib and xcb shared libraries the base image does not carry.
+    apt-get update -qq
+    apt-get install -qqy --no-install-recommends libgl1 libglib2.0-0t64 libxcb1
+    rm -rf /var/lib/apt/lists/*
+
     cd /opt/openarm_ai_brain_vla
     uv python install
-    # The brain whose models run beside the robot: the sam3-siglip extra
-    # brings torch and transformers into the image, and the manifest passes
-    # --nv so they see the host's GPU.
-    uv sync --no-editable --no-dev --extra sam3-siglip
+    # The brain whose models run beside the robot: the sam3-siglip and yoloe
+    # extras bring torch, transformers and ultralytics into the image, and
+    # the manifest passes --nv so they see the host's GPU. Both backends are
+    # installed so a launcher can choose one without a rebuild.
+    uv sync --no-editable --no-dev --extra sam3-siglip --extra yoloe
 
 %runscript
     cd /opt/openarm_ai_brain_vla

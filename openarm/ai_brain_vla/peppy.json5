@@ -79,15 +79,17 @@
       // source", which is what the contract asks for when the brain cannot
       // see. A launcher selects a model per launch without a code change.
       // "sam3_siglip" is the accurate local pipeline (SAM 3 finds, SigLIP
-      // names against a gallery, about 2 s a frame on a GPU).
+      // names against a gallery, about 2 s a frame on a GPU); "yoloe_vp"
+      // the real-time one (YOLOE-11M with the gallery's crops as visual
+      // prompts, about 20 ms, names enrolled items only).
       perception_backend: { $type: "string", $default: "none" },
       // The model identifier the perception backend loads (a weights name
       // or path); its meaning belongs to the backend. Empty is the
-      // backend's default. For "sam3_siglip" it is the gallery directory of
-      // reference crops the items are named from (manifest.json,
-      // classes.txt, prompts.txt), a path the container can see: one under
-      // the daemon user's home is, as is the Hugging Face cache the model
-      // weights load from.
+      // backend's default. For "sam3_siglip" and "yoloe_vp" it is the
+      // gallery directory of reference crops the items are named from
+      // (manifest.json, classes.txt, prompts.txt), a path the container can
+      // see: one under the daemon user's home is, as is the Hugging Face
+      // cache the model weights load from.
       perception_model: { $type: "string", $default: "" },
       // Which manipulation backend runs grab_item, drop_item and place_item.
       // "none" moves nothing: every sequence is refused with a message

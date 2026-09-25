@@ -17,6 +17,9 @@ REGISTRY: dict[str, str] = {
     # SAM 3 to find and SigLIP against a gallery to name: the most accurate
     # pipeline of the perception study. Needs the sam3-siglip extra and a GPU.
     "sam3_siglip": "openarm_ai_brain_vla.perception.sam3_siglip:Sam3SiglipDetector",
+    # YOLOE-11M with the gallery's crops as visual prompts: the study's
+    # real-time pipeline, 21 ms a frame. Needs the yoloe extra; a GPU helps.
+    "yoloe_vp": "openarm_ai_brain_vla.perception.yoloe_vp:YoloeVpDetector",
 }
 
 
