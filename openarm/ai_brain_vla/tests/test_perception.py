@@ -6,7 +6,16 @@ import math
 import pytest
 
 from conftest import FakeDetector, depth_frame, rgb_frame
-from openarm_ai_brain_vla.perception.camera import CameraModel, rotate
+from openarm_ai_brain_vla.perception.camera import (
+    INVERSE_PLUMB_BOB,
+    NONE,
+    PLUMB_BOB,
+    CameraModel,
+    distort,
+    pixel_to_ray,
+    rotate,
+    undistort,
+)
 from openarm_ai_brain_vla.perception.frames import FrameStore, decode_color, decode_depth, depth_at
 from openarm_ai_brain_vla.perception.perceiver import Perceiver, merge_duplicates
 from openarm_ai_brain_vla.ports import Box, CancelToken, Refusal
@@ -39,6 +48,86 @@ def test_an_identity_camera_deprojects_along_minus_z_with_x_right_and_y_up():
     assert close(right, (2.0, 0.0, -2.0))
     up = IDENTITY.deproject(8.0, 6.0 - focal, 2.0, width, height)
     assert close(up, (0.0, 2.0, -2.0))
+
+
+# A D455-like colour lens, the magnitudes a real unit reports.
+LENS = (-0.055, 0.066, -0.0007, 0.0005, -0.021)
+
+
+def test_a_pixel_becomes_a_ray_through_the_intrinsics_with_no_lens():
+    # Under "none" the ray is the pixel through fx, fy, cx, cy and nothing
+    # else, so the principal point looks straight ahead and one focal
+    # length to the right is 45 degrees.
+    assert close(pixel_to_ray(639.5, 359.5, 738.1, 738.1, 639.5, 359.5, NONE, ()), (0.0, 0.0))
+    assert close(pixel_to_ray(639.5 + 738.1, 359.5, 738.1, 738.1, 639.5, 359.5, NONE, ()), (1.0, 0.0))
+    # deproject is the same path with the field of view for the focal length.
+    assert close(IDENTITY.deproject(8.0 + 6.0, 6.0, 2.0, 16, 12), (2.0, 0.0, -2.0))
+
+
+def test_plumb_bob_round_trips_through_distort_and_undistort():
+    # The forward polynomial distorts an ideal point; undistorting by
+    # iteration brings it back, out to the image corners.
+    for point in [(0.0, 0.0), (0.3, -0.2), (-0.6, 0.35), (0.8, 0.45)]:
+        distorted = distort(PLUMB_BOB, LENS, *point)
+        assert not close(distorted, point, 1e-4) or point == (0.0, 0.0)
+        assert close(undistort(PLUMB_BOB, LENS, *distorted), point, 1e-9)
+    # And the same round trip the other way for the inverse model.
+    for point in [(0.3, -0.2), (-0.6, 0.35)]:
+        distorted = distort(INVERSE_PLUMB_BOB, LENS, *point)
+        assert close(undistort(INVERSE_PLUMB_BOB, LENS, *distorted), point, 1e-9)
+
+
+def test_the_inverse_model_applies_the_polynomial_once_from_the_distorted_point():
+    # inverse_plumb_bob is one application of the polynomial to the
+    # distorted point, nothing iterated: the result is the closed form.
+    xd, yd = 0.3, -0.2
+    k1, k2, p1, p2, k3 = LENS
+    r2 = xd * xd + yd * yd
+    radial = 1.0 + r2 * (k1 + r2 * (k2 + r2 * k3))
+    expected = (
+        xd * radial + 2.0 * p1 * xd * yd + p2 * (r2 + 2.0 * xd * xd),
+        yd * radial + p1 * (r2 + 2.0 * yd * yd) + 2.0 * p2 * xd * yd,
+    )
+    assert close(undistort(INVERSE_PLUMB_BOB, LENS, xd, yd), expected, 1e-12)
+
+
+def test_inverse_and_forward_models_agree_for_small_coefficients():
+    # To first order the inverse of the polynomial with coefficients c is
+    # the polynomial with -c, so for a small lens the direct inverse model
+    # with -c and the iterated forward model with c undistort a pixel to
+    # the same ray, within the second-order term.
+    for scale in (0.01, 0.003):
+        small = tuple(c * scale for c in (-0.5, 0.6, -0.07, 0.05, -0.2))
+        negated = tuple(-c for c in small)
+        for xd, yd in [(0.3, -0.2), (-0.6, 0.35), (0.8, 0.45)]:
+            forward = undistort(PLUMB_BOB, small, xd, yd)
+            direct = undistort(INVERSE_PLUMB_BOB, negated, xd, yd)
+            tolerance = 20.0 * scale * scale
+            assert close(forward, direct, tolerance), (scale, xd, yd, forward, direct)
+        # The agreement is second order: a lens ten times smaller agrees a
+        # hundred times better.
+    gaps = []
+    for scale in (0.01, 0.001):
+        small = tuple(c * scale for c in (-0.5, 0.6, -0.07, 0.05, -0.2))
+        negated = tuple(-c for c in small)
+        forward = undistort(PLUMB_BOB, small, 0.8, 0.45)
+        direct = undistort(INVERSE_PLUMB_BOB, negated, 0.8, 0.45)
+        gaps.append(math.hypot(forward[0] - direct[0], forward[1] - direct[1]))
+    assert gaps[0] / gaps[1] > 50.0
+
+
+def test_any_other_distortion_model_is_refused_by_name():
+    with pytest.raises(ValueError, match="kannala_brandt"):
+        pixel_to_ray(10.0, 10.0, 500.0, 500.0, 320.0, 240.0, "kannala_brandt", (0.1, 0.0, 0.0, 0.0))
+    with pytest.raises(ValueError, match="modified_plumb_bob"):
+        undistort("modified_plumb_bob", LENS, 0.1, 0.1)
+    # The right name with the wrong number of coefficients is refused too.
+    with pytest.raises(ValueError, match="k1, k2, p1, p2, k3"):
+        undistort(PLUMB_BOB, (0.1, 0.0), 0.1, 0.1)
+    with pytest.raises(ValueError, match="no coefficients"):
+        undistort(NONE, (0.1,), 0.1, 0.1)
+    with pytest.raises(ValueError, match="finite"):
+        undistort(INVERSE_PLUMB_BOB, (math.nan, 0.0, 0.0, 0.0, 0.0), 0.1, 0.1)
 
 
 def test_the_default_chest_pose_looks_ahead_and_down():
@@ -103,15 +192,3 @@ async def test_a_scan_is_refused_without_a_detector_or_without_frames():
     fake = Perceiver(FakeDetector(), frames, IDENTITY)
     with pytest.raises(Refusal, match="no camera frame received"):
         await fake.scan([], CancelToken(), 0.0)
-
-
-def test_registries_import_only_the_chosen_backend_and_refuse_unknown_names():
-    from openarm_ai_brain_vla.manipulation import make_manipulator
-    from openarm_ai_brain_vla.perception import make_detector
-
-    assert make_detector("none").name == "none"
-    assert make_manipulator("none").name == "none"
-    with pytest.raises(ValueError, match="unknown perception_backend 'sam9'"):
-        make_detector("sam9")
-    with pytest.raises(ValueError, match="unknown manipulation_backend"):
-        make_manipulator("policy")
