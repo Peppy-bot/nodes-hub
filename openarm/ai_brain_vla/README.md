@@ -123,13 +123,18 @@ claude mcp add --transport http robots http://127.0.0.1:8900/robot_control/v1/mc
 claude mcp add --transport http world  http://127.0.0.1:8902/simulation/v1/mcp
 ```
 
-Then in plain words: "put a sugar box, an apple and a blue ball on the table
-in front of the robot", "what do you see", "identify the apple", "identify the
-blue ball", "identify the mug" (there is none), "grab the apple". The client
-calls scene.spawn_object, brain.scan_items, brain.identify_item and
-brain.grab_item; every answer carries the label, the world position and the
-confidence. Without a client, the scene panel at `http://127.0.0.1:8766`
-spawns objects and any `item_perception:v1` consumer asks.
+The world starts empty: Waldo's default scene is a bare floor in front of the
+robot, and nothing is spawned until asked. So the first instruction puts the
+objects there, and the rest asks about them, in plain words: "put a sugar box,
+an apple and a blue ball on the table in front of the robot", "ask the brain
+what it sees", "identify the apple", "identify the blue ball", "identify the
+mug" (there is none), "grab the apple". The client calls scene.spawn_object,
+brain.scan_items, brain.identify_item and brain.grab_item; every answer carries
+the label, the world position and the confidence. Say "ask the brain" for a
+perception question: the endpoint also publishes the camera's latest frame as
+a resource, and an agent asked "do you see a banana" may look at the picture
+instead. Without a client, the world endpoint spawns objects for anything that
+speaks MCP, and any `item_perception:v1` consumer asks the brain.
 
 ### 3b. The same, headless, as an agent test
 
