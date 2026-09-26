@@ -29,9 +29,13 @@ def make_brain(*, detector=None, manipulator=None, ticks=None) -> Brain:
 
 
 def with_frames(brain: Brain, depth_m: float = 1.0) -> None:
+    from openarm_ai_brain_vla.perception.camera import Intrinsics
+
     brain.frames.color = rgb_frame(16, 12)
     brain.frames.depth = depth_frame(depth_m, 16, 12)
     brain.frames.depth_unit = 0.001
+    # The camera has answered where its pixels point: a 90 degree lens.
+    brain.perceiver.set_camera(brain.camera.with_intrinsics(Intrinsics.from_fovy(90.0, 16, 12)))
 
 
 def grab_goal(**overrides):

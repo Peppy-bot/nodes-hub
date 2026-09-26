@@ -26,12 +26,19 @@ class Perceiver:
         self.detector = detector
         self.frames = frames
         self.camera = camera
+        # Why the camera cannot place a pixel yet, until its intrinsics come.
+        self.camera_reason = "the camera's intrinsics have not been received yet"
         self._loading: Optional[asyncio.Task] = None
         self._load_error = ""
 
+    def set_camera(self, camera: CameraModel) -> None:
+        self.camera = camera
+        if camera.ready:
+            self.camera_reason = ""
+
     @property
     def available(self) -> bool:
-        return self.detector.available and self.frames.available
+        return self.detector.available and self.frames.available and self.camera.ready
 
     def why_unavailable(self) -> str:
         if not self.detector.available:
@@ -42,6 +49,8 @@ class Perceiver:
             return f"no perception source: perception_backend is '{self.detector.name}'"
         if not self.frames.available:
             return "no perception source: no camera frame received"
+        if not self.camera.ready:
+            return f"no perception source: {self.camera_reason}"
         return ""
 
     async def load(self, model: str, gallery: str = "") -> None:

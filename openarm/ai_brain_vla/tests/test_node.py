@@ -12,6 +12,7 @@ from peppygen.fixtures.exposed_actions.item_manipulation import grab_item as gra
 from peppygen.fixtures.exposed_actions.item_perception import scan_items as scan_fx
 from peppygen.fixtures.exposed_services.item_manipulation import get_state as get_state_fx
 from peppygen.consumed_services.camera import depth_stream_info
+from peppygen.consumed_services.geometry import get_color_intrinsics
 from peppygen.parameters import Parameters
 
 from openarm_ai_brain_vla.__main__ import setup
@@ -24,6 +25,10 @@ async def test_the_node_answers_every_member_with_no_backends():
         # for its depth unit at start; answer it so the store settles.
         h.mocks.deps.camera.depth_stream_info.enqueue_response(
             depth_stream_info.ResponseData(width=16, height=12, frames_per_second=15, encoding="z16", depth_unit=0.001)
+        )
+        # And the geometry slot, which the brain asks where the pixels point.
+        h.mocks.deps.geometry.get_color_intrinsics.enqueue_response(
+            get_color_intrinsics.ResponseData(success=True, message="", width=16, height=12, fx=6.0, fy=6.0, cx=8.0, cy=6.0, distortion_model="none", distortion=[])
         )
         state = await get_state_fx.poll(h, 5.0)
         assert state.gripper_names == ["left_gripper", "right_gripper"]

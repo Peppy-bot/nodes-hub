@@ -12,6 +12,7 @@ from openarm_ai_brain_vla.perception.camera import (
     NONE,
     PLUMB_BOB,
     CameraModel,
+    Intrinsics,
     distort,
     pixel_to_ray,
     rotate,
@@ -21,7 +22,7 @@ from openarm_ai_brain_vla.perception.frames import FrameStore, decode_color, dec
 from openarm_ai_brain_vla.perception.perceiver import Perceiver, merge_duplicates
 from openarm_ai_brain_vla.ports import Box, CancelToken, Refusal
 
-IDENTITY = CameraModel.from_parameters(90.0, "0 0 0 0 0 0 1")
+IDENTITY = CameraModel.from_parameters("0 0 0 0 0 0 1").with_intrinsics(Intrinsics.from_fovy(90.0, 16, 12))
 
 
 def close(a, b, tolerance=1e-6):
@@ -30,12 +31,32 @@ def close(a, b, tolerance=1e-6):
 
 def test_the_camera_pose_parameter_is_parsed_and_normalised():
     with pytest.raises(ValueError):
-        CameraModel.from_parameters(52.0, "0 0 0")
-    with pytest.raises(ValueError):
-        CameraModel.from_parameters(0.0, "0 0 0 0 0 0 1")
-    camera = CameraModel.from_parameters(52.0, "1, 2, 3, 0, 0, 0, 2")
+        CameraModel.from_parameters("0 0 0")
+    camera = CameraModel.from_parameters("1, 2, 3, 0, 0, 0, 2")
     assert camera.position == (1.0, 2.0, 3.0)
     assert close(camera.orientation, (0.0, 0.0, 0.0, 1.0))
+    # Without intrinsics the camera cannot place a pixel, and says so.
+    assert not camera.ready
+    with pytest.raises(ValueError, match="not known yet"):
+        camera.deproject(1.0, 1.0, 1.0, 16, 12)
+    assert camera.with_intrinsics(Intrinsics.from_fovy(90.0, 16, 12)).ready
+
+
+def test_intrinsics_are_checked_and_scale_with_the_image():
+    with pytest.raises(ValueError):
+        Intrinsics.from_fovy(0.0, 16, 12)
+    with pytest.raises(ValueError, match="positive finite focal"):
+        Intrinsics(16, 12, 0.0, 6.0, 8.0, 6.0)
+    with pytest.raises(ValueError, match="unknown distortion model"):
+        Intrinsics(16, 12, 6.0, 6.0, 8.0, 6.0, "fisheye")
+    # The ZED's colour intrinsics at 1280x720, used on a 640x360 stream:
+    # focal lengths halve, the principal point follows the pixel centres.
+    k = Intrinsics(1280, 720, 700.0, 700.0, 639.5, 359.5, PLUMB_BOB, (0.1, 0.0, 0.0, 0.0, 0.0))
+    half = k.scaled_to(640, 360)
+    assert (half.fx, half.fy) == (350.0, 350.0)
+    assert close((half.cx, half.cy), (319.5, 179.5))
+    assert half.distortion_model == PLUMB_BOB and half.distortion == (0.1, 0.0, 0.0, 0.0, 0.0)
+    assert k.scaled_to(1280, 720) is k
 
 
 def test_an_identity_camera_deprojects_along_minus_z_with_x_right_and_y_up():
@@ -43,7 +64,7 @@ def test_an_identity_camera_deprojects_along_minus_z_with_x_right_and_y_up():
     centre = IDENTITY.deproject(8.0, 6.0, 1.0, width, height)
     assert close(centre, (0.0, 0.0, -1.0))
     # 90 degree vertical field of view: the top edge is one focal length up.
-    focal = IDENTITY.focal_px(height)
+    focal = IDENTITY.intrinsics.fy
     assert close((focal,), (6.0,))
     right = IDENTITY.deproject(8.0 + focal, 6.0, 2.0, width, height)
     assert close(right, (2.0, 0.0, -2.0))
@@ -133,7 +154,7 @@ def test_any_other_distortion_model_is_refused_by_name():
 
 def test_the_default_chest_pose_looks_ahead_and_down():
     # The OpenArm v2 chest camera faces world +X, 62 degrees below the horizon.
-    chest = CameraModel.from_parameters(52.0, "0.0792 0.0315 0.7941 0.1710647 -0.1710647 -0.6861027 0.6861027")
+    chest = CameraModel.from_parameters("0.0792 0.0315 0.7941 0.1710647 -0.1710647 -0.6861027 0.6861027").with_intrinsics(Intrinsics.from_fovy(52.0, 1280, 720))
     forward = chest.forward()
     assert close(forward, (math.cos(math.radians(62)), 0.0, -math.sin(math.radians(62))), 1e-3)
     assert close(rotate(chest.orientation, (0.0, 1.0, 0.0)), (math.sin(math.radians(62)), 0.0, math.cos(math.radians(62))), 1e-3)
@@ -277,3 +298,24 @@ def test_the_confidence_parameter_reaches_a_detector_that_has_one():
     brain = Brain(params, node_runner=None, detector=Thresholded())
     assert brain.perceiver.detector.min_confidence == 0.25
 
+
+async def test_a_scan_waits_for_the_cameras_intrinsics_and_names_the_slot():
+    from openarm_ai_brain_vla.perception.geometry import VACANT, intrinsics_from
+    from types import SimpleNamespace
+
+    frames = FrameStore()
+    frames.color, frames.depth, frames.depth_unit = rgb_frame(16, 12), depth_frame(1.0, 16, 12), 0.001
+    perceiver = Perceiver(FakeDetector([Box("mug", 0.9, 4, 4, 8, 8)]), frames, CameraModel.from_parameters("0 0 0 0 0 0 1"))
+    assert not perceiver.available
+    with pytest.raises(Refusal, match="intrinsics have not been received"):
+        await perceiver.scan([], CancelToken(), 1.0)
+    perceiver.camera_reason = VACANT
+    with pytest.raises(Refusal, match="geometry slot is vacant"):
+        await perceiver.scan([], CancelToken(), 1.0)
+    answer = SimpleNamespace(width=16, height=12, fx=6.0, fy=6.0, cx=8.0, cy=6.0, distortion_model="none", distortion=[])
+    perceiver.set_camera(perceiver.camera.with_intrinsics(intrinsics_from(answer)))
+    assert perceiver.available and perceiver.camera_reason == ""
+    found = await perceiver.scan([], CancelToken(), 1.0)
+    assert [d.label for d in found] == ["mug"]
+    with pytest.raises(ValueError, match="unknown distortion model"):
+        intrinsics_from(SimpleNamespace(width=16, height=12, fx=6.0, fy=6.0, cx=8.0, cy=6.0, distortion_model="fisheye", distortion=[]))

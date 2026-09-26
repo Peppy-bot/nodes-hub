@@ -26,6 +26,12 @@
         // Optional: without a camera the brain still serves every member,
         // and both searches are refused with "no perception source".
         { name: "rgbd_camera", tag: "v1", link_id: "camera", cardinality: "zero_or_one" },
+        // Where that camera's pixels point: its colour intrinsics and lens
+        // model, served by the camera node (the sim relays, zed_camera,
+        // realsense_d4xx). Bound to the same camera as `camera`. Optional
+        // like it: without it no pixel can become a position, so both
+        // searches are refused naming the slot until it answers.
+        { name: "camera_geometry", tag: "v1", link_id: "geometry", cardinality: "zero_or_one" },
       ],
     },
   },
@@ -56,6 +62,7 @@
       ],
       consumes: [
         { link_id: "camera", name: "depth_stream_info" },
+        { link_id: "geometry", name: "get_color_intrinsics" },
       ],
     },
   },
@@ -116,19 +123,17 @@
       // "none" moves nothing: every sequence is refused with a message
       // naming the missing backend, while abort and get_state still work.
       manipulation_backend: { $type: "string", $default: "none" },
-      // The camera model, which the camera contracts do not carry: what
-      // turns a pixel and its depth into a world position. Vertical field
-      // of view of the colour stream, degrees.
-      camera_fovy_deg: { $type: "f64", $default: 52.0 },
       // Pose of the camera's optical frame in the world frame limb_motion
       // uses, as "x y z qx qy qz qw" (meters, unit quaternion), the camera
-      // looking along its -Z with +Y up. The default is the OpenArm v2 chest
-      // camera, the centre of the ZED Mini's left lens front, with the robot
-      // mounted at the world origin, copied from the engines'
-      // config/cameras.json5 and to be kept equal to it until the camera
-      // publishes its own geometry. A camera that moves with an arm needs
-      // the arm pose at capture time instead, which this parameter cannot
-      // express: the brain reads a fixed camera.
+      // looking along its -Z with +Y up. The intrinsics come from the
+      // camera itself through the `geometry` slot; no contract carries the
+      // camera's pose in the robot's frame yet, so it is this parameter.
+      // The default is the OpenArm v2 chest camera, the centre of the ZED
+      // Mini's left lens front, with the robot mounted at the world origin,
+      // from Enactic's CAD and equal to where the simulators place it. A
+      // camera that moves with an arm needs the arm pose at capture time
+      // instead, which this parameter cannot express: the brain reads a
+      // fixed camera.
       camera_pose: { $type: "string", $default: "0.0792 0.0315 0.7941 0.1710647 -0.1710647 -0.6861027 0.6861027" },
     },
   },

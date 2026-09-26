@@ -21,6 +21,7 @@ from .manipulation import make_manipulator
 from .perception import make_detector
 from .perception.camera import CameraModel
 from .perception.frames import FrameStore
+from .perception.geometry import learn_intrinsics
 from .perception.perceiver import Perceiver
 from .ports import Cancelled, Manipulator, Refusal
 from .robot import Robot
@@ -45,7 +46,7 @@ class Brain:
         self.state = State(params.gripper_names.split(","))
         self.robot = Robot(node_runner)
         self.frames = FrameStore()
-        self.camera = CameraModel.from_parameters(params.camera_fovy_deg, params.camera_pose)
+        self.camera = CameraModel.from_parameters(params.camera_pose)
         self.perceiver = Perceiver(detector or make_detector(params.perception_backend), self.frames, self.camera)
         if params.perception_confidence > 0.0 and hasattr(self.perceiver.detector, "min_confidence"):
             self.perceiver.detector.min_confidence = params.perception_confidence
@@ -65,8 +66,12 @@ class Brain:
         await self.manipulator.start(self.robot)
 
     def background(self, token) -> list[asyncio.Task]:
-        """The loops that run beside the action loops: the camera follower."""
-        return [asyncio.create_task(self.frames.run(self.node_runner, token))]
+        """The loops that run beside the action loops: the camera follower,
+        and the one asking the camera where its pixels point."""
+        return [
+            asyncio.create_task(self.frames.run(self.node_runner, token)),
+            asyncio.create_task(learn_intrinsics(self.node_runner, token, self.perceiver)),
+        ]
 
     async def shutdown(self) -> None:
         """The shutdown hook: stop what runs while the messenger is still

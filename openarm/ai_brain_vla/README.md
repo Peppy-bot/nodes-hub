@@ -50,16 +50,30 @@ alone; `yoloe_vp` refuses its searches and the rest of the node serves on.
   pack's own re-check keeps 0.10 clean (91% of items found, 0.4% phantom).
 - `manipulation_backend`: `none` ships; a scripted sequencer comes next.
 - `gripper_names`: the robot's grippers, in the order `get_state` reports them.
-- `camera_fovy_deg`, `camera_pose`: the camera model, below.
+- `camera_pose`: the camera model, below.
 
 ## The camera model
 
-A detection is a box in the colour image; the depth under it and a camera
-model turn it into a position in the robot's frame. `rgbd_camera:v1` carries
-no intrinsics, so for now `camera_fovy_deg` builds a pinhole from the vertical
-field of view with the principal point at the image centre, and `camera_pose`
-places the camera in the robot's world frame. The intrinsics are the part
-`camera_geometry:v1` replaces next.
+A detection is a box in the colour image. To become a position in the robot's
+frame it needs the depth under the box, which the depth stream gives, and a
+camera model: the intrinsics that turn a pixel into a ray, and the camera's
+pose in the robot's frame that turns the ray into a point.
+
+- **Intrinsics come from the camera.** The `geometry` slot consumes
+  `camera_geometry:v1`, served by the sim relays and by `zed_camera` and
+  `realsense_d4xx`, and the brain asks `get_color_intrinsics` at start: focal
+  lengths, principal point and lens model of the colour stream, undistorted by
+  `plumb_bob` or `inverse_plumb_bob` as the camera reports. The rig binds the
+  slot to the same camera as `camera`. Until it answers, both searches are
+  refused naming the reason (slot vacant, not answered yet, or the camera
+  refusing, as a UVC camera does). The depth is read at the colour pixels, so
+  the depth stream has to be aligned to colour, as the relays and the ZED
+  publish it and as `realsense_d4xx` does under `depth_to_color`.
+- **The pose is the `camera_pose` parameter**, the camera's optical frame in
+  the robot's world frame, because no contract carries a camera-to-world pose
+  yet. Its default is the OpenArm v2 chest camera, the ZED Mini's left lens
+  from Enactic's CAD, the value the simulators place the camera at; a measured
+  pose on the real robot replaces it.
 
 ## Testing it on any machine
 

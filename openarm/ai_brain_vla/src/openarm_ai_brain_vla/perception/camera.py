@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Sequence, Optional
 
 from ..ports import Quat, Vec3
 
@@ -38,17 +38,61 @@ _UNDISTORT_ITERATIONS = 20
 
 
 @dataclass(frozen=True)
-class CameraModel:
-    fovy_deg: float
-    position: Vec3
-    orientation: Quat
+class Intrinsics:
+    """Where the pixels of an image of `width` x `height` point: OpenCV's
+    pinhole through fx, fy, cx, cy, with the lens named by `distortion_model`
+    as camera_geometry:v1 reports it."""
+
+    width: int
+    height: int
+    fx: float
+    fy: float
+    cx: float
+    cy: float
+    distortion_model: str = NONE
+    distortion: tuple[float, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.width <= 0 or self.height <= 0:
+            raise ValueError(f"intrinsics need a positive image size, got {self.width}x{self.height}")
+        if not all(math.isfinite(v) for v in (self.fx, self.fy, self.cx, self.cy)) or self.fx <= 0.0 or self.fy <= 0.0:
+            raise ValueError(f"intrinsics need positive finite focal lengths, got fx {self.fx} fy {self.fy}")
+        if self.distortion_model not in DISTORTION_MODELS:
+            raise ValueError(f"unknown distortion model {self.distortion_model!r}; known: {', '.join(DISTORTION_MODELS)}")
 
     @classmethod
-    def from_parameters(cls, fovy_deg: float, pose_text: str) -> "CameraModel":
-        """`pose_text` is "x y z qx qy qz qw", as the camera_pose parameter
-        spells it."""
+    def from_fovy(cls, fovy_deg: float, width: int, height: int) -> "Intrinsics":
+        """A rendered camera with no lens: the vertical field of view gives
+        the focal length and the image centre is the principal point. For
+        tests and fixtures; a real camera answers get_color_intrinsics."""
         if not (0.0 < fovy_deg < 180.0):
-            raise ValueError(f"camera_fovy_deg must be between 0 and 180, got {fovy_deg}")
+            raise ValueError(f"the field of view must be between 0 and 180 degrees, got {fovy_deg}")
+        focal = (height / 2.0) / math.tan(math.radians(fovy_deg) / 2.0)
+        return cls(width, height, focal, focal, width / 2.0, height / 2.0)
+
+    def scaled_to(self, width: int, height: int) -> "Intrinsics":
+        """The same camera at another image size: focal lengths and the
+        principal point follow the pixels (pixel centres, so (c + 0.5) s - 0.5)."""
+        if (width, height) == (self.width, self.height):
+            return self
+        sx, sy = width / self.width, height / self.height
+        return Intrinsics(width, height, self.fx * sx, self.fy * sy, (self.cx + 0.5) * sx - 0.5, (self.cy + 0.5) * sy - 0.5, self.distortion_model, self.distortion)
+
+
+@dataclass(frozen=True)
+class CameraModel:
+    """The camera the brain looks through: its pose in the robot's world
+    frame, from the camera_pose parameter, and its intrinsics, from the
+    camera itself once it has answered. Not ready until it has."""
+
+    position: Vec3
+    orientation: Quat
+    intrinsics: Optional[Intrinsics] = None
+
+    @classmethod
+    def from_parameters(cls, pose_text: str) -> "CameraModel":
+        """`pose_text` is "x y z qx qy qz qw", as the camera_pose parameter
+        spells it. The intrinsics come later, with `with_intrinsics`."""
         parts = pose_text.replace(",", " ").split()
         if len(parts) != 7:
             raise ValueError("camera_pose must hold seven numbers: x y z qx qy qz qw")
@@ -62,20 +106,25 @@ class CameraModel:
         norm = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
         if norm < 1e-9:
             raise ValueError("camera_pose quaternion must not be zero")
-        return cls(fovy_deg, (x, y, z), (qx / norm, qy / norm, qz / norm, qw / norm))
+        return cls((x, y, z), (qx / norm, qy / norm, qz / norm, qw / norm))
 
-    def focal_px(self, height: int) -> float:
-        """Pixels per unit of tangent, from the vertical field of view;
-        square pixels, so the same horizontally."""
-        return (height / 2.0) / math.tan(math.radians(self.fovy_deg) / 2.0)
+    def with_intrinsics(self, intrinsics: Intrinsics) -> "CameraModel":
+        return CameraModel(self.position, self.orientation, intrinsics)
+
+    @property
+    def ready(self) -> bool:
+        return self.intrinsics is not None
 
     def deproject(self, u: float, v: float, depth_m: float, width: int, height: int) -> Vec3:
         """The world position of pixel (u, v), x right and y down, seen at
-        `depth_m` along the optical axis in an image of `width` x `height`.
-        A rendered camera: the field of view gives the focal length, the
-        image centre is the principal point, and there is no lens."""
-        focal = self.focal_px(height)
-        x, y = pixel_to_ray(u, v, focal, focal, width / 2.0, height / 2.0, NONE, ())
+        `depth_m` along the optical axis in an image of `width` x `height`:
+        the pixel through the intrinsics, scaled to that image size when the
+        stream is not at the size the intrinsics were given for, the lens
+        taken off, then the ray placed by the pose."""
+        if self.intrinsics is None:
+            raise ValueError("the camera's intrinsics are not known yet")
+        k = self.intrinsics.scaled_to(width, height)
+        x, y = pixel_to_ray(u, v, k.fx, k.fy, k.cx, k.cy, k.distortion_model, k.distortion)
         camera = (x * depth_m, -y * depth_m, -depth_m)
         rotated = rotate(self.orientation, camera)
         return (

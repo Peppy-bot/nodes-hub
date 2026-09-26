@@ -23,7 +23,6 @@ PARAMS = {
     "gallery_url": "",
     "perception_confidence": 0.0,
     "manipulation_backend": "none",
-    "camera_fovy_deg": 90.0,
     # At the origin, looking along world -Z with +Y up: the identity pose.
     "camera_pose": "0 0 0 0 0 0 1",
 }
