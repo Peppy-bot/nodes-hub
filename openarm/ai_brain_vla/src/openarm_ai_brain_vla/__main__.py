@@ -6,6 +6,8 @@ core, the moves and the model behind the two ports."""
 from __future__ import annotations
 
 import asyncio
+import logging
+import sys
 from functools import partial
 
 from peppygen import NodeBuilder, NodeRunner, clock
@@ -57,7 +59,23 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
     return loops
 
 
+def configure_logging(level: int = logging.INFO) -> logging.Logger:
+    """The node's own log lines reach the daemon's log. Python drops INFO
+    by default, which hid the backends' "loaded" lines inside the container;
+    only this package's logger is raised, so the model libraries stay quiet."""
+    logger = logging.getLogger("openarm_ai_brain_vla")
+    if not any(getattr(h, "_brain_handler", False) for h in logger.handlers):
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setFormatter(logging.Formatter("[brain] %(message)s"))
+        handler._brain_handler = True  # type: ignore[attr-defined]
+        logger.addHandler(handler)
+    logger.setLevel(level)
+    logger.propagate = False
+    return logger
+
+
 def main() -> None:
+    configure_logging()
     NodeBuilder().run(setup)
 
 

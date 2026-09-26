@@ -108,7 +108,11 @@ moves) and the world at `http://127.0.0.1:8902/simulation/v1/mcp`
 viewer is at `https://127.0.0.1:8080` (self-signed certificate). The first
 launch builds the brain's container, about ten minutes; the brain then loads
 its models in the background for about a minute and refuses searches as
-"still loading" until it is ready. Its log is `~/.peppy/logs/run/alpha_brain_inst.log`.
+"still loading" until it is ready. Its log is `~/.peppy/logs/run/alpha_brain_inst.log`,
+and two lines there say it is set: the camera's answer, `[brain] camera
+geometry: 1280x720 fx 738.1 fy 738.1 cx 639.5 cy 359.5 none`, and the backend's,
+`[brain] sam3_siglip: 120 items from galleries/waldo_catalogue/<digest>,
+prototypes shipped with the pack, on cuda`.
 
 ### 3. Drive it from an MCP client
 
