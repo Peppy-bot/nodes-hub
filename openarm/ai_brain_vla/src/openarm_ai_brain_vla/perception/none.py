@@ -19,7 +19,7 @@ class NoneDetector:
     def available(self) -> bool:
         return False
 
-    def load(self, model: str) -> None:
+    def load(self, model: str, gallery: str = "") -> None:
         return None
 
     def set_vocabulary(self, phrases: Sequence[str]) -> None:

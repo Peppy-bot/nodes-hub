@@ -157,7 +157,10 @@ class Detector(Protocol):
     @property
     def available(self) -> bool: ...
 
-    def load(self, model: str) -> None: ...
+    def load(self, model: str, gallery: str = "") -> None:
+        """`model` is perception_model, `gallery` the gallery_url parameter;
+        what either means belongs to the backend."""
+        ...
 
     def set_vocabulary(self, phrases: Sequence[str]) -> None:
         """The labels to look for. Empty means the detector's own

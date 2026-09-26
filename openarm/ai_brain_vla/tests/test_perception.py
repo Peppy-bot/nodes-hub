@@ -209,7 +209,7 @@ async def test_a_backend_loads_in_the_background_and_searches_wait_on_it():
         def available(self) -> bool:
             return self.ready
 
-        def load(self, model: str) -> None:
+        def load(self, model: str, gallery: str = "") -> None:
             self.release.wait(5.0)
             self.loaded = model
             self.ready = True
@@ -237,7 +237,7 @@ async def test_a_load_that_fails_becomes_the_reason_every_search_is_refused_with
         def available(self) -> bool:
             return False
 
-        def load(self, model: str) -> None:
+        def load(self, model: str, gallery: str = "") -> None:
             raise ValueError(f"no gallery at {model}")
 
     perceiver = Perceiver(BrokenDetector(), FrameStore(), IDENTITY)
@@ -259,3 +259,21 @@ def test_registries_import_only_the_chosen_backend_and_refuse_unknown_names():
         make_detector("sam9")
     with pytest.raises(ValueError, match="unknown manipulation_backend"):
         make_manipulator("policy")
+
+
+def test_the_confidence_parameter_reaches_a_detector_that_has_one():
+    from types import SimpleNamespace
+
+    from openarm_ai_brain_vla.brain import Brain
+    from conftest import PARAMS
+
+    class Thresholded(FakeDetector):
+        min_confidence = 0.25
+
+    params = SimpleNamespace(**{**PARAMS, "perception_confidence": 0.10})
+    brain = Brain(params, node_runner=None, detector=Thresholded())
+    assert brain.perceiver.detector.min_confidence == 0.10
+    params = SimpleNamespace(**{**PARAMS, "perception_confidence": 0.0})
+    brain = Brain(params, node_runner=None, detector=Thresholded())
+    assert brain.perceiver.detector.min_confidence == 0.25
+

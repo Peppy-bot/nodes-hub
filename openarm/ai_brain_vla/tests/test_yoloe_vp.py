@@ -3,6 +3,8 @@ vocabulary mapping and the box selection, all without torch. The model is
 exercised by test_yoloe_vp_models.py, which needs it installed and skips
 otherwise."""
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -13,6 +15,8 @@ from openarm_ai_brain_vla.perception.yoloe_vp import (
     YoloeVpDetector,
     boxes_from,
     by_image,
+    prompt_boxes,
+    table_rows,
     prototypes_from,
     wanted_classes,
 )
@@ -40,8 +44,8 @@ def test_a_class_without_a_crop_is_refused_by_index():
 def test_the_gallerys_crops_group_by_image(tmp_path):
     gallery = load_gallery(write_gallery(tmp_path / "g"))
     grouped = by_image(gallery.crops)
-    assert sorted(p.name for p in grouped) == ["000_chest.png", "001_chest.png"]
-    assert sorted(c.class_index for c in grouped[gallery.root / "images" / "000_chest.png"]) == [0, 1]
+    assert sorted(Path(p).name for p in grouped) == ["000_chest.png", "001_chest.png"]
+    assert sorted(c.class_index for c in grouped["images/000_chest.png"]) == [0, 1]
 
 
 def test_the_vocabulary_maps_to_gallery_items(tmp_path):
@@ -65,7 +69,57 @@ def test_the_registry_builds_the_backend_and_an_empty_model_is_refused():
     detector = make_detector("yoloe_vp")
     assert isinstance(detector, YoloeVpDetector) and detector.name == "yoloe_vp"
     assert not detector.available
-    with pytest.raises(ValueError, match="gallery directory"):
-        detector.load("  ")
+    with pytest.raises(ValueError, match="needs a gallery"):
+        detector.load("none")
+    with pytest.raises(ValueError, match="needs a gallery"):
+        detector.load("  ")  # no default gallery is set
     detector.set_vocabulary(["banana"])
     assert detector.detect(np.zeros((8, 8, 3), dtype=np.uint8)) == []
+
+
+def test_a_gallery_that_cannot_be_had_fails_the_load_by_name(tmp_path):
+    detector = YoloeVpDetector()
+    with pytest.raises(RuntimeError, match="needs its gallery"):
+        detector.load(str(tmp_path / "missing"))
+    assert not detector.available
+
+
+def test_a_crop_that_is_the_whole_image_prompts_with_the_whole_image(tmp_path):
+    from openarm_ai_brain_vla.perception.sam3_siglip import Crop
+
+    boxes = prompt_boxes([Crop("crops/a/0.jpg", None, 0), Crop("frame.png", (1.0, 2.0, 30.0, 40.0), 1)], 64, 48)
+    assert boxes.tolist() == [[0.0, 0.0, 64.0, 48.0], [1.0, 2.0, 30.0, 40.0]]
+
+
+def test_the_table_holds_boxed_non_background_classes_only(tmp_path):
+    from openarm_ai_brain_vla.perception.gallery_store import open_pack
+    from test_gallery_store import write_pack
+
+    url, root, cache = write_pack(tmp_path / "store")
+    gallery = load_gallery(open_pack(url, cache_dir=cache))
+    # Only the apple stands for a YCB catalogue id; the robot arm has no frame box.
+    assert table_rows(gallery) == [1]
+    harvest = load_gallery(write_gallery(tmp_path / "g"))
+    assert table_rows(harvest) == [0, 1, 2]
+
+
+def test_a_pack_of_crops_alone_is_refused_by_name_and_a_missing_gallery_url_is_a_reason(tmp_path):
+    from openarm_ai_brain_vla.perception.gallery_store import open_pack
+    from test_gallery_store import write_pack
+
+    url, root, cache = write_pack(tmp_path / "store")
+    gallery = load_gallery(open_pack(url, cache_dir=cache))
+    crops_only = gallery.__class__(gallery.name, gallery.classes, gallery.phrases,
+                                   tuple(c.__class__(c.image, None, c.class_index) for c in gallery.crops),
+                                   gallery.source, gallery.prototypes, gallery.background)
+    import openarm_ai_brain_vla.perception.yoloe_vp as backend
+    detector = YoloeVpDetector()
+    original = backend.load_gallery
+    backend.load_gallery = lambda source: crops_only
+    try:
+        with pytest.raises(ValueError, match="ships crops only"):
+            detector.load("", url)
+    finally:
+        backend.load_gallery = original
+    with pytest.raises(RuntimeError, match="needs its gallery"):
+        detector.load("", (tmp_path / "missing.json").as_uri())

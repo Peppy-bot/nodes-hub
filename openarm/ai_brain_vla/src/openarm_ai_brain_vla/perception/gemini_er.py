@@ -346,8 +346,8 @@ class GeminiErDetector:
     def available(self) -> bool:
         return self._api is not None
 
-    def load(self, model: str) -> None:
-        """Finds the key and opens the client. No key, or no library, fails
+    def load(self, model: str, gallery: str = "") -> None:
+        """Finds the key and opens the client; the gallery means nothing here. No key, or no library, fails
         the load with the reason every search is then refused with."""
         self.model = model.strip() or MODEL
         if self._api is not None:

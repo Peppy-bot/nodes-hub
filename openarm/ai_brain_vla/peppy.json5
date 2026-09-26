@@ -88,16 +88,30 @@
       perception_backend: { $type: "string", $default: "none" },
       // The model identifier the perception backend loads (a weights name
       // or path); its meaning belongs to the backend. Empty is the
-      // backend's default. For "sam3_siglip" and "yoloe_vp" it is the
-      // gallery directory of reference crops the items are named from
-      // (manifest.json, classes.txt, prompts.txt), a path the container can
-      // see: one under the daemon user's home is, as is the Hugging Face
-      // cache the model weights load from. For "gemini_er" it is the model
-      // id, "gemini-robotics-er-2-preview" when empty; the API key is not a
-      // parameter: it is read from GEMINI_API_KEY in the node's environment
-      // (`peppy stack launch` forwards the launching shell's), else from
+      // backend's default. For "sam3_siglip" and "yoloe_vp" it overrides the
+      // gallery below with a directory the container can see: an unpacked
+      // release, or a harvester dataset (manifest.json, classes.txt,
+      // prompts.txt) whose crops are embedded at load; "none" is no gallery.
+      // For "gemini_er" it is the model id, "gemini-robotics-er-2-preview"
+      // when empty; the API key is not a parameter: it is read from
+      // GEMINI_API_KEY in the node's environment (`peppy stack launch`
+      // forwards the launching shell's), else from
       // ~/.config/openarm_ai_brain_vla/gemini_api_key of the daemon user.
       perception_model: { $type: "string", $default: "" },
+      // The gallery the items are named from: the lock file of one
+      // immutable release of the gallery pack (126 items of the Waldo
+      // catalogue, their SigLIP prototypes and reference crops), fetched
+      // once into the daemon user's cache and checked against its sizes and
+      // hashes. The host is a development hostname; a custom domain
+      // replaces it here and nowhere else. Without it, or with it
+      // unreachable, sam3_siglip still runs, naming by words alone; yoloe_vp
+      // refuses its searches and the rest of the node serves on.
+      gallery_url: { $type: "string", $default: "https://pub-5099e5973ff5486bbad9e7c3b91f8279.r2.dev/galleries/waldo_catalogue/gallery.lock.json" },
+      // The confidence a gallery backend keeps a detection at, 0 for the
+      // backend's own (0.25, the study's). With the pack's background rows
+      // in the table its re-check keeps 0.10 clean, 91% of items found at
+      // 0.4% phantom boxes: the lever a demo pulls.
+      perception_confidence: { $type: "f64", $default: 0.0 },
       // Which manipulation backend runs grab_item, drop_item and place_item.
       // "none" moves nothing: every sequence is refused with a message
       // naming the missing backend, while abort and get_state still work.
