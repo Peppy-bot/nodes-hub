@@ -71,8 +71,10 @@ KEY_FILE = Path("~/.config/openarm_ai_brain_vla/gemini_api_key")
 # Answers a frame is asked for; the study's identify runs used one.
 SAMPLES = 1
 MATCH_IOU = 0.5
-# One call must fit inside the core's search timeout (10 s) with a retry.
-CALL_TIMEOUT_S = 8.0
+# The API refuses a deadline under 10 s, so one call gets the core's whole
+# default search timeout (10 s); the retry is for the 429s and 5xx that
+# come back at once, not for a slow answer.
+CALL_TIMEOUT_S = 10.0
 ATTEMPTS = 2
 RETRY_WAIT_S = 1.0
 # The frame travels as a JPEG: a tenth of the PNG the study sent, no
