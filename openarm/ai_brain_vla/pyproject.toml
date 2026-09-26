@@ -1,0 +1,59 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "openarm_ai_brain_vla"
+version = "0.1.0"
+description = "openarm_ai_brain_vla peppy node"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "peppygen",
+    "peppylib",
+    # Frames as arrays for the detector and the depth lookup; Pillow decodes
+    # the mjpeg colour encoding the camera contracts allow.
+    "numpy>=1.26",
+    "pillow>=10",
+]
+
+[project.optional-dependencies]
+# The sam3_siglip perception backend: SAM 3 and SigLIP through transformers on
+# torch. An extra, so a checkout that runs the unit tests or another backend
+# never installs them; the container installs it (apptainer.def).
+sam3-siglip = [
+    "torch>=2.7,<3",
+    # SAM 3's image processor is built on torchvision's transforms.
+    "torchvision>=0.22",
+    "transformers>=5.17,<5.18",
+    # SigLIP's tokenizer.
+    "sentencepiece>=0.2",
+    "protobuf>=5",
+]
+# The yoloe_vp perception backend: YOLOE through Ultralytics on torch, at the
+# version the study ran. Ultralytics is AGPL-3.0 unless licensed otherwise.
+yoloe = [
+    "torch>=2.7,<3",
+    "torchvision>=0.22",
+    "ultralytics>=8.4.150,<9",
+]
+# The gemini_er perception backend: Google's API client, no torch.
+gemini = [
+    "google-genai>=2.25,<3",
+]
+
+[project.scripts]
+openarm_ai_brain_vla = "openarm_ai_brain_vla.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/openarm_ai_brain_vla"]
+
+[dependency-groups]
+dev = ["pytest>=8", "pytest-asyncio>=0.25"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.uv.sources]
+peppygen = { path = ".peppy/libs/peppygen" }
+peppylib = { path = ".peppy/libs/peppylib" }

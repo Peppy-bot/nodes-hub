@@ -1,0 +1,140 @@
+// openarm_ai_brain_vla: the OpenArm implementer of item_perception and
+// item_manipulation, the contracts that scan for items, find one, pick it
+// up, and put it down. This manifest claims every member of both and depends on
+// limb_motion, the backbone's discrete arm and gripper moves; the launcher
+// binds that slot to the instance that governs the arms, so any move sent
+// through it is collision governed on the way down. The core enforces every
+// contract rule; what it cannot know, finding an item in an image and moving
+// an arm to it, sits behind two backends the parameters below select. Both
+// default to "none", so every member answers and the searches and sequences
+// are refused naming what is missing.
+{
+  peppy_schema: "node/v1",
+  manifest: {
+    name: "openarm_ai_brain_vla",
+    tag: "v1",
+    implements: [
+      { name: "item_perception", tag: "v1", link_id: "item_perception" },
+      { name: "item_manipulation", tag: "v1", link_id: "item_manipulation" },
+    ],
+    depends_on: {
+      contracts: [
+        { name: "limb_motion", tag: "v1", link_id: "limb_motion" },
+        // The camera the brain looks through: colour and depth from one
+        // rgbd producer, so a detection's pixel becomes a world position
+        // through the depth at that pixel and the camera model below.
+        // Optional: without a camera the brain still serves every member,
+        // and both searches are refused with "no perception source".
+        { name: "rgbd_camera", tag: "v1", link_id: "camera", cardinality: "zero_or_one" },
+        // Where that camera's pixels point: its colour intrinsics and lens
+        // model, served by the camera node (the sim relays, zed_camera,
+        // realsense_d4xx). Bound to the same camera as `camera`. Optional
+        // like it: without it no pixel can become a position, so both
+        // searches are refused naming the slot until it answers.
+        { name: "camera_geometry", tag: "v1", link_id: "geometry", cardinality: "zero_or_one" },
+      ],
+    },
+  },
+  interfaces: {
+    actions: {
+      exposes: [
+        { link_id: "item_perception", name: "scan_items" },
+        { link_id: "item_perception", name: "identify_item" },
+        { link_id: "item_manipulation", name: "grab_item" },
+        { link_id: "item_manipulation", name: "drop_item" },
+        { link_id: "item_manipulation", name: "place_item" },
+        { link_id: "item_manipulation", name: "abort" },
+      ],
+      consumes: [
+        { link_id: "limb_motion", name: "move_arm" },
+        { link_id: "limb_motion", name: "move_gripper" },
+      ],
+    },
+    topics: {
+      consumes: [
+        { link_id: "camera", name: "video_stream" },
+        { link_id: "camera", name: "depth_stream" },
+      ],
+    },
+    services: {
+      exposes: [
+        { link_id: "item_manipulation", name: "get_state" },
+      ],
+      consumes: [
+        { link_id: "camera", name: "depth_stream_info" },
+        { link_id: "geometry", name: "get_color_intrinsics" },
+      ],
+    },
+  },
+  execution: {
+    language: "python",
+    container: {
+      def_file: "apptainer.def",
+      // The perception models compute on the host's NVIDIA GPU; without a
+      // driver they fall back to the CPU, slowly.
+      apptainer_run_extra_args: ["--nv"],
+    },
+    parameters: {
+      // The grippers this instance serves, comma separated and in the order
+      // get_state reports them (e.g. "left_gripper,right_gripper"). They are
+      // the names limb_motion addresses, so the launcher names the set the
+      // robot actually has rather than the node assuming a pair.
+      gripper_names: "string",
+      // Which perception backend serves scan_items and identify_item, by the
+      // name it is registered under in the node's perception registry.
+      // "none" runs no model: every search is refused with "no perception
+      // source", which is what the contract asks for when the brain cannot
+      // see. A launcher selects a model per launch without a code change.
+      // "sam3_siglip" is the accurate local pipeline (SAM 3 finds, SigLIP
+      // names against a gallery, about 2 s a frame on a GPU); "yoloe_vp"
+      // the real-time one (YOLOE-11M with the gallery's crops as visual
+      // prompts, about 20 ms, names enrolled items only); "gemini_er" the
+      // one that needs nothing set up (Gemini Robotics-ER over Google's
+      // API: no GPU, no gallery, words alone; needs the network and a key,
+      // and bills and waits per question).
+      perception_backend: { $type: "string", $default: "none" },
+      // The model identifier the perception backend loads (a weights name
+      // or path); its meaning belongs to the backend. Empty is the
+      // backend's default. For "sam3_siglip" and "yoloe_vp" it overrides the
+      // gallery below with a directory the container can see: an unpacked
+      // release, or a harvester dataset (manifest.json, classes.txt,
+      // prompts.txt) whose crops are embedded at load; "none" is no gallery.
+      // For "gemini_er" it is the model id, "gemini-robotics-er-2-preview"
+      // when empty; the API key is not a parameter: it is read from
+      // GEMINI_API_KEY in the node's environment (`peppy stack launch`
+      // forwards the launching shell's), else from
+      // ~/.config/openarm_ai_brain_vla/gemini_api_key of the daemon user.
+      perception_model: { $type: "string", $default: "" },
+      // The gallery the items are named from: the lock file of one
+      // immutable release of the gallery pack (126 items of the Waldo
+      // catalogue, their SigLIP prototypes and reference crops), fetched
+      // once into the daemon user's cache and checked against its sizes and
+      // hashes. The host is a development hostname; a custom domain
+      // replaces it here and nowhere else. Without it, or with it
+      // unreachable, sam3_siglip still runs, naming by words alone; yoloe_vp
+      // refuses its searches and the rest of the node serves on.
+      gallery_url: { $type: "string", $default: "https://pub-5099e5973ff5486bbad9e7c3b91f8279.r2.dev/galleries/waldo_catalogue/gallery.lock.json" },
+      // The confidence a gallery backend keeps a detection at, 0 for the
+      // backend's own (0.25, the study's). With the pack's background rows
+      // in the table its re-check keeps 0.10 clean, 91% of items found at
+      // 0.4% phantom boxes: the lever a demo pulls.
+      perception_confidence: { $type: "f64", $default: 0.0 },
+      // Which manipulation backend runs grab_item, drop_item and place_item.
+      // "none" moves nothing: every sequence is refused with a message
+      // naming the missing backend, while abort and get_state still work.
+      manipulation_backend: { $type: "string", $default: "none" },
+      // Pose of the camera's optical frame in the world frame limb_motion
+      // uses, as "x y z qx qy qz qw" (meters, unit quaternion), the camera
+      // looking along its -Z with +Y up. The intrinsics come from the
+      // camera itself through the `geometry` slot; no contract carries the
+      // camera's pose in the robot's frame yet, so it is this parameter.
+      // The default is the OpenArm v2 chest camera, the centre of the ZED
+      // Mini's left lens front, with the robot mounted at the world origin,
+      // from Enactic's CAD and equal to where the simulators place it. A
+      // camera that moves with an arm needs the arm pose at capture time
+      // instead, which this parameter cannot express: the brain reads a
+      // fixed camera.
+      camera_pose: { $type: "string", $default: "0.0792 0.0315 0.7941 0.1710647 -0.1710647 -0.6861027 0.6861027" },
+    },
+  },
+}
