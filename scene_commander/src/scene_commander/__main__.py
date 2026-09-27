@@ -2531,11 +2531,12 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
     # preferred port follows launch order.
     listener = listen.bind_listener(params.http_host, params.http_port)
 
-    logger.info(
-        "Scene panel at %s (bound %s)",
-        listen.served_url(listener),
-        listen.bound_address(listener),
-    )
+    # The daemon renders the URLs an operator opens from this announcement,
+    # one per address of the machine, so the fallback port reaches the
+    # operator too.
+    host, port = listen.bound_host_and_port(listener)
+    node_runner.announce_endpoint("panel", "http", host, port)
+    logger.info("Scene panel bound at %s", listen.bound_address(listener))
 
     app = _build_app(node_runner)
 

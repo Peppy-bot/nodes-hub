@@ -5,8 +5,13 @@ name = "scene-commander-tests"
 version = "0.1.0"
 description = "Tests for the scene commander HTTP API and its Peppy calls"
 requires-python = ">=3.11,<3.12"
-# What the API is built on; the node pins no version either.
-dependencies = ["aiohttp"]
+dependencies = [
+    # What the API is built on; the node pins no version either.
+    "aiohttp",
+    # What the endpoint tests read the node's peppy.json5 with, so the runner
+    # they announce on refuses a label the manifest does not declare.
+    "pyjson5==2.0.0",
+]
 
 [dependency-groups]
 dev = ["pytest>=8"]

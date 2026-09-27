@@ -3,6 +3,7 @@
 import asyncio
 import enum
 import importlib.util
+import ipaddress
 import json
 import logging
 import sys
@@ -11,10 +12,13 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
+import pyjson5
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
-_SOURCE = Path(__file__).resolve().parents[1] / "src" / "scene_commander" / "__main__.py"
+_NODE = Path(__file__).resolve().parents[1]
+_SOURCE = _NODE / "src" / "scene_commander" / "__main__.py"
+_MANIFEST = _NODE / "peppy.json5"
 _ACTIONS = ("apply_force", "clear_scene", "load_scene", "move_object", "move_robot", "remove_object", "spawn_object")
 # The services of every slot a launch may leave vacant, by link id.
 _OPTIONAL_LINKS = {
@@ -219,6 +223,47 @@ def commander(monkeypatch):
     )
 
 
+class FakeNodeRunner:
+    """The runner's endpoint announcements, held to the rules peppylib holds
+    them to: each announced label is one the manifest declares, announced once
+    with an IP literal, and the seal that ends setup finds every declared label
+    announced.
+    """
+
+    def __init__(self):
+        self.declared = pyjson5.loads(_MANIFEST.read_text())["execution"].get("endpoints", {})
+        self.announced = []
+
+    def announce_endpoint(self, label, scheme, host, port, path=""):
+        if label not in self.declared:
+            raise ValueError(f"endpoint `{label}` is not declared in the manifest")
+
+        if label in self._announced_labels():
+            raise ValueError(f"endpoint `{label}` is already announced")
+
+        try:
+            ipaddress.ip_address(host)
+
+        except ValueError as error:
+            raise ValueError(f"endpoint `{label}` host `{host}` is not an IP literal") from error
+
+        self.announced.append((label, scheme, host, port, path))
+
+    def seal_endpoints(self):
+        unannounced = sorted(self.declared.keys() - self._announced_labels())
+
+        if unannounced:
+            raise ValueError(f"endpoints {unannounced} are declared but setup returned without announcing them")
+
+    def _announced_labels(self):
+        return {label for label, *_ in self.announced}
+
+
+@pytest.fixture
+def node_runner():
+    return FakeNodeRunner()
+
+
 class _FakeListener:
     """A bound socket, for the wiring around it; the real one is in test_http_port."""
 
@@ -227,6 +272,11 @@ class _FakeListener:
 
     def getsockname(self):
         return self._name
+
+
+async def _serve_nothing(app, listener):
+    """A server that stops at once, for the setups that do not read what it serves."""
+    return asyncio.create_task(asyncio.sleep(0))
 
 
 def _parameters(http_port, http_host="0.0.0.0"):
@@ -544,7 +594,9 @@ def test_invalid_input_is_a_400_that_never_reaches_the_provider(commander, caplo
     ]
 
 
-def test_setup_tolerates_a_provider_without_catalogue_but_not_an_unreachable_one(commander, caplog, monkeypatch):
+def test_setup_tolerates_a_provider_without_catalogue_but_not_an_unreachable_one(
+    commander, node_runner, caplog, monkeypatch,
+):
     caplog.set_level(logging.INFO)
     served = []
     # The socket reports a different port from the one configured, which is
@@ -561,7 +613,7 @@ def test_setup_tolerates_a_provider_without_catalogue_but_not_an_unreachable_one
     commander.services.get_assets_list.answers = [_busy()]
 
     async def run():
-        await asyncio.gather(*await commander.module.setup(_parameters(9000, "127.0.0.1"), object()))
+        await asyncio.gather(*await commander.module.setup(_parameters(9000, "127.0.0.1"), node_runner))
 
     asyncio.run(run())
     [(bound, routes)] = served
@@ -569,9 +621,8 @@ def test_setup_tolerates_a_provider_without_catalogue_but_not_an_unreachable_one
     assert routes >= {"/", "/api/assets", "/api/scene/load"}
     assert _node_log(commander, caplog) == [
         (logging.INFO, "Scene commander starting", None),
-        # The bound address reaches the operator here and nowhere else, and
-        # the socket is taken before the provider is waited on.
-        (logging.INFO, "Scene panel at http://127.0.0.1:9100 (bound 127.0.0.1:9100)", None),
+        # The socket is taken before the provider is waited on.
+        (logging.INFO, "Scene panel bound at 127.0.0.1:9100", None),
         (logging.INFO, "Capabilities: scene manipulation only", None),
         (logging.INFO, f"Scene provider has no catalogue: {_BUSY}", None),
         (logging.INFO, "Scene provider object state ready: 0 runtime objects", None),
@@ -579,11 +630,13 @@ def test_setup_tolerates_a_provider_without_catalogue_but_not_an_unreachable_one
 
     commander.objects.get_object_states.answers = [TimeoutError("get_object_states timed out")]
     with pytest.raises(TimeoutError, match="get_object_states timed out"):
-        asyncio.run(commander.module.setup(_parameters(9000, "127.0.0.1"), object()))
+        asyncio.run(commander.module.setup(_parameters(9000, "127.0.0.1"), FakeNodeRunner()))
     assert len(served) == 1
 
 
-def test_setup_tolerates_a_provider_without_object_state_and_the_page_asks_again(commander, caplog, monkeypatch):
+def test_setup_tolerates_a_provider_without_object_state_and_the_page_asks_again(
+    commander, node_runner, caplog, monkeypatch,
+):
     caplog.set_level(logging.INFO)
     served = []
     monkeypatch.setattr(commander.module.listen, "bind_listener", lambda *bound: _FakeListener("127.0.0.1", 9000))
@@ -596,7 +649,7 @@ def test_setup_tolerates_a_provider_without_object_state_and_the_page_asks_again
     commander.objects.get_object_states.answers = [_no_object_state()]
 
     async def run():
-        await asyncio.gather(*await commander.module.setup(_parameters(9000, "127.0.0.1"), object()))
+        await asyncio.gather(*await commander.module.setup(_parameters(9000, "127.0.0.1"), node_runner))
 
     asyncio.run(run())
     [app] = served
@@ -610,16 +663,39 @@ def test_setup_tolerates_a_provider_without_object_state_and_the_page_asks_again
     ]
 
 
-def test_setup_refuses_a_launch_it_cannot_serve_and_starts_no_server(commander, monkeypatch):
+def test_setup_refuses_a_launch_it_cannot_serve_and_starts_no_server(commander, node_runner, monkeypatch):
     # A node that never binds must fail its launch, not stand ready with
     # nothing listening.
     served = []
     monkeypatch.setattr(commander.module.listen, "start_serving", lambda *started: served.append(started))
 
     with pytest.raises(ValueError, match="http_host"):
-        asyncio.run(commander.module.setup(_parameters(9000, http_host="localhost"), object()))
+        asyncio.run(commander.module.setup(_parameters(9000, http_host="localhost"), node_runner))
 
     assert served == [], "a commander that cannot serve must start no server"
+    assert node_runner.announced == [], "a commander that cannot serve must announce no panel"
+
+
+def test_the_manifest_declares_the_panel_as_a_web_page(node_runner):
+    # A page endpoint is what the launch lists under `Web pages:`.
+    assert {label: endpoint["kind"] for label, endpoint in node_runner.declared.items()} == {"panel": "page"}
+
+
+def test_setup_announces_the_panel_on_the_address_its_socket_took(commander, node_runner, monkeypatch):
+    # The socket reports a different port from the one configured, which is
+    # what a fallback looks like: the announcement must follow the socket.
+    monkeypatch.setattr(commander.module.listen, "bind_listener", lambda *bound: _FakeListener("0.0.0.0", 9100))
+    monkeypatch.setattr(commander.module.listen, "start_serving", _serve_nothing)
+
+    async def run():
+        await asyncio.gather(*await commander.module.setup(_parameters(9000), node_runner))
+
+    asyncio.run(run())
+    # A panel on every interface is announced on the wildcard, which the
+    # daemon renders as one URL per address of the machine.
+    assert node_runner.announced == [("panel", "http", "0.0.0.0", 9100, "")]
+    # The check the runtime makes once setup returns.
+    node_runner.seal_endpoints()
 
 
 def test_http_server_keeps_browser_requests_out_of_the_log(commander, monkeypatch):
@@ -1182,25 +1258,21 @@ def test_a_camera_transport_failure_is_a_server_error_logged_in_one_line(command
     ]
 
 
-def test_setup_logs_the_bound_capabilities_and_calls_none_of_them(commander, caplog, monkeypatch):
+def test_setup_logs_the_bound_capabilities_and_calls_none_of_them(commander, node_runner, caplog, monkeypatch):
     caplog.set_level(logging.INFO)
     commander.bind_lighting()
     commander.bind_materials()
     commander.bind_cameras()
     monkeypatch.setattr(commander.module.listen, "bind_listener", lambda *bound: _FakeListener("127.0.0.1", 9000))
-
-    async def fake_server(app, bound):
-        return asyncio.create_task(asyncio.sleep(0))
-
-    monkeypatch.setattr(commander.module.listen, "start_serving", fake_server)
+    monkeypatch.setattr(commander.module.listen, "start_serving", _serve_nothing)
 
     async def run():
-        await asyncio.gather(*await commander.module.setup(_parameters(9000, "127.0.0.1"), object()))
+        await asyncio.gather(*await commander.module.setup(_parameters(9000, "127.0.0.1"), node_runner))
 
     asyncio.run(run())
     assert _node_log(commander, caplog) == [
         (logging.INFO, "Scene commander starting", None),
-        (logging.INFO, "Scene panel at http://127.0.0.1:9000 (bound 127.0.0.1:9000)", None),
+        (logging.INFO, "Scene panel bound at 127.0.0.1:9000", None),
         (logging.INFO, "Capabilities: lighting, materials, cameras", None),
         (logging.INFO, "Scene provider catalogue ready: 1 assets", None),
         (logging.INFO, "Scene provider object state ready: 0 runtime objects", None),
