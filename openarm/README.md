@@ -245,7 +245,10 @@ If the viewer opens but the video does not connect, first verify that the config
 
 ## Open Scene Commander
 
-Open:
+Open one of the URLs the launch prints under `Web pages:` as the `panel` of
+`scene_commander_inst` (`peppy stack list` shows them again under `Instance
+endpoints`). There is one URL for each address of the Isaac machine, on port
+8766 when no other process holds it:
 
 ```text
 http://<ISAAC_HOST_IP>:8766
@@ -636,11 +639,11 @@ An older instance is still running. Find it with `peppy stack list` and stop it 
 **A commander panel is not on 8765 or 8766**
 Both commanders prefer their configured port and take one from the operating
 system when another process holds it, so a second copy on a host comes up on a
-port of its own. Each logs the address it took:
+port of its own. The URLs the launch printed under `Web pages:` carry the port
+each took, and so do `peppy stack list` and `peppy node info`:
 
 ```bash
-peppy node info openarm_web_commander:v1     # or scene_commander:v1
-grep 'panel at' ~/.peppy/logs/run/<instance_id>.log
+peppy node info openarm_web_commander:v1     # or scene_commander:v1; lists each instance's panel URLs
 ```
 
 ## Adding an item to this repository

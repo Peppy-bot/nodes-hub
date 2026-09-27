@@ -65,27 +65,21 @@ def bind_listener(host: str, preferred_port: int) -> socket.socket:
         ) from error
 
 
-def served_url(listener: socket.socket) -> str:
-    """The address an operator opens to reach the scene panel on this socket.
-
-    A panel bound to every interface answers on loopback too, which is the
-    name that works in a browser on every platform.
+def bound_host_and_port(listener: socket.socket) -> tuple[str, int]:
+    """The IP literal and the port the socket is bound to, as the operating
+    system reports them: what the node announces as its panel endpoint, from
+    which the daemon renders the URLs an operator opens.
     """
 
     host, port = listener.getsockname()[:2]
 
-    if ipaddress.ip_address(host).is_unspecified:
-        return f"http://localhost:{port}"
-
-    return f"http://{_authority(host, port)}"
+    return host, port
 
 
 def bound_address(listener: socket.socket) -> str:
     """The address the socket is bound to, which a wildcard keeps as it is."""
 
-    host, port = listener.getsockname()[:2]
-
-    return _authority(host, port)
+    return _authority(*bound_host_and_port(listener))
 
 
 async def start_serving(

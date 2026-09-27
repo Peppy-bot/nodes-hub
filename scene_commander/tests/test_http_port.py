@@ -184,11 +184,12 @@ def test_port_zero_is_refused_by_name():
         listen.bind_listener("127.0.0.1", listen.ANY_PORT)
 
 
-def test_served_url_reads_the_bound_socket(holder):
-    assert listen.served_url(holder) == f"http://127.0.0.1:{port_of(holder)}"
+def test_the_bound_host_and_port_read_the_socket(holder):
+    assert listen.bound_host_and_port(holder) == ("127.0.0.1", port_of(holder))
+    assert listen.bound_address(holder) == f"127.0.0.1:{port_of(holder)}"
 
 
-def test_served_url_brackets_an_ipv6_host():
+def test_an_ipv6_host_is_bracketed_in_the_address_and_bare_in_the_announcement():
     probe = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
 
     try:
@@ -203,7 +204,9 @@ def test_served_url_brackets_an_ipv6_host():
     listener = listen.bind_listener("::1", _free_port())
 
     try:
-        assert listen.served_url(listener) == f"http://[::1]:{port_of(listener)}"
+        # The announcement takes an IP literal, which carries no brackets.
+        assert listen.bound_host_and_port(listener) == ("::1", port_of(listener))
+        assert listen.bound_address(listener) == f"[::1]:{port_of(listener)}"
 
     finally:
         listener.close()
@@ -212,7 +215,7 @@ def test_served_url_brackets_an_ipv6_host():
 def test_the_commander_serves_on_the_address_it_reports_and_releases_it():
     preferred = _free_port()
     listener = listen.bind_listener("127.0.0.1", preferred)
-    url = listen.served_url(listener)
+    url = _url_of(listener)
 
     async def serve_then_stop():
         server = await listen.start_serving(_page(), listener)
@@ -232,7 +235,7 @@ def test_the_commander_serves_on_the_address_it_reports_and_releases_it():
     rebound = listen.bind_listener("127.0.0.1", preferred)
 
     try:
-        assert listen.served_url(rebound) == url
+        assert _url_of(rebound) == url
 
     finally:
         rebound.close()
@@ -338,11 +341,14 @@ def test_a_site_that_cannot_serve_gives_the_port_back(monkeypatch):
     assert done.is_set(), "a failed start must clean up the runner it set up"
 
 
-def test_served_url_names_localhost_for_a_panel_on_every_interface():
+def test_a_panel_on_every_interface_keeps_the_wildcard():
+    # The daemon renders one URL per address of the machine from the
+    # wildcard, so the node announces it as it is.
     listener = listen.bind_listener("0.0.0.0", _free_port())
 
     try:
-        assert listen.served_url(listener) == f"http://localhost:{port_of(listener)}"
+        assert listen.bound_host_and_port(listener) == ("0.0.0.0", port_of(listener))
+        assert listen.bound_address(listener) == f"0.0.0.0:{port_of(listener)}"
 
     finally:
         listener.close()
@@ -379,7 +385,7 @@ def _serve_and_get(listener):
     """Serve a page on the bound socket and read it back, closing the socket."""
 
     async def serve_then_stop():
-        url = listen.served_url(listener)
+        url = _url_of(listener)
         server = await listen.start_serving(_page(), listener)
 
         try:
@@ -393,6 +399,11 @@ def _serve_and_get(listener):
             await asyncio.gather(server, return_exceptions=True)
 
     return asyncio.run(serve_then_stop())
+
+
+def _url_of(listener):
+    """Where a client on this host reaches a listener bound to one address."""
+    return f"http://{listen.bound_address(listener)}"
 
 
 def _page():

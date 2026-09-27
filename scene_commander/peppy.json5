@@ -110,6 +110,12 @@
       def_file: "apptainer.def",
     },
 
+    // The socket the scene panel binds during setup. The label is announced
+    // with the address the listener took; the daemon reports the URLs.
+    endpoints: {
+      panel: { kind: "page", description: "The scene panel, HTTP." },
+    },
+
     parameters: {
       // Where the scene panel is served. http_host is a literal IP address,
       // not a hostname. http_port is the port the panel prefers: a copy whose
