@@ -65,8 +65,7 @@ jobs:
   # release build waits for nothing.
   wait-for-peppy:
     name: Wait for the peppy dev build
-    # The smallest RunsOn runner, 1 vCPU: the job only looks for the build,
-    # every 30 seconds.
+    # The smallest RunsOn runner, 1 vCPU: the job only looks for the build.
     runs-on: runs-on=${{ github.run_id }}/runner=peppy-ci-ubuntu-24.04-x86_64/image=peppy-ubuntu24/cpu=1/ram=2+4/family=c8a+c7a+m8a+m7a  # custom Peppy AMI
     # The action stops its wait after 20 minutes.
     timeout-minutes: 25
