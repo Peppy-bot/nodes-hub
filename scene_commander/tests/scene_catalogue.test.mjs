@@ -104,6 +104,102 @@ const block = {
     description: 'Small red cube for grasping and stacking.',
 };
 
+// The body of a streamed answer, fed by the test: each chunk it pushes is one
+// read of the page's reader. It holds the connection its request came on
+// until it ends, or until the page aborts that request: as in a browser, the
+// abort frees the connection at once and fails every read after it.
+class Stream {
+    constructor() {
+        this.chunks = [];
+        this.ended = false;
+        this.aborted = false;
+        this.abortReason = null;
+        this.pendingRead = null;
+        this.onRead = null;
+        this.release = () => {};
+    }
+
+    push(...lines) {
+        for (const line of lines) this.pushText(`${JSON.stringify(line)}\n`);
+    }
+
+    pushText(text) {
+        const chunk = new TextEncoder().encode(text);
+        if (!this.pendingRead) {
+            this.chunks.push(chunk);
+            return;
+        }
+        this.takePendingRead().resolve({ done: false, value: chunk });
+    }
+
+    end() {
+        this.ended = true;
+        this.freeConnection();
+        if (!this.pendingRead) return;
+        this.takePendingRead().resolve({ done: true, value: undefined });
+    }
+
+    // Hold the connection `release` frees until the stream ends or `signal`
+    // aborts the page's request.
+    hold(signal, release) {
+        this.release = release;
+        if (this.ended) this.freeConnection();
+        signal?.addEventListener('abort', () => this.abort(signal.reason));
+    }
+
+    abort(reason) {
+        this.aborted = true;
+        this.abortReason = reason;
+        this.freeConnection();
+        if (!this.pendingRead) return;
+        this.takePendingRead().reject(reason);
+    }
+
+    freeConnection() {
+        const release = this.release;
+        this.release = () => {};
+        release();
+    }
+
+    takePendingRead() {
+        const read = this.pendingRead;
+        this.pendingRead = null;
+        return read;
+    }
+
+    getReader() {
+        return {
+            read: () => {
+                if (this.aborted) return Promise.reject(this.abortReason);
+                if (this.chunks.length) return Promise.resolve({ done: false, value: this.chunks.shift() });
+                if (this.ended) return Promise.resolve({ done: true, value: undefined });
+                const read = new Promise((resolve, reject) => { this.pendingRead = { resolve, reject }; });
+                this.onRead?.();
+                return read;
+            },
+        };
+    }
+
+    // Resolves once the page has read everything pushed and waits for more.
+    drained() {
+        if (this.pendingRead) return Promise.resolve();
+        return new Promise(resolve => {
+            this.onRead = () => {
+                this.onRead = null;
+                resolve();
+            };
+        });
+    }
+}
+
+// A streamed answer that has already ended with these lines.
+function streamOf(...lines) {
+    const stream = new Stream();
+    stream.push(...lines);
+    stream.end();
+    return stream;
+}
+
 const PROVIDER_BUSY = 'Isaac is still discovering its asset catalogue';
 const NO_OBJECT_STATE = 'Isaac has not loaded its stage yet';
 const NO_SCENE = 'no scene is loaded';
@@ -117,6 +213,11 @@ const CAPTURED = 1757944800.25;
 // lighting, materials: what their providers list; null while no scene is
 // loaded, which the node answers with HTTP 503. cameras: what /api/cameras
 // lists, every camera the simulation renders.
+// A load or a spawn answers with a stream that ends at once with success,
+// unless the test prepared the answer of the next request to its path.
+// Requests share the connections a browser keeps to one server over HTTP/1.1,
+// six at most: a request waits for a free one, and a streamed answer holds its
+// connection until it ends or the page aborts it.
 async function page(catalogue = [staticScene, dynamicScene, cage], objects = [],
     { unavailable = 0, objectState = null, robots = [], capabilities = {}, lighting = null, materials = null, cameras = [] } = {}) {
     const elements = new Map();
@@ -124,6 +225,11 @@ async function page(catalogue = [staticScene, dynamicScene, cage], objects = [],
     const requests = [];
     const waits = [];
     const intervals = [];
+    const prepared = new Map();
+    const prepare = (path, answer) => {
+        if (!prepared.has(path)) prepared.set(path, []);
+        prepared.get(path).push(answer);
+    };
     let currentCatalogue = catalogue;
     let currentObjects = objects;
     let currentLighting = lighting;
@@ -144,8 +250,53 @@ async function page(catalogue = [staticScene, dynamicScene, cage], objects = [],
         })),
     });
     const refused = (status, message) => ({ ok: false, status, json: async () => ({ success: false, message }) });
+    // The browser's connections to the node; a freed one goes to the first
+    // request that waits for one.
+    const connections = { free: 6, waiting: [] };
+    const release = () => {
+        const next = connections.waiting.shift();
+        if (next) next();
+        else connections.free += 1;
+    };
+    // What the node answers a request to `path`.
+    const answerTo = path => {
+        const preparedAnswer = prepared.get(path)?.shift();
+        if (preparedAnswer) {
+            return preparedAnswer;
+        }
+        if (path === '/api/scene/load' || path === '/api/objects/spawn') {
+            return { ok: true, status: 200, body: streamOf({ goal: '1' }, { success: true, message: 'Scene loaded' }) };
+        }
+        if (path === '/api/assets' && refusals > 0) {
+            refusals -= 1;
+            return refused(503, PROVIDER_BUSY);
+        }
+        if (path === '/api/objects' && objectStateReason !== null) {
+            return refused(503, objectStateReason);
+        }
+        if (path === '/api/lighting' && currentLighting === null) {
+            return refused(503, NO_SCENE);
+        }
+        if (path === '/api/materials' && currentMaterials === null) {
+            return refused(503, NO_SCENE);
+        }
+        const data = path === '/api/assets' ? { assets: currentCatalogue }
+            : path === '/api/objects'
+                ? { objects: currentObjects, count: currentObjects.length, timestamp: CAPTURED }
+            : path === '/api/robots' ? { robots, count: robots.length }
+            : path === '/api/capabilities'
+                ? { lighting: false, materials: false, cameras: false, ...capabilities }
+            : path === '/api/lighting' ? { lighting: currentLighting }
+            : path === '/api/materials' ? { materials: currentMaterials }
+            : path === '/api/cameras'
+                ? { message: `${currentCameras.length} cameras rendered`, cameras: currentCameras, count: currentCameras.length }
+            : { message: 'Scene loaded' };
+        return { ok: true, json: async () => ({ success: true, ...data }) };
+    };
     const context = vm.createContext({
+        AbortController,
         Option,
+        TextDecoder,
         document: {
             getElementById: id => {
                 assert.ok(elements.has(id), `page contains #${id}`);
@@ -162,33 +313,23 @@ async function page(catalogue = [staticScene, dynamicScene, cage], objects = [],
         setInterval: (callback, delay) => {
             intervals.push(delay);
         },
+        // A request reaches the node, and is recorded, once it has a connection.
         fetch: async (path, options) => {
+            if (connections.free > 0) {
+                connections.free -= 1;
+            }
+            else {
+                await new Promise(resolve => connections.waiting.push(resolve));
+            }
             requests.push({ path, body: options.body && JSON.parse(options.body) });
-            if (path === '/api/assets' && refusals > 0) {
-                refusals -= 1;
-                return refused(503, PROVIDER_BUSY);
+            const answered = await answerTo(path);
+            if (answered.body instanceof Stream) {
+                answered.body.hold(options.signal, release);
             }
-            if (path === '/api/objects' && objectStateReason !== null) {
-                return refused(503, objectStateReason);
+            else {
+                release();
             }
-            if (path === '/api/lighting' && currentLighting === null) {
-                return refused(503, NO_SCENE);
-            }
-            if (path === '/api/materials' && currentMaterials === null) {
-                return refused(503, NO_SCENE);
-            }
-            const data = path === '/api/assets' ? { assets: currentCatalogue }
-                : path === '/api/objects'
-                    ? { objects: currentObjects, count: currentObjects.length, timestamp: CAPTURED }
-                : path === '/api/robots' ? { robots, count: robots.length }
-                : path === '/api/capabilities'
-                    ? { lighting: false, materials: false, cameras: false, ...capabilities }
-                : path === '/api/lighting' ? { lighting: currentLighting }
-                : path === '/api/materials' ? { materials: currentMaterials }
-                : path === '/api/cameras'
-                    ? { message: `${currentCameras.length} cameras rendered`, cameras: currentCameras, count: currentCameras.length }
-                : { message: 'Scene loaded' };
-            return { ok: true, json: async () => ({ success: true, ...data }) };
+            return answered;
         },
     });
     await vm.runInContext(script, context);
@@ -210,6 +351,25 @@ async function page(catalogue = [staticScene, dynamicScene, cage], objects = [],
         setLighting: state => { currentLighting = state; },
         setMaterials: state => { currentMaterials = state; },
         setCameras: list => { currentCameras = list; },
+        // The stream the next request to `path` answers with, which the test feeds.
+        stream: path => {
+            const stream = new Stream();
+            prepare(path, { ok: true, status: 200, body: stream });
+            return stream;
+        },
+        // The JSON answer of the next request to `path`, a success.
+        answer: (path, data) => prepare(path, { ok: true, status: 200, json: async () => ({ success: true, ...data }) }),
+        // The next request to `path` is refused before any stream, as the
+        // node refuses bad input and a goal the simulator rejects.
+        refuse: (path, status, message) => prepare(path, refused(status, message)),
+        // The next request to `path` waits until the test refuses it with
+        // the function returned.
+        refuseLater: path => {
+            let answer;
+            prepare(path, new Promise(resolve => { answer = resolve; }));
+            return (status, message) => answer(refused(status, message));
+        },
+        click: id => vm.runInContext(element(id).attributes.onclick, context),
     };
 }
 
@@ -568,6 +728,309 @@ test('every scene edit reads the runtime objects again once its goal completes',
     assert.equal(ui.requests[since + 2].body.yaw, 0, 'a spawn stands as authored unless the form names a yaw');
     assert.deepEqual(ui.requests[since + 4].body, { object_id: 'obj_1', position: [0.5, 0, 0.8] });
     assert.deepEqual(ui.requests[since + 6].body, { object_id: 'obj_1' });
+});
+
+// Resolves once the page has handled every line pushed to `stream` and waits
+// for more, or once `running` settled, whichever comes first.
+const handled = (stream, running) => Promise.race([stream.drained(), running]);
+
+// How the node answers the cancel of a load: taken by the simulator, or not
+// delivered to it.
+const CANCEL_TAKEN = 'the simulator answered the cancel of load_scene: SIGNALLED';
+const CANCEL_LOST = "the cancel of load_scene was not delivered: service 'cancel' timed out";
+
+test('a scene load shows its progress line by line and refreshes only once it succeeded', async () => {
+    const ui = await page([staticScene], [], { capabilities: { lighting: true }, lighting: warehouseLighting });
+    const since = ui.requests.length;
+    const stream = ui.stream('/api/scene/load');
+    const loading = ui.run('loadScene()');
+
+    await handled(stream, loading);
+    assert.equal(ui.element('status').textContent, 'Loading scene...');
+    assert.equal(ui.element('cancelLoad').hidden, true, 'nothing to cancel before the simulator accepts the load');
+
+    stream.push({ goal: '7' });
+    await handled(stream, loading);
+    assert.equal(ui.element('cancelLoad').hidden, false);
+
+    stream.push({ progress: { bytes_fetched: 123_400_000, files_ready: 41, building: false } });
+    await handled(stream, loading);
+    assert.equal(ui.element('status').textContent, 'Loading scene: 123.4 MB, 41 files');
+
+    stream.push({ progress: { bytes_fetched: 368_000_000, files_ready: 135, building: true } });
+    await handled(stream, loading);
+    assert.equal(ui.element('status').textContent, 'Building the scene');
+    assert.deepEqual(ui.requests.slice(since).map(r => r.path), ['/api/scene/load'],
+        'nothing is read again while the load runs');
+
+    stream.push({ success: true, message: 'Loaded scene/warehouse_static' });
+    stream.end();
+    await loading;
+    assert.deepEqual(ui.requests.slice(since).map(r => r.path), ['/api/scene/load', '/api/objects', '/api/lighting']);
+    assert.equal(ui.element('status').textContent, 'Loaded scene/warehouse_static');
+    assert.equal(ui.element('status').style.borderColor, '#303741');
+    assert.equal(ui.element('cancelLoad').hidden, true);
+});
+
+test('a scene load that fails once accepted shows the reason and reads nothing again', async () => {
+    const ui = await page();
+    const since = ui.requests.length;
+    const stream = ui.stream('/api/scene/load');
+    stream.push({ goal: '2' }, { success: false, message: 'load_scene made no progress for 60 s; it was cancelled', cancelled_by: 'commander' });
+    stream.end();
+
+    await ui.run('loadScene()');
+    assert.deepEqual(ui.requests.slice(since).map(r => r.path), ['/api/scene/load']);
+    assert.equal(ui.element('status').textContent, 'load_scene made no progress for 60 s; it was cancelled');
+    assert.equal(ui.element('status').style.borderColor, '#9b424c');
+    assert.equal(ui.element('cancelLoad').hidden, true);
+});
+
+test('a scene load refused before it starts shows the refusal', async () => {
+    const ui = await page();
+    const since = ui.requests.length;
+    ui.refuse('/api/scene/load', 400, 'load_scene rejected: the simulator is shutting down');
+
+    await ui.run('loadScene()');
+    assert.deepEqual(ui.requests.slice(since).map(r => r.path), ['/api/scene/load']);
+    assert.equal(ui.element('status').textContent, 'load_scene rejected: the simulator is shutting down');
+    assert.equal(ui.element('status').style.borderColor, '#9b424c');
+});
+
+test('a scene load the simulator cancelled shows the reason the simulator gave', async () => {
+    const ui = await page();
+    const since = ui.requests.length;
+    const stream = ui.stream('/api/scene/load');
+    const message = 'load_scene was cancelled by the simulator: '
+        + 'load_scene(scene/warehouse_static) was replaced by load_scene(scene/warehouse_dynamic)';
+    stream.push(
+        { goal: '3' },
+        { progress: { bytes_fetched: 1_000_000, files_ready: 2, building: false } },
+        { success: false, message, cancelled_by: 'simulator' },
+    );
+    stream.end();
+
+    await ui.run('loadScene()');
+    assert.equal(ui.element('status').textContent, message);
+    assert.equal(ui.element('status').style.borderColor, '#9b424c');
+    assert.deepEqual(ui.requests.slice(since).map(r => r.path), ['/api/scene/load']);
+    assert.equal(ui.element('cancelLoad').hidden, true);
+});
+
+test('a newer load refused before it starts leaves the running load its status, its cancel and its end', async () => {
+    const ui = await page([staticScene], [], { capabilities: { lighting: true }, lighting: warehouseLighting });
+    const since = ui.requests.length;
+    const running = ui.stream('/api/scene/load');
+    const runningLoad = ui.run('loadScene()');
+    running.push({ goal: '1' }, { progress: { bytes_fetched: 1_000_000, files_ready: 1, building: false } });
+    await handled(running, runningLoad);
+
+    ui.refuse('/api/scene/load', 400, 'load_scene rejected: the simulator admits one load at a time');
+    await ui.run('loadScene()');
+    assert.equal(ui.element('status').textContent, 'load_scene rejected: the simulator admits one load at a time');
+    assert.equal(ui.element('status').style.borderColor, '#9b424c');
+    assert.equal(ui.element('cancelLoad').hidden, false, 'the running load can still be cancelled');
+
+    running.push({ progress: { bytes_fetched: 2_000_000, files_ready: 2, building: false } });
+    await handled(running, runningLoad);
+    assert.equal(ui.element('status').textContent, 'Loading scene: 2.0 MB, 2 files');
+
+    running.push({ success: true, message: 'Loaded scene/warehouse_static' });
+    running.end();
+    await runningLoad;
+    assert.equal(ui.element('status').textContent, 'Loaded scene/warehouse_static');
+    assert.equal(ui.element('cancelLoad').hidden, true);
+    assert.deepEqual(ui.requests.slice(since).map(r => r.path), [
+        '/api/scene/load', '/api/scene/load', '/api/objects', '/api/lighting',
+    ]);
+});
+
+test('a load this page replaced ends in silence and leaves the status to the newer load', async () => {
+    const ui = await page();
+    const first = ui.stream('/api/scene/load');
+    const second = ui.stream('/api/scene/load');
+    const firstLoad = ui.run('loadScene()');
+    first.push({ goal: '1' });
+    await handled(first, firstLoad);
+
+    const secondLoad = ui.run('loadScene()');
+    second.push({ goal: '2' }, { progress: { bytes_fetched: 0, files_ready: 5, building: false } });
+    await handled(second, secondLoad);
+    first.push({ success: false, message: 'load_scene was cancelled by the simulator', cancelled_by: 'simulator' });
+    first.end();
+    await firstLoad;
+    assert.equal(ui.element('status').textContent, 'Loading scene: 0.0 MB, 5 files');
+    assert.equal(ui.element('cancelLoad').hidden, false, 'the newer load can still be cancelled');
+
+    ui.answer('/api/goals/2/cancel', { message: CANCEL_TAKEN });
+    const cancelling = ui.click('cancelLoad');
+    assert.equal(second.aborted, true);
+    await cancelling;
+    await secondLoad;
+    assert.deepEqual(ui.requests.at(-1), { path: '/api/goals/2/cancel', body: {} });
+    assert.equal(ui.element('status').textContent, CANCEL_TAKEN);
+});
+
+test('the cancel button aborts the page\'s stream of the load, then cancels the load by the goal id it named', async () => {
+    const ui = await page();
+    const since = ui.requests.length;
+    const stream = ui.stream('/api/scene/load');
+    const loading = ui.run('loadScene()');
+    stream.push({ goal: '7' });
+    await handled(stream, loading);
+
+    ui.answer('/api/goals/7/cancel', { message: CANCEL_TAKEN });
+    const cancelling = ui.click('cancelLoad');
+    assert.equal(stream.aborted, true);
+    assert.equal(ui.element('status').textContent, 'Cancelling the scene load...');
+    assert.equal(ui.element('cancelLoad').hidden, true);
+
+    await cancelling;
+    await loading;
+    assert.deepEqual(ui.requests.slice(since), [
+        { path: '/api/scene/load', body: { asset_id: staticScene.asset_id, scale: 1 } },
+        { path: '/api/goals/7/cancel', body: {} },
+    ]);
+    // With its stream gone, the page says how the cancel was answered, and
+    // the aborted stream says nothing.
+    assert.equal(ui.element('status').textContent, CANCEL_TAKEN);
+    assert.equal(ui.element('status').style.borderColor, '#303741');
+});
+
+test('a page whose six connections all carry streams still sends the cancel of its load', async () => {
+    const ui = await page([staticScene, block], []);
+    const stream = ui.stream('/api/scene/load');
+    const loading = ui.run('loadScene()');
+    stream.push({ goal: '7' });
+    await handled(stream, loading);
+    for (const goal of ['8', '9', '10', '11', '12']) {
+        const spawn = ui.stream('/api/objects/spawn');
+        const spawning = ui.run('spawnObject()');
+        spawn.push({ goal });
+        await handled(spawn, spawning);
+    }
+
+    ui.answer('/api/goals/7/cancel', { message: CANCEL_TAKEN });
+    const cancelling = ui.click('cancelLoad');
+    assert.deepEqual(ui.requests.at(-1), { path: '/api/goals/7/cancel', body: {} },
+        'the cancel goes out on the connection the aborted stream freed, while five spawns hold theirs');
+    assert.equal(stream.aborted, true);
+
+    await cancelling;
+    await loading;
+    assert.equal(ui.element('status').textContent, CANCEL_TAKEN);
+});
+
+test('a cancel answered after a newer load was accepted leaves the status to the newer load', async () => {
+    const ui = await page();
+    const first = ui.stream('/api/scene/load');
+    const second = ui.stream('/api/scene/load');
+    const firstLoad = ui.run('loadScene()');
+    first.push({ goal: '7' });
+    await handled(first, firstLoad);
+
+    const refuseCancel = ui.refuseLater('/api/goals/7/cancel');
+    const cancelling = ui.click('cancelLoad');
+    assert.equal(first.aborted, true);
+    await firstLoad;
+
+    const secondLoad = ui.run('loadScene()');
+    second.push({ goal: '8' }, { progress: { bytes_fetched: 3_000_000, files_ready: 4, building: false } });
+    await handled(second, secondLoad);
+    refuseCancel(502, CANCEL_LOST);
+    await cancelling;
+    assert.equal(ui.element('status').textContent, 'Loading scene: 3.0 MB, 4 files');
+    assert.equal(ui.element('status').style.borderColor, '#303741');
+    assert.equal(ui.element('cancelLoad').hidden, false, 'the newer load can be cancelled');
+
+    second.push({ success: true, message: 'Loaded scene/warehouse_static' });
+    second.end();
+    await secondLoad;
+    assert.equal(ui.element('status').textContent, 'Loaded scene/warehouse_static');
+});
+
+test('a cancel the node refuses shows the refusal', async () => {
+    const ui = await page();
+    const stream = ui.stream('/api/scene/load');
+    const loading = ui.run('loadScene()');
+    stream.push({ goal: '7' });
+    await handled(stream, loading);
+
+    ui.refuse('/api/goals/7/cancel', 502, CANCEL_LOST);
+    const cancelling = ui.click('cancelLoad');
+    assert.equal(stream.aborted, true);
+    await cancelling;
+    await loading;
+    assert.equal(ui.element('status').textContent, CANCEL_LOST);
+    assert.equal(ui.element('status').style.borderColor, '#9b424c');
+    assert.equal(ui.element('cancelLoad').hidden, true);
+});
+
+test('the stream reader takes a line split over two reads and two lines in one read', async () => {
+    const ui = await page();
+    const stream = ui.stream('/api/scene/load');
+    const loading = ui.run('loadScene()');
+
+    stream.pushText('{"goal": "4"}\n{"progress": {"bytes_fetched": 1500000, "fi');
+    await handled(stream, loading);
+    assert.equal(ui.element('cancelLoad').hidden, false);
+    assert.equal(ui.element('status').textContent, 'Loading scene...');
+
+    stream.pushText('les_ready": 2, "building": false}}\n');
+    await handled(stream, loading);
+    assert.equal(ui.element('status').textContent, 'Loading scene: 1.5 MB, 2 files');
+
+    // The last line needs no newline before the stream ends.
+    stream.pushText('{"success": true, "message": "Loaded"}');
+    stream.end();
+    await loading;
+    assert.equal(ui.element('status').textContent, 'Loaded');
+});
+
+test('a stream cut before its result is reported as such', async () => {
+    const ui = await page();
+    const since = ui.requests.length;
+    ui.stream('/api/scene/load').end();
+
+    await ui.run('loadScene()');
+    assert.equal(ui.element('status').textContent, '/api/scene/load ended without a result');
+    assert.equal(ui.element('status').style.borderColor, '#9b424c');
+    assert.deepEqual(ui.requests.slice(since).map(r => r.path), ['/api/scene/load']);
+});
+
+test('a spawn shows its progress and reads the objects again once it succeeded', async () => {
+    const ui = await page([block], []);
+    const since = ui.requests.length;
+    const stream = ui.stream('/api/objects/spawn');
+    const spawning = ui.run('spawnObject()');
+
+    stream.push({ goal: '5' }, { progress: { bytes_fetched: 1_200_000, files_ready: 3, building: false } });
+    await handled(stream, spawning);
+    assert.equal(ui.element('status').textContent, `Loading ${block.asset_id}: 1.2 MB, 3 files`);
+
+    stream.push({ progress: { bytes_fetched: 1_200_000, files_ready: 4, building: true } });
+    await handled(stream, spawning);
+    assert.equal(ui.element('status').textContent, `Building ${block.asset_id}`);
+    assert.deepEqual(ui.requests.slice(since).map(r => r.path), ['/api/objects/spawn']);
+
+    stream.push({ success: true, message: `Spawned ${block.asset_id}`, object_id: 'obj_9' });
+    stream.end();
+    await spawning;
+    assert.deepEqual(ui.requests.slice(since).map(r => r.path), ['/api/objects/spawn', '/api/objects']);
+    assert.equal(ui.element('status').textContent, `Spawned ${block.asset_id}\nobject_id=obj_9`);
+});
+
+test('a spawn that fails once accepted shows the reason and reads nothing again', async () => {
+    const ui = await page([block], []);
+    const since = ui.requests.length;
+    const stream = ui.stream('/api/objects/spawn');
+    stream.push({ goal: '6' }, { success: false, message: 'spawn_object ended: the simulator is gone' });
+    stream.end();
+
+    await ui.run('spawnObject()');
+    assert.deepEqual(ui.requests.slice(since).map(r => r.path), ['/api/objects/spawn']);
+    assert.equal(ui.element('status').textContent, 'spawn_object ended: the simulator is gone');
+    assert.equal(ui.element('status').style.borderColor, '#9b424c');
 });
 
 // What a launch may bind beside the scene, as the node reports it.
