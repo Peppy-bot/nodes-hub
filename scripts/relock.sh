@@ -43,7 +43,7 @@ while IFS= read -r dir; do uv_dirs+=("$dir"); done < <(
 echo "relocking against $(peppy --version)"
 
 # Interface code is generated per node, so only a project that is a node has
-# any to generate: `openarm/sim_isaac/tests` is a uv project under a node and
+# any to generate: `sim_isaac/tests` is a uv project under a node and
 # depends on nothing generated, so nothing there needs a sync.
 for dir in $(printf '%s\n' "${crate_dirs[@]}" "${uv_dirs[@]}" | sort -u); do
   if [ -f "$dir/peppy.json5" ]; then

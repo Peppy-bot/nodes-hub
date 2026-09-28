@@ -19,6 +19,7 @@ use opencv::prelude::MatTraitConstManual;
 
 use crate::calibration::{StereoConf, resolution_key};
 use crate::depth_settings::{DepthSettings, num_disparities_for};
+use crate::geometry::{MAX_Z16_DEPTH_MM, RectifiedLeft, depth_mm as depth_mm_of};
 
 /// Millimetre depth for a fixed geometry, backed by OpenCV.
 pub struct CvDepth {
@@ -31,6 +32,8 @@ pub struct CvDepth {
     eye_height: i32,
     downscale: i32,
     fx: f64,
+    /// The rectified left projection the colour image is remapped into.
+    rectified_left: RectifiedLeft,
     baseline_mm: f64,
     numerator: f64,
     num_disparities: u32,
@@ -128,6 +131,12 @@ impl CvDepth {
         // Rectified focal length is P1(0,0); disparity to depth uses it, and
         // the disparity search range derives from it and the requested floor.
         let fx = *p1.at_2d::<f64>(0, 0).map_err(cv)?;
+        let rectified_left = RectifiedLeft {
+            fx,
+            fy: *p1.at_2d::<f64>(1, 1).map_err(cv)?,
+            cx: *p1.at_2d::<f64>(0, 2).map_err(cv)?,
+            cy: *p1.at_2d::<f64>(1, 2).map_err(cv)?,
+        };
         let baseline_mm = conf.baseline;
         let numerator = fx / downscale as f64 * baseline_mm * 16.0;
         let num_disp = num_disparities_for(
@@ -163,6 +172,7 @@ impl CvDepth {
             eye_height: h,
             downscale,
             fx,
+            rectified_left,
             baseline_mm,
             numerator,
             num_disparities: num_disp as u32,
@@ -178,9 +188,22 @@ impl CvDepth {
         self.num_disparities
     }
 
+    /// The rectified left projection (P1 of `stereo_rectify`): the camera the
+    /// published colour image shows, at the eye resolution.
+    pub fn rectified_left(&self) -> RectifiedLeft {
+        self.rectified_left
+    }
+
     /// The nearest depth the derived search range can measure.
     pub fn min_depth_floor_mm(&self) -> f64 {
         self.fx / self.downscale as f64 * self.baseline_mm / self.num_disparities as f64
+    }
+
+    /// The farthest depth the stream can report: the depth of the smallest
+    /// disparity SGBM resolves, a sixteenth of a pixel, or the last z16
+    /// reading when that is nearer.
+    pub fn max_depth_mm(&self) -> f64 {
+        self.numerator.min(MAX_Z16_DEPTH_MM)
     }
 
     pub fn baseline_mm(&self) -> f64 {
@@ -270,13 +293,7 @@ impl CvDepth {
         let disp = disparity16.data_typed::<i16>().map_err(cv)?;
         require_len("disparity", disp.len(), depth_mm.len())?;
         for (out, &d) in depth_mm.iter_mut().zip(disp.iter()) {
-            *out = 0;
-            if d > 0 {
-                let mm = self.numerator / f64::from(d);
-                if (1.0..65535.0).contains(&mm) {
-                    *out = mm as u16;
-                }
-            }
+            *out = depth_mm_of(self.numerator, d);
         }
         Ok(())
     }

@@ -13,21 +13,35 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Ceiling on the whole request, including a server that accepts then stalls
 /// on the body, so a startup fetch can never hang the node.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+/// Ceiling on the body. A conf is a few kilobytes; the cap only keeps a
+/// misbehaving server from exhausting memory.
+const MAX_CONF_BYTES: u64 = 10 * 1024 * 1024;
 
 /// Fetch one unit's factory calibration text by serial, bounded so it cannot
 /// hang. The conf carries every resolution; [`StereoConf::from_conf_str`]
 /// selects one.
 pub fn fetch_conf(serial: i32) -> Result<String, String> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(CONNECT_TIMEOUT)
-        .timeout(REQUEST_TIMEOUT)
-        .build();
+    fetch_conf_from(CALIBRATION_HOST, serial)
+}
+
+/// [`fetch_conf`] against any host. A body that is not valid UTF-8 is an
+/// error rather than a lossy decode: the geometry comes from this text, so a
+/// corrupted conf must fail the fetch, not reach the parser altered.
+fn fetch_conf_from(host: &str, serial: i32) -> Result<String, String> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_connect(Some(CONNECT_TIMEOUT))
+        .timeout_global(Some(REQUEST_TIMEOUT))
+        .build()
+        .into();
     agent
-        .get(CALIBRATION_HOST)
-        .query("SN", &serial.to_string())
+        .get(host)
+        .query("SN", serial.to_string())
         .call()
         .map_err(|e| format!("fetch calibration for serial {serial}: {e}"))?
-        .into_string()
+        .body_mut()
+        .with_config()
+        .limit(MAX_CONF_BYTES)
+        .read_to_string()
         .map_err(|e| format!("read calibration body for serial {serial}: {e}"))
 }
 
@@ -155,6 +169,70 @@ fn parse_ini(text: &str) -> HashMap<(String, String), f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::thread::JoinHandle;
+
+    /// Serves `response` to the first connection on a loopback port. Returns
+    /// the host to fetch from and the server, which yields the request line
+    /// it received.
+    fn serve_once(response: Vec<u8>) -> (String, JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let host = format!("http://{}/", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            // The header block ends at the first bare "\r\n".
+            let mut header = String::new();
+            while reader.read_line(&mut header).unwrap() > "\r\n".len() {
+                header.clear();
+            }
+            let mut stream = reader.into_inner();
+            stream.write_all(&response).unwrap();
+            request_line
+        });
+        (host, server)
+    }
+
+    fn http_response(status: &str, body: &[u8]) -> Vec<u8> {
+        let mut response = format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
+        response
+    }
+
+    #[test]
+    fn fetch_asks_for_the_serial_and_returns_the_conf_text() {
+        let (host, server) = serve_once(http_response("200 OK", b"[STEREO]\nBaseline=62.902\n"));
+        let conf = fetch_conf_from(&host, 12345).unwrap();
+        assert_eq!(conf, "[STEREO]\nBaseline=62.902\n");
+        assert_eq!(server.join().unwrap(), "GET /?SN=12345 HTTP/1.1\r\n");
+    }
+
+    #[test]
+    fn fetch_fails_on_an_error_status() {
+        let (host, server) = serve_once(http_response("404 Not Found", b"unknown serial"));
+        let err = fetch_conf_from(&host, 12345).unwrap_err();
+        assert_eq!(err, "fetch calibration for serial 12345: http status: 404");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn fetch_rejects_a_conf_that_is_not_utf8() {
+        let (host, server) =
+            serve_once(http_response("200 OK", b"[STEREO]\nBaseline=6\xff2.902\n"));
+        let err = fetch_conf_from(&host, 12345).unwrap_err();
+        assert!(
+            err.starts_with("read calibration body for serial 12345: "),
+            "got: {err}"
+        );
+        server.join().unwrap();
+    }
 
     #[test]
     fn rejects_a_conf_missing_its_rotation() {

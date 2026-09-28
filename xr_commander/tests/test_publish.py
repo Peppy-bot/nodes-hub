@@ -540,12 +540,26 @@ async def test_releasing_the_clutch_streams_the_measured_pose_not_the_last_hand_
                     break
                 assert time.monotonic() < deadline, "the driven target never reached the wire"
 
-            # Let go. The freeze burst must carry the measured pose.
+            # Let go. The freeze burst must carry the measured pose, once the
+            # samples the stream had already published when the clutch
+            # released have passed: the wire holds them in order, so how many
+            # arrive first is a matter of the host's speed, not of behavior.
+            # A stream that walks on to the last hand target instead reaches
+            # the end of its burst without ever sending the measured pose, and
+            # the wait for one times out.
             session.press(right=(False, False, False))
-            frozen = await asyncio.wait_for(subscription.next(), 10.0)
-            assert frozen.position[0] == pytest.approx(0.0), (
-                "release streamed the last hand target instead of the measured pose"
-            )
+            try:
+                while True:
+                    frozen = await asyncio.wait_for(subscription.next(), 10.0)
+                    if frozen.position[0] == pytest.approx(0.0):
+                        break
+                    assert frozen.position[0] == pytest.approx(0.3), (
+                        "only the driven target may precede the freeze on the wire"
+                    )
+            except asyncio.TimeoutError:
+                raise AssertionError(
+                    "release streamed the last hand target instead of the measured pose"
+                ) from None
 
             # And the burst is finite: the stream falls silent after it.
             with pytest.raises(asyncio.TimeoutError):

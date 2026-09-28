@@ -20,9 +20,12 @@ from peppygen.fixtures.exposed_actions.limb_motion import (
     move_gripper as move_gripper_fx,
 )
 from peppygen.fixtures.exposed_actions.postures import move_to_ready as move_to_ready_fx
-from peppygen.paired_topics.arm_link import joint_states as arm_states_topic
+from peppygen.fixtures.exposed_services.limb_state import (
+    get_limb_names as get_limb_names_fx,
+)
+from peppygen.paired_topics.arm import joint_states as arm_states_topic
 from peppygen.paired_topics.leader_arm import joint_states as upstream_states_topic
-from peppygen.paired_topics.gripper_link import gripper_states as gripper_states_topic
+from peppygen.paired_topics.gripper import gripper_states as gripper_states_topic
 from peppygen.paired_topics.leader_arm import joint_setpoints as leader_setpoints_topic
 from peppygen.paired_topics.leader_pose import pose_setpoints as leader_pose_topic
 from peppygen.parameters import Parameters
@@ -50,12 +53,12 @@ def make_parameters(**overrides) -> Parameters:
 
 
 async def publish_measured(h, positions=MEASURED, opening=0.0):
-    await h.mocks.pairings.arm_link.joint_states.publish(
+    await h.mocks.pairings.arm.joint_states.publish(
         arm_states_topic.Message(
             timestamp=time.time(), positions=positions, velocities=[], efforts=[]
         )
     )
-    await h.mocks.pairings.gripper_link.gripper_states.publish(
+    await h.mocks.pairings.gripper.gripper_states.publish(
         gripper_states_topic.Message(
             timestamp=time.time(), opening=opening, effort=0.0, max_effort=0.0
         )
@@ -99,7 +102,7 @@ async def test_the_joints_stream_passes_through_unchanged_and_relays_state():
             streamer = asyncio.create_task(_stream_leader_target(h, target, stamps))
             try:
                 first = await asyncio.wait_for(
-                    h.mocks.pairings.arm_link.joint_setpoints.next(), TIMEOUT_S
+                    h.mocks.pairings.arm.joint_setpoints.next(), TIMEOUT_S
                 )
                 # Pass-through: the leader's exact values go downstream, no
                 # clamp and no chase (the EE caps are transparent here).
@@ -116,6 +119,16 @@ async def test_the_joints_stream_passes_through_unchanged_and_relays_state():
             feeder.cancel()
 
 
+async def test_the_limb_names_are_answered_before_any_snapshot():
+    # No follower reports here, so no readout has been published: the names
+    # and the joint count behind them come from the robot itself.
+    async with harness.start(setup, parameters=make_parameters()) as h:
+        names = await get_limb_names_fx.poll(h, TIMEOUT_S)
+        assert names.arm_names == ["arm"]
+        assert names.joints_per_arm == [5]
+        assert names.gripper_names == ["gripper"]
+
+
 async def test_malformed_follower_state_neither_anchors_nor_relays():
     # Measured state is a trust boundary: a NaN vector must not become a
     # governor anchor, and must not be relayed upstream as if the follower
@@ -123,7 +136,7 @@ async def test_malformed_follower_state_neither_anchors_nor_relays():
     # job now and cannot even be built; see the cardinality test below.
     async with harness.start(setup, parameters=make_parameters()) as h:
         for positions in ([float("nan")] * 5,):
-            await h.mocks.pairings.arm_link.joint_states.publish(
+            await h.mocks.pairings.arm.joint_states.publish(
                 arm_states_topic.Message(
                     timestamp=time.time(), positions=positions, velocities=[], efforts=[]
                 )
@@ -146,7 +159,7 @@ async def test_backlog_replayed_follower_state_is_not_anchored_or_relayed():
     # a stall arrives with fresh arrival stamps; only the producer's wire
     # stamp can tell it apart from current measurement.
     async with harness.start(setup, parameters=make_parameters()) as h:
-        await h.mocks.pairings.arm_link.joint_states.publish(
+        await h.mocks.pairings.arm.joint_states.publish(
             arm_states_topic.Message(
                 timestamp=time.time() - 60.0, positions=MEASURED, velocities=[], efforts=[]
             )
@@ -185,7 +198,7 @@ async def test_pose_mode_streams_downstream_under_the_leader_capture_stamp():
         streamer = asyncio.create_task(stream_pose())
         try:
             downstream = await asyncio.wait_for(
-                h.mocks.pairings.arm_link.joint_setpoints.next(), TIMEOUT_S
+                h.mocks.pairings.arm.joint_setpoints.next(), TIMEOUT_S
             )
             assert len(downstream.positions) == 5
             assert downstream.efforts == []
@@ -231,7 +244,7 @@ async def test_move_arm_joints_completes_and_reports():
             while True:
                 try:
                     last = await asyncio.wait_for(
-                        h.mocks.pairings.arm_link.joint_setpoints.next(), 0.5
+                        h.mocks.pairings.arm.joint_setpoints.next(), 0.5
                     )
                 except TimeoutError:
                     break
@@ -323,7 +336,7 @@ async def test_posture_and_gripper_actions():
             while True:
                 try:
                     last = await asyncio.wait_for(
-                        h.mocks.pairings.gripper_link.gripper_setpoints.next(), 0.5
+                        h.mocks.pairings.gripper.gripper_setpoints.next(), 0.5
                     )
                 except TimeoutError:
                     break
@@ -444,7 +457,7 @@ async def test_stale_timestamped_leader_input_is_dropped():
                 await asyncio.sleep(0.02)
             with pytest.raises(asyncio.TimeoutError):
                 await asyncio.wait_for(
-                    h.mocks.pairings.arm_link.joint_setpoints.next(), 0.4
+                    h.mocks.pairings.arm.joint_setpoints.next(), 0.4
                 )
         finally:
             feeder.cancel()

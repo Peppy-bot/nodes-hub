@@ -1,0 +1,42 @@
+// What this engine alone knows about an SO-101. Its limbs, joints, camera and
+// start posture are sim_robot_core's entry of the same name.
+{
+  // The robot's USD, under PEPPY_ROBOT_ASSETS_DIR: MuJoCo Menagerie's
+  // robotstudio_so101 as a USD articulation, authored z-up in metres with its
+  // base link at the default prim's origin. The engine references it under a
+  // prim of the robot's own name, so the stage's default prim is the robot's
+  // prim.
+  stage: "so101/so101.usd",
+
+  // The stage's default prim carries the articulation root, with the base
+  // link fixed to the world. Every link is a prim named after its URDF link
+  // under it (base_link, shoulder_link, upper_arm_link, lower_arm_link,
+  // wrist_link, gripper_link, moving_jaw_so101_v1_link), which is where the
+  // front camera hanging from base_link is defined. Joint prims are named
+  // after the joints of the shared entry (shoulder_pan, shoulder_lift,
+  // elbow_flex, wrist_flex, wrist_roll, gripper), which is how PhysX names
+  // their dofs, and each carries a drive, which is what the posture the robot
+  // starts in and the gains below are written to.
+  articulation_root: ".",
+
+  // Position drives standing in for the STS3215 servos, which have no torque
+  // mode: the position gains of upstream's MuJoCo actuators, in the units the
+  // articulation view takes them (N*m/rad and N*m*s/rad), and the servo's
+  // stall-limited 2.94 N*m as each drive's effort ceiling. The engine raises
+  // a drive's damping to critical where kd falls short of it. Tuned by eye,
+  // not identified against the hardware. The drives hold the arm against
+  // gravity as the real servos do, so this entry asks for no gravity
+  // compensation.
+  arm_gains: {
+    kp: [998.22, 998.22, 998.22, 998.22, 998.22],
+    kd: [2.731, 2.731, 2.731, 2.731, 2.731],
+    max_efforts: [2.94, 2.94, 2.94, 2.94, 2.94],
+  },
+
+  // The jaw is the same servo as the arm's joints, tuned by eye like them.
+  gripper_gains: {
+    kp: [998.22],
+    kd: [2.731],
+    max_efforts: [2.94],
+  },
+}

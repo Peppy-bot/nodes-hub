@@ -22,7 +22,7 @@ import shutil
 from dataclasses import dataclass
 
 import peppygen.clock
-from peppygen.exposed_actions import record_episode
+from peppygen.exposed_actions.recording import record_episode
 
 from . import recording
 from .plan import RecordingPlan

@@ -25,8 +25,8 @@ from peppygen.consumed_topics.rgbd_cameras import (
 from peppygen.consumed_topics.rgbd_cameras import (
     video_stream as rgbd_cameras_video_stream,
 )
-from peppygen.exposed_services import finish_session as finish_session_svc
-from peppygen.exposed_services import resume_session as resume_session_svc
+from peppygen.exposed_services.recording import finish_session as finish_session_svc
+from peppygen.exposed_services.recording import resume_session as resume_session_svc
 from peppygen.parameters import Parameters
 
 from . import plan as plan_mod
@@ -142,8 +142,8 @@ def _recorded_links(plan: plan_mod.RecordingPlan) -> dict:
     sources differing only there would collapse into one entry and hide a
     swap between them."""
     links = {
-        "state_links": {"/".join(e.key): e.feature_key for e in plan.state},
-        "action_links": {"/".join(e.key): e.feature_key for e in plan.action},
+        "state_links": {str(e.key): e.feature_key for e in plan.state},
+        "action_links": {str(e.key): e.feature_key for e in plan.action},
     }
     assert len(links["state_links"]) == len(plan.state)
     assert len(links["action_links"]) == len(plan.action)

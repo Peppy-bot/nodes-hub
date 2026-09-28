@@ -6,7 +6,8 @@
 //! stereo-matched depth (millimeters, z16) as depth_stream. Depth lives in
 //! the rectified-left frame, so the pair is permanently color-aligned. The
 //! pipeline loop and the control services share one capture handle behind a
-//! mutex, so a control call waits at most one frame.
+//! mutex, so a control call waits at most one frame. camera_geometry answers
+//! from the same rectification, computed once when the pipeline opens.
 
 #[cfg(not(target_os = "linux"))]
 compile_error!("zed_camera captures over V4L2 and builds for Linux only");
@@ -19,6 +20,9 @@ use peppygen::exposed_services::camera::{
     depth_stream_info, set_color_brightness, set_color_contrast, set_color_exposure,
     set_color_gain, set_color_white_balance, video_stream_info,
 };
+use peppygen::exposed_services::geometry::{
+    get_color_intrinsics, get_depth_intrinsics, get_depth_to_color_extrinsics,
+};
 use peppygen::{NodeBuilder, NodeRunner, Parameters, Result};
 use peppylib::runtime::CancellationToken;
 use tokio::sync::{mpsc, oneshot};
@@ -29,6 +33,7 @@ use zed_camera::capture::{
     device_index, zed_serial,
 };
 use zed_camera::cv_depth::CvDepth;
+use zed_camera::geometry::{Geometry, Pinhole};
 use zed_camera::{DepthSettings, Resolution};
 
 const GRAB_TIMEOUT: Duration = Duration::from_millis(500);
@@ -38,6 +43,13 @@ const COLOR_ENCODING: &str = "rgb8";
 const DEPTH_ENCODING: &str = "z16";
 /// Depth is computed in the rectified-left (= published color) frame.
 const ALIGN_MODE: &str = "depth_to_color";
+/// Both streams are rectified images: camera_geometry's ideal pinhole.
+const DISTORTION_MODEL: &str = "none";
+/// SGBM disparity becomes the distance along the optical axis.
+const DEPTH_MODEL: &str = "z";
+/// What a geometry answer says beside its numbers: where they came from.
+const GEOMETRY_MESSAGE: &str =
+    "geometry of the rectified streams, from the unit's factory calibration";
 
 /// The capture device shared between the pipeline loop and the control
 /// services; every access is a short lock.
@@ -57,7 +69,14 @@ struct Opened {
     eye_height: u32,
     depth_width: u32,
     depth_height: u32,
+    geometry: SessionGeometry,
 }
+
+/// The geometry of the published streams, or why there is none to answer.
+/// The streams do not depend on it, so a rectification that yields numbers
+/// the contract cannot carry costs the geometry services their answer, not
+/// the node its frames.
+type SessionGeometry = std::result::Result<Geometry, String>;
 
 /// One processed capture: rectified left RGB plus depth, sharing a frame id.
 struct FrameSet {
@@ -129,6 +148,7 @@ fn main() -> Result<()> {
             eye_height,
             depth_width,
             depth_height,
+            geometry,
         } = ready_rx
             .await
             .map_err(|_| std::io::Error::other("pipeline exited before opening the camera"))?
@@ -152,6 +172,10 @@ fn main() -> Result<()> {
             depth_height,
             fps_u8,
         );
+        let geometry = Arc::new(geometry);
+        spawn_get_color_intrinsics(node_runner.clone(), geometry.clone());
+        spawn_get_depth_intrinsics(node_runner.clone(), geometry.clone());
+        spawn_get_depth_to_color_extrinsics(node_runner.clone(), geometry);
         spawn_set_color_exposure(node_runner.clone());
         spawn_set_color_white_balance(node_runner.clone(), camera.clone());
         spawn_set_color_gain(node_runner.clone(), camera.clone());
@@ -234,6 +258,29 @@ fn open_pipeline(config: &PipelineConfig) -> std::result::Result<(CvDepth, Opene
 
     let matcher = CvDepth::create(&conf_text, eye_width, eye_height, config.depth)?;
     let (depth_width, depth_height) = matcher.out_size();
+    let geometry = Geometry::new(
+        (eye_width, eye_height),
+        matcher.rectified_left(),
+        (depth_width, depth_height),
+        matcher.min_depth_floor_mm(),
+        matcher.max_depth_mm(),
+    );
+    match &geometry {
+        Ok(g) => info!(
+            "geometry: colour fx {:.3} fy {:.3} cx {:.3} cy {:.3}, depth fx {:.3} fy {:.3} cx {:.3} cy {:.3}, {:.3} m to {:.3} m",
+            g.color.fx,
+            g.color.fy,
+            g.color.cx,
+            g.color.cy,
+            g.depth.fx,
+            g.depth.fy,
+            g.depth.cx,
+            g.depth.cy,
+            g.min_depth_m,
+            g.max_depth_m,
+        ),
+        Err(e) => warn!("no geometry to answer, the geometry services refuse: {e}"),
+    }
 
     Ok((
         matcher,
@@ -243,6 +290,7 @@ fn open_pipeline(config: &PipelineConfig) -> std::result::Result<(CvDepth, Opene
             eye_height,
             depth_width,
             depth_height,
+            geometry,
         },
     ))
 }
@@ -362,6 +410,156 @@ fn spawn_stream_infos(
         }
     });
 }
+
+/// get_color_intrinsics: the rectified left projection at the eye size.
+fn color_intrinsics(geometry: &SessionGeometry) -> get_color_intrinsics::Response {
+    match geometry {
+        Ok(g) => {
+            let Pinhole {
+                width,
+                height,
+                fx,
+                fy,
+                cx,
+                cy,
+            } = g.color;
+            get_color_intrinsics::Response::new(
+                true,
+                GEOMETRY_MESSAGE.to_string(),
+                width,
+                height,
+                fx,
+                fy,
+                cx,
+                cy,
+                DISTORTION_MODEL.to_string(),
+                Vec::new(),
+            )
+        }
+        Err(reason) => get_color_intrinsics::Response::new(
+            false,
+            reason.clone(),
+            0,
+            0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            String::new(),
+            Vec::new(),
+        ),
+    }
+}
+
+/// get_depth_intrinsics: the same camera through the depth grid, and what a
+/// sample measures.
+fn depth_intrinsics(geometry: &SessionGeometry) -> get_depth_intrinsics::Response {
+    match geometry {
+        Ok(g) => {
+            let Pinhole {
+                width,
+                height,
+                fx,
+                fy,
+                cx,
+                cy,
+            } = g.depth;
+            get_depth_intrinsics::Response::new(
+                true,
+                GEOMETRY_MESSAGE.to_string(),
+                width,
+                height,
+                fx,
+                fy,
+                cx,
+                cy,
+                DISTORTION_MODEL.to_string(),
+                Vec::new(),
+                DEPTH_MODEL.to_string(),
+                g.min_depth_m,
+                g.max_depth_m,
+                ALIGN_MODE.to_string(),
+            )
+        }
+        Err(reason) => get_depth_intrinsics::Response::new(
+            false,
+            reason.clone(),
+            0,
+            0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            String::new(),
+            Vec::new(),
+            String::new(),
+            0.0,
+            0.0,
+            String::new(),
+        ),
+    }
+}
+
+/// get_depth_to_color_extrinsics: depth is matched in the colour stream's own
+/// view, so the two optical frames are one and the transform is the identity.
+fn depth_to_color_extrinsics(
+    geometry: &SessionGeometry,
+) -> get_depth_to_color_extrinsics::Response {
+    match geometry {
+        Ok(_) => get_depth_to_color_extrinsics::Response::new(
+            true,
+            GEOMETRY_MESSAGE.to_string(),
+            ALIGN_MODE.to_string(),
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ),
+        Err(reason) => get_depth_to_color_extrinsics::Response::new(
+            false,
+            reason.clone(),
+            String::new(),
+            [0.0; 3],
+            [0.0; 4],
+        ),
+    }
+}
+
+/// One camera_geometry service answering from the session's geometry.
+macro_rules! spawn_geometry_service {
+    ($fn_name:ident, $service:ident, $respond:ident) => {
+        fn $fn_name(runner: Arc<NodeRunner>, geometry: Arc<SessionGeometry>) {
+            tokio::spawn(async move {
+                let cancel = runner.cancellation_token().clone();
+                loop {
+                    let result = tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        result = $service::handle_next_request(&runner, |_req| {
+                            Ok($respond(&geometry))
+                        }) => result,
+                    };
+                    if let Err(e) = result {
+                        error!("{}: {e}", stringify!($service));
+                    }
+                }
+            });
+        }
+    };
+}
+
+spawn_geometry_service!(
+    spawn_get_color_intrinsics,
+    get_color_intrinsics,
+    color_intrinsics
+);
+spawn_geometry_service!(
+    spawn_get_depth_intrinsics,
+    get_depth_intrinsics,
+    depth_intrinsics
+);
+spawn_geometry_service!(
+    spawn_get_depth_to_color_extrinsics,
+    get_depth_to_color_extrinsics,
+    depth_to_color_extrinsics
+);
 
 fn lock_camera(camera: &Camera) -> std::sync::MutexGuard<'_, Capture> {
     camera
@@ -501,3 +699,72 @@ spawn_cid_control_service!(
     CID_CONTRAST,
     ""
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zed_camera::geometry::RectifiedLeft;
+
+    fn session() -> SessionGeometry {
+        Geometry::new(
+            (1280, 720),
+            RectifiedLeft {
+                fx: 700.25,
+                fy: 700.75,
+                cx: 652.125,
+                cy: 351.5,
+            },
+            (640, 360),
+            98.5,
+            65534.0,
+        )
+    }
+
+    #[test]
+    fn each_answer_reads_its_own_stream_and_names_the_frames_alignment() {
+        let color = color_intrinsics(&session());
+        assert!(color.success);
+        assert_eq!((color.width, color.height), (1280, 720));
+        assert_eq!(
+            (color.fx, color.fy, color.cx, color.cy),
+            (700.25, 700.75, 652.125, 351.5)
+        );
+        assert_eq!(color.distortion_model, "none");
+        assert!(color.distortion.is_empty());
+
+        let depth = depth_intrinsics(&session());
+        assert!(depth.success);
+        assert_eq!((depth.width, depth.height), (640, 360));
+        assert_eq!((depth.fx, depth.cx), (350.125, 325.8125));
+        assert_eq!(depth.depth_model, "z");
+        assert_eq!((depth.min_depth_m, depth.max_depth_m), (0.0985, 65.534));
+        // The value every frame header carries.
+        assert_eq!(depth.align_mode, ALIGN_MODE);
+
+        let pose = depth_to_color_extrinsics(&session());
+        assert!(pose.success);
+        assert_eq!(pose.align_mode, depth.align_mode);
+        assert_eq!(pose.depth_to_color_position, [0.0, 0.0, 0.0]);
+        assert_eq!(pose.depth_to_color_orientation, [0.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn without_a_geometry_every_answer_refuses_with_the_reason() {
+        let none: SessionGeometry =
+            Err("the rectified focal lengths are not positive numbers".into());
+        let color = color_intrinsics(&none);
+        assert!(!color.success);
+        assert!(color.message.contains("focal lengths"));
+        assert_eq!((color.width, color.fx), (0, 0.0));
+
+        let depth = depth_intrinsics(&none);
+        assert!(!depth.success);
+        assert!(depth.message.contains("focal lengths"));
+        assert!(depth.depth_model.is_empty());
+
+        let pose = depth_to_color_extrinsics(&none);
+        assert!(!pose.success);
+        assert!(pose.message.contains("focal lengths"));
+        assert_eq!(pose.depth_to_color_orientation, [0.0; 4]);
+    }
+}

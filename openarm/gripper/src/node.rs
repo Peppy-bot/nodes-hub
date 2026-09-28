@@ -366,8 +366,8 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     );
 
     // is_ready service: false until bringup and control wiring complete, then
-    // true. The real openarm_initializer polls this (component_ready) to
-    // gate the whole robot.
+    // true. A real robot's robot_initializer polls this (component_ready)
+    // to gate the whole robot.
     let ready = Arc::new(AtomicBool::new(false));
     {
         let runner = node_runner.clone();

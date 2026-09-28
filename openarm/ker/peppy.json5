@@ -1,12 +1,14 @@
-// openarm_ker: commander entry point driven by the OpenArm KER (Kinematic
+// openarm_ker: the commander driven by the OpenArm KER (Kinematic
 // Equivalent Replica), enactic's motorless bimanual leader arm. Reads the
 // KER's encoder frames from its M5Stack CoreS3 over USB vendor mode (or
-// serial CDC), maps the channels to per-side joint radians and the triggers
-// to gripper opening fractions, and streams both to the backbone over the
+// its serial device), maps the channels to per-side joint radians and commanded
+// gripper openings, and streams both to the backbone over the
 // joint_link / gripper_link pairings exactly like openarm_web_commander (the
-// backbone governs everything before it reaches a follower). The KER's thumb
-// button is the engage deadman: while disengaged the node emits nothing and
-// the robot holds at its last setpoints.
+// backbone governs everything before it reaches a follower). An arm engages
+// when its trigger is squeezed to engage_trigger_opening, having read back
+// above it first, and then tracks the KER; for an unengaged arm, a stale KER,
+// or a disconnected one the node emits nothing and those limbs hold at their
+// last setpoints.
 // KER's joint structure matches OpenArm v2 1:1 (links scaled to 70%), so no
 // coordinate transform is involved; v1 followers accept the same joint-space
 // stream but are not geometrically equivalent.
@@ -46,51 +48,38 @@
   execution: {
     language: "rust",
     container: {
-      def_file: "apptainer.def"
+      def_file: "apptainer.def",
     },
     parameters: {
       // "usb" reads the M5Stack in vendor mode (VID 0x303A, PID 0x4002, bulk
-      // endpoints); "serial" reads the CDC device at serial_port/serial_baud.
+      // endpoints), which is what enactic's released firmware streams.
+      // "serial" reads the ESP32's serial device at device_path/serial_baud,
+      // which a firmware built without USE_USB streams over instead.
       transport: { $type: "string", $default: "usb" },
-      serial_port: { $type: "string", $default: "/dev/m5_ker_485" },
+      device_path: { $type: "string", $default: "/dev/openarm/ker" },
       serial_baud: { $type: "u32", $default: 2000000 },
       // Follower generation ("v1" or "v2"): picks the joint clamp ranges (URDF
-      // limits). Required, not defaulted: KER mirrors v2, so the launcher
-      // states the target explicitly.
+      // limits). Required so a launch clamps to the arm it actually drives.
       hardware_version: "string",
-      // Rate (Hz) at which engaged setpoints are re-published on the arm and
-      // gripper pairing slots.
+      // Rate (Hz, 1..=1000) at which engaged setpoints are re-published on
+      // the arm and gripper pairing slots.
       command_rate_hz: "u32",
-      // KER channel wiring and calibration, CSV strings parsed once at
-      // startup. Channels are the device's 1-based CH indices; each side lists
-      // its 7 joint channels in j1..j7 order. Signs are +-1 per joint;
-      // offsets_deg are added after the sign, in the follower's joint frame.
-      // Required, never defaulted: these are physical facts of one KER unit
-      // pinned during bring-up, and a wrong guess streams a miscalibrated
-      // pose.
-      left_channels: "string",
-      right_channels: "string",
-      left_signs: "string",
-      right_signs: "string",
-      left_offsets_deg: "string",
-      right_offsets_deg: "string",
-      // Trigger (J8) channels and their angle (deg) at closed (opening 0) and
-      // fully open (opening 1); openings interpolate linearly and clamp to
-      // [0, 1]. Per side: the mirrored trigger mechanisms may read opposite
-      // directions.
-      left_trigger_channel: "u32",
-      right_trigger_channel: "u32",
-      left_trigger_closed_deg: "f64",
-      left_trigger_open_deg: "f64",
-      right_trigger_closed_deg: "f64",
-      right_trigger_open_deg: "f64",
-      // "toggle": the thumb button's rising edge toggles engaged/disengaged
-      // for the whole device. "always": engaged whenever frames are fresh
-      // (the escape hatch if a unit's button reads unreliably).
-      engage_mode: { $type: "string", $default: "toggle" },
+      // Engage an arm when its trigger opening (1 released, 0 fully squeezed)
+      // reaches this value or below (at least 0, under 1); a smaller value
+      // demands a deeper squeeze.
+      // The trigger must first read back above this value for three frames in
+      // a row, so a device returning under a held trigger stays put. From the
+      // engaging frame the arm and its gripper track the KER. That same squeeze
+      // commands the gripper, so an arm engages with its gripper near shut.
+      // Required: how deep a squeeze starts motion is a deployment choice.
+      engage_trigger_opening: "f64",
+      // Opening commanded at a released trigger (greater than 0, at most 1);
+      // a squeeze spans [0, this].
+      gripper_open_fraction: { $type: "f64", $default: 1.0 },
       // Stop publishing when the newest KER frame is older than this (s); the
-      // followers then hold their last setpoints. Must exceed the device's
-      // frame period.
+      // followers then hold their last setpoints. A frame arriving after a gap
+      // this long also disengages both arms. Refused below 0.005 s, five frame
+      // periods of the KER's 1 kHz stream.
       stale_timeout_s: { $type: "f64", $default: 0.25 },
       // Bring-up aid: log the raw channel table (degrees, unmapped) at 1 Hz.
       log_raw: { $type: "bool", $default: false }

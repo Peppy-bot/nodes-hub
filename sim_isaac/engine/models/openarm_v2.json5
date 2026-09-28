@@ -1,0 +1,40 @@
+// What this engine alone knows about an OpenArm v2. Its limbs, joints and
+// cameras are sim_robot_core's entry of the same name.
+{
+  // The robot's USD, under PEPPY_ROBOT_ASSETS_DIR. The engine references it
+  // under a prim of the robot's own name, so the stage's default prim is the
+  // robot's prim.
+  stage: "openarm/openarm_bimanual_v2.usd",
+
+  // The stage's default prim carries the articulation root, and every link is
+  // a prim named after its URDF link under it, which is where a camera
+  // hanging from that link is defined. Joint prims are named after the joints
+  // of the shared entry, which is how PhysX names their dofs.
+  articulation_root: ".",
+
+  // MIT servo gains (j1..j7) applied to every arm's PhysX joint drives so sim
+  // dynamics match the real driver, plus the motor torque caps
+  // (DM8009/4340/4310) applied as max_efforts.
+  arm_gains: {
+    kp: [240.0, 240.0, 240.0, 240.0, 24.0, 31.0, 25.0],
+    kd: [3.0, 3.0, 3.0, 3.0, 0.2, 0.2, 0.2],
+    max_efforts: [40.0, 40.0, 27.0, 27.0, 7.0, 7.0, 7.0],
+  },
+
+  // Explicit PhysX finger drives, one per finger of a gripper. Without these
+  // the fingers can free-float when the arm moves if the imported USD has
+  // weak/default drive gains.
+  gripper_gains: {
+    kp: [80.0, 80.0],
+    kd: [2.0, 2.0],
+    max_efforts: [5.0, 5.0],
+  },
+
+  // Mirrors the real driver's in-process gravity feedforward by disabling
+  // gravity on the robot's links.
+  gravity_compensation: true,
+
+  // The robot draws the head camera pack on its pedestal (head_camera.py),
+  // whose left eye its chest camera renders from.
+  head_camera: true,
+}

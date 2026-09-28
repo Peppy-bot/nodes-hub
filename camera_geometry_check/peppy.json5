@@ -1,0 +1,59 @@
+// camera_geometry_check: a bench tool for a camera that serves
+// camera_geometry:v1 beside rgbd_camera:v1, the real ones first: zed_camera
+// and realsense_d4xx answer from a calibration no test bench here has checked
+// against a device. It is a consumer like any other: it asks the camera where
+// its pixels point, takes one depth pixel near a corner of the image, and
+// prints the point that pixel is, in the camera's optical frame. Someone with
+// the device puts a target there, measures where it really is from the lens
+// (X to the right, Y down, Z forward) and compares. README.md has the
+// procedure. It knows no device and no SDK, so it checks a simulated camera
+// the same way.
+{
+  peppy_schema: "node/v1",
+  manifest: {
+    name: "camera_geometry_check",
+    tag: "v1",
+    depends_on: {
+      contracts: [
+        { name: "rgbd_camera", tag: "v1", link_id: "camera" },
+        { name: "camera_geometry", tag: "v1", link_id: "geometry" },
+      ],
+    },
+  },
+  interfaces: {
+    topics: {
+      consumes: [
+        { link_id: "camera", name: "depth_stream" },
+      ],
+    },
+    services: {
+      consumes: [
+        { link_id: "camera", name: "video_stream_info" },
+        { link_id: "camera", name: "depth_stream_info" },
+        { link_id: "geometry", name: "get_color_intrinsics" },
+        { link_id: "geometry", name: "get_depth_intrinsics" },
+        { link_id: "geometry", name: "get_depth_to_color_extrinsics" },
+      ],
+    },
+  },
+  execution: {
+    language: "rust",
+    container: {
+      def_file: "apptainer.def",
+    },
+    parameters: {
+      // The depth pixel to turn into a point, as fractions of the depth
+      // image: 0 0 is its first pixel, 1 1 its last. Near a corner is where a
+      // wrong focal length or principal point moves the point the most; the
+      // image centre would hide both.
+      pixel_u_fraction: { $type: "f64", $default: 0.85 },
+      pixel_v_fraction: { $type: "f64", $default: 0.85 },
+      // The depth used is the median of the readings in a square window
+      // around the pixel, this many pixels to each side, so one hole or one
+      // flying pixel does not decide the result.
+      window: { $type: "u32", $default: 3 },
+      // Seconds between reports.
+      period_s: { $type: "f64", $default: 5.0 },
+    },
+  },
+}

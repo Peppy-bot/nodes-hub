@@ -4,8 +4,8 @@
 //! drive real hardware with plain cargo: [`calibration`] parses
 //! the per-serial factory geometry, [`resolution`] names the capture modes,
 //! [`capture`] streams frames and drives controls through the `v4l` crate,
-//! and [`cv_depth`] rectifies and matches through the maintained opencv
-//! crate.
+//! [`cv_depth`] rectifies and matches through the maintained opencv
+//! crate, and [`geometry`] answers where the published pixels point.
 
 pub mod calibration;
 #[cfg(all(feature = "capture", target_os = "linux"))]
@@ -13,6 +13,7 @@ pub mod capture;
 #[cfg(feature = "cv")]
 pub mod cv_depth;
 pub mod depth_settings;
+pub mod geometry;
 pub mod resolution;
 
 pub use depth_settings::DepthSettings;

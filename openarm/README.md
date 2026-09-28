@@ -4,27 +4,27 @@
 
 | Component | What it does |
 |---|---|
-| [`openarm_initializer`](./initializer) | joins a simulation as this robot, and aggregates per-limb readiness into `is_ready` |
+| [`robot_initializer`](../robot_initializer) | the node every robot uses: joins a simulation as this robot's model, answers who the robot is on `get_identity`, and aggregates per-limb readiness into `is_ready` |
 | [`openarm_arm`](./arm) | drives one arm side (7 joints) |
 | [`openarm_gripper`](./gripper) | drives one gripper side (v1.0 prismatic or v2.0 pinch, by `hardware_version`) |
-| [`openarm_sim_mujoco`](./sim_mujoco) | MuJoCo simulation: stands one robot in its scene |
-| [`openarm_sim_isaac`](./sim_isaac) | Isaac Sim simulation: stands any number of robots' limbs in one scene |
+| [`sim_mujoco`](../sim_mujoco) | MuJoCo simulation: stands any number of robots, of any model it carries, in one composed scene |
+| [`sim_isaac`](../sim_isaac) | Isaac Sim simulation: stands any number of robots, of any model it carries, in one scene |
 | `waldo` | Waldo simulation: stands any number of robots' limbs in one world, with a Bevy browser viewer; lives in the separate `private-nodes-hub` repository, not in this hub |
 | [`openarm_backbone`](./backbone) | routes goals to the correct side |
 | [`openarm_web_commander`](./web_commander) | browser control panel |
-| [`openarm_ker`](./ker) | streams joint setpoints from a physical leader arm |
+| [`openarm_ker`](./ker) | streams joint setpoints from a real leader arm |
 | [`isaac_webviewer`](../isaac_webviewer) | serves the Isaac Sim WebRTC browser viewer |
 | [`scene_commander`](../scene_commander) | browser scene/object/physics control for any simulation implementing the `scene_manipulation` and `object_state` contracts (the Isaac Sim simulation and the Waldo simulation): it edits the scene through `scene_manipulation` and reads the spawned objects through `object_state` |
 
-A simulation plays the follower role of every limb pairing, so the backbone leads its limb slots exactly as it leads the real drivers' and the backbone and the UI never know which simulation is underneath. Every robot joins its simulation through its own `openarm_initializer`, which attaches it over the `simulation_robot` contract naming the copy it runs as and the model to stand, and the engine holds one pair per robot on each limb slot, told apart by the copy each pair belongs to; the same contract answers whether the robot stands with every limb paired, which is the readiness the initializer reports. An initializer that died and came back attaches the robot it already stands: the engine hands that robot's stay to the new goal, so a copy registering again changes nothing in the scene. `openarm_sim_mujoco` stands one robot at a time, loading that robot's scene when it joins. `openarm_sim_isaac` stands any number of robots of either generation in one scene, and `waldo` any number of the v2 its catalogue carries.
+A simulation plays the follower role of every limb pairing, so the backbone leads the simulation exactly as it leads the real drivers and the backbone and the UI never know which simulation is underneath. Every robot joins its simulation through its own `robot_initializer`, which attaches it over the `simulation_robot` contract naming the copy it runs as and the model to stand. A simulation holds every robot's pairs on one slot per kind of pair (`arms`, `grippers`, `rgb_cameras`, `rgbd_cameras`): a pair's robot is the copy it belongs to, and a limb pair's limb is the link it comes from on the backbone, which is why the backbone's downstream links carry its limbs' names (`left_arm`, `right_arm`, `left_gripper`, `right_gripper`). The same contract answers whether the robot stands with a pair for every limb of its model, which is the readiness the initializer reports, and a robot whose pairs are not its model's limbs and cameras does not stay. An initializer that died and came back attaches the robot it already stands: the engine hands that robot's stay to the new goal, so a copy registering again changes nothing in the scene. `sim_mujoco`, `sim_isaac` and `waldo` each stand any number of robots in one scene, of any model they carry, an OpenArm of either generation beside an SO-101.
 
 The third simulation, `waldo`, is published by the `private-nodes-hub` repository. Its launcher option is `waldo`, and its Bevy browser viewer is served over https on port 8080 with a self-signed certificate.
 
 The [launchers](https://github.com/Peppy-bot/launchers-hub)
 run robots as named copies: `simulation` runs one simulation and simulated
-robots, `fleet` any mix of physical and simulated ones. MuJoCo stands one
-simulated robot; Isaac Sim and Waldo stand as many as join them. Physical
-robots join beside the simulated ones on wall time.
+robots, `fleet` any mix of physical and simulated ones. Every simulation
+stands as many simulated robots as join it, and physical robots join beside
+the simulated ones on wall time.
 
 ## 1. Prerequisites
 
@@ -87,8 +87,8 @@ Each `peppy node add <path> -sb` registers the node in the stack, generates its 
 MuJoCo stack:
 
 ```sh
-peppy node add /path/to/ws/nodes-hub/openarm/sim_mujoco -sb --idle-timeout 18000
-peppy node add /path/to/ws/nodes-hub/openarm/initializer -sb --idle-timeout 1800
+peppy node add /path/to/ws/nodes-hub/sim_mujoco -sb --idle-timeout 18000
+peppy node add /path/to/ws/nodes-hub/robot_initializer -sb --idle-timeout 1800
 peppy node add /path/to/ws/nodes-hub/openarm/backbone -sb --idle-timeout 1800
 peppy node add /path/to/ws/nodes-hub/openarm/web_commander -sb --idle-timeout 1800
 ```
@@ -96,7 +96,7 @@ peppy node add /path/to/ws/nodes-hub/openarm/web_commander -sb --idle-timeout 18
 For Isaac, swap the simulation node; the initializer, backbone, and commander are simulation-agnostic and don't need rebuilding:
 
 ```sh
-peppy node add /path/to/ws/nodes-hub/openarm/sim_isaac -sb --idle-timeout 18000
+peppy node add /path/to/ws/nodes-hub/sim_isaac -sb --idle-timeout 18000
 ```
 
 For Waldo, the simulation node comes from the `private-nodes-hub` repository: register it with `peppy repo add /path/to/ws/private-nodes-hub` (then `peppy repo refresh`) and build it with the same larger timeout:
@@ -115,7 +115,7 @@ peppy node add /path/to/ws/nodes-hub/sim_rgbd_camera -sb --idle-timeout 1800
 Real robot:
 
 ```sh
-peppy node add /path/to/ws/nodes-hub/openarm/initializer -sb --idle-timeout 1800
+peppy node add /path/to/ws/nodes-hub/robot_initializer -sb --idle-timeout 1800
 peppy node add /path/to/ws/nodes-hub/openarm/arm -sb --idle-timeout 1800
 peppy node add /path/to/ws/nodes-hub/openarm/gripper -sb --idle-timeout 1800
 ```
@@ -152,15 +152,14 @@ peppy stack launch openarm_simulation --with isaac_sim
 peppy stack join openarm_v2_sim -i bravo --set-arguments commander_inst.http_port=8766
 ```
 
-MuJoCo and Isaac Sim also simulate `openarm_v1_sim`; Waldo's catalogue
-carries the v2. A copy selects its own recorder (`lerobot_recorder`), camera rig
+Every simulation also stands `openarm_v1_sim`, each catalogue carrying both
+generations. A copy selects its own recorder (`lerobot_recorder`), camera rig
 (`cameras_sim` for rendered v2 cameras) and robot commander (`xr_commander`,
-`mcp_commander`) with `with:` in the file or `--with` on join. Its ids carry
+`mcp_commander`, `ker_commander`) with `with:` in the file or `--with` on join. Its ids carry
 its name, `alpha_backbone_inst`; the simulation and scene control belong to the
 stack. Removing a copy takes its robot out of the scene and leaves the
-simulation running; `stack reset` stops everything. Isaac Sim stands every
-robot that joins, of either generation, Waldo every v2 that joins, and
-MuJoCo one robot at a time.
+simulation running; `stack reset` stops everything. Every simulation stands
+every robot that joins it, of either generation.
 Physical robots can join a fleet:
 
 ```sh
@@ -246,7 +245,10 @@ If the viewer opens but the video does not connect, first verify that the config
 
 ## Open Scene Commander
 
-Open:
+Open one of the URLs the launch prints under `Web pages:` as the `panel` of
+`scene_commander_inst` (`peppy stack list` shows them again under `Instance
+endpoints`). There is one URL for each address of the Isaac machine, on port
+8766 when no other process holds it:
 
 ```text
 http://<ISAAC_HOST_IP>:8766
@@ -593,7 +595,7 @@ A normal interactive session is:
       :8210              :8766                :8765
          |                |                     |
          |                v                     v
-         |        openarm_sim_isaac      openarm_backbone
+         |        sim_isaac              openarm_backbone
          |                ^                     |
          |                |                     |
          +----------------+---------------------+
@@ -622,7 +624,7 @@ peppy node add /path/to/ws/nodes-hub/openarm/<node> -sb --force --idle-timeout 1
 The sim keeps loading after `Launch complete`, and Isaac can take a minute. Watch its log until the world is up:
 
 ```sh
-peppy node info openarm_sim_mujoco:v1   # or openarm_sim_isaac:v1
+peppy node info sim_mujoco:v1   # or sim_isaac:v1
 ```
 
 **A move finishes with "reached (target clamped to joint limits)"**
@@ -637,11 +639,11 @@ An older instance is still running. Find it with `peppy stack list` and stop it 
 **A commander panel is not on 8765 or 8766**
 Both commanders prefer their configured port and take one from the operating
 system when another process holds it, so a second copy on a host comes up on a
-port of its own. Each logs the address it took:
+port of its own. The URLs the launch printed under `Web pages:` carry the port
+each took, and so do `peppy stack list` and `peppy node info`:
 
 ```bash
-peppy node info openarm_web_commander:v1     # or scene_commander:v1
-grep 'panel at' ~/.peppy/logs/run/<instance_id>.log
+peppy node info openarm_web_commander:v1     # or scene_commander:v1; lists each instance's panel URLs
 ```
 
 ## Adding an item to this repository

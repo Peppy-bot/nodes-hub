@@ -7,7 +7,9 @@ read-only observer: it attaches to each pairing's measured back-channel
 pairing's leader setpoint stream (LeRobot's `action` feature: commanded
 positions and gripper openings) without claiming either endpoint, samples
 every source onto a fixed fps grid, and writes episodes driven by the
-`record_episode` peppy action. The two "action"s are unrelated: LeRobot's is
+`record_episode` peppy action of the `episode_recording:v1` contract the node
+implements, beside its `finish_session` and `resume_session` services. The
+two "action"s are unrelated: LeRobot's is
 a per-frame dataset feature, peppy's is a goal/feedback/result RPC. A
 setpoint is a latest-wins command, so the action feature holds the last
 commanded value between messages rather than aging out the way state
@@ -29,14 +31,18 @@ instance drive every limb, which is the shape the openarm backbone has.
 
 A limb is named after the link of the pairing its command travels on, the
 backbone's end, and dimension names are that name plus a joint index
-(`left_arm_link_j0`); a gripper's single dimension names the quantity its
-feature carries (`left_gripper_link_opening` in state,
-`left_gripper_link_effort` in efforts).
+(`left_arm_j0`); a gripper's single dimension names the quantity its feature
+carries (`left_gripper_opening` in state, `left_gripper_effort` in efforts).
 What answers for a limb plays no part in its name: a physical OpenArm answers
 from a driver per limb and a simulated one from one simulation for all four,
-and both record the same columns. Two limbs commanded on one link are
-refused at startup. Joint counts and which optional vectors
-(velocities, efforts) a source delivers are discovered from its first message.
+and both record the same columns. A source is identified by the pair it is
+observed on, the end it publishes from plus the far end when the launcher
+named the pair by it (`simulation_inst/arms->backbone_inst/left_arm`): one
+simulation answers for every arm it stands on its one `arms` slot, and the
+far end is what keeps its limbs in separate cache slots. Two limbs commanded
+on one link, or one source bound to two limbs, are refused at startup. Joint
+counts and which optional vectors (velocities, efforts) a source delivers are
+discovered from its first message.
 See `peppy.json5` for the parameter reference.
 
 Requires peppy v0.23.0 or newer: the observed membership is read from the

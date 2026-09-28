@@ -16,7 +16,7 @@ capture = ["dep:v4l"]
 cv = ["dep:opencv"]
 
 [dependencies]
-opencv = { version = "0.99", optional = true, default-features = false, features = [
+opencv = { version = "0.100", optional = true, default-features = false, features = [
     "calib3d",
     "imgproc",
     "clang-runtime",
@@ -24,7 +24,7 @@ opencv = { version = "0.99", optional = true, default-features = false, features
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
-ureq = "2"
+ureq = "3"
 peppygen = { path = ".peppy/libs/peppygen" }
 peppylib = { path = ".peppy/libs/peppylib" }
 

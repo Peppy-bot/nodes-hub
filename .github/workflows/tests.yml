@@ -1,24 +1,43 @@
 name: Tests
 
-# Runs every repository Rust, Python, JavaScript and TypeScript test on each
+# Runs this repository's Rust, Python, JavaScript and TypeScript tests on each
 # pull request and push to main. Test discovery follows filesystem conventions
 # at every depth, so new projects and suites need no workflow entries.
+#
+# A push to main runs every suite. A pull request runs the suites of the
+# projects it touches, and anything it changes that no project holds (this
+# file, the scripts it runs, anything at the root) puts every project back in
+# scope. Every project a run leaves out is named in its summary, so a scoped
+# run never reads as full coverage.
 #
 # Every node depends on generated code (its gitignored `.peppy/libs`) that only
 # a running peppy daemon can produce, since `peppy node sync` calls the daemon's
 # node_generate service and resolves contracts through the daemon's repository
-# registry. So this job installs a peppy release, readies its bundled apptainer
-# for unprivileged use, boots a daemon of its own, generates the tested nodes'
+# registry. So this job installs peppy, readies its bundled apptainer for
+# unprivileged use, boots a daemon of its own, generates the tested nodes'
 # interfaces, and runs each node's tests inside a container derived from its
 # `apptainer.def`. The runner image provides none of the nodes' build
-# dependencies. The runner is self-hosted and reused, so everything worth
-# keeping between runs (test images, cargo registries, per-crate target dirs,
-# uv's downloads) simply outlives the job in the cache directory named below.
+# dependencies.
 #
-# Every job runs on that self-hosted runner; no job uses a GitHub-hosted one.
-# A pull request from a fork lands there too, so what keeps fork code off the
-# box is the repository's fork-PR approval gate, not the runner it is
-# scheduled on.
+# peppy and the daemon's repository registry come from the shared hub-ci-peppy
+# action of the peppy repository, the one the CI of every hub installs peppy
+# with. The registry holds this checkout as the nodes-hub entry, so a node's
+# dependency on another node here resolves to the working tree, and pins every
+# sibling hub at the commit of its branch named like the pull request's head
+# branch where it has one, and at its main otherwise, so a node is generated
+# against the contracts of a contracts-hub change made on a branch of the same
+# name. The job summary names the hub commits that ran.
+#
+# Every job runs on a RunsOn runner: an EC2 instance of its own, booted from
+# the peppy-ubuntu24 image for the job and discarded after it, sized by the
+# job's runs-on label. Everything worth keeping between runs (test images,
+# cargo registries, per-crate target dirs, uv's downloads) lives on the test
+# job's sticky disk, which RunsOn snapshots after the job and restores for the
+# next run on the same branch, or from main's newest snapshot for a branch's
+# first run. A pull request's run reads main's snapshot but never writes it;
+# the push to main is what keeps it current. A pull request from a fork runs
+# on the same runners, so what holds fork code is the repository's fork-PR
+# approval gate.
 on:
   push:
     branches: [main]
@@ -34,7 +53,7 @@ env:
 jobs:
   python-syntax:
     name: Python syntax
-    runs-on: self-hosted
+    runs-on: runs-on=${{ github.run_id }}/runner=peppy-ci-ubuntu-24.04-x86_64/image=peppy-ubuntu24/cpu=2/ram=4+8/family=c8a+c7a+m8a+m7a  # custom Peppy AMI
     timeout-minutes: 5
     permissions:
       contents: read
@@ -48,15 +67,10 @@ jobs:
       # syntax gate; each project's tests still use its own Python
       # requirements.
       #
-      # Through setup-python rather than the `container: python:3.13` this job
-      # used to declare. A container job has the runner pull the image with
-      # docker, and docker is not installed on every self-hosted box — this job
-      # failed with `docker: command not found` before reaching a single step
-      # of its own. setup-python wants nothing but the runner's tool cache, so
-      # it works the same on every box, and it drops a Docker Hub pull from
-      # every run, which matters because the anonymous pull quota those boxes
-      # share is the tightest thing about them. It is what the other
-      # repositories here already reach for.
+      # Through setup-python rather than a `container: python:3.13` job:
+      # setup-python wants nothing but the runner's tool cache, and it spares
+      # every run a Docker Hub pull. It is what the other repositories here
+      # already reach for.
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.13'
@@ -66,7 +80,7 @@ jobs:
 
   javascript-typescript:
     name: JavaScript and TypeScript tests
-    runs-on: self-hosted
+    runs-on: runs-on=${{ github.run_id }}/runner=peppy-ci-ubuntu-24.04-x86_64/image=peppy-ubuntu24/cpu=2/ram=4+8/family=c8a+c7a+m8a+m7a  # custom Peppy AMI
     timeout-minutes: 15
     permissions:
       contents: read
@@ -86,15 +100,21 @@ jobs:
 
   discover-and-run:
     name: All Rust and Python tests
-    # The self-hosted runner is x86, and the cache directory named below
-    # carries the architecture, so moving this repository onto an arm runner
-    # starts from an empty cache rather than a wrong-arch one. The base images
-    # and the librealsense apt repository are published for both.
-    runs-on: self-hosted
+    # 8 vCPU with 16 or 32 GB on the AMD families c8a, c7a, m8a and m7a, where
+    # one vCPU is a full core. The nodes build and test one after the other,
+    # and a full run keeps fewer than 8 cores busy (a warm run uses 3 on
+    # average) and peaks near 7 GB. The root disk holds the run's uv
+    # environments (a full run writes near 27 GB there), and the sticky disk
+    # holds the caches named below (a cold full run fills about 77 GB of it).
+    # Four families in each zone give enough spot pools that a spot instance is
+    # found at once. RunsOn keeps a sticky disk per architecture, so moving
+    # this job onto an arm runner starts from an empty cache rather than a
+    # wrong-arch one. The base images and the librealsense apt repository are
+    # published for both.
+    runs-on: runs-on=${{ github.run_id }}/runner=peppy-ci-ubuntu-24.04-x86_64/image=peppy-ubuntu24/cpu=8/ram=16+32/family=c8a+c7a+m8a+m7a/volume=60gb:gp3:500mbs:6000iops/sticky=node-tests:200gb  # custom Peppy AMI
     # A cold run compiles nine crates' full dependency trees and resolves
-    # lerobot's, torch included. The persistent cache keeps warm runs far under
-    # this, but the first run after the directory is cleared is legitimately
-    # slow.
+    # lerobot's, torch included. The sticky disk keeps warm runs far under
+    # this, but a run that starts from an empty disk is legitimately slow.
     timeout-minutes: 120
     permissions:
       contents: read
@@ -103,37 +123,36 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          # Full history: discovery diffs a pull request against its base to
+          # decide which projects' suites to run, and a shallow checkout holds
+          # neither the base commit nor the merge base with it.
+          fetch-depth: 0
           # Nothing here pushes, so the job has no use for a writable
           # credential sitting in .git/config for every later step to inherit.
           persist-credentials: false
 
       # Container images, cargo registries, crate build outputs and uv's
-      # download cache outlive the run in a directory on the self-hosted
-      # runner: they are what makes a warm run cheap. Nothing mounts or
-      # uploads it — the box is reused, so the directory the step below names
-      # is simply still there. The directory is live rather than a snapshot,
-      # so a run reads what the previous run left and a pull request writes
-      # into what later runs build on; nothing stored here may therefore be
-      # state one run depends on another having written, only caches
-      # apptainer, cargo and uv can rebuild from scratch. Each self-hosted
-      # runner is its own machine with its own $HOME, so this directory is
-      # per-box rather than shared: every box pays its own cold start, and
-      # whether a run is warm depends on which one it lands on. A box runs one
-      # job at a time, so nothing races inside these directories; two runner
-      # agents on a single box would, and is the thing to revisit.
+      # download cache live on the job's sticky disk: they are what makes a
+      # warm run cheap. runs-on/action bind-mounts the directory the next step
+      # names onto the disk, which RunsOn restored before the job and
+      # snapshots after it. Nothing stored here may be state one run depends
+      # on another having written, only caches apptainer, cargo and uv can
+      # rebuild from scratch.
+      - uses: runs-on/action@efac073ea2507ec18797de3a81704201ade11d9d # v2.3.1
+        with:
+          sticky_cache: custom,path=~/.cache/nodes-hub-ci
+
       - name: Name the caches this run reuses
         run: python3 .github/scripts/configure-build-cache.py
 
       # Every node image bootstraps from a public `peppybot/*` base on Docker
       # Hub, and an anonymous pull is charged against a quota tied to the
-      # address it comes from. On Blacksmith each job pulled from its own
-      # short-lived address, so the quota was never close. The self-hosted
-      # boxes are few and every repository's jobs share their addresses, so a
-      # run that has to build images the cache does not hold yet exhausts it
-      # partway through — and Docker Hub reports the overage by refusing a
-      # token with `unauthorized: incorrect username or password`, which reads
-      # like a credential fault but is a quota. Authenticating raises the
-      # ceiling and charges it to the account instead of the box.
+      # address it comes from, which a run that has to build images the cache
+      # does not hold yet can exhaust partway through. Docker Hub reports the
+      # overage by refusing a token with `unauthorized: incorrect username or
+      # password`, which reads like a credential fault but is a quota.
+      # Authenticating raises the ceiling and charges it to the account
+      # instead of the address.
       #
       # Apptainer reads these two variables for every `docker://` bootstrap,
       # the pulls the daemon makes on its own included. They are exported only
@@ -154,18 +173,29 @@ jobs:
             } >> "$GITHUB_ENV"
             echo "Base image pulls authenticate as $DOCKER_USERNAME."
           else
-            echo "No Docker Hub credentials in scope; pulls stay anonymous and share the box's quota."
+            echo "No Docker Hub credentials in scope; pulls stay anonymous and count against this runner's address."
           fi
 
-      - name: Discover all Rust and Python tests
+      # Discovery decides what the rest of this job runs, so its own suite runs
+      # first: a selection bug is the one kind that goes unnoticed, because it
+      # reports success over the suites it never selected.
+      - name: Run the discovery script's own tests
+        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
+
+      - name: Discover the tests this change reaches
         id: discover
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: python3 .github/scripts/discover-tests.py
 
-      - name: Install peppy
+      # The action unpacks the whole peppy release archive into
+      # RUNNER_TEMP/peppy-dist, whose bundled zenohd and apptainer the steps
+      # below use, puts its bin on PATH, and exports the PEPPY_HOME holding
+      # the registry the daemon reads.
+      - name: Install peppy and register the hub repositories
+        id: peppy
         if: steps.discover.outputs.any == 'true'
-        env:
-          PEPPY_VERSION: ${{ vars.PEPPY_VERSION }}
-        run: python3 .github/scripts/install-peppy.py
+        uses: Peppy-bot/peppy/.github/actions/hub-ci-peppy@dev
 
       - name: Ready the bundled apptainer for unprivileged use
         if: steps.discover.outputs.any == 'true'
@@ -179,15 +209,19 @@ jobs:
         if: steps.discover.outputs.any == 'true'
         run: python3 .github/scripts/sync-test-nodes.py
 
+      # A lockfile that does not resolve is named with the peppy version that
+      # generated the interfaces it was checked against.
       - name: Prove the committed lockfiles resolve against the generated interfaces
         if: steps.discover.outputs.any == 'true'
+        env:
+          PEPPY_INSTALLED: ${{ steps.peppy.outputs.peppy-version }}
         run: python3 .github/scripts/check-lockfiles.py
 
-      - name: Run all Rust tests in their build containers
+      - name: Run the selected Rust tests in their build containers
         if: steps.discover.outputs.any == 'true'
         run: python3 .github/scripts/run-rust-tests.py
 
-      - name: Run all Python tests in their build containers
+      - name: Run the selected Python tests in their build containers
         if: steps.discover.outputs.any == 'true'
         run: python3 .github/scripts/run-python-tests.py
 

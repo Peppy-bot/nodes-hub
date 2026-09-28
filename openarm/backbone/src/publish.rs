@@ -23,8 +23,7 @@ use peppygen::emitted_topics::collision_status::collision_status;
 use peppygen::emitted_topics::limb_state::limb_states;
 use peppygen::paired_topics::{
     leader_left_arm, leader_left_arm_pose, leader_left_gripper, leader_right_arm,
-    leader_right_arm_pose, leader_right_gripper, left_arm_link, left_gripper_link, right_arm_link,
-    right_gripper_link,
+    leader_right_arm_pose, leader_right_gripper, left_arm, left_gripper, right_arm, right_gripper,
 };
 use peppylib::{Payload, TopicPublisher};
 use srs_model::nalgebra::Isometry3;
@@ -32,7 +31,7 @@ use tracing::{error, warn};
 
 use crate::arm_pair::ArmPair;
 use crate::streams::{GripperState, warn_throttled};
-use crate::types::{ARM_DOF, JointVec, Side, world_pose_arrays};
+use crate::types::{JointVec, limb_names, world_pose_arrays};
 
 /// Pairing timestamp from this instance's bound clock, so consumers age
 /// samples on the same timeline they read. Errors until the clock delivers
@@ -189,15 +188,16 @@ impl Publisher<LimbStateBuild> {
     pub async fn send(&self, s: &LimbStateSnapshot) {
         let (left_position, left_orientation) = world_pose_arrays(&s.poses.left);
         let (right_position, right_orientation) = world_pose_arrays(&s.poses.right);
+        let names = limb_names();
         self.emit(move |timestamp| {
             (self.build)(
                 timestamp,
-                Side::ARM_NAMES.map(String::from).to_vec(),
-                vec![ARM_DOF as u32; 2],
+                names.arm_names,
+                names.joints_per_arm,
                 [s.joints.left, s.joints.right].concat(),
                 [left_position, right_position].concat(),
                 [left_orientation, right_orientation].concat(),
-                Side::GRIPPER_NAMES.map(String::from).to_vec(),
+                names.gripper_names,
                 vec![s.openings.left, s.openings.right],
             )
         })
@@ -257,28 +257,28 @@ impl Publishers {
             arm_setpoints: ArmPair::new(
                 Publisher::declare(
                     "left joint_setpoints",
-                    left_arm_link::joint_setpoints::declare_publisher(runner),
-                    left_arm_link::joint_setpoints::build_message as JointBuild,
+                    left_arm::joint_setpoints::declare_publisher(runner),
+                    left_arm::joint_setpoints::build_message as JointBuild,
                 )
                 .await?,
                 Publisher::declare(
                     "right joint_setpoints",
-                    right_arm_link::joint_setpoints::declare_publisher(runner),
-                    right_arm_link::joint_setpoints::build_message as JointBuild,
+                    right_arm::joint_setpoints::declare_publisher(runner),
+                    right_arm::joint_setpoints::build_message as JointBuild,
                 )
                 .await?,
             ),
             gripper_setpoints: ArmPair::new(
                 Publisher::declare(
                     "left gripper_setpoints",
-                    left_gripper_link::gripper_setpoints::declare_publisher(runner),
-                    left_gripper_link::gripper_setpoints::build_message as OpeningBuild,
+                    left_gripper::gripper_setpoints::declare_publisher(runner),
+                    left_gripper::gripper_setpoints::build_message as OpeningBuild,
                 )
                 .await?,
                 Publisher::declare(
                     "right gripper_setpoints",
-                    right_gripper_link::gripper_setpoints::declare_publisher(runner),
-                    right_gripper_link::gripper_setpoints::build_message as OpeningBuild,
+                    right_gripper::gripper_setpoints::declare_publisher(runner),
+                    right_gripper::gripper_setpoints::build_message as OpeningBuild,
                 )
                 .await?,
             ),

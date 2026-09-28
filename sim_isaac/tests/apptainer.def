@@ -1,0 +1,14 @@
+Bootstrap: docker
+From: peppybot/python-uv-base:latest
+
+# The image CI runs this suite in (.github/scripts/ci_containers.py derives it
+# from the From: line and the %post below). Not the node's own image: the
+# suites render nothing and run on a stock interpreter.
+
+%post
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+    # uv resolves sim_robot_core as a git dependency; the base image has no git.
+    apt-get update -qq
+    apt-get install -qqy --no-install-recommends git
+    rm -rf /var/lib/apt/lists/*
