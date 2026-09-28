@@ -14,7 +14,7 @@ name: Tests
 # main. It is green only when every other job of this workflow succeeded or
 # was skipped, so every check a pull request must pass is a job of this
 # workflow. merge-set-events.yml names this workflow by its name, Tests, to
-# hand the end of each run to the merge-set bot of peppy.
+# hand the start and the end of each run to the merge-set bot of peppy.
 #
 # Every node depends on generated code (its gitignored `.peppy/libs`) that only
 # a running peppy daemon can produce, since `peppy node sync` calls the daemon's
