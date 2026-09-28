@@ -10,7 +10,7 @@ import math
 import threading
 import uuid
 from concurrent.futures import Future
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from queue import Empty, Queue
 
 from peppygen.exposed_actions.scene import (
@@ -36,7 +36,10 @@ _NOT_CAPTURED = (
     "stage has loaded and the simulation is stepping"
 )
 
-
+# How long a progress message of a load_scene or spawn_object goal waits for
+# its caller to take it. A caller that stopped reading then holds neither its
+# goal nor the goals its action serves after it.
+_REPORT_TIMEOUT_S = 5.0
 
 
 def _yaw_of(payload: dict) -> float:
@@ -57,7 +60,60 @@ def _yaw_of(payload: dict) -> float:
 class _PendingCommand:
     operation: str
     payload: dict
+    # Answers the goal with the command's result.
     future: Future
+    # Tells the goal that the Isaac main thread starts the command.
+    started: Future = field(default_factory=Future)
+
+
+def _settle(future: Future, value) -> None:
+    """Hands `value` to the goal awaiting `future`, from the Isaac main
+    thread. A goal that stopped awaiting it, as the node stops, has cancelled
+    it, and is told nothing."""
+
+    if future.set_running_or_notify_cancel():
+        future.set_result(value)
+
+
+async def _report_progress(
+    context,
+    operation: str,
+    building: bool,
+) -> bool:
+    """Publishes one progress message of a load_scene or spawn_object goal,
+    with nothing fetched. False, and logged, when the caller did not take it
+    within _REPORT_TIMEOUT_S or the publish failed."""
+
+    try:
+        await asyncio.wait_for(
+            context.publish_feedback(
+                bytes_fetched=0,
+                files_ready=0,
+                building=building,
+            ),
+            timeout=_REPORT_TIMEOUT_S,
+        )
+
+    except asyncio.TimeoutError:
+        logger.warning(
+            "%s goal %s: the caller did not take a progress message "
+            "within %g s; its progress is no longer reported",
+            operation,
+            context.goal_id(),
+            _REPORT_TIMEOUT_S,
+        )
+        return False
+
+    except Exception as error:  # pylint: disable=W0718
+        logger.warning(
+            "%s goal %s: its progress is no longer reported: %s",
+            operation,
+            context.goal_id(),
+            error,
+        )
+        return False
+
+    return True
 
 
 class SceneActionIO:
@@ -65,7 +121,9 @@ class SceneActionIO:
 
     Scene edits run on the Isaac thread in submission order. Object state is
     captured there too, from the registry of spawned objects and the engine,
-    and get_object_states answers the latest capture.
+    and get_object_states answers the latest capture. A load_scene or
+    spawn_object goal reports its progress on its feedback
+    (_submit_reporting_progress).
     """
 
     def __init__(
@@ -411,23 +469,69 @@ class SceneActionIO:
             robots=robots,
         )
 
+    def _queue(
+        self,
+        operation: str,
+        payload: dict,
+    ) -> _PendingCommand:
+        """Hands a command to the Isaac main thread, which runs it after the
+        commands queued before it."""
+
+        command = _PendingCommand(
+            operation=operation,
+            payload=payload,
+            future=Future(),
+        )
+
+        self._pending.put(command)
+
+        return command
+
     async def _submit(
         self,
         operation: str,
         payload: dict,
     ) -> dict:
-        future = Future()
-
-        self._pending.put(
-            _PendingCommand(
-                operation=operation,
-                payload=payload,
-                future=future,
-            )
+        return await asyncio.wrap_future(
+            self._queue(operation, payload).future
         )
 
+    async def _submit_reporting_progress(
+        self,
+        context,
+        operation: str,
+        payload: dict,
+    ) -> dict:
+        """Runs a load_scene or spawn_object command as _submit does, and
+        reports its progress on the goal's feedback in two messages: accepted,
+        before the command is queued, then building, once the Isaac main
+        thread starts the command.
+
+        Isaac fetches no file itself, so nothing else is reported: the goal
+        is silent while its command waits for the main thread and while USD
+        resolves what it names. A message the caller does not take ends the
+        reports, and the command runs on.
+        """
+
+        reporting = await _report_progress(
+            context,
+            operation,
+            building=False,
+        )
+
+        command = self._queue(operation, payload)
+
+        if reporting:
+            await asyncio.wrap_future(command.started)
+
+            await _report_progress(
+                context,
+                operation,
+                building=True,
+            )
+
         return await asyncio.wrap_future(
-            future
+            command.future
         )
 
     def process_pending(
@@ -437,7 +541,8 @@ class SceneActionIO:
     ) -> None:
         """Execute queued scene commands on the Isaac main thread.
 
-        Each command's goal completes after a fresh object-state capture, so
+        Each command's goal learns that the command starts before it runs,
+        and completes after a fresh object-state capture, so
         a read once it has completed observes its edit. Until the first
         stamped capture, every frame tries one, so reads are answered from
         the first frame on, ahead of the stream's first tick. After that the
@@ -457,6 +562,8 @@ class SceneActionIO:
 
             except Empty:
                 return
+
+            _settle(pending.started, None)
 
             try:
                 result = self._execute(
@@ -480,10 +587,7 @@ class SceneActionIO:
             # scene is in the snapshot before its goal completes.
             self.capture_object_states()
 
-            if not pending.future.done():
-                pending.future.set_result(
-                    result
-                )
+            _settle(pending.future, result)
 
     def _execute(
         self,
@@ -905,7 +1009,8 @@ class SceneActionIO:
 
             request = context.request().data
 
-            result = await self._submit(
+            result = await self._submit_reporting_progress(
+                context,
                 "load_scene",
                 {
                     "asset_id": request.asset_id,
@@ -958,7 +1063,8 @@ class SceneActionIO:
 
             request = context.request().data
 
-            result = await self._submit(
+            result = await self._submit_reporting_progress(
+                context,
                 "spawn_object",
                 {
                     "asset_id": request.asset_id,
