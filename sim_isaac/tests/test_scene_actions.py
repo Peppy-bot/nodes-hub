@@ -649,17 +649,17 @@ def test_a_goal_reports_its_acceptance_before_its_command_then_its_build_once_th
     assert context.taken.empty()
 
 
-def _serve_to(provider, goal, caller, caplog):
-    """Serves one goal of `goal.action` to `caller`, the main thread running
-    its command once it is queued. Returns what happened, in order, and
-    checks the reports ended with a warning."""
+def _serve_to(provider, goal, context_class, caplog):
+    """Serves one goal of `goal.action` through a `context_class` goal
+    context, the main thread running its command once it is queued. Returns
+    what happened, in order, and checks the reports ended with a warning."""
     provider.io.set_assets(_CATALOGUE)
     events = []
     commands = _Commands(events)
     provider.io._pending = commands
 
     async def serve():
-        serving = _serve_one(provider, goal, caller(goal.request, events))
+        serving = _serve_one(provider, goal, context_class(goal.request, events))
         await asyncio.to_thread(commands.queued.wait, _LIVENESS_S)
         provider.io.process_pending(provider.launcher)
         # The loop comes back for the next goal, which ends it here.
@@ -673,7 +673,7 @@ def _serve_to(provider, goal, caller, caplog):
 
 
 def _assert_the_command_ran_after_the_one_offer(provider, goal, events):
-    """Nothing is offered once a message was not taken, and the command runs
+    """Nothing is offered once a message was not sent, and the command runs
     to its result all the same."""
     assert [event for event in events if event[0] in ("offered", "progress")] == [("offered", _ACCEPTED)]
     getattr(provider.launcher, goal.build).assert_called_once()
