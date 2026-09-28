@@ -90,7 +90,7 @@ from typing import Optional, Sequence, Union
 import numpy as np
 
 from ..ports import Box
-from .gallery_store import NO_GALLERY, GalleryUnavailable, HarvestDir, Pack, Source, phrase_for, resolve
+from .gallery_store import CACHE_DIR, NO_GALLERY, GalleryUnavailable, HarvestDir, Pack, Source, phrase_for, resolve
 
 logger = logging.getLogger(__name__)
 
@@ -484,13 +484,15 @@ class Models:
 class Sam3SiglipDetector:
     name = "sam3_siglip"
 
-    def __init__(self, models_factory=None) -> None:
+    def __init__(self, models_factory=None, cache_dir: Path = CACHE_DIR) -> None:
         self._gallery: Optional[Gallery] = None
         self._models: Optional[Models] = None
         self._prototypes: Optional[np.ndarray] = None
         self._vocabulary: list[str] = []
         self._text_prototypes: dict[tuple[str, ...], np.ndarray] = {}
         self._models_factory = models_factory or Models
+        # Where a fetched gallery pack is kept.
+        self._cache_dir = cache_dir
         # Why there is no gallery, when there is none: "" with one.
         self.gallery_reason = ""
         # The confidence a detection is kept at; the brain sets it from the
@@ -514,7 +516,7 @@ class Sam3SiglipDetector:
             raise RuntimeError(f"the sam3_siglip backend needs torch and transformers (the node's sam3-siglip extra): {error}") from error
         loaded: Optional[Gallery] = None
         try:
-            source = resolve(model, gallery)
+            source = resolve(model, gallery, self._cache_dir)
             loaded = load_gallery(source) if source is not None else None
             if loaded is not None:
                 self.gallery_reason = ""

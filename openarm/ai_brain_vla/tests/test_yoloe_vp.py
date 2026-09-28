@@ -113,7 +113,7 @@ def test_a_pack_of_crops_alone_is_refused_by_name_and_a_missing_gallery_url_is_a
                                    tuple(c.__class__(c.image, None, c.class_index) for c in gallery.crops),
                                    gallery.source, gallery.prototypes, gallery.background)
     import openarm_ai_brain_vla.perception.yoloe_vp as backend
-    detector = YoloeVpDetector()
+    detector = YoloeVpDetector(cache_dir=cache)
     original = backend.load_gallery
     backend.load_gallery = lambda source: crops_only
     try:

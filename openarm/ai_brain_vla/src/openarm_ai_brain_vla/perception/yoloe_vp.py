@@ -64,7 +64,7 @@ from typing import Optional, Sequence
 import numpy as np
 
 from ..ports import Box
-from .gallery_store import GalleryUnavailable, resolve
+from .gallery_store import CACHE_DIR, GalleryUnavailable, resolve
 from .sam3_siglip import Crop, Gallery, load_gallery, normalised
 
 logger = logging.getLogger(__name__)
@@ -218,10 +218,12 @@ class Model:
 class YoloeVpDetector:
     name = "yoloe_vp"
 
-    def __init__(self) -> None:
+    def __init__(self, cache_dir: Path = CACHE_DIR) -> None:
         self._gallery: Optional[Gallery] = None
         self._model: Optional[Model] = None
         self._vocabulary: list[str] = []
+        # Where a fetched gallery pack is kept.
+        self._cache_dir = cache_dir
         # The confidence a detection is kept at; the brain sets it from the
         # perception_confidence parameter before the load.
         self.min_confidence = MIN_CONFIDENCE
@@ -235,7 +237,7 @@ class YoloeVpDetector:
         and builds the prototypes. A gallery that cannot be had, or a library
         that is missing, fails the load with the reason."""
         try:
-            source = resolve(model, gallery)
+            source = resolve(model, gallery, self._cache_dir)
         except GalleryUnavailable as error:
             raise RuntimeError(f"the yoloe_vp backend needs its gallery: {error}") from error
         if source is None:

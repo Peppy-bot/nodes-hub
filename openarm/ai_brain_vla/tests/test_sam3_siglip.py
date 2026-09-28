@@ -293,7 +293,7 @@ def test_a_pack_loads_its_prototypes_instead_of_embedding_crops(tmp_path):
             return super().embed_images(crops)
 
     url, root, cache = write_pack(tmp_path / "store", dim=16)
-    detector = Sam3SiglipDetector(models_factory=CountingModels)
+    detector = Sam3SiglipDetector(models_factory=CountingModels, cache_dir=cache)
     detector.load("", url)
     assert detector.available and detector.gallery_reason == ""
     assert detector._prototypes.shape == (4, 16) and CountingModels.embedded == 0
@@ -302,7 +302,7 @@ def test_a_pack_loads_its_prototypes_instead_of_embedding_crops(tmp_path):
     detector.detect(np.zeros((60, 80, 3), dtype=np.uint8))
     assert detector._models.prompts[-1] == GENERIC_PROMPTS + ("apple",)
     # perception_model "none" beats the gallery_url: words only.
-    other = Sam3SiglipDetector(models_factory=FakeModels)
+    other = Sam3SiglipDetector(models_factory=FakeModels, cache_dir=cache)
     other.load("none", url)
     assert other.available and other._gallery is None and other.gallery_reason == 'perception_model is "none"'
 
@@ -329,8 +329,9 @@ def test_the_pack_backgrounds_are_dropped_by_the_detector(tmp_path):
             return e
 
     url, root, cache = write_pack(tmp_path / "store", dim=16)
-    detector = Sam3SiglipDetector(models_factory=ArmModels)
+    detector = Sam3SiglipDetector(models_factory=ArmModels, cache_dir=cache)
     detector.load("", url)
+    assert detector.gallery_reason == ""
     # A table where each row is its own axis, so the crop's axis 3 is the robot arm.
     detector._prototypes = np.eye(4, 16, dtype=np.float32)
     detector.set_vocabulary([])
@@ -362,8 +363,9 @@ def test_the_floor_drops_a_confident_phantom_on_the_gallery_route(tmp_path):
             return e
 
     url, root, cache = write_pack(tmp_path / "store", dim=16)
-    detector = Sam3SiglipDetector(models_factory=FarModels)
+    detector = Sam3SiglipDetector(models_factory=FarModels, cache_dir=cache)
     detector.load("", url)
+    assert detector.gallery_reason == ""
     detector._prototypes = np.eye(4, 16, dtype=np.float32)
     detector.set_vocabulary([])
     detector.min_confidence = 0.10
