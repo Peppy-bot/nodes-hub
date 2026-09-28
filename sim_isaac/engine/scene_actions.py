@@ -36,9 +36,9 @@ _NOT_CAPTURED = (
     "stage has loaded and the simulation is stepping"
 )
 
-# How long a progress message of a load_scene or spawn_object goal waits for
-# its caller to take it. A caller that stopped reading then holds neither its
-# goal nor the goals its action serves after it.
+# How long a progress message of a load_scene or spawn_object goal may take to
+# be sent. A message still not sent then holds neither its goal nor the goals
+# its action serves after it.
 _REPORT_TIMEOUT_S = 5.0
 
 
@@ -81,7 +81,7 @@ async def _report_progress(
     building: bool,
 ) -> bool:
     """Publishes one progress message of a load_scene or spawn_object goal,
-    with nothing fetched. False, and logged, when the caller did not take it
+    with nothing fetched. False, and logged, when the message was not sent
     within _REPORT_TIMEOUT_S or the publish failed."""
 
     try:
@@ -96,8 +96,8 @@ async def _report_progress(
 
     except asyncio.TimeoutError:
         logger.warning(
-            "%s goal %s: the caller did not take a progress message "
-            "within %g s; its progress is no longer reported",
+            "%s goal %s: a progress message was not sent within %g s; "
+            "its progress is no longer reported",
             operation,
             context.goal_id(),
             _REPORT_TIMEOUT_S,
@@ -509,7 +509,7 @@ class SceneActionIO:
 
         Isaac fetches no file itself, so nothing else is reported: the goal
         is silent while its command waits for the main thread and while USD
-        resolves what it names. A message the caller does not take ends the
+        resolves what it names. A message that is not sent in time ends the
         reports, and the command runs on.
         """
 

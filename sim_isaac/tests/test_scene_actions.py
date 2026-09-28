@@ -514,8 +514,8 @@ class _Handle:
 
 class _Goal:
     """A load_scene or spawn_object goal, as its generated context carries
-    it. It logs each progress message its caller takes and how it ends, and
-    hands each message to the test as the caller takes it."""
+    it. It logs each progress message it sends and how it ends, and hands
+    each message to the test as it sends it."""
 
     def __init__(self, data, events):
         self._request = SimpleNamespace(data=data)
@@ -543,17 +543,17 @@ class _Goal:
         self._events.append(("cancelled", *result))
 
 
-class _StuckCaller(_Goal):
-    """A goal whose caller stopped reading: a message is offered to it, and
-    never taken."""
+class _StuckPublish(_Goal):
+    """A goal whose progress message is never sent: its publish never
+    ends."""
 
     def publish_feedback(self, bytes_fetched, files_ready, building):
         self._events.append(("offered", (bytes_fetched, files_ready, building)))
         return asyncio.Event().wait()
 
 
-class _GoneCaller(_Goal):
-    """A goal whose caller is gone: the publish of a message fails."""
+class _FailingPublish(_Goal):
+    """A goal whose progress publish fails."""
 
     async def publish_feedback(self, bytes_fetched, files_ready, building):
         self._events.append(("offered", (bytes_fetched, files_ready, building)))
@@ -681,18 +681,18 @@ def _assert_the_command_ran_after_the_one_offer(provider, goal, events):
 
 
 @_REPORTING_ACTIONS
-def test_a_caller_that_stopped_reading_holds_neither_its_goal_nor_the_next(provider, goal, monkeypatch, caplog):
-    # No publish to this caller ever completes, so the bound ends the first
-    # without waiting.
+def test_a_message_never_sent_holds_neither_its_goal_nor_the_next(provider, goal, monkeypatch, caplog):
+    # No publish ever completes, so the bound ends the first without
+    # waiting.
     monkeypatch.setattr(provider.module, "_REPORT_TIMEOUT_S", 0)
 
-    events = _serve_to(provider, goal, _StuckCaller, caplog)
+    events = _serve_to(provider, goal, _StuckPublish, caplog)
 
     _assert_the_command_ran_after_the_one_offer(provider, goal, events)
 
 
 @_REPORTING_ACTIONS
-def test_a_caller_that_is_gone_holds_neither_its_goal_nor_the_next(provider, goal, caplog):
-    events = _serve_to(provider, goal, _GoneCaller, caplog)
+def test_a_failed_publish_holds_neither_its_goal_nor_the_next(provider, goal, caplog):
+    events = _serve_to(provider, goal, _FailingPublish, caplog)
 
     _assert_the_command_ran_after_the_one_offer(provider, goal, events)

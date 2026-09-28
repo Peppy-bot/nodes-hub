@@ -343,9 +343,9 @@ reported as stalled, and the caller cancels the goal. A cancel does not stop
 a command: the scene or the object still loads, and the goal ends as
 cancelled with the command's result.
 
-Each message waits at most 5 s for the caller to take it. When the caller
-does not take one, the goal sends no more progress messages, and the command
-runs and completes the goal as usual.
+Each message waits at most 5 s to be sent. When one is not sent in that
+time, the goal sends no more progress messages, and the command runs and
+completes the goal as usual.
 
 ## Robot asset bundles
 
