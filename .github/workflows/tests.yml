@@ -10,6 +10,12 @@ name: Tests
 # scope. Every project a run leaves out is named in its summary, so a scoped
 # run never reads as full coverage.
 #
+# The last job, `test`, is the one status check the org ruleset requires on
+# main. It is green only when every other job of this workflow succeeded or
+# was skipped, so every check a pull request must pass is a job of this
+# workflow. merge-set-events.yml names this workflow by its name, Tests, to
+# hand the end of each run to the merge-set bot of peppy.
+#
 # Every node depends on generated code (its gitignored `.peppy/libs`) that only
 # a running peppy daemon can produce, since `peppy node sync` calls the daemon's
 # node_generate service and resolves contracts through the daemon's repository
@@ -51,6 +57,52 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # `peppy_repository.json5` states what this repository publishes. It is
+  # generated, so a pull request that adds, moves, renames or deletes a node,
+  # contract, pairing or launcher leaves it stale unless the author
+  # regenerates it. A stale index makes an item silently invisible to every
+  # machine that consumes this repository, and none of those machines can fix
+  # it. This job catches that on the branch of the person who caused it, so
+  # it runs on pull requests alone. It runs on every pull request rather than
+  # behind a path filter: a removal or a rename drifts the index just as an
+  # addition does, and the check is a filesystem walk that costs seconds.
+  #
+  # peppy comes from the shared hub-ci-peppy action of the peppy repository,
+  # the one the CI of every hub installs it with; the job summary names the
+  # hub commits that action resolved.
+  check-index:
+    if: github.event_name == 'pull_request'
+    # The smallest RunsOn runner: the check is a filesystem walk. A pull
+    # request from a fork runs on the same runners, so what holds fork code is
+    # the repository's fork-PR approval gate.
+    runs-on: runs-on=${{ github.run_id }}/runner=peppy-ci-ubuntu-24.04-x86_64/image=peppy-ubuntu24/cpu=2/ram=4+8/family=c8a+c7a+m8a+m7a  # custom Peppy AMI
+    # Nothing here legitimately takes minutes; a hung step should fail fast
+    # rather than hold a runner for the default six hours.
+    timeout-minutes: 15
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          # Nothing here pushes, so the job has no use for a writable
+          # credential sitting in .git/config for every later step to inherit.
+          persist-credentials: false
+
+      # The action unpacks a peppy release archive under RUNNER_TEMP, puts its
+      # bin on PATH, and exports a PEPPY_HOME under RUNNER_TEMP holding a
+      # repository registry that pins every sibling hub by commit. Every peppy
+      # command builds its app context before dispatching, and that PEPPY_HOME
+      # keeps it in the job's own temp dir rather than a ~/.peppy nothing here
+      # asked for.
+      - name: Install peppy and register the hub repositories
+        uses: Peppy-bot/peppy/.github/actions/hub-ci-peppy@dev
+
+      # `peppy repo index` needs no daemon, so none is started here.
+      - name: Check peppy_repository.json5 matches the repository
+        run: peppy repo index . --check
+
   python-syntax:
     name: Python syntax
     runs-on: runs-on=${{ github.run_id }}/runner=peppy-ci-ubuntu-24.04-x86_64/image=peppy-ubuntu24/cpu=2/ram=4+8/family=c8a+c7a+m8a+m7a  # custom Peppy AMI
@@ -227,3 +279,26 @@ jobs:
 
       - name: Prove CI tested the committed manifests and lockfiles
         run: python3 .github/scripts/check-tested-manifests.py
+
+  # The one status check the org ruleset requires on main. It is green only
+  # when every job above succeeded or was skipped, so a red job blocks the
+  # merge whichever job it ran in.
+  test:
+    needs: [check-index, python-syntax, javascript-typescript, discover-and-run]
+    # Runs whatever happened above: on the default condition a failed or
+    # cancelled job would leave this check unreported instead of red.
+    if: always()
+    # The smallest RunsOn runner: the job reads the results of the others.
+    runs-on: runs-on=${{ github.run_id }}/runner=peppy-ci-ubuntu-24.04-x86_64/image=peppy-ubuntu24/cpu=2/ram=4+8/family=c8a+c7a+m8a+m7a  # custom Peppy AMI
+    timeout-minutes: 5
+    permissions: {}
+
+    steps:
+      - name: Report every job's result
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: echo "$RESULTS"
+
+      - name: Fail when any job failed or was cancelled
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
