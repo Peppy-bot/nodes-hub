@@ -212,7 +212,9 @@ jobs:
       # names onto the disk, which RunsOn restored before the job and
       # snapshots after it. Nothing stored here may be state one run depends
       # on another having written, only caches apptainer, cargo and uv can
-      # rebuild from scratch.
+      # rebuild from scratch. Cargo never removes an artifact a later build
+      # superseded, so the Rust step sweeps each target dir down to what its
+      # builds still use (see run-rust-tests.py).
       - uses: runs-on/action@efac073ea2507ec18797de3a81704201ade11d9d # v2.3.1
         with:
           sticky_cache: custom,path=~/.cache/nodes-hub-ci
@@ -291,6 +293,12 @@ jobs:
         env:
           PEPPY_INSTALLED: ${{ steps.peppy.outputs.peppy-version }}
         run: python3 .github/scripts/check-lockfiles.py
+
+      # The action exports the path of the script that run-rust-tests.py
+      # sweeps the target dirs with.
+      - name: Get the cargo target sweep
+        if: steps.discover.outputs.any == 'true'
+        uses: Peppy-bot/peppy/.github/actions/cargo-target-sweep@dev
 
       - name: Run the selected Rust tests in their build containers
         if: steps.discover.outputs.any == 'true'
