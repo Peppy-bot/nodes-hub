@@ -14,7 +14,7 @@ name: Tests
 # main. It is green only when every other job of this workflow succeeded or
 # was skipped, so every check a pull request must pass is a job of this
 # workflow. merge-set-events.yml names this workflow by its name, Tests, to
-# hand the end of each run to the merge-set bot of peppy.
+# hand the start and the end of each run to the merge-set bot of peppy.
 #
 # Every node depends on generated code (its gitignored `.peppy/libs`) that only
 # a running peppy daemon can produce, since `peppy node sync` calls the daemon's
@@ -57,6 +57,27 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The peppy dev build that the jobs below install. When peppy and this hub
+  # are pushed at the same time, peppy's CI uploads that build several
+  # minutes after this run starts. This job waits for it (see `wait-only` in
+  # the hub-ci-peppy action), and each job that installs peppy needs this
+  # job, so that only this small runner waits. A job whose peppy is a
+  # release build waits for nothing.
+  wait-for-peppy:
+    name: Wait for the peppy dev build
+    # The smallest RunsOn runner, 1 vCPU: the job only looks for the build.
+    runs-on: runs-on=${{ github.run_id }}/runner=peppy-ci-ubuntu-24.04-x86_64/image=peppy-ubuntu24/cpu=1/ram=2+4/family=c8a+c7a+m8a+m7a  # custom Peppy AMI
+    # The action stops its wait after 20 minutes.
+    timeout-minutes: 25
+    permissions:
+      contents: read
+
+    steps:
+      - name: Wait for the peppy dev build of the set
+        uses: Peppy-bot/peppy/.github/actions/hub-ci-peppy@dev
+        with:
+          wait-only: true
+
   # `peppy_repository.json5` states what this repository publishes. It is
   # generated, so a pull request that adds, moves, renames or deletes a node,
   # contract, pairing or launcher leaves it stale unless the author
@@ -71,6 +92,7 @@ jobs:
   # the one the CI of every hub installs it with; the job summary names the
   # hub commits that action resolved.
   check-index:
+    needs: wait-for-peppy
     if: github.event_name == 'pull_request'
     # The smallest RunsOn runner: the check is a filesystem walk. A pull
     # request from a fork runs on the same runners, so what holds fork code is
@@ -152,6 +174,7 @@ jobs:
 
   discover-and-run:
     name: All Rust and Python tests
+    needs: wait-for-peppy
     # 8 vCPU with 16 or 32 GB on the AMD families c8a, c7a, m8a and m7a, where
     # one vCPU is a full core. The nodes build and test one after the other,
     # and a full run keeps fewer than 8 cores busy (a warm run uses 3 on
@@ -284,7 +307,7 @@ jobs:
   # when every job above succeeded or was skipped, so a red job blocks the
   # merge whichever job it ran in.
   test:
-    needs: [check-index, python-syntax, javascript-typescript, discover-and-run]
+    needs: [wait-for-peppy, check-index, python-syntax, javascript-typescript, discover-and-run]
     # Runs whatever happened above: on the default condition a failed or
     # cancelled job would leave this check unreported instead of red.
     if: always()
