@@ -1,15 +1,19 @@
 """The scene_manipulation and object_state provider: what get_assets_list answers
 before and after discovery, what load_scene and clear_scene do to spawned
-objects, and what get_object_states answers: nothing until a capture, then
-the latest capture under its own stamp, every completed edit included."""
+objects, what get_object_states answers: nothing until a capture, then
+the latest capture under its own stamp, every completed edit included, and
+what a load_scene or spawn_object goal reports on its feedback."""
 
+import asyncio
 import importlib
 import importlib.util
 import json
 import logging
 import sys
+import threading
 from concurrent.futures import Future
 from pathlib import Path
+from queue import Queue
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, call
 
@@ -475,3 +479,220 @@ def test_a_failed_capture_is_unavailable_with_its_reason_rather_than_an_older_sn
     provider.stamps.now_s = 20.0
     provider.io.capture_object_states()
     assert provider.io._handle_get_object_states(None).timestamp == 20.0
+
+
+# A liveness bound only: a broken goal ends its test instead of hanging it.
+# No assertion reads it.
+_LIVENESS_S = 30.0
+
+
+class _Commands(Queue):
+    """The queue of scene commands for the Isaac main thread. It logs each
+    command a goal queues, and tells the test that one is queued."""
+
+    def __init__(self, events):
+        super().__init__()
+        self._events = events
+        self.queued = threading.Event()
+
+    def put(self, item, block=True, timeout=None):
+        self._events.append(("queued", item.operation))
+        super().put(item, block, timeout)
+        self.queued.set()
+
+
+class _Handle:
+    """An action handle that admits one goal, then closes as it does when
+    the node shuts down."""
+
+    def __init__(self, goal):
+        self._goals = [goal]
+
+    async def handle_goal_next_request(self, _decide):
+        return self._goals.pop() if self._goals else None
+
+
+class _Goal:
+    """A load_scene or spawn_object goal, as its generated context carries
+    it. It logs each progress message it sends and how it ends, and hands
+    each message to the test as it sends it."""
+
+    def __init__(self, data, events):
+        self._request = SimpleNamespace(data=data)
+        self._events = events
+        self.taken = asyncio.Queue()
+
+    def request(self):
+        return self._request
+
+    def goal_id(self):
+        return "goal-1"
+
+    def is_cancelled(self):
+        return False
+
+    async def publish_feedback(self, bytes_fetched, files_ready, building):
+        progress = (bytes_fetched, files_ready, building)
+        self._events.append(("progress", progress))
+        self.taken.put_nowait(progress)
+
+    async def complete(self, *result):
+        self._events.append(("completed", *result))
+
+    async def complete_cancelled(self, *result):
+        self._events.append(("cancelled", *result))
+
+
+class _StuckPublish(_Goal):
+    """A goal whose progress message is never sent: its publish never
+    ends."""
+
+    def publish_feedback(self, bytes_fetched, files_ready, building):
+        self._events.append(("offered", (bytes_fetched, files_ready, building)))
+        return asyncio.Event().wait()
+
+
+class _FailingPublish(_Goal):
+    """A goal whose progress publish fails."""
+
+    async def publish_feedback(self, bytes_fetched, files_ready, building):
+        self._events.append(("offered", (bytes_fetched, files_ready, building)))
+        raise RuntimeError("the feedback stream is closed")
+
+
+# Each action that reports its progress: the method that serves it, the
+# launcher method that builds what its goal names, the request of that goal,
+# and the message the goal completes with.
+_LOAD = SimpleNamespace(
+    action="load_scene", serve="_serve_load_scene", build="_runtime_load_isaac_scene",
+    request=SimpleNamespace(asset_id="scene/full_warehouse", scale=1.0),
+    message="Loaded scene scene/full_warehouse",
+)
+_SPAWN = SimpleNamespace(
+    action="spawn_object", serve="_serve_spawn_object", build="_runtime_spawn_isaac_asset",
+    request=SimpleNamespace(
+        asset_id="props/blocks/red_block", position=[0.5, 0.0, 0.8], yaw=0.0, scale=1.0, physics="dynamic",
+        mass=0.1,
+    ),
+    message="Spawned props/blocks/red_block",
+)
+_REPORTING_ACTIONS = pytest.mark.parametrize("goal", [_LOAD, _SPAWN], ids=lambda goal: goal.action)
+
+_ACCEPTED = (0, 0, False)
+_BUILDING = (0, 0, True)
+
+
+def _hold_the_build(provider, goal, events, finish):
+    """Makes the launcher's build of what `goal` names hold the Isaac main
+    thread until the test sets `finish`, as USD resolving a scene or an
+    object does, then do what it does and log it."""
+    method = getattr(provider.launcher, goal.build)
+    builds = method.side_effect
+
+    def build(command):
+        finish.wait(_LIVENESS_S)
+        if builds is not None:
+            builds(command)
+        events.append(("built", command["path"]))
+
+    method.side_effect = build
+
+
+def _serve_one(provider, goal, context):
+    """Starts serving `goal.action` with one goal, `context`, admitted."""
+    provider.io._action_handles = {goal.action: _Handle(context)}
+    return asyncio.create_task(getattr(provider.io, goal.serve)())
+
+
+@_REPORTING_ACTIONS
+def test_a_goal_reports_its_acceptance_before_its_command_then_its_build_once_the_main_thread_starts_it(
+    provider, goal
+):
+    provider.io.set_assets(_CATALOGUE)
+    events = []
+    commands = _Commands(events)
+    provider.io._pending = commands
+    finish = threading.Event()
+    _hold_the_build(provider, goal, events, finish)
+    isaac_frame = threading.Thread(target=provider.io.process_pending, args=(provider.launcher,))
+
+    async def serve():
+        context = _Goal(goal.request, events)
+        serving = _serve_one(provider, goal, context)
+
+        assert await asyncio.wait_for(context.taken.get(), _LIVENESS_S) == _ACCEPTED
+        # Taken before the command even reached the queue.
+        assert events[0] == ("progress", _ACCEPTED)
+
+        # Queued, the command waits for the main thread, and the goal says
+        # nothing more.
+        await asyncio.to_thread(commands.queued.wait, _LIVENESS_S)
+        assert context.taken.empty()
+
+        isaac_frame.start()
+        assert await asyncio.wait_for(context.taken.get(), _LIVENESS_S) == _BUILDING
+        # The main thread holds the build: the message came while it runs.
+        assert not [event for event in events if event[0] == "built"]
+
+        finish.set()
+        await asyncio.wait_for(serving, _LIVENESS_S)
+        return context
+
+    context = asyncio.run(serve())
+    isaac_frame.join(_LIVENESS_S)
+
+    built = _CATALOGUE[goal.request.asset_id]["path"]
+    assert events[:-1] == [
+        ("progress", _ACCEPTED), ("queued", goal.action), ("progress", _BUILDING), ("built", built),
+    ]
+    assert events[-1][:3] == ("completed", True, goal.message)
+    assert context.taken.empty()
+
+
+def _serve_to(provider, goal, context_class, caplog):
+    """Serves one goal of `goal.action` through a `context_class` goal
+    context, the main thread running its command once it is queued. Returns
+    what happened, in order, and checks the reports ended with a warning."""
+    provider.io.set_assets(_CATALOGUE)
+    events = []
+    commands = _Commands(events)
+    provider.io._pending = commands
+
+    async def serve():
+        serving = _serve_one(provider, goal, context_class(goal.request, events))
+        await asyncio.to_thread(commands.queued.wait, _LIVENESS_S)
+        provider.io.process_pending(provider.launcher)
+        # The loop comes back for the next goal, which ends it here.
+        await asyncio.wait_for(serving, _LIVENESS_S)
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(serve())
+
+    assert [r for r in caplog.records if "its progress is no longer reported" in r.message]
+    return events
+
+
+def _assert_the_command_ran_after_the_one_offer(provider, goal, events):
+    """Nothing is offered once a message was not sent, and the command runs
+    to its result all the same."""
+    assert [event for event in events if event[0] in ("offered", "progress")] == [("offered", _ACCEPTED)]
+    getattr(provider.launcher, goal.build).assert_called_once()
+    assert events[-1][:3] == ("completed", True, goal.message)
+
+
+@_REPORTING_ACTIONS
+def test_a_message_never_sent_holds_neither_its_goal_nor_the_next(provider, goal, monkeypatch, caplog):
+    # No publish ever completes, so the bound ends the first without
+    # waiting.
+    monkeypatch.setattr(provider.module, "_REPORT_TIMEOUT_S", 0)
+
+    events = _serve_to(provider, goal, _StuckPublish, caplog)
+
+    _assert_the_command_ran_after_the_one_offer(provider, goal, events)
+
+
+@_REPORTING_ACTIONS
+def test_a_failed_publish_holds_neither_its_goal_nor_the_next(provider, goal, caplog):
+    events = _serve_to(provider, goal, _FailingPublish, caplog)
+
+    _assert_the_command_ran_after_the_one_offer(provider, goal, events)

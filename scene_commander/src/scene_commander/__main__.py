@@ -11,13 +11,16 @@ is bound and asks nothing of the ones left vacant.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import itertools
 import json
 import logging
 import math
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from enum import StrEnum
 from functools import partial
 from types import ModuleType
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Awaitable, Callable
 
 import peppylib
 from aiohttp import web
@@ -75,8 +78,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Every request the provider answers at once: a service read or setter, a
+# cancel, and the result of a goal whose feedback stream has ended.
 SERVICE_TIMEOUT_S = 10.0
+# The admission of every goal (a provider may admit one goal at a time, so
+# a goal can wait for the one before it), and the whole of a goal that
+# reports no progress.
 ACTION_TIMEOUT_S = 60.0
+# The longest a load or a spawn may go without a progress message; each
+# message starts the window again.
+PROGRESS_TIMEOUT_S = 60.0
 
 
 class SceneCatalogueUnavailable(RuntimeError):
@@ -123,6 +134,38 @@ class ProviderRefusal(RuntimeError):
     def __init__(self, message: str, current: dict) -> None:
         super().__init__(message)
         self.current = current
+
+
+class Canceller(StrEnum):
+    """Who had a goal cancelled: this commander, when the goal made no
+    progress for a window or did not end in its whole bound; the page, by
+    the cancel route or by closing its stream; or the simulator itself, for
+    the reason its message gives, as when a newer load replaces one that is
+    still fetching its files."""
+
+    COMMANDER = "commander"
+    PAGE = "page"
+    SIMULATOR = "simulator"
+
+
+class GoalCancelled(RuntimeError):
+    """A goal that ended cancelled; `by` names who had it cancelled."""
+
+    def __init__(self, message: str, by: Canceller) -> None:
+        super().__init__(message)
+        self.by = by
+
+
+class CancelNotDelivered(RuntimeError):
+    """A cancel that did not reach the provider: nothing records it, and the
+    next cancel of the goal is sent again."""
+
+    def __init__(self, name: str, reason: Exception) -> None:
+        super().__init__(f"the cancel of {name} was not delivered: {reason}")
+        # Why the cancel did not reach the provider.
+        self.reason = reason
+        # What became of the cancel, for a message that names the goal.
+        self.outcome = f"the cancel was not delivered: {reason}"
 
 
 # ---------------------------------------------------------------------------
@@ -281,6 +324,19 @@ def _probe_capabilities(node_runner: NodeRunner) -> _Capabilities:
 # ---------------------------------------------------------------------------
 
 
+def _endpoint_name(module: ModuleType) -> str:
+    """The name of a consumed service or action: the last part of the name
+    of its generated module."""
+
+    return module.__name__.rsplit(".", 1)[-1]
+
+
+def _summary(name: str, fields: dict) -> str:
+    """What a call asked, as its log lines open with it."""
+
+    return f"{name}({', '.join(f'{key}={value}' for key, value in fields.items())})"
+
+
 async def _call_service(service, node_runner: NodeRunner, producer, request=None, **context):
     """Poll one service on producer and return its response data.
 
@@ -291,9 +347,8 @@ async def _call_service(service, node_runner: NodeRunner, producer, request=None
     a control is set on).
     """
 
-    name = service.__name__.rsplit(".", 1)[-1]
     fields = {**context, **(vars(request) if request is not None else {})}
-    summary = f"{name}({', '.join(f'{key}={value}' for key, value in fields.items())})"
+    summary = _summary(_endpoint_name(service), fields)
     arguments = (request,) if request is not None else ()
 
     response = await service.poll(
@@ -378,17 +433,144 @@ _CAMERA_CONTROLS = {
 # ---------------------------------------------------------------------------
 
 
-async def _run_action(action, node_runner: NodeRunner, request=None, **fields):
-    """Fire one scene_manipulation goal and return its result data.
+@dataclass(frozen=True)
+class _Progress:
+    """One progress message of a load or a spawn.
 
-    Every goal that completes leaves one log line naming what was asked and
-    what the provider answered. Rejections and failures raise with the
-    provider's reason; the HTTP layer logs them.
+    bytes_fetched counts the bytes of the asset files received so far,
+    files_ready the files found in the simulator's cache or received whole,
+    and building is true once every file is ready and the simulator builds.
     """
 
-    name = action.__name__.rsplit(".", 1)[-1]
-    summary = f"{name}({', '.join(f'{key}={value}' for key, value in fields.items())})"
+    bytes_fetched: int
+    files_ready: int
+    building: bool
 
+    @classmethod
+    def parse(cls, message) -> _Progress:
+        return cls(
+            bytes_fetched=message.bytes_fetched,
+            files_ready=message.files_ready,
+            building=message.building,
+        )
+
+
+class _Goal:
+    """One goal the provider admitted: its action and name, the handle on
+    it, and what was asked (the summary its log lines open with).
+
+    A cancel counts once the provider answered it: cancel_answer holds that
+    answer, a CancelState of the action, and cancelled_by who in this
+    commander sent it, when the provider signalled it to the goal.
+    found_over is set once a delivered cancel found the goal over: ended
+    already, or unknown to the provider.
+    """
+
+    def __init__(self, action, name: str, handle, summary: str) -> None:
+        self.action = action
+        self.name = name
+        self.handle = handle
+        self.summary = summary
+        self.cancel_answer = None
+        self.cancelled_by: Canceller | None = None
+        self.found_over = asyncio.Event()
+        self._cancelling = asyncio.Lock()
+
+    async def cancel(self, by: Canceller, why: str):
+        """Ask the provider to cancel the goal, and return its answer.
+
+        Once a cancel was delivered, a later call sends nothing and returns
+        the same answer. A cancel that does not reach the provider is logged
+        and raises CancelNotDelivered; the next call sends it again.
+        """
+
+        async with self._cancelling:
+            if self.cancel_answer is not None:
+                return self.cancel_answer
+
+            try:
+                reply = await self.handle.cancel_goal(timeout=SERVICE_TIMEOUT_S)
+
+            except (TimeoutError, ConnectionError) as exc:
+                not_delivered = CancelNotDelivered(self.name, exc)
+                logger.warning("%s: %s; %s", self.summary, why, not_delivered.outcome)
+                raise not_delivered from exc
+
+            logger.info("%s: %s; cancel %s", self.summary, why, reply.state.name)
+            self.cancel_answer = reply.state
+
+            if reply.state == self.action.CancelState.SIGNALLED:
+                self.cancelled_by = by
+            else:
+                self.found_over.set()
+
+            return reply.state
+
+    async def result_found_over(self):
+        """The result of a goal a delivered cancel found over, which the
+        provider answers at once; a goal it does not know has none."""
+
+        if self.cancel_answer == self.action.CancelState.UNKNOWN:
+            raise RuntimeError(f"{self.name}: the simulator does not know the goal")
+
+        return await self.handle.get_result(timeout=SERVICE_TIMEOUT_S)
+
+    def stall(self, outcome: str) -> str:
+        """The end of a load or a spawn that made no progress for a window."""
+
+        return f"{self.name} made no progress for {PROGRESS_TIMEOUT_S:g} s; {outcome}"
+
+    def data(self, result):
+        """The data of a goal that succeeded.
+
+        A provider may run a cancelled goal to its end and answer CANCELLED
+        with success: what it built stands, so the goal succeeded. Every
+        goal that succeeds leaves one log line naming what was asked and
+        what the provider answered. A goal that ended any other way raises
+        with the reason; the HTTP layer logs it.
+        """
+
+        status = self.action.ResultStatus
+
+        if result.status not in (status.COMPLETED, status.CANCELLED):
+            raise RuntimeError(f"{self.name} did not complete: {result.status.name}")
+
+        if result.data is not None and result.data.success:
+            logger.info("%s: %s", self.summary, result.data.message)
+
+            return result.data
+
+        if result.status == status.CANCELLED:
+            raise self._cancelled(result.data)
+
+        if result.data is None:
+            raise RuntimeError(f"{self.name} completed without result data")
+
+        raise RuntimeError(result.data.message)
+
+    def _cancelled(self, data) -> GoalCancelled:
+        # This commander reads the end of a goal whose cancel it had
+        # signalled only when it follows its progress: the whole-goal bound
+        # raises at once.
+        if self.cancelled_by == Canceller.COMMANDER:
+            return GoalCancelled(self.stall("it was cancelled"), Canceller.COMMANDER)
+
+        if self.cancelled_by == Canceller.PAGE:
+            return GoalCancelled(f"{self.name} was cancelled from the page", Canceller.PAGE)
+
+        reason = f": {data.message}" if data is not None and data.message else ""
+
+        return GoalCancelled(f"{self.name} was cancelled by the simulator{reason}", Canceller.SIMULATOR)
+
+
+async def _fire_goal(action, node_runner: NodeRunner, request=None, **fields) -> _Goal:
+    """Fire one scene_manipulation goal and return it once admitted.
+
+    A rejection raises with the provider's reason. fields name what was
+    asked, for the log lines of the goal.
+    """
+
+    name = _endpoint_name(action)
     producer = action.bound_producer(node_runner)
     goal = (request,) if request is not None else ()
 
@@ -403,32 +585,142 @@ async def _run_action(action, node_runner: NodeRunner, request=None, **fields):
     if not handle.accepted:
         raise RuntimeError(f"{name} rejected: {handle.reason}")
 
-    result = await handle.get_result(timeout=ACTION_TIMEOUT_S)
-
-    if result.status != action.ResultStatus.COMPLETED:
-        raise RuntimeError(f"{name} did not complete: {result.status.name}")
-
-    if result.data is None:
-        raise RuntimeError(f"{name} completed without result data")
-
-    if not result.data.success:
-        raise RuntimeError(result.data.message)
-
-    logger.info("%s: %s", summary, result.data.message)
-
-    return result.data
+    return _Goal(action, name, handle, _summary(name, fields))
 
 
-async def _action_load_scene(node_runner: NodeRunner, asset_id: str, scale: float) -> dict:
-    data = await _run_action(
+async def _run_action(action, node_runner: NodeRunner, request=None, **fields):
+    """Fire one goal of an action that reports no progress and return its
+    result data.
+
+    The whole goal is bounded by ACTION_TIMEOUT_S: a goal that has not
+    ended by then is cancelled, and the timeout raised. A cancel that finds
+    the goal ended answers with its result instead.
+    """
+
+    goal = await _fire_goal(action, node_runner, request, **fields)
+
+    try:
+        result = await goal.handle.get_result(timeout=ACTION_TIMEOUT_S)
+
+    except TimeoutError as exc:
+        bound = f"{goal.name} did not end within {ACTION_TIMEOUT_S:g} s"
+
+        try:
+            answer = await goal.cancel(Canceller.COMMANDER, f"no result within {ACTION_TIMEOUT_S:g} s")
+
+        except CancelNotDelivered as not_delivered:
+            raise TimeoutError(f"{bound}; {not_delivered.outcome}") from exc
+
+        if answer == goal.action.CancelState.SIGNALLED:
+            raise TimeoutError(f"{bound}; a cancel was sent") from exc
+
+        result = await goal.result_found_over()
+
+    return goal.data(result)
+
+
+async def _follow_progress(
+    goal: _Goal,
+    silence: Callable[[float], Awaitable[None]],
+    on_progress: Callable[[_Progress], Awaitable[None]],
+):
+    """Follow a load or a spawn until it ends, and return its result data.
+
+    Each progress message is handed to on_progress and starts the silence
+    window again: `silence` waits out PROGRESS_TIMEOUT_S. A window without
+    a message has the goal cancelled, unless a cancel was delivered
+    already, and the goal is followed on under the same rule to report how
+    it really ended; the next silent window ends the follow (see
+    _end_silent_follow). The feedback stream ends with the goal, whose
+    result the provider then answers at once. A cancel from here or from
+    the page that finds the goal over asks for its result at once too. A
+    provider that is gone ends the follow at once: it has no result left to
+    ask for.
+    """
+
+    next_message = asyncio.ensure_future(goal.handle.on_next_feedback_message())
+    found_over = asyncio.ensure_future(goal.found_over.wait())
+    stalled = False
+
+    try:
+        while True:
+            window = asyncio.ensure_future(silence(PROGRESS_TIMEOUT_S))
+
+            try:
+                await asyncio.wait((next_message, found_over, window), return_when=asyncio.FIRST_COMPLETED)
+
+            finally:
+                window.cancel()
+
+            if found_over.done():
+                return goal.data(await goal.result_found_over())
+
+            if not next_message.done():
+                if stalled:
+                    return await _end_silent_follow(goal)
+
+                stalled = True
+
+                # A cancel that is not delivered is logged, and sent again
+                # when the next silent window ends the follow.
+                with contextlib.suppress(CancelNotDelivered):
+                    await goal.cancel(Canceller.COMMANDER, f"no progress for {PROGRESS_TIMEOUT_S:g} s")
+
+                continue
+
+            try:
+                message = next_message.result()
+
+            except ConnectionError as exc:
+                raise ConnectionError(f"{goal.name} ended: the simulator is gone") from exc
+
+            except RuntimeError:
+                # The end of the stream: the goal has ended.
+                break
+
+            next_message = asyncio.ensure_future(goal.handle.on_next_feedback_message())
+            await on_progress(_Progress.parse(message))
+
+    finally:
+        next_message.cancel()
+        found_over.cancel()
+
+    return goal.data(await goal.handle.get_result(timeout=SERVICE_TIMEOUT_S))
+
+
+async def _end_silent_follow(goal: _Goal):
+    """End the follow of a goal that stayed silent for a second window
+    since its stall cancel, and return its result data if it has ended.
+
+    When a cancel was delivered, the simulator did not answer it, and the
+    follow ends. When none was, the cancel is sent again, once: the end
+    says whether the simulator took it, and a goal it finds over is
+    answered with its result.
+    """
+
+    if goal.cancel_answer is not None:
+        raise TimeoutError(goal.stall("a cancel was sent and the simulator did not answer"))
+
+    try:
+        await goal.cancel(Canceller.COMMANDER, f"no progress for {PROGRESS_TIMEOUT_S:g} s again")
+
+    except CancelNotDelivered as exc:
+        raise TimeoutError(goal.stall(f"the cancel was sent again and was not delivered: {exc.reason}")) from exc
+
+    if goal.found_over.is_set():
+        return goal.data(await goal.result_found_over())
+
+    raise TimeoutError(goal.stall("the cancel was sent again and the simulator took it"))
+
+
+async def _fire_load_scene(node_runner: NodeRunner, asset_id: str, scale: float) -> _Goal:
+    return await _fire_goal(
         load_scene,
         node_runner,
-        load_scene.GoalRequest(asset_id=asset_id, scale=float(scale)),
+        load_scene.GoalRequest(asset_id=asset_id, scale=scale),
         asset_id=asset_id,
-        scale=float(scale),
+        scale=scale,
     )
-
-    return {"success": True, "message": data.message}
 
 
 async def _action_clear_scene(node_runner: NodeRunner) -> dict:
@@ -437,17 +729,8 @@ async def _action_clear_scene(node_runner: NodeRunner) -> dict:
     return {"success": True, "message": data.message}
 
 
-async def _action_spawn_object(node_runner: NodeRunner, payload: dict) -> dict:
-    request = spawn_object.GoalRequest(
-        asset_id=str(payload["asset_id"]),
-        position=[float(value) for value in payload["position"]],
-        yaw=float(payload.get("yaw", 0.0)),
-        scale=float(payload.get("scale", 1.0)),
-        physics=str(payload.get("physics", "none")),
-        mass=float(payload.get("mass", 0.1)),
-    )
-
-    data = await _run_action(
+async def _fire_spawn_object(node_runner: NodeRunner, request) -> _Goal:
+    return await _fire_goal(
         spawn_object,
         node_runner,
         request,
@@ -457,8 +740,6 @@ async def _action_spawn_object(node_runner: NodeRunner, payload: dict) -> dict:
         physics=request.physics,
         mass=request.mass,
     )
-
-    return {"success": True, "message": data.message, "object_id": data.object_id}
 
 
 async def _action_apply_force(node_runner: NodeRunner, payload: dict) -> dict:
@@ -535,18 +816,42 @@ async def _action_move_robot(
 # ---------------------------------------------------------------------------
 
 
+class _StreamedGoals:
+    """The goals this commander streams to a page, by the id each stream
+    opens with; the cancel route finds a goal here while its stream runs."""
+
+    def __init__(self) -> None:
+        self._goals: dict[str, _Goal] = {}
+        self._ids = itertools.count(1)
+
+    def add(self, goal: _Goal) -> str:
+        goal_id = str(next(self._ids))
+        self._goals[goal_id] = goal
+
+        return goal_id
+
+    def find(self, goal_id: str) -> _Goal | None:
+        return self._goals.get(goal_id)
+
+    def remove(self, goal_id: str) -> None:
+        del self._goals[goal_id]
+
+
 _NODE_RUNNER = web.AppKey("node_runner", NodeRunner)
 _CAPABILITIES = web.AppKey("capabilities", _Capabilities)
 _CATALOGUE = web.AppKey("catalogue", _StateWatch)
 _OBJECT_STATE = web.AppKey("object_state", _StateWatch)
 # One profile watch per bound camera, by camera id.
 _PROFILES = web.AppKey("profiles", dict)
+# The wait of a load's or a spawn's silence window.
+_SILENCE = web.AppKey[Callable[[float], Awaitable[None]]]("silence")
+_STREAMED_GOALS = web.AppKey("streamed_goals", _StreamedGoals)
 
 
-def _json_error(request: web.Request, exc: Exception, status: int = 400) -> web.Response:
-    # Bad input and provider refusals are one line each; anything else is a
-    # bug in this node and keeps its traceback.
-    expected = isinstance(exc, (ValueError, KeyError, RuntimeError, TimeoutError))
+def _log_failure(request: web.Request, exc: Exception) -> None:
+    # Bad input, provider refusals and goals that did not succeed are one
+    # line each; anything else is a bug in this node and keeps its traceback.
+    expected = isinstance(exc, (ValueError, KeyError, RuntimeError, TimeoutError, ConnectionError))
 
     logger.warning(
         "%s %s failed: %s",
@@ -556,13 +861,119 @@ def _json_error(request: web.Request, exc: Exception, status: int = 400) -> web.
         exc_info=None if expected else exc,
     )
 
+
+def _failure(exc: Exception) -> dict:
     body = {"success": False, "message": str(exc)}
 
     # A refused setter answers with what stands, as the provider reported it.
     if isinstance(exc, ProviderRefusal):
         body.update(exc.current)
 
-    return web.json_response(body, status=status)
+    if isinstance(exc, GoalCancelled):
+        body["cancelled_by"] = exc.by
+
+    return body
+
+
+def _json_error(request: web.Request, exc: Exception, status: int = 400) -> web.Response:
+    _log_failure(request, exc)
+
+    return web.json_response(_failure(exc), status=status)
+
+
+class _GoalStream:
+    """The answer of an admitted load or spawn: one JSON line per event.
+
+    aiohttp leaves a handler running when its page goes away, and the
+    handler learns it from a write; no line is written after one the page
+    could not take. A line written while the goal is followed has the goal
+    cancelled then. The result line comes once the follow has ended, so a
+    page that cannot take it cancels nothing, and its close is logged.
+    """
+
+    def __init__(self, request: web.Request, goal: _Goal) -> None:
+        self.response = web.StreamResponse()
+        self.response.content_type = "application/x-ndjson"
+        self._request = request
+        self._goal = goal
+        self._page_open = True
+
+    async def write(self, line: dict) -> None:
+        """Write a line of a goal this commander follows."""
+
+        if not await self._write_finds_page_gone(line):
+            return
+
+        # A page that goes away cancels its goal, as an MCP client that
+        # disconnects cancels its call: nobody follows the goal any more,
+        # and a fetch nobody watches would keep the simulator's link busy. A
+        # cancel that is not delivered is logged, and the goal is followed
+        # to its end under the silence rule.
+        with contextlib.suppress(CancelNotDelivered):
+            await self._goal.cancel(Canceller.PAGE, "the page closed its stream")
+
+    async def progress(self, progress: _Progress) -> None:
+        await self.write({"progress": asdict(progress)})
+
+    async def write_result(self, result: dict) -> None:
+        """Write the last line, once the follow of the goal has ended."""
+
+        if await self._write_finds_page_gone(result):
+            logger.info("%s: the page closed its stream before its result", self._goal.summary)
+
+    async def _write_finds_page_gone(self, line: dict) -> bool:
+        """Write one line to the page, and return whether this write found
+        the page gone. A page found gone before gets no line."""
+
+        if not self._page_open:
+            return False
+
+        try:
+            if not self.response.prepared:
+                await self.response.prepare(self._request)
+
+            await self.response.write(json.dumps(line).encode() + b"\n")
+
+        except ConnectionError:
+            self._page_open = False
+
+            return True
+
+        return False
+
+
+async def _stream_goal(
+    request: web.Request, goal: _Goal, answer: Callable[[object], dict]
+) -> web.StreamResponse:
+    """Follow an admitted load or spawn and stream it to the page.
+
+    The page reads the goal's id first, which the cancel route takes, then
+    one line per progress message, and last the result: `answer` builds it
+    from the result data, and a goal that did not succeed ends the stream
+    with its failure, as a JSON answer carries one.
+    """
+
+    goals = request.app[_STREAMED_GOALS]
+    goal_id = goals.add(goal)
+    stream = _GoalStream(request, goal)
+
+    try:
+        await stream.write({"goal": goal_id})
+
+        try:
+            data = await _follow_progress(goal, request.app[_SILENCE], stream.progress)
+            result = answer(data)
+
+        except Exception as exc:
+            _log_failure(request, exc)
+            result = _failure(exc)
+
+        await stream.write_result(result)
+
+    finally:
+        goals.remove(goal_id)
+
+    return stream.response
 
 
 async def _request_json(request: web.Request) -> dict:
@@ -610,13 +1021,18 @@ def _vector(payload: dict, key: str, length: int) -> list[float]:
     return [float(value) for value in values]
 
 
+def _one_of(payload: dict, key: str, choices: tuple[str, ...]) -> str:
+    value = payload.get(key)
+
+    if value not in choices:
+        quoted = [f'"{choice}"' for choice in choices]
+        raise ValueError(f"{key} must be {', '.join(quoted[:-1])} or {quoted[-1]}")
+
+    return value
+
+
 def _mode(payload: dict) -> str:
-    mode = payload.get("mode")
-
-    if mode not in ("auto", "manual"):
-        raise ValueError('mode must be "auto" or "manual"')
-
-    return mode
+    return _one_of(payload, "mode", ("auto", "manual"))
 
 
 def _name(payload: dict, key: str) -> str:
@@ -626,6 +1042,36 @@ def _name(payload: dict, key: str) -> str:
         raise ValueError(f"{key} must be a non-empty string")
 
     return value
+
+
+def _optional(parse: Callable[[dict, str], object], payload: dict, key: str, default):
+    """A field the payload may leave out: parsed by `parse` when present,
+    `default` when absent."""
+
+    return parse(payload, key) if key in payload else default
+
+
+# The physics a spawned object takes, as scene_manipulation names them.
+_PHYSICS = ("dynamic", "static", "none")
+
+
+def _physics(payload: dict, key: str) -> str:
+    return _one_of(payload, key, _PHYSICS)
+
+
+def _spawn_request(payload: dict):
+    """The spawn_object goal the page's payload asks for, every field
+    parsed. A field it leaves out gives an object as authored, visual
+    only, with the page's default mass."""
+
+    return spawn_object.GoalRequest(
+        asset_id=_name(payload, "asset_id"),
+        position=_vector(payload, "position", 3),
+        yaw=_optional(_number, payload, "yaw", 0.0),
+        scale=_optional(_number, payload, "scale", 1.0),
+        physics=_optional(_physics, payload, "physics", "none"),
+        mass=_optional(_number, payload, "mass", 0.1),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -811,20 +1257,20 @@ async def _api_objects(request: web.Request) -> web.Response:
     )
 
 
-async def _api_load_scene(request: web.Request) -> web.Response:
+async def _api_load_scene(request: web.Request) -> web.StreamResponse:
     try:
         payload = await _request_json(request)
 
-        result = await _action_load_scene(
+        goal = await _fire_load_scene(
             request.app[_NODE_RUNNER],
-            str(payload["asset_id"]),
-            float(payload.get("scale", 1.0)),
+            _name(payload, "asset_id"),
+            _optional(_number, payload, "scale", 1.0),
         )
 
     except Exception as exc:
         return _json_error(request, exc)
 
-    return web.json_response(result)
+    return await _stream_goal(request, goal, lambda data: {"success": True, "message": data.message})
 
 
 async def _api_clear_scene(request: web.Request) -> web.Response:
@@ -837,19 +1283,45 @@ async def _api_clear_scene(request: web.Request) -> web.Response:
     return web.json_response(result)
 
 
-async def _api_spawn_object(request: web.Request) -> web.Response:
+async def _api_spawn_object(request: web.Request) -> web.StreamResponse:
     try:
-        payload = await _request_json(request)
-        payload["position"] = _vector(payload, "position", 3)
-        if "yaw" in payload:
-            payload["yaw"] = _number(payload, "yaw")
-
-        result = await _action_spawn_object(request.app[_NODE_RUNNER], payload)
+        goal = await _fire_spawn_object(
+            request.app[_NODE_RUNNER],
+            _spawn_request(await _request_json(request)),
+        )
 
     except Exception as exc:
         return _json_error(request, exc)
 
-    return web.json_response(result)
+    return await _stream_goal(
+        request,
+        goal,
+        lambda data: {"success": True, "message": data.message, "object_id": data.object_id},
+    )
+
+
+async def _api_cancel_goal(request: web.Request) -> web.Response:
+    """Cancel a load or a spawn by the id its stream opened with; a stream
+    still open then ends with how the goal really ended. A cancel that does
+    not reach the simulator answers 502 with the reason, and a caller may
+    send it again while the stream runs."""
+
+    goal_id = request.match_info["goal"]
+    goal = request.app[_STREAMED_GOALS].find(goal_id)
+
+    if goal is None:
+        return _json_error(request, ValueError(f"no running goal {goal_id}"), status=404)
+
+    try:
+        answer = await goal.cancel(Canceller.PAGE, "the page asked")
+
+    except CancelNotDelivered as exc:
+        # The cancel logged why it was not delivered.
+        return web.json_response(_failure(exc), status=502)
+
+    return web.json_response(
+        {"success": True, "message": f"the simulator answered the cancel of {goal.name}: {answer.name}"}
+    )
 
 
 async def _api_apply_force(request: web.Request) -> web.Response:
@@ -1335,6 +1807,7 @@ select:disabled {
 <button onclick="loadScene()">Load Scene</button>
 <button class="danger" onclick="clearScene()">Clear Scene</button>
 </div>
+<button id="cancelLoad" class="danger" onclick="cancelSceneLoad()" hidden>Cancel Load</button>
 </section>
 
 
@@ -1524,6 +1997,75 @@ async function api(path, options={}) {
     return data;
 }
 
+// A load or a spawn the simulator accepted answers with one JSON line per
+// event: {"goal": id} first, then {"progress": {...}} each time the
+// simulator reports progress, and last the result, shaped as the other
+// actions answer. A refusal answers before any line, as they do. The
+// stream holds its connection to the commander until its result, or until
+// `signal` aborts it.
+async function runGoal(path, body, { onProgress, onGoal = () => {}, signal }) {
+    const response = await fetch(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal
+    });
+
+    if (!response.ok) {
+        const data = await response.json();
+        throw new Error(data.message || `HTTP ${response.status}`);
+    }
+
+    for await (const line of jsonLines(response.body)) {
+        if ("goal" in line) {
+            onGoal(line.goal);
+        }
+        else if ("progress" in line) {
+            onProgress(line.progress);
+        }
+        else {
+            return line;
+        }
+    }
+
+    throw new Error(`${path} ended without a result`);
+}
+
+// The JSON lines of a streamed answer, each parsed once it is whole.
+async function* jsonLines(body) {
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    let pending = "";
+
+    for (;;) {
+        const { done, value } = await reader.read();
+        pending += done ? decoder.decode() : decoder.decode(value, { stream: true });
+
+        const lines = pending.split("\n");
+        pending = done ? "" : lines.pop();
+
+        for (const line of lines.filter(line => line.trim())) {
+            yield JSON.parse(line);
+        }
+
+        if (done) {
+            return;
+        }
+    }
+}
+
+// What the status says of a load in progress: the bytes and the files
+// ready while the simulator fetches, then that it builds.
+function progressText(progress, loading, building) {
+    if (progress.building) {
+        return building;
+    }
+
+    const megabytes = (progress.bytes_fetched / 1e6).toFixed(1);
+
+    return `${loading}: ${megabytes} MB, ${progress.files_ready} files`;
+}
+
 async function refreshAssets() {
     const data = await api("/api/assets");
 
@@ -1637,25 +2179,92 @@ function renderAssets() {
         `${filtered.length} matching assets`;
 }
 
+// The newest scene load this page started that the commander accepted,
+// with its goal id and the controller that aborts the page's stream of
+// it. Only that load speaks in the status and has the Cancel button: a
+// load started before it ends in silence here, however it ends, a newer
+// load the commander refuses leaves it running, and a load the page
+// cancels leaves the status to its cancel.
+let sceneLoad = null;
+
 async function loadScene() {
+    const load = { goal: null, stream: new AbortController() };
+    const newest = () => sceneLoad === load;
+
     try {
         status("Loading scene...");
 
-        const data = await api("/api/scene/load", {
-            method: "POST",
-            body: JSON.stringify({
-                asset_id: el("sceneSelect").value,
-                scale: number("sceneScale")
-            })
+        const result = await runGoal("/api/scene/load", {
+            asset_id: el("sceneSelect").value,
+            scale: number("sceneScale")
+        }, {
+            onProgress: progress => {
+                if (newest()) {
+                    status(progressText(progress, "Loading scene", "Building the scene"));
+                }
+            },
+            onGoal: goal => {
+                load.goal = goal;
+                sceneLoad = load;
+                el("cancelLoad").hidden = false;
+            },
+            signal: load.stream.signal
         });
+
+        if (!newest()) {
+            return;
+        }
+
+        if (!result.success) {
+            throw new Error(result.message);
+        }
 
         await refreshObjects();
         await refreshPanels();
 
-        status(data.message);
+        status(result.message);
     }
     catch (err) {
-        status(err.message, true);
+        // A load the commander refused was never the newest, and says why.
+        if (load.goal === null || newest()) {
+            status(err.message, true);
+        }
+    }
+    finally {
+        if (newest()) {
+            sceneLoad = null;
+            el("cancelLoad").hidden = true;
+        }
+    }
+}
+
+// Cancel first aborts the page's own stream of the load, which frees its
+// connection at once: a browser keeps six connections at most to the
+// commander, and each load or spawn holds one until its result, so the
+// cancel never waits behind them. The commander then cancels the load for
+// the cancel route, and also when the next line of the aborted stream
+// finds the page gone. With its stream aborted, the page does not read how
+// the load ends: the answer to the cancel speaks in the status, unless the
+// commander has accepted a newer load since.
+async function cancelSceneLoad() {
+    const load = sceneLoad;
+
+    if (load === null) {
+        return;
+    }
+
+    sceneLoad = null;
+    el("cancelLoad").hidden = true;
+    load.stream.abort();
+    status("Cancelling the scene load...");
+
+    const [message, failed] = await api(`/api/goals/${encodeURIComponent(load.goal)}/cancel`, {
+        method: "POST",
+        body: "{}"
+    }).then(data => [data.message, false], err => [err.message, true]);
+
+    if (sceneLoad === null) {
+        status(message, failed);
     }
 }
 
@@ -1688,22 +2297,27 @@ async function spawnObject() {
 
         status(`Spawning ${assetId}...`);
 
-        const data = await api("/api/objects/spawn", {
-            method: "POST",
-            body: JSON.stringify({
-                asset_id: assetId,
-                position: position("spawn"),
-                yaw: number("spawnYaw"),
-                scale: number("spawnScale"),
-                physics: el("spawnPhysics").value,
-                mass: number("spawnMass")
-            })
+        const result = await runGoal("/api/objects/spawn", {
+            asset_id: assetId,
+            position: position("spawn"),
+            yaw: number("spawnYaw"),
+            scale: number("spawnScale"),
+            physics: el("spawnPhysics").value,
+            mass: number("spawnMass")
+        }, {
+            onProgress: progress => {
+                status(progressText(progress, `Loading ${assetId}`, `Building ${assetId}`));
+            }
         });
+
+        if (!result.success) {
+            throw new Error(result.message);
+        }
 
         await refreshObjects();
 
         status(
-            `${data.message}\nobject_id=${data.object_id}`
+            `${result.message}\nobject_id=${result.object_id}`
         );
     }
     catch (err) {
@@ -2482,11 +3096,16 @@ async def _index(_request: web.Request) -> web.Response:
 # ---------------------------------------------------------------------------
 
 
-def _build_app(node_runner: NodeRunner) -> web.Application:
+def _build_app(
+    node_runner: NodeRunner,
+    silence: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> web.Application:
     capabilities = _probe_capabilities(node_runner)
     app = web.Application()
 
     app[_NODE_RUNNER] = node_runner
+    app[_SILENCE] = silence
+    app[_STREAMED_GOALS] = _StreamedGoals()
     app[_CAPABILITIES] = capabilities
     app[_CATALOGUE] = _StateWatch("catalogue", "assets")
     app[_OBJECT_STATE] = _StateWatch("object state", "runtime objects")
@@ -2503,6 +3122,7 @@ def _build_app(node_runner: NodeRunner) -> web.Application:
     app.router.add_post("/api/scene/load", _api_load_scene)
     app.router.add_post("/api/scene/clear", _api_clear_scene)
     app.router.add_post("/api/objects/spawn", _api_spawn_object)
+    app.router.add_post("/api/goals/{goal}/cancel", _api_cancel_goal)
     app.router.add_post("/api/objects/force", _api_apply_force)
     app.router.add_post("/api/objects/move", _api_move_object)
     app.router.add_post("/api/objects/remove", _api_remove_object)

@@ -325,6 +325,28 @@ The scene ids and the Isaac Sim paths behind them are in
 so loading one leaves them where they are; `load_scene` and `clear_scene`
 remove every object scene_manipulation spawned.
 
+### Progress of a load or a spawn
+
+A `load_scene` or `spawn_object` goal reports its progress on its feedback
+in two messages. The first, sent as the goal is accepted and before its
+command is queued, has `bytes_fetched` 0, `files_ready` 0 and `building`
+false. The second, with `building` true, is sent once the Isaac main thread
+starts the command. Isaac fetches no file itself, so both counts stay 0, and
+the goal sends no other progress message.
+
+So the goal is silent while its command waits for the main thread behind
+the commands queued before it, and while USD resolves the scene or the
+object from Isaac's asset root, a remote root included. A caller that bounds
+the silence since the last message, as the scene commander does, bounds that
+step too: a resolve that stays silent for longer than the caller's window is
+reported as stalled, and the caller cancels the goal. A cancel does not stop
+a command: the scene or the object still loads, and the goal ends as
+cancelled with the command's result.
+
+Each message waits at most 5 s to be sent. When one is not sent in that
+time, the goal sends no more progress messages, and the command runs and
+completes the goal as usual.
+
 ## Robot asset bundles
 
 The Isaac base image downloads one complete, prepared bundle per robot from
