@@ -44,6 +44,14 @@ name: Tests
 # the push to main is what keeps it current. A pull request from a fork runs
 # on the same runners, so what holds fork code is the repository's fork-PR
 # approval gate.
+#
+# Each job runs on a RunsOn spot instance in attempts 1 and 2 of its run, and
+# on an on-demand instance from attempt 3. When AWS interrupts a spot
+# instance, RunsOn runs the failed jobs again in the next attempt, but only
+# after attempt 1 or 2. A re-run is also an attempt, and the merge-set bot of
+# peppy re-runs this workflow to test a new commit of another branch of its
+# set. So each runs-on label adds spot=false from attempt 3, and AWS cannot
+# interrupt a job that RunsOn does not run again.
 on:
   push:
     branches: [main]
@@ -66,7 +74,7 @@ jobs:
   wait-for-peppy:
     name: Wait for the peppy dev build
     # The smallest RunsOn runner, 1 vCPU: the job only looks for the build.
-    runs-on: runs-on=${{ github.run_id }}/runner=peppy-ci-ubuntu-24.04-x86_64/image=peppy-ubuntu24/cpu=1/ram=2+4/family=c8a+c7a+m8a+m7a  # custom Peppy AMI
+    runs-on: runs-on=${{ github.run_id }}/runner=peppy-ci-ubuntu-24.04-x86_64/image=peppy-ubuntu24/cpu=1/ram=2+4/family=c8a+c7a+m8a+m7a${{ fromJSON(github.run_attempt) >= 3 && '/spot=false' || '' }}  # custom Peppy AMI
     # The action stops its wait after 20 minutes.
     timeout-minutes: 25
     permissions:
@@ -97,7 +105,7 @@ jobs:
     # The smallest RunsOn runner: the check is a filesystem walk. A pull
     # request from a fork runs on the same runners, so what holds fork code is
     # the repository's fork-PR approval gate.
-    runs-on: runs-on=${{ github.run_id }}/runner=peppy-ci-ubuntu-24.04-x86_64/image=peppy-ubuntu24/cpu=2/ram=4+8/family=c8a+c7a+m8a+m7a  # custom Peppy AMI
+    runs-on: runs-on=${{ github.run_id }}/runner=peppy-ci-ubuntu-24.04-x86_64/image=peppy-ubuntu24/cpu=2/ram=4+8/family=c8a+c7a+m8a+m7a${{ fromJSON(github.run_attempt) >= 3 && '/spot=false' || '' }}  # custom Peppy AMI
     # Nothing here legitimately takes minutes; a hung step should fail fast
     # rather than hold a runner for the default six hours.
     timeout-minutes: 15
@@ -127,7 +135,7 @@ jobs:
 
   python-syntax:
     name: Python syntax
-    runs-on: runs-on=${{ github.run_id }}/runner=peppy-ci-ubuntu-24.04-x86_64/image=peppy-ubuntu24/cpu=2/ram=4+8/family=c8a+c7a+m8a+m7a  # custom Peppy AMI
+    runs-on: runs-on=${{ github.run_id }}/runner=peppy-ci-ubuntu-24.04-x86_64/image=peppy-ubuntu24/cpu=2/ram=4+8/family=c8a+c7a+m8a+m7a${{ fromJSON(github.run_attempt) >= 3 && '/spot=false' || '' }}  # custom Peppy AMI
     timeout-minutes: 5
     permissions:
       contents: read
@@ -154,7 +162,7 @@ jobs:
 
   javascript-typescript:
     name: JavaScript and TypeScript tests
-    runs-on: runs-on=${{ github.run_id }}/runner=peppy-ci-ubuntu-24.04-x86_64/image=peppy-ubuntu24/cpu=2/ram=4+8/family=c8a+c7a+m8a+m7a  # custom Peppy AMI
+    runs-on: runs-on=${{ github.run_id }}/runner=peppy-ci-ubuntu-24.04-x86_64/image=peppy-ubuntu24/cpu=2/ram=4+8/family=c8a+c7a+m8a+m7a${{ fromJSON(github.run_attempt) >= 3 && '/spot=false' || '' }}  # custom Peppy AMI
     timeout-minutes: 15
     permissions:
       contents: read
@@ -186,7 +194,7 @@ jobs:
     # this job onto an arm runner starts from an empty cache rather than a
     # wrong-arch one. The base images and the librealsense apt repository are
     # published for both.
-    runs-on: runs-on=${{ github.run_id }}/runner=peppy-ci-ubuntu-24.04-x86_64/image=peppy-ubuntu24/cpu=8/ram=16+32/family=c8a+c7a+m8a+m7a/volume=60gb:gp3:500mbs:6000iops/sticky=node-tests:200gb  # custom Peppy AMI
+    runs-on: runs-on=${{ github.run_id }}/runner=peppy-ci-ubuntu-24.04-x86_64/image=peppy-ubuntu24/cpu=8/ram=16+32/family=c8a+c7a+m8a+m7a/volume=60gb:gp3:500mbs:6000iops/sticky=node-tests:200gb${{ fromJSON(github.run_attempt) >= 3 && '/spot=false' || '' }}  # custom Peppy AMI
     # A cold run compiles nine crates' full dependency trees and resolves
     # lerobot's, torch included. The sticky disk keeps warm runs far under
     # this, but a run that starts from an empty disk is legitimately slow.
@@ -312,7 +320,7 @@ jobs:
     # cancelled job would leave this check unreported instead of red.
     if: always()
     # The smallest RunsOn runner: the job reads the results of the others.
-    runs-on: runs-on=${{ github.run_id }}/runner=peppy-ci-ubuntu-24.04-x86_64/image=peppy-ubuntu24/cpu=2/ram=4+8/family=c8a+c7a+m8a+m7a  # custom Peppy AMI
+    runs-on: runs-on=${{ github.run_id }}/runner=peppy-ci-ubuntu-24.04-x86_64/image=peppy-ubuntu24/cpu=2/ram=4+8/family=c8a+c7a+m8a+m7a${{ fromJSON(github.run_attempt) >= 3 && '/spot=false' || '' }}  # custom Peppy AMI
     timeout-minutes: 5
     permissions: {}
 
