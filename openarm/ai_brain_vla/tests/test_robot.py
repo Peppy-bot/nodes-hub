@@ -97,6 +97,22 @@ async def test_a_stop_cancels_the_move_in_flight_and_reports_it_cancelled():
         await asyncio.wait_for(robot.stop(), WAIT)
 
 
+async def test_a_move_the_backbone_stops_reports_the_stops_message_without_a_cancel():
+    """The backbone's stop service ends a move as cancelled with no cancel
+    from the brain: the move fails with the stop's message, so a backend
+    sees it fail and does not go on."""
+    async with booted() as h:
+        robot = Robot(h.node_runner)
+        move = asyncio.create_task(robot.move_arm("left_arm", POSITION, ORIENTATION))
+        pending = await h.mocks.deps.limb_motion.move_arm.next_goal(WAIT)
+        active = await pending.accept()
+        await asyncio.wait_for(in_flight(robot), WAIT)
+        await active.complete_cancelled(arm_result(False, "stopped: the operator asked"))
+        result = await asyncio.wait_for(move, WAIT)
+        assert (result.success, result.message) == (False, "stopped: the operator asked")
+        assert robot.moves_in_flight == 0
+
+
 async def test_a_move_without_a_result_in_time_is_cancelled_and_reported():
     async with booted() as h:
         robot = Robot(h.node_runner, result_timeout_s=0.5)
