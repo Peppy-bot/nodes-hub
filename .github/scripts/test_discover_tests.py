@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """What `discover-tests.py` selects, and what it refuses to leave out."""
 
+import contextlib
 import importlib.util
+import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 
 def load_discovery():
@@ -175,6 +178,40 @@ class TakeInventory(unittest.TestCase):
         self.write("zed_camera/contest_data.py")
         found = discovery.take_inventory(self.root)
         self.assertEqual(found.python_tests, [])
+
+
+class Main(unittest.TestCase):
+    def setUp(self):
+        checkout = tempfile.TemporaryDirectory()
+        self.addCleanup(checkout.cleanup)
+        self.checkout = Path(checkout.name)
+        runner_temp = tempfile.TemporaryDirectory()
+        self.addCleanup(runner_temp.cleanup)
+        self.runner_temp = Path(runner_temp.name)
+
+    def discover(self, changed):
+        environment = {
+            "RUNNER_TEMP": str(self.runner_temp),
+            "GITHUB_OUTPUT": str(self.runner_temp / "output"),
+            "GITHUB_STEP_SUMMARY": str(self.runner_temp / "summary"),
+        }
+        with (
+            contextlib.chdir(self.checkout),
+            mock.patch.dict(os.environ, environment),
+            mock.patch.object(discovery, "changed_files", return_value=changed),
+        ):
+            self.assertEqual(discovery.main(), 0)
+
+    def written(self, name):
+        return (self.runner_temp / name).read_text()
+
+    def test_a_scoped_run_still_lists_every_rust_project(self):
+        for project in ("openarm/arm", "zed_camera"):
+            (self.checkout / project).mkdir(parents=True)
+            (self.checkout / project / "Cargo.toml").write_text("")
+        self.discover(["openarm/arm/src/main.rs"])
+        self.assertEqual(self.written("rust-test-dirs.txt"), "openarm/arm\n")
+        self.assertEqual(self.written("all-rust-projects.txt"), "openarm/arm\nzed_camera\n")
 
 
 if __name__ == "__main__":
