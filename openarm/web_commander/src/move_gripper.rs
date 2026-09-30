@@ -115,7 +115,7 @@ async fn run(
     let (success, summary) = match outcome {
         Ok(r) => match r.outcome {
             ResultOutcome::Completed(data) => {
-                // The backbone reports the command delivered and where the jaws
+                // The backbone reports the jaws standing still and where they
                 // measured; whether that opening is good (a grasp stops short of
                 // a full close on purpose) is this side's call to surface.
                 let msg = if data.success {

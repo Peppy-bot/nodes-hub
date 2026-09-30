@@ -6,7 +6,9 @@ passes through under the end-effector-speed governor (the joints-led
 stream's only limiter; the pose-mode stream's IK output is additionally
 rate-stepped per joint); otherwise silence, and the follower holds. The
 arm and the gripper claim independently, so a long arm move never freezes
-gripper teleop and vice versa.
+gripper teleop and vice versa. A gripper plan owns the gripper past the last
+sample of its ramp: it keeps commanding its target until the measured opening
+stands still.
 
 Fresh follower state gates everything: with the measured stream stale no limb
 gets a setpoint, an active plan fails, and the standing command resets. The
@@ -42,6 +44,18 @@ STALE_WIRE_TIMEOUT_S = 0.25
 # period, because the follower publishes state on its own independent rate;
 # 0.1 s is six periods of the family's validated 60 Hz state stream.
 STALE_FOLLOWER_TIMEOUT_S = 0.1
+# A gripper plan ends when the measured gripper stands still: its opening has
+# stayed within GRIPPER_STILL_FRAC of a reference opening for
+# GRIPPER_STILL_WINDOW_S. 0.2 % of the jaw travel is above measurement noise,
+# and the window outlasts STALE_FOLLOWER_TIMEOUT_S, so an opening that stands
+# through it was reported again while it stood. The three values are the
+# OpenArm backbone's, so move_gripper ends by one rule on both robots.
+GRIPPER_STILL_FRAC = 0.002
+GRIPPER_STILL_WINDOW_S = 0.25
+# A gripper standing still within this of its target reached it: 1 % of the
+# jaw travel. One standing still farther away is held by an object or by the
+# effort ceiling.
+GRIPPER_REACHED_FRAC = 0.01
 
 
 class LatestValue:
@@ -98,18 +112,47 @@ class ArmPlan:
 
 
 @dataclass
+class GripperSettle:
+    """The wait for the measured opening to stand still, once the follower
+    holds the plan's target sample."""
+
+    # When the settle began, on the control tick's clock.
+    began: float
+    # The measured opening the gripper is judged still against, and when it
+    # was taken. The first one is the opening measured as the settle begins.
+    reference: float
+    reference_at: float
+
+    def stands_still(self, measured: float, now: float) -> bool:
+        """Judge one measured opening. One farther than GRIPPER_STILL_FRAC
+        from the reference replaces it and restarts the window; one within it
+        stands still once the reference is GRIPPER_STILL_WINDOW_S old."""
+        if abs(measured - self.reference) > GRIPPER_STILL_FRAC:
+            self.reference = measured
+            self.reference_at = now
+            return False
+        return now - self.reference_at >= GRIPPER_STILL_WINDOW_S
+
+
+@dataclass
 class GripperPlan:
     target: float
-    # Travel budget, sized at admission: a goal that stalls past it fails
-    # instead of holding the busy slot forever. Required at construction,
-    # because a plan that reached the wait with an unset budget would fail
-    # the moment it started.
+    # Travel budget, sized at admission, for the ramp and the settle
+    # together: a goal that stalls past it, or whose gripper never stands
+    # still, fails instead of holding the busy slot forever. Required at
+    # construction, because a plan that reached the wait with an unset budget
+    # would fail the moment it started.
     timeout_s: float
     done: asyncio.Event = field(default_factory=asyncio.Event)
     aborted: bool = False
     failed: str | None = None
     # The opening the ramp stood at when the plan was cut, for reporting.
     frozen: float | None = None
+    # None while the ramp runs.
+    settle: GripperSettle | None = None
+    # The measured opening the gripper stood still at: set, with done, when
+    # the settle ends the plan.
+    settled: float | None = None
 
 
 class Coordinator:
@@ -159,7 +202,6 @@ class Coordinator:
         self._arm_tick_plan: ArmPlan | None = None
         self._arm_completing: ArmPlan | None = None
         self._gripper_tick_plan: GripperPlan | None = None
-        self._gripper_completing: GripperPlan | None = None
         self._arm_busy = False
         self._gripper_busy = False
         self._ik_failing = Latch()
@@ -276,10 +318,13 @@ class Coordinator:
             completing.done.set()
 
     def gripper_published(self, delivered: bool, command: float | None) -> None:
+        """The outcome of publishing this tick's gripper setpoint, and the
+        value that went out. An undelivered sample fails the plan it belonged
+        to, in the ramp and in the settle alike. A delivered one never
+        completes a plan: gripper_tick does, once the follower holds the
+        target sample and the measured opening stands still."""
         plan = self._gripper_tick_plan
-        completing = self._gripper_completing
         self._gripper_tick_plan = None
-        self._gripper_completing = None
         if not delivered:
             frozen = self._commanded_gripper
             self._commanded_gripper = None
@@ -294,8 +339,6 @@ class Coordinator:
             return
         assert command is not None, "a delivered setpoint must name the value that went out"
         self._delivered_gripper = command
-        if plan is not None and completing is not None:
-            completing.done.set()
 
     def release_arm(self) -> None:
         """Called by the action layer once an arm goal reaches a terminal
@@ -383,24 +426,36 @@ class Coordinator:
         return self._commanded_arm
 
     def gripper_tick(self, now: float) -> float | None:
+        """The opening to publish this tick, or None for silence. The caller
+        reports each returned opening's fate through gripper_published.
+
+        A plan runs in two phases. The ramp steps the commanded opening to
+        the target. Once the follower holds the target sample the plan
+        settles: it keeps commanding the target, and ends on the tick the
+        measured opening stands still, which publishes nothing."""
         self._gripper_tick_plan = None
-        self._gripper_completing = None
         self.gripper_tick_stamp_s = None
         plan = self._gripper_plan
         if plan is not None:
             anchor = self.gripper_anchor()
-            if anchor is None:
+            measured = self.measured_gripper.fresh(STALE_FOLLOWER_TIMEOUT_S)
+            if anchor is None or measured is None:
                 self._fail_gripper_plan(plan, "follower state went stale mid-goal")
                 return None
+            if self._gripper_stands_still(plan, measured, now):
+                self._gripper_plan = None
+                # Streamed input that arrived mid-plan must not re-target the
+                # gripper once the goal releases it.
+                self.leader_gripper.clear()
+                plan.settled = measured
+                plan.done.set()
+                return None
             # rate_step returns the target itself once within one tick's
-            # cap, so completion is exact equality, never a snap past it.
+            # cap, so the ramp lands by exact equality, never a snap past it.
+            # Through the settle the anchor is the delivered target, which
+            # the step holds.
             self._commanded_gripper = rate_step(anchor, plan.target, self._gripper_tick_cap)
             self._gripper_tick_plan = plan
-            if self._commanded_gripper == plan.target:
-                self._gripper_plan = None
-                self.leader_gripper.clear()
-                # Completion waits for the target sample's delivery.
-                self._gripper_completing = plan
             return self._commanded_gripper
 
         if self._gripper_busy:
@@ -420,6 +475,17 @@ class Coordinator:
         self._commanded_gripper = rate_step(anchor, desired, self._gripper_tick_cap)
         self.gripper_tick_stamp_s = self.leader_gripper.wire_timestamp_s
         return self._commanded_gripper
+
+    def _gripper_stands_still(self, plan: GripperPlan, measured: float, now: float) -> bool:
+        """Whether the plan ends this tick. Nothing is judged before the
+        follower holds the target sample; the first tick after that begins
+        the settle on the opening measured then."""
+        if self._delivered_gripper != plan.target:
+            return False
+        if plan.settle is None:
+            plan.settle = GripperSettle(began=now, reference=measured, reference_at=now)
+            return False
+        return plan.settle.stands_still(measured, now)
 
     def _streamed_arm_target(self, seed: tuple[float, ...] | None) -> tuple[float, ...] | None:
         """The streamed target, or None for silence. The pose path is best

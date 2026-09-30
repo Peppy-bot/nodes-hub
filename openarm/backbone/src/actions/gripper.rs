@@ -4,8 +4,8 @@
 //! the side's single-flight slot, and
 //! hand the accepted goal to the coordinator over its gripper goal channel. The
 //! coordinator runs the motion through the same per-tick governing as every
-//! other DOF, completes the goal on measured convergence, and releases the busy
-//! slot at the terminal.
+//! other DOF, completes the goal once the measured gripper stands still, and
+//! releases the busy slot at the terminal.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;

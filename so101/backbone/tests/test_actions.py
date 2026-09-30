@@ -4,11 +4,12 @@ naming, and failure-aware completion."""
 
 import asyncio
 import math
+import re
 import time
 from types import SimpleNamespace
 
 import pytest
-from conftest import WIDE_LIMITS, WIDE_REACH, FakeKinematics, make_config
+from conftest import WIDE_LIMITS, WIDE_REACH, FakeKinematics, gripper_step, make_config
 
 from so101_backbone.actions import (
     MAX_REQUESTED_DURATION_S,
@@ -18,7 +19,7 @@ from so101_backbone.actions import (
     Rejection,
     _orientation_note,
 )
-from so101_backbone.coordinator import Coordinator
+from so101_backbone.coordinator import GRIPPER_STILL_WINDOW_S, Coordinator
 
 
 class FakeGoalContext:
@@ -28,6 +29,9 @@ class FakeGoalContext:
         self.completed = None
         self.cancelled = None
         self._cancel = asyncio.Event()
+
+    def request_cancel(self):
+        self._cancel.set()
 
     async def cancel_signal(self):
         await self._cancel.wait()
@@ -57,6 +61,14 @@ async def installed_plan(coordinator):
     return await asyncio.wait_for(poll(), timeout=2.0)
 
 
+def run_gripper_plan_until_still(coordinator, stopped_at):
+    """The control ticks that end an admitted gripper plan: the target sample
+    goes out, then the jaws stand at `stopped_at` through the still window."""
+    gripper_step(coordinator, stopped_at, 0.0)
+    gripper_step(coordinator, stopped_at, 0.5)
+    gripper_step(coordinator, stopped_at, 0.5 + GRIPPER_STILL_WINDOW_S)
+
+
 async def test_gripper_goal_times_out_instead_of_holding_the_slot():
     coordinator, layer = make_layer()
     coordinator.measured_gripper.set(0.0)
@@ -71,6 +83,110 @@ async def test_gripper_goal_times_out_instead_of_holding_the_slot():
     assert "travel budget" in message
     # The gripper slot is free again.
     assert coordinator.try_claim_gripper()
+
+
+async def test_gripper_that_never_stands_still_times_out_instead_of_holding_the_slot(
+    follower_never_stale,
+):
+    coordinator, layer = make_layer()
+    coordinator.measured_gripper.set(1.0)
+    plan = layer._admit_gripper_move(0.5, 0.0)
+    # The target sample goes out and the settle begins before the goal is
+    # driven, so the outcome cannot depend on how the event loop interleaves
+    # the control ticks with the budget.
+    gripper_step(coordinator, 1.0, time.monotonic())
+    gripper_step(coordinator, 0.9, time.monotonic())
+
+    async def keep_the_jaws_moving():
+        # Each tick finds the opening 0.1 away from the tick before.
+        openings = (0.6, 0.7)
+        tick = 0
+        while True:
+            gripper_step(coordinator, openings[tick % 2], time.monotonic())
+            tick += 1
+            await asyncio.sleep(0.001)
+
+    plan.timeout_s = 0.05
+    ctx = FakeGoalContext()
+    control = asyncio.create_task(keep_the_jaws_moving())
+    await layer.drive_gripper(ctx, plan)
+    control.cancel()
+    success, message, _opening, _action_time = ctx.completed
+    assert success is False
+    assert re.fullmatch(
+        r"the gripper still moved \d+\.\d s after the commanded move ended", message
+    )
+    assert coordinator.try_claim_gripper()
+
+
+async def test_gripper_standing_still_on_the_target_completes_the_goal(follower_never_stale):
+    coordinator, layer = make_layer()
+    coordinator.measured_gripper.set(1.0)
+    plan = layer._admit_gripper_move(0.5, 0.0)
+    # 0.495 is inside the reached band around the 0.5 target.
+    run_gripper_plan_until_still(coordinator, stopped_at=0.495)
+    ctx = FakeGoalContext()
+    await layer.drive_gripper(ctx, plan)
+    success, message, opening, _action_time = ctx.completed
+    assert success is True
+    assert message == "move complete"
+    assert opening == 0.495
+    assert coordinator.try_claim_gripper()
+
+
+async def test_gripper_standing_still_short_of_the_target_completes_naming_both_openings(
+    follower_never_stale,
+):
+    coordinator, layer = make_layer()
+    coordinator.measured_gripper.set(1.0)
+    plan = layer._admit_gripper_move(0.5, 0.0)
+    # An object holds the jaws at 0.8: the goal succeeds and says so.
+    run_gripper_plan_until_still(coordinator, stopped_at=0.8)
+    ctx = FakeGoalContext()
+    await layer.drive_gripper(ctx, plan)
+    success, message, opening, _action_time = ctx.completed
+    assert success is True
+    assert message == "move complete: the gripper stopped at 0.800, short of the target 0.500"
+    assert opening == 0.8
+    assert coordinator.try_claim_gripper()
+
+
+async def test_cancel_while_the_gripper_settles_completes_cancelled(follower_never_stale):
+    coordinator, layer = make_layer()
+    coordinator.measured_gripper.set(1.0)
+    plan = layer._admit_gripper_move(0.5, 0.0)
+    # The target sample is out and the jaws are still on their way.
+    gripper_step(coordinator, 1.0, 0.0)
+    gripper_step(coordinator, 0.9, 0.5)
+    ctx = FakeGoalContext()
+    ctx.request_cancel()
+    await layer.drive_gripper(ctx, plan)
+    assert ctx.completed is None
+    success, message, opening, _action_time = ctx.cancelled
+    assert success is False
+    assert message == "cancelled"
+    assert opening == 0.9
+    assert plan.aborted
+    assert coordinator.try_claim_gripper()
+
+
+async def test_cancel_after_the_gripper_stood_still_reports_the_finished_move(
+    follower_never_stale,
+):
+    # The plan ended before the cancel could be served: the goal reports the
+    # move it finished rather than a cancel that stopped nothing.
+    coordinator, layer = make_layer()
+    coordinator.measured_gripper.set(1.0)
+    plan = layer._admit_gripper_move(0.5, 0.0)
+    run_gripper_plan_until_still(coordinator, stopped_at=0.5)
+    ctx = FakeGoalContext()
+    ctx.request_cancel()
+    await layer.drive_gripper(ctx, plan)
+    assert ctx.cancelled is None
+    success, message, opening, _action_time = ctx.completed
+    assert success is True
+    assert message == "move complete"
+    assert opening == 0.5
 
 
 async def test_abandon_walks_back_a_claimed_admission():

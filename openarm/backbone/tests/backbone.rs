@@ -225,6 +225,60 @@ fn spawn_left_arm_follower(
     rx
 }
 
+/// Jaw travel (opening fraction) the lagging gripper follower covers per
+/// [`STATE_PUMP_PERIOD`]: 1.0 per second against the 6.0 per second the
+/// backbone commands at, so the jaws arrive many state periods after the
+/// commanded ramp has landed.
+const LAGGING_GRIPPER_STEP: f64 = 0.01;
+
+/// Plays the left gripper as a follower whose jaws lag their commands: every
+/// [`STATE_PUMP_PERIOD`] the opening moves at most [`LAGGING_GRIPPER_STEP`]
+/// toward the latest setpoint the node streamed down, landing on it exactly,
+/// and is published as the measured state. It starts half open like the static
+/// gripper pumps. The returned watch carries the latest published opening.
+fn spawn_lagging_left_gripper_follower(
+    states: peppygen::mock::pairings::left_gripper::gripper_states::Publisher,
+    mut setpoints: peppygen::mock::pairings::left_gripper::gripper_setpoints::Subscription,
+) -> watch::Receiver<f64> {
+    let mut opening = 0.5;
+    let (tx, rx) = watch::channel(opening);
+    tokio::spawn(async move {
+        if !matches!(states.wait_for_subscriber(PUMP_TIMEOUT).await, Ok(true)) {
+            return;
+        }
+        let mut commanded = opening;
+        let mut ticker = tokio::time::interval(STATE_PUMP_PERIOD);
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    let remaining: f64 = commanded - opening;
+                    opening = if remaining.abs() <= LAGGING_GRIPPER_STEP {
+                        commanded
+                    } else {
+                        opening + LAGGING_GRIPPER_STEP.copysign(remaining)
+                    };
+                    let message = peppygen::paired_topics::left_gripper::gripper_states::Message {
+                        timestamp: SystemTime::now(),
+                        opening,
+                        effort: 0.0,
+                        max_effort: 1.0,
+                    };
+                    if states.publish(&message).await.is_err() {
+                        return;
+                    }
+                    tx.send_replace(opening);
+                }
+                received = setpoints.next() => match received {
+                    Ok(Some(m)) => commanded = m.opening,
+                    Err(_) => {}
+                    Ok(None) => return,
+                }
+            }
+        }
+    });
+    rx
+}
+
 /// The full boot with the robot reporting ready and the `collision_ctrl`
 /// dependency slot vacant (its `zero_or_one` empty binding): the launch-time
 /// band stands, exactly the branch the cardinality exists for.
@@ -400,6 +454,86 @@ async fn move_arm_joints_streams_a_trajectory_the_arm_follows_to_the_target() ->
     for (observed, commanded) in observed.iter().zip(target.iter()) {
         assert!((observed - commanded).abs() < 0.05);
     }
+
+    harness.shutdown().await
+}
+
+/// Exposed gripper action end-to-end: `move_gripper` with the left gripper
+/// played by a follower whose jaws lag their commands. The commanded ramp
+/// lands on the target while the jaws are still most of the way out; the
+/// result must wait until they stand still and report the opening they stopped
+/// at, not the one measured when the last setpoint went out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn move_gripper_answers_with_the_opening_the_lagging_jaws_stopped_at() -> peppygen::Result<()>
+{
+    use peppygen::fixtures::exposed_actions::limb_motion::move_gripper;
+
+    let (harness, mocks) = start_ready_vacant(params()).await?;
+
+    pump_is_ready(
+        mocks.deps.robot_init.is_ready,
+        Arc::new(AtomicBool::new(true)),
+    );
+    pump_arm_at_home!(
+        mocks.pairings.left_arm.joint_states,
+        peppygen::paired_topics::left_arm::joint_states
+    );
+    pump_arm_at_home!(
+        mocks.pairings.right_arm.joint_states,
+        peppygen::paired_topics::right_arm::joint_states
+    );
+    pump_gripper_half_open!(
+        mocks.pairings.right_gripper.gripper_states,
+        peppygen::paired_topics::right_gripper::gripper_states
+    );
+    let followed = spawn_lagging_left_gripper_follower(
+        mocks.pairings.left_gripper.gripper_states,
+        mocks.pairings.left_gripper.gripper_setpoints,
+    );
+
+    // Gate the goal on streaming having begun, as the arm move above does: a
+    // goal that reaches the coordinator during the seed wait is refused.
+    let mut right_wire = mocks.pairings.right_arm.joint_setpoints;
+    tokio::time::timeout(DEADLINE, right_wire.next())
+        .await
+        .expect("streaming never began before the goal")?
+        .expect("right arm subscription open");
+
+    // Close from half open: the commanded ramp covers the 0.4 travel in about
+    // 70 ms, the lagging jaws need 40 state periods.
+    let target = 0.1;
+    let goal = move_gripper::send_goal(
+        &harness,
+        &move_gripper::GoalRequestData {
+            gripper_name: "left_gripper".to_string(),
+            opening: target,
+            max_effort: 0.0,
+        },
+        peppygen::QoSProfile::Reliable,
+        DEADLINE,
+    )
+    .await?;
+    assert!(goal.accepted, "goal rejected: {:?}", goal.reason);
+
+    let result = goal.get_result(DEADLINE).await?;
+    let data = match result.outcome {
+        move_gripper::ResultOutcome::Completed(data) => data,
+        other => panic!("move_gripper did not complete: {other:?}"),
+    };
+    assert!(data.success, "move failed: {}", data.message);
+    assert_eq!(data.message, "move complete");
+    // The jaws stand still on the target once the result is out, so the
+    // follower's last opening is the one the backbone measured at the end.
+    assert_eq!(
+        data.final_opening,
+        *followed.borrow(),
+        "final_opening must be the opening the jaws stopped at"
+    );
+    assert!(
+        (data.final_opening - target).abs() < 1e-9,
+        "the jaws stopped at {}, commanded {target}",
+        data.final_opening
+    );
 
     harness.shutdown().await
 }
