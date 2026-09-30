@@ -189,6 +189,21 @@ Both are answered by the coordinator on the tick after the request, so
 they wait behind the readiness gate with the moves; a stop during the seed
 wait stops nothing and a check then is refused as a goal is.
 
+### camera_mounts
+
+`get_camera_poses` answers where the generation's design carries each
+camera, in the robot frame, as the pose of the camera's colour optical frame
+(`+x` to the right of the image, `+y` down it, `+z` along the view): the
+numbers `openarm_description` lists, which are the simulation's, so they are
+exact in a simulation and nominal on hardware. A camera fixed to the base
+(v2's `chest`) has one pose; a camera an arm carries (v2's `wrist_left` and
+`wrist_right`, which hang off the link the grasp point hangs off) is composed
+with that arm's grasp pose from the last `limb_states` snapshot, and the
+answer carries that snapshot's stamp. Served from bringup, refused with
+`the robot has not measured its joints yet` until a snapshot exists; a v1
+robot answers success with no camera. A description that mounts a camera on
+a link a moving joint carries, other than the grasp point's, stops bringup.
+
 ## Module map
 
 | Module | Owns | Why it lives here |

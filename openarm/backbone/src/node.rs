@@ -21,6 +21,7 @@ use tokio::task::JoinSet;
 use tracing::{error, info};
 
 use crate::actions;
+use crate::camera_mounts::{self, CameraMounts};
 use crate::coordinator::{self, ArmChannels};
 use crate::governor;
 use crate::liveness;
@@ -105,6 +106,9 @@ pub enum NodeError {
 
     #[error("build the self-collision governor")]
     Governor(#[from] governor::GovernorError),
+
+    #[error("place the cameras the description carries")]
+    CameraMounts(#[from] camera_mounts::CameraMountError),
 
     #[error("joint position limits must be finite and well-ordered (lo <= hi)")]
     JointLimits,
@@ -312,6 +316,10 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         },
     );
 
+    // The cameras the generation carries, each placed in the frame that
+    // carries it: a mount this backbone cannot place stops bringup here.
+    let mounts = Arc::new(CameraMounts::resolve(hardware_version)?);
+
     let left_limits = left_model.limits();
     let right_limits = right_model.limits();
     // The chase clamps every streamed/planned target into these limits with
@@ -359,6 +367,9 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     // The limb_motion services' way to the coordinator: a stop or a plan
     // check per request, answered on the tick after it is queued.
     let (request_tx, request_rx) = mpsc::channel(8);
+    // The grasp poses of the last limb_state snapshot, for the camera
+    // mounts service.
+    let (grasps_tx, grasps_rx) = watch::channel(None);
     let busy = [
         Arc::new(AtomicBool::new(false)),
         Arc::new(AtomicBool::new(false)),
@@ -422,6 +433,15 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         });
     }
 
+    // Where the cameras stand, answered for the life of the node from the
+    // grasp poses the coordinator measured last, and refused until it has.
+    tokio::spawn(camera_mounts::serve(
+        node_runner.clone(),
+        node_runner.cancellation_token().clone(),
+        mounts,
+        grasps_rx,
+    ));
+
     // Gate exposing actions + streaming on the robot being ready, in a spawned
     // task so this setup closure returns promptly for the health probe.
     let runner = node_runner.clone();
@@ -441,6 +461,7 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
             channels,
             request_rx,
             config_rx,
+            grasps_tx,
             coordinator::RunConfig {
                 cycle_period,
                 stale_limit,

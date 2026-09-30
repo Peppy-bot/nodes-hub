@@ -1037,3 +1037,103 @@ async fn a_plan_check_answers_without_moving_the_arm() -> peppygen::Result<()> {
     }
     harness.shutdown().await
 }
+
+/// The camera mounts service answers from bringup: refused until the
+/// coordinator has measured the arms, then every camera of the generation
+/// under the stamp of the snapshot the poses come from, a v1 robot with no
+/// camera at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn camera_poses_are_answered_once_the_arms_are_measured() -> peppygen::Result<()> {
+    use peppygen::fixtures::exposed_services::camera_mounts::get_camera_poses;
+
+    let (harness, mocks) = start_ready_vacant(params()).await?;
+    let ready = Arc::new(AtomicBool::new(false));
+    pump_is_ready(mocks.deps.robot_init.is_ready, ready.clone());
+
+    let refused = get_camera_poses::poll(&harness, DEADLINE).await?;
+    assert!(!refused.success);
+    assert_eq!(refused.message, "the robot has not measured its joints yet");
+    assert!(refused.camera_names.is_empty());
+
+    ready.store(true, Ordering::SeqCst);
+    pump_arm_at_home!(
+        mocks.pairings.left_arm.joint_states,
+        peppygen::paired_topics::left_arm::joint_states
+    );
+    pump_right_arm_and_grippers!(mocks);
+    let mut right_wire = mocks.pairings.right_arm.joint_setpoints;
+    tokio::time::timeout(DEADLINE, right_wire.next())
+        .await
+        .expect("streaming never began")?
+        .expect("right arm subscription open");
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    let answer = loop {
+        let answer = get_camera_poses::poll(&harness, DEADLINE).await?;
+        if answer.success {
+            break answer;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no measurement reached the service: {}",
+            answer.message
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    // v1 carries no camera: a success with nothing listed.
+    assert_eq!(answer.message, "0 cameras");
+    assert!(answer.camera_names.is_empty() && answer.carried_by.is_empty());
+    assert!(answer.positions.is_empty() && answer.orientations.is_empty());
+    harness.shutdown().await
+}
+
+/// A v2 robot lists its three cameras, the chest camera at the design's
+/// numbers and each wrist camera carried by its arm, under the stamp of a
+/// limb_states snapshot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_v2_robot_lists_its_three_cameras_in_the_robot_frame() -> peppygen::Result<()> {
+    use peppygen::fixtures::exposed_services::camera_mounts::get_camera_poses;
+
+    let (mut harness, mocks) = start_ready_vacant(peppygen::Parameters {
+        hardware_version: "v2".to_string(),
+        ..params()
+    })
+    .await?;
+    pump_is_ready(
+        mocks.deps.robot_init.is_ready,
+        Arc::new(AtomicBool::new(true)),
+    );
+    pump_arm_at_home!(
+        mocks.pairings.left_arm.joint_states,
+        peppygen::paired_topics::left_arm::joint_states
+    );
+    pump_right_arm_and_grippers!(mocks);
+    let snapshot = tokio::time::timeout(DEADLINE, harness.emitted.limb_state_limb_states.next())
+        .await
+        .expect("no limb_states snapshot before the deadline")?
+        .expect("limb_states subscription open");
+
+    let answer = get_camera_poses::poll(&harness, DEADLINE).await?;
+    assert!(answer.success, "{}", answer.message);
+    assert!(answer.timestamp >= snapshot.timestamp);
+    assert_eq!(answer.camera_names, ["wrist_left", "wrist_right", "chest"]);
+    assert_eq!(answer.carried_by, ["left_arm", "right_arm", ""]);
+    assert_eq!(answer.positions.len(), 9);
+    assert_eq!(answer.orientations.len(), 12);
+    assert_eq!(&answer.positions[6..9], [0.0792, 0.0315, 0.7941]);
+    // The chest camera looks along its optical +Z, to the robot's front and
+    // down: the image's +Y (down the picture) points forward and down.
+    let [x, y, z, w] = [
+        answer.orientations[8],
+        answer.orientations[9],
+        answer.orientations[10],
+        answer.orientations[11],
+    ];
+    // Rotate the unit +Z by the quaternion: v' = q v q*.
+    let view_z = 1.0 - 2.0 * (x * x + y * y);
+    let view_x = 2.0 * (x * z + w * y);
+    assert!(
+        view_x > 0.4 && view_z < -0.8,
+        "the chest camera looks forward and down: ({view_x}, {view_z})"
+    );
+    harness.shutdown().await
+}

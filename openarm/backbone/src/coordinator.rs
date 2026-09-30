@@ -33,6 +33,7 @@ use control_core::filters::LowPassFilter;
 use control_core::pacer::Pacer;
 
 use crate::arm_pair::ArmPair;
+use crate::camera_mounts::MeasuredGrasps;
 use crate::chase::rate_limited;
 use crate::governor::{GovState, Governor, Guard};
 use crate::liveness::{Admission, Cadence, CadenceChange, Liveness};
@@ -284,6 +285,7 @@ pub async fn run(
     mut channels: ArmPair<ArmChannels>,
     mut requests: mpsc::Receiver<CoordinatorRequest>,
     governor_config: watch::Receiver<GovernorConfig>,
+    measured_grasps: watch::Sender<Option<MeasuredGrasps>>,
     config: RunConfig,
     token: CancellationToken,
 ) -> peppygen::Result<()> {
@@ -294,7 +296,7 @@ pub async fn run(
         velocity_filter_cutoff_hz,
         upstream_mode,
     } = config;
-    let publishers = Publishers::declare(&runner).await?;
+    let publishers = Publishers::declare(&runner, measured_grasps).await?;
 
     // Hold each arm's real pose, not a neutral zero: wait for the first measured
     // state from both arms and seed the held setpoints there before publishing.

@@ -15,6 +15,8 @@ srs_model = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = 
 bimanual_collision_model = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "bimanual_collision_model" }
 openarm_description = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "openarm_description", features = ["meshes"] }
 control_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "control_core" }
+# The camera mounts are placed against the bundled URDF's fixed joints.
+urdf-rs = "0.9"
 
 # The collision narrowphase (GJK/EPA over convex hulls) and forward kinematics
 # are dense nalgebra f64 kernels. At the dev profile's opt-level 0 the governor's
