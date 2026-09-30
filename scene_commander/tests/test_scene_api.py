@@ -888,10 +888,11 @@ def test_spawn_object_reports_the_minted_object_id(commander, caplog):
     assert (status, lines) == (
         200, [{"goal": "1"}, {"success": True, "message": "spawn_object done", "object_id": "obj_42"}],
     )
-    # A spawn naming no yaw stands as authored.
+    # A spawn naming no yaw stands as authored; the panel turns an object by
+    # its yaw alone and names no orientation.
     assert spawn.goals == [SimpleNamespace(
-        asset_id="props/blocks/red_block", position=[0.5, 0.0, 0.8], yaw=0.0, scale=1.0, physics="dynamic",
-        mass=0.2,
+        asset_id="props/blocks/red_block", position=[0.5, 0.0, 0.8], yaw=0.0, orientation=None, scale=1.0,
+        physics="dynamic", mass=0.2,
     )]
     assert _node_log(commander, caplog) == [(
         logging.INFO,
@@ -917,7 +918,8 @@ def test_a_spawn_naming_only_its_asset_and_position_takes_the_defaults(commander
 
     assert status == 200
     assert commander.actions.spawn_object.goals == [SimpleNamespace(
-        asset_id="props/furniture/desk", position=[1.0, 0.0, 0.0], yaw=0.0, scale=1.0, physics="none", mass=0.1,
+        asset_id="props/furniture/desk", position=[1.0, 0.0, 0.0], yaw=0.0, orientation=None, scale=1.0,
+        physics="none", mass=0.1,
     )]
 
 
