@@ -12,6 +12,11 @@
 //! setpoint and its wire goes silent, and the first delivery after the gap
 //! re-anchors that setpoint on the measured pose, so a follower that restarts
 //! is never handed a target that drifted while nobody could see the arm.
+//!
+//! The loop also answers the two limb_motion services that read or end what
+//! it runs ([`CoordinatorRequest`]): a stop ends every move in flight on
+//! both sides at the start of a tick, and a plan check asks one arm's planner
+//! whether a Cartesian goal has a plan from where it stands.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,7 +25,8 @@ use std::time::{Duration, Instant};
 use peppygen::NodeRunner;
 use peppygen::exposed_actions::limb_motion::move_gripper;
 use peppylib::runtime::CancellationToken;
-use tokio::sync::{mpsc, watch};
+use srs_model::nalgebra::Isometry3;
+use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{error, info, warn};
 
 use control_core::filters::LowPassFilter;
@@ -34,7 +40,7 @@ use crate::motion::{MOTION_TIMEOUT_FACTOR, MoveBudget};
 use crate::planner::{self, BusyGuard, Goal, Planner};
 use crate::publish::{LimbStateSnapshot, Publishers};
 use crate::streams::{ArmState, GovernorConfig, GripperCommand, GripperState};
-use crate::types::{ARM_DOF, JointVec, Side};
+use crate::types::{ARM_DOF, JointVec, PlanTolerance, Side};
 use crate::upstream::{Upstream, UpstreamMode};
 
 /// How long [`seed_all`] waits for an arm's first measured state before warning that
@@ -86,6 +92,34 @@ pub struct RunConfig {
     pub upstream_mode: UpstreamMode,
 }
 
+/// What the limb_motion services ask of the loop, answered on the reply
+/// channel each carries; a reply the asker no longer waits for is dropped.
+pub enum CoordinatorRequest {
+    /// End every planned move in flight on both sides, answering the names of
+    /// the limbs whose move was ended.
+    Stop {
+        reason: String,
+        reply: oneshot::Sender<Vec<String>>,
+    },
+    /// Whether a `move_arm` goal with these fields has a plan from where the
+    /// arm stands: the time the move would take, or the refusal's words.
+    CheckArmMove {
+        side: Side,
+        target: Isometry3<f64>,
+        tolerance: PlanTolerance,
+        duration_s: f64,
+        reply: oneshot::Sender<Result<f64, String>>,
+    },
+}
+
+/// The message every goal a stop ends carries: the stop and its reason.
+pub fn stop_message(reason: &str) -> String {
+    if reason.is_empty() {
+        return "stopped".to_string();
+    }
+    format!("stopped: {reason}")
+}
+
 /// An accepted `move_gripper` goal handed to the coordinator, which executes it
 /// through the same per-tick governing as everything else (the gripper analog of
 /// [`Goal`] for the arms). The opening is the validated goal fraction; the
@@ -107,6 +141,18 @@ impl GripperGoal {
             .await
         {
             error!("move_gripper refuse: {e}");
+        }
+    }
+
+    /// Complete unstarted as cancelled by the stop service, with the stop's
+    /// `message`. The busy flag is the caller's concern.
+    pub async fn stop(self, message: &str, reported_frac: f64) {
+        if let Err(e) = self
+            .ctx
+            .complete_cancelled(false, message.to_string(), reported_frac, 0.0)
+            .await
+        {
+            error!("move_gripper stop: {e}");
         }
     }
 }
@@ -218,19 +264,25 @@ enum GripperTerminal {
     Settled(String),
     /// The move failed; the message says why.
     Failed(String),
-    /// The goal was cancelled.
-    Cancelled,
+    /// The goal was cancelled: by its caller, or by the stop service, whose
+    /// message names the stop and its reason.
+    Cancelled(String),
 }
 
 /// Run the coordination loop. Holds the governor and both planners. Runs until
 /// the node's cancellation token fires; returns `Err` if a publisher cannot be
 /// declared at bringup. Any return takes the node down (the supervisor in `main`
 /// treats it as fatal).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one input per producer the loop reads, wired once in node.rs"
+)]
 pub async fn run(
     runner: Arc<NodeRunner>,
     mut governor: Governor,
     mut planners: ArmPair<Planner>,
     mut channels: ArmPair<ArmChannels>,
+    mut requests: mpsc::Receiver<CoordinatorRequest>,
     governor_config: watch::Receiver<GovernorConfig>,
     config: RunConfig,
     token: CancellationToken,
@@ -246,7 +298,10 @@ pub async fn run(
 
     // Hold each arm's real pose, not a neutral zero: wait for the first measured
     // state from both arms and seed the held setpoints there before publishing.
-    if seed_all(&mut channels, &mut planners).await.is_err() {
+    if seed_all(&mut channels, &mut planners, &mut requests)
+        .await
+        .is_err()
+    {
         return Ok(());
     }
     info!("bimanual backbone: both arms reporting; governed streaming begins");
@@ -326,6 +381,19 @@ pub async fn run(
             now,
             stale_limit,
         );
+        // The services are answered ahead of the tick's advance: a stop ends
+        // every move before the planners would step it once more.
+        while let Ok(request) = requests.try_recv() {
+            serve_request(
+                request,
+                &mut channels,
+                &mut planners,
+                &mut gripper_moves,
+                &gripper_fraction,
+                now,
+            )
+            .await;
+        }
         let arm_ticks = advance_arms(&mut channels, &mut planners, arm_admission, now).await;
         let arm_candidate = ArmPair::new(arm_ticks.left.candidate, arm_ticks.right.candidate);
         let hands = ArmPair::new(arm_ticks.left.streamed_hand, arm_ticks.right.streamed_hand);
@@ -482,6 +550,85 @@ pub async fn run(
         tokio::select! {
             _ = token.cancelled() => return Ok(()),
             _ = pacer.pace() => {}
+        }
+    }
+}
+
+/// Answer one limb_motion service request. A stop ends the moves in flight
+/// on both sides (the arm's move through its planner, the gripper's through
+/// its terminal) and the goals admitted but not started, each as cancelled
+/// with the stop's message, and names the limbs whose move was in flight;
+/// the setpoints hold where they were last governed. A check asks the named
+/// arm's planner and moves nothing.
+async fn serve_request(
+    request: CoordinatorRequest,
+    channels: &mut ArmPair<ArmChannels>,
+    planners: &mut ArmPair<Planner>,
+    gripper_moves: &mut ArmPair<Option<GripperMove>>,
+    gripper_fraction: &impl Fn(&watch::Receiver<Option<GripperState>>) -> f64,
+    now: Instant,
+) {
+    match request {
+        CoordinatorRequest::Stop { reason, reply } => {
+            let message = stop_message(&reason);
+            info!("stop requested: {message}");
+            let mut stopped = Vec::new();
+            for (side, channels, planner, gripper_move) in [
+                (
+                    Side::Left,
+                    &mut channels.left,
+                    &mut planners.left,
+                    &mut gripper_moves.left,
+                ),
+                (
+                    Side::Right,
+                    &mut channels.right,
+                    &mut planners.right,
+                    &mut gripper_moves.right,
+                ),
+            ] {
+                let measured_q = channels
+                    .measured
+                    .borrow()
+                    .map_or_else(|| planner.setpoint(), |m| m.positions);
+                if planner.stop_active(&message, measured_q, now).await {
+                    stopped.push(Side::ARM_NAMES[side.index()].to_string());
+                }
+                while let Ok(goal) = channels.goals.try_recv() {
+                    let _release = BusyGuard(channels.busy.clone());
+                    goal.stop(&message, measured_q, planner).await;
+                }
+                let measured_frac = gripper_fraction(&channels.gripper);
+                if let Some(m) = gripper_move.take() {
+                    let elapsed_s = now.duration_since(m.motion.started).as_secs_f64();
+                    end_gripper_move(
+                        m,
+                        GripperTerminal::Cancelled(message.clone()),
+                        measured_frac,
+                        elapsed_s,
+                    )
+                    .await;
+                    stopped.push(Side::GRIPPER_NAMES[side.index()].to_string());
+                }
+                while let Ok(goal) = channels.gripper_goals.try_recv() {
+                    let _release = BusyGuard(channels.gripper_busy.clone());
+                    goal.stop(&message, measured_frac).await;
+                }
+            }
+            let _ = reply.send(stopped);
+        }
+        CoordinatorRequest::CheckArmMove {
+            side,
+            target,
+            tolerance,
+            duration_s,
+            reply,
+        } => {
+            let planner = match side {
+                Side::Left => &mut planners.left,
+                Side::Right => &mut planners.right,
+            };
+            let _ = reply.send(planner.check_cartesian(&target, tolerance, duration_s));
         }
     }
 }
@@ -783,6 +930,7 @@ const STALE_REFUSAL: &str = "the follower stopped reporting";
 async fn seed_all(
     channels: &mut ArmPair<ArmChannels>,
     planners: &mut ArmPair<Planner>,
+    requests: &mut mpsc::Receiver<CoordinatorRequest>,
 ) -> Result<(), Shutdown> {
     loop {
         tokio::select! {
@@ -808,6 +956,16 @@ async fn seed_all(
             }
             Some(goal) = channels.right.gripper_goals.recv() => {
                 refuse_seed_gripper_goal(goal, &channels.right).await;
+            }
+            // Nothing moves before the seed, so a stop stops nothing and a
+            // check has no held pose to plan from.
+            Some(request) = requests.recv() => match request {
+                CoordinatorRequest::Stop { reply, .. } => {
+                    let _ = reply.send(Vec::new());
+                }
+                CoordinatorRequest::CheckArmMove { reply, .. } => {
+                    let _ = reply.send(Err(SEED_REFUSAL.to_string()));
+                }
             }
         }
     }
@@ -976,7 +1134,7 @@ fn gripper_move_terminal(
     now: Instant,
 ) -> Option<GripperTerminal> {
     if cancelled {
-        return Some(GripperTerminal::Cancelled);
+        return Some(GripperTerminal::Cancelled("goal cancelled".to_string()));
     }
     let chasing = motion.settle.is_none()
         && (commanded_frac - motion.target_frac).abs() > GRIPPER_LANDED_FRAC;
@@ -1072,25 +1230,32 @@ async fn service_gripper_move(
         return;
     };
     let m = mv.take().expect("in-flight move checked above");
+    end_gripper_move(m, terminal, measured.frac, elapsed_s).await;
+}
+
+/// Complete a gripper move's goal on `terminal`, reporting `measured_frac`
+/// as `final_opening` and `elapsed_s` as `action_time`. The busy slot
+/// releases with the move.
+async fn end_gripper_move(
+    m: GripperMove,
+    terminal: GripperTerminal,
+    measured_frac: f64,
+    elapsed_s: f64,
+) {
     let result = match terminal {
         GripperTerminal::Settled(message) => {
             m.ctx
-                .complete(true, message, measured.frac, elapsed_s)
+                .complete(true, message, measured_frac, elapsed_s)
                 .await
         }
         GripperTerminal::Failed(message) => {
             m.ctx
-                .complete(false, message, measured.frac, elapsed_s)
+                .complete(false, message, measured_frac, elapsed_s)
                 .await
         }
-        GripperTerminal::Cancelled => {
+        GripperTerminal::Cancelled(message) => {
             m.ctx
-                .complete_cancelled(
-                    false,
-                    "goal cancelled".to_string(),
-                    measured.frac,
-                    elapsed_s,
-                )
+                .complete_cancelled(false, message, measured_frac, elapsed_s)
                 .await
         }
     };
@@ -1571,7 +1736,7 @@ mod tests {
         let mut motion = motion_from(1.0, start);
         assert_eq!(
             gripper_move_terminal(&mut motion, 0.8, fresh(0.9), true, start + ms(100)),
-            Some(GripperTerminal::Cancelled)
+            Some(GripperTerminal::Cancelled("goal cancelled".to_string()))
         );
     }
 
@@ -1589,7 +1754,7 @@ mod tests {
                 true,
                 landed + still_window()
             ),
-            Some(GripperTerminal::Cancelled)
+            Some(GripperTerminal::Cancelled("goal cancelled".to_string()))
         );
     }
 

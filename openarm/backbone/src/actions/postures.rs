@@ -2,8 +2,10 @@
 //! arms, hand each planner an ordinary joint goal to the posture, and
 //! complete the one action goal from both terminals. Cancel flips a shared
 //! flag the moves poll, so each arm stops the way a cancelled joint move
-//! stops. The two actions share the arms' single-flight slots, so a posture
-//! goal arriving while the other posture runs is rejected busy.
+//! stops; the stop service ends both arms' moves the same way, and the goal
+//! ends as cancelled with the stop's message. The two actions share the
+//! arms' single-flight slots, so a posture goal arriving while the other
+//! posture runs is rejected busy.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -48,9 +50,10 @@ enum Terminal {
 
 /// Judge the end of a posture move from what actually came back: the goals
 /// dispatched, the outcomes received, and whether a cancel was seen. Cancel
-/// wins whatever the outcomes say; otherwise success requires both arms
-/// dispatched and both outcomes successful (reported as `done`), and the
-/// message names the first thing that went wrong.
+/// wins whatever the outcomes say; a stop ends the goal as cancelled with
+/// the stop's message; otherwise success requires both arms dispatched and
+/// both outcomes successful (reported as `done`), and the message names the
+/// first thing that went wrong.
 fn summarize(
     pending: usize,
     outcomes: &[ReadyOutcome],
@@ -59,6 +62,9 @@ fn summarize(
 ) -> (Terminal, String) {
     if cancelled {
         return (Terminal::Cancelled, "goal cancelled".to_string());
+    }
+    if let Some(stopped) = outcomes.iter().find(|o| o.stopped) {
+        return (Terminal::Cancelled, stopped.message.clone());
     }
     if pending < 2 {
         return (
@@ -231,6 +237,7 @@ mod tests {
         ReadyOutcome {
             success,
             message: message.to_string(),
+            stopped: false,
         }
     }
 
@@ -291,6 +298,27 @@ mod tests {
         let (terminal, message) = summarize(0, &[], true, "both arms at ready");
         assert_eq!(terminal, Terminal::Cancelled);
         assert_eq!(message, "goal cancelled");
+    }
+
+    #[test]
+    fn a_stopped_arm_ends_the_goal_cancelled_with_the_stops_message() {
+        // The stop service ended the left arm's share; the right arm's share
+        // ended with it. The goal ends as cancelled, naming the stop.
+        let outcomes = [
+            ReadyOutcome {
+                success: false,
+                message: "left: stopped: operator".to_string(),
+                stopped: true,
+            },
+            ReadyOutcome {
+                success: false,
+                message: "right: stopped: operator".to_string(),
+                stopped: true,
+            },
+        ];
+        let (terminal, message) = summarize(2, &outcomes, false, "both arms at ready");
+        assert_eq!(terminal, Terminal::Cancelled);
+        assert_eq!(message, "left: stopped: operator");
     }
 
     #[test]

@@ -811,3 +811,229 @@ async fn goals_for_unknown_limb_names_are_refused() -> peppygen::Result<()> {
     );
     Ok(())
 }
+
+/// The stop service ends the moves in flight, whoever started them: an arm
+/// move and a gripper move both end as cancelled with the stop's message,
+/// the answer names both limbs, a stop with nothing moving names none, and
+/// a goal that arrives after the stop runs to its end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stop_ends_every_move_in_flight_and_a_later_goal_runs() -> peppygen::Result<()> {
+    use peppygen::fixtures::exposed_actions::limb_motion::{move_arm_joints, move_gripper};
+    use peppygen::fixtures::exposed_services::limb_motion::stop;
+
+    let (harness, mocks) = start_ready_vacant(params()).await?;
+    pump_is_ready(
+        mocks.deps.robot_init.is_ready,
+        Arc::new(AtomicBool::new(true)),
+    );
+    let followed = spawn_left_arm_follower(
+        mocks.pairings.left_arm.joint_states,
+        mocks.pairings.left_arm.joint_setpoints,
+    );
+    pump_arm_at_home!(
+        mocks.pairings.right_arm.joint_states,
+        peppygen::paired_topics::right_arm::joint_states
+    );
+    pump_gripper_half_open!(
+        mocks.pairings.right_gripper.gripper_states,
+        peppygen::paired_topics::right_gripper::gripper_states
+    );
+    let jaws = spawn_lagging_left_gripper_follower(
+        mocks.pairings.left_gripper.gripper_states,
+        mocks.pairings.left_gripper.gripper_setpoints,
+    );
+    let mut right_wire = mocks.pairings.right_arm.joint_setpoints;
+    tokio::time::timeout(DEADLINE, right_wire.next())
+        .await
+        .expect("streaming never began before the goal")?
+        .expect("right arm subscription open");
+
+    // Nothing moves: the stop stops nothing.
+    let idle = stop::poll(
+        &harness,
+        &stop::RequestData {
+            reason: "nothing to stop".to_string(),
+        },
+        DEADLINE,
+    )
+    .await?;
+    assert!(idle.success, "{}", idle.message);
+    assert!(idle.stopped.is_empty(), "{:?}", idle.stopped);
+    assert_eq!(idle.message, "nothing was moving");
+
+    // A long arm move and a gripper move whose jaws lag: both are in flight
+    // when the stop arrives. The stop is gated on the jaws having moved,
+    // so it ends moves that run, not ones that wait to be admitted.
+    let target = [0.0, -0.8, 0.0, 1.2, 0.0, 0.0, 0.0];
+    let arm_goal = move_arm_joints::send_goal(
+        &harness,
+        &move_arm_joints::GoalRequestData {
+            arm_name: "left_arm".to_string(),
+            joint_positions: target,
+            duration_s: 30.0,
+        },
+        peppygen::QoSProfile::Reliable,
+        DEADLINE,
+    )
+    .await?;
+    assert!(arm_goal.accepted, "goal rejected: {:?}", arm_goal.reason);
+    let gripper_goal = move_gripper::send_goal(
+        &harness,
+        &move_gripper::GoalRequestData {
+            gripper_name: "left_gripper".to_string(),
+            opening: 0.1,
+            max_effort: 0.0,
+        },
+        peppygen::QoSProfile::Reliable,
+        DEADLINE,
+    )
+    .await?;
+    assert!(
+        gripper_goal.accepted,
+        "goal rejected: {:?}",
+        gripper_goal.reason
+    );
+    let mut moving = jaws.clone();
+    tokio::time::timeout(
+        DEADLINE,
+        moving.wait_for(|opening| (opening - 0.5).abs() > 0.05),
+    )
+    .await
+    .expect("the jaws never started moving")
+    .expect("follower watch open");
+
+    let answer = stop::poll(
+        &harness,
+        &stop::RequestData {
+            reason: "the operator asked".to_string(),
+        },
+        DEADLINE,
+    )
+    .await?;
+    assert!(answer.success, "{}", answer.message);
+    assert_eq!(answer.stopped, ["left_arm", "left_gripper"]);
+    assert_eq!(answer.message, "stopped left_arm, left_gripper");
+
+    let result = arm_goal.get_result(DEADLINE).await?;
+    let data = match result.outcome {
+        move_arm_joints::ResultOutcome::Cancelled(data) => data,
+        other => panic!("the stopped arm move did not end cancelled: {other:?}"),
+    };
+    assert!(!data.success);
+    assert_eq!(data.message, "stopped: the operator asked");
+    let result = gripper_goal.get_result(DEADLINE).await?;
+    let data = match result.outcome {
+        move_gripper::ResultOutcome::Cancelled(data) => data,
+        other => panic!("the stopped gripper move did not end cancelled: {other:?}"),
+    };
+    assert!(!data.success);
+    assert_eq!(data.message, "stopped: the operator asked");
+    // The arm holds short of the target it was on its way to.
+    let held = *followed.borrow();
+    assert!(
+        (held[1] - target[1]).abs() > 0.1,
+        "the arm went on to the target after the stop: {held:?}"
+    );
+
+    // The stop does not latch: a goal that arrives after it runs to its end.
+    let later = move_arm_joints::send_goal(
+        &harness,
+        &move_arm_joints::GoalRequestData {
+            arm_name: "left_arm".to_string(),
+            joint_positions: target,
+            duration_s: 1.0,
+        },
+        peppygen::QoSProfile::Reliable,
+        DEADLINE,
+    )
+    .await?;
+    assert!(later.accepted, "goal rejected: {:?}", later.reason);
+    let result = later.get_result(DEADLINE).await?;
+    let data = match result.outcome {
+        move_arm_joints::ResultOutcome::Completed(data) => data,
+        other => panic!("the later move did not complete: {other:?}"),
+    };
+    assert!(data.success, "{}", data.message);
+
+    harness.shutdown().await
+}
+
+/// The plan check answers whether a Cartesian goal has a plan and moves
+/// nothing: a pose a little above the grasp point has one, with the time the
+/// move would take; a pose two metres away is refused with the words a
+/// `move_arm` refusal gives; an unknown arm is refused; and the arm mock
+/// observes no motion throughout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_plan_check_answers_without_moving_the_arm() -> peppygen::Result<()> {
+    use peppygen::fixtures::exposed_services::limb_motion::check_arm_move;
+
+    let (mut harness, mocks) = start_ready_vacant(params()).await?;
+    pump_is_ready(
+        mocks.deps.robot_init.is_ready,
+        Arc::new(AtomicBool::new(true)),
+    );
+    let followed = spawn_left_arm_follower(
+        mocks.pairings.left_arm.joint_states,
+        mocks.pairings.left_arm.joint_setpoints,
+    );
+    pump_right_arm_and_grippers!(mocks);
+
+    // Where the left grasp point stands, from the robot's own snapshot.
+    let snapshot = tokio::time::timeout(DEADLINE, harness.emitted.limb_state_limb_states.next())
+        .await
+        .expect("no limb_states snapshot before the deadline")?
+        .expect("limb_states subscription open");
+    let position = [
+        snapshot.positions[0],
+        snapshot.positions[1],
+        snapshot.positions[2],
+    ];
+    let orientation = [
+        snapshot.orientations[0],
+        snapshot.orientations[1],
+        snapshot.orientations[2],
+        snapshot.orientations[3],
+    ];
+    let check = |arm_name: &str, position: [f64; 3]| check_arm_move::RequestData {
+        arm_name: arm_name.to_string(),
+        position,
+        orientation,
+        duration_s: 0.0,
+        plan_position_tolerance_m: 0.0,
+        plan_orientation_tolerance_rad: 0.0,
+    };
+
+    let near = check("left_arm", [position[0], position[1], position[2] + 0.02]);
+    let answer = check_arm_move::poll(&harness, &near, DEADLINE).await?;
+    assert!(answer.success, "{}", answer.message);
+    assert!(answer.duration_s > 0.0, "{}", answer.duration_s);
+
+    let far = check("left_arm", [position[0] + 2.0, position[1], position[2]]);
+    let answer = check_arm_move::poll(&harness, &far, DEADLINE).await?;
+    assert!(!answer.success);
+    assert!(
+        answer.message.starts_with("goal pose not planned within"),
+        "{}",
+        answer.message
+    );
+    assert_eq!(answer.duration_s, 0.0);
+
+    let unknown = check("middle_arm", position);
+    let answer = check_arm_move::poll(&harness, &unknown, DEADLINE).await?;
+    assert!(!answer.success);
+    assert!(
+        answer.message.starts_with("unknown arm_name"),
+        "{}",
+        answer.message
+    );
+
+    // Nothing moved: the follower still adopts HOME from every setpoint.
+    let observed = *followed.borrow();
+    for (joint, (observed, home)) in observed.iter().zip(HOME.iter()).enumerate() {
+        assert!(
+            (observed - home).abs() < 1e-9,
+            "joint {joint} moved to {observed} during the checks"
+        );
+    }
+    harness.shutdown().await
+}

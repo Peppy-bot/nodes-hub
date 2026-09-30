@@ -356,6 +356,9 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     let (goal_tx1, goal_rx1) = mpsc::channel(1);
     let (grip_goal_tx0, grip_goal_rx0) = mpsc::channel(1);
     let (grip_goal_tx1, grip_goal_rx1) = mpsc::channel(1);
+    // The limb_motion services' way to the coordinator: a stop or a plan
+    // check per request, answered on the tick after it is queued.
+    let (request_tx, request_rx) = mpsc::channel(8);
     let busy = [
         Arc::new(AtomicBool::new(false)),
         Arc::new(AtomicBool::new(false)),
@@ -436,6 +439,7 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
             governor,
             planners,
             channels,
+            request_rx,
             config_rx,
             coordinator::RunConfig {
                 cycle_period,
@@ -472,6 +476,8 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
             [grip_goal_tx0, grip_goal_tx1],
             [gripper_busy[0].clone(), gripper_busy[1].clone()],
         ));
+        set.spawn(actions::stop::run_stop(runner.clone(), request_tx.clone()));
+        set.spawn(actions::arm::run_check_arm_move(runner.clone(), request_tx));
 
         // Inbound listeners buffer the latest message into the watch slots. They
         // run under the same fatal-first-exit supervision as the rest of the backbone,
