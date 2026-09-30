@@ -541,3 +541,131 @@ async def test_the_ee_caps_cannot_pin_the_slot_past_the_duration_ceiling():
     assert success is False
     assert "ceiling" in message
     assert coordinator.try_claim_arm(), "a refused move must release the arm"
+
+
+async def test_a_stopped_plan_completes_cancelled_with_the_stops_message(follower_never_stale):
+    coordinator, layer = make_layer()
+    coordinator.measured_joints.set((0.0,) * 5)
+    plan = layer._admit_arm_move((0.5,) * 5, 1.0)
+    ctx = FakeGoalContext()
+    driving = asyncio.create_task(layer.drive_arm(ctx, plan))
+    await asyncio.sleep(0)
+
+    assert layer.stop_moves("the operator asked") == ["arm"]
+    await driving
+
+    assert ctx.completed is None
+    success, message, positions, _action_time = ctx.cancelled
+    assert success is False
+    assert message == "stopped: the operator asked"
+    assert positions == [0.0] * 5
+    assert coordinator.try_claim_arm(), "the goal released the arm"
+
+
+async def test_a_stopped_gripper_plan_completes_cancelled_with_the_stops_message(
+    follower_never_stale,
+):
+    coordinator, layer = make_layer()
+    coordinator.measured_gripper.set(0.0)
+    plan = layer._admit_gripper_move(1.0, 0.0)
+    ctx = FakeGoalContext()
+    driving = asyncio.create_task(layer.drive_gripper(ctx, plan))
+    await asyncio.sleep(0)
+
+    assert layer.stop_moves("") == ["gripper"]
+    await driving
+
+    success, message, _opening, _action_time = ctx.cancelled
+    assert success is False
+    assert message == "stopped"
+    assert coordinator.try_claim_gripper()
+
+
+async def test_a_stop_during_the_pose_solve_ends_the_goal_without_a_plan():
+    class SlowKinematics(FakeKinematics):
+        def __init__(self, layer_holder):
+            super().__init__()
+            self.layer_holder = layer_holder
+
+        def inverse_kinematics(self, seed, position, orientation, **bars):
+            # The stop lands while the solve runs off the event loop.
+            self.layer_holder[0].stop_moves("the operator asked")
+            return super().inverse_kinematics(seed, position, orientation, **bars)
+
+    holder = []
+    kinematics = SlowKinematics(holder)
+    coordinator, layer = make_layer(kinematics)
+    holder.append(layer)
+    coordinator.measured_joints.set((0.0,) * 5)
+    goal = layer._admit_pose_move((0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, 0.0, 0.0)
+    ctx = FakeGoalContext()
+    await layer.drive_pose(ctx, goal, kinematics, kinematics)
+
+    assert ctx.completed is None
+    success, message, _position, _orientation, _t = ctx.cancelled
+    assert success is False
+    assert message == "stopped: the operator asked"
+    assert coordinator._arm_plan is None, "nothing was installed after the stop"
+    assert coordinator.try_claim_arm()
+
+
+async def test_the_plan_check_answers_the_duration_and_installs_nothing():
+    kinematics = FakeKinematics()
+    coordinator, layer = make_layer(kinematics, max_ee_velocity_m_s=0.1)
+    coordinator.measured_joints.set((0.0,) * 5)
+
+    success, message, duration_s = await layer.check_arm_move(
+        "arm", (0.2, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, 0.0, 0.0, kinematics, kinematics
+    )
+
+    assert success is True
+    assert duration_s > 0.0
+    assert message == f"a plan reaches the pose in {duration_s:.3f} s"
+    assert ("solve",) == tuple(c[0] for c in kinematics.solve_calls)
+    assert coordinator._arm_plan is None
+    assert coordinator.try_claim_arm(), "the check claims nothing"
+
+
+async def test_the_plan_check_refuses_as_the_move_would():
+    kinematics = FakeKinematics()
+    coordinator, layer = make_layer(kinematics)
+    coordinator.measured_joints.set((0.0,) * 5)
+
+    kinematics.corrupted = True
+    success, message, duration_s = await layer.check_arm_move(
+        "arm", (5.0, 5.0, 5.0), (0.0, 0.0, 0.0, 1.0), 0.0, 0.0, 0.0, kinematics, kinematics
+    )
+    assert success is False
+    assert "no solution reaches this pose" in message
+    assert duration_s == 0.0
+
+    kinematics.corrupted = False
+    success, message, _ = await layer.check_arm_move(
+        "wing", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, 0.0, 0.0, kinematics, kinematics
+    )
+    assert success is False
+    assert "unknown arm_name" in message
+    success, message, _ = await layer.check_arm_move(
+        "arm", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 0.0), 0.0, 0.0, 0.0, kinematics, kinematics
+    )
+    assert success is False
+    assert "quaternion" in message
+
+    # While an arm goal is in flight, the check is refused as a second goal is.
+    layer._admit_arm_move((0.5,) * 5, 1.0)
+    success, message, _ = await layer.check_arm_move(
+        "arm", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, 0.0, 0.0, kinematics, kinematics
+    )
+    assert success is False
+    assert message == "another arm goal is in flight"
+    assert len(kinematics.solve_calls) == 1, "a refused check pays no solve"
+
+
+async def test_the_plan_check_needs_fresh_follower_state():
+    kinematics = FakeKinematics()
+    _coordinator, layer = make_layer(kinematics)
+    success, message, _ = await layer.check_arm_move(
+        "arm", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, 0.0, 0.0, kinematics, kinematics
+    )
+    assert success is False
+    assert message == "no fresh follower state to anchor the move from"

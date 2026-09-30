@@ -52,3 +52,15 @@ def test_the_installed_solver_accepts_the_planning_bars():
         position_tolerance_m=0.01,
         orientation_tolerance_rad=0.5,
     )
+
+
+def test_the_ready_grasp_point_stands_in_front_of_the_base_in_the_robot_frame():
+    """The contracts define the robot frame with +x the way the robot
+    faces, and this backbone reports poses in the URDF's base_link frame as
+    they are: so the working posture's grasp point, out in front of the
+    robot, must have a positive x there, and stand on the robot's centre
+    line."""
+    kinematics = Kinematics(KINEMATICS_URDF_PATH)
+    ready_position, _ = kinematics.forward_kinematics(postures.READY_POSITIONS_RAD)
+    assert ready_position[0] > 0.3
+    assert abs(ready_position[1]) < 0.01

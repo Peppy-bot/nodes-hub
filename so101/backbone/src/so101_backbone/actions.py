@@ -1,12 +1,16 @@
-"""Action admission and execution over the coordinator.
+"""Action admission and execution over the coordinator, and the two
+limb_motion services that read or end what it runs.
 
 Admission (the goal decide callback) validates the request and claims the
 limb's single-flight busy slot; execution installs a trajectory plan and
 waits for the coordinator to stream it out, and a gripper goal then waits
 until the measured gripper stands still. Cancelling freezes the limb where
-the trajectory stands. Every terminal path releases the claimed slot, and no
-exception may ever kill an action server: an unforeseen failure rejects the
-goal and abandons anything admission installed.
+the trajectory stands, and so does the stop service, whoever started the
+move: the goal then ends as cancelled with the stop's message. The plan
+check runs a move_arm goal's solve from the same anchor and installs
+nothing. Every terminal path releases the claimed slot, and no exception may
+ever kill an action server: an unforeseen failure rejects the goal and
+abandons anything admission installed.
 """
 
 from __future__ import annotations
@@ -56,6 +60,18 @@ MAX_REQUESTED_DURATION_S = 120.0
 
 class Rejection(ValueError):
     """A goal that must not run, with the operator-facing reason."""
+
+
+class PlanRefused(ValueError):
+    """A pose move that has no plan from where the arm is, with the reason a
+    move_arm goal completes with and check_arm_move answers."""
+
+
+def stop_message(reason: str) -> str:
+    """The message every goal a stop ends carries: the stop and its reason."""
+    if not reason:
+        return "stopped"
+    return f"stopped: {reason}"
 
 
 @dataclass(frozen=True)
@@ -216,28 +232,16 @@ class ActionLayer:
         drive task so a hard pose never stalls the event loop inside the
         goal decide callback, failing the accepted goal when no solution
         exists."""
-        try:
-            matrix_from_pose(position, orientation)
-        except PoseError as e:
-            raise Rejection(str(e)) from e
-        _require_duration(duration_s)
         # Parsed before the claim: a rejection past this point would strand
         # the arm slot and teleop with it.
-        position_bar = _stated_tolerance(position_tolerance_m, "plan_position_tolerance_m")
-        orientation_bar = _stated_tolerance(
-            orientation_tolerance_rad, "plan_orientation_tolerance_rad"
+        goal = _pose_goal(
+            position, orientation, duration_s, position_tolerance_m, orientation_tolerance_rad
         )
         if self._coordinator.arm_anchor() is None:
             raise Rejection("no fresh follower state to anchor the move from")
         if not self._coordinator.try_claim_arm():
             raise Rejection("another arm goal is in flight")
-        return PoseGoal(
-            position=tuple(position),
-            orientation=tuple(orientation),
-            duration_s=duration_s,
-            position_tolerance_m=position_bar,
-            orientation_tolerance_rad=orientation_bar,
-        )
+        return goal
 
     def _admit_posture(self, target: tuple[float, ...], duration_s: float) -> ArmPlan:
         return self._admit_arm_move(target, duration_s)
@@ -326,10 +330,11 @@ class ActionLayer:
     async def _finish_plan(
         self, ctx, plan, abort, results, started: float, timeout_s: float | None = None
     ) -> None:
-        """Wait out the plan or a cancel (or the travel budget, which only a
-        gripper plan carries) and complete the goal. results(action_time)
+        """Wait out the plan, a cancel or a stop (or the travel budget, which
+        only a gripper plan carries) and complete the goal. results(action_time)
         builds (note, payload) and runs after any abort, so it reads the plan
-        where it stopped."""
+        where it stopped. A stop has already cut the plan, and the goal ends
+        as cancelled with the stop's message."""
         cancel_task = asyncio.ensure_future(ctx.cancel_signal())
         done_task = asyncio.ensure_future(plan.done.wait())
         try:
@@ -338,7 +343,10 @@ class ActionLayer:
             )
             now = time.monotonic()
             action_time = now - started
-            if plan.done.is_set():
+            if plan.stopped is not None:
+                note, payload = results(action_time)
+                await ctx.complete_cancelled(False, _join(plan.stopped, note), *payload)
+            elif plan.done.is_set():
                 note, payload = results(action_time)
                 success, message = _terminal(plan, note)
                 await ctx.complete(success, message, *payload)
@@ -405,10 +413,86 @@ class ActionLayer:
         )
         return minimum_jerk.QUINTIC_PEAK_VELOCITY * max(travel_ratio, turn_ratio)
 
+    async def _plan_pose(self, solver, kinematics, seed, goal: PoseGoal):
+        """The joint solution of `goal` from `seed` and the duration the move
+        takes, or PlanRefused with the reason: no solution inside the joint
+        limits, or a duration the end-effector speed caps push past the
+        ceiling. The solve runs off the event loop."""
+        solution = await asyncio.to_thread(
+            functools.partial(
+                solver.inverse_kinematics,
+                seed,
+                goal.position,
+                goal.orientation,
+                position_tolerance_m=goal.position_tolerance_m,
+                orientation_tolerance_rad=goal.orientation_tolerance_rad,
+            )
+        )
+        if solution is None or not self._limits.contains(solution):
+            raise PlanRefused(_unreached(goal))
+        duration_s = max(goal.duration_s, self._ee_floor_s(kinematics, seed, goal))
+        if duration_s > MAX_REQUESTED_DURATION_S:
+            # The requested duration was admitted against this ceiling, but
+            # the EE speed caps can raise it past one. Stretching anyway
+            # would hold the arm slot for longer than any goal is allowed
+            # to, so the move is refused instead.
+            raise PlanRefused(
+                f"the end-effector speed caps need {duration_s:.0f}s for this "
+                f"move, beyond the {MAX_REQUESTED_DURATION_S:.0f}s ceiling"
+            )
+        return solution, duration_s
+
+    async def check_arm_move(
+        self,
+        arm_name: str,
+        position,
+        orientation,
+        duration_s: float,
+        position_tolerance_m: float,
+        orientation_tolerance_rad: float,
+        solver,
+        kinematics,
+    ) -> tuple[bool, str, float]:
+        """Whether a move_arm goal with these fields has a plan from where the
+        arm is, without moving: (success, message, duration_s), the message
+        being the words the goal's refusal gives. Refused while an arm goal
+        is in flight, with the message a second goal gets, and while no
+        fresh follower state anchors a move."""
+        try:
+            _require_arm_name(arm_name)
+            goal = _pose_goal(
+                position, orientation, duration_s, position_tolerance_m,
+                orientation_tolerance_rad,
+            )
+        except Rejection as e:
+            return False, str(e), 0.0
+        if self._coordinator.arm_busy:
+            return False, "another arm goal is in flight", 0.0
+        seed = self._coordinator.arm_anchor()
+        if seed is None:
+            return False, "no fresh follower state to anchor the move from", 0.0
+        try:
+            _solution, planned_s = await self._plan_pose(solver, kinematics, seed, goal)
+        except PlanRefused as e:
+            return False, str(e), 0.0
+        except Exception as e:
+            log(f"pose solve failed: {e!r}")
+            return False, f"pose solve failed: {e!r}", 0.0
+        return True, f"a plan reaches the pose in {planned_s:.3f} s", planned_s
+
+    def stop_moves(self, reason: str) -> list[str]:
+        """End every planned move in flight for the stop service: the names
+        of the limbs whose move was cut."""
+        message = stop_message(reason)
+        log(f"stop requested: {message}")
+        return self._coordinator.stop_all(message)
+
     async def drive_pose(self, ctx, goal: PoseGoal | None, solver, kinematics) -> None:
         """Solve, install the trajectory, and wait it out. The solve runs
         off the event loop on a solver dedicated to point-to-point goals
-        (the control tick's streaming solver is a separate instance)."""
+        (the control tick's streaming solver is a separate instance). A
+        stop that runs during the solve ends the goal as cancelled with the
+        stop's message, and nothing is installed."""
         if goal is None:
             await _complete_guarded(
                 ctx, False, "goal admission was walked back", *_no_pose(), 0.0
@@ -423,41 +507,16 @@ class ActionLayer:
                     *_no_pose(), 0.0,
                 )
                 return
+            stops_before = self._coordinator.stop_count
             try:
-                solution = await asyncio.to_thread(
-                    functools.partial(
-                        solver.inverse_kinematics,
-                        seed,
-                        goal.position,
-                        goal.orientation,
-                        position_tolerance_m=goal.position_tolerance_m,
-                        orientation_tolerance_rad=goal.orientation_tolerance_rad,
-                    )
+                solution, duration_s = await self._plan_pose(solver, kinematics, seed, goal)
+            except PlanRefused as e:
+                position, orientation = kinematics.forward_kinematics(seed)
+                await _complete_guarded(
+                    ctx, False, str(e),
+                    list(position), list(orientation), time.monotonic() - started,
                 )
-                if solution is None or not self._limits.contains(solution):
-                    position, orientation = kinematics.forward_kinematics(seed)
-                    await _complete_guarded(
-                        ctx, False, _unreached(goal),
-                        list(position), list(orientation), time.monotonic() - started,
-                    )
-                    return
-                duration_s = max(goal.duration_s, self._ee_floor_s(kinematics, seed, goal))
-                if duration_s > MAX_REQUESTED_DURATION_S:
-                    # The requested duration was admitted against this ceiling,
-                    # but the EE speed caps can raise it past one. Stretching
-                    # anyway would hold the arm slot for longer than any goal
-                    # is allowed to, so the move is refused instead.
-                    position, orientation = kinematics.forward_kinematics(seed)
-                    await _complete_guarded(
-                        ctx, False,
-                        f"the end-effector speed caps need {duration_s:.0f}s for this "
-                        f"move, beyond the {MAX_REQUESTED_DURATION_S:.0f}s ceiling",
-                        list(position), list(orientation), time.monotonic() - started,
-                    )
-                    return
-                profile = minimum_jerk.plan(
-                    seed, solution, duration_s, self._config.max_joint_velocity_rad_s
-                )
+                return
             except Exception as e:
                 # A solver surprise must still reach a terminal result; the
                 # caller would otherwise wait out its whole timeout on an
@@ -468,6 +527,19 @@ class ActionLayer:
                     *_no_pose(), time.monotonic() - started,
                 )
                 return
+            if self._coordinator.stop_count != stops_before:
+                position, orientation = kinematics.forward_kinematics(seed)
+                try:
+                    await ctx.complete_cancelled(
+                        False, self._coordinator.last_stop,
+                        list(position), list(orientation), time.monotonic() - started,
+                    )
+                except Exception as e:
+                    log(f"goal completion failed: {e!r}")
+                return
+            profile = minimum_jerk.plan(
+                seed, solution, duration_s, self._config.max_joint_velocity_rad_s
+            )
             plan = self._coordinator.adopt_arm_plan(profile)
 
             def results(action_time):
@@ -540,6 +612,33 @@ class ActionLayer:
             plan.target,
             "follower state stale before any command streamed; reporting the goal target",
         )
+
+
+def _pose_goal(
+    position,
+    orientation,
+    duration_s: float,
+    position_tolerance_m: float,
+    orientation_tolerance_rad: float,
+) -> PoseGoal:
+    """The pose goal these wire fields name, or Rejection: a pose that is no
+    pose, a duration or a tolerance that is no bar."""
+    try:
+        matrix_from_pose(position, orientation)
+    except PoseError as e:
+        raise Rejection(str(e)) from e
+    _require_duration(duration_s)
+    position_bar = _stated_tolerance(position_tolerance_m, "plan_position_tolerance_m")
+    orientation_bar = _stated_tolerance(
+        orientation_tolerance_rad, "plan_orientation_tolerance_rad"
+    )
+    return PoseGoal(
+        position=tuple(position),
+        orientation=tuple(orientation),
+        duration_s=duration_s,
+        position_tolerance_m=position_bar,
+        orientation_tolerance_rad=orientation_bar,
+    )
 
 
 def _require_duration(duration_s: float) -> None:

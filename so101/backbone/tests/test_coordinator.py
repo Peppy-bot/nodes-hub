@@ -507,3 +507,39 @@ def test_admission_during_a_doomed_publish_anchors_on_delivered_state(fake_kinem
     profile = make_profile(anchor, FAR_TARGET, 1.0, (100.0,) * 5)
     assert profile.start == MEASURED
     c.arm_published(False, None)
+
+
+def test_a_stop_cuts_every_installed_plan_with_its_message_and_names_the_limbs(fake_kinematics):
+    from control_core_py.minimum_jerk import plan as make_profile
+
+    c = make_coordinator(fake_kinematics)
+    c.measured_joints.set(MEASURED)
+    c.measured_gripper.set(0.0)
+    assert c.stop_all("stopped: nothing yet") == []
+    assert (c.stop_count, c.last_stop) == (1, "stopped: nothing yet")
+
+    assert c.try_claim_arm() and c.try_claim_gripper()
+    arm_plan = c.adopt_arm_plan(make_profile(MEASURED, FAR_TARGET, 1.0, (100.0,) * 5))
+    gripper_plan = c.adopt_gripper_plan(1.0, 5.0)
+    now = time.monotonic()
+    sample = c.arm_tick(now)
+    c.arm_published(True, sample)
+    opening = c.gripper_tick(now)
+    c.gripper_published(True, opening)
+
+    assert c.stop_all("stopped: the operator asked") == ["arm", "gripper"]
+
+    # Each plan is cut where its stream stood, as a cancel cuts it, and
+    # carries the stop's message; the wire goes silent. The arm's cut is
+    # sampled at the stop's instant, a hair past the tick's.
+    assert arm_plan.stopped == "stopped: the operator asked"
+    assert arm_plan.aborted and arm_plan.done.is_set()
+    assert arm_plan.frozen == pytest.approx(sample, abs=1e-6)
+    assert gripper_plan.stopped == "stopped: the operator asked"
+    assert gripper_plan.aborted and gripper_plan.done.is_set()
+    assert gripper_plan.frozen == opening
+    assert c.arm_tick(now + 0.01) is None
+    assert c.gripper_tick(now + 0.01) is None
+    assert c.stop_count == 2
+    # The goals release the slots, as after a cancel; the stop does not.
+    assert c.arm_busy

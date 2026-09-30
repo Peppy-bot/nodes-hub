@@ -137,6 +137,11 @@
         // label limb_states, so a consumer can address a limb before a
         // snapshot has been published.
         { link_id: "limb_state", name: "get_limb_names" },
+        // The stop of every planned move in flight, whoever started it, and
+        // the plan check of a Cartesian move that moves nothing: the same
+        // solve a move_arm goal runs, from the same anchor.
+        { link_id: "limb_motion", name: "stop" },
+        { link_id: "limb_motion", name: "check_arm_move" },
       ],
     },
   },

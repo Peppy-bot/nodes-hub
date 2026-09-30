@@ -1,6 +1,7 @@
 """Wiring: parse parameters, build the kinematics, limits, and coordinator,
 and run the control tick, the upstream consumers, the state relays, the limb
-name service, and one server per exposed action."""
+name service, the stop and plan check services, and one server per exposed
+action."""
 
 from __future__ import annotations
 
@@ -15,6 +16,7 @@ from peppygen import NodeBuilder, NodeRunner
 from peppygen.emitted_topics.limb_state import limb_states
 from peppygen.exposed_actions.limb_motion import move_arm, move_arm_joints, move_gripper
 from peppygen.exposed_actions.postures import move_to_home, move_to_ready
+from peppygen.exposed_services.limb_motion import check_arm_move, stop
 from peppygen.exposed_services.limb_state import get_limb_names
 from peppygen.paired_topics.arm import joint_setpoints as down_joint_setpoints
 from peppygen.paired_topics.arm import joint_states as down_joint_states
@@ -435,6 +437,27 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
     tasks.extend(
         asyncio.create_task(serve(node_runner, module, token, decide, drive, layer, pending, label))
         for module, decide, drive, pending, label in action_servers
+    )
+
+    def on_stop(request) -> stop.Response:
+        stopped = layer.stop_moves(request.data.reason)
+        message = f"stopped {', '.join(stopped)}" if stopped else "nothing was moving"
+        return stop.Response(success=True, message=message, stopped=stopped)
+
+    async def on_check_arm_move(request) -> check_arm_move.Response:
+        d = request.data
+        success, message, duration_s = await layer.check_arm_move(
+            d.arm_name, tuple(d.position), tuple(d.orientation), d.duration_s,
+            d.plan_position_tolerance_m, d.plan_orientation_tolerance_rad,
+            point_solver, kinematics,
+        )
+        return check_arm_move.Response(success=success, message=message, duration_s=duration_s)
+
+    tasks.append(asyncio.create_task(runtime.serve(node_runner, stop, on_stop, "stop")))
+    tasks.append(
+        asyncio.create_task(
+            runtime.serve(node_runner, check_arm_move, on_check_arm_move, "check_arm_move")
+        )
     )
     tasks.append(
         asyncio.create_task(
