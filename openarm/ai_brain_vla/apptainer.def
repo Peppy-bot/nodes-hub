@@ -1,0 +1,34 @@
+Bootstrap: docker
+From: peppybot/python-uv-base:latest
+
+%labels
+    Name openarm_ai_brain_vla
+    Version v1
+
+%environment
+    export PATH="/opt/openarm_ai_brain_vla/.venv/bin:$PATH"
+
+%files
+    . /opt/openarm_ai_brain_vla
+
+%post
+    set -eux
+
+    # Keep the interpreter out of the container user's home directory. uv
+    # installs managed Pythons under $HOME, and at run time apptainer mounts
+    # the daemon user's home over the image's own, hiding whatever the build
+    # left there. A daemon running as root hides /root every time: the venv
+    # builds fine and then dies at exec with `./.venv/bin/python: not found`.
+    export UV_PYTHON_INSTALL_DIR=/opt/uv-python
+
+    cd /opt/openarm_ai_brain_vla
+    uv python install
+    # The brain whose models run beside the robot: the sam3-siglip extra
+    # brings torch and transformers into the image, and the manifest passes
+    # --nv so they see the host's GPU; gemini brings the API client. Every
+    # backend is installed so a launcher can choose one without a rebuild.
+    uv sync --no-editable --no-dev --extra sam3-siglip --extra gemini
+
+%runscript
+    cd /opt/openarm_ai_brain_vla
+    exec ./.venv/bin/python -u -m openarm_ai_brain_vla
