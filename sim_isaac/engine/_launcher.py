@@ -17,6 +17,7 @@ from sim_robot_core.cameras import FramePacer
 from bridge_extension import IsaacBridgeExtension
 from object_state import RUNTIME_OBJECTS_PATH, object_prim_path
 from runtime_commander_server import RuntimeCommanderServer
+from world import yaw_orientation
 
 logger = logging.getLogger(__name__)
 
@@ -957,13 +958,19 @@ class SimLauncher:
             [0.0, 0.0, 0.0],
         )
 
-        # Rotation about +z in radians; 0 = as authored.
-        yaw = float(
-            command.get(
-                "yaw",
-                0.0,
+        # The orientation, a unit quaternion (x, y, z, w) the command
+        # names, else the turn of its yaw about +z (0 = as authored).
+        orientation = command.get("orientation")
+
+        if orientation is None:
+            orientation = yaw_orientation(
+                float(
+                    command.get(
+                        "yaw",
+                        0.0,
+                    )
+                )
             )
-        )
 
         scale = command.get(
             "scale",
@@ -1043,7 +1050,7 @@ class SimLauncher:
         self._world.place(
             prim,
             [float(value) for value in position],
-            yaw,
+            tuple(float(value) for value in orientation),
         )
 
         self._runtime_apply_physics(
@@ -1053,11 +1060,11 @@ class SimLauncher:
         )
 
         logger.info(
-            "Spawned runtime object '%s' from %s at %s, at a yaw of %s rad",
+            "Spawned runtime object '%s' from %s at %s, turned to %s",
             name,
             usd_path,
             position,
-            yaw,
+            orientation,
         )
 
     def _runtime_apply_force(
@@ -1275,6 +1282,10 @@ class SimLauncher:
         self,
         command: dict,
     ) -> None:
+        """Moves a runtime object to the command's position; with an
+        orientation, a unit quaternion (x, y, z, w), it turns the object to
+        it too, as a spawn stands it."""
+
         import omni.usd
 
         from pxr import (
@@ -1302,6 +1313,23 @@ class SimLauncher:
             raise RuntimeError(
                 f"Runtime object does not exist: {name}"
             )
+
+        orientation = command.get("orientation")
+
+        if orientation is not None:
+            self._world.place(
+                prim,
+                [float(value) for value in position],
+                tuple(float(value) for value in orientation),
+            )
+
+            logger.info(
+                "Moved runtime object '%s' to %s, turned to %s",
+                name,
+                position,
+                orientation,
+            )
+            return
 
         xformable = UsdGeom.Xformable(
             prim

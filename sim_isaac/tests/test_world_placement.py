@@ -1,6 +1,7 @@
 """Where a robot stands on the stage, against real USD: the order an xform's
-ops are listed in decides where a turned robot ends up, and a referenced
-model brings its own ops."""
+ops are listed in decides where a turned robot ends up, a referenced model
+brings its own ops, and a placement is a unit quaternion the prim turns
+to."""
 
 import math
 import sys
@@ -18,6 +19,11 @@ QUARTER_TURN = math.pi / 2
 @pytest.fixture(name="place")
 def _place():
     return _world_module().World.place
+
+
+def _turned(yaw):
+    """The orientation of a turn of `yaw` radians about +z, as place takes it."""
+    return _world_module().yaw_orientation(yaw)
 
 
 def _prim(carries_orient: bool):
@@ -41,7 +47,7 @@ def _base_of(prim):
 def test_a_turned_robot_stands_where_it_was_placed(place, carries_orient):
     _stage, prim = _prim(carries_orient)
 
-    place(prim, (1.0, 0.0, 0.0), QUARTER_TURN)
+    place(prim, (1.0, 0.0, 0.0), _turned(QUARTER_TURN))
 
     base = _base_of(prim)
     assert base[0] == pytest.approx(1.0, abs=1e-6), base
@@ -52,7 +58,7 @@ def test_a_turned_robot_stands_where_it_was_placed(place, carries_orient):
 def test_the_robot_turns_about_its_own_base(place, carries_orient):
     _stage, prim = _prim(carries_orient)
 
-    place(prim, (1.0, 0.0, 0.0), QUARTER_TURN)
+    place(prim, (1.0, 0.0, 0.0), _turned(QUARTER_TURN))
 
     # A point a metre ahead of the base swings to a metre to its left.
     local = UsdGeom.Xformable(prim).GetLocalTransformation(Usd.TimeCode.Default())
@@ -68,7 +74,7 @@ def test_the_placement_ops_lead_whatever_the_model_carried(place):
     xform.AddOrientOp().Set(Gf.Quatf(1.0, Gf.Vec3f(0, 0, 0)))
     xform.AddScaleOp().Set(Gf.Vec3f(2.0, 2.0, 2.0))
 
-    place(prim, (0.0, 0.0, 0.0), 0.0)
+    place(prim, (0.0, 0.0, 0.0), _turned(0.0))
 
     assert [op.GetOpName() for op in xform.GetOrderedXformOps()] == [
         "xformOp:translate",
@@ -342,9 +348,23 @@ def test_a_model_turns_whatever_width_its_orient_op_was_authored_at(place, preci
     prim = stage.DefinePrim("/openarm/alpha", "Xform")
     UsdGeom.Xformable(prim).AddOrientOp(precision)
 
-    place(prim, (1.0, 0.0, 0.0), QUARTER_TURN)
+    place(prim, (1.0, 0.0, 0.0), _turned(QUARTER_TURN))
 
     local = UsdGeom.Xformable(prim).GetLocalTransformation(Usd.TimeCode.Default())
     ahead = local.Transform(Gf.Vec3d(1, 0, 0))
     assert ahead[0] == pytest.approx(1.0, abs=1e-2), ahead
     assert ahead[1] == pytest.approx(1.0, abs=1e-2), ahead
+
+
+def test_a_prim_placed_with_an_orientation_about_x_lies_on_its_side(place):
+    """The placement takes any unit quaternion, not only a turn about +z: a
+    quarter turn about +x carries a point above the origin to its left."""
+    _stage, prim = _prim(False)
+    half = math.sqrt(0.5)
+
+    place(prim, (0.0, 0.0, 0.0), (half, 0.0, 0.0, half))
+
+    local = UsdGeom.Xformable(prim).GetLocalTransformation(Usd.TimeCode.Default())
+    above = local.Transform(Gf.Vec3d(0, 0, 1))
+    assert above[1] == pytest.approx(-1.0, abs=1e-6), above
+    assert above[2] == pytest.approx(0.0, abs=1e-6), above

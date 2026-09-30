@@ -323,7 +323,17 @@ scene/office
 The scene ids and the Isaac Sim paths behind them are in
 `engine/_launcher.py`. Robots stand beside the runtime scene, not inside it,
 so loading one leaves them where they are; `load_scene` and `clear_scene`
-remove every object scene_manipulation spawned.
+remove every object scene_manipulation spawned. `get_scene` names the scene
+loaded last and its scale, and an empty asset id while the stage stands
+empty. `get_assets_list` narrows the catalogue by the `kind`, `category`
+and `query` its request sets, and `get_asset_categories` counts it per
+category. `get_objects_list` lists every object scene_manipulation spawned
+with its pose as of the latest capture, each in its asset's category and
+with the source `spawned`: an environment places no object of its own, so
+the source `scene` lists nothing. A `spawn_object` or `move_object` goal
+that carries an `orientation`, a unit quaternion `[x, y, z, w]`, stands the
+object turned to it, whatever the spawn's `yaw`; a move without one keeps
+the orientation the object has.
 
 ### Progress of a load or a spawn
 

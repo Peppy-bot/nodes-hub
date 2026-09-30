@@ -23,7 +23,13 @@ from peppygen.exposed_actions.scene import (
     spawn_object,
 )
 from peppygen.exposed_services.objects import get_object_states
-from peppygen.exposed_services.scene import get_assets_list, get_robots_list
+from peppygen.exposed_services.scene import (
+    get_asset_categories,
+    get_assets_list,
+    get_objects_list,
+    get_robots_list,
+    get_scene,
+)
 
 from object_state import IsaacObjectReader, ObjectStateSnapshot
 
@@ -41,6 +47,42 @@ _NOT_CAPTURED = (
 # its action serves after it.
 _REPORT_TIMEOUT_S = 5.0
 
+# The kinds an asset has, as get_assets_list filters them.
+_ASSET_KINDS = ("scene", "object")
+
+# The sources get_objects_list filters by. Every object of this stage was
+# spawned by a caller: the stage places no object of its own when it loads
+# a scene, so "scene" lists nothing.
+_OBJECT_SOURCES = ("spawned", "scene")
+
+# How far from 1 the length of an orientation may be before it is refused.
+_UNIT_TOLERANCE = 1e-3
+
+
+def _orientation_of(payload: dict) -> list[float] | None:
+    """The orientation a goal names, a unit quaternion [x, y, z, w]
+    normalised, or None when the goal names none. A quaternion that is not
+    a unit one, within _UNIT_TOLERANCE, is refused: USD takes it and turns
+    the prim by something else."""
+    orientation = payload.get("orientation")
+
+    if orientation is None:
+        return None
+
+    values = [float(value) for value in orientation]
+
+    if len(values) != 4:
+        raise ValueError("orientation must contain exactly 4 values [x, y, z, w]")
+
+    norm = math.sqrt(sum(value * value for value in values))
+
+    if not math.isfinite(norm) or abs(norm - 1.0) > _UNIT_TOLERANCE:
+        raise ValueError(
+            "orientation must be a unit quaternion [x, y, z, w]"
+        )
+
+    return [value / norm for value in values]
+
 
 def _yaw_of(payload: dict) -> float:
     """The heading a goal names, in radians about +z. A prim turned by a yaw
@@ -54,6 +96,31 @@ def _yaw_of(payload: dict) -> float:
         )
 
     return yaw
+
+
+def _matches(
+    asset: dict,
+    kind: str | None,
+    category: str | None,
+    query: str | None,
+) -> bool:
+    """Whether a public catalogue entry passes every filter that is set."""
+
+    if kind is not None and asset["kind"] != kind:
+        return False
+
+    if category is not None and asset["category"] != category:
+        return False
+
+    if query is None:
+        return True
+
+    needle = query.lower()
+
+    return any(
+        needle in str(asset.get(field, "")).lower()
+        for field in ("asset_id", "display_name", "description")
+    )
 
 
 @dataclass
@@ -151,6 +218,10 @@ class SceneActionIO:
         # The spawned objects in spawn order: what each was spawned from and
         # with. Where each one is comes from the engine at capture.
         self._objects: dict[str, dict] = {}
+        # The scene loaded last, as get_scene names it: no asset while the
+        # stage stands empty, which is how it opens and what clear_scene
+        # leaves.
+        self._scene: dict = {"asset_id": "", "scale": 1.0}
 
         self._object_reader = IsaacObjectReader()
         # The latest capture, and why there is none while it is None.
@@ -195,6 +266,9 @@ class SceneActionIO:
                 self._serve_apply_force()
             ),
             asyncio.create_task(self._serve_assets()),
+            asyncio.create_task(self._serve_asset_categories()),
+            asyncio.create_task(self._serve_objects_list()),
+            asyncio.create_task(self._serve_scene()),
             asyncio.create_task(self._serve_object_states()),
             asyncio.create_task(self._serve_robots()),
             asyncio.create_task(self._serve_load_scene()),
@@ -292,6 +366,10 @@ class SceneActionIO:
                         "display_name",
                         "",
                     ),
+                    "description": asset.get(
+                        "description",
+                        "",
+                    ),
                     "kind": asset.get(
                         "kind",
                         "",
@@ -333,32 +411,185 @@ class SceneActionIO:
 
         return public
 
-    def _handle_get_assets(
-        self,
-        _request,
-    ) -> get_assets_list.Response:
+    def _catalogue_ready(self) -> str | None:
+        """Why the catalogue cannot be answered yet, or None once it can."""
+
         with self._lock:
             ready = self._assets_ready
 
-        if not ready:
+        if ready:
+            return None
+
+        return (
+            "Isaac is still discovering its asset catalogue; "
+            "it is available once the stage has loaded"
+        )
+
+    def _handle_get_assets(
+        self,
+        request,
+    ) -> get_assets_list.Response:
+        """The catalogue, narrowed by every filter the request sets: a
+        kind that is neither scene nor object is refused, and the text is
+        looked for in an entry's id, name and description whatever the
+        case."""
+
+        not_ready = self._catalogue_ready()
+
+        if not_ready is not None:
             return get_assets_list.Response(
                 success=False,
-                message=(
-                    "Isaac is still discovering its asset catalogue; "
-                    "it is available once the stage has loaded"
-                ),
+                message=not_ready,
                 assets_json="[]",
             )
 
-        assets = self._public_assets()
+        kind = request.data.kind
+        category = request.data.category
+        query = request.data.query
+
+        if kind is not None and kind not in _ASSET_KINDS:
+            return get_assets_list.Response(
+                success=False,
+                message="kind must be scene or object",
+                assets_json="[]",
+            )
+
+        assets = [
+            asset
+            for asset in self._public_assets()
+            if _matches(asset, kind, category, query)
+        ]
 
         return get_assets_list.Response(
             success=True,
-            message=f"{len(assets)} assets available",
+            message=f"{len(assets)} assets listed",
             assets_json=json.dumps(
                 assets,
                 separators=(",", ":"),
             ),
+        )
+
+    def _handle_get_asset_categories(
+        self,
+        _request,
+    ) -> get_asset_categories.Response:
+        """Every category of the catalogue with its count, in the order the
+        catalogue lists them."""
+
+        not_ready = self._catalogue_ready()
+
+        if not_ready is not None:
+            return get_asset_categories.Response(
+                success=False,
+                message=not_ready,
+                categories=[],
+            )
+
+        counts: dict[tuple[str, str], int] = {}
+
+        for asset in self._public_assets():
+            key = (asset["kind"], asset["category"])
+            counts[key] = counts.get(key, 0) + 1
+
+        categories = [
+            get_asset_categories.ResponseCategoriesItem(
+                kind=kind,
+                category=category,
+                count=count,
+            )
+            for (kind, category), count in counts.items()
+        ]
+
+        return get_asset_categories.Response(
+            success=True,
+            message=f"{len(categories)} categories",
+            categories=categories,
+        )
+
+    def _handle_get_objects_list(
+        self,
+        request,
+    ) -> get_objects_list.Response:
+        """What stands on the stage and where, from the latest capture: every
+        object a caller spawned, in its asset's category, narrowed by the
+        request's source and category. The stage places no object of its own
+        when it loads a scene, so a request for the scene's objects lists
+        nothing."""
+
+        source = request.data.source
+        category = request.data.category
+
+        if source is not None and source not in _OBJECT_SOURCES:
+            return get_objects_list.Response(
+                success=False,
+                message="source must be spawned or scene",
+                timestamp=0.0,
+                objects=[],
+            )
+
+        with self._lock:
+            snapshot = self._snapshot
+            unavailable = self._unavailable
+
+        if snapshot is None:
+            return get_objects_list.Response(
+                success=False,
+                message=unavailable,
+                timestamp=0.0,
+                objects=[],
+            )
+
+        objects = []
+
+        if source != "scene":
+            for record in snapshot.objects:
+                asset = self._asset(record.asset_id) or {}
+                asset_category = str(asset.get("category", ""))
+
+                if category is not None and category != asset_category:
+                    continue
+
+                objects.append(
+                    get_objects_list.ResponseObjectsItem(
+                        object_id=record.object_id,
+                        asset_id=record.asset_id,
+                        category=asset_category,
+                        source="spawned",
+                        physics=record.physics,
+                        mass=record.mass,
+                        scale=record.scale,
+                        position=list(record.position),
+                        orientation=list(record.orientation),
+                    )
+                )
+
+        return get_objects_list.Response(
+            success=True,
+            message=f"{len(objects)} objects",
+            timestamp=snapshot.timestamp_s,
+            objects=objects,
+        )
+
+    def _handle_get_scene(
+        self,
+        _request,
+    ) -> get_scene.Response:
+        with self._lock:
+            scene = dict(self._scene)
+
+        if not scene["asset_id"]:
+            return get_scene.Response(
+                success=True,
+                message="no scene is loaded: the stage stands empty",
+                asset_id="",
+                scale=1.0,
+            )
+
+        return get_scene.Response(
+            success=True,
+            message=f"scene {scene['asset_id']} at scale {scene['scale']}",
+            asset_id=scene["asset_id"],
+            scale=scene["scale"],
         )
 
     def invalidate_physics_views(self) -> None:
@@ -629,6 +860,9 @@ class SceneActionIO:
                 }
             )
 
+            with self._lock:
+                self._scene = {"asset_id": asset_id, "scale": scale}
+
             return {
                 "success": True,
                 "message": f"Loaded scene {asset_id}",
@@ -638,6 +872,9 @@ class SceneActionIO:
             self._remove_spawned_objects(launcher)
 
             launcher._runtime_clear_scene()
+
+            with self._lock:
+                self._scene = {"asset_id": "", "scale": 1.0}
 
             return {
                 "success": True,
@@ -668,6 +905,7 @@ class SceneActionIO:
                     "position must contain exactly 3 values"
                 )
 
+            orientation = _orientation_of(payload)
             yaw = _yaw_of(payload)
 
             scale = float(payload["scale"])
@@ -704,21 +942,24 @@ class SceneActionIO:
                 + uuid.uuid4().hex[:12]
             )
 
-            launcher._runtime_spawn_isaac_asset(
-                {
-                    "name": object_id,
-                    "path": asset["path"],
-                    "position": position,
-                    "yaw": yaw,
-                    "scale": [
-                        scale,
-                        scale,
-                        scale,
-                    ],
-                    "physics": physics,
-                    "mass": mass,
-                }
-            )
+            spawn = {
+                "name": object_id,
+                "path": asset["path"],
+                "position": position,
+                "yaw": yaw,
+                "scale": [
+                    scale,
+                    scale,
+                    scale,
+                ],
+                "physics": physics,
+                "mass": mass,
+            }
+
+            if orientation is not None:
+                spawn["orientation"] = orientation
+
+            launcher._runtime_spawn_isaac_asset(spawn)
 
             with self._lock:
                 self._objects[object_id] = {
@@ -753,12 +994,17 @@ class SceneActionIO:
                     "position must contain exactly 3 values"
                 )
 
-            launcher._runtime_move_object(
-                {
-                    "name": object_id,
-                    "position": position,
-                }
-            )
+            move = {
+                "name": object_id,
+                "position": position,
+            }
+
+            orientation = _orientation_of(payload)
+
+            if orientation is not None:
+                move["orientation"] = orientation
+
+            launcher._runtime_move_object(move)
 
             return {
                 "success": True,
@@ -959,6 +1205,57 @@ class SceneActionIO:
                 )
                 await asyncio.sleep(1.0)
 
+    async def _serve_asset_categories(self) -> None:
+        while True:
+            try:
+                await get_asset_categories.handle_next_request(
+                    self._node_runner,
+                    self._handle_get_asset_categories,
+                )
+
+            except asyncio.CancelledError:
+                raise
+
+            except Exception:
+                logger.exception(
+                    "get_asset_categories service failed"
+                )
+                await asyncio.sleep(1.0)
+
+    async def _serve_objects_list(self) -> None:
+        while True:
+            try:
+                await get_objects_list.handle_next_request(
+                    self._node_runner,
+                    self._handle_get_objects_list,
+                )
+
+            except asyncio.CancelledError:
+                raise
+
+            except Exception:
+                logger.exception(
+                    "get_objects_list service failed"
+                )
+                await asyncio.sleep(1.0)
+
+    async def _serve_scene(self) -> None:
+        while True:
+            try:
+                await get_scene.handle_next_request(
+                    self._node_runner,
+                    self._handle_get_scene,
+                )
+
+            except asyncio.CancelledError:
+                raise
+
+            except Exception:
+                logger.exception(
+                    "get_scene service failed"
+                )
+                await asyncio.sleep(1.0)
+
     async def _serve_object_states(self) -> None:
         while True:
             try:
@@ -1072,6 +1369,7 @@ class SceneActionIO:
                         request.position
                     ),
                     "yaw": request.yaw,
+                    "orientation": request.orientation,
                     "scale": request.scale,
                     "physics": request.physics,
                     "mass": request.mass,
@@ -1125,6 +1423,7 @@ class SceneActionIO:
                     "position": list(
                         request.position
                     ),
+                    "orientation": request.orientation,
                 },
             )
 
