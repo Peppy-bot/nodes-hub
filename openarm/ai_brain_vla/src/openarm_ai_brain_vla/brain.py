@@ -26,7 +26,7 @@ from .perception.perceiver import Perceiver
 from .ports import Cancelled, Manipulator, Refusal
 from .robot import Robot
 from .sequencer import MANIPULATION, PERCEPTION, Job, Sequencer
-from .state import State
+from .state import State, new_run_token
 
 Body = Callable[[Job], Awaitable[dict]]
 
@@ -40,10 +40,11 @@ class Brain:
         detector=None,
         manipulator: Optional[Manipulator] = None,
         now: Optional[Callable[[], int]] = None,
+        run_token: Optional[str] = None,
     ) -> None:
         self.params = params
         self.node_runner = node_runner
-        self.state = State(params.gripper_names.split(","))
+        self.state = State(params.gripper_names.split(","), new_run_token() if run_token is None else run_token)
         self.robot = Robot(node_runner)
         self.frames = FrameStore()
         self.camera = CameraModel.from_parameters(params.camera_pose)

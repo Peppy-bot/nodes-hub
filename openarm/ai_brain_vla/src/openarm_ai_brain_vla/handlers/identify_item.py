@@ -3,7 +3,7 @@ the manipulation actions accept."""
 
 from __future__ import annotations
 
-from ..ports import Refusal
+from ..ports import Coverage, Refusal
 from ..sequencer import PERCEPTION
 from ..state import best_match
 
@@ -22,9 +22,9 @@ async def run(brain, ctx) -> None:
             if description:
                 raise Refusal(f"no item matches '{description}'")
             raise Refusal("no item in view")
-        # A search is not a full scan: it refreshes what it found and
-        # drops nothing, so the other items keep their ids.
-        item = brain.state.remember([best], brain.now(), complete=False)[0]
+        # A search covers nothing: it refreshes what it found, renames
+        # nothing and drops nothing, so the other items keep their ids.
+        item = brain.state.remember([best], brain.now(), coverage=Coverage())[0]
         return dict(
             item_id=item.item_id,
             label=item.label,

@@ -89,7 +89,7 @@ from typing import Optional, Sequence, Union
 
 import numpy as np
 
-from ..ports import Box
+from ..ports import Box, Coverage
 from .gallery_store import CACHE_DIR, NO_GALLERY, GalleryUnavailable, HarvestDir, Pack, Source, phrase_for, resolve
 
 logger = logging.getLogger(__name__)
@@ -163,6 +163,10 @@ class Gallery:
     def is_background(self, index: int) -> bool:
         return bool(self.background[index]) if index < len(self.background) else False
 
+    def item_indices(self) -> list[int]:
+        """The classes that are items: every class but the background ones."""
+        return [i for i in range(len(self.classes)) if not self.is_background(i)]
+
     def index_of(self, description: str) -> list[int]:
         """The gallery items a description names: those whose key or phrase
         it is, else those whose phrase holds every word of it, whole words,
@@ -173,7 +177,7 @@ class Gallery:
         wanted = description.strip().lower().replace("_", " ")
         if not wanted:
             return []
-        items = [i for i in range(len(self.classes)) if not self.is_background(i)]
+        items = self.item_indices()
         exact = [i for i in items if wanted in (self.classes[i].lower().replace("_", " "), self.phrases[i].lower())]
         if exact:
             return exact
@@ -571,6 +575,15 @@ class Sam3SiglipDetector:
 
     def set_vocabulary(self, phrases: Sequence[str]) -> None:
         self._vocabulary = list(phrases)
+
+    def scan_coverage(self) -> Coverage:
+        """A scan names the gallery's items, or `DEFAULT_VOCABULARY` without
+        a gallery; never a background class, since those boxes are dropped."""
+        if self._models is None:
+            return Coverage()
+        if self._gallery is None:
+            return Coverage(frozenset(DEFAULT_VOCABULARY))
+        return Coverage(frozenset(self._gallery.phrases[i] for i in self._gallery.item_indices()))
 
     def detect(self, image: np.ndarray) -> list[Box]:
         from PIL import Image

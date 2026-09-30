@@ -13,7 +13,7 @@ import pytest
 
 from peppygen.parameters import Parameters
 
-from openarm_ai_brain_vla.ports import Box, CancelToken, Gripper, Item, Outcome, Pose
+from openarm_ai_brain_vla.ports import Box, CancelToken, Coverage, Gripper, Item, Outcome, Pose
 
 PARAMS = {
     "gripper_names": "left_gripper,right_gripper",
@@ -34,12 +34,14 @@ def params() -> Parameters:
 
 
 class FakeDetector:
-    """Returns the boxes the test hands it, and records the vocabulary."""
+    """Returns the boxes the test hands it, and records the vocabulary. Its
+    scans name every label unless the test hands it a coverage."""
 
     name = "fake"
 
-    def __init__(self, boxes: Optional[list[Box]] = None) -> None:
+    def __init__(self, boxes: Optional[list[Box]] = None, coverage: Coverage = Coverage(every_label=True)) -> None:
         self.boxes = boxes or []
+        self.coverage = coverage
         self.loaded: Optional[str] = None
         self.vocabulary: list[str] = []
 
@@ -56,6 +58,9 @@ class FakeDetector:
 
     def detect(self, image: np.ndarray) -> list[Box]:
         return list(self.boxes)
+
+    def scan_coverage(self) -> Coverage:
+        return self.coverage
 
 
 class FakeManipulator:

@@ -4,12 +4,28 @@ data and pure functions, no robot calls, so every rule has a fast test.
 
 Rules written down here because the code depends on them:
 
-- Item ids. A scan's detection with the same label as a known item and
-  within `MATCH_RADIUS_M` of it keeps that item's id; any other detection
-  gets a new id, `<label>_<n>`. A known item that a full scan did not see
-  is dropped, unless a gripper holds it, so grab_item cannot be sent to an
-  item that left the table. An identify search is not a full scan: it
-  refreshes what it found and drops nothing.
+- Item ids. An id is `<label>_<n>-<run token>`. The run token is drawn
+  once per brain process, so after a restart an id from the earlier run is
+  refused as unknown instead of naming whatever item this run numbered the
+  same. `n` counts per label stem and only grows, so a dropped id never
+  comes back.
+- An item is the thing at its place. A detection keeps the id of a known
+  item within `MATCH_RADIUS_M` of it: one with the detection's label
+  first, then the nearest. The label only breaks ties, because one object
+  gets different labels from different searches (the gallery's name in a
+  scan, the caller's words in an identify search). Any other detection
+  mints a new id. An item a gripper holds is in the gripper, not where it
+  was grabbed, so no detection matches it. The cost: an item swapped for
+  another within the radius between two looks hands its id to the new one.
+- What a look drops and renames is its `Coverage`. A scan drops a known
+  item it did not see when it could have named it, unless a gripper holds
+  it, so grab_item cannot be sent to an item that left the table; an item
+  only a description finds survives it. An identify search covers nothing:
+  it refreshes what it found and drops nothing. An item that moved further
+  than the radius gets a new id, and a covering scan drops the old one.
+- Released items. A place_item moves the item to the pose it was put at,
+  so the next scan keeps its id. A drop_item leaves it at the position it
+  was grabbed at, since nothing measured where it landed.
 - Holding follows results, not jaws. A gripper holds an item after a
   successful grab and stops holding after a successful drop or place.
   Refusals, failures, cancels and aborts leave the flag as it was.
@@ -21,11 +37,18 @@ Rules written down here because the code depends on them:
 from __future__ import annotations
 
 import math
+import secrets
 from typing import Iterable, Optional, Sequence
 
-from .ports import Detection, Gripper, Item, Quat, Refusal, Vec3
+from .ports import Coverage, Detection, Gripper, Item, Quat, Refusal, Vec3
 
 MATCH_RADIUS_M = 0.05
+
+
+def new_run_token() -> str:
+    """The token every id of one brain process carries: six hex digits, so
+    two runs share one with a chance of 1 in 16.7 million."""
+    return secrets.token_hex(3)
 
 
 def arm_of(gripper_name: str) -> str:
@@ -63,14 +86,17 @@ def best_match(detections: Sequence[Detection], description: str) -> Optional[De
 
 
 class State:
-    def __init__(self, gripper_names: Iterable[str], match_radius_m: float = MATCH_RADIUS_M) -> None:
+    def __init__(self, gripper_names: Iterable[str], run_token: str, match_radius_m: float = MATCH_RADIUS_M) -> None:
         names = [name.strip() for name in gripper_names if name.strip()]
         if not names:
             raise ValueError("gripper_names must name at least one gripper")
         if len(set(names)) != len(names):
             raise ValueError("gripper_names must be distinct")
+        if not run_token.isalnum():
+            raise ValueError(f"run_token must be letters and digits, got {run_token!r}")
         self.grippers: dict[str, Gripper] = {name: Gripper(name=name, arm=arm_of(name)) for name in names}
         self.items: dict[str, Item] = {}
+        self.run_token = run_token
         self.match_radius_m = match_radius_m
         self._counts: dict[str, int] = {}
 
@@ -121,8 +147,21 @@ class State:
         gripper.held_item_id = item_id
 
     def clear_held(self, gripper: Gripper) -> str:
+        """Releases what the gripper holds and returns its id. The item
+        keeps the position it was grabbed at."""
         item_id = gripper.held_item_id or ""
         gripper.held_item_id = None
+        return item_id
+
+    def clear_held_placed(self, gripper: Gripper, position: Vec3, orientation: Optional[Quat]) -> str:
+        """Releases what the gripper holds at the pose place_item put it at
+        and returns its id. The item takes that pose, so the next scan finds
+        it where it stands and keeps its id."""
+        item_id = self.clear_held(gripper)
+        item = self.items.get(item_id)
+        if item is not None:
+            item.position = position
+            item.orientation = orientation
         return item_id
 
     def snapshot(self) -> tuple[list[str], list[bool], list[str]]:
@@ -142,51 +181,56 @@ class State:
             raise Refusal(f"unknown item '{item_id}'")
         return item
 
-    def remember(self, detections: Sequence[Detection], now_ns: int, *, complete: bool) -> list[Item]:
-        """Folds detections into the known items and returns them in the
-        detections' order. `complete` says the detections are everything in
-        view (a scan), so unseen items are dropped except held ones."""
+    def remember(self, detections: Sequence[Detection], now_ns: int, *, coverage: Coverage) -> list[Item]:
+        """Folds one look's detections into the known items and returns
+        them in the detections' order. `coverage` is what the look names
+        with authority: the unseen items it drops, except held ones, and
+        the seen items whose label it replaces."""
+        held = self._held_ids()
         seen: list[Item] = []
         claimed: set[str] = set()
         for detection in detections:
-            match = self._match(detection, claimed)
-            if match is None:
-                match = self._mint(detection.label, detection.position, detection.orientation, detection.confidence, now_ns)
+            item = self._match(detection, claimed, held)
+            if item is None:
+                item = self._mint(detection.label, detection.position, detection.orientation, detection.confidence, now_ns)
             else:
-                match.position = detection.position
-                match.orientation = detection.orientation
-                match.confidence = detection.confidence
-                match.seen_at_ns = now_ns
-            claimed.add(match.item_id)
-            seen.append(match)
-        if complete:
-            held = {gripper.held_item_id for gripper in self.grippers.values() if gripper.holding}
-            for item_id in list(self.items):
-                if item_id not in claimed and item_id not in held:
-                    del self.items[item_id]
+                _refresh(item, detection, now_ns, coverage)
+            claimed.add(item.item_id)
+            seen.append(item)
+        for item_id, item in list(self.items.items()):
+            if item_id not in claimed and item_id not in held and coverage.covers(item.label):
+                del self.items[item_id]
         return seen
 
     def mint_from_pose(self, position: Vec3, orientation: Optional[Quat], now_ns: int) -> Item:
         """An id for an item a goal addressed by pose rather than by id."""
         return self._mint("item", position, orientation, 0.0, now_ns)
 
-    def _match(self, detection: Detection, claimed: set[str]) -> Optional[Item]:
-        best: Optional[Item] = None
-        best_distance = self.match_radius_m
-        for item in self.items.values():
-            if item.item_id in claimed or item.label != detection.label:
-                continue
-            gap = distance(item.position, detection.position)
-            if gap <= best_distance:
-                best, best_distance = item, gap
-        return best
+    def _held_ids(self) -> set[str]:
+        return {gripper.held_item_id for gripper in self.grippers.values() if gripper.held_item_id is not None}
+
+    def _match(self, detection: Detection, claimed: set[str], held: set[str]) -> Optional[Item]:
+        """The known item at the detection's place: among the items within
+        the match radius that no earlier detection of this look claimed and
+        no gripper holds, one with the detection's label first, then the
+        nearest."""
+        near = [
+            item
+            for item in self.items.values()
+            if item.item_id not in claimed
+            and item.item_id not in held
+            and distance(item.position, detection.position) <= self.match_radius_m
+        ]
+        if not near:
+            return None
+        return min(near, key=lambda item: (item.label != detection.label, distance(item.position, detection.position)))
 
     def _mint(self, label: str, position: Vec3, orientation: Optional[Quat], confidence: float, now_ns: int) -> Item:
         stem = _stem(label)
         count = self._counts.get(stem, 0) + 1
         self._counts[stem] = count
         item = Item(
-            item_id=f"{stem}_{count}",
+            item_id=f"{stem}_{count}-{self.run_token}",
             label=label,
             position=position,
             orientation=orientation,
@@ -195,6 +239,17 @@ class State:
         )
         self.items[item.item_id] = item
         return item
+
+
+def _refresh(item: Item, detection: Detection, now_ns: int, coverage: Coverage) -> None:
+    """A known item as a look saw it again: where it is now, and the look's
+    label when the look names that label with authority."""
+    item.position = detection.position
+    item.orientation = detection.orientation
+    item.confidence = detection.confidence
+    item.seen_at_ns = now_ns
+    if coverage.covers(detection.label):
+        item.label = detection.label
 
 
 def _stem(label: str) -> str:

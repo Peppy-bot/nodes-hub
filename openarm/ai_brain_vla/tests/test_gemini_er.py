@@ -23,6 +23,7 @@ from openarm_ai_brain_vla.perception.gemini_er import (
     parse_boxes,
     plan_for,
 )
+from openarm_ai_brain_vla.ports import Coverage
 
 
 class FakeApi:
@@ -156,6 +157,11 @@ def test_the_registry_builds_the_backend_and_the_model_id_defaults():
     assert fake.model == MODEL and fake.available
     fake.load("gemini-robotics-er-3")
     assert fake.model == "gemini-robotics-er-3"
+
+
+def test_a_scan_covers_every_label_once_the_client_is_open():
+    assert GeminiErDetector().scan_coverage() == Coverage()
+    assert GeminiErDetector(api=FakeApi()).scan_coverage() == Coverage(every_label=True)
 
 
 def test_a_scan_asks_for_everything_and_keeps_the_models_labels():

@@ -57,7 +57,7 @@ from typing import Optional, Protocol, Sequence
 
 import numpy as np
 
-from ..ports import Box
+from ..ports import Box, Coverage
 
 logger = logging.getLogger(__name__)
 
@@ -367,6 +367,13 @@ class GeminiErDetector:
 
     def set_vocabulary(self, phrases: Sequence[str]) -> None:
         self._vocabulary = [p.strip() for p in phrases if p.strip()]
+
+    def scan_coverage(self) -> Coverage:
+        """A scan asks for every object in the model's own words, so it can
+        name any label."""
+        if self._api is None:
+            return Coverage()
+        return Coverage(every_label=True)
 
     def detect(self, image: np.ndarray) -> list[Box]:
         if self._api is None:

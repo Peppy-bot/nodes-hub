@@ -110,6 +110,22 @@ class Detection:
     orientation: Optional[Quat] = None
 
 
+@dataclass(frozen=True)
+class Coverage:
+    """The labels one look names with authority. A known item the look did
+    not see is dropped only when the look covers its label, and an item the
+    look saw takes the look's label only when the look covers it. So a scan
+    that cannot name an item leaves it alone, and a search by description
+    covers nothing: it never renames an item and never drops one.
+    `every_label` is a look that can name anything, an open-vocabulary scan."""
+
+    labels: frozenset[str] = frozenset()
+    every_label: bool = False
+
+    def covers(self, label: str) -> bool:
+        return self.every_label or label in self.labels
+
+
 @dataclass
 class Item:
     """A known item: the id the brain minted for it and what was last seen."""
@@ -169,6 +185,11 @@ class Detector(Protocol):
 
     def detect(self, image) -> list[Box]:
         """`image` is an H x W x 3 uint8 RGB array."""
+        ...
+
+    def scan_coverage(self) -> Coverage:
+        """The labels a scan, a search with the empty vocabulary, can name;
+        nothing while the backend is not loaded."""
         ...
 
 

@@ -12,7 +12,7 @@ async def run(brain, ctx) -> None:
 
     async def body(job) -> dict:
         detections = await brain.perceiver.scan([], job.cancel, goal.timeout_s)
-        items = brain.state.remember(detections, brain.now(), complete=True)
+        items = brain.state.remember(detections, brain.now(), coverage=brain.perceiver.detector.scan_coverage())
         return dict(
             item_ids=[item.item_id for item in items],
             labels=[item.label for item in items],

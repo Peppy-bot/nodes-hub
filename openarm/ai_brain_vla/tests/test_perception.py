@@ -20,7 +20,7 @@ from openarm_ai_brain_vla.perception.camera import (
 )
 from openarm_ai_brain_vla.perception.frames import FrameStore, decode_color, decode_depth, depth_at
 from openarm_ai_brain_vla.perception.perceiver import Perceiver, merge_duplicates
-from openarm_ai_brain_vla.ports import Box, CancelToken, Refusal
+from openarm_ai_brain_vla.ports import Box, CancelToken, Coverage, Refusal
 
 IDENTITY = CameraModel.from_parameters("0 0 0 0 0 0 1").with_intrinsics(Intrinsics.from_fovy(90.0, 16, 12))
 
@@ -208,6 +208,7 @@ async def test_a_scan_is_refused_without_a_detector_or_without_frames():
     from openarm_ai_brain_vla.perception.none import NoneDetector
 
     frames = FrameStore()
+    assert NoneDetector().scan_coverage() == Coverage()
     none = Perceiver(NoneDetector(), frames, IDENTITY)
     with pytest.raises(Refusal, match="perception_backend is 'none'"):
         await none.scan([], CancelToken(), 0.0)

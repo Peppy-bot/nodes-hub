@@ -22,8 +22,8 @@ async def run(brain, ctx) -> None:
         job.cancel.check()
         if not outcome.success:
             raise Refusal(outcome.message or "the placement failed")
-        item_id = state.clear_held(gripper)
         final = outcome.final_position if outcome.final_position is not None else pose.position
+        item_id = state.clear_held_placed(gripper, final, pose.orientation)
         return dict(gripper_name=gripper.name, item_id=item_id, final_position=list(final))
 
     await brain.run_guarded(ctx, MANIPULATION, "place_item", body, ZERO)

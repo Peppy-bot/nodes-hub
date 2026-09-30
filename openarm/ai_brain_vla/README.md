@@ -75,6 +75,29 @@ pose in the robot's frame that turns the ray into a point.
   from Enactic's CAD, the value the simulators place the camera at; a measured
   pose on the real robot replaces it.
 
+## Item ids
+
+`scan_items` and `identify_item` give each item an id that `grab_item` takes,
+`<label>_<n>-<run token>`, for example `mustard_bottle_1-3fa9c2`. The brain
+keeps its items in memory only.
+
+- **An item is the thing at its place.** A detection within 5 cm of a known
+  item keeps that item's id, whatever label the search gave it: "yellow
+  bottle" returns the id and the label a scan gave the mustard bottle. The
+  label only decides between two items at one place, such as an apple in a
+  bowl.
+- **A scan drops only what it could name.** A known item that a scan does not
+  see is dropped when the scan could have named it, never when a gripper holds
+  it. With `sam3_siglip` and `yoloe_vp` a scan names the gallery's items, so an
+  item found by words alone ("blue ball") keeps its id across scans; a
+  `gemini_er` scan names anything, so it drops every item it does not see.
+- **An item that moves more than 5 cm gets a new id** at the next scan, and the
+  old id is dropped. `place_item` is the exception: the item takes the pose it
+  was put at, so its id stays. After `drop_item` the item keeps the position it
+  was grabbed at, since nothing measured where it landed.
+- **The run token is new at each start of the node**, so an id from before a
+  restart is refused as an unknown item instead of naming a different one.
+
 ## Testing it on any machine
 
 What the machine needs: an NVIDIA GPU with 12 GB free (SAM 3 and SigLIP take

@@ -1,14 +1,18 @@
 """The rules in State, each one a test: gripper resolution, the holding
-flag, item ids across scans, and the best match for a description."""
+flag, item ids across looks and runs, and the best match for a description."""
 
 import pytest
 
-from openarm_ai_brain_vla.ports import Detection, Refusal
-from openarm_ai_brain_vla.state import State, arm_of, best_match
+from openarm_ai_brain_vla.ports import Coverage, Detection, Refusal
+from openarm_ai_brain_vla.state import State, arm_of, best_match, new_run_token
+
+# A scan that can name anything, and a search by description, which covers nothing.
+EVERY = Coverage(every_label=True)
+NOTHING = Coverage()
 
 
-def make_state() -> State:
-    return State(["left_gripper", "right_gripper"])
+def make_state(run_token: str = "t0") -> State:
+    return State(["left_gripper", "right_gripper"], run_token)
 
 
 def test_arm_names_follow_the_backbone_side_naming():
@@ -19,9 +23,18 @@ def test_arm_names_follow_the_backbone_side_naming():
 
 def test_gripper_names_must_be_present_and_distinct():
     with pytest.raises(ValueError):
-        State([""])
+        State([""], "t0")
     with pytest.raises(ValueError):
-        State(["a", "a"])
+        State(["a", "a"], "t0")
+
+
+def test_the_run_token_must_be_letters_and_digits():
+    for token in ("", "a-b", "a b", "a_b"):
+        with pytest.raises(ValueError, match="run_token must be letters and digits"):
+            State(["left_gripper"], token)
+    token = new_run_token()
+    assert len(token) == 6 and int(token, 16) >= 0
+    assert State(["left_gripper"], token).run_token == token
 
 
 def test_named_gripper_for_a_grab_must_exist_and_be_free():
@@ -66,52 +79,144 @@ def test_a_scan_keeps_ids_for_items_that_stayed_and_drops_the_ones_that_left():
     first = state.remember(
         [Detection("cup", (0.50, 0.10, 0.70), 0.9), Detection("cup", (0.50, -0.20, 0.70), 0.8), Detection("banana", (0.40, 0.0, 0.70), 0.7)],
         now_ns=1,
-        complete=True,
+        coverage=EVERY,
     )
-    assert [item.item_id for item in first] == ["cup_1", "cup_2", "banana_1"]
+    assert [item.item_id for item in first] == ["cup_1-t0", "cup_2-t0", "banana_1-t0"]
     # The first cup moved 2 cm, the second one is gone, a bowl appeared.
     second = state.remember(
         [Detection("cup", (0.52, 0.10, 0.70), 0.95), Detection("bowl", (0.60, 0.0, 0.70), 0.6)],
         now_ns=2,
-        complete=True,
+        coverage=EVERY,
     )
-    assert [item.item_id for item in second] == ["cup_1", "bowl_1"]
-    assert set(state.items) == {"cup_1", "bowl_1"}
-    assert state.items["cup_1"].position == (0.52, 0.10, 0.70)
-    # Beyond the match radius the same label is a new item.
-    third = state.remember([Detection("cup", (0.80, 0.10, 0.70), 0.9)], now_ns=3, complete=True)
-    assert third[0].item_id == "cup_3"
+    assert [item.item_id for item in second] == ["cup_1-t0", "bowl_1-t0"]
+    assert set(state.items) == {"cup_1-t0", "bowl_1-t0"}
+    assert state.items["cup_1-t0"].position == (0.52, 0.10, 0.70)
+    # Beyond the match radius the same label is a new item, and a dropped
+    # number is never minted again.
+    third = state.remember([Detection("cup", (0.80, 0.10, 0.70), 0.9)], now_ns=3, coverage=EVERY)
+    assert third[0].item_id == "cup_3-t0"
+    assert set(state.items) == {"cup_3-t0"}
 
 
 def test_a_scan_never_drops_an_item_a_gripper_holds():
     state = make_state()
-    state.remember([Detection("cup", (0.5, 0.1, 0.7), 0.9)], now_ns=1, complete=True)
-    state.set_held(state.grippers["left_gripper"], "cup_1")
-    state.remember([], now_ns=2, complete=True)
-    assert "cup_1" in state.items
+    state.remember([Detection("cup", (0.5, 0.1, 0.7), 0.9)], now_ns=1, coverage=EVERY)
+    state.set_held(state.grippers["left_gripper"], "cup_1-t0")
+    state.remember([], now_ns=2, coverage=EVERY)
+    assert "cup_1-t0" in state.items
 
 
 def test_an_identify_search_refreshes_without_dropping_the_rest():
     state = make_state()
-    state.remember([Detection("cup", (0.5, 0.1, 0.7), 0.9), Detection("banana", (0.4, 0.0, 0.7), 0.7)], now_ns=1, complete=True)
-    found = state.remember([Detection("cup", (0.51, 0.1, 0.7), 0.9)], now_ns=2, complete=False)
-    assert found[0].item_id == "cup_1"
-    assert set(state.items) == {"cup_1", "banana_1"}
+    state.remember([Detection("cup", (0.5, 0.1, 0.7), 0.9), Detection("banana", (0.4, 0.0, 0.7), 0.7)], now_ns=1, coverage=EVERY)
+    found = state.remember([Detection("cup", (0.51, 0.1, 0.7), 0.8)], now_ns=2, coverage=NOTHING)
+    assert found[0].item_id == "cup_1-t0"
+    assert found[0].position == (0.51, 0.1, 0.7) and found[0].confidence == 0.8 and found[0].seen_at_ns == 2
+    assert set(state.items) == {"cup_1-t0", "banana_1-t0"}
+
+
+def test_a_search_under_other_words_keeps_the_scans_id_and_label():
+    state = make_state()
+    gallery_scan = Coverage(frozenset({"mustard bottle", "apple"}))
+    scanned = state.remember([Detection("mustard bottle", (0.5, 0.0, 0.7), 0.9)], now_ns=1, coverage=gallery_scan)[0]
+    # The words route labels the same bottle with the caller's description.
+    found = state.remember([Detection("yellow bottle", (0.51, 0.0, 0.7), 0.96)], now_ns=2, coverage=NOTHING)[0]
+    assert found.item_id == scanned.item_id == "mustard_bottle_1-t0"
+    assert found.label == "mustard bottle"
+    rescanned = state.remember([Detection("mustard bottle", (0.5, 0.0, 0.7), 0.9)], now_ns=3, coverage=gallery_scan)[0]
+    assert rescanned.item_id == "mustard_bottle_1-t0"
+    assert set(state.items) == {"mustard_bottle_1-t0"}
+
+
+def test_a_scan_under_other_words_keeps_the_searchs_id_and_takes_its_label():
+    state = make_state()
+    found = state.remember([Detection("red apple", (0.5, 0.1, 0.7), 1.0)], now_ns=1, coverage=NOTHING)[0]
+    assert found.item_id == "red_apple_1-t0"
+    # An open-vocabulary scan names the same apple in its own words.
+    scanned = state.remember([Detection("apple", (0.51, 0.1, 0.7), 1.0)], now_ns=2, coverage=EVERY)[0]
+    assert scanned.item_id == "red_apple_1-t0" and scanned.label == "apple"
+    # Under a label the scan names, the apple is dropped once it is gone.
+    state.remember([], now_ns=3, coverage=Coverage(frozenset({"apple"})))
+    assert state.items == {}
+
+
+def test_items_sharing_a_place_keep_their_own_ids():
+    state = make_state()
+    first = state.remember(
+        [Detection("bowl", (0.50, 0.00, 0.70), 0.9), Detection("apple", (0.51, 0.01, 0.72), 0.8)], now_ns=1, coverage=EVERY
+    )
+    assert [item.item_id for item in first] == ["bowl_1-t0", "apple_1-t0"]
+    # The apple now comes first and sits nearer the bowl's last position
+    # than the bowl does: the label decides between the two.
+    second = state.remember(
+        [Detection("apple", (0.50, 0.00, 0.71), 0.95), Detection("bowl", (0.52, 0.00, 0.70), 0.9)], now_ns=2, coverage=EVERY
+    )
+    assert [item.item_id for item in second] == ["apple_1-t0", "bowl_1-t0"]
+    assert [item.label for item in second] == ["apple", "bowl"]
+
+
+def test_a_scan_drops_only_the_unseen_items_it_could_name():
+    state = make_state()
+    gallery_scan = Coverage(frozenset({"cup", "bowl"}))
+    state.remember([Detection("cup", (0.5, 0.1, 0.7), 0.9)], now_ns=1, coverage=gallery_scan)
+    # Only the words route finds a blue ball: the gallery does not know it.
+    state.remember([Detection("blue ball", (0.4, -0.1, 0.7), 0.9)], now_ns=2, coverage=NOTHING)
+    assert set(state.items) == {"cup_1-t0", "blue_ball_1-t0"}
+    state.remember([], now_ns=3, coverage=gallery_scan)
+    assert set(state.items) == {"blue_ball_1-t0"}
+    state.remember([], now_ns=4, coverage=EVERY)
+    assert state.items == {}
+
+
+def test_no_detection_matches_an_item_a_gripper_holds():
+    state = make_state()
+    state.remember([Detection("cup", (0.5, 0.1, 0.7), 0.9)], now_ns=1, coverage=EVERY)
+    state.set_held(state.grippers["left_gripper"], "cup_1-t0")
+    # Another cup stands where the held one was grabbed.
+    seen = state.remember([Detection("cup", (0.5, 0.1, 0.7), 0.9)], now_ns=2, coverage=EVERY)
+    assert seen[0].item_id == "cup_2-t0"
+    assert set(state.items) == {"cup_1-t0", "cup_2-t0"}
+
+
+def test_a_placed_item_keeps_its_id_where_it_was_put_and_a_dropped_one_stays_where_it_was_grabbed():
+    state = make_state()
+    state.remember([Detection("cup", (0.5, 0.1, 0.7), 0.9), Detection("bowl", (0.4, -0.1, 0.7), 0.9)], now_ns=1, coverage=EVERY)
+    left, right = state.grippers["left_gripper"], state.grippers["right_gripper"]
+    state.set_held(left, "cup_1-t0")
+    assert state.clear_held_placed(left, (0.6, -0.2, 0.75), (0.0, 0.0, 0.0, 1.0)) == "cup_1-t0"
+    assert not left.holding
+    assert state.items["cup_1-t0"].position == (0.6, -0.2, 0.75)
+    assert state.items["cup_1-t0"].orientation == (0.0, 0.0, 0.0, 1.0)
+    state.set_held(right, "bowl_1-t0")
+    assert state.clear_held(right) == "bowl_1-t0"
+    assert state.items["bowl_1-t0"].position == (0.4, -0.1, 0.7)
+    seen = state.remember([Detection("cup", (0.61, -0.2, 0.74), 0.9)], now_ns=2, coverage=EVERY)
+    assert seen[0].item_id == "cup_1-t0"
+
+
+def test_ids_carry_the_run_token_so_an_earlier_runs_id_is_refused():
+    before, after = make_state("aaaaaa"), make_state("bbbbbb")
+    apple = Detection("apple", (0.5, 0.0, 0.7), 0.9)
+    old = before.remember([apple], now_ns=1, coverage=EVERY)[0]
+    new = after.remember([apple], now_ns=1, coverage=EVERY)[0]
+    assert (old.item_id, new.item_id) == ("apple_1-aaaaaa", "apple_1-bbbbbb")
+    with pytest.raises(Refusal, match="unknown item 'apple_1-aaaaaa'"):
+        after.item(old.item_id)
 
 
 def test_unknown_items_are_refused_and_pose_grabs_get_an_id():
     state = make_state()
-    with pytest.raises(Refusal, match="unknown item 'cup_9'"):
-        state.item("cup_9")
+    with pytest.raises(Refusal, match="unknown item 'cup_9-t0'"):
+        state.item("cup_9-t0")
     item = state.mint_from_pose((0.5, 0.0, 0.7), None, now_ns=1)
-    assert item.item_id == "item_1"
-    assert state.item("item_1") is item
+    assert item.item_id == "item_1-t0"
+    assert state.item("item_1-t0") is item
 
 
 def test_labels_become_clean_id_stems():
     state = make_state()
-    item = state.remember([Detection("Cheez-It cracker box", (0.5, 0.0, 0.7), 0.9)], now_ns=1, complete=True)[0]
-    assert item.item_id == "cheez_it_cracker_box_1"
+    item = state.remember([Detection("Cheez-It cracker box", (0.5, 0.0, 0.7), 0.9)], now_ns=1, coverage=EVERY)[0]
+    assert item.item_id == "cheez_it_cracker_box_1-t0"
     assert item.label == "Cheez-It cracker box"
 
 

@@ -26,6 +26,7 @@ from openarm_ai_brain_vla.perception.sam3_siglip import (
     normalised,
     plan_for,
 )
+from openarm_ai_brain_vla.ports import Coverage
 
 
 def write_gallery(root: Path, *, prompts: bool = True, drop_class: str = "") -> Path:
@@ -261,6 +262,21 @@ def test_no_gallery_leaves_the_backend_working_by_words(tmp_path):
     boxes = detector.detect(np.zeros((60, 80, 3), dtype=np.uint8))
     assert [b.label for b in boxes] == [DEFAULT_VOCABULARY[0]]
     assert detector._models.prompts[-1] == DEFAULT_VOCABULARY
+
+
+def test_a_scan_covers_the_gallerys_items_or_the_default_vocabulary(tmp_path):
+    from openarm_ai_brain_vla.perception.sam3_siglip import DEFAULT_VOCABULARY
+    from test_gallery_store import write_pack
+
+    detector = Sam3SiglipDetector(models_factory=FakeModels)
+    assert detector.scan_coverage() == Coverage()
+    detector.load("")
+    assert detector.scan_coverage() == Coverage(frozenset(DEFAULT_VOCABULARY))
+    url, root, cache = write_pack(tmp_path / "store", dim=16)
+    detector = Sam3SiglipDetector(models_factory=FakeModels, cache_dir=cache)
+    detector.load("", url)
+    # The robot arm is a background class: a box named as it is dropped.
+    assert detector.scan_coverage() == Coverage(frozenset({"cube", "apple", "lemon"}))
 
 
 def test_a_gallery_that_cannot_be_had_is_a_reason_not_a_failure(tmp_path):

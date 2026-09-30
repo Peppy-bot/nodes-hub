@@ -63,7 +63,7 @@ from typing import Optional, Sequence
 
 import numpy as np
 
-from ..ports import Box
+from ..ports import Box, Coverage
 from .gallery_store import CACHE_DIR, GalleryUnavailable, resolve
 from .sam3_siglip import Crop, Gallery, load_gallery, normalised
 
@@ -139,7 +139,7 @@ def table_rows(gallery: Gallery) -> list[int]:
     with at least one boxed crop, not flagged background, and, when the
     gallery names catalogue ids, standing for a `TABLE_ITEM_PREFIX` item."""
     boxed = {c.class_index for c in gallery.crops if c.box is not None}
-    rows = [i for i in range(len(gallery.classes)) if i in boxed and not gallery.is_background(i)]
+    rows = [i for i in gallery.item_indices() if i in boxed]
     if gallery.variants:
         rows = [i for i in rows if any(v.startswith(TABLE_ITEM_PREFIX) for v in gallery.variants[i])]
     return rows
@@ -260,6 +260,12 @@ class YoloeVpDetector:
 
     def set_vocabulary(self, phrases: Sequence[str]) -> None:
         self._vocabulary = list(phrases)
+
+    def scan_coverage(self) -> Coverage:
+        """A scan names the items of the model's table, and nothing else."""
+        if self._gallery is None or self._model is None:
+            return Coverage()
+        return Coverage(frozenset(self._gallery.phrases[i] for i in self._model.rows))
 
     def detect(self, image: np.ndarray) -> list[Box]:
         if self._gallery is None or self._model is None:

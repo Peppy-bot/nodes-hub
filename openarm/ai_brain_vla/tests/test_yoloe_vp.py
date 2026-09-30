@@ -20,6 +20,7 @@ from openarm_ai_brain_vla.perception.yoloe_vp import (
     prototypes_from,
     wanted_classes,
 )
+from openarm_ai_brain_vla.ports import Coverage
 from test_sam3_siglip import write_gallery
 
 
@@ -101,6 +102,21 @@ def test_the_table_holds_boxed_non_background_classes_only(tmp_path):
     assert table_rows(gallery) == [1]
     harvest = load_gallery(write_gallery(tmp_path / "g"))
     assert table_rows(harvest) == [0, 1, 2]
+
+
+def test_a_scan_covers_the_items_of_the_models_table(tmp_path):
+    from types import SimpleNamespace
+
+    from openarm_ai_brain_vla.perception.gallery_store import open_pack
+    from test_gallery_store import write_pack
+
+    detector = YoloeVpDetector()
+    assert detector.scan_coverage() == Coverage()
+    url, root, cache = write_pack(tmp_path / "store")
+    gallery = load_gallery(open_pack(url, cache_dir=cache))
+    # The model stands in with its table alone: the apple is its one row.
+    detector._gallery, detector._model = gallery, SimpleNamespace(rows=table_rows(gallery))
+    assert detector.scan_coverage() == Coverage(frozenset({"apple"}))
 
 
 def test_a_pack_of_crops_alone_is_refused_by_name_and_a_missing_gallery_url_is_a_reason(tmp_path):

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Sequence
 
-from ..ports import Box
+from ..ports import Box, Coverage
 
 
 class NoneDetector:
@@ -27,3 +27,6 @@ class NoneDetector:
 
     def detect(self, image) -> list[Box]:
         return []
+
+    def scan_coverage(self) -> Coverage:
+        return Coverage()
