@@ -7,6 +7,7 @@ From: peppybot/python-uv-base:latest
 
 %environment
     export PATH="/opt/openarm_ai_brain_vla/.venv/bin:$PATH"
+    export OPENARM_AI_BRAIN_VLA_WEIGHTS=/opt/openarm_ai_brain_vla/weights
 
 %files
     . /opt/openarm_ai_brain_vla
@@ -28,6 +29,12 @@ From: peppybot/python-uv-base:latest
     # --nv so they see the host's GPU; gemini brings the API client. Every
     # backend is installed so a launcher can choose one without a rebuild.
     uv sync --no-editable --no-dev --extra sam3-siglip --extra gemini
+
+    # The weights of the sam3_siglip backend's two models, about 7 GB from
+    # the Hugging Face Hub, each pinned by its revision in weights.py. The
+    # image carries them so that a start of the node fetches nothing.
+    ./.venv/bin/python -m openarm_ai_brain_vla.perception.weights fetch \
+        /opt/openarm_ai_brain_vla/weights
 
 %runscript
     cd /opt/openarm_ai_brain_vla

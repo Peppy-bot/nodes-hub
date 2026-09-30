@@ -1,10 +1,10 @@
 """SAM 3 to find, SigLIP to name: `perception_backend: "sam3_siglip"`.
 
 SAM 3 proposes the objects in a frame and SigLIP names each crop by words.
-The node ships no pictures of items and fetches nothing but the two models'
-weights, so what a scan reports is whatever SigLIP can name, not a list
-someone enrolled. The weights, the Hugging Face cache, must be visible
-inside the node's container; paths under the daemon user's home are.
+The node ships no pictures of items, so what a scan reports is whatever
+SigLIP can name, not a list someone enrolled. The two models' weights are
+staged in the node image at build (weights.py): a load reads them from
+there, and the backend fetches nothing.
 
 - A scan prompts SAM 3 with the one word "object" and names every crop by
   the nearest of the scan vocabulary (`vocabulary.txt`, the LVIS v1 category
@@ -21,8 +21,8 @@ inside the node's container; paths under the daemon user's home are.
   item's name, and a description that names an enrolled item runs the scan
   with the item's name added to SAM 3's prompt, the core picking the item
   by name afterwards.
-- `perception_model` is the Hub repository or local directory the SAM 3
-  weights are read from; empty is `SAM3_REPO`.
+- `perception_model` names a directory the container can see holding other
+  SAM 3 weights, as transformers saves a model; empty is the staged ones.
 
 A search keeps its deadline between its three stages: before SAM 3
 proposes, before SigLIP embeds the crops, and before the crops are named.
@@ -79,14 +79,10 @@ from typing import Optional, Sequence
 import numpy as np
 
 from ..ports import Box, Coverage, Deadline, iou
+from . import weights
 from .gallery import Gallery, load_gallery
 
 logger = logging.getLogger(__name__)
-
-# SAM 3's official weights are gated behind a licence click-through on the
-# Hub; this mirror carries the same files. SigLIP so400m is the study's namer.
-SAM3_REPO = "jetjodh/sam3"
-SIGLIP_REPO = "google/siglip-so400m-patch14-384"
 
 # The study's settings, in the order the pipeline applies them.
 PROPOSAL_CONF = 0.05
@@ -329,22 +325,37 @@ def text_table(models: "Models", labels: Sequence[str]) -> np.ndarray:
     return np.concatenate([models.embed_texts(phrases[i : i + TEXT_BATCH]) for i in range(0, len(phrases), TEXT_BATCH)])
 
 
-class Models:
-    """The two models on one device, and the three calls the backend makes
-    on them. Imports torch and transformers at construction and nowhere
-    else."""
+def sam3_weights(model: str) -> Path:
+    """The directory SAM 3's weights are read from: the one
+    `perception_model` names, else the staged one. Raises ValueError when
+    the parameter names something that is not a directory: a repository on
+    the Hub is not fetched."""
+    name = model.strip()
+    if not name:
+        return weights.staged(weights.SAM3)
+    directory = Path(name).expanduser()
+    if not directory.is_dir():
+        raise ValueError(f"perception_model {directory} is not a directory the node can see")
+    return directory
 
-    def __init__(self, sam3_repo: str = SAM3_REPO, siglip_repo: str = SIGLIP_REPO, device: Optional[str] = None) -> None:
+
+class Models:
+    """The two models on one device, each read from its directory with no
+    network, and the three calls the backend makes on them. Imports torch
+    and transformers at construction and nowhere else."""
+
+    def __init__(self, sam3_directory: Path, siglip_directory: Path, device: Optional[str] = None) -> None:
         import torch
         from transformers import AutoModel, AutoProcessor, Sam3Model, Sam3Processor
 
         self.torch = torch
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.half = self.device.startswith("cuda")
-        self.sam3_processor = Sam3Processor.from_pretrained(sam3_repo)
-        self.sam3 = Sam3Model.from_pretrained(sam3_repo).to(self.device).eval()
-        self.siglip_processor = AutoProcessor.from_pretrained(siglip_repo)
-        self.siglip = AutoModel.from_pretrained(siglip_repo, dtype=torch.float16 if self.half else torch.float32).to(self.device).eval()
+        self.sam3_processor = Sam3Processor.from_pretrained(sam3_directory, local_files_only=True)
+        self.sam3 = Sam3Model.from_pretrained(sam3_directory, local_files_only=True).to(self.device).eval()
+        self.siglip_processor = AutoProcessor.from_pretrained(siglip_directory, local_files_only=True)
+        siglip_dtype = torch.float16 if self.half else torch.float32
+        self.siglip = AutoModel.from_pretrained(siglip_directory, dtype=siglip_dtype, local_files_only=True).to(self.device).eval()
 
     def propose(self, image, prompts: Sequence[str]) -> tuple[np.ndarray, np.ndarray]:
         """Every instance SAM 3 finds for any of `prompts`: boxes in pixels
@@ -394,7 +405,7 @@ class Sam3SiglipDetector:
     name = "sam3_siglip"
 
     def __init__(self, models_factory=None, vocabulary: Optional[Sequence[str]] = None) -> None:
-        # Builds the two models from the SAM 3 repository or directory.
+        # Builds the two models from SAM 3's directory and SigLIP's.
         self._models_factory = models_factory or Models
         # What a scan names a crop among by words.
         self.scan_vocabulary: tuple[str, ...] = tuple(vocabulary) if vocabulary is not None else load_vocabulary()
@@ -416,15 +427,19 @@ class Sam3SiglipDetector:
 
     def load(self, model: str, gallery: str) -> None:
         """Reads the enrolment gallery `gallery` names, if any, then loads
-        the two models, SAM 3 from `model` when that is set, and embeds the
-        scan vocabulary and the enrolled items' crops. A named gallery that
-        cannot be read fails the load with the reason, before the models
-        take their minute; so do models that cannot be loaded."""
+        the two models from their staged weights, SAM 3 from the directory
+        `model` names when that is set, and embeds the scan vocabulary and
+        the enrolled items' crops. A named gallery that cannot be read and
+        weights that are not where they are read from fail the load with
+        the reason, before the models take their minute; so do models that
+        cannot be loaded."""
         from PIL import Image
 
         enrolment = load_gallery(gallery)
+        sam3_directory = sam3_weights(model)
+        siglip_directory = weights.staged(weights.SIGLIP)
         try:
-            models = self._models_factory(model.strip() or SAM3_REPO)
+            models = self._models_factory(sam3_directory, siglip_directory)
         except ImportError as error:
             raise RuntimeError(f"the sam3_siglip backend needs torch and transformers (the node's sam3-siglip extra): {error}") from error
         prototypes = embed_prototypes(enrolment, models) if enrolment is not None else None

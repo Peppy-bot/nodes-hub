@@ -14,6 +14,7 @@ import pytest
 
 from peppygen.parameters import Parameters
 
+from openarm_ai_brain_vla.perception import weights
 from openarm_ai_brain_vla.ports import Box, CancelToken, Coverage, Deadline, Gripper, Item, Outcome, Pose
 
 PARAMS = {
@@ -49,6 +50,22 @@ def no_network(monkeypatch):
     monkeypatch.setattr(socket, "getaddrinfo", refuse)
     monkeypatch.setattr(socket, "create_connection", refuse)
     monkeypatch.setattr(socket.socket, "connect", refuse)
+
+
+def fake_download(source: weights.Source, directory) -> None:
+    """Stands in for the Hub: one small file per model, naming where the
+    model comes from."""
+    (directory / "config.json").write_text(f"{source.repository}@{source.revision}")
+
+
+@pytest.fixture
+def staged_weights(tmp_path, monkeypatch):
+    """The two models staged in a directory of the test's own, which the
+    node is told to read them from, as the node image does."""
+    directory = tmp_path / "weights"
+    weights.fetch(directory, download=fake_download)
+    monkeypatch.setenv(weights.WEIGHTS_DIRECTORY_VARIABLE, str(directory))
+    return directory
 
 
 class FakeToken:

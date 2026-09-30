@@ -93,8 +93,9 @@
       // network and a key, and bills and waits per question).
       perception_backend: { $type: "string", $default: "none" },
       // The identifier of the model the perception backend loads; empty is
-      // the backend's default. For "sam3_siglip" it is the Hugging Face
-      // repository or local directory the SAM 3 weights are read from. For
+      // the backend's default. For "sam3_siglip" it is a directory the
+      // container can see holding other SAM 3 weights, as transformers saves
+      // a model; empty is the weights the node image carries. For
       // "gemini_er" it is the model id, "gemini-robotics-er-2-preview" when
       // empty; the API key is not a parameter: it is read from
       // GEMINI_API_KEY in the node's environment (`peppy stack launch`

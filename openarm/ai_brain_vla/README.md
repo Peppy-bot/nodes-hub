@@ -15,9 +15,25 @@ and no code changes.
 | `none` | no model: every search refused with "no perception source" | | |
 
 `sam3_siglip` is the robot's backend. It needs no data but its two models'
-weights: the node ships no pictures of items and fetches none, so what a scan
-reports is whatever SigLIP can name, not a list someone enrolled.
-`gemini_er` is the words-only remote backend meant for the router node.
+weights, which the node image carries: the node ships no pictures of items and
+fetches nothing when it starts, so what a scan reports is whatever SigLIP can
+name, not a list someone enrolled. `gemini_er` is the words-only remote
+backend meant for the router node.
+
+## The models' weights
+
+The node image carries the weights of SAM 3 and SigLIP, about 7 GB. The build
+of the image fetches them from the Hugging Face Hub, each model at the
+revision `perception/weights.py` pins (`apptainer.def` runs
+`python -m openarm_ai_brain_vla.perception.weights fetch`), and a load reads
+them from the image with no network. So a start of the node downloads
+nothing, a node stopped while it loads leaves nothing on the machine, and
+every image built from one commit of the node carries the same files.
+
+SAM 3 comes from `jetjodh/sam3`, a mirror of the official `facebook/sam3`,
+which is gated behind a licence click-through; the pinned revision carries
+the same files, each with the same content hash. `perception_model` names a
+directory holding other SAM 3 weights.
 
 ## How `sam3_siglip` names what it finds
 
@@ -58,8 +74,10 @@ the wait and another call.
 
 - `perception_backend`: above.
 - `perception_model`: the model the backend loads; empty is its default. For
-  `sam3_siglip` the Hugging Face repository or local directory of the SAM 3
-  weights; for `gemini_er` the model id.
+  `sam3_siglip` a directory the container can see holding other SAM 3
+  weights, as transformers saves a model, empty being the weights the image
+  carries; a name that is not a directory fails the load, and nothing is
+  fetched. For `gemini_er` the model id.
 - `perception_gallery`: the enrolment gallery of `sam3_siglip`, above; empty
   is none. The other backends refuse to load with one.
 - `perception_confidence`: the confidence a detection is kept at, 0 for the
@@ -141,10 +159,10 @@ keeps its items in memory only.
 
 What the machine needs: an NVIDIA GPU with 12 GB free (SAM 3 and SigLIP take
 about 6 GB, Waldo the rest), peppy 0.31 or later with `nodes-hub` and
-`launchers-hub` registered, network on first start (the container build
-fetches torch and the model libraries, the first load fetches about 7 GB of
-weights from Hugging Face), and Chrome for Waldo's viewer. Nothing else: no
-dataset, no gallery, no key unless Gemini is tried.
+`launchers-hub` registered, network for the first launch (the container build
+fetches torch, the model libraries and about 7 GB of weights from Hugging
+Face), and Chrome for Waldo's viewer. Nothing else: no dataset, no gallery,
+no key unless Gemini is tried.
 
 ### 1. Register the hubs
 
@@ -165,9 +183,10 @@ robots at `http://127.0.0.1:8900/robot_control/v1/mcp`
 moves) and the world at `http://127.0.0.1:8902/simulation/v1/mcp`
 (`scene.spawn_object`, `scene.remove_object`, `scene.get_assets_list`). The
 viewer is at `https://127.0.0.1:8080` (self-signed certificate). The first
-launch builds the brain's container, about ten minutes; the brain then loads
-its models in the background for about a minute and refuses searches as
-"still loading" until it is ready. Its log is `~/.peppy/logs/run/alpha_brain_inst.log`,
+launch builds the brain's container, about ten minutes and the time the link
+takes for the weights; at every start the brain then loads its models in the
+background for about a minute and refuses searches as "still loading" until
+it is ready. Its log is `~/.peppy/logs/run/alpha_brain_inst.log`,
 and two lines there say it is set: the camera's answer, `[brain] camera
 geometry: 1280x720 fx 738.1 fy 738.1 cx 639.5 cy 359.5 none`, and the backend's,
 `[brain] sam3_siglip: a vocabulary of 1198 names, no enrolment gallery, on
@@ -276,4 +295,8 @@ a more general name of the same thing ("bottle" for "alsace wine bottle",
 library: the core and the handlers against fakes, the backends around their
 models, and the whole node over the wire under the generated harness, its
 camera and backbone mocked. `tests/test_sam3_siglip_models.py` runs the real
-models where torch, the extras and a GPU are present and skips elsewhere.
+models where torch, the extras, a GPU and the staged weights are present, and
+skips elsewhere. Outside the image,
+`python -m openarm_ai_brain_vla.perception.weights fetch <directory>` stages
+the weights, and `OPENARM_AI_BRAIN_VLA_WEIGHTS` names that directory to the
+node.

@@ -7,14 +7,13 @@ import numpy as np
 import pytest
 
 from conftest import NEVER, PASSED
-from openarm_ai_brain_vla.perception import make_detector
+from openarm_ai_brain_vla.perception import make_detector, weights
 from openarm_ai_brain_vla.perception.gallery import load_gallery
 from openarm_ai_brain_vla.ports import Coverage, SearchTimeout
 from openarm_ai_brain_vla.perception.sam3_siglip import (
     BACKGROUND_PHRASES,
     GENERIC_PROMPTS,
     MIN_CONFIDENCE,
-    SAM3_REPO,
     SIMILARITY_FLOOR,
     Route,
     VOCABULARY_MARGIN,
@@ -30,6 +29,9 @@ from openarm_ai_brain_vla.perception.sam3_siglip import (
     unlike_the_words,
 )
 from test_gallery import write_harvest
+
+# Every load reads the models from where they are staged.
+pytestmark = pytest.mark.usefixtures("staged_weights")
 
 VOCABULARY = ("cup", "banana")
 
@@ -181,13 +183,14 @@ class FakeModels:
     """Stands in for the two models: one box per call; every distinct text
     is a unit axis of its own, in the order first seen, and every crop is
     `looks_like`, a mix of texts by weight, so a test says what the crop
-    looks like. Records the SAM 3 repository it was built from."""
+    looks like. Records the two directories it was built from."""
 
     device = "fake"
     looks_like = {"a photo of a cup": 1.0}
 
-    def __init__(self, sam3_repo: str = SAM3_REPO) -> None:
-        self.sam3_repo = sam3_repo
+    def __init__(self, sam3_directory, siglip_directory) -> None:
+        self.sam3_directory = sam3_directory
+        self.siglip_directory = siglip_directory
         self.prompts: list[tuple[str, ...]] = []
         self.texts: list[str] = []
         self._axes: dict[str, int] = {}
@@ -235,13 +238,41 @@ def test_a_scan_names_what_it_finds_by_the_vocabulary():
     assert detector._models.texts == texts
 
 
-def test_the_sam3_weights_come_from_the_model_parameter_or_the_mirror():
+def test_the_models_are_built_from_the_staged_weights(staged_weights):
     detector = Sam3SiglipDetector(models_factory=FakeModels, vocabulary=VOCABULARY)
     detector.load("", "")
-    assert detector._models.sam3_repo == SAM3_REPO
+    assert detector._models.sam3_directory == staged_weights / weights.SAM3.directory_name
+    assert detector._models.siglip_directory == staged_weights / weights.SIGLIP.directory_name
+
+
+def test_other_sam3_weights_come_from_the_directory_the_model_parameter_names(tmp_path, staged_weights):
+    other = tmp_path / "other_sam3"
+    other.mkdir()
     detector = Sam3SiglipDetector(models_factory=FakeModels, vocabulary=VOCABULARY)
-    detector.load(" /weights/sam3 ", "")
-    assert detector._models.sam3_repo == "/weights/sam3"
+    detector.load(f" {other} ", "")
+    assert detector._models.sam3_directory == other
+    assert detector._models.siglip_directory == staged_weights / weights.SIGLIP.directory_name
+
+
+def test_a_repository_is_not_a_model_directory_and_nothing_is_fetched(no_network):
+    made = []
+    detector = Sam3SiglipDetector(models_factory=lambda *directories: made.append(directories), vocabulary=VOCABULARY)
+    with pytest.raises(ValueError, match="perception_model facebook/sam3 is not a directory the node can see"):
+        detector.load("facebook/sam3", "")
+    assert not detector.available and made == []
+
+
+def test_weights_that_are_not_staged_fail_the_load_before_the_models(tmp_path, monkeypatch, no_network):
+    made = []
+    detector = Sam3SiglipDetector(models_factory=lambda *directories: made.append(directories), vocabulary=VOCABULARY)
+    monkeypatch.setenv(weights.WEIGHTS_DIRECTORY_VARIABLE, str(tmp_path / "nothing_staged"))
+    with pytest.raises(FileNotFoundError, match="the weights of jetjodh/sam3 are not staged at"):
+        detector.load("", "")
+    # SigLIP's weights are read from where they are staged whatever
+    # directory SAM 3's come from.
+    with pytest.raises(FileNotFoundError, match="the weights of google/siglip-so400m-patch14-384 are not staged at"):
+        detector.load(str(tmp_path), "")
+    assert not detector.available and made == []
 
 
 def test_a_scan_drops_a_box_on_the_robot_itself():
@@ -317,9 +348,9 @@ def test_a_search_does_not_return_what_looks_more_like_another_name():
     assert detected(detector, ["mug"]) == [("mug", 0.9)]
 
 
-def test_the_backend_downloads_nothing_but_its_models(tmp_path, no_network):
-    """The models' weights, which the fake stands in for, are the backend's
-    only download: the vocabulary ships in the node, and a gallery is a
+def test_the_backend_downloads_nothing(tmp_path, no_network):
+    """A load and its searches reach for no network: the models' weights
+    are staged, the vocabulary ships in the node, and a gallery is a
     directory the launch names."""
     assert len(load_vocabulary()) == 1198
     detector = Sam3SiglipDetector(models_factory=FakeModels, vocabulary=VOCABULARY)
@@ -344,9 +375,9 @@ def test_a_scan_covers_the_vocabulary_and_the_enrolled_items(tmp_path):
 def test_a_named_gallery_that_cannot_be_read_fails_the_load_before_the_models(tmp_path):
     made = []
 
-    def factory(sam3_repo):
-        made.append(sam3_repo)
-        return FakeModels(sam3_repo)
+    def factory(sam3_directory, siglip_directory):
+        made.append(sam3_directory)
+        return FakeModels(sam3_directory, siglip_directory)
 
     detector = Sam3SiglipDetector(models_factory=factory, vocabulary=VOCABULARY)
     with pytest.raises(ValueError, match="is not a directory the node can see"):
