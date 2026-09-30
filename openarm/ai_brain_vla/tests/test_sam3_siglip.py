@@ -259,6 +259,18 @@ def test_a_search_does_not_return_what_looks_more_like_another_name():
     assert detected(detector, ["mug"]) == [("mug", 0.9)]
 
 
+def test_the_backend_downloads_nothing_but_its_models(tmp_path, no_network):
+    """The models' weights, which the fake stands in for, are the backend's
+    only download: the vocabulary ships in the node, and a gallery is a
+    directory the launch names."""
+    assert len(load_vocabulary()) == 1198
+    detector = Sam3SiglipDetector(models_factory=FakeModels, vocabulary=VOCABULARY)
+    detector.load(str(write_release(tmp_path / "release", dim=DIM)))
+    assert detected(detector) == [("cup", 0.9)]
+    assert detected(detector, ["apple"]) == [("cup", 0.9)]
+    assert detected(detector, ["blue ball"]) == []
+
+
 def test_a_scan_covers_the_vocabulary_and_the_enrolled_items(tmp_path):
     detector = Sam3SiglipDetector(models_factory=FakeModels, vocabulary=VOCABULARY)
     assert detector.scan_coverage() == Coverage()

@@ -93,6 +93,11 @@ def test_no_gallery_is_named_by_an_empty_model_or_none():
     assert load_gallery("none") is None and load_gallery("None") is None
 
 
+def test_a_url_is_not_a_gallery_and_nothing_is_fetched(no_network):
+    with pytest.raises(ValueError, match="is not a directory the node can see"):
+        load_gallery("https://assets.example.r2.dev/galleries/gallery.lock.json")
+
+
 def test_a_named_gallery_that_is_not_one_is_refused_with_the_reason(tmp_path):
     with pytest.raises(ValueError, match="is not a directory the node can see"):
         load_gallery(str(tmp_path / "missing"))

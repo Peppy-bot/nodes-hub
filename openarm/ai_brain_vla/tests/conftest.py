@@ -31,6 +31,20 @@ def params() -> Parameters:
     return Parameters.from_dict(dict(PARAMS))
 
 
+@pytest.fixture
+def no_network(monkeypatch):
+    """Fails the test at any reach for the network, a name lookup or a
+    connection: what runs under it downloads nothing."""
+    import socket
+
+    def refuse(*args, **kwargs):
+        raise AssertionError(f"reached for the network: {args!r}")
+
+    monkeypatch.setattr(socket, "getaddrinfo", refuse)
+    monkeypatch.setattr(socket, "create_connection", refuse)
+    monkeypatch.setattr(socket.socket, "connect", refuse)
+
+
 class FakeDetector:
     """Returns the boxes the test hands it, and records the vocabulary. Its
     scans name every label unless the test hands it a coverage."""
