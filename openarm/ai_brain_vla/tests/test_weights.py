@@ -4,10 +4,12 @@ when the server sends other bytes. The Hub is a fake, or a server of the
 test's own on the loopback interface: the suite downloads nothing from the
 network."""
 
+import dataclasses
 import fcntl
 import hashlib
 import http.server
 import io
+import json
 import logging
 import re
 import subprocess
@@ -26,6 +28,7 @@ from openarm_ai_brain_vla.perception.weights import (
     FETCHING_SUFFIX,
     LOCK_FILE,
     PARTIAL_SUFFIX,
+    PINS,
     SAM3,
     SIGLIP,
     SOURCES,
@@ -37,17 +40,16 @@ from openarm_ai_brain_vla.perception.weights import (
     WeightsError,
 )
 
-# A model of two files, the second of many chunks at the chunk size the
-# tests set.
+# A model of two files: one of less than a piece, one of ten pieces.
 FILES = {"config.json": b"{}", "model.safetensors": bytes(range(100))}
-CHUNK_BYTES = 10
+PIECE_BYTES = 10
 # How long a test waits for another thread or process before it fails. No
 # test passes because this time has gone by.
 FAILURE_S = 60.0
 
 
 def source_of(files: dict[str, bytes]) -> Source:
-    pins = tuple(File(path, len(content), hashlib.sha256(content).hexdigest()) for path, content in files.items())
+    pins = tuple(File(path, len(content), PIECE_BYTES, weights.pieces_of(io.BytesIO(content), PIECE_BYTES)) for path, content in files.items())
     return Source("model", "someone/model", "0123456789abcdef0123456789abcdef01234567", pins)
 
 
@@ -106,11 +108,6 @@ class FakeHub:
         yield Body(starts_at, read)
 
 
-@pytest.fixture(autouse=True)
-def small_chunks(monkeypatch):
-    monkeypatch.setattr(weights, "CHUNK_BYTES", CHUNK_BYTES)
-
-
 @pytest.fixture
 def hub() -> FakeHub:
     return FakeHub()
@@ -129,19 +126,48 @@ def content_of(directory: Path) -> dict[str, bytes]:
     return {path.name: path.read_bytes() for path in directory.iterdir()}
 
 
-def test_every_model_is_pinned_by_a_commit_and_every_file_by_its_size_and_hash():
-    assert SOURCES == (SAM3, SIGLIP)
-    assert len({source.name for source in SOURCES}) == len(SOURCES)
+def test_every_model_is_pinned_by_a_commit_and_every_file_by_its_size_and_the_hash_of_each_piece():
+    assert PINS.sources == SOURCES == (SAM3, SIGLIP) and PINS.piece_bytes == 16 * 1024 * 1024
+    assert [(source.name, source.repository) for source in SOURCES] == [("sam3", "jetjodh/sam3"), ("siglip", "google/siglip-so400m-patch14-384")]
     for source in SOURCES:
         assert re.fullmatch(r"[0-9a-f]{40}", source.revision), source
         assert source.directory_name == f"{source.name}-{source.revision}"
         paths = [file.path for file in source.files]
         assert len(set(paths)) == len(paths) and {"config.json", "model.safetensors"} <= set(paths)
         for file in source.files:
-            assert file.size > 0 and re.fullmatch(r"[0-9a-f]{64}", file.sha256), file
+            assert file.piece_bytes == PINS.piece_bytes
+            assert file.piece_end(len(file.pieces) - 1) == file.size
+            assert all(re.fullmatch(r"[0-9a-f]{64}", piece) for piece in file.pieces), file.path
     # The checkpoint of SAM 3's original code base is not one transformers reads.
     assert "sam3.pt" not in [file.path for file in SAM3.files]
     assert SAM3.url(SAM3.files[0]) == f"https://huggingface.co/jetjodh/sam3/resolve/{SAM3.revision}/config.json"
+
+
+def test_a_pins_file_is_read_as_its_models_in_order(tmp_path):
+    pins = {
+        "piece_bytes": PIECE_BYTES,
+        "models": [
+            {
+                "name": MODEL.name,
+                "repository": MODEL.repository,
+                "revision": MODEL.revision,
+                "files": [{"path": file.path, "size": file.size, "pieces": list(file.pieces)} for file in MODEL.files],
+            }
+        ],
+    }
+    (tmp_path / "pins.json").write_text(json.dumps(pins))
+    assert weights.load_pins(tmp_path / "pins.json") == weights.Pins(PIECE_BYTES, (MODEL,))
+
+
+def test_a_file_is_pinned_by_as_many_pieces_as_its_size_makes():
+    assert len(SAFETENSORS.pieces) == 10 and (SAFETENSORS.piece_start(9), SAFETENSORS.piece_end(9)) == (90, 100)
+    odd = File("odd", 25, PIECE_BYTES, weights.pieces_of(io.BytesIO(bytes(25)), PIECE_BYTES))
+    assert [(odd.piece_start(index), odd.piece_end(index)) for index in range(3)] == [(0, 10), (10, 20), (20, 25)]
+    assert odd.pieces == (hashlib.sha256(bytes(10)).hexdigest(), hashlib.sha256(bytes(10)).hexdigest(), hashlib.sha256(bytes(5)).hexdigest())
+    with pytest.raises(ValueError, match="odd is pinned with 2 pieces, and 25 bytes make 3 of 10"):
+        File("odd", 25, PIECE_BYTES, odd.pieces[:2])
+    with pytest.raises(ValueError, match="empty is pinned with 0 bytes in pieces of 10"):
+        File("empty", 0, PIECE_BYTES, ())
 
 
 def test_a_model_is_downloaded_whole_under_its_name_and_revision(directory, hub):
@@ -162,27 +188,27 @@ def test_a_model_on_the_machine_is_not_downloaded_again(directory, hub, no_netwo
 
 
 def test_a_node_killed_in_a_download_leaves_a_partial_file_that_the_next_start_continues(directory, hub):
-    hub.plan["model.safetensors"] = [Step(after=30, then=Killed())]
+    hub.plan["model.safetensors"] = [Step(after=35, then=Killed())]
     with pytest.raises(Killed):
         weights.stage(MODEL, directory, hub.open_at)
     # Nothing is under the model's name, so nothing reads half a model: the
     # file that was whole has its name, the other is partial and holds
-    # every chunk that was read.
+    # every byte that was read, three pieces and half of the fourth.
     fetching = directory / f"{MODEL.directory_name}{FETCHING_SUFFIX}"
     assert names_in(directory) == sorted([LOCK_FILE, fetching.name])
-    assert content_of(fetching) == {"config.json": b"{}", f"model.safetensors{PARTIAL_SUFFIX}": FILES["model.safetensors"][:30]}
+    assert content_of(fetching) == {"config.json": b"{}", f"model.safetensors{PARTIAL_SUFFIX}": FILES["model.safetensors"][:35]}
     hub.asked.clear()
     staged_at = weights.stage(MODEL, directory, hub.open_at)
-    assert hub.asked == [("model.safetensors", 30)]
+    assert hub.asked == [("model.safetensors", 35)]
     assert content_of(staged_at) == FILES
     assert names_in(directory) == sorted([LOCK_FILE, MODEL.directory_name])
 
 
 @pytest.mark.parametrize("then", [None, ConnectionResetError("the link went down")])
 def test_a_link_that_drops_is_asked_again_from_the_last_byte(directory, hub, then):
-    hub.plan["model.safetensors"] = [Step(after=30, then=then), Step(after=30, then=then), Step(after=30, then=then)]
+    hub.plan["model.safetensors"] = [Step(after=35, then=then), Step(after=35, then=then)]
     staged_at = weights.stage(MODEL, directory, hub.open_at)
-    assert hub.asked == [("config.json", 0), ("model.safetensors", 0), ("model.safetensors", 30), ("model.safetensors", 60), ("model.safetensors", 90)]
+    assert hub.asked == [("config.json", 0), ("model.safetensors", 0), ("model.safetensors", 35), ("model.safetensors", 70)]
     assert content_of(staged_at) == FILES
 
 
@@ -201,6 +227,12 @@ def test_a_download_fails_when_attempts_in_a_row_add_nothing_and_the_next_one_co
     assert hub.asked == [("model.safetensors", 50)]
 
 
+def test_attempts_that_bring_less_than_a_piece_each_move_the_download_on(directory, hub):
+    hub.plan["model.safetensors"] = [Step(after=9)] * 12
+    assert content_of(weights.stage(MODEL, directory, hub.open_at)) == FILES
+    assert [offset for path, offset in hub.asked if path == "model.safetensors"] == list(range(0, 100, 9))
+
+
 def test_a_server_whose_file_is_shorter_than_the_pin_fails_the_download(directory):
     hub = FakeHub({**FILES, "model.safetensors": FILES["model.safetensors"][:90]})
     url = MODEL.url(SAFETENSORS)
@@ -217,29 +249,33 @@ def test_a_server_that_sends_the_whole_file_starts_the_partial_file_again(direct
     assert content_of(staged_at) == FILES
 
 
-def test_an_answer_that_starts_past_the_byte_asked_for_is_not_appended(directory, hub):
+def test_an_answer_that_starts_at_another_byte_than_the_one_asked_for_is_not_appended(directory, hub):
     @contextmanager
     def ahead(url, offset):
         with hub.open_at(url, offset) as body:
             yield Body(body.starts_at + 5, body.read) if url.endswith("model.safetensors") else body
 
     url = MODEL.url(SAFETENSORS)
-    with pytest.raises(WeightsError, match=re.escape(f"the download of {url} stopped at 0 of 100 bytes: the answer starts at byte 5, past byte 0")):
+    with pytest.raises(WeightsError, match=re.escape(f"the download of {url} stopped at 0 of 100 bytes: the answer starts at byte 5, and byte 0 was asked for")):
         weights.stage(MODEL, directory, ahead)
     assert content_of(directory / f"{MODEL.directory_name}{FETCHING_SUFFIX}") == {"config.json": b"{}", f"model.safetensors{PARTIAL_SUFFIX}": b""}
 
 
-def test_bytes_that_are_not_the_pinned_ones_are_removed_and_never_named(directory, hub):
-    other = FakeHub({**FILES, "model.safetensors": bytes(100)})
-    found = hashlib.sha256(bytes(100)).hexdigest()
+def test_a_piece_that_is_not_the_pinned_one_is_cut_off_and_fails_the_download(directory, hub):
+    served = FILES["model.safetensors"][:30] + bytes(70)
+    other = FakeHub({**FILES, "model.safetensors": served})
+    found = hashlib.sha256(bytes(10)).hexdigest()
     url = MODEL.url(SAFETENSORS)
-    with pytest.raises(WeightsError, match=re.escape(f"{url} is not the pinned file: its SHA-256 is {found}, the pin is {SAFETENSORS.sha256}")):
+    with pytest.raises(WeightsError, match=re.escape(f"{url} is not the pinned file: the SHA-256 of piece 3 is {found}, the pin is {SAFETENSORS.pieces[3]}")):
         weights.stage(MODEL, directory, other.open_at)
+    # The download is not asked for again: the server has other bytes.
+    assert other.asked == [("config.json", 0), ("model.safetensors", 0)]
+    # The pieces before it were the pinned ones and stay; nothing is named.
     fetching = directory / f"{MODEL.directory_name}{FETCHING_SUFFIX}"
-    assert names_in(directory) == sorted([LOCK_FILE, fetching.name]) and names_in(fetching) == ["config.json"]
-    # The next fetch downloads the file from its start.
+    assert names_in(directory) == sorted([LOCK_FILE, fetching.name])
+    assert content_of(fetching) == {"config.json": b"{}", f"model.safetensors{PARTIAL_SUFFIX}": FILES["model.safetensors"][:30]}
     assert content_of(weights.stage(MODEL, directory, hub.open_at)) == FILES
-    assert hub.asked == [("model.safetensors", 0)]
+    assert hub.asked == [("model.safetensors", 30)]
 
 
 def test_no_more_than_the_pinned_size_of_a_file_is_read(directory):
@@ -247,14 +283,49 @@ def test_no_more_than_the_pinned_size_of_a_file_is_read(directory):
     assert content_of(weights.stage(MODEL, directory, longer.open_at)) == FILES
 
 
-def test_a_partial_file_of_other_bytes_fails_the_fetch_once(directory, hub):
+def partial_holding(directory: Path, content: bytes) -> Path:
     fetching = directory / f"{MODEL.directory_name}{FETCHING_SUFFIX}"
     fetching.mkdir(parents=True)
-    (fetching / f"model.safetensors{PARTIAL_SUFFIX}").write_bytes(bytes(120))
-    with pytest.raises(WeightsError, match="is not the pinned file"):
-        weights.stage(MODEL, directory, hub.open_at)
-    assert hub.asked == [("config.json", 0)]
+    partial = fetching / f"model.safetensors{PARTIAL_SUFFIX}"
+    partial.write_bytes(content)
+    return partial
+
+
+def test_a_partial_file_that_ends_inside_a_piece_is_continued_from_its_last_byte(directory, hub):
+    partial_holding(directory, FILES["model.safetensors"][:37])
     assert content_of(weights.stage(MODEL, directory, hub.open_at)) == FILES
+    assert hub.asked == [("config.json", 0), ("model.safetensors", 37)]
+
+
+def test_a_piece_whose_start_on_the_disk_is_not_the_pinned_one_is_downloaded_again(directory, hub):
+    partial_holding(directory, FILES["model.safetensors"][:30] + b"nothing")
+    assert content_of(weights.stage(MODEL, directory, hub.open_at)) == FILES
+    # The piece is compared when the server has sent its end, cut off, and
+    # asked for whole: the server is not the one with other bytes.
+    assert hub.asked == [("config.json", 0), ("model.safetensors", 37), ("model.safetensors", 30)]
+
+
+@pytest.mark.parametrize("whole_pieces", [3, 10])
+def test_the_piece_a_partial_file_ends_with_is_compared_before_the_download_continues(directory, hub, whole_pieces):
+    # What a node killed between the last byte of a piece and its
+    # comparison leaves, when the piece is another than the pinned one.
+    ends_at = whole_pieces * PIECE_BYTES
+    partial_holding(directory, FILES["model.safetensors"][: ends_at - PIECE_BYTES] + bytes(PIECE_BYTES))
+    assert content_of(weights.stage(MODEL, directory, hub.open_at)) == FILES
+    assert hub.asked == [("config.json", 0), ("model.safetensors", ends_at - PIECE_BYTES)]
+
+
+def test_a_partial_file_larger_than_the_file_is_emptied(directory, hub):
+    partial_holding(directory, bytes(120))
+    assert content_of(weights.stage(MODEL, directory, hub.open_at)) == FILES
+    assert hub.asked == [("config.json", 0), ("model.safetensors", 0)]
+
+
+def test_a_partial_file_that_holds_the_whole_file_is_named_with_no_request(directory, hub):
+    # What a node killed between its last piece and the name leaves.
+    partial_holding(directory, FILES["model.safetensors"])
+    assert content_of(weights.stage(MODEL, directory, hub.open_at)) == FILES
+    assert hub.asked == [("config.json", 0)]
 
 
 def test_a_disk_without_room_for_what_is_missing_is_refused_before_the_download(directory, hub, monkeypatch):
@@ -269,9 +340,10 @@ def test_a_disk_without_room_for_what_is_missing_is_refused_before_the_download(
         weights.stage(MODEL, directory, hub.open_at)
     fetching = directory / f"{MODEL.directory_name}{FETCHING_SUFFIX}"
     assert hub.asked == [] and asked_of == [fetching]
-    # What a stopped download left counts: one byte of it makes the room.
-    (fetching / f"model.safetensors{PARTIAL_SUFFIX}").write_bytes(FILES["model.safetensors"][:1])
+    # What a stopped download left counts: one piece of it makes the room.
+    (fetching / f"model.safetensors{PARTIAL_SUFFIX}").write_bytes(FILES["model.safetensors"][:10])
     assert content_of(weights.stage(MODEL, directory, hub.open_at)) == FILES
+    assert hub.asked == [("config.json", 0), ("model.safetensors", 10)]
 
 
 def test_the_free_room_is_the_disk_of_the_directory(tmp_path):
@@ -338,7 +410,7 @@ def test_a_second_node_waits_for_the_one_that_downloads_and_then_finds_the_model
     assert outcome == [directory / MODEL.directory_name] and hub.asked == []
 
 
-def test_the_download_logs_where_it_goes_and_each_tenth_of_a_file(directory, hub):
+def test_the_download_logs_where_it_goes_and_each_tenth_of_a_file_that_a_checked_piece_ends(directory, hub):
     with lines_of_the_download() as lines:
         weights.stage(MODEL, directory, hub.open_at)
     url = MODEL.url(SAFETENSORS)
@@ -512,18 +584,26 @@ def test_the_command_downloads_into_the_directory_of_the_node_when_given_none(di
     assert content_of(directory / MODEL.directory_name) == FILES
 
 
+def test_the_command_prints_the_pin_of_a_file_as_the_pins_file_holds_it(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(weights, "PINS", dataclasses.replace(PINS, piece_bytes=PIECE_BYTES))
+    for path, content in FILES.items():
+        (tmp_path / path).write_bytes(content)
+    weights.main(["pin", *(str(tmp_path / path) for path in FILES)])
+    printed = json.loads(capsys.readouterr().out)
+    assert [File(pin["path"], pin["size"], PIECE_BYTES, tuple(pin["pieces"])) for pin in printed] == list(MODEL.files)
+
+
 # A node that loads: the download runs in the daemon thread the perceiver
 # gives a load, and the process ends when its first line of input comes,
 # while the download still waits for bytes.
 NODE_THAT_STOPS_IN_A_DOWNLOAD = """
-import asyncio, sys
+import asyncio, json, sys
 from pathlib import Path
 from openarm_ai_brain_vla.perception import weights
 from openarm_ai_brain_vla.perception.perceiver import in_daemon_thread
 
-weights.HUB, directory = sys.argv[1], Path(sys.argv[2])
-weights.CHUNK_BYTES = int(sys.argv[3])
-file = weights.File(sys.argv[4], int(sys.argv[5]), sys.argv[6])
+weights.HUB, directory, pin = sys.argv[1], Path(sys.argv[2]), json.loads(sys.argv[3])
+file = weights.File(pin["path"], pin["size"], pin["piece_bytes"], tuple(pin["pieces"]))
 source = weights.Source("model", "someone/model", "0123456789abcdef0123456789abcdef01234567", (file,))
 
 async def node():
@@ -537,8 +617,8 @@ asyncio.run(node())
 
 def test_a_node_that_stops_in_a_download_ends_at_once_and_the_next_start_continues(directory, loopback):
     model = Source(MODEL.name, MODEL.repository, MODEL.revision, (SAFETENSORS,))
-    loopback.stalls_after = 30
-    arguments = [loopback.url, str(directory), str(CHUNK_BYTES), SAFETENSORS.path, str(SAFETENSORS.size), SAFETENSORS.sha256]
+    loopback.stalls_after = 35
+    arguments = [loopback.url, str(directory), json.dumps(dataclasses.asdict(SAFETENSORS))]
     node = subprocess.Popen([sys.executable, "-c", NODE_THAT_STOPS_IN_A_DOWNLOAD, *arguments], stdin=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
         assert loopback.stalled.wait(FAILURE_S)

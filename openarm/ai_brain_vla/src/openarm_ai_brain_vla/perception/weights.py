@@ -2,11 +2,18 @@
 to the machine by the first load that needs them.
 
 A model is a `Source`: a repository of the Hugging Face Hub at one commit,
-and the files of it that transformers reads, each pinned by its size and
-its SHA-256. `stage` names the directory that holds a model's files and
-downloads them first when the machine does not have them. Only a node whose
-launch selects the backend downloads them, once for the machine, and every
-machine reads the same bytes.
+and the files of it that transformers reads. `weights.json` pins them: each
+file by its size and by the SHA-256 of each of its pieces, `piece_bytes` of
+the file in a row. `stage` names the directory that holds a model's files
+and downloads them first when the machine does not have them. Only a node
+whose launch selects the backend downloads them, once for the machine, and
+every machine reads the same bytes.
+
+SAM 3's official repository, facebook/sam3, is gated behind a licence
+click-through on the Hub. The pinned one, jetjodh/sam3, is a mirror that
+carries the same files, each with the same content hash at the pinned
+revision. Its `sam3.pt`, the checkpoint of the original code base, is not a
+file transformers reads. SigLIP so400m is the study's namer.
 
 The weights are kept in the directory `WEIGHTS_DIRECTORY_VARIABLE` names,
 else in `DEFAULT_DIRECTORY` of the daemon user's home, which the container
@@ -16,25 +23,35 @@ sees and which stays when the node image is built again:
     <directory>/<name>-<revision>/            a whole model
     <directory>/<name>-<revision>.fetching/   a model that is being downloaded
 
-A file is downloaded as `<file>.partial` in the `.fetching` directory and
-takes its name once it holds the pinned bytes. The directory takes the
-model's name once it holds every file. So a directory under a model's name
-always holds the whole model, checked, and a load that finds it reads no
-network and hashes nothing.
+A file is downloaded as `<file>.partial` in the `.fetching` directory. Its
+bytes are written as they come, and each piece is compared with its pin
+when its last byte is written: a piece with another hash is cut off the
+partial file, so the pieces before the one a partial file ends in are
+always checked ones. The file takes its name once its last piece is
+checked, and the directory takes the model's name once it holds every file.
+So a directory under a model's name always holds the whole model, checked,
+and a load that finds it reads no network and hashes nothing.
 
 A node can be stopped or killed at any point of a download. It leaves at
 most one partial file for each file of the model, and the next start
-continues each partial file from its last byte with an HTTP range request.
-The download runs on the standard library alone, in the thread of the load:
-it starts no thread and no process that could hold the node past its
-shutdown. Two nodes of one machine do not download the same files twice:
-one holds the lock of the directory, and the other waits for it and then
-finds the model.
+continues each from its last byte with an HTTP range request, after it has
+read again the one piece the partial file ends in. So a start that lasts
+long enough to receive some bytes moves the download on, however many
+starts it takes. The download runs on the standard library alone, in the
+thread of the load: it starts no thread and no process that could hold the
+node past its shutdown. Two nodes of one machine do not download the same
+files twice: one holds the lock of the directory, and the other waits for
+it and then finds the model.
 
     python -m openarm_ai_brain_vla.perception.weights fetch [directory]
 
 downloads every model, for a machine that must have the weights before its
 first launch or that a robot with no network copies the directory from.
+
+    python -m openarm_ai_brain_vla.perception.weights pin <file>...
+
+prints the pin of each file as `weights.json` holds it, for the files of a
+revision whose content is known to be the right one.
 """
 
 from __future__ import annotations
@@ -43,6 +60,7 @@ import argparse
 import fcntl
 import hashlib
 import http.client
+import json
 import logging
 import os
 import re
@@ -60,11 +78,14 @@ MODULE = "openarm_ai_brain_vla.perception.weights"
 # the launching shell's environment to the nodes it starts on that machine.
 WEIGHTS_DIRECTORY_VARIABLE = "OPENARM_AI_BRAIN_VLA_WEIGHTS"
 DEFAULT_DIRECTORY = Path("~/.cache/openarm_ai_brain_vla/weights")
+PINS_FILE = Path(__file__).with_name("weights.json")
 HUB = "https://huggingface.co"
 LOCK_FILE = "lock"
 FETCHING_SUFFIX = ".fetching"
 PARTIAL_SUFFIX = ".partial"
-CHUNK_BYTES = 1 << 20
+# The most bytes read from the network and written to the disk at a time: a
+# node that is killed loses what it was reading, and no more.
+CHUNK_BYTES = 1 << 18
 # The seconds a connection, or one read from it, can take before the attempt
 # fails.
 TIMEOUT_S = 60.0
@@ -78,12 +99,26 @@ class WeightsError(Exception):
 
 @dataclass(frozen=True)
 class File:
-    """One file of a model: its path in the repository, its size in bytes
-    and the SHA-256 of its content."""
+    """One file of a model: its path in the repository, its size in bytes,
+    and the SHA-256 of each of its pieces, `piece_bytes` of the file in a
+    row and the rest of it in the last one."""
 
     path: str
     size: int
-    sha256: str
+    piece_bytes: int
+    pieces: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if self.size <= 0 or self.piece_bytes <= 0:
+            raise ValueError(f"{self.path} is pinned with {self.size} bytes in pieces of {self.piece_bytes}")
+        if len(self.pieces) != -(-self.size // self.piece_bytes):
+            raise ValueError(f"{self.path} is pinned with {len(self.pieces)} pieces, and {self.size} bytes make {-(-self.size // self.piece_bytes)} of {self.piece_bytes}")
+
+    def piece_start(self, index: int) -> int:
+        return index * self.piece_bytes
+
+    def piece_end(self, index: int) -> int:
+        return min(self.size, (index + 1) * self.piece_bytes)
 
 
 @dataclass(frozen=True)
@@ -104,41 +139,46 @@ class Source:
         return f"{HUB}/{self.repository}/resolve/{self.revision}/{file.path}"
 
 
-# SAM 3's official repository, facebook/sam3, is gated behind a licence
-# click-through on the Hub. This mirror carries the same files, each with the
-# same content hash at this revision. Its `sam3.pt`, the checkpoint of the
-# original code base, is not a file transformers reads.
-SAM3 = Source(
-    "sam3",
-    "jetjodh/sam3",
-    "1aa50ce07302cb375f85d8084b68a0fb378b8d85",
-    (
-        File("config.json", 25843, "4616385e4b21f2e5e22c875b65679185cbccfa95de42542b9166f7dc3d57160f"),
-        File("merges.txt", 524619, "9fd691f7c8039210e0fced15865466c65820d09b63988b0174bfe25de299051a"),
-        File("model.safetensors", 3439938512, "6d06f0a5f84e435071fe6603e61d0b4cc7b40e0d39d487cfd4d67d8cc11cc14a"),
-        File("processor_config.json", 1712, "6420cf2671fa9309ea95bc0144a8b9861666d1c5f43c8db09e410dacda974fce"),
-        File("special_tokens_map.json", 588, "2cdb3b8331a60c92fc1e55a13e9fd61fd2293c5a51275fdcccd62b780052530e"),
-        File("tokenizer.json", 3642073, "6d9109cc838977f3ca94a379eec36aecc7c807e1785cd729660ca2fc0171fb35"),
-        File("tokenizer_config.json", 799, "39670ad98457fe8f14ca59f6bb74591e9fc850974380a63993e5b8ffc865baa2"),
-        File("vocab.json", 862328, "5047b556ce86ccaf6aa22b3ffccfc52d391ea4accdab9c2f2407da5b742d4363"),
-    ),
-)
-# SigLIP so400m is the study's namer.
-SIGLIP = Source(
-    "siglip",
-    "google/siglip-so400m-patch14-384",
-    "9fdffc58afc957d1a03a25b10dba0329ab15c2a3",
-    (
-        File("config.json", 576, "adc04928d8fd19a61822584fe0cf2e813e5ebac17f3e49fb1ea096860ae6457b"),
-        File("model.safetensors", 3511950624, "ea2abad2b7f8a9c1aa5e49a244d5d57ffa71c56f720c94bc5d240ef4d6e1d94a"),
-        File("preprocessor_config.json", 368, "f59da2f87c3cd079bd4f8f3037e81b277c60c498e279a8020331f67a5a3157e8"),
-        File("special_tokens_map.json", 409, "2b6a1ff67a27e0df9ac0c7d93250fc0d87431c7b366b3d5669217104f9088a26"),
-        File("spiece.model", 798330, "1e5036bed065526c3c212dfbe288752391797c4bb1a284aa18c9a0b23fcaf8ec"),
-        File("tokenizer.json", 2399357, "c6e405cb7c670d56636a9402c81023a55bc6c3c53d89cf02b92f5c5005bfe920"),
-        File("tokenizer_config.json", 711, "d6423dae508cc3a129d22ea443841c111832a1a73125b8f25ea8736951698bcb"),
-    ),
-)
-SOURCES = (SAM3, SIGLIP)
+def pieces_of(content, piece_bytes: int) -> tuple[str, ...]:
+    """The SHA-256 of each piece of a file open for reading."""
+    return tuple(hashlib.sha256(piece).hexdigest() for piece in iter(lambda: content.read(piece_bytes), b""))
+
+
+def pin_of(path: Path, piece_bytes: int) -> dict:
+    """The pin of the file at `path`, as `weights.json` holds it."""
+    with path.open("rb") as content:
+        return {"path": path.name, "size": path.stat().st_size, "pieces": list(pieces_of(content, piece_bytes))}
+
+
+@dataclass(frozen=True)
+class Pins:
+    """What a pins file holds: the size of a piece, and the models in the
+    file's order."""
+
+    piece_bytes: int
+    sources: tuple[Source, ...]
+
+
+def load_pins(path: Path = PINS_FILE) -> Pins:
+    pins = json.loads(path.read_text())
+    piece_bytes = pins["piece_bytes"]
+    return Pins(
+        piece_bytes,
+        tuple(
+            Source(
+                model["name"],
+                model["repository"],
+                model["revision"],
+                tuple(File(file["path"], file["size"], piece_bytes, tuple(file["pieces"])) for file in model["files"]),
+            )
+            for model in pins["models"]
+        ),
+    )
+
+
+PINS = load_pins()
+SOURCES = PINS.sources
+SAM3, SIGLIP = SOURCES
 
 
 @dataclass(frozen=True)
@@ -232,59 +272,95 @@ def fetch(source: Source, directory: Path, open_at: OpenAt) -> Path:
 
 def fetch_file(source: Source, file: File, fetching: Path, open_at: OpenAt) -> None:
     """Puts `file` in `fetching` under its name: downloads what its partial
-    file lacks, and names the file once its content is the pinned one. A
-    partial file with other content is removed and the fetch fails, so the
-    next one downloads the file from its start."""
+    file lacks, and names the file once its last piece is checked."""
     target = fetching / file.path
     if target.exists():
         return
     partial = partial_of(target)
-    url = source.url(file)
-    download(file, url, partial, open_at)
+    partial.touch()
+    download(file, source.url(file), partial, open_at)
     with partial.open("rb") as content:
-        found = hashlib.file_digest(content, "sha256").hexdigest()
         # The bytes reach the disk before the name that says they are whole.
         os.fsync(content.fileno())
-    if found != file.sha256:
-        partial.unlink()
-        raise WeightsError(f"{url} is not the pinned file: its SHA-256 is {found}, the pin is {file.sha256}")
     partial.rename(target)
 
 
 def download(file: File, url: str, partial: Path, open_at: OpenAt) -> None:
-    """Appends to `partial` until it holds as many bytes as `file`. A
+    """Appends to `partial` until it holds `file`, every piece checked. A
     failed attempt is followed by another from the byte the file ends at,
-    until `STALLED_ATTEMPTS` of them in a row have added nothing."""
+    until `STALLED_ATTEMPTS` of them in a row have added nothing. Raises
+    WeightsError then, and when the server sends a piece that is not the
+    pinned one."""
     stalled = 0
-    while (held := size_of(partial)) < file.size:
+    held = keep_checked(file, partial)
+    while held < file.size:
         try:
             receive(file, url, partial, held, open_at)
             failure = "the server ended its answer"
         except (OSError, http.client.HTTPException) as error:
             failure = str(error) or type(error).__name__
-        now_held = size_of(partial)
-        stalled = 0 if now_held > held else stalled + 1
+        held, held_before = partial.stat().st_size, held
+        stalled = 0 if held > held_before else stalled + 1
         if stalled == STALLED_ATTEMPTS:
-            raise WeightsError(f"the download of {url} stopped at {now_held} of {file.size} bytes: {failure}")
+            raise WeightsError(f"the download of {url} stopped at {held} of {file.size} bytes: {failure}")
+
+
+def keep_checked(file: File, partial: Path) -> int:
+    """The bytes of `partial` that a download continues from. A node can
+    be killed after it wrote the last byte of a piece and before it compared
+    the piece, so a partial file that ends where a piece ends has that piece
+    compared here, and cut off when it is another. A partial file larger
+    than `file` is not one a download wrote, and is emptied."""
+    held = partial.stat().st_size
+    if held == 0:
+        return 0
+    if held > file.size:
+        os.truncate(partial, 0)
+        return 0
+    index = (held - 1) // file.piece_bytes
+    if held < file.piece_end(index):
+        return held
+    with partial.open("rb") as content:
+        content.seek(file.piece_start(index))
+        found = hashlib.sha256(content.read()).hexdigest()
+    if found == file.pieces[index]:
+        return held
+    os.truncate(partial, file.piece_start(index))
+    return file.piece_start(index)
 
 
 def receive(file: File, url: str, partial: Path, held: int, open_at: OpenAt) -> None:
     """One attempt: asks for `file` from the byte `partial` ends at and
     appends what comes, at most up to the file's size, each chunk written
-    through before the next is read, so a node that is killed loses the
-    chunk it was reading and no more. A server that sends the whole file
-    makes the partial file start again."""
-    with open_at(url, held) as body, partial.open("ab") as out:
-        if body.starts_at > held:
-            raise OSError(f"the answer starts at byte {body.starts_at}, past byte {held}")
+    through before the next is read. A server that sends the whole file
+    makes the partial file start again. A piece is compared with its pin
+    when its last byte is written, and cut off when it is another: the
+    attempt then ends when the partial file held the start of that piece,
+    and raises WeightsError when the server sent all of it."""
+    with open_at(url, held) as body, partial.open("r+b") as out:
+        if body.starts_at not in (0, held):
+            raise OSError(f"the answer starts at byte {body.starts_at}, and byte {held} was asked for")
         out.truncate(body.starts_at)
         position = body.starts_at
-        while position < file.size and (chunk := body.read(min(CHUNK_BYTES, file.size - position))):
+        index = position // file.piece_bytes
+        # What the partial file holds of the piece it ends in.
+        out.seek(file.piece_start(index))
+        piece = hashlib.sha256(out.read())
+        while position < file.size and (chunk := body.read(min(CHUNK_BYTES, file.piece_end(index) - position))):
             out.write(chunk)
             out.flush()
-            before, position = position, position + len(chunk)
-            if tenths(position, file) > tenths(before, file):
+            piece.update(chunk)
+            position += len(chunk)
+            if position < file.piece_end(index):
+                continue
+            if piece.hexdigest() != file.pieces[index]:
+                out.truncate(file.piece_start(index))
+                if body.starts_at > file.piece_start(index):
+                    return
+                raise WeightsError(f"{url} is not the pinned file: the SHA-256 of piece {index} is {piece.hexdigest()}, the pin is {file.pieces[index]}")
+            if tenths(position, file) > tenths(file.piece_start(index), file):
                 logger.info("%s: %d0%% of %.1f MB", url, tenths(position, file), file.size / 1e6)
+            index, piece = index + 1, hashlib.sha256()
 
 
 def tenths(position: int, file: File) -> int:
@@ -312,12 +388,18 @@ def free_bytes(directory: Path) -> int:
 
 
 def main(arguments: Optional[Sequence[str]] = None) -> None:
-    parser = argparse.ArgumentParser(prog=f"python -m {MODULE}", description="Downloads the weights of the sam3_siglip backend's models.")
+    parser = argparse.ArgumentParser(prog=f"python -m {MODULE}", description="Downloads and pins the weights of the sam3_siglip backend's models.")
     commands = parser.add_subparsers(dest="command", required=True)
     fetch_command = commands.add_parser("fetch", help="download every model that a directory does not hold")
     fetch_command.add_argument("directory", type=Path, nargs="?", help=f"where the weights are kept; the node's own directory when left out ({WEIGHTS_DIRECTORY_VARIABLE}, else {DEFAULT_DIRECTORY})")
-    into = parser.parse_args(arguments).directory or node_directory()
+    pin_command = commands.add_parser("pin", help=f"print the pin of each file, as {PINS_FILE.name} holds it")
+    pin_command.add_argument("files", type=Path, nargs="+", help="a file of a model, whose content is the right one")
+    asked = parser.parse_args(arguments)
+    if asked.command == "pin":
+        print(json.dumps([pin_of(path, PINS.piece_bytes) for path in asked.files], indent=2))
+        return
     logging.basicConfig(level=logging.INFO, format="%(message)s")
+    into = asked.directory or node_directory()
     for source in SOURCES:
         logger.info("%s is in %s", source.repository, stage(source, into))
 

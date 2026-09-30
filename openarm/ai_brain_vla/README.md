@@ -30,25 +30,28 @@ the image is built again. A launch with another backend downloads nothing.
 `OPENARM_AI_BRAIN_VLA_WEIGHTS`, exported in the shell that launches, names
 another directory the container can see.
 
-`perception/weights.py` pins each model to one commit of its repository and
-each of its files to a size and a SHA-256. A file takes its name only when
-its content is the pinned one, and a model's directory takes its name only
-when it holds every file. So a load reads a whole, checked model or none, and
-a load that finds the models uses no network.
+`perception/weights.json` pins each model to one commit of its repository,
+and each of its files to its size and to the SHA-256 of each 16 MiB piece of
+it. The node compares each piece with its pin as the download ends it
+(`perception/weights.py`). A file takes its name only when every piece of it
+is the pinned one, and a model's directory takes its name only when it holds
+every file. So a load reads a whole, checked model or none, and a load that
+finds the models uses no network.
 
 A node can be stopped at any point of the download: it leaves at most one
 partial file for each file of a model, and the next start continues each from
-its last byte. While the download runs the node's log has a line for each
-tenth of a file, and searches are refused as "still loading". A download
-that cannot go on (no network, no room on the disk, bytes that are not the
-pinned ones) fails the load with the reason, and the next start of the node
-continues it. Two nodes on one machine do not download the weights twice: the
-second waits for the first.
+its last byte, however short each start is. While the download runs the
+node's log has a line for each tenth of a file, and searches are refused as
+"still loading". A download that cannot go on (no network, no room on the
+disk, a piece that is not the pinned one) fails the load with the reason, and
+the next start of the node continues it. Two nodes on one machine do not
+download the weights twice: the second waits for the first.
 
 From the node's directory,
 `uv run --locked python -m openarm_ai_brain_vla.perception.weights fetch [directory]`
 downloads both models with no launch. A robot with no network takes a copy of
-that directory from a machine that has one.
+that directory from a machine that has one. The same module's `pin <file>...`
+prints the pins of the files of another revision for `weights.json`.
 
 SAM 3 comes from `jetjodh/sam3`, a mirror of the official `facebook/sam3`,
 which is gated behind a licence click-through; the pinned revision carries
