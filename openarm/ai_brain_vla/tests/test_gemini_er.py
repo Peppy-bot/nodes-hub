@@ -7,14 +7,19 @@ import json
 import numpy as np
 import pytest
 
+from conftest import NEVER, PASSED
+from openarm_ai_brain_vla.perception import gemini_er
 from openarm_ai_brain_vla.perception import make_detector
 from openarm_ai_brain_vla.perception.gemini_er import (
     IDENTIFY,
     KEY_ENV,
     LIST,
+    MIN_CALL_TIMEOUT_S,
+    MIN_CONFIDENCE,
     MODEL,
     OPEN,
     Answer,
+    ApiFailure,
     GeminiErDetector,
     api_key,
     identify_prompt,
@@ -23,22 +28,41 @@ from openarm_ai_brain_vla.perception.gemini_er import (
     parse_boxes,
     plan_for,
 )
-from openarm_ai_brain_vla.ports import Coverage
+from openarm_ai_brain_vla.ports import Coverage, SearchTimeout
 
 
 class FakeApi:
-    """Answers every question with the texts it was given, in order, and
-    keeps what it was asked."""
+    """Answers every question with the texts it was given, in order, a
+    failure where a text is an ApiFailure, and keeps what it was asked and
+    the deadline each call got."""
 
-    def __init__(self, *texts: str) -> None:
+    def __init__(self, *texts) -> None:
         self.texts = list(texts)
         self.prompts: list[str] = []
         self.images: list[bytes] = []
+        self.timeouts: list[float] = []
 
-    def ask(self, image: bytes, prompt: str) -> Answer:
+    def ask(self, image: bytes, prompt: str, timeout_s: float) -> Answer:
         self.images.append(image)
         self.prompts.append(prompt)
-        return Answer(self.texts.pop(0) if self.texts else "[]", input_tokens=1000, output_tokens=20, thought_tokens=100, latency_s=1.5)
+        self.timeouts.append(timeout_s)
+        text = self.texts.pop(0) if self.texts else "[]"
+        if isinstance(text, ApiFailure):
+            raise text
+        return Answer(text, input_tokens=1000, output_tokens=20, thought_tokens=100, latency_s=1.5)
+
+
+class Budget:
+    """A deadline with a fixed amount of time left, never passed."""
+
+    def __init__(self, remaining_s: float) -> None:
+        self._remaining_s = remaining_s
+
+    def check(self) -> None:
+        return None
+
+    def remaining_s(self) -> float:
+        return self._remaining_s
 
 
 def frame(width=200, height=100):
@@ -144,19 +168,28 @@ def test_loading_without_a_key_refuses_with_the_reason(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     detector = GeminiErDetector()
     with pytest.raises(RuntimeError, match=KEY_ENV):
-        detector.load("")
+        detector.load("", "")
     assert not detector.available
-    assert detector.detect(frame()) == []
+    assert detector.detect(frame(), NEVER) == []
 
 
 def test_the_registry_builds_the_backend_and_the_model_id_defaults():
     detector = make_detector("gemini_er")
     assert detector.name == "gemini_er"
+    assert detector.min_confidence == MIN_CONFIDENCE == 0.5
     fake = GeminiErDetector(api=FakeApi())
-    fake.load("  ")
+    fake.load("  ", "")
     assert fake.model == MODEL and fake.available
-    fake.load("gemini-robotics-er-3")
+    fake.load("gemini-robotics-er-3", "")
     assert fake.model == "gemini-robotics-er-3"
+
+
+def test_a_gallery_fails_the_load_since_the_backend_reads_none(tmp_path):
+    # Refused before the key is even looked for.
+    detector = GeminiErDetector()
+    with pytest.raises(ValueError, match="gemini_er takes no enrolment gallery"):
+        detector.load("", str(tmp_path))
+    assert not detector.available
 
 
 def test_a_scan_covers_every_label_once_the_client_is_open():
@@ -167,9 +200,9 @@ def test_a_scan_covers_every_label_once_the_client_is_open():
 def test_a_scan_asks_for_everything_and_keeps_the_models_labels():
     api = FakeApi(json.dumps([{"label": "red mug", "y": 100, "x": 100, "y2": 500, "x2": 300}]))
     detector = GeminiErDetector(api=api)
-    detector.load("")
+    detector.load("", "")
     detector.set_vocabulary([])
-    boxes = detector.detect(frame(200, 100))
+    boxes = detector.detect(frame(200, 100), NEVER)
     assert api.prompts[0].startswith("Detect every distinct object")
     assert api.images[0][:3] == b"\xff\xd8\xff"  # a JPEG
     assert [(b.label, b.confidence, b.x0, b.y0, b.x1, b.y1) for b in boxes] == [("red mug", 1.0, 20.0, 10.0, 60.0, 50.0)]
@@ -178,9 +211,9 @@ def test_a_scan_asks_for_everything_and_keeps_the_models_labels():
 def test_an_identify_search_asks_one_question_and_names_its_boxes():
     api = FakeApi(json.dumps([{"label": "cup", "y": 0, "x": 0, "y2": 1000, "x2": 500}]))
     detector = GeminiErDetector(api=api)
-    detector.load("")
+    detector.load("", "")
     detector.set_vocabulary(["the mug"])
-    boxes = detector.detect(frame(200, 100))
+    boxes = detector.detect(frame(200, 100), NEVER)
     assert api.prompts == [identify_prompt("the mug")]
     assert [(b.label, b.x1) for b in boxes] == [("the mug", 100.0)]
     assert detector.calls == 1 and detector.spent_usd > 0.0
@@ -192,8 +225,75 @@ def test_a_scan_for_named_items_lists_them_and_drops_the_rest():
         {"label": "spoon", "y": 0, "x": 500, "y2": 500, "x2": 1000},
     ]))
     detector = GeminiErDetector(api=api)
-    detector.load("")
+    detector.load("", "")
     detector.set_vocabulary(["mug", "banana"])
-    boxes = detector.detect(frame())
+    boxes = detector.detect(frame(), NEVER)
     assert api.prompts == [list_prompt(["mug", "banana"])]
     assert [b.label for b in boxes] == ["mug"]
+
+
+MUG = json.dumps([{"label": "mug", "y": 0, "x": 0, "y2": 500, "x2": 500}])
+
+
+def test_a_call_gets_the_budget_left_never_under_the_apis_least_deadline():
+    api = FakeApi(MUG, MUG)
+    detector = GeminiErDetector(api=api)
+    detector.load("", "")
+    detector.set_vocabulary(["mug"])
+    detector.detect(frame(), Budget(30.0))
+    detector.detect(frame(), Budget(3.0))
+    assert api.timeouts == [30.0, MIN_CALL_TIMEOUT_S]
+
+
+def test_a_search_whose_budget_is_gone_stops_before_the_call():
+    api = FakeApi(MUG)
+    detector = GeminiErDetector(api=api)
+    detector.load("", "")
+    detector.set_vocabulary(["mug"])
+    with pytest.raises(SearchTimeout, match="did not finish within 1 s"):
+        detector.detect(frame(), PASSED)
+    assert api.prompts == [] and detector.calls == 0
+
+
+def test_a_refused_call_is_asked_again_only_with_budget_for_the_wait(monkeypatch):
+    monkeypatch.setattr(gemini_er, "RETRY_WAIT_S", 0.0)
+    # Room for another call: the 429 is asked again and answered.
+    api = FakeApi(ApiFailure(429, "quota"), MUG)
+    detector = GeminiErDetector(api=api)
+    detector.load("", "")
+    detector.set_vocabulary(["mug"])
+    assert [b.label for b in detector.detect(frame(), Budget(30.0))] == ["mug"]
+    assert len(api.prompts) == 2 and detector.calls == 1
+    # No room: the failure is the search's, and the bill stops at one call.
+    api = FakeApi(ApiFailure(503, "overloaded"), MUG)
+    detector = GeminiErDetector(api=api)
+    detector.load("", "")
+    detector.set_vocabulary(["mug"])
+    with pytest.raises(ApiFailure, match="the API answered 503: overloaded"):
+        detector.detect(frame(), Budget(0.0))
+    assert len(api.prompts) == 1
+    # A refusal that will not change with a retry is never asked again.
+    api = FakeApi(ApiFailure(400, "bad request"), MUG)
+    detector = GeminiErDetector(api=api)
+    detector.load("", "")
+    detector.set_vocabulary(["mug"])
+    with pytest.raises(ApiFailure, match="400"):
+        detector.detect(frame(), Budget(30.0))
+    assert len(api.prompts) == 1
+    assert ApiFailure(429, "").retryable and ApiFailure(500, "").retryable and not ApiFailure(404, "").retryable
+
+
+def test_the_confidence_is_the_share_of_answers_and_the_floor_applies_to_it(monkeypatch):
+    monkeypatch.setattr(gemini_er, "SAMPLES", 2)
+    api = FakeApi(MUG, "[]")
+    detector = GeminiErDetector(api=api)
+    detector.load("", "")
+    detector.set_vocabulary(["mug"])
+    boxes = detector.detect(frame(), NEVER)
+    assert [(b.label, b.confidence) for b in boxes] == [("mug", 0.5)]
+    api = FakeApi(MUG, "[]")
+    detector = GeminiErDetector(api=api)
+    detector.load("", "")
+    detector.min_confidence = 0.6
+    detector.set_vocabulary(["mug"])
+    assert detector.detect(frame(), NEVER) == []

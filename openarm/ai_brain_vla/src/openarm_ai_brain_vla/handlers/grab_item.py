@@ -14,16 +14,15 @@ async def run(brain, ctx) -> None:
     async def body(job) -> dict:
         state = brain.state
         # The item first: its position decides which free gripper suits it.
-        known = state.item(goal.item_id) if goal.item_id else None
+        known = state.item_to_grab(goal.item_id) if goal.item_id else None
         near = known.position if known is not None else tuple(goal.position)
         gripper = state.gripper_for_grab(goal.gripper_name, near)
-        if not brain.manipulator.available:
-            raise Refusal(f"no manipulation backend: manipulation_backend is '{brain.manipulator.name}'")
+        manipulator = brain.manipulator_or_refuse()
         item = known
         if item is None:
             orientation = tuple(goal.orientation) if goal.orientation is not None else None
             item = state.mint_from_pose(tuple(goal.position), orientation, brain.now())
-        outcome = await brain.manipulator.grab(item, gripper, goal.max_effort, job.cancel)
+        outcome = await manipulator.grab(item, gripper, goal.max_effort, job.cancel)
         job.cancel.check()
         if not outcome.success:
             raise Refusal(outcome.message or "the grasp failed")

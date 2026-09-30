@@ -1,12 +1,15 @@
-"""The camera model and the core Perceiver: pixels to world positions,
-duplicate boxes, and the ways a scan is refused."""
+"""The camera model, the frame store and the core Perceiver: pixels to
+world positions, frames paired by capture, the camera's answers asked
+until they come, duplicate boxes, and the ways a scan is refused."""
 
 import asyncio
 import math
+import threading
+from types import SimpleNamespace
 
 import pytest
 
-from conftest import FakeDetector, depth_frame, rgb_frame
+from conftest import NEVER, FakeDetector, FakeToken, depth_frame, rgb_frame
 from openarm_ai_brain_vla.perception.camera import (
     INVERSE_PLUMB_BOB,
     NONE,
@@ -18,8 +21,10 @@ from openarm_ai_brain_vla.perception.camera import (
     rotate,
     undistort,
 )
-from openarm_ai_brain_vla.perception.frames import FrameStore, decode_color, decode_depth, depth_at
-from openarm_ai_brain_vla.perception.perceiver import Perceiver, merge_duplicates
+from openarm_ai_brain_vla.perception import frames as frames_module
+from openarm_ai_brain_vla.perception import geometry
+from openarm_ai_brain_vla.perception.frames import FRAME_BUFFER, FrameStore, decode_color, decode_depth, depth_at
+from openarm_ai_brain_vla.perception.perceiver import DEFAULT_TIMEOUT_S, Perceiver, in_daemon_thread, merge_duplicates
 from openarm_ai_brain_vla.ports import Box, CancelToken, Coverage, Refusal
 
 IDENTITY = CameraModel.from_parameters("0 0 0 0 0 0 1").with_intrinsics(Intrinsics.from_fovy(90.0, 16, 12))
@@ -179,6 +184,109 @@ def test_frames_decode_and_depth_reads_the_median_under_a_box():
         decode_color(message)
 
 
+def store_with(colors=(), depths=(), depth_unit=0.001) -> FrameStore:
+    store = FrameStore()
+    for message in colors:
+        store.add_color(message)
+    for message in depths:
+        store.add_depth(message)
+    store.depth_unit = depth_unit
+    return store
+
+
+def test_the_frame_store_pairs_colour_and_depth_by_capture():
+    # Colour runs a frame ahead of depth: the newest pair is capture 2.
+    store = store_with([rgb_frame(frame_id=1), rgb_frame(frame_id=2), rgb_frame(frame_id=3)], [depth_frame(1.0, frame_id=1), depth_frame(2.0, frame_id=2)])
+    frame = store.latest()
+    assert frame.color.header.frame_id == 2 and frame.depth.header.frame_id == 2
+    assert store.why_unavailable() == "" and store.frames_seen == 3
+    # Only the last FRAME_BUFFER frames of a stream are kept.
+    for frame_id in range(10, 10 + FRAME_BUFFER + 2):
+        store.add_color(rgb_frame(frame_id=frame_id))
+    assert [m.header.frame_id for m in store.colors] == list(range(12, 12 + FRAME_BUFFER))
+
+
+def test_the_frame_store_says_what_is_missing():
+    assert FrameStore().why_unavailable() == "no camera frame received"
+    assert store_with([rgb_frame()]).why_unavailable() == "no depth frame received"
+    assert store_with([rgb_frame()], [depth_frame(1.0)], depth_unit=None).why_unavailable() == "the camera has not answered depth_stream_info yet"
+    disjoint = store_with([rgb_frame(frame_id=1), rgb_frame(frame_id=2)], [depth_frame(1.0, frame_id=3)])
+    assert disjoint.why_unavailable() == "no colour and depth frame of one capture received (latest colour frame_id 2, depth 3)"
+    with pytest.raises(Refusal, match="no colour and depth frame of one capture"):
+        disjoint.latest()
+
+
+def test_frames_that_are_not_aligned_to_each_other_are_refused():
+    unaligned = store_with([rgb_frame(align_mode="none")], [depth_frame(1.0, align_mode="none")])
+    assert unaligned.why_unavailable() == "the camera's depth is not aligned to its colour (align_mode 'none'); the brain reads depth at colour pixels"
+    mixed = store_with([rgb_frame(align_mode="depth_to_color")], [depth_frame(1.0, align_mode="none")])
+    assert mixed.why_unavailable() == "the colour and depth frames name different alignments ('depth_to_color' and 'none')"
+    for mode in ("depth_to_color", "color_to_depth"):
+        assert store_with([rgb_frame(align_mode=mode)], [depth_frame(1.0, align_mode=mode)]).why_unavailable() == ""
+    unknown = store_with([rgb_frame(align_mode="rectified")], [depth_frame(1.0, align_mode="rectified")])
+    assert "align_mode 'rectified'" in unknown.why_unavailable()
+
+
+class Feed:
+    """A subscription that delivers its messages, then waits until it is
+    cancelled; `delivered` says the messages are all out."""
+
+    def __init__(self, messages) -> None:
+        self.messages = list(messages)
+        self.delivered = asyncio.Event()
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self.messages:
+            return ("camera", self.messages.pop(0))
+        self.delivered.set()
+        await asyncio.Event().wait()
+
+
+async def test_the_frame_store_asks_the_depth_unit_until_answered_then_follows_both_streams(monkeypatch):
+    answers = [TimeoutError("no answer yet"), SimpleNamespace(data=SimpleNamespace(depth_unit=0.001))]
+
+    async def poll(node_runner, producer, timeout):
+        answer = answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    colours = Feed([rgb_frame(frame_id=1), rgb_frame(frame_id=2)])
+    depths = Feed([depth_frame(1.0, frame_id=2)])
+
+    async def subscribe_colour(node_runner):
+        return colours
+
+    async def subscribe_depth(node_runner):
+        return depths
+
+    monkeypatch.setattr(frames_module, "DEPTH_INFO_RETRY_S", 0.0)
+    monkeypatch.setattr(frames_module.depth_stream_info, "poll", poll)
+    monkeypatch.setattr(frames_module.video_stream, "bound_producer", lambda node_runner: "camera")
+    monkeypatch.setattr(frames_module.video_stream, "subscribe", subscribe_colour)
+    monkeypatch.setattr(frames_module.depth_stream, "subscribe", subscribe_depth)
+    store = FrameStore()
+    token = FakeToken()
+    running = asyncio.create_task(store.run(None, token))
+    await asyncio.wait_for(colours.delivered.wait(), 1.0)
+    await asyncio.wait_for(depths.delivered.wait(), 1.0)
+    assert answers == [] and store.depth_unit == 0.001 and store.frames_seen == 2
+    frame = store.latest()
+    assert frame.color.header.frame_id == 2 and frame.depth.header.frame_id == 2
+    token.cancel()
+    await asyncio.wait_for(running, 1.0)
+
+
+async def test_a_vacant_camera_slot_leaves_the_store_empty(monkeypatch):
+    monkeypatch.setattr(frames_module.video_stream, "bound_producer", lambda node_runner: None)
+    store = FrameStore()
+    await asyncio.wait_for(store.run(None, FakeToken()), 1.0)
+    assert store.why_unavailable() == "no camera frame received"
+
+
 def test_duplicate_boxes_of_one_label_keep_the_most_confident():
     a = Box("cup", 0.9, 0, 0, 10, 10)
     b = Box("cup", 0.8, 1, 1, 11, 11)
@@ -189,19 +297,46 @@ def test_duplicate_boxes_of_one_label_keep_the_most_confident():
 
 
 async def test_a_scan_turns_boxes_into_world_detections():
-    frames = FrameStore()
-    frames.color = rgb_frame(16, 12)
-    frames.depth = depth_frame(2.0, 16, 12)
-    frames.depth_unit = 0.001
+    frames = store_with([rgb_frame(16, 12)], [depth_frame(2.0, 16, 12)])
     detector = FakeDetector([Box("cup", 0.9, 6, 4, 10, 8), Box("cup", 0.85, 6.5, 4.5, 10.5, 8.5)])
     perceiver = Perceiver(detector, frames, IDENTITY)
-    await perceiver.load("weights.pt")
-    assert detector.loaded == "weights.pt"
+    await perceiver.load("weights.pt", "/gallery")
+    assert detector.loaded == ("weights.pt", "/gallery")
     detections = await perceiver.scan(["cup"], CancelToken(), timeout_s=0.0)
     assert detector.vocabulary == ["cup"]
     assert len(detections) == 1
     assert detections[0].label == "cup" and detections[0].confidence == 0.9
     assert close(detections[0].position, (0.0, 0.0, -2.0))
+    # The detector is handed the search's deadline: the default budget for
+    # a zero timeout, the caller's otherwise.
+    assert detector.deadlines[-1].budget_s == DEFAULT_TIMEOUT_S
+    await perceiver.scan([], CancelToken(), timeout_s=2.5)
+    assert detector.deadlines[-1].budget_s == 2.5
+
+
+async def test_a_detectors_calls_run_in_daemon_threads_of_their_own():
+    threads: dict[str, threading.Thread] = {}
+
+    class Recording(FakeDetector):
+        def load(self, model, gallery):
+            threads["load"] = threading.current_thread()
+
+        def detect(self, image, deadline):
+            threads["detect"] = threading.current_thread()
+            return []
+
+    perceiver = Perceiver(Recording(), store_with([rgb_frame()], [depth_frame(1.0)]), IDENTITY)
+    await perceiver.load("", "")
+    await perceiver.scan([], CancelToken(), 0.0)
+    assert threads["load"].daemon and threads["detect"].daemon
+    assert threads["load"] is not threading.main_thread()
+    assert threads["load"].name == "brain-load" and threads["detect"].name == "brain-detect"
+
+    def boom():
+        raise ValueError("in the thread")
+
+    with pytest.raises(ValueError, match="in the thread"):
+        await in_daemon_thread(boom)
 
 
 async def test_a_scan_is_refused_without_a_detector_or_without_frames():
@@ -209,12 +344,28 @@ async def test_a_scan_is_refused_without_a_detector_or_without_frames():
 
     frames = FrameStore()
     assert NoneDetector().scan_coverage() == Coverage()
+    assert NoneDetector().detect(None, NEVER) == []
     none = Perceiver(NoneDetector(), frames, IDENTITY)
     with pytest.raises(Refusal, match="perception_backend is 'none'"):
         await none.scan([], CancelToken(), 0.0)
     fake = Perceiver(FakeDetector(), frames, IDENTITY)
     with pytest.raises(Refusal, match="no camera frame received"):
         await fake.scan([], CancelToken(), 0.0)
+    assert not fake.available
+    fake.frames.add_color(rgb_frame(align_mode="none"))
+    fake.frames.add_depth(depth_frame(1.0, align_mode="none"))
+    fake.frames.depth_unit = 0.001
+    with pytest.raises(Refusal, match="no perception source: the camera's depth is not aligned"):
+        await fake.scan([], CancelToken(), 0.0)
+
+
+async def test_the_none_backend_refuses_a_model_or_a_gallery_it_cannot_read():
+    from openarm_ai_brain_vla.perception.none import NoneDetector
+
+    NoneDetector().load("", "")
+    for model, gallery in (("weights", ""), ("", "/gallery")):
+        with pytest.raises(ValueError, match="perception_backend 'none' loads no model"):
+            NoneDetector().load(model, gallery)
 
 
 async def test_a_backend_loads_in_the_background_and_searches_wait_on_it():
@@ -225,31 +376,31 @@ async def test_a_backend_loads_in_the_background_and_searches_wait_on_it():
         def __init__(self) -> None:
             super().__init__()
             self.ready = False
+            self.entered = threading.Event()
             self.release = threading.Event()
 
         @property
         def available(self) -> bool:
             return self.ready
 
-        def load(self, model: str) -> None:
+        def load(self, model: str, gallery: str) -> None:
+            self.entered.set()
             self.release.wait(5.0)
-            self.loaded = model
+            self.loaded = (model, gallery)
             self.ready = True
-
-    import threading
 
     detector = SlowDetector()
     frames = FrameStore()
     perceiver = Perceiver(detector, frames, IDENTITY)
-    task = perceiver.start_loading("gallery")
-    await asyncio.sleep(0.05)
+    task = perceiver.start_loading("", "gallery")
+    await asyncio.wait_for(asyncio.to_thread(detector.entered.wait), 5.0)
     assert not task.done()
     assert perceiver.why_unavailable() == "no perception source: perception_backend 'fake' is still loading"
     with pytest.raises(Refusal, match="still loading"):
         await perceiver.scan([], CancelToken(), timeout_s=0.0)
     detector.release.set()
     await perceiver.loaded()
-    assert detector.loaded == "gallery" and detector.available
+    assert detector.loaded == ("", "gallery") and detector.available
     assert perceiver.why_unavailable() == "no perception source: no camera frame received"
 
 
@@ -259,15 +410,15 @@ async def test_a_load_that_fails_becomes_the_reason_every_search_is_refused_with
         def available(self) -> bool:
             return False
 
-        def load(self, model: str) -> None:
-            raise ValueError(f"no gallery at {model}")
+        def load(self, model: str, gallery: str) -> None:
+            raise ValueError(f"gallery {gallery} is not a directory the node can see")
 
     perceiver = Perceiver(BrokenDetector(), FrameStore(), IDENTITY)
-    await perceiver.start_loading("/nowhere")
+    await perceiver.start_loading("", "/nowhere")
     assert perceiver.why_unavailable() == (
-        "no perception source: perception_backend 'fake' could not load '/nowhere': no gallery at /nowhere"
+        "no perception source: perception_backend 'fake' could not load: gallery /nowhere is not a directory the node can see"
     )
-    with pytest.raises(Refusal, match="could not load '/nowhere'"):
+    with pytest.raises(Refusal, match="could not load: gallery /nowhere"):
         await perceiver.scan([], CancelToken(), timeout_s=0.0)
 
 
@@ -283,29 +434,23 @@ def test_registries_import_only_the_chosen_backend_and_refuse_unknown_names():
         make_manipulator("policy")
 
 
-def test_the_confidence_parameter_reaches_a_detector_that_has_one():
-    from types import SimpleNamespace
-
+def test_the_confidence_parameter_reaches_the_detector_unless_it_is_zero():
     from openarm_ai_brain_vla.brain import Brain
     from conftest import PARAMS
 
-    class Thresholded(FakeDetector):
-        min_confidence = 0.25
-
+    detector = FakeDetector()
+    detector.min_confidence = 0.25
     params = SimpleNamespace(**{**PARAMS, "perception_confidence": 0.10})
-    brain = Brain(params, node_runner=None, detector=Thresholded())
-    assert brain.perceiver.detector.min_confidence == 0.10
+    assert Brain(params, node_runner=None, detector=detector).perceiver.detector.min_confidence == 0.10
+    detector.min_confidence = 0.25
     params = SimpleNamespace(**{**PARAMS, "perception_confidence": 0.0})
-    brain = Brain(params, node_runner=None, detector=Thresholded())
-    assert brain.perceiver.detector.min_confidence == 0.25
+    assert Brain(params, node_runner=None, detector=detector).perceiver.detector.min_confidence == 0.25
 
 
 async def test_a_scan_waits_for_the_cameras_intrinsics_and_names_the_slot():
     from openarm_ai_brain_vla.perception.geometry import VACANT, intrinsics_from
-    from types import SimpleNamespace
 
-    frames = FrameStore()
-    frames.color, frames.depth, frames.depth_unit = rgb_frame(16, 12), depth_frame(1.0, 16, 12), 0.001
+    frames = store_with([rgb_frame(16, 12)], [depth_frame(1.0, 16, 12)])
     perceiver = Perceiver(FakeDetector([Box("mug", 0.9, 4, 4, 8, 8)]), frames, CameraModel.from_parameters("0 0 0 0 0 0 1"))
     assert not perceiver.available
     with pytest.raises(Refusal, match="intrinsics have not been received"):
@@ -320,3 +465,88 @@ async def test_a_scan_waits_for_the_cameras_intrinsics_and_names_the_slot():
     assert [d.label for d in found] == ["mug"]
     with pytest.raises(ValueError, match="unknown distortion model"):
         intrinsics_from(SimpleNamespace(width=16, height=12, fx=6.0, fy=6.0, cx=8.0, cy=6.0, distortion_model="fisheye", distortion=[]))
+
+
+def colour_answer(success: bool = True, message: str = "", fx: float = 6.0):
+    return SimpleNamespace(success=success, message=message, width=16, height=12, fx=fx, fy=6.0, cx=8.0, cy=6.0, distortion_model="none", distortion=[])
+
+
+def depth_answer(success: bool = True, message: str = "", depth_model: str = "z"):
+    return SimpleNamespace(success=success, message=message, depth_model=depth_model)
+
+
+async def test_the_camera_is_asked_again_until_it_knows_its_geometry(monkeypatch):
+    # The reasons a search is refused with, one per round, until the
+    # camera answers both questions with something usable: not answered,
+    # colour not known yet (what a sim relay says before its simulation
+    # speaks), depth not known, a depth model the brain does not read, an
+    # unusable pinhole, then the answer.
+    perceiver = Perceiver(FakeDetector(), FrameStore(), CameraModel.from_parameters("0 0 0 0 0 0 1"))
+    colour = [
+        TimeoutError("no answer"),
+        colour_answer(False, "no camera geometry received from the simulation yet"),
+        colour_answer(),
+        colour_answer(),
+        colour_answer(fx=0.0),
+        colour_answer(),
+    ]
+    depth = [depth_answer(), depth_answer(False, "no depth stream"), depth_answer(depth_model="range"), depth_answer(), depth_answer()]
+    reasons: list[str] = []
+
+    async def poll_colour(node_runner, producer, timeout):
+        reasons.append(perceiver.camera_reason)
+        answer = colour.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return SimpleNamespace(data=answer)
+
+    async def poll_depth(node_runner, producer, timeout):
+        return SimpleNamespace(data=depth.pop(0))
+
+    monkeypatch.setattr(geometry, "INTRINSICS_RETRY_S", 0.0)
+    monkeypatch.setattr(geometry.get_color_intrinsics, "bound_producer", lambda node_runner: "camera")
+    monkeypatch.setattr(geometry.get_color_intrinsics, "poll", poll_colour)
+    monkeypatch.setattr(geometry.get_depth_intrinsics, "poll", poll_depth)
+    await asyncio.wait_for(geometry.learn_intrinsics(None, FakeToken(), perceiver), 5.0)
+    assert reasons == [
+        "the camera's intrinsics have not been received yet",
+        "the camera's geometry is not answered yet (TimeoutError('no answer'))",
+        "the camera does not know its colour intrinsics: no camera geometry received from the simulation yet",
+        "the camera does not know its depth intrinsics: no depth stream",
+        "the camera's depth samples are 'range' distances; the brain reads distances along the optical axis ('z')",
+        "the camera's intrinsics are unusable: intrinsics need positive finite focal lengths, got fx 0.0 fy 6.0",
+    ]
+    assert colour == [] and depth == []
+    assert perceiver.camera.ready and perceiver.camera_reason == ""
+
+
+async def test_a_camera_that_never_knows_its_geometry_is_asked_until_the_node_stops(monkeypatch):
+    perceiver = Perceiver(FakeDetector(), FrameStore(), CameraModel.from_parameters("0 0 0 0 0 0 1"))
+    token = FakeToken()
+    asked = 0
+
+    async def poll_colour(node_runner, producer, timeout):
+        nonlocal asked
+        asked += 1
+        if asked == 3:
+            token.cancel()
+        return SimpleNamespace(data=colour_answer(False, "this camera has no calibration"))
+
+    async def poll_depth(node_runner, producer, timeout):
+        return SimpleNamespace(data=depth_answer())
+
+    monkeypatch.setattr(geometry, "INTRINSICS_RETRY_S", 0.0)
+    monkeypatch.setattr(geometry.get_color_intrinsics, "bound_producer", lambda node_runner: "camera")
+    monkeypatch.setattr(geometry.get_color_intrinsics, "poll", poll_colour)
+    monkeypatch.setattr(geometry.get_depth_intrinsics, "poll", poll_depth)
+    await asyncio.wait_for(geometry.learn_intrinsics(None, token, perceiver), 5.0)
+    assert asked == 3
+    assert not perceiver.camera.ready
+    assert perceiver.camera_reason == "the camera does not know its colour intrinsics: this camera has no calibration"
+
+
+async def test_a_vacant_geometry_slot_is_the_reason_at_once(monkeypatch):
+    perceiver = Perceiver(FakeDetector(), FrameStore(), CameraModel.from_parameters("0 0 0 0 0 0 1"))
+    monkeypatch.setattr(geometry.get_color_intrinsics, "bound_producer", lambda node_runner: None)
+    await asyncio.wait_for(geometry.learn_intrinsics(None, FakeToken(), perceiver), 1.0)
+    assert perceiver.camera_reason == geometry.VACANT

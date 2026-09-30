@@ -28,7 +28,14 @@ instead of a box), so it is repaired the way the study repaired it. A
 generative model gives no confidence: with `SAMPLES` answers a frame, boxes
 of one label overlapping at IoU 0.5 across answers are one item whose
 confidence is the share of answers that returned it, so one answer, the
-study's setting, makes every box confidence 1.
+study's setting, makes every box confidence 1. `min_confidence` is the
+least share a box is kept at.
+
+A search keeps its deadline this way: each call to the API gets the budget
+left, never under `MIN_CALL_TIMEOUT_S`, the least deadline the API takes;
+a refused or failed call is asked again only when the budget has room for
+the wait and another call; and a search whose budget is gone before a call
+stops there, so the core refuses it.
 
 The API key is read from `KEY_ENV` in the node's environment, else from
 `KEY_FILE` under the daemon user's home, which the container sees. `peppy
@@ -38,9 +45,10 @@ touching a launcher file; a machine the node is placed on holds the key
 in the file. The key is never logged. Token usage and the list-price cost
 of every call are logged so the bill is visible.
 
-`perception_model` is the model id; empty is `MODEL`. Everything around
-the API is plain code tested with a fake; google-genai is imported by
-`load` alone.
+`perception_model` is the model id; empty is `MODEL`. The backend takes
+no enrolment gallery, so a `perception_gallery` fails the load. Everything
+around the API is plain code tested with a fake; google-genai is imported
+by `load` alone.
 """
 
 from __future__ import annotations
@@ -57,7 +65,7 @@ from typing import Optional, Protocol, Sequence
 
 import numpy as np
 
-from ..ports import Box, Coverage
+from ..ports import Box, Coverage, Deadline, iou
 
 logger = logging.getLogger(__name__)
 
@@ -71,10 +79,12 @@ KEY_FILE = Path("~/.config/openarm_ai_brain_vla/gemini_api_key")
 # Answers a frame is asked for; the study's identify runs used one.
 SAMPLES = 1
 MATCH_IOU = 0.5
-# The API refuses a deadline under 10 s, so one call gets the core's whole
-# default search timeout (10 s); the retry is for the 429s and 5xx that
-# come back at once, not for a slow answer.
-CALL_TIMEOUT_S = 10.0
+# The least share of the answers a box is kept at: half of them.
+MIN_CONFIDENCE = 0.5
+# The API refuses a call deadline under 10 s, so a call never gets less,
+# whatever is left of the search's budget; the retry is for the 429s and
+# 5xx that come back at once, not for a slow answer.
+MIN_CALL_TIMEOUT_S = 10.0
 ATTEMPTS = 2
 RETRY_WAIT_S = 1.0
 # The frame travels as a JPEG: a tenth of the PNG the study sent, no
@@ -240,13 +250,6 @@ def parse_boxes(
     return boxes, unmatched
 
 
-def iou(a: np.ndarray, b: np.ndarray) -> float:
-    lt, rb = np.maximum(a[:2], b[:2]), np.minimum(a[2:], b[2:])
-    inter = float(np.clip(rb - lt, 0, None).prod())
-    union = float((a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter)
-    return inter / union if union > 0 else 0.0
-
-
 def merge_samples(per_sample: Sequence[Sequence[tuple[str, np.ndarray]]], iou_threshold: float = MATCH_IOU) -> list[Box]:
     """Boxes of one label overlapping across answers are one item: its box
     is their mean and its confidence the share of answers that returned it.
@@ -287,15 +290,28 @@ class Answer:
         return self.input_tokens * PRICE_IN_PER_M / 1e6 + (self.output_tokens + self.thought_tokens) * PRICE_OUT_PER_M / 1e6
 
 
+class ApiFailure(Exception):
+    """A call the API refused or failed: its status code, and whether it
+    is the kind that comes back at once and may be asked again (a 429 or
+    a 5xx)."""
+
+    def __init__(self, code: Optional[int], message: str) -> None:
+        super().__init__(f"the API answered {code}: {message}")
+        self.code = code
+        self.retryable = code == 429 or 500 <= (code or 0) < 600
+
+
 class Asks(Protocol):
-    def ask(self, image: bytes, prompt: str) -> Answer: ...
+    def ask(self, image: bytes, prompt: str, timeout_s: float) -> Answer:
+        """One answer within `timeout_s`, or an `ApiFailure`."""
+        ...
 
 
 class GeminiApi:
     """The google-genai client behind `ask`. Imports the library at
     construction and nowhere else."""
 
-    def __init__(self, key: str, model: str, thinking: str = THINKING, timeout_s: float = CALL_TIMEOUT_S) -> None:
+    def __init__(self, key: str, model: str, thinking: str = THINKING) -> None:
         from google import genai
         from google.genai import errors, types
 
@@ -303,35 +319,30 @@ class GeminiApi:
         self.errors = errors
         self.model = model
         self.thinking = thinking
-        self.client = genai.Client(api_key=key, http_options=types.HttpOptions(timeout=int(timeout_s * 1000)))
+        self.client = genai.Client(api_key=key)
 
-    def ask(self, image: bytes, prompt: str) -> Answer:
+    def ask(self, image: bytes, prompt: str, timeout_s: float) -> Answer:
         types = self.types
         config = types.GenerateContentConfig(
             thinking_config=types.ThinkingConfig(thinking_level=self.thinking.upper()),
             response_mime_type="application/json",
             automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+            http_options=types.HttpOptions(timeout=int(timeout_s * 1000)),
         )
         contents = [types.Part.from_bytes(data=image, mime_type="image/jpeg"), prompt]
-        for attempt in range(1, ATTEMPTS + 1):
-            t0 = time.perf_counter()
-            try:
-                response = self.client.models.generate_content(model=self.model, contents=contents, config=config)
-            except self.errors.APIError as error:
-                retry = error.code == 429 or 500 <= (error.code or 0) < 600
-                if not retry or attempt == ATTEMPTS:
-                    raise
-                time.sleep(RETRY_WAIT_S)
-                continue
-            usage = response.usage_metadata
-            return Answer(
-                text=response.text or "",
-                input_tokens=(usage.prompt_token_count or 0) if usage else 0,
-                output_tokens=(usage.candidates_token_count or 0) if usage else 0,
-                thought_tokens=(usage.thoughts_token_count or 0) if usage else 0,
-                latency_s=time.perf_counter() - t0,
-            )
-        raise RuntimeError("unreachable")
+        t0 = time.perf_counter()
+        try:
+            response = self.client.models.generate_content(model=self.model, contents=contents, config=config)
+        except self.errors.APIError as error:
+            raise ApiFailure(error.code, error.message or str(error)) from error
+        usage = response.usage_metadata
+        return Answer(
+            text=response.text or "",
+            input_tokens=(usage.prompt_token_count or 0) if usage else 0,
+            output_tokens=(usage.candidates_token_count or 0) if usage else 0,
+            thought_tokens=(usage.thoughts_token_count or 0) if usage else 0,
+            latency_s=time.perf_counter() - t0,
+        )
 
 
 class GeminiErDetector:
@@ -341,6 +352,9 @@ class GeminiErDetector:
         self._api = api
         self._vocabulary: list[str] = []
         self.model = MODEL
+        # The least share of the answers a box is kept at; the brain sets
+        # it from the perception_confidence parameter before the load.
+        self.min_confidence = MIN_CONFIDENCE
         self.spent_usd = 0.0
         self.calls = 0
 
@@ -348,9 +362,12 @@ class GeminiErDetector:
     def available(self) -> bool:
         return self._api is not None
 
-    def load(self, model: str) -> None:
+    def load(self, model: str, gallery: str) -> None:
         """Finds the key and opens the client. No key, or no library, fails
-        the load with the reason every search is then refused with."""
+        the load with the reason every search is then refused with; so does
+        a gallery, which this backend cannot read."""
+        if gallery.strip():
+            raise ValueError("gemini_er takes no enrolment gallery: perception_gallery must be empty")
         self.model = model.strip() or MODEL
         if self._api is not None:
             return
@@ -375,7 +392,7 @@ class GeminiErDetector:
             return Coverage()
         return Coverage(every_label=True)
 
-    def detect(self, image: np.ndarray) -> list[Box]:
+    def detect(self, image: np.ndarray, deadline: Deadline) -> list[Box]:
         if self._api is None:
             return []
         height, width = image.shape[:2]
@@ -383,13 +400,29 @@ class GeminiErDetector:
         data = jpeg_bytes(image)
         per_sample: list[list[tuple[str, np.ndarray]]] = []
         for _ in range(SAMPLES):
-            answer = self._api.ask(data, plan.prompt)
+            answer = self._ask(data, plan.prompt, deadline)
             self._account(plan, answer)
             boxes, unmatched = parse_boxes(answer.text, width, height, plan.allowed, plan.force_label)
             if unmatched:
                 logger.info("gemini_er: labels outside the list dropped: %s", ", ".join(sorted(set(unmatched))))
             per_sample.append(boxes)
-        return merge_samples(per_sample, MATCH_IOU)
+        return [box for box in merge_samples(per_sample, MATCH_IOU) if box.confidence >= self.min_confidence]
+
+    def _ask(self, image: bytes, prompt: str, deadline: Deadline) -> Answer:
+        """One answer within the deadline: a call gets the budget left,
+        never under the API's least deadline, and a call that came back
+        refused or failed is asked again once when the budget has room for
+        the wait and another call."""
+        for attempt in range(1, ATTEMPTS + 1):
+            deadline.check()
+            try:
+                return self._api.ask(image, prompt, max(deadline.remaining_s(), MIN_CALL_TIMEOUT_S))
+            except ApiFailure as failure:
+                if not failure.retryable or attempt == ATTEMPTS or deadline.remaining_s() <= RETRY_WAIT_S:
+                    raise
+                logger.info("gemini_er: %s; asking again in %g s", failure, RETRY_WAIT_S)
+                time.sleep(RETRY_WAIT_S)
+        raise RuntimeError("unreachable")
 
     def _account(self, plan: Plan, answer: Answer) -> None:
         self.calls += 1

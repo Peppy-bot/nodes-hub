@@ -40,7 +40,6 @@ async def test_stopping_a_running_job_sets_its_token_calls_the_stopper_and_waits
             job.cancel.check()
         assert raised.value.by_caller is False
         assert raised.value.reason == "aborted: operator"
-        await asyncio.sleep(0.01)
         sequencer.finish(job)
 
     task = asyncio.create_task(worker())

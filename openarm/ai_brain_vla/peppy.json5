@@ -63,6 +63,7 @@
       consumes: [
         { link_id: "camera", name: "depth_stream_info" },
         { link_id: "geometry", name: "get_color_intrinsics" },
+        { link_id: "geometry", name: "get_depth_intrinsics" },
       ],
     },
   },
@@ -86,30 +87,35 @@
       // source", which is what the contract asks for when the brain cannot
       // see. A launcher selects a model per launch without a code change.
       // "sam3_siglip" is the local pipeline (SAM 3 finds, SigLIP names by
-      // words from a general vocabulary, about 1 s a frame on a GPU);
-      // "gemini_er" the remote one (Gemini Robotics-ER over Google's API:
-      // no GPU, words alone; needs the network and a key, and bills and
-      // waits per question).
+      // words from a general vocabulary; about 1 s a scan on an A10, about
+      // 2 s on a Jetson Thor); "gemini_er" the remote one (Gemini
+      // Robotics-ER over Google's API: no GPU, words alone; needs the
+      // network and a key, and bills and waits per question).
       perception_backend: { $type: "string", $default: "none" },
-      // The model identifier the perception backend loads (a weights name
-      // or path); its meaning belongs to the backend. Empty is the
-      // backend's default. For "sam3_siglip" it names an enrolment gallery,
-      // a directory the container can see holding pictures of particular
-      // items, which then take their own names before the vocabulary's: a
-      // release (index.json) or a harvester dataset (manifest.json,
-      // classes.txt, prompts.txt). Empty or "none" is no gallery, and the
-      // node ships none.
-      // For "gemini_er" it is the model id, "gemini-robotics-er-2-preview"
-      // when empty; the API key is not a parameter: it is read from
+      // The identifier of the model the perception backend loads; empty is
+      // the backend's default. For "sam3_siglip" it is the Hugging Face
+      // repository or local directory the SAM 3 weights are read from. For
+      // "gemini_er" it is the model id, "gemini-robotics-er-2-preview" when
+      // empty; the API key is not a parameter: it is read from
       // GEMINI_API_KEY in the node's environment (`peppy stack launch`
       // forwards the launching shell's), else from
       // ~/.config/openarm_ai_brain_vla/gemini_api_key of the daemon user.
+      // "none" takes no model and refuses to load with one.
       perception_model: { $type: "string", $default: "" },
-      // The confidence sam3_siglip keeps a detection at, objectness times
-      // naming probability, 0 for the backend's own (0.25). Lower finds more
-      // items and more boxes on the robot's own body: on the Waldo frames
-      // the node's README measures, a scan finds 77.2% of the items at 0.25
-      // with 0.40 boxes a frame on nothing, and 90.0% at 0.15 with 0.89.
+      // An enrolment gallery for "sam3_siglip": a directory the container
+      // can see holding a harvester dataset (manifest.json, classes.txt,
+      // prompts.txt) with pictures of particular items, which then take
+      // their own names before the vocabulary's. Empty is no gallery, and
+      // the node ships none. The other backends take none and refuse to
+      // load with one.
+      perception_gallery: { $type: "string", $default: "" },
+      // The confidence a detection is kept at, 0 for the backend's own. For
+      // sam3_siglip it is objectness times naming probability, 0.25 by
+      // default; lower finds more items and more boxes on the robot's own
+      // body: on the Waldo frames the node's README measures, a scan finds
+      // 77.2% of the items at 0.25 with 0.40 boxes a frame on nothing, and
+      // 90.0% at 0.15 with 0.89. For gemini_er it is the share of the
+      // answers to one frame that returned the box, 0.5 by default.
       perception_confidence: { $type: "f64", $default: 0.0 },
       // Which manipulation backend runs grab_item, drop_item and place_item.
       // "none" moves nothing: every sequence is refused with a message

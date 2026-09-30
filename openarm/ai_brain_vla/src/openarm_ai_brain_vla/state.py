@@ -28,7 +28,9 @@ Rules written down here because the code depends on them:
   was grabbed at, since nothing measured where it landed.
 - Holding follows results, not jaws. A gripper holds an item after a
   successful grab and stops holding after a successful drop or place.
-  Refusals, failures, cancels and aborts leave the flag as it was.
+  Refusals, failures, cancels and aborts leave the flag as it was. A grab
+  of an item a gripper holds is refused naming that gripper: the item is
+  in its jaws, not at the position it was grabbed at.
 - Gripper to arm. The backbone names both by side, so `left_gripper`
   drives with `left_arm`. That is `arm_of`, the one function to change for
   a robot that names its limbs differently.
@@ -41,6 +43,7 @@ import secrets
 from typing import Iterable, Optional, Sequence
 
 from .ports import Coverage, Detection, Gripper, Item, Quat, Refusal, Vec3
+from .words import named_by
 
 MATCH_RADIUS_M = 0.05
 
@@ -66,23 +69,18 @@ def distance(a: Vec3, b: Vec3) -> float:
 
 def best_match(detections: Sequence[Detection], description: str) -> Optional[Detection]:
     """The one detection a description names, the rule identify_item uses.
-    With a description, the highest confidence among detections whose
-    label is that description, then among those whose label contains one
-    of its words; without one, the highest confidence of all, the item
-    the detector judged most prominent."""
+    With a description, the highest confidence among the detections whose
+    label it names (`words.named_by`: the label is the description, else
+    holds every word of it, stopwords aside); without one, the highest
+    confidence of all, the item the detector judged most prominent."""
     if not detections:
         return None
-    wanted = description.strip().lower()
-    if not wanted:
+    if not description.strip():
         return max(detections, key=lambda d: d.confidence)
-    exact = [d for d in detections if d.label.strip().lower() == wanted]
-    if exact:
-        return max(exact, key=lambda d: d.confidence)
-    words = [w for w in wanted.split() if w]
-    loose = [d for d in detections if any(w in d.label.lower() for w in words)]
-    if loose:
-        return max(loose, key=lambda d: d.confidence)
-    return None
+    named = named_by(description, [d.label for d in detections])
+    if not named:
+        return None
+    return max((detections[i] for i in named), key=lambda d: d.confidence)
 
 
 class State:
@@ -180,6 +178,18 @@ class State:
         if item is None:
             raise Refusal(f"unknown item '{item_id}'")
         return item
+
+    def item_to_grab(self, item_id: str) -> Item:
+        """The known item grab_item closes on: it must exist, and no gripper
+        may hold it already."""
+        item = self.item(item_id)
+        holder = self.holder_of(item_id)
+        if holder is not None:
+            raise Refusal(f"item '{item_id}' is held by gripper '{holder.name}'")
+        return item
+
+    def holder_of(self, item_id: str) -> Optional[Gripper]:
+        return next((gripper for gripper in self.grippers.values() if gripper.held_item_id == item_id), None)
 
     def remember(self, detections: Sequence[Detection], now_ns: int, *, coverage: Coverage) -> list[Item]:
         """Folds one look's detections into the known items and returns

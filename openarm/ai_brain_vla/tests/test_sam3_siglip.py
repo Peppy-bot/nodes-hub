@@ -6,13 +6,15 @@ installed and skips otherwise."""
 import numpy as np
 import pytest
 
+from conftest import NEVER, PASSED
 from openarm_ai_brain_vla.perception import make_detector
 from openarm_ai_brain_vla.perception.gallery import load_gallery
-from openarm_ai_brain_vla.ports import Coverage
+from openarm_ai_brain_vla.ports import Coverage, SearchTimeout
 from openarm_ai_brain_vla.perception.sam3_siglip import (
     BACKGROUND_PHRASES,
     GENERIC_PROMPTS,
     MIN_CONFIDENCE,
+    SAM3_REPO,
     SIMILARITY_FLOOR,
     Route,
     VOCABULARY_MARGIN,
@@ -27,7 +29,7 @@ from openarm_ai_brain_vla.perception.sam3_siglip import (
     under_floor,
     unlike_the_words,
 )
-from test_gallery import write_harvest, write_release
+from test_gallery import write_harvest
 
 VOCABULARY = ("cup", "banana")
 
@@ -147,7 +149,7 @@ def test_the_backend_is_registered_and_unavailable_until_loaded():
     assert detector.scan_vocabulary == load_vocabulary()
     assert not detector.available
     detector.set_vocabulary(["banana"])
-    assert detector.detect(np.zeros((4, 4, 3), dtype=np.uint8)) == []
+    assert detector.detect(np.zeros((4, 4, 3), dtype=np.uint8), NEVER) == []
 
 
 def test_loading_without_the_models_says_which_extra(tmp_path):
@@ -160,9 +162,9 @@ def test_loading_without_the_models_says_which_extra(tmp_path):
     else:
         pytest.skip("torch is installed here: the models would load")
     with pytest.raises(RuntimeError, match="sam3-siglip extra"):
-        Sam3SiglipDetector().load("")
+        Sam3SiglipDetector().load("", "")
     with pytest.raises(RuntimeError, match="sam3-siglip extra"):
-        Sam3SiglipDetector().load(str(write_harvest(tmp_path / "g")))
+        Sam3SiglipDetector().load("", str(write_harvest(tmp_path / "g")))
 
 
 def test_the_background_phrases_are_the_studys_and_the_robots_own_body():
@@ -179,12 +181,13 @@ class FakeModels:
     """Stands in for the two models: one box per call; every distinct text
     is a unit axis of its own, in the order first seen, and every crop is
     `looks_like`, a mix of texts by weight, so a test says what the crop
-    looks like."""
+    looks like. Records the SAM 3 repository it was built from."""
 
     device = "fake"
     looks_like = {"a photo of a cup": 1.0}
 
-    def __init__(self) -> None:
+    def __init__(self, sam3_repo: str = SAM3_REPO) -> None:
+        self.sam3_repo = sam3_repo
         self.prompts: list[tuple[str, ...]] = []
         self.texts: list[str] = []
         self._axes: dict[str, int] = {}
@@ -215,14 +218,14 @@ def blank() -> np.ndarray:
     return np.zeros((60, 80, 3), dtype=np.uint8)
 
 
-def detected(detector, phrases=()):
+def detected(detector, phrases=(), deadline=NEVER):
     detector.set_vocabulary(list(phrases))
-    return [(b.label, round(b.confidence, 2)) for b in detector.detect(blank())]
+    return [(b.label, round(b.confidence, 2)) for b in detector.detect(blank(), deadline)]
 
 
 def test_a_scan_names_what_it_finds_by_the_vocabulary():
     detector = Sam3SiglipDetector(models_factory=FakeModels, vocabulary=VOCABULARY)
-    detector.load("")
+    detector.load("", "")
     assert detector.available
     # The vocabulary is embedded once, at load, with the background phrases.
     texts = list(detector._models.texts)
@@ -232,30 +235,85 @@ def test_a_scan_names_what_it_finds_by_the_vocabulary():
     assert detector._models.texts == texts
 
 
+def test_the_sam3_weights_come_from_the_model_parameter_or_the_mirror():
+    detector = Sam3SiglipDetector(models_factory=FakeModels, vocabulary=VOCABULARY)
+    detector.load("", "")
+    assert detector._models.sam3_repo == SAM3_REPO
+    detector = Sam3SiglipDetector(models_factory=FakeModels, vocabulary=VOCABULARY)
+    detector.load(" /weights/sam3 ", "")
+    assert detector._models.sam3_repo == "/weights/sam3"
+
+
 def test_a_scan_drops_a_box_on_the_robot_itself():
     class OnTheArm(FakeModels):
         looks_like = {"a photo of a robot arm": 1.0}
 
     detector = Sam3SiglipDetector(models_factory=OnTheArm, vocabulary=VOCABULARY)
-    detector.load("")
+    detector.load("", "")
     assert detected(detector) == []
 
 
-def test_a_description_is_searched_by_its_own_words():
+def test_a_description_is_searched_by_its_own_words_and_its_table_is_not_kept():
     detector = Sam3SiglipDetector(models_factory=looking_like(blue_ball=1.0), vocabulary=VOCABULARY)
-    detector.load("none")
+    detector.load("", "")
+    at_load = len(detector._models.texts)
     assert detected(detector, ["blue ball"]) == [("blue ball", 0.9)]
     assert detector._models.prompts[-1] == ("blue ball",)
+    # Each words search embeds its words and the background phrases again:
+    # only the vocabulary's table lives for the backend's life.
+    per_search = 1 + len(BACKGROUND_PHRASES)
+    assert len(detector._models.texts) == at_load + per_search
+    detected(detector, ["blue ball"])
+    assert len(detector._models.texts) == at_load + 2 * per_search
+    assert detector._vocabulary_table.shape[0] == len(VOCABULARY) + len(BACKGROUND_PHRASES)
+
+
+class Ticking:
+    """A deadline that passes at its n-th check, so a test says at which
+    stage the search runs out of time."""
+
+    def __init__(self, passes_at: int) -> None:
+        self.checks = 0
+        self.passes_at = passes_at
+
+    def check(self) -> None:
+        self.checks += 1
+        if self.checks >= self.passes_at:
+            raise SearchTimeout(1.0)
+
+    def remaining_s(self) -> float:
+        return 0.0 if self.checks >= self.passes_at else 1.0
+
+
+def test_a_search_stops_at_its_deadline_between_its_stages():
+    detector = Sam3SiglipDetector(models_factory=looking_like(blue_ball=1.0), vocabulary=VOCABULARY)
+    detector.load("", "")
+    proposals = len(detector._models.prompts)
+    # Passed before anything: SAM 3 is not even asked.
+    with pytest.raises(SearchTimeout, match="did not finish within 1 s"):
+        detected(detector, ["blue ball"], PASSED)
+    assert len(detector._models.prompts) == proposals
+    # Passed after the proposals: SAM 3 ran, SigLIP did not embed a crop.
+    embedded = len(detector._models.texts)
+    with pytest.raises(SearchTimeout):
+        detected(detector, ["blue ball"], Ticking(passes_at=2))
+    assert len(detector._models.prompts) == proposals + 1 and len(detector._models.texts) == embedded
+    # Passed after the crops are embedded: no names are made.
+    with pytest.raises(SearchTimeout):
+        detected(detector, ["blue ball"], Ticking(passes_at=3))
+    assert len(detector._models.texts) == embedded
+    # Never passed: the search answers.
+    assert detected(detector, ["blue ball"], Ticking(passes_at=4)) == [("blue ball", 0.9)]
 
 
 def test_a_search_does_not_return_what_looks_more_like_another_name():
     # A cup that looks a little like a mug is not returned for "mug"...
     detector = Sam3SiglipDetector(models_factory=looking_like(mug=0.6, cup=0.8), vocabulary=VOCABULARY)
-    detector.load("")
+    detector.load("", "")
     assert detected(detector, ["mug"]) == []
     # ...and a mug that looks a little like a cup is.
     detector = Sam3SiglipDetector(models_factory=looking_like(mug=0.8, cup=0.6), vocabulary=VOCABULARY)
-    detector.load("")
+    detector.load("", "")
     assert detected(detector, ["mug"]) == [("mug", 0.9)]
 
 
@@ -265,46 +323,38 @@ def test_the_backend_downloads_nothing_but_its_models(tmp_path, no_network):
     directory the launch names."""
     assert len(load_vocabulary()) == 1198
     detector = Sam3SiglipDetector(models_factory=FakeModels, vocabulary=VOCABULARY)
-    detector.load(str(write_release(tmp_path / "release", dim=DIM)))
-    assert detected(detector) == [("cup", 0.9)]
-    assert detected(detector, ["apple"]) == [("cup", 0.9)]
+    detector.load("", str(write_harvest(tmp_path / "g")))
+    # Every crop of the harvest looks like the scan's box here, so the box
+    # is an enrolled item, the first of three prototypes that are one.
+    assert detected(detector) == [("coffee can", 0.3)]
+    assert detected(detector, ["banana"]) == [("coffee can", 0.3)]
     assert detected(detector, ["blue ball"]) == []
 
 
 def test_a_scan_covers_the_vocabulary_and_the_enrolled_items(tmp_path):
     detector = Sam3SiglipDetector(models_factory=FakeModels, vocabulary=VOCABULARY)
     assert detector.scan_coverage() == Coverage()
-    detector.load("")
+    detector.load("", "")
     assert detector.scan_coverage() == Coverage(frozenset(VOCABULARY))
     detector = Sam3SiglipDetector(models_factory=FakeModels, vocabulary=VOCABULARY)
-    detector.load(str(write_release(tmp_path / "release", dim=DIM)))
-    # The robot arm is a background class: a box named as it is dropped.
-    assert detector.scan_coverage() == Coverage(frozenset({"cup", "banana", "cube", "apple", "lemon"}))
+    detector.load("", str(write_harvest(tmp_path / "g")))
+    assert detector.scan_coverage() == Coverage(frozenset({"cup", "banana", "coffee can", "cracker box"}))
 
 
 def test_a_named_gallery_that_cannot_be_read_fails_the_load_before_the_models(tmp_path):
     made = []
 
-    def factory():
-        made.append(1)
-        return FakeModels()
+    def factory(sam3_repo):
+        made.append(sam3_repo)
+        return FakeModels(sam3_repo)
 
     detector = Sam3SiglipDetector(models_factory=factory, vocabulary=VOCABULARY)
     with pytest.raises(ValueError, match="is not a directory the node can see"):
-        detector.load(str(tmp_path / "missing"))
+        detector.load("", str(tmp_path / "missing"))
     assert not detector.available and made == []
 
 
 def test_an_enrolled_item_is_named_by_its_pictures_built_at_load(tmp_path):
-    detector = Sam3SiglipDetector(models_factory=FakeModels, vocabulary=VOCABULARY)
-    detector.load(str(write_harvest(tmp_path / "g")))
-    # Every crop looks alike here, so the three prototypes are one and a
-    # box near them takes the first enrolled name.
-    assert detector._prototypes is not None and detector._prototypes.shape[0] == 3
-    assert [label for label, _ in detected(detector)] == ["coffee can"]
-
-
-def test_a_release_brings_its_prototypes_instead_of_embedding_crops(tmp_path):
     class CountingModels(FakeModels):
         embedded = 0
 
@@ -313,41 +363,37 @@ def test_a_release_brings_its_prototypes_instead_of_embedding_crops(tmp_path):
             return super().embed_images(crops)
 
     detector = Sam3SiglipDetector(models_factory=CountingModels, vocabulary=VOCABULARY)
-    detector.load(str(write_release(tmp_path / "release", dim=DIM)))
-    assert detector._prototypes.shape == (4, DIM) and CountingModels.embedded == 0
-    assert detector._gallery.phrases == ("cube", "apple", "lemon", "robot arm")
-    detected(detector, ["apple"])
-    assert detector._models.prompts[-1] == GENERIC_PROMPTS + ("apple",)
+    detector.load("", str(write_harvest(tmp_path / "g")))
+    # The three visible crops are embedded at load, one prototype per item;
+    # every crop looks alike here, so the three prototypes are one and a
+    # box near them takes the first enrolled name.
+    assert CountingModels.embedded == 3
+    assert detector._prototypes is not None and detector._prototypes.shape == (3, DIM)
+    assert detector._gallery.phrases == ("coffee can", "cracker box", "banana")
+    assert [label for label, _ in detected(detector)] == ["coffee can"]
+    detected(detector, ["cracker box"])
+    assert detector._models.prompts[-1] == GENERIC_PROMPTS + ("cracker box",)
 
 
 def enrolled(detector, nearest: int) -> None:
-    """Four prototypes on texts of their own, the one at `nearest` the
+    """Three prototypes on texts of their own, the one at `nearest` the
     crop itself, or none of them when `nearest` is -1."""
     models = detector._models
-    rows = [models.axis(f"prototype {i}") for i in range(4)]
+    rows = [models.axis(f"prototype {i}") for i in range(3)]
     if nearest >= 0:
         rows[nearest] = models.embed_images([None])[0]
     detector._prototypes = np.stack(rows)
 
 
-def test_a_box_like_an_enrolled_background_class_is_dropped(tmp_path):
-    detector = Sam3SiglipDetector(models_factory=FakeModels, vocabulary=VOCABULARY)
-    detector.load(str(write_release(tmp_path / "release", dim=DIM)))
-    enrolled(detector, nearest=3)    # the release's "robot arm"
-    assert detected(detector) == []
-    detector.min_confidence = 0.0
-    assert detected(detector) == []
-
-
 def test_a_box_like_an_enrolled_item_takes_its_name_before_the_vocabulary(tmp_path):
     detector = Sam3SiglipDetector(models_factory=FakeModels, vocabulary=VOCABULARY)
-    detector.load(str(write_release(tmp_path / "release", dim=DIM)))
-    enrolled(detector, nearest=1)    # the release's "apple"
-    assert detected(detector) == [("apple", 0.9)]
+    detector.load("", str(write_harvest(tmp_path / "g")))
+    enrolled(detector, nearest=1)    # the harvest's "cracker box"
+    assert detected(detector) == [("cracker box", 0.9)]
 
 
 def test_a_box_unlike_every_enrolled_item_is_named_by_the_vocabulary(tmp_path):
     detector = Sam3SiglipDetector(models_factory=FakeModels, vocabulary=VOCABULARY)
-    detector.load(str(write_release(tmp_path / "release", dim=DIM)))
+    detector.load("", str(write_harvest(tmp_path / "g")))
     enrolled(detector, nearest=-1)
     assert detected(detector) == [("cup", 0.9)]

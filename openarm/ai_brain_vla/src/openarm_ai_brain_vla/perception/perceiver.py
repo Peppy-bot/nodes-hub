@@ -6,19 +6,63 @@ cannot drift apart on geometry.
 A scan asks the detector for its whole vocabulary. An identify search
 asks for the description's phrase and lets the core pick the best match
 afterwards (`state.best_match`), so no detector implements selection.
+
+Both blocking calls of a detector, the load and a search, run in a daemon
+thread of their own rather than in the event loop's executor: the
+executor's threads are joined when the process exits, and a load that
+takes a minute would hold the node past its shutdown window, while a
+daemon thread dies with the process. A search is awaited until its thread
+returns, whatever its deadline: the detector keeps the deadline between
+its stages, and the lane the search runs in stays busy until the thread
+has returned, so no second search starts on the same models while the
+first still runs.
 """
 
 from __future__ import annotations
 
 import asyncio
-from typing import Optional, Sequence
+import logging
+import threading
+from typing import Callable, Optional, Sequence
 
-from ..ports import Box, CancelToken, Detection, Detector, Refusal
+from ..ports import Box, CancelToken, Deadline, Detection, Detector, Refusal, SearchTimeout, iou
 from .camera import CameraModel
 from .frames import FrameStore, decode_color, decode_depth, depth_at
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_TIMEOUT_S = 10.0
 DUPLICATE_IOU = 0.5
+
+
+async def in_daemon_thread(function: Callable, *args):
+    """Runs `function(*args)` in a daemon thread and returns what it
+    returned, or raises what it raised."""
+    loop = asyncio.get_running_loop()
+    done: asyncio.Future = loop.create_future()
+
+    def settle(result, error: Optional[Exception]) -> None:
+        if done.done():
+            return
+        if error is None:
+            done.set_result(result)
+        else:
+            done.set_exception(error)
+
+    def run() -> None:
+        try:
+            outcome = (function(*args), None)
+        except Exception as error:
+            outcome = (None, error)
+        try:
+            loop.call_soon_threadsafe(settle, *outcome)
+        except RuntimeError:
+            # The loop is closed: the node stopped while the call ran, and
+            # nothing awaits the outcome any more.
+            pass
+
+    threading.Thread(target=run, name=f"brain-{function.__name__}", daemon=True).start()
+    return await done
 
 
 class Perceiver:
@@ -38,7 +82,7 @@ class Perceiver:
 
     @property
     def available(self) -> bool:
-        return self.detector.available and self.frames.available and self.camera.ready
+        return self.why_unavailable() == ""
 
     def why_unavailable(self) -> str:
         if not self.detector.available:
@@ -47,22 +91,23 @@ class Perceiver:
             if self._load_error:
                 return f"no perception source: {self._load_error}"
             return f"no perception source: perception_backend is '{self.detector.name}'"
-        if not self.frames.available:
-            return "no perception source: no camera frame received"
+        frames = self.frames.why_unavailable()
+        if frames:
+            return f"no perception source: {frames}"
         if not self.camera.ready:
             return f"no perception source: {self.camera_reason}"
         return ""
 
-    async def load(self, model: str) -> None:
+    async def load(self, model: str, gallery: str) -> None:
         """Loads the backend's model. A failure is raised, and kept as the
         reason every search is refused with from then on."""
         try:
-            await asyncio.to_thread(self.detector.load, model)
+            await in_daemon_thread(self.detector.load, model, gallery)
         except Exception as error:
-            self._load_error = f"perception_backend '{self.detector.name}' could not load {model!r}: {error}"
+            self._load_error = f"perception_backend '{self.detector.name}' could not load: {error}"
             raise
 
-    def start_loading(self, model: str) -> asyncio.Task:
+    def start_loading(self, model: str, gallery: str) -> asyncio.Task:
         """Begins the load in the background and returns its task. A backend
         that takes a minute to load must not hold the node's start: the node
         is healthy at once and refuses searches as still loading until the
@@ -70,9 +115,9 @@ class Perceiver:
 
         async def run() -> None:
             try:
-                await self.load(model)
+                await self.load(model, gallery)
             except Exception:
-                print(f"[brain] {self._load_error}")
+                logger.error("%s", self._load_error)
 
         self._loading = asyncio.create_task(run())
         return self._loading
@@ -84,20 +129,20 @@ class Perceiver:
 
     async def scan(self, phrases: Sequence[str], cancel: CancelToken, timeout_s: float) -> list[Detection]:
         """Looks once at the latest frame for `phrases`, or for everything
-        the detector knows when `phrases` is empty."""
+        the detector knows when `phrases` is empty, within `timeout_s`, the
+        default budget when that is zero."""
         reason = self.why_unavailable()
         if reason:
             raise Refusal(reason)
         frame = self.frames.latest()
-        assert frame is not None
         image = decode_color(frame.color)
         depth_m = decode_depth(frame.depth, frame.depth_unit)
         self.detector.set_vocabulary(list(phrases))
-        timeout = timeout_s if timeout_s > 0.0 else DEFAULT_TIMEOUT_S
+        deadline = Deadline.after(timeout_s if timeout_s > 0.0 else DEFAULT_TIMEOUT_S)
         try:
-            boxes = await asyncio.wait_for(asyncio.to_thread(self.detector.detect, image), timeout)
-        except asyncio.TimeoutError:
-            raise Refusal(f"the search did not finish within {timeout:g} s") from None
+            boxes = await in_daemon_thread(self.detector.detect, image, deadline)
+        except SearchTimeout as timeout:
+            raise Refusal(str(timeout)) from None
         cancel.check()
         detections: list[Detection] = []
         for box in merge_duplicates(boxes):
@@ -115,15 +160,7 @@ def merge_duplicates(boxes: Sequence[Box]) -> list[Box]:
     are one item: the more confident box stays."""
     kept: list[Box] = []
     for box in sorted(boxes, key=lambda b: b.confidence, reverse=True):
-        if any(other.label == box.label and iou(other, box) > DUPLICATE_IOU for other in kept):
+        if any(other.label == box.label and iou(other.xyxy, box.xyxy) > DUPLICATE_IOU for other in kept):
             continue
         kept.append(box)
     return kept
-
-
-def iou(a: Box, b: Box) -> float:
-    x0, y0 = max(a.x0, b.x0), max(a.y0, b.y0)
-    x1, y1 = min(a.x1, b.x1), min(a.y1, b.y1)
-    overlap = max(0.0, x1 - x0) * max(0.0, y1 - y0)
-    union = a.area + b.area - overlap
-    return overlap / union if union > 0.0 else 0.0

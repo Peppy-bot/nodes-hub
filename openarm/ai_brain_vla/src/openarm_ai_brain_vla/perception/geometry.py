@@ -1,27 +1,43 @@
 """Where the camera model's intrinsics come from: the camera itself, through
-`camera_geometry:v1`'s get_color_intrinsics on the `geometry` slot.
+`camera_geometry:v1` on the `geometry` slot. get_color_intrinsics gives the
+pinhole the detections' pixels are in; get_depth_intrinsics says what a
+depth sample measures.
 
 The slot is optional, like the camera's. Vacant, the intrinsics never come
-and every search is refused naming the slot. Bound, the service is asked
-until it answers; a camera that refuses (a UVC camera knows nothing of its
-lens) is final and the refusal's message is the reason; an answer that is
-not a usable pinhole is refused too. The intrinsics are those of the colour
-stream, which the detections' pixels are in; the depth is read at the same
-pixels, so the depth stream has to be aligned to colour, as the sim relays
-and the ZED publish it and as realsense_d4xx does under depth_to_color.
+and every search is refused naming the slot. Bound, both services are asked
+again every `INTRINSICS_RETRY_S` until each has answered with success and
+the answers are usable, and until then a search is refused with the last
+reason they were not. The contract gives one answer, success false with a
+message, both to a camera that has not heard from its simulation yet and
+to a device that knows nothing of its lens, so the brain keeps asking in
+both cases: the first answers within seconds, the second refuses for the
+node's whole life and the log says so once. A depth model other than "z"
+is a reason too: the brain reads a sample as the distance along the
+optical axis, which is what the camera model deprojects. The intrinsics
+are those of the colour stream, which the detections' pixels are in; the
+depth is read at the same pixels, so the frame store refuses a pair of
+frames that are not aligned.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 
-from peppygen.consumed_services.geometry import get_color_intrinsics
+from peppygen.consumed_services.geometry import get_color_intrinsics, get_depth_intrinsics
 
+from ..ports import Refusal
+from ..waiting import unless_cancelled
 from .camera import Intrinsics
+
+logger = logging.getLogger(__name__)
 
 INTRINSICS_TIMEOUT_S = 5.0
 INTRINSICS_RETRY_S = 2.0
 VACANT = "the geometry slot is vacant: link the camera's camera_geometry to it"
+# The depth model the brain reads: a sample is the distance along the
+# optical axis.
+Z_DEPTH = "z"
 
 
 def intrinsics_from(data) -> Intrinsics:
@@ -33,34 +49,51 @@ def intrinsics_from(data) -> Intrinsics:
     )
 
 
+async def camera_intrinsics(node_runner, producer) -> Intrinsics:
+    """One round of both questions: the colour intrinsics when the camera
+    answers both with success, measures depth along the optical axis and
+    reports a usable pinhole; a Refusal naming the reason otherwise."""
+    try:
+        color = (await get_color_intrinsics.poll(node_runner, producer, INTRINSICS_TIMEOUT_S)).data
+        depth = (await get_depth_intrinsics.poll(node_runner, producer, INTRINSICS_TIMEOUT_S)).data
+    except Exception as error:
+        raise Refusal(f"the camera's geometry is not answered yet ({error!r})") from error
+    if not color.success:
+        raise Refusal(f"the camera does not know its colour intrinsics: {color.message}")
+    if not depth.success:
+        raise Refusal(f"the camera does not know its depth intrinsics: {depth.message}")
+    if depth.depth_model != Z_DEPTH:
+        raise Refusal(
+            f"the camera's depth samples are '{depth.depth_model}' distances; the brain reads distances along the optical axis ('{Z_DEPTH}')"
+        )
+    try:
+        return intrinsics_from(color)
+    except ValueError as error:
+        raise Refusal(f"the camera's intrinsics are unusable: {error}") from error
+
+
 async def learn_intrinsics(node_runner, token, perceiver) -> None:
-    """Asks the geometry slot for the colour intrinsics until it answers, and
-    gives the perceiver its camera, or the reason it has none."""
+    """Asks the geometry slot for the camera's intrinsics until it has
+    them, and gives the perceiver its camera; meanwhile the perceiver
+    carries the reason it has none."""
     producer = get_color_intrinsics.bound_producer(node_runner)
     if producer is None:
         perceiver.camera_reason = VACANT
         return
+    reported = ""
     while not token.is_cancelled():
         try:
-            answer = await get_color_intrinsics.poll(node_runner, producer, INTRINSICS_TIMEOUT_S)
-        except Exception as error:
-            perceiver.camera_reason = f"get_color_intrinsics not answered yet ({error!r})"
-            await asyncio.sleep(INTRINSICS_RETRY_S)
+            intrinsics = await camera_intrinsics(node_runner, producer)
+        except Refusal as refusal:
+            perceiver.camera_reason = refusal.message
+            if refusal.message != reported:
+                logger.info("%s; asking again every %g s", refusal.message, INTRINSICS_RETRY_S)
+                reported = refusal.message
+            await unless_cancelled(token, asyncio.sleep(INTRINSICS_RETRY_S))
             continue
-        data = answer.data
-        if not data.success:
-            perceiver.camera_reason = f"the camera refuses its intrinsics: {data.message}"
-            print(f"[brain] {perceiver.camera_reason}")
-            return
-        try:
-            intrinsics = intrinsics_from(data)
-        except ValueError as error:
-            perceiver.camera_reason = f"the camera's intrinsics are unusable: {error}"
-            print(f"[brain] {perceiver.camera_reason}")
-            return
         perceiver.set_camera(perceiver.camera.with_intrinsics(intrinsics))
-        print(
-            f"[brain] camera geometry: {intrinsics.width}x{intrinsics.height} fx {intrinsics.fx:.1f} fy {intrinsics.fy:.1f} "
-            f"cx {intrinsics.cx:.1f} cy {intrinsics.cy:.1f} {intrinsics.distortion_model}"
+        logger.info(
+            "camera geometry: %dx%d fx %.1f fy %.1f cx %.1f cy %.1f %s",
+            intrinsics.width, intrinsics.height, intrinsics.fx, intrinsics.fy, intrinsics.cx, intrinsics.cy, intrinsics.distortion_model,
         )
         return

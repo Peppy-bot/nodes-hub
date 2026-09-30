@@ -10,7 +10,7 @@ and no code changes.
 
 | `perception_backend` | what it is | needs | per frame |
 |---|---|---|---|
-| `sam3_siglip` | SAM 3 finds what is in view, SigLIP names each box by words: a general vocabulary for a scan, the searched words for identify | GPU | about 2 s a scan on a Jetson Thor |
+| `sam3_siglip` | SAM 3 finds what is in view, SigLIP names each box by words: a general vocabulary for a scan, the searched words for identify | GPU | about 1 s a scan on an A10, about 2 s on a Jetson Thor |
 | `gemini_er` | Gemini Robotics-ER over Google's API, words only | network, `GEMINI_API_KEY` | about 2 s a question |
 | `none` | no model: every search refused with "no perception source" | | |
 
@@ -32,22 +32,43 @@ reports is whatever SigLIP can name, not a list someone enrolled.
   nearly as much as the vocabulary's nearest name, so a bowl is not returned
   for "mug". Its label is the description.
 - **An enrolment gallery**, optional, gives particular items their own names.
-  `perception_model` names it: a directory the container can see holding a
-  release (`index.json` with the classes, their labels and crops, and
-  optionally their SigLIP prototypes) or a harvester dataset (`manifest.json`,
-  `classes.txt`, `prompts.txt`). A box that resembles an enrolled item's
-  pictures (cosine 0.80 or more to its prototype) takes the item's name before
-  the vocabulary's, and a description naming an enrolled item is searched the
-  scan's way with that name added to SAM 3's prompt. A directory that is not
-  a gallery fails the load, and every search is refused naming the reason.
+  `perception_gallery` names it: a directory the container can see holding a
+  harvester dataset (`manifest.json` with the frames and every item's box in
+  them, `classes.txt`, and `prompts.txt` with the words each item is named
+  by). A box that resembles an enrolled item's pictures (cosine 0.80 or more
+  to its prototype) takes the item's name before the vocabulary's, and a
+  description naming an enrolled item is searched the scan's way with that
+  name added to SAM 3's prompt. A directory that is not a gallery fails the
+  load, and every search is refused naming the reason.
+
+## Every search keeps a deadline
+
+`timeout_s` of a scan or an identify search bounds it, 10 s when zero. The
+detector checks the deadline between its stages, SAM 3's proposals, SigLIP's
+embeddings and the naming for `sam3_siglip`, each call to the API for
+`gemini_er`, and stops there once it has passed; the search is then refused
+with `the search did not finish within 10 s`. The search's lane stays busy
+until the detector has returned, so a second search never starts on the same
+models while the first still runs. Gemini's API takes no call deadline under
+10 s, so a call gets the budget left and never less than that, and a call
+refused with a 429 or a 5xx is asked again only when the budget has room for
+the wait and another call.
 
 ## Parameters
 
-- `perception_backend`, `perception_model`: above.
-- `perception_confidence`: the confidence a detection is kept at, objectness
-  times naming probability; 0 is the backend's own 0.25. Lower finds more
-  items and more boxes on the robot's own body (measured below).
-- `manipulation_backend`: `none` ships; a scripted sequencer comes next.
+- `perception_backend`: above.
+- `perception_model`: the model the backend loads; empty is its default. For
+  `sam3_siglip` the Hugging Face repository or local directory of the SAM 3
+  weights; for `gemini_er` the model id.
+- `perception_gallery`: the enrolment gallery of `sam3_siglip`, above; empty
+  is none. The other backends refuse to load with one.
+- `perception_confidence`: the confidence a detection is kept at, 0 for the
+  backend's own. For `sam3_siglip` it is objectness times naming probability,
+  0.25 by default; lower finds more items and more boxes on the robot's own
+  body (measured below). For `gemini_er` it is the share of the answers to one
+  frame that returned the box, 0.5 by default.
+- `manipulation_backend`: `none`, the one backend: every sequence is refused
+  naming it, while abort and get_state work.
 - `gripper_names`: the robot's grippers, in the order `get_state` reports them.
 - `camera_pose`: the camera model, below.
 
@@ -60,19 +81,29 @@ pose in the robot's frame that turns the ray into a point.
 
 - **Intrinsics come from the camera.** The `geometry` slot consumes
   `camera_geometry:v1`, served by the sim relays and by `zed_camera` and
-  `realsense_d4xx`, and the brain asks `get_color_intrinsics` at start: focal
+  `realsense_d4xx`. The brain asks `get_color_intrinsics` for the focal
   lengths, principal point and lens model of the colour stream, undistorted by
-  `plumb_bob` or `inverse_plumb_bob` as the camera reports. The rig binds the
-  slot to the same camera as `camera`. Until it answers, both searches are
-  refused naming the reason (slot vacant, not answered yet, or the camera
-  refusing, as a UVC camera does). The depth is read at the colour pixels, so
-  the depth stream has to be aligned to colour, as the relays and the ZED
-  publish it and as `realsense_d4xx` does under `depth_to_color`.
+  `plumb_bob` or `inverse_plumb_bob` as the camera reports, and
+  `get_depth_intrinsics` for what a depth sample measures, which must be the
+  distance along the optical axis (`depth_model` "z"). The rig binds the slot
+  to the same camera as `camera`. The brain asks both every 2 s until the
+  camera answers both with success and something usable; until then both
+  searches are refused naming the reason (slot vacant, not answered yet, the
+  camera not knowing its geometry, as a sim relay says before its simulation
+  has spoken and as a UVC camera says for good, a depth model the brain does
+  not read).
+- **Colour and depth are paired by capture.** The two streams share
+  `frame_id`, the capture-pair counter of `rgbd_camera:v1`; the brain keeps
+  the last eight frames of each and reads the depth of the same capture as
+  the picture. The depth is read at the colour pixels, so the streams have to
+  be aligned, as the relays and the ZED publish them and as `realsense_d4xx`
+  does under `depth_to_color`: a pair whose frames say `align_mode` "none",
+  or two different alignments, is refused with the reason.
 - **The pose is the `camera_pose` parameter**, the camera's optical frame in
-  the robot's world frame, because no contract carries a camera-to-world pose
-  yet. Its default is the OpenArm v2 chest camera, the ZED Mini's left lens
-  from Enactic's CAD, the value the simulators place the camera at; a measured
-  pose on the real robot replaces it.
+  the robot's world frame, because no contract carries a camera-to-world pose.
+  Its default is the OpenArm v2 chest camera, the ZED Mini's left lens from
+  Enactic's CAD, the value the simulators place the camera at; a measured pose
+  on the real robot replaces it.
 
 ## Item ids
 
@@ -85,6 +116,11 @@ keeps its items in memory only.
   bottle" returns the id and the label a scan gave the mustard bottle. The
   label only decides between two items at one place, such as an apple in a
   bowl.
+- **A description names whole words.** `identify_item` returns the detection
+  whose label is the description, else the most confident one whose label
+  holds every word of it, stopwords aside: "the coffee can please" names
+  "coffee can" and never "thermos" or "candle". The same rule names an
+  enrolled item of the gallery.
 - **A scan drops only what it could name.** A known item that a scan does not
   see is dropped when the scan could have named it, never when a gripper holds
   it. A `sam3_siglip` scan names the names of its vocabulary (and an enrolment
@@ -95,22 +131,24 @@ keeps its items in memory only.
   old id is dropped. `place_item` is the exception: the item takes the pose it
   was put at, so its id stays. After `drop_item` the item keeps the position it
   was grabbed at, since nothing measured where it landed.
+- **A held item cannot be grabbed again.** A `grab_item` for an item a gripper
+  holds is refused naming the gripper: the item is in its jaws, not where it
+  was grabbed.
 - **The run token is new at each start of the node**, so an id from before a
   restart is refused as an unknown item instead of naming a different one.
 
 ## Testing it on any machine
 
 What the machine needs: an NVIDIA GPU with 12 GB free (SAM 3 and SigLIP take
-about 6 GB, Waldo the rest), peppy 0.31 or later, network on first start (the
-container build fetches torch and the model libraries, the first load fetches
-about 7 GB of weights from Hugging Face), and Chrome for Waldo's viewer.
-Nothing else: no dataset, no gallery, no key unless Gemini is tried.
+about 6 GB, Waldo the rest), peppy 0.31 or later with `nodes-hub` and
+`launchers-hub` registered, network on first start (the container build
+fetches torch and the model libraries, the first load fetches about 7 GB of
+weights from Hugging Face), and Chrome for Waldo's viewer. Nothing else: no
+dataset, no gallery, no key unless Gemini is tried.
 
-### 1. Check out the branches and register them
+### 1. Register the hubs
 
 ```sh
-git -C nodes-hub checkout feat/item-perception        # this node
-git -C launchers-hub checkout feat/item-perception    # the brain option and its links
 peppy repo add /path/to/nodes-hub; peppy repo add /path/to/launchers-hub; peppy repo refresh
 ```
 
@@ -192,7 +230,7 @@ peppy node run openarm_ai_brain_vla:v1 -i brain -b --clock simulation \
 ```
 
 `perception_backend=gemini_er` with `GEMINI_API_KEY` exported in that shell;
-`perception_model=/path/to/gallery` with `sam3_siglip` to enrol particular
+`perception_gallery=/path/to/gallery` with `sam3_siglip` to enrol particular
 items. A brain run this way is not on the MCP endpoint, so ask it through an
 `item_perception:v1` consumer node.
 
@@ -206,7 +244,7 @@ items. A brain run this way is not on the MCP endpoint, so ask it through an
   reported as an item ("handle", "clip"): about 0.40 such boxes a frame on the
   frames measured below.
 - Identify by a plain name ("mustard bottle", "yellow bottle", "blue ball"):
-  about 2 s with `sam3_siglip`, about 2 s with `gemini_er`.
+  about 2 s with `sam3_siglip` on a Jetson Thor, about 2 s with `gemini_er`.
 - An item that is not on the table ("mug" when there is none, "keyboard"):
   refused, `no item matches 'mug'`, for 95.3% of such searches below.
 - `perception_backend=none`: every search refused with `no perception source`.
@@ -215,7 +253,7 @@ items. A brain run this way is not on the MCP endpoint, so ask it through an
 
 On the 300 chest-camera frames of a Waldo harvest of the catalogue's table
 items (947 items at least 80% visible, each with its box; a box is right at
-IoU 0.5), at the default confidence:
+IoU 0.5), at the default confidence, on an A10:
 
 | | found | wrong item | box on nothing | nothing returned |
 |---|---|---|---|---|
@@ -235,5 +273,7 @@ a more general name of the same thing ("bottle" for "alsace wine bottle",
 ## Tests
 
 `uv run --locked --with pytest pytest` runs the suite without any model
-library; `tests/test_sam3_siglip_models.py` runs the real models where torch,
-the extras and a GPU are present and skips elsewhere.
+library: the core and the handlers against fakes, the backends around their
+models, and the whole node over the wire under the generated harness, its
+camera and backbone mocked. `tests/test_sam3_siglip_models.py` runs the real
+models where torch, the extras and a GPU are present and skips elsewhere.

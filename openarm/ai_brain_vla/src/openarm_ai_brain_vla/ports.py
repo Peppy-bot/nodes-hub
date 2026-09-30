@@ -1,6 +1,6 @@
 """The seams of the brain: the plain data that crosses them, the two
-interfaces a backend implements, and the cancel token every long call
-takes.
+interfaces a backend implements, the cancel token every long call takes,
+and the deadline every search carries.
 
 The core owns every contract rule. A backend only answers one question:
 "what do you see in this image" (a `Detector`) or "do this with the arm"
@@ -11,6 +11,7 @@ or completes a goal, so swapping a backend cannot break a contract rule.
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass
 from typing import Optional, Protocol, Sequence
 
@@ -37,6 +38,37 @@ class Cancelled(Exception):
         super().__init__(reason)
         self.reason = reason
         self.by_caller = by_caller
+
+
+class SearchTimeout(Exception):
+    """A detector stopped at its deadline: the search has no answer, and
+    the core refuses it naming the budget."""
+
+    def __init__(self, budget_s: float) -> None:
+        super().__init__(f"the search did not finish within {budget_s:g} s")
+        self.budget_s = budget_s
+
+
+@dataclass(frozen=True)
+class Deadline:
+    """When a search must have answered: an instant of the monotonic clock
+    and the budget it was set from. A detector calls `check` between its
+    stages, so a search ends at the next stage boundary after the deadline
+    rather than running on."""
+
+    at: float
+    budget_s: float
+
+    @classmethod
+    def after(cls, budget_s: float) -> "Deadline":
+        return cls(time.monotonic() + budget_s, budget_s)
+
+    def remaining_s(self) -> float:
+        return max(0.0, self.at - time.monotonic())
+
+    def check(self) -> None:
+        if time.monotonic() >= self.at:
+            raise SearchTimeout(self.budget_s)
 
 
 class CancelToken:
@@ -94,8 +126,17 @@ class Box:
         return ((self.x0 + self.x1) / 2.0, (self.y0 + self.y1) / 2.0)
 
     @property
-    def area(self) -> float:
-        return max(0.0, self.x1 - self.x0) * max(0.0, self.y1 - self.y0)
+    def xyxy(self) -> tuple[float, float, float, float]:
+        return (self.x0, self.y0, self.x1, self.y1)
+
+
+def iou(a: Sequence[float], b: Sequence[float]) -> float:
+    """Intersection over union of two boxes given as x0, y0, x1, y1."""
+    x0, y0 = max(a[0], b[0]), max(a[1], b[1])
+    x1, y1 = min(a[2], b[2]), min(a[3], b[3])
+    overlap = max(0.0, x1 - x0) * max(0.0, y1 - y0)
+    union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - overlap
+    return float(overlap / union) if union > 0.0 else 0.0
 
 
 @dataclass(frozen=True)
@@ -166,16 +207,23 @@ class Detector(Protocol):
     """The swappable piece of perception: a model that finds boxes in one
     RGB image. The core does everything around it: frames, depth, the
     camera model, duplicate boxes, ids. `detect` and `load` may block; the
-    core runs them off the event loop."""
+    core runs each in a thread of its own."""
 
     name: str
+    # The confidence a detection is kept at, 0 to 1, in the backend's own
+    # measure of it. The brain sets it from the perception_confidence
+    # parameter before the load when that parameter is above zero.
+    min_confidence: float
 
     @property
     def available(self) -> bool: ...
 
-    def load(self, model: str) -> None:
-        """`model` is the perception_model parameter; what it means belongs
-        to the backend."""
+    def load(self, model: str, gallery: str) -> None:
+        """`model` is the perception_model parameter, the identifier of a
+        model the backend reads; `gallery` the perception_gallery parameter,
+        a directory of pictures of particular items. Each backend says what
+        it makes of them, and fails the load naming a value it does not
+        take."""
         ...
 
     def set_vocabulary(self, phrases: Sequence[str]) -> None:
@@ -183,8 +231,10 @@ class Detector(Protocol):
         vocabulary, which is what a scan asks for."""
         ...
 
-    def detect(self, image) -> list[Box]:
-        """`image` is an H x W x 3 uint8 RGB array."""
+    def detect(self, image, deadline: Deadline) -> list[Box]:
+        """`image` is an H x W x 3 uint8 RGB array. The detector checks
+        `deadline` between its stages and raises `SearchTimeout` once it has
+        passed."""
         ...
 
     def scan_coverage(self) -> Coverage:
@@ -196,8 +246,7 @@ class Detector(Protocol):
 class Manipulator(Protocol):
     """The swappable piece of manipulation. Every move it makes goes
     through the `Robot` it is started with, so a stop can cancel the move
-    in flight whatever the backend is. A scripted sequence stands here
-    first; a learned policy can stand here later."""
+    in flight whatever the backend is."""
 
     name: str
 

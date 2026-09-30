@@ -14,9 +14,7 @@ async def run(brain, ctx) -> None:
     async def body(job) -> dict:
         state = brain.state
         gripper = state.holder(goal.gripper_name)
-        if not brain.manipulator.available:
-            raise Refusal(f"no manipulation backend: manipulation_backend is '{brain.manipulator.name}'")
-        outcome = await brain.manipulator.drop(gripper, job.cancel)
+        outcome = await brain.manipulator_or_refuse().drop(gripper, job.cancel)
         job.cancel.check()
         if not outcome.success:
             raise Refusal(outcome.message or "the release failed")

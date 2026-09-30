@@ -9,6 +9,7 @@ import asyncio
 import logging
 import sys
 from functools import partial
+from typing import Optional
 
 from peppygen import NodeBuilder, NodeRunner, clock
 from peppygen.exposed_actions.item_manipulation import abort, drop_item, grab_item, place_item
@@ -24,18 +25,30 @@ from .handlers import grab_item as grab_item_handler
 from .handlers import identify_item as identify_item_handler
 from .handlers import place_item as place_item_handler
 from .handlers import scan_items as scan_items_handler
+from .ports import Detector, Manipulator
 from .serve import serve_action, serve_service
 
+logger = logging.getLogger(__name__)
 
-async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Task]:
+
+async def setup(
+    params: Parameters,
+    node_runner: NodeRunner,
+    *,
+    detector: Optional[Detector] = None,
+    manipulator: Optional[Manipulator] = None,
+) -> list[asyncio.Task]:
+    """The node's entry point. `detector` and `manipulator` stand in for
+    the backends the parameters select when given, which is how the whole
+    node runs over the wire against fakes."""
     await clock.init(node_runner)
     token = node_runner.cancellation_token()
-    brain = Brain(params, node_runner)
+    brain = Brain(params, node_runner, detector=detector, manipulator=manipulator)
     await brain.start()
     node_runner.on_shutdown(brain.shutdown)
-    print(
-        f"[brain] grippers {brain.state.gripper_names()}, perception '{brain.perceiver.detector.name}', "
-        f"manipulation '{brain.manipulator.name}'"
+    logger.info(
+        "grippers %s, perception '%s', manipulation '%s'",
+        brain.state.gripper_names(), brain.perceiver.detector.name, brain.manipulator.name,
     )
     # Per-goal tasks live here so a goal in flight is never collected
     # before it completes.
@@ -60,14 +73,14 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
 
 
 def configure_logging(level: int = logging.INFO) -> logging.Logger:
-    """The node's own log lines reach the daemon's log. Python drops INFO
-    by default, which hid the backends' "loaded" lines inside the container;
-    only this package's logger is raised, so the model libraries stay quiet."""
+    """The node's own log lines reach the daemon's log, each opened with
+    "[brain]". Python drops INFO by default; only this package's logger is
+    raised, so the model libraries stay quiet. One handler however many
+    times it is called."""
     logger = logging.getLogger("openarm_ai_brain_vla")
-    if not any(getattr(h, "_brain_handler", False) for h in logger.handlers):
+    if not logger.handlers:
         handler = logging.StreamHandler(sys.stderr)
         handler.setFormatter(logging.Formatter("[brain] %(message)s"))
-        handler._brain_handler = True  # type: ignore[attr-defined]
         logger.addHandler(handler)
     logger.setLevel(level)
     logger.propagate = False

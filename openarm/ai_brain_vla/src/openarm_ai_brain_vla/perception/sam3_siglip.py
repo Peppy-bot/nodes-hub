@@ -15,20 +15,26 @@ inside the node's container; paths under the daemon user's home are.
   the described item when it resembles the words more than the background
   phrases and at most `VOCABULARY_MARGIN` less than the vocabulary's nearest
   name, so a bowl is not returned for "mug".
-- An enrolment gallery (gallery.py), named by `perception_model`, adds
+- An enrolment gallery (gallery.py), named by `perception_gallery`, adds
   pictures of particular items: a crop whose embedding is at
   `SIMILARITY_FLOOR` or nearer an enrolled item's prototype takes that
   item's name, and a description that names an enrolled item runs the scan
   with the item's name added to SAM 3's prompt, the core picking the item
   by name afterwards.
+- `perception_model` is the Hub repository or local directory the SAM 3
+  weights are read from; empty is `SAM3_REPO`.
+
+A search keeps its deadline between its three stages: before SAM 3
+proposes, before SigLIP embeds the crops, and before the crops are named.
+Past the deadline the search stops there and the core refuses it.
 
 Measured on the 300 chest-camera frames of a Waldo harvest of the
 catalogue's table items (947 items with their boxes, a box right at IoU
-0.5), at the default confidence: a scan found 77.2% of the items with
-0.40 boxes a frame on nothing, most of them on the robot's own
-gripper; a search for an item in view by its catalogue name returned it for
-77.9%, another item for 1.0%, and nothing for 19.3%; a search
-for an item not in view returned something for 4.7%.
+0.5), at the default confidence, on an A10: a scan found 77.2% of the
+items with 0.40 boxes a frame on nothing, most of them on the robot's own
+gripper, in about 1 s a frame; a search for an item in view by its
+catalogue name returned it for 77.9%, another item for 1.0%, and nothing
+for 19.3%; a search for an item not in view returned something for 4.7%.
 
 SAM 3's objectness is its query score alone. Its presence score, SAM 3's
 own guess whether the prompt's concept is in the frame, refuses concepts
@@ -39,10 +45,10 @@ place against items that are not there: without it, a search for an item
 not in view returned something for 36%.
 
 SAM 3 is prompted with the one word "object" for a scan, not with names.
-Measured on the perception study's Waldo frames with a 28-item gallery,
-that scan found 90.6% of items against 87.0% for the 28 name prompts, in
-0.94 s a frame against 3.4 s, and its time does not grow with what it looks
-for.
+Measured on the perception study's Waldo frames with a 28-item gallery, on
+the same A10, that scan found 90.6% of items against 87.0% for the 28 name
+prompts, in 0.94 s a frame against 3.4 s, and its time does not grow with
+what it looks for.
 
 `SIMILARITY_FLOOR` guards an enrolled name: the softmax names every crop
 after the nearest prototype however far it is. Measured on the study's
@@ -72,8 +78,8 @@ from typing import Optional, Sequence
 
 import numpy as np
 
-from ..ports import Box, Coverage
-from .gallery import Crop, Gallery, load_gallery
+from ..ports import Box, Coverage, Deadline, iou
+from .gallery import Gallery, load_gallery
 
 logger = logging.getLogger(__name__)
 
@@ -184,14 +190,6 @@ def class_agnostic_nms(boxes: np.ndarray, scores: np.ndarray, iou_threshold: flo
     return kept
 
 
-def iou(a: np.ndarray, b: np.ndarray) -> float:
-    x0, y0 = max(a[0], b[0]), max(a[1], b[1])
-    x1, y1 = min(a[2], b[2]), min(a[3], b[3])
-    overlap = max(0.0, x1 - x0) * max(0.0, y1 - y0)
-    union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - overlap
-    return float(overlap / union) if union > 0.0 else 0.0
-
-
 def grown(box: Sequence[float], margin: float, width: int, height: int) -> tuple[int, int, int, int]:
     """The crop of a box grown by `margin` of its size on each side, at
     least `MIN_CROP_PX` on each side about the box's centre, and kept inside
@@ -267,12 +265,12 @@ def name_enrolled_first(
 ) -> tuple[list[Optional[str]], np.ndarray]:
     """The names by words with every crop that resembles an enrolled item
     (its best cosine at `SIMILARITY_FLOOR` or above) renamed after that
-    item, or None when the item is a background class."""
+    item."""
     best, enrolled_probability = name_by_prototypes(embeddings, prototypes, TEMPERATURE)
     near = ~under_floor(embeddings, prototypes)
     out_names, out_probability = list(names), probability.copy()
     for i in np.flatnonzero(near):
-        out_names[i] = None if gallery.is_background(int(best[i])) else gallery.phrases[int(best[i])]
+        out_names[i] = gallery.phrases[int(best[i])]
         out_probability[i] = enrolled_probability[i]
     return out_names, out_probability
 
@@ -300,18 +298,18 @@ def detections_from(
 
 def embed_prototypes(gallery: Gallery, models: "Models") -> np.ndarray:
     """One prototype per enrolled item: the mean SigLIP embedding of its
-    crops, each grown by a tenth when it is a box in a frame."""
+    crops, each grown by a tenth of its box."""
     from PIL import Image
 
     sums: Optional[np.ndarray] = None
     counts = np.zeros(len(gallery.classes), dtype=np.int64)
-    by_image: dict[str, list[Crop]] = {}
+    by_image: dict[str, list] = {}
     for crop in gallery.crops:
         by_image.setdefault(crop.image, []).append(crop)
     for crops in by_image.values():
         with Image.open(gallery.image_path(crops[0])) as image:
             image = image.convert("RGB")
-            pieces = [image.crop(grown(c.box, CROP_MARGIN, image.width, image.height)) if c.box else image for c in crops]
+            pieces = [image.crop(grown(c.box, CROP_MARGIN, image.width, image.height)) for c in crops]
             embeddings = models.embed_images(pieces)
         if sums is None:
             sums = np.zeros((len(gallery.classes), embeddings.shape[1]), dtype=np.float32)
@@ -347,7 +345,6 @@ class Models:
         self.sam3 = Sam3Model.from_pretrained(sam3_repo).to(self.device).eval()
         self.siglip_processor = AutoProcessor.from_pretrained(siglip_repo)
         self.siglip = AutoModel.from_pretrained(siglip_repo, dtype=torch.float16 if self.half else torch.float32).to(self.device).eval()
-        self._text_inputs: dict[str, object] = {}
 
     def propose(self, image, prompts: Sequence[str]) -> tuple[np.ndarray, np.ndarray]:
         """Every instance SAM 3 finds for any of `prompts`: boxes in pixels
@@ -365,9 +362,7 @@ class Models:
             pixel_values = self.sam3_processor(images=image, return_tensors="pt").to(self.device)["pixel_values"]
             vision = self.sam3.get_vision_features(pixel_values=pixel_values)
             for prompt in prompts:
-                text = self._text_inputs.get(prompt)
-                if text is None:
-                    text = self._text_inputs[prompt] = self.sam3_processor(text=prompt, return_tensors="pt").to(self.device)
+                text = self.sam3_processor(text=prompt, return_tensors="pt").to(self.device)
                 outputs = self.sam3(vision_embeds=vision, input_ids=text["input_ids"], attention_mask=text.get("attention_mask"))
                 score = outputs.pred_logits.sigmoid()[0]
                 boxes.append(outputs.pred_boxes[0].float().cpu().numpy() * scale)
@@ -399,6 +394,7 @@ class Sam3SiglipDetector:
     name = "sam3_siglip"
 
     def __init__(self, models_factory=None, vocabulary: Optional[Sequence[str]] = None) -> None:
+        # Builds the two models from the SAM 3 repository or directory.
         self._models_factory = models_factory or Models
         # What a scan names a crop among by words.
         self.scan_vocabulary: tuple[str, ...] = tuple(vocabulary) if vocabulary is not None else load_vocabulary()
@@ -406,37 +402,38 @@ class Sam3SiglipDetector:
         self._gallery: Optional[Gallery] = None
         self._prototypes: Optional[np.ndarray] = None
         self._search: list[str] = []
-        # Text tables by the labels they name, the scan vocabulary's made at load.
-        self._text_tables: dict[tuple[str, ...], np.ndarray] = {}
-        # The confidence a detection is kept at; the brain sets it from the
-        # perception_confidence parameter before the load.
+        # The text table of the scan vocabulary, made once at load: a
+        # description's table is made for its search and dropped with it.
+        self._vocabulary_table: Optional[np.ndarray] = None
+        # The confidence a detection is kept at, objectness times naming
+        # probability; the brain sets it from the perception_confidence
+        # parameter before the load.
         self.min_confidence = MIN_CONFIDENCE
 
     @property
     def available(self) -> bool:
         return self._models is not None
 
-    def load(self, model: str) -> None:
-        """Reads the enrolment gallery `model` names, if any, then loads the
-        two models and embeds the scan vocabulary. A named gallery that
+    def load(self, model: str, gallery: str) -> None:
+        """Reads the enrolment gallery `gallery` names, if any, then loads
+        the two models, SAM 3 from `model` when that is set, and embeds the
+        scan vocabulary and the enrolled items' crops. A named gallery that
         cannot be read fails the load with the reason, before the models
         take their minute; so do models that cannot be loaded."""
         from PIL import Image
 
-        gallery = load_gallery(model)
+        enrolment = load_gallery(gallery)
         try:
-            models = self._models_factory()
+            models = self._models_factory(model.strip() or SAM3_REPO)
         except ImportError as error:
             raise RuntimeError(f"the sam3_siglip backend needs torch and transformers (the node's sam3-siglip extra): {error}") from error
-        prototypes = None
-        if gallery is not None:
-            prototypes = normalised(gallery.prototypes) if gallery.prototypes is not None else embed_prototypes(gallery, models)
-        self._text_tables = {self.scan_vocabulary: text_table(models, self.scan_vocabulary)}
+        prototypes = embed_prototypes(enrolment, models) if enrolment is not None else None
+        self._vocabulary_table = text_table(models, self.scan_vocabulary)
         # The first CUDA call pays for the kernels; take it here, not on the
         # first search.
         models.propose(Image.new("RGB", (64, 64)), GENERIC_PROMPTS)
-        self._gallery, self._models, self._prototypes = gallery, models, prototypes
-        enrolled = f"{len(gallery.classes)} enrolled items from {gallery.root}" if gallery is not None else "no enrolment gallery"
+        self._gallery, self._models, self._prototypes = enrolment, models, prototypes
+        enrolled = f"{len(enrolment.classes)} enrolled items from {enrolment.root}" if enrolment is not None else "no enrolment gallery"
         logger.info("sam3_siglip: a vocabulary of %d names, %s, on %s", len(self.scan_vocabulary), enrolled, models.device)
 
     def set_vocabulary(self, phrases: Sequence[str]) -> None:
@@ -444,20 +441,20 @@ class Sam3SiglipDetector:
 
     def scan_coverage(self) -> Coverage:
         """A scan names the vocabulary's names, and the enrolled items'
-        phrases when there is a gallery; never a background class, since
-        those boxes are dropped."""
+        phrases when there is a gallery."""
         if self._models is None:
             return Coverage()
-        enrolled = [self._gallery.phrases[i] for i in self._gallery.item_indices()] if self._gallery is not None else []
+        enrolled = self._gallery.phrases if self._gallery is not None else ()
         return Coverage(frozenset(self.scan_vocabulary) | frozenset(enrolled))
 
-    def detect(self, image: np.ndarray) -> list[Box]:
+    def detect(self, image: np.ndarray, deadline: Deadline) -> list[Box]:
         from PIL import Image
 
-        if self._models is None:
+        if self._models is None or self._vocabulary_table is None:
             return []
         plan = plan_for(self._gallery, self._search, self.scan_vocabulary)
         frame = Image.fromarray(np.ascontiguousarray(image))
+        deadline.check()
         boxes, objectness = self._models.propose(frame, plan.prompts)
         above = objectness >= PROPOSAL_CONF
         boxes, objectness = boxes[above], objectness[above]
@@ -466,19 +463,16 @@ class Sam3SiglipDetector:
             return []
         boxes, objectness = boxes[keep], objectness[keep]
         crops = [frame.crop(grown(box, CROP_MARGIN, frame.width, frame.height)) for box in boxes]
+        deadline.check()
         embeddings = self._models.embed_images(crops)
-        table = self._text_table(plan.labels)
-        names, probability = name_by_words(embeddings, table, plan.labels)
+        deadline.check()
         if plan.route is Route.WORDS:
-            vocabulary_table = self._text_tables[self.scan_vocabulary][: len(self.scan_vocabulary)]
-            unlike = unlike_the_words(embeddings, table, vocabulary_table)
+            table = text_table(self._models, plan.labels)
+            names, probability = name_by_words(embeddings, table, plan.labels)
+            unlike = unlike_the_words(embeddings, table, self._vocabulary_table[: len(self.scan_vocabulary)])
             names = [None if far else name for name, far in zip(names, unlike)]
-        elif self._gallery is not None and self._prototypes is not None:
-            names, probability = name_enrolled_first(embeddings, self._prototypes, self._gallery, names, probability)
+        else:
+            names, probability = name_by_words(embeddings, self._vocabulary_table, plan.labels)
+            if self._gallery is not None and self._prototypes is not None:
+                names, probability = name_enrolled_first(embeddings, self._prototypes, self._gallery, names, probability)
         return detections_from(boxes, objectness, names, probability, self.min_confidence)
-
-    def _text_table(self, labels: tuple[str, ...]) -> np.ndarray:
-        table = self._text_tables.get(labels)
-        if table is None:
-            table = self._text_tables[labels] = text_table(self._models, labels)
-        return table

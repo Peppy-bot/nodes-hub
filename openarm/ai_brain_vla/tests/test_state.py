@@ -5,6 +5,7 @@ import pytest
 
 from openarm_ai_brain_vla.ports import Coverage, Detection, Refusal
 from openarm_ai_brain_vla.state import State, arm_of, best_match, new_run_token
+from openarm_ai_brain_vla.words import content_words, named_by, normalised
 
 # A scan that can name anything, and a search by description, which covers nothing.
 EVERY = Coverage(every_label=True)
@@ -208,9 +209,25 @@ def test_unknown_items_are_refused_and_pose_grabs_get_an_id():
     state = make_state()
     with pytest.raises(Refusal, match="unknown item 'cup_9-t0'"):
         state.item("cup_9-t0")
+    with pytest.raises(Refusal, match="unknown item 'cup_9-t0'"):
+        state.item_to_grab("cup_9-t0")
     item = state.mint_from_pose((0.5, 0.0, 0.7), None, now_ns=1)
     assert item.item_id == "item_1-t0"
     assert state.item("item_1-t0") is item
+    assert state.item_to_grab("item_1-t0") is item
+
+
+def test_an_item_a_gripper_holds_cannot_be_grabbed_again():
+    state = make_state()
+    state.remember([Detection("cup", (0.5, 0.1, 0.7), 0.9), Detection("bowl", (0.4, -0.1, 0.7), 0.9)], now_ns=1, coverage=EVERY)
+    assert state.holder_of("cup_1-t0") is None
+    state.set_held(state.grippers["left_gripper"], "cup_1-t0")
+    assert state.holder_of("cup_1-t0") is state.grippers["left_gripper"]
+    with pytest.raises(Refusal, match="item 'cup_1-t0' is held by gripper 'left_gripper'"):
+        state.item_to_grab("cup_1-t0")
+    assert state.item_to_grab("bowl_1-t0").item_id == "bowl_1-t0"
+    state.clear_held(state.grippers["left_gripper"])
+    assert state.item_to_grab("cup_1-t0").item_id == "cup_1-t0"
 
 
 def test_labels_become_clean_id_stems():
@@ -227,6 +244,34 @@ def test_best_match_prefers_the_exact_label_then_a_word_then_confidence():
     assert best_match([cup, red_cup, bowl], "red cup") is red_cup
     assert best_match([cup, bowl], "cup") is cup
     assert best_match([red_cup, bowl], "cup") is red_cup
+    assert best_match([cup, red_cup, bowl], "the cup please") is cup
     assert best_match([cup, bowl], "") is bowl
     assert best_match([cup, bowl], "spoon") is None
     assert best_match([], "cup") is None
+
+
+def test_best_match_never_matches_part_of_a_word_or_a_stopword():
+    thermos = Detection("thermos", (0, 0, 0), 0.9)
+    candle = Detection("candle", (0, 0, 0), 0.8)
+    feather = Detection("feather", (0, 0, 0), 0.7)
+    seen = [thermos, candle, feather]
+    assert best_match(seen, "the coffee can please") is None
+    assert best_match(seen, "can") is None
+    assert best_match(seen, "the mug") is None
+    assert best_match(seen, "the") is None
+    assert best_match(seen, "the candle") is candle
+
+
+def test_a_description_names_a_label_by_whole_words_stopwords_aside():
+    labels = ["coffee can", "cracker box", "candle", "red coffee can"]
+    assert named_by("coffee can", labels) == [0]
+    assert named_by("Coffee_Can", labels) == [0]
+    assert named_by("the coffee can please", labels) == [0, 3]
+    assert named_by("can", labels) == [0, 3]
+    assert named_by("red can", labels) == [3]
+    assert named_by("box can", labels) == []
+    assert named_by("coffee tin", labels) == []
+    assert named_by("cand", labels) == []
+    assert named_by("the", labels) == [] and named_by("  ", labels) == []
+    assert normalised("  Red_Coffee   Can ") == "red coffee can"
+    assert content_words("the Red coffee can, please") == {"red", "coffee", "can,"}

@@ -3,14 +3,19 @@ contract rules from goal to result, with no router and no robot."""
 
 import asyncio
 
-import pytest
 
 from conftest import PARAMS, FakeCtx, FakeDetector, FakeManipulator, depth_frame, rgb_frame
+from peppygen.exposed_actions.item_manipulation import abort as abort_action
+from peppygen.exposed_actions.item_manipulation import drop_item as drop_action
+from peppygen.exposed_actions.item_manipulation import grab_item as grab_action
+from peppygen.exposed_actions.item_manipulation import place_item as place_action
+from peppygen.exposed_actions.item_perception import identify_item as identify_action
+from peppygen.exposed_actions.item_perception import scan_items as scan_action
 from peppygen.parameters import Parameters
 
 from openarm_ai_brain_vla.brain import Brain
 from openarm_ai_brain_vla.handlers import abort, drop_item, get_state, grab_item, identify_item, place_item, scan_items
-from openarm_ai_brain_vla.ports import Box, Coverage
+from openarm_ai_brain_vla.ports import Box, Coverage, SearchTimeout
 
 
 class Ticks:
@@ -31,17 +36,37 @@ def make_brain(*, detector=None, manipulator=None, ticks=None) -> Brain:
 def with_frames(brain: Brain, depth_m: float = 1.0) -> None:
     from openarm_ai_brain_vla.perception.camera import Intrinsics
 
-    brain.frames.color = rgb_frame(16, 12)
-    brain.frames.depth = depth_frame(depth_m, 16, 12)
+    brain.frames.add_color(rgb_frame(16, 12))
+    brain.frames.add_depth(depth_frame(depth_m, 16, 12))
     brain.frames.depth_unit = 0.001
     # The camera has answered where its pixels point: a 90 degree lens.
     brain.perceiver.set_camera(brain.camera.with_intrinsics(Intrinsics.from_fovy(90.0, 16, 12)))
 
 
-def grab_goal(**overrides):
+def scan_goal(timeout_s: float = 0.0) -> FakeCtx:
+    return FakeCtx(scan_action, timeout_s=timeout_s)
+
+
+def identify_goal(description: str, timeout_s: float = 0.0) -> FakeCtx:
+    return FakeCtx(identify_action, description=description, timeout_s=timeout_s)
+
+
+def grab_goal(**overrides) -> FakeCtx:
     goal = dict(gripper_name="", item_id="", position=[0.0, 0.0, 0.0], orientation=None, max_effort=0.0)
     goal.update(overrides)
-    return FakeCtx(**goal)
+    return FakeCtx(grab_action, **goal)
+
+
+def drop_goal(gripper_name: str = "") -> FakeCtx:
+    return FakeCtx(drop_action, gripper_name=gripper_name)
+
+
+def place_goal(position, gripper_name: str = "", orientation=None) -> FakeCtx:
+    return FakeCtx(place_action, gripper_name=gripper_name, position=position, orientation=orientation)
+
+
+def abort_goal(reason: str = "") -> FakeCtx:
+    return FakeCtx(abort_action, reason=reason)
 
 
 def state_of(brain: Brain):
@@ -60,7 +85,7 @@ async def test_get_state_starts_idle_with_the_configured_grippers():
 
 async def test_scan_and_grab_are_refused_without_backends_but_the_rules_still_speak_first():
     brain = make_brain()
-    ctx = FakeCtx(timeout_s=0.0)
+    ctx = scan_goal()
     await scan_items.run(brain, ctx)
     assert ctx.completed["success"] is False
     assert ctx.completed["message"].startswith("no perception source")
@@ -76,6 +101,14 @@ async def test_scan_and_grab_are_refused_without_backends_but_the_rules_still_sp
     assert ctx.completed["message"] == "no manipulation backend: manipulation_backend is 'none'"
     assert ctx.completed["gripper_name"] == "" and ctx.completed["item_id"] == ""
 
+    ctx = drop_goal()
+    await drop_item.run(brain, ctx)
+    assert ctx.completed["message"] == "no gripper holds an item"
+    ctx = place_goal([0.5, 0.1, 0.7])
+    await place_item.run(brain, ctx)
+    assert ctx.completed["message"] == "no gripper holds an item"
+    assert ctx.completed["final_position"] == [0.0, 0.0, 0.0]
+
 
 async def test_scan_then_identify_then_grab_by_id_then_place():
     detector = FakeDetector([Box("cup", 0.9, 7, 5, 9, 7), Box("banana", 0.7, 1, 1, 3, 3)])
@@ -84,7 +117,7 @@ async def test_scan_then_identify_then_grab_by_id_then_place():
     brain = make_brain(detector=detector, manipulator=manipulator, ticks=ticks)
     with_frames(brain, depth_m=1.0)
 
-    ctx = FakeCtx(timeout_s=0.0)
+    ctx = scan_goal()
     await scan_items.run(brain, ctx)
     assert ctx.completed["success"] is True
     assert ctx.completed["item_ids"] == ["cup_1-t0", "banana_1-t0"]
@@ -92,7 +125,7 @@ async def test_scan_then_identify_then_grab_by_id_then_place():
     assert len(ctx.completed["positions"]) == 6
     assert ctx.completed["confidences"] == [0.9, 0.7]
 
-    ctx = FakeCtx(description="cup", timeout_s=0.0)
+    ctx = identify_goal("cup")
     await identify_item.run(brain, ctx)
     assert ctx.completed["success"] is True
     assert ctx.completed["item_id"] == "cup_1-t0"
@@ -113,12 +146,32 @@ async def test_scan_then_identify_then_grab_by_id_then_place():
     await grab_item.run(brain, ctx)
     assert ctx.completed["message"] == "gripper 'left_gripper' already holds item 'cup_1-t0'"
 
-    ctx = FakeCtx(gripper_name="", position=[0.6, 0.2, 0.75], orientation=None)
+    ctx = place_goal([0.6, 0.2, 0.75])
     await place_item.run(brain, ctx)
     assert ctx.completed["success"] is True
     assert ctx.completed["gripper_name"] == "left_gripper" and ctx.completed["item_id"] == "cup_1-t0"
     assert ctx.completed["final_position"] == [0.6, 0.2, 0.76]
     assert state_of(brain).holding == [False, False]
+
+
+async def test_a_grab_of_an_item_a_gripper_holds_is_refused_naming_the_gripper():
+    detector = FakeDetector([Box("cup", 0.9, 7, 5, 9, 7)])
+    manipulator = FakeManipulator()
+    brain = make_brain(detector=detector, manipulator=manipulator)
+    with_frames(brain)
+    await scan_items.run(brain, scan_goal())
+    await grab_item.run(brain, grab_goal(gripper_name="left_gripper", item_id="cup_1-t0"))
+    assert state_of(brain).held_item_ids == ["cup_1-t0", ""]
+
+    # The item is in the left jaws, not on the table: neither the right
+    # gripper by name nor a free gripper by choice may be sent for it.
+    for gripper_name in ("right_gripper", ""):
+        ctx = grab_goal(gripper_name=gripper_name, item_id="cup_1-t0")
+        await grab_item.run(brain, ctx)
+        assert ctx.completed["success"] is False
+        assert ctx.completed["message"] == "item 'cup_1-t0' is held by gripper 'left_gripper'"
+    assert state_of(brain).held_item_ids == ["cup_1-t0", ""]
+    assert len(manipulator.calls) == 1
 
 
 async def test_a_grab_by_pose_mints_an_id_and_a_failed_grab_changes_nothing():
@@ -135,7 +188,7 @@ async def test_a_grab_by_pose_mints_an_id_and_a_failed_grab_changes_nothing():
     await grab_item.run(brain, ctx)
     assert ctx.completed["success"] is True and ctx.completed["item_id"] == "item_1-t0"
 
-    ctx = FakeCtx(gripper_name="")
+    ctx = drop_goal()
     await drop_item.run(brain, ctx)
     assert ctx.completed["success"] is True
     assert ctx.completed["gripper_name"] == "right_gripper" and ctx.completed["item_id"] == "item_1-t0"
@@ -146,13 +199,13 @@ async def test_a_search_under_other_words_returns_the_scans_id():
     detector = FakeDetector([Box("mustard bottle", 0.9, 7, 5, 9, 7)])
     brain = make_brain(detector=detector)
     with_frames(brain)
-    scan = FakeCtx(timeout_s=0.0)
+    scan = scan_goal()
     await scan_items.run(brain, scan)
     assert scan.completed["item_ids"] == ["mustard_bottle_1-t0"]
 
     # The words route names the same box with the caller's description.
     detector.boxes = [Box("yellow bottle", 0.96, 7, 5, 9, 7)]
-    ctx = FakeCtx(description="yellow bottle", timeout_s=0.0)
+    ctx = identify_goal("yellow bottle")
     await identify_item.run(brain, ctx)
     assert ctx.completed["success"] is True
     assert ctx.completed["item_id"] == "mustard_bottle_1-t0"
@@ -160,20 +213,36 @@ async def test_a_search_under_other_words_returns_the_scans_id():
     assert ctx.completed["confidence"] == 0.96
 
 
+async def test_a_description_names_whole_words_only():
+    # A scan under the vocabulary returns general names; a description
+    # that shares letters with one of them, or only stopwords, names none.
+    detector = FakeDetector([Box("thermos", 0.9, 7, 5, 9, 7), Box("candle", 0.8, 1, 1, 3, 3), Box("feather", 0.7, 4, 4, 6, 6)])
+    brain = make_brain(detector=detector)
+    with_frames(brain)
+    for description in ("the coffee can please", "can", "the mug"):
+        ctx = identify_goal(description)
+        await identify_item.run(brain, ctx)
+        assert ctx.completed["success"] is False
+        assert ctx.completed["message"] == f"no item matches '{description}'"
+    ctx = identify_goal("the candle please")
+    await identify_item.run(brain, ctx)
+    assert ctx.completed["success"] is True and ctx.completed["label"] == "candle"
+
+
 async def test_a_scan_keeps_an_item_only_a_description_finds():
     detector = FakeDetector([Box("cup", 0.9, 7, 5, 9, 7)], coverage=Coverage(frozenset({"cup"})))
     brain = make_brain(detector=detector, manipulator=FakeManipulator())
     with_frames(brain)
-    await scan_items.run(brain, FakeCtx(timeout_s=0.0))
+    await scan_items.run(brain, scan_goal())
 
     detector.boxes = [Box("blue ball", 0.8, 1, 1, 3, 3)]
-    ctx = FakeCtx(description="blue ball", timeout_s=0.0)
+    ctx = identify_goal("blue ball")
     await identify_item.run(brain, ctx)
     assert ctx.completed["item_id"] == "blue_ball_1-t0"
 
     # The scan cannot name a blue ball, so not seeing it is no news.
     detector.boxes = [Box("cup", 0.9, 7, 5, 9, 7)]
-    scan = FakeCtx(timeout_s=0.0)
+    scan = scan_goal()
     await scan_items.run(brain, scan)
     assert scan.completed["item_ids"] == ["cup_1-t0"]
     grab = grab_goal(gripper_name="", item_id="blue_ball_1-t0")
@@ -185,18 +254,18 @@ async def test_a_placed_item_keeps_its_id_in_the_next_scan():
     detector = FakeDetector([Box("cup", 0.9, 7, 5, 9, 7)])
     brain = make_brain(detector=detector, manipulator=FakeManipulator())
     with_frames(brain, depth_m=1.0)
-    await scan_items.run(brain, FakeCtx(timeout_s=0.0))
+    await scan_items.run(brain, scan_goal())
     await grab_item.run(brain, grab_goal(gripper_name="", item_id="cup_1-t0"))
 
     # Put it where a box in the image's corner points, far from where it was.
     corner = Box("cup", 0.9, 1, 1, 3, 3)
     target = brain.perceiver.camera.deproject(*corner.centre, 1.0, 16, 12)
-    ctx = FakeCtx(gripper_name="", position=list(target), orientation=None)
+    ctx = place_goal(list(target))
     await place_item.run(brain, ctx)
     assert ctx.completed["success"] is True and ctx.completed["item_id"] == "cup_1-t0"
 
     detector.boxes = [corner]
-    scan = FakeCtx(timeout_s=0.0)
+    scan = scan_goal()
     await scan_items.run(brain, scan)
     assert scan.completed["item_ids"] == ["cup_1-t0"]
 
@@ -204,11 +273,26 @@ async def test_a_placed_item_keeps_its_id_in_the_next_scan():
 async def test_identify_reports_nothing_found_as_a_failed_result():
     brain = make_brain(detector=FakeDetector([Box("bowl", 0.9, 7, 5, 9, 7)]))
     with_frames(brain)
-    ctx = FakeCtx(description="cup", timeout_s=0.0)
+    ctx = identify_goal("cup")
     await identify_item.run(brain, ctx)
     assert ctx.completed["success"] is False
     assert ctx.completed["message"] == "no item matches 'cup'"
     assert ctx.completed["item_id"] == ""
+
+
+async def test_a_search_that_stops_at_its_deadline_is_a_failed_result_and_frees_the_lane():
+    class TimingOut(FakeDetector):
+        def detect(self, image, deadline):
+            raise SearchTimeout(deadline.budget_s)
+
+    brain = make_brain(detector=TimingOut([Box("cup", 0.9, 7, 5, 9, 7)]))
+    with_frames(brain)
+    ctx = scan_goal(timeout_s=0.5)
+    await scan_items.run(brain, ctx)
+    assert ctx.completed["success"] is False
+    assert ctx.completed["message"] == "the search did not finish within 0.5 s"
+    assert ctx.completed["item_ids"] == []
+    assert brain.sequencer.running("perception") is None
 
 
 async def test_one_manipulation_at_a_time_and_abort_stops_it_without_touching_holding():
@@ -217,7 +301,7 @@ async def test_one_manipulation_at_a_time_and_abort_stops_it_without_touching_ho
     brain = make_brain(manipulator=manipulator, ticks=ticks)
     first = grab_goal(gripper_name="left_gripper", position=[0.5, 0.1, 0.7])
     running = asyncio.create_task(grab_item.run(brain, first))
-    await asyncio.sleep(0.01)
+    await manipulator.begun()
     ticks.now_ns += 2_000_000_000
     assert state_of(brain).current_action == "grab_item"
     assert state_of(brain).current_action_elapsed_s == 2.0
@@ -226,7 +310,7 @@ async def test_one_manipulation_at_a_time_and_abort_stops_it_without_touching_ho
     await grab_item.run(brain, second)
     assert second.completed["message"] == "grab_item is running"
 
-    stop = FakeCtx(reason="operator pressed stop")
+    stop = abort_goal("operator pressed stop")
     await abort.run(brain, stop)
     await running
     assert stop.completed["success"] is True
@@ -237,7 +321,7 @@ async def test_one_manipulation_at_a_time_and_abort_stops_it_without_touching_ho
     assert state_of(brain).holding == [False, False]
     assert state_of(brain).current_action == ""
 
-    idle = FakeCtx(reason="")
+    idle = abort_goal()
     await abort.run(brain, idle)
     assert idle.completed["success"] is True
     assert idle.completed["aborted_action"] == ""
@@ -249,7 +333,7 @@ async def test_a_callers_cancel_completes_the_goal_as_cancelled():
     brain = make_brain(manipulator=manipulator)
     ctx = grab_goal(gripper_name="left_gripper", position=[0.5, 0.1, 0.7])
     running = asyncio.create_task(grab_item.run(brain, ctx))
-    await asyncio.sleep(0.01)
+    await manipulator.begun()
     ctx.cancel()
     await asyncio.wait_for(running, 1.0)
     assert ctx.completed is None
@@ -266,10 +350,26 @@ async def test_a_search_may_run_beside_a_manipulation():
     with_frames(brain)
     grab = grab_goal(gripper_name="left_gripper", position=[0.5, 0.1, 0.7])
     running = asyncio.create_task(grab_item.run(brain, grab))
-    await asyncio.sleep(0.01)
-    scan = FakeCtx(timeout_s=0.0)
+    await manipulator.begun()
+    scan = scan_goal()
     await scan_items.run(brain, scan)
     assert scan.completed["success"] is True
     assert state_of(brain).current_action == "grab_item"
-    await abort.run(brain, FakeCtx(reason=""))
+    await abort.run(brain, abort_goal())
     await running
+
+
+async def test_shutdown_stops_the_running_sequence_as_aborted():
+    manipulator = FakeManipulator(wait_for_stop=True)
+    brain = make_brain(manipulator=manipulator)
+    ctx = grab_goal(gripper_name="left_gripper", position=[0.5, 0.1, 0.7])
+    running = asyncio.create_task(grab_item.run(brain, ctx))
+    await manipulator.begun()
+    await asyncio.wait_for(brain.shutdown(), 1.0)
+    await running
+    assert ctx.completed["success"] is False
+    assert ctx.completed["message"] == "aborted: the node is shutting down"
+    assert manipulator.stopped == 1
+    assert state_of(brain).current_action == ""
+    # Idle lanes make a shutdown a no-op.
+    await asyncio.wait_for(brain.shutdown(), 1.0)

@@ -49,7 +49,7 @@ class Brain:
         self.frames = FrameStore()
         self.camera = CameraModel.from_parameters(params.camera_pose)
         self.perceiver = Perceiver(detector or make_detector(params.perception_backend), self.frames, self.camera)
-        if params.perception_confidence > 0.0 and hasattr(self.perceiver.detector, "min_confidence"):
+        if params.perception_confidence > 0.0:
             self.perceiver.detector.min_confidence = params.perception_confidence
         self.manipulator: Manipulator = manipulator or make_manipulator(params.manipulation_backend)
         self.sequencer = Sequencer(stopper=self._stop_lane)
@@ -63,7 +63,7 @@ class Brain:
         model, once. The load runs in the background, since a backend that
         takes a minute to load must not hold the node's start; searches are
         refused as still loading until it ends."""
-        self.perceiver.start_loading(self.params.perception_model)
+        self.perceiver.start_loading(self.params.perception_model, self.params.perception_gallery)
         await self.manipulator.start(self.robot)
 
     def background(self, token) -> list[asyncio.Task]:
@@ -81,6 +81,13 @@ class Brain:
         await self.sequencer.stop(MANIPULATION, "aborted: the node is shutting down")
         await self.sequencer.stop(PERCEPTION, "aborted: the node is shutting down")
         await self.robot.stop()
+
+    def manipulator_or_refuse(self) -> Manipulator:
+        """The manipulation backend, or the refusal every sequence gets
+        when the launcher selected none."""
+        if not self.manipulator.available:
+            raise Refusal(f"no manipulation backend: manipulation_backend is '{self.manipulator.name}'")
+        return self.manipulator
 
     async def _stop_lane(self, lane: str) -> None:
         if lane == MANIPULATION:

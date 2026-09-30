@@ -14,11 +14,10 @@ async def run(brain, ctx) -> None:
     async def body(job) -> dict:
         state = brain.state
         gripper = state.holder(goal.gripper_name)
-        if not brain.manipulator.available:
-            raise Refusal(f"no manipulation backend: manipulation_backend is '{brain.manipulator.name}'")
+        manipulator = brain.manipulator_or_refuse()
         orientation = tuple(goal.orientation) if goal.orientation is not None else None
         pose = Pose(tuple(goal.position), orientation)
-        outcome = await brain.manipulator.place(gripper, pose, job.cancel)
+        outcome = await manipulator.place(gripper, pose, job.cancel)
         job.cancel.check()
         if not outcome.success:
             raise Refusal(outcome.message or "the placement failed")
