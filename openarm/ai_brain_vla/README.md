@@ -10,30 +10,51 @@ and no code changes.
 
 | `perception_backend` | what it is | needs | per frame |
 |---|---|---|---|
-| `sam3_siglip` | SAM 3 finds what is in view, SigLIP names each box by words: a general vocabulary for a scan, the searched words for identify | GPU | about 1 s a scan on an A10, about 2 s on a Jetson Thor |
+| `sam3_siglip` | SAM 3 finds what is in view, SigLIP names each box by words: a general vocabulary for a scan, the searched words for identify | GPU, network for its first load on a machine | about 1 s a scan on an A10, about 2 s on a Jetson Thor |
 | `gemini_er` | Gemini Robotics-ER over Google's API, words only | network, `GEMINI_API_KEY` | about 2 s a question |
 | `none` | no model: every search refused with "no perception source" | | |
 
 `sam3_siglip` is the robot's backend. It needs no data but its two models'
-weights, which the node image carries: the node ships no pictures of items and
-fetches nothing when it starts, so what a scan reports is whatever SigLIP can
+weights, which the node downloads at its first load on a machine: the node
+ships no pictures of items, so what a scan reports is whatever SigLIP can
 name, not a list someone enrolled. `gemini_er` is the words-only remote
 backend meant for the router node.
 
 ## The models' weights
 
-The node image carries the weights of SAM 3 and SigLIP, about 7 GB. The build
-of the image fetches them from the Hugging Face Hub, each model at the
-revision `perception/weights.py` pins (`apptainer.def` runs
-`python -m openarm_ai_brain_vla.perception.weights fetch`), and a load reads
-them from the image with no network. So a start of the node downloads
-nothing, a node stopped while it loads leaves nothing on the machine, and
-every image built from one commit of the node carries the same files.
+The weights of SAM 3 and SigLIP, about 7 GB, are not in the node image. A
+node whose launch selects `sam3_siglip` downloads them from the Hugging Face
+Hub at its first load on a machine and keeps them in
+`~/.cache/openarm_ai_brain_vla/weights` of the daemon user, which stays when
+the image is built again. A launch with another backend downloads nothing.
+`OPENARM_AI_BRAIN_VLA_WEIGHTS`, exported in the shell that launches, names
+another directory the container can see.
+
+`perception/weights.py` pins each model to one commit of its repository and
+each of its files to a size and a SHA-256. A file takes its name only when
+its content is the pinned one, and a model's directory takes its name only
+when it holds every file. So a load reads a whole, checked model or none, and
+a load that finds the models uses no network.
+
+A node can be stopped at any point of the download: it leaves at most one
+partial file for each file of a model, and the next start continues each from
+its last byte. While the download runs the node's log has a line for each
+tenth of a file, and searches are refused as "still loading". A download
+that cannot go on (no network, no room on the disk, bytes that are not the
+pinned ones) fails the load with the reason, and the next start of the node
+continues it. Two nodes on one machine do not download the weights twice: the
+second waits for the first.
+
+From the node's directory,
+`uv run --locked python -m openarm_ai_brain_vla.perception.weights fetch [directory]`
+downloads both models with no launch. A robot with no network takes a copy of
+that directory from a machine that has one.
 
 SAM 3 comes from `jetjodh/sam3`, a mirror of the official `facebook/sam3`,
 which is gated behind a licence click-through; the pinned revision carries
 the same files, each with the same content hash. `perception_model` names a
-directory holding other SAM 3 weights.
+directory holding other SAM 3 weights, and the pinned SAM 3 is then not
+downloaded.
 
 ## How `sam3_siglip` names what it finds
 
@@ -75,9 +96,9 @@ the wait and another call.
 - `perception_backend`: above.
 - `perception_model`: the model the backend loads; empty is its default. For
   `sam3_siglip` a directory the container can see holding other SAM 3
-  weights, as transformers saves a model, empty being the weights the image
-  carries; a name that is not a directory fails the load, and nothing is
-  fetched. For `gemini_er` the model id.
+  weights, as transformers saves a model, empty being the pinned weights the
+  node downloads; a name that is not a directory fails the load before
+  anything is downloaded. For `gemini_er` the model id.
 - `perception_gallery`: the enrolment gallery of `sam3_siglip`, above; empty
   is none. The other backends refuse to load with one.
 - `perception_confidence`: the confidence a detection is kept at, 0 for the
@@ -160,9 +181,9 @@ keeps its items in memory only.
 What the machine needs: an NVIDIA GPU with 12 GB free (SAM 3 and SigLIP take
 about 6 GB, Waldo the rest), peppy 0.31 or later with `nodes-hub` and
 `launchers-hub` registered, network for the first launch (the container build
-fetches torch, the model libraries and about 7 GB of weights from Hugging
-Face), and Chrome for Waldo's viewer. Nothing else: no dataset, no gallery,
-no key unless Gemini is tried.
+fetches torch and the model libraries, and the brain's first load downloads
+about 7 GB of weights from Hugging Face), and Chrome for Waldo's viewer.
+Nothing else: no dataset, no gallery, no key unless Gemini is tried.
 
 ### 1. Register the hubs
 
@@ -183,11 +204,12 @@ robots at `http://127.0.0.1:8900/robot_control/v1/mcp`
 moves) and the world at `http://127.0.0.1:8902/simulation/v1/mcp`
 (`scene.spawn_object`, `scene.remove_object`, `scene.get_assets_list`). The
 viewer is at `https://127.0.0.1:8080` (self-signed certificate). The first
-launch builds the brain's container, about ten minutes and the time the link
-takes for the weights; at every start the brain then loads its models in the
-background for about a minute and refuses searches as "still loading" until
-it is ready. Its log is `~/.peppy/logs/run/alpha_brain_inst.log`,
-and two lines there say it is set: the camera's answer, `[brain] camera
+launch builds the brain's container, about ten minutes, and the brain's first
+load on the machine then downloads the weights, as long as the link takes for
+7 GB. At every start the brain loads its models in the background for about a
+minute and refuses searches as "still loading" until it is ready. Its log is
+`~/.peppy/logs/run/alpha_brain_inst.log`: it says how far a download is,
+and two lines there say the brain is set: the camera's answer, `[brain] camera
 geometry: 1280x720 fx 738.1 fy 738.1 cx 639.5 cy 359.5 none`, and the backend's,
 `[brain] sam3_siglip: a vocabulary of 1198 names, no enrolment gallery, on
 cuda`.
@@ -295,8 +317,6 @@ a more general name of the same thing ("bottle" for "alsace wine bottle",
 library: the core and the handlers against fakes, the backends around their
 models, and the whole node over the wire under the generated harness, its
 camera and backbone mocked. `tests/test_sam3_siglip_models.py` runs the real
-models where torch, the extras, a GPU and the staged weights are present, and
-skips elsewhere. Outside the image,
-`python -m openarm_ai_brain_vla.perception.weights fetch <directory>` stages
-the weights, and `OPENARM_AI_BRAIN_VLA_WEIGHTS` names that directory to the
-node.
+models where torch, the extras, a GPU and the weights are present, and skips
+elsewhere: it downloads nothing, and the `fetch` command above puts the
+weights where it reads them.

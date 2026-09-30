@@ -30,7 +30,7 @@ from openarm_ai_brain_vla.perception.sam3_siglip import (
 )
 from test_gallery import write_harvest
 
-# Every load reads the models from where they are staged.
+# Every load finds the models' weights on the machine.
 pytestmark = pytest.mark.usefixtures("staged_weights")
 
 VOCABULARY = ("cup", "banana")
@@ -238,40 +238,64 @@ def test_a_scan_names_what_it_finds_by_the_vocabulary():
     assert detector._models.texts == texts
 
 
-def test_the_models_are_built_from_the_staged_weights(staged_weights):
+def test_the_models_are_built_from_the_weights_on_the_machine(staged_weights, no_network):
     detector = Sam3SiglipDetector(models_factory=FakeModels, vocabulary=VOCABULARY)
     detector.load("", "")
     assert detector._models.sam3_directory == staged_weights / weights.SAM3.directory_name
     assert detector._models.siglip_directory == staged_weights / weights.SIGLIP.directory_name
 
 
-def test_other_sam3_weights_come_from_the_directory_the_model_parameter_names(tmp_path, staged_weights):
+@pytest.fixture
+def staging(monkeypatch):
+    """Stands in for the download: records each model a load asks for and
+    the directory it asks for it in, and names the model's directory."""
+    asked = []
+
+    def stage(source, directory):
+        asked.append((source, directory))
+        return directory / source.directory_name
+
+    monkeypatch.setattr(weights, "stage", stage)
+    return asked
+
+
+def test_a_load_asks_for_both_models_in_the_directory_the_node_keeps_its_weights_in(staged_weights, staging):
+    detector = Sam3SiglipDetector(models_factory=FakeModels, vocabulary=VOCABULARY)
+    detector.load("", "")
+    assert staging == [(weights.SAM3, staged_weights), (weights.SIGLIP, staged_weights)]
+    assert detector._models.sam3_directory == staged_weights / weights.SAM3.directory_name
+    assert detector._models.siglip_directory == staged_weights / weights.SIGLIP.directory_name
+
+
+def test_other_sam3_weights_come_from_the_directory_the_model_parameter_names(tmp_path, staged_weights, staging):
     other = tmp_path / "other_sam3"
     other.mkdir()
     detector = Sam3SiglipDetector(models_factory=FakeModels, vocabulary=VOCABULARY)
     detector.load(f" {other} ", "")
+    # The pinned SAM 3 is not asked for: a launch that names its own SAM 3
+    # does not download the other.
+    assert staging == [(weights.SIGLIP, staged_weights)]
     assert detector._models.sam3_directory == other
     assert detector._models.siglip_directory == staged_weights / weights.SIGLIP.directory_name
 
 
-def test_a_repository_is_not_a_model_directory_and_nothing_is_fetched(no_network):
+def test_a_repository_is_not_a_model_directory_and_nothing_is_downloaded(staging):
     made = []
     detector = Sam3SiglipDetector(models_factory=lambda *directories: made.append(directories), vocabulary=VOCABULARY)
     with pytest.raises(ValueError, match="perception_model facebook/sam3 is not a directory the node can see"):
         detector.load("facebook/sam3", "")
-    assert not detector.available and made == []
+    assert not detector.available and made == [] and staging == []
 
 
-def test_weights_that_are_not_staged_fail_the_load_before_the_models(tmp_path, monkeypatch, no_network):
+def test_weights_that_cannot_be_downloaded_fail_the_load_before_the_models(monkeypatch):
+    def stage(source, directory):
+        raise weights.WeightsError(f"the download of {source.repository} stopped")
+
+    monkeypatch.setattr(weights, "stage", stage)
     made = []
     detector = Sam3SiglipDetector(models_factory=lambda *directories: made.append(directories), vocabulary=VOCABULARY)
-    monkeypatch.setenv(weights.WEIGHTS_DIRECTORY_VARIABLE, str(tmp_path / "nothing_staged"))
-    with pytest.raises(FileNotFoundError, match="the weights of jetjodh/sam3 are not staged at"):
+    with pytest.raises(weights.WeightsError, match="the download of jetjodh/sam3 stopped"):
         detector.load("", "")
-    # SigLIP's weights are read from where they are staged whatever
-    # directory SAM 3's come from.
-    with pytest.raises(FileNotFoundError, match="the weights of google/siglip-so400m-patch14-384 are not staged at"):
-        detector.load(str(tmp_path), "")
     assert not detector.available and made == []
 
 
@@ -348,10 +372,10 @@ def test_a_search_does_not_return_what_looks_more_like_another_name():
     assert detected(detector, ["mug"]) == [("mug", 0.9)]
 
 
-def test_the_backend_downloads_nothing(tmp_path, no_network):
-    """A load and its searches reach for no network: the models' weights
-    are staged, the vocabulary ships in the node, and a gallery is a
-    directory the launch names."""
+def test_the_backend_downloads_nothing_but_weights_the_machine_lacks(tmp_path, no_network):
+    """A load and its searches reach for no network when the models'
+    weights are on the machine: the vocabulary ships in the node, and a
+    gallery is a directory the launch names."""
     assert len(load_vocabulary()) == 1198
     detector = Sam3SiglipDetector(models_factory=FakeModels, vocabulary=VOCABULARY)
     detector.load("", str(write_harvest(tmp_path / "g")))

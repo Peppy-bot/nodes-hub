@@ -88,14 +88,16 @@
       // see. A launcher selects a model per launch without a code change.
       // "sam3_siglip" is the local pipeline (SAM 3 finds, SigLIP names by
       // words from a general vocabulary; about 1 s a scan on an A10, about
-      // 2 s on a Jetson Thor); "gemini_er" the remote one (Gemini
-      // Robotics-ER over Google's API: no GPU, words alone; needs the
-      // network and a key, and bills and waits per question).
+      // 2 s on a Jetson Thor; its first load on a machine downloads about
+      // 7 GB of weights into the daemon user's home); "gemini_er" the
+      // remote one (Gemini Robotics-ER over Google's API: no GPU, words
+      // alone; needs the network and a key, and bills and waits per
+      // question).
       perception_backend: { $type: "string", $default: "none" },
       // The identifier of the model the perception backend loads; empty is
       // the backend's default. For "sam3_siglip" it is a directory the
       // container can see holding other SAM 3 weights, as transformers saves
-      // a model; empty is the weights the node image carries. For
+      // a model; empty is the pinned weights the node downloads. For
       // "gemini_er" it is the model id, "gemini-robotics-er-2-preview" when
       // empty; the API key is not a parameter: it is read from
       // GEMINI_API_KEY in the node's environment (`peppy stack launch`

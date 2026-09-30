@@ -15,7 +15,8 @@ from ..ports import Detector
 REGISTRY: dict[str, str] = {
     "none": "openarm_ai_brain_vla.perception.none:NoneDetector",
     # SAM 3 to find and SigLIP to name, by words from a general vocabulary.
-    # Needs the sam3-siglip extra, its weights staged (weights.py) and a GPU.
+    # Needs the sam3-siglip extra and a GPU, and downloads its weights
+    # (weights.py) at the first load on a machine.
     "sam3_siglip": "openarm_ai_brain_vla.perception.sam3_siglip:Sam3SiglipDetector",
     # Gemini Robotics-ER over Google's API: no GPU, a key and
     # the network. Needs the gemini extra.

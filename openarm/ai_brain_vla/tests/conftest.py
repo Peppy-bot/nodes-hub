@@ -52,18 +52,14 @@ def no_network(monkeypatch):
     monkeypatch.setattr(socket.socket, "connect", refuse)
 
 
-def fake_download(source: weights.Source, directory) -> None:
-    """Stands in for the Hub: one small file per model, naming where the
-    model comes from."""
-    (directory / "config.json").write_text(f"{source.repository}@{source.revision}")
-
-
 @pytest.fixture
 def staged_weights(tmp_path, monkeypatch):
-    """The two models staged in a directory of the test's own, which the
-    node is told to read them from, as the node image does."""
+    """The two models on the machine: a directory of the test's own, which
+    the node is told to keep its weights in, holds the directory of each
+    model, so a load downloads nothing."""
     directory = tmp_path / "weights"
-    weights.fetch(directory, download=fake_download)
+    for source in weights.SOURCES:
+        (directory / source.directory_name).mkdir(parents=True)
     monkeypatch.setenv(weights.WEIGHTS_DIRECTORY_VARIABLE, str(directory))
     return directory
 

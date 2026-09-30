@@ -858,7 +858,6 @@ gemini = [
     { name = "google-genai" },
 ]
 sam3-siglip = [
-    { name = "huggingface-hub" },
     { name = "protobuf" },
     { name = "sentencepiece" },
     { name = "torch" },
@@ -875,7 +874,6 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "google-genai", marker = "extra == 'gemini'", specifier = ">=2.25,<3" },
-    { name = "huggingface-hub", marker = "extra == 'sam3-siglip'", specifier = ">=1.32,<2" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "peppygen", directory = ".peppy/libs/peppygen" },
     { name = "peppylib", directory = ".peppy/libs/peppylib" },

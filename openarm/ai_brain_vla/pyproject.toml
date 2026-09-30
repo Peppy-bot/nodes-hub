@@ -25,9 +25,6 @@ sam3-siglip = [
     # SAM 3's image processor is built on torchvision's transforms.
     "torchvision>=0.22",
     "transformers>=5.17,<5.18",
-    # Fetches the two models' weights from the Hub when the image is built
-    # (perception/weights.py).
-    "huggingface-hub>=1.32,<2",
     # SigLIP's tokenizer.
     "sentencepiece>=0.2",
     "protobuf>=5",

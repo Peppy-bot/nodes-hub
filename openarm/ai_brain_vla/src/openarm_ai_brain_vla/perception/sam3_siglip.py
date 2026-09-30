@@ -3,8 +3,8 @@
 SAM 3 proposes the objects in a frame and SigLIP names each crop by words.
 The node ships no pictures of items, so what a scan reports is whatever
 SigLIP can name, not a list someone enrolled. The two models' weights are
-staged in the node image at build (weights.py): a load reads them from
-there, and the backend fetches nothing.
+kept on the machine (weights.py): the first load there downloads them, and
+a load that finds them reads no network.
 
 - A scan prompts SAM 3 with the one word "object" and names every crop by
   the nearest of the scan vocabulary (`vocabulary.txt`, the LVIS v1 category
@@ -22,7 +22,7 @@ there, and the backend fetches nothing.
   with the item's name added to SAM 3's prompt, the core picking the item
   by name afterwards.
 - `perception_model` names a directory the container can see holding other
-  SAM 3 weights, as transformers saves a model; empty is the staged ones.
+  SAM 3 weights, as transformers saves a model; empty is the pinned ones.
 
 A search keeps its deadline between its three stages: before SAM 3
 proposes, before SigLIP embeds the crops, and before the crops are named.
@@ -325,14 +325,14 @@ def text_table(models: "Models", labels: Sequence[str]) -> np.ndarray:
     return np.concatenate([models.embed_texts(phrases[i : i + TEXT_BATCH]) for i in range(0, len(phrases), TEXT_BATCH)])
 
 
-def sam3_weights(model: str) -> Path:
-    """The directory SAM 3's weights are read from: the one
-    `perception_model` names, else the staged one. Raises ValueError when
-    the parameter names something that is not a directory: a repository on
-    the Hub is not fetched."""
+def other_sam3_weights(model: str) -> Optional[Path]:
+    """The directory of other SAM 3 weights that `perception_model` names,
+    None when it names none. Raises ValueError when the parameter names
+    something that is not a directory: only the pinned weights are
+    downloaded."""
     name = model.strip()
     if not name:
-        return weights.staged(weights.SAM3)
+        return None
     directory = Path(name).expanduser()
     if not directory.is_dir():
         raise ValueError(f"perception_model {directory} is not a directory the node can see")
@@ -427,17 +427,20 @@ class Sam3SiglipDetector:
 
     def load(self, model: str, gallery: str) -> None:
         """Reads the enrolment gallery `gallery` names, if any, then loads
-        the two models from their staged weights, SAM 3 from the directory
-        `model` names when that is set, and embeds the scan vocabulary and
-        the enrolled items' crops. A named gallery that cannot be read and
-        weights that are not where they are read from fail the load with
-        the reason, before the models take their minute; so do models that
-        cannot be loaded."""
+        the two models from their weights on the machine, which it downloads
+        first when they are not there, SAM 3 from the directory `model`
+        names when that is set, and embeds the scan vocabulary and the
+        enrolled items' crops. A named gallery that cannot be read and a
+        `model` that is not a directory fail the load with the reason,
+        before anything is downloaded; so do weights that cannot be
+        downloaded and models that cannot be loaded."""
         from PIL import Image
 
         enrolment = load_gallery(gallery)
-        sam3_directory = sam3_weights(model)
-        siglip_directory = weights.staged(weights.SIGLIP)
+        other_sam3 = other_sam3_weights(model)
+        directory = weights.node_directory()
+        sam3_directory = other_sam3 or weights.stage(weights.SAM3, directory)
+        siglip_directory = weights.stage(weights.SIGLIP, directory)
         try:
             models = self._models_factory(sam3_directory, siglip_directory)
         except ImportError as error:
