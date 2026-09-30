@@ -117,13 +117,13 @@ def test_an_identify_search_refreshes_without_dropping_the_rest():
 
 def test_a_search_under_other_words_keeps_the_scans_id_and_label():
     state = make_state()
-    gallery_scan = Coverage(frozenset({"mustard bottle", "apple"}))
-    scanned = state.remember([Detection("mustard bottle", (0.5, 0.0, 0.7), 0.9)], now_ns=1, coverage=gallery_scan)[0]
+    vocabulary_scan = Coverage(frozenset({"mustard bottle", "apple"}))
+    scanned = state.remember([Detection("mustard bottle", (0.5, 0.0, 0.7), 0.9)], now_ns=1, coverage=vocabulary_scan)[0]
     # The words route labels the same bottle with the caller's description.
     found = state.remember([Detection("yellow bottle", (0.51, 0.0, 0.7), 0.96)], now_ns=2, coverage=NOTHING)[0]
     assert found.item_id == scanned.item_id == "mustard_bottle_1-t0"
     assert found.label == "mustard bottle"
-    rescanned = state.remember([Detection("mustard bottle", (0.5, 0.0, 0.7), 0.9)], now_ns=3, coverage=gallery_scan)[0]
+    rescanned = state.remember([Detection("mustard bottle", (0.5, 0.0, 0.7), 0.9)], now_ns=3, coverage=vocabulary_scan)[0]
     assert rescanned.item_id == "mustard_bottle_1-t0"
     assert set(state.items) == {"mustard_bottle_1-t0"}
 
@@ -157,12 +157,12 @@ def test_items_sharing_a_place_keep_their_own_ids():
 
 def test_a_scan_drops_only_the_unseen_items_it_could_name():
     state = make_state()
-    gallery_scan = Coverage(frozenset({"cup", "bowl"}))
-    state.remember([Detection("cup", (0.5, 0.1, 0.7), 0.9)], now_ns=1, coverage=gallery_scan)
-    # Only the words route finds a blue ball: the gallery does not know it.
+    vocabulary_scan = Coverage(frozenset({"cup", "bowl"}))
+    state.remember([Detection("cup", (0.5, 0.1, 0.7), 0.9)], now_ns=1, coverage=vocabulary_scan)
+    # Only the words route finds a blue ball: the scan's vocabulary has no such name.
     state.remember([Detection("blue ball", (0.4, -0.1, 0.7), 0.9)], now_ns=2, coverage=NOTHING)
     assert set(state.items) == {"cup_1-t0", "blue_ball_1-t0"}
-    state.remember([], now_ns=3, coverage=gallery_scan)
+    state.remember([], now_ns=3, coverage=vocabulary_scan)
     assert set(state.items) == {"blue_ball_1-t0"}
     state.remember([], now_ns=4, coverage=EVERY)
     assert state.items == {}

@@ -8,46 +8,45 @@ and no code changes.
 
 ## Perception backends
 
-| `perception_backend` | what it is | needs | identify correct (Waldo frames) | wrong item | phantom | per frame |
-|---|---|---|---|---|---|---|
-| `sam3_siglip` | SAM 3 finds, SigLIP names against the gallery's prototypes; words for anything not enrolled | GPU, the gallery | 88.3% | 1.6% | 0.3% | about 1 s |
-| `yoloe_vp` | YOLOE-11M with the gallery's frames as visual prompts, the 28 YCB items only | GPU, the gallery | 80.1% | 3.9% | 9.1% | 20 ms |
-| `gemini_er` | Gemini Robotics-ER over Google's API, words only | network, `GEMINI_API_KEY` | 76.5% (study, at low thinking; the node asks at medium) | 1.3% | 2.2% | about 2 s a question |
-| `none` | no model: every search refused with "no perception source" | | | | | |
+| `perception_backend` | what it is | needs | per frame |
+|---|---|---|---|
+| `sam3_siglip` | SAM 3 finds what is in view, SigLIP names each box by words: a general vocabulary for a scan, the searched words for identify | GPU | about 2 s a scan on a Jetson Thor |
+| `gemini_er` | Gemini Robotics-ER over Google's API, words only | network, `GEMINI_API_KEY` | about 2 s a question |
+| `none` | no model: every search refused with "no perception source" | | |
 
-The numbers are the study scorer's on its 90 Waldo camera frames
-(`yolo_world_eval`), identify_item at the default threshold. `sam3_siglip` is
-the robot's backend: it works from the whole gallery with nothing configured per
-run, drops a box that resembles nothing enrolled (background rows and a
-similarity floor), and finds an unenrolled item by its description. `yoloe_vp`
-is the real-time option for a known, small set of items: its accuracy falls as
-its table grows (68% with 117 rows), so it is kept to the YCB items, and on the
-live simulated table it found the sugar box but missed the apple and named robot
-parts as tools; see the module docstring. It is kept as the measured real-time
-comparison, not as the robot's backend. `gemini_er` is the words-only remote
-backend meant for the router node.
+`sam3_siglip` is the robot's backend. It needs no data but its two models'
+weights: the node ships no pictures of items and fetches none, so what a scan
+reports is whatever SigLIP can name, not a list someone enrolled.
+`gemini_er` is the words-only remote backend meant for the router node.
 
-## The gallery
+## How `sam3_siglip` names what it finds
 
-`gallery_url` names one immutable release of the gallery pack, a lock file
-whose files are fetched once into `~/.cache/openarm_ai_brain_vla/galleries/<digest>/`
-of the daemon user and checked against their sizes and hashes. Release 2 holds
-117 objects of the Waldo catalogue plus three background classes (robot arm,
-robot gripper, empty floor), their SigLIP prototypes, 2,950 reference crops and
-the 900 frames they were cut from. A new release is a new prefix behind the
-same lock URL; the node picks it up on its next start.
-
-`perception_model` overrides the gallery with a directory (an unpacked release,
-or a harvester dataset with `manifest.json`, `classes.txt`, `prompts.txt`), or
-with `none` for no gallery at all. Without a gallery `sam3_siglip` runs by words
-alone; `yoloe_vp` refuses its searches and the rest of the node serves on.
+- **A scan** prompts SAM 3 with the one word "object" and names every box by
+  the nearest name of the scan vocabulary, the 1,198 LVIS v1 category names in
+  `perception/vocabulary.txt`, by SigLIP's image-to-text similarity. A box
+  nearer a background phrase (an empty table, the robot's own arm or gripper)
+  than any name is dropped. The labels are general: "can", "mug", "wrench",
+  "laptop computer".
+- **An identify search** prompts SAM 3 with the description and returns a box
+  that resembles the described words more than the background phrases and
+  nearly as much as the vocabulary's nearest name, so a bowl is not returned
+  for "mug". Its label is the description.
+- **An enrolment gallery**, optional, gives particular items their own names.
+  `perception_model` names it: a directory the container can see holding a
+  release (`index.json` with the classes, their labels and crops, and
+  optionally their SigLIP prototypes) or a harvester dataset (`manifest.json`,
+  `classes.txt`, `prompts.txt`). A box that resembles an enrolled item's
+  pictures (cosine 0.80 or more to its prototype) takes the item's name before
+  the vocabulary's, and a description naming an enrolled item is searched the
+  scan's way with that name added to SAM 3's prompt. A directory that is not
+  a gallery fails the load, and every search is refused naming the reason.
 
 ## Parameters
 
-- `perception_backend`, `perception_model`, `gallery_url`: above.
-- `perception_confidence`: the confidence a gallery backend keeps a detection
-  at; 0 is the backend's own 0.25. With the background rows in the table the
-  pack's own re-check keeps 0.10 clean (91% of items found, 0.4% phantom).
+- `perception_backend`, `perception_model`: above.
+- `perception_confidence`: the confidence a detection is kept at, objectness
+  times naming probability; 0 is the backend's own 0.25. Lower finds more
+  items and more boxes on the robot's own body (measured below).
 - `manipulation_backend`: `none` ships; a scripted sequencer comes next.
 - `gripper_names`: the robot's grippers, in the order `get_state` reports them.
 - `camera_pose`: the camera model, below.
@@ -88,9 +87,10 @@ keeps its items in memory only.
   bowl.
 - **A scan drops only what it could name.** A known item that a scan does not
   see is dropped when the scan could have named it, never when a gripper holds
-  it. With `sam3_siglip` and `yoloe_vp` a scan names the gallery's items, so an
-  item found by words alone ("blue ball") keeps its id across scans; a
-  `gemini_er` scan names anything, so it drops every item it does not see.
+  it. A `sam3_siglip` scan names the names of its vocabulary (and an enrolment
+  gallery's items), so an item found by other words ("blue ball") keeps its id
+  across scans; a `gemini_er` scan names anything, so it drops every item it
+  does not see.
 - **An item that moves more than 5 cm gets a new id** at the next scan, and the
   old id is dropped. `place_item` is the exception: the item takes the pose it
   was put at, so its id stays. After `drop_item` the item keeps the position it
@@ -103,9 +103,8 @@ keeps its items in memory only.
 What the machine needs: an NVIDIA GPU with 12 GB free (SAM 3 and SigLIP take
 about 6 GB, Waldo the rest), peppy 0.31 or later, network on first start (the
 container build fetches torch and the model libraries, the first load fetches
-about 2 GB of weights from Hugging Face and GitHub and 54 MB of gallery from
-the pack's host), and Chrome for Waldo's viewer. Nothing else: no dataset, no
-gallery on disk, no key unless Gemini is tried.
+about 7 GB of weights from Hugging Face), and Chrome for Waldo's viewer.
+Nothing else: no dataset, no gallery, no key unless Gemini is tried.
 
 ### 1. Check out the branches and register them
 
@@ -122,9 +121,8 @@ peppy stack launch simulation_mcp --with alpha.ai_brain_vla
 ```
 
 Waldo, the v2 robot `alpha` driven over MCP with its rendered cameras, and the
-brain with `sam3_siglip` from the published gallery (verified on peppy 0.31.4:
-eighteen minutes on a fresh machine, most of it building the node images). Two
-endpoints come up on the machine's loopback: the robots at `http://127.0.0.1:8900/robot_control/v1/mcp`
+brain with `sam3_siglip`. Two endpoints come up on the machine's loopback: the
+robots at `http://127.0.0.1:8900/robot_control/v1/mcp`
 (`brain.scan_items`, `brain.identify_item`, `brain.grab_item`, the cameras, the
 moves) and the world at `http://127.0.0.1:8902/simulation/v1/mcp`
 (`scene.spawn_object`, `scene.remove_object`, `scene.get_assets_list`). The
@@ -134,8 +132,8 @@ its models in the background for about a minute and refuses searches as
 "still loading" until it is ready. Its log is `~/.peppy/logs/run/alpha_brain_inst.log`,
 and two lines there say it is set: the camera's answer, `[brain] camera
 geometry: 1280x720 fx 738.1 fy 738.1 cx 639.5 cy 359.5 none`, and the backend's,
-`[brain] sam3_siglip: 120 items from galleries/waldo_catalogue/<digest>,
-prototypes shipped with the pack, on cuda`.
+`[brain] sam3_siglip: a vocabulary of 1198 names, no enrolment gallery, on
+cuda`.
 
 ### 3. Drive it from an MCP client
 
@@ -176,13 +174,10 @@ claude -p "Tell me what robot alpha sees on the table, find the red apple on the
   --output-format stream-json --verbose
 ```
 
-With five textured objects spawned (a mustard bottle, a cracker box, a Poly
-Haven apple and lemon, a mug), the agent called robot.list, brain.scan_items,
-and brain.identify_item three times with the plain names "red apple", "mug"
-and "banana", not the sentence it was given, because the tool's description
-asks for the item's plain name. It reported the five items with positions
-within 3 cm of where they were spawned, the red apple at 0.96 and the mug at
-0.66, and "no banana", from the refusal. About $0.60 of API use per run.
+The agent calls robot.list, brain.scan_items and brain.identify_item with
+the plain names, not the sentence it was given, because the tool's
+description asks for the item's plain name, and reports the items with their
+positions and "no banana" from the refusal.
 
 ### 4. Switch the backend
 
@@ -196,44 +191,49 @@ peppy node run openarm_ai_brain_vla:v1 -i brain -b --clock simulation \
   gripper_names=left_gripper,right_gripper perception_backend=sam3_siglip
 ```
 
-`perception_backend=yoloe_vp` for the real-time table of the 28 YCB items;
 `perception_backend=gemini_er` with `GEMINI_API_KEY` exported in that shell;
-`perception_model=none` with `sam3_siglip` for the words-only mode, no gallery
-at all. A brain run this way is not on the MCP endpoint, so ask it through an
+`perception_model=/path/to/gallery` with `sam3_siglip` to enrol particular
+items. A brain run this way is not on the MCP endpoint, so ask it through an
 `item_perception:v1` consumer node.
 
 ### 5. What to expect
 
-- A scan lists the enrolled items on the table with positions within about
-  3 cm of where they were spawned, and nothing on the robot's own arms. Keep
-  the objects inside the chest camera's view, about x 0.3 to 0.7 and y within
-  0.25 of the centre line: a mug at y 0.27 was not seen until moved in.
-- Textured objects behave like the YCB ones: on the live table a mustard
-  bottle, a cracker box, a Poly Haven apple and lemon and a mug were all found,
-  identified at 0.66 to 0.98, and "yellow bottle" found the mustard bottle by
-  words at 0.96.
-- Identify by an enrolled name: about 1.3 s with `sam3_siglip`, 0.05 s with
-  `yoloe_vp`, about 2 s with `gemini_er`.
-- Identify by a description not in the gallery ("blue ball", "grey
-  cylinder"): found by `sam3_siglip` through its words route and by
-  `gemini_er`, refused by `yoloe_vp`, which names enrolled items only.
+- A scan lists what stands on the table under general names ("can", "mug",
+  "bottle", "wrench") with positions from the depth under each box. Keep the
+  objects inside the chest camera's view, about x 0.3 to 0.7 and y within
+  0.25 of the centre line.
+- The robot's own gripper, when it stands in the chest camera's view, can be
+  reported as an item ("handle", "clip"): about 0.40 such boxes a frame on the
+  frames measured below.
+- Identify by a plain name ("mustard bottle", "yellow bottle", "blue ball"):
+  about 2 s with `sam3_siglip`, about 2 s with `gemini_er`.
 - An item that is not on the table ("mug" when there is none, "keyboard"):
-  refused, `no item matches 'mug'`.
+  refused, `no item matches 'mug'`, for 95.3% of such searches below.
 - `perception_backend=none`: every search refused with `no perception source`.
-- The gallery route is taken only when every word of the description matches
-  an enrolled phrase, whole words; "blue ball" is a words search even though
-  "blue pen" is enrolled.
 
-Measured on the study's Waldo frames (`yolo_world_eval`, the same scorer as the
-study): `sam3_siglip` 88.3% of identify queries correct, 1.6% the wrong item,
-0.3% a box for an absent item, about 1 s a frame; `yoloe_vp` 80.1%, 3.9%, 9.1%,
-20 ms; `gemini_er` 76.5%, 1.3%, 2.2% in the study, at its low thinking level.
+### Measured
+
+On the 300 chest-camera frames of a Waldo harvest of the catalogue's table
+items (947 items at least 80% visible, each with its box; a box is right at
+IoU 0.5), at the default confidence:
+
+| | found | wrong item | box on nothing | nothing returned |
+|---|---|---|---|---|
+| scan | 77.2% of the items | | 0.40 boxes a frame, most on the robot's gripper | |
+| identify an item in view, by its catalogue name | 77.9% | 1.0% | 1.8% | 19.3% |
+| identify an item not in view | | | 4.7% returned something | 95.3% refused |
+
+At `perception_confidence` 0.15 a scan finds 90.0% of the items with 0.89
+boxes a frame on nothing. Common objects take their plain names; objects the
+vocabulary has no name for take the nearest it has (a Bunsen burner tripod is
+a "stool"). The searches use the catalogue's names. The check against the
+vocabulary refuses 81% of the searches that return nothing: the crop looks
+more like another name of the vocabulary than like the searched words, often
+a more general name of the same thing ("bottle" for "alsace wine bottle",
+"potato" for "sweet potato") and, for glassware, "cylinder".
 
 ## Tests
 
 `uv run --locked --with pytest pytest` runs the suite without any model
-library; the `*_models.py` files run the real models where torch, the extras
-and a GPU are present and skip elsewhere. The accuracy numbers above come from
-the perception study's own scorer (`yolo_world_eval`, September 2026) run over
-each backend loaded from the published pack, the same frames and the same
-scoring the study used for its candidates.
+library; `tests/test_sam3_siglip_models.py` runs the real models where torch,
+the extras and a GPU are present and skips elsewhere.

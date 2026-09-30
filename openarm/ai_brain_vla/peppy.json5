@@ -85,39 +85,31 @@
       // "none" runs no model: every search is refused with "no perception
       // source", which is what the contract asks for when the brain cannot
       // see. A launcher selects a model per launch without a code change.
-      // "sam3_siglip" is the accurate local pipeline (SAM 3 finds, SigLIP
-      // names against a gallery, about 2 s a frame on a GPU); "yoloe_vp"
-      // the real-time one (YOLOE-11M with the gallery's crops as visual
-      // prompts, about 20 ms, names enrolled items only); "gemini_er" the
-      // one that needs nothing set up (Gemini Robotics-ER over Google's
-      // API: no GPU, no gallery, words alone; needs the network and a key,
-      // and bills and waits per question).
+      // "sam3_siglip" is the local pipeline (SAM 3 finds, SigLIP names by
+      // words from a general vocabulary, about 1 s a frame on a GPU);
+      // "gemini_er" the remote one (Gemini Robotics-ER over Google's API:
+      // no GPU, words alone; needs the network and a key, and bills and
+      // waits per question).
       perception_backend: { $type: "string", $default: "none" },
       // The model identifier the perception backend loads (a weights name
       // or path); its meaning belongs to the backend. Empty is the
-      // backend's default. For "sam3_siglip" and "yoloe_vp" it overrides the
-      // gallery below with a directory the container can see: an unpacked
-      // release, or a harvester dataset (manifest.json, classes.txt,
-      // prompts.txt) whose crops are embedded at load; "none" is no gallery.
+      // backend's default. For "sam3_siglip" it names an enrolment gallery,
+      // a directory the container can see holding pictures of particular
+      // items, which then take their own names before the vocabulary's: a
+      // release (index.json) or a harvester dataset (manifest.json,
+      // classes.txt, prompts.txt). Empty or "none" is no gallery, and the
+      // node ships none.
       // For "gemini_er" it is the model id, "gemini-robotics-er-2-preview"
       // when empty; the API key is not a parameter: it is read from
       // GEMINI_API_KEY in the node's environment (`peppy stack launch`
       // forwards the launching shell's), else from
       // ~/.config/openarm_ai_brain_vla/gemini_api_key of the daemon user.
       perception_model: { $type: "string", $default: "" },
-      // The gallery the items are named from: the lock file of one
-      // immutable release of the gallery pack (126 items of the Waldo
-      // catalogue, their SigLIP prototypes and reference crops), fetched
-      // once into the daemon user's cache and checked against its sizes and
-      // hashes. The host is a development hostname; a custom domain
-      // replaces it here and nowhere else. Without it, or with it
-      // unreachable, sam3_siglip still runs, naming by words alone; yoloe_vp
-      // refuses its searches and the rest of the node serves on.
-      gallery_url: { $type: "string", $default: "https://pub-5099e5973ff5486bbad9e7c3b91f8279.r2.dev/galleries/waldo_catalogue/gallery.lock.json" },
-      // The confidence a gallery backend keeps a detection at, 0 for the
-      // backend's own (0.25, the study's). With the pack's background rows
-      // in the table its re-check keeps 0.10 clean, 91% of items found at
-      // 0.4% phantom boxes: the lever a demo pulls.
+      // The confidence sam3_siglip keeps a detection at, objectness times
+      // naming probability, 0 for the backend's own (0.25). Lower finds more
+      // items and more boxes on the robot's own body: on the Waldo frames
+      // the node's README measures, a scan finds 77.2% of the items at 0.25
+      // with 0.40 boxes a frame on nothing, and 90.0% at 0.15 with 0.89.
       perception_confidence: { $type: "f64", $default: 0.0 },
       // Which manipulation backend runs grab_item, drop_item and place_item.
       // "none" moves nothing: every sequence is refused with a message

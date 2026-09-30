@@ -53,17 +53,16 @@ class Perceiver:
             return f"no perception source: {self.camera_reason}"
         return ""
 
-    async def load(self, model: str, gallery: str = "") -> None:
-        """Loads the backend's model, and the gallery it names. A failure is
-        raised, and kept as the reason every search is refused with from
-        then on."""
+    async def load(self, model: str) -> None:
+        """Loads the backend's model. A failure is raised, and kept as the
+        reason every search is refused with from then on."""
         try:
-            await asyncio.to_thread(self.detector.load, model, gallery)
+            await asyncio.to_thread(self.detector.load, model)
         except Exception as error:
             self._load_error = f"perception_backend '{self.detector.name}' could not load {model!r}: {error}"
             raise
 
-    def start_loading(self, model: str, gallery: str = "") -> asyncio.Task:
+    def start_loading(self, model: str) -> asyncio.Task:
         """Begins the load in the background and returns its task. A backend
         that takes a minute to load must not hold the node's start: the node
         is healthy at once and refuses searches as still loading until the
@@ -71,7 +70,7 @@ class Perceiver:
 
         async def run() -> None:
             try:
-                await self.load(model, gallery)
+                await self.load(model)
             except Exception:
                 print(f"[brain] {self._load_error}")
 

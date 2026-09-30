@@ -1,77 +1,61 @@
 """SAM 3 to find, SigLIP to name: `perception_backend: "sam3_siglip"`.
 
-The most accurate pipeline of the September 2026 perception study
-(yolo_world_eval, candidate 1): 87% of identify_item queries correct on
-both simulators' cameras, 1 to 2% the wrong item, 1 to 2% phantom boxes,
-about 2 s a frame on an A10. SAM 3 is prompted with each item's name and
-returns every instance it finds; the boxes are pooled with the names SAM 3
-gave them thrown away, and each crop is named by its SigLIP embedding
-against prototypes, the mean embedding of the reference crops of each item
-in a gallery. Identity comes from what the items look like rather than
-from what they are called, which is what made this the most accurate.
+SAM 3 proposes the objects in a frame and SigLIP names each crop by words.
+The node ships no pictures of items and fetches nothing but the two models'
+weights, so what a scan reports is whatever SigLIP can name, not a list
+someone enrolled. The weights, the Hugging Face cache, must be visible
+inside the node's container; paths under the daemon user's home are.
 
-The gallery is the published pack `gallery_url` names, fetched once and
-cached (gallery_store.py): 126 items of the Waldo catalogue with a SigLIP
-prototype each already computed, so loading reads one small file instead of
-embedding 2,564 crops. `perception_model` can override it with a directory:
-an unpacked release, or a harvester dataset (`manifest.json` with boxes,
-`classes.txt`, `prompts.txt`) whose crops are embedded here. The models'
-weights, the Hugging Face cache, must be visible inside the node's
-container; paths under the daemon user's home are.
+- A scan prompts SAM 3 with the one word "object" and names every crop by
+  the nearest of the scan vocabulary (`vocabulary.txt`, the LVIS v1 category
+  names) and the background phrases, by SigLIP's image-to-text similarity; a
+  crop nearest a background phrase (an empty table, the robot's own arm) is
+  dropped.
+- A search for a description prompts SAM 3 with the description. A crop is
+  the described item when it resembles the words more than the background
+  phrases and at most `VOCABULARY_MARGIN` less than the vocabulary's nearest
+  name, so a bowl is not returned for "mug".
+- An enrolment gallery (gallery.py), named by `perception_model`, adds
+  pictures of particular items: a crop whose embedding is at
+  `SIMILARITY_FLOOR` or nearer an enrolled item's prototype takes that
+  item's name, and a description that names an enrolled item runs the scan
+  with the item's name added to SAM 3's prompt, the core picking the item
+  by name afterwards.
 
-SAM 3 is prompted with the one word "object", not with every item's name.
-Measured on the study's Waldo frames with its 28-item gallery, that scan
-found 90.6% of items against 87.0% for the 28 name prompts, missed 5.9%
-against 12.1%, named the wrong item for 3.6% against 1.0% and boxed an
-absent one for 4.6% against 1.2%, in 0.94 s a frame against 3.4 s; and the
-time no longer grows with the gallery, where 126 name prompts took 13 s. An
-identify search adds the names its description matches to that prompt, so
-the item asked for is proposed even where "object" would miss it.
+Measured on the 300 chest-camera frames of a Waldo harvest of the
+catalogue's table items (947 items with their boxes, a box right at IoU
+0.5), at the default confidence: a scan found 77.2% of the items with
+0.40 boxes a frame on nothing, most of them on the robot's own
+gripper; a search for an item in view by its catalogue name returned it for
+77.9%, another item for 1.0%, and nothing for 19.3%; a search
+for an item not in view returned something for 4.7%.
 
-The pack may carry background classes, pictures of the robot's own arm and
-gripper and of the empty floor, flagged `background` in its index. They sit
-in the prototype table so a box on the robot has something nearer than any
-item, and a box named as one of them is dropped: that is how a scan says
-"none of these". A description never matches a background class.
+SAM 3's objectness is its query score alone. Its presence score, SAM 3's
+own guess whether the prompt's concept is in the frame, refuses concepts
+its queries box well: on those frames it put "sugar box" at 0.03 over a box
+its query scored 0.89 at IoU 0.98, and multiplied in it left 37% of the
+searches for items in view with nothing. The vocabulary check takes its
+place against items that are not there: without it, a search for an item
+not in view returned something for 36%.
 
-`MIN_CONFIDENCE` is the study's threshold; the node's `perception_confidence`
-parameter overrides it per launch, since with background rows in the table
-the pack's own re-check keeps 0.10 clean (91% of items found, 0.4% phantom).
+SAM 3 is prompted with the one word "object" for a scan, not with names.
+Measured on the perception study's Waldo frames with a 28-item gallery,
+that scan found 90.6% of items against 87.0% for the 28 name prompts, in
+0.94 s a frame against 3.4 s, and its time does not grow with what it looks
+for.
 
-The softmax names every box after the nearest prototype however far it is,
-so a box on the robot that resembles no item still gets an item's name when
-no background row is nearer. `SIMILARITY_FLOOR` is the second "none of
-these": a box whose best cosine to any prototype is under it is dropped.
-Measured on the study's Waldo frames against the pack's 120 rows, boxes on a
-real item have a best cosine of 0.82 or more for 95% of them (median 0.94),
-phantom boxes a median of 0.80 and at most 0.86. At 0.80 the floor drops 25
-of 37 phantoms for 4 of 288 true items; at 0.83, 34 of 37 for 11 of 288. It
-applies to naming by picture only: image-to-text cosines run lower and the
-text route has its background phrases instead.
+`SIMILARITY_FLOOR` guards an enrolled name: the softmax names every crop
+after the nearest prototype however far it is. Measured on the study's
+Waldo frames against a 120-row gallery, boxes on a real item have a best
+cosine of 0.82 or more for 95% of them (median 0.94), phantom boxes a
+median of 0.80 and at most 0.86. At 0.80 the floor drops 25 of 37 phantoms
+for 4 of 288 true items. A crop under it is named by the vocabulary.
 
-The gallery is optional. Empty names the node's default pack, "none" no
-gallery; either that or a gallery that cannot be had (a pack the network
-does not give and the cache lacks, a directory that is not there) leaves
-the backend working by words alone: every search takes the text
-route below, and a scan looks for `DEFAULT_VOCABULARY`, a handful of
-generic table items, since without a gallery there is nothing else to look
-for. The reason the gallery is missing is logged and kept, never fatal.
-
-The settings are the study's: proposals at objectness 0.05, class-agnostic
-NMS at IoU 0.6, at most 40 a frame, crops grown by a tenth, SigLIP so400m in
-half precision, a softmax at temperature 100 over cosine similarities. A
-detection is kept at objectness times class probability of 0.25 and above,
-the confidence the study scored at.
-
-A scan looks for every item of the gallery. An identify search whose
-description names a gallery item runs that same scan and leaves the choice
-to the core: this is the search the study scored, and SAM 3 prompted with
-one name alone misses items it finds under another (a mug it boxes as a
-bowl, say), while naming against the whole gallery keeps the wrong item
-under the right name from being returned. A description the gallery does
-not know is searched open-vocabulary: SAM 3 is prompted with the
-description and each box is named by SigLIP between the description and a
-few background phrases, the study's text naming.
+The other settings are the study's: proposals at objectness 0.05,
+class-agnostic NMS at IoU 0.6, at most 40 a frame, crops grown by a tenth,
+SigLIP so400m in half precision, a softmax at temperature 100 over cosine
+similarities. A detection is kept at objectness times naming probability of
+0.25 and above.
 
 Everything around the models is plain numpy and tested without them; torch
 and transformers are imported by `load` alone, so selecting another backend
@@ -80,17 +64,16 @@ never imports them.
 
 from __future__ import annotations
 
-import json
 import logging
-import math
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
-from typing import Optional, Sequence, Union
+from typing import Optional, Sequence
 
 import numpy as np
 
 from ..ports import Box, Coverage
-from .gallery_store import CACHE_DIR, NO_GALLERY, GalleryUnavailable, HarvestDir, Pack, Source, phrase_for, resolve
+from .gallery import Crop, Gallery, load_gallery
 
 logger = logging.getLogger(__name__)
 
@@ -105,223 +88,85 @@ PROPOSAL_IOU = 0.6
 MAX_PROPOSALS = 40
 CROP_MARGIN = 0.1
 TEMPERATURE = 100.0
-GALLERY_MIN_VISIBLE = 0.8
 MIN_CONFIDENCE = 0.25
-# The least a crop may resemble its nearest prototype to be an item at all
-# (the module docstring has the measurement behind the value).
+# The least a crop may resemble its nearest enrolled prototype to take that
+# item's name (the module docstring has the measurement behind the value).
 SIMILARITY_FLOOR = 0.80
 # The narrowest crop sent to SigLIP. A crop one or three pixels on a side
 # reads to the image processor as a channel axis; a box that thin holds no
 # item anyway, so it is widened about its centre before cropping.
 MIN_CROP_PX = 8
-# What a crop is compared with beside a description the gallery does not
-# know, so a crop that looks like none of them is dropped rather than named.
-BACKGROUND_PHRASES = ("an empty table surface", "a white robot gripper", "a plain wooden board", "a blue wall")
-# What a scan looks for when there is no gallery to enumerate: generic
-# names of what stands on a robot's table, named by words.
-DEFAULT_VOCABULARY = ("cup", "mug", "bottle", "can", "box", "bowl", "plate", "fruit", "ball", "block", "tool", "toy")
-
-# Words a description carries that name nothing.
-STOPWORDS = frozenset({"a", "an", "the", "this", "that", "my", "some", "please", "me", "of", "it"})
-
-GALLERY_NAMING = "gallery"
-TEXT_NAMING = "text"
-# What SAM 3 is asked for when the search is for gallery items: one generic
-# prompt whose proposals are named against every prototype (see the module
-# docstring for the measurement).
+# What a crop is compared with beside the labels it may take, so a crop
+# that looks like none of them is dropped rather than named: the study's
+# four, and the robot's own arm and gripper, which stand in the chest
+# camera's view.
+BACKGROUND_PHRASES = (
+    "an empty table surface",
+    "a white robot gripper",
+    "a plain wooden board",
+    "a blue wall",
+    "a grey robot arm",
+    "a black robot gripper",
+    "a robot arm",
+    "part of a robot",
+)
+# How much less a crop may resemble the searched words than the nearest
+# name of the vocabulary and still be what was asked for (cosine).
+VOCABULARY_MARGIN = 0.03
+# The scan's vocabulary: the names a crop is named among by words.
+VOCABULARY_FILE = Path(__file__).with_name("vocabulary.txt")
+# Phrases a text embedding call takes at once: the vocabulary is a thousand.
+TEXT_BATCH = 256
+# What SAM 3 is asked for when the search is for everything in view: one
+# generic prompt (see the module docstring for the measurement).
 GENERIC_PROMPTS = ("object",)
 
 
-@dataclass(frozen=True)
-class Crop:
-    """One reference crop of a gallery item: an image and, when the image
-    is a whole frame, the box of the item in it; a pack's crops are the
-    whole image, box None."""
-
-    image: str
-    box: Optional[tuple[float, float, float, float]]
-    class_index: int
+def load_vocabulary(path: Path = VOCABULARY_FILE) -> tuple[str, ...]:
+    """The names in a vocabulary file: one a line, `#` lines are comments."""
+    lines = (line.strip() for line in path.read_text().splitlines())
+    return tuple(line for line in lines if line and not line.startswith("#"))
 
 
-@dataclass(frozen=True)
-class Gallery:
-    """The items the backend can name: their keys, their plain phrases, the
-    reference crops, and the prototypes when the source ships them."""
+class Route(Enum):
+    """The two ways a search names its boxes (see `plan_for`)."""
 
-    name: str
-    classes: tuple[str, ...]
-    phrases: tuple[str, ...]
-    crops: tuple[Crop, ...]
-    source: Source
-    prototypes: Optional[np.ndarray] = None
-    # Per class, whether it is background: named to be dropped, never asked for.
-    background: tuple[bool, ...] = ()
-    # Per class, the catalogue ids it stands for (a pack's `variants` and
-    # `catalogue_id`); empty for a harvester dataset.
-    variants: tuple[tuple[str, ...], ...] = ()
-
-    def is_background(self, index: int) -> bool:
-        return bool(self.background[index]) if index < len(self.background) else False
-
-    def item_indices(self) -> list[int]:
-        """The classes that are items: every class but the background ones."""
-        return [i for i in range(len(self.classes)) if not self.is_background(i)]
-
-    def index_of(self, description: str) -> list[int]:
-        """The gallery items a description names: those whose key or phrase
-        it is, else those whose phrase holds every word of it, whole words,
-        articles aside. Empty when none does, and a background class is
-        never one. Stricter than the core's own rule on purpose: with a
-        hundred names, "blue ball" must not become the gallery's "blue pen"
-        and lose the words route that would find it."""
-        wanted = description.strip().lower().replace("_", " ")
-        if not wanted:
-            return []
-        items = self.item_indices()
-        exact = [i for i in items if wanted in (self.classes[i].lower().replace("_", " "), self.phrases[i].lower())]
-        if exact:
-            return exact
-        words = {w for w in wanted.split() if w and w not in STOPWORDS}
-        if not words:
-            return []
-        return [i for i in items if words <= set(self.phrases[i].lower().split())]
-
-    def image_path(self, crop: Crop) -> Path:
-        """The local file of a crop's image, fetched first when the source
-        is a pack the cache lacks."""
-        if isinstance(self.source, Pack):
-            return self.source.file(crop.image)
-        return self.source.root / crop.image
-
-    def fetch_crops(self) -> None:
-        """Brings every crop image into the cache, in parallel, for a backend
-        that builds its class table from pictures."""
-        if isinstance(self.source, Pack):
-            self.source.files(sorted({c.image for c in self.crops}))
+    SCAN = "scan"
+    WORDS = "words"
 
 
 @dataclass(frozen=True)
 class Plan:
-    """What one search runs: the phrases SAM 3 is prompted with, and how the
-    boxes are named, against the gallery's prototypes or against the text of
-    the searched phrases."""
+    """What one search runs: the phrases SAM 3 is prompted with, the labels
+    a box is named among by words, and the route that names the boxes."""
 
     prompts: tuple[str, ...]
-    naming: str
     labels: tuple[str, ...]
+    route: Route
 
 
-def load_gallery(source: Union[Source, Path], min_visible: float = GALLERY_MIN_VISIBLE) -> Gallery:
-    """The gallery a source holds: a pack's index and prototypes, or a
-    harvester dataset's manifest and frames (a bare path is one)."""
-    if isinstance(source, Pack):
-        return load_pack(source)
-    root = source if isinstance(source, Path) else source.root
-    return load_harvest(root, min_visible)
-
-
-def load_pack(pack: Pack) -> Gallery:
-    """A release of the published pack: classes and their crops from
-    `index.json`, phrases from the labels, prototypes from the npz it names."""
-    index = pack.index()
-    classes = [str(c) for c in index.get("classes", [])]
-    objects = index.get("objects", {})
-    if not classes or not isinstance(objects, dict):
-        raise ValueError(f"gallery {pack.prefix}: index.json names no classes")
-    crops: list[Crop] = []
-    phrases: list[str] = []
-    background: list[bool] = []
-    variants: list[tuple[str, ...]] = []
-    for i, name in enumerate(classes):
-        entry = objects.get(name, {})
-        phrases.append(phrase_for(name, entry))
-        background.append(bool(entry.get("background", False)))
-        ids = [str(v) for v in entry.get("variants", []) if v] + ([str(entry["catalogue_id"])] if entry.get("catalogue_id") else [])
-        variants.append(tuple(dict.fromkeys(ids)))
-    frames = index.get("frames") or {}
-    manifest_path = str(frames.get("manifest", "")) if isinstance(frames, dict) else ""
-    if manifest_path and pack.has(manifest_path):
-        # The frames the crops were cut from, with their boxes: what a
-        # backend that builds its own table from pictures needs.
-        manifest = json.loads(pack.file(manifest_path).read_text())
-        index_of = {c: i for i, c in enumerate(classes)}
-        for record in manifest.get("images", []):
-            image = str(record["image"])
-            for obj in record.get("objects_on_table", []):
-                box = obj.get("bbox_xyxy_px")
-                if box and obj.get("visible_fraction", 0.0) >= GALLERY_MIN_VISIBLE and obj.get("class") in index_of:
-                    crops.append(Crop(image, tuple(float(v) for v in box), index_of[obj["class"]]))
-    else:
-        for i, name in enumerate(classes):
-            for path in objects.get(name, {}).get("crops", []):
-                crops.append(Crop(str(path), None, i))
-    prototypes = None
-    meta = index.get("prototypes") or {}
-    if isinstance(meta, dict) and meta.get("file") and pack.has(str(meta["file"])):
-        with np.load(pack.file(str(meta["file"]))) as z:
-            table = np.asarray(z["prototypes"], dtype=np.float32)
-        if table.shape[0] != len(classes):
-            raise ValueError(f"gallery {pack.prefix}: {table.shape[0]} prototypes for {len(classes)} classes")
-        prototypes = normalised(table)
-    return Gallery(pack.prefix, tuple(classes), tuple(phrases), tuple(crops), pack, prototypes, tuple(background), tuple(variants))
-
-
-def load_harvest(root: Path, min_visible: float = GALLERY_MIN_VISIBLE) -> Gallery:
-    """A harvester dataset under `root`, refused with the reason when it is not one."""
-    if not root.is_dir():
-        raise ValueError(f"{root} must be the gallery directory of a harvester dataset, and it does not exist")
-    manifest_path = root / "manifest.json"
-    if not manifest_path.is_file():
-        raise ValueError(f"gallery {root} has no manifest.json")
-    manifest = json.loads(manifest_path.read_text())
-    classes = _lines(root / "classes.txt") or [str(c) for c in manifest.get("classes", [])]
-    if not classes:
-        raise ValueError(f"gallery {root} names no items: classes.txt is missing or empty")
-    phrases = _lines(root / "prompts.txt") or [c.replace("_", " ") for c in classes]
-    if len(phrases) != len(classes):
-        raise ValueError(f"gallery {root}: prompts.txt has {len(phrases)} lines for {len(classes)} classes")
-    index_of = {c: i for i, c in enumerate(classes)}
-    crops: list[Crop] = []
-    for record in manifest.get("images", []):
-        image = str(record["image"])
-        for obj in record.get("objects_on_table", []):
-            box = obj.get("bbox_xyxy_px")
-            if not box or obj.get("visible_fraction", 0.0) < min_visible or obj.get("class") not in index_of:
-                continue
-            crops.append(Crop(image, tuple(float(v) for v in box), index_of[obj["class"]]))
-    missing = [c for c in classes if not any(cr.class_index == i for i, cr in ((index_of[c], cr) for cr in crops))]
-    if missing:
-        raise ValueError(f"gallery {root} has no crop at or above {min_visible:g} visible for {missing}")
-    return Gallery(str(root), tuple(classes), tuple(phrases), tuple(crops), HarvestDir(root), None, tuple(False for _ in classes))
-
-
-def _lines(path: Path) -> list[str]:
-    if not path.is_file():
-        return []
-    return [line.strip() for line in path.read_text().splitlines() if line.strip()]
-
-
-def plan_for(gallery: Optional[Gallery], phrases: Sequence[str]) -> Plan:
-    """The search for `phrases`. With a gallery, a scan prompts SAM 3 with
-    the generic prompt and names every box by prototype; an identify whose
-    description names gallery items adds their phrases to that prompt and
-    names the same way. Without a gallery, or for a description it does not
-    know, the phrases themselves (or the default vocabulary for a scan) are
-    prompted for and named by text."""
+def plan_for(gallery: Optional[Gallery], phrases: Sequence[str], vocabulary: Sequence[str]) -> Plan:
+    """The search for `phrases`. A scan, no phrases, takes the scan route:
+    SAM 3 is prompted with the generic prompt and every box is named by the
+    vocabulary, after an enrolled item's picture when there is a gallery. A
+    description that names enrolled items takes the same route with their
+    phrases added to the prompt, and the core picks the item by name
+    afterwards. Any other description takes the words route: SAM 3 is
+    prompted with the words, and a box is named by them when it resembles
+    them more than the background phrases and nearly as much as the
+    vocabulary's nearest name."""
     wanted = [p.strip() for p in phrases if p.strip()]
+    if not wanted:
+        return Plan(GENERIC_PROMPTS, tuple(vocabulary), Route.SCAN)
+    enrolled: list[str] = []
     if gallery is not None:
-        if not wanted:
-            return Plan(GENERIC_PROMPTS, GALLERY_NAMING, gallery.phrases)
-        matched: list[str] = []
         for phrase in wanted:
             for i in gallery.index_of(phrase):
-                if gallery.phrases[i] not in matched:
-                    matched.append(gallery.phrases[i])
-        if matched:
-            return Plan(GENERIC_PROMPTS + tuple(matched), GALLERY_NAMING, gallery.phrases)
-    if not wanted:
-        return Plan(DEFAULT_VOCABULARY, TEXT_NAMING, DEFAULT_VOCABULARY)
-    return Plan(tuple(wanted), TEXT_NAMING, tuple(wanted))
+                if gallery.phrases[i] not in enrolled:
+                    enrolled.append(gallery.phrases[i])
+    if enrolled:
+        return Plan(GENERIC_PROMPTS + tuple(enrolled), tuple(vocabulary), Route.SCAN)
+    return Plan(tuple(wanted), tuple(wanted), Route.WORDS)
 
 
 def class_agnostic_nms(boxes: np.ndarray, scores: np.ndarray, iou_threshold: float, max_keep: int) -> list[int]:
@@ -398,28 +243,92 @@ def normalised(vectors: np.ndarray) -> np.ndarray:
     return vectors / np.where(norms == 0.0, 1.0, norms)
 
 
+def name_by_words(embeddings: np.ndarray, table: np.ndarray, labels: Sequence[str]) -> tuple[list[Optional[str]], np.ndarray]:
+    """Per crop, the label it is nearest by words and the probability of
+    that choice. `table` holds the text embeddings of `labels` then of the
+    background phrases; a crop nearest a background phrase is named None."""
+    best, probability = name_by_prototypes(embeddings, table, TEMPERATURE)
+    return [labels[b] if b < len(labels) else None for b in best], probability
+
+
+def unlike_the_words(embeddings: np.ndarray, words_table: np.ndarray, vocabulary_table: np.ndarray, margin: float = VOCABULARY_MARGIN) -> np.ndarray:
+    """Per crop, whether it resembles the searched words (the first row of
+    `words_table`) less than the vocabulary's nearest name by more than
+    `margin`: a bowl found for "mug" looks more like a bowl than a mug."""
+    return embeddings @ words_table[0] < (embeddings @ vocabulary_table.T).max(axis=1) - margin
+
+
+def name_enrolled_first(
+    embeddings: np.ndarray,
+    prototypes: np.ndarray,
+    gallery: Gallery,
+    names: Sequence[Optional[str]],
+    probability: np.ndarray,
+) -> tuple[list[Optional[str]], np.ndarray]:
+    """The names by words with every crop that resembles an enrolled item
+    (its best cosine at `SIMILARITY_FLOOR` or above) renamed after that
+    item, or None when the item is a background class."""
+    best, enrolled_probability = name_by_prototypes(embeddings, prototypes, TEMPERATURE)
+    near = ~under_floor(embeddings, prototypes)
+    out_names, out_probability = list(names), probability.copy()
+    for i in np.flatnonzero(near):
+        out_names[i] = None if gallery.is_background(int(best[i])) else gallery.phrases[int(best[i])]
+        out_probability[i] = enrolled_probability[i]
+    return out_names, out_probability
+
+
 def detections_from(
     boxes: np.ndarray,
     objectness: np.ndarray,
-    best: np.ndarray,
+    names: Sequence[Optional[str]],
     probability: np.ndarray,
-    labels: Sequence[str],
     min_confidence: float = MIN_CONFIDENCE,
-    background: Sequence[bool] = (),
 ) -> list[Box]:
-    """The boxes named as one of `labels`, at objectness times class
-    probability of `min_confidence` and above. A box named beyond the
-    labels, as one of the background phrases, or as a label flagged
-    `background`, is dropped: that is the "none of these" answer."""
+    """The named boxes at objectness times naming probability of
+    `min_confidence` and above. A box named None, as background, is dropped:
+    that is the "none of these" answer."""
     out: list[Box] = []
-    for box, o, b, p in zip(boxes, objectness, best, probability):
-        if b >= len(labels) or (b < len(background) and background[b]):
+    for box, o, name, p in zip(boxes, objectness, names, probability):
+        if name is None:
             continue
         confidence = float(o) * float(p)
         if confidence < min_confidence:
             continue
-        out.append(Box(label=labels[int(b)], confidence=confidence, x0=float(box[0]), y0=float(box[1]), x1=float(box[2]), y1=float(box[3])))
+        out.append(Box(label=name, confidence=confidence, x0=float(box[0]), y0=float(box[1]), x1=float(box[2]), y1=float(box[3])))
     return out
+
+
+def embed_prototypes(gallery: Gallery, models: "Models") -> np.ndarray:
+    """One prototype per enrolled item: the mean SigLIP embedding of its
+    crops, each grown by a tenth when it is a box in a frame."""
+    from PIL import Image
+
+    sums: Optional[np.ndarray] = None
+    counts = np.zeros(len(gallery.classes), dtype=np.int64)
+    by_image: dict[str, list[Crop]] = {}
+    for crop in gallery.crops:
+        by_image.setdefault(crop.image, []).append(crop)
+    for crops in by_image.values():
+        with Image.open(gallery.image_path(crops[0])) as image:
+            image = image.convert("RGB")
+            pieces = [image.crop(grown(c.box, CROP_MARGIN, image.width, image.height)) if c.box else image for c in crops]
+            embeddings = models.embed_images(pieces)
+        if sums is None:
+            sums = np.zeros((len(gallery.classes), embeddings.shape[1]), dtype=np.float32)
+        for crop, embedding in zip(crops, embeddings):
+            sums[crop.class_index] += embedding
+            counts[crop.class_index] += 1
+    if sums is None or (counts == 0).any():
+        missing = [gallery.classes[i] for i in range(len(gallery.classes)) if counts[i] == 0]
+        raise ValueError(f"gallery {gallery.root} has no crop for {missing}")
+    return normalised(sums)
+
+
+def text_table(models: "Models", labels: Sequence[str]) -> np.ndarray:
+    """The text embeddings a crop is named against by words: `labels`, then
+    the background phrases."""
+    phrases = [f"a photo of a {p}" for p in labels] + [f"a photo of {b}" for b in BACKGROUND_PHRASES]
+    return np.concatenate([models.embed_texts(phrases[i : i + TEXT_BATCH]) for i in range(0, len(phrases), TEXT_BATCH)])
 
 
 class Models:
@@ -442,9 +351,12 @@ class Models:
 
     def propose(self, image, prompts: Sequence[str]) -> tuple[np.ndarray, np.ndarray]:
         """Every instance SAM 3 finds for any of `prompts`: boxes in pixels
-        and their objectness, the query logit times the presence logit, as
-        SAM 3's own post-processing scores them. The frame is encoded once
-        and the detector decoder runs once per prompt."""
+        and their objectness, the query score alone. SAM 3's presence score,
+        its own guess whether the prompt's concept is in the frame at all,
+        is left out: it refuses concepts its queries box well (the module
+        docstring has the measurement), and SigLIP decides what a box is.
+        The frame is encoded once and the detector decoder runs once per
+        prompt."""
         torch = self.torch
         width, height = image.size
         scale = np.array([width, height, width, height], dtype=np.float32)
@@ -458,8 +370,6 @@ class Models:
                     text = self._text_inputs[prompt] = self.sam3_processor(text=prompt, return_tensors="pt").to(self.device)
                 outputs = self.sam3(vision_embeds=vision, input_ids=text["input_ids"], attention_mask=text.get("attention_mask"))
                 score = outputs.pred_logits.sigmoid()[0]
-                if outputs.presence_logits is not None:
-                    score = score * outputs.presence_logits.sigmoid()[0]
                 boxes.append(outputs.pred_boxes[0].float().cpu().numpy() * scale)
                 scores.append(score.float().cpu().numpy())
         if not boxes:
@@ -488,17 +398,16 @@ class Models:
 class Sam3SiglipDetector:
     name = "sam3_siglip"
 
-    def __init__(self, models_factory=None, cache_dir: Path = CACHE_DIR) -> None:
-        self._gallery: Optional[Gallery] = None
-        self._models: Optional[Models] = None
-        self._prototypes: Optional[np.ndarray] = None
-        self._vocabulary: list[str] = []
-        self._text_prototypes: dict[tuple[str, ...], np.ndarray] = {}
+    def __init__(self, models_factory=None, vocabulary: Optional[Sequence[str]] = None) -> None:
         self._models_factory = models_factory or Models
-        # Where a fetched gallery pack is kept.
-        self._cache_dir = cache_dir
-        # Why there is no gallery, when there is none: "" with one.
-        self.gallery_reason = ""
+        # What a scan names a crop among by words.
+        self.scan_vocabulary: tuple[str, ...] = tuple(vocabulary) if vocabulary is not None else load_vocabulary()
+        self._models: Optional[Models] = None
+        self._gallery: Optional[Gallery] = None
+        self._prototypes: Optional[np.ndarray] = None
+        self._search: list[str] = []
+        # Text tables by the labels they name, the scan vocabulary's made at load.
+        self._text_tables: dict[tuple[str, ...], np.ndarray] = {}
         # The confidence a detection is kept at; the brain sets it from the
         # perception_confidence parameter before the load.
         self.min_confidence = MIN_CONFIDENCE
@@ -507,90 +416,47 @@ class Sam3SiglipDetector:
     def available(self) -> bool:
         return self._models is not None
 
-    def load(self, model: str, gallery: str = "") -> None:
-        """Loads the two models, then the gallery `model` or `gallery` names
-        and its prototypes. Models that cannot be loaded fail the load with
-        the reason; a gallery that cannot be had does not: the backend works
-        by words alone and says why in the log."""
+    def load(self, model: str) -> None:
+        """Reads the enrolment gallery `model` names, if any, then loads the
+        two models and embeds the scan vocabulary. A named gallery that
+        cannot be read fails the load with the reason, before the models
+        take their minute; so do models that cannot be loaded."""
         from PIL import Image
 
+        gallery = load_gallery(model)
         try:
             models = self._models_factory()
         except ImportError as error:
             raise RuntimeError(f"the sam3_siglip backend needs torch and transformers (the node's sam3-siglip extra): {error}") from error
-        loaded: Optional[Gallery] = None
-        try:
-            source = resolve(model, gallery, self._cache_dir)
-            loaded = load_gallery(source) if source is not None else None
-            if loaded is not None:
-                self.gallery_reason = ""
-            elif model.strip().lower() == NO_GALLERY:
-                self.gallery_reason = 'perception_model is "none"'
-            else:
-                self.gallery_reason = "perception_model names no gallery and gallery_url is empty"
-        except (GalleryUnavailable, ValueError, OSError) as error:
-            self.gallery_reason = str(error)
-        if loaded is None:
-            models.propose(Image.new("RGB", (64, 64)), GENERIC_PROMPTS)
-            self._gallery, self._models, self._prototypes = None, models, None
-            logger.warning("sam3_siglip: no gallery (%s): naming by words, a scan looks for %s", self.gallery_reason, ", ".join(DEFAULT_VOCABULARY))
-            return
-        if loaded.prototypes is not None:
-            prototypes = loaded.prototypes
-            how = "prototypes shipped with the pack"
-        else:
-            prototypes = self._embed_prototypes(loaded, models)
-            how = f"{len(loaded.crops)} reference crops embedded"
+        prototypes = None
+        if gallery is not None:
+            prototypes = normalised(gallery.prototypes) if gallery.prototypes is not None else embed_prototypes(gallery, models)
+        self._text_tables = {self.scan_vocabulary: text_table(models, self.scan_vocabulary)}
         # The first CUDA call pays for the kernels; take it here, not on the
         # first search.
         models.propose(Image.new("RGB", (64, 64)), GENERIC_PROMPTS)
-        self._gallery, self._models, self._prototypes = loaded, models, prototypes
-        logger.info("sam3_siglip: %d items from %s, %s, on %s", len(loaded.classes), loaded.name, how, models.device)
-
-    @staticmethod
-    def _embed_prototypes(gallery: Gallery, models: "Models") -> np.ndarray:
-        """One prototype per item: the mean SigLIP embedding of its crops,
-        each grown by a tenth when it is a box in a frame."""
-        from PIL import Image
-
-        sums: Optional[np.ndarray] = None
-        counts = np.zeros(len(gallery.classes), dtype=np.int64)
-        by_image: dict[str, list[Crop]] = {}
-        for crop in gallery.crops:
-            by_image.setdefault(crop.image, []).append(crop)
-        for image_key, crops in by_image.items():
-            with Image.open(gallery.image_path(crops[0])) as image:
-                image = image.convert("RGB")
-                pieces = [image.crop(grown(c.box, CROP_MARGIN, image.width, image.height)) if c.box else image for c in crops]
-                embeddings = models.embed_images(pieces)
-            if sums is None:
-                sums = np.zeros((len(gallery.classes), embeddings.shape[1]), dtype=np.float32)
-            for crop, embedding in zip(crops, embeddings):
-                sums[crop.class_index] += embedding
-                counts[crop.class_index] += 1
-        if sums is None or (counts == 0).any():
-            missing = [gallery.classes[i] for i in range(len(gallery.classes)) if counts[i] == 0]
-            raise ValueError(f"gallery {gallery.name} has no crop for {missing}")
-        return normalised(sums)
+        self._gallery, self._models, self._prototypes = gallery, models, prototypes
+        enrolled = f"{len(gallery.classes)} enrolled items from {gallery.root}" if gallery is not None else "no enrolment gallery"
+        logger.info("sam3_siglip: a vocabulary of %d names, %s, on %s", len(self.scan_vocabulary), enrolled, models.device)
 
     def set_vocabulary(self, phrases: Sequence[str]) -> None:
-        self._vocabulary = list(phrases)
+        self._search = list(phrases)
 
     def scan_coverage(self) -> Coverage:
-        """A scan names the gallery's items, or `DEFAULT_VOCABULARY` without
-        a gallery; never a background class, since those boxes are dropped."""
+        """A scan names the vocabulary's names, and the enrolled items'
+        phrases when there is a gallery; never a background class, since
+        those boxes are dropped."""
         if self._models is None:
             return Coverage()
-        if self._gallery is None:
-            return Coverage(frozenset(DEFAULT_VOCABULARY))
-        return Coverage(frozenset(self._gallery.phrases[i] for i in self._gallery.item_indices()))
+        enrolled = [self._gallery.phrases[i] for i in self._gallery.item_indices()] if self._gallery is not None else []
+        return Coverage(frozenset(self.scan_vocabulary) | frozenset(enrolled))
 
     def detect(self, image: np.ndarray) -> list[Box]:
         from PIL import Image
 
         if self._models is None:
             return []
-        plan = plan_for(self._gallery, self._vocabulary)
+        plan = plan_for(self._gallery, self._search, self.scan_vocabulary)
         frame = Image.fromarray(np.ascontiguousarray(image))
         boxes, objectness = self._models.propose(frame, plan.prompts)
         above = objectness >= PROPOSAL_CONF
@@ -601,20 +467,18 @@ class Sam3SiglipDetector:
         boxes, objectness = boxes[keep], objectness[keep]
         crops = [frame.crop(grown(box, CROP_MARGIN, frame.width, frame.height)) for box in boxes]
         embeddings = self._models.embed_images(crops)
-        if plan.naming == GALLERY_NAMING and self._prototypes is not None:
-            prototypes = self._prototypes
-        else:
-            prototypes = self._text_prototypes.get(plan.labels)
-            if prototypes is None:
-                prototypes = self._models.embed_texts(
-                    [f"a photo of a {p}" for p in plan.labels] + [f"a photo of {b}" for b in BACKGROUND_PHRASES]
-                )
-                self._text_prototypes[plan.labels] = prototypes
-        best, probability = name_by_prototypes(embeddings, prototypes, TEMPERATURE)
-        background = ()
-        if plan.naming == GALLERY_NAMING and self._gallery is not None:
-            background = self._gallery.background
-            # Naming by picture: a box that resembles no prototype enough is
-            # nothing enrolled, whatever the softmax made of it.
-            probability = np.where(under_floor(embeddings, prototypes, SIMILARITY_FLOOR), 0.0, probability)
-        return detections_from(boxes, objectness, best, probability, plan.labels, self.min_confidence, background)
+        table = self._text_table(plan.labels)
+        names, probability = name_by_words(embeddings, table, plan.labels)
+        if plan.route is Route.WORDS:
+            vocabulary_table = self._text_tables[self.scan_vocabulary][: len(self.scan_vocabulary)]
+            unlike = unlike_the_words(embeddings, table, vocabulary_table)
+            names = [None if far else name for name, far in zip(names, unlike)]
+        elif self._gallery is not None and self._prototypes is not None:
+            names, probability = name_enrolled_first(embeddings, self._prototypes, self._gallery, names, probability)
+        return detections_from(boxes, objectness, names, probability, self.min_confidence)
+
+    def _text_table(self, labels: tuple[str, ...]) -> np.ndarray:
+        table = self._text_tables.get(labels)
+        if table is None:
+            table = self._text_tables[labels] = text_table(self._models, labels)
+        return table

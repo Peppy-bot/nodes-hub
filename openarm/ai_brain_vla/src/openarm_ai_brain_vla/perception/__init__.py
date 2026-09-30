@@ -14,13 +14,10 @@ from ..ports import Detector
 
 REGISTRY: dict[str, str] = {
     "none": "openarm_ai_brain_vla.perception.none:NoneDetector",
-    # SAM 3 to find and SigLIP against a gallery to name: the most accurate
-    # pipeline of the perception study. Needs the sam3-siglip extra and a GPU.
+    # SAM 3 to find and SigLIP to name, by words from a general vocabulary.
+    # Needs the sam3-siglip extra and a GPU.
     "sam3_siglip": "openarm_ai_brain_vla.perception.sam3_siglip:Sam3SiglipDetector",
-    # YOLOE-11M with the gallery's crops as visual prompts: the study's
-    # real-time pipeline, 21 ms a frame. Needs the yoloe extra; a GPU helps.
-    "yoloe_vp": "openarm_ai_brain_vla.perception.yoloe_vp:YoloeVpDetector",
-    # Gemini Robotics-ER over Google's API: no GPU, no gallery, a key and
+    # Gemini Robotics-ER over Google's API: no GPU, a key and
     # the network. Needs the gemini extra.
     "gemini_er": "openarm_ai_brain_vla.perception.gemini_er:GeminiErDetector",
 }

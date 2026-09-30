@@ -231,7 +231,7 @@ async def test_a_backend_loads_in_the_background_and_searches_wait_on_it():
         def available(self) -> bool:
             return self.ready
 
-        def load(self, model: str, gallery: str = "") -> None:
+        def load(self, model: str) -> None:
             self.release.wait(5.0)
             self.loaded = model
             self.ready = True
@@ -259,7 +259,7 @@ async def test_a_load_that_fails_becomes_the_reason_every_search_is_refused_with
         def available(self) -> bool:
             return False
 
-        def load(self, model: str, gallery: str = "") -> None:
+        def load(self, model: str) -> None:
             raise ValueError(f"no gallery at {model}")
 
     perceiver = Perceiver(BrokenDetector(), FrameStore(), IDENTITY)

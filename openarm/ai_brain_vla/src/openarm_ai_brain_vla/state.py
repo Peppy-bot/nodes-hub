@@ -12,8 +12,8 @@ Rules written down here because the code depends on them:
 - An item is the thing at its place. A detection keeps the id of a known
   item within `MATCH_RADIUS_M` of it: one with the detection's label
   first, then the nearest. The label only breaks ties, because one object
-  gets different labels from different searches (the gallery's name in a
-  scan, the caller's words in an identify search). Any other detection
+  gets different labels from different searches (the vocabulary's name in
+  a scan, the caller's words in an identify search). Any other detection
   mints a new id. An item a gripper holds is in the gripper, not where it
   was grabbed, so no detection matches it. The cost: an item swapped for
   another within the radius between two looks hands its id to the new one.

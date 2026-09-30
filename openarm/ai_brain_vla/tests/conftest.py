@@ -19,8 +19,6 @@ PARAMS = {
     "gripper_names": "left_gripper,right_gripper",
     "perception_backend": "none",
     "perception_model": "",
-    # No gallery in the tests: nothing is fetched.
-    "gallery_url": "",
     "perception_confidence": 0.0,
     "manipulation_backend": "none",
     # At the origin, looking along world -Z with +Y up: the identity pose.
@@ -49,9 +47,8 @@ class FakeDetector:
     def available(self) -> bool:
         return True
 
-    def load(self, model: str, gallery: str = "") -> None:
+    def load(self, model: str) -> None:
         self.loaded = model
-        self.gallery = gallery
 
     def set_vocabulary(self, phrases: Sequence[str]) -> None:
         self.vocabulary = list(phrases)

@@ -63,7 +63,7 @@ class Brain:
         model, once. The load runs in the background, since a backend that
         takes a minute to load must not hold the node's start; searches are
         refused as still loading until it ends."""
-        self.perceiver.start_loading(self.params.perception_model, self.params.gallery_url)
+        self.perceiver.start_loading(self.params.perception_model)
         await self.manipulator.start(self.robot)
 
     def background(self, token) -> list[asyncio.Task]:
