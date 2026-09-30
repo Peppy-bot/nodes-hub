@@ -25,6 +25,8 @@ import logging
 import threading
 from typing import Callable, Optional, Sequence
 
+from dataclasses import dataclass
+
 from ..ports import Box, CancelToken, Deadline, Detection, Detector, Refusal, SearchTimeout, iou
 from .camera import CameraModel
 from .frames import FrameStore, decode_color, decode_depth, depth_at
@@ -65,20 +67,37 @@ async def in_daemon_thread(function: Callable, *args):
     return await done
 
 
+@dataclass(frozen=True)
+class Look:
+    """What one look at the camera gave: the detections, each placed in the
+    robot frame with its region in the picture, and the picture itself:
+    its size in pixels and its capture time, so a region can be read
+    against the same frame."""
+
+    detections: list[Detection]
+    image_width: int
+    image_height: int
+    frame_timestamp: float
+
+
 class Perceiver:
     def __init__(self, detector: Detector, frames: FrameStore, camera: CameraModel) -> None:
         self.detector = detector
         self.frames = frames
         self.camera = camera
-        # Why the camera cannot place a pixel yet, until its intrinsics come.
-        self.camera_reason = "the camera's intrinsics have not been received yet"
+        # Why the camera cannot place a pixel yet: its intrinsics, until
+        # the camera has answered, and its pose, until the robot has.
+        self.intrinsics_reason = "the camera's intrinsics have not been received yet"
+        self.pose_reason = "the camera's pose has not been received from the robot yet"
         self._loading: Optional[asyncio.Task] = None
         self._load_error = ""
 
     def set_camera(self, camera: CameraModel) -> None:
         self.camera = camera
-        if camera.ready:
-            self.camera_reason = ""
+        if camera.intrinsics is not None:
+            self.intrinsics_reason = ""
+        if camera.placed:
+            self.pose_reason = ""
 
     @property
     def available(self) -> bool:
@@ -94,8 +113,10 @@ class Perceiver:
         frames = self.frames.why_unavailable()
         if frames:
             return f"no perception source: {frames}"
-        if not self.camera.ready:
-            return f"no perception source: {self.camera_reason}"
+        if self.camera.intrinsics is None:
+            return f"no perception source: {self.intrinsics_reason}"
+        if not self.camera.placed:
+            return f"no perception source: {self.pose_reason}"
         return ""
 
     async def load(self, model: str, gallery: str) -> None:
@@ -127,7 +148,7 @@ class Perceiver:
         if self._loading is not None:
             await self._loading
 
-    async def scan(self, phrases: Sequence[str], cancel: CancelToken, timeout_s: float) -> list[Detection]:
+    async def scan(self, phrases: Sequence[str], cancel: CancelToken, timeout_s: float) -> Look:
         """Looks once at the latest frame for `phrases`, or for everything
         the detector knows when `phrases` is empty, within `timeout_s`, the
         default budget when that is zero."""
@@ -151,8 +172,15 @@ class Perceiver:
                 continue
             u, v = box.centre
             position = self.camera.deproject(u, v, depth, frame.color.width, frame.color.height)
-            detections.append(Detection(label=box.label, position=position, confidence=box.confidence))
-        return detections
+            detections.append(
+                Detection(label=box.label, position=position, confidence=box.confidence, region=box.xyxy)
+            )
+        return Look(
+            detections=detections,
+            image_width=int(frame.color.width),
+            image_height=int(frame.color.height),
+            frame_timestamp=float(frame.color.header.timestamp),
+        )
 
 
 def merge_duplicates(boxes: Sequence[Box]) -> list[Box]:

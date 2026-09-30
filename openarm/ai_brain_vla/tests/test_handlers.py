@@ -39,8 +39,11 @@ def with_frames(brain: Brain, depth_m: float = 1.0) -> None:
     brain.frames.add_color(rgb_frame(16, 12))
     brain.frames.add_depth(depth_frame(depth_m, 16, 12))
     brain.frames.depth_unit = 0.001
-    # The camera has answered where its pixels point: a 90 degree lens.
-    brain.perceiver.set_camera(brain.camera.with_intrinsics(Intrinsics.from_fovy(90.0, 16, 12)))
+    # The camera has answered where its pixels point, a 90 degree lens, and
+    # the robot where it stands: at the origin, looking along +Z.
+    brain.perceiver.set_camera(
+        brain.camera.with_intrinsics(Intrinsics.from_fovy(90.0, 16, 12)).with_pose((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
+    )
 
 
 def scan_goal(timeout_s: float = 0.0) -> FakeCtx:
@@ -124,6 +127,11 @@ async def test_scan_then_identify_then_grab_by_id_then_place():
     assert ctx.completed["labels"] == ["cup", "banana"]
     assert len(ctx.completed["positions"]) == 6
     assert ctx.completed["confidences"] == [0.9, 0.7]
+    # Each item's box, in the picture the scan looked at.
+    assert ctx.completed["regions"] == [7.0, 5.0, 9.0, 7.0, 1.0, 1.0, 3.0, 3.0]
+    assert ctx.completed["camera"] == "chest"
+    assert (ctx.completed["image_width"], ctx.completed["image_height"]) == (16, 12)
+    assert ctx.completed["frame_timestamp"] == 1.0
 
     ctx = identify_goal("cup")
     await identify_item.run(brain, ctx)
@@ -131,6 +139,10 @@ async def test_scan_then_identify_then_grab_by_id_then_place():
     assert ctx.completed["item_id"] == "cup_1-t0"
     assert detector.vocabulary == ["cup"]
     assert ctx.completed["orientation"] is None
+    assert ctx.completed["region"] == [7.0, 5.0, 9.0, 7.0]
+    assert ctx.completed["camera"] == "chest"
+    assert (ctx.completed["image_width"], ctx.completed["image_height"]) == (16, 12)
+    assert ctx.completed["frame_timestamp"] == 1.0
 
     ctx = grab_goal(gripper_name="", item_id="cup_1-t0")
     ticks.now_ns += 3_000_000_000

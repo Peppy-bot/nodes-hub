@@ -17,6 +17,9 @@ from typing import Optional, Protocol, Sequence
 
 Vec3 = tuple[float, float, float]
 Quat = tuple[float, float, float, float]
+# A region of a picture: x0, y0, x1, y1 in pixels, x to the right and y
+# down, the corners of the box that holds an item.
+Region = tuple[float, float, float, float]
 
 
 class Refusal(Exception):
@@ -141,14 +144,16 @@ def iou(a: Sequence[float], b: Sequence[float]) -> float:
 
 @dataclass(frozen=True)
 class Detection:
-    """A box turned into the world: the label, where the item is, and how
-    sure the detector was. Orientation is set only by a backend that
-    resolves it; the contracts make it optional for that reason."""
+    """A box turned into the world: the label, where the item is, how sure
+    the detector was, and the box itself, where the item is in the picture
+    the look used. Orientation is set only by a backend that resolves it;
+    the contracts make it optional for that reason."""
 
     label: str
     position: Vec3
     confidence: float = 0.0
     orientation: Optional[Quat] = None
+    region: Optional[Region] = None
 
 
 @dataclass(frozen=True)
@@ -169,7 +174,10 @@ class Coverage:
 
 @dataclass
 class Item:
-    """A known item: the id the brain minted for it and what was last seen."""
+    """A known item: the id the brain minted for it and what was last seen.
+    `region` is where the look that last saw it found it in the picture;
+    none for an item the last look did not see, or one addressed by
+    pose."""
 
     item_id: str
     label: str
@@ -177,6 +185,7 @@ class Item:
     orientation: Optional[Quat]
     confidence: float
     seen_at_ns: int
+    region: Optional[Region] = None
 
 
 @dataclass

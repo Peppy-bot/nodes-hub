@@ -27,23 +27,36 @@ from openarm_ai_brain_vla.perception.frames import FRAME_BUFFER, FrameStore, dec
 from openarm_ai_brain_vla.perception.perceiver import DEFAULT_TIMEOUT_S, Perceiver, in_daemon_thread, merge_duplicates
 from openarm_ai_brain_vla.ports import Box, CancelToken, Coverage, Refusal
 
-IDENTITY = CameraModel.from_parameters("0 0 0 0 0 0 1").with_intrinsics(Intrinsics.from_fovy(90.0, 16, 12))
+# At the robot frame's origin, looking along its +Z: the identity pose.
+AT_ORIGIN = CameraModel().with_pose((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
+IDENTITY = AT_ORIGIN.with_intrinsics(Intrinsics.from_fovy(90.0, 16, 12))
 
 
 def close(a, b, tolerance=1e-6):
     return all(abs(x - y) <= tolerance for x, y in zip(a, b))
 
 
-def test_the_camera_pose_parameter_is_parsed_and_normalised():
-    with pytest.raises(ValueError):
-        CameraModel.from_parameters("0 0 0")
-    camera = CameraModel.from_parameters("1, 2, 3, 0, 0, 0, 2")
+def test_the_camera_pose_the_robot_reports_is_checked_and_normalised():
+    with pytest.raises(ValueError, match="three coordinates"):
+        CameraModel().with_pose((0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
+    with pytest.raises(ValueError, match="finite"):
+        CameraModel().with_pose((math.nan, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
+    with pytest.raises(ValueError, match="zero"):
+        CameraModel().with_pose((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 0.0))
+    camera = CameraModel().with_pose((1, 2, 3), (0, 0, 0, 2))
     assert camera.position == (1.0, 2.0, 3.0)
     assert close(camera.orientation, (0.0, 0.0, 0.0, 1.0))
-    # Without intrinsics the camera cannot place a pixel, and says so.
-    assert not camera.ready
-    with pytest.raises(ValueError, match="not known yet"):
+    # Without intrinsics, or without a pose, the camera cannot place a
+    # pixel, and says which.
+    assert camera.placed and not camera.ready
+    with pytest.raises(ValueError, match="intrinsics are not known yet"):
         camera.deproject(1.0, 1.0, 1.0, 16, 12)
+    unplaced = CameraModel().with_intrinsics(Intrinsics.from_fovy(90.0, 16, 12))
+    assert not unplaced.placed and not unplaced.ready
+    with pytest.raises(ValueError, match="pose is not known yet"):
+        unplaced.deproject(1.0, 1.0, 1.0, 16, 12)
+    with pytest.raises(ValueError, match="pose is not known yet"):
+        unplaced.forward()
     assert camera.with_intrinsics(Intrinsics.from_fovy(90.0, 16, 12)).ready
 
 
@@ -64,17 +77,20 @@ def test_intrinsics_are_checked_and_scale_with_the_image():
     assert k.scaled_to(1280, 720) is k
 
 
-def test_an_identity_camera_deprojects_along_minus_z_with_x_right_and_y_up():
+def test_an_identity_camera_deprojects_along_plus_z_with_x_right_and_y_down():
+    # The optical frame camera_geometry and camera_mounts share: +X to the
+    # right of the image, +Y down it, +Z along the view.
     width, height = 16, 12
     centre = IDENTITY.deproject(8.0, 6.0, 1.0, width, height)
-    assert close(centre, (0.0, 0.0, -1.0))
+    assert close(centre, (0.0, 0.0, 1.0))
+    assert close(IDENTITY.forward(), (0.0, 0.0, 1.0))
     # 90 degree vertical field of view: the top edge is one focal length up.
     focal = IDENTITY.intrinsics.fy
     assert close((focal,), (6.0,))
     right = IDENTITY.deproject(8.0 + focal, 6.0, 2.0, width, height)
-    assert close(right, (2.0, 0.0, -2.0))
-    up = IDENTITY.deproject(8.0, 6.0 - focal, 2.0, width, height)
-    assert close(up, (0.0, 2.0, -2.0))
+    assert close(right, (2.0, 0.0, 2.0))
+    down = IDENTITY.deproject(8.0, 6.0 + focal, 2.0, width, height)
+    assert close(down, (0.0, 2.0, 2.0))
 
 
 # A D455-like colour lens, the magnitudes a real unit reports.
@@ -88,7 +104,7 @@ def test_a_pixel_becomes_a_ray_through_the_intrinsics_with_no_lens():
     assert close(pixel_to_ray(639.5, 359.5, 738.1, 738.1, 639.5, 359.5, NONE, ()), (0.0, 0.0))
     assert close(pixel_to_ray(639.5 + 738.1, 359.5, 738.1, 738.1, 639.5, 359.5, NONE, ()), (1.0, 0.0))
     # deproject is the same path with the field of view for the focal length.
-    assert close(IDENTITY.deproject(8.0 + 6.0, 6.0, 2.0, 16, 12), (2.0, 0.0, -2.0))
+    assert close(IDENTITY.deproject(8.0 + 6.0, 6.0, 2.0, 16, 12), (2.0, 0.0, 2.0))
 
 
 def test_plumb_bob_round_trips_through_distort_and_undistort():
@@ -157,12 +173,32 @@ def test_any_other_distortion_model_is_refused_by_name():
         undistort(INVERSE_PLUMB_BOB, (math.nan, 0.0, 0.0, 0.0, 0.0), 0.1, 0.1)
 
 
-def test_the_default_chest_pose_looks_ahead_and_down():
-    # The OpenArm v2 chest camera faces world +X, 62 degrees below the horizon.
-    chest = CameraModel.from_parameters("0.0792 0.0315 0.7941 0.1710647 -0.1710647 -0.6861027 0.6861027").with_intrinsics(Intrinsics.from_fovy(52.0, 1280, 720))
+def quaternion_product(a, b):
+    """`a` then `b` as one rotation, both [x, y, z, w]: the rotation `a * b`."""
+    ax, ay, az, aw = a
+    bx, by, bz, bw = b
+    return (
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+        aw * bw - ax * bx - ay * by - az * bz,
+    )
+
+
+# The OpenArm v2 chest camera as the backbone reports it: the design's mount
+# (looking along its own -Z with +Y up) turned half a turn about X into the
+# optical frame.
+CHEST_POSITION = (0.0792, 0.0315, 0.7941)
+CHEST_ORIENTATION = quaternion_product((0.1710647, -0.1710647, -0.6861027, 0.6861027), (1.0, 0.0, 0.0, 0.0))
+
+
+def test_the_chest_pose_the_backbone_reports_looks_ahead_and_down():
+    # The OpenArm v2 chest camera faces the robot's +X, 62 degrees below the
+    # horizon, and the image's +Y (down the picture) leans forward and down.
+    chest = CameraModel().with_pose(CHEST_POSITION, CHEST_ORIENTATION).with_intrinsics(Intrinsics.from_fovy(52.0, 1280, 720))
     forward = chest.forward()
     assert close(forward, (math.cos(math.radians(62)), 0.0, -math.sin(math.radians(62))), 1e-3)
-    assert close(rotate(chest.orientation, (0.0, 1.0, 0.0)), (math.sin(math.radians(62)), 0.0, math.cos(math.radians(62))), 1e-3)
+    assert close(rotate(chest.orientation, (0.0, 1.0, 0.0)), (-math.sin(math.radians(62)), 0.0, -math.cos(math.radians(62))), 1e-3)
     # One meter along the axis from the chest lands on the table in front.
     point = chest.deproject(640.0, 360.0, 1.0, 1280, 720)
     assert close(point, (0.0792 + forward[0], 0.0315, 0.7941 + forward[2]), 1e-3)
@@ -302,11 +338,15 @@ async def test_a_scan_turns_boxes_into_world_detections():
     perceiver = Perceiver(detector, frames, IDENTITY)
     await perceiver.load("weights.pt", "/gallery")
     assert detector.loaded == ("weights.pt", "/gallery")
-    detections = await perceiver.scan(["cup"], CancelToken(), timeout_s=0.0)
+    look = await perceiver.scan(["cup"], CancelToken(), timeout_s=0.0)
     assert detector.vocabulary == ["cup"]
+    detections = look.detections
     assert len(detections) == 1
     assert detections[0].label == "cup" and detections[0].confidence == 0.9
-    assert close(detections[0].position, (0.0, 0.0, -2.0))
+    assert close(detections[0].position, (0.0, 0.0, 2.0))
+    # The look reports the box in the picture it used, and the picture.
+    assert detections[0].region == (6, 4, 10, 8)
+    assert (look.image_width, look.image_height, look.frame_timestamp) == (16, 12, 1.0)
     # The detector is handed the search's deadline: the default budget for
     # a zero timeout, the caller's otherwise.
     assert detector.deadlines[-1].budget_s == DEFAULT_TIMEOUT_S
@@ -451,18 +491,18 @@ async def test_a_scan_waits_for_the_cameras_intrinsics_and_names_the_slot():
     from openarm_ai_brain_vla.perception.geometry import VACANT, intrinsics_from
 
     frames = store_with([rgb_frame(16, 12)], [depth_frame(1.0, 16, 12)])
-    perceiver = Perceiver(FakeDetector([Box("mug", 0.9, 4, 4, 8, 8)]), frames, CameraModel.from_parameters("0 0 0 0 0 0 1"))
+    perceiver = Perceiver(FakeDetector([Box("mug", 0.9, 4, 4, 8, 8)]), frames, AT_ORIGIN)
     assert not perceiver.available
     with pytest.raises(Refusal, match="intrinsics have not been received"):
         await perceiver.scan([], CancelToken(), 1.0)
-    perceiver.camera_reason = VACANT
+    perceiver.intrinsics_reason = VACANT
     with pytest.raises(Refusal, match="geometry slot is vacant"):
         await perceiver.scan([], CancelToken(), 1.0)
     answer = SimpleNamespace(width=16, height=12, fx=6.0, fy=6.0, cx=8.0, cy=6.0, distortion_model="none", distortion=[])
     perceiver.set_camera(perceiver.camera.with_intrinsics(intrinsics_from(answer)))
-    assert perceiver.available and perceiver.camera_reason == ""
+    assert perceiver.available and perceiver.intrinsics_reason == ""
     found = await perceiver.scan([], CancelToken(), 1.0)
-    assert [d.label for d in found] == ["mug"]
+    assert [d.label for d in found.detections] == ["mug"]
     with pytest.raises(ValueError, match="unknown distortion model"):
         intrinsics_from(SimpleNamespace(width=16, height=12, fx=6.0, fy=6.0, cx=8.0, cy=6.0, distortion_model="fisheye", distortion=[]))
 
@@ -481,7 +521,7 @@ async def test_the_camera_is_asked_again_until_it_knows_its_geometry(monkeypatch
     # colour not known yet (what a sim relay says before its simulation
     # speaks), depth not known, a depth model the brain does not read, an
     # unusable pinhole, then the answer.
-    perceiver = Perceiver(FakeDetector(), FrameStore(), CameraModel.from_parameters("0 0 0 0 0 0 1"))
+    perceiver = Perceiver(FakeDetector(), FrameStore(), AT_ORIGIN)
     colour = [
         TimeoutError("no answer"),
         colour_answer(False, "no camera geometry received from the simulation yet"),
@@ -494,7 +534,7 @@ async def test_the_camera_is_asked_again_until_it_knows_its_geometry(monkeypatch
     reasons: list[str] = []
 
     async def poll_colour(node_runner, producer, timeout):
-        reasons.append(perceiver.camera_reason)
+        reasons.append(perceiver.intrinsics_reason)
         answer = colour.pop(0)
         if isinstance(answer, Exception):
             raise answer
@@ -517,11 +557,11 @@ async def test_the_camera_is_asked_again_until_it_knows_its_geometry(monkeypatch
         "the camera's intrinsics are unusable: intrinsics need positive finite focal lengths, got fx 0.0 fy 6.0",
     ]
     assert colour == [] and depth == []
-    assert perceiver.camera.ready and perceiver.camera_reason == ""
+    assert perceiver.camera.ready and perceiver.intrinsics_reason == ""
 
 
 async def test_a_camera_that_never_knows_its_geometry_is_asked_until_the_node_stops(monkeypatch):
-    perceiver = Perceiver(FakeDetector(), FrameStore(), CameraModel.from_parameters("0 0 0 0 0 0 1"))
+    perceiver = Perceiver(FakeDetector(), FrameStore(), AT_ORIGIN)
     token = FakeToken()
     asked = 0
 
@@ -542,11 +582,68 @@ async def test_a_camera_that_never_knows_its_geometry_is_asked_until_the_node_st
     await asyncio.wait_for(geometry.learn_intrinsics(None, token, perceiver), 5.0)
     assert asked == 3
     assert not perceiver.camera.ready
-    assert perceiver.camera_reason == "the camera does not know its colour intrinsics: this camera has no calibration"
+    assert perceiver.intrinsics_reason == "the camera does not know its colour intrinsics: this camera has no calibration"
 
 
 async def test_a_vacant_geometry_slot_is_the_reason_at_once(monkeypatch):
-    perceiver = Perceiver(FakeDetector(), FrameStore(), CameraModel.from_parameters("0 0 0 0 0 0 1"))
+    perceiver = Perceiver(FakeDetector(), FrameStore(), AT_ORIGIN)
     monkeypatch.setattr(geometry.get_color_intrinsics, "bound_producer", lambda node_runner: None)
     await asyncio.wait_for(geometry.learn_intrinsics(None, FakeToken(), perceiver), 1.0)
-    assert perceiver.camera_reason == geometry.VACANT
+    assert perceiver.intrinsics_reason == geometry.VACANT
+
+
+def poses_answer(success: bool = True, message: str = "", names=("wrist_left", "chest"), chest_position=(0.1, 0.2, 0.3)):
+    positions = [0.5, 0.5, 0.5] * (len(names) - 1) + list(chest_position)
+    orientations = [0.0, 0.0, 0.0, 1.0] * len(names)
+    return SimpleNamespace(
+        success=success, message=message, timestamp=7.0, camera_names=list(names), positions=positions,
+        orientations=orientations, carried_by=["left_arm"] * (len(names) - 1) + [""],
+    )
+
+
+async def test_the_robot_is_asked_again_until_it_places_the_camera(monkeypatch):
+    # The reasons a search is refused with, one per round, until the robot
+    # answers with success and names the camera: not answered, not measured
+    # yet, a robot without that camera, then the answer.
+    frames = store_with([rgb_frame(16, 12)], [depth_frame(1.0, 16, 12)])
+    perceiver = Perceiver(FakeDetector(), frames, CameraModel().with_intrinsics(Intrinsics.from_fovy(90.0, 16, 12)))
+    assert not perceiver.available
+    with pytest.raises(Refusal, match="pose has not been received from the robot"):
+        await perceiver.scan([], CancelToken(), 1.0)
+    answers = [
+        TimeoutError("no answer"),
+        poses_answer(False, "the robot has not measured its joints yet"),
+        poses_answer(names=("wrist_left", "wrist_right")),
+        poses_answer(),
+    ]
+    reasons: list[str] = []
+
+    async def poll(node_runner, producer, timeout):
+        reasons.append(perceiver.pose_reason)
+        answer = answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return SimpleNamespace(data=answer)
+
+    monkeypatch.setattr(geometry, "INTRINSICS_RETRY_S", 0.0)
+    monkeypatch.setattr(geometry.get_camera_poses, "bound_producer", lambda node_runner: "robot")
+    monkeypatch.setattr(geometry.get_camera_poses, "poll", poll)
+    await asyncio.wait_for(geometry.learn_camera_pose(None, FakeToken(), perceiver, "chest"), 5.0)
+    assert reasons == [
+        "the camera's pose has not been received from the robot yet",
+        "the robot's camera mounts are not answered yet (TimeoutError('no answer'))",
+        "the robot does not know where its cameras stand: the robot has not measured its joints yet",
+        "the robot carries no camera named 'chest' (it carries: wrist_left, wrist_right)",
+    ]
+    assert answers == []
+    assert perceiver.camera.ready and perceiver.pose_reason == ""
+    assert perceiver.camera.position == (0.1, 0.2, 0.3)
+    assert perceiver.available
+
+
+async def test_a_vacant_camera_mounts_slot_is_the_reason_at_once(monkeypatch):
+    perceiver = Perceiver(FakeDetector(), FrameStore(), CameraModel())
+    monkeypatch.setattr(geometry.get_camera_poses, "bound_producer", lambda node_runner: None)
+    await asyncio.wait_for(geometry.learn_camera_pose(None, FakeToken(), perceiver, "chest"), 1.0)
+    assert perceiver.pose_reason == geometry.MOUNTS_VACANT
+    assert not perceiver.camera.placed

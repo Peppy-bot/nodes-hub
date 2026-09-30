@@ -32,6 +32,13 @@
         // like it: without it no pixel can become a position, so both
         // searches are refused naming the slot until it answers.
         { name: "camera_geometry", tag: "v1", link_id: "geometry", cardinality: "zero_or_one" },
+        // Where that camera stands on the robot: the pose of its optical
+        // frame in the robot frame, served by the robot's backbone for the
+        // camera the `camera_name` parameter names. Optional like the two
+        // above: without it no pixel can become a position, so both
+        // searches are refused naming the slot until it answers and names
+        // the camera.
+        { name: "camera_mounts", tag: "v1", link_id: "camera_mounts", cardinality: "zero_or_one" },
       ],
     },
   },
@@ -64,6 +71,7 @@
         { link_id: "camera", name: "depth_stream_info" },
         { link_id: "geometry", name: "get_color_intrinsics" },
         { link_id: "geometry", name: "get_depth_intrinsics" },
+        { link_id: "camera_mounts", name: "get_camera_poses" },
       ],
     },
   },
@@ -124,18 +132,14 @@
       // "none" moves nothing: every sequence is refused with a message
       // naming the missing backend, while abort and get_state still work.
       manipulation_backend: { $type: "string", $default: "none" },
-      // Pose of the camera's optical frame in the world frame limb_motion
-      // uses, as "x y z qx qy qz qw" (meters, unit quaternion), the camera
-      // looking along its -Z with +Y up. The intrinsics come from the
-      // camera itself through the `geometry` slot; no contract carries the
-      // camera's pose in the robot's frame yet, so it is this parameter.
-      // The default is the OpenArm v2 chest camera, the centre of the ZED
-      // Mini's left lens front, with the robot mounted at the world origin,
-      // from Enactic's CAD and equal to where the simulators place it. A
-      // camera that moves with an arm needs the arm pose at capture time
-      // instead, which this parameter cannot express: the brain reads a
-      // fixed camera.
-      camera_pose: { $type: "string", $default: "0.0792 0.0315 0.7941 0.1710647 -0.1710647 -0.6861027 0.6861027" },
+      // The name the camera the brain looks through runs under on the
+      // robot, as the robot's camera_mounts lists it: the brain reads the
+      // pose of that camera, in the robot frame, from the `camera_mounts`
+      // slot, once, and reports every position in that frame. The default
+      // is the OpenArm v2 chest camera, fixed to the torso; a camera an
+      // arm carries moves between the answer and a scan, so the brain
+      // looks through a fixed one.
+      camera_name: { $type: "string", $default: "chest" },
     },
   },
 }

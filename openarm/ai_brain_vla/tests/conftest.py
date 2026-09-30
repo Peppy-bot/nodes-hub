@@ -24,8 +24,7 @@ PARAMS = {
     "perception_gallery": "",
     "perception_confidence": 0.0,
     "manipulation_backend": "none",
-    # At the origin, looking along world -Z with +Y up: the identity pose.
-    "camera_pose": "0 0 0 0 0 0 1",
+    "camera_name": "chest",
 }
 
 # A deadline no search reaches, and one every search has passed.
@@ -206,10 +205,12 @@ class FakeCtx:
         assert set(fields) == expected, f"{self.action.__name__} completed with {sorted(fields)}, its result carries {sorted(expected)}"
 
 
-def answer_the_camera(h, *, colour=None) -> None:
-    """The camera mocks of a harness answer what the brain asks at start:
-    the depth unit, and the geometry once per answer in `colour`, the
-    known colour intrinsics when none are given."""
+def answer_the_camera(h, *, colour=None, mounts=None) -> None:
+    """The camera and robot mocks of a harness answer what the brain asks
+    at start: the depth unit, the geometry once per answer in `colour`, the
+    known colour intrinsics when none are given, and where the camera
+    stands once per answer in `mounts`, the chest camera at the origin
+    looking along the robot's +Z when none are given."""
     from peppygen.consumed_services.camera import depth_stream_info
     from peppygen.consumed_services.geometry import get_depth_intrinsics
 
@@ -224,6 +225,25 @@ def answer_the_camera(h, *, colour=None) -> None:
                 depth_model="z", min_depth_m=0.1, max_depth_m=10.0, align_mode="depth_to_color",
             )
         )
+    for answer in mounts if mounts is not None else (camera_poses(),):
+        h.mocks.deps.camera_mounts.get_camera_poses.enqueue_response(answer)
+
+
+def camera_poses(success: bool = True, message: str = "", names=("chest",)):
+    """The robot's answer: every camera of `names` at the origin, its
+    optical frame the robot frame's, or the answer of a robot that has not
+    measured its joints yet."""
+    from peppygen.consumed_services.camera_mounts import get_camera_poses
+
+    if not success:
+        return get_camera_poses.ResponseData(
+            success=False, message=message, timestamp=0.0, camera_names=[], positions=[], orientations=[], carried_by=[]
+        )
+    return get_camera_poses.ResponseData(
+        success=True, message="", timestamp=7.0, camera_names=list(names),
+        positions=[0.0, 0.0, 0.0] * len(names), orientations=[0.0, 0.0, 0.0, 1.0] * len(names),
+        carried_by=[""] * len(names),
+    )
 
 
 def colour_intrinsics(success: bool = True, message: str = ""):

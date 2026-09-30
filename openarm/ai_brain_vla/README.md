@@ -112,14 +112,21 @@ the wait and another call.
 - `manipulation_backend`: `none`, the one backend: every sequence is refused
   naming it, while abort and get_state work.
 - `gripper_names`: the robot's grippers, in the order `get_state` reports them.
-- `camera_pose`: the camera model, below.
+- `camera_name`: the camera the brain looks through, by the name the robot's
+  `camera_mounts` lists it under; the camera model, below.
 
 ## The camera model
 
-A detection is a box in the colour image. To become a position in the robot's
-frame it needs the depth under the box, which the depth stream gives, and a
-camera model: the intrinsics that turn a pixel into a ray, and the camera's
-pose in the robot's frame that turns the ray into a point.
+A detection is a box in the colour image. To become a position in the robot
+frame, the frame the robot contracts define (fixed to the robot's base, +X
+the way the robot faces, +Y to its left, +Z up), it needs the depth under the
+box, which the depth stream gives, and a camera model: the intrinsics that
+turn a pixel into a ray, and the camera's pose in the robot frame that turns
+the ray into a point. Every position the brain reports is in that frame, and
+every result also says where each item is in the picture it looked at: the
+box in the pixels of the colour frame of the camera `camera_name` names, x to
+the right and y down, with the frame's size and capture time, so a caller can
+read a region against the same frame.
 
 - **Intrinsics come from the camera.** The `geometry` slot consumes
   `camera_geometry:v1`, served by the sim relays and by `zed_camera` and
@@ -141,11 +148,18 @@ pose in the robot's frame that turns the ray into a point.
   be aligned, as the relays and the ZED publish them and as `realsense_d4xx`
   does under `depth_to_color`: a pair whose frames say `align_mode` "none",
   or two different alignments, is refused with the reason.
-- **The pose is the `camera_pose` parameter**, the camera's optical frame in
-  the robot's world frame, because no contract carries a camera-to-world pose.
-  Its default is the OpenArm v2 chest camera, the ZED Mini's left lens from
-  Enactic's CAD, the value the simulators place the camera at; a measured pose
-  on the real robot replaces it.
+- **The pose comes from the robot.** The `camera_mounts` slot consumes
+  `camera_mounts:v1`, served by the robot's backbone: `get_camera_poses`
+  lists where the robot's design carries each camera, in the robot frame, as
+  the pose of its optical frame (+X to the right of the image, +Y down it, +Z
+  along the view). The brain asks every 2 s until the robot answers with
+  success and names the camera `camera_name` names, `chest` by default, the
+  OpenArm v2 head camera; until then both searches are refused naming the
+  reason (slot vacant, not answered yet, the robot not having measured its
+  joints, a robot that carries no camera by that name). The pose is read
+  once: the brain looks through a camera fixed to the robot's base, and a
+  camera an arm carries would have moved between the answer and a scan. The
+  values are the design's, exact in a simulation and nominal on hardware.
 
 ## Item ids
 
@@ -270,6 +284,7 @@ run the brain on its own beside the same stack, once per backend:
 peppy stack launch openarm_simulation --with robot_control,alpha.mcp_commander,alpha.cameras_sim
 peppy node run openarm_ai_brain_vla:v1 -i brain -b --clock simulation \
   --link limb_motion@alpha_backbone_inst --link camera@alpha_chest --link geometry@alpha_chest \
+  --link camera_mounts@alpha_backbone_inst \
   gripper_names=left_gripper,right_gripper perception_backend=sam3_siglip
 ```
 
