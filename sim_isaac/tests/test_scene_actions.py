@@ -213,6 +213,8 @@ def test_the_catalogue_is_narrowed_by_each_filter_and_a_bad_kind_is_refused(prov
     assert _listed(provider, kind="object", category="Blocks", query="blue") == ["props/blocks/blue_block"]
     assert _listed(provider, query="no such asset") == []
     assert _listed(provider, kind="scene", category="Blocks") == []
+    # A filter sent empty is no filter, as a filter left out.
+    assert _listed(provider, kind="", category="", query="") == _listed(provider)
 
     refused = provider.io._handle_get_assets(_assets_request(kind="robot"))
     assert refused.success is False
@@ -261,6 +263,9 @@ def test_the_inventory_lists_every_spawned_object_with_its_category_and_pose(pro
     assert len(blocks.objects) == 2
     none = provider.io._handle_get_objects_list(_objects_request(category="Furniture"))
     assert (none.success, none.objects) == (True, [])
+    # A filter sent empty is no filter, as a filter left out.
+    empty = provider.io._handle_get_objects_list(_objects_request(source="", category=""))
+    assert [item.object_id for item in empty.objects] == [red, blue]
 
     refused = provider.io._handle_get_objects_list(_objects_request(source="placed"))
     assert refused.success is False

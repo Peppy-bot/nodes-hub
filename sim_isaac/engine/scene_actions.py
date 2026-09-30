@@ -98,6 +98,12 @@ def _yaw_of(payload: dict) -> float:
     return yaw
 
 
+def _filter(value: str | None) -> str | None:
+    """A request's filter: a field left out, or sent empty, is no filter."""
+
+    return value or None
+
+
 def _matches(
     asset: dict,
     kind: str | None,
@@ -443,9 +449,9 @@ class SceneActionIO:
                 assets_json="[]",
             )
 
-        kind = request.data.kind
-        category = request.data.category
-        query = request.data.query
+        kind = _filter(request.data.kind)
+        category = _filter(request.data.category)
+        query = _filter(request.data.query)
 
         if kind is not None and kind not in _ASSET_KINDS:
             return get_assets_list.Response(
@@ -516,8 +522,8 @@ class SceneActionIO:
         when it loads a scene, so a request for the scene's objects lists
         nothing."""
 
-        source = request.data.source
-        category = request.data.category
+        source = _filter(request.data.source)
+        category = _filter(request.data.category)
 
         if source is not None and source not in _OBJECT_SOURCES:
             return get_objects_list.Response(
