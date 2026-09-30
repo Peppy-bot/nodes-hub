@@ -48,7 +48,8 @@ fingers identically.
    in-flight move) into a rate-limited candidate, and hands out the side's
    end-effector Jacobian when the target came from the operator's stream.
 5. **Service gripper moves** - `move_gripper` goals chase through the same
-   governed configuration as everything else.
+   governed configuration as everything else, then hold their target until
+   the measured gripper stands still.
 6. **Govern** - one `Governor::govern` call over the whole 16-DOF step.
 7. **Publish** - governed setpoints to the follower slots, measured states
    relayed up the leader slots, and the proximity readout at ~20 Hz.
@@ -137,11 +138,30 @@ steered-elbow line, or the guarded servo (a damped resolved-rate law that can
 cross singular surfaces a discrete IK walk cannot). Planning runs after
 admission (peppy's goal decision is pre-context, so reachability cannot be a
 refusal): an accepted goal whose pose no tier reaches, servo rollout
-included, completes unsuccessfully at once. Completion is graded on the
-commanded motion with a
-2x-nominal timeout; results report the measured state and the caller judges
-how close it landed (the governor may have held it short, and that is not a
-failure of the move machinery).
+included, completes unsuccessfully at once. Completion of an arm move is
+graded on the commanded motion with a 2x-nominal timeout; results report the
+measured state and the caller judges how close it landed (the governor may
+have held it short, and that is not a failure of the move machinery).
+
+`move_gripper` ends on the measured gripper instead. The commanded opening
+ramps to the target under the same 2x-nominal timeout, then the move stays in
+flight, still commanding the target and still holding the side's busy slot,
+until the measured opening stands still: within 0.002 of a reference opening
+for 0.25 s, judged on delivered openings only. `final_opening` is the opening
+measured then and `action_time` runs to that moment.
+
+| End of the move | `success` | `message` |
+|---|---|---|
+| Still, within 0.01 of the target | true | `move complete` |
+| Still, farther from the target (an object or the effort cap holds the jaws) | true | `move complete: the gripper stopped at <opening>, short of the target <target>` |
+| Still moving 3 s after the commanded opening landed | false | `the gripper still moved <seconds> s after the commanded move ended` |
+| The follower stops reporting while the gripper settles | false | `the follower stopped reporting` |
+| The commanded ramp overruns its timeout (a collision-governed clamp) | false | `overran 2x its <seconds>s nominal travel, short of the target (a collision-governed clamp ends here)` |
+| Cancelled, in the ramp or while settling | false, completed as cancelled | `goal cancelled` |
+
+A gripper that stops short is a success on purpose: the move was neither
+refused, failed nor cancelled, and the caller judges the grasp from
+`final_opening`.
 
 ## Module map
 

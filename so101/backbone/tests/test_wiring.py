@@ -330,7 +330,13 @@ async def test_posture_and_gripper_actions():
             assert grip.accepted
             grip_result = await grip.get_result(TIMEOUT_S)
             assert grip_result.status == move_gripper_fx.ResultStatus.COMPLETED
+            # The mocked follower never moves its jaws: the goal ends once
+            # they have stood still, a success that names where they stand.
             assert grip_result.data.success
+            assert grip_result.data.message == (
+                "move complete: the gripper stopped at 0.000, short of the target 0.500"
+            )
+            assert grip_result.data.final_opening == 0.0
             # The ramp's last downstream opening is the target.
             last = None
             while True:

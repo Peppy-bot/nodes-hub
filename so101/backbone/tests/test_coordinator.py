@@ -1,10 +1,16 @@
 import time
 
 import pytest
-from conftest import WIDE_LIMITS, WIDE_REACH, make_config
+from conftest import WIDE_LIMITS, WIDE_REACH, gripper_step, make_config
 from control_core_py.minimum_jerk import plan
 
-from so101_backbone.coordinator import STALE_FOLLOWER_TIMEOUT_S, Coordinator
+from so101_backbone.coordinator import (
+    GRIPPER_STILL_FRAC,
+    GRIPPER_STILL_WINDOW_S,
+    STALE_FOLLOWER_TIMEOUT_S,
+    Coordinator,
+    GripperSettle,
+)
 from so101_backbone.params import UpstreamMode
 
 MEASURED = (0.0, 0.1, 0.2, 0.3, 0.4)
@@ -118,22 +124,150 @@ def test_busy_slots_are_single_flight_and_independent(fake_kinematics):
     assert c.try_claim_gripper()
 
 
-def test_gripper_plan_ramps_and_completes(fake_kinematics):
+def test_gripper_plan_ramps_then_settles_and_completes(fake_kinematics, follower_never_stale):
     c = make_coordinator(fake_kinematics, max_gripper_rate_frac_s=2.0)
     c.measured_gripper.set(0.0)
     assert c.try_claim_gripper()
     adopted = c.adopt_gripper_plan(1.0, timeout_s=5.0)
-    start = time.monotonic()
+    # A follower that tracks every command: 2.0/s at 100 Hz is 0.02 per
+    # tick, so the ramp to 1.0 takes about 50 ticks.
     last = 0.0
-    while not adopted.done.is_set():
-        c.measured_gripper.set(last)  # the live follower keeps streaming
-        value = c.gripper_tick(time.monotonic())
-        c.gripper_published(True, value)
-        # 2.0/s at 100 Hz is 0.02 per tick.
-        assert value - last <= 0.02 + 1e-12
+    ticks = 0
+    while last != 1.0:
+        value = gripper_step(c, last, ticks * 0.01)
+        assert 0.0 < value - last <= 0.02 + 1e-12
         last = value
-        assert time.monotonic() - start < 2.0
-    assert last == 1.0
+        ticks += 1
+        assert ticks <= 51
+        assert not adopted.done.is_set()
+    # The target sample is out and the follower stands on it: the plan keeps
+    # commanding the target through the still window.
+    assert gripper_step(c, 1.0, 1.0) == 1.0
+    assert gripper_step(c, 1.0, 1.0 + GRIPPER_STILL_WINDOW_S / 2) == 1.0
+    assert not adopted.done.is_set()
+    assert gripper_step(c, 1.0, 1.0 + GRIPPER_STILL_WINDOW_S) is None
+    assert adopted.done.is_set()
+    assert adopted.failed is None
+    assert adopted.settled == 1.0
+    c.release_gripper()
+
+
+def test_gripper_plan_is_not_done_while_the_measured_opening_still_changes(
+    fake_kinematics, follower_never_stale
+):
+    # Transparent rate: the first sample out is the target itself, while the
+    # jaws have not moved yet.
+    c = make_coordinator(fake_kinematics)
+    c.measured_gripper.set(1.0)
+    assert c.try_claim_gripper()
+    adopted = c.adopt_gripper_plan(0.5, timeout_s=5.0)
+    assert gripper_step(c, 1.0, 0.0) == 0.5
+    assert not adopted.done.is_set(), "a delivered target sample does not end the plan"
+    # The jaws lag: they close 0.05 every 50 ms and arrive at 0.5 s. All the
+    # way the plan keeps the gripper: it commands the target, ignores the
+    # leader stream, and holds the busy slot against a second goal.
+    for tick in range(1, 11):
+        c.leader_gripper.set(1.0)
+        assert gripper_step(c, 1.0 - 0.05 * tick, 0.05 * tick) == 0.5
+        assert not adopted.done.is_set()
+        assert not c.try_claim_gripper()
+    # On the target, but not for the whole window yet.
+    assert gripper_step(c, 0.5, 0.5 + GRIPPER_STILL_WINDOW_S / 2) == 0.5
+    assert not adopted.done.is_set()
+    # Still for the window: the plan ends, and that tick publishes nothing.
+    assert gripper_step(c, 0.5, 0.5 + GRIPPER_STILL_WINDOW_S) is None
+    assert adopted.done.is_set()
+    assert adopted.failed is None
+    assert adopted.settled == 0.5
+    # Until the action layer releases the slot the wire stays silent.
+    assert gripper_step(c, 0.5, 1.0) is None
+    assert not c.try_claim_gripper()
+    c.release_gripper()
+
+
+def test_gripper_held_short_of_the_target_ends_the_plan_where_it_stands(
+    fake_kinematics, follower_never_stale
+):
+    # An object stops the jaws at 0.8 on the way to 0.5.
+    c = make_coordinator(fake_kinematics)
+    c.measured_gripper.set(1.0)
+    assert c.try_claim_gripper()
+    adopted = c.adopt_gripper_plan(0.5, timeout_s=5.0)
+    assert gripper_step(c, 1.0, 0.0) == 0.5
+    assert gripper_step(c, 0.8, 0.5) == 0.5
+    assert gripper_step(c, 0.8, 0.5 + GRIPPER_STILL_WINDOW_S) is None
+    assert adopted.done.is_set()
+    assert adopted.failed is None
+    assert adopted.settled == 0.8
+    c.release_gripper()
+
+
+def test_gripper_plan_with_no_travel_still_waits_out_the_window(
+    fake_kinematics, follower_never_stale
+):
+    # The goal names the opening the gripper already holds.
+    c = make_coordinator(fake_kinematics)
+    c.measured_gripper.set(0.5)
+    assert c.try_claim_gripper()
+    adopted = c.adopt_gripper_plan(0.5, timeout_s=5.0)
+    # The first tick delivers the target sample; the settle, and with it the
+    # window, begins on the tick after.
+    assert gripper_step(c, 0.5, 0.0) == 0.5
+    assert gripper_step(c, 0.5, 0.5) == 0.5
+    assert gripper_step(c, 0.5, 0.5 + GRIPPER_STILL_WINDOW_S / 2) == 0.5
+    assert not adopted.done.is_set()
+    assert gripper_step(c, 0.5, 0.5 + GRIPPER_STILL_WINDOW_S) is None
+    assert adopted.done.is_set()
+    assert adopted.settled == 0.5
+    c.release_gripper()
+
+
+def test_a_change_larger_than_the_still_band_restarts_the_window():
+    settle = GripperSettle(began=0.0, reference=0.8, reference_at=0.0)
+    moved = 0.8 - GRIPPER_STILL_FRAC * 1.5
+    restart = GRIPPER_STILL_WINDOW_S / 2
+    assert not settle.stands_still(moved, restart)
+    # A full window after the settle began, but not after the restart.
+    assert not settle.stands_still(moved, GRIPPER_STILL_WINDOW_S)
+    assert settle.stands_still(moved, restart + GRIPPER_STILL_WINDOW_S)
+
+
+def test_a_change_smaller_than_the_still_band_keeps_the_window_running():
+    settle = GripperSettle(began=0.0, reference=0.8, reference_at=0.0)
+    jittered = 0.8 - GRIPPER_STILL_FRAC * 0.5
+    assert not settle.stands_still(jittered, GRIPPER_STILL_WINDOW_S / 2)
+    assert settle.stands_still(jittered, GRIPPER_STILL_WINDOW_S)
+
+
+def test_follower_silence_fails_a_settling_gripper_plan(fake_kinematics, follower_never_stale):
+    # A frozen last opening must not pass for a gripper standing still.
+    c = make_coordinator(fake_kinematics)
+    c.measured_gripper.set(1.0)
+    assert c.try_claim_gripper()
+    adopted = c.adopt_gripper_plan(0.5, timeout_s=5.0)
+    assert gripper_step(c, 1.0, 0.0) == 0.5
+    assert gripper_step(c, 0.5, 0.5) == 0.5
+    c.measured_gripper.clear()  # no measured opening left to judge
+    assert c.gripper_tick(0.5 + GRIPPER_STILL_WINDOW_S) is None
+    assert adopted.done.is_set()
+    assert "went stale mid-goal" in adopted.failed
+    assert adopted.settled is None
+    c.release_gripper()
+
+
+def test_publish_failure_fails_a_settling_gripper_plan(fake_kinematics, follower_never_stale):
+    c = make_coordinator(fake_kinematics)
+    c.measured_gripper.set(1.0)
+    assert c.try_claim_gripper()
+    adopted = c.adopt_gripper_plan(0.5, timeout_s=5.0)
+    assert gripper_step(c, 1.0, 0.0) == 0.5
+    assert gripper_step(c, 0.5, 0.5) == 0.5
+    c.measured_gripper.set(0.5)
+    assert c.gripper_tick(0.5 + GRIPPER_STILL_WINDOW_S / 2) == 0.5
+    c.gripper_published(False, None)
+    assert adopted.done.is_set()
+    assert "publish failed" in adopted.failed
+    assert adopted.settled is None
     c.release_gripper()
 
 

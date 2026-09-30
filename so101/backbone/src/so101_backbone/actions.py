@@ -2,7 +2,8 @@
 
 Admission (the goal decide callback) validates the request and claims the
 limb's single-flight busy slot; execution installs a trajectory plan and
-waits for the coordinator to stream it out. Cancelling freezes the limb where
+waits for the coordinator to stream it out, and a gripper goal then waits
+until the measured gripper stands still. Cancelling freezes the limb where
 the trajectory stands. Every terminal path releases the claimed slot, and no
 exception may ever kill an action server: an unforeseen failure rejects the
 goal and abandons anything admission installed.
@@ -27,12 +28,19 @@ from so101_description.transforms import (
 )
 from so101_description.units import NUM_JOINTS
 
-from so101_backbone.coordinator import ArmPlan, Coordinator, GripperPlan
+from so101_backbone.coordinator import (
+    GRIPPER_REACHED_FRAC,
+    ArmPlan,
+    Coordinator,
+    GripperPlan,
+)
 from so101_backbone.params import Config
 
-# Slack past a gripper move's nominal travel time before the goal fails: the
+# Slack past a gripper move's nominal travel time before the goal fails. It
+# covers the settle after the ramp, and it bounds a goal that cannot end: the
 # plan is anchored on live state, so a follower that stops reporting stalls
-# it, and a stalled goal must not hold the busy slot forever.
+# it, a gripper that keeps moving never settles, and neither may hold the
+# busy slot forever.
 GRIPPER_TRAVEL_GRACE_S = 2.0
 
 # Backoff after a failed goal delivery, so a persistently broken action
@@ -318,16 +326,18 @@ class ActionLayer:
     async def _finish_plan(
         self, ctx, plan, abort, results, started: float, timeout_s: float | None = None
     ) -> None:
-        """Wait out the plan or a cancel (or the travel budget, when given)
-        and complete the goal. results(action_time) builds (note, payload)
-        and runs after any abort, so it reads the plan where it stopped."""
+        """Wait out the plan or a cancel (or the travel budget, which only a
+        gripper plan carries) and complete the goal. results(action_time)
+        builds (note, payload) and runs after any abort, so it reads the plan
+        where it stopped."""
         cancel_task = asyncio.ensure_future(ctx.cancel_signal())
         done_task = asyncio.ensure_future(plan.done.wait())
         try:
             await asyncio.wait(
                 [cancel_task, done_task], timeout=timeout_s, return_when=asyncio.FIRST_COMPLETED
             )
-            action_time = time.monotonic() - started
+            now = time.monotonic()
+            action_time = now - started
             if plan.done.is_set():
                 note, payload = results(action_time)
                 success, message = _terminal(plan, note)
@@ -339,11 +349,7 @@ class ActionLayer:
             else:
                 abort(plan)
                 note, payload = results(action_time)
-                await ctx.complete(
-                    False,
-                    _join("goal did not complete within its travel budget", note),
-                    *payload,
-                )
+                await ctx.complete(False, _join(_overrun(plan, now), note), *payload)
         except Exception as e:
             log(f"goal completion failed: {e!r}")
         finally:
@@ -517,9 +523,12 @@ class ActionLayer:
         )
 
     def _final_opening(self, plan: GripperPlan) -> tuple[float, str]:
-        """Prefer the measured opening; fall back to where the ramp stood
-        when the plan was cut; only a plan cut before any command streamed
-        reports its target, saying so."""
+        """The opening the gripper stood still at, when that is how the plan
+        ended. Otherwise prefer the measured opening; fall back to where the
+        ramp stood when the plan was cut; only a plan cut before any command
+        streamed reports its target, saying so."""
+        if plan.settled is not None:
+            return plan.settled, ""
         measured = self._coordinator.measured_gripper.fresh(
             self._coordinator.follower_state_timeout_s
         )
@@ -581,10 +590,40 @@ def _require_gripper_name(gripper_name: str) -> None:
 
 def _terminal(plan: ArmPlan | GripperPlan, note: str) -> tuple[bool, str]:
     """success and message for a done plan: a coordinator-failed plan is a
-    failed goal, whatever the wall clock says."""
+    failed goal, whatever the wall clock says. A gripper plan that did not
+    fail is done because the gripper stands still, and its message says
+    whether that is on the target."""
     if plan.failed is not None:
         return False, _join(plan.failed, note)
+    if isinstance(plan, GripperPlan):
+        return True, _join(_stood_still(plan), note)
     return True, note
+
+
+def _stood_still(plan: GripperPlan) -> str:
+    """The success message for a gripper standing still: on the target when
+    within GRIPPER_REACHED_FRAC of it, else short of it, where an object or
+    the effort ceiling holds the jaws, with both openings named. Success
+    either way: the caller judges the grasp from final_opening."""
+    assert plan.settled is not None, "a gripper plan done without failing stood still"
+    if abs(plan.settled - plan.target) <= GRIPPER_REACHED_FRAC:
+        return "move complete"
+    return (
+        f"move complete: the gripper stopped at {plan.settled:.3f}, "
+        f"short of the target {plan.target:.3f}"
+    )
+
+
+def _overrun(plan: GripperPlan, now: float) -> str:
+    """Why a gripper plan ran out of its travel budget at `now`: the ramp
+    never delivered its target, or it did and the measured gripper never
+    stood still afterwards."""
+    if plan.settle is None:
+        return "goal did not complete within its travel budget"
+    return (
+        f"the gripper still moved {now - plan.settle.began:.1f} s "
+        "after the commanded move ended"
+    )
 
 
 # Beyond this the arm landed somewhere an operator would not call the pose

@@ -1,6 +1,9 @@
-"""Shared fixtures: a config, wide limits, and a fake kinematics."""
+"""Shared fixtures: a config, wide limits, a fake kinematics, a follower
+whose liveness does not ride the host's clock, and one gripper control tick."""
 
 from __future__ import annotations
+
+import math
 
 import pytest
 from so101_description.limits import JointLimits
@@ -79,6 +82,26 @@ def make_config(**overrides) -> Config:
     return Config(**{**base, **overrides})
 
 
+def gripper_step(coordinator, measured: float, now: float) -> float | None:
+    """One control tick of the gripper at the instant `now`, with the follower
+    reporting `measured`: the opening that went out, or None for silence."""
+    coordinator.measured_gripper.set(measured)
+    opening = coordinator.gripper_tick(now)
+    if opening is not None:
+        coordinator.gripper_published(True, opening)
+    return opening
+
+
 @pytest.fixture
 def fake_kinematics():
     return FakeKinematics()
+
+
+@pytest.fixture
+def follower_never_stale(monkeypatch):
+    """Keep every measured sample fresh however long the host takes. The
+    gripper settle tests hand gripper_tick their own instants, while follower
+    liveness is judged on the host's clock; pinning it keeps a scheduling
+    pause between a sample and the tick that reads it from failing the plan
+    as stale."""
+    monkeypatch.setattr("so101_backbone.coordinator.STALE_FOLLOWER_TIMEOUT_S", math.inf)
