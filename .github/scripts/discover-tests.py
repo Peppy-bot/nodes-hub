@@ -180,6 +180,9 @@ def main() -> int:
 
     write_lines(output_dir / "rust-test-dirs.txt", selection.rust_projects)
     write_lines(output_dir / "python-test-files.txt", selection.python_tests)
+    # The Rust step removes the target dir of every project the checkout no
+    # longer holds, so it needs all of them, not only the ones this run tests.
+    write_lines(output_dir / "all-rust-projects.txt", inventory.rust_projects)
 
     # A nested project owns its own tests, and a root pyproject.toml may own
     # tests too. Keeping each file's exact owner avoids running it twice in
