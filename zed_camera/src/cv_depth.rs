@@ -81,7 +81,6 @@ impl CvDepth {
             Mat::default(),
             Mat::default(),
         );
-        let (mut roi1, mut roi2) = (Rect::default(), Rect::default());
         calib3d::stereo_rectify(
             &k_left,
             &dist_left,
@@ -98,8 +97,8 @@ impl CvDepth {
             calib3d::CALIB_ZERO_DISPARITY,
             0.0,
             size,
-            &mut roi1,
-            &mut roi2,
+            None,
+            None,
         )
         .map_err(cv)?;
 
@@ -350,4 +349,98 @@ fn downscaled(gray: &Mat, size: Size) -> Result<Mat, String> {
     let mut out = Mat::default();
     imgproc::resize(gray, &mut out, size, 0.0, 0.0, INTER_AREA).map_err(cv)?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const EYE_WIDTH: u32 = 672;
+    const EYE_HEIGHT: u32 = 376;
+    const FOCAL_PX: f64 = 350.0;
+    const BASELINE_MM: f64 = 120.0;
+
+    /// A VGA rig with identical eyes, no distortion and no rotation between
+    /// them, so rectification leaves both images where they are.
+    fn ideal_vga_conf() -> String {
+        let eye = format!("fx={FOCAL_PX}\nfy={FOCAL_PX}\ncx=336\ncy=188\n");
+        format!(
+            "[LEFT_CAM_VGA]\n{eye}[RIGHT_CAM_VGA]\n{eye}\
+             [STEREO]\nBaseline={BASELINE_MM}\nRX_VGA=0\nCV_VGA=0\nRZ_VGA=0\n"
+        )
+    }
+
+    /// Luma noise in YUYV's limited range, the same for every run.
+    fn noise_rows(width: usize, height: usize) -> Vec<Vec<u8>> {
+        let mut state = 0x2545_f491_u32;
+        (0..height)
+            .map(|_| {
+                (0..width)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 17;
+                        state ^= state << 5;
+                        16 + (state % 220) as u8
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// A side-by-side YUYV frame whose right eye sees the left eye's texture
+    /// moved `shift` pixels to the left: a disparity of `shift` everywhere.
+    fn side_by_side_yuyv(shift: usize) -> Vec<u8> {
+        let (width, height) = (EYE_WIDTH as usize, EYE_HEIGHT as usize);
+        let texture = noise_rows(width + shift, height);
+        let mut frame = Vec::with_capacity(2 * width * height * 2);
+        for row in &texture {
+            let eyes = row[..width].iter().chain(&row[shift..shift + width]);
+            let lumas: Vec<u8> = eyes.copied().collect();
+            let (pairs, _) = lumas.as_chunks::<2>();
+            for &[y0, y1] in pairs {
+                frame.extend([y0, 128, y1, 128]);
+            }
+        }
+        frame
+    }
+
+    #[test]
+    fn an_ideal_rig_reads_a_uniform_disparity_as_its_depth() {
+        let shift = 20;
+        let settings = DepthSettings::new(0.5, 5, 1).unwrap();
+        let mut depth = CvDepth::create(&ideal_vga_conf(), EYE_WIDTH, EYE_HEIGHT, settings)
+            .expect("an ideal calibration rectifies");
+        let (out_width, out_height) = depth.out_size();
+        let mut left_rgb = vec![0; (EYE_WIDTH * EYE_HEIGHT * 3) as usize];
+        let mut depth_mm = vec![0; (out_width * out_height) as usize];
+
+        depth
+            .process(&side_by_side_yuyv(shift), &mut left_rgb, &mut depth_mm)
+            .unwrap();
+
+        // Away from the borders and from the columns left of the search
+        // range, where the matcher has no right pixel to compare against.
+        let margin = 8;
+        let first_column = depth.num_disparities() as usize + margin;
+        let rows = margin..out_height as usize - margin;
+        let columns = first_column..out_width as usize - margin;
+        let inner: Vec<u16> = rows
+            .flat_map(|y| columns.clone().map(move |x| (y, x)))
+            .map(|(y, x)| depth_mm[y * out_width as usize + x])
+            .collect();
+        let mut measured: Vec<u16> = inner.iter().copied().filter(|&mm| mm > 0).collect();
+        assert!(
+            measured.len() * 10 >= inner.len() * 9,
+            "only {} of {} inner pixels have a depth",
+            measured.len(),
+            inner.len()
+        );
+        measured.sort_unstable();
+        let median = f64::from(measured[measured.len() / 2]);
+        let expected = FOCAL_PX * BASELINE_MM / shift as f64;
+        assert!(
+            (median - expected).abs() <= expected * 0.01,
+            "median depth {median} mm, expected {expected} mm"
+        );
+    }
 }
