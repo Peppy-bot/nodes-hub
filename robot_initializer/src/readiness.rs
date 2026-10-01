@@ -99,14 +99,12 @@ async fn simulation_ready(runner: &NodeRunner) -> bool {
 /// robot with no drivers of its own.
 async fn every_limb_ready(runner: &NodeRunner) -> bool {
     let limbs = limb_is_ready::bound_producers(runner);
-    let polls = limbs
-        .iter()
-        .map(|limb| async move {
-            matches!(
-                limb_is_ready::poll(runner, limb, POLL_TIMEOUT).await,
-                Ok(response) if response.data.ready
-            )
-        });
+    let polls = limbs.iter().map(|limb| async move {
+        matches!(
+            limb_is_ready::poll(runner, limb, POLL_TIMEOUT).await,
+            Ok(response) if response.data.ready
+        )
+    });
     futures::future::join_all(polls)
         .await
         .into_iter()

@@ -5,9 +5,8 @@ const JPEG_QUALITY: u8 = 85;
 
 /// Convert RGB8 to BGR8 by swapping R and B channels
 fn rgb_to_bgr(data: &[u8]) -> Vec<u8> {
-    data.chunks_exact(3)
-        .flat_map(|rgb| [rgb[2], rgb[1], rgb[0]])
-        .collect()
+    let (pixels, _) = data.as_chunks::<3>();
+    pixels.iter().flat_map(|&[r, g, b]| [b, g, r]).collect()
 }
 
 /// Encode RGB8 data as JPEG
@@ -50,8 +49,8 @@ fn yuyv_to_rgb(data: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
         )));
     }
     let mut rgb = Vec::with_capacity((width as usize) * (height as usize) * 3);
-    for pair in data.chunks_exact(4) {
-        let [y0, u, y1, v] = [pair[0], pair[1], pair[2], pair[3]];
+    let (pairs, _) = data.as_chunks::<4>();
+    for &[y0, u, y1, v] in pairs {
         for y in [y0, y1] {
             let y = 1.164_384 * (f32::from(y) - 16.0);
             let u = f32::from(u) - 128.0;
@@ -360,8 +359,9 @@ mod tests {
             "grayscale must expand to RGB8"
         );
         // Grey expands to equal channels; JPEG is lossy so allow a little drift.
-        for px in frame.data().chunks_exact(3) {
-            assert!(px[0].abs_diff(px[1]) <= 2 && px[1].abs_diff(px[2]) <= 2);
+        let (pixels, _) = frame.data().as_chunks::<3>();
+        for &[r, g, b] in pixels {
+            assert!(r.abs_diff(g) <= 2 && g.abs_diff(b) <= 2);
         }
     }
 
