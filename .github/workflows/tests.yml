@@ -227,6 +227,11 @@ jobs:
         with:
           sticky_cache: custom,path=~/.cache/nodes-hub-ci
 
+      # Writes what the sticky disk holds and what grew in it to the job
+      # summary at the end of the job. Its post step runs before the one of
+      # runs-on/action above, which unmounts the disk.
+      - uses: Peppy-bot/peppy/.github/actions/sticky-disk-report@dev
+
       - name: Name the caches this run reuses
         run: python3 .github/scripts/configure-build-cache.py
 
