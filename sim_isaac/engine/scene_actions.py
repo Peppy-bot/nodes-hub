@@ -129,6 +129,48 @@ def _matches(
     )
 
 
+def _public_catalogue(assets) -> list[dict]:
+    """The catalogue metadata a caller sees, without the raw Isaac paths:
+    scenes first in their fixed order, then every other asset by kind,
+    category and name."""
+
+    public = [
+        {
+            "asset_id": asset.get("asset_id", ""),
+            "display_name": asset.get("display_name", ""),
+            "description": asset.get("description", ""),
+            "kind": asset.get("kind", ""),
+            "category": asset.get("category", ""),
+        }
+        for asset in assets
+    ]
+
+    scene_order = {
+        "scene/simple_warehouse": 0,
+        "scene/flat_grid": 1,
+        "scene/black_grid": 2,
+        "scene/curved_grid": 3,
+        "scene/simple_room": 4,
+        "scene/office": 5,
+        "scene/hospital": 6,
+        "scene/warehouse_forklifts": 7,
+        "scene/warehouse_multiple_shelves": 8,
+        "scene/full_warehouse": 9,
+    }
+
+    public.sort(
+        key=lambda item: (
+            item["kind"].lower(),
+            item["category"].lower(),
+            scene_order.get(item["asset_id"], 999) if item["kind"] == "scene" else 0,
+            item["display_name"].lower(),
+            item["asset_id"],
+        )
+    )
+
+    return public
+
+
 @dataclass
 class _PendingCommand:
     operation: str
@@ -221,6 +263,10 @@ class SceneActionIO:
         # get_assets_list says so rather than answering with nothing.
         self._assets: dict[str, dict] = {}
         self._assets_ready = False
+        # The catalogue as a caller sees it, and each asset's category,
+        # both built once when the assets come.
+        self._catalogue: list[dict] = []
+        self._category_by_asset: dict[str, str] = {}
         # The spawned objects in spawn order: what each was spawned from and
         # with. Where each one is comes from the engine at capture.
         self._objects: dict[str, dict] = {}
@@ -267,16 +313,23 @@ class SceneActionIO:
             ),
         }
 
+        services = (
+            (get_assets_list, self._handle_get_assets),
+            (get_asset_categories, self._handle_get_asset_categories),
+            (get_objects_list, self._handle_get_objects_list),
+            (get_scene, self._handle_get_scene),
+            (get_object_states, self._handle_get_object_states),
+            (get_robots_list, self._handle_get_robots),
+        )
+
         self._tasks = [
             asyncio.create_task(
                 self._serve_apply_force()
             ),
-            asyncio.create_task(self._serve_assets()),
-            asyncio.create_task(self._serve_asset_categories()),
-            asyncio.create_task(self._serve_objects_list()),
-            asyncio.create_task(self._serve_scene()),
-            asyncio.create_task(self._serve_object_states()),
-            asyncio.create_task(self._serve_robots()),
+            *(
+                asyncio.create_task(self._serve_service(module, handler))
+                for module, handler in services
+            ),
             asyncio.create_task(self._serve_load_scene()),
             asyncio.create_task(self._serve_clear_scene()),
             asyncio.create_task(self._serve_spawn_object()),
@@ -315,6 +368,11 @@ class SceneActionIO:
                 asset_id: dict(asset)
                 for asset_id, asset in assets.items()
             }
+            self._catalogue = _public_catalogue(self._assets.values())
+            self._category_by_asset = {
+                asset["asset_id"]: asset["category"]
+                for asset in self._catalogue
+            }
             self._assets_ready = True
 
         logger.info(
@@ -351,71 +409,11 @@ class SceneActionIO:
         with self._lock:
             return object_id in self._objects
 
-    def _public_assets(self) -> list:
-        """Return catalogue metadata without exposing raw Isaac paths."""
+    def _public_assets(self) -> list[dict]:
+        """The catalogue as a caller sees it."""
 
         with self._lock:
-            assets = list(
-                self._assets.values()
-            )
-
-        public = []
-
-        for asset in assets:
-            public.append(
-                {
-                    "asset_id": asset.get(
-                        "asset_id",
-                        "",
-                    ),
-                    "display_name": asset.get(
-                        "display_name",
-                        "",
-                    ),
-                    "description": asset.get(
-                        "description",
-                        "",
-                    ),
-                    "kind": asset.get(
-                        "kind",
-                        "",
-                    ),
-                    "category": asset.get(
-                        "category",
-                        "",
-                    ),
-                }
-            )
-
-        scene_order = {
-            "scene/simple_warehouse": 0,
-            "scene/flat_grid": 1,
-            "scene/black_grid": 2,
-            "scene/curved_grid": 3,
-            "scene/simple_room": 4,
-            "scene/office": 5,
-            "scene/hospital": 6,
-            "scene/warehouse_forklifts": 7,
-            "scene/warehouse_multiple_shelves": 8,
-            "scene/full_warehouse": 9,
-        }
-
-        public.sort(
-            key=lambda item: (
-                item["kind"].lower(),
-                item["category"].lower(),
-                scene_order.get(
-                    item["asset_id"],
-                    999,
-                )
-                if item["kind"] == "scene"
-                else 0,
-                item["display_name"].lower(),
-                item["asset_id"],
-            )
-        )
-
-        return public
+            return self._catalogue
 
     def _catalogue_ready(self) -> str | None:
         """Why the catalogue cannot be answered yet, or None once it can."""
@@ -536,6 +534,7 @@ class SceneActionIO:
         with self._lock:
             snapshot = self._snapshot
             unavailable = self._unavailable
+            category_by_asset = self._category_by_asset
 
         if snapshot is None:
             return get_objects_list.Response(
@@ -549,8 +548,7 @@ class SceneActionIO:
 
         if source != "scene":
             for record in snapshot.objects:
-                asset = self._asset(record.asset_id) or {}
-                asset_category = str(asset.get("category", ""))
+                asset_category = category_by_asset.get(record.asset_id, "")
 
                 if category is not None and category != asset_category:
                     continue
@@ -1194,12 +1192,18 @@ class SceneActionIO:
                 message,
             )
 
-    async def _serve_assets(self) -> None:
+    async def _serve_service(self, module, handler) -> None:
+        """Answers the requests of the service `module` with `handler` for
+        the life of the node; a round that fails is logged and the next one
+        starts a second later."""
+
+        name = module.__name__.rsplit(".", 1)[-1]
+
         while True:
             try:
-                await get_assets_list.handle_next_request(
+                await module.handle_next_request(
                     self._node_runner,
-                    self._handle_get_assets,
+                    handler,
                 )
 
             except asyncio.CancelledError:
@@ -1207,92 +1211,8 @@ class SceneActionIO:
 
             except Exception:
                 logger.exception(
-                    "get_assets_list service failed"
-                )
-                await asyncio.sleep(1.0)
-
-    async def _serve_asset_categories(self) -> None:
-        while True:
-            try:
-                await get_asset_categories.handle_next_request(
-                    self._node_runner,
-                    self._handle_get_asset_categories,
-                )
-
-            except asyncio.CancelledError:
-                raise
-
-            except Exception:
-                logger.exception(
-                    "get_asset_categories service failed"
-                )
-                await asyncio.sleep(1.0)
-
-    async def _serve_objects_list(self) -> None:
-        while True:
-            try:
-                await get_objects_list.handle_next_request(
-                    self._node_runner,
-                    self._handle_get_objects_list,
-                )
-
-            except asyncio.CancelledError:
-                raise
-
-            except Exception:
-                logger.exception(
-                    "get_objects_list service failed"
-                )
-                await asyncio.sleep(1.0)
-
-    async def _serve_scene(self) -> None:
-        while True:
-            try:
-                await get_scene.handle_next_request(
-                    self._node_runner,
-                    self._handle_get_scene,
-                )
-
-            except asyncio.CancelledError:
-                raise
-
-            except Exception:
-                logger.exception(
-                    "get_scene service failed"
-                )
-                await asyncio.sleep(1.0)
-
-    async def _serve_object_states(self) -> None:
-        while True:
-            try:
-                await get_object_states.handle_next_request(
-                    self._node_runner,
-                    self._handle_get_object_states,
-                )
-
-            except asyncio.CancelledError:
-                raise
-
-            except Exception:
-                logger.exception(
-                    "get_object_states service failed"
-                )
-                await asyncio.sleep(1.0)
-
-    async def _serve_robots(self) -> None:
-        while True:
-            try:
-                await get_robots_list.handle_next_request(
-                    self._node_runner,
-                    self._handle_get_robots,
-                )
-
-            except asyncio.CancelledError:
-                raise
-
-            except Exception:
-                logger.exception(
-                    "get_robots_list service failed"
+                    "%s service failed",
+                    name,
                 )
                 await asyncio.sleep(1.0)
 

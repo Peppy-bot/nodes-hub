@@ -151,6 +151,14 @@ impl Side {
         }
     }
 
+    /// This side in the description's vocabulary.
+    pub fn model(self) -> openarm_description::Side {
+        match self {
+            Side::Left => openarm_description::Side::Left,
+            Side::Right => openarm_description::Side::Right,
+        }
+    }
+
     /// Index into a left-then-right `[T; 2]`.
     pub fn index(self) -> usize {
         match self {
@@ -189,6 +197,12 @@ pub fn limb_names() -> LimbNames {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn side_model_maps_this_crate_onto_the_description() {
+        assert_eq!(Side::Left.model(), openarm_description::Side::Left);
+        assert_eq!(Side::Right.model(), openarm_description::Side::Right);
+    }
 
     // Pins the name tables to the parsers: a name the tables advertise (on
     // limb_state's arm_names/gripper_names) must parse back to its side, and

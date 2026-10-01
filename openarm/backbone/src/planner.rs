@@ -100,12 +100,7 @@ impl JointReply {
     ) {
         let cancelled = outcome.is_cancelled();
         let stopped = matches!(outcome, Outcome::Stopped(_));
-        let (success, message) = match outcome {
-            Outcome::Complete => (true, "trajectory complete".to_string()),
-            Outcome::Cancelled => (false, "goal cancelled".to_string()),
-            Outcome::Stopped(message) => (false, message),
-            Outcome::Failed(reason) => (false, reason),
-        };
+        let (success, message) = outcome.report(|| "trajectory complete".to_string());
         match self {
             Self::MoveArmJoints(ctx) => {
                 let result = if cancelled {
@@ -173,13 +168,10 @@ impl Goal {
             }
             Goal::Cartesian { ctx, .. } => {
                 let cancelled = outcome.is_cancelled();
-                let message = match outcome {
-                    Outcome::Complete => unreachable!("an unstarted goal never completes"),
-                    Outcome::Cancelled => "goal cancelled".to_string(),
-                    Outcome::Stopped(message) | Outcome::Failed(message) => message,
-                };
+                let (success, message) =
+                    outcome.report(|| unreachable!("an unstarted goal never completes"));
                 planner
-                    .finish_cartesian(&ctx, reported_q, false, &message, 0.0, cancelled)
+                    .finish_cartesian(&ctx, reported_q, success, &message, 0.0, cancelled)
                     .await;
             }
         }
@@ -297,6 +289,16 @@ impl Outcome {
     /// Whether the goal ends through its cancelled completion.
     fn is_cancelled(&self) -> bool {
         matches!(self, Self::Cancelled | Self::Stopped(_))
+    }
+
+    /// What the goal reports: whether it succeeded, and the words, which
+    /// `completed` gives for a move that ran to its end.
+    fn report(self, completed: impl FnOnce() -> String) -> (bool, String) {
+        match self {
+            Self::Complete => (true, completed()),
+            Self::Cancelled => (false, "goal cancelled".to_string()),
+            Self::Stopped(message) | Self::Failed(message) => (false, message),
+        }
     }
 }
 
@@ -494,12 +496,8 @@ impl Planner {
             Mode::CartesianMove(m) => {
                 let elapsed = now.duration_since(m.path.motion_start()).as_secs_f64();
                 let cancelled = outcome.is_cancelled();
-                let message = match outcome {
-                    Outcome::Complete => m.path.completion_message().to_string(),
-                    Outcome::Cancelled => "goal cancelled".to_string(),
-                    Outcome::Stopped(message) | Outcome::Failed(message) => message,
-                };
-                self.finish_cartesian(&m.ctx, measured_q, false, &message, elapsed, cancelled)
+                let (success, message) = outcome.report(|| m.path.completion_message().to_string());
+                self.finish_cartesian(&m.ctx, measured_q, success, &message, elapsed, cancelled)
                     .await;
                 true
             }
@@ -772,21 +770,10 @@ impl Planner {
         outcome: Outcome,
         elapsed: f64,
     ) -> Advance {
-        let (success, message) = match &outcome {
-            Outcome::Complete => (true, m.path.completion_message()),
-            Outcome::Cancelled => (false, "goal cancelled"),
-            Outcome::Stopped(message) => (false, message.as_str()),
-            Outcome::Failed(reason) => (false, reason.as_str()),
-        };
-        self.finish_cartesian(
-            &m.ctx,
-            measured_q,
-            success,
-            message,
-            elapsed,
-            outcome.is_cancelled(),
-        )
-        .await;
+        let cancelled = outcome.is_cancelled();
+        let (success, message) = outcome.report(|| m.path.completion_message().to_string());
+        self.finish_cartesian(&m.ctx, measured_q, success, &message, elapsed, cancelled)
+            .await;
         Advance::ends_move(m.prev_q_des)
     }
 

@@ -1284,14 +1284,10 @@ class SimLauncher:
     ) -> None:
         """Moves a runtime object to the command's position; with an
         orientation, a unit quaternion (x, y, z, w), it turns the object to
-        it too, as a spawn stands it."""
+        it too, as a spawn stands it, and without one the object keeps its
+        turn."""
 
         import omni.usd
-
-        from pxr import (
-            Gf,
-            UsdGeom,
-        )
 
         name = command["name"]
 
@@ -1316,53 +1312,25 @@ class SimLauncher:
 
         orientation = command.get("orientation")
 
-        if orientation is not None:
-            self._world.place(
-                prim,
-                [float(value) for value in position],
-                tuple(float(value) for value in orientation),
-            )
+        self._world.place(
+            prim,
+            [float(value) for value in position],
+            None if orientation is None else tuple(float(value) for value in orientation),
+        )
 
+        if orientation is None:
             logger.info(
-                "Moved runtime object '%s' to %s, turned to %s",
+                "Moved runtime object '%s' to %s",
                 name,
                 position,
-                orientation,
             )
             return
 
-        xformable = UsdGeom.Xformable(
-            prim
-        )
-
-        translate_op = None
-
-        for op in xformable.GetOrderedXformOps():
-            if (
-                op.GetOpType()
-                ==
-                UsdGeom.XformOp.TypeTranslate
-            ):
-                translate_op = op
-                break
-
-        if translate_op is None:
-            translate_op = (
-                xformable.AddTranslateOp()
-            )
-
-        translate_op.Set(
-            Gf.Vec3d(
-                float(position[0]),
-                float(position[1]),
-                float(position[2]),
-            )
-        )
-
         logger.info(
-            "Moved runtime object '%s' to %s",
+            "Moved runtime object '%s' to %s, turned to %s",
             name,
             position,
+            orientation,
         )
 
     def _runtime_remove(

@@ -83,6 +83,27 @@ def test_the_placement_ops_lead_whatever_the_model_carried(place):
     ]
 
 
+def test_a_placement_naming_no_orientation_moves_the_prim_and_keeps_its_turn(place):
+    _stage, prim = _prim(carries_orient=True)
+    place(prim, (1.0, 0.0, 0.0), _turned(QUARTER_TURN))
+
+    place(prim, (0.0, 2.0, 0.0))
+
+    base = _base_of(prim)
+    assert base[0] == pytest.approx(0.0, abs=1e-6), base
+    assert base[1] == pytest.approx(2.0, abs=1e-6), base
+    # Still a quarter turn: a point a metre ahead of the base is a metre to
+    # its left of where it stands.
+    local = UsdGeom.Xformable(prim).GetLocalTransformation(Usd.TimeCode.Default())
+    ahead = local.Transform(Gf.Vec3d(1, 0, 0))
+    assert ahead[0] == pytest.approx(0.0, abs=1e-6), ahead
+    assert ahead[1] == pytest.approx(3.0, abs=1e-6), ahead
+    assert [op.GetOpName() for op in UsdGeom.Xformable(prim).GetOrderedXformOps()][:2] == [
+        "xformOp:translate",
+        "xformOp:orient",
+    ]
+
+
 class _FakeStage:
     """Enough of a stage for World.move: it hands back the prim it was
     given, as the live stage does."""

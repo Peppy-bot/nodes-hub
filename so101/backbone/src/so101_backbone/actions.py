@@ -57,6 +57,12 @@ _GOAL_RETRY_S = 1.0
 # the arm until a manual cancel.
 MAX_REQUESTED_DURATION_S = 120.0
 
+# The refusal of an arm goal, or a check of one, while another arm goal runs.
+ARM_BUSY = "another arm goal is in flight"
+# The refusal of an arm goal, or a check of one, while no follower state is
+# fresh enough to anchor the move from.
+NO_ANCHOR = "no fresh follower state to anchor the move from"
+
 
 class Rejection(ValueError):
     """A goal that must not run, with the operator-facing reason."""
@@ -178,9 +184,9 @@ class ActionLayer:
         _require_duration(duration_s)
         anchor = self._coordinator.arm_anchor()
         if anchor is None:
-            raise Rejection("no fresh follower state to anchor the move from")
+            raise Rejection(NO_ANCHOR)
         if not self._coordinator.try_claim_arm():
-            raise Rejection("another arm goal is in flight")
+            raise Rejection(ARM_BUSY)
         try:
             profile = minimum_jerk.plan(
                 anchor, target, duration_s, self._config.max_joint_velocity_rad_s
@@ -238,9 +244,9 @@ class ActionLayer:
             position, orientation, duration_s, position_tolerance_m, orientation_tolerance_rad
         )
         if self._coordinator.arm_anchor() is None:
-            raise Rejection("no fresh follower state to anchor the move from")
+            raise Rejection(NO_ANCHOR)
         if not self._coordinator.try_claim_arm():
-            raise Rejection("another arm goal is in flight")
+            raise Rejection(ARM_BUSY)
         return goal
 
     def _admit_posture(self, target: tuple[float, ...], duration_s: float) -> ArmPlan:
@@ -369,7 +375,7 @@ class ActionLayer:
         landing point."""
         if plan is None:
             await _complete_guarded(
-                ctx, False, "goal admission was walked back", [0.0] * NUM_JOINTS, 0.0
+                ctx.complete, False, "goal admission was walked back", [0.0] * NUM_JOINTS, 0.0
             )
             return
 
@@ -386,7 +392,7 @@ class ActionLayer:
 
     async def drive_posture(self, ctx, plan: ArmPlan | None) -> None:
         if plan is None:
-            await _complete_guarded(ctx, False, "goal admission was walked back")
+            await _complete_guarded(ctx.complete, False, "goal admission was walked back")
             return
 
         def results(_action_time):
@@ -467,10 +473,10 @@ class ActionLayer:
         except Rejection as e:
             return False, str(e), 0.0
         if self._coordinator.arm_busy:
-            return False, "another arm goal is in flight", 0.0
+            return False, ARM_BUSY, 0.0
         seed = self._coordinator.arm_anchor()
         if seed is None:
-            return False, "no fresh follower state to anchor the move from", 0.0
+            return False, NO_ANCHOR, 0.0
         try:
             _solution, planned_s = await self._plan_pose(solver, kinematics, seed, goal)
         except PlanRefused as e:
@@ -495,7 +501,7 @@ class ActionLayer:
         stop's message, and nothing is installed."""
         if goal is None:
             await _complete_guarded(
-                ctx, False, "goal admission was walked back", *_no_pose(), 0.0
+                ctx.complete, False, "goal admission was walked back", *_no_pose(), 0.0
             )
             return
         started = time.monotonic()
@@ -503,7 +509,7 @@ class ActionLayer:
             seed = self._coordinator.arm_anchor()
             if seed is None:
                 await _complete_guarded(
-                    ctx, False, "follower state went stale before the move started",
+                    ctx.complete, False, "follower state went stale before the move started",
                     *_no_pose(), 0.0,
                 )
                 return
@@ -513,7 +519,7 @@ class ActionLayer:
             except PlanRefused as e:
                 position, orientation = kinematics.forward_kinematics(seed)
                 await _complete_guarded(
-                    ctx, False, str(e),
+                    ctx.complete, False, str(e),
                     list(position), list(orientation), time.monotonic() - started,
                 )
                 return
@@ -523,19 +529,16 @@ class ActionLayer:
                 # accepted goal.
                 log(f"pose solve failed: {e!r}")
                 await _complete_guarded(
-                    ctx, False, f"pose solve failed: {e!r}",
+                    ctx.complete, False, f"pose solve failed: {e!r}",
                     *_no_pose(), time.monotonic() - started,
                 )
                 return
             if self._coordinator.stop_count != stops_before:
                 position, orientation = kinematics.forward_kinematics(seed)
-                try:
-                    await ctx.complete_cancelled(
-                        False, self._coordinator.last_stop,
-                        list(position), list(orientation), time.monotonic() - started,
-                    )
-                except Exception as e:
-                    log(f"goal completion failed: {e!r}")
+                await _complete_guarded(
+                    ctx.complete_cancelled, False, self._coordinator.last_stop,
+                    list(position), list(orientation), time.monotonic() - started,
+                )
                 return
             profile = minimum_jerk.plan(
                 seed, solution, duration_s, self._config.max_joint_velocity_rad_s
@@ -560,7 +563,7 @@ class ActionLayer:
 
     async def drive_gripper(self, ctx, plan: GripperPlan | None) -> None:
         if plan is None:
-            await _complete_guarded(ctx, False, "goal admission was walked back", 0.0, 0.0)
+            await _complete_guarded(ctx.complete, False, "goal admission was walked back", 0.0, 0.0)
             return
 
         def results(action_time):
@@ -752,9 +755,11 @@ def _no_pose() -> tuple[list[float], list[float]]:
     return [0.0] * 3, [0.0, 0.0, 0.0, 1.0]
 
 
-async def _complete_guarded(ctx, *args) -> None:
+async def _complete_guarded(complete, *args) -> None:
+    """Ends the goal through `complete`, the context's complete or
+    complete_cancelled, and logs a completion the runtime refused."""
     try:
-        await ctx.complete(*args)
+        await complete(*args)
     except Exception as e:
         log(f"goal completion failed: {e!r}")
 

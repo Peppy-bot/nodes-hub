@@ -18,12 +18,13 @@ use openarm_description::{CameraMount, HardwareVersion};
 use peppygen::NodeRunner;
 use peppygen::exposed_services::camera_mounts::get_camera_poses;
 use peppylib::runtime::CancellationToken;
-use srs_model::nalgebra::{Isometry3, Quaternion, Translation3, UnitQuaternion, Vector3};
+use srs_model::chain_kinematics::Tree;
+use srs_model::nalgebra::{Isometry3, UnitQuaternion, Vector3};
 use tokio::sync::watch;
 use tracing::{error, info};
 
 use crate::arm_pair::ArmPair;
-use crate::types::{Side, world_pose_arrays};
+use crate::types::{Side, pose_from_wire, world_pose_arrays};
 
 /// What the service answers while the coordinator has measured nothing yet.
 const NOT_MEASURED_YET: &str = "the robot has not measured its joints yet";
@@ -96,10 +97,16 @@ impl CameraMounts {
     /// carried by the base, in the robot frame; any other mount is refused.
     pub fn resolve(version: HardwareVersion) -> Result<Self, CameraMountError> {
         let robot = urdf_rs::read_from_string(version.urdf()).expect("bundled URDF must parse");
+        let tree = Tree::from_robot(&robot).expect("bundled URDF must be one tree");
+        for side in [Side::Left, Side::Right] {
+            if tree.link_index(version.tcp_link(side.model())).is_none() {
+                return Err(CameraMountError::NoToolJoint { side: side.label() });
+            }
+        }
         let mounts = version
             .camera_mounts()
             .iter()
-            .map(|mount| resolve_mount(&robot, version, mount))
+            .map(|mount| resolve_mount(&tree, version, mount))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self { mounts })
     }
@@ -113,11 +120,7 @@ impl CameraMounts {
                 let (carried_by, pose) = match mount.carrier {
                     Carrier::Base => ("", mount.pose),
                     Carrier::Arm(side) => {
-                        let grasp = match side {
-                            Side::Left => grasps.left,
-                            Side::Right => grasps.right,
-                        };
-                        (Side::ARM_NAMES[side.index()], grasp * mount.pose)
+                        (Side::ARM_NAMES[side.index()], grasps.get(side) * mount.pose)
                     }
                 };
                 CameraPose {
@@ -130,30 +133,32 @@ impl CameraMounts {
     }
 }
 
+/// The description's pose of `mount` in the link that carries it.
+fn mount_pose(mount: &CameraMount) -> Isometry3<f64> {
+    let [w, x, y, z] = mount.quat_wxyz;
+    pose_from_wire(mount.position, [x, y, z, w]).expect("the description's mount pose is a pose")
+}
+
 /// One mount in its carrier's frame: the description's pose, turned half a
 /// turn about X into the optical frame, composed below the link it is fixed
 /// to as that link stands in its carrier's frame.
 fn resolve_mount(
-    robot: &urdf_rs::Robot,
+    tree: &Tree,
     version: HardwareVersion,
     mount: &CameraMount,
 ) -> Result<ResolvedMount, CameraMountError> {
-    let [w, x, y, z] = mount.quat_wxyz;
-    let in_link = Isometry3::from_parts(
-        Translation3::new(mount.position[0], mount.position[1], mount.position[2]),
-        UnitQuaternion::from_quaternion(Quaternion::new(w, x, y, z)),
-    ) * UnitQuaternion::from_axis_angle(&Vector3::x_axis(), PI);
+    let in_link = mount_pose(mount) * UnitQuaternion::from_axis_angle(&Vector3::x_axis(), PI);
+    let Some(link) = tree.link_index(mount.parent_link) else {
+        return Err(CameraMountError::UnknownLink {
+            camera: mount.name.to_string(),
+            link: mount.parent_link.to_string(),
+        });
+    };
     for side in [Side::Left, Side::Right] {
-        let tool_joint = robot
-            .joints
-            .iter()
-            .find(|joint| joint.child.link == version.tcp_link(model_side(side)))
-            .ok_or(CameraMountError::NoToolJoint { side: side.label() })?;
-        if tool_joint.parent.link == mount.parent_link {
-            // The camera and the grasp point hang off one link: the camera
-            // in the grasp point's frame is the tool transform undone, then
-            // the mount.
-            let tool = joint_origin(tool_joint);
+        // The grasp point hangs off the camera's link over fixed joints: the
+        // camera in the grasp point's frame is the tool transform undone,
+        // then the mount.
+        if let Some(tool) = tree.fixed_path_to(link, version.tcp_link(side.model())) {
             return Ok(ResolvedMount {
                 name: mount.name,
                 carrier: Carrier::Arm(side),
@@ -161,7 +166,16 @@ fn resolve_mount(
             });
         }
     }
-    let link_in_root = fixed_pose_from_root(robot, mount.name, mount.parent_link)?;
+    let link_in_root = if link == tree.root() {
+        Isometry3::identity()
+    } else {
+        tree.fixed_path_to(tree.root(), mount.parent_link)
+            .ok_or_else(|| CameraMountError::MovingLink {
+                camera: mount.name.to_string(),
+                link: mount.parent_link.to_string(),
+                joint: moving_joint_above(tree, link),
+            })?
+    };
     Ok(ResolvedMount {
         name: mount.name,
         carrier: Carrier::Base,
@@ -169,55 +183,14 @@ fn resolve_mount(
     })
 }
 
-/// The pose of `link` in the URDF root's frame, over fixed joints alone: a
-/// link a moving joint carries is refused, naming the joint.
-fn fixed_pose_from_root(
-    robot: &urdf_rs::Robot,
-    camera: &str,
-    link: &str,
-) -> Result<Isometry3<f64>, CameraMountError> {
-    if !robot.links.iter().any(|l| l.name == link) {
-        return Err(CameraMountError::UnknownLink {
-            camera: camera.to_string(),
-            link: link.to_string(),
-        });
-    }
-    let mut pose = Isometry3::identity();
-    let mut current = link;
-    while let Some(joint) = robot
-        .joints
-        .iter()
-        .find(|joint| joint.child.link == current)
-    {
-        if joint.joint_type != urdf_rs::JointType::Fixed {
-            return Err(CameraMountError::MovingLink {
-                camera: camera.to_string(),
-                link: link.to_string(),
-                joint: joint.name.clone(),
-            });
-        }
-        pose = joint_origin(joint) * pose;
-        current = &joint.parent.link;
-    }
-    Ok(pose)
-}
-
-/// A joint's origin as an isometry: URDF rpy is extrinsic X, Y, Z.
-fn joint_origin(joint: &urdf_rs::Joint) -> Isometry3<f64> {
-    let [x, y, z] = joint.origin.xyz.0;
-    let [roll, pitch, yaw] = joint.origin.rpy.0;
-    Isometry3::from_parts(
-        Translation3::new(x, y, z),
-        UnitQuaternion::from_euler_angles(roll, pitch, yaw),
-    )
-}
-
-/// This crate's side in the description's vocabulary.
-fn model_side(side: Side) -> openarm_description::Side {
-    match side {
-        Side::Left => openarm_description::Side::Left,
-        Side::Right => openarm_description::Side::Right,
-    }
+/// The name of the first joint between the root and `link` that moves.
+fn moving_joint_above(tree: &Tree, link: usize) -> String {
+    tree.path_to(link)
+        .into_iter()
+        .map(|joint| tree.joint(joint))
+        .find(|joint| joint.kind.is_movable())
+        .map(|joint| joint.name.clone())
+        .expect("a link no fixed path reaches hangs below a moving joint")
 }
 
 /// The answer to one request: every camera's pose at `measured`, or the
@@ -287,7 +260,7 @@ mod tests {
     }
 
     fn v2_arm(side: Side) -> srs_model::Arm {
-        crate::arm_model(HardwareVersion::V2, model_side(side)).expect("build the arm")
+        crate::arm_model(HardwareVersion::V2, side.model()).expect("build the arm")
     }
 
     /// The grasp pose of `side` at `q`, in the robot frame.
@@ -326,9 +299,7 @@ mod tests {
         // The model's camera looks along its own -Z; the optical frame's +Z
         // is that same direction, and its +Y points down the image where
         // the model's +Y pointed up it.
-        let model = &HardwareVersion::V2.camera_mounts()[2];
-        let [w, x, y, z] = model.quat_wxyz;
-        let model_rotation = UnitQuaternion::from_quaternion(Quaternion::new(w, x, y, z));
+        let model_rotation = mount_pose(&HardwareVersion::V2.camera_mounts()[2]).rotation;
         let view = model_rotation * -Vector3::z();
         let image_up = model_rotation * Vector3::y();
         let optical = chest.pose.rotation;
@@ -368,13 +339,8 @@ mod tests {
         // mount in that link, then the half turn into the optical frame.
         let arm = v2_arm(Side::Left);
         let tip_in_root = arm.world_pose(&arm.at(&bent).tip_pose());
-        let model = &HardwareVersion::V2.camera_mounts()[0];
-        let [w, x, y, z] = model.quat_wxyz;
         let expected = tip_in_root
-            * Isometry3::from_parts(
-                Translation3::new(model.position[0], model.position[1], model.position[2]),
-                UnitQuaternion::from_quaternion(Quaternion::new(w, x, y, z)),
-            )
+            * mount_pose(&HardwareVersion::V2.camera_mounts()[0])
             * UnitQuaternion::from_axis_angle(&Vector3::x_axis(), PI);
         assert!(
             (left_bent.pose.translation.vector - expected.translation.vector).norm() < 1e-9,

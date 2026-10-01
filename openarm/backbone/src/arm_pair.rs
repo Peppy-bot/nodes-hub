@@ -2,6 +2,8 @@
 //! everywhere (governing, streaming, the per-tick math), so a named `left`/`right`
 //! pair reads far better than `[_; 2]` indexed by 0/1 or a bare tuple.
 
+use crate::types::Side;
+
 /// A `left`/`right` pair of the same type: joint vectors, planners, the per-arm
 /// channel bundles.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -13,5 +15,21 @@ pub struct ArmPair<T> {
 impl<T> ArmPair<T> {
     pub fn new(left: T, right: T) -> Self {
         Self { left, right }
+    }
+
+    /// The value held for `side`.
+    pub fn get(&self, side: Side) -> &T {
+        match side {
+            Side::Left => &self.left,
+            Side::Right => &self.right,
+        }
+    }
+
+    /// The value held for `side`, to change.
+    pub fn get_mut(&mut self, side: Side) -> &mut T {
+        match side {
+            Side::Left => &mut self.left,
+            Side::Right => &mut self.right,
+        }
     }
 }

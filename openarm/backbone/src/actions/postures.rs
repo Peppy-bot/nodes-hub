@@ -19,14 +19,6 @@ use crate::actions::claim;
 use crate::planner::{Goal, JointReply, ReadyOutcome, ReadyReply};
 use crate::types::Side;
 
-/// This crate's side in the description's vocabulary.
-fn model_side(side: Side) -> openarm_description::Side {
-    match side {
-        Side::Left => openarm_description::Side::Left,
-        Side::Right => openarm_description::Side::Right,
-    }
-}
-
 /// Claim both arms' single-flight slots, or name the busy arm. A failure on
 /// the second claim unwinds the first, so a refusal never leaves a slot held.
 fn claim_both(busy: &[Arc<AtomicBool>; 2]) -> std::result::Result<(), &'static str> {
@@ -123,7 +115,7 @@ macro_rules! posture_runner {
                 for side in [Side::Left, Side::Right] {
                     let idx = side.index();
                     let goal = Goal::Joint {
-                        target: $posture(model_side(side)),
+                        target: $posture(side.model()),
                         duration_s,
                         reply: JointReply::Ready(ReadyReply {
                             done_tx: done_tx.clone(),
@@ -191,12 +183,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn model_side_maps_this_crate_onto_the_description() {
-        assert_eq!(model_side(Side::Left), openarm_description::Side::Left);
-        assert_eq!(model_side(Side::Right), openarm_description::Side::Right);
-    }
-
-    #[test]
     fn both_postures_sit_inside_both_generations_joint_limits() {
         // The planner sends postures unclamped, so an out-of-limit posture
         // would reach the arms; this pin, against the same floored model the
@@ -206,7 +192,7 @@ mod tests {
         use openarm_description::{HardwareVersion, JointPosture, home, ready};
         for version in [HardwareVersion::V1, HardwareVersion::V2] {
             for side in [Side::Left, Side::Right] {
-                let model = crate::arm_model(version, model_side(side))
+                let model = crate::arm_model(version, side.model())
                     .expect("build arm from the bundled URDF");
                 let limits = model.limits();
                 let postures = [
@@ -217,7 +203,7 @@ mod tests {
                     ("home", home),
                 ];
                 for (name, posture) in postures {
-                    let q_all = posture(model_side(side));
+                    let q_all = posture(side.model());
                     for (j, (&q, limit)) in q_all.iter().zip(&limits).enumerate() {
                         assert!(
                             q >= limit.lo && q <= limit.hi,

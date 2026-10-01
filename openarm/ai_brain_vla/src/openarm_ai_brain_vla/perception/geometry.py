@@ -38,7 +38,7 @@ from peppygen.consumed_services.geometry import get_color_intrinsics, get_depth_
 
 from ..ports import Refusal
 from ..waiting import unless_cancelled
-from .camera import Intrinsics
+from .camera import CameraModel, Intrinsics
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +83,26 @@ async def camera_intrinsics(node_runner, producer) -> Intrinsics:
         raise Refusal(f"the camera's intrinsics are unusable: {error}") from error
 
 
+async def _learn(token, perceiver, reason_attribute: str, ask, learned) -> None:
+    """Asks `ask` for the camera until it answers one, then gives it to the
+    perceiver and logs it through `learned`; meanwhile the perceiver's
+    `reason_attribute` carries the last reason the answer was refused."""
+    reported = ""
+    while not token.is_cancelled():
+        try:
+            camera = await ask()
+        except Refusal as refusal:
+            setattr(perceiver, reason_attribute, refusal.message)
+            if refusal.message != reported:
+                logger.info("%s; asking again every %g s", refusal.message, INTRINSICS_RETRY_S)
+                reported = refusal.message
+            await unless_cancelled(token, asyncio.sleep(INTRINSICS_RETRY_S))
+            continue
+        perceiver.set_camera(camera)
+        learned(camera)
+        return
+
+
 async def learn_intrinsics(node_runner, token, perceiver) -> None:
     """Asks the geometry slot for the camera's intrinsics until it has
     them, and gives the perceiver its camera; meanwhile the perceiver
@@ -91,23 +111,21 @@ async def learn_intrinsics(node_runner, token, perceiver) -> None:
     if producer is None:
         perceiver.intrinsics_reason = VACANT
         return
-    reported = ""
-    while not token.is_cancelled():
-        try:
-            intrinsics = await camera_intrinsics(node_runner, producer)
-        except Refusal as refusal:
-            perceiver.intrinsics_reason = refusal.message
-            if refusal.message != reported:
-                logger.info("%s; asking again every %g s", refusal.message, INTRINSICS_RETRY_S)
-                reported = refusal.message
-            await unless_cancelled(token, asyncio.sleep(INTRINSICS_RETRY_S))
-            continue
-        perceiver.set_camera(perceiver.camera.with_intrinsics(intrinsics))
+
+    async def ask() -> CameraModel:
+        # The perceiver's camera is read after the answer, so a pose the
+        # other learner gave it meanwhile is kept.
+        intrinsics = await camera_intrinsics(node_runner, producer)
+        return perceiver.camera.with_intrinsics(intrinsics)
+
+    def learned(camera: CameraModel) -> None:
+        k = camera.intrinsics
         logger.info(
             "camera geometry: %dx%d fx %.1f fy %.1f cx %.1f cy %.1f %s",
-            intrinsics.width, intrinsics.height, intrinsics.fx, intrinsics.fy, intrinsics.cx, intrinsics.cy, intrinsics.distortion_model,
+            k.width, k.height, k.fx, k.fy, k.cx, k.cy, k.distortion_model,
         )
-        return
+
+    await _learn(token, perceiver, "intrinsics_reason", ask, learned)
 
 
 def camera_pose_from(data, camera_name: str):
@@ -144,22 +162,18 @@ async def learn_camera_pose(node_runner, token, perceiver, camera_name: str) -> 
     if producer is None:
         perceiver.pose_reason = MOUNTS_VACANT
         return
-    reported = ""
-    while not token.is_cancelled():
+
+    async def ask() -> CameraModel:
+        position, orientation = await camera_pose(node_runner, producer, camera_name)
         try:
-            position, orientation = await camera_pose(node_runner, producer, camera_name)
-            placed = perceiver.camera.with_pose(position, orientation)
-        except (Refusal, ValueError) as refusal:
-            message = str(refusal)
-            perceiver.pose_reason = message
-            if message != reported:
-                logger.info("%s; asking again every %g s", message, INTRINSICS_RETRY_S)
-                reported = message
-            await unless_cancelled(token, asyncio.sleep(INTRINSICS_RETRY_S))
-            continue
-        perceiver.set_camera(placed)
+            return perceiver.camera.with_pose(position, orientation)
+        except ValueError as error:
+            raise Refusal(str(error)) from error
+
+    def learned(camera: CameraModel) -> None:
         logger.info(
             "camera '%s' stands at (%.3f, %.3f, %.3f) in the robot frame, looking along %s",
-            camera_name, *placed.position, tuple(round(v, 3) for v in placed.forward()),
+            camera_name, *camera.pose.position, tuple(round(v, 3) for v in camera.forward()),
         )
-        return
+
+    await _learn(token, perceiver, "pose_reason", ask, learned)

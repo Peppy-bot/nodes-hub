@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from conftest import NEVER, FakeDetector, FakeToken, depth_frame, rgb_frame
+from conftest import NEVER, FakeDetector, FakeToken, camera_poses, depth_frame, rgb_frame
 from openarm_ai_brain_vla.perception.camera import (
     INVERSE_PLUMB_BOB,
     NONE,
@@ -44,8 +44,8 @@ def test_the_camera_pose_the_robot_reports_is_checked_and_normalised():
     with pytest.raises(ValueError, match="zero"):
         CameraModel().with_pose((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 0.0))
     camera = CameraModel().with_pose((1, 2, 3), (0, 0, 0, 2))
-    assert camera.position == (1.0, 2.0, 3.0)
-    assert close(camera.orientation, (0.0, 0.0, 0.0, 1.0))
+    assert camera.pose.position == (1.0, 2.0, 3.0)
+    assert close(camera.pose.orientation, (0.0, 0.0, 0.0, 1.0))
     # Without intrinsics, or without a pose, the camera cannot place a
     # pixel, and says which.
     assert camera.placed and not camera.ready
@@ -198,7 +198,7 @@ def test_the_chest_pose_the_backbone_reports_looks_ahead_and_down():
     chest = CameraModel().with_pose(CHEST_POSITION, CHEST_ORIENTATION).with_intrinsics(Intrinsics.from_fovy(52.0, 1280, 720))
     forward = chest.forward()
     assert close(forward, (math.cos(math.radians(62)), 0.0, -math.sin(math.radians(62))), 1e-3)
-    assert close(rotate(chest.orientation, (0.0, 1.0, 0.0)), (-math.sin(math.radians(62)), 0.0, -math.cos(math.radians(62))), 1e-3)
+    assert close(rotate(chest.pose.orientation, (0.0, 1.0, 0.0)), (-math.sin(math.radians(62)), 0.0, -math.cos(math.radians(62))), 1e-3)
     # One meter along the axis from the chest lands on the table in front.
     point = chest.deproject(640.0, 360.0, 1.0, 1280, 720)
     assert close(point, (0.0792 + forward[0], 0.0315, 0.7941 + forward[2]), 1e-3)
@@ -593,12 +593,12 @@ async def test_a_vacant_geometry_slot_is_the_reason_at_once(monkeypatch):
 
 
 def poses_answer(success: bool = True, message: str = "", names=("wrist_left", "chest"), chest_position=(0.1, 0.2, 0.3)):
-    positions = [0.5, 0.5, 0.5] * (len(names) - 1) + list(chest_position)
-    orientations = [0.0, 0.0, 0.0, 1.0] * len(names)
-    return SimpleNamespace(
-        success=success, message=message, timestamp=7.0, camera_names=list(names), positions=positions,
-        orientations=orientations, carried_by=["left_arm"] * (len(names) - 1) + [""],
-    )
+    """The robot's answer as conftest's camera_poses gives it, the last
+    camera named, the chest, standing at `chest_position`."""
+    answer = camera_poses(success, message, names)
+    if success:
+        answer.positions[-3:] = list(chest_position)
+    return answer
 
 
 async def test_the_robot_is_asked_again_until_it_places_the_camera(monkeypatch):
@@ -637,7 +637,7 @@ async def test_the_robot_is_asked_again_until_it_places_the_camera(monkeypatch):
     ]
     assert answers == []
     assert perceiver.camera.ready and perceiver.pose_reason == ""
-    assert perceiver.camera.position == (0.1, 0.2, 0.3)
+    assert perceiver.camera.pose.position == (0.1, 0.2, 0.3)
     assert perceiver.available
 
 

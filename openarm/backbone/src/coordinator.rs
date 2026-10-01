@@ -25,13 +25,13 @@ use std::time::{Duration, Instant};
 use peppygen::NodeRunner;
 use peppygen::exposed_actions::limb_motion::move_gripper;
 use peppylib::runtime::CancellationToken;
-use srs_model::nalgebra::Isometry3;
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{error, info, warn};
 
 use control_core::filters::LowPassFilter;
 use control_core::pacer::Pacer;
 
+use crate::actions::arm::ArmMoveRequest;
 use crate::arm_pair::ArmPair;
 use crate::camera_mounts::MeasuredGrasps;
 use crate::chase::rate_limited;
@@ -41,7 +41,7 @@ use crate::motion::{MOTION_TIMEOUT_FACTOR, MoveBudget};
 use crate::planner::{self, BusyGuard, Goal, Planner};
 use crate::publish::{LimbStateSnapshot, Publishers};
 use crate::streams::{ArmState, GovernorConfig, GripperCommand, GripperState};
-use crate::types::{ARM_DOF, JointVec, PlanTolerance, Side};
+use crate::types::{ARM_DOF, JointVec, Side};
 use crate::upstream::{Upstream, UpstreamMode};
 
 /// How long [`seed_all`] waits for an arm's first measured state before warning that
@@ -105,10 +105,7 @@ pub enum CoordinatorRequest {
     /// Whether a `move_arm` goal with these fields has a plan from where the
     /// arm stands: the time the move would take, or the refusal's words.
     CheckArmMove {
-        side: Side,
-        target: Isometry3<f64>,
-        tolerance: PlanTolerance,
-        duration_s: f64,
+        request: ArmMoveRequest,
         reply: oneshot::Sender<Result<f64, String>>,
     },
 }
@@ -575,33 +572,22 @@ async fn serve_request(
             let message = stop_message(&reason);
             info!("stop requested: {message}");
             let mut stopped = Vec::new();
-            for (side, channels, planner, gripper_move) in [
-                (
-                    Side::Left,
-                    &mut channels.left,
-                    &mut planners.left,
-                    &mut gripper_moves.left,
-                ),
-                (
-                    Side::Right,
-                    &mut channels.right,
-                    &mut planners.right,
-                    &mut gripper_moves.right,
-                ),
-            ] {
-                let measured_q = channels
+            for side in [Side::Left, Side::Right] {
+                let arm = channels.get_mut(side);
+                let planner = planners.get_mut(side);
+                let measured_q = arm
                     .measured
                     .borrow()
                     .map_or_else(|| planner.setpoint(), |m| m.positions);
                 if planner.stop_active(&message, measured_q, now).await {
                     stopped.push(Side::ARM_NAMES[side.index()].to_string());
                 }
-                while let Ok(goal) = channels.goals.try_recv() {
-                    let _release = BusyGuard(channels.busy.clone());
+                while let Ok(goal) = arm.goals.try_recv() {
+                    let _release = BusyGuard(arm.busy.clone());
                     goal.stop(&message, measured_q, planner).await;
                 }
-                let measured_frac = gripper_fraction(&channels.gripper);
-                if let Some(m) = gripper_move.take() {
+                let measured_frac = gripper_fraction(&arm.gripper);
+                if let Some(m) = gripper_moves.get_mut(side).take() {
                     let elapsed_s = now.duration_since(m.motion.started).as_secs_f64();
                     end_gripper_move(
                         m,
@@ -612,25 +598,19 @@ async fn serve_request(
                     .await;
                     stopped.push(Side::GRIPPER_NAMES[side.index()].to_string());
                 }
-                while let Ok(goal) = channels.gripper_goals.try_recv() {
-                    let _release = BusyGuard(channels.gripper_busy.clone());
+                while let Ok(goal) = arm.gripper_goals.try_recv() {
+                    let _release = BusyGuard(arm.gripper_busy.clone());
                     goal.stop(&message, measured_frac).await;
                 }
             }
             let _ = reply.send(stopped);
         }
-        CoordinatorRequest::CheckArmMove {
-            side,
-            target,
-            tolerance,
-            duration_s,
-            reply,
-        } => {
-            let planner = match side {
-                Side::Left => &mut planners.left,
-                Side::Right => &mut planners.right,
-            };
-            let _ = reply.send(planner.check_cartesian(&target, tolerance, duration_s));
+        CoordinatorRequest::CheckArmMove { request, reply } => {
+            let _ = reply.send(planners.get_mut(request.side).check_cartesian(
+                &request.target,
+                request.tolerance,
+                request.duration_s,
+            ));
         }
     }
 }

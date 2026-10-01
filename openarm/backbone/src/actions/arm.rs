@@ -206,13 +206,7 @@ pub async fn run_check_arm_move(
             let (reply, answer) = oneshot::channel();
             let asked = ask_coordinator(
                 &requests,
-                CoordinatorRequest::CheckArmMove {
-                    side: request.side,
-                    target: request.target,
-                    tolerance: request.tolerance,
-                    duration_s: request.duration_s,
-                    reply,
-                },
+                CoordinatorRequest::CheckArmMove { request, reply },
                 answer,
             );
             Ok(match asked {

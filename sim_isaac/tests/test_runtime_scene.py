@@ -12,6 +12,8 @@ from unittest.mock import Mock
 
 import pytest
 
+from _world import world_module
+
 _ENGINE_DIR = Path(__file__).resolve().parents[1] / "engine"
 _SCENE = "/World/RuntimeScene"
 _OBJECTS = "/World/RuntimeObjects"
@@ -69,16 +71,19 @@ class FakeStage:
                 del self.prims[existing]
 
 
-def _stand(prim, position, orientation):
+def _stand(prim, position, orientation=None):
     """World.place on the fake stage: the prim records where it was stood
-    and the way it was turned, a unit quaternion (x, y, z, w)."""
+    and the way it was turned, a unit quaternion (x, y, z, w), or keeps its
+    turn when none is given."""
     prim.translate = tuple(position)
-    prim.orientation = tuple(orientation)
+    if orientation is not None:
+        prim.orientation = tuple(orientation)
 
 
 def _turned_by(yaw):
-    """The orientation of a turn of `yaw` radians about +z."""
-    return (0.0, 0.0, math.sin(yaw / 2.0), math.cos(yaw / 2.0))
+    """The orientation of a turn of `yaw` radians about +z, as the engine
+    makes it."""
+    return world_module().yaw_orientation(yaw)
 
 
 class FakeXformOp:
@@ -389,7 +394,7 @@ def test_a_move_with_an_orientation_stands_the_object_anew_and_one_without_keeps
         "object_id": object_id, "position": [2.0, 0.0, 0.8],
     })
     assert result["success"]
-    scene.world.place.assert_not_called()
+    scene.world.place.assert_called_once_with(prim, [2.0, 0.0, 0.8], None)
     assert (prim.translate, prim.orientation) == ((2.0, 0.0, 0.8), (0.0, 0.0, 1.0, 0.0))
 
 

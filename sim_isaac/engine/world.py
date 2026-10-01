@@ -440,13 +440,14 @@ class World:
         return compensated
 
     @staticmethod
-    def place(prim, position, orientation) -> None:
+    def place(prim, position, orientation=None) -> None:
         """Stands a prim, a robot or a spawned object, at `position` turned to
-        `orientation`, a unit quaternion (x, y, z, w). USD applies an xform's
-        ops in the order they are listed and a referenced model brings its
-        own, so the order is pinned here: the prim turns about its own origin
-        and is then moved. Left to the order the reference happened to leave,
-        a robot asked for (1, 0, 0) at a quarter turn stands at (0, 1, 0)."""
+        `orientation`, a unit quaternion (x, y, z, w), or turned as it stands
+        when none is given. USD applies an xform's ops in the order they are
+        listed and a referenced model brings its own, so the order is pinned
+        here: the prim turns about its own origin and is then moved. Left to
+        the order the reference happened to leave, a robot asked for
+        (1, 0, 0) at a quarter turn stands at (0, 1, 0)."""
         from pxr import Gf, UsdGeom  # pylint: disable=C0415
 
         xform = UsdGeom.Xformable(prim)
@@ -455,21 +456,24 @@ class World:
         translate = ops.get(UsdGeom.XformOp.TypeTranslate) or xform.AddTranslateOp()
         translate.Set(Gf.Vec3d(*position))
 
-        x, y, z, w = (float(value) for value in orientation)
-        orient = ops.get(UsdGeom.XformOp.TypeOrient) or xform.AddOrientOp()
-        # USD refuses a quaternion of the wrong width outright, and a
-        # referenced model brings whichever its author chose.
-        turn = {
-            UsdGeom.XformOp.PrecisionDouble: lambda: Gf.Quatd(w, Gf.Vec3d(x, y, z)),
-            UsdGeom.XformOp.PrecisionHalf: lambda: Gf.Quath(w, Gf.Vec3h(x, y, z)),
-        }.get(orient.GetPrecision(), lambda: Gf.Quatf(w, Gf.Vec3f(x, y, z)))
-        orient.Set(turn())
+        orient = ops.get(UsdGeom.XformOp.TypeOrient)
+        if orientation is not None:
+            x, y, z, w = (float(value) for value in orientation)
+            orient = orient or xform.AddOrientOp()
+            # USD refuses a quaternion of the wrong width outright, and a
+            # referenced model brings whichever its author chose.
+            turn = {
+                UsdGeom.XformOp.PrecisionDouble: lambda: Gf.Quatd(w, Gf.Vec3d(x, y, z)),
+                UsdGeom.XformOp.PrecisionHalf: lambda: Gf.Quath(w, Gf.Vec3h(x, y, z)),
+            }.get(orient.GetPrecision(), lambda: Gf.Quatf(w, Gf.Vec3f(x, y, z)))
+            orient.Set(turn())
 
-        # Whatever else the reference carried keeps its place after these two.
+        # Whatever else the reference carried keeps its place after these.
+        placing = [translate] if orient is None else [translate, orient]
         rest = [
             op
             for op in xform.GetOrderedXformOps()
             if op.GetOpType()
             not in (UsdGeom.XformOp.TypeTranslate, UsdGeom.XformOp.TypeOrient)
         ]
-        xform.SetXformOpOrder([translate, orient, *rest])
+        xform.SetXformOpOrder([*placing, *rest])
