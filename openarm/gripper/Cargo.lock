@@ -2607,6 +2607,7 @@ dependencies = [
  "rand 0.10.2",
  "rustls-native-certs",
  "rustls-pemfile",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
