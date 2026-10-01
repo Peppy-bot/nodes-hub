@@ -16,7 +16,7 @@ capture = ["dep:v4l"]
 cv = ["dep:opencv"]
 
 [dependencies]
-opencv = { version = "0.100", optional = true, default-features = false, features = [
+opencv = { version = "0.101", optional = true, default-features = false, features = [
     "calib3d",
     "imgproc",
     "clang-runtime",
