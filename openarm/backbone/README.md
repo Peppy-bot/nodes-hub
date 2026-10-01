@@ -120,15 +120,18 @@ field pose.
 | Action | Goal | Refused when |
 |---|---|---|
 | `move_arm_joints` | `arm_name`, 7 joint positions (rad), `duration_s` (the limb_motion contract) | non-finite, negative duration, out of joint limits, side busy |
-| `move_arm` | `arm_name`, world pose (position m + quaternion `[x, y, z, w]`), `duration_s` (the limb_motion contract) | non-finite, degenerate quaternion, negative duration, side busy |
+| `move_arm` | `arm_name`, robot-frame pose (position m + quaternion `[x, y, z, w]`), `duration_s` (the limb_motion contract) | non-finite, degenerate quaternion, negative duration, side busy |
 | `move_gripper` | `gripper_name`, opening fraction in [0, 1], `max_effort` (the limb_motion contract) | non-finite, out of range, negative effort cap, side busy |
 | `move_to_ready` | `duration_s` (the postures contract; both arms to the Ready posture) | non-finite, negative duration, over 600 s, either arm busy |
 | `move_to_home` | `duration_s` (the postures contract; both arms to the Home rest) | non-finite, negative duration, over 600 s, either arm busy |
 
 `arm_name`/`gripper_name`: `left_arm`/`right_arm` and `left_gripper`/`right_gripper`,
-an unknown name refused in the result. Every world pose here, commanded or
-reported, is the gripper's **grasp point** (midway between the pads on the jaw
-closing axis, `+z` out of the gripper), not the wrist flange they mount on:
+an unknown name refused in the result. Every pose here, commanded or
+reported, is in the robot frame the contracts define, which for this robot
+is the root link of the URDF: the bottom of the pedestal's base plate on the
+column axis, `+x` to the robot's front, `+y` to its left, `+z` up. It is the
+gripper's **grasp point** (midway between the pads on the jaw closing axis,
+`+z` out of the gripper), not the wrist flange they mount on:
 `openarm_description` carries the offset per generation and `arm_model` builds
 the model with it, so the pose solved for, the pose reported, and the point the
 EE speed cap applies to are one frame. One move per side at a time (a
@@ -162,6 +165,44 @@ measured then and `action_time` runs to that moment.
 A gripper that stops short is a success on purpose: the move was neither
 refused, failed nor cancelled, and the caller judges the grasp from
 `final_opening`.
+
+### Services of limb_motion
+
+`stop` ends every planned move in flight, whoever started it: the arm moves
+through their planners, the gripper moves through their terminal, the
+posture moves through both arms, and the goals admitted but not started
+yet. Each goal ends as cancelled with `stopped: <reason>` (`stopped` for an
+empty reason); a posture goal ends as cancelled with its first arm's
+message. Each limb holds the setpoint it was last governed to, as after a
+cancel, and the answer's `stopped` names the limbs whose move was in flight,
+empty with `nothing was moving` when none was. The stop does not latch: a
+goal admitted after it runs. A leader's streamed setpoints are not stopped.
+
+`check_arm_move` takes the fields of a `move_arm` goal and answers whether
+a plan reaches the pose from the arm's held setpoint, with the time the
+move would take, without moving: the same validation, the same planner and
+the same refusal words as the goal (`goal pose not planned within ...`).
+It is refused while the arm executes a move, with the message a second
+goal gets, and it checks no collision with the robot or the room.
+
+Both are answered by the coordinator on the tick after the request, so
+they wait behind the readiness gate with the moves; a stop during the seed
+wait stops nothing and a check then is refused as a goal is.
+
+### camera_mounts
+
+`get_camera_poses` answers where the generation's design carries each
+camera, in the robot frame, as the pose of the camera's colour optical frame
+(`+x` to the right of the image, `+y` down it, `+z` along the view): the
+numbers `openarm_description` lists, which are the simulation's, so they are
+exact in a simulation and nominal on hardware. A camera fixed to the base
+(v2's `chest`) has one pose; a camera an arm carries (v2's `wrist_left` and
+`wrist_right`, which hang off the link the grasp point hangs off) is composed
+with that arm's grasp pose from the last `limb_states` snapshot, and the
+answer carries that snapshot's stamp. Served from bringup, refused with
+`the robot has not measured its joints yet` until a snapshot exists; a v1
+robot answers success with no camera. A description that mounts a camera on
+a link a moving joint carries, other than the grasp point's, stops bringup.
 
 ## Module map
 

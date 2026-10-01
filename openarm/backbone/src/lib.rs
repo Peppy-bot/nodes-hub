@@ -18,6 +18,7 @@
 
 mod actions;
 mod arm_pair;
+mod camera_mounts;
 mod chase;
 mod coordinator;
 mod governor;

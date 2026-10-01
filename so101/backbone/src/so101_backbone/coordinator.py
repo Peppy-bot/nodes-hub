@@ -14,6 +14,10 @@ Fresh follower state gates everything: with the measured stream stale no limb
 gets a setpoint, an active plan fails, and the standing command resets. The
 first tick after any silence re-engages from the measured position, governed
 by the same caps, exactly like every other tick.
+
+The stop service ends every plan installed, whoever admitted it: each plan
+is cut where its stream stands, as a cancel cuts it, and carries the stop's
+message for its goal to end with.
 """
 
 from __future__ import annotations
@@ -24,6 +28,7 @@ from dataclasses import dataclass, field
 
 from control_core_py.minimum_jerk import Profile
 from control_core_py.runtime import Latch
+from so101_description.limbs import ARM_LIMB, GRIPPER_LIMB
 from so101_description.limits import JointLimits
 
 from so101_backbone.governor import EEGovernor, rate_step
@@ -102,6 +107,9 @@ class ArmPlan:
     # The sample the stream stood at when the plan was cut; last_sample
     # reports it instead of re-evaluating the profile at a later clock.
     frozen: tuple[float, ...] | None = None
+    # The stop service's message when it cut the plan: the goal ends as
+    # cancelled with it.
+    stopped: str | None = None
 
     def last_sample(self, now: float) -> tuple[float, ...]:
         if self.frozen is not None:
@@ -153,6 +161,9 @@ class GripperPlan:
     # The measured opening the gripper stood still at: set, with done, when
     # the settle ends the plan.
     settled: float | None = None
+    # The stop service's message when it cut the plan: the goal ends as
+    # cancelled with it.
+    stopped: str | None = None
 
 
 class Coordinator:
@@ -206,6 +217,11 @@ class Coordinator:
         self._gripper_busy = False
         self._ik_failing = Latch()
         self._out_of_reach = Latch()
+        # How many stops have run, and the message of the last one: a goal
+        # whose plan was not installed when a stop ran reads them to end as
+        # stopped instead of installing its plan afterwards.
+        self.stop_count = 0
+        self.last_stop: str | None = None
 
     # -------------------------------------------------------------- busy slots
 
@@ -223,6 +239,11 @@ class Coordinator:
             return False
         self._gripper_busy = True
         return True
+
+    @property
+    def arm_busy(self) -> bool:
+        """Whether an arm goal holds the arm, from admission to release."""
+        return self._arm_busy
 
     # ------------------------------------------------------------------ anchors
 
@@ -286,6 +307,26 @@ class Coordinator:
             self._gripper_plan = None
         plan.aborted = True
         plan.done.set()
+
+    def stop_all(self, message: str) -> list[str]:
+        """Cut every installed plan for the stop service, whoever admitted
+        it, each as a cancel cuts it and carrying `message` for its goal to
+        end with. The names of the limbs whose plan was cut; the busy slots
+        release with the goals, as after a cancel."""
+        self.stop_count += 1
+        self.last_stop = message
+        stopped = []
+        arm_plan = self._arm_plan
+        if arm_plan is not None:
+            arm_plan.stopped = message
+            self.abort_arm_plan(arm_plan)
+            stopped.append(ARM_LIMB)
+        gripper_plan = self._gripper_plan
+        if gripper_plan is not None:
+            gripper_plan.stopped = message
+            self.abort_gripper_plan(gripper_plan)
+            stopped.append(GRIPPER_LIMB)
+        return stopped
 
     def arm_published(self, delivered: bool, command: tuple[float, ...] | None) -> None:
         """The outcome of publishing this tick's arm setpoint, and the value

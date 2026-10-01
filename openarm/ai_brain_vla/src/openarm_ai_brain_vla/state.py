@@ -26,6 +26,10 @@ Rules written down here because the code depends on them:
 - Released items. A place_item moves the item to the pose it was put at,
   so the next scan keeps its id. A drop_item leaves it at the position it
   was grabbed at, since nothing measured where it landed.
+- Regions. An item carries the region of the look that last saw it, in
+  that look's picture. A look that did not see a known item it keeps
+  clears the region: the picture has moved on, and a region of an older
+  picture would be reported against the new one.
 - Holding follows results, not jaws. A gripper holds an item after a
   successful grab and stops holding after a successful drop or place.
   Refusals, failures, cancels and aborts leave the flag as it was. A grab
@@ -203,13 +207,18 @@ class State:
             item = self._match(detection, claimed, held)
             if item is None:
                 item = self._mint(detection.label, detection.position, detection.orientation, detection.confidence, now_ns)
+                item.region = detection.region
             else:
                 _refresh(item, detection, now_ns, coverage)
             claimed.add(item.item_id)
             seen.append(item)
         for item_id, item in list(self.items.items()):
-            if item_id not in claimed and item_id not in held and coverage.covers(item.label):
+            if item_id in claimed:
+                continue
+            if item_id not in held and coverage.covers(item.label):
                 del self.items[item_id]
+            else:
+                item.region = None
         return seen
 
     def mint_from_pose(self, position: Vec3, orientation: Optional[Quat], now_ns: int) -> Item:
@@ -258,6 +267,7 @@ def _refresh(item: Item, detection: Detection, now_ns: int, coverage: Coverage) 
     item.orientation = detection.orientation
     item.confidence = detection.confidence
     item.seen_at_ns = now_ns
+    item.region = detection.region
     if coverage.covers(detection.label):
         item.label = detection.label
 

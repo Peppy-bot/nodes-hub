@@ -176,9 +176,11 @@ class CancelNotDelivered(RuntimeError):
 async def _fetch_assets(node_runner: NodeRunner) -> list[dict]:
     producer = get_assets_list.bound_producer(node_runner)
 
+    # The whole catalogue: the panel filters it itself.
     response = await get_assets_list.poll(
         node_runner,
         producer,
+        get_assets_list.Request(kind=None, category=None, query=None),
         timeout=SERVICE_TIMEOUT_S,
     )
 
@@ -767,9 +769,11 @@ async def _action_apply_force(node_runner: NodeRunner, payload: dict) -> dict:
 
 
 async def _action_move_object(node_runner: NodeRunner, payload: dict) -> dict:
+    # The panel moves an object without turning it.
     request = move_object.GoalRequest(
         object_id=str(payload["object_id"]),
         position=[float(value) for value in payload["position"]],
+        orientation=None,
     )
 
     data = await _run_action(
@@ -1068,6 +1072,8 @@ def _spawn_request(payload: dict):
         asset_id=_name(payload, "asset_id"),
         position=_vector(payload, "position", 3),
         yaw=_optional(_number, payload, "yaw", 0.0),
+        # The panel turns an object by its yaw alone.
+        orientation=None,
         scale=_optional(_number, payload, "scale", 1.0),
         physics=_optional(_physics, payload, "physics", "none"),
         mass=_optional(_number, payload, "mass", 0.1),

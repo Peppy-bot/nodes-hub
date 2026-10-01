@@ -3,6 +3,7 @@ removing objects, what each does to the cached physics views, and which
 runtime commands may touch an object scene_manipulation spawned."""
 
 import importlib.util
+import math
 import logging
 import sys
 from pathlib import Path
@@ -11,12 +12,17 @@ from unittest.mock import Mock
 
 import pytest
 
+from _world import world_module
+
 _ENGINE_DIR = Path(__file__).resolve().parents[1] / "engine"
 _SCENE = "/World/RuntimeScene"
 _OBJECTS = "/World/RuntimeObjects"
 _ASSET_ROOT = "https://assets.example/Isaac/6.1"
 _ACTIONS = ("apply_force", "clear_scene", "load_scene", "move_object", "move_robot", "remove_object", "spawn_object")
-_SERVICES = {"scene": ("get_assets_list", "get_robots_list"), "objects": ("get_object_states",)}
+_SERVICES = {
+    "scene": ("get_assets_list", "get_asset_categories", "get_objects_list", "get_robots_list", "get_scene"),
+    "objects": ("get_object_states",),
+}
 _PROPS = {
     "props/blocks/red_block": {
         "asset_id": "props/blocks/red_block", "display_name": "red block", "kind": "object",
@@ -31,7 +37,7 @@ class FakePrim:
         self.valid = valid
         self.references = []
         self.translate = None
-        self.yaw = None
+        self.orientation = None
         self.scale = None
 
     def IsValid(self):
@@ -65,11 +71,19 @@ class FakeStage:
                 del self.prims[existing]
 
 
-def _stand(prim, position, yaw):
+def _stand(prim, position, orientation=None):
     """World.place on the fake stage: the prim records where it was stood
-    and the way it was turned."""
+    and the way it was turned, a unit quaternion (x, y, z, w), or keeps its
+    turn when none is given."""
     prim.translate = tuple(position)
-    prim.yaw = yaw
+    if orientation is not None:
+        prim.orientation = tuple(orientation)
+
+
+def _turned_by(yaw):
+    """The orientation of a turn of `yaw` radians about +z, as the engine
+    makes it."""
+    return world_module().yaw_orientation(yaw)
 
 
 class FakeXformOp:
@@ -347,9 +361,41 @@ def test_a_spawned_object_stands_where_it_was_asked_turned_by_its_yaw_at_its_sca
     object_id = _spawn(scene, scene_manipulation, yaw=1.5, scale=2.0)
 
     prim = scene.stage.prims[f"{_OBJECTS}/{object_id}"]
-    assert (prim.translate, prim.yaw, prim.scale) == ((0.5, 0.0, 0.8), 1.5, (2.0, 2.0, 2.0))
+    assert (prim.translate, prim.orientation, prim.scale) == ((0.5, 0.0, 0.8), _turned_by(1.5), (2.0, 2.0, 2.0))
     # The world stands it, as it stands a robot, once its scale is in place.
-    scene.world.place.assert_called_once_with(prim, [0.5, 0.0, 0.8], 1.5)
+    scene.world.place.assert_called_once_with(prim, [0.5, 0.0, 0.8], _turned_by(1.5))
+
+
+def test_a_spawned_object_with_an_orientation_stands_turned_to_it_whatever_its_yaw(scene, scene_manipulation):
+    result = scene_manipulation._execute(scene.launcher, "spawn_object", {
+        "asset_id": "props/blocks/red_block", "position": [0.5, 0.0, 0.8], "yaw": 1.5,
+        "orientation": [0.0, 0.0, 1.0, 0.0], "scale": 1.0, "physics": "none", "mass": 0.1,
+    })
+    assert result["success"]
+
+    prim = scene.stage.prims[f"{_OBJECTS}/{result['object_id']}"]
+    assert prim.orientation == (0.0, 0.0, 1.0, 0.0)
+
+
+def test_a_move_with_an_orientation_stands_the_object_anew_and_one_without_keeps_it(scene, scene_manipulation):
+    object_id = _spawn(scene, scene_manipulation, yaw=1.5)
+    prim = scene.stage.prims[f"{_OBJECTS}/{object_id}"]
+    scene.world.place.reset_mock()
+
+    result = scene_manipulation._execute(scene.launcher, "move_object", {
+        "object_id": object_id, "position": [1.0, 0.0, 0.8], "orientation": [0.0, 0.0, 1.0, 0.0],
+    })
+    assert result["success"]
+    scene.world.place.assert_called_once_with(prim, [1.0, 0.0, 0.8], (0.0, 0.0, 1.0, 0.0))
+    assert (prim.translate, prim.orientation) == ((1.0, 0.0, 0.8), (0.0, 0.0, 1.0, 0.0))
+
+    scene.world.place.reset_mock()
+    result = scene_manipulation._execute(scene.launcher, "move_object", {
+        "object_id": object_id, "position": [2.0, 0.0, 0.8],
+    })
+    assert result["success"]
+    scene.world.place.assert_called_once_with(prim, [2.0, 0.0, 0.8], None)
+    assert (prim.translate, prim.orientation) == ((2.0, 0.0, 0.8), (0.0, 0.0, 1.0, 0.0))
 
 
 def test_a_runtime_spawn_naming_no_yaw_stands_as_authored(scene, scene_manipulation, tmp_path):
@@ -364,8 +410,8 @@ def test_a_runtime_spawn_naming_no_yaw_stands_as_authored(scene, scene_manipulat
         "command": "spawn_usd", "name": "Turned", "path": str(usd), "position": [1.0, 1.0, 0.8], "yaw": -0.75,
     })
 
-    assert scene.stage.prims[f"{_OBJECTS}/Authored"].yaw == 0.0
-    assert scene.stage.prims[f"{_OBJECTS}/Turned"].yaw == -0.75
+    assert scene.stage.prims[f"{_OBJECTS}/Authored"].orientation == (0.0, 0.0, 0.0, 1.0)
+    assert scene.stage.prims[f"{_OBJECTS}/Turned"].orientation == _turned_by(-0.75)
 
 
 def test_a_runtime_robot_move_hands_the_world_the_position_and_the_yaw(scene):

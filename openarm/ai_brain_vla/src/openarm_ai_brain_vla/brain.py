@@ -21,7 +21,7 @@ from .manipulation import make_manipulator
 from .perception import make_detector
 from .perception.camera import CameraModel
 from .perception.frames import FrameStore
-from .perception.geometry import learn_intrinsics
+from .perception.geometry import learn_camera_pose, learn_intrinsics
 from .perception.perceiver import Perceiver
 from .ports import Cancelled, Manipulator, Refusal
 from .robot import Robot
@@ -47,7 +47,7 @@ class Brain:
         self.state = State(params.gripper_names.split(","), new_run_token() if run_token is None else run_token)
         self.robot = Robot(node_runner)
         self.frames = FrameStore()
-        self.camera = CameraModel.from_parameters(params.camera_pose)
+        self.camera = CameraModel()
         self.perceiver = Perceiver(detector or make_detector(params.perception_backend), self.frames, self.camera)
         if params.perception_confidence > 0.0:
             self.perceiver.detector.min_confidence = params.perception_confidence
@@ -68,10 +68,12 @@ class Brain:
 
     def background(self, token) -> list[asyncio.Task]:
         """The loops that run beside the action loops: the camera follower,
-        and the one asking the camera where its pixels point."""
+        the one asking the camera where its pixels point, and the one
+        asking the robot where the camera stands."""
         return [
             asyncio.create_task(self.frames.run(self.node_runner, token)),
             asyncio.create_task(learn_intrinsics(self.node_runner, token, self.perceiver)),
+            asyncio.create_task(learn_camera_pose(self.node_runner, token, self.perceiver, self.params.camera_name)),
         ]
 
     async def shutdown(self) -> None:

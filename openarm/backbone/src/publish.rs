@@ -27,9 +27,11 @@ use peppygen::paired_topics::{
 };
 use peppylib::{Payload, TopicPublisher};
 use srs_model::nalgebra::Isometry3;
+use tokio::sync::watch;
 use tracing::{error, warn};
 
 use crate::arm_pair::ArmPair;
+use crate::camera_mounts::MeasuredGrasps;
 use crate::streams::{GripperState, warn_throttled};
 use crate::types::{JointVec, limb_names, world_pose_arrays};
 
@@ -185,7 +187,7 @@ impl Publisher<LimbStateBuild> {
     /// Publish one whole-robot snapshot, flattened per the contract's slicing
     /// rule: joint vectors concatenated in arm order, poses at fixed 3- and
     /// 4-strides, the name tables labelling every index.
-    pub async fn send(&self, s: &LimbStateSnapshot) {
+    pub async fn send(&self, s: &LimbStateSnapshot) -> Option<SystemTime> {
         let (left_position, left_orientation) = world_pose_arrays(&s.poses.left);
         let (right_position, right_orientation) = world_pose_arrays(&s.poses.right);
         let names = limb_names();
@@ -201,7 +203,7 @@ impl Publisher<LimbStateBuild> {
                 vec![s.openings.left, s.openings.right],
             )
         })
-        .await;
+        .await
     }
 }
 
@@ -215,17 +217,27 @@ impl<Build> Publisher<Build> {
     /// Stamp, build and publish, naming the slot in either failure. A publish
     /// error is a transient wire condition; a build error (or a clock that has
     /// not ticked) means the message was never formed. Neither is fatal: the
-    /// next tick tries again.
-    async fn emit(&self, build: impl FnOnce(SystemTime) -> peppygen::Result<Payload>) {
-        match pairing_timestamp().and_then(|timestamp| build(timestamp).map_err(|e| e.to_string()))
-        {
-            Ok(msg) => {
+    /// next tick tries again. The stamp the message was formed under, once it
+    /// was.
+    async fn emit(
+        &self,
+        build: impl FnOnce(SystemTime) -> peppygen::Result<Payload>,
+    ) -> Option<SystemTime> {
+        let stamped = pairing_timestamp().and_then(|timestamp| {
+            build(timestamp)
+                .map(|msg| (timestamp, msg))
+                .map_err(|e| e.to_string())
+        });
+        match stamped {
+            Ok((timestamp, msg)) => {
                 if let Err(e) = self.publisher.publish(msg).await {
                     self.log_throttled(|| warn!("{} publish: {e}", self.what));
                 }
+                Some(timestamp)
             }
             Err(e) => {
                 self.log_throttled(|| error!("{} build: {e}", self.what));
+                None
             }
         }
     }
@@ -249,11 +261,18 @@ pub struct Publishers {
     status: Publisher<StatusBuild>,
     /// The whole-robot state snapshot, on its contract-backed topic.
     limb_states: Publisher<LimbStateBuild>,
+    /// The grasp poses of the last snapshot, under its stamp: what the
+    /// camera mounts service composes the carried cameras with.
+    measured_grasps: watch::Sender<Option<MeasuredGrasps>>,
 }
 
 impl Publishers {
-    pub async fn declare(runner: &NodeRunner) -> peppygen::Result<Self> {
+    pub async fn declare(
+        runner: &NodeRunner,
+        measured_grasps: watch::Sender<Option<MeasuredGrasps>>,
+    ) -> peppygen::Result<Self> {
         Ok(Self {
+            measured_grasps,
             arm_setpoints: ArmPair::new(
                 Publisher::declare(
                     "left joint_setpoints",
@@ -354,9 +373,15 @@ impl Publishers {
             .await;
     }
 
-    /// Publish one whole-robot state snapshot.
+    /// Publish one whole-robot state snapshot, and hand its grasp poses to
+    /// the camera mounts service under the same stamp.
     pub async fn send_limb_states(&self, snapshot: &LimbStateSnapshot) {
-        self.limb_states.send(snapshot).await;
+        if let Some(timestamp) = self.limb_states.send(snapshot).await {
+            self.measured_grasps.send_replace(Some(MeasuredGrasps {
+                timestamp,
+                poses: snapshot.poses,
+            }));
+        }
     }
 }
 

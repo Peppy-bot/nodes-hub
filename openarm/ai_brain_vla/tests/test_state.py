@@ -16,6 +16,21 @@ def make_state(run_token: str = "t0") -> State:
     return State(["left_gripper", "right_gripper"], run_token)
 
 
+def test_a_region_follows_the_look_that_last_saw_the_item():
+    state = State(["left_gripper"], "t0")
+    [cup] = state.remember([Detection("cup", (0.5, 0.1, 0.7), 0.9, region=(1.0, 2.0, 3.0, 4.0))], now_ns=1, coverage=EVERY)
+    assert cup.region == (1.0, 2.0, 3.0, 4.0)
+    # A search by description sees it elsewhere in its own picture.
+    [again] = state.remember([Detection("cup", (0.51, 0.1, 0.7), 0.8, region=(5.0, 6.0, 7.0, 8.0))], now_ns=2, coverage=NOTHING)
+    assert again is cup and cup.region == (5.0, 6.0, 7.0, 8.0)
+    # A look that keeps the item without seeing it clears the region: its
+    # picture is not the one the region was read in.
+    state.remember([Detection("bowl", (0.9, 0.0, 0.7), 0.9, region=(0.0, 0.0, 1.0, 1.0))], now_ns=3, coverage=NOTHING)
+    assert cup.region is None
+    # An item addressed by pose has no picture.
+    assert state.mint_from_pose((0.2, 0.2, 0.7), None, now_ns=4).region is None
+
+
 def test_arm_names_follow_the_backbone_side_naming():
     assert arm_of("left_gripper") == "left_arm"
     assert arm_of("right_gripper") == "right_arm"

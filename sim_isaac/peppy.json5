@@ -76,6 +76,9 @@
     services: {
       exposes: [
         { link_id: "scene", name: "get_assets_list" },
+        { link_id: "scene", name: "get_asset_categories" },
+        { link_id: "scene", name: "get_objects_list" },
+        { link_id: "scene", name: "get_scene" },
         { link_id: "scene", name: "get_robots_list" },
         { link_id: "objects", name: "get_object_states" },
         { link_id: "robots", name: "is_ready" },

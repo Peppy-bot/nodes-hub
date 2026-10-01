@@ -1,5 +1,6 @@
 """identify_item: the one item best matching a description, with an id
-the manipulation actions accept."""
+the manipulation actions accept and its region in the picture the search
+looked at."""
 
 from __future__ import annotations
 
@@ -7,7 +8,10 @@ from ..ports import Coverage, Refusal
 from ..sequencer import PERCEPTION
 from ..state import best_match
 
-ZERO = dict(item_id="", label="", position=[0.0, 0.0, 0.0], orientation=None, confidence=0.0)
+ZERO = dict(
+    item_id="", label="", position=[0.0, 0.0, 0.0], orientation=None, confidence=0.0, region=None, camera="",
+    image_width=0, image_height=0, frame_timestamp=0.0,
+)
 
 
 async def run(brain, ctx) -> None:
@@ -16,8 +20,8 @@ async def run(brain, ctx) -> None:
     async def body(job) -> dict:
         description = goal.description.strip()
         phrases = [description] if description else []
-        detections = await brain.perceiver.scan(phrases, job.cancel, goal.timeout_s)
-        best = best_match(detections, description)
+        look = await brain.perceiver.scan(phrases, job.cancel, goal.timeout_s)
+        best = best_match(look.detections, description)
         if best is None:
             if description:
                 raise Refusal(f"no item matches '{description}'")
@@ -31,6 +35,11 @@ async def run(brain, ctx) -> None:
             position=list(item.position),
             orientation=list(item.orientation) if item.orientation is not None else None,
             confidence=item.confidence,
+            region=list(item.region) if item.region is not None else None,
+            camera=brain.params.camera_name,
+            image_width=look.image_width,
+            image_height=look.image_height,
+            frame_timestamp=look.frame_timestamp,
         )
 
     await brain.run_guarded(ctx, PERCEPTION, "identify_item", body, ZERO)

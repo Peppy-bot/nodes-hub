@@ -20,6 +20,12 @@ from peppygen.fixtures.exposed_actions.limb_motion import (
     move_gripper as move_gripper_fx,
 )
 from peppygen.fixtures.exposed_actions.postures import move_to_ready as move_to_ready_fx
+from peppygen.exposed_services.limb_motion import check_arm_move as check_arm_move_prod
+from peppygen.exposed_services.limb_motion import stop as stop_prod
+from peppygen.fixtures.exposed_services.limb_motion import (
+    check_arm_move as check_arm_move_fx,
+)
+from peppygen.fixtures.exposed_services.limb_motion import stop as stop_fx
 from peppygen.fixtures.exposed_services.limb_state import (
     get_limb_names as get_limb_names_fx,
 )
@@ -478,3 +484,110 @@ async def test_the_wire_refuses_a_joint_vector_of_the_wrong_width():
         upstream_states_topic.build_message(
             timestamp=time.time(), positions=[0.0] * 4, velocities=[], efforts=[]
         )
+
+
+async def test_a_stop_ends_the_moves_in_flight_and_a_later_goal_runs():
+    async with harness.start(setup, parameters=make_parameters()) as h:
+        feeder = await feeding_measured(h)
+        try:
+            idle = await stop_fx.poll(h, stop_prod.RequestData(reason="nothing yet"), TIMEOUT_S)
+            assert idle.success
+            assert idle.stopped == []
+            assert idle.message == "nothing was moving"
+
+            slow = await move_arm_joints_fx.send_goal(
+                h,
+                move_arm_joints_prod.GoalRequestData(
+                    arm_name="arm",
+                    joint_positions=[p + 0.5 for p in MEASURED],
+                    duration_s=5.0,
+                ),
+                peppylib.QoSProfile.Reliable,
+                TIMEOUT_S,
+            )
+            assert slow.accepted
+            jaws = await move_gripper_fx.send_goal(
+                h,
+                move_gripper_prod.GoalRequestData(
+                    gripper_name="gripper", opening=1.0, max_effort=0.0
+                ),
+                peppylib.QoSProfile.Reliable,
+                TIMEOUT_S,
+            )
+            assert jaws.accepted
+            # Both plans stream before the stop: a setpoint of each is out.
+            await asyncio.wait_for(h.mocks.pairings.arm.joint_setpoints.next(), TIMEOUT_S)
+            await asyncio.wait_for(h.mocks.pairings.gripper.gripper_setpoints.next(), TIMEOUT_S)
+
+            answer = await stop_fx.poll(
+                h, stop_prod.RequestData(reason="the operator asked"), TIMEOUT_S
+            )
+            assert answer.success
+            assert answer.stopped == ["arm", "gripper"]
+            assert answer.message == "stopped arm, gripper"
+
+            result = await slow.get_result(TIMEOUT_S)
+            assert result.status == move_arm_joints_fx.ResultStatus.CANCELLED
+            assert not result.data.success
+            assert result.data.message == "stopped: the operator asked"
+            result = await jaws.get_result(TIMEOUT_S)
+            assert result.status == move_gripper_fx.ResultStatus.CANCELLED
+            assert result.data.message == "stopped: the operator asked"
+
+            # The stop does not latch: a later goal runs to its end.
+            later = await move_arm_joints_fx.send_goal(
+                h,
+                move_arm_joints_prod.GoalRequestData(
+                    arm_name="arm", joint_positions=MEASURED, duration_s=0.0
+                ),
+                peppylib.QoSProfile.Reliable,
+                TIMEOUT_S,
+            )
+            assert later.accepted
+            result = await later.get_result(TIMEOUT_S)
+            assert result.status == move_arm_joints_fx.ResultStatus.COMPLETED
+            assert result.data.success
+        finally:
+            feeder.cancel()
+
+
+async def test_the_plan_check_answers_without_moving():
+    async with harness.start(setup, parameters=make_parameters()) as h:
+        feeder = await feeding_measured(h)
+        try:
+            from so101_description.kinematics import Kinematics
+            from so101_description.model import KINEMATICS_URDF_PATH
+
+            position, orientation = Kinematics(KINEMATICS_URDF_PATH).forward_kinematics(
+                MEASURED
+            )
+            check = check_arm_move_prod.RequestData(
+                arm_name="arm",
+                position=[position[0], position[1], position[2] + 0.02],
+                orientation=list(orientation),
+                duration_s=0.0,
+                plan_position_tolerance_m=0.0,
+                plan_orientation_tolerance_rad=0.0,
+            )
+            answer = await check_arm_move_fx.poll(h, check, TIMEOUT_S)
+            assert answer.success, answer.message
+            assert answer.duration_s > 0.0
+
+            far = check_arm_move_prod.RequestData(
+                arm_name="arm",
+                position=[position[0] + 2.0, position[1], position[2]],
+                orientation=list(orientation),
+                duration_s=0.0,
+                plan_position_tolerance_m=0.0,
+                plan_orientation_tolerance_rad=0.0,
+            )
+            answer = await check_arm_move_fx.poll(h, far, TIMEOUT_S)
+            assert not answer.success
+            assert "no solution reaches this pose" in answer.message
+            assert answer.duration_s == 0.0
+
+            # Nothing streamed downstream: the checks moved nothing.
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(h.mocks.pairings.arm.joint_setpoints.next(), 0.5)
+        finally:
+            feeder.cancel()

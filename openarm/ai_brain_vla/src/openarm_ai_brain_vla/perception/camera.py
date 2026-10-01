@@ -1,12 +1,15 @@
-"""The camera model: what turns a pixel and its depth into a world
-position. The camera contracts carry image size and encoding only, so
-the field of view and the camera's pose come from the node's parameters.
+"""The camera model: what turns a pixel and its depth into a position in
+the robot frame. The camera contracts carry image size and encoding only:
+the intrinsics come from the camera through camera_geometry, and the
+camera's pose from the robot through camera_mounts, both once they have
+answered.
 
-Conventions, the same the engines use for their cameras: the camera
-looks along its own -Z with +Y as image up and +X as image right; a
-depth sample is the distance along the optical axis; the pose is the
-optical frame in the world frame limb_motion uses, a unit quaternion
-[x, y, z, w].
+Conventions, camera_geometry's and camera_mounts': the optical frame has
++X to the right of the image, +Y down it and +Z along the view; a depth
+sample is the distance along the optical axis; the pose is the optical
+frame in the robot frame limb_motion uses, position in metres and a unit
+quaternion [x, y, z, w], so a point p of the optical frame is R(q) p + t
+of the robot frame.
 
 A pixel becomes a ray through `pixel_to_ray`, in camera_geometry:v1's
 terms: the pixel through fx, fy, cx, cy to a normalised point, then the
@@ -80,62 +83,77 @@ class Intrinsics:
 
 
 @dataclass(frozen=True)
-class CameraModel:
-    """The camera the brain looks through: its pose in the robot's world
-    frame, from the camera_pose parameter, and its intrinsics, from the
-    camera itself once it has answered. Not ready until it has."""
+class CameraPose:
+    """The optical frame in the robot frame: metres, and a unit quaternion
+    [x, y, z, w]."""
 
     position: Vec3
     orientation: Quat
+
+
+@dataclass(frozen=True)
+class CameraModel:
+    """The camera the brain looks through: the pose of its optical frame in
+    the robot frame, from the robot's camera_mounts once it has answered,
+    and its intrinsics, from the camera itself once it has. Not ready until
+    both have."""
+
+    pose: Optional[CameraPose] = None
     intrinsics: Optional[Intrinsics] = None
 
-    @classmethod
-    def from_parameters(cls, pose_text: str) -> "CameraModel":
-        """`pose_text` is "x y z qx qy qz qw", as the camera_pose parameter
-        spells it. The intrinsics come later, with `with_intrinsics`."""
-        parts = pose_text.replace(",", " ").split()
-        if len(parts) != 7:
-            raise ValueError("camera_pose must hold seven numbers: x y z qx qy qz qw")
-        try:
-            values = [float(part) for part in parts]
-        except ValueError:
-            raise ValueError("camera_pose must hold seven numbers: x y z qx qy qz qw") from None
+    def with_pose(self, position: Vec3, orientation: Quat) -> "CameraModel":
+        """The pose camera_mounts reports: three finite metres and a unit
+        quaternion [x, y, z, w], normalised here, refused as a ValueError
+        when it is no pose."""
+        if len(position) != 3 or len(orientation) != 4:
+            raise ValueError("a camera pose is three coordinates and a quaternion of four")
+        values = [float(value) for value in (*position, *orientation)]
         if any(not math.isfinite(value) for value in values):
-            raise ValueError("camera_pose must be finite")
+            raise ValueError("a camera pose must be finite")
         x, y, z, qx, qy, qz, qw = values
         norm = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
         if norm < 1e-9:
-            raise ValueError("camera_pose quaternion must not be zero")
-        return cls((x, y, z), (qx / norm, qy / norm, qz / norm, qw / norm))
+            raise ValueError("a camera pose's quaternion must not be zero")
+        pose = CameraPose((x, y, z), (qx / norm, qy / norm, qz / norm, qw / norm))
+        return CameraModel(pose, self.intrinsics)
 
     def with_intrinsics(self, intrinsics: Intrinsics) -> "CameraModel":
-        return CameraModel(self.position, self.orientation, intrinsics)
+        return CameraModel(self.pose, intrinsics)
+
+    @property
+    def placed(self) -> bool:
+        """Whether the pose is known."""
+        return self.pose is not None
 
     @property
     def ready(self) -> bool:
-        return self.intrinsics is not None
+        return self.intrinsics is not None and self.placed
 
     def deproject(self, u: float, v: float, depth_m: float, width: int, height: int) -> Vec3:
-        """The world position of pixel (u, v), x right and y down, seen at
-        `depth_m` along the optical axis in an image of `width` x `height`:
-        the pixel through the intrinsics, scaled to that image size when the
-        stream is not at the size the intrinsics were given for, the lens
-        taken off, then the ray placed by the pose."""
+        """The robot-frame position of pixel (u, v), x right and y down,
+        seen at `depth_m` along the optical axis in an image of `width` x
+        `height`: the pixel through the intrinsics, scaled to that image
+        size when the stream is not at the size the intrinsics were given
+        for, the lens taken off, then the ray placed by the pose."""
         if self.intrinsics is None:
             raise ValueError("the camera's intrinsics are not known yet")
+        if self.pose is None:
+            raise ValueError("the camera's pose is not known yet")
         k = self.intrinsics.scaled_to(width, height)
         x, y = pixel_to_ray(u, v, k.fx, k.fy, k.cx, k.cy, k.distortion_model, k.distortion)
-        camera = (x * depth_m, -y * depth_m, -depth_m)
-        rotated = rotate(self.orientation, camera)
+        camera = (x * depth_m, y * depth_m, depth_m)
+        rotated = rotate(self.pose.orientation, camera)
         return (
-            self.position[0] + rotated[0],
-            self.position[1] + rotated[1],
-            self.position[2] + rotated[2],
+            self.pose.position[0] + rotated[0],
+            self.pose.position[1] + rotated[1],
+            self.pose.position[2] + rotated[2],
         )
 
     def forward(self) -> Vec3:
-        """The world direction the camera looks along."""
-        return rotate(self.orientation, (0.0, 0.0, -1.0))
+        """The robot-frame direction the camera looks along."""
+        if self.pose is None:
+            raise ValueError("the camera's pose is not known yet")
+        return rotate(self.pose.orientation, (0.0, 0.0, 1.0))
 
 
 def pixel_to_ray(

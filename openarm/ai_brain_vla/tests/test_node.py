@@ -7,7 +7,7 @@ import asyncio
 import time
 from functools import partial
 
-from conftest import PARAMS, FakeDetector, FakeManipulator, answer_the_camera, colour_intrinsics, depth_frame, rgb_frame
+from conftest import PARAMS, FakeDetector, FakeManipulator, answer_the_camera, camera_poses, colour_intrinsics, depth_frame, rgb_frame
 from peppygen import QoSProfile
 from peppygen.exposed_actions.item_manipulation import abort as abort_action
 from peppygen.exposed_actions.item_manipulation import drop_item as drop_action
@@ -110,12 +110,19 @@ async def test_every_member_completes_over_the_wire_with_backends():
         scan = await scanned(h)
         assert scan.success is True, scan.message
         assert scan.labels == ["cup"] and scan.confidences == [0.9] and len(scan.positions) == 3
+        # The robot placed the camera at its origin looking along +Z: the
+        # box's centre, a metre deep, is a metre ahead.
+        assert [round(v, 6) for v in scan.positions] == [0.0, 0.0, 1.0]
+        assert scan.regions == [7.0, 5.0, 9.0, 7.0]
+        assert scan.camera == "chest" and (scan.image_width, scan.image_height) == (16, 12)
+        assert scan.frame_timestamp > 0.0
         [cup] = scan.item_ids
 
         found = await result_of(identify_fx, h, identify_action.GoalRequestData(description="the cup", timeout_s=0.0))
         assert found.success is True, found.message
         assert (found.item_id, found.label, found.confidence) == (cup, "cup", 0.9)
         assert found.position == scan.positions and found.orientation is None
+        assert found.region == [7.0, 5.0, 9.0, 7.0] and found.camera == "chest"
 
         grabbed = await result_of(grab_fx, h, grab_request("left_gripper", item_id=cup))
         assert grabbed.success is True, grabbed.message
@@ -191,3 +198,18 @@ async def test_the_camera_is_asked_again_until_it_knows_its_geometry(monkeypatch
         assert scan.labels == ["cup"]
         assert h.mocks.deps.geometry.get_color_intrinsics.captured_count() == 2
         assert h.mocks.deps.geometry.get_depth_intrinsics.captured_count() == 2
+
+
+async def test_the_robot_is_asked_again_until_it_names_the_camera(monkeypatch):
+    # The robot answers, but carries no camera by the name the brain looks
+    # through: the brain keeps asking, and the first scan after the answer
+    # that names it succeeds.
+    monkeypatch.setattr(geometry, "INTRINSICS_RETRY_S", 0.0)
+    detector = FakeDetector([Box("cup", 0.9, 7, 5, 9, 7)])
+    async with harness.start(partial(setup, detector=detector), parameters=params()) as h:
+        wrists_only = camera_poses(names=("wrist_left", "wrist_right"))
+        answer_the_camera(h, mounts=(wrists_only, wrists_only, camera_poses()))
+        await publish_a_capture(h)
+        scan = await scanned(h)
+        assert scan.success is True, scan.message
+        assert h.mocks.deps.camera_mounts.get_camera_poses.captured_count() == 3

@@ -33,6 +33,11 @@
       // The whole-robot posture moves: both arms to Ready or Home through
       // the same admission and planner path as move_arm_joints.
       { name: "postures", tag: "v1", link_id: "postures" },
+      // Where the robot's design carries each camera, in the robot frame,
+      // composed with the measured grasp poses for the cameras the arms
+      // carry: the design values, exact in a simulation and nominal on
+      // hardware.
+      { name: "camera_mounts", tag: "v1", link_id: "camera_mounts" },
     ],
     depends_on: {
       contracts: [
@@ -168,7 +173,16 @@
         // that label limb_states. Served from bringup, ahead of the
         // readiness gate the moves wait on: the names are fixed, so a
         // consumer can address a limb before the robot can move one.
-        { link_id: "limb_state", name: "get_limb_names" }
+        { link_id: "limb_state", name: "get_limb_names" },
+        // The stop of every planned move in flight, whoever started it, and
+        // the plan check of a Cartesian move that moves nothing. Both are
+        // answered by the coordinator, so they wait behind the readiness
+        // gate with the moves.
+        { link_id: "limb_motion", name: "stop" },
+        { link_id: "limb_motion", name: "check_arm_move" },
+        // Where the cameras stand now, answered from bringup: refused until
+        // the coordinator has measured the arms.
+        { link_id: "camera_mounts", name: "get_camera_poses" }
       ],
       consumes: [
         { link_id: "robot_init", name: "is_ready" }

@@ -2,8 +2,10 @@
 //! arms, hand each planner an ordinary joint goal to the posture, and
 //! complete the one action goal from both terminals. Cancel flips a shared
 //! flag the moves poll, so each arm stops the way a cancelled joint move
-//! stops. The two actions share the arms' single-flight slots, so a posture
-//! goal arriving while the other posture runs is rejected busy.
+//! stops; the stop service ends both arms' moves the same way, and the goal
+//! ends as cancelled with the stop's message. The two actions share the
+//! arms' single-flight slots, so a posture goal arriving while the other
+//! posture runs is rejected busy.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,14 +18,6 @@ use tracing::error;
 use crate::actions::claim;
 use crate::planner::{Goal, JointReply, ReadyOutcome, ReadyReply};
 use crate::types::Side;
-
-/// This crate's side in the description's vocabulary.
-fn model_side(side: Side) -> openarm_description::Side {
-    match side {
-        Side::Left => openarm_description::Side::Left,
-        Side::Right => openarm_description::Side::Right,
-    }
-}
 
 /// Claim both arms' single-flight slots, or name the busy arm. A failure on
 /// the second claim unwinds the first, so a refusal never leaves a slot held.
@@ -48,9 +42,10 @@ enum Terminal {
 
 /// Judge the end of a posture move from what actually came back: the goals
 /// dispatched, the outcomes received, and whether a cancel was seen. Cancel
-/// wins whatever the outcomes say; otherwise success requires both arms
-/// dispatched and both outcomes successful (reported as `done`), and the
-/// message names the first thing that went wrong.
+/// wins whatever the outcomes say; a stop ends the goal as cancelled with
+/// the stop's message; otherwise success requires both arms dispatched and
+/// both outcomes successful (reported as `done`), and the message names the
+/// first thing that went wrong.
 fn summarize(
     pending: usize,
     outcomes: &[ReadyOutcome],
@@ -59,6 +54,9 @@ fn summarize(
 ) -> (Terminal, String) {
     if cancelled {
         return (Terminal::Cancelled, "goal cancelled".to_string());
+    }
+    if let Some(stopped) = outcomes.iter().find(|o| o.stopped) {
+        return (Terminal::Cancelled, stopped.message.clone());
     }
     if pending < 2 {
         return (
@@ -117,7 +115,7 @@ macro_rules! posture_runner {
                 for side in [Side::Left, Side::Right] {
                     let idx = side.index();
                     let goal = Goal::Joint {
-                        target: $posture(model_side(side)),
+                        target: $posture(side.model()),
                         duration_s,
                         reply: JointReply::Ready(ReadyReply {
                             done_tx: done_tx.clone(),
@@ -185,12 +183,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn model_side_maps_this_crate_onto_the_description() {
-        assert_eq!(model_side(Side::Left), openarm_description::Side::Left);
-        assert_eq!(model_side(Side::Right), openarm_description::Side::Right);
-    }
-
-    #[test]
     fn both_postures_sit_inside_both_generations_joint_limits() {
         // The planner sends postures unclamped, so an out-of-limit posture
         // would reach the arms; this pin, against the same floored model the
@@ -200,7 +192,7 @@ mod tests {
         use openarm_description::{HardwareVersion, JointPosture, home, ready};
         for version in [HardwareVersion::V1, HardwareVersion::V2] {
             for side in [Side::Left, Side::Right] {
-                let model = crate::arm_model(version, model_side(side))
+                let model = crate::arm_model(version, side.model())
                     .expect("build arm from the bundled URDF");
                 let limits = model.limits();
                 let postures = [
@@ -211,7 +203,7 @@ mod tests {
                     ("home", home),
                 ];
                 for (name, posture) in postures {
-                    let q_all = posture(model_side(side));
+                    let q_all = posture(side.model());
                     for (j, (&q, limit)) in q_all.iter().zip(&limits).enumerate() {
                         assert!(
                             q >= limit.lo && q <= limit.hi,
@@ -231,6 +223,7 @@ mod tests {
         ReadyOutcome {
             success,
             message: message.to_string(),
+            stopped: false,
         }
     }
 
@@ -291,6 +284,27 @@ mod tests {
         let (terminal, message) = summarize(0, &[], true, "both arms at ready");
         assert_eq!(terminal, Terminal::Cancelled);
         assert_eq!(message, "goal cancelled");
+    }
+
+    #[test]
+    fn a_stopped_arm_ends_the_goal_cancelled_with_the_stops_message() {
+        // The stop service ended the left arm's share; the right arm's share
+        // ended with it. The goal ends as cancelled, naming the stop.
+        let outcomes = [
+            ReadyOutcome {
+                success: false,
+                message: "left: stopped: operator".to_string(),
+                stopped: true,
+            },
+            ReadyOutcome {
+                success: false,
+                message: "right: stopped: operator".to_string(),
+                stopped: true,
+            },
+        ];
+        let (terminal, message) = summarize(2, &outcomes, false, "both arms at ready");
+        assert_eq!(terminal, Terminal::Cancelled);
+        assert_eq!(message, "left: stopped: operator");
     }
 
     #[test]
