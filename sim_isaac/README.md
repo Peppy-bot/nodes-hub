@@ -82,7 +82,7 @@ pair is read for it through `sim_robot_core.pairs`:
   SO-101. Those are the names the robot answers to in `limb_motion` and
   `limb_state`, the names `attach` answers with, and the names the engine logs;
 - a camera pair's camera is its relay's name in the copy (`wrist_left`,
-  `front`): the relay's instance id without the copy's prefix.
+  `wrist`): the relay's instance id without the copy's prefix.
 
 A robot's lease is renewed only while its pairs are its model's: every limb of
 its model, and nothing its model lacks. A camera its model carries may go

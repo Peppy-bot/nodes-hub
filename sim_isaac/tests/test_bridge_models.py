@@ -385,7 +385,7 @@ class TestRigs:
             "chest",
         ]
         assert rigs["charlo"][0] == "/World/charlo"
-        assert [camera.name for camera in rigs["charlo"][1].entry.cameras] == ["front"]
+        assert [camera.name for camera in rigs["charlo"][1].entry.cameras] == ["wrist"]
 
     def test_a_robot_pairing_no_camera_renders_none_whatever_its_model_carries(self, engine, fleet):
         fleet._io.camera_robots.return_value = {"charlo"}

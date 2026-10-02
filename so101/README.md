@@ -30,7 +30,7 @@ follower node: the engine plays the follower role, the same backbone leads
 `simulation_inst/arms` and `simulation_inst/grippers` through those links, and
 the link a pair comes from is how the engine knows which limb it drives.
 [`sim_mujoco`](../sim_mujoco), [`sim_isaac`](../sim_isaac) and Waldo all stand
-the `so101` model, with its `front` camera. The backbone does not wait on
+the `so101` model, with its `wrist` camera. The backbone does not wait on
 `robot_ready`: it holds still while its limbs report nothing, which is what a
 robot not yet admitted looks like.
 

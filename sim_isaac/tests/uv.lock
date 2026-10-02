@@ -243,7 +243,7 @@ dev = [
 requires-dist = [
     { name = "numpy", specifier = ">=1.26" },
     { name = "pyjson5", specifier = "==2.0.0" },
-    { name = "sim-robot-core", git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=sim_robot_core&rev=c03a5492abc65b7e1190e8fdd771d5e1e131869a" },
+    { name = "sim-robot-core", git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=sim_robot_core&rev=7b3a277bff890d0dde26e6aa998074fa90cbffb0" },
 ]
 
 [package.metadata.requires-dev]
@@ -257,7 +257,7 @@ dev = [
 [[package]]
 name = "sim-robot-core"
 version = "0.1.0"
-source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=sim_robot_core&rev=c03a5492abc65b7e1190e8fdd771d5e1e131869a#c03a5492abc65b7e1190e8fdd771d5e1e131869a" }
+source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=sim_robot_core&rev=7b3a277bff890d0dde26e6aa998074fa90cbffb0#7b3a277bff890d0dde26e6aa998074fa90cbffb0" }
 dependencies = [
     { name = "numpy" },
     { name = "pyjson5" },

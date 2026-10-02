@@ -1,6 +1,6 @@
 """The SO-101 this engine stands, held to so101_description: the hardware's
 source of truth for the joints, their limits, the tool frame, the start
-posture and the front camera.
+posture and the wrist camera.
 
 The model is MuJoCo Menagerie's robotstudio_so101 at the commit
 sim_base_images/so101_model.lock.json pins, read from the baked assets
@@ -49,10 +49,11 @@ TOOL_ORIENTATION_TOLERANCE = 1e-4
 # composed from the two.
 TOOL_PARENT_LINK = "gripper_link"
 TOOL_JOINT = "gripper_frame_joint"
-# The site that is the tool frame in the MJCF, and the body the URDF's base
-# link is there.
+# The site that is the tool frame in the MJCF, and the bodies the URDF's base
+# link and gripper link are there.
 TOOL_SITE = "gripperframe"
 BASE_BODY = "base"
+GRIPPER_BODY = "gripper"
 
 # Where each motor joint sits in its range, per configuration: mid-range,
 # two spread poses, and the limits, with wrist_roll at the upper limit only
@@ -357,28 +358,38 @@ class TestStartPosture:
         assert targets == pytest.approx(described)
 
 
-class TestFrontCamera:
-    def test_it_hangs_from_the_base_at_the_descriptions_pose(self, rendered):
-        described = simulation.front_camera()
+class TestWristCamera:
+    def test_it_hangs_from_the_gripper_at_the_descriptions_pose(self, rendered):
+        described = simulation.wrist_camera()
         camera = rendered.camera(f"{ROBOT}/{described.name}")
         orientation = np.array(described.quat_wxyz) / np.linalg.norm(described.quat_wxyz)
 
-        assert rendered.body(int(camera.bodyid[0])).name == f"{ROBOT}/{BASE_BODY}"
+        assert rendered.body(int(camera.bodyid[0])).name == f"{ROBOT}/{GRIPPER_BODY}"
         assert camera.pos == pytest.approx(described.pos)
         assert camera.quat == pytest.approx(orientation)
         assert camera.fovy[0] == pytest.approx(described.fovy_deg)
 
-    def test_the_base_body_is_the_urdfs_base_link(self, known, rendered):
-        """The camera's pose is written in the URDF's base link frame, so the
-        body it hangs from has to be that frame."""
-        base = rendered.body(f"{ROBOT}/{BASE_BODY}")
+    @pytest.mark.parametrize("configuration", _CONFIGURATIONS)
+    def test_the_gripper_body_is_the_urdfs_gripper_link(self, known, model, urdf, configuration):
+        """The camera's pose is written in the URDF's gripper link frame, so
+        the body it hangs from has to be that frame wherever the arm stands."""
+        link = simulation.wrist_camera().parent_link
+        data = _pose(model, configuration)
+        base, gripper = data.body(BASE_BODY), data.body(GRIPPER_BODY)
+        position, orientation = _in_frame(
+            base.xpos, base.xmat.reshape(3, 3), gripper.xpos, gripper.xmat.reshape(3, 3)
+        )
+        # MuJoCo fuses the URDF's base link into the world.
+        described = _pose(urdf, configuration).body(link)
 
-        assert known.body_of(simulation.front_camera().parent_link) == BASE_BODY
-        assert base.pos.tolist() == [0.0, 0.0, 0.0]
-        assert base.quat.tolist() == [1.0, 0.0, 0.0, 0.0]
+        assert known.body_of(link) == GRIPPER_BODY
+        assert position == pytest.approx(described.xpos, abs=TOOL_POSITION_TOLERANCE_M)
+        assert orientation == pytest.approx(
+            described.xmat.reshape(3, 3), abs=TOOL_ORIENTATION_TOLERANCE
+        )
 
     def test_it_streams_the_descriptions_resolution(self, known, rendered):
-        described = simulation.front_camera()
+        described = simulation.wrist_camera()
         (camera,) = known.entry.cameras
 
         assert (camera.name, camera.width, camera.height, camera.fps) == (

@@ -26,7 +26,7 @@ dependencies = [
     "sim_robot_core",
     # The hardware's source of truth the SO-101 model is held to
     # (test_so101_model.py): joint names, URDF limits, the tool frame, the
-    # start posture and the front camera.
+    # start posture and the wrist camera.
     "so101_description",
 ]
 
@@ -39,5 +39,5 @@ dev = ["pytest>=8"]
 package = false
 
 [tool.uv.sources]
-sim_robot_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "sim_robot_core", rev = "c03a5492abc65b7e1190e8fdd771d5e1e131869a" }
-so101_description = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "so101_description", rev = "960ed472252acbb5766a1e604b337d511d31700b" }
+sim_robot_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "sim_robot_core", rev = "7b3a277bff890d0dde26e6aa998074fa90cbffb0" }
+so101_description = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "so101_description", rev = "7b3a277bff890d0dde26e6aa998074fa90cbffb0" }
