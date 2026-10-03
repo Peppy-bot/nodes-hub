@@ -688,6 +688,13 @@ class _Handle:
         return self._goals.pop() if self._goals else None
 
 
+def _progress(*, bytes_fetched, files_ready, building, bytes_ready, bytes_total, bytes_per_second):
+    """A progress message as a goal publishes it: every field of the
+    contract's feedback, by keyword, in the contract's order."""
+
+    return (bytes_fetched, files_ready, building, bytes_ready, bytes_total, bytes_per_second)
+
+
 class _Goal:
     """A load_scene or spawn_object goal, as its generated context carries
     it. It logs each progress message it sends and how it ends, and hands
@@ -707,8 +714,8 @@ class _Goal:
     def is_cancelled(self):
         return False
 
-    async def publish_feedback(self, bytes_fetched, files_ready, building):
-        progress = (bytes_fetched, files_ready, building)
+    async def publish_feedback(self, **fields):
+        progress = _progress(**fields)
         self._events.append(("progress", progress))
         self.taken.put_nowait(progress)
 
@@ -723,16 +730,16 @@ class _StuckPublish(_Goal):
     """A goal whose progress message is never sent: its publish never
     ends."""
 
-    def publish_feedback(self, bytes_fetched, files_ready, building):
-        self._events.append(("offered", (bytes_fetched, files_ready, building)))
+    def publish_feedback(self, **fields):
+        self._events.append(("offered", _progress(**fields)))
         return asyncio.Event().wait()
 
 
 class _FailingPublish(_Goal):
     """A goal whose progress publish fails."""
 
-    async def publish_feedback(self, bytes_fetched, files_ready, building):
-        self._events.append(("offered", (bytes_fetched, files_ready, building)))
+    async def publish_feedback(self, **fields):
+        self._events.append(("offered", _progress(**fields)))
         raise RuntimeError("the feedback stream is closed")
 
 
@@ -754,8 +761,8 @@ _SPAWN = SimpleNamespace(
 )
 _REPORTING_ACTIONS = pytest.mark.parametrize("goal", [_LOAD, _SPAWN], ids=lambda goal: goal.action)
 
-_ACCEPTED = (0, 0, False)
-_BUILDING = (0, 0, True)
+_ACCEPTED = (0, 0, False, 0, 0, 0)
+_BUILDING = (0, 0, True, 0, 0, 0)
 
 
 def _hold_the_build(provider, goal, events, finish):
