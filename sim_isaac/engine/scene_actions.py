@@ -196,8 +196,9 @@ async def _report_progress(
     building: bool,
 ) -> bool:
     """Publishes one progress message of a load_scene or spawn_object goal,
-    with nothing fetched. False, and logged, when the message was not sent
-    within _REPORT_TIMEOUT_S or the publish failed."""
+    with nothing fetched and nothing to fetch: Isaac reads every asset from
+    its own install. False, and logged, when the message was not sent within
+    _REPORT_TIMEOUT_S or the publish failed."""
 
     try:
         await asyncio.wait_for(
@@ -205,6 +206,9 @@ async def _report_progress(
                 bytes_fetched=0,
                 files_ready=0,
                 building=building,
+                bytes_ready=0,
+                bytes_total=0,
+                bytes_per_second=0,
             ),
             timeout=_REPORT_TIMEOUT_S,
         )
