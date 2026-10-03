@@ -24,8 +24,9 @@
   // in company than it does alone.
   solver: '<option integrator="implicitfast"/>',
 
-  // The URDF's base link is upstream's `base` body.
-  link_bodies: { base_link: "base" },
+  // The URDF's gripper link, which the wrist camera hangs from, is
+  // upstream's `gripper` body.
+  link_bodies: { gripper_link: "gripper" },
 
   // Where upstream and so101_description differ the description wins:
   // upstream stops wrist_roll short of the URDF's upper limit, and puts its

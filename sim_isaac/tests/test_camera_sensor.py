@@ -335,31 +335,31 @@ class TestWhereAModelsCamerasHang:
     def test_the_rig_is_the_cameras_of_the_robots_own_model(self):
         so101 = isaac_models.IsaacModels.read().of("so101")
         sensor = IsaacCameraSensor("charlo", "/World/charlo", so101, FakeIO())
-        assert list(sensor._cameras) == ["front"]
+        assert list(sensor._cameras) == ["wrist"]
 
         openarm = isaac_models.IsaacModels.read().of("openarm_v2")
         sensor = IsaacCameraSensor("alpha", "/World/alpha", openarm, FakeIO())
         assert list(sensor._cameras) == ["wrist_left", "wrist_right", "chest"]
 
-    def test_an_so101s_front_camera_hangs_from_its_own_base_link(self):
+    def test_an_so101s_wrist_camera_hangs_from_its_own_gripper_link(self):
         from pxr import UsdGeom
 
         # An OpenArm stands beside it, and another SO-101 with the same links.
         stage = self._stage(
             "/World/alpha/openarm_body_link0",
-            "/World/bravo/base_link",
-            "/World/charlo/base_link",
+            "/World/bravo/gripper_link",
+            "/World/charlo/gripper_link",
         )
         so101 = isaac_models.IsaacModels.read().of("so101")
 
-        assert self._hang(stage, "/World/charlo", so101) == ["/World/charlo/base_link/front"]
+        assert self._hang(stage, "/World/charlo", so101) == ["/World/charlo/gripper_link/wrist"]
 
-        camera = stage.GetPrimAtPath("/World/charlo/base_link/front")
+        camera = stage.GetPrimAtPath("/World/charlo/gripper_link/wrist")
         assert camera.IsA(UsdGeom.Camera)
-        (front,) = shipped_entry("so101").cameras
+        (wrist,) = shipped_entry("so101").cameras
         translate, _orient = UsdGeom.Xformable(camera).GetOrderedXformOps()
-        assert tuple(translate.Get()) == pytest.approx(front.pos)
-        assert not stage.GetPrimAtPath("/World/bravo/base_link/front").IsValid()
+        assert tuple(translate.Get()) == pytest.approx(wrist.pos)
+        assert not stage.GetPrimAtPath("/World/bravo/gripper_link/wrist").IsValid()
 
     def test_an_openarm_v2s_cameras_hang_from_its_wrists_and_its_pedestal(self):
         stage = self._stage(
@@ -376,11 +376,11 @@ class TestWhereAModelsCamerasHang:
         ]
 
     def test_a_link_hangs_from_the_prim_its_models_entry_maps_it_to(self):
-        stage = self._stage("/World/charlo/base")
-        (front,) = shipped_entry("so101").cameras
-        known = _known(front, link_prims={"base_link": "base"})
+        stage = self._stage("/World/charlo/gripper")
+        (wrist,) = shipped_entry("so101").cameras
+        known = _known(wrist, link_prims={"gripper_link": "gripper"})
 
-        assert self._hang(stage, "/World/charlo", known) == ["/World/charlo/base/front"]
+        assert self._hang(stage, "/World/charlo", known) == ["/World/charlo/gripper/wrist"]
 
     def test_a_parent_link_the_robots_stage_lacks_is_refused_with_what_it_has(self):
         stage = self._stage("/World/charlo/shoulder_link")
@@ -390,5 +390,5 @@ class TestWhereAModelsCamerasHang:
             self._hang(stage, "/World/charlo", so101)
 
         message = str(refused.value)
-        assert "camera 'front' parent link 'base_link' is not under /World/charlo as 'base_link'" in message
+        assert "camera 'wrist' parent link 'gripper_link' is not under /World/charlo as 'gripper_link'" in message
         assert "shoulder_link" in message

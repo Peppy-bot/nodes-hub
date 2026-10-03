@@ -12,7 +12,7 @@
   // link fixed to the world. Every link is a prim named after its URDF link
   // under it (base_link, shoulder_link, upper_arm_link, lower_arm_link,
   // wrist_link, gripper_link, moving_jaw_so101_v1_link), which is where the
-  // front camera hanging from base_link is defined. Joint prims are named
+  // wrist camera hanging from gripper_link is defined. Joint prims are named
   // after the joints of the shared entry (shoulder_pan, shoulder_lift,
   // elbow_flex, wrist_flex, wrist_roll, gripper), which is how PhysX names
   // their dofs, and each carries a drive, which is what the posture the robot

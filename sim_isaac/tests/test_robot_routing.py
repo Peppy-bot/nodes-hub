@@ -41,7 +41,7 @@ CHARLO_GRIPPER = member("charlo_backbone_inst", "gripper", "charlo")
 ALPHA_WRIST_LEFT = member("alpha_wrist_left", "simulation", "alpha")
 ALPHA_WRIST_RIGHT = member("alpha_wrist_right", "simulation", "alpha")
 ALPHA_CHEST = member("alpha_chest", "simulation", "alpha")
-CHARLO_FRONT = member("charlo_front", "simulation", "charlo")
+CHARLO_WRIST = member("charlo_wrist", "simulation", "charlo")
 
 
 @pytest.fixture(name="scene")
@@ -286,7 +286,7 @@ class TestRobotsOfDifferentModels:
         no robot that pairs limbs alone."""
         assert fleet.io.camera_robots() == set()
 
-        pair("rgb_cameras", CHARLO_FRONT)
+        pair("rgb_cameras", CHARLO_WRIST)
         assert fleet.io.camera_robots() == {"charlo"}
 
         pair("rgbd_cameras", ALPHA_CHEST)
@@ -297,19 +297,19 @@ class TestRobotsOfDifferentModels:
 
     def test_a_camera_pair_with_no_copy_is_the_only_robots(self, scene):
         _admit(scene, "solo", "so101")
-        pair("rgb_cameras", member("front", "simulation", None))
+        pair("rgb_cameras", member("wrist", "simulation", None))
 
         assert scene.io.camera_robots() == {"solo"}
-        assert scene.io.held_by("solo") == Held(rgb_cameras=frozenset({"front"}))
+        assert scene.io.held_by("solo") == Held(rgb_cameras=frozenset({"wrist"}))
 
     def test_each_robot_holds_its_own_pairs(self, fleet):
-        pair("rgb_cameras", CHARLO_FRONT, ALPHA_WRIST_LEFT)
+        pair("rgb_cameras", CHARLO_WRIST, ALPHA_WRIST_LEFT)
         pair("rgbd_cameras", ALPHA_CHEST)
 
         assert fleet.io.held_by("charlo") == Held(
             arms=frozenset({"arm"}),
             grippers=frozenset({"gripper"}),
-            rgb_cameras=frozenset({"front"}),
+            rgb_cameras=frozenset({"wrist"}),
         )
         assert fleet.io.held_by("alpha") == Held(
             arms=frozenset({"left_arm", "right_arm"}),
@@ -325,20 +325,20 @@ class TestCameras:
     def rig_fixture(self, scene):
         _admit(scene, "alpha", "openarm_v2")
         _admit(scene, "charlo", "so101")
-        pair("rgb_cameras", CHARLO_FRONT, ALPHA_WRIST_LEFT, ALPHA_WRIST_RIGHT)
+        pair("rgb_cameras", CHARLO_WRIST, ALPHA_WRIST_LEFT, ALPHA_WRIST_RIGHT)
         pair("rgbd_cameras", ALPHA_CHEST)
         _serve(scene)
         return scene
 
     def test_a_color_frame_goes_to_the_relay_named_after_the_camera(self, rig):
-        assert rig.io.publish_color_frame("charlo", "front", 1.5, 7, "rgb8", 4, 2, b"front")
+        assert rig.io.publish_color_frame("charlo", "wrist", 1.5, 7, "rgb8", 4, 2, b"wrist")
         _publishes(rig)
 
         ((peer, payload),) = _sent("rgb_cameras", "video_stream")
         header, *frame = payload
-        assert peer == CHARLO_FRONT.info
+        assert peer == CHARLO_WRIST.info
         assert (header.timestamp, header.frame_id) == (1.5, 7)
-        assert frame == ["rgb8", 4, 2, b"front"]
+        assert frame == ["rgb8", 4, 2, b"wrist"]
 
     def test_a_color_stream_is_described_to_its_own_relay(self, rig):
         rig.io.publish_color_stream_info("alpha", "wrist_right", 960, 600, 15, "rgb8")
@@ -372,7 +372,7 @@ class TestCameras:
         relay of the same slot does not stand in, and neither does the same
         robot's relay on the other slot."""
         assert not rig.io.publish_color_frame("charlo", "wrist_left", 1.0, 0, "rgb8", 4, 2, b"")
-        assert not rig.io.publish_color_frame("alpha", "front", 1.0, 0, "rgb8", 4, 2, b"")
+        assert not rig.io.publish_color_frame("alpha", "wrist", 1.0, 0, "rgb8", 4, 2, b"")
         assert not rig.io.publish_color_frame("alpha", "chest", 1.0, 0, "rgb8", 4, 2, b"")
         _publishes(rig)
 

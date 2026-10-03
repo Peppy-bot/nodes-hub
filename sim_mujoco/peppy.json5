@@ -34,7 +34,7 @@
         // Robot-mounted cameras rendered from the live scene, one slot per
         // kind of camera: the engine plays the camera role and a per-camera
         // relay presents the rgb/rgbd contract. A pair's camera is its
-        // relay's name in the copy (wrist_left, front), and it is rendered
+        // relay's name in the copy (wrist_left, wrist), and it is rendered
         // for the robot of its pair, so a stack that pairs no camera renders
         // none and pays for none.
         { name: "sim_rgb_camera_link", tag: "v1", role: "camera", link_id: "rgb_cameras", cardinality: "zero_or_more" },

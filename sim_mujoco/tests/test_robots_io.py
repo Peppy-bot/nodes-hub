@@ -45,7 +45,7 @@ OPENARM_V2_HAS = (
     "grippers ['left_gripper', 'right_gripper'], rgb_cameras ['wrist_left', 'wrist_right'], "
     "rgbd_cameras ['chest']"
 )
-SO101_HAS = "the model so101 has arms ['arm'], grippers ['gripper'], rgb_cameras ['front'], rgbd_cameras []"
+SO101_HAS = "the model so101 has arms ['arm'], grippers ['gripper'], rgb_cameras ['wrist'], rgbd_cameras []"
 
 
 def _robots_io() -> RobotsIO:

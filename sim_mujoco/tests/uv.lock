@@ -23,7 +23,7 @@ wheels = [
 [[package]]
 name = "control-core-py"
 version = "0.1.0"
-source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=control_core_py&rev=960ed472252acbb5766a1e604b337d511d31700b#960ed472252acbb5766a1e604b337d511d31700b" }
+source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=control_core_py&rev=7b3a277bff890d0dde26e6aa998074fa90cbffb0#7b3a277bff890d0dde26e6aa998074fa90cbffb0" }
 
 [[package]]
 name = "etils"
@@ -216,8 +216,8 @@ requires-dist = [
     { name = "mujoco", specifier = "==3.10.0" },
     { name = "numpy", specifier = "==2.4.4" },
     { name = "pyjson5", specifier = "==2.0.0" },
-    { name = "sim-robot-core", git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=sim_robot_core&rev=c03a5492abc65b7e1190e8fdd771d5e1e131869a" },
-    { name = "so101-description", git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=so101_description&rev=960ed472252acbb5766a1e604b337d511d31700b" },
+    { name = "sim-robot-core", git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=sim_robot_core&rev=7b3a277bff890d0dde26e6aa998074fa90cbffb0" },
+    { name = "so101-description", git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=so101_description&rev=7b3a277bff890d0dde26e6aa998074fa90cbffb0" },
 ]
 
 [package.metadata.requires-dev]
@@ -226,7 +226,7 @@ dev = [{ name = "pytest", specifier = ">=8" }]
 [[package]]
 name = "sim-robot-core"
 version = "0.1.0"
-source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=sim_robot_core&rev=c03a5492abc65b7e1190e8fdd771d5e1e131869a#c03a5492abc65b7e1190e8fdd771d5e1e131869a" }
+source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=sim_robot_core&rev=7b3a277bff890d0dde26e6aa998074fa90cbffb0#7b3a277bff890d0dde26e6aa998074fa90cbffb0" }
 dependencies = [
     { name = "numpy" },
     { name = "pyjson5" },
@@ -235,7 +235,7 @@ dependencies = [
 [[package]]
 name = "so101-description"
 version = "0.1.0"
-source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=so101_description&rev=960ed472252acbb5766a1e604b337d511d31700b#960ed472252acbb5766a1e604b337d511d31700b" }
+source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=so101_description&rev=7b3a277bff890d0dde26e6aa998074fa90cbffb0#7b3a277bff890d0dde26e6aa998074fa90cbffb0" }
 dependencies = [
     { name = "control-core-py" },
     { name = "numpy" },

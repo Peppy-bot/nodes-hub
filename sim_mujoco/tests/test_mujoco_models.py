@@ -62,7 +62,7 @@ class TestTheShippedEntries:
             False,
             False,
         )
-        assert known.link_bodies == {"base_link": "base"}
+        assert known.link_bodies == {"gripper_link": "gripper"}
         assert known.joint_ranges == {"wrist_roll": (-2.74385, 2.84121)}
         assert known.site_poses == {
             "gripperframe": SitePose(
