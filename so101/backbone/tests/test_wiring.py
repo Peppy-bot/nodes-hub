@@ -418,6 +418,32 @@ async def test_nonzero_max_effort_is_accepted_and_ignored():
             feeder.cancel()
 
 
+async def test_a_gripper_goals_max_effort_never_reaches_the_follower():
+    async with harness.start(setup, parameters=make_parameters()) as h:
+        feeder = await feeding_measured(h)
+        try:
+            goal = await move_gripper_fx.send_goal(
+                h,
+                move_gripper_prod.GoalRequestData(
+                    gripper_name="gripper", opening=0.5, max_effort=2.0
+                ),
+                peppylib.QoSProfile.Reliable,
+                TIMEOUT_S,
+            )
+            assert goal.accepted
+            # No leader sends gripper setpoints. Thus the first setpoint that
+            # the follower receives is a step of this goal to its opening.
+            setpoint = await asyncio.wait_for(
+                h.mocks.pairings.gripper.gripper_setpoints.next(), TIMEOUT_S
+            )
+            assert 0.0 < setpoint.opening <= 0.5
+            assert setpoint.max_effort == 0.0
+            result = await goal.get_result(TIMEOUT_S)
+            assert result.data.success
+        finally:
+            feeder.cancel()
+
+
 async def test_malformed_pose_goal_is_rejected_and_the_server_survives():
     async with harness.start(setup, parameters=make_parameters()) as h:
         feeder = await feeding_measured(h)
