@@ -7,7 +7,7 @@ from pathlib import Path
 import subprocess
 import sys
 
-from ci_containers import container_command, derive_test_image, log_group
+from ci_containers import CARGO_HOME, cargo_home_bind, container_command, derive_test_image, log_group
 
 
 def main() -> int:
@@ -32,6 +32,8 @@ def main() -> int:
             binds=[
                 f"{cache / 'uv'}:/uv",
                 f"{temporary / 'uv-environments'}:/environments",
+                # uv builds a project's Rust extensions with cargo.
+                cargo_home_bind(cache),
                 f"{temporary / 'peppy-dist'}:/peppy-dist",
             ],
             variables={
@@ -39,6 +41,7 @@ def main() -> int:
                 "UV_CACHE_DIR": "/uv/cache",
                 "UV_PYTHON_INSTALL_DIR": "/uv/python",
                 "UV_PROJECT_ENVIRONMENT": environment,
+                "CARGO_HOME": CARGO_HOME,
                 "PEPPY_ZENOHD_PATH": "/peppy-dist/bin/zenohd",
             },
         )
