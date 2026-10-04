@@ -242,20 +242,21 @@ within 2 s for each of its two answers.
 The grid, the limits, the verdicts, the largest workable rectangle and the
 messages of the verdicts, of the count of workable points and of a view not
 checked (for a robot without a perception camera too) are
-`workspace_core`'s, so these answers and the simulation's read alike; the
-refusals of a request and of the camera's geometry, in the table above and
-below, are the backbone's own.
+`workspace_core`'s, so these answers and the simulation's read alike. The
+parsing of a request and its refusals (below), the reach memo and the
+composition of each answer are `workspace_core::design`'s. The refusals of
+the camera's geometry, in the table above, are the backbone's own.
 
 `describe_workspace` measures the surface at its height to the millimetre,
-each grid point's reach at a target 4 cm above it, and keeps the reach
-grids of the last 32 heights it measured (the one stored first goes past
-that), so a repeated height answers from the stored grid. A height that is
-not a finite number, an empty position list, one that does not split into
-points of 3 values, a value that is not a finite number, and a coordinate
-more than 1000 m from the robot's base point are refused. Both services
-read nothing of the arms and move nothing, so they answer from bringup,
-ahead of the readiness gate. The robot's own body is not checked for hiding
-a point from the camera.
+each grid point's reach at a target 4 cm above it, and keeps the reach grids
+of the last 32 heights it measured (the one stored first goes past that), so
+a repeated height answers from the stored grid. A height that is not a
+finite number or that is more than 1000 m from the robot's base point, an
+empty position list, one that does not split into points of 3 values, a
+value that is not a finite number, and a coordinate more than 1000 m from
+the robot's base point are refused. Both services read nothing of the arms
+and move nothing, so they answer from bringup, ahead of the readiness gate.
+The robot's own body is not checked for hiding a point from the camera.
 
 ## Module map
 
@@ -279,7 +280,7 @@ a point from the camera.
 | `governor/barrier.rs` | the projection and the floor scan | the two stages that are not per-DOF fractions |
 | `torso.rs` | the torso clip regions the URDF does not carry | geometry facts, versioned with the node |
 | `actions/` | goal admission (validate + claim), nothing else | execution belongs to the planner/coordinator that owns the state |
-| `workspace.rs` | the workspace judgement from the design: reach per grasp orientation, the perception camera, the per-height reach memo, the parsing of a request and of the camera's geometry | pure: no messaging, so every answer is unit-tested without a node |
+| `workspace.rs` | the OpenArm's part of the workspace answer from the design: reach per grasp orientation, the perception camera, the per-height reach memo it keeps, the parsing of the camera's geometry; `workspace_core::design` parses the request and composes the answer | pure: no messaging, so every answer is unit-tested without a node |
 | `workspace_service.rs` | the two workspace services and the read of the linked camera's geometry | the thin edge between the generated handlers and `workspace.rs` |
 | `serving.rs` | the loop of each service answered for the life of the node (`get_limb_names`, `get_camera_poses`, the workspace services): ended by the node's cancel, an error logged and waited out for 1 s | one loop, so no service can hot-spin on a broken transport or outlive the node |
 | `types.rs`, `arm_pair.rs` | `ARM_DOF`, `JointVec`, `Side`, the motion-timeout rule, `ArmPair` | shared primitives |
