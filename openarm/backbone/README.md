@@ -164,7 +164,10 @@ measured then and `action_time` runs to that moment.
 
 A gripper that stops short is a success on purpose: the move was neither
 refused, failed nor cancelled, and the caller judges the grasp from
-`final_opening`.
+`final_opening`. After the move, the backbone sends the gripper nothing
+until the next gripper move or a leader's gripper stream, so the gripper
+keeps the move's target opening and `max_effort` (relayed unchanged) and
+goes on squeezing what it holds.
 
 `move_to_ready` and `move_to_home` give each arm's planner a joint move to
 the posture and complete when both moves end. `success` says that both
@@ -179,7 +182,11 @@ that is where each arm was when the move ended. When an arm has no such
 pose, the three arrays are empty and the message ends with
 `; no arm poses: <arm> has not measured its joints` (a goal during the seed
 wait) or `; no arm poses: <arm> did not report the end of its move` (its
-planner is unavailable or dropped the move).
+planner is unavailable or dropped the move). A posture move sends no
+gripper command, so each gripper goes on as its last command drives it. On
+v2 with both grippers fully open, the jaws at Home sit closer to the torso
+than the validated stop distance (`d_stop_m` 5 mm), so the governor holds
+both arms short of Home: close the grippers first.
 
 ### Services of limb_motion
 

@@ -1182,6 +1182,166 @@ mod tests {
         );
     }
 
+    /// A posture share whose arm never follows: the governor holds every
+    /// step, or the arm stands against an obstacle the backbone cannot see.
+    /// The move ends on its clock with success, and reports the grasp pose
+    /// of the measured joints, not of the goal.
+    #[tokio::test]
+    async fn a_joint_move_the_governor_holds_still_completes_with_success() {
+        let held = [0.0; ARM_DOF];
+        let target = [0.5; ARM_DOF];
+        let mut planner = test_planner(held);
+        let measured_grasp = planner.ee_pose_world(&held);
+        let (goal_tx, mut goals) = mpsc::channel(1);
+        let busy = Arc::new(AtomicBool::new(true));
+
+        // The governor holds every step: no candidate is committed.
+        let (done_tx, mut done_rx) = mpsc::channel(1);
+        goal_tx
+            .send(ready_goal(target, done_tx))
+            .await
+            .expect("queue the goal");
+        let now = Instant::now();
+        planner.tick(held, None, &mut goals, &busy, now).await;
+        assert!(busy.load(Ordering::Acquire), "the move is in flight");
+        planner
+            .tick(
+                held,
+                None,
+                &mut goals,
+                &busy,
+                now + Duration::from_secs(3600),
+            )
+            .await;
+        let outcome = done_rx.try_recv().expect("the move ends on its clock");
+        assert!(outcome.success, "{}", outcome.message);
+        assert_eq!(outcome.message, "left: trajectory complete");
+        assert!(!outcome.stopped);
+        assert_eq!(outcome.grasp, Some(measured_grasp));
+        assert_eq!(planner.setpoint(), held, "the arm never left its pose");
+        assert!(!busy.load(Ordering::Acquire), "the end releases the slot");
+
+        // The governor lets every step through, but the arm stands still.
+        let (done_tx, mut done_rx) = mpsc::channel(1);
+        busy.store(true, Ordering::Release);
+        goal_tx
+            .send(ready_goal(target, done_tx))
+            .await
+            .expect("queue the goal");
+        let now = Instant::now();
+        let tick = planner.tick(held, None, &mut goals, &busy, now).await;
+        planner.commit(tick.candidate);
+        let Mode::JointMove(JointMove { traj, .. }) = &planner.mode else {
+            panic!("the goal starts a joint move");
+        };
+        let motion_start = traj.motion_start;
+        // Half of the one-second move, on the move's own clock.
+        for step in 1..=5 {
+            let tick = planner
+                .tick(
+                    held,
+                    None,
+                    &mut goals,
+                    &busy,
+                    motion_start + Duration::from_millis(100 * step),
+                )
+                .await;
+            planner.commit(tick.candidate);
+        }
+        assert!(done_rx.try_recv().is_err(), "the move is in flight");
+        assert_ne!(planner.setpoint(), held, "the commanded arm moves");
+        planner
+            .tick(
+                held,
+                None,
+                &mut goals,
+                &busy,
+                now + Duration::from_secs(3600),
+            )
+            .await;
+        let outcome = done_rx.try_recv().expect("the move ends on its clock");
+        assert!(outcome.success, "{}", outcome.message);
+        assert_eq!(outcome.message, "left: trajectory complete");
+        assert_eq!(outcome.grasp, Some(measured_grasp));
+        assert!(!busy.load(Ordering::Acquire), "the end releases the slot");
+    }
+
+    /// The rest posture puts each grasp point lower and closer to the
+    /// column than the working posture does, on both generations and both
+    /// sides; on openarm_v2 the grasp points are at the numbers the
+    /// description's joints give.
+    #[test]
+    fn the_home_grasp_points_sit_lower_and_closer_in_than_ready() {
+        use openarm_description::{HardwareVersion, home, ready};
+        let horizontal = |pose: &Isometry3<f64>| pose.translation.x.hypot(pose.translation.y);
+        for version in [HardwareVersion::V1, HardwareVersion::V2] {
+            for side in [Side::Left, Side::Right] {
+                let model = crate::arm_model(version, side.model()).expect("build the arm");
+                let mut planner = Planner::new(side, model, test_cfg());
+                let r = planner.ee_pose_world(&ready(side.model()));
+                let h = planner.ee_pose_world(&home(side.model()));
+                let label = format!("{version:?} {}", side.label());
+                assert!(
+                    h.translation.z < r.translation.z,
+                    "{label}: home z {} is not below ready z {}",
+                    h.translation.z,
+                    r.translation.z
+                );
+                assert!(
+                    horizontal(&h) < horizontal(&r),
+                    "{label}: home is {} m out, ready {} m",
+                    horizontal(&h),
+                    horizontal(&r)
+                );
+            }
+        }
+
+        // openarm_v2: [x, y, z] in metres and [x, y, z, w] of each posture's
+        // grasp point, the left arm the mirror of the right.
+        let v2 = [
+            (
+                Side::Right,
+                [0.3363, -0.1951, 0.2836],
+                [-0.2897, 0.8363, -0.0870, 0.4573],
+                [0.0174, -0.1535, 0.1024],
+                [0.0, 0.9997, 0.0, 0.0250],
+            ),
+            (
+                Side::Left,
+                [0.3363, 0.1951, 0.2836],
+                [0.2897, 0.8363, 0.0870, 0.4573],
+                [0.0174, 0.1535, 0.1024],
+                [0.0, 0.9997, 0.0, 0.0250],
+            ),
+        ];
+        let at = |pose: &Isometry3<f64>, position: [f64; 3], orientation: [f64; 4]| {
+            let [x, y, z, w] = orientation;
+            let expected =
+                UnitQuaternion::from_quaternion(srs_model::nalgebra::Quaternion::new(w, x, y, z));
+            let off_m = (pose.translation.vector - Vector3::from(position)).norm();
+            let off_rad = pose.rotation.angle_to(&expected);
+            off_m < 1e-3 && off_rad < 5e-3
+        };
+        for (side, ready_position, ready_orientation, home_position, home_orientation) in v2 {
+            let model = crate::arm_model(HardwareVersion::V2, side.model()).expect("build the arm");
+            let mut planner = Planner::new(side, model, test_cfg());
+            let r = planner.ee_pose_world(&ready(side.model()));
+            let h = planner.ee_pose_world(&home(side.model()));
+            assert!(
+                at(&r, ready_position, ready_orientation),
+                "v2 {} ready grasp point at {:?}",
+                side.label(),
+                world_pose_arrays(&r)
+            );
+            assert!(
+                at(&h, home_position, home_orientation),
+                "v2 {} home grasp point at {:?}",
+                side.label(),
+                world_pose_arrays(&h)
+            );
+        }
+    }
+
     #[tokio::test]
     async fn a_queued_goal_is_stopped_unstarted_with_the_message() {
         let mut planner = test_planner([0.0; ARM_DOF]);
