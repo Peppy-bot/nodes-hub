@@ -639,9 +639,8 @@ async def test_the_workspace_answers_on_reach_alone_from_bringup():
         assert not points.all_workable
         assert points.message.endswith(NOT_CHECKED)
         near, close, far = points.results
-        assert [near.position, close.position, far.position] == pytest.approx(
-            [list(NEAR), list(CLOSE), list(FAR)]
-        )
+        for result, asked in zip(points.results, (NEAR, CLOSE, FAR), strict=True):
+            assert result.position == pytest.approx(list(asked))
         assert (near.workable, near.reachable, near.arm, near.short_by) == (True, True, "arm", 0.0)
         assert (close.workable, close.reachable, close.arm) == (False, False, "")
         assert 0.0 <= close.short_by <= REACH_TOLERANCE
