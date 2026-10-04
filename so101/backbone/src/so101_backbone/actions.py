@@ -390,14 +390,21 @@ class ActionLayer:
         finally:
             self._coordinator.release_arm()
 
-    async def drive_posture(self, ctx, plan: ArmPlan | None) -> None:
+    async def drive_posture(self, ctx, plan: ArmPlan | None, kinematics) -> None:
+        """Wait until the plan ends, a cancel comes or a stop comes. Then
+        complete the goal with the grasp pose of the arm, from the joints
+        that the follower measures at that time, whatever the value of
+        success. All terminal paths, also a walked-back admission, use the
+        same rule (see _measured_grasp_pose)."""
         if plan is None:
-            await _complete_guarded(ctx.complete, False, "goal admission was walked back")
+            note, pose = self._measured_grasp_pose(kinematics)
+            await _complete_guarded(
+                ctx.complete, False, _join("goal admission was walked back", note), *pose
+            )
             return
 
         def results(_action_time):
-            _, note = self._final_arm_positions(plan)
-            return note, ()
+            return self._measured_grasp_pose(kinematics)
 
         try:
             await self._finish_plan(
@@ -596,6 +603,22 @@ class ActionLayer:
             plan.last_sample(time.monotonic()),
             "follower state stale; reporting the commanded position",
         )
+
+    def _measured_grasp_pose(
+        self, kinematics
+    ) -> tuple[str, tuple[list[str], list[float], list[float]]]:
+        """The pose fields of a posture result and a note: (note, (arm_names,
+        positions, orientations)). The pose is the forward kinematics of the
+        measured joints. A posture result gives only a measured pose. Thus,
+        when the follower state is stale, the three arrays are empty and the
+        note gives the reason."""
+        measured = self._coordinator.measured_joints.fresh(
+            self._coordinator.follower_state_timeout_s
+        )
+        if measured is None:
+            return "follower state stale; no measured pose to report", ([], [], [])
+        position, orientation = kinematics.forward_kinematics(measured)
+        return "", ([ARM_LIMB], list(position), list(orientation))
 
     def _final_opening(self, plan: GripperPlan) -> tuple[float, str]:
         """The opening the gripper stood still at, when that is how the plan

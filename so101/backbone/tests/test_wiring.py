@@ -10,6 +10,7 @@ import pytest
 from peppygen.exposed_actions.limb_motion import move_arm as move_arm_prod
 from peppygen.exposed_actions.limb_motion import move_arm_joints as move_arm_joints_prod
 from peppygen.exposed_actions.limb_motion import move_gripper as move_gripper_prod
+from peppygen.exposed_actions.postures import move_to_home as move_to_home_prod
 from peppygen.exposed_actions.postures import move_to_ready as move_to_ready_prod
 from peppygen.fixtures import harness
 from peppygen.fixtures.exposed_actions.limb_motion import move_arm as move_arm_fx
@@ -19,6 +20,7 @@ from peppygen.fixtures.exposed_actions.limb_motion import (
 from peppygen.fixtures.exposed_actions.limb_motion import (
     move_gripper as move_gripper_fx,
 )
+from peppygen.fixtures.exposed_actions.postures import move_to_home as move_to_home_fx
 from peppygen.fixtures.exposed_actions.postures import move_to_ready as move_to_ready_fx
 from peppygen.exposed_services.limb_motion import check_arm_move as check_arm_move_prod
 from peppygen.exposed_services.limb_motion import stop as stop_prod
@@ -35,6 +37,9 @@ from peppygen.paired_topics.gripper import gripper_states as gripper_states_topi
 from peppygen.paired_topics.leader_arm import joint_setpoints as leader_setpoints_topic
 from peppygen.paired_topics.leader_pose import pose_setpoints as leader_pose_topic
 from peppygen.parameters import Parameters
+from so101_description import postures
+from so101_description.kinematics import Kinematics
+from so101_description.model import KINEMATICS_URDF_PATH
 
 from so101_backbone.__main__ import setup
 
@@ -354,6 +359,39 @@ async def test_posture_and_gripper_actions():
                     break
             assert last is not None
             assert math.isclose(last.opening, 0.5)
+        finally:
+            feeder.cancel()
+
+
+async def test_a_posture_result_names_the_arm_and_its_measured_grasp_point():
+    # One scenario for three facts of the result of each posture move: the
+    # result names the arm, it gives the grasp point of the measured joints,
+    # and it can report success when the arm did not arrive. The mocked
+    # follower always measures MEASURED, so the arm never gets to a posture.
+    kinematics = Kinematics(KINEMATICS_URDF_PATH)
+    measured_position, measured_orientation = kinematics.forward_kinematics(MEASURED)
+    async with harness.start(setup, parameters=make_parameters()) as h:
+        feeder = await feeding_measured(h)
+        try:
+            for production, fixture, posture in (
+                (move_to_ready_prod, move_to_ready_fx, postures.READY_POSITIONS_RAD),
+                (move_to_home_prod, move_to_home_fx, postures.HOME_POSITIONS_RAD),
+            ):
+                goal = await fixture.send_goal(
+                    h,
+                    production.GoalRequestData(duration_s=0.0),
+                    peppylib.QoSProfile.Reliable,
+                    TIMEOUT_S,
+                )
+                assert goal.accepted
+                result = await goal.get_result(TIMEOUT_S)
+                assert result.status == fixture.ResultStatus.COMPLETED
+                assert result.data.success
+                assert result.data.arm_names == ["arm"]
+                assert result.data.positions == pytest.approx(list(measured_position))
+                assert result.data.orientations == pytest.approx(list(measured_orientation))
+                posture_position, _orientation = kinematics.forward_kinematics(posture)
+                assert math.dist(result.data.positions, posture_position) > 0.1
         finally:
             feeder.cancel()
 

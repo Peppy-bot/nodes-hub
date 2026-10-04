@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 from conftest import WIDE_LIMITS, WIDE_REACH, FakeKinematics, gripper_step, make_config
+from so101_description.postures import READY_POSITIONS_RAD
 
 from so101_backbone.actions import (
     MAX_REQUESTED_DURATION_S,
@@ -20,6 +21,12 @@ from so101_backbone.actions import (
     _orientation_note,
 )
 from so101_backbone.coordinator import GRIPPER_STILL_WINDOW_S, Coordinator
+
+# Measured joints that are not equal to a target of these tests. Thus the
+# grasp point of the measurement is different from the grasp point of each
+# target.
+MEASURED = (0.0, 0.1, 0.2, 0.3, 0.4)
+STALE_NO_POSE = "follower state stale; no measured pose to report"
 
 
 class FakeGoalContext:
@@ -67,6 +74,16 @@ def run_gripper_plan_until_still(coordinator, stopped_at):
     gripper_step(coordinator, stopped_at, 0.0)
     gripper_step(coordinator, stopped_at, 0.5)
     gripper_step(coordinator, stopped_at, 0.5 + GRIPPER_STILL_WINDOW_S)
+
+
+def run_arm_plan_to_its_end(coordinator, plan):
+    """Run the control ticks that end an admitted arm plan, at explicit
+    instants. The first sample is sent at 0 and the last sample at the end
+    of the profile, and the follower receives the two. The measured joints
+    do not change."""
+    coordinator.arm_published(True, coordinator.arm_tick(0.0))
+    coordinator.arm_published(True, coordinator.arm_tick(plan.profile.duration_s))
+    assert plan.done.is_set()
 
 
 async def test_gripper_goal_times_out_instead_of_holding_the_slot():
@@ -249,6 +266,92 @@ async def test_none_plan_completes_as_failure_and_leaves_the_server_alive():
     assert success is False
     assert "walked back" in message
     assert len(positions) == 5
+
+
+async def test_a_posture_result_reports_the_grasp_point_of_the_measured_joints(
+    follower_never_stale,
+):
+    kinematics = FakeKinematics()
+    coordinator, layer = make_layer(kinematics)
+    coordinator.measured_joints.set(MEASURED)
+    plan = layer._admit_posture(READY_POSITIONS_RAD, 0.0)
+    # The plan ends. The follower measures the arm at its start position.
+    run_arm_plan_to_its_end(coordinator, plan)
+    ctx = FakeGoalContext()
+    await layer.drive_posture(ctx, plan, kinematics)
+    position, orientation = kinematics.forward_kinematics(MEASURED)
+    assert position != kinematics.forward_kinematics(READY_POSITIONS_RAD)[0]
+    assert ctx.completed == (True, "", ["arm"], list(position), list(orientation))
+    assert coordinator.try_claim_arm()
+
+
+async def test_a_posture_with_stale_follower_state_reports_empty_arrays(follower_never_stale):
+    kinematics = FakeKinematics()
+    coordinator, layer = make_layer(kinematics)
+    coordinator.measured_joints.set(MEASURED)
+    plan = layer._admit_posture(READY_POSITIONS_RAD, 0.0)
+    run_arm_plan_to_its_end(coordinator, plan)
+    # The follower sends no more state after it receives the last sample.
+    # No measurement is fresh, thus the result gives no pose and gives the
+    # reason.
+    coordinator.measured_joints.clear()
+    ctx = FakeGoalContext()
+    await layer.drive_posture(ctx, plan, kinematics)
+    assert ctx.completed == (True, STALE_NO_POSE, [], [], [])
+
+    walked_back = FakeGoalContext()
+    await layer.drive_posture(walked_back, None, kinematics)
+    assert walked_back.completed == (
+        False, f"goal admission was walked back; {STALE_NO_POSE}", [], [], [],
+    )
+
+
+async def test_a_walked_back_posture_reports_where_the_arm_stands(follower_never_stale):
+    # The goal fails, and its result still gives the measured pose.
+    kinematics = FakeKinematics()
+    coordinator, layer = make_layer(kinematics)
+    coordinator.measured_joints.set(MEASURED)
+    ctx = FakeGoalContext()
+    await layer.drive_posture(ctx, None, kinematics)
+    position, orientation = kinematics.forward_kinematics(MEASURED)
+    assert ctx.completed == (
+        False, "goal admission was walked back", ["arm"], list(position), list(orientation),
+    )
+
+
+def stop_every_move(layer, _ctx):
+    assert layer.stop_moves("the operator asked") == ["arm"]
+
+
+def cancel_the_goal(_layer, ctx):
+    ctx.request_cancel()
+
+
+@pytest.mark.parametrize(
+    ("cut_the_move", "message"),
+    [(stop_every_move, "stopped: the operator asked"), (cancel_the_goal, "cancelled")],
+    ids=["stop", "cancel"],
+)
+async def test_a_stopped_posture_reports_the_measured_grasp_point(
+    cut_the_move, message, follower_never_stale
+):
+    kinematics = FakeKinematics()
+    coordinator, layer = make_layer(kinematics)
+    coordinator.measured_joints.set(MEASURED)
+    plan = layer._admit_posture(READY_POSITIONS_RAD, 0.0)
+    coordinator.arm_published(True, coordinator.arm_tick(0.0))
+    # The move stops while the arm moves to the posture. The follower
+    # measures the arm at that position.
+    stopped_at = (0.0, 0.05, 0.1, 0.15, 0.2)
+    coordinator.measured_joints.set(stopped_at)
+    ctx = FakeGoalContext()
+    cut_the_move(layer, ctx)
+    await layer.drive_posture(ctx, plan, kinematics)
+    position, orientation = kinematics.forward_kinematics(stopped_at)
+    assert ctx.completed is None
+    assert ctx.cancelled == (False, message, ["arm"], list(position), list(orientation))
+    assert plan.aborted
+    assert coordinator.try_claim_arm()
 
 
 def test_admission_rejects_before_claiming():
