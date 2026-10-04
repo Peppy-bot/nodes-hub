@@ -44,9 +44,21 @@ def posture_settings():
     return config.from_parameters(default_parameters())
 
 
+def posture_result(module, success, message):
+    """A posture result as a robot sends it. The commander reads only the
+    status and the message, thus the arm pose in it is a fixed value."""
+    return module.ResultResponseData(
+        success=success,
+        message=message,
+        arm_names=["right_arm"],
+        positions=[0.3, -0.2, 0.3],
+        orientations=[0.0, 0.0, 0.0, 1.0],
+    )
+
+
 def done(module):
     """The action's success verdict, as each completed-goal assertion uses."""
-    return module.ResultResponseData(success=True, message="done")
+    return posture_result(module, success=True, message="done")
 
 
 def frame_message(width=1, height=1, encoding="bgr8", data=None):
@@ -189,7 +201,7 @@ async def test_squeezing_cancels_the_move_in_flight():
             session.press(right=(False, False, True))
             await asyncio.wait_for(active.cancel_signal(), 10.0)
             await active.complete_cancelled(
-                move_to_home.ResultResponseData(success=False, message="cancelled")
+                posture_result(move_to_home, success=False, message="cancelled")
             )
             # The squeeze that cancelled must not have fired a fresh goal.
             with pytest.raises(TimeoutError):
