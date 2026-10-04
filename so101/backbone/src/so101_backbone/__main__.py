@@ -1,7 +1,7 @@
 """Wiring: parse parameters, build the kinematics, limits, and coordinator,
 and run the control tick, the upstream consumers, the state relays, the limb
-name service, the stop and plan check services, and one server per exposed
-action."""
+name service, the stop and plan check services, one server per exposed
+action, and the workspace services."""
 
 from __future__ import annotations
 
@@ -41,6 +41,7 @@ from so101_description.model import KINEMATICS_URDF_PATH
 from so101_description.setpoints import parse_gripper_setpoint, parse_joint_setpoints
 
 from so101_backbone import params as params_mod
+from so101_backbone import workspace_service
 from so101_backbone.actions import ActionLayer, PendingSlot, serve
 from so101_backbone.coordinator import (
     STALE_WIRE_TIMEOUT_S,
@@ -49,6 +50,7 @@ from so101_backbone.coordinator import (
 from so101_backbone.params import UpstreamMode
 from so101_backbone.reach import fit_reach_ball
 from so101_backbone.setpoints import parse_pose_setpoint
+from so101_backbone.workspace import ReachWorker
 
 runtime.configure("so101_backbone")
 
@@ -466,6 +468,14 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
                 config.upstream_mode is UpstreamMode.POSE,
                 coordinator.follower_state_timeout_s, token,
             )
+        )
+    )
+    # The workspace answers measure reach in a worker process of their own,
+    # with its own solver on the same model bytes, so the control loop above
+    # keeps its rate while a surface is measured.
+    tasks.append(
+        asyncio.create_task(
+            workspace_service.serve(node_runner, ReachWorker(KINEMATICS_URDF_PATH))
         )
     )
     return tasks

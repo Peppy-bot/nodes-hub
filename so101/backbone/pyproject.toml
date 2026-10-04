@@ -12,6 +12,7 @@ dependencies = [
     "peppylib",
     "control_core_py",
     "so101_description[kinematics]",
+    "workspace_core_py",
 ]
 
 [project.scripts]
@@ -31,7 +32,10 @@ asyncio_mode = "auto"
 [tool.uv.sources]
 peppygen = { path = ".peppy/libs/peppygen" }
 peppylib = { path = ".peppy/libs/peppylib" }
-# The shared libs live in the public-peppy-libs repository, followed on its
-# default branch like the Rust nodes' control_core.
-control_core_py = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "control_core_py" }
-so101_description = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "so101_description" }
+# The shared libs live in the public-peppy-libs repository, all three at one
+# commit of it, so the backbone builds against one state of that repository.
+# workspace_core_py is a PyO3 extension that uv builds from its source, so the
+# build needs cargo (see apptainer.def).
+control_core_py = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "control_core_py", rev = "997a29ffad6baf99e02966659ca91345fd1b07c0" }
+so101_description = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "so101_description", rev = "997a29ffad6baf99e02966659ca91345fd1b07c0" }
+workspace_core_py = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "workspace_core_py", rev = "997a29ffad6baf99e02966659ca91345fd1b07c0" }
