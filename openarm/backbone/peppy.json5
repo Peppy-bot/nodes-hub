@@ -38,6 +38,11 @@
       // carry: the design values, exact in a simulation and nominal on
       // hardware.
       { name: "camera_mounts", tag: "v1", link_id: "camera_mounts" },
+      // Where the robot can work, from its design alone: where its arms
+      // reach and where its perception camera (the one camera that gives
+      // depth and that no arm carries: v2's chest) sees, in the robot frame,
+      // on a flat, level surface at a given height or at given points.
+      { name: "workspace", tag: "v1", link_id: "workspace" },
     ],
     depends_on: {
       contracts: [
@@ -45,7 +50,13 @@
         // Runtime governor controls: an optional backbone feature, since not
         // every leader can produce them. A vacant slot leaves the launch-time
         // band standing.
-        { name: "openarm_governor_control", tag: "v1", link_id: "collision_ctrl", cardinality: "zero_or_one" }
+        { name: "openarm_governor_control", tag: "v1", link_id: "collision_ctrl", cardinality: "zero_or_one" },
+        // The perception camera's own geometry, read at each workspace
+        // request: its colour intrinsics give the field of view and its
+        // depth intrinsics the depths it measures. Optional: a vacant slot
+        // leaves the workspace answers without a view check, and they say
+        // so.
+        { name: "camera_geometry", tag: "v1", link_id: "perception_geometry", cardinality: "zero_or_one" }
       ],
       pairings: [
         // The exclusive command loop with the one leading node (panel or
@@ -182,10 +193,20 @@
         { link_id: "limb_motion", name: "check_arm_move" },
         // Where the cameras stand now, answered from bringup: refused until
         // the coordinator has measured the arms.
-        { link_id: "camera_mounts", name: "get_camera_poses" }
+        { link_id: "camera_mounts", name: "get_camera_poses" },
+        // Where the robot can work on a surface and whether it can work
+        // given points, answered from bringup: they read the design and the
+        // perception camera's geometry, never the arms, so they move nothing
+        // and do not wait for the robot to be ready.
+        { link_id: "workspace", name: "describe_workspace" },
+        { link_id: "workspace", name: "check_positions" }
       ],
       consumes: [
-        { link_id: "robot_init", name: "is_ready" }
+        { link_id: "robot_init", name: "is_ready" },
+        // The perception camera's field of view, depth model and depth
+        // range, asked at each workspace request when a camera is linked.
+        { link_id: "perception_geometry", name: "get_color_intrinsics" },
+        { link_id: "perception_geometry", name: "get_depth_intrinsics" }
       ]
     }
   },

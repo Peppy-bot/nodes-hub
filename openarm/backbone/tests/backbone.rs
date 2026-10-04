@@ -6,12 +6,14 @@
 //!
 //! - `startup::wait_until_ready` gates the subscriptions, publishers, actions
 //!   and the coordinator on `robot_init/is_ready` answering `ready: true`, so
-//!   every test pumps that mock service. The `get_limb_names` service stands
-//!   outside that gate and answers from bringup.
+//!   every test pumps that mock service. The `get_limb_names`,
+//!   `get_camera_poses` and workspace services stand outside that gate and
+//!   answer from bringup.
 //! - `coordinator::seed_all` then gates streaming on a first measured state
 //!   from BOTH arms and BOTH grippers, and `liveness` freezes a limb that goes
 //!   silent for four periods of `follower_state_rate_hz`. The harness pins every pairing slot to a
-//!   mock (only the `collision_ctrl` dependency slot has a `_vacant` knob), so
+//!   mock (only the `collision_ctrl` and `perception_geometry` dependency
+//!   slots have a `_vacant` knob), so
 //!   each test pumps all four follower back-channels at a rate inside the
 //!   stale limit. The unselected slots (pose pairs, upstream gripper pairs,
 //!   and any leader pair a test does not drive) stay silent, which is exactly
@@ -22,6 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 use peppygen::fixtures::harness::{Config, Harness};
+use peppygen::mock::deps::perception_geometry::{get_color_intrinsics, get_depth_intrinsics};
 use tokio::sync::watch;
 
 /// How long a mock pump waits parked for the node's next poll or for the
@@ -76,6 +79,15 @@ fn params() -> peppygen::Parameters {
         max_joint_velocity_rad_s_7: 20.943946,
         upstream_mode: "joints".to_string(),
         velocity_filter_cutoff_hz: 15.0,
+    }
+}
+
+/// The node's parameter set on v2 hardware, whose design carries the
+/// cameras.
+fn v2_params() -> peppygen::Parameters {
+    peppygen::Parameters {
+        hardware_version: "v2".to_string(),
+        ..params()
     }
 }
 
@@ -279,9 +291,10 @@ fn spawn_lagging_left_gripper_follower(
     rx
 }
 
-/// The full boot with the robot reporting ready and the `collision_ctrl`
-/// dependency slot vacant (its `zero_or_one` empty binding): the launch-time
-/// band stands, exactly the branch the cardinality exists for.
+/// The full boot with the robot reporting ready and both dependency slots
+/// vacant (their `zero_or_one` empty binding): the launch-time band stands,
+/// exactly the branch the cardinality exists for, and the workspace answers
+/// leave the view unchecked.
 async fn start_ready_vacant(
     parameters: peppygen::Parameters,
 ) -> peppygen::Result<(Harness, peppygen::fixtures::harness::Mocks)> {
@@ -289,6 +302,7 @@ async fn start_ready_vacant(
         Config {
             parameters: Some(parameters),
             collision_ctrl_vacant: true,
+            perception_geometry_vacant: true,
             ..Default::default()
         },
         openarm_backbone::setup,
@@ -297,6 +311,10 @@ async fn start_ready_vacant(
     assert!(
         mocks.deps.collision_ctrl.is_none(),
         "a vacant collision_ctrl slot must start no mock"
+    );
+    assert!(
+        mocks.deps.perception_geometry.is_none(),
+        "a vacant perception_geometry slot must start no mock"
     );
     Ok((harness, mocks))
 }
@@ -383,6 +401,7 @@ async fn move_arm_joints_streams_a_trajectory_the_arm_follows_to_the_target() ->
         Config {
             parameters: Some(params()),
             collision_ctrl_vacant: false,
+            perception_geometry_vacant: true,
             ..Default::default()
         },
         openarm_backbone::setup,
@@ -1093,11 +1112,7 @@ async fn camera_poses_are_answered_once_the_arms_are_measured() -> peppygen::Res
 async fn a_v2_robot_lists_its_three_cameras_in_the_robot_frame() -> peppygen::Result<()> {
     use peppygen::fixtures::exposed_services::camera_mounts::get_camera_poses;
 
-    let (mut harness, mocks) = start_ready_vacant(peppygen::Parameters {
-        hardware_version: "v2".to_string(),
-        ..params()
-    })
-    .await?;
+    let (mut harness, mocks) = start_ready_vacant(v2_params()).await?;
     pump_is_ready(
         mocks.deps.robot_init.is_ready,
         Arc::new(AtomicBool::new(true)),
@@ -1134,6 +1149,320 @@ async fn a_v2_robot_lists_its_three_cameras_in_the_robot_frame() -> peppygen::Re
     assert!(
         view_x > 0.4 && view_z < -0.8,
         "the chest camera looks forward and down: ({view_x}, {view_z})"
+    );
+    harness.shutdown().await
+}
+
+/// Answers every poll of a request-less mock service with `$answer`, until
+/// the mock's session closes.
+macro_rules! pump_answers {
+    ($service:expr, $answer:expr) => {{
+        let service = $service;
+        let answer = $answer;
+        tokio::spawn(async move {
+            while let Ok(responder) = service.next_request(PUMP_TIMEOUT).await {
+                if responder.respond(answer.clone()).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }};
+}
+
+/// Plays the mock bound to `perception_geometry` as the chest camera's
+/// camera_geometry, answering `$colour` and `$depth`, and holds the robot not
+/// ready. The other mocks stay with the test.
+macro_rules! answer_as_the_chest_camera {
+    ($mocks:ident, $colour:expr, $depth:expr) => {
+        let geometry = $mocks
+            .deps
+            .perception_geometry
+            .expect("a bound perception_geometry slot starts its mock");
+        pump_answers!(geometry.get_color_intrinsics, $colour);
+        pump_answers!(geometry.get_depth_intrinsics, $depth);
+        pump_is_ready(
+            $mocks.deps.robot_init.is_ready,
+            Arc::new(AtomicBool::new(false)),
+        );
+    };
+}
+
+/// The v2 boot with the `perception_geometry` slot bound to its mock, which
+/// a test plays as the chest camera's camera_geometry, and `collision_ctrl`
+/// vacant.
+async fn start_v2_with_camera_geometry()
+-> peppygen::Result<(Harness, peppygen::fixtures::harness::Mocks)> {
+    Harness::start_with(
+        Config {
+            parameters: Some(v2_params()),
+            collision_ctrl_vacant: true,
+            perception_geometry_vacant: false,
+            ..Default::default()
+        },
+        openarm_backbone::setup,
+    )
+    .await
+}
+
+/// The chest camera's colour intrinsics as the simulated camera gives them:
+/// 1280 by 720 pixels over a 52 degree vertical field of view, the optical
+/// axis through the middle of the image.
+fn chest_colour_intrinsics() -> get_color_intrinsics::ResponseData {
+    let focal = 360.0 / 26f64.to_radians().tan();
+    get_color_intrinsics::ResponseData {
+        success: true,
+        message: String::new(),
+        width: 1280,
+        height: 720,
+        fx: focal,
+        fy: focal,
+        cx: 639.5,
+        cy: 359.5,
+        distortion_model: "none".to_string(),
+        distortion: Vec::new(),
+    }
+}
+
+/// The chest camera's depth intrinsics, aligned to the colour stream and
+/// measuring depths from 0.1 to 10 m.
+fn chest_depth_intrinsics() -> get_depth_intrinsics::ResponseData {
+    let colour = chest_colour_intrinsics();
+    get_depth_intrinsics::ResponseData {
+        success: true,
+        message: String::new(),
+        width: colour.width,
+        height: colour.height,
+        fx: colour.fx,
+        fy: colour.fy,
+        cx: colour.cx,
+        cy: colour.cy,
+        distortion_model: colour.distortion_model,
+        distortion: colour.distortion,
+        depth_model: "z".to_string(),
+        min_depth_m: 0.1,
+        max_depth_m: 10.0,
+        align_mode: "depth_to_color".to_string(),
+    }
+}
+
+/// What a camera that gives colour alone answers when asked for its depth
+/// intrinsics.
+fn no_depth_intrinsics() -> get_depth_intrinsics::ResponseData {
+    get_depth_intrinsics::ResponseData {
+        success: false,
+        message: "this camera has no depth stream".to_string(),
+        width: 0,
+        height: 0,
+        fx: 0.0,
+        fy: 0.0,
+        cx: 0.0,
+        cy: 0.0,
+        distortion_model: String::new(),
+        distortion: Vec::new(),
+        depth_model: String::new(),
+        min_depth_m: 0.0,
+        max_depth_m: 0.0,
+        align_mode: String::new(),
+    }
+}
+
+/// With no camera geometry linked, describe_workspace answers from the
+/// design before the robot is ready: v2 still names the chest camera as its
+/// perception camera, reach alone decides, no part is said to be seen, and
+/// the message says why. A height that is not a number is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn without_camera_geometry_the_workspace_is_described_without_a_view_check()
+-> peppygen::Result<()> {
+    use peppygen::fixtures::exposed_services::workspace::describe_workspace;
+
+    let (harness, mocks) = start_ready_vacant(v2_params()).await?;
+    pump_is_ready(
+        mocks.deps.robot_init.is_ready,
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    let table = describe_workspace::RequestData {
+        surface_height: 0.45,
+    };
+    let answer = describe_workspace::poll(&harness, &table, DEADLINE).await?;
+    assert!(answer.success, "{}", answer.message);
+    assert_eq!(answer.perception_camera, "chest");
+    assert!(answer.workable && answer.area > 0.0, "{}", answer.message);
+    assert!(answer.rectangle.is_some() && answer.reach.is_some());
+    assert_eq!(answer.view, None);
+    assert!(
+        answer.message.ends_with(
+            "The view is not checked: no camera geometry is linked for the chest camera."
+        ),
+        "{}",
+        answer.message
+    );
+
+    let not_a_number = describe_workspace::RequestData {
+        surface_height: f64::NAN,
+    };
+    let refused = describe_workspace::poll(&harness, &not_a_number, DEADLINE).await?;
+    assert!(!refused.success);
+    assert_eq!(refused.message, "surface_height must be a finite number");
+    harness.shutdown().await
+}
+
+/// With the chest camera's geometry linked, check_positions judges each
+/// point by reach and by what the camera sees through its own intrinsics: a
+/// point 0.30 m ahead at table height is workable, one a metre ahead is out
+/// of reach by how far the closest arm stops. A list that does not split
+/// into points is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn with_camera_geometry_linked_check_positions_reports_what_the_chest_camera_sees()
+-> peppygen::Result<()> {
+    use peppygen::fixtures::exposed_services::workspace::check_positions;
+
+    let (harness, mocks) = start_v2_with_camera_geometry().await?;
+    answer_as_the_chest_camera!(mocks, chest_colour_intrinsics(), chest_depth_intrinsics());
+
+    let points = check_positions::RequestData {
+        positions: vec![0.30, 0.0, 0.45, 1.0, 0.0, 0.45],
+    };
+    let answer = check_positions::poll(&harness, &points, DEADLINE).await?;
+    assert!(answer.success, "{}", answer.message);
+    assert_eq!(answer.perception_camera, "chest");
+    let [near, far] = answer.results.as_slice() else {
+        panic!("one result per point: {:?}", answer.results);
+    };
+    assert_eq!(near.position, [0.30, 0.0, 0.45]);
+    assert!(
+        near.workable && near.reachable && near.in_view,
+        "{}",
+        near.message
+    );
+    assert_eq!((near.view.as_str(), near.short_by), ("seen", 0.0));
+    assert_eq!(
+        near.message,
+        format!(
+            "Workable: {} reaches it and the chest camera sees it.",
+            near.arm
+        )
+    );
+    assert_eq!(far.position, [1.0, 0.0, 0.45]);
+    assert!(!far.workable && !far.reachable, "{}", far.message);
+    assert!(
+        far.arm.is_empty() && far.short_by > 0.01,
+        "{}",
+        far.short_by
+    );
+    assert!(!answer.all_workable);
+    assert_eq!(answer.message, "1 of the 2 points is workable.");
+
+    let ragged = check_positions::RequestData {
+        positions: vec![0.30, 0.0],
+    };
+    let refused = check_positions::poll(&harness, &ragged, DEADLINE).await?;
+    assert!(!refused.success && refused.results.is_empty());
+    assert_eq!(
+        refused.message,
+        "positions must hold 3 values (x, y, z) per point"
+    );
+    harness.shutdown().await
+}
+
+/// A linked camera that gives no depth cannot be the chest camera, the
+/// perception camera: the answer is refused, naming it and saying why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_linked_camera_without_depth_is_refused_naming_the_chest_camera() -> peppygen::Result<()>
+{
+    use peppygen::fixtures::exposed_services::workspace::check_positions;
+
+    let (harness, mocks) = start_v2_with_camera_geometry().await?;
+    answer_as_the_chest_camera!(mocks, chest_colour_intrinsics(), no_depth_intrinsics());
+
+    let point = check_positions::RequestData {
+        positions: vec![0.30, 0.0, 0.45],
+    };
+    let answer = check_positions::poll(&harness, &point, DEADLINE).await?;
+    assert!(!answer.success);
+    assert_eq!(
+        answer.message,
+        "the camera linked as the chest camera, the perception camera, gives no depth: \
+         this camera has no depth stream"
+    );
+    assert!(answer.results.is_empty() && answer.perception_camera.is_empty());
+    harness.shutdown().await
+}
+
+/// A linked camera whose depth stream gives a depth model camera_geometry:v1
+/// does not name leaves the chest camera's depth range without a meaning:
+/// the answer is refused, naming the model.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_linked_camera_of_an_unknown_depth_model_is_refused_naming_the_model()
+-> peppygen::Result<()> {
+    use peppygen::fixtures::exposed_services::workspace::check_positions;
+
+    let (harness, mocks) = start_v2_with_camera_geometry().await?;
+    answer_as_the_chest_camera!(
+        mocks,
+        chest_colour_intrinsics(),
+        get_depth_intrinsics::ResponseData {
+            depth_model: "disparity".to_string(),
+            ..chest_depth_intrinsics()
+        }
+    );
+
+    let point = check_positions::RequestData {
+        positions: vec![0.30, 0.0, 0.45],
+    };
+    let answer = check_positions::poll(&harness, &point, DEADLINE).await?;
+    assert!(!answer.success);
+    assert_eq!(
+        answer.message,
+        "cannot read the depth intrinsics of the chest camera, the perception camera: \
+         unknown depth model 'disparity': camera_geometry:v1 names \"z\" and \"range\""
+    );
+    assert!(answer.results.is_empty() && answer.perception_camera.is_empty());
+    harness.shutdown().await
+}
+
+/// What a simulated camera answers for its colour intrinsics before it
+/// hears from the simulation.
+fn unready_colour_intrinsics() -> get_color_intrinsics::ResponseData {
+    get_color_intrinsics::ResponseData {
+        success: false,
+        message: "no camera geometry has been received from the simulation".to_string(),
+        width: 0,
+        height: 0,
+        fx: 0.0,
+        fy: 0.0,
+        cx: 0.0,
+        cy: 0.0,
+        distortion_model: String::new(),
+        distortion: Vec::new(),
+    }
+}
+
+/// A linked camera that cannot give its colour intrinsics now leaves the
+/// chest camera's view unknown: the answer is refused with the camera's
+/// reason, and says nothing of what the robot reaches.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_linked_camera_without_its_colour_intrinsics_is_refused_with_its_reason()
+-> peppygen::Result<()> {
+    use peppygen::fixtures::exposed_services::workspace::describe_workspace;
+
+    let (harness, mocks) = start_v2_with_camera_geometry().await?;
+    answer_as_the_chest_camera!(mocks, unready_colour_intrinsics(), no_depth_intrinsics());
+
+    let table = describe_workspace::RequestData {
+        surface_height: 0.45,
+    };
+    let answer = describe_workspace::poll(&harness, &table, DEADLINE).await?;
+    assert!(!answer.success);
+    assert_eq!(
+        answer.message,
+        "cannot read the colour intrinsics of the chest camera, the perception camera: \
+         no camera geometry has been received from the simulation"
+    );
+    assert!(!answer.workable && answer.area == 0.0);
+    assert_eq!(
+        (answer.rectangle, answer.reach, answer.view),
+        (None, None, None)
     );
     harness.shutdown().await
 }

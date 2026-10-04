@@ -8,7 +8,9 @@
 //! A request then composes the carried ones with the grasp poses the
 //! coordinator measured last, the ones limb_states publishes, and answers
 //! under that measurement's stamp. Served from bringup: until the coordinator
-//! has measured the arms the answer says so.
+//! has measured the arms the answer says so. The workspace tools read the
+//! same placements, with the depths each camera measures, through
+//! [`CameraMounts::design_cameras`].
 
 use std::f64::consts::PI;
 use std::sync::Arc;
@@ -21,9 +23,10 @@ use peppylib::runtime::CancellationToken;
 use srs_model::chain_kinematics::Tree;
 use srs_model::nalgebra::{Isometry3, UnitQuaternion, Vector3};
 use tokio::sync::watch;
-use tracing::{error, info};
+use tracing::info;
 
 use crate::arm_pair::ArmPair;
+use crate::serving;
 use crate::types::{Side, pose_from_wire, world_pose_arrays};
 
 /// What the service answers while the coordinator has measured nothing yet.
@@ -46,12 +49,27 @@ enum Carrier {
     Arm(Side),
 }
 
-/// One camera, resolved: its optical frame in its carrier's frame.
+/// One camera, resolved: its optical frame in its carrier's frame, and the
+/// depths it measures.
 #[derive(Clone, Debug)]
 struct ResolvedMount {
     name: &'static str,
     carrier: Carrier,
     pose: Isometry3<f64>,
+    depth_range: Option<[f64; 2]>,
+}
+
+/// One camera as the design fixes it, whatever the arms do: what the
+/// workspace tools read to find the perception camera and place its view.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DesignCamera {
+    pub name: &'static str,
+    /// The depths the camera measures, nearest and farthest, metres; none
+    /// for a camera that gives colour alone.
+    pub depth_range: Option<[f64; 2]>,
+    /// The camera's optical frame in the robot frame when the base carries
+    /// it; none when an arm carries it, so that it moves with that arm.
+    pub fixed_pose: Option<Isometry3<f64>>,
 }
 
 /// The pose of one camera at one measurement, as the service reports it.
@@ -131,6 +149,21 @@ impl CameraMounts {
             })
             .collect()
     }
+
+    /// Every camera as the design fixes it, in the description's order.
+    pub fn design_cameras(&self) -> Vec<DesignCamera> {
+        self.mounts
+            .iter()
+            .map(|mount| DesignCamera {
+                name: mount.name,
+                depth_range: mount.depth_range,
+                fixed_pose: match mount.carrier {
+                    Carrier::Base => Some(mount.pose),
+                    Carrier::Arm(_) => None,
+                },
+            })
+            .collect()
+    }
 }
 
 /// The description's pose of `mount` in the link that carries it.
@@ -163,6 +196,7 @@ fn resolve_mount(
                 name: mount.name,
                 carrier: Carrier::Arm(side),
                 pose: tool.inverse() * in_link,
+                depth_range: mount.depth_range,
             });
         }
     }
@@ -180,6 +214,7 @@ fn resolve_mount(
         name: mount.name,
         carrier: Carrier::Base,
         pose: link_in_root * in_link,
+        depth_range: mount.depth_range,
     })
 }
 
@@ -238,15 +273,12 @@ pub async fn serve(
     measured: watch::Receiver<Option<MeasuredGrasps>>,
 ) {
     info!("camera mounts: {} cameras", mounts.mounts.len());
-    while !token.is_cancelled() {
-        if let Err(e) = get_camera_poses::handle_next_request(&runner, |_request| {
+    serving::serve("get_camera_poses", &token, || {
+        get_camera_poses::handle_next_request(&runner, |_request| {
             Ok(answer(&mounts, measured.borrow().as_ref()))
         })
-        .await
-        {
-            error!("get_camera_poses: {e}");
-        }
-    }
+    })
+    .await;
 }
 
 #[cfg(test)]
@@ -307,6 +339,34 @@ mod tests {
         assert!((optical * Vector3::y() + image_up).norm() < 1e-9);
         // It faces the robot's front and looks down.
         assert!(view.x > 0.4 && view.z < -0.8, "{view}");
+    }
+
+    #[test]
+    fn the_design_fixes_the_chest_camera_where_it_is_reported_and_no_wrist_camera() {
+        let mounts = v2_mounts();
+        let cameras = mounts.design_cameras();
+        assert_eq!(
+            cameras.iter().map(|c| c.name).collect::<Vec<_>>(),
+            ["wrist_left", "wrist_right", "chest"]
+        );
+        let reported = mounts.poses(&ArmPair::new(Isometry3::identity(), Isometry3::identity()));
+        let chest = &cameras[2];
+        assert_eq!(chest.fixed_pose, Some(by_name(&reported, "chest").pose));
+        assert_eq!(chest.depth_range, Some([0.1, 10.0]));
+        for wrist in &cameras[..2] {
+            assert_eq!(
+                (wrist.fixed_pose, wrist.depth_range),
+                (None, None),
+                "{}",
+                wrist.name
+            );
+        }
+        assert!(
+            CameraMounts::resolve(HardwareVersion::V1)
+                .expect("resolves")
+                .design_cameras()
+                .is_empty()
+        );
     }
 
     #[test]

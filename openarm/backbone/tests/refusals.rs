@@ -40,6 +40,7 @@ async fn refusal_error(spoil: impl FnOnce(&mut peppygen::Parameters)) -> peppyge
         Config {
             parameters: Some(parameters),
             collision_ctrl_vacant: true,
+            perception_geometry_vacant: true,
             ..Default::default()
         },
         openarm_backbone::setup,

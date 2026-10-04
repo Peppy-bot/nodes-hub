@@ -15,6 +15,7 @@ srs_model = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = 
 bimanual_collision_model = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "bimanual_collision_model" }
 openarm_description = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "openarm_description", features = ["meshes"] }
 control_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "control_core" }
+workspace_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "workspace_core" }
 # The camera mounts are placed against the bundled URDF's fixed joints. The
 # version public-peppy-libs uses: the mounts hand the parsed robot to
 # `srs_model::chain_kinematics::Tree::from_robot`, which takes that version's
@@ -40,3 +41,6 @@ opt-level = 3
 
 [dev-dependencies]
 peppygen = { path = ".peppy/libs/peppygen", features = ["testing"] }
+# A paused clock, so a test waits out the service loop's pause without the
+# host's time.
+tokio = { version = "1", features = ["full", "test-util"] }
