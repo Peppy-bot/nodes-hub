@@ -27,6 +27,7 @@ mod motion;
 mod node;
 mod planner;
 mod publish;
+mod serving;
 mod servo;
 mod startup;
 mod streams;
@@ -34,6 +35,8 @@ mod torso;
 mod trajectory;
 mod types;
 mod upstream;
+mod workspace;
+mod workspace_service;
 
 // Sibling modules' unit tests reach the shared model builder as `crate::arm_model`.
 #[cfg(test)]

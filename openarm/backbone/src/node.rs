@@ -1,8 +1,9 @@
 // Node composition: validates every parameter up front, builds the arm models
-// and the self-collision governor, wires the channels, and spawns the
-// limb-name responder plus the readiness-gated coordination loop, every action
-// handler and every stream listener. All motion and stream logic lives in the
-// sibling modules; this is only the assembly.
+// and the self-collision governor, wires the channels, and spawns the services
+// answered from bringup (limb names, camera mounts, workspace) plus the
+// readiness-gated coordination loop, every action handler and every stream
+// listener. All motion and stream logic lives in the sibling modules; this is
+// only the assembly.
 
 use crate::arm_pair::ArmPair;
 use crate::types::{JointVec, Side, limb_names};
@@ -26,10 +27,13 @@ use crate::coordinator::{self, ArmChannels};
 use crate::governor;
 use crate::liveness;
 use crate::planner::{PlanConfig, Planner};
+use crate::serving;
 use crate::servo::EeCaps;
 use crate::startup;
 use crate::streams;
 use crate::upstream::UpstreamMode;
+use crate::workspace::Workspace;
+use crate::workspace_service;
 
 /// The fastest the coordination loop is driven. It paces the same 1 Mbit
 /// CAN FD arms as openarm_arm; the stack runs at 100 Hz.
@@ -109,6 +113,9 @@ pub enum NodeError {
 
     #[error("place the cameras the description carries")]
     CameraMounts(#[from] camera_mounts::CameraMountError),
+
+    #[error("find the perception camera among the cameras the description carries")]
+    PerceptionCamera(#[from] workspace_core::PerceptionCameraError),
 
     #[error("joint position limits must be finite and well-ordered (lo <= hi)")]
     JointLimits,
@@ -256,20 +263,14 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     // base links directly.
     let left_base = hardware_version.base_link(openarm_description::Side::Left);
     let right_base = hardware_version.base_link(openarm_description::Side::Right);
-    let left_model =
-        arm_model(hardware_version, openarm_description::Side::Left).map_err(|source| {
-            NodeError::ArmModel {
-                side: "left",
-                source,
-            }
-        })?;
-    let right_model =
-        arm_model(hardware_version, openarm_description::Side::Right).map_err(|source| {
-            NodeError::ArmModel {
-                side: "right",
-                source,
-            }
-        })?;
+    let build_arm = |side: Side| {
+        arm_model(hardware_version, side.model()).map_err(|source| NodeError::ArmModel {
+            side: side.label(),
+            source,
+        })
+    };
+    let left_model = build_arm(Side::Left)?;
+    let right_model = build_arm(Side::Right)?;
     info!("arm models loaded");
 
     // The collision model needs the URDF string (joint limits are irrelevant to it,
@@ -319,6 +320,14 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     // The cameras the generation carries, each placed in the frame that
     // carries it: a mount this backbone cannot place stops bringup here.
     let mounts = Arc::new(CameraMounts::resolve(hardware_version)?);
+
+    // Where the robot can work, judged from its design on a pair of arm
+    // models of its own (the planners own theirs) and its perception
+    // camera: a design with more than one candidate stops bringup here.
+    let workspace = Arc::new(Workspace::new(
+        ArmPair::new(build_arm(Side::Left)?, build_arm(Side::Right)?),
+        &mounts,
+    )?);
 
     let left_limits = left_model.limits();
     let right_limits = right_model.limits();
@@ -416,8 +425,8 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         let runner = node_runner.clone();
         let token = node_runner.cancellation_token().clone();
         tokio::spawn(async move {
-            while !token.is_cancelled() {
-                if let Err(e) = get_limb_names::handle_next_request(&runner, |_req| {
+            serving::serve("get_limb_names", &token, || {
+                get_limb_names::handle_next_request(&runner, |_request| {
                     let names = limb_names();
                     Ok(get_limb_names::Response::new(
                         names.arm_names,
@@ -425,11 +434,8 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
                         names.gripper_names,
                     ))
                 })
-                .await
-                {
-                    error!("get_limb_names: {e}");
-                }
-            }
+            })
+            .await;
         });
     }
 
@@ -441,6 +447,14 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         mounts,
         grasps_rx,
     ));
+
+    // Where the robot can work, answered for the life of the node from the
+    // design alone, so ahead of the readiness gate like the mounts.
+    workspace_service::spawn(
+        node_runner.clone(),
+        node_runner.cancellation_token().clone(),
+        workspace,
+    );
 
     // Gate exposing actions + streaming on the robot being ready, in a spawned
     // task so this setup closure returns promptly for the health probe.

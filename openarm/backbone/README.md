@@ -204,6 +204,59 @@ answer carries that snapshot's stamp. Served from bringup, refused with
 robot answers success with no camera. A description that mounts a camera on
 a link a moving joint carries, other than the grasp point's, stops bringup.
 
+### workspace
+
+`describe_workspace` and `check_positions` answer where the robot can work
+from its design alone, in the robot frame, knowing nothing of the room: a
+surface is a flat, level plane at the height asked, with nothing in the way.
+A point is reachable when an arm brings its grasp point within 1 cm of it
+in one of the 16 grasp orientations `workspace_core` lists (the gripper
+pointing straight down or straight forward, each at 8 rolls), solved by the
+arm's closed-form IK seeded at Ready: a grasp within 1 cm of an edge of
+the arm's reach, outside or inside it, is solved moved into that reach by
+less than 1 cm, in the same orientation.
+The arm whose base stands nearer the point is tried first and named. A
+point out of reach carries how far the closest arm stops its grasp point
+short of it in any orientation, its joint limits aside: at most 0.01 when
+the grasp point gets within 1 cm of it, but in no grasp orientation, which
+the message words as `no arm reaches it with its gripper pointing down or
+forward`. A point is in view when it lies inside the perception camera's
+field of view and its depth, by the depth model the camera gives (`z`, the
+depth along the optical axis, or `range`, the straight-line distance), lies
+inside the camera's depth range. The perception camera is derived
+from the description, never configured: the one camera that gives depth
+and that no arm carries (v2's `chest`; v1 has none, and is judged on reach
+alone). Its pose is the design's, the one `camera_mounts` reports; its
+field of view, depth model and depth range are what the camera linked as
+`perception_geometry` (`camera_geometry:v1`) answers at each request,
+within 2 s for each of its two answers.
+
+| `perception_geometry` | The answers |
+|---|---|
+| vacant | no view check (`no_camera`), and the message says `The view is not checked: no camera geometry is linked for the chest camera.` |
+| linked, answering | the view is checked through the camera's own intrinsics and depth stream |
+| linked, colour intrinsics refused, not answered in time, or not a pinhole model | refused: `cannot read the colour intrinsics of the chest camera, the perception camera: <reason>` |
+| linked, depth intrinsics not answered in time, not a depth range, or of a depth model `camera_geometry:v1` does not name | refused: `cannot read the depth intrinsics of the chest camera, the perception camera: <reason>` |
+| linked, depth intrinsics refused (a camera that gives no depth) | refused: `the camera linked as the chest camera, the perception camera, gives no depth: <reason>` |
+
+The grid, the limits, the verdicts, the largest workable rectangle and the
+messages of the verdicts, of the count of workable points and of a view not
+checked (for a robot without a perception camera too) are
+`workspace_core`'s, so these answers and the simulation's read alike; the
+refusals of a request and of the camera's geometry, in the table above and
+below, are the backbone's own.
+
+`describe_workspace` measures the surface at its height to the millimetre,
+each grid point's reach at a target 4 cm above it, and keeps the reach
+grids of the last 32 heights it measured (the one stored first goes past
+that), so a repeated height answers from the stored grid. A height that is
+not a finite number, an empty position list, one that does not split into
+points of 3 values, a value that is not a finite number, and a coordinate
+more than 1000 m from the robot's base point are refused. Both services
+read nothing of the arms and move nothing, so they answer from bringup,
+ahead of the readiness gate. The robot's own body is not checked for hiding
+a point from the camera.
+
 ## Module map
 
 | Module | Owns | Why it lives here |
@@ -226,6 +279,9 @@ a link a moving joint carries, other than the grasp point's, stops bringup.
 | `governor/barrier.rs` | the projection and the floor scan | the two stages that are not per-DOF fractions |
 | `torso.rs` | the torso clip regions the URDF does not carry | geometry facts, versioned with the node |
 | `actions/` | goal admission (validate + claim), nothing else | execution belongs to the planner/coordinator that owns the state |
+| `workspace.rs` | the workspace judgement from the design: reach per grasp orientation, the perception camera, the per-height reach memo, the parsing of a request and of the camera's geometry | pure: no messaging, so every answer is unit-tested without a node |
+| `workspace_service.rs` | the two workspace services and the read of the linked camera's geometry | the thin edge between the generated handlers and `workspace.rs` |
+| `serving.rs` | the loop of each service answered for the life of the node (`get_limb_names`, `get_camera_poses`, the workspace services): ended by the node's cancel, an error logged and waited out for 1 s | one loop, so no service can hot-spin on a broken transport or outlive the node |
 | `types.rs`, `arm_pair.rs` | `ARM_DOF`, `JointVec`, `Side`, the motion-timeout rule, `ArmPair` | shared primitives |
 
 ## Parameters and links
@@ -250,7 +306,10 @@ leading node, four toward the followers) are optional and established by the
 launcher: each one either names a peer, from this instance's `links` or the
 peer's own, or is declared `{ vacant: "<why>" }`, and a slot left unmentioned
 by both ends fails launch validation. Publishing on a vacant slot is a legal
-no-op, so partial deployments and monitors boot cleanly.
+no-op, so partial deployments and monitors boot cleanly. The
+`perception_geometry` dependency slot is optional too: bind it to the
+camera_geometry provider of the perception camera (`chest` on v2) for the
+workspace answers to check the view, or leave it vacant for reach alone.
 
 ## Build, run, test
 
