@@ -57,12 +57,19 @@ pub struct PlanConfig {
     pub limits: [Limit; ARM_DOF],
 }
 
-/// How a joint move ended, reported to a ready-move aggregation.
+/// How one arm's share of a posture move ended, reported to the posture
+/// action that sent it.
 pub struct ReadyOutcome {
+    /// The arm that moved.
+    pub side: Side,
     pub success: bool,
     pub message: String,
     /// The move was ended by the stop service, whoever started it.
     pub stopped: bool,
+    /// The arm's grasp pose in the robot frame, from the joints measured
+    /// when its share ended: the pose limb_state gives for those joints.
+    /// None when the arm had not measured its joints yet.
+    pub grasp: Option<Isometry3<f64>>,
 }
 
 /// One arm's share of a whole-robot ready move: where its terminal reports,
@@ -88,39 +95,47 @@ impl JointReply {
         }
     }
 
-    /// Report the terminal. The ready share folds `Cancelled` into a failed
-    /// outcome and carries a stop as one; the joint action keeps its
-    /// distinct cancelled completion, which a stop ends it with too.
+    /// Report the terminal of `planner`'s arm with `measured_q`, the joints
+    /// the arm measured when the move ended (none before its first
+    /// measurement). The joint action keeps its distinct cancelled
+    /// completion, which a stop ends it with too, and reports the held
+    /// setpoint in place of a missing measurement. The ready share folds
+    /// `Cancelled` into a failed outcome, carries a stop as one, and gives
+    /// the grasp pose of the measured joints, or no pose without them.
     async fn finish(
         self,
-        side: &'static str,
+        planner: &mut Planner,
         outcome: Outcome,
-        measured_q: JointVec,
+        measured_q: Option<JointVec>,
         elapsed_s: f64,
     ) {
+        let side = planner.side;
         let cancelled = outcome.is_cancelled();
         let stopped = matches!(outcome, Outcome::Stopped(_));
         let (success, message) = outcome.report(|| "trajectory complete".to_string());
         match self {
             Self::MoveArmJoints(ctx) => {
+                let reported_q = planner.reported_joints(measured_q);
                 let result = if cancelled {
-                    ctx.complete_cancelled(success, message, measured_q, elapsed_s)
+                    ctx.complete_cancelled(success, message, reported_q, elapsed_s)
                         .await
                 } else {
-                    ctx.complete(success, message, measured_q, elapsed_s).await
+                    ctx.complete(success, message, reported_q, elapsed_s).await
                 };
                 if let Err(e) = result {
-                    error!("{side}: move_arm_joints complete: {e}");
+                    error!("{}: move_arm_joints complete: {e}", side.label());
                 }
             }
             Self::Ready(r) => {
                 let outcome = ReadyOutcome {
+                    side,
                     success,
-                    message: format!("{side}: {message}"),
+                    message: format!("{}: {message}", side.label()),
                     stopped,
+                    grasp: measured_q.map(|q| planner.ee_pose_world(&q)),
                 };
                 if r.done_tx.send(outcome).await.is_err() {
-                    error!("{side}: ready outcome aggregation closed");
+                    error!("{}: ready outcome aggregation closed", side.label());
                 }
             }
         }
@@ -143,33 +158,41 @@ pub enum Goal {
 }
 
 impl Goal {
-    /// Complete unstarted, `success: false`, reporting `reported_q` (the
-    /// measured joints, per the result contract). The busy flag is the
-    /// caller's concern.
-    pub async fn refuse(self, reason: &str, reported_q: JointVec, planner: &mut Planner) {
-        self.end_unstarted(Outcome::Failed(reason.to_string()), reported_q, planner)
+    /// Complete unstarted, `success: false`, reporting `measured_q` (the
+    /// measured joints, per the result contract; none before the arm's first
+    /// measurement). The busy flag is the caller's concern.
+    pub async fn refuse(self, reason: &str, measured_q: Option<JointVec>, planner: &mut Planner) {
+        self.end_unstarted(Outcome::Failed(reason.to_string()), measured_q, planner)
             .await;
     }
 
     /// Complete unstarted as cancelled by the stop service, with the stop's
-    /// `message`, reporting `reported_q`. The busy flag is the caller's
+    /// `message`, reporting `measured_q`. The busy flag is the caller's
     /// concern.
-    pub async fn stop(self, message: &str, reported_q: JointVec, planner: &mut Planner) {
-        self.end_unstarted(Outcome::Stopped(message.to_string()), reported_q, planner)
-            .await;
+    pub async fn stop(self, message: &str, measured_q: JointVec, planner: &mut Planner) {
+        self.end_unstarted(
+            Outcome::Stopped(message.to_string()),
+            Some(measured_q),
+            planner,
+        )
+        .await;
     }
 
-    async fn end_unstarted(self, outcome: Outcome, reported_q: JointVec, planner: &mut Planner) {
+    async fn end_unstarted(
+        self,
+        outcome: Outcome,
+        measured_q: Option<JointVec>,
+        planner: &mut Planner,
+    ) {
         match self {
             Goal::Joint { reply, .. } => {
-                reply
-                    .finish(planner.side.label(), outcome, reported_q, 0.0)
-                    .await;
+                reply.finish(planner, outcome, measured_q, 0.0).await;
             }
             Goal::Cartesian { ctx, .. } => {
                 let cancelled = outcome.is_cancelled();
                 let (success, message) =
                     outcome.report(|| unreachable!("an unstarted goal never completes"));
+                let reported_q = planner.reported_joints(measured_q);
                 planner
                     .finish_cartesian(&ctx, reported_q, success, &message, 0.0, cancelled)
                     .await;
@@ -392,6 +415,12 @@ impl Planner {
         self.setpoint
     }
 
+    /// The joints a move_arm or move_arm_joints result reports: the measured
+    /// joints, or the held setpoint before the arm's first measurement.
+    fn reported_joints(&self, measured_q: Option<JointVec>) -> JointVec {
+        measured_q.unwrap_or(self.setpoint)
+    }
+
     /// World-frame end-effector pose at `q`; the planner owns this arm's chain.
     pub fn ee_pose_world(&mut self, q: &JointVec) -> Isometry3<f64> {
         let ee_base = self.model.at(q).ee_pose();
@@ -435,7 +464,7 @@ impl Planner {
             if matches!(mode, Mode::Follow) {
                 mode = self.start_goal(goal, busy.clone(), now).await;
             } else {
-                goal.refuse("another move is in flight", measured_q, self)
+                goal.refuse("another move is in flight", Some(measured_q), self)
                     .await;
             }
         }
@@ -488,9 +517,7 @@ impl Planner {
             Mode::Follow => false,
             Mode::JointMove(JointMove { traj, reply, _busy }) => {
                 let elapsed = now.duration_since(traj.motion_start).as_secs_f64();
-                reply
-                    .finish(self.side.label(), outcome, measured_q, elapsed)
-                    .await;
+                reply.finish(self, outcome, Some(measured_q), elapsed).await;
                 true
             }
             Mode::CartesianMove(m) => {
@@ -612,9 +639,7 @@ impl Planner {
         } else {
             Outcome::Complete
         };
-        reply
-            .finish(self.side.label(), outcome, measured_q, elapsed)
-            .await;
+        reply.finish(self, outcome, Some(measured_q), elapsed).await;
         // A cancel holds where the arm already is; a completion holds the last
         // sample.
         Advance::ends_move(if cancelled { self.setpoint } else { q_des })

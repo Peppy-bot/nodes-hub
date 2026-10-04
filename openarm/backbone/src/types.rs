@@ -5,6 +5,8 @@
 use srs_model::chain_kinematics::{ServoTolerances, ToleranceError};
 use srs_model::nalgebra::{Isometry3, Quaternion, Translation3, UnitQuaternion};
 
+use crate::arm_pair::ArmPair;
+
 /// Degrees of freedom of one arm, from the description that also supplies the
 /// URDF the governor and planner run against.
 pub const ARM_DOF: usize = openarm_description::ARM_DOF;
@@ -20,6 +22,18 @@ pub fn world_pose_arrays(pose: &Isometry3<f64>) -> ([f64; 3], [f64; 4]) {
     let t = pose.translation.vector;
     let r = pose.rotation;
     ([t.x, t.y, t.z], [r.i, r.j, r.k, r.w])
+}
+
+/// Both arms' grasp poses as limb_state and the posture results carry them:
+/// the positions (3 per arm) and the orientations (4 per arm, `[x, y, z,
+/// w]`), each in [`Side::ARM_NAMES`] order.
+pub fn arm_pose_arrays(poses: &ArmPair<Isometry3<f64>>) -> (Vec<f64>, Vec<f64>) {
+    let (left_position, left_orientation) = world_pose_arrays(&poses.left);
+    let (right_position, right_orientation) = world_pose_arrays(&poses.right);
+    (
+        [left_position, right_position].concat(),
+        [left_orientation, right_orientation].concat(),
+    )
 }
 
 /// Parse a world-frame pose off the wire: three finite position components

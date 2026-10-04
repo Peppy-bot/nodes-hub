@@ -968,10 +968,9 @@ async fn seed_all(
 /// Refuse one arm goal during the seed wait, reporting the measured pose when
 /// one already arrived and releasing the goal's busy claim.
 async fn refuse_seed_arm_goal(goal: Goal, channels: &ArmChannels, planner: &mut Planner) {
-    let measured = *channels.measured.borrow();
+    let measured_q = channels.measured.borrow().map(|m| m.positions);
     let _release = BusyGuard(channels.busy.clone());
-    let reported = measured.map_or_else(|| planner.setpoint(), |m| m.positions);
-    goal.refuse(SEED_REFUSAL, reported, planner).await;
+    goal.refuse(SEED_REFUSAL, measured_q, planner).await;
 }
 
 /// Refuse one gripper goal during the seed wait, reporting the measured
@@ -1031,7 +1030,7 @@ async fn tick_arm(
         planner.abort_active(STALE_REFUSAL, measured_q, now).await;
         while let Ok(goal) = channels.goals.try_recv() {
             let _release = BusyGuard(channels.busy.clone());
-            goal.refuse(STALE_REFUSAL, measured_q, planner).await;
+            goal.refuse(STALE_REFUSAL, Some(measured_q), planner).await;
         }
         return planner::Tick {
             candidate: planner.setpoint(),

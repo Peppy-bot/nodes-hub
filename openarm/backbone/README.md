@@ -166,6 +166,21 @@ A gripper that stops short is a success on purpose: the move was neither
 refused, failed nor cancelled, and the caller judges the grasp from
 `final_opening`.
 
+`move_to_ready` and `move_to_home` give each arm's planner a joint move to
+the posture and complete when both moves end. `success` says that both
+moves ran their time out, not that the arms arrived: the governor can hold
+an arm short, and the backbone does not see an arm that stops against an
+object. Whatever the terminal, the result gives `arm_names` (`left_arm`,
+`right_arm`, the order of limb_state) and, in that order, `positions` (3 per
+arm, m) and `orientations` (4 per arm, `[x, y, z, w]`): the grasp pose of
+each arm in the robot frame, from the joints it measured when its move
+ended, as limb_state gives it for those joints. After a cancel or a stop,
+that is where each arm was when the move ended. When an arm has no such
+pose, the three arrays are empty and the message ends with
+`; no arm poses: <arm> has not measured its joints` (a goal during the seed
+wait) or `; no arm poses: <arm> did not report the end of its move` (its
+planner is unavailable or dropped the move).
+
 ### Services of limb_motion
 
 `stop` ends every planned move in flight, whoever started it: the arm moves
