@@ -181,6 +181,16 @@ impl Side {
         }
     }
 
+    /// This side's arm name, as [`Self::ARM_NAMES`] gives it.
+    pub fn arm_name(self) -> &'static str {
+        Self::ARM_NAMES[self.index()]
+    }
+
+    /// This side's gripper name, as [`Self::GRIPPER_NAMES`] gives it.
+    pub fn gripper_name(self) -> &'static str {
+        Self::GRIPPER_NAMES[self.index()]
+    }
+
     /// Label for logs.
     pub fn label(self) -> &'static str {
         match self {
@@ -219,8 +229,8 @@ mod tests {
     }
 
     // Pins the name tables to the parsers: a name the tables advertise (on
-    // limb_state's arm_names/gripper_names) must parse back to its side, and
-    // a foreign name must be refused, not misrouted.
+    // limb_state's arm_names/gripper_names) or a side gives must parse back
+    // to its side, and a foreign name must be refused, not misrouted.
     #[test]
     fn advertised_names_parse_and_foreign_names_refuse() {
         assert_eq!(Side::from_arm_name(Side::ARM_NAMES[0]), Some(Side::Left));
@@ -233,6 +243,10 @@ mod tests {
             Side::from_gripper_name(Side::GRIPPER_NAMES[1]),
             Some(Side::Right)
         );
+        for side in [Side::Left, Side::Right] {
+            assert_eq!(Side::from_arm_name(side.arm_name()), Some(side));
+            assert_eq!(Side::from_gripper_name(side.gripper_name()), Some(side));
+        }
         assert_eq!(Side::from_arm_name("left_gripper"), None);
         assert_eq!(Side::from_gripper_name("left_arm"), None);
         assert_eq!(Side::from_arm_name("LEFT_ARM"), None);

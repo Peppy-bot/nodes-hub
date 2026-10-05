@@ -137,9 +137,7 @@ impl CameraMounts {
             .map(|mount| {
                 let (carried_by, pose) = match mount.carrier {
                     Carrier::Base => ("", mount.pose),
-                    Carrier::Arm(side) => {
-                        (Side::ARM_NAMES[side.index()], grasps.get(side) * mount.pose)
-                    }
+                    Carrier::Arm(side) => (side.arm_name(), grasps.get(side) * mount.pose),
                 };
                 CameraPose {
                     name: mount.name,

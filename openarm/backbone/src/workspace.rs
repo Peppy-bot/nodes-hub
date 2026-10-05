@@ -385,7 +385,7 @@ impl Workspace {
             .find(|&side| self.reaches(side, &grasps))
         {
             Some(side) => Reach::Reached {
-                arm: Side::ARM_NAMES[side.index()].to_owned(),
+                arm: side.arm_name().to_owned(),
             },
             None => Reach::Short {
                 by: self.shortfall(target),

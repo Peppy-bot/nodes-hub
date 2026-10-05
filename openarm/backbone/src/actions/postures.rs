@@ -96,7 +96,7 @@ fn measured_grasps(
     outcomes: &[ReadyOutcome],
 ) -> std::result::Result<ArmPair<Isometry3<f64>>, String> {
     let grasp = |side: Side| {
-        let arm = Side::ARM_NAMES[side.index()];
+        let arm = side.arm_name();
         let outcome = outcomes
             .iter()
             .find(|o| o.side == side)
@@ -233,12 +233,9 @@ macro_rules! posture_runner {
                     orientations,
                 } = posture_result(pending, &outcomes, cancel_seen || ctx.is_cancelled(), $done);
                 let result = match terminal {
-                    Terminal::Success => {
-                        ctx.complete(true, message, arm_names, positions, orientations)
-                            .await
-                    }
-                    Terminal::Failed => {
-                        ctx.complete(false, message, arm_names, positions, orientations)
+                    Terminal::Success | Terminal::Failed => {
+                        let success = terminal == Terminal::Success;
+                        ctx.complete(success, message, arm_names, positions, orientations)
                             .await
                     }
                     Terminal::Cancelled => {

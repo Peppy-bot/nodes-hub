@@ -580,7 +580,7 @@ async fn serve_request(
                 let planner = planners.get_mut(side);
                 let measured = seeded_measurement(arm, *arm_admission.get(side));
                 if planner.stop_active(&message, measured, now).await {
-                    stopped.push(Side::ARM_NAMES[side.index()].to_string());
+                    stopped.push(side.arm_name().to_string());
                 }
                 while let Ok(goal) = arm.goals.try_recv() {
                     let _release = BusyGuard(arm.busy.clone());
@@ -596,7 +596,7 @@ async fn serve_request(
                         elapsed_s,
                     )
                     .await;
-                    stopped.push(Side::GRIPPER_NAMES[side.index()].to_string());
+                    stopped.push(side.gripper_name().to_string());
                 }
                 while let Ok(goal) = arm.gripper_goals.try_recv() {
                     let _release = BusyGuard(arm.gripper_busy.clone());
