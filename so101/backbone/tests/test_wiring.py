@@ -363,11 +363,15 @@ async def test_posture_and_gripper_actions():
             feeder.cancel()
 
 
-async def test_a_posture_result_names_the_arm_and_its_measured_grasp_point():
+async def test_a_posture_result_names_the_arm_and_its_measured_grasp_point(
+    follower_never_stale,
+):
     # One scenario for three facts of the result of each posture move: the
     # result names the arm, it gives the grasp point of the measured joints,
     # and it can report success when the arm did not arrive. The mocked
     # follower always measures MEASURED, so the arm never gets to a posture.
+    # follower_never_stale keeps a pause of the event loop from making the
+    # measured joints stale.
     kinematics = Kinematics(KINEMATICS_URDF_PATH)
     measured_position, measured_orientation = kinematics.forward_kinematics(MEASURED)
     async with harness.start(setup, parameters=make_parameters()) as h:
