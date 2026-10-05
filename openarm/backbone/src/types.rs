@@ -5,6 +5,8 @@
 use srs_model::chain_kinematics::{ServoTolerances, ToleranceError};
 use srs_model::nalgebra::{Isometry3, Quaternion, Translation3, UnitQuaternion};
 
+use crate::arm_pair::ArmPair;
+
 /// Degrees of freedom of one arm, from the description that also supplies the
 /// URDF the governor and planner run against.
 pub const ARM_DOF: usize = openarm_description::ARM_DOF;
@@ -20,6 +22,18 @@ pub fn world_pose_arrays(pose: &Isometry3<f64>) -> ([f64; 3], [f64; 4]) {
     let t = pose.translation.vector;
     let r = pose.rotation;
     ([t.x, t.y, t.z], [r.i, r.j, r.k, r.w])
+}
+
+/// Both arms' grasp poses as limb_state and the posture results carry them.
+/// The positions have 3 values per arm. The orientations have 4 values per
+/// arm, `[x, y, z, w]`. Both are in [`Side::ARM_NAMES`] order.
+pub fn arm_pose_arrays(poses: &ArmPair<Isometry3<f64>>) -> (Vec<f64>, Vec<f64>) {
+    let (left_position, left_orientation) = world_pose_arrays(&poses.left);
+    let (right_position, right_orientation) = world_pose_arrays(&poses.right);
+    (
+        [left_position, right_position].concat(),
+        [left_orientation, right_orientation].concat(),
+    )
 }
 
 /// Parse a world-frame pose off the wire: three finite position components
@@ -167,6 +181,16 @@ impl Side {
         }
     }
 
+    /// This side's arm name, as [`Self::ARM_NAMES`] gives it.
+    pub fn arm_name(self) -> &'static str {
+        Self::ARM_NAMES[self.index()]
+    }
+
+    /// This side's gripper name, as [`Self::GRIPPER_NAMES`] gives it.
+    pub fn gripper_name(self) -> &'static str {
+        Self::GRIPPER_NAMES[self.index()]
+    }
+
     /// Label for logs.
     pub fn label(self) -> &'static str {
         match self {
@@ -205,8 +229,8 @@ mod tests {
     }
 
     // Pins the name tables to the parsers: a name the tables advertise (on
-    // limb_state's arm_names/gripper_names) must parse back to its side, and
-    // a foreign name must be refused, not misrouted.
+    // limb_state's arm_names/gripper_names) or a side gives must parse back
+    // to its side, and a foreign name must be refused, not misrouted.
     #[test]
     fn advertised_names_parse_and_foreign_names_refuse() {
         assert_eq!(Side::from_arm_name(Side::ARM_NAMES[0]), Some(Side::Left));
@@ -219,6 +243,10 @@ mod tests {
             Side::from_gripper_name(Side::GRIPPER_NAMES[1]),
             Some(Side::Right)
         );
+        for side in [Side::Left, Side::Right] {
+            assert_eq!(Side::from_arm_name(side.arm_name()), Some(side));
+            assert_eq!(Side::from_gripper_name(side.gripper_name()), Some(side));
+        }
         assert_eq!(Side::from_arm_name("left_gripper"), None);
         assert_eq!(Side::from_gripper_name("left_arm"), None);
         assert_eq!(Side::from_arm_name("LEFT_ARM"), None);

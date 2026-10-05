@@ -3,6 +3,7 @@ same validation setup runs at startup, plus the FK claims the poses are
 documented with."""
 
 import math
+from xml.etree import ElementTree
 
 from so101_description import limits as limits_mod
 from so101_description import postures
@@ -24,6 +25,14 @@ def test_postures_sit_inside_the_embedded_urdf_limits():
     limits = limits_mod.from_urdf(KINEMATICS_URDF_PATH)
     assert limits.contains(postures.HOME_POSITIONS_RAD)
     assert limits.contains(postures.READY_POSITIONS_RAD)
+
+
+def test_the_embedded_urdf_carries_no_collision_geometry():
+    """The backbone checks no collision. The URDF of its kinematics has the
+    links and the joints of the arm, and no collision shape."""
+    root = ElementTree.parse(KINEMATICS_URDF_PATH).getroot()
+    assert root.findall("link")
+    assert root.findall(".//collision") == []
 
 
 def test_home_is_collapsed_low_and_close_relative_to_ready():

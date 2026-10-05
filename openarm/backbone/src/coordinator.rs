@@ -13,10 +13,12 @@
 //! re-anchors that setpoint on the measured pose, so a follower that restarts
 //! is never handed a target that drifted while nobody could see the arm.
 //!
-//! The loop also answers the two limb_motion services that read or end what
-//! it runs ([`CoordinatorRequest`]): a stop ends every move in flight on
-//! both sides at the start of a tick, and a plan check asks one arm's planner
-//! whether a Cartesian goal has a plan from where it stands.
+//! At the start of a tick, the loop also answers the requests of the
+//! actions and services ([`CoordinatorRequest`]):
+//! - a stop ends every move in flight on both sides;
+//! - a plan check asks one arm's planner whether a Cartesian goal has a plan
+//!   from where it stands;
+//! - a posture goal that completes asks for the grasp pose of each arm.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,6 +27,7 @@ use std::time::{Duration, Instant};
 use peppygen::NodeRunner;
 use peppygen::exposed_actions::limb_motion::move_gripper;
 use peppylib::runtime::CancellationToken;
+use srs_model::nalgebra::Isometry3;
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{error, info, warn};
 
@@ -38,7 +41,7 @@ use crate::chase::rate_limited;
 use crate::governor::{GovState, Governor, Guard};
 use crate::liveness::{Admission, Cadence, CadenceChange, Liveness};
 use crate::motion::{MOTION_TIMEOUT_FACTOR, MoveBudget};
-use crate::planner::{self, BusyGuard, Goal, Planner};
+use crate::planner::{self, BusyGuard, Goal, Measurement, Planner, Unmeasured};
 use crate::publish::{LimbStateSnapshot, Publishers};
 use crate::streams::{ArmState, GovernorConfig, GripperCommand, GripperState};
 use crate::types::{ARM_DOF, JointVec, Side};
@@ -93,8 +96,13 @@ pub struct RunConfig {
     pub upstream_mode: UpstreamMode,
 }
 
-/// What the limb_motion services ask of the loop, answered on the reply
-/// channel each carries; a reply the asker no longer waits for is dropped.
+/// The grasp pose of one arm in the robot frame, from the joints it
+/// measured, or why it has no fresh measurement of them.
+pub type MeasuredGrasp = Result<Isometry3<f64>, Unmeasured>;
+
+/// What the limb_motion services and the posture moves ask of the loop,
+/// answered on the reply channel each carries. A reply that the asker no
+/// longer waits for is dropped.
 pub enum CoordinatorRequest {
     /// End every planned move in flight on both sides, answering the names of
     /// the limbs whose move was ended.
@@ -107,6 +115,11 @@ pub enum CoordinatorRequest {
     CheckArmMove {
         request: ArmMoveRequest,
         reply: oneshot::Sender<Result<f64, String>>,
+    },
+    /// The grasp pose of each arm, measured when the loop serves the
+    /// request: what a posture result gives when its goal completes.
+    MeasureGrasps {
+        reply: oneshot::Sender<ArmPair<MeasuredGrasp>>,
     },
 }
 
@@ -387,6 +400,7 @@ pub async fn run(
                 request,
                 &mut channels,
                 &mut planners,
+                arm_admission,
                 &mut gripper_moves,
                 &gripper_fraction,
                 now,
@@ -553,16 +567,23 @@ pub async fn run(
     }
 }
 
-/// Answer one limb_motion service request. A stop ends the moves in flight
-/// on both sides (the arm's move through its planner, the gripper's through
-/// its terminal) and the goals admitted but not started, each as cancelled
-/// with the stop's message, and names the limbs whose move was in flight;
-/// the setpoints hold where they were last governed. A check asks the named
-/// arm's planner and moves nothing.
+/// Answer one request:
+/// - A stop ends the moves in flight on both sides and the goals admitted
+///   but not started. The planner ends an arm's move; the gripper's
+///   terminal ends a gripper's move.
+/// - Each goal that the stop ends completes as cancelled with the stop's
+///   message. The answer names the limbs whose move was in flight. The
+///   setpoints hold where they were last governed.
+/// - A check asks the named arm's planner and moves nothing.
+/// - A grasp request answers the grasp pose of each arm.
+///
+/// The results and the grasp poses come from each arm's
+/// [`seeded_measurement`] under `arm_admission`.
 async fn serve_request(
     request: CoordinatorRequest,
     channels: &mut ArmPair<ArmChannels>,
     planners: &mut ArmPair<Planner>,
+    arm_admission: ArmPair<Admission>,
     gripper_moves: &mut ArmPair<Option<GripperMove>>,
     gripper_fraction: &impl Fn(&watch::Receiver<Option<GripperState>>) -> f64,
     now: Instant,
@@ -575,16 +596,13 @@ async fn serve_request(
             for side in [Side::Left, Side::Right] {
                 let arm = channels.get_mut(side);
                 let planner = planners.get_mut(side);
-                let measured_q = arm
-                    .measured
-                    .borrow()
-                    .map_or_else(|| planner.setpoint(), |m| m.positions);
-                if planner.stop_active(&message, measured_q, now).await {
-                    stopped.push(Side::ARM_NAMES[side.index()].to_string());
+                let measured = seeded_measurement(arm, *arm_admission.get(side));
+                if planner.stop_active(&message, measured, now).await {
+                    stopped.push(side.arm_name().to_string());
                 }
                 while let Ok(goal) = arm.goals.try_recv() {
                     let _release = BusyGuard(arm.busy.clone());
-                    goal.stop(&message, measured_q, planner).await;
+                    goal.stop(&message, measured, planner).await;
                 }
                 let measured_frac = gripper_fraction(&arm.gripper);
                 if let Some(m) = gripper_moves.get_mut(side).take() {
@@ -596,7 +614,7 @@ async fn serve_request(
                         elapsed_s,
                     )
                     .await;
-                    stopped.push(Side::GRIPPER_NAMES[side.index()].to_string());
+                    stopped.push(side.gripper_name().to_string());
                 }
                 while let Ok(goal) = arm.gripper_goals.try_recv() {
                     let _release = BusyGuard(arm.gripper_busy.clone());
@@ -611,6 +629,9 @@ async fn serve_request(
                 request.tolerance,
                 request.duration_s,
             ));
+        }
+        CoordinatorRequest::MeasureGrasps { reply } => {
+            let _ = reply.send(measured_grasps(channels, planners, arm_admission));
         }
     }
 }
@@ -811,6 +832,46 @@ fn live<T>(admission: Admission, read: impl FnOnce() -> Option<T>) -> Option<T> 
     (admission != Admission::Stale).then(read).flatten()
 }
 
+/// The joints an arm's move results report after the seed: its latest
+/// measurement, or [`Unmeasured::Stale`] for a stale side, as [`live`]
+/// reads it. The seed gated on every arm's first measurement, so a live
+/// side always holds one.
+fn seeded_measurement(channels: &ArmChannels, admission: Admission) -> Measurement {
+    if admission == Admission::Stale {
+        return Err(Unmeasured::Stale);
+    }
+    Ok(channels
+        .measured
+        .borrow()
+        .expect("seed gated on the first state")
+        .positions)
+}
+
+/// The latest joints an arm measured before the seed ends, or
+/// [`Unmeasured::NotYet`] while it has none. The seed judges no liveness, so
+/// this value can be stale.
+fn latest_measurement(channels: &ArmChannels) -> Measurement {
+    channels
+        .measured
+        .borrow()
+        .map(|m| m.positions)
+        .ok_or(Unmeasured::NotYet)
+}
+
+/// The grasp pose of each arm after the seed, at the joints of its
+/// [`seeded_measurement`] under `arm_admission`, or why it has none.
+fn measured_grasps(
+    channels: &ArmPair<ArmChannels>,
+    planners: &mut ArmPair<Planner>,
+    arm_admission: ArmPair<Admission>,
+) -> ArmPair<MeasuredGrasp> {
+    let mut grasp = |side: Side| {
+        seeded_measurement(channels.get(side), *arm_admission.get(side))
+            .map(|q| planners.get_mut(side).ee_pose_world(&q))
+    };
+    ArmPair::new(grasp(Side::Left), grasp(Side::Right))
+}
+
 /// Gather one whole-robot snapshot for the limb_state readout: every limb's
 /// live measurement, the arms' grasp-point poses FK'd from those joints. Any
 /// stale or missing limb yields `None`: a partial robot is not a snapshot.
@@ -940,13 +1001,19 @@ async fn seed_all(
                 refuse_seed_gripper_goal(goal, &channels.right).await;
             }
             // Nothing moves before the seed, so a stop stops nothing and a
-            // check has no held pose to plan from.
+            // check has no held pose to plan from. The seed judges no
+            // liveness, so no measurement is known to be fresh: a grasp
+            // request gets no pose for either arm.
             Some(request) = requests.recv() => match request {
                 CoordinatorRequest::Stop { reply, .. } => {
                     let _ = reply.send(Vec::new());
                 }
                 CoordinatorRequest::CheckArmMove { reply, .. } => {
                     let _ = reply.send(Err(SEED_REFUSAL.to_string()));
+                }
+                CoordinatorRequest::MeasureGrasps { reply } => {
+                    let unseeded = Err(Unmeasured::NotYet);
+                    let _ = reply.send(ArmPair::new(unseeded, unseeded));
                 }
             }
         }
@@ -968,10 +1035,9 @@ async fn seed_all(
 /// Refuse one arm goal during the seed wait, reporting the measured pose when
 /// one already arrived and releasing the goal's busy claim.
 async fn refuse_seed_arm_goal(goal: Goal, channels: &ArmChannels, planner: &mut Planner) {
-    let measured = *channels.measured.borrow();
+    let measured = latest_measurement(channels);
     let _release = BusyGuard(channels.busy.clone());
-    let reported = measured.map_or_else(|| planner.setpoint(), |m| m.positions);
-    goal.refuse(SEED_REFUSAL, reported, planner).await;
+    goal.refuse(SEED_REFUSAL, measured, planner).await;
 }
 
 /// Refuse one gripper goal during the seed wait, reporting the measured
@@ -1009,35 +1075,40 @@ async fn wait_for_first<T>(
 }
 
 /// Advance one arm's planner to its candidate setpoint for this tick: anchor on the
-/// measured pose (or the held setpoint if no measurement yet), feed the latest
-/// leader command, and admit any pending move goal.
+/// measured pose, feed the latest leader command, and admit any pending move
+/// goal. Runs only after the seed, which gated on the arm's first measurement.
 async fn tick_arm(
     channels: &mut ArmChannels,
     planner: &mut Planner,
     admission: Admission,
     now: Instant,
 ) -> planner::Tick {
-    let measured_q = match *channels.measured.borrow_and_update() {
-        Some(s) => s.positions,
-        None => planner.setpoint(),
-    };
     // A stale limb holds exactly where it was last governed. Advancing the
     // planner would walk the setpoint away from an arm nobody can see, and a
     // held setpoint needs no hand basis: there is no streamed motion to cap.
     // A move in that darkness can neither progress nor be verified, so it and
     // any queued goal fail here, freeing the claim each holds: a ready share
-    // that kept its claim would wedge the ready action for good.
+    // that kept its claim would wedge the ready action for good. Their
+    // results report no measurement, because the last one is stale.
     if admission == Admission::Stale {
-        planner.abort_active(STALE_REFUSAL, measured_q, now).await;
+        planner
+            .abort_active(STALE_REFUSAL, Err(Unmeasured::Stale), now)
+            .await;
         while let Ok(goal) = channels.goals.try_recv() {
             let _release = BusyGuard(channels.busy.clone());
-            goal.refuse(STALE_REFUSAL, measured_q, planner).await;
+            goal.refuse(STALE_REFUSAL, Err(Unmeasured::Stale), planner)
+                .await;
         }
         return planner::Tick {
             candidate: planner.setpoint(),
             streamed_hand: None,
         };
     }
+    let measured_q = channels
+        .measured
+        .borrow_and_update()
+        .expect("seed gated on the first state")
+        .positions;
     // First delivery after a gap: the held setpoint is now fiction, so adopt
     // the measured pose before advancing. The per-joint velocity limit in the
     // chase then walks it back to the operator's command instead of the
@@ -1297,6 +1368,7 @@ fn filtered_velocity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::planner::ReadyOutcome;
 
     fn cmd(opening: f64) -> Option<GripperCommand> {
         Some(GripperCommand {
@@ -1835,18 +1907,18 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_stale_tick_refuses_queued_goals_instead_of_parking_them() {
-        use crate::planner::{JointReply, PlanConfig, ReadyOutcome, ReadyReply};
+    /// A planner of the `side` arm of v1 hardware, holding `held`.
+    fn planner_holding(side: Side, held: JointVec) -> Planner {
+        use crate::planner::PlanConfig;
         use crate::servo::EeCaps;
 
         const TEST_PERIOD: Duration = Duration::from_millis(10);
         let version = openarm_description::HardwareVersion::V1;
-        let model = crate::arm_model(version, openarm_description::Side::Left)
-            .expect("build arm from the bundled URDF");
+        let model =
+            crate::arm_model(version, side.model()).expect("build arm from the bundled URDF");
         let limits = model.limits();
         let mut planner = Planner::new(
-            Side::Left,
+            side,
             model,
             PlanConfig {
                 cycle_period: TEST_PERIOD,
@@ -1859,36 +1931,53 @@ mod tests {
                 limits,
             },
         );
-        let held = [0.0, -0.8, 0.0, 1.2, 0.0, 0.0, 0.0];
         planner.commit(held);
+        planner
+    }
 
-        let (command, _command_rx) = watch::channel(None);
-        let (gripper_command, _gripper_command_rx) = watch::channel(None);
-        let (_measured_tx, measured) = watch::channel(None);
-        let (_gripper_tx, gripper) = watch::channel(None);
+    /// One arm's channels, with its busy slot claimed as at a goal's
+    /// accept. The test drives them through the two senders it also gets:
+    /// the measured state and the goal queue.
+    fn claimed_arm_channels() -> (
+        ArmChannels,
+        watch::Sender<Option<ArmState>>,
+        mpsc::Sender<Goal>,
+    ) {
+        let (command, _) = watch::channel(None);
+        let (gripper_command, _) = watch::channel(None);
+        let (measured_tx, measured) = watch::channel(None);
+        let (_, gripper) = watch::channel(None);
         let (goal_tx, goals) = mpsc::channel(2);
-        let (_gripper_goal_tx, gripper_goals) = mpsc::channel(1);
-        let busy = Arc::new(AtomicBool::new(true)); // claimed at accept
-        let mut channels = ArmChannels {
+        let (_, gripper_goals) = mpsc::channel(1);
+        let channels = ArmChannels {
             command,
             gripper_command,
             measured,
             gripper,
             goals,
-            busy: busy.clone(),
+            busy: Arc::new(AtomicBool::new(true)),
             gripper_goals,
             gripper_busy: Arc::new(AtomicBool::new(false)),
         };
+        (channels, measured_tx, goal_tx)
+    }
+
+    /// The measured state of an arm at `positions`, standing still.
+    fn standing_at(positions: JointVec) -> Option<ArmState> {
+        Some(ArmState {
+            positions,
+            velocities: [0.0; ARM_DOF],
+        })
+    }
+
+    #[tokio::test]
+    async fn a_stale_tick_refuses_queued_goals_instead_of_parking_them() {
+        let held = [0.0, -0.8, 0.0, 1.2, 0.0, 0.0, 0.0];
+        let mut planner = planner_holding(Side::Left, held);
+        let (mut channels, _measured_tx, goal_tx) = claimed_arm_channels();
         let (done_tx, mut done_rx) = mpsc::channel::<ReadyOutcome>(1);
         goal_tx
-            .send(Goal::Joint {
-                target: held,
-                duration_s: 1.0,
-                reply: JointReply::Ready(ReadyReply {
-                    done_tx,
-                    cancelled: Arc::new(AtomicBool::new(false)),
-                }),
-            })
+            .send(Goal::posture_share(held, done_tx))
             .await
             .expect("queue the goal");
 
@@ -1902,9 +1991,176 @@ mod tests {
 
         let outcome = done_rx.recv().await.expect("a refused goal must report");
         assert!(!outcome.success);
-        assert!(outcome.message.contains("stopped reporting"));
-        assert!(!busy.load(Ordering::Acquire), "refusal releases the claim");
+        assert_eq!(outcome.message, "left: the follower stopped reporting");
+        assert!(
+            !channels.busy.load(Ordering::Acquire),
+            "refusal releases the claim"
+        );
         assert_eq!(tick.candidate, planner.setpoint(), "a stale side holds");
         assert!(tick.streamed_hand.is_none(), "a stale side streams nothing");
+    }
+
+    /// A posture share in flight when its follower goes stale fails at the
+    /// first stale tick and frees its arm.
+    #[tokio::test]
+    async fn a_stale_tick_ends_the_posture_share_in_flight() {
+        let held = [0.0, -0.8, 0.0, 1.2, 0.0, 0.0, 0.0];
+        let mut planner = planner_holding(Side::Left, held);
+        let (mut channels, measured_tx, goal_tx) = claimed_arm_channels();
+        measured_tx.send_replace(standing_at(held));
+        let (done_tx, mut done_rx) = mpsc::channel::<ReadyOutcome>(1);
+        goal_tx
+            .send(Goal::posture_share([0.3; ARM_DOF], done_tx))
+            .await
+            .expect("queue the goal");
+
+        let start = Instant::now();
+        tick_arm(&mut channels, &mut planner, Admission::Live, start).await;
+        assert!(done_rx.try_recv().is_err(), "the share is in flight");
+        assert!(channels.busy.load(Ordering::Acquire));
+
+        tick_arm(
+            &mut channels,
+            &mut planner,
+            Admission::Stale,
+            start + Duration::from_millis(100),
+        )
+        .await;
+        let outcome = done_rx.try_recv().expect("the stale tick ends the share");
+        assert!(!outcome.success && !outcome.stopped);
+        assert_eq!(outcome.message, "left: the follower stopped reporting");
+        assert!(
+            !channels.busy.load(Ordering::Acquire),
+            "the abort releases the claim"
+        );
+    }
+
+    /// A grasp request measures each arm when the loop serves it, not when
+    /// the arm's posture share ended:
+    /// - the left share runs its time out, then the left follower goes
+    ///   stale, so the left arm has no fresh measurement;
+    /// - the right share fails on a stale follower, then the right follower
+    ///   recovers, so the right arm has the grasp pose of its latest joints.
+    #[tokio::test]
+    async fn a_grasp_request_measures_each_arm_when_it_is_served() {
+        let held = [0.0, -0.8, 0.0, 1.2, 0.0, 0.0, 0.0];
+        let (left, left_measured, left_goals) = claimed_arm_channels();
+        let (right, right_measured, right_goals) = claimed_arm_channels();
+        let mut channels = ArmPair::new(left, right);
+        let mut planners = ArmPair::new(
+            planner_holding(Side::Left, held),
+            planner_holding(Side::Right, held),
+        );
+        let (done_tx, mut done_rx) = mpsc::channel::<ReadyOutcome>(2);
+        for (measured, goals) in [
+            (&left_measured, &left_goals),
+            (&right_measured, &right_goals),
+        ] {
+            measured.send_replace(standing_at(held));
+            goals
+                .send(Goal::posture_share([0.3; ARM_DOF], done_tx.clone()))
+                .await
+                .expect("queue the share");
+        }
+
+        let start = Instant::now();
+        for side in [Side::Left, Side::Right] {
+            let (arm, planner) = (channels.get_mut(side), planners.get_mut(side));
+            tick_arm(arm, planner, Admission::Live, start).await;
+        }
+        assert!(done_rx.try_recv().is_err(), "both shares are in flight");
+        let late = start + Duration::from_secs(3600);
+        tick_arm(
+            &mut channels.left,
+            &mut planners.left,
+            Admission::Live,
+            late,
+        )
+        .await;
+        tick_arm(
+            &mut channels.right,
+            &mut planners.right,
+            Admission::Stale,
+            late,
+        )
+        .await;
+        let left_end = done_rx.try_recv().expect("the left share ends");
+        assert!(left_end.success, "{}", left_end.message);
+        let right_end = done_rx.try_recv().expect("the right share ends");
+        assert_eq!(right_end.message, "right: the follower stopped reporting");
+
+        let recovered = [0.2, -0.6, 0.1, 1.0, 0.0, 0.0, 0.0];
+        right_measured.send_replace(standing_at(recovered));
+        let (reply, answer) = oneshot::channel();
+        serve_request(
+            CoordinatorRequest::MeasureGrasps { reply },
+            &mut channels,
+            &mut planners,
+            ArmPair::new(Admission::Stale, Admission::Reanchor),
+            &mut ArmPair::new(None, None),
+            &|_: &watch::Receiver<Option<GripperState>>| 0.0,
+            late,
+        )
+        .await;
+        let grasps = answer.await.expect("the loop answers the request");
+        assert_eq!(grasps.left, Err(Unmeasured::Stale));
+        assert_eq!(grasps.right, Ok(planners.right.ee_pose_world(&recovered)));
+    }
+
+    /// During the seed wait, a grasp request gets no pose for either arm,
+    /// also when both arms have measured their joints. Here the grippers
+    /// stay silent, so the seed never ends.
+    #[tokio::test]
+    async fn a_grasp_request_during_the_seed_wait_gets_no_pose() {
+        let held = [0.0, -0.8, 0.0, 1.2, 0.0, 0.0, 0.0];
+        let (mut left, left_measured, _left_goals) = claimed_arm_channels();
+        let (mut right, right_measured, _right_goals) = claimed_arm_channels();
+        let (_left_gripper, silent) = watch::channel(None);
+        left.gripper = silent;
+        let (_right_gripper, silent) = watch::channel(None);
+        right.gripper = silent;
+        left_measured.send_replace(standing_at(held));
+        right_measured.send_replace(standing_at(held));
+        let mut channels = ArmPair::new(left, right);
+        let mut planners = ArmPair::new(
+            planner_holding(Side::Left, held),
+            planner_holding(Side::Right, held),
+        );
+        let (requests_tx, mut requests) = mpsc::channel(1);
+        let (reply, answer) = oneshot::channel();
+        requests_tx
+            .send(CoordinatorRequest::MeasureGrasps { reply })
+            .await
+            .expect("queue the request");
+
+        tokio::select! {
+            _ = seed_all(&mut channels, &mut planners, &mut requests) => {
+                panic!("the seed ended while the grippers are silent");
+            }
+            grasps = answer => {
+                let grasps = grasps.expect("the seed wait answers the request");
+                assert_eq!(grasps.left, Err(Unmeasured::NotYet));
+                assert_eq!(grasps.right, Err(Unmeasured::NotYet));
+            }
+        }
+    }
+
+    /// After the seed, a side's results report its latest measurement while
+    /// it delivers, and no measurement once it is stale, whatever it last
+    /// measured.
+    #[test]
+    fn a_stale_side_reports_no_measurement_and_a_live_side_its_latest() {
+        let (channels, measured_tx, _goal_tx) = claimed_arm_channels();
+        let latest = [0.1, -0.8, 0.0, 1.2, 0.0, 0.0, 0.0];
+        measured_tx.send_replace(standing_at(latest));
+        assert_eq!(seeded_measurement(&channels, Admission::Live), Ok(latest));
+        assert_eq!(
+            seeded_measurement(&channels, Admission::Reanchor),
+            Ok(latest)
+        );
+        assert_eq!(
+            seeded_measurement(&channels, Admission::Stale),
+            Err(Unmeasured::Stale)
+        );
     }
 }

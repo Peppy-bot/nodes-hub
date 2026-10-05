@@ -57,7 +57,25 @@ pub struct PlanConfig {
     pub limits: [Limit; ARM_DOF],
 }
 
-/// How a joint move ended, reported to a ready-move aggregation.
+/// Why an arm has no fresh measurement of its joints.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unmeasured {
+    /// The seed wait is not over: an arm or a gripper has not reported its
+    /// first state yet.
+    NotYet,
+    /// The follower stopped reporting, so its last measurement is stale.
+    Stale,
+}
+
+/// The joints an arm measured, or why it has no fresh measurement of them.
+pub type Measurement = Result<JointVec, Unmeasured>;
+
+/// The note a move_arm or move_arm_joints result adds to its message when it
+/// reports the joints commanded last, because the follower stopped reporting.
+const COMMANDED_JOINTS_NOTE: &str = "the result comes from the joints commanded last";
+
+/// How one arm's share of a posture move ended, reported to the posture
+/// action that sent it.
 pub struct ReadyOutcome {
     pub success: bool,
     pub message: String,
@@ -88,39 +106,45 @@ impl JointReply {
         }
     }
 
-    /// Report the terminal. The ready share folds `Cancelled` into a failed
-    /// outcome and carries a stop as one; the joint action keeps its
-    /// distinct cancelled completion, which a stop ends it with too.
+    /// Report the terminal of `planner`'s arm with `measured`, the joints
+    /// the arm measured when the move ended. The joint action keeps its
+    /// distinct cancelled completion, which a stop ends it with too, and
+    /// reports what [`Planner::reported_joints`] gives. The ready share
+    /// folds `Cancelled` into a failed outcome and carries a stop as one.
+    /// It reports no joints: the posture action measures both arms when its
+    /// goal completes.
     async fn finish(
         self,
-        side: &'static str,
+        planner: &mut Planner,
         outcome: Outcome,
-        measured_q: JointVec,
+        measured: Measurement,
         elapsed_s: f64,
     ) {
+        let side = planner.side;
         let cancelled = outcome.is_cancelled();
         let stopped = matches!(outcome, Outcome::Stopped(_));
         let (success, message) = outcome.report(|| "trajectory complete".to_string());
         match self {
             Self::MoveArmJoints(ctx) => {
+                let (reported_q, message) = planner.reported_joints(measured, message);
                 let result = if cancelled {
-                    ctx.complete_cancelled(success, message, measured_q, elapsed_s)
+                    ctx.complete_cancelled(success, message, reported_q, elapsed_s)
                         .await
                 } else {
-                    ctx.complete(success, message, measured_q, elapsed_s).await
+                    ctx.complete(success, message, reported_q, elapsed_s).await
                 };
                 if let Err(e) = result {
-                    error!("{side}: move_arm_joints complete: {e}");
+                    error!("{}: move_arm_joints complete: {e}", side.label());
                 }
             }
             Self::Ready(r) => {
                 let outcome = ReadyOutcome {
                     success,
-                    message: format!("{side}: {message}"),
+                    message: format!("{}: {message}", side.label()),
                     stopped,
                 };
                 if r.done_tx.send(outcome).await.is_err() {
-                    error!("{side}: ready outcome aggregation closed");
+                    error!("{}: ready outcome aggregation closed", side.label());
                 }
             }
         }
@@ -143,33 +167,46 @@ pub enum Goal {
 }
 
 impl Goal {
-    /// Complete unstarted, `success: false`, reporting `reported_q` (the
+    /// A posture share to `target` over one second, reporting on `done_tx`:
+    /// the goal of the unit tests of the planner and the coordinator.
+    #[cfg(test)]
+    pub fn posture_share(target: JointVec, done_tx: mpsc::Sender<ReadyOutcome>) -> Self {
+        Goal::Joint {
+            target,
+            duration_s: 1.0,
+            reply: JointReply::Ready(ReadyReply {
+                done_tx,
+                cancelled: Arc::new(AtomicBool::new(false)),
+            }),
+        }
+    }
+
+    /// Complete unstarted, `success: false`, reporting `measured` (the
     /// measured joints, per the result contract). The busy flag is the
     /// caller's concern.
-    pub async fn refuse(self, reason: &str, reported_q: JointVec, planner: &mut Planner) {
-        self.end_unstarted(Outcome::Failed(reason.to_string()), reported_q, planner)
+    pub async fn refuse(self, reason: &str, measured: Measurement, planner: &mut Planner) {
+        self.end_unstarted(Outcome::Failed(reason.to_string()), measured, planner)
             .await;
     }
 
     /// Complete unstarted as cancelled by the stop service, with the stop's
-    /// `message`, reporting `reported_q`. The busy flag is the caller's
+    /// `message`, reporting `measured`. The busy flag is the caller's
     /// concern.
-    pub async fn stop(self, message: &str, reported_q: JointVec, planner: &mut Planner) {
-        self.end_unstarted(Outcome::Stopped(message.to_string()), reported_q, planner)
+    pub async fn stop(self, message: &str, measured: Measurement, planner: &mut Planner) {
+        self.end_unstarted(Outcome::Stopped(message.to_string()), measured, planner)
             .await;
     }
 
-    async fn end_unstarted(self, outcome: Outcome, reported_q: JointVec, planner: &mut Planner) {
+    async fn end_unstarted(self, outcome: Outcome, measured: Measurement, planner: &mut Planner) {
         match self {
             Goal::Joint { reply, .. } => {
-                reply
-                    .finish(planner.side.label(), outcome, reported_q, 0.0)
-                    .await;
+                reply.finish(planner, outcome, measured, 0.0).await;
             }
             Goal::Cartesian { ctx, .. } => {
                 let cancelled = outcome.is_cancelled();
                 let (success, message) =
                     outcome.report(|| unreachable!("an unstarted goal never completes"));
+                let (reported_q, message) = planner.reported_joints(measured, message);
                 planner
                     .finish_cartesian(&ctx, reported_q, success, &message, 0.0, cancelled)
                     .await;
@@ -392,6 +429,23 @@ impl Planner {
         self.setpoint
     }
 
+    /// The joints a move_arm or move_arm_joints result reports, and the
+    /// result's `message`:
+    /// - the measured joints, with `message` as it is;
+    /// - when the follower stopped reporting, the held setpoint, which is
+    ///   the joints commanded last, with [`COMMANDED_JOINTS_NOTE`] added;
+    /// - before the arm's first measurement, the held setpoint, with
+    ///   `message` as it is: only a refusal ends then, and it says why.
+    fn reported_joints(&self, measured: Measurement, message: String) -> (JointVec, String) {
+        match measured {
+            Ok(q) => (q, message),
+            Err(Unmeasured::Stale) => {
+                (self.setpoint, format!("{message}; {COMMANDED_JOINTS_NOTE}"))
+            }
+            Err(Unmeasured::NotYet) => (self.setpoint, message),
+        }
+    }
+
     /// World-frame end-effector pose at `q`; the planner owns this arm's chain.
     pub fn ee_pose_world(&mut self, q: &JointVec) -> Isometry3<f64> {
         let ee_base = self.model.at(q).ee_pose();
@@ -435,7 +489,7 @@ impl Planner {
             if matches!(mode, Mode::Follow) {
                 mode = self.start_goal(goal, busy.clone(), now).await;
             } else {
-                goal.refuse("another move is in flight", measured_q, self)
+                goal.refuse("another move is in flight", Ok(measured_q), self)
                     .await;
             }
         }
@@ -465,39 +519,45 @@ impl Planner {
 
     /// Fail the active move and answer its caller: for a follower gone
     /// stale, where the move can neither progress nor be verified. The result
-    /// reports `measured_q`, the follower's last (frozen) measurement. Ambient
-    /// Follow mode is untouched; the busy slot releases with the mode.
-    pub async fn abort_active(&mut self, reason: &str, measured_q: JointVec, now: Instant) {
-        self.end_active(Outcome::Failed(reason.to_string()), measured_q, now)
+    /// reports `measured`, which for a stale follower is
+    /// [`Unmeasured::Stale`]. Ambient Follow mode is untouched; the busy slot
+    /// releases with the mode.
+    pub async fn abort_active(&mut self, reason: &str, measured: Measurement, now: Instant) {
+        self.end_active(Outcome::Failed(reason.to_string()), measured, now)
             .await;
     }
 
     /// End the active move for the stop service: its goal completes as
-    /// cancelled with `message`, the arm holds the setpoint it was last
-    /// governed to, as after a cancel, and the busy slot releases with the
-    /// mode. Whether a move was in flight.
-    pub async fn stop_active(&mut self, message: &str, measured_q: JointVec, now: Instant) -> bool {
-        self.end_active(Outcome::Stopped(message.to_string()), measured_q, now)
+    /// cancelled with `message`, reporting `measured`, the joints measured
+    /// when the stop came. The arm holds the setpoint it was last governed
+    /// to, as after a cancel, and the busy slot releases with the mode.
+    /// Whether a move was in flight.
+    pub async fn stop_active(
+        &mut self,
+        message: &str,
+        measured: Measurement,
+        now: Instant,
+    ) -> bool {
+        self.end_active(Outcome::Stopped(message.to_string()), measured, now)
             .await
     }
 
-    /// End the active move with `outcome`, reporting `measured_q`; ambient
+    /// End the active move with `outcome`, reporting `measured`; ambient
     /// Follow mode is untouched. Whether a move was in flight.
-    async fn end_active(&mut self, outcome: Outcome, measured_q: JointVec, now: Instant) -> bool {
+    async fn end_active(&mut self, outcome: Outcome, measured: Measurement, now: Instant) -> bool {
         match std::mem::replace(&mut self.mode, Mode::Follow) {
             Mode::Follow => false,
             Mode::JointMove(JointMove { traj, reply, _busy }) => {
                 let elapsed = now.duration_since(traj.motion_start).as_secs_f64();
-                reply
-                    .finish(self.side.label(), outcome, measured_q, elapsed)
-                    .await;
+                reply.finish(self, outcome, measured, elapsed).await;
                 true
             }
             Mode::CartesianMove(m) => {
                 let elapsed = now.duration_since(m.path.motion_start()).as_secs_f64();
                 let cancelled = outcome.is_cancelled();
                 let (success, message) = outcome.report(|| m.path.completion_message().to_string());
-                self.finish_cartesian(&m.ctx, measured_q, success, &message, elapsed, cancelled)
+                let (reported_q, message) = self.reported_joints(measured, message);
+                self.finish_cartesian(&m.ctx, reported_q, success, &message, elapsed, cancelled)
                     .await;
                 true
             }
@@ -612,9 +672,7 @@ impl Planner {
         } else {
             Outcome::Complete
         };
-        reply
-            .finish(self.side.label(), outcome, measured_q, elapsed)
-            .await;
+        reply.finish(self, outcome, Ok(measured_q), elapsed).await;
         // A cancel holds where the arm already is; a completion holds the last
         // sample.
         Advance::ends_move(if cancelled { self.setpoint } else { q_des })
@@ -917,17 +975,19 @@ impl Planner {
         })
     }
 
-    /// Complete a Cartesian goal, reporting the measured world pose at exit.
+    /// Complete a Cartesian goal, reporting the world pose of `reported_q`:
+    /// the joints measured at exit, or those [`Planner::reported_joints`]
+    /// gives without a fresh measurement.
     async fn finish_cartesian(
         &mut self,
         ctx: &move_arm::GoalContext,
-        measured_q: JointVec,
+        reported_q: JointVec,
         success: bool,
         message: &str,
         elapsed: f64,
         cancelled: bool,
     ) {
-        let (pos, quat) = world_pose_arrays(&self.ee_pose_world(&measured_q));
+        let (pos, quat) = world_pose_arrays(&self.ee_pose_world(&reported_q));
         let result = if cancelled {
             ctx.complete_cancelled(false, message.into(), pos, quat, elapsed)
                 .await
@@ -1053,6 +1113,7 @@ mod tests {
         );
     }
 
+    /// The abort of a follower gone stale fails the move and frees the slot.
     #[tokio::test]
     async fn aborting_the_active_move_fails_it_and_frees_the_busy_slot() {
         let mut planner = test_planner([0.0; ARM_DOF]);
@@ -1060,14 +1121,7 @@ mod tests {
         let (goal_tx, mut goals) = mpsc::channel(1);
         let busy = Arc::new(AtomicBool::new(true)); // claimed at accept
         goal_tx
-            .send(Goal::Joint {
-                target: [0.5; ARM_DOF],
-                duration_s: 1.0,
-                reply: JointReply::Ready(ReadyReply {
-                    done_tx,
-                    cancelled: Arc::new(AtomicBool::new(false)),
-                }),
-            })
+            .send(Goal::posture_share([0.5; ARM_DOF], done_tx))
             .await
             .expect("queue the goal");
         let now = Instant::now();
@@ -1080,29 +1134,25 @@ mod tests {
         );
 
         planner
-            .abort_active("the follower stopped reporting", [0.1; ARM_DOF], now)
+            .abort_active(
+                "the follower stopped reporting",
+                Err(Unmeasured::Stale),
+                now,
+            )
             .await;
         let outcome = done_rx.recv().await.expect("aborted move must report");
         assert!(!outcome.success);
-        assert!(outcome.message.contains("stopped reporting"));
+        assert_eq!(outcome.message, "left: the follower stopped reporting");
         assert!(!busy.load(Ordering::Acquire), "abort releases the slot");
         // With nothing active the abort is a no-op.
-        planner.abort_active("again", [0.1; ARM_DOF], now).await;
+        planner
+            .abort_active("again", Err(Unmeasured::Stale), now)
+            .await;
     }
 
-    /// A ready-share joint goal to `target` over one second, reporting on
-    /// `done_tx`.
-    fn ready_goal(target: JointVec, done_tx: mpsc::Sender<ReadyOutcome>) -> Goal {
-        Goal::Joint {
-            target,
-            duration_s: 1.0,
-            reply: JointReply::Ready(ReadyReply {
-                done_tx,
-                cancelled: Arc::new(AtomicBool::new(false)),
-            }),
-        }
-    }
-
+    /// A stop ends the move as cancelled with its message. The arm holds
+    /// the setpoint it was last governed to, not the pose measured when the
+    /// stop came.
     #[tokio::test]
     async fn stopping_the_active_move_ends_it_cancelled_with_the_message_and_holds() {
         let held = [0.0; ARM_DOF];
@@ -1111,7 +1161,7 @@ mod tests {
         let (goal_tx, mut goals) = mpsc::channel(1);
         let busy = Arc::new(AtomicBool::new(true));
         goal_tx
-            .send(ready_goal([0.5; ARM_DOF], done_tx))
+            .send(Goal::posture_share([0.5; ARM_DOF], done_tx))
             .await
             .expect("queue the goal");
         let now = Instant::now();
@@ -1121,8 +1171,9 @@ mod tests {
             "move in flight holds the slot"
         );
 
+        let measured_at_stop = [0.1; ARM_DOF];
         let stopped = planner
-            .stop_active("stopped: operator", [0.1; ARM_DOF], now)
+            .stop_active("stopped: operator", Ok(measured_at_stop), now)
             .await;
         assert!(stopped, "a move was in flight");
         let outcome = done_rx.recv().await.expect("the stopped move reports");
@@ -1138,7 +1189,7 @@ mod tests {
         // With nothing active a stop ends nothing.
         assert!(
             !planner
-                .stop_active("stopped: again", [0.1; ARM_DOF], now)
+                .stop_active("stopped: again", Ok([0.1; ARM_DOF]), now)
                 .await
         );
 
@@ -1146,7 +1197,7 @@ mod tests {
         let (done_tx, mut done_rx) = mpsc::channel(1);
         busy.store(true, Ordering::Release);
         goal_tx
-            .send(ready_goal([0.2; ARM_DOF], done_tx))
+            .send(Goal::posture_share([0.2; ARM_DOF], done_tx))
             .await
             .expect("queue the goal");
         planner.tick(held, None, &mut goals, &busy, now).await;
@@ -1157,16 +1208,201 @@ mod tests {
         );
     }
 
+    /// A posture share whose arm never follows: the governor holds every
+    /// step, or the arm stands against an obstacle the backbone cannot see.
+    /// The move ends on its clock with success.
+    #[tokio::test]
+    async fn a_joint_move_the_governor_holds_still_completes_with_success() {
+        let held = [0.0; ARM_DOF];
+        let target = [0.5; ARM_DOF];
+        let mut planner = test_planner(held);
+        let (goal_tx, mut goals) = mpsc::channel(1);
+        let busy = Arc::new(AtomicBool::new(true));
+
+        // The governor holds every step: no candidate is committed.
+        let (done_tx, mut done_rx) = mpsc::channel(1);
+        goal_tx
+            .send(Goal::posture_share(target, done_tx))
+            .await
+            .expect("queue the goal");
+        let now = Instant::now();
+        planner.tick(held, None, &mut goals, &busy, now).await;
+        assert!(busy.load(Ordering::Acquire), "the move is in flight");
+        planner
+            .tick(
+                held,
+                None,
+                &mut goals,
+                &busy,
+                now + Duration::from_secs(3600),
+            )
+            .await;
+        let outcome = done_rx.try_recv().expect("the move ends on its clock");
+        assert!(outcome.success, "{}", outcome.message);
+        assert_eq!(outcome.message, "left: trajectory complete");
+        assert!(!outcome.stopped);
+        assert_eq!(planner.setpoint(), held, "the arm never left its pose");
+        assert!(!busy.load(Ordering::Acquire), "the end releases the slot");
+
+        // The governor lets every step through, but the arm stands still.
+        let (done_tx, mut done_rx) = mpsc::channel(1);
+        busy.store(true, Ordering::Release);
+        goal_tx
+            .send(Goal::posture_share(target, done_tx))
+            .await
+            .expect("queue the goal");
+        let now = Instant::now();
+        let tick = planner.tick(held, None, &mut goals, &busy, now).await;
+        planner.commit(tick.candidate);
+        let Mode::JointMove(JointMove { traj, .. }) = &planner.mode else {
+            panic!("the goal starts a joint move");
+        };
+        let motion_start = traj.motion_start;
+        // Half of the one-second move, on the move's own clock.
+        for step in 1..=5 {
+            let tick = planner
+                .tick(
+                    held,
+                    None,
+                    &mut goals,
+                    &busy,
+                    motion_start + Duration::from_millis(100 * step),
+                )
+                .await;
+            planner.commit(tick.candidate);
+        }
+        assert!(done_rx.try_recv().is_err(), "the move is in flight");
+        assert_ne!(planner.setpoint(), held, "the commanded arm moves");
+        planner
+            .tick(
+                held,
+                None,
+                &mut goals,
+                &busy,
+                now + Duration::from_secs(3600),
+            )
+            .await;
+        let outcome = done_rx.try_recv().expect("the move ends on its clock");
+        assert!(outcome.success, "{}", outcome.message);
+        assert_eq!(outcome.message, "left: trajectory complete");
+        assert!(!busy.load(Ordering::Acquire), "the end releases the slot");
+    }
+
+    /// The rest posture puts each grasp point lower and closer to the
+    /// column than the working posture does. This is true on both
+    /// generations and both sides. On openarm_v2, the grasp points are at
+    /// the numbers that the description's joints give.
+    #[test]
+    fn the_home_grasp_points_sit_lower_and_closer_in_than_ready() {
+        use openarm_description::{HardwareVersion, home, ready};
+        let horizontal = |pose: &Isometry3<f64>| pose.translation.x.hypot(pose.translation.y);
+        for version in [HardwareVersion::V1, HardwareVersion::V2] {
+            for side in [Side::Left, Side::Right] {
+                let model = crate::arm_model(version, side.model()).expect("build the arm");
+                let mut planner = Planner::new(side, model, test_cfg());
+                let r = planner.ee_pose_world(&ready(side.model()));
+                let h = planner.ee_pose_world(&home(side.model()));
+                let label = format!("{version:?} {}", side.label());
+                assert!(
+                    h.translation.z < r.translation.z,
+                    "{label}: home z {} is not below ready z {}",
+                    h.translation.z,
+                    r.translation.z
+                );
+                assert!(
+                    horizontal(&h) < horizontal(&r),
+                    "{label}: home is {} m out, ready {} m",
+                    horizontal(&h),
+                    horizontal(&r)
+                );
+            }
+        }
+
+        // openarm_v2: the right arm's grasp point of each posture, as
+        // [x, y, z] in metres and [x, y, z, w].
+        let right_ready = (
+            [0.3363, -0.1951, 0.2836],
+            [-0.2897, 0.8363, -0.0870, 0.4573],
+        );
+        let right_home = ([0.0174, -0.1535, 0.1024], [0.0, 0.9997, 0.0, 0.0250]);
+        // The left arm's grasp point is the mirror of the right arm's across
+        // the x-z plane. y changes sign, and so do x and z of the quaternion.
+        let mirror =
+            |([x, y, z], [qx, qy, qz, qw]): ([f64; 3], [f64; 4])| ([x, -y, z], [-qx, qy, -qz, qw]);
+        let at = |pose: &Isometry3<f64>, (position, orientation): ([f64; 3], [f64; 4])| {
+            let [x, y, z, w] = orientation;
+            let expected =
+                UnitQuaternion::from_quaternion(srs_model::nalgebra::Quaternion::new(w, x, y, z));
+            let off_m = (pose.translation.vector - Vector3::from(position)).norm();
+            let off_rad = pose.rotation.angle_to(&expected);
+            off_m < 1e-3 && off_rad < 5e-3
+        };
+        for side in [Side::Left, Side::Right] {
+            let (ready_grasp, home_grasp) = match side {
+                Side::Right => (right_ready, right_home),
+                Side::Left => (mirror(right_ready), mirror(right_home)),
+            };
+            let model = crate::arm_model(HardwareVersion::V2, side.model()).expect("build the arm");
+            let mut planner = Planner::new(side, model, test_cfg());
+            let r = planner.ee_pose_world(&ready(side.model()));
+            let h = planner.ee_pose_world(&home(side.model()));
+            assert!(
+                at(&r, ready_grasp),
+                "v2 {} ready grasp point at {:?}",
+                side.label(),
+                world_pose_arrays(&r)
+            );
+            assert!(
+                at(&h, home_grasp),
+                "v2 {} home grasp point at {:?}",
+                side.label(),
+                world_pose_arrays(&h)
+            );
+        }
+    }
+
     #[tokio::test]
     async fn a_queued_goal_is_stopped_unstarted_with_the_message() {
         let mut planner = test_planner([0.0; ARM_DOF]);
         let (done_tx, mut done_rx) = mpsc::channel(1);
-        ready_goal([0.5; ARM_DOF], done_tx)
-            .stop("stopped: operator", [0.1; ARM_DOF], &mut planner)
+        Goal::posture_share([0.5; ARM_DOF], done_tx)
+            .stop("stopped: operator", Ok([0.1; ARM_DOF]), &mut planner)
             .await;
         let outcome = done_rx.recv().await.expect("the stopped goal reports");
         assert!(!outcome.success && outcome.stopped);
         assert_eq!(outcome.message, "left: stopped: operator");
+    }
+
+    /// A move_arm or move_arm_joints result reports the measured joints as
+    /// they are. When the follower stopped reporting, it reports the held
+    /// setpoint, which is the joints commanded last, and its message says
+    /// so. Before the first measurement it reports the held setpoint, and
+    /// the refusal's message stays as it is.
+    #[test]
+    fn an_arm_result_without_a_fresh_measurement_reports_the_commanded_joints() {
+        let held = [0.2; ARM_DOF];
+        let planner = test_planner(held);
+        let measured = [0.1; ARM_DOF];
+        assert_eq!(
+            planner.reported_joints(Ok(measured), "trajectory complete".to_string()),
+            (measured, "trajectory complete".to_string())
+        );
+        assert_eq!(
+            planner.reported_joints(
+                Err(Unmeasured::Stale),
+                "the follower stopped reporting".to_string()
+            ),
+            (
+                held,
+                "the follower stopped reporting; the result comes from the joints commanded last"
+                    .to_string()
+            )
+        );
+        let refusal = "the follower has not reported its first state yet";
+        assert_eq!(
+            planner.reported_joints(Err(Unmeasured::NotYet), refusal.to_string()),
+            (held, refusal.to_string())
+        );
     }
 
     #[tokio::test]
@@ -1201,7 +1437,7 @@ mod tests {
         let (goal_tx, mut goals) = mpsc::channel(1);
         let busy = Arc::new(AtomicBool::new(true));
         goal_tx
-            .send(ready_goal(POSE_TEST_Q, done_tx))
+            .send(Goal::posture_share(POSE_TEST_Q, done_tx))
             .await
             .expect("queue the goal");
         planner

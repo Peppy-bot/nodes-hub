@@ -9,7 +9,18 @@ import time
 from types import SimpleNamespace
 
 import pytest
-from conftest import WIDE_LIMITS, WIDE_REACH, FakeKinematics, gripper_step, make_config
+from conftest import (
+    MEASURED,
+    WIDE_LIMITS,
+    WIDE_REACH,
+    FakeKinematics,
+    gripper_step,
+    make_config,
+)
+from so101_description import limits as limits_mod
+from so101_description.kinematics import Kinematics
+from so101_description.model import KINEMATICS_URDF_PATH
+from so101_description.postures import READY_POSITIONS_RAD
 
 from so101_backbone.actions import (
     MAX_REQUESTED_DURATION_S,
@@ -20,6 +31,9 @@ from so101_backbone.actions import (
     _orientation_note,
 )
 from so101_backbone.coordinator import GRIPPER_STILL_WINDOW_S, Coordinator
+
+STALE_NO_POSE = "follower state stale; no measured pose to report"
+STALE_COMMANDED = "follower state stale; reporting the commanded position"
 
 
 class FakeGoalContext:
@@ -43,10 +57,10 @@ class FakeGoalContext:
         self.cancelled = args
 
 
-def make_layer(kinematics=None, **config_overrides):
+def make_layer(kinematics=None, limits=WIDE_LIMITS, **config_overrides):
     config = make_config(**config_overrides)
-    coordinator = Coordinator(config, kinematics or FakeKinematics(), WIDE_LIMITS, WIDE_REACH)
-    return coordinator, ActionLayer(coordinator, config, WIDE_LIMITS)
+    coordinator = Coordinator(config, kinematics or FakeKinematics(), limits, WIDE_REACH)
+    return coordinator, ActionLayer(coordinator, config, limits)
 
 
 async def installed_plan(coordinator):
@@ -67,6 +81,16 @@ def run_gripper_plan_until_still(coordinator, stopped_at):
     gripper_step(coordinator, stopped_at, 0.0)
     gripper_step(coordinator, stopped_at, 0.5)
     gripper_step(coordinator, stopped_at, 0.5 + GRIPPER_STILL_WINDOW_S)
+
+
+def run_arm_plan_to_its_end(coordinator, plan):
+    """Run the control ticks that end an admitted arm plan, at explicit
+    instants. The first sample is sent at 0 and the last sample at the end
+    of the profile, and the follower receives the two. The measured joints
+    do not change."""
+    coordinator.arm_published(True, coordinator.arm_tick(0.0))
+    coordinator.arm_published(True, coordinator.arm_tick(plan.profile.duration_s))
+    assert plan.done.is_set()
 
 
 async def test_gripper_goal_times_out_instead_of_holding_the_slot():
@@ -228,6 +252,20 @@ async def test_arm_and_gripper_claims_are_independent():
         layer._admit_gripper_move(0.5, 0.0)
 
 
+def test_a_posture_does_not_claim_or_drive_the_gripper(follower_never_stale):
+    coordinator, layer = make_layer()
+    coordinator.measured_joints.set(MEASURED)
+    coordinator.measured_gripper.set(0.3)
+    plan = layer._admit_posture(READY_POSITIONS_RAD, 0.0)
+    # From its first sample to its last, the posture sends the gripper
+    # nothing. The gripper stays free for its own goals.
+    for now in (0.0, plan.profile.duration_s):
+        coordinator.arm_published(True, coordinator.arm_tick(now))
+        assert coordinator.gripper_tick(now) is None
+    assert plan.done.is_set()
+    assert coordinator.try_claim_gripper() is True
+
+
 async def test_failed_plan_completes_as_failure():
     coordinator, layer = make_layer()
     coordinator.measured_joints.set((0.0,) * 5)
@@ -251,6 +289,120 @@ async def test_none_plan_completes_as_failure_and_leaves_the_server_alive():
     assert len(positions) == 5
 
 
+async def test_an_arm_move_reports_the_measured_joints(follower_never_stale):
+    coordinator, layer = make_layer()
+    coordinator.measured_joints.set((0.0,) * 5)
+    plan = layer._admit_arm_move((0.5,) * 5, 0.0)
+    # The plan ends. The follower measures the arm at its start position.
+    run_arm_plan_to_its_end(coordinator, plan)
+    ctx = FakeGoalContext()
+    await layer.drive_arm(ctx, plan)
+    success, message, positions, _action_time = ctx.completed
+    assert (success, message) == (True, "")
+    assert positions == [0.0] * 5
+
+
+async def test_a_stale_follower_reports_the_commanded_joints_with_a_note(follower_never_stale):
+    coordinator, layer = make_layer()
+    coordinator.measured_joints.set((0.0,) * 5)
+    plan = layer._admit_arm_move((0.5,) * 5, 0.0)
+    run_arm_plan_to_its_end(coordinator, plan)
+    # The follower sends no more state after it receives the last sample.
+    # The last command of a finished plan is its end sample.
+    coordinator.measured_joints.clear()
+    ctx = FakeGoalContext()
+    await layer.drive_arm(ctx, plan)
+    success, message, positions, _action_time = ctx.completed
+    assert (success, message) == (True, STALE_COMMANDED)
+    assert positions == [0.5] * 5
+
+
+async def test_a_posture_result_reports_the_grasp_point_of_the_measured_joints(
+    follower_never_stale,
+):
+    kinematics = FakeKinematics()
+    coordinator, layer = make_layer(kinematics)
+    coordinator.measured_joints.set(MEASURED)
+    plan = layer._admit_posture(READY_POSITIONS_RAD, 0.0)
+    # The plan ends. The follower measures the arm at its start position.
+    run_arm_plan_to_its_end(coordinator, plan)
+    ctx = FakeGoalContext()
+    await layer.drive_posture(ctx, plan, kinematics)
+    position, orientation = kinematics.forward_kinematics(MEASURED)
+    assert position != kinematics.forward_kinematics(READY_POSITIONS_RAD)[0]
+    assert ctx.completed == (True, "", ["arm"], list(position), list(orientation))
+    assert coordinator.try_claim_arm()
+
+
+async def test_a_posture_with_stale_follower_state_reports_empty_arrays(follower_never_stale):
+    kinematics = FakeKinematics()
+    coordinator, layer = make_layer(kinematics)
+    coordinator.measured_joints.set(MEASURED)
+    plan = layer._admit_posture(READY_POSITIONS_RAD, 0.0)
+    run_arm_plan_to_its_end(coordinator, plan)
+    # The follower sends no more state after it receives the last sample.
+    # No measurement is fresh, thus the result gives no pose and gives the
+    # reason.
+    coordinator.measured_joints.clear()
+    ctx = FakeGoalContext()
+    await layer.drive_posture(ctx, plan, kinematics)
+    assert ctx.completed == (True, STALE_NO_POSE, [], [], [])
+
+    walked_back = FakeGoalContext()
+    await layer.drive_posture(walked_back, None, kinematics)
+    assert walked_back.completed == (
+        False, f"goal admission was walked back; {STALE_NO_POSE}", [], [], [],
+    )
+
+
+async def test_a_walked_back_posture_reports_where_the_arm_stands(follower_never_stale):
+    # The goal fails, and its result still gives the measured pose.
+    kinematics = FakeKinematics()
+    coordinator, layer = make_layer(kinematics)
+    coordinator.measured_joints.set(MEASURED)
+    ctx = FakeGoalContext()
+    await layer.drive_posture(ctx, None, kinematics)
+    position, orientation = kinematics.forward_kinematics(MEASURED)
+    assert ctx.completed == (
+        False, "goal admission was walked back", ["arm"], list(position), list(orientation),
+    )
+
+
+def stop_every_move(layer, _ctx):
+    assert layer.stop_moves("the operator asked") == ["arm"]
+
+
+def cancel_the_goal(_layer, ctx):
+    ctx.request_cancel()
+
+
+@pytest.mark.parametrize(
+    ("cut_the_move", "message"),
+    [(stop_every_move, "stopped: the operator asked"), (cancel_the_goal, "cancelled")],
+    ids=["stop", "cancel"],
+)
+async def test_a_stopped_posture_reports_the_measured_grasp_point(
+    cut_the_move, message, follower_never_stale
+):
+    kinematics = FakeKinematics()
+    coordinator, layer = make_layer(kinematics)
+    coordinator.measured_joints.set(MEASURED)
+    plan = layer._admit_posture(READY_POSITIONS_RAD, 0.0)
+    coordinator.arm_published(True, coordinator.arm_tick(0.0))
+    # The move stops while the arm moves to the posture. The follower
+    # measures the arm at that position.
+    stopped_at = (0.0, 0.05, 0.1, 0.15, 0.2)
+    coordinator.measured_joints.set(stopped_at)
+    ctx = FakeGoalContext()
+    cut_the_move(layer, ctx)
+    await layer.drive_posture(ctx, plan, kinematics)
+    position, orientation = kinematics.forward_kinematics(stopped_at)
+    assert ctx.completed is None
+    assert ctx.cancelled == (False, message, ["arm"], list(position), list(orientation))
+    assert plan.aborted
+    assert coordinator.try_claim_arm()
+
+
 def test_admission_rejects_before_claiming():
     coordinator, layer = make_layer()
     coordinator.measured_joints.set((0.0,) * 5)
@@ -258,6 +410,27 @@ def test_admission_rejects_before_claiming():
         layer._admit_arm_move((9.0,) * 5, 0.0)
     # A rejected goal never left the slot held.
     assert coordinator.try_claim_arm()
+
+
+async def test_an_arm_goal_below_the_base_plane_is_admitted(follower_never_stale):
+    # The SO-101 checks no collision. This target is inside the joint limits.
+    # Its grasp point is 0.2 m below the plane that the base stands on, thus
+    # through the surface below the robot. The backbone accepts the move and
+    # runs it to its end.
+    kinematics = Kinematics(KINEMATICS_URDF_PATH)
+    limits = limits_mod.from_urdf(KINEMATICS_URDF_PATH)
+    below_the_base = (0.0, 1.5, 0.0, 0.0, 0.0)
+    assert limits.contains(below_the_base)
+    position, _orientation = kinematics.forward_kinematics(below_the_base)
+    assert position[2] < -0.15
+    coordinator, layer = make_layer(kinematics, limits=limits)
+    coordinator.measured_joints.set(READY_POSITIONS_RAD)
+    plan = layer._admit_arm_move(below_the_base, 0.0)
+    assert plan.profile.end == below_the_base
+    run_arm_plan_to_its_end(coordinator, plan)
+    ctx = FakeGoalContext()
+    await layer.drive_arm(ctx, plan)
+    assert ctx.completed[0] is True
 
 
 def test_pose_admission_rejects_busy_before_solving():
@@ -328,6 +501,47 @@ async def test_pose_goal_solves_in_drive_and_streams_a_plan():
     assert success is True
     assert ("solve",) == tuple(c[0] for c in kinematics.solve_calls)
     assert coordinator.try_claim_arm()
+
+
+async def pose_move_at_the_end_of_its_plan(coordinator, layer, kinematics):
+    """Run the plan of a pose goal to its end, at explicit instants. The goal
+    is the grasp point of kinematics.solution. The follower measures the arm
+    at its start position, (0.0,) * 5. Returns the goal context and the drive
+    task. The drive task completes the goal when it runs next."""
+    coordinator.measured_joints.set((0.0,) * 5)
+    goal_position, _orientation = kinematics.forward_kinematics(kinematics.solution)
+    goal = layer._admit_pose_move(goal_position, (0.0, 0.0, 0.0, 1.0), 0.0, 0.0, 0.0)
+    ctx = FakeGoalContext()
+    task = asyncio.create_task(layer.drive_pose(ctx, goal, kinematics, kinematics))
+    plan = await installed_plan(coordinator)
+    assert plan.profile.end == kinematics.solution
+    run_arm_plan_to_its_end(coordinator, plan)
+    return ctx, task
+
+
+async def test_a_pose_move_reports_the_grasp_point_of_the_measured_joints(follower_never_stale):
+    kinematics = FakeKinematics()
+    coordinator, layer = make_layer(kinematics)
+    ctx, task = await pose_move_at_the_end_of_its_plan(coordinator, layer, kinematics)
+    await task
+    success, message, position, _orientation, _t = ctx.completed
+    assert (success, message) == (True, "")
+    # The result gives the position of the arm, not the goal.
+    assert position == list(kinematics.forward_kinematics((0.0,) * 5)[0])
+    assert position != list(kinematics.forward_kinematics(kinematics.solution)[0])
+
+
+async def test_a_stale_follower_reports_the_commanded_pose_with_a_note(follower_never_stale):
+    kinematics = FakeKinematics()
+    coordinator, layer = make_layer(kinematics)
+    ctx, task = await pose_move_at_the_end_of_its_plan(coordinator, layer, kinematics)
+    # The follower sends no more state after it receives the last sample.
+    # The last command of a finished plan is its end sample.
+    coordinator.measured_joints.clear()
+    await task
+    success, message, position, _orientation, _t = ctx.completed
+    assert (success, message) == (True, STALE_COMMANDED)
+    assert position == list(kinematics.forward_kinematics(kinematics.solution)[0])
 
 
 async def test_pose_move_duration_floors_at_the_linear_ee_cap():

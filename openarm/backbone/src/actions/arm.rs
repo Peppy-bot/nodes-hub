@@ -23,7 +23,7 @@ use crate::coordinator::CoordinatorRequest;
 use crate::planner::{ARM_BUSY, Goal, JointReply};
 use crate::types::{ARM_DOF, JointVec, PlanTolerance, Side, pose_from_wire};
 
-use crate::actions::{ask_coordinator, claim};
+use crate::actions::{blocking_ask_coordinator, claim};
 
 fn target_in_limits(q: &JointVec, limits: &[Limit; ARM_DOF]) -> bool {
     q.iter().zip(limits).all(|(&v, l)| v >= l.lo && v <= l.hi)
@@ -204,7 +204,7 @@ pub async fn run_check_arm_move(
                 Err(reason) => return Ok(check_arm_move::Response::new(false, reason, 0.0)),
             };
             let (reply, answer) = oneshot::channel();
-            let asked = ask_coordinator(
+            let asked = blocking_ask_coordinator(
                 &requests,
                 CoordinatorRequest::CheckArmMove { request, reply },
                 answer,

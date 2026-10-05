@@ -12,6 +12,7 @@ from conftest import (
     CLOSE,
     FAR,
     FAR_SHORT_BY_MORE_THAN,
+    MEASURED,
     NEAR,
     NOT_CHECKED,
     assert_rectangle_inside_reach,
@@ -19,6 +20,7 @@ from conftest import (
 from peppygen.exposed_actions.limb_motion import move_arm as move_arm_prod
 from peppygen.exposed_actions.limb_motion import move_arm_joints as move_arm_joints_prod
 from peppygen.exposed_actions.limb_motion import move_gripper as move_gripper_prod
+from peppygen.exposed_actions.postures import move_to_home as move_to_home_prod
 from peppygen.exposed_actions.postures import move_to_ready as move_to_ready_prod
 from peppygen.fixtures import harness
 from peppygen.fixtures.exposed_actions.limb_motion import move_arm as move_arm_fx
@@ -28,6 +30,7 @@ from peppygen.fixtures.exposed_actions.limb_motion import (
 from peppygen.fixtures.exposed_actions.limb_motion import (
     move_gripper as move_gripper_fx,
 )
+from peppygen.fixtures.exposed_actions.postures import move_to_home as move_to_home_fx
 from peppygen.fixtures.exposed_actions.postures import move_to_ready as move_to_ready_fx
 from peppygen.exposed_services.limb_motion import check_arm_move as check_arm_move_prod
 from peppygen.exposed_services.limb_motion import stop as stop_prod
@@ -54,11 +57,13 @@ from peppygen.paired_topics.gripper import gripper_states as gripper_states_topi
 from peppygen.paired_topics.leader_arm import joint_setpoints as leader_setpoints_topic
 from peppygen.paired_topics.leader_pose import pose_setpoints as leader_pose_topic
 from peppygen.parameters import Parameters
+from so101_description import postures
+from so101_description.kinematics import Kinematics
+from so101_description.model import KINEMATICS_URDF_PATH
 from workspace_core_py import REACH_TOLERANCE
 
 from so101_backbone.__main__ import setup
 
-MEASURED = [0.0, 0.1, 0.2, 0.3, 0.4]
 TIMEOUT_S = 10.0
 # The bound of an answer that measures reach: the first starts the worker
 # process and measures a whole surface. A hang guard, not a measure of speed.
@@ -381,6 +386,44 @@ async def test_posture_and_gripper_actions():
             feeder.cancel()
 
 
+async def test_a_posture_result_names_the_arm_and_its_measured_grasp_point(
+    follower_never_stale,
+):
+    # One scenario for three facts of the result of each posture move:
+    # - the result names the arm;
+    # - it gives the grasp point of the measured joints;
+    # - it can report success when the arm did not arrive.
+    # The mocked follower always measures MEASURED, so the arm never gets to
+    # a posture. follower_never_stale keeps a pause of the event loop from
+    # making the measured joints stale.
+    kinematics = Kinematics(KINEMATICS_URDF_PATH)
+    measured_position, measured_orientation = kinematics.forward_kinematics(MEASURED)
+    async with harness.start(setup, parameters=make_parameters()) as h:
+        feeder = await feeding_measured(h)
+        try:
+            for production, fixture, posture in (
+                (move_to_ready_prod, move_to_ready_fx, postures.READY_POSITIONS_RAD),
+                (move_to_home_prod, move_to_home_fx, postures.HOME_POSITIONS_RAD),
+            ):
+                goal = await fixture.send_goal(
+                    h,
+                    production.GoalRequestData(duration_s=0.0),
+                    peppylib.QoSProfile.Reliable,
+                    TIMEOUT_S,
+                )
+                assert goal.accepted
+                result = await goal.get_result(TIMEOUT_S)
+                assert result.status == fixture.ResultStatus.COMPLETED
+                assert result.data.success
+                assert result.data.arm_names == ["arm"]
+                assert result.data.positions == pytest.approx(list(measured_position))
+                assert result.data.orientations == pytest.approx(list(measured_orientation))
+                posture_position, _orientation = kinematics.forward_kinematics(posture)
+                assert math.dist(result.data.positions, posture_position) > 0.1
+        finally:
+            feeder.cancel()
+
+
 async def test_nonzero_max_effort_is_accepted_and_ignored():
     # Contract semantics: 0 = no preference, >0 = a preference the
     # implementer may ignore; both the stream and the action run the
@@ -397,6 +440,32 @@ async def test_nonzero_max_effort_is_accepted_and_ignored():
                 TIMEOUT_S,
             )
             assert goal.accepted
+            result = await goal.get_result(TIMEOUT_S)
+            assert result.data.success
+        finally:
+            feeder.cancel()
+
+
+async def test_a_gripper_goals_max_effort_never_reaches_the_follower():
+    async with harness.start(setup, parameters=make_parameters()) as h:
+        feeder = await feeding_measured(h)
+        try:
+            goal = await move_gripper_fx.send_goal(
+                h,
+                move_gripper_prod.GoalRequestData(
+                    gripper_name="gripper", opening=0.5, max_effort=2.0
+                ),
+                peppylib.QoSProfile.Reliable,
+                TIMEOUT_S,
+            )
+            assert goal.accepted
+            # No leader sends gripper setpoints. Thus the first setpoint that
+            # the follower receives is a step of this goal to its opening.
+            setpoint = await asyncio.wait_for(
+                h.mocks.pairings.gripper.gripper_setpoints.next(), TIMEOUT_S
+            )
+            assert 0.0 < setpoint.opening <= 0.5
+            assert setpoint.max_effort == 0.0
             result = await goal.get_result(TIMEOUT_S)
             assert result.data.success
         finally:

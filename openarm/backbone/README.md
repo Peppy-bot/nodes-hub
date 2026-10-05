@@ -145,6 +145,10 @@ included, completes unsuccessfully at once. Completion of an arm move is
 graded on the commanded motion with a 2x-nominal timeout; results report the
 measured state and the caller judges how close it landed (the governor may
 have held it short, and that is not a failure of the move machinery).
+When the arm's follower stops reporting, the move fails with
+`the follower stopped reporting; the result comes from the joints commanded last`.
+Its result then reports the held setpoint, because the last measurement is
+stale.
 
 `move_gripper` ends on the measured gripper instead. The commanded opening
 ramps to the target under the same 2x-nominal timeout, then the move stays in
@@ -164,7 +168,47 @@ measured then and `action_time` runs to that moment.
 
 A gripper that stops short is a success on purpose: the move was neither
 refused, failed nor cancelled, and the caller judges the grasp from
-`final_opening`.
+`final_opening`. After the move, the backbone sends the gripper nothing
+until the next gripper move or a leader's gripper stream. Thus the gripper
+keeps the move's target opening and `max_effort` (relayed unchanged), and
+goes on squeezing what it holds.
+
+`move_to_ready` and `move_to_home` give each arm's planner a joint move to
+the posture. The goal completes when both moves end. `success` says that
+both moves ran their time out, not that the arms arrived. The governor can
+hold an arm short, and the backbone does not see an arm that stops against
+an object. Thus the message of a success is `the move to ready ran its time`
+or `the move to home ran its time`.
+
+Whatever the terminal, the result gives the pose of each arm:
+
+- `arm_names`: `left_arm` and `right_arm`, in the order of limb_state.
+- `positions`: 3 values per arm, in metres, in the order of `arm_names`.
+- `orientations`: 4 values per arm, `[x, y, z, w]`, in the same order.
+
+Each pose is the grasp point of the arm in the robot frame. The
+coordinator measures both arms when the posture goal completes, after the
+moves of both arms ended. limb_state gives the same pose for the same
+joints. After a cancel or a stop, the pose is where the arm stopped. A
+moving arm can then settle a little further, to the setpoint it holds.
+
+When an arm has no fresh measurement when the goal completes, the three
+arrays are empty. The message then ends with one of these reasons:
+
+- `; no arm poses: the robot has not measured every limb yet`: the goal
+  came during the seed wait, before each arm and each gripper reported its
+  first state. The seed wait judges no liveness, so no measurement is known
+  to be fresh, and neither arm has a pose.
+- `; no arm poses: <arm> stopped reporting its joints`: the follower of the
+  arm stopped reporting, so its last measurement is stale.
+- `; no arm poses: <refusal>`: the coordinator did not answer, for example
+  `the coordinator is not running`.
+
+A posture move sends no gripper command, so each gripper goes on as its
+last command drives it. On v2 with both grippers fully open, the jaws at
+Home sit closer to the torso than the validated stop distance (`d_stop_m`,
+5 mm). Thus the governor holds both arms short of Home: close the grippers
+first.
 
 ### Services of limb_motion
 

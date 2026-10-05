@@ -33,7 +33,7 @@ use tracing::{error, warn};
 use crate::arm_pair::ArmPair;
 use crate::camera_mounts::MeasuredGrasps;
 use crate::streams::{GripperState, warn_throttled};
-use crate::types::{JointVec, limb_names, world_pose_arrays};
+use crate::types::{JointVec, arm_pose_arrays, limb_names, world_pose_arrays};
 
 /// Pairing timestamp from this instance's bound clock, so consumers age
 /// samples on the same timeline they read. Errors until the clock delivers
@@ -188,8 +188,7 @@ impl Publisher<LimbStateBuild> {
     /// rule: joint vectors concatenated in arm order, poses at fixed 3- and
     /// 4-strides, the name tables labelling every index.
     pub async fn send(&self, s: &LimbStateSnapshot) -> Option<SystemTime> {
-        let (left_position, left_orientation) = world_pose_arrays(&s.poses.left);
-        let (right_position, right_orientation) = world_pose_arrays(&s.poses.right);
+        let (positions, orientations) = arm_pose_arrays(&s.poses);
         let names = limb_names();
         self.emit(move |timestamp| {
             (self.build)(
@@ -197,8 +196,8 @@ impl Publisher<LimbStateBuild> {
                 names.arm_names,
                 names.joints_per_arm,
                 [s.joints.left, s.joints.right].concat(),
-                [left_position, right_position].concat(),
-                [left_orientation, right_orientation].concat(),
+                positions,
+                orientations,
                 names.gripper_names,
                 vec![s.openings.left, s.openings.right],
             )

@@ -12,7 +12,7 @@ use peppygen::{NodeRunner, Result};
 use tokio::sync::{mpsc, oneshot};
 use tracing::error;
 
-use crate::actions::ask_coordinator;
+use crate::actions::blocking_ask_coordinator;
 use crate::coordinator::CoordinatorRequest;
 
 /// Expose `stop`: every request goes to the coordinator, which ends the
@@ -24,7 +24,7 @@ pub async fn run_stop(
     loop {
         stop::handle_next_request(&runner, |request| {
             let (reply, answer) = oneshot::channel();
-            let asked = ask_coordinator(
+            let asked = blocking_ask_coordinator(
                 &requests,
                 CoordinatorRequest::Stop {
                     reason: request.data.reason,

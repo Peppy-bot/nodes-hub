@@ -24,12 +24,13 @@ fn claim(busy: &AtomicBool) -> bool {
 }
 
 /// Hand `request` to the coordinator and wait for the answer it sends on
-/// `answer`, from inside a service handler, which the generated code calls
-/// synchronously: the wait blocks in place on the runtime, for at most
-/// [`COORDINATOR_REPLY_TIMEOUT`]. The refusal names what went wrong: a
-/// coordinator that is not running, one that has too many requests queued,
-/// or one that did not answer in time.
-fn ask_coordinator<T>(
+/// `answer`, for at most [`COORDINATOR_REPLY_TIMEOUT`]. The refusal names
+/// what went wrong:
+/// - the coordinator is not running;
+/// - it has too many requests queued;
+/// - it dropped the request;
+/// - it did not answer in time.
+async fn ask_coordinator<T>(
     requests: &mpsc::Sender<CoordinatorRequest>,
     request: CoordinatorRequest,
     answer: oneshot::Receiver<T>,
@@ -40,15 +41,23 @@ fn ask_coordinator<T>(
         }
         mpsc::error::TrySendError::Closed(_) => "the coordinator is not running".to_string(),
     })?;
+    match tokio::time::timeout(COORDINATOR_REPLY_TIMEOUT, answer).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(_)) => Err("the coordinator dropped the request".to_string()),
+        Err(_) => Err(format!(
+            "the coordinator did not answer within {COORDINATOR_REPLY_TIMEOUT:?}"
+        )),
+    }
+}
+
+/// [`ask_coordinator`] from inside a service handler, which the generated
+/// code calls synchronously: the wait blocks in place on the runtime.
+fn blocking_ask_coordinator<T>(
+    requests: &mpsc::Sender<CoordinatorRequest>,
+    request: CoordinatorRequest,
+    answer: oneshot::Receiver<T>,
+) -> std::result::Result<T, String> {
     tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(async {
-            match tokio::time::timeout(COORDINATOR_REPLY_TIMEOUT, answer).await {
-                Ok(Ok(value)) => Ok(value),
-                Ok(Err(_)) => Err("the coordinator dropped the request".to_string()),
-                Err(_) => Err(format!(
-                    "the coordinator did not answer within {COORDINATOR_REPLY_TIMEOUT:?}"
-                )),
-            }
-        })
+        tokio::runtime::Handle::current().block_on(ask_coordinator(requests, request, answer))
     })
 }

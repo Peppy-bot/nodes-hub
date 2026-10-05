@@ -80,6 +80,12 @@ impl ConfiguredModel {
         self.inner.distance_gradient(&s.arms.left, &s.arms.right)
     }
 
+    /// Every pair of bodies the model checks, by link name.
+    #[cfg(test)]
+    pub fn checked_pairs(&self) -> Vec<(&str, &str)> {
+        self.inner.checked_pairs()
+    }
+
     /// Upper bound (m) on how much the clearance can change over a step.
     /// Placement-free by the library's construction (precomputed levers), so
     /// it takes only the step.

@@ -628,6 +628,8 @@ fn dot(a: &[f64; GOV_DOF], b: &[f64; GOV_DOF]) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::limiters::measured_tripwire::MONITOR_TRIP_FRACTION;
     use super::*;
     use crate::chase::rate_limited;
@@ -762,6 +764,87 @@ mod tests {
                     .zip(openarm_description::READY_R)
                     .all(|(q, r)| (q.abs() - r.abs()).abs() < 1e-3),
                 "the governed move to Ready stalled at {side:?}"
+            );
+        }
+    }
+
+    /// The governor keeps only the robot's own bodies apart. Every body of
+    /// every checked pair is a collision link of the v2 URDF:
+    /// - the torso and the head camera;
+    /// - the links of each arm;
+    /// - the fingers of each gripper.
+    ///
+    /// Thus the floor, a table, an object or a held item is in no pair.
+    #[test]
+    fn the_governor_checks_only_the_robots_own_links() {
+        let g = v2_governor(true);
+        let mut robot_links: BTreeSet<String> = ["openarm_body_link0", "openarm_head_camera"]
+            .map(String::from)
+            .into();
+        for side in ["left", "right"] {
+            let arm_links = ["base_link", "ee_base_link", "ee_link1", "ee_link2"]
+                .into_iter()
+                .map(String::from)
+                .chain((1..=6).map(|i| format!("link{i}")));
+            robot_links.extend(arm_links.map(|link| format!("openarm_{side}_{link}")));
+        }
+        assert_eq!(robot_links.len(), 22);
+
+        let checked: BTreeSet<String> = g
+            .model
+            .checked_pairs()
+            .into_iter()
+            .flat_map(|(a, b)| [a.to_string(), b.to_string()])
+            .collect();
+        let foreign: Vec<&String> = checked.difference(&robot_links).collect();
+        assert!(
+            foreign.is_empty(),
+            "checked bodies outside the robot: {foreign:?}"
+        );
+        for link in ["openarm_body_link0", "openarm_head_camera"] {
+            assert!(checked.contains(link), "{link} is in no checked pair");
+        }
+    }
+
+    /// On openarm_v2 with both grippers fully open, the jaws at Home sit
+    /// closer to the torso than the stop distance. So the governor holds
+    /// both arms short of Home on a move from Ready, while the same move
+    /// with closed grippers arrives.
+    #[test]
+    fn the_v2_open_jaws_at_home_sit_under_the_stop_against_the_torso() {
+        let mut g = v2_governor(true);
+        let p = g.proximity(&at(home())).expect("query");
+        let names = format!("{} <-> {}", p.link_a, p.link_b);
+        assert!(
+            0.0 < p.distance && p.distance < D_STOP,
+            "open jaws at Home sit {:+.5} m from {names}",
+            p.distance
+        );
+        assert!(
+            names.contains("body") && names.contains("ee_link"),
+            "the nearest pair at Home is a finger against the torso, got {names}"
+        );
+
+        let held = drive(&mut g, at(ready()), &at(home()), 400);
+        assert!(distance(&mut g, &held) >= D_STOP - 1e-9);
+        let home_elbow = home().left[3];
+        for (side, arm) in [("left", held.arms.left), ("right", held.arms.right)] {
+            assert!(
+                arm[3] > home_elbow + 0.1,
+                "the {side} elbow reached {:.4}, Home is {home_elbow}",
+                arm[3]
+            );
+        }
+
+        let closed = |arms| GovState::new(arms, ArmPair::new(0.0, 0.0));
+        let arrived = drive(&mut g, closed(ready()), &closed(home()), 1000);
+        for (side, arm, rest) in [
+            ("left", arrived.arms.left, home().left),
+            ("right", arrived.arms.right, home().right),
+        ] {
+            assert!(
+                arm.iter().zip(rest).all(|(q, r)| (q - r).abs() < 1e-3),
+                "with closed grippers the {side} arm stalled at {arm:?}"
             );
         }
     }

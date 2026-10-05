@@ -1,6 +1,13 @@
-"""Shared fixtures: a config, wide limits, a fake kinematics, a follower
-whose liveness does not ride the host's clock, one gripper control tick, and
-the targets and checks of the workspace tests."""
+"""Shared fixtures:
+
+- a config;
+- wide limits;
+- the measured joints;
+- a fake kinematics;
+- a follower whose liveness does not ride the host's clock;
+- one gripper control tick;
+- the targets and checks of the workspace tests.
+"""
 
 from __future__ import annotations
 
@@ -14,6 +21,11 @@ from so101_backbone.reach import ReachBall
 
 WIDE_LIMITS = JointLimits(lower=(-3.1,) * 5, upper=(3.1,) * 5)
 WIDE_REACH = ReachBall(center=(0.0, 0.0, 0.0), radius=1e9)
+
+# The joints the follower measures in the tests. They are not equal to a
+# target of the tests. Thus the grasp point of the measurement is different
+# from the grasp point of each target.
+MEASURED = (0.0, 0.1, 0.2, 0.3, 0.4)
 
 # Targets of the robot frame (m). The arm reaches NEAR pointing down. Its grasp
 # point gets to CLOSE, but in no grasp direction: forward points 0.27 rad away
