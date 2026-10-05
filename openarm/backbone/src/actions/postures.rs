@@ -147,13 +147,21 @@ fn posture_result(
 /// the robot until a manual cancel.
 const MAX_REQUESTED_DURATION_S: f64 = 600.0;
 
+/// The message of a move_to_ready that succeeds. Success says that both
+/// arms' moves ran their time out, not that the arms arrived: the governor
+/// can hold an arm short, and an object can stop it.
+const READY_DONE: &str = "the move to ready ran its time";
+
+/// The message of a move_to_home that succeeds, worded as [`READY_DONE`].
+const HOME_DONE: &str = "the move to home ran its time";
+
 /// Expand one posture action's run loop: expose it, claim both arms per
 /// accepted goal, run both joint moves, complete the goal once both report.
 /// One goal at a time; a goal arriving mid-move waits unread until this one
 /// completes, then claims the freed arms. Written once here because the two
 /// generated action modules carry distinct types with an identical surface.
 macro_rules! posture_runner {
-    ($fn_name:ident, $action:ident, $name:literal, $posture:expr, $done:literal) => {
+    ($fn_name:ident, $action:ident, $name:literal, $posture:expr, $done:expr) => {
         pub async fn $fn_name(
             runner: Arc<NodeRunner>,
             goal_txs: [mpsc::Sender<Goal>; 2],
@@ -251,14 +259,14 @@ posture_runner!(
     move_to_ready,
     "move_to_ready",
     openarm_description::ready,
-    "both arms at ready"
+    READY_DONE
 );
 posture_runner!(
     run_move_to_home,
     move_to_home,
     "move_to_home",
     openarm_description::home,
-    "both arms at home"
+    HOME_DONE
 );
 
 #[cfg(test)]
@@ -332,9 +340,9 @@ mod tests {
             outcome(Side::Left, true, "trajectory complete"),
             outcome(Side::Right, true, "trajectory complete"),
         ];
-        let (terminal, message) = summarize(2, &outcomes, false, "both arms at ready");
+        let (terminal, message) = summarize(2, &outcomes, false, READY_DONE);
         assert_eq!(terminal, Terminal::Success);
-        assert_eq!(message, "both arms at ready");
+        assert_eq!(message, READY_DONE);
     }
 
     #[test]
@@ -343,7 +351,7 @@ mod tests {
             outcome(Side::Left, true, "trajectory complete"),
             outcome(Side::Right, false, "goal cancelled"),
         ];
-        let (terminal, message) = summarize(2, &outcomes, false, "both arms at home");
+        let (terminal, message) = summarize(2, &outcomes, false, HOME_DONE);
         assert_eq!(terminal, Terminal::Failed);
         assert_eq!(message, "goal cancelled");
     }
@@ -351,16 +359,16 @@ mod tests {
     #[test]
     fn a_dropped_planner_reply_fails_with_a_matching_message() {
         // done_rx closed after one success: success and message must derive
-        // from the same predicate, so this cannot read "both arms at ready".
+        // from the same predicate, so this cannot read READY_DONE.
         let outcomes = [outcome(Side::Left, true, "trajectory complete")];
-        let (terminal, message) = summarize(2, &outcomes, false, "both arms at ready");
+        let (terminal, message) = summarize(2, &outcomes, false, READY_DONE);
         assert_eq!(terminal, Terminal::Failed);
         assert_eq!(message, "a planner dropped the move");
     }
 
     #[test]
     fn no_dispatched_goal_is_a_planner_failure() {
-        let (terminal, message) = summarize(0, &[], false, "both arms at ready");
+        let (terminal, message) = summarize(0, &[], false, READY_DONE);
         assert_eq!(terminal, Terminal::Failed);
         assert_eq!(message, "an arm's planner is unavailable");
         let only_left = [outcome(Side::Left, true, "trajectory complete")];
@@ -374,14 +382,14 @@ mod tests {
             outcome(Side::Left, false, "left: IK failed mid-trajectory"),
             outcome(Side::Right, false, "right: motion timed out"),
         ];
-        let (terminal, message) = summarize(2, &outcomes, false, "both arms at ready");
+        let (terminal, message) = summarize(2, &outcomes, false, READY_DONE);
         assert_eq!(terminal, Terminal::Failed);
         assert_eq!(message, "left: IK failed mid-trajectory");
     }
 
     #[test]
     fn a_cancel_with_nothing_pending_still_completes_cancelled() {
-        let (terminal, message) = summarize(0, &[], true, "both arms at ready");
+        let (terminal, message) = summarize(0, &[], true, READY_DONE);
         assert_eq!(terminal, Terminal::Cancelled);
         assert_eq!(message, "goal cancelled");
     }
@@ -400,7 +408,7 @@ mod tests {
                 ..outcome(Side::Right, false, "right: stopped: operator")
             },
         ];
-        let (terminal, message) = summarize(2, &outcomes, false, "both arms at ready");
+        let (terminal, message) = summarize(2, &outcomes, false, READY_DONE);
         assert_eq!(terminal, Terminal::Cancelled);
         assert_eq!(message, "left: stopped: operator");
     }
@@ -411,7 +419,7 @@ mod tests {
             outcome(Side::Left, true, "trajectory complete"),
             outcome(Side::Right, true, "trajectory complete"),
         ];
-        let (terminal, message) = summarize(2, &outcomes, true, "both arms at ready");
+        let (terminal, message) = summarize(2, &outcomes, true, READY_DONE);
         assert_eq!(terminal, Terminal::Cancelled);
         assert_eq!(message, "goal cancelled");
     }
@@ -425,9 +433,9 @@ mod tests {
             outcome(Side::Right, true, "trajectory complete"),
             outcome(Side::Left, true, "trajectory complete"),
         ];
-        let result = posture_result(2, &outcomes, false, "both arms at ready");
+        let result = posture_result(2, &outcomes, false, READY_DONE);
         assert_eq!(result.terminal, Terminal::Success);
-        assert_eq!(result.message, "both arms at ready");
+        assert_eq!(result.message, READY_DONE);
         assert_eq!(result.arm_names, ["left_arm", "right_arm"]);
         assert_eq!(result.positions, [0.3, 0.2, 0.25, 0.3, -0.2, 0.25]);
         let (sin, cos) = 0.1f64.sin_cos();
@@ -464,7 +472,7 @@ mod tests {
             (&failed, true, Terminal::Cancelled),
             (&stopped, false, Terminal::Cancelled),
         ] {
-            let result = posture_result(2, outcomes, cancelled, "both arms at ready");
+            let result = posture_result(2, outcomes, cancelled, READY_DONE);
             assert_eq!(result.terminal, terminal);
             assert_eq!(result.arm_names, ["left_arm", "right_arm"]);
             assert_eq!(result.positions, [0.3, 0.2, 0.25, 0.3, -0.2, 0.25]);
@@ -479,7 +487,7 @@ mod tests {
     #[test]
     fn an_arm_without_a_measured_pose_empties_the_posture_arrays() {
         let dropped = [outcome(Side::Left, true, "trajectory complete")];
-        let result = posture_result(2, &dropped, false, "both arms at ready");
+        let result = posture_result(2, &dropped, false, READY_DONE);
         assert_eq!(result.terminal, Terminal::Failed);
         assert_eq!(
             result.message,
@@ -497,7 +505,7 @@ mod tests {
                 ..outcome(Side::Left, false, &format!("left: {refusal}"))
             },
         ];
-        let result = posture_result(2, &unmeasured, false, "both arms at ready");
+        let result = posture_result(2, &unmeasured, false, READY_DONE);
         assert_eq!(result.terminal, Terminal::Failed);
         assert_eq!(
             result.message,
@@ -513,7 +521,7 @@ mod tests {
                 ..outcome(Side::Right, false, "right: the follower stopped reporting")
             },
         ];
-        let result = posture_result(2, &stale, false, "both arms at ready");
+        let result = posture_result(2, &stale, false, READY_DONE);
         assert_eq!(result.terminal, Terminal::Failed);
         assert_eq!(
             result.message,

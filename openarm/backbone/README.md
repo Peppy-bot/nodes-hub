@@ -177,7 +177,8 @@ goes on squeezing what it holds.
 the posture and complete when both moves end. `success` says that both
 moves ran their time out, not that the arms arrived: the governor can hold
 an arm short, and the backbone does not see an arm that stops against an
-object. Whatever the terminal, the result gives `arm_names` (`left_arm`,
+object. So the message of a success is `the move to ready ran its time` or
+`the move to home ran its time`. Whatever the terminal, the result gives `arm_names` (`left_arm`,
 `right_arm`, the order of limb_state) and, in that order, `positions` (3 per
 arm, m) and `orientations` (4 per arm, `[x, y, z, w]`): the grasp pose of
 each arm in the robot frame, from the joints it measured when its move

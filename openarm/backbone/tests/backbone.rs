@@ -1413,10 +1413,10 @@ async fn a_stop_leaves_a_settled_gripper_closed() -> peppygen::Result<()> {
 
 /// A posture result gives arm_names and, in that order, the grasp pose of
 /// each arm measured when the move ended: the pose limb_state gives for the
-/// same joints. Its success says that the move's time ran out, not that the
-/// arms arrived: here both arms stand still at HOME, so move_to_ready
-/// succeeds with neither arm at Ready. move_to_home gives its result the
-/// same way.
+/// same joints. Its success and its message say that the move's time ran
+/// out, not that the arms arrived: here both arms stand still at HOME, so
+/// move_to_ready succeeds with neither arm at Ready. move_to_home gives its
+/// result the same way.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_posture_result_reports_each_arms_measured_grasp_point() -> peppygen::Result<()> {
     let (mut harness, mocks) = start_ready_vacant(params()).await?;
@@ -1433,7 +1433,10 @@ async fn a_posture_result_reports_each_arms_measured_grasp_point() -> peppygen::
 
     let ready = complete_posture!(harness, move_to_ready, 0.0);
     let home = complete_posture!(harness, move_to_home, 0.0);
-    for (result, done) in [(ready, "both arms at ready"), (home, "both arms at home")] {
+    for (result, done) in [
+        (ready, "the move to ready ran its time"),
+        (home, "the move to home ran its time"),
+    ] {
         assert!(result.success, "{}", result.message);
         assert_eq!(result.message, done);
         assert_eq!(result.arm_names, ["left_arm", "right_arm"]);
