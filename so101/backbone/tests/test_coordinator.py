@@ -1,7 +1,7 @@
 import time
 
 import pytest
-from conftest import WIDE_LIMITS, WIDE_REACH, gripper_step, make_config
+from conftest import MEASURED, WIDE_LIMITS, WIDE_REACH, gripper_step, make_config
 from control_core_py.minimum_jerk import plan
 
 from so101_backbone.coordinator import (
@@ -13,7 +13,6 @@ from so101_backbone.coordinator import (
 )
 from so101_backbone.params import UpstreamMode
 
-MEASURED = (0.0, 0.1, 0.2, 0.3, 0.4)
 FAR_TARGET = (1.0, 1.1, 1.2, 1.3, 1.4)
 
 
