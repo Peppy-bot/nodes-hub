@@ -7,6 +7,7 @@ import time
 
 import peppylib
 import pytest
+from conftest import MEASURED
 from peppygen.exposed_actions.limb_motion import move_arm as move_arm_prod
 from peppygen.exposed_actions.limb_motion import move_arm_joints as move_arm_joints_prod
 from peppygen.exposed_actions.limb_motion import move_gripper as move_gripper_prod
@@ -43,7 +44,6 @@ from so101_description.model import KINEMATICS_URDF_PATH
 
 from so101_backbone.__main__ import setup
 
-MEASURED = [0.0, 0.1, 0.2, 0.3, 0.4]
 TIMEOUT_S = 10.0
 
 

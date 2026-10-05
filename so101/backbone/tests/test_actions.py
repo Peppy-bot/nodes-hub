@@ -9,7 +9,14 @@ import time
 from types import SimpleNamespace
 
 import pytest
-from conftest import WIDE_LIMITS, WIDE_REACH, FakeKinematics, gripper_step, make_config
+from conftest import (
+    MEASURED,
+    WIDE_LIMITS,
+    WIDE_REACH,
+    FakeKinematics,
+    gripper_step,
+    make_config,
+)
 from so101_description import limits as limits_mod
 from so101_description.kinematics import Kinematics
 from so101_description.model import KINEMATICS_URDF_PATH
@@ -25,10 +32,6 @@ from so101_backbone.actions import (
 )
 from so101_backbone.coordinator import GRIPPER_STILL_WINDOW_S, Coordinator
 
-# Measured joints that are not equal to a target of these tests. Thus the
-# grasp point of the measurement is different from the grasp point of each
-# target.
-MEASURED = (0.0, 0.1, 0.2, 0.3, 0.4)
 STALE_NO_POSE = "follower state stale; no measured pose to report"
 STALE_COMMANDED = "follower state stale; reporting the commanded position"
 
