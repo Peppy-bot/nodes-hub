@@ -110,7 +110,7 @@ async fn measure_grasps(requests: &mpsc::Sender<CoordinatorRequest>) -> GraspAns
 
 /// The grasp pose of each arm in `answer`, or why the result gives none:
 /// - the coordinator did not answer;
-/// - an arm has not measured its joints;
+/// - the seed wait is not over, so the robot has not measured every limb;
 /// - the follower of an arm stopped reporting.
 fn measured_poses(answer: GraspAnswer) -> std::result::Result<ArmPair<Isometry3<f64>>, String> {
     let grasps = answer?;
@@ -118,7 +118,7 @@ fn measured_poses(answer: GraspAnswer) -> std::result::Result<ArmPair<Isometry3<
         let arm = side.arm_name();
         let grasp: MeasuredGrasp = *grasps.get(side);
         grasp.map_err(|unmeasured| match unmeasured {
-            Unmeasured::NotYet => format!("{arm} has not measured its joints"),
+            Unmeasured::NotYet => "the robot has not measured every limb yet".to_string(),
             Unmeasured::Stale => format!("{arm} stopped reporting its joints"),
         })
     };
@@ -534,9 +534,9 @@ mod tests {
         }
     }
 
-    /// When one arm has no fresh measurement, or the coordinator does not
+    /// When an arm has no fresh measurement, or the coordinator does not
     /// answer, the result gives no pose for any arm. The message adds why:
-    /// - the left arm has not measured its joints;
+    /// - the seed wait is not over, so neither arm has a pose;
     /// - the follower of the right arm stopped reporting;
     /// - the coordinator is not running.
     #[test]
@@ -549,9 +549,9 @@ mod tests {
             (
                 Ok(ArmPair::new(
                     Err(Unmeasured::NotYet),
-                    Ok(grasp_of(Side::Right)),
+                    Err(Unmeasured::NotYet),
                 )),
-                "left_arm has not measured its joints",
+                "the robot has not measured every limb yet",
             ),
             (
                 Ok(ArmPair::new(

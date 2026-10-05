@@ -631,9 +631,7 @@ async fn serve_request(
             ));
         }
         CoordinatorRequest::MeasureGrasps { reply } => {
-            let _ = reply.send(measured_grasps(planners, |side| {
-                seeded_measurement(channels.get(side), *arm_admission.get(side))
-            }));
+            let _ = reply.send(measured_grasps(channels, planners, arm_admission));
         }
     }
 }
@@ -849,9 +847,10 @@ fn seeded_measurement(channels: &ArmChannels, admission: Admission) -> Measureme
         .positions)
 }
 
-/// The joints an arm measured before the seed ends: its first measurement,
-/// or [`Unmeasured::NotYet`] while it has none.
-fn first_measurement(channels: &ArmChannels) -> Measurement {
+/// The latest joints an arm measured before the seed ends, or
+/// [`Unmeasured::NotYet`] while it has none. The seed judges no liveness, so
+/// this value can be stale.
+fn latest_measurement(channels: &ArmChannels) -> Measurement {
     channels
         .measured
         .borrow()
@@ -859,13 +858,17 @@ fn first_measurement(channels: &ArmChannels) -> Measurement {
         .ok_or(Unmeasured::NotYet)
 }
 
-/// The grasp pose of each arm at the joints `measure` gives for its side,
-/// or why `measure` gives none.
+/// The grasp pose of each arm after the seed, at the joints of its
+/// [`seeded_measurement`] under `arm_admission`, or why it has none.
 fn measured_grasps(
+    channels: &ArmPair<ArmChannels>,
     planners: &mut ArmPair<Planner>,
-    mut measure: impl FnMut(Side) -> Measurement,
+    arm_admission: ArmPair<Admission>,
 ) -> ArmPair<MeasuredGrasp> {
-    let mut grasp = |side: Side| measure(side).map(|q| planners.get_mut(side).ee_pose_world(&q));
+    let mut grasp = |side: Side| {
+        seeded_measurement(channels.get(side), *arm_admission.get(side))
+            .map(|q| planners.get_mut(side).ee_pose_world(&q))
+    };
     ArmPair::new(grasp(Side::Left), grasp(Side::Right))
 }
 
@@ -998,8 +1001,9 @@ async fn seed_all(
                 refuse_seed_gripper_goal(goal, &channels.right).await;
             }
             // Nothing moves before the seed, so a stop stops nothing and a
-            // check has no held pose to plan from. A grasp request gets the
-            // first measurement of each arm that has one.
+            // check has no held pose to plan from. The seed judges no
+            // liveness, so no measurement is known to be fresh: a grasp
+            // request gets no pose for either arm.
             Some(request) = requests.recv() => match request {
                 CoordinatorRequest::Stop { reply, .. } => {
                     let _ = reply.send(Vec::new());
@@ -1008,9 +1012,8 @@ async fn seed_all(
                     let _ = reply.send(Err(SEED_REFUSAL.to_string()));
                 }
                 CoordinatorRequest::MeasureGrasps { reply } => {
-                    let _ = reply.send(measured_grasps(planners, |side| {
-                        first_measurement(channels.get(side))
-                    }));
+                    let unseeded = Err(Unmeasured::NotYet);
+                    let _ = reply.send(ArmPair::new(unseeded, unseeded));
                 }
             }
         }
@@ -1032,7 +1035,7 @@ async fn seed_all(
 /// Refuse one arm goal during the seed wait, reporting the measured pose when
 /// one already arrived and releasing the goal's busy claim.
 async fn refuse_seed_arm_goal(goal: Goal, channels: &ArmChannels, planner: &mut Planner) {
-    let measured = first_measurement(channels);
+    let measured = latest_measurement(channels);
     let _release = BusyGuard(channels.busy.clone());
     goal.refuse(SEED_REFUSAL, measured, planner).await;
 }
@@ -2102,6 +2105,44 @@ mod tests {
         let grasps = answer.await.expect("the loop answers the request");
         assert_eq!(grasps.left, Err(Unmeasured::Stale));
         assert_eq!(grasps.right, Ok(planners.right.ee_pose_world(&recovered)));
+    }
+
+    /// During the seed wait, a grasp request gets no pose for either arm,
+    /// also when both arms have measured their joints. Here the grippers
+    /// stay silent, so the seed never ends.
+    #[tokio::test]
+    async fn a_grasp_request_during_the_seed_wait_gets_no_pose() {
+        let held = [0.0, -0.8, 0.0, 1.2, 0.0, 0.0, 0.0];
+        let (mut left, left_measured, _left_goals) = claimed_arm_channels();
+        let (mut right, right_measured, _right_goals) = claimed_arm_channels();
+        let (_left_gripper, silent) = watch::channel(None);
+        left.gripper = silent;
+        let (_right_gripper, silent) = watch::channel(None);
+        right.gripper = silent;
+        left_measured.send_replace(standing_at(held));
+        right_measured.send_replace(standing_at(held));
+        let mut channels = ArmPair::new(left, right);
+        let mut planners = ArmPair::new(
+            planner_holding(Side::Left, held),
+            planner_holding(Side::Right, held),
+        );
+        let (requests_tx, mut requests) = mpsc::channel(1);
+        let (reply, answer) = oneshot::channel();
+        requests_tx
+            .send(CoordinatorRequest::MeasureGrasps { reply })
+            .await
+            .expect("queue the request");
+
+        tokio::select! {
+            _ = seed_all(&mut channels, &mut planners, &mut requests) => {
+                panic!("the seed ended while the grippers are silent");
+            }
+            grasps = answer => {
+                let grasps = grasps.expect("the seed wait answers the request");
+                assert_eq!(grasps.left, Err(Unmeasured::NotYet));
+                assert_eq!(grasps.right, Err(Unmeasured::NotYet));
+            }
+        }
     }
 
     /// After the seed, a side's results report its latest measurement while

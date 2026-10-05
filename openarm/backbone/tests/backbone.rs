@@ -1448,7 +1448,7 @@ async fn a_posture_goal_before_the_first_measurement_reports_no_pose() -> peppyg
     assert!(
         result.message.ends_with(
             "the follower has not reported its first state yet; \
-             no arm poses: left_arm has not measured its joints"
+             no arm poses: the robot has not measured every limb yet"
         ),
         "{}",
         result.message

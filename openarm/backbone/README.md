@@ -195,8 +195,10 @@ moving arm can then settle a little further, to the setpoint it holds.
 When an arm has no fresh measurement when the goal completes, the three
 arrays are empty. The message then ends with one of these reasons:
 
-- `; no arm poses: <arm> has not measured its joints`: the goal came
-  during the seed wait.
+- `; no arm poses: the robot has not measured every limb yet`: the goal
+  came during the seed wait, before each arm and each gripper reported its
+  first state. The seed wait judges no liveness, so no measurement is known
+  to be fresh, and neither arm has a pose.
 - `; no arm poses: <arm> stopped reporting its joints`: the follower of the
   arm stopped reporting, so its last measurement is stale.
 - `; no arm poses: <refusal>`: the coordinator did not answer, for example

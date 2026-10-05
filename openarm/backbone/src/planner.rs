@@ -60,7 +60,8 @@ pub struct PlanConfig {
 /// Why an arm has no fresh measurement of its joints.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unmeasured {
-    /// The follower has not reported its first state yet.
+    /// The seed wait is not over: an arm or a gripper has not reported its
+    /// first state yet.
     NotYet,
     /// The follower stopped reporting, so its last measurement is stale.
     Stale,
