@@ -13,10 +13,12 @@
 //! re-anchors that setpoint on the measured pose, so a follower that restarts
 //! is never handed a target that drifted while nobody could see the arm.
 //!
-//! The loop also answers the two limb_motion services that read or end what
-//! it runs ([`CoordinatorRequest`]): a stop ends every move in flight on
-//! both sides at the start of a tick, and a plan check asks one arm's planner
-//! whether a Cartesian goal has a plan from where it stands.
+//! At the start of a tick, the loop also answers the requests of the
+//! actions and services ([`CoordinatorRequest`]):
+//! - a stop ends every move in flight on both sides;
+//! - a plan check asks one arm's planner whether a Cartesian goal has a plan
+//!   from where it stands;
+//! - a posture goal that completes asks for the grasp pose of each arm.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,6 +27,7 @@ use std::time::{Duration, Instant};
 use peppygen::NodeRunner;
 use peppygen::exposed_actions::limb_motion::move_gripper;
 use peppylib::runtime::CancellationToken;
+use srs_model::nalgebra::Isometry3;
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{error, info, warn};
 
@@ -93,8 +96,13 @@ pub struct RunConfig {
     pub upstream_mode: UpstreamMode,
 }
 
-/// What the limb_motion services ask of the loop, answered on the reply
-/// channel each carries; a reply the asker no longer waits for is dropped.
+/// The grasp pose of one arm in the robot frame, from the joints it
+/// measured, or why it has no fresh measurement of them.
+pub type MeasuredGrasp = Result<Isometry3<f64>, Unmeasured>;
+
+/// What the limb_motion services and the posture moves ask of the loop,
+/// answered on the reply channel each carries. A reply that the asker no
+/// longer waits for is dropped.
 pub enum CoordinatorRequest {
     /// End every planned move in flight on both sides, answering the names of
     /// the limbs whose move was ended.
@@ -107,6 +115,11 @@ pub enum CoordinatorRequest {
     CheckArmMove {
         request: ArmMoveRequest,
         reply: oneshot::Sender<Result<f64, String>>,
+    },
+    /// The grasp pose of each arm, measured when the loop serves the
+    /// request: what a posture result gives when its goal completes.
+    MeasureGrasps {
+        reply: oneshot::Sender<ArmPair<MeasuredGrasp>>,
     },
 }
 
@@ -554,13 +567,18 @@ pub async fn run(
     }
 }
 
-/// Answer one limb_motion service request. A stop ends the moves in flight
-/// on both sides (the arm's move through its planner, the gripper's through
-/// its terminal) and the goals admitted but not started, each as cancelled
-/// with the stop's message, and names the limbs whose move was in flight;
-/// the setpoints hold where they were last governed. An arm's results
-/// report its [`seeded_measurement`] under `arm_admission`. A check asks the
-/// named arm's planner and moves nothing.
+/// Answer one request:
+/// - A stop ends the moves in flight on both sides and the goals admitted
+///   but not started. The planner ends an arm's move; the gripper's
+///   terminal ends a gripper's move.
+/// - Each goal that the stop ends completes as cancelled with the stop's
+///   message. The answer names the limbs whose move was in flight. The
+///   setpoints hold where they were last governed.
+/// - A check asks the named arm's planner and moves nothing.
+/// - A grasp request answers the grasp pose of each arm.
+///
+/// The results and the grasp poses come from each arm's
+/// [`seeded_measurement`] under `arm_admission`.
 async fn serve_request(
     request: CoordinatorRequest,
     channels: &mut ArmPair<ArmChannels>,
@@ -611,6 +629,11 @@ async fn serve_request(
                 request.tolerance,
                 request.duration_s,
             ));
+        }
+        CoordinatorRequest::MeasureGrasps { reply } => {
+            let _ = reply.send(measured_grasps(planners, |side| {
+                seeded_measurement(channels.get(side), *arm_admission.get(side))
+            }));
         }
     }
 }
@@ -826,6 +849,26 @@ fn seeded_measurement(channels: &ArmChannels, admission: Admission) -> Measureme
         .positions)
 }
 
+/// The joints an arm measured before the seed ends: its first measurement,
+/// or [`Unmeasured::NotYet`] while it has none.
+fn first_measurement(channels: &ArmChannels) -> Measurement {
+    channels
+        .measured
+        .borrow()
+        .map(|m| m.positions)
+        .ok_or(Unmeasured::NotYet)
+}
+
+/// The grasp pose of each arm at the joints `measure` gives for its side,
+/// or why `measure` gives none.
+fn measured_grasps(
+    planners: &mut ArmPair<Planner>,
+    mut measure: impl FnMut(Side) -> Measurement,
+) -> ArmPair<MeasuredGrasp> {
+    let mut grasp = |side: Side| measure(side).map(|q| planners.get_mut(side).ee_pose_world(&q));
+    ArmPair::new(grasp(Side::Left), grasp(Side::Right))
+}
+
 /// Gather one whole-robot snapshot for the limb_state readout: every limb's
 /// live measurement, the arms' grasp-point poses FK'd from those joints. Any
 /// stale or missing limb yields `None`: a partial robot is not a snapshot.
@@ -955,13 +998,19 @@ async fn seed_all(
                 refuse_seed_gripper_goal(goal, &channels.right).await;
             }
             // Nothing moves before the seed, so a stop stops nothing and a
-            // check has no held pose to plan from.
+            // check has no held pose to plan from. A grasp request gets the
+            // first measurement of each arm that has one.
             Some(request) = requests.recv() => match request {
                 CoordinatorRequest::Stop { reply, .. } => {
                     let _ = reply.send(Vec::new());
                 }
                 CoordinatorRequest::CheckArmMove { reply, .. } => {
                     let _ = reply.send(Err(SEED_REFUSAL.to_string()));
+                }
+                CoordinatorRequest::MeasureGrasps { reply } => {
+                    let _ = reply.send(measured_grasps(planners, |side| {
+                        first_measurement(channels.get(side))
+                    }));
                 }
             }
         }
@@ -983,11 +1032,7 @@ async fn seed_all(
 /// Refuse one arm goal during the seed wait, reporting the measured pose when
 /// one already arrived and releasing the goal's busy claim.
 async fn refuse_seed_arm_goal(goal: Goal, channels: &ArmChannels, planner: &mut Planner) {
-    let measured = channels
-        .measured
-        .borrow()
-        .map(|m| m.positions)
-        .ok_or(Unmeasured::NotYet);
+    let measured = first_measurement(channels);
     let _release = BusyGuard(channels.busy.clone());
     goal.refuse(SEED_REFUSAL, measured, planner).await;
 }
@@ -1859,18 +1904,18 @@ mod tests {
         );
     }
 
-    /// A left-arm planner of v1 hardware, holding `held`.
-    fn planner_holding(held: JointVec) -> Planner {
+    /// A planner of the `side` arm of v1 hardware, holding `held`.
+    fn planner_holding(side: Side, held: JointVec) -> Planner {
         use crate::planner::PlanConfig;
         use crate::servo::EeCaps;
 
         const TEST_PERIOD: Duration = Duration::from_millis(10);
         let version = openarm_description::HardwareVersion::V1;
-        let model = crate::arm_model(version, openarm_description::Side::Left)
-            .expect("build arm from the bundled URDF");
+        let model =
+            crate::arm_model(version, side.model()).expect("build arm from the bundled URDF");
         let limits = model.limits();
         let mut planner = Planner::new(
-            Side::Left,
+            side,
             model,
             PlanConfig {
                 cycle_period: TEST_PERIOD,
@@ -1926,10 +1971,18 @@ mod tests {
         }
     }
 
+    /// The measured state of an arm at `positions`, standing still.
+    fn standing_at(positions: JointVec) -> Option<ArmState> {
+        Some(ArmState {
+            positions,
+            velocities: [0.0; ARM_DOF],
+        })
+    }
+
     #[tokio::test]
     async fn a_stale_tick_refuses_queued_goals_instead_of_parking_them() {
         let held = [0.0, -0.8, 0.0, 1.2, 0.0, 0.0, 0.0];
-        let mut planner = planner_holding(held);
+        let mut planner = planner_holding(Side::Left, held);
         let (mut channels, _measured_tx, goal_tx) = claimed_arm_channels();
         let (done_tx, mut done_rx) = mpsc::channel::<ReadyOutcome>(1);
         goal_tx
@@ -1948,7 +2001,6 @@ mod tests {
         let outcome = done_rx.recv().await.expect("a refused goal must report");
         assert!(!outcome.success);
         assert_eq!(outcome.message, "left: the follower stopped reporting");
-        assert_eq!(outcome.grasp, Err(Unmeasured::Stale));
         assert!(
             !channels.busy.load(Ordering::Acquire),
             "refusal releases the claim"
@@ -1958,17 +2010,13 @@ mod tests {
     }
 
     /// A posture share in flight when its follower goes stale fails at the
-    /// first stale tick with no grasp pose: the last measurement is stale,
-    /// so it is not where the arm ended.
+    /// first stale tick and frees its arm.
     #[tokio::test]
-    async fn a_stale_tick_ends_the_posture_share_in_flight_with_no_grasp_pose() {
+    async fn a_stale_tick_ends_the_posture_share_in_flight() {
         let held = [0.0, -0.8, 0.0, 1.2, 0.0, 0.0, 0.0];
-        let mut planner = planner_holding(held);
+        let mut planner = planner_holding(Side::Left, held);
         let (mut channels, measured_tx, goal_tx) = claimed_arm_channels();
-        measured_tx.send_replace(Some(ArmState {
-            positions: held,
-            velocities: [0.0; ARM_DOF],
-        }));
+        measured_tx.send_replace(standing_at(held));
         let (done_tx, mut done_rx) = mpsc::channel::<ReadyOutcome>(1);
         goal_tx
             .send(posture_share([0.3; ARM_DOF], done_tx))
@@ -1990,11 +2038,82 @@ mod tests {
         let outcome = done_rx.try_recv().expect("the stale tick ends the share");
         assert!(!outcome.success && !outcome.stopped);
         assert_eq!(outcome.message, "left: the follower stopped reporting");
-        assert_eq!(outcome.grasp, Err(Unmeasured::Stale));
         assert!(
             !channels.busy.load(Ordering::Acquire),
             "the abort releases the claim"
         );
+    }
+
+    /// A grasp request measures each arm when the loop serves it, not when
+    /// the arm's posture share ended:
+    /// - the left share runs its time out, then the left follower goes
+    ///   stale, so the left arm has no fresh measurement;
+    /// - the right share fails on a stale follower, then the right follower
+    ///   recovers, so the right arm has the grasp pose of its latest joints.
+    #[tokio::test]
+    async fn a_grasp_request_measures_each_arm_when_it_is_served() {
+        let held = [0.0, -0.8, 0.0, 1.2, 0.0, 0.0, 0.0];
+        let (left, left_measured, left_goals) = claimed_arm_channels();
+        let (right, right_measured, right_goals) = claimed_arm_channels();
+        let mut channels = ArmPair::new(left, right);
+        let mut planners = ArmPair::new(
+            planner_holding(Side::Left, held),
+            planner_holding(Side::Right, held),
+        );
+        let (done_tx, mut done_rx) = mpsc::channel::<ReadyOutcome>(2);
+        for (measured, goals) in [
+            (&left_measured, &left_goals),
+            (&right_measured, &right_goals),
+        ] {
+            measured.send_replace(standing_at(held));
+            goals
+                .send(posture_share([0.3; ARM_DOF], done_tx.clone()))
+                .await
+                .expect("queue the share");
+        }
+
+        let start = Instant::now();
+        for side in [Side::Left, Side::Right] {
+            let (arm, planner) = (channels.get_mut(side), planners.get_mut(side));
+            tick_arm(arm, planner, Admission::Live, start).await;
+        }
+        assert!(done_rx.try_recv().is_err(), "both shares are in flight");
+        let late = start + Duration::from_secs(3600);
+        tick_arm(
+            &mut channels.left,
+            &mut planners.left,
+            Admission::Live,
+            late,
+        )
+        .await;
+        tick_arm(
+            &mut channels.right,
+            &mut planners.right,
+            Admission::Stale,
+            late,
+        )
+        .await;
+        let left_end = done_rx.try_recv().expect("the left share ends");
+        assert!(left_end.success, "{}", left_end.message);
+        let right_end = done_rx.try_recv().expect("the right share ends");
+        assert_eq!(right_end.message, "right: the follower stopped reporting");
+
+        let recovered = [0.2, -0.6, 0.1, 1.0, 0.0, 0.0, 0.0];
+        right_measured.send_replace(standing_at(recovered));
+        let (reply, answer) = oneshot::channel();
+        serve_request(
+            CoordinatorRequest::MeasureGrasps { reply },
+            &mut channels,
+            &mut planners,
+            ArmPair::new(Admission::Stale, Admission::Reanchor),
+            &mut ArmPair::new(None, None),
+            &|_: &watch::Receiver<Option<GripperState>>| 0.0,
+            late,
+        )
+        .await;
+        let grasps = answer.await.expect("the loop answers the request");
+        assert_eq!(grasps.left, Err(Unmeasured::Stale));
+        assert_eq!(grasps.right, Ok(planners.right.ee_pose_world(&recovered)));
     }
 
     /// After the seed, a side's results report its latest measurement while
@@ -2004,10 +2123,7 @@ mod tests {
     fn a_stale_side_reports_no_measurement_and_a_live_side_its_latest() {
         let (channels, measured_tx, _goal_tx) = claimed_arm_channels();
         let latest = [0.1, -0.8, 0.0, 1.2, 0.0, 0.0, 0.0];
-        measured_tx.send_replace(Some(ArmState {
-            positions: latest,
-            velocities: [0.0; ARM_DOF],
-        }));
+        measured_tx.send_replace(standing_at(latest));
         assert_eq!(seeded_measurement(&channels, Admission::Live), Ok(latest));
         assert_eq!(
             seeded_measurement(&channels, Admission::Reanchor),

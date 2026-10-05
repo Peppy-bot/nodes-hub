@@ -186,21 +186,21 @@ Whatever the terminal, the result gives the pose of each arm:
 - `positions`: 3 values per arm, in metres, in the order of `arm_names`.
 - `orientations`: 4 values per arm, `[x, y, z, w]`, in the same order.
 
-Each pose is the grasp point of the arm in the robot frame. It comes from
-the joints that the arm measured when its move ended. limb_state gives the
-same pose for the same joints. After a cancel or a stop, the pose is where
-the arm was when the move ended. A moving arm can then settle a little
-further, to the setpoint it holds.
+Each pose is the grasp point of the arm in the robot frame. The
+coordinator measures both arms when the posture goal completes, after the
+moves of both arms ended. limb_state gives the same pose for the same
+joints. After a cancel or a stop, the pose is where the arm stopped. A
+moving arm can then settle a little further, to the setpoint it holds.
 
-When an arm has no measured pose, the three arrays are empty. The message
-then ends with one of these reasons:
+When an arm has no fresh measurement when the goal completes, the three
+arrays are empty. The message then ends with one of these reasons:
 
 - `; no arm poses: <arm> has not measured its joints`: the goal came
   during the seed wait.
 - `; no arm poses: <arm> stopped reporting its joints`: the follower of the
   arm stopped reporting, so its last measurement is stale.
-- `; no arm poses: <arm> did not report the end of its move`: the planner
-  of the arm is unavailable or dropped the move.
+- `; no arm poses: <refusal>`: the coordinator did not answer, for example
+  `the coordinator is not running`.
 
 A posture move sends no gripper command, so each gripper goes on as its
 last command drives it. On v2 with both grippers fully open, the jaws at

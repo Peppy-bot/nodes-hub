@@ -1413,11 +1413,11 @@ async fn a_stop_leaves_a_settled_gripper_closed() -> peppygen::Result<()> {
 }
 
 /// A posture result gives arm_names and, in that order, the grasp pose of
-/// each arm measured when the move ended: the pose limb_state gives for the
-/// same joints. Its success and its message say that the move's time ran
-/// out, not that the arms arrived: here both arms stand still at HOME, so
-/// move_to_ready succeeds with neither arm at Ready. move_to_home gives its
-/// result the same way.
+/// each arm measured when the goal completes. limb_state gives the same
+/// pose for the same joints. Its success and its message say that the
+/// move's time ran out, not that the arms arrived. Here both arms stand
+/// still at HOME, so move_to_ready succeeds with neither arm at Ready.
+/// move_to_home gives its result the same way.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_posture_result_reports_each_arms_measured_grasp_point() -> peppygen::Result<()> {
     let (mut harness, mocks) = start_ready_vacant(params()).await?;

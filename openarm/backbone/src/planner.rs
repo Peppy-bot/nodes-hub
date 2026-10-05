@@ -57,7 +57,7 @@ pub struct PlanConfig {
     pub limits: [Limit; ARM_DOF],
 }
 
-/// Why an arm has no fresh measurement of its joints when its move ends.
+/// Why an arm has no fresh measurement of its joints.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unmeasured {
     /// The follower has not reported its first state yet.
@@ -66,8 +66,7 @@ pub enum Unmeasured {
     Stale,
 }
 
-/// The joints an arm measured when its move ends, or why it has no fresh
-/// measurement of them.
+/// The joints an arm measured, or why it has no fresh measurement of them.
 pub type Measurement = Result<JointVec, Unmeasured>;
 
 /// The note a move_arm or move_arm_joints result adds to its message when it
@@ -77,16 +76,10 @@ const COMMANDED_JOINTS_NOTE: &str = "the result comes from the joints commanded 
 /// How one arm's share of a posture move ended, reported to the posture
 /// action that sent it.
 pub struct ReadyOutcome {
-    /// The arm that moved.
-    pub side: Side,
     pub success: bool,
     pub message: String,
     /// The move was ended by the stop service, whoever started it.
     pub stopped: bool,
-    /// The arm's grasp pose in the robot frame, from the joints measured
-    /// when its share ended: the pose limb_state gives for those joints.
-    /// When the arm had no fresh measurement then, why it has no pose.
-    pub grasp: Result<Isometry3<f64>, Unmeasured>,
 }
 
 /// One arm's share of a whole-robot ready move: where its terminal reports,
@@ -115,9 +108,10 @@ impl JointReply {
     /// Report the terminal of `planner`'s arm with `measured`, the joints
     /// the arm measured when the move ended. The joint action keeps its
     /// distinct cancelled completion, which a stop ends it with too, and
-    /// reports what [`Planner::reported_joints`] gives. The ready share folds
-    /// `Cancelled` into a failed outcome, carries a stop as one, and gives
-    /// the grasp pose of the measured joints, or why it has none.
+    /// reports what [`Planner::reported_joints`] gives. The ready share
+    /// folds `Cancelled` into a failed outcome and carries a stop as one.
+    /// It reports no joints: the posture action measures both arms when its
+    /// goal completes.
     async fn finish(
         self,
         planner: &mut Planner,
@@ -144,11 +138,9 @@ impl JointReply {
             }
             Self::Ready(r) => {
                 let outcome = ReadyOutcome {
-                    side,
                     success,
                     message: format!("{}: {message}", side.label()),
                     stopped,
-                    grasp: measured.map(|q| planner.ee_pose_world(&q)),
                 };
                 if r.done_tx.send(outcome).await.is_err() {
                     error!("{}: ready outcome aggregation closed", side.label());
@@ -1106,9 +1098,7 @@ mod tests {
         );
     }
 
-    /// The abort of a follower gone stale fails the move, frees the slot,
-    /// and gives the ready share no grasp pose: the last measurement is
-    /// stale, so it is not where the arm ended.
+    /// The abort of a follower gone stale fails the move and frees the slot.
     #[tokio::test]
     async fn aborting_the_active_move_fails_it_and_frees_the_busy_slot() {
         let mut planner = test_planner([0.0; ARM_DOF]);
@@ -1145,7 +1135,6 @@ mod tests {
         let outcome = done_rx.recv().await.expect("aborted move must report");
         assert!(!outcome.success);
         assert_eq!(outcome.message, "left: the follower stopped reporting");
-        assert_eq!(outcome.grasp, Err(Unmeasured::Stale));
         assert!(!busy.load(Ordering::Acquire), "abort releases the slot");
         // With nothing active the abort is a no-op.
         planner
@@ -1166,10 +1155,9 @@ mod tests {
         }
     }
 
-    /// A stop ends the move as cancelled with its message. The result gives
-    /// the grasp pose of the joints measured when the stop came, while the
-    /// arm holds the setpoint it was last governed to: a moving arm can
-    /// settle past the pose the result gives.
+    /// A stop ends the move as cancelled with its message. The arm holds
+    /// the setpoint it was last governed to, not the pose measured when the
+    /// stop came.
     #[tokio::test]
     async fn stopping_the_active_move_ends_it_cancelled_with_the_message_and_holds() {
         let held = [0.0; ARM_DOF];
@@ -1197,11 +1185,6 @@ mod tests {
         assert!(!outcome.success);
         assert!(outcome.stopped);
         assert_eq!(outcome.message, "left: stopped: operator");
-        assert_eq!(
-            outcome.grasp,
-            Ok(planner.ee_pose_world(&measured_at_stop)),
-            "the result is where the arm was measured when the stop came"
-        );
         assert!(!busy.load(Ordering::Acquire), "the stop releases the slot");
         assert_eq!(
             planner.setpoint(),
@@ -1232,14 +1215,12 @@ mod tests {
 
     /// A posture share whose arm never follows: the governor holds every
     /// step, or the arm stands against an obstacle the backbone cannot see.
-    /// The move ends on its clock with success, and reports the grasp pose
-    /// of the measured joints, not of the goal.
+    /// The move ends on its clock with success.
     #[tokio::test]
     async fn a_joint_move_the_governor_holds_still_completes_with_success() {
         let held = [0.0; ARM_DOF];
         let target = [0.5; ARM_DOF];
         let mut planner = test_planner(held);
-        let measured_grasp = planner.ee_pose_world(&held);
         let (goal_tx, mut goals) = mpsc::channel(1);
         let busy = Arc::new(AtomicBool::new(true));
 
@@ -1265,7 +1246,6 @@ mod tests {
         assert!(outcome.success, "{}", outcome.message);
         assert_eq!(outcome.message, "left: trajectory complete");
         assert!(!outcome.stopped);
-        assert_eq!(outcome.grasp, Ok(measured_grasp));
         assert_eq!(planner.setpoint(), held, "the arm never left its pose");
         assert!(!busy.load(Ordering::Acquire), "the end releases the slot");
 
@@ -1310,7 +1290,6 @@ mod tests {
         let outcome = done_rx.try_recv().expect("the move ends on its clock");
         assert!(outcome.success, "{}", outcome.message);
         assert_eq!(outcome.message, "left: trajectory complete");
-        assert_eq!(outcome.grasp, Ok(measured_grasp));
         assert!(!busy.load(Ordering::Acquire), "the end releases the slot");
     }
 
