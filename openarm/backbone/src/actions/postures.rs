@@ -166,7 +166,7 @@ fn posture_result(
 const MAX_REQUESTED_DURATION_S: f64 = 600.0;
 
 /// The message of a move_to_ready that succeeds. Success says that both
-/// arms' moves ran their time out, not that the arms arrived: the governor
+/// arms' moves ran their time out, not that the arms arrived. The governor
 /// can hold an arm short, and an object can stop it.
 const READY_DONE: &str = "the move to ready ran its time";
 
@@ -336,8 +336,8 @@ mod tests {
         }
     }
 
-    /// A grasp pose that tells the arms apart: y is 0.2 m on the left and
-    /// -0.2 m on the right, and each turns about z by its own y in radians.
+    /// A grasp pose that tells the arms apart. y is 0.2 m on the left and
+    /// -0.2 m on the right. Each turns about z by its own y in radians.
     fn grasp_of(side: Side) -> Isometry3<f64> {
         let y = match side {
             Side::Left => 0.2,

@@ -1932,9 +1932,9 @@ mod tests {
         planner
     }
 
-    /// One arm's channels with its busy slot claimed, as at a goal's
-    /// accept, and the senders a test drives them with: the measured state
-    /// and the goal queue.
+    /// One arm's channels, with its busy slot claimed as at a goal's
+    /// accept. The test drives them through the two senders it also gets:
+    /// the measured state and the goal queue.
     fn claimed_arm_channels() -> (
         ArmChannels,
         watch::Sender<Option<ArmState>>,

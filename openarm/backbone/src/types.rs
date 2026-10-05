@@ -24,9 +24,9 @@ pub fn world_pose_arrays(pose: &Isometry3<f64>) -> ([f64; 3], [f64; 4]) {
     ([t.x, t.y, t.z], [r.i, r.j, r.k, r.w])
 }
 
-/// Both arms' grasp poses as limb_state and the posture results carry them:
-/// the positions (3 per arm) and the orientations (4 per arm, `[x, y, z,
-/// w]`), each in [`Side::ARM_NAMES`] order.
+/// Both arms' grasp poses as limb_state and the posture results carry them.
+/// The positions have 3 values per arm. The orientations have 4 values per
+/// arm, `[x, y, z, w]`. Both are in [`Side::ARM_NAMES`] order.
 pub fn arm_pose_arrays(poses: &ArmPair<Isometry3<f64>>) -> (Vec<f64>, Vec<f64>) {
     let (left_position, left_orientation) = world_pose_arrays(&poses.left);
     let (right_position, right_orientation) = world_pose_arrays(&poses.right);

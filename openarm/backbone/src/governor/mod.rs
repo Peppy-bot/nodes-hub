@@ -768,10 +768,13 @@ mod tests {
         }
     }
 
-    /// The governor keeps only the robot's own bodies apart: every body of
-    /// every checked pair is a collision link of the v2 URDF (the torso, the
-    /// head camera, the links of each arm and the fingers of each gripper),
-    /// so the floor, a table, an object or a held item is in no pair.
+    /// The governor keeps only the robot's own bodies apart. Every body of
+    /// every checked pair is a collision link of the v2 URDF:
+    /// - the torso and the head camera;
+    /// - the links of each arm;
+    /// - the fingers of each gripper.
+    ///
+    /// Thus the floor, a table, an object or a held item is in no pair.
     #[test]
     fn the_governor_checks_only_the_robots_own_links() {
         let g = v2_governor(true);

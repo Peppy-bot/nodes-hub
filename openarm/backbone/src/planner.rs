@@ -1288,9 +1288,9 @@ mod tests {
     }
 
     /// The rest posture puts each grasp point lower and closer to the
-    /// column than the working posture does, on both generations and both
-    /// sides; on openarm_v2 the grasp points are at the numbers the
-    /// description's joints give.
+    /// column than the working posture does. This is true on both
+    /// generations and both sides. On openarm_v2, the grasp points are at
+    /// the numbers that the description's joints give.
     #[test]
     fn the_home_grasp_points_sit_lower_and_closer_in_than_ready() {
         use openarm_description::{HardwareVersion, home, ready};
@@ -1325,7 +1325,7 @@ mod tests {
         );
         let right_home = ([0.0174, -0.1535, 0.1024], [0.0, 0.9997, 0.0, 0.0250]);
         // The left arm's grasp point is the mirror of the right arm's across
-        // the x-z plane: y changes sign, and so do x and z of the quaternion.
+        // the x-z plane. y changes sign, and so do x and z of the quaternion.
         let mirror =
             |([x, y, z], [qx, qy, qz, qw]): ([f64; 3], [f64; 4])| ([x, -y, z], [-qx, qy, -qz, qw]);
         let at = |pose: &Isometry3<f64>, (position, orientation): ([f64; 3], [f64; 4])| {

@@ -246,8 +246,8 @@
       // throttles within ~2 cm. With these values:
       // - On v1, the home pose sits outside the band, so it is unthrottled.
       // - On v2 with both grippers fully open, the jaws at home sit under d_stop_m
-      //   against the torso, so the governor holds both arms short of home. Close
-      //   the grippers before move_to_home (README, "Actions").
+      //   against the torso. Thus the governor holds both arms short of home.
+      //   Close the grippers before move_to_home (README, "Actions").
       d_stop_m: "f64",
       d_safe_m: "f64",
       // Governor state at launch, before the first governor_control message.

@@ -373,9 +373,9 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     let (goal_tx1, goal_rx1) = mpsc::channel(1);
     let (grip_goal_tx0, grip_goal_rx0) = mpsc::channel(1);
     let (grip_goal_tx1, grip_goal_rx1) = mpsc::channel(1);
-    // The way of the limb_motion services and the posture moves to the
-    // coordinator: a stop, a plan check or a grasp request per request,
-    // answered on the tick after it is queued.
+    // The limb_motion services and the posture moves send their requests to
+    // the coordinator here: a stop, a plan check or a grasp request. The
+    // coordinator answers each on the tick after it is queued.
     let (request_tx, request_rx) = mpsc::channel(8);
     // The grasp poses of the last limb_state snapshot, for the camera
     // mounts service.

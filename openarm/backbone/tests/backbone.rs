@@ -222,11 +222,13 @@ impl ArmFollower {
     }
 }
 
-/// Plays one arm as a perfect follower, starting at [`HOME`]: publishes its
-/// measured state every [`STATE_PUMP_PERIOD`] on `$states` (a publisher of
-/// the `$message` slot), adopting each governed setpoint the node streams
-/// down `$setpoints` as the new measurement, until the test brakes it.
-/// The watch it gives carries the latest adopted position, so a test can
+/// Plays one arm as a perfect follower, starting at [`HOME`]:
+/// - it publishes its measured state every [`STATE_PUMP_PERIOD`] on
+///   `$states`, a publisher of the `$message` slot;
+/// - it adopts each governed setpoint that the node streams down
+///   `$setpoints` as the new measurement, until the test brakes it.
+///
+/// The watch it gives carries the latest adopted position. Thus a test can
 /// assert what motion the arm mock observed.
 macro_rules! spawn_arm_follower {
     ($states:expr, $setpoints:expr, $message:path) => {{
@@ -435,9 +437,9 @@ async fn start_ready_vacant(
     Ok((harness, mocks))
 }
 
-/// Wait for the first governed setpoint on the right arm's wire: the
-/// coordinator has then seeded every limb, so a goal sent from now on runs
-/// instead of the seed wait refusing it.
+/// Wait for the first governed setpoint on the right arm's wire. The
+/// coordinator has then seeded every limb. Thus a goal sent from now on
+/// runs, and the seed wait does not refuse it.
 async fn await_streaming(
     mut right_wire: peppygen::mock::pairings::right_arm::joint_setpoints::Subscription,
 ) -> peppygen::Result<()> {
@@ -768,11 +770,11 @@ async fn move_arm_joints_streams_a_trajectory_the_arm_follows_to_the_target() ->
     harness.shutdown().await
 }
 
-/// A joint move the collision governor holds short still completes with
-/// success when its time runs out, and its result gives the joints the arm
-/// measured then, not the goal: with the band widened until the rest pose
-/// sits under d_stop, a left wrist sent toward the centerline never gets
-/// there.
+/// A joint move that the collision governor holds short still completes
+/// with success when its time runs out. Its result gives the joints that
+/// the arm measured then, not the goal. Here the band is wide, so the rest
+/// pose sits under d_stop. A left wrist sent toward the centerline never
+/// gets there.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_joint_move_the_governor_holds_completes_with_the_measured_pose() -> peppygen::Result<()>
 {
@@ -816,10 +818,10 @@ async fn a_joint_move_the_governor_holds_completes_with_the_measured_pose() -> p
     harness.shutdown().await
 }
 
-/// A move_arm result gives the grasp pose of the joints the arm measured
-/// when the move ended: here the left arm stands still at Ready, so a move
-/// 5 cm up runs to its end with success, and its result gives where the
-/// arm stands, which limb_state gives too, not the goal.
+/// A move_arm result gives the grasp pose of the joints that the arm
+/// measured when the move ended. Here the left arm stands still at Ready.
+/// A move 5 cm up runs to its end with success. Its result gives where the
+/// arm stands, as limb_state does, not the goal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pose_move_reports_the_grasp_point_of_the_measured_joints() -> peppygen::Result<()> {
     use peppygen::fixtures::exposed_actions::limb_motion::move_arm;
@@ -967,12 +969,13 @@ async fn move_gripper_answers_with_the_opening_the_lagging_jaws_stopped_at() -> 
     harness.shutdown().await
 }
 
-/// After a move_gripper ends, the node sends that gripper nothing new, so
-/// the gripper keeps the move's opening and effort cap and keeps squeezing
-/// what it holds: here an object stops the jaws at 0.3 on their way to 0.0,
-/// the move ends with success short of its target, and through a later arm
-/// move every setpoint the gripper gets is still 0.0 at the effort cap of
-/// 1.5, which the node relays unchanged.
+/// After a move_gripper ends, the node sends that gripper nothing new. Thus
+/// the gripper keeps the move's opening and effort cap, and keeps squeezing
+/// what it holds. Here:
+/// - an object stops the jaws at 0.3 on their way to 0.0;
+/// - the move ends with success, short of its target;
+/// - through a later arm move, each setpoint that the gripper gets is still
+///   0.0 at the effort cap of 1.5, which the node relays unchanged.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_gripper_held_by_an_object_keeps_its_closing_command_after_the_move()
 -> peppygen::Result<()> {
@@ -1063,9 +1066,9 @@ async fn the_coordinator_holds_everything_until_robot_init_reports_ready() -> pe
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_closing_command_inside_d_stop_reads_stopped_on_collision_status() -> peppygen::Result<()>
 {
-    // Widen the band: the rest-pose clearance (a few cm) is far under d_stop, so any
-    // closing candidate is denied outright (Stopped, not Throttling) and the
-    // measured-state tripwire is armed from the first tick.
+    // Widen the band: the rest-pose clearance (a few cm) is far under d_stop.
+    // Thus the governor denies any closing candidate outright (Stopped, not
+    // Throttling), and the measured-state tripwire is armed from the first tick.
     let mut wide = params();
     wide.d_stop_m = 0.8;
     wide.d_safe_m = 1.0;
@@ -1373,9 +1376,9 @@ async fn a_stop_ends_every_move_in_flight_and_a_later_goal_runs() -> peppygen::R
     harness.shutdown().await
 }
 
-/// robot.stop opens no gripper: with a gripper closed to 0.1 by a settled
-/// move, a stop names no gripper, and through a later arm move the last
-/// opening the gripper got is still 0.1, where its jaws stay.
+/// robot.stop opens no gripper. Here a settled move closed a gripper to
+/// 0.1. A stop names no gripper. Through a later arm move, the last opening
+/// that the gripper got is still 0.1, where its jaws stay.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stop_leaves_a_settled_gripper_closed() -> peppygen::Result<()> {
     use peppygen::fixtures::exposed_services::limb_motion::stop;
@@ -1497,13 +1500,15 @@ async fn a_posture_goal_above_the_duration_ceiling_is_refused() -> peppygen::Res
     harness.shutdown().await
 }
 
-/// After robot.stop, a posture result gives the pose of each arm measured
-/// when the stop came: the left arm, played by a follower the test brakes
-/// on its way to Ready, and the right arm, which stands at HOME. The test
-/// brakes the left arm and waits until the robot measures it there before
-/// the stop, so each arm rests where it was measured. The goal ends
-/// cancelled, with success false, and with the poses limb_state gives for
-/// those joints.
+/// After robot.stop, a posture result gives where each arm stopped:
+/// - the left arm, played by a follower that the test brakes on its way to
+///   Ready;
+/// - the right arm, which stands at HOME.
+///
+/// The test waits until the robot measures the braked left arm before the
+/// stop. Thus each arm rests where the robot measured it. The goal ends
+/// cancelled, with success false and with the poses that limb_state gives
+/// for those joints.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stopped_posture_reports_where_the_arms_stopped() -> peppygen::Result<()> {
     use peppygen::fixtures::exposed_actions::postures::move_to_ready;
@@ -1575,9 +1580,9 @@ async fn a_stopped_posture_reports_where_the_arms_stopped() -> peppygen::Result<
     harness.shutdown().await
 }
 
-/// A posture move sends no command to the grippers: a gripper that a
+/// A posture move sends no command to the grippers. A gripper that a
 /// move_gripper left at 0.2 stays there through move_to_ready and
-/// move_to_home, and gets no opening other than that one.
+/// move_to_home. It gets no opening other than that one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_posture_move_leaves_the_grippers_alone() -> peppygen::Result<()> {
     let (harness, LeftFollowers { gripper, .. }) = start_with_left_followers(0.0).await?;
