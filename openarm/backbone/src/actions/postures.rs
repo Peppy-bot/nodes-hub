@@ -21,7 +21,7 @@ use tracing::error;
 
 use crate::actions::claim;
 use crate::arm_pair::ArmPair;
-use crate::planner::{Goal, JointReply, ReadyOutcome, ReadyReply};
+use crate::planner::{Goal, JointReply, ReadyOutcome, ReadyReply, Unmeasured};
 use crate::types::{Side, arm_pose_arrays, limb_names};
 
 /// Claim both arms' single-flight slots, or name the busy arm. A failure on
@@ -90,7 +90,8 @@ struct PostureResult {
 
 /// The grasp pose of each arm when its share ended, or why an arm has
 /// none: its share did not report (its planner is unavailable or dropped
-/// the move), or the arm had not measured its joints.
+/// the move), the arm had not measured its joints, or its follower stopped
+/// reporting.
 fn measured_grasps(
     outcomes: &[ReadyOutcome],
 ) -> std::result::Result<ArmPair<Isometry3<f64>>, String> {
@@ -100,9 +101,10 @@ fn measured_grasps(
             .iter()
             .find(|o| o.side == side)
             .ok_or_else(|| format!("{arm} did not report the end of its move"))?;
-        outcome
-            .grasp
-            .ok_or_else(|| format!("{arm} has not measured its joints"))
+        outcome.grasp.map_err(|unmeasured| match unmeasured {
+            Unmeasured::NotYet => format!("{arm} has not measured its joints"),
+            Unmeasured::Stale => format!("{arm} stopped reporting its joints"),
+        })
     };
     Ok(ArmPair::new(grasp(Side::Left)?, grasp(Side::Right)?))
 }
@@ -320,7 +322,7 @@ mod tests {
             success,
             message: message.to_string(),
             stopped: false,
-            grasp: Some(grasp_of(side)),
+            grasp: Ok(grasp_of(side)),
         }
     }
 
@@ -444,7 +446,7 @@ mod tests {
     #[test]
     fn a_posture_that_does_not_succeed_still_reports_both_poses() {
         let failed = [
-            outcome(Side::Left, false, "left: the follower stopped reporting"),
+            outcome(Side::Left, false, "left: IK failed mid-trajectory"),
             outcome(Side::Right, true, "trajectory complete"),
         ];
         let stopped = [
@@ -472,7 +474,8 @@ mod tests {
 
     /// When one arm has no measured pose, the result gives no pose for any
     /// arm, and the message adds why: here the right arm's share never
-    /// reported, then the left arm had not measured its joints.
+    /// reported, then the left arm had not measured its joints, then the
+    /// right arm's follower stopped reporting.
     #[test]
     fn an_arm_without_a_measured_pose_empties_the_posture_arrays() {
         let dropped = [outcome(Side::Left, true, "trajectory complete")];
@@ -490,7 +493,7 @@ mod tests {
         let unmeasured = [
             outcome(Side::Right, false, &format!("right: {refusal}")),
             ReadyOutcome {
-                grasp: None,
+                grasp: Err(Unmeasured::NotYet),
                 ..outcome(Side::Left, false, &format!("left: {refusal}"))
             },
         ];
@@ -499,6 +502,23 @@ mod tests {
         assert_eq!(
             result.message,
             format!("right: {refusal}; no arm poses: left_arm has not measured its joints")
+        );
+        assert!(result.arm_names.is_empty());
+        assert!(result.positions.is_empty() && result.orientations.is_empty());
+
+        let stale = [
+            outcome(Side::Left, true, "trajectory complete"),
+            ReadyOutcome {
+                grasp: Err(Unmeasured::Stale),
+                ..outcome(Side::Right, false, "right: the follower stopped reporting")
+            },
+        ];
+        let result = posture_result(2, &stale, false, "both arms at ready");
+        assert_eq!(result.terminal, Terminal::Failed);
+        assert_eq!(
+            result.message,
+            "right: the follower stopped reporting; no arm poses: right_arm stopped reporting \
+             its joints"
         );
         assert!(result.arm_names.is_empty());
         assert!(result.positions.is_empty() && result.orientations.is_empty());

@@ -145,6 +145,10 @@ included, completes unsuccessfully at once. Completion of an arm move is
 graded on the commanded motion with a 2x-nominal timeout; results report the
 measured state and the caller judges how close it landed (the governor may
 have held it short, and that is not a failure of the move machinery).
+When the arm's follower stops reporting, the move fails with
+`the follower stopped reporting; the result comes from the joints commanded last`.
+Its result then reports the held setpoint, because the last measurement is
+stale.
 
 `move_gripper` ends on the measured gripper instead. The commanded opening
 ramps to the target under the same 2x-nominal timeout, then the move stays in
@@ -181,8 +185,10 @@ ended, as limb_state gives it for those joints. After a cancel or a stop,
 that is where each arm was when the move ended. When an arm has no such
 pose, the three arrays are empty and the message ends with
 `; no arm poses: <arm> has not measured its joints` (a goal during the seed
-wait) or `; no arm poses: <arm> did not report the end of its move` (its
-planner is unavailable or dropped the move). A posture move sends no
+wait), `; no arm poses: <arm> stopped reporting its joints` (its follower
+stopped reporting, so its last measurement is stale) or
+`; no arm poses: <arm> did not report the end of its move` (its planner is
+unavailable or dropped the move). A posture move sends no
 gripper command, so each gripper goes on as its last command drives it. On
 v2 with both grippers fully open, the jaws at Home sit closer to the torso
 than the validated stop distance (`d_stop_m` 5 mm), so the governor holds
