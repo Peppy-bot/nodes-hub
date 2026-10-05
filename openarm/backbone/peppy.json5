@@ -237,14 +237,17 @@
       // least one control period and at most 0.5 s, i.e. a rate within
       // [8, 4 x control_rate_hz].
       follower_state_rate_hz: "u32",
-      // Self-collision governor band (m), signed surface distance between the two
-      // arms. At/under d_stop_m motion toward contact is fully stopped; at/over
-      // d_safe_m it is unthrottled; between, it ramps linearly. Separating motion
-      // is never throttled (recovery from a tangle is always allowed). Require
-      // 0 < d_stop_m < d_safe_m. The collision model was validated against
-      // d_stop_m=0.005, d_safe_m=0.02: the rest-pose clearance (~24 mm of the nearest
-      // checked pair) sits just above d_safe_m, so the home pose is unthrottled and
-      // an approach throttles within ~2 cm.
+      // Self-collision governor band (m), signed surface distance of the nearest
+      // checked pair of the robot's own bodies. At/under d_stop_m motion toward
+      // contact is fully stopped; at/over d_safe_m it is unthrottled; between, it
+      // ramps linearly. Separating motion is never throttled (recovery from a
+      // tangle is always allowed). Require 0 < d_stop_m < d_safe_m. The collision
+      // model was validated against d_stop_m=0.005, d_safe_m=0.02, so an approach
+      // throttles within ~2 cm. With these values:
+      // - On v1, the home pose sits outside the band, so it is unthrottled.
+      // - On v2 with both grippers fully open, the jaws at home sit under d_stop_m
+      //   against the torso, so the governor holds both arms short of home. Close
+      //   the grippers before move_to_home (README, "Actions").
       d_stop_m: "f64",
       d_safe_m: "f64",
       // Governor state at launch, before the first governor_control message.

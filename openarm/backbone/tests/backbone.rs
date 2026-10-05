@@ -47,7 +47,8 @@ const STATE_PUMP_PERIOD: Duration = Duration::from_millis(10);
 /// Rest pose both arms are seeded at: elbow (j4) exactly at the description's
 /// 0.05 rad singularity floor, so the planner's limit clamp is the identity
 /// and held setpoints echo it bit-exact. Same pose as the governor's own
-/// unit-test `home()`; nearest-pair clearance there is ~24 mm.
+/// unit-test `home()`, whose nearest checked pair sits outside the validated
+/// band on v1 (the governor test `far_apart_is_unthrottled`).
 const HOME: [f64; 7] = [0.0, 0.0, 0.0, 0.05, 0.0, 0.0, 0.0];
 
 /// Outer deadline for every bounded convergence loop.
@@ -1020,7 +1021,7 @@ async fn the_coordinator_holds_everything_until_robot_init_reports_ready() -> pe
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_closing_command_inside_d_stop_reads_stopped_on_collision_status() -> peppygen::Result<()>
 {
-    // Widen the band: rest-pose clearance (~24 mm) is far under d_stop, so any
+    // Widen the band: the rest-pose clearance (a few cm) is far under d_stop, so any
     // closing candidate is denied outright (Stopped, not Throttling) and the
     // measured-state tripwire is armed from the first tick.
     let mut wide = params();
