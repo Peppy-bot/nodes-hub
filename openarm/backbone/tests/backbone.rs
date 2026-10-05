@@ -148,25 +148,18 @@ macro_rules! pump_arm_at_home {
     };
 }
 
-/// Static aperture pump for one gripper follower, at `$opening`.
-macro_rules! pump_gripper_at {
-    ($publisher:expr, $message:path, $opening:expr) => {
+/// Static aperture pump for one gripper follower, half open.
+macro_rules! pump_gripper_half_open {
+    ($publisher:expr, $message:path) => {
         pump_states!($publisher, || {
             use $message as message;
             message::Message {
                 timestamp: SystemTime::now(),
-                opening: $opening,
+                opening: 0.5,
                 effort: 0.0,
                 max_effort: 1.0,
             }
         })
-    };
-}
-
-/// Static aperture pump for one gripper follower, half open.
-macro_rules! pump_gripper_half_open {
-    ($publisher:expr, $message:path) => {
-        pump_gripper_at!($publisher, $message, 0.5)
     };
 }
 
@@ -202,8 +195,8 @@ fn leader_command(
     }
 }
 
-/// One arm played by [`spawn_arm_follower!`]: the latest position it
-/// adopted, and its brake.
+/// The left arm played by [`spawn_left_arm_follower`]: the latest position
+/// it adopted, and its brake.
 struct ArmFollower {
     followed: watch::Receiver<[f64; 7]>,
     brake: mpsc::Sender<oneshot::Sender<[f64; 7]>>,
@@ -222,75 +215,58 @@ impl ArmFollower {
     }
 }
 
-/// Plays one arm as a perfect follower, starting at [`HOME`]:
+/// Plays the left arm as a perfect follower, starting at [`HOME`]:
 /// - it publishes its measured state every [`STATE_PUMP_PERIOD`] on
-///   `$states`, a publisher of the `$message` slot;
+///   `states`;
 /// - it adopts each governed setpoint that the node streams down
-///   `$setpoints` as the new measurement, until the test brakes it.
+///   `setpoints` as the new measurement, until the test brakes it.
 ///
-/// The watch it gives carries the latest adopted position. Thus a test can
+/// Its `followed` watch carries the latest adopted position. Thus a test can
 /// assert what motion the arm mock observed.
-macro_rules! spawn_arm_follower {
-    ($states:expr, $setpoints:expr, $message:path) => {{
-        let states = $states;
-        let mut setpoints = $setpoints;
-        let (tx, followed) = watch::channel(HOME);
-        let (brake, mut brakes) = mpsc::channel::<oneshot::Sender<[f64; 7]>>(1);
-        tokio::spawn(async move {
-            use $message as message;
-            if !matches!(states.wait_for_subscriber(PUMP_TIMEOUT).await, Ok(true)) {
-                return;
-            }
-            let mut positions = HOME;
-            let mut braked = false;
-            let mut ticker = tokio::time::interval(STATE_PUMP_PERIOD);
-            loop {
-                tokio::select! {
-                    _ = ticker.tick() => {
-                        let message = message::Message {
-                            timestamp: SystemTime::now(),
-                            positions: positions.to_vec(),
-                            velocities: vec![0.0; 7],
-                            efforts: Vec::new(),
-                        };
-                        if states.publish(&message).await.is_err() {
-                            return;
-                        }
-                    }
-                    received = setpoints.next() => match received {
-                        Ok(Some(m)) if !braked && m.positions.len() == 7 => {
-                            for (slot, v) in positions.iter_mut().zip(&m.positions) {
-                                *slot = *v;
-                            }
-                            tx.send_replace(positions);
-                        }
-                        Ok(Some(_)) | Err(_) => {}
-                        Ok(None) => return,
-                    },
-                    Some(reply) = brakes.recv(), if !braked => {
-                        braked = true;
-                        let _ = reply.send(positions);
-                    }
-                }
-            }
-        });
-        ArmFollower { followed, brake }
-    }};
-}
-
-/// Plays the left arm as a perfect follower that is never braked (see
-/// [`spawn_arm_follower!`]). The returned watch carries the latest adopted
-/// position.
 fn spawn_left_arm_follower(
     states: peppygen::mock::pairings::left_arm::joint_states::Publisher,
-    setpoints: peppygen::mock::pairings::left_arm::joint_setpoints::Subscription,
-) -> watch::Receiver<[f64; 7]> {
-    spawn_arm_follower!(
-        states,
-        setpoints,
-        peppygen::paired_topics::left_arm::joint_states
-    )
-    .followed
+    mut setpoints: peppygen::mock::pairings::left_arm::joint_setpoints::Subscription,
+) -> ArmFollower {
+    let (tx, followed) = watch::channel(HOME);
+    let (brake, mut brakes) = mpsc::channel::<oneshot::Sender<[f64; 7]>>(1);
+    tokio::spawn(async move {
+        if !matches!(states.wait_for_subscriber(PUMP_TIMEOUT).await, Ok(true)) {
+            return;
+        }
+        let mut positions = HOME;
+        let mut braked = false;
+        let mut ticker = tokio::time::interval(STATE_PUMP_PERIOD);
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    let message = peppygen::paired_topics::left_arm::joint_states::Message {
+                        timestamp: SystemTime::now(),
+                        positions: positions.to_vec(),
+                        velocities: vec![0.0; 7],
+                        efforts: Vec::new(),
+                    };
+                    if states.publish(&message).await.is_err() {
+                        return;
+                    }
+                }
+                received = setpoints.next() => match received {
+                    Ok(Some(m)) if !braked && m.positions.len() == 7 => {
+                        for (slot, v) in positions.iter_mut().zip(&m.positions) {
+                            *slot = *v;
+                        }
+                        tx.send_replace(positions);
+                    }
+                    Ok(Some(_)) | Err(_) => {}
+                    Ok(None) => return,
+                },
+                Some(reply) = brakes.recv(), if !braked => {
+                    braked = true;
+                    let _ = reply.send(positions);
+                }
+            }
+        }
+    });
+    ArmFollower { followed, brake }
 }
 
 /// Jaw travel (opening fraction) the lagging gripper follower covers per
@@ -472,7 +448,8 @@ async fn start_with_left_followers(object_at: f64) -> peppygen::Result<(Harness,
     let arm = spawn_left_arm_follower(
         mocks.pairings.left_arm.joint_states,
         mocks.pairings.left_arm.joint_setpoints,
-    );
+    )
+    .followed;
     pump_arm_at_home!(
         mocks.pairings.right_arm.joint_states,
         peppygen::paired_topics::right_arm::joint_states
@@ -731,7 +708,8 @@ async fn move_arm_joints_streams_a_trajectory_the_arm_follows_to_the_target() ->
     let followed = spawn_left_arm_follower(
         mocks.pairings.left_arm.joint_states,
         mocks.pairings.left_arm.joint_setpoints,
-    );
+    )
+    .followed;
     pump_right_arm_and_grippers!(mocks);
 
     // Gate the goal on streaming having begun: a goal that reaches the
@@ -789,7 +767,8 @@ async fn a_joint_move_the_governor_holds_completes_with_the_measured_pose() -> p
     let followed = spawn_left_arm_follower(
         mocks.pairings.left_arm.joint_states,
         mocks.pairings.left_arm.joint_setpoints,
-    );
+    )
+    .followed;
     pump_right_arm_and_grippers!(mocks);
     await_streaming(mocks.pairings.right_arm.joint_setpoints).await?;
 
@@ -1519,10 +1498,9 @@ async fn a_stopped_posture_reports_where_the_arms_stopped() -> peppygen::Result<
         mocks.deps.robot_init.is_ready,
         Arc::new(AtomicBool::new(true)),
     );
-    let left = spawn_arm_follower!(
+    let left = spawn_left_arm_follower(
         mocks.pairings.left_arm.joint_states,
         mocks.pairings.left_arm.joint_setpoints,
-        peppygen::paired_topics::left_arm::joint_states
     );
     pump_right_arm_and_grippers!(mocks);
     next_snapshot(&mut harness).await?;
@@ -1624,7 +1602,8 @@ async fn a_plan_check_answers_without_moving_the_arm() -> peppygen::Result<()> {
     let followed = spawn_left_arm_follower(
         mocks.pairings.left_arm.joint_states,
         mocks.pairings.left_arm.joint_setpoints,
-    );
+    )
+    .followed;
     pump_right_arm_and_grippers!(mocks);
 
     // Where the left grasp point stands, from the robot's own snapshot.
