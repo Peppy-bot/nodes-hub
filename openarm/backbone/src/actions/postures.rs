@@ -5,10 +5,12 @@
 //! stops; the stop service ends both arms' moves the same way, and the goal
 //! ends as cancelled with the stop's message. The two actions share the
 //! arms' single-flight slots, so a posture goal arriving while the other
-//! posture runs is rejected busy. Whatever the terminal, the result gives
-//! the grasp pose of each arm from the joints it measured when its share
-//! ended, in limb_state's arm order; when an arm has no such pose, the
-//! result gives no pose and its message says why.
+//! posture runs is rejected busy.
+//!
+//! Whatever the terminal, the result gives the grasp pose of each arm, in
+//! limb_state's arm order. The pose comes from the joints that the arm
+//! measured when its share ended. When an arm has no such pose, the result
+//! gives no pose, and its message says why.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
