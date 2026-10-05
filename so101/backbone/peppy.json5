@@ -20,10 +20,12 @@
     name: "so101_backbone",
     tag: "v1",
     // Every pose this node reports or takes names the URDF's fixed
-    // gripper_frame_link TCP: the limb_state poses, the limb_motion goal and
-    // result poses, and the postures result poses. On this
-    // single-moving-jaw gripper the pad midpoint shifts with the opening, so
-    // no static frame is exactly the contracts' grasp point.
+    // gripper_frame_link TCP:
+    // - the limb_state poses;
+    // - the limb_motion goal and result poses;
+    // - the postures result poses.
+    // On this single-moving-jaw gripper the pad midpoint shifts with the
+    // opening. Thus no static frame is exactly the contracts' grasp point.
     implements: [
       // Whole-robot state snapshots for consumers that hold no pairing:
       // joint positions, the end-effector pose, and the gripper opening.

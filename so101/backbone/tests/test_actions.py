@@ -413,10 +413,10 @@ def test_admission_rejects_before_claiming():
 
 
 async def test_an_arm_goal_below_the_base_plane_is_admitted(follower_never_stale):
-    # The SO-101 checks no collision. This target is inside the joint limits,
-    # and its grasp point is 0.2 m below the plane that the base stands on,
-    # thus through the surface below the robot. The backbone accepts the
-    # move and runs it to its end.
+    # The SO-101 checks no collision. This target is inside the joint limits.
+    # Its grasp point is 0.2 m below the plane that the base stands on, thus
+    # through the surface below the robot. The backbone accepts the move and
+    # runs it to its end.
     kinematics = Kinematics(KINEMATICS_URDF_PATH)
     limits = limits_mod.from_urdf(KINEMATICS_URDF_PATH)
     below_the_base = (0.0, 1.5, 0.0, 0.0, 0.0)

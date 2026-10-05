@@ -16,7 +16,7 @@ WIDE_LIMITS = JointLimits(lower=(-3.1,) * 5, upper=(3.1,) * 5)
 WIDE_REACH = ReachBall(center=(0.0, 0.0, 0.0), radius=1e9)
 
 # The joints the follower measures in the tests. They are not equal to a
-# target of the tests, so the grasp point of the measurement is different
+# target of the tests. Thus the grasp point of the measurement is different
 # from the grasp point of each target.
 MEASURED = (0.0, 0.1, 0.2, 0.3, 0.4)
 
