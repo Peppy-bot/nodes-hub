@@ -14,10 +14,22 @@ From: peppybot/python-uv-base:latest
 %post
     set -eux
     export DEBIAN_FRONTEND=noninteractive
-    # uv resolves the shared libs as git dependencies; the base image has no git.
+    # uv resolves the shared libs as git dependencies; the base image has no
+    # git. gcc and libc6-dev link workspace_core_py, a Rust extension that uv
+    # builds from its source.
     apt-get update -qq
-    apt-get install -qqy --no-install-recommends git
+    apt-get install -qqy --no-install-recommends git gcc libc6-dev
     rm -rf /var/lib/apt/lists/*
+    # The Rust toolchain that builds workspace_core_py: rustup's minimal
+    # profile under /opt/rust, and the toolchain's own cargo and rustc on the
+    # default PATH, where they run without rustup's environment. CI needs
+    # that: it runs the tests in an image of this part of %post alone, with
+    # an environment and a HOME of its own.
+    export RUSTUP_HOME=/opt/rust/rustup CARGO_HOME=/opt/rust/cargo
+    curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
+        | sh -s -- -y --no-modify-path --profile minimal --default-toolchain stable
+    ln -s "$("$CARGO_HOME/bin/rustup" which cargo)" /usr/local/bin/cargo
+    ln -s "$("$CARGO_HOME/bin/rustup" which rustc)" /usr/local/bin/rustc
     # uv defaults its managed interpreter under $HOME (/root at build time);
     # a daemon running as root mounts its home over that and the node dies
     # with ./.venv/bin/python: not found.
@@ -27,7 +39,11 @@ From: peppybot/python-uv-base:latest
     uv python install
     # --no-dev keeps the test-only group out of the runtime image.
     # --locked fails the build on a stale lockfile instead of re-resolving.
-    uv sync --locked --no-editable --no-dev
+    # Cargo builds under /opt/rust, so the removal below takes its outputs.
+    CARGO_TARGET_DIR=/opt/rust/target uv sync --locked --no-editable --no-dev
+    # The runtime image keeps the built extension and no compiler.
+    rm -rf /opt/rust /usr/local/bin/cargo /usr/local/bin/rustc
+    apt-get purge -qqy --auto-remove gcc libc6-dev
 
 %runscript
     cd /opt/so101_backbone

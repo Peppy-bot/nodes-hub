@@ -1,114 +1,33 @@
-//! The workspace contract's judgement, from the robot's design alone: where
-//! the arms reach and where the perception camera sees, in the robot frame,
-//! on a flat, level surface at a given height or at given points. Reach is
-//! the arms' closed-form inverse kinematics, the grasp point at the target,
-//! to within the reach tolerance, in each grasp orientation `workspace_core`
-//! lists; the view is `workspace_core`'s field-of-view and depth test of the
-//! perception camera, placed where the design fixes it and seen through the
-//! intrinsics and the depth stream its camera gives. The verdicts, the
-//! largest workable rectangle and the messages of the verdicts, of the count
-//! of workable points and of a view not checked are `workspace_core`'s, so
-//! this answer and a simulation's read alike; the refusals of a request and
-//! of the perception camera's geometry are this module's own. A surface's
-//! reach depends on the design and its height alone, so it is kept per
-//! height and a repeated height answers from the stored grid.
+//! The OpenArm's part of the workspace contract's answer, from the robot's
+//! design alone: whether an arm reaches a point, and where the perception
+//! camera stands, in the robot frame. Reach is the arms' closed-form inverse
+//! kinematics, the grasp point at the target, to within the reach tolerance,
+//! in each grasp orientation `workspace_core` lists; the view is
+//! `workspace_core`'s field-of-view and depth test of the perception camera,
+//! placed where the design fixes it and seen through the intrinsics and the
+//! depth stream its camera gives. The parsing of a request, the reach of the
+//! surfaces measured last and the composition of each answer are
+//! `workspace_core::design`'s, so this answer reads as every robot's and as a
+//! simulation's; the refusals of the perception camera's geometry are this
+//! module's own.
 
-use std::collections::VecDeque;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard};
 
 use srs_model::nalgebra::{Isometry3, Matrix3, Rotation3, Translation3, UnitQuaternion, Vector3};
 use srs_model::{Arm, ArmAnglePolicy};
-use workspace_core::messages::{
-    Counted, SurfaceCamera, Unchecked, answer_message, point_message, robot_frame_placement,
-    surface_message, unchecked_view_message,
+use workspace_core::design::{
+    self, Positions, PositionsAnswer, PositionsReach, ReachMemo, SurfaceAnswer, SurfaceHeight,
+    SurfaceReach, ViewCheck,
 };
 use workspace_core::{
-    Camera, CameraFacts, Depth, DepthModel, Fit, GraspOrientation, GridPoint, Intrinsics, Limits,
-    PerceptionCameraError, REACH_TOLERANCE, Reach, UnknownDepthModel, View, fit,
-    largest_workable_rectangle, reach_bounds, view_bounds, view_of, workable_area,
+    Camera, CameraFacts, Depth, DepthModel, GraspOrientation, Intrinsics, PerceptionCameraError,
+    REACH_TOLERANCE, Reach, UnknownDepthModel,
 };
 
 use crate::arm_pair::ArmPair;
 use crate::camera_mounts::{CameraMounts, DesignCamera};
 use crate::types::Side;
-
-/// What describe_workspace answers to a surface height that is not a finite
-/// number.
-pub const NON_FINITE_SURFACE_HEIGHT: &str = "surface_height must be a finite number";
-
-/// What check_positions answers to an empty list of points.
-pub const NO_POSITIONS: &str = "positions must hold at least one point";
-
-/// What check_positions answers to a list that does not split into points.
-pub const POSITIONS_NOT_TRIPLES: &str = "positions must hold 3 values (x, y, z) per point";
-
-/// What check_positions answers to a list holding a value that is not a
-/// finite number.
-pub const NON_FINITE_POSITION: &str = "positions must hold finite numbers only";
-
-/// How far from the robot's base point a coordinate of a checked point may
-/// be, in metres: far beyond any arm, and near enough that every distance
-/// the check computes stays a finite number.
-pub const MAX_COORDINATE: f64 = 1000.0;
-
-/// What check_positions answers to a list holding a coordinate beyond
-/// [`MAX_COORDINATE`].
-pub const DISTANT_POSITION: &str =
-    "positions must hold coordinates within 1000 m of the robot's base point";
-
-/// How many surface heights the reach memo keeps. Each holds a verdict per
-/// grid point and the heights come from callers, so the memo is bounded:
-/// past the bound it drops the height it stored first, also when a caller
-/// asked that height again after it was stored.
-const REACH_MEMO_HEIGHTS: usize = 32;
-
-/// The height of a surface above the robot's base point, parsed off a
-/// request to the millimetre: a surface is measured at its height to the
-/// millimetre, so two heights that round alike get one answer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SurfaceHeight {
-    millimetres: i64,
-}
-
-impl SurfaceHeight {
-    pub fn from_wire(metres: f64) -> Result<Self, &'static str> {
-        if !metres.is_finite() {
-            return Err(NON_FINITE_SURFACE_HEIGHT);
-        }
-        Ok(Self {
-            millimetres: (metres * 1000.0).round() as i64,
-        })
-    }
-
-    pub fn metres(self) -> f64 {
-        self.millimetres as f64 / 1000.0
-    }
-}
-
-/// The points of a check_positions request, parsed: at least one, each three
-/// finite coordinates in the robot frame, each within [`MAX_COORDINATE`].
-#[derive(Clone, Debug, PartialEq)]
-pub struct Positions(Vec<[f64; 3]>);
-
-impl Positions {
-    pub fn from_wire(values: &[f64]) -> Result<Self, &'static str> {
-        if values.is_empty() {
-            return Err(NO_POSITIONS);
-        }
-        let (points, rest) = values.as_chunks::<3>();
-        if !rest.is_empty() {
-            return Err(POSITIONS_NOT_TRIPLES);
-        }
-        if !values.iter().all(|value| value.is_finite()) {
-            return Err(NON_FINITE_POSITION);
-        }
-        if !values.iter().all(|value| value.abs() <= MAX_COORDINATE) {
-            return Err(DISTANT_POSITION);
-        }
-        Ok(Self(points.to_vec()))
-    }
-}
 
 /// Why the perception camera's view cannot be checked now, from what the
 /// camera linked as perception_geometry answered.
@@ -269,85 +188,6 @@ pub fn grasp_poses(target: [f64; 3]) -> impl Iterator<Item = Isometry3<f64>> {
     GraspOrientation::all().map(move |orientation| grasp_pose(orientation, target))
 }
 
-/// What describe_workspace answers of one surface.
-#[derive(Clone, Debug, PartialEq)]
-pub struct SurfaceAnswer {
-    pub workable: bool,
-    pub area: f64,
-    /// `[x_min, x_max, y_min, y_max]` of the largest workable rectangle.
-    pub rectangle: Option<[f64; 4]>,
-    /// `[x_min, x_max, y_min, y_max]` bounding the points an arm reaches.
-    pub reach: Option<[f64; 4]>,
-    /// `[x_min, x_max, y_min, y_max]` bounding the points the camera sees.
-    pub view: Option<[f64; 4]>,
-    pub message: String,
-}
-
-/// What check_positions answers of one point.
-#[derive(Clone, Debug, PartialEq)]
-pub struct PointAnswer {
-    pub position: [f64; 3],
-    pub reach: Reach,
-    pub view: View,
-    pub message: String,
-}
-
-impl PointAnswer {
-    /// Whether the robot can work the point ([`workspace_core::workable`]).
-    pub fn workable(&self) -> bool {
-        workspace_core::workable(&self.reach, &self.view)
-    }
-}
-
-/// What check_positions answers of every point, in the request's order.
-#[derive(Clone, Debug, PartialEq)]
-pub struct PositionsAnswer {
-    pub points: Vec<PointAnswer>,
-    pub message: String,
-}
-
-impl PositionsAnswer {
-    pub fn all_workable(&self) -> bool {
-        self.points.iter().all(PointAnswer::workable)
-    }
-}
-
-/// The reach grids of the surfaces measured last, one per height, in the
-/// order they were stored: past `capacity` the first stored goes.
-struct ReachMemo {
-    capacity: usize,
-    grids: VecDeque<(SurfaceHeight, Arc<[Reach]>)>,
-}
-
-impl ReachMemo {
-    fn new(capacity: usize) -> Self {
-        Self {
-            capacity,
-            grids: VecDeque::with_capacity(capacity),
-        }
-    }
-
-    fn get(&self, height: SurfaceHeight) -> Option<Arc<[Reach]>> {
-        self.grids
-            .iter()
-            .find(|(stored, _)| *stored == height)
-            .map(|(_, grid)| grid.clone())
-    }
-
-    /// Stores `grid` for `height` and gives back the grid stored for it: the
-    /// one already there when another request measured the height first.
-    fn insert(&mut self, height: SurfaceHeight, grid: Arc<[Reach]>) -> Arc<[Reach]> {
-        if let Some(stored) = self.get(height) {
-            return stored;
-        }
-        if self.grids.len() == self.capacity {
-            self.grids.pop_front();
-        }
-        self.grids.push_back((height, grid.clone()));
-        grid
-    }
-}
-
 /// The robot's workspace from its design: its two arms, its perception
 /// camera if it has one, and the reach of the surfaces measured last.
 pub struct Workspace {
@@ -364,12 +204,25 @@ impl Workspace {
         Ok(Self {
             arms,
             perception_camera: PerceptionCamera::of(&mounts.design_cameras())?,
-            reach_memo: Mutex::new(ReachMemo::new(REACH_MEMO_HEIGHTS)),
+            reach_memo: Mutex::new(ReachMemo::new()),
         })
     }
 
     pub fn perception_camera(&self) -> Option<&PerceptionCamera> {
         self.perception_camera.as_ref()
+    }
+
+    /// How an answer checks the view when no linked camera gives the
+    /// perception camera's geometry: not at all. The answer then says why:
+    /// the robot has no perception camera, or no camera geometry is linked
+    /// for the perception camera it names.
+    pub fn unlinked_view_check(&self) -> ViewCheck<'static> {
+        match self.perception_camera {
+            None => ViewCheck::NoPerceptionCamera,
+            Some(perception) => ViewCheck::NoCameraGeometry {
+                camera: perception.name,
+            },
+        }
     }
 
     /// Whether an arm brings its grasp point to `target`, in the robot frame,
@@ -393,95 +246,27 @@ impl Workspace {
         }
     }
 
-    /// Where on a flat, level surface at `height` the robot can work, its
-    /// perception camera `camera` when its view is checked.
-    pub fn describe(&self, height: SurfaceHeight, camera: Option<&Camera>) -> SurfaceAnswer {
-        let limits = Limits::STANDARD;
-        let top = height.metres();
-        let reaches = self.surface_reach(height);
-        let points: Vec<GridPoint> = limits
-            .grid
-            .points()
-            .into_iter()
-            .zip(reaches.iter())
-            .map(|((x, y), reach)| GridPoint {
-                x,
-                y,
-                reach: reach.clone(),
-                view: view_of(camera, [x, y, top]),
-            })
-            .collect();
-        let fit = fit(&points, &limits);
-        let surface_camera = camera
-            .zip(self.perception_camera)
-            .map(|(camera, perception)| SurfaceCamera {
-                name: perception.name,
-                above_top: camera.position[2] - top,
-            });
-        let placement = match &fit {
-            Fit::Workable { rectangle, .. } => Some(robot_frame_placement(rectangle)),
-            _ => None,
-        };
-        SurfaceAnswer {
-            workable: fit.workable(),
-            area: workable_area(&points, &limits.grid),
-            rectangle: largest_workable_rectangle(&points, &limits.grid)
-                .map(|rectangle| rectangle.to_array()),
-            reach: reach_bounds(&points).map(|rectangle| rectangle.to_array()),
-            view: view_bounds(&points).map(|rectangle| rectangle.to_array()),
-            message: sentences([
-                Some(surface_message(&fit, surface_camera)),
-                placement,
-                self.unchecked_view(camera).map(unchecked_view_message),
-            ]),
-        }
+    /// Where on a flat, level surface at `height` the robot can work, the
+    /// view checked as `view_check` says.
+    pub fn describe(&self, height: SurfaceHeight, view_check: &ViewCheck<'_>) -> SurfaceAnswer {
+        design::describe_surface(&self.surface_reach(height), view_check)
     }
 
-    /// Whether the robot can work each of `positions`, its perception camera
-    /// `camera` when its view is checked.
-    pub fn check(&self, positions: &Positions, camera: Option<&Camera>) -> PositionsAnswer {
-        let name = self.perception_camera.map(|perception| perception.name);
-        let points: Vec<PointAnswer> = positions
-            .0
-            .iter()
-            .map(|&position| {
-                let reach = self.reach(position);
-                let view = view_of(camera, position);
-                let message = point_message(&reach, &view, name);
-                PointAnswer {
-                    position,
-                    reach,
-                    view,
-                    message,
-                }
-            })
-            .collect();
-        let workable = points.iter().filter(|point| point.workable()).count();
-        let message = answer_message(
-            workable,
-            points.len(),
-            Counted::Points,
-            self.unchecked_view(camera),
-        );
-        PositionsAnswer { points, message }
+    /// Whether the robot can work each of `positions`, the view checked as
+    /// `view_check` says.
+    pub fn check(&self, positions: &Positions, view_check: &ViewCheck<'_>) -> PositionsAnswer {
+        let reach = PositionsReach::measure(positions, |point| self.reach(point));
+        design::check_positions(&reach, view_check)
     }
 
-    /// The reach of every grid point of a surface at `height`, at its target
-    /// above the surface, in the grid's order: from the memo when the height
+    /// The reach of the surface at `height`: from the memo when the height
     /// was measured last, else measured now and stored.
-    fn surface_reach(&self, height: SurfaceHeight) -> Arc<[Reach]> {
-        if let Some(grid) = self.reach_memo().get(height) {
-            return grid;
+    fn surface_reach(&self, height: SurfaceHeight) -> SurfaceReach {
+        if let Some(stored) = self.reach_memo().get(height) {
+            return stored;
         }
-        let limits = Limits::STANDARD;
-        let target_z = height.metres() + limits.above_surface;
-        let grid: Arc<[Reach]> = limits
-            .grid
-            .points()
-            .into_iter()
-            .map(|(x, y)| self.reach([x, y, target_z]))
-            .collect();
-        self.reach_memo().insert(height, grid)
+        let measured = SurfaceReach::measure(height, |target| self.reach(target));
+        self.reach_memo().insert(measured)
     }
 
     fn reach_memo(&self) -> MutexGuard<'_, ReachMemo> {
@@ -537,23 +322,6 @@ impl Workspace {
             })
             .fold(f64::INFINITY, f64::min)
     }
-
-    /// Why an answer checks no view: the robot has no perception camera, or
-    /// no camera geometry is linked for it. None when `camera` is checked.
-    fn unchecked_view(&self, camera: Option<&Camera>) -> Option<Unchecked<'static>> {
-        match (self.perception_camera, camera) {
-            (None, _) => Some(Unchecked::NoPerceptionCamera),
-            (Some(perception), None) => Some(Unchecked::NoCameraGeometry {
-                camera: perception.name,
-            }),
-            (Some(_), Some(_)) => None,
-        }
-    }
-}
-
-/// The sentences given, in order, as one message.
-fn sentences<const N: usize>(parts: [Option<String>; N]) -> String {
-    parts.into_iter().flatten().collect::<Vec<_>>().join(" ")
 }
 
 #[cfg(test)]
@@ -562,7 +330,9 @@ mod tests {
 
     use openarm_description::HardwareVersion;
     use srs_model::Solution;
-    use workspace_core::GraspDirection;
+    use workspace_core::design::MAX_COORDINATE;
+    use workspace_core::messages::robot_frame_placement;
+    use workspace_core::{GraspDirection, View};
 
     fn arms(version: HardwareVersion) -> ArmPair<Arm> {
         let arm = |side: Side| crate::arm_model(version, side.model()).expect("build the arm");
@@ -669,6 +439,17 @@ mod tests {
             )
     }
 
+    /// The view checked through the simulated chest camera ([`chest`]).
+    fn chest_view(workspace: &Workspace) -> ViewCheck<'static> {
+        let perception = workspace
+            .perception_camera()
+            .expect("v2 has a perception camera");
+        ViewCheck::Checked {
+            camera: perception.name,
+            geometry: chest(workspace),
+        }
+    }
+
     fn height(metres: f64) -> SurfaceHeight {
         SurfaceHeight::from_wire(metres).expect("a finite height")
     }
@@ -739,7 +520,7 @@ mod tests {
     #[test]
     fn a_point_in_front_at_table_height_is_reached_and_seen() {
         let v2 = workspace(HardwareVersion::V2);
-        let answer = v2.check(&positions(&[0.30, 0.0, 0.45]), Some(&chest(&v2)));
+        let answer = v2.check(&positions(&[0.30, 0.0, 0.45]), &chest_view(&v2));
         let [point] = answer.points.as_slice() else {
             panic!("one point answered: {answer:?}");
         };
@@ -761,7 +542,7 @@ mod tests {
     fn a_point_a_metre_in_front_is_out_of_reach_by_how_far_the_closest_arm_stops() {
         let v2 = workspace(HardwareVersion::V2);
         let target = [1.0, 0.0, 0.45];
-        let answer = v2.check(&positions(&target), Some(&chest(&v2)));
+        let answer = v2.check(&positions(&target), &chest_view(&v2));
         let point = &answer.points[0];
         let Reach::Short { by } = point.reach else {
             panic!("a metre ahead is out of reach: {point:?}");
@@ -794,7 +575,7 @@ mod tests {
     fn a_point_the_grasp_point_gets_to_tilted_falls_short_by_nothing_in_a_grasp_orientation() {
         let v2 = workspace(HardwareVersion::V2);
         let target = [0.40, 0.0, 0.30];
-        let answer = v2.check(&positions(&target), Some(&chest(&v2)));
+        let answer = v2.check(&positions(&target), &chest_view(&v2));
         let point = &answer.points[0];
         assert_eq!(point.reach, Reach::Short { by: 0.0 });
         assert_eq!(
@@ -846,22 +627,16 @@ mod tests {
     #[test]
     fn the_arm_on_the_side_of_a_point_names_its_reach_and_the_left_one_a_point_between() {
         let v2 = workspace(HardwareVersion::V2);
-        let answer = v2.check(
-            &positions(&[0.30, 0.2, 0.45, 0.30, -0.2, 0.45, 0.30, 0.0, 0.45]),
-            None,
-        );
-        let arms: Vec<&str> = answer
-            .points
-            .iter()
-            .map(|point| point.reach.arm())
-            .collect();
+        let reaches =
+            [[0.30, 0.2, 0.45], [0.30, -0.2, 0.45], [0.30, 0.0, 0.45]].map(|point| v2.reach(point));
+        let arms = reaches.each_ref().map(Reach::arm);
         assert_eq!(arms, ["left_arm", "right_arm", "left_arm"]);
     }
 
     #[test]
     fn a_surface_at_table_height_is_workable_inside_both_the_reach_and_the_view() {
         let v2 = workspace(HardwareVersion::V2);
-        let answer = v2.describe(height(0.45), Some(&chest(&v2)));
+        let answer = v2.describe(height(0.45), &chest_view(&v2));
         assert!(answer.workable, "{}", answer.message);
         let [x_min, x_max, y_min, y_max] = answer.rectangle.expect("a rectangle");
         for bounds in [answer.reach, answer.view] {
@@ -886,7 +661,7 @@ mod tests {
     #[test]
     fn a_surface_above_the_chest_camera_is_not_visible_and_says_how_far_above_it_is() {
         let v2 = workspace(HardwareVersion::V2);
-        let answer = v2.describe(height(0.96), Some(&chest(&v2)));
+        let answer = v2.describe(height(0.96), &chest_view(&v2));
         assert!(!answer.workable);
         assert!(answer.reach.is_some(), "the arms reach part of it");
         assert_eq!((answer.view, answer.rectangle), (None, None));
@@ -900,7 +675,7 @@ mod tests {
     #[test]
     fn a_surface_just_below_the_chest_camera_says_how_far_ahead_the_arms_reach_it() {
         let v2 = workspace(HardwareVersion::V2);
-        let answer = v2.describe(height(0.75), Some(&chest(&v2)));
+        let answer = v2.describe(height(0.75), &chest_view(&v2));
         assert!(!answer.workable);
         assert_eq!((answer.view, answer.rectangle), (None, None));
         let [x_min, x_max, ..] = answer.reach.expect("the arms reach part of it");
@@ -914,124 +689,86 @@ mod tests {
     }
 
     #[test]
-    fn without_linked_camera_geometry_nothing_is_seen_and_the_answers_say_the_view_is_not_checked()
-    {
-        let v2 = workspace(HardwareVersion::V2);
-        let unchecked =
-            "The view is not checked: no camera geometry is linked for the chest camera.";
-        let surface = v2.describe(height(0.45), None);
-        assert!(surface.workable, "reach alone decides");
-        assert_eq!(surface.view, None);
-        assert!(surface.message.ends_with(unchecked), "{}", surface.message);
-        let checked = v2.check(&positions(&[0.30, 0.0, 0.45]), None);
-        assert_eq!(checked.points[0].view, View::NoCamera);
-        assert!(checked.all_workable());
-        assert_eq!(
-            checked.message,
-            format!("The point is workable. {unchecked}")
-        );
-    }
-
-    #[test]
     fn a_robot_without_a_perception_camera_is_judged_on_reach_alone_and_says_so() {
         let v1 = workspace(HardwareVersion::V1);
+        let view_check = v1.unlinked_view_check();
+        assert_eq!(view_check, ViewCheck::NoPerceptionCamera);
         let unchecked = "The view is not checked: the robot has no perception camera.";
-        let checked = v1.check(&positions(&[0.30, -0.2, 0.45]), None);
-        assert_eq!(checked.points[0].view, View::NoCamera);
+        let checked = v1.check(&positions(&[0.30, -0.2, 0.45]), &view_check);
+        let [point] = checked.points.as_slice() else {
+            panic!("one point answered: {checked:?}");
+        };
+        assert_eq!(
+            point.reach,
+            Reach::Reached {
+                arm: "right_arm".to_owned()
+            }
+        );
+        assert_eq!(point.view, View::NoCamera);
         assert_eq!(
             checked.message,
             format!("The point is workable. {unchecked}")
         );
-        let surface = v1.describe(height(0.45), None);
+        let surface = v1.describe(height(0.45), &view_check);
+        assert!(surface.workable, "{}", surface.message);
         assert_eq!(surface.view, None);
         assert!(surface.message.ends_with(unchecked), "{}", surface.message);
     }
 
     #[test]
-    fn a_repeated_height_answers_from_the_stored_reach_grid() {
+    fn a_perception_camera_with_no_linked_geometry_leaves_the_view_unchecked_and_names_it() {
         let v2 = workspace(HardwareVersion::V2);
-        let camera = chest(&v2);
-        let first = v2.describe(height(0.45), Some(&camera));
-        let stored = v2.surface_reach(height(0.45));
-        // A height that rounds to the same millimetre is the same surface.
-        let second = v2.describe(height(0.4502), Some(&camera));
-        assert_eq!(first, second);
-        assert_eq!(v2.reach_memo().grids.len(), 1);
-        assert!(Arc::ptr_eq(&stored, &v2.surface_reach(height(0.4498))));
-        assert_eq!(stored.len(), Limits::STANDARD.grid.points().len());
+        let view_check = v2.unlinked_view_check();
+        assert_eq!(view_check, ViewCheck::NoCameraGeometry { camera: "chest" });
+        let unchecked =
+            "The view is not checked: no camera geometry is linked for the chest camera.";
+        let checked = v2.check(&positions(&[0.30, 0.0, 0.45]), &view_check);
+        let [point] = checked.points.as_slice() else {
+            panic!("one point answered: {checked:?}");
+        };
+        assert!(point.reach.reached(), "{point:?}");
+        assert_eq!(point.view, View::NoCamera);
+        assert_eq!(
+            checked.message,
+            format!("The point is workable. {unchecked}")
+        );
+        let surface = v2.describe(height(0.45), &view_check);
+        assert!(surface.workable, "{}", surface.message);
+        assert_eq!(surface.view, None);
+        assert!(surface.message.ends_with(unchecked), "{}", surface.message);
     }
 
     #[test]
-    fn the_reach_memo_drops_the_height_it_stored_first_past_its_bound() {
-        let grid = |by: f64| -> Arc<[Reach]> { Arc::from(vec![Reach::Short { by }]) };
-        let mut memo = ReachMemo::new(2);
-        memo.insert(height(0.1), grid(0.1));
-        memo.insert(height(0.2), grid(0.2));
-        let kept = memo.insert(height(0.1), grid(0.9));
-        assert_eq!(kept[0], Reach::Short { by: 0.1 }, "the stored grid stands");
-        memo.insert(height(0.3), grid(0.3));
-        assert_eq!(memo.grids.len(), 2);
-        assert!(
-            memo.get(height(0.1)).is_none(),
-            "stored first, dropped first"
-        );
+    fn a_measured_surface_is_stored_and_its_height_answers_from_the_stored_reach() {
+        let v2 = workspace(HardwareVersion::V2);
+        let view = chest_view(&v2);
+        let table = height(0.45);
+        assert!(v2.describe(table, &view).workable);
+        assert_eq!(v2.reach_memo().len(), 1);
+        let table_reach = SurfaceReach::measure(table, |target| v2.reach(target));
         assert_eq!(
-            memo.get(height(0.2)).expect("kept")[0],
-            Reach::Short { by: 0.2 }
+            v2.reach_memo().get(table),
+            Some(table_reach),
+            "the reach measured for the table is stored"
         );
-        assert_eq!(
-            memo.get(height(0.3)).expect("kept")[0],
-            Reach::Short { by: 0.3 }
-        );
-    }
-
-    #[test]
-    fn a_surface_height_is_parsed_to_the_millimetre_and_a_non_finite_one_is_refused() {
-        assert_eq!(height(0.4504), height(0.45));
-        assert_eq!(height(0.4506).metres(), 0.451);
-        assert_eq!(height(-0.0004).metres(), 0.0);
-        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            assert_eq!(
-                SurfaceHeight::from_wire(bad),
-                Err(NON_FINITE_SURFACE_HEIGHT)
-            );
-        }
-    }
-
-    #[test]
-    fn positions_are_parsed_into_points_and_refused_when_empty_ragged_or_not_finite() {
-        assert_eq!(
-            positions(&[0.1, 0.2, 0.3, 0.4, 0.5, 0.6]).0,
-            [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]
-        );
-        assert_eq!(Positions::from_wire(&[]), Err(NO_POSITIONS));
-        assert_eq!(
-            Positions::from_wire(&[0.1, 0.2, 0.3, 0.4]),
-            Err(POSITIONS_NOT_TRIPLES)
-        );
-        assert_eq!(
-            Positions::from_wire(&[0.1, f64::NAN, 0.3]),
-            Err(NON_FINITE_POSITION)
-        );
-        assert_eq!(
-            Positions::from_wire(&[0.1, 0.2, f64::INFINITY]),
-            Err(NON_FINITE_POSITION)
-        );
-        assert_eq!(
-            Positions::from_wire(&[1e200, 0.0, 0.0]),
-            Err(DISTANT_POSITION)
-        );
-        assert_eq!(
-            Positions::from_wire(&[0.0, -1000.5, 0.0]),
-            Err(DISTANT_POSITION)
-        );
+        // The arms reach part of a shelf 0.30 m up, but the reach stored for
+        // its height says that no arm reaches any of it: the answer is the
+        // stored one.
+        let shelf = height(0.30);
+        let shelf_reach = SurfaceReach::measure(shelf, |target| v2.reach(target));
+        assert!(shelf_reach.reaches().iter().any(Reach::reached));
+        v2.reach_memo()
+            .insert(SurfaceReach::measure(shelf, |_| Reach::Short { by: 0.5 }));
+        let answer = v2.describe(shelf, &view);
+        assert!(!answer.workable);
+        assert_eq!(answer.reach, None, "{}", answer.message);
+        assert_eq!(v2.reach_memo().len(), 2);
     }
 
     #[test]
     fn a_point_at_the_coordinate_bound_falls_short_by_a_finite_distance() {
         let v2 = workspace(HardwareVersion::V2);
-        let answer = v2.check(&positions(&[MAX_COORDINATE, 0.0, 0.0]), None);
-        let Reach::Short { by } = answer.points[0].reach else {
+        let Reach::Short { by } = v2.reach([MAX_COORDINATE, 0.0, 0.0]) else {
             panic!("a kilometre ahead is out of reach");
         };
         assert!(by.is_finite() && by > 990.0, "{by}");

@@ -6,13 +6,12 @@ from pathlib import Path
 import subprocess
 import sys
 
-from ci_containers import container_command, derive_test_image, log_group
+from ci_containers import CARGO_HOME, cargo_home_bind, container_command, derive_test_image, log_group
 
 
 def main() -> int:
     cache = Path(os.environ["CI_CACHE_DIR"])
     temporary = Path(os.environ["RUNNER_TEMP"])
-    (cache / "cargo-home").mkdir(parents=True, exist_ok=True)
     projects = (temporary / "rust-test-dirs.txt").read_text().splitlines()
     stale = []
     reports = []
@@ -21,8 +20,8 @@ def main() -> int:
         image = derive_test_image(project, "peppybot/rust-cargo-base:latest")
         command = container_command(
             project, image,
-            binds=[f"{cache / 'cargo-home'}:/cargo", os.environ["PEPPY_HOME"]],
-            variables={"CARGO_HOME": "/cargo", "RUSTUP_HOME": "/root/.rustup"},
+            binds=[cargo_home_bind(cache), os.environ["PEPPY_HOME"]],
+            variables={"CARGO_HOME": CARGO_HOME, "RUSTUP_HOME": "/root/.rustup"},
         )
         result = subprocess.run(
             [*command, "cargo", "metadata", "--locked", "--format-version", "1"],

@@ -262,7 +262,7 @@ wheels = [
 [[package]]
 name = "control-core-py"
 version = "0.1.0"
-source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=control_core_py#1238f466201316c0ed57dab1cd626237b0b3db50" }
+source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=control_core_py&rev=997a29ffad6baf99e02966659ca91345fd1b07c0#997a29ffad6baf99e02966659ca91345fd1b07c0" }
 
 [[package]]
 name = "eigenpy"
@@ -867,6 +867,7 @@ dependencies = [
     { name = "peppygen" },
     { name = "peppylib" },
     { name = "so101-description", extra = ["kinematics"] },
+    { name = "workspace-core-py" },
 ]
 
 [package.dev-dependencies]
@@ -877,10 +878,11 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "control-core-py", git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=control_core_py" },
+    { name = "control-core-py", git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=control_core_py&rev=997a29ffad6baf99e02966659ca91345fd1b07c0" },
     { name = "peppygen", directory = ".peppy/libs/peppygen" },
     { name = "peppylib", directory = ".peppy/libs/peppylib" },
-    { name = "so101-description", extras = ["kinematics"], git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=so101_description" },
+    { name = "so101-description", extras = ["kinematics"], git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=so101_description&rev=997a29ffad6baf99e02966659ca91345fd1b07c0" },
+    { name = "workspace-core-py", git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=workspace_core_py&rev=997a29ffad6baf99e02966659ca91345fd1b07c0" },
 ]
 
 [package.metadata.requires-dev]
@@ -892,7 +894,7 @@ dev = [
 [[package]]
 name = "so101-description"
 version = "0.1.0"
-source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=so101_description#1238f466201316c0ed57dab1cd626237b0b3db50" }
+source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=so101_description&rev=997a29ffad6baf99e02966659ca91345fd1b07c0#997a29ffad6baf99e02966659ca91345fd1b07c0" }
 dependencies = [
     { name = "control-core-py" },
     { name = "numpy" },
@@ -969,3 +971,8 @@ sdist = { url = "https://files.pythonhosted.org/packages/3d/7a/f98d4ada7c499565a
 wheels = [
     { url = "https://files.pythonhosted.org/packages/39/cc/9c0adc5861020de426ec71716b6c1bef8d90694b7d6d0a16202cdb1647f5/wcwidth-0.8.4-py3-none-any.whl", hash = "sha256:2097bb1d28a0ba8fe177c2eb607317f9b1627b03f33ebebfd3da670b337a65ba", size = 299474, upload-time = "2026-09-17T23:31:43.816Z" },
 ]
+
+[[package]]
+name = "workspace-core-py"
+version = "0.1.0"
+source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=workspace_core_py&rev=997a29ffad6baf99e02966659ca91345fd1b07c0#997a29ffad6baf99e02966659ca91345fd1b07c0" }

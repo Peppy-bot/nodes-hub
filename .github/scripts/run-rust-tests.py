@@ -18,7 +18,7 @@ import shutil
 import subprocess
 import sys
 
-from ci_containers import container_command, derive_test_image, log_group
+from ci_containers import CARGO_HOME, cargo_home_bind, container_command, derive_test_image, log_group
 
 
 def target_dir(cache: Path, project: str) -> Path:
@@ -65,17 +65,16 @@ def main() -> int:
         image = derive_test_image(project, "peppybot/rust-cargo-base:latest")
         target = target_dir(cache, project)
         target.mkdir(parents=True, exist_ok=True)
-        (cache / "cargo-home").mkdir(parents=True, exist_ok=True)
         command = container_command(
             project, image,
             binds=[
-                f"{cache / 'cargo-home'}:/cargo",
+                cargo_home_bind(cache),
                 f"{target}:/target",
                 f"{temporary / 'peppy-dist'}:/peppy-dist",
                 os.environ["PEPPY_HOME"],
             ],
             variables={
-                "CARGO_HOME": "/cargo",
+                "CARGO_HOME": CARGO_HOME,
                 "RUSTUP_HOME": "/root/.rustup",
                 "CARGO_TARGET_DIR": "/target",
                 "CARGO_INCREMENTAL": "0",

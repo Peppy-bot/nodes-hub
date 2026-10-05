@@ -20,11 +20,11 @@ use peppygen::exposed_services::workspace::{check_positions, describe_workspace}
 use peppylib::runtime::CancellationToken;
 use tracing::info;
 use workspace_core::Camera;
+use workspace_core::design::{Positions, SurfaceHeight, ViewCheck};
 
 use crate::serving;
 use crate::workspace::{
-    CameraGeometryError, PerceptionCamera, Positions, SurfaceHeight, Workspace, depth_from_wire,
-    intrinsics_from_wire,
+    CameraGeometryError, PerceptionCamera, Workspace, depth_from_wire, intrinsics_from_wire,
 };
 
 /// How long a request waits for each of the camera's answers: short, so a
@@ -95,17 +95,17 @@ fn describe(
     };
     let height = match SurfaceHeight::from_wire(surface_height) {
         Ok(height) => height,
-        Err(reason) => return refused(reason.to_owned()),
-    };
-    let camera = match read_camera(runner, workspace) {
-        Ok(camera) => camera,
         Err(e) => return refused(e.to_string()),
     };
-    let answer = workspace.describe(height, camera.as_ref());
+    let view_check = match read_view_check(runner, workspace) {
+        Ok(view_check) => view_check,
+        Err(e) => return refused(e.to_string()),
+    };
+    let answer = workspace.describe(height, &view_check);
     describe_workspace::Response::new(
         true,
         answer.message,
-        perception_camera_name(workspace),
+        perception_camera_name(&view_check),
         answer.workable,
         answer.area,
         answer.rectangle,
@@ -125,13 +125,13 @@ fn check(
     };
     let positions = match Positions::from_wire(positions) {
         Ok(positions) => positions,
-        Err(reason) => return refused(reason.to_owned()),
-    };
-    let camera = match read_camera(runner, workspace) {
-        Ok(camera) => camera,
         Err(e) => return refused(e.to_string()),
     };
-    let answer = workspace.check(&positions, camera.as_ref());
+    let view_check = match read_view_check(runner, workspace) {
+        Ok(view_check) => view_check,
+        Err(e) => return refused(e.to_string()),
+    };
+    let answer = workspace.check(&positions, &view_check);
     let all_workable = answer.all_workable();
     let results = answer
         .points
@@ -150,7 +150,7 @@ fn check(
     check_positions::Response::new(
         true,
         answer.message,
-        perception_camera_name(workspace),
+        perception_camera_name(&view_check),
         all_workable,
         results,
     )
@@ -158,25 +158,27 @@ fn check(
 
 /// The perception camera's name as the answers carry it: "" for a robot
 /// without one.
-fn perception_camera_name(workspace: &Workspace) -> String {
-    workspace
+fn perception_camera_name(view_check: &ViewCheck<'_>) -> String {
+    view_check
         .perception_camera()
-        .map_or_else(String::new, |camera| camera.name.to_owned())
+        .unwrap_or_default()
+        .to_owned()
 }
 
-/// The perception camera, placed by the design and seen through the
-/// geometry the linked camera gives now; none when the robot has no
-/// perception camera or no camera is linked, so its view is not checked.
-/// Run from a handler: it blocks in place on the runtime for the answers.
-fn read_camera(
+/// How the answer checks the view: through the perception camera, placed by
+/// the design and seen through the geometry the linked camera gives now; not
+/// at all when the robot has no perception camera or no camera is linked
+/// ([`Workspace::unlinked_view_check`]). Run from a handler: it blocks in
+/// place on the runtime for the answers.
+fn read_view_check(
     runner: &NodeRunner,
     workspace: &Workspace,
-) -> Result<Option<Camera>, CameraGeometryError> {
-    let Some(perception) = workspace.perception_camera() else {
-        return Ok(None);
-    };
-    let Some(linked) = get_color_intrinsics::bound_producer(runner) else {
-        return Ok(None);
+) -> Result<ViewCheck<'static>, CameraGeometryError> {
+    let (Some(perception), Some(linked)) = (
+        workspace.perception_camera(),
+        get_color_intrinsics::bound_producer(runner),
+    ) else {
+        return Ok(workspace.unlinked_view_check());
     };
     let (colour, depth) = tokio::runtime::Handle::current().block_on(async {
         tokio::join!(
@@ -184,7 +186,10 @@ fn read_camera(
             get_depth_intrinsics::poll(runner, linked, GEOMETRY_TIMEOUT),
         )
     });
-    camera_from_answers(perception, colour, depth).map(Some)
+    Ok(ViewCheck::Checked {
+        camera: perception.name,
+        geometry: camera_from_answers(perception, colour, depth)?,
+    })
 }
 
 /// The perception camera seen through the linked camera's two answers, or

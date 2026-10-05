@@ -15,7 +15,7 @@ kinematics module.
 | `so101_follower` | The real arm. Pure follower: `joint_link` + `gripper_link` follower slots on one node (one process must own the serial port), `component_ready`, `motor_health`, `alert`. No motion logic. |
 | `so101_leader` | The passive leader arm as a teleop device. Open-loop `joint_link` + `gripper_link` leader; staleness is the deadman (the hardware has no engage button). |
 | [`robot_initializer`](../robot_initializer) | The node every robot uses, run with `model: "so101"`: answers who the robot is on `get_identity` and whether it is ready on `is_ready`, from the follower's readiness on hardware and from the simulation standing it in a simulation, which it joins as the `so101` model. |
-| `so101_backbone` | The motion authority in between. Follower role toward whatever leads (joint, pose, or gripper streams), leader role toward the follower; exposes the `limb_motion` and `postures` move actions, the `limb_motion` services (`stop` ends every planned move in flight, whoever started it, each goal then ending as cancelled with `stopped: <reason>`; `check_arm_move` runs a `move_arm` goal's solve from the same anchor and moves nothing) and the `limb_state` readout. Every pose is in the URDF's `base_link` frame, the robot frame the contracts define: `+x` the way the robot faces, `+z` up. A joints-led stream passes through under the end-effector-speed governor, its only limiter; a pose-led stream is reach-clipped, solved, and rate-stepped per joint before that same governor. Move actions run minimum-jerk plans sized by the per-joint velocity caps, and Cartesian moves additionally by the EE speed caps. A gripper move ramps at the gripper rate cap and ends once the measured gripper stands still, on its target or short of it where an object holds the jaws. Everything gates on fresh follower state. |
+| `so101_backbone` | The motion authority in between. Follower role toward whatever leads (joint, pose, or gripper streams), leader role toward the follower; exposes the `limb_motion` and `postures` move actions, the `limb_motion` services (`stop` ends every planned move in flight, whoever started it, each goal then ending as cancelled with `stopped: <reason>`; `check_arm_move` runs a `move_arm` goal's solve from the same anchor and moves nothing), the `limb_state` readout and the `workspace` services (`describe_workspace` and `check_positions`: where the arm reaches, from the design alone; see [Workspace](#workspace)). Every pose is in the URDF's `base_link` frame, the robot frame the contracts define: `+x` the way the robot faces, `+z` up. A joints-led stream passes through under the end-effector-speed governor, its only limiter; a pose-led stream is reach-clipped, solved, and rate-stepped per joint before that same governor. Move actions run minimum-jerk plans sized by the per-joint velocity caps, and Cartesian moves additionally by the EE speed caps. A gripper move ramps at the gripper rate cap and ends once the measured gripper stands still, on its target or short of it where an object holds the jaws. Everything gates on fresh follower state. |
 
 ```text
 so101_leader ──joint+gripper──▶ so101_backbone ──joint+gripper──▶ so101_follower
@@ -163,6 +163,80 @@ This is accepted for now. Teleop through `xr_commander` drives the streaming
 path, which is best effort and unverified by design, and is unaffected. The
 cost falls on scripted `move_arm` goals.
 
+## Workspace
+
+The backbone implements `workspace:v1`. `describe_workspace` and
+`check_positions` tell where the robot can work, from its design alone, in
+the robot frame (the URDF's `base_link` frame). The answers know nothing of
+the room: a surface is a flat, level plane at the height that the request
+gives, with nothing on it.
+
+- **Reach.** The arm `arm` reaches a point when the `ApproachSolver` of
+  `so101_description` finds joints inside the joint limits that put the grasp
+  point within 1 cm of the point, with the approach axis of the gripper
+  within 0.05 rad of straight down or straight forward. Forward kinematics
+  verifies the joints. The backbone tries down first, then forward, for each
+  point. The roll of the gripper about its approach axis is free. For a point
+  that the reach sphere of the solver rules out at 1 cm, the solver gives no
+  joints at once and does no search (see `ApproachSolver` in
+  `so101_description.kinematics`).
+- **Short by.** For a point that the arm does not reach, `short_by` is the
+  least distance: the distance from the point to the nearest grasp point that
+  the search of the solver finds, in any orientation. The search of the solver
+  is local, so this distance can be longer than the true least distance. Thus
+  this distance does not decide whether the arm reaches a point. `short_by` is
+  this distance also when the grasp point gets within 1 cm of the point, but
+  in no grasp direction. The documentation of `ApproachSolver` and
+  `ApproachSolver.least_distance` gives how far from the true least distance
+  this distance can be, and the measured rates at which the solver reaches
+  points.
+- **Grasp point.** The grasp point is the origin of `gripper_frame_link`, the
+  fixed frame that `limb_state` reports. On this gripper the midpoint between
+  the pads moves with the opening, so this frame is an approximation of the
+  grasp point of the contracts (see [URDF](#urdf)).
+- **View.** The robot has no perception camera: its one camera, `wrist`, is
+  on the arm. Thus `perception_camera` is `""`, the view of each point is
+  `no_camera`, and the messages say that the view is not checked. A point is
+  workable when the arm reaches it.
+
+The grid, the limits, the parsing of a request and its refusals, the reach
+memo, and the composition of each answer and its messages come from
+`workspace_core_py`, the Python bindings of `workspace_core`. Thus these
+answers read the same as the answers of the OpenArm and of a simulation. The
+backbone refuses a height that is not a finite number or that is more than
+1000 m from the base point, an empty position list, a list that does not
+divide into points of 3 values, a value that is not a finite number, and a
+coordinate more than 1000 m from the base point.
+Both services read nothing of the arm and move nothing, so they answer from
+bringup, also when no follower state comes in.
+
+The solver work for one surface (663 grid targets) lasts many ticks of the
+control loop (the documentation of `ApproachSolver` gives its measured time).
+The process of the backbone runs the control loop, and only one of its threads
+runs Python at a time. Thus the backbone does the solver work in one worker
+process, with a solver of its own. It starts this process with the `spawn`
+method at the first request. On a loaded AMD EPYC Genoa, the start of the
+worker with a first point took 0.22 to 0.27 s of wall time. A request sends
+its points to the worker in chunks of one surface (663 points), the next chunk
+when the worker has measured the chunk before it. The worker measures one
+chunk at a time, in the order that the requests send them. Thus a request
+waits for at most one chunk of each request in front of it.
+
+The backbone keeps the reach of the last 32 surface heights (to the
+millimetre) in its own process. A height that it keeps gets its answer
+without the worker: on that host, in a median time of about 0.1 ms. When the
+backbone keeps 32 heights, a new height replaces the height that it kept
+first.
+
+When the node stops, the worker stops after the chunk that it measures. The
+worker also stops when the process of the backbone stops without a shutdown.
+If the worker stops while it has a chunk, the backbone refuses the request
+of that chunk. If the worker stops while it has no chunk, the next chunk
+starts a new worker. But if that chunk goes to the process pool of the
+worker before the pool has seen that the worker stopped, the backbone
+refuses the request of that chunk, and the chunk after it starts a new
+worker.
+
 ## Serial devices
 
 The follower and leader adapters are identical USB serial bridges. Install
@@ -171,10 +245,10 @@ The follower and leader adapters are identical USB serial bridges. Install
 
 ## Shared libraries
 
-Two libs in the
+Three libs in the
 [public-peppy-libs](https://github.com/Peppy-bot/public-peppy-libs)
-repository, consumed as uv git dependencies exactly like the Rust nodes
-consume `control_core`:
+repository, consumed as uv git dependencies like the Rust nodes consume
+`control_core`:
 
 - `control_core_py`: generic Python node plumbing (asyncio stream helpers,
   parameter validators, the hardware device-thread skeleton). Nothing
@@ -182,18 +256,26 @@ consume `control_core`:
 - `so101_description`: the robot's identity (joint and motor names, wire
   units, limb names, the named postures, STS3215-shaped setpoint parsing,
   the lerobot device boundary, and the embedded kinematics URDF with its
-  TCP frame, parsed limits, and placo FK/IK behind a `kinematics` extra),
-  `openarm_description`'s sibling. A future arm adds its own description
-  and reuses `control_core_py` unchanged.
+  TCP frame, parsed limits, and placo FK/IK behind a `kinematics` extra,
+  with the `ApproachSolver` of the workspace answers),
+  `openarm_description`'s sibling.
+- `workspace_core_py`: the Python bindings of `workspace_core`, for the
+  backbone only: the parsing of a `workspace:v1` request, the grid, the
+  reach memo, and the answers of a robot without a perception camera. It is
+  a PyO3 extension that uv builds from its source, so the image of the
+  backbone installs a Rust toolchain for the build and removes it after.
 
-The pyprojects pin `main`, like the Rust nodes' `control_core`.
+The follower and the leader follow `main`, like the Rust nodes'
+`control_core`. The backbone pins its three libs at one commit (`rev`), so
+they always come from one state of that repository.
 
 ## Testing
 
 Each node carries pure-logic tests (parsing, health policy, governor and
-coordinator arbitration, action lifecycles); the follower, leader, and
-backbone add peppygen harness tests that boot the node in-process against
-mocked pairing peers and fake hardware.
+coordinator arbitration, action lifecycles, and the workspace answers of the
+backbone with its worker process); the follower, leader, and backbone add
+peppygen harness tests that boot the node in-process against mocked pairing
+peers and fake hardware.
 
 ```sh
 cd <node> && peppy node sync
