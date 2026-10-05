@@ -392,10 +392,10 @@ class ActionLayer:
 
     async def drive_posture(self, ctx, plan: ArmPlan | None, kinematics) -> None:
         """Wait until the plan ends, a cancel comes or a stop comes. Then
-        complete the goal with the grasp pose of the arm, from the joints
-        that the follower measures at that time, whatever the value of
-        success. All terminal paths, also a walked-back admission, use the
-        same rule (see _measured_grasp_pose)."""
+        complete the goal with the grasp pose of the arm, whatever the value
+        of success. The pose comes from the joints that the follower measures
+        at that time. All terminal paths, also a walked-back admission, use
+        the same rule (see _measured_grasp_pose)."""
         if plan is None:
             note, pose = self._measured_grasp_pose(kinematics)
             await _complete_guarded(

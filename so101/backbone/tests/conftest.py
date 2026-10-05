@@ -1,6 +1,13 @@
-"""Shared fixtures: a config, wide limits, the measured joints, a fake
-kinematics, a follower whose liveness does not ride the host's clock, one
-gripper control tick, and the targets and checks of the workspace tests."""
+"""Shared fixtures:
+
+- a config;
+- wide limits;
+- the measured joints;
+- a fake kinematics;
+- a follower whose liveness does not ride the host's clock;
+- one gripper control tick;
+- the targets and checks of the workspace tests.
+"""
 
 from __future__ import annotations
 
