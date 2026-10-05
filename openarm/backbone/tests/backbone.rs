@@ -448,6 +448,46 @@ async fn await_streaming(
     Ok(())
 }
 
+/// The left arm and the left gripper of a node that
+/// [`start_with_left_followers`] started.
+struct LeftFollowers {
+    /// The latest position the left arm adopted.
+    arm: watch::Receiver<[f64; 7]>,
+    gripper: LeftGripper,
+}
+
+/// Start the node with the robot ready and wait until streaming begins.
+/// - The left arm is a perfect follower (see [`spawn_left_arm_follower`]).
+/// - The left gripper lags its commands, and an object stops its jaws at
+///   `object_at` (see [`spawn_left_gripper_follower`]).
+/// - The right arm stands at [`HOME`] and the right gripper is half open.
+async fn start_with_left_followers(object_at: f64) -> peppygen::Result<(Harness, LeftFollowers)> {
+    let (harness, mocks) = start_ready_vacant(params()).await?;
+    pump_is_ready(
+        mocks.deps.robot_init.is_ready,
+        Arc::new(AtomicBool::new(true)),
+    );
+    let arm = spawn_left_arm_follower(
+        mocks.pairings.left_arm.joint_states,
+        mocks.pairings.left_arm.joint_setpoints,
+    );
+    pump_arm_at_home!(
+        mocks.pairings.right_arm.joint_states,
+        peppygen::paired_topics::right_arm::joint_states
+    );
+    pump_gripper_half_open!(
+        mocks.pairings.right_gripper.gripper_states,
+        peppygen::paired_topics::right_gripper::gripper_states
+    );
+    let gripper = spawn_left_gripper_follower(
+        mocks.pairings.left_gripper.gripper_states,
+        mocks.pairings.left_gripper.gripper_setpoints,
+        object_at,
+    );
+    await_streaming(mocks.pairings.right_arm.joint_setpoints).await?;
+    Ok((harness, LeftFollowers { arm, gripper }))
+}
+
 /// The next limb_states snapshot the node emits. The node emits one only
 /// once it has seeded every limb, so the first one also says that streaming
 /// began.
@@ -485,11 +525,11 @@ struct PostureResult {
 }
 
 /// Send one goal of `$action` (move_to_ready or move_to_home) with
-/// `$duration_s`, and wait for the result it completes with.
-macro_rules! complete_posture {
+/// `$duration_s`, and give the node's answer to it.
+macro_rules! send_posture_goal {
     ($harness:expr, $action:ident, $duration_s:expr) => {{
         use peppygen::fixtures::exposed_actions::postures::$action;
-        let goal = $action::send_goal(
+        $action::send_goal(
             &$harness,
             &$action::GoalRequestData {
                 duration_s: $duration_s,
@@ -497,7 +537,31 @@ macro_rules! complete_posture {
             peppygen::QoSProfile::Reliable,
             DEADLINE,
         )
-        .await?;
+        .await?
+    }};
+}
+
+/// Send one goal of `$action` with `$duration_s`, and assert that the node
+/// refuses it as an invalid duration.
+macro_rules! assert_posture_refused {
+    ($harness:expr, $action:ident, $duration_s:expr) => {{
+        let goal = send_posture_goal!($harness, $action, $duration_s);
+        assert!(
+            !goal.accepted,
+            "a {} s {} must be refused",
+            $duration_s,
+            stringify!($action)
+        );
+        assert_eq!(goal.reason.as_deref(), Some("invalid duration"));
+    }};
+}
+
+/// Send one goal of `$action` with `$duration_s`, and wait for the result
+/// it completes with.
+macro_rules! complete_posture {
+    ($harness:expr, $action:ident, $duration_s:expr) => {{
+        use peppygen::fixtures::exposed_actions::postures::$action;
+        let goal = send_posture_goal!($harness, $action, $duration_s);
         assert!(
             goal.accepted,
             "{} rejected: {:?}",
@@ -912,29 +976,7 @@ async fn move_gripper_answers_with_the_opening_the_lagging_jaws_stopped_at() -> 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_gripper_held_by_an_object_keeps_its_closing_command_after_the_move()
 -> peppygen::Result<()> {
-    let (harness, mocks) = start_ready_vacant(params()).await?;
-    pump_is_ready(
-        mocks.deps.robot_init.is_ready,
-        Arc::new(AtomicBool::new(true)),
-    );
-    spawn_left_arm_follower(
-        mocks.pairings.left_arm.joint_states,
-        mocks.pairings.left_arm.joint_setpoints,
-    );
-    pump_arm_at_home!(
-        mocks.pairings.right_arm.joint_states,
-        peppygen::paired_topics::right_arm::joint_states
-    );
-    pump_gripper_half_open!(
-        mocks.pairings.right_gripper.gripper_states,
-        peppygen::paired_topics::right_gripper::gripper_states
-    );
-    let gripper = spawn_left_gripper_follower(
-        mocks.pairings.left_gripper.gripper_states,
-        mocks.pairings.left_gripper.gripper_setpoints,
-        0.3,
-    );
-    await_streaming(mocks.pairings.right_arm.joint_setpoints).await?;
+    let (harness, LeftFollowers { gripper, .. }) = start_with_left_followers(0.3).await?;
 
     let squeeze = GripperSetpoint {
         opening: 0.0,
@@ -1236,28 +1278,7 @@ async fn goals_for_unknown_limb_names_are_refused() -> peppygen::Result<()> {
 async fn a_stop_ends_every_move_in_flight_and_a_later_goal_runs() -> peppygen::Result<()> {
     use peppygen::fixtures::exposed_services::limb_motion::stop;
 
-    let (harness, mocks) = start_ready_vacant(params()).await?;
-    pump_is_ready(
-        mocks.deps.robot_init.is_ready,
-        Arc::new(AtomicBool::new(true)),
-    );
-    let followed = spawn_left_arm_follower(
-        mocks.pairings.left_arm.joint_states,
-        mocks.pairings.left_arm.joint_setpoints,
-    );
-    pump_arm_at_home!(
-        mocks.pairings.right_arm.joint_states,
-        peppygen::paired_topics::right_arm::joint_states
-    );
-    pump_gripper_half_open!(
-        mocks.pairings.right_gripper.gripper_states,
-        peppygen::paired_topics::right_gripper::gripper_states
-    );
-    let jaws = spawn_lagging_left_gripper_follower(
-        mocks.pairings.left_gripper.gripper_states,
-        mocks.pairings.left_gripper.gripper_setpoints,
-    );
-    await_streaming(mocks.pairings.right_arm.joint_setpoints).await?;
+    let (harness, LeftFollowers { arm, gripper }) = start_with_left_followers(0.0).await?;
 
     // Nothing moves: the stop stops nothing.
     let idle = stop::poll(
@@ -1304,7 +1325,7 @@ async fn a_stop_ends_every_move_in_flight_and_a_later_goal_runs() -> peppygen::R
         "goal rejected: {:?}",
         gripper_goal.reason
     );
-    let mut moving = jaws.clone();
+    let mut moving = gripper.jaws.clone();
     tokio::time::timeout(
         DEADLINE,
         moving.wait_for(|opening| (opening - 0.5).abs() > 0.05),
@@ -1340,7 +1361,7 @@ async fn a_stop_ends_every_move_in_flight_and_a_later_goal_runs() -> peppygen::R
     assert!(!data.success);
     assert_eq!(data.message, "stopped: the operator asked");
     // The arm holds short of the target it was on its way to.
-    let held = *followed.borrow();
+    let held = *arm.borrow();
     assert!(
         (held[1] - target[1]).abs() > 0.1,
         "the arm went on to the target after the stop: {held:?}"
@@ -1359,29 +1380,7 @@ async fn a_stop_ends_every_move_in_flight_and_a_later_goal_runs() -> peppygen::R
 async fn a_stop_leaves_a_settled_gripper_closed() -> peppygen::Result<()> {
     use peppygen::fixtures::exposed_services::limb_motion::stop;
 
-    let (harness, mocks) = start_ready_vacant(params()).await?;
-    pump_is_ready(
-        mocks.deps.robot_init.is_ready,
-        Arc::new(AtomicBool::new(true)),
-    );
-    spawn_left_arm_follower(
-        mocks.pairings.left_arm.joint_states,
-        mocks.pairings.left_arm.joint_setpoints,
-    );
-    pump_arm_at_home!(
-        mocks.pairings.right_arm.joint_states,
-        peppygen::paired_topics::right_arm::joint_states
-    );
-    pump_gripper_half_open!(
-        mocks.pairings.right_gripper.gripper_states,
-        peppygen::paired_topics::right_gripper::gripper_states
-    );
-    let gripper = spawn_left_gripper_follower(
-        mocks.pairings.left_gripper.gripper_states,
-        mocks.pairings.left_gripper.gripper_setpoints,
-        0.0,
-    );
-    await_streaming(mocks.pairings.right_arm.joint_setpoints).await?;
+    let (harness, LeftFollowers { gripper, .. }) = start_with_left_followers(0.0).await?;
 
     let data = complete_left_gripper_move(&harness, 0.1, 0.0).await?;
     assert!(data.success, "{}", data.message);
@@ -1481,8 +1480,6 @@ async fn a_posture_goal_before_the_first_measurement_reports_no_pose() -> peppyg
 /// admission, for both postures.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_posture_goal_above_the_duration_ceiling_is_refused() -> peppygen::Result<()> {
-    use peppygen::fixtures::exposed_actions::postures::{move_to_home, move_to_ready};
-
     let (harness, mocks) = start_ready_vacant(params()).await?;
     pump_is_ready(
         mocks.deps.robot_init.is_ready,
@@ -1495,24 +1492,8 @@ async fn a_posture_goal_above_the_duration_ceiling_is_refused() -> peppygen::Res
     pump_right_arm_and_grippers!(mocks);
     await_streaming(mocks.pairings.right_arm.joint_setpoints).await?;
 
-    let ready = move_to_ready::send_goal(
-        &harness,
-        &move_to_ready::GoalRequestData { duration_s: 601.0 },
-        peppygen::QoSProfile::Reliable,
-        DEADLINE,
-    )
-    .await?;
-    assert!(!ready.accepted, "a 601 s move_to_ready must be refused");
-    assert_eq!(ready.reason.as_deref(), Some("invalid duration"));
-    let home = move_to_home::send_goal(
-        &harness,
-        &move_to_home::GoalRequestData { duration_s: 601.0 },
-        peppygen::QoSProfile::Reliable,
-        DEADLINE,
-    )
-    .await?;
-    assert!(!home.accepted, "a 601 s move_to_home must be refused");
-    assert_eq!(home.reason.as_deref(), Some("invalid duration"));
+    assert_posture_refused!(harness, move_to_ready, 601.0);
+    assert_posture_refused!(harness, move_to_home, 601.0);
     harness.shutdown().await
 }
 
@@ -1541,13 +1522,7 @@ async fn a_stopped_posture_reports_where_the_arms_stopped() -> peppygen::Result<
     pump_right_arm_and_grippers!(mocks);
     next_snapshot(&mut harness).await?;
 
-    let goal = move_to_ready::send_goal(
-        &harness,
-        &move_to_ready::GoalRequestData { duration_s: 30.0 },
-        peppygen::QoSProfile::Reliable,
-        DEADLINE,
-    )
-    .await?;
+    let goal = send_posture_goal!(harness, move_to_ready, 30.0);
     assert!(goal.accepted, "goal rejected: {:?}", goal.reason);
     let mut moving = left.followed.clone();
     tokio::time::timeout(
@@ -1605,29 +1580,7 @@ async fn a_stopped_posture_reports_where_the_arms_stopped() -> peppygen::Result<
 /// move_to_home, and gets no opening other than that one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_posture_move_leaves_the_grippers_alone() -> peppygen::Result<()> {
-    let (harness, mocks) = start_ready_vacant(params()).await?;
-    pump_is_ready(
-        mocks.deps.robot_init.is_ready,
-        Arc::new(AtomicBool::new(true)),
-    );
-    spawn_left_arm_follower(
-        mocks.pairings.left_arm.joint_states,
-        mocks.pairings.left_arm.joint_setpoints,
-    );
-    pump_arm_at_home!(
-        mocks.pairings.right_arm.joint_states,
-        peppygen::paired_topics::right_arm::joint_states
-    );
-    pump_gripper_half_open!(
-        mocks.pairings.right_gripper.gripper_states,
-        peppygen::paired_topics::right_gripper::gripper_states
-    );
-    let gripper = spawn_left_gripper_follower(
-        mocks.pairings.left_gripper.gripper_states,
-        mocks.pairings.left_gripper.gripper_setpoints,
-        0.0,
-    );
-    await_streaming(mocks.pairings.right_arm.joint_setpoints).await?;
+    let (harness, LeftFollowers { gripper, .. }) = start_with_left_followers(0.0).await?;
 
     let data = complete_left_gripper_move(&harness, 0.2, 0.0).await?;
     assert!(data.success, "{}", data.message);
