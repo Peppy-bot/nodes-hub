@@ -1515,11 +1515,13 @@ async fn a_posture_goal_above_the_duration_ceiling_is_refused() -> peppygen::Res
     harness.shutdown().await
 }
 
-/// After robot.stop, a posture result gives where the arms stopped: the
-/// left arm, played by a follower the test brakes on its way to Ready, and
-/// the right arm, which stands at HOME. The goal ends cancelled, with
-/// success false, and with the poses limb_state gives for the joints the
-/// arms stand at.
+/// After robot.stop, a posture result gives the pose of each arm measured
+/// when the stop came: the left arm, played by a follower the test brakes
+/// on its way to Ready, and the right arm, which stands at HOME. The test
+/// brakes the left arm and waits until the robot measures it there before
+/// the stop, so each arm rests where it was measured. The goal ends
+/// cancelled, with success false, and with the poses limb_state gives for
+/// those joints.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stopped_posture_reports_where_the_arms_stopped() -> peppygen::Result<()> {
     use peppygen::fixtures::exposed_actions::postures::move_to_ready;

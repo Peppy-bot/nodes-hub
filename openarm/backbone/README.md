@@ -183,7 +183,8 @@ object. So the message of a success is `the move to ready ran its time` or
 arm, m) and `orientations` (4 per arm, `[x, y, z, w]`): the grasp pose of
 each arm in the robot frame, from the joints it measured when its move
 ended, as limb_state gives it for those joints. After a cancel or a stop,
-that is where each arm was when the move ended. When an arm has no such
+that is where each arm was when the move ended. A moving arm can then
+settle a little further, to the setpoint it holds. When an arm has no such
 pose, the three arrays are empty and the message ends with
 `; no arm poses: <arm> has not measured its joints` (a goal during the seed
 wait), `; no arm poses: <arm> stopped reporting its joints` (its follower

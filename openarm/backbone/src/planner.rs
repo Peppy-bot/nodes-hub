@@ -1166,6 +1166,10 @@ mod tests {
         }
     }
 
+    /// A stop ends the move as cancelled with its message. The result gives
+    /// the grasp pose of the joints measured when the stop came, while the
+    /// arm holds the setpoint it was last governed to: a moving arm can
+    /// settle past the pose the result gives.
     #[tokio::test]
     async fn stopping_the_active_move_ends_it_cancelled_with_the_message_and_holds() {
         let held = [0.0; ARM_DOF];
@@ -1184,14 +1188,20 @@ mod tests {
             "move in flight holds the slot"
         );
 
+        let measured_at_stop = [0.1; ARM_DOF];
         let stopped = planner
-            .stop_active("stopped: operator", Ok([0.1; ARM_DOF]), now)
+            .stop_active("stopped: operator", Ok(measured_at_stop), now)
             .await;
         assert!(stopped, "a move was in flight");
         let outcome = done_rx.recv().await.expect("the stopped move reports");
         assert!(!outcome.success);
         assert!(outcome.stopped);
         assert_eq!(outcome.message, "left: stopped: operator");
+        assert_eq!(
+            outcome.grasp,
+            Ok(planner.ee_pose_world(&measured_at_stop)),
+            "the result is where the arm was measured when the stop came"
+        );
         assert!(!busy.load(Ordering::Acquire), "the stop releases the slot");
         assert_eq!(
             planner.setpoint(),
