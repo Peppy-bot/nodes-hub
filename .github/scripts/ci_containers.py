@@ -56,6 +56,20 @@ def test_image_definition(project: Path, fallback_base: str) -> str:
     return f"Bootstrap: docker\nFrom: {base}\n\n%post\n" + "".join(preparation)
 
 
+# Where a suite's cargo keeps the crates it downloads, in the container.
+# Cargo's default home there lies under the runner's home, which --no-home
+# leaves read-only.
+CARGO_HOME = "/cargo"
+
+
+def cargo_home_bind(cache: Path) -> str:
+    """The bind of the CI cache's cargo home at CARGO_HOME, made on first
+    use: the crates every suite's cargo downloads, kept between runs."""
+    home = cache / "cargo-home"
+    home.mkdir(parents=True, exist_ok=True)
+    return f"{home}:{CARGO_HOME}"
+
+
 def derive_test_image(project: str, fallback_base: str) -> Path:
     """Cache whole images by definition hash; failed builds leave no image behind."""
     cache = Path(os.environ["CI_CACHE_DIR"])

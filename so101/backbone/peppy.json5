@@ -4,7 +4,8 @@
 // this node plays the follower role toward the commander (raw setpoints
 // stream in on the leader_* slots and the measured state relays back up
 // them) and the leader role toward the arm. Exposes the joint /
-// Cartesian / gripper move actions and executes them itself; drives the arm
+// Cartesian / gripper move actions and executes them itself; answers where
+// the robot can work (workspace), from its design alone; drives the arm
 // and gripper over the downstream pairings (leader role). Everything the
 // follower executes leaves through the arm / gripper slots, so a recorder
 // observing those slots captures teleop and actions identically.
@@ -23,7 +24,8 @@
     // gripper_frame_link TCP:
     // - the limb_state poses;
     // - the limb_motion goal and result poses;
-    // - the postures result poses.
+    // - the postures result poses;
+    // - the grasp point of the workspace answers.
     // On this single-moving-jaw gripper the pad midpoint shifts with the
     // opening. Thus no static frame is exactly the contracts' grasp point.
     implements: [
@@ -37,6 +39,12 @@
       // Whole-robot posture moves, executed through the same admission and
       // trajectory path as move_arm_joints.
       { name: "postures", tag: "v1", link_id: "postures" },
+      // Where the robot can work, from its design alone: where its arm
+      // reaches, in the robot frame (the URDF's base_link frame), on a flat,
+      // level surface at a given height or at given points. The robot has no
+      // perception camera (its one camera, wrist, rides the arm), so the
+      // answers are on reach alone.
+      { name: "workspace", tag: "v1", link_id: "workspace" },
     ],
     depends_on: {
       pairings: [
@@ -146,6 +154,13 @@
         // solve a move_arm goal runs, from the same anchor.
         { link_id: "limb_motion", name: "stop" },
         { link_id: "limb_motion", name: "check_arm_move" },
+        // Where the robot can work on a surface and whether it can work
+        // given points, answered from bringup: they read the design, never
+        // the arm, so they move nothing and need no follower state. The
+        // reach is measured in a worker process with a solver of its own,
+        // and the reach of the last 32 surface heights is kept.
+        { link_id: "workspace", name: "describe_workspace" },
+        { link_id: "workspace", name: "check_positions" },
       ],
     },
   },

@@ -1,6 +1,6 @@
 """Shared fixtures: a config, wide limits, the measured joints, a fake
-kinematics, a follower whose liveness does not ride the host's clock, and one
-gripper control tick."""
+kinematics, a follower whose liveness does not ride the host's clock, one
+gripper control tick, and the targets and checks of the workspace tests."""
 
 from __future__ import annotations
 
@@ -19,6 +19,20 @@ WIDE_REACH = ReachBall(center=(0.0, 0.0, 0.0), radius=1e9)
 # target of the tests. Thus the grasp point of the measurement is different
 # from the grasp point of each target.
 MEASURED = (0.0, 0.1, 0.2, 0.3, 0.4)
+
+# Targets of the robot frame (m). The arm reaches NEAR pointing down. Its grasp
+# point gets to CLOSE, but in no grasp direction: forward points 0.27 rad away
+# from the plane of the arm there, and down is more than 0.1 m out of reach.
+# FAR is out of the reach of the arm: farther than the arm is long (about
+# 0.5 m from the pan axis), so it is short by more than FAR_SHORT_BY_MORE_THAN.
+NEAR = (0.2, 0.0, 0.04)
+CLOSE = (0.4, 0.1, 0.1)
+FAR = (1.0, 0.0, 0.2)
+FAR_SHORT_BY_MORE_THAN = 0.4
+
+# The sentence each workspace answer of this robot, which has no perception
+# camera, ends with.
+NOT_CHECKED = "The view is not checked: the robot has no perception camera."
 
 
 class FakeKinematics:
@@ -86,6 +100,15 @@ def make_config(**overrides) -> Config:
         "max_gripper_rate_frac_s": 1e9,
     }
     return Config(**{**base, **overrides})
+
+
+def assert_rectangle_inside_reach(answer) -> None:
+    """The workable rectangle of a describe_workspace answer has an area and
+    lies inside the answer's reach bounds, both (x_min, x_max, y_min, y_max)."""
+    x_min, x_max, y_min, y_max = answer.reach
+    r_x_min, r_x_max, r_y_min, r_y_max = answer.rectangle
+    assert x_min <= r_x_min < r_x_max <= x_max
+    assert y_min <= r_y_min < r_y_max <= y_max
 
 
 def gripper_step(coordinator, measured: float, now: float) -> float | None:

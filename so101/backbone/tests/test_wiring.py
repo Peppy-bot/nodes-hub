@@ -1,5 +1,6 @@
 """In-process harness tests: the node booted against mocked pairing peers,
-covering the teleop path, the relays, and the action surface end to end."""
+covering the teleop path, the relays, the action surface and the workspace
+services end to end."""
 
 import asyncio
 import math
@@ -7,7 +8,15 @@ import time
 
 import peppylib
 import pytest
-from conftest import MEASURED
+from conftest import (
+    CLOSE,
+    FAR,
+    FAR_SHORT_BY_MORE_THAN,
+    MEASURED,
+    NEAR,
+    NOT_CHECKED,
+    assert_rectangle_inside_reach,
+)
 from peppygen.exposed_actions.limb_motion import move_arm as move_arm_prod
 from peppygen.exposed_actions.limb_motion import move_arm_joints as move_arm_joints_prod
 from peppygen.exposed_actions.limb_motion import move_gripper as move_gripper_prod
@@ -25,12 +34,22 @@ from peppygen.fixtures.exposed_actions.postures import move_to_home as move_to_h
 from peppygen.fixtures.exposed_actions.postures import move_to_ready as move_to_ready_fx
 from peppygen.exposed_services.limb_motion import check_arm_move as check_arm_move_prod
 from peppygen.exposed_services.limb_motion import stop as stop_prod
+from peppygen.exposed_services.workspace import check_positions as check_positions_prod
+from peppygen.exposed_services.workspace import (
+    describe_workspace as describe_workspace_prod,
+)
 from peppygen.fixtures.exposed_services.limb_motion import (
     check_arm_move as check_arm_move_fx,
 )
 from peppygen.fixtures.exposed_services.limb_motion import stop as stop_fx
 from peppygen.fixtures.exposed_services.limb_state import (
     get_limb_names as get_limb_names_fx,
+)
+from peppygen.fixtures.exposed_services.workspace import (
+    check_positions as check_positions_fx,
+)
+from peppygen.fixtures.exposed_services.workspace import (
+    describe_workspace as describe_workspace_fx,
 )
 from peppygen.paired_topics.arm import joint_states as arm_states_topic
 from peppygen.paired_topics.leader_arm import joint_states as upstream_states_topic
@@ -41,10 +60,14 @@ from peppygen.parameters import Parameters
 from so101_description import postures
 from so101_description.kinematics import Kinematics
 from so101_description.model import KINEMATICS_URDF_PATH
+from workspace_core_py import REACH_TOLERANCE
 
 from so101_backbone.__main__ import setup
 
 TIMEOUT_S = 10.0
+# The bound of an answer that measures reach: the first starts the worker
+# process and measures a whole surface. A hang guard, not a measure of speed.
+WORKSPACE_TIMEOUT_S = 60.0
 
 
 def make_parameters(**overrides) -> Parameters:
@@ -660,3 +683,54 @@ async def test_the_plan_check_answers_without_moving():
                 await asyncio.wait_for(h.mocks.pairings.arm.joint_setpoints.next(), 0.5)
         finally:
             feeder.cancel()
+
+
+async def test_the_workspace_answers_on_reach_alone_from_bringup():
+    # No follower reports: the answers read the design, never the arm.
+    async with harness.start(setup, parameters=make_parameters()) as h:
+        surface = await describe_workspace_fx.poll(
+            h, describe_workspace_prod.RequestData(surface_height=0.0), WORKSPACE_TIMEOUT_S
+        )
+        assert surface.success, surface.message
+        assert surface.perception_camera == ""
+        assert surface.workable
+        assert surface.area >= 0.03
+        assert_rectangle_inside_reach(surface)
+        assert surface.view is None
+        assert surface.message.endswith(NOT_CHECKED)
+
+        wire = [*NEAR, *CLOSE, *FAR]
+        points = await check_positions_fx.poll(
+            h, check_positions_prod.RequestData(positions=wire), WORKSPACE_TIMEOUT_S
+        )
+        assert points.success, points.message
+        assert points.perception_camera == ""
+        assert not points.all_workable
+        assert points.message.endswith(NOT_CHECKED)
+        near, close, far = points.results
+        for result, asked in zip(points.results, (NEAR, CLOSE, FAR), strict=True):
+            assert result.position == pytest.approx(list(asked))
+        assert (near.workable, near.reachable, near.arm, near.short_by) == (True, True, "arm", 0.0)
+        assert (close.workable, close.reachable, close.arm) == (False, False, "")
+        assert 0.0 <= close.short_by <= REACH_TOLERANCE
+        assert (far.workable, far.reachable, far.arm) == (False, False, "")
+        assert far.short_by > FAR_SHORT_BY_MORE_THAN
+        assert {(p.in_view, p.view) for p in points.results} == {(False, "no_camera")}
+
+
+async def test_the_workspace_refuses_what_is_not_a_request():
+    async with harness.start(setup, parameters=make_parameters()) as h:
+        surface = await describe_workspace_fx.poll(
+            h, describe_workspace_prod.RequestData(surface_height=math.nan), TIMEOUT_S
+        )
+        assert not surface.success
+        assert surface.message == "surface_height must be a finite number"
+        assert (surface.perception_camera, surface.workable, surface.area) == ("", False, 0.0)
+        assert (surface.rectangle, surface.reach, surface.view) == (None, None, None)
+
+        points = await check_positions_fx.poll(
+            h, check_positions_prod.RequestData(positions=[0.2, 0.0]), TIMEOUT_S
+        )
+        assert not points.success
+        assert points.message == "positions must hold 3 values (x, y, z) per point"
+        assert (points.perception_camera, points.all_workable, points.results) == ("", False, [])
