@@ -166,6 +166,20 @@ pub enum Goal {
 }
 
 impl Goal {
+    /// A posture share to `target` over one second, reporting on `done_tx`:
+    /// the goal of the unit tests of the planner and the coordinator.
+    #[cfg(test)]
+    pub fn posture_share(target: JointVec, done_tx: mpsc::Sender<ReadyOutcome>) -> Self {
+        Goal::Joint {
+            target,
+            duration_s: 1.0,
+            reply: JointReply::Ready(ReadyReply {
+                done_tx,
+                cancelled: Arc::new(AtomicBool::new(false)),
+            }),
+        }
+    }
+
     /// Complete unstarted, `success: false`, reporting `measured` (the
     /// measured joints, per the result contract). The busy flag is the
     /// caller's concern.
@@ -1106,14 +1120,7 @@ mod tests {
         let (goal_tx, mut goals) = mpsc::channel(1);
         let busy = Arc::new(AtomicBool::new(true)); // claimed at accept
         goal_tx
-            .send(Goal::Joint {
-                target: [0.5; ARM_DOF],
-                duration_s: 1.0,
-                reply: JointReply::Ready(ReadyReply {
-                    done_tx,
-                    cancelled: Arc::new(AtomicBool::new(false)),
-                }),
-            })
+            .send(Goal::posture_share([0.5; ARM_DOF], done_tx))
             .await
             .expect("queue the goal");
         let now = Instant::now();
@@ -1142,19 +1149,6 @@ mod tests {
             .await;
     }
 
-    /// A ready-share joint goal to `target` over one second, reporting on
-    /// `done_tx`.
-    fn ready_goal(target: JointVec, done_tx: mpsc::Sender<ReadyOutcome>) -> Goal {
-        Goal::Joint {
-            target,
-            duration_s: 1.0,
-            reply: JointReply::Ready(ReadyReply {
-                done_tx,
-                cancelled: Arc::new(AtomicBool::new(false)),
-            }),
-        }
-    }
-
     /// A stop ends the move as cancelled with its message. The arm holds
     /// the setpoint it was last governed to, not the pose measured when the
     /// stop came.
@@ -1166,7 +1160,7 @@ mod tests {
         let (goal_tx, mut goals) = mpsc::channel(1);
         let busy = Arc::new(AtomicBool::new(true));
         goal_tx
-            .send(ready_goal([0.5; ARM_DOF], done_tx))
+            .send(Goal::posture_share([0.5; ARM_DOF], done_tx))
             .await
             .expect("queue the goal");
         let now = Instant::now();
@@ -1202,7 +1196,7 @@ mod tests {
         let (done_tx, mut done_rx) = mpsc::channel(1);
         busy.store(true, Ordering::Release);
         goal_tx
-            .send(ready_goal([0.2; ARM_DOF], done_tx))
+            .send(Goal::posture_share([0.2; ARM_DOF], done_tx))
             .await
             .expect("queue the goal");
         planner.tick(held, None, &mut goals, &busy, now).await;
@@ -1227,7 +1221,7 @@ mod tests {
         // The governor holds every step: no candidate is committed.
         let (done_tx, mut done_rx) = mpsc::channel(1);
         goal_tx
-            .send(ready_goal(target, done_tx))
+            .send(Goal::posture_share(target, done_tx))
             .await
             .expect("queue the goal");
         let now = Instant::now();
@@ -1253,7 +1247,7 @@ mod tests {
         let (done_tx, mut done_rx) = mpsc::channel(1);
         busy.store(true, Ordering::Release);
         goal_tx
-            .send(ready_goal(target, done_tx))
+            .send(Goal::posture_share(target, done_tx))
             .await
             .expect("queue the goal");
         let now = Instant::now();
@@ -1323,25 +1317,18 @@ mod tests {
             }
         }
 
-        // openarm_v2: [x, y, z] in metres and [x, y, z, w] of each posture's
-        // grasp point, the left arm the mirror of the right.
-        let v2 = [
-            (
-                Side::Right,
-                [0.3363, -0.1951, 0.2836],
-                [-0.2897, 0.8363, -0.0870, 0.4573],
-                [0.0174, -0.1535, 0.1024],
-                [0.0, 0.9997, 0.0, 0.0250],
-            ),
-            (
-                Side::Left,
-                [0.3363, 0.1951, 0.2836],
-                [0.2897, 0.8363, 0.0870, 0.4573],
-                [0.0174, 0.1535, 0.1024],
-                [0.0, 0.9997, 0.0, 0.0250],
-            ),
-        ];
-        let at = |pose: &Isometry3<f64>, position: [f64; 3], orientation: [f64; 4]| {
+        // openarm_v2: the right arm's grasp point of each posture, as
+        // [x, y, z] in metres and [x, y, z, w].
+        let right_ready = (
+            [0.3363, -0.1951, 0.2836],
+            [-0.2897, 0.8363, -0.0870, 0.4573],
+        );
+        let right_home = ([0.0174, -0.1535, 0.1024], [0.0, 0.9997, 0.0, 0.0250]);
+        // The left arm's grasp point is the mirror of the right arm's across
+        // the x-z plane: y changes sign, and so do x and z of the quaternion.
+        let mirror =
+            |([x, y, z], [qx, qy, qz, qw]): ([f64; 3], [f64; 4])| ([x, -y, z], [-qx, qy, -qz, qw]);
+        let at = |pose: &Isometry3<f64>, (position, orientation): ([f64; 3], [f64; 4])| {
             let [x, y, z, w] = orientation;
             let expected =
                 UnitQuaternion::from_quaternion(srs_model::nalgebra::Quaternion::new(w, x, y, z));
@@ -1349,19 +1336,23 @@ mod tests {
             let off_rad = pose.rotation.angle_to(&expected);
             off_m < 1e-3 && off_rad < 5e-3
         };
-        for (side, ready_position, ready_orientation, home_position, home_orientation) in v2 {
+        for side in [Side::Left, Side::Right] {
+            let (ready_grasp, home_grasp) = match side {
+                Side::Right => (right_ready, right_home),
+                Side::Left => (mirror(right_ready), mirror(right_home)),
+            };
             let model = crate::arm_model(HardwareVersion::V2, side.model()).expect("build the arm");
             let mut planner = Planner::new(side, model, test_cfg());
             let r = planner.ee_pose_world(&ready(side.model()));
             let h = planner.ee_pose_world(&home(side.model()));
             assert!(
-                at(&r, ready_position, ready_orientation),
+                at(&r, ready_grasp),
                 "v2 {} ready grasp point at {:?}",
                 side.label(),
                 world_pose_arrays(&r)
             );
             assert!(
-                at(&h, home_position, home_orientation),
+                at(&h, home_grasp),
                 "v2 {} home grasp point at {:?}",
                 side.label(),
                 world_pose_arrays(&h)
@@ -1373,7 +1364,7 @@ mod tests {
     async fn a_queued_goal_is_stopped_unstarted_with_the_message() {
         let mut planner = test_planner([0.0; ARM_DOF]);
         let (done_tx, mut done_rx) = mpsc::channel(1);
-        ready_goal([0.5; ARM_DOF], done_tx)
+        Goal::posture_share([0.5; ARM_DOF], done_tx)
             .stop("stopped: operator", Ok([0.1; ARM_DOF]), &mut planner)
             .await;
         let outcome = done_rx.recv().await.expect("the stopped goal reports");
@@ -1445,7 +1436,7 @@ mod tests {
         let (goal_tx, mut goals) = mpsc::channel(1);
         let busy = Arc::new(AtomicBool::new(true));
         goal_tx
-            .send(ready_goal(POSE_TEST_Q, done_tx))
+            .send(Goal::posture_share(POSE_TEST_Q, done_tx))
             .await
             .expect("queue the goal");
         planner

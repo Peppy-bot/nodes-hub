@@ -1365,7 +1365,7 @@ fn filtered_velocity(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::planner::{JointReply, ReadyOutcome, ReadyReply};
+    use crate::planner::ReadyOutcome;
 
     fn cmd(opening: f64) -> Option<GripperCommand> {
         Some(GripperCommand {
@@ -1959,18 +1959,6 @@ mod tests {
         (channels, measured_tx, goal_tx)
     }
 
-    /// A posture share to `target` over one second, reporting on `done_tx`.
-    fn posture_share(target: JointVec, done_tx: mpsc::Sender<ReadyOutcome>) -> Goal {
-        Goal::Joint {
-            target,
-            duration_s: 1.0,
-            reply: JointReply::Ready(ReadyReply {
-                done_tx,
-                cancelled: Arc::new(AtomicBool::new(false)),
-            }),
-        }
-    }
-
     /// The measured state of an arm at `positions`, standing still.
     fn standing_at(positions: JointVec) -> Option<ArmState> {
         Some(ArmState {
@@ -1986,7 +1974,7 @@ mod tests {
         let (mut channels, _measured_tx, goal_tx) = claimed_arm_channels();
         let (done_tx, mut done_rx) = mpsc::channel::<ReadyOutcome>(1);
         goal_tx
-            .send(posture_share(held, done_tx))
+            .send(Goal::posture_share(held, done_tx))
             .await
             .expect("queue the goal");
 
@@ -2019,7 +2007,7 @@ mod tests {
         measured_tx.send_replace(standing_at(held));
         let (done_tx, mut done_rx) = mpsc::channel::<ReadyOutcome>(1);
         goal_tx
-            .send(posture_share([0.3; ARM_DOF], done_tx))
+            .send(Goal::posture_share([0.3; ARM_DOF], done_tx))
             .await
             .expect("queue the goal");
 
@@ -2067,7 +2055,7 @@ mod tests {
         ] {
             measured.send_replace(standing_at(held));
             goals
-                .send(posture_share([0.3; ARM_DOF], done_tx.clone()))
+                .send(Goal::posture_share([0.3; ARM_DOF], done_tx.clone()))
                 .await
                 .expect("queue the share");
         }
