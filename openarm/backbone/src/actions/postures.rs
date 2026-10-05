@@ -165,6 +165,13 @@ fn posture_result(
 /// the robot until a manual cancel.
 const MAX_REQUESTED_DURATION_S: f64 = 600.0;
 
+/// Whether a posture goal of `duration_s` is admitted: a duration from 0 s
+/// to [`MAX_REQUESTED_DURATION_S`], both included. A NaN or an infinite
+/// duration is refused.
+fn admissible_duration(duration_s: f64) -> bool {
+    duration_s.is_finite() && (0.0..=MAX_REQUESTED_DURATION_S).contains(&duration_s)
+}
+
 /// The message of a move_to_ready that succeeds. Success says that both
 /// arms' moves ran their time out, not that the arms arrived. The governor
 /// can hold an arm short, and an object can stop it.
@@ -191,10 +198,7 @@ macro_rules! posture_runner {
             loop {
                 let accepted = handle
                     .handle_goal_next_request(|req| {
-                        let duration_s = req.data.duration_s;
-                        if !(duration_s.is_finite()
-                            && (0.0..=MAX_REQUESTED_DURATION_S).contains(&duration_s))
-                        {
+                        if !admissible_duration(req.data.duration_s) {
                             return Ok($action::GoalDecision::reject("invalid duration"));
                         }
                         if let Err(reason) = claim_both(&busy) {
@@ -333,6 +337,18 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// The duration ceiling admits 0 s and 600 s, and refuses a duration
+    /// just past either edge, a NaN and an infinite one.
+    #[test]
+    fn a_posture_duration_is_admitted_from_zero_to_six_hundred_seconds() {
+        for admitted in [0.0, 1.0, 600.0] {
+            assert!(admissible_duration(admitted), "{admitted} s is refused");
+        }
+        for refused in [-1e-6, 600.000001, f64::NAN, f64::INFINITY] {
+            assert!(!admissible_duration(refused), "{refused} s is admitted");
         }
     }
 
