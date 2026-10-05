@@ -416,18 +416,19 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
         pending = PendingSlot()
         return (module, make_decide(pending), drive_with(driver, pending), pending, label)
 
+    def drive_posture(ctx, plan):
+        return layer.drive_posture(ctx, plan, kinematics)
+
     action_servers = [
         server(move_arm_joints,
                lambda p: layer.decide_arm_joints(move_arm_joints, p),
                layer.drive_arm, "move_arm_joints"),
         server(move_to_ready,
                lambda p: layer.decide_posture(move_to_ready, postures.READY_POSITIONS_RAD, p),
-               lambda ctx, plan: layer.drive_posture(ctx, plan, kinematics),
-               "move_to_ready"),
+               drive_posture, "move_to_ready"),
         server(move_to_home,
                lambda p: layer.decide_posture(move_to_home, postures.HOME_POSITIONS_RAD, p),
-               lambda ctx, plan: layer.drive_posture(ctx, plan, kinematics),
-               "move_to_home"),
+               drive_posture, "move_to_home"),
         server(move_arm,
                lambda p: layer.decide_pose(move_arm, p),
                lambda ctx, goal: layer.drive_pose(ctx, goal, point_solver, kinematics),

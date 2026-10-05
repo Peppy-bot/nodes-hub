@@ -591,12 +591,17 @@ class ActionLayer:
 
     # ---------------------------------------------------------------- results
 
+    def _fresh_measured_joints(self) -> tuple[float, ...] | None:
+        """The joints the follower measured, or None when its state is
+        stale: the one freshness rule of every arm and posture result."""
+        return self._coordinator.measured_joints.fresh(
+            self._coordinator.follower_state_timeout_s
+        )
+
     def _final_arm_positions(self, plan: ArmPlan) -> tuple[tuple[float, ...], str]:
         """Prefer the measured landing point; fall back to where the
         trajectory stopped, saying so."""
-        measured = self._coordinator.measured_joints.fresh(
-            self._coordinator.follower_state_timeout_s
-        )
+        measured = self._fresh_measured_joints()
         if measured is not None:
             return measured, ""
         return (
@@ -612,9 +617,7 @@ class ActionLayer:
         measured joints. A posture result gives only a measured pose. Thus,
         when the follower state is stale, the three arrays are empty and the
         note gives the reason."""
-        measured = self._coordinator.measured_joints.fresh(
-            self._coordinator.follower_state_timeout_s
-        )
+        measured = self._fresh_measured_joints()
         if measured is None:
             return "follower state stale; no measured pose to report", ([], [], [])
         position, orientation = kinematics.forward_kinematics(measured)
