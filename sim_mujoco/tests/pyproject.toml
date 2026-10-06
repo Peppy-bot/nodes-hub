@@ -19,8 +19,8 @@ dependencies = [
     # (sim_base_images/requirements.mujoco.txt), so the scene these
     # suites compile is compiled by the mujoco the node runs on.
     "mujoco==3.10.0",
-    "numpy==2.4.4",
-    "pyjson5==2.0.0",
+    "numpy==2.5.3",
+    "pyjson5==2.0.1",
     # What the engine shares with every other one: the registry, the four
     # slots, the model entries and the camera configuration.
     "sim_robot_core",
