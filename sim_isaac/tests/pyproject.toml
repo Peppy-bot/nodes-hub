@@ -19,7 +19,7 @@ dependencies = [
     # test is the parser the node runs on. That file leaves numpy to Isaac
     # Sim, which is free to move it, hence the floor here.
     "numpy>=1.26",
-    "pyjson5==2.0.0",
+    "pyjson5==2.0.1",
     # What the engine shares with every other one: the registry, the four
     # slots, the model entries and the camera configuration.
     "sim_robot_core",
@@ -33,7 +33,7 @@ dev = [
     "mujoco==3.10.0",
     # PyPI provides no USD wheel or source distribution for Linux ARM64.
     # That platform runs the runtime suites without the USD-specific tests.
-    "usd-core==26.5; platform_machine == 'x86_64' or platform_machine == 'AMD64' or sys_platform == 'darwin'",
+    "usd-core==26.8; platform_machine == 'x86_64' or platform_machine == 'AMD64' or sys_platform == 'darwin'",
 ]
 
 [tool.uv]
