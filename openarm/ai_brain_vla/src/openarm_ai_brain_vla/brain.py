@@ -7,13 +7,15 @@ five sequences: a refusal or a failure completes with success false and
 the message; a cancel by the caller completes as cancelled; an abort
 completes with success false and "aborted: <reason>"; the fields the
 contract says are zero or empty on failure are the `zero` dict each
-handler passes.
+handler passes. It is also where each goal of the five leaves its one line
+in the log, so a search that found nothing says there what it looked at.
 """
 
 from __future__ import annotations
 
 import asyncio
-from typing import Awaitable, Callable, Optional
+import logging
+from typing import Awaitable, Callable, Optional, Sequence
 
 from peppygen import clock
 
@@ -22,11 +24,13 @@ from .perception import make_detector
 from .perception.camera import CameraModel
 from .perception.frames import FrameStore
 from .perception.geometry import learn_camera_pose, learn_intrinsics
-from .perception.perceiver import Perceiver
+from .perception.perceiver import Look, Perceiver
 from .ports import Cancelled, Manipulator, Refusal
 from .robot import Robot
 from .sequencer import MANIPULATION, PERCEPTION, Job, Sequencer
 from .state import State, new_run_token
+
+logger = logging.getLogger(__name__)
 
 Body = Callable[[Job], Awaitable[dict]]
 
@@ -84,6 +88,14 @@ class Brain:
         await self.sequencer.stop(PERCEPTION, "aborted: the node is shutting down")
         await self.robot.stop()
 
+    async def look(self, job: Job, phrases: Sequence[str], timeout_s: float) -> Look:
+        """One look at the camera for the search `job` runs, as
+        `Perceiver.scan` gives it; what the look saw goes on the job's notes
+        for the log."""
+        seen = await self.perceiver.scan(phrases, job.cancel, timeout_s)
+        job.notes.append(seen.describe(job.started_ns))
+        return seen
+
     def manipulator_or_refuse(self) -> Manipulator:
         """The manipulation backend, or the refusal every sequence gets
         when the launcher selected none."""
@@ -96,32 +108,56 @@ class Brain:
             await self.manipulator.stop()
             await self.robot.stop()
 
-    async def run_guarded(self, ctx, lane: str, action: str, body: Body, zero: dict) -> None:
+    async def run_guarded(self, ctx, lane: str, action: str, body: Body, zero: dict, asked: str = "") -> None:
         """Admits the goal into its lane, runs `body` under a cancel
-        watcher, and completes the goal the way the contract wants."""
+        watcher, and completes the goal the way the contract wants. Before
+        it completes, the goal leaves its line in the log: the action and
+        `asked`, what the goal asked for in a few words, how the goal ended
+        and after how long, then the notes the body put on its job."""
         started = self.now()
+        goal = f"{action} {asked}" if asked else action
         try:
             job = self.sequencer.start(lane, action, started)
         except Refusal as refusal:
+            self._log_end(goal, "refused", started, refusal.message)
             await ctx.complete(success=False, message=refusal.message, action_time=0.0, **zero)
             return
         watcher = asyncio.create_task(self._watch_cancel(ctx, job))
         try:
             fields = await body(job)
             job.cancel.check()
+            self._log_end(goal, "succeeded", started, "", job.notes)
             await ctx.complete(success=True, message="", action_time=self._elapsed(started), **fields)
         except Refusal as refusal:
+            self._log_end(goal, "refused", started, refusal.message, job.notes)
             await ctx.complete(success=False, message=refusal.message, action_time=0.0, **zero)
         except Cancelled as cancelled:
+            self._log_end(goal, "stopped", started, cancelled.reason, job.notes)
             if cancelled.by_caller:
                 await ctx.complete_cancelled(success=False, message=cancelled.reason, action_time=self._elapsed(started), **zero)
             else:
                 await ctx.complete(success=False, message=cancelled.reason, action_time=self._elapsed(started), **zero)
         except Exception as error:
+            self._log_end(goal, "failed", started, repr(error), job.notes, error=error)
             await ctx.complete(success=False, message=f"{action} failed: {error!r}", action_time=0.0, **zero)
         finally:
             watcher.cancel()
             self.sequencer.finish(job)
+
+    def _log_end(
+        self, goal: str, ended: str, started_ns: int, reason: str, notes: Sequence[str] = (), error: Optional[Exception] = None
+    ) -> None:
+        """The one line a goal leaves in the log: `goal`, how it `ended`
+        and after how long, the reason when there is one, then `notes`. A
+        failure, `error`, logs at error level with its traceback."""
+        line = f"{goal} {ended} after {self._elapsed(started_ns):.2f} s"
+        if reason:
+            line += f": {reason}"
+        line = "; ".join([line, *notes])
+        if error is None:
+            logger.info("%s", line)
+        else:
+            logger.error("%s", line, exc_info=error)
 
     async def _watch_cancel(self, ctx, job: Job) -> None:
         await ctx.cancel_signal()

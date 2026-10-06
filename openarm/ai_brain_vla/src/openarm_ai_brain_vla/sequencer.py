@@ -32,6 +32,9 @@ class Job:
     started_ns: int
     cancel: CancelToken = field(default_factory=CancelToken)
     done: asyncio.Event = field(default_factory=asyncio.Event)
+    # What the sequence found out on its way, in a few words each, for the
+    # line its goal leaves in the log (`Brain.run_guarded`).
+    notes: list[str] = field(default_factory=list)
 
     def elapsed_s(self, now_ns: int) -> float:
         return max(0.0, (now_ns - self.started_ns) / 1e9)

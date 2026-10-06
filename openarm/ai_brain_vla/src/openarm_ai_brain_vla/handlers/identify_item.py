@@ -16,11 +16,11 @@ ZERO = dict(
 
 async def run(brain, ctx) -> None:
     goal = ctx.request().data
+    description = goal.description.strip()
 
     async def body(job) -> dict:
-        description = goal.description.strip()
         phrases = [description] if description else []
-        look = await brain.perceiver.scan(phrases, job.cancel, goal.timeout_s)
+        look = await brain.look(job, phrases, goal.timeout_s)
         best = best_match(look.detections, description)
         if best is None:
             if description:
@@ -29,6 +29,7 @@ async def run(brain, ctx) -> None:
         # A search covers nothing: it refreshes what it found, renames
         # nothing and drops nothing, so the other items keep their ids.
         item = brain.state.remember([best], brain.now(), coverage=Coverage())[0]
+        job.notes.append(f"item {item.item_id}")
         return dict(
             item_id=item.item_id,
             label=item.label,
@@ -42,4 +43,4 @@ async def run(brain, ctx) -> None:
             frame_timestamp=look.frame_timestamp,
         )
 
-    await brain.run_guarded(ctx, PERCEPTION, "identify_item", body, ZERO)
+    await brain.run_guarded(ctx, PERCEPTION, "identify_item", body, ZERO, asked=f"'{description}'")
