@@ -211,7 +211,7 @@ peppy repo add /path/to/nodes-hub; peppy repo add /path/to/launchers-hub; peppy 
 ### 2. Launch the simulation with the brain on its MCP endpoint
 
 ```sh
-peppy stack launch simulation_mcp --with alpha.ai_brain_vla
+peppy stack launch simulation_mcp --join openarm_sim:alpha --with alpha.ai_brain_vla
 ```
 
 Waldo, the v2 robot `alpha` driven over MCP with its rendered cameras, and the
