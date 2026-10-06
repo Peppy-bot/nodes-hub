@@ -5,9 +5,9 @@
 # The MuJoCo image is published as a multi-arch manifest (linux/amd64 +
 # linux/arm64) so the node runs on both x86_64 and aarch64 hosts. Isaac Sim 6.1
 # publishes an arm64 image too, but the Isaac node is validated on x86_64 only,
-# so its image stays amd64. Two of MuJoCo's transitive deps are x86_64 only and
-# are dropped on arm64 — both are optional accelerators; see
-# requirements.mujoco.txt (PyOpenGL-accelerate) and overrides.mujoco.txt (embreex).
+# so its image stays amd64. One of the MuJoCo image's dependencies,
+# PyOpenGL-accelerate, is x86_64 only and is left out on arm64. It is an
+# optional accelerator; see requirements.mujoco.txt.
 #
 # To bump a sim version: update the version variable below and rerun. This
 # manifest is the single source of truth for the base image tags; the script
@@ -28,8 +28,8 @@ export RCLONE_S3_SECRET_ACCESS_KEY="${RCLONE_S3_SECRET_ACCESS_KEY:?RCLONE_S3_SEC
 # ── Version manifest ──────────────────────────────────────────────────────────
 ISAAC_VERSION="6.1.0"    # mirrors nvcr.io/nvidia/isaac-sim upstream version
 MUJOCO_VERSION="3.10.0"  # mirrors mujoco PyPI version (requirements.mujoco.txt)
-ISAAC_IMAGE_REV="3"      # bump when Isaac image content changes without an upstream version bump
-MUJOCO_IMAGE_REV="3"     # bump when MuJoCo image content changes without an upstream version bump
+ISAAC_IMAGE_REV="4"      # bump when Isaac image content changes without an upstream version bump
+MUJOCO_IMAGE_REV="4"     # bump when MuJoCo image content changes without an upstream version bump
 IMAGE_NAMESPACE="peppybot"  # Docker Hub namespace these base images are pushed to
 
 # Target platforms. MuJoCo ships wheels for both arches; Isaac Sim is amd64 only.
