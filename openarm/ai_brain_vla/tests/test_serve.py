@@ -6,7 +6,7 @@ import logging
 
 import pytest
 
-from conftest import FakeToken
+from conftest import FakeToken, records_of
 from openarm_ai_brain_vla.serve import report_failure
 from openarm_ai_brain_vla.waiting import unless_cancelled
 
@@ -48,17 +48,9 @@ async def test_what_the_awaitable_raises_is_raised():
 
 @pytest.fixture
 def serve_log(caplog):
-    """The serve module's log records, whatever the package logger's
-    propagation is set to."""
-    logger = logging.getLogger("openarm_ai_brain_vla.serve")
-    propagated = logger.propagate
-    logger.propagate = False
-    logger.addHandler(caplog.handler)
-    try:
-        yield caplog
-    finally:
-        logger.removeHandler(caplog.handler)
-        logger.propagate = propagated
+    """The serve module's log records."""
+    with records_of(caplog, "openarm_ai_brain_vla.serve") as records:
+        yield records
 
 
 async def test_a_handler_that_raises_is_reported_with_its_traceback(serve_log):

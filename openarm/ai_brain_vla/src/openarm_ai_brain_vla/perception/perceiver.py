@@ -71,13 +71,36 @@ async def in_daemon_thread(function: Callable, *args):
 class Look:
     """What one look at the camera gave: the detections, each placed in the
     robot frame with its region in the picture, and the picture itself:
-    its size in pixels and its capture time, so a region can be read
-    against the same frame."""
+    its size in pixels, its capture time and its capture-pair counter, so a
+    region can be read against the same frame. The detector's other boxes
+    are kept for the log: each duplicate of a more confident box, and each
+    box with no depth reading under its centre."""
 
     detections: list[Detection]
     image_width: int
     image_height: int
     frame_timestamp: float
+    frame_id: int
+    duplicates: list[Box]
+    unplaced: list[Box]
+
+    def describe(self, search_started_ns: int) -> str:
+        """The look in a few words for the log: the frame, when the camera
+        took it against the start of the search, and every box of the
+        detector with its confidence, the placed ones first, then the
+        duplicates and the boxes with no depth, each marked so."""
+        age_s = search_started_ns / 1e9 - self.frame_timestamp
+        if age_s >= 0.0:
+            taken = f"{age_s:.2f} s before the search"
+        else:
+            taken = f"{-age_s:.2f} s after the search began"
+        boxes = [f"{detection.label} {detection.confidence:.2f}" for detection in self.detections]
+        boxes += [f"{box.label} {box.confidence:.2f} (duplicate)" for box in self.duplicates]
+        boxes += [f"{box.label} {box.confidence:.2f} (no depth)" for box in self.unplaced]
+        if not boxes:
+            return f"frame {self.frame_id} taken {taken}, no box"
+        count = "1 box" if len(boxes) == 1 else f"{len(boxes)} boxes"
+        return f"frame {self.frame_id} taken {taken}, {count}: {', '.join(boxes)}"
 
 
 class Perceiver:
@@ -165,10 +188,13 @@ class Perceiver:
         except SearchTimeout as timeout:
             raise Refusal(str(timeout)) from None
         cancel.check()
+        kept, duplicates = merge_duplicates(boxes)
         detections: list[Detection] = []
-        for box in merge_duplicates(boxes):
+        unplaced: list[Box] = []
+        for box in kept:
             depth = depth_at(depth_m, box, frame.color.width, frame.color.height)
             if depth is None:
+                unplaced.append(box)
                 continue
             u, v = box.centre
             position = self.camera.deproject(u, v, depth, frame.color.width, frame.color.height)
@@ -180,15 +206,21 @@ class Perceiver:
             image_width=int(frame.color.width),
             image_height=int(frame.color.height),
             frame_timestamp=float(frame.color.header.timestamp),
+            frame_id=int(frame.color.header.frame_id),
+            duplicates=duplicates,
+            unplaced=unplaced,
         )
 
 
-def merge_duplicates(boxes: Sequence[Box]) -> list[Box]:
+def merge_duplicates(boxes: Sequence[Box]) -> tuple[list[Box], list[Box]]:
     """Two boxes of one label that overlap by more than `DUPLICATE_IOU`
-    are one item: the more confident box stays."""
+    are one item: the more confident box stays. The boxes that stay, then
+    the duplicates, each list from the most confident box down."""
     kept: list[Box] = []
+    duplicates: list[Box] = []
     for box in sorted(boxes, key=lambda b: b.confidence, reverse=True):
         if any(other.label == box.label and iou(other.xyxy, box.xyxy) > DUPLICATE_IOU for other in kept):
+            duplicates.append(box)
             continue
         kept.append(box)
-    return kept
+    return kept, duplicates

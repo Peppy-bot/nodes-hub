@@ -1,10 +1,12 @@
 """The camera model, the frame store and the core Perceiver: pixels to
 world positions, frames paired by capture, the camera's answers asked
-until they come, duplicate boxes, and the ways a scan is refused."""
+until they come, duplicate boxes, the ways a scan is refused, and the
+words a look leaves in the log."""
 
 import asyncio
 import math
 import threading
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -24,8 +26,8 @@ from openarm_ai_brain_vla.perception.camera import (
 from openarm_ai_brain_vla.perception import frames as frames_module
 from openarm_ai_brain_vla.perception import geometry
 from openarm_ai_brain_vla.perception.frames import FRAME_BUFFER, FrameStore, decode_color, decode_depth, depth_at
-from openarm_ai_brain_vla.perception.perceiver import DEFAULT_TIMEOUT_S, Perceiver, in_daemon_thread, merge_duplicates
-from openarm_ai_brain_vla.ports import Box, CancelToken, Coverage, Refusal
+from openarm_ai_brain_vla.perception.perceiver import DEFAULT_TIMEOUT_S, Look, Perceiver, in_daemon_thread, merge_duplicates
+from openarm_ai_brain_vla.ports import Box, CancelToken, Coverage, Detection, Refusal
 
 # At the robot frame's origin, looking along its +Z: the identity pose.
 AT_ORIGIN = CameraModel().with_pose((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
@@ -328,13 +330,17 @@ def test_duplicate_boxes_of_one_label_keep_the_most_confident():
     b = Box("cup", 0.8, 1, 1, 11, 11)
     other = Box("bowl", 0.7, 1, 1, 11, 11)
     far = Box("cup", 0.6, 50, 50, 60, 60)
-    kept = merge_duplicates([b, a, other, far])
+    kept, duplicates = merge_duplicates([b, a, other, far])
     assert kept == [a, other, far]
+    assert duplicates == [b]
 
 
 async def test_a_scan_turns_boxes_into_world_detections():
-    frames = store_with([rgb_frame(16, 12)], [depth_frame(2.0, 16, 12)])
-    detector = FakeDetector([Box("cup", 0.9, 6, 4, 10, 8), Box("cup", 0.85, 6.5, 4.5, 10.5, 8.5)])
+    frames = store_with([rgb_frame(16, 12, frame_id=7)], [depth_frame(2.0, 16, 12, frame_id=7)])
+    duplicate = Box("cup", 0.85, 6.5, 4.5, 10.5, 8.5)
+    # Its centre is off the picture, where the depth frame has no reading.
+    off_the_picture = Box("bowl", 0.5, 30, 30, 40, 40)
+    detector = FakeDetector([Box("cup", 0.9, 6, 4, 10, 8), duplicate, off_the_picture])
     perceiver = Perceiver(detector, frames, IDENTITY)
     await perceiver.load("weights.pt", "/gallery")
     assert detector.loaded == ("weights.pt", "/gallery")
@@ -346,12 +352,35 @@ async def test_a_scan_turns_boxes_into_world_detections():
     assert close(detections[0].position, (0.0, 0.0, 2.0))
     # The look reports the box in the picture it used, and the picture.
     assert detections[0].region == (6, 4, 10, 8)
-    assert (look.image_width, look.image_height, look.frame_timestamp) == (16, 12, 1.0)
+    assert (look.image_width, look.image_height, look.frame_timestamp, look.frame_id) == (16, 12, 1.0, 7)
+    # The detector's other boxes stay in the look for the log.
+    assert look.duplicates == [duplicate]
+    assert look.unplaced == [off_the_picture]
     # The detector is handed the search's deadline: the default budget for
     # a zero timeout, the caller's otherwise.
     assert detector.deadlines[-1].budget_s == DEFAULT_TIMEOUT_S
     await perceiver.scan([], CancelToken(), timeout_s=2.5)
     assert detector.deadlines[-1].budget_s == 2.5
+
+
+def test_a_look_names_its_frame_its_age_and_every_box_for_the_log():
+    look = Look(
+        detections=[Detection("cup", (0.0, 0.0, 2.0), 0.9)],
+        image_width=16,
+        image_height=12,
+        frame_timestamp=10.0,
+        frame_id=7,
+        duplicates=[Box("cup", 0.85, 6.5, 4.5, 10.5, 8.5)],
+        unplaced=[Box("bowl", 0.5, 30, 30, 40, 40)],
+    )
+    boxes = "3 boxes: cup 0.90, cup 0.85 (duplicate), bowl 0.50 (no depth)"
+    assert look.describe(10_250_000_000) == f"frame 7 taken 0.25 s before the search, {boxes}"
+    # The latest frame may be newer than the start of the search.
+    assert look.describe(9_900_000_000) == f"frame 7 taken 0.10 s after the search began, {boxes}"
+    one = replace(look, duplicates=[], unplaced=[])
+    assert one.describe(10_000_000_000) == "frame 7 taken 0.00 s before the search, 1 box: cup 0.90"
+    nothing = replace(one, detections=[])
+    assert nothing.describe(10_000_000_000) == "frame 7 taken 0.00 s before the search, no box"
 
 
 async def test_a_detectors_calls_run_in_daemon_threads_of_their_own():

@@ -18,7 +18,7 @@ async def run(brain, ctx) -> None:
     goal = ctx.request().data
 
     async def body(job) -> dict:
-        look = await brain.perceiver.scan([], job.cancel, goal.timeout_s)
+        look = await brain.look(job, [], goal.timeout_s)
         items = brain.state.remember(look.detections, brain.now(), coverage=brain.perceiver.detector.scan_coverage())
         return dict(
             item_ids=[item.item_id for item in items],

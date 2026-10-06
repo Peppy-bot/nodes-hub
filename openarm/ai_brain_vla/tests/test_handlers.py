@@ -1,10 +1,13 @@
 """Every handler against the brain's core with fake backends: the
-contract rules from goal to result, with no router and no robot."""
+contract rules from goal to result, and the line each goal leaves in the
+log, with no router and no robot."""
 
 import asyncio
+import logging
 
+import pytest
 
-from conftest import PARAMS, FakeCtx, FakeDetector, FakeManipulator, depth_frame, rgb_frame
+from conftest import PARAMS, FakeCtx, FakeDetector, FakeManipulator, depth_frame, records_of, rgb_frame
 from peppygen.exposed_actions.item_manipulation import abort as abort_action
 from peppygen.exposed_actions.item_manipulation import drop_item as drop_action
 from peppygen.exposed_actions.item_manipulation import grab_item as grab_action
@@ -74,6 +77,17 @@ def abort_goal(reason: str = "") -> FakeCtx:
 
 def state_of(brain: Brain):
     return get_state.handle(brain, None)
+
+
+@pytest.fixture
+def brain_log(caplog):
+    """The records of the brain's core, where each goal leaves its line."""
+    with records_of(caplog, "openarm_ai_brain_vla.brain") as records:
+        yield records
+
+
+def lines(log) -> list[str]:
+    return [record.getMessage() for record in log.records]
 
 
 async def test_get_state_starts_idle_with_the_configured_grippers():
@@ -385,3 +399,84 @@ async def test_shutdown_stops_the_running_sequence_as_aborted():
     assert state_of(brain).current_action == ""
     # Idle lanes make a shutdown a no-op.
     await asyncio.wait_for(brain.shutdown(), 1.0)
+
+
+async def test_a_search_logs_the_frame_it_looked_at_each_box_and_the_item_it_returned(brain_log):
+    ticks = Ticks()
+
+    class Slow(FakeDetector):
+        """Takes 0.84 s of the brain's clock to answer."""
+
+        def detect(self, image, deadline):
+            ticks.now_ns += 840_000_000
+            return super().detect(image, deadline)
+
+    brain = make_brain(detector=Slow([Box("cup", 0.9, 7, 5, 9, 7), Box("cup", 0.85, 7, 5, 9, 7.2)]), ticks=ticks)
+    with_frames(brain)
+    # The frames were taken at 1.0 s of the brain's clock.
+    ticks.now_ns = 1_250_000_000
+    await identify_item.run(brain, identify_goal("cup"))
+    await identify_item.run(brain, identify_goal("bowl"))
+    await scan_items.run(brain, scan_goal())
+    boxes = "2 boxes: cup 0.90, cup 0.85 (duplicate)"
+    assert lines(brain_log) == [
+        f"identify_item 'cup' succeeded after 0.84 s; frame 1 taken 0.25 s before the search, {boxes}; item cup_1-t0",
+        f"identify_item 'bowl' refused after 0.84 s: no item matches 'bowl'; frame 1 taken 1.09 s before the search, {boxes}",
+        f"scan_items succeeded after 0.84 s; frame 1 taken 1.93 s before the search, {boxes}",
+    ]
+    assert {record.levelno for record in brain_log.records} == {logging.INFO}
+
+
+async def test_a_search_that_found_nothing_logs_whether_the_detector_boxed_anything(brain_log):
+    no_depth = make_brain(detector=FakeDetector([Box("cup", 0.9, 7, 5, 9, 7)]))
+    with_frames(no_depth, depth_m=0.0)
+    await identify_item.run(no_depth, identify_goal("cup"))
+    no_box = make_brain(detector=FakeDetector())
+    with_frames(no_box)
+    await identify_item.run(no_box, identify_goal(""))
+    assert lines(brain_log) == [
+        "identify_item 'cup' refused after 0.00 s: no item matches 'cup'; frame 1 taken 0.00 s before the search, 1 box: cup 0.90 (no depth)",
+        "identify_item '' refused after 0.00 s: no item in view; frame 1 taken 0.00 s before the search, no box",
+    ]
+
+
+async def test_a_search_refused_before_it_looked_logs_the_reason_alone(brain_log):
+    brain = make_brain(detector=FakeDetector([Box("cup", 0.9, 7, 5, 9, 7)]))
+    await identify_item.run(brain, identify_goal("  cup "))
+    assert lines(brain_log) == ["identify_item 'cup' refused after 0.00 s: no perception source: no camera frame received"]
+
+
+async def test_a_search_that_failed_logs_its_traceback(brain_log):
+    class Broken(FakeDetector):
+        def detect(self, image, deadline):
+            raise RuntimeError("the GPU is gone")
+
+    brain = make_brain(detector=Broken())
+    with_frames(brain)
+    ctx = scan_goal()
+    await scan_items.run(brain, ctx)
+    assert ctx.completed["message"] == "scan_items failed: RuntimeError('the GPU is gone')"
+    [record] = brain_log.records
+    assert record.levelno == logging.ERROR
+    assert record.getMessage() == "scan_items failed after 0.00 s: RuntimeError('the GPU is gone')"
+    assert "RuntimeError: the GPU is gone" in brain_log.text
+
+
+async def test_a_manipulation_goal_logs_how_it_ended(brain_log):
+    manipulator = FakeManipulator(wait_for_stop=True)
+    ticks = Ticks()
+    brain = make_brain(manipulator=manipulator, ticks=ticks)
+    first = grab_goal(gripper_name="left_gripper", position=[0.5, 0.1, 0.7])
+    running = asyncio.create_task(grab_item.run(brain, first))
+    await manipulator.begun()
+    ticks.now_ns += 2_000_000_000
+    await grab_item.run(brain, grab_goal(gripper_name="right_gripper", position=[0.5, -0.1, 0.7]))
+    await abort.run(brain, abort_goal("operator pressed stop"))
+    await running
+    manipulator.wait_for_stop = False
+    await grab_item.run(brain, grab_goal(gripper_name="left_gripper", position=[0.5, 0.1, 0.7]))
+    assert lines(brain_log) == [
+        "grab_item refused after 0.00 s: grab_item is running",
+        "grab_item stopped after 2.00 s: aborted: operator pressed stop",
+        "grab_item succeeded after 0.00 s",
+    ]

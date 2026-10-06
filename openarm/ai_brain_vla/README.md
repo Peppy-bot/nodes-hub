@@ -229,7 +229,21 @@ minute and refuses searches as "still loading" until it is ready. Its log is
 and two lines there say the brain is set: the camera's answer, `[brain] camera
 geometry: 1280x720 fx 738.1 fy 738.1 cx 639.5 cy 359.5 none`, and the backend's,
 `[brain] sam3_siglip: a vocabulary of 1198 names, no enrolment gallery, on
-cuda`.
+cuda`. Then each goal of `brain.scan_items`, `brain.identify_item`,
+`brain.grab_item`, `brain.drop_item` and `brain.place_item` leaves one line
+there when it ends: how it ended and after how long, and for a search, the
+frame it looked at, how long before the search the camera took that frame,
+and each box of the detector with its confidence, marked `(duplicate)` or
+`(no depth)` when the brain did not place it:
+
+```text
+[brain] identify_item 'potted plant' succeeded after 2.59 s; frame 4512 taken 0.03 s before the search, 2 boxes: potted plant 0.82, potted plant 0.39; item potted_plant_1-3f9a2c
+[brain] identify_item 'watering can' refused after 2.62 s: no item matches 'watering can'; frame 4512 taken 0.03 s before the search, no box
+```
+
+So a search that found nothing says whether the detector boxed nothing,
+whether its boxes had no depth under them, or whether the frame was old. A
+goal that failed on an error also logs its traceback.
 
 ### 3. Drive it from an MCP client
 

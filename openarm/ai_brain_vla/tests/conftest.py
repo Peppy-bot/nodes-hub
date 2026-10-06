@@ -1,13 +1,16 @@
 """Shared test pieces: the node's parameters, fake backends, a fake goal
-context, and the camera's messages, so the core and the handlers run in
-plain tests with no router, no robot and no model."""
+context, the camera's messages, and the records of one logger, so the core
+and the handlers run in plain tests with no router, no robot and no
+model."""
 
 from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
+from contextlib import contextmanager
 from types import SimpleNamespace
-from typing import Optional, Sequence
+from typing import Iterator, Optional, Sequence
 
 import numpy as np
 import pytest
@@ -61,6 +64,25 @@ def staged_weights(tmp_path, monkeypatch):
         (directory / source.directory_name).mkdir(parents=True)
     monkeypatch.setenv(weights.WEIGHTS_DIRECTORY_VARIABLE, str(directory))
     return directory
+
+
+@contextmanager
+def records_of(caplog, name: str) -> Iterator[pytest.LogCaptureFixture]:
+    """`caplog` holding the records of the logger `name` from info up,
+    each once, whatever `configure_logging` set on the package logger: it
+    stops the package's records at its own handler, before the one pytest
+    reads at the root."""
+    logger = logging.getLogger(name)
+    propagated, level = logger.propagate, logger.level
+    logger.propagate = False
+    logger.setLevel(logging.INFO)
+    logger.addHandler(caplog.handler)
+    try:
+        yield caplog
+    finally:
+        logger.removeHandler(caplog.handler)
+        logger.setLevel(level)
+        logger.propagate = propagated
 
 
 class FakeToken:
