@@ -480,7 +480,7 @@ source = "git+https://github.com/Peppy-bot/public-peppy-libs#a5ea281a406150ac7ac
 dependencies = [
  "nalgebra",
  "thiserror 2.0.21",
- "urdf-rs",
+ "urdf-rs 0.9.1",
 ]
 
 [[package]]
@@ -2414,7 +2414,7 @@ name = "openarm_description"
 version = "0.1.0"
 source = "git+https://github.com/Peppy-bot/public-peppy-libs#a5ea281a406150ac7ac50f8127d5014e5806fa6f"
 dependencies = [
- "urdf-rs",
+ "urdf-rs 0.9.1",
 ]
 
 [[package]]
@@ -2434,7 +2434,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
- "urdf-rs",
+ "urdf-rs 0.10.0",
 ]
 
 [[package]]
@@ -3769,7 +3769,7 @@ dependencies = [
  "chain_kinematics",
  "nalgebra",
  "thiserror 2.0.21",
- "urdf-rs",
+ "urdf-rs 0.9.1",
 ]
 
 [[package]]
@@ -4401,6 +4401,20 @@ name = "urdf-rs"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b4113a15747d43814d57a486b42a85c8387800d3c0d76cf4fc807dd239b0249"
+dependencies = [
+ "RustyXML",
+ "quick-xml",
+ "regex",
+ "serde",
+ "serde-xml-rs",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "urdf-rs"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0c1c4d002a2d281d6ae7a1a8b319bddc50506a35731e826fb9dbd8d648c39bcf"
 dependencies = [
  "RustyXML",
  "quick-xml",
