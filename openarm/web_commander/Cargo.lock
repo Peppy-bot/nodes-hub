@@ -476,11 +476,11 @@ dependencies = [
 [[package]]
 name = "chain_kinematics"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#a5ea281a406150ac7ac50f8127d5014e5806fa6f"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs?branch=chore%2Fdependency-upgrades#1a72fcdcc9c28b8d447e95fc5adaba92941b4e27"
 dependencies = [
  "nalgebra",
  "thiserror 2.0.21",
- "urdf-rs 0.9.1",
+ "urdf-rs",
 ]
 
 [[package]]
@@ -608,7 +608,7 @@ dependencies = [
 [[package]]
 name = "control_core"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#a5ea281a406150ac7ac50f8127d5014e5806fa6f"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs?branch=chore%2Fdependency-upgrades#1a72fcdcc9c28b8d447e95fc5adaba92941b4e27"
 dependencies = [
  "thiserror 2.0.21",
  "tokio",
@@ -2412,9 +2412,9 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 [[package]]
 name = "openarm_description"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#a5ea281a406150ac7ac50f8127d5014e5806fa6f"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs?branch=chore%2Fdependency-upgrades#1a72fcdcc9c28b8d447e95fc5adaba92941b4e27"
 dependencies = [
- "urdf-rs 0.9.1",
+ "urdf-rs",
 ]
 
 [[package]]
@@ -2434,7 +2434,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
- "urdf-rs 0.10.0",
+ "urdf-rs",
 ]
 
 [[package]]
@@ -3764,12 +3764,12 @@ dependencies = [
 [[package]]
 name = "srs_model"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#a5ea281a406150ac7ac50f8127d5014e5806fa6f"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs?branch=chore%2Fdependency-upgrades#1a72fcdcc9c28b8d447e95fc5adaba92941b4e27"
 dependencies = [
  "chain_kinematics",
  "nalgebra",
  "thiserror 2.0.21",
- "urdf-rs 0.9.1",
+ "urdf-rs",
 ]
 
 [[package]]
@@ -4394,20 +4394,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
-]
-
-[[package]]
-name = "urdf-rs"
-version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b4113a15747d43814d57a486b42a85c8387800d3c0d76cf4fc807dd239b0249"
-dependencies = [
- "RustyXML",
- "quick-xml",
- "regex",
- "serde",
- "serde-xml-rs",
- "thiserror 2.0.21",
 ]
 
 [[package]]

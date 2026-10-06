@@ -6,9 +6,9 @@ edition = "2024"
 [dependencies]
 peppygen = { path = ".peppy/libs/peppygen" }
 peppylib = { path = ".peppy/libs/peppylib" }
-openarm_description = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "openarm_description" }
-srs_model = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "srs_model" }
-control_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "control_core" }
+openarm_description = { git = "https://github.com/Peppy-bot/public-peppy-libs", branch = "chore/dependency-upgrades", package = "openarm_description" }
+srs_model = { git = "https://github.com/Peppy-bot/public-peppy-libs", branch = "chore/dependency-upgrades", package = "srs_model" }
+control_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", branch = "chore/dependency-upgrades", package = "control_core" }
 # The version public-peppy-libs uses, so the velocity limits come from the
 # same parser as the backbone's, and one urdf-rs is built.
 urdf-rs = "0.10"
