@@ -502,7 +502,7 @@ tool frame included. CPU only, no Isaac Sim. From the repository root, with
 the upstream staged by `sim_base_images/so101_model.py fetch <directory>`:
 
 ```bash
-uv run --no-project --python 3.11 --with mujoco==3.10.0 --with usd-core==26.8 --with numpy \
+uv run --no-project --python 3.11 --with mujoco==3.15.0 --with usd-core==26.8 --with numpy \
   python sim_isaac/scripts/build_so101.py \
   --model /tmp/so101-upstream/so101 \
   --urdf <so101_description>/urdf/so101_kinematics.urdf \
