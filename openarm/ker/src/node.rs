@@ -175,7 +175,8 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     // leaves the device free for the next start, and of two starts that race
     // exactly one takes it. The shutdown hook holds the claim for the node's
     // whole run and drops it on every stop path.
-    let ker_claim = instance_lock::claim(KER_DEVICE, node_runner.processor().bound_instance_id())?;
+    let ker_claim = instance_lock::claim(KER_DEVICE, node_runner.processor().bound_instance_id())
+        .inspect_err(|e| error!("{e}"))?;
     node_runner.on_shutdown(async move {
         drop(ker_claim);
     });

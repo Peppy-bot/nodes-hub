@@ -239,7 +239,8 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     let arm_claim = instance_lock::claim(
         &format!("openarm_arm_{arm_id}"),
         node_runner.processor().bound_instance_id(),
-    )?;
+    )
+    .inspect_err(|e| error!("{e}"))?;
 
     // Shutdown: the claim outlives the motors. The control task is the sole
     // motor writer and signals `shutdown_tx` once they are disabled; this hook
