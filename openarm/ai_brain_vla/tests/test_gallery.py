@@ -1,13 +1,32 @@
-"""The enrolment gallery a launch names by directory: a harvester
-dataset, or nothing."""
+"""The enrolment gallery a launch names: an enrolment the node ships, a
+directory of prototypes or a harvester dataset, or nothing."""
 
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
 from PIL import Image
 
-from openarm_ai_brain_vla.perception.gallery import MANIFEST_FILE, load_gallery
+from openarm_ai_brain_vla.perception import weights
+from openarm_ai_brain_vla.perception.gallery import MANIFEST_FILE, METADATA_FILE, PROTOTYPES_FILE, Gallery, load_gallery, shipped
+
+DIM = 8
+
+
+def write_enrolment(root: Path, *, model: str = weights.SIGLIP.repository, background=("robot_arm",), prompts: bool = True, classes_file: bool = True, dim: int = DIM) -> Path:
+    """A four-class enrolment in the prototypes form: three items and the
+    robot's arm as background, each prototype a unit axis of its own."""
+    root.mkdir(parents=True, exist_ok=True)
+    classes = ["coffee_can", "cracker_box", "banana", "robot_arm"]
+    prototypes = np.eye(dim, dtype=np.float32)[: len(classes)] * 3.0   # not yet normalised
+    np.savez(root / PROTOTYPES_FILE, prototypes=prototypes.astype(np.float16), classes=np.array(classes))
+    if classes_file:
+        (root / "classes.txt").write_text("\n".join(classes) + "\n")
+    if prompts:
+        (root / "prompts.txt").write_text("coffee can\ncracker box\nbanana\nrobot arm\n")
+    (root / METADATA_FILE).write_text(json.dumps({"format": "enrolment/v1", "model": model, "source": "a test", "background": list(background)}))
+    return root
 
 
 def write_harvest(root: Path, *, prompts: bool = True, drop_class: str = "") -> Path:
@@ -57,13 +76,82 @@ def test_a_url_is_not_a_gallery_and_nothing_is_fetched(no_network):
         load_gallery("https://assets.example.r2.dev/galleries/gallery.lock.json")
 
 
+def test_the_node_ships_the_waldo_catalogue_as_prototypes_made_by_its_own_siglip(no_network):
+    assert list(shipped()) == ["waldo_catalogue"]
+    gallery = load_gallery("waldo_catalogue")
+    assert gallery.prototypes is not None and gallery.prototypes.shape == (120, 1152)
+    assert np.allclose(np.linalg.norm(gallery.prototypes, axis=1), 1.0, atol=1e-3)
+    assert gallery.model == weights.SIGLIP.repository
+    assert len(gallery.item_indices()) == 117 and len(gallery.background) == 3
+    assert {gallery.classes[i] for i in gallery.background} == {"robot_arm", "robot_gripper", "empty_floor"}
+    assert "Waldo catalogue" in gallery.source and gallery.crops == ()
+    # The simulation's objects under their catalogue names, by the core's rule.
+    assert [gallery.phrases[i] for i in gallery.index_of("mustard bottle")] == ["mustard bottle"]
+    assert [gallery.phrases[i] for i in gallery.index_of("the cracker box")] == ["cracker box"]
+    # A background row is never what a description names.
+    assert gallery.index_of("robot arm") == [] and gallery.index_of("empty floor") == []
+    assert all(p == p.strip() and p for p in gallery.phrases)
+
+
+def test_a_missing_gallery_names_the_shipped_ones_in_its_refusal(tmp_path):
+    with pytest.raises(ValueError, match=r"not an enrolment the node ships \(waldo_catalogue\) and is not a directory"):
+        load_gallery("waldo_catalog")
+
+
+def test_a_directory_of_prototypes_is_read_as_it_is(tmp_path):
+    gallery = load_gallery(str(write_enrolment(tmp_path / "e")))
+    assert isinstance(gallery, Gallery)
+    assert gallery.classes == ("coffee_can", "cracker_box", "banana", "robot_arm")
+    assert gallery.phrases == ("coffee can", "cracker box", "banana", "robot arm")
+    assert gallery.prototypes.shape == (4, DIM) and gallery.prototypes.dtype == np.float32
+    # Normalised on the way in, whatever the file holds.
+    assert np.allclose(np.linalg.norm(gallery.prototypes, axis=1), 1.0)
+    assert gallery.background == frozenset({3}) and gallery.is_background(3) and not gallery.is_background(0)
+    assert gallery.item_indices() == [0, 1, 2]
+    assert gallery.model == weights.SIGLIP.repository and gallery.crops == ()
+    assert gallery.index_of("coffee can") == [0] and gallery.index_of("arm") == []
+
+
+def test_a_directory_of_prototypes_takes_its_classes_from_the_file_when_there_is_no_list(tmp_path):
+    gallery = load_gallery(str(write_enrolment(tmp_path / "e", classes_file=False, prompts=False)))
+    assert gallery.classes == ("coffee_can", "cracker_box", "banana", "robot_arm")
+    assert gallery.phrases == ("coffee can", "cracker box", "banana", "robot arm")
+
+
+def test_prototypes_that_disagree_with_their_files_are_refused_with_the_reason(tmp_path):
+    root = write_enrolment(tmp_path / "e")
+    (root / "classes.txt").write_text("coffee_can\ncracker_box\nbanana\n")
+    with pytest.raises(ValueError, match="classes in prototypes.npz differ from classes.txt"):
+        load_gallery(str(root))
+    root = write_enrolment(tmp_path / "f")
+    np.savez(root / PROTOTYPES_FILE, prototypes=np.eye(DIM, dtype=np.float32)[:3])
+    with pytest.raises(ValueError, match="holds 3 prototypes for 4 classes"):
+        load_gallery(str(root))
+    root = write_enrolment(tmp_path / "g")
+    bad = np.eye(DIM, dtype=np.float32)[:4]
+    bad[1] = 0.0
+    np.savez(root / PROTOTYPES_FILE, prototypes=bad)
+    with pytest.raises(ValueError, match="empty or non-finite prototype"):
+        load_gallery(str(root))
+    root = write_enrolment(tmp_path / "h", background=("robot_leg",))
+    with pytest.raises(ValueError, match=r"background classes that are not enrolled: \['robot_leg'\]"):
+        load_gallery(str(root))
+    root = write_enrolment(tmp_path / "i", background=("coffee_can", "cracker_box", "banana", "robot_arm"))
+    with pytest.raises(ValueError, match="enrols no item: every class is background"):
+        load_gallery(str(root))
+    root = write_enrolment(tmp_path / "j")
+    (root / PROTOTYPES_FILE).write_bytes(b"not an archive")
+    with pytest.raises(ValueError, match="prototypes.npz cannot be read"):
+        load_gallery(str(root))
+
+
 def test_a_named_gallery_that_is_not_one_is_refused_with_the_reason(tmp_path):
     with pytest.raises(ValueError, match="is not a directory the node can see"):
         load_gallery(str(tmp_path / "missing"))
     with pytest.raises(ValueError, match="is not a directory the node can see"):
         load_gallery("none")
     (tmp_path / "empty").mkdir()
-    with pytest.raises(ValueError, match="holds no manifest.json"):
+    with pytest.raises(ValueError, match="holds no manifest.json and no prototypes.npz"):
         load_gallery(str(tmp_path / "empty"))
     broken = tmp_path / "broken"
     broken.mkdir()
