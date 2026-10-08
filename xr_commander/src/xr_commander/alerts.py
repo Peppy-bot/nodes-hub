@@ -8,55 +8,78 @@ panel track alongside the camera views.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from functools import lru_cache
 
 import cv2
 
-from xr_commander.bus import CancellationToken, Latch, log, messages
+from xr_commander.bus import CancellationToken, Latch, log, messages, ticks
 
-# Severity encoding of the alert contract: 0 clears, then warning < critical
-# < fault.
-CLEAR = 0
+# Severity encoding of the alert contract: warning < critical < fault. A
+# listed alert is active; a set that omits one clears it.
 WARNING = 1
 CRITICAL = 2
 FAULT = 3
 
 _LEVEL_LABELS = {WARNING: "WARNING", CRITICAL: "CRITICAL", FAULT: "FAULT"}
 
-# Alerts age out this long after arrival: 3x the contract's 2000 ms re-emit
-# ceiling, so an alert survives two dropped re-emits but not a dead producer.
-# An aged-out alert means the producer went quiet and its condition is
-# unknown, not cleared; only a severity-0 message clears.
+# A producer's set ages out this long after arrival: three times the
+# contract's 2000 ms cadence ceiling, so a set survives two dropped
+# re-publishes but not a producer that went quiet. An aged-out set means the
+# producer's conditions are unknown, not cleared; only an omitted entry says
+# cleared.
 ALERT_STALE_AFTER_MS = 6000
+
+# How often the slot's membership is read, so a producer that leaves takes
+# its alerts with it sooner than the aging window would.
+MEMBERSHIP_POLL_S = 0.5
+
 
 @dataclass(frozen=True)
 class Alert:
-    """One active alert: its severity, operator text, and arrival time."""
+    """One active alert: its severity and operator text."""
 
     severity: int
     text: str
+
+
+@dataclass(frozen=True)
+class _ProducerSet:
+    """One producer's active set and when it arrived."""
+
+    alerts: tuple[Alert, ...]
     received_monotonic_s: float
 
 
 class ActiveAlerts:
-    """Latest alert per (producer, source, kind), loop-confined: the listener
-    writes and the panel reads, with no await between a read and its purge.
-    The producer is the transport-authenticated instance, so no producer can
-    replace or clear another's alert through the wire strings.
+    """Each producer's latest alert set, loop-confined: the listener and the
+    membership poll write, and the panel reads.
 
-    A severity-0 message removes its entry, so recovery clears the alert as
-    directly as it was raised. Severities above the contract's ceiling are
-    refused (ValueError), as is an alert with no identity, matching the
-    commander's boundary so a malformed producer can neither outrank a
-    genuine fault nor render as an unnamed one.
+    A producer is addressed by the (core node, instance id) pair the wire
+    gives, which is unique across the mesh where an instance id alone is
+    unique only within one stack. A producer's set replaces its own entry and
+    nobody else's, so no producer can clear another's alert through the wire
+    strings.
+
+    A set that omits an alert clears it. A set goes when its producer leaves
+    the slot, and ages out after `ALERT_STALE_AFTER_MS` if the producer stops
+    re-publishing. An entry with no identity, a severity outside the
+    contract, or an identity the same message already carries is dropped and
+    the rest of the set stands: a producer's one bad entry must not blank the
+    motors it reported correctly.
     """
 
-    def __init__(self, *, producers_bound: bool = True, monotonic=time.monotonic) -> None:
-        self._producers_bound = producers_bound
-        # Injectable so staleness tests can move time instead of sleeping.
+    def __init__(
+        self,
+        *,
+        bound_now: Callable[[], Iterable[tuple[str, str]]],
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._bound_now = bound_now
         self._monotonic = monotonic
-        self._by_identity: dict[tuple[str, str, str], Alert] = {}
+        self._by_producer: dict[tuple[str, str], _ProducerSet] = {}
+        self._bound: set[tuple[str, str]] = set(bound_now())
 
     @property
     def producers_bound(self) -> bool:
@@ -64,51 +87,76 @@ class ActiveAlerts:
 
         The slot is zero_or_more, so an unwired stack receives nothing and
         looks exactly like a healthy one. A surface that renders silence has
-        to be able to say which of the two it is showing.
+        to be able to say which of the two it is showing. Follows the slot,
+        so a producer that joins or leaves after start-up moves it.
         """
-        return self._producers_bound
+        return bool(self._bound)
 
-    def update(
-        self, producer: str, source: str, kind: str, severity: int, message: str
-    ) -> None:
-        if not source or not kind:
-            raise ValueError("alert identity needs a source and a kind")
-        if severity != CLEAR and severity not in _LEVEL_LABELS:
-            raise ValueError(f"undefined severity {severity}")
-        if severity == CLEAR:
-            self._by_identity.pop((producer, source, kind), None)
-            return
-        self._by_identity[(producer, source, kind)] = Alert(
-            severity=severity,
-            text=f"{source.upper()} {_LEVEL_LABELS[severity]}: {message}",
-            received_monotonic_s=self._monotonic(),
+    def replace(self, producer: tuple[str, str], active: Iterable[object]) -> list[str]:
+        """Take `producer`'s set from the wire message's `active` entries.
+
+        Answers the reasons any entry was dropped, for the caller to log.
+        """
+        alerts: list[Alert] = []
+        seen: set[tuple[str, str]] = set()
+        refused: list[str] = []
+        for item in active:
+            source, kind = item.source, item.kind
+            if not source or not kind:
+                refused.append("alert identity needs a source and a kind")
+                continue
+            if item.severity not in _LEVEL_LABELS:
+                refused.append(f"undefined severity {item.severity}")
+                continue
+            if (source, kind) in seen:
+                refused.append(f"{source!r} {kind!r} listed twice")
+                continue
+            seen.add((source, kind))
+            alerts.append(
+                Alert(
+                    severity=item.severity,
+                    text=f"{source.upper()} {_LEVEL_LABELS[item.severity]}: {item.message}",
+                )
+            )
+        self._by_producer[producer] = _ProducerSet(
+            alerts=tuple(alerts), received_monotonic_s=self._monotonic()
         )
+        return refused
+
+    def retain(self, producers: Iterable[tuple[str, str]]) -> None:
+        """Keep the sets of the producers the slot holds, and record them."""
+        self._bound = set(producers)
+        self._by_producer = {
+            producer: held
+            for producer, held in self._by_producer.items()
+            if producer in self._bound
+        }
 
     def active(self) -> tuple[Alert, ...]:
         """Every live alert, worst first, ordered so equal severities keep a
-        stable place on the panel rather than swapping between re-draws.
+        stable place on the panel between re-draws.
 
-        Stale entries are purged here: a producer that stopped re-emitting
-        cannot leave its alert on screen, and the map stays bounded when
-        sources vary.
+        A producer that stopped re-publishing is purged here, so its last set
+        cannot stay on screen as current.
         """
-        now = self._monotonic()
-        self._by_identity = {
-            identity: alert
-            for identity, alert in self._by_identity.items()
-            if now - alert.received_monotonic_s <= ALERT_STALE_AFTER_MS / 1000.0
+        oldest = self._monotonic() - ALERT_STALE_AFTER_MS / 1000.0
+        self._by_producer = {
+            producer: held
+            for producer, held in self._by_producer.items()
+            if held.received_monotonic_s >= oldest
         }
-        # Ordered by severity then by identity, never by the rendered text:
-        # the text carries a live measurement the producer re-emits, so
-        # sorting on it swaps two equal-severity rows whenever a reading
-        # ticks.
-        return tuple(
-            alert
-            for _identity, alert in sorted(
-                self._by_identity.items(),
-                key=lambda item: (-item[1].severity, item[0]),
-            )
+        # Ordered by severity, then by producer, then by the order the
+        # producer listed its own alerts in. Never by the rendered text,
+        # which carries a measurement that moves between re-publishes.
+        ordered = sorted(
+            (
+                (-alert.severity, producer, index, alert)
+                for producer, held in self._by_producer.items()
+                for index, alert in enumerate(held.alerts)
+            ),
+            key=lambda row: row[:3],
         )
+        return tuple(row[3] for row in ordered)
 
 
 # Below this fraction of the intended scale the glyphs stop surviving VP8,
@@ -166,7 +214,7 @@ async def drain_alerts(
     active: ActiveAlerts,
     token: CancellationToken,
 ) -> None:
-    """Keep `active` at every producer's newest alerts."""
+    """Keep `active` at every producer's newest alert set."""
     try:
         subscription = await topic_module.subscribe(node_runner)
     except Exception as e:
@@ -174,23 +222,49 @@ async def drain_alerts(
         # than a task that dies and takes its failure with it.
         log(f"alerts subscribe failed: {e!r}")
         return
-    # Latched per producer: a malformed producer repeats every re-emit, and
-    # a shared latch would be cleared by any other producer's good message,
-    # so one bad arm would log on every re-emit forever.
-    unusable: dict[str, Latch] = {}
+    # Latched per producer: a producer's refusal logs once, until a set from
+    # that same producer parses clean.
+    unusable: dict[tuple[str, str], Latch] = {}
     async for producer, message in messages(subscription, token, "alerts"):
-        latch = unusable.get(producer.instance_id)
+        key = (producer.core_node, producer.instance_id)
+        latch = unusable.get(key)
         if latch is None:
-            latch = unusable[producer.instance_id] = Latch()
+            latch = unusable[key] = Latch()
         try:
-            active.update(
-                producer.instance_id,
-                message.source,
-                message.kind,
-                message.severity,
-                message.message,
-            )
-            latch.clear()
+            refused = active.replace(key, message.active)
         except Exception as e:
-            latch.trip(f"alert unusable from {producer.instance_id}: {e!r}")
+            latch.trip(f"alert set unusable from {key[1]}: {e!r}")
+            continue
+        if refused:
+            latch.trip(f"alert entry dropped from {key[1]}: {refused[0]}")
+        else:
+            latch.clear()
     log("alerts stream ended")
+
+
+async def follow_producers(
+    node_runner,
+    topic_module,
+    active: ActiveAlerts,
+    token: CancellationToken,
+    *,
+    period_s: float = MEMBERSHIP_POLL_S,
+) -> None:
+    """Keep `active` at the producers the alert slot holds.
+
+    The generated slot API answers who is bound and offers no change stream,
+    so this polls it. It runs in its own task, so the panel's frame loop
+    never pays for the call or carries its failure, and a producer that
+    leaves without publishing again is noticed before its set ages out.
+    """
+    failing = Latch()
+    async for _ in ticks(period_s, token):
+        try:
+            active.retain(
+                (p.core_node, p.instance_id)
+                for p in topic_module.bound_producers(node_runner)
+            )
+            failing.clear()
+        except BaseException as e:  # a slot the manifest lost raises through pyo3
+            failing.trip(f"alerts bound set unreadable: {e!r}")
+    log("alerts membership poll ended")
