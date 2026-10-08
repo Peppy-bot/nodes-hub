@@ -212,13 +212,16 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
         )
 
     token = node_runner.cancellation_token()
-    # Shared by the alert listener, the status panel, and every camera drain.
-    alerts_bound = bool(alerts_topic.bound_producers(node_runner))
+    # Shared by the alert listener and the status panel. A stack with nothing
+    # bound to the alert slot can never receive an alert, so its quiet panel
+    # means "not wired" rather than "nothing wrong": silence must not be
+    # rendered as health. The slot is read live, so a producer that joins
+    # after start-up moves the panel off "not wired".
     active_alerts = alerts.ActiveAlerts(
-        # A stack with nothing bound to the alert slot can never receive an
-        # alert, so its quiet panel means "not wired" rather than "nothing
-        # wrong". Silence must not be rendered as health.
-        producers_bound=alerts_bound,
+        bound_now=lambda: (
+            (p.core_node, p.instance_id)
+            for p in alerts_topic.bound_producers(node_runner)
+        ),
     )
     # Shared by the health listener and the status panel, on the same
     # unwired-is-not-healthy reasoning as the alerts.
@@ -238,14 +241,19 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
         )
         for action_module, pressed in _POSTURE_BUTTONS
     ]
-    # Skipped when nothing is bound, like the camera drains: there is
-    # nothing to receive, and the panel already says "not wired".
-    if alerts_bound:
-        tasks.append(
-            asyncio.create_task(
-                alerts.drain_alerts(node_runner, alerts_topic, active_alerts, token)
-            )
+    # Always listening: the slot takes any number of producers and one that
+    # joins after start-up has to reach the panel, so there is nothing to
+    # gate on.
+    tasks.append(
+        asyncio.create_task(
+            alerts.drain_alerts(node_runner, alerts_topic, active_alerts, token)
         )
+    )
+    tasks.append(
+        asyncio.create_task(
+            alerts.follow_producers(node_runner, alerts_topic, active_alerts, token)
+        )
+    )
     if motor_reports.producers_bound:
         tasks.append(
             asyncio.create_task(

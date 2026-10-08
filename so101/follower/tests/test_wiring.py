@@ -89,16 +89,39 @@ async def test_a_latched_servo_fault_reaches_the_alert_stream():
     fake = FakeHardware()
     async with harness.start(make_setup(lambda config: fake), parameters=PARAMETERS) as h:
         await asyncio.wait_for(h.emitted.motor_health_motor_health.next(), TIMEOUT_S)
+        # The opening set goes out while every motor is quiet, so a consumer
+        # that subscribes later can tell a healthy follower from one that
+        # has not started.
+        opening = await asyncio.wait_for(h.emitted.alerts_alerts.next(), TIMEOUT_S)
+        assert opening.active == [], "a quiet follower opens with an empty set"
+
         fake.faults = (0, 32, 0, 0, 0, 0)  # overload latched on shoulder_lift
+        # The set is published on the change and again on the cadence floor,
+        # so the fault arrives in one of the next messages.
+        deadline = asyncio.get_event_loop().time() + TIMEOUT_S
+        faulted = None
+        while faulted is None and asyncio.get_event_loop().time() < deadline:
+            message = await asyncio.wait_for(h.emitted.alerts_alerts.next(), TIMEOUT_S)
+            faulted = next(
+                (entry for entry in message.active if "shoulder_lift" in entry.source),
+                None,
+            )
+        assert faulted is not None, "the latched fault never reached the alert set"
+        assert faulted.severity == 3, "a latched fault is the fault severity"
+        assert faulted.kind == "motor_condition"
+        assert "overload" in faulted.message
+
+        # Clearing the fault clears the entry by omitting it, with no
+        # severity-0 message.
+        fake.faults = (0, 0, 0, 0, 0, 0)
         deadline = asyncio.get_event_loop().time() + TIMEOUT_S
         while asyncio.get_event_loop().time() < deadline:
-            alert = await asyncio.wait_for(h.emitted.alerts_alerts.next(), TIMEOUT_S)
-            if "shoulder_lift" in alert.source:
+            message = await asyncio.wait_for(h.emitted.alerts_alerts.next(), TIMEOUT_S)
+            if all("shoulder_lift" not in entry.source for entry in message.active):
                 break
-        assert "shoulder_lift" in alert.source
-        assert alert.severity > 0
-        assert alert.kind == "motor_condition"
-        assert "overload" in alert.message
+        assert all("shoulder_lift" not in entry.source for entry in message.active), (
+            "a recovered motor is cleared by being left out of the set"
+        )
 
 
 async def test_setpoints_reach_the_bus_in_device_units():
