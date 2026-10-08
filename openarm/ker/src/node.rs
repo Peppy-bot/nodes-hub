@@ -8,9 +8,8 @@ use std::time::Duration;
 use control_core::time::{DurationError, RateOutOfRange, duration_from_secs, period_from_hz};
 use openarm_description::HardwareVersion;
 use peppygen::{NodeRunner, Parameters, Result};
-use peppylib::datastore::{self, Encoding};
 use tokio::sync::watch;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use crate::engage::{EngageTriggerOpening, EngageTriggerOpeningOutOfRange};
 use crate::mapping::{GripperOpenFraction, GripperOpenFractionOutOfRange};
@@ -18,11 +17,9 @@ use crate::publish;
 use crate::reader::{self, ReaderConfig};
 use crate::transport::{TransportConfig, TransportError};
 
-const DATASTORE_TIMEOUT: Duration = Duration::from_secs(3);
-const LOCK_REMOVE_TIMEOUT: Duration = Duration::from_secs(1);
 /// One node instance per KER device: a second reader would fight for the USB
 /// claim (or interleave on the serial port) in confusing ways, so fail fast.
-const LOCK_KEY: &str = "openarm_ker_instance_lock";
+const KER_DEVICE: &str = "openarm_ker";
 /// The fastest this node streams the leader's pose. The KER reference loop
 /// runs at 1 kHz; nothing downstream consumes faster.
 const MAX_RATE_HZ: u32 = 1_000;
@@ -40,10 +37,7 @@ static TASK_FAILED: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new
 /// Named rather than stringly typed so each refusal keeps its source, and so
 /// this list names every refusal `setup` itself raises (a device the channel
 /// map does not describe is refused by the reader and arrives as
-/// [`NodeError::TaskStopped`], with the reason in the log). It
-/// exists because returning a refusal, rather than panicking it, is what runs
-/// the shutdown hooks: a panic in `setup` unwinds past them, leaving the
-/// instance lock standing against the next start.
+/// [`NodeError::TaskStopped`], with the reason in the log).
 #[derive(Debug, thiserror::Error)]
 pub enum NodeError {
     #[error("parameter command_rate_hz")]
@@ -71,8 +65,8 @@ pub enum NodeError {
     #[error(transparent)]
     GripperOpenFraction(#[from] GripperOpenFractionOutOfRange),
 
-    #[error("instance lock {key} held by {holder}")]
-    LockHeld { key: String, holder: String },
+    #[error(transparent)]
+    Claim(#[from] instance_lock::Error),
 
     #[error("spawn the KER reader thread")]
     ReaderThread(#[source] std::io::Error),
@@ -176,33 +170,15 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         config.gripper_open_fraction.fraction(),
     );
 
-    // Instance lock: refuse to start if another instance is running. Held in the
-    // core-node datastore (released from the on_shutdown hook below), so a
-    // lock leaked by a hard crash clears with the stack instead of
-    // lingering like a /tmp file. get-then-store is not atomic; two
-    // simultaneous starts can race (single-writer in practice).
-    if let Some(held) = datastore::get(&node_runner, LOCK_KEY, DATASTORE_TIMEOUT).await? {
-        return Err(NodeError::LockHeld {
-            key: LOCK_KEY.to_string(),
-            holder: held.last_modified_by,
-        });
-    }
-    datastore::store(
-        &node_runner,
-        LOCK_KEY,
-        b"locked".to_vec(),
-        Encoding::TEXT_PLAIN,
-        DATASTORE_TIMEOUT,
-    )
-    .await?;
-    {
-        let runner = node_runner.clone();
-        node_runner.on_shutdown(async move {
-            if let Err(e) = datastore::remove(&runner, LOCK_KEY, LOCK_REMOVE_TIMEOUT).await {
-                warn!("failed to remove lock {LOCK_KEY}: {e}");
-            }
-        });
-    }
+    // The claim is an exclusive lock on a file the kernel releases when this
+    // process exits by any route, including SIGKILL, so a crashed instance
+    // leaves the device free for the next start, and of two starts that race
+    // exactly one takes it. The shutdown hook holds the claim for the node's
+    // whole run and drops it on every stop path.
+    let ker_claim = instance_lock::claim(KER_DEVICE, node_runner.processor().bound_instance_id())?;
+    node_runner.on_shutdown(async move {
+        drop(ker_claim);
+    });
 
     // The reader thread owns the device and keeps the newest mapped sample
     // on the watch channel; the publish tasks stream it. Returning

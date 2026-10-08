@@ -53,7 +53,10 @@
   execution: {
     language: "rust",
     container: {
-      def_file: "apptainer.def"
+      def_file: "apptainer.def",
+      // Where the instance lock on this node's device lives. Bound so every
+      // instance on the host locks the one file.
+      mount_paths: ["/tmp/peppy_instance_locks"],
     },
     parameters: {
       arm_id: "u8",
