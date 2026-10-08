@@ -1801,6 +1801,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "instance_lock"
+version = "0.1.0"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs?rev=30a609fdd207befca957db4222732e2cd46d6b21#30a609fdd207befca957db4222732e2cd46d6b21"
+dependencies = [
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "ipnet"
 version = "2.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2507,6 +2515,7 @@ name = "openarm_arm"
 version = "0.1.0"
 dependencies = [
  "control_core",
+ "instance_lock",
  "openarm_can",
  "openarm_description",
  "peppygen",
