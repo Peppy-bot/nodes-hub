@@ -10,6 +10,9 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 openarm_can = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "openarm_can" }
 control_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "control_core" }
+# One revision per git source, so the explicit rev keeps this dependency's
+# source apart from the crates above, which the lockfile holds at theirs.
+instance_lock = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "instance_lock", rev = "30a609fdd207befca957db4222732e2cd46d6b21" }
 # Supplies the HardwareVersion/Side parse the arm node uses, so both limbs
 # accept the same generation names.
 openarm_description = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "openarm_description" }

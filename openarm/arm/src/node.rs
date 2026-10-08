@@ -11,7 +11,6 @@ use openarm_can::ArmCan;
 use openarm_description::{HardwareVersion, Side};
 use peppygen::exposed_services::ready::is_ready;
 use peppygen::{NodeRunner, Parameters, Result};
-use peppylib::datastore::{self, Encoding};
 use srs_model::nalgebra::Isometry3;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -43,10 +42,6 @@ fn side_for(arm_id: u8) -> NodeResult<Side> {
 const POST_ENABLE_SLEEP: Duration = Duration::from_millis(100);
 const BRINGUP_RECV_US: u32 = 500;
 const ENABLE_FD: bool = true;
-const DATASTORE_TIMEOUT: Duration = Duration::from_secs(3);
-/// Tighter bound for shutdown lock removal so motor disable + lock removal stays
-/// inside the default 5 s shutdown grace window.
-const LOCK_REMOVE_TIMEOUT: Duration = Duration::from_secs(1);
 /// Bound on the shutdown hook that awaits the health task's final flush.
 /// Hooks share one grace window and this one runs before the motor-disable
 /// hook, so an unbounded wait on a stalled publish would hold the motors
@@ -63,7 +58,7 @@ const MAX_RATE_HZ: u32 = 1_000;
 /// this list is the one place to read what a launch can be rejected for. It
 /// exists because returning a refusal, rather than panicking it, is what runs
 /// the shutdown hooks: a panic in `setup` unwinds past them, leaving the motors
-/// energised and the instance lock held.
+/// energised.
 #[derive(Debug, thiserror::Error)]
 pub enum NodeError {
     #[error("parameter control_rate_hz")]
@@ -88,8 +83,8 @@ pub enum NodeError {
         source: srs_model::SrsError,
     },
 
-    #[error("instance lock {key} held by {holder}")]
-    LockHeld { key: String, holder: String },
+    #[error(transparent)]
+    Claim(#[from] instance_lock::Error),
 
     #[error("open the CAN interface")]
     CanOpen(#[from] openarm_can::CanError),
@@ -236,46 +231,27 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     );
     info!("config: kp={kp:?} kd={kd:?}");
 
-    // Instance lock: refuse to start if another instance with the same arm_id is
-    // running. Held in the core-node datastore (released from the on_shutdown
-    // hook below), so a lock leaked by a hard crash clears with the stack
-    // instead of lingering like a /tmp file. get-then-store is not atomic; two
-    // simultaneous starts can race (single-writer in practice).
-    let lock_key = format!("openarm_arm_{arm_id}_instance_lock");
-    if let Some(held) = datastore::get(&node_runner, lock_key.as_str(), DATASTORE_TIMEOUT).await? {
-        return Err(NodeError::LockHeld {
-            key: lock_key,
-            holder: held.last_modified_by,
-        });
-    }
-    datastore::store(
-        &node_runner,
-        lock_key.as_str(),
-        b"locked".to_vec(),
-        Encoding::TEXT_PLAIN,
-        DATASTORE_TIMEOUT,
-    )
-    .await?;
+    // One instance per arm: two instances sharing an `arm_id` command one arm's
+    // motors, each decoding the other's replies. The claim is an exclusive lock
+    // on a file the kernel releases when this process exits by any route,
+    // including SIGKILL, so a crashed instance leaves its arm free for the next
+    // start, and of two starts that race exactly one takes the arm.
+    let arm_claim = instance_lock::claim(
+        &format!("openarm_arm_{arm_id}"),
+        node_runner.processor().bound_instance_id(),
+    )?;
 
-    // Shutdown: register the lock-release hook right after acquiring the lock,
-    // so a panic during bringup still releases the key (dropping `shutdown_tx`
-    // completes `shutdown_rx`, so the hook runs). On a normal stop the control
-    // task disables the motors (the sole motor writer) and signals
-    // `shutdown_tx` when done; this hook waits for that,
-    // then removes the datastore lock. The runtime fires it on every stop path
-    // with the messenger connected and awaits it before exit.
+    // Shutdown: the claim outlives the motors. The control task is the sole
+    // motor writer and signals `shutdown_tx` once they are disabled; this hook
+    // waits for that, then drops the claim, so the next start of this arm finds
+    // the motors already off. Registered here, before the motors are ever
+    // enabled, it also covers a bringup that ends early: dropping `shutdown_tx`
+    // completes `shutdown_rx`, so the hook runs.
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    {
-        let runner = node_runner.clone();
-        let lock_key = lock_key.clone();
-        node_runner.on_shutdown(async move {
-            let _ = shutdown_rx.await;
-            if let Err(e) = datastore::remove(&runner, lock_key.as_str(), LOCK_REMOVE_TIMEOUT).await
-            {
-                warn!("failed to remove lock {lock_key}: {e}");
-            }
-        });
-    }
+    node_runner.on_shutdown(async move {
+        let _ = shutdown_rx.await;
+        drop(arm_claim);
+    });
 
     // Hardware bringup: sequence mirrors ROS2 v10_simple_hardware on_init/on_activate.
     // Arm motor lineup + CAN addressing are identical across generations; open()

@@ -11,7 +11,6 @@ use control_core::time::{RateOutOfRange, period_from_hz};
 use openarm_description::{HardwareVersion, Side};
 use peppygen::exposed_services::ready::is_ready;
 use peppygen::{NodeRunner, Parameters, Result};
-use peppylib::datastore::{self, Encoding};
 use peppylib::runtime::CancellationToken;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,10 +24,6 @@ const POST_ENABLE_SLEEP: Duration = Duration::from_millis(100);
 const POST_DISABLE_SLEEP: Duration = Duration::from_millis(100);
 const BRINGUP_RECV_US: u32 = 2000;
 const ENABLE_FD: bool = true;
-const DATASTORE_TIMEOUT: Duration = Duration::from_secs(3);
-/// Tighter bound for shutdown lock removal so disable + drain + removal stays
-/// inside the default 5 s shutdown grace window.
-const LOCK_REMOVE_TIMEOUT: Duration = Duration::from_secs(1);
 /// Bound on the shutdown hook that awaits the health task's final flush.
 /// Hooks share one grace window and this one runs before the motor-disable
 /// hook, so an unbounded wait on a stalled publish would hold the motors
@@ -52,7 +47,7 @@ const MAX_RATE_HZ: u32 = 1_000;
 /// this list is the one place to read what a launch can be rejected for. It
 /// exists because returning a refusal, rather than panicking it, is what runs
 /// the shutdown hooks: a panic in `setup` unwinds past them, leaving the motor
-/// energised and the instance lock held.
+/// energised.
 #[derive(Debug, thiserror::Error)]
 pub enum NodeError {
     #[error("parameter control_rate_hz")]
@@ -73,8 +68,8 @@ pub enum NodeError {
     #[error(transparent)]
     Limits(#[from] crate::hardware::PosForceLimitsError),
 
-    #[error("instance lock {key} held by {holder}")]
-    LockHeld { key: String, holder: String },
+    #[error(transparent)]
+    Claim(#[from] instance_lock::Error),
 
     #[error("enable the gripper motor")]
     Enable(#[from] openarm_can::EnableFailure),
@@ -216,50 +211,23 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         recv_timeout_us: params.recv_timeout_us,
     };
 
-    // Instance lock: refuse to start if another instance with the same
-    // gripper_id is running. Held in the core-node datastore (released from the on_shutdown
-    // hook below), so a lock leaked by a hard crash clears with the stack
-    // instead of lingering like a /tmp file. get-then-store is not atomic; two
-    // simultaneous starts can race (single-writer in practice). Same scheme as
-    // openarm_arm.
-    //
-    // The superseded openarm_gripper_v2 node keyed its lock on its own name,
-    // which this key does not exclude. Both drive the same motor id on the
-    // same bus, so a survivor of that node is checked for too: without it two
-    // processes would command one gripper, each decoding the other's replies.
-    // Drop the legacy key once no deployment can still be running that node.
-    let lock_key = format!("openarm_gripper_{gripper_id}_instance_lock");
-    let superseded_lock_key = format!("openarm_gripper_v2_{gripper_id}_instance_lock");
-    for key in [superseded_lock_key.as_str(), lock_key.as_str()] {
-        if let Some(held) = datastore::get(&node_runner, key, DATASTORE_TIMEOUT).await? {
-            return Err(NodeError::LockHeld {
-                key: key.to_string(),
-                holder: held.last_modified_by,
-            });
-        }
-    }
-    datastore::store(
-        &node_runner,
-        lock_key.as_str(),
-        b"locked".to_vec(),
-        Encoding::TEXT_PLAIN,
-        DATASTORE_TIMEOUT,
-    )
-    .await?;
+    // One instance per gripper: two instances sharing a `gripper_id` command one
+    // motor id on one bus, each decoding the other's replies. The claim is an
+    // exclusive lock on a file the kernel releases when this process exits by
+    // any route, including SIGKILL, so a crashed instance leaves its gripper
+    // free for the next start, and of two starts that race exactly one takes the
+    // gripper. Same scheme as openarm_arm.
+    let gripper_claim = instance_lock::claim(
+        &format!("openarm_gripper_{gripper_id}"),
+        node_runner.processor().bound_instance_id(),
+    )?;
 
-    // Lock-release hook, registered first so it runs last (after the
-    // motor-disable hook below). The runtime fires it on every stop path with
-    // the messenger still connected, so the key never outlives the process.
-    {
-        let runner = node_runner.clone();
-        let lock_key = lock_key.clone();
-        node_runner.on_shutdown(async move {
-            if let Err(e) = datastore::remove(&runner, lock_key.as_str(), LOCK_REMOVE_TIMEOUT).await
-            {
-                warn!("failed to remove lock {lock_key}: {e}");
-            }
-        });
-    }
+    // Claim-release hook, registered first so it runs last, after the
+    // motor-disable hook below: the next start of this gripper finds its motor
+    // already disabled.
+    node_runner.on_shutdown(async move {
+        drop(gripper_claim);
+    });
 
     // Hardware bringup, mirroring the ROS2 reference's on_init / on_configure
     // / on_activate: opening writes this generation's control mode into the
