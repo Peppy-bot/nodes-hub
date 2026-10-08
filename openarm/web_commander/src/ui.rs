@@ -394,8 +394,8 @@ struct ProximityView {
 #[derive(Serialize)]
 struct AlertView {
     source: String,
-    // Alert severity: 1 warning, 2 critical, 3 fault (0 never renders; a
-    // clear removes its entry instead).
+    // Alert severity on the contract's scale: 1 warning, 2 critical, 3
+    // fault. The browser indexes its colour and label tables by this number.
     severity: u8,
     message: String,
 }
@@ -554,7 +554,7 @@ impl Snapshot {
                 stopped: p.disposition == Disposition::Stopped,
             }),
             health: health_panel_view(s, now),
-            alerts: live_alerts(s, now),
+            alerts: alert_views(s, now),
             alerts_bound: s.alerts_bound,
             status: s.status.clone(),
         }
@@ -569,19 +569,23 @@ fn live_proximity(s: &UiState, now: Instant) -> Option<&Proximity> {
         .filter(|p| now.duration_since(p.received_at) < PROXIMITY_STALE_AFTER)
 }
 
-/// The still-live alerts, most severe first (receipt order within a
-/// severity); entries whose producer stopped re-emitting age out.
-fn live_alerts(s: &UiState, now: Instant) -> Vec<AlertView> {
+/// The alerts of every producer whose set is still live, most severe first.
+///
+/// Producers are ordered by identity and each producer lists its own alerts
+/// in a fixed order, and the sort is stable, so the list holds its order
+/// between redraws while a producer republishes an unchanged set.
+fn alert_views(s: &UiState, now: Instant) -> Vec<AlertView> {
     let mut live: Vec<&Alert> = s
         .alerts
-        .iter()
-        .filter(|a| a.validity.is_live_at(now))
+        .values()
+        .filter(|set| set.validity.is_live_at(now))
+        .flat_map(|set| set.alerts.iter())
         .collect();
     live.sort_by_key(|a| std::cmp::Reverse(a.severity));
     live.into_iter()
         .map(|a| AlertView {
             source: a.source.clone(),
-            severity: a.severity,
+            severity: a.severity.wire(),
             message: a.message.clone(),
         })
         .collect()
@@ -918,8 +922,10 @@ impl From<JogModeWire> for JogMode {
 mod tests {
     use super::*;
     use crate::state::{
-        ArmHealth, GripperHealth, HEALTH_STALE_AFTER, MotorHealthReading, Validity,
+        ALERT_STALE_AFTER, AlertSet, AlertSeverity, ArmHealth, GripperHealth, HEALTH_STALE_AFTER,
+        MotorHealthReading, Validity,
     };
+    use peppylib::messaging::ProducerRef;
 
     // A panel that has not answered within this is not going to.
     const REPLY_BUDGET: Duration = Duration::from_secs(5);
@@ -944,20 +950,27 @@ mod tests {
         s
     }
 
-    const TEST_VALID_FOR: Duration = Duration::from_secs(5);
-
-    fn alert(source: &str, severity: u8, received_at: Instant) -> Alert {
-        alert_from("core/left_arm_inst", source, severity, received_at)
+    fn producer(instance: &str) -> ProducerRef {
+        ProducerRef::new("core", instance)
     }
 
-    fn alert_from(producer: &str, source: &str, severity: u8, received_at: Instant) -> Alert {
+    fn left_arm() -> ProducerRef {
+        producer("left_arm_inst")
+    }
+
+    fn alert(source: &str, severity: AlertSeverity) -> Alert {
         Alert {
-            producer: producer.to_string(),
             source: source.to_string(),
-            kind: "motor_overload".to_string(),
             severity,
             message: "holding 93% of rated torque".to_string(),
-            validity: Validity::new(received_at, TEST_VALID_FOR),
+        }
+    }
+
+    /// A set received at `received_at`, so it renders until its window ends.
+    fn alert_set(alerts: Vec<Alert>, received_at: Instant) -> AlertSet {
+        AlertSet {
+            alerts,
+            validity: Validity::new(received_at, ALERT_STALE_AFTER),
         }
     }
 
@@ -992,64 +1005,151 @@ mod tests {
     }
 
     #[test]
-    fn alerts_upsert_by_identity_and_clear_on_severity_zero() {
+    fn a_producers_set_replaces_its_whole_entry_and_clears_by_absence() {
         let mut s = ui_state();
-        let t0 = Instant::now();
-        s.apply_alert(alert("left arm j2", 1, t0));
-        s.apply_alert(alert("left arm j2", 2, t0));
-        assert_eq!(s.alerts.len(), 1, "one entry per (producer, source, kind)");
-        assert_eq!(s.alerts[0].severity, 2);
-        s.apply_alert(alert("left arm j2", 0, t0));
-        assert!(s.alerts.is_empty(), "severity 0 clears the entry");
+        let t0 = s.created_at;
+        s.apply_alert_set(
+            left_arm(),
+            alert_set(
+                vec![
+                    alert("left arm j2", AlertSeverity::Warning),
+                    alert("left arm j5", AlertSeverity::Warning),
+                ],
+                t0,
+            ),
+        );
+        s.apply_alert_set(
+            left_arm(),
+            alert_set(vec![alert("left arm j2", AlertSeverity::Critical)], t0),
+        );
+        assert_eq!(s.alerts.len(), 1, "one set per producer");
+        let views = alert_views(&s, t0);
+        assert_eq!(views.len(), 1, "the omitted alert is gone");
+        assert_eq!(views[0].source, "left arm j2");
+        assert_eq!(views[0].severity, AlertSeverity::Critical.wire());
+
+        s.apply_alert_set(left_arm(), alert_set(Vec::new(), t0));
+        assert!(
+            alert_views(&s, t0).is_empty(),
+            "a set that omits every alert clears them"
+        );
+    }
+
+    #[test]
+    fn a_producer_that_stops_refreshing_its_set_ages_out() {
+        // The contract's cadence is what lets the panel stop presenting a
+        // quiet producer's conditions as current.
+        let mut s = ui_state();
+        let t0 = s.created_at;
+        s.apply_alert_set(
+            left_arm(),
+            alert_set(vec![alert("left arm j2", AlertSeverity::Fault)], t0),
+        );
+        assert_eq!(
+            alert_views(&s, t0 + ALERT_STALE_AFTER - Duration::from_millis(1)).len(),
+            1,
+            "live for the whole window"
+        );
+        assert!(
+            alert_views(&s, t0 + ALERT_STALE_AFTER).is_empty(),
+            "a quiet producer's set stops rendering"
+        );
     }
 
     #[test]
     fn a_producer_cannot_replace_or_clear_anothers_alert() {
         let mut s = ui_state();
-        let t0 = Instant::now();
-        s.apply_alert(alert_from("core/left_arm_inst", "left arm j2", 2, t0));
-        s.apply_alert(alert_from("core/imposter", "left arm j2", 1, t0));
-        assert_eq!(s.alerts.len(), 2, "same wire strings, distinct producers");
-        s.apply_alert(alert_from("core/imposter", "left arm j2", 0, t0));
-        assert_eq!(s.alerts.len(), 1, "the clear removed only its own entry");
-        assert_eq!(s.alerts[0].producer, "core/left_arm_inst");
-        assert_eq!(s.alerts[0].severity, 2);
-    }
-
-    #[test]
-    fn a_clear_for_an_unknown_alert_is_a_no_op() {
-        let mut s = ui_state();
-        let t0 = Instant::now();
-        s.apply_alert(alert("right arm j1", 2, t0));
-        s.apply_alert(alert("left arm j2", 0, t0));
-        assert_eq!(s.alerts.len(), 1, "an unknown clear removes nothing");
-        assert_eq!(s.alerts[0].source, "right arm j1");
-    }
-
-    #[test]
-    fn alerts_purge_entries_whose_producer_went_quiet() {
-        let mut s = ui_state();
-        let t0 = Instant::now();
-        s.apply_alert(alert("left arm j2", 1, t0));
-        s.apply_alert(alert("right arm j1", 2, t0 + TEST_VALID_FOR));
-        assert_eq!(s.alerts.len(), 1, "the quiet producer's entry is purged");
-        assert_eq!(s.alerts[0].source, "right arm j1");
-    }
-
-    #[test]
-    fn live_alerts_age_out_and_sort_most_severe_first() {
-        let mut s = ui_state();
-        let t0 = Instant::now();
-        s.apply_alert(alert("left arm j2", 1, t0));
-        s.apply_alert(alert("right arm j1", 3, t0));
-        let views = live_alerts(&s, t0 + Duration::from_secs(1));
-        assert_eq!(views.len(), 2);
-        assert_eq!(views[0].source, "right arm j1", "most severe first");
-        assert_eq!(views[1].source, "left arm j2");
-        assert!(
-            live_alerts(&s, t0 + TEST_VALID_FOR).is_empty(),
-            "a quiet producer's alerts stop rendering"
+        let t0 = s.created_at;
+        s.apply_alert_set(
+            left_arm(),
+            alert_set(vec![alert("left arm j2", AlertSeverity::Critical)], t0),
         );
+        s.apply_alert_set(
+            producer("imposter"),
+            alert_set(vec![alert("left arm j2", AlertSeverity::Warning)], t0),
+        );
+        assert_eq!(
+            alert_views(&s, t0).len(),
+            2,
+            "same wire strings, distinct producers"
+        );
+        s.apply_alert_set(producer("imposter"), alert_set(Vec::new(), t0));
+        let views = alert_views(&s, t0);
+        assert_eq!(views.len(), 1, "the empty set cleared only its own entry");
+        assert_eq!(views[0].severity, AlertSeverity::Critical.wire());
+    }
+
+    #[test]
+    fn a_producer_that_leaves_the_slot_takes_its_alerts_with_it() {
+        let mut s = ui_state();
+        let t0 = s.created_at;
+        let right = producer("right_arm_inst");
+        s.apply_alert_set(
+            left_arm(),
+            alert_set(vec![alert("left arm j2", AlertSeverity::Warning)], t0),
+        );
+        s.apply_alert_set(
+            right.clone(),
+            alert_set(vec![alert("right arm j1", AlertSeverity::Critical)], t0),
+        );
+        s.retain_alert_producers(&[right]);
+        let views = alert_views(&s, t0);
+        assert_eq!(views.len(), 1, "the departed producer's set is gone");
+        assert_eq!(views[0].source, "right arm j1");
+        assert!(s.alerts_bound, "the slot still holds a producer");
+    }
+
+    #[test]
+    fn an_empty_bound_set_clears_every_alert_and_reads_as_unwired() {
+        // The startup state and the last-producer-leaves state. A panel that
+        // kept the rows would show a robot nobody is watching as a healthy
+        // one.
+        let mut s = ui_state();
+        let t0 = s.created_at;
+        s.alerts_bound = true;
+        s.apply_alert_set(
+            left_arm(),
+            alert_set(vec![alert("left arm j2", AlertSeverity::Fault)], t0),
+        );
+        s.retain_alert_producers(&[]);
+        assert!(alert_views(&s, t0).is_empty());
+        assert!(!s.alerts_bound, "an empty slot is not wired");
+    }
+
+    #[test]
+    fn alert_views_sort_most_severe_first_and_hold_their_order() {
+        let mut s = ui_state();
+        let t0 = s.created_at;
+        let listed = || {
+            vec![
+                alert("left arm j2", AlertSeverity::Critical),
+                alert("left arm j5", AlertSeverity::Fault),
+                alert("left arm j7", AlertSeverity::Warning),
+            ]
+        };
+        s.apply_alert_set(left_arm(), alert_set(listed(), t0));
+        s.apply_alert_set(
+            producer("right_arm_inst"),
+            alert_set(vec![alert("right arm j1", AlertSeverity::Critical)], t0),
+        );
+        let sources: Vec<String> = alert_views(&s, t0)
+            .iter()
+            .map(|v| v.source.clone())
+            .collect();
+        assert_eq!(
+            sources,
+            ["left arm j5", "left arm j2", "right arm j1", "left arm j7"],
+            "severity descending, then producer, then the producer's own order"
+        );
+
+        // A producer republishing an unchanged set must not reshuffle the
+        // list under an operator reading it.
+        s.apply_alert_set(left_arm(), alert_set(listed(), t0));
+        let after: Vec<String> = alert_views(&s, t0)
+            .iter()
+            .map(|v| v.source.clone())
+            .collect();
+        assert_eq!(after, sources);
     }
 
     #[test]
@@ -1211,7 +1311,10 @@ mod tests {
         let t0 = s.created_at;
         s.health[Side::Left] = Some(arm_health([HealthLevel::Nominal; ARM_DOF], t0));
         s.gripper_health[Side::Left] = Some(gripper_health(HealthLevel::Fault, t0));
-        s.apply_alert(alert("left arm j2", 2, t0));
+        s.apply_alert_set(
+            left_arm(),
+            alert_set(vec![alert("left arm j2", AlertSeverity::Critical)], t0),
+        );
         let json = build_snapshot_json(&s, t0, &models, &registry).unwrap();
         let snap: serde_json::Value = serde_json::from_str(&json).unwrap();
 

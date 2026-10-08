@@ -26,7 +26,7 @@ use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 use tracing::{error, warn};
 
-use crate::owner::CommandFrame;
+use crate::owner::{CommandFrame, GovernorFrame};
 use crate::state::Side;
 
 /// Pairing timestamp from this instance's bound clock, so the backbone ages
@@ -72,26 +72,13 @@ pub async fn run(
 
     let mut tasks = tokio::task::JoinSet::new();
 
-    // Governor controls: no deadman, so this always publishes the latest frame.
-    let governor_rx = frame_rx.clone();
-    tasks.spawn(stream_setpoints(
+    // Governor controls: a latched setting. The topic retains the newest
+    // message, so a backbone that starts later reads the setting in force
+    // and the operator need not touch a control to resend it.
+    tasks.spawn(stream_governor_control(
         governor_pub,
-        command_period,
+        frame_rx.clone(),
         token.clone(),
-        "governor control".to_string(),
-        move || {
-            let g = governor_rx.borrow().governor;
-            Some(
-                governor_control::build_message(
-                    g.collision_enabled,
-                    g.d_stop,
-                    g.d_safe,
-                    g.max_ee_velocity_m_s,
-                    g.max_gripper_rate_frac_s,
-                )
-                .map_err(|e| e.to_string()),
-            )
-        },
     ));
     for (side, arm_pub, build_arm, gripper_pub, build_gripper) in [
         (
@@ -158,6 +145,77 @@ pub async fn run(
 // whenever it returns None (the side is disabled). Failures latch so a stuck side warns
 // once, not every tick. The period arrives already validated, so this side never
 // divides by a rate it has to trust.
+impl GovernorFrame {
+    /// Whether this is the same setting as `other`, compared on the bits of
+    /// each control so the answer is total: a non-finite value the UI should
+    /// never send would otherwise compare unequal to itself and publish the
+    /// same setting at the frame rate.
+    pub fn same_setting(&self, other: &Self) -> bool {
+        self.collision_enabled == other.collision_enabled
+            && self.d_stop.to_bits() == other.d_stop.to_bits()
+            && self.d_safe.to_bits() == other.d_safe.to_bits()
+            && self.max_ee_velocity_m_s.to_bits() == other.max_ee_velocity_m_s.to_bits()
+            && self.max_gripper_rate_frac_s.to_bits() == other.max_gripper_rate_frac_s.to_bits()
+    }
+}
+
+/// Publish the operator's governor controls whenever they change, until
+/// shutdown.
+///
+/// The first frame always goes out, so the retained message exists before
+/// the operator touches anything. A frame that repeats the setting in force
+/// publishes nothing: each message is a change the backbone governs by until
+/// the next, and the topic holds the last one for whoever subscribes later.
+async fn stream_governor_control(
+    publisher: TopicPublisher,
+    mut frame_rx: watch::Receiver<CommandFrame>,
+    token: CancellationToken,
+) {
+    let mut sent: Option<GovernorFrame> = None;
+    let mut failing = false;
+    loop {
+        let governor = frame_rx.borrow_and_update().governor;
+        if !sent
+            .as_ref()
+            .is_some_and(|last| last.same_setting(&governor))
+        {
+            let built = governor_control::build_message(
+                governor.collision_enabled,
+                governor.d_stop,
+                governor.d_safe,
+                governor.max_ee_velocity_m_s,
+                governor.max_gripper_rate_frac_s,
+            )
+            .map_err(|e| e.to_string());
+            let result = match built {
+                Ok(msg) => publisher.publish(msg).await.map_err(|e| e.to_string()),
+                Err(e) => Err(e),
+            };
+            match result {
+                // Only a delivered setting is recorded, so a failed publish
+                // is sent again on the next frame.
+                Ok(()) => {
+                    sent = Some(governor);
+                    failing = false;
+                }
+                Err(e) if !failing => {
+                    failing = true;
+                    error!("governor control publish failing: {e}");
+                }
+                Err(_) => {}
+            }
+        }
+        tokio::select! {
+            _ = token.cancelled() => return,
+            changed = frame_rx.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
 async fn stream_setpoints(
     publisher: TopicPublisher,
     period: Duration,
@@ -192,6 +250,64 @@ async fn stream_setpoints(
                 warn!("{label} command publish failing, suppressing repeats: {e}");
             }
             Err(_) => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_governor_setting_compares_equal_to_itself_including_a_non_finite_one() {
+        // The publisher sends only on a change, so a control that compared
+        // unequal to itself would publish the setting in force at the frame
+        // rate on a reliable topic.
+        let setting = GovernorFrame {
+            collision_enabled: true,
+            d_stop: 0.005,
+            d_safe: 0.02,
+            max_ee_velocity_m_s: 0.25,
+            max_gripper_rate_frac_s: 6.0,
+        };
+        assert!(setting.same_setting(&setting));
+
+        let nan = GovernorFrame {
+            d_stop: f64::NAN,
+            ..setting
+        };
+        assert!(
+            nan.same_setting(&nan),
+            "a non-finite control is still the same setting as itself"
+        );
+        assert!(!nan.same_setting(&setting));
+
+        for moved in [
+            GovernorFrame {
+                collision_enabled: false,
+                ..setting
+            },
+            GovernorFrame {
+                d_stop: 0.006,
+                ..setting
+            },
+            GovernorFrame {
+                d_safe: 0.03,
+                ..setting
+            },
+            GovernorFrame {
+                max_ee_velocity_m_s: 0.3,
+                ..setting
+            },
+            GovernorFrame {
+                max_gripper_rate_frac_s: 7.0,
+                ..setting
+            },
+        ] {
+            assert!(
+                !setting.same_setting(&moved),
+                "every control is compared: {moved:?}"
+            );
         }
     }
 }

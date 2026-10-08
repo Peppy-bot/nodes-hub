@@ -31,13 +31,20 @@ fn proximity_msg() -> collision_status::Message {
     }
 }
 
+/// A set holding one alert, as a producer publishes it.
 fn alert_msg() -> alerts::Message {
-    alerts::Message {
-        timestamp: SystemTime::now(),
+    alert_set_msg(vec![alerts::MessageActiveItem {
         source: "left arm j2".to_string(),
-        kind: "motor_overload".to_string(),
+        kind: "motor_condition".to_string(),
         severity: 2,
         message: "holding 93% of rated torque".to_string(),
+    }])
+}
+
+fn alert_set_msg(active: Vec<alerts::MessageActiveItem>) -> alerts::Message {
+    alerts::Message {
+        timestamp: SystemTime::now(),
+        active,
     }
 }
 
@@ -93,7 +100,7 @@ async fn consumed_topics_surface_on_the_panel() -> peppygen::Result<()> {
                 observed_left_arm::MOCK_INSTANCE_ID.to_string(),
                 "alpha_right_arm_inst".to_string(),
             ],
-            alerts_instances: 1,
+            alerts_instances: 2,
             ..Config::default()
         },
         openarm_web_commander::setup,
@@ -130,8 +137,9 @@ async fn consumed_topics_surface_on_the_panel() -> peppygen::Result<()> {
     assert_eq!(proximity["throttled"], true);
     assert_eq!(proximity["stopped"], false);
 
-    // alerts -> the alerts list, attributed and severity-tagged. Re-publish
-    // with a fresh timestamp per pass so the entry cannot age out mid-poll.
+    // alerts -> the alerts list, attributed and severity-tagged. The set
+    // ages out after three contract periods, so re-publish each pass as a
+    // producer's cadence would.
     let snapshot = republish_until(
         &mut ws,
         "the alert never rendered",
@@ -147,6 +155,60 @@ async fn consumed_topics_surface_on_the_panel() -> peppygen::Result<()> {
     assert_eq!(alert["source"], "left arm j2");
     assert_eq!(alert["severity"], 2);
     assert_eq!(alert["message"], "holding 93% of rated torque");
+
+    // A second producer's set stands beside the first, and a producer's
+    // own set replaces only its own entries.
+    let snapshot = republish_until(
+        &mut ws,
+        "the second producer's alert never rendered",
+        || {
+            let first = alert_msg();
+            let second = alert_set_msg(vec![alerts::MessageActiveItem {
+                source: "right arm j1".to_string(),
+                kind: "motor_condition".to_string(),
+                severity: 3,
+                message: "overload: the motor cut out and the joint is limp".to_string(),
+            }]);
+            let publishers = (&mocks.deps.alerts[0].alerts, &mocks.deps.alerts[1].alerts);
+            async move {
+                publishers.0.publish(&first).await?;
+                publishers.1.publish(&second).await
+            }
+        },
+        |s| s["alerts"].as_array().is_some_and(|a| a.len() == 2),
+    )
+    .await?;
+    let worst = &snapshot["alerts"][0];
+    assert_eq!(worst["source"], "right arm j1", "most severe first");
+    assert_eq!(worst["severity"], 3);
+
+    // An empty set from the first producer clears its entry and leaves the
+    // second producer's alone, which is how a recovery reaches the panel.
+    let snapshot = republish_until(
+        &mut ws,
+        "the cleared alert never left the list",
+        || {
+            let cleared = alert_set_msg(Vec::new());
+            let second = alert_set_msg(vec![alerts::MessageActiveItem {
+                source: "right arm j1".to_string(),
+                kind: "motor_condition".to_string(),
+                severity: 3,
+                message: "overload: the motor cut out and the joint is limp".to_string(),
+            }]);
+            let publishers = (&mocks.deps.alerts[0].alerts, &mocks.deps.alerts[1].alerts);
+            async move {
+                publishers.0.publish(&cleared).await?;
+                publishers.1.publish(&second).await
+            }
+        },
+        |s| {
+            s["alerts"]
+                .as_array()
+                .is_some_and(|a| a.len() == 1 && a[0]["source"] == "right arm j1")
+        },
+    )
+    .await?;
+    assert_eq!(snapshot["alerts"][0]["severity"], 3);
 
     // The observed left arm's health renders one row per motor.
     let live = republish_until(
