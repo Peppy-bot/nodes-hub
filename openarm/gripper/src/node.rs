@@ -220,7 +220,8 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     let gripper_claim = instance_lock::claim(
         &format!("openarm_gripper_{gripper_id}"),
         node_runner.processor().bound_instance_id(),
-    )?;
+    )
+    .inspect_err(|e| error!("{e}"))?;
 
     // Claim-release hook, registered first so it runs last, after the
     // motor-disable hook below: the next start of this gripper finds its motor
