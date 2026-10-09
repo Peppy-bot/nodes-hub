@@ -6,7 +6,8 @@
 //! simulation standing it answers for every limb at once.
 //!
 //! A robot that runs in a simulation also joins its scene, which is the one
-//! thing a simulated robot does that a real one does not.
+//! thing a simulated robot does that a real one does not, and its setup ends
+//! only once the simulation stands it.
 //!
 //! Every robot says who it is as well: the name it stands under, the model
 //! it is and the core node hosting it, which is the name it joins a scene
@@ -15,6 +16,7 @@
 #![forbid(unsafe_code)]
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use peppygen::{NodeRunner, Parameters, Result};
 
@@ -23,6 +25,8 @@ mod join;
 mod readiness;
 
 use identity::Identity;
+use join::Joined;
+pub use join::{HostClock, Moment, StandClock};
 
 /// The robot's own error: a fact about this robot, which is what a launcher
 /// reads back when the node refuses to start.
@@ -43,10 +47,24 @@ fn model_of(model: &str) -> Result<&str> {
 }
 
 pub async fn setup(params: Parameters, runner: Arc<NodeRunner>) -> Result<()> {
+    setup_with_clock(params, runner, HostClock::starting_now).await
+}
+
+/// [`setup`], with the wait for the robot to stand on the clock that `clock`
+/// starts on the stand budget. The node runs on [`HostClock`]; a test drives
+/// the wait with a clock of its own.
+pub async fn setup_with_clock<C: StandClock>(
+    params: Parameters,
+    runner: Arc<NodeRunner>,
+    clock: impl FnOnce(Duration) -> C + Send,
+) -> Result<()> {
     let identity = Identity::of(&runner, model_of(&params.model)?);
     identity::serve(identity.clone(), runner.clone());
-    join::scene(&identity, &params.placement, &runner).await?;
-    readiness::serve(runner)
+    match join::scene(&identity, &params.placement, &runner, clock).await? {
+        Joined::OwnHardware | Joined::Standing => readiness::serve(runner),
+        // A node that is stopping serves no readiness.
+        Joined::Stopped => Ok(()),
+    }
 }
 
 #[cfg(test)]

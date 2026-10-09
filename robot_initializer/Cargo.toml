@@ -13,3 +13,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 peppygen = { path = ".peppy/libs/peppygen", features = ["testing"] }
+# Paused time, for the tests of the host's clock that the wait for standing
+# runs on.
+tokio = { version = "1", features = ["test-util"] }
