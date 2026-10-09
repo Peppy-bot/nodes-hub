@@ -225,11 +225,12 @@ peppy node run \
 
 A robot names its model on its own initializer when it joins.
 
-The node is ready once Isaac Sim takes robots: its setup ends only after
-Isaac Sim has booted, warmed up and started its timeline, so the stand budget
-of a robot that joins at launch covers its stand only, not the boot. A robot
-that attaches during the boot waits in a queue, and stands once Isaac Sim
-takes robots. The manifest declares a setup budget of 540 s
+The node's setup ends only once Isaac Sim takes robots: after Isaac Sim has
+booted, warmed up and started its timeline. Only then does the node report
+healthy, and does the daemon go on to start the next instance, so the stand
+budget of a robot that joins at launch covers its stand only, not the boot.
+A robot that attaches during the boot waits in a queue, and stands once
+Isaac Sim takes robots. The manifest declares a setup budget of 540 s
 (`execution.setup_timeout_secs`), which covers the boot on a cold Kit cache;
 a boot that takes longer fails the start of the node. A boot that fails ends
 the setup at once with its error, and a stop during the boot ends the setup.

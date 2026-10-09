@@ -10,7 +10,7 @@ import logging
 import threading
 import time
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Optional, Protocol
 
 from sim_robot_core.cameras import FramePacer
 
@@ -46,6 +46,17 @@ _RUNTIME_SCENE_PATH = "/World/RuntimeScene"
 _PRIM_REPLACING_COMMANDS = frozenset({"spawn_usd", "spawn_isaac_asset", "remove"})
 
 
+class Boot(Protocol):
+    """Where the launcher reports how Isaac Sim's boot ended: the node's
+    setup ends on it."""
+
+    def takes_robots(self) -> None:
+        """Isaac Sim has booted, warmed up and started its timeline."""
+
+    def fails(self, error: Exception) -> None:
+        """The boot ended with `error` before Isaac Sim took robots."""
+
+
 class SimLauncher:
     def __init__(
         self,
@@ -60,7 +71,7 @@ class SimLauncher:
         frame_rate_hz: int,
         render_mode: str,
         anti_aliasing: int,
-        takes_robots: Callable[[], None],
+        boot: Boot,
     ) -> None:
         self._sim_app = sim_app
         self._world = world
@@ -74,9 +85,10 @@ class SimLauncher:
         self._anti_aliasing = anti_aliasing
         self._timeline = None
         self._extension: Optional[IsaacBridgeExtension] = extension
-        # Called once, when the loop starts to stand the robots that attach:
-        # the node's setup waits for this moment.
-        self._takes_robots = takes_robots
+        # Told once how the boot ended: when the loop starts to stand the
+        # robots that attach, or with the error that ended the boot first.
+        # The node's setup waits for it.
+        self._boot = boot
 
 
         # Runtime-discovered NVIDIA Isaac prop catalogue.
@@ -249,12 +261,15 @@ class SimLauncher:
             # Isaac Sim has booted, warmed up and started its timeline: from
             # here the loop stands every robot that attaches, the ones that
             # waited in the edits queue first.
-            self._takes_robots()
+            self._boot.takes_robots()
 
             self._run_loop()
 
         except FileNotFoundError as exc:
             logger.error(str(exc))
+            # The run ends here without an error, so the boot's error reaches
+            # the node's setup from here.
+            self._boot.fails(exc)
         except KeyboardInterrupt:
             logger.info("Shutting down.")
         except Exception:

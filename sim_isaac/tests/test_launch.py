@@ -167,7 +167,7 @@ def test_launch_selects_extensions_before_construction_and_preserves_handoff(
         frame_rate_hz=60,
         render_mode="RealTimePathTracing",
         anti_aliasing=3,
-        takes_robots=state.module._boot.takes_robots,
+        boot=state.module._boot,
     )
     state.thread.assert_called_once_with(target=state.module._run_node_builder, daemon=True)
     state.thread.return_value.start.assert_called_once_with()
@@ -409,45 +409,91 @@ def _boot_outcome(module):
     async def read():
         try:
             await module._boot.wait()
-        except RuntimeError as error:
+        except Exception as error:  # pylint: disable=W0718
             return error
         return None
 
     return asyncio.run(read())
 
 
+def _record_the_wait_for_the_node(state):
+    """Records, each time the main thread waits for the node's thread,
+    whether the boot had failed by then."""
+    waits = []
+
+    def join(timeout):
+        assert timeout == state.module._SETUP_REPORT_TIMEOUT_S
+        waits.append(state.module._boot.failed())
+
+    state.thread.return_value.join.side_effect = join
+    return waits
+
+
 def test_isaac_takes_robots_when_the_launcher_says_so(startup):
     state = startup()
+    waits = _record_the_wait_for_the_node(state)
 
     def run():
-        state.sim_launcher.call_args.kwargs["takes_robots"]()
+        state.sim_launcher.call_args.kwargs["boot"].takes_robots()
         state.trace.append("run")
 
     state.sim_launcher.return_value.run.side_effect = run
     state.module.main()
 
-    # The loop ran and ended, as on a stop, after Isaac Sim took robots.
+    # The loop ran and ended, as on a stop, after Isaac Sim took robots: the
+    # node's setup had ended, so the process does not wait for it.
     assert _boot_outcome(state.module) is None
+    assert waits == []
 
 
-def test_a_boot_error_ends_the_boot(startup):
+def test_a_boot_error_ends_the_setup_with_it_before_the_process_ends(startup, monkeypatch):
     state = startup()
+    _setup_handing_off(state, monkeypatch)
+    waits = _record_the_wait_for_the_node(state)
     failure = RuntimeError("no GPU")
     state.simulation_app.side_effect = failure
 
-    with pytest.raises(RuntimeError, match="no GPU"):
-        state.module.main()
+    def boot():
+        with pytest.raises(RuntimeError, match="no GPU"):
+            state.module.main()
 
-    assert _boot_outcome(state.module) is failure
+    with pytest.raises(RuntimeError, match="Isaac Sim did not boot: no GPU") as raised:
+        _run_setup_until_it_waits(state.module, lambda _setup: boot())
+
+    assert raised.value.__cause__ is failure
+    # The main thread waited for the node's thread once the boot had failed,
+    # so the node reports the setup's error before the process ends.
+    assert waits == [True]
+
+
+def test_a_missing_file_that_the_launcher_reports_ends_the_setup_with_it(startup, monkeypatch):
+    state = startup()
+    _setup_handing_off(state, monkeypatch)
+    waits = _record_the_wait_for_the_node(state)
+    missing = FileNotFoundError("the stage's USD is missing")
+    # The launcher logs a missing file, reports it to the boot and returns.
+    state.sim_launcher.return_value.run.side_effect = (
+        lambda: state.sim_launcher.call_args.kwargs["boot"].fails(missing)
+    )
+
+    with pytest.raises(
+        RuntimeError, match="Isaac Sim did not boot: the stage's USD is missing"
+    ) as raised:
+        _run_setup_until_it_waits(state.module, lambda _setup: state.module.main())
+
+    assert raised.value.__cause__ is missing
+    assert waits == [True]
 
 
 def test_a_launcher_that_ends_before_it_takes_robots_ends_the_boot(startup):
     state = startup()
+    waits = _record_the_wait_for_the_node(state)
     state.module.main()
 
     outcome = _boot_outcome(state.module)
     assert isinstance(outcome, RuntimeError)
     assert str(outcome) == "Isaac Sim closed before it took robots"
+    assert waits == [True]
 
 
 @pytest.fixture
