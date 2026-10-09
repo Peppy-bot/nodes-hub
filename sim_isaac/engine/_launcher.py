@@ -10,7 +10,7 @@ import logging
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from sim_robot_core.cameras import FramePacer
 
@@ -60,6 +60,7 @@ class SimLauncher:
         frame_rate_hz: int,
         render_mode: str,
         anti_aliasing: int,
+        takes_robots: Callable[[], None],
     ) -> None:
         self._sim_app = sim_app
         self._world = world
@@ -73,6 +74,9 @@ class SimLauncher:
         self._anti_aliasing = anti_aliasing
         self._timeline = None
         self._extension: Optional[IsaacBridgeExtension] = extension
+        # Called once, when the loop starts to stand the robots that attach:
+        # the node's setup waits for this moment.
+        self._takes_robots = takes_robots
 
 
         # Runtime-discovered NVIDIA Isaac prop catalogue.
@@ -241,6 +245,11 @@ class SimLauncher:
             logger.info(
                 "Scene loaded; waiting for bridge setup"
             )
+
+            # Isaac Sim has booted, warmed up and started its timeline: from
+            # here the loop stands every robot that attaches, the ones that
+            # waited in the edits queue first.
+            self._takes_robots()
 
             self._run_loop()
 

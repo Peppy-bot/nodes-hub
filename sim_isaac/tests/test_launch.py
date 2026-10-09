@@ -1,5 +1,6 @@
 """Exercise startup through fake runtimes and parse the packaged Kit experience."""
 
+import asyncio
 import builtins
 import ctypes
 import importlib.util
@@ -166,6 +167,7 @@ def test_launch_selects_extensions_before_construction_and_preserves_handoff(
         frame_rate_hz=60,
         render_mode="RealTimePathTracing",
         anti_aliasing=3,
+        takes_robots=state.module._boot.takes_robots,
     )
     state.thread.assert_called_once_with(target=state.module._run_node_builder, daemon=True)
     state.thread.return_value.start.assert_called_once_with()
@@ -336,6 +338,116 @@ def test_setup_failure_does_not_construct_isaac(startup):
     assert raised.value.__cause__ is failure
     state.simulation_app.assert_not_called()
     state.sim_launcher.assert_not_called()
+
+
+def _setup_handing_off(state, monkeypatch):
+    """The node's setup with its IO stubbed: the handoff ends at once and
+    answers the node's tasks, so what the setup waits for after it is the
+    boot alone."""
+    tasks = [object()]
+
+    async def handed_off(_params, _node_runner):
+        return tasks
+
+    monkeypatch.setattr(state.module, "_node_setup", handed_off)
+    return tasks
+
+
+def _run_setup_until_it_waits(module, settle_the_boot):
+    """Runs the node's setup until it waits on the boot, settles the boot
+    with `settle_the_boot`, and answers what the setup ends with."""
+
+    async def scenario():
+        setup = asyncio.ensure_future(module.setup(object(), object()))
+        # The stubbed handoff does not suspend, so one step of the setup
+        # takes it to the first wait it has.
+        await asyncio.sleep(0)
+        assert not setup.done(), "the setup waits for Isaac Sim to take robots"
+        settle_the_boot(setup)
+        return await setup
+
+    return asyncio.run(scenario())
+
+
+def test_setup_ends_once_isaac_takes_robots(startup, monkeypatch):
+    state = startup()
+    tasks = _setup_handing_off(state, monkeypatch)
+
+    ended = _run_setup_until_it_waits(state.module, lambda _setup: state.module._boot.takes_robots())
+
+    assert ended is tasks
+
+
+def test_a_boot_that_fails_ends_the_setup_with_its_error(startup, monkeypatch):
+    state = startup()
+    _setup_handing_off(state, monkeypatch)
+    failure = RuntimeError("Kit could not open the stage")
+
+    with pytest.raises(RuntimeError, match="Isaac Sim did not boot: Kit could not open the stage") as raised:
+        _run_setup_until_it_waits(state.module, lambda _setup: state.module._boot.fails(failure))
+
+    assert raised.value.__cause__ is failure
+
+
+def test_a_stop_during_the_boot_ends_the_setup(startup, monkeypatch):
+    state = startup()
+    _setup_handing_off(state, monkeypatch)
+
+    # peppylib cancels an async setup when the node is stopped.
+    with pytest.raises(asyncio.CancelledError):
+        _run_setup_until_it_waits(state.module, lambda setup: setup.cancel())
+
+    # The main thread still finishes its boot, and nothing waits for it.
+    state.module._boot.takes_robots()
+    state.module._boot.fails(RuntimeError("Isaac Sim closed before it took robots"))
+
+
+def _boot_outcome(module):
+    """What the node's setup reads of the boot: None once Isaac Sim takes
+    robots, else the error that ended the boot."""
+
+    async def read():
+        try:
+            await module._boot.wait()
+        except RuntimeError as error:
+            return error
+        return None
+
+    return asyncio.run(read())
+
+
+def test_isaac_takes_robots_when_the_launcher_says_so(startup):
+    state = startup()
+
+    def run():
+        state.sim_launcher.call_args.kwargs["takes_robots"]()
+        state.trace.append("run")
+
+    state.sim_launcher.return_value.run.side_effect = run
+    state.module.main()
+
+    # The loop ran and ended, as on a stop, after Isaac Sim took robots.
+    assert _boot_outcome(state.module) is None
+
+
+def test_a_boot_error_ends_the_boot(startup):
+    state = startup()
+    failure = RuntimeError("no GPU")
+    state.simulation_app.side_effect = failure
+
+    with pytest.raises(RuntimeError, match="no GPU"):
+        state.module.main()
+
+    assert _boot_outcome(state.module) is failure
+
+
+def test_a_launcher_that_ends_before_it_takes_robots_ends_the_boot(startup):
+    state = startup()
+    state.module.main()
+
+    outcome = _boot_outcome(state.module)
+    assert isinstance(outcome, RuntimeError)
+    assert str(outcome) == "Isaac Sim closed before it took robots"
 
 
 @pytest.fixture
