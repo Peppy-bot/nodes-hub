@@ -1,0 +1,408 @@
+{
+ "format": "enrolment/v1",
+ "model": "google/siglip-so400m-patch14-384",
+ "source": "Waldo catalogue gallery pack, release 2 (galleries/waldo_catalogue/36e5c931), 900 chest frames of 117 catalogue objects, September 2026",
+ "built": "2026-10-07",
+ "items": 117,
+ "background": [
+  "robot_arm",
+  "robot_gripper",
+  "empty_floor"
+ ],
+ "variants": {
+  "adjustable_wrench": [
+   "polyhaven_adjustable_wrench",
+   "ycb_adjustable_wrench"
+  ],
+  "apple": [
+   "polyhaven_food_apple_01",
+   "ycb_apple"
+  ],
+  "banana": [
+   "polyhaven_bananas_a",
+   "ycb_banana"
+  ],
+  "bleach_bottle": [
+   "ycb_bleach_cleanser"
+  ],
+  "bowl": [
+   "ycb_bowl"
+  ],
+  "cracker_box": [
+   "ycb_cracker_box"
+  ],
+  "fork": [
+   "ycb_fork"
+  ],
+  "hammer": [
+   "ycb_hammer"
+  ],
+  "knife": [
+   "ycb_knife"
+  ],
+  "clamp": [
+   "ycb_large_clamp"
+  ],
+  "marker": [
+   "ycb_large_marker"
+  ],
+  "lemon": [
+   "polyhaven_lemon",
+   "ycb_lemon"
+  ],
+  "mug": [
+   "ycb_mug"
+  ],
+  "mustard_bottle": [
+   "ycb_mustard_bottle"
+  ],
+  "phillips_screwdriver": [
+   "ycb_phillips_screwdriver"
+  ],
+  "pitcher": [
+   "ycb_pitcher_base"
+  ],
+  "plate": [
+   "ycb_plate"
+  ],
+  "potted_meat_can": [
+   "ycb_potted_meat_can"
+  ],
+  "power_drill": [
+   "ycb_power_drill"
+  ],
+  "scissors": [
+   "ycb_scissors"
+  ],
+  "skillet_lid": [
+   "ycb_skillet_lid"
+  ],
+  "spatula": [
+   "ycb_spatula"
+  ],
+  "sponge": [
+   "ycb_sponge"
+  ],
+  "spoon": [
+   "ycb_spoon"
+  ],
+  "sugar_box": [
+   "ycb_sugar_box"
+  ],
+  "tomato_soup_can": [
+   "ycb_tomato_soup_can"
+  ],
+  "tuna_can": [
+   "ycb_tuna_fish_can"
+  ],
+  "wood_block": [
+   "ycb_wood_block"
+  ],
+  "plastic_crate_01": [
+   "polyhaven_plastic_crate_01"
+  ],
+  "combination_wrench": [
+   "polyhaven_combination_wrench"
+  ],
+  "pliers": [
+   "polyhaven_pliers"
+  ],
+  "screwdriver": [
+   "polyhaven_screwdriver"
+  ],
+  "flathead_screwdriver": [
+   "polyhaven_flathead_screwdriver"
+  ],
+  "cross_pein_hammer": [
+   "polyhaven_cross_pein_hammer"
+  ],
+  "measuring_tape_01": [
+   "polyhaven_measuring_tape_01"
+  ],
+  "drill_01": [
+   "polyhaven_drill_01"
+  ],
+  "metal_toolbox": [
+   "polyhaven_metal_toolbox"
+  ],
+  "spray_paint_bottles_clean": [
+   "polyhaven_spray_paint_bottles_clean"
+  ],
+  "spray_paint_bottles_dirty": [
+   "polyhaven_spray_paint_bottles_dirty"
+  ],
+  "small_oil_can_01": [
+   "polyhaven_small_oil_can_01"
+  ],
+  "planter_pot_clay": [
+   "polyhaven_planter_pot_clay"
+  ],
+  "potted_plant_04": [
+   "polyhaven_potted_plant_04"
+  ],
+  "seeding_tray_01": [
+   "polyhaven_seeding_tray_01"
+  ],
+  "trowel_01": [
+   "polyhaven_trowel_01"
+  ],
+  "garden_gloves_01": [
+   "polyhaven_garden_gloves_01"
+  ],
+  "garden_sprinkler_01": [
+   "polyhaven_garden_sprinkler_01"
+  ],
+  "chemistry_set_beaker_large": [
+   "polyhaven_chemistry_set_beaker_large"
+  ],
+  "chemistry_set_beaker_med": [
+   "polyhaven_chemistry_set_beaker_med"
+  ],
+  "chemistry_set_beaker_small": [
+   "polyhaven_chemistry_set_beaker_small"
+  ],
+  "chemistry_set_test_tube_a": [
+   "polyhaven_chemistry_set_test_tube_a",
+   "polyhaven_chemistry_set_test_tube_b"
+  ],
+  "chemistry_set_bottle_dark_a": [
+   "polyhaven_chemistry_set_bottle_dark_a",
+   "polyhaven_chemistry_set_bottle_dark_b",
+   "polyhaven_chemistry_set_bottle_dark_c",
+   "polyhaven_chemistry_set_bottle_dark_d",
+   "polyhaven_chemistry_set_bottle_dark_e"
+  ],
+  "chemistry_set_bottle_clear_a": [
+   "polyhaven_chemistry_set_bottle_clear_a",
+   "polyhaven_chemistry_set_bottle_clear_b",
+   "polyhaven_chemistry_set_bottle_clear_c",
+   "polyhaven_chemistry_set_bottle_clear_d",
+   "polyhaven_chemistry_set_bottle_clear_e"
+  ],
+  "chemistry_set_clamp_stand": [
+   "polyhaven_chemistry_set_clamp_stand"
+  ],
+  "chemistry_set_clamp_tool": [
+   "polyhaven_chemistry_set_clamp_tool"
+  ],
+  "chemistry_set_bunsen_burner": [
+   "polyhaven_chemistry_set_bunsen_burner"
+  ],
+  "chemistry_set_test_tube_stand_a": [
+   "polyhaven_chemistry_set_test_tube_stand_a",
+   "polyhaven_chemistry_set_test_tube_stand_b"
+  ],
+  "bunsen_burner": [
+   "polyhaven_bunsen_burner"
+  ],
+  "bunsen_burner_stand": [
+   "polyhaven_bunsen_burner_stand"
+  ],
+  "vintage_microscope": [
+   "polyhaven_vintage_microscope"
+  ],
+  "retro_multimeter": [
+   "polyhaven_retro_multimeter"
+  ],
+  "magnifying_glass_01": [
+   "polyhaven_magnifying_glass_01"
+  ],
+  "clipboard": [
+   "polyhaven_clipboard"
+  ],
+  "pot_enamel_01_base": [
+   "polyhaven_pot_enamel_01_base"
+  ],
+  "pot_enamel_01_lid": [
+   "polyhaven_pot_enamel_01_lid"
+  ],
+  "brass_pan_01": [
+   "polyhaven_brass_pan_01"
+  ],
+  "wooden_spoon": [
+   "polyhaven_wooden_spoon"
+  ],
+  "jug_01": [
+   "polyhaven_jug_01"
+  ],
+  "wooden_bowl_01": [
+   "polyhaven_wooden_bowl_01"
+  ],
+  "carved_wooden_plate": [
+   "polyhaven_carved_wooden_plate"
+  ],
+  "tea_set_01_teapot_01": [
+   "polyhaven_tea_set_01_teapot_01"
+  ],
+  "tea_set_01_teapot_01_lid": [
+   "polyhaven_tea_set_01_teapot_01_lid"
+  ],
+  "tea_set_01_sugar_cup_01": [
+   "polyhaven_tea_set_01_sugar_cup_01"
+  ],
+  "tea_set_01_sugar_cup_01_lid": [
+   "polyhaven_tea_set_01_sugar_cup_01_lid"
+  ],
+  "tea_set_01_cup_small_01": [
+   "polyhaven_tea_set_01_cup_small_01",
+   "polyhaven_tea_set_01_cup_small_02"
+  ],
+  "tea_set_01_saucer_circular_03": [
+   "polyhaven_tea_set_01_saucer_circular_03",
+   "polyhaven_tea_set_01_saucer_circular_04"
+  ],
+  "tea_set_01_plate_large_square_01": [
+   "polyhaven_tea_set_01_plate_large_square_01"
+  ],
+  "tea_set_01_plate_large_circular_03": [
+   "polyhaven_tea_set_01_plate_large_circular_03"
+  ],
+  "food_lime_01": [
+   "polyhaven_food_lime_01"
+  ],
+  "bananas_bunch": [
+   "polyhaven_bananas_bunch"
+  ],
+  "yellow_onion": [
+   "polyhaven_yellow_onion"
+  ],
+  "sweet_potato": [
+   "polyhaven_sweet_potato"
+  ],
+  "food_avocado_01": [
+   "polyhaven_food_avocado_01"
+  ],
+  "food_pears_asian_01_a": [
+   "polyhaven_food_pears_asian_01_a",
+   "polyhaven_food_pears_asian_01_b",
+   "polyhaven_food_pears_asian_01_c",
+   "polyhaven_food_pears_asian_01_d",
+   "polyhaven_food_pears_asian_01_e"
+  ],
+  "croissant": [
+   "polyhaven_croissant"
+  ],
+  "carrot_cake": [
+   "polyhaven_carrot_cake"
+  ],
+  "strawberry_chocolate_cake": [
+   "polyhaven_strawberry_chocolate_cake"
+  ],
+  "russian_food_cans_01_salt_box": [
+   "polyhaven_russian_food_cans_01_salt_box"
+  ],
+  "russian_food_cans_01_can_cond": [
+   "polyhaven_russian_food_cans_01_can_cond"
+  ],
+  "russian_food_cans_01_can_fish": [
+   "polyhaven_russian_food_cans_01_can_fish"
+  ],
+  "long_life_food_milk": [
+   "polyhaven_long_life_food_milk"
+  ],
+  "long_life_food_tomatoes": [
+   "polyhaven_long_life_food_tomatoes"
+  ],
+  "long_life_food_beans": [
+   "polyhaven_long_life_food_beans"
+  ],
+  "long_life_food_sardines": [
+   "polyhaven_long_life_food_sardines"
+  ],
+  "wine_bottles_01_bordeaux": [
+   "polyhaven_wine_bottles_01_bordeaux"
+  ],
+  "wine_bottles_01_alsace": [
+   "polyhaven_wine_bottles_01_alsace"
+  ],
+  "wine_bottles_01_burgundy": [
+   "polyhaven_wine_bottles_01_burgundy"
+  ],
+  "wine_bottles_01_champagne": [
+   "polyhaven_wine_bottles_01_champagne"
+  ],
+  "wicker_basket_02_base": [
+   "polyhaven_wicker_basket_02_base"
+  ],
+  "wicker_basket_02_lid": [
+   "polyhaven_wicker_basket_02_lid"
+  ],
+  "classic_laptop": [
+   "polyhaven_classic_laptop"
+  ],
+  "stationery_supplies_pen_red": [
+   "polyhaven_stationery_supplies_pen_red"
+  ],
+  "stationery_supplies_pen_blue": [
+   "polyhaven_stationery_supplies_pen_blue"
+  ],
+  "stationery_supplies_pen_fancy": [
+   "polyhaven_stationery_supplies_pen_fancy"
+  ],
+  "stationery_supplies_pencil_new_a": [
+   "polyhaven_stationery_supplies_pencil_new_a",
+   "polyhaven_stationery_supplies_pencil_new_b"
+  ],
+  "stationery_supplies_pencil_used": [
+   "polyhaven_stationery_supplies_pencil_used"
+  ],
+  "stationery_supplies_pencil_old": [
+   "polyhaven_stationery_supplies_pencil_old"
+  ],
+  "stationery_supplies_eraser": [
+   "polyhaven_stationery_supplies_eraser"
+  ],
+  "stationery_supplies_pencilcup": [
+   "polyhaven_stationery_supplies_pencilcup"
+  ],
+  "office_notepads_yellow_pad": [
+   "polyhaven_office_notepads_yellow_pad"
+  ],
+  "office_notepads_note_stack": [
+   "polyhaven_office_notepads_note_stack"
+  ],
+  "office_notepads_sticky_stack": [
+   "polyhaven_office_notepads_sticky_stack"
+  ],
+  "office_notepads_a4_stack": [
+   "polyhaven_office_notepads_a4_stack"
+  ],
+  "binder_notebook_open": [
+   "polyhaven_binder_notebook_open"
+  ],
+  "binder_notebook_closed": [
+   "polyhaven_binder_notebook_closed"
+  ],
+  "vintage_stapler": [
+   "polyhaven_vintage_stapler"
+  ],
+  "book_encyclopedia_set_01_book01": [
+   "polyhaven_book_encyclopedia_set_01_book01",
+   "polyhaven_book_encyclopedia_set_01_book02",
+   "polyhaven_book_encyclopedia_set_01_book03",
+   "polyhaven_book_encyclopedia_set_01_book04",
+   "polyhaven_book_encyclopedia_set_01_book05",
+   "polyhaven_book_encyclopedia_set_01_book06",
+   "polyhaven_book_encyclopedia_set_01_book07",
+   "polyhaven_book_encyclopedia_set_01_book08",
+   "polyhaven_book_encyclopedia_set_01_book09",
+   "polyhaven_book_encyclopedia_set_01_book10",
+   "polyhaven_book_encyclopedia_set_01_book11",
+   "polyhaven_book_encyclopedia_set_01_book12",
+   "polyhaven_book_encyclopedia_set_01_book13",
+   "polyhaven_book_encyclopedia_set_01_book14",
+   "polyhaven_book_encyclopedia_set_01_book15",
+   "polyhaven_book_encyclopedia_set_01_book16",
+   "polyhaven_book_encyclopedia_set_01_book17",
+   "polyhaven_book_encyclopedia_set_01_book18",
+   "polyhaven_book_encyclopedia_set_01_book19",
+   "polyhaven_book_encyclopedia_set_01_book20"
+  ],
+  "mantel_clock_01": [
+   "polyhaven_mantel_clock_01"
+  ],
+  "robot_arm": [],
+  "robot_gripper": [],
+  "empty_floor": []
+ }
+}
