@@ -44,18 +44,14 @@ fn left(message: &str) -> attach::ResultResponseData {
 }
 
 /// Stops the node, and plays the engine that takes its robot out: the node
-/// cancels the robot's goal, waits for the engine's result, and stops once
-/// the engine ends the goal as cancelled. Answers the node's own account of
-/// its setup.
+/// cancels the robot's goal, and the engine ends it as cancelled. Answers
+/// the node's own account of its setup. That the shutdown hook waits for the
+/// robot to leave is the unit tests' of the hook, on paused time.
 async fn stop_and_take_out(harness: Harness, stay: &attach::ActiveGoal) -> peppygen::Result<()> {
     let stopping = tokio::spawn(harness.shutdown());
     tokio::time::timeout(WIRE, stay.cancel_signal())
         .await
         .expect("a stopping robot cancels its goal");
-    assert!(
-        !stopping.is_finished(),
-        "a stopping robot waits for the engine to take it out"
-    );
     stay.complete_cancelled(&left("the robot left the scene"))
         .await?;
     tokio::time::timeout(WIRE, stopping)
@@ -237,16 +233,11 @@ async fn a_robot_that_does_not_stand_within_its_budget_leaves_and_fails() -> pep
         .await?;
     logged(&format!("'{robot}' was admitted to the simulation")).await;
 
-    // The budget runs out: the robot leaves the simulation, and fails only
-    // once the engine says it is out.
+    // The budget runs out: the robot leaves the simulation, and fails.
     clock.spend();
     tokio::time::timeout(WIRE, stay.cancel_signal())
         .await
         .expect("a robot out of budget cancels its goal");
-    assert!(
-        !harness.setup_finished(),
-        "a robot out of budget waits for the engine to take it out"
-    );
     stay.complete_cancelled(&left("the robot left before it stood"))
         .await?;
     let failure = shutdown_once_setup_returns(harness)

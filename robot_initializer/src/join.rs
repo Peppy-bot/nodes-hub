@@ -18,13 +18,20 @@
 //! reports the instance finished, and `peppy stack join` puts the copy back.
 //!
 //! A task that outlives the setup sends the goal and holds it for the robot's
-//! whole stay, and it cancels every goal that the engine accepted before it
-//! lets go of it. A node that stops, or whose stand budget runs out, before
-//! the engine answers waits for the answer and cancels the goal the engine
-//! accepts. A node that stops takes its robot out and waits for the engine's
-//! result, which arrives once the robot is out of the scene and its name is
-//! free: removing a copy returns only then, so a copy joined straight back
-//! under the same name finds its name free.
+//! whole stay, and it cancels every goal that the engine accepted and that it
+//! holds before it lets go of it. A node that stops takes its robot out and
+//! waits for the engine's result, which arrives once the robot is out of the
+//! scene and its name is free: removing a copy returns only then, so a copy
+//! joined straight back under the same name finds its name free.
+//!
+//! The engine's answer to the goal is the only handle the node can cancel
+//! with. A node that stops, or whose stand budget runs out, before the engine
+//! answers goes on waiting for the answer only while its shutdown hook waits
+//! for the robot to leave: at most [`LEAVE_REPORT_TIMEOUT`] (4.5 s) after the
+//! stop or the failed setup, and never past peppy's shutdown grace. The node
+//! sends a cancel for a goal that the engine accepts in that time, and waits
+//! for the engine's result in what is left of it. Then the process ends, so
+//! a goal that the engine accepts later gets no cancel from this node.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -48,7 +55,9 @@ const RESULT_TIMEOUT: Duration = Duration::from_secs(2);
 /// engine a scene rebuild.
 const LEAVE_TIMEOUT: Duration = Duration::from_secs(4);
 /// How long the shutdown hook waits for the robot to be out, inside peppy's
-/// shutdown grace (5 s by default, `lifecycle.shutdown_grace_secs`).
+/// shutdown grace (5 s by default, `lifecycle.shutdown_grace_secs`). The
+/// process ends with the hook, so this also bounds how long a node that
+/// stops before the engine answers its goal waits for that answer.
 const LEAVE_REPORT_TIMEOUT: Duration = Duration::from_millis(4500);
 /// What the stand budget keeps back from the setup budget: the wait for the
 /// leave report, and one second more, so a robot that does not stand has
@@ -340,7 +349,8 @@ async fn wait_to_stand<C: StandClock>(
     let mut goal = admission(join, clock, verdict).await?;
     let robot = join.robot();
     // A node that stopped, or whose budget ran out, before the engine
-    // answered takes back the goal the engine accepted.
+    // answered takes back the goal the engine accepted while the shutdown
+    // hook still waits.
     if join.token.is_cancelled() || verdict.given() {
         leave(&goal, robot, false).await;
         return None;
@@ -408,8 +418,9 @@ async fn wait_to_stand<C: StandClock>(
 /// Sends the goal and waits for the engine's answer, and answers the goal
 /// that the engine accepted. A refusal or a wire error gives the setup its
 /// verdict. Neither a stop nor the end of the stand budget ends this wait:
-/// the budget gives the setup its verdict at once, and the wait goes on, so
-/// a goal that the engine accepts after either can be cancelled.
+/// the budget gives the setup its verdict at once, and the wait goes on
+/// until the shutdown hook gives up, at most [`LEAVE_REPORT_TIMEOUT`] later,
+/// so that a goal that the engine accepts in that time is cancelled.
 async fn admission<C: StandClock>(
     join: &Join,
     clock: &mut C,
@@ -740,6 +751,30 @@ mod tests {
                 "{refusal}"
             );
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_shutdown_hook_waits_for_the_robot_to_leave() {
+        let token = CancellationToken::new();
+        let (left, has_left) = oneshot::channel();
+        let hook = tokio::spawn(wait_to_leave(token.clone(), has_left));
+        tokio::task::yield_now().await;
+        assert!(token.is_cancelled(), "the hook tells the stay to end");
+
+        // Up to the last instant of its bound, the hook still waits for the
+        // stay to say that the robot left.
+        tokio::time::advance(LEAVE_REPORT_TIMEOUT - Duration::from_millis(1)).await;
+        assert!(!hook.is_finished(), "the hook waits for the robot to leave");
+        left.send(()).expect("the hook still waits");
+        hook.await.expect("the hook ends once the robot left");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_shutdown_hook_gives_up_at_its_bound() {
+        let (_left, has_left) = oneshot::channel::<()>();
+        let start = Instant::now();
+        wait_to_leave(CancellationToken::new(), has_left).await;
+        assert_eq!(start.elapsed(), LEAVE_REPORT_TIMEOUT);
     }
 
     #[tokio::test(start_paused = true)]

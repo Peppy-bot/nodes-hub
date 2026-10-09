@@ -33,8 +33,14 @@ leave the simulation, so 174.5 s. While the node waits, it logs:
 It logs the second line every 10 s, and the caller of the join gets each line
 as progress. A robot that the simulation does not stand within the budget
 leaves the simulation, and the node fails. A node that stops before its robot
-stands takes the robot out, also when the engine has not accepted the robot
-yet: the node waits for the acceptance and then cancels the goal.
+stands takes the robot out.
+
+The node can cancel a goal only once the engine has answered it. When the
+node stops, or its stand budget runs out, before the engine answers, the
+node goes on waiting for the answer for at most 4.5 s, inside peppy's
+shutdown grace, and cancels a goal that the engine accepts in that time.
+Then the node's process ends, so a goal that the engine accepts later gets
+no cancel from this node.
 
 The robot's limbs reach the engine through the backbone's pairings, one pair
 per limb on the engine's slots, and the engine tells one robot's limbs from
