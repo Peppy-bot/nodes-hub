@@ -132,6 +132,12 @@
   execution: {
     language: "python",
 
+    // The setup ends only when Isaac Sim takes robots: after its boot, its
+    // warm-up and the start of its timeline, which take minutes on a cold
+    // Kit cache. This budget covers the boot, so a robot that joins at
+    // launch waits for its stand within its own budget.
+    setup_timeout_secs: 540,
+
     container: {
       def_file: "apptainer.def",
 

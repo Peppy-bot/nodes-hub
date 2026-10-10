@@ -45,6 +45,8 @@ def loop(monkeypatch):
         commander=Mock(),
         scene=Mock(),
         timeline=Mock(),
+        # Where the launcher reports how the boot ended.
+        boot=Mock(spec=["takes_robots", "fails"]),
         settings=Mock(spec=["get", "get_as_bool", "set", "set_bool"]),
         settings_values={_MAIN_RATE_LIMIT_ENABLED: False},
         # What Kit reports it renders with; the launch asked for exactly this.
@@ -139,6 +141,7 @@ def loop(monkeypatch):
         frame_rate_hz=60,
         render_mode="RealTimePathTracing",
         anti_aliasing=3,
+        boot=state.boot,
     )
     monkeypatch.setattr(state.launcher, "_update_runtime_forces", lambda: phase("forces"))
     state.launcher._extension = bridge
@@ -418,3 +421,47 @@ def test_substituted_render_profile_stops_before_the_timeline_and_closes_isaac(l
     assert loop.trace[-3:] == ["commander.stop", "bridge.shutdown", "app.close"]
     loop.app.close.assert_called_once_with()
     assert not loop.ready.is_set()
+    # A boot that fails takes no robots. The error leaves run() and the
+    # launch reports it to the node's setup.
+    loop.boot.takes_robots.assert_not_called()
+    loop.boot.fails.assert_not_called()
+
+
+def test_a_missing_file_during_the_boot_ends_the_boot_with_it(loop):
+    # run() logs a missing file rather than raising it, so it reports the
+    # error to the node's setup itself.
+    missing = FileNotFoundError("the stage's USD is missing")
+    loop.launcher._load_stage.side_effect = missing
+    loop.launcher.run()
+
+    loop.boot.fails.assert_called_once_with(missing)
+    loop.boot.takes_robots.assert_not_called()
+    loop.app.update.assert_not_called()
+    loop.app.close.assert_called_once_with()
+
+
+def test_robots_are_taken_once_the_timeline_plays_and_before_the_first_frame(loop, monkeypatch):
+    # A robot that attached during the boot waits in the edits queue until
+    # the loop runs, and the node's setup ends only at that moment.
+    order = []
+    loop.launcher._warmup.side_effect = lambda: order.append("warmup")
+    start_timeline = loop.launcher._start_timeline
+
+    def traced_start_timeline():
+        order.append("timeline")
+        start_timeline()
+
+    monkeypatch.setattr(loop.launcher, "_start_timeline", traced_start_timeline)
+    loop.boot.takes_robots.side_effect = lambda: order.append("takes robots")
+    update = loop.app.update.side_effect
+
+    def traced_update():
+        order.append("update")
+        update()
+
+    loop.app.update.side_effect = traced_update
+    loop.launcher.run()
+
+    assert order[:4] == ["warmup", "timeline", "takes robots", "update"]
+    loop.boot.takes_robots.assert_called_once_with()
+    loop.boot.fails.assert_not_called()

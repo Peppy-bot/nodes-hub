@@ -2,41 +2,51 @@
 //! the model to stand and where, and holds that goal for as long as it is in
 //! the scene.
 //!
-//! Its limbs pair to the engine through the backbone, and the copy the engine reads on each pair is
-//! the one this goal named, so a setpoint reaches the robot it was meant for
-//! and its measured state comes back on the same pair.
+//! Its limbs pair to the engine through the backbone, and the copy the engine
+//! reads on each pair is the one this goal named, so a setpoint reaches the
+//! robot it was meant for and its measured state comes back on the same pair.
 //!
-//! Joining fails loudly, so a robot the scene refused never serves the
-//! readiness it cannot back, and `peppy stack list` reports the instance
-//! failed with the engine's reason. The node serves readiness from the
-//! moment the engine admits the robot, which is what the launch's health
-//! check waits for; the engine says the robot stands on the goal's
-//! feedback, and a goal the engine ends before that is a robot the scene
-//! could not stand: the node logs the engine's reason and stops, as it does
-//! when the goal ends later, and `peppy stack list` reports the instance
-//! finished; `peppy stack join` puts the copy back.
+//! The node's setup ends once the engine says that the robot stands, so the
+//! node serves readiness, and the start of its copy ends, only for a robot
+//! that stands in the scene. The wait for the engine's acceptance and the
+//! wait for `standing` share one stand budget: the node's setup budget less
+//! what its leave report needs, so a robot that does not stand fails with
+//! its own reason before the daemon's limit. A robot that the engine refuses,
+//! or whose goal the engine ends before the robot stands, fails the setup
+//! with the engine's reason, and the join of its copy is undone. A goal that
+//! the engine ends after the robot stood stops the node: `peppy stack list`
+//! reports the instance finished, and `peppy stack join` puts the copy back.
 //!
-//! A node that stops takes its robot out and waits for the engine's result,
-//! which arrives once the robot is out of the scene and its name is free:
-//! removing a copy returns only then, so a copy joined straight back under
-//! the same name finds its name free.
+//! A task that outlives the setup sends the goal and holds it for the robot's
+//! whole stay, and it cancels every goal that the engine accepted and that it
+//! holds before it lets go of it. A node that stops takes its robot out and
+//! waits for the engine's result, which arrives once the robot is out of the
+//! scene and its name is free: removing a copy returns only then, so a copy
+//! joined straight back under the same name finds its name free.
+//!
+//! The engine's answer to the goal is the only handle the node can cancel
+//! with. A node that stops, or whose stand budget runs out, before the engine
+//! answers goes on waiting for the answer only while its shutdown hook waits
+//! for the robot to leave: at most [`LEAVE_REPORT_TIMEOUT`] (4.5 s) after the
+//! stop or the failed setup, and never past peppy's shutdown grace. The node
+//! sends a cancel for a goal that the engine accepts in that time, and waits
+//! for the engine's result in what is left of it. Then the process ends, so
+//! a goal that the engine accepts later gets no cancel from this node.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use peppygen::consumed_actions::simulation::attach;
 use peppygen::parameters::placement::Placement;
-use peppygen::{NodeRunner, QoSProfile, Result};
+use peppygen::{NodeRunner, ProducerRef, QoSProfile, Result};
 use peppylib::runtime::CancellationToken;
-use tracing::{error, info, warn};
+use tokio::sync::oneshot;
+use tokio::time::{Instant, Interval, MissedTickBehavior};
+use tracing::{info, warn};
 
 use crate::identity::Identity;
 use crate::refused;
 
-/// How long the robot waits for the simulation to admit it. The engine
-/// answers once it has checked the model and the spot, and stands the robot
-/// after, which on a cold cache takes it tens of seconds.
-const ATTACH_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long the account of a stay the engine ended may take: the goal is
 /// terminal, so the engine answers at once.
 const RESULT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -45,11 +55,121 @@ const RESULT_TIMEOUT: Duration = Duration::from_secs(2);
 /// engine a scene rebuild.
 const LEAVE_TIMEOUT: Duration = Duration::from_secs(4);
 /// How long the shutdown hook waits for the robot to be out, inside peppy's
-/// shutdown grace (5 s by default, `lifecycle.shutdown_grace_secs`).
+/// shutdown grace (5 s by default, `lifecycle.shutdown_grace_secs`). The
+/// process ends with the hook, so this also bounds how long a node that
+/// stops before the engine answers its goal waits for that answer.
 const LEAVE_REPORT_TIMEOUT: Duration = Duration::from_millis(4500);
+/// What the stand budget keeps back from the setup budget: the wait for the
+/// leave report, and one second more, so a robot that does not stand has
+/// left and the node has failed with its own reason before the daemon's
+/// limit.
+const LEAVE_RESERVE: Duration = Duration::from_millis(5500);
+/// How often the wait for standing says that the robot does not stand yet.
+/// Each line reaches the caller of the join as progress.
+const PROGRESS_PERIOD: Duration = Duration::from_secs(10);
 // The wait outlasts the leave it waits for, so a robot that does leave is
-// not reported as one that did not.
+// not reported as one that did not, and the reserve outlasts the wait.
 const _: () = assert!(LEAVE_REPORT_TIMEOUT.as_millis() > LEAVE_TIMEOUT.as_millis());
+const _: () = assert!(LEAVE_RESERVE.as_millis() > LEAVE_REPORT_TIMEOUT.as_millis());
+
+/// The clock that the wait for standing runs on: when to say that the robot
+/// does not stand yet, and when the stand budget is spent. The node runs on
+/// [`HostClock`]; a test drives the wait with a clock of its own.
+pub trait StandClock: Send + 'static {
+    /// The time since the robot's goal was sent.
+    fn elapsed(&self) -> Duration;
+
+    /// Resolves at the next moment of the wait. A future that is dropped
+    /// before it resolves loses no moment.
+    fn next(&mut self) -> impl Future<Output = Moment> + Send;
+}
+
+/// A moment of the wait for standing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Moment {
+    /// The robot does not stand yet, this long after its goal was sent.
+    Progress(Duration),
+    /// The stand budget is spent.
+    Spent,
+}
+
+/// The host's clock: a progress moment every [`PROGRESS_PERIOD`] after the
+/// goal is sent, until the stand budget is spent.
+pub struct HostClock {
+    start: Instant,
+    end: Instant,
+    progress: Interval,
+}
+
+impl HostClock {
+    /// A clock on the stand budget `budget`, from now.
+    pub fn starting_now(budget: Duration) -> Self {
+        Self::every(PROGRESS_PERIOD, budget)
+    }
+
+    fn every(period: Duration, budget: Duration) -> Self {
+        let start = Instant::now();
+        let mut progress = tokio::time::interval_at(start + period, period);
+        progress.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        Self {
+            start,
+            end: start + budget,
+            progress,
+        }
+    }
+}
+
+impl StandClock for HostClock {
+    fn elapsed(&self) -> Duration {
+        self.start.elapsed()
+    }
+
+    async fn next(&mut self) -> Moment {
+        // The end of the budget comes first, so a budget that is a whole
+        // number of periods ends on its last moment rather than reporting it.
+        tokio::select! {
+            biased;
+            () = tokio::time::sleep_until(self.end) => Moment::Spent,
+            tick = self.progress.tick() => Moment::Progress(tick - self.start),
+        }
+    }
+}
+
+/// What the join of this robot came to, once the setup can go on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Joined {
+    /// The robot drives its own hardware and joins no simulation.
+    OwnHardware,
+    /// The simulation stands the robot.
+    Standing,
+    /// The node was stopped before the robot stood.
+    Stopped,
+}
+
+/// A duration as this node's logs give it: seconds, to the tenth, as `10 s`
+/// or `174.5 s`.
+fn seconds(duration: Duration) -> String {
+    let tenths = (duration.as_millis() + 50) / 100;
+    match tenths % 10 {
+        0 => format!("{} s", tenths / 10),
+        tenth => format!("{}.{tenth} s", tenths / 10),
+    }
+}
+
+/// The time this robot has to stand, the acceptance included: the node's
+/// setup budget less [`LEAVE_RESERVE`].
+fn stand_budget(setup: Duration) -> std::result::Result<Duration, String> {
+    setup
+        .checked_sub(LEAVE_RESERVE)
+        .filter(|budget| !budget.is_zero())
+        .ok_or_else(|| {
+            format!(
+                "this node's setup budget of {} leaves no time to stand the robot: the node keeps {} of it to leave the simulation, so execution.setup_timeout_secs in its manifest must be more than that",
+                seconds(setup),
+                seconds(LEAVE_RESERVE)
+            )
+        })
+}
 
 /// Where the launcher asks this robot to stand, as the engine takes it.
 /// `auto` leaves the spot to the engine. A spot that is not a number is
@@ -73,119 +193,344 @@ fn spot_of(
     }))
 }
 
-/// Joins the simulation the launcher bound this robot to, standing the
-/// model `identity` names under the name it gives the robot. A robot with no
-/// simulation bound drives its own hardware and returns without joining.
-pub async fn scene(
+/// Joins the simulation that the launcher bound this robot to, standing the
+/// model `identity` names under the name it gives the robot, and resolves
+/// once the robot stands, with the wait on the clock that `clock` starts on
+/// the stand budget. A robot with no simulation bound drives its own
+/// hardware and returns at once.
+pub async fn scene<C: StandClock>(
     identity: &Identity,
     placement: &Placement,
     runner: &Arc<NodeRunner>,
-) -> Result<()> {
+    clock: impl FnOnce(Duration) -> C + Send,
+) -> Result<Joined> {
     let Some(simulation) = attach::bound_producer(runner).cloned() else {
         info!("no simulation stands this robot, so it joins none");
-        return Ok(());
+        return Ok(Joined::OwnHardware);
     };
-    let Identity { robot, model, .. } = identity.clone();
     let placement = spot_of(placement).map_err(refused)?;
+    let setup_budget = runner.setup_timeout();
+    let budget = stand_budget(setup_budget).map_err(refused)?;
 
-    let goal = attach::ActionHandle::fire_goal(
-        runner,
-        &simulation,
-        ATTACH_TIMEOUT,
-        attach::GoalRequest {
-            robot: robot.clone(),
-            model: model.clone(),
+    let token = runner.cancellation_token().clone();
+    let (stood, has_stood) = oneshot::channel();
+    let (left, has_left) = oneshot::channel();
+    // Registered before the goal is sent, so a stop at any moment of the
+    // join waits for the robot to leave.
+    runner.on_shutdown(wait_to_leave(token.clone(), has_left));
+    let join = Join {
+        runner: Arc::clone(runner),
+        simulation,
+        request: attach::GoalRequest {
+            robot: identity.robot.clone(),
+            model: identity.model.clone(),
             placement,
         },
-        QoSProfile::Reliable,
-    )
-    .await?;
-    if !goal.accepted {
-        return Err(refused(format!(
-            "the simulation refused this robot: {}",
-            goal.reason.unwrap_or_else(|| "no reason given".into())
-        )));
-    }
-    let stood = goal
-        .data
-        .clone()
-        .ok_or_else(|| refused("the simulation stood this robot without naming its limbs"))?;
-    info!(
-        "'{robot}' joined the simulation as {model}, with arms [{}] and grippers [{}]",
-        stood.arm_names.join(", "),
-        stood.gripper_names.join(", ")
-    );
-
-    hold(runner, goal, robot);
-    Ok(())
-}
-
-/// Holds the robot's place in the scene for as long as the node runs: the
-/// goal ends when the engine takes the robot out, and shutting the node down
-/// tells the engine to and waits until the robot is out.
-fn hold(runner: &Arc<NodeRunner>, goal: attach::ActionHandle, robot: String) {
-    let token = runner.cancellation_token().clone();
-    let (left, has_left) = tokio::sync::oneshot::channel();
-    tokio::spawn(stay(goal, robot, left, token.clone()));
-    runner.on_shutdown(async move {
-        token.cancel();
-        if tokio::time::timeout(LEAVE_REPORT_TIMEOUT, has_left)
-            .await
-            .is_err()
-        {
-            warn!("this robot did not leave the scene within {LEAVE_REPORT_TIMEOUT:?}");
-        }
-    });
-}
-
-/// One robot's stay: it ends when the engine ends the goal (the goal's
-/// feedback stream closes with it) or the engine is gone, or when this
-/// node is shutting down and leaves. Either way the node stops, because a
-/// robot that is not in the scene has no readiness to serve. A goal the
-/// engine ends before it ever said the robot stands is a robot the scene
-/// could not stand, reported as such.
-async fn stay(
-    mut goal: attach::ActionHandle,
-    robot: String,
-    left: tokio::sync::oneshot::Sender<()>,
-    token: CancellationToken,
-) {
-    let mut stood = false;
-    let ended = tokio::select! {
-        _ = token.cancelled() => false,
-        () = stay_ends(&mut goal, &robot, &mut stood) => true,
+        wire: setup_budget,
+        budget,
+        token: token.clone(),
     };
-    if ended {
-        report(&robot, stood, account(&goal).await);
-        token.cancel();
-    } else {
-        leave(&goal, &robot, stood).await;
+    tokio::spawn(stay(join, clock(budget), stood, left));
+
+    tokio::select! {
+        biased;
+        () = token.cancelled() => Ok(Joined::Stopped),
+        stand = has_stood => match stand {
+            Ok(Ok(())) => Ok(Joined::Standing),
+            Ok(Err(failure)) => Err(failure),
+            Err(_) => Err(refused("the stay of this robot ended before it said whether the robot stands")),
+        },
+    }
+}
+
+/// A node that stops tells the robot's stay to end, and waits, inside
+/// peppy's shutdown grace, for the robot to leave the scene.
+async fn wait_to_leave(token: CancellationToken, has_left: oneshot::Receiver<()>) {
+    token.cancel();
+    if tokio::time::timeout(LEAVE_REPORT_TIMEOUT, has_left)
+        .await
+        .is_err()
+    {
+        warn!(
+            "this robot did not leave the scene within {}",
+            seconds(LEAVE_REPORT_TIMEOUT)
+        );
+    }
+}
+
+/// One robot's join: the goal it sends, and the budgets it waits on.
+struct Join {
+    runner: Arc<NodeRunner>,
+    simulation: ProducerRef,
+    request: attach::GoalRequest,
+    /// How long the wire waits for the engine's answer to the goal: the
+    /// setup budget, so the stand budget, which is shorter, ends that wait
+    /// first.
+    wire: Duration,
+    /// The time the robot has to stand, the acceptance included.
+    budget: Duration,
+    token: CancellationToken,
+}
+
+impl Join {
+    fn robot(&self) -> &str {
+        &self.request.robot
+    }
+
+    fn not_standing_yet(&self, elapsed: Duration) {
+        info!(
+            "'{}' does not stand yet: {} of {}",
+            self.robot(),
+            seconds(elapsed),
+            seconds(self.budget)
+        );
+    }
+
+    fn out_of_budget(&self) -> peppygen::Error {
+        refused(format!(
+            "the simulation did not stand this robot within {}",
+            seconds(self.budget)
+        ))
+    }
+}
+
+fn did_not_stand(why: impl std::fmt::Display) -> peppygen::Error {
+    refused(format!("the simulation did not stand this robot: {why}"))
+}
+
+/// One robot's stay, from the goal it sends to the goal's end: it tells the
+/// setup whether the robot stands, holds the goal for as long as the robot
+/// is in the scene, and says when the robot has left.
+async fn stay<C: StandClock>(
+    join: Join,
+    mut clock: C,
+    stood: oneshot::Sender<Result<()>>,
+    left: oneshot::Sender<()>,
+) {
+    let mut verdict = Verdict(Some(stood));
+    if let Some(goal) = wait_to_stand(&join, &mut clock, &mut verdict).await {
+        hold(goal, &join).await;
     }
     let _ = left.send(());
 }
 
-/// Resolves once the engine's side of the stay is over: the engine sends
-/// one feedback message when the robot stands, which sets `stood`, and the
-/// stream closes when the goal ends or the engine is gone. `stood` is what
-/// the node reports the stay by, whichever way the stay ends.
-async fn stay_ends(goal: &mut attach::ActionHandle, robot: &str, stood: &mut bool) {
+/// The setup's end of the wait for standing, told once whether the robot
+/// stands. A node that stops is told nothing: its setup ends on the stop.
+struct Verdict(Option<oneshot::Sender<Result<()>>>);
+
+impl Verdict {
+    fn give(&mut self, verdict: Result<()>) {
+        if let Some(setup) = self.0.take() {
+            let _ = setup.send(verdict);
+        }
+    }
+
+    fn given(&self) -> bool {
+        self.0.is_none()
+    }
+}
+
+/// What the wait for standing hears while the goal runs.
+enum Event {
+    Stop,
+    Clock(Moment),
+    Feedback(Heard),
+}
+
+/// Sends the goal and waits for the robot to stand, within the stand budget,
+/// and answers the goal of a robot that stands. Every other way out gives
+/// the setup its verdict, except a stop, and cancels a goal that the engine
+/// accepted and that still runs.
+async fn wait_to_stand<C: StandClock>(
+    join: &Join,
+    clock: &mut C,
+    verdict: &mut Verdict,
+) -> Option<attach::ActionHandle> {
+    let mut goal = admission(join, clock, verdict).await?;
+    let robot = join.robot();
+    // A node that stopped, or whose budget ran out, before the engine
+    // answered takes back the goal the engine accepted while the shutdown
+    // hook still waits.
+    if join.token.is_cancelled() || verdict.given() {
+        leave(&goal, robot, false).await;
+        return None;
+    }
+    let Some(limbs) = goal.data.clone() else {
+        leave(&goal, robot, false).await;
+        verdict.give(Err(did_not_stand(
+            "it admitted the robot without naming its limbs",
+        )));
+        return None;
+    };
+    info!(
+        "'{robot}' was admitted to the simulation as {}; it starts once the simulation stands it, within {}",
+        join.request.model,
+        seconds(join.budget.saturating_sub(clock.elapsed()))
+    );
+
     loop {
-        match goal.on_next_feedback_message().await {
-            Ok(feedback) if feedback.standing => {
-                info!("'{robot}' stands in the scene");
-                *stood = true;
+        let event = tokio::select! {
+            biased;
+            () = join.token.cancelled() => Event::Stop,
+            feedback = goal.on_next_feedback_message() => Event::Feedback(heard(feedback)),
+            moment = clock.next() => Event::Clock(moment),
+        };
+        match event {
+            Event::Feedback(Heard::Standing) => {
+                info!(
+                    "'{robot}' stands in the simulation, with arms [{}] and grippers [{}]",
+                    limbs.arm_names.join(", "),
+                    limbs.gripper_names.join(", ")
+                );
+                verdict.give(Ok(()));
+                return Some(goal);
             }
-            Ok(_) => {}
-            Err(peppygen::Error::ActionFeedbackChannelClosed) => return,
-            Err(peppygen::Error::ActionFeedbackProducerGone { .. }) => {
-                warn!("the simulation standing '{robot}' is gone");
-                return;
+            Event::Feedback(Heard::NotStanding) => {}
+            Event::Clock(Moment::Progress(elapsed)) => join.not_standing_yet(elapsed),
+            Event::Feedback(Heard::End(StreamEnd::Ended)) => {
+                verdict.give(Err(did_not_stand(reason_of(account(&goal).await))));
+                return None;
             }
-            Err(e) => {
-                warn!("the stay of '{robot}' cannot be followed: {e}");
-                return;
+            Event::Feedback(Heard::End(StreamEnd::Gone)) => {
+                verdict.give(Err(did_not_stand("the simulation is gone")));
+                return None;
+            }
+            Event::Feedback(Heard::End(StreamEnd::Broken(e))) => {
+                leave(&goal, robot, false).await;
+                verdict.give(Err(did_not_stand(format!(
+                    "its stand cannot be followed: {e}"
+                ))));
+                return None;
+            }
+            Event::Clock(Moment::Spent) => {
+                leave(&goal, robot, false).await;
+                verdict.give(Err(join.out_of_budget()));
+                return None;
+            }
+            Event::Stop => {
+                leave(&goal, robot, false).await;
+                return None;
             }
         }
+    }
+}
+
+/// Sends the goal and waits for the engine's answer, and answers the goal
+/// that the engine accepted. A refusal or a wire error gives the setup its
+/// verdict. Neither a stop nor the end of the stand budget ends this wait:
+/// the budget gives the setup its verdict at once, and the wait goes on
+/// until the shutdown hook gives up, at most [`LEAVE_REPORT_TIMEOUT`] later,
+/// so that a goal that the engine accepts in that time is cancelled.
+async fn admission<C: StandClock>(
+    join: &Join,
+    clock: &mut C,
+    verdict: &mut Verdict,
+) -> Option<attach::ActionHandle> {
+    let send = attach::ActionHandle::fire_goal(
+        &join.runner,
+        &join.simulation,
+        join.wire,
+        join.request.clone(),
+        QoSProfile::Reliable,
+    );
+    let mut send = std::pin::pin!(send);
+    let mut spent = false;
+    let answer = loop {
+        tokio::select! {
+            biased;
+            answer = &mut send => break answer,
+            moment = clock.next(), if !spent => match moment {
+                Moment::Progress(elapsed) => join.not_standing_yet(elapsed),
+                Moment::Spent => {
+                    spent = true;
+                    verdict.give(Err(join.out_of_budget()));
+                }
+            },
+        }
+    };
+    let goal = match answer {
+        Ok(goal) => goal,
+        Err(e) => {
+            verdict.give(Err(e));
+            return None;
+        }
+    };
+    if !goal.accepted {
+        verdict.give(Err(refused(format!(
+            "the simulation refused this robot: {}",
+            goal.reason.unwrap_or_else(|| "no reason given".into())
+        ))));
+        return None;
+    }
+    Some(goal)
+}
+
+/// Holds the place of a robot that stands, for as long as the node runs: the
+/// goal ends when the engine takes the robot out, which stops the node,
+/// because a robot that is not in the scene has no readiness to serve, and
+/// a node that stops takes the robot out.
+async fn hold(mut goal: attach::ActionHandle, join: &Join) {
+    let robot = join.robot();
+    let end = tokio::select! {
+        biased;
+        () = join.token.cancelled() => None,
+        end = stay_ends(&mut goal) => Some(end),
+    };
+    match end {
+        None => leave(&goal, robot, true).await,
+        Some(StreamEnd::Ended) => report(robot, true, account(&goal).await),
+        Some(StreamEnd::Gone) => {
+            warn!("the simulation standing '{robot}' is gone");
+            report(robot, true, account(&goal).await);
+        }
+        Some(StreamEnd::Broken(e)) => {
+            warn!("the stay of '{robot}' cannot be followed: {e}");
+            leave(&goal, robot, true).await;
+        }
+    }
+    // However the stay ended, the node stops with it.
+    join.token.cancel();
+}
+
+/// Resolves once the engine's side of the stay is over: the stream closes
+/// when the goal ends or the engine is gone.
+async fn stay_ends(goal: &mut attach::ActionHandle) -> StreamEnd {
+    loop {
+        if let Heard::End(end) = heard(goal.on_next_feedback_message().await) {
+            return end;
+        }
+    }
+}
+
+/// What one read of the goal's feedback says.
+#[derive(Debug, PartialEq, Eq)]
+enum Heard {
+    /// The engine says that the robot stands.
+    Standing,
+    /// A message that does not say so.
+    NotStanding,
+    /// The stream is over.
+    End(StreamEnd),
+}
+
+/// How the goal's feedback stream ended.
+#[derive(Debug, PartialEq, Eq)]
+enum StreamEnd {
+    /// The engine ended the goal, and the stream closed with it.
+    Ended,
+    /// The engine is gone.
+    Gone,
+    /// The stream broke, so the stand cannot be followed.
+    Broken(String),
+}
+
+fn heard(feedback: Result<attach::FeedbackMessage>) -> Heard {
+    match feedback {
+        Ok(feedback) if feedback.standing => Heard::Standing,
+        Ok(_) => Heard::NotStanding,
+        Err(peppygen::Error::ActionFeedbackChannelClosed) => Heard::End(StreamEnd::Ended),
+        Err(peppygen::Error::ActionFeedbackProducerGone { .. }) => Heard::End(StreamEnd::Gone),
+        Err(e) => Heard::End(StreamEnd::Broken(e.to_string())),
     }
 }
 
@@ -199,12 +544,12 @@ async fn account(
         .map_err(|e| e.to_string())
 }
 
-/// Takes the robot out of the scene on the way out: cancelling the goal asks
-/// the engine to, and the engine's result says the robot is out and its name
-/// is free. Both share [`LEAVE_TIMEOUT`].
+/// Takes the robot out of the scene: cancelling the goal asks the engine to,
+/// and the engine's result says the robot is out and its name is free. Both
+/// share [`LEAVE_TIMEOUT`].
 async fn leave(goal: &attach::ActionHandle, robot: &str, stood: bool) {
-    let deadline = tokio::time::Instant::now() + LEAVE_TIMEOUT;
-    let remaining = || deadline.saturating_duration_since(tokio::time::Instant::now());
+    let deadline = Instant::now() + LEAVE_TIMEOUT;
+    let remaining = || deadline.saturating_duration_since(Instant::now());
     if let Err(e) = goal.cancel_goal(remaining()).await {
         warn!("'{robot}' could not tell the simulation it is leaving: {e}");
         return;
@@ -215,11 +560,30 @@ async fn leave(goal: &attach::ActionHandle, robot: &str, stood: bool) {
     }
 }
 
+/// Whether a goal ended as asked, and what the engine said of it.
+fn said(outcome: attach::ResultOutcome) -> (bool, String) {
+    match outcome {
+        attach::ResultOutcome::Completed(data) | attach::ResultOutcome::Cancelled(data) => {
+            (data.success, data.message)
+        }
+        attach::ResultOutcome::Abandoned => (false, "the simulation abandoned it".to_owned()),
+        attach::ResultOutcome::Expired => (false, "it left before the reason was read".to_owned()),
+    }
+}
+
+/// Why the engine ended a goal before the robot stood.
+fn reason_of(outcome: std::result::Result<attach::ResultOutcome, String>) -> String {
+    match outcome {
+        Ok(outcome) => said(outcome).1,
+        Err(e) => format!("it ended the goal and did not say why: {e}"),
+    }
+}
+
 /// How a robot's stay ended, with what the engine said of it.
 #[derive(Debug, PartialEq, Eq)]
 enum Ending {
-    /// The engine never stood the robot.
-    NeverStood(String),
+    /// The robot left before the engine stood it.
+    LeftBeforeStanding(String),
     /// The engine took the robot out of the scene, as it was asked to.
     TakenOut(String),
     /// The engine took the robot out for a reason of its own.
@@ -231,28 +595,23 @@ enum Ending {
 /// What the engine's account says became of a robot that `stood` or never
 /// did.
 fn ending(stood: bool, outcome: std::result::Result<attach::ResultOutcome, String>) -> Ending {
-    let (asked_for, said) = match outcome {
+    let (asked_for, message) = match outcome {
         Err(e) => return Ending::Unsaid(e),
-        Ok(attach::ResultOutcome::Completed(data) | attach::ResultOutcome::Cancelled(data)) => {
-            (data.success, data.message)
-        }
-        Ok(attach::ResultOutcome::Abandoned) => (false, "the simulation abandoned it".to_owned()),
-        Ok(attach::ResultOutcome::Expired) => {
-            (false, "it left before the reason was read".to_owned())
-        }
+        Ok(outcome) => said(outcome),
     };
     match (stood, asked_for) {
-        (false, _) => Ending::NeverStood(said),
-        (true, true) => Ending::TakenOut(said),
-        (true, false) => Ending::Dropped(said),
+        (false, _) => Ending::LeftBeforeStanding(message),
+        (true, true) => Ending::TakenOut(message),
+        (true, false) => Ending::Dropped(message),
     }
 }
 
-/// Reports how this robot's stay ended: a robot that stood was taken out of
-/// the scene, and one that never stood could not be stood.
+/// Reports how this robot's stay ended.
 fn report(robot: &str, stood: bool, outcome: std::result::Result<attach::ResultOutcome, String>) {
     match ending(stood, outcome) {
-        Ending::NeverStood(why) => error!("the simulation did not stand '{robot}': {why}"),
+        Ending::LeftBeforeStanding(why) => {
+            info!("'{robot}' left the simulation before it stood: {why}");
+        }
         Ending::TakenOut(why) => {
             info!("the simulation took '{robot}' out of the scene: {why}");
         }
@@ -265,7 +624,7 @@ fn report(robot: &str, stood: bool, outcome: std::result::Result<attach::ResultO
 mod tests {
     use super::*;
 
-    fn said(success: bool, message: &str) -> attach::ResultResponseData {
+    fn engine_said(success: bool, message: &str) -> attach::ResultResponseData {
         attach::ResultResponseData {
             success,
             message: message.to_owned(),
@@ -274,25 +633,21 @@ mod tests {
 
     #[test]
     fn a_stay_is_reported_by_whether_the_robot_ever_stood() {
-        // A goal the engine ends before the robot stands: the scene could
-        // not stand it, whatever the engine's own verdict on the goal.
+        // A robot that leaves before the engine stands it left, whatever the
+        // engine's own verdict on the goal.
         assert_eq!(
             ending(
                 false,
-                Ok(attach::ResultOutcome::Completed(said(false, "no files")))
+                Ok(attach::ResultOutcome::Cancelled(engine_said(
+                    true,
+                    "left before it stood"
+                )))
             ),
-            Ending::NeverStood("no files".to_owned())
-        );
-        assert_eq!(
-            ending(
-                false,
-                Ok(attach::ResultOutcome::Completed(said(true, "cleared")))
-            ),
-            Ending::NeverStood("cleared".to_owned())
+            Ending::LeftBeforeStanding("left before it stood".to_owned())
         );
         assert_eq!(
             ending(false, Ok(attach::ResultOutcome::Abandoned)),
-            Ending::NeverStood("the simulation abandoned it".to_owned())
+            Ending::LeftBeforeStanding("the simulation abandoned it".to_owned())
         );
 
         // A robot that stood: the engine took it out as asked, or for a
@@ -300,14 +655,16 @@ mod tests {
         assert_eq!(
             ending(
                 true,
-                Ok(attach::ResultOutcome::Cancelled(said(true, "left")))
+                Ok(attach::ResultOutcome::Cancelled(engine_said(true, "left")))
             ),
             Ending::TakenOut("left".to_owned())
         );
         assert_eq!(
             ending(
                 true,
-                Ok(attach::ResultOutcome::Completed(said(false, "lapsed")))
+                Ok(attach::ResultOutcome::Completed(engine_said(
+                    false, "lapsed"
+                )))
             ),
             Ending::Dropped("lapsed".to_owned())
         );
@@ -318,6 +675,146 @@ mod tests {
         assert_eq!(
             ending(true, Err("timed out".to_owned())),
             Ending::Unsaid("timed out".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_goal_the_engine_ended_before_the_robot_stood_gives_the_engines_reason() {
+        assert_eq!(
+            reason_of(Ok(attach::ResultOutcome::Completed(engine_said(
+                false,
+                "its files could not be fetched"
+            )))),
+            "its files could not be fetched"
+        );
+        assert_eq!(
+            reason_of(Ok(attach::ResultOutcome::Abandoned)),
+            "the simulation abandoned it"
+        );
+        assert_eq!(
+            reason_of(Err("timed out".to_owned())),
+            "it ended the goal and did not say why: timed out"
+        );
+    }
+
+    #[test]
+    fn the_feedback_says_whether_the_robot_stands_and_how_its_stream_ended() {
+        let standing = |standing| Ok(attach::FeedbackMessage { standing });
+        assert_eq!(heard(standing(true)), Heard::Standing);
+        assert_eq!(heard(standing(false)), Heard::NotStanding);
+        assert_eq!(
+            heard(Err(peppygen::Error::ActionFeedbackChannelClosed)),
+            Heard::End(StreamEnd::Ended)
+        );
+        assert_eq!(
+            heard(Err(peppygen::Error::ActionFeedbackProducerGone {
+                instance_id: Some("simulation_inst".to_owned()),
+                action_name: "attach".to_owned(),
+            })),
+            Heard::End(StreamEnd::Gone)
+        );
+        // Anything else breaks the stream: the stand cannot be followed, and
+        // the wait for standing leaves the simulation and fails on it, as it
+        // does when the stand budget is spent.
+        assert_eq!(
+            heard(Err(refused("a feedback message that does not decode"))),
+            Heard::End(StreamEnd::Broken(
+                "a feedback message that does not decode".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn durations_are_given_in_seconds_to_the_tenth() {
+        assert_eq!(seconds(Duration::from_secs(10)), "10 s");
+        assert_eq!(seconds(Duration::from_millis(174_500)), "174.5 s");
+        assert_eq!(seconds(Duration::from_millis(164_460)), "164.5 s");
+        assert_eq!(seconds(Duration::from_millis(4_500)), "4.5 s");
+        assert_eq!(seconds(Duration::from_millis(40)), "0 s");
+    }
+
+    #[test]
+    fn the_stand_budget_is_the_setup_budget_less_the_leave_reserve() {
+        assert_eq!(
+            stand_budget(Duration::from_secs(180)),
+            Ok(Duration::from_millis(174_500))
+        );
+        assert_eq!(
+            stand_budget(Duration::from_secs(6)),
+            Ok(Duration::from_millis(500))
+        );
+        for setup in [Duration::from_secs(5), LEAVE_RESERVE] {
+            let refusal = stand_budget(setup).unwrap_err();
+            assert!(
+                refusal.contains("leaves no time to stand the robot")
+                    && refusal.contains("execution.setup_timeout_secs"),
+                "{refusal}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_shutdown_hook_waits_for_the_robot_to_leave() {
+        let token = CancellationToken::new();
+        let (left, has_left) = oneshot::channel();
+        let hook = tokio::spawn(wait_to_leave(token.clone(), has_left));
+        tokio::task::yield_now().await;
+        assert!(token.is_cancelled(), "the hook tells the stay to end");
+
+        // Up to the last instant of its bound, the hook still waits for the
+        // stay to say that the robot left.
+        tokio::time::advance(LEAVE_REPORT_TIMEOUT - Duration::from_millis(1)).await;
+        assert!(!hook.is_finished(), "the hook waits for the robot to leave");
+        left.send(()).expect("the hook still waits");
+        hook.await.expect("the hook ends once the robot left");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_shutdown_hook_gives_up_at_its_bound() {
+        let (_left, has_left) = oneshot::channel::<()>();
+        let start = Instant::now();
+        wait_to_leave(CancellationToken::new(), has_left).await;
+        assert_eq!(start.elapsed(), LEAVE_REPORT_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_host_clock_says_progress_every_period_until_the_budget_is_spent() {
+        let mut clock = HostClock::every(Duration::from_secs(10), Duration::from_millis(25_500));
+        assert_eq!(
+            clock.next().await,
+            Moment::Progress(Duration::from_secs(10))
+        );
+        assert_eq!(clock.elapsed(), Duration::from_secs(10));
+        assert_eq!(
+            clock.next().await,
+            Moment::Progress(Duration::from_secs(20))
+        );
+        assert_eq!(clock.next().await, Moment::Spent);
+        assert_eq!(clock.elapsed(), Duration::from_millis(25_500));
+        // A spent budget stays spent.
+        assert_eq!(clock.next().await, Moment::Spent);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_budget_of_whole_periods_ends_on_its_last_moment() {
+        let mut clock = HostClock::every(Duration::from_secs(10), Duration::from_secs(20));
+        assert_eq!(
+            clock.next().await,
+            Moment::Progress(Duration::from_secs(10))
+        );
+        assert_eq!(clock.next().await, Moment::Spent);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_node_says_progress_every_ten_seconds() {
+        let mut clock = HostClock::starting_now(Duration::from_millis(174_500));
+        assert_eq!(
+            clock.next().await,
+            Moment::Progress(Duration::from_secs(10))
+        );
+        assert_eq!(
+            clock.next().await,
+            Moment::Progress(Duration::from_secs(20))
         );
     }
 }

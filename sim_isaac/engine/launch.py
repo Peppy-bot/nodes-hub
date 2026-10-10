@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import ctypes
 import logging
 import os
@@ -55,6 +56,11 @@ _RENDER_CONFIG = {
 _ready = threading.Event()
 _stop = threading.Event()
 
+# How long the main thread waits, after a boot that failed, for the node's
+# thread to end the setup with the boot's error and run the shutdown hooks,
+# which peppy bounds by its shutdown grace. The process ends after that.
+_SETUP_REPORT_TIMEOUT_S = 30
+
 
 @dataclass
 class _SimHandoff:
@@ -79,23 +85,86 @@ class _SimHandoff:
     renders: bool
 
 
+class _Boot:
+    """Isaac Sim's boot, as the node's setup waits for it.
+
+    The main thread settles it once: when Isaac Sim takes robots, or with the
+    error that ends the boot first. The node's setup awaits it on the node's
+    loop.
+    """
+
+    def __init__(self) -> None:
+        self._outcome: concurrent.futures.Future = concurrent.futures.Future()
+
+    def takes_robots(self) -> None:
+        """Isaac Sim has booted, warmed up and started its timeline: a robot
+        that attaches from now on stands."""
+        self._settle(self._outcome.set_result, None)
+
+    def fails(self, error: Exception) -> None:
+        """The boot ended with `error`. Once Isaac Sim takes robots, or once
+        the boot failed, this changes nothing."""
+        self._settle(self._outcome.set_exception, error)
+
+    def failed(self) -> bool:
+        """Whether the boot ended with an error, which the node's setup ends
+        with unless the node was stopped first."""
+        return (
+            self._outcome.done()
+            and not self._outcome.cancelled()
+            and self._outcome.exception() is not None
+        )
+
+    async def wait(self) -> None:
+        """Returns once Isaac Sim takes robots, and raises the error of a boot
+        that failed. A wait that is cancelled ends at once."""
+        await asyncio.wrap_future(self._outcome)
+
+    @staticmethod
+    def _settle(settle, value) -> None:
+        try:
+            settle(value)
+        except concurrent.futures.InvalidStateError:
+            # The boot is settled already, or the setup stopped waiting.
+            pass
+
+
 _handoff: dict[str, _SimHandoff] = {}
 _setup_error: dict[str, Exception] = {}
 _handoff_ready = threading.Event()
+_boot = _Boot()
 
 
 async def setup(params, node_runner) -> list:
-    """Set up Peppy IO and hand resolved parameters to Isaac."""
+    """Set up Peppy IO, hand the resolved parameters to Isaac, and return
+    once Isaac Sim takes robots: the start of the node ends, and the daemon
+    goes on to the next instance, only when a robot that attaches can stand.
+    A boot that fails ends the setup with its error, and a stop during the
+    boot ends the setup."""
 
     # A setup failure must reach main() promptly: record it and release the
     # handoff wait, so the process dies on the real error instead of the
     # 30s parameter timeout.
     try:
-        return await _node_setup(params, node_runner)
+        tasks = await _node_setup(params, node_runner)
     except Exception as exc:
         _setup_error["value"] = exc
         _handoff_ready.set()
         raise
+    await _wait_for_isaac()
+    return tasks
+
+
+async def _wait_for_isaac() -> None:
+    """Waits for the main thread to boot Isaac Sim, warm it up and start its
+    timeline."""
+
+    logger.info("Isaac Sim boots; the setup ends once it takes robots")
+    try:
+        await _boot.wait()
+    except Exception as error:
+        raise RuntimeError(f"Isaac Sim did not boot: {error}") from error
+    logger.info("Isaac Sim takes robots")
 
 
 async def _node_setup(params, node_runner) -> list:
@@ -248,10 +317,11 @@ def main() -> None:
 
     _preflight_nvidia_driver()
 
-    threading.Thread(
+    node = threading.Thread(
         target=_run_node_builder,
         daemon=True,
-    ).start()
+    )
+    node.start()
 
     if not _handoff_ready.wait(
         timeout=30
@@ -265,6 +335,24 @@ def main() -> None:
             "node setup failed"
         ) from _setup_error["value"]
     handoff = _handoff["value"]
+
+    # The node's setup waits for the boot, so whatever ends the boot before
+    # Isaac Sim takes robots ends that wait too, with its error. The node's
+    # thread is a daemon thread, so the process waits for it to report that
+    # error before it ends.
+    try:
+        _run_isaac(handoff)
+    except Exception as error:
+        _boot.fails(error)
+        raise
+    finally:
+        _boot.fails(RuntimeError("Isaac Sim closed before it took robots"))
+        if _boot.failed():
+            node.join(timeout=_SETUP_REPORT_TIMEOUT_S)
+
+
+def _run_isaac(handoff: _SimHandoff) -> None:
+    """Boot Isaac Sim with the node's parameters and run its loop."""
 
     # --------------------------------------------------------------
     # WebRTC configuration
@@ -394,6 +482,7 @@ def main() -> None:
         frame_rate_hz=_FRAME_RATE_HZ,
         render_mode=_RENDER_CONFIG["renderer"],
         anti_aliasing=_RENDER_CONFIG["anti_aliasing"],
+        boot=_boot,
     )
     # A robot that attached before now waits in the edits queue, and the loop
     # below stands it on this thread, which is the only one that may.

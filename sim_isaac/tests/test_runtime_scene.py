@@ -142,7 +142,7 @@ def scene(monkeypatch):
     world.place.side_effect = _stand
     launcher = module.SimLauncher(
         Mock(), world, Mock(), Mock(), Mock(), Mock(), object(), scene_actions, frame_rate_hz=60,
-        render_mode="RealTimePathTracing", anti_aliasing=3,
+        render_mode="RealTimePathTracing", anti_aliasing=3, boot=Mock(),
     )
     # Specced against the real bridge, so a call to a method the bridge
     # lacks raises.
