@@ -60,6 +60,18 @@ _OBJECT_SOURCES = ("spawned", "scene")
 _UNIT_TOLERANCE = 1e-3
 
 
+def _refuse_snap(payload: dict) -> None:
+    """Refuses a goal that names a snap: a snap stands an object where one of
+    its belt ends, a landmark, meets a belt end of another object, and Isaac
+    keeps no landmark of an object, so it refuses every snap, as
+    scene_manipulation:v1 says."""
+    if payload.get("snap_to") is not None:
+        raise ValueError(
+            "this simulation keeps no landmark of an object, so it places "
+            "nothing by a snap: give the goal a position instead of snap_to"
+        )
+
+
 def _orientation_of(payload: dict) -> list[float] | None:
     """The orientation a goal names, a unit quaternion [x, y, z, w]
     normalised, or None when the goal names none. A quaternion that is not
@@ -963,6 +975,7 @@ class SceneActionIO:
             }
 
         if operation == "spawn_object":
+            _refuse_snap(payload)
             asset_id = payload["asset_id"]
             asset = self._asset(asset_id)
 
@@ -1058,6 +1071,7 @@ class SceneActionIO:
             }
 
         if operation == "move_object":
+            _refuse_snap(payload)
             object_id = payload["object_id"]
 
             if self._object(object_id) is None:
@@ -1376,6 +1390,7 @@ class SceneActionIO:
                     "scale": request.scale,
                     "physics": request.physics,
                     "mass": request.mass,
+                    "snap_to": request.snap_to,
                 },
             )
 
@@ -1427,6 +1442,7 @@ class SceneActionIO:
                         request.position
                     ),
                     "orientation": request.orientation,
+                    "snap_to": request.snap_to,
                 },
             )
 

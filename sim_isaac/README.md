@@ -349,6 +349,9 @@ answers as `get_objects_list` does: unavailable, with the reason. A
 `spawn_object` or `move_object` goal that carries an `orientation`, a unit
 quaternion `[x, y, z, w]`, stands the object turned to it, whatever the
 spawn's `yaw`; a move without one keeps the orientation the object has.
+Isaac keeps no landmark, so a `spawn_object` or `move_object` goal that
+carries a `snap_to` is refused, naming the position to give instead, and
+nothing is spawned or moved.
 
 ### Progress of a load or a spawn
 

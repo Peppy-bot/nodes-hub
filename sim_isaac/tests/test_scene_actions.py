@@ -506,6 +506,28 @@ def test_an_orientation_that_is_no_unit_quaternion_is_refused_on_spawn_and_move(
     assert _spawned_ids(provider) == [object_id]
 
 
+def test_a_snap_is_refused_on_spawn_and_move_before_the_stage(provider):
+    """Isaac keeps no landmark, so a goal that names a snap is refused and
+    mints, builds and moves nothing."""
+    provider.io.set_assets(_CATALOGUE)
+    object_id = _spawn(provider)
+    provider.launcher.reset_mock()
+    snap = SimpleNamespace(object_id=object_id, landmark="outlet", own_landmark="inlet")
+
+    with pytest.raises(ValueError, match="keeps no landmark of an object, so it places nothing by a snap"):
+        provider.io._execute(provider.launcher, "spawn_object", {
+            "asset_id": "props/blocks/red_block", "position": [0.0, 0.0, 0.0], "yaw": 0.0, "scale": 1.0,
+            "physics": "static", "mass": 0.1, "snap_to": snap,
+        })
+    with pytest.raises(ValueError, match="keeps no landmark of an object, so it places nothing by a snap"):
+        provider.io._execute(provider.launcher, "move_object", {
+            "object_id": object_id, "position": [0.0, 0.0, 0.0], "snap_to": snap,
+        })
+
+    assert provider.launcher.mock_calls == []
+    assert _spawned_ids(provider) == [object_id]
+
+
 def test_a_move_carries_its_orientation_to_the_stage_and_keeps_it_otherwise(provider):
     provider.io.set_assets(_CATALOGUE)
     object_id = _spawn(provider)
@@ -793,7 +815,7 @@ _SPAWN = SimpleNamespace(
     action="spawn_object", serve="_serve_spawn_object", build="_runtime_spawn_isaac_asset",
     request=SimpleNamespace(
         asset_id="props/blocks/red_block", position=[0.5, 0.0, 0.8], yaw=0.0, orientation=None, scale=1.0,
-        physics="dynamic", mass=0.1,
+        physics="dynamic", mass=0.1, snap_to=None,
     ),
     message="Spawned props/blocks/red_block",
 )
