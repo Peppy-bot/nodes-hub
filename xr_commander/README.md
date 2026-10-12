@@ -65,8 +65,12 @@ reserved for the panel.
 ## Operating it
 
 Open the URL the node prints at startup in the headset's browser and press
-**Enter VR**. Without a bound camera only the status panel shows (nothing at
-all with it disabled); the robot view is whatever camera you bind.
+**Passthrough**. The page is teleop_xr's dashboard trimmed to what this node
+honors: that button, the connection state and the camera feeds. teleop_xr's
+VR mode, speed and precision controls, robot model settings and network tuning
+drive its own IK stack and robot model, which this node does not run, so the
+page hides them. Without a bound camera only the status panel shows (nothing
+at all with it disabled); the robot view is whatever camera you bind.
 
 - **Grip button**: the deadman and clutch, per hand. Squeeze to engage that
   hand, release to let go. While it is released the node publishes nothing at
@@ -168,9 +172,9 @@ full list and defaults.
 
 ## Development
 
-`frames`, `devices`, `clutch`, `config`, `tls`, and the decode half of `video`
-are pure of peppy; `publish` imports the generated modules, so the full suite
-needs the synced environment (and nothing served):
+`frames`, `devices`, `clutch`, `config`, `tls`, `page`, and the decode half of
+`video` are pure of peppy; `publish` imports the generated modules, so the full
+suite needs the synced environment (and nothing served):
 
 ```bash
 peppy node sync   # resolves the peppygen/peppylib path dependencies uv needs

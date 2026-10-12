@@ -1,7 +1,8 @@
 """The headset session: everything that knows teleop_xr exists.
 
 Owns the server lifecycle only; what an XR frame is lives in `devices`, so the
-clutch and publishers never import a web stack.
+clutch and publishers never import a web stack, and the page it serves at '/'
+is `page`'s trim of teleop_xr's.
 """
 
 from __future__ import annotations
@@ -11,14 +12,18 @@ import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
+import teleop_xr
 import uvicorn
 from fastapi import APIRouter, FastAPI
-from teleop_xr import Teleop
 from teleop_xr.config import TeleopSettings
 from teleop_xr.video_stream import VideoSource
 
+from xr_commander import page
 from xr_commander.bus import log
 from xr_commander.devices import XrFrame, parse_hands
+
+# teleop_xr's prebuilt page, as the installed package ships it.
+DASHBOARD = Path(teleop_xr.__file__).with_name("dist") / "index.html"
 
 _SERVER_START_TIMEOUT_S = 5.0
 _SERVER_STOP_TIMEOUT_S = 2.0
@@ -87,9 +92,9 @@ class XrSession:
             # and matches incoming WebRTC tracks to them by stream id.
             camera_views=camera_views,
         )
-        self._teleop = Teleop(settings, video_sources=video_sources)
+        self._teleop = teleop_xr.Teleop(settings, video_sources=video_sources)
         self._teleop.subscribe(self._on_xr_update)
-        for router in routers:
+        for router in (page.build_router(DASHBOARD), *routers):
             include_router_first(self._teleop.app, router)
 
         self._server = uvicorn.Server(
