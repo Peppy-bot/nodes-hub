@@ -1,30 +1,23 @@
 """The scene_manipulation and object_state provider: what get_assets_list answers
 before and after discovery, what load_scene and clear_scene do to spawned
 objects, what get_object_states answers: nothing until a capture, then
-the latest capture under its own stamp, every completed edit included, and
-what a load_scene or spawn_object goal reports on its feedback."""
+the latest capture under its own stamp, every completed edit included, what
+get_object answers for one object of that capture, and what a load_scene or
+spawn_object goal reports on its feedback."""
 
 import asyncio
 import importlib
-import importlib.util
 import json
 import logging
-import sys
 import threading
 from concurrent.futures import Future
-from pathlib import Path
 from queue import Queue
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from unittest.mock import Mock, call
 
 import pytest
 
-_ENGINE_DIR = Path(__file__).resolve().parents[1] / "engine"
-_ACTIONS = ("apply_force", "clear_scene", "load_scene", "move_object", "move_robot", "remove_object", "spawn_object")
-_SERVICES = {
-    "scene": ("get_assets_list", "get_asset_categories", "get_objects_list", "get_robots_list", "get_scene"),
-    "objects": ("get_object_states",),
-}
+from _scene_actions import scene_actions_module
 
 
 def _request(**fields):
@@ -39,6 +32,10 @@ def _assets_request(kind=None, category=None, query=None):
 
 def _objects_request(source=None, category=None):
     return _request(source=source, category=category)
+
+
+def _object_request(object_id):
+    return _request(object_id=object_id)
 
 
 class _Robot(SimpleNamespace):
@@ -107,35 +104,7 @@ class FakeReader:
 
 @pytest.fixture
 def provider(monkeypatch):
-    actions = ModuleType("peppygen.exposed_actions.scene")
-    for name in _ACTIONS:
-        setattr(actions, name, ModuleType(f"{actions.__name__}.{name}"))
-    modules = {
-        "peppygen": ModuleType("peppygen"),
-        "peppygen.exposed_actions": ModuleType("peppygen.exposed_actions"),
-        "peppygen.exposed_actions.scene": actions,
-        "peppygen.exposed_services": ModuleType("peppygen.exposed_services"),
-    }
-    for link, names in _SERVICES.items():
-        services = ModuleType(f"peppygen.exposed_services.{link}")
-        for name in names:
-            module = ModuleType(f"{services.__name__}.{name}")
-            module.Response = lambda **fields: SimpleNamespace(**fields)
-            module.ResponseObjectsItem = lambda **fields: SimpleNamespace(**fields)
-            # The generated record of one robot in a get_robots_list answer.
-            module.ResponseRobotsItem = lambda **fields: SimpleNamespace(**fields)
-            # The generated record of one category in a get_asset_categories answer.
-            module.ResponseCategoriesItem = lambda **fields: SimpleNamespace(**fields)
-            setattr(services, name, module)
-        modules[services.__name__] = services
-    for name, module in modules.items():
-        monkeypatch.setitem(sys.modules, name, module)
-    monkeypatch.syspath_prepend(str(_ENGINE_DIR))
-    spec = importlib.util.spec_from_file_location("_scene_actions_under_test", _ENGINE_DIR / "scene_actions.py")
-    module = importlib.util.module_from_spec(spec)
-    # Its dataclass resolves postponed annotations through sys.modules.
-    monkeypatch.setitem(sys.modules, spec.name, module)
-    spec.loader.exec_module(module)
+    module = scene_actions_module(monkeypatch, "_scene_actions_under_test")
 
     stamps = FakeStamps()
     world = _world(("alpha", "openarm_v2", (0.0, 0.0, 0.0), 0.0))
@@ -279,6 +248,75 @@ def test_the_inventory_is_unavailable_with_the_captures_reason_until_a_capture(p
     assert response.success is False
     assert "has not captured its object state yet" in response.message
     assert (response.timestamp, response.objects) == (0.0, [])
+
+
+# What a get_object answer holds besides its pose: this stage keeps no
+# landmark and simulates no state of an object.
+_NO_LANDMARK_AND_NO_STATE = {
+    "landmarks": [], "bounds": None, "breakage": None, "contents": None, "membranes": None, "crush": None,
+    "heat": None, "heaters": None,
+}
+
+
+def _assert_no_object(response, reason):
+    """A get_object refusal: its reason, and nothing in any other field."""
+    assert vars(response) == {
+        "success": False, "message": reason, "timestamp": 0.0, "object_id": "", "asset_id": "",
+        "position": [0.0, 0.0, 0.0], "orientation": [0.0, 0.0, 0.0, 0.0], "scale": 0.0,
+        **_NO_LANDMARK_AND_NO_STATE,
+    }
+
+
+def test_one_object_answers_its_pose_and_scale_with_no_landmark_and_no_state(provider):
+    provider.io.set_assets(_CATALOGUE)
+    _spawn(provider)
+    result = provider.io._execute(provider.launcher, "spawn_object", {
+        "asset_id": "props/blocks/blue_block", "position": [0.5, 0.0, 0.8], "yaw": 0.0, "scale": 1.5,
+        "physics": "static", "mass": 0.2,
+    })
+    blue = result["object_id"]
+    provider.stage[blue] = [1.0, 2.0, 3.0]
+    provider.io.capture_object_states()
+
+    response = provider.io._handle_get_object(_object_request(blue))
+
+    assert vars(response) == {
+        "success": True,
+        "message": f"pose and scale of {blue}; Isaac keeps no landmark and simulates no state of an object",
+        "timestamp": 10.0, "object_id": blue, "asset_id": "props/blocks/blue_block",
+        "position": [1.0, 2.0, 3.0], "orientation": [0.0, 0.0, 0.0, 1.0], "scale": 1.5,
+        **_NO_LANDMARK_AND_NO_STATE,
+    }
+    # The pose is the one get_objects_list lists from the same capture.
+    (listed,) = [item for item in provider.io._handle_get_objects_list(_objects_request()).objects
+                 if item.object_id == blue]
+    assert (listed.position, listed.orientation, listed.scale) == (
+        response.position, response.orientation, response.scale,
+    )
+
+
+def test_one_object_is_refused_when_its_id_names_no_spawned_object(provider):
+    provider.io.set_assets(_CATALOGUE)
+    object_id = _spawn(provider)
+    provider.io.capture_object_states()
+
+    _assert_no_object(provider.io._handle_get_object(_object_request("obj_missing")), "Unknown object_id: obj_missing")
+    _assert_no_object(provider.io._handle_get_object(_object_request("")), "Unknown object_id: ")
+
+    # A removed object is gone from the capture that follows its removal.
+    provider.io._execute(provider.launcher, "remove_object", {"object_id": object_id})
+    provider.io.capture_object_states()
+    _assert_no_object(provider.io._handle_get_object(_object_request(object_id)), f"Unknown object_id: {object_id}")
+
+
+def test_one_object_is_unavailable_with_the_captures_reason_until_a_capture(provider):
+    provider.io.set_assets(_CATALOGUE)
+    object_id = _spawn(provider)
+
+    response = provider.io._handle_get_object(_object_request(object_id))
+
+    _assert_no_object(response, provider.module._NOT_CAPTURED)
+    assert "has not captured its object state yet" in response.message
 
 
 def test_the_loaded_scene_is_named_after_a_load_and_empty_after_a_clear(provider):

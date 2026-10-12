@@ -225,6 +225,16 @@ peppy node run \
 
 A robot names its model on its own initializer when it joins.
 
+The node's setup ends only once Isaac Sim takes robots: after Isaac Sim has
+booted, warmed up and started its timeline. Only then does the node report
+healthy, and does the daemon go on to start the next instance, so the stand
+budget of a robot that joins at launch covers its stand only, not the boot.
+A robot that attaches during the boot waits in a queue, and stands once
+Isaac Sim takes robots. The manifest declares a setup budget of 540 s
+(`execution.setup_timeout_secs`), which covers the boot on a cold Kit cache;
+a boot that takes longer fails the start of the node. A boot that fails ends
+the setup at once with its error, and a stop during the boot ends the setup.
+
 ## Runtime and Performance
 
 Both headless and windowed launches use the packaged
@@ -330,10 +340,15 @@ and `query` its request sets, and `get_asset_categories` counts it per
 category. `get_objects_list` lists every object scene_manipulation spawned
 with its pose as of the latest capture, each in its asset's category and
 with the source `spawned`: an environment places no object of its own, so
-the source `scene` lists nothing. A `spawn_object` or `move_object` goal
-that carries an `orientation`, a unit quaternion `[x, y, z, w]`, stands the
-object turned to it, whatever the spawn's `yaw`; a move without one keeps
-the orientation the object has.
+the source `scene` lists nothing. `get_object` answers one of those objects
+from the same capture: its pose and its scale, as `get_objects_list` lists
+them. Isaac keeps no landmark and simulates no state of an object, so
+`landmarks` is empty and no state field is present. An object id that names
+no spawned object is refused, and before the first capture `get_object`
+answers as `get_objects_list` does: unavailable, with the reason. A
+`spawn_object` or `move_object` goal that carries an `orientation`, a unit
+quaternion `[x, y, z, w]`, stands the object turned to it, whatever the
+spawn's `yaw`; a move without one keeps the orientation the object has.
 
 ### Progress of a load or a spawn
 
@@ -442,7 +457,7 @@ mkdir -p /tmp/openarm-isaac-source
 docker cp "$source_container:$source_directory/." /tmp/openarm-isaac-source/
 docker rm "$source_container"
 
-uv run --no-project --python 3.11 --with usd-core==26.5 \
+uv run --no-project --python 3.11 --with usd-core==26.8 \
   --with-requirements sim_isaac/scripts/requirements-visuals.txt \
   python sim_isaac/scripts/prepare_assets.py \
   --source-dir /tmp/openarm-isaac-source \
@@ -502,7 +517,7 @@ tool frame included. CPU only, no Isaac Sim. From the repository root, with
 the upstream staged by `sim_base_images/so101_model.py fetch <directory>`:
 
 ```bash
-uv run --no-project --python 3.11 --with mujoco==3.10.0 --with usd-core==26.5 --with numpy \
+uv run --no-project --python 3.11 --with mujoco==3.15.0 --with usd-core==26.8 --with numpy \
   python sim_isaac/scripts/build_so101.py \
   --model /tmp/so101-upstream/so101 \
   --urdf <so101_description>/urdf/so101_kinematics.urdf \
@@ -547,7 +562,7 @@ Inspect a Peppy run log:
 
 ```bash
 grep -E \
-'Runtime commander|Scene loaded|Runtime command failed|ERROR|Traceback' \
+'Isaac Sim takes robots|Isaac Sim did not boot|Runtime commander|Scene loaded|Runtime command failed|ERROR|Traceback' \
 ~/.peppy/logs/run/<RUN_ID>.log \
 | tail -n 100
 ```

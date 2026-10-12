@@ -15,7 +15,7 @@ use crate::state::REJECT_WARN_PERIOD;
 
 /// Pause after a receive error before retrying, so a persistently failing
 /// subscription cannot hot-spin its task or flood the log.
-const RECEIVE_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+pub const RECEIVE_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
 /// This instance's bound clock, for judging a wire timestamp's age on the
 /// timeline it was written from. Errs until the clock resolves: on a clock

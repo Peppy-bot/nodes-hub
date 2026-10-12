@@ -1,14 +1,18 @@
-//! What both of this node's tests boot a robot with. Each test binary
-//! compiles its own copy, so a builder only one of them calls is unused in
-//! the other.
+//! What this node's tests boot a robot with. Each test binary compiles its
+//! own copy, so a builder that only one of them calls is unused in the
+//! others.
 #![allow(dead_code)]
 
+use std::pin::Pin;
+use std::sync::{Arc, LazyLock, Once};
 use std::time::Duration;
 
-use peppygen::Parameters;
 use peppygen::fixtures::harness::{Config, Harness};
 use peppygen::mock::deps::simulation::attach;
 use peppygen::parameters::placement::Placement;
+use peppygen::{NodeRunner, Parameters};
+use robot_initializer::{Moment, StandClock};
+use tokio::sync::{mpsc, watch};
 
 /// Joints of one OpenArm arm, as the engine reports them.
 const ARM_DOF: u32 = 7;
@@ -18,6 +22,9 @@ const SETUP_BUDGET: Duration = Duration::from_secs(30);
 
 /// How often a test checks whether the node's `setup` has returned.
 const SETUP_POLL: Duration = Duration::from_millis(50);
+
+/// How long a test waits for the node to log a line it is about to log.
+const LOGGING: Duration = Duration::from_secs(10);
 
 /// The four limbs of an OpenArm, each with a driver answering for it.
 pub const LIMBS: usize = 4;
@@ -122,4 +129,129 @@ pub async fn await_setup_return(harness: &Harness) {
 pub async fn shutdown_once_setup_returns(harness: Harness) -> peppygen::Result<()> {
     await_setup_return(&harness).await;
     harness.shutdown().await
+}
+
+/// A clock that the test drives: the robot's wait for standing hears the
+/// moments the test sends, and no other, so no test reaches the stand
+/// budget unless it spends it.
+pub struct ScriptedClock {
+    moments: mpsc::UnboundedReceiver<Moment>,
+    elapsed: Duration,
+}
+
+impl StandClock for ScriptedClock {
+    fn elapsed(&self) -> Duration {
+        self.elapsed
+    }
+
+    async fn next(&mut self) -> Moment {
+        let Some(moment) = self.moments.recv().await else {
+            return std::future::pending().await;
+        };
+        if let Moment::Progress(elapsed) = moment {
+            self.elapsed = elapsed;
+        }
+        moment
+    }
+}
+
+/// The test's end of a [`ScriptedClock`].
+pub struct Clock(mpsc::UnboundedSender<Moment>);
+
+impl Clock {
+    /// Tells the robot that it does not stand yet, `elapsed` after its goal
+    /// was sent.
+    pub fn progress(&self, elapsed: Duration) {
+        self.send(Moment::Progress(elapsed));
+    }
+
+    /// Spends the robot's stand budget.
+    pub fn spend(&self) {
+        self.send(Moment::Spent);
+    }
+
+    fn send(&self, moment: Moment) {
+        self.0
+            .send(moment)
+            .expect("the robot's wait for standing hears its clock");
+    }
+}
+
+/// A clock for the test to drive, and the end of it that the node reads.
+pub fn scripted_clock() -> (Clock, ScriptedClock) {
+    let (moments, heard) = mpsc::unbounded_channel();
+    (
+        Clock(moments),
+        ScriptedClock {
+            moments: heard,
+            elapsed: Duration::ZERO,
+        },
+    )
+}
+
+/// What the harness runs as the node's setup.
+pub type Setup = Pin<Box<dyn Future<Output = peppygen::Result<()>> + Send>>;
+
+/// The node's own setup, its wait for standing on `clock`.
+pub fn setup_on(clock: ScriptedClock) -> impl FnOnce(Parameters, Arc<NodeRunner>) -> Setup {
+    move |params, runner| {
+        Box::pin(robot_initializer::setup_with_clock(
+            params,
+            runner,
+            move |_budget| clock,
+        ))
+    }
+}
+
+/// Every line logged in this test binary, as an operator reads it.
+static LOGGED: LazyLock<watch::Sender<Vec<String>>> =
+    LazyLock::new(|| watch::Sender::new(Vec::new()));
+
+/// One logged line on its way to [`LOGGED`]: the formatter writes an event
+/// whole, then drops the line.
+#[derive(Default)]
+struct Line(Vec<u8>);
+
+impl std::io::Write for Line {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for Line {
+    fn drop(&mut self) {
+        let line = String::from_utf8_lossy(&self.0).trim_end().to_owned();
+        LOGGED.send_modify(|lines| lines.push(line));
+    }
+}
+
+/// Captures every line logged in this test binary from now on, for
+/// [`logged`]. Each harness runs its node under a name of its own, so a test
+/// reads its own robot's lines by that name.
+pub fn capture_logs() {
+    static CAPTURING: Once = Once::new();
+    CAPTURING.call_once(|| {
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(Line::default)
+            .init();
+    });
+}
+
+/// Waits until a line that holds `text` is logged, failing the test after
+/// [`LOGGING`].
+pub async fn logged(text: &str) {
+    let mut lines = LOGGED.subscribe();
+    tokio::time::timeout(
+        LOGGING,
+        lines.wait_for(|lines| lines.iter().any(|line| line.contains(text))),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("the node logs {text:?} within {LOGGING:?}"))
+    .expect("the log stays open for as long as the test binary runs");
 }

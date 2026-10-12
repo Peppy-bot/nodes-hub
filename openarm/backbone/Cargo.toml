@@ -20,7 +20,7 @@ workspace_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", packa
 # version public-peppy-libs uses: the mounts hand the parsed robot to
 # `srs_model::chain_kinematics::Tree::from_robot`, which takes that version's
 # `urdf_rs::Robot`.
-urdf-rs = "0.9"
+urdf-rs = "0.10"
 
 # The collision narrowphase (GJK/EPA over convex hulls) and forward kinematics
 # are dense nalgebra f64 kernels. At the dev profile's opt-level 0 the governor's

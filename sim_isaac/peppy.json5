@@ -78,6 +78,7 @@
         { link_id: "scene", name: "get_assets_list" },
         { link_id: "scene", name: "get_asset_categories" },
         { link_id: "scene", name: "get_objects_list" },
+        { link_id: "scene", name: "get_object" },
         { link_id: "scene", name: "get_scene" },
         { link_id: "scene", name: "get_robots_list" },
         { link_id: "objects", name: "get_object_states" },
@@ -131,6 +132,12 @@
 
   execution: {
     language: "python",
+
+    // The setup ends only when Isaac Sim takes robots: after its boot, its
+    // warm-up and the start of its timeline, which take minutes on a cold
+    // Kit cache. This budget covers the boot, so a robot that joins at
+    // launch waits for its stand within its own budget.
+    setup_timeout_secs: 540,
 
     container: {
       def_file: "apptainer.def",

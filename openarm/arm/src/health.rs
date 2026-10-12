@@ -189,8 +189,8 @@ fn fractions(ratings: &[Ratings; ARM_DOF], state: &ArmState) -> ([f64; ARM_DOF],
 }
 
 /// Emit the per-motor health reports at [`HEALTH_PERIOD`], forever, and the
-/// operator alerts they imply (transitions as they happen, active alerts on
-/// the heartbeat resync).
+/// operator alerts they imply, as the set of active alerts published again
+/// whenever it changes.
 ///
 /// A sample the control loop has not refreshed is not republished: the
 /// cadence is what lets a consumer tell a steady robot from a dead
@@ -217,9 +217,7 @@ pub async fn run_publisher(
         return; // control loop gone before any motor reported
     }
     let mut pacer = Pacer::new(HEALTH_PERIOD).expect("HEALTH_PERIOD is non-zero");
-    let sources = (1..=ARM_DOF)
-        .map(|j| format!("{alert_source} j{j}"))
-        .collect();
+    let sources = std::array::from_fn(|j| format!("{alert_source} j{}", j + 1));
     let mut raiser = AlertRaiser::new(sources);
     let mut health_warn = LatchedWarn::new("motor_health publish");
     let mut readings_warn = LatchedWarn::new("health readings");
@@ -290,45 +288,45 @@ async fn publish_report(
     }
 }
 
-/// Publish the alert transitions and heartbeat re-emits these reports owe.
-/// Alerts commit per successful publish ([`AlertRaiser::mark_sent`]): a
-/// failed send stays owed and retries next round, and the heartbeat
-/// commits only when the whole round went out.
+/// Publish the alert set these reports owe: a motor's condition changed, or
+/// the floor elapsed since the last set went out. The set commits per
+/// successful publish ([`AlertRaiser::mark_sent`]): a failed send stays owed
+/// and retries next round.
+///
+/// Called from the round that publishes health, so a control loop that stops
+/// writing samples stops refreshing the set too and a consumer ages it out.
 async fn publish_due_alerts(
     publisher: &peppylib::TopicPublisher,
-    raiser: &mut AlertRaiser,
+    raiser: &mut AlertRaiser<ARM_DOF>,
     reports: &[MotorHealth; ARM_DOF],
     warn: &mut LatchedWarn,
 ) {
     let now = Instant::now();
-    let batch = raiser.due(reports, now);
-    let mut all_sent = true;
-    for pending in &batch.items {
-        let result = async {
-            let msg = alerts_topic::build_message(
-                capture_timestamp()?,
-                pending.alert.source.clone(),
-                MOTOR_ALERT_KIND.to_string(),
-                pending.alert.severity,
-                pending.alert.message.clone(),
-            )
-            .map_err(|e| e.to_string())?;
-            publisher.publish(msg).await.map_err(|e| e.to_string())
-        }
-        .await;
-        match result {
-            Ok(()) => {
-                raiser.mark_sent(pending);
-                warn.success();
-            }
-            Err(e) => {
-                all_sent = false;
-                warn.failure(&e);
-            }
-        }
+    let Some(set) = raiser.due(reports, now) else {
+        return;
+    };
+    let result = async {
+        let active = set
+            .alerts()
+            .iter()
+            .map(|alert| alerts_topic::MessageActiveItem {
+                source: alert.source.clone(),
+                kind: MOTOR_ALERT_KIND.to_string(),
+                severity: alert.severity.wire(),
+                message: alert.message.clone(),
+            })
+            .collect();
+        let msg =
+            alerts_topic::build_message(capture_timestamp()?, active).map_err(|e| e.to_string())?;
+        publisher.publish(msg).await.map_err(|e| e.to_string())
     }
-    if batch.heartbeat && all_sent {
-        raiser.mark_heartbeat(now);
+    .await;
+    match result {
+        Ok(()) => {
+            raiser.mark_sent(&set, now);
+            warn.success();
+        }
+        Err(e) => warn.failure(&e),
     }
 }
 

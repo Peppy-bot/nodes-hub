@@ -2,9 +2,11 @@ import time
 
 import numpy as np
 
+from peppygen.consumed_topics.alerts import alerts as alerts_topic
+
 from tests.helpers import IDENTITY
 from xr_commander import panel
-from xr_commander.alerts import CRITICAL, ActiveAlerts
+from xr_commander.alerts import ActiveAlerts
 from xr_commander.clutch import HandClutch
 from xr_commander.devices import HandSample, XrFrame
 from xr_commander.frames import Pose
@@ -27,16 +29,30 @@ from xr_commander.task_page import UNNAMED_TASK
 POSE = Pose(np.zeros(3), IDENTITY)
 
 
+_PRODUCER = ("core", "left_arm_inst")
+
+
 def quiet():
-    """An alert map with nothing active."""
-    return ActiveAlerts()
+    """An alert store with one bound producer and nothing active."""
+    return ActiveAlerts(bound_now=lambda: [_PRODUCER])
 
 
 def raised(*alerts):
-    """An alert map holding each (source, severity, message)."""
-    active = ActiveAlerts()
-    for source_name, severity, message in alerts:
-        active.update("left_arm_inst", source_name, "motor_overload", severity, message)
+    """An alert store holding each (source, severity, message) as one set."""
+    active = quiet()
+    refused = active.replace(
+        _PRODUCER,
+        [
+            alerts_topic.MessageActiveItem(
+                source=source_name,
+                kind="motor_condition",
+                severity=severity,
+                message=message,
+            )
+            for source_name, severity, message in alerts
+        ],
+    )
+    assert refused == [], refused
     return active
 
 

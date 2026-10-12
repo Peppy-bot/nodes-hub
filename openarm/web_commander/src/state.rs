@@ -1,11 +1,13 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::gestures::BakedGesture;
 use crate::pose::Jog;
 
-pub use control_core::motor_health::HealthLevel;
+pub use control_core::motor_health::{AlertSeverity, HealthLevel};
 pub use openarm_description::ARM_DOF;
+use peppylib::messaging::ProducerRef;
 // The gripper axis is the unitless opening fraction (0 = closed, 1 = open);
 // this is only the startup default for the gripper target.
 pub const GRIPPER_CLOSED: f64 = 0.0;
@@ -266,11 +268,13 @@ pub struct UiState {
     // nothing to say. Resolved once at startup, as the recorder panel is.
     pub health_bound: bool,
     // Same question for the alerts slot, so an empty alert list can say
-    // "not wired" rather than implying all clear.
+    // "not wired" rather than implying all clear. Follows the slot's bound
+    // set, which grows when a producer joins after startup.
     pub alerts_bound: bool,
-    // Active operator alerts, one per (source, kind); severity-0 messages
-    // remove theirs, and the view ages out entries whose producer went quiet.
-    pub alerts: Vec<Alert>,
+    // The active set each bound producer last published. A producer's next
+    // set replaces its whole entry, one that leaves the slot takes its
+    // entry with it, and one that stops refreshing ages out.
+    pub alerts: BTreeMap<ProducerRef, AlertSet>,
     pub status: String,
 }
 
@@ -283,18 +287,20 @@ pub const REJECT_WARN_PERIOD: Duration = Duration::from_secs(1);
 /// reports each component at least this often.
 const HEALTH_REPORT_PERIOD: Duration = Duration::from_millis(500);
 
-/// The alerts contract's re-emit ceiling: a producer re-announces each
-/// active alert at least this often.
-const ALERT_REEMIT_PERIOD: Duration = Duration::from_millis(2000);
-
 /// Health reports age out three contract periods (1500 ms) after receipt:
 /// one missed report is transport jitter, three in a row is a producer gone
 /// quiet, and the panel falls to not-reporting rather than latching.
 pub const HEALTH_STALE_AFTER: Duration = HEALTH_REPORT_PERIOD.saturating_mul(3);
 
-/// Alerts age out three re-emit periods (6000 ms) after receipt, the same
-/// three-missed-periods patience as [`HEALTH_STALE_AFTER`].
-pub const ALERT_STALE_AFTER: Duration = ALERT_REEMIT_PERIOD.saturating_mul(3);
+/// The alert contract's producer cadence ceiling: every producer publishes
+/// its active set at least this often while it runs.
+const ALERT_SET_PERIOD: Duration = Duration::from_millis(2000);
+
+/// A producer's alert set ages out three cadence periods (6000 ms) after
+/// receipt, the same three-missed-periods patience as [`HEALTH_STALE_AFTER`].
+/// An aged-out set means the producer went quiet and its conditions are
+/// unknown; the contract says only an omitted entry says cleared.
+pub const ALERT_STALE_AFTER: Duration = ALERT_SET_PERIOD.saturating_mul(3);
 
 /// Slack allowed between a wire timestamp and this consumer's clock before the
 /// timestamp counts as pre-aged. Producers timestamp from the daemon-resolved clock
@@ -302,9 +308,8 @@ pub const ALERT_STALE_AFTER: Duration = ALERT_REEMIT_PERIOD.saturating_mul(3);
 /// disagreement.
 pub const TIMESTAMP_SKEW_ALLOWANCE: Duration = Duration::from_millis(500);
 
-/// A report's receipt time plus the fixed window it stays renderable for:
-/// the one aging rule shared by health reports and alerts. Anything older
-/// than its window stopped being re-emitted and drops instead of latching.
+/// A report's receipt time plus the fixed window it stays renderable for.
+/// A report older than its window has a quiet producer and drops.
 #[derive(Clone, Copy, Debug)]
 pub struct Validity {
     received_at: Instant,
@@ -317,10 +322,6 @@ impl Validity {
             received_at,
             live_for,
         }
-    }
-
-    pub fn received_at(self) -> Instant {
-        self.received_at
     }
 
     pub fn is_live_at(self, now: Instant) -> bool {
@@ -352,21 +353,22 @@ pub fn parse_timestamp_validity(
     Ok(Validity::new(received_at, live_for))
 }
 
-/// One operator alert, identified by (producer, source, kind): the producer
-/// raises it with a non-zero severity, re-emits actives inside the
-/// contract's re-emit ceiling, and retires it with severity 0. One not
-/// re-emitted within [`ALERT_STALE_AFTER`] has a quiet producer and drops
-/// instead of latching. The producer is part of the identity because source
-/// and kind are wire strings: without it, one producer could replace or
-/// clear another's alert.
-#[derive(Clone, Debug)]
+/// One operator alert as its producer listed it.
+///
+/// The producer is not a field: a set belongs to the producer it is filed
+/// under, which is the transport-authenticated instance rather than a wire
+/// string, so no producer can replace or clear another's alert.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Alert {
-    /// The transport-authenticated producing instance, not a wire string.
-    pub producer: String,
     pub source: String,
-    pub kind: String,
-    pub severity: u8,
+    pub severity: AlertSeverity,
     pub message: String,
+}
+
+/// One producer's active set, with the window it stays renderable for.
+#[derive(Clone, Debug)]
+pub struct AlertSet {
+    pub alerts: Vec<Alert>,
     pub validity: Validity,
 }
 
@@ -475,24 +477,22 @@ impl UiState {
             created_at: Instant::now(),
             health_bound: false,
             alerts_bound: false,
-            alerts: Vec::new(),
+            alerts: BTreeMap::new(),
             status: "ready".to_string(),
         }
     }
 
-    /// Fold one received alert in: replace the (producer, source, kind)
-    /// entry, or remove it on a severity-0 clear. Entries that outlived
-    /// their validity window are purged here too, keyed on the incoming
-    /// receipt time, so the list stays bounded even when sources vary.
-    pub fn apply_alert(&mut self, alert: Alert) {
-        self.alerts.retain(|a| {
-            let replaced =
-                a.producer == alert.producer && a.source == alert.source && a.kind == alert.kind;
-            !replaced && a.validity.is_live_at(alert.validity.received_at())
-        });
-        if alert.severity > 0 {
-            self.alerts.push(alert);
-        }
+    /// Replaces `producer`'s set with the one it published.
+    pub fn apply_alert_set(&mut self, producer: ProducerRef, set: AlertSet) {
+        self.alerts.insert(producer, set);
+    }
+
+    /// Keeps the sets of `producers`, the ones the alerts slot holds, and
+    /// records whether the slot holds any producer at all.
+    pub fn retain_alert_producers(&mut self, producers: &[ProducerRef]) {
+        self.alerts
+            .retain(|producer, _| producers.contains(producer));
+        self.alerts_bound = !producers.is_empty();
     }
 
     pub fn set_status(&mut self, message: impl Into<String>) {

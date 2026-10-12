@@ -32,16 +32,15 @@ from so101_follower.health import (
     EWMA_TAU_S,
     HEALTH_RATE_HZ,
     SILENT_AFTER_MISSED_READS,
-    Alert,
+    AlertSet,
     AlertTracker,
+    Bands,
     SustainedLoads,
     assess,
 )
 
 runtime.configure("so101_follower")
 
-# Re-emission cadence of active alerts, inside the contract's 2000 ms bound.
-_ALERT_REEMIT_S = 1.6
 # A health snapshot older than this many health periods means the device
 # thread is wedged; the stream then goes silent rather than republishing
 # stale readings under fresh timestamps.
@@ -109,22 +108,34 @@ async def _consume_setpoints(
 
 
 class _AlertBus:
-    """One publisher for every alert this node raises."""
+    """The publisher of this node's active alert set."""
 
     def __init__(self, publisher):
         self._publisher = publisher
         self._failing = runtime.Latch()
 
-    async def emit(self, alert: Alert) -> None:
+    async def emit(self, owed: AlertSet) -> bool:
+        """Publishes the set; False when the publish failed."""
         try:
             await self._publisher.publish(
                 alerts_topic.build_message(
-                    _now_s(), alert.source, alert.kind, alert.severity, alert.message
+                    _now_s(),
+                    [
+                        alerts_topic.MessageActiveItem(
+                            source=alert.source,
+                            kind=alert.kind,
+                            severity=alert.severity,
+                            message=alert.message,
+                        )
+                        for alert in owed.alerts
+                    ],
                 )
             )
             self._failing.clear()
+            return True
         except Exception as e:
             self._failing.trip(f"alert publish failing: {e!r}")
+            return False
 
 
 async def _stream_health(
@@ -136,11 +147,11 @@ async def _stream_health(
 ):
     publisher = await motor_health_topic.declare_publisher(node_runner)
     sustained = SustainedLoads(EWMA_TAU_S)
+    bands = Bands()
     tracker = AlertTracker(f"so101_follower {config.robot_id}")
     period_s = 1.0 / HEALTH_RATE_HZ
     failing = runtime.Latch()
     last_readings_stamp = 0.0
-    last_reemit_monotonic = time.monotonic()
     async for _ in runtime.ticks(period_s, token):
         now = time.monotonic()
         snapshot = device.latest_health()
@@ -167,6 +178,7 @@ async def _stream_health(
             snapshot.fault_bits,
             sustained.current(),
             bus_silent,
+            bands,
         )
         try:
             await publisher.publish(
@@ -188,14 +200,9 @@ async def _stream_health(
         except Exception as e:
             failing.trip(f"motor_health publish failing: {e!r}")
 
-        for alert in tracker.transitions(report):
-            await alert_bus.emit(alert)
-        # Wall-clock gated: slipped ticks must not stretch the cadence past
-        # the contract's 2000 ms ceiling.
-        if now - last_reemit_monotonic >= _ALERT_REEMIT_S:
-            last_reemit_monotonic = now
-            for alert in tracker.active():
-                await alert_bus.emit(alert)
+        owed = tracker.due(report)
+        if owed is not None and await alert_bus.emit(owed):
+            tracker.mark_sent(owed)
 
 
 def _bus_age_s(device: DeviceLoop) -> float:

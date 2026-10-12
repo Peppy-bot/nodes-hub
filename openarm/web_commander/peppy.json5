@@ -102,8 +102,9 @@
       // slots. Producing these is what lets the panel drive an enabled
       // arm/gripper continuously instead of one move at a time; the backbone
       // governs each and re-streams the governed value, so a follower clamps
-      // and rate-limits on its side. The governor control is re-published
-      // periodically (lossy QoS) so a dropped toggle cannot strand the backbone.
+      // and rate-limits on its side. The governor control is a latched
+      // setting: it goes out when the operator moves one, and the topic
+      // retains the newest message for a backbone that starts later.
       emits: [
         { link_id: "left_arm", name: "joint_setpoints" },
         { link_id: "right_arm", name: "joint_setpoints" },

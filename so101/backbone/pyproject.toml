@@ -29,6 +29,13 @@ testpaths = ["tests"]
 pythonpath = ["src"]
 asyncio_mode = "auto"
 
+[tool.uv]
+# The kinematics run on placo 0.9.15, which requires pin 3.4.0. pin's wheels
+# link urdfdom 4 and tinyxml2 10 (liburdfdom_sensor.so.4.0), but pin sets no
+# upper bound on either, so a newer cmeel-urdfdom or cmeel-tinyxml2 makes
+# so101_description.kinematics fail to import.
+constraint-dependencies = ["cmeel-urdfdom<5", "cmeel-tinyxml2<11"]
+
 [tool.uv.sources]
 peppygen = { path = ".peppy/libs/peppygen" }
 peppylib = { path = ".peppy/libs/peppylib" }

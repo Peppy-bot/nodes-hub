@@ -15,7 +15,8 @@
 // In a simulation it also joins the scene: it attaches as this robot, naming
 // the copy it runs as, the model to stand and where, and holds that goal for
 // as long as the robot is in the scene; the robot's limbs pair to the engine
-// through the backbone.
+// through the backbone. Its setup ends once the simulation stands the robot,
+// so the start of its copy ends only for a robot that stands.
 {
   peppy_schema: "node/v1",
   manifest: {
@@ -57,6 +58,13 @@
     container: {
       def_file: "apptainer.def",
     },
+    // In a simulation, the setup waits for the engine to accept the robot
+    // and then to stand it: the engine fetches the robot's files, which
+    // takes longest on a cold cache, builds its world again and places the
+    // robot. The two waits share this budget, less 5.5 s that the node
+    // keeps to leave the simulation when the robot does not stand, so the
+    // node fails with its own reason before peppy's limit.
+    setup_timeout_secs: 180,
     parameters: {
       // The robot's model id, as a simulation's catalogue names it, for
       // example "openarm_v2" or "so101". It is the model get_identity answers

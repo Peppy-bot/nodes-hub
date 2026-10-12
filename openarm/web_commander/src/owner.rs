@@ -29,8 +29,8 @@ use crate::pose::{
     joint_jog_tick,
 };
 use crate::state::{
-    ARM_DOF, Alert, ArmHealth, ArmTarget, BySide, GesturePhase, GesturePlayback, GripperHealth,
-    Proximity, RecordingEpisode, SIDES, Side, UiState,
+    ARM_DOF, ArmHealth, ArmTarget, BySide, GesturePhase, GesturePlayback, GripperHealth, Proximity,
+    RecordingEpisode, SIDES, Side, UiState,
 };
 use crate::ui::{
     Command, build_snapshot_json, clamp_to_limits, ee_speed_floored, gripper_limits, sane_duration,
@@ -78,7 +78,13 @@ pub enum Feedback {
         side: Side,
         health: GripperHealth,
     },
-    Alert(Alert),
+    /// The set a producer published.
+    AlertSet {
+        producer: peppylib::messaging::ProducerRef,
+        set: crate::state::AlertSet,
+    },
+    /// The producers the alerts slot holds, as of this delivery.
+    AlertProducers(Vec<peppylib::messaging::ProducerRef>),
     ArmGoalDone {
         side: Side,
         summary: String,
@@ -121,8 +127,10 @@ pub struct GripperFrame {
     pub max_effort: f64,
 }
 
-/// The operator's self-collision governor controls, streamed continuously (no deadman:
-/// the backbone must always know the operator's intent).
+/// The operator's self-collision governor controls, published when the
+/// operator moves one. The topic retains the newest message, so a backbone
+/// that starts later reads the controls in force without the operator
+/// touching anything.
 #[derive(Clone, Copy, Debug)]
 pub struct GovernorFrame {
     pub collision_enabled: bool,
@@ -241,6 +249,10 @@ pub async fn run(
     };
     owner.state.recorder.available = record::available(&owner.runner);
     owner.state.health_bound = crate::motor_health::available(&owner.runner);
+    // The slot's membership as it stands before the alert listener's first
+    // delivery, so the opening snapshot says whether anything is wired. From
+    // then on `Feedback::AlertProducers` carries it, and a producer that
+    // joins later flips it.
     owner.state.alerts_bound = crate::alerts::available(&owner.runner);
 
     // Publish the starting frame and snapshot before the first tick, so the publishers
@@ -714,8 +726,11 @@ impl Owner {
             Feedback::MotorHealth { side, health } => {
                 self.state.health[side] = Some(*health);
             }
-            Feedback::Alert(alert) => {
-                self.state.apply_alert(alert);
+            Feedback::AlertSet { producer, set } => {
+                self.state.apply_alert_set(producer, set);
+            }
+            Feedback::AlertProducers(producers) => {
+                self.state.retain_alert_producers(&producers);
             }
             Feedback::ArmGoalDone { side, summary } => {
                 self.state.arms[side].in_flight = false;
@@ -1060,6 +1075,7 @@ fn apply_jog(s: &mut UiState, side: Side, adv: JogAdvance) {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::pose::CartesianJog;
     use openarm_description::HardwareVersion;

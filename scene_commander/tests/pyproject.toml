@@ -10,7 +10,7 @@ dependencies = [
     "aiohttp",
     # What the endpoint tests read the node's peppy.json5 with, so the runner
     # they announce on refuses a label the manifest does not declare.
-    "pyjson5==2.0.0",
+    "pyjson5==2.0.1",
 ]
 
 [dependency-groups]

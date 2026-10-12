@@ -101,9 +101,8 @@ fn fractions(state: &GripperState, ratings: Ratings) -> (f64, f64) {
 /// Publish health and alerts until shutdown, plus one final round after
 /// cancellation.
 ///
-/// The health message and the alert batch fail independently: a bad health
-/// round must not swallow the alert transitions or the heartbeat re-emits
-/// that keep alerts alive on consumer panels, and vice versa.
+/// The health message and the alert set fail independently: a bad health
+/// round must not swallow a changed alert set, and vice versa.
 ///
 /// The final round re-reads and re-judges the driver cache, flushing the
 /// fault verdict the follow loop wrote there before cancelling the node.
@@ -125,7 +124,7 @@ pub async fn run(
     };
     let stale_after = drive::ticks_within(STATE_STALE_AFTER, cycle_period);
     let mut filter = MotorHealthFilter::new(ratings);
-    let mut raiser = AlertRaiser::new(vec![alert_source]);
+    let mut raiser = AlertRaiser::new([alert_source]);
     let mut ticker = tokio::time::interval(HEALTH_PERIOD);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut health_warn = LatchedWarn::new("motor_health publish");
@@ -214,45 +213,41 @@ async fn publish_report(
     }
 }
 
-/// Publish the alert transitions and heartbeat re-emits this report owes.
-/// Alerts commit per successful publish ([`AlertRaiser::mark_sent`]): a
-/// failed send stays owed and retries next round, and the heartbeat
-/// commits only when the whole round went out.
+/// Publish the alert set this report owes: the motor's condition changed, or
+/// the floor elapsed since the last set went out. The set commits per
+/// successful publish ([`AlertRaiser::mark_sent`]): a failed send stays owed
+/// and retries next round.
 async fn publish_due_alerts(
     publisher: &peppylib::TopicPublisher,
-    raiser: &mut AlertRaiser,
+    raiser: &mut AlertRaiser<1>,
     report: &MotorHealth,
     warn: &mut LatchedWarn,
 ) {
     let now = Instant::now();
-    let batch = raiser.due(std::slice::from_ref(report), now);
-    let mut all_sent = true;
-    for pending in &batch.items {
-        let result = async {
-            let msg = alerts::build_message(
-                capture_timestamp()?,
-                pending.alert.source.clone(),
-                MOTOR_ALERT_KIND.to_string(),
-                pending.alert.severity,
-                pending.alert.message.clone(),
-            )
-            .map_err(|e| e.to_string())?;
-            publisher.publish(msg).await.map_err(|e| e.to_string())
-        }
-        .await;
-        match result {
-            Ok(()) => {
-                raiser.mark_sent(pending);
-                warn.success();
-            }
-            Err(e) => {
-                all_sent = false;
-                warn.failure(&e);
-            }
-        }
+    let Some(set) = raiser.due(std::array::from_ref(report), now) else {
+        return;
+    };
+    let result = async {
+        let active = set
+            .alerts()
+            .iter()
+            .map(|alert| alerts::MessageActiveItem {
+                source: alert.source.clone(),
+                kind: MOTOR_ALERT_KIND.to_string(),
+                severity: alert.severity.wire(),
+                message: alert.message.clone(),
+            })
+            .collect();
+        let msg = alerts::build_message(capture_timestamp()?, active).map_err(|e| e.to_string())?;
+        publisher.publish(msg).await.map_err(|e| e.to_string())
     }
-    if batch.heartbeat && all_sent {
-        raiser.mark_heartbeat(now);
+    .await;
+    match result {
+        Ok(()) => {
+            raiser.mark_sent(&set, now);
+            warn.success();
+        }
+        Err(e) => warn.failure(&e),
     }
 }
 

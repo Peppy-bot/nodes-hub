@@ -11,7 +11,7 @@ srs_model = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = 
 control_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "control_core" }
 # The version public-peppy-libs uses, so the velocity limits come from the
 # same parser as the backbone's, and one urdf-rs is built.
-urdf-rs = "0.9"
+urdf-rs = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
