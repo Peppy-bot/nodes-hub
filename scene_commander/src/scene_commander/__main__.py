@@ -769,11 +769,13 @@ async def _action_apply_force(node_runner: NodeRunner, payload: dict) -> dict:
 
 
 async def _action_move_object(node_runner: NodeRunner, payload: dict) -> dict:
-    # The panel moves an object without turning it.
+    # The panel moves an object to a position, without turning it or
+    # snapping it to a belt end.
     request = move_object.GoalRequest(
         object_id=str(payload["object_id"]),
         position=[float(value) for value in payload["position"]],
         orientation=None,
+        snap_to=None,
     )
 
     data = await _run_action(
@@ -1072,11 +1074,13 @@ def _spawn_request(payload: dict):
         asset_id=_name(payload, "asset_id"),
         position=_vector(payload, "position", 3),
         yaw=_optional(_number, payload, "yaw", 0.0),
-        # The panel turns an object by its yaw alone.
+        # The panel turns an object by its yaw alone, at its position, and
+        # snaps it to no belt end.
         orientation=None,
         scale=_optional(_number, payload, "scale", 1.0),
         physics=_optional(_physics, payload, "physics", "none"),
         mass=_optional(_number, payload, "mass", 0.1),
+        snap_to=None,
     )
 
 

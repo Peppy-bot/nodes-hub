@@ -892,13 +892,25 @@ def test_spawn_object_reports_the_minted_object_id(commander, caplog):
     # its yaw alone and names no orientation.
     assert spawn.goals == [SimpleNamespace(
         asset_id="props/blocks/red_block", position=[0.5, 0.0, 0.8], yaw=0.0, orientation=None, scale=1.0,
-        physics="dynamic", mass=0.2,
+        physics="dynamic", mass=0.2, snap_to=None,
     )]
     assert _node_log(commander, caplog) == [(
         logging.INFO,
         "spawn_object(asset_id=props/blocks/red_block, position=[0.5, 0.0, 0.8], yaw=0.0, physics=dynamic, "
         "mass=0.2): spawn_object done",
         None,
+    )]
+
+
+def test_a_move_names_its_position_alone(commander):
+    status, _, _ = _call(commander, lambda client: _stream(client, "/api/objects/move", {
+        "object_id": "obj_1", "position": [1, 0, 0],
+    }))
+
+    assert status == 200
+    # The panel turns nothing and snaps nothing to a belt end.
+    assert commander.actions.move_object.goals == [SimpleNamespace(
+        object_id="obj_1", position=[1.0, 0.0, 0.0], orientation=None, snap_to=None,
     )]
 
 
@@ -919,7 +931,7 @@ def test_a_spawn_naming_only_its_asset_and_position_takes_the_defaults(commander
     assert status == 200
     assert commander.actions.spawn_object.goals == [SimpleNamespace(
         asset_id="props/furniture/desk", position=[1.0, 0.0, 0.0], yaw=0.0, orientation=None, scale=1.0,
-        physics="none", mass=0.1,
+        physics="none", mass=0.1, snap_to=None,
     )]
 
 
