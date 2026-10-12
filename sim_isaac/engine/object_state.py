@@ -63,6 +63,14 @@ class ObjectStateSnapshot:
     timestamp_s: float
     objects: tuple[ObjectRecord, ...]
 
+    def record_of(self, object_id: str) -> ObjectRecord | None:
+        """The record of the object `object_id`, or None when the capture
+        holds no such object."""
+        return next(
+            (record for record in self.objects if record.object_id == object_id),
+            None,
+        )
+
 
 def object_prim_path(object_id: str) -> str:
     return f"{RUNTIME_OBJECTS_PATH}/{object_id}"

@@ -3,7 +3,6 @@ removing objects, what each does to the cached physics views, and which
 runtime commands may touch an object scene_manipulation spawned."""
 
 import importlib.util
-import math
 import logging
 import sys
 from pathlib import Path
@@ -12,17 +11,13 @@ from unittest.mock import Mock
 
 import pytest
 
+from _scene_actions import scene_actions_module
 from _world import world_module
 
 _ENGINE_DIR = Path(__file__).resolve().parents[1] / "engine"
 _SCENE = "/World/RuntimeScene"
 _OBJECTS = "/World/RuntimeObjects"
 _ASSET_ROOT = "https://assets.example/Isaac/6.1"
-_ACTIONS = ("apply_force", "clear_scene", "load_scene", "move_object", "move_robot", "remove_object", "spawn_object")
-_SERVICES = {
-    "scene": ("get_assets_list", "get_asset_categories", "get_objects_list", "get_robots_list", "get_scene"),
-    "objects": ("get_object_states",),
-}
 _PROPS = {
     "props/blocks/red_block": {
         "asset_id": "props/blocks/red_block", "display_name": "red block", "kind": "object",
@@ -265,27 +260,7 @@ class StageReader:
 @pytest.fixture
 def scene_manipulation(scene, monkeypatch):
     """The real scene_manipulation provider as the launcher's, reading the fake stage."""
-    actions = ModuleType("peppygen.exposed_actions.scene")
-    for name in _ACTIONS:
-        setattr(actions, name, ModuleType(f"{actions.__name__}.{name}"))
-    modules = {
-        "peppygen": ModuleType("peppygen"),
-        "peppygen.exposed_actions": ModuleType("peppygen.exposed_actions"),
-        actions.__name__: actions,
-        "peppygen.exposed_services": ModuleType("peppygen.exposed_services"),
-    }
-    for link, names in _SERVICES.items():
-        services = ModuleType(f"peppygen.exposed_services.{link}")
-        for name in names:
-            setattr(services, name, ModuleType(f"{services.__name__}.{name}"))
-        modules[services.__name__] = services
-    for name, module in modules.items():
-        monkeypatch.setitem(sys.modules, name, module)
-    spec = importlib.util.spec_from_file_location("_scene_manipulation_under_test", _ENGINE_DIR / "scene_actions.py")
-    module = importlib.util.module_from_spec(spec)
-    # Its dataclass resolves postponed annotations through sys.modules.
-    monkeypatch.setitem(sys.modules, spec.name, module)
-    spec.loader.exec_module(module)
+    module = scene_actions_module(monkeypatch, "_scene_manipulation_under_test")
 
     world = Mock(spec=["robots"])
     world.robots.return_value = []

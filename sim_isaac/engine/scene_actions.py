@@ -26,6 +26,7 @@ from peppygen.exposed_services.objects import get_object_states
 from peppygen.exposed_services.scene import (
     get_asset_categories,
     get_assets_list,
+    get_object,
     get_objects_list,
     get_robots_list,
     get_scene,
@@ -171,6 +172,37 @@ def _public_catalogue(assets) -> list[dict]:
     return public
 
 
+# The state fields of a get_object answer, each present only for an object
+# whose asset simulates it. This stage simulates none of them.
+_NO_OBJECT_STATE = {
+    "bounds": None,
+    "breakage": None,
+    "contents": None,
+    "membranes": None,
+    "crush": None,
+    "heat": None,
+    "heaters": None,
+}
+
+
+def _refused_object(message: str) -> get_object.Response:
+    """A get_object answer that names no object, with the reason: every
+    other field carries nothing."""
+
+    return get_object.Response(
+        success=False,
+        message=message,
+        timestamp=0.0,
+        object_id="",
+        asset_id="",
+        position=[0.0, 0.0, 0.0],
+        orientation=[0.0, 0.0, 0.0, 0.0],
+        scale=0.0,
+        landmarks=[],
+        **_NO_OBJECT_STATE,
+    )
+
+
 @dataclass
 class _PendingCommand:
     operation: str
@@ -240,9 +272,9 @@ class SceneActionIO:
 
     Scene edits run on the Isaac thread in submission order. Object state is
     captured there too, from the registry of spawned objects and the engine,
-    and get_object_states answers the latest capture. A load_scene or
-    spawn_object goal reports its progress on its feedback
-    (_submit_reporting_progress).
+    and get_object_states, get_objects_list and get_object answer the latest
+    capture. A load_scene or spawn_object goal reports its progress on its
+    feedback (_submit_reporting_progress).
     """
 
     def __init__(
@@ -321,6 +353,7 @@ class SceneActionIO:
             (get_assets_list, self._handle_get_assets),
             (get_asset_categories, self._handle_get_asset_categories),
             (get_objects_list, self._handle_get_objects_list),
+            (get_object, self._handle_get_object),
             (get_scene, self._handle_get_scene),
             (get_object_states, self._handle_get_object_states),
             (get_robots_list, self._handle_get_robots),
@@ -576,6 +609,46 @@ class SceneActionIO:
             message=f"{len(objects)} objects",
             timestamp=snapshot.timestamp_s,
             objects=objects,
+        )
+
+    def _handle_get_object(
+        self,
+        request,
+    ) -> get_object.Response:
+        """One spawned object from the latest capture: its pose and its
+        scale, as get_objects_list lists them. This stage keeps no landmark
+        and simulates no state of an object, so landmarks is empty and no
+        state field is present. An object_id that names no spawned object is
+        refused."""
+
+        object_id = request.data.object_id
+
+        with self._lock:
+            snapshot = self._snapshot
+            unavailable = self._unavailable
+
+        if snapshot is None:
+            return _refused_object(unavailable)
+
+        record = snapshot.record_of(object_id)
+
+        if record is None:
+            return _refused_object(f"Unknown object_id: {object_id}")
+
+        return get_object.Response(
+            success=True,
+            message=(
+                f"pose and scale of {object_id}; Isaac keeps no landmark "
+                "and simulates no state of an object"
+            ),
+            timestamp=snapshot.timestamp_s,
+            object_id=record.object_id,
+            asset_id=record.asset_id,
+            position=list(record.position),
+            orientation=list(record.orientation),
+            scale=record.scale,
+            landmarks=[],
+            **_NO_OBJECT_STATE,
         )
 
     def _handle_get_scene(

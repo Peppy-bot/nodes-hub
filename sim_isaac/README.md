@@ -340,10 +340,15 @@ and `query` its request sets, and `get_asset_categories` counts it per
 category. `get_objects_list` lists every object scene_manipulation spawned
 with its pose as of the latest capture, each in its asset's category and
 with the source `spawned`: an environment places no object of its own, so
-the source `scene` lists nothing. A `spawn_object` or `move_object` goal
-that carries an `orientation`, a unit quaternion `[x, y, z, w]`, stands the
-object turned to it, whatever the spawn's `yaw`; a move without one keeps
-the orientation the object has.
+the source `scene` lists nothing. `get_object` answers one of those objects
+from the same capture: its pose and its scale, as `get_objects_list` lists
+them. Isaac keeps no landmark and simulates no state of an object, so
+`landmarks` is empty and no state field is present. An object id that names
+no spawned object is refused, and before the first capture `get_object`
+answers as `get_objects_list` does: unavailable, with the reason. A
+`spawn_object` or `move_object` goal that carries an `orientation`, a unit
+quaternion `[x, y, z, w]`, stands the object turned to it, whatever the
+spawn's `yaw`; a move without one keeps the orientation the object has.
 
 ### Progress of a load or a spawn
 
