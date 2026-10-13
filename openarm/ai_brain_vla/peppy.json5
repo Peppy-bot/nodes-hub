@@ -113,12 +113,15 @@
       // ~/.config/openarm_ai_brain_vla/gemini_api_key of the daemon user.
       // "none" takes no model and refuses to load with one.
       perception_model: { $type: "string", $default: "" },
-      // An enrolment gallery for "sam3_siglip": a directory the container
-      // can see holding a harvester dataset (manifest.json, classes.txt,
-      // prompts.txt) with pictures of particular items, which then take
-      // their own names before the vocabulary's. Empty is no gallery, and
-      // the node ships none. The other backends take none and refuse to
-      // load with one.
+      // An enrolment gallery for "sam3_siglip": pictures of particular
+      // items, which then take their own names before the vocabulary's
+      // when the picture and the words agree. Either the name of an
+      // enrolment the node ships, "waldo_catalogue" (the simulation's table
+      // objects, as SigLIP prototypes; the simulation launchers select it),
+      // or a directory the container can see holding such prototypes or a
+      // harvester dataset (manifest.json, classes.txt, prompts.txt) to
+      // embed at load. Empty is no gallery, the robot's default. The other
+      // backends take none and refuse to load with one.
       perception_gallery: { $type: "string", $default: "" },
       // The confidence a detection is kept at, 0 for the backend's own. For
       // sam3_siglip it is objectness times naming probability, 0.25 by

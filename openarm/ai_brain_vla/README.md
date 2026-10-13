@@ -72,14 +72,31 @@ downloaded.
   nearly as much as the vocabulary's nearest name, so a bowl is not returned
   for "mug". Its label is the description.
 - **An enrolment gallery**, optional, gives particular items their own names.
-  `perception_gallery` names it: a directory the container can see holding a
-  harvester dataset (`manifest.json` with the frames and every item's box in
-  them, `classes.txt`, and `prompts.txt` with the words each item is named
-  by). A box that resembles an enrolled item's pictures (cosine 0.80 or more
-  to its prototype) takes the item's name before the vocabulary's, and a
+  `perception_gallery` names it, and the robot's default is none. In a scan a
+  box takes an enrolled item's name only when two things agree: it resembles
+  the item's pictures (cosine 0.80 or more to its SigLIP prototype), and by
+  text it resembles the item's words at most 0.03 less than the vocabulary's
+  nearest name. Picture-to-picture and picture-to-text similarities are not
+  on one scale, so the second check compares text with text, the way an
+  identify search does; without it an unknown object nearest an enrolled
+  picture took that item's exact name. A box nearest an enrolled picture of
+  the robot's own arm or gripper, or of the empty table, is dropped. A
   description naming an enrolled item is searched the scan's way with that
-  name added to SAM 3's prompt. A directory that is not a gallery fails the
-  load, and every search is refused naming the reason.
+  name added to SAM 3's prompt. Two forms:
+  - **`waldo_catalogue`, shipped in the node**: the 117 table objects of the
+    simulation's catalogue as prototypes (`perception/enrolments/waldo_catalogue`,
+    272 kB: `prototypes.npz`, `classes.txt`, `prompts.txt`, and `gallery.json`
+    naming the SigLIP checkpoint that made them, their source and the three
+    background rows). The simulation launchers select it under Waldo, since a
+    rendered mesh's look is what the general words miss; a real robot runs
+    without it, real objects being what SigLIP's words were trained on.
+    `tools/build_enrolment.py` rebuilds it from a gallery pack or a harvest,
+    and the brain refuses prototypes another checkpoint made.
+  - **A directory the container can see**, holding either the same four files
+    or a harvester dataset to embed at load (`manifest.json` with the frames
+    and every item's box in them, `classes.txt`, `prompts.txt`). A directory
+    that is neither fails the load, and every search is refused naming the
+    reason.
 
 ## Every search keeps a deadline
 
@@ -102,8 +119,9 @@ the wait and another call.
   weights, as transformers saves a model, empty being the pinned weights the
   node downloads; a name that is not a directory fails the load before
   anything is downloaded. For `gemini_er` the model id.
-- `perception_gallery`: the enrolment gallery of `sam3_siglip`, above; empty
-  is none. The other backends refuse to load with one.
+- `perception_gallery`: the enrolment gallery of `sam3_siglip`, above: empty
+  is none, `waldo_catalogue` the one the node ships, else a directory the
+  container can see. The other backends refuse to load with one.
 - `perception_confidence`: the confidence a detection is kept at, 0 for the
   backend's own. For `sam3_siglip` it is objectness times naming probability,
   0.25 by default; lower finds more items and more boxes on the robot's own
@@ -200,7 +218,11 @@ about 6 GB, Waldo the rest), peppy 0.31 or later with `nodes-hub` and
 `launchers-hub` registered, network for the first launch (the container build
 fetches torch and the model libraries, and the brain's first load downloads
 about 7 GB of weights from Hugging Face), and Chrome for Waldo's viewer.
-Nothing else: no dataset, no gallery, no key unless Gemini is tried.
+Nothing else: no dataset, no gallery to fetch, no key unless Gemini is tried.
+Under Waldo the launch enrols the catalogue's objects from the prototypes the
+node ships, so a scan reports them under the catalogue's names ("mustard
+bottle", "cracker box"); anything else, and everything on a real robot, is
+named by words.
 
 ### 1. Register the hubs
 
@@ -228,8 +250,8 @@ minute and refuses searches as "still loading" until it is ready. Its log is
 `~/.peppy/logs/run/alpha_brain_inst.log`: it says how far a download is,
 and two lines there say the brain is set: the camera's answer, `[brain] camera
 geometry: 1280x720 fx 738.1 fy 738.1 cx 639.5 cy 359.5 none`, and the backend's,
-`[brain] sam3_siglip: a vocabulary of 1198 names, no enrolment gallery, on
-cuda`. Then each goal of `brain.scan_items`, `brain.identify_item`,
+`[brain] sam3_siglip: a vocabulary of 1198 names, 117 enrolled items from
+waldo_catalogue (prototypes by google/siglip-so400m-patch14-384), on cuda`. Then each goal of `brain.scan_items`, `brain.identify_item`,
 `brain.grab_item`, `brain.drop_item` and `brain.place_item` leaves one line
 there when it ends: how it ended and after how long, and for a search, the
 frame it looked at, how long before the search the camera took that frame,
@@ -310,7 +332,9 @@ items. A brain run this way is not on the MCP endpoint, so ask it through an
 ### 5. What to expect
 
 - A scan lists what stands on the table under general names ("can", "mug",
-  "bottle", "wrench") with positions from the depth under each box. Keep the
+  "bottle", "wrench") with positions from the depth under each box; under
+  Waldo the catalogue's objects carry their catalogue names ("mustard
+  bottle", "cracker box") from the enrolment the launch selects. Keep the
   objects inside the chest camera's view, about x 0.3 to 0.7 and y within
   0.25 of the centre line.
 - The robot's own gripper, when it stands in the chest camera's view, can be
@@ -342,6 +366,27 @@ vocabulary refuses 81% of the searches that return nothing: the crop looks
 more like another name of the vocabulary than like the searched words, often
 a more general name of the same thing ("bottle" for "alsace wine bottle",
 "potato" for "sweet potato") and, for glassware, "cylinder".
+
+#### The shipped enrolment, on the live table
+
+The same table seen by two brains on 7 October 2026 (peppy 0.31.10, Waldo):
+five catalogue objects the enrolment knows (mustard bottle, cracker box,
+Poly Haven apple and lemon, mug) and two it has never seen (a sketchfab egg,
+a conveyor cage panel). The stack's brain ran with `waldo_catalogue`, as the
+simulation launchers set it; a second brain beside it ran with no gallery.
+
+| | no gallery, words alone | `waldo_catalogue` |
+|---|---|---|
+| scan: the five enrolled objects | 3 found: mug 0.51, apple 0.51, cracker box as "packet" 0.30; mustard bottle and lemon not found | 5 found under their catalogue names: cracker box 0.86, mustard bottle 0.83, mug 0.83, apple 0.56, lemon 0.53 |
+| scan: the two unknown objects | egg as "potato" 0.48, panel as "wooden leg" 0.49 | the same two names and confidences: the referee leaves them to the vocabulary |
+| identify by catalogue name, the five | all five found, 0.94 to 0.98 | all five found, 0.84 to 0.98 |
+| identify by words ("yellow bottle", "red apple", "egg") | found | found |
+| identify "keyboard", not on the table | refused | refused |
+
+So the enrolment adds recall and exact names in a scan of the catalogue's
+objects, which is what the simulation's tests ask by, and changes nothing
+for an object it does not know; identify by name reaches the same items
+either way, through the words route.
 
 ## Tests
 

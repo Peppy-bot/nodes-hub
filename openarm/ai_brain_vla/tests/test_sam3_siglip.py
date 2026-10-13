@@ -8,7 +8,9 @@ import pytest
 
 from conftest import NEVER, PASSED
 from openarm_ai_brain_vla.perception import make_detector, weights
-from openarm_ai_brain_vla.perception.gallery import load_gallery
+from pathlib import Path
+
+from openarm_ai_brain_vla.perception.gallery import Gallery, load_gallery
 from openarm_ai_brain_vla.ports import Coverage, SearchTimeout
 from openarm_ai_brain_vla.perception.sam3_siglip import (
     BACKGROUND_PHRASES,
@@ -28,7 +30,7 @@ from openarm_ai_brain_vla.perception.sam3_siglip import (
     under_floor,
     unlike_the_words,
 )
-from test_gallery import write_harvest
+from test_gallery import write_enrolment, write_harvest
 
 # Every load finds the models' weights on the machine.
 pytestmark = pytest.mark.usefixtures("staged_weights")
@@ -377,10 +379,11 @@ def test_the_backend_downloads_nothing_but_weights_the_machine_lacks(tmp_path, n
     weights are on the machine: the vocabulary ships in the node, and a
     gallery is a directory the launch names."""
     assert len(load_vocabulary()) == 1198
-    detector = Sam3SiglipDetector(models_factory=FakeModels, vocabulary=VOCABULARY)
+    # Every crop looks like a cup and a coffee can at once, so the box is
+    # an enrolled item: the words agree, and of three prototypes that are
+    # one the first, the coffee can, names it.
+    detector = Sam3SiglipDetector(models_factory=looking_like(cup=1.0, coffee_can=1.0), vocabulary=VOCABULARY)
     detector.load("", str(write_harvest(tmp_path / "g")))
-    # Every crop of the harvest looks like the scan's box here, so the box
-    # is an enrolled item, the first of three prototypes that are one.
     assert detected(detector) == [("coffee can", 0.3)]
     assert detected(detector, ["banana"]) == [("coffee can", 0.3)]
     assert detected(detector, ["blue ball"]) == []
@@ -417,17 +420,51 @@ def test_an_enrolled_item_is_named_by_its_pictures_built_at_load(tmp_path):
             CountingModels.embedded += len(crops)
             return super().embed_images(crops)
 
+    CountingModels.looks_like = {"a photo of a cup": 1.0, "a photo of a coffee can": 1.0}
     detector = Sam3SiglipDetector(models_factory=CountingModels, vocabulary=VOCABULARY)
     detector.load("", str(write_harvest(tmp_path / "g")))
     # The three visible crops are embedded at load, one prototype per item;
     # every crop looks alike here, so the three prototypes are one and a
-    # box near them takes the first enrolled name.
+    # box near them takes the first enrolled name, the words agreeing.
     assert CountingModels.embedded == 3
     assert detector._prototypes is not None and detector._prototypes.shape == (3, DIM)
     assert detector._gallery.phrases == ("coffee can", "cracker box", "banana")
+    assert detector._enrolled_table.shape == (3, DIM)
     assert [label for label, _ in detected(detector)] == ["coffee can"]
     detected(detector, ["cracker box"])
     assert detector._models.prompts[-1] == GENERIC_PROMPTS + ("cracker box",)
+
+
+def test_shipped_prototypes_are_used_as_they_are_and_nothing_is_embedded_at_load(tmp_path):
+    class CountingModels(FakeModels):
+        embedded = 0
+
+        def embed_images(self, crops):
+            CountingModels.embedded += len(crops)
+            return super().embed_images(crops)
+
+    detector = Sam3SiglipDetector(models_factory=CountingModels, vocabulary=VOCABULARY)
+    detector.load("", str(write_enrolment(tmp_path / "e", dim=DIM)))
+    assert CountingModels.embedded == 0
+    assert detector._prototypes.shape == (4, DIM) and detector._enrolled_table.shape == (4, DIM)
+    # The words of every enrolled class were embedded, the referee's table.
+    assert {"a photo of a coffee can", "a photo of a cracker box", "a photo of a banana", "a photo of a robot arm"} <= set(detector._models.texts)
+    # The background row is not something a scan can name.
+    assert detector.scan_coverage() == Coverage(frozenset({"cup", "banana", "coffee can", "cracker box"}))
+
+
+def test_prototypes_made_by_another_siglip_are_refused_before_the_models(tmp_path):
+    made = []
+
+    def factory(sam3_directory, siglip_directory):
+        made.append(sam3_directory)
+        return FakeModels(sam3_directory, siglip_directory)
+
+    detector = Sam3SiglipDetector(models_factory=factory, vocabulary=VOCABULARY)
+    root = write_enrolment(tmp_path / "e", model="google/siglip-base-patch16-224", dim=DIM)
+    with pytest.raises(ValueError, match="made by google/siglip-base-patch16-224; this node names by google/siglip-so400m-patch14-384"):
+        detector.load("", str(root))
+    assert not detector.available and made == []
 
 
 def enrolled(detector, nearest: int) -> None:
@@ -440,15 +477,62 @@ def enrolled(detector, nearest: int) -> None:
     detector._prototypes = np.stack(rows)
 
 
-def test_a_box_like_an_enrolled_item_takes_its_name_before_the_vocabulary(tmp_path):
-    detector = Sam3SiglipDetector(models_factory=FakeModels, vocabulary=VOCABULARY)
+def test_a_box_like_an_enrolled_item_takes_its_name_when_the_words_agree(tmp_path):
+    # The crop looks like a cup and like a cracker box in equal measure, so
+    # by text the enrolled words are as near as the vocabulary's nearest
+    # name; with its prototype nearest too, the enrolled name wins.
+    detector = Sam3SiglipDetector(models_factory=looking_like(cup=1.0, cracker_box=1.0), vocabulary=VOCABULARY)
     detector.load("", str(write_harvest(tmp_path / "g")))
     enrolled(detector, nearest=1)    # the harvest's "cracker box"
     assert detected(detector) == [("cracker box", 0.9)]
 
 
-def test_a_box_unlike_every_enrolled_item_is_named_by_the_vocabulary(tmp_path):
+def test_a_box_near_an_enrolled_prototype_keeps_the_general_name_when_the_words_disagree(tmp_path):
+    # The referee: the crop is the cracker box's prototype itself, but by
+    # text it is a cup and not at all a cracker box, so an unknown object
+    # that merely resembles an enrolled picture is not given its exact name.
     detector = Sam3SiglipDetector(models_factory=FakeModels, vocabulary=VOCABULARY)
+    detector.load("", str(write_harvest(tmp_path / "g")))
+    enrolled(detector, nearest=1)
+    assert detected(detector) == [("cup", 0.9)]
+
+
+def test_a_box_unlike_every_enrolled_item_is_named_by_the_vocabulary(tmp_path):
+    detector = Sam3SiglipDetector(models_factory=looking_like(cup=1.0, cracker_box=1.0), vocabulary=VOCABULARY)
     detector.load("", str(write_harvest(tmp_path / "g")))
     enrolled(detector, nearest=-1)
     assert detected(detector) == [("cup", 0.9)]
+
+
+def test_a_box_nearest_a_background_prototype_is_dropped(tmp_path):
+    # The crop looks like a cup, and it is the enrolment's picture of the
+    # robot's own arm: that row names nothing, so the box is "none of these".
+    detector = Sam3SiglipDetector(models_factory=FakeModels, vocabulary=VOCABULARY)
+    detector.load("", str(write_enrolment(tmp_path / "e", dim=DIM)))
+    models = detector._models
+    rows = [models.axis(f"prototype {i}") for i in range(3)] + [models.embed_images([None])[0]]
+    detector._prototypes = np.stack(rows)
+    assert detected(detector) == []
+    # Away from every prototype, the same box is a cup again.
+    detector._prototypes = np.stack([models.axis(f"prototype {i}") for i in range(4)])
+    assert detected(detector) == [("cup", 0.9)]
+
+
+def test_the_referee_compares_text_with_text_on_the_two_tables():
+    from openarm_ai_brain_vla.perception.sam3_siglip import name_enrolled_first
+
+    gallery = Gallery(Path("."), ("mustard", "arm"), ("mustard bottle", "robot arm"), background=frozenset({1}))
+    e = np.eye(6, dtype=np.float32)
+    prototypes = np.stack([e[0], e[1]])                 # the mustard bottle's picture, the arm's picture
+    enrolled_table = np.stack([e[2], e[3]])             # "a photo of a mustard bottle", "a photo of a robot arm"
+    vocabulary_table = np.stack([e[4], e[5]])           # "bottle", "jar"
+    like = lambda *parts: normalised(sum(parts))
+    crops = np.stack([
+        like(3 * e[0], e[2], e[4]),    # the mustard picture (cosine 0.90), its words and "bottle" alike by text: enrolled
+        like(3 * e[0], e[4]),          # the mustard picture (0.95), but by text a plain bottle: the general name stands
+        like(3 * e[1], e[4]),          # the arm's picture: dropped
+        like(e[2], e[4]),              # far from every prototype: untouched
+    ])
+    names, probability = name_enrolled_first(crops, prototypes, gallery, ["bottle", "bottle", "bottle", "bottle"], np.full(4, 0.6), enrolled_table, vocabulary_table)
+    assert names == ["mustard bottle", "bottle", None, "bottle"]
+    assert probability[0] > 0.6 and list(probability[1:]) == [0.6, 0.6, 0.6]

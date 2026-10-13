@@ -16,11 +16,19 @@ a load that finds them reads no network.
   phrases and at most `VOCABULARY_MARGIN` less than the vocabulary's nearest
   name, so a bowl is not returned for "mug".
 - An enrolment gallery (gallery.py), named by `perception_gallery`, adds
-  pictures of particular items: a crop whose embedding is at
-  `SIMILARITY_FLOOR` or nearer an enrolled item's prototype takes that
-  item's name, and a description that names an enrolled item runs the scan
-  with the item's name added to SAM 3's prompt, the core picking the item
-  by name afterwards.
+  pictures of particular items, as prototypes the node ships
+  (`waldo_catalogue`, the simulation's table objects, which the simulation
+  launchers select) or as a directory to embed at load. In a scan a crop
+  takes an enrolled item's name only when two things agree: its embedding
+  is at `SIMILARITY_FLOOR` or nearer the item's prototype, and by text it
+  resembles the item's words at most `VOCABULARY_MARGIN` less than the
+  vocabulary's nearest name. Image-to-image and image-to-text cosines are
+  not on one scale, so the second check compares text with text, the way a
+  search does; without it an unknown object nearest an enrolled prototype
+  took that item's exact name. A crop nearest a background prototype (the
+  robot's arm or gripper, the empty table) is dropped. A description that
+  names an enrolled item runs the scan with the item's name added to SAM
+  3's prompt, the core picking the item by name afterwards.
 - `perception_model` names a directory the container can see holding other
   SAM 3 weights, as transformers saves a model; empty is the pinned ones.
 
@@ -258,15 +266,28 @@ def name_enrolled_first(
     gallery: Gallery,
     names: Sequence[Optional[str]],
     probability: np.ndarray,
+    enrolled_table: np.ndarray,
+    vocabulary_table: np.ndarray,
+    margin: float = VOCABULARY_MARGIN,
 ) -> tuple[list[Optional[str]], np.ndarray]:
-    """The names by words with every crop that resembles an enrolled item
-    (its best cosine at `SIMILARITY_FLOOR` or above) renamed after that
-    item."""
+    """The names by words, with a crop renamed after the enrolled item it
+    resembles when its best cosine to a prototype is at `SIMILARITY_FLOOR`
+    or above and, by text, it resembles that item's words (its row of
+    `enrolled_table`) at most `margin` less than the vocabulary's nearest
+    name; a crop nearest a background prototype is dropped, named None.
+    Otherwise the name by words stands."""
     best, enrolled_probability = name_by_prototypes(embeddings, prototypes, TEMPERATURE)
     near = ~under_floor(embeddings, prototypes)
+    nearest_word = (embeddings @ vocabulary_table.T).max(axis=1)
     out_names, out_probability = list(names), probability.copy()
     for i in np.flatnonzero(near):
-        out_names[i] = gallery.phrases[int(best[i])]
+        item = int(best[i])
+        if gallery.is_background(item):
+            out_names[i] = None
+            continue
+        if float(embeddings[i] @ enrolled_table[item]) < nearest_word[i] - margin:
+            continue
+        out_names[i] = gallery.phrases[item]
         out_probability[i] = enrolled_probability[i]
     return out_names, out_probability
 
@@ -412,6 +433,9 @@ class Sam3SiglipDetector:
         self._models: Optional[Models] = None
         self._gallery: Optional[Gallery] = None
         self._prototypes: Optional[np.ndarray] = None
+        # The text embeddings of the enrolled items' words, the referee of an
+        # enrolled name in a scan (see `name_enrolled_first`).
+        self._enrolled_table: Optional[np.ndarray] = None
         self._search: list[str] = []
         # The text table of the scan vocabulary, made once at load: a
         # description's table is made for its search and dropped with it.
@@ -429,14 +453,20 @@ class Sam3SiglipDetector:
         """Reads the enrolment gallery `gallery` names, if any, then loads
         the two models from their weights on the machine, which it downloads
         first when they are not there, SAM 3 from the directory `model`
-        names when that is set, and embeds the scan vocabulary and the
-        enrolled items' crops. A named gallery that cannot be read and a
-        `model` that is not a directory fail the load with the reason,
-        before anything is downloaded; so do weights that cannot be
-        downloaded and models that cannot be loaded."""
+        names when that is set, and embeds the scan vocabulary, the enrolled
+        items' words and, for a gallery of pictures, their crops; a gallery
+        of prototypes is used as it is. A named gallery that cannot be read,
+        prototypes another SigLIP checkpoint made and a `model` that is not
+        a directory fail the load with the reason, before anything is
+        downloaded; so do weights that cannot be downloaded and models that
+        cannot be loaded."""
         from PIL import Image
 
         enrolment = load_gallery(gallery)
+        if enrolment is not None and enrolment.model and enrolment.model != weights.SIGLIP.repository:
+            raise ValueError(
+                f"gallery {gallery.strip()} holds prototypes made by {enrolment.model}; this node names by {weights.SIGLIP.repository}"
+            )
         other_sam3 = other_sam3_weights(model)
         directory = weights.node_directory()
         sam3_directory = other_sam3 or weights.stage(weights.SAM3, directory)
@@ -445,13 +475,20 @@ class Sam3SiglipDetector:
             models = self._models_factory(sam3_directory, siglip_directory)
         except ImportError as error:
             raise RuntimeError(f"the sam3_siglip backend needs torch and transformers (the node's sam3-siglip extra): {error}") from error
-        prototypes = embed_prototypes(enrolment, models) if enrolment is not None else None
+        prototypes = enrolled_table = None
+        if enrolment is not None:
+            prototypes = enrolment.prototypes if enrolment.prototypes is not None else embed_prototypes(enrolment, models)
+            enrolled_table = text_table(models, enrolment.phrases)[: len(enrolment.phrases)]
         self._vocabulary_table = text_table(models, self.scan_vocabulary)
         # The first CUDA call pays for the kernels; take it here, not on the
         # first search.
         models.propose(Image.new("RGB", (64, 64)), GENERIC_PROMPTS)
-        self._gallery, self._models, self._prototypes = enrolment, models, prototypes
-        enrolled = f"{len(enrolment.classes)} enrolled items from {enrolment.root}" if enrolment is not None else "no enrolment gallery"
+        self._gallery, self._models, self._prototypes, self._enrolled_table = enrolment, models, prototypes, enrolled_table
+        if enrolment is None:
+            enrolled = "no enrolment gallery"
+        else:
+            made = f"prototypes by {enrolment.model}" if enrolment.prototypes is not None else "prototypes built from its pictures"
+            enrolled = f"{len(enrolment.item_indices())} enrolled items from {gallery.strip()} ({made})"
         logger.info("sam3_siglip: a vocabulary of %d names, %s, on %s", len(self.scan_vocabulary), enrolled, models.device)
 
     def set_vocabulary(self, phrases: Sequence[str]) -> None:
@@ -462,7 +499,7 @@ class Sam3SiglipDetector:
         phrases when there is a gallery."""
         if self._models is None:
             return Coverage()
-        enrolled = self._gallery.phrases if self._gallery is not None else ()
+        enrolled = [self._gallery.phrases[i] for i in self._gallery.item_indices()] if self._gallery is not None else []
         return Coverage(frozenset(self.scan_vocabulary) | frozenset(enrolled))
 
     def detect(self, image: np.ndarray, deadline: Deadline) -> list[Box]:
@@ -491,6 +528,9 @@ class Sam3SiglipDetector:
             names = [None if far else name for name, far in zip(names, unlike)]
         else:
             names, probability = name_by_words(embeddings, self._vocabulary_table, plan.labels)
-            if self._gallery is not None and self._prototypes is not None:
-                names, probability = name_enrolled_first(embeddings, self._prototypes, self._gallery, names, probability)
+            if self._gallery is not None and self._prototypes is not None and self._enrolled_table is not None:
+                names, probability = name_enrolled_first(
+                    embeddings, self._prototypes, self._gallery, names, probability,
+                    self._enrolled_table, self._vocabulary_table[: len(self.scan_vocabulary)],
+                )
         return detections_from(boxes, objectness, names, probability, self.min_confidence)
