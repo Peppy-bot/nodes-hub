@@ -1,8 +1,10 @@
 """The per-tick motion authority: one loop resolves what the follower is told.
 
 Precedence per limb per tick: an admitted action plan owns the limb (streamed
-input is ignored while one runs); otherwise a fresh streamed leader target
-passes through under the end-effector-speed governor (the joints-led
+input is ignored while one runs), and a goal is admitted only while no leader
+target arrived within the deadman, so a streaming leader keeps the limb;
+otherwise a fresh streamed leader target passes through under the
+end-effector-speed governor (the joints-led
 stream's only limiter; the pose-mode stream's IK output is additionally
 rate-stepped per joint); otherwise silence, and the follower holds. The
 arm and the gripper claim independently, so a long arm move never freezes
@@ -75,7 +77,8 @@ class LatestValue:
 
     def __init__(self) -> None:
         self._value = None
-        self._stamp = 0.0
+        # When the value last arrived; None until one has.
+        self._stamp: float | None = None
         # The producer's capture timestamp (wire seconds), forwarded so the
         # downstream stamp names when the leader read the sample, not when
         # this node relayed it.
@@ -87,9 +90,13 @@ class LatestValue:
         self.wire_timestamp_s = wire_timestamp_s
 
     def fresh(self, timeout_s: float):
-        if self._value is None or time.monotonic() - self._stamp > timeout_s:
+        if self._value is None or not self.set_within(timeout_s):
             return None
         return self._value
+
+    def set_within(self, timeout_s: float) -> bool:
+        """Whether a value arrived within `timeout_s`, cleared since or not."""
+        return self._stamp is not None and time.monotonic() - self._stamp <= timeout_s
 
     def clear(self) -> None:
         self._value = None
@@ -244,6 +251,16 @@ class Coordinator:
     def arm_busy(self) -> bool:
         """Whether an arm goal holds the arm, from admission to release."""
         return self._arm_busy
+
+    def leader_streams_arm(self) -> bool:
+        """True while a leader's arm command arrived within the deadman. Reads
+        the arrival time, which goal boundaries do not clear, so a leader
+        keeps the arm across them."""
+        return self._upstream_arm.set_within(STALE_LEADER_TIMEOUT_S)
+
+    def leader_streams_gripper(self) -> bool:
+        """Whether a leader's gripper command arrived within the deadman."""
+        return self.leader_gripper.set_within(STALE_LEADER_TIMEOUT_S)
 
     # ------------------------------------------------------------------ anchors
 

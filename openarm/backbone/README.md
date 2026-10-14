@@ -54,6 +54,14 @@ fingers identically.
 7. **Publish** - governed setpoints to the follower slots, measured states
    relayed up the leader slots, and the proximity readout at ~20 Hz.
 
+The action handlers admit goals before the loop runs them. A goal on a limb
+that received a leader command within the last 250 ms is refused, so whoever
+is streaming the limb keeps it until the stream stops. A posture is refused
+while either arm is being streamed, and `check_arm_move` returns the same
+refusal. Releasing the headset's grip streams the measured pose for a quarter
+second, so a posture button pressed within about half a second of letting go
+is refused; a later press goes through.
+
 ## The governed pipeline
 
 `Governor::govern(prev, cand, measured, hands, dt)` runs six stages, each
@@ -119,11 +127,11 @@ field pose.
 
 | Action | Goal | Refused when |
 |---|---|---|
-| `move_arm_joints` | `arm_name`, 7 joint positions (rad), `duration_s` (the limb_motion contract) | non-finite, negative duration, out of joint limits, side busy |
-| `move_arm` | `arm_name`, robot-frame pose (position m + quaternion `[x, y, z, w]`), `duration_s` (the limb_motion contract) | non-finite, degenerate quaternion, negative duration, side busy |
-| `move_gripper` | `gripper_name`, opening fraction in [0, 1], `max_effort` (the limb_motion contract) | non-finite, out of range, negative effort cap, side busy |
-| `move_to_ready` | `duration_s` (the postures contract; both arms to the Ready posture) | non-finite, negative duration, over 600 s, either arm busy |
-| `move_to_home` | `duration_s` (the postures contract; both arms to the Home rest) | non-finite, negative duration, over 600 s, either arm busy |
+| `move_arm_joints` | `arm_name`, 7 joint positions (rad), `duration_s` (the limb_motion contract) | non-finite, negative duration, out of joint limits, a leader streaming the arm, side busy |
+| `move_arm` | `arm_name`, robot-frame pose (position m + quaternion `[x, y, z, w]`), `duration_s` (the limb_motion contract) | non-finite, degenerate quaternion, negative duration, a leader streaming the arm, side busy |
+| `move_gripper` | `gripper_name`, opening fraction in [0, 1], `max_effort` (the limb_motion contract) | non-finite, out of range, negative effort cap, a leader streaming the gripper, side busy |
+| `move_to_ready` | `duration_s` (the postures contract; both arms to the Ready posture) | non-finite, negative duration, over 600 s, a leader streaming either arm, either arm busy |
+| `move_to_home` | `duration_s` (the postures contract; both arms to the Home rest) | non-finite, negative duration, over 600 s, a leader streaming either arm, either arm busy |
 
 `arm_name`/`gripper_name`: `left_arm`/`right_arm` and `left_gripper`/`right_gripper`,
 an unknown name refused in the result. Every pose here, commanded or
@@ -177,8 +185,8 @@ goes on squeezing what it holds.
 the posture. The goal completes when both moves end. `success` says that
 both moves ran their time out, not that the arms arrived. The governor can
 hold an arm short, and the backbone does not see an arm that stops against
-an object. Thus the message of a success is `the move to ready ran its time`
-or `the move to home ran its time`.
+an object. The message of a success is `move to ready completed` or `move to
+home completed`.
 
 Whatever the terminal, the result gives the pose of each arm:
 
@@ -226,8 +234,9 @@ goal admitted after it runs. A leader's streamed setpoints are not stopped.
 a plan reaches the pose from the arm's held setpoint, with the time the
 move would take, without moving: the same validation, the same planner and
 the same refusal words as the goal (`goal pose not planned within ...`).
-It is refused while the arm executes a move, with the message a second
-goal gets, and it checks no collision with the robot or the room.
+It is refused while a leader streams the arm and while the arm executes a
+move, with the same message a goal would get, and it checks no collision with
+the robot or the room.
 
 Both are answered by the coordinator on the tick after the request, so
 they wait behind the readiness gate with the moves; a stop during the seed

@@ -679,6 +679,67 @@ async fn a_leader_command_fans_through_to_the_governed_arm_wire() -> peppygen::R
     harness.shutdown().await
 }
 
+/// A leader that is streaming has the limb: a goal on it is refused, and
+/// admitted once the stream has stopped for the streaming window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_goal_on_an_arm_a_leader_streams_waits_for_the_stream_to_stop() -> peppygen::Result<()> {
+    let (harness, mocks) = start_ready_vacant(params()).await?;
+    pump_is_ready(
+        mocks.deps.robot_init.is_ready,
+        Arc::new(AtomicBool::new(true)),
+    );
+    let mut followed = spawn_left_arm_follower(
+        mocks.pairings.left_arm.joint_states,
+        mocks.pairings.left_arm.joint_setpoints,
+    )
+    .followed;
+    pump_right_arm_and_grippers!(mocks);
+    await_streaming(mocks.pairings.right_arm.joint_setpoints).await?;
+    let leader = mocks.pairings.leader_left_arm.joint_setpoints;
+
+    // The leader bends the elbow. The command has landed once the governed
+    // wire moves toward it, which the listener notes before the chase can
+    // read the command; the republish on an empty read window covers a
+    // best-effort drop.
+    let mut target = HOME;
+    target[3] = 0.4;
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    leader.publish(&leader_command(target)).await?;
+    while followed.borrow()[3] - HOME[3] < 0.01 {
+        match tokio::time::timeout(READ_WINDOW, followed.changed()).await {
+            Ok(changed) => changed.expect("the left arm follower runs"),
+            Err(_) => leader.publish(&leader_command(target)).await?,
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the leader's command never reached the governed wire"
+        );
+    }
+    let refused = move_arm_joints::send_goal(
+        &harness,
+        &move_arm_joints::GoalRequestData {
+            arm_name: "left_arm".to_string(),
+            joint_positions: HOME,
+            duration_s: 0.2,
+        },
+        peppygen::QoSProfile::Reliable,
+        DEADLINE,
+    )
+    .await?;
+    assert!(!refused.accepted, "a streaming leader must keep the arm");
+    let reason = refused.reason.unwrap_or_default();
+    assert!(
+        reason.starts_with("a leader is streaming arm commands"),
+        "the refusal must say a leader streams: {reason}"
+    );
+
+    // The leader lets go: past the 250 ms streaming window, the arm takes
+    // the goal.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    complete_left_arm_joint_move(&harness, HOME, 0.2).await?;
+    harness.shutdown().await
+}
+
 /// Exposed action end-to-end: `move_arm_joints` through the real action
 /// engine, with the left arm mock playing a perfect follower (it adopts every
 /// governed setpoint as its measured state). The goal must be admitted, the
@@ -1416,8 +1477,8 @@ async fn a_posture_result_reports_each_arms_measured_grasp_point() -> peppygen::
     let ready = complete_posture!(harness, move_to_ready, 0.0);
     let home = complete_posture!(harness, move_to_home, 0.0);
     for (result, done) in [
-        (ready, "the move to ready ran its time"),
-        (home, "the move to home ran its time"),
+        (ready, "move to ready completed"),
+        (home, "move to home completed"),
     ] {
         assert!(result.success, "{}", result.message);
         assert_eq!(result.message, done);

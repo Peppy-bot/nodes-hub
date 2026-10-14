@@ -22,10 +22,11 @@ use srs_model::nalgebra::Isometry3;
 use tokio::sync::{mpsc, oneshot};
 use tracing::error;
 
-use crate::actions::{ask_coordinator, claim};
+use crate::actions::{ARM_LEADER_STREAMING, ask_coordinator, claim};
 use crate::arm_pair::ArmPair;
 use crate::coordinator::{CoordinatorRequest, MeasuredGrasp};
 use crate::planner::{Goal, JointReply, ReadyOutcome, ReadyReply, Unmeasured};
+use crate::streams::LeaderActivity;
 use crate::types::{Side, arm_pose_arrays, limb_names};
 
 /// Claim both arms' single-flight slots, or name the busy arm. A failure on
@@ -172,13 +173,13 @@ fn admissible_duration(duration_s: f64) -> bool {
     duration_s.is_finite() && (0.0..=MAX_REQUESTED_DURATION_S).contains(&duration_s)
 }
 
-/// The message of a move_to_ready that succeeds. Success says that both
-/// arms' moves ran their time out, not that the arms arrived. The governor
-/// can hold an arm short, and an object can stop it.
-const READY_DONE: &str = "the move to ready ran its time";
+/// The message of a move_to_ready that succeeds. Success means both moves ran
+/// for their duration; the governor can hold an arm short and an object can
+/// stop it, so it does not mean the arms arrived.
+const READY_DONE: &str = "move to ready completed";
 
 /// The message of a move_to_home that succeeds, worded as [`READY_DONE`].
-const HOME_DONE: &str = "the move to home ran its time";
+const HOME_DONE: &str = "move to home completed";
 
 /// Expand one posture action's run loop: expose it, claim both arms per
 /// accepted goal, and run both joint moves. Once both report, complete the
@@ -192,6 +193,7 @@ macro_rules! posture_runner {
             runner: Arc<NodeRunner>,
             goal_txs: [mpsc::Sender<Goal>; 2],
             busy: [Arc<AtomicBool>; 2],
+            activity: [LeaderActivity; 2],
             requests: mpsc::Sender<CoordinatorRequest>,
         ) -> Result<()> {
             let mut handle = $action::ActionHandle::expose(&runner).await?;
@@ -200,6 +202,9 @@ macro_rules! posture_runner {
                     .handle_goal_next_request(|req| {
                         if !admissible_duration(req.data.duration_s) {
                             return Ok($action::GoalDecision::reject("invalid duration"));
+                        }
+                        if activity.iter().any(LeaderActivity::streaming) {
+                            return Ok($action::GoalDecision::reject(ARM_LEADER_STREAMING));
                         }
                         if let Err(reason) = claim_both(&busy) {
                             return Ok($action::GoalDecision::reject(reason));

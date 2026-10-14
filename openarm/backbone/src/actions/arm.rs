@@ -2,7 +2,8 @@
 //! backbone exposes to the commander, and the `check_arm_move` service that
 //! asks whether a Cartesian goal has a plan without moving. Each validates
 //! the goal (arm_name, finiteness, duration, and joint limits for joint
-//! moves); a move claims the target arm's single-flight slot, then hands the
+//! moves) and refuses it while a leader streams the arm; a move claims the
+//! target arm's single-flight slot, then hands the
 //! accepted goal to that arm's planner over its goal channel. The planner
 //! runs the motion - governed against the other arm - completes the goal, and
 //! releases the busy slot at the terminal. The check claims nothing: the
@@ -23,7 +24,8 @@ use crate::coordinator::CoordinatorRequest;
 use crate::planner::{ARM_BUSY, Goal, JointReply};
 use crate::types::{ARM_DOF, JointVec, PlanTolerance, Side, pose_from_wire};
 
-use crate::actions::{blocking_ask_coordinator, claim};
+use crate::actions::{ARM_LEADER_STREAMING, blocking_ask_coordinator, claim};
+use crate::streams::LeaderActivity;
 
 fn target_in_limits(q: &JointVec, limits: &[Limit; ARM_DOF]) -> bool {
     q.iter().zip(limits).all(|(&v, l)| v >= l.lo && v <= l.hi)
@@ -74,6 +76,7 @@ pub async fn run_move_arm_joints(
     runner: Arc<NodeRunner>,
     goal_txs: [mpsc::Sender<Goal>; 2],
     busy: [Arc<AtomicBool>; 2],
+    activity: [LeaderActivity; 2],
     limits: [[Limit; ARM_DOF]; 2],
 ) -> Result<()> {
     let mut handle = move_arm_joints::ActionHandle::expose(&runner).await?;
@@ -98,6 +101,9 @@ pub async fn run_move_arm_joints(
                     return Ok(move_arm_joints::GoalDecision::reject(
                         "target out of joint limits",
                     ));
+                }
+                if activity[idx].streaming() {
+                    return Ok(move_arm_joints::GoalDecision::reject(ARM_LEADER_STREAMING));
                 }
                 if !claim(&busy[idx]) {
                     return Ok(move_arm_joints::GoalDecision::reject(ARM_BUSY));
@@ -145,6 +151,7 @@ pub async fn run_move_arm(
     runner: Arc<NodeRunner>,
     goal_txs: [mpsc::Sender<Goal>; 2],
     busy: [Arc<AtomicBool>; 2],
+    activity: [LeaderActivity; 2],
 ) -> Result<()> {
     let mut handle = move_arm::ActionHandle::expose(&runner).await?;
     loop {
@@ -154,6 +161,9 @@ pub async fn run_move_arm(
                     Ok(request) => request,
                     Err(reason) => return Ok(move_arm::GoalDecision::reject(reason)),
                 };
+                if activity[request.side.index()].streaming() {
+                    return Ok(move_arm::GoalDecision::reject(ARM_LEADER_STREAMING));
+                }
                 if !claim(&busy[request.side.index()]) {
                     return Ok(move_arm::GoalDecision::reject(ARM_BUSY));
                 }
@@ -187,6 +197,7 @@ pub async fn run_move_arm(
 pub async fn run_check_arm_move(
     runner: Arc<NodeRunner>,
     requests: mpsc::Sender<CoordinatorRequest>,
+    activity: [LeaderActivity; 2],
 ) -> Result<()> {
     loop {
         check_arm_move::handle_next_request(&runner, |req| {
@@ -203,6 +214,13 @@ pub async fn run_check_arm_move(
                 Ok(request) => request,
                 Err(reason) => return Ok(check_arm_move::Response::new(false, reason, 0.0)),
             };
+            if activity[request.side.index()].streaming() {
+                return Ok(check_arm_move::Response::new(
+                    false,
+                    ARM_LEADER_STREAMING.to_string(),
+                    0.0,
+                ));
+            }
             let (reply, answer) = oneshot::channel();
             let asked = blocking_ask_coordinator(
                 &requests,
