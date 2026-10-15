@@ -605,6 +605,7 @@ dependencies = [
  "capnpc",
  "chrono",
  "gix-url",
+ "libc",
  "peppy-config-model",
  "serde",
  "serde_json5",
