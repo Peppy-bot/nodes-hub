@@ -13,15 +13,19 @@ bounding what the joints may do to reach it, are the follower's business.
 
 ## Making a robot drivable from a headset
 
-Implement these and bind them in a launcher. No code here changes.
+One headset serves the whole stack. Every robot that should be drivable from
+it pairs into the headset's four slots. The controllers drive one robot at a
+time: the one chosen on the headset's page. Implement these on the robot's
+side and bind them in a launcher. No code here changes.
 
 | Interface | Kind | Your robot's side | Slots on this node |
 |---|---|---|---|
-| `pose_link/v1` | pairing | `follower` | `left_arm`, `right_arm` |
-| `gripper_link/v1` | pairing | `follower` | `left_gripper`, `right_gripper` |
+| `pose_link/v1` | pairing | `follower` | `left_arm`, `right_arm` (any number of robots) |
+| `gripper_link/v1` | pairing | `follower` | `left_gripper`, `right_gripper` (any number of robots) |
 | `rgb_camera/v1` | contract | implementer | `color_cameras` (any number) |
 | `rgbd_camera/v1` | contract | implementer | `rgbd_cameras` (any number, colour half only) |
-| `postures/v1` | contract | implementer | `postures` (any number; the first bound producer takes the face buttons) |
+| `postures/v1` | contract | implementer | `postures` (any number; the chosen robot's takes the face buttons) |
+| `episode_recording/v1` | contract | implementer | `recorder` (any number; the chosen robot's takes the left face buttons) |
 
 Both pairings are defined in `pairings-hub` (`robot/pose_link.json5`,
 `robot/gripper_link.json5`). On the wire: positions are metres, orientations
@@ -30,51 +34,62 @@ are unit quaternions `[x, y, z, w]` (scalar last), and both directions of
 of full travel, 0 closed to 1 fully open; `max_effort` 0 means the follower's
 configured ceiling.
 
-Every slot is optional. A single-arm robot binds one arm; a robot with no
-grippers binds none; the motion-only deployment binds no cameras. Which physical
-limb each operator hand drives is decided by the launcher's `links`, not here.
+Every slot is optional. A robot is identified by the copy its backbone runs
+in, or by the backbone's instance id outside a copy. It pairs only the sides
+it has: a single-arm robot pairs the right side, and a robot without
+grippers leaves the gripper slots alone. The robot declares the pairs from
+its own side, naming this node's slots:
 
 ```json5
 {
-  source: { name: "xr_commander", tag: "v1" },
+  source: { name: "openarm_backbone", tag: "v1" },
   instances: [{
-    instance_id: "xr_inst",
-    arguments: { command_rate_hz: 100 },
+    instance_id: "backbone_inst",
     links: {
-      left_arm:  "backbone_inst/leader_left_arm_pose",
-      right_arm: "backbone_inst/leader_right_arm_pose",
-      left_gripper:  "backbone_inst/leader_left_gripper",
-      right_gripper: "backbone_inst/leader_right_gripper",
-      postures: ["backbone_inst"],
-      rgbd_cameras: ["chest_cam"],
+      leader_left_arm_pose: "headset_inst/left_arm",
+      leader_right_arm_pose: "headset_inst/right_arm",
+      leader_left_gripper: "headset_inst/left_gripper",
+      leader_right_gripper: "headset_inst/right_gripper",
     },
   }],
 }
 ```
 
-A link value names the peer instance, plus `/slot` when the peer exposes more
-than one slot of that pairing (this backbone has one per side); the camera
-slots take a list, since any number of producers may bind.
+and the launcher adds the robot's postures, recorder and cameras to the
+headset under the option that selects the robot, so a robot that joins later
+brings them with it: `add_links: { postures: ["backbone_inst"],
+rgbd_cameras: ["chest"] }` on `headset_inst`. The page's **Robot** card
+lists the paired robots in name order and picks the one to drive; it works from a laptop's
+browser as well as the headset's. Until a robot is chosen, or while the
+chosen one is away, the controllers keep the robot they are driving; if that
+robot leaves, they fall back to the first robot that paired. When the chosen
+robot returns, it takes over again.
 
-Each bound camera streams under its instance id, so the launcher's instance
-naming is the headset's view naming. The names `wrist_left` and `wrist_right`
-are special: those panels anchor to the controllers instead of floating, so
-name the wrist camera instances exactly that to get anchoring. `status` is
-reserved for the panel.
+The headset shows the chosen robot's cameras, one panel per camera role,
+where the role is the camera's instance id in the robot's fragment
+(`wrist_left`, `chest`). The roles `wrist_left` and `wrist_right` are
+special: those panels anchor to the controllers instead of floating. A robot
+that pairs one arm, such as the SO-101, shows its one `wrist` camera on the
+wrist panel of the hand that drives it. `status` is reserved for the status
+panel while it is on. When another robot is chosen, the hands and the panels
+switch to it at once: the page drops the panels the new robot has no camera
+for and adds its own. Every panel is fed the chosen robot's newest frame 30
+times a second, the rate the headset's video tracks play at, and a camera
+that stops delivering reads NO SIGNAL.
 
 ## Operating it
 
 Open the URL the node prints at startup in the headset's browser and press
-**Passthrough**. The page is teleop_xr's dashboard trimmed to what this node
-honors: that button, the connection state and the camera feeds. teleop_xr's
-VR mode, speed and precision controls, robot model settings and network tuning
-drive its own IK stack and robot model, which this node does not run, so the
-page hides them. Without a bound camera only the status panel shows (nothing
-at all with it disabled); the robot view is whatever camera you bind.
+**Start**, or **Start Passthrough** to see the room around the panels. The
+page is teleop_xr's; it holds the **Robot** card, read from this node's
+`/robot` route, and the camera feeds, which list the headset's panels from
+the first load. Without a bound camera only the status panel shows (nothing at all
+with it disabled); the robot view is whatever camera you bind.
 
 - **Grip button**: the deadman and clutch, per hand. Squeeze to engage that
-  hand, release to let go. While it is released the node publishes nothing at
-  all on that hand's slots, so the follower holds where it was.
+  hand, release to let go. Letting go streams the measured pose for a quarter
+  second, so the follower stops where it is, and then that hand's slots fall
+  silent until the next squeeze.
 - **Motion**: relative to the squeeze. The commanded pose is where the
   end-effector was when you engaged, displaced by your hand's motion since,
   scaled by `motion_scale` (orientation is never scaled). Release, reposition,
@@ -84,15 +99,18 @@ at all with it disabled); the robot view is whatever camera you bind.
   is held, so releasing the grip freezes the grasp; match the trigger to the
   held opening before re-engaging, or the gripper springs back open.
 - **Face buttons** (right controller): **A** (the lower button) fires the
-  follower's whole-robot `move_to_home` action, **B** fires `move_to_ready`;
-  each is a planned move that runs to completion on its own. Squeezing either
-  grip cancels the move in flight and takes manual control back. Inert unless
-  the `postures` slot is bound.
-- **Face buttons** (left controller): the dataset recorder. **X** starts an
-  episode under the current task label; the next press stops and saves it, and
-  the panel row shows `saving...` until the recorder's result lands. Holding
-  **Y** for a second finishes the session: the dataset finalizes and a fresh
-  one opens in place. Inert unless the `recorder` slot is bound.
+  chosen robot's whole-robot `move_to_home` action, **B** fires
+  `move_to_ready`; each is a planned move that runs to completion on its own.
+  Squeezing either grip cancels the move in flight and takes manual control
+  back. Does nothing while the chosen robot has no postures action.
+- **Face buttons** (left controller): the chosen robot's dataset recorder.
+  **X** starts an episode under the current task label; the next press stops
+  and saves it, and the panel row shows `saving...` until the recorder's
+  result lands. Holding **Y** for a second finishes the session: the dataset
+  finalizes and a fresh one opens in place. If the robot changes during an
+  episode, the episode keeps its row and X still stops it. With no episode
+  in flight, the buttons do nothing while the chosen robot has no recorder.
+- **Changing the robot**: choosing another robot releases both hands. The previous robot stops where it is, and the next squeeze engages the new one. A grip held through the change drives nothing until it is released; the status panel says so.
 
 The mapping assumes you share the robot's facing (natural once your view is
 the robot's camera). Motion is relative to the squeeze, so standing elsewhere
@@ -100,15 +118,36 @@ mostly costs intuition, not correctness.
 
 ### The status panel
 
-A headset has no console, so a floating `status` panel carries the state that
-decides whether a hand can drive: whether the headset link is live, and per
-hand whether it has a controller, a held grip, a fresh measurement from its
-follower, and an engagement. It answers "why is nothing moving" without
-taking the headset off. It is an ordinary named view, so it moves and resizes
-like a camera panel; `status_panel_enabled: false` removes it.
+A headset has no console, so a floating `status` panel carries the state
+that decides whether a hand can drive: whether the headset link is live, and
+per hand whether it has a controller, a held grip, a fresh measurement from
+its follower, and an engagement. It answers "why is nothing moving" without
+taking the headset off. It floats above the middle of the row of camera
+panels (above the chest camera's panel when that is the only floating one)
+and moves like a camera panel. It is on by default; `status_panel_enabled:
+false` hides it. The right hand's row (the only row, on a one-armed robot)
+reports the posture buttons: "moving to home..." while the move runs, then
+"move to home completed", "move to home cancelled", "move to home failed:
+<cause>" or "move to home refused: <cause>" for three seconds. A press that
+does nothing says why for three seconds: "move to home ignored: release the
+grip first", "move to home ignored: still moving to ready", "move to home:
+bravo has no postures".
 
-With a recorder bound it also carries the task line: what the next episode
-records as, so the label is visible without taking the headset off.
+While the chosen robot has a recorder it also carries the task line: what
+the next episode records as, so the label is visible without taking the
+headset off. Its alert and motor sections appear only while something is
+wired to them.
+
+### Where the page is, on the wire
+
+The node publishes the `page` topic of the `headset/v1` contract so
+someone not wearing the headset can find the page. The message carries
+`urls`: the page's URLs, one per address of this machine, the outbound
+route first (empty when `https_host` is a loopback address or the machine
+has no network address). It goes out once the page is up, and the topic
+retains it, so a consumer that subscribes later reads it at once. The
+Waldo simulation's `headset_teleop` panel reads it and offers the link
+that opens the page in the headset.
 
 ### Naming the task
 
@@ -126,14 +165,14 @@ so an unnamed session is obvious in the headset, and the startup log names the
 placeholder and points at the page.
 
 `/task` on the same origin is that page: a plain form, so the headset's
-browser can set it before you enter VR, or a second person can set it from a
-laptop while the session runs. A change applies to the next episode; the one
+browser can set it before you press Start, or a second person can set it from
+a laptop while the session runs. A change applies to the next episode; the one
 recording keeps the label it started with. Blank, over-long, and control
 characters are refused, and a refusal leaves the previous label in place, so a
 bad edit cannot unset a label episodes are already recording under.
 
-Served only when the `recorder` slot is bound; teleoperation without one has
-no page and no task line.
+The page is always served; the task line shows only while the chosen robot has
+a recorder.
 
 ## Reaching it from the headset
 
@@ -143,13 +182,14 @@ certificate on first boot (kept in `~/.xr_commander/tls/` and reused, so the
 browser's one-time acceptance sticks across restarts) and always serves HTTPS.
 Two ways in, shown for the default `https_port` of 4443:
 
-- **Over the network**: open one of the page URLs the launch prints under
-  `Web pages:` (`peppy stack list` shows them again under `Instance
-  endpoints`) in the headset and click through the browser warning once.
+- **Over the network**: open the page URL the node prints at startup (the
+  launch prints it under `Web pages:`, and `peppy stack list` under
+  `Instance endpoints`) in the headset and click through the browser warning
+  once. In Waldo, the `headset_teleop` panel's **Send to headset** button sends the page to the headset through Meta's Web Launch; the browser must be signed in to the headset's Meta account.
 - **Over USB** (lowest latency). Needs `adb` on this machine and the headset
-  in developer mode (free Meta developer account, toggled in the Meta Horizon
-  phone app; accept the in-headset USB-debugging prompt). Then
-  `adb reverse tcp:4443 tcp:4443` and open `https://localhost:4443`.
+  in developer mode (free Meta developer account, toggled in the Meta
+  Horizon phone app; accept the in-headset USB-debugging prompt). Then `adb
+  reverse tcp:4443 tcp:4443` and open `https://localhost:4443`.
 
 The WebSocket carries unauthenticated motion control, exactly as the browser
 control panels in this ecosystem do. Trusted networks only.
@@ -167,19 +207,22 @@ installed.
 `motion_scale` (hand-to-EE travel scale) and `gripper_open_fraction` (where a
 released trigger rests). `stale_timeout_s` is the deadman on a frozen or
 disconnected headset. `view_max_width` bounds what the headset encoder is fed,
-and `status_panel_enabled` draws the status panel. See `peppy.json5` for the
+and `status_panel_enabled: false` hides the status panel. See `peppy.json5` for the
 full list and defaults.
 
 ## Development
 
-`frames`, `devices`, `clutch`, `config`, `tls`, `page`, and the decode half of
-`video` are pure of peppy; `publish` imports the generated modules, so the full
-suite needs the synced environment (and nothing served):
+`frames`, `devices`, `clutch`, `config`, `addresses`, `tls`, `robot_choice`,
+`robots`, and the decode half of `video` are pure of peppy; `publish` and
+`status` import the generated modules, so the full suite needs the synced
+environment (and nothing served):
 
 ```bash
 peppy node sync   # resolves the peppygen/peppylib path dependencies uv needs
 uv run pytest
 ```
 
-Built on [teleop_xr](https://github.com/qrafty-ai/teleop_xr) (Apache-2.0), which
-supplies the WebXR frontend, the WebSocket session, and the WebRTC video path.
+Built on Peppy's [fork of teleop_xr](https://github.com/Peppy-bot/teleop_xr)
+(Apache-2.0), which supplies the page, the WebSocket session, and the WebRTC
+video path; the fork's README lists what it changes from
+[upstream](https://github.com/qrafty-ai/teleop_xr).

@@ -4,28 +4,8 @@ import time
 
 import pytest
 
-from peppygen.consumed_actions.postures import move_to_home as postures_move_to_home
-from peppygen.consumed_actions.recorder import record_episode as recorder_record_episode
-
-from tests.helpers import FakeSubscription, FakeToken, boot
-from xr_commander.bus import Latch, messages, next_message, select_producer, ticks
-
-
-async def test_select_producer_picks_the_first_and_reports_a_surplus(capsys):
-    async with boot(postures_instances=2) as h:
-        bound = postures_move_to_home.bound_producers(h.node_runner)
-        target = select_producer(postures_move_to_home, h.node_runner, "postures")
-        assert target.instance_id == bound[0].instance_id
-    assert "several postures producers" in capsys.readouterr().out
-
-
-async def test_select_producer_is_none_and_silent_on_an_empty_slot(capsys):
-    async with boot() as h:  # the recorder slot boots unwired
-        assert (
-            select_producer(recorder_record_episode, h.node_runner, "recorder") is None
-        )
-    # Silent: nothing the node logs, in particular no surplus line.
-    assert "[xr_commander]" not in capsys.readouterr().out
+from tests.helpers import FakeSubscription, FakeToken
+from xr_commander.bus import FLASH_S, FlashNote, Latch, messages, next_message, ticks
 
 
 class HangingSubscription:
@@ -284,3 +264,14 @@ def test_a_cancelled_token_ends_the_pacer_before_any_tick():
         return [tick async for tick in ticks(0.01, CancelledToken())]
 
     assert asyncio.run(scenario()) == []
+
+
+def test_a_flash_note_shows_for_the_hold_then_clears():
+    note = FlashNote()
+    assert note.text() == ""
+    note.set("saved")
+    now = time.monotonic()
+    assert note.text(now) == "saved"
+    assert note.text(now + FLASH_S + 0.01) == ""
+    note.set("")
+    assert note.text(now) == ""

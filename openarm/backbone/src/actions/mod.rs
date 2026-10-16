@@ -15,6 +15,12 @@ use crate::coordinator::CoordinatorRequest;
 /// ticking runs it out.
 const COORDINATOR_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The refusal of an arm goal, or a plan check, on an arm a leader is
+/// streaming: the leader has the arm until its stream stops.
+pub const ARM_LEADER_STREAMING: &str = "a leader is streaming arm commands; release the headset's grip, switch off the browser panel's stream, or stop the leader node, then retry";
+/// The gripper's counterpart of [`ARM_LEADER_STREAMING`].
+pub const GRIPPER_LEADER_STREAMING: &str = "a leader is streaming gripper commands; release the headset's grip, switch off the browser panel's stream, or stop the leader node, then retry";
+
 /// Claim a side's single-flight move slot, or report it already busy. Shared
 /// by the arm, gripper, and posture admission handlers; the matching release
 /// rides the move's busy guard.

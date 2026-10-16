@@ -1,21 +1,28 @@
 """Camera frames off the peppy bus and into the headset's WebRTC tracks.
 
-One bound camera = one named track, keyed by instance id. Frames are handed to
-teleop_xr as BGR: its track converts BGR-to-RGB before encoding.
+The headset shows the chosen robot's cameras, one panel per camera role, the
+id a camera's copy wrote for it (`wrist_left`, `chest`). A robot that pairs
+one arm shows its one `wrist` camera on the wrist panel of the hand driving
+that arm. When the choice changes the panels change with it, on the pages in
+session too. Every shown panel is fed the chosen robot's newest frame at
+`TRACK_HZ`, steadily. Frames are handed to teleop_xr as BGR: its track
+converts BGR-to-RGB before encoding.
 """
 
 from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from types import ModuleType
 from typing import Protocol
 
 import cv2
 import numpy as np
 
 from xr_commander.bus import CancellationToken, Latch, log, messages, ticks
+from xr_commander.robots import PairedRobots
 
 # The colour encodings the rgb_camera / rgbd_camera contracts declare. A camera
 # announcing anything else is refused rather than guessed at.
@@ -25,8 +32,19 @@ _BYTES_PER_PIXEL = {"rgb8": 3, "bgr8": 3, "yuyv": 2}
 # the headset a frozen frame is indistinguishable from live video.
 _CAMERA_SILENT_S = 2.0
 _SILENCE_POLL_S = 0.5
+# How often the chosen robot's panels are read off the camera slots.
+_FOLLOW_PERIOD_S = 0.2
 _NO_SIGNAL_HEIGHT = 180
 _NO_SIGNAL_WIDTH = 320
+
+# The rate teleop_xr's camera tracks play at: each frame is stamped 1/30 s
+# after the one before (aiortc's video clock), so every panel is fed its
+# newest frame at exactly this rate, whatever rate its camera publishes at.
+TRACK_HZ = 30
+# The role of the one wrist camera of a robot with one arm.
+LONE_WRIST_ROLE = "wrist"
+# The panels teleop_xr anchors to the controllers, by hand.
+WRIST_PANELS = {"left": "wrist_left", "right": "wrist_right"}
 
 
 class FrameSink(Protocol):
@@ -72,51 +90,178 @@ def decode_to_bgr(encoding: str, width: int, height: int, data: bytes) -> np.nda
         raise ValueError(f"{encoding} frame failed to convert: {e}") from None
 
 
-# One camera_views entry, matching teleop_xr's ViewConfig. It requires a
-# capture device; the frame source is supplied directly, so it is never
-# opened, and geometry travels with every frame.
-CAMERA_VIEW = {"device": 0}
+@dataclass(frozen=True)
+class CameraSource:
+    """One bound camera: the robot it belongs to, None for a camera the
+    launcher deploys outside any copy, and its role, the id its copy's
+    fragment wrote for it (its instance id outside a copy)."""
+
+    robot: str | None
+    role: str
+
+
+def camera_source(member) -> CameraSource:
+    """A bound member's camera, by robot and role."""
+    if member.copy is None:
+        return CameraSource(robot=None, role=member.producer.instance_id)
+    return CameraSource(robot=member.copy.name, role=member.copy.instance_id)
+
+
+def panel_of(
+    source: CameraSource, arm_sides: Callable[[str], frozenset[str]]
+) -> str | None:
+    """The panel a camera fills: its role, or for the `wrist` camera of a
+    robot that pairs one arm, the wrist panel of the hand driving that arm.
+    None while the camera's robot pairs no arm with the headset: the headset
+    has nothing of it to show."""
+    if source.robot is None:
+        return source.role
+    sides = arm_sides(source.robot)
+    if not sides:
+        return None
+    if source.role == LONE_WRIST_ROLE and len(sides) == 1:
+        (side,) = sides
+        return WRIST_PANELS[side]
+    return source.role
+
+
+def shows_for(source: CameraSource, chosen_robot: str | None) -> bool:
+    """Whether a camera's frames reach its role's panel: the chosen robot's
+    cameras do, and a camera outside any copy belongs to every robot."""
+    return source.robot is None or source.robot == chosen_robot
+
+
+def panel_for(source: CameraSource, robots: PairedRobots) -> str | None:
+    """The panel a camera fills now, None while it is not the chosen
+    robot's."""
+    if not shows_for(source, robots.chosen()):
+        return None
+    return panel_of(source, robots.arm_sides)
 
 
 @dataclass(frozen=True)
-class CameraTrack:
-    """One camera's headset track: the instance id is also the view name the
-    headset sees."""
+class LastFrame:
+    """The newest frame a panel was given: whose camera, and when (monotonic
+    seconds)."""
 
-    instance_id: str
-    sink: FrameSink
-
-
-def camera_views(track_ids: Sequence[str]) -> dict[str, dict]:
-    """teleop_xr's panel config: one CAMERA_VIEW entry per track name."""
-    return {track_id: dict(CAMERA_VIEW) for track_id in track_ids}
+    source: CameraSource
+    monotonic_s: float
 
 
-def assert_unique_track_ids(track_ids: Sequence[str]) -> None:
-    """ValueError when two tracks share a headset name: the collision would
-    silently drop one track's frames."""
-    duplicates = sorted({name for name in track_ids if track_ids.count(name) > 1})
-    if duplicates:
-        raise ValueError(
-            f"headset view names collide: {duplicates}. Camera instance ids "
-            "and the status panel's name must be unique"
-        )
+@dataclass(frozen=True)
+class _Shown:
+    """A frame waiting on a panel, and the camera it came from; None for a
+    frame of the node's own, which every robot shows."""
+
+    frame: np.ndarray
+    source: CameraSource | None
 
 
-def discover_tracks(
-    node_runner,
-    topic_module,
-    make_sink: Callable[[], FrameSink],
-) -> list[CameraTrack]:
-    """A track per camera bound to one slot, in binding order.
+class CameraPanels:
+    """The headset's camera panels, each made the first time a camera fills
+    it, and the ones the chosen robot fills.
 
-    Purely from the bindings: a camera that starts late streams into its
-    waiting track whenever its first frame arrives.
+    `show_views` tells the session the shown panels whenever they change; a
+    name the session reserves (the status panel's) is refused, once.
     """
-    return [
-        CameraTrack(instance_id=producer.instance_id, sink=make_sink())
-        for producer in topic_module.bound_producers(node_runner)
-    ]
+
+    def __init__(
+        self,
+        make_sink: Callable[[], FrameSink],
+        show_views: Callable[[Mapping[str, FrameSink]], None],
+        reserved: frozenset[str],
+    ) -> None:
+        self._make_sink = make_sink
+        self._show_views = show_views
+        self._reserved = reserved
+        self._sinks: dict[str, FrameSink] = {}
+        self._newest: dict[str, _Shown] = {}
+        self._shown: tuple[str, ...] = ()
+        self._refused = Latch()
+
+    def ensure(self, name: str) -> bool:
+        """Make the panel `name` if this is its first camera; False for a
+        reserved name."""
+        if name in self._reserved:
+            self._refused.trip(
+                f"camera instance {name!r} clashes with the status panel's name; "
+                "its frames are dropped. Rename the camera instance"
+            )
+            return False
+        if name not in self._sinks:
+            self._sinks[name] = self._make_sink()
+        return True
+
+    def show_only(self, names: Iterable[str]) -> None:
+        """Show the panels `names` alone, telling the session when the set
+        changes."""
+        shown = tuple(sorted(name for name in set(names) if self.ensure(name)))
+        if shown == self._shown:
+            return
+        self._shown = shown
+        self._show_views({name: self._sinks[name] for name in shown})
+        log(f"camera panels shown: {', '.join(shown) or 'none'}")
+
+    def shown(self) -> tuple[str, ...]:
+        """The panels shown, by name."""
+        return self._shown
+
+    def show(
+        self, name: str, frame: np.ndarray, source: CameraSource | None = None
+    ) -> None:
+        """Show `frame`, from `source`'s camera, on the panel `name` from the
+        next feed on."""
+        if self.ensure(name):
+            self._newest[name] = _Shown(frame, source)
+
+    def feed(self, chosen_robot: str | None) -> None:
+        """Hand every shown panel its newest frame once, while that frame
+        is the chosen robot's."""
+        for name in self._shown:
+            newest = self._newest.get(name)
+            if newest is None:
+                continue
+            if newest.source is None or shows_for(newest.source, chosen_robot):
+                self._sinks[name].put_frame(newest.frame)
+
+
+async def feed_panels(
+    panels: CameraPanels,
+    chosen_robot: Callable[[], str | None],
+    token: CancellationToken,
+) -> None:
+    """Feed every shown panel at `TRACK_HZ` until shutdown."""
+    async for _ in ticks(1.0 / TRACK_HZ, token):
+        panels.feed(chosen_robot())
+
+
+def chosen_panels(
+    node_runner, slot_modules: Sequence[ModuleType], robots: PairedRobots
+) -> set[str]:
+    """The panels the chosen robot's bound cameras fill."""
+    sources = (
+        camera_source(member)
+        for module in slot_modules
+        for member in module.bound_members(node_runner)
+    )
+    return {
+        name for source in sources if (name := panel_for(source, robots)) is not None
+    }
+
+
+async def follow_camera_panels(
+    node_runner,
+    slot_modules: Sequence[ModuleType],
+    panels: CameraPanels,
+    robots: PairedRobots,
+    token: CancellationToken,
+    period_s: float = _FOLLOW_PERIOD_S,
+) -> None:
+    """Show the chosen robot's panels as its cameras and arms pair and as
+    the choice changes, so a camera that joins late has a panel before its
+    first frame, and a silent one reads NO SIGNAL."""
+    async for _ in ticks(period_s, token):
+        panels.show_only(chosen_panels(node_runner, slot_modules, robots))
 
 
 def shrink_to_width(frame: np.ndarray, max_width: int) -> np.ndarray:
@@ -143,41 +288,52 @@ def _decode_and_shrink(message, view_max_width: int) -> np.ndarray:
 async def drain_frames(
     node_runner,
     topic_module,
-    sinks: dict[str, FrameSink],
+    panels: CameraPanels,
+    robots: PairedRobots,
     token: CancellationToken,
     label: str,
     view_max_width: int = 0,
-    health: dict[str, float] | None = None,
+    health: dict[str, LastFrame] | None = None,
 ) -> None:
-    """Route every frame from one camera slot into its track's sink.
+    """Route every frame of the chosen robot's cameras on one slot onto the
+    camera's panel; the other robots' frames are dropped.
 
     Frames are handled in arrival order; the subscription's bounded queue is
     the only backpressure. Decode runs in a worker thread so a heavy frame
     never stalls the command streams sharing the loop. An undecodable frame is
     logged once and dropped, never stopping the other producers. `health`
-    (instance id to monotonic seconds) is stamped per delivered frame for the
+    (panel to its newest frame) is stamped per delivered frame for the
     silence watchdog.
     """
     try:
         subscription = await topic_module.subscribe(node_runner)
     except Exception as e:
-        # Loud and fail-safe: the affected tracks simply never show video.
+        # Loud and fail-safe: the affected panels simply never show video.
         log(f"{label} subscribe failed: {e!r}")
         return
     # Latched per producer: a bad encoding repeats every frame.
     unusable: dict[str, Latch] = {}
     async for producer, message in messages(subscription, token, label):
-        sink: FrameSink | None = sinks.get(producer.instance_id)
-        if sink is None:
-            continue  # a producer outside this slot's bound set
+        # The set follows the stack's joins, so it is read per frame.
+        sources = {
+            (m.producer.core_node, m.producer.instance_id): camera_source(m)
+            for m in topic_module.bound_members(node_runner)
+        }
+        source = sources.get((producer.core_node, producer.instance_id))
+        name = panel_for(source, robots) if source is not None else None
+        if name is None:
+            continue
         latch = unusable.get(producer.instance_id)
         if latch is None:
             latch = unusable[producer.instance_id] = Latch()
         try:
             frame = await asyncio.to_thread(_decode_and_shrink, message, view_max_width)
-            sink.put_frame(frame)
+            if panel_for(source, robots) != name:
+                # The choice changed while the frame decoded.
+                continue
+            panels.show(name, frame, source)
             if health is not None:
-                health[producer.instance_id] = time.monotonic()
+                health[name] = LastFrame(source, time.monotonic())
             latch.clear()
         except Exception as e:
             latch.trip(f"{label} {producer.instance_id} frame unusable: {e!r}")
@@ -195,33 +351,53 @@ def no_signal_frame(track_id: str) -> np.ndarray:
     return frame
 
 
+def shows_live_video(
+    last: LastFrame | None,
+    chosen_robot: str | None,
+    now: float,
+    timed_from: float,
+    silent_after_s: float,
+) -> bool:
+    """Whether a panel shows its chosen robot's camera: a frame of that
+    camera came within `silent_after_s`. A panel holding no frame of the
+    chosen robot is timed from `timed_from`."""
+    if last is None or not shows_for(last.source, chosen_robot):
+        return now - timed_from <= silent_after_s
+    return now - last.monotonic_s <= silent_after_s
+
+
 async def watch_camera_silence(
-    tracks: Sequence[CameraTrack],
-    health: Mapping[str, float],
+    panels: CameraPanels,
+    health: Mapping[str, LastFrame],
+    chosen_robot: Callable[[], str | None],
     token: CancellationToken,
     silent_after_s: float = _CAMERA_SILENT_S,
     poll_s: float = _SILENCE_POLL_S,
 ) -> None:
-    """Blank a track whose camera stopped delivering, and say so once.
+    """Show NO SIGNAL on a shown panel whose chosen robot's camera stopped
+    delivering, or never did, and say so once.
 
-    A camera that has never produced is timed from the watcher's start, so a
-    dead camera reads NO SIGNAL instead of an indistinguishable blank panel.
+    A panel is timed from when it was shown or the chosen robot last
+    changed, whichever is later.
     """
-    started = time.monotonic()
+    chosen = chosen_robot()
+    shown_since: dict[str, float] = {}
     dark: set[str] = set()
     async for _ in ticks(poll_s, token):
         now = time.monotonic()
-        for track in tracks:
-            last = health.get(track.instance_id, started)
-            if now - last > silent_after_s:
-                if track.instance_id not in dark:
-                    dark.add(track.instance_id)
-                    log(f"camera {track.instance_id} went silent; blanking its track")
-                    try:
-                        track.sink.put_frame(no_signal_frame(track.instance_id))
-                    except Exception as e:
-                        # One refusing sink must not end the watch for the rest.
-                        log(f"camera {track.instance_id} blank failed: {e!r}")
-            elif track.instance_id in dark:
-                dark.discard(track.instance_id)
-                log(f"camera {track.instance_id} recovered")
+        current = chosen_robot()
+        if current != chosen:
+            chosen = current
+            shown_since = dict.fromkeys(shown_since, now)
+        shown_since = {name: shown_since.get(name, now) for name in panels.shown()}
+        for name, since in shown_since.items():
+            live = shows_live_video(
+                health.get(name), chosen, now, since, silent_after_s
+            )
+            if not live and name not in dark:
+                dark.add(name)
+                log(f"camera panel {name} went silent; showing NO SIGNAL")
+                panels.show(name, no_signal_frame(name))
+            elif live and name in dark:
+                dark.discard(name)
+                log(f"camera panel {name} recovered")

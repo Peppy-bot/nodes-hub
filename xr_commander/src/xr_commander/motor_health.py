@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import math
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 
 from xr_commander.bus import CancellationToken, Latch, log, messages
@@ -111,8 +111,15 @@ class MotorHealthReports:
     instead of dropping the rows as if the motors were fine.
     """
 
-    def __init__(self, *, producers: Sequence[str] = (), monotonic=time.monotonic) -> None:
-        self._producer_order = {name: index for index, name in enumerate(producers)}
+    def __init__(
+        self,
+        *,
+        bound_now: Callable[[], Sequence[str]] = tuple,
+        monotonic=time.monotonic,
+    ) -> None:
+        # The producers wired to the slot now, read live: the slot follows
+        # the stack's joins.
+        self._bound_now = bound_now
         # Injectable so staleness tests can move time instead of sleeping.
         self._monotonic = monotonic
         self._by_instance: dict[str, HealthReport] = {}
@@ -125,7 +132,7 @@ class MotorHealthReports:
         looks exactly like one whose producers all died. A surface that
         renders silence has to be able to say which of the two it is showing.
         """
-        return bool(self._producer_order)
+        return bool(self._bound_now())
 
     def update(
         self,
@@ -161,8 +168,8 @@ class MotorHealthReports:
         )
 
     def by_instance(self) -> tuple[InstanceHealth, ...]:
-        """Every instance ever received, configured producer order first and the rest
-        sorted; a report older than the staleness window reads as None.
+        """Every instance ever received, the bound producers' order first and
+        the rest sorted; a report older than the staleness window reads as None.
 
         An instance never received is absent entirely: the launcher may not
         wire it, and rows for it would name motors this node knows nothing
@@ -177,9 +184,9 @@ class MotorHealthReports:
             )
 
         known = self._by_instance
+        bound_order = {name: index for index, name in enumerate(self._bound_now())}
         ordered = sorted(
-            known,
-            key=lambda name: (self._producer_order.get(name, len(self._producer_order)), name),
+            known, key=lambda name: (bound_order.get(name, len(bound_order)), name)
         )
         return tuple(entry(known[name]) for name in ordered)
 
@@ -210,9 +217,7 @@ def _motor_text(report: HealthReport, index: int) -> str:
     if report.effort_fraction_rated:
         parts.append(f"rated {_percent(report.effort_fraction_rated[index])}")
     if report.effort_fraction_rated_sustained:
-        parts.append(
-            f"sust {_percent(report.effort_fraction_rated_sustained[index])}"
-        )
+        parts.append(f"sust {_percent(report.effort_fraction_rated_sustained[index])}")
     if report.driver_temp_c and report.winding_temp_c:
         parts.append(
             f"{_celsius(report.driver_temp_c[index])}"
