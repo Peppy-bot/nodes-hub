@@ -1,9 +1,14 @@
 // xr_commander: a robot-agnostic teleoperation leader driven from a WebXR
 // headset. Serves the WebXR page (teleop_xr), streams a Cartesian setpoint per
-// hand on pose_link and an opening per hand on gripper_link, and relays bound
-// cameras into the headset as WebRTC tracks. Carries no kinematics: solving a
-// pose into joints is the follower's business. The deadman is the grip button,
-// per hand; released means nothing is published and the follower holds.
+// hand on pose_link and an opening per hand on gripper_link to the robot it
+// drives, relays bound cameras into the headset as WebRTC tracks, and
+// publishes where its page is: the page's URLs. One headset per
+// stack: the backbone of every robot it leads pairs into its slots, and the
+// robot card on its page chooses the one the hands drive, else the robot
+// they drive while it stays paired, else the first robot paired. Carries no
+// kinematics: solving a pose into joints is the follower's business. The
+// deadman is the grip button, per hand; released streams the measured pose
+// for a quarter second, then nothing, and the follower holds.
 {
   peppy_schema: "node/v1",
   manifest: {
@@ -15,40 +20,47 @@
       "webxr",
       "commander",
     ],
+    implements: [
+      // Where the headset's page is, for whoever is not wearing it: the
+      // URLs its page is served at.
+      { name: "headset", tag: "v1", link_id: "headset" },
+    ],
     depends_on: {
       contracts: [
         // Optional dataset recorder, driven from the headset: the face
         // buttons start and stop episodes and finish the session, so an
-        // operator in VR records without breaking out of it.
+        // operator records without taking the headset off.
         { name: "episode_recording", tag: "v1", link_id: "recorder", cardinality: "zero_or_more" },
         // Operator video; depth of an RGB-D camera is not consumed.
         { name: "rgb_camera", tag: "v1", link_id: "color_cameras", cardinality: "zero_or_more" },
         { name: "rgbd_camera", tag: "v1", link_id: "rgbd_cameras", cardinality: "zero_or_more" },
         // Whole-robot posture moves.
         { name: "postures", tag: "v1", link_id: "postures", cardinality: "zero_or_more" },
-        // Operator alerts from any producer the launcher wires. The headset
-        // has no text channel of its own, so an active alert is drawn onto
-        // the camera tracks; unbound leaves the video untouched.
+        // Operator alerts from any producer the launcher wires, listed on
+        // the status panel: the headset has no text channel of its own.
+        // Unbound, the panel draws no alert section.
         { name: "alert", tag: "v1", link_id: "alerts", cardinality: "zero_or_more" },
         // Per-motor health from any motor-bearing producer the launcher
-        // wires, listed on the status panel; unbound leaves the section
-        // reading "not wired".
+        // wires, listed on the status panel. Unbound, the panel draws no
+        // health section.
         { name: "motor_health", tag: "v1", link_id: "motor_health", cardinality: "zero_or_more" },
       ],
       pairings: [
-        // One Cartesian command loop per operator hand; which follower each
-        // hand drives is the launcher's choice.
-        { name: "pose_link", tag: "v1", role: "leader", link_id: "left_arm", cardinality: "zero_or_one" },
-        { name: "pose_link", tag: "v1", role: "leader", link_id: "right_arm", cardinality: "zero_or_one" },
+        // One Cartesian command loop per operator hand. Every robot the
+        // launcher pairs in holds a pair here; the hand drives the pair of
+        // the chosen robot and is silent toward the others.
+        { name: "pose_link", tag: "v1", role: "leader", link_id: "left_arm", cardinality: "zero_or_more" },
+        { name: "pose_link", tag: "v1", role: "leader", link_id: "right_arm", cardinality: "zero_or_more" },
         // The same hand's opening loop.
-        { name: "gripper_link", tag: "v1", role: "leader", link_id: "left_gripper", cardinality: "zero_or_one" },
-        { name: "gripper_link", tag: "v1", role: "leader", link_id: "right_gripper", cardinality: "zero_or_one" },
+        { name: "gripper_link", tag: "v1", role: "leader", link_id: "left_gripper", cardinality: "zero_or_more" },
+        { name: "gripper_link", tag: "v1", role: "leader", link_id: "right_gripper", cardinality: "zero_or_more" },
       ],
     },
   },
   interfaces: {
     topics: {
       emits: [
+        { link_id: "headset", name: "page" },
         { link_id: "left_arm", name: "pose_setpoints" },
         { link_id: "right_arm", name: "pose_setpoints" },
         { link_id: "left_gripper", name: "gripper_setpoints" },
@@ -108,8 +120,10 @@
       // Widest video frame (px) relayed into the headset; 0 relays
       // sensor-native frames.
       view_max_width: { $type: "u32", $default: 640 },
-      // Draw a status panel in the headset (link and per-hand state) as an
-      // extra floating view. Off leaves the headset showing cameras only.
+      // Draw a status panel in the headset (link, per-hand state, the
+      // posture and recorder outcomes, alerts, motor health) as an extra
+      // floating view above the cameras'; off, the headset shows cameras
+      // only.
       status_panel_enabled: { $type: "bool", $default: true },
     },
   },

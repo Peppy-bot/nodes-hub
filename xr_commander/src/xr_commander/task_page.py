@@ -2,12 +2,12 @@
 
 A headset has no keyboard reachable from inside a session, so the task is
 typed on a page served from the origin the headset already trusts: by the
-operator before entering VR, or by a second person on a laptop while the
+operator before pressing Start, or by a second person on a laptop while the
 session runs. The page is the only source of the label. A session starts with
-nothing set, and whatever is recorded first goes down as `UNNAMED_TASK` rather
-than being refused: a lost demonstration cannot be recovered, while a uniform
-placeholder is one string to correct afterwards. Mounted only when a recorder
-is bound; teleoperation without one serves no page.
+nothing set, and whatever is recorded first goes down as `UNNAMED_TASK`: a
+lost demonstration cannot be recovered, while a uniform placeholder is one
+string to correct afterwards. Served always: the chosen robot's recorder, when
+it has one, records under it.
 
 The label is read when a goal fires, so a change lands on the next episode and
 can never rename the episode being recorded.
@@ -17,12 +17,12 @@ from __future__ import annotations
 
 import html
 import threading
-import urllib.parse
 
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from xr_commander.bus import log
+from xr_commander.forms import BAD_REQUEST, SEE_OTHER, form_field, read_capped_body
 
 PATH = "/task"
 
@@ -36,12 +36,6 @@ MAX_TASK_CHARS = 120
 UNNAMED_TASK = "unnamed teleop task"
 
 _FIELD = "task"
-_FORM_MEDIA_TYPE = "application/x-www-form-urlencoded"
-# One short form field; anything larger is not a submission from this page.
-_MAX_BODY_BYTES = 4096
-# The browser reissues the GET after a successful POST, so a reload cannot
-# resubmit the form.
-_SEE_OTHER = 303
 
 
 def parse_task(value) -> str:
@@ -96,43 +90,6 @@ class TaskLabel:
         with self._lock:
             self._label = label
         return label
-
-
-async def read_capped_body(request: Request) -> bytes:
-    """The request body, refused past the cap without buffering the rest.
-
-    Read in chunks rather than through `request.body()`, which would hold the
-    whole submission in memory before any check could reject it.
-    """
-    chunks: list[bytes] = []
-    size = 0
-    async for chunk in request.stream():
-        size += len(chunk)
-        if size > _MAX_BODY_BYTES:
-            raise ValueError(f"form is larger than {_MAX_BODY_BYTES} bytes")
-        chunks.append(chunk)
-    return b"".join(chunks)
-
-
-def form_field(content_type: str, body: bytes) -> str:
-    """The raw task field a submitted form carries.
-
-    Structure only: the body's size belongs to whoever read it, and what makes
-    a label acceptable belongs to `parse_task`. Decoded here rather than
-    through Starlette's form parser, which requires python-multipart even for
-    urlencoded bodies.
-    """
-    media_type = content_type.split(";")[0].strip().lower()
-    if media_type != _FORM_MEDIA_TYPE:
-        raise ValueError(f"form must be {_FORM_MEDIA_TYPE}, got {media_type or 'none'}")
-    try:
-        fields = urllib.parse.parse_qs(body.decode("utf-8"), keep_blank_values=True)
-    except UnicodeDecodeError:
-        raise ValueError("form is not valid UTF-8") from None
-    values = fields.get(_FIELD, [])
-    if len(values) != 1:
-        raise ValueError(f"form must carry one {_FIELD} field, got {len(values)}")
-    return values[0]
 
 
 _STYLE = """
@@ -200,7 +157,7 @@ def _refused(label: TaskLabel, pending: str | None, error: Exception) -> HTMLRes
     log(f"task refused: {error}")
     return HTMLResponse(
         render_page(label.current(), pending=pending, error=str(error)),
-        status_code=400,
+        status_code=BAD_REQUEST,
     )
 
 
@@ -218,6 +175,7 @@ def build_router(label: TaskLabel) -> APIRouter:
             submitted = form_field(
                 request.headers.get("content-type", ""),
                 await read_capped_body(request),
+                _FIELD,
             )
         except ValueError as e:
             return _refused(label, None, e)
@@ -226,6 +184,6 @@ def build_router(label: TaskLabel) -> APIRouter:
         except ValueError as e:
             return _refused(label, submitted, e)
         log(f"episode task set to {adopted!r}")
-        return RedirectResponse(PATH, status_code=_SEE_OTHER)
+        return RedirectResponse(PATH, status_code=SEE_OTHER)
 
     return router

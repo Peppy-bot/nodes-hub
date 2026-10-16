@@ -1,15 +1,10 @@
-import time
-
 import numpy as np
-
 from peppygen.consumed_topics.alerts import alerts as alerts_topic
 
-from tests.helpers import IDENTITY
+from tests.helpers import FakeSession, source, squeezing_hand
 from xr_commander import panel
 from xr_commander.alerts import ActiveAlerts
 from xr_commander.clutch import HandClutch
-from xr_commander.devices import HandSample, XrFrame
-from xr_commander.frames import Pose
 from xr_commander.motor_health import FAULT, HealthRow, MotorHealthReports
 from xr_commander.panel import (
     HandSource,
@@ -22,12 +17,9 @@ from xr_commander.panel import (
     render,
     snapshot,
 )
-from xr_commander.publish import LatestPose
+from xr_commander.publish import HeldOverSqueeze, MeasuredPoses, PostureStatus
 from xr_commander.record import RecorderStatus
 from xr_commander.task_page import UNNAMED_TASK
-
-POSE = Pose(np.zeros(3), IDENTITY)
-
 
 _PRODUCER = ("core", "left_arm_inst")
 
@@ -84,6 +76,7 @@ def states(**overrides):
         "gripper_bound": True,
         "tracked": True,
         "squeezing": True,
+        "held_over": False,
         "follower_fresh": True,
         "engaged": True,
     }
@@ -94,12 +87,61 @@ def state_of(**overrides):
     return hand_line("LEFT", **states(**overrides)).state
 
 
+def test_a_posture_note_takes_the_hands_row():
+    note = "move to home refused: a leader is streaming arm commands"
+    assert hand_line("RIGHT", **states(squeezing=False), note=note).state == note
+    assert (
+        hand_line("RIGHT", **states(tracked=False, squeezing=False), note=note).state
+        == note
+    )
+    # The note shows while the grip is held too.
+    assert hand_line("RIGHT", **states(), note=note).state == note
+    assert (
+        hand_line(
+            "RIGHT", **states(arm_bound=False, gripper_bound=False), note=note
+        ).state
+        == "nothing bound"
+    )
+
+
+def test_the_posture_state_rides_the_right_hands_row():
+    posture = PostureStatus()
+    posture.moving = "home"
+    session = FakeSession({"left": squeezing_hand()})
+    moving = "moving to home..."
+    state = snapshot(
+        session,
+        [source("left"), source("right")],
+        10.0,
+        quiet(),
+        no_health(),
+        posture=posture,
+    )
+    rows = {row.label: row.state for row in state.hands}
+    assert rows["RIGHT"] == moving
+    assert rows["LEFT"] != moving
+    posture.moving = None
+    posture.set_note("move to home completed")
+    state = snapshot(
+        session,
+        [source("left"), source("right")],
+        10.0,
+        quiet(),
+        no_health(),
+        posture=posture,
+    )
+    assert {row.label: row.state for row in state.hands}[
+        "RIGHT"
+    ] == "move to home completed"
+
+
 def test_each_gate_the_operator_hits_gets_its_own_wording():
     # The panel exists to answer "why is nothing moving", so every refusal
     # must read differently.
     assert state_of(arm_bound=False, gripper_bound=False) == "nothing bound"
     assert state_of(tracked=False) == "no controller"
     assert state_of(squeezing=False) == "grip released"
+    assert state_of(held_over=True) == "release the grip, then squeeze again"
     assert state_of(follower_fresh=False) == "waiting for arm"
     assert state_of(engaged=False) == "re-anchoring"
     assert state_of() == "driving"
@@ -128,7 +170,9 @@ def test_a_lone_wired_hand_is_named_for_the_slot_it_drives():
 def test_the_earliest_unmet_gate_wins_over_every_later_one():
     # Pin each adjacent pair: reordering any two checks would report a later
     # problem than the one the operator has to fix first.
-    assert state_of(arm_bound=False, gripper_bound=False, tracked=False) == "nothing bound"
+    assert (
+        state_of(arm_bound=False, gripper_bound=False, tracked=False) == "nothing bound"
+    )
     assert state_of(tracked=False, squeezing=False) == "no controller"
     assert state_of(squeezing=False, follower_fresh=False) == "grip released"
     assert state_of(follower_fresh=False, engaged=False) == "waiting for arm"
@@ -143,42 +187,6 @@ def test_only_a_driving_hand_reads_as_driving():
 
 def test_the_label_is_carried_through():
     assert hand_line("RIGHT", **states()).label == "RIGHT"
-
-
-class FakeSession:
-    """A frame source holding one hand-set, stamped now."""
-
-    def __init__(self, hands=None, age_s=0.0):
-        self._hands = hands or {}
-        self._age_s = age_s
-
-    def latest(self):
-        if self._hands is None:
-            return None
-        return XrFrame(
-            received_monotonic_s=time.monotonic() - self._age_s, hands=self._hands
-        )
-
-
-def squeezing_hand():
-    return HandSample(pose=POSE, squeezing=True, trigger=0.0)
-
-
-def source(handedness, *, arm_bound=True, gripper_bound=None, fresh=True, engaged=False):
-    measured = LatestPose()
-    if fresh:
-        measured.set(POSE)
-    clutch = HandClutch(1.0)
-    if engaged:
-        clutch.step(squeezing=True, hand=POSE, measured_ee=POSE)
-    gripper = arm_bound if gripper_bound is None else gripper_bound
-    return HandSource(
-        handedness=handedness,
-        clutch=clutch,
-        measured=measured,
-        arm_paired=lambda: arm_bound,
-        gripper_paired=lambda: gripper,
-    )
 
 
 def test_each_row_reads_its_own_hand_not_a_neighbours():
@@ -209,19 +217,37 @@ def test_a_pair_established_after_boot_reaches_the_panel():
     hand = HandSource(
         handedness="left",
         clutch=HandClutch(1.0),
-        measured=LatestPose(),
-        arm_paired=lambda: bool(paired),
-        gripper_paired=lambda: False,
+        squeeze=HeldOverSqueeze(),
+        measured=MeasuredPoses(),
+        arm_peer=lambda: paired[0] if paired else None,
+        gripper_peer=lambda: None,
     )
     assert (
         snapshot(session, [hand], 10.0, quiet(), no_health()).hands[0].state
         == "nothing bound"
     )
-    paired.append(True)
+    paired.append("backbone")
     assert (
         snapshot(session, [hand], 10.0, quiet(), no_health()).hands[0].state
         != "nothing bound"
     )
+
+
+def test_a_long_row_state_stays_inside_the_panel():
+    long_state = "move to home refused: a leader is streaming arm commands and more"
+    rows = (panel.Row("RIGHT", long_state, (70, 70, 235)),)
+    frame = render(PanelState(headset_live=True, hands=rows))
+    lit = np.nonzero(np.any(frame != panel._BACKGROUND, axis=2).any(axis=0))[0]
+    assert lit.max() <= panel._WIDTH - panel._MARGIN_X
+
+
+def test_a_one_armed_robots_only_row_carries_the_posture_note():
+    posture = PostureStatus()
+    posture.moving = "home"
+    session = FakeSession({"left": squeezing_hand()})
+    hands = [source("left"), source("right", arm_bound=False, gripper_bound=False)]
+    rows = snapshot(session, hands, 10.0, quiet(), no_health(), posture=posture).hands
+    assert [(row.label, row.state) for row in rows] == [("ARM", "moving to home...")]
 
 
 def test_only_wired_hands_get_rows_and_a_lone_one_reads_arm():
@@ -277,13 +303,19 @@ def panel_state(*rows):
     return PanelState(headset_live=True, hands=tuple(rows))
 
 
-def test_an_unwired_alert_slot_renders_differently_from_a_quiet_one():
-    # "none" and "not wired" must differ in pixels, not just in state: the
-    # panel is the only place the operator can see the difference.
+def test_an_unwired_alert_slot_draws_no_section_and_a_quiet_one_does():
     rows = (hand_line("LEFT", **states()),)
-    quiet = render(PanelState(headset_live=True, hands=rows, alerts_bound=True))
-    unwired = render(PanelState(headset_live=True, hands=rows, alerts_bound=False))
-    assert not np.array_equal(quiet, unwired)
+    blank = render(
+        PanelState(
+            headset_live=True, hands=rows, alerts_bound=False, health_bound=False
+        )
+    )
+    quiet = render(
+        PanelState(headset_live=True, hands=rows, alerts_bound=True, health_bound=False)
+    )
+    below = slice(panel._RULE_Y, None)
+    assert not np.any(blank[below] != panel._BACKGROUND)
+    assert not np.array_equal(quiet[below], blank[below])
 
 
 def test_a_rendered_frame_is_what_the_encoder_expects():
@@ -547,13 +579,20 @@ def test_the_health_section_is_drawn_below_the_alerts():
     )
 
 
-def test_an_unwired_health_slot_renders_differently_from_a_quiet_one():
-    # "no reports" and "not wired" must differ in pixels: with producers
-    # wired, a silent section is a finding, not a launcher choice.
+def test_an_unwired_health_slot_draws_no_section_and_a_silent_wired_one_does():
+    # With producers wired, a silent section is a finding: "no reports".
     rows = (hand_line("LEFT", **states()),)
-    wired = render(PanelState(headset_live=True, hands=rows, health_bound=True))
-    unwired = render(PanelState(headset_live=True, hands=rows, health_bound=False))
-    assert not np.array_equal(wired, unwired)
+    wired = render(
+        PanelState(headset_live=True, hands=rows, alerts_bound=False, health_bound=True)
+    )
+    unwired = render(
+        PanelState(
+            headset_live=True, hands=rows, alerts_bound=False, health_bound=False
+        )
+    )
+    below = slice(panel._MOTORS_RULE_Y, None)
+    assert not np.any(unwired[below] != panel._BACKGROUND)
+    assert not np.array_equal(wired[below], unwired[below])
 
 
 def test_a_long_health_row_stays_inside_the_panel():
@@ -607,9 +646,7 @@ def test_a_relabelled_task_redraws_the_panel():
 def test_naming_the_first_task_redraws_the_panel():
     session = FakeSession({"left": squeezing_hand()})
     hands = [source("left")]
-    unset = snapshot(
-        session, hands, 10.0, quiet(), no_health(), RecorderStatus(), None
-    )
+    unset = snapshot(session, hands, 10.0, quiet(), no_health(), RecorderStatus(), None)
     named = snapshot(
         session, hands, 10.0, quiet(), no_health(), RecorderStatus(), "wipe the table"
     )
@@ -623,7 +660,9 @@ def test_the_task_shares_the_link_line_instead_of_taking_a_status_row():
     rows = (hand_line("LEFT", **states()), hand_line("RIGHT", **states()))
     without = render(PanelState(headset_live=True, hands=rows))
     with_task = render(
-        PanelState(headset_live=True, hands=rows, task=panel.task_line("wipe the table"))
+        PanelState(
+            headset_live=True, hands=rows, task=panel.task_line("wipe the table")
+        )
     )
     row_band = slice(panel._FIRST_ROW_BASELINE - 30, panel._RULE_Y)
     assert np.array_equal(without[row_band], with_task[row_band])

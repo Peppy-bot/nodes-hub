@@ -1,19 +1,13 @@
-from fastapi import FastAPI
-from fastapi.staticfiles import StaticFiles
+import asyncio
+import json
+import threading
 
-from tests.helpers import asgi_request
+import teleop_xr
+from teleop_xr.config import TeleopSettings, ViewConfig
+
+from tests.helpers import FORM, asgi_request, frontend_app
 from xr_commander.task_page import PATH, TaskLabel, build_router
-from xr_commander.xr import include_router_first, wait_until_started
-
-FORM = {"content-type": "application/x-www-form-urlencoded"}
-
-
-def frontend_app(tmp_path) -> FastAPI:
-    """A stand-in for teleop_xr's app: a frontend mounted at '/', which
-    matches every path and shadows anything routed after it."""
-    app = FastAPI()
-    app.mount("/", StaticFiles(directory=tmp_path), name="frontend")
-    return app
+from xr_commander.xr import XrSession, include_router_first, wait_until_started
 
 
 def test_a_router_added_first_outranks_the_frontend_mount(tmp_path):
@@ -60,3 +54,68 @@ def test_a_dead_server_thread_ends_the_wait_early():
 
 def test_the_deadline_bounds_a_server_that_never_starts():
     assert not wait_until_started(lambda: False, lambda: True, 0.05, tick_s=0.0)
+
+
+def test_a_panel_change_is_shown_on_the_running_servers_loop(tmp_path):
+    # The server handles its pages on its own loop in its own thread; the
+    # change runs there, between the page messages, never on the caller's,
+    # through the fork's own method, with the session's own panel raised
+    # above the cameras' row.
+    from xr_commander import tls
+
+    cert, key = tls.ensure_certificate(tmp_path)
+    status = object()
+    session = XrSession(
+        host="127.0.0.1",
+        port=0,
+        tls_cert_path=cert,
+        tls_key_path=key,
+        video_sources={"status": status},
+    )
+    shown: list[tuple[asyncio.AbstractEventLoop, int, dict, dict]] = []
+    done = threading.Event()
+    replace = session._teleop.replace_video_sources
+
+    async def record(sources, views):
+        shown.append(
+            (asyncio.get_running_loop(), threading.get_ident(), sources, views)
+        )
+        await replace(sources, views)
+        done.set()
+
+    session._teleop.replace_video_sources = record
+    session.start()
+    try:
+        chest = object()
+        session.show_views({"chest": chest})
+        assert done.wait(5.0)
+        ((loop, thread, sources, views),) = shown
+        assert loop is session._server_loop()
+        assert thread != threading.get_ident()
+        assert sources == {"status": status, "chest": chest}
+        assert views == {"status": ViewConfig(raised=True), "chest": ViewConfig()}
+        # The next page to load is told the views, the session's own raised.
+        told = json.loads(asgi_request(session._teleop.app, "GET", "/config").body)
+        assert {
+            name: view["raised"] for name, view in told["camera_views"].items()
+        } == {
+            "status": True,
+            "chest": False,
+        }
+    finally:
+        session.stop()
+    # Stopped, there is no page to show a change on.
+    session.show_views({})
+    assert len(shown) == 1
+
+
+def test_the_installed_teleop_xr_offers_what_the_session_uses():
+    # The fork's surface the session is built on; a drift fails here, ahead
+    # of node boot.
+    assert ViewConfig(raised=True).raised and ViewConfig().device is None
+    teleop = teleop_xr.Teleop(
+        TeleopSettings(camera_views={"status": ViewConfig(raised=True)})
+    )
+    served = asgi_request(teleop.app, "GET", "/config")
+    assert served.status == 200
+    assert json.loads(served.body)["camera_views"]["status"]["raised"] is True

@@ -21,40 +21,22 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
+from xr_commander import addresses
+
 _VALID_FOR = datetime.timedelta(days=3650)
 # Regenerate ahead of expiry so a long-lived install never serves a cert the
 # browser rejects outright (an expired cert cannot be clicked through).
 _RENEW_MARGIN = datetime.timedelta(days=30)
-# RFC 5737 TEST-NET; the datagram socket is never written, only routed.
-_PROBE_ENDPOINT = ("192.0.2.1", 1)
 
 
-def outbound_ip() -> str | None:
-    """The outbound-facing address, or None when routing is unknowable."""
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
-            probe.connect(_PROBE_ENDPOINT)
-            return probe.getsockname()[0]
-    except OSError:
-        return None
-
-
-def _lan_addresses() -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
-    """Every address this host answers on, for the SAN: the outbound route
-    (the address the startup log prints), the hostname's, and loopback.
+def _lan_addresses() -> list[addresses.Address]:
+    """Every address this host answers on, for the SAN: the page's addresses
+    (the ones the startup log prints) and loopback.
 
     A later address change is harmless: the interstitial covers any mismatch.
     """
-    addresses = {ipaddress.ip_address("127.0.0.1")}
-    routed = outbound_ip()
-    if routed is not None:
-        addresses.add(ipaddress.ip_address(routed))
-    try:
-        for info in socket.getaddrinfo(socket.gethostname(), None):
-            addresses.add(ipaddress.ip_address(info[4][0].split("%")[0]))
-    except (OSError, ValueError):
-        pass
-    return sorted(addresses, key=str)
+    names = {ipaddress.ip_address("127.0.0.1"), *addresses.host_addresses()}
+    return sorted(names, key=str)
 
 
 def _write_private(path: Path, data: bytes) -> None:

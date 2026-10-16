@@ -2,7 +2,6 @@ import asyncio
 import math
 
 import pytest
-
 from peppygen.consumed_topics.motor_health import motor_health as motor_health_topic
 
 from tests.helpers import FakeToken, boot, eventually, running_drain
@@ -119,7 +118,9 @@ def test_an_instance_never_received_renders_nothing():
 
 @pytest.mark.parametrize("prefix", ["", "alpha_", "right_"])
 def test_instances_follow_configured_producer_order(prefix):
-    store = MotorHealthReports(producers=(f"{prefix}right_arm_inst", f"{prefix}left_gripper_inst"))
+    store = MotorHealthReports(
+        bound_now=lambda: (f"{prefix}right_arm_inst", f"{prefix}left_gripper_inst")
+    )
     report(store, instance=f"{prefix}left_gripper_inst", levels=(0,))
     report(store, instance=f"{prefix}right_arm_inst")
     assert [entry.instance for entry in store.by_instance()] == [
@@ -262,8 +263,7 @@ async def test_drain_motor_health_keys_reports_by_the_producing_instance():
     async with boot(motor_health_instances=2) as h:
         arm, gripper = h.mocks.deps.motor_health
         arm_id, gripper_id = [
-            p.instance_id
-            for p in motor_health_topic.bound_producers(h.node_runner)
+            p.instance_id for p in motor_health_topic.bound_producers(h.node_runner)
         ]
         store = MotorHealthReports()
         async with running_drain(
@@ -274,8 +274,10 @@ async def test_drain_motor_health_keys_reports_by_the_producing_instance():
             await arm.motor_health.publish(_wire())
             await gripper.motor_health.publish(_wire((0,)))
             await eventually(
-                lambda: [entry.instance for entry in store.by_instance()]
-                == sorted([arm_id, gripper_id]),
+                lambda: (
+                    [entry.instance for entry in store.by_instance()]
+                    == sorted([arm_id, gripper_id])
+                ),
                 message="both producers' reports",
             )
         # Each report landed under its own transport-authenticated instance.
@@ -293,8 +295,7 @@ async def test_a_malformed_producer_is_reported_once_not_every_report(capsys):
     async with boot(motor_health_instances=2) as h:
         bad, good = h.mocks.deps.motor_health
         bad_id, good_id = [
-            p.instance_id
-            for p in motor_health_topic.bound_producers(h.node_runner)
+            p.instance_id for p in motor_health_topic.bound_producers(h.node_runner)
         ]
         logged: list[str] = []
         store = MotorHealthReports()
@@ -314,9 +315,7 @@ async def test_a_malformed_producer_is_reported_once_not_every_report(capsys):
         ):
             for _ in range(3):
                 await bad.motor_health.publish(_wire(levels=(9,) * 7))
-            await eventually(
-                lambda: len(unusable()) == 1, message="the first refusal"
-            )
+            await eventually(lambda: len(unusable()) == 1, message="the first refusal")
             await good.motor_health.publish(_wire())
             await eventually(
                 lambda: len(store.by_instance()) == 1, message="the good report"
@@ -338,8 +337,8 @@ async def test_a_malformed_producer_is_reported_once_not_every_report(capsys):
 
 
 def test_an_unwired_health_slot_is_distinguishable_from_a_quiet_one():
-    unwired = MotorHealthReports(producers=())
-    wired = MotorHealthReports(producers=("motor_inst",))
+    unwired = MotorHealthReports(bound_now=lambda: ())
+    wired = MotorHealthReports(bound_now=lambda: ("motor_inst",))
     assert unwired.by_instance() == wired.by_instance() == ()
     assert not unwired.producers_bound
     assert wired.producers_bound

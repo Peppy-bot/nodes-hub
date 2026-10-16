@@ -4,17 +4,80 @@ import time
 from types import SimpleNamespace
 
 import numpy as np
-
 import peppygen.clock
+from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
+from peppygen.consumed_topics.color_cameras import video_stream as color_video_stream
 from peppygen.fixtures import harness
 from peppygen.parameters import Parameters
 
+from xr_commander.clutch import HandClutch
+from xr_commander.devices import HandSample, XrFrame
 from xr_commander.frames import Pose
+from xr_commander.panel import HandSource
+from xr_commander.publish import HeldOverSqueeze, MeasuredPoses
+from xr_commander.robots import PairedRobots
 
 IDENTITY = np.array([0.0, 0.0, 0.0, 1.0])
+
+
+def frame_message(width=1, height=1, encoding="bgr8", data=None):
+    if data is None:
+        data = np.zeros((height, width, 3), dtype=np.uint8).tobytes()
+    return color_video_stream.Message(
+        header=color_video_stream.MessageHeader(timestamp=0.0, frame_id=0),
+        encoding=encoding,
+        width=width,
+        height=height,
+        frame=data,
+    )
+
+
 X = np.array([1.0, 0.0, 0.0])
 Y = np.array([0.0, 1.0, 0.0])
 POSE = Pose(np.zeros(3), IDENTITY)
+
+
+class FakeSession:
+    """A frame source holding one hand-set, stamped now."""
+
+    def __init__(self, hands=None, age_s=0.0):
+        self._hands = hands or {}
+        self._age_s = age_s
+
+    def latest(self):
+        return XrFrame(
+            received_monotonic_s=time.monotonic() - self._age_s, hands=self._hands
+        )
+
+
+def squeezing_hand():
+    return HandSample(pose=POSE, squeezing=True, trigger=0.0)
+
+
+# A stand-in for the chosen robot's pair on a slot, for tests that read the
+# panel and the streams without a wire.
+PEER = "peer"
+
+
+def source(
+    handedness, *, arm_bound=True, gripper_bound=None, fresh=True, engaged=False
+):
+    measured = MeasuredPoses()
+    if fresh:
+        measured.set(PEER, POSE)
+    clutch = HandClutch(1.0)
+    if engaged:
+        clutch.step(squeezing=True, hand=POSE, measured_ee=POSE)
+    gripper = arm_bound if gripper_bound is None else gripper_bound
+    return HandSource(
+        handedness=handedness,
+        clutch=clutch,
+        squeeze=HeldOverSqueeze(),
+        measured=measured,
+        arm_peer=lambda: PEER if arm_bound else None,
+        gripper_peer=lambda: PEER if gripper else None,
+    )
 
 
 def default_parameters(**overrides) -> SimpleNamespace:
@@ -228,3 +291,60 @@ class FakeToken:
 
     async def cancelled(self):
         await self._event.wait()
+
+
+def robots_of(h):
+    """The paired robots over the harness's real runner and slot modules."""
+    from peppygen.paired_topics.left_arm import pose_setpoints as left_arm
+    from peppygen.paired_topics.left_gripper import gripper_setpoints as left_gripper
+    from peppygen.paired_topics.right_arm import pose_setpoints as right_arm
+    from peppygen.paired_topics.right_gripper import gripper_setpoints as right_gripper
+
+    return PairedRobots(
+        h.node_runner,
+        arms={"left": left_arm, "right": right_arm},
+        grippers={"left": left_gripper, "right": right_gripper},
+    )
+
+
+def peer_of(h, module):
+    """The one mock peer the harness paired into `module`'s slot."""
+    (member,) = module.peers(h.node_runner)
+    return member.info
+
+
+FORM = {"content-type": "application/x-www-form-urlencoded"}
+
+
+def frontend_app(tmp_path) -> FastAPI:
+    """A stand-in for teleop_xr's app: a frontend mounted at '/', which
+    matches every path and shadows anything routed after it."""
+    app = FastAPI()
+    app.mount("/", StaticFiles(directory=tmp_path), name="frontend")
+    return app
+
+
+class FakeRobots:
+    """The paired robots as a pure test sets them, and the choices a page
+    makes on them."""
+
+    def __init__(self, names=(), chosen=None):
+        self._names = list(names)
+        self._chosen = chosen
+        self.choices = []
+
+    def names(self):
+        return list(self._names)
+
+    def chosen(self):
+        return self._chosen
+
+    def standing(self):
+        return self.names(), self._chosen
+
+    def choose(self, name):
+        self.choices.append(name)
+        if name not in self._names:
+            return False
+        self._chosen = name
+        return True

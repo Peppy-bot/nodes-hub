@@ -1,20 +1,18 @@
 import pytest
 from fastapi import FastAPI
 
-from tests.helpers import asgi_request
+from tests.helpers import FORM, asgi_request
 from xr_commander import task_page
+from xr_commander.forms import form_field
 from xr_commander.task_page import (
     MAX_TASK_CHARS,
     PATH,
     UNNAMED_TASK,
     TaskLabel,
     build_router,
-    form_field,
     parse_task,
     render_page,
 )
-
-FORM = {"content-type": "application/x-www-form-urlencoded"}
 
 
 def app_with(label: TaskLabel) -> FastAPI:
@@ -93,33 +91,10 @@ def test_a_refused_label_leaves_the_previous_one_recording(bad):
     assert label.current() == "fold the towel"
 
 
-def test_a_form_carries_its_task_decoded():
-    assert form_field(FORM["content-type"], b"task=pick+up+the+red+block") == (
-        "pick up the red block"
-    )
-    charset = "application/x-www-form-urlencoded; charset=utf-8"
-    assert form_field(charset, b"task=a%20b") == "a b"
-
-
-@pytest.mark.parametrize(
-    ("content_type", "body", "reason"),
-    [
-        ("application/json", b'{"task": "x"}', "must be application"),
-        (FORM["content-type"], b"other=x", "one task field"),
-        (FORM["content-type"], b"task=a&task=b", "one task field"),
-        (FORM["content-type"], b"task=\xff\xfe", "not valid UTF-8"),
-        ("", b"task=x", "must be application"),
-    ],
-)
-def test_a_malformed_submission_is_refused_structurally(content_type, body, reason):
-    with pytest.raises(ValueError, match=reason):
-        form_field(content_type, body)
-
-
 def test_a_blank_field_is_the_parsers_refusal_not_the_forms():
     # Structure is fine, so form_field hands it on; what makes a label
     # acceptable is the parser's call alone.
-    assert form_field(FORM["content-type"], b"task=") == ""
+    assert form_field(FORM["content-type"], b"task=", "task") == ""
     with pytest.raises(ValueError, match="blank"):
         labelled("fold the towel").set("")
 

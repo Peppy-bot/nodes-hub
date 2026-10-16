@@ -28,7 +28,7 @@ from xr_commander.bus import CancellationToken, Latch, ticks
 from xr_commander.clutch import HandClutch
 from xr_commander.config import Settings
 from xr_commander.devices import FrameSource, fresh_frame
-from xr_commander.publish import LatestPose
+from xr_commander.publish import HeldOverSqueeze, MeasuredPoses, PostureStatus
 from xr_commander.record import RecorderStatus
 from xr_commander.video import FrameSink
 
@@ -120,46 +120,47 @@ class HandSource:
     """Everything the panel reads for one hand, in display order.
 
     Carried together so a hand cannot be described from another hand's clutch,
-    and so an unbound arm is a state rather than a silent wait. The paired
-    callables are read live each snapshot: at setup time the daemon may still
-    be establishing the launcher's pairs, so a boot-time read races.
+    and so an unbound arm shows as a state of its own. The peer
+    callables answer the chosen robot's pair on the hand's slots, read live
+    each snapshot: the pairs follow the stack's joins and the choice.
     """
 
     handedness: str
     clutch: HandClutch
-    measured: LatestPose
-    arm_paired: Callable[[], bool]
-    gripper_paired: Callable[[], bool]
+    # The arm stream's gate: whether a squeeze must be released first.
+    squeeze: HeldOverSqueeze
+    measured: MeasuredPoses
+    arm_peer: Callable[[], object | None]
+    gripper_peer: Callable[[], object | None]
 
     def bound(self) -> HandBinding:
         """This tick's view of what listens to the hand. Read once and
-        carried, because the paired callables go live to the daemon and a
+        carried, because the peer callables go live to the daemon and a
         second read could describe a row the filter would not have admitted."""
-        return HandBinding(
-            hand=self, arm=self.arm_paired(), gripper=self.gripper_paired()
-        )
+        return HandBinding(hand=self, arm=self.arm_peer(), gripper=self.gripper_peer())
 
 
 @dataclass(frozen=True)
 class HandBinding:
-    """One hand with the pairing state read for this snapshot."""
+    """One hand with the chosen robot's pairs on its slots as read for this
+    snapshot, None where it holds none."""
 
     hand: HandSource
-    arm: bool
-    gripper: bool
+    arm: object | None
+    gripper: object | None
 
     @property
     def wired(self) -> bool:
         """Whether anything downstream listens. A side with a gripper but no
         pose_link still grips, so either slot counts."""
-        return self.arm or self.gripper
+        return self.arm is not None or self.gripper is not None
 
     def label(self, *, lone: bool) -> str:
         """The row's name. A single wired hand is the robot's one limb, so it
         drops the handedness and says which slot it actually drives."""
         if not lone:
             return self.hand.handedness.upper()
-        return "ARM" if self.arm else "GRIPPER"
+        return "ARM" if self.arm is not None else "GRIPPER"
 
 
 @dataclass(frozen=True)
@@ -238,19 +239,28 @@ def hand_line(
     gripper_bound: bool,
     tracked: bool,
     squeezing: bool,
+    held_over: bool,
     follower_fresh: bool,
     engaged: bool,
+    note: str | None = None,
 ) -> Row:
     """Read one hand's row off the same conditions the clutch gates on, in the
-    order the operator hits them: a bound slot, a controller, a grip, a
-    follower, a snapshot. The earliest unmet one is what to fix.
+    order the operator hits them: a bound slot, a controller, a grip, a grip
+    released since the robot changed, a follower, a snapshot. The earliest
+    unmet one is what to fix. `note`, a posture move, its outcome or why a
+    press was ignored, takes the row while it stands, on a hand with a
+    binding.
     """
     if not arm_bound and not gripper_bound:
         return Row(label, "nothing bound", _RESTING)
+    if note:
+        return Row(label, note, _WAITING)
     if not tracked:
         return Row(label, "no controller", _RESTING)
     if not squeezing:
         return Row(label, "grip released", _RESTING)
+    if held_over:
+        return Row(label, "release the grip, then squeeze again", _WAITING)
     if not arm_bound:
         # A gripper-only hand's grip is the whole story: no pose to anchor,
         # so the clutch's follower and engagement gates do not apply.
@@ -301,14 +311,19 @@ def snapshot(
     health: motor_health.MotorHealthReports,
     recorder: RecorderStatus | None = None,
     task: str | None = None,
+    posture: PostureStatus | None = None,
 ) -> PanelState:
-    """This tick's panel content, read from the sources the streams read."""
+    """This tick's panel content, read from the sources the streams read.
+    The posture buttons are the right controller's, so their state goes on
+    the right hand's row, or on the only row when the right hand has none."""
     frame = fresh_frame(session, stale_timeout_s)
     # Only hands something listens to get a row; with nothing wired at all,
     # every hand shows so a misconfigured stack says why nothing drives.
     bound = [hand.bound() for hand in hands]
     wired = [binding for binding in bound if binding.wired]
     shown = wired if wired else bound
+    has_right = any(b.hand.handedness == "right" for b in shown)
+    noted = "right" if has_right else (shown[0].hand.handedness if shown else None)
     rows = []
     for binding in shown:
         hand = binding.hand
@@ -316,12 +331,17 @@ def snapshot(
         rows.append(
             hand_line(
                 binding.label(lone=len(wired) == 1),
-                arm_bound=binding.arm,
-                gripper_bound=binding.gripper,
+                arm_bound=binding.arm is not None,
+                gripper_bound=binding.gripper is not None,
                 tracked=sample is not None,
                 squeezing=bool(sample and sample.squeezing),
-                follower_fresh=hand.measured.fresh(stale_timeout_s) is not None,
+                held_over=hand.squeeze.held_over(),
+                follower_fresh=hand.measured.fresh(binding.arm, stale_timeout_s)
+                is not None,
                 engaged=hand.clutch.engaged,
+                note=posture.state()
+                if posture is not None and hand.handedness == noted
+                else None,
             )
         )
     recorder_line = recorder_row(recorder)
@@ -376,7 +396,8 @@ def render(state: PanelState) -> np.ndarray:
     for index, row in enumerate(rows):
         baseline = _FIRST_ROW_BASELINE + index * _ROW_STEP
         _text(frame, row.label, (_MARGIN_X, baseline), _BODY_SCALE, _HEADING)
-        _text(frame, row.state, (_STATE_X, baseline), _BODY_SCALE, row.colour)
+        body, scale = _fitted(row.state, _BODY_SCALE, _WIDTH - _MARGIN_X - _STATE_X)
+        _text(frame, body, (_STATE_X, baseline), scale, row.colour)
     _render_alerts(frame, state.alerts, state.alerts_bound)
     _render_health(frame, state.health, state.health_bound)
     return frame
@@ -385,13 +406,11 @@ def render(state: PanelState) -> np.ndarray:
 def _render_alerts(
     frame: np.ndarray, alerts: tuple[PanelLine, ...], bound: bool
 ) -> None:
-    """The alert section, headed even when empty so a quiet robot is legible
-    as quiet rather than as a panel that stopped drawing.
-
-    An empty section says which kind of quiet it is. The slot is
-    zero_or_more, so a stack that wired nothing receives nothing and would
-    otherwise be indistinguishable from a robot with nothing to report.
+    """The alert section, headed even when empty so a quiet robot reads as
+    quiet; absent while nothing is wired to the slot.
     """
+    if not alerts and not bound:
+        return
     cv2.rectangle(
         frame,
         (_MARGIN_X, _RULE_Y),
@@ -401,8 +420,7 @@ def _render_alerts(
     )
     _text(frame, "ALERTS", (_MARGIN_X, _ALERTS_TITLE_BASELINE), _BODY_SCALE, _HEADING)
     if not alerts:
-        empty, colour = ("none", _RESTING) if bound else ("not wired", _WAITING)
-        _text(frame, empty, (_STATE_X, _ALERTS_TITLE_BASELINE), _BODY_SCALE, colour)
+        _text(frame, "none", (_STATE_X, _ALERTS_TITLE_BASELINE), _BODY_SCALE, _RESTING)
         return
     usable = _WIDTH - 2 * _MARGIN_X
     for index, line in enumerate(alerts):
@@ -414,13 +432,16 @@ def _render_alerts(
 def _render_health(
     frame: np.ndarray, health: tuple[PanelLine, ...], bound: bool
 ) -> None:
-    """The motor health section, headed even when empty like the alerts.
+    """The motor health section, headed even when empty like the alerts, and
+    absent like them while nothing is wired.
 
     An empty section with producers wired reads "no reports" in the quiet
     colour: the contract mandates a report per 500 ms, so a wired slot that
-    has heard nothing is itself a finding, where "not wired" is a launcher
-    choice. Sources never received draw no rows at all.
+    has heard nothing is itself a finding. Sources never received draw no
+    rows at all.
     """
+    if not health and not bound:
+        return
     cv2.rectangle(
         frame,
         (_MARGIN_X, _MOTORS_RULE_Y),
@@ -430,10 +451,13 @@ def _render_health(
     )
     _text(frame, "MOTORS", (_MARGIN_X, _MOTORS_TITLE_BASELINE), _BODY_SCALE, _HEADING)
     if not health:
-        empty, colour = (
-            ("no reports", _NOT_REPORTING_MAGENTA) if bound else ("not wired", _WAITING)
+        _text(
+            frame,
+            "no reports",
+            (_STATE_X, _MOTORS_TITLE_BASELINE),
+            _BODY_SCALE,
+            _NOT_REPORTING_MAGENTA,
         )
-        _text(frame, empty, (_STATE_X, _MOTORS_TITLE_BASELINE), _BODY_SCALE, colour)
         return
     usable = _WIDTH - 2 * _MARGIN_X
     for index, line in enumerate(health):
@@ -451,10 +475,14 @@ async def stream_status(
     token: CancellationToken,
     alerts: ActiveAlerts,
     health: motor_health.MotorHealthReports,
-    recorder: RecorderStatus | None = None,
-    read_task: Callable[[], str] | None = None,
+    recorder: Callable[[], RecorderStatus | None],
+    read_task: Callable[[], str | None],
+    posture: PostureStatus,
 ) -> None:
     """Publish the panel until shutdown, re-drawing only on a change.
+
+    `recorder` and `read_task` are read per frame: the chosen robot decides
+    whether a recorder row and a task line are drawn.
 
     Latched: a failing render would repeat every frame, and the panel going
     dark is not worth killing a session over.
@@ -464,9 +492,15 @@ async def stream_status(
     frame: np.ndarray | None = None
     async for _ in ticks(1.0 / _PUBLISH_HZ, token):
         try:
-            task = read_task() if read_task is not None else None
             state = snapshot(
-                session, hands, settings.stale_timeout_s, alerts, health, recorder, task
+                session,
+                hands,
+                settings.stale_timeout_s,
+                alerts,
+                health,
+                recorder(),
+                read_task(),
+                posture=posture,
             )
             if state != drawn or frame is None:
                 frame, drawn = render(state), state

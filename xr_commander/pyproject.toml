@@ -41,3 +41,7 @@ asyncio_mode = "auto"
 [tool.uv.sources]
 peppygen = { path = ".peppy/libs/peppygen" }
 peppylib = { path = ".peppy/libs/peppylib" }
+# The WebXR server and its page come from Peppy's fork of teleop_xr, as the
+# wheel its release attaches: the page is built into the wheel, so uv
+# installs it as any wheel.
+teleop-xr = { url = "https://github.com/Peppy-bot/teleop_xr/releases/download/v1.3.5%2Bpeppy.1/teleop_xr-1.3.5%2Bpeppy.1-py3-none-any.whl" }
