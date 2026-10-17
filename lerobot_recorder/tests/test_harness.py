@@ -9,7 +9,7 @@ commanded_joints source (one limb), one color camera, and the remaining
 zero_or_more slots deliberately empty. Synchronization is wire-observable
 (goal admission, feedback, results, service responses) under bounded
 timeouts; the only polling is retrying goal admission while the mocks'
-first samples are still in flight, itself bounded."""
+first samples or a ticked instant are still in flight, itself bounded."""
 
 import asyncio
 import json
@@ -40,6 +40,8 @@ OBSERVED = "mock-core/mock-observed_joints-0/mock_source"
 COMMANDED = "mock-core/mock-commanded_joints-0/mock_source"
 CAMERA = "mock-core/mock-color_cameras-0"
 LIMB = "mock_source"
+# What the node's refusal says while its clock has read no instant.
+CLOCK_NOT_READY = "clock not ready"
 
 
 def params(tmp_path) -> Parameters:
@@ -102,11 +104,12 @@ async def stream(h, stop: asyncio.Event) -> None:
             pass
 
 
-async def goal_accepted(h, deadline_s: float = 240.0):
-    """Send record_episode goals until the node admits one. Rejections while
-    the mocks' first samples are in flight are the node's own admission
-    answers ('... has not produced yet' / 'no fresh frame'), so the retry is
-    driving the real wire protocol, bounded by deadline_s."""
+async def first_goal_answer(h, settled, failure: str, deadline_s: float):
+    """Send record_episode goals until the node's answer is `settled`, and
+    return that answer. The refusals before it are the node's own admission
+    answers while what it waits for is still in flight to it, so the retry is
+    driving the real wire protocol, bounded by deadline_s. `failure` opens
+    the message of a retry that runs out."""
     loop = asyncio.get_running_loop()
     deadline = loop.time() + deadline_s
     reason = None
@@ -117,12 +120,33 @@ async def goal_accepted(h, deadline_s: float = 240.0):
             peppylib.QoSProfile.Standard,
             30.0,
         )
-        if goal.accepted:
+        if settled(goal):
             return goal
         reason = goal.reason
         assert reason, "a rejection must carry the node's refusal reason"
         await asyncio.sleep(0.2)
-    pytest.fail(f"goal never accepted within {deadline_s}s; last reason: {reason!r}")
+    pytest.fail(f"{failure} within {deadline_s}s; last reason: {reason!r}")
+
+
+async def goal_accepted(h, deadline_s: float = 240.0):
+    """Send record_episode goals until the node admits one, retrying the
+    refusals while the mocks' first samples are in flight ('... has not
+    produced yet' / 'no fresh frame')."""
+    return await first_goal_answer(
+        h, lambda goal: goal.accepted, "goal never accepted", deadline_s
+    )
+
+
+async def goal_past_the_clock(h, deadline_s: float = 60.0):
+    """Send record_episode goals until the node answers with something other
+    than its clock refusal, retrying that refusal while the instant the test
+    ticked is in flight to the node's clock."""
+    return await first_goal_answer(
+        h,
+        lambda goal: goal.accepted or CLOCK_NOT_READY not in goal.reason,
+        "the node never read the ticked instant",
+        deadline_s,
+    )
 
 
 async def finish_rolled(h, deadline_s: float = 60.0):
@@ -196,18 +220,15 @@ async def test_a_driven_clock_gates_admission_until_the_test_ticks_it(tmp_path):
             30.0,
         )
         assert not goal.accepted
-        assert "clock not ready" in goal.reason
+        assert CLOCK_NOT_READY in goal.reason
 
         # The test is the simulator: tick() waits for the node's clock
-        # subscription (opened by the setup's clock init), publishes the
-        # instant, and from here on now_ns() reads exactly this value.
+        # subscription (opened by the setup's clock init) and publishes the
+        # instant. The node's subscription takes the instant in on a task of
+        # its own, so a goal sent right after tick() can still meet the clock
+        # refusal.
         await h.clock.tick(1_000_000_000)
-        goal = await record_episode.send_goal(
-            h,
-            record_episode.GoalRequestData(task="time-but-no-sources"),
-            peppylib.QoSProfile.Standard,
-            30.0,
-        )
+        goal = await goal_past_the_clock(h)
         assert not goal.accepted
         assert "has not produced yet" in goal.reason
 

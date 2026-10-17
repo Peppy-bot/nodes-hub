@@ -15,6 +15,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -124,6 +125,14 @@ def names_in(directory: Path) -> list[str]:
 
 def content_of(directory: Path) -> dict[str, bytes]:
     return {path.name: path.read_bytes() for path in directory.iterdir()}
+
+
+def wait_until_written(path: Path, size: int) -> None:
+    """Waits until another process has written `size` bytes of `path`."""
+    end = time.monotonic() + FAILURE_S
+    while (written := path.stat().st_size) < size:
+        assert time.monotonic() < end, f"{path.name} holds {written} of {size} bytes after {FAILURE_S} s"
+        time.sleep(0.01)
 
 
 def test_every_model_is_pinned_by_a_commit_and_every_file_by_its_size_and_the_hash_of_each_piece():
@@ -620,14 +629,17 @@ def test_a_node_that_stops_in_a_download_ends_at_once_and_the_next_start_continu
     loopback.stalls_after = 35
     arguments = [loopback.url, str(directory), json.dumps(dataclasses.asdict(SAFETENSORS))]
     node = subprocess.Popen([sys.executable, "-c", NODE_THAT_STOPS_IN_A_DOWNLOAD, *arguments], stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+    fetching = directory / f"{MODEL.directory_name}{FETCHING_SUFFIX}"
     try:
         assert loopback.stalled.wait(FAILURE_S)
-        # The node is told to stop while its download waits for the next bytes.
+        # The server has sent 35 bytes. The node writes the three whole
+        # pieces in them, and then its download waits for the rest of the
+        # fourth: the node is told to stop only then.
+        wait_until_written(fetching / f"model.safetensors{PARTIAL_SUFFIX}", 30)
         _, errors = node.communicate(b"stop\n", timeout=FAILURE_S)
     finally:
         node.kill()
     assert node.returncode == 0, errors.decode()
-    fetching = directory / f"{MODEL.directory_name}{FETCHING_SUFFIX}"
     assert content_of(fetching) == {f"model.safetensors{PARTIAL_SUFFIX}": FILES["model.safetensors"][:30]}
     # The lock went with the process, and the next start asks for the rest.
     loopback.seen.clear()
