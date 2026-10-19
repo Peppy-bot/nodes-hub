@@ -1,0 +1,54 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ai_brain_vla"
+version = "0.1.0"
+description = "ai_brain_vla peppy node"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "peppygen",
+    "peppylib",
+    # The core every brain shares: the contract rules, the robot proxy, the
+    # camera geometry and the goal loops.
+    "brain_core",
+    # Arrays and pictures for the sam3_siglip pipeline and the enrolment
+    # gallery.
+    "numpy>=1.26",
+    "pillow>=10",
+]
+
+[project.optional-dependencies]
+# The sam3_siglip perception model: SAM 3 and SigLIP through transformers on
+# torch. An extra, so a checkout that runs the unit tests never installs
+# them; the container installs it (apptainer.def).
+sam3-siglip = [
+    "torch>=2.7,<3",
+    # SAM 3's image processor is built on torchvision's transforms.
+    "torchvision>=0.22",
+    "transformers>=5.18,<5.19",
+    # SigLIP's tokenizer.
+    "sentencepiece>=0.2",
+    "protobuf>=5",
+]
+
+[project.scripts]
+ai_brain_vla = "ai_brain_vla.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ai_brain_vla"]
+
+[dependency-groups]
+dev = ["pytest>=8", "pytest-asyncio>=0.25"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.uv.sources]
+peppygen = { path = ".peppy/libs/peppygen" }
+peppylib = { path = ".peppy/libs/peppylib" }
+# brain_core lives in the public-peppy-libs repository, pinned to one commit
+# of it: the node image holds the node's own directory alone.
+brain_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "brain_core", rev = "9de347b9b38570d16777f3340e95cc0676383a9b" }

@@ -1,0 +1,126 @@
+// ai_brain_vla: a brain whose models run beside the robot, on its GPU. It
+// implements item_perception and item_manipulation, the contracts that scan
+// for items, find one, pick it up and put it down, and brain_model, which
+// names the model of each role. It depends on limb_motion, the backbone's
+// discrete arm and gripper moves; the launcher binds that slot to the
+// instance that governs the arms, so any move sent through it is collision
+// governed on the way down. brain_core enforces every contract rule; what
+// it cannot know, finding an item in an image and moving an arm to it, is
+// the model of each role, which the parameters below name. Perception
+// defaults to "sam3_siglip" and manipulation to "none". A role on "none"
+// refuses its goals, naming the missing model.
+{
+  peppy_schema: "node/v1",
+  manifest: {
+    name: "ai_brain_vla",
+    tag: "v1",
+    implements: [
+      { name: "item_perception", tag: "v1", link_id: "item_perception" },
+      { name: "item_manipulation", tag: "v1", link_id: "item_manipulation" },
+      { name: "brain_model", tag: "v1", link_id: "brain_model" },
+    ],
+    depends_on: {
+      contracts: [
+        { name: "limb_motion", tag: "v1", link_id: "limb_motion" },
+        // The camera the brain looks through: colour and depth from one
+        // rgbd producer, so a detection's pixel becomes a world position
+        // through the depth at that pixel and the camera model below.
+        // Optional: without a camera the brain still serves every member,
+        // and both searches are refused with "no perception source".
+        { name: "rgbd_camera", tag: "v1", link_id: "camera", cardinality: "zero_or_one" },
+        // Where that camera's pixels point: its colour intrinsics and lens
+        // model, served by the camera node (the sim relays, zed_camera,
+        // realsense_d4xx). Bound to the same camera as `camera`. Optional
+        // like it: without it no pixel can become a position, so both
+        // searches are refused naming the slot until it answers.
+        { name: "camera_geometry", tag: "v1", link_id: "geometry", cardinality: "zero_or_one" },
+        // Where that camera stands on the robot: the pose of its optical
+        // frame in the robot frame, served by the robot's backbone for the
+        // camera the `camera_name` parameter names. Optional like the two
+        // above: without it no pixel can become a position, so both
+        // searches are refused naming the slot until it answers and names
+        // the camera.
+        { name: "camera_mounts", tag: "v1", link_id: "camera_mounts", cardinality: "zero_or_one" },
+      ],
+    },
+  },
+  interfaces: {
+    actions: {
+      exposes: [
+        { link_id: "item_perception", name: "scan_items" },
+        { link_id: "item_perception", name: "identify_item" },
+        { link_id: "item_manipulation", name: "grab_item" },
+        { link_id: "item_manipulation", name: "drop_item" },
+        { link_id: "item_manipulation", name: "place_item" },
+        { link_id: "item_manipulation", name: "abort" },
+        { link_id: "brain_model", name: "switch_model" },
+      ],
+      consumes: [
+        { link_id: "limb_motion", name: "move_arm" },
+        { link_id: "limb_motion", name: "move_gripper" },
+      ],
+    },
+    topics: {
+      consumes: [
+        { link_id: "camera", name: "video_stream" },
+        { link_id: "camera", name: "depth_stream" },
+      ],
+    },
+    services: {
+      exposes: [
+        { link_id: "item_manipulation", name: "get_state" },
+        { link_id: "brain_model", name: "get_model" },
+        { link_id: "brain_model", name: "list_models" },
+      ],
+      consumes: [
+        { link_id: "camera", name: "depth_stream_info" },
+        { link_id: "geometry", name: "get_color_intrinsics" },
+        { link_id: "geometry", name: "get_depth_intrinsics" },
+        { link_id: "camera_mounts", name: "get_camera_poses" },
+      ],
+    },
+  },
+  execution: {
+    language: "python",
+    container: {
+      def_file: "apptainer.def",
+      // The perception models compute on the host's NVIDIA GPU; without a
+      // driver they fall back to the CPU, slowly.
+      apptainer_run_extra_args: ["--nv"],
+    },
+    parameters: {
+      // Each arm with the gripper it carries, comma separated, in the order
+      // get_state reports the grippers: "left_arm:left_gripper,right_arm:right_gripper"
+      // on the OpenArm, "arm:gripper" on the SO-101. They are the names
+      // limb_motion addresses, so the launcher names the limbs the robot has.
+      limbs: "string",
+      // The perception model, for the node's whole life. "sam3_siglip", the
+      // default, is SAM 3 to find and SigLIP to name, by words from a
+      // general vocabulary: about 1 s a scan on an A10, about 2 s on a
+      // Jetson Thor; it loads in the background from the node's start, and
+      // its first load on a machine downloads about 7 GB of pinned weights
+      // into the daemon user's home. "none" runs no model: every search is
+      // refused with "no perception source", which is what the contract
+      // asks for when the brain cannot see.
+      perception_model: { $type: "string", $default: "sam3_siglip" },
+      // The manipulation model. "none" moves nothing: every sequence is
+      // refused naming the missing model, while abort and get_state work.
+      manipulation_model: { $type: "string", $default: "none" },
+      // An enrolment gallery for "sam3_siglip": the name of an enrolment the
+      // node ships, whose items then take their own names before the
+      // vocabulary's when the picture and the words agree.
+      // "waldo_catalogue" holds the simulation's table objects as SigLIP
+      // prototypes; the simulation launchers select it. Empty is no
+      // gallery, the robot's default. A gallery beside perception_model
+      // "none" stops the node at its start, since nothing would read it.
+      perception_gallery: { $type: "string", $default: "" },
+      // The name the camera the brain looks through runs under on the
+      // robot, as the robot's camera_mounts lists it: the brain reads the
+      // pose of that camera, in the robot frame, from the `camera_mounts`
+      // slot, once, and reports every position in that frame. A camera an
+      // arm carries moves between the answer and a scan, so the brain looks
+      // through one fixed to the robot's body.
+      camera_name: "string",
+    },
+  },
+}
