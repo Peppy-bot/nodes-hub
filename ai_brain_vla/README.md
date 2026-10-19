@@ -115,6 +115,64 @@ computes in a daemon thread of its own, and its lane stays busy until it has
 returned, so a second search never starts on the same models while the
 first still runs.
 
+## How it works
+
+brain_core's README draws the parts every brain shares, a goal from its
+arrival to its result, and cancel, abort and shutdown. This node brings
+`VlaModels`, its `ModelSource`, and `Sam3SiglipDetector`, the perception
+model `sam3_siglip`.
+
+### switch_model
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as caller
+    participant H as switch_model handler
+    participant M as Models
+    participant VM as VlaModels
+    C->>H: goal with role and model
+    H->>H: parse_role(goal.role, the brain's roles), as a lane-less job
+    alt not a role of this brain
+        H-->>C: refused: this brain runs no model for the role
+    else a Role
+        H->>M: switch(role, model, job)
+        M->>VM: offered(role, model)
+        alt not the model the role runs
+            VM-->>C: refused: this brain runs only 'sam3_siglip' for perception
+        else the role's lane runs a goal, or another switch of the role runs
+            M-->>C: refused, naming it
+        else the running model
+            M->>VM: await prepare(entry)
+            VM-->>M: the same model, with no load
+            M-->>H: the model's name
+            H-->>C: success, role and model
+        end
+    end
+```
+
+### scan_items, from the perceiver to the models
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant B as Brain.look
+    participant P as Perceiver
+    participant D as Sam3SiglipDetector
+    participant T as daemon thread
+    B->>D: why_unavailable()
+    alt its background load runs, or failed
+        D-->>B: "perception_model 'sam3_siglip' is still loading", or the load's error
+    else loaded
+        B->>P: scan(detector, [], cancel, timeout_s)
+        P->>D: await detect(image, [], deadline)
+        D->>T: find(image, [], deadline)
+        T->>T: SAM 3 proposes, SigLIP embeds the crops, the crops are named, the deadline checked between
+        T-->>D: boxes, or SearchTimeout
+        D-->>P: boxes
+    end
+```
+
 ## Parameters
 
 - `limbs`: each arm with the gripper it carries, in the order `get_state`

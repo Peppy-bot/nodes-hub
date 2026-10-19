@@ -96,6 +96,99 @@ goal of its role runs, naming it, and while another switch of its role runs.
 A goal never sees its model change. At the node's start the starting model
 makes no call: the first search is its first call.
 
+## How it works
+
+brain_core's README draws the parts every brain shares, a goal from its
+arrival to its result, and cancel, abort and shutdown. This node brings
+`RouterModels`, its `ModelSource`, and `VlmDetector`, the perception model
+of a catalog entry.
+
+### switch_model
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as caller
+    participant H as switch_model handler
+    participant B as Brain.run_guarded
+    participant Q as Sequencer
+    participant M as Models
+    participant RM as RouterModels
+    participant P as Provider
+    C->>H: goal with role and model
+    H->>B: run_guarded(ctx, no lane, "switch_model", body, ZERO)
+    B->>Q: start(no lane, "switch_model")
+    alt the node is shutting down
+        Q-->>B: Refusal
+        B-->>C: success=false
+    else admitted as a lane-less job
+        Q-->>B: Job
+        B->>H: body(job)
+        H->>H: parse_role(goal.role, the brain's roles)
+        alt not a role of this brain
+            H-->>B: Refusal: this brain runs no model for the role
+        else a Role
+            H->>M: switch(role, model, job)
+            M->>RM: offered(role, model)
+            alt the role does not take the model
+                RM-->>B: Refusal: the model is not a model of the role here, see list_models
+            else another switch of the role runs
+                M-->>B: Refusal: switch_model is running for the role
+            else the role's lane runs a goal
+                M-->>B: Refusal: scan_items is running
+            else every check passes
+                M->>M: mark the role as switching
+                M->>RM: await prepare(entry), cut short by the job's cancel
+                alt no route of the model has a key
+                    RM-->>B: Refusal naming every key variable, no call made
+                else a route has a key
+                    RM->>P: await ask(route, a small grey picture, the probe question, at least 30 s)
+                    alt the provider fails, or the answer does not read
+                        P-->>B: ProviderFailure or UnreadableAnswer, the role keeps its model
+                    else the model answers
+                        RM-->>M: a VlmDetector on that route
+                        M->>M: the job's cancel is checked, then the lane, with no await before the set
+                        M->>M: the role's model is the new VlmDetector
+                        M-->>H: the model's name
+                        H-->>B: role and model
+                    end
+                end
+                M->>M: release the switching mark
+            end
+        end
+        B-->>C: the result, action_time the elapsed time
+        B->>Q: finish(job)
+    end
+```
+
+### scan_items, from the detector to the provider
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant P as Perceiver
+    participant D as VlmDetector
+    participant V as Provider
+    P->>D: await detect(image, [], deadline)
+    D->>D: the scan prompt, and the frame as a JPEG at quality 95
+    loop at most 2 calls
+        D->>D: deadline.check()
+        D->>V: await ask(route, jpeg, prompt, the budget left, never under the route's floor)
+        V-->>D: Reply, or ProviderFailure
+        Note over D,V: one more call, after 1 s, only for a 429, a gateway timeout or a 5xx, with budget left
+    end
+    alt the deadline passed before a call
+        D-->>P: SearchTimeout
+    else the provider failed
+        D-->>P: ProviderFailure, one log line with no traceback
+    else the answer does not read against the schema
+        D-->>P: UnreadableAnswer, its text in the log
+    else boxes, or none
+        D->>D: box_2d from yx_0_1000 to pixels, each box at confidence 0
+        D-->>P: boxes
+    end
+```
+
 ## Parameters
 
 | Parameter | Default | Meaning |
