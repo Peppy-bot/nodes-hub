@@ -76,7 +76,7 @@ logger = logging.getLogger(__name__)
 MODULE = "ai_brain_vla.perception.weights"
 # Names the directory the weights are kept in. `peppy stack launch` forwards
 # the launching shell's environment to the nodes it starts on that machine.
-WEIGHTS_DIRECTORY_VARIABLE = "OPENARM_AI_BRAIN_VLA_WEIGHTS"
+WEIGHTS_DIRECTORY_VARIABLE = "AI_BRAIN_VLA_WEIGHTS"
 DEFAULT_DIRECTORY = Path("~/.cache/openarm_ai_brain_vla/weights")
 PINS_FILE = Path(__file__).with_name("weights.json")
 HUB = "https://huggingface.co"

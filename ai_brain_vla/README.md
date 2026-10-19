@@ -36,7 +36,7 @@ Hub at its first load on a machine and keeps them in
 `~/.cache/openarm_ai_brain_vla/weights` of the daemon user, which stays when
 the image is built again. A launch with `perception_model: "none"` downloads
 nothing.
-`OPENARM_AI_BRAIN_VLA_WEIGHTS`, exported in the shell that launches, names
+`AI_BRAIN_VLA_WEIGHTS`, exported in the shell that launches, names
 another directory the container can see.
 
 `perception/weights.json` pins each model to one commit of its repository,
