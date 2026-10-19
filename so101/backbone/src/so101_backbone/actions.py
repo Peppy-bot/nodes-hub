@@ -59,6 +59,16 @@ MAX_REQUESTED_DURATION_S = 120.0
 
 # The refusal of an arm goal, or a check of one, while another arm goal runs.
 ARM_BUSY = "another arm goal is in flight"
+# The refusal of an arm or gripper goal, or a check of one, while a leader
+# streams commands for that limb: the leader has it until its stream stops.
+ARM_LEADER_STREAMING = (
+    "a leader is streaming arm commands; release the headset's grip, switch off"
+    " the browser panel's stream, or stop the leader node, then retry"
+)
+GRIPPER_LEADER_STREAMING = (
+    "a leader is streaming gripper commands; release the headset's grip, switch"
+    " off the browser panel's stream, or stop the leader node, then retry"
+)
 # The refusal of an arm goal, or a check of one, while no follower state is
 # fresh enough to anchor the move from.
 NO_ANCHOR = "no fresh follower state to anchor the move from"
@@ -185,6 +195,8 @@ class ActionLayer:
         anchor = self._coordinator.arm_anchor()
         if anchor is None:
             raise Rejection(NO_ANCHOR)
+        if self._coordinator.leader_streams_arm():
+            raise Rejection(ARM_LEADER_STREAMING)
         if not self._coordinator.try_claim_arm():
             raise Rejection(ARM_BUSY)
         try:
@@ -214,6 +226,8 @@ class ActionLayer:
         anchor = self._coordinator.gripper_anchor()
         if anchor is None:
             raise Rejection("no fresh gripper state to anchor the move from")
+        if self._coordinator.leader_streams_gripper():
+            raise Rejection(GRIPPER_LEADER_STREAMING)
         if not self._coordinator.try_claim_gripper():
             raise Rejection("another gripper goal is in flight")
         try:
@@ -245,6 +259,8 @@ class ActionLayer:
         )
         if self._coordinator.arm_anchor() is None:
             raise Rejection(NO_ANCHOR)
+        if self._coordinator.leader_streams_arm():
+            raise Rejection(ARM_LEADER_STREAMING)
         if not self._coordinator.try_claim_arm():
             raise Rejection(ARM_BUSY)
         return goal
@@ -468,9 +484,9 @@ class ActionLayer:
     ) -> tuple[bool, str, float]:
         """Whether a move_arm goal with these fields has a plan from where the
         arm is, without moving: (success, message, duration_s), the message
-        being the words the goal's refusal gives. Refused while an arm goal
-        is in flight, with the message a second goal gets, and while no
-        fresh follower state anchors a move."""
+        being the words the goal's refusal gives. Refused with the same
+        messages, in the same order, as a goal: no fresh follower state, a
+        leader streaming the arm, an arm goal in flight."""
         try:
             _require_arm_name(arm_name)
             goal = _pose_goal(
@@ -479,11 +495,13 @@ class ActionLayer:
             )
         except Rejection as e:
             return False, str(e), 0.0
-        if self._coordinator.arm_busy:
-            return False, ARM_BUSY, 0.0
         seed = self._coordinator.arm_anchor()
         if seed is None:
             return False, NO_ANCHOR, 0.0
+        if self._coordinator.leader_streams_arm():
+            return False, ARM_LEADER_STREAMING, 0.0
+        if self._coordinator.arm_busy:
+            return False, ARM_BUSY, 0.0
         try:
             _solution, planned_s = await self._plan_pose(solver, kinematics, seed, goal)
         except PlanRefused as e:

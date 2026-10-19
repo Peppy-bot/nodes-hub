@@ -22,7 +22,7 @@ The third simulation, `waldo`, is published by the `private-nodes-hub` repositor
 
 The [launchers](https://github.com/Peppy-bot/launchers-hub)
 run robots as named copies: `simulation` runs one simulation and simulated
-robots, `fleet` any mix of physical and simulated ones. Every simulation
+robots, `physical` the physical ones. Every simulation
 stands as many simulated robots as join it, and physical robots join beside
 the simulated ones on wall time.
 
@@ -137,35 +137,36 @@ Every node you added should show `Stage: Ready`. If one is stuck at an earlier s
 ## 4. Launch the stack
 
 The `openarm_simulation` launcher deploys one copy, `alpha`, a v2 with the
-web commander, and the simulation is selected at launch; `fleet` deploys
+web commander, and the simulation is selected at launch; `physical` deploys
 none and every robot joins it. These are separate sessions:
 
 ```sh
 # Physical v2 with the web commander.
-peppy stack launch fleet
-peppy stack join openarm_v2 -i alpha
+peppy stack launch physical
+peppy stack join openarm:alpha --with v2
 
 # Simulated v2 with the web commander; more robots join the same simulation.
 peppy stack launch openarm_simulation                 # Waldo
 peppy stack launch openarm_simulation --with mujoco
 peppy stack launch openarm_simulation --with isaac_sim
-peppy stack join openarm_v2_sim -i bravo --set-arguments commander_inst.http_port=8766
+peppy stack join openarm_sim:bravo --set-arguments commander_inst.http_port=8766
 ```
 
-Every simulation also stands `openarm_v1_sim`, each catalogue carrying both
-generations. A copy selects its own recorder (`lerobot_recorder`), camera rig
-(`cameras_sim` for rendered v2 cameras) and robot commander (`xr_commander`,
-`mcp_commander`, `ker_commander`) with `with:` in the file or `--with` on join. Its ids carry
+Every simulation also stands a v1 (`--with v1` on the join), each catalogue
+carrying both generations. A copy selects its own recorder (`lerobot_recorder`), camera rig
+(`cameras_sim` for rendered v2 cameras) and robot commander (`web_commander`,
+`ker_commander`, or `none`, which the stack's headset leads when the stack
+runs one) with `with:` in the file or `--with` on join. Its ids carry
 its name, `alpha_backbone_inst`; the simulation and scene control belong to the
 stack. Removing a copy takes its robot out of the scene and leaves the
 simulation running; `stack reset` stops everything. Every simulation stands
 every robot that joins it, of either generation.
-Physical robots can join a fleet:
+Physical robots join `physical`, each on its own machine:
 
 ```sh
-peppy stack launch fleet
-peppy stack join openarm_v2 -i alpha --place jetson-1
-peppy stack join openarm_v1 -i bravo --place jetson-2
+peppy stack launch physical
+peppy stack join openarm:alpha@jetson-1 --with v2
+peppy stack join openarm:bravo@jetson-2 --with v1
 peppy stack list
 peppy stack remove bravo
 peppy stack reset --federated

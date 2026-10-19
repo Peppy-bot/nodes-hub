@@ -12,7 +12,7 @@
 //! receives.
 
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use peppygen::NodeRunner;
@@ -174,12 +174,45 @@ async fn subscribe_pair<L, R>(
     }
 }
 
+/// A leader command younger than this means a leader is streaming the limb:
+/// the limb is the leader's, and a goal on it is refused until the stream
+/// stops. The window is the SO-101 backbone's leader deadman and the
+/// headset's release burst, both a quarter second: a refusal lasts as long as
+/// a follower would still follow the stream, and the burst after a grip is
+/// released reads as one unbroken stream. It covers the gaps of a stream at
+/// 4 Hz or faster; the leaders run at 30 Hz and above.
+pub const LEADER_STREAMING_WINDOW: Duration = Duration::from_millis(250);
+
+/// When a leader last streamed a well-formed command for one limb. Written by
+/// the limb's listener, read by the goal handlers, which refuse a goal on a
+/// limb a leader is streaming.
+#[derive(Clone, Default)]
+pub struct LeaderActivity {
+    last: Arc<Mutex<Option<Instant>>>,
+}
+
+impl LeaderActivity {
+    /// A leader command arrived now.
+    pub fn note(&self) {
+        *self.last.lock().expect("stamp lock poisoned") = Some(Instant::now());
+    }
+
+    /// Whether a leader command arrived within [`LEADER_STREAMING_WINDOW`].
+    pub fn streaming(&self) -> bool {
+        self.last
+            .lock()
+            .expect("stamp lock poisoned")
+            .is_some_and(|last| last.elapsed() <= LEADER_STREAMING_WINDOW)
+    }
+}
+
 /// Apply one received message to its side's watch, and report whether the
 /// listener should keep going.
 ///
 /// This is the whole receive policy, in one place: a well-formed message
-/// replaces that side's latest, a malformed one is dropped with a throttled
-/// reason rather than driving an arm, a receive error backs off instead of
+/// replaces that side's latest and, on a leader's stream, notes the leader's
+/// activity; a malformed one is dropped with a throttled reason rather than
+/// driving an arm, a receive error backs off instead of
 /// spinning, and a closed subscription ends the listener (the node is shutting
 /// down). Each generated slot has its own message type and the subscriptions
 /// share no trait, so the select that produced `received` stays with its
@@ -190,12 +223,16 @@ async fn accept<Raw, Parsed>(
     received: peppygen::Result<Option<Raw>>,
     parse: impl Fn(Raw) -> Result<Parsed, &'static str>,
     latest: &[watch::Sender<Option<Parsed>>; 2],
+    activity: Option<&[LeaderActivity; 2]>,
     last_reject_warn: &mut Option<Instant>,
 ) -> bool {
     match received {
         Ok(Some(raw)) => match parse(raw) {
             Ok(parsed) => {
                 latest[side.index()].send_replace(Some(parsed));
+                if let Some(activity) = activity {
+                    activity[side.index()].note();
+                }
             }
             Err(reason) => warn_throttled(last_reject_warn, || {
                 warn!("{what}: dropping {} message with {reason}", side.label());
@@ -217,6 +254,7 @@ async fn accept<Raw, Parsed>(
 pub async fn run_pose_command_listener(
     runner: Arc<NodeRunner>,
     latest: [watch::Sender<Option<Upstream>>; 2],
+    activity: [LeaderActivity; 2],
 ) {
     const WHAT: &str = "upstream pose_setpoints";
     let Some((mut left, mut right)) = subscribe_pair(
@@ -240,6 +278,7 @@ pub async fn run_pose_command_listener(
             received,
             |(position, orientation)| parse_pose_command(position, orientation),
             &latest,
+            Some(&activity),
             &mut warned,
         )
         .await;
@@ -257,6 +296,7 @@ pub async fn run_pose_command_listener(
 pub async fn run_joint_command_listener(
     runner: Arc<NodeRunner>,
     latest: [watch::Sender<Option<Upstream>>; 2],
+    activity: [LeaderActivity; 2],
 ) {
     const WHAT: &str = "upstream joint_setpoints";
     let Some((mut left, mut right)) = subscribe_pair(
@@ -280,6 +320,7 @@ pub async fn run_joint_command_listener(
             received,
             parse_joint_command,
             &latest,
+            Some(&activity),
             &mut warned,
         )
         .await;
@@ -295,6 +336,7 @@ pub async fn run_joint_command_listener(
 pub async fn run_gripper_command_listener(
     runner: Arc<NodeRunner>,
     latest: [watch::Sender<Option<GripperCommand>>; 2],
+    activity: [LeaderActivity; 2],
 ) {
     const WHAT: &str = "upstream gripper_setpoints";
     let Some((mut left, mut right)) = subscribe_pair(
@@ -318,6 +360,7 @@ pub async fn run_gripper_command_listener(
             received,
             |(opening, max_effort)| parse_gripper_command(opening, max_effort),
             &latest,
+            Some(&activity),
             &mut warned,
         )
         .await;
@@ -358,6 +401,7 @@ pub async fn run_joint_state_listener(
             received,
             |(positions, velocities)| parse_joint_state(positions, velocities),
             &latest,
+            None,
             &mut warned,
         )
         .await;
@@ -397,6 +441,7 @@ pub async fn run_gripper_state_listener(
             received,
             |(opening, effort, max_effort)| parse_gripper_state(opening, effort, max_effort),
             &latest,
+            None,
             &mut warned,
         )
         .await;
@@ -456,6 +501,16 @@ mod tests {
 
     use crate::types::ARM_DOF;
     use srs_model::nalgebra::{Isometry3, Vector3};
+
+    #[test]
+    fn a_leader_streams_a_limb_for_the_window_after_its_last_command() {
+        let activity = LeaderActivity::default();
+        assert!(!activity.streaming());
+        activity.note();
+        assert!(activity.streaming());
+        std::thread::sleep(LEADER_STREAMING_WINDOW + Duration::from_millis(20));
+        assert!(!activity.streaming());
+    }
 
     #[test]
     fn joint_state_requires_arm_dof_positions_with_matching_velocities() {

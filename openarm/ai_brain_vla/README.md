@@ -236,9 +236,9 @@ peppy repo add /path/to/nodes-hub; peppy repo add /path/to/launchers-hub; peppy 
 peppy stack launch simulation_mcp --join openarm_sim:alpha --with alpha.ai_brain_vla
 ```
 
-Waldo, the v2 robot `alpha` driven over MCP with its rendered cameras, and the
-brain with `sam3_siglip`. Two endpoints come up on the machine's loopback: the
-robots at `http://127.0.0.1:8900/robot_control/v1/mcp`
+Waldo, the v2 robot `alpha` with its rendered cameras, driven over MCP and
+from the stack's headset, and the brain with `sam3_siglip`. Three MCP endpoints come up on the machine's
+loopback, the framework's beside these two: the robots at `http://127.0.0.1:8900/robot_control/v1/mcp`
 (`brain.scan_items`, `brain.identify_item`, `brain.grab_item`, the cameras, the
 moves) and the world at `http://127.0.0.1:8902/simulation/v1/mcp`
 (`scene.spawn_object`, `scene.remove_object`, `scene.get_assets_list`). The
@@ -317,7 +317,7 @@ The launcher fixes `sam3_siglip` for the simulated robot. To compare backends,
 run the brain on its own beside the same stack, once per backend:
 
 ```sh
-peppy stack launch openarm_simulation --with robot_control,alpha.mcp_commander,alpha.cameras_sim
+peppy stack launch openarm_simulation --with robot_control,alpha.cameras_sim
 peppy node run openarm_ai_brain_vla:v1 -i brain -b --clock simulation \
   --link limb_motion@alpha_backbone_inst --link camera@alpha_chest --link geometry@alpha_chest \
   --link camera_mounts@alpha_backbone_inst \

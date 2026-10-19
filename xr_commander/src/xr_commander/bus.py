@@ -35,17 +35,6 @@ def log(message: str) -> None:
     print(f"[xr_commander] {message}", flush=True)
 
 
-def select_producer(module, node_runner, label: str):
-    """The slot's first bound producer, or None when none is bound; a surplus
-    is logged so the unused producers are not a silent mystery."""
-    producers = module.bound_producers(node_runner)
-    if not producers:
-        return None
-    if len(producers) > 1:
-        log(f"several {label} producers bound; using {producers[0].instance_id}")
-    return producers[0]
-
-
 class Latch:
     """Log a recurring condition once, re-arming once it clears."""
 
@@ -59,6 +48,26 @@ class Latch:
 
     def clear(self) -> None:
         self._tripped = False
+
+
+# How long an outcome flashes on a panel row.
+FLASH_S = 3.0
+
+
+class FlashNote:
+    """A line that shows for `FLASH_S` after it is set, then clears."""
+
+    def __init__(self) -> None:
+        self._text = ""
+        self._until_monotonic = 0.0
+
+    def set(self, text: str) -> None:
+        self._text = text
+        self._until_monotonic = time.monotonic() + FLASH_S
+
+    def text(self, now_monotonic: float | None = None) -> str:
+        now = time.monotonic() if now_monotonic is None else now_monotonic
+        return self._text if now < self._until_monotonic else ""
 
 
 async def next_message(subscription: Subscription, token: CancellationToken) -> Any:

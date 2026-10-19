@@ -1,7 +1,8 @@
 //! Gripper move-action admission: the `move_gripper` handler the backbone exposes.
 //! Mirrors the arm move admission exactly: validate the goal (gripper_name,
-//! finiteness, the [0, 1] opening range, a non-negative effort cap), claim
-//! the side's single-flight slot, and
+//! finiteness, the [0, 1] opening range, a non-negative effort cap), refuse
+//! it while a leader streams the gripper, claim the side's single-flight
+//! slot, and
 //! hand the accepted goal to the coordinator over its gripper goal channel. The
 //! coordinator runs the motion through the same per-tick governing as every
 //! other DOF, completes the goal once the measured gripper stands still, and
@@ -15,8 +16,10 @@ use peppygen::{NodeRunner, Result};
 use tokio::sync::mpsc;
 use tracing::error;
 
+use crate::actions::GRIPPER_LEADER_STREAMING;
 use crate::actions::claim;
 use crate::coordinator::GripperGoal;
+use crate::streams::LeaderActivity;
 use crate::types::Side;
 
 /// Expose `move_gripper`: validate + claim, then hand the goal to the
@@ -25,6 +28,7 @@ pub async fn run_move_gripper(
     runner: Arc<NodeRunner>,
     goal_txs: [mpsc::Sender<GripperGoal>; 2],
     busy: [Arc<AtomicBool>; 2],
+    activity: [LeaderActivity; 2],
 ) -> Result<()> {
     let mut handle = ActionHandle::expose(&runner).await?;
     loop {
@@ -48,6 +52,9 @@ pub async fn run_move_gripper(
                         "max_effort {} is not a non-negative finite value",
                         d.max_effort
                     )));
+                }
+                if activity[idx].streaming() {
+                    return Ok(GoalDecision::reject(GRIPPER_LEADER_STREAMING));
                 }
                 if !claim(&busy[idx]) {
                     return Ok(GoalDecision::reject("gripper is already executing a move"));

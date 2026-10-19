@@ -1,9 +1,11 @@
 """The command streams, one task per hand per pairing slot.
 
-Silence is the deadman: a disengaged hand stops commanding and the follower
-holds. Releasing the arm clutch first streams a short burst of the measured
-pose, so the follower stops where the robot is rather than at the last hand
-target. One task per stream.
+Each slot holds a pair per robot; a stream commands the chosen robot's pair
+and is silent toward the others. Silence is the deadman: a disengaged hand
+stops commanding and the follower holds. Releasing the arm clutch first
+streams a short burst of the measured pose, so the follower stops where the
+robot is; a change of robot releases the same way toward the robot left
+behind, and the new robot engages on the next squeeze. One task per stream.
 """
 
 from __future__ import annotations
@@ -19,10 +21,10 @@ from xr_commander.bus import (
     GOAL_CANCEL_TIMEOUT_S,
     GOAL_SEND_TIMEOUT_S,
     CancellationToken,
+    FlashNote,
     Latch,
     log,
     messages,
-    select_producer,
     ticks,
 )
 from xr_commander.clutch import HandClutch
@@ -35,6 +37,7 @@ from xr_commander.devices import (
     gripper_opening,
 )
 from xr_commander.frames import Pose
+from xr_commander.robots import PairedRobots
 
 _GOAL_RESULT_FLOOR_S = 120.0
 # A follower may stretch a short requested duration to its own limits, so the
@@ -47,31 +50,32 @@ def _result_timeout_s(posture_move_duration_s: float) -> float:
     return max(_GOAL_RESULT_FLOOR_S, _RESULT_GRACE_FACTOR * posture_move_duration_s)
 
 
-class LatestPose:
-    """Most recent measured pose; one writer, one reader, both on the loop."""
+class MeasuredPoses:
+    """Each paired follower's most recent measured pose, by the peer that
+    reported it; one writer, one reader, both on the loop."""
 
     def __init__(self) -> None:
-        self._value: Pose | None = None
-        self._received_monotonic_s = 0.0
+        self._latest: dict[object, tuple[Pose, float]] = {}
 
-    def set(self, pose: Pose) -> None:
-        self._value = pose
-        self._received_monotonic_s = time.monotonic()
+    def set(self, peer, pose: Pose) -> None:
+        self._latest[peer] = (pose, time.monotonic())
 
     def fresh(
-        self, stale_timeout_s: float, now_monotonic: float | None = None
+        self, peer, stale_timeout_s: float, now_monotonic: float | None = None
     ) -> Pose | None:
-        """The measured pose, or None when none has arrived recently: a dead
-        follower's last report is not a pose the arm is still at."""
-        if self._value is None:
+        """`peer`'s measured pose, or None when it has reported none
+        recently: a dead follower's last report is not a pose the arm is
+        still at, and no peer has no pose."""
+        if peer is None or peer not in self._latest:
             return None
+        pose, received_monotonic_s = self._latest[peer]
         now = time.monotonic() if now_monotonic is None else now_monotonic
-        if now - self._received_monotonic_s > stale_timeout_s:
+        if now - received_monotonic_s > stale_timeout_s:
             return None
-        return self._value
+        return pose
 
 
-def _timestamp_seconds() -> float:
+def timestamp_seconds() -> float:
     """This instance's bound clock."""
     return peppygen.clock.now_ns() / 1e9
 
@@ -120,14 +124,45 @@ class ReleaseHold:
         return None
 
 
+class HeldOverSqueeze:
+    """A squeeze held across a change of the chosen robot drives nothing
+    until a fresh frame shows the grip released: the hand engages the new
+    robot on its next squeeze. The first robot chosen engages a squeeze
+    already held."""
+
+    def __init__(self) -> None:
+        self._chosen: str | None = None
+        self._had_chosen = False
+        self._held_over = False
+
+    def note_chosen(self, chosen: str | None) -> None:
+        """Note this tick's chosen robot; each stream of the hand notes it,
+        and the first to see a change trips the gate for both."""
+        if chosen == self._chosen:
+            return
+        self._held_over = self._held_over or self._had_chosen
+        self._had_chosen = self._had_chosen or chosen is not None
+        self._chosen = chosen
+
+    def held_over(self) -> bool:
+        """Whether a squeeze must be released before it drives again."""
+        return self._held_over
+
+    def engages(self, sample: HandSample | None) -> bool:
+        """Whether this tick's squeeze drives the chosen robot."""
+        if sample is not None and not sample.squeezing:
+            self._held_over = False
+        return bool(sample and sample.squeezing) and not self._held_over
+
+
 async def drain_pose_states(
     node_runner,
     topic_module,
-    holder: LatestPose,
+    holder: MeasuredPoses,
     label: str,
     token: CancellationToken,
 ) -> None:
-    """Keep `holder` at the follower's newest measured pose."""
+    """Keep `holder` at every paired follower's newest measured pose."""
     try:
         subscription = await topic_module.subscribe(node_runner)
     except Exception as e:
@@ -136,11 +171,9 @@ async def drain_pose_states(
         return
     # Latched: a malformed pose would repeat every tick.
     unusable = Latch()
-    async for _producer, message in messages(
-        subscription, token, f"{label} pose_states"
-    ):
+    async for peer, message in messages(subscription, token, f"{label} pose_states"):
         try:
-            holder.set(Pose.from_xyz_quat(message.position, message.orientation))
+            holder.set(peer, Pose.from_xyz_quat(message.position, message.orientation))
             unusable.clear()
         except Exception as e:
             unusable.trip(f"{label} pose_states unusable: {e!r}")
@@ -152,9 +185,11 @@ async def _run_stream(
     period: float,
     label: str,
     token: CancellationToken,
-    build: Callable[[], object | None],
+    build: Callable[[], tuple[object, bytes] | None],
 ) -> None:
-    """Publish `build()` every `period` seconds, skipping ticks that return None."""
+    """Every `period` seconds publish the `(peer, payload)` that `build()`
+    returns to that peer, skipping ticks that return None. A peer that
+    left between the build and the send is a logged refusal."""
     try:
         publisher = await topic_module.declare_publisher(node_runner)
     except Exception as e:
@@ -166,16 +201,17 @@ async def _run_stream(
 
     async for _ in ticks(period, token):
         try:
-            payload = build()
+            built = build()
             building.clear()
         except Exception as e:
             building.trip(f"{label} could not build a message: {e!r}")
             continue
-        if payload is None:
+        if built is None:
             continue
 
+        peer, payload = built
         try:
-            await publisher.publish(payload)
+            await publisher.publish_to(peer, payload)
             publishing.clear()
         except Exception as e:
             publishing.trip(f"{label} publish failing: {e!r}")
@@ -187,45 +223,65 @@ async def stream_pose(
     topic_module,
     handedness: Handedness,
     clutch: HandClutch,
+    squeeze: HeldOverSqueeze,
     session: FrameSource,
-    measured: LatestPose,
+    measured: MeasuredPoses,
+    robots: PairedRobots,
     settings: Settings,
     token: CancellationToken,
 ) -> None:
-    """Drive one hand's pose_link slot from the clutch. Releasing the
-    clutch streams a short freeze burst of the measured pose, so the
-    follower stops where the robot is instead of walking on to the last
-    hand pose."""
+    """Drive the chosen robot's pair on one hand's pose_link slot from the
+    clutch, gated by `squeeze`. Releasing the clutch streams a short freeze burst of the measured
+    pose, so the follower stops where the robot is. A change of robot is a
+    release: the robot last driven gets the burst at its own measured pose,
+    and the new robot engages on the next squeeze."""
     # The one refusal an operator cannot see coming: squeezing while the
     # follower's measured pose is absent or stale does nothing. Say so once.
     waiting = Latch()
     hold = ReleaseHold(settings.tick_period_s)
+    # The pair the clutch last drove: every message goes to it, the release
+    # burst included, whichever robot is chosen since.
+    driven = None
+    # This hand's pair last tick: a new pair (a robot change on this hand)
+    # re-anchors the clutch.
+    last_peer = None
 
     def build():
+        nonlocal driven, last_peer
         # Stamped first: a clock that cannot stamp must fail the tick before
         # the clutch mutates its engagement state.
-        timestamp = _timestamp_seconds()
+        timestamp = timestamp_seconds()
         sample = fresh_sample(session, handedness, settings.stale_timeout_s)
-        measured_ee = measured.fresh(settings.stale_timeout_s)
+        peer = robots.peer_for(topic_module)
+        squeeze.note_chosen(robots.chosen())
+        if peer != last_peer:
+            clutch.release()
+        last_peer = peer
+        squeezing = squeeze.engages(sample)
+        measured_ee = measured.fresh(peer, settings.stale_timeout_s)
         if measured_ee is not None:
             waiting.clear()
-        elif sample is not None and sample.squeezing:
+        elif squeezing and peer is not None:
             waiting.trip(
                 f"{handedness} arm: squeeze ignored until the follower "
                 "reports a fresh measured pose"
             )
         target = clutch.step(
-            squeezing=sample.squeezing if sample else False,
+            squeezing=squeezing,
             hand=sample.pose if sample else None,
             measured_ee=measured_ee,
         )
+        if target is not None:
+            driven = peer
         commanded = hold.step(
-            target=target, measured_ee=measured_ee, now_s=time.monotonic()
+            target=target,
+            measured_ee=measured.fresh(driven, settings.stale_timeout_s),
+            now_s=time.monotonic(),
         )
-        if commanded is None:
+        if commanded is None or driven is None:
             return None
         position, orientation = commanded.as_wire()
-        return topic_module.build_message(timestamp, position, orientation)
+        return driven, topic_module.build_message(timestamp, position, orientation)
 
     await _run_stream(
         node_runner,
@@ -242,24 +298,31 @@ async def stream_gripper(
     *,
     topic_module,
     handedness: Handedness,
+    squeeze: HeldOverSqueeze,
     session: FrameSource,
+    robots: PairedRobots,
     settings: Settings,
     token: CancellationToken,
 ) -> None:
-    """Drive one hand's gripper_link slot from its trigger.
+    """Drive the chosen robot's pair on one hand's gripper_link slot from its
+    trigger, gated by `squeeze`, the hand's gate the arm stream shares.
 
     Gated on the grip deadman, not the arm clutch: a side with a gripper but
-    no pose_link must still grip.
+    no pose_link must still grip. A robot left behind keeps its last
+    opening: silence holds the grasp. The new robot's gripper follows from
+    the next squeeze.
     """
 
     def build():
         sample = fresh_sample(session, handedness, settings.stale_timeout_s)
-        if sample is None or not sample.squeezing:
+        peer = robots.peer_for(topic_module)
+        squeeze.note_chosen(robots.chosen())
+        if sample is None or not squeeze.engages(sample) or peer is None:
             return None
         opening = gripper_opening(sample.trigger, settings.gripper_open_fraction)
         # A trigger carries no effort intent, so max_effort rides 0 and the
         # follower's ceiling applies.
-        return topic_module.build_message(_timestamp_seconds(), opening, 0.0)
+        return peer, topic_module.build_message(timestamp_seconds(), opening, 0.0)
 
     await _run_stream(
         node_runner,
@@ -271,26 +334,64 @@ async def stream_gripper(
     )
 
 
+def cause(reason: str | None) -> str:
+    """The clause of a refusal that names the cause, ahead of the remedy a
+    backbone appends after a semicolon."""
+    return (reason or "refused").split(";", 1)[0]
+
+
+class PostureStatus:
+    """The posture buttons as the panel shows them, on the right hand's row:
+    the move in flight, then its outcome flashed for a few seconds. Every
+    writer runs on the event loop."""
+
+    def __init__(self) -> None:
+        self.moving: str | None = None
+        self._note = FlashNote()
+
+    def set_note(self, text: str) -> None:
+        self._note.set(text)
+
+    def state(self, now_monotonic: float | None = None) -> str | None:
+        """What the row says: a fresh note, else the move in flight, else
+        None."""
+        note = self._note.text(now_monotonic)
+        if note:
+            return note
+        if self.moving is not None:
+            return f"moving to {self.moving}..."
+        return None
+
+    def end_move(self, label: str) -> None:
+        """The move to `label` is over; another button's move stays."""
+        if self.moving == label:
+            self.moving = None
+
+
 async def run_posture_button(
     node_runner,
     *,
     action_module,
     pressed: Callable[[HandSample], bool],
     session: FrameSource,
+    robots: PairedRobots,
+    status: PostureStatus,
     settings: Settings,
     token: CancellationToken,
 ) -> None:
-    """Fire the module's posture move on the button's rising edge.
+    """Fire the module's posture move at the chosen robot on the button's
+    rising edge.
 
     `pressed` reads the right hand's button for this posture. Squeezing either
     grip cancels the move in flight: taking manual control back is the cancel
-    gesture, so a squeeze also vetoes a same-tick press. Zero bound producers
-    leaves the button inert; a surplus is logged here.
+    gesture, so a squeeze also vetoes a press, which the row then says, as
+    does a press while a posture move runs. A press while no robot has a
+    postures action does nothing, logged once and said on the row of a
+    hand with a binding. The move in flight and its outcome go to `status`.
     """
     name = action_module.TARGET_ACTION_NAME
-    target = select_producer(action_module, node_runner, name)
-    if target is None:
-        return
+    label = name.removeprefix("move_to_")
+    unoffered = Latch()
 
     # None until the button has been observed at all: a thumb already down on
     # the first tracked frame is not a press, and neither is one held across
@@ -305,6 +406,7 @@ async def run_posture_button(
         if waiter is not None:
             waiter.cancel()
         handle, waiter = None, None
+        status.end_move(label)
 
     try:
         async for _ in ticks(settings.tick_period_s, token):
@@ -318,12 +420,45 @@ async def run_posture_button(
                 handle, waiter = None, None
             if handle is not None and squeeze and not prev_squeeze:
                 try:
-                    await handle.cancel_goal(GOAL_CANCEL_TIMEOUT_S)
+                    cancel = await handle.cancel_goal(GOAL_CANCEL_TIMEOUT_S)
                 except Exception as e:
                     # The goal may still finish unwatched; re-arm the button.
-                    log(f"{name} cancel failed: {e!r}")
+                    log(f"move to {label}: cancel failed: {e!r}")
+                    status.set_note(f"move to {label}: cancel failed (see log)")
                     disown_waiter()
-            elif handle is None and rising and not squeeze:
+                else:
+                    log(f"move to {label}: cancel {cancel.state.name.lower()}")
+                    if cancel.state.name == "UNKNOWN":
+                        # The server lost the goal; a result may never come.
+                        status.set_note(
+                            f"move to {label}: cancel state unknown (see log)"
+                        )
+                        disown_waiter()
+                    else:
+                        # The row stops claiming a move; the result's note follows.
+                        status.end_move(label)
+            elif rising and squeeze:
+                note = f"move to {label} ignored: release the grip first"
+                status.set_note(note)
+                log(note)
+            elif rising and status.moving is not None:
+                note = f"move to {label} ignored: still moving to {status.moving}"
+                status.set_note(note)
+                log(note)
+            elif handle is None and rising:
+                target = robots.producer_for(action_module)
+                if target is None:
+                    chosen = robots.chosen()
+                    note = (
+                        f"move to {label}: no robot paired"
+                        if chosen is None
+                        else f"move to {label}: {chosen} has no postures"
+                    )
+                    status.set_note(note)
+                    unoffered.trip(note)
+                    prev_button, prev_squeeze = button, squeeze
+                    continue
+                unoffered.clear()
                 fired = await fire_goal(
                     node_runner,
                     action_module,
@@ -331,10 +466,17 @@ async def run_posture_button(
                     name,
                     duration_s=settings.posture_move_duration_s,
                 )
-                if fired is not None:
+                if fired is None:
+                    status.set_note(f"move to {label}: send failed (see log)")
+                elif not fired.accepted:
+                    status.set_note(f"move to {label} refused: {cause(fired.reason)}")
+                else:
                     handle = fired
+                    status.moving = label
                     timeout = _result_timeout_s(settings.posture_move_duration_s)
-                    waiter = asyncio.create_task(_log_result(name, fired, timeout))
+                    waiter = asyncio.create_task(
+                        _watch_result(label, fired, timeout, status)
+                    )
             prev_button, prev_squeeze = button, squeeze
     finally:
         if waiter is not None:
@@ -342,9 +484,9 @@ async def run_posture_button(
 
 
 async def fire_goal(node_runner, action_module, target, name: str, **request_fields):
-    """The accepted goal handle, or None with the failure or refusal logged.
-    Builds the request too, so a raising constructor is a logged send failure
-    rather than a dead button task."""
+    """The goal handle, accepted or refused with the refusal logged, or None
+    with the send failure logged. Builds the request too, so a constructor
+    that raises is logged as a send failure and the button loop goes on."""
     try:
         request = action_module.GoalRequest(**request_fields)
         fired = await action_module.ActionHandle.fire_goal(
@@ -355,17 +497,35 @@ async def fire_goal(node_runner, action_module, target, name: str, **request_fie
         return None
     if not fired.accepted:
         log(f"{name} rejected: {fired.reason}")
-        return None
     return fired
 
 
-async def _log_result(name: str, handle, timeout_s: float) -> None:
+async def _watch_result(
+    label: str, handle, timeout_s: float, status: PostureStatus
+) -> None:
+    """Log the move's result and flash it on the row; the move is over
+    either way."""
     try:
         result = await handle.get_result(timeout_s)
     except asyncio.CancelledError:
         raise
     except Exception as e:
-        log(f"{name} result: {e!r}")
+        note = f"move to {label}: result unknown"
+        log(f"{note}: {e!r}")
+        status.set_note(note)
         return
-    detail = result.data.message if result.data else ""
-    log(f"{name} {result.status.name.lower()}: {detail}")
+    finally:
+        status.end_move(label)
+    data = result.data
+    if result.status.name == "CANCELLED":
+        note = f"move to {label} cancelled"
+    elif data is None:
+        # Abandoned or expired: the server dropped the goal or its result.
+        note = f"move to {label} {result.status.name.lower()}"
+    elif data.success:
+        note = f"move to {label} completed"
+    else:
+        reason = cause(data.message) if data.message else "no reason given"
+        note = f"move to {label} failed: {reason}"
+    log(note)
+    status.set_note(note)

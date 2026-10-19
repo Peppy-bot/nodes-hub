@@ -15,7 +15,7 @@ kinematics module.
 | `so101_follower` | The real arm. Pure follower: `joint_link` + `gripper_link` follower slots on one node (one process must own the serial port), `component_ready`, `motor_health`, `alert`. No motion logic. |
 | `so101_leader` | The passive leader arm as a teleop device. Open-loop `joint_link` + `gripper_link` leader; staleness is the deadman (the hardware has no engage button). |
 | [`robot_initializer`](../robot_initializer) | The node every robot uses, run with `model: "so101"`: answers who the robot is on `get_identity` and whether it is ready on `is_ready`, from the follower's readiness on hardware and from the simulation standing it in a simulation, which it joins as the `so101` model. |
-| `so101_backbone` | The motion authority in between. Follower role toward whatever leads (joint, pose, or gripper streams), leader role toward the follower; exposes the `limb_motion` and `postures` move actions, the `limb_motion` services (`stop` ends every planned move in flight, whoever started it, each goal then ending as cancelled with `stopped: <reason>`; `check_arm_move` runs a `move_arm` goal's solve from the same anchor and moves nothing), the `limb_state` readout and the `workspace` services (`describe_workspace` and `check_positions`: where the arm reaches, from the design alone; see [Workspace](#workspace)). Every pose is in the URDF's `base_link` frame, the robot frame the contracts define: `+x` the way the robot faces, `+z` up. A joints-led stream passes through under the end-effector-speed governor, its only limiter; a pose-led stream is reach-clipped, solved, and rate-stepped per joint before that same governor. Move actions run minimum-jerk plans sized by the per-joint velocity caps, and Cartesian moves additionally by the EE speed caps. A gripper move ramps at the gripper rate cap and ends once the measured gripper stands still, on its target or short of it where an object holds the jaws. Everything gates on fresh follower state. |
+| `so101_backbone` | The motion authority in between. Follower role toward whatever leads (joint, pose, or gripper streams), leader role toward the follower; exposes the `limb_motion` and `postures` move actions, the `limb_motion` services (`stop` ends every planned move in flight, whoever started it, each goal then ending as cancelled with `stopped: <reason>`; `check_arm_move` runs a `move_arm` goal's solve from the same anchor and moves nothing), the `limb_state` readout and the `workspace` services (`describe_workspace` and `check_positions`: where the arm reaches, from the design alone; see [Workspace](#workspace)). Every pose is in the URDF's `base_link` frame, the robot frame the contracts define: `+x` the way the robot faces, `+z` up. A joints-led stream passes through under the end-effector-speed governor, its only limiter; a pose-led stream is reach-clipped, solved, and rate-stepped per joint before that same governor. Move actions run minimum-jerk plans sized by the per-joint velocity caps, and Cartesian moves additionally by the EE speed caps. A gripper move ramps at the gripper rate cap and ends once the measured gripper stands still, on its target or short of it where an object holds the jaws. Everything gates on fresh follower state. A goal on a limb a leader is streaming is refused until the stream has been silent for the deadman timeout; an admitted goal owns its limb until it ends. |
 
 ```text
 so101_leader ──joint+gripper──▶ so101_backbone ──joint+gripper──▶ so101_follower
@@ -56,8 +56,9 @@ family uses them precisely:
   each happens to play the matching pairing role, which is the only reason
   the names align.
 - The node leading the backbone, whichever it is, is the **commander**
-  (openarm vocabulary): `so101_leader`, `xr_commander`, or a future policy
-  runner. Every commander option fills the launcher's `commander_inst`.
+  (openarm vocabulary): `so101_leader`, the stack's headset (`xr_commander`),
+  or a future policy runner. The leader arm fills the copy's
+  `commander_inst`; the headset is the stack's `headset_inst`.
 
 ## Calibration (once per arm, on the host)
 

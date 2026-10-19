@@ -23,6 +23,8 @@ from so101_description.model import KINEMATICS_URDF_PATH
 from so101_description.postures import READY_POSITIONS_RAD
 
 from so101_backbone.actions import (
+    ARM_LEADER_STREAMING,
+    NO_ANCHOR,
     MAX_REQUESTED_DURATION_S,
     ActionLayer,
     PendingSlot,
@@ -30,7 +32,11 @@ from so101_backbone.actions import (
     Rejection,
     _orientation_note,
 )
-from so101_backbone.coordinator import GRIPPER_STILL_WINDOW_S, Coordinator
+from so101_backbone.coordinator import (
+    GRIPPER_STILL_WINDOW_S,
+    STALE_LEADER_TIMEOUT_S,
+    Coordinator,
+)
 
 STALE_NO_POSE = "follower state stale; no measured pose to report"
 STALE_COMMANDED = "follower state stale; reporting the commanded position"
@@ -883,3 +889,60 @@ async def test_the_plan_check_needs_fresh_follower_state():
     )
     assert success is False
     assert message == "no fresh follower state to anchor the move from"
+
+
+def test_a_streaming_leader_keeps_the_limbs_until_its_stream_stops(monkeypatch):
+    coordinator, layer = make_layer()
+    coordinator.measured_joints.set((0.0,) * 5)
+    coordinator.measured_gripper.set(0.5)
+    coordinator.leader_joints.set((0.0,) * 5)
+    coordinator.leader_gripper.set(0.5)
+    pose = ((0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, 0.0, 0.0)
+    with pytest.raises(Rejection, match="leader is streaming arm"):
+        layer._admit_arm_move((0.1,) * 5, 0.0)
+    with pytest.raises(Rejection, match="leader is streaming arm"):
+        layer._admit_pose_move(*pose)
+    with pytest.raises(Rejection, match="leader is streaming gripper"):
+        layer._admit_gripper_move(0.2, 0.0)
+    # The refusals held no slot.
+    assert coordinator.try_claim_arm() and coordinator.try_claim_gripper()
+    coordinator.release_arm()
+    coordinator.release_gripper()
+    # A goal boundary clears the leader holders; the leader still streams.
+    with pytest.raises(Rejection, match="leader is streaming arm"):
+        layer._admit_arm_move((0.1,) * 5, 0.0)
+    with pytest.raises(Rejection, match="leader is streaming gripper"):
+        layer._admit_gripper_move(0.2, 0.0)
+    # The leader lets go: past the deadman, the limbs take goals again. The
+    # follower state is refreshed so only the leader's age moves.
+    later = time.monotonic() + STALE_LEADER_TIMEOUT_S + 0.01
+    monkeypatch.setattr(time, "monotonic", lambda: later)
+    coordinator.measured_joints.set((0.0,) * 5)
+    coordinator.measured_gripper.set(0.5)
+    assert layer._admit_pose_move(*pose) is not None
+    coordinator.release_arm()
+    assert layer._admit_arm_move((0.1,) * 5, 0.0) is not None
+    assert layer._admit_gripper_move(0.2, 0.0) is not None
+
+
+async def test_the_move_check_refuses_in_the_goals_order():
+    # No follower state and a streaming leader: the anchor is refused first,
+    # by the check and by the goal alike.
+    coordinator, layer = make_layer()
+    coordinator.leader_joints.set((0.0,) * 5)
+    pose = ((0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, 0.0, 0.0)
+    ok, message, _duration_s = await layer.check_arm_move("arm", *pose, None, None)
+    assert (ok, message) == (False, NO_ANCHOR)
+    with pytest.raises(Rejection, match=NO_ANCHOR):
+        layer._admit_pose_move(*pose)
+
+
+async def test_the_move_check_answers_the_streaming_refusal_without_claiming():
+    coordinator, layer = make_layer()
+    coordinator.measured_joints.set((0.0,) * 5)
+    coordinator.leader_joints.set((0.0,) * 5)
+    ok, message, duration_s = await layer.check_arm_move(
+        "arm", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, 0.0, 0.0, None, None
+    )
+    assert (ok, message, duration_s) == (False, ARM_LEADER_STREAMING, 0.0)
+    assert coordinator.try_claim_arm()

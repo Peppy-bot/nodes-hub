@@ -1,23 +1,35 @@
 import asyncio
 import time
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
 import pytest
-from teleop_xr.config import ViewConfig
-
 from peppygen.consumed_topics.color_cameras import video_stream as color_video_stream
 
-from tests.helpers import FakeToken, RecordingSink, boot, eventually, running_drain
+from tests.helpers import (
+    FakeToken,
+    RecordingSink,
+    boot,
+    eventually,
+    frame_message,
+    running_drain,
+)
 from xr_commander.video import (
-    CAMERA_VIEW,
-    CameraTrack,
-    assert_unique_track_ids,
-    camera_views,
+    TRACK_HZ,
+    CameraPanels,
+    CameraSource,
+    LastFrame,
+    camera_source,
+    chosen_panels,
     decode_to_bgr,
-    discover_tracks,
     drain_frames,
+    feed_panels,
+    follow_camera_panels,
     no_signal_frame,
+    panel_of,
+    shows_for,
+    shows_live_video,
     shrink_to_width,
     watch_camera_silence,
 )
@@ -80,33 +92,205 @@ def test_a_payload_that_contradicts_its_header_is_refused():
         decode_to_bgr("rgb8", 2, 2, b"\x00" * 11)
 
 
-def test_camera_views_names_every_track_with_the_shared_view_shape():
-    views = camera_views(["wrist_left", "chest"])
-    assert views == {"wrist_left": CAMERA_VIEW, "chest": CAMERA_VIEW}
-    assert views["wrist_left"] is not CAMERA_VIEW  # callers own their copy
+def member(instance_id, copy=None, in_copy_id=None):
+    """A bound camera as the generated slot answers it."""
+    tag = None if copy is None else SimpleNamespace(name=copy, instance_id=in_copy_id)
+    return SimpleNamespace(copy=tag, producer=SimpleNamespace(instance_id=instance_id))
 
 
-def test_the_view_shape_satisfies_the_installed_frontend_config():
-    # The panel config is teleop_xr's schema; a shape drift must fail here,
-    # not at node boot.
-    ViewConfig(**CAMERA_VIEW)
+def test_a_camera_is_named_by_its_robot_and_the_id_its_copy_wrote():
+    assert camera_source(
+        member("alpha_wrist_left", "alpha", "wrist_left")
+    ) == CameraSource(robot="alpha", role="wrist_left")
+    assert camera_source(member("chest")) == CameraSource(robot=None, role="chest")
 
 
-def test_colliding_track_ids_are_refused():
-    # A camera instance named after the status panel collides exactly here.
-    with pytest.raises(ValueError, match="collide"):
-        assert_unique_track_ids(["chest", "chest"])
-    assert_unique_track_ids(["chest", "status"])
+def test_the_chosen_robots_cameras_show_and_a_copyless_camera_always_does():
+    alpha = CameraSource(robot="alpha", role="chest")
+    assert shows_for(alpha, "alpha")
+    assert not shows_for(alpha, "bravo")
+    assert not shows_for(alpha, None)
+    assert shows_for(CameraSource(robot=None, role="chest"), "bravo")
 
 
-async def test_every_bound_producer_gets_a_track_named_by_its_instance():
-    async with boot(color_cameras_instances=2) as h:
-        bound = color_video_stream.bound_producers(h.node_runner)
-        assert len(bound) == 2
-        tracks = discover_tracks(h.node_runner, color_video_stream, RecordingSink)
-        assert [t.instance_id for t in tracks] == [p.instance_id for p in bound]
-        assert len(set(t.instance_id for t in tracks)) == 2
-        assert all(isinstance(t.sink, RecordingSink) for t in tracks)
+def recording_panels(reserved=frozenset()):
+    """Camera panels over recording sinks, with the sinks by panel name and
+    every set of views told to the session."""
+    sinks: dict[str, RecordingSink] = {}
+    told: list[dict] = []
+
+    def show_views(views):
+        sinks.update(views)
+        told.append(dict(views))
+
+    panels = CameraPanels(
+        make_sink=RecordingSink, show_views=show_views, reserved=reserved
+    )
+    return panels, sinks, told
+
+
+def sides(**by_robot):
+    """An arm_sides answering the hands each named robot pairs an arm with."""
+    return lambda robot: frozenset(by_robot.get(robot, ()))
+
+
+def robots_choosing(chosen, **by_robot):
+    """The paired robots as the camera code reads them."""
+    return SimpleNamespace(chosen=lambda: chosen, arm_sides=sides(**by_robot))
+
+
+def test_a_camera_fills_the_panel_of_its_role():
+    both = sides(alpha=["left", "right"])
+    assert panel_of(CameraSource("alpha", "chest"), both) == "chest"
+    assert panel_of(CameraSource(None, "chest"), sides()) == "chest"
+
+
+def test_a_one_armed_robots_wrist_camera_fills_the_wrist_panel_of_its_hand():
+    wrist = CameraSource("bravo", "wrist")
+    assert panel_of(wrist, sides(bravo=["right"])) == "wrist_right"
+    assert panel_of(wrist, sides(bravo=["left"])) == "wrist_left"
+    assert panel_of(wrist, sides(bravo=["left", "right"])) == "wrist"
+
+
+def test_a_camera_of_a_robot_pairing_no_arm_fills_no_panel():
+    assert panel_of(CameraSource("charlie", "wrist"), sides()) is None
+    assert panel_of(CameraSource("charlie", "chest"), sides()) is None
+
+
+def cameras_of(*members):
+    """A camera slot module answering `members` as bound."""
+    return SimpleNamespace(bound_members=lambda _runner: list(members))
+
+
+OPENARM_AND_SO101 = cameras_of(
+    member("alpha_wrist_left", "alpha", "wrist_left"),
+    member("alpha_wrist_right", "alpha", "wrist_right"),
+    member("alpha_chest", "alpha", "chest"),
+    member("bravo_wrist", "bravo", "wrist"),
+)
+
+
+def test_the_chosen_robots_cameras_alone_are_its_panels():
+    pairs = {"alpha": ["left", "right"], "bravo": ["right"]}
+    openarm = robots_choosing("alpha", **pairs)
+    so101 = robots_choosing("bravo", **pairs)
+    assert chosen_panels(None, [OPENARM_AND_SO101], openarm) == {
+        "wrist_left",
+        "wrist_right",
+        "chest",
+    }
+    assert chosen_panels(None, [OPENARM_AND_SO101], so101) == {"wrist_right"}
+    # A camera outside any copy is every robot's.
+    copyless = cameras_of(member("overhead"))
+    assert chosen_panels(None, [copyless], so101) == {"overhead"}
+
+
+def test_the_session_is_told_the_shown_panels_once_per_change(capsys):
+    panels, _sinks, told = recording_panels(reserved=frozenset({"status"}))
+    panels.show_only(["wrist_right", "chest"])
+    panels.show_only(["chest", "wrist_right"])
+    panels.show_only(["wrist_right"])
+    assert [sorted(views) for views in told] == [
+        ["chest", "wrist_right"],
+        ["wrist_right"],
+    ]
+    # A panel keeps its sink across sets: a page in session holds its track.
+    assert told[0]["wrist_right"] is told[1]["wrist_right"]
+    assert panels.shown() == ("wrist_right",)
+    out = capsys.readouterr().out
+    assert "camera panels shown: chest, wrist_right" in out
+    assert "camera panels shown: wrist_right" in out
+
+
+def test_a_reserved_name_is_refused_once_and_never_shown(capsys):
+    panels, _sinks, told = recording_panels(reserved=frozenset({"status"}))
+    assert not panels.ensure("status")
+    panels.show_only(["status", "chest"])
+    assert told == [{"chest": told[0]["chest"]}]
+    assert capsys.readouterr().out.count("status panel's name") == 1
+
+
+def test_a_feed_hands_each_shown_panel_the_chosen_robots_newest_frame():
+    panels, sinks, _told = recording_panels()
+    first, second = np.zeros((1, 1, 3), np.uint8), np.ones((1, 1, 3), np.uint8)
+    alpha = CameraSource("alpha", "chest")
+    panels.show_only(["chest", "wrist_left"])
+    panels.show("chest", first, alpha)
+    panels.show("chest", second, alpha)
+    panels.feed("alpha")
+    panels.feed("alpha")
+    assert [frame is second for frame in sinks["chest"].frames] == [True, True]
+    # A shown panel nothing was shown on is fed nothing.
+    assert sinks["wrist_left"].frames == []
+    # Another robot's frame is held back once the choice moves on.
+    panels.feed("bravo")
+    assert len(sinks["chest"].frames) == 2
+    # A hidden panel is fed nothing.
+    panels.show_only(["wrist_left"])
+    panels.feed("alpha")
+    assert len(sinks["chest"].frames) == 2
+
+
+def test_the_panels_are_fed_at_the_tracks_rate():
+    panels, sinks, _told = recording_panels()
+    panels.show_only(["chest"])
+    panels.show("chest", np.zeros((1, 1, 3), np.uint8))
+    token = FakeToken()
+    window_s = 3 / TRACK_HZ
+
+    async def run():
+        task = asyncio.create_task(feed_panels(panels, lambda: None, token))
+        await asyncio.sleep(window_s)
+        token.cancel()
+        await asyncio.wait_for(task, 1.0)
+
+    asyncio.run(run())
+    assert 2 <= len(sinks["chest"].frames) <= 4
+
+
+async def test_following_the_slots_shows_a_panel_per_bound_camera_role():
+    async with boot(color_cameras_instance_ids=["wrist_left", "chest"]) as h:
+        panels, _sinks, _told = recording_panels()
+        async with running_drain(
+            lambda token: follow_camera_panels(
+                h.node_runner,
+                [color_video_stream],
+                panels,
+                robots_choosing(None),
+                token,
+                period_s=0.01,
+            )
+        ):
+            await eventually(
+                lambda: panels.shown() == ("chest", "wrist_left"),
+                message="a panel per role",
+            )
+
+
+async def test_the_panels_follow_the_choice_and_the_arms_as_they_pair():
+    arms: dict[str, list[str]] = {}
+    chosen = ["bravo"]
+    robots = SimpleNamespace(
+        chosen=lambda: chosen[0],
+        arm_sides=lambda robot: frozenset(arms.get(robot, ())),
+    )
+    panels, _sinks, _told = recording_panels()
+    async with running_drain(
+        lambda token: follow_camera_panels(
+            None, [OPENARM_AND_SO101], panels, robots, token, period_s=0.01
+        )
+    ):
+        await asyncio.sleep(0.05)
+        assert panels.shown() == ()
+        arms.update(bravo=["right"], alpha=["left", "right"])
+        await eventually(
+            lambda: panels.shown() == ("wrist_right",), message="bravo's wrist panel"
+        )
+        chosen[0] = "alpha"
+        await eventually(
+            lambda: panels.shown() == ("chest", "wrist_left", "wrist_right"),
+            message="alpha's three panels",
+        )
 
 
 def bgr_message(width=1, height=1):
@@ -120,17 +304,23 @@ def bgr_message(width=1, height=1):
     )
 
 
+# No robot chosen and none pairing an arm: the harness's cameras are
+# outside any copy, which every robot shows.
+NO_ROBOTS = robots_choosing(None)
+
+
 async def test_an_undecodable_frame_is_dropped_and_logged_once(capsys):
-    async with boot(color_cameras_instances=1) as h:
+    async with boot(color_cameras_instance_ids=["chest"]) as h:
         camera = h.mocks.deps.color_cameras[0]
-        cam_id = color_video_stream.bound_producers(h.node_runner)[0].instance_id
-        sink = RecordingSink()
-        health: dict[str, float] = {}
+        panels, sinks, _told = recording_panels()
+        panels.show_only(["chest"])
+        health: dict[str, LastFrame] = {}
         async with running_drain(
             lambda token: drain_frames(
                 h.node_runner,
                 color_video_stream,
-                {cam_id: sink},
+                panels,
+                NO_ROBOTS,
                 token,
                 "test",
                 0,
@@ -149,9 +339,11 @@ async def test_an_undecodable_frame_is_dropped_and_logged_once(capsys):
             await camera.video_stream.publish(bgr_message())
             # Per-producer order holds, so the landed good frame proves both
             # bad ones were already processed.
-            await eventually(lambda: len(sink.frames) == 1, message="the good frame")
+            await eventually(lambda: "chest" in health, message="the good frame")
+        panels.feed(None)
+        assert len(sinks["chest"].frames) == 1
         assert capsys.readouterr().out.count("frame unusable") == 1  # latched
-        assert cam_id in health  # stamped for the delivered frame only
+        assert health["chest"].source == CameraSource(robot=None, role="chest")
 
 
 def test_a_failed_camera_subscribe_is_loud_and_fatal_to_the_drain(capsys):
@@ -163,7 +355,14 @@ def test_a_failed_camera_subscribe_is_loud_and_fatal_to_the_drain(capsys):
 
     async def run():
         await asyncio.wait_for(
-            drain_frames(None, ExplodingTopic(), {}, FakeToken(), "camera"),
+            drain_frames(
+                None,
+                ExplodingTopic(),
+                recording_panels()[0],
+                NO_ROBOTS,
+                FakeToken(),
+                "camera",
+            ),
             1.0,
         )
 
@@ -177,48 +376,151 @@ def test_no_signal_frame_is_drawn_and_sized():
     assert frame.any()  # the text actually rendered
 
 
-def test_a_silent_camera_is_blanked_once_and_recovery_logged(capsys):
-    sink = RecordingSink()
-    track = CameraTrack(instance_id="cam", sink=sink)
-    health = {"cam": time.monotonic()}
+COPYLESS = CameraSource(robot=None, role="cam")
+
+
+def test_a_panel_shows_live_video_while_its_chosen_robots_camera_delivers():
+    now = 100.0
+    fresh = LastFrame(CameraSource("alpha", "cam"), now - 0.5)
+    assert shows_live_video(fresh, "alpha", now, 0.0, 2.0)
+    assert not shows_live_video(fresh, "alpha", now + 2.0, 0.0, 2.0)
+    # A camera outside any copy is every robot's.
+    assert shows_live_video(LastFrame(COPYLESS, now), "bravo", now, 0.0, 2.0)
+    # A panel holding no frame of the chosen robot is timed from the start
+    # given, however fresh another robot's frame is.
+    for last in (None, fresh):
+        assert shows_live_video(last, "bravo", now, now - 1.0, 2.0)
+        assert not shows_live_video(last, "bravo", now, now - 3.0, 2.0)
+
+
+def watched_panel(name):
+    panels, sinks, _told = recording_panels()
+    panels.show_only([name])
+    return panels, sinks[name]
+
+
+def run_watch(panels, health, chosen, steps):
+    """Watch `panels` for silence, running each step in turn while it does,
+    and stop one poll after the last."""
     token = FakeToken()
 
     async def run():
         task = asyncio.create_task(
             watch_camera_silence(
-                [track], health, token, silent_after_s=0.03, poll_s=0.01
+                panels, health, chosen, token, silent_after_s=0.03, poll_s=0.01
             )
         )
-        await asyncio.sleep(0.09)
-        assert len(sink.frames) == 1  # blanked once, not per poll
-        health["cam"] = time.monotonic()  # the camera resumes
-        await asyncio.sleep(0.03)
+        for step in steps:
+            await asyncio.sleep(0.09)
+            step()
+        await asyncio.sleep(0.02)
         token.cancel()
         await asyncio.wait_for(task, 1.0)
 
     asyncio.run(run())
+
+
+def fed_no_signal(panels, sink, name) -> bool:
+    panels.feed(None)
+    return np.array_equal(sink.frames[-1], no_signal_frame(name))
+
+
+def test_a_silent_camera_is_blanked_once_and_recovery_logged(capsys):
+    panels, sink = watched_panel("cam")
+    health = {"cam": LastFrame(COPYLESS, time.monotonic())}
+    fed = []
+
+    def resume():
+        fed.append(fed_no_signal(panels, sink, "cam"))
+        health["cam"] = LastFrame(COPYLESS, time.monotonic())
+
+    run_watch(panels, health, lambda: None, [resume])
+    assert fed == [True]
     out = capsys.readouterr().out
-    assert "went silent" in out
+    assert out.count("went silent") == 1  # blanked once, not per poll
     assert "recovered" in out
 
 
-def test_a_camera_that_never_produces_is_blanked_from_the_watcher_start():
+def test_a_camera_that_never_produces_is_blanked_timed_from_its_panel_showing(
+    capsys,
+):
     # A dead camera and no camera look identical as a blank panel; the timer
-    # starts with the watcher so the panel says NO SIGNAL instead.
-    sink = RecordingSink()
-    track = CameraTrack(instance_id="cam", sink=sink)
+    # starts when the panel shows so the panel says NO SIGNAL instead.
+    panels, sink = watched_panel("cam")
+    run_watch(panels, {}, lambda: None, [lambda: None])
+    assert fed_no_signal(panels, sink, "cam")
+    assert capsys.readouterr().out.count("went silent") == 1
+
+
+def test_a_panel_shown_late_is_timed_from_its_showing(capsys):
+    panels, sinks, _told = recording_panels()
+    panels.show_only(["cam"])
+    seen = []
+
+    def show_late_panel():
+        # The watcher has run longer than the silence span already.
+        panels.show_only(["cam", "late"])
+
+    def check():
+        panels.feed(None)
+        frames = sinks["late"].frames
+        seen.append(
+            bool(frames) and np.array_equal(frames[-1], no_signal_frame("late"))
+        )
+
     token = FakeToken()
 
     async def run():
         task = asyncio.create_task(
-            watch_camera_silence([track], {}, token, silent_after_s=0.03, poll_s=0.01)
+            watch_camera_silence(
+                panels, {}, lambda: None, token, silent_after_s=0.1, poll_s=0.01
+            )
         )
-        await asyncio.sleep(0.09)
+        await asyncio.sleep(0.2)
+        show_late_panel()
+        await asyncio.sleep(0.05)
+        check()
+        await asyncio.sleep(0.15)
+        check()
         token.cancel()
         await asyncio.wait_for(task, 1.0)
 
     asyncio.run(run())
-    assert len(sink.frames) == 1  # blanked once, not per poll
+    # Fed nothing until its silence span passes from its showing.
+    assert seen == [False, True]
+
+
+def test_a_newly_chosen_robots_silent_camera_is_blanked_once_timed_from_the_choice():
+    panels, sink = watched_panel("chest")
+    panels.show("chest", np.zeros((1, 1, 3), np.uint8))
+    health = {"chest": LastFrame(CameraSource("alpha", "chest"), time.monotonic())}
+    chosen = ["alpha"]
+    seen = []
+    token = FakeToken()
+
+    async def run():
+        task = asyncio.create_task(
+            watch_camera_silence(
+                panels,
+                health,
+                lambda: chosen[0],
+                token,
+                silent_after_s=0.2,
+                poll_s=0.01,
+            )
+        )
+        await asyncio.sleep(0.15)
+        chosen[0] = "bravo"
+        # Alpha's frame is old by now, but bravo is timed from its choice.
+        await asyncio.sleep(0.1)
+        seen.append(fed_no_signal(panels, sink, "chest"))
+        await asyncio.sleep(0.2)
+        seen.append(fed_no_signal(panels, sink, "chest"))
+        token.cancel()
+        await asyncio.wait_for(task, 1.0)
+
+    asyncio.run(run())
+    assert seen == [False, True]
 
 
 def test_shrink_keeps_aspect_and_caps_width():
@@ -231,3 +533,74 @@ def test_shrink_never_upscales_and_zero_disables():
     frame = np.zeros((120, 160, 3), dtype=np.uint8)
     assert shrink_to_width(frame, 640) is frame
     assert shrink_to_width(frame, 0) is frame
+
+
+async def test_a_frame_decoded_across_a_robot_change_is_dropped(monkeypatch):
+    async with boot(color_cameras_instance_ids=["chest"]) as h:
+        camera = h.mocks.deps.color_cameras[0]
+        panels, sinks, _told = recording_panels()
+        panels.show_only(["chest"])
+        # The harness's camera is outside any copy, so it shows for every
+        # robot; the switch is to no robot at all, which shows it still, so
+        # the test flips the camera's robot under the decode instead.
+        chosen = ["alpha"]
+        robots = SimpleNamespace(
+            chosen=lambda: chosen[0], arm_sides=sides(alpha=["left", "right"])
+        )
+        monkeypatch.setattr(
+            "xr_commander.video.camera_source",
+            lambda member: CameraSource("alpha", "chest"),
+        )
+        decoding = asyncio.Event()
+        switched = asyncio.Event()
+
+        def slow_decode(message, view_max_width):
+            decoding.set()
+            # Blocks the worker, never the loop, until the choice has moved on.
+            while not switched.is_set():
+                time.sleep(0.005)
+            return np.zeros((1, 1, 3), np.uint8)
+
+        monkeypatch.setattr("xr_commander.video._decode_and_shrink", slow_decode)
+        async with running_drain(
+            lambda token: drain_frames(
+                h.node_runner, color_video_stream, panels, robots, token, "test"
+            )
+        ):
+            await camera.video_stream.publish(bgr_message())
+            await asyncio.wait_for(decoding.wait(), 10.0)
+            chosen[0] = "bravo"
+            switched.set()
+            await asyncio.sleep(0.2)
+        panels.feed("bravo")
+        panels.feed("alpha")
+        assert sinks["chest"].frames == []
+
+
+async def test_drain_frames_routes_each_camera_into_the_panel_of_its_role():
+    async with boot(color_cameras_instance_ids=["wrist_left", "chest"]) as h:
+        wrist_mock, chest_mock = h.mocks.deps.color_cameras
+        sinks: dict[str, RecordingSink] = {}
+        panels = CameraPanels(
+            make_sink=RecordingSink, show_views=sinks.update, reserved=frozenset()
+        )
+        panels.show_only(["wrist_left", "chest"])
+        robots = SimpleNamespace(
+            chosen=lambda: None, arm_sides=lambda _robot: frozenset()
+        )
+        async with running_drain(
+            lambda token: drain_frames(
+                h.node_runner, color_video_stream, panels, robots, token, "test"
+            )
+        ) as drain:
+            # Cameras outside any copy belong to every robot, chosen or not.
+            await wrist_mock.video_stream.publish(frame_message())
+            await chest_mock.video_stream.publish(frame_message())
+            await eventually(
+                lambda: (
+                    panels.feed(None)
+                    or (sinks["wrist_left"].frames and sinks["chest"].frames)
+                ),
+                message="a frame in each panel",
+            )
+            assert not drain.done()

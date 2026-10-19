@@ -1,8 +1,6 @@
 import asyncio
 
 import cv2
-import pytest
-
 from peppygen.consumed_topics.alerts import alerts as alerts_topic
 
 from tests.helpers import FakeToken, boot, eventually, running_drain
@@ -252,7 +250,7 @@ async def test_drain_alerts_keeps_every_producers_alerts():
         active = active_alerts()
         async with running_drain(
             lambda token: drain_alerts(h.node_runner, alerts_topic, active, token)
-        ) as drain:
+        ):
             await left.alerts.publish(_wire(_item("left arm j2", 2)))
             await right.alerts.publish(_wire(_item("right arm j5", 3)))
             await eventually(

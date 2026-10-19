@@ -31,6 +31,7 @@ use crate::serving;
 use crate::servo::EeCaps;
 use crate::startup;
 use crate::streams;
+use crate::streams::LeaderActivity;
 use crate::upstream::UpstreamMode;
 use crate::workspace::Workspace;
 use crate::workspace_service;
@@ -462,6 +463,10 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     let runner = node_runner.clone();
     let token = node_runner.cancellation_token().clone();
     let goal_busy = [busy[0].clone(), busy[1].clone()];
+    // When a leader last streamed each limb: the goal handlers refuse a goal
+    // on a limb a leader is streaming.
+    let arm_activity = [LeaderActivity::default(), LeaderActivity::default()];
+    let gripper_activity = [LeaderActivity::default(), LeaderActivity::default()];
     tokio::spawn(async move {
         startup::wait_until_ready(&runner, &token).await;
 
@@ -490,32 +495,41 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
             runner.clone(),
             [goal_tx0.clone(), goal_tx1.clone()],
             [goal_busy[0].clone(), goal_busy[1].clone()],
+            arm_activity.clone(),
             [left_limits, right_limits],
         ));
         set.spawn(actions::arm::run_move_arm(
             runner.clone(),
             [goal_tx0.clone(), goal_tx1.clone()],
             [goal_busy[0].clone(), goal_busy[1].clone()],
+            arm_activity.clone(),
         ));
         set.spawn(actions::postures::run_move_to_ready(
             runner.clone(),
             [goal_tx0.clone(), goal_tx1.clone()],
             [goal_busy[0].clone(), goal_busy[1].clone()],
+            arm_activity.clone(),
             request_tx.clone(),
         ));
         set.spawn(actions::postures::run_move_to_home(
             runner.clone(),
             [goal_tx0, goal_tx1],
             [goal_busy[0].clone(), goal_busy[1].clone()],
+            arm_activity.clone(),
             request_tx.clone(),
         ));
         set.spawn(actions::gripper::run_move_gripper(
             runner.clone(),
             [grip_goal_tx0, grip_goal_tx1],
             [gripper_busy[0].clone(), gripper_busy[1].clone()],
+            gripper_activity.clone(),
         ));
         set.spawn(actions::stop::run_stop(runner.clone(), request_tx.clone()));
-        set.spawn(actions::arm::run_check_arm_move(runner.clone(), request_tx));
+        set.spawn(actions::arm::run_check_arm_move(
+            runner.clone(),
+            request_tx,
+            arm_activity.clone(),
+        ));
 
         // Inbound listeners buffer the latest message into the watch slots. They
         // run under the same fatal-first-exit supervision as the rest of the backbone,
@@ -527,16 +541,28 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         match upstream_mode {
             UpstreamMode::Joints => spawn_listener(
                 &mut set,
-                streams::run_joint_command_listener(runner.clone(), [cmd_tx0, cmd_tx1]),
+                streams::run_joint_command_listener(
+                    runner.clone(),
+                    [cmd_tx0, cmd_tx1],
+                    arm_activity,
+                ),
             ),
             UpstreamMode::Pose => spawn_listener(
                 &mut set,
-                streams::run_pose_command_listener(runner.clone(), [cmd_tx0, cmd_tx1]),
+                streams::run_pose_command_listener(
+                    runner.clone(),
+                    [cmd_tx0, cmd_tx1],
+                    arm_activity,
+                ),
             ),
         }
         spawn_listener(
             &mut set,
-            streams::run_gripper_command_listener(runner.clone(), [gripcmd_tx0, gripcmd_tx1]),
+            streams::run_gripper_command_listener(
+                runner.clone(),
+                [gripcmd_tx0, gripcmd_tx1],
+                gripper_activity,
+            ),
         );
         spawn_listener(
             &mut set,
