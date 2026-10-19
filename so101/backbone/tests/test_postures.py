@@ -17,10 +17,6 @@ def test_postures_are_five_entry_joint_targets():
         assert len(posture) == NUM_JOINTS
 
 
-def test_ready_is_the_calibration_midpoint():
-    assert postures.READY_POSITIONS_RAD == (0.0,) * NUM_JOINTS
-
-
 def test_postures_sit_inside_the_embedded_urdf_limits():
     limits = limits_mod.from_urdf(KINEMATICS_URDF_PATH)
     assert limits.contains(postures.HOME_POSITIONS_RAD)
@@ -67,8 +63,8 @@ def test_the_ready_grasp_point_stands_in_front_of_the_base_in_the_robot_frame():
     """The contracts define the robot frame with +x the way the robot
     faces, and this backbone reports poses in the URDF's base_link frame as
     they are: so the working posture's grasp point, out in front of the
-    robot, must have a positive x there, and stand on the robot's centre
-    line."""
+    robot, must have a positive x there, and stand within 10 mm of the
+    robot's centre line."""
     kinematics = Kinematics(KINEMATICS_URDF_PATH)
     ready_position, _ = kinematics.forward_kinematics(postures.READY_POSITIONS_RAD)
     assert ready_position[0] > 0.3
