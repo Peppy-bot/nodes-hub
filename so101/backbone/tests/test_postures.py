@@ -17,10 +17,6 @@ def test_postures_are_five_entry_joint_targets():
         assert len(posture) == NUM_JOINTS
 
 
-def test_ready_is_the_calibration_midpoint():
-    assert postures.READY_POSITIONS_RAD == (0.0,) * NUM_JOINTS
-
-
 def test_postures_sit_inside_the_embedded_urdf_limits():
     limits = limits_mod.from_urdf(KINEMATICS_URDF_PATH)
     assert limits.contains(postures.HOME_POSITIONS_RAD)

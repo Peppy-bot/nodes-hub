@@ -103,7 +103,7 @@ as the target, so a solution provably exists):
 
 | Seed posture | Refused |
 |---|---|
-| `ready` (the calibration middle) | 14% (n=400) |
+| Every joint at zero (the calibration middle) | 14% (n=400) |
 | An arbitrary in-limits posture, which is what `move_arm` seeds from | 39% (n=300) |
 
 Refusals concentrate near the base rather than at the rim: 25% within 0.23 m
