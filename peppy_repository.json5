@@ -171,6 +171,11 @@
         path: "uvc_camera_video_reconstruction/rust/peppy.json5"
       }
     },
+    vlm_router_brain: {
+      v1: {
+        path: "vlm_router_brain/peppy.json5"
+      }
+    },
     xr_commander: {
       v1: {
         path: "xr_commander/peppy.json5"

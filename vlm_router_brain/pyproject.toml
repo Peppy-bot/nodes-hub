@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vlm_router_brain"
+version = "0.1.0"
+description = "vlm_router_brain peppy node"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "peppygen",
+    "peppylib",
+    # The core every brain shares: the contract rules, the robot proxy, the
+    # camera geometry and the goal loops.
+    "brain_core",
+    # Every model call goes through any-llm, to Google's API or OpenRouter.
+    # Pinned exactly: the error classes the retry policy reads and the
+    # reasoning settings of each route are any-llm's.
+    "any-llm-sdk[openrouter,gemini]==1.37.0",
+    # The schema every answer is asked for and read with.
+    "pydantic>=2",
+    # Frames as arrays; Pillow encodes the JPEG each question carries.
+    "numpy>=1.26",
+    "pillow>=10",
+]
+
+[project.scripts]
+vlm_router_brain = "vlm_router_brain.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vlm_router_brain"]
+
+[dependency-groups]
+dev = ["pytest>=8", "pytest-asyncio>=0.25"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.uv.sources]
+peppygen = { path = ".peppy/libs/peppygen" }
+peppylib = { path = ".peppy/libs/peppylib" }
+# brain_core lives in the public-peppy-libs repository, pinned to one commit
+# of it: the node image holds the node's own directory alone.
+brain_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "brain_core", rev = "9de347b9b38570d16777f3340e95cc0676383a9b" }

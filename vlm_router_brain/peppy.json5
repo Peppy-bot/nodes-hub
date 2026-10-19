@@ -1,0 +1,120 @@
+// vlm_router_brain: a brain whose models are hosted vision-language models,
+// reached over the network. It implements item_perception and
+// item_manipulation, the contracts that scan for items, find one, pick it
+// up and put it down, and brain_model, which names the model of each role
+// and switches one while the brain runs. It depends on limb_motion, the
+// backbone's discrete arm and gripper moves; the launcher binds that slot to
+// the instance that governs the arms, so any move sent through it is
+// collision governed on the way down.
+//
+// The models are the entries of the node's catalog (catalog.json): each has
+// a name of its own, the roles it serves, and the routes that reach it, a
+// provider and that provider's model id. The node reads the key of a route
+// from its own environment, OPENROUTER_API_KEY for openrouter and
+// GEMINI_API_KEY for gemini, and takes the first route whose key is set. No
+// key is a parameter, and no key is logged.
+{
+  peppy_schema: "node/v1",
+  manifest: {
+    name: "vlm_router_brain",
+    tag: "v1",
+    implements: [
+      { name: "item_perception", tag: "v1", link_id: "item_perception" },
+      { name: "item_manipulation", tag: "v1", link_id: "item_manipulation" },
+      { name: "brain_model", tag: "v1", link_id: "brain_model" },
+    ],
+    depends_on: {
+      contracts: [
+        { name: "limb_motion", tag: "v1", link_id: "limb_motion" },
+        // The camera the brain looks through: colour and depth from one
+        // rgbd producer, so a detection's pixel becomes a world position
+        // through the depth at that pixel and the camera model below.
+        // Optional: without a camera the brain still serves every member,
+        // and both searches are refused with "no perception source".
+        { name: "rgbd_camera", tag: "v1", link_id: "camera", cardinality: "zero_or_one" },
+        // Where that camera's pixels point: its colour intrinsics and lens
+        // model, served by the camera node. Bound to the same camera as
+        // `camera`. Optional like it: without it no pixel can become a
+        // position, so both searches are refused naming the slot until it
+        // answers.
+        { name: "camera_geometry", tag: "v1", link_id: "geometry", cardinality: "zero_or_one" },
+        // Where that camera stands on the robot: the pose of its optical
+        // frame in the robot frame, served by the robot's backbone for the
+        // camera the `camera_name` parameter names. Optional like the two
+        // above: without it no pixel can become a position, so both
+        // searches are refused naming the slot until it answers and names
+        // the camera.
+        { name: "camera_mounts", tag: "v1", link_id: "camera_mounts", cardinality: "zero_or_one" },
+      ],
+    },
+  },
+  interfaces: {
+    actions: {
+      exposes: [
+        { link_id: "item_perception", name: "scan_items" },
+        { link_id: "item_perception", name: "identify_item" },
+        { link_id: "item_manipulation", name: "grab_item" },
+        { link_id: "item_manipulation", name: "drop_item" },
+        { link_id: "item_manipulation", name: "place_item" },
+        { link_id: "item_manipulation", name: "abort" },
+        { link_id: "brain_model", name: "switch_model" },
+      ],
+      consumes: [
+        { link_id: "limb_motion", name: "move_arm" },
+        { link_id: "limb_motion", name: "move_gripper" },
+      ],
+    },
+    topics: {
+      consumes: [
+        { link_id: "camera", name: "video_stream" },
+        { link_id: "camera", name: "depth_stream" },
+      ],
+    },
+    services: {
+      exposes: [
+        { link_id: "item_manipulation", name: "get_state" },
+        { link_id: "brain_model", name: "get_model" },
+        { link_id: "brain_model", name: "list_models" },
+      ],
+      consumes: [
+        { link_id: "camera", name: "depth_stream_info" },
+        { link_id: "geometry", name: "get_color_intrinsics" },
+        { link_id: "geometry", name: "get_depth_intrinsics" },
+        { link_id: "camera_mounts", name: "get_camera_poses" },
+      ],
+    },
+  },
+  execution: {
+    language: "python",
+    // The models run at their providers: the container needs the network
+    // and no GPU.
+    container: {
+      def_file: "apptainer.def",
+    },
+    parameters: {
+      // Each arm with the gripper it carries, comma separated, in the order
+      // get_state reports the grippers: "left_arm:left_gripper,right_arm:right_gripper"
+      // on the OpenArm, "arm:gripper" on the SO-101. They are the names
+      // limb_motion addresses, so the launcher names the limbs the robot has.
+      limbs: "string",
+      // The model perception starts on: a catalog model that serves
+      // perception (list_models names them), or "none", which refuses every
+      // search naming the missing model. The default is Gemini Robotics-ER
+      // on Google's API, the model the perception study measured, which
+      // needs GEMINI_API_KEY. switch_model changes it while the brain runs.
+      perception_model: { $type: "string", $default: "gemini-robotics-er-2-preview" },
+      // The model manipulation starts on. The catalog has no model that
+      // serves manipulation, so "none" is the one this node accepts: every
+      // sequence is refused naming the missing model, while abort and
+      // get_state work.
+      manipulation_model: { $type: "string", $default: "none" },
+      // The name the camera the brain looks through runs under on the
+      // robot, as the robot's camera_mounts lists it: the brain reads the
+      // pose of that camera, in the robot frame, from the `camera_mounts`
+      // slot, once, and reports every position in that frame. A camera an
+      // arm carries moves between the answer and a scan, so the brain looks
+      // through one fixed to the robot's body.
+      camera_name: "string",
+    },
+  },
+}
