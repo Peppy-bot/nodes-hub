@@ -1,6 +1,11 @@
 {
   peppy_schema: "repository/v1",
   nodes: {
+    ai_brain_vla: {
+      v1: {
+        path: "ai_brain_vla/peppy.json5"
+      }
+    },
     camera_geometry_check: {
       v1: {
         path: "camera_geometry_check/peppy.json5"
@@ -54,11 +59,6 @@
     my_rust_robot_brain: {
       v1: {
         path: "example_robot/my_robot_brain/my_rust_robot_brain/peppy.json5"
-      }
-    },
-    openarm_ai_brain_vla: {
-      v1: {
-        path: "openarm/ai_brain_vla/peppy.json5"
       }
     },
     openarm_arm: {
@@ -169,6 +169,11 @@
     uvc_camera_video_reconstruction_rust: {
       v1: {
         path: "uvc_camera_video_reconstruction/rust/peppy.json5"
+      }
+    },
+    vlm_router_brain: {
+      v1: {
+        path: "vlm_router_brain/peppy.json5"
       }
     },
     xr_commander: {

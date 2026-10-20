@@ -1,0 +1,38 @@
+Bootstrap: docker
+From: peppybot/python-uv-base:latest
+
+%labels
+    Name ai_brain_vla
+    Version v1
+
+%environment
+    export PATH="/opt/ai_brain_vla/.venv/bin:$PATH"
+
+%files
+    . /opt/ai_brain_vla
+
+%post
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+    # uv resolves brain_core as a git dependency; the base image has no git.
+    apt-get update -qq
+    apt-get install -qqy --no-install-recommends git
+    rm -rf /var/lib/apt/lists/*
+
+    # Keep the interpreter out of the container user's home directory. uv
+    # installs managed Pythons under $HOME, and at run time apptainer mounts
+    # the daemon user's home over the image's own, hiding whatever the build
+    # left there. A daemon running as root hides /root every time: the venv
+    # builds fine and then dies at exec with `./.venv/bin/python: not found`.
+    export UV_PYTHON_INSTALL_DIR=/opt/uv-python
+
+    cd /opt/ai_brain_vla
+    uv python install
+    # The brain whose models run beside the robot: the sam3-siglip extra
+    # brings torch and transformers into the image, and the manifest passes
+    # --nv so they see the host's GPU.
+    uv sync --no-editable --no-dev --extra sam3-siglip
+
+%runscript
+    cd /opt/ai_brain_vla
+    exec ./.venv/bin/python -u -m ai_brain_vla

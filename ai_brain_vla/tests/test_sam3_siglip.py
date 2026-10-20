@@ -1,0 +1,547 @@
+"""The sam3_siglip backend around its models: the vocabulary, the search
+plan, the proposal selection and the naming, all without torch. The models
+themselves are exercised by test_sam3_siglip_models.py, which needs them
+installed and skips otherwise."""
+
+import asyncio
+import threading
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from brain_core.ports import Coverage, SearchTimeout
+from conftest import NEVER, PASSED
+
+from ai_brain_vla.perception import weights
+from ai_brain_vla.perception.gallery import Gallery, load_harvest
+from ai_brain_vla.perception.sam3_siglip import (
+    BACKGROUND_PHRASES,
+    GENERIC_PROMPTS,
+    MIN_CONFIDENCE,
+    SIMILARITY_FLOOR,
+    Route,
+    VOCABULARY_MARGIN,
+    Sam3SiglipDetector,
+    class_agnostic_nms,
+    detections_from,
+    grown,
+    load_vocabulary,
+    name_by_prototypes,
+    normalised,
+    plan_for,
+    under_floor,
+    unlike_the_words,
+)
+from test_gallery import write_enrolment, write_harvest
+
+# Every load finds the models' weights on the machine.
+pytestmark = pytest.mark.usefixtures("staged_weights")
+
+VOCABULARY = ("cup", "banana")
+
+
+def test_the_vocabulary_is_a_general_one_each_name_once():
+    vocabulary = load_vocabulary()
+    assert len(vocabulary) == 1198 and len(set(vocabulary)) == len(vocabulary)
+    assert all(name == name.lower() and "(" not in name and "_" not in name for name in vocabulary)
+    assert {"cup", "mug", "bottle", "banana", "apple", "sponge", "wrench", "stapler"} <= set(vocabulary)
+
+
+def test_a_vocabulary_file_skips_comments_and_blank_lines(tmp_path):
+    path = tmp_path / "words.txt"
+    path.write_text("# a comment\ncup\n\n  banana  \n")
+    assert load_vocabulary(path) == ("cup", "banana")
+
+
+def test_the_plan_is_the_vocabulary_an_enrolled_item_or_the_words(tmp_path):
+    gallery = load_harvest(write_harvest(tmp_path / "g"))
+    # A scan: the generic prompt, every box named by the vocabulary, after
+    # an enrolled picture when there is a gallery.
+    assert plan_for(None, [], VOCABULARY) == (scan := plan_for(None, ["  "], VOCABULARY)) == plan_for(gallery, [], VOCABULARY)
+    assert scan.prompts == GENERIC_PROMPTS and scan.labels == VOCABULARY and scan.route is Route.SCAN
+    # An enrolled item: the scan's generic prompt plus the item's own name,
+    # named the scan's way, and the core picks the item by name afterwards;
+    # a cracker box found for "coffee can" is called a cracker box and never
+    # returned for it.
+    known = plan_for(gallery, ["coffee can"], VOCABULARY)
+    assert known.prompts == GENERIC_PROMPTS + ("coffee can",) and known.labels == VOCABULARY and known.route is Route.SCAN
+    assert plan_for(gallery, ["the coffee can please"], VOCABULARY) == known
+    assert plan_for(gallery, ["can"], VOCABULARY).prompts == GENERIC_PROMPTS + ("coffee can",)
+    # Any other description: searched and named by its own words.
+    for words in (plan_for(gallery, ["red mug"], VOCABULARY), plan_for(None, [" red mug "], VOCABULARY)):
+        assert words.prompts == ("red mug",) and words.labels == ("red mug",) and words.route is Route.WORDS
+    assert plan_for(gallery, ["blue can"], VOCABULARY).route is Route.WORDS
+
+
+def test_class_agnostic_nms_keeps_the_most_confident_of_overlapping_boxes():
+    boxes = np.array([
+        [0, 0, 10, 10],     # the coffee can, called a coffee can
+        [1, 1, 11, 11],     # the same coffee can, called a cracker box: goes
+        [50, 50, 60, 60],   # another item
+        [52, 50, 62, 60],   # overlapping it, weaker: goes
+        [0, 0, 5, 5],       # a quarter of the first box, IoU 0.25: stays
+    ], dtype=np.float32)
+    scores = np.array([0.6, 0.9, 0.5, 0.4, 0.3], dtype=np.float32)
+    assert class_agnostic_nms(boxes, scores, 0.6, 40) == [1, 2, 4]
+    assert class_agnostic_nms(boxes, scores, 0.6, 2) == [1, 2]
+    assert class_agnostic_nms(boxes[:0], scores[:0], 0.6, 40) == []
+
+
+def test_crops_grow_by_the_margin_and_stay_inside_the_image():
+    assert grown((10, 10, 30, 50), 0.1, 100, 100) == (8, 6, 32, 54)
+    assert grown((0, 0, 30, 50), 0.1, 100, 100) == (0, 0, 33, 55)
+    assert grown((80, 70, 100, 100), 0.1, 100, 100) == (78, 67, 100, 100)
+    # A box one pixel wide is widened to eight about its centre: 10.5 +- 4.
+    assert grown((10, 10, 11, 40), 0.1, 100, 100) == (6, 7, 14, 43)
+    # Widened at the image's edge, the crop shifts inwards rather than shrinks.
+    assert grown((0, 50, 1, 60), 0.0, 100, 100) == (0, 50, 8, 60)
+    assert grown((99, 50, 100, 60), 0.0, 100, 100) == (92, 50, 100, 60)
+
+
+def test_naming_takes_the_nearest_prototype_with_a_sharp_softmax():
+    prototypes = normalised(np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]))
+    embeddings = normalised(np.array([[0.9, 0.1, 0.0], [0.1, 0.0, 0.95], [0.6, 0.6, 0.0]]))
+    best, probability = name_by_prototypes(embeddings, prototypes, 100.0)
+    assert best.tolist() == [0, 2, 0]
+    # At temperature 100 a clear match is nearly certain, a tie is not.
+    assert probability[0] > 0.99 and probability[1] > 0.99
+    assert abs(probability[2] - 0.5) < 0.01
+
+
+def test_detections_keep_the_confident_named_boxes_and_drop_the_background():
+    boxes = np.array([[0, 0, 10, 10], [20, 20, 30, 30], [40, 40, 50, 50], [60, 60, 70, 70]], dtype=np.float32)
+    objectness = np.array([0.9, 0.9, 0.3, 0.9])
+    names = ["coffee can", "banana", "coffee can", None]   # the last is named as background
+    probability = np.array([0.95, 0.5, 0.95, 0.99])
+    out = detections_from(boxes, objectness, names, probability)
+    # 0.3 x 0.95 = 0.285 is kept at the study's threshold of 0.25; the
+    # background box goes whatever its confidence.
+    assert MIN_CONFIDENCE == 0.25
+    assert [(d.label, round(d.confidence, 3)) for d in out] == [
+        ("coffee can", 0.855),
+        ("banana", 0.45),
+        ("coffee can", 0.285),
+    ]
+    assert (out[0].x0, out[0].y0, out[0].x1, out[0].y1) == (0.0, 0.0, 10.0, 10.0)
+    assert detections_from(boxes[2:3], objectness[2:3] * 0.5, names[2:3], probability[2:3]) == []
+    assert [d.label for d in detections_from(boxes, objectness, names, probability, 0.5)] == ["coffee can"]
+
+
+def test_a_box_that_resembles_no_prototype_enough_is_nothing_enrolled():
+    prototypes = normalised(np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32))
+    near = normalised(np.array([[0.95, 0.3, 0.0]], dtype=np.float32))
+    far = normalised(np.array([[0.5, 0.5, 0.7]], dtype=np.float32))
+    assert under_floor(near, prototypes).tolist() == [False]
+    assert under_floor(far, prototypes).tolist() == [True]
+    assert 0.75 <= SIMILARITY_FLOOR <= 0.9
+
+
+def test_a_search_refuses_a_box_that_looks_more_like_another_name():
+    words = np.array([[1.0, 0.0, 0.0]], dtype=np.float32)         # "mug"
+    vocabulary = np.array([[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
+    crops = normalised(np.array([
+        [0.6, 0.8, 0.0],    # more a bowl than a mug: refused
+        [0.8, 0.6, 0.0],    # more a mug than a bowl: kept
+        [0.7, 0.71, 0.0],   # nearly as much a mug: kept within the margin
+    ], dtype=np.float32))
+    assert unlike_the_words(crops, words, vocabulary).tolist() == [True, False, False]
+    assert 0.0 < VOCABULARY_MARGIN < 0.1
+
+
+def test_the_detector_finds_nothing_and_says_so_until_it_is_loaded():
+    detector = Sam3SiglipDetector()
+    assert detector.name == "sam3_siglip"
+    assert detector.scan_vocabulary == load_vocabulary()
+    assert detector.why_unavailable() == "perception_model 'sam3_siglip' is not loaded"
+    assert detector.scan_coverage() == Coverage()
+    assert detector.find(np.zeros((4, 4, 3), dtype=np.uint8), ["banana"], NEVER) == []
+
+
+def test_loading_without_the_models_says_which_extra(tmp_path):
+    """The models are needed whatever the gallery: without torch the load
+    fails naming the extra that installs them."""
+    try:
+        import torch  # noqa: F401
+    except ImportError:
+        pass
+    else:
+        pytest.skip("torch is installed here: the models would load")
+    with pytest.raises(RuntimeError, match="sam3-siglip extra"):
+        Sam3SiglipDetector().load("")
+    with pytest.raises(RuntimeError, match="sam3-siglip extra"):
+        Sam3SiglipDetector().load("waldo_catalogue")
+
+
+def test_the_background_phrases_are_the_studys_and_the_robots_own_body():
+    assert BACKGROUND_PHRASES[:4] == ("an empty table surface", "a white robot gripper", "a plain wooden board", "a blue wall")
+    assert {"a robot arm", "a black robot gripper"} <= set(BACKGROUND_PHRASES)
+
+
+# ----------------------------------------------------------------- with fake models
+
+DIM = 64
+
+
+class FakeModels:
+    """Stands in for the two models: one box per call; every distinct text
+    is a unit axis of its own, in the order first seen, and every crop is
+    `looks_like`, a mix of texts by weight, so a test says what the crop
+    looks like. Records the two directories it was built from."""
+
+    device = "fake"
+    looks_like = {"a photo of a cup": 1.0}
+
+    def __init__(self, sam3_directory, siglip_directory) -> None:
+        self.sam3_directory = sam3_directory
+        self.siglip_directory = siglip_directory
+        self.prompts: list[tuple[str, ...]] = []
+        self.texts: list[str] = []
+        self._axes: dict[str, int] = {}
+
+    def axis(self, text: str) -> np.ndarray:
+        return np.eye(DIM, dtype=np.float32)[self._axes.setdefault(text, len(self._axes))]
+
+    def propose(self, image, prompts):
+        self.prompts.append(tuple(prompts))
+        return np.array([[10.0, 10.0, 50.0, 40.0]], dtype=np.float32), np.array([0.9], dtype=np.float32)
+
+    def embed_images(self, crops):
+        crop = normalised(sum(weight * self.axis(text) for text, weight in self.looks_like.items()))
+        return np.stack([crop for _ in crops])
+
+    def embed_texts(self, phrases):
+        self.texts.extend(phrases)
+        return np.stack([self.axis(p) for p in phrases])
+
+
+def looking_like(**weights):
+    """A FakeModels class whose crops look like the named texts; a keyword
+    is the text's words with underscores, "a photo of a " before it."""
+    return type("Fake", (FakeModels,), {"looks_like": {f"a photo of a {k.replace('_', ' ')}": w for k, w in weights.items()}})
+
+
+def blank() -> np.ndarray:
+    return np.zeros((60, 80, 3), dtype=np.uint8)
+
+
+def detected(detector, phrases=(), deadline=NEVER):
+    return [(b.label, round(b.confidence, 2)) for b in detector.find(blank(), list(phrases), deadline)]
+
+
+def with_prototypes(detector, nearest: int) -> None:
+    """One prototype per enrolled class, each on a text of its own, the one
+    at `nearest` the crop itself, or none of them when `nearest` is -1."""
+    models = detector._models
+    rows = [models.axis(f"prototype {i}") for i in range(len(detector._gallery.classes))]
+    if nearest >= 0:
+        rows[nearest] = models.embed_images([None])[0]
+    detector._prototypes = np.stack(rows)
+
+
+def test_a_scan_names_what_it_finds_by_the_vocabulary():
+    detector = Sam3SiglipDetector(models_factory=FakeModels, vocabulary=VOCABULARY)
+    detector.load("")
+    assert detector.why_unavailable() == ""
+    # The vocabulary is embedded once, at load, with the background phrases.
+    texts = list(detector._models.texts)
+    assert texts == ["a photo of a cup", "a photo of a banana"] + [f"a photo of {b}" for b in BACKGROUND_PHRASES]
+    assert detected(detector) == [("cup", 0.9)]
+    assert detector._models.prompts[-1] == GENERIC_PROMPTS
+    assert detector._models.texts == texts
+
+
+def test_the_models_are_built_from_the_weights_on_the_machine(staged_weights, no_network):
+    detector = Sam3SiglipDetector(models_factory=FakeModels, vocabulary=VOCABULARY)
+    detector.load("")
+    assert detector._models.sam3_directory == staged_weights / weights.SAM3.directory_name
+    assert detector._models.siglip_directory == staged_weights / weights.SIGLIP.directory_name
+
+
+@pytest.fixture
+def staging(monkeypatch):
+    """Stands in for the download: records each model a load asks for and
+    the directory it asks for it in, and names the model's directory."""
+    asked = []
+
+    def stage(source, directory):
+        asked.append((source, directory))
+        return directory / source.directory_name
+
+    monkeypatch.setattr(weights, "stage", stage)
+    return asked
+
+
+def test_a_load_asks_for_both_models_in_the_directory_the_node_keeps_its_weights_in(staged_weights, staging):
+    detector = Sam3SiglipDetector(models_factory=FakeModels, vocabulary=VOCABULARY)
+    detector.load("")
+    assert staging == [(weights.SAM3, staged_weights), (weights.SIGLIP, staged_weights)]
+    assert detector._models.sam3_directory == staged_weights / weights.SAM3.directory_name
+    assert detector._models.siglip_directory == staged_weights / weights.SIGLIP.directory_name
+
+
+def test_weights_that_cannot_be_downloaded_fail_the_load_before_the_models(monkeypatch):
+    def stage(source, directory):
+        raise weights.WeightsError(f"the download of {source.repository} stopped")
+
+    monkeypatch.setattr(weights, "stage", stage)
+    made = []
+    detector = Sam3SiglipDetector(models_factory=lambda *directories: made.append(directories), vocabulary=VOCABULARY)
+    with pytest.raises(weights.WeightsError, match="the download of jetjodh/sam3 stopped"):
+        detector.load("")
+    assert detector.why_unavailable() != "" and made == []
+
+
+def test_a_scan_drops_a_box_on_the_robot_itself():
+    class OnTheArm(FakeModels):
+        looks_like = {"a photo of a robot arm": 1.0}
+
+    detector = Sam3SiglipDetector(models_factory=OnTheArm, vocabulary=VOCABULARY)
+    detector.load("")
+    assert detected(detector) == []
+
+
+def test_a_description_is_searched_by_its_own_words_and_its_table_is_not_kept():
+    detector = Sam3SiglipDetector(models_factory=looking_like(blue_ball=1.0), vocabulary=VOCABULARY)
+    detector.load("")
+    at_load = len(detector._models.texts)
+    assert detected(detector, ["blue ball"]) == [("blue ball", 0.9)]
+    assert detector._models.prompts[-1] == ("blue ball",)
+    # Each words search embeds its words and the background phrases again:
+    # only the vocabulary's table lives for the backend's life.
+    per_search = 1 + len(BACKGROUND_PHRASES)
+    assert len(detector._models.texts) == at_load + per_search
+    detected(detector, ["blue ball"])
+    assert len(detector._models.texts) == at_load + 2 * per_search
+    assert detector._vocabulary_table.shape[0] == len(VOCABULARY) + len(BACKGROUND_PHRASES)
+
+
+class Ticking:
+    """A deadline that passes at its n-th check, so a test says at which
+    stage the search runs out of time."""
+
+    def __init__(self, passes_at: int) -> None:
+        self.checks = 0
+        self.passes_at = passes_at
+
+    def check(self) -> None:
+        self.checks += 1
+        if self.checks >= self.passes_at:
+            raise SearchTimeout(1.0)
+
+    def remaining_s(self) -> float:
+        return 0.0 if self.checks >= self.passes_at else 1.0
+
+
+def test_a_search_stops_at_its_deadline_between_its_stages():
+    detector = Sam3SiglipDetector(models_factory=looking_like(blue_ball=1.0), vocabulary=VOCABULARY)
+    detector.load("")
+    proposals = len(detector._models.prompts)
+    # Passed before anything: SAM 3 is not even asked.
+    with pytest.raises(SearchTimeout, match="did not finish within 1 s"):
+        detected(detector, ["blue ball"], PASSED)
+    assert len(detector._models.prompts) == proposals
+    # Passed after the proposals: SAM 3 ran, SigLIP did not embed a crop.
+    embedded = len(detector._models.texts)
+    with pytest.raises(SearchTimeout):
+        detected(detector, ["blue ball"], Ticking(passes_at=2))
+    assert len(detector._models.prompts) == proposals + 1 and len(detector._models.texts) == embedded
+    # Passed after the crops are embedded: no names are made.
+    with pytest.raises(SearchTimeout):
+        detected(detector, ["blue ball"], Ticking(passes_at=3))
+    assert len(detector._models.texts) == embedded
+    # Never passed: the search answers.
+    assert detected(detector, ["blue ball"], Ticking(passes_at=4)) == [("blue ball", 0.9)]
+
+
+def test_a_search_does_not_return_what_looks_more_like_another_name():
+    # A cup that looks a little like a mug is not returned for "mug"...
+    detector = Sam3SiglipDetector(models_factory=looking_like(mug=0.6, cup=0.8), vocabulary=VOCABULARY)
+    detector.load("")
+    assert detected(detector, ["mug"]) == []
+    # ...and a mug that looks a little like a cup is.
+    detector = Sam3SiglipDetector(models_factory=looking_like(mug=0.8, cup=0.6), vocabulary=VOCABULARY)
+    detector.load("")
+    assert detected(detector, ["mug"]) == [("mug", 0.9)]
+
+
+def test_the_backend_downloads_nothing_but_weights_the_machine_lacks(shipped_folder, no_network):
+    """A load and its searches reach for no network when the models'
+    weights are on the machine: the vocabulary and the enrolments ship in
+    the node."""
+    assert len(load_vocabulary()) == 1198
+    # Every crop looks like a cup and a coffee can at once, and is the
+    # coffee can's prototype, so the box is the enrolled item: the words
+    # agree.
+    write_enrolment(shipped_folder / "items", dim=DIM)
+    detector = Sam3SiglipDetector(models_factory=looking_like(cup=1.0, coffee_can=1.0), vocabulary=VOCABULARY)
+    detector.load("items")
+    with_prototypes(detector, nearest=0)
+    assert detected(detector) == [("coffee can", 0.9)]
+    assert detected(detector, ["banana"]) == [("coffee can", 0.9)]
+    assert detected(detector, ["blue ball"]) == []
+
+
+def test_a_scan_covers_the_vocabulary_and_the_enrolled_items(shipped_folder):
+    detector = Sam3SiglipDetector(models_factory=FakeModels, vocabulary=VOCABULARY)
+    assert detector.scan_coverage() == Coverage()
+    detector.load("")
+    assert detector.scan_coverage() == Coverage(frozenset(VOCABULARY))
+    write_enrolment(shipped_folder / "items", dim=DIM)
+    detector = Sam3SiglipDetector(models_factory=FakeModels, vocabulary=VOCABULARY)
+    detector.load("items")
+    assert detector.scan_coverage() == Coverage(frozenset({"cup", "banana", "coffee can", "cracker box"}))
+
+
+def test_a_named_gallery_that_cannot_be_read_fails_the_load_before_the_models(tmp_path):
+    made = []
+
+    def factory(sam3_directory, siglip_directory):
+        made.append(sam3_directory)
+        return FakeModels(sam3_directory, siglip_directory)
+
+    detector = Sam3SiglipDetector(models_factory=factory, vocabulary=VOCABULARY)
+    with pytest.raises(ValueError, match="perception_gallery '.*missing' is not an enrolment this node ships"):
+        detector.load(str(tmp_path / "missing"))
+    assert detector.why_unavailable() != "" and made == []
+
+
+def test_shipped_prototypes_are_used_as_they_are_and_nothing_is_embedded_at_load(shipped_folder):
+    class CountingModels(FakeModels):
+        embedded = 0
+
+        def embed_images(self, crops):
+            CountingModels.embedded += len(crops)
+            return super().embed_images(crops)
+
+    write_enrolment(shipped_folder / "items", dim=DIM)
+    detector = Sam3SiglipDetector(models_factory=CountingModels, vocabulary=VOCABULARY)
+    detector.load("items")
+    assert CountingModels.embedded == 0
+    assert detector._prototypes.shape == (4, DIM) and detector._enrolled_table.shape == (4, DIM)
+    # The words of every enrolled class were embedded, the referee's table.
+    assert {"a photo of a coffee can", "a photo of a cracker box", "a photo of a banana", "a photo of a robot arm"} <= set(detector._models.texts)
+    # The background row is not something a scan can name.
+    assert detector.scan_coverage() == Coverage(frozenset({"cup", "banana", "coffee can", "cracker box"}))
+
+
+def test_prototypes_made_by_another_siglip_are_refused_before_the_models(shipped_folder):
+    made = []
+
+    def factory(sam3_directory, siglip_directory):
+        made.append(sam3_directory)
+        return FakeModels(sam3_directory, siglip_directory)
+
+    detector = Sam3SiglipDetector(models_factory=factory, vocabulary=VOCABULARY)
+    write_enrolment(shipped_folder / "other", model="google/siglip-base-patch16-224", dim=DIM)
+    with pytest.raises(ValueError, match="made by google/siglip-base-patch16-224; this node names by google/siglip-so400m-patch14-384"):
+        detector.load("other")
+    assert detector.why_unavailable() != "" and made == []
+
+
+def test_a_box_like_an_enrolled_item_takes_its_name_when_the_words_agree(shipped_folder):
+    # The crop looks like a cup and like a cracker box in equal measure, so
+    # by text the enrolled words are as near as the vocabulary's nearest
+    # name; with its prototype nearest too, the enrolled name wins.
+    detector = Sam3SiglipDetector(models_factory=looking_like(cup=1.0, cracker_box=1.0), vocabulary=VOCABULARY)
+    write_enrolment(shipped_folder / "items", dim=DIM)
+    detector.load("items")
+    with_prototypes(detector, nearest=1)    # the enrolment's "cracker box"
+    assert detected(detector) == [("cracker box", 0.9)]
+
+
+def test_a_box_near_an_enrolled_prototype_keeps_the_general_name_when_the_words_disagree(shipped_folder):
+    # The referee: the crop is the cracker box's prototype itself, but by
+    # text it is a cup and not at all a cracker box, so an unknown object
+    # that merely resembles an enrolled picture is not given its exact name.
+    detector = Sam3SiglipDetector(models_factory=FakeModels, vocabulary=VOCABULARY)
+    write_enrolment(shipped_folder / "items", dim=DIM)
+    detector.load("items")
+    with_prototypes(detector, nearest=1)
+    assert detected(detector) == [("cup", 0.9)]
+
+
+def test_a_box_unlike_every_enrolled_item_is_named_by_the_vocabulary(shipped_folder):
+    detector = Sam3SiglipDetector(models_factory=looking_like(cup=1.0, cracker_box=1.0), vocabulary=VOCABULARY)
+    write_enrolment(shipped_folder / "items", dim=DIM)
+    detector.load("items")
+    with_prototypes(detector, nearest=-1)
+    assert detected(detector) == [("cup", 0.9)]
+
+
+def test_a_box_nearest_a_background_prototype_is_dropped(shipped_folder):
+    # The crop looks like a cup, and it is the enrolment's picture of the
+    # robot's own arm: that row names nothing, so the box is "none of these".
+    write_enrolment(shipped_folder / "items", dim=DIM)
+    detector = Sam3SiglipDetector(models_factory=FakeModels, vocabulary=VOCABULARY)
+    detector.load("items")
+    with_prototypes(detector, nearest=3)    # the robot's arm
+    assert detected(detector) == []
+    # Away from every prototype, the same box is a cup again.
+    with_prototypes(detector, nearest=-1)
+    assert detected(detector) == [("cup", 0.9)]
+
+
+def test_the_referee_compares_text_with_text_on_the_two_tables():
+    from ai_brain_vla.perception.sam3_siglip import name_enrolled_first
+
+    gallery = Gallery(Path("."), ("mustard", "arm"), ("mustard bottle", "robot arm"), background=frozenset({1}))
+    e = np.eye(6, dtype=np.float32)
+    prototypes = np.stack([e[0], e[1]])                 # the mustard bottle's picture, the arm's picture
+    enrolled_table = np.stack([e[2], e[3]])             # "a photo of a mustard bottle", "a photo of a robot arm"
+    vocabulary_table = np.stack([e[4], e[5]])           # "bottle", "jar"
+    like = lambda *parts: normalised(sum(parts))
+    crops = np.stack([
+        like(3 * e[0], e[2], e[4]),    # the mustard picture (cosine 0.90), its words and "bottle" alike by text: enrolled
+        like(3 * e[0], e[4]),          # the mustard picture (0.95), but by text a plain bottle: the general name stands
+        like(3 * e[1], e[4]),          # the arm's picture: dropped
+        like(e[2], e[4]),              # far from every prototype: untouched
+    ])
+    names, probability = name_enrolled_first(crops, prototypes, gallery, ["bottle", "bottle", "bottle", "bottle"], np.full(4, 0.6), enrolled_table, vocabulary_table)
+    assert names == ["mustard bottle", "bottle", None, "bottle"]
+    assert probability[0] > 0.6 and list(probability[1:]) == [0.6, 0.6, 0.6]
+
+
+async def test_a_search_is_refused_as_still_loading_until_the_background_load_ends(staged_weights):
+    entered, release = threading.Event(), threading.Event()
+
+    class SlowModels(FakeModels):
+        def __init__(self, *directories) -> None:
+            entered.set()
+            release.wait(5.0)
+            super().__init__(*directories)
+
+    detector = Sam3SiglipDetector(models_factory=SlowModels, vocabulary=VOCABULARY)
+    task = detector.start_loading("")
+    await asyncio.wait_for(asyncio.to_thread(entered.wait), 5.0)
+    assert not task.done()
+    assert detector.why_unavailable() == "perception_model 'sam3_siglip' is still loading"
+    release.set()
+    await detector.loaded()
+    assert detector.why_unavailable() == ""
+
+
+async def test_a_load_that_fails_is_the_reason_every_search_is_refused_with(shipped_folder):
+    detector = Sam3SiglipDetector(models_factory=FakeModels, vocabulary=VOCABULARY)
+    await detector.start_loading("waldo")
+    assert detector.why_unavailable() == (
+        "perception_model 'sam3_siglip' could not load: perception_gallery 'waldo' is not an enrolment this node ships (none)"
+    )
+    assert detector.scan_coverage() == Coverage()
+
+
+async def test_a_search_computes_in_a_daemon_thread_of_its_own():
+    threads: list[threading.Thread] = []
+
+    class Recording(FakeModels):
+        def propose(self, image, prompts):
+            threads.append(threading.current_thread())
+            return super().propose(image, prompts)
+
+    detector = Sam3SiglipDetector(models_factory=Recording, vocabulary=VOCABULARY)
+    detector.load("")
+    threads.clear()
+    boxes = await detector.detect(blank(), [], NEVER)
+    assert [(box.label, round(box.confidence, 2)) for box in boxes] == [("cup", 0.9)]
+    [thread] = threads
+    assert thread.daemon and thread is not threading.main_thread() and thread.name == "brain-find"
