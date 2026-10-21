@@ -275,6 +275,9 @@ struct ServoTrack {
     /// The caller's arrival slack, judged by each tick's step. Parsed at
     /// planning time, so a track exists only for a slack the law can reach.
     tolerance: ServoTolerances,
+    /// The fraction of the live end-effector caps every tick steps at: the
+    /// pace the plan rolled the move out at to take its requested time.
+    pace: f64,
     started: Instant,
     prev_sample_at: Instant,
     /// The plan-time rollout duration. The runtime aborts once the move runs
@@ -797,7 +800,10 @@ impl Planner {
         let step = track.servo.step(
             self.model.chain(),
             &governed_q,
-            &self.plan_limits().servo_at(dt, track.tolerance),
+            &self
+                .plan_limits()
+                .paced(track.pace)
+                .servo_at(dt, track.tolerance),
         );
         match step {
             ServoStep::Converged(q) => PathStep::To {
@@ -943,14 +949,16 @@ impl Planner {
             CartesianPlan::Servo {
                 duration_s,
                 tolerance,
+                pace,
             } => {
                 info!(
-                    "{}: move_arm start (servo-guided), rollout={duration_s:.3}s",
+                    "{}: move_arm start (servo-guided), rollout={duration_s:.3}s at {pace:.3} of the speed caps",
                     self.side.label()
                 );
                 MovePath::Servo(ServoTrack {
                     servo: Box::new(servo_from(start_world, target, self.cfg.smoothing)),
                     tolerance,
+                    pace,
                     started: now,
                     prev_sample_at: now,
                     budget: MoveBudget::new(duration_s, self.cfg.ee.linear_m_s),
@@ -1096,6 +1104,7 @@ mod tests {
             tolerance: PlanTolerance::default()
                 .servo()
                 .expect("the node's default slack is reachable"),
+            pace: 1.0,
             started: now,
             prev_sample_at: now,
             budget: MoveBudget::new(1.0, planner.cfg.ee.linear_m_s),
@@ -1110,6 +1119,42 @@ mod tests {
             (track.budget.seconds() - (0.25 + 0.75 * 2.0)).abs() < 1e-9,
             "expected the remaining deadline to double, got {}",
             track.budget.seconds()
+        );
+    }
+
+    #[test]
+    fn a_paced_servo_tick_moves_the_arm_at_its_fraction_of_the_speed_caps() {
+        // One tick toward a goal 10 cm away, at the full caps and at a tenth of
+        // them: the paced tick moves the arm a tenth as far, so a servo-guided
+        // move runs as slowly as its plan's pace says.
+        let moved_at = |pace: f64| {
+            let mut planner = pose_planner();
+            let start = planner.ee_pose_world(&POSE_TEST_Q);
+            let mut end = start;
+            end.translation.vector.x += 0.1;
+            let now = Instant::now();
+            let mut track = ServoTrack {
+                servo: Box::new(servo_from(start, end, planner.cfg.smoothing)),
+                tolerance: PlanTolerance::default()
+                    .servo()
+                    .expect("the node's default slack is reachable"),
+                pace,
+                started: now,
+                prev_sample_at: now,
+                budget: MoveBudget::new(10.0, planner.cfg.ee.linear_m_s),
+            };
+            let PathStep::To { q_des, .. } =
+                planner.step_servo(&mut track, 0.0, now + planner.cfg.cycle_period)
+            else {
+                panic!("a fresh servo tick steps");
+            };
+            (planner.ee_pose_world(&q_des).translation.vector - start.translation.vector).norm()
+        };
+        let (full, tenth) = (moved_at(1.0), moved_at(0.1));
+        assert!(full > 0.0, "the full-speed tick moved nothing");
+        assert!(
+            (tenth / full - 0.1).abs() < 1e-2,
+            "a tenth of the caps moved the arm {tenth:.6} m against {full:.6} m"
         );
     }
 

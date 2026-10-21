@@ -5,16 +5,18 @@
 //! damping bounds the joint rates while the task error carries the arm across,
 //! deviating from the line only where the geometry forces it and re-converging
 //! beyond. The law runs against a reference that walks the line at the
-//! end-effector speed cap, held back by a leash whenever the arm falls behind, so
+//! end-effector speed caps, held back by a leash whenever the arm falls behind, so
 //! a move_arm goal degrades to exactly the motion streaming produces instead of a
-//! blind joint-space swing.
+//! blind joint-space swing. A move the law would finish sooner than requested
+//! runs at caps scaled down alike, so it takes the time it was asked to, as a
+//! line does.
 //!
 //! The plan rolls the identical law out offline (closed-form steps, well under a
-//! millisecond each) before accepting the goal: a goal that converges within
-//! [`MAX_SERVO_S`] is accepted with that duration, one that does not is rejected
-//! rather than started. That offline proof is the only reachability check the
-//! servo needs, so the runtime just runs the law and trusts the plan, with
-//! [`MAX_SERVO_S`] as its lone backstop.
+//! millisecond each) before accepting the goal: a goal that converges within its
+//! ceiling, the requested time plus [`MAX_SERVO_S`], is accepted with the
+//! duration the rollout took, one that does not is rejected rather than started.
+//! That offline proof is the only reachability check the servo needs, so the
+//! runtime just runs the law at the pace the plan chose and trusts the plan.
 //!
 //! The law itself is [`chain_kinematics::servo`], which knows nothing about an
 //! SRS arm. What stays here is what is this robot's: the smoothing filter, the
@@ -47,10 +49,9 @@ pub use srs_model::chain_kinematics::EeCaps;
 /// wall crossing is ground through instead of the reference running away. Bespoke
 /// to the leashed-reference law; no MoveIt analogue.
 const LEASH_M: f64 = 0.05;
-/// Hard ceiling on a servo move. The plan-time rollout runs at most this long; a
-/// goal that has not converged by then is taken as unreachable and rejected, and
-/// the runtime aborts a move still going past it (the rare case where the
-/// governor holds the arm off its path indefinitely).
+/// Ceiling on a servo move past the time it was asked to take. The plan-time
+/// rollout runs at most the request plus this long; a goal that has not
+/// converged by then is taken as unreachable and rejected.
 pub const MAX_SERVO_S: f64 = 30.0;
 
 /// Cutoff (Hz) for the per-joint Butterworth smoothing of the servo's joint command,
@@ -99,7 +100,19 @@ pub fn servo_from(
     ServoState::new(start, end, LEASH_M, JointSmoothing([smoothing; ARM_DOF]))
 }
 
-impl PlanLimits<'_> {
+impl<'a> PlanLimits<'a> {
+    /// These limits with both end-effector caps scaled by `pace`, the fraction of
+    /// full speed a servo-guided move runs at to take its requested time.
+    pub fn paced(&self, pace: f64) -> PlanLimits<'a> {
+        PlanLimits {
+            ee: EeCaps {
+                linear_m_s: self.ee.linear_m_s * pace,
+                angular_rad_s: self.ee.angular_rad_s * pace,
+            },
+            ..*self
+        }
+    }
+
     /// The plan's budgets as one servo tick's, so the rollout that accepts a goal
     /// and the runtime that executes it cannot be given different numbers. `dt`
     /// is the tick's own: the rollout steps at the nominal control period, the
@@ -118,7 +131,7 @@ impl PlanLimits<'_> {
 
 /// Roll the servo law out offline at the control period per step: the plan-time
 /// proof that the law reaches the pose, returning how long it took, or `None`
-/// when it has not converged within [`MAX_SERVO_S`] (unreachable this way).
+/// when it has not converged within `budget_s` (unreachable this way).
 /// Deterministic and identical to the runtime law, so an accepted goal executes
 /// the motion that was validated; a few thousand closed-form steps cost
 /// milliseconds.
@@ -129,12 +142,13 @@ pub fn rollout(
     seed: JointVec,
     limits: &PlanLimits,
     tolerance: ServoTolerances,
+    budget_s: f64,
 ) -> Option<f64> {
     srs_model::chain_kinematics::rollout(
         model.chain(),
         servo_from(*start, *end, limits.smoothing),
         seed,
         &limits.servo_at(limits.control_period, tolerance),
-        MAX_SERVO_S,
+        budget_s,
     )
 }
