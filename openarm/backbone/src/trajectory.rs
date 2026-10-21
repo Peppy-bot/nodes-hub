@@ -250,10 +250,14 @@ pub enum CartesianPlan {
     /// cannot), validated by an offline rollout that took about this long, to
     /// the `tolerance` that rollout ran at: this tier arrives no tighter than
     /// the law's tracking floor, and carries the slack it proved it can meet so
-    /// the runtime cannot be given another.
+    /// the runtime cannot be given another. `pace` is the fraction of the
+    /// end-effector caps the law runs at, below 1 when it would otherwise
+    /// finish sooner than requested: the rollout ran at that pace, and so does
+    /// the runtime.
     Servo {
         duration_s: f64,
         tolerance: ServoTolerances,
+        pace: f64,
     },
 }
 
@@ -389,12 +393,43 @@ pub fn plan_cartesian(
     let tolerance = tolerance
         .servo()
         .map_err(PlanRejection::ServoCannotArrive)?;
-    crate::servo::rollout(model, start, end, seed, limits, tolerance)
-        .map(|duration_s| CartesianPlan::Servo {
-            duration_s,
+    let full_speed_s = crate::servo::rollout(
+        model,
+        start,
+        end,
+        seed,
+        limits,
+        tolerance,
+        crate::servo::MAX_SERVO_S,
+    )
+    .ok_or(PlanRejection::Unreachable)?;
+    if full_speed_s <= 0.0 || requested_duration_secs <= full_speed_s {
+        return Ok(CartesianPlan::Servo {
+            duration_s: full_speed_s,
             tolerance,
-        })
-        .ok_or(PlanRejection::Unreachable)
+            pace: 1.0,
+        });
+    }
+    // The law at full speed would arrive sooner than requested. Scaling every
+    // end-effector cap by the same fraction slows the whole motion alike, so
+    // the move takes the requested time, as a line does, and the rollout at
+    // that pace is its duration.
+    let pace = full_speed_s / requested_duration_secs;
+    crate::servo::rollout(
+        model,
+        start,
+        end,
+        seed,
+        &limits.paced(pace),
+        tolerance,
+        requested_duration_secs + crate::servo::MAX_SERVO_S,
+    )
+    .map(|duration_s| CartesianPlan::Servo {
+        duration_s,
+        tolerance,
+        pace,
+    })
+    .ok_or(PlanRejection::Unreachable)
 }
 
 /// Interpolate between two poses at blend parameter `s` ∈ [0,1]: position by a
@@ -513,21 +548,24 @@ mod tests {
         0.7944156253074012,
     ];
 
-    /// Run the servo law to convergence, asserting every step stays inside the
-    /// per-joint velocity budget and that the pose it lands on honours
-    /// `tolerance`, and return the converged configuration.
+    /// Run the servo law to convergence at `pace` of the speed caps, asserting
+    /// every step stays inside the per-joint velocity budget and that the pose it
+    /// lands on honours `tolerance`, and return the converged configuration.
     fn run_servo_to_convergence(
         model: &Arm,
         start: &Isometry3<f64>,
         end: &Isometry3<f64>,
         seed: JointVec,
         tolerance: PlanTolerance,
+        pace: f64,
     ) -> JointVec {
         let mut state =
             crate::servo::servo_from(*start, *end, crate::servo::smoothing_for(TEST_DT).unwrap());
-        let servo_limits = v2_limits().servo_at(TEST_DT, tolerance.servo().expect("reachable"));
+        let servo_limits = v2_limits()
+            .paced(pace)
+            .servo_at(TEST_DT, tolerance.servo().expect("reachable"));
         let mut q = seed;
-        let steps = (crate::servo::MAX_SERVO_S / TEST_DT.as_secs_f64()).ceil() as usize;
+        let steps = (crate::servo::MAX_SERVO_S / pace / TEST_DT.as_secs_f64()).ceil() as usize;
         for _ in 0..steps {
             match state.step(model.chain(), &q, &servo_limits) {
                 crate::servo::ServoStep::Stepped(next) => {
@@ -562,21 +600,17 @@ mod tests {
         panic!("servo did not converge within the ceiling");
     }
 
-    // The field repro: pulling the right arm straight back across the base
-    // (world x +0.07 -> -0.18 at constant orientation). No continuous joint path
-    // tracks that line at any arm angle (the exact IK solution jumps branches
-    // mid-path), so the plan must fall through to the guarded servo, whose
-    // damped law crosses the wall the way the streaming jog does.
-    #[test]
-    fn cross_body_pull_runs_the_guarded_servo() {
-        let model = v2_right_arm();
+    /// The field repro: the right arm pulled straight back across the base
+    /// (world x +0.07 -> -0.18 at constant orientation), as its start and end
+    /// poses and the configuration it starts from.
+    fn cross_body_pull(model: &Arm) -> (Isometry3<f64>, Isometry3<f64>, JointVec) {
         let start = recorded_tip_pose(
-            &model,
+            model,
             [0.0715597403410507, -0.179708420505458, 0.448631054180598],
             REPRO_QUAT,
         );
         let end = recorded_tip_pose(
-            &model,
+            model,
             [-0.178440259658949, -0.179708420505458, 0.448631054180598],
             REPRO_QUAT,
         );
@@ -588,6 +622,121 @@ mod tests {
             )
             .expect("start pose reachable from ready")
             .q;
+        (start, end, seed)
+    }
+
+    /// The cross-body pull's duration at the full speed caps.
+    fn cross_body_pull_at_full_speed(model: &Arm) -> f64 {
+        let (start, end, seed) = cross_body_pull(model);
+        crate::servo::rollout(
+            model,
+            &start,
+            &end,
+            seed,
+            &v2_limits(),
+            default_servo_tolerance(),
+            crate::servo::MAX_SERVO_S,
+        )
+        .expect("the pull converges at full speed")
+    }
+
+    // A servo-guided move takes the time asked for, as a line does: requested
+    // at several times what the law needs at full speed, the pull runs at a
+    // fraction of the speed caps, arrives at the request, and still lands on
+    // the pose within its slack.
+    #[test]
+    fn a_servo_guided_move_takes_the_requested_duration() {
+        let model = v2_right_arm();
+        let (start, end, seed) = cross_body_pull(&model);
+        let full_speed_s = cross_body_pull_at_full_speed(&model);
+        for requested in [2.0 * full_speed_s, 10.0 * full_speed_s] {
+            let plan = plan_cartesian(
+                &model,
+                &start,
+                &end,
+                seed,
+                &v2_limits(),
+                requested,
+                default_tolerance(),
+            )
+            .expect("servo reaches the pose");
+            let CartesianPlan::Servo {
+                duration_s, pace, ..
+            } = plan
+            else {
+                panic!("an untrackable line must fall through to the servo");
+            };
+            assert!(
+                pace < 1.0,
+                "asked for {requested:.2}s, the pull ran at {pace} of the caps"
+            );
+            assert!(
+                (duration_s - requested).abs() <= 0.05 * requested,
+                "asked for {requested:.2}s, the pull was planned at {duration_s:.2}s"
+            );
+            run_servo_to_convergence(&model, &start, &end, seed, default_tolerance(), pace);
+        }
+    }
+
+    // As fast as the limits allow, a request of 0, keeps the full speed caps.
+    #[test]
+    fn a_servo_guided_move_asked_for_no_duration_runs_at_the_speed_caps() {
+        let model = v2_right_arm();
+        let (start, end, seed) = cross_body_pull(&model);
+        let plan = plan_cartesian(
+            &model,
+            &start,
+            &end,
+            seed,
+            &v2_limits(),
+            0.0,
+            default_tolerance(),
+        )
+        .expect("servo reaches the pose");
+        let CartesianPlan::Servo {
+            duration_s, pace, ..
+        } = plan
+        else {
+            panic!("an untrackable line must fall through to the servo");
+        };
+        assert_eq!(pace, 1.0);
+        assert_eq!(duration_s, cross_body_pull_at_full_speed(&model));
+    }
+
+    // The ceiling bounds the time past the request, so a servo-guided move
+    // asked to take longer than the ceiling itself is still admitted.
+    #[test]
+    fn a_servo_guided_move_requested_past_the_ceiling_is_admitted() {
+        let model = v2_right_arm();
+        let (start, end, seed) = cross_body_pull(&model);
+        let requested = crate::servo::MAX_SERVO_S + 15.0;
+        let plan = plan_cartesian(
+            &model,
+            &start,
+            &end,
+            seed,
+            &v2_limits(),
+            requested,
+            default_tolerance(),
+        )
+        .expect("a long request is admitted");
+        let CartesianPlan::Servo { duration_s, .. } = plan else {
+            panic!("an untrackable line must fall through to the servo");
+        };
+        assert!(
+            (duration_s - requested).abs() <= 0.05 * requested,
+            "asked for {requested:.2}s, the pull was planned at {duration_s:.2}s"
+        );
+    }
+
+    // No continuous joint path tracks the cross-body pull at any arm angle (the
+    // exact IK solution jumps branches mid-path), so the plan must fall through
+    // to the guarded servo, whose damped law crosses the wall the way the
+    // streaming jog does.
+    #[test]
+    fn cross_body_pull_runs_the_guarded_servo() {
+        let model = v2_right_arm();
+        let (start, end, seed) = cross_body_pull(&model);
         let plan = plan_cartesian(
             &model,
             &start,
@@ -598,14 +747,17 @@ mod tests {
             default_tolerance(),
         )
         .expect("servo reaches the pose");
-        let CartesianPlan::Servo { duration_s, .. } = plan else {
+        let CartesianPlan::Servo {
+            duration_s, pace, ..
+        } = plan
+        else {
             panic!("an untrackable line must fall through to the servo");
         };
         assert!(
             duration_s < crate::servo::MAX_SERVO_S,
             "servo rollout should finish inside the ceiling, took {duration_s:.1}s"
         );
-        run_servo_to_convergence(&model, &start, &end, seed, default_tolerance());
+        run_servo_to_convergence(&model, &start, &end, seed, default_tolerance(), pace);
     }
 
     // The user-reported gap made a regression test: pulling x back to -0.2 from
@@ -632,9 +784,12 @@ mod tests {
             default_tolerance(),
         )
         .expect("the pull must be reachable, as streaming proves live");
-        if let CartesianPlan::Servo { duration_s, .. } = plan {
+        if let CartesianPlan::Servo {
+            duration_s, pace, ..
+        } = plan
+        {
             assert!(duration_s < crate::servo::MAX_SERVO_S);
-            run_servo_to_convergence(&model, &start, &end, READY, default_tolerance());
+            run_servo_to_convergence(&model, &start, &end, READY, default_tolerance(), pace);
         }
         // A Line verdict is equally acceptable: the pose is reached on the line.
     }
@@ -732,7 +887,7 @@ mod tests {
         };
         let mut end = start;
         end.rotation = UnitQuaternion::from_axis_angle(&Vector3::x_axis(), 0.7) * end.rotation;
-        run_servo_to_convergence(&model, &start, &end, READY, default_tolerance());
+        run_servo_to_convergence(&model, &start, &end, READY, default_tolerance(), 1.0);
     }
 
     // The incident regression: after a servo move parks the arm at an unusual
@@ -743,25 +898,8 @@ mod tests {
     #[test]
     fn small_nudge_after_a_servo_move_stays_a_quiet_line() {
         let model = v2_right_arm();
-        let start = recorded_tip_pose(
-            &model,
-            [0.0715597403410507, -0.179708420505458, 0.448631054180598],
-            REPRO_QUAT,
-        );
-        let end = recorded_tip_pose(
-            &model,
-            [-0.178440259658949, -0.179708420505458, 0.448631054180598],
-            REPRO_QUAT,
-        );
-        let seed = model
-            .solve_ik(
-                &model.base_pose(&start),
-                srs_model::ArmAnglePolicy::FromSeed,
-                &READY,
-            )
-            .expect("start pose reachable from ready")
-            .q;
-        let parked = run_servo_to_convergence(&model, &start, &end, seed, default_tolerance());
+        let (start, end, seed) = cross_body_pull(&model);
+        let parked = run_servo_to_convergence(&model, &start, &end, seed, default_tolerance(), 1.0);
         // From the parked posture, nudge 3 cm in +x: an ordinary move.
         let nudge_start = {
             let ee = model.at(&parked).ee_pose();
@@ -1152,10 +1290,13 @@ mod tests {
         let (start, end) = tolerance_sensitive_goal(&model);
         let tolerance = panel_tolerance();
 
-        plan_cartesian(&model, &start, &end, READY, &v2_limits(), 2.0, tolerance)
+        let plan = plan_cartesian(&model, &start, &end, READY, &v2_limits(), 2.0, tolerance)
             .expect("admitted at the panel's slack");
+        let CartesianPlan::Servo { pace, .. } = plan else {
+            panic!("this goal is admitted through the servo");
+        };
         // Asserts the landed pose against `tolerance` on both axes.
-        run_servo_to_convergence(&model, &start, &end, READY, tolerance);
+        run_servo_to_convergence(&model, &start, &end, READY, tolerance, pace);
     }
 
     // Convergence is judged against the caller's bar, so a wider bar is met
@@ -1175,6 +1316,7 @@ mod tests {
             READY,
             &v2_limits(),
             default_servo_tolerance(),
+            crate::servo::MAX_SERVO_S,
         )
         .expect("the pull converges at the default bar");
         let loose = crate::servo::rollout(
@@ -1186,6 +1328,7 @@ mod tests {
             panel_tolerance()
                 .servo()
                 .expect("the panel's slack is reachable"),
+            crate::servo::MAX_SERVO_S,
         )
         .expect("a wider bar cannot refuse what a narrower one accepted");
         // Strict: an equal duration would mean the bar was never consulted.
