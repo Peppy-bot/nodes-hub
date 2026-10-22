@@ -25,7 +25,9 @@ use peppygen::exposed_actions::limb_motion::{move_arm, move_arm_joints};
 use control_core::chase::{chase_step, exceeds_rate};
 use control_core::path_timing::JointTrajectory;
 use control_core::timing::MotionClock;
-use srs_model::chain_kinematics::{EeCaps, ServoPlan, ServoTrajectory, clamp_into};
+use srs_model::chain_kinematics::{
+    EeCaps, JointSmoothing, ServoPlan, ServoTrajectory, Smoother, clamp_into, rate_step_toward,
+};
 use srs_model::nalgebra::Isometry3;
 use srs_model::{
     Arm, CartesianPlan, Jacobian, Limit, LineCursor, LinePlan, LineTrajectory, PlanLimits,
@@ -368,6 +370,10 @@ pub struct Planner {
     mode: Mode,
     /// Last governed setpoint: the chase base and the value held when idle.
     setpoint: JointVec,
+    /// The smoother a streamed pose's steps pass through, one Butterworth per
+    /// joint as a planned servo move's; reset whenever the stream is not a
+    /// pose, so a resumed stream seeds on the setpoint.
+    stream_smoothing: JointSmoothing<ARM_DOF>,
 }
 
 impl Planner {
@@ -378,6 +384,7 @@ impl Planner {
         Self {
             side,
             model,
+            stream_smoothing: JointSmoothing::new(cfg.smoothing),
             cfg,
             mode: Mode::Follow,
             setpoint: [0.0; ARM_DOF],
@@ -576,22 +583,27 @@ impl Planner {
     /// into a steady pull the governor can shape.
     fn follow_target(&mut self, command: &Option<Upstream>) -> JointVec {
         let target = match command {
-            None => return self.setpoint,
-            Some(Upstream::Joints(positions)) => *positions,
+            None => {
+                self.stream_smoothing.reset();
+                return self.setpoint;
+            }
+            Some(Upstream::Joints(positions)) => {
+                self.stream_smoothing.reset();
+                *positions
+            }
             Some(Upstream::Pose(pose)) => {
                 let q = self.setpoint;
                 let ee = self.world_ee_pose(&q);
-                srs_model::chain_kinematics::rate_step_toward(
-                    self.model.chain(),
-                    &q,
-                    &ee,
-                    pose,
-                    &self.plan_limits().servo_at(
-                        PlanTolerance::default()
-                            .servo()
-                            .expect("the node's default slack is reachable"),
-                    ),
-                )
+                let limits = self.plan_limits().servo_at(
+                    PlanTolerance::default()
+                        .servo()
+                        .expect("the node's default slack is reachable"),
+                );
+                let step = rate_step_toward(self.model.chain(), &q, &ee, pose, &limits);
+                // Smoothed as a planned servo step is, then held to the
+                // velocity limit again: a smoother can overshoot its input.
+                let smoothed = self.stream_smoothing.smooth(&step);
+                chase_step(&q, &smoothed, &limits.max_joint_velocity, limits.dt_s)
             }
         };
         clamp_into(&self.cfg.limits, &target)
@@ -757,6 +769,7 @@ impl Planner {
 
     /// Start an accepted goal in the mode that executes it.
     async fn start_goal(&mut self, goal: Goal, busy: Arc<AtomicBool>, now: Instant) -> Mode {
+        self.stream_smoothing.reset();
         let busy = BusyGuard(busy);
         match goal {
             Goal::Joint {
@@ -1499,5 +1512,62 @@ mod tests {
             [0.4; ARM_DOF],
             "a command after the move resumes following"
         );
+    }
+
+    // A pose stream that arrives every second tick, a 6 cm/s lift of the hand
+    // from ready, is followed as one motion: once the sweep is under way, each
+    // joint's velocity changes from one tick to the next by under a tenth of
+    // its size over the sweep.
+    #[test]
+    fn a_streamed_pose_arriving_every_second_tick_is_followed_smoothly() {
+        use openarm_description::ready;
+        let side = Side::Right;
+        let model = crate::arm_model(openarm_description::HardwareVersion::V2, side.model())
+            .expect("build the v2 right arm");
+        let cfg = PlanConfig {
+            max_joint_velocity_rad_s: [
+                16.754666, 16.754666, 5.445426, 5.445426, 20.943946, 20.943946, 20.943946,
+            ],
+            ee: EeCaps {
+                linear_m_s: 0.5,
+                angular_rad_s: 0.8,
+            },
+            limits: model.limits(),
+            ..test_cfg()
+        };
+        let start_q = ready(side.model());
+        let mut planner = Planner::new(side, model, cfg);
+        planner.commit(start_q);
+        let start = planner.world_ee_pose(&start_q);
+        let dt = planner.cfg.cycle_period.as_secs_f64();
+        let mut target = start;
+        let mut qs = vec![start_q];
+        for tick in 1..=300usize {
+            if tick % 2 == 1 {
+                target.translation.vector.z =
+                    start.translation.vector.z + 0.06 * (tick - 1) as f64 * dt;
+            }
+            let q = planner.follow_target(&Some(Upstream::Pose(target)));
+            planner.commit(q);
+            qs.push(q);
+        }
+        let velocities: Vec<JointVec> = qs
+            .windows(2)
+            .map(|w| std::array::from_fn(|i| (w[1][i] - w[0][i]) / dt))
+            .collect();
+        // The first second is the smoother settling and the law catching the
+        // target up; the sweep is steady after it.
+        let steady = &velocities[100..];
+        for i in 0..ARM_DOF {
+            let size = steady.iter().map(|v| v[i].abs()).fold(0.0, f64::max);
+            let alternation = steady
+                .windows(2)
+                .map(|w| (w[1][i] - w[0][i]).abs())
+                .fold(0.0, f64::max);
+            assert!(
+                alternation <= 0.1 * size,
+                "joint {i} changes velocity by {alternation:.3} rad/s between ticks on a {size:.3} rad/s sweep"
+            );
+        }
     }
 }
