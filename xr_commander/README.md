@@ -149,6 +149,24 @@ retains it, so a consumer that subscribes later reads it at once. The
 Waldo simulation's `headset_teleop` panel reads it and offers the link
 that opens the page in the headset.
 
+### The chosen robot's sensors in a simulation
+
+A simulation streams each camera of a robot at 1 Hz until a holder holds it
+over `sim_sensor_streams:v1`, and at the camera's own rate while one does.
+While a headset page is in session (it sent an XR frame in the last 5 s),
+the headset holds every sensor of the chosen robot under the holder name
+`headset`, so that its panels show that robot's cameras at their own rate.
+Without a session it holds nothing: a launcher deploys the headset beside a
+simulation whether or not someone wears it, and the chosen robot falls back
+to the first robot paired, which would keep that robot's cameras live for
+nobody. The headset renews the hold a third of the way through each lease
+that the simulation answers with. When another robot is chosen, no robot is
+paired or the session ends, it releases its hold on the robot it held
+before, and it releases its hold when the node stops. A refused or failed hold is logged once and
+tried again a second later; until then the cameras stream at 1 Hz. The
+launcher binds the simulation to the `sensor_streams` slot. On a physical
+stack the slot is vacant, and the headset holds nothing.
+
 ### Naming the task
 
 Every recorded frame carries a task label, which LeRobot stores once per
@@ -213,9 +231,9 @@ full list and defaults.
 ## Development
 
 `frames`, `devices`, `clutch`, `config`, `addresses`, `tls`, `robot_choice`,
-`robots`, and the decode half of `video` are pure of peppy; `publish` and
-`status` import the generated modules, so the full suite needs the synced
-environment (and nothing served):
+`robots`, `sensor_hold`, and the decode half of `video` are pure of peppy;
+`publish` and `status` import the generated modules, so the full suite needs
+the synced environment (and nothing served):
 
 ```bash
 peppy node sync   # resolves the peppygen/peppylib path dependencies uv needs
