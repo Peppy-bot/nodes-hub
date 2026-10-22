@@ -44,7 +44,7 @@ never named `none` or `scripted`.
 ## The scripted manipulator
 
 `scripted` is brain_core's `ScriptedManipulator` on its `CentreProposer`, and
-makes no model call. A `grab_item` takes the item's seen point lowered 2 cm
+makes no model call. A `grab_item` takes the item's seen point lowered 2.5 cm
 (a grab by pose takes the pose itself), checks with the backbone's
 `check_arm_move` that the pre-grasp point 10 cm above, the grasp point and
 the lifted point 10 cm above all plan, trying the gripper pointing down at 8
