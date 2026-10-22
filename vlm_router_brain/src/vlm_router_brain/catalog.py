@@ -31,15 +31,18 @@ from .keys import KEY_VARIABLES
 
 CATALOG_FILE = "catalog.json"
 # The roles a catalog model serves in this node: perception, through the
-# node's detector. Manipulation runs "none" alone here.
+# node's detector. Manipulation runs the models built into the node alone.
 CATALOG_ROLES = frozenset({Role.PERCEPTION})
 # The coordinate formats the node reads, each with its prompt wording
 # (prompts.py) and its converter (parsing.py): yx_0_1000 is a box as
 # [y_min, x_min, y_max, x_max] normalised to 0-1000.
 COORDINATES = ("yx_0_1000",)
 REASONING_EFFORTS = get_args(ReasoningEffort)
-# The name a role's missing model goes by, never a catalog model's.
+# The names of the models built into the node, never a catalog model's:
+# "none", a role's missing model, and "scripted", the scripted manipulator.
 NONE = "none"
+SCRIPTED = "scripted"
+BUILT_IN_NAMES = (NONE, SCRIPTED)
 
 _ENTRY_FIELDS = frozenset({"name", "roles", "coordinates", "routes"})
 _ROUTE_FIELDS = frozenset({"route", "min_call_timeout_s", "reasoning_effort"})
@@ -116,8 +119,8 @@ def _parse_entry(raw: Any, where: str) -> CatalogEntry:
     _refuse_fields(raw, _ENTRY_FIELDS, where)
     name = _text(raw, "name", where)
     where = f"{CATALOG_FILE} model '{name}'"
-    if name == NONE:
-        raise CatalogError(f"{where}: '{NONE}' names a role's missing model, never a catalog model")
+    if name in BUILT_IN_NAMES:
+        raise CatalogError(f"{where}: '{name}' names a model built into the node, never a catalog model")
     roles = raw["roles"]
     if not isinstance(roles, list) or not roles:
         raise CatalogError(f"{where}: roles must be a list of at least one role")

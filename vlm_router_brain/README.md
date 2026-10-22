@@ -35,9 +35,28 @@ A catalog the node cannot read stops it at its start, naming the entry and
 the field.
 
 Both roles also accept `none`, the role's missing model: its goals are
-refused naming it. No catalog model serves manipulation, so manipulation
-runs `none`, and `grab_item`, `drop_item` and `place_item` are refused with
-`no manipulation model: manipulation_model is 'none'`.
+refused naming it. No catalog model serves manipulation. Manipulation runs a
+model built into the node: `scripted`, its default, or `none`, which refuses
+`grab_item`, `drop_item` and `place_item` with
+`no manipulation model: manipulation_model is 'none'`. A catalog model is
+never named `none` or `scripted`.
+
+## The scripted manipulator
+
+`scripted` is brain_core's `ScriptedManipulator` on its `CentreProposer`, and
+makes no model call. A `grab_item` takes the item's seen point lowered 2 cm
+(a grab by pose takes the pose itself), checks with the backbone's
+`check_arm_move` that the pre-grasp point 10 cm above, the grasp point and
+the lifted point 10 cm above all plan, trying the gripper pointing down at 8
+rolls (a grab by pose with an orientation tries that one alone), then opens,
+reaches, closes with the goal's `max_effort` and lifts. It judges the hold
+twice: from the close's `final_opening`, then from the first `limb_states`
+snapshot captured after the lift, which it waits up to 1 s for; below 0.05
+the grab fails, with `closed on nothing` or `slipped while lifting`.
+`drop_item` opens the gripper where it is; `place_item` carries the item to
+the pose and opens there. Every move goes through the backbone that the
+`limb_motion` slot binds, and the `limb_state` slot gives the measured
+openings, so the launcher binds both to the robot's backbone.
 
 ## Keys
 
@@ -139,7 +158,13 @@ sequenceDiagram
             else every check passes
                 M->>M: mark the role as switching
                 M->>RM: await prepare(entry), cut short by the job's cancel
-                alt no route of the model has a key
+                alt a model built into the node: none, or scripted for manipulation
+                    RM-->>M: its backend, no call made
+                    M->>M: the job's cancel is checked, then the lane, with no await before the set
+                    M->>M: the role's model is the new backend
+                    M-->>H: the model's name
+                    H-->>B: role and model
+                else no route of the model has a key
                     RM-->>B: Refusal naming every key variable, no call made
                 else a route has a key
                     RM->>P: await ask(route, a small grey picture, the probe question, at least 30 s)
@@ -195,7 +220,7 @@ sequenceDiagram
 |---|---|---|
 | `limbs` | required | Each arm with its gripper, `"left_arm:left_gripper,right_arm:right_gripper"` |
 | `perception_model` | `gemini-robotics-er-2-preview` | A catalog model that serves perception, or `none` |
-| `manipulation_model` | `none` | `none` |
+| `manipulation_model` | `scripted` | `scripted` or `none` |
 | `camera_name` | required | The camera the brain looks through, as the robot's `camera_mounts` names it |
 
 ## Tests
@@ -204,4 +229,5 @@ sequenceDiagram
 key: the catalog, the keys, the any-llm adapter against any-llm's own
 exception classes, the parser, the detector and the switch against a scripted
 provider, and the whole node over the wire under the generated harness, its
-camera and backbone mocked.
+camera and backbone mocked: a search, a switch, and the scripted grab from
+the identified item to the held flag.
