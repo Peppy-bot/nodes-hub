@@ -236,15 +236,15 @@ async def test_identify_then_a_scripted_grab_holds_the_item():
         pre = await land_move(h)
         reach = await land_move(h)
         # The cup was seen 1 m out along +Z: the grasp point is 2.5 cm under
-        # it, reached from 10 cm back along the approach, straight down.
+        # it, reached from 7.5 cm back along the approach, straight down.
         assert [round(v, 6) for v in reach.position] == [0.0, 0.0, 0.975]
-        assert [round(v, 6) for v in pre.position] == [0.0, 0.0, 1.075] and reach.orientation == [0.0, 1.0, 0.0, 0.0]
+        assert [round(v, 6) for v in pre.position] == [0.0, 0.0, 1.05] and reach.orientation == [0.0, 1.0, 0.0, 0.0]
         closed = await stop_grip_at(h, 0.3)
         assert (closed.opening, closed.max_effort) == (0.0, 15.0)
         done = asyncio.Event()
         stream = asyncio.create_task(publish_limbs_until(h, done, 0.3))
         lift = await land_move(h)
-        assert [round(v, 6) for v in lift.position] == [0.0, 0.0, 1.075]
+        assert [round(v, 6) for v in lift.position] == [0.0, 0.0, 1.05]
         result = (await grab.get_result(WAIT)).data
         done.set()
         await stream

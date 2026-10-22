@@ -46,8 +46,8 @@ never named `none` or `scripted`.
 `scripted` is brain_core's `ScriptedManipulator` on its `CentreProposer`, and
 makes no model call. A `grab_item` takes the item's seen point lowered 2.5 cm
 (a grab by pose takes the pose itself), checks with the backbone's
-`check_arm_move` that the pre-grasp point 10 cm above, the grasp point and
-the lifted point 10 cm above all plan, trying the gripper pointing down at 8
+`check_arm_move` that the pre-grasp point 7.5 cm above, the grasp point and
+the lifted point 7.5 cm above all plan, trying the gripper pointing down at 8
 rolls (a grab by pose with an orientation tries that one alone), then opens,
 reaches, closes with the goal's `max_effort` and lifts. It judges the hold
 twice: from the close's `final_opening`, then from the first `limb_states`
