@@ -44,6 +44,12 @@
         // wires, listed on the status panel. Unbound, the panel draws no
         // health section.
         { name: "motor_health", tag: "v1", link_id: "motor_health", cardinality: "zero_or_more" },
+        // The sensor streams of a simulation, where one runs: the headset
+        // holds the sensors of the chosen robot, so that its cameras stream
+        // at their own rate while the operator drives it, and releases them
+        // when it chooses another robot or stops. Unbound (a physical
+        // stack), the headset holds nothing.
+        { name: "sim_sensor_streams", tag: "v1", link_id: "sensor_streams", cardinality: "zero_or_one" },
       ],
       pairings: [
         // One Cartesian command loop per operator hand. Every robot the
@@ -80,6 +86,9 @@
       consumes: [
         // Finalizes the current dataset session and opens a fresh one.
         { link_id: "recorder", name: "finish_session" },
+        // Holds, renews and releases the sensors of the chosen robot.
+        { link_id: "sensor_streams", name: "hold" },
+        { link_id: "sensor_streams", name: "release" },
       ],
     },
     actions: {

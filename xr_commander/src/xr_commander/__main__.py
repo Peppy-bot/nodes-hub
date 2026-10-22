@@ -26,6 +26,10 @@ from peppygen.consumed_actions.recorder import (
 from peppygen.consumed_services.recorder import (
     finish_session as recorder_finish_session,
 )
+from peppygen.consumed_services.sensor_streams import hold as sensor_streams_hold
+from peppygen.consumed_services.sensor_streams import (
+    release as sensor_streams_release,
+)
 from peppygen.consumed_topics.alerts import alerts as alerts_topic
 from peppygen.consumed_topics.color_cameras import (
     video_stream as color_cameras_video_stream,
@@ -60,6 +64,7 @@ from xr_commander import (
     publish,
     record,
     robot_choice,
+    sensor_hold,
     task_page,
     tls,
     video,
@@ -303,6 +308,35 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
         )
     )
     tasks.append(asyncio.create_task(video.feed_panels(panels, robots.chosen, token)))
+
+    # In a simulation, the chosen robot's sensors stream at their own rate
+    # while a headset page in session drives it. Registered after
+    # `stop_session`, so the hold is released before the server stops.
+    sensor_target = sensor_streams_hold.bound_producer(node_runner)
+    if sensor_target is not None:
+        timing = sensor_hold.Timing()
+        hold = sensor_hold.ChosenRobotHold(
+            sensor_hold.SensorStreams(
+                node_runner,
+                sensor_target,
+                hold_module=sensor_streams_hold,
+                release_module=sensor_streams_release,
+                timeout_s=timing.call_timeout_s,
+            ),
+            timing,
+        )
+        node_runner.on_shutdown(hold.stop)
+        tasks.append(
+            asyncio.create_task(
+                sensor_hold.follow_chosen_robot(
+                    hold,
+                    sensor_hold.driven_robot(
+                        robots.chosen, session.latest, timing.session_timeout_s
+                    ),
+                    token,
+                )
+            )
+        )
 
     recorder_status = record.RecorderStatus()
 
