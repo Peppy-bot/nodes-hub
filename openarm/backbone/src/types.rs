@@ -87,10 +87,8 @@ impl Default for PlanTolerance {
 }
 
 impl PlanTolerance {
-    /// The same slack as the guarded servo's arrival bar, or a refusal when the
-    /// servo law could not reach it. The line tiers plan by exact IK and can meet
-    /// a tolerance tighter than the law's tracking floor, so the refusal belongs
-    /// to that tier alone and not to the goal.
+    /// The same slack as the guarded servo's arrival bar, or the refusal of a
+    /// value that is not a slack.
     pub fn servo(&self) -> Result<ServoTolerances, ToleranceError> {
         ServoTolerances::new(self.position_m, self.orientation_rad)
     }

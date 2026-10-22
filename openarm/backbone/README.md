@@ -144,13 +144,20 @@ gripper's **grasp point** (midway between the pads on the jaw closing axis,
 the model with it, so the pose solved for, the pose reported, and the point the
 EE speed cap applies to are one frame. One move per side at a time (a
 single-flight busy slot whose release rides a drop guard, so no terminal can
-leak it). `move_arm` plans the quietest tier that works: a held-elbow line, a
-steered-elbow line, or the guarded servo (a damped resolved-rate law that can
-cross singular surfaces a discrete IK walk cannot). Planning runs after
+leak it). `move_arm` plans the quietest tier that works (`srs_model::plan_cartesian`): a
+line with the elbow held, a line with the elbow swiveled toward the widest
+joint-limit margin or the highest manipulability, or the guarded servo
+(`chain_kinematics::plan_servo`, a damped resolved-rate law that can cross
+singular surfaces a discrete IK walk cannot, rolled out offline and played from
+rest to rest). Every plan is timed from rest to rest within the velocity and
+acceleration limits the launcher sets and the hand's speed caps
+(`control_core::path_timing`, the time-optimal timing of a path through
+waypoints), and a line is checked tick by tick for the velocity and the
+acceleration as the runtime will command it before it runs. Planning runs after
 admission (peppy's goal decision is pre-context, so reachability cannot be a
 refusal): an accepted goal whose pose no tier reaches, servo rollout
-included, completes unsuccessfully at once. Completion of an arm move is
-graded on the commanded motion with a 2x-nominal timeout; results report the
+included, completes unsuccessfully at once. An arm move completes when its
+commanded trajectory does; results report the
 measured state and the caller judges how close it landed (the governor may
 have held it short, and that is not a failure of the move machinery).
 When the arm's follower stops reporting, the move fails with
@@ -159,7 +166,7 @@ Its result then reports the held setpoint, because the last measurement is
 stale.
 
 `move_gripper` ends on the measured gripper instead. The commanded opening
-ramps to the target under the same 2x-nominal timeout, then the move stays in
+ramps to the target under a 2x-nominal timeout, then the move stays in
 flight, still commanding the target and still holding the side's busy slot,
 until the measured opening stands still: within 0.002 of a reference opening
 for 0.25 s, judged on delivered openings only. `final_opening` is the opening
@@ -323,9 +330,6 @@ The robot's own body is not checked for hiding a point from the camera.
 | `coordinator.rs` | the tick, gripper move execution, the upstream relay | IO orchestration; its seam with the safety core is exactly one `govern` call, which is why the governor is not folded into it |
 | `liveness.rs` | follower admission (`Live` / `Reanchor` / `Stale`) | delivery-cadence policy for the coordinator, independent of any message type |
 | `planner.rs` | per-arm mode machine (Follow / joint move / Cartesian move) -> one rate-limited candidate + the stream-tick Jacobian | knows one arm only; never the other arm, never the collision model |
-| `chase.rs` | `rate_limited`, the one per-tick rate clamp every chase shares | the arm chase, the gripper chase and the servo re-clamp cannot round differently |
-| `trajectory.rs` | quintic joint trajectories, Cartesian line planning, tier selection | plan-time; validates what the planner then executes |
-| `servo.rs` | the guarded servo law + its plan-time rollout | identical law offline and online, so acceptance is proof |
 | `governor/mod.rs` | `GovState`, the pipeline, the runtime controls, disposition and readout | the only mutable resource is the collision model |
 | `governor/sense.rs` | the pre-projection model read (`Sensed`) | limiters and the projection decide on one snapshot |
 | `governor/model.rs` | `ConfiguredModel`, the only door to the collision model | every query takes the whole configuration; stale-placement reads are unrepresentable |

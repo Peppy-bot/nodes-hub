@@ -1,4 +1,10 @@
 //! Fixtures shared by the backbone's integration tests.
+//!
+//! Each integration test is its own crate, so items unused by one suite are
+//! expected; the allow keeps clippy's -D warnings gate meaningful for the rest.
+#![allow(dead_code)]
+
+pub mod fixtures;
 
 use std::time::Duration;
 
@@ -40,6 +46,13 @@ pub fn params() -> peppygen::Parameters {
         max_joint_velocity_rad_s_5: 20.943946,
         max_joint_velocity_rad_s_6: 20.943946,
         max_joint_velocity_rad_s_7: 20.943946,
+        max_joint_acceleration_rad_s2_1: 5.0,
+        max_joint_acceleration_rad_s2_2: 5.0,
+        max_joint_acceleration_rad_s2_3: 5.0,
+        max_joint_acceleration_rad_s2_4: 5.0,
+        max_joint_acceleration_rad_s2_5: 5.0,
+        max_joint_acceleration_rad_s2_6: 5.0,
+        max_joint_acceleration_rad_s2_7: 5.0,
         upstream_mode: "joints".to_string(),
         velocity_filter_cutoff_hz: 15.0,
     }

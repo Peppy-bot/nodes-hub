@@ -11,6 +11,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use peppygen::exposed_actions::limb_motion::{move_arm, move_arm_joints};
 use peppygen::exposed_services::limb_motion::check_arm_move;
@@ -27,6 +28,19 @@ use crate::types::{ARM_DOF, JointVec, PlanTolerance, Side, pose_from_wire};
 use crate::actions::{ARM_LEADER_STREAMING, blocking_ask_coordinator, claim};
 use crate::streams::LeaderActivity;
 
+/// The longest a move may be asked to take: the deadline the robot_control
+/// exposure gives a move. A plan walks the control ticks of the request, so
+/// the bound also bounds its work.
+pub const MAX_MOVE_DURATION_S: f64 = 60.0;
+
+/// The refusal of a duration outside what a move may be asked to take.
+const INVALID_DURATION: &str = "duration_s must be a number of seconds from 0 to 60";
+
+/// Whether `duration_s` is a duration a move may be asked to take.
+fn valid_duration(duration_s: f64) -> bool {
+    duration_s.is_finite() && (0.0..=MAX_MOVE_DURATION_S).contains(&duration_s)
+}
+
 fn target_in_limits(q: &JointVec, limits: &[Limit; ARM_DOF]) -> bool {
     q.iter().zip(limits).all(|(&v, l)| v >= l.lo && v <= l.hi)
 }
@@ -39,7 +53,7 @@ pub(crate) struct ArmMoveRequest {
     pub side: Side,
     pub target: Isometry3<f64>,
     pub tolerance: PlanTolerance,
-    pub duration_s: f64,
+    pub duration: Duration,
 }
 
 impl ArmMoveRequest {
@@ -58,14 +72,14 @@ impl ArmMoveRequest {
         let tolerance =
             PlanTolerance::from_wire(plan_position_tolerance_m, plan_orientation_tolerance_rad)
                 .map_err(|reason| format!("goal has {reason}"))?;
-        if !(duration_s.is_finite() && duration_s >= 0.0) {
-            return Err("invalid duration".to_string());
+        if !valid_duration(duration_s) {
+            return Err(INVALID_DURATION.to_string());
         }
         Ok(Self {
             side,
             target,
             tolerance,
-            duration_s,
+            duration: Duration::from_secs_f64(duration_s),
         })
     }
 }
@@ -94,8 +108,8 @@ pub async fn run_move_arm_joints(
                         "non-finite joint target",
                     ));
                 }
-                if !(d.duration_s.is_finite() && d.duration_s >= 0.0) {
-                    return Ok(move_arm_joints::GoalDecision::reject("invalid duration"));
+                if !valid_duration(d.duration_s) {
+                    return Ok(move_arm_joints::GoalDecision::reject(INVALID_DURATION));
                 }
                 if !target_in_limits(&d.joint_positions, &limits[idx]) {
                     return Ok(move_arm_joints::GoalDecision::reject(
@@ -120,7 +134,7 @@ pub async fn run_move_arm_joints(
         if goal_txs[idx]
             .send(Goal::Joint {
                 target,
-                duration_s,
+                duration: Duration::from_secs_f64(duration_s),
                 reply: JointReply::MoveArmJoints(Box::new(ctx)),
             })
             .await
@@ -177,7 +191,7 @@ pub async fn run_move_arm(
             .send(Goal::Cartesian {
                 target: request.target,
                 tolerance: request.tolerance,
-                duration_s: request.duration_s,
+                duration: request.duration,
                 ctx: Box::new(ctx),
             })
             .await
@@ -228,10 +242,10 @@ pub async fn run_check_arm_move(
                 answer,
             );
             Ok(match asked {
-                Ok(Ok(duration_s)) => check_arm_move::Response::new(
+                Ok(Ok(duration)) => check_arm_move::Response::new(
                     true,
-                    format!("a plan reaches the pose in {duration_s:.3} s"),
-                    duration_s,
+                    format!("a plan reaches the pose in {:.3} s", duration.as_secs_f64()),
+                    duration.as_secs_f64(),
                 ),
                 Ok(Err(refusal)) => check_arm_move::Response::new(false, refusal, 0.0),
                 Err(refusal) => {

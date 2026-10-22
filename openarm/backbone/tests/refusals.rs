@@ -105,6 +105,14 @@ async fn a_non_finite_joint_velocity_cap_is_refused_by_name() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_non_positive_joint_acceleration_cap_is_refused_by_name() {
+    refusal_names("max_joint_acceleration_rad_s2_2", |p| {
+        p.max_joint_acceleration_rad_s2_2 = 0.0
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_non_finite_ee_speed_cap_is_refused_by_name() {
     refusal_names("max_ee_velocity_m_s", |p| {
         p.max_ee_velocity_m_s = f64::INFINITY
