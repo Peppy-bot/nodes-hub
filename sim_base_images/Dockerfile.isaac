@@ -57,8 +57,8 @@ RUN /isaac-sim/python.sh -m pip install --no-cache-dir --retries 5 --timeout 180
 COPY download_assets.sh isaac_assets.env /tmp/
 RUN --mount=type=secret,id=rclone_key \
     --mount=type=secret,id=rclone_secret \
-    RCLONE_S3_ACCESS_KEY_ID="$(cat /run/secrets/rclone_key)" \
-    RCLONE_S3_SECRET_ACCESS_KEY="$(cat /run/secrets/rclone_secret)" \
+    WALDO_R2_ACCESS_KEY_ID="$(cat /run/secrets/rclone_key)" \
+    WALDO_R2_SECRET_ACCESS_KEY="$(cat /run/secrets/rclone_secret)" \
     bash /tmp/download_assets.sh --variant isaac \
     && mkdir -p /opt/robot_assets \
     && cp -r /tmp/.peppy_openarm_assets_isaac/. /opt/robot_assets/ \

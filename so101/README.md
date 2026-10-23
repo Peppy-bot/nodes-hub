@@ -15,7 +15,7 @@ kinematics module.
 | `so101_follower` | The real arm. Pure follower: `joint_link` + `gripper_link` follower slots on one node (one process must own the serial port), `component_ready`, `motor_health`, `alert`. No motion logic. |
 | `so101_leader` | The passive leader arm as a teleop device. Open-loop `joint_link` + `gripper_link` leader; staleness is the deadman (the hardware has no engage button). |
 | [`robot_initializer`](../robot_initializer) | The node every robot uses, run with `model: "so101"`: answers who the robot is on `get_identity` and whether it is ready on `is_ready`, from the follower's readiness on hardware and from the simulation standing it in a simulation, which it joins as the `so101` model. |
-| `so101_backbone` | The motion authority in between. Follower role toward whatever leads (joint, pose, or gripper streams), leader role toward the follower; exposes the `limb_motion` and `postures` move actions, the `limb_motion` services (`stop` ends every planned move in flight, whoever started it, each goal then ending as cancelled with `stopped: <reason>`; `check_arm_move` runs a `move_arm` goal's solve from the same anchor and moves nothing), the `limb_state` readout and the `workspace` services (`describe_workspace` and `check_positions`: where the arm reaches, from the design alone; see [Workspace](#workspace)). Every pose is in the URDF's `base_link` frame, the robot frame the contracts define: `+x` the way the robot faces, `+z` up. A joints-led stream passes through under the end-effector-speed governor, its only limiter; a pose-led stream is reach-clipped, solved, and rate-stepped per joint before that same governor. Move actions run minimum-jerk plans sized by the per-joint velocity caps, and Cartesian moves additionally by the EE speed caps. A gripper move ramps at the gripper rate cap and ends once the measured gripper stands still, on its target or short of it where an object holds the jaws. Everything gates on fresh follower state. A goal on a limb a leader is streaming is refused until the stream has been silent for the deadman timeout; an admitted goal owns its limb until it ends. |
+| `so101_backbone` | The motion authority in between. Follower role toward whatever leads (joint, pose, or gripper streams), leader role toward the follower; exposes the `limb_motion` and `postures` move actions, the `limb_motion` services (`stop` ends every planned move in flight, whoever started it, each goal then ending as cancelled with `stopped: <reason>`; `check_arm_move` runs a `move_arm` goal's solve from the same anchor and moves nothing), the `limb_state` readout and the `workspace` services (`describe_workspace` and `check_positions`: where the arm reaches, from the design alone; see [Workspace](#workspace)). Every pose is in the URDF's `base_link` frame, the robot frame the contracts define: `+x` the way the robot faces, `+z` up. A joints-led stream passes through under the end-effector-speed governor, its only limiter; a pose-led stream is reach-clipped, solved, and rate-stepped per joint before that same governor. Move actions run minimum-jerk plans sized by the per-joint velocity caps, and Cartesian moves additionally by the EE speed caps. Each arm move completes once the measured arm stands within the settle tolerances its goal names, at or after the planned end, and fails at its settle timeout. A gripper move ramps at the gripper rate cap and, from the planned end of that travel on, completes once the measured gripper stands still, on its target or short of it where an object holds the jaws, or at its settle timeout wherever the jaws stand. Everything gates on fresh follower state. A goal on a limb a leader is streaming is refused until the stream has been silent for the deadman timeout; an admitted goal owns its limb until it ends. |
 
 ```text
 so101_leader ──joint+gripper──▶ so101_backbone ──joint+gripper──▶ so101_follower
@@ -92,8 +92,9 @@ The backbone solves with lerobot's placo-based `RobotKinematics`.
 streaming small deltas rather than for reaching a pose from anywhere.
 `so101_description.kinematics` wraps it: a point-to-point solve iterates that
 step up to `IK_MAX_ITERATIONS` and accepts only when forward kinematics puts
-the end effector within `IK_POSITION_TOLERANCE_M` of the target, so a
-`move_arm` never moves the arm to a pose it did not actually reach.
+the grasp point within the goal's `plan_position_tolerance_m` and
+`plan_orientation_tolerance_rad` of the target, so a `move_arm` never moves
+the arm to a pose it did not actually reach.
 
 That verification makes refusals honest, not rare. The search stays a local
 descent from the arm's current posture, so it finds solutions on that branch
@@ -150,10 +151,12 @@ follows the commanded stream tick by tick and never plans between two poses.
 
 Two further limits worth knowing:
 
-- **Orientation is not verified.** Five joints underactuate three rotational
-  degrees of freedom, so orientation is a soft, low-weight objective of the QP
-  and only position is gated. A successful `move_arm` reports the orientation
-  it actually reached; check it if it matters.
+- **Orientation is hard to meet.** Five joints underactuate three rotational
+  degrees of freedom, so orientation is a soft, low-weight objective of the QP,
+  and a goal that names a tight `plan_orientation_tolerance_rad` often has no
+  plan. A wide one admits the nearest the arm reaches, and a bar of π or more
+  admits any orientation; the move's settle judges the orientation it did
+  reach against `settle_orientation_tolerance_rad`.
 - **The reach ball bounds outward extent only.** Streamed pose targets are
   clamped into a ball fitted to the sampled reachable set
   (`backbone/src/so101_backbone/reach.py`) so the streaming solver is never

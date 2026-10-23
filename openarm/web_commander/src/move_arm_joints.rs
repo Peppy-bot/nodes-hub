@@ -15,7 +15,6 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::owner::{Feedback, PREEMPT_GRACE};
-use crate::pose::REACHED_JOINT_TOL_RAD;
 use crate::result_wait::{RESULT_POLL, RESULT_RETRY_DELAY, result_poll_retryable};
 use crate::state::{ARM_DOF, Side};
 
@@ -24,25 +23,30 @@ use crate::state::{ARM_DOF, Side};
 const GOAL_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// One discrete joint move, as fired at the backbone: the side, the 7-joint target
-/// (rad), the requested duration (0 = fastest safe), and whether to wait the
-/// preempt grace first (set when this move was queued behind the goal it
-/// cancelled).
+/// (rad), the requested duration (0 = fastest safe), and the settle tolerance
+/// (rad, the one bar every joint is held to) and timeout (s) the move
+/// completes under.
+#[derive(Clone, Copy)]
 pub struct Goal {
     pub side: Side,
     pub joint_positions: [f64; ARM_DOF],
     pub duration_s: f64,
-    pub grace: bool,
+    pub settle_tolerance_rad: f64,
+    pub settle_timeout_s: f64,
 }
 
+/// Fire `goal`; `grace` waits the preempt grace first (set when this move was
+/// queued behind the goal it cancelled).
 pub fn spawn(
     runner: Arc<NodeRunner>,
     feedback: mpsc::Sender<Feedback>,
     token: CancellationToken,
     preempt: tokio_util::sync::CancellationToken,
     goal: Goal,
+    grace: bool,
 ) {
     tokio::spawn(async move {
-        run(runner, feedback, token, preempt, goal).await;
+        run(runner, feedback, token, preempt, goal, grace).await;
     });
 }
 
@@ -52,12 +56,14 @@ async fn run(
     token: CancellationToken,
     preempt: tokio_util::sync::CancellationToken,
     goal: Goal,
+    grace: bool,
 ) {
     let Goal {
         side,
         joint_positions,
         duration_s,
-        grace,
+        settle_tolerance_rad,
+        settle_timeout_s,
     } = goal;
     // A queued preempt fires only after the backbone releases its single-flight gate.
     if grace {
@@ -73,6 +79,8 @@ async fn run(
         arm_name: side.arm_name().to_string(),
         joint_positions,
         duration_s,
+        settle_tolerances_rad: [settle_tolerance_rad; ARM_DOF],
+        settle_timeout_s,
     };
 
     // The launcher-pinned, cardinality-one limb_motion slot provides the explicit
@@ -143,39 +151,22 @@ async fn run(
     {
         warn!(side = side.label(), error = %e, "cancel after result error failed");
     }
+    // The backbone judges arrival: success means the measured joints settled
+    // within the goal's tolerance, and a failure's message says how far off
+    // they stood.
     let (success, summary) = match outcome {
         Ok(r) => match r.outcome {
-            ResultOutcome::Completed(data) => {
-                if !data.success {
-                    (
-                        false,
-                        format!("move_arm_joints ({label}) failed: {}", data.message),
-                    )
-                } else {
-                    // Confirm the arm actually reached the commanded joints, not just
-                    // that the trajectory finished (a governor stop finishes it too).
-                    let max_err = (0..ARM_DOF)
-                        .map(|i| (data.final_joint_positions[i] - joint_positions[i]).abs())
-                        .fold(0.0_f64, f64::max);
-                    if max_err <= REACHED_JOINT_TOL_RAD {
-                        (
-                            true,
-                            format!(
-                                "move_arm_joints ({label}): success in {:.2}s",
-                                data.action_time
-                            ),
-                        )
-                    } else {
-                        (
-                            false,
-                            format!(
-                                "move_arm_joints ({label}) ended {:.1} deg off target (blocked?)",
-                                max_err.to_degrees()
-                            ),
-                        )
-                    }
-                }
-            }
+            ResultOutcome::Completed(data) if data.success => (
+                true,
+                format!(
+                    "move_arm_joints ({label}): success in {:.2}s",
+                    data.action_time
+                ),
+            ),
+            ResultOutcome::Completed(data) => (
+                false,
+                format!("move_arm_joints ({label}) failed: {}", data.message),
+            ),
             ResultOutcome::Cancelled(data) => (
                 false,
                 format!("move_arm_joints ({label}) cancelled: {}", data.message),

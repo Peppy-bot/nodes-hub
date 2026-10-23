@@ -28,13 +28,13 @@ use crate::governor;
 use crate::liveness;
 use crate::planner::{PlanConfig, Planner};
 use crate::serving;
-use crate::servo::EeCaps;
 use crate::startup;
 use crate::streams;
 use crate::streams::LeaderActivity;
 use crate::upstream::UpstreamMode;
 use crate::workspace::Workspace;
 use crate::workspace_service;
+use srs_model::chain_kinematics::EeCaps;
 
 /// The fastest the coordination loop is driven. It paces the same 1 Mbit
 /// CAN FD arms as openarm_arm; the stack runs at 100 Hz.
@@ -73,6 +73,13 @@ pub enum NodeError {
 
     #[error("parameter max_joint_velocity_rad_s_{joint}")]
     JointVelocityCap {
+        joint: usize,
+        #[source]
+        source: NotPositiveFinite,
+    },
+
+    #[error("parameter max_joint_acceleration_rad_s2_{joint}")]
+    JointAccelerationCap {
         joint: usize,
         #[source]
         source: NotPositiveFinite,
@@ -164,7 +171,20 @@ where
 /// backbone solves, reports, or caps the speed of is at the gripper's grasp point.
 /// This is the single site the backbone imposes either, so the model's `limits()`
 /// carry the margin for IK seeding, trajectory sizing and the chase clamp.
-pub(crate) fn arm_model(
+/// The per-joint caps of one kind, each a positive finite number, or the
+/// refusal `refuse` builds naming the joint (counted from 1) and what was
+/// wrong with its value.
+fn joint_caps(
+    caps: JointVec,
+    refuse: impl Fn(usize, NotPositiveFinite) -> NodeError,
+) -> std::result::Result<JointVec, NodeError> {
+    for (joint, cap) in caps.iter().enumerate() {
+        PositiveFinite::parse(*cap).map_err(|source| refuse(joint + 1, source))?;
+    }
+    Ok(caps)
+}
+
+pub fn arm_model(
     version: HardwareVersion,
     side: openarm_description::Side,
 ) -> std::result::Result<srs_model::Arm, srs_model::SrsError> {
@@ -201,27 +221,38 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         stale_limit, params.follower_state_rate_hz, params.control_rate_hz
     );
     // Built here, where a rate that cannot carry the cutoff is a refusal by
-    // name; every servo move copies the value instead of rebuilding it.
+    // name; every servo move copies the value.
     let servo_smoothing =
-        crate::servo::smoothing_for(cycle_period).map_err(|source| NodeError::ServoSmoothing {
-            rate_hz: params.control_rate_hz,
-            source,
+        srs_model::chain_kinematics::command_smoothing(cycle_period).map_err(|source| {
+            NodeError::ServoSmoothing {
+                rate_hz: params.control_rate_hz,
+                source,
+            }
         })?;
-    let max_joint_velocity_rad_s: JointVec = [
-        params.max_joint_velocity_rad_s_1,
-        params.max_joint_velocity_rad_s_2,
-        params.max_joint_velocity_rad_s_3,
-        params.max_joint_velocity_rad_s_4,
-        params.max_joint_velocity_rad_s_5,
-        params.max_joint_velocity_rad_s_6,
-        params.max_joint_velocity_rad_s_7,
-    ];
-    for (joint, limit) in max_joint_velocity_rad_s.iter().enumerate() {
-        PositiveFinite::parse(*limit).map_err(|source| NodeError::JointVelocityCap {
-            joint: joint + 1,
-            source,
-        })?;
-    }
+    let max_joint_velocity_rad_s = joint_caps(
+        [
+            params.max_joint_velocity_rad_s_1,
+            params.max_joint_velocity_rad_s_2,
+            params.max_joint_velocity_rad_s_3,
+            params.max_joint_velocity_rad_s_4,
+            params.max_joint_velocity_rad_s_5,
+            params.max_joint_velocity_rad_s_6,
+            params.max_joint_velocity_rad_s_7,
+        ],
+        |joint, source| NodeError::JointVelocityCap { joint, source },
+    )?;
+    let max_joint_acceleration_rad_s2 = joint_caps(
+        [
+            params.max_joint_acceleration_rad_s2_1,
+            params.max_joint_acceleration_rad_s2_2,
+            params.max_joint_acceleration_rad_s2_3,
+            params.max_joint_acceleration_rad_s2_4,
+            params.max_joint_acceleration_rad_s2_5,
+            params.max_joint_acceleration_rad_s2_6,
+            params.max_joint_acceleration_rad_s2_7,
+        ],
+        |joint, source| NodeError::JointAccelerationCap { joint, source },
+    )?;
     let max_ee_velocity =
         PositiveFinite::parse(params.max_ee_velocity_m_s).map_err(NodeError::EeVelocity)?;
     let max_ee_angular = PositiveFinite::parse(params.max_ee_angular_velocity_rad_s)
@@ -346,6 +377,7 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         cycle_period,
         smoothing: servo_smoothing,
         max_joint_velocity_rad_s,
+        max_joint_acceleration_rad_s2,
         ee: EeCaps {
             linear_m_s: max_ee_velocity.get(),
             angular_rad_s: max_ee_angular.get(),
@@ -389,6 +421,16 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         Arc::new(AtomicBool::new(false)),
         Arc::new(AtomicBool::new(false)),
     ];
+    // Whether each limb's follower delivers fresh state: the coordinator
+    // writes these every tick, and the goal handlers refuse on them.
+    let fresh = [
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    ];
+    let gripper_fresh = [
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    ];
     let (config_tx, config_rx) = watch::channel(streams::GovernorConfig {
         enabled: params.collision_governor_enabled,
         d_stop: params.d_stop_m,
@@ -397,26 +439,36 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         max_gripper_rate_frac_s: params.max_gripper_rate_frac_s,
     });
 
+    let arm_activity = [LeaderActivity::default(), LeaderActivity::default()];
+    let gripper_activity = [LeaderActivity::default(), LeaderActivity::default()];
     let channels = ArmPair::new(
         ArmChannels {
             command: cmd_tx0.clone(),
             gripper_command: gripcmd_tx0.clone(),
+            leader: arm_activity[0].clone(),
+            gripper_leader: gripper_activity[0].clone(),
             measured: meas_rx0,
             gripper: grip_rx0,
             goals: goal_rx0,
             busy: busy[0].clone(),
             gripper_goals: grip_goal_rx0,
             gripper_busy: gripper_busy[0].clone(),
+            fresh: fresh[0].clone(),
+            gripper_fresh: gripper_fresh[0].clone(),
         },
         ArmChannels {
             command: cmd_tx1.clone(),
             gripper_command: gripcmd_tx1.clone(),
+            leader: arm_activity[1].clone(),
+            gripper_leader: gripper_activity[1].clone(),
             measured: meas_rx1,
             gripper: grip_rx1,
             goals: goal_rx1,
             busy: busy[1].clone(),
             gripper_goals: grip_goal_rx1,
             gripper_busy: gripper_busy[1].clone(),
+            fresh: fresh[1].clone(),
+            gripper_fresh: gripper_fresh[1].clone(),
         },
     );
 
@@ -465,8 +517,6 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     let goal_busy = [busy[0].clone(), busy[1].clone()];
     // When a leader last streamed each limb: the goal handlers refuse a goal
     // on a limb a leader is streaming.
-    let arm_activity = [LeaderActivity::default(), LeaderActivity::default()];
-    let gripper_activity = [LeaderActivity::default(), LeaderActivity::default()];
     tokio::spawn(async move {
         startup::wait_until_ready(&runner, &token).await;
 
@@ -495,6 +545,7 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
             runner.clone(),
             [goal_tx0.clone(), goal_tx1.clone()],
             [goal_busy[0].clone(), goal_busy[1].clone()],
+            fresh.clone(),
             arm_activity.clone(),
             [left_limits, right_limits],
         ));
@@ -502,12 +553,14 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
             runner.clone(),
             [goal_tx0.clone(), goal_tx1.clone()],
             [goal_busy[0].clone(), goal_busy[1].clone()],
+            fresh.clone(),
             arm_activity.clone(),
         ));
         set.spawn(actions::postures::run_move_to_ready(
             runner.clone(),
             [goal_tx0.clone(), goal_tx1.clone()],
             [goal_busy[0].clone(), goal_busy[1].clone()],
+            fresh.clone(),
             arm_activity.clone(),
             request_tx.clone(),
         ));
@@ -515,6 +568,7 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
             runner.clone(),
             [goal_tx0, goal_tx1],
             [goal_busy[0].clone(), goal_busy[1].clone()],
+            fresh.clone(),
             arm_activity.clone(),
             request_tx.clone(),
         ));
@@ -522,12 +576,14 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
             runner.clone(),
             [grip_goal_tx0, grip_goal_tx1],
             [gripper_busy[0].clone(), gripper_busy[1].clone()],
+            gripper_fresh.clone(),
             gripper_activity.clone(),
         ));
         set.spawn(actions::stop::run_stop(runner.clone(), request_tx.clone()));
         set.spawn(actions::arm::run_check_arm_move(
             runner.clone(),
             request_tx,
+            fresh.clone(),
             arm_activity.clone(),
         ));
 

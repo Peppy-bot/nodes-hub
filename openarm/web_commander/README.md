@@ -5,16 +5,30 @@ a page on port 8765 by default, with three interaction modes:
 
 - **Streaming**: deadman-gated live control. Enabling a side streams its arm and
   gripper setpoints continuously on that side's joint_link / gripper_link
-  pairing slots.
-  Per-arm controls: seven joint sliders, world-frame x/y/z sliders, an
-  orientation arcball, and an elbow-swivel (psi) slider that moves the elbow
-  through the null space while the hand holds still. The touched control leads;
-  the rest is softly held.
-- **Actions**: compose a target, then **Execute** fires a discrete governed
-  move on the `limb_motion` contract slot (`move_arm_joints` for a joint
-  target, `move_arm` for a pose, `move_gripper` for the jaw; the backbone
-  serves them), with **Home Pose** / **Ready Pose** presets and a per-move
-  duration input.
+  pairing slots. Per-arm controls: seven joint sliders, toward which the joint
+  target ramps under the jog's speed and acceleration limits, and the gripper
+  slider. The world-frame x/y/z sliders and the orientation arcball read the
+  pose of the joint target here.
+- **Actions**: compose a target, either on the joint sliders or as a world-frame
+  pose on the x/y/z sliders and the arcball, then **Execute** fires a discrete
+  governed move on the `limb_motion` contract slot (`move_arm_joints` for a
+  joint target, `move_arm` for a pose, `move_gripper` for the jaw; the backbone
+  serves them), with **Home Pose** / **Ready Pose** presets. In Actions mode
+  each arm card shows its per-move inputs: **move time (s)** and **settle
+  timeout (s)**; below them the **joint move** group, the **angle tolerance
+  (rad)** every joint settles within; and below that the **pose move** group,
+  the grasp point's **position tolerance (m)** and **angle tolerance (rad)**.
+  The group the next Execute does not fire dims. The backbone completes an arm
+  move once the measured arm stands within the tolerance of the target at or
+  after the planned end, and fails it with the remaining error once the
+  timeout runs out. The inputs are prefilled with 2 s, 2 s, 0.1 rad, 20 mm and
+  0.15 rad, and send what the operator types; the backbone refuses a value out
+  of its range with a message on the status line. A pose's settle tolerances
+  must cover the panel's own plan tolerances of 5 mm and 5 degrees, since the
+  plan may sit that far from the composed pose. The gripper card's **settle
+  timeout (s)**, prefilled 2 s, is the longest the backbone waits after the
+  commanded travel for the jaws to stand still. The move then reports where
+  the jaws stand.
 - **Gestures**: one button per baked choreography (wave, spiral, figure eight,
   shrug, clap) plus **Stop**. Gestures are
   authored in `src/gestures.rs` as joint keyframes or Cartesian curves, resolved
@@ -61,7 +75,7 @@ are supplied too:
 ```sh
 peppy node run openarm_web_commander:v1 \
     command_rate_hz=100 hardware_version=v2 max_ee_velocity_m_s=0.5 \
-    joint_jog_acceleration_rad_s2=10.0 \
+    joint_jog_acceleration_rad_s2=10.0 joint_jog_velocity_rad_s=1.0 \
     collision_governor_enabled=true d_stop=0.005 d_safe=0.02 \
     --link limb_motion@backbone_inst \
     --link collision_status@backbone_inst \

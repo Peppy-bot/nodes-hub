@@ -5,8 +5,8 @@ Standing lets go of the stage before it changes it: the views stop reading and
 the timeline stops. Whatever the change does, the stage has to be taken up
 again, or the robots already on it are frozen for good. A robot leaves when
 its goal is cancelled, or when its pairs have not been its model's for the
-lease; the stage stands many robots, of different models, and each is held to
-its own.
+pair grace time; the stage stands many robots, of different models, and each
+is held to its own.
 """
 
 from __future__ import annotations
@@ -327,10 +327,12 @@ def test_a_stay_that_lapsed_takes_the_robot_off_the_stage_first():
     io._edits.submit.return_value = _done()
     goal = _Goal()
 
-    asyncio.run(io._take_out(goal, "alpha", Ending.LAPSED, "its pairs were gone for the lease"))
+    asyncio.run(
+        io._take_out(goal, "alpha", Ending.LAPSED, "its pairs were gone for the pair grace time")
+    )
 
     io._edits.submit.assert_called_once()
-    assert goal.answers == [("completed", False, "its pairs were gone for the lease")]
+    assert goal.answers == [("completed", False, "its pairs were gone for the pair grace time")]
 
 
 # What a robot holds once every limb of its model is paired.
@@ -340,9 +342,10 @@ OPENARM_LIMBS = Held(
 )
 SO101_LIMBS = Held(arms=frozenset({"arm"}), grippers=frozenset({"gripper"}))
 
-# The lease every leasing test gives, in the words a stay's ending says it.
-LEASE_S = 2.0
-LEASE = "2.0s, the lease this scene gives"
+# The pair grace time every pair grace test gives, in the words a stay's
+# ending says it.
+PAIR_GRACE_S = 2.0
+PAIR_GRACE = "2.0s, the pair grace time this scene gives"
 # What each model's side of a mismatch names.
 OPENARM_V2_HAS = (
     "the model openarm_v2 has arms ['left_arm', 'right_arm'], "
@@ -367,11 +370,11 @@ def _caller(robot: str) -> Caller:
     return Caller(core_node="sim16", instance_id=f"{robot}_init_inst")
 
 
-def _leasing(now_s: float, fleet: dict, reached_s: Optional[float] = 0.0) -> RobotsIO:
+def _fleet_io_at(now_s: float, fleet: dict, reached_s: Optional[float] = 0.0) -> RobotsIO:
     """A RobotsIO whose robots, each given as name: (model, what it holds),
-    are read at `now_s` with the lease this scene gives. Their leases run
-    from `reached_s`, when a limb first reached each, and not at all when
-    that is None."""
+    are read at `now_s` with the pair grace time this scene gives. Their pair
+    grace times run from `reached_s`, when a limb first reached each, and not
+    at all when that is None."""
     io = RobotsIO.__new__(RobotsIO)
     io._models = MODELS
     io._robots = Registry()
@@ -381,7 +384,7 @@ def _leasing(now_s: float, fleet: dict, reached_s: Optional[float] = 0.0) -> Rob
             io._robots.note_limbs_reached(name, reached_s)
     io._loop = SimpleNamespace(time=lambda: now_s)
     io._io = _Pairs({name: held for name, (_model, held) in fleet.items()})
-    io._lease_s = LEASE_S
+    io._pair_grace_s = PAIR_GRACE_S
     io._handovers = {}
     return io
 
@@ -496,7 +499,7 @@ class TestHowAStayEnds:
 
     @staticmethod
     def _watching() -> RobotsIO:
-        io = _leasing(now_s=0.0, fleet={"alpha": ("openarm_v2", OPENARM_LIMBS)})
+        io = _fleet_io_at(now_s=0.0, fleet={"alpha": ("openarm_v2", OPENARM_LIMBS)})
         io._stopping = asyncio.Event()
         return io
 
@@ -530,7 +533,7 @@ class TestHowAStayEnds:
     def test_a_stopping_engine_ends_every_stay(self):
         io = self._watching()
         io._stopping.set()
-        io._lease_check_period = lambda: 0.0
+        io._pair_grace_check_period = lambda: 0.0
 
         ending, why = asyncio.run(io._watch(_Leaving(), "alpha", io._handover("alpha")))
 
@@ -542,7 +545,7 @@ class TestHowAStayEnds:
         has nothing left to watch."""
         io = self._watching()
         io._robots.release("alpha")
-        io._lease_check_period = lambda: 0.0
+        io._pair_grace_check_period = lambda: 0.0
 
         ending, why = asyncio.run(io._watch(_Leaving(), "alpha", io._handover("alpha")))
 
@@ -567,12 +570,15 @@ class TestHowAStayEnds:
         assert asyncio.run(watch_and_count()) == []
 
 
-class TestLease:
-    def test_a_robot_holding_its_models_pairs_keeps_its_place_however_stale_its_lease(self):
-        """The watcher's tick renews a lease from the pairs it reads, and a
-        node loop the stage kept busy leaves the lease stale: a robot still
-        holding its pairs is not taken out for that."""
-        io = _leasing(now_s=10.0, fleet={"alpha": ("openarm_v2", OPENARM_LIMBS)})
+class TestPairGrace:
+    def test_a_robot_holding_its_models_pairs_keeps_its_place_however_stale_its_pair_grace_time(
+        self,
+    ):
+        """The watcher's tick starts a pair grace time again from the pairs
+        it reads, and a node loop the stage kept busy leaves the pair grace
+        time stale: a robot still holding its pairs is not taken out for
+        that."""
+        io = _fleet_io_at(now_s=10.0, fleet={"alpha": ("openarm_v2", OPENARM_LIMBS)})
         robot = io._robots.of_name("alpha")
 
         assert io._lapse(robot) is None
@@ -586,32 +592,34 @@ class TestLease:
             grippers=OPENARM_LIMBS.grippers,
             rgb_cameras=frozenset({"wrist_left"}),
         )
-        io = _leasing(now_s=10.0, fleet={"alpha": ("openarm_v2", held)})
+        io = _fleet_io_at(now_s=10.0, fleet={"alpha": ("openarm_v2", held)})
         robot = io._robots.of_name("alpha")
 
         assert io._lapse(robot) is None
         assert robot.last_paired_s == 10.0
 
-    def test_a_robot_holding_no_pair_for_the_lease_lapses(self):
-        io = _leasing(now_s=10.0, fleet={"alpha": ("openarm_v2", Held())})
+    def test_a_robot_holding_no_pair_for_the_pair_grace_time_lapses(self):
+        io = _fleet_io_at(now_s=10.0, fleet={"alpha": ("openarm_v2", Held())})
 
         assert io._lapse(io._robots.of_name("alpha")) == (
-            f"none of this robot's limbs were paired for {LEASE}"
+            f"none of this robot's limbs were paired for {PAIR_GRACE}"
         )
 
-    def test_a_robot_has_the_lease_to_pair_its_limbs(self):
-        io = _leasing(now_s=LEASE_S, fleet={"alpha": ("openarm_v2", Held())})
+    def test_a_robot_has_the_pair_grace_time_to_pair_its_limbs(self):
+        io = _fleet_io_at(now_s=PAIR_GRACE_S, fleet={"alpha": ("openarm_v2", Held())})
         robot = io._robots.of_name("alpha")
 
         assert io._lapse(robot) is None
-        assert robot.last_paired_s == 0.0, "a lease still running is not a renewed one"
+        assert robot.last_paired_s == 0.0, (
+            "a pair grace time still running is not one started again"
+        )
 
     def test_a_robot_missing_a_limb_lapses_naming_both_lists(self):
         held = Held(arms=OPENARM_LIMBS.arms, grippers=frozenset({"left_gripper"}))
-        io = _leasing(now_s=10.0, fleet={"alpha": ("openarm_v2", held)})
+        io = _fleet_io_at(now_s=10.0, fleet={"alpha": ("openarm_v2", held)})
 
         assert io._lapse(io._robots.of_name("alpha")) == (
-            f"this robot's pairs were not its model's for {LEASE}: its pairs name "
+            f"this robot's pairs were not its model's for {PAIR_GRACE}: its pairs name "
             "arms ['left_arm', 'right_arm'], grippers ['left_gripper'], rgb_cameras [], "
             f"rgbd_cameras [], and {OPENARM_V2_HAS}"
         )
@@ -620,10 +628,10 @@ class TestLease:
         held = Held(
             arms=SO101_LIMBS.arms, grippers=SO101_LIMBS.grippers, rgbd_cameras=frozenset({"chest"})
         )
-        io = _leasing(now_s=10.0, fleet={"charlo": ("so101", held)})
+        io = _fleet_io_at(now_s=10.0, fleet={"charlo": ("so101", held)})
 
         assert io._lapse(io._robots.of_name("charlo")) == (
-            f"this robot's pairs were not its model's for {LEASE}: its pairs name "
+            f"this robot's pairs were not its model's for {PAIR_GRACE}: its pairs name "
             "arms ['arm'], grippers ['gripper'], rgb_cameras [], rgbd_cameras ['chest'], "
             f"and {SO101_HAS}"
         )
@@ -631,7 +639,7 @@ class TestLease:
     def test_each_robot_of_a_fleet_is_held_to_its_own_model(self):
         """An SO-101 stands beside an OpenArm on the same four slots. Each
         holds its own model's limbs, and neither is asked for the other's."""
-        io = _leasing(
+        io = _fleet_io_at(
             now_s=10.0,
             fleet={"alpha": ("openarm_v2", OPENARM_LIMBS), "charlo": ("so101", SO101_LIMBS)},
         )
@@ -642,29 +650,32 @@ class TestLease:
             assert robot.last_paired_s == 10.0
 
     def test_one_robots_mismatch_ends_its_own_stay_and_no_others(self):
-        """The SO-101's backbone leads an OpenArm's limbs: its lease runs
-        out naming both lists while the OpenArm beside it keeps its place."""
-        io = _leasing(
+        """The SO-101's backbone leads an OpenArm's limbs: its pair grace
+        time runs out naming both lists while the OpenArm beside it keeps its
+        place."""
+        io = _fleet_io_at(
             now_s=10.0,
             fleet={"alpha": ("openarm_v2", OPENARM_LIMBS), "charlo": ("so101", OPENARM_LIMBS)},
         )
-        # The lease is read at once instead of after a share of it.
-        io._lease_check_period = lambda: 0.0
+        # The pair grace time is read at once instead of after a share of it.
+        io._pair_grace_check_period = lambda: 0.0
         io._stopping = threading.Event()
 
         ending, why = asyncio.run(io._watch(_Staying(), "charlo", io._handover("charlo")))
 
         assert ending is Ending.LAPSED
         assert why == (
-            f"this robot's pairs were not its model's for {LEASE}: its pairs name "
+            f"this robot's pairs were not its model's for {PAIR_GRACE}: its pairs name "
             "arms ['left_arm', 'right_arm'], grippers ['left_gripper', 'right_gripper'], "
             f"rgb_cameras [], rgbd_cameras [], and {SO101_HAS}"
         )
         assert io._robots.of_name("charlo").last_paired_s == 0.0
         assert io._lapse(io._robots.of_name("alpha")) is None
 
-    def test_the_watcher_renews_each_lease_only_while_its_robots_pairs_are_its_models(self):
-        io = _leasing(
+    def test_the_watcher_restarts_each_pair_grace_time_only_while_its_robots_pairs_are_its_models(
+        self,
+    ):
+        io = _fleet_io_at(
             now_s=10.0,
             fleet={
                 "alpha": ("openarm_v2", OPENARM_LIMBS),
@@ -697,7 +708,7 @@ class TestReadiness:
         return io._ready(request).ready
 
     def _standing(self, fleet: dict) -> RobotsIO:
-        io = _leasing(now_s=1.0, fleet=fleet)
+        io = _fleet_io_at(now_s=1.0, fleet=fleet)
         for name in fleet:
             io._robots.stand(name)
         return io
@@ -736,7 +747,7 @@ class TestReadiness:
         assert self._ready(io, "charlo")
 
     def test_a_robot_that_does_not_stand_yet_is_not_ready(self):
-        io = _leasing(now_s=1.0, fleet={"alpha": ("openarm_v2", OPENARM_LIMBS)})
+        io = _fleet_io_at(now_s=1.0, fleet={"alpha": ("openarm_v2", OPENARM_LIMBS)})
         assert not self._ready(io, "alpha")
 
     def test_an_instance_with_no_robot_is_not_ready(self):

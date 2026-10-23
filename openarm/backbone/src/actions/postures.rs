@@ -22,12 +22,12 @@ use srs_model::nalgebra::Isometry3;
 use tokio::sync::{mpsc, oneshot};
 use tracing::error;
 
-use crate::actions::{ARM_LEADER_STREAMING, ask_coordinator, claim};
+use crate::actions::{ARM_LEADER_STREAMING, ARM_NO_FRESH_STATE, ask_coordinator, claim};
 use crate::arm_pair::ArmPair;
 use crate::coordinator::{CoordinatorRequest, MeasuredGrasp};
 use crate::planner::{Goal, JointReply, ReadyOutcome, ReadyReply, Unmeasured};
 use crate::streams::LeaderActivity;
-use crate::types::{Side, arm_pose_arrays, limb_names};
+use crate::types::{Side, arm_pose_arrays, limb_names, move_seconds_from_wire};
 
 /// Claim both arms' single-flight slots, or name the busy arm. A failure on
 /// the second claim unwinds the first, so a refusal never leaves a slot held.
@@ -161,18 +161,6 @@ fn posture_result(
     }
 }
 
-/// Ceiling on a requested posture duration: the move claims both arms'
-/// single-flight slots for its whole run, so an absurd request must not pin
-/// the robot until a manual cancel.
-const MAX_REQUESTED_DURATION_S: f64 = 600.0;
-
-/// Whether a posture goal of `duration_s` is admitted: a duration from 0 s
-/// to [`MAX_REQUESTED_DURATION_S`], both included. A NaN or an infinite
-/// duration is refused.
-fn admissible_duration(duration_s: f64) -> bool {
-    duration_s.is_finite() && (0.0..=MAX_REQUESTED_DURATION_S).contains(&duration_s)
-}
-
 /// The message of a move_to_ready that succeeds. Success means both moves ran
 /// for their duration; the governor can hold an arm short and an object can
 /// stop it, so it does not mean the arms arrived.
@@ -193,6 +181,7 @@ macro_rules! posture_runner {
             runner: Arc<NodeRunner>,
             goal_txs: [mpsc::Sender<Goal>; 2],
             busy: [Arc<AtomicBool>; 2],
+            fresh: [Arc<AtomicBool>; 2],
             activity: [LeaderActivity; 2],
             requests: mpsc::Sender<CoordinatorRequest>,
         ) -> Result<()> {
@@ -200,8 +189,13 @@ macro_rules! posture_runner {
             loop {
                 let accepted = handle
                     .handle_goal_next_request(|req| {
-                        if !admissible_duration(req.data.duration_s) {
-                            return Ok($action::GoalDecision::reject("invalid duration"));
+                        if let Err(reason) =
+                            move_seconds_from_wire("duration_s", req.data.duration_s)
+                        {
+                            return Ok($action::GoalDecision::reject(reason));
+                        }
+                        if fresh.iter().any(|arm| !arm.load(Ordering::Acquire)) {
+                            return Ok($action::GoalDecision::reject(ARM_NO_FRESH_STATE));
                         }
                         if activity.iter().any(LeaderActivity::streaming) {
                             return Ok($action::GoalDecision::reject(ARM_LEADER_STREAMING));
@@ -213,7 +207,8 @@ macro_rules! posture_runner {
                     })
                     .await?;
                 let Some(ctx) = accepted else { return Ok(()) };
-                let duration_s = ctx.request().data.duration_s;
+                let duration = move_seconds_from_wire("duration_s", ctx.request().data.duration_s)
+                    .expect("validated on accept");
 
                 let cancelled = Arc::new(AtomicBool::new(false));
                 let (done_tx, mut done_rx) = mpsc::channel::<ReadyOutcome>(2);
@@ -222,7 +217,7 @@ macro_rules! posture_runner {
                     let idx = side.index();
                     let goal = Goal::Joint {
                         target: $posture(side.model()),
-                        duration_s,
+                        duration,
                         reply: JointReply::Ready(ReadyReply {
                             done_tx: done_tx.clone(),
                             cancelled: cancelled.clone(),
@@ -342,18 +337,6 @@ mod tests {
                     }
                 }
             }
-        }
-    }
-
-    /// The duration ceiling admits 0 s and 600 s, and refuses a duration
-    /// just past either edge, a NaN and an infinite one.
-    #[test]
-    fn a_posture_duration_is_admitted_from_zero_to_six_hundred_seconds() {
-        for admitted in [0.0, 1.0, 600.0] {
-            assert!(admissible_duration(admitted), "{admitted} s is refused");
-        }
-        for refused in [-1e-6, 600.000001, f64::NAN, f64::INFINITY] {
-            assert!(!admissible_duration(refused), "{refused} s is admitted");
         }
     }
 

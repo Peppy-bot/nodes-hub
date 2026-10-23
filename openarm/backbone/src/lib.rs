@@ -19,26 +19,22 @@
 mod actions;
 mod arm_pair;
 mod camera_mounts;
-mod chase;
 mod coordinator;
 mod governor;
 mod liveness;
-mod motion;
 mod node;
 mod planner;
 mod publish;
 mod serving;
-mod servo;
+mod settle;
 mod startup;
 mod streams;
+#[cfg(test)]
+mod test_support;
 mod torso;
-mod trajectory;
 mod types;
 mod upstream;
 mod workspace;
 mod workspace_service;
 
-// Sibling modules' unit tests reach the shared model builder as `crate::arm_model`.
-#[cfg(test)]
-use node::arm_model;
-pub use node::{NodeError, setup};
+pub use node::{NodeError, arm_model, setup};

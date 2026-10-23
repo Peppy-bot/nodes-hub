@@ -127,8 +127,9 @@
      axes) and drag near the rim to roll about the view axis. The bright triad is the
      target orientation, the faint one is measured; z (blue) is the gripper approach. */
   .arcball { display: flex; flex-direction: column; align-items: center; gap: 5px; margin: 14px 0 2px; }
-  .arcball svg { width: 128px; height: 128px; touch-action: none; cursor: grab; }
-  .arcball svg:active { cursor: grabbing; }
+  .arcball svg { width: 128px; height: 128px; touch-action: none; }
+  body.actions-mode .arcball svg { cursor: grab; }
+  body.actions-mode .arcball svg:active { cursor: grabbing; }
   .ab-rim { fill: var(--bg-soft); stroke: var(--lo); stroke-width: 2.5; }
   .ab-t { stroke-width: 3.5; stroke-linecap: round; }
   .ab-m { stroke-width: 2.5; stroke-linecap: round; }
@@ -140,8 +141,8 @@
     font: 600 10px/1 'Inter Tight', sans-serif; letter-spacing: 0.06em;
     text-transform: uppercase; color: var(--ink-50);
   }
-  /* The arcball takes no input in gestures mode, so its drag hint hides too. */
-  body.gestures-mode .ab-hint { display: none; }
+  /* The arcball takes input only in actions mode, so its drag hint shows only there. */
+  body:not(.actions-mode) .ab-hint { display: none; }
 
   /* Every track is full width on a shared axis; the ends outside the slider's
      reachable [lo, hi] are painted dead-gray. set_reachable drives the stops,
@@ -167,14 +168,38 @@
     background: radial-gradient(circle at 34% 28%, #ffffff 0%, #e4e7ec 45%, #c2c7cf 100%);
     box-shadow: -2px -2px 5px var(--hi), 3px 3px 6px var(--lo), inset 0 0 0 1px var(--ink-15);
   }
-  /* Read-only track (the elbow slider in actions): drop the draggable thumb, leaving
-     just the track and the measured caret as a current-position indicator. */
+  /* Read-only track (the pose sliders outside actions, every slider in gestures): drop
+     the draggable thumb, leaving just the track and the measured caret as a
+     current-position indicator. */
   input[type=range].readonly-track::-webkit-slider-thumb { opacity: 0; width: 0; cursor: default; }
   input[type=range].readonly-track::-moz-range-thumb { opacity: 0; width: 0; cursor: default; }
 
   .actions {
     display: flex; gap: 10px; margin-top: 14px; justify-content: flex-end; align-items: center;
   }
+  /* The per-move inputs of actions mode, above the buttons: the requested
+     duration and settle timeout on one line, and under them the settle
+     tolerances of each kind of move side by side, prefilled with the
+     recommended values. */
+  .knobs { flex-direction: column; align-items: flex-start; gap: 4px; margin-top: 8px; }
+  .knob-row { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; }
+  .knobs label {
+    display: inline-flex; align-items: center; gap: 5px;
+    text-transform: none; letter-spacing: 0; font-size: 11px; color: var(--ink-50);
+  }
+  .knobs input { width: 4.2em; }
+  /* The tolerances of one kind of move, under its name: the joint group for a
+     joint move, the pose group for a pose move. The group the next Execute does
+     not fire dims, and stays editable. */
+  .knob-group {
+    display: flex; flex-direction: column; align-items: flex-start; gap: 2px;
+    padding: 2px 6px 4px; border: 1px solid var(--ink-15); border-radius: 6px;
+  }
+  .knob-group .knob-title {
+    font-size: 10px; font-weight: 600; letter-spacing: 0.06em;
+    text-transform: uppercase; color: var(--ink-70);
+  }
+  .knob-group.idle { opacity: 0.45; }
   /* Slider column: the full-width track (with its actual-position caret) over the
      limit readouts, each pinned under the gray boundary it marks. */
   .scol { display: flex; flex-direction: column; gap: 3px; }
@@ -343,19 +368,20 @@ const PI = Math.PI;
 const ARM_DOF = 7;
 // Gripper axis is the unitless opening fraction: 0 closed, 1 fully open.
 const GRIPPER_MAX = 1;
-// Shared full-width axis for every angular track (joints and the elbow swivel):
-// +-200deg exactly spans the widest joint on both hardware generations, so all
-// rows align and the grayed ends mark each joint's own limits.
+// Shared full-width axis for every joint track: +-200deg exactly spans the widest
+// joint on both hardware generations, so all rows align and the grayed ends mark
+// each joint's own limits.
 const JOINT_AXIS = 200 * PI / 180;
 // World-frame position controls: x/y/z sliders bound to indices 0..2 of the arm view's
-// `pose`/`pose_feedback`. That pose is the gripper's grasp point (between the pads),
-// not the wrist it mounts on, so dialling an object's centre puts the pads around it.
-// Orientation (indices 3..5, euler) is not shown directly; the arcball composes it on
-// quaternions instead. Each slider's band comes from the snapshot's per-side
-// `pos_bounds`, applied each frame like the joint limits, so v1 and v2 both work. That
-// band is each axis's true limit with the other two at their best case, so a target
-// dialled inside it can still be refused by the backbone's IK: reaching a given x may
-// need a y and z the operator did not ask for.
+// `pose`/`pose_feedback`. They read the pose of the joint target, and in actions mode
+// they compose the pose a move_arm Execute fires. That pose is the gripper's grasp
+// point (between the pads), not the wrist it mounts on, so dialling an object's
+// centre puts the pads around it. Orientation (indices 3..5, euler) is not shown
+// directly; the arcball composes it on quaternions instead. Each slider's band comes
+// from the snapshot's per-side `pos_bounds`, applied each frame like the joint
+// limits, so v1 and v2 both work. That band is each axis's true limit with the other
+// two at their best case, so a target dialled inside it can still be refused by the
+// backbone's IK: reaching a given x may need a y and z the operator did not ask for.
 const POS_AXES = [
   {i: 0, label: 'x'},
   {i: 1, label: 'y'},
@@ -366,8 +392,9 @@ const POS_AXES = [
 // composing; the drag updates it directly.
 const quatTargetCam = { left: [0, 0, 0, 1], right: [0, 0, 0, 1] };
 let arcballDrag = { side: null, p0: null, start: null, pid: null };
-// Interaction mode: 'streaming' follows controls live (deadman-gated); 'actions'
-// composes a target and fires it as a discrete backbone move on Execute;
+// Interaction mode: 'streaming' follows the joint and gripper sliders live
+// (deadman-gated); 'actions' composes a target and fires it as a discrete backbone
+// move on Execute;
 // 'gestures' plays baked choreography from the server's library while the
 // per-arm controls become read-only viewers.
 const UI_MODES = ['streaming', 'actions', 'gestures', 'motors'];
@@ -450,12 +477,29 @@ function build_arm(side, label) {
     <div id="${side}_arm_joints"></div>
     <div class="pose-head">pose · world</div>
     <div id="${side}_arm_pos"></div>
-    <div id="${side}_arm_psi"></div>
     <div id="${side}_arm_orient"></div>
+    <div class="actions knobs" id="${side}_knobs" style="display:none">
+      <div class="knob-row">
+        <label>move time (s)<input type="number" id="${side}_dur" value="2" min="0" max="60" step="0.5"></label>
+        <label>settle timeout (s)<input type="number" id="${side}_settle_s" value="2" min="0" max="60" step="0.5"></label>
+      </div>
+      <div class="knob-row">
+        <div class="knob-group" id="${side}_joint_knobs">
+          <span class="knob-title">joint move</span>
+          <div class="knob-row">
+            <label>angle tolerance (rad)<input type="number" id="${side}_settle_joints" value="0.1" min="0.01" step="0.01"></label>
+          </div>
+        </div>
+        <div class="knob-group" id="${side}_pose_knobs">
+          <span class="knob-title">pose move</span>
+          <div class="knob-row">
+            <label>position tolerance (m)<input type="number" id="${side}_settle_pos" value="0.02" min="0.005" step="0.001"></label>
+            <label>angle tolerance (rad)<input type="number" id="${side}_settle_rot" value="0.15" min="0.09" step="0.01"></label>
+          </div>
+        </div>
+      </div>
+    </div>
     <div class="actions">
-      <label id="${side}_dur_l" style="display:none; align-items:center; gap:5px; margin-right:auto; text-transform:none; letter-spacing:0; font-size:11px; color:var(--ink-50);">
-        move (s)<input type="number" id="${side}_dur" value="2" min="0" step="0.5" style="width:3.8em;">
-      </label>
       <button id="${side}_home_btn" style="display:none" onclick="reset_arm('${side}')">Home Pose</button>
       <button id="${side}_ready_btn" style="display:none" onclick="ready_arm('${side}')">Ready Pose</button>
       <button class="primary" id="${side}_arm_btn" onclick="primary_arm('${side}')">Enable</button>
@@ -473,18 +517,11 @@ function build_arm(side, label) {
       `on_pose_input('${side}', 'position', ${ax.i})`));
   }
   $(`${side}_arm_orient`).appendChild(arcball_widget(side));
-  // Elbow (arm-angle) slider: swivels the elbow through the null space, holding the
-  // hand pose. Streaming-only (the backbone plans the elbow for actions-mode moves).
-  $(`${side}_arm_psi`).appendChild(slider_row(`${side}_psi`, 'ψ', -JOINT_AXIS, JOINT_AXIS, 0.01,
-    `on_arm_angle_input('${side}')`));
-  // The elbow swivel's reach is fixed at +-pi; apply_snapshot refreshes the joints
-  // and x/y/z from live limits, but never touches this one.
-  set_reachable(`${side}_psi`, -PI, PI, -JOINT_AXIS, JOINT_AXIS, fmtRadAsDeg);
 }
 
 // A joint-style slider row: name, full-width track with a measured caret over the
 // limit readouts, then the commanded and measured numeric columns. Shared by the
-// joints, the elbow swivel, and the world-frame x/y/z so all read exactly the same.
+// joints and the world-frame x/y/z so all read exactly the same.
 // Sub-elements derive their ids from the slider's: `_ghost` (measured caret),
 // `_lo`/`_hi` (limit labels, filled by set_reachable), `_t` (target), `_f` (measured).
 function slider_row(id, name, min, max, step, oninput) {
@@ -504,9 +541,6 @@ function slider_row(id, name, min, max, step, oninput) {
   return row;
 }
 
-// One roll/pitch/yaw dial: an SVG knob you drag around to set the angle. The viewBox
-// is centred at 0,0; the hand points at the commanded angle and the orange tick marks
-// the measured angle. Angles use the math convention (0 at 3 o'clock, CCW positive).
 // The orientation arcball: a sphere showing the target hand frame (bright triad) over
 // the measured frame (faint), which you drag to reorient. Measured lines are drawn
 // first so the target renders on top.
@@ -564,6 +598,9 @@ function build_gripper(side, label) {
       <span class="fb">max effort (shaft N&middot;m)</span>
     </div>
     <div class="actions">
+      <span class="knobs" id="${side}_g_knobs" style="display:none">
+        <label>settle timeout (s)<input type="number" id="${side}_g_settle_s" value="2" min="0" max="60" step="0.5"></label>
+      </span>
       <button class="primary" id="${side}_g_btn" style="display:none" onclick="execute_gripper('${side}')">Execute · gripper</button>
     </div>`;
 }
@@ -602,50 +639,13 @@ function send_arm_target(side, overrideIdx) {
     ws.send(JSON.stringify({cmd: 'set_arm_target', side, joints: read_joints(side, overrideIdx)})));
 }
 
-// Compose the desired pose from the latest server floats plus the control being
-// dragged: only the touched axis takes the DOM value, so the sliders' step grid
-// never feeds 1 mm parasitic jogs back on the other axes.
-function read_pose(side, overrideAxis) {
-  const snap = latestSnap && latestSnap[`${side}_arm`];
-  const position = POS_AXES.map(ax =>
-    ax.i === overrideAxis || !snap
-      ? parseFloat($(`${side}_p${ax.i}`).value)
-      : snap.pose[ax.i]);
-  const orientation = qnorm(qmul(qconj(VQ), quatTargetCam[side]));  // camera -> world
-  const arm_angle = parseFloat($(`${side}_psi`).value);
-  return {position, orientation, arm_angle};
-}
-
-// Stream the composed pose to the server's jog. `mode` = the component the touched
-// control drives (position / orientation / arm_angle); the rest is held.
-function send_arm_pose(side, mode, overrideAxis) {
-  if (!enabled[side] || !ws || ws.readyState !== 1) return;
-  const {position, orientation, arm_angle} = read_pose(side, overrideAxis);
-  if (![...position, ...orientation, arm_angle].every(Number.isFinite)) return;
-  throttled(`${side}_pose`, () =>
-    ws.send(JSON.stringify({cmd: 'set_arm_pose', side, position, orientation, arm_angle, mode})));
-}
-
-// Pose control moved (an x/y/z slider or the arcball): refresh the x/y/z target
-// readouts, then while streaming-enabled arm the server's jog. The touched control
-// leads; the rest is softly held.
+// Pose control moved (an x/y/z slider or the arcball) in actions mode: refresh the
+// x/y/z target readouts and make the pose the space Execute fires.
 function on_pose_input(side, lead, overrideAxis) {
   if (lead === 'position') clamp_slider($(`${side}_p${overrideAxis}`));
   for (const ax of POS_AXES) $(`${side}_p${ax.i}_t`).textContent = fmt(parseFloat($(`${side}_p${ax.i}`).value));
   touched[side] = 'pose';
-  if (uiMode !== 'streaming') { refresh_primary(side); return; }
-  send_arm_pose(side, lead, overrideAxis);
-}
-
-// Elbow slider moved: swivel the elbow through the null space (streaming-only; the backbone
-// plans the elbow for actions-mode moves, so the slider is read-only there).
-function on_arm_angle_input(side) {
-  const el = $(`${side}_psi`);
-  clamp_slider(el);
-  $(`${side}_psi_t`).textContent = fmtRadAsDeg(parseFloat(el.value));
-  touched[side] = 'pose';
-  if (uiMode !== 'streaming') { refresh_primary(side); return; }
-  send_arm_pose(side, 'arm_angle', undefined);
+  refresh_primary(side);
 }
 
 // Trailing-edge throttle per channel: input events fire per pixel, but one jog
@@ -728,7 +728,7 @@ function arcball_xy(side, e) {
   return [(e.clientX - (r.left + r.width/2)) / rim, -(e.clientY - (r.top + r.height/2)) / rim];
 }
 function arcball_down(side, e) {
-  if (uiMode === 'gestures') return;
+  if (uiMode !== 'actions') return;
   $(`${side}_ab`).setPointerCapture(e.pointerId);
   const [nx, ny] = arcball_xy(side, e);
   arcballDrag = { side, p0: arcball_point(nx, ny), start: quatTargetCam[side].slice(), pid: e.pointerId };
@@ -840,7 +840,11 @@ function slider_joints(side) {
 
 function fire_arm(side, duration_s) {
   if (!ws || ws.readyState !== 1) return;
-  ws.send(JSON.stringify({cmd: 'fire_arm', side, joints: slider_joints(side), duration_s}));
+  ws.send(JSON.stringify({
+    cmd: 'fire_arm', side, joints: slider_joints(side), duration_s,
+    settle_tolerance_rad: knob(`${side}_settle_joints`),
+    settle_timeout_s: knob(`${side}_settle_s`),
+  }));
 }
 
 // Slider moved: update the readout, and while enabled stream the new opening.
@@ -870,8 +874,8 @@ function primary_arm(side) {
 }
 
 // Fire the composed target for one side as a discrete governed backbone move. The last
-// control space the operator touched picks which: the x/y/z sliders + dials fire a
-// straight-line Cartesian move_arm; the joint sliders fire move_arm_joints. Refused
+// control space the operator touched picks which: the x/y/z sliders and the arcball
+// fire a straight-line Cartesian move_arm; the joint sliders fire move_arm_joints. Refused
 // server-side while a side streams, but actions mode holds both deadmen down.
 function execute_arm(side) {
   if (!ws || ws.readyState !== 1) return;
@@ -879,9 +883,14 @@ function execute_arm(side) {
     const position = POS_AXES.map(ax => parseFloat($(`${side}_p${ax.i}`).value));
     const orientation = qnorm(qmul(qconj(VQ), quatTargetCam[side]));
     if (![...position, ...orientation].every(Number.isFinite)) return;
-    ws.send(JSON.stringify({cmd: 'fire_arm_pose', side, position, orientation, duration_s: arm_duration(side)}));
+    ws.send(JSON.stringify({
+      cmd: 'fire_arm_pose', side, position, orientation, duration_s: arm_duration(side),
+      settle_position_tolerance_m: knob(`${side}_settle_pos`),
+      settle_orientation_tolerance_rad: knob(`${side}_settle_rot`),
+      settle_timeout_s: knob(`${side}_settle_s`),
+    }));
   } else {
-    ws.send(JSON.stringify({cmd: 'fire_arm', side, joints: slider_joints(side), duration_s: arm_duration(side)}));
+    fire_arm(side, arm_duration(side));
   }
 }
 
@@ -891,7 +900,9 @@ function execute_gripper(side) {
   if (!ws || ws.readyState !== 1) return;
   const position = parseFloat($(`${side}_g`).value);
   if (!Number.isFinite(position)) return;
-  ws.send(JSON.stringify({cmd: 'fire_gripper', side, position}));
+  ws.send(JSON.stringify({
+    cmd: 'fire_gripper', side, position, settle_timeout_s: knob(`${side}_g_settle_s`),
+  }));
 }
 
 // Switch interaction mode. Actions and Gestures both run discrete/served motion,
@@ -991,8 +1002,12 @@ function refresh_primary(side) {
     btn.textContent = on ? 'Disable' : 'Enable';
     btn.classList.toggle('enabled', on);
   } else {
-    btn.textContent = touched[side] === 'pose' ? 'Execute · pose' : 'Execute · joints';
+    const pose = touched[side] === 'pose';
+    btn.textContent = pose ? 'Execute · pose' : 'Execute · joints';
     btn.classList.remove('enabled');
+    // The tolerances the next Execute uses stand out; the other group dims.
+    $(`${side}_joint_knobs`).classList.toggle('idle', pose);
+    $(`${side}_pose_knobs`).classList.toggle('idle', !pose);
   }
 }
 
@@ -1003,25 +1018,36 @@ function refresh_mode_buttons(side) {
   const on = uiMode === 'actions';
   $(`${side}_home_btn`).style.display = on ? '' : 'none';
   $(`${side}_ready_btn`).style.display = on ? '' : 'none';
-  $(`${side}_dur_l`).style.display = on ? 'inline-flex' : 'none';
+  $(`${side}_knobs`).style.display = on ? '' : 'none';
+  $(`${side}_g_knobs`).style.display = on ? '' : 'none';
   $(`${side}_g_btn`).style.display = on ? '' : 'none';
   $(`${side}_arm_btn`).style.display = uiMode === 'gestures' ? 'none' : '';
+}
+
+// A per-move input (a duration, a settle tolerance, a settle timeout) as the
+// wire takes it: the number the operator typed, which the backbone refuses with a
+// message when it is out of range, or the prefilled value for a blank field.
+function knob(id) {
+  const el = $(id);
+  const v = parseFloat(el.value);
+  return Number.isFinite(v) ? v : parseFloat(el.defaultValue);
 }
 
 // Requested duration (s) for this arm's discrete moves; 0 = as fast as the EE-speed
 // cap allows. Read by Home, Ready, and Execute.
 function arm_duration(side) {
-  const v = parseFloat($(`${side}_dur`).value);
-  return Number.isFinite(v) && v >= 0 ? v : 0;
+  return knob(`${side}_dur`);
 }
 
 function apply_snapshot(snap) {
   latestSnap = snap;
   update_gesture_panel(snap);
   // In gestures mode the per-arm controls are viewers: the sliders mirror the
-  // played setpoints but take no input.
+  // played setpoints but take no input. The pose controls take input in actions
+  // mode alone, where they compose the pose Execute fires.
   const viewing = uiMode === 'gestures';
-  document.body.classList.toggle('gestures-mode', viewing);
+  const composing = uiMode === 'actions';
+  document.body.classList.toggle('actions-mode', composing);
   // Shared world-position axis across both arms: every x/y/z track spans it, so
   // the six rows align; each side's reachable band is grayed per axis below.
   const posBounds = ['left', 'right'].flatMap(s => snap[`${s}_arm`].pos_bounds);
@@ -1053,10 +1079,6 @@ function apply_snapshot(snap) {
         const [lo, hi] = a.limits[i];
         set_reachable(`${side}_j${i}`, lo, hi, -JOINT_AXIS, JOINT_AXIS, fmtRadAsDeg);
       }
-      // The slider mirrors the held target, so a pose-field edit (solved to
-      // joints server-side) shows on the sliders too - except the joint the
-      // operator is actively dragging, which we must not fight. The caret and
-      // the grey column carry the measured pose.
       // Freeze only the space being composed in actions mode; the other space keeps
       // tracking the setpoint, so a pose Execute's IK shows on the joint sliders (and
       // a joint Execute's FK shows on the pose controls). The sliders mirror the
@@ -1072,17 +1094,17 @@ function apply_snapshot(snap) {
       place_caret(`${side}_j${i}`, a.feedback ? a.feedback[i] : null, -JOINT_AXIS, JOINT_AXIS);
     }
 
-    // World position: the x/y/z sliders mirror the FK of the joint target while enabled
-    // (so a joint move updates them) or the measured pose while disabled, each with the
-    // measured value marked. Skip a control being edited.
+    // World position: the x/y/z sliders mirror the FK of the joint target, with the
+    // measured value marked, unless the operator composes a pose in actions. Skip a
+    // control being edited.
     for (const ax of POS_AXES) {
       const i = ax.i;
       // The track spans the shared cross-side axis; this side's reach on this axis
       // (pos_bounds, per generation) grays the dead ends and bounds the thumb.
       const [pmin, pmax] = a.pos_bounds[i];
       const el = $(`${side}_p${i}`);
-      el.disabled = viewing;
-      el.classList.toggle('readonly-track', viewing);
+      el.disabled = !composing;
+      el.classList.toggle('readonly-track', !composing);
       if (el.min != posMin) el.min = posMin;
       if (el.max != posMax) el.max = posMax;
       set_reachable(`${side}_p${i}`, pmin, pmax, posMin, posMax, fmt);
@@ -1103,21 +1125,6 @@ function apply_snapshot(snap) {
       if (src) quatTargetCam[side] = qmul(VQ, src);
     }
     render_arcball(side);
-
-    // Elbow (arm angle): streaming-only. The slider shows the target psi, the
-    // caret shows measured; disabled in actions, where the backbone plans the
-    // elbow for straight-line moves.
-    const psiEl = $(`${side}_psi`);
-    // Live slider in streaming; in actions drop the thumb (readonly-track) so it reads
-    // as a current-position indicator (red tick only), not a dead slider.
-    psiEl.disabled = uiMode !== 'streaming';
-    psiEl.classList.toggle('readonly-track', uiMode !== 'streaming');
-    if (document.activeElement !== psiEl) {
-      const src = a.arm_angle;
-      if (src != null) { psiEl.value = src; $(`${side}_psi_t`).textContent = fmtRadAsDeg(src); }
-    }
-    $(`${side}_psi_f`).textContent = a.arm_angle_feedback != null ? fmtRadAsDeg(a.arm_angle_feedback) : '---';
-    place_caret(`${side}_psi`, a.arm_angle_feedback, -JOINT_AXIS, JOINT_AXIS);
 
     const g = snap[`${side}_gripper`];
     const gb = $(`${side}_g_badge`);

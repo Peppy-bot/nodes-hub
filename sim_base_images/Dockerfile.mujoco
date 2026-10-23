@@ -26,8 +26,8 @@ RUN pip install --no-cache-dir --retries 5 --timeout 180 -r /tmp/requirements.tx
 COPY download_assets.sh /tmp/download_assets.sh
 RUN --mount=type=secret,id=rclone_key \
     --mount=type=secret,id=rclone_secret \
-    RCLONE_S3_ACCESS_KEY_ID="$(cat /run/secrets/rclone_key)" \
-    RCLONE_S3_SECRET_ACCESS_KEY="$(cat /run/secrets/rclone_secret)" \
+    PEPPY_R2_DATA01_ACCESS_KEY_ID="$(cat /run/secrets/rclone_key)" \
+    PEPPY_R2_DATA01_SECRET_ACCESS_KEY="$(cat /run/secrets/rclone_secret)" \
     bash /tmp/download_assets.sh --variant mujoco \
     && mkdir -p /opt/robot_assets/openarm \
     && cp -r /tmp/.peppy_openarm_assets_mujoco/. /opt/robot_assets/openarm/ \

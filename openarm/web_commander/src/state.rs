@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::gestures::BakedGesture;
-use crate::pose::Jog;
+use crate::pose::JointJog;
 
 pub use control_core::motor_health::{AlertSeverity, HealthLevel};
 pub use openarm_description::ARM_DOF;
@@ -100,15 +100,10 @@ pub struct ArmTarget {
     // Cancels the in-flight goal so a new Send preempts instead of being
     // rejected by the arm's single-flight gate.
     pub preempt: Option<tokio_util::sync::CancellationToken>,
-    // What the operator is actively driving this side toward: a joint target (the setpoint
-    // ramps toward it under a velocity/acceleration cap) or a Cartesian jog (stepped toward
-    // a world pose one capped increment per tick, held at the reach boundary). None when the
-    // side is idle. Arming either space clears the other, and it clears on enable/disable,
-    // since the two spaces must not fight.
-    pub jog: Option<Jog>,
-    // Whether a Cartesian jog is currently held at the reach boundary. Drives one-shot
-    // status transitions (blocked <-> moving), so neither message latches or spams.
-    pub jog_blocked: bool,
+    // The joint target the operator is driving this side toward: the setpoint ramps
+    // toward it under the jog's velocity and acceleration caps. None when the side is
+    // idle; it clears on enable/disable.
+    pub jog: Option<JointJog>,
 }
 
 impl ArmTarget {
@@ -120,7 +115,6 @@ impl ArmTarget {
             in_flight: false,
             preempt: None,
             jog: None,
-            jog_blocked: false,
         }
     }
 }
@@ -222,8 +216,7 @@ pub struct UiState {
     // arm/gripper targets each tick.
     pub gesture: Option<GesturePlayback>,
     // Streaming deadman, one per side: while false the commander emits no
-    // commands for that side's arm or gripper and both targets track the measured
-    // pose, so enabling never steps the robot. The arm and gripper share the
+    // commands for that side's arm or gripper. The arm and gripper share the
     // deadman because the operator enables a whole side at once.
     pub enabled: BySide<bool>,
     // Operator controls for the backbone's self-collision governor, streamed to the
@@ -236,10 +229,11 @@ pub struct UiState {
     pub d_safe: f64,
     pub max_ee_velocity_m_s: f64,
     pub max_gripper_rate_frac_s: f64,
-    // Joint-slider jog feel, a node parameter so a deployment tunes the ramp without a
-    // rebuild: the acceleration the streamed target ramps toward the slider under (the
-    // whole jog is acceleration-limited). The backbone still governs the final ramp.
+    // Joint-slider jog feel, node parameters so a deployment tunes the ramp without a
+    // rebuild: the acceleration the streamed target ramps toward the slider under, and the
+    // speed it is held at or under. The backbone still governs the final ramp.
     pub joint_jog_acceleration_rad_s2: f64,
+    pub joint_jog_velocity_rad_s: f64,
     // The launch governor-enable state, restored on operator disconnect so an
     // operator who turned avoidance off cannot leave the backbone latched ungoverned,
     // while a deployment that launched ungoverned is not force-armed either.
@@ -457,6 +451,7 @@ impl UiState {
         max_ee_velocity_m_s: f64,
         max_gripper_rate_frac_s: f64,
         joint_jog_acceleration_rad_s2: f64,
+        joint_jog_velocity_rad_s: f64,
     ) -> Self {
         Self {
             arms: BySide::splat(ArmTarget::home()),
@@ -470,6 +465,7 @@ impl UiState {
             max_ee_velocity_m_s,
             max_gripper_rate_frac_s,
             joint_jog_acceleration_rad_s2,
+            joint_jog_velocity_rad_s,
             proximity: None,
             recorder: RecorderState::unavailable(),
             health: BySide::splat(None),

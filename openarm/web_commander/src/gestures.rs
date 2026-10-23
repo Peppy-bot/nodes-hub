@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use control_core::minimum_jerk::{self, QUINTIC_PEAK_VELOCITY};
+use control_core::minimum_jerk::{QUINTIC_PEAK_VELOCITY, blend};
 use srs_model::nalgebra::{Quaternion, UnitQuaternion};
 
 use crate::pose::ArmModels;
@@ -173,12 +173,6 @@ impl Registry {
 /// gesture drives it, the gripper opening.
 pub type GestureSamples = BySide<Option<([f64; ARM_DOF], Option<f64>)>>;
 
-/// The shared quintic profile held at its endpoints: playback evaluates past
-/// the end of a segment, where the pose is the one the segment finished on.
-pub fn quintic_blend(tau: f64) -> f64 {
-    minimum_jerk::quintic(tau.clamp(0.0, 1.0)).0
-}
-
 /// Size the lead-in blend so the fastest joint peaks at
 /// [`LEAD_IN_SPEED_FRACTION`] of its velocity budget, within the comfort band.
 pub fn lead_in_duration(
@@ -219,7 +213,7 @@ pub fn advance_gesture_step(
                     sample_all(&pb.gesture, 0.0),
                 );
             }
-            let s = quintic_blend(t / duration_s);
+            let s = blend(t / duration_s);
             let mut out = BySide::new(None, None);
             for side in SIDES {
                 let (Some(start), Some(first)) = (from[side], pb.gesture.first_joints(side)) else {
@@ -332,7 +326,7 @@ fn append_ready_coda(models: &ArmModels, tracks: &mut BySide<Option<BakedTrack>>
         };
         let from = *track.joints.last().expect("baked tracks are never empty");
         for k in 1..n {
-            let blend = quintic_blend(at(k) / coda_s);
+            let blend = blend(at(k) / coda_s);
             track.joints.push(std::array::from_fn(|j| {
                 lerp(from[j], READY[side][j], blend)
             }));
@@ -505,7 +499,7 @@ fn bake_cartesian(
     let mut prev = READY[side];
     let joints: Vec<[f64; ARM_DOF]> = (0..n)
         .map(|k| {
-            let off = curve(quintic_blend(at(k) / def.duration_s));
+            let off = curve(blend(at(k) / def.duration_s));
             let p = [
                 anchor_pos[0] + off[0],
                 anchor_pos[1] + off[1],
@@ -836,10 +830,10 @@ mod tests {
     fn the_blend_holds_at_its_endpoints() {
         // The profile itself is control_core's; what this wrapper owns is the
         // hold, since playback evaluates past the end of a segment.
-        assert_eq!(quintic_blend(0.0), 0.0);
-        assert_eq!(quintic_blend(1.0), 1.0);
-        assert_eq!(quintic_blend(-5.0), 0.0);
-        assert_eq!(quintic_blend(5.0), 1.0);
+        assert_eq!(blend(0.0), 0.0);
+        assert_eq!(blend(1.0), 1.0);
+        assert_eq!(blend(-5.0), 0.0);
+        assert_eq!(blend(5.0), 1.0);
     }
 
     #[test]

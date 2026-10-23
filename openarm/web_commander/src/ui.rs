@@ -25,7 +25,7 @@ use tracing::warn;
 
 use crate::gestures::Registry;
 use crate::owner::UiMsg;
-use crate::pose::{ArmModels, JogMode, Pose};
+use crate::pose::{ArmModels, Pose};
 use crate::state::{
     ARM_DOF, Alert, ArmTarget, Disposition, GesturePhase, GripperTarget, HealthLevel, HealthReport,
     Proximity, Side, UiState,
@@ -258,8 +258,12 @@ async fn ws_handle(mut socket: WebSocket, app: AppState) {
                 Some(Ok(Message::Text(text))) => match serde_json::from_str::<Command>(text.as_str()) {
                     Ok(cmd) => { let _ = app.command_tx.send(UiMsg::Command(cmd)).await; }
                     // Payload withheld: it carries operator free text (task
-                    // names) and arbitrary bytes from the wire.
-                    Err(e) => warn!(error = %e, payload_bytes = text.len(), "ws: bad command"),
+                    // names) and arbitrary bytes from the wire. The status line
+                    // says the command was not read.
+                    Err(e) => {
+                        warn!(error = %e, payload_bytes = text.len(), "ws: bad command");
+                        let _ = app.command_tx.send(UiMsg::Unreadable(e.to_string())).await;
+                    }
                 },
                 Some(Ok(Message::Close(_))) | None => break,
                 Some(Err(e)) => { warn!(error = %e, "ws: recv"); break; }
@@ -288,20 +292,37 @@ pub(crate) fn clamp_to_limits(joints: &mut [f64; ARM_DOF], side: Side) {
     }
 }
 
-// Clamp a requested move duration to a sane range (finite, 0..=30 s). 0 = fastest.
+/// The longest duration a limb_motion goal may request: the contract's bound,
+/// which the backbone refuses past.
+const MAX_MOVE_DURATION_S: f64 = 60.0;
+
+// Clamp a requested move duration into the contract's range (finite, 0..=60 s).
+// 0 = fastest.
 pub(crate) fn sane_duration(duration_s: f64) -> f64 {
     if duration_s.is_finite() {
-        duration_s.clamp(0.0, 30.0)
+        duration_s.clamp(0.0, MAX_MOVE_DURATION_S)
     } else {
         0.0
     }
 }
 
 // A discrete move's duration: the operator's request, floored so the straight-line
-// EE speed never exceeds the governor cap (time >= distance / cap). The backbone floors
-// again at its joint-velocity limit, so this only ever slows a move, never speeds it.
-pub(crate) fn ee_speed_floored(user_s: f64, ee_distance_m: f64, max_ee_velocity_m_s: f64) -> f64 {
-    (ee_distance_m / max_ee_velocity_m_s).max(user_s)
+// EE speed never exceeds the governor cap (time >= distance / cap), or the refusal
+// of a move that needs longer than the contract's bound at that cap. The backbone
+// floors again at its joint-velocity limit, so this only ever slows a move.
+pub(crate) fn ee_speed_floored(
+    user_s: f64,
+    ee_distance_m: f64,
+    max_ee_velocity_m_s: f64,
+) -> Result<f64, String> {
+    let floored = (ee_distance_m / max_ee_velocity_m_s).max(user_s);
+    if floored > MAX_MOVE_DURATION_S {
+        return Err(format!(
+            "this move needs {floored:.0} s at the {max_ee_velocity_m_s} m/s speed cap, past the \
+             {MAX_MOVE_DURATION_S:.0} s a move may take: raise the cap or move in steps"
+        ));
+    }
+    Ok(floored)
 }
 
 /// Serialize the browser snapshot from the owner's state; called on the owner's
@@ -479,10 +500,6 @@ struct ArmView {
     // so orientation never round-trips through euler on the wire.
     orientation: [f64; 4],
     orientation_feedback: Option<[f64; 4]>,
-    // Arm angle psi (elbow swivel, rad) of the target and the measured pose; `null` at
-    // the straight-arm singularity (kept off by the elbow floor). Drives the elbow slider.
-    arm_angle: Option<f64>,
-    arm_angle_feedback: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -772,8 +789,6 @@ fn arm_view(a: &ArmTarget, side: Side, models: &ArmModels) -> ArmView {
         pose_feedback: a.last_feedback.map(|fb| models.ee_pose_world(side, &fb)),
         orientation: models.ee_quat_world(side, &a.joints),
         orientation_feedback: a.last_feedback.map(|fb| models.ee_quat_world(side, &fb)),
-        arm_angle: models.arm_angle(side, &a.joints),
-        arm_angle_feedback: a.last_feedback.and_then(|fb| models.arm_angle(side, &fb)),
     }
 }
 
@@ -798,30 +813,23 @@ pub(crate) enum Command {
         joints: [f64; ARM_DOF],
         // Requested move duration (s); 0 = fastest safe.
         duration_s: f64,
+        // The settle tolerance (rad, held by every joint) and timeout (s) the
+        // backbone completes the move under.
+        settle_tolerance_rad: f64,
+        settle_timeout_s: f64,
     },
     // Toggle the streaming deadman for one side. While enabled, the command stream
     // emits that side's arm target and gripper opening on its pairing slots;
-    // while disabled both track the measured pose and emit nothing.
+    // while disabled it emits nothing for the side.
     SetEnabled {
         side: SideWire,
         on: bool,
     },
-    // Update an enabled arm's streamed target. Ignored while disabled, where the
-    // target follows the measured pose so enabling never steps the arm.
+    // Update an enabled arm's streamed target: the joint jog ramps the setpoint
+    // toward it. Ignored while disabled.
     SetArmTarget {
         side: SideWire,
         joints: [f64; ARM_DOF],
-    },
-    // Arm a jog: position (metres) + orientation quaternion [x, y, z, w] + arm angle
-    // (elbow swivel, rad), plus which one the jog drives (`mode` = the touched control;
-    // the rest is held). The command stream walks the joint target toward it and holds
-    // at the boundary. Ignored while disabled, like set_arm_target.
-    SetArmPose {
-        side: SideWire,
-        position: [f64; 3],
-        orientation: [f64; 4],
-        arm_angle: f64,
-        mode: JogModeWire,
     },
     // Fire the backbone's planned Cartesian move_arm to a composed world-frame pose
     // (Actions-mode Execute): a governed straight-line move, not a jog. Refused
@@ -832,6 +840,11 @@ pub(crate) enum Command {
         orientation: [f64; 4],
         // Requested move duration (s); 0 = fastest safe.
         duration_s: f64,
+        // The settle tolerances (m, rad) and timeout (s) the backbone completes
+        // the move under.
+        settle_position_tolerance_m: f64,
+        settle_orientation_tolerance_rad: f64,
+        settle_timeout_s: f64,
     },
     // Update an enabled gripper's streamed opening. Ignored while disabled.
     SetGripperTarget {
@@ -850,6 +863,9 @@ pub(crate) enum Command {
     FireGripper {
         side: SideWire,
         position: f64,
+        // The longest (s) the backbone waits after the planned end of the travel
+        // for the jaws to stand still.
+        settle_timeout_s: f64,
     },
     // Set the backbone's self-collision-avoidance toggle (streamed continuously).
     SetCollision {
@@ -897,27 +913,6 @@ impl From<SideWire> for Side {
     }
 }
 
-// Which component a jog drives, as sent by the panel: "position" from the x/y/z
-// sliders, "orientation" from the arcball, or "arm_angle" from the elbow slider.
-#[derive(Deserialize, Copy, Clone)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum JogModeWire {
-    Position,
-    Orientation,
-    #[serde(rename = "arm_angle")]
-    ArmAngle,
-}
-
-impl From<JogModeWire> for JogMode {
-    fn from(m: JogModeWire) -> Self {
-        match m {
-            JogModeWire::Position => JogMode::Position,
-            JogModeWire::Orientation => JogMode::Orientation,
-            JogModeWire::ArmAngle => JogMode::ArmAngle,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -926,6 +921,104 @@ mod tests {
         MotorHealthReading, Validity,
     };
     use peppylib::messaging::ProducerRef;
+
+    /// The value a panel input with `id` is prefilled with.
+    fn prefilled(id: &str) -> f64 {
+        let at = INDEX_HTML
+            .find(&format!("id=\"${{side}}_{id}\" value=\""))
+            .unwrap_or_else(|| panic!("the panel has no {id} input"));
+        let value = &INDEX_HTML[at..]
+            .split('"')
+            .nth(3)
+            .expect("a value attribute");
+        value
+            .parse()
+            .unwrap_or_else(|e| panic!("{id} prefill {value}: {e}"))
+    }
+
+    // The backbone refuses a pose goal whose settle tolerance is below the
+    // plan tolerance of its axis, so the panel's prefilled settle must cover
+    // the plan tolerances it sends.
+    #[test]
+    fn the_prefilled_pose_settle_covers_the_plan_tolerances_the_panel_sends() {
+        use crate::pose::{PLAN_ANGLE_TOL_RAD, PLAN_POS_TOL_M};
+        assert!(prefilled("settle_pos") >= PLAN_POS_TOL_M);
+        assert!(prefilled("settle_rot") >= PLAN_ANGLE_TOL_RAD);
+        assert!(prefilled("settle_joints") > 0.0);
+    }
+
+    /// Every key of each object literal the page sends with `cmd: '<cmd>',`,
+    /// in order: the shorthand keys and the `key:` keys alike. Each literal
+    /// ends where its `ws.send(JSON.stringify({...}))` closes.
+    fn page_payload_keys(cmd: &str) -> Vec<Vec<String>> {
+        let marker = format!("cmd: '{cmd}',");
+        INDEX_HTML
+            .match_indices(&marker)
+            .map(|(at, _)| {
+                let end = INDEX_HTML[at..].find("}))").expect("the send closes");
+                let literal = &INDEX_HTML[at..at + end];
+                literal
+                    .split(',')
+                    .map(|entry| entry.split(':').next().expect("a key").trim().to_string())
+                    .filter(|key| !key.is_empty())
+                    .collect()
+            })
+            .collect()
+    }
+
+    // Every move command the page sends carries every field the server reads:
+    // each literal, filled with a value of the right shape per key, parses as a
+    // Command. A send site that leaves a field out is dropped unread.
+    #[test]
+    fn every_move_command_the_page_sends_parses_as_a_command() {
+        for (cmd, shaped) in [
+            (
+                "fire_arm",
+                vec![("joints", serde_json::json!(vec![0.0; ARM_DOF]))],
+            ),
+            (
+                "fire_arm_pose",
+                vec![
+                    ("position", serde_json::json!([0.4, 0.1, 0.8])),
+                    ("orientation", serde_json::json!([0.0, 0.0, 0.0, 1.0])),
+                ],
+            ),
+            ("fire_gripper", vec![("position", serde_json::json!(0.5))]),
+        ] {
+            let sites = page_payload_keys(cmd);
+            assert_eq!(sites.len(), 1, "the page sends {cmd} from one place");
+            let payload: serde_json::Map<String, serde_json::Value> = sites[0]
+                .iter()
+                .map(|key| {
+                    let value = match key.as_str() {
+                        "cmd" => serde_json::json!(cmd),
+                        "side" => serde_json::json!("left"),
+                        other => shaped
+                            .iter()
+                            .find(|(name, _)| *name == other)
+                            .map_or(serde_json::json!(1.0), |(_, v)| v.clone()),
+                    };
+                    (key.clone(), value)
+                })
+                .collect();
+            serde_json::from_value::<Command>(serde_json::Value::Object(payload.clone()))
+                .unwrap_or_else(|e| panic!("the page's {cmd} {payload:?} does not parse: {e}"));
+        }
+    }
+
+    #[test]
+    fn a_move_too_slow_for_the_contract_bound_is_refused() {
+        assert_eq!(
+            ee_speed_floored(2.0, 0.8, 0.01),
+            Err(
+                "this move needs 80 s at the 0.01 m/s speed cap, past the 60 s a move may \
+                 take: raise the cap or move in steps"
+                    .to_string()
+            )
+        );
+        assert_eq!(sane_duration(61.0), MAX_MOVE_DURATION_S);
+        assert_eq!(ee_speed_floored(2.0, 0.1, 0.25), Ok(2.0));
+    }
 
     // A panel that has not answered within this is not going to.
     const REPLY_BUDGET: Duration = Duration::from_secs(5);
@@ -940,7 +1033,7 @@ mod tests {
     }
 
     fn ui_state() -> UiState {
-        UiState::new(true, 0.005, 0.02, 0.25, 6.0, 10.0)
+        UiState::new(true, 0.005, 0.02, 0.25, 6.0, 10.0, 1.0)
     }
 
     /// A state with health producers bound, as every wired deployment has.

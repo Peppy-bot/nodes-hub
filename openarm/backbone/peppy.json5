@@ -121,7 +121,10 @@
           name: "move_arm_joints",
           refine: {
             goal_service: {
-              request_message_format: { joint_positions: { $length: 7 } },
+              request_message_format: {
+                joint_positions: { $length: 7 },
+                settle_tolerances_rad: { $length: 7 },
+              },
             },
             result_service: {
               response_message_format: { final_joint_positions: { $length: 7 } },
@@ -252,7 +255,7 @@
       d_safe_m: "f64",
       // Governor state at launch, before the first governor_control message.
       collision_governor_enabled: "bool",
-      // Per-joint peak velocity (rad/s) sizing the quintic trajectories and the
+      // Per-joint peak velocity (rad/s) sizing the planned trajectories and the
       // stream chase. URDF joint velocity limits, identical for both hardware
       // generations (the v2 URDF states the same values at lower precision); the
       // backbone is the sole owner of motion sizing.
@@ -263,6 +266,18 @@
       max_joint_velocity_rad_s_5: { $type: "f64", $default: 20.943946 },
       max_joint_velocity_rad_s_6: { $type: "f64", $default: 20.943946 },
       max_joint_velocity_rad_s_7: { $type: "f64", $default: 20.943946 },
+      // Per-joint peak acceleration (rad/s²) every planned arm move is timed
+      // within and a streamed pose brakes into a joint limit at: the
+      // max_acceleration of the OpenArm MoveIt configuration (enactic
+      // openarm_ros2, joint_limits.yaml), identical for both hardware
+      // generations.
+      max_joint_acceleration_rad_s2_1: { $type: "f64", $default: 5.0 },
+      max_joint_acceleration_rad_s2_2: { $type: "f64", $default: 5.0 },
+      max_joint_acceleration_rad_s2_3: { $type: "f64", $default: 5.0 },
+      max_joint_acceleration_rad_s2_4: { $type: "f64", $default: 5.0 },
+      max_joint_acceleration_rad_s2_5: { $type: "f64", $default: 5.0 },
+      max_joint_acceleration_rad_s2_6: { $type: "f64", $default: 5.0 },
+      max_joint_acceleration_rad_s2_7: { $type: "f64", $default: 5.0 },
       // End-effector angular-speed cap (rad/s) for streamed poses and the
       // servo reference. Require > 0. An operational governor cap like
       // max_ee_velocity_m_s, so the launcher decides it (0.8 is MoveIt

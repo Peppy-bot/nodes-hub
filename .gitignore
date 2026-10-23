@@ -16,6 +16,9 @@ sim_mujoco/engine/assets/head_camera/
 *.bak
 *.orig
 
+# Failing examples Hegel property tests keep for replay (per crate).
+.hegel/
+
 # Python
 __pycache__/
 *.py[cod]

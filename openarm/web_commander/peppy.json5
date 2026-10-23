@@ -3,9 +3,9 @@
 // an operating-system port otherwise) that streams arm and gripper setpoints
 // to the backbone over the joint_link / gripper_link
 // pairings (the backbone governs and re-streams them), reads live state by
-// observing the backbone's downstream pairings, jogs the arm in joint or
-// Cartesian (world-frame IK) space, and fires move_arm_joints / move_arm /
-// move_gripper goals through the limb_motion contract slot (the backbone).
+// observing the backbone's downstream pairings, jogs the arm in joint space,
+// and fires move_arm_joints / move_arm / move_gripper goals through the
+// limb_motion contract slot (the backbone).
 {
   peppy_schema: "node/v1",
   manifest: {
@@ -79,7 +79,10 @@
           name: "move_arm_joints",
           refine: {
             goal_service: {
-              request_message_format: { joint_positions: { $length: 7 } },
+              request_message_format: {
+                joint_positions: { $length: 7 },
+                settle_tolerances_rad: { $length: 7 },
+              },
             },
             result_service: {
               response_message_format: { final_joint_positions: { $length: 7 } },
@@ -161,11 +164,12 @@
       // gripper's own speed_rad_s is the other limit and the lower of the two wins.
       max_gripper_rate_frac_s: { $type: "f64", $default: 6.0 },
       // Joint-slider jog feel: the acceleration (rad/s^2) the streamed target ramps toward
-      // the slider under. The whole jog is acceleration-limited (ramp up, brake to rest),
-      // so this alone sets the smoothness. A node parameter so it can be tuned per
-      // deployment without a rebuild; the backbone still governs the final motion. Lower is
-      // gentler.
+      // the slider under, and the speed (rad/s) it is held at or under on the way. Node
+      // parameters so they can be tuned per deployment without a rebuild; the backbone
+      // still governs the final motion. Lower is gentler. At 1 rad/s a quarter turn of a
+      // slider arrives in about 1.7 s.
       joint_jog_acceleration_rad_s2: { $type: "f64", $default: 10.0 },
+      joint_jog_velocity_rad_s: { $type: "f64", $default: 1.0 },
       // Launch state for the rest of the governor controls the commander streams live
       // on governor_control, set per deployment in step with openarm_backbone. The
       // band requires 0 < d_stop < d_safe.

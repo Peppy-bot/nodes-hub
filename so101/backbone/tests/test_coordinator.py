@@ -1,3 +1,4 @@
+import math
 import time
 
 import pytest
@@ -5,11 +6,15 @@ from conftest import MEASURED, WIDE_LIMITS, WIDE_REACH, gripper_step, make_confi
 from control_core_py.minimum_jerk import plan
 
 from so101_backbone.coordinator import (
-    GRIPPER_STILL_FRAC,
+    GRIPPER_STILL_BAND,
     GRIPPER_STILL_WINDOW_S,
+    STALE_FOLLOWER_REFUSAL,
     STALE_FOLLOWER_TIMEOUT_S,
     Coordinator,
-    GripperSettle,
+    PostureEnd,
+    StillRun,
+    JointSettle,
+    PoseSettle,
 )
 from so101_backbone.params import UpstreamMode
 
@@ -18,6 +23,14 @@ FAR_TARGET = (1.0, 1.1, 1.2, 1.3, 1.4)
 
 def make_coordinator(fake_kinematics, reach=WIDE_REACH, **config_overrides):
     return Coordinator(make_config(**config_overrides), fake_kinematics, WIDE_LIMITS, reach)
+
+
+def adopt_gripper(c, target, settle_timeout_s=5.0):
+    """Adopt a gripper plan to `target` on `c` which waits up to
+    `settle_timeout_s` past the planned end of its ramp for the jaws to stand
+    still. Under the transparent rate the tests run at the first sample lands
+    the command on the target, and the next tick is the planned end."""
+    return c.adopt_gripper_plan(target, settle_timeout_s, c.gripper_anchor())
 
 
 def test_silence_publishes_nothing(fake_kinematics):
@@ -60,7 +73,7 @@ def test_plan_owns_the_arm_and_drops_mid_plan_stream_input(fake_kinematics):
     c = make_coordinator(fake_kinematics)
     c.measured_joints.set(MEASURED)
     assert c.try_claim_arm()
-    adopted = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 0.05, (100.0,) * 5))
+    adopted = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 0.05, (100.0,) * 5), PostureEnd(""))
 
     c.leader_joints.set((9.0,) * 5)  # streamed input during the plan
     start = time.monotonic()
@@ -85,7 +98,7 @@ def test_abort_freezes_where_the_trajectory_stands(fake_kinematics):
     c = make_coordinator(fake_kinematics)
     c.measured_joints.set(MEASURED)
     assert c.try_claim_arm()
-    adopted = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 10.0, (100.0,) * 5))
+    adopted = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 10.0, (100.0,) * 5), PostureEnd(""))
     # Run the trajectory well past its start before cutting it, so freezing
     # where it stands is distinguishable from reporting where it began.
     start = time.monotonic()
@@ -123,150 +136,211 @@ def test_busy_slots_are_single_flight_and_independent(fake_kinematics):
     assert c.try_claim_gripper()
 
 
-def test_gripper_plan_ramps_then_settles_and_completes(fake_kinematics, follower_never_stale):
+def test_gripper_plan_ramps_then_completes_once_the_jaws_stand_still(
+    fake_kinematics, follower_never_stale
+):
     c = make_coordinator(fake_kinematics, max_gripper_rate_frac_s=2.0)
     c.measured_gripper.set(0.0)
     assert c.try_claim_gripper()
-    adopted = c.adopt_gripper_plan(1.0, timeout_s=5.0)
-    # A follower that tracks every command: 2.0/s at 100 Hz is 0.02 per
-    # tick, so the ramp to 1.0 takes about 50 ticks.
+    # The ramp from 0 to 1 at 2.0/s lands at 0.5 s; the tick after is the
+    # planned end.
+    adopted = adopt_gripper(c, 1.0)
+    # A follower that tracks every command a tick late: 2.0/s at 100 Hz is
+    # 0.02 per tick, so the ramp to 1.0 takes 50 ticks, and the plan runs
+    # through the 49 before the planned end.
     last = 0.0
-    ticks = 0
-    while last != 1.0:
-        value = gripper_step(c, last, ticks * 0.01)
+    for tick in range(49):
+        value = gripper_step(c, last, tick * 0.01)
         assert 0.0 < value - last <= 0.02 + 1e-12
         last = value
-        ticks += 1
-        assert ticks <= 51
         assert not adopted.done.is_set()
-    # The target sample is out and the follower stands on it: the plan keeps
-    # commanding the target through the still window.
-    assert gripper_step(c, 1.0, 1.0) == 1.0
-    assert gripper_step(c, 1.0, 1.0 + GRIPPER_STILL_WINDOW_S / 2) == 1.0
+    # The command lands with the jaws at 0.98; the next tick finds it on the
+    # target, the planned end, with the jaws at 1.0, and they stand still
+    # there a window later.
+    assert gripper_step(c, last, 0.5) == 1.0
+    assert gripper_step(c, 1.0, 0.625) == 1.0
     assert not adopted.done.is_set()
-    assert gripper_step(c, 1.0, 1.0 + GRIPPER_STILL_WINDOW_S) is None
+    assert gripper_step(c, 1.0, 0.875) == 1.0
     assert adopted.done.is_set()
     assert adopted.failed is None
-    assert adopted.settled == 1.0
+    assert adopted.completed_on == 1.0
+    assert adopted.still_moving_after_s is None
     c.release_gripper()
 
 
-def test_gripper_plan_is_not_done_while_the_measured_opening_still_changes(
-    fake_kinematics, follower_never_stale
-):
+def test_a_gripper_plan_owns_the_gripper_through_its_travel(fake_kinematics, follower_never_stale):
     # Transparent rate: the first sample out is the target itself, while the
-    # jaws have not moved yet.
+    # jaws have not moved yet; the next tick is the planned end.
     c = make_coordinator(fake_kinematics)
     c.measured_gripper.set(1.0)
     assert c.try_claim_gripper()
-    adopted = c.adopt_gripper_plan(0.5, timeout_s=5.0)
+    adopted = adopt_gripper(c, 0.5)
     assert gripper_step(c, 1.0, 0.0) == 0.5
     assert not adopted.done.is_set(), "a delivered target sample does not end the plan"
-    # The jaws lag: they close 0.05 every 50 ms and arrive at 0.5 s. All the
-    # way the plan keeps the gripper: it commands the target, ignores the
-    # leader stream, and holds the busy slot against a second goal.
-    for tick in range(1, 11):
+    # The jaws lag: they close 0.05 every 50 ms. All the way the plan keeps
+    # the gripper: it commands the target, ignores the leader stream, and
+    # holds the busy slot against a second goal.
+    for tick in range(1, 10):
         c.leader_gripper.set(1.0)
         assert gripper_step(c, 1.0 - 0.05 * tick, 0.05 * tick) == 0.5
         assert not adopted.done.is_set()
         assert not c.try_claim_gripper()
-    # On the target, but not for the whole window yet.
-    assert gripper_step(c, 0.5, 0.5 + GRIPPER_STILL_WINDOW_S / 2) == 0.5
+    # The jaws stand at 0.52 from 0.5 s on: a still window later the plan
+    # completes on the delivery of that tick's target.
+    assert gripper_step(c, 0.52, 0.5) == 0.5
     assert not adopted.done.is_set()
-    # Still for the window: the plan ends, and that tick publishes nothing.
-    assert gripper_step(c, 0.5, 0.5 + GRIPPER_STILL_WINDOW_S) is None
+    assert gripper_step(c, 0.52, 0.75) == 0.5
     assert adopted.done.is_set()
     assert adopted.failed is None
-    assert adopted.settled == 0.5
+    assert adopted.completed_on == 0.52
     # Until the action layer releases the slot the wire stays silent.
     assert gripper_step(c, 0.5, 1.0) is None
     assert not c.try_claim_gripper()
     c.release_gripper()
 
 
-def test_gripper_held_short_of_the_target_ends_the_plan_where_it_stands(
+def test_a_delivery_farther_than_the_still_band_restarts_the_window(
     fake_kinematics, follower_never_stale
 ):
-    # An object stops the jaws at 0.8 on the way to 0.5.
     c = make_coordinator(fake_kinematics)
     c.measured_gripper.set(1.0)
     assert c.try_claim_gripper()
-    adopted = c.adopt_gripper_plan(0.5, timeout_s=5.0)
-    assert gripper_step(c, 1.0, 0.0) == 0.5
-    assert gripper_step(c, 0.8, 0.5) == 0.5
-    assert gripper_step(c, 0.8, 0.5 + GRIPPER_STILL_WINDOW_S) is None
+    adopted = adopt_gripper(c, 0.5)
+    # The command lands on the first tick; the jaws stand at 0.6.
+    assert gripper_step(c, 0.6, 0.0) == 0.5
+    # The next tick is the planned end, where the run starts with the jaws
+    # 0.015 closer, farther than the band from where they stood: a delivery
+    # a window after the start does not complete the plan.
+    moved = 0.6 - GRIPPER_STILL_BAND * 1.5
+    assert gripper_step(c, moved, 0.125) == 0.5
+    assert gripper_step(c, moved, 0.25) == 0.5
+    assert not adopted.done.is_set()
+    # A window after the planned end they still stand there: the plan completes.
+    assert gripper_step(c, moved, 0.375) == 0.5
     assert adopted.done.is_set()
-    assert adopted.failed is None
-    assert adopted.settled == 0.8
+    assert adopted.completed_on == moved
     c.release_gripper()
 
 
-def test_gripper_plan_with_no_travel_still_waits_out_the_window(
+def test_a_cached_opening_never_counts_as_still(fake_kinematics, follower_never_stale):
+    c = make_coordinator(fake_kinematics)
+    c.measured_gripper.set(1.0)
+    assert c.try_claim_gripper()
+    adopted = adopt_gripper(c, 0.5)
+    assert gripper_step(c, 0.6, 0.0) == 0.5
+    # The planned end, where the run starts on the delivered 0.6.
+    assert gripper_step(c, 0.6, 0.25) == 0.5
+    # No delivery since: the cached 0.6 stands on the holder, fresh enough
+    # to drive the gripper, and is no evidence that the jaws stopped,
+    # however long past the window.
+    for now in (0.5, 0.75, 1.0):
+        assert c.gripper_tick(now) == 0.5
+        c.gripper_published(True, 0.5)
+        assert not adopted.done.is_set()
+    # A fresh delivery within the band completes the plan.
+    assert gripper_step(c, 0.6, 1.25) == 0.5
+    assert adopted.done.is_set()
+    c.release_gripper()
+
+
+def test_the_settle_timeout_completes_a_plan_whose_jaws_keep_moving(
+    fake_kinematics, follower_never_stale
+):
+    c = make_coordinator(fake_kinematics)
+    c.measured_gripper.set(1.0)
+    assert c.try_claim_gripper()
+    adopted = adopt_gripper(c, 0.5, settle_timeout_s=1.0)
+    for now, opening in ((0.0, 1.0), (0.5, 0.9), (0.75, 0.8), (1.0, 0.7), (1.25, 0.6)):
+        assert gripper_step(c, opening, now) == 0.5
+        assert not adopted.done.is_set()
+    assert gripper_step(c, 0.55, 1.5) == 0.5
+    assert adopted.done.is_set()
+    assert adopted.failed is None
+    assert adopted.completed_on == 0.55
+    assert adopted.still_moving_after_s == 1.0
+    c.release_gripper()
+
+
+def test_a_gripper_an_item_holds_short_of_the_target_completes_where_the_jaws_stopped(
+    fake_kinematics, follower_never_stale
+):
+    # An item stops the jaws at 0.8 on the way to 0.5: they stand still
+    # there, the plan completes, and the opening the item holds them at is
+    # what the result reads.
+    c = make_coordinator(fake_kinematics)
+    c.measured_gripper.set(1.0)
+    assert c.try_claim_gripper()
+    adopted = adopt_gripper(c, 0.5)
+    assert gripper_step(c, 1.0, 0.0) == 0.5
+    assert gripper_step(c, 0.8, 0.25) == 0.5
+    assert not adopted.done.is_set()
+    assert gripper_step(c, 0.8, 0.5) == 0.5
+    assert adopted.done.is_set()
+    assert adopted.failed is None
+    assert adopted.completed_on == 0.8
+    c.release_gripper()
+
+
+def test_gripper_plan_with_no_travel_completes_once_the_jaws_stand_still(
     fake_kinematics, follower_never_stale
 ):
     # The goal names the opening the gripper already holds.
     c = make_coordinator(fake_kinematics)
     c.measured_gripper.set(0.5)
     assert c.try_claim_gripper()
-    adopted = c.adopt_gripper_plan(0.5, timeout_s=5.0)
-    # The first tick delivers the target sample; the settle, and with it the
-    # window, begins on the tick after.
+    adopted = adopt_gripper(c, 0.5)
+    # The first tick is the planned end and takes the reference; a delivery
+    # a window later completes the plan once that tick's sample is
+    # delivered.
     assert gripper_step(c, 0.5, 0.0) == 0.5
-    assert gripper_step(c, 0.5, 0.5) == 0.5
-    assert gripper_step(c, 0.5, 0.5 + GRIPPER_STILL_WINDOW_S / 2) == 0.5
-    assert not adopted.done.is_set()
-    assert gripper_step(c, 0.5, 0.5 + GRIPPER_STILL_WINDOW_S) is None
-    assert adopted.done.is_set()
-    assert adopted.settled == 0.5
-    c.release_gripper()
-
-
-def test_a_change_larger_than_the_still_band_restarts_the_window():
-    settle = GripperSettle(began=0.0, reference=0.8, reference_at=0.0)
-    moved = 0.8 - GRIPPER_STILL_FRAC * 1.5
-    restart = GRIPPER_STILL_WINDOW_S / 2
-    assert not settle.stands_still(moved, restart)
-    # A full window after the settle began, but not after the restart.
-    assert not settle.stands_still(moved, GRIPPER_STILL_WINDOW_S)
-    assert settle.stands_still(moved, restart + GRIPPER_STILL_WINDOW_S)
-
-
-def test_a_change_smaller_than_the_still_band_keeps_the_window_running():
-    settle = GripperSettle(began=0.0, reference=0.8, reference_at=0.0)
-    jittered = 0.8 - GRIPPER_STILL_FRAC * 0.5
-    assert not settle.stands_still(jittered, GRIPPER_STILL_WINDOW_S / 2)
-    assert settle.stands_still(jittered, GRIPPER_STILL_WINDOW_S)
-
-
-def test_follower_silence_fails_a_settling_gripper_plan(fake_kinematics, follower_never_stale):
-    # A frozen last opening must not pass for a gripper standing still.
-    c = make_coordinator(fake_kinematics)
-    c.measured_gripper.set(1.0)
-    assert c.try_claim_gripper()
-    adopted = c.adopt_gripper_plan(0.5, timeout_s=5.0)
-    assert gripper_step(c, 1.0, 0.0) == 0.5
-    assert gripper_step(c, 0.5, 0.5) == 0.5
-    c.measured_gripper.clear()  # no measured opening left to judge
-    assert c.gripper_tick(0.5 + GRIPPER_STILL_WINDOW_S) is None
-    assert adopted.done.is_set()
-    assert "went stale mid-goal" in adopted.failed
-    assert adopted.settled is None
-    c.release_gripper()
-
-
-def test_publish_failure_fails_a_settling_gripper_plan(fake_kinematics, follower_never_stale):
-    c = make_coordinator(fake_kinematics)
-    c.measured_gripper.set(1.0)
-    assert c.try_claim_gripper()
-    adopted = c.adopt_gripper_plan(0.5, timeout_s=5.0)
-    assert gripper_step(c, 1.0, 0.0) == 0.5
-    assert gripper_step(c, 0.5, 0.5) == 0.5
     c.measured_gripper.set(0.5)
-    assert c.gripper_tick(0.5 + GRIPPER_STILL_WINDOW_S / 2) == 0.5
+    assert c.gripper_tick(GRIPPER_STILL_WINDOW_S) == 0.5
+    assert not adopted.done.is_set(), "completion waits for delivery"
+    c.gripper_published(True, 0.5)
+    assert adopted.done.is_set()
+    assert adopted.completed_on == 0.5
+    c.release_gripper()
+
+
+def test_a_run_holds_openings_within_the_band_of_one_another():
+    run = StillRun.starting(0.8, 0.0)
+    jittered = run.extended(0.8 - GRIPPER_STILL_BAND * 0.5, 0.1)
+    assert (jittered.low, jittered.high, jittered.since) == (0.8 - GRIPPER_STILL_BAND * 0.5, 0.8, 0.0)
+    # An opening within the band of the first but not of the lowest starts
+    # a new run: the jaws moved more than the band in all.
+    spread = jittered.extended(0.8 + GRIPPER_STILL_BAND * 0.6, 0.2)
+    assert (spread.low, spread.high, spread.since) == (0.8 + GRIPPER_STILL_BAND * 0.6,) * 2 + (0.2,)
+
+
+def test_follower_silence_fails_a_gripper_plan_in_flight(fake_kinematics, follower_never_stale):
+    # A frozen last opening must not pass for a measured one.
+    c = make_coordinator(fake_kinematics)
+    c.measured_gripper.set(1.0)
+    assert c.try_claim_gripper()
+    adopted = adopt_gripper(c, 0.5)
+    assert gripper_step(c, 1.0, 0.0) == 0.5
+    assert gripper_step(c, 0.6, 0.5) == 0.5
+    c.measured_gripper.clear()  # no measured opening left to report
+    assert c.gripper_tick(1.0) is None
+    assert adopted.done.is_set()
+    assert adopted.failed == STALE_FOLLOWER_REFUSAL
+    assert adopted.completed_on is None
+    c.release_gripper()
+
+
+def test_publish_failure_fails_a_gripper_plan_in_flight(fake_kinematics, follower_never_stale):
+    c = make_coordinator(fake_kinematics)
+    c.measured_gripper.set(1.0)
+    assert c.try_claim_gripper()
+    adopted = adopt_gripper(c, 0.5)
+    assert gripper_step(c, 1.0, 0.0) == 0.5
+    assert gripper_step(c, 0.6, 0.5) == 0.5
+    c.measured_gripper.set(0.6)
+    assert c.gripper_tick(0.6) == 0.5
     c.gripper_published(False, None)
     assert adopted.done.is_set()
     assert "publish failed" in adopted.failed
-    assert adopted.settled is None
+    assert adopted.completed_on is None
     c.release_gripper()
 
 
@@ -342,7 +416,7 @@ def test_release_resets_anchors_to_measured(fake_kinematics):
     c = make_coordinator(fake_kinematics)
     c.measured_joints.set(MEASURED)
     assert c.try_claim_arm()
-    adopted = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 0.01, (100.0,) * 5))
+    adopted = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 0.01, (100.0,) * 5), PostureEnd(""))
     start = time.monotonic()
     while not adopted.done.is_set():
         c.measured_joints.set(MEASURED)  # the live follower keeps streaming
@@ -382,7 +456,7 @@ def test_follower_staleness_fails_an_active_arm_plan(fake_kinematics):
     c = make_coordinator(fake_kinematics)
     c.measured_joints.set(MEASURED)
     assert c.try_claim_arm()
-    adopted = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 10.0, (100.0,) * 5))
+    adopted = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 10.0, (100.0,) * 5), PostureEnd(""))
     assert c.arm_tick(time.monotonic()) is not None
     time.sleep(STALE_FOLLOWER_TIMEOUT_S * 1.5)
     assert c.arm_tick(time.monotonic()) is None
@@ -396,7 +470,7 @@ def test_follower_staleness_fails_an_active_gripper_plan(fake_kinematics):
     c = make_coordinator(fake_kinematics, max_gripper_rate_frac_s=2.0)
     c.measured_gripper.set(0.0)
     assert c.try_claim_gripper()
-    adopted = c.adopt_gripper_plan(1.0, timeout_s=5.0)
+    adopted = adopt_gripper(c, 1.0)
     assert c.gripper_tick(time.monotonic()) is not None
     time.sleep(STALE_FOLLOWER_TIMEOUT_S * 1.5)
     assert c.gripper_tick(time.monotonic()) is None
@@ -409,7 +483,7 @@ def test_publish_failure_fails_the_plan_the_setpoint_came_from(fake_kinematics):
     c = make_coordinator(fake_kinematics)
     c.measured_joints.set(MEASURED)
     assert c.try_claim_arm()
-    adopted = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 10.0, (100.0,) * 5))
+    adopted = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 10.0, (100.0,) * 5), PostureEnd(""))
     assert c.arm_tick(time.monotonic()) is not None
     c.arm_published(False, None)
     assert adopted.done.is_set()
@@ -425,7 +499,7 @@ def test_publish_failure_with_no_plan_touches_nothing(fake_kinematics):
     # A failed streamed publish has no goal to fail; the plan installed
     # between the tick and the outcome must be untouched.
     assert c.try_claim_arm()
-    adopted = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 10.0, (100.0,) * 5))
+    adopted = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 10.0, (100.0,) * 5), PostureEnd(""))
     c.arm_published(False, None)
     assert not adopted.done.is_set()
     assert adopted.failed is None
@@ -436,7 +510,7 @@ def test_final_sample_publish_failure_fails_the_goal(fake_kinematics):
     c = make_coordinator(fake_kinematics)
     c.measured_joints.set(MEASURED)
     assert c.try_claim_arm()
-    adopted = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 0.001, (1000.0,) * 5))
+    adopted = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 0.001, (1000.0,) * 5), PostureEnd(""))
     start = time.monotonic()
     target = None
     while target is None:
@@ -457,7 +531,7 @@ def test_gripper_streams_while_an_arm_plan_runs(fake_kinematics):
     c.measured_joints.set(MEASURED)
     c.measured_gripper.set(0.0)
     assert c.try_claim_arm()
-    c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 10.0, (100.0,) * 5))
+    c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 10.0, (100.0,) * 5), PostureEnd(""))
     c.arm_tick(time.monotonic())
     # The operator can still work the gripper during a long arm move.
     c.leader_gripper.set(1.0)
@@ -518,8 +592,8 @@ def test_a_stop_cuts_every_installed_plan_with_its_message_and_names_the_limbs(f
     assert (c.stop_count, c.last_stop) == (1, "stopped: nothing yet")
 
     assert c.try_claim_arm() and c.try_claim_gripper()
-    arm_plan = c.adopt_arm_plan(make_profile(MEASURED, FAR_TARGET, 1.0, (100.0,) * 5))
-    gripper_plan = c.adopt_gripper_plan(1.0, 5.0)
+    arm_plan = c.adopt_arm_plan(make_profile(MEASURED, FAR_TARGET, 1.0, (100.0,) * 5), PostureEnd(""))
+    gripper_plan = adopt_gripper(c, 1.0)
     now = time.monotonic()
     sample = c.arm_tick(now)
     c.arm_published(True, sample)
@@ -542,3 +616,96 @@ def test_a_stop_cuts_every_installed_plan_with_its_message_and_names_the_limbs(f
     assert c.stop_count == 2
     # The goals release the slots, as after a cancel; the stop does not.
     assert c.arm_busy
+
+
+def arm_settle(tolerances_rad=(0.1,) * 5, timeout_s=2.0) -> JointSettle:
+    return JointSettle(tolerances_rad=tolerances_rad, timeout_s=timeout_s)
+
+
+def test_an_arm_plan_keeps_commanding_its_end_sample_until_the_joints_settle(fake_kinematics):
+    c = make_coordinator(fake_kinematics)
+    c.measured_joints.set(MEASURED)
+    assert c.try_claim_arm()
+    adopted = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 1.0, (100.0,) * 5), arm_settle())
+    c.arm_published(True, c.arm_tick(0.0))
+    # At the planned end the follower still measures the start: the end
+    # sample goes out and the plan stays installed.
+    c.measured_joints.set(MEASURED)
+    assert c.arm_tick(1.0) == FAR_TARGET
+    c.arm_published(True, FAR_TARGET)
+    assert not adopted.done.is_set()
+    # Every joint within 0.1 rad: the plan completes on the delivery of this
+    # tick's end sample.
+    c.measured_joints.set(tuple(t - 0.05 for t in FAR_TARGET))
+    assert c.arm_tick(1.5) == FAR_TARGET
+    assert not adopted.done.is_set(), "completion waits for delivery"
+    c.arm_published(True, FAR_TARGET)
+    assert adopted.done.is_set()
+    assert adopted.failed is None
+    c.release_arm()
+
+
+def test_an_arm_plan_outside_its_tolerances_at_the_timeout_fails_naming_the_worst_joint(
+    fake_kinematics,
+):
+    c = make_coordinator(fake_kinematics)
+    c.measured_joints.set(MEASURED)
+    assert c.try_claim_arm()
+    # Joint 3 ends 0.7 rad out against its 0.1 rad; joint 1 ends 0.15 rad
+    # out, within its 0.2 rad.
+    target = (0.15, 0.15, 0.9, 0.35, 0.45)
+    settle = arm_settle(tolerances_rad=(0.2, 0.1, 0.1, 0.1, 0.1), timeout_s=2.0)
+    adopted = c.adopt_arm_plan(plan(MEASURED, target, 1.0, (100.0,) * 5), settle)
+    c.arm_published(True, c.arm_tick(0.0))
+    for now in (1.0, 2.0, 2.9):
+        c.measured_joints.set(MEASURED)
+        assert c.arm_tick(now) == target
+        c.arm_published(True, target)
+        assert not adopted.done.is_set()
+    c.measured_joints.set(MEASURED)
+    assert c.arm_tick(3.0) is None
+    assert adopted.done.is_set()
+    assert adopted.failed == "still 0.700 rad from the target at joint 3, 2.0 s after the planned end"
+    c.release_arm()
+
+
+def test_a_joint_settle_names_the_joint_farthest_outside_its_own_tolerance():
+    settle = arm_settle(tolerances_rad=(0.5, 0.01, 0.1, 0.1, 0.1))
+    measured = (0.0,) * 5
+    # Joint 1 is 0.4 rad out, inside its 0.5 rad. Joint 2 is 0.05 rad out,
+    # 0.04 rad past its bar; joint 3 is 0.12 rad out, 0.02 rad past its bar.
+    target = (0.4, 0.05, 0.12, 0.0, 0.0)
+    assert settle.shortfall(measured, target, None) == (
+        "still 0.050 rad from the target at joint 2"
+    )
+    assert settle.shortfall(target, target, None) is None
+
+
+def test_a_pose_settle_judges_the_measured_grasp_point_against_the_commanded_pose(
+    fake_kinematics,
+):
+    goal_position, _orientation = fake_kinematics.forward_kinematics(fake_kinematics.solution)
+    settle = PoseSettle(
+        position=goal_position,
+        orientation=(0.0, 0.0, 0.0, 1.0),
+        position_tolerance_m=0.01,
+        orientation_tolerance_rad=0.2,
+        timeout_s=2.0,
+    )
+    assert settle.shortfall(fake_kinematics.solution, None, fake_kinematics) is None
+    assert settle.shortfall((0.0,) * 5, None, fake_kinematics) == (
+        "still 16.3 mm / 0.00 rad from the target"
+    )
+    # The arm stands on the position, turned 44 degrees from the commanded
+    # orientation.
+    half = math.radians(44.0) / 2.0
+    turned = PoseSettle(
+        position=goal_position,
+        orientation=(math.sin(half), 0.0, 0.0, math.cos(half)),
+        position_tolerance_m=0.01,
+        orientation_tolerance_rad=0.2,
+        timeout_s=2.0,
+    )
+    assert turned.shortfall(fake_kinematics.solution, None, fake_kinematics) == (
+        "still 0.0 mm / 0.77 rad from the target"
+    )

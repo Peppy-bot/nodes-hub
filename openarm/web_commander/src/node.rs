@@ -66,6 +66,9 @@ pub enum NodeError {
     #[error("parameter joint_jog_acceleration_rad_s2")]
     JogAcceleration(#[source] NotPositiveFinite),
 
+    #[error("parameter joint_jog_velocity_rad_s")]
+    JogVelocity(#[source] NotPositiveFinite),
+
     #[error("parameter max_gripper_rate_frac_s")]
     GripperRate(#[source] NotPositiveFinite),
 
@@ -142,6 +145,8 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         PositiveFinite::parse(params.max_ee_velocity_m_s).map_err(NodeError::EeVelocity)?;
     let jog_acceleration = PositiveFinite::parse(params.joint_jog_acceleration_rad_s2)
         .map_err(NodeError::JogAcceleration)?;
+    let jog_velocity =
+        PositiveFinite::parse(params.joint_jog_velocity_rad_s).map_err(NodeError::JogVelocity)?;
     // The panel streams this rate to the backbone, which refuses the same
     // values; refusing here names the launcher parameter instead of surfacing
     // as a rejected frame after the node is already up.
@@ -166,6 +171,7 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         max_ee_velocity.get(),
         gripper_rate.get(),
         jog_acceleration.get(),
+        jog_velocity.get(),
     );
 
     let command_period =
@@ -301,6 +307,7 @@ mod tests {
             http_host: "0.0.0.0".to_string(),
             http_port: 8765,
             joint_jog_acceleration_rad_s2: 10.0,
+            joint_jog_velocity_rad_s: 1.0,
             max_ee_velocity_m_s: 0.5,
             max_gripper_rate_frac_s: 6.0,
         }

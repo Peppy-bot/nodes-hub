@@ -21,6 +21,14 @@ pub const ARM_LEADER_STREAMING: &str = "a leader is streaming arm commands; rele
 /// The gripper's counterpart of [`ARM_LEADER_STREAMING`].
 pub const GRIPPER_LEADER_STREAMING: &str = "a leader is streaming gripper commands; release the headset's grip, switch off the browser panel's stream, or stop the leader node, then retry";
 
+/// Refusal of an arm goal, or a check of one, while the arm's follower
+/// delivers no fresh state: before its first state, or after it stopped.
+pub const ARM_NO_FRESH_STATE: &str = "no fresh follower state to anchor the move from";
+
+/// Refusal of a gripper goal while the gripper's follower delivers no fresh
+/// state.
+pub const GRIPPER_NO_FRESH_STATE: &str = "no fresh gripper state to anchor the move from";
+
 /// Claim a side's single-flight move slot, or report it already busy. Shared
 /// by the arm, gripper, and posture admission handlers; the matching release
 /// rides the move's busy guard.
