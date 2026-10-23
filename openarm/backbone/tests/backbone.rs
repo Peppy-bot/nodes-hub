@@ -490,7 +490,7 @@ macro_rules! send_posture_goal {
 }
 
 /// Send one goal of `$action` with `$duration_s`, and assert that the node
-/// refuses it as an invalid duration.
+/// refuses it as a duration outside the contract's bound.
 macro_rules! assert_posture_refused {
     ($harness:expr, $action:ident, $duration_s:expr) => {{
         let goal = send_posture_goal!($harness, $action, $duration_s);
@@ -500,7 +500,10 @@ macro_rules! assert_posture_refused {
             $duration_s,
             stringify!($action)
         );
-        assert_eq!(goal.reason.as_deref(), Some("invalid duration"));
+        assert_eq!(
+            goal.reason.as_deref(),
+            Some("duration_s must be a number of seconds from 0 to 60")
+        );
     }};
 }
 
@@ -536,12 +539,26 @@ async fn complete_left_arm_joint_move(
     target: [f64; 7],
     duration_s: f64,
 ) -> peppygen::Result<move_arm_joints::ResultData> {
+    let data = left_arm_joint_move(harness, target, duration_s).await?;
+    assert!(data.success, "{}", data.message);
+    Ok(data)
+}
+
+/// Send one `move_arm_joints` goal for the left arm to `target` over
+/// `duration_s`, and wait for the result it completes with, success or not.
+async fn left_arm_joint_move(
+    harness: &Harness,
+    target: [f64; 7],
+    duration_s: f64,
+) -> peppygen::Result<move_arm_joints::ResultData> {
     let goal = move_arm_joints::send_goal(
         harness,
         &move_arm_joints::GoalRequestData {
             arm_name: "left_arm".to_string(),
             joint_positions: target,
             duration_s,
+            settle_tolerances_rad: [SETTLE_TOLERANCE_RAD; 7],
+            settle_timeout_s: SETTLE_TIMEOUT_S,
         },
         peppygen::QoSProfile::Reliable,
         DEADLINE,
@@ -549,13 +566,41 @@ async fn complete_left_arm_joint_move(
     .await?;
     assert!(goal.accepted, "goal rejected: {:?}", goal.reason);
     match goal.get_result(DEADLINE).await?.outcome {
-        move_arm_joints::ResultOutcome::Completed(data) => {
-            assert!(data.success, "{}", data.message);
-            Ok(data)
-        }
+        move_arm_joints::ResultOutcome::Completed(data) => Ok(data),
         other => panic!("move_arm_joints did not complete: {other:?}"),
     }
 }
+
+/// The plan slack the Cartesian moves of these tests are planned within: the
+/// guarded servo's own arrival bar.
+const PLAN_POSITION_TOLERANCE_M: f64 = control_core::servo::POSITION_TOLERANCE_M;
+const PLAN_ORIENTATION_TOLERANCE_RAD: f64 = control_core::servo::ORIENTATION_TOLERANCE_RAD;
+
+/// The settle the moves of these tests ask for: a slack the followers'
+/// tracking stays within, and a timeout that keeps a failed settle short.
+const SETTLE_TOLERANCE_RAD: f64 = 0.05;
+const SETTLE_POSITION_TOLERANCE_M: f64 = 0.005;
+const SETTLE_ORIENTATION_TOLERANCE_RAD: f64 = 0.05;
+const SETTLE_TIMEOUT_S: f64 = 0.5;
+
+/// The seconds a failed settle's message names after the planned end. The
+/// node formats the time it measured, so a stalled test host reads higher
+/// than the settle timeout, never lower.
+fn seconds_after_planned_end(message: &str) -> f64 {
+    let (_, tail) = message
+        .rsplit_once(", ")
+        .expect("a settle failure names the time since the planned end");
+    tail.strip_suffix(" s after the planned end")
+        .expect("the time ends the message")
+        .parse()
+        .expect("a number of seconds")
+}
+
+/// The settle timeout the gripper moves of these tests ask for: well past the
+/// lagging follower's longest travel here, half open to closed at
+/// [`LAGGING_GRIPPER_STEP`] per [`STATE_PUMP_PERIOD`] (0.5 s), plus the still
+/// window, so every move completes on stillness.
+const GRIPPER_SETTLE_TIMEOUT_S: f64 = 2.0;
 
 /// Send one `move_gripper` goal for the left gripper to `opening` under
 /// `max_effort`, and wait for the result it completes with.
@@ -570,6 +615,7 @@ async fn complete_left_gripper_move(
             gripper_name: "left_gripper".to_string(),
             opening,
             max_effort,
+            settle_timeout_s: GRIPPER_SETTLE_TIMEOUT_S,
         },
         peppygen::QoSProfile::Reliable,
         DEADLINE,
@@ -690,6 +736,8 @@ async fn a_goal_on_an_arm_a_leader_streams_waits_for_the_stream_to_stop() -> pep
             arm_name: "left_arm".to_string(),
             joint_positions: HOME,
             duration_s: 0.2,
+            settle_tolerances_rad: [SETTLE_TOLERANCE_RAD; 7],
+            settle_timeout_s: SETTLE_TIMEOUT_S,
         },
         peppygen::QoSProfile::Reliable,
         DEADLINE,
@@ -778,14 +826,14 @@ async fn move_arm_joints_streams_a_trajectory_the_arm_follows_to_the_target() ->
     harness.shutdown().await
 }
 
-/// A joint move that the collision governor holds short still completes
-/// with success when its time runs out. Its result gives the joints that
-/// the arm measured then, not the goal. Here the band is wide, so the rest
-/// pose sits under d_stop. A left wrist sent toward the centerline never
-/// gets there.
+/// A joint move that the collision governor holds short fails its settle
+/// when the settle timeout runs out after the planned end, naming the held
+/// joint. Its result gives the joints that the arm measured then, not the
+/// goal. Here the band is wide, so the rest pose sits under d_stop. A left
+/// wrist sent toward the centerline never gets there.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_joint_move_the_governor_holds_completes_with_the_measured_pose() -> peppygen::Result<()>
-{
+async fn a_joint_move_the_governor_holds_fails_its_settle_with_the_measured_pose()
+-> peppygen::Result<()> {
     let mut wide = params();
     wide.d_stop_m = 0.8;
     wide.d_safe_m = 1.0;
@@ -805,8 +853,22 @@ async fn a_joint_move_the_governor_holds_completes_with_the_measured_pose() -> p
     let mut inward = HOME;
     inward[2] = 1.5;
     inward[3] = 0.4;
-    let data = complete_left_arm_joint_move(&harness, inward, 1.0).await?;
-    assert_eq!(data.message, "trajectory complete");
+    let data = left_arm_joint_move(&harness, inward, 1.0).await?;
+    assert!(
+        !data.success,
+        "a held arm cannot have settled on its target"
+    );
+    assert!(
+        data.message.starts_with("still ")
+            && data.message.contains(" rad from the target at joint 3, "),
+        "the failure names the held joint: {}",
+        data.message
+    );
+    assert!(
+        seconds_after_planned_end(&data.message) >= SETTLE_TIMEOUT_S,
+        "the failure came no sooner than the settle timeout: {}",
+        data.message
+    );
     assert!(
         (data.final_joint_positions[2] - inward[2]).abs() > 0.5,
         "the governor let the wrist reach its goal: {:?}",
@@ -829,8 +891,9 @@ async fn a_joint_move_the_governor_holds_completes_with_the_measured_pose() -> p
 
 /// A move_arm result gives the grasp pose of the joints that the arm
 /// measured when the move ended. Here the left arm stands still at Ready.
-/// A move 5 cm up runs to its end with success. Its result gives where the
-/// arm stands, as limb_state does, not the goal.
+/// A move 5 cm up runs to its planned end and fails its settle, naming the
+/// 50 mm the grasp point still stands from the target. Its result gives
+/// where the arm stands, as limb_state does, not the goal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pose_move_reports_the_grasp_point_of_the_measured_joints() -> peppygen::Result<()> {
     use peppygen::fixtures::exposed_actions::limb_motion::move_arm;
@@ -872,8 +935,8 @@ async fn a_pose_move_reports_the_grasp_point_of_the_measured_joints() -> peppyge
             position: raised,
             orientation,
             duration_s: 1.0,
-            plan_position_tolerance_m: 0.0,
-            plan_orientation_tolerance_rad: 0.0,
+            plan_position_tolerance_m: PLAN_POSITION_TOLERANCE_M,
+            plan_orientation_tolerance_rad: PLAN_ORIENTATION_TOLERANCE_RAD,
         },
         DEADLINE,
     )
@@ -887,8 +950,11 @@ async fn a_pose_move_reports_the_grasp_point_of_the_measured_joints() -> peppyge
             position: raised,
             orientation,
             duration_s: 1.0,
-            plan_position_tolerance_m: 0.0,
-            plan_orientation_tolerance_rad: 0.0,
+            plan_position_tolerance_m: PLAN_POSITION_TOLERANCE_M,
+            plan_orientation_tolerance_rad: PLAN_ORIENTATION_TOLERANCE_RAD,
+            settle_position_tolerance_m: SETTLE_POSITION_TOLERANCE_M,
+            settle_orientation_tolerance_rad: SETTLE_ORIENTATION_TOLERANCE_RAD,
+            settle_timeout_s: SETTLE_TIMEOUT_S,
         },
         peppygen::QoSProfile::Reliable,
         DEADLINE,
@@ -899,7 +965,18 @@ async fn a_pose_move_reports_the_grasp_point_of_the_measured_joints() -> peppyge
         move_arm::ResultOutcome::Completed(data) => data,
         other => panic!("move_arm did not complete: {other:?}"),
     };
-    assert!(data.success, "{}", data.message);
+    assert!(!data.success, "an arm that never moved cannot have settled");
+    assert!(
+        data.message
+            .starts_with("still 50.0 mm / 0.00 rad from the target, "),
+        "the failure names the remaining error: {}",
+        data.message
+    );
+    assert!(
+        seconds_after_planned_end(&data.message) >= SETTLE_TIMEOUT_S,
+        "the failure came no sooner than the settle timeout: {}",
+        data.message
+    );
     assert_all_close("final_position", &data.final_position, &start, 1e-9);
     assert_all_close(
         "final_orientation",
@@ -924,8 +1001,8 @@ async fn a_pose_move_reports_the_grasp_point_of_the_measured_joints() -> peppyge
 /// Exposed gripper action end-to-end: `move_gripper` with the left gripper
 /// played by a follower whose jaws lag their commands. The commanded ramp
 /// lands on the target while the jaws are still most of the way out; the
-/// result must wait until they stand still and report the opening they stopped
-/// at, not the one measured when the last setpoint went out.
+/// result comes once they have stood still on it and reports the opening
+/// measured then.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn move_gripper_answers_with_the_opening_the_lagging_jaws_stopped_at() -> peppygen::Result<()>
 {
@@ -957,23 +1034,16 @@ async fn move_gripper_answers_with_the_opening_the_lagging_jaws_stopped_at() -> 
     await_streaming(mocks.pairings.right_arm.joint_setpoints).await?;
 
     // Close from half open: the commanded ramp covers the 0.4 travel in about
-    // 70 ms, the lagging jaws need 40 state periods.
+    // 70 ms, the lagging jaws need 40 state periods and then stand still.
     let target = 0.1;
     let data = complete_left_gripper_move(&harness, target, 0.0).await?;
     assert!(data.success, "move failed: {}", data.message);
     assert_eq!(data.message, "move complete");
-    // The jaws stand still on the target once the result is out, so the
-    // follower's last opening is the one the backbone measured at the end.
     assert_eq!(
-        data.final_opening,
-        *followed.borrow(),
-        "final_opening must be the opening the jaws stopped at"
+        data.final_opening, target,
+        "final_opening must be the opening the jaws arrived at"
     );
-    assert!(
-        (data.final_opening - target).abs() < 1e-9,
-        "the jaws stopped at {}, commanded {target}",
-        data.final_opening
-    );
+    assert_eq!(*followed.borrow(), target, "the jaws stand on the target");
 
     harness.shutdown().await
 }
@@ -982,7 +1052,8 @@ async fn move_gripper_answers_with_the_opening_the_lagging_jaws_stopped_at() -> 
 /// the gripper keeps the move's opening and effort cap, and keeps squeezing
 /// what it holds. Here:
 /// - an object stops the jaws at 0.3 on their way to 0.0;
-/// - the move ends with success, short of its target;
+/// - the move completes once the jaws stand still there and reports where
+///   they stopped;
 /// - through a later arm move, each setpoint that the gripper gets is still
 ///   0.0 at the effort cap of 1.5, which the node relays unchanged.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -996,10 +1067,7 @@ async fn a_gripper_held_by_an_object_keeps_its_closing_command_after_the_move()
     };
     let data = complete_left_gripper_move(&harness, squeeze.opening, squeeze.max_effort).await?;
     assert!(data.success, "{}", data.message);
-    assert_eq!(
-        data.message,
-        "move complete: the gripper stopped at 0.300, short of the target 0.000"
-    );
+    assert_eq!(data.message, "move complete");
     assert_eq!(data.final_opening, 0.3);
     let during = gripper.received_since(0);
     assert!(!during.is_empty(), "the move commanded the gripper");
@@ -1246,6 +1314,8 @@ async fn goals_for_unknown_limb_names_are_refused() -> peppygen::Result<()> {
             arm_name: "torso".to_string(),
             joint_positions: HOME,
             duration_s: 1.0,
+            settle_tolerances_rad: [SETTLE_TOLERANCE_RAD; 7],
+            settle_timeout_s: SETTLE_TIMEOUT_S,
         },
         peppygen::QoSProfile::Reliable,
         DEADLINE,
@@ -1264,6 +1334,7 @@ async fn goals_for_unknown_limb_names_are_refused() -> peppygen::Result<()> {
             gripper_name: "left_arm".to_string(),
             opening: 0.5,
             max_effort: 0.0,
+            settle_timeout_s: GRIPPER_SETTLE_TIMEOUT_S,
         },
         peppygen::QoSProfile::Reliable,
         DEADLINE,
@@ -1315,6 +1386,8 @@ async fn a_stop_ends_every_move_in_flight_and_a_later_goal_runs() -> peppygen::R
             arm_name: "left_arm".to_string(),
             joint_positions: target,
             duration_s: 30.0,
+            settle_tolerances_rad: [SETTLE_TOLERANCE_RAD; 7],
+            settle_timeout_s: SETTLE_TIMEOUT_S,
         },
         peppygen::QoSProfile::Reliable,
         DEADLINE,
@@ -1327,6 +1400,7 @@ async fn a_stop_ends_every_move_in_flight_and_a_later_goal_runs() -> peppygen::R
             gripper_name: "left_gripper".to_string(),
             opening: 0.1,
             max_effort: 0.0,
+            settle_timeout_s: GRIPPER_SETTLE_TIMEOUT_S,
         },
         peppygen::QoSProfile::Reliable,
         DEADLINE,
@@ -1504,8 +1578,8 @@ async fn a_posture_goal_above_the_duration_ceiling_is_refused() -> peppygen::Res
     pump_right_arm_and_grippers!(mocks);
     await_streaming(mocks.pairings.right_arm.joint_setpoints).await?;
 
-    assert_posture_refused!(harness, move_to_ready, 601.0);
-    assert_posture_refused!(harness, move_to_home, 601.0);
+    assert_posture_refused!(harness, move_to_ready, 61.0);
+    assert_posture_refused!(harness, move_to_home, 61.0);
     harness.shutdown().await
 }
 
@@ -1654,8 +1728,8 @@ async fn a_plan_check_answers_without_moving_the_arm() -> peppygen::Result<()> {
         position,
         orientation,
         duration_s: 0.0,
-        plan_position_tolerance_m: 0.0,
-        plan_orientation_tolerance_rad: 0.0,
+        plan_position_tolerance_m: PLAN_POSITION_TOLERANCE_M,
+        plan_orientation_tolerance_rad: PLAN_ORIENTATION_TOLERANCE_RAD,
     };
 
     let near = check("left_arm", [position[0], position[1], position[2] + 0.02]);

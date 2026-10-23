@@ -761,6 +761,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "dashu-base"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "861a614e79388a4c72aa66b0bdabc91e3a4f30d53e0c8d962953e207d75884d0"
+dependencies = [
+ "num-modular",
+]
+
+[[package]]
+name = "dashu-int"
+version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "64a0490b40a6a3f6427970035f17f76fd59c01d3cd9f9140809672863a0d64c8"
+dependencies = [
+ "cfg-if",
+ "dashu-base",
+ "num-modular",
+ "static_assertions",
+]
+
+[[package]]
 name = "data-encoding"
 version = "2.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1017,7 +1038,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6e634e2e0ebac1ee034020da1ca582e17ffe4e0f5e985823721e168928136dcb"
 dependencies = [
  "crc32fast",
- "miniz_oxide",
+ "miniz_oxide 0.9.1",
  "zlib-rs",
 ]
 
@@ -1415,6 +1436,46 @@ name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
+
+[[package]]
+name = "hegeltest"
+version = "0.50.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "81e656493068afe662e9812a45f58e93503da5b8a748fb1757e4f11b6d4c516a"
+dependencies = [
+ "hegeltest-c",
+ "hegeltest-macros",
+ "parking_lot",
+]
+
+[[package]]
+name = "hegeltest-c"
+version = "0.48.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2a256cdc3ada9f8e207abbf05e695aceefd302856ea98599bd242fbd20a19634"
+dependencies = [
+ "dashu-int",
+ "hashbrown 0.17.1",
+ "libm",
+ "miniz_oxide 0.8.9",
+ "once_cell",
+ "rand 0.10.3",
+ "rustc-hash",
+ "rustix",
+ "toml 1.1.8+spec-1.1.0",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "hegeltest-macros"
+version = "0.50.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "800a8e9e904889fb4776f8017b29a7e475e8bf135206116d530c235f5598c773"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "hermit-abi"
@@ -2134,6 +2195,15 @@ checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
 name = "miniz_oxide"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
+dependencies = [
+ "adler2",
+]
+
+[[package]]
+name = "miniz_oxide"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c"
@@ -2320,6 +2390,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "num-modular"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd8e500409e6cd603b03e477c26a6caecdc27ac58979a53e881c75eafc079f44"
+
+[[package]]
 name = "num-rational"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2377,6 +2453,7 @@ version = "0.1.0"
 dependencies = [
  "bimanual_collision_model",
  "control_core",
+ "hegeltest",
  "openarm_description",
  "peppygen",
  "peppylib",
@@ -4048,6 +4125,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "toml"
+version = "1.1.8+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "20489e00e4d8741d6be680764cc12e270655e375a20d1011e844a9c3379e678d"
+dependencies = [
+ "serde_spanned",
+ "toml_datetime 1.1.2+spec-1.1.0",
+ "toml_parser",
+ "winnow 1.0.4",
+]
+
+[[package]]
 name = "toml_datetime"
 version = "0.7.5+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4939,7 +5028,7 @@ dependencies = [
  "serde_json",
  "serde_with",
  "serde_yaml",
- "toml",
+ "toml 0.9.12+spec-1.1.0",
  "tracing",
  "uhlc",
  "validated_struct",
