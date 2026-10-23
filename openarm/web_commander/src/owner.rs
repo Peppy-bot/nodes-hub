@@ -342,6 +342,7 @@ impl Owner {
             tick_dt_s,
             self.state.max_ee_velocity_m_s,
             self.state.joint_jog_acceleration_rad_s2,
+            self.state.joint_jog_velocity_rad_s,
         );
         for side in SIDES {
             if !self.state.enabled[side] {
@@ -1086,7 +1087,7 @@ mod tests {
 
     // The caps a 100 Hz tick at the sim launcher's 0.5 m/s knob derives.
     fn caps() -> JogCaps {
-        JogCaps::per_tick(0.01, 0.5, 10.0)
+        JogCaps::per_tick(0.01, 0.5, 10.0, 1.0)
     }
 
     fn arm(joints: [f64; ARM_DOF], jog: Option<Jog>, jog_blocked: bool) -> ArmTarget {
@@ -1249,7 +1250,7 @@ mod tests {
 
     // A state with measurements on both sides, as RunGesture requires.
     fn measured_state() -> UiState {
-        let mut s = UiState::new(true, 0.005, 0.02, 0.25, 6.0, 10.0);
+        let mut s = UiState::new(true, 0.005, 0.02, 0.25, 6.0, 10.0, 1.0);
         for side in SIDES {
             s.arms[side].last_feedback = Some([0.1, 0.2, -0.1, 0.8, 0.0, 0.1, 0.0]);
             s.grippers[side].last_feedback = Some(0.3);
@@ -1356,7 +1357,7 @@ mod tests {
     #[test]
     fn disconnect_disarms_sides_and_restores_governor_default_on() {
         // Launched with avoidance on; operator turned it off with both sides armed.
-        let mut s = UiState::new(true, 0.005, 0.02, 0.25, 6.0, 10.0);
+        let mut s = UiState::new(true, 0.005, 0.02, 0.25, 6.0, 10.0, 1.0);
         s.collision_enabled = false;
         s.enabled[Side::Left] = true;
         s.enabled[Side::Right] = true;
@@ -1374,7 +1375,7 @@ mod tests {
     #[test]
     fn disconnect_restores_governor_default_off_when_launched_ungoverned() {
         // Launched deliberately ungoverned; operator turned avoidance on.
-        let mut s = UiState::new(false, 0.005, 0.02, 0.25, 6.0, 10.0);
+        let mut s = UiState::new(false, 0.005, 0.02, 0.25, 6.0, 10.0, 1.0);
         s.collision_enabled = true;
         reset_on_disconnect(&mut s);
         assert!(
