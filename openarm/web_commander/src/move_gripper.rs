@@ -23,16 +23,25 @@ use crate::state::Side;
 // cover the decider, not a discovery probe.
 const GOAL_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// One discrete gripper move, as fired at the backbone: the side, the opening
+/// fraction, the effort cap in its wire encoding (0 = no preference), and the
+/// longest (s) the backbone waits after the planned end of the travel for the
+/// jaws to stand still.
+pub struct Goal {
+    pub side: Side,
+    pub opening: f64,
+    pub max_effort: f64,
+    pub settle_timeout_s: f64,
+}
+
 pub fn spawn(
     runner: Arc<NodeRunner>,
     feedback: mpsc::Sender<Feedback>,
     token: CancellationToken,
-    side: Side,
-    opening: f64,
-    max_effort: f64,
+    goal: Goal,
 ) {
     tokio::spawn(async move {
-        run(runner, feedback, token, side, opening, max_effort).await;
+        run(runner, feedback, token, goal).await;
     });
 }
 
@@ -40,10 +49,14 @@ async fn run(
     runner: Arc<NodeRunner>,
     feedback: mpsc::Sender<Feedback>,
     token: CancellationToken,
-    side: Side,
-    opening: f64,
-    max_effort: f64,
+    goal: Goal,
 ) {
+    let Goal {
+        side,
+        opening,
+        max_effort,
+        settle_timeout_s,
+    } = goal;
     let label = side.label();
     info!(side = label, opening, max_effort, "fire move_gripper");
 
@@ -51,6 +64,7 @@ async fn run(
         gripper_name: side.gripper_name().to_string(),
         opening,
         max_effort,
+        settle_timeout_s,
     };
 
     let downstream = match limb_motion_move_gripper::ActionHandle::fire_goal(
@@ -115,9 +129,10 @@ async fn run(
     let (success, summary) = match outcome {
         Ok(r) => match r.outcome {
             ResultOutcome::Completed(data) => {
-                // The backbone reports the jaws standing still and where they
-                // measured; whether that opening is good (a grasp stops short of
-                // a full close on purpose) is this side's call to surface.
+                // The backbone reports where the jaws measured once they stood
+                // still, or settle_timeout_s after the planned end of the travel:
+                // on the target, or where an object or the effort cap stopped
+                // them, which a grasp reads as its result.
                 let msg = if data.success {
                     format!(
                         "move_gripper ({}): success in {:.2}s, opening {:.2}",

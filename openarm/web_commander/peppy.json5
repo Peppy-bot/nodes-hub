@@ -3,9 +3,9 @@
 // an operating-system port otherwise) that streams arm and gripper setpoints
 // to the backbone over the joint_link / gripper_link
 // pairings (the backbone governs and re-streams them), reads live state by
-// observing the backbone's downstream pairings, jogs the arm in joint or
-// Cartesian (world-frame IK) space, and fires move_arm_joints / move_arm /
-// move_gripper goals through the limb_motion contract slot (the backbone).
+// observing the backbone's downstream pairings, jogs the arm in joint space,
+// and fires move_arm_joints / move_arm / move_gripper goals through the
+// limb_motion contract slot (the backbone).
 {
   peppy_schema: "node/v1",
   manifest: {
@@ -79,7 +79,10 @@
           name: "move_arm_joints",
           refine: {
             goal_service: {
-              request_message_format: { joint_positions: { $length: 7 } },
+              request_message_format: {
+                joint_positions: { $length: 7 },
+                settle_tolerances_rad: { $length: 7 },
+              },
             },
             result_service: {
               response_message_format: { final_joint_positions: { $length: 7 } },
