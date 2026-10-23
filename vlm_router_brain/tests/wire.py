@@ -6,6 +6,8 @@ the wire."""
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass, field
+from weakref import WeakKeyDictionary
 
 import numpy as np
 
@@ -102,20 +104,42 @@ async def once_the_brain_sees(fixture, h, request):
     raise AssertionError(f"the brain never saw the capture: {data.message}")
 
 
-def limbs_at(timestamp: float, left_opening: float) -> limb_states.Message:
-    """A limb_states snapshot of the OpenArm: two arms of seven joints, the
-    left gripper at `left_opening` and the right one open."""
+@dataclass
+class FakeLimbs:
+    """The limbs the harness's backbone publishes on limb_states: the left
+    grasp point where the last landed move put it, the left gripper's
+    opening, and the stamp of the last snapshot. The right arm stays at
+    rest with its gripper open."""
+
+    left_position: list[float] = field(default_factory=lambda: [0.4, 0.2, 0.9])
+    left_orientation: list[float] = field(default_factory=lambda: [0.0, 1.0, 0.0, 0.0])
+    left_opening: float = 1.0
+    stamp: float = 1.0
+
+
+_LIMBS: WeakKeyDictionary = WeakKeyDictionary()
+
+
+def limbs_of(h) -> FakeLimbs:
+    """The fake backbone's limbs under harness `h`."""
+    return _LIMBS.setdefault(h, FakeLimbs())
+
+
+def limbs_at(limbs: FakeLimbs) -> limb_states.Message:
+    """A limb_states snapshot of the OpenArm, two arms of seven joints, as
+    `limbs` stand."""
     return limb_states.Message(
-        timestamp=timestamp, arm_names=["left_arm", "right_arm"], joints_per_arm=[7, 7], joint_positions=[0.0] * 14,
-        positions=[0.4, 0.2, 0.9, 0.4, -0.2, 0.9], orientations=[0.0, 1.0, 0.0, 0.0] * 2,
-        gripper_names=["left_gripper", "right_gripper"], gripper_openings=[left_opening, 1.0],
+        timestamp=limbs.stamp, arm_names=["left_arm", "right_arm"], joints_per_arm=[7, 7], joint_positions=[0.0] * 14,
+        positions=[*limbs.left_position, 0.4, -0.2, 0.9], orientations=[*limbs.left_orientation, 0.0, 1.0, 0.0, 0.0],
+        gripper_names=["left_gripper", "right_gripper"], gripper_openings=[limbs.left_opening, 1.0],
     )
 
 
-async def publish_limbs(h, timestamp: float, left_opening: float = 1.0) -> None:
+async def publish_limbs(h) -> None:
+    """One snapshot of the fake backbone's limbs as they stand."""
     topic = h.mocks.deps.limb_state.limb_states
     assert await topic.wait_for_subscriber(WAIT)
-    await topic.publish(limbs_at(timestamp, left_opening))
+    await topic.publish(limbs_at(limbs_of(h)))
 
 
 def grab_by_pose(position, orientation=None) -> grab_action.GoalRequestData:
@@ -136,7 +160,7 @@ async def once_the_brain_has_limbs(h) -> None:
     backbone refuses, so it moves nothing."""
     plan(h, False)
     for _ in range(ATTEMPTS):
-        await publish_limbs(h, 1.0)
+        await publish_limbs(h)
         data = await result_of(grab_fx, h, grab_by_pose([0.5, 0.0, 0.9], [0.0, 1.0, 0.0, 0.0]))
         if data.message != NO_SNAPSHOT:
             assert data.message.endswith("with gripper 'left_gripper': goal pose not planned"), data.message
@@ -152,8 +176,14 @@ async def accepted_move(h):
 
 
 async def land_move(h) -> move_arm.GoalRequest:
-    """The next move_arm goal, landed on its target."""
+    """The next move_arm goal, landed on its target: limb_states shows the
+    left grasp point there before the goal completes."""
     request, active = await accepted_move(h)
+    assert request.arm_name == "left_arm", request.arm_name
+    limbs = limbs_of(h)
+    limbs.left_position, limbs.left_orientation = list(request.position), list(request.orientation)
+    limbs.stamp += 1.0
+    await publish_limbs(h)
     await active.complete(
         move_arm.ResultResponseData(
             success=True, message="move complete", final_position=request.position,
@@ -181,11 +211,14 @@ async def stop_grip_at(h, final_opening: float) -> move_gripper.GoalRequest:
 
 
 async def publish_limbs_until(h, done: asyncio.Event, left_opening: float) -> None:
-    """The backbone's stream from the lift on: a snapshot with a later stamp
-    after each one, until `done`, so whatever the order the lift's result
-    and a snapshot reach the brain in, a later snapshot follows."""
-    timestamp = 2.0
+    """The backbone's stream from the lift on, the left gripper at
+    `left_opening`: a snapshot with a later stamp after each one, the arm
+    where the last landed move put it, until `done`, so whatever the order
+    the lift's result and a snapshot reach the brain in, a later snapshot
+    follows."""
+    limbs = limbs_of(h)
+    limbs.left_opening = left_opening
     while not done.is_set():
-        await publish_limbs(h, timestamp, left_opening)
-        timestamp += 1.0
+        limbs.stamp += 1.0
+        await publish_limbs(h)
         await asyncio.sleep(0.01)
