@@ -17,6 +17,14 @@ from ai_brain_vla.__main__ import setup
 WAIT = 10.0
 POSITION = (0.5, 0.1, 0.7)
 ORIENTATION = (0.0, 0.0, 0.0, 1.0)
+# The tolerances and settle timeout the moves below name.
+BARS = {
+    "plan_position_tolerance_m": 0.001,
+    "plan_orientation_tolerance_rad": 0.01,
+    "settle_position_tolerance_m": 0.02,
+    "settle_orientation_tolerance_rad": 0.15,
+    "settle_timeout_s": 2.0,
+}
 
 
 def robot_on(node_runner, **kwargs) -> Robot:
@@ -54,7 +62,7 @@ def arm_result(success: bool, message: str) -> move_arm.ResultResponseData:
 async def test_an_accepted_move_returns_the_backbones_result():
     async with booted() as h:
         robot = robot_on(h.node_runner)
-        move = asyncio.create_task(robot.move_arm("left_arm", POSITION, ORIENTATION, duration_s=1.5))
+        move = asyncio.create_task(robot.move_arm("left_arm", POSITION, ORIENTATION, duration_s=1.5, **BARS))
         pending = await h.mocks.deps.limb_motion.move_arm.next_goal(WAIT)
         assert pending.request.arm_name == "left_arm"
         assert pending.request.position == [0.5, 0.1, 0.7] and pending.request.duration_s == 1.5
@@ -62,7 +70,7 @@ async def test_an_accepted_move_returns_the_backbones_result():
         await active.complete(arm_result(True, ""))
         assert await asyncio.wait_for(move, WAIT) == MoveResult(True, "", (0.51, 0.1, 0.69), (0.0, 0.0, 0.0, 1.0))
 
-        grip = asyncio.create_task(robot.set_gripper("left_gripper", 0.2, max_effort=5.0))
+        grip = asyncio.create_task(robot.set_gripper("left_gripper", 0.2, max_effort=5.0, settle_timeout_s=2.0))
         pending = await h.mocks.deps.limb_motion.move_gripper.next_goal(WAIT)
         assert (pending.request.gripper_name, pending.request.opening, pending.request.max_effort) == ("left_gripper", 0.2, 5.0)
         active = await pending.accept()
@@ -73,12 +81,12 @@ async def test_an_accepted_move_returns_the_backbones_result():
 async def test_a_move_the_backbone_refuses_or_fails_says_why():
     async with booted() as h:
         robot = robot_on(h.node_runner)
-        move = asyncio.create_task(robot.move_arm("third_arm", POSITION, ORIENTATION))
+        move = asyncio.create_task(robot.move_arm("third_arm", POSITION, ORIENTATION, duration_s=0.0, **BARS))
         pending = await h.mocks.deps.limb_motion.move_arm.next_goal(WAIT)
         await pending.reject("unknown arm 'third_arm'")
         assert await asyncio.wait_for(move, WAIT) == MoveResult(False, "unknown arm 'third_arm'")
 
-        move = asyncio.create_task(robot.move_arm("left_arm", POSITION, ORIENTATION))
+        move = asyncio.create_task(robot.move_arm("left_arm", POSITION, ORIENTATION, duration_s=0.0, **BARS))
         pending = await h.mocks.deps.limb_motion.move_arm.next_goal(WAIT)
         active = await pending.accept()
         await active.complete(arm_result(False, "no plan reaches the target"))
@@ -89,7 +97,7 @@ async def test_a_move_the_backbone_refuses_or_fails_says_why():
 async def test_a_stop_cancels_the_move_in_flight_and_reports_it_cancelled():
     async with booted() as h:
         robot = robot_on(h.node_runner)
-        move = asyncio.create_task(robot.move_arm("left_arm", POSITION, ORIENTATION))
+        move = asyncio.create_task(robot.move_arm("left_arm", POSITION, ORIENTATION, duration_s=0.0, **BARS))
         pending = await h.mocks.deps.limb_motion.move_arm.next_goal(WAIT)
         active = await pending.accept()
         # The acceptance reaches the proxy after the mock sent it: the stop
@@ -111,7 +119,7 @@ async def test_a_move_the_backbone_stops_reports_the_stops_message_without_a_can
     sees it fail and does not go on."""
     async with booted() as h:
         robot = robot_on(h.node_runner)
-        move = asyncio.create_task(robot.move_arm("left_arm", POSITION, ORIENTATION))
+        move = asyncio.create_task(robot.move_arm("left_arm", POSITION, ORIENTATION, duration_s=0.0, **BARS))
         pending = await h.mocks.deps.limb_motion.move_arm.next_goal(WAIT)
         active = await pending.accept()
         await asyncio.wait_for(in_flight(robot), WAIT)
@@ -124,7 +132,7 @@ async def test_a_move_the_backbone_stops_reports_the_stops_message_without_a_can
 async def test_a_move_without_a_result_in_time_is_cancelled_and_reported():
     async with booted() as h:
         robot = robot_on(h.node_runner, result_timeout_s=0.5)
-        move = asyncio.create_task(robot.move_arm("left_arm", POSITION, ORIENTATION))
+        move = asyncio.create_task(robot.move_arm("left_arm", POSITION, ORIENTATION, duration_s=0.0, **BARS))
         pending = await h.mocks.deps.limb_motion.move_arm.next_goal(WAIT)
         active = await pending.accept()
         # The backbone never answers: the proxy gives up on the result and
