@@ -869,7 +869,7 @@ impl Planner {
             // No continuous joint path tracks the line: play the path the
             // guarded servo's rollout just validated, the same damped law the
             // operator's streaming jog crosses these walls with.
-            CartesianPlan::Servo(ServoPlan { duration, path }) => {
+            CartesianPlan::Servo(ServoPlan { duration, path, .. }) => {
                 info!(
                     "{}: move_arm start (servo-guided), duration={:.3}s",
                     self.side.label(),
