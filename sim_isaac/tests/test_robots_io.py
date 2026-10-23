@@ -199,8 +199,8 @@ def test_a_copy_admitted_while_its_robot_leaves_is_stood_afresh():
 
 def test_a_goal_that_never_reached_its_stay_gives_back_its_name_and_its_spot():
     """A goal is accepted on a hop of its own after this engine has answered
-    for it, and a robot with no stay has nothing watching its lease: what its
-    admission reserved is held by nobody, and the copy that comes after it
+    for it, and a robot with no stay has nothing watching its pair grace time:
+    what its admission reserved is held by nobody, and the copy that comes after it
     takes the name."""
     io = _robots_io(_stage())
 
@@ -248,8 +248,8 @@ class _Hop:
 
 def test_a_goal_lost_on_the_way_back_frees_the_name_it_was_admitted_under():
     """The engine answers each attach and then waits for the goal it
-    accepted. A goal that never arrives has nothing watching its lease, so
-    serving the attaches gives its name and its spot back."""
+    accepted. A goal that never arrives has nothing watching its pair grace
+    time, so serving the attaches gives its name and its spot back."""
     io = _robots_io(_stage())
     handle = _Hop(_request())
 
@@ -295,7 +295,7 @@ def test_a_copy_re_registering_its_own_robot_takes_it_over_where_it_stands():
     assert list(io._robots.standing()) == ["alpha"]
 
 
-def _built(lease_s: float = 2.0) -> RobotsIO:
+def _built(pair_grace_s: float = 2.0) -> RobotsIO:
     """A RobotsIO built the way the launch builds it, so the order its parts
     are given in is the order it reads them."""
     return RobotsIO(
@@ -306,7 +306,7 @@ def _built(lease_s: float = 2.0) -> RobotsIO:
         World(head_camera_pack=None),
         Edits(),
         _HoldsEverything(),
-        lease_s,
+        pair_grace_s,
     )
 
 
@@ -321,11 +321,11 @@ def test_a_robots_io_reads_each_part_as_the_launch_gives_it():
     assert io._models is MODELS
 
 
-def test_a_lease_no_robot_can_keep_is_refused_as_the_engine_is_built():
-    """The lease is how long a robot whose pairs are gone stays, so one that
-    is zero or below takes every robot off the stage as it stands."""
-    with pytest.raises(ValueError, match="robot_lease_ms must be positive"):
-        _built(lease_s=0.0)
+def test_a_pair_grace_time_no_robot_can_keep_is_refused_as_the_engine_is_built():
+    """The pair grace time is how long a robot whose pairs are gone stays, so
+    one that is zero or below takes every robot off the stage as it stands."""
+    with pytest.raises(ValueError, match="robot_pair_grace_ms must be positive"):
+        _built(pair_grace_s=0.0)
 
 
 def test_another_caller_naming_the_standing_robot_is_refused():
@@ -365,45 +365,47 @@ def test_a_goal_handed_over_leaves_its_robot_standing():
     assert goal.answers == [("completed", False, "another goal hosts it")]
 
 
-def _lease_io() -> RobotsIO:
-    """A RobotsIO with only the parts a lease and a forget touch."""
+def _bare_io() -> RobotsIO:
+    """A RobotsIO with only the parts a pair grace check and a forget
+    touch."""
     io = RobotsIO.__new__(RobotsIO)
     io._placements = {}
     io._handovers = {}
     return io
 
 
-class TestHowOftenAStayChecksItsLease:
-    """A stay wakes on a share of its lease so a robot whose pairs are gone
-    leaves within it, and no faster than the floor, because every wake is a
+class TestHowOftenAStayChecksItsPairGrace:
+    """A stay wakes on a share of its pair grace time so a robot whose pairs
+    are gone leaves within it, and no faster than the floor, because every wake is a
     turn of the node loop the whole engine shares."""
 
-    def test_the_period_is_a_share_of_the_lease(self):
-        io = _lease_io()
-        io._lease_s = 8.0
+    def test_the_period_is_a_share_of_the_pair_grace_time(self):
+        io = _bare_io()
+        io._pair_grace_s = 8.0
 
-        assert io._lease_check_period() == 8.0 * 0.25
+        assert io._pair_grace_check_period() == 8.0 * 0.25
 
-    def test_a_short_lease_is_checked_no_faster_than_the_floor(self):
-        """`robot_lease_ms` takes any positive number, and a lease of one
-        millisecond would wake the node loop a thousand times a second."""
-        io = _lease_io()
-        io._lease_s = 0.001
+    def test_a_short_pair_grace_time_is_checked_no_faster_than_the_floor(self):
+        """`robot_pair_grace_ms` takes any positive number, and a pair grace
+        time of one millisecond would wake the node loop a thousand times a
+        second."""
+        io = _bare_io()
+        io._pair_grace_s = 0.001
 
-        assert io._lease_check_period() == 0.05
+        assert io._pair_grace_check_period() == 0.05
 
-    def test_every_lease_is_checked_inside_itself(self):
-        io = _lease_io()
-        for lease_s in (0.001, 0.05, 1.0, 8.0, 600.0):
-            io._lease_s = lease_s
-            assert 0.0 < io._lease_check_period()
-            assert io._lease_check_period() <= max(lease_s, 0.05)
+    def test_every_pair_grace_time_is_checked_inside_itself(self):
+        io = _bare_io()
+        for pair_grace_s in (0.001, 0.05, 1.0, 8.0, 600.0):
+            io._pair_grace_s = pair_grace_s
+            assert 0.0 < io._pair_grace_check_period()
+            assert io._pair_grace_check_period() <= max(pair_grace_s, 0.05)
 
 
 def test_forgetting_a_robot_drops_its_spot_and_its_signal():
     """What a robot's joining held is a spot promised and a signal its own
     goal waits on, and a name given back leaves neither behind."""
-    io = _lease_io()
+    io = _bare_io()
     io._placements["alpha"] = Placement.of((0.0, 0.0, 0.0), 0.0)
     io._handover("alpha")
 
@@ -433,7 +435,7 @@ def test_the_stay_taking_a_robot_over_ends_the_one_hosting_it_and_not_itself():
     io = _robots_io(_stage(("alpha", "openarm_v2", ORIGIN)))
     assert io._admit(_request()).accepted
     io._robots.stand("alpha")
-    io._lease_s = 2.0
+    io._pair_grace_s = 2.0
     io._io = _HoldsEverything()
     io._stopping = asyncio.Event()
     hosted = io._handover("alpha")
@@ -442,7 +444,7 @@ def test_the_stay_taking_a_robot_over_ends_the_one_hosting_it_and_not_itself():
     async def take_over() -> tuple:
         stay = asyncio.create_task(io._stay(goal))
         # Enough turns for the stay to end the goal it took the robot from
-        # and to settle into watching the robot's lease.
+        # and to settle into watching the robot's pair grace time.
         for _ in range(50):
             await asyncio.sleep(0)
         watching = not stay.done(), list(goal.answers)

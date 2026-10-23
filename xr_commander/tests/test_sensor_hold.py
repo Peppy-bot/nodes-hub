@@ -18,9 +18,9 @@ from xr_commander.sensor_hold import (
     follow_chosen_robot,
 )
 
-HELD = Answer(success=True, message="held", lease_ms=9000)
-RELEASED = Answer(success=True, message="released", lease_ms=9000)
-REFUSED = Answer(success=False, message="no robot named alpha stands", lease_ms=0)
+HELD = Answer(success=True, message="held", hold_ms=9000)
+RELEASED = Answer(success=True, message="released", hold_ms=9000)
+REFUSED = Answer(success=False, message="no robot named alpha stands", hold_ms=0)
 
 
 class FakeClock:
@@ -85,7 +85,7 @@ async def test_a_changed_choice_releases_the_robot_held_before_it_holds_the_next
 
 
 @pytest.mark.asyncio
-async def test_the_hold_is_renewed_a_third_of_the_way_through_its_lease():
+async def test_the_hold_is_renewed_a_third_of_the_way_through_its_hold_length():
     streams = FakeStreams()
     clock = FakeClock()
     hold = holding(streams, clock)
@@ -95,7 +95,7 @@ async def test_the_hold_is_renewed_a_third_of_the_way_through_its_lease():
     await hold.follow("alpha")
     assert streams.calls == [("hold", "alpha")]
 
-    # A 9 s lease is renewed after 3 s, then 3 s after that renewal.
+    # A 9 s hold is renewed after 3 s, then 3 s after that renewal.
     clock.now += 0.125
     await hold.follow("alpha")
     clock.now += 3.0
@@ -104,8 +104,8 @@ async def test_the_hold_is_renewed_a_third_of_the_way_through_its_lease():
 
 
 @pytest.mark.asyncio
-async def test_a_short_lease_is_renewed_no_faster_than_the_choice_is_read():
-    streams = FakeStreams(holds=[Answer(success=True, message="held", lease_ms=0)])
+async def test_a_short_hold_is_renewed_no_faster_than_the_choice_is_read():
+    streams = FakeStreams(holds=[Answer(success=True, message="held", hold_ms=0)])
     clock = FakeClock()
     # Steps that are exact in binary, so the sum lands on the period.
     timing = Timing(follow_period_s=0.25)
@@ -314,12 +314,12 @@ async def test_the_loop_follows_the_choice_until_the_token_cancels():
         await asyncio.wait_for(task, 5.0)
 
 
-def sensor_state(module, success=True, message="held", lease_ms=9000):
+def sensor_state(module, success=True, message="held", hold_ms=9000):
     """A hold or release answer with no sensor listed."""
     return module.ResponseData(
         success=success,
         message=message,
-        lease_ms=lease_ms,
+        hold_ms=hold_ms,
         sensors=[],
         rgb_cameras=[],
         rgbd_cameras=[],
@@ -361,7 +361,7 @@ async def test_a_refusal_over_the_wire_is_tried_again():
         mock = h.mocks.deps.sensor_streams
         mock.hold.enqueue_response(
             sensor_state(
-                sensor_streams_hold, success=False, message="no robot", lease_ms=0
+                sensor_streams_hold, success=False, message="no robot", hold_ms=0
             )
         )
         mock.hold.enqueue_response(sensor_state(sensor_streams_hold))

@@ -9,9 +9,9 @@ sent an XR frame within `Timing.session_timeout_s`. A launcher deploys the
 headset beside a simulation whether or not someone wears it, and the
 chosen robot falls back to the first robot paired, so without a session
 the headset holds nothing and the robots' cameras stay idle. The headset
-renews the hold a third of the way through each lease the simulation
-answers with. When the robot it drives changes, or it drives none, it
-releases its hold on the robot it held before it holds the next one, and
+renews the hold a third of the way through each hold length (`hold_ms`) the
+simulation answers with. When the robot it drives changes, or it drives none,
+it releases its hold on the robot it held before it holds the next one, and
 it releases its hold when the node stops. On a stack without a simulation
 the slot is vacant, and the headset holds nothing.
 
@@ -59,7 +59,7 @@ class Answer:
     success: bool
     message: str
     # How long a hold lasts from the call that made or renewed it (ms).
-    lease_ms: int
+    hold_ms: int
 
 
 class SensorStreams:
@@ -97,7 +97,7 @@ class SensorStreams:
 
 
 def _answer(data) -> Answer:
-    return Answer(success=data.success, message=data.message, lease_ms=data.lease_ms)
+    return Answer(success=data.success, message=data.message, hold_ms=data.hold_ms)
 
 
 class ChosenRobotHold:
@@ -150,7 +150,7 @@ class ChosenRobotHold:
             await self._release_held()
 
     async def _hold(self, robot: str) -> None:
-        # Read before the call: the lease runs from the simulation's answer,
+        # Read before the call: the hold runs from the simulation's answer,
         # so the renewal lands early rather than late.
         now = self._monotonic()
         try:
@@ -167,7 +167,7 @@ class ChosenRobotHold:
         if not self._is_held:
             log(f"holding the sensors of {robot} at their own rate")
             self._is_held = True
-        renew_after_s = max(answer.lease_ms / 3000.0, self.timing.follow_period_s)
+        renew_after_s = max(answer.hold_ms / 3000.0, self.timing.follow_period_s)
         self._renew_at = now + renew_after_s
 
     async def _release_held(self) -> None:
@@ -176,7 +176,8 @@ class ChosenRobotHold:
         self._failing.clear()
         if robot is None:
             return
-        # Not tried again: an unreleased hold lapses with its lease.
+        # Not tried again: an unreleased hold lapses at the end of its hold
+        # length.
         try:
             answer = await self._streams.release(robot)
         except Exception as e:

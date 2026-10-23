@@ -17,6 +17,7 @@ import pytest
 _NODE_DIR = Path(__file__).resolve().parents[1]
 # Where the base images of both simulation nodes are built from.
 _IMAGES_DIR = _NODE_DIR.parent / "sim_base_images"
+_R2_ENDPOINT = "https://b9abcee11c090aef5279f874ff078826.r2.cloudflarestorage.com"
 
 
 def _shell_value(script: str, name: str) -> str:
@@ -183,8 +184,31 @@ def _bundle(path: Path, files: dict[str, bytes]) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+# Each bucket has its own R2 token, so each variant reads with its own pair.
+_R2_CREDENTIAL_NAMES = {
+    "isaac": ("WALDO_R2_ACCESS_KEY_ID", "WALDO_R2_SECRET_ACCESS_KEY"),
+    "mujoco": ("PEPPY_R2_DATA01_ACCESS_KEY_ID", "PEPPY_R2_DATA01_SECRET_ACCESS_KEY"),
+}
+
+
+def _r2_credentials_env(variants) -> dict[str, str]:
+    """The R2 key pair of each variant in `variants`, each with values of its own."""
+    env = {}
+    for variant in variants:
+        key_name, secret_name = _R2_CREDENTIAL_NAMES[variant]
+        env[key_name] = f"{variant}-key"
+        env[secret_name] = f"{variant}-secret"
+    return env
+
+
 def _run_installer(
-    tmp_path, *, variant="isaac", corrupt=False, download_fails=False, checksum=None
+    tmp_path,
+    *,
+    variant="isaac",
+    corrupt=False,
+    download_fails=False,
+    checksum=None,
+    credential_variants=("isaac", "mujoco"),
 ):
     # The two bundles the installer fetches: what the output holds after a
     # run, one directory per robot.
@@ -234,6 +258,8 @@ with open(os.environ["MOCK_RCLONE_LOG"], "a") as log:
     log.write(json.dumps({
         "args": sys.argv[1:],
         "endpoint": os.environ["RCLONE_CONFIG_R2_ENDPOINT"],
+        "access_key_id": os.environ["RCLONE_CONFIG_R2_ACCESS_KEY_ID"],
+        "secret_access_key": os.environ["RCLONE_CONFIG_R2_SECRET_ACCESS_KEY"],
     }) + "\n")
 if os.environ["MOCK_RCLONE_FAIL"] == "1":
     sys.exit(9)
@@ -266,8 +292,7 @@ os.execv(os.environ["REAL_TAR"], ["tar", *sys.argv[1:]])
         env={
             "PATH": f"{bin_dir}{os.pathsep}{os.defpath}",
             "TMPDIR": str(scratch),
-            "RCLONE_S3_ACCESS_KEY_ID": "test-key",
-            "RCLONE_S3_SECRET_ACCESS_KEY": "test-secret",
+            **_r2_credentials_env(credential_variants),
             "MOCK_RCLONE_LOG": str(rclone_log),
             "MOCK_RCLONE_FAIL": "1" if download_fails else "0",
             "MOCK_BUNDLES": json.dumps({
@@ -290,6 +315,12 @@ os.execv(os.environ["REAL_TAR"], ["tar", *sys.argv[1:]])
     return result, calls, files
 
 
+def _assert_reaches_r2_with_the_credentials_of(variant, call):
+    assert call["endpoint"] == _R2_ENDPOINT
+    assert call["access_key_id"] == f"{variant}-key"
+    assert call["secret_access_key"] == f"{variant}-secret"
+
+
 def test_isaac_installer_fetches_only_pinned_keys_and_extracts_each_bundle_under_its_robot(tmp_path):
     result, calls, files = _run_installer(tmp_path)
     assert result.returncode == 0, result.stderr
@@ -300,9 +331,7 @@ def test_isaac_installer_fetches_only_pinned_keys_and_extracts_each_bundle_under
     for call in calls:
         assert call["args"][3:] == ["--progress"]
         assert Path(call["args"][2]).is_relative_to(tmp_path / "scratch")
-        assert call["endpoint"] == (
-            "https://b9abcee11c090aef5279f874ff078826.r2.cloudflarestorage.com"
-        )
+        _assert_reaches_r2_with_the_credentials_of("isaac", call)
     output = tmp_path / "output"
     assert {
         str(path.relative_to(output)): path.read_bytes()
@@ -354,10 +383,24 @@ def test_mujoco_installer_keeps_its_directory_copy_without_isaac_pin(tmp_path):
         f"{tmp_path}/output/",
         "--progress",
     ]
-    assert calls[0]["endpoint"] == (
-        "https://b9abcee11c090aef5279f874ff078826.r2.cloudflarestorage.com"
-    )
+    _assert_reaches_r2_with_the_credentials_of("mujoco", calls[0])
     output = tmp_path / "output"
     assert list(output.iterdir()) == [output / "robot.xml"]
     assert (output / "robot.xml").read_bytes() == b"MuJoCo robot"
     assert not (tmp_path / "tar.jsonl").exists()
+
+
+@pytest.mark.parametrize("variant, other", [("isaac", "mujoco"), ("mujoco", "isaac")])
+def test_installer_refuses_to_run_without_the_credentials_of_its_bucket(
+    tmp_path, variant, other
+):
+    # R2 refuses the token of the other bucket, so the installer must not fall
+    # back to it.
+    result, calls, _ = _run_installer(
+        tmp_path, variant=variant, credential_variants=(other,)
+    )
+    assert result.returncode != 0
+    assert f"{_R2_CREDENTIAL_NAMES[variant][0]} must be set" in result.stderr
+    assert calls == []
+    output = tmp_path / "output"
+    assert list(output.iterdir()) == [output / "stale.usd"]
