@@ -397,10 +397,14 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         max_gripper_rate_frac_s: params.max_gripper_rate_frac_s,
     });
 
+    let arm_activity = [LeaderActivity::default(), LeaderActivity::default()];
+    let gripper_activity = [LeaderActivity::default(), LeaderActivity::default()];
     let channels = ArmPair::new(
         ArmChannels {
             command: cmd_tx0.clone(),
             gripper_command: gripcmd_tx0.clone(),
+            leader: arm_activity[0].clone(),
+            gripper_leader: gripper_activity[0].clone(),
             measured: meas_rx0,
             gripper: grip_rx0,
             goals: goal_rx0,
@@ -411,6 +415,8 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         ArmChannels {
             command: cmd_tx1.clone(),
             gripper_command: gripcmd_tx1.clone(),
+            leader: arm_activity[1].clone(),
+            gripper_leader: gripper_activity[1].clone(),
             measured: meas_rx1,
             gripper: grip_rx1,
             goals: goal_rx1,
@@ -465,8 +471,6 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     let goal_busy = [busy[0].clone(), busy[1].clone()];
     // When a leader last streamed each limb: the goal handlers refuse a goal
     // on a limb a leader is streaming.
-    let arm_activity = [LeaderActivity::default(), LeaderActivity::default()];
-    let gripper_activity = [LeaderActivity::default(), LeaderActivity::default()];
     tokio::spawn(async move {
         startup::wait_until_ready(&runner, &token).await;
 
