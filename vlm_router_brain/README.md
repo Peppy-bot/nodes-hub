@@ -52,7 +52,9 @@ rolls (a grab by pose with an orientation tries that one alone), then opens,
 reaches, closes with the goal's `max_effort` and lifts. It judges the hold
 twice: from the close's `final_opening`, then from the first `limb_states`
 snapshot captured after the lift, which it waits up to 1 s for; below 0.05
-the grab fails, with `closed on nothing` or `slipped while lifting`.
+the grab fails, with `closed on nothing` or `slipped while lifting`. A grab
+that fails once the descent was sent first opens the gripper and moves the
+arm straight back up to the pre-grasp point, unless a stop ended the step.
 `drop_item` opens the gripper where it is; `place_item` carries the item to
 the pose and opens there. Every move goes through the backbone that the
 `limb_motion` slot binds, and the `limb_state` slot gives the measured

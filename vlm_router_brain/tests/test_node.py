@@ -257,7 +257,7 @@ async def test_identify_then_a_scripted_grab_holds_the_item():
         assert state.gripper_openings == [0.3, 1.0]
 
 
-async def test_a_gripper_that_closes_on_nothing_fails_the_grab_and_holds_nothing():
+async def test_a_gripper_that_closes_on_nothing_retreats_fails_the_grab_and_holds_nothing():
     async with harness.start(partial(setup, provider=FakeProvider()), parameters=params()) as h:
         answer_the_camera(h)
         await once_the_brain_has_limbs(h)
@@ -265,11 +265,15 @@ async def test_a_gripper_that_closes_on_nothing_fails_the_grab_and_holds_nothing
         grab = await grab_fx.send_goal(h, grab_by_pose([0.5, 0.1, 0.75]), QoSProfile.Standard, 5.0)
         assert grab.accepted, grab.reason
         await stop_grip_at(h, 1.0)
-        await land_move(h)
+        pre = await land_move(h)
         reach = await land_move(h)
         # A grab by pose reaches the pose itself, unlowered.
         assert [round(v, 6) for v in reach.position] == [0.5, 0.1, 0.75]
         await stop_grip_at(h, 0.0)
+        # The retreat: the gripper opens and the arm goes back up to the
+        # pre-grasp point.
+        assert (await stop_grip_at(h, 1.0)).opening == 1.0
+        assert (await land_move(h)).position == pre.position
         result = (await grab.get_result(WAIT)).data
         assert (result.success, result.message) == (False, "gripper 'left_gripper' closed on nothing")
         assert (result.gripper_name, result.item_id) == ("", "")
