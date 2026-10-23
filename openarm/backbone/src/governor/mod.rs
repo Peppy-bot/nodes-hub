@@ -167,8 +167,9 @@ const MIN_GRADIENT_NORM_SQ: f64 = 1e-18;
 /// monotone along a joint-space segment, so a fixed grid would step over a thin
 /// pocket on a large jump; scaling the probe count to the segment length keeps the
 /// resolution fixed. Tied to the smallest hull feature the scan must resolve (a few
-/// mm of surface motion).
-const MAX_PROBE_ARC_RAD: f64 = 0.01;
+/// mm of surface motion). A planned path is checked at admission at this
+/// resolution too.
+pub(crate) const MAX_PROBE_ARC_RAD: f64 = 0.01;
 /// Probe-count floor for near-zero steps, where the `MAX_PROBE_ARC_RAD` count
 /// rounds down to almost nothing. The spacing guarantee itself comes from the
 /// per-arc count (a full-speed step still gets `excursion / MAX_PROBE_ARC_RAD`
@@ -202,10 +203,39 @@ enum Clip {
 /// The nearest checked pair at a configuration: signed surface distance (m;
 /// positive is clearance, negative is penetration) and the two link names. The
 /// operator proximity readout.
+#[derive(Clone, Debug, PartialEq)]
 pub struct NearestPair {
     pub distance: f64,
     pub link_a: String,
     pub link_b: String,
+}
+
+/// A planned path the governor refuses at admission: at its nearest
+/// configuration this pair stands inside the stop band, nearer than the path
+/// starts.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PathBlocked {
+    pub pair: NearestPair,
+    pub d_stop: f64,
+}
+
+impl std::fmt::Display for PathBlocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (a, b, band) = (&self.pair.link_a, &self.pair.link_b, self.d_stop * 1000.0);
+        let mm = self.pair.distance * 1000.0;
+        if mm < 0.0 {
+            write!(
+                f,
+                "the planned path would push {a} {:.0} mm into {b}, inside the {band:.0} mm stop band",
+                -mm
+            )
+        } else {
+            write!(
+                f,
+                "the planned path would bring {a} within {mm:.0} mm of {b}, inside the {band:.0} mm stop band"
+            )
+        }
+    }
 }
 
 pub struct Governor {
@@ -324,6 +354,30 @@ impl Governor {
     /// candidate hold, which reports Stopped in either mode.
     pub fn guard(&self) -> Guard {
         self.guard
+    }
+
+    /// Walk a planned `path` of whole configurations, its start first, and
+    /// report the nearest pair of any configuration that closes into the
+    /// stop band: nearer than the stop distance, and nearer than the path
+    /// starts, so a path that opens a gap from inside the band is admitted as
+    /// the barrier admits a separating step. `None` admits the path, always
+    /// while the governor is disabled, as its barrier is then.
+    pub fn path_blocked(&mut self, path: &[GovState]) -> Option<PathBlocked> {
+        if !self.enabled {
+            return None;
+        }
+        let start = self.proximity(path.first()?)?;
+        let nearest = path
+            .iter()
+            .skip(1)
+            .filter_map(|state| self.proximity(state))
+            .min_by(|a, b| a.distance.total_cmp(&b.distance))?;
+        (nearest.distance < self.d_stop && nearest.distance < start.distance).then_some(
+            PathBlocked {
+                pair: nearest,
+                d_stop: self.d_stop,
+            },
+        )
     }
 
     /// Retune the band at runtime (the operator's stop/safe controls). Rejects an
@@ -714,6 +768,37 @@ mod tests {
 
     fn v2_governor(enabled: bool) -> Governor {
         governor_for(openarm_description::HardwareVersion::V2, enabled)
+    }
+
+    /// A path from Ready that stays in free space is admitted; one that swings
+    /// the left wrist over the pedestal's head is refused by the pair it would
+    /// close; the way back out of that overlap is admitted, as the path only
+    /// opens the gap; and a disabled governor admits everything.
+    #[test]
+    fn a_planned_path_into_the_pedestal_is_blocked_and_a_free_or_opening_one_admitted() {
+        let mut governor = v2_governor(true);
+        let grippers = ArmPair::new(0.0, 0.0);
+        let at = |arms: ArmPair<JointVec>| GovState::new(arms, grippers);
+        let mut lifted = ready();
+        lifted.left[0] -= 0.3;
+        let free = [at(ready()), at(lifted)];
+        assert_eq!(governor.path_blocked(&free), None);
+
+        let swung = [at(ready()), at(over_the_head())];
+        let blocked = governor
+            .path_blocked(&swung)
+            .expect("the swing over the head is refused");
+        assert!(blocked.pair.distance < D_STOP, "{blocked}");
+        assert!(
+            blocked.to_string().contains("inside the 5 mm stop band"),
+            "{blocked}"
+        );
+
+        let back_out = [at(over_the_head()), at(ready())];
+        assert_eq!(governor.path_blocked(&back_out), None);
+
+        let mut disabled = v2_governor(false);
+        assert_eq!(disabled.path_blocked(&swung), None);
     }
 
     /// Both arms in the Ready posture, the resting posture a bring-up moves to.

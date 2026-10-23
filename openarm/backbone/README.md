@@ -68,6 +68,21 @@ refusal. Releasing the headset's grip streams the measured pose for a quarter
 second, so a posture button pressed within about half a second of letting go
 is refused; a later press goes through.
 
+An admitted arm move is also checked against the collision guard before it
+plays: its planned path, the joint trajectory of a joint move or the walk of
+a Cartesian plan, is probed once per 0.01 rad of its farthest joint's travel,
+each probe placed beside where the other arm's own plan has it at that
+instant and the grippers where they are commanded. A path that closes into
+the stop band, nearer than `d_stop_m` and nearer than it starts, is refused
+before it starts, as `goal refused: the planned path would bring <link>
+within <mm> mm of <link>, inside the <mm> mm stop band`, the move completing
+failed with the pose it would have started from and the arm staying put. The
+check reads the paths as the guard reads the arms: a posture's second share
+is checked beside the first share's motion, and a goal admitted while the
+other arm moves is checked beside that move. `check_arm_move` answers the
+same refusal. A path that opens a gap from inside the band is admitted, as
+the guard admits a separating step, and a disabled guard admits every path.
+
 ## The governed pipeline
 
 `Governor::govern(prev, cand, measured, hands, dt)` runs six stages, each
@@ -240,8 +255,8 @@ arrays are empty. The message then ends with one of these reasons:
 A posture move sends no gripper command, so each gripper goes on as its
 last command drives it. On v2 with both grippers fully open, the jaws at
 Home sit closer to the torso than the validated stop distance (`d_stop_m`,
-5 mm). Thus the governor holds both arms short of Home: close the grippers
-first.
+5 mm). Thus a move to Home with the grippers open is refused at admission,
+naming a jaw and the torso: close the grippers first.
 
 ### Services of limb_motion
 
