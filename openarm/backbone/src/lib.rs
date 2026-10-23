@@ -26,6 +26,7 @@ mod node;
 mod planner;
 mod publish;
 mod serving;
+mod settle;
 mod startup;
 mod streams;
 #[cfg(test)]

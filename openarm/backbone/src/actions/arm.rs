@@ -1,13 +1,14 @@
 //! Arm move-action admission: the `move_arm_joints` and `move_arm` handlers the
 //! backbone exposes to the commander, and the `check_arm_move` service that
 //! asks whether a Cartesian goal has a plan without moving. Each validates
-//! the goal (arm_name, finiteness, duration, and joint limits for joint
-//! moves) and refuses it while a leader streams the arm; a move claims the
-//! target arm's single-flight slot, then hands the
+//! the goal (arm_name, finiteness, duration, the settle it asks for, and
+//! joint limits for joint moves) and refuses it while a leader streams the
+//! arm; a move claims the target arm's single-flight slot, then hands the
 //! accepted goal to that arm's planner over its goal channel. The planner
-//! runs the motion - governed against the other arm - completes the goal, and
-//! releases the busy slot at the terminal. The check claims nothing: the
-//! coordinator asks the planner and answers the duration or the refusal.
+//! runs the motion - governed against the other arm - settles it, completes
+//! the goal, and releases the busy slot at the terminal. The check claims
+//! nothing: the coordinator asks the planner and answers the duration or the
+//! refusal.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,71 +18,85 @@ use peppygen::exposed_actions::limb_motion::{move_arm, move_arm_joints};
 use peppygen::exposed_services::limb_motion::check_arm_move;
 use peppygen::{NodeRunner, Result};
 use srs_model::Limit;
-use srs_model::nalgebra::Isometry3;
 use tokio::sync::{mpsc, oneshot};
 use tracing::error;
 
 use crate::coordinator::CoordinatorRequest;
 use crate::planner::{ARM_BUSY, Goal, JointReply};
-use crate::types::{ARM_DOF, JointVec, PlanTolerance, Side, pose_from_wire};
+use crate::settle::Settle;
+use crate::types::{
+    ARM_DOF, ArmMoveRequest, JointVec, PoseTolerance, Side, joint_tolerances_from_wire,
+    move_seconds_from_wire,
+};
 
-use crate::actions::{ARM_LEADER_STREAMING, blocking_ask_coordinator, claim};
+use crate::actions::{ARM_LEADER_STREAMING, ARM_NO_FRESH_STATE, blocking_ask_coordinator, claim};
 use crate::streams::LeaderActivity;
-
-/// The longest a move may be asked to take: the deadline the robot_control
-/// exposure gives a move. A plan walks the control ticks of the request, so
-/// the bound also bounds its work.
-pub const MAX_MOVE_DURATION_S: f64 = 60.0;
-
-/// The refusal of a duration outside what a move may be asked to take.
-const INVALID_DURATION: &str = "duration_s must be a number of seconds from 0 to 60";
-
-/// Whether `duration_s` is a duration a move may be asked to take.
-fn valid_duration(duration_s: f64) -> bool {
-    duration_s.is_finite() && (0.0..=MAX_MOVE_DURATION_S).contains(&duration_s)
-}
 
 fn target_in_limits(q: &JointVec, limits: &[Limit; ARM_DOF]) -> bool {
     q.iter().zip(limits).all(|(&v, l)| v >= l.lo && v <= l.hi)
 }
 
-/// A Cartesian move as `move_arm` takes it and `check_arm_move` checks it,
-/// parsed once off the wire: both carry the same fields with the same
-/// meaning, and both refuse the same values with the same words.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct ArmMoveRequest {
-    pub side: Side,
-    pub target: Isometry3<f64>,
-    pub tolerance: PlanTolerance,
-    pub duration: Duration,
+/// A `move_arm` goal parsed off the wire: the move to plan, and the settle it
+/// asks for, whose slack covers the plan's on each axis.
+struct MoveArmGoal {
+    request: ArmMoveRequest,
+    settle: Settle<PoseTolerance>,
 }
 
-impl ArmMoveRequest {
-    pub(crate) fn from_wire(
-        arm_name: &str,
-        position: [f64; 3],
-        orientation: [f64; 4],
-        duration_s: f64,
-        plan_position_tolerance_m: f64,
-        plan_orientation_tolerance_rad: f64,
-    ) -> std::result::Result<Self, String> {
-        let side =
-            Side::from_arm_name(arm_name).ok_or_else(|| Side::UNKNOWN_ARM_NAME.to_string())?;
-        let target = pose_from_wire(position, orientation)
-            .map_err(|reason| format!("goal pose has {reason}"))?;
-        let tolerance =
-            PlanTolerance::from_wire(plan_position_tolerance_m, plan_orientation_tolerance_rad)
-                .map_err(|reason| format!("goal has {reason}"))?;
-        if !valid_duration(duration_s) {
-            return Err(INVALID_DURATION.to_string());
-        }
-        Ok(Self {
-            side,
-            target,
-            tolerance,
-            duration: Duration::from_secs_f64(duration_s),
-        })
+fn move_arm_goal(d: &move_arm::GoalRequestData) -> std::result::Result<MoveArmGoal, String> {
+    let request = ArmMoveRequest::from_wire(
+        &d.arm_name,
+        d.position,
+        d.orientation,
+        d.duration_s,
+        d.plan_position_tolerance_m,
+        d.plan_orientation_tolerance_rad,
+    )?;
+    let tolerance = PoseTolerance::from_wire(
+        "settle",
+        d.settle_position_tolerance_m,
+        d.settle_orientation_tolerance_rad,
+    )?;
+    tolerance.covers(&request.tolerance)?;
+    let timeout = move_seconds_from_wire("settle_timeout_s", d.settle_timeout_s)?;
+    Ok(MoveArmGoal {
+        request,
+        settle: Settle { tolerance, timeout },
+    })
+}
+
+/// A `move_arm_joints` goal parsed off the wire: a finite target inside the
+/// arm's joint limits, the duration, and the settle it asks for.
+struct JointMoveRequest {
+    side: Side,
+    target: JointVec,
+    duration: Duration,
+    settle: Settle<JointVec>,
+}
+
+fn joint_move_request(
+    d: &move_arm_joints::GoalRequestData,
+    limits: &[[Limit; ARM_DOF]; 2],
+) -> std::result::Result<JointMoveRequest, String> {
+    let side =
+        Side::from_arm_name(&d.arm_name).ok_or_else(|| Side::UNKNOWN_ARM_NAME.to_string())?;
+    if !d.joint_positions.iter().all(|v| v.is_finite()) {
+        return Err("non-finite joint target".to_string());
     }
+    let duration = move_seconds_from_wire("duration_s", d.duration_s)?;
+    if !target_in_limits(&d.joint_positions, &limits[side.index()]) {
+        return Err("target out of joint limits".to_string());
+    }
+    let settle = Settle {
+        tolerance: joint_tolerances_from_wire(d.settle_tolerances_rad)?,
+        timeout: move_seconds_from_wire("settle_timeout_s", d.settle_timeout_s)?,
+    };
+    Ok(JointMoveRequest {
+        side,
+        target: d.joint_positions,
+        duration,
+        settle,
+    })
 }
 
 /// Expose `move_arm_joints`: validate + claim, then hand the goal to the arm's
@@ -90,6 +105,7 @@ pub async fn run_move_arm_joints(
     runner: Arc<NodeRunner>,
     goal_txs: [mpsc::Sender<Goal>; 2],
     busy: [Arc<AtomicBool>; 2],
+    fresh: [Arc<AtomicBool>; 2],
     activity: [LeaderActivity; 2],
     limits: [[Limit; ARM_DOF]; 2],
 ) -> Result<()> {
@@ -97,45 +113,34 @@ pub async fn run_move_arm_joints(
     loop {
         let accepted = handle
             .handle_goal_next_request(|req| {
-                let d = &req.data;
-                let Some(idx) = Side::from_arm_name(&d.arm_name).map(Side::index) else {
-                    return Ok(move_arm_joints::GoalDecision::reject(
-                        Side::UNKNOWN_ARM_NAME,
-                    ));
+                let request = match joint_move_request(&req.data, &limits) {
+                    Ok(request) => request,
+                    Err(reason) => return Ok(move_arm_joints::GoalDecision::reject(reason)),
                 };
-                if !d.joint_positions.iter().all(|v| v.is_finite()) {
-                    return Ok(move_arm_joints::GoalDecision::reject(
-                        "non-finite joint target",
-                    ));
+                if !fresh[request.side.index()].load(Ordering::Acquire) {
+                    return Ok(move_arm_joints::GoalDecision::reject(ARM_NO_FRESH_STATE));
                 }
-                if !valid_duration(d.duration_s) {
-                    return Ok(move_arm_joints::GoalDecision::reject(INVALID_DURATION));
-                }
-                if !target_in_limits(&d.joint_positions, &limits[idx]) {
-                    return Ok(move_arm_joints::GoalDecision::reject(
-                        "target out of joint limits",
-                    ));
-                }
-                if activity[idx].streaming() {
+                if activity[request.side.index()].streaming() {
                     return Ok(move_arm_joints::GoalDecision::reject(ARM_LEADER_STREAMING));
                 }
-                if !claim(&busy[idx]) {
+                if !claim(&busy[request.side.index()]) {
                     return Ok(move_arm_joints::GoalDecision::reject(ARM_BUSY));
                 }
                 Ok(move_arm_joints::GoalDecision::accept())
             })
             .await?;
         let Some(ctx) = accepted else { return Ok(()) };
-        let idx = Side::from_arm_name(&ctx.request().data.arm_name)
-            .map(Side::index)
-            .expect("validated on accept");
-        let target = ctx.request().data.joint_positions;
-        let duration_s = ctx.request().data.duration_s;
+        let request =
+            joint_move_request(&ctx.request().data, &limits).expect("validated on accept");
+        let idx = request.side.index();
         if goal_txs[idx]
             .send(Goal::Joint {
-                target,
-                duration: Duration::from_secs_f64(duration_s),
-                reply: JointReply::MoveArmJoints(Box::new(ctx)),
+                target: request.target,
+                duration: request.duration,
+                reply: JointReply::MoveArmJoints {
+                    ctx: Box::new(ctx),
+                    settle: request.settle,
+                },
             })
             .await
             .is_err()
@@ -147,51 +152,43 @@ pub async fn run_move_arm_joints(
     }
 }
 
-/// The `move_arm` goal's fields as [`ArmMoveRequest::from_wire`] takes them.
-fn move_arm_request(d: &move_arm::GoalRequestData) -> std::result::Result<ArmMoveRequest, String> {
-    ArmMoveRequest::from_wire(
-        &d.arm_name,
-        d.position,
-        d.orientation,
-        d.duration_s,
-        d.plan_position_tolerance_m,
-        d.plan_orientation_tolerance_rad,
-    )
-}
-
 /// Expose `move_arm` (Cartesian): validate + claim, then hand the goal to the
 /// arm's planner, which plans IK along the path and runs it governed.
 pub async fn run_move_arm(
     runner: Arc<NodeRunner>,
     goal_txs: [mpsc::Sender<Goal>; 2],
     busy: [Arc<AtomicBool>; 2],
+    fresh: [Arc<AtomicBool>; 2],
     activity: [LeaderActivity; 2],
 ) -> Result<()> {
     let mut handle = move_arm::ActionHandle::expose(&runner).await?;
     loop {
         let accepted = handle
             .handle_goal_next_request(|req| {
-                let request = match move_arm_request(&req.data) {
-                    Ok(request) => request,
+                let side = match move_arm_goal(&req.data) {
+                    Ok(goal) => goal.request.side,
                     Err(reason) => return Ok(move_arm::GoalDecision::reject(reason)),
                 };
-                if activity[request.side.index()].streaming() {
+                if !fresh[side.index()].load(Ordering::Acquire) {
+                    return Ok(move_arm::GoalDecision::reject(ARM_NO_FRESH_STATE));
+                }
+                if activity[side.index()].streaming() {
                     return Ok(move_arm::GoalDecision::reject(ARM_LEADER_STREAMING));
                 }
-                if !claim(&busy[request.side.index()]) {
+                if !claim(&busy[side.index()]) {
                     return Ok(move_arm::GoalDecision::reject(ARM_BUSY));
                 }
                 Ok(move_arm::GoalDecision::accept())
             })
             .await?;
         let Some(ctx) = accepted else { return Ok(()) };
-        let request = move_arm_request(&ctx.request().data).expect("validated on accept");
+        let MoveArmGoal { request, settle } =
+            move_arm_goal(&ctx.request().data).expect("validated on accept");
         let idx = request.side.index();
         if goal_txs[idx]
             .send(Goal::Cartesian {
-                target: request.target,
-                tolerance: request.tolerance,
-                duration: request.duration,
+                request,
+                settle,
                 ctx: Box::new(ctx),
             })
             .await
@@ -204,13 +201,15 @@ pub async fn run_move_arm(
     }
 }
 
-/// Expose `check_arm_move`: validate the fields as `move_arm` does, then ask
-/// the coordinator, which asks the arm's planner for a plan from the held
-/// setpoint and moves nothing. The answer is the duration the move would
-/// take, or the words a `move_arm` refusal gives.
+/// Expose `check_arm_move`: validate the planning fields as `move_arm` does,
+/// refuse it as `move_arm` refuses (no fresh follower state, a streaming
+/// leader), then ask the coordinator, which asks the arm's planner for a plan
+/// from the held setpoint and moves nothing. The answer is the duration the
+/// move would take, or the words a `move_arm` refusal gives.
 pub async fn run_check_arm_move(
     runner: Arc<NodeRunner>,
     requests: mpsc::Sender<CoordinatorRequest>,
+    fresh: [Arc<AtomicBool>; 2],
     activity: [LeaderActivity; 2],
 ) -> Result<()> {
     loop {
@@ -228,6 +227,13 @@ pub async fn run_check_arm_move(
                 Ok(request) => request,
                 Err(reason) => return Ok(check_arm_move::Response::new(false, reason, 0.0)),
             };
+            if !fresh[request.side.index()].load(Ordering::Acquire) {
+                return Ok(check_arm_move::Response::new(
+                    false,
+                    ARM_NO_FRESH_STATE.to_string(),
+                    0.0,
+                ));
+            }
             if activity[request.side.index()].streaming() {
                 return Ok(check_arm_move::Response::new(
                     false,

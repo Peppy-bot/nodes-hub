@@ -87,7 +87,10 @@
           name: "move_arm_joints",
           refine: {
             goal_service: {
-              request_message_format: { joint_positions: { $length: 5 } },
+              request_message_format: {
+                joint_positions: { $length: 5 },
+                settle_tolerances_rad: { $length: 5 },
+              },
             },
             result_service: {
               response_message_format: { final_joint_positions: { $length: 5 } },
@@ -105,9 +108,11 @@
         // cannot; the same target often solves from a different starting
         // posture. See so101/README.md.
         //
-        // Orientation is best effort on a 5-DOF arm: only position is
-        // verified, against IK_POSITION_TOLERANCE_M. Orientation is a soft,
-        // low-weight objective and is not gated.
+        // The solve is verified against the goal's plan tolerances: the
+        // distance and the angle between the planned and the commanded
+        // pose. Five joints underactuate the three rotations, so a goal
+        // that names a tight plan_orientation_tolerance_rad often has no
+        // plan; a wide one admits the nearest orientation the arm reaches.
         //
         // Endpoints only: one solve for the goal, then a minimum-jerk blend
         // in joint space. The end effector does not walk the straight line

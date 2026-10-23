@@ -36,7 +36,8 @@ use srs_model::{
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
-use crate::types::{ARM_DOF, JointVec, PlanTolerance, Side, world_pose_arrays};
+use crate::settle::{Settle, Verdict, joint_shortfall, pose_shortfall, verdict};
+use crate::types::{ARM_DOF, ArmMoveRequest, JointVec, PoseTolerance, Side, world_pose_arrays};
 use crate::upstream::Upstream;
 
 /// Slack the runtime per-tick velocity guard of a line allows over the planned
@@ -95,18 +96,47 @@ pub struct ReadyReply {
 }
 
 /// Where a joint move reports its terminal: the move_arm_joints action goal
-/// that carried it (boxed: the goal context dwarfs the other variant), or one
-/// arm's share of a move_to_ready goal.
+/// that carried it (boxed: the goal context dwarfs the other variant) with
+/// the settle the goal asked for, or one arm's share of a posture goal
+/// (move_to_ready or move_to_home), which ends at the planned end of its
+/// trajectory.
 pub enum JointReply {
-    MoveArmJoints(Box<move_arm_joints::GoalContext>),
+    MoveArmJoints {
+        ctx: Box<move_arm_joints::GoalContext>,
+        settle: Settle<JointVec>,
+    },
     Ready(ReadyReply),
 }
 
 impl JointReply {
     fn is_cancelled(&self) -> bool {
         match self {
-            Self::MoveArmJoints(ctx) => ctx.is_cancelled(),
+            Self::MoveArmJoints { ctx, .. } => ctx.is_cancelled(),
             Self::Ready(r) => r.cancelled.load(Ordering::Acquire),
+        }
+    }
+
+    /// How a joint move whose trajectory has run to its planned end ends at
+    /// `now`, with the arm measuring `measured` against `target`: a posture
+    /// share completes there; a move_arm_joints goal completes once every
+    /// joint stands within its settle tolerance, fails once its settle timeout
+    /// has passed, and stays in flight in between.
+    fn settle_outcome(
+        &self,
+        measured: &JointVec,
+        target: &JointVec,
+        clock: &MotionClock,
+        now: Instant,
+    ) -> Option<Outcome> {
+        match self {
+            Self::Ready(_) => Some(Outcome::Complete),
+            Self::MoveArmJoints { settle, .. } => verdict(
+                joint_shortfall(measured, target, &settle.tolerance),
+                planned_end(clock),
+                now,
+                settle.timeout,
+            )
+            .map(Outcome::from),
         }
     }
 
@@ -129,7 +159,7 @@ impl JointReply {
         let stopped = matches!(outcome, Outcome::Stopped(_));
         let (success, message) = outcome.report(|| "trajectory complete".to_string());
         match self {
-            Self::MoveArmJoints(ctx) => {
+            Self::MoveArmJoints { ctx, .. } => {
                 let (reported_q, message) = planner.reported_joints(measured, message);
                 let result = if cancelled {
                     ctx.complete_cancelled(success, message, reported_q, elapsed_s)
@@ -163,9 +193,8 @@ pub enum Goal {
         reply: JointReply,
     },
     Cartesian {
-        target: Isometry3<f64>,
-        tolerance: PlanTolerance,
-        duration: Duration,
+        request: ArmMoveRequest,
+        settle: Settle<PoseTolerance>,
         ctx: Box<move_arm::GoalContext>,
     },
 }
@@ -250,6 +279,9 @@ struct JointMove {
 struct CartesianMove {
     path: MovePath,
     ctx: Box<move_arm::GoalContext>,
+    /// The commanded pose the settle judges the measured grasp point against.
+    target: Isometry3<f64>,
+    settle: Settle<PoseTolerance>,
     // Last commanded joint target: held on cancel/failure so the arm never snaps.
     prev_q_des: JointVec,
     _busy: BusyGuard,
@@ -554,7 +586,7 @@ impl Planner {
     pub fn check_cartesian(
         &mut self,
         target: &Isometry3<f64>,
-        tolerance: PlanTolerance,
+        tolerance: PoseTolerance,
         requested: Duration,
     ) -> Result<Duration, String> {
         if !matches!(self.mode, Mode::Follow) {
@@ -595,9 +627,9 @@ impl Planner {
                 let q = self.setpoint;
                 let ee = self.world_ee_pose(&q);
                 let limits = self.plan_limits().servo_at(
-                    PlanTolerance::default()
+                    STREAMED_POSE_TOLERANCE
                         .servo()
-                        .expect("the node's default slack is reachable"),
+                        .expect("the servo's own slack is reachable"),
                 );
                 let step = rate_step_toward(self.model.chain(), &q, &ee, pose, &limits);
                 // Smoothed as a planned servo step is, then held to the
@@ -629,39 +661,41 @@ impl Planner {
         }
     }
 
-    /// One joint-trajectory tick: sample the trajectory, and complete the goal on
-    /// cancel or on running to the end. Either terminal drops `m` (and with it
-    /// the busy guard), releasing the slot.
+    /// One joint-trajectory tick: sample the trajectory, and complete the goal
+    /// on cancel, or from the planned end on as the reply's settle judges the
+    /// measured arm against the trajectory's end. Any terminal drops `m` (and
+    /// with it the busy guard), releasing the slot.
     async fn advance_joint(&mut self, m: JointMove, measured_q: JointVec, now: Instant) -> Advance {
         let JointMove { traj, reply, _busy } = m;
         let q_des = traj.sample(now);
         let cancelled = reply.is_cancelled();
-        if !cancelled && !traj.clock().is_complete(now) {
+        let outcome = if cancelled {
+            Some(Outcome::Cancelled)
+        } else if traj.clock().is_complete(now) {
+            reply.settle_outcome(&measured_q, &q_des, traj.clock(), now)
+        } else {
+            None
+        };
+        let Some(outcome) = outcome else {
             return Advance {
                 target: q_des,
                 next_mode: Mode::JointMove(JointMove { traj, reply, _busy }),
                 origin: Origin::PlannedMove,
             };
-        }
-        // Success means the trajectory ran to completion (not cancelled). The
-        // result carries the measured pose, so the caller judges how close it
-        // landed; the governor may have held it short.
-        let elapsed = traj.clock().elapsed_secs(now);
-        let outcome = if cancelled {
-            Outcome::Cancelled
-        } else {
-            Outcome::Complete
         };
+        let elapsed = traj.clock().elapsed_secs(now);
         reply.finish(self, outcome, Ok(measured_q), elapsed).await;
-        // A cancel holds where the arm already is; a completion holds the last
-        // sample.
+        // A cancel holds where the arm already is; a settle, met or failed,
+        // holds the trajectory's end.
         Advance::ends_move(if cancelled { self.setpoint } else { q_des })
     }
 
     /// One Cartesian tick: advance the move's path (line-tracking IK, or the
-    /// guarded servo) and complete on cancel, on the path giving up, or on
-    /// normal completion. Any terminal drops `m` (and with it the busy guard),
-    /// releasing the slot.
+    /// guarded servo) and complete on cancel, on the path giving up, or from
+    /// the planned end on as the settle judges the measured grasp point
+    /// against the commanded pose; a path at its end keeps giving its last
+    /// target. Any terminal drops `m` (and with it the busy guard), releasing
+    /// the slot.
     async fn advance_cartesian(
         &mut self,
         mut m: CartesianMove,
@@ -687,15 +721,26 @@ impl Planner {
             }
         };
         m.prev_q_des = q_des;
-        if !complete {
+        let outcome = complete
+            .then(|| {
+                let measured = self.model.world_ee_pose(&measured_q);
+                verdict(
+                    pose_shortfall(&measured, &m.target, &m.settle.tolerance),
+                    planned_end(m.path.clock()),
+                    now,
+                    m.settle.timeout,
+                )
+                .map(Outcome::from)
+            })
+            .flatten();
+        let Some(outcome) = outcome else {
             return Advance {
                 target: q_des,
                 next_mode: Mode::CartesianMove(m),
                 origin: Origin::PlannedMove,
             };
-        }
-        self.end_cartesian(&m, measured_q, Outcome::Complete, elapsed)
-            .await
+        };
+        self.end_cartesian(&m, measured_q, outcome, elapsed).await
     }
 
     /// Track the straight line: walk the line to the blend this tick reached,
@@ -792,14 +837,10 @@ impl Planner {
                 })
             }
             Goal::Cartesian {
-                target,
-                tolerance,
-                duration,
+                request,
+                settle,
                 ctx,
-            } => {
-                self.start_cartesian(target, tolerance, duration, ctx, busy, now)
-                    .await
-            }
+            } => self.start_cartesian(request, settle, ctx, busy, now).await,
         }
     }
 
@@ -812,13 +853,18 @@ impl Planner {
     /// the governor held the arm off its measured pose just before admission.
     async fn start_cartesian(
         &mut self,
-        target: Isometry3<f64>,
-        tolerance: PlanTolerance,
-        requested: Duration,
+        request: ArmMoveRequest,
+        settle: Settle<PoseTolerance>,
         ctx: Box<move_arm::GoalContext>,
         busy: BusyGuard,
         now: Instant,
     ) -> Mode {
+        let ArmMoveRequest {
+            target,
+            tolerance,
+            duration: requested,
+            ..
+        } = request;
         let start_world = self.model.world_ee_pose(&self.setpoint);
         let plan = plan_cartesian(
             &self.model,
@@ -891,6 +937,8 @@ impl Planner {
         Mode::CartesianMove(CartesianMove {
             path,
             ctx,
+            target,
+            settle,
             prev_q_des,
             _busy: busy,
         })
@@ -922,9 +970,30 @@ impl Planner {
     }
 }
 
+/// The slack a streamed pose's servo step runs against: the guarded servo's
+/// own arrival bar.
+const STREAMED_POSE_TOLERANCE: PoseTolerance = PoseTolerance {
+    position_m: control_core::servo::POSITION_TOLERANCE_M,
+    orientation_rad: control_core::servo::ORIENTATION_TOLERANCE_RAD,
+};
+
+/// When the motion `clock` plays ends.
+fn planned_end(clock: &MotionClock) -> Instant {
+    clock.motion_start() + clock.duration()
+}
+
+impl From<Verdict> for Outcome {
+    fn from(verdict: Verdict) -> Self {
+        match verdict {
+            Verdict::Settled => Self::Complete,
+            Verdict::Failed(message) => Self::Failed(message),
+        }
+    }
+}
+
 /// The refusal of a Cartesian move no plan reaches within `tolerance`: what a
 /// `move_arm` goal completes with, and what `check_arm_move` answers.
-fn not_planned(tolerance: PlanTolerance, rejection: &PlanRejection) -> String {
+fn not_planned(tolerance: PoseTolerance, rejection: &PlanRejection) -> String {
     format!(
         "goal pose not planned within {:.1} mm / {:.1} deg: {rejection}",
         tolerance.position_m * 1000.0,
@@ -1291,7 +1360,7 @@ mod tests {
             start.rotation,
         );
         let duration = planner
-            .check_cartesian(&near, PlanTolerance::default(), Duration::ZERO)
+            .check_cartesian(&near, STREAMED_POSE_TOLERANCE, Duration::ZERO)
             .expect("a pose 5 cm ahead has a plan");
         assert!(duration > Duration::ZERO, "{duration:?}");
         assert_eq!(planner.setpoint(), POSE_TEST_Q, "the check moves nothing");
@@ -1301,7 +1370,7 @@ mod tests {
             start.rotation,
         );
         let refusal = planner
-            .check_cartesian(&far, PlanTolerance::default(), Duration::ZERO)
+            .check_cartesian(&far, STREAMED_POSE_TOLERANCE, Duration::ZERO)
             .expect_err("a pose 2 m away has no plan");
         assert!(
             refusal.starts_with("goal pose not planned within"),
@@ -1321,7 +1390,7 @@ mod tests {
             .tick(POSE_TEST_Q, None, &mut goals, &busy, Instant::now())
             .await;
         assert_eq!(
-            planner.check_cartesian(&near, PlanTolerance::default(), Duration::ZERO),
+            planner.check_cartesian(&near, STREAMED_POSE_TOLERANCE, Duration::ZERO),
             Err(ARM_BUSY.to_string())
         );
     }

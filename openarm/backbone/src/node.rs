@@ -421,6 +421,16 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         Arc::new(AtomicBool::new(false)),
         Arc::new(AtomicBool::new(false)),
     ];
+    // Whether each limb's follower delivers fresh state: the coordinator
+    // writes these every tick, and the goal handlers refuse on them.
+    let fresh = [
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    ];
+    let gripper_fresh = [
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    ];
     let (config_tx, config_rx) = watch::channel(streams::GovernorConfig {
         enabled: params.collision_governor_enabled,
         d_stop: params.d_stop_m,
@@ -443,6 +453,8 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
             busy: busy[0].clone(),
             gripper_goals: grip_goal_rx0,
             gripper_busy: gripper_busy[0].clone(),
+            fresh: fresh[0].clone(),
+            gripper_fresh: gripper_fresh[0].clone(),
         },
         ArmChannels {
             command: cmd_tx1.clone(),
@@ -455,6 +467,8 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
             busy: busy[1].clone(),
             gripper_goals: grip_goal_rx1,
             gripper_busy: gripper_busy[1].clone(),
+            fresh: fresh[1].clone(),
+            gripper_fresh: gripper_fresh[1].clone(),
         },
     );
 
@@ -531,6 +545,7 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
             runner.clone(),
             [goal_tx0.clone(), goal_tx1.clone()],
             [goal_busy[0].clone(), goal_busy[1].clone()],
+            fresh.clone(),
             arm_activity.clone(),
             [left_limits, right_limits],
         ));
@@ -538,12 +553,14 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
             runner.clone(),
             [goal_tx0.clone(), goal_tx1.clone()],
             [goal_busy[0].clone(), goal_busy[1].clone()],
+            fresh.clone(),
             arm_activity.clone(),
         ));
         set.spawn(actions::postures::run_move_to_ready(
             runner.clone(),
             [goal_tx0.clone(), goal_tx1.clone()],
             [goal_busy[0].clone(), goal_busy[1].clone()],
+            fresh.clone(),
             arm_activity.clone(),
             request_tx.clone(),
         ));
@@ -551,6 +568,7 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
             runner.clone(),
             [goal_tx0, goal_tx1],
             [goal_busy[0].clone(), goal_busy[1].clone()],
+            fresh.clone(),
             arm_activity.clone(),
             request_tx.clone(),
         ));
@@ -558,12 +576,14 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
             runner.clone(),
             [grip_goal_tx0, grip_goal_tx1],
             [gripper_busy[0].clone(), gripper_busy[1].clone()],
+            gripper_fresh.clone(),
             gripper_activity.clone(),
         ));
         set.spawn(actions::stop::run_stop(runner.clone(), request_tx.clone()));
         set.spawn(actions::arm::run_check_arm_move(
             runner.clone(),
             request_tx,
+            fresh.clone(),
             arm_activity.clone(),
         ));
 

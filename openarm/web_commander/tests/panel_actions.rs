@@ -1,8 +1,10 @@
 //! Operator-driven consumed actions and services, end to end over the panel's
 //! WebSocket (the node's real command surface): fire_arm must land a
-//! move_arm_joints goal on the limb_motion mock; the record button must drive the
-//! recorder mock's record_episode goal through feedback, Stop (= cancel with
-//! save), and result; Finish must call the recorder's finish_session service.
+//! move_arm_joints goal on the limb_motion mock and fire_gripper a move_gripper
+//! goal, each carrying the operator's settle fields; the record button must
+//! drive the recorder mock's record_episode goal through feedback, Stop
+//! (= cancel with save), and result; Finish must call the recorder's
+//! finish_session service.
 //!
 //! One booting test per binary: `ui::init_limits` is once-per-process.
 
@@ -11,7 +13,7 @@ mod helpers;
 use std::time::Duration;
 
 use peppygen::fixtures::harness::{Config, Harness};
-use peppygen::mock::deps::limb_motion::move_arm_joints;
+use peppygen::mock::deps::limb_motion::{move_arm_joints, move_gripper};
 use peppygen::mock::deps::recorder::{finish_session, record_episode};
 
 const PANEL_PORT: u16 = 18634;
@@ -20,6 +22,15 @@ const PANEL_PORT: u16 = 18634;
 /// sit above the elbow's singularity floor), so the panel's clamp passes them
 /// through verbatim.
 const TARGET_JOINTS: [f64; 7] = [0.1, 0.1, -0.2, 0.9, 0.1, -0.1, 0.0];
+
+/// The settle fields the operator types for the joint move.
+const SETTLE_TOLERANCE_RAD: f64 = 0.2;
+const SETTLE_TIMEOUT_S: f64 = 1.5;
+
+/// The opening the operator composes for the gripper move, and the settle
+/// timeout typed for it.
+const GRIPPER_OPENING: f64 = 0.3;
+const GRIPPER_SETTLE_TIMEOUT_S: f64 = 0.8;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn panel_commands_drive_backbone_and_recorder() -> peppygen::Result<()> {
@@ -50,6 +61,8 @@ async fn panel_commands_drive_backbone_and_recorder() -> peppygen::Result<()> {
         "side": "left",
         "joints": TARGET_JOINTS,
         "duration_s": 0.0,
+        "settle_tolerance_rad": SETTLE_TOLERANCE_RAD,
+        "settle_timeout_s": SETTLE_TIMEOUT_S,
     });
     ws.send_text(&command.to_string())
         .await
@@ -71,6 +84,14 @@ async fn panel_commands_drive_backbone_and_recorder() -> peppygen::Result<()> {
         pending.request.joint_positions
     );
     assert_eq!(pending.request.duration_s, 0.0, "0 = fastest safe");
+    assert_eq!(
+        pending.request.settle_tolerances_rad, [SETTLE_TOLERANCE_RAD; 7],
+        "the one settle tolerance the operator typed is held by every joint"
+    );
+    assert_eq!(
+        pending.request.settle_timeout_s, SETTLE_TIMEOUT_S,
+        "the goal must carry the operator's settle timeout as typed"
+    );
     let goal_joints = pending.request.joint_positions;
     // The node's goal-accept timeout is 2 s, so admit before observing state.
     let active = pending.accept().await?;
@@ -80,11 +101,11 @@ async fn panel_commands_drive_backbone_and_recorder() -> peppygen::Result<()> {
     })
     .await;
 
-    // Finishing exactly on target makes the node's reached-check pass.
+    // The backbone judged the settle; the panel reports its verdict as it stands.
     active
         .complete(&move_arm_joints::ResultResponseData {
             success: true,
-            message: String::new(),
+            message: "trajectory complete".to_string(),
             final_joint_positions: goal_joints,
             action_time: 0.42,
         })
@@ -94,6 +115,57 @@ async fn panel_commands_drive_backbone_and_recorder() -> peppygen::Result<()> {
             && s["status"]
                 .as_str()
                 .is_some_and(|t| t.contains("move_arm_joints (left): success"))
+    })
+    .await;
+
+    // --- fire_gripper -> move_gripper goal on the limb_motion producer --------
+    ws.send_text(
+        &serde_json::json!({
+            "cmd": "fire_gripper",
+            "side": "left",
+            "position": GRIPPER_OPENING,
+            "settle_timeout_s": GRIPPER_SETTLE_TIMEOUT_S,
+        })
+        .to_string(),
+    )
+    .await
+    .expect("send fire_gripper");
+    let pending = mocks
+        .deps
+        .limb_motion
+        .move_gripper
+        .next_goal(Duration::from_secs(10))
+        .await?;
+    assert_eq!(pending.request.gripper_name, "left_gripper");
+    assert_eq!(
+        (
+            pending.request.opening,
+            pending.request.max_effort,
+            pending.request.settle_timeout_s
+        ),
+        (GRIPPER_OPENING, 0.0, GRIPPER_SETTLE_TIMEOUT_S),
+        "the goal must carry the composed opening, no effort preference, and the operator's settle timeout"
+    );
+    let active = pending.accept().await?;
+    ws.snapshot_until(
+        Duration::from_secs(10),
+        "left gripper move in flight",
+        |s| s["left_gripper"]["in_flight"] == true,
+    )
+    .await;
+    active
+        .complete(&move_gripper::ResultResponseData {
+            success: true,
+            message: "move complete".to_string(),
+            final_opening: GRIPPER_OPENING,
+            action_time: 0.3,
+        })
+        .await?;
+    ws.snapshot_until(Duration::from_secs(15), "left gripper move done", |s| {
+        s["left_gripper"]["in_flight"] == false
+            && s["status"]
+                .as_str()
+                .is_some_and(|t| t.contains("move_gripper (left): success"))
     })
     .await;
 

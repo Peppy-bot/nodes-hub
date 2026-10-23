@@ -121,7 +121,10 @@
           name: "move_arm_joints",
           refine: {
             goal_service: {
-              request_message_format: { joint_positions: { $length: 7 } },
+              request_message_format: {
+                joint_positions: { $length: 7 },
+                settle_tolerances_rad: { $length: 7 },
+              },
             },
             result_service: {
               response_message_format: { final_joint_positions: { $length: 7 } },

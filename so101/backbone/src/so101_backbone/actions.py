@@ -1,12 +1,17 @@
 """Action admission and execution over the coordinator, and the two
 limb_motion services that read or end what it runs.
 
-Admission (the goal decide callback) validates the request and claims the
-limb's single-flight busy slot; execution installs a trajectory plan and
-waits for the coordinator to stream it out, and a gripper goal then waits
-until the measured gripper stands still. Cancelling freezes the limb where
-the trajectory stands, and so does the stop service, whoever started the
-move: the goal then ends as cancelled with the stop's message. The plan
+Admission (the goal decide callback) validates the request, its settle
+fields included, and claims the limb's single-flight busy slot; execution
+installs a plan and waits for the coordinator to stream it out: an arm move
+ends once the measured joints, or the measured grasp point, stand within the
+settle tolerance of the target, and fails when its settle timeout runs out
+past the planned end; a gripper move ends, past the planned end of its
+travel, once the jaws stand still or its settle timeout runs out, and
+reports the opening measured then, where an object may hold the jaws.
+Cancelling freezes the limb where the trajectory stands, and so does the
+stop service, whoever started the move: the goal then ends as cancelled with
+the stop's message. The plan
 check runs a move_arm goal's solve from the same anchor and installs
 nothing. Every terminal path releases the claimed slot, and no exception may
 ever kill an action server: an unforeseen failure rejects the goal and
@@ -22,43 +27,50 @@ import time
 from dataclasses import dataclass
 
 from control_core_py import minimum_jerk
+from control_core_py.minimum_jerk import Profile
 from control_core_py.runtime import Latch, log
 from so101_description.limbs import ARM_LIMB, GRIPPER_LIMB
 from so101_description.limits import JointLimits
-from so101_description.transforms import (
-    PoseError,
-    matrix_from_pose,
-    relative_rotation_rad,
-)
+from so101_description.transforms import relative_rotation_rad
 from so101_description.units import NUM_JOINTS
 
 from so101_backbone.coordinator import (
-    GRIPPER_REACHED_FRAC,
+    STALE_FOLLOWER_REFUSAL,
     ArmPlan,
     Coordinator,
     GripperPlan,
+    JointSettle,
+    PoseSettle,
+    PostureEnd,
 )
 from so101_backbone.params import Config
-
-# Slack past a gripper move's nominal travel time before the goal fails. It
-# covers the settle after the ramp, and it bounds a goal that cannot end: the
-# plan is anchored on live state, so a follower that stops reporting stalls
-# it, a gripper that keeps moving never settles, and neither may hold the
-# busy slot forever.
-GRIPPER_TRAVEL_GRACE_S = 2.0
 
 # Backoff after a failed goal delivery, so a persistently broken action
 # transport logs once and retries at a human pace instead of spinning the
 # event loop.
 _GOAL_RETRY_S = 1.0
 
-# Ceiling on a goal's requested duration: a move claims its limb's
-# single-flight slot for the whole run, so an absurd request must not pin
-# the arm until a manual cancel.
-MAX_REQUESTED_DURATION_S = 120.0
+# The contract's bound on every duration and timeout a goal carries: a
+# number of seconds from 0 to 60. The posture moves share it.
+MAX_REQUESTED_DURATION_S = 60.0
 
-# The refusal of an arm goal, or a check of one, while another arm goal runs.
-ARM_BUSY = "another arm goal is in flight"
+# A quaternion of a smaller norm has no direction to normalize.
+QUATERNION_MIN_NORM = 1e-6
+
+# The refusal of an arm goal, or a check of one, while another arm goal
+# runs, and of a gripper goal while another gripper goal runs.
+ARM_BUSY = "arm is already executing a motion"
+GRIPPER_BUSY = "gripper is already executing a move"
+# The messages the posture moves complete with.
+READY_DONE = "move to ready completed"
+HOME_DONE = "move to home completed"
+# The refusals of a goal naming no limb of this robot.
+UNKNOWN_ARM_NAME = f'unknown arm_name: this robot\'s arm is "{ARM_LIMB}"'
+UNKNOWN_GRIPPER_NAME = f'unknown gripper_name: this robot\'s gripper is "{GRIPPER_LIMB}"'
+# The note a result adds when it reports the position commanded last, the
+# follower having stopped reporting.
+COMMANDED_JOINTS_NOTE = "the result comes from the joints commanded last"
+COMMANDED_OPENING_NOTE = "the result comes from the opening commanded last"
 # The refusal of an arm or gripper goal, or a check of one, while a leader
 # streams commands for that limb: the leader has it until its stream stops.
 ARM_LEADER_STREAMING = (
@@ -92,16 +104,28 @@ def stop_message(reason: str) -> str:
 
 @dataclass(frozen=True)
 class PoseGoal:
-    """An admitted move_arm goal whose IK solve runs in the drive task: the
-    arm slot is already claimed, so the anchor cannot move under the solve."""
+    """A pose to plan: the fields move_arm and check_arm_move share."""
 
     position: tuple[float, ...]
     orientation: tuple[float, ...]
     duration_s: float
-    # The caller's planning slack, or None where the wire's 0 asked for this
-    # planner's default. Judged against the goal pose alone, never the path.
-    position_tolerance_m: float | None
-    orientation_tolerance_rad: float | None
+    # The caller's planning slack, judged against the goal pose alone, never
+    # the path.
+    position_tolerance_m: float
+    orientation_tolerance_rad: float
+
+
+@dataclass(frozen=True)
+class PoseMove:
+    """An admitted move_arm goal whose IK solve runs in the drive task: the
+    arm slot is already claimed, so the anchor cannot move under the solve."""
+
+    goal: PoseGoal
+    # How the move ends past the planned end of its trajectory.
+    settle: PoseSettle
+    # The stop count at admission: a stop since ends the goal before it
+    # moves, the solve included.
+    stops_before: int
 
 
 class PendingSlot:
@@ -109,9 +133,9 @@ class PendingSlot:
     delivery on one action can only ever walk back its own admission."""
 
     def __init__(self) -> None:
-        self.plan: ArmPlan | GripperPlan | PoseGoal | None = None
+        self.plan: ArmPlan | GripperPlan | PoseMove | None = None
 
-    def take(self) -> ArmPlan | GripperPlan | PoseGoal | None:
+    def take(self) -> ArmPlan | GripperPlan | PoseMove | None:
         plan = self.plan
         self.plan = None
         return plan
@@ -183,15 +207,30 @@ class ActionLayer:
 
     # -------------------------------------------------------------- admission
 
-    def _admit_arm_move(self, target: tuple[float, ...], duration_s: float) -> ArmPlan:
-        """Claim the arm's busy slot and install the trajectory, or raise
-        Rejection. The claim happens last so a rejected goal never leaves the
-        slot held."""
-        if len(target) != NUM_JOINTS or not all(math.isfinite(p) for p in target):
-            raise Rejection(f"target must be {NUM_JOINTS} finite joint positions")
+    def _admit_arm_move(
+        self,
+        target: tuple[float, ...],
+        duration_s: float,
+        settle_tolerances_rad: tuple[float, ...],
+        settle_timeout_s: float,
+    ) -> ArmPlan:
+        """Claim the arm's busy slot and install a move_arm_joints goal's
+        trajectory and settle, or raise Rejection."""
+        assert len(target) == NUM_JOINTS
+        if not all(math.isfinite(p) for p in target):
+            raise Rejection("non-finite joint target")
+        _require_duration(duration_s, "duration_s")
         if not self._limits.contains(target):
-            raise Rejection("target exceeds a joint position limit")
-        _require_duration(duration_s)
+            raise Rejection("target out of joint limits")
+        settle = _joint_settle(settle_tolerances_rad, settle_timeout_s)
+        return self._admit_trajectory(target, duration_s, settle)
+
+    def _admit_trajectory(
+        self, target: tuple[float, ...], duration_s: float, settle: JointSettle | PostureEnd
+    ) -> ArmPlan:
+        """Claim the arm's busy slot and install the trajectory to `target`
+        with `settle`, or raise Rejection. The claim happens last so a
+        rejected goal never leaves the slot held."""
         anchor = self._coordinator.arm_anchor()
         if anchor is None:
             raise Rejection(NO_ANCHOR)
@@ -203,17 +242,22 @@ class ActionLayer:
             profile = minimum_jerk.plan(
                 anchor, target, duration_s, self._config.max_joint_velocity_rad_s
             )
-            return self._coordinator.adopt_arm_plan(profile)
+            return self._coordinator.adopt_arm_plan(profile, settle)
         except BaseException:
             # A failure between claim and adopt must not hold the slot.
             self._coordinator.release_arm()
             raise
 
-    def _admit_gripper_move(self, opening: float, max_effort: float) -> GripperPlan:
-        if not (math.isfinite(opening) and 0.0 <= opening <= 1.0):
-            raise Rejection("opening must be finite and within 0..1")
+    def _admit_gripper_move(
+        self, opening: float, max_effort: float, settle_timeout_s: float
+    ) -> GripperPlan:
+        if not math.isfinite(opening):
+            raise Rejection("non-finite gripper opening")
+        if not 0.0 <= opening <= 1.0:
+            raise Rejection(f"opening {opening} outside [0, 1]")
         if not math.isfinite(max_effort) or max_effort < 0.0:
-            raise Rejection("max_effort must be finite and non-negative")
+            raise Rejection(f"max_effort {max_effort} is not a non-negative finite value")
+        settle_timeout_s = _require_duration(settle_timeout_s, "settle_timeout_s")
         if max_effort > 0.0:
             # Same disposition as the streamed path: legal contract intent
             # this hardware cannot honor (the ceiling is fixed in firmware),
@@ -229,13 +273,9 @@ class ActionLayer:
         if self._coordinator.leader_streams_gripper():
             raise Rejection(GRIPPER_LEADER_STREAMING)
         if not self._coordinator.try_claim_gripper():
-            raise Rejection("another gripper goal is in flight")
+            raise Rejection(GRIPPER_BUSY)
         try:
-            timeout_s = (
-                abs(opening - anchor) / self._config.max_gripper_rate_frac_s
-                + GRIPPER_TRAVEL_GRACE_S
-            )
-            return self._coordinator.adopt_gripper_plan(opening, timeout_s)
+            return self._coordinator.adopt_gripper_plan(opening, settle_timeout_s, anchor)
         except BaseException:
             self._coordinator.release_gripper()
             raise
@@ -247,15 +287,24 @@ class ActionLayer:
         duration_s: float,
         position_tolerance_m: float,
         orientation_tolerance_rad: float,
-    ) -> PoseGoal:
+        settle_position_tolerance_m: float,
+        settle_orientation_tolerance_rad: float,
+        settle_timeout_s: float,
+    ) -> PoseMove:
         """Validate and claim the arm; the verified IK solve runs in the
         drive task so a hard pose never stalls the event loop inside the
         goal decide callback, failing the accepted goal when no solution
         exists."""
         # Parsed before the claim: a rejection past this point would strand
         # the arm slot and teleop with it.
-        goal = _pose_goal(
-            position, orientation, duration_s, position_tolerance_m, orientation_tolerance_rad
+        move = _pose_move(
+            _pose_goal(
+                position, orientation, duration_s, position_tolerance_m, orientation_tolerance_rad
+            ),
+            settle_position_tolerance_m,
+            settle_orientation_tolerance_rad,
+            settle_timeout_s,
+            self._coordinator.stop_count,
         )
         if self._coordinator.arm_anchor() is None:
             raise Rejection(NO_ANCHOR)
@@ -263,29 +312,42 @@ class ActionLayer:
             raise Rejection(ARM_LEADER_STREAMING)
         if not self._coordinator.try_claim_arm():
             raise Rejection(ARM_BUSY)
-        return goal
+        return move
 
-    def _admit_posture(self, target: tuple[float, ...], duration_s: float) -> ArmPlan:
-        return self._admit_arm_move(target, duration_s)
+    def _admit_posture(
+        self, target: tuple[float, ...], duration_s: float, completion: str
+    ) -> ArmPlan:
+        """A posture move runs to the planned end of its trajectory and
+        reports the measured grasp point with `completion` as its message."""
+        _require_duration(duration_s, "duration_s")
+        return self._admit_trajectory(target, duration_s, PostureEnd(completion))
 
     # ----------------------------------------------------- decide constructors
 
     def decide_arm_joints(self, module, pending: PendingSlot):
         def decide(request):
             def admit():
-                _require_arm_name(request.data.arm_name)
+                d = request.data
+                _require_arm_name(d.arm_name)
                 return self._admit_arm_move(
-                    tuple(request.data.joint_positions), request.data.duration_s
+                    tuple(d.joint_positions),
+                    d.duration_s,
+                    tuple(d.settle_tolerances_rad),
+                    d.settle_timeout_s,
                 )
 
             return self._decide(module, admit, pending)
 
         return decide
 
-    def decide_posture(self, module, target: tuple[float, ...], pending: PendingSlot):
+    def decide_posture(
+        self, module, target: tuple[float, ...], completion: str, pending: PendingSlot
+    ):
         def decide(request):
             return self._decide(
-                module, lambda: self._admit_posture(target, request.data.duration_s), pending
+                module,
+                lambda: self._admit_posture(target, request.data.duration_s, completion),
+                pending,
             )
 
         return decide
@@ -293,13 +355,17 @@ class ActionLayer:
     def decide_pose(self, module, pending: PendingSlot):
         def decide(request):
             def admit():
-                _require_arm_name(request.data.arm_name)
+                d = request.data
+                _require_arm_name(d.arm_name)
                 return self._admit_pose_move(
-                    tuple(request.data.position),
-                    tuple(request.data.orientation),
-                    request.data.duration_s,
-                    request.data.plan_position_tolerance_m,
-                    request.data.plan_orientation_tolerance_rad,
+                    tuple(d.position),
+                    tuple(d.orientation),
+                    d.duration_s,
+                    d.plan_position_tolerance_m,
+                    d.plan_orientation_tolerance_rad,
+                    d.settle_position_tolerance_m,
+                    d.settle_orientation_tolerance_rad,
+                    d.settle_timeout_s,
                 )
 
             return self._decide(module, admit, pending)
@@ -309,10 +375,9 @@ class ActionLayer:
     def decide_gripper(self, module, pending: PendingSlot):
         def decide(request):
             def admit():
-                _require_gripper_name(request.data.gripper_name)
-                return self._admit_gripper_move(
-                    request.data.opening, request.data.max_effort
-                )
+                d = request.data
+                _require_gripper_name(d.gripper_name)
+                return self._admit_gripper_move(d.opening, d.max_effort, d.settle_timeout_s)
 
             return self._decide(module, admit, pending)
 
@@ -339,7 +404,7 @@ class ActionLayer:
         if isinstance(plan, ArmPlan):
             self._coordinator.abort_arm_plan(plan)
             self._coordinator.release_arm()
-        elif isinstance(plan, PoseGoal):
+        elif isinstance(plan, PoseMove):
             # Nothing installed yet: the solve had not run. Only the claim
             # is walked back.
             self._coordinator.release_arm()
@@ -349,22 +414,16 @@ class ActionLayer:
 
     # -------------------------------------------------------------- execution
 
-    async def _finish_plan(
-        self, ctx, plan, abort, results, started: float, timeout_s: float | None = None
-    ) -> None:
-        """Wait out the plan, a cancel or a stop (or the travel budget, which
-        only a gripper plan carries) and complete the goal. results(action_time)
-        builds (note, payload) and runs after any abort, so it reads the plan
-        where it stopped. A stop has already cut the plan, and the goal ends
-        as cancelled with the stop's message."""
+    async def _finish_plan(self, ctx, plan, abort, results, started: float) -> None:
+        """Wait out the plan, a cancel or a stop and complete the goal.
+        results(action_time) builds (note, payload) and runs after any abort,
+        so it reads the plan where it stopped. A stop has already cut the
+        plan, and the goal ends as cancelled with the stop's message."""
         cancel_task = asyncio.ensure_future(ctx.cancel_signal())
         done_task = asyncio.ensure_future(plan.done.wait())
         try:
-            await asyncio.wait(
-                [cancel_task, done_task], timeout=timeout_s, return_when=asyncio.FIRST_COMPLETED
-            )
-            now = time.monotonic()
-            action_time = now - started
+            await asyncio.wait([cancel_task, done_task], return_when=asyncio.FIRST_COMPLETED)
+            action_time = time.monotonic() - started
             if plan.stopped is not None:
                 note, payload = results(action_time)
                 await ctx.complete_cancelled(False, _join(plan.stopped, note), *payload)
@@ -372,14 +431,10 @@ class ActionLayer:
                 note, payload = results(action_time)
                 success, message = _terminal(plan, note)
                 await ctx.complete(success, message, *payload)
-            elif cancel_task.done():
-                abort(plan)
-                note, payload = results(action_time)
-                await ctx.complete_cancelled(False, _join("cancelled", note), *payload)
             else:
                 abort(plan)
                 note, payload = results(action_time)
-                await ctx.complete(False, _join(_overrun(plan, now), note), *payload)
+                await ctx.complete_cancelled(False, _join("goal cancelled", note), *payload)
         except Exception as e:
             log(f"goal completion failed: {e!r}")
         finally:
@@ -442,10 +497,11 @@ class ActionLayer:
         )
         return minimum_jerk.QUINTIC_PEAK_VELOCITY * max(travel_ratio, turn_ratio)
 
-    async def _plan_pose(self, solver, kinematics, seed, goal: PoseGoal):
-        """The joint solution of `goal` from `seed` and the duration the move
-        takes, or PlanRefused with the reason: no solution inside the joint
-        limits, or a duration the end-effector speed caps push past the
+    async def _plan_pose(self, solver, kinematics, seed, goal: PoseGoal) -> Profile:
+        """The trajectory of `goal` from `seed`: the joint solution reached in
+        the requested duration, floored by the joint velocity caps and the
+        end-effector speed caps. PlanRefused with the reason when no solution
+        lies inside the joint limits, or the caps push the duration past the
         ceiling. The solve runs off the event loop."""
         solution = await asyncio.to_thread(
             functools.partial(
@@ -460,16 +516,19 @@ class ActionLayer:
         if solution is None or not self._limits.contains(solution):
             raise PlanRefused(_unreached(goal))
         duration_s = max(goal.duration_s, self._ee_floor_s(kinematics, seed, goal))
-        if duration_s > MAX_REQUESTED_DURATION_S:
+        profile = minimum_jerk.plan(
+            seed, solution, duration_s, self._config.max_joint_velocity_rad_s
+        )
+        if profile.duration_s > MAX_REQUESTED_DURATION_S:
             # The requested duration was admitted against this ceiling, but
-            # the EE speed caps can raise it past one. Stretching anyway
-            # would hold the arm slot for longer than any goal is allowed
-            # to, so the move is refused instead.
+            # the caps can raise it past one. Stretching anyway would hold
+            # the arm slot for longer than any goal is allowed to, so the
+            # move is refused instead.
             raise PlanRefused(
-                f"the end-effector speed caps need {duration_s:.0f}s for this "
+                f"the speed caps need {profile.duration_s:.0f}s for this "
                 f"move, beyond the {MAX_REQUESTED_DURATION_S:.0f}s ceiling"
             )
-        return solution, duration_s
+        return profile
 
     async def check_arm_move(
         self,
@@ -482,16 +541,15 @@ class ActionLayer:
         solver,
         kinematics,
     ) -> tuple[bool, str, float]:
-        """Whether a move_arm goal with these fields has a plan from where the
-        arm is, without moving: (success, message, duration_s), the message
-        being the words the goal's refusal gives. Refused with the same
-        messages, in the same order, as a goal: no fresh follower state, a
-        leader streaming the arm, an arm goal in flight."""
+        """Whether a move_arm goal with these planning fields has a plan from
+        where the arm is, without moving: (success, message, duration_s), the
+        message being the words the goal's refusal gives. Refused with the
+        same messages, in the same order, as a goal: no fresh follower state,
+        a leader streaming the arm, an arm goal in flight."""
         try:
             _require_arm_name(arm_name)
             goal = _pose_goal(
-                position, orientation, duration_s, position_tolerance_m,
-                orientation_tolerance_rad,
+                position, orientation, duration_s, position_tolerance_m, orientation_tolerance_rad
             )
         except Rejection as e:
             return False, str(e), 0.0
@@ -503,12 +561,13 @@ class ActionLayer:
         if self._coordinator.arm_busy:
             return False, ARM_BUSY, 0.0
         try:
-            _solution, planned_s = await self._plan_pose(solver, kinematics, seed, goal)
+            profile = await self._plan_pose(solver, kinematics, seed, goal)
         except PlanRefused as e:
             return False, str(e), 0.0
         except Exception as e:
             log(f"pose solve failed: {e!r}")
             return False, f"pose solve failed: {e!r}", 0.0
+        planned_s = profile.duration_s
         return True, f"a plan reaches the pose in {planned_s:.3f} s", planned_s
 
     def stop_moves(self, reason: str) -> list[str]:
@@ -518,34 +577,44 @@ class ActionLayer:
         log(f"stop requested: {message}")
         return self._coordinator.stop_all(message)
 
-    async def drive_pose(self, ctx, goal: PoseGoal | None, solver, kinematics) -> None:
-        """Solve, install the trajectory, and wait it out. The solve runs
-        off the event loop on a solver dedicated to point-to-point goals
-        (the control tick's streaming solver is a separate instance). A
-        stop that runs during the solve ends the goal as cancelled with the
-        stop's message, and nothing is installed."""
-        if goal is None:
+    async def drive_pose(self, ctx, move: PoseMove | None, solver, kinematics) -> None:
+        """Solve, install the trajectory with the move's settle, and wait it
+        out. The solve runs off the event loop on a solver dedicated to
+        point-to-point goals (the control tick's streaming solver is a
+        separate instance). A stop that runs during the solve ends the goal
+        as cancelled with the stop's message, and nothing is installed."""
+        if move is None:
             await _complete_guarded(
                 ctx.complete, False, "goal admission was walked back", *_no_pose(), 0.0
             )
             return
+        goal = move.goal
         started = time.monotonic()
         try:
             seed = self._coordinator.arm_anchor()
             if seed is None:
+                note, pose = self._standing_pose(kinematics)
                 await _complete_guarded(
-                    ctx.complete, False, "follower state went stale before the move started",
-                    *_no_pose(), 0.0,
+                    ctx.complete, False, _join(STALE_FOLLOWER_REFUSAL, note), *pose, 0.0
                 )
                 return
-            stops_before = self._coordinator.stop_count
+
+            async def end_stopped() -> None:
+                note, pose = self._standing_pose(kinematics)
+                await _complete_guarded(
+                    ctx.complete_cancelled, False, _join(self._coordinator.last_stop, note),
+                    *pose, 0.0,
+                )
+
+            if self._coordinator.stop_count != move.stops_before:
+                await end_stopped()
+                return
             try:
-                solution, duration_s = await self._plan_pose(solver, kinematics, seed, goal)
+                profile = await self._plan_pose(solver, kinematics, seed, goal)
             except PlanRefused as e:
                 position, orientation = kinematics.forward_kinematics(seed)
                 await _complete_guarded(
-                    ctx.complete, False, str(e),
-                    list(position), list(orientation), time.monotonic() - started,
+                    ctx.complete, False, str(e), list(position), list(orientation), 0.0
                 )
                 return
             except Exception as e:
@@ -558,25 +627,15 @@ class ActionLayer:
                     *_no_pose(), time.monotonic() - started,
                 )
                 return
-            if self._coordinator.stop_count != stops_before:
-                position, orientation = kinematics.forward_kinematics(seed)
-                await _complete_guarded(
-                    ctx.complete_cancelled, False, self._coordinator.last_stop,
-                    list(position), list(orientation), time.monotonic() - started,
-                )
+            if self._coordinator.stop_count != move.stops_before:
+                await end_stopped()
                 return
-            profile = minimum_jerk.plan(
-                seed, solution, duration_s, self._config.max_joint_velocity_rad_s
-            )
-            plan = self._coordinator.adopt_arm_plan(profile)
+            plan = self._coordinator.adopt_arm_plan(profile, move.settle)
 
             def results(action_time):
                 positions, note = self._final_arm_positions(plan)
                 position, orientation = kinematics.forward_kinematics(positions)
-                return (
-                    _join(note, _orientation_note(orientation, goal.orientation)),
-                    (list(position), list(orientation), action_time),
-                )
+                return note, (list(position), list(orientation), action_time)
 
             await self._finish_plan(
                 ctx, plan, self._coordinator.abort_arm_plan, results, started
@@ -597,12 +656,7 @@ class ActionLayer:
 
         try:
             await self._finish_plan(
-                ctx,
-                plan,
-                self._coordinator.abort_gripper_plan,
-                results,
-                time.monotonic(),
-                timeout_s=plan.timeout_s,
+                ctx, plan, self._coordinator.abort_gripper_plan, results, time.monotonic()
             )
         finally:
             self._coordinator.release_gripper()
@@ -622,10 +676,7 @@ class ActionLayer:
         measured = self._fresh_measured_joints()
         if measured is not None:
             return measured, ""
-        return (
-            plan.last_sample(time.monotonic()),
-            "follower state stale; reporting the commanded position",
-        )
+        return plan.last_sample(time.monotonic()), COMMANDED_JOINTS_NOTE
 
     def _measured_grasp_pose(
         self, kinematics
@@ -637,28 +688,38 @@ class ActionLayer:
         note gives the reason."""
         measured = self._fresh_measured_joints()
         if measured is None:
-            return "follower state stale; no measured pose to report", ([], [], [])
+            return f"no arm poses: {ARM_LIMB} stopped reporting its joints", ([], [], [])
         position, orientation = kinematics.forward_kinematics(measured)
         return "", ([ARM_LIMB], list(position), list(orientation))
 
+    def _standing_pose(self, kinematics) -> tuple[str, tuple[list[float], list[float]]]:
+        """Where the grasp point stands with no plan installed, as a move
+        that never ran reports it: the forward kinematics of the fresh
+        measured joints, else of the joints commanded last with the note,
+        else no pose."""
+        measured = self._fresh_measured_joints()
+        if measured is not None:
+            position, orientation = kinematics.forward_kinematics(measured)
+            return "", (list(position), list(orientation))
+        commanded = self._coordinator.commanded_arm
+        if commanded is None:
+            return "", _no_pose()
+        position, orientation = kinematics.forward_kinematics(commanded)
+        return COMMANDED_JOINTS_NOTE, (list(position), list(orientation))
+
     def _final_opening(self, plan: GripperPlan) -> tuple[float, str]:
-        """The opening the gripper stood still at, when that is how the plan
-        ended. Otherwise prefer the measured opening; fall back to where the
-        ramp stood when the plan was cut; only a plan cut before any command
-        streamed reports its target, saying so."""
-        if plan.settled is not None:
-            return plan.settled, ""
+        """The opening measured when the plan completed. Otherwise prefer the
+        measured opening; fall back to where the ramp stood when the plan was
+        cut, saying so."""
+        if plan.completed_on is not None:
+            return plan.completed_on, ""
         measured = self._coordinator.measured_gripper.fresh(
             self._coordinator.follower_state_timeout_s
         )
         if measured is not None:
             return measured, ""
-        if plan.frozen is not None:
-            return plan.frozen, "follower state stale; reporting the commanded position"
-        return (
-            plan.target,
-            "follower state stale before any command streamed; reporting the goal target",
-        )
+        assert plan.frozen is not None, "a plan that did not complete was cut"
+        return plan.frozen, COMMANDED_OPENING_NOTE
 
 
 def _pose_goal(
@@ -668,134 +729,143 @@ def _pose_goal(
     position_tolerance_m: float,
     orientation_tolerance_rad: float,
 ) -> PoseGoal:
-    """The pose goal these wire fields name, or Rejection: a pose that is no
-    pose, a duration or a tolerance that is no bar."""
-    try:
-        matrix_from_pose(position, orientation)
-    except PoseError as e:
-        raise Rejection(str(e)) from e
-    _require_duration(duration_s)
-    position_bar = _stated_tolerance(position_tolerance_m, "plan_position_tolerance_m")
-    orientation_bar = _stated_tolerance(
+    """The pose goal these wire fields name, with its orientation normalized,
+    or Rejection: a pose that is no pose, a tolerance that is no bar, or a
+    duration out of its bound."""
+    if not all(math.isfinite(v) for v in (*position, *orientation)):
+        raise Rejection("goal pose has non-finite values")
+    norm = math.sqrt(sum(q * q for q in orientation))
+    if norm <= QUATERNION_MIN_NORM:
+        raise Rejection("goal pose has an unnormalizable orientation")
+    position_tolerance_m = _require_tolerance(position_tolerance_m, "plan_position_tolerance_m")
+    orientation_tolerance_rad = _require_tolerance(
         orientation_tolerance_rad, "plan_orientation_tolerance_rad"
     )
     return PoseGoal(
         position=tuple(position),
-        orientation=tuple(orientation),
-        duration_s=duration_s,
-        position_tolerance_m=position_bar,
-        orientation_tolerance_rad=orientation_bar,
+        orientation=tuple(q / norm for q in orientation),
+        duration_s=_require_duration(duration_s, "duration_s"),
+        position_tolerance_m=position_tolerance_m,
+        orientation_tolerance_rad=orientation_tolerance_rad,
     )
 
 
-def _require_duration(duration_s: float) -> None:
-    if not math.isfinite(duration_s) or duration_s < 0.0:
-        raise Rejection("duration_s must be finite and non-negative")
-    if duration_s > MAX_REQUESTED_DURATION_S:
-        raise Rejection(f"duration_s must not exceed {MAX_REQUESTED_DURATION_S:.0f}")
+def _pose_move(
+    goal: PoseGoal,
+    settle_position_tolerance_m: float,
+    settle_orientation_tolerance_rad: float,
+    settle_timeout_s: float,
+    stops_before: int,
+) -> PoseMove:
+    """The move_arm goal `goal` settles into, admitted at stop count
+    `stops_before`, or Rejection: a settle tolerance that is no bar or below
+    the plan tolerance of its axis, or a timeout out of its bound."""
+    position_tolerance_m = _require_tolerance(
+        settle_position_tolerance_m, "settle_position_tolerance_m"
+    )
+    orientation_tolerance_rad = _require_tolerance(
+        settle_orientation_tolerance_rad, "settle_orientation_tolerance_rad"
+    )
+    _require_settle_covers_plan(position_tolerance_m, goal.position_tolerance_m, "position_tolerance_m")
+    _require_settle_covers_plan(
+        orientation_tolerance_rad, goal.orientation_tolerance_rad, "orientation_tolerance_rad"
+    )
+    settle = PoseSettle(
+        position=goal.position,
+        orientation=goal.orientation,
+        position_tolerance_m=position_tolerance_m,
+        orientation_tolerance_rad=orientation_tolerance_rad,
+        timeout_s=_require_duration(settle_timeout_s, "settle_timeout_s"),
+    )
+    return PoseMove(goal=goal, settle=settle, stops_before=stops_before)
+
+
+def _joint_settle(tolerances_rad: tuple[float, ...], timeout_s: float) -> JointSettle:
+    """The settle of a move_arm_joints goal, or Rejection: a positive finite
+    tolerance per joint of the arm, and a timeout."""
+    assert len(tolerances_rad) == NUM_JOINTS
+    if not all(math.isfinite(v) and v > 0.0 for v in tolerances_rad):
+        raise Rejection("each settle_tolerances_rad entry must be a positive number")
+    return JointSettle(
+        tolerances_rad=tuple(tolerances_rad),
+        timeout_s=_require_duration(timeout_s, "settle_timeout_s"),
+    )
+
+
+def _require_duration(value: float, field: str) -> float:
+    """`value`, the seconds the wire field `field` carries, or Rejection
+    unless it is within the contract's bound."""
+    if not (math.isfinite(value) and 0.0 <= value <= MAX_REQUESTED_DURATION_S):
+        raise Rejection(
+            f"{field} must be a number of seconds from 0 to {MAX_REQUESTED_DURATION_S:.0f}"
+        )
+    return value
+
+
+def _require_tolerance(value: float, field: str) -> float:
+    """`value`, the bar the wire field `field` carries, or Rejection unless
+    it is positive and finite."""
+    if not (math.isfinite(value) and value > 0.0):
+        raise Rejection(f"{field} must be a positive number")
+    return value
+
+
+def _require_settle_covers_plan(settle_bar: float, plan_bar: float, axis: str) -> None:
+    """Refuse a settle bar below the plan bar of its axis, naming the field
+    to raise: the plan may sit that far from the pose."""
+    if settle_bar < plan_bar:
+        raise Rejection(
+            f"settle_{axis} must be at least plan_{axis}: the plan may sit that far from the pose"
+        )
 
 
 def _unreached(goal: PoseGoal) -> str:
-    """Why a solve refused, naming the bars it was judged against so the
-    caller can tell its own slack from this planner's default."""
-    bars = []
-    if goal.position_tolerance_m is not None:
-        bars.append(f"{goal.position_tolerance_m * 1000:.0f} mm")
-    if goal.orientation_tolerance_rad is not None:
-        bars.append(f"{math.degrees(goal.orientation_tolerance_rad):.0f} deg")
-    slack = f" within {' and '.join(bars)}" if bars else ""
+    """Why a solve refused, naming the bars it was judged against."""
     return (
-        f"no solution reaches this pose{slack} from where the arm is now, "
-        "inside the joint limits; the search is a local descent, so the same "
-        "pose may solve from a different posture"
+        f"goal pose not planned within {goal.position_tolerance_m * 1000:.1f} mm / "
+        f"{math.degrees(goal.orientation_tolerance_rad):.1f} deg: no solution reaches it "
+        "from where the arm is now, inside the joint limits; the search is a local "
+        "descent, so the same pose may solve from a different posture"
     )
-
-
-def _stated_tolerance(value: float, field: str) -> float | None:
-    """The caller's bar, or None where the wire's 0 asked for the planner's
-    default. Anything that is neither is a rejected goal, not a silent
-    fallback to the default."""
-    if value == 0.0:
-        return None
-    if not math.isfinite(value) or value < 0.0:
-        raise Rejection(f"{field} must be finite and non-negative")
-    return value
 
 
 def _require_arm_name(arm_name: str) -> None:
     if arm_name != ARM_LIMB:
-        raise Rejection(f'unknown arm_name {arm_name!r}; this robot has one arm, "{ARM_LIMB}"')
+        raise Rejection(UNKNOWN_ARM_NAME)
 
 
 def _require_gripper_name(gripper_name: str) -> None:
     if gripper_name != GRIPPER_LIMB:
-        raise Rejection(
-            f'unknown gripper_name {gripper_name!r}; this robot has one gripper, "{GRIPPER_LIMB}"'
-        )
+        raise Rejection(UNKNOWN_GRIPPER_NAME)
 
 
 def _terminal(plan: ArmPlan | GripperPlan, note: str) -> tuple[bool, str]:
     """success and message for a done plan: a coordinator-failed plan is a
-    failed goal, whatever the wall clock says. A gripper plan that did not
-    fail is done because the gripper stands still, and its message says
-    whether that is on the target."""
+    failed goal, whatever the wall clock says; a plan that did not fail
+    completed, an arm plan as its settle ends it and a gripper plan past the
+    planned end of its travel, with the message of that ending."""
     if plan.failed is not None:
         return False, _join(plan.failed, note)
-    if isinstance(plan, GripperPlan):
-        return True, _join(_stood_still(plan), note)
-    return True, note
+    return True, _join(_completion(plan), note)
 
 
-def _stood_still(plan: GripperPlan) -> str:
-    """The success message for a gripper standing still: on the target when
-    within GRIPPER_REACHED_FRAC of it, else short of it, where an object or
-    the effort ceiling holds the jaws, with both openings named. Success
-    either way: the caller judges the grasp from final_opening."""
-    assert plan.settled is not None, "a gripper plan done without failing stood still"
-    if abs(plan.settled - plan.target) <= GRIPPER_REACHED_FRAC:
-        return "move complete"
-    return (
-        f"move complete: the gripper stopped at {plan.settled:.3f}, "
-        f"short of the target {plan.target:.3f}"
-    )
-
-
-def _overrun(plan: GripperPlan, now: float) -> str:
-    """Why a gripper plan ran out of its travel budget at `now`: the ramp
-    never delivered its target, or it did and the measured gripper never
-    stood still afterwards."""
-    if plan.settle is None:
-        return "goal did not complete within its travel budget"
-    return (
-        f"the gripper still moved {now - plan.settle.began:.1f} s "
-        "after the commanded move ended"
-    )
-
-
-# Beyond this the arm landed somewhere an operator would not call the pose
-# they asked for, so the result says so rather than reporting a bare success.
-_ORIENTATION_NOTE_FLOOR_RAD = math.radians(2.0)
-
-
-def _orientation_note(reached, requested) -> str:
-    """What to say about the orientation actually achieved. Five joints
-    underactuate three rotational degrees of freedom, so a move that reached
-    its position can still be turned well away from the requested pose; a
-    result that reported only success would hide that."""
-    error_rad = relative_rotation_rad(reached, requested)
-    if error_rad < _ORIENTATION_NOTE_FLOOR_RAD:
-        return ""
-    return (
-        f"orientation reached within {math.degrees(error_rad):.0f} degrees of the "
-        "request: five joints underactuate three rotational degrees of freedom"
-    )
+def _completion(plan: ArmPlan | GripperPlan) -> str:
+    """The words a completed plan reports."""
+    if isinstance(plan, ArmPlan):
+        return plan.settle.completion
+    if plan.still_moving_after_s is not None:
+        return (
+            "move complete: the jaws had not stood still by the settle timeout, "
+            f"{plan.still_moving_after_s:.1f} s after the planned end"
+        )
+    return "move complete"
 
 
 def _no_pose() -> tuple[list[float], list[float]]:
-    """The final-pose fields for a refusal that never had a pose to report:
-    no anchor was resolved, or the solve produced nothing. A path that does
-    know where the arm is reports that instead. Fresh lists per call, since
-    they are handed to the generated completion API."""
+    """The final-pose fields of a result with no pose to report: a walked-back
+    admission, a solve that raised, or a move that never ran with neither
+    fresh measured joints nor a commanded setpoint to place the arm. Fresh
+    lists per call, since they are handed to the generated completion API."""
     return [0.0] * 3, [0.0, 0.0, 0.0, 1.0]
 
 
