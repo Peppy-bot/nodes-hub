@@ -37,15 +37,15 @@ use control_core::pacer::Pacer;
 use crate::actions::arm::ArmMoveRequest;
 use crate::arm_pair::ArmPair;
 use crate::camera_mounts::MeasuredGrasps;
-use crate::chase::rate_limited;
 use crate::governor::{GovState, Governor, Guard};
 use crate::liveness::{Admission, Cadence, CadenceChange, Liveness};
-use crate::motion::{MOTION_TIMEOUT_FACTOR, MoveBudget};
 use crate::planner::{self, BusyGuard, Goal, Measurement, Planner, Unmeasured};
 use crate::publish::{LimbStateSnapshot, Publishers};
 use crate::streams::{ArmState, GovernorConfig, GripperCommand, GripperState, LeaderActivity};
 use crate::types::{ARM_DOF, JointVec, Side};
 use crate::upstream::{Upstream, UpstreamMode};
+use control_core::chase::rate_limited;
+use control_core::move_budget::{MOTION_TIMEOUT_FACTOR, MoveBudget};
 
 /// How long [`seed_all`] waits for an arm's first measured state before warning that
 /// the backbone is still blocked, so a silent arm is visible in the log instead of an
@@ -117,7 +117,7 @@ pub enum CoordinatorRequest {
     /// arm stands: the time the move would take, or the refusal's words.
     CheckArmMove {
         request: ArmMoveRequest,
-        reply: oneshot::Sender<Result<f64, String>>,
+        reply: oneshot::Sender<Result<Duration, String>>,
     },
     /// The grasp pose of each arm, measured when the loop serves the
     /// request: what a posture result gives when its goal completes.
@@ -200,7 +200,7 @@ struct GripperMotion {
     target_frac: f64,
     started: Instant,
     /// Nominal chase duration; the runtime aborts once the chase runs past
-    /// `MOTION_TIMEOUT_FACTOR` times this, exactly as the arm servo does.
+    /// `MOTION_TIMEOUT_FACTOR` times this.
     /// Re-budgeted by [`MoveBudget::after_rate_change`] when the operator slows
     /// the opening rate mid-move.
     budget: MoveBudget,
@@ -630,7 +630,7 @@ async fn serve_request(
             let _ = reply.send(planners.get_mut(request.side).check_cartesian(
                 &request.target,
                 request.tolerance,
-                request.duration_s,
+                request.duration,
             ));
         }
         CoordinatorRequest::MeasureGrasps { reply } => {
@@ -870,7 +870,7 @@ fn measured_grasps(
 ) -> ArmPair<MeasuredGrasp> {
     let mut grasp = |side: Side| {
         seeded_measurement(channels.get(side), *arm_admission.get(side))
-            .map(|q| planners.get_mut(side).ee_pose_world(&q))
+            .map(|q| planners.get_mut(side).world_ee_pose(&q))
     };
     ArmPair::new(grasp(Side::Left), grasp(Side::Right))
 }
@@ -891,8 +891,8 @@ fn limb_state_snapshot(
     Some(LimbStateSnapshot {
         joints: ArmPair::new(left.positions, right.positions),
         poses: ArmPair::new(
-            planners.left.ee_pose_world(&left.positions),
-            planners.right.ee_pose_world(&right.positions),
+            planners.left.world_ee_pose(&left.positions),
+            planners.right.world_ee_pose(&right.positions),
         ),
         openings: ArmPair::new(left_gripper.fraction, right_gripper.fraction),
     })
@@ -941,7 +941,7 @@ async fn relay_upstream(
         if let Some(m) = measured {
             wire.send(&m.positions, &m.velocities).await;
             if upstream_mode == UpstreamMode::Pose {
-                pose_wire.send(&planner.ee_pose_world(&m.positions)).await;
+                pose_wire.send(&planner.world_ee_pose(&m.positions)).await;
             }
         }
     }
@@ -1168,9 +1168,8 @@ const GRIPPER_REACHED_FRAC: f64 = 0.01;
 const GRIPPER_SETTLE_TIMEOUT_S: f64 = 3.0;
 
 /// Nominal duration (s) of a gripper move admitted with the chase at
-/// `governed_frac`: the commanded travel at the opening rate. The gripper
-/// analog of the arm servo's plan-time rollout, graded by the same
-/// [`motion_timed_out`] rule.
+/// `governed_frac`: the commanded travel at the opening rate, graded by
+/// [`MoveBudget::timed_out`].
 fn gripper_move_budget_s(governed_frac: f64, target_frac: f64, gripper_rate_frac_s: f64) -> f64 {
     (target_frac - governed_frac).abs() / gripper_rate_frac_s
 }
@@ -1924,7 +1923,7 @@ mod tests {
     /// A planner of the `side` arm of v1 hardware, holding `held`.
     fn planner_holding(side: Side, held: JointVec) -> Planner {
         use crate::planner::PlanConfig;
-        use crate::servo::EeCaps;
+        use srs_model::chain_kinematics::EeCaps;
 
         const TEST_PERIOD: Duration = Duration::from_millis(10);
         let version = openarm_description::HardwareVersion::V1;
@@ -1936,8 +1935,9 @@ mod tests {
             model,
             PlanConfig {
                 cycle_period: TEST_PERIOD,
-                smoothing: crate::servo::smoothing_for(TEST_PERIOD).unwrap(),
+                smoothing: srs_model::chain_kinematics::command_smoothing(TEST_PERIOD).unwrap(),
                 max_joint_velocity_rad_s: [10.0; ARM_DOF],
+                max_joint_acceleration_rad_s2: crate::test_support::A_MAX,
                 ee: EeCaps {
                     linear_m_s: 1.0,
                     angular_rad_s: 0.8,
@@ -2146,7 +2146,7 @@ mod tests {
         .await;
         let grasps = answer.await.expect("the loop answers the request");
         assert_eq!(grasps.left, Err(Unmeasured::Stale));
-        assert_eq!(grasps.right, Ok(planners.right.ee_pose_world(&recovered)));
+        assert_eq!(grasps.right, Ok(planners.right.world_ee_pose(&recovered)));
     }
 
     /// During the seed wait, a grasp request gets no pose for either arm,

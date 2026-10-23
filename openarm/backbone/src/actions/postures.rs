@@ -15,6 +15,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use peppygen::exposed_actions::postures::{move_to_home, move_to_ready};
 use peppygen::{NodeRunner, Result};
@@ -222,7 +223,7 @@ macro_rules! posture_runner {
                     let idx = side.index();
                     let goal = Goal::Joint {
                         target: $posture(side.model()),
-                        duration_s,
+                        duration: Duration::from_secs_f64(duration_s),
                         reply: JointReply::Ready(ReadyReply {
                             done_tx: done_tx.clone(),
                             cancelled: cancelled.clone(),

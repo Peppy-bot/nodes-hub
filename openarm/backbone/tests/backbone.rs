@@ -28,17 +28,12 @@ use peppygen::fixtures::harness::{Config, Harness};
 use peppygen::mock::deps::perception_geometry::{get_color_intrinsics, get_depth_intrinsics};
 use tokio::sync::{mpsc, oneshot, watch};
 
+mod helpers;
+use helpers::params;
+
 /// How long a mock pump waits parked for the node's next poll or for the
 /// node's subscription to appear; only expires once the harness is gone.
 const PUMP_TIMEOUT: Duration = Duration::from_secs(120);
-
-/// Control rate for the tests: 20 ms cycle (Nyquist 25 Hz, above the 15 Hz
-/// velocity-filter default).
-const CONTROL_RATE_HZ: u32 = 50;
-
-/// Declared follower rate for the tests: four of its periods make an 80 ms
-/// stale window, comfortably above the state pumps even on a loaded machine.
-const FOLLOWER_STATE_RATE_HZ: u32 = 50;
 
 /// Follower back-channel period; must stay well inside the 80 ms follower
 /// stale window or the coordinator freezes that limb.
@@ -57,32 +52,6 @@ const DEADLINE: Duration = Duration::from_secs(90);
 /// Per-read window inside a convergence loop: several coordinator readout /
 /// stream periods, so an elapsed window means "nothing arrived", not jitter.
 const READ_WINDOW: Duration = Duration::from_secs(2);
-
-/// The node's full parameter set (most have no schema default, so every test
-/// passes them explicitly): v1 hardware, joints-mode upstream, the validated
-/// collision band, and a permissive EE cap so streamed chases converge fast.
-fn params() -> peppygen::Parameters {
-    peppygen::Parameters {
-        collision_governor_enabled: true,
-        control_rate_hz: CONTROL_RATE_HZ,
-        d_safe_m: 0.02,
-        d_stop_m: 0.005,
-        follower_state_rate_hz: FOLLOWER_STATE_RATE_HZ,
-        hardware_version: "v1".to_string(),
-        max_ee_angular_velocity_rad_s: 0.8,
-        max_ee_velocity_m_s: 2.0,
-        max_gripper_rate_frac_s: 6.0,
-        max_joint_velocity_rad_s_1: 16.754666,
-        max_joint_velocity_rad_s_2: 16.754666,
-        max_joint_velocity_rad_s_3: 5.445426,
-        max_joint_velocity_rad_s_4: 5.445426,
-        max_joint_velocity_rad_s_5: 20.943946,
-        max_joint_velocity_rad_s_6: 20.943946,
-        max_joint_velocity_rad_s_7: 20.943946,
-        upstream_mode: "joints".to_string(),
-        velocity_filter_cutoff_hz: 15.0,
-    }
-}
 
 /// The node's parameter set on v2 hardware, whose design carries the
 /// cameras.
@@ -1648,7 +1617,7 @@ async fn a_posture_move_leaves_the_grippers_alone() -> peppygen::Result<()> {
 
 /// The plan check answers whether a Cartesian goal has a plan and moves
 /// nothing: a pose a little above the grasp point has one, with the time the
-/// move would take; a pose two metres away is refused with the words a
+/// move would take; a pose two meters away is refused with the words a
 /// `move_arm` refusal gives; an unknown arm is refused; and the arm mock
 /// observes no motion throughout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1969,7 +1938,7 @@ async fn without_camera_geometry_the_workspace_is_described_without_a_view_check
 
 /// With the chest camera's geometry linked, check_positions judges each
 /// point by reach and by what the camera sees through its own intrinsics: a
-/// point 0.30 m ahead at table height is workable, one a metre ahead is out
+/// point 0.30 m ahead at table height is workable, one a meter ahead is out
 /// of reach by how far the closest arm stops. A list that does not split
 /// into points is refused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

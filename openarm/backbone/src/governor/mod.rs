@@ -632,7 +632,7 @@ mod tests {
 
     use super::limiters::measured_tripwire::MONITOR_TRIP_FRACTION;
     use super::*;
-    use crate::chase::rate_limited;
+    use control_core::chase::{chase_step, rate_limited};
 
     /// Materialize a generation's bundled collision meshes so the file-based collision
     /// builder can fit hulls; the URDF itself comes from the same `HardwareVersion`.
@@ -992,12 +992,10 @@ mod tests {
         g.distance_at(&concat(s)).expect("finite config")
     }
 
-    /// Step `from` toward `to` by at most `max` rad on each joint (a stand-in for
-    /// the velocity-limited chase that feeds the governor in the real loop).
+    /// Step `from` toward `to` by at most `max` rad on each joint: one tick of
+    /// the velocity-limited chase that feeds the governor in the real loop.
     fn chase(from: &ArmPair<JointVec>, to: &ArmPair<JointVec>, max: f64) -> ArmPair<JointVec> {
-        let one = |f: &JointVec, t: &JointVec| {
-            std::array::from_fn(|i| f[i] + (t[i] - f[i]).clamp(-max, max))
-        };
+        let one = |f: &JointVec, t: &JointVec| chase_step(f, t, &[max; ARM_DOF], 1.0);
         ArmPair::new(one(&from.left, &to.left), one(&from.right, &to.right))
     }
 
@@ -2534,8 +2532,8 @@ max={} us | over budget {over}/{}",
     /// realized clearance never crosses the stop floor on any tick; measured
     /// tracks commanded (perfect tracking). Returns the settled state.
     fn drive(g: &mut Governor, start: GovState, target: &GovState, ticks: usize) -> GovState {
-        let gripper_step = g.max_gripper_rate_frac_s() * DT;
-        let chase_frac = |from: f64, to: f64| from + (to - from).clamp(-gripper_step, gripper_step);
+        let rate = g.max_gripper_rate_frac_s();
+        let chase_frac = |from: f64, to: f64| rate_limited(from, to, rate, DT);
         let mut s = start;
         for _ in 0..ticks {
             let cand = GovState::new(
