@@ -19,11 +19,11 @@
 # builder so the amd64 host can cross-build the arm64 layers.
 #
 # Usage:
-#   RCLONE_S3_ACCESS_KEY_ID=<key> RCLONE_S3_SECRET_ACCESS_KEY=<secret> bash sim_base_images/build_base_images.sh
+#   PEPPY_R2_DATA01_ACCESS_KEY_ID=<key> PEPPY_R2_DATA01_SECRET_ACCESS_KEY=<secret> bash sim_base_images/build_base_images.sh
 set -euo pipefail
 
-export RCLONE_S3_ACCESS_KEY_ID="${RCLONE_S3_ACCESS_KEY_ID:?RCLONE_S3_ACCESS_KEY_ID must be set}"
-export RCLONE_S3_SECRET_ACCESS_KEY="${RCLONE_S3_SECRET_ACCESS_KEY:?RCLONE_S3_SECRET_ACCESS_KEY must be set}"
+export PEPPY_R2_DATA01_ACCESS_KEY_ID="${PEPPY_R2_DATA01_ACCESS_KEY_ID:?PEPPY_R2_DATA01_ACCESS_KEY_ID must be set}"
+export PEPPY_R2_DATA01_SECRET_ACCESS_KEY="${PEPPY_R2_DATA01_SECRET_ACCESS_KEY:?PEPPY_R2_DATA01_SECRET_ACCESS_KEY must be set}"
 
 # ── Version manifest ──────────────────────────────────────────────────────────
 ISAAC_VERSION="6.1.0"    # mirrors nvcr.io/nvidia/isaac-sim upstream version
@@ -123,8 +123,8 @@ if (( BUILD_ISAAC )); then
         --platform "${ISAAC_PLATFORMS}" \
         --allow network.host \
         --network=host \
-        --secret id=rclone_key,env=RCLONE_S3_ACCESS_KEY_ID \
-        --secret id=rclone_secret,env=RCLONE_S3_SECRET_ACCESS_KEY \
+        --secret id=rclone_key,env=PEPPY_R2_DATA01_ACCESS_KEY_ID \
+        --secret id=rclone_secret,env=PEPPY_R2_DATA01_SECRET_ACCESS_KEY \
         --build-arg ISAAC_VERSION="${ISAAC_VERSION}" \
         -t "${ISAAC_IMAGE}" \
         -f "${IMAGES_DIR}/Dockerfile.isaac" \
@@ -141,8 +141,8 @@ if (( BUILD_MUJOCO )); then
         --platform "${MUJOCO_PLATFORMS}" \
         --allow network.host \
         --network=host \
-        --secret id=rclone_key,env=RCLONE_S3_ACCESS_KEY_ID \
-        --secret id=rclone_secret,env=RCLONE_S3_SECRET_ACCESS_KEY \
+        --secret id=rclone_key,env=PEPPY_R2_DATA01_ACCESS_KEY_ID \
+        --secret id=rclone_secret,env=PEPPY_R2_DATA01_SECRET_ACCESS_KEY \
         -t "${MUJOCO_IMAGE}" \
         -f "${IMAGES_DIR}/Dockerfile.mujoco" \
         --push \

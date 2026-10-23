@@ -17,6 +17,7 @@ import pytest
 _NODE_DIR = Path(__file__).resolve().parents[1]
 # Where the base images of both simulation nodes are built from.
 _IMAGES_DIR = _NODE_DIR.parent / "sim_base_images"
+_R2_ENDPOINT = "https://b9abcee11c090aef5279f874ff078826.r2.cloudflarestorage.com"
 
 
 def _shell_value(script: str, name: str) -> str:
@@ -234,6 +235,8 @@ with open(os.environ["MOCK_RCLONE_LOG"], "a") as log:
     log.write(json.dumps({
         "args": sys.argv[1:],
         "endpoint": os.environ["RCLONE_CONFIG_R2_ENDPOINT"],
+        "access_key_id": os.environ["RCLONE_CONFIG_R2_ACCESS_KEY_ID"],
+        "secret_access_key": os.environ["RCLONE_CONFIG_R2_SECRET_ACCESS_KEY"],
     }) + "\n")
 if os.environ["MOCK_RCLONE_FAIL"] == "1":
     sys.exit(9)
@@ -266,8 +269,8 @@ os.execv(os.environ["REAL_TAR"], ["tar", *sys.argv[1:]])
         env={
             "PATH": f"{bin_dir}{os.pathsep}{os.defpath}",
             "TMPDIR": str(scratch),
-            "RCLONE_S3_ACCESS_KEY_ID": "test-key",
-            "RCLONE_S3_SECRET_ACCESS_KEY": "test-secret",
+            "PEPPY_R2_DATA01_ACCESS_KEY_ID": "test-key",
+            "PEPPY_R2_DATA01_SECRET_ACCESS_KEY": "test-secret",
             "MOCK_RCLONE_LOG": str(rclone_log),
             "MOCK_RCLONE_FAIL": "1" if download_fails else "0",
             "MOCK_BUNDLES": json.dumps({
@@ -290,6 +293,12 @@ os.execv(os.environ["REAL_TAR"], ["tar", *sys.argv[1:]])
     return result, calls, files
 
 
+def _assert_reaches_r2_with_the_test_credentials(call):
+    assert call["endpoint"] == _R2_ENDPOINT
+    assert call["access_key_id"] == "test-key"
+    assert call["secret_access_key"] == "test-secret"
+
+
 def test_isaac_installer_fetches_only_pinned_keys_and_extracts_each_bundle_under_its_robot(tmp_path):
     result, calls, files = _run_installer(tmp_path)
     assert result.returncode == 0, result.stderr
@@ -300,9 +309,7 @@ def test_isaac_installer_fetches_only_pinned_keys_and_extracts_each_bundle_under
     for call in calls:
         assert call["args"][3:] == ["--progress"]
         assert Path(call["args"][2]).is_relative_to(tmp_path / "scratch")
-        assert call["endpoint"] == (
-            "https://b9abcee11c090aef5279f874ff078826.r2.cloudflarestorage.com"
-        )
+        _assert_reaches_r2_with_the_test_credentials(call)
     output = tmp_path / "output"
     assert {
         str(path.relative_to(output)): path.read_bytes()
@@ -354,9 +361,7 @@ def test_mujoco_installer_keeps_its_directory_copy_without_isaac_pin(tmp_path):
         f"{tmp_path}/output/",
         "--progress",
     ]
-    assert calls[0]["endpoint"] == (
-        "https://b9abcee11c090aef5279f874ff078826.r2.cloudflarestorage.com"
-    )
+    _assert_reaches_r2_with_the_test_credentials(calls[0])
     output = tmp_path / "output"
     assert list(output.iterdir()) == [output / "robot.xml"]
     assert (output / "robot.xml").read_bytes() == b"MuJoCo robot"

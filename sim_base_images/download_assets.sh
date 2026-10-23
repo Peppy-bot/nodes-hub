@@ -3,7 +3,7 @@
 # mirror for MuJoCo, one pinned bundle per robot for Isaac Sim.
 # Usage: download_assets.sh --variant <isaac|mujoco> [--output-dir <path>]
 # Called by Dockerfile.isaac and Dockerfile.mujoco during base image builds.
-# To rebuild base images: RCLONE_S3_ACCESS_KEY_ID=<key> RCLONE_S3_SECRET_ACCESS_KEY=<secret> bash sim_base_images/build_base_images.sh
+# To rebuild base images: PEPPY_R2_DATA01_ACCESS_KEY_ID=<key> PEPPY_R2_DATA01_SECRET_ACCESS_KEY=<secret> bash sim_base_images/build_base_images.sh
 set -euo pipefail
 
 VARIANT=""
@@ -21,8 +21,8 @@ if [[ "$VARIANT" != "isaac" && "$VARIANT" != "mujoco" ]]; then
     exit 1
 fi
 
-KEY_ID="${RCLONE_S3_ACCESS_KEY_ID:?RCLONE_S3_ACCESS_KEY_ID must be set}"
-SECRET="${RCLONE_S3_SECRET_ACCESS_KEY:?RCLONE_S3_SECRET_ACCESS_KEY must be set}"
+KEY_ID="${PEPPY_R2_DATA01_ACCESS_KEY_ID:?PEPPY_R2_DATA01_ACCESS_KEY_ID must be set}"
+SECRET="${PEPPY_R2_DATA01_SECRET_ACCESS_KEY:?PEPPY_R2_DATA01_SECRET_ACCESS_KEY must be set}"
 ENDPOINT="https://b9abcee11c090aef5279f874ff078826.r2.cloudflarestorage.com"
 BUCKET="peppy-data01"
 
