@@ -61,7 +61,7 @@ are supplied too:
 ```sh
 peppy node run openarm_web_commander:v1 \
     command_rate_hz=100 hardware_version=v2 max_ee_velocity_m_s=0.5 \
-    joint_jog_acceleration_rad_s2=10.0 \
+    joint_jog_acceleration_rad_s2=10.0 joint_jog_velocity_rad_s=1.0 \
     collision_governor_enabled=true d_stop=0.005 d_safe=0.02 \
     --link limb_motion@backbone_inst \
     --link collision_status@backbone_inst \
