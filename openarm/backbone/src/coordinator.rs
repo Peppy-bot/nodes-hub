@@ -73,6 +73,11 @@ pub struct ArmChannels {
     pub busy: Arc<AtomicBool>,
     pub gripper_goals: mpsc::Receiver<GripperGoal>,
     pub gripper_busy: Arc<AtomicBool>,
+    /// Whether the arm's and the gripper's followers deliver fresh state,
+    /// written every tick for the goal handlers, which refuse a goal on a
+    /// limb whose follower is stale or has not reported yet.
+    pub fresh: Arc<AtomicBool>,
+    pub gripper_fresh: Arc<AtomicBool>,
 }
 
 /// The coordinator's run parameters. A *leading node* that stops streaming is
@@ -463,6 +468,14 @@ pub async fn run(
             now,
             stale_limit,
         );
+        for side in [Side::Left, Side::Right] {
+            let arm = channels.get(side);
+            let fresh = |admission: Admission| admission != Admission::Stale;
+            arm.fresh
+                .store(fresh(*arm_admission.get(side)), Ordering::Release);
+            arm.gripper_fresh
+                .store(fresh(*gripper_admission.get(side)), Ordering::Release);
+        }
         // The services are answered ahead of the tick's advance: a stop ends
         // every move before the planners would step it once more.
         while let Ok(request) = requests.try_recv() {
@@ -1951,6 +1964,8 @@ mod tests {
             busy: Arc::new(AtomicBool::new(true)),
             gripper_goals,
             gripper_busy: Arc::new(AtomicBool::new(false)),
+            fresh: Arc::new(AtomicBool::new(false)),
+            gripper_fresh: Arc::new(AtomicBool::new(false)),
         };
         (channels, measured_tx, goal_tx)
     }

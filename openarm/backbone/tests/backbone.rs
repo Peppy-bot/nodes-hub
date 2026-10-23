@@ -492,7 +492,7 @@ macro_rules! send_posture_goal {
 /// Send one goal of `$action` with `$duration_s`, and assert that the node
 /// refuses it as a duration outside the contract's bound.
 macro_rules! assert_posture_refused {
-    ($harness:expr, $action:ident, $duration_s:expr) => {{
+    ($harness:expr, $action:ident, $duration_s:expr, $reason:expr) => {{
         let goal = send_posture_goal!($harness, $action, $duration_s);
         assert!(
             !goal.accepted,
@@ -500,10 +500,7 @@ macro_rules! assert_posture_refused {
             $duration_s,
             stringify!($action)
         );
-        assert_eq!(
-            goal.reason.as_deref(),
-            Some("duration_s must be a number of seconds from 0 to 60")
-        );
+        assert_eq!(goal.reason.as_deref(), Some($reason));
     }};
 }
 
@@ -757,6 +754,50 @@ async fn a_goal_on_an_arm_a_leader_streams_waits_for_the_stream_to_stop() -> pep
     harness.shutdown().await
 }
 
+/// Admission end-to-end: a goal on a limb whose follower has not reported is
+/// refused at the door, before the coordinator has seeded, with the refusal
+/// the so101 backbone gives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_goal_on_a_limb_with_no_fresh_follower_state_is_refused_at_admission()
+-> peppygen::Result<()> {
+    let (harness, mocks) = Harness::start_with(
+        Config {
+            parameters: Some(params()),
+            collision_ctrl_vacant: false,
+            perception_geometry_vacant: true,
+            ..Default::default()
+        },
+        openarm_backbone::setup,
+    )
+    .await?;
+    pump_is_ready(
+        mocks.deps.robot_init.is_ready,
+        Arc::new(AtomicBool::new(true)),
+    );
+    // The right arm and both grippers report; the left arm never does.
+    pump_right_arm_and_grippers!(mocks);
+
+    let goal = move_arm_joints::send_goal(
+        &harness,
+        &move_arm_joints::GoalRequestData {
+            arm_name: "left_arm".to_string(),
+            joint_positions: HOME,
+            duration_s: 1.0,
+            settle_tolerances_rad: [SETTLE_TOLERANCE_RAD; 7],
+            settle_timeout_s: SETTLE_TIMEOUT_S,
+        },
+        peppygen::QoSProfile::Reliable,
+        DEADLINE,
+    )
+    .await?;
+    assert!(!goal.accepted, "a goal on an unreported arm was accepted");
+    assert_eq!(
+        goal.reason.as_deref(),
+        Some("no fresh follower state to anchor the move from")
+    );
+    harness.shutdown().await
+}
+
 /// Exposed action end-to-end: `move_arm_joints` through the real action
 /// engine, with the left arm mock playing a perfect follower (it adopts every
 /// governed setpoint as its measured state). The goal must be admitted, the
@@ -790,10 +831,10 @@ async fn move_arm_joints_streams_a_trajectory_the_arm_follows_to_the_target() ->
     .followed;
     pump_right_arm_and_grippers!(mocks);
 
-    // Gate the goal on streaming having begun: a goal that reaches the
-    // coordinator while `seed_all` still waits for first states is refused
-    // ("the follower has not reported its first state yet"), so wait for the
-    // first governed setpoint on the (uncommanded) right wire first.
+    // Gate the goal on streaming having begun: a goal sent before the
+    // coordinator's first tick is refused at admission ("no fresh follower
+    // state to anchor the move from"), so wait for the first governed
+    // setpoint on the (uncommanded) right wire first.
     await_streaming(mocks.pairings.right_arm.joint_setpoints).await?;
 
     // A known-good working posture (the coordinator's own unit tests hold it),
@@ -1537,28 +1578,19 @@ async fn a_posture_result_reports_each_arms_measured_grasp_point() -> peppygen::
     harness.shutdown().await
 }
 
-/// Before the arms report their first state, a posture goal ends failed
-/// with no grasp pose, and its message says why.
+/// Before the arms report their first state, a posture goal is refused at
+/// admission, with the refusal every arm goal gets then.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_posture_goal_before_the_first_measurement_reports_no_pose() -> peppygen::Result<()> {
+async fn a_posture_goal_before_the_first_measurement_is_refused() -> peppygen::Result<()> {
     let (harness, mocks) = start_ready_vacant(params()).await?;
     pump_is_ready(
         mocks.deps.robot_init.is_ready,
         Arc::new(AtomicBool::new(true)),
     );
     // No follower reports, so the coordinator waits for the first states.
-    let result = complete_posture!(harness, move_to_ready, 1.0);
-    assert!(!result.success);
-    assert!(
-        result.message.ends_with(
-            "the follower has not reported its first state yet; \
-             no arm poses: the robot has not measured every limb yet"
-        ),
-        "{}",
-        result.message
-    );
-    assert!(result.arm_names.is_empty(), "{:?}", result.arm_names);
-    assert!(result.positions.is_empty() && result.orientations.is_empty());
+    let refusal = "no fresh follower state to anchor the move from";
+    assert_posture_refused!(harness, move_to_ready, 1.0, refusal);
+    assert_posture_refused!(harness, move_to_home, 1.0, refusal);
     harness.shutdown().await
 }
 
@@ -1578,8 +1610,9 @@ async fn a_posture_goal_above_the_duration_ceiling_is_refused() -> peppygen::Res
     pump_right_arm_and_grippers!(mocks);
     await_streaming(mocks.pairings.right_arm.joint_setpoints).await?;
 
-    assert_posture_refused!(harness, move_to_ready, 61.0);
-    assert_posture_refused!(harness, move_to_home, 61.0);
+    let ceiling = "duration_s must be a number of seconds from 0 to 60";
+    assert_posture_refused!(harness, move_to_ready, 61.0, ceiling);
+    assert_posture_refused!(harness, move_to_home, 61.0, ceiling);
     harness.shutdown().await
 }
 

@@ -56,8 +56,13 @@ fingers identically.
    relayed up the leader slots, and the proximity readout at ~20 Hz.
 
 The action handlers admit goals before the loop runs them. A goal on a limb
-that received a leader command within the last 250 ms is refused, so whoever
-is streaming the limb keeps it until the stream stops. A posture is refused
+whose follower delivers no fresh state, before its first state or after it
+stopped reporting, is refused with `no fresh follower state to anchor the move
+from` (`no fresh gripper state to anchor the move from` for a gripper), and so
+is `check_arm_move`; until the coordinator has seeded on every follower's
+first state, every goal is refused that way. A goal on a limb that received a
+leader command within the last 250 ms is refused, so whoever is streaming the
+limb keeps it until the stream stops. A posture is refused
 while either arm is being streamed, and `check_arm_move` returns the same
 refusal. Releasing the headset's grip streams the measured pose for a quarter
 second, so a posture button pressed within about half a second of letting go
@@ -227,10 +232,6 @@ moving arm can then settle a little further, to the setpoint it holds.
 When an arm has no fresh measurement when the goal completes, the three
 arrays are empty. The message then ends with one of these reasons:
 
-- `; no arm poses: the robot has not measured every limb yet`: the goal
-  came during the seed wait, before each arm and each gripper reported its
-  first state. The seed wait judges no liveness, so no measurement is known
-  to be fresh, and neither arm has a pose.
 - `; no arm poses: <arm> stopped reporting its joints`: the follower of the
   arm stopped reporting, so its last measurement is stale.
 - `; no arm poses: <refusal>`: the coordinator did not answer, for example

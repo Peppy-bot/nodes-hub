@@ -29,7 +29,7 @@ use crate::types::{
     move_seconds_from_wire,
 };
 
-use crate::actions::{ARM_LEADER_STREAMING, blocking_ask_coordinator, claim};
+use crate::actions::{ARM_LEADER_STREAMING, ARM_NO_FRESH_STATE, blocking_ask_coordinator, claim};
 use crate::streams::LeaderActivity;
 
 fn target_in_limits(q: &JointVec, limits: &[Limit; ARM_DOF]) -> bool {
@@ -105,6 +105,7 @@ pub async fn run_move_arm_joints(
     runner: Arc<NodeRunner>,
     goal_txs: [mpsc::Sender<Goal>; 2],
     busy: [Arc<AtomicBool>; 2],
+    fresh: [Arc<AtomicBool>; 2],
     activity: [LeaderActivity; 2],
     limits: [[Limit; ARM_DOF]; 2],
 ) -> Result<()> {
@@ -116,6 +117,9 @@ pub async fn run_move_arm_joints(
                     Ok(request) => request,
                     Err(reason) => return Ok(move_arm_joints::GoalDecision::reject(reason)),
                 };
+                if !fresh[request.side.index()].load(Ordering::Acquire) {
+                    return Ok(move_arm_joints::GoalDecision::reject(ARM_NO_FRESH_STATE));
+                }
                 if activity[request.side.index()].streaming() {
                     return Ok(move_arm_joints::GoalDecision::reject(ARM_LEADER_STREAMING));
                 }
@@ -154,6 +158,7 @@ pub async fn run_move_arm(
     runner: Arc<NodeRunner>,
     goal_txs: [mpsc::Sender<Goal>; 2],
     busy: [Arc<AtomicBool>; 2],
+    fresh: [Arc<AtomicBool>; 2],
     activity: [LeaderActivity; 2],
 ) -> Result<()> {
     let mut handle = move_arm::ActionHandle::expose(&runner).await?;
@@ -164,6 +169,9 @@ pub async fn run_move_arm(
                     Ok(goal) => goal.request.side,
                     Err(reason) => return Ok(move_arm::GoalDecision::reject(reason)),
                 };
+                if !fresh[side.index()].load(Ordering::Acquire) {
+                    return Ok(move_arm::GoalDecision::reject(ARM_NO_FRESH_STATE));
+                }
                 if activity[side.index()].streaming() {
                     return Ok(move_arm::GoalDecision::reject(ARM_LEADER_STREAMING));
                 }
@@ -194,12 +202,14 @@ pub async fn run_move_arm(
 }
 
 /// Expose `check_arm_move`: validate the planning fields as `move_arm` does,
-/// then ask the coordinator, which asks the arm's planner for a plan from the
-/// held setpoint and moves nothing. The answer is the duration the move would
-/// take, or the words a `move_arm` refusal gives.
+/// refuse it as `move_arm` refuses (no fresh follower state, a streaming
+/// leader), then ask the coordinator, which asks the arm's planner for a plan
+/// from the held setpoint and moves nothing. The answer is the duration the
+/// move would take, or the words a `move_arm` refusal gives.
 pub async fn run_check_arm_move(
     runner: Arc<NodeRunner>,
     requests: mpsc::Sender<CoordinatorRequest>,
+    fresh: [Arc<AtomicBool>; 2],
     activity: [LeaderActivity; 2],
 ) -> Result<()> {
     loop {
@@ -217,6 +227,13 @@ pub async fn run_check_arm_move(
                 Ok(request) => request,
                 Err(reason) => return Ok(check_arm_move::Response::new(false, reason, 0.0)),
             };
+            if !fresh[request.side.index()].load(Ordering::Acquire) {
+                return Ok(check_arm_move::Response::new(
+                    false,
+                    ARM_NO_FRESH_STATE.to_string(),
+                    0.0,
+                ));
+            }
             if activity[request.side.index()].streaming() {
                 return Ok(check_arm_move::Response::new(
                     false,

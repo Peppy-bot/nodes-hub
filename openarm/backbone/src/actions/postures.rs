@@ -22,7 +22,7 @@ use srs_model::nalgebra::Isometry3;
 use tokio::sync::{mpsc, oneshot};
 use tracing::error;
 
-use crate::actions::{ARM_LEADER_STREAMING, ask_coordinator, claim};
+use crate::actions::{ARM_LEADER_STREAMING, ARM_NO_FRESH_STATE, ask_coordinator, claim};
 use crate::arm_pair::ArmPair;
 use crate::coordinator::{CoordinatorRequest, MeasuredGrasp};
 use crate::planner::{Goal, JointReply, ReadyOutcome, ReadyReply, Unmeasured};
@@ -181,6 +181,7 @@ macro_rules! posture_runner {
             runner: Arc<NodeRunner>,
             goal_txs: [mpsc::Sender<Goal>; 2],
             busy: [Arc<AtomicBool>; 2],
+            fresh: [Arc<AtomicBool>; 2],
             activity: [LeaderActivity; 2],
             requests: mpsc::Sender<CoordinatorRequest>,
         ) -> Result<()> {
@@ -192,6 +193,9 @@ macro_rules! posture_runner {
                             move_seconds_from_wire("duration_s", req.data.duration_s)
                         {
                             return Ok($action::GoalDecision::reject(reason));
+                        }
+                        if fresh.iter().any(|arm| !arm.load(Ordering::Acquire)) {
+                            return Ok($action::GoalDecision::reject(ARM_NO_FRESH_STATE));
                         }
                         if activity.iter().any(LeaderActivity::streaming) {
                             return Ok($action::GoalDecision::reject(ARM_LEADER_STREAMING));

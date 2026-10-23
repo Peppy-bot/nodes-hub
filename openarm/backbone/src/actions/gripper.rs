@@ -1,8 +1,9 @@
 //! Gripper move-action admission: the `move_gripper` handler the backbone
 //! exposes. Mirrors the arm move admission exactly: validate the goal
 //! (gripper_name, finiteness, the [0, 1] opening range, a non-negative effort
-//! cap, a settle timeout from 0 to 60 s), refuse it while a leader streams
-//! the gripper, claim the side's single-flight slot, and hand the accepted
+//! cap, a settle timeout from 0 to 60 s), refuse it while the gripper's
+//! follower delivers no fresh state or a leader streams the gripper, claim
+//! the side's single-flight slot, and hand the accepted
 //! goal to the coordinator over its gripper goal channel. The coordinator
 //! runs the motion through the same per-tick governing as every other DOF,
 //! completes the goal once the jaws stand still after the planned end of the
@@ -20,8 +21,8 @@ use peppygen::{NodeRunner, Result};
 use tokio::sync::mpsc;
 use tracing::error;
 
-use crate::actions::GRIPPER_LEADER_STREAMING;
 use crate::actions::claim;
+use crate::actions::{GRIPPER_LEADER_STREAMING, GRIPPER_NO_FRESH_STATE};
 use crate::coordinator::GripperGoal;
 use crate::streams::LeaderActivity;
 use crate::types::{Side, move_seconds_from_wire};
@@ -67,6 +68,7 @@ pub async fn run_move_gripper(
     runner: Arc<NodeRunner>,
     goal_txs: [mpsc::Sender<GripperGoal>; 2],
     busy: [Arc<AtomicBool>; 2],
+    fresh: [Arc<AtomicBool>; 2],
     activity: [LeaderActivity; 2],
 ) -> Result<()> {
     let mut handle = ActionHandle::expose(&runner).await?;
@@ -77,6 +79,9 @@ pub async fn run_move_gripper(
                     Ok(request) => request.side,
                     Err(reason) => return Ok(GoalDecision::reject(reason)),
                 };
+                if !fresh[side.index()].load(std::sync::atomic::Ordering::Acquire) {
+                    return Ok(GoalDecision::reject(GRIPPER_NO_FRESH_STATE));
+                }
                 if activity[side.index()].streaming() {
                     return Ok(GoalDecision::reject(GRIPPER_LEADER_STREAMING));
                 }
