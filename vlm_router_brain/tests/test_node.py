@@ -224,6 +224,8 @@ async def test_identify_then_a_scripted_grab_holds_the_item():
         await publish_a_capture(h)
         found = await once_the_brain_sees(identify_fx, h, identify())
         assert found.success is True, found.message
+        # No limb_states snapshot yet: no measured opening.
+        assert (await get_state_fx.poll(h, 5.0)).gripper_openings == []
         await once_the_brain_has_limbs(h)
         plan(h, True, True, True)
         grab = await grab_fx.send_goal(
@@ -251,6 +253,8 @@ async def test_identify_then_a_scripted_grab_holds_the_item():
         assert (result.success, result.gripper_name, result.item_id) == (True, "left_gripper", found.item_id), result.message
         state = await get_state_fx.poll(h, 5.0)
         assert (state.holding, state.held_item_ids) == ([True, False], [found.item_id, ""])
+        # The last snapshot the backbone published: the left jaws on the cup.
+        assert state.gripper_openings == [0.3, 1.0]
 
 
 async def test_a_gripper_that_closes_on_nothing_fails_the_grab_and_holds_nothing():
