@@ -167,7 +167,8 @@ still stands outside its tolerance `settle_timeout_s` after the planned end
 fails with the remaining error, `still 0.031 rad from the target at joint 4,
 2.0 s after the planned end` or `still 8.0 mm / 0.02 rad from the target, 2.0 s
 after the planned end`, and the arm holds where it stands: on the target, or
-where the governor held it short. Every result reports the measured state at that moment. A
+where the governor held it short. Every result reports the measured state at
+that moment. A
 posture move completes at the planned end and reports where each arm stands.
 When the arm's follower stops reporting, the move fails with
 `the follower stopped reporting; the result comes from the joints commanded last`.
@@ -185,8 +186,8 @@ constant of about 0.18 s, so they stand still within about 1 s of any move).
 From the planned end on, the move keeps commanding the target and holding the
 side's busy slot until the measured opening has stood still: every opening
 the follower delivered over 0.25 s lies within 0.01 of the travel of the
-others, the band and window the limb_motion contract states. Jaws an object or the effort cap stops short of the target stand still
-there too. At the latest `settle_timeout_s` after the planned end the move
+others, the band and window the limb_motion contract states. Jaws an object
+or the effort cap stops short of the target stand still there too. At the latest `settle_timeout_s` after the planned end the move
 completes wherever the jaws stand: a gripper move never fails on its settle,
 since a grasp is expected to stop short. `final_opening` is the opening
 measured when the move ended and `action_time` runs to that moment.
@@ -198,8 +199,9 @@ measured when the move ended and `action_time` runs to that moment.
 | The follower stops reporting during the move | false | `the follower stopped reporting; the result comes from the opening commanded last`, and `final_opening` is the opening commanded last |
 | Cancelled before it completes | false, completed as cancelled | `goal cancelled` |
 
-The caller judges a grasp from `final_opening`. After the move, the backbone sends the gripper nothing
-until the next gripper move or a leader's gripper stream. Thus the gripper
+The caller judges a grasp from `final_opening`. After the move, the backbone
+sends the gripper nothing until the next gripper move or a leader's gripper
+stream. Thus the gripper
 keeps the move's target opening and `max_effort` (relayed unchanged), and
 goes on squeezing what it holds.
 

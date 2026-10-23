@@ -59,7 +59,10 @@ pub fn joint_shortfall(
     target: &JointVec,
     tolerances: &JointVec,
 ) -> Option<String> {
+    // Scanned last to first, so the first of equally far joints is named,
+    // as the so101 backbone names it.
     let (joint, error_rad) = (0..ARM_DOF)
+        .rev()
         .map(|j| (j, (measured[j] - target[j]).abs()))
         .filter(|&(j, error_rad)| error_rad > tolerances[j])
         .max_by(|a, b| (a.1 - tolerances[a.0]).total_cmp(&(b.1 - tolerances[b.0])))?;
@@ -154,6 +157,17 @@ mod tests {
             Some(Verdict::Failed(
                 "still 8 mm / 0.02 rad from the target, 2.0 s after the planned end".to_string()
             ))
+        );
+    }
+
+    #[test]
+    fn equally_far_joints_name_the_first() {
+        let measured = [0.0; ARM_DOF];
+        let target = [0.2; ARM_DOF];
+        let tolerances = [0.1; ARM_DOF];
+        assert_eq!(
+            joint_shortfall(&measured, &target, &tolerances),
+            Some("0.200 rad from the target at joint 1".to_string())
         );
     }
 

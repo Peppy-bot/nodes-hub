@@ -1,13 +1,13 @@
-//! Gripper move-action admission: the `move_gripper` handler the backbone exposes.
-//! Mirrors the arm move admission exactly: validate the goal (gripper_name,
-//! finiteness, the [0, 1] opening range, a non-negative effort cap, a settle
-//! time from 0 to 60 s), refuse
-//! it while a leader streams the gripper, claim the side's single-flight
-//! slot, and hand the accepted goal to the coordinator over its gripper goal
-//! channel. The coordinator runs the motion through the same per-tick
-//! governing as every other DOF, completes the goal once the jaws stand still
-//! after the planned end of the commanded travel or at the goal's settle
-//! timeout, and releases the busy slot at the terminal.
+//! Gripper move-action admission: the `move_gripper` handler the backbone
+//! exposes. Mirrors the arm move admission exactly: validate the goal
+//! (gripper_name, finiteness, the [0, 1] opening range, a non-negative effort
+//! cap, a settle timeout from 0 to 60 s), refuse it while a leader streams
+//! the gripper, claim the side's single-flight slot, and hand the accepted
+//! goal to the coordinator over its gripper goal channel. The coordinator
+//! runs the motion through the same per-tick governing as every other DOF,
+//! completes the goal once the jaws stand still after the planned end of the
+//! commanded travel or at the goal's settle timeout, and releases the busy
+//! slot at the terminal.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;

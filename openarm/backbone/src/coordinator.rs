@@ -41,8 +41,7 @@ use crate::liveness::{Admission, Cadence, CadenceChange, Liveness};
 use crate::planner::{self, BusyGuard, Goal, Measurement, Planner, Unmeasured};
 use crate::publish::{LimbStateSnapshot, Publishers};
 use crate::streams::{ArmState, GovernorConfig, GripperCommand, GripperState, LeaderActivity};
-use crate::types::ArmMoveRequest;
-use crate::types::{ARM_DOF, JointVec, Side};
+use crate::types::{ARM_DOF, ArmMoveRequest, JointVec, Side};
 use crate::upstream::{Upstream, UpstreamMode};
 use control_core::chase::rate_limited;
 
@@ -260,14 +259,13 @@ impl GripperMotion {
     /// Note the opening the governor published last tick, and return the
     /// planned end while the commanded travel rests: on each tick after
     /// admission on which the commanded opening stands on the target, or the
-    /// collision guard changed the opening the chase asked for. The planned
+    /// collision guard held it where it stood. The planned
     /// end is the first tick of the current rest. The travel moving on clears
     /// it, with the openings judged during the rest, so a hold the guard lets
     /// go of leaves nothing behind. Whatever the opening rate, and however the
     /// operator retunes it during the move, the travel rests only there.
     fn travel_end(&mut self, commanded: CommandedOpening, now: Instant) -> Option<Instant> {
-        let rests =
-            now > self.admitted && (commanded.frac == self.target_frac || commanded.guarded);
+        let rests = now > self.admitted && (commanded.frac == self.target_frac || commanded.held);
         let rest_start = self.planned_end.unwrap_or(now);
         self.planned_end = rests.then_some(rest_start);
         if !rests {
@@ -299,30 +297,32 @@ struct MeasuredOpening {
 }
 
 /// A gripper's commanded opening as one tick sees it: the opening the
-/// governor published last tick, and whether its collision guard changed the
-/// opening the chase asked for then.
+/// governor published last tick, and whether its collision guard held the
+/// opening where it stood then.
 #[derive(Clone, Copy, Debug)]
 struct CommandedOpening {
     frac: f64,
-    guarded: bool,
+    held: bool,
 }
+
+/// The largest part of the chase's step the governor may let through for the
+/// guard to count as holding the opening: a hold leaves float dust, orders of
+/// magnitude under any throttle, which still moves the opening and is travel.
+const GUARD_HOLD_STEP_FRAC: f64 = 0.01;
 
 impl CommandedOpening {
     /// An idle side's opening, re-anchored on the measured gripper.
     fn idle(frac: f64) -> Self {
-        Self {
-            frac,
-            guarded: false,
-        }
+        Self { frac, held: false }
     }
 
-    /// The opening the governor published from the chase's `chased`. The
-    /// governor passes an unrestricted step through bit for bit, so any
-    /// difference is the guard's.
-    fn published(governed: f64, chased: f64) -> Self {
+    /// The opening the governor published, `governed`, from the chase's step
+    /// from `prev` to `chased`: held when the governor let through under
+    /// [`GUARD_HOLD_STEP_FRAC`] of that step.
+    fn published(governed: f64, prev: f64, chased: f64) -> Self {
         Self {
             frac: governed,
-            guarded: governed != chased,
+            held: (governed - prev).abs() < GUARD_HOLD_STEP_FRAC * (chased - prev).abs(),
         }
     }
 }
@@ -535,8 +535,16 @@ pub async fn run(
         let measured = measured_config(&channels, &prev, measured_grippers);
         let governed = governor.govern(&prev, &cand, &measured, &hands, dt);
         commanded_grippers = ArmPair::new(
-            CommandedOpening::published(governed.grippers.left, cand.grippers.left),
-            CommandedOpening::published(governed.grippers.right, cand.grippers.right),
+            CommandedOpening::published(
+                governed.grippers.left,
+                prev.grippers.left,
+                cand.grippers.left,
+            ),
+            CommandedOpening::published(
+                governed.grippers.right,
+                prev.grippers.right,
+                cand.grippers.right,
+            ),
         );
 
         // Publish one governed setpoint per arm on its pairing slot; the slot
@@ -849,8 +857,8 @@ async fn advance_arms(
 /// Service both sides' backbone-executed gripper moves: admit a queued goal
 /// into a free side, and end an in-flight move once its jaws stand still or
 /// its settle timeout passes, on cancellation, or on a follower gone stale.
-/// `commanded` is the opening the governor published last tick and whether it
-/// changed the chase's step: what a move reads its commanded travel from.
+/// `commanded` is the opening the governor published last tick and whether
+/// the guard held it: what a move reads its commanded travel from.
 async fn service_gripper_moves(
     moves: &mut ArmPair<Option<GripperMove>>,
     channels: &mut ArmPair<ArmChannels>,
@@ -1249,11 +1257,13 @@ fn gripper_move_terminal(
     (since_end >= motion.settle_timeout).then_some(GripperTerminal::SettleTimedOut(since_end))
 }
 
-/// Admit a queued gripper goal into a free side, and end an in-flight move on
-/// the terminal [`gripper_move_terminal`] decides. `commanded` is the opening the
-/// governor published last tick and whether it changed the chase's step. Every terminal reports the opening measured
-/// that tick as `final_opening` and the time since admission as
-/// `action_time`. The busy slot releases with the move on every path.
+/// Admit a queued gripper goal into a free side, refusing it while the
+/// follower is stale, and end an in-flight move on the terminal
+/// [`gripper_move_terminal`] decides. `commanded` is the opening the governor
+/// published last tick and whether the guard held it. Every terminal reports
+/// the opening measured that tick as `final_opening` and the time since
+/// admission as `action_time`. The busy slot releases with the move on every
+/// path.
 async fn service_gripper_move(
     mv: &mut Option<GripperMove>,
     channels: &mut ArmChannels,
@@ -1264,7 +1274,9 @@ async fn service_gripper_move(
 ) {
     // Drain fully: every queued goal is answered, never left parked.
     while let Ok(goal) = channels.gripper_goals.try_recv() {
-        if mv.is_none() {
+        if admission == Admission::Stale {
+            goal.refuse(STALE_REFUSAL, measured.frac).await;
+        } else if mv.is_none() {
             *mv = Some(GripperMove {
                 motion: GripperMotion::new(goal.opening, goal.settle_timeout, now),
                 max_effort: goal.max_effort,
@@ -1315,7 +1327,8 @@ async fn end_gripper_move(
         }
         GripperTerminal::SettleTimedOut(since_end) => {
             let message = format!(
-                "move complete: the jaws had not stood still by the settle timeout, {:.1} s after the planned end",
+                "move complete: the jaws had not stood still by the settle timeout, \
+                 {:.1} s after the planned end",
                 since_end.as_secs_f64()
             );
             m.ctx
@@ -1540,18 +1553,31 @@ mod tests {
 
     /// The governor published `frac`, the chase's own step.
     fn free(frac: f64) -> CommandedOpening {
-        CommandedOpening {
-            frac,
-            guarded: false,
-        }
+        CommandedOpening { frac, held: false }
     }
 
-    /// The governor published `frac` in place of the chase's step.
+    /// The governor held the opening at `frac` against the chase's step.
     fn held(frac: f64) -> CommandedOpening {
-        CommandedOpening {
-            frac,
-            guarded: true,
-        }
+        CommandedOpening { frac, held: true }
+    }
+
+    #[test]
+    fn the_guard_holds_an_opening_it_lets_creep_and_throttles_one_it_lets_travel() {
+        let (prev, chased) = (0.94, 0.88);
+        assert!(!CommandedOpening::published(chased, prev, chased).held);
+        assert!(
+            !CommandedOpening::published(0.91, prev, chased).held,
+            "a throttle is travel"
+        );
+        assert!(CommandedOpening::published(prev, prev, chased).held);
+        assert!(
+            CommandedOpening::published(prev - 4e-9, prev, chased).held,
+            "a creep is a hold"
+        );
+        assert!(
+            !CommandedOpening::published(prev, prev, prev).held,
+            "no step asked for"
+        );
     }
 
     /// A move to [`MOVE_TARGET`] whose commanded travel came to rest at
