@@ -176,7 +176,8 @@ async fn subscribe_pair<L, R>(
 
 /// A leader command younger than this means a leader is streaming the limb:
 /// the limb is the leader's, and a goal on it is refused until the stream
-/// stops. The window is the SO-101 backbone's leader deadman and the
+/// stops; a limb whose leader has stopped streaming holds its setpoint, its
+/// last command dropped. The window is the SO-101 backbone's leader deadman and the
 /// headset's release burst, both a quarter second: a refusal lasts as long as
 /// a follower would still follow the stream, and the burst after a grip is
 /// released reads as one unbroken stream. It covers the gaps of a stream at
@@ -185,7 +186,8 @@ pub const LEADER_STREAMING_WINDOW: Duration = Duration::from_millis(250);
 
 /// When a leader last streamed a well-formed command for one limb. Written by
 /// the limb's listener, read by the goal handlers, which refuse a goal on a
-/// limb a leader is streaming.
+/// limb a leader is streaming, and by the coordinator, which follows a command
+/// only while its leader is streaming.
 #[derive(Clone, Default)]
 pub struct LeaderActivity {
     last: Arc<Mutex<Option<Instant>>>,

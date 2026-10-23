@@ -573,8 +573,8 @@ impl Planner {
     }
 
     /// Resolve the Follow target, holding the last governed setpoint when no
-    /// command has arrived. If the producer stops, the latest command persists
-    /// (held for joints, converged to for a pose); no freshness deadman.
+    /// command has arrived. The coordinator hands in `None` for a leader that
+    /// has stopped streaming, so a stopped leader's limb holds here.
     ///
     /// A joint command is chased directly. A pose gets one damped
     /// resolved-rate step from the *governed* setpoint (measured lags by

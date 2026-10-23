@@ -41,7 +41,7 @@ use crate::governor::{GovState, Governor, Guard};
 use crate::liveness::{Admission, Cadence, CadenceChange, Liveness};
 use crate::planner::{self, BusyGuard, Goal, Measurement, Planner, Unmeasured};
 use crate::publish::{LimbStateSnapshot, Publishers};
-use crate::streams::{ArmState, GovernorConfig, GripperCommand, GripperState};
+use crate::streams::{ArmState, GovernorConfig, GripperCommand, GripperState, LeaderActivity};
 use crate::types::{ARM_DOF, JointVec, Side};
 use crate::upstream::{Upstream, UpstreamMode};
 use control_core::chase::rate_limited;
@@ -65,6 +65,10 @@ const SEED_WAIT_WARN_PERIOD: Duration = Duration::from_secs(2);
 pub struct ArmChannels {
     pub command: watch::Sender<Option<Upstream>>,
     pub gripper_command: watch::Sender<Option<GripperCommand>>,
+    /// When the arm's and the gripper's leaders last streamed a well-formed
+    /// command. A command is followed only while its leader is streaming.
+    pub leader: LeaderActivity,
+    pub gripper_leader: LeaderActivity,
     pub measured: watch::Receiver<Option<ArmState>>,
     pub gripper: watch::Receiver<Option<GripperState>>,
     pub goals: mpsc::Receiver<Goal>,
@@ -73,11 +77,10 @@ pub struct ArmChannels {
     pub gripper_busy: Arc<AtomicBool>,
 }
 
-/// The coordinator's run parameters. A *leading node* that stops streaming gets
-/// no deadman: joints mode holds the last governed setpoint where it is, and
-/// pose mode keeps converging to the last received pose, rate-capped and
-/// governed (the planner documents that choice). A *follower* that stops
-/// delivering is the opposite case and does have one, `stale_limit` (see
+/// The coordinator's run parameters. A *leading node* that stops streaming is
+/// held off by the leader window ([`crate::streams::LEADER_STREAMING_WINDOW`]):
+/// its last command is dropped and the limb holds its governed setpoint. A
+/// *follower* that stops delivering has its own limit, `stale_limit` (see
 /// [`crate::liveness`]).
 pub struct RunConfig {
     pub cycle_period: Duration,
@@ -1117,8 +1120,14 @@ async fn tick_arm(
         warn!("arm follower stream recovered; re-anchoring on the measured pose");
         planner.seed_from_measured(measured_q);
     }
-    // Read out so no watch borrow guard is held across the await below.
-    let command = *channels.command.borrow();
+    // Read out so no watch borrow guard is held across the await below. A
+    // leader that has stopped streaming leaves nothing to follow: its last
+    // command is dropped and the limb holds its setpoint.
+    let command = channels
+        .leader
+        .streaming()
+        .then(|| *channels.command.borrow())
+        .flatten();
     planner
         .tick(
             measured_q,
@@ -1337,13 +1346,18 @@ fn gripper_target(mv: &Option<GripperMove>, channels: &ArmChannels) -> Option<Gr
             max_effort: m.max_effort,
         });
     }
-    follow_gripper_target(&channels.gripper_command.borrow().clone())
+    channels
+        .gripper_leader
+        .streaming()
+        .then(|| follow_gripper_target(&channels.gripper_command.borrow().clone()))
+        .flatten()
 }
 
 /// Resolve the streamed target: the latest leader command with its opening
 /// clamped into `[0, 1]`, or `None` when none has arrived. The stream is
-/// paired to one producer, so there is nothing to arbitrate; a stopped
-/// producer just leaves the last opening in place, held by the gripper.
+/// paired to one producer, so there is nothing to arbitrate; the caller hands
+/// a stopped producer's command in as `None`, which leaves the gripper holding
+/// its setpoint.
 fn follow_gripper_target(command: &Option<GripperCommand>) -> Option<GripperTarget> {
     command.as_ref().map(|c| GripperTarget {
         frac: c.opening.clamp(0.0, 1.0),
@@ -1952,6 +1966,8 @@ mod tests {
         let channels = ArmChannels {
             command,
             gripper_command,
+            leader: LeaderActivity::default(),
+            gripper_leader: LeaderActivity::default(),
             measured,
             gripper,
             goals,
@@ -1998,6 +2014,32 @@ mod tests {
         );
         assert_eq!(tick.candidate, planner.setpoint(), "a stale side holds");
         assert!(tick.streamed_hand.is_none(), "a stale side streams nothing");
+    }
+
+    /// A leader's command is followed only while the leader streams: once it
+    /// stops, the arm holds its setpoint.
+    #[tokio::test]
+    async fn a_command_from_a_leader_that_stopped_streaming_is_held_not_followed() {
+        let held = [0.0, -0.8, 0.0, 1.2, 0.0, 0.0, 0.0];
+        let mut planner = planner_holding(Side::Left, held);
+        let (mut channels, measured_tx, _goal_tx) = claimed_arm_channels();
+        measured_tx.send_replace(standing_at(held));
+        let target = [0.3, -0.8, 0.0, 1.2, 0.0, 0.0, 0.0];
+        channels
+            .command
+            .send_replace(Some(Upstream::Joints(target)));
+
+        let silent = tick_arm(&mut channels, &mut planner, Admission::Live, Instant::now()).await;
+        assert_eq!(silent.candidate, held, "no leader streaming: the arm holds");
+
+        channels.leader.note();
+        let streaming =
+            tick_arm(&mut channels, &mut planner, Admission::Live, Instant::now()).await;
+        assert!(
+            streaming.candidate[0] > held[0],
+            "a streaming leader's command is chased: {:?}",
+            streaming.candidate
+        );
     }
 
     /// A posture share in flight when its follower goes stale fails at the
