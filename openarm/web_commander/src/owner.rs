@@ -382,7 +382,13 @@ impl Owner {
                 }
                 clamp_to_limits(&mut joints, side);
                 let target_ee = self.ee_position(side, &joints);
-                let duration_s = self.floored_duration(side, target_ee, duration_s);
+                let duration_s = match self.floored_duration(side, target_ee, duration_s) {
+                    Ok(duration_s) => duration_s,
+                    Err(refusal) => {
+                        self.status(side, &refusal);
+                        return;
+                    }
+                };
                 self.fire_or_queue(
                     side,
                     ArmGoal::Joints(move_arm_joints::Goal {
@@ -434,7 +440,13 @@ impl Owner {
                     }
                     None => seed,
                 };
-                let duration_s = self.floored_duration(side, position, duration_s);
+                let duration_s = match self.floored_duration(side, position, duration_s) {
+                    Ok(duration_s) => duration_s,
+                    Err(refusal) => {
+                        self.status(side, &refusal);
+                        return;
+                    }
+                };
                 // Send the backbone the normalized quaternion, not the raw wire values.
                 let orientation = [rotation.i, rotation.j, rotation.k, rotation.w];
                 self.fire_or_queue(
@@ -808,8 +820,14 @@ impl Owner {
     }
 
     // Floor a requested arm-move duration so the straight-line EE speed stays under the
-    // governor cap (time >= distance / cap). With no measured pose yet, just sanitize.
-    fn floored_duration(&self, side: Side, target_ee: [f64; 3], requested_s: f64) -> f64 {
+    // governor cap (time >= distance / cap), or refuse a move that needs longer than a
+    // move may take at that cap. With no measured pose yet, just sanitize.
+    fn floored_duration(
+        &self,
+        side: Side,
+        target_ee: [f64; 3],
+        requested_s: f64,
+    ) -> Result<f64, String> {
         match self.state.arms[side].last_feedback {
             Some(measured) => {
                 let dist = dist3(self.ee_position(side, &measured), target_ee);
@@ -819,7 +837,7 @@ impl Owner {
                     self.state.max_ee_velocity_m_s,
                 )
             }
-            None => sane_duration(requested_s),
+            None => Ok(sane_duration(requested_s)),
         }
     }
 

@@ -191,7 +191,7 @@ async fn firing_a_pose_carries_the_plan_and_settle_fields_and_reports_the_backbo
     active
         .complete(&move_arm::ResultResponseData {
             success: false,
-            message: "still 8 mm / 0.02 rad from the target 2.0 s after the planned end"
+            message: "still 8.0 mm / 0.02 rad from the target, 2.0 s after the planned end"
                 .to_string(),
             final_position: goal_position,
             final_orientation: goal_orientation,
@@ -201,7 +201,7 @@ async fn firing_a_pose_carries_the_plan_and_settle_fields_and_reports_the_backbo
     ws.snapshot_until(Duration::from_secs(15), "failed settle surfaced", |s| {
         s["left_arm"]["in_flight"] == false
             && s["status"].as_str().is_some_and(|t| {
-                t.contains("move_arm (left) failed: still 8 mm / 0.02 rad from the target")
+                t.contains("move_arm (left) failed: still 8.0 mm / 0.02 rad from the target, 2.0 s")
             })
     })
     .await;

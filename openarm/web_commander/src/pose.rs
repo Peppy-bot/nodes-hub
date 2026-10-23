@@ -165,7 +165,7 @@ pub struct JogCaps {
 /// The operator's active drive for one arm, reconciled toward once per stream tick:
 /// the setpoint walks toward the slider `target` one acceleration-limited step per
 /// tick (carrying `vel`, the per-joint jog velocity, across ticks), so the arm ramps
-/// smoothly instead of snapping. `target` refreshes as the operator drags; `vel` is
+/// smoothly. `target` refreshes as the operator drags; `vel` is
 /// preserved across those refreshes so a continuous drag keeps its momentum.
 #[derive(Clone, Copy, Debug)]
 pub struct JointJog {
@@ -217,7 +217,7 @@ pub fn joint_jog_tick(
         // Land on the target only when this step is directed at it and would reach or
         // cross it (`step*error >= error^2`), clamping the position there so it never
         // overshoots. A mid-drag reversal (velocity still opposing `error`) fails this
-        // test, so the joint decelerates and turns around instead of snapping backward.
+        // test, so the joint decelerates and turns around.
         let joint = if step * error >= error * error {
             target[i]
         } else {

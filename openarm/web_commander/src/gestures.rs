@@ -173,7 +173,6 @@ impl Registry {
 /// gesture drives it, the gripper opening.
 pub type GestureSamples = BySide<Option<([f64; ARM_DOF], Option<f64>)>>;
 
-
 /// Size the lead-in blend so the fastest joint peaks at
 /// [`LEAD_IN_SPEED_FRACTION`] of its velocity budget, within the comfort band.
 pub fn lead_in_duration(

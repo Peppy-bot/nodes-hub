@@ -307,13 +307,22 @@ pub(crate) fn sane_duration(duration_s: f64) -> f64 {
 }
 
 // A discrete move's duration: the operator's request, floored so the straight-line
-// EE speed never exceeds the governor cap (time >= distance / cap), and held within
-// the contract's bound. The backbone floors again at its joint-velocity limit, so this
-// only ever slows a move, never speeds it.
-pub(crate) fn ee_speed_floored(user_s: f64, ee_distance_m: f64, max_ee_velocity_m_s: f64) -> f64 {
-    (ee_distance_m / max_ee_velocity_m_s)
-        .max(user_s)
-        .min(MAX_MOVE_DURATION_S)
+// EE speed never exceeds the governor cap (time >= distance / cap), or the refusal
+// of a move that needs longer than the contract's bound at that cap. The backbone
+// floors again at its joint-velocity limit, so this only ever slows a move.
+pub(crate) fn ee_speed_floored(
+    user_s: f64,
+    ee_distance_m: f64,
+    max_ee_velocity_m_s: f64,
+) -> Result<f64, String> {
+    let floored = (ee_distance_m / max_ee_velocity_m_s).max(user_s);
+    if floored > MAX_MOVE_DURATION_S {
+        return Err(format!(
+            "this move needs {floored:.0} s at the {max_ee_velocity_m_s} m/s speed cap, past the \
+             {MAX_MOVE_DURATION_S:.0} s a move may take: raise the cap or move in steps"
+        ));
+    }
+    Ok(floored)
 }
 
 /// Serialize the browser snapshot from the owner's state; called on the owner's
@@ -998,10 +1007,17 @@ mod tests {
     }
 
     #[test]
-    fn a_floored_duration_stays_within_the_contract_bound() {
-        assert_eq!(ee_speed_floored(2.0, 0.8, 0.01), MAX_MOVE_DURATION_S);
+    fn a_move_too_slow_for_the_contract_bound_is_refused() {
+        assert_eq!(
+            ee_speed_floored(2.0, 0.8, 0.01),
+            Err(
+                "this move needs 80 s at the 0.01 m/s speed cap, past the 60 s a move may \
+                 take: raise the cap or move in steps"
+                    .to_string()
+            )
+        );
         assert_eq!(sane_duration(61.0), MAX_MOVE_DURATION_S);
-        assert_eq!(ee_speed_floored(2.0, 0.1, 0.25), 2.0);
+        assert_eq!(ee_speed_floored(2.0, 0.1, 0.25), Ok(2.0));
     }
 
     // A panel that has not answered within this is not going to.
