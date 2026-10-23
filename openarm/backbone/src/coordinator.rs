@@ -39,7 +39,7 @@ use crate::arm_pair::ArmPair;
 use crate::camera_mounts::MeasuredGrasps;
 use crate::governor::{GovState, Governor, Guard};
 use crate::liveness::{Admission, Cadence, CadenceChange, Liveness};
-use crate::planner::{self, BusyGuard, Goal, Measurement, Planner, Unmeasured};
+use crate::planner::{self, BusyGuard, Goal, Measurement, PathClearance, Planner, Unmeasured};
 use crate::publish::{LimbStateSnapshot, Publishers};
 use crate::streams::{ArmState, GovernorConfig, GripperCommand, GripperState};
 use crate::types::{ARM_DOF, JointVec, Side};
@@ -395,6 +395,8 @@ pub async fn run(
         );
         // The services are answered ahead of the tick's advance: a stop ends
         // every move before the planners would step it once more.
+        let against = admitted_against(&planners, governed_grippers);
+        let mut clearance = |side, path: &[JointVec]| governor.path_blocked(&against, side, path);
         while let Ok(request) = requests.try_recv() {
             serve_request(
                 request,
@@ -403,11 +405,24 @@ pub async fn run(
                 arm_admission,
                 &mut gripper_moves,
                 &gripper_fraction,
+                &mut clearance,
                 now,
             )
             .await;
         }
-        let arm_ticks = advance_arms(&mut channels, &mut planners, arm_admission, now).await;
+        let arm_ticks = {
+            let against = admitted_against(&planners, governed_grippers);
+            let mut clearance =
+                |side, path: &[JointVec]| governor.path_blocked(&against, side, path);
+            advance_arms(
+                &mut channels,
+                &mut planners,
+                arm_admission,
+                now,
+                &mut clearance,
+            )
+            .await
+        };
         let arm_candidate = ArmPair::new(arm_ticks.left.candidate, arm_ticks.right.candidate);
         let hands = ArmPair::new(arm_ticks.left.streamed_hand, arm_ticks.right.streamed_hand);
         let measured_grippers = ArmPair::new(
@@ -579,6 +594,7 @@ pub async fn run(
 ///
 /// The results and the grasp poses come from each arm's
 /// [`seeded_measurement`] under `arm_admission`.
+#[allow(clippy::too_many_arguments)] // every channel, admission and check a request may need
 async fn serve_request(
     request: CoordinatorRequest,
     channels: &mut ArmPair<ArmChannels>,
@@ -586,6 +602,7 @@ async fn serve_request(
     arm_admission: ArmPair<Admission>,
     gripper_moves: &mut ArmPair<Option<GripperMove>>,
     gripper_fraction: &impl Fn(&watch::Receiver<Option<GripperState>>) -> f64,
+    clearance: &mut PathClearance<'_>,
     now: Instant,
 ) {
     match request {
@@ -628,6 +645,7 @@ async fn serve_request(
                 &request.target,
                 request.tolerance,
                 request.duration,
+                clearance,
             ));
         }
         CoordinatorRequest::MeasureGrasps { reply } => {
@@ -754,20 +772,38 @@ fn admit_grippers(
     )
 }
 
+/// The configuration a planned path is admitted against: both arms at their
+/// governed setpoints and the grippers at theirs.
+fn admitted_against(planners: &ArmPair<Planner>, grippers: ArmPair<f64>) -> GovState {
+    GovState::new(
+        ArmPair::new(planners.left.setpoint(), planners.right.setpoint()),
+        grippers,
+    )
+}
+
 /// Advance both planners to this tick's candidate setpoints and hand bases.
 async fn advance_arms(
     channels: &mut ArmPair<ArmChannels>,
     planners: &mut ArmPair<Planner>,
     admission: ArmPair<Admission>,
     now: Instant,
+    clearance: &mut PathClearance<'_>,
 ) -> ArmPair<planner::Tick> {
     ArmPair::new(
-        tick_arm(&mut channels.left, &mut planners.left, admission.left, now).await,
+        tick_arm(
+            &mut channels.left,
+            &mut planners.left,
+            admission.left,
+            now,
+            &mut *clearance,
+        )
+        .await,
         tick_arm(
             &mut channels.right,
             &mut planners.right,
             admission.right,
             now,
+            &mut *clearance,
         )
         .await,
     )
@@ -1082,6 +1118,7 @@ async fn tick_arm(
     planner: &mut Planner,
     admission: Admission,
     now: Instant,
+    clearance: &mut PathClearance<'_>,
 ) -> planner::Tick {
     // A stale limb holds exactly where it was last governed. Advancing the
     // planner would walk the setpoint away from an arm nobody can see, and a
@@ -1126,6 +1163,7 @@ async fn tick_arm(
             &mut channels.goals,
             &channels.busy,
             now,
+            clearance,
         )
         .await
 }
@@ -1986,6 +2024,7 @@ mod tests {
             &mut planner,
             Admission::Stale,
             Instant::now(),
+            &mut |_, _| None,
         )
         .await;
 
@@ -2015,7 +2054,14 @@ mod tests {
             .expect("queue the goal");
 
         let start = Instant::now();
-        tick_arm(&mut channels, &mut planner, Admission::Live, start).await;
+        tick_arm(
+            &mut channels,
+            &mut planner,
+            Admission::Live,
+            start,
+            &mut |_, _| None,
+        )
+        .await;
         assert!(done_rx.try_recv().is_err(), "the share is in flight");
         assert!(channels.busy.load(Ordering::Acquire));
 
@@ -2024,6 +2070,7 @@ mod tests {
             &mut planner,
             Admission::Stale,
             start + Duration::from_millis(100),
+            &mut |_, _| None,
         )
         .await;
         let outcome = done_rx.try_recv().expect("the stale tick ends the share");
@@ -2066,7 +2113,7 @@ mod tests {
         let start = Instant::now();
         for side in [Side::Left, Side::Right] {
             let (arm, planner) = (channels.get_mut(side), planners.get_mut(side));
-            tick_arm(arm, planner, Admission::Live, start).await;
+            tick_arm(arm, planner, Admission::Live, start, &mut |_, _| None).await;
         }
         assert!(done_rx.try_recv().is_err(), "both shares are in flight");
         let late = start + Duration::from_secs(3600);
@@ -2075,6 +2122,7 @@ mod tests {
             &mut planners.left,
             Admission::Live,
             late,
+            &mut |_, _| None,
         )
         .await;
         tick_arm(
@@ -2082,6 +2130,7 @@ mod tests {
             &mut planners.right,
             Admission::Stale,
             late,
+            &mut |_, _| None,
         )
         .await;
         let left_end = done_rx.try_recv().expect("the left share ends");
@@ -2099,6 +2148,7 @@ mod tests {
             ArmPair::new(Admission::Stale, Admission::Reanchor),
             &mut ArmPair::new(None, None),
             &|_: &watch::Receiver<Option<GripperState>>| 0.0,
+            &mut |_, _| None,
             late,
         )
         .await;

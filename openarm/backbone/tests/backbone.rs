@@ -536,6 +536,18 @@ async fn complete_left_arm_joint_move(
     target: [f64; 7],
     duration_s: f64,
 ) -> peppygen::Result<move_arm_joints::ResultData> {
+    let data = finish_left_arm_joint_move(harness, target, duration_s).await?;
+    assert!(data.success, "{}", data.message);
+    Ok(data)
+}
+
+/// Send one `move_arm_joints` goal for the left arm and wait for the result
+/// it completes with, whatever its success.
+async fn finish_left_arm_joint_move(
+    harness: &Harness,
+    target: [f64; 7],
+    duration_s: f64,
+) -> peppygen::Result<move_arm_joints::ResultData> {
     let goal = move_arm_joints::send_goal(
         harness,
         &move_arm_joints::GoalRequestData {
@@ -549,10 +561,7 @@ async fn complete_left_arm_joint_move(
     .await?;
     assert!(goal.accepted, "goal rejected: {:?}", goal.reason);
     match goal.get_result(DEADLINE).await?.outcome {
-        move_arm_joints::ResultOutcome::Completed(data) => {
-            assert!(data.success, "{}", data.message);
-            Ok(data)
-        }
+        move_arm_joints::ResultOutcome::Completed(data) => Ok(data),
         other => panic!("move_arm_joints did not complete: {other:?}"),
     }
 }
@@ -778,14 +787,13 @@ async fn move_arm_joints_streams_a_trajectory_the_arm_follows_to_the_target() ->
     harness.shutdown().await
 }
 
-/// A joint move that the collision governor holds short still completes
-/// with success when its time runs out. Its result gives the joints that
-/// the arm measured then, not the goal. Here the band is wide, so the rest
-/// pose sits under d_stop. A left wrist sent toward the centerline never
-/// gets there.
+/// A joint move whose path the collision governor would stop is refused
+/// before it starts, naming the pair it would close, and the arm stays where
+/// it was. Here the band is wide, so the rest pose sits under d_stop and a
+/// left wrist sent toward the centerline is inside the band from its first
+/// configuration.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_joint_move_the_governor_holds_completes_with_the_measured_pose() -> peppygen::Result<()>
-{
+async fn a_joint_move_into_the_stop_band_is_refused_before_it_starts() -> peppygen::Result<()> {
     let mut wide = params();
     wide.d_stop_m = 0.8;
     wide.d_safe_m = 1.0;
@@ -805,23 +813,25 @@ async fn a_joint_move_the_governor_holds_completes_with_the_measured_pose() -> p
     let mut inward = HOME;
     inward[2] = 1.5;
     inward[3] = 0.4;
-    let data = complete_left_arm_joint_move(&harness, inward, 1.0).await?;
-    assert_eq!(data.message, "trajectory complete");
+    let data = finish_left_arm_joint_move(&harness, inward, 1.0).await?;
+    assert!(!data.success, "{}", data.message);
     assert!(
-        (data.final_joint_positions[2] - inward[2]).abs() > 0.5,
-        "the governor let the wrist reach its goal: {:?}",
-        data.final_joint_positions
+        data.message
+            .contains("goal refused: the planned path would ")
+            && data.message.contains("openarm_left_"),
+        "{}",
+        data.message
+    );
+    assert!(
+        data.message.contains("inside the 800 mm stop band"),
+        "{}",
+        data.message
     );
     let observed = *followed.borrow();
-    for (joint, (reported, observed)) in data
-        .final_joint_positions
-        .iter()
-        .zip(observed.iter())
-        .enumerate()
-    {
+    for (joint, (rest, observed)) in HOME.iter().zip(observed.iter()).enumerate() {
         assert!(
-            (reported - observed).abs() < 0.05,
-            "joint {joint}: the result gives {reported}, the arm stands at {observed}"
+            (rest - observed).abs() < 0.05,
+            "joint {joint}: the arm moved from {rest} to {observed}"
         );
     }
     harness.shutdown().await

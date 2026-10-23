@@ -38,7 +38,7 @@ use tracing::{info, warn};
 
 use crate::arm_pair::ArmPair;
 use crate::torso::{TORSO_BODY, torso_regions};
-use crate::types::{ARM_DOF, JointVec};
+use crate::types::{ARM_DOF, JointVec, Side};
 
 mod barrier;
 mod limiters;
@@ -202,10 +202,38 @@ enum Clip {
 /// The nearest checked pair at a configuration: signed surface distance (m;
 /// positive is clearance, negative is penetration) and the two link names. The
 /// operator proximity readout.
+#[derive(Clone, Debug, PartialEq)]
 pub struct NearestPair {
     pub distance: f64,
     pub link_a: String,
     pub link_b: String,
+}
+
+/// A planned path the governor refuses at admission: at its nearest sample
+/// this pair stands inside the stop band.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PathBlocked {
+    pub pair: NearestPair,
+    pub d_stop: f64,
+}
+
+impl std::fmt::Display for PathBlocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (a, b, band) = (&self.pair.link_a, &self.pair.link_b, self.d_stop * 1000.0);
+        let mm = self.pair.distance * 1000.0;
+        if mm < 0.0 {
+            write!(
+                f,
+                "the planned path would push {a} {:.0} mm into {b}, inside the {band:.0} mm stop band",
+                -mm
+            )
+        } else {
+            write!(
+                f,
+                "the planned path would bring {a} within {mm:.0} mm of {b}, inside the {band:.0} mm stop band"
+            )
+        }
+    }
 }
 
 pub struct Governor {
@@ -322,6 +350,34 @@ impl Governor {
     /// while disabled (the collision machinery stands down; the speed caps
     /// still shape motion but are not collision events), except the non-finite
     /// candidate hold, which reports Stopped in either mode.
+    /// Walk one arm's planned path against the rest of `prev` (the other arm
+    /// and both grippers where they are governed to) and report the nearest
+    /// pair of any configuration on it that stands inside the stop band, which
+    /// refuses the plan before it plays. `None` while the governor is disabled,
+    /// as its barrier is then.
+    pub fn path_blocked(
+        &mut self,
+        prev: &GovState,
+        side: Side,
+        path: &[JointVec],
+    ) -> Option<PathBlocked> {
+        if !self.enabled {
+            return None;
+        }
+        let nearest = path
+            .iter()
+            .filter_map(|q| {
+                let mut state = *prev;
+                *state.arms.get_mut(side) = *q;
+                self.model.proximity(&concat(&state))
+            })
+            .min_by(|a, b| a.distance.total_cmp(&b.distance))?;
+        (nearest.distance < self.d_stop).then_some(PathBlocked {
+            pair: nearest,
+            d_stop: self.d_stop,
+        })
+    }
+
     pub fn guard(&self) -> Guard {
         self.guard
     }
@@ -714,6 +770,32 @@ mod tests {
 
     fn v2_governor(enabled: bool) -> Governor {
         governor_for(openarm_description::HardwareVersion::V2, enabled)
+    }
+
+    /// A path from Ready that stays in free space is admitted; one that swings
+    /// the left wrist over the pedestal's head is refused by the pair it would
+    /// close, and a disabled governor admits everything.
+    #[test]
+    fn a_planned_path_into_the_pedestal_is_blocked_and_a_free_one_admitted() {
+        let mut governor = v2_governor(true);
+        let prev = GovState::new(ready(), ArmPair::new(0.0, 0.0));
+        let mut lifted = ready().left;
+        lifted[0] -= 0.3;
+        let free = [ready().left, lifted];
+        assert_eq!(governor.path_blocked(&prev, Side::Left, &free), None);
+
+        let swung = [ready().left, over_the_head().left];
+        let blocked = governor
+            .path_blocked(&prev, Side::Left, &swung)
+            .expect("the swing over the head is refused");
+        assert!(blocked.pair.distance < D_STOP, "{blocked}");
+        assert!(
+            blocked.to_string().contains("inside the 5 mm stop band"),
+            "{blocked}"
+        );
+
+        let mut disabled = v2_governor(false);
+        assert_eq!(disabled.path_blocked(&prev, Side::Left, &swung), None);
     }
 
     /// Both arms in the Ready posture, the resting posture a bring-up moves to.

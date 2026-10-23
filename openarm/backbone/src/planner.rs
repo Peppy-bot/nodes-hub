@@ -36,8 +36,18 @@ use srs_model::{
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
+use crate::governor::PathBlocked;
 use crate::types::{ARM_DOF, JointVec, PlanTolerance, Side, world_pose_arrays};
 use crate::upstream::Upstream;
+
+/// The governor's admission check of a planned path: given the arm and the
+/// configurations the path walks through, the pair that refuses it, if any.
+pub type PathClearance<'a> = dyn FnMut(Side, &[JointVec]) -> Option<PathBlocked> + Send + 'a;
+
+/// Configurations a planned path is checked at before it plays, start and
+/// goal included: one per percent of the path. The governor checks every tick
+/// while the path plays; admission catches what this walk sees.
+const ADMISSION_PATH_SAMPLES: usize = 101;
 
 /// Slack the runtime per-tick velocity guard of a line allows over the planned
 /// limit before aborting the move: the plan sized the line at its own
@@ -465,12 +475,15 @@ impl Planner {
         goals: &mut mpsc::Receiver<Goal>,
         busy: &Arc<AtomicBool>,
         now: Instant,
+        clearance: &mut PathClearance<'_>,
     ) -> Tick {
         let mut mode = std::mem::replace(&mut self.mode, Mode::Follow);
         // Drain fully: every queued goal is answered, never left parked.
         while let Ok(goal) = goals.try_recv() {
             if matches!(mode, Mode::Follow) {
-                mode = self.start_goal(goal, busy.clone(), now).await;
+                mode = self
+                    .start_goal(goal, busy.clone(), measured_q, now, clearance)
+                    .await;
             } else {
                 goal.refuse("another move is in flight", Ok(measured_q), self)
                     .await;
@@ -556,6 +569,7 @@ impl Planner {
         target: &Isometry3<f64>,
         tolerance: PlanTolerance,
         requested: Duration,
+        clearance: &mut PathClearance<'_>,
     ) -> Result<Duration, String> {
         if !matches!(self.mode, Mode::Follow) {
             return Err(ARM_BUSY.to_string());
@@ -569,6 +583,9 @@ impl Planner {
             tolerance.servo(),
         )
         .map_err(|rejection| not_planned(tolerance, &rejection))?;
+        if let Some(blocked) = clearance(self.side, &plan.joint_samples(ADMISSION_PATH_SAMPLES)) {
+            return Err(blocked_path(&blocked));
+        }
         Ok(plan.duration())
     }
 
@@ -768,9 +785,25 @@ impl Planner {
     }
 
     /// Start an accepted goal in the mode that executes it.
-    async fn start_goal(&mut self, goal: Goal, busy: Arc<AtomicBool>, now: Instant) -> Mode {
+    async fn start_goal(
+        &mut self,
+        goal: Goal,
+        busy: Arc<AtomicBool>,
+        measured_q: JointVec,
+        now: Instant,
+        clearance: &mut PathClearance<'_>,
+    ) -> Mode {
         self.stream_smoothing.reset();
         let busy = BusyGuard(busy);
+        if let Goal::Joint { target, .. } = &goal {
+            let path = joint_line_samples(&self.setpoint, target, ADMISSION_PATH_SAMPLES);
+            if let Some(blocked) = clearance(self.side, &path) {
+                goal.refuse(&blocked_path(&blocked), Ok(measured_q), self)
+                    .await;
+                // `busy` drops here: the slot is released with the refusal.
+                return Mode::Follow;
+            }
+        }
         match goal {
             Goal::Joint {
                 target,
@@ -797,9 +830,23 @@ impl Planner {
                 duration,
                 ctx,
             } => {
-                self.start_cartesian(target, tolerance, duration, ctx, busy, now)
+                self.start_cartesian(target, tolerance, duration, ctx, busy, now, clearance)
                     .await
             }
+        }
+    }
+
+    /// Complete an unstarted move_arm goal failed with `message`, reporting
+    /// the pose the move would have started from.
+    async fn refuse_cartesian(
+        &self,
+        ctx: Box<move_arm::GoalContext>,
+        message: String,
+        start_world: &Isometry3<f64>,
+    ) {
+        let (pos, quat) = world_pose_arrays(start_world);
+        if let Err(e) = ctx.complete(false, message, pos, quat, 0.0).await {
+            error!("{}: move_arm complete: {e}", self.side.label());
         }
     }
 
@@ -810,6 +857,7 @@ impl Planner {
     /// measured pose, so the first-tick velocity guard compares the IK of the
     /// same configuration the chase continues from and cannot false-trip when
     /// the governor held the arm off its measured pose just before admission.
+    #[allow(clippy::too_many_arguments)] // the goal's four fields, the slot, the clock and the check
     async fn start_cartesian(
         &mut self,
         target: Isometry3<f64>,
@@ -818,6 +866,7 @@ impl Planner {
         ctx: Box<move_arm::GoalContext>,
         busy: BusyGuard,
         now: Instant,
+        clearance: &mut PathClearance<'_>,
     ) -> Mode {
         let start_world = self.model.world_ee_pose(&self.setpoint);
         let plan = plan_cartesian(
@@ -831,17 +880,17 @@ impl Planner {
         let plan = match plan {
             Ok(plan) => plan,
             Err(rejection) => {
-                let (pos, quat) = world_pose_arrays(&start_world);
-                if let Err(e) = ctx
-                    .complete(false, not_planned(tolerance, &rejection), pos, quat, 0.0)
-                    .await
-                {
-                    error!("{}: move_arm complete: {e}", self.side.label());
-                }
+                self.refuse_cartesian(ctx, not_planned(tolerance, &rejection), &start_world)
+                    .await;
                 // `busy` drops here: the slot is released even on this early exit.
                 return Mode::Follow;
             }
         };
+        if let Some(blocked) = clearance(self.side, &plan.joint_samples(ADMISSION_PATH_SAMPLES)) {
+            self.refuse_cartesian(ctx, blocked_path(&blocked), &start_world)
+                .await;
+            return Mode::Follow;
+        }
         let path = match plan {
             CartesianPlan::Line(LinePlan {
                 duration,
@@ -924,6 +973,23 @@ impl Planner {
 
 /// The refusal of a Cartesian move no plan reaches within `tolerance`: what a
 /// `move_arm` goal completes with, and what `check_arm_move` answers.
+/// The refusal of a move whose planned path the governor would stop.
+fn blocked_path(blocked: &PathBlocked) -> String {
+    format!("goal refused: {blocked}")
+}
+
+/// `count` configurations evenly spaced along the straight joint-space line
+/// from `start` to `end`, both included: the path a joint move plays.
+fn joint_line_samples(start: &JointVec, end: &JointVec, count: usize) -> Vec<JointVec> {
+    let steps = count.saturating_sub(1).max(1) as f64;
+    (0..count)
+        .map(|i| {
+            let f = i as f64 / steps;
+            std::array::from_fn(|j| start[j] + (end[j] - start[j]) * f)
+        })
+        .collect()
+}
+
 fn not_planned(tolerance: PlanTolerance, rejection: &PlanRejection) -> String {
     format!(
         "goal pose not planned within {:.1} mm / {:.1} deg: {rejection}",
@@ -973,6 +1039,58 @@ mod tests {
         planner
     }
 
+    /// A joint move whose path the governor would stop never starts: it
+    /// completes failed with the pair named, the slot is released and the
+    /// planner stays in Follow.
+    #[tokio::test]
+    async fn a_joint_move_the_clearance_refuses_fails_before_it_starts() {
+        let mut planner = test_planner([0.0; ARM_DOF]);
+        let (done_tx, mut done_rx) = mpsc::channel(1);
+        let (goal_tx, mut goals) = mpsc::channel(1);
+        let busy = Arc::new(AtomicBool::new(true));
+        goal_tx
+            .send(Goal::posture_share([0.5; ARM_DOF], done_tx))
+            .await
+            .expect("queue the goal");
+        let mut walked = Vec::new();
+        let now = Instant::now();
+        let tick = planner
+            .tick(
+                [0.0; ARM_DOF],
+                None,
+                &mut goals,
+                &busy,
+                now,
+                &mut |side, path| {
+                    assert_eq!(side, Side::Left);
+                    walked.push(path.len());
+                    Some(PathBlocked {
+                        pair: crate::governor::NearestPair {
+                            distance: 0.002,
+                            link_a: "openarm_left_link5".into(),
+                            link_b: "openarm_body_link0".into(),
+                        },
+                        d_stop: 0.005,
+                    })
+                },
+            )
+            .await;
+        let outcome = done_rx.try_recv().expect("the refusal reports");
+        assert!(!outcome.success);
+        assert_eq!(
+            outcome.message,
+            "left: goal refused: the planned path would bring openarm_left_link5 within 2 mm \
+             of openarm_body_link0, inside the 5 mm stop band"
+        );
+        assert_eq!(walked, vec![ADMISSION_PATH_SAMPLES]);
+        assert!(
+            !busy.load(Ordering::Acquire),
+            "the refusal releases the slot"
+        );
+        assert!(matches!(planner.mode, Mode::Follow));
+        assert_eq!(tick.candidate, [0.0; ARM_DOF], "nothing moved");
+    }
+
     /// An in-limit pose: elbow off its 0.05 floor, j2 inside [-3.32, 0.17].
     const POSE_TEST_Q: JointVec = [0.0, -0.8, 0.0, 1.2, 0.0, 0.0, 0.0];
 
@@ -1003,7 +1121,9 @@ mod tests {
             .expect("queue the goal");
         let now = Instant::now();
         planner
-            .tick([0.0; ARM_DOF], None, &mut goals, &busy, now)
+            .tick([0.0; ARM_DOF], None, &mut goals, &busy, now, &mut |_, _| {
+                None
+            })
             .await;
         assert!(
             busy.load(Ordering::Acquire),
@@ -1042,7 +1162,9 @@ mod tests {
             .await
             .expect("queue the goal");
         let now = Instant::now();
-        planner.tick(held, None, &mut goals, &busy, now).await;
+        planner
+            .tick(held, None, &mut goals, &busy, now, &mut |_, _| None)
+            .await;
         assert!(
             busy.load(Ordering::Acquire),
             "move in flight holds the slot"
@@ -1077,7 +1199,9 @@ mod tests {
             .send(Goal::posture_share([0.2; ARM_DOF], done_tx))
             .await
             .expect("queue the goal");
-        planner.tick(held, None, &mut goals, &busy, now).await;
+        planner
+            .tick(held, None, &mut goals, &busy, now, &mut |_, _| None)
+            .await;
         assert!(busy.load(Ordering::Acquire), "the later goal runs");
         assert!(
             done_rx.try_recv().is_err(),
@@ -1103,7 +1227,9 @@ mod tests {
             .await
             .expect("queue the goal");
         let now = Instant::now();
-        planner.tick(held, None, &mut goals, &busy, now).await;
+        planner
+            .tick(held, None, &mut goals, &busy, now, &mut |_, _| None)
+            .await;
         assert!(busy.load(Ordering::Acquire), "the move is in flight");
         planner
             .tick(
@@ -1112,6 +1238,7 @@ mod tests {
                 &mut goals,
                 &busy,
                 now + Duration::from_secs(3600),
+                &mut |_, _| None,
             )
             .await;
         let outcome = done_rx.try_recv().expect("the move ends on its clock");
@@ -1129,7 +1256,9 @@ mod tests {
             .await
             .expect("queue the goal");
         let now = Instant::now();
-        let tick = planner.tick(held, None, &mut goals, &busy, now).await;
+        let tick = planner
+            .tick(held, None, &mut goals, &busy, now, &mut |_, _| None)
+            .await;
         planner.commit(tick.candidate);
         let Mode::JointMove(JointMove { traj, .. }) = &planner.mode else {
             panic!("the goal starts a joint move");
@@ -1144,6 +1273,7 @@ mod tests {
                     &mut goals,
                     &busy,
                     motion_start + Duration::from_millis(100 * step),
+                    &mut |_, _| None,
                 )
                 .await;
             planner.commit(tick.candidate);
@@ -1157,6 +1287,7 @@ mod tests {
                 &mut goals,
                 &busy,
                 now + Duration::from_secs(3600),
+                &mut |_, _| None,
             )
             .await;
         let outcome = done_rx.try_recv().expect("the move ends on its clock");
@@ -1291,7 +1422,12 @@ mod tests {
             start.rotation,
         );
         let duration = planner
-            .check_cartesian(&near, PlanTolerance::default(), Duration::ZERO)
+            .check_cartesian(
+                &near,
+                PlanTolerance::default(),
+                Duration::ZERO,
+                &mut |_, _| None,
+            )
             .expect("a pose 5 cm ahead has a plan");
         assert!(duration > Duration::ZERO, "{duration:?}");
         assert_eq!(planner.setpoint(), POSE_TEST_Q, "the check moves nothing");
@@ -1301,7 +1437,12 @@ mod tests {
             start.rotation,
         );
         let refusal = planner
-            .check_cartesian(&far, PlanTolerance::default(), Duration::ZERO)
+            .check_cartesian(
+                &far,
+                PlanTolerance::default(),
+                Duration::ZERO,
+                &mut |_, _| None,
+            )
             .expect_err("a pose 2 m away has no plan");
         assert!(
             refusal.starts_with("goal pose not planned within"),
@@ -1318,10 +1459,22 @@ mod tests {
             .await
             .expect("queue the goal");
         planner
-            .tick(POSE_TEST_Q, None, &mut goals, &busy, Instant::now())
+            .tick(
+                POSE_TEST_Q,
+                None,
+                &mut goals,
+                &busy,
+                Instant::now(),
+                &mut |_, _| None,
+            )
             .await;
         assert_eq!(
-            planner.check_cartesian(&near, PlanTolerance::default(), Duration::ZERO),
+            planner.check_cartesian(
+                &near,
+                PlanTolerance::default(),
+                Duration::ZERO,
+                &mut |_, _| None
+            ),
             Err(ARM_BUSY.to_string())
         );
     }
