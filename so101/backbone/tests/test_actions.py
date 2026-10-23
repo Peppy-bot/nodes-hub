@@ -16,6 +16,7 @@ from conftest import (
     gripper_step,
     make_config,
 )
+from control_core_py import minimum_jerk
 from so101_description import limits as limits_mod
 from so101_description.kinematics import Kinematics
 from so101_description.model import KINEMATICS_URDF_PATH
@@ -793,13 +794,13 @@ async def test_a_tolerance_that_is_no_bar_is_refused(bad):
     coordinator.measured_joints.set((0.0,) * 5)
     coordinator.measured_gripper.set(0.5)
     pose = ((0.1, 0.0, 0.2), IDENTITY_QUAT)
-    for plan, settle in (
-        ((bad, 0.2), SETTLE),
-        ((0.01, bad), SETTLE),
-        (PLAN, (bad, 0.2, 2.0)),
-        (PLAN, (0.01, bad, 2.0)),
+    for plan, settle, field in (
+        ((bad, 0.2), SETTLE, "plan_position_tolerance_m"),
+        ((0.01, bad), SETTLE, "plan_orientation_tolerance_rad"),
+        (PLAN, (bad, 0.2, 2.0), "settle_position_tolerance_m"),
+        (PLAN, (0.01, bad, 2.0), "settle_orientation_tolerance_rad"),
     ):
-        with pytest.raises(Rejection, match="tolerance_(m|rad) must be a positive number"):
+        with pytest.raises(Rejection, match=f"{field} must be a positive number"):
             admit_pose(layer, *pose, plan=plan, settle=settle)
     with pytest.raises(Rejection, match="each settle_tolerances_rad entry must be a positive number"):
         admit_joints(layer, (0.1,) * 5, tolerances=(0.1, 0.1, bad, 0.1, 0.1))
@@ -941,8 +942,25 @@ async def test_a_stop_before_the_pose_drive_runs_ends_the_goal_as_stopped():
     success, message, position, _orientation, _t = ctx.cancelled
     assert (success, message) == (False, "stopped: the operator asked")
     assert position == list(kinematics.forward_kinematics((0.0,) * 5)[0])
+    assert kinematics.solve_calls == []
     assert coordinator._arm_plan is None
     assert coordinator.try_claim_arm()
+
+
+async def test_the_plan_check_answers_the_duration_the_joint_caps_floor():
+    # The EE caps are transparent and the joint caps bind: the check answers
+    # the duration the move's own trajectory takes.
+    kinematics = FakeKinematics()
+    coordinator, layer = make_layer(kinematics, max_joint_velocity_rad_s=(2.0,) * 5)
+    coordinator.measured_joints.set((0.0,) * 5)
+    success, message, duration_s = await layer.check_arm_move(
+        "arm", (0.2, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, *PLAN, kinematics, kinematics
+    )
+    floored = minimum_jerk.plan((0.0,) * 5, kinematics.solution, 0.0, (2.0,) * 5).duration_s
+    assert success is True
+    assert floored > 0.0
+    assert duration_s == pytest.approx(floored)
+    assert message == f"a plan reaches the pose in {duration_s:.3f} s"
 
 
 async def test_a_zero_settle_timeout_fails_an_arm_move_short_of_its_target_at_the_planned_end(

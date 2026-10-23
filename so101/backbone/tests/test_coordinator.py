@@ -30,7 +30,7 @@ def adopt_gripper(c, target, settle_timeout_s=5.0):
     `settle_timeout_s` past the planned end of its ramp for the jaws to stand
     still. Under the transparent rate the tests run at the first sample lands
     the command on the target, and the next tick is the planned end."""
-    return c.adopt_gripper_plan(target, settle_timeout_s)
+    return c.adopt_gripper_plan(target, settle_timeout_s, c.gripper_anchor())
 
 
 def test_silence_publishes_nothing(fake_kinematics):

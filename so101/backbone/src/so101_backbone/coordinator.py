@@ -224,6 +224,8 @@ class GripperPlan:
     # How long past the planned end the plan waits for the jaws to stand
     # still before it completes wherever they stand.
     settle_timeout_s: float
+    # The opening the ramp starts from: the gripper anchor at admission.
+    chase_base: float
     done: asyncio.Event = field(default_factory=asyncio.Event)
     # The planned end: the first tick that found the commanded opening on
     # the target. None while the ramp travels.
@@ -407,9 +409,13 @@ class Coordinator:
         self._arm_plan = ArmPlan(profile=profile, settle=settle)
         return self._arm_plan
 
-    def adopt_gripper_plan(self, target: float, settle_timeout_s: float) -> GripperPlan:
+    def adopt_gripper_plan(
+        self, target: float, settle_timeout_s: float, chase_base: float
+    ) -> GripperPlan:
         self.leader_gripper.clear()
-        self._gripper_plan = GripperPlan(target=target, settle_timeout_s=settle_timeout_s)
+        self._gripper_plan = GripperPlan(
+            target=target, settle_timeout_s=settle_timeout_s, chase_base=chase_base
+        )
         return self._gripper_plan
 
     def abort_arm_plan(self, plan: ArmPlan) -> None:
@@ -424,7 +430,7 @@ class Coordinator:
 
     def abort_gripper_plan(self, plan: GripperPlan) -> None:
         if self._gripper_plan is plan:
-            plan.frozen = self._commanded_gripper
+            plan.frozen = self._ramp_stands(plan)
             self._gripper_plan = None
         plan.aborted = True
         plan.done.set()
@@ -533,9 +539,14 @@ class Coordinator:
         plan.failed = reason
         plan.done.set()
 
+    def _ramp_stands(self, plan: GripperPlan) -> float:
+        """Where the ramp of `plan` stands: the opening commanded last, or
+        the chase base before its first tick."""
+        return self._commanded_gripper if self._commanded_gripper is not None else plan.chase_base
+
     def _fail_gripper_plan(self, plan: GripperPlan, reason: str) -> None:
         self._gripper_plan = None
-        plan.frozen = self._commanded_gripper
+        plan.frozen = self._ramp_stands(plan)
         self._commanded_gripper = None
         self._delivered_gripper = None
         plan.failed = reason

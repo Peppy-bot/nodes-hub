@@ -154,9 +154,9 @@ Two further limits worth knowing:
 - **Orientation is hard to meet.** Five joints underactuate three rotational
   degrees of freedom, so orientation is a soft, low-weight objective of the QP,
   and a goal that names a tight `plan_orientation_tolerance_rad` often has no
-  plan. A wide one, up to 3.2 rad for any orientation, admits the nearest the
-  arm reaches, and the move's settle judges the orientation it did reach
-  against `settle_orientation_tolerance_rad`.
+  plan. A wide one admits the nearest the arm reaches, and a bar of π or more
+  admits any orientation; the move's settle judges the orientation it did
+  reach against `settle_orientation_tolerance_rad`.
 - **The reach ball bounds outward extent only.** Streamed pose targets are
   clamped into a ball fitted to the sampled reachable set
   (`backbone/src/so101_backbone/reach.py`) so the streaming solver is never

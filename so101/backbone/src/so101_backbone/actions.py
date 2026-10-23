@@ -27,6 +27,7 @@ import time
 from dataclasses import dataclass
 
 from control_core_py import minimum_jerk
+from control_core_py.minimum_jerk import Profile
 from control_core_py.runtime import Latch, log
 from so101_description.limbs import ARM_LIMB, GRIPPER_LIMB
 from so101_description.limits import JointLimits
@@ -266,14 +267,15 @@ class ActionLayer:
             )
         else:
             self._effort_unsupported.clear()
-        if self._coordinator.gripper_anchor() is None:
+        anchor = self._coordinator.gripper_anchor()
+        if anchor is None:
             raise Rejection("no fresh gripper state to anchor the move from")
         if self._coordinator.leader_streams_gripper():
             raise Rejection(GRIPPER_LEADER_STREAMING)
         if not self._coordinator.try_claim_gripper():
             raise Rejection(GRIPPER_BUSY)
         try:
-            return self._coordinator.adopt_gripper_plan(opening, settle_timeout_s)
+            return self._coordinator.adopt_gripper_plan(opening, settle_timeout_s, anchor)
         except BaseException:
             self._coordinator.release_gripper()
             raise
@@ -495,10 +497,11 @@ class ActionLayer:
         )
         return minimum_jerk.QUINTIC_PEAK_VELOCITY * max(travel_ratio, turn_ratio)
 
-    async def _plan_pose(self, solver, kinematics, seed, goal: PoseGoal):
-        """The joint solution of `goal` from `seed` and the duration the move
-        takes, or PlanRefused with the reason: no solution inside the joint
-        limits, or a duration the end-effector speed caps push past the
+    async def _plan_pose(self, solver, kinematics, seed, goal: PoseGoal) -> Profile:
+        """The trajectory of `goal` from `seed`: the joint solution reached in
+        the requested duration, floored by the joint velocity caps and the
+        end-effector speed caps. PlanRefused with the reason when no solution
+        lies inside the joint limits, or the caps push the duration past the
         ceiling. The solve runs off the event loop."""
         solution = await asyncio.to_thread(
             functools.partial(
@@ -513,16 +516,19 @@ class ActionLayer:
         if solution is None or not self._limits.contains(solution):
             raise PlanRefused(_unreached(goal))
         duration_s = max(goal.duration_s, self._ee_floor_s(kinematics, seed, goal))
-        if duration_s > MAX_REQUESTED_DURATION_S:
+        profile = minimum_jerk.plan(
+            seed, solution, duration_s, self._config.max_joint_velocity_rad_s
+        )
+        if profile.duration_s > MAX_REQUESTED_DURATION_S:
             # The requested duration was admitted against this ceiling, but
-            # the EE speed caps can raise it past one. Stretching anyway
-            # would hold the arm slot for longer than any goal is allowed
-            # to, so the move is refused instead.
+            # the caps can raise it past one. Stretching anyway would hold
+            # the arm slot for longer than any goal is allowed to, so the
+            # move is refused instead.
             raise PlanRefused(
-                f"the end-effector speed caps need {duration_s:.0f}s for this "
+                f"the speed caps need {profile.duration_s:.0f}s for this "
                 f"move, beyond the {MAX_REQUESTED_DURATION_S:.0f}s ceiling"
             )
-        return solution, duration_s
+        return profile
 
     async def check_arm_move(
         self,
@@ -555,12 +561,13 @@ class ActionLayer:
         if self._coordinator.arm_busy:
             return False, ARM_BUSY, 0.0
         try:
-            _solution, planned_s = await self._plan_pose(solver, kinematics, seed, goal)
+            profile = await self._plan_pose(solver, kinematics, seed, goal)
         except PlanRefused as e:
             return False, str(e), 0.0
         except Exception as e:
             log(f"pose solve failed: {e!r}")
             return False, f"pose solve failed: {e!r}", 0.0
+        planned_s = profile.duration_s
         return True, f"a plan reaches the pose in {planned_s:.3f} s", planned_s
 
     def stop_moves(self, reason: str) -> list[str]:
@@ -591,8 +598,19 @@ class ActionLayer:
                     ctx.complete, False, _join(STALE_FOLLOWER_REFUSAL, note), *pose, 0.0
                 )
                 return
+
+            async def end_stopped() -> None:
+                note, pose = self._standing_pose(kinematics)
+                await _complete_guarded(
+                    ctx.complete_cancelled, False, _join(self._coordinator.last_stop, note),
+                    *pose, 0.0,
+                )
+
+            if self._coordinator.stop_count != move.stops_before:
+                await end_stopped()
+                return
             try:
-                solution, duration_s = await self._plan_pose(solver, kinematics, seed, goal)
+                profile = await self._plan_pose(solver, kinematics, seed, goal)
             except PlanRefused as e:
                 position, orientation = kinematics.forward_kinematics(seed)
                 await _complete_guarded(
@@ -610,15 +628,8 @@ class ActionLayer:
                 )
                 return
             if self._coordinator.stop_count != move.stops_before:
-                note, pose = self._standing_pose(kinematics)
-                await _complete_guarded(
-                    ctx.complete_cancelled, False, _join(self._coordinator.last_stop, note),
-                    *pose, 0.0,
-                )
+                await end_stopped()
                 return
-            profile = minimum_jerk.plan(
-                seed, solution, duration_s, self._config.max_joint_velocity_rad_s
-            )
             plan = self._coordinator.adopt_arm_plan(profile, move.settle)
 
             def results(action_time):
@@ -699,8 +710,7 @@ class ActionLayer:
     def _final_opening(self, plan: GripperPlan) -> tuple[float, str]:
         """The opening measured when the plan completed. Otherwise prefer the
         measured opening; fall back to where the ramp stood when the plan was
-        cut; only a plan cut before any command streamed reports its target,
-        saying so."""
+        cut, saying so."""
         if plan.completed_on is not None:
             return plan.completed_on, ""
         measured = self._coordinator.measured_gripper.fresh(
@@ -708,9 +718,8 @@ class ActionLayer:
         )
         if measured is not None:
             return measured, ""
-        if plan.frozen is not None:
-            return plan.frozen, COMMANDED_OPENING_NOTE
-        return plan.target, "the result comes from the goal target"
+        assert plan.frozen is not None, "a plan that did not complete was cut"
+        return plan.frozen, COMMANDED_OPENING_NOTE
 
 
 def _pose_goal(
@@ -853,10 +862,10 @@ def _completion(plan: ArmPlan | GripperPlan) -> str:
 
 
 def _no_pose() -> tuple[list[float], list[float]]:
-    """The final-pose fields for a refusal that never had a pose to report:
-    no anchor was resolved, or the solve produced nothing. A path that does
-    know where the arm is reports that instead. Fresh lists per call, since
-    they are handed to the generated completion API."""
+    """The final-pose fields of a result with no pose to report: a walked-back
+    admission, a solve that raised, or a move that never ran with neither
+    fresh measured joints nor a commanded setpoint to place the arm. Fresh
+    lists per call, since they are handed to the generated completion API."""
     return [0.0] * 3, [0.0, 0.0, 0.0, 1.0]
 
 
