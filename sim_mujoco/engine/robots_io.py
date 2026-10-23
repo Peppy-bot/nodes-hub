@@ -29,13 +29,14 @@ from edits import Edits
 from mujoco_models import MujocoModel, MujocoModels
 from world import SPOT_PITCH_M, Placement, World, name_in_the_scene, within_one_spot
 
-# How long a robot's stay waits between checks of its own lease, as a share
-# of the lease: a robot whose limbs are gone leaves within a quarter of a
-# lease of the lease running out. The same tick records whether the robot
-# holds the pairs its model asks for, which is what renews its lease.
-_LEASE_CHECK_SHARE = 0.25
-# The shortest lease check, for a lease too short to share.
-_LEASE_CHECK_FLOOR_S = 0.05
+# How long a robot's stay waits between checks of its own pair grace time, as
+# a share of that time: a robot whose limbs are gone leaves within a quarter
+# of its pair grace time after that time runs out. The same tick records
+# whether the robot holds the pairs its model asks for, which is what starts
+# its pair grace time again.
+_PAIR_GRACE_CHECK_SHARE = 0.25
+# The shortest pair grace check, for a pair grace time too short to share.
+_PAIR_GRACE_CHECK_FLOOR_S = 0.05
 # Pause after a runtime error before serving again, so a broken transport
 # cannot hot-spin a loop or flood the log.
 _RETRY_BACKOFF_S = 1.0
@@ -50,7 +51,7 @@ class Ending(enum.Enum):
 
     #: Its caller cancelled the goal.
     LEFT = "left"
-    #: Its pairs were not the ones its model asks for, for the lease.
+    #: Its pairs were not the ones its model asks for, for the pair grace time.
     LAPSED = "lapsed"
     #: Another goal of the same caller hosts the robot now.
     HANDED_OVER = "handed over"
@@ -74,7 +75,7 @@ class RobotsIO:
         world: World,
         edits: Edits,
         io,
-        lease_s: float,
+        pair_grace_s: float,
     ) -> None:
         self._node_runner = node_runner
         self._loop = loop
@@ -89,9 +90,11 @@ class RobotsIO:
         # The limb pairs, which are what a robot is driven through and what
         # keeps it in the scene.
         self._io = io
-        if lease_s <= 0.0:
-            raise ValueError(f"robot_lease_ms must be positive, got {lease_s * 1000:g}")
-        self._lease_s = lease_s
+        if pair_grace_s <= 0.0:
+            raise ValueError(
+                f"robot_pair_grace_ms must be positive, got {pair_grace_s * 1000:g}"
+            )
+        self._pair_grace_s = pair_grace_s
         # Set by the launch once the engine exists: a scene that changed has
         # to be composed again before it is stepped, and the engine reading
         # the scene lets go of it first.
@@ -167,9 +170,9 @@ class RobotsIO:
             asyncio.create_task(self._watch_pairs()),
         ]
         logger.info(
-            "the scene is open: robots attach with a model of %s, lease %.1fs",
+            "the scene is open: robots attach with a model of %s, pair grace time %.1fs",
             ", ".join(self._models.names()),
-            self._lease_s,
+            self._pair_grace_s,
         )
 
     async def stop(self) -> None:
@@ -184,10 +187,11 @@ class RobotsIO:
 
     async def _watch_pairs(self) -> None:
         """Records which robots hold the pairs their model asks for, on the
-        same tick their stay checks its lease. A robot's pairs dissolve when
-        its nodes stop, so this is how a robot that is gone stops renewing,
-        and a robot paired as another model never renews at all."""
-        period = self._lease_check_period()
+        same tick their stay checks its pair grace time. A robot's pairs
+        dissolve when its nodes stop, so this is how a robot that is gone stops
+        starting its pair grace time again, and a robot paired as another model
+        never starts it again at all."""
+        period = self._pair_grace_check_period()
         while True:
             try:
                 matched = {
@@ -222,7 +226,8 @@ class RobotsIO:
         """Gives back what an admission reserved for a goal that never
         reached its stay. A goal is accepted on a hop of its own after this
         engine has answered for it, and a robot with no stay has nothing
-        watching its lease, so its name and its spot are held by nobody."""
+        watching its pair grace time, so its name and its spot are held by
+        nobody."""
         name, self._admitted = self._admitted, None
         if name is None:
             return
@@ -234,9 +239,10 @@ class RobotsIO:
             name,
         )
 
-    def _lease_check_period(self) -> float:
-        """How often a stay checks its lease: a share of the lease, floored."""
-        return max(self._lease_s * _LEASE_CHECK_SHARE, _LEASE_CHECK_FLOOR_S)
+    def _pair_grace_check_period(self) -> float:
+        """How often a stay checks its pair grace time: a share of that time,
+        floored."""
+        return max(self._pair_grace_s * _PAIR_GRACE_CHECK_SHARE, _PAIR_GRACE_CHECK_FLOOR_S)
 
     def _admit(self, request: attach.GoalRequest) -> attach.GoalDecision:
         """Whether a robot may join, and the limbs it will drive, under the
@@ -326,7 +332,8 @@ class RobotsIO:
     async def _stay(self, context: attach.GoalContext) -> None:
         """One robot's stay in the scene: it joins, it is driven through its
         limb pairs, and it leaves when the goal is cancelled, when its pairs
-        have not been its model's for the lease, or when the engine stops.
+        have not been its model's for the pair grace time, or when the engine
+        stops.
 
         A goal admitted for the robot its caller already stands takes that
         stay over instead: the scene is untouched, and the goal that hosted
@@ -341,9 +348,9 @@ class RobotsIO:
         adopted = robot.standing()
         if adopted:
             # The goal that hosted this robot ends here, where the goal
-            # taking it over exists and is about to watch the robot's lease.
-            # Ending it takes the signal this stay then waits on, so the two
-            # happen in this order.
+            # taking it over exists and is about to watch the robot's pair
+            # grace time. Ending it takes the signal this stay then waits on,
+            # so the two happen in this order.
             self._hand_over(name)
             logger.info("robot '%s' (%s) is hosted by its new goal", name, model)
         handover = self._handover(name)
@@ -447,7 +454,7 @@ class RobotsIO:
         """Waits for the robot's stay to end, and says how it ended."""
         cancel = asyncio.create_task(context.cancel_signal())
         handed = asyncio.create_task(handover.wait())
-        period = self._lease_check_period()
+        period = self._pair_grace_check_period()
         try:
             while True:
                 done, _ = await asyncio.wait(
@@ -480,14 +487,14 @@ class RobotsIO:
         return robot.entry.mismatch(self._io.held_by(robot.name))
 
     def _lapse(self, robot: Robot) -> Optional[str]:
-        """Why the robot's lease ran out, or None while it runs: its pairs
-        are not its model's now, and were not for the lease. They are read
-        here as well as on the watcher's tick, so a robot still holding them
-        keeps its place however long the node loop went without renewing its
-        lease, and a robot no limb reached yet keeps its place for as long as
-        its goal runs. A robot holding no pair is told its limbs were gone,
-        and any other which of its pairs and its model's limbs and cameras
-        differ."""
+        """Why the robot's pair grace time ran out, or None while it runs: its
+        pairs are not its model's now, and were not for the pair grace time.
+        They are read here as well as on the watcher's tick, so a robot still
+        holding them keeps its place however long the node loop went without
+        starting its pair grace time again, and a robot no limb reached yet
+        keeps its place for as long as its goal runs. A robot holding no pair
+        is told its limbs were gone, and any other which of its pairs and its
+        model's limbs and cameras differ."""
         now = self._loop.time()
         held = self._io.held_by(robot.name)
         mismatch = robot.entry.mismatch(held)
@@ -496,16 +503,16 @@ class RobotsIO:
             return None
         if held.holds_a_limb():
             self._robots.note_limbs_reached(robot.name, now)
-        if not robot.lease_ran_out(now, self._lease_s):
+        if not robot.pair_grace_ran_out(now, self._pair_grace_s):
             return None
         if held.is_empty():
             return (
-                f"none of this robot's limbs were paired for {self._lease_s:.1f}s, "
-                "the lease this scene gives"
+                f"none of this robot's limbs were paired for {self._pair_grace_s:.1f}s, "
+                "the pair grace time this scene gives"
             )
         return (
-            f"this robot's pairs were not its model's for {self._lease_s:.1f}s, the lease "
-            f"this scene gives: {mismatch}"
+            f"this robot's pairs were not its model's for {self._pair_grace_s:.1f}s, "
+            f"the pair grace time this scene gives: {mismatch}"
         )
 
     def _forget(self, name: str) -> None:

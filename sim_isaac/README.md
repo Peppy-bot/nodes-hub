@@ -84,14 +84,14 @@ pair is read for it through `sim_robot_core.pairs`:
 - a camera pair's camera is its relay's name in the copy (`wrist_left`,
   `wrist`): the relay's instance id without the copy's prefix.
 
-A robot's lease is renewed only while its pairs are its model's: every limb of
-its model, and nothing its model lacks. A camera its model carries may go
-unpaired, since a camera nobody views is not rendered. When the lease runs
-out the stay ends, saying either that none of the robot's limbs were paired or
-naming both lists: what its pairs name and what its model has. A robot is
-ready once it stands and holds a pair for every limb of its model, so an
-SO-101 is ready with its one arm and its one gripper. Each robot on the stage
-is held to its own model.
+A robot's pair grace time (`robot_pair_grace_ms`) starts again only while its
+pairs are its model's: every limb of its model, and nothing its model lacks. A
+camera its model carries may go unpaired, since a camera nobody views is not
+rendered. When the pair grace time runs out the stay ends, saying either that
+none of the robot's limbs were paired or naming both lists: what its pairs name
+and what its model has. A robot is ready once it stands and holds a pair for
+every limb of its model, so an SO-101 is ready with its one arm and its one
+gripper. Each robot on the stage is held to its own model.
 
 ## Models
 

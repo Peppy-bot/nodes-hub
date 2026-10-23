@@ -170,13 +170,14 @@
         $default: true,
       },
 
-      // How long a robot may go without holding the pairs its model asks
-      // for before it leaves the stage, once a limb first reached it. A
-      // robot's pairs dissolve when its nodes stop, so a robot whose process
-      // is gone leaves within this window, and one paired as another model
-      // stays this long before its stay ends naming both lists; a robot no
-      // limb reached yet stays for as long as its goal does.
-      robot_lease_ms: { $type: "u32", $default: 2000 },
+      // The pair grace time: how long a robot may go without holding the
+      // pairs its model asks for before it leaves the stage, once a limb
+      // first reached it. A robot's pairs dissolve when its nodes stop, so a
+      // robot whose process is gone leaves within this window, and one paired
+      // as another model stays this long before its stay ends naming both
+      // lists; a robot no limb reached yet stays for as long as its goal
+      // does.
+      robot_pair_grace_ms: { $type: "u32", $default: 2000 },
 
       // Render and stream the cameras of each robot's own model on the
       // camera slots, each on the pair of its own relay: a rig per robot

@@ -141,7 +141,7 @@ names the robot by, `openarm_v2` or `so101` for example.
 
 **the robot left the scene and its node stopped**
 A stay ends when the engine takes the robot out or its limbs hold no pair
-for the engine's lease, and the node stops with it: a robot that is not in
-the scene has no readiness to serve. `peppy stack list` reports the instance
-finished, with the engine's own account of why in the node's run log.
+for the engine's pair grace time, and the node stops with it: a robot that is
+not in the scene has no readiness to serve. `peppy stack list` reports the
+instance finished, with the engine's own account of why in the node's run log.
 Nothing brings the copy back on its own: `peppy stack join` it again.

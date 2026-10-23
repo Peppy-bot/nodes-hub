@@ -53,7 +53,7 @@ async def _run_sim(params, node_runner) -> list:
         world,
         edits,
         io,
-        params.robot_lease_ms / 1000.0,
+        params.robot_pair_grace_ms / 1000.0,
     )
     await robots_io.start()
     launcher = SimLauncher(
