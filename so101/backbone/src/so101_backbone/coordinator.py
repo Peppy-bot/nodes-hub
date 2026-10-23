@@ -8,9 +8,13 @@ end-effector-speed governor (the joints-led
 stream's only limiter; the pose-mode stream's IK output is additionally
 rate-stepped per joint); otherwise silence, and the follower holds. The
 arm and the gripper claim independently, so a long arm move never freezes
-gripper teleop and vice versa. A gripper plan owns the gripper past the last
-sample of its ramp: it keeps commanding its target until the measured opening
-stands still.
+gripper teleop and vice versa. An arm plan owns the arm past the planned end
+of its trajectory: it keeps commanding its end sample until the measured
+joints, or the measured grasp point, stand within the goal's settle
+tolerance of the target, or the goal's settle timeout fails it. A gripper
+plan keeps commanding its target past the planned end of its travel until
+the jaws stand still, wherever they stand, or until the goal's settle
+timeout, and completes either way.
 
 Fresh follower state gates everything: with the measured stream stale no limb
 gets a setpoint, an active plan fails, and the standing command resets. The
@@ -25,13 +29,16 @@ message for its goal to end with.
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from dataclasses import dataclass, field
+from typing import ClassVar
 
 from control_core_py.minimum_jerk import Profile
 from control_core_py.runtime import Latch
 from so101_description.limbs import ARM_LIMB, GRIPPER_LIMB
 from so101_description.limits import JointLimits
+from so101_description.transforms import relative_rotation_rad
 
 from so101_backbone.governor import EEGovernor, rate_step
 from so101_backbone.params import Config, UpstreamMode
@@ -51,18 +58,13 @@ STALE_WIRE_TIMEOUT_S = 0.25
 # period, because the follower publishes state on its own independent rate;
 # 0.1 s is six periods of the family's validated 60 Hz state stream.
 STALE_FOLLOWER_TIMEOUT_S = 0.1
-# A gripper plan ends when the measured gripper stands still: its opening has
-# stayed within GRIPPER_STILL_FRAC of a reference opening for
-# GRIPPER_STILL_WINDOW_S. 0.2 % of the jaw travel is above measurement noise,
-# and the window outlasts STALE_FOLLOWER_TIMEOUT_S, so an opening that stands
-# through it was reported again while it stood. The three values are the
-# OpenArm backbone's, so move_gripper ends by one rule on both robots.
-GRIPPER_STILL_FRAC = 0.002
+# The failure of a move in flight once the follower's measured state is stale.
+STALE_FOLLOWER_REFUSAL = "the follower stopped reporting"
+# The jaws stand still once every opening the follower delivered over
+# GRIPPER_STILL_WINDOW_S lies within GRIPPER_STILL_BAND of full jaw travel of
+# the others: the band and window the limb_motion contract states.
+GRIPPER_STILL_BAND = 0.01
 GRIPPER_STILL_WINDOW_S = 0.25
-# A gripper standing still within this of its target reached it: 1 % of the
-# jaw travel. One standing still farther away is held by an object or by the
-# effort ceiling.
-GRIPPER_REACHED_FRAC = 0.01
 
 
 class LatestValue:
@@ -79,6 +81,9 @@ class LatestValue:
         self._value = None
         # When the value last arrived; None until one has.
         self._stamp: float | None = None
+        # How many values have arrived: a reader that saw this count tells a
+        # value delivered since from the one it already read.
+        self.deliveries = 0
         # The producer's capture timestamp (wire seconds), forwarded so the
         # downstream stamp names when the leader read the sample, not when
         # this node relayed it.
@@ -87,6 +92,7 @@ class LatestValue:
     def set(self, value, wire_timestamp_s: float | None = None) -> None:
         self._value = value
         self._stamp = time.monotonic()
+        self.deliveries += 1
         self.wire_timestamp_s = wire_timestamp_s
 
     def fresh(self, timeout_s: float):
@@ -102,9 +108,72 @@ class LatestValue:
         self._value = None
 
 
+@dataclass(frozen=True)
+class JointSettle:
+    """How a joint move ends past the planned end of its trajectory: each
+    measured joint within its own tolerance (rad, one per joint in the
+    arm's joint order) of its target, within timeout_s."""
+
+    tolerances_rad: tuple[float, ...]
+    timeout_s: float
+    completion: ClassVar[str] = "trajectory complete"
+
+    def shortfall(self, measured, target, _kinematics) -> str | None:
+        """How far the joint farthest outside its tolerance still stands
+        from `target`, or None once every joint is within its tolerance."""
+        errors = [abs(m - t) for m, t in zip(measured, target, strict=True)]
+        excesses = [e - bar for e, bar in zip(errors, self.tolerances_rad, strict=True)]
+        worst = max(range(len(excesses)), key=excesses.__getitem__)
+        if excesses[worst] <= 0.0:
+            return None
+        return f"still {errors[worst]:.3f} rad from the target at joint {worst + 1}"
+
+
+@dataclass(frozen=True)
+class PoseSettle:
+    """How a pose move ends past the planned end of its trajectory: the
+    measured grasp point within the tolerances of the commanded pose, within
+    timeout_s. The position is judged as the Euclidean distance, the
+    orientation as the geodesic angle."""
+
+    position: tuple[float, ...]
+    orientation: tuple[float, ...]
+    position_tolerance_m: float
+    orientation_tolerance_rad: float
+    timeout_s: float
+    completion: ClassVar[str] = "cartesian move complete"
+
+    def shortfall(self, measured, _target, kinematics) -> str | None:
+        """How far the grasp point of the `measured` joints still stands from
+        the commanded pose, or None once it is within both tolerances."""
+        position, orientation = kinematics.forward_kinematics(measured)
+        distance_m = math.dist(position, self.position)
+        angle_rad = relative_rotation_rad(orientation, self.orientation)
+        if (
+            distance_m <= self.position_tolerance_m
+            and angle_rad <= self.orientation_tolerance_rad
+        ):
+            return None
+        return f"still {distance_m * 1000:.1f} mm / {angle_rad:.2f} rad from the target"
+
+
+@dataclass(frozen=True)
+class PostureEnd:
+    """How a posture move ends: at the planned end of its trajectory,
+    judging nothing, with `completion` as its message."""
+
+    completion: str
+
+    def shortfall(self, _measured, _target, _kinematics) -> None:
+        return None
+
+
 @dataclass
 class ArmPlan:
     profile: Profile
+    # How the plan ends past the planned end of its profile, judged on the
+    # measured joints each tick, and the message it completes with.
+    settle: JointSettle | PoseSettle | PostureEnd
     done: asyncio.Event = field(default_factory=asyncio.Event)
     started_monotonic: float | None = None
     aborted: bool = False
@@ -126,51 +195,77 @@ class ArmPlan:
         return self.profile.sample(now - self.started_monotonic)
 
 
-@dataclass
-class GripperSettle:
-    """The wait for the measured opening to stand still, once the follower
-    holds the plan's target sample."""
+@dataclass(frozen=True)
+class StillRun:
+    """A run of openings the follower delivered that all lie within
+    GRIPPER_STILL_BAND of one another: the lowest and the highest of them,
+    and when the first was measured."""
 
-    # When the settle began, on the control tick's clock.
-    began: float
-    # The measured opening the gripper is judged still against, and when it
-    # was taken. The first one is the opening measured as the settle begins.
-    reference: float
-    reference_at: float
+    low: float
+    high: float
+    since: float
 
-    def stands_still(self, measured: float, now: float) -> bool:
-        """Judge one measured opening. One farther than GRIPPER_STILL_FRAC
-        from the reference replaces it and restarts the window; one within it
-        stands still once the reference is GRIPPER_STILL_WINDOW_S old."""
-        if abs(measured - self.reference) > GRIPPER_STILL_FRAC:
-            self.reference = measured
-            self.reference_at = now
-            return False
-        return now - self.reference_at >= GRIPPER_STILL_WINDOW_S
+    @classmethod
+    def starting(cls, opening: float, now: float) -> StillRun:
+        return cls(low=opening, high=opening, since=now)
+
+    def extended(self, opening: float, now: float) -> StillRun:
+        """This run with `opening` measured at `now` added, or a new run from
+        it when it lies farther than the band from an opening of this one."""
+        low, high = min(self.low, opening), max(self.high, opening)
+        if high - low > GRIPPER_STILL_BAND:
+            return StillRun.starting(opening, now)
+        return StillRun(low=low, high=high, since=self.since)
 
 
 @dataclass
 class GripperPlan:
     target: float
-    # Travel budget, sized at admission, for the ramp and the settle
-    # together: a goal that stalls past it, or whose gripper never stands
-    # still, fails instead of holding the busy slot forever. Required at
-    # construction, because a plan that reached the wait with an unset budget
-    # would fail the moment it started.
-    timeout_s: float
+    # How long past the planned end the plan waits for the jaws to stand
+    # still before it completes wherever they stand.
+    settle_timeout_s: float
     done: asyncio.Event = field(default_factory=asyncio.Event)
+    # The planned end: the first tick that found the commanded opening on
+    # the target. None while the ramp travels.
+    planned_end: float | None = None
+    # The follower's delivery count the last tick read, which tells a fresh
+    # opening from a cached one.
+    read_delivery: int | None = None
+    # The run of openings delivered since the planned end that lie within
+    # the still band of one another; None before the first.
+    still: StillRun | None = None
     aborted: bool = False
     failed: str | None = None
     # The opening the ramp stood at when the plan was cut, for reporting.
     frozen: float | None = None
-    # None while the ramp runs.
-    settle: GripperSettle | None = None
-    # The measured opening the gripper stood still at: set, with done, when
-    # the settle ends the plan.
-    settled: float | None = None
+    # The opening measured when the plan completed, which it reports.
+    completed_on: float | None = None
+    # How long past the planned end the settle timeout completed the plan,
+    # before the jaws stood still; None when they stood still.
+    still_moving_after_s: float | None = None
     # The stop service's message when it cut the plan: the goal ends as
     # cancelled with it.
     stopped: str | None = None
+
+    def settles(self, measured: float, fresh: bool, since_end_s: float, now: float) -> bool:
+        """Whether a tick `since_end_s` past the planned end, reading
+        `measured`, completes the plan: once the jaws stand still, judged on
+        `fresh` deliveries alone, the openings delivered over a still window
+        lying within the still band of one another, or once the settle
+        timeout runs out, which records how long past the planned end that
+        was."""
+        if fresh:
+            self.still = (
+                StillRun.starting(measured, now)
+                if self.still is None
+                else self.still.extended(measured, now)
+            )
+            if now - self.still.since >= GRIPPER_STILL_WINDOW_S:
+                return True
+        if since_end_s < self.settle_timeout_s:
+            return False
+        self.still_moving_after_s = since_end_s
+        return True
 
 
 class Coordinator:
@@ -220,6 +315,7 @@ class Coordinator:
         self._arm_tick_plan: ArmPlan | None = None
         self._arm_completing: ArmPlan | None = None
         self._gripper_tick_plan: GripperPlan | None = None
+        self._gripper_completing: GripperPlan | None = None
         self._arm_busy = False
         self._gripper_busy = False
         self._ik_failing = Latch()
@@ -293,19 +389,27 @@ class Coordinator:
             return None
         return self._delivered_gripper if self._delivered_gripper is not None else measured
 
+    @property
+    def commanded_arm(self) -> tuple[float, ...] | None:
+        """The joints commanded last, or None while the wire is silent."""
+        return self._commanded_arm
+
     # ------------------------------------------------------------------- plans
 
-    def adopt_arm_plan(self, profile: Profile) -> ArmPlan:
-        """Install an admitted action's trajectory. Streamed input already in
-        flight must not re-target the arm when the plan ends, so the arm's
-        leader holders are dropped here and again at release."""
+    def adopt_arm_plan(
+        self, profile: Profile, settle: JointSettle | PoseSettle | PostureEnd
+    ) -> ArmPlan:
+        """Install an admitted action's trajectory and its settle. Streamed
+        input already in flight must not re-target the arm when the plan
+        ends, so the arm's leader holders are dropped here and again at
+        release."""
         self._drop_arm_leader_input()
-        self._arm_plan = ArmPlan(profile=profile)
+        self._arm_plan = ArmPlan(profile=profile, settle=settle)
         return self._arm_plan
 
-    def adopt_gripper_plan(self, target: float, timeout_s: float) -> GripperPlan:
+    def adopt_gripper_plan(self, target: float, settle_timeout_s: float) -> GripperPlan:
         self.leader_gripper.clear()
-        self._gripper_plan = GripperPlan(target=target, timeout_s=timeout_s)
+        self._gripper_plan = GripperPlan(target=target, settle_timeout_s=settle_timeout_s)
         return self._gripper_plan
 
     def abort_arm_plan(self, plan: ArmPlan) -> None:
@@ -378,11 +482,12 @@ class Coordinator:
     def gripper_published(self, delivered: bool, command: float | None) -> None:
         """The outcome of publishing this tick's gripper setpoint, and the
         value that went out. An undelivered sample fails the plan it belonged
-        to, in the ramp and in the settle alike. A delivered one never
-        completes a plan: gripper_tick does, once the follower holds the
-        target sample and the measured opening stands still."""
+        to. A plan at its planned end completes on the delivery of that
+        tick's target."""
         plan = self._gripper_tick_plan
+        completing = self._gripper_completing
         self._gripper_tick_plan = None
+        self._gripper_completing = None
         if not delivered:
             frozen = self._commanded_gripper
             self._commanded_gripper = None
@@ -397,6 +502,8 @@ class Coordinator:
             return
         assert command is not None, "a delivered setpoint must name the value that went out"
         self._delivered_gripper = command
+        if completing is not None:
+            completing.done.set()
 
     def release_arm(self) -> None:
         """Called by the action layer once an arm goal reaches a terminal
@@ -442,14 +549,12 @@ class Coordinator:
         self._arm_tick_plan = None
         self._arm_completing = None
         self.arm_tick_stamp_s = None
-        follower_live = (
-            self.measured_joints.fresh(STALE_FOLLOWER_TIMEOUT_S) is not None
-        )
+        measured = self.measured_joints.fresh(STALE_FOLLOWER_TIMEOUT_S)
         plan = self._arm_plan
         if plan is not None:
-            if not follower_live:
+            if measured is None:
                 # A move in the dark can neither progress nor be verified.
-                self._fail_arm_plan(plan, "follower state went stale mid-goal")
+                self._fail_arm_plan(plan, STALE_FOLLOWER_REFUSAL)
                 return None
             if plan.started_monotonic is None:
                 plan.started_monotonic = now
@@ -457,12 +562,7 @@ class Coordinator:
             self._commanded_arm = plan.profile.sample(t)
             self._arm_tick_plan = plan
             if plan.profile.done(t):
-                self._arm_plan = None
-                # Streamed input that arrived mid-plan must not re-target the
-                # arm on the very next tick; the leader re-engages fresh.
-                # Completion waits for the final sample's delivery.
-                self._drop_arm_leader_input()
-                self._arm_completing = plan
+                return self._end_arm_plan(plan, t, measured)
             return self._commanded_arm
 
         if self._arm_busy:
@@ -483,35 +583,66 @@ class Coordinator:
         self.arm_tick_stamp_s = self._upstream_arm.wire_timestamp_s
         return self._commanded_arm
 
+    def _end_arm_plan(self, plan: ArmPlan, t_s: float, measured) -> tuple[float, ...] | None:
+        """A tick at or after the planned end of `plan`, its end sample
+        commanded. The plan completes on the delivery of that sample when its
+        settle is met on the `measured` joints; it fails
+        once the settle has timed out, with the shortfall measured then, and
+        that tick publishes nothing; otherwise it keeps commanding the end
+        sample."""
+        settle = plan.settle
+        shortfall = settle.shortfall(measured, plan.profile.end, self._kinematics)
+        if shortfall is None:
+            self._arm_plan = None
+            # Streamed input that arrived mid-plan must not re-target the
+            # arm on the very next tick; the leader re-engages fresh.
+            self._drop_arm_leader_input()
+            self._arm_completing = plan
+            return self._commanded_arm
+        since_end_s = t_s - plan.profile.duration_s
+        if since_end_s < settle.timeout_s:
+            return self._commanded_arm
+        self._arm_tick_plan = None
+        self._fail_arm_plan(plan, f"{shortfall}, {since_end_s:.1f} s after the planned end")
+        return None
+
     def gripper_tick(self, now: float) -> float | None:
         """The opening to publish this tick, or None for silence. The caller
         reports each returned opening's fate through gripper_published.
 
-        A plan runs in two phases. The ramp steps the commanded opening to
-        the target. Once the follower holds the target sample the plan
-        settles: it keeps commanding the target, and ends on the tick the
-        measured opening stands still, which publishes nothing."""
+        A plan ramps the commanded opening to the target at the gripper rate
+        cap, to its planned end, the first tick that finds the command on the
+        target, and keeps commanding the target past it; it completes on the
+        delivery of the tick that finds the jaws standing still, or of the
+        tick its settle timeout runs out on."""
         self._gripper_tick_plan = None
+        self._gripper_completing = None
         self.gripper_tick_stamp_s = None
         plan = self._gripper_plan
         if plan is not None:
             anchor = self.gripper_anchor()
             measured = self.measured_gripper.fresh(STALE_FOLLOWER_TIMEOUT_S)
             if anchor is None or measured is None:
-                self._fail_gripper_plan(plan, "follower state went stale mid-goal")
+                self._fail_gripper_plan(plan, STALE_FOLLOWER_REFUSAL)
                 return None
-            if self._gripper_stands_still(plan, measured, now):
+            delivery = self.measured_gripper.deliveries
+            fresh = delivery != plan.read_delivery
+            plan.read_delivery = delivery
+            # The planned end is the first tick that finds the opening
+            # commanded last on the target: the ramp lands by exact equality.
+            if plan.planned_end is None and anchor == plan.target:
+                plan.planned_end = now
+            if plan.planned_end is not None and plan.settles(
+                measured, fresh, now - plan.planned_end, now
+            ):
                 self._gripper_plan = None
                 # Streamed input that arrived mid-plan must not re-target the
                 # gripper once the goal releases it.
                 self.leader_gripper.clear()
-                plan.settled = measured
-                plan.done.set()
-                return None
+                plan.completed_on = measured
+                self._gripper_completing = plan
             # rate_step returns the target itself once within one tick's
             # cap, so the ramp lands by exact equality, never a snap past it.
-            # Through the settle the anchor is the delivered target, which
-            # the step holds.
             self._commanded_gripper = rate_step(anchor, plan.target, self._gripper_tick_cap)
             self._gripper_tick_plan = plan
             return self._commanded_gripper
@@ -533,17 +664,6 @@ class Coordinator:
         self._commanded_gripper = rate_step(anchor, desired, self._gripper_tick_cap)
         self.gripper_tick_stamp_s = self.leader_gripper.wire_timestamp_s
         return self._commanded_gripper
-
-    def _gripper_stands_still(self, plan: GripperPlan, measured: float, now: float) -> bool:
-        """Whether the plan ends this tick. Nothing is judged before the
-        follower holds the target sample; the first tick after that begins
-        the settle on the opening measured then."""
-        if self._delivered_gripper != plan.target:
-            return False
-        if plan.settle is None:
-            plan.settle = GripperSettle(began=now, reference=measured, reference_at=now)
-            return False
-        return plan.settle.stands_still(measured, now)
 
     def _streamed_arm_target(self, seed: tuple[float, ...] | None) -> tuple[float, ...] | None:
         """The streamed target, or None for silence. The pose path is best

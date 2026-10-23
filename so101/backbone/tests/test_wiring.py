@@ -4,6 +4,7 @@ services end to end."""
 
 import asyncio
 import math
+import re
 import time
 
 import peppylib
@@ -63,6 +64,7 @@ from so101_description.model import KINEMATICS_URDF_PATH
 from workspace_core_py import REACH_TOLERANCE
 
 from so101_backbone.__main__ import setup
+from so101_backbone.coordinator import GRIPPER_STILL_WINDOW_S
 
 TIMEOUT_S = 10.0
 # The bound of an answer that measures reach: the first starts the worker
@@ -260,11 +262,15 @@ async def test_move_arm_joints_completes_and_reports():
     async with harness.start(setup, parameters=make_parameters()) as h:
         feeder = await feeding_measured(h)
         try:
-            target = [p + 0.2 for p in MEASURED]
+            # The mocked follower keeps measuring MEASURED, within the 0.1 rad
+            # settle tolerance of every joint's target, so the move completes
+            # at its planned end.
+            target = [p + 0.05 for p in MEASURED]
             goal = await move_arm_joints_fx.send_goal(
                 h,
                 move_arm_joints_prod.GoalRequestData(
-                    arm_name="arm", joint_positions=target, duration_s=0.0
+                    arm_name="arm", joint_positions=target, duration_s=0.0,
+                    settle_tolerances_rad=[0.1] * 5, settle_timeout_s=2.0,
                 ),
                 peppylib.QoSProfile.Reliable,
                 TIMEOUT_S,
@@ -288,6 +294,39 @@ async def test_move_arm_joints_completes_and_reports():
             feeder.cancel()
 
 
+async def test_move_arm_joints_outside_its_tolerances_fails_with_the_shortfall():
+    async with harness.start(setup, parameters=make_parameters()) as h:
+        feeder = await feeding_measured(h)
+        try:
+            # The mocked follower never leaves MEASURED, 0.2 rad from every
+            # joint's target, outside the 0.1 rad tolerance.
+            goal = await move_arm_joints_fx.send_goal(
+                h,
+                move_arm_joints_prod.GoalRequestData(
+                    arm_name="arm",
+                    joint_positions=[p + 0.2 for p in MEASURED],
+                    duration_s=0.0,
+                    settle_tolerances_rad=[0.1] * 5,
+                    settle_timeout_s=0.3,
+                ),
+                peppylib.QoSProfile.Reliable,
+                TIMEOUT_S,
+            )
+            assert goal.accepted
+            result = await goal.get_result(TIMEOUT_S)
+            assert result.status == move_arm_joints_fx.ResultStatus.COMPLETED
+            assert not result.data.success
+            # Every joint is 0.2 rad short; the one named is whichever float
+            # sum lands a few ulps farther out.
+            assert re.fullmatch(
+                r"still 0\.200 rad from the target at joint [1-5], \d+\.\d s after the planned end",
+                result.data.message,
+            ), result.data.message
+            assert result.data.final_joint_positions == pytest.approx(MEASURED)
+        finally:
+            feeder.cancel()
+
+
 async def test_second_goal_is_rejected_while_busy():
     async with harness.start(setup, parameters=make_parameters()) as h:
         # The in-flight goal outlives STALE_FOLLOWER_TIMEOUT_S, and a plan
@@ -300,6 +339,8 @@ async def test_second_goal_is_rejected_while_busy():
                     arm_name="arm",
                     joint_positions=[p + 0.5 for p in MEASURED],
                     duration_s=5.0,
+                    settle_tolerances_rad=[0.1] * 5,
+                    settle_timeout_s=2.0,
                 ),
                 peppylib.QoSProfile.Reliable,
                 TIMEOUT_S,
@@ -308,13 +349,14 @@ async def test_second_goal_is_rejected_while_busy():
             second = await move_arm_joints_fx.send_goal(
                 h,
                 move_arm_joints_prod.GoalRequestData(
-                    arm_name="arm", joint_positions=MEASURED, duration_s=0.0
+                    arm_name="arm", joint_positions=MEASURED, duration_s=0.0,
+                    settle_tolerances_rad=[0.1] * 5, settle_timeout_s=2.0,
                 ),
                 peppylib.QoSProfile.Reliable,
                 TIMEOUT_S,
             )
             assert not second.accepted
-            assert "in flight" in second.reason
+            assert second.reason == "arm is already executing a motion"
             cancel = await slow.cancel_goal(TIMEOUT_S)
             assert cancel.state == move_arm_joints_fx.CancelState.SIGNALLED
             result = await slow.get_result(TIMEOUT_S)
@@ -329,7 +371,8 @@ async def test_goal_without_follower_state_is_rejected():
         goal = await move_arm_joints_fx.send_goal(
             h,
             move_arm_joints_prod.GoalRequestData(
-                arm_name="arm", joint_positions=MEASURED, duration_s=0.0
+                arm_name="arm", joint_positions=MEASURED, duration_s=0.0,
+                settle_tolerances_rad=[0.1] * 5, settle_timeout_s=2.0,
             ),
             peppylib.QoSProfile.Reliable,
             TIMEOUT_S,
@@ -356,7 +399,7 @@ async def test_posture_and_gripper_actions():
             grip = await move_gripper_fx.send_goal(
                 h,
                 move_gripper_prod.GoalRequestData(
-                    gripper_name="gripper", opening=0.5, max_effort=0.0
+                    gripper_name="gripper", opening=0.5, max_effort=0.0, settle_timeout_s=2.0
                 ),
                 peppylib.QoSProfile.Reliable,
                 TIMEOUT_S,
@@ -364,13 +407,13 @@ async def test_posture_and_gripper_actions():
             assert grip.accepted
             grip_result = await grip.get_result(TIMEOUT_S)
             assert grip_result.status == move_gripper_fx.ResultStatus.COMPLETED
-            # The mocked follower never moves its jaws: the goal ends once
-            # they have stood still, a success that names where they stand.
+            # The mocked follower never moves its jaws: past the planned end
+            # of its travel the goal finds them standing still and reports
+            # where they stand.
             assert grip_result.data.success
-            assert grip_result.data.message == (
-                "move complete: the gripper stopped at 0.000, short of the target 0.500"
-            )
+            assert grip_result.data.message == "move complete"
             assert grip_result.data.final_opening == 0.0
+            assert grip_result.data.action_time >= GRIPPER_STILL_WINDOW_S
             # The ramp's last downstream opening is the target.
             last = None
             while True:
@@ -434,7 +477,7 @@ async def test_nonzero_max_effort_is_accepted_and_ignored():
             goal = await move_gripper_fx.send_goal(
                 h,
                 move_gripper_prod.GoalRequestData(
-                    gripper_name="gripper", opening=0.5, max_effort=2.0
+                    gripper_name="gripper", opening=0.5, max_effort=2.0, settle_timeout_s=2.0
                 ),
                 peppylib.QoSProfile.Reliable,
                 TIMEOUT_S,
@@ -453,7 +496,7 @@ async def test_a_gripper_goals_max_effort_never_reaches_the_follower():
             goal = await move_gripper_fx.send_goal(
                 h,
                 move_gripper_prod.GoalRequestData(
-                    gripper_name="gripper", opening=0.5, max_effort=2.0
+                    gripper_name="gripper", opening=0.5, max_effort=2.0, settle_timeout_s=2.0
                 ),
                 peppylib.QoSProfile.Reliable,
                 TIMEOUT_S,
@@ -484,14 +527,17 @@ async def test_malformed_pose_goal_is_rejected_and_the_server_survives():
                     position=[0.1, 0.0, 0.2],
                     orientation=[0.0, 0.0, 0.0, 0.0],
                     duration_s=0.0,
-                    plan_position_tolerance_m=0.0,
-                    plan_orientation_tolerance_rad=0.0,
+                    plan_position_tolerance_m=0.01,
+                    plan_orientation_tolerance_rad=0.5,
+                    settle_position_tolerance_m=0.01,
+                    settle_orientation_tolerance_rad=0.5,
+                    settle_timeout_s=2.0,
                 ),
                 peppylib.QoSProfile.Reliable,
                 TIMEOUT_S,
             )
             assert not bad.accepted
-            assert "unit quaternion" in bad.reason
+            assert bad.reason == "goal pose has an unnormalizable orientation"
             # The server must still decide the next goal (reachability of the
             # target pose is not the point; a decision is).
             again = await move_arm_fx.send_goal(
@@ -501,14 +547,17 @@ async def test_malformed_pose_goal_is_rejected_and_the_server_survives():
                     position=[0.0, 0.0, 0.42],
                     orientation=[0.0, 0.0, 0.0, 1.0],
                     duration_s=0.0,
-                    plan_position_tolerance_m=0.0,
-                    plan_orientation_tolerance_rad=0.0,
+                    plan_position_tolerance_m=0.01,
+                    plan_orientation_tolerance_rad=0.5,
+                    settle_position_tolerance_m=0.01,
+                    settle_orientation_tolerance_rad=0.5,
+                    settle_timeout_s=2.0,
                 ),
                 peppylib.QoSProfile.Reliable,
                 TIMEOUT_S,
             )
             if not again.accepted:
-                assert "unit quaternion" not in again.reason
+                assert "unnormalizable" not in again.reason
         finally:
             feeder.cancel()
 
@@ -519,13 +568,14 @@ async def test_out_of_limit_goal_is_rejected():
         goal = await move_arm_joints_fx.send_goal(
             h,
             move_arm_joints_prod.GoalRequestData(
-                arm_name="arm", joint_positions=[9.0] * 5, duration_s=0.0
+                arm_name="arm", joint_positions=[9.0] * 5, duration_s=0.0,
+                settle_tolerances_rad=[0.1] * 5, settle_timeout_s=2.0,
             ),
             peppylib.QoSProfile.Reliable,
             TIMEOUT_S,
         )
         assert not goal.accepted
-        assert "joint position limit" in goal.reason
+        assert goal.reason == "target out of joint limits"
 
 
 async def test_unknown_arm_name_is_refused():
@@ -534,7 +584,8 @@ async def test_unknown_arm_name_is_refused():
         goal = await move_arm_joints_fx.send_goal(
             h,
             move_arm_joints_prod.GoalRequestData(
-                arm_name="left_arm", joint_positions=MEASURED, duration_s=0.0
+                arm_name="left_arm", joint_positions=MEASURED, duration_s=0.0,
+                settle_tolerances_rad=[0.1] * 5, settle_timeout_s=2.0,
             ),
             peppylib.QoSProfile.Reliable,
             TIMEOUT_S,
@@ -579,7 +630,11 @@ async def test_the_wire_refuses_a_joint_vector_of_the_wrong_width():
 
 
 async def test_a_stop_ends_the_moves_in_flight_and_a_later_goal_runs():
-    async with harness.start(setup, parameters=make_parameters()) as h:
+    # A gripper rate of 0.1 per second gives the full-travel gripper move
+    # below a planned end 10 s out, so the stop finds it in flight.
+    async with harness.start(
+        setup, parameters=make_parameters(max_gripper_rate_frac_s=0.1)
+    ) as h:
         feeder = await feeding_measured(h)
         try:
             idle = await stop_fx.poll(h, stop_prod.RequestData(reason="nothing yet"), TIMEOUT_S)
@@ -593,6 +648,8 @@ async def test_a_stop_ends_the_moves_in_flight_and_a_later_goal_runs():
                     arm_name="arm",
                     joint_positions=[p + 0.5 for p in MEASURED],
                     duration_s=5.0,
+                    settle_tolerances_rad=[0.1] * 5,
+                    settle_timeout_s=2.0,
                 ),
                 peppylib.QoSProfile.Reliable,
                 TIMEOUT_S,
@@ -601,7 +658,7 @@ async def test_a_stop_ends_the_moves_in_flight_and_a_later_goal_runs():
             jaws = await move_gripper_fx.send_goal(
                 h,
                 move_gripper_prod.GoalRequestData(
-                    gripper_name="gripper", opening=1.0, max_effort=0.0
+                    gripper_name="gripper", opening=1.0, max_effort=0.0, settle_timeout_s=2.0
                 ),
                 peppylib.QoSProfile.Reliable,
                 TIMEOUT_S,
@@ -630,7 +687,8 @@ async def test_a_stop_ends_the_moves_in_flight_and_a_later_goal_runs():
             later = await move_arm_joints_fx.send_goal(
                 h,
                 move_arm_joints_prod.GoalRequestData(
-                    arm_name="arm", joint_positions=MEASURED, duration_s=0.0
+                    arm_name="arm", joint_positions=MEASURED, duration_s=0.0,
+                    settle_tolerances_rad=[0.1] * 5, settle_timeout_s=2.0,
                 ),
                 peppylib.QoSProfile.Reliable,
                 TIMEOUT_S,
@@ -658,8 +716,8 @@ async def test_the_plan_check_answers_without_moving():
                 position=[position[0], position[1], position[2] + 0.02],
                 orientation=list(orientation),
                 duration_s=0.0,
-                plan_position_tolerance_m=0.0,
-                plan_orientation_tolerance_rad=0.0,
+                plan_position_tolerance_m=0.01,
+                plan_orientation_tolerance_rad=0.5,
             )
             answer = await check_arm_move_fx.poll(h, check, TIMEOUT_S)
             assert answer.success, answer.message
@@ -670,12 +728,12 @@ async def test_the_plan_check_answers_without_moving():
                 position=[position[0] + 2.0, position[1], position[2]],
                 orientation=list(orientation),
                 duration_s=0.0,
-                plan_position_tolerance_m=0.0,
-                plan_orientation_tolerance_rad=0.0,
+                plan_position_tolerance_m=0.01,
+                plan_orientation_tolerance_rad=0.5,
             )
             answer = await check_arm_move_fx.poll(h, far, TIMEOUT_S)
             assert not answer.success
-            assert "no solution reaches this pose" in answer.message
+            assert answer.message.startswith("goal pose not planned within ")
             assert answer.duration_s == 0.0
 
             # Nothing streamed downstream: the checks moved nothing.

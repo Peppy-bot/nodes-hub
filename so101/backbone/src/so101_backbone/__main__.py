@@ -42,7 +42,7 @@ from so101_description.setpoints import parse_gripper_setpoint, parse_joint_setp
 
 from so101_backbone import params as params_mod
 from so101_backbone import workspace_service
-from so101_backbone.actions import ActionLayer, PendingSlot, serve
+from so101_backbone.actions import HOME_DONE, READY_DONE, ActionLayer, PendingSlot, serve
 from so101_backbone.coordinator import (
     STALE_WIRE_TIMEOUT_S,
     Coordinator,
@@ -301,9 +301,11 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
     # The postures and limits below are validated against the same model
     # bytes the constants were verified on. The point-to-point solver is a
     # second instance: move_arm solves run off the event loop and must not
-    # share the control tick's solver state.
+    # share the control tick's solver state. The plan check solves on a
+    # third, since a check and a move can solve at once.
     kinematics = Kinematics(KINEMATICS_URDF_PATH)
     point_solver = Kinematics(KINEMATICS_URDF_PATH)
+    check_solver = Kinematics(KINEMATICS_URDF_PATH)
     limits = limits_mod.from_urdf(KINEMATICS_URDF_PATH)
     for name, posture in (
         ("HOME_POSITIONS_RAD", postures.HOME_POSITIONS_RAD),
@@ -426,10 +428,14 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
                lambda p: layer.decide_arm_joints(move_arm_joints, p),
                layer.drive_arm, "move_arm_joints"),
         server(move_to_ready,
-               lambda p: layer.decide_posture(move_to_ready, postures.READY_POSITIONS_RAD, p),
+               lambda p: layer.decide_posture(
+                   move_to_ready, postures.READY_POSITIONS_RAD, READY_DONE, p
+               ),
                drive_posture, "move_to_ready"),
         server(move_to_home,
-               lambda p: layer.decide_posture(move_to_home, postures.HOME_POSITIONS_RAD, p),
+               lambda p: layer.decide_posture(
+                   move_to_home, postures.HOME_POSITIONS_RAD, HOME_DONE, p
+               ),
                drive_posture, "move_to_home"),
         server(move_arm,
                lambda p: layer.decide_pose(move_arm, p),
@@ -454,7 +460,7 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
         success, message, duration_s = await layer.check_arm_move(
             d.arm_name, tuple(d.position), tuple(d.orientation), d.duration_s,
             d.plan_position_tolerance_m, d.plan_orientation_tolerance_rad,
-            point_solver, kinematics,
+            check_solver, kinematics,
         )
         return check_arm_move.Response(success=success, message=message, duration_s=duration_s)
 
