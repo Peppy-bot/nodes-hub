@@ -18,12 +18,15 @@
 # The script provisions QEMU binfmt handlers and a docker-container buildx
 # builder so the amd64 host can cross-build the arm64 layers.
 #
+# Each image reads its assets from its own R2 bucket, with its own token. The
+# Isaac image needs WALDO_R2_ACCESS_KEY_ID and WALDO_R2_SECRET_ACCESS_KEY
+# (isaac-sim-assets), the MuJoCo image PEPPY_R2_DATA01_ACCESS_KEY_ID and
+# PEPPY_R2_DATA01_SECRET_ACCESS_KEY (peppy-data01). The script asks only for
+# the pair of each image it builds.
+#
 # Usage:
-#   PEPPY_R2_DATA01_ACCESS_KEY_ID=<key> PEPPY_R2_DATA01_SECRET_ACCESS_KEY=<secret> bash sim_base_images/build_base_images.sh
+#   bash sim_base_images/build_base_images.sh [--isaac-only|--mujoco-only]
 set -euo pipefail
-
-export PEPPY_R2_DATA01_ACCESS_KEY_ID="${PEPPY_R2_DATA01_ACCESS_KEY_ID:?PEPPY_R2_DATA01_ACCESS_KEY_ID must be set}"
-export PEPPY_R2_DATA01_SECRET_ACCESS_KEY="${PEPPY_R2_DATA01_SECRET_ACCESS_KEY:?PEPPY_R2_DATA01_SECRET_ACCESS_KEY must be set}"
 
 # ── Version manifest ──────────────────────────────────────────────────────────
 ISAAC_VERSION="6.1.0"    # mirrors nvcr.io/nvidia/isaac-sim upstream version
@@ -55,6 +58,15 @@ case "${1:-}" in
         exit 2
         ;;
 esac
+
+if (( BUILD_ISAAC )); then
+    export WALDO_R2_ACCESS_KEY_ID="${WALDO_R2_ACCESS_KEY_ID:?WALDO_R2_ACCESS_KEY_ID must be set to build the Isaac image}"
+    export WALDO_R2_SECRET_ACCESS_KEY="${WALDO_R2_SECRET_ACCESS_KEY:?WALDO_R2_SECRET_ACCESS_KEY must be set to build the Isaac image}"
+fi
+if (( BUILD_MUJOCO )); then
+    export PEPPY_R2_DATA01_ACCESS_KEY_ID="${PEPPY_R2_DATA01_ACCESS_KEY_ID:?PEPPY_R2_DATA01_ACCESS_KEY_ID must be set to build the MuJoCo image}"
+    export PEPPY_R2_DATA01_SECRET_ACCESS_KEY="${PEPPY_R2_DATA01_SECRET_ACCESS_KEY:?PEPPY_R2_DATA01_SECRET_ACCESS_KEY must be set to build the MuJoCo image}"
+fi
 
 IMAGES_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NODES_DIR="$(cd "${IMAGES_DIR}/.." && pwd)"
@@ -123,8 +135,8 @@ if (( BUILD_ISAAC )); then
         --platform "${ISAAC_PLATFORMS}" \
         --allow network.host \
         --network=host \
-        --secret id=rclone_key,env=PEPPY_R2_DATA01_ACCESS_KEY_ID \
-        --secret id=rclone_secret,env=PEPPY_R2_DATA01_SECRET_ACCESS_KEY \
+        --secret id=rclone_key,env=WALDO_R2_ACCESS_KEY_ID \
+        --secret id=rclone_secret,env=WALDO_R2_SECRET_ACCESS_KEY \
         --build-arg ISAAC_VERSION="${ISAAC_VERSION}" \
         -t "${ISAAC_IMAGE}" \
         -f "${IMAGES_DIR}/Dockerfile.isaac" \

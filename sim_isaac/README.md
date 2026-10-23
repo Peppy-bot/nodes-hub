@@ -493,7 +493,7 @@ Download the published object and verify its SHA-256 before setting
 `ISAAC_ASSETS_KEY` and `ISAAC_ASSETS_SHA256` in `isaac_assets.env`. Bump
 `ISAAC_IMAGE_REV` in `build_base_images.sh`, then use an authenticated Docker
 builder to publish the base image. The build reads the bundles from R2 with
-`PEPPY_R2_DATA01_ACCESS_KEY_ID` and `PEPPY_R2_DATA01_SECRET_ACCESS_KEY`:
+`WALDO_R2_ACCESS_KEY_ID` and `WALDO_R2_SECRET_ACCESS_KEY`:
 
 ```bash
 bash sim_base_images/build_base_images.sh --isaac-only

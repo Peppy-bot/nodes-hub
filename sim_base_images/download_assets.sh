@@ -3,7 +3,11 @@
 # mirror for MuJoCo, one pinned bundle per robot for Isaac Sim.
 # Usage: download_assets.sh --variant <isaac|mujoco> [--output-dir <path>]
 # Called by Dockerfile.isaac and Dockerfile.mujoco during base image builds.
-# To rebuild base images: PEPPY_R2_DATA01_ACCESS_KEY_ID=<key> PEPPY_R2_DATA01_SECRET_ACCESS_KEY=<secret> bash sim_base_images/build_base_images.sh
+# Each variant reads its own bucket with its own R2 token: Isaac reads
+# isaac-sim-assets with WALDO_R2_ACCESS_KEY_ID and WALDO_R2_SECRET_ACCESS_KEY,
+# MuJoCo reads peppy-data01 with PEPPY_R2_DATA01_ACCESS_KEY_ID and
+# PEPPY_R2_DATA01_SECRET_ACCESS_KEY.
+# To rebuild base images: bash sim_base_images/build_base_images.sh
 set -euo pipefail
 
 VARIANT=""
@@ -21,8 +25,13 @@ if [[ "$VARIANT" != "isaac" && "$VARIANT" != "mujoco" ]]; then
     exit 1
 fi
 
-KEY_ID="${PEPPY_R2_DATA01_ACCESS_KEY_ID:?PEPPY_R2_DATA01_ACCESS_KEY_ID must be set}"
-SECRET="${PEPPY_R2_DATA01_SECRET_ACCESS_KEY:?PEPPY_R2_DATA01_SECRET_ACCESS_KEY must be set}"
+if [[ "$VARIANT" == "isaac" ]]; then
+    KEY_ID="${WALDO_R2_ACCESS_KEY_ID:?WALDO_R2_ACCESS_KEY_ID must be set}"
+    SECRET="${WALDO_R2_SECRET_ACCESS_KEY:?WALDO_R2_SECRET_ACCESS_KEY must be set}"
+else
+    KEY_ID="${PEPPY_R2_DATA01_ACCESS_KEY_ID:?PEPPY_R2_DATA01_ACCESS_KEY_ID must be set}"
+    SECRET="${PEPPY_R2_DATA01_SECRET_ACCESS_KEY:?PEPPY_R2_DATA01_SECRET_ACCESS_KEY must be set}"
+fi
 ENDPOINT="https://b9abcee11c090aef5279f874ff078826.r2.cloudflarestorage.com"
 BUCKET="peppy-data01"
 
