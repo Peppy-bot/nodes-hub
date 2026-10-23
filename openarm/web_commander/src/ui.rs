@@ -940,7 +940,7 @@ mod tests {
     }
 
     fn ui_state() -> UiState {
-        UiState::new(true, 0.005, 0.02, 0.25, 6.0, 10.0)
+        UiState::new(true, 0.005, 0.02, 0.25, 6.0, 10.0, 1.0)
     }
 
     /// A state with health producers bound, as every wired deployment has.
