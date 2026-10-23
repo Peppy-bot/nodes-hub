@@ -867,14 +867,13 @@ async fn move_arm_joints_streams_a_trajectory_the_arm_follows_to_the_target() ->
     harness.shutdown().await
 }
 
-/// A joint move that the collision governor holds short fails its settle
-/// when the settle timeout runs out after the planned end, naming the held
-/// joint. Its result gives the joints that the arm measured then, not the
-/// goal. Here the band is wide, so the rest pose sits under d_stop. A left
-/// wrist sent toward the centerline never gets there.
+/// A joint move whose path the collision governor would stop is refused
+/// before it starts, naming the pair it would close, and the arm stays where
+/// it was. Here the band is wide, so the rest pose sits under d_stop and a
+/// left wrist sent toward the centerline closes the gap from its first
+/// configuration.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_joint_move_the_governor_holds_fails_its_settle_with_the_measured_pose()
--> peppygen::Result<()> {
+async fn a_joint_move_into_the_stop_band_is_refused_before_it_starts() -> peppygen::Result<()> {
     let mut wide = params();
     wide.d_stop_m = 0.8;
     wide.d_safe_m = 1.0;
@@ -895,36 +894,21 @@ async fn a_joint_move_the_governor_holds_fails_its_settle_with_the_measured_pose
     inward[2] = 1.5;
     inward[3] = 0.4;
     let data = left_arm_joint_move(&harness, inward, 1.0).await?;
+    assert!(!data.success, "{}", data.message);
     assert!(
-        !data.success,
-        "a held arm cannot have settled on its target"
-    );
-    assert!(
-        data.message.starts_with("still ")
-            && data.message.contains(" rad from the target at joint 3, "),
-        "the failure names the held joint: {}",
+        data.message
+            .starts_with("goal refused: the planned path would ")
+            && data.message.contains("openarm_left_")
+            && data.message.ends_with("inside the 800 mm stop band"),
+        "{}",
         data.message
     );
-    assert!(
-        seconds_after_planned_end(&data.message) >= SETTLE_TIMEOUT_S,
-        "the failure came no sooner than the settle timeout: {}",
-        data.message
-    );
-    assert!(
-        (data.final_joint_positions[2] - inward[2]).abs() > 0.5,
-        "the governor let the wrist reach its goal: {:?}",
-        data.final_joint_positions
-    );
+    assert_eq!(data.action_time, 0.0, "the move never played");
     let observed = *followed.borrow();
-    for (joint, (reported, observed)) in data
-        .final_joint_positions
-        .iter()
-        .zip(observed.iter())
-        .enumerate()
-    {
+    for (joint, (rest, observed)) in HOME.iter().zip(observed.iter()).enumerate() {
         assert!(
-            (reported - observed).abs() < 0.05,
-            "joint {joint}: the result gives {reported}, the arm stands at {observed}"
+            (rest - observed).abs() < 0.05,
+            "joint {joint}: the arm moved from {rest} to {observed}"
         );
     }
     harness.shutdown().await
