@@ -55,9 +55,10 @@ impl Failure {
     }
 }
 
-/// Gives each listed generated `FailureKind` the kind of the same name.
+/// Gives the generated `FailureKind` of `member` the kind of the same name,
+/// and `unreachable` the kind `$unreachable` of the member.
 macro_rules! member_failure_kinds {
-    ($($member:ty),+ $(,)?) => {$(
+    ($member:ty, unreachable => $unreachable:ident) => {
         impl From<FailureKind> for $member {
             fn from(kind: FailureKind) -> Self {
                 match kind {
@@ -66,27 +67,31 @@ macro_rules! member_failure_kinds {
                     FailureKind::ResourceUnavailable => Self::ResourceUnavailable,
                     FailureKind::AttemptFailed => Self::AttemptFailed,
                     FailureKind::Timeout => Self::Timeout,
-                    FailureKind::Unreachable => Self::Unreachable,
+                    FailureKind::Unreachable => Self::$unreachable,
                     FailureKind::LeaderStreaming => Self::LeaderStreaming,
                 }
             }
         }
-    )+};
+    };
 }
 
-member_failure_kinds!(
-    move_arm_joints::FailureKind,
-    move_arm::FailureKind,
-    move_gripper::FailureKind,
-    move_to_ready::FailureKind,
-    move_to_home::FailureKind,
-    check_arm_move::FailureKind,
-);
+// The Cartesian move and the postures list `unreachable`.
+member_failure_kinds!(move_arm::FailureKind, unreachable => Unreachable);
+member_failure_kinds!(move_to_ready::FailureKind, unreachable => Unreachable);
+member_failure_kinds!(move_to_home::FailureKind, unreachable => Unreachable);
+// The backbone plans no path for these members, so no plan failure reaches
+// them, and their contract lists no `unreachable` for them: a plan failure
+// that did would be an attempt that failed, and its message says why.
+member_failure_kinds!(move_arm_joints::FailureKind, unreachable => AttemptFailed);
+member_failure_kinds!(move_gripper::FailureKind, unreachable => AttemptFailed);
+member_failure_kinds!(check_arm_move::FailureKind, unreachable => AttemptFailed);
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Each member gets the kind of the same name, and a member whose
+    /// contract lists no `unreachable` gets `attempt_failed` for it.
     #[test]
     fn each_member_gets_the_kind_of_the_same_name() {
         let kinds = [
@@ -99,15 +104,23 @@ mod tests {
             (FailureKind::LeaderStreaming, "leader_streaming"),
         ];
         for (kind, name) in kinds {
-            let names = [
-                move_arm_joints::FailureKind::from(kind).as_str(),
+            let planning = [
                 move_arm::FailureKind::from(kind).as_str(),
-                move_gripper::FailureKind::from(kind).as_str(),
                 move_to_ready::FailureKind::from(kind).as_str(),
                 move_to_home::FailureKind::from(kind).as_str(),
+            ];
+            assert_eq!(planning, [name; 3], "{kind:?}");
+            let unplanned = if kind == FailureKind::Unreachable {
+                "attempt_failed"
+            } else {
+                name
+            };
+            let others = [
+                move_arm_joints::FailureKind::from(kind).as_str(),
+                move_gripper::FailureKind::from(kind).as_str(),
                 check_arm_move::FailureKind::from(kind).as_str(),
             ];
-            assert_eq!(names, [name; 6], "{kind:?}");
+            assert_eq!(others, [unplanned; 3], "{kind:?}");
         }
     }
 
