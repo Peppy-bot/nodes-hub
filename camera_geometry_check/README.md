@@ -27,8 +27,11 @@ most. The image centre would hide both.
 
 ## Check 1: the answers against the device's own numbers
 
-Each report prints the three answers as they came. Read them beside what the device
-says about itself:
+Each report prints the three answers as they came. An answer the camera cannot give
+is an error reply, printed with its failure kind and message, such as
+`precondition_failed` for a simulated camera that has not heard from its simulation
+yet. Without the depth intrinsics the report gives no point. Read the answers beside
+what the device says about itself:
 
 | Camera | The device's own numbers | What has to hold |
 |---|---|---|
@@ -37,7 +40,8 @@ says about itself:
 
 The `checks` line must read `true` four times: the colour size equals
 `video_stream_info`, the depth size equals the depth frame, the answer's `align_mode`
-equals the frame header's, and both depth answers name the same mode.
+equals the frame header's, and both depth answers name the same mode. A check reads
+`not answered` when an answer it needs is an error reply.
 
 ## Check 2: one point against a tape measure
 
