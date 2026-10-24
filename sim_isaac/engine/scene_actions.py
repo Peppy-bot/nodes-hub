@@ -2,8 +2,9 @@
 """Peppy scene_manipulation and object_state bridge for Isaac Sim.
 
 A goal this bridge cannot run is refused when it arrives, with a failure kind
-of peppy: `rejected` for a request that names something the stage does not
-hold or a value it does not take, and `precondition_failed` while the asset
+of peppy: `rejected` for a request that names an asset or an object the stage
+does not hold or a value it does not take, `resource_unavailable` for a robot
+that does not stand on the stage, and `precondition_failed` while the asset
 catalogue is not discovered yet. A goal it accepted runs its command on the
 Isaac main thread, which checks the request again against the stage as it is
 then: a command that cannot run fails its goal with the same kinds, and one
@@ -55,6 +56,7 @@ logger = logging.getLogger(__name__)
 # object_state declares them.
 REJECTED = "rejected"
 PRECONDITION_FAILED = "precondition_failed"
+RESOURCE_UNAVAILABLE = "resource_unavailable"
 ATTEMPT_FAILED = "attempt_failed"
 
 # The actions of scene_manipulation, by the name of the command each goal
@@ -1249,6 +1251,10 @@ class SceneActionIO:
         return {}
 
     def _robot_move_of(self, payload: dict) -> _RobotMove:
+        """A move of a robot the stage stands. A robot that does not stand on
+        the stage is refused with `resource_unavailable`, and a position or a
+        yaw that is not finite with `rejected`."""
+
         robot = payload["robot"]
         names = [
             each.instance
@@ -1256,10 +1262,11 @@ class SceneActionIO:
         ]
 
         if robot not in names:
-            raise _rejected(
+            raise SceneFailure(
+                RESOURCE_UNAVAILABLE,
                 f"no robot stands as {robot!r} in this "
                 f"simulation, which stands "
-                f"{', '.join(names) or 'none'}"
+                f"{', '.join(names) or 'none'}",
             )
 
         return _RobotMove(

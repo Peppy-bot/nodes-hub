@@ -123,23 +123,26 @@ info <node>:v1` per limb node) or the simulation's.
 **the node fails at start, saying the simulation refused it or did not stand it**
 The message gives the engine's failure kind and its reason. The engine
 refuses at once what it can know before it admits the robot: with `rejected`
-a model its catalogue does not carry or a name that breaks the engine's name
-rule, and with `precondition_failed` a name that another robot holds or no
-spot that it can promise the robot (a `placement` within reach of a robot
-that stands or that is on its way in, or no free spot left). The message
-then says "the simulation refused this robot". What fails after the
-admission fails the goal before the robot stands: the robot's files could
-not be fetched, its model could not be built into the world, the scene
-covers a named `placement` by then, or the engine took the robot out because
-it could not say that the robot stands. The message then says "the
-simulation did not stand this robot" with the engine's failure kind and
-reason. A robot that the simulation does not stand
-within the stand budget leaves the simulation, and the message says "the
-simulation did not stand this robot within 174.5 s". In each case the start
-of the copy fails: `peppy stack join` undoes the copy, and a launch that
-names the copy fails. Fix what the reason names (the robot's `model`, its
-name or its `placement`), or make room in the world, then `peppy stack join`
-the copy again.
+a model its catalogue does not carry or that it cannot stand, a name that
+breaks the engine's name rule, or a `placement` that it does not take; and
+with `precondition_failed` a name that another robot holds, a name whose
+robot still joins or leaves the scene, or no spot that it can promise the
+robot (a `placement` within reach of a robot that stands or that is on its
+way in, or no free spot left). The message then says "the simulation
+refused this robot". What fails after the admission fails the goal before
+the robot stands: with `attempt_failed` when the robot's files could not be
+fetched or its model could not be built into the world, with
+`precondition_failed` when the scene covers a named `placement` by then, and
+with `resource_unavailable` when the engine took the robot out because it
+could not say that the robot stands. The message then says "the simulation
+did not stand this robot" with the engine's failure kind and reason. A
+robot that the simulation does not stand within the stand budget leaves the
+simulation, and the message says "the simulation did not stand this robot
+within 174.5 s". In each case the start of the copy fails: `peppy stack
+join` undoes the copy, and a launch that names the copy fails. Fix what the
+reason names (the robot's `model`, its name or its `placement`), make room
+in the world, or wait until the robot that still joins or leaves under the
+name is in or out, then `peppy stack join` the copy again.
 
 **the node stops right after it starts, saying `model` names the robot's model**
 The launcher left `model` empty. Give it the id the simulation's catalogue

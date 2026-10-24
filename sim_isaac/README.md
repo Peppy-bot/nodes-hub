@@ -97,7 +97,8 @@ robot on the stage is held to its own model.
 An `attach` goal is refused with `rejected` for a model with no entry, a name
 the stage cannot stand a robot under or a placement that is not finite, and
 with `precondition_failed` for a name or a spot another robot holds, a second
-robot of the same caller, or another model for the robot the caller stands.
+robot of the same caller, the robot of the caller while it still joins, or
+another model for the robot the caller stands.
 A cancel of its caller takes the robot out and ends the goal cancelled. The
 sender grace of `attach` is the pair grace time: when the process that sent
 the goal is gone, the robot stays for that time, and then peppy cancels the
@@ -370,14 +371,15 @@ Isaac keeps no landmark, so a `spawn_object` or `move_object` goal that
 carries a `snap_to` is refused, naming the position to give instead, and
 nothing is spawned or moved.
 
-Each scene goal is checked as it arrives. A goal that names an asset, an
-object or a robot the stage does not hold, or a value it does not take, is
-refused with `rejected`, and a goal that arrives before the asset catalogue
-is discovered is refused with `precondition_failed`. The Isaac main thread
-checks the goal again when its command runs, since a command queued before
-it can remove its object: a check that fails there fails the goal with the
-same kind, and a command that Isaac does not carry out fails it with
-`attempt_failed`.
+Each scene goal is checked as it arrives. A goal that names an asset or an
+object the stage does not hold, or a value it does not take, is refused with
+`rejected`. A `move_robot` goal for a robot that does not stand on the stage
+is refused with `resource_unavailable`, and a goal that arrives before the
+asset catalogue is discovered is refused with `precondition_failed`. The
+Isaac main thread checks the goal again when its command runs, since a
+command queued before it can remove its object, and its robot can leave the
+stage meanwhile: a check that fails there fails the goal with the same kind,
+and a command that Isaac does not carry out fails it with `attempt_failed`.
 
 ### Progress of a load or a spawn
 

@@ -268,9 +268,9 @@ class RobotsIO:
         A request this engine never takes (a name it cannot stand a robot
         under, a model it has no entry for, a placement that is not finite)
         is refused with `rejected`. A request the stage cannot take now (a
-        name or a spot another robot holds, a second robot of the caller,
-        another model for the robot the caller stands) is refused with
-        `precondition_failed`."""
+        name or a spot another robot holds, a second robot of the caller, the
+        robot of the caller while it still joins, another model for the robot
+        the caller stands) is refused with `precondition_failed`."""
         caller = Caller(core_node=request.core_node, instance_id=request.instance_id)
         self._admitted = None
         try:

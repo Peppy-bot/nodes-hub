@@ -384,6 +384,17 @@ def test_a_second_robot_of_the_same_caller_is_refused():
     )
 
 
+def test_a_copy_re_registering_a_robot_that_still_joins_is_refused():
+    """The robot the copy attached has not stood yet: a second goal for it
+    is a request the stage cannot take now, and the first goal goes on."""
+    io = _robots_io(_stage())
+    assert _accepted(io._admit(_request()))
+
+    decision = io._admit(_request())
+
+    assert "already joining 'alpha'" in _refused(decision, FailureKind.PRECONDITION_FAILED)
+
+
 def test_a_copy_re_registering_as_another_model_is_refused():
     """A robot is the model it attached as, so the registry answers for the
     name and the goal is told."""

@@ -221,6 +221,15 @@ def test_a_copy_re_registering_its_own_robot_is_admitted():
     assert io._handover("alpha").is_set() is False, "the new goal's own signal is fresh"
 
 
+def test_a_re_registration_of_a_robot_that_still_joins_is_refused():
+    """The robot the caller attached has not stood yet: a second goal for it
+    is a request the scene cannot take now, and the first goal goes on."""
+    io = _robots_io()
+    assert _accepted(io._admit(_request()))
+    decision = io._admit(_request())
+    assert "already joining 'alpha'" in _refused(decision, FailureKind.PRECONDITION_FAILED)
+
+
 def test_a_re_registration_naming_another_model_is_refused():
     io = _robots_io()
     assert _accepted(io._admit(_request()))

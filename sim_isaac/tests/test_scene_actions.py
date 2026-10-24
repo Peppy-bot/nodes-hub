@@ -439,7 +439,7 @@ def test_a_robot_the_stage_does_not_stand_is_refused_before_the_stage(provider):
         lambda: provider.io._execute(
             provider.launcher, "move_robot", {"robot": "ghost", "position": [1.0, 0.0, 0.0], "yaw": 0.0}
         ),
-        "rejected",
+        "resource_unavailable",
     )
 
     assert "no robot stands as 'ghost'" in refused
@@ -1018,7 +1018,7 @@ def _refusal(decision):
     ("apply_force", SimpleNamespace(object_id="obj_missing", force=[1.0, 0.0, 0.0], duration_s=0.5),
      ("rejected", "Unknown object_id: obj_missing")),
     ("move_robot", SimpleNamespace(robot="ghost", position=[0.0, 0.0, 0.0], yaw=0.0),
-     ("rejected", "no robot stands as 'ghost' in this simulation, which stands alpha")),
+     ("resource_unavailable", "no robot stands as 'ghost' in this simulation, which stands alpha")),
 ])
 def test_a_goal_whose_command_the_stage_cannot_take_is_refused_when_it_arrives(
     provider, action, request_data, refusal
@@ -1074,6 +1074,29 @@ def test_a_goal_whose_object_is_gone_by_the_time_its_command_runs_fails_with_the
 
     assert events == [("failed", "rejected", f"Unknown object_id: {object_id}")]
     provider.launcher._runtime_apply_force.assert_not_called()
+
+
+def test_a_move_of_a_robot_that_left_before_its_command_ran_fails_with_resource_unavailable(provider):
+    """A move is admitted while its robot stands, and the robot leaves the
+    stage before the move's command reaches the main thread: the check there
+    finds no robot, and the goal fails with the kind of its refusal."""
+    events = []
+    move = _Goal(SimpleNamespace(robot="alpha", position=[1.0, 0.0, 0.0], yaw=0.0), events)
+    assert provider.io._decide(provider.module.move_robot, "move_robot", move.request()).refusal is None
+    provider.io._world = _world()
+
+    async def run_the_move():
+        moving = asyncio.create_task(provider.io._run_goal("move_robot", move))
+        while not moving.done():
+            provider.io.process_pending(provider.launcher)
+            await asyncio.sleep(0)
+
+    asyncio.run(asyncio.wait_for(run_the_move(), _LIVENESS_S))
+
+    assert events == [
+        ("failed", "resource_unavailable", "no robot stands as 'alpha' in this simulation, which stands none")
+    ]
+    provider.launcher._runtime_move_robot_root.assert_not_called()
 
 
 def test_a_command_isaac_does_not_carry_out_fails_its_goal_with_attempt_failed(provider):
