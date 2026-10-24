@@ -7,8 +7,8 @@
 // governed on the way down. brain_core enforces every contract rule; what
 // it cannot know, finding an item in an image and moving an arm to it, is
 // the model of each role, which the parameters below name. Perception
-// defaults to "sam3_siglip" and manipulation to "none". A role on "none"
-// refuses its goals, naming the missing model.
+// defaults to "sam3_siglip" and manipulation to "scripted". A role on
+// "none" refuses its goals, naming the missing model.
 {
   peppy_schema: "node/v1",
   manifest: {
@@ -22,6 +22,12 @@
     depends_on: {
       contracts: [
         { name: "limb_motion", tag: "v1", link_id: "limb_motion" },
+        // The robot's measured limbs, from the backbone that governs them:
+        // a grab reads the gripper's opening after the lift from it, to
+        // judge whether the item stayed in the jaws, and get_state reports
+        // each gripper's opening from it. Required: a grab judged from the
+        // gripper's opening alone cannot tell a hold from a slip.
+        { name: "limb_state", tag: "v1", link_id: "limb_state" },
         // The camera the brain looks through: colour and depth from one
         // rgbd producer, so a detection's pixel becomes a world position
         // through the depth at that pixel and the camera model below.
@@ -64,6 +70,7 @@
       consumes: [
         { link_id: "camera", name: "video_stream" },
         { link_id: "camera", name: "depth_stream" },
+        { link_id: "limb_state", name: "limb_states" },
       ],
     },
     services: {
@@ -73,6 +80,7 @@
         { link_id: "brain_model", name: "list_models" },
       ],
       consumes: [
+        { link_id: "limb_motion", name: "check_arm_move" },
         { link_id: "camera", name: "depth_stream_info" },
         { link_id: "geometry", name: "get_color_intrinsics" },
         { link_id: "geometry", name: "get_depth_intrinsics" },
@@ -103,9 +111,12 @@
       // refused with "no perception source", which is what the contract
       // asks for when the brain cannot see.
       perception_model: { $type: "string", $default: "sam3_siglip" },
-      // The manipulation model. "none" moves nothing: every sequence is
-      // refused naming the missing model, while abort and get_state work.
-      manipulation_model: { $type: "string", $default: "none" },
+      // The manipulation model, for the node's whole life. "scripted", the
+      // default, grabs from above at the item's seen point and needs no
+      // model: brain_core's ScriptedManipulator. "none" moves nothing:
+      // every sequence is refused naming the missing model, while abort
+      // and get_state work.
+      manipulation_model: { $type: "string", $default: "scripted" },
       // An enrolment gallery for "sam3_siglip": the name of an enrolment the
       // node ships, whose items then take their own names before the
       // vocabulary's when the picture and the words agree.

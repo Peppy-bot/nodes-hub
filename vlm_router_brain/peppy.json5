@@ -26,6 +26,12 @@
     depends_on: {
       contracts: [
         { name: "limb_motion", tag: "v1", link_id: "limb_motion" },
+        // The robot's measured limbs, from the backbone that governs them:
+        // a grab reads the gripper's opening after the lift from it, to
+        // judge whether the item stayed in the jaws. Required: a grab
+        // judged from the gripper's opening alone cannot tell a hold from
+        // a slip.
+        { name: "limb_state", tag: "v1", link_id: "limb_state" },
         // The camera the brain looks through: colour and depth from one
         // rgbd producer, so a detection's pixel becomes a world position
         // through the depth at that pixel and the camera model below.
@@ -68,6 +74,7 @@
       consumes: [
         { link_id: "camera", name: "video_stream" },
         { link_id: "camera", name: "depth_stream" },
+        { link_id: "limb_state", name: "limb_states" },
       ],
     },
     services: {
@@ -77,6 +84,7 @@
         { link_id: "brain_model", name: "list_models" },
       ],
       consumes: [
+        { link_id: "limb_motion", name: "check_arm_move" },
         { link_id: "camera", name: "depth_stream_info" },
         { link_id: "geometry", name: "get_color_intrinsics" },
         { link_id: "geometry", name: "get_depth_intrinsics" },
@@ -103,11 +111,11 @@
       // on Google's API, the model the perception study measured, which
       // needs GEMINI_API_KEY. switch_model changes it while the brain runs.
       perception_model: { $type: "string", $default: "gemini-robotics-er-2-preview" },
-      // The model manipulation starts on. The catalog has no model that
-      // serves manipulation, so "none" is the one this node accepts: every
-      // sequence is refused naming the missing model, while abort and
-      // get_state work.
-      manipulation_model: { $type: "string", $default: "none" },
+      // The model manipulation starts on: "scripted", the default, grabs
+      // from above at the item's seen point and needs no model call; "none"
+      // refuses every sequence naming the missing model, while abort and
+      // get_state work. No catalog model serves manipulation.
+      manipulation_model: { $type: "string", $default: "scripted" },
       // The name the camera the brain looks through runs under on the
       // robot, as the robot's camera_mounts lists it: the brain reads the
       // pose of that camera, in the robot frame, from the `camera_mounts`
