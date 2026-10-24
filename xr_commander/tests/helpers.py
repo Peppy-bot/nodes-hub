@@ -220,14 +220,19 @@ async def tap_x(session, *, settle=0.05):
     session.press(x=True)
 
 
+# The reason of a goal that its caller cancelled.
+CANCELLED_BY_CALLER = "cancelled by its caller"
+
+
 async def stop_and_save(session, active, cancelled_result, *, settle=0.05):
-    """The second X press of an episode: stop-and-save, not a fresh goal —
-    cancels the active goal and completes it with the recorder's verdict."""
+    """The second X press of an episode: stop-and-save, not a fresh goal. It
+    cancels the active goal, and the recorder ends the goal cancelled, for
+    the reason of the caller's cancel, with its result."""
     session.press(x=False)
     await asyncio.sleep(settle)
     session.press(x=True)
     await asyncio.wait_for(active.cancel_signal(), 10.0)
-    await active.complete_cancelled(cancelled_result)
+    await active.complete_cancelled(CANCELLED_BY_CALLER, cancelled_result)
 
 
 class RecordingSink:

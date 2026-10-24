@@ -3,8 +3,8 @@
 X toggles: a press starts an episode, the next press stops and saves it (a
 cancelled record_episode goal is the recorder's operator-stop). Holding Y
 finishes the session: the recorder finalizes and mirrors the dataset and opens
-a fresh one in place. The recorder owns every refusal; this side only relays
-them to the log and the status panel.
+a fresh one in place. The recorder owns every refusal and every error reply;
+this side only relays them to the log and the status panel.
 """
 
 from __future__ import annotations
@@ -208,7 +208,7 @@ async def _start_episode(
     if handle is None:
         return None
     if not handle.accepted:
-        status.set_note(f"record refused: {cause(handle.reason)}")
+        status.set_note(f"record refused: {cause(handle.refusal.message)}")
         return None
     log(f"recording: {task!r}")
     watcher = asyncio.create_task(_watch_episode(handle, status, timing))
@@ -235,23 +235,24 @@ async def _stop_episode(
 async def _finish_session(
     node_runner, finish_module, target, status: RecorderStatus, timing: Timing
 ) -> None:
-    """Roll the session over; the recorder owns every refusal (it refuses
-    mid-episode) and the answer is relayed either way."""
+    """Roll the session over; the recorder owns every error reply (it refuses
+    mid-episode) and the answer is relayed either way: an error reply that
+    the finish failed as a failure, any other as a refusal."""
     try:
         response = await finish_module.poll(
             node_runner, target, timing.finish_timeout_s
         )
+    except finish_module.Failure as failure:
+        log(f"finish_session error reply: {failure}")
+        failed = failure.kind is finish_module.FailureKind.ATTEMPT_FAILED
+        status.set_note("finish failed" if failed else "finish refused")
+        return
     except Exception as e:
         log(f"finish_session failed: {e!r}")
         status.set_note("finish failed")
         return
-    data = response.data
-    if data.error:
-        log(f"finish_session refused: {data.error}")
-        status.set_note("finish refused")
-    else:
-        log(f"session finished: {data.session}")
-        status.set_note("session finished")
+    log(f"session finished: {response.data.session}")
+    status.set_note("session finished")
 
 
 async def _watch_episode(
@@ -276,15 +277,21 @@ async def _watch_episode(
         except Exception as e:
             log(f"record_episode result: {e!r}")
             return
+        # A saved episode ends its goal cancelled, with its result, for the
+        # reason of the operator's stop or of the recorder's own; an episode
+        # the recorder could not save fails its goal.
         data = result.data
-        if data is None:
+        if result.failure is not None:
+            log(f"episode discarded: {result.failure}")
+            status.set_note("episode discarded")
+        elif data is None:
             log(f"record_episode {result.status.name.lower()}")
             status.set_note(f"episode {result.status.name.lower()}")
         elif data.discarded:
-            log(f"episode discarded: {data.error or 'recorder gave no reason'}")
+            log(f"episode discarded: {result.cancel_reason}")
             status.set_note("episode discarded")
         else:
-            ended = f": {data.error}" if data.error else ""
+            ended = f": {result.cancel_reason}" if result.cancel_reason else ""
             log(
                 f"episode {data.episode_index} saved, "
                 f"{data.frames_recorded} frames{ended}"

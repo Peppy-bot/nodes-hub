@@ -10,7 +10,6 @@ from tests.helpers import FakeToken, boot, eventually
 from xr_commander.devices import XrFrame
 from xr_commander.sensor_hold import (
     HOLDER,
-    Answer,
     ChosenRobotHold,
     SensorStreams,
     Timing,
@@ -18,9 +17,12 @@ from xr_commander.sensor_hold import (
     follow_chosen_robot,
 )
 
-HELD = Answer(success=True, message="held", hold_ms=9000)
-RELEASED = Answer(success=True, message="released", hold_ms=9000)
-REFUSED = Answer(success=False, message="no robot named alpha stands", hold_ms=0)
+# The hold length (ms) the simulation answers a hold with.
+HELD = 9000
+# The error reply of a hold of a robot that does not stand.
+REFUSED = sensor_streams_hold.Failure(
+    sensor_streams_hold.FailureKind.RESOURCE_UNAVAILABLE, "no robot named alpha stands"
+)
 
 
 class FakeClock:
@@ -36,7 +38,8 @@ class FakeClock:
 class FakeStreams:
     """The simulation's hold and release services as a pure test scripts
     them: every call recorded, each answered by the next scripted answer of
-    its kind (an exception is raised), else by success."""
+    its kind (an exception, an error reply among them, is raised), else by
+    success."""
 
     def __init__(self, holds=(), releases=()):
         self.calls = []
@@ -49,7 +52,7 @@ class FakeStreams:
 
     async def release(self, robot):
         self.calls.append(("release", robot))
-        return self._next(self._releases, RELEASED)
+        return self._next(self._releases, None)
 
     @staticmethod
     def _next(scripted, default):
@@ -105,7 +108,7 @@ async def test_the_hold_is_renewed_a_third_of_the_way_through_its_hold_length():
 
 @pytest.mark.asyncio
 async def test_a_short_hold_is_renewed_no_faster_than_the_choice_is_read():
-    streams = FakeStreams(holds=[Answer(success=True, message="held", hold_ms=0)])
+    streams = FakeStreams(holds=[0])
     clock = FakeClock()
     # Steps that are exact in binary, so the sum lands on the period.
     timing = Timing(follow_period_s=0.25)
@@ -146,7 +149,7 @@ async def test_no_robot_from_the_start_calls_nothing():
 
 
 @pytest.mark.asyncio
-async def test_a_refused_hold_is_logged_once_and_tried_again_after_the_retry_wait(
+async def test_a_hold_error_reply_is_logged_once_and_tried_again_after_the_retry_wait(
     capsys,
 ):
     streams = FakeStreams(holds=[REFUSED, REFUSED])
@@ -162,7 +165,12 @@ async def test_a_refused_hold_is_logged_once_and_tried_again_after_the_retry_wai
     await hold.follow("alpha")
     assert streams.calls == [("hold", "alpha")] * 2
     log = capsys.readouterr().out
-    assert log.count("sensor hold of alpha refused: no robot named alpha stands") == 1
+    assert (
+        log.count(
+            "sensor hold of alpha refused: resource_unavailable: no robot named alpha stands"
+        )
+        == 1
+    )
 
     # The third try is accepted, and the log says that the robot is held.
     clock.now += 1.0
@@ -199,6 +207,27 @@ async def test_a_refused_robot_is_still_released_when_the_choice_changes():
     await hold.follow("bravo")
 
     assert streams.calls == [("hold", "alpha"), ("release", "alpha"), ("hold", "bravo")]
+
+
+@pytest.mark.asyncio
+async def test_a_release_error_reply_is_logged_and_the_hold_lapses(capsys):
+    streams = FakeStreams(
+        releases=[
+            sensor_streams_release.Failure(
+                sensor_streams_release.FailureKind.REJECTED, "holder is empty"
+            )
+        ]
+    )
+    hold = holding(streams)
+
+    await hold.follow("alpha")
+    await hold.follow("bravo")
+
+    assert streams.calls == [("hold", "alpha"), ("release", "alpha"), ("hold", "bravo")]
+    assert (
+        "sensor release of alpha refused: rejected: holder is empty; the hold lapses"
+        in capsys.readouterr().out
+    )
 
 
 @pytest.mark.asyncio
@@ -314,11 +343,9 @@ async def test_the_loop_follows_the_choice_until_the_token_cancels():
         await asyncio.wait_for(task, 5.0)
 
 
-def sensor_state(module, success=True, message="held", hold_ms=9000):
+def sensor_state(module, hold_ms=9000):
     """A hold or release answer with no sensor listed."""
     return module.ResponseData(
-        success=success,
-        message=message,
         hold_ms=hold_ms,
         sensors=[],
         rgb_cameras=[],
@@ -356,23 +383,29 @@ async def test_the_hold_and_its_release_reach_the_simulation_over_the_wire():
 
 
 @pytest.mark.asyncio
-async def test_a_refusal_over_the_wire_is_tried_again():
+async def test_an_error_reply_over_the_wire_is_tried_again(capsys):
     async with boot() as h:
         mock = h.mocks.deps.sensor_streams
-        mock.hold.enqueue_response(
-            sensor_state(
-                sensor_streams_hold, success=False, message="no robot", hold_ms=0
-            )
-        )
-        mock.hold.enqueue_response(sensor_state(sensor_streams_hold))
         clock = FakeClock()
         hold = holding(wired_streams(h), clock, Timing(retry_s=1.0))
 
-        await hold.follow("alpha")
+        following = asyncio.create_task(hold.follow("alpha"))
+        _request, responder = await mock.hold.next_request(10.0)
+        await responder.respond_failure(
+            sensor_streams_hold.FailureKind.RESOURCE_UNAVAILABLE, "no robot named alpha stands"
+        )
+        await asyncio.wait_for(following, 10.0)
+        assert (
+            "sensor hold of alpha refused: resource_unavailable: no robot named alpha stands"
+            in capsys.readouterr().out
+        )
+
+        mock.hold.enqueue_response(sensor_state(sensor_streams_hold))
         clock.now += 1.0
         await hold.follow("alpha")
 
         assert [request.robot for request in mock.hold.captured()] == ["alpha"] * 2
+        assert "holding the sensors of alpha" in capsys.readouterr().out
 
 
 @pytest.mark.asyncio

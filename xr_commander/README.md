@@ -162,7 +162,7 @@ to the first robot paired, which would keep that robot's cameras live for
 nobody. The headset renews the hold a third of the way through each hold
 length (`hold_ms`) that the simulation answers with. When another robot is
 chosen, no robot is paired or the session ends, it releases its hold on the robot it held
-before, and it releases its hold when the node stops. A refused or failed hold is logged once and
+before, and it releases its hold when the node stops. A hold that gets an error reply, or whose call fails, is logged once and
 tried again a second later; until then the cameras stream at 1 Hz. The
 launcher binds the simulation to the `sensor_streams` slot. On a physical
 stack the slot is vacant, and the headset holds nothing.

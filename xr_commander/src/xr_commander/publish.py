@@ -15,7 +15,6 @@ import time
 from collections.abc import Callable
 
 import peppygen.clock
-from peppygen import QoSProfile
 
 from xr_commander.bus import (
     GOAL_CANCEL_TIMEOUT_S,
@@ -334,10 +333,10 @@ async def stream_gripper(
     )
 
 
-def cause(reason: str | None) -> str:
-    """The clause of a refusal that names the cause, ahead of the remedy a
-    backbone appends after a semicolon."""
-    return (reason or "refused").split(";", 1)[0]
+def cause(message: str) -> str:
+    """The clause of the message of a refusal or a failure that names the
+    cause, ahead of the remedy a backbone appends after a semicolon."""
+    return (message or "no reason given").split(";", 1)[0]
 
 
 class PostureStatus:
@@ -469,7 +468,7 @@ async def run_posture_button(
                 if fired is None:
                     status.set_note(f"move to {label}: send failed (see log)")
                 elif not fired.accepted:
-                    status.set_note(f"move to {label} refused: {cause(fired.reason)}")
+                    status.set_note(f"move to {label} refused: {cause(fired.refusal.message)}")
                 else:
                     handle = fired
                     status.moving = label
@@ -490,13 +489,13 @@ async def fire_goal(node_runner, action_module, target, name: str, **request_fie
     try:
         request = action_module.GoalRequest(**request_fields)
         fired = await action_module.ActionHandle.fire_goal(
-            node_runner, target, request, GOAL_SEND_TIMEOUT_S, QoSProfile.Standard
+            node_runner, target, request, GOAL_SEND_TIMEOUT_S
         )
     except Exception as e:
         log(f"{name} failed to send: {e!r}")
         return None
     if not fired.accepted:
-        log(f"{name} rejected: {fired.reason}")
+        log(f"{name} refused: {fired.refusal}")
     return fired
 
 
@@ -516,16 +515,15 @@ async def _watch_result(
         return
     finally:
         status.end_move(label)
-    data = result.data
-    if result.status.name == "CANCELLED":
-        note = f"move to {label} cancelled"
-    elif data is None:
-        # Abandoned or expired: the server dropped the goal or its result.
-        note = f"move to {label} {result.status.name.lower()}"
-    elif data.success:
-        note = f"move to {label} completed"
-    else:
-        reason = cause(data.message) if data.message else "no reason given"
-        note = f"move to {label} failed: {reason}"
-    log(note)
+    note = _outcome_note(label, result)
+    log(note if result.cancel_reason is None else f"{note}: {result.cancel_reason}")
     status.set_note(note)
+
+
+def _outcome_note(label: str, result) -> str:
+    """What the row says of how the move to `label` ended: completed, failed
+    with the cause of its failure, or cancelled, abandoned or expired."""
+    status = result.status.name
+    if status == "FAILED":
+        return f"move to {label} failed: {cause(result.failure.message)}"
+    return f"move to {label} {status.lower()}"
