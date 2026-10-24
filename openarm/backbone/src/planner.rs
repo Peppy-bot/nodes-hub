@@ -36,6 +36,7 @@ use srs_model::{
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
+use crate::failure::{Failure, FailureKind};
 use crate::settle::{Settle, Verdict, joint_shortfall, pose_shortfall, verdict};
 use crate::types::{ARM_DOF, ArmMoveRequest, JointVec, PoseTolerance, Side, world_pose_arrays};
 use crate::upstream::Upstream;
@@ -48,6 +49,14 @@ const VELOCITY_GUARD_MARGIN: f64 = 1.5;
 /// The refusal of a goal, or a plan check, that reaches an arm executing a
 /// move: the one message for both, whichever gate answers it.
 pub const ARM_BUSY: &str = "arm is already executing a motion";
+
+/// The failure of a goal that reaches the planner while another move is in
+/// flight on its arm.
+const ANOTHER_MOVE_IN_FLIGHT: &str = "another move is in flight";
+
+/// The reason a posture share ends with when its posture goal is cancelled.
+/// The posture action ends its goal with the reason of its own cancel.
+const POSTURE_CANCELLED: &str = "its posture goal was cancelled";
 
 /// Per-arm static configuration for the planner (the motion limits relocated
 /// from the arm). Cloned per side.
@@ -75,23 +84,38 @@ pub enum Unmeasured {
 /// The joints an arm measured, or why it has no fresh measurement of them.
 pub type Measurement = Result<JointVec, Unmeasured>;
 
-/// The note a move_arm or move_arm_joints result adds to its message when it
-/// reports the joints commanded last, because the follower stopped reporting.
+/// The note a cancelled move_arm or move_arm_joints goal adds to its reason
+/// when its result reports the joints commanded last, because the arm has
+/// no fresh measurement.
 const COMMANDED_JOINTS_NOTE: &str = "the result comes from the joints commanded last";
 
-/// How one arm's share of a posture move ended, reported to the posture
-/// action that sent it.
-pub struct ReadyOutcome {
-    pub success: bool,
-    pub message: String,
-    /// The move was ended by the stop service, whoever started it.
-    pub stopped: bool,
+/// How a move ended. A posture share reports it to the posture action that
+/// sent it, the failure labelled with the side of its arm.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Outcome {
+    /// The move ran to its end, and an arm move with a settle settled.
+    Complete,
+    /// The move was cancelled, for this reason: by its caller, or by the
+    /// stop service, whose reason names the stop.
+    Cancelled(String),
+    /// The move failed, and its goal gives no result.
+    Failed(Failure),
+}
+
+/// What `check_arm_move` answers for an arm that can take the move.
+#[derive(Debug, PartialEq)]
+pub enum PlanCheck {
+    /// A plan reaches the pose; the move would take this long.
+    Reachable(Duration),
+    /// No plan reaches the pose, in the words of the `unreachable` failure of
+    /// a move_arm goal.
+    Unreachable(String),
 }
 
 /// One arm's share of a whole-robot ready move: where its terminal reports,
 /// and the cancel flag the admission task flips on the action's cancel.
 pub struct ReadyReply {
-    pub done_tx: mpsc::Sender<ReadyOutcome>,
+    pub done_tx: mpsc::Sender<Outcome>,
     pub cancelled: Arc<AtomicBool>,
 }
 
@@ -109,18 +133,26 @@ pub enum JointReply {
 }
 
 impl JointReply {
-    fn is_cancelled(&self) -> bool {
+    /// The reason of the cancel the move received, or `None` before one: the
+    /// cause of the move_arm_joints goal's cancel signal, or the cancel of
+    /// the posture goal, which its action flags.
+    fn cancel_reason(&self) -> Option<String> {
         match self {
-            Self::MoveArmJoints { ctx, .. } => ctx.is_cancelled(),
-            Self::Ready(r) => r.cancelled.load(Ordering::Acquire),
+            Self::MoveArmJoints { ctx, .. } => {
+                ctx.cancel_cause().map(|cause| cause.reason().to_string())
+            }
+            Self::Ready(r) => r
+                .cancelled
+                .load(Ordering::Acquire)
+                .then(|| POSTURE_CANCELLED.to_string()),
         }
     }
 
     /// How a joint move whose trajectory has run to its planned end ends at
     /// `now`, with the arm measuring `measured` against `target`: a posture
     /// share completes there; a move_arm_joints goal completes once every
-    /// joint stands within its settle tolerance, fails once its settle timeout
-    /// has passed, and stays in flight in between.
+    /// joint stands within its settle tolerance, fails with `timeout` once
+    /// its settle timeout has passed, and stays in flight in between.
     fn settle_outcome(
         &self,
         measured: &JointVec,
@@ -140,47 +172,62 @@ impl JointReply {
         }
     }
 
-    /// Report the terminal of `planner`'s arm with `measured`, the joints
-    /// the arm measured when the move ended. The joint action keeps its
-    /// distinct cancelled completion, which a stop ends it with too, and
-    /// reports what [`Planner::reported_joints`] gives. The ready share
-    /// folds `Cancelled` into a failed outcome and carries a stop as one.
-    /// It reports no joints: the posture action measures both arms when its
-    /// goal completes.
+    /// End the move of `planner`'s arm on `outcome`, with `measured`, the
+    /// joints the arm measured when the move ended. A move_arm_joints goal
+    /// completes or ends cancelled with what [`Planner::reported_joints`]
+    /// gives, and fails with no result. A posture share reports its outcome
+    /// and no joints: the posture action measures both arms when its goal
+    /// ends.
     async fn finish(
         self,
-        planner: &mut Planner,
+        planner: &Planner,
         outcome: Outcome,
         measured: Measurement,
         elapsed_s: f64,
     ) {
         let side = planner.side;
-        let cancelled = outcome.is_cancelled();
-        let stopped = matches!(outcome, Outcome::Stopped(_));
-        let (success, message) = outcome.report(|| "trajectory complete".to_string());
+        let ctx = match self {
+            Self::MoveArmJoints { ctx, .. } => ctx,
+            Self::Ready(r) => return r.report(side, outcome).await,
+        };
+        let joints = planner.reported_joints(&measured);
+        let ended = match outcome {
+            Outcome::Complete => ctx.complete(joints, elapsed_s).await,
+            Outcome::Cancelled(reason) => {
+                ctx.complete_cancelled(cancelled_reason(reason, &measured), joints, elapsed_s)
+                    .await
+            }
+            Outcome::Failed(failure) => ctx.fail(failure.kind.into(), failure.message).await,
+        };
+        if let Err(e) = ended {
+            error!("{}: move_arm_joints end: {e}", side.label());
+        }
+    }
+
+    /// Fail the move of the arm on `side` with `failure`, which reports no
+    /// joints.
+    async fn fail(self, side: Side, failure: Failure) {
         match self {
             Self::MoveArmJoints { ctx, .. } => {
-                let (reported_q, message) = planner.reported_joints(measured, message);
-                let result = if cancelled {
-                    ctx.complete_cancelled(success, message, reported_q, elapsed_s)
-                        .await
-                } else {
-                    ctx.complete(success, message, reported_q, elapsed_s).await
-                };
-                if let Err(e) = result {
-                    error!("{}: move_arm_joints complete: {e}", side.label());
+                if let Err(e) = ctx.fail(failure.kind.into(), failure.message).await {
+                    error!("{}: move_arm_joints end: {e}", side.label());
                 }
             }
-            Self::Ready(r) => {
-                let outcome = ReadyOutcome {
-                    success,
-                    message: format!("{}: {message}", side.label()),
-                    stopped,
-                };
-                if r.done_tx.send(outcome).await.is_err() {
-                    error!("{}: ready outcome aggregation closed", side.label());
-                }
-            }
+            Self::Ready(r) => r.report(side, Outcome::Failed(failure)).await,
+        }
+    }
+}
+
+impl ReadyReply {
+    /// Report how the share of the arm on `side` ended, its failure labelled
+    /// with the side.
+    async fn report(self, side: Side, outcome: Outcome) {
+        let outcome = match outcome {
+            Outcome::Failed(failure) => Outcome::Failed(failure.labelled(side.label())),
+            other => other,
+        };
+        if self.done_tx.send(outcome).await.is_err() {
+            error!("{}: ready outcome aggregation closed", side.label());
         }
     }
 }
@@ -203,7 +250,7 @@ impl Goal {
     /// A posture share to `target` over one second, reporting on `done_tx`:
     /// the goal of the unit tests of the planner and the coordinator.
     #[cfg(test)]
-    pub fn posture_share(target: JointVec, done_tx: mpsc::Sender<ReadyOutcome>) -> Self {
+    pub fn posture_share(target: JointVec, done_tx: mpsc::Sender<Outcome>) -> Self {
         Goal::Joint {
             target,
             duration: Duration::from_secs(1),
@@ -214,35 +261,24 @@ impl Goal {
         }
     }
 
-    /// Complete unstarted, `success: false`, reporting `measured` (the
-    /// measured joints, per the result contract). The busy flag is the
+    /// Fail unstarted with `failure`, with no result. The busy flag is the
     /// caller's concern.
-    pub async fn refuse(self, reason: &str, measured: Measurement, planner: &mut Planner) {
-        self.end_unstarted(Outcome::Failed(reason.to_string()), measured, planner)
-            .await;
-    }
-
-    /// Complete unstarted as cancelled by the stop service, with the stop's
-    /// `message`, reporting `measured`. The busy flag is the caller's
-    /// concern.
-    pub async fn stop(self, message: &str, measured: Measurement, planner: &mut Planner) {
-        self.end_unstarted(Outcome::Stopped(message.to_string()), measured, planner)
-            .await;
-    }
-
-    async fn end_unstarted(self, outcome: Outcome, measured: Measurement, planner: &mut Planner) {
+    pub async fn fail(self, failure: Failure, planner: &Planner) {
         match self {
-            Goal::Joint { reply, .. } => {
-                reply.finish(planner, outcome, measured, 0.0).await;
-            }
+            Goal::Joint { reply, .. } => reply.fail(planner.side, failure).await,
+            Goal::Cartesian { ctx, .. } => planner.fail_cartesian(&ctx, failure).await,
+        }
+    }
+
+    /// End unstarted as cancelled by the stop service, for `reason`, which
+    /// names the stop, reporting `measured`. The busy flag is the caller's
+    /// concern.
+    pub async fn stop(self, reason: &str, measured: Measurement, planner: &Planner) {
+        let outcome = Outcome::Cancelled(reason.to_string());
+        match self {
+            Goal::Joint { reply, .. } => reply.finish(planner, outcome, measured, 0.0).await,
             Goal::Cartesian { ctx, .. } => {
-                let cancelled = outcome.is_cancelled();
-                let (success, message) =
-                    outcome.report(|| unreachable!("an unstarted goal never completes"));
-                let (reported_q, message) = planner.reported_joints(measured, message);
-                planner
-                    .finish_cartesian(&ctx, reported_q, success, &message, 0.0, cancelled)
-                    .await;
+                planner.finish_cartesian(&ctx, outcome, measured, 0.0).await
             }
         }
     }
@@ -311,49 +347,14 @@ impl MovePath {
             Self::Servo(servo) => servo.clock(),
         }
     }
-
-    /// How the completion reads in the goal result.
-    fn completion_message(&self) -> &'static str {
-        match self {
-            Self::Line(_) => "cartesian move complete",
-            Self::Servo(_) => "cartesian move complete (servo-guided)",
-        }
-    }
-}
-
-/// How a move ended. `Cancelled` is the terminal the caller asked for;
-/// `Stopped` the one the stop service ended it with, carrying the message
-/// that names the stop and its reason. Both are reported through the
-/// cancelled completion.
-enum Outcome {
-    Complete,
-    Cancelled,
-    Stopped(String),
-    Failed(String),
-}
-
-impl Outcome {
-    /// Whether the goal ends through its cancelled completion.
-    fn is_cancelled(&self) -> bool {
-        matches!(self, Self::Cancelled | Self::Stopped(_))
-    }
-
-    /// What the goal reports: whether it succeeded, and the words, which
-    /// `completed` gives for a move that ran to its end.
-    fn report(self, completed: impl FnOnce() -> String) -> (bool, String) {
-        match self {
-            Self::Complete => (true, completed()),
-            Self::Cancelled => (false, "goal cancelled".to_string()),
-            Self::Stopped(message) | Self::Failed(message) => (false, message),
-        }
-    }
 }
 
 /// One tick of a Cartesian path.
 enum PathStep {
     /// The joint target for this tick, and whether the path has finished.
     To { q_des: JointVec, complete: bool },
-    /// The path cannot continue; the move completes failed with this reason.
+    /// The path cannot continue; the move fails with `attempt_failed` and
+    /// this message.
     Failed(String),
 }
 
@@ -444,20 +445,13 @@ impl Planner {
         self.setpoint
     }
 
-    /// The joints a move_arm or move_arm_joints result reports, and the
-    /// result's `message`:
-    /// - the measured joints, with `message` as it is;
-    /// - when the follower stopped reporting, the held setpoint, which is
-    ///   the joints commanded last, with [`COMMANDED_JOINTS_NOTE`] added;
-    /// - before the arm's first measurement, the held setpoint, with
-    ///   `message` as it is: only a refusal ends then, and it says why.
-    fn reported_joints(&self, measured: Measurement, message: String) -> (JointVec, String) {
+    /// The joints a move_arm or move_arm_joints result reports: the
+    /// measured joints, or without a fresh measurement the held setpoint,
+    /// which is the joints commanded last ([`cancelled_reason`] says so).
+    fn reported_joints(&self, measured: &Measurement) -> JointVec {
         match measured {
-            Ok(q) => (q, message),
-            Err(Unmeasured::Stale) => {
-                (self.setpoint, format!("{message}; {COMMANDED_JOINTS_NOTE}"))
-            }
-            Err(Unmeasured::NotYet) => (self.setpoint, message),
+            Ok(q) => *q,
+            Err(_) => self.setpoint,
         }
     }
 
@@ -504,8 +498,8 @@ impl Planner {
             if matches!(mode, Mode::Follow) {
                 mode = self.start_goal(goal, busy.clone(), now).await;
             } else {
-                goal.refuse("another move is in flight", Ok(measured_q), self)
-                    .await;
+                let failure = Failure::new(FailureKind::PreconditionFailed, ANOTHER_MOVE_IN_FLIGHT);
+                goal.fail(failure, self).await;
             }
         }
 
@@ -532,34 +526,25 @@ impl Planner {
         }
     }
 
-    /// Fail the active move and answer its caller: for a follower gone
-    /// stale, where the move can neither progress nor be verified. The result
-    /// reports `measured`, which for a stale follower is
-    /// [`Unmeasured::Stale`]. Ambient Follow mode is untouched; the busy slot
-    /// releases with the mode.
-    pub async fn abort_active(&mut self, reason: &str, measured: Measurement, now: Instant) {
-        self.end_active(Outcome::Failed(reason.to_string()), measured, now)
-            .await;
+    /// Fail the active move with `failure` and answer its caller, with no
+    /// result: for a follower gone stale, where the move can neither
+    /// progress nor be verified. Ambient Follow mode is untouched; the busy
+    /// slot releases with the mode.
+    pub async fn fail_active(&mut self, failure: Failure) {
+        match std::mem::replace(&mut self.mode, Mode::Follow) {
+            Mode::Follow => {}
+            Mode::JointMove(JointMove { reply, .. }) => reply.fail(self.side, failure).await,
+            Mode::CartesianMove(m) => self.fail_cartesian(&m.ctx, failure).await,
+        }
     }
 
-    /// End the active move for the stop service: its goal completes as
-    /// cancelled with `message`, reporting `measured`, the joints measured
-    /// when the stop came. The arm holds the setpoint it was last governed
-    /// to, as after a cancel, and the busy slot releases with the mode.
-    /// Whether a move was in flight.
-    pub async fn stop_active(
-        &mut self,
-        message: &str,
-        measured: Measurement,
-        now: Instant,
-    ) -> bool {
-        self.end_active(Outcome::Stopped(message.to_string()), measured, now)
-            .await
-    }
-
-    /// End the active move with `outcome`, reporting `measured`; ambient
-    /// Follow mode is untouched. Whether a move was in flight.
-    async fn end_active(&mut self, outcome: Outcome, measured: Measurement, now: Instant) -> bool {
+    /// End the active move for the stop service: its goal ends cancelled
+    /// for `reason`, which names the stop, reporting `measured`, the joints
+    /// measured when the stop came. The arm holds the setpoint it was last
+    /// governed to, as after a cancel, and the busy slot releases with the
+    /// mode. Whether a move was in flight.
+    pub async fn stop_active(&mut self, reason: &str, measured: Measurement, now: Instant) -> bool {
+        let outcome = Outcome::Cancelled(reason.to_string());
         match std::mem::replace(&mut self.mode, Mode::Follow) {
             Mode::Follow => false,
             Mode::JointMove(JointMove { traj, reply, _busy }) => {
@@ -569,10 +554,7 @@ impl Planner {
             }
             Mode::CartesianMove(m) => {
                 let elapsed = m.path.clock().elapsed_secs(now);
-                let cancelled = outcome.is_cancelled();
-                let (success, message) = outcome.report(|| m.path.completion_message().to_string());
-                let (reported_q, message) = self.reported_joints(measured, message);
-                self.finish_cartesian(&m.ctx, reported_q, success, &message, elapsed, cancelled)
+                self.finish_cartesian(&m.ctx, outcome, measured, elapsed)
                     .await;
                 true
             }
@@ -581,16 +563,17 @@ impl Planner {
 
     /// Whether a `move_arm` goal to `target` has a plan from the held
     /// setpoint, without moving: the time the move would take, or the words
-    /// its refusal gives. Refused while a move executes, with the message a
-    /// second goal gets; the check claims no slot and changes no state.
+    /// of its `unreachable` failure. Refused while a move executes, as a
+    /// second goal is, with `precondition_failed`; the check claims no slot
+    /// and changes no state.
     pub fn check_cartesian(
         &mut self,
         target: &Isometry3<f64>,
         tolerance: PoseTolerance,
         requested: Duration,
-    ) -> Result<Duration, String> {
+    ) -> Result<PlanCheck, Failure> {
         if !matches!(self.mode, Mode::Follow) {
-            return Err(ARM_BUSY.to_string());
+            return Err(Failure::new(FailureKind::PreconditionFailed, ARM_BUSY));
         }
         let plan = plan_cartesian(
             &self.model,
@@ -599,9 +582,11 @@ impl Planner {
             &self.plan_limits(),
             requested,
             tolerance.servo(),
-        )
-        .map_err(|rejection| not_planned(tolerance, &rejection))?;
-        Ok(plan.duration())
+        );
+        Ok(match plan {
+            Ok(plan) => PlanCheck::Reachable(plan.duration()),
+            Err(rejection) => PlanCheck::Unreachable(not_planned(tolerance, &rejection)),
+        })
     }
 
     /// Resolve the Follow target, holding the last governed setpoint when no
@@ -661,20 +646,19 @@ impl Planner {
         }
     }
 
-    /// One joint-trajectory tick: sample the trajectory, and complete the goal
-    /// on cancel, or from the planned end on as the reply's settle judges the
+    /// One joint-trajectory tick: sample the trajectory, and end the goal on
+    /// cancel, or from the planned end on as the reply's settle judges the
     /// measured arm against the trajectory's end. Any terminal drops `m` (and
     /// with it the busy guard), releasing the slot.
     async fn advance_joint(&mut self, m: JointMove, measured_q: JointVec, now: Instant) -> Advance {
         let JointMove { traj, reply, _busy } = m;
         let q_des = traj.sample(now);
-        let cancelled = reply.is_cancelled();
-        let outcome = if cancelled {
-            Some(Outcome::Cancelled)
-        } else if traj.clock().is_complete(now) {
-            reply.settle_outcome(&measured_q, &q_des, traj.clock(), now)
-        } else {
-            None
+        let outcome = match reply.cancel_reason() {
+            Some(reason) => Some(Outcome::Cancelled(reason)),
+            None if traj.clock().is_complete(now) => {
+                reply.settle_outcome(&measured_q, &q_des, traj.clock(), now)
+            }
+            None => None,
         };
         let Some(outcome) = outcome else {
             return Advance {
@@ -684,6 +668,7 @@ impl Planner {
             };
         };
         let elapsed = traj.clock().elapsed_secs(now);
+        let cancelled = matches!(outcome, Outcome::Cancelled(_));
         reply.finish(self, outcome, Ok(measured_q), elapsed).await;
         // A cancel holds where the arm already is; a settle, met or failed,
         // holds the trajectory's end.
@@ -691,8 +676,8 @@ impl Planner {
     }
 
     /// One Cartesian tick: advance the move's path (line-tracking IK, or the
-    /// guarded servo) and complete on cancel, on the path giving up, or from
-    /// the planned end on as the settle judges the measured grasp point
+    /// guarded servo) and end the goal on cancel, on the path giving up, or
+    /// from the planned end on as the settle judges the measured grasp point
     /// against the commanded pose; a path at its end keeps giving its last
     /// target. Any terminal drops `m` (and with it the busy guard), releasing
     /// the slot.
@@ -703,10 +688,9 @@ impl Planner {
         now: Instant,
     ) -> Advance {
         let elapsed = m.path.clock().elapsed_secs(now);
-        if m.ctx.is_cancelled() {
-            return self
-                .end_cartesian(&m, measured_q, Outcome::Cancelled, elapsed)
-                .await;
+        if let Some(cause) = m.ctx.cancel_cause() {
+            let outcome = Outcome::Cancelled(cause.reason().to_string());
+            return self.end_cartesian(&m, measured_q, outcome, elapsed).await;
         }
         let stepped = match &mut m.path {
             MovePath::Line(line) => self.step_line(line, &m.prev_q_des, now),
@@ -714,10 +698,9 @@ impl Planner {
         };
         let (q_des, complete) = match stepped {
             PathStep::To { q_des, complete } => (q_des, complete),
-            PathStep::Failed(reason) => {
-                return self
-                    .end_cartesian(&m, measured_q, Outcome::Failed(reason), elapsed)
-                    .await;
+            PathStep::Failed(message) => {
+                let outcome = Outcome::Failed(Failure::new(FailureKind::AttemptFailed, message));
+                return self.end_cartesian(&m, measured_q, outcome, elapsed).await;
             }
         };
         m.prev_q_des = q_des;
@@ -805,9 +788,7 @@ impl Planner {
         outcome: Outcome,
         elapsed: f64,
     ) -> Advance {
-        let cancelled = outcome.is_cancelled();
-        let (success, message) = outcome.report(|| m.path.completion_message().to_string());
-        self.finish_cartesian(&m.ctx, measured_q, success, &message, elapsed, cancelled)
+        self.finish_cartesian(&m.ctx, outcome, Ok(measured_q), elapsed)
             .await;
         Advance::ends_move(m.prev_q_des)
     }
@@ -844,8 +825,8 @@ impl Planner {
         }
     }
 
-    /// Plan an accepted move_arm goal and start executing it, or complete it
-    /// failed here when no path reaches the pose.
+    /// Plan an accepted move_arm goal and start executing it, or fail it here
+    /// with `unreachable` when no path reaches the pose.
     ///
     /// The start pose is the FK of the held setpoint (the chase base), not the
     /// measured pose, so the first-tick velocity guard compares the IK of the
@@ -877,13 +858,9 @@ impl Planner {
         let plan = match plan {
             Ok(plan) => plan,
             Err(rejection) => {
-                let (pos, quat) = world_pose_arrays(&start_world);
-                if let Err(e) = ctx
-                    .complete(false, not_planned(tolerance, &rejection), pos, quat, 0.0)
-                    .await
-                {
-                    error!("{}: move_arm complete: {e}", self.side.label());
-                }
+                let failure =
+                    Failure::new(FailureKind::Unreachable, not_planned(tolerance, &rejection));
+                self.fail_cartesian(&ctx, failure).await;
                 // `busy` drops here: the slot is released even on this early exit.
                 return Mode::Follow;
             }
@@ -944,28 +921,39 @@ impl Planner {
         })
     }
 
-    /// Complete a Cartesian goal, reporting the world pose of `reported_q`:
-    /// the joints measured at exit, or those [`Planner::reported_joints`]
-    /// gives without a fresh measurement.
+    /// End a Cartesian goal on `outcome`: it completes or ends cancelled
+    /// with the world pose of the joints [`Planner::reported_joints`] gives
+    /// for `measured`, and fails with no result.
     async fn finish_cartesian(
-        &mut self,
+        &self,
         ctx: &move_arm::GoalContext,
-        reported_q: JointVec,
-        success: bool,
-        message: &str,
+        outcome: Outcome,
+        measured: Measurement,
         elapsed: f64,
-        cancelled: bool,
     ) {
-        let (pos, quat) = world_pose_arrays(&self.world_ee_pose(&reported_q));
-        let result = if cancelled {
-            ctx.complete_cancelled(false, message.into(), pos, quat, elapsed)
-                .await
-        } else {
-            ctx.complete(success, message.into(), pos, quat, elapsed)
-                .await
+        let reported_pose =
+            || world_pose_arrays(&self.world_ee_pose(&self.reported_joints(&measured)));
+        let ended = match outcome {
+            Outcome::Complete => {
+                let (pos, quat) = reported_pose();
+                ctx.complete(pos, quat, elapsed).await
+            }
+            Outcome::Cancelled(reason) => {
+                let (pos, quat) = reported_pose();
+                ctx.complete_cancelled(cancelled_reason(reason, &measured), pos, quat, elapsed)
+                    .await
+            }
+            Outcome::Failed(failure) => return self.fail_cartesian(ctx, failure).await,
         };
-        if let Err(e) = result {
-            error!("{}: move_arm complete: {e}", self.side.label());
+        if let Err(e) = ended {
+            error!("{}: move_arm end: {e}", self.side.label());
+        }
+    }
+
+    /// Fail a Cartesian goal with `failure`, with no result.
+    async fn fail_cartesian(&self, ctx: &move_arm::GoalContext, failure: Failure) {
+        if let Err(e) = ctx.fail(failure.kind.into(), failure.message).await {
+            error!("{}: move_arm end: {e}", self.side.label());
         }
     }
 }
@@ -986,13 +974,24 @@ impl From<Verdict> for Outcome {
     fn from(verdict: Verdict) -> Self {
         match verdict {
             Verdict::Settled => Self::Complete,
-            Verdict::Failed(message) => Self::Failed(message),
+            Verdict::TimedOut(message) => Self::Failed(Failure::new(FailureKind::Timeout, message)),
         }
     }
 }
 
-/// The refusal of a Cartesian move no plan reaches within `tolerance`: what a
-/// `move_arm` goal completes with, and what `check_arm_move` answers.
+/// The reason a cancelled move_arm or move_arm_joints goal ends with:
+/// `reason`, and [`COMMANDED_JOINTS_NOTE`] after it when the arm has no fresh
+/// measurement, so its result reports the joints commanded last.
+fn cancelled_reason(reason: String, measured: &Measurement) -> String {
+    match measured {
+        Ok(_) => reason,
+        Err(_) => format!("{reason}; {COMMANDED_JOINTS_NOTE}"),
+    }
+}
+
+/// Why no plan reaches a Cartesian move within `tolerance`: the message of
+/// a `move_arm` goal's `unreachable` failure, and the reason `check_arm_move`
+/// answers.
 fn not_planned(tolerance: PoseTolerance, rejection: &PlanRejection) -> String {
     format!(
         "goal pose not planned within {:.1} mm / {:.1} deg: {rejection}",
@@ -1059,9 +1058,10 @@ mod tests {
         planner
     }
 
-    /// The abort of a follower gone stale fails the move and frees the slot.
+    /// The failure of a follower gone stale fails the move with its kind,
+    /// labelled with the side, and frees the slot.
     #[tokio::test]
-    async fn aborting_the_active_move_fails_it_and_frees_the_busy_slot() {
+    async fn failing_the_active_move_fails_it_and_frees_the_busy_slot() {
         let mut planner = test_planner([0.0; ARM_DOF]);
         let (done_tx, mut done_rx) = mpsc::channel(1);
         let (goal_tx, mut goals) = mpsc::channel(1);
@@ -1079,28 +1079,26 @@ mod tests {
             "move in flight holds the slot"
         );
 
-        planner
-            .abort_active(
-                "the follower stopped reporting",
-                Err(Unmeasured::Stale),
-                now,
-            )
-            .await;
-        let outcome = done_rx.recv().await.expect("aborted move must report");
-        assert!(!outcome.success);
-        assert_eq!(outcome.message, "left: the follower stopped reporting");
-        assert!(!busy.load(Ordering::Acquire), "abort releases the slot");
-        // With nothing active the abort is a no-op.
-        planner
-            .abort_active("again", Err(Unmeasured::Stale), now)
-            .await;
+        let stale = Failure::new(
+            FailureKind::ResourceUnavailable,
+            "the follower stopped reporting",
+        );
+        planner.fail_active(stale.clone()).await;
+        let outcome = done_rx.recv().await.expect("the failed move must report");
+        assert_eq!(outcome, Outcome::Failed(stale.clone().labelled("left")));
+        assert!(
+            !busy.load(Ordering::Acquire),
+            "the failure releases the slot"
+        );
+        // With nothing active the failure is a no-op.
+        planner.fail_active(stale).await;
     }
 
-    /// A stop ends the move as cancelled with its message. The arm holds
-    /// the setpoint it was last governed to, not the pose measured when the
-    /// stop came.
+    /// A stop ends the move cancelled for its reason. The arm holds the
+    /// setpoint it was last governed to, not the pose measured when the stop
+    /// came.
     #[tokio::test]
-    async fn stopping_the_active_move_ends_it_cancelled_with_the_message_and_holds() {
+    async fn stopping_the_active_move_ends_it_cancelled_for_the_reason_and_holds() {
         let held = [0.0; ARM_DOF];
         let mut planner = test_planner(held);
         let (done_tx, mut done_rx) = mpsc::channel(1);
@@ -1123,9 +1121,7 @@ mod tests {
             .await;
         assert!(stopped, "a move was in flight");
         let outcome = done_rx.recv().await.expect("the stopped move reports");
-        assert!(!outcome.success);
-        assert!(outcome.stopped);
-        assert_eq!(outcome.message, "left: stopped: operator");
+        assert_eq!(outcome, Outcome::Cancelled("stopped: operator".to_string()));
         assert!(!busy.load(Ordering::Acquire), "the stop releases the slot");
         assert_eq!(
             planner.setpoint(),
@@ -1156,9 +1152,9 @@ mod tests {
 
     /// A posture share whose arm never follows: the governor holds every
     /// step, or the arm stands against an obstacle the backbone cannot see.
-    /// The move ends on its clock with success.
+    /// The move completes on its clock.
     #[tokio::test]
-    async fn a_joint_move_the_governor_holds_still_completes_with_success() {
+    async fn a_joint_move_the_governor_holds_still_completes() {
         let held = [0.0; ARM_DOF];
         let target = [0.5; ARM_DOF];
         let mut planner = test_planner(held);
@@ -1184,9 +1180,7 @@ mod tests {
             )
             .await;
         let outcome = done_rx.try_recv().expect("the move ends on its clock");
-        assert!(outcome.success, "{}", outcome.message);
-        assert_eq!(outcome.message, "left: trajectory complete");
-        assert!(!outcome.stopped);
+        assert_eq!(outcome, Outcome::Complete);
         assert_eq!(planner.setpoint(), held, "the arm never left its pose");
         assert!(!busy.load(Ordering::Acquire), "the end releases the slot");
 
@@ -1229,8 +1223,7 @@ mod tests {
             )
             .await;
         let outcome = done_rx.try_recv().expect("the move ends on its clock");
-        assert!(outcome.success, "{}", outcome.message);
-        assert_eq!(outcome.message, "left: trajectory complete");
+        assert_eq!(outcome, Outcome::Complete);
         assert!(!busy.load(Ordering::Acquire), "the end releases the slot");
     }
 
@@ -1308,47 +1301,79 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_queued_goal_is_stopped_unstarted_with_the_message() {
-        let mut planner = test_planner([0.0; ARM_DOF]);
+    async fn a_queued_goal_is_stopped_unstarted_for_the_reason() {
+        let planner = test_planner([0.0; ARM_DOF]);
         let (done_tx, mut done_rx) = mpsc::channel(1);
         Goal::posture_share([0.5; ARM_DOF], done_tx)
-            .stop("stopped: operator", Ok([0.1; ARM_DOF]), &mut planner)
+            .stop("stopped: operator", Ok([0.1; ARM_DOF]), &planner)
             .await;
         let outcome = done_rx.recv().await.expect("the stopped goal reports");
-        assert!(!outcome.success && outcome.stopped);
-        assert_eq!(outcome.message, "left: stopped: operator");
+        assert_eq!(outcome, Outcome::Cancelled("stopped: operator".to_string()));
+    }
+
+    /// A goal that reaches the planner while a move is in flight on its arm
+    /// fails with `precondition_failed`, and the move in flight goes on.
+    #[tokio::test]
+    async fn a_goal_behind_a_move_in_flight_fails_and_the_move_goes_on() {
+        let mut planner = test_planner([0.0; ARM_DOF]);
+        let (goal_tx, mut goals) = mpsc::channel(2);
+        let (running_tx, mut running_rx) = mpsc::channel(1);
+        let (second_tx, mut second_rx) = mpsc::channel(1);
+        let busy = Arc::new(AtomicBool::new(true));
+        for (target, done_tx) in [([0.5; ARM_DOF], running_tx), ([0.2; ARM_DOF], second_tx)] {
+            goal_tx
+                .send(Goal::posture_share(target, done_tx))
+                .await
+                .expect("queue the goal");
+        }
+        planner
+            .tick([0.0; ARM_DOF], None, &mut goals, &busy, Instant::now())
+            .await;
+        let failure = Failure::new(FailureKind::PreconditionFailed, ANOTHER_MOVE_IN_FLIGHT);
+        assert_eq!(
+            second_rx.try_recv().expect("the second goal ends at once"),
+            Outcome::Failed(failure.labelled("left"))
+        );
+        assert!(running_rx.try_recv().is_err(), "the first move runs on");
+        assert!(
+            busy.load(Ordering::Acquire),
+            "the first move holds the slot"
+        );
+    }
+
+    /// An arm move whose settle times out fails with `timeout`, the verdict's
+    /// words as its message; a settled one completes.
+    #[test]
+    fn a_settle_verdict_ends_the_move_complete_or_timed_out() {
+        assert_eq!(Outcome::from(Verdict::Settled), Outcome::Complete);
+        let words = "still 0.200 rad from the target at joint 3, 0.5 s after the planned end";
+        assert_eq!(
+            Outcome::from(Verdict::TimedOut(words.to_string())),
+            Outcome::Failed(Failure::new(FailureKind::Timeout, words))
+        );
     }
 
     /// A move_arm or move_arm_joints result reports the measured joints as
-    /// they are. When the follower stopped reporting, it reports the held
-    /// setpoint, which is the joints commanded last, and its message says
-    /// so. Before the first measurement it reports the held setpoint, and
-    /// the refusal's message stays as it is.
+    /// they are. Without a fresh measurement it reports the held setpoint,
+    /// which is the joints commanded last, and the reason of a cancelled
+    /// goal says so.
     #[test]
     fn an_arm_result_without_a_fresh_measurement_reports_the_commanded_joints() {
         let held = [0.2; ARM_DOF];
         let planner = test_planner(held);
         let measured = [0.1; ARM_DOF];
+        assert_eq!(planner.reported_joints(&Ok(measured)), measured);
         assert_eq!(
-            planner.reported_joints(Ok(measured), "trajectory complete".to_string()),
-            (measured, "trajectory complete".to_string())
+            cancelled_reason("stopped: operator".to_string(), &Ok(measured)),
+            "stopped: operator"
         );
-        assert_eq!(
-            planner.reported_joints(
-                Err(Unmeasured::Stale),
-                "the follower stopped reporting".to_string()
-            ),
-            (
-                held,
-                "the follower stopped reporting; the result comes from the joints commanded last"
-                    .to_string()
-            )
-        );
-        let refusal = "the follower has not reported its first state yet";
-        assert_eq!(
-            planner.reported_joints(Err(Unmeasured::NotYet), refusal.to_string()),
-            (held, refusal.to_string())
-        );
+        for unmeasured in [Unmeasured::Stale, Unmeasured::NotYet] {
+            assert_eq!(planner.reported_joints(&Err(unmeasured)), held);
+            assert_eq!(
+                cancelled_reason("stopped: operator".to_string(), &Err(unmeasured)),
+                "stopped: operator; the result comes from the joints commanded last"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1359,9 +1384,10 @@ mod tests {
             (start.translation.vector + Vector3::new(0.05, 0.0, 0.0)).into(),
             start.rotation,
         );
-        let duration = planner
-            .check_cartesian(&near, STREAMED_POSE_TOLERANCE, Duration::ZERO)
-            .expect("a pose 5 cm ahead has a plan");
+        let checked = planner.check_cartesian(&near, STREAMED_POSE_TOLERANCE, Duration::ZERO);
+        let Ok(PlanCheck::Reachable(duration)) = checked else {
+            panic!("a pose 5 cm ahead has a plan: {checked:?}");
+        };
         assert!(duration > Duration::ZERO, "{duration:?}");
         assert_eq!(planner.setpoint(), POSE_TEST_Q, "the check moves nothing");
 
@@ -1369,16 +1395,17 @@ mod tests {
             (start.translation.vector + Vector3::new(2.0, 0.0, 0.0)).into(),
             start.rotation,
         );
-        let refusal = planner
-            .check_cartesian(&far, STREAMED_POSE_TOLERANCE, Duration::ZERO)
-            .expect_err("a pose 2 m away has no plan");
+        let checked = planner.check_cartesian(&far, STREAMED_POSE_TOLERANCE, Duration::ZERO);
+        let Ok(PlanCheck::Unreachable(reason)) = checked else {
+            panic!("a pose 2 m away has no plan: {checked:?}");
+        };
         assert!(
-            refusal.starts_with("goal pose not planned within"),
-            "{refusal}"
+            reason.starts_with("goal pose not planned within"),
+            "{reason}"
         );
         assert_eq!(planner.setpoint(), POSE_TEST_Q);
 
-        // While a move executes, the check is refused as a second goal is.
+        // While a move executes, the check is refused as a goal is.
         let (done_tx, _done_rx) = mpsc::channel(1);
         let (goal_tx, mut goals) = mpsc::channel(1);
         let busy = Arc::new(AtomicBool::new(true));
@@ -1391,7 +1418,7 @@ mod tests {
             .await;
         assert_eq!(
             planner.check_cartesian(&near, STREAMED_POSE_TOLERANCE, Duration::ZERO),
-            Err(ARM_BUSY.to_string())
+            Err(Failure::new(FailureKind::PreconditionFailed, ARM_BUSY))
         );
     }
 

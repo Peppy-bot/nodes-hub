@@ -1,14 +1,14 @@
 //! Gripper move-action admission: the `move_gripper` handler the backbone
 //! exposes. Mirrors the arm move admission exactly: validate the goal
 //! (gripper_name, finiteness, the [0, 1] opening range, a non-negative effort
-//! cap, a settle timeout from 0 to 60 s), refuse it while the gripper's
-//! follower delivers no fresh state or a leader streams the gripper, claim
-//! the side's single-flight slot, and hand the accepted
-//! goal to the coordinator over its gripper goal channel. The coordinator
-//! runs the motion through the same per-tick governing as every other DOF,
-//! completes the goal once the jaws stand still after the planned end of the
-//! commanded travel or at the goal's settle timeout, and releases the busy
-//! slot at the terminal.
+//! cap, a settle timeout from 0 to 60 s), refusing a value it does not take
+//! with `rejected`, refuse it while the gripper's follower delivers no fresh
+//! state or a leader streams the gripper, claim the side's single-flight
+//! slot, and hand the accepted goal to the coordinator over its gripper goal
+//! channel. The coordinator runs the motion through the same per-tick
+//! governing as every other DOF, completes the goal once the jaws stand
+//! still after the planned end of the commanded travel or at the goal's
+//! settle timeout, and releases the busy slot at the terminal.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -21,9 +21,9 @@ use peppygen::{NodeRunner, Result};
 use tokio::sync::mpsc;
 use tracing::error;
 
-use crate::actions::claim;
-use crate::actions::{GRIPPER_LEADER_STREAMING, GRIPPER_NO_FRESH_STATE};
+use crate::actions::{GRIPPER_WORDS, admit_limb};
 use crate::coordinator::GripperGoal;
+use crate::failure::{Failure, FailureKind};
 use crate::streams::LeaderActivity;
 use crate::types::{Side, move_seconds_from_wire};
 
@@ -75,20 +75,16 @@ pub async fn run_move_gripper(
     loop {
         let accepted = handle
             .handle_goal_next_request(|req| {
-                let side = match gripper_goal_request(&req.data) {
-                    Ok(request) => request.side,
-                    Err(reason) => return Ok(GoalDecision::reject(reason)),
-                };
-                if !fresh[side.index()].load(std::sync::atomic::Ordering::Acquire) {
-                    return Ok(GoalDecision::reject(GRIPPER_NO_FRESH_STATE));
-                }
-                if activity[side.index()].streaming() {
-                    return Ok(GoalDecision::reject(GRIPPER_LEADER_STREAMING));
-                }
-                if !claim(&busy[side.index()]) {
-                    return Ok(GoalDecision::reject("gripper is already executing a move"));
-                }
-                Ok(GoalDecision::accept())
+                let admitted = gripper_goal_request(&req.data)
+                    .map_err(|reason| Failure::new(FailureKind::Rejected, reason))
+                    .and_then(|request| {
+                        let idx = request.side.index();
+                        admit_limb(&fresh[idx], &activity[idx], &busy[idx], &GRIPPER_WORDS)
+                    });
+                Ok(match admitted {
+                    Ok(()) => GoalDecision::accept(),
+                    Err(f) => GoalDecision::refuse(f.kind.into(), f.message),
+                })
             })
             .await?;
         let Some(ctx) = accepted else { return Ok(()) };

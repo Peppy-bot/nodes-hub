@@ -23,14 +23,15 @@ pub struct Settle<T> {
 pub enum Verdict {
     /// The measured limb stands within the tolerance of the target.
     Settled,
-    /// The timeout passed with the limb still short of the target; the
-    /// message says how far and how long after the planned end.
-    Failed(String),
+    /// The timeout passed with the limb still short of the target, and the
+    /// move fails with `timeout`; the message says how far and how long
+    /// after the planned end.
+    TimedOut(String),
 }
 
 /// Judge a move at `now` whose motion ends at `planned_end`: nothing before
 /// the planned end; from it on, settled once nothing stands short of the
-/// target, failed once `timeout` has passed since the planned end with
+/// target, timed out once `timeout` has passed since the planned end with
 /// `shortfall` still standing, and in flight in between.
 pub fn verdict(
     shortfall: Option<String>,
@@ -44,7 +45,7 @@ pub fn verdict(
     let since_end = now.duration_since(planned_end);
     match shortfall {
         None => Some(Verdict::Settled),
-        Some(shortfall) if since_end >= timeout => Some(Verdict::Failed(format!(
+        Some(shortfall) if since_end >= timeout => Some(Verdict::TimedOut(format!(
             "still {shortfall}, {:.1} s after the planned end",
             since_end.as_secs_f64()
         ))),
@@ -103,10 +104,10 @@ mod tests {
     }
 
     // Nothing is judged before the planned end; from it on, the verdict
-    // settles on nothing short of the target, fails once the timeout has
+    // settles on nothing short of the target, times out once the timeout has
     // passed with a shortfall still standing, and waits in between.
     #[hegel::test]
-    fn the_verdict_settles_fails_or_waits_by_shortfall_and_time(tc: TestCase) {
+    fn the_verdict_settles_times_out_or_waits_by_shortfall_and_time(tc: TestCase) {
         let short: bool = tc.draw(gs::booleans());
         let [since_end_s, timeout_s]: [f64; 2] =
             tc.draw(gs::arrays(gs::floats().min_value(-1.0).max_value(10.0)));
@@ -130,7 +131,7 @@ mod tests {
         let timed_out = now.duration_since(planned_end) >= seconds(timeout_s.max(0.0));
         match (shortfall, timed_out, judged) {
             (None, _, Some(Verdict::Settled)) => {}
-            (Some(shortfall), true, Some(Verdict::Failed(message))) => {
+            (Some(shortfall), true, Some(Verdict::TimedOut(message))) => {
                 assert!(
                     message.starts_with(&format!("still {shortfall}, ")),
                     "{message}"
@@ -145,7 +146,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_verdict_names_the_time_since_the_planned_end() {
+    fn a_timed_out_verdict_names_the_time_since_the_planned_end() {
         let planned_end = Instant::now();
         assert_eq!(
             verdict(
@@ -154,7 +155,7 @@ mod tests {
                 planned_end + seconds(2.04),
                 seconds(2.0)
             ),
-            Some(Verdict::Failed(
+            Some(Verdict::TimedOut(
                 "still 8 mm / 0.02 rad from the target, 2.0 s after the planned end".to_string()
             ))
         );
