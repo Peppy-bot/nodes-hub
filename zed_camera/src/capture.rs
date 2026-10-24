@@ -3,7 +3,7 @@
 //! USB descriptor of the ZED's HID sibling ([`zed_serial`]); the video
 //! interface carries none. The device runs auto exposure.
 
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind};
 use std::path::Path;
 use std::time::Duration;
 
@@ -35,6 +35,53 @@ pub const CID_GAMMA: u32 = 0x0098_0910;
 pub const CID_GAIN: u32 = 0x0098_0913;
 pub const CID_AWB_TEMPERATURE: u32 = 0x0098_091a;
 pub const CID_SHARPNESS: u32 = 0x0098_091b;
+
+/// Why a control write gave no value: the failure kind of peppy that says
+/// why, and the reason in words.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlFailure {
+    pub kind: ControlFailureKind,
+    pub message: String,
+}
+
+/// The failure kinds of peppy that a control gives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlFailureKind {
+    /// The device does not offer the control, or does not take the value.
+    Rejected,
+    /// The control does not take a write now: it is read-only, inactive in
+    /// the current mode, or held by another application.
+    PreconditionFailed,
+    /// The device is gone.
+    ResourceUnavailable,
+    /// The write failed for another reason.
+    AttemptFailed,
+}
+
+impl ControlFailure {
+    /// A request the node does not take, such as an unknown mode.
+    pub fn rejected(message: impl Into<String>) -> Self {
+        Self {
+            kind: ControlFailureKind::Rejected,
+            message: message.into(),
+        }
+    }
+
+    /// The failure of a write of control `cid` that the driver refused with
+    /// `error`, by the errno that VIDIOC_S_EXT_CTRLS documents for it.
+    fn of_write(cid: u32, error: &io::Error) -> Self {
+        let kind = match error.raw_os_error() {
+            Some(libc::EINVAL | libc::ERANGE) => ControlFailureKind::Rejected,
+            Some(libc::EACCES | libc::EBUSY) => ControlFailureKind::PreconditionFailed,
+            Some(libc::ENODEV) => ControlFailureKind::ResourceUnavailable,
+            _ => ControlFailureKind::AttemptFailed,
+        };
+        Self {
+            kind,
+            message: format!("set control {cid:#x}: {error}"),
+        }
+    }
+}
 
 /// The result of one grab attempt.
 pub enum Grab {
@@ -123,13 +170,13 @@ impl Capture {
     }
 
     /// Writes an integer control by CID; the driver clamps to its range.
-    pub fn set_control(&self, cid: u32, value: i32) -> Result<(), String> {
+    pub fn set_control(&self, cid: u32, value: i32) -> Result<(), ControlFailure> {
         self.device
             .set_control(Control {
                 id: cid,
                 value: Value::Integer(value as i64),
             })
-            .map_err(|e| e.to_string())
+            .map_err(|error| ControlFailure::of_write(cid, &error))
     }
 }
 
@@ -202,6 +249,53 @@ mod tests {
     fn device_index_parses_only_video_paths() {
         assert_eq!(device_index("/dev/video7").unwrap(), 7);
         assert!(device_index("/dev/ttyUSB0").is_err());
+    }
+
+    fn kind_of_errno(errno: i32) -> ControlFailureKind {
+        ControlFailure::of_write(CID_GAIN, &io::Error::from_raw_os_error(errno)).kind
+    }
+
+    #[test]
+    fn a_control_or_a_value_the_device_does_not_take_is_rejected() {
+        assert_eq!(kind_of_errno(libc::EINVAL), ControlFailureKind::Rejected);
+        assert_eq!(kind_of_errno(libc::ERANGE), ControlFailureKind::Rejected);
+    }
+
+    #[test]
+    fn a_control_that_takes_no_write_now_fails_a_precondition() {
+        assert_eq!(
+            kind_of_errno(libc::EACCES),
+            ControlFailureKind::PreconditionFailed
+        );
+        assert_eq!(
+            kind_of_errno(libc::EBUSY),
+            ControlFailureKind::PreconditionFailed
+        );
+    }
+
+    #[test]
+    fn a_device_that_is_gone_is_unavailable() {
+        assert_eq!(
+            kind_of_errno(libc::ENODEV),
+            ControlFailureKind::ResourceUnavailable
+        );
+    }
+
+    #[test]
+    fn any_other_refusal_of_the_driver_is_a_failed_attempt() {
+        assert_eq!(kind_of_errno(libc::EIO), ControlFailureKind::AttemptFailed);
+        let without_errno = io::Error::other("no errno");
+        assert_eq!(
+            ControlFailure::of_write(CID_GAIN, &without_errno).kind,
+            ControlFailureKind::AttemptFailed
+        );
+    }
+
+    #[test]
+    fn a_failed_write_names_the_control() {
+        let failure =
+            ControlFailure::of_write(CID_CONTRAST, &io::Error::from_raw_os_error(libc::ERANGE));
+        assert!(failure.message.contains("0x980901"), "{}", failure.message);
     }
 
     #[test]
