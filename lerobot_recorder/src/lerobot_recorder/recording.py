@@ -36,7 +36,7 @@ DISK_CHECK_PERIOD_S = 1.0
 # An episode whose sampling falls this far behind the fps grid ends: its
 # frames would claim k/fps spacing they no longer have.
 MAX_SCHEDULE_LAG_S = 1.0
-# Shorter episodes are refused rather than saved. The library computes
+# Shorter episodes are discarded rather than saved. The library computes
 # episode stats on two sides of a two-sample fork (compute_stats.py, `if
 # reshaped.shape[0] < 2`) whose branches disagree on dtype for the integer
 # columns, so a one-frame episode writes a schema every later episode is
@@ -225,7 +225,7 @@ class NotReady(Exception):
 
 class SampleGap(Exception):
     """A source went missing, stale, or changed shape mid-episode: the episode
-    ends with a save and this reason in the result."""
+    ends with a save, and its goal ends cancelled for this reason."""
 
 
 def _fresh_link_sample(

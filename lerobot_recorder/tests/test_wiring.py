@@ -8,6 +8,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from peppygen.exposed_services.recording import resume_session
 
 import lerobot_recorder.__main__ as main_mod
 from lerobot_recorder import recording
@@ -249,8 +250,9 @@ def test_resuming_with_the_leaders_swapped_is_refused(tmp_path):
     must compare the mapping, not the sources."""
     session_dir = session_with(tmp_path, _recorded_links(two_limb_plan("arm0", "arm1")))
 
-    with pytest.raises(ValueError, match="would cross the limbs"):
+    with pytest.raises(resume_session.Failure, match="would cross the limbs") as raised:
         _check_same_links(session_dir, two_limb_plan("arm1", "arm0"))
+    assert raised.value.kind is resume_session.FailureKind.PRECONDITION_FAILED
 
 
 def test_sources_differing_only_by_core_node_stay_distinct():
@@ -316,13 +318,15 @@ def test_a_session_without_a_session_json_is_refused(tmp_path):
     without them is not a session this node wrote."""
     bare = tmp_path / "2026-08-06_10-00-00"
     bare.mkdir()
-    with pytest.raises(ValueError, match="session.json unreadable"):
+    with pytest.raises(resume_session.Failure, match="session.json unreadable") as raised:
         _check_same_links(bare, make_plan())
+    assert raised.value.kind is resume_session.FailureKind.REJECTED
 
 
 def test_a_session_json_without_links_is_refused(tmp_path):
-    with pytest.raises(ValueError, match="records no state_links"):
+    with pytest.raises(resume_session.Failure, match="records no state_links") as raised:
         _check_same_links(session_with(tmp_path, {}), make_plan())
+    assert raised.value.kind is resume_session.FailureKind.REJECTED
 
 
 def test_setup_discovers_the_seeded_membership_inline(tmp_path):
@@ -388,8 +392,12 @@ def test_resolving_a_session_validates_the_operator_supplied_name(tmp_path):
     from lerobot_recorder.storage import StorageTarget
 
     target = StorageTarget(root=tmp_path, s3=None)
-    with pytest.raises(ValueError, match="is not a session name"):
+    with pytest.raises(resume_session.Failure, match="is not a session name") as raised:
         _resolve_existing_session(target, "../evil", make_plan())
+    assert raised.value.kind is resume_session.FailureKind.REJECTED
+    with pytest.raises(resume_session.Failure, match="no session named") as raised:
+        _resolve_existing_session(target, "2026-01-01_00-00-00", make_plan())
+    assert raised.value.kind is resume_session.FailureKind.REJECTED
 
     plan = make_plan()
     session_dir = session_with(tmp_path, _recorded_links(plan))

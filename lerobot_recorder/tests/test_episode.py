@@ -11,6 +11,8 @@ import time
 from types import SimpleNamespace
 
 import pytest
+from peppygen.exposed_actions.recording import record_episode
+from peppygen.exposed_services.recording import finish_session, resume_session
 
 from lerobot_recorder import episode, recording
 from lerobot_recorder.episode import Recorder, Timing
@@ -149,15 +151,29 @@ class FailingCreateSink(FakeSink):
         raise OSError("mkdir failed")
 
 
+# The kinds of the record_episode goals the recorder fails.
+ATTEMPT_FAILED = record_episode.FailureKind.ATTEMPT_FAILED
+PRECONDITION_FAILED = record_episode.FailureKind.PRECONDITION_FAILED
+
+
 class FakeCtx:
+    """Records how the goal ended: ("cancelled", reason, episode_index,
+    frames_recorded, discarded) or ("failed", kind, message). The goal of a
+    record_episode never completes, so the fake has no complete."""
+
     def __init__(self, task="t"):
         self._request = goal_request(task)
         self._cancel = asyncio.Event()
-        self.completions = []
+        self._cause = None
+        self.endings = []
         self.feedbacks = []
 
     def request(self):
         return self._request
+
+    def request_cancel(self, cause="caller") -> None:
+        self._cause = cause
+        self._cancel.set()
 
     async def cancel_signal(self) -> None:
         await self._cancel.wait()
@@ -165,16 +181,22 @@ class FakeCtx:
     def is_cancelled(self) -> bool:
         return self._cancel.is_set()
 
+    def cancel_cause(self):
+        return self._cause
+
     async def publish_feedback(self, frames_recorded, disk_free_bytes) -> None:
         self.feedbacks.append((frames_recorded, disk_free_bytes))
 
-    async def complete(self, episode_index, frames_recorded, discarded, error) -> None:
-        self.completions.append(("done", episode_index, frames_recorded, discarded, error))
+    async def fail(self, kind, message) -> None:
+        self.endings.append(("failed", kind, message))
 
-    async def complete_cancelled(self, episode_index, frames_recorded, discarded, error) -> None:
-        self.completions.append(
-            ("cancelled", episode_index, frames_recorded, discarded, error)
-        )
+    async def complete_cancelled(self, reason, episode_index, frames_recorded, discarded) -> None:
+        self.endings.append(("cancelled", reason, episode_index, frames_recorded, discarded))
+
+    def ending(self):
+        """The one way the goal ended."""
+        (ending,) = self.endings
+        return ending
 
 
 class FakeToken:
@@ -222,34 +244,36 @@ def test_save_failure_recovers_for_next_goal(tmp_path):
         token = FakeToken()
         first = FakeCtx()
         await recorder._record(first, token)
-        kind, index, frames, discarded, error = first.completions[0]
-        assert (kind, index, discarded) == ("done", -1, True)
-        assert frames > 0
-        assert "episode save failed" in error
+        # The episode could not be saved: the goal fails, with no result.
+        ending, kind, message = first.ending()
+        assert (ending, kind) == ("failed", ATTEMPT_FAILED)
+        assert "episode save failed" in message
         assert sink.discards == 1
 
         cache.links[ARM0] = fresh_joints()
         second = FakeCtx()
         await recorder._record(second, token)
-        kind, index, frames, discarded, error = second.completions[0]
-        assert (kind, index, discarded) == ("done", 0, False)
-        assert "stale" in error
+        # The recorder ended the episode itself on a stale source, with a
+        # save: the goal ends cancelled, for a reason that names the cause.
+        ending, reason, index, frames, discarded = second.ending()
+        assert (ending, index, discarded) == ("cancelled", 0, False)
+        assert frames > 0
+        assert "stale" in reason
         assert sink.saves == 1
 
     asyncio.run(run())
 
 
-def test_a_refusal_reports_the_shortfall_and_what_ended_it():
+def test_a_too_short_failure_reports_the_shortfall_and_what_ended_it():
     # Both halves are needed: an episode cut short by a low disk is a disk
     # problem, not a recording-technique problem.
-    assert "need 2" in episode._too_short(1, None)
     both = episode._too_short(1, "only 12 MB free under the session directory")
     assert "need 2" in both and "12 MB free" in both
     # Nothing captured at all still says why it ended.
-    assert "frame write failed" in episode._too_short(0, "frame write failed")
+    assert "cancelled by its caller" in episode._too_short(0, "cancelled by its caller")
 
 
-def test_a_one_frame_episode_is_refused_rather_than_saved(tmp_path):
+def test_a_one_frame_episode_fails_rather_than_being_saved(tmp_path):
     # The library's episode stats change dtype below two samples, so saving
     # this would write a schema every later episode is rejected against.
     plan = arm_plan()
@@ -261,19 +285,18 @@ def test_a_one_frame_episode_is_refused_rather_than_saved(tmp_path):
         recorder._schema = capture_now(cache, plan)
         ctx = FakeCtx()
         await recorder._record(ctx, FakeToken())
-        kind, index, frames, discarded, error = ctx.completions[0]
-        assert (kind, index, discarded) == ("done", -1, True)
-        assert frames < recording.MIN_EPISODE_FRAMES
-        assert "too short to save" in error
-        # What ended it survives alongside the refusal.
-        assert "stale" in error
+        ending, kind, message = ctx.ending()
+        assert (ending, kind) == ("failed", ATTEMPT_FAILED)
+        assert "too short to save: 1 frame(s), need 2" in message
+        # What ended it survives alongside the shortfall.
+        assert "stale" in message
         assert sink.saves == 0
         assert sink.discards == 1
 
     asyncio.run(run())
 
 
-def test_a_refused_episode_leaves_the_session_recordable(tmp_path):
+def test_a_too_short_episode_leaves_the_session_recordable(tmp_path):
     # The wedge this guards against is session-wide, so the next episode has
     # to still be savable.
     plan = arm_plan()
@@ -286,22 +309,23 @@ def test_a_refused_episode_leaves_the_session_recordable(tmp_path):
         recorder._schema = capture_now(cache, plan)
         first = FakeCtx()
         await recorder._record(first, token)
-        assert first.completions[0][3] is True  # refused, too short
+        assert first.ending()[0] == "failed"  # too short
 
         sink.fps = 100
         cache.links[ARM0] = fresh_joints()
         second = FakeCtx()
         await recorder._record(second, token)
-        kind, index, frames, discarded, _error = second.completions[0]
-        # Index 0: a refusal saves nothing, so it consumes no episode index.
-        assert (kind, index, discarded) == ("done", 0, False)
+        ending, _reason, index, frames, discarded = second.ending()
+        # Index 0: a failed episode saves nothing, so it consumes no episode
+        # index.
+        assert (ending, index, discarded) == ("cancelled", 0, False)
         assert frames >= recording.MIN_EPISODE_FRAMES
         assert sink.saves == 1
 
     asyncio.run(run())
 
 
-def test_add_frame_failure_ends_goal_with_discard(tmp_path):
+def test_add_frame_failure_fails_the_goal_and_discards(tmp_path):
     plan = arm_plan()
     sink = FakeSink(fail_add=True)
     recorder, cache = recorder_with(plan, sink, tmp_path)
@@ -311,9 +335,9 @@ def test_add_frame_failure_ends_goal_with_discard(tmp_path):
         recorder._schema = capture_now(cache, plan)
         ctx = FakeCtx()
         await recorder._record(ctx, FakeToken())
-        kind, index, frames, discarded, error = ctx.completions[0]
-        assert (kind, index, frames, discarded) == ("done", -1, 0, True)
-        assert "frame write failed" in error
+        ending, kind, message = ctx.ending()
+        assert (ending, kind) == ("failed", ATTEMPT_FAILED)
+        assert message == "frame write failed: boom"
         assert sink.discards == 1
         assert sink.saves == 0
 
@@ -341,9 +365,9 @@ def test_schedule_lag_ends_episode_with_save(tmp_path):
         ctx = FakeCtx()
         await recorder._record(ctx, FakeToken())
         keep_fresh.cancel()
-        kind, _index, frames, discarded, error = ctx.completions[0]
-        assert (kind, discarded) == ("done", False)
-        assert "cannot sustain" in error
+        ending, reason, _index, frames, discarded = ctx.ending()
+        assert (ending, discarded) == ("cancelled", False)
+        assert reason.startswith("cannot sustain 100 fps")
         assert frames > 0
         assert sink.saves == 1
 
@@ -368,9 +392,9 @@ def test_disk_floor_trips_on_its_own_cadence(tmp_path):
         recorder._schema = capture_now(cache, plan)
         ctx = FakeCtx()
         await recorder._record(ctx, FakeToken())
-        kind, _index, frames, discarded, error = ctx.completions[0]
-        assert (kind, discarded) == ("done", False)
-        assert "MB free" in error
+        ending, reason, _index, frames, discarded = ctx.ending()
+        assert (ending, discarded) == ("cancelled", False)
+        assert reason == "only 0 MB free under the session directory"
         assert frames >= recording.MIN_EPISODE_FRAMES
         assert sink.saves == 1
 
@@ -402,12 +426,13 @@ def test_feedback_per_frame_with_slow_disk_field(tmp_path):
     asyncio.run(run())
 
 
-def test_decide_rejects_while_recording(tmp_path):
+def test_decide_refuses_while_recording(tmp_path):
     recorder, _ = recorder_with(arm_plan(), FakeSink(), tmp_path)
     recorder._recording = True
     decision = recorder._decide(goal_request())
-    assert not decision.accepted
-    assert "already recording" in decision.reason
+    assert decision.refusal == record_episode.Failure(
+        PRECONDITION_FAILED, "an episode is already recording"
+    )
 
 
 def test_decide_claims_the_slot_at_admission(tmp_path):
@@ -417,23 +442,24 @@ def test_decide_claims_the_slot_at_admission(tmp_path):
     cache.links[ARM0] = fresh_joints()
     recorder._schema = capture_now(cache, arm_plan())
 
-    assert recorder._decide(goal_request()).accepted
+    assert recorder._decide(goal_request()).refusal is None
     assert recorder._recording
     second = recorder._decide(goal_request())
-    assert not second.accepted
-    assert "already recording" in second.reason
+    assert second.refusal.kind is PRECONDITION_FAILED
+    assert "already recording" in second.refusal.message
 
 
-def test_decide_rejects_while_finishing(tmp_path):
+def test_decide_refuses_while_finishing(tmp_path):
     recorder, _ = recorder_with(arm_plan(), FakeSink(), tmp_path)
     recorder._finishing = True
     decision = recorder._decide(goal_request())
-    assert not decision.accepted
-    assert "finishing the session" in decision.reason
+    assert decision.refusal == record_episode.Failure(
+        PRECONDITION_FAILED, "finishing the session"
+    )
     assert not recorder._recording
 
 
-def test_decide_rejects_instead_of_raising(tmp_path):
+def test_decide_refuses_instead_of_raising(tmp_path):
     """A decider that raises would kill the goal server for the node's life,
     leaving every later goal undecided."""
 
@@ -444,16 +470,17 @@ def test_decide_rejects_instead_of_raising(tmp_path):
         arm_plan(), FakeSink(), tmp_path, disk_usage=exploding_disk_usage
     )
     decision = recorder._decide(goal_request())
-    assert not decision.accepted
-    assert "cannot start an episode" in decision.reason
+    assert decision.refusal.kind is ATTEMPT_FAILED
+    assert "cannot start an episode" in decision.refusal.message
     assert not recorder._recording
 
 
 def test_goal_refused_below_the_disk_floor(tmp_path):
     recorder, _ = recorder_with(arm_plan(), FakeSink(), tmp_path, disk_usage=free_disk(1))
     decision = recorder._decide(goal_request())
-    assert not decision.accepted
-    assert "MB free" in decision.reason
+    assert decision.refusal == record_episode.Failure(
+        PRECONDITION_FAILED, "only 0 MB free under the session directory"
+    )
     assert not recorder._recording
 
 
@@ -463,8 +490,8 @@ def test_goal_refused_before_the_clock_is_ready(tmp_path):
 
     recorder, _ = recorder_with(arm_plan(), FakeSink(), tmp_path, now_ns=unstarted_clock)
     decision = recorder._decide(goal_request())
-    assert not decision.accepted
-    assert "clock not ready" in decision.reason
+    assert decision.refusal.kind is PRECONDITION_FAILED
+    assert "clock not ready" in decision.refusal.message
 
 
 def test_goal_refused_when_camera_dead_after_first_episode(tmp_path):
@@ -508,7 +535,7 @@ def test_goal_refused_on_schema_drift(tmp_path):
     assert "changed shape" in reason
 
 
-def test_create_failure_leaves_schema_unset(tmp_path):
+def test_create_failure_fails_the_goal_and_leaves_schema_unset(tmp_path):
     plan = arm_plan()
     sink = FailingCreateSink(created=False)
     recorder, cache = recorder_with(plan, sink, tmp_path)
@@ -517,9 +544,7 @@ def test_create_failure_leaves_schema_unset(tmp_path):
         cache.links[ARM0] = fresh_joints()
         ctx = FakeCtx()
         await recorder._run_episode(None, ctx, FakeToken())
-        kind, index, frames, discarded, error = ctx.completions[0]
-        assert (kind, index, frames, discarded) == ("done", -1, 0, True)
-        assert "dataset create failed" in error
+        assert ctx.ending() == ("failed", ATTEMPT_FAILED, "dataset create failed: mkdir failed")
         assert recorder._schema is None
         # The next goal re-probes instead of assuming a dataset exists.
         assert recorder._refuse_reason() is None
@@ -527,15 +552,13 @@ def test_create_failure_leaves_schema_unset(tmp_path):
     asyncio.run(run())
 
 
-def test_contain_episode_failure_completes_goal(tmp_path):
+def test_contain_episode_failure_fails_the_goal(tmp_path):
     recorder, _ = recorder_with(arm_plan(), FakeSink(), tmp_path)
 
     async def run():
         ctx = FakeCtx()
         await recorder._contain_episode_failure(ctx, RuntimeError("unexpected"))
-        kind, index, frames, discarded, error = ctx.completions[0]
-        assert (kind, index, frames, discarded) == ("done", -1, 0, True)
-        assert "internal error: unexpected" in error
+        assert ctx.ending() == ("failed", ATTEMPT_FAILED, "internal error: unexpected")
 
     asyncio.run(run())
 
@@ -574,27 +597,102 @@ def test_max_episode_length_ends_with_save(tmp_path):
         recorder._schema = capture_now(cache, plan)
         ctx = FakeCtx()
         await recorder._record(ctx, FakeToken())
-        kind, _index, frames, discarded, error = ctx.completions[0]
-        assert (kind, discarded) == ("done", False)
-        assert error == "max episode length reached"
-        assert frames == 5
+        assert ctx.ending() == ("cancelled", "max episode length reached", 0, 5, False)
         assert sink.saves == 1
 
     asyncio.run(run())
 
 
-def test_create_failure_reports_cancellation(tmp_path):
+class StopAtFrame(FakeCtx):
+    """A goal context that runs `stop` as the feedback of frame `frame` goes
+    out: the next tick of the episode finds it, whatever the host's speed."""
+
+    def __init__(self, frame, stop):
+        super().__init__()
+        self._frame = frame
+        self._stop = stop
+
+    async def publish_feedback(self, frames_recorded, disk_free_bytes) -> None:
+        await super().publish_feedback(frames_recorded, disk_free_bytes)
+        if frames_recorded == self._frame:
+            self._stop(self)
+
+
+def recorder_on_a_still_clock(tmp_path, sink):
+    """A recorder whose clock stands at the stamp of its one fresh sample, so
+    no source goes stale whatever the host's speed: only the test ends the
+    episode, before its 100-frame bound."""
+    plan = arm_plan()
+    stamp = time.time_ns()
+    recorder, cache = recorder_with(
+        plan, sink, tmp_path, now_ns=lambda: stamp, timing=Timing(max_episode_s=1.0)
+    )
+    cache.links[ARM0] = JointSample(
+        positions=(0.0, 0.0), velocities=(0.0, 0.0), efforts=(), timestamp_ns=stamp
+    )
+    recorder._schema = recording.capture_schema(cache, plan, None, stamp, STALENESS_S)
+    return recorder
+
+
+@pytest.mark.parametrize(
+    ("cause", "reason"),
+    [("caller", "cancelled by its caller"), ("sender_gone", "its sender is gone")],
+)
+def test_a_cancel_saves_the_episode_and_ends_the_goal_cancelled(tmp_path, cause, reason):
+    sink = FakeSink(fps=100)
+    recorder = recorder_on_a_still_clock(tmp_path, sink)
+    ctx = StopAtFrame(2, lambda ctx: ctx.request_cancel(cause))
+
+    asyncio.run(recorder._record(ctx, FakeToken()))
+    # The episode saved: the goal ends cancelled with its result, for the
+    # reason of the cause of the cancel.
+    assert ctx.ending() == ("cancelled", reason, 0, 2, False)
+    assert sink.saves == 1
+
+
+def test_a_shutdown_saves_the_episode_and_ends_the_goal_cancelled(tmp_path):
+    sink = FakeSink(fps=100)
+    recorder = recorder_on_a_still_clock(tmp_path, sink)
+    token = FakeToken()
+    ctx = StopAtFrame(2, lambda _ctx: token._event.set())
+
+    async def run():
+        await recorder._record(ctx, token)
+
+    asyncio.run(run())
+    assert ctx.ending() == ("cancelled", "recorder shutting down", 0, 2, False)
+    assert sink.saves == 1
+
+
+def test_a_cancel_before_two_frames_fails_the_goal_with_nothing_saved(tmp_path):
+    sink = FakeSink(fps=100)
+    recorder = recorder_on_a_still_clock(tmp_path, sink)
+
+    async def run():
+        ctx = FakeCtx()
+        ctx.request_cancel()
+        await recorder._record(ctx, FakeToken())
+        assert ctx.ending() == (
+            "failed",
+            ATTEMPT_FAILED,
+            "too short to save: 0 frame(s), need 2 (cancelled by its caller)",
+        )
+        assert sink.saves == 0
+
+    asyncio.run(run())
+
+
+def test_create_failure_fails_a_cancelled_goal(tmp_path):
     plan = arm_plan()
     recorder, cache = recorder_with(plan, FailingCreateSink(created=False), tmp_path)
 
     async def run():
         cache.links[ARM0] = fresh_joints()
         ctx = FakeCtx()
-        ctx._cancel.set()
+        ctx.request_cancel()
         await recorder._run_episode(None, ctx, FakeToken())
-        kind, index, frames, discarded, error = ctx.completions[0]
-        assert (kind, index, frames, discarded) == ("cancelled", -1, 0, True)
-        assert "dataset create failed" in error
+        # Nothing was saved, so the goal fails even though it was cancelled.
+        assert ctx.ending() == ("failed", ATTEMPT_FAILED, "dataset create failed: mkdir failed")
 
     asyncio.run(run())
 
@@ -618,9 +716,11 @@ def test_depth_unit_drift_ends_goal_before_recording(tmp_path):
     async def run():
         ctx = FakeCtx()
         await recorder._run_episode(None, ctx, FakeToken())
-        kind, index, frames, discarded, error = ctx.completions[0]
-        assert (kind, index, frames, discarded) == ("done", -1, 0, True)
-        assert "depth unit changed" in error
+        assert ctx.ending() == (
+            "failed",
+            PRECONDITION_FAILED,
+            "rgbd depth unit changed since the dataset was created",
+        )
         assert sink.frames == 0
 
     asyncio.run(run())
@@ -636,7 +736,10 @@ def resume_recorder(tmp_path, current=None, existing=None, **overrides):
 
         def open_existing(name):
             if name != "2026-07-27_10-00-00":
-                raise ValueError(f"no session named {name} under this storage target")
+                raise resume_session.Failure(
+                    resume_session.FailureKind.REJECTED,
+                    f"no session named {name} under this storage target",
+                )
             return target_dir, existing, None
 
         recorder._open_existing = open_existing
@@ -650,10 +753,8 @@ def test_resume_swaps_onto_the_existing_session(tmp_path):
 
     async def run():
         cache.links[ARM0] = fresh_joints()
-        session, episodes, error = await recorder.resume_session(
-            "2026-07-27_10-00-00", None
-        )
-        assert (session, episodes, error) == ("2026-07-27_10-00-00", 3, None)
+        session, episodes = await recorder.resume_session("2026-07-27_10-00-00", None)
+        assert (session, episodes) == ("2026-07-27_10-00-00", 3)
         assert recorder._sink is existing
         assert recorder._session_dir.name == "2026-07-27_10-00-00"
         assert recorder._schema is not None
@@ -673,62 +774,76 @@ def test_resume_finalizes_the_abandoned_empty_session(tmp_path):
 
     async def run():
         cache.links[ARM0] = fresh_joints()
-        _, _, error = await recorder.resume_session("2026-07-27_10-00-00", None)
-        assert error is None
+        await recorder.resume_session("2026-07-27_10-00-00", None)
         assert current.finalized
 
     asyncio.run(run())
 
 
-def test_resume_refusals_leave_state_untouched(tmp_path):
+RESUME_REJECTED = resume_session.FailureKind.REJECTED
+RESUME_PRECONDITION_FAILED = resume_session.FailureKind.PRECONDITION_FAILED
+RESUME_ATTEMPT_FAILED = resume_session.FailureKind.ATTEMPT_FAILED
+
+
+def test_resume_error_replies_leave_state_untouched(tmp_path):
     existing = FakeSink(created=False)
     recorder, cache = resume_recorder(tmp_path, existing=existing)
     original_sink = recorder._sink
     original_dir = recorder._session_dir
 
-    async def refused(name="2026-07-27_10-00-00"):
-        session, episodes, error = await recorder.resume_session(name, None)
-        assert session == "" and episodes == 0 and error
+    async def refused(name="2026-07-27_10-00-00") -> tuple:
+        with pytest.raises(resume_session.Failure) as raised:
+            await recorder.resume_session(name, None)
         assert recorder._sink is original_sink
         assert recorder._session_dir is original_dir
         assert recorder._schema is None
         assert not recorder._resuming
-        return error
+        return raised.value.kind, raised.value.message
 
     async def run():
         recorder._recording = True
-        assert "episode is recording" in await refused()
+        assert await refused() == (RESUME_PRECONDITION_FAILED, "an episode is recording")
         recorder._recording = False
 
         recorder._finishing = True
-        assert "finishing the session" in await refused()
+        assert await refused() == (RESUME_PRECONDITION_FAILED, "finishing the session")
         recorder._finishing = False
 
         recorder._roll_pending = True
-        assert "retry finish_session" in await refused()
+        kind, message = await refused()
+        assert kind is RESUME_PRECONDITION_FAILED and "retry finish_session" in message
         recorder._roll_pending = False
 
         # Unknown name from the factory.
-        assert "no session named" in await refused("2026-01-01_00-00-00")
+        kind, message = await refused("2026-01-01_00-00-00")
+        assert kind is RESUME_REJECTED and "no session named" in message
 
-        # Preflight refusal (e.g. no saved episodes).
+        # A stored session with nothing to append to.
         existing.preflight_error = ValueError("session has no saved episodes")
-        assert "no saved episodes" in await refused()
+        assert await refused() == (RESUME_REJECTED, "session has no saved episodes")
         existing.preflight_error = None
 
         # Sources not live: schema capture fails.
-        assert "not ready to resume" in await refused()
+        kind, message = await refused()
+        assert kind is RESUME_PRECONDITION_FAILED and "not ready to resume" in message
 
-        # Compatibility refusal from Sink.resume.
+        # The live sources no longer match the session.
         cache.links[ARM0] = fresh_joints()
         existing.resume_error = ValueError("dataset fps is 30, this recorder runs 100")
-        assert "cannot resume" in await refused()
+        kind, message = await refused()
+        assert kind is RESUME_PRECONDITION_FAILED and "cannot resume" in message
+        existing.resume_error = None
+
+        # The resume itself fails.
+        existing.resume_error = OSError("disk unplugged")
+        assert await refused() == (RESUME_ATTEMPT_FAILED, "resume failed: disk unplugged")
         existing.resume_error = None
 
         # A current session with saved episodes must be finished first.
         recorder._sink.created = True
         recorder._sink.saves = 2
-        assert "finish it first" in await refused()
+        kind, message = await refused()
+        assert kind is RESUME_PRECONDITION_FAILED and "finish it first" in message
 
     asyncio.run(run())
 
@@ -739,8 +854,11 @@ def test_resume_refuses_the_current_session_name(tmp_path):
     recorder._session_dir = tmp_path / "2026-07-27_10-00-00"
 
     async def run():
-        _, _, error = await recorder.resume_session("2026-07-27_10-00-00", None)
-        assert "currently recording" in error
+        with pytest.raises(resume_session.Failure) as raised:
+            await recorder.resume_session("2026-07-27_10-00-00", None)
+        assert raised.value == resume_session.Failure(
+            RESUME_PRECONDITION_FAILED, "that session is currently recording"
+        )
 
     asyncio.run(run())
 
@@ -749,8 +867,11 @@ def test_resume_unavailable_without_a_factory(tmp_path):
     recorder, _ = resume_recorder(tmp_path)
 
     async def run():
-        _, _, error = await recorder.resume_session("2026-07-27_10-00-00", None)
-        assert "resume unavailable" in error
+        with pytest.raises(resume_session.Failure) as raised:
+            await recorder.resume_session("2026-07-27_10-00-00", None)
+        assert raised.value == resume_session.Failure(
+            RESUME_PRECONDITION_FAILED, "session resume unavailable"
+        )
 
     asyncio.run(run())
 
@@ -759,14 +880,19 @@ def test_goals_and_finish_refused_while_resuming(tmp_path):
     recorder, _cache = resume_recorder(tmp_path)
     recorder._resuming = True
     decision = recorder._decide(goal_request())
-    assert not decision.accepted
-    assert "resuming a session" in decision.reason
+    assert decision.refusal == record_episode.Failure(PRECONDITION_FAILED, "resuming a session")
 
     async def run():
-        _, error = await recorder.finish_session()
-        assert "resuming a session" in error
-        _, _, error = await recorder.resume_session("2026-07-27_10-00-00", None)
-        assert "already resuming" in error
+        with pytest.raises(finish_session.Failure) as raised:
+            await recorder.finish_session()
+        assert raised.value == finish_session.Failure(
+            finish_session.FailureKind.PRECONDITION_FAILED, "resuming a session"
+        )
+        with pytest.raises(resume_session.Failure) as raised:
+            await recorder.resume_session("2026-07-27_10-00-00", None)
+        assert raised.value == resume_session.Failure(
+            RESUME_PRECONDITION_FAILED, "already resuming"
+        )
 
     asyncio.run(run())
 
@@ -812,8 +938,8 @@ def test_resume_serializes_against_a_warmup_create_in_flight(tmp_path):
         assert not resume.done()
         current.proceed.set()
         keep_live()
-        session, _episodes, error = await asyncio.wait_for(resume, timeout=5)
-        assert error is None and session
+        session, _episodes = await asyncio.wait_for(resume, timeout=5)
+        assert session
         # The in-flight create landed on the OLD sink; the resumed sink never
         # saw a create, and the schema is resume's capture.
         assert current.created and current.finalized
@@ -890,8 +1016,7 @@ def test_warmup_rearms_the_session_finish_session_rolls_to(tmp_path):
             _until(lambda: recorder._schema is not None, tick=keep_live), timeout=5
         )
         first_sink.saves = 2
-        _, error = await recorder.finish_session()
-        assert error is None
+        await recorder.finish_session()
         # The rolled-to session warms up on its own; without a persistent
         # warm-up its first episode would pay dataset creation at Record.
         await asyncio.wait_for(
@@ -920,8 +1045,8 @@ def test_finish_session_rolls_to_a_fresh_session(tmp_path):
         cache.links[ARM0] = fresh_joints()
         await recorder._ensure_created(None)
         first_sink.saves = 2
-        name, error = await recorder.finish_session()
-        assert error is None and name
+        name = await recorder.finish_session()
+        assert name == tmp_path.name
         assert first_sink.finalized
         assert recorder._sink is second_sink
         assert recorder._session_dir == next_dir
@@ -930,21 +1055,35 @@ def test_finish_session_rolls_to_a_fresh_session(tmp_path):
     asyncio.run(run())
 
 
+FINISH_PRECONDITION_FAILED = finish_session.FailureKind.PRECONDITION_FAILED
+FINISH_ATTEMPT_FAILED = finish_session.FailureKind.ATTEMPT_FAILED
+
+
+async def finish_error_reply(recorder) -> finish_session.Failure:
+    """The error reply finish_session gives now."""
+    with pytest.raises(finish_session.Failure) as raised:
+        await recorder.finish_session()
+    return raised.value
+
+
 def test_finish_session_refuses_when_empty_or_recording(tmp_path):
     recorder, _ = recorder_with(arm_plan(), FakeSink(), tmp_path)
     recorder._open_session = lambda: (tmp_path, FakeSink(created=False), None)
 
     async def run():
-        _, error = await recorder.finish_session()
-        assert "nothing recorded" in error
+        assert await finish_error_reply(recorder) == finish_session.Failure(
+            FINISH_PRECONDITION_FAILED, "nothing recorded this session"
+        )
         recorder._sink.saves = 1
         recorder._recording = True
-        _, error = await recorder.finish_session()
-        assert "recording" in error
+        assert await finish_error_reply(recorder) == finish_session.Failure(
+            FINISH_PRECONDITION_FAILED, "an episode is recording"
+        )
         recorder._recording = False
         recorder._finishing = True
-        _, error = await recorder.finish_session()
-        assert "already finishing" in error
+        assert await finish_error_reply(recorder) == finish_session.Failure(
+            FINISH_PRECONDITION_FAILED, "already finishing"
+        )
 
     asyncio.run(run())
 
@@ -956,9 +1095,9 @@ def test_finish_session_refuses_before_the_dataset_exists(tmp_path):
     recorder._open_session = lambda: (tmp_path, FakeSink(created=False), None)
 
     async def run():
-        name, error = await recorder.finish_session()
-        assert name == ""
-        assert "nothing recorded" in error
+        assert await finish_error_reply(recorder) == finish_session.Failure(
+            FINISH_PRECONDITION_FAILED, "nothing recorded this session"
+        )
 
     asyncio.run(run())
 
@@ -969,8 +1108,9 @@ def test_finish_session_refuses_without_a_session_factory(tmp_path):
     recorder, _ = recorder_with(arm_plan(), sink, tmp_path)
 
     async def run():
-        _, error = await recorder.finish_session()
-        assert "session rolling unavailable" in error
+        assert await finish_error_reply(recorder) == finish_session.Failure(
+            FINISH_PRECONDITION_FAILED, "session rolling unavailable"
+        )
         assert not sink.finalized
 
     asyncio.run(run())
@@ -995,16 +1135,17 @@ def test_finish_session_roll_failure_refuses_goals_until_retried(tmp_path):
     recorder._open_session = failing_then_working
 
     async def run():
-        name, error = await recorder.finish_session()
-        assert name == "" and "finish failed" in error
+        assert await finish_error_reply(recorder) == finish_session.Failure(
+            FINISH_ATTEMPT_FAILED, "finish failed: mkdir failed"
+        )
         assert sink.finalized
         # The finalized sink must not take another episode.
         decision = recorder._decide(goal_request())
-        assert not decision.accepted
-        assert "retry finish_session" in decision.reason
+        assert decision.refusal.kind is PRECONDITION_FAILED
+        assert "retry finish_session" in decision.refusal.message
         assert not recorder._recording
-        name, error = await recorder.finish_session()
-        assert error is None and name
+        name = await recorder.finish_session()
+        assert name == tmp_path.name
         # The retry rolled without closing the already-finalized sink again.
         assert sink.finalizes == 1
         assert recorder._sink is next_sink
@@ -1061,9 +1202,9 @@ def test_finish_session_keeps_the_session_when_finalize_fails(tmp_path):
     recorder._open_session = lambda: pytest.fail("rolled despite a failed finalize")
 
     async def run():
-        name, error = await recorder.finish_session()
-        assert name == ""
-        assert "finish failed" in error
+        assert await finish_error_reply(recorder) == finish_session.Failure(
+            FINISH_ATTEMPT_FAILED, "finish failed: parquet footer failed"
+        )
         assert recorder._sink is sink
         # Not left latched: a retry is allowed once the fault clears.
         assert not recorder._finishing
@@ -1071,10 +1212,11 @@ def test_finish_session_keeps_the_session_when_finalize_fails(tmp_path):
     asyncio.run(run())
 
 
-def test_short_video_outranks_the_ordinary_ending_and_is_logged(tmp_path, capsys):
+def test_a_short_video_saves_the_episode_and_is_logged(tmp_path, capsys):
     """The episode saved, so it is not discarded, but its video no longer
-    covers its rows. That outranks whatever ended the episode in the result,
-    and the run log keeps it after the panel's status line has moved on."""
+    covers its rows. The goal ends as the episode's ending says, and the run
+    log keeps the short video, for the operator to know before training on
+    the episode."""
     plan = arm_plan()
     video_error = "video is shorter than the state rows (cam0 3 frame(s) missing)"
     sink = FakeSink(video_error=video_error)
@@ -1085,12 +1227,10 @@ def test_short_video_outranks_the_ordinary_ending_and_is_logged(tmp_path, capsys
         recorder._schema = capture_now(cache, plan)
         ctx = FakeCtx()
         await recorder._record(ctx, FakeToken())
-        kind, index, _frames, discarded, error = ctx.completions[0]
-        assert (kind, index, discarded) == ("done", 0, False)
-        # Equality, not containment: the episode ended on a stale source, and
-        # the result must carry the short video INSTEAD of that reason, not
-        # alongside it.
-        assert error == video_error
+        ending, reason, index, _frames, discarded = ctx.ending()
+        assert (ending, index, discarded) == ("cancelled", 0, False)
+        # The episode ended on a stale source, and the reason names it.
+        assert "stale" in reason
         assert sink.saves == 1, "a short video is still a saved episode"
 
     asyncio.run(run())

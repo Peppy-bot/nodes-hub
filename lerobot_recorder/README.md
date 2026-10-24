@@ -62,9 +62,10 @@ the live session is not (its open files lack footers until finalize, a
 lerobot format property). Recording continues into the new session.
 Training across several session datasets is standard lerobot practice
 (`MultiLeRobotDataset`, or merge them with
-`lerobot-edit-dataset --operation.type merge`). `finish_session` refuses
-while an episode is recording and when the session has no episodes;
-stopping the node finishes the current session the same way.
+`lerobot-edit-dataset --operation.type merge`). `finish_session` gives an
+error reply with `precondition_failed` while an episode is recording and
+when the session has no episodes, and with `attempt_failed` when the finish
+fails; stopping the node finishes the current session the same way.
 
 ### Resuming a session
 
@@ -75,13 +76,17 @@ unfinished sessions alike are resumable as long as they hold at least one
 saved episode; the library appends in fresh chunk files, so finished files
 are never rewritten and the session can be finished again afterwards. The
 current session must be empty; it is abandoned in place, never deleted.
-Resume is refused until every live source is fresh, because the session's
-recorded features are checked against the live sources before anything is
-constructed; a session recorded with different cameras, rates, or joints
-is refused with the difference named. Each session also records which
-source fed which dimension (`session.json`), and a launch that binds the
-same sources to different limbs is refused: features alone cannot catch
-that swap, since limbs keep their follower-derived names either way. After
+Resume gets an error reply with `precondition_failed` until every live
+source is fresh, because the session's recorded features are checked
+against the live sources before anything is constructed; a session recorded
+with different cameras, rates, or joints gets the same error reply, with
+the difference named. Each session also records which source fed which
+dimension (`session.json`), and a launch that binds the same sources to
+different limbs gets that error reply too: features alone cannot catch that
+swap, since limbs keep their follower-derived names either way. A name that
+names no session of this node, or a session with no saved episode, gets an
+error reply with `rejected`. After an error reply the open session stays as
+it was. After
 an unclean stop a session
 remains resumable, but episodes since its last chunk rotation may be
 unreadable (their parquet footer was never written).
@@ -158,16 +163,22 @@ convention (aws-cli, spark, smart_open).
 
 ## Episodes
 
-One `record_episode` goal is one episode. A goal is refused until every
-observed source and camera has produced a fresh sample (`max_staleness_s`),
-the disk floor holds (`min_remaining_disk_bytes`), and the dataset schema
-still matches the live sources. A source going stale or silent mid-episode
-ends the episode with a save and the reason in the goal result; episodes
-also auto-stop at the length where LeRobot's float32 timestamps would stop
-loading. Feedback carries one message per recorded frame with
-`disk_free_bytes` riding along about once per second.
+One `record_episode` goal is one episode, and the goal never completes. A
+goal is refused with `precondition_failed` until every observed source and
+camera has produced a fresh sample (`max_staleness_s`), the disk floor holds
+(`min_remaining_disk_bytes`), and the dataset schema still matches the live
+sources, and while another episode records. The caller's cancel ends the
+episode with a save. So does the recorder itself when a source goes stale or
+silent mid-episode, when the disk floor trips, when it cannot keep its frame
+rate, when it shuts down, and at the length where LeRobot's float32
+timestamps would stop loading. A saved episode ends its goal cancelled with
+its result, for a reason that names the cause. Feedback carries one message
+per recorded frame with `disk_free_bytes` riding along about once per
+second.
 
-An episode of fewer than two frames is discarded instead of saved. LeRobot
+An episode that cannot be written or saved fails its goal with
+`attempt_failed`, and its frames are dropped. So does an episode of fewer
+than two frames, which is discarded instead of saved. LeRobot
 computes episode stats differently below two samples and the two branches
 disagree on dtype for the integer columns, so a one-frame episode writes a
 dataset schema every later episode is rejected against, which wedges the
