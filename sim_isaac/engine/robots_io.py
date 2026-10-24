@@ -23,6 +23,7 @@ from peppygen.exposed_services.robots import is_ready
 
 from sim_robot_core.registry import Caller, Registry, Robot
 
+from cancels import cancel_reason
 from edits import Edits
 from isaac_models import IsaacModel, IsaacModels
 from world import SPOT_PITCH_M, Placement, World, name_in_the_stage, within_one_spot
@@ -41,14 +42,20 @@ _RETRY_BACKOFF_S = 1.0
 # The same, for the readiness service: every robot's readiness runs through
 # that one loop, so it is back well inside a readiness poll.
 _READY_RETRY_BACKOFF_S = 0.05
+# The reason the goal that held a robot ends cancelled with, once another
+# goal of the same caller holds the robot.
+_HANDED_OVER = "another goal of the same caller holds the robot now"
 
 logger = logging.getLogger(__name__)
 
 
 class Ending(enum.Enum):
-    """How a robot's stay ended."""
+    """How a robot's stay ended. The goal of a robot that left or was handed
+    over ends cancelled, and the goal of any other stay fails with
+    `resource_unavailable`: the engine took the robot out."""
 
-    #: Its caller cancelled the goal.
+    #: Its goal received its cancel signal: a cancel of its caller, or a
+    #: sender gone for longer than the sender grace.
     LEFT = "left"
     #: Its pairs were not the ones its model asks for, for the pair grace time.
     LAPSED = "lapsed"
@@ -58,6 +65,14 @@ class Ending(enum.Enum):
     STOPPED = "stopped"
     #: Its holder could not be told it stands, so it is taken out.
     FAILED = "failed"
+
+
+def _asked_placement(asked) -> Optional[Placement]:
+    """The placement an attach goal names, or None when it leaves the spot
+    to the engine. Raises ValueError for a placement the stage cannot take."""
+    if asked is None:
+        return None
+    return Placement.of(asked.position, asked.yaw)
 
 
 class RobotsIO:
@@ -163,8 +178,12 @@ class RobotsIO:
     async def start(self) -> None:
         """Exposes both contracts and spawns their loops. Runs on the node
         loop before the sim thread starts, so a robot that attaches early
-        waits while the scene compiles and then stands."""
+        waits while the scene compiles and then stands. The sender grace of
+        the attach goal is the pair grace time: a robot whose initializer is
+        gone stays that long, so an initializer that comes back within it
+        registers the robot that still stands."""
         handle = await attach.ActionHandle.expose(self._node_runner)
+        await handle.set_sender_grace(self._pair_grace_s)
         self._tasks = [
             asyncio.create_task(self._serve_attach(handle)),
             asyncio.create_task(self._serve_ready()),
@@ -245,14 +264,22 @@ class RobotsIO:
         names its own model gives them: the model must be one this engine
         stands, the placement must be free, and the name must be free or
         already this caller's own robot. Admitting reserves the name, or
-        hands this caller's standing robot over to the goal being admitted."""
+        hands this caller's standing robot over to the goal being admitted.
+
+        A request this engine never takes (a name it cannot stand a robot
+        under, a model it has no entry for, a placement that is not finite)
+        is refused with `rejected`. A request the stage cannot take now (a
+        name or a spot another robot holds, a second robot of the caller,
+        another model for the robot the caller stands) is refused with
+        `precondition_failed`."""
         caller = Caller(core_node=request.core_node, instance_id=request.instance_id)
         self._admitted = None
         try:
             robot_name = name_in_the_stage(request.data.robot)
             entry = self._models.of(request.data.model).entry
+            asked = _asked_placement(request.data.placement)
         except ValueError as error:
-            return attach.GoalDecision.reject(str(error))
+            return attach.GoalDecision.refuse(attach.FailureKind.REJECTED, str(error))
         limbs = attach.GoalResponse(
             arm_names=entry.arm_names(),
             arm_joints=entry.arm_joint_counts(),
@@ -261,17 +288,17 @@ class RobotsIO:
         try:
             adopted = self._robots.admit(robot_name, entry, caller)
         except ValueError as error:
-            return attach.GoalDecision.reject(str(error))
+            return attach.GoalDecision.refuse(attach.FailureKind.PRECONDITION_FAILED, str(error))
         if adopted:
             # The robot stands where it stands; only its host changes,
             # and the stay taking it over is what ends the one hosting
             # it now.
             return attach.GoalDecision.accept(limbs)
         try:
-            placement = self._placement(request.data.placement, robot_name)
+            placement = self._placement(asked, robot_name)
         except ValueError as error:
             self._robots.release(robot_name)
-            return attach.GoalDecision.reject(str(error))
+            return attach.GoalDecision.refuse(attach.FailureKind.PRECONDITION_FAILED, str(error))
         self._placements[robot_name] = placement
         self._admitted = robot_name
         return attach.GoalDecision.accept(limbs)
@@ -287,7 +314,7 @@ class RobotsIO:
         self._handover(name).set()
         self._handovers[name] = asyncio.Event()
 
-    def _placement(self, asked, name: str) -> Placement:
+    def _placement(self, asked: Optional[Placement], name: str) -> Placement:
         """Where the robot stands: what it asked for, or a spot of the
         engine's own. A spot another robot stands on is refused, because two
         robots in one place resolve their overlap by throwing each other.
@@ -296,15 +323,14 @@ class RobotsIO:
         promised = tuple(self._placements.values())
         if asked is None:
             return self._world.free_spot(promised, name)
-        placement = Placement.of(asked.position, asked.yaw)
-        holder = self._whoever_holds(placement, name)
+        holder = self._whoever_holds(asked, name)
         if holder is not None:
             raise ValueError(
-                f"{holder} within {SPOT_PITCH_M:g} m of {list(placement.position)}: stand "
+                f"{holder} within {SPOT_PITCH_M:g} m of {list(asked.position)}: stand "
                 "this robot further off, or turn its `placement.auto` on and take the spot "
                 "this stage gives it"
             )
-        return placement
+        return asked
 
     def _whoever_holds(self, placement: Placement, name: str) -> Optional[str]:
         """Who is in the way of a robot joining as `name`: the robot standing
@@ -339,7 +365,10 @@ class RobotsIO:
         model = request.data.model
         robot = self._robots.of_name(name)
         if robot is None:
-            await context.complete(False, "the name was given back before the robot stood")
+            await context.fail(
+                attach.FailureKind.ATTEMPT_FAILED,
+                "the name was given back before the robot stood",
+            )
             return
         adopted = robot.standing()
         if adopted:
@@ -374,10 +403,13 @@ class RobotsIO:
     ) -> None:
         """Ends a robot's stay the way it ended: a robot handed over stays
         standing for its new goal, one whose engine is stopping goes down
-        with the stage, and any other is taken off the stage first."""
+        with the stage, and any other is taken off the stage first. The goal
+        of a robot that left or was handed over ends cancelled for `why`; the
+        goal of any other fails with `resource_unavailable`, and `why` is its
+        message."""
         if ending is Ending.HANDED_OVER:
             logger.info("robot '%s' is hosted by another goal of its copy", name)
-            await context.complete(False, why)
+            await context.complete_cancelled(why)
             return
         # Everything this robot's joining held goes back before the stage is
         # asked to let it go. Taking a robot out waits for the thread that
@@ -398,22 +430,25 @@ class RobotsIO:
                     error,
                 )
         if ending is Ending.LEFT:
-            await context.complete_cancelled(True, why)
+            await context.complete_cancelled(why)
         else:
-            await context.complete(False, why)
+            await context.fail(attach.FailureKind.RESOURCE_UNAVAILABLE, why)
 
     async def _stand(self, context: attach.GoalContext, name: str, model: str) -> bool:
         """Puts the robot on the stage, answering the goal itself when the
-        scene will not take it, or when the robot leaves while its stand
-        still waits for the thread that steps the scene: that stand is
-        withdrawn and the name given back at once. False when the robot
-        never stood."""
+        scene will not take it (failed with `attempt_failed`), or when the
+        robot leaves while its stand still waits for the thread that steps
+        the scene (cancelled): that stand is withdrawn and the name given
+        back at once. False when the robot never stood."""
         placement = self._placements.get(name)
         if placement is None:
             # Whatever took the spot back took the name with it, and this
             # goal is the one holding it now.
             self._robots.release(name)
-            await context.complete(False, "the name was given back before the robot stood")
+            await context.fail(
+                attach.FailureKind.ATTEMPT_FAILED,
+                "the name was given back before the robot stood",
+            )
             return False
         known = self._models.of(model)
         edit = self._edits.submit(lambda: self.stand(name, known, placement))
@@ -427,7 +462,7 @@ class RobotsIO:
             self._forget(name)
             self._robots.release(name)
             logger.info("robot '%s' left before it stood", name)
-            await context.complete_cancelled(True, "the robot left before it stood")
+            await context.complete_cancelled(cancel_reason(context))
             return False
         try:
             await standing
@@ -435,7 +470,10 @@ class RobotsIO:
             logger.warning("robot '%s' could not join: %s", name, error)
             self._forget(name)
             self._robots.release(name)
-            await context.complete(False, f"the scene could not stand the robot: {error}")
+            await context.fail(
+                attach.FailureKind.ATTEMPT_FAILED,
+                f"the scene could not stand the robot: {error}",
+            )
             return False
         self._robots.stand(name)
         logger.info("robot '%s' (%s) is in the scene", name, model)
@@ -444,7 +482,8 @@ class RobotsIO:
     async def _watch(
         self, context: attach.GoalContext, name: str, handover: asyncio.Event
     ) -> tuple[Ending, str]:
-        """Waits for the robot's stay to end, and says how it ended."""
+        """Waits for the robot's stay to end, and says how it ended and why.
+        A robot that left gives the cause of the cancel of its goal."""
         cancel = asyncio.create_task(context.cancel_signal())
         handed = asyncio.create_task(handover.wait())
         period = self._pair_grace_check_period()
@@ -454,12 +493,9 @@ class RobotsIO:
                     {cancel, handed}, timeout=period, return_when=asyncio.FIRST_COMPLETED
                 )
                 if handed in done:
-                    return (
-                        Ending.HANDED_OVER,
-                        "this robot is hosted by another goal of this copy",
-                    )
+                    return Ending.HANDED_OVER, _HANDED_OVER
                 if cancel in done:
-                    return Ending.LEFT, "the robot left the scene"
+                    return Ending.LEFT, cancel_reason(context)
                 if self._stopping.is_set():
                     return Ending.STOPPED, "the engine stopped"
                 robot = self._robots.of_name(name)

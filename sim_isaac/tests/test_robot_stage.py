@@ -24,7 +24,8 @@ import pytest
 from sim_robot_core.pairs import Held
 from sim_robot_core.registry import Caller, Registry
 
-import runtime_fakes  # noqa: F401  pylint: disable=W0611  (installs the runtime robots_io imports)
+import runtime_fakes  # pylint: disable=W0611  (installs the runtime robots_io imports)
+from runtime_fakes import FailureKind
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "engine"))
 
@@ -136,7 +137,8 @@ def test_a_removal_that_fails_takes_the_stage_back_up():
 
 
 class _Goal:
-    """The parts of an attach goal a robot's stand reads and answers."""
+    """The parts of an attach goal a robot's stand reads and answers. Its
+    holder cancels it, once it lets go."""
 
     def __init__(self, request=None):
         self.leave = asyncio.Event()
@@ -150,14 +152,20 @@ class _Goal:
     async def cancel_signal(self):
         await self.leave.wait()
 
+    def cancel_cause(self):
+        return "caller"
+
     async def publish_feedback(self, standing):
         self.feedback.append(standing)
 
-    async def complete(self, success, message):
-        self.answers.append(("completed", success, message))
+    async def complete(self):
+        self.answers.append(("completed",))
 
-    async def complete_cancelled(self, success, message):
-        self.answers.append(("cancelled", success, message))
+    async def fail(self, kind, message):
+        self.answers.append(("failed", kind, message))
+
+    async def complete_cancelled(self, reason):
+        self.answers.append(("cancelled", reason))
 
 
 def _joining_io():
@@ -186,7 +194,7 @@ def test_a_stand_whose_spot_was_taken_back_gives_the_name_back():
 
     io._robots.release.assert_called_once_with("alpha")
     assert goal.answers == [
-        ("completed", False, "the name was given back before the robot stood")
+        ("failed", FailureKind.ATTEMPT_FAILED, "the name was given back before the robot stood")
     ]
 
 
@@ -201,7 +209,7 @@ def test_a_stay_whose_name_went_back_before_it_began_answers_its_own_goal():
     asyncio.run(io._stay(goal))
 
     assert goal.answers == [
-        ("completed", False, "the name was given back before the robot stood")
+        ("failed", FailureKind.ATTEMPT_FAILED, "the name was given back before the robot stood")
     ]
 
 
@@ -221,7 +229,7 @@ def test_a_robot_that_leaves_before_the_stage_takes_it_up_never_stands():
     goal, stood = asyncio.run(leave_while_waiting())
 
     assert stood is False
-    assert goal.answers == [("cancelled", True, "the robot left before it stood")]
+    assert goal.answers == [("cancelled", "cancelled by its caller")]
     io._robots.release.assert_called_once_with("alpha")
     io._robots.stand.assert_not_called()
     assert "alpha" not in io._placements
@@ -304,7 +312,11 @@ def test_a_robot_whose_holder_cannot_be_told_it_stands_is_taken_out():
 
     io._edits.submit.assert_called_once()
     assert goal.answers == [
-        ("completed", False, "the robot's holder could not be told it stands: the holder is away")
+        (
+            "failed",
+            FailureKind.RESOURCE_UNAVAILABLE,
+            "the robot's holder could not be told it stands: the holder is away",
+        )
     ]
 
 
@@ -318,7 +330,7 @@ def test_a_stay_ending_with_the_engine_asks_nothing_of_the_stopping_stage():
     io._edits.submit.assert_not_called()
     io._robots.release.assert_called_once_with("alpha")
     assert "alpha" not in io._placements
-    assert goal.answers == [("completed", False, "the engine stopped")]
+    assert goal.answers == [("failed", FailureKind.RESOURCE_UNAVAILABLE, "the engine stopped")]
 
 
 def test_a_stay_that_lapsed_takes_the_robot_off_the_stage_first():
@@ -332,7 +344,9 @@ def test_a_stay_that_lapsed_takes_the_robot_off_the_stage_first():
     )
 
     io._edits.submit.assert_called_once()
-    assert goal.answers == [("completed", False, "its pairs were gone for the pair grace time")]
+    assert goal.answers == [
+        ("failed", FailureKind.RESOURCE_UNAVAILABLE, "its pairs were gone for the pair grace time")
+    ]
 
 
 # What a robot holds once every limb of its model is paired.
@@ -438,7 +452,9 @@ def test_a_robot_the_stage_refused_gives_back_its_name_and_its_spot():
     assert asyncio.run(stand_and_drain()) is False
     io._robots.release.assert_called_once_with("alpha")
     assert io._placements == {}
-    assert "the stage will not take it" in goal.answers[0][2]
+    ((outcome, kind, message),) = goal.answers
+    assert (outcome, kind) == ("failed", FailureKind.ATTEMPT_FAILED)
+    assert "the stage will not take it" in message
 
 
 def test_a_robot_that_stood_is_recorded_as_standing():
@@ -513,7 +529,7 @@ class TestHowAStayEnds:
         ending, why = asyncio.run(io._watch(_Leaving(), "alpha", handover))
 
         assert ending is Ending.HANDED_OVER
-        assert why == "this robot is hosted by another goal of this copy"
+        assert why == "another goal of the same caller holds the robot now"
 
     def test_a_holder_that_lets_go_ends_its_stay(self):
         """`peppy stack remove` cancels the goal, which is how a copy takes
@@ -528,7 +544,7 @@ class TestHowAStayEnds:
         ending, why = asyncio.run(let_go())
 
         assert ending is Ending.LEFT
-        assert why == "the robot left the scene"
+        assert why == "cancelled by its caller"
 
     def test_a_stopping_engine_ends_every_stay(self):
         io = self._watching()
@@ -800,8 +816,8 @@ class TestAdmission:
 
         decision = io._admit(_request("alpha", model))
 
-        assert decision.accepted
-        answer = decision.payload
+        assert decision.refusal is None
+        answer = decision.response
         assert (answer.arm_names, answer.arm_joints, answer.gripper_names) == (
             arm_names,
             arm_joints,
@@ -809,13 +825,13 @@ class TestAdmission:
         )
         assert io._robots.of_name("alpha").model == model
 
-    def test_a_model_the_engine_has_no_entry_for_is_refused_with_the_ones_it_stands(self):
+    def test_a_model_the_engine_has_no_entry_for_is_rejected_with_the_ones_it_stands(self):
         io = _admitting()
 
         decision = io._admit(_request("alpha", "openarm_v9"))
 
-        assert not decision.accepted
-        assert decision.payload == (
+        assert decision.refusal.kind is FailureKind.REJECTED
+        assert decision.refusal.message == (
             "unknown model 'openarm_v9': this engine stands openarm_v1, openarm_v2, so101"
         )
         assert io._robots.robots() == []
@@ -824,8 +840,8 @@ class TestAdmission:
     def test_an_so101_is_admitted_beside_an_openarm_each_on_a_spot_of_its_own(self):
         io = _admitting()
 
-        assert io._admit(_request("alpha", "openarm_v2")).accepted
-        assert io._admit(_request("charlo", "so101")).accepted
+        assert io._admit(_request("alpha", "openarm_v2")).refusal is None
+        assert io._admit(_request("charlo", "so101")).refusal is None
 
         assert {robot.name: robot.model for robot in io._robots.robots()} == {
             "alpha": "openarm_v2",
