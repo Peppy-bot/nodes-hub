@@ -40,9 +40,16 @@ All members sit under `link_id: "camera"`.
   Controls apply synchronously in the handler, so the response reflects what
   actually happened to the hardware, including the value the driver clamped to.
 
-Control services never fail the call for a domain problem: they answer
-`success: false` with a reason and the value currently in effect. An `Err` is
-reserved for transport failures.
+A control service answers the value the driver kept, or `-1` for an automatic
+mode. A control that gives no value gets an error reply with a failure kind and
+the reason:
+
+| Failure kind | Cause |
+|---|---|
+| `rejected` | A mode other than `auto` and `manual`, or a control or value the device does not offer (`EINVAL`, `ERANGE`). |
+| `precondition_failed` | The control takes no write now: it is read-only, inactive in the current mode, or held by another application (`EACCES`, `EBUSY`). |
+| `resource_unavailable` | The device is gone (`ENODEV`). |
+| `attempt_failed` | Any other refusal of the driver. |
 
 ## Parameters (`uvc_camera_linux`)
 

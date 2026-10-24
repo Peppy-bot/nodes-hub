@@ -20,7 +20,8 @@ use v4l::video::Capture as _;
 use v4l::{Format, FourCC};
 
 use crate::camera::controls::{
-    CameraControlRequest, ControlResult, ExposureMode, VALUE_UNAVAILABLE, WhiteBalanceMode,
+    CameraControlRequest, ControlFailure, ControlResult, ExposureMode, VALUE_UNAVAILABLE,
+    WhiteBalanceMode,
 };
 use crate::types::{CameraConfig, Encoding, Error, Frame, Result};
 
@@ -388,13 +389,10 @@ fn process_groups() -> Option<Vec<u32>> {
 
 /// Set an integer control and read back what the driver kept.
 fn set_integer_control(device: &Device, cid: u32, name: &str, value: i32) -> ControlResult {
-    if let Err(e) = write_control(device, cid, i64::from(value)) {
-        return ControlResult::err(format!("Failed to set {name}: {e}"));
-    }
+    write_control(device, cid, name, i64::from(value))?;
     // The driver clamps to its own range, so report what it kept rather than
     // what was asked for.
-    let current = read_control(device, cid).unwrap_or(value);
-    ControlResult::ok(format!("{name} set to {current}"), current)
+    Ok(read_control(device, cid).unwrap_or(value))
 }
 
 /// Set exposure mode and, in manual mode, the absolute exposure value.
@@ -403,21 +401,19 @@ fn set_exposure(device: &Device, mode: &ExposureMode, value: i32) -> ControlResu
         ExposureMode::Auto => V4L2_EXPOSURE_AUTO_VALUE,
         ExposureMode::Manual => V4L2_EXPOSURE_MANUAL_VALUE,
     };
-    if let Err(e) = write_control(device, V4L2_CID_EXPOSURE_AUTO, auto_value) {
-        return ControlResult::err(format!("Failed to set exposure mode: {e}"));
-    }
+    write_control(device, V4L2_CID_EXPOSURE_AUTO, "exposure mode", auto_value)?;
 
     match mode {
-        ExposureMode::Auto => ControlResult::ok("Exposure set to auto mode", VALUE_UNAVAILABLE),
+        ExposureMode::Auto => Ok(VALUE_UNAVAILABLE),
         ExposureMode::Manual => {
             // Absolute exposure is in 100us units for V4L2.
-            if let Err(e) = write_control(device, V4L2_CID_EXPOSURE_ABSOLUTE, i64::from(value)) {
-                return ControlResult::err(format!(
-                    "Exposure mode set to manual but value failed: {e}"
-                ));
-            }
-            let current = read_control(device, V4L2_CID_EXPOSURE_ABSOLUTE).unwrap_or(value);
-            ControlResult::ok(format!("Exposure set to manual, value {current}"), current)
+            write_control(
+                device,
+                V4L2_CID_EXPOSURE_ABSOLUTE,
+                "exposure value (the mode is manual)",
+                i64::from(value),
+            )?;
+            Ok(read_control(device, V4L2_CID_EXPOSURE_ABSOLUTE).unwrap_or(value))
         }
     }
 }
@@ -425,41 +421,40 @@ fn set_exposure(device: &Device, mode: &ExposureMode, value: i32) -> ControlResu
 /// Set white balance mode and, in manual mode, the colour temperature.
 fn set_white_balance(device: &Device, mode: &WhiteBalanceMode, temperature: i32) -> ControlResult {
     let auto = i64::from(matches!(mode, WhiteBalanceMode::Auto));
-    if let Err(e) = write_control(device, V4L2_CID_AUTO_WHITE_BALANCE, auto) {
-        return ControlResult::err(format!("Failed to set white balance mode: {e}"));
-    }
+    write_control(
+        device,
+        V4L2_CID_AUTO_WHITE_BALANCE,
+        "white balance mode",
+        auto,
+    )?;
 
     match mode {
-        WhiteBalanceMode::Auto => {
-            ControlResult::ok("White balance set to auto mode", VALUE_UNAVAILABLE)
-        }
+        WhiteBalanceMode::Auto => Ok(VALUE_UNAVAILABLE),
         WhiteBalanceMode::Manual => {
-            if let Err(e) = write_control(
+            write_control(
                 device,
                 V4L2_CID_WHITE_BALANCE_TEMPERATURE,
+                "white balance temperature (the mode is manual)",
                 i64::from(temperature),
-            ) {
-                return ControlResult::err(format!(
-                    "White balance mode set to manual but temperature failed: {e}"
-                ));
-            }
-            let current =
-                read_control(device, V4L2_CID_WHITE_BALANCE_TEMPERATURE).unwrap_or(temperature);
-            ControlResult::ok(
-                format!("White balance set to manual, temperature {current}K"),
-                current,
-            )
+            )?;
+            Ok(read_control(device, V4L2_CID_WHITE_BALANCE_TEMPERATURE).unwrap_or(temperature))
         }
     }
 }
 
-fn write_control(device: &Device, cid: u32, value: i64) -> std::result::Result<(), String> {
+/// Write one control; `name` says which in the failure.
+fn write_control(
+    device: &Device,
+    cid: u32,
+    name: &str,
+    value: i64,
+) -> std::result::Result<(), ControlFailure> {
     device
         .set_control(Control {
             id: cid,
             value: Value::Integer(value),
         })
-        .map_err(|e| e.to_string())
+        .map_err(|error| ControlFailure::of_write(name, &error))
 }
 
 fn read_control(device: &Device, cid: u32) -> Option<i32> {

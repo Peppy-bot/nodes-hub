@@ -1,6 +1,8 @@
 //! Camera control request and result types, shared between the service
 //! handlers and the device layer that applies them.
 
+use std::io;
+
 /// Exposure mode for the `set_exposure` service
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExposureMode {
@@ -63,34 +65,57 @@ pub enum CameraControlRequest {
     SetContrast { value: i32 },
 }
 
-/// Reported when a control has no meaningful current value: the write failed,
-/// or the mode (e.g. auto exposure) leaves the driver managing it.
+/// Reported when a control has no meaningful current value: the mode (e.g.
+/// auto exposure) leaves the driver managing it.
 pub const VALUE_UNAVAILABLE: i32 = -1;
 
-/// Result of applying a camera control
-#[derive(Debug, Clone)]
-pub struct ControlResult {
-    pub success: bool,
+/// Result of applying a camera control: the value the driver kept
+/// ([`VALUE_UNAVAILABLE`] in an auto mode), or why the write gave none.
+pub type ControlResult = Result<i32, ControlFailure>;
+
+/// Why a control write gave no value: the failure kind of peppy that says
+/// why, and the reason in words.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlFailure {
+    pub kind: ControlFailureKind,
     pub message: String,
-    /// Current value after applying the control; [`VALUE_UNAVAILABLE`] if not
-    /// applicable or unreadable
-    pub current_value: i32,
 }
 
-impl ControlResult {
-    pub fn ok(message: impl Into<String>, current_value: i32) -> Self {
+/// The failure kinds of peppy that a control write gives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlFailureKind {
+    /// The device does not offer the control, or does not take the value.
+    Rejected,
+    /// The control does not take a write now: it is read-only, inactive in
+    /// the current mode, or held by another application.
+    PreconditionFailed,
+    /// The device is gone.
+    ResourceUnavailable,
+    /// The write failed for another reason.
+    AttemptFailed,
+}
+
+impl ControlFailure {
+    /// A request the node does not take, such as an unknown mode.
+    pub fn rejected(message: impl Into<String>) -> Self {
         Self {
-            success: true,
+            kind: ControlFailureKind::Rejected,
             message: message.into(),
-            current_value,
         }
     }
 
-    pub fn err(message: impl Into<String>) -> Self {
+    /// The failure of a write of `what` that the driver refused with
+    /// `error`, by the errno that VIDIOC_S_EXT_CTRLS documents for it.
+    pub fn of_write(what: &str, error: &io::Error) -> Self {
+        let kind = match error.raw_os_error() {
+            Some(libc::EINVAL | libc::ERANGE) => ControlFailureKind::Rejected,
+            Some(libc::EACCES | libc::EBUSY) => ControlFailureKind::PreconditionFailed,
+            Some(libc::ENODEV) => ControlFailureKind::ResourceUnavailable,
+            _ => ControlFailureKind::AttemptFailed,
+        };
         Self {
-            success: false,
-            message: message.into(),
-            current_value: VALUE_UNAVAILABLE,
+            kind,
+            message: format!("Failed to set {what}: {error}"),
         }
     }
 }
@@ -123,17 +148,57 @@ mod tests {
         assert!(WhiteBalanceMode::try_from("bad").is_err());
     }
 
-    #[test]
-    fn test_control_result_ok() {
-        let r = ControlResult::ok("Brightness set to 128", 128);
-        assert!(r.success);
-        assert_eq!(r.current_value, 128);
+    fn kind_of_errno(errno: i32) -> ControlFailureKind {
+        ControlFailure::of_write("gain", &io::Error::from_raw_os_error(errno)).kind
     }
 
     #[test]
-    fn test_control_result_err() {
-        let r = ControlResult::err("Not supported");
-        assert!(!r.success);
-        assert_eq!(r.current_value, VALUE_UNAVAILABLE);
+    fn a_control_or_a_value_the_device_does_not_take_is_rejected() {
+        assert_eq!(kind_of_errno(libc::EINVAL), ControlFailureKind::Rejected);
+        assert_eq!(kind_of_errno(libc::ERANGE), ControlFailureKind::Rejected);
+    }
+
+    #[test]
+    fn a_control_that_takes_no_write_now_fails_a_precondition() {
+        assert_eq!(
+            kind_of_errno(libc::EACCES),
+            ControlFailureKind::PreconditionFailed
+        );
+        assert_eq!(
+            kind_of_errno(libc::EBUSY),
+            ControlFailureKind::PreconditionFailed
+        );
+    }
+
+    #[test]
+    fn a_device_that_is_gone_is_unavailable() {
+        assert_eq!(
+            kind_of_errno(libc::ENODEV),
+            ControlFailureKind::ResourceUnavailable
+        );
+    }
+
+    #[test]
+    fn any_other_refusal_of_the_driver_is_a_failed_attempt() {
+        assert_eq!(kind_of_errno(libc::EIO), ControlFailureKind::AttemptFailed);
+        let without_errno = io::Error::other("no errno");
+        assert_eq!(
+            ControlFailure::of_write("gain", &without_errno).kind,
+            ControlFailureKind::AttemptFailed
+        );
+    }
+
+    #[test]
+    fn a_failed_write_names_the_control_and_the_cause() {
+        let failure =
+            ControlFailure::of_write("contrast", &io::Error::from_raw_os_error(libc::ERANGE));
+        assert!(failure.message.contains("contrast"), "{}", failure.message);
+        assert!(
+            failure
+                .message
+                .contains(&io::Error::from_raw_os_error(libc::ERANGE).to_string()),
+            "{}",
+            failure.message
+        );
     }
 }

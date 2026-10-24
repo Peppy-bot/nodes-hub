@@ -54,9 +54,8 @@ async def test_boot_emits_frames_shaped_by_parameter_defaults():
 
 
 async def test_set_exposure_acks_and_echoes_requested_value():
-    """The mock's control services acknowledge every request: success=True, a
-    fixed "mock: <name> acknowledged" message, and the requested value echoed
-    back as current_value (there is no hardware to adjust)."""
+    """The mock's control services answer every request with the requested
+    value echoed back as current_value (there is no hardware to adjust)."""
     async with harness.start(setup) as h:
         for requested in (125, 7):
             response = await set_exposure.poll(
@@ -64,8 +63,6 @@ async def test_set_exposure_acks_and_echoes_requested_value():
                 set_exposure.RequestData(mode="manual", value=requested),
                 SERVICE_TIMEOUT,
             )
-            assert response.success is True
-            assert response.message == "mock: set_exposure acknowledged"
             assert response.current_value == requested
 
 
