@@ -23,7 +23,6 @@ from peppygen.exposed_services.robots import is_ready
 
 from sim_robot_core.registry import Caller, Registry, Robot
 
-from cancels import cancel_reason
 from edits import Edits
 from isaac_models import IsaacModel, IsaacModels
 from world import SPOT_PITCH_M, Placement, World, name_in_the_stage, within_one_spot
@@ -462,7 +461,7 @@ class RobotsIO:
             self._forget(name)
             self._robots.release(name)
             logger.info("robot '%s' left before it stood", name)
-            await context.complete_cancelled(cancel_reason(context))
+            await context.complete_cancelled(context.cancel_reason())
             return False
         try:
             await standing
@@ -495,7 +494,7 @@ class RobotsIO:
                 if handed in done:
                     return Ending.HANDED_OVER, _HANDED_OVER
                 if cancel in done:
-                    return Ending.LEFT, cancel_reason(context)
+                    return Ending.LEFT, context.cancel_reason()
                 if self._stopping.is_set():
                     return Ending.STOPPED, "the engine stopped"
                 robot = self._robots.of_name(name)

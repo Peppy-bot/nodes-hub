@@ -19,7 +19,7 @@ from sim_robot_core.pairs import Held
 from sim_robot_core.registry import Caller, Registry
 
 import runtime_fakes  # pylint: disable=W0611  (installs the runtime robots_io imports)
-from runtime_fakes import FailureKind
+from runtime_fakes import CANCEL_REASONS, FailureKind
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "engine"))
 
@@ -313,6 +313,9 @@ class _Answers:
 
     def cancel_cause(self):
         return self.cause
+
+    def cancel_reason(self):
+        return CANCEL_REASONS.get(self.cause)
 
     async def complete(self):
         self.answers.append(("completed",))

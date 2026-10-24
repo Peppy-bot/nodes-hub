@@ -43,8 +43,11 @@ from so101_backbone.coordinator import (
 )
 from so101_backbone.failures import FailureKind
 
+# The reason the generated goal context gives for each cause of a cancel
+# signal, in peppy's words.
+CANCEL_REASONS = {"caller": "cancelled by its caller", "sender_gone": "its sender is gone"}
 # The reason of a goal that its caller cancelled.
-CANCELLED_BY_CALLER = "cancelled by its caller"
+CANCELLED_BY_CALLER = CANCEL_REASONS["caller"]
 
 # The bars of the moves below, where a test sets no others: the plan and the
 # settle of a pose move each allow 1 cm and 0.2 rad, a joint move 0.1 rad per
@@ -93,6 +96,9 @@ class FakeGoalContext:
 
     def cancel_cause(self):
         return self._cause
+
+    def cancel_reason(self):
+        return CANCEL_REASONS.get(self._cause)
 
     async def complete(self, *result):
         self.completed = result

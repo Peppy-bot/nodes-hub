@@ -110,7 +110,7 @@ async def _drive_goal(ctx, current_position: list[int], busy: list[bool]):
             task.cancel()
         if cancel_task in done:
             last_known = list(current_position)
-            reason = _cancel_reason(ctx)
+            reason = ctx.cancel_reason()
             print(f"[arm] move_arm cancelled ({reason}) at position: {last_known}")
             try:
                 await ctx.complete_cancelled(reason, last_known)
@@ -125,13 +125,6 @@ async def _drive_goal(ctx, current_position: list[int], busy: list[bool]):
                 print(f"[arm] complete error: {e!r}")
     finally:
         busy[0] = False
-
-
-def _cancel_reason(ctx) -> str:
-    """The reason of a cancelled goal, in the words of its cancel cause."""
-    if ctx.cancel_cause() == "sender_gone":
-        return "its sender is gone"
-    return "cancelled by its caller"
 
 
 async def _execute_goal(ctx, start, target, duration, current_position):

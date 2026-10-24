@@ -101,6 +101,11 @@ class Failure:
     message: str
 
 
+# The reason the generated goal context gives for each cause of a cancel
+# signal, in peppy's words.
+CANCEL_REASONS = {"caller": "cancelled by its caller", "sender_gone": "its sender is gone"}
+
+
 class _GoalDecision:
     """What admitting a goal answers, as the generated GoalDecision holds it:
     the response of an accepted goal, or the failure of a refused one."""

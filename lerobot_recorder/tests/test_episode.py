@@ -157,6 +157,11 @@ ATTEMPT_FAILED = record_episode.FailureKind.ATTEMPT_FAILED
 PRECONDITION_FAILED = record_episode.FailureKind.PRECONDITION_FAILED
 
 
+# The reason the generated goal context gives for each cause of a cancel
+# signal, in peppy's words.
+CANCEL_REASONS = {"caller": "cancelled by its caller", "sender_gone": "its sender is gone"}
+
+
 class FakeCtx:
     """Records how the goal ended: ("cancelled", reason, episode_index,
     frames_recorded, video_frames_missing) or ("failed", kind, message). The goal of a
@@ -184,6 +189,9 @@ class FakeCtx:
 
     def cancel_cause(self):
         return self._cause
+
+    def cancel_reason(self):
+        return CANCEL_REASONS.get(self._cause)
 
     async def publish_feedback(self, frames_recorded, disk_free_bytes) -> None:
         self.feedbacks.append((frames_recorded, disk_free_bytes))

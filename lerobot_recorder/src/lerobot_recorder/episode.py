@@ -94,14 +94,6 @@ def _too_short(frames: int, ended_because: str) -> str:
     return f"too short to save: {frames} frame(s), need {need} ({ended_because})"
 
 
-def cancel_reason(cause: str | None) -> str:
-    """The reason of a goal that its cancel signal ended, in the words of
-    peppy for `cause`, the cancel cause of the goal context."""
-    if cause == "sender_gone":
-        return "its sender is gone"
-    return "cancelled by its caller"
-
-
 async def _end_goal(end, *args) -> None:
     """Ends the goal through `end`, the context's fail or complete_cancelled,
     and logs an end the runtime refused."""
@@ -568,7 +560,7 @@ class Recorder:
         try:
             while True:
                 if cancel.done() or ctx.is_cancelled():
-                    ended_because = cancel_reason(ctx.cancel_cause())
+                    ended_because = ctx.cancel_reason()
                     break
                 if shutdown.done():
                     ended_because = "recorder shutting down"

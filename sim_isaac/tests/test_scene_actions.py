@@ -21,6 +21,7 @@ from unittest.mock import Mock, call
 import pytest
 
 from _scene_actions import scene_actions_module
+from runtime_fakes import CANCEL_REASONS
 
 
 def _request(**fields):
@@ -795,6 +796,9 @@ class _Goal:
 
     def cancel_cause(self):
         return self._cause
+
+    def cancel_reason(self):
+        return CANCEL_REASONS.get(self._cause)
 
     async def publish_feedback(self, **fields):
         progress = _progress(**fields)

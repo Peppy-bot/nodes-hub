@@ -114,14 +114,6 @@ def stop_message(reason: str) -> str:
     return f"stopped: {reason}"
 
 
-def cancel_reason(cause: str | None) -> str:
-    """The reason of a goal that its cancel signal ended, in the words of
-    peppy for `cause`, the cancel cause of the goal context."""
-    if cause == "sender_gone":
-        return "its sender is gone"
-    return "cancelled by its caller"
-
-
 @dataclass(frozen=True)
 class PoseGoal:
     """A pose to plan: the fields move_arm and check_arm_move share."""
@@ -465,9 +457,7 @@ class ActionLayer:
                 await ctx.complete(*results(action_time))
             else:
                 abort(plan)
-                await ctx.complete_cancelled(
-                    cancel_reason(ctx.cancel_cause()), *results(action_time)
-                )
+                await ctx.complete_cancelled(ctx.cancel_reason(), *results(action_time))
         except Exception as e:
             log(f"goal completion failed: {e!r}")
         finally:

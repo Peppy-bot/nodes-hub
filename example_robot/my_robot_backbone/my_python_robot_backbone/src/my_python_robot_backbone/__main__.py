@@ -18,19 +18,12 @@ CANCEL_TIMEOUT = 2.0
 RESULT_TIMEOUT = 30.0
 
 
-def _cancel_reason(cause: str) -> str:
-    """The reason of a goal cancelled for `cause`, in the words of peppy."""
-    if cause == "sender_gone":
-        return "its sender is gone"
-    return "cancelled by its caller"
-
-
 def _relayed_cancel_reason(backbone_ctx, token, arm_reason: str) -> str:
-    """Why the backbone's goal ended cancelled: the cause of its own cancel
+    """Why the backbone's goal ended cancelled: the reason of its own cancel
     signal, the shutdown of the backbone, or else the arm's own reason."""
-    cause = backbone_ctx.cancel_cause()
-    if cause is not None:
-        return _cancel_reason(cause)
+    own_reason = backbone_ctx.cancel_reason()
+    if own_reason is not None:
+        return own_reason
     if token.is_cancelled():
         return "the backbone is shutting down"
     return arm_reason
