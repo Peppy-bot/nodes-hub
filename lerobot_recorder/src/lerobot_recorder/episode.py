@@ -644,7 +644,7 @@ class Recorder:
             )
             return
         try:
-            video_error = await self._sink.save_episode()
+            shortfall = await self._sink.save_episode()
         except Exception as e:
             # The library's buffer is unusable after a failed save; drop it
             # so the next goal starts clean.
@@ -654,14 +654,18 @@ class Recorder:
             )
             return
         self._kick_mirror()
-        if video_error is not None:
-            # The episode saved, but its video no longer lines up with its
-            # rows: the one thing the operator has to know before training
-            # on it. The result has no field for it, so the run log is where
-            # an operator finds which episode came up short.
-            print(f"[recorder] episode {episode_index}: {video_error}", flush=True)
+        warning = shortfall.warning()
+        if warning is not None:
+            # The episode saved, but its video does not line up with its
+            # rows. The result gives the frames the shortest video misses;
+            # the run log names each camera that came up short.
+            print(f"[recorder] episode {episode_index}: {warning}", flush=True)
         await _end_goal(
-            ctx.complete_cancelled, ended_because, episode_index, frames, False
+            ctx.complete_cancelled,
+            ended_because,
+            episode_index,
+            frames,
+            shortfall.video_frames_missing,
         )
 
     def _append_frame(self, row, pending, task: str) -> None:

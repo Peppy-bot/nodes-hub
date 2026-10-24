@@ -172,9 +172,14 @@ episode with a save. So does the recorder itself when a source goes stale or
 silent mid-episode, when the disk floor trips, when it cannot keep its frame
 rate, when it shuts down, and at the length where LeRobot's float32
 timestamps would stop loading. A saved episode ends its goal cancelled with
-its result, for a reason that names the cause. Feedback carries one message
-per recorded frame with `disk_free_bytes` riding along about once per
-second.
+its result, for a reason that names the cause. The result gives the index of
+the saved episode, its frame count and `video_frames_missing`: the frames
+that the shortest camera video of the episode misses against its state rows.
+The streaming encoder drops video frames on a host that cannot encode at the
+capture rate (`streaming_encoding`). An episode with missing frames should
+not be trained on; the log names each camera whose video came up short.
+Feedback carries one message per recorded frame with `disk_free_bytes`
+riding along about once per second.
 
 An episode that cannot be written or saved fails its goal with
 `attempt_failed`, and its frames are dropped. So does an episode of fewer

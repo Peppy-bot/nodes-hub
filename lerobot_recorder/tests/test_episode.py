@@ -23,7 +23,7 @@ from lerobot_recorder.recording import (
     LinkLayout,
     SourceSchema,
 )
-from lerobot_recorder.sink import ResumeManifest
+from lerobot_recorder.sink import ResumeManifest, VideoShortfall
 from tests.test_recording import ARM0, STALENESS_S, joint_entry, make_plan
 
 
@@ -71,7 +71,7 @@ class FakeSink:
         fail_add=False,
         add_delay_s=0.0,
         created=True,
-        video_error=None,
+        video_missing=None,
     ):
         self.fps = fps
         self.created = created
@@ -89,7 +89,8 @@ class FakeSink:
         self._fail_save = fail_save
         self._fail_add = fail_add
         self._add_delay_s = add_delay_s
-        self._video_error = video_error
+        # Per camera whose video comes up short, the frames it misses.
+        self._video_missing = video_missing or {}
 
     @property
     def episodes_saved(self) -> int:
@@ -111,13 +112,13 @@ class FakeSink:
             time.sleep(self._add_delay_s)
         self.frames += 1
 
-    async def save_episode(self) -> str | None:
+    async def save_episode(self) -> VideoShortfall:
         assert self.created and not self.finalized, "saving needs an open dataset"
         if self._fail_save > 0:
             self._fail_save -= 1
             raise OSError("disk full")
         self.saves += 1
-        return self._video_error
+        return VideoShortfall(dict(self._video_missing))
 
     def discard_open_frames(self) -> None:
         assert self.created, "discarding needs an open dataset"
@@ -158,7 +159,7 @@ PRECONDITION_FAILED = record_episode.FailureKind.PRECONDITION_FAILED
 
 class FakeCtx:
     """Records how the goal ended: ("cancelled", reason, episode_index,
-    frames_recorded, discarded) or ("failed", kind, message). The goal of a
+    frames_recorded, video_frames_missing) or ("failed", kind, message). The goal of a
     record_episode never completes, so the fake has no complete."""
 
     def __init__(self, task="t"):
@@ -190,8 +191,12 @@ class FakeCtx:
     async def fail(self, kind, message) -> None:
         self.endings.append(("failed", kind, message))
 
-    async def complete_cancelled(self, reason, episode_index, frames_recorded, discarded) -> None:
-        self.endings.append(("cancelled", reason, episode_index, frames_recorded, discarded))
+    async def complete_cancelled(
+        self, reason, episode_index, frames_recorded, video_frames_missing
+    ) -> None:
+        self.endings.append(
+            ("cancelled", reason, episode_index, frames_recorded, video_frames_missing)
+        )
 
     def ending(self):
         """The one way the goal ended."""
@@ -255,8 +260,8 @@ def test_save_failure_recovers_for_next_goal(tmp_path):
         await recorder._record(second, token)
         # The recorder ended the episode itself on a stale source, with a
         # save: the goal ends cancelled, for a reason that names the cause.
-        ending, reason, index, frames, discarded = second.ending()
-        assert (ending, index, discarded) == ("cancelled", 0, False)
+        ending, reason, index, frames, missing = second.ending()
+        assert (ending, index, missing) == ("cancelled", 0, 0)
         assert frames > 0
         assert "stale" in reason
         assert sink.saves == 1
@@ -315,10 +320,10 @@ def test_a_too_short_episode_leaves_the_session_recordable(tmp_path):
         cache.links[ARM0] = fresh_joints()
         second = FakeCtx()
         await recorder._record(second, token)
-        ending, _reason, index, frames, discarded = second.ending()
+        ending, _reason, index, frames, missing = second.ending()
         # Index 0: a failed episode saves nothing, so it consumes no episode
         # index.
-        assert (ending, index, discarded) == ("cancelled", 0, False)
+        assert (ending, index, missing) == ("cancelled", 0, 0)
         assert frames >= recording.MIN_EPISODE_FRAMES
         assert sink.saves == 1
 
@@ -365,8 +370,8 @@ def test_schedule_lag_ends_episode_with_save(tmp_path):
         ctx = FakeCtx()
         await recorder._record(ctx, FakeToken())
         keep_fresh.cancel()
-        ending, reason, _index, frames, discarded = ctx.ending()
-        assert (ending, discarded) == ("cancelled", False)
+        ending, reason, _index, frames, missing = ctx.ending()
+        assert (ending, missing) == ("cancelled", 0)
         assert reason.startswith("cannot sustain 100 fps")
         assert frames > 0
         assert sink.saves == 1
@@ -392,8 +397,8 @@ def test_disk_floor_trips_on_its_own_cadence(tmp_path):
         recorder._schema = capture_now(cache, plan)
         ctx = FakeCtx()
         await recorder._record(ctx, FakeToken())
-        ending, reason, _index, frames, discarded = ctx.ending()
-        assert (ending, discarded) == ("cancelled", False)
+        ending, reason, _index, frames, missing = ctx.ending()
+        assert (ending, missing) == ("cancelled", 0)
         assert reason == "only 0 MB free under the session directory"
         assert frames >= recording.MIN_EPISODE_FRAMES
         assert sink.saves == 1
@@ -597,7 +602,7 @@ def test_max_episode_length_ends_with_save(tmp_path):
         recorder._schema = capture_now(cache, plan)
         ctx = FakeCtx()
         await recorder._record(ctx, FakeToken())
-        assert ctx.ending() == ("cancelled", "max episode length reached", 0, 5, False)
+        assert ctx.ending() == ("cancelled", "max episode length reached", 0, 5, 0)
         assert sink.saves == 1
 
     asyncio.run(run())
@@ -646,7 +651,7 @@ def test_a_cancel_saves_the_episode_and_ends_the_goal_cancelled(tmp_path, cause,
     asyncio.run(recorder._record(ctx, FakeToken()))
     # The episode saved: the goal ends cancelled with its result, for the
     # reason of the cause of the cancel.
-    assert ctx.ending() == ("cancelled", reason, 0, 2, False)
+    assert ctx.ending() == ("cancelled", reason, 0, 2, 0)
     assert sink.saves == 1
 
 
@@ -660,7 +665,7 @@ def test_a_shutdown_saves_the_episode_and_ends_the_goal_cancelled(tmp_path):
         await recorder._record(ctx, token)
 
     asyncio.run(run())
-    assert ctx.ending() == ("cancelled", "recorder shutting down", 0, 2, False)
+    assert ctx.ending() == ("cancelled", "recorder shutting down", 0, 2, 0)
     assert sink.saves == 1
 
 
@@ -1212,14 +1217,13 @@ def test_finish_session_keeps_the_session_when_finalize_fails(tmp_path):
     asyncio.run(run())
 
 
-def test_a_short_video_saves_the_episode_and_is_logged(tmp_path, capsys):
-    """The episode saved, so it is not discarded, but its video no longer
-    covers its rows. The goal ends as the episode's ending says, and the run
-    log keeps the short video, for the operator to know before training on
-    the episode."""
+def test_a_short_video_saves_the_episode_and_gives_its_missing_frames(tmp_path, capsys):
+    """The episode saved, but its videos do not cover its rows. The goal ends
+    as the episode's ending says, its result gives the frames the shortest
+    video misses, and the run log names each short video, for the operator
+    to know before training on the episode."""
     plan = arm_plan()
-    video_error = "video is shorter than the state rows (cam0 3 frame(s) missing)"
-    sink = FakeSink(video_error=video_error)
+    sink = FakeSink(video_missing={"cam0": 3, "cam1": 7})
     recorder, cache = recorder_with(plan, sink, tmp_path)
 
     async def run():
@@ -1227,11 +1231,13 @@ def test_a_short_video_saves_the_episode_and_is_logged(tmp_path, capsys):
         recorder._schema = capture_now(cache, plan)
         ctx = FakeCtx()
         await recorder._record(ctx, FakeToken())
-        ending, reason, index, _frames, discarded = ctx.ending()
-        assert (ending, index, discarded) == ("cancelled", 0, False)
+        ending, reason, index, _frames, missing = ctx.ending()
+        assert (ending, index, missing) == ("cancelled", 0, 7)
         # The episode ended on a stale source, and the reason names it.
         assert "stale" in reason
         assert sink.saves == 1, "a short video is still a saved episode"
 
     asyncio.run(run())
-    assert video_error in capsys.readouterr().out
+    log = capsys.readouterr().out
+    assert "[recorder] episode 0: video is shorter than the state rows" in log
+    assert "cam0 3, cam1 7 frame(s) missing" in log

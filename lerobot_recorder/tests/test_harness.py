@@ -45,8 +45,8 @@ CLOCK_NOT_READY = "clock not ready"
 
 def params(tmp_path) -> Parameters:
     # Staged-PNG encoding: its writer queue is unbounded, so a saved
-    # episode's video deterministically covers every row (no drop-driven
-    # video_error to race the result assertions against). Staleness is
+    # episode's video deterministically covers every row (no dropped video
+    # frames to race the result assertions against). Staleness is
     # generous: a loaded host importing torch mid-test must not read as a
     # dead source.
     return make_params(
@@ -239,7 +239,7 @@ async def test_record_episode_feedback_flows_and_cancel_saves(tmp_path):
     while the mocks stream, a goal sent mid-episode is refused busy, and
     cancel (the operator stop) ends the episode with a save: a CANCELLED
     result for the reason of the caller's cancel, carrying episode_index 0,
-    the frame count and discarded=False."""
+    the frame count and no missing video frame."""
     async with boot(tmp_path) as h:
         stop = asyncio.Event()
         streamer = asyncio.create_task(stream(h, stop))
@@ -269,9 +269,9 @@ async def test_record_episode_feedback_flows_and_cancel_saves(tmp_path):
             assert result.status == record_episode.ResultStatus.CANCELLED
             assert result.cancel_reason == "cancelled by its caller"
             assert result.data is not None
-            assert result.data.discarded is False
             assert result.data.episode_index == 0
             assert result.data.frames_recorded >= second.frames_recorded
+            assert result.data.video_frames_missing == 0
 
             # d) finish_session rolls the saved session over to a fresh one.
             (recorded_dir,) = session_dirs(tmp_path)
