@@ -3,11 +3,11 @@ models the parameters name.
 
 Each role runs the model its parameter names for the node's whole life:
 `perception_model` ("none" or "sam3_siglip") and `manipulation_model`
-("none"). list_models names that model for each role, and switch_model
-accepts it alone and refuses any other with `rejected`: "this brain runs
-only 'sam3_siglip' for perception". The parameters are read once, at the
-node's start, and a name the brain does not run stops it there, as does a
-`perception_gallery` beside a model that reads none.
+("none" or "scripted"). list_models names that model for each role, and
+switch_model accepts it alone and refuses any other with `rejected`: "this
+brain runs only 'sam3_siglip' for perception". The parameters are read
+once, at the node's start, and a name the brain does not run stops it
+there, as does a `perception_gallery` beside a model that reads none.
 
 The start (`start`) builds each model; sam3_siglip begins its load in the
 background then, so the node is healthy at once. A switch to the running
@@ -19,7 +19,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Mapping, Sequence
 
+from brain_core.manipulation.centre_proposer import CentreProposer
 from brain_core.manipulation.none import NoneManipulator
+from brain_core.manipulation.scripted import ScriptedManipulator
 from brain_core.ports import Detector, FailureKind, Manipulator, Refusal, Role
 
 from .perception import DETECTORS, TAKES_A_GALLERY
@@ -27,6 +29,7 @@ from .perception.gallery import shipped_root
 
 MANIPULATORS: dict[str, Callable[[], Manipulator]] = {
     "none": NoneManipulator,
+    "scripted": lambda: ScriptedManipulator(CentreProposer()),
 }
 
 

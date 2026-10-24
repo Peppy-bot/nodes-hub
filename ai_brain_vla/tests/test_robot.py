@@ -4,9 +4,10 @@ fires to the outcome it reads."""
 
 import asyncio
 
-from brain_core.robot import GripResult, MoveEnd, MoveResult, Robot
+from brain_core.robot import GripResult, MoveCheck, MoveEnd, MoveResult, Robot
 from conftest import PARAMS, answer_the_camera
 from peppygen.consumed_actions.limb_motion import move_arm, move_gripper
+from peppygen.consumed_services.limb_motion import check_arm_move
 from peppygen.fixtures import harness
 from peppygen.parameters import Parameters
 
@@ -23,11 +24,13 @@ BARS = {
     "settle_orientation_tolerance_rad": 0.15,
     "settle_timeout_s": 2.0,
 }
+# The fields a check names besides the pose: the moves' plan bars.
+PLAN = {"duration_s": 0.0, **{key: BARS[key] for key in ("plan_position_tolerance_m", "plan_orientation_tolerance_rad")}}
 
 
 def robot_on(node_runner, **kwargs) -> Robot:
     """brain_core's Robot on the generated modules this node passes it."""
-    return Robot(node_runner, move_arm, move_gripper, **kwargs)
+    return Robot(node_runner, move_arm, move_gripper, check_arm_move, **kwargs)
 
 
 class booted:
@@ -138,3 +141,16 @@ async def test_a_move_without_a_result_in_time_is_cancelled_and_reported_lost():
         assert result.end is MoveEnd.LOST and result.message.startswith("move_arm gave no result")
         await asyncio.wait_for(active.cancel_signal(), WAIT)
         await active.complete_cancelled("cancelled by its caller", arm_result())
+
+
+async def test_a_check_asks_the_backbone_and_reads_its_plan_or_its_reason():
+    async with booted() as h:
+        robot = robot_on(h.node_runner)
+        service = h.mocks.deps.limb_motion.check_arm_move
+        service.enqueue_response(check_arm_move.ResponseData(reachable=True, reason="", duration_s=1.25))
+        service.enqueue_response(check_arm_move.ResponseData(reachable=False, reason="goal pose not planned", duration_s=0.0))
+        assert await robot.check_arm_move("left_arm", POSITION, ORIENTATION, **PLAN) == MoveCheck(True, "", 1.25)
+        assert await robot.check_arm_move("left_arm", POSITION, ORIENTATION, **PLAN) == MoveCheck(False, "goal pose not planned", 0.0)
+        [first, second] = service.captured()
+        assert (first.arm_name, first.position, first.orientation) == ("left_arm", [0.5, 0.1, 0.7], [0.0, 0.0, 0.0, 1.0])
+        assert robot.moves_in_flight == 0
