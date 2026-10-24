@@ -8,7 +8,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use peppygen::NodeRunner;
-use peppygen::QoSProfile;
 use peppygen::consumed_actions::limb_motion::move_gripper as limb_motion_move_gripper;
 use peppygen::consumed_actions::limb_motion::move_gripper::ResultOutcome;
 use peppylib::runtime::CancellationToken;
@@ -72,22 +71,23 @@ async fn run(
         limb_motion_move_gripper::bound_producer(&runner),
         GOAL_TIMEOUT,
         goal,
-        QoSProfile::SensorData,
+        peppygen::DEFAULT_FEEDBACK_BOUND,
     )
     .await
     {
-        Ok(handle) if handle.accepted => handle,
-        Ok(handle) => {
-            let reason = handle.reason.unwrap_or_else(|| "no reason given".into());
-            finalize(
-                &feedback,
-                side,
-                false,
-                format!("backbone rejected the gripper goal: {reason}"),
-            )
-            .await;
-            return;
-        }
+        Ok(handle) => match handle.refusal {
+            None => handle,
+            Some(refusal) => {
+                finalize(
+                    &feedback,
+                    side,
+                    false,
+                    format!("backbone refused the gripper goal: {refusal}"),
+                )
+                .await;
+                return;
+            }
+        },
         Err(e) => {
             finalize(&feedback, side, false, format!("fire_goal failed: {e}")).await;
             return;
@@ -133,23 +133,25 @@ async fn run(
                 // still, or settle_timeout_s after the planned end of the travel:
                 // on the target, or where an object or the effort cap stopped
                 // them, which a grasp reads as its result.
-                let msg = if data.success {
-                    format!(
-                        "move_gripper ({}): success in {:.2}s, opening {:.2}",
-                        label, data.action_time, data.final_opening
-                    )
+                let settle = if data.settled {
+                    ""
                 } else {
-                    format!(
-                        "move_gripper ({}) failed at opening {:.2}: {}",
-                        label, data.final_opening, data.message
-                    )
+                    ", the jaws had not stood still by the settle timeout"
                 };
-                (data.success, msg)
+                (
+                    true,
+                    format!(
+                        "move_gripper ({label}): success in {:.2}s, opening {:.2}{settle}",
+                        data.action_time, data.final_opening
+                    ),
+                )
             }
-            ResultOutcome::Cancelled(data) => (
-                false,
-                format!("move_gripper ({label}) cancelled: {}", data.message),
-            ),
+            ResultOutcome::Failed(failure) => {
+                (false, format!("move_gripper ({label}) failed: {failure}"))
+            }
+            ResultOutcome::Cancelled { reason, .. } => {
+                (false, format!("move_gripper ({label}) cancelled: {reason}"))
+            }
             ResultOutcome::Abandoned => (
                 false,
                 format!("move_gripper ({label}) abandoned by backbone"),

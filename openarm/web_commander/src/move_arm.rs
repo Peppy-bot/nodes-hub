@@ -7,7 +7,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use peppygen::NodeRunner;
-use peppygen::QoSProfile;
 use peppygen::consumed_actions::limb_motion::move_arm as limb_motion_move_arm;
 use peppygen::consumed_actions::limb_motion::move_arm::ResultOutcome;
 use peppylib::runtime::CancellationToken;
@@ -97,22 +96,23 @@ async fn run(
         limb_motion_move_arm::bound_producer(&runner),
         GOAL_TIMEOUT,
         goal,
-        QoSProfile::SensorData,
+        peppygen::DEFAULT_FEEDBACK_BOUND,
     )
     .await
     {
-        Ok(handle) if handle.accepted => handle,
-        Ok(handle) => {
-            let reason = handle.reason.unwrap_or_else(|| "no reason given".into());
-            finalize(
-                &feedback,
-                side,
-                false,
-                format!("backbone rejected the pose goal: {reason}"),
-            )
-            .await;
-            return;
-        }
+        Ok(handle) => match handle.refusal {
+            None => handle,
+            Some(refusal) => {
+                finalize(
+                    &feedback,
+                    side,
+                    false,
+                    format!("backbone refused the pose goal: {refusal}"),
+                )
+                .await;
+                return;
+            }
+        },
         Err(e) => {
             finalize(&feedback, side, false, format!("fire_goal failed: {e}")).await;
             return;
@@ -157,23 +157,22 @@ async fn run(
     {
         warn!(side = side.label(), error = %e, "cancel after result error failed");
     }
-    // The backbone judges arrival: success means the measured grasp point
-    // settled within the goal's tolerances, and a failure's message says how
-    // far off it stood.
+    // The backbone judges arrival: a completed move means the measured grasp
+    // point settled within the goal's tolerances, and a failure's kind and
+    // message say why not, such as `unreachable`, or `timeout` and how far
+    // off it stood.
     let (success, summary) = match outcome {
         Ok(r) => match r.outcome {
-            ResultOutcome::Completed(data) if data.success => (
+            ResultOutcome::Completed(data) => (
                 true,
                 format!("move_arm ({label}): success in {:.2}s", data.action_time),
             ),
-            ResultOutcome::Completed(data) => (
-                false,
-                format!("move_arm ({label}) failed: {}", data.message),
-            ),
-            ResultOutcome::Cancelled(data) => (
-                false,
-                format!("move_arm ({label}) cancelled: {}", data.message),
-            ),
+            ResultOutcome::Failed(failure) => {
+                (false, format!("move_arm ({label}) failed: {failure}"))
+            }
+            ResultOutcome::Cancelled { reason, .. } => {
+                (false, format!("move_arm ({label}) cancelled: {reason}"))
+            }
             ResultOutcome::Abandoned => {
                 (false, format!("move_arm ({label}) abandoned by backbone"))
             }
