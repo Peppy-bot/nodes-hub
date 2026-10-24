@@ -151,18 +151,10 @@ async fn run(
 
     let (success, summary) = match outcome {
         Ok(r) => match r.outcome {
-            ResultOutcome::Cancelled { reason, data } => episode_summary(
-                data.episode_index,
-                data.frames_recorded,
-                data.discarded,
-                recorder_reason(reason),
-            ),
-            ResultOutcome::Completed(data) => episode_summary(
-                data.episode_index,
-                data.frames_recorded,
-                data.discarded,
-                None,
-            ),
+            ResultOutcome::Cancelled { reason, data } => {
+                episode_summary(&data, recorder_reason(reason))
+            }
+            ResultOutcome::Completed(data) => episode_summary(&data, None),
             ResultOutcome::Failed(failure) => (false, format!("episode failed: {failure}")),
             ResultOutcome::Abandoned => (false, "recorder abandoned the episode".to_string()),
             ResultOutcome::Expired => (false, "episode result expired".to_string()),
@@ -208,28 +200,29 @@ fn recorder_reason(reason: String) -> Option<String> {
 }
 
 // The one-line outcome for the status bar, from the recorder's result fields
-// and the reason the recorder gave when it ended the episode itself.
+// and the reason the recorder gave when it ended the episode itself. The
+// outcome is a success only for an episode the operator stopped whose videos
+// hold every frame: an episode whose videos miss frames should not be trained
+// on.
 fn episode_summary(
-    episode_index: i64,
-    frames: u64,
-    discarded: bool,
+    data: &record_episode::ResultResponseData,
     recorder_reason: Option<String>,
 ) -> (bool, String) {
     let ending = match &recorder_reason {
         Some(reason) => format!(" ({reason})"),
         None => String::new(),
     };
-    if discarded {
-        (
-            false,
-            format!("episode discarded after {frames} frames{ending}"),
-        )
-    } else {
-        (
-            recorder_reason.is_none(),
-            format!("episode {episode_index} saved, {frames} frames{ending}"),
-        )
-    }
+    let missing = match data.video_frames_missing {
+        0 => String::new(),
+        count => format!("; {count} video frame(s) missing, do not train on it"),
+    };
+    (
+        recorder_reason.is_none() && data.video_frames_missing == 0,
+        format!(
+            "episode {} saved, {} frames{ending}{missing}",
+            data.episode_index, data.frames_recorded
+        ),
+    )
 }
 
 // Report the episode outcome to the owner, which clears the recording state and
@@ -246,7 +239,21 @@ async fn finalize(feedback: &mpsc::Sender<Feedback>, success: bool, summary: imp
 
 #[cfg(test)]
 mod tests {
+    use peppygen::consumed_actions::recorder::record_episode::ResultResponseData;
+
     use super::{episode_summary, recorder_reason};
+
+    fn saved(
+        episode_index: i64,
+        frames_recorded: u64,
+        video_frames_missing: u64,
+    ) -> ResultResponseData {
+        ResultResponseData {
+            episode_index,
+            frames_recorded,
+            video_frames_missing,
+        }
+    }
 
     #[test]
     fn the_commanders_own_cancel_gives_no_recorder_reason() {
@@ -259,22 +266,32 @@ mod tests {
 
     #[test]
     fn saved_episode_reports_index_and_frames() {
-        let (ok, msg) = episode_summary(4, 120, false, None);
+        let (ok, msg) = episode_summary(&saved(4, 120, 0), None);
         assert!(ok);
         assert_eq!(msg, "episode 4 saved, 120 frames");
     }
 
     #[test]
     fn auto_stop_reason_rides_the_summary() {
-        let (ok, msg) = episode_summary(2, 55, false, Some("source went stale".into()));
+        let (ok, msg) = episode_summary(&saved(2, 55, 0), Some("source went stale".into()));
         assert!(!ok);
         assert_eq!(msg, "episode 2 saved, 55 frames (source went stale)");
     }
 
     #[test]
-    fn discarded_episode_is_a_failure() {
-        let (ok, msg) = episode_summary(-1, 9, true, None);
+    fn missing_video_frames_ride_the_summary_and_are_not_a_success() {
+        let (ok, msg) = episode_summary(&saved(4, 120, 3), None);
         assert!(!ok);
-        assert_eq!(msg, "episode discarded after 9 frames");
+        assert_eq!(
+            msg,
+            "episode 4 saved, 120 frames; 3 video frame(s) missing, do not train on it"
+        );
+
+        let (ok, msg) = episode_summary(&saved(2, 55, 1), Some("source went stale".into()));
+        assert!(!ok);
+        assert_eq!(
+            msg,
+            "episode 2 saved, 55 frames (source went stale); 1 video frame(s) missing, do not train on it"
+        );
     }
 }

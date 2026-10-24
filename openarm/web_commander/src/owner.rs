@@ -97,7 +97,7 @@ pub enum Feedback {
         frames: u64,
     },
     // The record goal reached a terminal state; the summary names the saved
-    // (or discarded) episode.
+    // episode, or why no episode was saved.
     RecordDone {
         summary: String,
     },

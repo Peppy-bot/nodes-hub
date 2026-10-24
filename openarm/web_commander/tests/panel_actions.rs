@@ -208,7 +208,7 @@ async fn panel_commands_drive_backbone_and_recorder() -> peppygen::Result<()> {
             &record_episode::ResultResponseData {
                 episode_index: 3,
                 frames_recorded: 7,
-                discarded: false,
+                video_frames_missing: 0,
             },
         )
         .await?;
