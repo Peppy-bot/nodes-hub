@@ -40,6 +40,6 @@ testpaths = ["tests"]
 [tool.uv.sources]
 peppygen = { path = ".peppy/libs/peppygen" }
 peppylib = { path = ".peppy/libs/peppylib" }
-# brain_core lives in the public-peppy-libs repository, pinned to one commit
-# of it: the node image holds the node's own directory alone.
-brain_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "brain_core", rev = "58084b3461cb587977b369120ba796669990b8e6" }
+# brain_core from the public-peppy-libs checkout beside this hub in the
+# superproject.
+brain_core = { path = "../../public-peppy-libs/brain_core", editable = true }

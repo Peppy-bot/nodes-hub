@@ -107,7 +107,7 @@ class FakeManipulator:
     def why_unavailable(self) -> str:
         return ""
 
-    async def start(self, robot) -> None:
+    async def start(self, robot, limb_states) -> None:
         return None
 
     async def begun(self) -> None:
