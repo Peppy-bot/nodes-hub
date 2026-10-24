@@ -1,6 +1,7 @@
 """Action-layer behavior that the wire cannot provoke deterministically:
 settles and their timeouts, walked-back admissions, per-server pending
-isolation, limb naming, and failure-aware completion."""
+isolation, limb naming, refusals and failures with their kinds, and how each
+goal ends."""
 
 import asyncio
 import math
@@ -23,24 +24,27 @@ from so101_description.model import KINEMATICS_URDF_PATH
 from so101_description.postures import READY_POSITIONS_RAD
 
 from so101_backbone.actions import (
+    ARM_BUSY,
     ARM_LEADER_STREAMING,
-    NO_ANCHOR,
+    GRIPPER_LEADER_STREAMING,
     MAX_REQUESTED_DURATION_S,
-    READY_DONE,
+    NO_ANCHOR,
+    WALKED_BACK,
     ActionLayer,
     PendingSlot,
     PoseMove,
-    Rejection,
+    Refusal,
 )
 from so101_backbone.coordinator import (
+    FOLLOWER_SILENT,
     GRIPPER_STILL_WINDOW_S,
     STALE_LEADER_TIMEOUT_S,
     Coordinator,
 )
+from so101_backbone.failures import FailureKind
 
-STALE_NO_POSE = "no arm poses: arm stopped reporting its joints"
-STALE_COMMANDED = "the result comes from the joints commanded last"
-STALE_FOLLOWER = "the follower stopped reporting"
+# The reason of a goal that its caller cancelled.
+CANCELLED_BY_CALLER = "cancelled by its caller"
 
 # The bars of the moves below, where a test sets no others: the plan and the
 # settle of a pose move each allow 1 cm and 0.2 rad, a joint move 0.1 rad per
@@ -69,24 +73,40 @@ def admit_gripper(layer, opening, max_effort=0.0, settle_timeout_s=GRIPPER_SETTL
 
 
 class FakeGoalContext:
-    """Records the terminal call; cancel never fires unless asked."""
+    """Records how the goal ended: its result when it completed, its kind and
+    message when it failed, its reason and result when it ended cancelled.
+    The cancel signal never fires unless asked."""
 
     def __init__(self):
         self.completed = None
+        self.failed = None
         self.cancelled = None
         self._cancel = asyncio.Event()
+        self._cause = None
 
-    def request_cancel(self):
+    def request_cancel(self, cause="caller"):
+        self._cause = cause
         self._cancel.set()
 
     async def cancel_signal(self):
         await self._cancel.wait()
 
-    async def complete(self, *args):
-        self.completed = args
+    def cancel_cause(self):
+        return self._cause
 
-    async def complete_cancelled(self, *args):
-        self.cancelled = args
+    async def complete(self, *result):
+        self.completed = result
+
+    async def fail(self, kind, message):
+        self.failed = (kind, message)
+
+    async def complete_cancelled(self, reason, *result):
+        self.cancelled = (reason, *result)
+
+
+def refusal_of(raised) -> tuple[FailureKind, str]:
+    """The kind and the reason of a Refusal that pytest.raises caught."""
+    return raised.value.kind, str(raised.value)
 
 
 def make_layer(kinematics=None, limits=WIDE_LIMITS, **config_overrides):
@@ -153,8 +173,8 @@ async def test_a_gripper_move_completes_once_the_jaws_stand_still_past_the_plann
     assert plan.done.is_set()
     ctx = FakeGoalContext()
     await layer.drive_gripper(ctx, plan)
-    success, message, opening, _action_time = ctx.completed
-    assert (success, message, opening) == (True, "move complete", 0.52)
+    settled, opening, _action_time = ctx.completed
+    assert (settled, opening) == (True, 0.52)
     assert coordinator.try_claim_gripper()
 
 
@@ -170,8 +190,8 @@ async def test_a_close_onto_an_item_completes_once_the_jaws_stand_still_where_it
     run_gripper_plan_to_its_end(coordinator, plan, measured_at_end=0.8)
     ctx = FakeGoalContext()
     await layer.drive_gripper(ctx, plan)
-    success, message, opening, _action_time = ctx.completed
-    assert (success, message, opening) == (True, "move complete", 0.8)
+    settled, opening, _action_time = ctx.completed
+    assert (settled, opening) == (True, 0.8)
     assert coordinator.try_claim_gripper()
 
 
@@ -182,7 +202,8 @@ async def test_the_settle_timeout_completes_a_move_whose_jaws_keep_moving(follow
     # The command lands on the 50th tick, at 0.49 s, and the tick after is
     # the planned end. Each delivery from then on lands 0.1 from the one
     # before, farther than the still band: the jaws never stand still, and
-    # 2.0 s after the planned end the move completes wherever they are.
+    # 2.0 s after the planned end the move completes wherever they are, not
+    # settled.
     for tick in range(50):
         gripper_step(coordinator, 1.0, round(tick * 0.01, 2))
     for now, opening in ((0.5, 0.9), (1.0, 0.8), (1.5, 0.7), (2.0, 0.6), (2.49, 0.5)):
@@ -192,10 +213,8 @@ async def test_the_settle_timeout_completes_a_move_whose_jaws_keep_moving(follow
     assert plan.done.is_set()
     ctx = FakeGoalContext()
     await layer.drive_gripper(ctx, plan)
-    success, message, opening, _action_time = ctx.completed
-    assert success is True
-    assert message == "move complete: the jaws had not stood still by the settle timeout, 2.0 s after the planned end"
-    assert opening == 0.4
+    settled, opening, _action_time = ctx.completed
+    assert (settled, opening) == (False, 0.4)
     assert coordinator.try_claim_gripper()
 
 
@@ -207,7 +226,7 @@ async def test_a_zero_settle_timeout_completes_the_gripper_move_at_its_planned_e
     plan = admit_gripper(layer, 0.5, settle_timeout_s=0.0)
     # The command lands on the 50th tick, at 0.49 s, with the jaws at 0.7;
     # the tick after is the planned end, and the timeout of 0 completes the
-    # move there.
+    # move there, not settled.
     for tick in range(50):
         gripper_step(coordinator, 1.0 if tick < 25 else 0.7, round(tick * 0.01, 2))
         assert not plan.done.is_set()
@@ -215,9 +234,8 @@ async def test_a_zero_settle_timeout_completes_the_gripper_move_at_its_planned_e
     assert plan.done.is_set()
     ctx = FakeGoalContext()
     await layer.drive_gripper(ctx, plan)
-    success, message, opening, _action_time = ctx.completed
-    assert (success, opening) == (True, 0.55)
-    assert message == "move complete: the jaws had not stood still by the settle timeout, 0.0 s after the planned end"
+    settled, opening, _action_time = ctx.completed
+    assert (settled, opening) == (False, 0.55)
 
 
 @pytest.mark.parametrize("bad", [-0.001, math.nan, math.inf, MAX_REQUESTED_DURATION_S + 0.001])
@@ -225,15 +243,16 @@ def test_a_gripper_settle_timeout_that_is_no_duration_is_refused(bad):
     coordinator, layer = make_layer()
     coordinator.measured_gripper.set(0.5)
     with pytest.raises(
-        Rejection, match="settle_timeout_s must be a number of seconds from 0 to 60"
-    ):
+        Refusal, match="settle_timeout_s must be a number of seconds from 0 to 60"
+    ) as raised:
         admit_gripper(layer, 0.2, settle_timeout_s=bad)
+    assert raised.value.kind is FailureKind.REJECTED
     assert coordinator.try_claim_gripper(), "a refused settle timeout must not hold the slot"
     coordinator.release_gripper()
     assert admit_gripper(layer, 0.2, settle_timeout_s=MAX_REQUESTED_DURATION_S) is not None
 
 
-async def test_cancel_during_the_gripper_travel_completes_cancelled(follower_never_stale):
+async def test_cancel_during_the_gripper_travel_ends_the_goal_cancelled(follower_never_stale):
     coordinator, layer = make_layer(max_gripper_rate_frac_s=1.0)
     coordinator.measured_gripper.set(1.0)
     plan = admit_gripper(layer, 0.5)
@@ -244,10 +263,8 @@ async def test_cancel_during_the_gripper_travel_completes_cancelled(follower_nev
     ctx.request_cancel()
     await layer.drive_gripper(ctx, plan)
     assert ctx.completed is None
-    success, message, opening, _action_time = ctx.cancelled
-    assert success is False
-    assert message == "goal cancelled"
-    assert opening == 0.9
+    reason, settled, opening, _action_time = ctx.cancelled
+    assert (reason, settled, opening) == (CANCELLED_BY_CALLER, False, 0.9)
     assert plan.aborted
     assert coordinator.try_claim_gripper()
 
@@ -265,10 +282,8 @@ async def test_cancel_after_the_gripper_move_ended_reports_the_finished_move(
     ctx.request_cancel()
     await layer.drive_gripper(ctx, plan)
     assert ctx.cancelled is None
-    success, message, opening, _action_time = ctx.completed
-    assert success is True
-    assert message == "move complete"
-    assert opening == 0.5
+    settled, opening, _action_time = ctx.completed
+    assert (settled, opening) == (True, 0.5)
 
 
 async def test_abandon_walks_back_a_claimed_admission():
@@ -304,17 +319,19 @@ async def test_arm_and_gripper_claims_are_independent():
     # An arm move in flight must not block a gripper goal, and vice versa.
     plan = admit_gripper(layer, 1.0, 0.0)
     assert plan is not None
-    with pytest.raises(Rejection, match="arm is already executing a motion"):
+    with pytest.raises(Refusal, match="arm is already executing a motion") as raised:
         admit_joints(layer, (0.2,) * 5, 0.0)
-    with pytest.raises(Rejection, match="gripper is already executing a move"):
+    assert raised.value.kind is FailureKind.PRECONDITION_FAILED
+    with pytest.raises(Refusal, match="gripper is already executing a move") as raised:
         admit_gripper(layer, 0.5, 0.0)
+    assert raised.value.kind is FailureKind.PRECONDITION_FAILED
 
 
 def test_a_posture_does_not_claim_or_drive_the_gripper(follower_never_stale):
     coordinator, layer = make_layer()
     coordinator.measured_joints.set(MEASURED)
     coordinator.measured_gripper.set(0.3)
-    plan = layer._admit_posture(READY_POSITIONS_RAD, 0.0, READY_DONE)
+    plan = layer._admit_posture(READY_POSITIONS_RAD, 0.0)
     # From its first sample to its last, the posture sends the gripper
     # nothing. The gripper stays free for its own goals.
     for now in (0.0, plan.profile.duration_s):
@@ -324,27 +341,32 @@ def test_a_posture_does_not_claim_or_drive_the_gripper(follower_never_stale):
     assert coordinator.try_claim_gripper() is True
 
 
-async def test_failed_plan_completes_as_failure():
+async def test_a_failed_plan_fails_the_goal_with_its_kind_and_no_result():
     coordinator, layer = make_layer()
     coordinator.measured_joints.set((0.0,) * 5)
     plan = admit_joints(layer, (0.1,) * 5, 0.0)
-    coordinator._fail_arm_plan(plan, STALE_FOLLOWER)
+    coordinator._fail_arm_plan(plan, FOLLOWER_SILENT)
     ctx = FakeGoalContext()
     await layer.drive_arm(ctx, plan)
-    success, message, _positions, _action_time = ctx.completed
-    assert success is False
-    assert message.startswith(STALE_FOLLOWER)
+    assert ctx.failed == (FailureKind.RESOURCE_UNAVAILABLE, "the follower stopped reporting")
+    assert ctx.completed is None and ctx.cancelled is None
     assert coordinator.try_claim_arm()
 
 
-async def test_none_plan_completes_as_failure_and_leaves_the_server_alive():
-    _coordinator, layer = make_layer()
+@pytest.mark.parametrize("limb", ["arm", "gripper", "pose", "posture"])
+async def test_a_walked_back_admission_fails_the_goal_and_leaves_the_server_alive(limb):
+    kinematics = FakeKinematics()
+    _coordinator, layer = make_layer(kinematics)
+    drive = {
+        "arm": layer.drive_arm,
+        "gripper": layer.drive_gripper,
+        "pose": lambda ctx, plan: layer.drive_pose(ctx, plan, kinematics, kinematics),
+        "posture": lambda ctx, plan: layer.drive_posture(ctx, plan, kinematics),
+    }[limb]
     ctx = FakeGoalContext()
-    await layer.drive_arm(ctx, None)
-    success, message, positions, _action_time = ctx.completed
-    assert success is False
-    assert "walked back" in message
-    assert len(positions) == 5
+    await drive(ctx, None)
+    assert ctx.failed == (FailureKind.ATTEMPT_FAILED, WALKED_BACK)
+    assert ctx.completed is None and ctx.cancelled is None
 
 
 async def test_an_arm_move_completes_once_the_measured_joints_are_within_their_tolerances(
@@ -369,12 +391,11 @@ async def test_an_arm_move_completes_once_the_measured_joints_are_within_their_t
     assert plan.done.is_set()
     ctx = FakeGoalContext()
     await layer.drive_arm(ctx, plan)
-    success, message, positions, _action_time = ctx.completed
-    assert (success, message) == (True, "trajectory complete")
+    positions, _action_time = ctx.completed
     assert positions == list(arrived)
 
 
-async def test_an_arm_move_outside_its_tolerances_at_the_timeout_fails_with_the_shortfall(
+async def test_an_arm_move_outside_its_tolerances_at_the_timeout_fails_with_timeout(
     follower_never_stale,
 ):
     coordinator, layer = make_layer()
@@ -393,14 +414,17 @@ async def test_an_arm_move_outside_its_tolerances_at_the_timeout_fails_with_the_
     assert plan.done.is_set()
     ctx = FakeGoalContext()
     await layer.drive_arm(ctx, plan)
-    success, message, positions, _action_time = ctx.completed
-    assert success is False
-    assert message == "still 0.500 rad from the target at joint 1, 2.0 s after the planned end"
-    assert positions == [0.0] * 5
+    # The message says how far the arm still stands from the target and how
+    # long after the planned end. A failed goal gives no result.
+    assert ctx.failed == (
+        FailureKind.TIMEOUT,
+        "still 0.500 rad from the target at joint 1, 2.0 s after the planned end",
+    )
+    assert ctx.completed is None
     assert coordinator.try_claim_arm()
 
 
-async def test_a_stale_follower_reports_the_commanded_joints_with_a_note(follower_never_stale):
+async def test_a_stale_follower_reports_the_commanded_joints(follower_never_stale):
     coordinator, layer = make_layer()
     coordinator.measured_joints.set((0.0,) * 5)
     plan = admit_joints(layer, (0.5,) * 5, 0.0)
@@ -412,8 +436,7 @@ async def test_a_stale_follower_reports_the_commanded_joints_with_a_note(followe
     coordinator.measured_joints.clear()
     ctx = FakeGoalContext()
     await layer.drive_arm(ctx, plan)
-    success, message, positions, _action_time = ctx.completed
-    assert (success, message) == (True, f"trajectory complete; {STALE_COMMANDED}")
+    positions, _action_time = ctx.completed
     assert positions == [0.5] * 5
 
 
@@ -423,14 +446,14 @@ async def test_a_posture_result_reports_the_grasp_point_of_the_measured_joints(
     kinematics = FakeKinematics()
     coordinator, layer = make_layer(kinematics)
     coordinator.measured_joints.set(MEASURED)
-    plan = layer._admit_posture(READY_POSITIONS_RAD, 0.0, READY_DONE)
+    plan = layer._admit_posture(READY_POSITIONS_RAD, 0.0)
     # The plan ends. The follower measures the arm at its start position.
     run_arm_plan_to_its_end(coordinator, plan)
     ctx = FakeGoalContext()
     await layer.drive_posture(ctx, plan, kinematics)
     position, orientation = kinematics.forward_kinematics(MEASURED)
     assert position != kinematics.forward_kinematics(READY_POSITIONS_RAD)[0]
-    assert ctx.completed == (True, READY_DONE, ["arm"], list(position), list(orientation))
+    assert ctx.completed == (["arm"], list(position), list(orientation))
     assert coordinator.try_claim_arm()
 
 
@@ -438,34 +461,14 @@ async def test_a_posture_with_stale_follower_state_reports_empty_arrays(follower
     kinematics = FakeKinematics()
     coordinator, layer = make_layer(kinematics)
     coordinator.measured_joints.set(MEASURED)
-    plan = layer._admit_posture(READY_POSITIONS_RAD, 0.0, READY_DONE)
+    plan = layer._admit_posture(READY_POSITIONS_RAD, 0.0)
     run_arm_plan_to_its_end(coordinator, plan)
     # The follower sends no more state after it receives the last sample.
-    # No measurement is fresh, thus the result gives no pose and gives the
-    # reason.
+    # No measurement is fresh, thus the result gives no pose.
     coordinator.measured_joints.clear()
     ctx = FakeGoalContext()
     await layer.drive_posture(ctx, plan, kinematics)
-    assert ctx.completed == (True, f"{READY_DONE}; {STALE_NO_POSE}", [], [], [])
-
-    walked_back = FakeGoalContext()
-    await layer.drive_posture(walked_back, None, kinematics)
-    assert walked_back.completed == (
-        False, f"goal admission was walked back; {STALE_NO_POSE}", [], [], [],
-    )
-
-
-async def test_a_walked_back_posture_reports_where_the_arm_stands(follower_never_stale):
-    # The goal fails, and its result still gives the measured pose.
-    kinematics = FakeKinematics()
-    coordinator, layer = make_layer(kinematics)
-    coordinator.measured_joints.set(MEASURED)
-    ctx = FakeGoalContext()
-    await layer.drive_posture(ctx, None, kinematics)
-    position, orientation = kinematics.forward_kinematics(MEASURED)
-    assert ctx.completed == (
-        False, "goal admission was walked back", ["arm"], list(position), list(orientation),
-    )
+    assert ctx.completed == ([], [], [])
 
 
 def stop_every_move(layer, _ctx):
@@ -477,17 +480,17 @@ def cancel_the_goal(_layer, ctx):
 
 
 @pytest.mark.parametrize(
-    ("cut_the_move", "message"),
-    [(stop_every_move, "stopped: the operator asked"), (cancel_the_goal, "goal cancelled")],
+    ("cut_the_move", "reason"),
+    [(stop_every_move, "stopped: the operator asked"), (cancel_the_goal, CANCELLED_BY_CALLER)],
     ids=["stop", "cancel"],
 )
 async def test_a_stopped_posture_reports_the_measured_grasp_point(
-    cut_the_move, message, follower_never_stale
+    cut_the_move, reason, follower_never_stale
 ):
     kinematics = FakeKinematics()
     coordinator, layer = make_layer(kinematics)
     coordinator.measured_joints.set(MEASURED)
-    plan = layer._admit_posture(READY_POSITIONS_RAD, 0.0, READY_DONE)
+    plan = layer._admit_posture(READY_POSITIONS_RAD, 0.0)
     coordinator.arm_published(True, coordinator.arm_tick(0.0))
     # The move stops while the arm moves to the posture. The follower
     # measures the arm at that position.
@@ -498,17 +501,18 @@ async def test_a_stopped_posture_reports_the_measured_grasp_point(
     await layer.drive_posture(ctx, plan, kinematics)
     position, orientation = kinematics.forward_kinematics(stopped_at)
     assert ctx.completed is None
-    assert ctx.cancelled == (False, message, ["arm"], list(position), list(orientation))
+    assert ctx.cancelled == (reason, ["arm"], list(position), list(orientation))
     assert plan.aborted
     assert coordinator.try_claim_arm()
 
 
-def test_admission_rejects_before_claiming():
+def test_admission_refuses_before_claiming():
     coordinator, layer = make_layer()
     coordinator.measured_joints.set((0.0,) * 5)
-    with pytest.raises(Rejection, match="target out of joint limits"):
+    with pytest.raises(Refusal, match="target out of joint limits") as raised:
         admit_joints(layer, (9.0,) * 5, 0.0)
-    # A rejected goal never left the slot held.
+    assert raised.value.kind is FailureKind.REJECTED
+    # A refused goal never left the slot held.
     assert coordinator.try_claim_arm()
 
 
@@ -531,16 +535,17 @@ async def test_an_arm_goal_below_the_base_plane_is_admitted(follower_never_stale
     run_arm_plan_to_its_end(coordinator, plan)
     ctx = FakeGoalContext()
     await layer.drive_arm(ctx, plan)
-    assert ctx.completed[0] is True
+    assert ctx.completed is not None
 
 
-def test_pose_admission_rejects_busy_before_solving():
+def test_pose_admission_refuses_busy_before_solving():
     kinematics = FakeKinematics()
     coordinator, layer = make_layer(kinematics)
     coordinator.measured_joints.set((0.0,) * 5)
     admit_joints(layer, (0.1,) * 5, 0.0)
-    with pytest.raises(Rejection, match="arm is already executing a motion"):
+    with pytest.raises(Refusal) as raised:
         admit_pose(layer, (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0))
+    assert refusal_of(raised) == (FailureKind.PRECONDITION_FAILED, ARM_BUSY)
     # The expensive verified solve never ran for the doomed goal.
     assert kinematics.solve_calls == []
 
@@ -560,12 +565,12 @@ def test_unknown_limb_names_are_refused():
         )
     )
     decision = layer.decide_arm_joints(module, PendingSlot())(request)
-    assert not decision.accepted
-    assert "unknown arm_name" in decision.reason
+    assert decision.refusal.kind is module.FailureKind.REJECTED
+    assert "unknown arm_name" in decision.refusal.message
     assert coordinator.try_claim_arm()
 
 
-def test_decide_rejects_any_admission_surprise_without_holding_the_slot():
+def test_decide_refuses_any_admission_surprise_without_holding_the_slot():
     from peppygen.exposed_actions.limb_motion import move_arm_joints as module
 
     coordinator, layer = make_layer()
@@ -577,9 +582,56 @@ def test_decide_rejects_any_admission_surprise_without_holding_the_slot():
             raise RuntimeError("admission surprise")
 
     decision = layer.decide_arm_joints(module, PendingSlot())(Boom())
-    assert not decision.accepted
-    assert "admission failed" in decision.reason
+    assert decision.refusal.kind is module.FailureKind.ATTEMPT_FAILED
+    assert "admission failed" in decision.refusal.message
     assert coordinator.try_claim_arm(), "no surprise may leave the slot held"
+
+
+def test_a_goal_on_a_limb_a_leader_streams_is_refused_with_leader_streaming():
+    from peppygen.exposed_actions.limb_motion import move_arm, move_gripper
+    from peppygen.exposed_actions.postures import move_to_home
+
+    coordinator, layer = make_layer()
+    coordinator.measured_joints.set((0.0,) * 5)
+    coordinator.measured_gripper.set(0.5)
+    coordinator.leader_joints.set((0.0,) * 5)
+    coordinator.leader_gripper.set(0.5)
+    pose = SimpleNamespace(
+        data=SimpleNamespace(
+            arm_name="arm",
+            position=[0.1, 0.0, 0.2],
+            orientation=[0.0, 0.0, 0.0, 1.0],
+            duration_s=0.0,
+            plan_position_tolerance_m=0.01,
+            plan_orientation_tolerance_rad=0.2,
+            settle_position_tolerance_m=0.01,
+            settle_orientation_tolerance_rad=0.2,
+            settle_timeout_s=2.0,
+        )
+    )
+    gripper = SimpleNamespace(
+        data=SimpleNamespace(
+            gripper_name="gripper", opening=0.2, max_effort=0.0, settle_timeout_s=2.0
+        )
+    )
+    posture = SimpleNamespace(data=SimpleNamespace(duration_s=0.0))
+
+    for decision, module, reason in (
+        (layer.decide_pose(move_arm, PendingSlot())(pose), move_arm, ARM_LEADER_STREAMING),
+        (
+            layer.decide_gripper(move_gripper, PendingSlot())(gripper),
+            move_gripper,
+            GRIPPER_LEADER_STREAMING,
+        ),
+        (
+            layer.decide_posture(move_to_home, READY_POSITIONS_RAD, PendingSlot())(posture),
+            move_to_home,
+            ARM_LEADER_STREAMING,
+        ),
+    ):
+        assert decision.refusal == module.Failure(module.FailureKind.LEADER_STREAMING, reason)
+    # The refusals held no slot.
+    assert coordinator.try_claim_arm() and coordinator.try_claim_gripper()
 
 
 async def test_pose_goal_solves_in_drive_and_streams_a_plan():
@@ -604,8 +656,7 @@ async def test_pose_goal_solves_in_drive_and_streams_a_plan():
     runner = asyncio.create_task(run_plan_to_completion())
     await layer.drive_pose(ctx, goal, kinematics, kinematics)
     runner.cancel()
-    success, _message, _position, _orientation, _t = ctx.completed
-    assert success is True
+    assert ctx.completed is not None
     assert ("solve",) == tuple(c[0] for c in kinematics.solve_calls)
     assert coordinator.try_claim_arm()
 
@@ -639,12 +690,11 @@ async def test_a_pose_move_completes_once_the_measured_grasp_point_is_within_tol
     )
     assert plan.done.is_set()
     await task
-    success, message, position, _orientation, _t = ctx.completed
-    assert (success, message) == (True, "cartesian move complete")
+    position, _orientation, _t = ctx.completed
     assert position == list(kinematics.forward_kinematics(kinematics.solution)[0])
 
 
-async def test_a_pose_move_outside_its_tolerance_at_the_timeout_fails_with_the_shortfall(
+async def test_a_pose_move_outside_its_tolerance_at_the_timeout_fails_with_timeout(
     follower_never_stale,
 ):
     kinematics = FakeKinematics()
@@ -657,15 +707,15 @@ async def test_a_pose_move_outside_its_tolerance_at_the_timeout_fails_with_the_s
     assert coordinator.arm_tick(plan.profile.duration_s + 2.0) is None
     assert plan.done.is_set()
     await task
-    success, message, position, _orientation, _t = ctx.completed
-    assert success is False
-    assert message == "still 16.3 mm / 0.00 rad from the target, 2.0 s after the planned end"
-    # The result gives the grasp point of the arm, not the goal.
-    assert position == list(kinematics.forward_kinematics((0.0,) * 5)[0])
+    assert ctx.failed == (
+        FailureKind.TIMEOUT,
+        "still 16.3 mm / 0.00 rad from the target, 2.0 s after the planned end",
+    )
+    assert ctx.completed is None
     assert coordinator.try_claim_arm()
 
 
-async def test_a_stale_follower_reports_the_commanded_pose_with_a_note(follower_never_stale):
+async def test_a_stale_follower_reports_the_commanded_pose(follower_never_stale):
     kinematics = FakeKinematics()
     coordinator, layer = make_layer(kinematics)
     ctx, task, _plan = await pose_move_at_the_end_of_its_plan(
@@ -675,8 +725,7 @@ async def test_a_stale_follower_reports_the_commanded_pose_with_a_note(follower_
     # The last command of a finished plan is its end sample.
     coordinator.measured_joints.clear()
     await task
-    success, message, position, _orientation, _t = ctx.completed
-    assert (success, message) == (True, f"cartesian move complete; {STALE_COMMANDED}")
+    position, _orientation, _t = ctx.completed
     assert position == list(kinematics.forward_kinematics(kinematics.solution)[0])
 
 
@@ -710,7 +759,7 @@ async def test_pose_move_duration_floors_at_the_angular_ee_cap():
     await task
 
 
-async def test_unreachable_pose_completes_failed_and_releases():
+async def test_an_unreachable_pose_fails_with_unreachable_and_releases():
     kinematics = FakeKinematics()
     kinematics.corrupted = True  # solve returns None
     coordinator, layer = make_layer(kinematics)
@@ -718,12 +767,13 @@ async def test_unreachable_pose_completes_failed_and_releases():
     goal = admit_pose(layer, (5.0, 5.0, 5.0), (0.0, 0.0, 0.0, 1.0))
     ctx = FakeGoalContext()
     await layer.drive_pose(ctx, goal, kinematics, kinematics)
-    success, message, _position, _orientation, _t = ctx.completed
-    assert success is False
+    kind, message = ctx.failed
+    assert kind is FailureKind.UNREACHABLE
     assert message.startswith("goal pose not planned within ")
-    # The refusal must say the search was local, so a caller knows to retry
+    # The failure must say the search was local, so a caller knows to retry
     # from elsewhere rather than read it as the pose being out of reach.
     assert "local descent" in message
+    assert ctx.completed is None
     assert coordinator.try_claim_arm()
 
 
@@ -739,8 +789,11 @@ async def test_abandoned_pose_admission_releases_the_claim():
 def test_absurd_duration_is_refused():
     coordinator, layer = make_layer()
     coordinator.measured_joints.set((0.0,) * 5)
-    with pytest.raises(Rejection, match="duration_s must be a number of seconds from 0 to 60"):
+    with pytest.raises(
+        Refusal, match="duration_s must be a number of seconds from 0 to 60"
+    ) as raised:
         admit_joints(layer, (0.1,) * 5, MAX_REQUESTED_DURATION_S + 1.0)
+    assert raised.value.kind is FailureKind.REJECTED
     assert coordinator.try_claim_arm()
 
 
@@ -762,8 +815,8 @@ async def test_pose_solver_surprise_still_reaches_a_terminal_result():
     goal = admit_pose(layer, (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0))
     ctx = FakeGoalContext()
     await layer.drive_pose(ctx, goal, kinematics, kinematics)
-    success, message, _position, _orientation, _t = ctx.completed
-    assert success is False
+    kind, message = ctx.failed
+    assert kind is FailureKind.ATTEMPT_FAILED
     assert "pose solve failed" in message
     assert coordinator.try_claim_arm()
 
@@ -800,10 +853,14 @@ async def test_a_tolerance_that_is_no_bar_is_refused(bad):
         (PLAN, (bad, 0.2, 2.0), "settle_position_tolerance_m"),
         (PLAN, (0.01, bad, 2.0), "settle_orientation_tolerance_rad"),
     ):
-        with pytest.raises(Rejection, match=f"{field} must be a positive number"):
+        with pytest.raises(Refusal, match=f"{field} must be a positive number") as raised:
             admit_pose(layer, *pose, plan=plan, settle=settle)
-    with pytest.raises(Rejection, match="each settle_tolerances_rad entry must be a positive number"):
+        assert raised.value.kind is FailureKind.REJECTED
+    with pytest.raises(
+        Refusal, match="each settle_tolerances_rad entry must be a positive number"
+    ) as raised:
         admit_joints(layer, (0.1,) * 5, tolerances=(0.1, 0.1, bad, 0.1, 0.1))
+    assert raised.value.kind is FailureKind.REJECTED
     assert coordinator.try_claim_arm(), "a refused tolerance must not hold the slot"
 
 
@@ -813,9 +870,9 @@ async def test_a_settle_timeout_that_is_no_duration_is_refused(bad):
     coordinator.measured_joints.set((0.0,) * 5)
     coordinator.measured_gripper.set(0.5)
     refusal = "settle_timeout_s must be a number of seconds from 0 to 60"
-    with pytest.raises(Rejection, match=refusal):
+    with pytest.raises(Refusal, match=refusal):
         admit_pose(layer, (0.1, 0.0, 0.2), IDENTITY_QUAT, settle=(0.01, 0.2, bad))
-    with pytest.raises(Rejection, match=refusal):
+    with pytest.raises(Refusal, match=refusal):
         admit_joints(layer, (0.1,) * 5, timeout_s=bad)
     assert coordinator.try_claim_arm()
 
@@ -824,14 +881,14 @@ def test_a_settle_tolerance_below_the_plan_tolerance_of_its_axis_is_refused():
     coordinator, layer = make_layer()
     coordinator.measured_joints.set((0.0,) * 5)
     refusal = "settle_{0} must be at least plan_{0}: the plan may sit that far from the pose"
-    with pytest.raises(Rejection, match=refusal.format("position_tolerance_m")):
+    with pytest.raises(Refusal, match=refusal.format("position_tolerance_m")):
         admit_pose(layer, (0.1, 0.0, 0.2), IDENTITY_QUAT, settle=(0.005, 0.2, 2.0))
-    with pytest.raises(Rejection, match=refusal.format("orientation_tolerance_rad")):
+    with pytest.raises(Refusal, match=refusal.format("orientation_tolerance_rad")):
         admit_pose(layer, (0.1, 0.0, 0.2), IDENTITY_QUAT, settle=(0.01, 0.1, 2.0))
     assert coordinator.try_claim_arm()
 
 
-async def test_a_refused_tolerance_names_the_bar_it_was_judged_against():
+async def test_an_unreachable_failure_names_the_bar_it_was_judged_against():
     kinematics = FakeKinematics()
     kinematics.corrupted = True
     coordinator, layer = make_layer(kinematics)
@@ -841,27 +898,28 @@ async def test_a_refused_tolerance_names_the_bar_it_was_judged_against():
     )
     ctx = FakeGoalContext()
     await layer.drive_pose(ctx, move, kinematics, kinematics)
-    success, message, _p, _o, _t = ctx.completed
-    assert success is False
+    kind, message = ctx.failed
+    assert kind is FailureKind.UNREACHABLE
     assert "4.0 mm" in message and "2.9 deg" in message
 
 
 async def test_the_ee_caps_cannot_pin_the_slot_past_the_duration_ceiling():
     # A move admitted under the ceiling can still need longer than it once
-    # the end-effector speed caps are applied; that must refuse, not stretch.
+    # the end-effector speed caps are applied; that has no plan, and must not
+    # stretch.
     kinematics = FakeKinematics()
     coordinator, layer = make_layer(kinematics, max_ee_velocity_m_s=1e-4)
     coordinator.measured_joints.set((0.0,) * 5)
     goal = admit_pose(layer, (5.0, 0.0, 0.2), IDENTITY_QUAT)
     ctx = FakeGoalContext()
     await layer.drive_pose(ctx, goal, kinematics, kinematics)
-    success, message, _p, _o, _t = ctx.completed
-    assert success is False
+    kind, message = ctx.failed
+    assert kind is FailureKind.UNREACHABLE
     assert "ceiling" in message
-    assert coordinator.try_claim_arm(), "a refused move must release the arm"
+    assert coordinator.try_claim_arm(), "a failed move must release the arm"
 
 
-async def test_a_stopped_plan_completes_cancelled_with_the_stops_message(follower_never_stale):
+async def test_a_stopped_plan_ends_cancelled_with_the_stops_reason(follower_never_stale):
     coordinator, layer = make_layer()
     coordinator.measured_joints.set((0.0,) * 5)
     plan = admit_joints(layer, (0.5,) * 5, 1.0)
@@ -873,14 +931,30 @@ async def test_a_stopped_plan_completes_cancelled_with_the_stops_message(followe
     await driving
 
     assert ctx.completed is None
-    success, message, positions, _action_time = ctx.cancelled
-    assert success is False
-    assert message == "stopped: the operator asked"
+    reason, positions, _action_time = ctx.cancelled
+    assert reason == "stopped: the operator asked"
     assert positions == [0.0] * 5
     assert coordinator.try_claim_arm(), "the goal released the arm"
 
 
-async def test_a_stopped_gripper_plan_completes_cancelled_with_the_stops_message(
+async def test_a_goal_whose_sender_is_gone_ends_cancelled_with_that_reason(
+    follower_never_stale,
+):
+    coordinator, layer = make_layer()
+    coordinator.measured_joints.set((0.0,) * 5)
+    plan = admit_joints(layer, (0.5,) * 5, 1.0)
+    ctx = FakeGoalContext()
+    ctx.request_cancel(cause="sender_gone")
+    await layer.drive_arm(ctx, plan)
+
+    reason, positions, _action_time = ctx.cancelled
+    assert reason == "its sender is gone"
+    assert positions == [0.0] * 5
+    assert plan.aborted
+    assert coordinator.try_claim_arm()
+
+
+async def test_a_stopped_gripper_plan_ends_cancelled_with_the_stops_reason(
     follower_never_stale,
 ):
     coordinator, layer = make_layer()
@@ -893,9 +967,8 @@ async def test_a_stopped_gripper_plan_completes_cancelled_with_the_stops_message
     assert layer.stop_moves("") == ["gripper"]
     await driving
 
-    success, message, _opening, _action_time = ctx.cancelled
-    assert success is False
-    assert message == "stopped"
+    reason, settled, _opening, _action_time = ctx.cancelled
+    assert (reason, settled) == ("stopped", False)
     assert coordinator.try_claim_gripper()
 
 
@@ -920,16 +993,15 @@ async def test_a_stop_during_the_pose_solve_ends_the_goal_without_a_plan():
     await layer.drive_pose(ctx, goal, kinematics, kinematics)
 
     assert ctx.completed is None
-    success, message, _position, _orientation, _t = ctx.cancelled
-    assert success is False
-    assert message == "stopped: the operator asked"
+    reason, _position, _orientation, _t = ctx.cancelled
+    assert reason == "stopped: the operator asked"
     assert coordinator._arm_plan is None, "nothing was installed after the stop"
     assert coordinator.try_claim_arm()
 
 
 async def test_a_stop_before_the_pose_drive_runs_ends_the_goal_as_stopped():
     # The stop lands between the goal's admission and its drive task: the
-    # goal ends as cancelled with the stop's message, and nothing is solved.
+    # goal ends cancelled with the stop's reason, and nothing is solved.
     kinematics = FakeKinematics()
     coordinator, layer = make_layer(kinematics)
     coordinator.measured_joints.set((0.0,) * 5)
@@ -939,8 +1011,8 @@ async def test_a_stop_before_the_pose_drive_runs_ends_the_goal_as_stopped():
     await layer.drive_pose(ctx, goal, kinematics, kinematics)
 
     assert ctx.completed is None
-    success, message, position, _orientation, _t = ctx.cancelled
-    assert (success, message) == (False, "stopped: the operator asked")
+    reason, position, _orientation, _t = ctx.cancelled
+    assert reason == "stopped: the operator asked"
     assert position == list(kinematics.forward_kinematics((0.0,) * 5)[0])
     assert kinematics.solve_calls == []
     assert coordinator._arm_plan is None
@@ -953,14 +1025,13 @@ async def test_the_plan_check_answers_the_duration_the_joint_caps_floor():
     kinematics = FakeKinematics()
     coordinator, layer = make_layer(kinematics, max_joint_velocity_rad_s=(2.0,) * 5)
     coordinator.measured_joints.set((0.0,) * 5)
-    success, message, duration_s = await layer.check_arm_move(
+    check = await layer.check_arm_move(
         "arm", (0.2, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, *PLAN, kinematics, kinematics
     )
     floored = minimum_jerk.plan((0.0,) * 5, kinematics.solution, 0.0, (2.0,) * 5).duration_s
-    assert success is True
+    assert (check.reachable, check.reason) == (True, "")
     assert floored > 0.0
-    assert duration_s == pytest.approx(floored)
-    assert message == f"a plan reaches the pose in {duration_s:.3f} s"
+    assert check.duration_s == pytest.approx(floored)
 
 
 async def test_a_zero_settle_timeout_fails_an_arm_move_short_of_its_target_at_the_planned_end(
@@ -976,9 +1047,10 @@ async def test_a_zero_settle_timeout_fails_an_arm_move_short_of_its_target_at_th
     assert plan.done.is_set()
     ctx = FakeGoalContext()
     await layer.drive_arm(ctx, plan)
-    success, message, _positions, _action_time = ctx.completed
-    assert success is False
-    assert message == "still 0.500 rad from the target at joint 1, 0.0 s after the planned end"
+    assert ctx.failed == (
+        FailureKind.TIMEOUT,
+        "still 0.500 rad from the target at joint 1, 0.0 s after the planned end",
+    )
     assert coordinator.try_claim_arm()
 
 
@@ -987,61 +1059,78 @@ async def test_the_plan_check_answers_the_duration_and_installs_nothing():
     coordinator, layer = make_layer(kinematics, max_ee_velocity_m_s=0.1)
     coordinator.measured_joints.set((0.0,) * 5)
 
-    success, message, duration_s = await layer.check_arm_move(
+    check = await layer.check_arm_move(
         "arm", (0.2, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, *PLAN, kinematics, kinematics
     )
 
-    assert success is True
-    assert duration_s > 0.0
-    assert message == f"a plan reaches the pose in {duration_s:.3f} s"
+    assert (check.reachable, check.reason) == (True, "")
+    assert check.duration_s > 0.0
     assert ("solve",) == tuple(c[0] for c in kinematics.solve_calls)
     assert coordinator._arm_plan is None
     assert coordinator.try_claim_arm(), "the check claims nothing"
 
 
-async def test_the_plan_check_refuses_as_the_move_would():
+async def test_the_plan_check_answers_unreachable_and_refuses_as_the_move_would():
     kinematics = FakeKinematics()
     coordinator, layer = make_layer(kinematics)
     coordinator.measured_joints.set((0.0,) * 5)
 
     kinematics.corrupted = True
-    success, message, duration_s = await layer.check_arm_move(
+    check = await layer.check_arm_move(
         "arm", (5.0, 5.0, 5.0), (0.0, 0.0, 0.0, 1.0), 0.0, *PLAN, kinematics, kinematics
     )
-    assert success is False
-    assert message.startswith("goal pose not planned within ")
-    assert duration_s == 0.0
+    assert (check.reachable, check.duration_s) == (False, 0.0)
+    assert check.reason.startswith("goal pose not planned within ")
 
     kinematics.corrupted = False
-    success, message, _ = await layer.check_arm_move(
-        "wing", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, *PLAN, kinematics, kinematics
+    with pytest.raises(Refusal, match="unknown arm_name") as raised:
+        await layer.check_arm_move(
+            "wing", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, *PLAN, kinematics, kinematics
+        )
+    assert raised.value.kind is FailureKind.REJECTED
+    with pytest.raises(Refusal) as raised:
+        await layer.check_arm_move(
+            "arm", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 0.0), 0.0, *PLAN, kinematics, kinematics
+        )
+    assert refusal_of(raised) == (
+        FailureKind.REJECTED, "goal pose has an unnormalizable orientation"
     )
-    assert success is False
-    assert "unknown arm_name" in message
-    success, message, _ = await layer.check_arm_move(
-        "arm", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 0.0), 0.0, *PLAN, kinematics, kinematics
-    )
-    assert success is False
-    assert message == "goal pose has an unnormalizable orientation"
 
     # While an arm goal is in flight, the check is refused as a second goal is.
     admit_joints(layer, (0.5,) * 5, 1.0)
-    success, message, _ = await layer.check_arm_move(
-        "arm", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, *PLAN, kinematics, kinematics
-    )
-    assert success is False
-    assert message == "arm is already executing a motion"
+    with pytest.raises(Refusal) as raised:
+        await layer.check_arm_move(
+            "arm", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, *PLAN, kinematics, kinematics
+        )
+    assert refusal_of(raised) == (FailureKind.PRECONDITION_FAILED, ARM_BUSY)
     assert len(kinematics.solve_calls) == 1, "a refused check pays no solve"
 
 
 async def test_the_plan_check_needs_fresh_follower_state():
     kinematics = FakeKinematics()
     _coordinator, layer = make_layer(kinematics)
-    success, message, _ = await layer.check_arm_move(
-        "arm", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, *PLAN, kinematics, kinematics
+    with pytest.raises(Refusal) as raised:
+        await layer.check_arm_move(
+            "arm", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, *PLAN, kinematics, kinematics
+        )
+    assert refusal_of(raised) == (FailureKind.RESOURCE_UNAVAILABLE, NO_ANCHOR)
+
+
+async def test_a_solve_that_raises_fails_the_plan_check_with_attempt_failed():
+    class BoomKinematics(FakeKinematics):
+        def inverse_kinematics(self, seed, position, orientation, **bars):
+            raise RuntimeError("solver surprise")
+
+    kinematics = BoomKinematics()
+    coordinator, layer = make_layer(kinematics)
+    coordinator.measured_joints.set((0.0,) * 5)
+    with pytest.raises(Refusal) as raised:
+        await layer.check_arm_move(
+            "arm", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, *PLAN, kinematics, kinematics
+        )
+    assert refusal_of(raised) == (
+        FailureKind.ATTEMPT_FAILED, "pose solve failed: RuntimeError('solver surprise')"
     )
-    assert success is False
-    assert message == "no fresh follower state to anchor the move from"
 
 
 def test_a_streaming_leader_keeps_the_limbs_until_its_stream_stops(monkeypatch):
@@ -1051,20 +1140,23 @@ def test_a_streaming_leader_keeps_the_limbs_until_its_stream_stops(monkeypatch):
     coordinator.leader_joints.set((0.0,) * 5)
     coordinator.leader_gripper.set(0.5)
     pose = ((0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0))
-    with pytest.raises(Rejection, match="leader is streaming arm"):
+    with pytest.raises(Refusal) as raised:
         admit_joints(layer, (0.1,) * 5, 0.0)
-    with pytest.raises(Rejection, match="leader is streaming arm"):
+    assert refusal_of(raised) == (FailureKind.LEADER_STREAMING, ARM_LEADER_STREAMING)
+    with pytest.raises(Refusal) as raised:
         admit_pose(layer, *pose)
-    with pytest.raises(Rejection, match="leader is streaming gripper"):
+    assert refusal_of(raised) == (FailureKind.LEADER_STREAMING, ARM_LEADER_STREAMING)
+    with pytest.raises(Refusal) as raised:
         admit_gripper(layer, 0.2, 0.0)
+    assert refusal_of(raised) == (FailureKind.LEADER_STREAMING, GRIPPER_LEADER_STREAMING)
     # The refusals held no slot.
     assert coordinator.try_claim_arm() and coordinator.try_claim_gripper()
     coordinator.release_arm()
     coordinator.release_gripper()
     # A goal boundary clears the leader holders; the leader still streams.
-    with pytest.raises(Rejection, match="leader is streaming arm"):
+    with pytest.raises(Refusal, match="leader is streaming arm"):
         admit_joints(layer, (0.1,) * 5, 0.0)
-    with pytest.raises(Rejection, match="leader is streaming gripper"):
+    with pytest.raises(Refusal, match="leader is streaming gripper"):
         admit_gripper(layer, 0.2, 0.0)
     # The leader lets go: past the deadman, the limbs take goals again. The
     # follower state is refreshed so only the leader's age moves.
@@ -1084,18 +1176,21 @@ async def test_the_move_check_refuses_in_the_goals_order():
     coordinator, layer = make_layer()
     coordinator.leader_joints.set((0.0,) * 5)
     pose = ((0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0))
-    ok, message, _duration_s = await layer.check_arm_move("arm", *pose, 0.0, *PLAN, None, None)
-    assert (ok, message) == (False, NO_ANCHOR)
-    with pytest.raises(Rejection, match=NO_ANCHOR):
+    with pytest.raises(Refusal) as raised:
+        await layer.check_arm_move("arm", *pose, 0.0, *PLAN, None, None)
+    assert refusal_of(raised) == (FailureKind.RESOURCE_UNAVAILABLE, NO_ANCHOR)
+    with pytest.raises(Refusal) as raised:
         admit_pose(layer, *pose)
+    assert refusal_of(raised) == (FailureKind.RESOURCE_UNAVAILABLE, NO_ANCHOR)
 
 
-async def test_the_move_check_answers_the_streaming_refusal_without_claiming():
+async def test_the_move_check_gives_the_streaming_refusal_without_claiming():
     coordinator, layer = make_layer()
     coordinator.measured_joints.set((0.0,) * 5)
     coordinator.leader_joints.set((0.0,) * 5)
-    ok, message, duration_s = await layer.check_arm_move(
-        "arm", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, *PLAN, None, None
-    )
-    assert (ok, message, duration_s) == (False, ARM_LEADER_STREAMING, 0.0)
+    with pytest.raises(Refusal) as raised:
+        await layer.check_arm_move(
+            "arm", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, *PLAN, None, None
+        )
+    assert refusal_of(raised) == (FailureKind.LEADER_STREAMING, ARM_LEADER_STREAMING)
     assert coordinator.try_claim_arm()

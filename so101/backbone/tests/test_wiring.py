@@ -15,7 +15,6 @@ from conftest import (
     FAR_SHORT_BY_MORE_THAN,
     MEASURED,
     NEAR,
-    NOT_CHECKED,
     assert_rectangle_inside_reach,
 )
 from peppygen.exposed_actions.limb_motion import move_arm as move_arm_prod
@@ -272,13 +271,12 @@ async def test_move_arm_joints_completes_and_reports():
                     arm_name="arm", joint_positions=target, duration_s=0.0,
                     settle_tolerances_rad=[0.1] * 5, settle_timeout_s=2.0,
                 ),
-                peppylib.QoSProfile.Reliable,
                 TIMEOUT_S,
             )
             assert goal.accepted
             result = await goal.get_result(TIMEOUT_S)
             assert result.status == move_arm_joints_fx.ResultStatus.COMPLETED
-            assert result.data.success
+            assert result.data.final_joint_positions == pytest.approx(MEASURED)
             # The trajectory's last downstream setpoint lands on the target.
             last = None
             while True:
@@ -294,7 +292,7 @@ async def test_move_arm_joints_completes_and_reports():
             feeder.cancel()
 
 
-async def test_move_arm_joints_outside_its_tolerances_fails_with_the_shortfall():
+async def test_move_arm_joints_outside_its_tolerances_fails_with_timeout():
     async with harness.start(setup, parameters=make_parameters()) as h:
         feeder = await feeding_measured(h)
         try:
@@ -309,25 +307,25 @@ async def test_move_arm_joints_outside_its_tolerances_fails_with_the_shortfall()
                     settle_tolerances_rad=[0.1] * 5,
                     settle_timeout_s=0.3,
                 ),
-                peppylib.QoSProfile.Reliable,
                 TIMEOUT_S,
             )
             assert goal.accepted
             result = await goal.get_result(TIMEOUT_S)
-            assert result.status == move_arm_joints_fx.ResultStatus.COMPLETED
-            assert not result.data.success
+            assert result.status == move_arm_joints_fx.ResultStatus.FAILED
+            # A failed goal gives no result.
+            assert result.data is None
+            assert result.failure.kind is move_arm_joints_fx.FailureKind.TIMEOUT
             # Every joint is 0.2 rad short; the one named is whichever float
             # sum lands a few ulps farther out.
             assert re.fullmatch(
                 r"still 0\.200 rad from the target at joint [1-5], \d+\.\d s after the planned end",
-                result.data.message,
-            ), result.data.message
-            assert result.data.final_joint_positions == pytest.approx(MEASURED)
+                result.failure.message,
+            ), result.failure.message
         finally:
             feeder.cancel()
 
 
-async def test_second_goal_is_rejected_while_busy():
+async def test_second_goal_is_refused_while_busy_and_a_cancel_ends_the_first():
     async with harness.start(setup, parameters=make_parameters()) as h:
         # The in-flight goal outlives STALE_FOLLOWER_TIMEOUT_S, and a plan
         # failed for staleness would cancel before cancel_goal ever runs.
@@ -342,7 +340,6 @@ async def test_second_goal_is_rejected_while_busy():
                     settle_tolerances_rad=[0.1] * 5,
                     settle_timeout_s=2.0,
                 ),
-                peppylib.QoSProfile.Reliable,
                 TIMEOUT_S,
             )
             assert slow.accepted
@@ -352,21 +349,23 @@ async def test_second_goal_is_rejected_while_busy():
                     arm_name="arm", joint_positions=MEASURED, duration_s=0.0,
                     settle_tolerances_rad=[0.1] * 5, settle_timeout_s=2.0,
                 ),
-                peppylib.QoSProfile.Reliable,
                 TIMEOUT_S,
             )
-            assert not second.accepted
-            assert second.reason == "arm is already executing a motion"
+            assert second.refusal == move_arm_joints_fx.Failure(
+                move_arm_joints_fx.FailureKind.PRECONDITION_FAILED,
+                "arm is already executing a motion",
+            )
             cancel = await slow.cancel_goal(TIMEOUT_S)
             assert cancel.state == move_arm_joints_fx.CancelState.SIGNALLED
             result = await slow.get_result(TIMEOUT_S)
             assert result.status == move_arm_joints_fx.ResultStatus.CANCELLED
-            assert not result.data.success
+            assert result.cancel_reason == "cancelled by its caller"
+            assert len(result.data.final_joint_positions) == 5
         finally:
             feeder.cancel()
 
 
-async def test_goal_without_follower_state_is_rejected():
+async def test_goal_without_follower_state_is_refused():
     async with harness.start(setup, parameters=make_parameters()) as h:
         goal = await move_arm_joints_fx.send_goal(
             h,
@@ -374,11 +373,10 @@ async def test_goal_without_follower_state_is_rejected():
                 arm_name="arm", joint_positions=MEASURED, duration_s=0.0,
                 settle_tolerances_rad=[0.1] * 5, settle_timeout_s=2.0,
             ),
-            peppylib.QoSProfile.Reliable,
             TIMEOUT_S,
         )
-        assert not goal.accepted
-        assert "no fresh follower state" in goal.reason
+        assert goal.refusal.kind is move_arm_joints_fx.FailureKind.RESOURCE_UNAVAILABLE
+        assert "no fresh follower state" in goal.refusal.message
 
 
 async def test_posture_and_gripper_actions():
@@ -388,20 +386,17 @@ async def test_posture_and_gripper_actions():
             posture = await move_to_ready_fx.send_goal(
                 h,
                 move_to_ready_prod.GoalRequestData(duration_s=0.0),
-                peppylib.QoSProfile.Reliable,
                 TIMEOUT_S,
             )
             assert posture.accepted
             result = await posture.get_result(TIMEOUT_S)
             assert result.status == move_to_ready_fx.ResultStatus.COMPLETED
-            assert result.data.success
 
             grip = await move_gripper_fx.send_goal(
                 h,
                 move_gripper_prod.GoalRequestData(
                     gripper_name="gripper", opening=0.5, max_effort=0.0, settle_timeout_s=2.0
                 ),
-                peppylib.QoSProfile.Reliable,
                 TIMEOUT_S,
             )
             assert grip.accepted
@@ -410,8 +405,7 @@ async def test_posture_and_gripper_actions():
             # The mocked follower never moves its jaws: past the planned end
             # of its travel the goal finds them standing still and reports
             # where they stand.
-            assert grip_result.data.success
-            assert grip_result.data.message == "move complete"
+            assert grip_result.data.settled
             assert grip_result.data.final_opening == 0.0
             assert grip_result.data.action_time >= GRIPPER_STILL_WINDOW_S
             # The ramp's last downstream opening is the target.
@@ -435,7 +429,7 @@ async def test_a_posture_result_names_the_arm_and_its_measured_grasp_point(
     # One scenario for three facts of the result of each posture move:
     # - the result names the arm;
     # - it gives the grasp point of the measured joints;
-    # - it can report success when the arm did not arrive.
+    # - it completes when the arm did not arrive.
     # The mocked follower always measures MEASURED, so the arm never gets to
     # a posture. follower_never_stale keeps a pause of the event loop from
     # making the measured joints stale.
@@ -451,13 +445,11 @@ async def test_a_posture_result_names_the_arm_and_its_measured_grasp_point(
                 goal = await fixture.send_goal(
                     h,
                     production.GoalRequestData(duration_s=0.0),
-                    peppylib.QoSProfile.Reliable,
                     TIMEOUT_S,
                 )
                 assert goal.accepted
                 result = await goal.get_result(TIMEOUT_S)
                 assert result.status == fixture.ResultStatus.COMPLETED
-                assert result.data.success
                 assert result.data.arm_names == ["arm"]
                 assert result.data.positions == pytest.approx(list(measured_position))
                 assert result.data.orientations == pytest.approx(list(measured_orientation))
@@ -479,12 +471,11 @@ async def test_nonzero_max_effort_is_accepted_and_ignored():
                 move_gripper_prod.GoalRequestData(
                     gripper_name="gripper", opening=0.5, max_effort=2.0, settle_timeout_s=2.0
                 ),
-                peppylib.QoSProfile.Reliable,
                 TIMEOUT_S,
             )
             assert goal.accepted
             result = await goal.get_result(TIMEOUT_S)
-            assert result.data.success
+            assert result.status == move_gripper_fx.ResultStatus.COMPLETED
         finally:
             feeder.cancel()
 
@@ -498,7 +489,6 @@ async def test_a_gripper_goals_max_effort_never_reaches_the_follower():
                 move_gripper_prod.GoalRequestData(
                     gripper_name="gripper", opening=0.5, max_effort=2.0, settle_timeout_s=2.0
                 ),
-                peppylib.QoSProfile.Reliable,
                 TIMEOUT_S,
             )
             assert goal.accepted
@@ -510,12 +500,12 @@ async def test_a_gripper_goals_max_effort_never_reaches_the_follower():
             assert 0.0 < setpoint.opening <= 0.5
             assert setpoint.max_effort == 0.0
             result = await goal.get_result(TIMEOUT_S)
-            assert result.data.success
+            assert result.status == move_gripper_fx.ResultStatus.COMPLETED
         finally:
             feeder.cancel()
 
 
-async def test_malformed_pose_goal_is_rejected_and_the_server_survives():
+async def test_malformed_pose_goal_is_refused_and_the_server_survives():
     async with harness.start(setup, parameters=make_parameters()) as h:
         feeder = await feeding_measured(h)
         try:
@@ -533,11 +523,11 @@ async def test_malformed_pose_goal_is_rejected_and_the_server_survives():
                     settle_orientation_tolerance_rad=0.5,
                     settle_timeout_s=2.0,
                 ),
-                peppylib.QoSProfile.Reliable,
                 TIMEOUT_S,
             )
-            assert not bad.accepted
-            assert bad.reason == "goal pose has an unnormalizable orientation"
+            assert bad.refusal == move_arm_fx.Failure(
+                move_arm_fx.FailureKind.REJECTED, "goal pose has an unnormalizable orientation"
+            )
             # The server must still decide the next goal (reachability of the
             # target pose is not the point; a decision is).
             again = await move_arm_fx.send_goal(
@@ -553,16 +543,15 @@ async def test_malformed_pose_goal_is_rejected_and_the_server_survives():
                     settle_orientation_tolerance_rad=0.5,
                     settle_timeout_s=2.0,
                 ),
-                peppylib.QoSProfile.Reliable,
                 TIMEOUT_S,
             )
             if not again.accepted:
-                assert "unnormalizable" not in again.reason
+                assert "unnormalizable" not in again.refusal.message
         finally:
             feeder.cancel()
 
 
-async def test_out_of_limit_goal_is_rejected():
+async def test_out_of_limit_goal_is_refused():
     async with harness.start(setup, parameters=make_parameters()) as h:
         await publish_measured(h)
         goal = await move_arm_joints_fx.send_goal(
@@ -571,11 +560,11 @@ async def test_out_of_limit_goal_is_rejected():
                 arm_name="arm", joint_positions=[9.0] * 5, duration_s=0.0,
                 settle_tolerances_rad=[0.1] * 5, settle_timeout_s=2.0,
             ),
-            peppylib.QoSProfile.Reliable,
             TIMEOUT_S,
         )
-        assert not goal.accepted
-        assert goal.reason == "target out of joint limits"
+        assert goal.refusal == move_arm_joints_fx.Failure(
+            move_arm_joints_fx.FailureKind.REJECTED, "target out of joint limits"
+        )
 
 
 async def test_unknown_arm_name_is_refused():
@@ -587,11 +576,10 @@ async def test_unknown_arm_name_is_refused():
                 arm_name="left_arm", joint_positions=MEASURED, duration_s=0.0,
                 settle_tolerances_rad=[0.1] * 5, settle_timeout_s=2.0,
             ),
-            peppylib.QoSProfile.Reliable,
             TIMEOUT_S,
         )
-        assert not goal.accepted
-        assert "unknown arm_name" in goal.reason
+        assert goal.refusal.kind is move_arm_joints_fx.FailureKind.REJECTED
+        assert "unknown arm_name" in goal.refusal.message
 
 
 async def test_stale_timestamped_leader_input_is_dropped():
@@ -638,9 +626,7 @@ async def test_a_stop_ends_the_moves_in_flight_and_a_later_goal_runs():
         feeder = await feeding_measured(h)
         try:
             idle = await stop_fx.poll(h, stop_prod.RequestData(reason="nothing yet"), TIMEOUT_S)
-            assert idle.success
             assert idle.stopped == []
-            assert idle.message == "nothing was moving"
 
             slow = await move_arm_joints_fx.send_goal(
                 h,
@@ -651,7 +637,6 @@ async def test_a_stop_ends_the_moves_in_flight_and_a_later_goal_runs():
                     settle_tolerances_rad=[0.1] * 5,
                     settle_timeout_s=2.0,
                 ),
-                peppylib.QoSProfile.Reliable,
                 TIMEOUT_S,
             )
             assert slow.accepted
@@ -660,7 +645,6 @@ async def test_a_stop_ends_the_moves_in_flight_and_a_later_goal_runs():
                 move_gripper_prod.GoalRequestData(
                     gripper_name="gripper", opening=1.0, max_effort=0.0, settle_timeout_s=2.0
                 ),
-                peppylib.QoSProfile.Reliable,
                 TIMEOUT_S,
             )
             assert jaws.accepted
@@ -671,17 +655,18 @@ async def test_a_stop_ends_the_moves_in_flight_and_a_later_goal_runs():
             answer = await stop_fx.poll(
                 h, stop_prod.RequestData(reason="the operator asked"), TIMEOUT_S
             )
-            assert answer.success
             assert answer.stopped == ["arm", "gripper"]
-            assert answer.message == "stopped arm, gripper"
 
+            # Each goal the stop ended ends cancelled, with a reason that
+            # names the stop and its reason, and with its result.
             result = await slow.get_result(TIMEOUT_S)
             assert result.status == move_arm_joints_fx.ResultStatus.CANCELLED
-            assert not result.data.success
-            assert result.data.message == "stopped: the operator asked"
+            assert result.cancel_reason == "stopped: the operator asked"
+            assert len(result.data.final_joint_positions) == 5
             result = await jaws.get_result(TIMEOUT_S)
             assert result.status == move_gripper_fx.ResultStatus.CANCELLED
-            assert result.data.message == "stopped: the operator asked"
+            assert result.cancel_reason == "stopped: the operator asked"
+            assert not result.data.settled
 
             # The stop does not latch: a later goal runs to its end.
             later = await move_arm_joints_fx.send_goal(
@@ -690,13 +675,11 @@ async def test_a_stop_ends_the_moves_in_flight_and_a_later_goal_runs():
                     arm_name="arm", joint_positions=MEASURED, duration_s=0.0,
                     settle_tolerances_rad=[0.1] * 5, settle_timeout_s=2.0,
                 ),
-                peppylib.QoSProfile.Reliable,
                 TIMEOUT_S,
             )
             assert later.accepted
             result = await later.get_result(TIMEOUT_S)
             assert result.status == move_arm_joints_fx.ResultStatus.COMPLETED
-            assert result.data.success
         finally:
             feeder.cancel()
 
@@ -720,7 +703,7 @@ async def test_the_plan_check_answers_without_moving():
                 plan_orientation_tolerance_rad=0.5,
             )
             answer = await check_arm_move_fx.poll(h, check, TIMEOUT_S)
-            assert answer.success, answer.message
+            assert (answer.reachable, answer.reason) == (True, "")
             assert answer.duration_s > 0.0
 
             far = check_arm_move_prod.RequestData(
@@ -732,14 +715,95 @@ async def test_the_plan_check_answers_without_moving():
                 plan_orientation_tolerance_rad=0.5,
             )
             answer = await check_arm_move_fx.poll(h, far, TIMEOUT_S)
-            assert not answer.success
-            assert answer.message.startswith("goal pose not planned within ")
+            assert not answer.reachable
+            assert answer.reason.startswith("goal pose not planned within ")
             assert answer.duration_s == 0.0
 
             # Nothing streamed downstream: the checks moved nothing.
             with pytest.raises(TimeoutError):
                 await asyncio.wait_for(h.mocks.pairings.arm.joint_setpoints.next(), 0.5)
+
+            # A check that move_arm would refuse gets an error reply with the
+            # kind of that refusal.
+            unknown = check_arm_move_prod.RequestData(
+                arm_name="left_arm",
+                position=list(position),
+                orientation=list(orientation),
+                duration_s=0.0,
+                plan_position_tolerance_m=0.01,
+                plan_orientation_tolerance_rad=0.5,
+            )
+            with pytest.raises(check_arm_move_fx.Failure) as raised:
+                await check_arm_move_fx.poll(h, unknown, TIMEOUT_S)
+            assert raised.value.kind is check_arm_move_fx.FailureKind.REJECTED
+            assert "unknown arm_name" in raised.value.message
         finally:
+            feeder.cancel()
+
+
+async def test_a_move_arm_goal_with_no_plan_fails_with_unreachable():
+    async with harness.start(setup, parameters=make_parameters()) as h:
+        feeder = await feeding_measured(h)
+        try:
+            position, orientation = Kinematics(KINEMATICS_URDF_PATH).forward_kinematics(
+                MEASURED
+            )
+            goal = await move_arm_fx.send_goal(
+                h,
+                move_arm_prod.GoalRequestData(
+                    arm_name="arm",
+                    position=[position[0] + 2.0, position[1], position[2]],
+                    orientation=list(orientation),
+                    duration_s=0.0,
+                    plan_position_tolerance_m=0.01,
+                    plan_orientation_tolerance_rad=0.5,
+                    settle_position_tolerance_m=0.01,
+                    settle_orientation_tolerance_rad=0.5,
+                    settle_timeout_s=2.0,
+                ),
+                TIMEOUT_S,
+            )
+            assert goal.accepted
+            result = await goal.get_result(TIMEOUT_S)
+            assert result.status == move_arm_fx.ResultStatus.FAILED
+            assert result.data is None
+            assert result.failure.kind is move_arm_fx.FailureKind.UNREACHABLE
+            assert result.failure.message.startswith("goal pose not planned within ")
+        finally:
+            feeder.cancel()
+
+
+async def test_a_streaming_leader_refuses_goals_and_checks_with_leader_streaming():
+    async with harness.start(setup, parameters=make_parameters()) as h:
+        feeder = await feeding_measured(h)
+        streamer = asyncio.create_task(_stream_leader_target(h, list(MEASURED), []))
+        try:
+            # The leader's target reached the follower: the node follows the
+            # leader, which holds the arm while it streams.
+            await asyncio.wait_for(h.mocks.pairings.arm.joint_setpoints.next(), TIMEOUT_S)
+
+            posture = await move_to_ready_fx.send_goal(
+                h, move_to_ready_prod.GoalRequestData(duration_s=0.0), TIMEOUT_S
+            )
+            assert posture.refusal.kind is move_to_ready_fx.FailureKind.LEADER_STREAMING
+            assert posture.refusal.message.startswith("a leader is streaming arm commands")
+
+            position, orientation = Kinematics(KINEMATICS_URDF_PATH).forward_kinematics(
+                MEASURED
+            )
+            check = check_arm_move_prod.RequestData(
+                arm_name="arm",
+                position=list(position),
+                orientation=list(orientation),
+                duration_s=0.0,
+                plan_position_tolerance_m=0.01,
+                plan_orientation_tolerance_rad=0.5,
+            )
+            with pytest.raises(check_arm_move_fx.Failure) as raised:
+                await check_arm_move_fx.poll(h, check, TIMEOUT_S)
+            assert raised.value.kind is check_arm_move_fx.FailureKind.LEADER_STREAMING
+        finally:
+            streamer.cancel()
             feeder.cancel()
 
 
@@ -749,22 +813,18 @@ async def test_the_workspace_answers_on_reach_alone_from_bringup():
         surface = await describe_workspace_fx.poll(
             h, describe_workspace_prod.RequestData(surface_height=0.0), WORKSPACE_TIMEOUT_S
         )
-        assert surface.success, surface.message
         assert surface.perception_camera == ""
         assert surface.workable
         assert surface.area >= 0.03
         assert_rectangle_inside_reach(surface)
         assert surface.view is None
-        assert surface.message.endswith(NOT_CHECKED)
 
         wire = [*NEAR, *CLOSE, *FAR]
         points = await check_positions_fx.poll(
             h, check_positions_prod.RequestData(positions=wire), WORKSPACE_TIMEOUT_S
         )
-        assert points.success, points.message
         assert points.perception_camera == ""
         assert not points.all_workable
-        assert points.message.endswith(NOT_CHECKED)
         near, close, far = points.results
         for result, asked in zip(points.results, (NEAR, CLOSE, FAR), strict=True):
             assert result.position == pytest.approx(list(asked))
@@ -774,21 +834,25 @@ async def test_the_workspace_answers_on_reach_alone_from_bringup():
         assert (far.workable, far.reachable, far.arm) == (False, False, "")
         assert far.short_by > FAR_SHORT_BY_MORE_THAN
         assert {(p.in_view, p.view) for p in points.results} == {(False, "no_camera")}
+        # Each point's message says that its view is not checked.
+        assert all("view is not checked" in p.message for p in points.results)
 
 
-async def test_the_workspace_refuses_what_is_not_a_request():
+async def test_the_workspace_gives_an_error_reply_to_what_is_not_a_request():
     async with harness.start(setup, parameters=make_parameters()) as h:
-        surface = await describe_workspace_fx.poll(
-            h, describe_workspace_prod.RequestData(surface_height=math.nan), TIMEOUT_S
+        with pytest.raises(describe_workspace_fx.Failure) as raised:
+            await describe_workspace_fx.poll(
+                h, describe_workspace_prod.RequestData(surface_height=math.nan), TIMEOUT_S
+            )
+        assert raised.value == describe_workspace_fx.Failure(
+            describe_workspace_fx.FailureKind.REJECTED, "surface_height must be a finite number"
         )
-        assert not surface.success
-        assert surface.message == "surface_height must be a finite number"
-        assert (surface.perception_camera, surface.workable, surface.area) == ("", False, 0.0)
-        assert (surface.rectangle, surface.reach, surface.view) == (None, None, None)
 
-        points = await check_positions_fx.poll(
-            h, check_positions_prod.RequestData(positions=[0.2, 0.0]), TIMEOUT_S
+        with pytest.raises(check_positions_fx.Failure) as raised:
+            await check_positions_fx.poll(
+                h, check_positions_prod.RequestData(positions=[0.2, 0.0]), TIMEOUT_S
+            )
+        assert raised.value == check_positions_fx.Failure(
+            check_positions_fx.FailureKind.REJECTED,
+            "positions must hold 3 values (x, y, z) per point",
         )
-        assert not points.success
-        assert points.message == "positions must hold 3 values (x, y, z) per point"
-        assert (points.perception_camera, points.all_workable, points.results) == ("", False, [])

@@ -23,7 +23,8 @@ by the same caps, exactly like every other tick.
 
 The stop service ends every plan installed, whoever admitted it: each plan
 is cut where its stream stands, as a cancel cuts it, and carries the stop's
-message for its goal to end with.
+message for its goal to end with. A plan the coordinator fails carries the
+failure kind and the message its goal fails with.
 """
 
 from __future__ import annotations
@@ -32,14 +33,13 @@ import asyncio
 import math
 import time
 from dataclasses import dataclass, field
-from typing import ClassVar
-
 from control_core_py.minimum_jerk import Profile
 from control_core_py.runtime import Latch
 from so101_description.limbs import ARM_LIMB, GRIPPER_LIMB
 from so101_description.limits import JointLimits
 from so101_description.transforms import relative_rotation_rad
 
+from so101_backbone.failures import FailureKind
 from so101_backbone.governor import EEGovernor, rate_step
 from so101_backbone.params import Config, UpstreamMode
 from so101_backbone.reach import ReachBall
@@ -58,13 +58,28 @@ STALE_WIRE_TIMEOUT_S = 0.25
 # period, because the follower publishes state on its own independent rate;
 # 0.1 s is six periods of the family's validated 60 Hz state stream.
 STALE_FOLLOWER_TIMEOUT_S = 0.1
-# The failure of a move in flight once the follower's measured state is stale.
-STALE_FOLLOWER_REFUSAL = "the follower stopped reporting"
 # The jaws stand still once every opening the follower delivered over
 # GRIPPER_STILL_WINDOW_S lies within GRIPPER_STILL_BAND of full jaw travel of
 # the others: the band and window the limb_motion contract states.
 GRIPPER_STILL_BAND = 0.01
 GRIPPER_STILL_WINDOW_S = 0.25
+
+
+@dataclass(frozen=True)
+class PlanFailure:
+    """Why the coordinator cut a plan short: the failure kind its goal fails
+    with, and the message."""
+
+    kind: FailureKind
+    message: str
+
+
+# The failure of a move in flight once the follower's measured state is stale.
+FOLLOWER_SILENT = PlanFailure(FailureKind.RESOURCE_UNAVAILABLE, "the follower stopped reporting")
+# The failure of a move whose setpoint did not reach the follower.
+PUBLISH_FAILED = PlanFailure(
+    FailureKind.ATTEMPT_FAILED, "downstream setpoint publish failed mid-goal"
+)
 
 
 class LatestValue:
@@ -116,7 +131,6 @@ class JointSettle:
 
     tolerances_rad: tuple[float, ...]
     timeout_s: float
-    completion: ClassVar[str] = "trajectory complete"
 
     def shortfall(self, measured, target, _kinematics) -> str | None:
         """How far the joint farthest outside its tolerance still stands
@@ -141,7 +155,6 @@ class PoseSettle:
     position_tolerance_m: float
     orientation_tolerance_rad: float
     timeout_s: float
-    completion: ClassVar[str] = "cartesian move complete"
 
     def shortfall(self, measured, _target, kinematics) -> str | None:
         """How far the grasp point of the `measured` joints still stands from
@@ -160,9 +173,7 @@ class PoseSettle:
 @dataclass(frozen=True)
 class PostureEnd:
     """How a posture move ends: at the planned end of its trajectory,
-    judging nothing, with `completion` as its message."""
-
-    completion: str
+    judging nothing."""
 
     def shortfall(self, _measured, _target, _kinematics) -> None:
         return None
@@ -172,14 +183,14 @@ class PostureEnd:
 class ArmPlan:
     profile: Profile
     # How the plan ends past the planned end of its profile, judged on the
-    # measured joints each tick, and the message it completes with.
+    # measured joints each tick.
     settle: JointSettle | PoseSettle | PostureEnd
     done: asyncio.Event = field(default_factory=asyncio.Event)
     started_monotonic: float | None = None
     aborted: bool = False
-    # Set when the coordinator cut the plan short for a cause the goal must
-    # report (follower staleness, a dead downstream wire).
-    failed: str | None = None
+    # Set when the coordinator cut the plan short for a cause the goal fails
+    # with: follower staleness, a dead downstream wire, a settle timeout.
+    failed: PlanFailure | None = None
     # The sample the stream stood at when the plan was cut; last_sample
     # reports it instead of re-evaluating the profile at a later clock.
     frozen: tuple[float, ...] | None = None
@@ -237,7 +248,9 @@ class GripperPlan:
     # the still band of one another; None before the first.
     still: StillRun | None = None
     aborted: bool = False
-    failed: str | None = None
+    # Set when the coordinator cut the plan short for a cause the goal fails
+    # with: follower staleness, a dead downstream wire.
+    failed: PlanFailure | None = None
     # The opening the ramp stood at when the plan was cut, for reporting.
     frozen: float | None = None
     # The opening measured when the plan completed, which it reports.
@@ -331,7 +344,7 @@ class Coordinator:
     # -------------------------------------------------------------- busy slots
 
     def try_claim_arm(self) -> bool:
-        """Single-flight admission for the arm: a second arm goal is rejected
+        """Single-flight admission for the arm: a second arm goal is refused
         rather than queued, and streamed arm input is ignored while one runs.
         The gripper claims independently."""
         if self._arm_busy:
@@ -477,7 +490,7 @@ class Coordinator:
             if self._arm_plan is plan:
                 self._arm_plan = None
             plan.frozen = plan.last_sample(time.monotonic())
-            plan.failed = "downstream setpoint publish failed mid-goal"
+            plan.failed = PUBLISH_FAILED
             plan.done.set()
             return
         assert command is not None, "a delivered setpoint must name the value that went out"
@@ -503,7 +516,7 @@ class Coordinator:
             if self._gripper_plan is plan:
                 self._gripper_plan = None
             plan.frozen = frozen
-            plan.failed = "downstream setpoint publish failed mid-goal"
+            plan.failed = PUBLISH_FAILED
             plan.done.set()
             return
         assert command is not None, "a delivered setpoint must name the value that went out"
@@ -531,12 +544,12 @@ class Coordinator:
         self.leader_joints.clear()
         self.leader_pose.clear()
 
-    def _fail_arm_plan(self, plan: ArmPlan, reason: str) -> None:
+    def _fail_arm_plan(self, plan: ArmPlan, failure: PlanFailure) -> None:
         plan.frozen = plan.last_sample(time.monotonic())
         self._arm_plan = None
         self._commanded_arm = None
         self._delivered_arm = None
-        plan.failed = reason
+        plan.failed = failure
         plan.done.set()
 
     def _ramp_stands(self, plan: GripperPlan) -> float:
@@ -544,12 +557,12 @@ class Coordinator:
         the chase base before its first tick."""
         return self._commanded_gripper if self._commanded_gripper is not None else plan.chase_base
 
-    def _fail_gripper_plan(self, plan: GripperPlan, reason: str) -> None:
+    def _fail_gripper_plan(self, plan: GripperPlan, failure: PlanFailure) -> None:
         self._gripper_plan = None
         plan.frozen = self._ramp_stands(plan)
         self._commanded_gripper = None
         self._delivered_gripper = None
-        plan.failed = reason
+        plan.failed = failure
         plan.done.set()
 
     # -------------------------------------------------------------------- tick
@@ -565,7 +578,7 @@ class Coordinator:
         if plan is not None:
             if measured is None:
                 # A move in the dark can neither progress nor be verified.
-                self._fail_arm_plan(plan, STALE_FOLLOWER_REFUSAL)
+                self._fail_arm_plan(plan, FOLLOWER_SILENT)
                 return None
             if plan.started_monotonic is None:
                 plan.started_monotonic = now
@@ -597,9 +610,9 @@ class Coordinator:
     def _end_arm_plan(self, plan: ArmPlan, t_s: float, measured) -> tuple[float, ...] | None:
         """A tick at or after the planned end of `plan`, its end sample
         commanded. The plan completes on the delivery of that sample when its
-        settle is met on the `measured` joints; it fails
-        once the settle has timed out, with the shortfall measured then, and
-        that tick publishes nothing; otherwise it keeps commanding the end
+        settle is met on the `measured` joints; it fails with `timeout` once
+        the settle has timed out, with the shortfall measured then, and that
+        tick publishes nothing; otherwise it keeps commanding the end
         sample."""
         settle = plan.settle
         shortfall = settle.shortfall(measured, plan.profile.end, self._kinematics)
@@ -614,7 +627,12 @@ class Coordinator:
         if since_end_s < settle.timeout_s:
             return self._commanded_arm
         self._arm_tick_plan = None
-        self._fail_arm_plan(plan, f"{shortfall}, {since_end_s:.1f} s after the planned end")
+        self._fail_arm_plan(
+            plan,
+            PlanFailure(
+                FailureKind.TIMEOUT, f"{shortfall}, {since_end_s:.1f} s after the planned end"
+            ),
+        )
         return None
 
     def gripper_tick(self, now: float) -> float | None:
@@ -634,7 +652,7 @@ class Coordinator:
             anchor = self.gripper_anchor()
             measured = self.measured_gripper.fresh(STALE_FOLLOWER_TIMEOUT_S)
             if anchor is None or measured is None:
-                self._fail_gripper_plan(plan, STALE_FOLLOWER_REFUSAL)
+                self._fail_gripper_plan(plan, FOLLOWER_SILENT)
                 return None
             delivery = self.measured_gripper.deliveries
             fresh = delivery != plan.read_delivery

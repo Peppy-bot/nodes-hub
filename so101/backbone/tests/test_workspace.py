@@ -37,6 +37,7 @@ from workspace_core_py import (
 )
 
 from so101_backbone import workspace as workspace_module
+from so101_backbone.failures import FailureKind
 from so101_backbone.workspace import (
     CHUNK_TARGETS,
     ReachWorker,
@@ -225,10 +226,14 @@ async def test_a_surface_height_asked_again_answers_from_the_reach_measured_for_
 
 
 async def test_a_reach_not_measured_refuses_the_request_and_stores_nothing():
-    reaches = FakeReaches(reached_near_the_middle, failures=[Refused("the worker ended")])
+    reaches = FakeReaches(
+        reached_near_the_middle,
+        failures=[Refused(FailureKind.ATTEMPT_FAILED, "the worker ended")],
+    )
     workspace = Workspace(reaches)
-    with pytest.raises(Refused, match="^the worker ended$"):
+    with pytest.raises(Refused, match="^the worker ended$") as raised:
         await workspace.describe(0.1)
+    assert raised.value.kind is FailureKind.ATTEMPT_FAILED
     answer = await workspace.describe(0.1)
     assert len(reaches.calls) == 2
     assert answer.workable
@@ -268,8 +273,9 @@ async def test_a_height_that_is_not_a_surface_height_of_a_request_is_refused_unm
     surface_height, reason
 ):
     reaches = FakeReaches(reached_near_the_middle)
-    with pytest.raises(Refused, match=f"^{reason}$"):
+    with pytest.raises(Refused, match=f"^{reason}$") as raised:
         await Workspace(reaches).describe(surface_height)
+    assert raised.value.kind is FailureKind.REJECTED
     assert reaches.calls == []
 
 
@@ -287,8 +293,9 @@ async def test_a_height_that_is_not_a_surface_height_of_a_request_is_refused_unm
 )
 async def test_values_that_are_not_points_of_a_request_are_refused_unmeasured(wire, reason):
     reaches = FakeReaches(reached_near_the_middle)
-    with pytest.raises(Refused, match=f"^{reason}$"):
+    with pytest.raises(Refused, match=f"^{reason}$") as raised:
         await Workspace(reaches).check(wire)
+    assert raised.value.kind is FailureKind.REJECTED
     assert reaches.calls == []
 
 
@@ -358,15 +365,19 @@ async def test_one_spawned_worker_serves_every_request_and_ends_on_close(worker)
 
     worker.close()
     assert_ends(process.sentinel)
-    with pytest.raises(Refused, match="^the node is shutting down$"):
+    with pytest.raises(Refused, match="^the node is shutting down$") as raised:
         await worker.reaches([NEAR])
+    assert raised.value.kind is FailureKind.RESOURCE_UNAVAILABLE
     assert spawned_since(before | {process.pid}) == []
 
 
 async def test_a_target_the_solver_refuses_refuses_the_request_and_the_worker_serves_on(worker):
     before = children_pids()
-    with pytest.raises(Refused, match=r"^the reach could not be measured: ValueError\("):
+    with pytest.raises(
+        Refused, match=r"^the reach could not be measured: ValueError\("
+    ) as raised:
         await worker.reaches([NEAR, (math.nan, 0.0, 0.0)])
+    assert raised.value.kind is FailureKind.ATTEMPT_FAILED
     (process,) = spawned_since(before)
 
     assert await worker.reaches([NEAR]) == [Reach.reached_by("arm")]
@@ -440,8 +451,9 @@ async def test_a_worker_that_ends_while_it_holds_a_chunk_refuses_its_request(wor
     await next_sent(sent_chunks)
     os.kill(ended.pid, signal.SIGKILL)
 
-    with pytest.raises(Refused, match="^the reach worker ended: "):
+    with pytest.raises(Refused, match="^the reach worker ended: ") as raised:
         await outcome_of(request)
+    assert raised.value.kind is FailureKind.ATTEMPT_FAILED
     # The next request starts another worker.
     assert await worker.reaches([NEAR]) == [Reach.reached_by("arm")]
     (another,) = spawned_since(before)

@@ -65,6 +65,8 @@ from workspace_core_py import (
     describe_without_perception_camera,
 )
 
+from so101_backbone.failures import FailureKind
+
 # A point of the robot frame (m): (x, y, z).
 Target = tuple[float, float, float]
 
@@ -74,8 +76,12 @@ CHUNK_TARGETS = len(SurfaceHeight.from_wire(0.0).grid_targets())
 
 
 class Refused(Exception):
-    """A workspace request the robot refuses: the message is the reason the
-    answer carries."""
+    """A workspace request the robot does not answer: the failure kind of its
+    error reply, and the message, its reason."""
+
+    def __init__(self, kind: FailureKind, reason: str):
+        super().__init__(reason)
+        self.kind = kind
 
 
 def reach_of(solver: ApproachSolver, target: Target) -> Reach:
@@ -199,9 +205,11 @@ class ReachWorker:
             try:
                 return await asyncio.wrap_future(in_worker)
             except BrokenProcessPool as e:
-                raise Refused(f"the reach worker ended: {e}") from e
+                raise Refused(FailureKind.ATTEMPT_FAILED, f"the reach worker ended: {e}") from e
             except Exception as e:
-                raise Refused(f"the reach could not be measured: {e!r}") from e
+                raise Refused(
+                    FailureKind.ATTEMPT_FAILED, f"the reach could not be measured: {e!r}"
+                ) from e
 
     async def _last_chunk_measured(self) -> None:
         """Wait until the worker is done with the chunk sent to it last. Only
@@ -224,7 +232,7 @@ class ReachWorker:
 
     def _running_pool(self) -> ProcessPoolExecutor:
         if self._closed:
-            raise Refused("the node is shutting down")
+            raise Refused(FailureKind.RESOURCE_UNAVAILABLE, "the node is shutting down")
         if self._pool is None:
             self._pool = ProcessPoolExecutor(
                 max_workers=1,
@@ -272,9 +280,9 @@ class Workspace:
 
 
 def _parsed(parse, wire):
-    """What `parse` makes of `wire`; Refused with its reason when it raises
-    ValueError."""
+    """What `parse` makes of `wire`; Refused, `rejected`, with its reason
+    when it raises ValueError."""
     try:
         return parse(wire)
     except ValueError as e:
-        raise Refused(str(e)) from None
+        raise Refused(FailureKind.REJECTED, str(e)) from None
