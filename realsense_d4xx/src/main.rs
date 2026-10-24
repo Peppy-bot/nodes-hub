@@ -24,7 +24,8 @@ use crate::frame::FrameSet;
 use crate::geometry::{Pinhole, Published};
 use crate::modes::{AlignMode, AutoManualMode, ColorFormat};
 use crate::pipeline::{
-    Capture, DEPTH_TOPIC_ENCODING, EMIT_CHANNEL_CAPACITY, PipelineConfig, PipelineHandle, open,
+    Capture, ControlFailure, ControlFailureKind, DEPTH_TOPIC_ENCODING, EMIT_CHANNEL_CAPACITY,
+    PipelineConfig, PipelineHandle, open,
 };
 
 fn main() -> Result<()> {
@@ -346,10 +347,6 @@ fn spawn_depth_stream_info(
     });
 }
 
-/// What a geometry answer says beside its numbers: where they came from.
-const GEOMETRY_MESSAGE: &str =
-    "geometry from the device's calibration, for the streams as published";
-
 /// RealSense depth is the distance along the optical axis.
 const DEPTH_MODEL: &str = "z";
 
@@ -358,19 +355,15 @@ const DEPTH_MODEL: &str = "z";
 type PublishedGeometry = std::result::Result<Published, String>;
 
 /// get_color_intrinsics: the colour stream's model under the current mode.
-fn color_intrinsics(published: &PublishedGeometry) -> get_color_intrinsics::Response {
+/// A calibration that could not be read, or that the contract cannot
+/// express, gives an error reply with `rejected`.
+fn color_intrinsics(
+    published: &PublishedGeometry,
+) -> std::result::Result<get_color_intrinsics::Response, get_color_intrinsics::Failure> {
     let refuse = |reason: &String| {
-        get_color_intrinsics::Response::new(
-            false,
+        get_color_intrinsics::Failure::new(
+            get_color_intrinsics::FailureKind::Rejected,
             reason.clone(),
-            0,
-            0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            String::new(),
-            Vec::new(),
         )
     };
     match published.as_ref().map(|p| &p.color) {
@@ -383,9 +376,7 @@ fn color_intrinsics(published: &PublishedGeometry) -> get_color_intrinsics::Resp
             cy,
             distortion_model,
             distortion,
-        })) => get_color_intrinsics::Response::new(
-            true,
-            GEOMETRY_MESSAGE.to_string(),
+        })) => Ok(get_color_intrinsics::Response::new(
             *width,
             *height,
             *fx,
@@ -394,40 +385,26 @@ fn color_intrinsics(published: &PublishedGeometry) -> get_color_intrinsics::Resp
             *cy,
             distortion_model.to_string(),
             distortion.clone(),
-        ),
-        Ok(Err(reason)) | Err(reason) => refuse(reason),
+        )),
+        Ok(Err(reason)) | Err(reason) => Err(refuse(reason)),
     }
 }
 
 /// get_depth_intrinsics: the depth stream's model under the current mode,
-/// what a sample measures, and the mode the answer describes.
-fn depth_intrinsics(published: &PublishedGeometry) -> get_depth_intrinsics::Response {
+/// what a sample measures, and the mode the answer describes. Refused as
+/// get_color_intrinsics is.
+fn depth_intrinsics(
+    published: &PublishedGeometry,
+) -> std::result::Result<get_depth_intrinsics::Response, get_depth_intrinsics::Failure> {
     let refuse = |reason: &String| {
-        get_depth_intrinsics::Response::new(
-            false,
+        get_depth_intrinsics::Failure::new(
+            get_depth_intrinsics::FailureKind::Rejected,
             reason.clone(),
-            0,
-            0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            String::new(),
-            Vec::new(),
-            String::new(),
-            0.0,
-            0.0,
-            String::new(),
         )
     };
-    let published = match published {
-        Ok(published) => published,
-        Err(reason) => return refuse(reason),
-    };
+    let published = published.as_ref().map_err(refuse)?;
     match (&published.depth, &published.depth_range_m) {
-        (Ok(depth), Ok((min_depth_m, max_depth_m))) => get_depth_intrinsics::Response::new(
-            true,
-            GEOMETRY_MESSAGE.to_string(),
+        (Ok(depth), Ok((min_depth_m, max_depth_m))) => Ok(get_depth_intrinsics::Response::new(
             depth.width,
             depth.height,
             depth.fx,
@@ -440,39 +417,33 @@ fn depth_intrinsics(published: &PublishedGeometry) -> get_depth_intrinsics::Resp
             *min_depth_m,
             *max_depth_m,
             published.align_mode.as_str().to_string(),
-        ),
-        (Err(reason), _) | (_, Err(reason)) => refuse(reason),
+        )),
+        (Err(reason), _) | (_, Err(reason)) => Err(refuse(reason)),
     }
 }
 
 /// get_depth_to_color_extrinsics: the device's transform while the streams
-/// are unaligned, the identity while one is warped into the other.
+/// are unaligned, the identity while one is warped into the other. Refused
+/// as get_color_intrinsics is.
 fn depth_to_color_extrinsics(
     published: &PublishedGeometry,
-) -> get_depth_to_color_extrinsics::Response {
+) -> std::result::Result<
+    get_depth_to_color_extrinsics::Response,
+    get_depth_to_color_extrinsics::Failure,
+> {
     let refuse = |reason: &String| {
-        get_depth_to_color_extrinsics::Response::new(
-            false,
+        get_depth_to_color_extrinsics::Failure::new(
+            get_depth_to_color_extrinsics::FailureKind::Rejected,
             reason.clone(),
-            String::new(),
-            [0.0; 3],
-            [0.0; 4],
         )
     };
-    let published = match published {
-        Ok(published) => published,
-        Err(reason) => return refuse(reason),
-    };
-    match &published.depth_to_color {
-        Ok(pose) => get_depth_to_color_extrinsics::Response::new(
-            true,
-            GEOMETRY_MESSAGE.to_string(),
-            published.align_mode.as_str().to_string(),
-            pose.position,
-            pose.orientation,
-        ),
-        Err(reason) => refuse(reason),
-    }
+    let published = published.as_ref().map_err(refuse)?;
+    let pose = published.depth_to_color.as_ref().map_err(refuse)?;
+    Ok(get_depth_to_color_extrinsics::Response::new(
+        published.align_mode.as_str().to_string(),
+        pose.position,
+        pose.orientation,
+    ))
 }
 
 /// One camera_geometry service. The geometry is worked out per request,
@@ -486,7 +457,7 @@ macro_rules! spawn_geometry_service {
                     let result = tokio::select! {
                         _ = cancel.cancelled() => break,
                         result = $service::handle_next_request(&runner, |_req| {
-                            Ok($respond(&handle.published_geometry()))
+                            $respond(&handle.published_geometry())
                         }) => result,
                     };
                     if let Err(e) = result {
@@ -514,226 +485,114 @@ spawn_geometry_service!(
     depth_to_color_extrinsics
 );
 
-fn spawn_set_color_exposure(runner: Arc<NodeRunner>, handle: Arc<PipelineHandle>) {
-    tokio::spawn(async move {
-        let cancel = runner.cancellation_token().clone();
-        loop {
-            let handle = handle.clone();
-            let result = tokio::select! {
-                _ = cancel.cancelled() => break,
-                result = set_color_exposure::handle_next_request(&runner, move |req| {
-                    let response = match AutoManualMode::parse(&req.data.mode, "exposure") {
-                        Ok(mode) => match handle.set_color_exposure(mode, req.data.value) {
-                            Ok(()) => set_color_exposure::Response::new(
-                                true,
-                                format!("color exposure set ({mode})"),
-                                req.data.value,
-                            ),
-                            Err(e) => set_color_exposure::Response::new(
-                                false,
-                                format!("set color exposure: {e}"),
-                                req.data.value,
-                            ),
-                        },
-                        Err(msg) => set_color_exposure::Response::new(false, msg, req.data.value),
-                    };
-                    Ok(response)
-                }) => result,
-            };
-            if let Err(e) = result {
-                error!("set_color_exposure: {e}");
-            }
-        }
-    });
+/// The error reply of `$service` for an option write that failed: the same
+/// kind, from the service's own kinds.
+macro_rules! control_failure {
+    ($service:ident, $failure:expr) => {{
+        let ControlFailure { kind, message } = $failure;
+        let kind = match kind {
+            ControlFailureKind::Rejected => $service::FailureKind::Rejected,
+            ControlFailureKind::ResourceUnavailable => $service::FailureKind::ResourceUnavailable,
+            ControlFailureKind::AttemptFailed => $service::FailureKind::AttemptFailed,
+        };
+        $service::Failure::new(kind, message)
+    }};
 }
 
-fn spawn_set_color_white_balance(runner: Arc<NodeRunner>, handle: Arc<PipelineHandle>) {
-    tokio::spawn(async move {
-        let cancel = runner.cancellation_token().clone();
-        loop {
-            let handle = handle.clone();
-            let result = tokio::select! {
-                _ = cancel.cancelled() => break,
-                result = set_color_white_balance::handle_next_request(&runner, move |req| {
-                    let response = match AutoManualMode::parse(&req.data.mode, "white_balance") {
-                        Ok(mode) => match handle.set_color_white_balance(mode, req.data.temperature) {
-                            Ok(()) => set_color_white_balance::Response::new(
-                                true,
-                                format!("color white_balance set ({mode})"),
-                                req.data.temperature,
-                            ),
-                            Err(e) => set_color_white_balance::Response::new(
-                                false,
-                                format!("set color white_balance: {e}"),
-                                req.data.temperature,
-                            ),
-                        },
-                        Err(msg) => set_color_white_balance::Response::new(
-                            false,
-                            msg,
-                            req.data.temperature,
-                        ),
+/// One service that writes a device option in an auto or a manual mode,
+/// with `$set` of the pipeline handle, and answers the value of the
+/// request. A mode other than "auto" and "manual" gives an error reply with
+/// `rejected`.
+macro_rules! spawn_mode_control_service {
+    ($fn_name:ident, $service:ident, $set:ident, $value:ident, $label:literal) => {
+        fn $fn_name(runner: Arc<NodeRunner>, handle: Arc<PipelineHandle>) {
+            tokio::spawn(async move {
+                let cancel = runner.cancellation_token().clone();
+                loop {
+                    let handle = handle.clone();
+                    let result = tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        result = $service::handle_next_request(&runner, move |req| {
+                            let mode = AutoManualMode::parse(&req.data.mode, $label).map_err(
+                                |reason| $service::Failure::new($service::FailureKind::Rejected, reason),
+                            )?;
+                            handle
+                                .$set(mode, req.data.$value)
+                                .map(|()| $service::Response::new(req.data.$value))
+                                .map_err(|failure| control_failure!($service, failure))
+                        }) => result,
                     };
-                    Ok(response)
-                }) => result,
-            };
-            if let Err(e) = result {
-                error!("set_color_white_balance: {e}");
-            }
+                    if let Err(e) = result {
+                        error!("{}: {e}", stringify!($service));
+                    }
+                }
+            });
         }
-    });
+    };
 }
 
-fn spawn_set_color_gain(runner: Arc<NodeRunner>, handle: Arc<PipelineHandle>) {
-    tokio::spawn(async move {
-        let cancel = runner.cancellation_token().clone();
-        loop {
-            let handle = handle.clone();
-            let result = tokio::select! {
-                _ = cancel.cancelled() => break,
-                result = set_color_gain::handle_next_request(&runner, move |req| {
-                    let response = match handle.set_color_gain(req.data.value) {
-                        Ok(()) => set_color_gain::Response::new(
-                            true,
-                            "color gain set".into(),
-                            req.data.value,
-                        ),
-                        Err(e) => set_color_gain::Response::new(
-                            false,
-                            format!("set color gain: {e}"),
-                            req.data.value,
-                        ),
+spawn_mode_control_service!(
+    spawn_set_color_exposure,
+    set_color_exposure,
+    set_color_exposure,
+    value,
+    "exposure"
+);
+spawn_mode_control_service!(
+    spawn_set_color_white_balance,
+    set_color_white_balance,
+    set_color_white_balance,
+    temperature,
+    "white_balance"
+);
+
+/// One service that writes a single device option, with `$set` of the
+/// pipeline handle, and answers the value of the request.
+macro_rules! spawn_value_control_service {
+    ($fn_name:ident, $service:ident, $set:ident) => {
+        fn $fn_name(runner: Arc<NodeRunner>, handle: Arc<PipelineHandle>) {
+            tokio::spawn(async move {
+                let cancel = runner.cancellation_token().clone();
+                loop {
+                    let handle = handle.clone();
+                    let result = tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        result = $service::handle_next_request(&runner, move |req| {
+                            handle
+                                .$set(req.data.value)
+                                .map(|()| $service::Response::new(req.data.value))
+                                .map_err(|failure| control_failure!($service, failure))
+                        }) => result,
                     };
-                    Ok(response)
-                }) => result,
-            };
-            if let Err(e) = result {
-                error!("set_color_gain: {e}");
-            }
+                    if let Err(e) = result {
+                        error!("{}: {e}", stringify!($service));
+                    }
+                }
+            });
         }
-    });
+    };
 }
 
-fn spawn_set_color_brightness(runner: Arc<NodeRunner>, handle: Arc<PipelineHandle>) {
-    tokio::spawn(async move {
-        let cancel = runner.cancellation_token().clone();
-        loop {
-            let handle = handle.clone();
-            let result = tokio::select! {
-                _ = cancel.cancelled() => break,
-                result = set_color_brightness::handle_next_request(&runner, move |req| {
-                    let response = match handle.set_color_brightness(req.data.value) {
-                        Ok(()) => set_color_brightness::Response::new(
-                            true,
-                            "color brightness set".into(),
-                            req.data.value,
-                        ),
-                        Err(e) => set_color_brightness::Response::new(
-                            false,
-                            format!("set color brightness: {e}"),
-                            req.data.value,
-                        ),
-                    };
-                    Ok(response)
-                }) => result,
-            };
-            if let Err(e) = result {
-                error!("set_color_brightness: {e}");
-            }
-        }
-    });
-}
+spawn_value_control_service!(spawn_set_color_gain, set_color_gain, set_color_gain);
+spawn_value_control_service!(
+    spawn_set_color_brightness,
+    set_color_brightness,
+    set_color_brightness
+);
+spawn_value_control_service!(
+    spawn_set_color_contrast,
+    set_color_contrast,
+    set_color_contrast
+);
+spawn_value_control_service!(spawn_set_depth_gain, set_depth_gain, set_depth_gain);
+spawn_value_control_service!(
+    spawn_set_depth_laser_power_mw,
+    set_depth_laser_power_mw,
+    set_depth_laser_power_mw
+);
 
-fn spawn_set_color_contrast(runner: Arc<NodeRunner>, handle: Arc<PipelineHandle>) {
-    tokio::spawn(async move {
-        let cancel = runner.cancellation_token().clone();
-        loop {
-            let handle = handle.clone();
-            let result = tokio::select! {
-                _ = cancel.cancelled() => break,
-                result = set_color_contrast::handle_next_request(&runner, move |req| {
-                    let response = match handle.set_color_contrast(req.data.value) {
-                        Ok(()) => set_color_contrast::Response::new(
-                            true,
-                            "color contrast set".into(),
-                            req.data.value,
-                        ),
-                        Err(e) => set_color_contrast::Response::new(
-                            false,
-                            format!("set color contrast: {e}"),
-                            req.data.value,
-                        ),
-                    };
-                    Ok(response)
-                }) => result,
-            };
-            if let Err(e) = result {
-                error!("set_color_contrast: {e}");
-            }
-        }
-    });
-}
-
-fn spawn_set_depth_gain(runner: Arc<NodeRunner>, handle: Arc<PipelineHandle>) {
-    tokio::spawn(async move {
-        let cancel = runner.cancellation_token().clone();
-        loop {
-            let handle = handle.clone();
-            let result = tokio::select! {
-                _ = cancel.cancelled() => break,
-                result = set_depth_gain::handle_next_request(&runner, move |req| {
-                    let response = match handle.set_depth_gain(req.data.value) {
-                        Ok(()) => set_depth_gain::Response::new(
-                            true,
-                            "depth gain set".into(),
-                            req.data.value,
-                        ),
-                        Err(e) => set_depth_gain::Response::new(
-                            false,
-                            format!("set depth gain: {e}"),
-                            req.data.value,
-                        ),
-                    };
-                    Ok(response)
-                }) => result,
-            };
-            if let Err(e) = result {
-                error!("set_depth_gain: {e}");
-            }
-        }
-    });
-}
-
-fn spawn_set_depth_laser_power_mw(runner: Arc<NodeRunner>, handle: Arc<PipelineHandle>) {
-    tokio::spawn(async move {
-        let cancel = runner.cancellation_token().clone();
-        loop {
-            let handle = handle.clone();
-            let result = tokio::select! {
-                _ = cancel.cancelled() => break,
-                result = set_depth_laser_power_mw::handle_next_request(&runner, move |req| {
-                    let response = match handle.set_depth_laser_power_mw(req.data.value) {
-                        Ok(()) => set_depth_laser_power_mw::Response::new(
-                            true,
-                            "depth laser_power set".into(),
-                            req.data.value,
-                        ),
-                        Err(e) => set_depth_laser_power_mw::Response::new(
-                            false,
-                            format!("set depth laser_power: {e}"),
-                            req.data.value,
-                        ),
-                    };
-                    Ok(response)
-                }) => result,
-            };
-            if let Err(e) = result {
-                error!("set_depth_laser_power_mw: {e}");
-            }
-        }
-    });
-}
-
+/// set_align_mode switches the alignment the capture loop applies from the
+/// next frame on. An unknown mode gives an error reply with `rejected`.
 fn spawn_set_align_mode(runner: Arc<NodeRunner>, handle: Arc<PipelineHandle>) {
     tokio::spawn(async move {
         let cancel = runner.cancellation_token().clone();
@@ -742,22 +601,11 @@ fn spawn_set_align_mode(runner: Arc<NodeRunner>, handle: Arc<PipelineHandle>) {
             let result = tokio::select! {
                 _ = cancel.cancelled() => break,
                 result = set_align_mode::handle_next_request(&runner, move |req| {
-                    let response = match AlignMode::try_from(req.data.mode.as_str()) {
-                        Ok(mode) => {
-                            handle.set_align_mode(mode);
-                            set_align_mode::Response::new(
-                                true,
-                                format!("align mode set to {mode}"),
-                                mode.as_str().to_string(),
-                            )
-                        }
-                        Err(msg) => set_align_mode::Response::new(
-                            false,
-                            msg,
-                            handle.align_mode().as_str().to_string(),
-                        ),
-                    };
-                    Ok(response)
+                    let mode = AlignMode::try_from(req.data.mode.as_str()).map_err(|reason| {
+                        set_align_mode::Failure::new(set_align_mode::FailureKind::Rejected, reason)
+                    })?;
+                    handle.set_align_mode(mode);
+                    Ok(set_align_mode::Response::new(mode.as_str().to_string()))
                 }) => result,
             };
             if let Err(e) = result {
@@ -836,9 +684,8 @@ mod tests {
             AlignMode::ColorToDepth,
         ] {
             let published = Ok(calibration().published(mode));
-            let depth = depth_intrinsics(&published);
-            let pose = depth_to_color_extrinsics(&published);
-            assert!(depth.success && pose.success);
+            let depth = depth_intrinsics(&published).unwrap();
+            let pose = depth_to_color_extrinsics(&published).unwrap();
             // The spelling the frame headers use.
             assert_eq!(depth.align_mode, mode.as_str());
             assert_eq!(pose.align_mode, mode.as_str());
@@ -848,11 +695,11 @@ mod tests {
     #[test]
     fn the_answers_follow_the_align_mode() {
         let unaligned = Ok(calibration().published(AlignMode::None));
-        let depth = depth_intrinsics(&unaligned);
+        let depth = depth_intrinsics(&unaligned).unwrap();
         assert_eq!((depth.width, depth.height, depth.fx), (848, 480, 423.5));
         assert_eq!(depth.depth_model, "z");
         assert_eq!(depth.distortion_model, "none");
-        let pose = depth_to_color_extrinsics(&unaligned);
+        let pose = depth_to_color_extrinsics(&unaligned).unwrap();
         assert_eq!(
             pose.depth_to_color_position,
             [f64::from(0.015_f32), 0.0, 0.0]
@@ -862,13 +709,14 @@ mod tests {
         // Aligned to colour, the depth frames are colour-shaped and there is
         // nothing left between the two frames.
         let aligned = Ok(calibration().published(AlignMode::DepthToColor));
-        let depth = depth_intrinsics(&aligned);
+        let depth = depth_intrinsics(&aligned).unwrap();
         assert_eq!((depth.width, depth.height, depth.fx), (1280, 720, 915.25));
-        let pose = depth_to_color_extrinsics(&aligned);
+        let pose = depth_to_color_extrinsics(&aligned).unwrap();
         assert_eq!(pose.depth_to_color_position, [0.0, 0.0, 0.0]);
 
         // Aligned to depth, it is the colour frames that change shape.
-        let color = color_intrinsics(&Ok(calibration().published(AlignMode::ColorToDepth)));
+        let color =
+            color_intrinsics(&Ok(calibration().published(AlignMode::ColorToDepth))).unwrap();
         assert_eq!((color.width, color.height, color.fx), (848, 480, 423.5));
     }
 
@@ -876,20 +724,18 @@ mod tests {
     fn a_calibration_that_could_not_be_read_refuses_everything_with_the_reason() {
         let unread: PublishedGeometry =
             Err("read the Color intrinsics: device disconnected".to_string());
-        let color = color_intrinsics(&unread);
-        let depth = depth_intrinsics(&unread);
-        let pose = depth_to_color_extrinsics(&unread);
-        for (success, message) in [
-            (color.success, &color.message),
-            (depth.success, &depth.message),
-            (pose.success, &pose.message),
-        ] {
-            assert!(!success);
+        let color = color_intrinsics(&unread).unwrap_err();
+        assert_eq!(color.kind, get_color_intrinsics::FailureKind::Rejected);
+        let depth = depth_intrinsics(&unread).unwrap_err();
+        assert_eq!(depth.kind, get_depth_intrinsics::FailureKind::Rejected);
+        let pose = depth_to_color_extrinsics(&unread).unwrap_err();
+        assert_eq!(
+            pose.kind,
+            get_depth_to_color_extrinsics::FailureKind::Rejected
+        );
+        for message in [&color.message, &depth.message, &pose.message] {
             assert!(message.contains("device disconnected"), "{message}");
         }
-        assert_eq!((color.width, color.fx), (0, 0.0));
-        assert!(depth.depth_model.is_empty() && depth.align_mode.is_empty());
-        assert_eq!(pose.depth_to_color_orientation, [0.0; 4]);
     }
 
     #[test]
@@ -898,17 +744,19 @@ mod tests {
         distorted.color.distortion = Distortion::ModifiedBrownConrady;
         distorted.color.coeffs = [-0.055, 0.066, -0.0007, 0.0005, -0.021];
         let unaligned = Ok(distorted.published(AlignMode::None));
-        let color = color_intrinsics(&unaligned);
-        assert!(!color.success);
+        let color = color_intrinsics(&unaligned).unwrap_err();
+        assert_eq!(color.kind, get_color_intrinsics::FailureKind::Rejected);
         assert!(
             color.message.contains("cannot express"),
             "{}",
             color.message
         );
-        assert!(depth_intrinsics(&unaligned).success);
-        assert!(depth_to_color_extrinsics(&unaligned).success);
+        assert!(depth_intrinsics(&unaligned).is_ok());
+        assert!(depth_to_color_extrinsics(&unaligned).is_ok());
         // Warped into the colour image, depth carries the colour distortion.
-        assert!(!depth_intrinsics(&Ok(distorted.published(AlignMode::DepthToColor))).success);
+        let depth =
+            depth_intrinsics(&Ok(distorted.published(AlignMode::DepthToColor))).unwrap_err();
+        assert_eq!(depth.kind, get_depth_intrinsics::FailureKind::Rejected);
     }
 
     #[test]
@@ -946,15 +794,13 @@ mod tests {
     fn the_inverse_model_a_d4xx_colour_stream_reports_passes_through_by_name() {
         let mut distorted = calibration();
         distorted.color.coeffs = [-0.055, 0.066, -0.0007, 0.0005, -0.021];
-        let color = color_intrinsics(&Ok(distorted.published(AlignMode::None)));
-        assert!(color.success);
+        let color = color_intrinsics(&Ok(distorted.published(AlignMode::None))).unwrap();
         assert_eq!(color.distortion_model, "inverse_plumb_bob");
         assert_eq!(
             color.distortion,
             [-0.055_f32, 0.066, -0.0007, 0.0005, -0.021].map(f64::from)
         );
-        let depth = depth_intrinsics(&Ok(distorted.published(AlignMode::DepthToColor)));
-        assert!(depth.success);
+        let depth = depth_intrinsics(&Ok(distorted.published(AlignMode::DepthToColor))).unwrap();
         assert_eq!(depth.distortion_model, "inverse_plumb_bob");
     }
 }
