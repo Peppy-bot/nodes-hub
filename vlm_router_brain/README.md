@@ -35,17 +35,18 @@ A catalog the node cannot read stops it at its start, naming the entry and
 the field.
 
 Both roles also accept `none`, the role's missing model: its goals are
-refused naming it. No catalog model serves manipulation, so manipulation
-runs `none`, and `grab_item`, `drop_item` and `place_item` are refused with
-`no manipulation model: manipulation_model is 'none'`.
+refused naming it, a search with `precondition_failed`. No catalog model
+serves manipulation, so manipulation runs `none`, and `grab_item`,
+`drop_item` and `place_item` are refused in their result with `no
+manipulation model: manipulation_model is 'none'`.
 
 ## Keys
 
 The node reads the key of a route from its own environment and from nowhere
 else: `GEMINI_API_KEY` for `gemini`, `OPENROUTER_API_KEY` for `openrouter`. A
 model runs on the first of its routes whose key is set. A starting model with
-no keyed route stops the node, and a switch to one is refused, both naming
-the variables. No key is a parameter, and none is logged. A provider message
+no keyed route stops the node, and a switch to one fails with
+`resource_unavailable`, both naming the variables. No key is a parameter, and none is logged. A provider message
 that holds the route's key shows `***` in its place.
 
 `peppy stack launch` passes the launching shell's environment to the nodes it
@@ -70,9 +71,10 @@ against, one schema:
 ```
 
 `box_2d` is `[y_min, x_min, y_max, x_max]` normalised to 0-1000, and
-`{"boxes": []}` means nothing asked for is visible. An answer of another shape
-fails the search with `the model's answer could not be read`, and its text
-goes to the log. A hosted model gives no confidence, so every item reports 0.
+`{"boxes": []}` means nothing asked for is visible, and an `identify_item`
+then fails with `not_found`. An answer of another shape fails the search with
+`attempt_failed`, `the model's answer could not be read`, and its text goes
+to the log. A hosted model gives no confidence, so every item reports 0.
 
 ## Every search keeps a deadline
 
@@ -80,26 +82,28 @@ goes to the log. A hosted model gives no confidence, so every item reports 0.
 left, never under 10 s. A call that comes back with a 429, a gateway timeout
 or a 5xx is asked again once, after 1 s, when the budget has room for the
 wait. Any other failure, a lost connection among them, fails the search with
-`<model> failed: <class>: <message>`, and the log keeps one line with no
-traceback. A search whose budget is gone before a call is refused with `the
-search did not finish within <budget> s`. Each call logs its route, its
-tokens and its latency.
+`attempt_failed`, `<model> failed: <class>: <message>`, and the log keeps one
+line with no traceback. A search whose budget is gone before a call fails
+with `timeout`, `the search did not finish within <budget> s`. Each call logs
+its route, its tokens and its latency.
 
 ## Switching a model
 
 `switch_model {role: "perception", model: "claude-opus-5.5"}` makes that
 model the perception model. The node asks the model once, a small grey
 picture and a question whose answer is `{"boxes": []}`, and the switch fails
-with the provider's message when the model cannot be reached or its answer
-does not read; the role then keeps its model. A switch is refused while a
-goal of its role runs, naming it, and while another switch of its role runs.
-A goal never sees its model change. At the node's start the starting model
-makes no call: the first search is its first call.
+with `attempt_failed` and the provider's message when the model cannot be
+reached or its answer does not read; the role then keeps its model. A switch
+is refused with `rejected` for a role or a model the brain does not have, and
+with `precondition_failed` while a goal of its role runs, naming it, and
+while another switch of its role runs. A goal never sees its model change.
+At the node's start the starting model makes no call: the first search is
+its first call.
 
 ## How it works
 
 brain_core's README draws the parts every brain shares, a goal from its
-arrival to its result, and cancel, abort and shutdown. This node brings
+arrival to its end, and cancel, abort and shutdown. This node brings
 `RouterModels`, its `ModelSource`, and `VlmDetector`, the perception model
 of a catalog entry.
 
@@ -116,47 +120,39 @@ sequenceDiagram
     participant RM as RouterModels
     participant P as Provider
     C->>H: goal with role and model
-    H->>B: run_guarded(ctx, no lane, "switch_model", body, ZERO)
-    B->>Q: start(no lane, "switch_model")
+    H->>H: decide: the checks made before the goal is accepted
     alt the node is shutting down
-        Q-->>B: Refusal
-        B-->>C: success=false
-    else admitted as a lane-less job
+        H-->>C: refused, precondition_failed
+    else not a role of this brain
+        H-->>C: refused, rejected: this brain runs no model for the role
+    else the role does not take the model (RouterModels.offered)
+        H-->>C: refused, rejected: the model is not a model of the role here, see list_models
+    else another switch of the role runs, or the role's lane runs a goal
+        H-->>C: refused, precondition_failed: switch_model is running for the role, or scan_items is running
+    else accepted
+        H->>B: run_guarded(ctx, no lane, "switch_model", body, ZERO, STATUS_ENDS)
+        B->>Q: start(no lane, "switch_model")
         Q-->>B: Job
         B->>H: body(job)
-        H->>H: parse_role(goal.role, the brain's roles)
-        alt not a role of this brain
-            H-->>B: Refusal: this brain runs no model for the role
-        else a Role
-            H->>M: switch(role, model, job)
-            M->>RM: offered(role, model)
-            alt the role does not take the model
-                RM-->>B: Refusal: the model is not a model of the role here, see list_models
-            else another switch of the role runs
-                M-->>B: Refusal: switch_model is running for the role
-            else the role's lane runs a goal
-                M-->>B: Refusal: scan_items is running
-            else every check passes
-                M->>M: mark the role as switching
-                M->>RM: await prepare(entry), cut short by the job's cancel
-                alt no route of the model has a key
-                    RM-->>B: Refusal naming every key variable, no call made
-                else a route has a key
-                    RM->>P: await ask(route, a small grey picture, the probe question, at least 30 s)
-                    alt the provider fails, or the answer does not read
-                        P-->>B: ProviderFailure or UnreadableAnswer, the role keeps its model
-                    else the model answers
-                        RM-->>M: a VlmDetector on that route
-                        M->>M: the job's cancel is checked, then the lane, with no await before the set
-                        M->>M: the role's model is the new VlmDetector
-                        M-->>H: the model's name
-                        H-->>B: role and model
-                    end
-                end
-                M->>M: release the switching mark
+        H->>M: switch(role, model, job): the checks of the decision again
+        M->>M: mark the role as switching
+        M->>RM: await prepare(entry), cut short by the job's cancel
+        alt no route of the model has a key
+            RM-->>B: Refusal, resource_unavailable, naming every key variable, no call made
+        else a route has a key
+            RM->>P: await ask(route, a small grey picture, the probe question, at least 30 s)
+            alt the provider fails, or the answer does not read
+                P-->>B: ProviderFailure or UnreadableAnswer, attempt_failed, the role keeps its model
+            else the model answers
+                RM-->>M: a VlmDetector on that route
+                M->>M: the job's cancel is checked, then the lane, with no await before the set
+                M->>M: the role's model is the new VlmDetector
+                M-->>H: the model's name
+                H-->>B: role and model
             end
         end
-        B-->>C: the result, action_time the elapsed time
+        M->>M: release the switching mark
+        B-->>C: completed with role and model, failed with the kind, or cancelled; action_time the elapsed time
         B->>Q: finish(job)
     end
 ```

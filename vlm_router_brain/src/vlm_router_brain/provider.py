@@ -12,8 +12,9 @@ passed explicitly (so gemini never falls back to another variable),
 `unified_exceptions=True` (so every provider raises any-llm's classes) and
 `max_retries=0` (so the detector's one retry is the only one).
 
-A failure is a `ProviderFailure`, an expected failure: "<model> failed:
-<class>: <message>", and whether the detector may ask again. It may for a
+A failure is a `ProviderFailure`, an expected failure with the kind
+`attempt_failed`: "<model> failed: <class>: <message>", and whether the
+detector may ask again. It may for a
 429, a gateway timeout, or a provider or upstream error with a 5xx status,
 the failures that come back at once; any other, a lost connection among
 them, fails the search. The message never holds the route's key: each
@@ -37,7 +38,7 @@ from any_llm.exceptions import (
     UpstreamProviderError,
 )
 
-from brain_core.ports import ExpectedFailure
+from brain_core.ports import ExpectedFailure, FailureKind
 
 from .catalog import Route
 from .keys import KEY_VARIABLES, key_for
@@ -62,7 +63,7 @@ class Reply:
 
 class ProviderFailure(ExpectedFailure):
     def __init__(self, model_name: str, error_class: str, detail: str, *, retryable: bool) -> None:
-        super().__init__(f"{model_name} failed: {error_class}: {detail}")
+        super().__init__(FailureKind.ATTEMPT_FAILED, f"{model_name} failed: {error_class}: {detail}")
         self.retryable = retryable
 
 

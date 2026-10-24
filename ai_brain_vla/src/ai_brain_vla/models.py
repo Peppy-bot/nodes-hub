@@ -4,8 +4,8 @@ models the parameters name.
 Each role runs the model its parameter names for the node's whole life:
 `perception_model` ("none" or "sam3_siglip") and `manipulation_model`
 ("none"). list_models names that model for each role, and switch_model
-accepts it alone and refuses any other: "this brain runs only
-'sam3_siglip' for perception". The parameters are read once, at the
+accepts it alone and refuses any other with `rejected`: "this brain runs
+only 'sam3_siglip' for perception". The parameters are read once, at the
 node's start, and a name the brain does not run stops it there, as does a
 `perception_gallery` beside a model that reads none.
 
@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from typing import Callable, Mapping, Sequence
 
 from brain_core.manipulation.none import NoneManipulator
-from brain_core.ports import Detector, Manipulator, Refusal, Role
+from brain_core.ports import Detector, FailureKind, Manipulator, Refusal, Role
 
 from .perception import DETECTORS, TAKES_A_GALLERY
 from .perception.gallery import shipped_root
@@ -72,7 +72,7 @@ class VlaModels:
     def offered(self, role: Role, name: str) -> VlaEntry:
         running = self._names[role]
         if name != running:
-            raise Refusal(f"this brain runs only '{running}' for {role}")
+            raise Refusal(FailureKind.REJECTED, f"this brain runs only '{running}' for {role}")
         return VlaEntry(role, name)
 
     def start(self, entry: VlaEntry):

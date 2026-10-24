@@ -9,7 +9,6 @@ from functools import partial
 
 import pytest
 from conftest import FakeProvider, answer, records_of
-from peppygen import QoSProfile
 from peppygen.exposed_actions.brain_model import switch_model as switch_action
 from peppygen.exposed_actions.item_manipulation import grab_item as grab_action
 from peppygen.exposed_actions.item_perception import identify_item as identify_action
@@ -21,7 +20,7 @@ from peppygen.fixtures.exposed_actions.item_perception import identify_item as i
 from peppygen.fixtures.exposed_actions.item_perception import scan_items as scan_fx
 from peppygen.fixtures.exposed_services.brain_model import get_model as get_model_fx
 from peppygen.fixtures.exposed_services.brain_model import list_models as list_models_fx
-from wire import WAIT, answer_the_camera, once_the_brain_sees, params, publish_a_capture, result_of
+from wire import WAIT, answer_the_camera, failure_of, once_the_brain_sees, params, publish_a_capture, refusal_of, result_of
 
 from vlm_router_brain.__main__ import setup
 from vlm_router_brain.provider import ProviderFailure, Reply
@@ -55,18 +54,28 @@ async def test_identify_then_scan_succeed_and_the_start_made_no_call():
         assert provider.calls == []
         answer_the_camera(h)
         await publish_a_capture(h)
-        found = await once_the_brain_sees(identify_fx, h, identify())
-        assert found.success is True, found.message
+        result = await once_the_brain_sees(identify_fx, h, identify())
+        assert result.status == identify_fx.ResultStatus.COMPLETED, result.failure
+        found = result.data
         assert (found.label, found.confidence, found.camera) == ("the cup", 0.0, "chest")
         assert [round(v, 6) for v in found.position] == [0.0, 0.0, 1.0]
         assert found.region == [4.0, 3.0, 12.0, 9.0] and (found.image_width, found.image_height) == (16, 12)
         scanned = await result_of(scan_fx, h, scan())
-        assert scanned.success is True, scanned.message
         assert scanned.labels == ["cup"] and scanned.confidences == [0.0]
         # The identify prompt names the item; the scan asks for everything.
         assert provider.calls[0].prompt.startswith("Find the cup in this image")
         assert provider.calls[1].prompt.startswith("Detect every distinct object")
         assert {call.route.spelled for call in provider.calls} == {f"gemini:{ER}"}
+
+
+async def test_a_search_with_no_capture_yet_is_refused_with_resource_unavailable():
+    provider = FakeProvider()
+    async with harness.start(partial(setup, provider=provider), parameters=params()) as h:
+        answer_the_camera(h)
+        refusal = await refusal_of(identify_fx, h, identify())
+        assert refusal.kind is identify_fx.FailureKind.RESOURCE_UNAVAILABLE
+        assert refusal.message.startswith("no perception source: ")
+        assert provider.calls == []
 
 
 async def test_a_provider_error_fails_that_search_alone_and_the_next_search_asks_again(caplog):
@@ -77,12 +86,12 @@ async def test_a_provider_error_fails_that_search_alone_and_the_next_search_asks
         await publish_a_capture(h)
         with records_of(caplog, "brain_core.brain") as log:
             failed = await once_the_brain_sees(identify_fx, h, identify())
-        assert failed.success is False
-        assert failed.message == f"{ER} failed: ProviderError: overloaded"
+        assert failed.status == identify_fx.ResultStatus.FAILED and failed.data is None
+        assert failed.failure == identify_fx.Failure("attempt_failed", f"{ER} failed: ProviderError: overloaded")
         [line] = [record for record in log.records if record.levelno >= logging.WARNING]
         assert line.levelno == logging.WARNING and line.exc_info is None
         found = await result_of(identify_fx, h, identify())
-        assert found.success is True, found.message
+        assert found.label == "the cup"
         assert len(provider.calls) == 2
 
 
@@ -93,11 +102,23 @@ async def test_an_unreadable_answer_and_a_spent_budget_each_fail_the_search_nami
         await publish_a_capture(h)
         with records_of(caplog, "brain_core.brain") as log:
             unreadable = await once_the_brain_sees(identify_fx, h, identify())
-        assert (unreadable.success, unreadable.message) == (False, "the model's answer could not be read")
+        assert unreadable.failure == identify_fx.Failure("attempt_failed", "the model's answer could not be read")
         assert all(record.exc_info is None for record in log.records)
-        spent = await result_of(identify_fx, h, identify(timeout_s=1e-9))
-        assert (spent.success, spent.message) == (False, "the search did not finish within 1e-09 s")
+        spent = await failure_of(identify_fx, h, identify(timeout_s=1e-9))
+        assert spent == identify_fx.Failure("timeout", "the search did not finish within 1e-09 s")
         assert len(provider.calls) == 1
+
+
+async def test_a_search_that_finds_nothing_fails_with_not_found():
+    provider = FakeProvider(answer(("the bowl", [250, 250, 750, 750])), answer())
+    async with harness.start(partial(setup, provider=provider), parameters=params()) as h:
+        answer_the_camera(h)
+        await publish_a_capture(h)
+        # The model names what it was asked for; a scan's labels are its own.
+        found = await once_the_brain_sees(identify_fx, h, identify("the bowl"))
+        assert found.status == identify_fx.ResultStatus.COMPLETED, found.failure
+        nothing = await failure_of(identify_fx, h, identify("the cup"))
+        assert nothing == identify_fx.Failure("not_found", "no item matches 'the cup'")
 
 
 async def test_get_model_and_list_models_name_the_catalog_models_never_a_provider():
@@ -117,11 +138,31 @@ async def test_a_switch_probes_once_and_get_model_then_reports_the_new_model():
         answer_the_camera(h)
         await publish_a_capture(h)
         switched = await result_of(switch_fx, h, switch("perception", OPUS))
-        assert (switched.success, switched.role, switched.model) == (True, "perception", OPUS), switched.message
+        assert (switched.role, switched.model) == ("perception", OPUS)
         assert (await get_model_fx.poll(h, 5.0)).models == [OPUS, "none"]
         found = await once_the_brain_sees(identify_fx, h, identify())
-        assert found.success is True, found.message
+        assert found.status == identify_fx.ResultStatus.COMPLETED, found.failure
         assert [call.route.spelled for call in provider.calls] == ["openrouter:anthropic/claude-opus-5.5"] * 2
+
+
+async def test_a_switch_whose_probe_fails_fails_with_attempt_failed_and_keeps_the_model():
+    failure = ProviderFailure(OPUS, "ModelNotFoundError", "no such model", retryable=False)
+    async with harness.start(partial(setup, provider=FakeProvider(failure)), parameters=params()) as h:
+        answer_the_camera(h)
+        failed = await failure_of(switch_fx, h, switch("perception", OPUS))
+        assert failed == switch_fx.Failure("attempt_failed", f"{OPUS} failed: ModelNotFoundError: no such model")
+        assert (await get_model_fx.poll(h, 5.0)).models == [ER, "none"]
+
+
+async def test_a_switch_to_a_model_with_no_key_fails_with_resource_unavailable(monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY")
+    provider = FakeProvider()
+    async with harness.start(partial(setup, provider=provider), parameters=params()) as h:
+        answer_the_camera(h)
+        failed = await failure_of(switch_fx, h, switch("perception", OPUS))
+        assert failed.kind is switch_fx.FailureKind.RESOURCE_UNAVAILABLE
+        assert failed.message.startswith(f"no key reaches '{OPUS}'")
+        assert provider.calls == []
 
 
 async def test_perception_switches_to_none_and_back():
@@ -129,11 +170,13 @@ async def test_perception_switches_to_none_and_back():
         answer_the_camera(h)
         await publish_a_capture(h)
         off = await result_of(switch_fx, h, switch("perception", "none"))
-        assert (off.success, off.model) == (True, "none"), off.message
-        refused = await result_of(identify_fx, h, identify())
-        assert (refused.success, refused.message) == (False, "no perception source: perception_model is 'none'")
+        assert off.model == "none"
+        # A role whose model is "none" refuses its goals with
+        # precondition_failed, as brain_model says.
+        refused = await refusal_of(identify_fx, h, identify())
+        assert refused == identify_fx.Failure("precondition_failed", "no perception source: perception_model is 'none'")
         back = await result_of(switch_fx, h, switch("perception", ER))
-        assert (back.success, back.model) == (True, ER), back.message
+        assert back.model == ER
         assert (await get_model_fx.poll(h, 5.0)).models == [ER, "none"]
 
 
@@ -141,12 +184,12 @@ async def test_manipulation_accepts_none_alone_and_refuses_every_grab():
     async with harness.start(partial(setup, provider=FakeProvider()), parameters=params()) as h:
         answer_the_camera(h)
         kept = await result_of(switch_fx, h, switch("manipulation", "none"))
-        assert (kept.success, kept.role, kept.model) == (True, "manipulation", "none"), kept.message
-        refused = await result_of(switch_fx, h, switch("manipulation", OPUS))
-        assert (refused.success, refused.role, refused.model) == (False, "", "")
-        assert refused.message == f"'{OPUS}' is not a manipulation model here; see list_models"
-        unknown = await result_of(switch_fx, h, switch("arm", "none"))
-        assert unknown.message == "this brain runs no model for the role 'arm'"
+        assert (kept.role, kept.model) == ("manipulation", "none")
+        refused = await refusal_of(switch_fx, h, switch("manipulation", OPUS))
+        assert refused == switch_fx.Failure("rejected", f"'{OPUS}' is not a manipulation model here; see list_models")
+        unknown = await refusal_of(switch_fx, h, switch("arm", "none"))
+        assert unknown == switch_fx.Failure("rejected", "this brain runs no model for the role 'arm'")
+        # item_manipulation reports in its result.
         grabbed = await result_of(
             grab_fx, h,
             grab_action.GoalRequestData(gripper_name="left_gripper", item_id="", position=[0.5, 0.1, 0.7], orientation=[0.0, 0.0, 0.0, 1.0], max_effort=0.0),
@@ -154,7 +197,7 @@ async def test_manipulation_accepts_none_alone_and_refuses_every_grab():
         assert (grabbed.success, grabbed.message) == (False, "no manipulation model: manipulation_model is 'none'")
 
 
-async def test_a_switch_is_refused_while_a_search_of_its_role_runs():
+async def test_a_switch_and_a_search_are_refused_while_a_search_of_the_role_runs():
     provider = FakeProvider(answer(("the cup", [250, 250, 750, 750])), answer(("the cup", [250, 250, 750, 750])))
     async with harness.start(partial(setup, provider=provider), parameters=params()) as h:
         answer_the_camera(h)
@@ -163,14 +206,16 @@ async def test_a_switch_is_refused_while_a_search_of_its_role_runs():
         await once_the_brain_sees(identify_fx, h, identify())
         provider.gate = asyncio.Event()
         provider.called.clear()
-        search = await identify_fx.send_goal(h, identify(), QoSProfile.Standard, 5.0)
-        assert search.accepted, search.reason
+        search = await identify_fx.send_goal(h, identify(), 5.0)
+        assert search.accepted, search.refusal
         await asyncio.wait_for(provider.called.wait(), WAIT)
-        refused = await result_of(switch_fx, h, switch("perception", OPUS))
-        assert (refused.success, refused.message) == (False, "identify_item is running")
+        refused = await refusal_of(switch_fx, h, switch("perception", OPUS))
+        assert refused == switch_fx.Failure("precondition_failed", "identify_item is running")
+        second = await refusal_of(scan_fx, h, scan())
+        assert second == scan_fx.Failure("precondition_failed", "identify_item is running")
         provider.gate.set()
         result = await search.get_result(WAIT)
-        assert result.data.success is True
+        assert result.status == identify_fx.ResultStatus.COMPLETED, result.failure
         assert (await get_model_fx.poll(h, 5.0)).models == [ER, "none"]
 
 
@@ -179,13 +224,14 @@ async def test_a_second_switch_is_refused_and_a_cancelled_one_keeps_the_model():
     provider.gate = asyncio.Event()
     async with harness.start(partial(setup, provider=provider), parameters=params()) as h:
         answer_the_camera(h)
-        first = await switch_fx.send_goal(h, switch("perception", OPUS), QoSProfile.Standard, 5.0)
-        assert first.accepted, first.reason
+        first = await switch_fx.send_goal(h, switch("perception", OPUS), 5.0)
+        assert first.accepted, first.refusal
         await asyncio.wait_for(provider.called.wait(), WAIT)
-        second = await result_of(switch_fx, h, switch("perception", "gpt-6-astra"))
-        assert (second.success, second.message) == (False, "switch_model is running for perception")
+        second = await refusal_of(switch_fx, h, switch("perception", "gpt-6-astra"))
+        assert second == switch_fx.Failure("precondition_failed", "switch_model is running for perception")
         await first.cancel_goal(5.0)
         result = await first.get_result(WAIT)
         assert result.status == switch_fx.ResultStatus.CANCELLED
-        assert (result.data.success, result.data.message, result.data.model) == (False, "cancelled by the caller", "")
+        assert result.cancel_reason == "cancelled by its caller"
+        assert (result.data.role, result.data.model) == ("", "")
         assert (await get_model_fx.poll(h, 5.0)).models == [ER, "none"]

@@ -14,8 +14,8 @@ under the route's `min_call_timeout_s`, the least deadline the provider
 takes; a call that failed is asked again once, after `RETRY_WAIT_S`, when
 the failure is one that comes back at once (`ProviderFailure.retryable`)
 and the budget has room for the wait; and a search whose budget is gone
-before a call stops there, so the core refuses it. Each call logs its
-route, its tokens and its latency, and no cost.
+before a call stops there, so the core fails it with `timeout`. Each call
+logs its route, its tokens and its latency, and no cost.
 """
 
 from __future__ import annotations

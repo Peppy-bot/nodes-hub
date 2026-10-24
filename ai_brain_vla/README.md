@@ -14,7 +14,7 @@ role.
 | `perception_model` | what it is | needs | per frame |
 |---|---|---|---|
 | `sam3_siglip` | SAM 3 finds what is in view, SigLIP names each box by words: a general vocabulary for a scan, the searched words for identify | GPU, network for its first load on a machine | about 1 s a scan on an A10, about 2 s on a Jetson Thor |
-| `none` | no model: every search refused with "no perception source: perception_model is 'none'" | | |
+| `none` | no model: every search refused with `precondition_failed`, "no perception source: perception_model is 'none'" | | |
 
 `sam3_siglip` is the robot's model. It needs no data but its two models'
 weights, which the node downloads at its first load on a machine: what a
@@ -25,8 +25,8 @@ work.
 
 Each role runs the model its parameter names for the node's whole life.
 `get_model` and `list_models` name it, and `switch_model` accepts it alone:
-any other is refused with "this brain runs only 'sam3_siglip' for
-perception".
+any other is refused with `rejected`, "this brain runs only 'sam3_siglip'
+for perception".
 
 ## The models' weights
 
@@ -109,8 +109,8 @@ the same files, each with the same content hash.
 
 `timeout_s` of a scan or an identify search bounds it, 10 s when zero. The
 detector checks the deadline between its stages, SAM 3's proposals, SigLIP's
-embeddings and the naming, and stops there once it has passed; the search is
-then refused with `the search did not finish within 10 s`. The search
+embeddings and the naming, and stops there once it has passed; the search
+then fails with `timeout`, `the search did not finish within 10 s`. The search
 computes in a daemon thread of its own, and its lane stays busy until it has
 returned, so a second search never starts on the same models while the
 first still runs.
@@ -118,7 +118,7 @@ first still runs.
 ## How it works
 
 brain_core's README draws the parts every brain shares, a goal from its
-arrival to its result, and cancel, abort and shutdown. This node brings
+arrival to its end, and cancel, abort and shutdown. This node brings
 `VlaModels`, its `ModelSource`, and `Sam3SiglipDetector`, the perception
 model `sam3_siglip`.
 
@@ -132,21 +132,22 @@ sequenceDiagram
     participant M as Models
     participant VM as VlaModels
     C->>H: goal with role and model
-    H->>H: parse_role(goal.role, the brain's roles), as a lane-less job
+    H->>H: decide: parse_role(goal.role, the brain's roles)
     alt not a role of this brain
-        H-->>C: refused: this brain runs no model for the role
+        H-->>C: refused, rejected: this brain runs no model for the role
     else a Role
-        H->>M: switch(role, model, job)
+        H->>M: check_switch(role, model)
         M->>VM: offered(role, model)
         alt not the model the role runs
-            VM-->>C: refused: this brain runs only 'sam3_siglip' for perception
+            VM-->>C: refused, rejected: this brain runs only 'sam3_siglip' for perception
         else the role's lane runs a goal, or another switch of the role runs
-            M-->>C: refused, naming it
+            M-->>C: refused, precondition_failed, naming it
         else the running model
+            H->>M: switch(role, model, job), as a lane-less job
             M->>VM: await prepare(entry)
             VM-->>M: the same model, with no load
             M-->>H: the model's name
-            H-->>C: success, role and model
+            H-->>C: completed, role and model
         end
     end
 ```
@@ -160,9 +161,9 @@ sequenceDiagram
     participant P as Perceiver
     participant D as Sam3SiglipDetector
     participant T as daemon thread
-    B->>D: why_unavailable()
+    B->>D: why_unavailable(), at the decision and again in the look
     alt its background load runs, or failed
-        D-->>B: "perception_model 'sam3_siglip' is still loading", or the load's error
+        D-->>B: "perception_model 'sam3_siglip' is still loading", or the load's error: refused, resource_unavailable
     else loaded
         B->>P: scan(detector, [], cancel, timeout_s)
         P->>D: await detect(image, [], deadline)
@@ -207,11 +208,11 @@ read a region against the same frame.
   `get_depth_intrinsics` for what a depth sample measures, which must be the
   distance along the optical axis (`depth_model` "z"). The rig binds the slot
   to the same camera as `camera`. The brain asks both every 2 s until the
-  camera answers both with success and something usable; until then both
-  searches are refused naming the reason (slot vacant, not answered yet, the
-  camera not knowing its geometry, as a sim relay says before its simulation
-  has spoken and as a UVC camera says for good, a depth model the brain does
-  not read).
+  camera gives both responses and they are usable; until then both searches
+  are refused with `resource_unavailable`, naming the reason (slot vacant,
+  not answered yet, the camera's error reply, which a sim relay gives before
+  its simulation has spoken and a camera without a calibration gives for
+  good, a depth model the brain does not read).
 - **Colour and depth are paired by capture.** The two streams share
   `frame_id`, the capture-pair counter of `rgbd_camera:v1`; the brain keeps
   the last eight frames of each and reads the depth of the same capture as
@@ -223,11 +224,12 @@ read a region against the same frame.
   `camera_mounts:v1`, served by the robot's backbone: `get_camera_poses`
   lists where the robot's design carries each camera, in the robot frame, as
   the pose of its optical frame (+X to the right of the image, +Y down it, +Z
-  along the view). The brain asks every 2 s until the robot answers with
-  success and names the camera `camera_name` names (the OpenArm launchers
-  name `chest`, the v2 head camera); until then both searches are refused naming the
-  reason (slot vacant, not answered yet, the robot not having measured its
-  joints, a robot that carries no camera by that name). The pose is read
+  along the view). The brain asks every 2 s until the robot gives its
+  response and names the camera `camera_name` names (the OpenArm launchers
+  name `chest`, the v2 head camera); until then both searches are refused
+  with `resource_unavailable`, naming the reason (slot vacant, not answered
+  yet, the robot's error reply before it has measured its joints, a robot
+  that carries no camera by that name). The pose is read
   once: the brain looks through a camera fixed to the robot's base, and a
   camera an arm carries would have moved between the answer and a scan. The
   values are the design's, exact in a simulation and nominal on hardware.
@@ -313,7 +315,7 @@ and each box of the detector with its confidence, marked `(duplicate)` or
 
 ```text
 [brain] identify_item 'potted plant' succeeded after 2.59 s; frame 4512 taken 0.03 s before the search, 2 boxes: potted plant 0.82, potted plant 0.39; item potted_plant_1-3f9a2c
-[brain] identify_item 'watering can' refused after 2.62 s: no item matches 'watering can'; frame 4512 taken 0.03 s before the search, no box
+[brain] identify_item 'watering can' failed after 2.62 s: no item matches 'watering can'; frame 4512 taken 0.03 s before the search, no box
 ```
 
 So a search that found nothing says whether the detector boxed nothing,
@@ -362,7 +364,7 @@ claude -p "Tell me what robot alpha sees on the table, find the red apple on the
 The agent calls robot.list, brain.scan_items and brain.identify_item with
 the plain names, not the sentence it was given, because the tool's
 description asks for the item's plain name, and reports the items with their
-positions and "no banana" from the refusal.
+positions and "no banana" from the search that failed with `not_found`.
 
 ### 4. Run the brain on its own
 
@@ -395,9 +397,10 @@ A brain run this way is not on the MCP endpoint, so ask it through an
 - Identify by a plain name ("mustard bottle", "yellow bottle", "blue ball"):
   about 2 s on a Jetson Thor.
 - An item that is not on the table ("mug" when there is none, "keyboard"):
-  refused, `no item matches 'mug'`, for 95.3% of such searches below.
-- `perception_model=none`: every search refused with `no perception source:
-  perception_model is 'none'`.
+  the search fails with `not_found`, `no item matches 'mug'`, for 95.3% of
+  such searches below.
+- `perception_model=none`: every search refused with `precondition_failed`,
+  `no perception source: perception_model is 'none'`.
 
 ### Measured
 
@@ -409,7 +412,7 @@ IoU 0.5), at the default confidence, on an A10:
 |---|---|---|---|---|
 | scan | 77.2% of the items | | 0.40 boxes a frame, most on the robot's gripper | |
 | identify an item in view, by its catalogue name | 77.9% | 1.0% | 1.8% | 19.3% |
-| identify an item not in view | | | 4.7% returned something | 95.3% refused |
+| identify an item not in view | | | 4.7% returned something | 95.3% not found |
 
 With the threshold a detection is kept at (`MIN_CONFIDENCE` in
 `perception/sam3_siglip.py`) at 0.15 instead of 0.25, a scan finds 90.0% of
@@ -435,7 +438,7 @@ simulation launchers set it; a second brain beside it ran with no gallery.
 | scan: the two unknown objects | egg as "potato" 0.48, panel as "wooden leg" 0.49 | the same two names and confidences: the referee leaves them to the vocabulary |
 | identify by catalogue name, the five | all five found, 0.94 to 0.98 | all five found, 0.84 to 0.98 |
 | identify by words ("yellow bottle", "red apple", "egg") | found | found |
-| identify "keyboard", not on the table | refused | refused |
+| identify "keyboard", not on the table | not found | not found |
 
 So the enrolment adds recall and exact names in a scan of the catalogue's
 objects, which is what the simulation's tests ask by, and changes nothing

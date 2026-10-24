@@ -3,7 +3,7 @@ catalog.
 
 Both roles accept "none", the role's missing model; perception also
 accepts every catalog model that serves it. A name a role does not accept
-is refused pointing to list_models. `offered` gives the entry of a name for
+is refused with `rejected`, pointing to list_models. `offered` gives the entry of a name for
 a role, `NoModel` for "none" and a `RouterEntry` for a catalog model, so the
 entry carries the role it was offered for. A catalog model runs on the
 first of its routes whose key is set in the node's environment, the route
@@ -14,7 +14,8 @@ At the node's start (`start`) the starting model makes no call: the first
 search is its first call, and a provider failure fails that search alone.
 A switch (`prepare`) probes the route once before brain_core hands the
 role its new model, so a model that cannot be reached fails the switch and
-the role keeps its model.
+the role keeps its model: with `resource_unavailable` when no route of the
+model has its key, with `attempt_failed` when the probe fails.
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ from typing import Callable, Mapping, Sequence, Union
 
 from brain_core.manipulation.none import NoneManipulator
 from brain_core.perception.none import NoneDetector
-from brain_core.ports import Refusal, Role
+from brain_core.ports import FailureKind, Refusal, Role
 
 from .catalog import NONE, Catalog, CatalogEntry, Route
 from .keys import first_keyed, no_key_message
@@ -77,7 +78,7 @@ class RouterModels:
             return NoModel(role)
         catalog_entry = self._catalog.get(name)
         if catalog_entry is None or role not in catalog_entry.roles:
-            raise Refusal(f"'{name}' is not a {role} model here; see list_models")
+            raise Refusal(FailureKind.REJECTED, f"'{name}' is not a {role} model here; see list_models")
         return RouterEntry(role, catalog_entry)
 
     def start(self, entry: Entry):
@@ -95,7 +96,7 @@ class RouterModels:
         model = entry.catalog_entry
         route = first_keyed(model.routes, self._environ)
         if route is None:
-            raise Refusal(no_key_message(model.name, model.routes))
+            raise Refusal(FailureKind.RESOURCE_UNAVAILABLE, no_key_message(model.name, model.routes))
         await probe(self._provider, route)
         return self._build(entry, route)
 

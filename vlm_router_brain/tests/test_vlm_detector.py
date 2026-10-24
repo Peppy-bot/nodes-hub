@@ -11,7 +11,7 @@ import pytest
 from conftest import FakeProvider, TEST_CATALOG, answer, records_of
 from PIL import Image
 
-from brain_core.ports import Coverage, Deadline, SearchTimeout
+from brain_core.ports import Coverage, Deadline, FailureKind, SearchTimeout
 
 from vlm_router_brain.parsing import UnreadableAnswer
 from vlm_router_brain.provider import ProviderFailure, Reply
@@ -107,7 +107,9 @@ async def test_a_failure_that_may_not_be_asked_again_fails_at_once():
 async def test_a_call_gets_the_budget_left_but_never_less_than_the_routes_floor():
     provider = FakeProvider()
     await detector_on(provider).detect(FRAME, [], FAR)
-    assert 990.0 < provider.calls[0].timeout_s <= 1000.0
+    # The budget left, above the route's 10 s floor however long the
+    # tests took to come here.
+    assert 10.0 < provider.calls[0].timeout_s < 1000.0
     # Two seconds left: the call still gets the route's 10 s.
     await detector_on(provider).detect(FRAME, [], Deadline(at=time.monotonic() + 2.0, budget_s=2.0))
     assert provider.calls[1].timeout_s == 10.0
@@ -126,6 +128,7 @@ async def test_an_unreadable_answer_fails_the_search_and_its_text_goes_to_the_lo
         with pytest.raises(UnreadableAnswer) as raised:
             await detector_on(provider).detect(FRAME, ["the mustard bottle"], FAR)
     assert raised.value.message == "the model's answer could not be read"
+    assert raised.value.kind is FailureKind.ATTEMPT_FAILED
     [unreadable] = [record for record in log.records if record.levelno == logging.WARNING]
     assert unreadable.getMessage() == "fast: the answer could not be read: 'I see a yellow bottle on the left.'"
 
