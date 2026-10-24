@@ -1,6 +1,6 @@
 use peppygen::consumed_actions::robot_controller::move_arm as arm;
 use peppygen::consumed_topics::camera::video_stream;
-use peppygen::{NodeBuilder, NodeRunner, Parameters, QoSProfile, Result};
+use peppygen::{DEFAULT_FEEDBACK_BOUND, NodeBuilder, NodeRunner, Parameters, Result};
 use peppylib::runtime::CancellationToken;
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,14 +8,18 @@ use tokio::sync::watch;
 
 fn log_arm_result(side: &str, result: arm::ResultResponse) {
     // get_result returns a typed terminal outcome rather than erroring.
-    // Completed/Cancelled carry the result payload; Abandoned/Expired do not.
+    // Completed/Cancelled carry the result payload, Failed the failure kind
+    // and message; Abandoned/Expired carry nothing.
     match result.outcome {
         arm::ResultOutcome::Completed(data) => println!(
             "[brain] {side} arm completed at position: {:?}",
             data.final_position
         ),
-        arm::ResultOutcome::Cancelled(data) => println!(
-            "[brain] {side} arm cancelled at position: {:?}",
+        arm::ResultOutcome::Failed(failure) => {
+            eprintln!("[brain] {side} arm failed: {failure}")
+        }
+        arm::ResultOutcome::Cancelled { reason, data } => println!(
+            "[brain] {side} arm cancelled ({reason}) at position: {:?}",
             data.final_position
         ),
         arm::ResultOutcome::Abandoned => {
@@ -104,6 +108,25 @@ async fn ai_process(node_runner: Arc<NodeRunner>, cancel_token: CancellationToke
     }
 }
 
+/// The handle of a goal the arm accepted. A goal that could not be fired or
+/// that the arm refused is logged, with the kind and message of the refusal,
+/// and gives `None`.
+fn accepted_handle(side: &str, fired: Result<arm::ActionHandle>) -> Option<arm::ActionHandle> {
+    let handle = match fired {
+        Ok(handle) => handle,
+        Err(e) => {
+            eprintln!("[brain] Failed to fire the {side} arm goal: {e}");
+            return None;
+        }
+    };
+    if let Some(refusal) = &handle.refusal {
+        eprintln!("[brain] {side} arm goal refused: {refusal}");
+        return None;
+    }
+    println!("[brain] {side} arm goal accepted");
+    Some(handle)
+}
+
 async fn process_frame(node_runner: &NodeRunner, frame: &video_stream::Message) {
     // Process the frame and generate fake arm positions
     let fake_position = [
@@ -134,47 +157,20 @@ async fn process_frame(node_runner: &NodeRunner, frame: &video_stream::Message) 
             arm::bound_producer(node_runner),
             goal_timeout,
             left_goal,
-            QoSProfile::Standard,
+            DEFAULT_FEEDBACK_BOUND,
         ),
         arm::ActionHandle::fire_goal(
             node_runner,
             arm::bound_producer(node_runner),
             goal_timeout,
             right_goal,
-            QoSProfile::Standard,
+            DEFAULT_FEEDBACK_BOUND,
         ),
     );
 
     // Get the action handles from accepted goals
-    let left_handle = match left_goal_result {
-        Ok(handle) if handle.accepted => {
-            println!("[brain] Left arm goal accepted");
-            Some(handle)
-        }
-        Ok(_) => {
-            eprintln!("[brain] Left arm goal rejected");
-            None
-        }
-        Err(e) => {
-            eprintln!("Failed to fire left arm goal: {e}");
-            None
-        }
-    };
-
-    let right_handle = match right_goal_result {
-        Ok(handle) if handle.accepted => {
-            println!("[brain] Right arm goal accepted");
-            Some(handle)
-        }
-        Ok(_) => {
-            eprintln!("[brain] Right arm goal rejected");
-            None
-        }
-        Err(e) => {
-            eprintln!("Failed to fire right arm goal: {e}");
-            None
-        }
-    };
+    let left_handle = accepted_handle("Left", left_goal_result);
+    let right_handle = accepted_handle("Right", right_goal_result);
 
     // Wait for results from both arms concurrently (only if goals were accepted)
     match (left_handle, right_handle) {

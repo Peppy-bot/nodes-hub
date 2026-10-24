@@ -77,6 +77,52 @@ async def test_frame_drives_move_arm_goals_and_loops_to_next_frame():
         await _accept_and_complete(goals)
 
 
+async def test_refused_failed_and_cancelled_goals_are_read_and_the_brain_goes_on(
+    capsys,
+):
+    """A goal the controller refuses, one that fails and one that ends
+    cancelled each end that frame's goal pair: the brain logs the failure kind
+    and message, or the cancel reason, and takes the next frame."""
+    async with harness.start(setup) as h:
+        camera = h.mocks.deps.camera.video_stream
+        controller = h.mocks.deps.robot_controller.move_arm
+
+        await camera.publish(_frame_message(0, bytes([10, 20, 30, 40, 50, 60])))
+        goals = await _goal_pair(controller)
+        await goals[0].refuse(
+            move_arm.FailureKind.PRECONDITION_FAILED, "arm 0 is already moving"
+        )
+        right = await goals[1].accept()
+        await right.fail(move_arm.FailureKind.ATTEMPT_FAILED, "the arm stalled")
+
+        # The next pair proves the brain read both ends and looped back.
+        await camera.publish(_frame_message(1, bytes([40, 50, 60, 70, 80, 90])))
+        goals = await _goal_pair(controller)
+        logged = capsys.readouterr().out
+        assert (
+            "Left arm goal refused: precondition_failed: arm 0 is already moving"
+            in logged
+        )
+        assert "Right arm failed: attempt_failed: the arm stalled" in logged
+
+        left = await goals[0].accept()
+        await left.complete_cancelled(
+            "stopped by a stop request",
+            move_arm.ResultResponseData(final_position=[1, 2, 3]),
+        )
+        await _accept_and_complete({1: goals[1]})
+
+        await camera.publish(_frame_message(2, bytes([70, 80, 90, 1, 2, 3])))
+        goals = await _goal_pair(controller)
+        logged = capsys.readouterr().out
+        assert (
+            "Left arm cancelled (stopped by a stop request) at position: [1, 2, 3]"
+            in logged
+        )
+        assert "Right arm completed at position: [40, 50, 60]" in logged
+        await _accept_and_complete(goals)
+
+
 async def test_shutdown_is_clean_after_boot():
     """Exiting the harness context with the brain idle (subscribed, parked on
     the frame mailbox) cancels its reader/worker tasks and closes the mocks
