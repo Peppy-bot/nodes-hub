@@ -13,9 +13,12 @@
 //! what its leave report needs, so a robot that does not stand fails with
 //! its own reason before the daemon's limit. A robot that the engine refuses,
 //! or whose goal the engine ends before the robot stands, fails the setup
-//! with the engine's reason, and the join of its copy is undone. A goal that
-//! the engine ends after the robot stood stops the node: `peppy stack list`
-//! reports the instance finished, and `peppy stack join` puts the copy back.
+//! with the engine's failure kind and reason, and the join of its copy is
+//! undone. A goal that ends after the robot stood stops the node: `peppy
+//! stack list` reports the instance finished, and `peppy stack join` puts the
+//! copy back. The goal ends cancelled when this node takes the robot out, or
+//! when another goal of the same copy holds the robot now, and fails with
+//! `resource_unavailable` when the engine takes the robot out itself.
 //!
 //! A task that outlives the setup sends the goal and holds it for the robot's
 //! whole stay, and it cancels every goal that the engine accepted and that it
@@ -38,7 +41,7 @@ use std::time::Duration;
 
 use peppygen::consumed_actions::simulation::attach;
 use peppygen::parameters::placement::Placement;
-use peppygen::{NodeRunner, ProducerRef, QoSProfile, Result};
+use peppygen::{DEFAULT_FEEDBACK_BOUND, NodeRunner, ProducerRef, Result};
 use peppylib::runtime::CancellationToken;
 use tokio::sync::oneshot;
 use tokio::time::{Instant, Interval, MissedTickBehavior};
@@ -431,7 +434,7 @@ async fn admission<C: StandClock>(
         &join.simulation,
         join.wire,
         join.request.clone(),
-        QoSProfile::Reliable,
+        DEFAULT_FEEDBACK_BOUND,
     );
     let mut send = std::pin::pin!(send);
     let mut spent = false;
@@ -455,10 +458,9 @@ async fn admission<C: StandClock>(
             return None;
         }
     };
-    if !goal.accepted {
+    if let Some(refusal) = &goal.refusal {
         verdict.give(Err(refused(format!(
-            "the simulation refused this robot: {}",
-            goal.reason.unwrap_or_else(|| "no reason given".into())
+            "the simulation refused this robot: {refusal}"
         ))));
         return None;
     }
@@ -560,21 +562,25 @@ async fn leave(goal: &attach::ActionHandle, robot: &str, stood: bool) {
     }
 }
 
-/// Whether a goal ended as asked, and what the engine said of it.
-fn said(outcome: attach::ResultOutcome) -> (bool, String) {
+/// What the engine said of a goal that ended. A stay never completes: it
+/// ends cancelled, for the reason the engine gives, or it fails, with the
+/// failure kind and the message of the engine.
+fn said(outcome: attach::ResultOutcome) -> String {
     match outcome {
-        attach::ResultOutcome::Completed(data) | attach::ResultOutcome::Cancelled(data) => {
-            (data.success, data.message)
+        attach::ResultOutcome::Cancelled { reason } => reason,
+        attach::ResultOutcome::Failed(failure) => failure.to_string(),
+        attach::ResultOutcome::Completed => {
+            "the simulation completed it without a reason".to_owned()
         }
-        attach::ResultOutcome::Abandoned => (false, "the simulation abandoned it".to_owned()),
-        attach::ResultOutcome::Expired => (false, "it left before the reason was read".to_owned()),
+        attach::ResultOutcome::Abandoned => "the simulation abandoned it".to_owned(),
+        attach::ResultOutcome::Expired => "it left before the reason was read".to_owned(),
     }
 }
 
 /// Why the engine ended a goal before the robot stood.
 fn reason_of(outcome: std::result::Result<attach::ResultOutcome, String>) -> String {
     match outcome {
-        Ok(outcome) => said(outcome).1,
+        Ok(outcome) => said(outcome),
         Err(e) => format!("it ended the goal and did not say why: {e}"),
     }
 }
@@ -584,9 +590,11 @@ fn reason_of(outcome: std::result::Result<attach::ResultOutcome, String>) -> Str
 enum Ending {
     /// The robot left before the engine stood it.
     LeftBeforeStanding(String),
-    /// The engine took the robot out of the scene, as it was asked to.
-    TakenOut(String),
-    /// The engine took the robot out for a reason of its own.
+    /// The goal ended cancelled: this node took the robot out, or another
+    /// goal of the same copy holds the robot now. The reason says which.
+    Cancelled(String),
+    /// The engine took the robot out for a reason of its own: the goal
+    /// failed, with `resource_unavailable` and a message that says why.
     Dropped(String),
     /// The engine did not say what became of the robot.
     Unsaid(String),
@@ -595,14 +603,16 @@ enum Ending {
 /// What the engine's account says became of a robot that `stood` or never
 /// did.
 fn ending(stood: bool, outcome: std::result::Result<attach::ResultOutcome, String>) -> Ending {
-    let (asked_for, message) = match outcome {
+    let outcome = match outcome {
         Err(e) => return Ending::Unsaid(e),
-        Ok(outcome) => said(outcome),
+        Ok(outcome) => outcome,
     };
-    match (stood, asked_for) {
-        (false, _) => Ending::LeftBeforeStanding(message),
-        (true, true) => Ending::TakenOut(message),
-        (true, false) => Ending::Dropped(message),
+    if !stood {
+        return Ending::LeftBeforeStanding(said(outcome));
+    }
+    match outcome {
+        attach::ResultOutcome::Cancelled { reason } => Ending::Cancelled(reason),
+        other => Ending::Dropped(said(other)),
     }
 }
 
@@ -612,8 +622,8 @@ fn report(robot: &str, stood: bool, outcome: std::result::Result<attach::ResultO
         Ending::LeftBeforeStanding(why) => {
             info!("'{robot}' left the simulation before it stood: {why}");
         }
-        Ending::TakenOut(why) => {
-            info!("the simulation took '{robot}' out of the scene: {why}");
+        Ending::Cancelled(why) => {
+            info!("the stay of '{robot}' in the simulation ended: {why}");
         }
         Ending::Dropped(why) => warn!("the simulation took '{robot}' out of the scene: {why}"),
         Ending::Unsaid(why) => warn!("the simulation did not say why '{robot}' left: {why}"),
@@ -624,11 +634,14 @@ fn report(robot: &str, stood: bool, outcome: std::result::Result<attach::ResultO
 mod tests {
     use super::*;
 
-    fn engine_said(success: bool, message: &str) -> attach::ResultResponseData {
-        attach::ResultResponseData {
-            success,
-            message: message.to_owned(),
+    fn cancelled(reason: &str) -> attach::ResultOutcome {
+        attach::ResultOutcome::Cancelled {
+            reason: reason.to_owned(),
         }
+    }
+
+    fn failed(kind: attach::FailureKind, message: &str) -> attach::ResultOutcome {
+        attach::ResultOutcome::Failed(attach::Failure::new(kind, message))
     }
 
     #[test]
@@ -636,37 +649,40 @@ mod tests {
         // A robot that leaves before the engine stands it left, whatever the
         // engine's own verdict on the goal.
         assert_eq!(
-            ending(
-                false,
-                Ok(attach::ResultOutcome::Cancelled(engine_said(
-                    true,
-                    "left before it stood"
-                )))
-            ),
-            Ending::LeftBeforeStanding("left before it stood".to_owned())
+            ending(false, Ok(cancelled("cancelled by its caller"))),
+            Ending::LeftBeforeStanding("cancelled by its caller".to_owned())
         );
         assert_eq!(
             ending(false, Ok(attach::ResultOutcome::Abandoned)),
             Ending::LeftBeforeStanding("the simulation abandoned it".to_owned())
         );
 
-        // A robot that stood: the engine took it out as asked, or for a
-        // reason of its own.
+        // A robot that stood: its goal ended cancelled, because this node
+        // took it out or another goal of its copy holds it now, or the
+        // engine took it out for a reason of its own.
         assert_eq!(
-            ending(
-                true,
-                Ok(attach::ResultOutcome::Cancelled(engine_said(true, "left")))
-            ),
-            Ending::TakenOut("left".to_owned())
+            ending(true, Ok(cancelled("cancelled by its caller"))),
+            Ending::Cancelled("cancelled by its caller".to_owned())
         );
         assert_eq!(
             ending(
                 true,
-                Ok(attach::ResultOutcome::Completed(engine_said(
-                    false, "lapsed"
-                )))
+                Ok(cancelled(
+                    "another goal of the same caller holds the robot now"
+                ))
             ),
-            Ending::Dropped("lapsed".to_owned())
+            Ending::Cancelled("another goal of the same caller holds the robot now".to_owned())
+        );
+        assert_eq!(
+            ending(
+                true,
+                Ok(failed(attach::FailureKind::ResourceUnavailable, "lapsed"))
+            ),
+            Ending::Dropped("resource_unavailable: lapsed".to_owned())
+        );
+        assert_eq!(
+            ending(true, Ok(attach::ResultOutcome::Completed)),
+            Ending::Dropped("the simulation completed it without a reason".to_owned())
         );
         assert_eq!(
             ending(true, Ok(attach::ResultOutcome::Expired)),
@@ -681,11 +697,11 @@ mod tests {
     #[test]
     fn a_goal_the_engine_ended_before_the_robot_stood_gives_the_engines_reason() {
         assert_eq!(
-            reason_of(Ok(attach::ResultOutcome::Completed(engine_said(
-                false,
+            reason_of(Ok(failed(
+                attach::FailureKind::AttemptFailed,
                 "its files could not be fetched"
-            )))),
-            "its files could not be fetched"
+            ))),
+            "attempt_failed: its files could not be fetched"
         );
         assert_eq!(
             reason_of(Ok(attach::ResultOutcome::Abandoned)),

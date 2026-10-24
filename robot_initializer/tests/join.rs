@@ -1,9 +1,10 @@
 //! Joining a simulation over the wire, the engine played by its generated
 //! mock: the node attaches as the name it runs under with the model it is,
 //! stands where it is told, starts only once the engine stands it, says so
-//! while it waits, fails with the engine's reason or its own when the robot
-//! does not stand, cancels every goal the engine accepted when it stops, and
-//! serves no readiness for a robot that does not stand.
+//! while it waits, fails with the engine's failure kind and reason or its
+//! own when the robot does not stand, cancels every goal the engine accepted
+//! when it stops, serves no readiness for a robot that does not stand, and
+//! says how the stay of a robot that stood ended.
 //!
 //! The tests of the wait for standing run it on a clock the test drives, on
 //! the stand budget of the node's manifest, so no test reaches a deadline it
@@ -34,14 +35,9 @@ const A_LONG_STAY: Duration = Duration::from_secs(3);
 /// the 5.5 s it keeps to leave the simulation.
 const STAND_BUDGET: &str = "174.5 s";
 
-/// The engine's result for a robot it took out because its goal was
-/// cancelled.
-fn left(message: &str) -> attach::ResultResponseData {
-    attach::ResultResponseData {
-        success: true,
-        message: message.into(),
-    }
-}
+/// The reason the engine ends the goal of a robot it took out because its
+/// caller cancelled the goal.
+const CANCELLED_BY_ITS_CALLER: &str = "cancelled by its caller";
 
 /// Stops the node, and plays the engine that takes its robot out: the node
 /// cancels the robot's goal, and the engine ends it as cancelled. Answers
@@ -52,8 +48,7 @@ async fn stop_and_take_out(harness: Harness, stay: &attach::ActiveGoal) -> peppy
     tokio::time::timeout(WIRE, stay.cancel_signal())
         .await
         .expect("a stopping robot cancels its goal");
-    stay.complete_cancelled(&left("the robot left the scene"))
-        .await?;
+    stay.complete_cancelled(CANCELLED_BY_ITS_CALLER).await?;
     tokio::time::timeout(WIRE, stopping)
         .await
         .expect("a robot the engine took out stops")
@@ -92,10 +87,10 @@ async fn the_robot_joins_the_scene_under_its_own_name() -> peppygen::Result<()> 
     );
 
     // The engine takes the robot out, which ends the node with it.
-    stay.complete(&attach::ResultResponseData {
-        success: true,
-        message: "the scene was cleared".into(),
-    })
+    stay.fail(
+        attach::FailureKind::ResourceUnavailable,
+        "the scene was cleared",
+    )
     .await?;
     let deadline = tokio::time::Instant::now() + WIRE;
     while robot_is_ready::poll(&harness, UNSERVED).await.is_ok() {
@@ -173,19 +168,21 @@ async fn a_robot_the_engine_ends_before_it_stands_fails_with_the_engines_reason(
         .await?;
 
     // The engine admitted the robot and then could not stand it: the goal
-    // ends before the robot ever stood, and the node fails with the
-    // engine's reason.
-    stay.complete(&attach::ResultResponseData {
-        success: false,
-        message: "its files could not be fetched".into(),
-    })
+    // fails before the robot ever stood, and the node fails with the
+    // engine's failure kind and reason.
+    stay.fail(
+        attach::FailureKind::AttemptFailed,
+        "its files could not be fetched",
+    )
     .await?;
     let failure = shutdown_once_setup_returns(harness)
         .await
         .expect_err("a robot the engine did not stand fails to start")
         .to_string();
     assert!(
-        failure.contains("the simulation did not stand this robot: its files could not be fetched"),
+        failure.contains(
+            "the simulation did not stand this robot: attempt_failed: its files could not be fetched"
+        ),
         "{failure}"
     );
     Ok(())
@@ -238,8 +235,7 @@ async fn a_robot_that_does_not_stand_within_its_budget_leaves_and_fails() -> pep
     tokio::time::timeout(WIRE, stay.cancel_signal())
         .await
         .expect("a robot out of budget cancels its goal");
-    stay.complete_cancelled(&left("the robot left before it stood"))
-        .await?;
+    stay.complete_cancelled(CANCELLED_BY_ITS_CALLER).await?;
     let failure = shutdown_once_setup_returns(harness)
         .await
         .expect_err("a robot that did not stand in time fails to start")
@@ -273,8 +269,7 @@ async fn a_robot_out_of_budget_before_the_engine_answers_fails_and_cancels_the_g
     tokio::time::timeout(WIRE, stay.cancel_signal())
         .await
         .expect("a robot out of budget cancels the goal the engine accepts");
-    stay.complete_cancelled(&left("the robot left before it stood"))
-        .await?;
+    stay.complete_cancelled(CANCELLED_BY_ITS_CALLER).await?;
     let failure = harness
         .shutdown()
         .await
@@ -309,8 +304,7 @@ async fn a_robot_stopped_before_the_engine_answers_cancels_the_goal_it_accepts()
     tokio::time::timeout(WIRE, stay.cancel_signal())
         .await
         .expect("a stopped robot cancels the goal the engine accepts");
-    stay.complete_cancelled(&left("the robot left before it stood"))
-        .await?;
+    stay.complete_cancelled(CANCELLED_BY_ITS_CALLER).await?;
 
     // A stop is no failure.
     harness.shutdown().await
@@ -375,13 +369,75 @@ async fn a_robot_stays_until_the_engine_ends_its_goal() -> peppygen::Result<()> 
         "a robot whose goal still runs keeps serving readiness"
     );
 
-    // The engine ends the goal: the robot is out of the scene, and the node
-    // stops with it.
-    stay.complete(&attach::ResultResponseData {
-        success: false,
-        message: "the scene was cleared".into(),
-    })
+    // The engine takes the robot out: its goal fails, the robot is out of
+    // the scene, and the node stops with it.
+    stay.fail(
+        attach::FailureKind::ResourceUnavailable,
+        "the scene was cleared",
+    )
     .await?;
+    stopped_within(&harness, WIRE).await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_robot_the_engine_takes_out_says_why_and_stops() -> peppygen::Result<()> {
+    capture_logs();
+    let (harness, mut mocks) =
+        Harness::start_with(joining_a_simulation("openarm_v2"), robot_initializer::setup).await?;
+    let mut simulation = simulation_of(&mut mocks);
+    let robot = harness.instance_id().to_owned();
+    let stay = simulation
+        .attach
+        .next_goal(WIRE)
+        .await?
+        .accept(stood())
+        .await?;
+    stay.publish_feedback(&attach::FeedbackMessage { standing: true })
+        .await?;
+    await_setup_return(&harness).await;
+
+    // The engine takes the robot out for a reason of its own: the node
+    // logs the failure kind and the reason, and stops.
+    stay.fail(
+        attach::FailureKind::ResourceUnavailable,
+        "none of this robot's limbs were paired for 2.0s",
+    )
+    .await?;
+    logged(&format!(
+        "the simulation took '{robot}' out of the scene: resource_unavailable: none of this robot's limbs were paired for 2.0s"
+    ))
+    .await;
+    stopped_within(&harness, WIRE).await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_robot_another_goal_of_its_copy_holds_says_so_and_stops() -> peppygen::Result<()> {
+    capture_logs();
+    let (harness, mut mocks) =
+        Harness::start_with(joining_a_simulation("openarm_v2"), robot_initializer::setup).await?;
+    let mut simulation = simulation_of(&mut mocks);
+    let robot = harness.instance_id().to_owned();
+    let stay = simulation
+        .attach
+        .next_goal(WIRE)
+        .await?
+        .accept(stood())
+        .await?;
+    stay.publish_feedback(&attach::FeedbackMessage { standing: true })
+        .await?;
+    await_setup_return(&harness).await;
+
+    // Another goal of the same copy holds the robot now: this goal ends
+    // cancelled, with that reason, and the node stops. The robot stays in
+    // the scene for the goal that holds it.
+    stay.complete_cancelled("another goal of the same caller holds the robot now")
+        .await?;
+    logged(&format!(
+        "the stay of '{robot}' in the simulation ended: another goal of the same caller holds the robot now"
+    ))
+    .await;
     stopped_within(&harness, WIRE).await;
     Ok(())
 }
@@ -456,8 +512,11 @@ async fn a_robot_stands_where_it_is_told() -> peppygen::Result<()> {
         .clone()
         .expect("this robot named its spot");
     assert_eq!((spot.position, spot.yaw), ([1.0, -2.0, 0.0], 0.5));
-    goal.reject(Some("that is enough of this robot"), None)
-        .await?;
+    goal.refuse(
+        attach::FailureKind::Rejected,
+        "that is enough of this robot",
+    )
+    .await?;
     let _ = harness.shutdown().await;
     Ok(())
 }
@@ -472,8 +531,11 @@ async fn a_robot_attaches_as_the_model_it_was_launched_as() -> peppygen::Result<
     // exist is the engine's to say, and this node adds nothing to the name.
     let goal = simulation.attach.next_goal(WIRE).await?;
     assert_eq!(goal.request.model, "so101");
-    goal.reject(Some("that is enough of this robot"), None)
-        .await?;
+    goal.refuse(
+        attach::FailureKind::Rejected,
+        "that is enough of this robot",
+    )
+    .await?;
     let _ = harness.shutdown().await;
     Ok(())
 }
@@ -511,8 +573,11 @@ async fn a_refused_robot_serves_no_readiness() -> peppygen::Result<()> {
     let mut simulation = simulation_of(&mut mocks);
     let goal = simulation.attach.next_goal(WIRE).await?;
     assert_eq!(goal.request.model, "openarm_v1");
-    goal.reject(Some("robot 'other' stands within 1.5 m"), None)
-        .await?;
+    goal.refuse(
+        attach::FailureKind::PreconditionFailed,
+        "robot 'other' stands within 1.5 m",
+    )
+    .await?;
 
     // Setup fails, so the readiness service never starts.
     await_setup_return(&harness).await;
@@ -520,14 +585,16 @@ async fn a_refused_robot_serves_no_readiness() -> peppygen::Result<()> {
         robot_is_ready::poll(&harness, UNSERVED).await.is_err(),
         "a refused robot serves no readiness"
     );
-    // The node's failure carries the engine's reason.
+    // The node's failure carries the engine's failure kind and reason.
     let failure = harness
         .shutdown()
         .await
         .expect_err("a refused robot fails to start")
         .to_string();
     assert!(
-        failure.contains("the simulation refused this robot: robot 'other' stands within 1.5 m"),
+        failure.contains(
+            "the simulation refused this robot: precondition_failed: robot 'other' stands within 1.5 m"
+        ),
         "{failure}"
     );
     Ok(())

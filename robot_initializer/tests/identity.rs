@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use peppygen::fixtures::exposed_services::robot_identity::get_identity;
 use peppygen::fixtures::harness::Harness;
+use peppygen::mock::deps::simulation::attach;
 
 mod common;
 use common::{
@@ -65,8 +66,11 @@ async fn a_robot_joins_the_scene_under_the_name_it_answers() -> peppygen::Result
     assert_eq!(identity.model, "openarm_v1");
     assert_eq!(identity.core_node, core_node_of(&harness));
 
-    goal.reject(Some("that is enough of this robot"), None)
-        .await?;
+    goal.refuse(
+        attach::FailureKind::Rejected,
+        "that is enough of this robot",
+    )
+    .await?;
     let _ = harness.shutdown().await;
     Ok(())
 }
