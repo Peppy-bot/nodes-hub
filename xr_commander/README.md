@@ -106,10 +106,13 @@ with it disabled); the robot view is whatever camera you bind.
 - **Face buttons** (left controller): the chosen robot's dataset recorder.
   **X** starts an episode under the current task label; the next press stops
   and saves it, and the panel row shows `saving...` until the recorder's
-  result lands. Holding **Y** for a second finishes the session: the dataset
-  finalizes and a fresh one opens in place. If the robot changes during an
-  episode, the episode keeps its row and X still stops it. With no episode
-  in flight, the buttons do nothing while the chosen robot has no recorder.
+  result lands. The row then shows `saved episode <n>`, with the count of
+  video frames missing when the videos of the episode miss frames: do not
+  train on such an episode. Holding **Y** for a second finishes the session:
+  the dataset finalizes and a fresh one opens in place. If the robot changes
+  during an episode, the episode keeps its row and X still stops it. With no
+  episode in flight, the buttons do nothing while the chosen robot has no
+  recorder.
 - **Changing the robot**: choosing another robot releases both hands. The previous robot stops where it is, and the next squeeze engages the new one. A grip held through the change drives nothing until it is released; the status panel says so.
 
 The mapping assumes you share the robot's facing (natural once your view is

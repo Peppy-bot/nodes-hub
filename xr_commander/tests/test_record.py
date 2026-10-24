@@ -25,7 +25,7 @@ from xr_commander.devices import HandSample, XrFrame
 
 # The result of an ordinary stop-and-save.
 SAVED = record_episode.ResultResponseData(
-    episode_index=0, frames_recorded=7, discarded=False
+    episode_index=0, frames_recorded=7, video_frames_missing=0
 )
 
 
@@ -437,6 +437,27 @@ async def test_an_episode_the_recorder_ends_itself_notes_the_save_and_logs_the_c
     assert "episode 0 saved, 7 frames: link backbone_inst/arm stale (0.30s behind)" in (
         capsys.readouterr().out
     )
+
+
+async def test_a_saved_episode_whose_videos_miss_frames_says_so(capsys):
+    """The videos of the episode miss frames: the note and the log give the
+    count, and the log says not to train on the episode."""
+    async with boot_recording() as h:
+        status = record.RecorderStatus()
+        handle, active = await _fired_episode(h)
+        watcher = asyncio.create_task(record._watch_episode(handle, status))
+        await active.complete_cancelled(
+            "link backbone_inst/arm stale (0.30s behind)",
+            record_episode.ResultResponseData(
+                episode_index=2, frames_recorded=7, video_frames_missing=3
+            ),
+        )
+        await asyncio.wait_for(watcher, 10.0)
+        assert status.note() == "saved episode 2, 3 video frame(s) missing"
+    assert (
+        "episode 2 saved, 7 frames: link backbone_inst/arm stale (0.30s behind); "
+        "3 video frame(s) missing, do not train on it"
+    ) in capsys.readouterr().out
 
 
 class SpyStatus(record.RecorderStatus):

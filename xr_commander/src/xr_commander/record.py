@@ -287,15 +287,20 @@ async def _watch_episode(
         elif data is None:
             log(f"record_episode {result.status.name.lower()}")
             status.set_note(f"episode {result.status.name.lower()}")
-        elif data.discarded:
-            log(f"episode discarded: {result.cancel_reason}")
-            status.set_note("episode discarded")
         else:
             ended = f": {result.cancel_reason}" if result.cancel_reason else ""
-            log(
+            saved = (
                 f"episode {data.episode_index} saved, "
                 f"{data.frames_recorded} frames{ended}"
             )
-            status.set_note(f"saved episode {data.episode_index}")
+            note = f"saved episode {data.episode_index}"
+            # A video that misses frames does not line up with the state
+            # rows: the operator must know before training on the episode.
+            if data.video_frames_missing > 0:
+                missing = f"{data.video_frames_missing} video frame(s) missing"
+                saved += f"; {missing}, do not train on it"
+                note += f", {missing}"
+            log(saved)
+            status.set_note(note)
     finally:
         status.recording, status.frames, status.saving = False, 0, False
