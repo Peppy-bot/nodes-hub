@@ -6,12 +6,14 @@
 //! ingestion. video_stream_info answers from the simulation's latest stream
 //! description. Of the camera_geometry services, get_color_intrinsics answers
 //! from the simulation's latest geometry, the stream's pinhole model relayed
-//! as it came, and refuses until the first arrives; the two depth services
-//! always refuse, a colour camera having no depth stream. The camera
+//! as it came, and gives an error reply of the kind `precondition_failed`
+//! until the first arrives; the two depth services always give one of the
+//! kind `rejected`, a colour camera having no depth stream. The camera
 //! controls, the profile and the reset forward to the simulation's camera
 //! response model on the optional control slot, named by this relay's name in
 //! its copy (its instance id without the copy's prefix), and answer what the
-//! model answers; with the slot vacant every one of them refuses.
+//! model answers, its error replies with their kinds; with the slot vacant
+//! every one of them gives an error reply of the kind `rejected`.
 
 #![forbid(unsafe_code)]
 

@@ -7,11 +7,13 @@
 //! The stream-info services answer from the simulation's latest descriptions.
 //! The camera_geometry services answer from the simulation's latest geometry,
 //! the pinhole model of each stream and the depth stream's pose against the
-//! colour one, relayed as it came; until the first arrives they refuse.
-//! The colour controls, the profile and the reset forward to the simulation's
-//! camera response model on the optional control slot, named by this relay's
-//! name in its copy (its instance id without the copy's prefix), and answer
-//! what the model answers; with the slot vacant every one of them refuses.
+//! colour one, relayed as it came; until the first arrives they give an error
+//! reply of the kind `precondition_failed`. The colour controls, the profile
+//! and the reset forward to the simulation's camera response model on the
+//! optional control slot, named by this relay's name in its copy (its
+//! instance id without the copy's prefix), and answer what the model answers,
+//! its error replies with their kinds; with the slot vacant every one of them
+//! gives an error reply of the kind `rejected`.
 
 #![forbid(unsafe_code)]
 

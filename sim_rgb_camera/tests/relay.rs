@@ -29,12 +29,9 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 /// coming off is covered by the node's own tests.
 const CAMERA: &str = "wrist_left";
 
-/// A refused control answers with the no-value sentinel rather than inventing
-/// a reading, matching what the uvc and zed nodes answer.
-const NO_CURRENT_VALUE: i32 = -1;
-
-/// The refusal the node answers on every control while the control slot is
-/// vacant, verbatim: a caller reads it to learn there is no model to adjust.
+/// The message of the error reply the node gives on every control while the
+/// control slot is vacant, verbatim: a caller reads it to learn there is no
+/// model to adjust.
 const NO_RESPONSE_MODEL_MESSAGE: &str =
     "no camera response model is linked: nothing to adjust, describe or reset";
 
@@ -43,12 +40,14 @@ const NO_RESPONSE_MODEL_MESSAGE: &str =
 const PROFILE_JSON: &str =
     r#"{"device":"sim","label":"Sim color camera","encoding":"rgb8","controls":{}}"#;
 
-/// The refusal get_color_intrinsics answers before the simulation's first
-/// geometry, verbatim: a consumer reads it to learn it is early, not broken.
+/// The message of the error reply get_color_intrinsics gives before the
+/// simulation's first geometry, verbatim: a consumer reads it to learn it is
+/// early, not broken.
 const NO_GEOMETRY_MESSAGE: &str = "no camera geometry received from the simulation yet";
 
-/// The refusal the two depth services always answer, verbatim: a consumer
-/// reads it to learn this camera will never have a depth stream.
+/// The message of the error reply the two depth services always give,
+/// verbatim: a consumer reads it to learn this camera will never have a depth
+/// stream.
 const NO_DEPTH_STREAM_MESSAGE: &str = "a colour camera has no depth stream";
 
 /// Width carried only by the geometries a test expects to be rejected, so
@@ -76,15 +75,23 @@ fn geometry() -> simulation_geometry::Message {
 
 /// Polls get_color_intrinsics until `ready` accepts the response: the
 /// geometry arrives on its own leg, so one round trip does not order the two.
+/// The error reply of a relay that has no geometry yet is polled again.
 async fn color_intrinsics_once(
     harness: &Harness,
     ready: impl Fn(&get_color_intrinsics::Response) -> bool,
 ) -> peppygen::Result<get_color_intrinsics::Response> {
     let deadline = tokio::time::Instant::now() + TIMEOUT;
     loop {
-        let response = get_color_intrinsics::poll(harness, TIMEOUT).await?;
-        if ready(&response) {
-            return Ok(response);
+        match get_color_intrinsics::poll(harness, TIMEOUT).await {
+            Ok(response) if ready(&response) => return Ok(response),
+            Ok(_) => {}
+            Err(error) => {
+                let early = get_color_intrinsics::Failure::of(&error)
+                    .is_some_and(|failure| failure.message == NO_GEOMETRY_MESSAGE);
+                if !early {
+                    return Err(error);
+                }
+            }
         }
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -210,25 +217,26 @@ async fn every_control_refuses_without_a_response_model() -> peppygen::Result<()
     );
 
     // The contract requires these services to exist, and with no model linked
-    // there is nothing behind them. Refusing is the honest answer; answering
-    // success would tell a caller its adjustment took effect. The message
-    // names the cause verbatim, so a caller can tell this apart from a model
+    // there is nothing behind them. An error reply is the honest answer; a
+    // response would tell a caller its adjustment took effect. Its kind is
+    // the one a model gives for a control it does not model, and its message
+    // names the cause verbatim, so a caller can tell it apart from a model
     // that refused a value.
-    // The reading field is named for what the control adjusts, so the caller
-    // names it: white balance reports a temperature where the rest report a
-    // value.
     macro_rules! assert_refuses {
-        ($service:ident, $request:expr, $reading:ident) => {{
-            let response = $service::poll(&harness, &$request, TIMEOUT).await?;
-            assert!(
-                !response.success,
-                concat!(
+        ($service:ident, $request:expr) => {{
+            let error = $service::poll(&harness, &$request, TIMEOUT)
+                .await
+                .expect_err(concat!(
                     stringify!($service),
-                    " must refuse without a response model"
-                )
+                    " must give an error reply without a response model"
+                ));
+            assert_eq!(
+                $service::Failure::of(&error),
+                Some($service::Failure::new(
+                    $service::FailureKind::Rejected,
+                    NO_RESPONSE_MODEL_MESSAGE
+                ))
             );
-            assert_eq!(response.message, NO_RESPONSE_MODEL_MESSAGE);
-            assert_eq!(response.$reading, NO_CURRENT_VALUE);
         }};
     }
 
@@ -237,44 +245,41 @@ async fn every_control_refuses_without_a_response_model() -> peppygen::Result<()
         set_exposure::RequestData {
             mode: "manual".to_string(),
             value: 100,
-        },
-        current_value
+        }
     );
     assert_refuses!(
         set_white_balance,
         set_white_balance::RequestData {
             mode: "manual".to_string(),
             temperature: 4000,
-        },
-        current_temperature
+        }
     );
-    assert_refuses!(set_gain, set_gain::RequestData { value: 10 }, current_value);
-    assert_refuses!(
-        set_brightness,
-        set_brightness::RequestData { value: 10 },
-        current_value
-    );
-    assert_refuses!(
-        set_contrast,
-        set_contrast::RequestData { value: 10 },
-        current_value
-    );
+    assert_refuses!(set_gain, set_gain::RequestData { value: 10 });
+    assert_refuses!(set_brightness, set_brightness::RequestData { value: 10 });
+    assert_refuses!(set_contrast, set_contrast::RequestData { value: 10 });
 
     // The profile is the model's description of the device, so without a
-    // model there is none: the answer says so and carries no JSON a caller
-    // could mistake for one.
-    let profile = get_camera_profile::poll(&harness, TIMEOUT).await?;
-    assert!(!profile.success);
-    assert!(
-        profile
-            .message
-            .contains("no camera response model is linked")
+    // model there is none, and nothing to reset either.
+    let profile = get_camera_profile::poll(&harness, TIMEOUT)
+        .await
+        .expect_err("no profile without a response model");
+    assert_eq!(
+        get_camera_profile::Failure::of(&profile),
+        Some(get_camera_profile::Failure::new(
+            get_camera_profile::FailureKind::Rejected,
+            NO_RESPONSE_MODEL_MESSAGE
+        ))
     );
-    assert!(profile.profile_json.is_empty());
-
-    let reset = reset_camera::poll(&harness, TIMEOUT).await?;
-    assert!(!reset.success);
-    assert!(reset.message.contains("no camera response model is linked"));
+    let reset = reset_camera::poll(&harness, TIMEOUT)
+        .await
+        .expect_err("no reset without a response model");
+    assert_eq!(
+        reset_camera::Failure::of(&reset),
+        Some(reset_camera::Failure::new(
+            reset_camera::FailureKind::Rejected,
+            NO_RESPONSE_MODEL_MESSAGE
+        ))
+    );
 
     harness.shutdown().await
 }
@@ -298,19 +303,14 @@ async fn every_control_forwards_to_the_response_model_under_the_camera_name() ->
 
     // Each control goes to its twin on the model with the request's own
     // fields under the camera's name, and the model's answer comes back
-    // verbatim: a relay that rewrote the message or the reading would hide
-    // what the device model decided. The scripted answers are served by the
+    // verbatim: a relay that rewrote the reading would hide what the device
+    // model decided. The scripted answers are served by the
     // mock as the requests arrive, and every request is captured before its
     // answer leaves, so the capture is complete once the poll returns.
     macro_rules! assert_forwards {
         ($service:ident, $twin:ident, $request:expr, $answer:expr, $reading:ident, $expect:expr) => {{
             control.$twin.enqueue_response($answer)?;
             let response = $service::poll(&harness, &$request, TIMEOUT).await?;
-            assert!(
-                response.success,
-                concat!(stringify!($service), " must relay the model's success")
-            );
-            assert_eq!(response.message, $answer.message);
             assert_eq!(response.$reading, $answer.$reading);
             let captured = control.$twin.captured()?;
             assert_eq!(captured.len(), 1, stringify!($twin));
@@ -329,7 +329,7 @@ async fn every_control_forwards_to_the_response_model_under_the_camera_name() ->
             mode: "manual".to_string(),
             value: 250,
         },
-        control_mock::set_camera_exposure::ResponseData::new(true, "exposure set".to_string(), 250),
+        control_mock::set_camera_exposure::ResponseData::new(250),
         current_value,
         |request: &control_mock::set_camera_exposure::Request| {
             assert_eq!(request.mode, "manual");
@@ -343,11 +343,7 @@ async fn every_control_forwards_to_the_response_model_under_the_camera_name() ->
             mode: "auto".to_string(),
             temperature: 0,
         },
-        control_mock::set_camera_white_balance::ResponseData::new(
-            true,
-            "white balance auto".to_string(),
-            4600
-        ),
+        control_mock::set_camera_white_balance::ResponseData::new(4600),
         current_temperature,
         |request: &control_mock::set_camera_white_balance::Request| {
             assert_eq!(request.mode, "auto");
@@ -358,7 +354,7 @@ async fn every_control_forwards_to_the_response_model_under_the_camera_name() ->
         set_gain,
         set_camera_gain,
         set_gain::RequestData { value: 12 },
-        control_mock::set_camera_gain::ResponseData::new(true, "gain set".to_string(), 12),
+        control_mock::set_camera_gain::ResponseData::new(12),
         current_value,
         |request: &control_mock::set_camera_gain::Request| assert_eq!(request.value, 12)
     );
@@ -366,11 +362,7 @@ async fn every_control_forwards_to_the_response_model_under_the_camera_name() ->
         set_brightness,
         set_camera_brightness,
         set_brightness::RequestData { value: 64 },
-        control_mock::set_camera_brightness::ResponseData::new(
-            true,
-            "brightness set".to_string(),
-            64
-        ),
+        control_mock::set_camera_brightness::ResponseData::new(64),
         current_value,
         |request: &control_mock::set_camera_brightness::Request| assert_eq!(request.value, 64)
     );
@@ -378,7 +370,7 @@ async fn every_control_forwards_to_the_response_model_under_the_camera_name() ->
         set_contrast,
         set_camera_contrast,
         set_contrast::RequestData { value: 40 },
-        control_mock::set_camera_contrast::ResponseData::new(true, "contrast set".to_string(), 40),
+        control_mock::set_camera_contrast::ResponseData::new(40),
         current_value,
         |request: &control_mock::set_camera_contrast::Request| assert_eq!(request.value, 40)
     );
@@ -388,27 +380,16 @@ async fn every_control_forwards_to_the_response_model_under_the_camera_name() ->
     control
         .describe_camera
         .enqueue_response(control_mock::describe_camera::ResponseData::new(
-            true,
-            "described".to_string(),
             PROFILE_JSON.to_string(),
         ))?;
     let profile = get_camera_profile::poll(&harness, TIMEOUT).await?;
-    assert!(profile.success);
-    assert_eq!(profile.message, "described");
     assert_eq!(profile.profile_json, PROFILE_JSON);
     let described = control.describe_camera.captured()?;
     assert_eq!(described.len(), 1);
     assert_eq!(described[0].camera, CAMERA);
 
-    control
-        .reset_camera
-        .enqueue_response(control_mock::reset_camera::ResponseData::new(
-            true,
-            "defaults restored".to_string(),
-        ))?;
-    let reset = reset_camera::poll(&harness, TIMEOUT).await?;
-    assert!(reset.success);
-    assert_eq!(reset.message, "defaults restored");
+    control.reset_camera.enqueue_response()?;
+    reset_camera::poll(&harness, TIMEOUT).await?;
     let resets = control.reset_camera.captured()?;
     assert_eq!(resets.len(), 1);
     assert_eq!(resets[0].camera, CAMERA);
@@ -417,35 +398,8 @@ async fn every_control_forwards_to_the_response_model_under_the_camera_name() ->
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_refusal_from_the_response_model_passes_through_unchanged() -> peppygen::Result<()> {
-    let (harness, mocks) = Harness::start(sim_rgb_camera::setup).await?;
-    let control = mocks
-        .deps
-        .control
-        .as_ref()
-        .expect("the default boot binds the control slot");
-
-    // A model refusing a value answers false with the reading it kept. The
-    // relay must pass that through as is: substituting its own message or the
-    // no-value sentinel would hide both why the value was refused and what
-    // the camera is still set to.
-    let refusal = control_mock::set_camera_gain::ResponseData::new(
-        false,
-        "gain 9000 is above the device maximum of 255".to_string(),
-        128,
-    );
-    control.set_camera_gain.enqueue_response(refusal.clone())?;
-    let response =
-        set_gain::poll(&harness, &set_gain::RequestData { value: 9000 }, TIMEOUT).await?;
-    assert!(!response.success);
-    assert_eq!(response.message, refusal.message);
-    assert_eq!(response.current_value, 128);
-
-    harness.shutdown().await
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_response_model_failure_answers_a_refusal_with_the_error() -> peppygen::Result<()> {
+async fn an_error_reply_of_the_response_model_passes_on_with_its_kind_and_its_message()
+-> peppygen::Result<()> {
     let (harness, mocks) = Harness::start(sim_rgb_camera::setup).await?;
     let control = mocks
         .deps
@@ -454,26 +408,63 @@ async fn a_response_model_failure_answers_a_refusal_with_the_error() -> peppygen
         .expect("the default boot binds the control slot");
 
     // An unscripted request parks at the mock until the test answers it, so
-    // the relay's poll and the mock's failure run side by side: the poll
-    // returns only once the failure is delivered, and the relay must turn it
-    // into a refusal that carries the reason rather than an error of its own.
-    let (response, served) = tokio::join!(
-        set_contrast::poll(&harness, &set_contrast::RequestData { value: 40 }, TIMEOUT),
-        async {
-            let (request, responder) = control.set_camera_contrast.next_request(TIMEOUT).await?;
-            assert_eq!(request.camera, harness.instance_id());
-            responder.respond_error("device model crashed").await
-        }
-    );
+    // the relay's poll and the mock's error reply run side by side: the poll
+    // returns only once the reply is delivered. The relay passes the reply on
+    // as it is: a kind or a message of its own would hide why the model
+    // refused.
+    for kind in control_mock::set_camera_gain::FailureKind::ALL {
+        let message = format!("the device model gives {kind}");
+        let (relayed, served) = tokio::join!(
+            set_gain::poll(&harness, &set_gain::RequestData { value: 9000 }, TIMEOUT),
+            async {
+                let (request, responder) = control.set_camera_gain.next_request(TIMEOUT).await?;
+                assert_eq!(request.value, 9000);
+                responder.respond_failure(kind, message.clone()).await
+            }
+        );
+        served?;
+        let error = relayed.expect_err("the model gave an error reply");
+        let failure = set_gain::Failure::of(&error).expect("the relay gives an error reply");
+        assert_eq!(failure.kind.as_str(), kind.as_str());
+        assert_eq!(failure.message, message);
+    }
+
+    // The profile and the reset pass on the model's error replies the same
+    // way.
+    let (relayed, served) = tokio::join!(get_camera_profile::poll(&harness, TIMEOUT), async {
+        let (_, responder) = control.describe_camera.next_request(TIMEOUT).await?;
+        responder
+            .respond_failure(
+                control_mock::describe_camera::FailureKind::PreconditionFailed,
+                "the camera is not attached to its simulation yet",
+            )
+            .await
+    });
     served?;
-    let response = response?;
-    assert!(!response.success);
-    assert!(
-        response.message.contains("device model crashed"),
-        "the model's failure must reach the caller: {}",
-        response.message
+    assert_eq!(
+        get_camera_profile::Failure::of(&relayed.expect_err("the model gave an error reply")),
+        Some(get_camera_profile::Failure::new(
+            get_camera_profile::FailureKind::PreconditionFailed,
+            "the camera is not attached to its simulation yet"
+        ))
     );
-    assert_eq!(response.current_value, NO_CURRENT_VALUE);
+    let (relayed, served) = tokio::join!(reset_camera::poll(&harness, TIMEOUT), async {
+        let (_, responder) = control.reset_camera.next_request(TIMEOUT).await?;
+        responder
+            .respond_failure(
+                control_mock::reset_camera::FailureKind::ResourceUnavailable,
+                "the robot of this camera is gone",
+            )
+            .await
+    });
+    served?;
+    assert_eq!(
+        reset_camera::Failure::of(&relayed.expect_err("the model gave an error reply")),
+        Some(reset_camera::Failure::new(
+            reset_camera::FailureKind::ResourceUnavailable,
+            "the robot of this camera is gone"
+        ))
+    );
 
     harness.shutdown().await
 }
@@ -483,12 +474,18 @@ async fn color_intrinsics_answer_from_the_simulation_geometry() -> peppygen::Res
     let (harness, mocks) = Harness::start(sim_rgb_camera::setup).await?;
 
     // Before the simulation says where the pixels point there is no model to
-    // hand over. Zeros under success would have a consumer divide by a focal
-    // length of zero, so the service refuses and says why.
-    let early = get_color_intrinsics::poll(&harness, TIMEOUT).await?;
-    assert!(!early.success);
-    assert_eq!(early.message, NO_GEOMETRY_MESSAGE);
-    assert_eq!(early.fx, 0.0);
+    // hand over. Zeros in a response would have a consumer divide by a focal
+    // length of zero, so the service gives an error reply and says why.
+    let early = get_color_intrinsics::poll(&harness, TIMEOUT)
+        .await
+        .expect_err("no geometry before the simulation's first");
+    assert_eq!(
+        get_color_intrinsics::Failure::of(&early),
+        Some(get_color_intrinsics::Failure::new(
+            get_color_intrinsics::FailureKind::PreconditionFailed,
+            NO_GEOMETRY_MESSAGE
+        ))
+    );
 
     mocks
         .pairings
@@ -497,7 +494,7 @@ async fn color_intrinsics_answer_from_the_simulation_geometry() -> peppygen::Res
         .publish(&geometry())
         .await?;
 
-    let color = color_intrinsics_once(&harness, |r| r.success).await?;
+    let color = color_intrinsics_once(&harness, |_| true).await?;
     assert_eq!((color.width, color.height), (960, 600));
     assert_eq!((color.fx, color.fy), (461.9595, 461.9595));
     assert_eq!((color.cx, color.cy), (479.5, 299.5));
@@ -512,21 +509,33 @@ async fn the_depth_services_refuse_on_a_colour_camera() -> peppygen::Result<()> 
     let (harness, mocks) = Harness::start(sim_rgb_camera::setup).await?;
 
     // camera_geometry asks every implementer for the two depth services, and
-    // a colour camera has nothing behind them. The refusal names that cause,
-    // so a consumer can tell it apart from a geometry that is merely late:
-    // it is the same before the geometry arrives and after.
+    // a colour camera has nothing behind them. The error reply is `rejected`
+    // and names that cause, so a consumer can tell it apart from a geometry
+    // that is merely late: it is the same before the geometry arrives and
+    // after.
     macro_rules! assert_no_depth_stream {
         () => {{
-            let depth = get_depth_intrinsics::poll(&harness, TIMEOUT).await?;
-            assert!(!depth.success);
-            assert_eq!(depth.message, NO_DEPTH_STREAM_MESSAGE);
-            assert_eq!((depth.width, depth.height), (0, 0));
-            assert!(depth.depth_model.is_empty());
+            let depth = get_depth_intrinsics::poll(&harness, TIMEOUT)
+                .await
+                .expect_err("a colour camera has no depth intrinsics");
+            assert_eq!(
+                get_depth_intrinsics::Failure::of(&depth),
+                Some(get_depth_intrinsics::Failure::new(
+                    get_depth_intrinsics::FailureKind::Rejected,
+                    NO_DEPTH_STREAM_MESSAGE
+                ))
+            );
 
-            let pose = get_depth_to_color_extrinsics::poll(&harness, TIMEOUT).await?;
-            assert!(!pose.success);
-            assert_eq!(pose.message, NO_DEPTH_STREAM_MESSAGE);
-            assert_eq!(pose.depth_to_color_orientation, [0.0; 4]);
+            let pose = get_depth_to_color_extrinsics::poll(&harness, TIMEOUT)
+                .await
+                .expect_err("a colour camera has no depth-to-colour pose");
+            assert_eq!(
+                get_depth_to_color_extrinsics::Failure::of(&pose),
+                Some(get_depth_to_color_extrinsics::Failure::new(
+                    get_depth_to_color_extrinsics::FailureKind::Rejected,
+                    NO_DEPTH_STREAM_MESSAGE
+                ))
+            );
         }};
     }
 
@@ -537,7 +546,7 @@ async fn the_depth_services_refuse_on_a_colour_camera() -> peppygen::Result<()> 
         .geometry
         .publish(&geometry())
         .await?;
-    color_intrinsics_once(&harness, |r| r.success).await?;
+    color_intrinsics_once(&harness, |_| true).await?;
     assert_no_depth_stream!();
 
     harness.shutdown().await
@@ -555,7 +564,7 @@ async fn an_unusable_geometry_is_ignored() -> peppygen::Result<()> {
         .geometry
         .publish(&geometry())
         .await?;
-    color_intrinsics_once(&harness, |r| r.success).await?;
+    color_intrinsics_once(&harness, |_| true).await?;
 
     // A consumer divides by the focal lengths, so a model without usable ones
     // is ignored whole; each bad one carries a width the good one does not,
@@ -578,7 +587,6 @@ async fn an_unusable_geometry_is_ignored() -> peppygen::Result<()> {
     // after the settle is what the rejections left it.
     tokio::time::sleep(REJECTION_SETTLE).await;
     let after = get_color_intrinsics::poll(&harness, TIMEOUT).await?;
-    assert!(after.success);
     assert_ne!(
         after.width, REJECTED_WIDTH,
         "an unusable geometry was adopted"

@@ -49,29 +49,22 @@ const RECEIVE_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Bounds every call forwarded to the simulation's camera response model. A
 /// control is one round trip through the simulation's device model, so an
-/// answer later than this means the model is gone, and the caller gets a
-/// refusal carrying the timeout rather than a service that hangs.
+/// answer later than this means the model is gone, and the caller gets an
+/// error reply of the kind `timeout` rather than a service that hangs.
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The refusal every forwarded call (a control, the profile, the reset)
-/// answers while the control slot is vacant: the launch linked this relay
-/// to a simulation without a camera response model, so there is nothing
-/// behind the controls to adjust, describe or reset.
+/// The message of the error reply every forwarded call (a control, the
+/// profile, the reset) gets while the control slot is vacant: the launch
+/// linked this relay to a simulation without a camera response model, so
+/// there is nothing behind the controls to adjust, describe or reset.
 const NO_RESPONSE_MODEL_MESSAGE: &str =
     "no camera response model is linked: nothing to adjust, describe or reset";
 
-/// current_value in a refused control response: the no-value sentinel uvc and
-/// zed answer when no usable hardware value exists.
-const NO_CURRENT_VALUE: i32 = -1;
-
-/// The refusal every geometry service answers until the simulation's first
-/// geometry arrives. The relay has no camera model of its own, and zeros
-/// handed over as a pinhole model would have a consumer divide by them.
+/// The message of the error reply every geometry service gives until the
+/// simulation's first geometry arrives. The relay has no camera model of its
+/// own, and zeros handed over as a pinhole model would have a consumer divide
+/// by them.
 const NO_GEOMETRY_MESSAGE: &str = "no camera geometry received from the simulation yet";
-
-/// What a geometry service says beside the numbers it hands over: they are
-/// the simulation's, relayed as they came.
-const GEOMETRY_MESSAGE: &str = "geometry as published by the simulation";
 
 /// How far from 1 the length of the depth-to-colour quaternion may be. A
 /// quaternion that is not of unit length scales every point it turns.
@@ -160,101 +153,50 @@ fn unusable_part(geometry: &simulation_geometry::Message) -> Option<&'static str
 }
 
 /// get_color_intrinsics: the colour stream's pinhole model as the simulation
-/// published it, or the refusal while no geometry has arrived.
-fn color_intrinsics(
-    geometry: Option<simulation_geometry::Message>,
-) -> get_color_intrinsics::Response {
-    match geometry {
-        Some(g) => get_color_intrinsics::Response::new(
-            true,
-            GEOMETRY_MESSAGE.to_string(),
-            g.width,
-            g.height,
-            g.fx,
-            g.fy,
-            g.cx,
-            g.cy,
-            g.distortion_model,
-            g.distortion,
-        ),
-        None => get_color_intrinsics::Response::new(
-            false,
-            NO_GEOMETRY_MESSAGE.to_string(),
-            0,
-            0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            String::new(),
-            Vec::new(),
-        ),
-    }
+/// published it.
+fn color_intrinsics(g: simulation_geometry::Message) -> get_color_intrinsics::Response {
+    get_color_intrinsics::Response::new(
+        g.width,
+        g.height,
+        g.fx,
+        g.fy,
+        g.cx,
+        g.cy,
+        g.distortion_model,
+        g.distortion,
+    )
 }
 
 /// get_depth_intrinsics: the depth stream's own pinhole model, what its
 /// samples measure and the alignment the answer holds under.
-fn depth_intrinsics(
-    geometry: Option<simulation_geometry::Message>,
-) -> get_depth_intrinsics::Response {
-    match geometry {
-        Some(g) => get_depth_intrinsics::Response::new(
-            true,
-            GEOMETRY_MESSAGE.to_string(),
-            g.depth_width,
-            g.depth_height,
-            g.depth_fx,
-            g.depth_fy,
-            g.depth_cx,
-            g.depth_cy,
-            g.depth_distortion_model,
-            g.depth_distortion,
-            g.depth_model,
-            g.min_depth_m,
-            g.max_depth_m,
-            g.align_mode,
-        ),
-        None => get_depth_intrinsics::Response::new(
-            false,
-            NO_GEOMETRY_MESSAGE.to_string(),
-            0,
-            0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            String::new(),
-            Vec::new(),
-            String::new(),
-            0.0,
-            0.0,
-            String::new(),
-        ),
-    }
+fn depth_intrinsics(g: simulation_geometry::Message) -> get_depth_intrinsics::Response {
+    get_depth_intrinsics::Response::new(
+        g.depth_width,
+        g.depth_height,
+        g.depth_fx,
+        g.depth_fy,
+        g.depth_cx,
+        g.depth_cy,
+        g.depth_distortion_model,
+        g.depth_distortion,
+        g.depth_model,
+        g.min_depth_m,
+        g.max_depth_m,
+        g.align_mode,
+    )
 }
 
 /// get_depth_to_color_extrinsics: where the depth optical frame sits in the
 /// colour one, under the same alignment get_depth_intrinsics names. Both
 /// answers come from the one geometry message, so they always agree.
 fn depth_to_color_extrinsics(
-    geometry: Option<simulation_geometry::Message>,
+    g: simulation_geometry::Message,
 ) -> get_depth_to_color_extrinsics::Response {
-    match geometry {
-        Some(g) => get_depth_to_color_extrinsics::Response::new(
-            true,
-            GEOMETRY_MESSAGE.to_string(),
-            g.align_mode,
-            g.depth_to_color_position,
-            g.depth_to_color_orientation,
-        ),
-        None => get_depth_to_color_extrinsics::Response::new(
-            false,
-            NO_GEOMETRY_MESSAGE.to_string(),
-            String::new(),
-            [0.0; 3],
-            [0.0; 4],
-        ),
-    }
+    get_depth_to_color_extrinsics::Response::new(
+        g.align_mode,
+        g.depth_to_color_position,
+        g.depth_to_color_orientation,
+    )
 }
 
 /// Logs the first error of a run and suppresses the rest until something
@@ -282,10 +224,96 @@ impl RepeatedError {
     }
 }
 
-/// The outcome of routing one call to the simulation's camera response
-/// model: the model's answer, relayed verbatim, or the message the caller
-/// gets for why the call never reached a model.
-type Forwarded<T> = std::result::Result<T, String>;
+/// Why a forwarded call has no answer of the simulation's camera response
+/// model. Each cause gives the caller an error reply of its own kind, which
+/// `relayed_failure!` names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Unanswered {
+    /// The model gave an error reply. Its kind, by its wire name, and its
+    /// message pass on as they came.
+    Refused { kind: &'static str, message: String },
+    /// No model is linked: the control slot is vacant.
+    NoModel,
+    /// This relay's instance id names no camera.
+    NoCamera(String),
+    /// The model gave no answer within [`CONTROL_TIMEOUT`].
+    TimedOut(String),
+    /// No model answers on the control slot.
+    Unreachable(String),
+    /// The call failed in another way, such as a request or an answer that
+    /// does not encode or decode.
+    Broken(String),
+}
+
+impl Unanswered {
+    /// Why a poll of the model failed with `error`. `refusal` is the error
+    /// reply of the model that `error` holds, read by the member the poll
+    /// went to, or `None` when `error` is no error reply.
+    fn of(error: &peppygen::Error, refusal: Option<(&'static str, String)>) -> Self {
+        if let Some((kind, message)) = refusal {
+            return Self::Refused { kind, message };
+        }
+        let message =
+            format!("forwarding to the simulation's camera response model failed: {error}");
+        match error {
+            peppygen::Error::ServiceTimeout { .. } => Self::TimedOut(message),
+            peppygen::Error::ServiceUnreachable { .. } => Self::Unreachable(message),
+            _ => Self::Broken(message),
+        }
+    }
+
+    /// Whether the call failed on its way to the model or back. An error
+    /// reply is an answer of the model, and a vacant slot or a relay that
+    /// names no camera is fixed for the life of the node.
+    fn in_transport(&self) -> bool {
+        matches!(
+            self,
+            Self::TimedOut(_) | Self::Unreachable(_) | Self::Broken(_)
+        )
+    }
+}
+
+/// The error reply of the exposed member `$service` for a forwarded call
+/// that has no answer, `$unanswered`. An error reply of the model passes on
+/// with its kind and its message: the members of sim_camera_control and the
+/// members this relay exposes declare the kinds of peppy alone, so a kind of
+/// the one is a kind of the other. A vacant control slot gives `rejected`,
+/// as a model gives for a control it does not model; a relay that names no
+/// camera gives `precondition_failed`; a model that does not answer in time
+/// gives `timeout`; a model that is not there gives `resource_unavailable`;
+/// any other failure gives `attempt_failed`.
+macro_rules! relayed_failure {
+    ($service:ident, $unanswered:expr) => {
+        match $unanswered {
+            Unanswered::Refused { kind, message } => match $service::FailureKind::parse(kind) {
+                Some(kind) => $service::Failure::new(kind, message),
+                None => $service::Failure::new(
+                    $service::FailureKind::AttemptFailed,
+                    format!(
+                        "the simulation's camera response model gave the failure kind `{kind}`, which {} does not declare: {message}",
+                        stringify!($service)
+                    ),
+                ),
+            },
+            Unanswered::NoModel => $service::Failure::new(
+                $service::FailureKind::Rejected,
+                NO_RESPONSE_MODEL_MESSAGE,
+            ),
+            Unanswered::NoCamera(message) => {
+                $service::Failure::new($service::FailureKind::PreconditionFailed, message)
+            }
+            Unanswered::TimedOut(message) => {
+                $service::Failure::new($service::FailureKind::Timeout, message)
+            }
+            Unanswered::Unreachable(message) => {
+                $service::Failure::new($service::FailureKind::ResourceUnavailable, message)
+            }
+            Unanswered::Broken(message) => {
+                $service::Failure::new($service::FailureKind::AttemptFailed, message)
+            }
+        }
+    };
+}
 
 /// The camera this relay is, as the simulation names it: the relay's name
 /// in its copy. A launch mints a copy's instance ids as `<copy>_<id>`, so
@@ -294,8 +322,8 @@ type Forwarded<T> = std::result::Result<T, String>;
 /// is the camera's name as it is. The simulation's slot holds a pair per
 /// camera of its kind, so the slot says nothing of which camera a pair is;
 /// the relay's requests name no robot, which the simulation tells by the
-/// pair the relay holds.
-fn camera_name(copy: Option<&str>, instance_id: &str) -> Forwarded<String> {
+/// pair the relay holds. `Err` says why the id names no camera.
+fn camera_name(copy: Option<&str>, instance_id: &str) -> std::result::Result<String, String> {
     let Some(copy) = copy else {
         return Ok(instance_id.to_owned());
     };
@@ -328,10 +356,10 @@ struct ControlRoute {
     runner: Arc<NodeRunner>,
     /// The camera every forwarded request names, worked out once: the copy
     /// and the instance id are fixed for the life of the node.
-    camera: Forwarded<String>,
+    camera: std::result::Result<String, String>,
     /// Whether the last forwarded call failed in transport. The first failure
-    /// is logged and the rest are suppressed until a call goes through: a
-    /// caller retrying against a simulation that is gone would otherwise
+    /// is logged and the rest are suppressed until a call reaches the model:
+    /// a caller retrying against a simulation that is gone would otherwise
     /// write a line per attempt.
     transport_failing: AtomicBool,
 }
@@ -348,41 +376,50 @@ impl ControlRoute {
 
     /// Forwards one call. `bound` is the control slot's producer, `call`
     /// polls the response model for this relay's camera on it, and the
-    /// model's answer relays verbatim. Every way the call cannot reach the
-    /// model is an `Err` carrying the caller's message: the vacant slot
-    /// first, then a relay whose id names no camera, both fixed for the life
-    /// of the node; then the transport. The pairing is no condition here:
-    /// the model tells the relay's robot by the pair the relay holds, so a
-    /// relay holding none gets the model's own refusal, relayed like any
-    /// other answer.
+    /// model's answer relays verbatim. `refusal_of` reads the model's error
+    /// reply in the error of a poll that failed: its kind, by its wire name,
+    /// and its message. Every way the call gets no answer is an `Err` that
+    /// says why: the vacant slot first, then a relay whose id names no
+    /// camera, both fixed for the life of the node; then the model's error
+    /// reply or the transport. The pairing is no condition here: the model
+    /// tells the relay's robot by the pair the relay holds, so a relay
+    /// holding none gets the model's own error reply, relayed like any other.
     fn forward<T, Fut>(
         &self,
         bound: Option<&ProducerRef>,
         call: impl FnOnce(String, ProducerRef) -> Fut,
-    ) -> Forwarded<T>
+        refusal_of: impl FnOnce(&peppygen::Error) -> Option<(&'static str, String)>,
+    ) -> std::result::Result<T, Unanswered>
     where
         Fut: Future<Output = Result<T>>,
     {
         let Some(target) = bound else {
-            return Err(NO_RESPONSE_MODEL_MESSAGE.to_string());
+            return Err(Unanswered::NoModel);
         };
-        let camera = self.camera.clone()?;
+        let camera = self.camera.clone().map_err(Unanswered::NoCamera)?;
         match wait_for(call(camera, target.clone())) {
             Ok(answer) => {
                 self.transport_failing.store(false, Ordering::SeqCst);
                 Ok(answer)
             }
-            Err(e) => {
-                if !self.transport_failing.swap(true, Ordering::SeqCst) {
-                    warn!(
-                        "forwarding to the camera response model failing, suppressing repeats: {e}"
-                    );
-                }
-                Err(format!(
-                    "forwarding to the simulation's camera response model failed: {e}"
-                ))
-            }
+            Err(error) => Err(self.unanswered(&error, refusal_of(&error))),
         }
+    }
+
+    /// Why a poll failed with `error`, logging the first of a run of
+    /// failures in transport.
+    fn unanswered(
+        &self,
+        error: &peppygen::Error,
+        refusal: Option<(&'static str, String)>,
+    ) -> Unanswered {
+        let unanswered = Unanswered::of(error, refusal);
+        if !unanswered.in_transport() {
+            self.transport_failing.store(false, Ordering::SeqCst);
+        } else if !self.transport_failing.swap(true, Ordering::SeqCst) {
+            warn!("forwarding to the camera response model failing, suppressing repeats: {error}");
+        }
+        unanswered
     }
 }
 
@@ -574,7 +611,8 @@ async fn track_geometry(
 
 /// Answer one service from what the simulation last said: a stream-info
 /// service from the shared stream description, a geometry service from the
-/// shared geometry.
+/// shared geometry. `$respond` gives the response, or the failure of an error
+/// reply.
 macro_rules! spawn_info_service {
     ($runner:expr, $description:expr, $service:ident, $respond:expr) => {{
         let runner = $runner.clone();
@@ -590,7 +628,7 @@ macro_rules! spawn_info_service {
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner())
                             .clone();
-                        Ok($respond(d))
+                        $respond(d)
                     }) => result,
                 };
                 match result {
@@ -602,8 +640,25 @@ macro_rules! spawn_info_service {
     }};
 }
 
+/// Answer one geometry service with `$answer` from the simulation's latest
+/// geometry. A camera that has not heard from its simulation yet gives an
+/// error reply of the kind `precondition_failed`.
+macro_rules! spawn_geometry_service {
+    ($runner:expr, $geometry:expr, $service:ident, $answer:expr) => {
+        spawn_info_service!($runner, $geometry, $service, |geometry: Option<_>| {
+            geometry.map($answer).ok_or_else(|| {
+                $service::Failure::new(
+                    $service::FailureKind::PreconditionFailed,
+                    NO_GEOMETRY_MESSAGE,
+                )
+            })
+        })
+    };
+}
+
 /// One service whose every request routes through the control route:
-/// `$answer` maps the request to the response, forwarding inside.
+/// `$answer` maps the request to the response or the failure of an error
+/// reply, forwarding inside.
 macro_rules! spawn_forwarding_service {
     ($route:expr, $service:ident, $answer:expr) => {{
         let route: Arc<ControlRoute> = $route.clone();
@@ -615,7 +670,7 @@ macro_rules! spawn_forwarding_service {
                 let result = tokio::select! {
                     _ = cancel.cancelled() => break,
                     result = $service::handle_next_request(&runner, |request| {
-                        Ok(($answer)(&route, request))
+                        ($answer)(&route, request)
                     }) => result,
                 };
                 match result {
@@ -628,35 +683,36 @@ macro_rules! spawn_forwarding_service {
 }
 
 /// One colour control forwarded to its response-model twin: the request's
-/// fields go through under the camera's name and the model's answer
-/// relays verbatim, success or not; a call that never reached the model
-/// answers false and the reason. `$reading` names the response's reading
-/// field beside the fallback a refusal carries in it: a temperature for
+/// fields go through under the camera's name, and the model's response
+/// relays verbatim, as does the kind and the message of its error reply. A
+/// call that gets no answer of the model gets the error reply
+/// `relayed_failure!` names. `$reading` names the one field of the response: a temperature for
 /// white balance, a value for the other controls, the profile JSON for
-/// get_camera_profile; reset_camera carries none.
+/// get_camera_profile; reset_camera answers none.
 macro_rules! spawn_forwarding_control {
-    ($route:expr, $service:ident => $control:ident, [$($field:ident),*] $(, $reading:ident = $fallback:expr)?) => {
+    ($route:expr, $service:ident => $control:ident, [$($field:ident),*] $(, $reading:ident)?) => {
         spawn_forwarding_service!(
             $route,
             $service,
             |route: &ControlRoute, _request: $service::Request| {
                 $(let $field = _request.data.$field;)*
-                let answer = route.forward(
-                    $control::bound_producer(&route.runner),
-                    |camera, target| async move {
-                        let request =
-                            $control::Request::new(String::new(), camera $(, $field)*);
-                        $control::poll(&route.runner, &target, CONTROL_TIMEOUT, request)
-                            .await
-                            .map(|response| response.data)
-                    },
-                );
-                match answer {
-                    Ok(answer) => {
-                        $service::Response::new(answer.success, answer.message $(, answer.$reading)?)
-                    }
-                    Err(message) => $service::Response::new(false, message $(, $fallback)?),
-                }
+                route
+                    .forward(
+                        $control::bound_producer(&route.runner),
+                        |camera, target| async move {
+                            let request =
+                                $control::Request::new(String::new(), camera $(, $field)*);
+                            $control::poll(&route.runner, &target, CONTROL_TIMEOUT, request)
+                                .await
+                                $(.map(|response| response.data.$reading))?
+                        },
+                        |error| {
+                            $control::Failure::of(error)
+                                .map(|failure| (failure.kind.as_str(), failure.message))
+                        },
+                    )
+                    $(.map(|$reading| $service::Response::new($reading)))?
+                    .map_err(|unanswered| relayed_failure!($service, unanswered))
             }
         )
     };
@@ -671,12 +727,12 @@ pub async fn setup(_params: Parameters, node_runner: Arc<NodeRunner>) -> Result<
     let route = Arc::new(ControlRoute::new(node_runner.clone()));
     match &route.camera {
         Ok(camera) => info!("this relay is camera '{camera}'"),
-        Err(unnamed) => warn!("every forwarded call refuses: {unnamed}"),
+        Err(unnamed) => warn!("every forwarded call gets an error reply: {unnamed}"),
     }
     if describe_camera::bound_producer(&node_runner).is_some() {
         info!("camera response model linked: colour controls forward to the simulation");
     } else {
-        info!("no camera response model linked: every colour control refuses");
+        info!("no camera response model linked: every colour control gets an error reply");
     }
 
     spawn_info_service!(
@@ -684,7 +740,12 @@ pub async fn setup(_params: Parameters, node_runner: Arc<NodeRunner>) -> Result<
         description,
         video_stream_info,
         |d: StreamDescription| {
-            video_stream_info::Response::new(d.width, d.height, d.frames_per_second, d.encoding)
+            Ok(video_stream_info::Response::new(
+                d.width,
+                d.height,
+                d.frames_per_second,
+                d.encoding,
+            ))
         }
     );
     spawn_info_service!(
@@ -692,28 +753,28 @@ pub async fn setup(_params: Parameters, node_runner: Arc<NodeRunner>) -> Result<
         description,
         depth_stream_info,
         |d: StreamDescription| {
-            depth_stream_info::Response::new(
+            Ok(depth_stream_info::Response::new(
                 d.depth_width,
                 d.depth_height,
                 d.frames_per_second,
                 d.depth_encoding,
                 d.depth_unit,
-            )
+            ))
         }
     );
-    spawn_info_service!(
+    spawn_geometry_service!(
         node_runner,
         geometry,
         get_color_intrinsics,
         color_intrinsics
     );
-    spawn_info_service!(
+    spawn_geometry_service!(
         node_runner,
         geometry,
         get_depth_intrinsics,
         depth_intrinsics
     );
-    spawn_info_service!(
+    spawn_geometry_service!(
         node_runner,
         geometry,
         get_depth_to_color_extrinsics,
@@ -723,36 +784,31 @@ pub async fn setup(_params: Parameters, node_runner: Arc<NodeRunner>) -> Result<
         route,
         set_color_exposure => set_camera_exposure,
         [mode, value],
-        current_value = NO_CURRENT_VALUE
+        current_value
     );
     spawn_forwarding_control!(
         route,
         set_color_white_balance => set_camera_white_balance,
         [mode, temperature],
-        current_temperature = NO_CURRENT_VALUE
+        current_temperature
     );
-    spawn_forwarding_control!(route, set_color_gain => set_camera_gain, [value], current_value = NO_CURRENT_VALUE);
+    spawn_forwarding_control!(route, set_color_gain => set_camera_gain, [value], current_value);
     spawn_forwarding_control!(
         route,
         set_color_brightness => set_camera_brightness,
         [value],
-        current_value = NO_CURRENT_VALUE
+        current_value
     );
     spawn_forwarding_control!(
         route,
         set_color_contrast => set_camera_contrast,
         [value],
-        current_value = NO_CURRENT_VALUE
+        current_value
     );
     // The profile is the simulation's description of the device this camera
     // stands for, and the reset puts every control back to its defaults:
     // both live with the response model, so both forward to it.
-    spawn_forwarding_control!(
-        route,
-        get_camera_profile => describe_camera,
-        [],
-        profile_json = String::new()
-    );
+    spawn_forwarding_control!(route, get_camera_profile => describe_camera, [], profile_json);
     spawn_forwarding_control!(route, reset_camera => control_reset_camera, []);
 
     let video = tokio::spawn(relay_video(node_runner.clone(), token.clone()));
@@ -958,44 +1014,101 @@ mod tests {
     }
 
     #[test]
-    fn the_geometry_answers_refuse_until_a_geometry_arrives() {
-        let color = color_intrinsics(None);
-        assert!(!color.success);
-        assert_eq!(color.message, NO_GEOMETRY_MESSAGE);
-        assert_eq!((color.width, color.height), (0, 0));
-
-        let depth = depth_intrinsics(None);
-        assert!(!depth.success);
-        assert_eq!(depth.message, NO_GEOMETRY_MESSAGE);
-        assert!(depth.depth_model.is_empty());
-
-        let pose = depth_to_color_extrinsics(None);
-        assert!(!pose.success);
-        assert_eq!(pose.message, NO_GEOMETRY_MESSAGE);
-        assert_eq!(pose.depth_to_color_orientation, [0.0; 4]);
-    }
-
-    #[test]
     fn each_geometry_answer_reads_its_own_stream() {
         // The depth grid is not the colour grid: an answer that read the
         // colour numbers for depth would place every point at twice its
         // distance from the optical axis.
-        let color = color_intrinsics(Some(chest_geometry()));
-        assert!(color.success);
+        let color = color_intrinsics(chest_geometry());
         assert_eq!((color.width, color.height), (1280, 720));
         assert_eq!((color.fx, color.cx, color.cy), (738.1094, 639.5, 359.5));
 
-        let depth = depth_intrinsics(Some(chest_geometry()));
-        assert!(depth.success);
+        let depth = depth_intrinsics(chest_geometry());
         assert_eq!((depth.width, depth.height), (640, 360));
         assert_eq!((depth.fx, depth.cx, depth.cy), (369.0547, 319.5, 179.5));
         assert_eq!(depth.depth_model, "z");
         assert_eq!((depth.min_depth_m, depth.max_depth_m), (0.1, 10.0));
 
         // The two depth answers name the same alignment.
-        let pose = depth_to_color_extrinsics(Some(chest_geometry()));
-        assert!(pose.success);
+        let pose = depth_to_color_extrinsics(chest_geometry());
         assert_eq!(pose.align_mode, depth.align_mode);
         assert_eq!(pose.depth_to_color_orientation, [0.0, 0.0, 0.0, 1.0]);
+    }
+
+    /// The failure kind of the error reply that `unanswered` gives
+    /// set_color_gain, by its wire name, and its message.
+    fn relayed(unanswered: Unanswered) -> (&'static str, String) {
+        let failure = relayed_failure!(set_color_gain, unanswered);
+        (failure.kind.as_str(), failure.message)
+    }
+
+    #[test]
+    fn an_error_reply_of_the_model_passes_on_with_its_kind_and_its_message() {
+        for kind in set_camera_gain::FailureKind::ALL {
+            let error = peppygen::Error::Deserialization("an error reply".to_owned());
+            let unanswered = Unanswered::of(
+                &error,
+                Some((kind.as_str(), "gain 9000 is above 255".to_owned())),
+            );
+            assert!(!unanswered.in_transport(), "an error reply is an answer");
+            assert_eq!(
+                relayed(unanswered),
+                (kind.as_str(), "gain 9000 is above 255".to_owned())
+            );
+        }
+    }
+
+    #[test]
+    fn a_call_that_gets_no_answer_gives_the_kind_of_its_cause() {
+        let timed_out = Unanswered::of(
+            &peppygen::Error::ServiceTimeout {
+                instance_id: Some("sim".to_owned()),
+                service_name: "set_camera_gain".to_owned(),
+            },
+            None,
+        );
+        let unreachable = Unanswered::of(
+            &peppygen::Error::ServiceUnreachable {
+                instance_id: Some("sim".to_owned()),
+                service_name: "set_camera_gain".to_owned(),
+            },
+            None,
+        );
+        let broken = Unanswered::of(
+            &peppygen::Error::Deserialization("a response that does not decode".to_owned()),
+            None,
+        );
+        for unanswered in [&timed_out, &unreachable, &broken] {
+            assert!(unanswered.in_transport(), "{unanswered:?}");
+        }
+        let (kind, message) = relayed(timed_out);
+        assert_eq!(kind, "timeout");
+        assert!(
+            message.starts_with("forwarding to the simulation's camera response model failed: ")
+                && message.contains("timed out"),
+            "{message}"
+        );
+        assert_eq!(relayed(unreachable).0, "resource_unavailable");
+        let (kind, message) = relayed(broken);
+        assert_eq!(kind, "attempt_failed");
+        assert!(
+            message.contains("a response that does not decode"),
+            "{message}"
+        );
+
+        // Causes fixed for the life of the node.
+        assert_eq!(
+            relayed(Unanswered::NoModel),
+            ("rejected", NO_RESPONSE_MODEL_MESSAGE.to_owned())
+        );
+        assert_eq!(
+            relayed(Unanswered::NoCamera(
+                "this relay names no camera".to_owned()
+            )),
+            (
+                "precondition_failed",
+                "this relay names no camera".to_owned()
+            )
+        );
+        assert!(!Unanswered::NoModel.in_transport());
     }
 }
