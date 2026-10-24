@@ -91,7 +91,8 @@ PROGRESS_TIMEOUT_S = 60.0
 
 
 class SceneCatalogueUnavailable(RuntimeError):
-    """The scene provider answered get_assets_list without a catalogue.
+    """The scene provider gave get_assets_list an error reply of the kind
+    precondition_failed: it has no catalogue yet.
 
     An engine answers this way while it is still discovering its assets, and
     its message says so. The page waits it out and asks again.
@@ -99,20 +100,21 @@ class SceneCatalogueUnavailable(RuntimeError):
 
 
 class ObjectStateUnavailable(RuntimeError):
-    """The object state provider answered get_object_states without a snapshot.
+    """The object state provider gave get_object_states an error reply: it
+    has no snapshot.
 
-    An engine answers this way when it does not inspect its scene or is not
-    ready yet, and its message says why. An empty scene is a snapshot with
-    no objects, never this.
+    An engine answers this way when it does not inspect its scene (the kind
+    rejected) or is not ready yet (precondition_failed), and its message
+    says why. An empty scene is a snapshot with no objects, never this.
     """
 
 
 class StateUnavailable(RuntimeError):
-    """A provider answered a read without the state it was asked for.
+    """A provider gave a read an error reply of the kind precondition_failed:
+    the state it was asked for is absent for now.
 
-    Lighting and materials are absent until a scene is loaded, a camera's
-    profile until the camera is attached to its device or simulation; the
-    provider's message says why, and the page asks again.
+    Lighting and materials are absent until a scene is loaded; the provider's
+    message says why, and the page asks again.
     """
 
 
@@ -125,23 +127,21 @@ class CapabilityUnbound(RuntimeError):
 
 
 class ProviderRefusal(RuntimeError):
-    """A provider refused a setter and left its target as it was.
+    """A provider gave a setter or a reset an error reply and left its target
+    as it was.
 
-    Its message says why; current holds the effective values it reported
-    with the refusal, which the answer carries so a caller sees what stands.
+    Its message names the failure kind and says why. An error reply carries
+    no effective values, so the page reads what stands from the provider's
+    state.
     """
-
-    def __init__(self, message: str, current: dict) -> None:
-        super().__init__(message)
-        self.current = current
 
 
 class Canceller(StrEnum):
     """Who had a goal cancelled: this commander, when the goal made no
     progress for a window or did not end in its whole bound; the page, by
     the cancel route or by closing its stream; or the simulator itself, for
-    the reason its message gives, as when a newer load replaces one that is
-    still fetching its files."""
+    the reason it gives, as when a newer load replaces one that is still
+    fetching its files."""
 
     COMMANDER = "commander"
     PAGE = "page"
@@ -173,40 +173,52 @@ class CancelNotDelivered(RuntimeError):
 # ---------------------------------------------------------------------------
 
 
+def _not_yet(service: ModuleType, failure) -> bool:
+    """Whether an error reply of `service` says that the provider lacks what
+    it was asked for only for now: the kind precondition_failed."""
+
+    return failure.kind is service.FailureKind.PRECONDITION_FAILED
+
+
 async def _fetch_assets(node_runner: NodeRunner) -> list[dict]:
     producer = get_assets_list.bound_producer(node_runner)
 
     # The whole catalogue: the panel filters it itself.
-    response = await get_assets_list.poll(
-        node_runner,
-        producer,
-        get_assets_list.Request(kind=None, category=None, query=None),
-        timeout=SERVICE_TIMEOUT_S,
-    )
+    try:
+        response = await get_assets_list.poll(
+            node_runner,
+            producer,
+            get_assets_list.Request(kind=None, category=None, query=None),
+            timeout=SERVICE_TIMEOUT_S,
+        )
 
-    data = response.data
+    except get_assets_list.Failure as failure:
+        if _not_yet(get_assets_list, failure):
+            raise SceneCatalogueUnavailable(str(failure)) from failure
 
-    if not data.success:
-        raise SceneCatalogueUnavailable(data.message)
+        raise
 
-    return json.loads(data.assets_json)
+    return json.loads(response.data.assets_json)
 
 
 async def _fetch_objects(node_runner: NodeRunner) -> dict:
-    """The provider's object state snapshot: its capture time and records."""
+    """The provider's object state snapshot: its capture time and records.
+    Every error reply of get_object_states says that the provider has no
+    snapshot to give."""
 
     producer = get_object_states.bound_producer(node_runner)
 
-    response = await get_object_states.poll(
-        node_runner,
-        producer,
-        timeout=SERVICE_TIMEOUT_S,
-    )
+    try:
+        response = await get_object_states.poll(
+            node_runner,
+            producer,
+            timeout=SERVICE_TIMEOUT_S,
+        )
+
+    except get_object_states.Failure as failure:
+        raise ObjectStateUnavailable(str(failure)) from failure
 
     data = response.data
-
-    if not data.success:
-        raise ObjectStateUnavailable(data.message)
 
     return {
         "timestamp": data.timestamp,
@@ -215,6 +227,9 @@ async def _fetch_objects(node_runner: NodeRunner) -> dict:
 
 
 async def _fetch_robots(node_runner: NodeRunner) -> list[dict]:
+    """The robots the scene stands. An error reply raises the typed failure
+    of get_robots_list, which names its kind."""
+
     producer = get_robots_list.bound_producer(node_runner)
 
     response = await get_robots_list.poll(
@@ -222,11 +237,6 @@ async def _fetch_robots(node_runner: NodeRunner) -> list[dict]:
         producer,
         timeout=SERVICE_TIMEOUT_S,
     )
-
-    data = response.data
-
-    if not data.success:
-        raise RuntimeError(data.message)
 
     return [
         {
@@ -236,7 +246,7 @@ async def _fetch_robots(node_runner: NodeRunner) -> list[dict]:
             "yaw": robot.yaw,
             "attached": robot.attached,
         }
-        for robot in data.robots
+        for robot in response.data.robots
     ]
 
 
@@ -339,35 +349,45 @@ def _summary(name: str, fields: dict) -> str:
     return f"{name}({', '.join(f'{key}={value}' for key, value in fields.items())})"
 
 
-async def _call_service(service, node_runner: NodeRunner, producer, request=None, **context):
-    """Poll one service on producer and return its response data.
+def _done(summary: str) -> str:
+    """What this commander says of a call or a goal that succeeded: what was
+    asked, and that it was done. A provider says nothing of a success, so
+    the page and the log read these words."""
 
-    Every call that succeeds leaves one log line naming what was asked and
-    what the provider answered. A refusal raises with the provider's reason
-    and the effective values it reported; the HTTP layer logs it and answers
-    with both. context names what the request itself does not (the camera
-    a control is set on).
+    return f"{summary} done"
+
+
+async def _call_service(service, node_runner: NodeRunner, producer, request=None, **context) -> dict:
+    """Poll one setter or reset on producer and return the page's answer:
+    that it was done, and the effective values a setter reports.
+
+    Every call that succeeds leaves one log line naming what was asked. An
+    error reply raises ProviderRefusal with its kind and its reason; the HTTP
+    layer logs it and answers with it. A reset declares no response, so its
+    poll returns nothing. context names what the request itself does not
+    (the camera a control is set on).
     """
 
     fields = {**context, **(vars(request) if request is not None else {})}
     summary = _summary(_endpoint_name(service), fields)
     arguments = (request,) if request is not None else ()
 
-    response = await service.poll(
-        node_runner,
-        producer,
-        *arguments,
-        timeout=SERVICE_TIMEOUT_S,
-    )
+    try:
+        response = await service.poll(
+            node_runner,
+            producer,
+            *arguments,
+            timeout=SERVICE_TIMEOUT_S,
+        )
 
-    data = response.data
+    except service.Failure as failure:
+        raise ProviderRefusal(str(failure)) from failure
 
-    if not data.success:
-        raise ProviderRefusal(data.message, _current(data))
+    message = _done(summary)
+    logger.info("%s", message)
+    current = {} if response is None else _current(response.data)
 
-    logger.info("%s: %s", summary, data.message)
-
-    return data
+    return {"success": True, "message": message, **current}
 
 
 def _current(data) -> dict:
@@ -376,22 +396,22 @@ def _current(data) -> dict:
     return {key: value for key, value in vars(data).items() if key.startswith("current_")}
 
 
-def _result(data) -> dict:
-    return {"success": True, "message": data.message, **_current(data)}
-
-
-async def _fetch_json(service, node_runner: NodeRunner, producer, field: str) -> tuple[dict, str]:
+async def _fetch_json(service, node_runner: NodeRunner, producer, field: str) -> dict:
     """A provider's state as the JSON it carries in `field` (a scene's
-    lighting, its materials, a camera's profile), and the message it came
-    with."""
+    lighting, its materials). An error reply of the kind precondition_failed
+    raises StateUnavailable; any other raises the typed failure of
+    `service`."""
 
-    response = await service.poll(node_runner, producer, timeout=SERVICE_TIMEOUT_S)
-    data = response.data
+    try:
+        response = await service.poll(node_runner, producer, timeout=SERVICE_TIMEOUT_S)
 
-    if not data.success:
-        raise StateUnavailable(data.message)
+    except service.Failure as failure:
+        if _not_yet(service, failure):
+            raise StateUnavailable(str(failure)) from failure
 
-    return json.loads(getattr(data, field)), data.message
+        raise
+
+    return json.loads(getattr(response.data, field))
 
 
 # ---------------------------------------------------------------------------
@@ -522,35 +542,59 @@ class _Goal:
 
         return f"{self.name} made no progress for {PROGRESS_TIMEOUT_S:g} s; {outcome}"
 
-    def data(self, result):
-        """The data of a goal that succeeded.
+    def answer(self, result) -> dict:
+        """The page's answer to a goal that succeeded: that it was done, and
+        for a spawn the object it built.
 
-        A provider may run a cancelled goal to its end and answer CANCELLED
-        with success: what it built stands, so the goal succeeded. Every
-        goal that succeeds leaves one log line naming what was asked and
-        what the provider answered. A goal that ended any other way raises
-        with the reason; the HTTP layer logs it.
+        A completed goal succeeded. So did a spawn that ended cancelled with
+        the object it built: its cancel came once the object stood, and the
+        object stands, so the page reads its id. Every goal that succeeds
+        leaves one log line naming what was asked. A goal that ended any
+        other way raises with the reason: a failed goal with its failure
+        kind, a cancelled one naming who cancelled it. The HTTP layer logs
+        it.
         """
 
         status = self.action.ResultStatus
 
-        if result.status not in (status.COMPLETED, status.CANCELLED):
-            raise RuntimeError(f"{self.name} did not complete: {result.status.name}")
+        if result.status == status.COMPLETED:
+            return self._succeeded(result, _done(self.summary))
 
-        if result.data is not None and result.data.success:
-            logger.info("%s: %s", self.summary, result.data.message)
+        if result.status == status.FAILED:
+            raise RuntimeError(f"{self.name} failed: {result.failure}")
 
-            return result.data
+        if result.status == status.CANCELLED and self._spawned(result):
+            return self._succeeded(
+                result,
+                f"{_done(self.summary)}; it ended cancelled after it built the object: {result.cancel_reason}",
+            )
 
         if result.status == status.CANCELLED:
-            raise self._cancelled(result.data)
+            raise self._cancelled(result.cancel_reason)
 
-        if result.data is None:
-            raise RuntimeError(f"{self.name} completed without result data")
+        raise RuntimeError(f"{self.name} did not complete: {result.status.name}")
 
-        raise RuntimeError(result.data.message)
+    def _spawned(self, result) -> str:
+        """The object a spawn built, as its result names it: empty for any
+        other goal, and for a spawn that ended cancelled and built nothing.
+        spawn_object is the one action of the panel that declares a
+        result."""
 
-    def _cancelled(self, data) -> GoalCancelled:
+        if self.action is not spawn_object:
+            return ""
+
+        return result.data.object_id
+
+    def _succeeded(self, result, message: str) -> dict:
+        logger.info("%s", message)
+        answer = {"success": True, "message": message}
+
+        if self.action is spawn_object:
+            answer["object_id"] = self._spawned(result)
+
+        return answer
+
+    def _cancelled(self, reason: str | None) -> GoalCancelled:
         # This commander reads the end of a goal whose cancel it had
         # signalled only when it follows its progress: the whole-goal bound
         # raises at once.
@@ -560,16 +604,16 @@ class _Goal:
         if self.cancelled_by == Canceller.PAGE:
             return GoalCancelled(f"{self.name} was cancelled from the page", Canceller.PAGE)
 
-        reason = f": {data.message}" if data is not None and data.message else ""
+        said = f": {reason}" if reason else ""
 
-        return GoalCancelled(f"{self.name} was cancelled by the simulator{reason}", Canceller.SIMULATOR)
+        return GoalCancelled(f"{self.name} was cancelled by the simulator{said}", Canceller.SIMULATOR)
 
 
 async def _fire_goal(action, node_runner: NodeRunner, request=None, **fields) -> _Goal:
     """Fire one scene_manipulation goal and return it once admitted.
 
-    A rejection raises with the provider's reason. fields name what was
-    asked, for the log lines of the goal.
+    A refusal raises with its failure kind and the provider's reason. fields
+    name what was asked, for the log lines of the goal.
     """
 
     name = _endpoint_name(action)
@@ -581,18 +625,17 @@ async def _fire_goal(action, node_runner: NodeRunner, request=None, **fields) ->
         producer,
         *goal,
         timeout=ACTION_TIMEOUT_S,
-        feedback_qos=peppylib.QoSProfile.Standard,
     )
 
-    if not handle.accepted:
-        raise RuntimeError(f"{name} rejected: {handle.reason}")
+    if handle.refusal is not None:
+        raise RuntimeError(f"{name} was refused: {handle.refusal}")
 
     return _Goal(action, name, handle, _summary(name, fields))
 
 
-async def _run_action(action, node_runner: NodeRunner, request=None, **fields):
-    """Fire one goal of an action that reports no progress and return its
-    result data.
+async def _run_action(action, node_runner: NodeRunner, request=None, **fields) -> dict:
+    """Fire one goal of an action that reports no progress and return the
+    page's answer.
 
     The whole goal is bounded by ACTION_TIMEOUT_S: a goal that has not
     ended by then is cancelled, and the timeout raised. A cancel that finds
@@ -618,15 +661,15 @@ async def _run_action(action, node_runner: NodeRunner, request=None, **fields):
 
         result = await goal.result_found_over()
 
-    return goal.data(result)
+    return goal.answer(result)
 
 
 async def _follow_progress(
     goal: _Goal,
     silence: Callable[[float], Awaitable[None]],
     on_progress: Callable[[_Progress], Awaitable[None]],
-):
-    """Follow a load or a spawn until it ends, and return its result data.
+) -> dict:
+    """Follow a load or a spawn until it ends, and return the page's answer.
 
     Each progress message is handed to on_progress and starts the silence
     window again: `silence` waits out PROGRESS_TIMEOUT_S. A window without
@@ -637,7 +680,8 @@ async def _follow_progress(
     result the provider then answers at once. A cancel from here or from
     the page that finds the goal over asks for its result at once too. A
     provider that is gone ends the follow at once: it has no result left to
-    ask for.
+    ask for. So does a handle that fell behind its feedback bound: it
+    cancelled the goal itself.
     """
 
     next_message = asyncio.ensure_future(goal.handle.on_next_feedback_message())
@@ -655,7 +699,7 @@ async def _follow_progress(
                 window.cancel()
 
             if found_over.done():
-                return goal.data(await goal.result_found_over())
+                return goal.answer(await goal.result_found_over())
 
             if not next_message.done():
                 if stalled:
@@ -676,6 +720,11 @@ async def _follow_progress(
             except ConnectionError as exc:
                 raise ConnectionError(f"{goal.name} ended: the simulator is gone") from exc
 
+            except peppylib.FeedbackOverflowError as exc:
+                raise RuntimeError(
+                    f"{goal.name} was cancelled: this commander fell behind its progress messages: {exc}"
+                ) from exc
+
             except RuntimeError:
                 # The end of the stream: the goal has ended.
                 break
@@ -687,12 +736,12 @@ async def _follow_progress(
         next_message.cancel()
         found_over.cancel()
 
-    return goal.data(await goal.handle.get_result(timeout=SERVICE_TIMEOUT_S))
+    return goal.answer(await goal.handle.get_result(timeout=SERVICE_TIMEOUT_S))
 
 
-async def _end_silent_follow(goal: _Goal):
+async def _end_silent_follow(goal: _Goal) -> dict:
     """End the follow of a goal that stayed silent for a second window
-    since its stall cancel, and return its result data if it has ended.
+    since its stall cancel, and return the page's answer if it has ended.
 
     When a cancel was delivered, the simulator did not answer it, and the
     follow ends. When none was, the cancel is sent again, once: the end
@@ -710,7 +759,7 @@ async def _end_silent_follow(goal: _Goal):
         raise TimeoutError(goal.stall(f"the cancel was sent again and was not delivered: {exc.reason}")) from exc
 
     if goal.found_over.is_set():
-        return goal.data(await goal.result_found_over())
+        return goal.answer(await goal.result_found_over())
 
     raise TimeoutError(goal.stall("the cancel was sent again and the simulator took it"))
 
@@ -726,9 +775,7 @@ async def _fire_load_scene(node_runner: NodeRunner, asset_id: str, scale: float)
 
 
 async def _action_clear_scene(node_runner: NodeRunner) -> dict:
-    data = await _run_action(clear_scene, node_runner)
-
-    return {"success": True, "message": data.message}
+    return await _run_action(clear_scene, node_runner)
 
 
 async def _fire_spawn_object(node_runner: NodeRunner, request) -> _Goal:
@@ -756,7 +803,7 @@ async def _action_apply_force(node_runner: NodeRunner, payload: dict) -> dict:
         duration_s=float(payload.get("duration_s", 0.5)),
     )
 
-    data = await _run_action(
+    return await _run_action(
         apply_force,
         node_runner,
         request,
@@ -764,8 +811,6 @@ async def _action_apply_force(node_runner: NodeRunner, payload: dict) -> dict:
         force=force,
         duration_s=request.duration_s,
     )
-
-    return {"success": True, "message": data.message}
 
 
 async def _action_move_object(node_runner: NodeRunner, payload: dict) -> dict:
@@ -778,7 +823,7 @@ async def _action_move_object(node_runner: NodeRunner, payload: dict) -> dict:
         snap_to=None,
     )
 
-    data = await _run_action(
+    return await _run_action(
         move_object,
         node_runner,
         request,
@@ -786,18 +831,14 @@ async def _action_move_object(node_runner: NodeRunner, payload: dict) -> dict:
         position=request.position,
     )
 
-    return {"success": True, "message": data.message}
-
 
 async def _action_remove_object(node_runner: NodeRunner, object_id: str) -> dict:
-    data = await _run_action(
+    return await _run_action(
         remove_object,
         node_runner,
         remove_object.GoalRequest(object_id=object_id),
         object_id=object_id,
     )
-
-    return {"success": True, "message": data.message}
 
 
 async def _action_move_robot(
@@ -805,7 +846,7 @@ async def _action_move_robot(
 ) -> dict:
     position = [float(value) for value in position]
 
-    data = await _run_action(
+    return await _run_action(
         move_robot,
         node_runner,
         move_robot.GoalRequest(robot=robot, position=position, yaw=yaw),
@@ -813,8 +854,6 @@ async def _action_move_robot(
         position=position,
         yaw=yaw,
     )
-
-    return {"success": True, "message": data.message}
 
 
 # ---------------------------------------------------------------------------
@@ -870,10 +909,6 @@ def _log_failure(request: web.Request, exc: Exception) -> None:
 
 def _failure(exc: Exception) -> dict:
     body = {"success": False, "message": str(exc)}
-
-    # A refused setter answers with what stands, as the provider reported it.
-    if isinstance(exc, ProviderRefusal):
-        body.update(exc.current)
 
     if isinstance(exc, GoalCancelled):
         body["cancelled_by"] = exc.by
@@ -948,15 +983,13 @@ class _GoalStream:
         return False
 
 
-async def _stream_goal(
-    request: web.Request, goal: _Goal, answer: Callable[[object], dict]
-) -> web.StreamResponse:
+async def _stream_goal(request: web.Request, goal: _Goal) -> web.StreamResponse:
     """Follow an admitted load or spawn and stream it to the page.
 
     The page reads the goal's id first, which the cancel route takes, then
-    one line per progress message, and last the result: `answer` builds it
-    from the result data, and a goal that did not succeed ends the stream
-    with its failure, as a JSON answer carries one.
+    one line per progress message, and last the result: the answer of a
+    goal that succeeded, or the failure of one that did not, as a JSON
+    answer carries one.
     """
 
     goals = request.app[_STREAMED_GOALS]
@@ -967,8 +1000,7 @@ async def _stream_goal(
         await stream.write({"goal": goal_id})
 
         try:
-            data = await _follow_progress(goal, request.app[_SILENCE], stream.progress)
-            result = answer(data)
+            result = await _follow_progress(goal, request.app[_SILENCE], stream.progress)
 
         except Exception as exc:
             _log_failure(request, exc)
@@ -1280,7 +1312,7 @@ async def _api_load_scene(request: web.Request) -> web.StreamResponse:
     except Exception as exc:
         return _json_error(request, exc)
 
-    return await _stream_goal(request, goal, lambda data: {"success": True, "message": data.message})
+    return await _stream_goal(request, goal)
 
 
 async def _api_clear_scene(request: web.Request) -> web.Response:
@@ -1303,11 +1335,7 @@ async def _api_spawn_object(request: web.Request) -> web.StreamResponse:
     except Exception as exc:
         return _json_error(request, exc)
 
-    return await _stream_goal(
-        request,
-        goal,
-        lambda data: {"success": True, "message": data.message, "object_id": data.object_id},
-    )
+    return await _stream_goal(request, goal)
 
 
 async def _api_cancel_goal(request: web.Request) -> web.Response:
@@ -1435,7 +1463,7 @@ async def _api_panel(panel: _Panel, request: web.Request) -> web.Response:
     watch = request.app[panel.watch]
 
     try:
-        state, _ = await _fetch_json(
+        state = await _fetch_json(
             panel.get,
             request.app[_NODE_RUNNER],
             panel.producer(request.app),
@@ -1479,7 +1507,7 @@ async def _api_set_panel(panel: _Panel, request: web.Request) -> web.Response:
         producer = panel.producer(request.app)
         service, built = panel.request(route, await _request_json(request))
 
-        data = await _call_service(service, request.app[_NODE_RUNNER], producer, built)
+        answer = await _call_service(service, request.app[_NODE_RUNNER], producer, built)
 
     except CapabilityUnbound as exc:
         return _json_error(request, exc, status=404)
@@ -1487,12 +1515,12 @@ async def _api_set_panel(panel: _Panel, request: web.Request) -> web.Response:
     except Exception as exc:
         return _json_error(request, exc)
 
-    return web.json_response(_result(data))
+    return web.json_response(answer)
 
 
 async def _api_reset_panel(panel: _Panel, request: web.Request) -> web.Response:
     try:
-        data = await _call_service(
+        answer = await _call_service(
             panel.reset,
             request.app[_NODE_RUNNER],
             panel.producer(request.app),
@@ -1504,29 +1532,36 @@ async def _api_reset_panel(panel: _Panel, request: web.Request) -> web.Response:
     except Exception as exc:
         return _json_error(request, exc)
 
-    return web.json_response(_result(data))
+    return web.json_response(answer)
 
 
 async def _describe_camera(app: web.Application, listed) -> dict:
     """One camera as the page lists it: its stream from the simulation's
-    listing, and its device profile when the simulation describes one."""
+    listing, and its device profile when the simulation describes one. An
+    error reply of describe_camera leaves this camera without a profile,
+    with the reason in profile_message, and the other cameras as they are."""
 
     camera_id = f"{listed.robot}/{listed.camera}"
     watch = app[_PROFILES].setdefault(
         camera_id, _StateWatch("profile", "controls", provider=f"Camera {camera_id}")
     )
-    response = await describe_camera.poll(
-        app[_NODE_RUNNER],
-        _camera_producer(app),
-        describe_camera.Request(robot=listed.robot, camera=listed.camera),
-        timeout=SERVICE_TIMEOUT_S,
-    )
-    data = response.data
-    profile = json.loads(data.profile_json) if data.success else None
 
-    if profile is None:
-        watch.unavailable(data.message)
+    try:
+        response = await describe_camera.poll(
+            app[_NODE_RUNNER],
+            _camera_producer(app),
+            describe_camera.Request(robot=listed.robot, camera=listed.camera),
+            timeout=SERVICE_TIMEOUT_S,
+        )
+
+    except describe_camera.Failure as failure:
+        profile = None
+        profile_message = str(failure)
+        watch.unavailable(profile_message)
+
     else:
+        profile = json.loads(response.data.profile_json)
+        profile_message = ""
         watch.ready(sum(1 for control in profile["controls"].values() if control.get("supported")))
 
     return {
@@ -1541,7 +1576,7 @@ async def _describe_camera(app: web.Application, listed) -> dict:
             "encoding": listed.encoding,
         },
         "profile": profile,
-        "profile_message": data.message,
+        "profile_message": profile_message,
     }
 
 
@@ -1553,13 +1588,9 @@ async def _api_cameras(request: web.Request) -> web.Response:
         response = await get_cameras.poll(
             request.app[_NODE_RUNNER], _camera_producer(request.app), timeout=SERVICE_TIMEOUT_S
         )
-        listing = response.data
-
-        if not listing.success:
-            raise StateUnavailable(listing.message)
 
         cameras = await asyncio.gather(
-            *(_describe_camera(request.app, listed) for listed in listing.cameras)
+            *(_describe_camera(request.app, listed) for listed in response.data.cameras)
         )
 
     except CapabilityUnbound as exc:
@@ -1568,9 +1599,7 @@ async def _api_cameras(request: web.Request) -> web.Response:
     except Exception as exc:
         return _json_error(request, exc, status=500)
 
-    return web.json_response(
-        {"success": True, "message": listing.message, "cameras": cameras, "count": len(cameras)}
-    )
+    return web.json_response({"success": True, "cameras": cameras, "count": len(cameras)})
 
 
 async def _api_set_camera(request: web.Request) -> web.Response:
@@ -1586,7 +1615,7 @@ async def _api_set_camera(request: web.Request) -> web.Response:
     try:
         payload = await _request_json(request)
 
-        data = await _call_service(
+        answer = await _call_service(
             control.service,
             request.app[_NODE_RUNNER],
             _camera_producer(request.app),
@@ -1603,12 +1632,12 @@ async def _api_set_camera(request: web.Request) -> web.Response:
     except Exception as exc:
         return _json_error(request, exc)
 
-    return web.json_response(_result(data))
+    return web.json_response(answer)
 
 
 async def _api_reset_camera(request: web.Request) -> web.Response:
     try:
-        data = await _call_service(
+        answer = await _call_service(
             reset_camera,
             request.app[_NODE_RUNNER],
             _camera_producer(request.app),
@@ -1623,7 +1652,7 @@ async def _api_reset_camera(request: web.Request) -> web.Response:
     except Exception as exc:
         return _json_error(request, exc)
 
-    return web.json_response(_result(data))
+    return web.json_response(answer)
 
 
 # ---------------------------------------------------------------------------
