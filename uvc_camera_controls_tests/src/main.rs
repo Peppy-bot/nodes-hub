@@ -21,6 +21,24 @@ use ffmpeg_next::util::frame::video::Video as VideoFrame;
 /// 5s timeout used on the normal path would exceed the whole window).
 const HOOK_RESTORE_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// Print what a control call gave: the value the camera kept, or the failure
+/// kind and message of the camera's error reply.
+macro_rules! report_control {
+    ($service:ident, $result:expr, $kept:ident) => {
+        match $result {
+            Ok(response) => println!(
+                "  {}: the camera kept {}",
+                stringify!($service),
+                response.data.$kept
+            ),
+            Err(error) => match $service::Failure::of(&error) {
+                Some(failure) => eprintln!("  {} refused: {failure}", stringify!($service)),
+                None => eprintln!("  {} failed: {error}", stringify!($service)),
+            },
+        }
+    };
+}
+
 fn main() -> Result<()> {
     ffmpeg_next::init().expect("Failed to initialize FFmpeg");
 
@@ -81,7 +99,7 @@ async fn record_video(node_runner: Arc<NodeRunner>) {
     let exposure_needs_restore = register_restore_hook(&node_runner, |runner| async move {
         restore_exposure(&runner, HOOK_RESTORE_TIMEOUT).await;
     });
-    let _ = camera_set_exposure::poll(
+    let result = camera_set_exposure::poll(
         &node_runner,
         camera_set_exposure::bound_producer(&node_runner),
         Duration::from_secs(5),
@@ -91,6 +109,7 @@ async fn record_video(node_runner: Arc<NodeRunner>) {
         },
     )
     .await;
+    report_control!(camera_set_exposure, result, current_value);
     all_frames.extend(record_seconds(&node_runner, fps, 3).await);
     if token.is_cancelled() {
         return;
@@ -104,7 +123,7 @@ async fn record_video(node_runner: Arc<NodeRunner>) {
     let white_balance_needs_restore = register_restore_hook(&node_runner, |runner| async move {
         restore_white_balance(&runner, HOOK_RESTORE_TIMEOUT).await;
     });
-    let _ = camera_set_white_balance::poll(
+    let result = camera_set_white_balance::poll(
         &node_runner,
         camera_set_white_balance::bound_producer(&node_runner),
         Duration::from_secs(5),
@@ -114,6 +133,7 @@ async fn record_video(node_runner: Arc<NodeRunner>) {
         },
     )
     .await;
+    report_control!(camera_set_white_balance, result, current_temperature);
     all_frames.extend(record_seconds(&node_runner, fps, 3).await);
     if token.is_cancelled() {
         return;
@@ -127,13 +147,14 @@ async fn record_video(node_runner: Arc<NodeRunner>) {
     let gain_needs_restore = register_restore_hook(&node_runner, |runner| async move {
         restore_gain(&runner, HOOK_RESTORE_TIMEOUT).await;
     });
-    let _ = camera_set_gain::poll(
+    let result = camera_set_gain::poll(
         &node_runner,
         camera_set_gain::bound_producer(&node_runner),
         Duration::from_secs(5),
         camera_set_gain::Request { value: 100 },
     )
     .await;
+    report_control!(camera_set_gain, result, current_value);
     all_frames.extend(record_seconds(&node_runner, fps, 3).await);
     if token.is_cancelled() {
         return;
@@ -147,13 +168,14 @@ async fn record_video(node_runner: Arc<NodeRunner>) {
     let brightness_needs_restore = register_restore_hook(&node_runner, |runner| async move {
         restore_brightness(&runner, HOOK_RESTORE_TIMEOUT).await;
     });
-    let _ = camera_set_brightness::poll(
+    let result = camera_set_brightness::poll(
         &node_runner,
         camera_set_brightness::bound_producer(&node_runner),
         Duration::from_secs(5),
         camera_set_brightness::Request { value: 100 },
     )
     .await;
+    report_control!(camera_set_brightness, result, current_value);
     all_frames.extend(record_seconds(&node_runner, fps, 3).await);
     if token.is_cancelled() {
         return;
@@ -167,13 +189,14 @@ async fn record_video(node_runner: Arc<NodeRunner>) {
     let contrast_needs_restore = register_restore_hook(&node_runner, |runner| async move {
         restore_contrast(&runner, HOOK_RESTORE_TIMEOUT).await;
     });
-    let _ = camera_set_contrast::poll(
+    let result = camera_set_contrast::poll(
         &node_runner,
         camera_set_contrast::bound_producer(&node_runner),
         Duration::from_secs(5),
         camera_set_contrast::Request { value: 100 },
     )
     .await;
+    report_control!(camera_set_contrast, result, current_value);
     all_frames.extend(record_seconds(&node_runner, fps, 3).await);
     if token.is_cancelled() {
         return;
@@ -251,7 +274,8 @@ where
 }
 
 /// Each restore_* helper sets a control back to its default and returns
-/// whether the service call succeeded.
+/// whether the camera took it. An error reply is not a restore, so the
+/// shutdown hook of the control tries again.
 async fn restore_exposure(node_runner: &NodeRunner, timeout: Duration) -> bool {
     camera_set_exposure::poll(
         node_runner,
