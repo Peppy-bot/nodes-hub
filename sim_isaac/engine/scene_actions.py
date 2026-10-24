@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""Peppy scene_manipulation and object_state bridge for Isaac Sim."""
+"""Peppy scene_manipulation and object_state bridge for Isaac Sim.
+
+A goal this bridge cannot run is refused when it arrives, with a failure kind
+of peppy: `rejected` for a request that names something the stage does not
+hold or a value it does not take, and `precondition_failed` while the asset
+catalogue is not discovered yet. A goal it accepted runs its command on the
+Isaac main thread, which checks the request again against the stage as it is
+then: a command that cannot run fails its goal with the same kinds, and one
+that Isaac does not carry out fails it with `attempt_failed`. A service gives
+its response, or an error reply with the same kinds.
+"""
 
 from __future__ import annotations
 
@@ -11,7 +21,10 @@ import threading
 import uuid
 from concurrent.futures import Future
 from dataclasses import dataclass, field
+from functools import partial
 from queue import Empty, Queue
+from types import ModuleType
+from typing import Callable
 
 from peppygen.exposed_actions.scene import (
     apply_force,
@@ -37,6 +50,28 @@ from object_state import IsaacObjectReader, ObjectStateSnapshot
 
 logger = logging.getLogger(__name__)
 
+# The failure kinds of peppy that a scene command and a service give, by
+# their name on the wire. Every member of scene_manipulation and
+# object_state declares them.
+REJECTED = "rejected"
+PRECONDITION_FAILED = "precondition_failed"
+ATTEMPT_FAILED = "attempt_failed"
+
+# The actions of scene_manipulation, by the name of the command each goal
+# runs on the Isaac main thread.
+_ACTIONS: dict[str, ModuleType] = {
+    "apply_force": apply_force,
+    "load_scene": load_scene,
+    "clear_scene": clear_scene,
+    "spawn_object": spawn_object,
+    "move_object": move_object,
+    "remove_object": remove_object,
+    "move_robot": move_robot,
+}
+
+# The actions whose goals report their progress on their feedback.
+_REPORTING_PROGRESS = ("load_scene", "spawn_object")
+
 # What get_object_states answers until the first capture: not an empty scene.
 _NOT_CAPTURED = (
     "Isaac has not captured its object state yet; it captures once the "
@@ -59,17 +94,114 @@ _OBJECT_SOURCES = ("spawned", "scene")
 # How far from 1 the length of an orientation may be before it is refused.
 _UNIT_TOLERANCE = 1e-3
 
+# The longest push apply_force schedules, in seconds.
+_LONGEST_PUSH_S = 30.0
+
+# The physics a spawned object may have, as spawn_object names them.
+_PHYSICS = ("none", "static", "dynamic")
+
+# How a refusal names each kind of asset.
+_ASSET_KIND_WORDS = {"scene": "a scene", "object": "an object"}
+
+
+class SceneFailure(Exception):
+    """Why a scene command does not run, or ran and gave no result: a
+    failure kind of peppy and a message for a person. A goal is refused with
+    it when it arrives, or fails with it once its command ran; a service
+    gives it as its error reply."""
+
+    def __init__(self, kind: str, message: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.message = message
+
+
+def _rejected(message: str) -> SceneFailure:
+    return SceneFailure(REJECTED, message)
+
+
+@dataclass(frozen=True)
+class _Load:
+    """A load_scene command, checked: the scene asset and the scale it
+    stands at."""
+
+    asset_id: str
+    path: str
+    scale: float
+
+
+@dataclass(frozen=True)
+class _Spawn:
+    """A spawn_object command, checked."""
+
+    asset_id: str
+    path: str
+    position: list[float]
+    yaw: float
+    # A unit quaternion [x, y, z, w], normalised, in place of yaw; None
+    # turns the object by yaw.
+    orientation: list[float] | None
+    scale: float
+    physics: str
+    mass: float
+
+
+@dataclass(frozen=True)
+class _Move:
+    """A move_object command, checked: the object, where it goes, and the
+    orientation it takes, or None to keep its own."""
+
+    object_id: str
+    position: list[float]
+    orientation: list[float] | None
+
+
+@dataclass(frozen=True)
+class _Push:
+    """An apply_force command, checked: a dynamic object, the world-frame
+    force in newtons, and how long it pushes."""
+
+    object_id: str
+    force: list[float]
+    duration_s: float
+
+
+@dataclass(frozen=True)
+class _RobotMove:
+    """A move_robot command, checked: a robot the stage stands, where its
+    base goes and which way it faces."""
+
+    robot: str
+    position: list[float]
+    yaw: float
+
 
 def _refuse_snap(payload: dict) -> None:
     """Refuses a goal that names a snap: a snap stands an object where one of
     its belt ends, a landmark, meets a belt end of another object, and Isaac
-    keeps no landmark of an object, so it refuses every snap, as
-    scene_manipulation:v1 says."""
+    keeps no landmark of an object, so it refuses every snap with `rejected`,
+    as scene_manipulation:v1 says."""
     if payload.get("snap_to") is not None:
-        raise ValueError(
+        raise _rejected(
             "this simulation keeps no landmark of an object, so it places "
             "nothing by a snap: give the goal a position instead of snap_to"
         )
+
+
+def _finite_vector(payload: dict, name: str, length: int, form: str) -> list[float]:
+    """The vector `name` a goal carries: `length` finite numbers, as `form`
+    writes them. A prim moved by a value that is not a number reports no
+    error and simulates nothing, so one is refused here."""
+    values = [float(value) for value in payload[name]]
+
+    if len(values) != length or not all(math.isfinite(value) for value in values):
+        raise _rejected(f"{name} must contain exactly {length} finite values {form}")
+
+    return values
+
+
+def _position_of(payload: dict) -> list[float]:
+    return _finite_vector(payload, "position", 3, "[x, y, z]")
 
 
 def _orientation_of(payload: dict) -> list[float] | None:
@@ -85,12 +217,12 @@ def _orientation_of(payload: dict) -> list[float] | None:
     values = [float(value) for value in orientation]
 
     if len(values) != 4:
-        raise ValueError("orientation must contain exactly 4 values [x, y, z, w]")
+        raise _rejected("orientation must contain exactly 4 values [x, y, z, w]")
 
     norm = math.sqrt(sum(value * value for value in values))
 
     if not math.isfinite(norm) or abs(norm - 1.0) > _UNIT_TOLERANCE:
-        raise ValueError(
+        raise _rejected(
             "orientation must be a unit quaternion [x, y, z, w]"
         )
 
@@ -104,11 +236,63 @@ def _yaw_of(payload: dict) -> float:
     yaw = float(payload["yaw"])
 
     if not math.isfinite(yaw):
-        raise ValueError(
+        raise _rejected(
             "yaw must be a finite number of radians"
         )
 
     return yaw
+
+
+def _positive_of(payload: dict, name: str) -> float:
+    """The quantity `name` a goal carries, which must be a finite number
+    above zero, such as a scale or a mass."""
+    value = float(payload[name])
+
+    if not math.isfinite(value) or value <= 0.0:
+        raise _rejected(f"{name} must be a finite number greater than zero")
+
+    return value
+
+
+def _physics_of(payload: dict) -> str:
+    physics = str(payload["physics"]).lower()
+
+    if physics not in _PHYSICS:
+        raise _rejected("physics must be none, static, or dynamic")
+
+    return physics
+
+
+def _duration_of(payload: dict) -> float:
+    duration_s = float(payload["duration_s"])
+
+    if not math.isfinite(duration_s) or duration_s <= 0.0 or duration_s > _LONGEST_PUSH_S:
+        raise _rejected(f"duration_s must be > 0 and <= {_LONGEST_PUSH_S:g} seconds")
+
+    return duration_s
+
+
+def _payload_of(operation: str, request) -> dict:
+    """The fields a goal of `operation` carries, by name. A clear_scene goal
+    carries none."""
+    if operation == "clear_scene":
+        return {}
+
+    return dict(vars(request.data))
+
+
+def _answering(module: ModuleType, handler: Callable) -> Callable:
+    """`handler`, which gives each SceneFailure it raises as an error reply
+    of the service `module`, with the same kind."""
+
+    def answer(request):
+        try:
+            return handler(request)
+
+        except SceneFailure as failure:
+            raise module.Failure(failure.kind, failure.message) from None
+
+    return answer
 
 
 def _filter(value: str | None) -> str | None:
@@ -197,29 +381,12 @@ _NO_OBJECT_STATE = {
 }
 
 
-def _refused_object(message: str) -> get_object.Response:
-    """A get_object answer that names no object, with the reason: every
-    other field carries nothing."""
-
-    return get_object.Response(
-        success=False,
-        message=message,
-        timestamp=0.0,
-        object_id="",
-        asset_id="",
-        position=[0.0, 0.0, 0.0],
-        orientation=[0.0, 0.0, 0.0, 0.0],
-        scale=0.0,
-        landmarks=[],
-        **_NO_OBJECT_STATE,
-    )
-
-
 @dataclass
 class _PendingCommand:
     operation: str
     payload: dict
-    # Answers the goal with the command's result.
+    # Answers the goal with the command's result, or with the SceneFailure
+    # of a command that did not run or gave no result.
     future: Future
     # Tells the goal that the Isaac main thread starts the command.
     started: Future = field(default_factory=Future)
@@ -232,6 +399,14 @@ def _settle(future: Future, value) -> None:
 
     if future.set_running_or_notify_cancel():
         future.set_result(value)
+
+
+def _settle_failure(future: Future, failure: SceneFailure) -> None:
+    """Hands `failure` to the goal awaiting `future`, as _settle hands a
+    value."""
+
+    if future.set_running_or_notify_cancel():
+        future.set_exception(failure)
 
 
 async def _report_progress(
@@ -334,31 +509,24 @@ class SceneActionIO:
 
         self._action_handles = {}
 
+        # How each command is checked against the stage, and how it runs
+        # on the Isaac main thread once it is.
+        self._commands = {
+            "load_scene": (self._scene_to_load, self._load_scene),
+            "clear_scene": (lambda _payload: None, self._clear_scene),
+            "spawn_object": (self._spawn_of, self._spawn_object),
+            "move_object": (self._move_of, self._move_object),
+            "remove_object": (self._object_to_remove, self._remove_object),
+            "apply_force": (self._push_of, self._apply_force),
+            "move_robot": (self._robot_move_of, self._move_robot),
+        }
+
     async def start(self) -> None:
         """Expose Peppy services/actions and start their request loops."""
 
         self._action_handles = {
-            "apply_force": await apply_force.ActionHandle.expose(
-                self._node_runner
-            ),
-            "load_scene": await load_scene.ActionHandle.expose(
-                self._node_runner
-            ),
-            "clear_scene": await clear_scene.ActionHandle.expose(
-                self._node_runner
-            ),
-            "spawn_object": await spawn_object.ActionHandle.expose(
-                self._node_runner
-            ),
-            "move_object": await move_object.ActionHandle.expose(
-                self._node_runner
-            ),
-            "remove_object": await remove_object.ActionHandle.expose(
-                self._node_runner
-            ),
-            "move_robot": await move_robot.ActionHandle.expose(
-                self._node_runner
-            ),
+            operation: await module.ActionHandle.expose(self._node_runner)
+            for operation, module in _ACTIONS.items()
         }
 
         services = (
@@ -372,19 +540,14 @@ class SceneActionIO:
         )
 
         self._tasks = [
-            asyncio.create_task(
-                self._serve_apply_force()
-            ),
             *(
                 asyncio.create_task(self._serve_service(module, handler))
                 for module, handler in services
             ),
-            asyncio.create_task(self._serve_load_scene()),
-            asyncio.create_task(self._serve_clear_scene()),
-            asyncio.create_task(self._serve_spawn_object()),
-            asyncio.create_task(self._serve_move_object()),
-            asyncio.create_task(self._serve_remove_object()),
-            asyncio.create_task(self._serve_move_robot()),
+            *(
+                asyncio.create_task(self._serve_action(operation))
+                for operation in _ACTIONS
+            ),
         ]
 
         logger.info(
@@ -464,19 +627,50 @@ class SceneActionIO:
         with self._lock:
             return self._catalogue
 
-    def _catalogue_ready(self) -> str | None:
-        """Why the catalogue cannot be answered yet, or None once it can."""
+    def _require_catalogue(self) -> None:
+        """Raises `precondition_failed` until the launcher has handed over
+        the discovered catalogue."""
 
         with self._lock:
             ready = self._assets_ready
 
         if ready:
-            return None
+            return
 
-        return (
+        raise SceneFailure(
+            PRECONDITION_FAILED,
             "Isaac is still discovering its asset catalogue; "
-            "it is available once the stage has loaded"
+            "it is available once the stage has loaded",
         )
+
+    def _catalogue_asset(self, asset_id: str, kind: str) -> dict:
+        """The asset `asset_id` names in the catalogue, which must be of
+        `kind`. Refused while the catalogue is not discovered yet, and for an
+        id that names no asset of that kind."""
+
+        self._require_catalogue()
+        asset = self._asset(asset_id)
+
+        if asset is None:
+            raise _rejected(f"Unknown asset_id: {asset_id}")
+
+        if asset.get("kind") != kind:
+            raise _rejected(f"Asset is not {_ASSET_KIND_WORDS[kind]}: {asset_id}")
+
+        return asset
+
+    def _latest_snapshot(self) -> ObjectStateSnapshot:
+        """The latest capture. Raises `precondition_failed` with why there is
+        none: Isaac has not captured yet, or its last capture failed."""
+
+        with self._lock:
+            snapshot = self._snapshot
+            unavailable = self._unavailable
+
+        if snapshot is None:
+            raise SceneFailure(PRECONDITION_FAILED, unavailable)
+
+        return snapshot
 
     def _handle_get_assets(
         self,
@@ -487,25 +681,14 @@ class SceneActionIO:
         looked for in an entry's id, name and description whatever the
         case."""
 
-        not_ready = self._catalogue_ready()
-
-        if not_ready is not None:
-            return get_assets_list.Response(
-                success=False,
-                message=not_ready,
-                assets_json="[]",
-            )
+        self._require_catalogue()
 
         kind = _filter(request.data.kind)
         category = _filter(request.data.category)
         query = _filter(request.data.query)
 
         if kind is not None and kind not in _ASSET_KINDS:
-            return get_assets_list.Response(
-                success=False,
-                message="kind must be scene or object",
-                assets_json="[]",
-            )
+            raise _rejected("kind must be scene or object")
 
         assets = [
             asset
@@ -514,8 +697,6 @@ class SceneActionIO:
         ]
 
         return get_assets_list.Response(
-            success=True,
-            message=f"{len(assets)} assets listed",
             assets_json=json.dumps(
                 assets,
                 separators=(",", ":"),
@@ -529,14 +710,7 @@ class SceneActionIO:
         """Every category of the catalogue with its count, in the order the
         catalogue lists them."""
 
-        not_ready = self._catalogue_ready()
-
-        if not_ready is not None:
-            return get_asset_categories.Response(
-                success=False,
-                message=not_ready,
-                categories=[],
-            )
+        self._require_catalogue()
 
         counts: dict[tuple[str, str], int] = {}
 
@@ -554,8 +728,6 @@ class SceneActionIO:
         ]
 
         return get_asset_categories.Response(
-            success=True,
-            message=f"{len(categories)} categories",
             categories=categories,
         )
 
@@ -573,25 +745,12 @@ class SceneActionIO:
         category = _filter(request.data.category)
 
         if source is not None and source not in _OBJECT_SOURCES:
-            return get_objects_list.Response(
-                success=False,
-                message="source must be spawned or scene",
-                timestamp=0.0,
-                objects=[],
-            )
+            raise _rejected("source must be spawned or scene")
+
+        snapshot = self._latest_snapshot()
 
         with self._lock:
-            snapshot = self._snapshot
-            unavailable = self._unavailable
             category_by_asset = self._category_by_asset
-
-        if snapshot is None:
-            return get_objects_list.Response(
-                success=False,
-                message=unavailable,
-                timestamp=0.0,
-                objects=[],
-            )
 
         objects = []
 
@@ -617,8 +776,6 @@ class SceneActionIO:
                 )
 
         return get_objects_list.Response(
-            success=True,
-            message=f"{len(objects)} objects",
             timestamp=snapshot.timestamp_s,
             objects=objects,
         )
@@ -631,28 +788,16 @@ class SceneActionIO:
         scale, as get_objects_list lists them. This stage keeps no landmark
         and simulates no state of an object, so landmarks is empty and no
         state field is present. An object_id that names no spawned object is
-        refused."""
+        refused with `rejected`."""
 
         object_id = request.data.object_id
-
-        with self._lock:
-            snapshot = self._snapshot
-            unavailable = self._unavailable
-
-        if snapshot is None:
-            return _refused_object(unavailable)
-
+        snapshot = self._latest_snapshot()
         record = snapshot.record_of(object_id)
 
         if record is None:
-            return _refused_object(f"Unknown object_id: {object_id}")
+            raise _rejected(f"Unknown object_id: {object_id}")
 
         return get_object.Response(
-            success=True,
-            message=(
-                f"pose and scale of {object_id}; Isaac keeps no landmark "
-                "and simulates no state of an object"
-            ),
             timestamp=snapshot.timestamp_s,
             object_id=record.object_id,
             asset_id=record.asset_id,
@@ -667,20 +812,12 @@ class SceneActionIO:
         self,
         _request,
     ) -> get_scene.Response:
+        """The scene loaded last: no asset while the stage stands empty."""
+
         with self._lock:
             scene = dict(self._scene)
 
-        if not scene["asset_id"]:
-            return get_scene.Response(
-                success=True,
-                message="no scene is loaded: the stage stands empty",
-                asset_id="",
-                scale=1.0,
-            )
-
         return get_scene.Response(
-            success=True,
-            message=f"scene {scene['asset_id']} at scale {scene['scale']}",
             asset_id=scene["asset_id"],
             scale=scene["scale"],
         )
@@ -744,23 +881,13 @@ class SceneActionIO:
         self,
         _request,
     ) -> get_object_states.Response:
-        with self._lock:
-            snapshot = self._snapshot
-            unavailable = self._unavailable
+        """The latest capture. No capture is not an empty scene: it gives an
+        error reply with `precondition_failed`, as object_state:v1 says of
+        an implementer that is not ready."""
 
-        if snapshot is None:
-            # Unavailable is not an empty scene: the timestamp and objects
-            # carry nothing.
-            return get_object_states.Response(
-                success=False,
-                message=unavailable,
-                timestamp=0.0,
-                objects=[],
-            )
+        snapshot = self._latest_snapshot()
 
         return get_object_states.Response(
-            success=True,
-            message=f"{len(snapshot.objects)} objects",
             timestamp=snapshot.timestamp_s,
             objects=[
                 get_object_states.ResponseObjectsItem(
@@ -786,10 +913,7 @@ class SceneActionIO:
             )
             for robot in standing
         ]
-        plural = "" if len(robots) == 1 else "s"
         return get_robots_list.Response(
-            success=True,
-            message=f"{len(robots)} robot{plural} standing",
             robots=robots,
         )
 
@@ -816,6 +940,9 @@ class SceneActionIO:
         operation: str,
         payload: dict,
     ) -> dict:
+        """Runs a command on the Isaac main thread and returns its result.
+        Raises the SceneFailure of a command that did not run or gave no
+        result."""
         return await asyncio.wrap_future(
             self._queue(operation, payload).future
         )
@@ -866,12 +993,14 @@ class SceneActionIO:
         """Execute queued scene commands on the Isaac main thread.
 
         Each command's goal learns that the command starts before it runs,
-        and completes after a fresh object-state capture, so
-        a read once it has completed observes its edit. Until the first
-        stamped capture, every frame tries one, so reads are answered from
-        the first frame on, ahead of the stream's first tick. After that the
-        state tick and the capture after each edit keep the snapshot current,
-        and bring it back after a failed read.
+        and ends after a fresh object-state capture, so a read once it has
+        ended observes its edit. A command the stage cannot take now gives
+        its goal the SceneFailure of its check, and a command that raised
+        anything else gives `attempt_failed`. Until the first stamped
+        capture, every frame tries one, so reads are answered from the first
+        frame on, ahead of the stream's first tick. After that the state tick
+        and the capture after each edit keep the snapshot current, and bring
+        it back after a failed read.
         """
 
         with self._lock:
@@ -889,6 +1018,8 @@ class SceneActionIO:
 
             _settle(pending.started, None)
 
+            failure = None
+
             try:
                 result = self._execute(
                     launcher,
@@ -896,22 +1027,40 @@ class SceneActionIO:
                     pending.payload,
                 )
 
+            except SceneFailure as refused:
+                logger.warning(
+                    "Scene action '%s' did not run: %s",
+                    pending.operation,
+                    refused.message,
+                )
+
+                failure = refused
+
             except Exception as exc:
                 logger.exception(
                     "Scene action '%s' failed",
                     pending.operation,
                 )
 
-                result = {
-                    "success": False,
-                    "message": str(exc),
-                }
+                failure = SceneFailure(ATTEMPT_FAILED, str(exc))
 
             # Succeeded or failed partway, whatever the command did to the
-            # scene is in the snapshot before its goal completes.
+            # scene is in the snapshot before its goal ends.
             self.capture_object_states()
 
-            _settle(pending.future, result)
+            if failure is None:
+                _settle(pending.future, result)
+            else:
+                _settle_failure(pending.future, failure)
+
+    def _check(self, operation: str, payload: dict):
+        """The command a goal of `operation` names, checked against the
+        catalogue, the spawned objects and the robots as they are now.
+        Raises SceneFailure for a command the stage cannot take."""
+
+        check, _run = self._commands[operation]
+
+        return check(payload)
 
     def _execute(
         self,
@@ -919,328 +1068,216 @@ class SceneActionIO:
         operation: str,
         payload: dict,
     ) -> dict:
-        """Execute one scene command from the Isaac simulation thread."""
+        """Execute one scene command from the Isaac simulation thread, and
+        return its result: the fields of the goal's result. The command is
+        checked again first, against the stage as it is now."""
 
-        if operation == "load_scene":
-            asset_id = payload["asset_id"]
-            asset = self._asset(asset_id)
+        check, run = self._commands[operation]
 
-            if asset is None:
-                raise ValueError(
-                    f"Unknown asset_id: {asset_id}"
-                )
+        return run(launcher, check(payload))
 
-            if asset.get("kind") != "scene":
-                raise ValueError(
-                    f"Asset is not a scene: {asset_id}"
-                )
+    def _scene_to_load(self, payload: dict) -> _Load:
+        asset = self._catalogue_asset(payload["asset_id"], "scene")
 
-            scale = float(payload["scale"])
-
-            if scale <= 0.0:
-                raise ValueError(
-                    "scale must be greater than zero"
-                )
-
-            # scene_manipulation: spawned objects go first, then the scene is
-            # replaced.
-            self._remove_spawned_objects(launcher)
-
-            launcher._runtime_load_isaac_scene(
-                {
-                    "path": asset["path"],
-                    "scale": [scale, scale, scale],
-                }
-            )
-
-            with self._lock:
-                self._scene = {"asset_id": asset_id, "scale": scale}
-
-            return {
-                "success": True,
-                "message": f"Loaded scene {asset_id}",
-            }
-
-        if operation == "clear_scene":
-            self._remove_spawned_objects(launcher)
-
-            launcher._runtime_clear_scene()
-
-            with self._lock:
-                self._scene = {"asset_id": "", "scale": 1.0}
-
-            return {
-                "success": True,
-                "message": "Runtime scene cleared",
-            }
-
-        if operation == "spawn_object":
-            _refuse_snap(payload)
-            asset_id = payload["asset_id"]
-            asset = self._asset(asset_id)
-
-            if asset is None:
-                raise ValueError(
-                    f"Unknown asset_id: {asset_id}"
-                )
-
-            if asset.get("kind") != "object":
-                raise ValueError(
-                    f"Asset is not an object: {asset_id}"
-                )
-
-            position = [
-                float(value)
-                for value in payload["position"]
-            ]
-
-            if len(position) != 3:
-                raise ValueError(
-                    "position must contain exactly 3 values"
-                )
-
-            orientation = _orientation_of(payload)
-            yaw = _yaw_of(payload)
-
-            scale = float(payload["scale"])
-
-            if scale <= 0.0:
-                raise ValueError(
-                    "scale must be greater than zero"
-                )
-
-            physics = str(
-                payload["physics"]
-            ).lower()
-
-            if physics not in (
-                "none",
-                "static",
-                "dynamic",
-            ):
-                raise ValueError(
-                    "physics must be none, static, or dynamic"
-                )
-
-            mass = float(
-                payload["mass"]
-            )
-
-            if mass <= 0.0:
-                raise ValueError(
-                    "mass must be greater than zero"
-                )
-
-            object_id = (
-                "obj_"
-                + uuid.uuid4().hex[:12]
-            )
-
-            spawn = {
-                "name": object_id,
-                "path": asset["path"],
-                "position": position,
-                "yaw": yaw,
-                "scale": [
-                    scale,
-                    scale,
-                    scale,
-                ],
-                "physics": physics,
-                "mass": mass,
-            }
-
-            if orientation is not None:
-                spawn["orientation"] = orientation
-
-            launcher._runtime_spawn_isaac_asset(spawn)
-
-            with self._lock:
-                self._objects[object_id] = {
-                    "object_id": object_id,
-                    "asset_id": asset_id,
-                    "scale": scale,
-                    "physics": physics,
-                    "mass": mass,
-                }
-
-            return {
-                "success": True,
-                "message": f"Spawned {asset_id}",
-                "object_id": object_id,
-            }
-
-        if operation == "move_object":
-            _refuse_snap(payload)
-            object_id = payload["object_id"]
-
-            if self._object(object_id) is None:
-                raise ValueError(
-                    f"Unknown object_id: {object_id}"
-                )
-
-            position = [
-                float(value)
-                for value in payload["position"]
-            ]
-
-            if len(position) != 3:
-                raise ValueError(
-                    "position must contain exactly 3 values"
-                )
-
-            move = {
-                "name": object_id,
-                "position": position,
-            }
-
-            orientation = _orientation_of(payload)
-
-            if orientation is not None:
-                move["orientation"] = orientation
-
-            launcher._runtime_move_object(move)
-
-            return {
-                "success": True,
-                "message": f"Moved {object_id}",
-            }
-
-        if operation == "remove_object":
-            object_id = payload["object_id"]
-
-            if self._object(object_id) is None:
-                raise ValueError(
-                    f"Unknown object_id: {object_id}"
-                )
-
-            launcher._runtime_remove(
-                {
-                    "name": object_id,
-                }
-            )
-
-            with self._lock:
-                self._objects.pop(
-                    object_id,
-                    None,
-                )
-
-            return {
-                "success": True,
-                "message": f"Removed {object_id}",
-            }
-
-        if operation == "apply_force":
-            object_id = str(
-                payload["object_id"]
-            )
-
-            obj = self._object(
-                object_id
-            )
-
-            if obj is None:
-                raise ValueError(
-                    f"Unknown object_id: {object_id}"
-                )
-
-            if (
-                str(
-                    obj.get(
-                        "physics",
-                        "none",
-                    )
-                ).lower()
-                != "dynamic"
-            ):
-                raise ValueError(
-                    "Force can only be applied to "
-                    f"dynamic objects: {object_id}"
-                )
-
-            force = [
-                float(value)
-                for value in payload["force"]
-            ]
-
-            if len(force) != 3:
-                raise ValueError(
-                    "force must contain exactly "
-                    "3 values [Fx, Fy, Fz]"
-                )
-
-            duration_s = float(
-                payload["duration_s"]
-            )
-
-            if (
-                duration_s <= 0.0
-                or duration_s > 30.0
-            ):
-                raise ValueError(
-                    "duration_s must be > 0 "
-                    "and <= 30 seconds"
-                )
-
-            launcher._runtime_apply_force(
-                {
-                    "name": object_id,
-                    "force": force,
-                    "duration_s": duration_s,
-                }
-            )
-
-            return {
-                "success": True,
-                "message": (
-                    f"Applied force {force} N "
-                    f"to {object_id} for "
-                    f"{duration_s:.3f} s"
-                ),
-            }
-
-        if operation == "move_robot":
-            robot = payload["robot"]
-            standing = self._world.robots()
-            names = [
-                each.instance
-                for each in standing
-            ]
-
-            if robot not in names:
-                raise ValueError(
-                    f"no robot stands as {robot!r} in this "
-                    f"simulation, which stands "
-                    f"{', '.join(names) or 'none'}"
-                )
-
-            position = [
-                float(value)
-                for value in payload["position"]
-            ]
-
-            if len(position) != 3:
-                raise ValueError(
-                    "position must contain exactly 3 values"
-                )
-
-            launcher._runtime_move_robot_root(
-                {
-                    "robot": robot,
-                    "position": position,
-                    "yaw": _yaw_of(payload),
-                }
-            )
-
-            return {
-                "success": True,
-                "message": "Robot root moved",
-            }
-
-        raise ValueError(
-            f"Unsupported scene operation: {operation}"
+        return _Load(
+            asset_id=payload["asset_id"],
+            path=asset["path"],
+            scale=_positive_of(payload, "scale"),
         )
+
+    def _load_scene(self, launcher, load: _Load) -> dict:
+        # scene_manipulation: spawned objects go first, then the scene is
+        # replaced.
+        self._remove_spawned_objects(launcher)
+
+        launcher._runtime_load_isaac_scene(
+            {
+                "path": load.path,
+                "scale": [load.scale, load.scale, load.scale],
+            }
+        )
+
+        with self._lock:
+            self._scene = {"asset_id": load.asset_id, "scale": load.scale}
+
+        return {}
+
+    def _clear_scene(self, launcher, _nothing) -> dict:
+        self._remove_spawned_objects(launcher)
+
+        launcher._runtime_clear_scene()
+
+        with self._lock:
+            self._scene = {"asset_id": "", "scale": 1.0}
+
+        return {}
+
+    def _spawn_of(self, payload: dict) -> _Spawn:
+        _refuse_snap(payload)
+        asset = self._catalogue_asset(payload["asset_id"], "object")
+
+        return _Spawn(
+            asset_id=payload["asset_id"],
+            path=asset["path"],
+            position=_position_of(payload),
+            yaw=_yaw_of(payload),
+            orientation=_orientation_of(payload),
+            scale=_positive_of(payload, "scale"),
+            physics=_physics_of(payload),
+            mass=_positive_of(payload, "mass"),
+        )
+
+    def _spawn_object(self, launcher, spawn: _Spawn) -> dict:
+        object_id = (
+            "obj_"
+            + uuid.uuid4().hex[:12]
+        )
+
+        command = {
+            "name": object_id,
+            "path": spawn.path,
+            "position": spawn.position,
+            "yaw": spawn.yaw,
+            "scale": [
+                spawn.scale,
+                spawn.scale,
+                spawn.scale,
+            ],
+            "physics": spawn.physics,
+            "mass": spawn.mass,
+        }
+
+        if spawn.orientation is not None:
+            command["orientation"] = spawn.orientation
+
+        launcher._runtime_spawn_isaac_asset(command)
+
+        with self._lock:
+            self._objects[object_id] = {
+                "object_id": object_id,
+                "asset_id": spawn.asset_id,
+                "scale": spawn.scale,
+                "physics": spawn.physics,
+                "mass": spawn.mass,
+            }
+
+        return {"object_id": object_id}
+
+    def _spawned_object(self, object_id: str) -> dict:
+        """The spawned object `object_id` names. Refused with `rejected` for
+        an id that names none."""
+
+        obj = self._object(object_id)
+
+        if obj is None:
+            raise _rejected(f"Unknown object_id: {object_id}")
+
+        return obj
+
+    def _move_of(self, payload: dict) -> _Move:
+        _refuse_snap(payload)
+        object_id = str(payload["object_id"])
+        self._spawned_object(object_id)
+
+        return _Move(
+            object_id=object_id,
+            position=_position_of(payload),
+            orientation=_orientation_of(payload),
+        )
+
+    def _move_object(self, launcher, move: _Move) -> dict:
+        command = {
+            "name": move.object_id,
+            "position": move.position,
+        }
+
+        if move.orientation is not None:
+            command["orientation"] = move.orientation
+
+        launcher._runtime_move_object(command)
+
+        return {}
+
+    def _object_to_remove(self, payload: dict) -> str:
+        object_id = str(payload["object_id"])
+        self._spawned_object(object_id)
+
+        return object_id
+
+    def _remove_object(self, launcher, object_id: str) -> dict:
+        launcher._runtime_remove(
+            {
+                "name": object_id,
+            }
+        )
+
+        with self._lock:
+            self._objects.pop(
+                object_id,
+                None,
+            )
+
+        return {}
+
+    def _push_of(self, payload: dict) -> _Push:
+        """A push of a dynamic object: a static or visual-only object takes
+        no force, so a push of one is refused."""
+
+        object_id = str(payload["object_id"])
+        obj = self._spawned_object(object_id)
+
+        if str(obj.get("physics", "none")).lower() != "dynamic":
+            raise _rejected(
+                f"Force can only be applied to dynamic objects: {object_id}"
+            )
+
+        return _Push(
+            object_id=object_id,
+            force=_finite_vector(payload, "force", 3, "[Fx, Fy, Fz]"),
+            duration_s=_duration_of(payload),
+        )
+
+    def _apply_force(self, launcher, push: _Push) -> dict:
+        launcher._runtime_apply_force(
+            {
+                "name": push.object_id,
+                "force": push.force,
+                "duration_s": push.duration_s,
+            }
+        )
+
+        return {}
+
+    def _robot_move_of(self, payload: dict) -> _RobotMove:
+        robot = payload["robot"]
+        names = [
+            each.instance
+            for each in self._world.robots()
+        ]
+
+        if robot not in names:
+            raise _rejected(
+                f"no robot stands as {robot!r} in this "
+                f"simulation, which stands "
+                f"{', '.join(names) or 'none'}"
+            )
+
+        return _RobotMove(
+            robot=robot,
+            position=_position_of(payload),
+            yaw=_yaw_of(payload),
+        )
+
+    def _move_robot(self, launcher, move: _RobotMove) -> dict:
+        launcher._runtime_move_robot_root(
+            {
+                "robot": move.robot,
+                "position": move.position,
+                "yaw": move.yaw,
+            }
+        )
+
+        return {}
 
     def _remove_spawned_objects(self, launcher) -> None:
         """Remove every spawned object, as load_scene and clear_scene promise."""
@@ -1258,43 +1295,19 @@ class SceneActionIO:
             with self._lock:
                 self._objects.pop(object_id, None)
 
-    async def _finish_simple(
-        self,
-        context,
-        result: dict,
-    ) -> None:
-        success = bool(
-            result.get("success", False)
-        )
-
-        message = str(
-            result.get("message", "")
-        )
-
-        if context.is_cancelled():
-            await context.complete_cancelled(
-                success,
-                message,
-            )
-
-        else:
-            await context.complete(
-                success,
-                message,
-            )
-
     async def _serve_service(self, module, handler) -> None:
         """Answers the requests of the service `module` with `handler` for
-        the life of the node; a round that fails is logged and the next one
-        starts a second later."""
+        the life of the node, each SceneFailure as an error reply; a round
+        that fails is logged and the next one starts a second later."""
 
         name = module.__name__.rsplit(".", 1)[-1]
+        answer = _answering(module, handler)
 
         while True:
             try:
                 await module.handle_next_request(
                     self._node_runner,
-                    handler,
+                    answer,
                 )
 
             except asyncio.CancelledError:
@@ -1307,243 +1320,58 @@ class SceneActionIO:
                 )
                 await asyncio.sleep(1.0)
 
-    async def _serve_load_scene(self) -> None:
-        handle = self._action_handles[
-            "load_scene"
-        ]
+    def _decide(self, module: ModuleType, operation: str, request):
+        """Admits a goal of `operation` whose command the stage can take
+        now, and refuses any other with the failure kind of its check."""
+
+        try:
+            self._check(operation, _payload_of(operation, request))
+
+        except SceneFailure as failure:
+            return module.GoalDecision.refuse(failure.kind, failure.message)
+
+        return module.GoalDecision.accept()
+
+    async def _serve_action(self, operation: str) -> None:
+        """Serves the goals of the action `operation` for the life of the
+        node, one at a time, in the order they come."""
+
+        module = _ACTIONS[operation]
+        handle = self._action_handles[operation]
+        decide = partial(self._decide, module, operation)
 
         while True:
-            context = await handle.handle_goal_next_request(
-                lambda _request:
-                load_scene.GoalDecision.accept()
-            )
+            context = await handle.handle_goal_next_request(decide)
 
             if context is None:
                 return
 
-            request = context.request().data
+            await self._run_goal(operation, context)
 
-            result = await self._submit_reporting_progress(
-                context,
-                "load_scene",
-                {
-                    "asset_id": request.asset_id,
-                    "scale": request.scale,
-                },
-            )
+    async def _run_goal(self, operation: str, context) -> None:
+        """Runs the command of one admitted goal and ends the goal: failed
+        with the kind of a command that did not run or gave no result, and
+        otherwise completed with its result. A cancel does not stop a
+        command once it is queued, so a goal that received one still
+        completes with what its command did."""
 
-            await self._finish_simple(
-                context,
-                result,
-            )
+        payload = _payload_of(operation, context.request())
 
-    async def _serve_clear_scene(self) -> None:
-        handle = self._action_handles[
-            "clear_scene"
-        ]
-
-        while True:
-            context = await handle.handle_goal_next_request(
-                lambda _request:
-                clear_scene.GoalDecision.accept()
-            )
-
-            if context is None:
-                return
-
-            result = await self._submit(
-                "clear_scene",
-                {},
-            )
-
-            await self._finish_simple(
-                context,
-                result,
-            )
-
-    async def _serve_spawn_object(self) -> None:
-        handle = self._action_handles[
-            "spawn_object"
-        ]
-
-        while True:
-            context = await handle.handle_goal_next_request(
-                lambda _request:
-                spawn_object.GoalDecision.accept()
-            )
-
-            if context is None:
-                return
-
-            request = context.request().data
-
-            result = await self._submit_reporting_progress(
-                context,
-                "spawn_object",
-                {
-                    "asset_id": request.asset_id,
-                    "position": list(
-                        request.position
-                    ),
-                    "yaw": request.yaw,
-                    "orientation": request.orientation,
-                    "scale": request.scale,
-                    "physics": request.physics,
-                    "mass": request.mass,
-                    "snap_to": request.snap_to,
-                },
-            )
-
-            success = bool(
-                result.get("success", False)
-            )
-            message = str(
-                result.get("message", "")
-            )
-            object_id = str(
-                result.get("object_id", "")
-            )
-
-            if context.is_cancelled():
-                await context.complete_cancelled(
-                    success,
-                    message,
-                    object_id,
+        try:
+            if operation in _REPORTING_PROGRESS:
+                result = await self._submit_reporting_progress(
+                    context,
+                    operation,
+                    payload,
                 )
-
             else:
-                await context.complete(
-                    success,
-                    message,
-                    object_id,
+                result = await self._submit(
+                    operation,
+                    payload,
                 )
 
-    async def _serve_move_object(self) -> None:
-        handle = self._action_handles[
-            "move_object"
-        ]
+        except SceneFailure as failure:
+            await context.fail(failure.kind, failure.message)
+            return
 
-        while True:
-            context = await handle.handle_goal_next_request(
-                lambda _request:
-                move_object.GoalDecision.accept()
-            )
-
-            if context is None:
-                return
-
-            request = context.request().data
-
-            result = await self._submit(
-                "move_object",
-                {
-                    "object_id": request.object_id,
-                    "position": list(
-                        request.position
-                    ),
-                    "orientation": request.orientation,
-                    "snap_to": request.snap_to,
-                },
-            )
-
-            await self._finish_simple(
-                context,
-                result,
-            )
-
-    async def _serve_remove_object(self) -> None:
-        handle = self._action_handles[
-            "remove_object"
-        ]
-
-        while True:
-            context = await handle.handle_goal_next_request(
-                lambda _request:
-                remove_object.GoalDecision.accept()
-            )
-
-            if context is None:
-                return
-
-            request = context.request().data
-
-            result = await self._submit(
-                "remove_object",
-                {
-                    "object_id": request.object_id,
-                },
-            )
-
-            await self._finish_simple(
-                context,
-                result,
-            )
-
-    async def _serve_apply_force(self) -> None:
-        handle = self._action_handles[
-            "apply_force"
-        ]
-
-        while True:
-            context = (
-                await handle.handle_goal_next_request(
-                    lambda _request:
-                    apply_force.GoalDecision.accept()
-                )
-            )
-
-            if context is None:
-                return
-
-            request = context.request().data
-
-            result = await self._submit(
-                "apply_force",
-                {
-                    "object_id": request.object_id,
-                    "force": [
-                        float(value)
-                        for value in request.force
-                    ],
-                    "duration_s": float(
-                        request.duration_s
-                    ),
-                },
-            )
-
-            await self._finish_simple(
-                context,
-                result,
-            )
-
-    async def _serve_move_robot(self) -> None:
-        handle = self._action_handles[
-            "move_robot"
-        ]
-
-        while True:
-            context = await handle.handle_goal_next_request(
-                lambda _request:
-                move_robot.GoalDecision.accept()
-            )
-
-            if context is None:
-                return
-
-            request = context.request().data
-
-            result = await self._submit(
-                "move_robot",
-                {
-                    "robot": request.robot,
-                    "position": list(
-                        request.position
-                    ),
-                    "yaw": request.yaw,
-                },
-            )
-
-            await self._finish_simple(
-                context,
-                result,
-            )
+        await context.complete(**result)

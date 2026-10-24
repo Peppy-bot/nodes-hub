@@ -1,11 +1,14 @@
 """The scene_manipulation and object_state provider: what get_assets_list answers
 before and after discovery, what load_scene and clear_scene do to spawned
-objects, what get_object_states answers: nothing until a capture, then
+objects, what get_object_states answers: an error reply until a capture, then
 the latest capture under its own stamp, every completed edit included, what
-get_object answers for one object of that capture, and what a load_scene or
-spawn_object goal reports on its feedback."""
+get_object answers for one object of that capture, what a load_scene or
+spawn_object goal reports on its feedback, and the failure kind of each goal
+refused when it arrives, of each goal whose command fails, and of each error
+reply."""
 
 import asyncio
+import contextlib
 import importlib
 import json
 import logging
@@ -24,6 +27,14 @@ def _request(**fields):
     """A service request as the generated code hands it over: its fields
     under `data`, an absent optional field None."""
     return SimpleNamespace(data=SimpleNamespace(**fields))
+
+
+def _refused(provider, call, kind):
+    """The message of the SceneFailure of `kind` that `call` raises."""
+    with pytest.raises(provider.module.SceneFailure) as refused:
+        call()
+    assert refused.value.kind == kind, refused.value.message
+    return refused.value.message
 
 
 def _assets_request(kind=None, category=None, query=None):
@@ -140,24 +151,17 @@ _CATALOGUE = {
 
 
 def test_assets_are_refused_with_a_reason_until_discovery_hands_them_over(provider):
-    response = provider.io._handle_get_assets(_assets_request())
-    assert response.success is False
-    assert "still discovering its asset catalogue" in response.message
-    assert json.loads(response.assets_json) == []
-    categories = provider.io._handle_get_asset_categories(None)
-    assert categories.success is False
-    assert "still discovering its asset catalogue" in categories.message
-    assert categories.categories == []
+    assets = _refused(provider, lambda: provider.io._handle_get_assets(_assets_request()), "precondition_failed")
+    assert "still discovering its asset catalogue" in assets
+    categories = _refused(provider, lambda: provider.io._handle_get_asset_categories(None), "precondition_failed")
+    assert "still discovering its asset catalogue" in categories
 
     provider.io.set_assets({})
     response = provider.io._handle_get_assets(_assets_request())
-    assert response.success is True
-    assert response.message == "0 assets listed"
     assert json.loads(response.assets_json) == []
 
     provider.io.set_assets(_CATALOGUE)
     response = provider.io._handle_get_assets(_assets_request())
-    assert response.success is True
     assert [a["asset_id"] for a in json.loads(response.assets_json)] == [
         "props/blocks/blue_block", "props/blocks/red_block", "scene/full_warehouse",
     ]
@@ -167,7 +171,6 @@ def test_assets_are_refused_with_a_reason_until_discovery_hands_them_over(provid
 
 def _listed(provider, **filters):
     response = provider.io._handle_get_assets(_assets_request(**filters))
-    assert response.success is True, response.message
     return [a["asset_id"] for a in json.loads(response.assets_json)]
 
 
@@ -185,10 +188,8 @@ def test_the_catalogue_is_narrowed_by_each_filter_and_a_bad_kind_is_refused(prov
     # A filter sent empty is no filter, as a filter left out.
     assert _listed(provider, kind="", category="", query="") == _listed(provider)
 
-    refused = provider.io._handle_get_assets(_assets_request(kind="robot"))
-    assert refused.success is False
-    assert refused.message == "kind must be scene or object"
-    assert json.loads(refused.assets_json) == []
+    refused = _refused(provider, lambda: provider.io._handle_get_assets(_assets_request(kind="robot")), "rejected")
+    assert refused == "kind must be scene or object"
 
 
 def test_the_categories_count_the_catalogue_in_listing_order(provider):
@@ -196,7 +197,6 @@ def test_the_categories_count_the_catalogue_in_listing_order(provider):
 
     response = provider.io._handle_get_asset_categories(None)
 
-    assert response.success is True
     assert [(c.kind, c.category, c.count) for c in response.categories] == [
         ("object", "Blocks", 2), ("scene", "Scenes", 1),
     ]
@@ -210,7 +210,7 @@ def test_the_inventory_lists_every_spawned_object_with_its_category_and_pose(pro
 
     response = provider.io._handle_get_objects_list(_objects_request())
 
-    assert (response.success, response.message, response.timestamp) == (True, "2 objects", 10.0)
+    assert response.timestamp == 10.0
     assert [vars(item) for item in response.objects] == [
         {
             "object_id": red, "asset_id": "props/blocks/red_block", "category": "Blocks", "source": "spawned",
@@ -227,27 +227,27 @@ def test_the_inventory_lists_every_spawned_object_with_its_category_and_pose(pro
     spawned = provider.io._handle_get_objects_list(_objects_request(source="spawned"))
     assert [item.object_id for item in spawned.objects] == [red, blue]
     scene = provider.io._handle_get_objects_list(_objects_request(source="scene"))
-    assert (scene.success, scene.objects) == (True, [])
+    assert scene.objects == []
     blocks = provider.io._handle_get_objects_list(_objects_request(category="Blocks"))
     assert len(blocks.objects) == 2
     none = provider.io._handle_get_objects_list(_objects_request(category="Furniture"))
-    assert (none.success, none.objects) == (True, [])
+    assert none.objects == []
     # A filter sent empty is no filter, as a filter left out.
     empty = provider.io._handle_get_objects_list(_objects_request(source="", category=""))
     assert [item.object_id for item in empty.objects] == [red, blue]
 
-    refused = provider.io._handle_get_objects_list(_objects_request(source="placed"))
-    assert refused.success is False
-    assert refused.message == "source must be spawned or scene"
-    assert (refused.timestamp, refused.objects) == (0.0, [])
+    refused = _refused(
+        provider, lambda: provider.io._handle_get_objects_list(_objects_request(source="placed")), "rejected"
+    )
+    assert refused == "source must be spawned or scene"
 
 
 def test_the_inventory_is_unavailable_with_the_captures_reason_until_a_capture(provider):
-    response = provider.io._handle_get_objects_list(_objects_request())
+    unavailable = _refused(
+        provider, lambda: provider.io._handle_get_objects_list(_objects_request()), "precondition_failed"
+    )
 
-    assert response.success is False
-    assert "has not captured its object state yet" in response.message
-    assert (response.timestamp, response.objects) == (0.0, [])
+    assert "has not captured its object state yet" in unavailable
 
 
 # What a get_object answer holds besides its pose: this stage keeps no
@@ -258,13 +258,9 @@ _NO_LANDMARK_AND_NO_STATE = {
 }
 
 
-def _assert_no_object(response, reason):
-    """A get_object refusal: its reason, and nothing in any other field."""
-    assert vars(response) == {
-        "success": False, "message": reason, "timestamp": 0.0, "object_id": "", "asset_id": "",
-        "position": [0.0, 0.0, 0.0], "orientation": [0.0, 0.0, 0.0, 0.0], "scale": 0.0,
-        **_NO_LANDMARK_AND_NO_STATE,
-    }
+def _assert_no_object(provider, object_id, kind, reason):
+    """A get_object error reply: its kind and its reason."""
+    assert _refused(provider, lambda: provider.io._handle_get_object(_object_request(object_id)), kind) == reason
 
 
 def test_one_object_answers_its_pose_and_scale_with_no_landmark_and_no_state(provider):
@@ -281,8 +277,6 @@ def test_one_object_answers_its_pose_and_scale_with_no_landmark_and_no_state(pro
     response = provider.io._handle_get_object(_object_request(blue))
 
     assert vars(response) == {
-        "success": True,
-        "message": f"pose and scale of {blue}; Isaac keeps no landmark and simulates no state of an object",
         "timestamp": 10.0, "object_id": blue, "asset_id": "props/blocks/blue_block",
         "position": [1.0, 2.0, 3.0], "orientation": [0.0, 0.0, 0.0, 1.0], "scale": 1.5,
         **_NO_LANDMARK_AND_NO_STATE,
@@ -300,35 +294,31 @@ def test_one_object_is_refused_when_its_id_names_no_spawned_object(provider):
     object_id = _spawn(provider)
     provider.io.capture_object_states()
 
-    _assert_no_object(provider.io._handle_get_object(_object_request("obj_missing")), "Unknown object_id: obj_missing")
-    _assert_no_object(provider.io._handle_get_object(_object_request("")), "Unknown object_id: ")
+    _assert_no_object(provider, "obj_missing", "rejected", "Unknown object_id: obj_missing")
+    _assert_no_object(provider, "", "rejected", "Unknown object_id: ")
 
     # A removed object is gone from the capture that follows its removal.
     provider.io._execute(provider.launcher, "remove_object", {"object_id": object_id})
     provider.io.capture_object_states()
-    _assert_no_object(provider.io._handle_get_object(_object_request(object_id)), f"Unknown object_id: {object_id}")
+    _assert_no_object(provider, object_id, "rejected", f"Unknown object_id: {object_id}")
 
 
 def test_one_object_is_unavailable_with_the_captures_reason_until_a_capture(provider):
     provider.io.set_assets(_CATALOGUE)
     object_id = _spawn(provider)
 
-    response = provider.io._handle_get_object(_object_request(object_id))
-
-    _assert_no_object(response, provider.module._NOT_CAPTURED)
-    assert "has not captured its object state yet" in response.message
+    _assert_no_object(provider, object_id, "precondition_failed", provider.module._NOT_CAPTURED)
+    assert "has not captured its object state yet" in provider.module._NOT_CAPTURED
 
 
 def test_the_loaded_scene_is_named_after_a_load_and_empty_after_a_clear(provider):
     provider.io.set_assets(_CATALOGUE)
     opening = provider.io._handle_get_scene(None)
-    assert (opening.success, opening.asset_id, opening.scale) == (True, "", 1.0)
-    assert "stands empty" in opening.message
+    assert vars(opening) == {"asset_id": "", "scale": 1.0}
 
     provider.io._execute(provider.launcher, "load_scene", {"asset_id": "scene/full_warehouse", "scale": 2.0})
     loaded = provider.io._handle_get_scene(None)
-    assert (loaded.success, loaded.asset_id, loaded.scale) == (True, "scene/full_warehouse", 2.0)
-    assert loaded.message == "scene scene/full_warehouse at scale 2.0"
+    assert vars(loaded) == {"asset_id": "scene/full_warehouse", "scale": 2.0}
 
     provider.io._execute(provider.launcher, "clear_scene", {})
     cleared = provider.io._handle_get_scene(None)
@@ -340,7 +330,7 @@ def _spawn(provider, asset_id="props/blocks/red_block"):
         "asset_id": asset_id, "position": [0.5, 0.0, 0.8], "yaw": 0.0, "scale": 1.0, "physics": "dynamic",
         "mass": 0.1,
     })
-    assert result["success"]
+    assert list(result) == ["object_id"]
     return result["object_id"]
 
 
@@ -355,7 +345,7 @@ def test_load_scene_removes_spawned_objects_then_replaces_the_scene(provider):
 
     result = provider.io._execute(provider.launcher, "load_scene", {"asset_id": "scene/full_warehouse", "scale": 2.0})
 
-    assert result == {"success": True, "message": "Loaded scene scene/full_warehouse"}
+    assert result == {}
     assert provider.launcher.mock_calls == [
         call._runtime_remove({"name": first}),
         call._runtime_remove({"name": second}),
@@ -373,7 +363,7 @@ def test_clear_scene_removes_spawned_objects_then_the_scene(provider):
 
     result = provider.io._execute(provider.launcher, "clear_scene", {})
 
-    assert result == {"success": True, "message": "Runtime scene cleared"}
+    assert result == {}
     assert provider.launcher.mock_calls == [
         call._runtime_remove({"name": object_id}),
         call._runtime_clear_scene(),
@@ -390,8 +380,12 @@ def test_load_scene_rejects_unknown_or_non_scene_assets_before_touching_the_stag
     object_id = _spawn(provider)
     provider.launcher.reset_mock()
 
-    with pytest.raises(ValueError, match=message):
-        provider.io._execute(provider.launcher, "load_scene", {"asset_id": asset_id, "scale": 1.0})
+    refused = _refused(
+        provider,
+        lambda: provider.io._execute(provider.launcher, "load_scene", {"asset_id": asset_id, "scale": 1.0}),
+        "rejected",
+    )
+    assert refused == message
     assert provider.launcher.mock_calls == []
     assert _spawned_ids(provider) == [object_id]
 
@@ -432,27 +426,37 @@ def test_moving_a_robot_by_name_moves_that_robot_to_face_the_yaw_it_names(provid
         provider.launcher, "move_robot", {"robot": "bravo", "position": [1.0, -2.0, 0.0], "yaw": -0.5}
     )
 
-    assert result["success"] is True
+    assert result == {}
     assert provider.launcher.mock_calls == [
         call._runtime_move_robot_root({"robot": "bravo", "position": [1.0, -2.0, 0.0], "yaw": -0.5})
     ]
 
 
 def test_a_robot_the_stage_does_not_stand_is_refused_before_the_stage(provider):
-    with pytest.raises(ValueError, match="no robot stands as 'ghost'"):
-        provider.io._execute(
+    refused = _refused(
+        provider,
+        lambda: provider.io._execute(
             provider.launcher, "move_robot", {"robot": "ghost", "position": [1.0, 0.0, 0.0], "yaw": 0.0}
-        )
+        ),
+        "rejected",
+    )
+
+    assert "no robot stands as 'ghost'" in refused
 
     assert provider.launcher.mock_calls == []
 
 
 @pytest.mark.parametrize("yaw", [float("nan"), float("inf"), float("-inf")])
 def test_a_move_to_a_yaw_that_is_no_number_is_refused_before_the_stage(provider, yaw):
-    with pytest.raises(ValueError, match="yaw must be a finite number of radians"):
-        provider.io._execute(
+    refused = _refused(
+        provider,
+        lambda: provider.io._execute(
             provider.launcher, "move_robot", {"robot": "alpha", "position": [1.0, 0.0, 0.0], "yaw": yaw}
-        )
+        ),
+        "rejected",
+    )
+
+    assert refused == "yaw must be a finite number of radians"
 
     assert provider.launcher.mock_calls == []
 
@@ -465,7 +469,6 @@ def test_a_spawn_reaches_the_stage_with_the_yaw_it_names(provider):
         "physics": "static", "mass": 0.1,
     })
 
-    assert result["success"]
     (spawned,) = provider.launcher._runtime_spawn_isaac_asset.call_args.args
     assert (spawned["name"], spawned["position"], spawned["yaw"]) == (result["object_id"], [0.5, 0.0, 0.8], 1.5)
     assert "orientation" not in spawned
@@ -479,8 +482,8 @@ def test_a_spawn_with_an_orientation_reaches_the_stage_normalised(provider):
         "orientation": [0.0, 0.0, 0.0, 1.0005], "scale": 1.0, "physics": "static", "mass": 0.1,
     })
 
-    assert result["success"]
     (spawned,) = provider.launcher._runtime_spawn_isaac_asset.call_args.args
+    assert spawned["name"] == result["object_id"]
     assert spawned["orientation"] == [0.0, 0.0, 0.0, 1.0]
 
 
@@ -492,15 +495,16 @@ def test_an_orientation_that_is_no_unit_quaternion_is_refused_on_spawn_and_move(
     object_id = _spawn(provider)
     provider.launcher.reset_mock()
 
-    with pytest.raises(ValueError, match="orientation must"):
-        provider.io._execute(provider.launcher, "spawn_object", {
-            "asset_id": "props/blocks/red_block", "position": [0.5, 0.0, 0.8], "yaw": 0.0,
-            "orientation": orientation, "scale": 1.0, "physics": "static", "mass": 0.1,
-        })
-    with pytest.raises(ValueError, match="orientation must"):
-        provider.io._execute(provider.launcher, "move_object", {
-            "object_id": object_id, "position": [1.0, 0.0, 0.8], "orientation": orientation,
-        })
+    on_spawn = _refused(provider, lambda: provider.io._execute(provider.launcher, "spawn_object", {
+        "asset_id": "props/blocks/red_block", "position": [0.5, 0.0, 0.8], "yaw": 0.0,
+        "orientation": orientation, "scale": 1.0, "physics": "static", "mass": 0.1,
+    }), "rejected")
+    on_move = _refused(provider, lambda: provider.io._execute(provider.launcher, "move_object", {
+        "object_id": object_id, "position": [1.0, 0.0, 0.8], "orientation": orientation,
+    }), "rejected")
+
+    assert on_spawn.startswith("orientation must")
+    assert on_move.startswith("orientation must")
 
     assert provider.launcher.mock_calls == []
     assert _spawned_ids(provider) == [object_id]
@@ -514,15 +518,16 @@ def test_a_snap_is_refused_on_spawn_and_move_before_the_stage(provider):
     provider.launcher.reset_mock()
     snap = SimpleNamespace(object_id=object_id, landmark="outlet", own_landmark="inlet")
 
-    with pytest.raises(ValueError, match="keeps no landmark of an object, so it places nothing by a snap"):
-        provider.io._execute(provider.launcher, "spawn_object", {
-            "asset_id": "props/blocks/red_block", "position": [0.0, 0.0, 0.0], "yaw": 0.0, "scale": 1.0,
-            "physics": "static", "mass": 0.1, "snap_to": snap,
-        })
-    with pytest.raises(ValueError, match="keeps no landmark of an object, so it places nothing by a snap"):
-        provider.io._execute(provider.launcher, "move_object", {
-            "object_id": object_id, "position": [0.0, 0.0, 0.0], "snap_to": snap,
-        })
+    on_spawn = _refused(provider, lambda: provider.io._execute(provider.launcher, "spawn_object", {
+        "asset_id": "props/blocks/red_block", "position": [0.0, 0.0, 0.0], "yaw": 0.0, "scale": 1.0,
+        "physics": "static", "mass": 0.1, "snap_to": snap,
+    }), "rejected")
+    on_move = _refused(provider, lambda: provider.io._execute(provider.launcher, "move_object", {
+        "object_id": object_id, "position": [0.0, 0.0, 0.0], "snap_to": snap,
+    }), "rejected")
+
+    assert "keeps no landmark of an object, so it places nothing by a snap" in on_spawn
+    assert "keeps no landmark of an object, so it places nothing by a snap" in on_move
 
     assert provider.launcher.mock_calls == []
     assert _spawned_ids(provider) == [object_id]
@@ -536,7 +541,7 @@ def test_a_move_carries_its_orientation_to_the_stage_and_keeps_it_otherwise(prov
     result = provider.io._execute(provider.launcher, "move_object", {
         "object_id": object_id, "position": [1.0, 0.0, 0.8], "orientation": [0.0, 0.0, 1.0, 0.0],
     })
-    assert result == {"success": True, "message": f"Moved {object_id}"}
+    assert result == {}
     assert provider.launcher.mock_calls == [
         call._runtime_move_object({"name": object_id, "position": [1.0, 0.0, 0.8], "orientation": [0.0, 0.0, 1.0, 0.0]})
     ]
@@ -550,11 +555,12 @@ def test_a_move_carries_its_orientation_to_the_stage_and_keeps_it_otherwise(prov
 def test_a_spawn_at_a_yaw_that_is_no_number_is_refused_and_mints_nothing(provider, yaw):
     provider.io.set_assets(_CATALOGUE)
 
-    with pytest.raises(ValueError, match="yaw must be a finite number of radians"):
-        provider.io._execute(provider.launcher, "spawn_object", {
-            "asset_id": "props/blocks/red_block", "position": [0.5, 0.0, 0.8], "yaw": yaw, "scale": 1.0,
-            "physics": "static", "mass": 0.1,
-        })
+    refused = _refused(provider, lambda: provider.io._execute(provider.launcher, "spawn_object", {
+        "asset_id": "props/blocks/red_block", "position": [0.5, 0.0, 0.8], "yaw": yaw, "scale": 1.0,
+        "physics": "static", "mass": 0.1,
+    }), "rejected")
+
+    assert refused == "yaw must be a finite number of radians"
 
     assert provider.launcher.mock_calls == []
     assert _spawned_ids(provider) == []
@@ -572,21 +578,21 @@ def test_it_owns_exactly_the_objects_it_spawned_and_has_not_removed(provider):
     assert not provider.io.owns(second)
 
 
-def _assert_unavailable(response, reason):
-    assert response.success is False
-    assert reason in response.message
-    # Unavailable is not an empty scene: nothing rides along.
-    assert (response.timestamp, response.objects) == (0.0, [])
+def _assert_unavailable(provider, reason):
+    """Unavailable is not an empty scene: get_object_states gives an error
+    reply with `precondition_failed`, and nothing rides along."""
+    unavailable = _refused(provider, lambda: provider.io._handle_get_object_states(None), "precondition_failed")
+    assert reason in unavailable
 
 
 def test_object_state_is_unavailable_with_a_reason_until_a_stamped_capture(provider):
-    _assert_unavailable(provider.io._handle_get_object_states(None), "has not captured its object state yet")
+    _assert_unavailable(provider, "has not captured its object state yet")
 
     # A publisher that has not stepped cannot stamp: no snapshot, no read.
     provider.stamps.now_s = None
     assert provider.io.capture_object_states() is None
     provider.io.process_pending(provider.launcher)
-    _assert_unavailable(provider.io._handle_get_object_states(None), "has not captured its object state yet")
+    _assert_unavailable(provider, "has not captured its object state yet")
     assert provider.reader.reads == 0
 
 
@@ -594,7 +600,6 @@ def test_the_first_frame_answers_an_empty_scene_before_any_stream_tick(provider)
     provider.io.process_pending(provider.launcher)
 
     response = provider.io._handle_get_object_states(None)
-    assert (response.success, response.message) == (True, "0 objects")
     assert (response.timestamp, response.objects) == (10.0, [])
     assert provider.launcher.mock_calls == []
 
@@ -646,10 +651,13 @@ def test_the_answer_carries_its_capture_stamp_never_the_request_time(provider):
 
 def _submit(provider, operation, payload):
     """Queue a command as a goal would, and record what get_object_states
-    answers at the instant the goal completes."""
+    answers at the instant the goal learns how its command ended: its
+    result, or the SceneFailure of a command that did not run."""
     future = Future()
     seen = []
-    future.add_done_callback(lambda done: seen.append((done.result(), provider.io._handle_get_object_states(None))))
+    future.add_done_callback(
+        lambda done: seen.append((done.exception() or done.result(), provider.io._handle_get_object_states(None)))
+    )
     provider.io._pending.put(provider.module._PendingCommand(operation=operation, payload=payload, future=future))
     return seen
 
@@ -685,9 +693,9 @@ def test_a_failed_goal_still_completes_after_a_capture(provider):
     failed = _submit(provider, "remove_object", {"object_id": "obj_missing"})
     provider.io.process_pending(provider.launcher)
 
-    ((result, response),) = failed
-    assert result == {"success": False, "message": "Unknown object_id: obj_missing"}
-    assert (response.success, response.objects) == (True, [])
+    ((failure, response),) = failed
+    assert (failure.kind, failure.message) == ("rejected", "Unknown object_id: obj_missing")
+    assert response.objects == []
 
 
 def test_a_failed_capture_is_unavailable_with_its_reason_rather_than_an_older_snapshot(provider, caplog):
@@ -699,7 +707,7 @@ def test_a_failed_capture_is_unavailable_with_its_reason_rather_than_an_older_sn
             assert provider.io.capture_object_states() is None
 
     _assert_unavailable(
-        provider.io._handle_get_object_states(None),
+        provider,
         "Isaac could not capture its object state: PhysX simulates no rigid body at /World/RuntimeObjects/obj_1",
     )
     assert len([r for r in caplog.records if "could not capture" in r.message]) == 1, "one line per failure"
@@ -738,14 +746,23 @@ class _Commands(Queue):
 
 
 class _Handle:
-    """An action handle that admits one goal, then closes as it does when
-    the node shuts down."""
+    """An action handle that offers its goals in order, then closes as it
+    does when the node shuts down. It asks the engine to decide on each, as
+    the generated handle does, records each decision, and hands over a goal
+    the engine admitted; a goal it refused is never handed over."""
 
-    def __init__(self, goal):
-        self._goals = [goal]
+    def __init__(self, *goals):
+        self._goals = list(goals)
+        self.decisions = []
 
-    async def handle_goal_next_request(self, _decide):
-        return self._goals.pop() if self._goals else None
+    async def handle_goal_next_request(self, decide):
+        while self._goals:
+            goal = self._goals.pop(0)
+            decision = decide(goal.request())
+            self.decisions.append(decision)
+            if decision.refusal is None:
+                return goal
+        return None
 
 
 def _progress(*, bytes_fetched, files_ready, building, bytes_ready, bytes_total, bytes_per_second):
@@ -756,13 +773,15 @@ def _progress(*, bytes_fetched, files_ready, building, bytes_ready, bytes_total,
 
 
 class _Goal:
-    """A load_scene or spawn_object goal, as its generated context carries
-    it. It logs each progress message it sends and how it ends, and hands
-    each message to the test as it sends it."""
+    """A goal of a scene action, as its generated context carries it. It
+    logs each progress message it sends and how it ends, and hands each
+    message to the test as it sends it. A goal given a cancel cause has
+    received its cancel signal for that cause."""
 
-    def __init__(self, data, events):
+    def __init__(self, data, events, cause=None):
         self._request = SimpleNamespace(data=data)
         self._events = events
+        self._cause = cause
         self.taken = asyncio.Queue()
 
     def request(self):
@@ -772,18 +791,24 @@ class _Goal:
         return "goal-1"
 
     def is_cancelled(self):
-        return False
+        return self._cause is not None
+
+    def cancel_cause(self):
+        return self._cause
 
     async def publish_feedback(self, **fields):
         progress = _progress(**fields)
         self._events.append(("progress", progress))
         self.taken.put_nowait(progress)
 
-    async def complete(self, *result):
-        self._events.append(("completed", *result))
+    async def complete(self, **result):
+        self._events.append(("completed", result))
 
-    async def complete_cancelled(self, *result):
-        self._events.append(("cancelled", *result))
+    async def fail(self, kind, message):
+        self._events.append(("failed", kind, message))
+
+    async def complete_cancelled(self, reason, **result):
+        self._events.append(("cancelled", reason, result))
 
 
 class _StuckPublish(_Goal):
@@ -803,21 +828,21 @@ class _FailingPublish(_Goal):
         raise RuntimeError("the feedback stream is closed")
 
 
-# Each action that reports its progress: the method that serves it, the
-# launcher method that builds what its goal names, the request of that goal,
-# and the message the goal completes with.
+# Each action that reports its progress: the launcher method that builds
+# what its goal names, the request of that goal, and the fields of the result
+# the goal completes with.
 _LOAD = SimpleNamespace(
-    action="load_scene", serve="_serve_load_scene", build="_runtime_load_isaac_scene",
+    action="load_scene", build="_runtime_load_isaac_scene",
     request=SimpleNamespace(asset_id="scene/full_warehouse", scale=1.0),
-    message="Loaded scene scene/full_warehouse",
+    result=[],
 )
 _SPAWN = SimpleNamespace(
-    action="spawn_object", serve="_serve_spawn_object", build="_runtime_spawn_isaac_asset",
+    action="spawn_object", build="_runtime_spawn_isaac_asset",
     request=SimpleNamespace(
         asset_id="props/blocks/red_block", position=[0.5, 0.0, 0.8], yaw=0.0, orientation=None, scale=1.0,
         physics="dynamic", mass=0.1, snap_to=None,
     ),
-    message="Spawned props/blocks/red_block",
+    result=["object_id"],
 )
 _REPORTING_ACTIONS = pytest.mark.parametrize("goal", [_LOAD, _SPAWN], ids=lambda goal: goal.action)
 
@@ -842,9 +867,9 @@ def _hold_the_build(provider, goal, events, finish):
 
 
 def _serve_one(provider, goal, context):
-    """Starts serving `goal.action` with one goal, `context`, admitted."""
+    """Starts serving `goal.action` with one goal, `context`, offered."""
     provider.io._action_handles = {goal.action: _Handle(context)}
-    return asyncio.create_task(getattr(provider.io, goal.serve)())
+    return asyncio.create_task(provider.io._serve_action(goal.action))
 
 
 @_REPORTING_ACTIONS
@@ -888,7 +913,8 @@ def test_a_goal_reports_its_acceptance_before_its_command_then_its_build_once_th
     assert events[:-1] == [
         ("progress", _ACCEPTED), ("queued", goal.action), ("progress", _BUILDING), ("built", built),
     ]
-    assert events[-1][:3] == ("completed", True, goal.message)
+    (outcome, result) = events[-1]
+    assert (outcome, list(result)) == ("completed", goal.result)
     assert context.taken.empty()
 
 
@@ -920,7 +946,8 @@ def _assert_the_command_ran_after_the_one_offer(provider, goal, events):
     to its result all the same."""
     assert [event for event in events if event[0] in ("offered", "progress")] == [("offered", _ACCEPTED)]
     getattr(provider.launcher, goal.build).assert_called_once()
-    assert events[-1][:3] == ("completed", True, goal.message)
+    (outcome, result) = events[-1]
+    assert (outcome, list(result)) == ("completed", goal.result)
 
 
 @_REPORTING_ACTIONS
@@ -939,3 +966,157 @@ def test_a_failed_publish_holds_neither_its_goal_nor_the_next(provider, goal, ca
     events = _serve_to(provider, goal, _FailingPublish, caplog)
 
     _assert_the_command_ran_after_the_one_offer(provider, goal, events)
+
+
+def _serve_goals(provider, action, *contexts, run_commands=True):
+    """Serves `action` with `contexts` offered in order, the main thread
+    running each command it is given, until the handle closes. Returns the
+    handle, which holds the engine's decisions."""
+    handle = _Handle(*contexts)
+    provider.io._action_handles = {action: handle}
+
+    async def serve():
+        serving = asyncio.create_task(provider.io._serve_action(action))
+        while not serving.done():
+            if run_commands:
+                provider.io.process_pending(provider.launcher)
+            await asyncio.sleep(0)
+        await serving
+
+    asyncio.run(asyncio.wait_for(serve(), _LIVENESS_S))
+    return handle
+
+
+def _refusal(decision):
+    return (decision.refusal.kind, decision.refusal.message)
+
+
+@pytest.mark.parametrize(("action", "request_data", "refusal"), [
+    ("load_scene", SimpleNamespace(asset_id="scene/missing", scale=1.0),
+     ("rejected", "Unknown asset_id: scene/missing")),
+    ("load_scene", SimpleNamespace(asset_id="scene/full_warehouse", scale=0.0),
+     ("rejected", "scale must be a finite number greater than zero")),
+    ("spawn_object", SimpleNamespace(
+        asset_id="scene/full_warehouse", position=[0.0, 0.0, 0.0], yaw=0.0, orientation=None, scale=1.0,
+        physics="dynamic", mass=0.1, snap_to=None,
+    ), ("rejected", "Asset is not an object: scene/full_warehouse")),
+    ("spawn_object", SimpleNamespace(
+        asset_id="props/blocks/red_block", position=[float("nan"), 0.0, 0.0], yaw=0.0, orientation=None,
+        scale=1.0, physics="dynamic", mass=0.1, snap_to=None,
+    ), ("rejected", "position must contain exactly 3 finite values [x, y, z]")),
+    ("spawn_object", SimpleNamespace(
+        asset_id="props/blocks/red_block", position=[0.0, 0.0, 0.0], yaw=0.0, orientation=None, scale=1.0,
+        physics="dynamic", mass=float("nan"), snap_to=None,
+    ), ("rejected", "mass must be a finite number greater than zero")),
+    ("move_object", SimpleNamespace(object_id="obj_missing", position=[0.0, 0.0, 0.0], orientation=None,
+                                    snap_to=None), ("rejected", "Unknown object_id: obj_missing")),
+    ("remove_object", SimpleNamespace(object_id="obj_missing"), ("rejected", "Unknown object_id: obj_missing")),
+    ("apply_force", SimpleNamespace(object_id="obj_missing", force=[1.0, 0.0, 0.0], duration_s=0.5),
+     ("rejected", "Unknown object_id: obj_missing")),
+    ("move_robot", SimpleNamespace(robot="ghost", position=[0.0, 0.0, 0.0], yaw=0.0),
+     ("rejected", "no robot stands as 'ghost' in this simulation, which stands alpha")),
+])
+def test_a_goal_whose_command_the_stage_cannot_take_is_refused_when_it_arrives(
+    provider, action, request_data, refusal
+):
+    """The engine checks a goal when it arrives: a refused goal never
+    queues a command, and its client reads the kind and the reason."""
+    provider.io.set_assets(_CATALOGUE)
+    events = []
+    commands = _Commands(events)
+    provider.io._pending = commands
+
+    handle = _serve_goals(provider, action, _Goal(request_data, events), run_commands=False)
+
+    assert [_refusal(decision) for decision in handle.decisions] == [refusal]
+    assert events == []
+
+
+def test_a_goal_that_arrives_before_the_catalogue_is_refused_until_it_is_discovered(provider):
+    """The asset a load names may be one the catalogue lists once it is
+    discovered, so the refusal is a precondition, not the asset."""
+    events = []
+    load = SimpleNamespace(asset_id="scene/full_warehouse", scale=1.0)
+
+    before = _serve_goals(provider, "load_scene", _Goal(load, events))
+    provider.io.set_assets(_CATALOGUE)
+    after = _serve_goals(provider, "load_scene", _Goal(load, events))
+
+    ((kind, message),) = [_refusal(decision) for decision in before.decisions]
+    assert kind == "precondition_failed"
+    assert "still discovering its asset catalogue" in message
+    assert [decision.refusal for decision in after.decisions] == [None]
+    assert [event for event in events if event[0] != "progress"] == [("completed", {})]
+
+
+def test_a_goal_whose_object_is_gone_by_the_time_its_command_runs_fails_with_the_same_kind(provider):
+    """A push is admitted while its object stands, and a remove runs before
+    the push's command reaches the main thread: the check there finds no
+    object, and the goal fails with the kind its refusal would have had."""
+    provider.io.set_assets(_CATALOGUE)
+    object_id = _spawn(provider)
+    events = []
+    push = _Goal(SimpleNamespace(object_id=object_id, force=[1.0, 0.0, 0.0], duration_s=0.5), events)
+    assert provider.io._decide(provider.module.apply_force, "apply_force", push.request()).refusal is None
+    provider.io._execute(provider.launcher, "remove_object", {"object_id": object_id})
+
+    async def run_the_push():
+        pushing = asyncio.create_task(provider.io._run_goal("apply_force", push))
+        while not pushing.done():
+            provider.io.process_pending(provider.launcher)
+            await asyncio.sleep(0)
+
+    asyncio.run(asyncio.wait_for(run_the_push(), _LIVENESS_S))
+
+    assert events == [("failed", "rejected", f"Unknown object_id: {object_id}")]
+    provider.launcher._runtime_apply_force.assert_not_called()
+
+
+def test_a_command_isaac_does_not_carry_out_fails_its_goal_with_attempt_failed(provider):
+    provider.io.set_assets(_CATALOGUE)
+    provider.launcher._runtime_clear_scene.side_effect = RuntimeError("the stage is locked")
+    events = []
+
+    _serve_goals(provider, "clear_scene", _Goal(None, events))
+
+    assert events == [("failed", "attempt_failed", "the stage is locked")]
+
+
+@pytest.mark.parametrize("cause", ["caller", "sender_gone"])
+def test_a_goal_cancelled_while_its_command_ran_completes_with_what_the_command_did(provider, cause):
+    """A cancel does not stop a command once it is queued: the spawned
+    object stands, so the goal completes and gives its id."""
+    provider.io.set_assets(_CATALOGUE)
+    events = []
+
+    _serve_goals(provider, "spawn_object", _Goal(_SPAWN.request, events, cause=cause))
+
+    (outcome, result) = events[-1]
+    assert outcome == "completed"
+    assert provider.io.owns(result["object_id"])
+
+
+def test_a_service_gives_a_scene_failure_as_an_error_reply_of_its_own_member(provider):
+    """Each service answers through the generated handler, which turns the
+    Failure of its member into an error reply of that kind."""
+    module = provider.module
+    replies = []
+
+    async def handle_next_request(_runner, handler):
+        try:
+            replies.append(handler(_assets_request()))
+        except module.get_assets_list.Failure as failure:
+            replies.append(failure)
+        raise asyncio.CancelledError
+
+    module.get_assets_list.handle_next_request = handle_next_request
+
+    async def serve_once():
+        with contextlib.suppress(asyncio.CancelledError):
+            await provider.io._serve_service(module.get_assets_list, provider.io._handle_get_assets)
+
+    asyncio.run(serve_once())
+
+    (failure,) = replies
+    assert failure.kind == "precondition_failed"
+    assert "still discovering its asset catalogue" in failure.message
