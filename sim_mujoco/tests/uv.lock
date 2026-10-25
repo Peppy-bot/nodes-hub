@@ -216,7 +216,7 @@ requires-dist = [
     { name = "mujoco", specifier = "==3.15.0" },
     { name = "numpy", specifier = "==2.5.3" },
     { name = "pyjson5", specifier = "==2.0.1" },
-    { name = "sim-robot-core", git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=sim_robot_core&rev=f99b51b8728f081aeac2dce59cd89759a16a0774" },
+    { name = "sim-robot-core", git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=sim_robot_core&rev=bf279f4c9c94eb20fb89eebeaf9339913fa940a1" },
     { name = "so101-description", git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=so101_description&rev=7b3a277bff890d0dde26e6aa998074fa90cbffb0" },
 ]
 
@@ -226,7 +226,7 @@ dev = [{ name = "pytest", specifier = ">=8" }]
 [[package]]
 name = "sim-robot-core"
 version = "0.1.0"
-source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=sim_robot_core&rev=f99b51b8728f081aeac2dce59cd89759a16a0774#f99b51b8728f081aeac2dce59cd89759a16a0774" }
+source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=sim_robot_core&rev=bf279f4c9c94eb20fb89eebeaf9339913fa940a1#bf279f4c9c94eb20fb89eebeaf9339913fa940a1" }
 dependencies = [
     { name = "numpy" },
     { name = "pyjson5" },

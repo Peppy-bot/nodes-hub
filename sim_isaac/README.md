@@ -95,10 +95,15 @@ of its model, so an SO-101 is ready with its one arm and its one gripper. Each
 robot on the stage is held to its own model.
 
 An `attach` goal is refused with `rejected` for a model with no entry, a name
-the stage cannot stand a robot under or a placement that is not finite, and
-with `precondition_failed` for a name or a spot another robot holds, a second
-robot of the same caller, the robot of the caller while it still joins, or
-another model for the robot the caller stands.
+the stage cannot stand a robot under or a placement that is not finite, with
+`busy` for the robot of the caller while it still joins, and with
+`precondition_failed` for a name or a spot another robot holds, a second robot
+of the same caller, or another model for the robot the caller stands. A goal
+refused with `busy` takes the robot over once it stands, so
+`robot_initializer` sends it again; any other refusal stays until someone
+changes the stage. A robot that leaves gives its name back as soon as its stay
+ends, before the stage lets it go, so a copy that joins straight back is never
+refused for it.
 A cancel of its caller takes the robot out and ends the goal cancelled. The
 sender grace of `attach` is the pair grace time: when the process that sent
 the goal is gone, the robot stays for that time, and then peppy cancels the

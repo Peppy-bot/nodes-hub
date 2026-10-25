@@ -88,14 +88,15 @@ class Subscription:
 
 
 class FailureKind(str, enum.Enum):
-    """The failure kinds of attach: the kinds of peppy, as the generated
-    module names them."""
+    """The failure kinds of attach: the kinds of peppy, then the kind of
+    simulation_robot that attach lists, as the generated module names them."""
 
     ATTEMPT_FAILED = "attempt_failed"
     TIMEOUT = "timeout"
     PRECONDITION_FAILED = "precondition_failed"
     RESOURCE_UNAVAILABLE = "resource_unavailable"
     REJECTED = "rejected"
+    BUSY = "busy"
 
 
 @dataclass(frozen=True)

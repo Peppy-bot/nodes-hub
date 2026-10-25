@@ -23,7 +23,7 @@ from typing import Optional
 from peppygen.exposed_actions.robots import attach
 from peppygen.exposed_services.robots import is_ready
 
-from sim_robot_core.registry import Caller, Registry, Robot
+from sim_robot_core.registry import Caller, Registry, Robot, StillJoining
 
 from edits import Edits
 from mujoco_models import MujocoModel, MujocoModels
@@ -271,10 +271,14 @@ class RobotsIO:
 
         A request this engine never takes (a name it cannot stand a robot
         under, a model it has no entry for, a placement that is not finite)
-        is refused with `rejected`. A request the scene cannot take now (a
-        name or a spot another robot holds, a second robot of the caller, the
-        robot of the caller while it still joins, another model for the robot
-        the caller stands) is refused with `precondition_failed`."""
+        is refused with `rejected`. The robot of the caller while it still
+        joins is refused with `busy`: the same attach takes it over once it
+        stands. A request the scene cannot take now (a name or a spot
+        another robot holds, a second robot of the caller, another model for
+        the robot the caller stands) is refused with `precondition_failed`.
+        The name of a robot that leaves is free once its stay ends, before
+        the scene lets the robot go, so no robot that leaves refuses a
+        name."""
         caller = Caller(core_node=request.core_node, instance_id=request.instance_id)
         self._admitted = None
         try:
@@ -290,6 +294,8 @@ class RobotsIO:
         )
         try:
             adopted = self._robots.admit(robot_name, entry, caller)
+        except StillJoining as error:
+            return attach.GoalDecision.refuse(attach.FailureKind.BUSY, str(error))
         except ValueError as error:
             return attach.GoalDecision.refuse(attach.FailureKind.PRECONDITION_FAILED, str(error))
         if adopted:
