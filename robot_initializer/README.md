@@ -39,6 +39,22 @@ as progress. A robot that the simulation does not stand within the budget
 leaves the simulation, and the node fails. A node that stops before its robot
 stands takes the robot out.
 
+The engine refuses the robot with `busy` while a robot in its way still joins
+or leaves the scene: the robot of the copy that `peppy stack remove` took out
+and that the engine has not taken out yet, or the robot that an instance of
+the copy attached and that does not stand yet. The same goal can succeed once
+that robot is out or stands, so the node sends it again 1 s later, for as
+long as the stand budget lasts, and logs each wait:
+
+```text
+the simulation cannot take 'alpha' yet (busy: 'alpha' is leaving the world; attach again once it is out); it attaches again in 1 s
+```
+
+So a copy removed and joined straight back stands once its old robot is out,
+and an instance that comes back while its robot still joins takes the robot
+over once it stands. Any other refusal fails the setup at once. A node that
+stops while it waits to attach again sends nothing more.
+
 The node can cancel a goal only once the engine has answered it. When the
 node stops, or its stand budget runs out, before the engine answers, the
 node goes on waiting for the answer for at most 4.5 s, inside peppy's
@@ -125,11 +141,11 @@ The message gives the engine's failure kind and its reason. The engine
 refuses at once what it can know before it admits the robot: with `rejected`
 a model its catalogue does not carry or that it cannot stand, a name that
 breaks the engine's name rule, or a `placement` that it does not take; and
-with `precondition_failed` a name that another robot holds, a name whose
-robot still joins or leaves the scene, or no spot that it can promise the
-robot (a `placement` within reach of a robot that stands or that is on its
-way in, or no free spot left). The message then says "the simulation
-refused this robot". What fails after the admission fails the goal before
+with `precondition_failed` a name that another robot holds, or no spot that
+it can promise the robot (a `placement` within reach of a robot that stands
+or that is on its way in, or no free spot left). The message then says "the
+simulation refused this robot". A refusal with `busy` is no failure: the
+node waits and attaches again, as above. What fails after the admission fails the goal before
 the robot stands: with `attempt_failed` when the robot's files could not be
 fetched or its model could not be built into the world, with
 `precondition_failed` when the scene covers a named `placement` by then, and
@@ -138,11 +154,14 @@ could not say that the robot stands. The message then says "the simulation
 did not stand this robot" with the engine's failure kind and reason. A
 robot that the simulation does not stand within the stand budget leaves the
 simulation, and the message says "the simulation did not stand this robot
-within 174.5 s". In each case the start of the copy fails: `peppy stack
-join` undoes the copy, and a launch that names the copy fails. Fix what the
-reason names (the robot's `model`, its name or its `placement`), make room
-in the world, or wait until the robot that still joins or leaves under the
-name is in or out, then `peppy stack join` the copy again.
+within 174.5 s". When the engine still refused the robot with `busy` then,
+the message goes on with "until then it refused this robot with busy: " and
+the engine's last reason: the robot in its way did not leave or stand in all
+that time, and the engine's own log says why. In each case the start of the
+copy fails: `peppy stack join` undoes the copy, and a launch that names the
+copy fails. Fix what the reason names (the robot's `model`, its name or its
+`placement`), or make room in the world, then `peppy stack join` the copy
+again.
 
 **the node stops right after it starts, saying `model` names the robot's model**
 The launcher left `model` empty. Give it the id the simulation's catalogue

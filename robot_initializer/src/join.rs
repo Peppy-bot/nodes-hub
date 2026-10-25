@@ -11,14 +11,18 @@
 //! that stands in the scene. The wait for the engine's acceptance and the
 //! wait for `standing` share one stand budget: the node's setup budget less
 //! what its leave report needs, so a robot that does not stand fails with
-//! its own reason before the daemon's limit. A robot that the engine refuses,
-//! or whose goal the engine ends before the robot stands, fails the setup
-//! with the engine's failure kind and reason, and the join of its copy is
-//! undone. A goal that ends after the robot stood stops the node: `peppy
-//! stack list` reports the instance finished, and `peppy stack join` puts the
-//! copy back. The goal ends cancelled when this node takes the robot out, or
-//! when another goal of the same copy holds the robot now, and fails with
-//! `resource_unavailable` when the engine takes the robot out itself.
+//! its own reason before the daemon's limit. A robot that the engine refuses
+//! with `busy` waits: a robot in its way still joins or leaves the scene, so
+//! the node sends the goal again every [`RESEND_PERIOD`] (1 s), inside the
+//! stand budget, and logs each wait. A robot that the engine refuses for
+//! another reason, or whose goal the engine ends before the robot stands,
+//! fails the setup with the engine's failure kind and reason, and the join
+//! of its copy is undone. A goal that ends after the robot stood stops the
+//! node: `peppy stack list` reports the instance finished, and `peppy stack
+//! join` puts the copy back. The goal ends cancelled when this node takes
+//! the robot out, or when another goal of the same copy holds the robot now,
+//! and fails with `resource_unavailable` when the engine takes the robot out
+//! itself.
 //!
 //! A task that outlives the setup sends the goal and holds it for the robot's
 //! whole stay, and it cancels every goal that the engine accepted and that it
@@ -70,17 +74,26 @@ const LEAVE_RESERVE: Duration = Duration::from_millis(5500);
 /// How often the wait for standing says that the robot does not stand yet.
 /// Each line reaches the caller of the join as progress.
 const PROGRESS_PERIOD: Duration = Duration::from_secs(10);
+/// How long the node waits to send its goal again after the engine refused
+/// it with `busy`: the robot in its way still joins or leaves the scene,
+/// which takes the engine about one rebuild of its world.
+const RESEND_PERIOD: Duration = Duration::from_secs(1);
 // The wait outlasts the leave it waits for, so a robot that does leave is
 // not reported as one that did not, and the reserve outlasts the wait.
 const _: () = assert!(LEAVE_REPORT_TIMEOUT.as_millis() > LEAVE_TIMEOUT.as_millis());
 const _: () = assert!(LEAVE_RESERVE.as_millis() > LEAVE_REPORT_TIMEOUT.as_millis());
 
 /// The clock that the wait for standing runs on: when to say that the robot
-/// does not stand yet, and when the stand budget is spent. The node runs on
+/// does not stand yet, when to send a goal that the engine refused with
+/// `busy` again, and when the stand budget is spent. The node runs on
 /// [`HostClock`]; a test drives the wait with a clock of its own.
 pub trait StandClock: Send + 'static {
-    /// The time since the robot's goal was sent.
+    /// The time since the robot's first goal was sent.
     fn elapsed(&self) -> Duration;
+
+    /// Asks for one [`Moment::Resend`]: the end of the wait before the
+    /// goal is sent again.
+    fn resend_soon(&mut self);
 
     /// Resolves at the next moment of the wait. A future that is dropped
     /// before it resolves loses no moment.
@@ -90,18 +103,24 @@ pub trait StandClock: Send + 'static {
 /// A moment of the wait for standing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Moment {
-    /// The robot does not stand yet, this long after its goal was sent.
+    /// The robot does not stand yet, this long after its first goal was
+    /// sent.
     Progress(Duration),
+    /// The wait that [`StandClock::resend_soon`] asked for is over: the
+    /// node sends its goal again.
+    Resend,
     /// The stand budget is spent.
     Spent,
 }
 
 /// The host's clock: a progress moment every [`PROGRESS_PERIOD`] after the
-/// goal is sent, until the stand budget is spent.
+/// first goal is sent, a resend [`RESEND_PERIOD`] after each request for
+/// one, until the stand budget is spent.
 pub struct HostClock {
     start: Instant,
     end: Instant,
     progress: Interval,
+    resend: Option<Instant>,
 }
 
 impl HostClock {
@@ -118,6 +137,7 @@ impl HostClock {
             start,
             end: start + budget,
             progress,
+            resend: None,
         }
     }
 }
@@ -127,14 +147,27 @@ impl StandClock for HostClock {
         self.start.elapsed()
     }
 
+    fn resend_soon(&mut self) {
+        self.resend = Some(Instant::now() + RESEND_PERIOD);
+    }
+
     async fn next(&mut self) -> Moment {
         // The end of the budget comes first, so a budget that is a whole
-        // number of periods ends on its last moment rather than reporting it.
-        tokio::select! {
+        // number of periods ends on its last moment rather than reporting it,
+        // and a resend due at the end of the budget is never sent.
+        let resend = self.resend;
+        let moment = tokio::select! {
             biased;
             () = tokio::time::sleep_until(self.end) => Moment::Spent,
+            () = tokio::time::sleep_until(resend.unwrap_or(self.end)), if resend.is_some() => {
+                Moment::Resend
+            }
             tick = self.progress.tick() => Moment::Progress(tick - self.start),
+        };
+        if moment == Moment::Resend {
+            self.resend = None;
         }
+        moment
     }
 }
 
@@ -290,10 +323,22 @@ impl Join {
     }
 
     fn out_of_budget(&self) -> peppygen::Error {
-        refused(format!(
+        refused(self.budget_spent())
+    }
+
+    fn budget_spent(&self) -> String {
+        format!(
             "the simulation did not stand this robot within {}",
             seconds(self.budget)
-        ))
+        )
+    }
+
+    fn waits_to_attach_again(&self, refusal: &attach::Failure) {
+        info!(
+            "the simulation cannot take '{}' yet ({refusal}); it attaches again in {}",
+            self.robot(),
+            seconds(RESEND_PERIOD)
+        );
     }
 }
 
@@ -390,6 +435,8 @@ async fn wait_to_stand<C: StandClock>(
             }
             Event::Feedback(Heard::NotStanding) => {}
             Event::Clock(Moment::Progress(elapsed)) => join.not_standing_yet(elapsed),
+            // No resend is asked for once the engine accepted the goal.
+            Event::Clock(Moment::Resend) => {}
             Event::Feedback(Heard::End(StreamEnd::Ended)) => {
                 verdict.give(Err(did_not_stand(reason_of(account(&goal).await))));
                 return None;
@@ -418,13 +465,79 @@ async fn wait_to_stand<C: StandClock>(
     }
 }
 
-/// Sends the goal and waits for the engine's answer, and answers the goal
-/// that the engine accepted. A refusal or a wire error gives the setup its
-/// verdict. Neither a stop nor the end of the stand budget ends this wait:
-/// the budget gives the setup its verdict at once, and the wait goes on
-/// until the shutdown hook gives up, at most [`LEAVE_REPORT_TIMEOUT`] later,
-/// so that a goal that the engine accepts in that time is cancelled.
+/// Sends the goal until the engine accepts it, and answers the goal that
+/// the engine accepted. A refusal with `busy` says that a robot in the way
+/// still joins or leaves the scene: the node waits [`RESEND_PERIOD`] and
+/// sends the goal again ([`wait_to_attach_again`]), for as long as the stand
+/// budget lasts and the node runs. Any other refusal, and a wire error, give
+/// the setup its verdict at once.
 async fn admission<C: StandClock>(
+    join: &Join,
+    clock: &mut C,
+    verdict: &mut Verdict,
+) -> Option<attach::ActionHandle> {
+    loop {
+        let goal = answer(join, clock, verdict).await?;
+        let Some(refusal) = &goal.refusal else {
+            return Some(goal);
+        };
+        // A node that stopped, or whose budget ran out, while the engine
+        // had not answered sends nothing more.
+        if join.token.is_cancelled() || verdict.given() {
+            return None;
+        }
+        if refusal.kind != attach::FailureKind::Busy {
+            verdict.give(Err(refused(format!(
+                "the simulation refused this robot: {refusal}"
+            ))));
+            return None;
+        }
+        join.waits_to_attach_again(refusal);
+        if !wait_to_attach_again(join, clock, verdict, refusal).await {
+            return None;
+        }
+    }
+}
+
+/// Waits [`RESEND_PERIOD`] before the goal that the engine refused with
+/// `busy` is sent again, saying that the robot does not stand yet on each
+/// progress moment. False when the join ends instead: the node stops, which
+/// tells the setup nothing, or the stand budget is spent, which gives the
+/// setup its verdict with the engine's last refusal.
+async fn wait_to_attach_again<C: StandClock>(
+    join: &Join,
+    clock: &mut C,
+    verdict: &mut Verdict,
+    refusal: &attach::Failure,
+) -> bool {
+    clock.resend_soon();
+    loop {
+        let moment = tokio::select! {
+            biased;
+            () = join.token.cancelled() => return false,
+            moment = clock.next() => moment,
+        };
+        match moment {
+            Moment::Resend => return true,
+            Moment::Progress(elapsed) => join.not_standing_yet(elapsed),
+            Moment::Spent => {
+                verdict.give(Err(refused(format!(
+                    "{}: until then it refused this robot with {refusal}",
+                    join.budget_spent()
+                ))));
+                return false;
+            }
+        }
+    }
+}
+
+/// Sends the goal once and waits for the engine's answer: the goal that the
+/// engine accepted or refused. A wire error gives the setup its verdict.
+/// Neither a stop nor the end of the stand budget ends this wait: the budget
+/// gives the setup its verdict at once, and the wait goes on until the
+/// shutdown hook gives up, at most [`LEAVE_REPORT_TIMEOUT`] later, so that a
+/// goal that the engine accepts in that time is cancelled.
+async fn answer<C: StandClock>(
     join: &Join,
     clock: &mut C,
     verdict: &mut Verdict,
@@ -444,6 +557,8 @@ async fn admission<C: StandClock>(
             answer = &mut send => break answer,
             moment = clock.next(), if !spent => match moment {
                 Moment::Progress(elapsed) => join.not_standing_yet(elapsed),
+                // No resend is asked for while a goal waits for its answer.
+                Moment::Resend => {}
                 Moment::Spent => {
                     spent = true;
                     verdict.give(Err(join.out_of_budget()));
@@ -451,20 +566,13 @@ async fn admission<C: StandClock>(
             },
         }
     };
-    let goal = match answer {
-        Ok(goal) => goal,
+    match answer {
+        Ok(goal) => Some(goal),
         Err(e) => {
             verdict.give(Err(e));
-            return None;
+            None
         }
-    };
-    if let Some(refusal) = &goal.refusal {
-        verdict.give(Err(refused(format!(
-            "the simulation refused this robot: {refusal}"
-        ))));
-        return None;
     }
-    Some(goal)
 }
 
 /// Holds the place of a robot that stands, for as long as the node runs: the
@@ -818,6 +926,47 @@ mod tests {
             clock.next().await,
             Moment::Progress(Duration::from_secs(10))
         );
+        assert_eq!(clock.next().await, Moment::Spent);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_host_clock_says_resend_one_period_after_each_request() {
+        let mut clock = HostClock::every(Duration::from_secs(10), Duration::from_secs(30));
+        tokio::time::advance(Duration::from_millis(9_500)).await;
+        clock.resend_soon();
+        // The resend is due at 10.5 s, after the progress moment of 10 s.
+        assert_eq!(
+            clock.next().await,
+            Moment::Progress(Duration::from_secs(10))
+        );
+        assert_eq!(clock.next().await, Moment::Resend);
+        assert_eq!(clock.elapsed(), Duration::from_millis(10_500));
+        // One request gives one resend.
+        assert_eq!(
+            clock.next().await,
+            Moment::Progress(Duration::from_secs(20))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_dropped_before_its_resend_loses_no_resend() {
+        let mut clock = HostClock::every(Duration::from_secs(10), Duration::from_secs(30));
+        clock.resend_soon();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), clock.next())
+                .await
+                .is_err(),
+            "the resend is not due yet"
+        );
+        assert_eq!(clock.next().await, Moment::Resend);
+        assert_eq!(clock.elapsed(), RESEND_PERIOD);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_resend_due_once_the_budget_is_spent_is_never_given() {
+        let mut clock = HostClock::every(Duration::from_secs(10), RESEND_PERIOD);
+        clock.resend_soon();
+        assert_eq!(clock.next().await, Moment::Spent);
         assert_eq!(clock.next().await, Moment::Spent);
     }
 

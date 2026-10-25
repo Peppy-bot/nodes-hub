@@ -384,15 +384,29 @@ def test_a_second_robot_of_the_same_caller_is_refused():
     )
 
 
-def test_a_copy_re_registering_a_robot_that_still_joins_is_refused():
+def test_a_copy_re_registering_a_robot_that_still_joins_is_busy_until_it_stands():
     """The robot the copy attached has not stood yet: a second goal for it
-    is a request the stage cannot take now, and the first goal goes on."""
+    is refused with `busy`, and the first goal goes on. Once the robot
+    stands, the same goal takes it over."""
     io = _robots_io(_stage())
     assert _accepted(io._admit(_request()))
 
     decision = io._admit(_request())
 
-    assert "already joining 'alpha'" in _refused(decision, FailureKind.PRECONDITION_FAILED)
+    assert "already joining 'alpha'" in _refused(decision, FailureKind.BUSY)
+    io._robots.stand("alpha")
+    assert _accepted(io._admit(_request()))
+
+
+def test_a_robot_that_joins_keeps_its_name_from_another_caller():
+    """Only the caller's own robot is `busy` while it joins: once it stands,
+    the name stays its own, so another caller is refused for good."""
+    io = _robots_io(_stage())
+    assert _accepted(io._admit(_request()))
+
+    decision = io._admit(_request(instance="other_init_inst"))
+
+    assert "already stands as 'alpha'" in _refused(decision, FailureKind.PRECONDITION_FAILED)
 
 
 def test_a_copy_re_registering_as_another_model_is_refused():
