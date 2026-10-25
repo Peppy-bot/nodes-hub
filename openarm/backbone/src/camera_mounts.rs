@@ -8,7 +8,8 @@
 //! A request then composes the carried ones with the grasp poses the
 //! coordinator measured last, the ones limb_states publishes, and answers
 //! under that measurement's stamp. Served from bringup: until the coordinator
-//! has measured the arms the answer says so. The workspace tools read the
+//! has measured the arms the caller gets an error reply with
+//! `precondition_failed`. The workspace tools read the
 //! same placements, with the depths each camera measures, through
 //! [`CameraMounts::design_cameras`].
 
@@ -29,7 +30,8 @@ use crate::arm_pair::ArmPair;
 use crate::serving;
 use crate::types::{Side, pose_from_wire, world_pose_arrays};
 
-/// What the service answers while the coordinator has measured nothing yet.
+/// The message of the error reply while the coordinator has measured
+/// nothing yet.
 const NOT_MEASURED_YET: &str = "the robot has not measured its joints yet";
 
 /// The grasp poses the coordinator measured last, in the robot frame, and
@@ -226,19 +228,17 @@ fn moving_joint_above(tree: &Tree, link: usize) -> String {
         .expect("a link no fixed path reaches hangs below a moving joint")
 }
 
-/// The answer to one request: every camera's pose at `measured`, or the
-/// refusal while nothing has been measured.
-fn answer(mounts: &CameraMounts, measured: Option<&MeasuredGrasps>) -> get_camera_poses::Response {
+/// The answer to one request: every camera's pose at `measured`, or
+/// `precondition_failed` while nothing has been measured.
+fn answer(
+    mounts: &CameraMounts,
+    measured: Option<&MeasuredGrasps>,
+) -> Result<get_camera_poses::Response, get_camera_poses::Failure> {
     let Some(measured) = measured else {
-        return get_camera_poses::Response::new(
-            false,
-            NOT_MEASURED_YET.to_string(),
-            SystemTime::UNIX_EPOCH,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        );
+        return Err(get_camera_poses::Failure::new(
+            get_camera_poses::FailureKind::PreconditionFailed,
+            NOT_MEASURED_YET,
+        ));
     };
     let poses = mounts.poses(&measured.poses);
     let mut positions = Vec::with_capacity(poses.len() * 3);
@@ -248,9 +248,7 @@ fn answer(mounts: &CameraMounts, measured: Option<&MeasuredGrasps>) -> get_camer
         positions.extend(position);
         orientations.extend(orientation);
     }
-    get_camera_poses::Response::new(
-        true,
-        format!("{} cameras", poses.len()),
+    Ok(get_camera_poses::Response::new(
         measured.timestamp,
         poses.iter().map(|camera| camera.name.to_string()).collect(),
         positions,
@@ -259,7 +257,7 @@ fn answer(mounts: &CameraMounts, measured: Option<&MeasuredGrasps>) -> get_camer
             .iter()
             .map(|camera| camera.carried_by.to_string())
             .collect(),
-    )
+    ))
 }
 
 /// Serve `get_camera_poses` for the life of the node, from the grasp poses
@@ -273,7 +271,7 @@ pub async fn serve(
     info!("camera mounts: {} cameras", mounts.mounts.len());
     serving::serve("get_camera_poses", &token, || {
         get_camera_poses::handle_next_request(&runner, |_request| {
-            Ok(answer(&mounts, measured.borrow().as_ref()))
+            answer(&mounts, measured.borrow().as_ref())
         })
     })
     .await;
@@ -412,18 +410,21 @@ mod tests {
     #[test]
     fn the_answer_lists_every_camera_under_the_measurement_stamp_or_refuses() {
         let mounts = v2_mounts();
-        let refused = answer(&mounts, None);
-        assert!(!refused.success);
-        assert_eq!(refused.message, NOT_MEASURED_YET);
-        assert!(refused.camera_names.is_empty() && refused.positions.is_empty());
+        let refused = answer(&mounts, None).expect_err("nothing is measured yet");
+        assert_eq!(
+            refused,
+            get_camera_poses::Failure::new(
+                get_camera_poses::FailureKind::PreconditionFailed,
+                NOT_MEASURED_YET
+            )
+        );
 
         let home: JointVec = [0.0, 0.0, 0.0, 0.05, 0.0, 0.0, 0.0];
         let measured = MeasuredGrasps {
             timestamp: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(7),
             poses: ArmPair::new(grasp(Side::Left, &home), grasp(Side::Right, &home)),
         };
-        let reply = answer(&mounts, Some(&measured));
-        assert!(reply.success, "{}", reply.message);
+        let reply = answer(&mounts, Some(&measured)).expect("the arms are measured");
         assert_eq!(reply.timestamp, measured.timestamp);
         assert_eq!(reply.camera_names, ["wrist_left", "wrist_right", "chest"]);
         assert_eq!(reply.carried_by, ["left_arm", "right_arm", ""]);

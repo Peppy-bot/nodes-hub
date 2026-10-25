@@ -149,7 +149,7 @@ fn main() -> Result<()> {
             });
 
             // camera_geometry: a UVC device carries no calibration, so each
-            // member answers its refusal.
+            // member gives an error reply with `rejected`.
             tokio::spawn(listen_for_get_color_intrinsics_requests(Arc::clone(
                 &node_runner,
             )));

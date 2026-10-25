@@ -75,13 +75,16 @@
         { link_id: "geometry", name: "get_depth_to_color_extrinsics" },
         // RealSense-specific hardware knobs, native to this node (the
         // rgbd_camera contract carries only what every device can honor).
+        // set_depth_gain and set_depth_laser_power_mw write a device option.
+        // A write gets an error reply with `rejected` when the device does
+        // not offer the option or does not take the value, with
+        // `resource_unavailable` when the device is disconnected, and with
+        // `attempt_failed` when it fails for another reason.
         {
           // Depth imager gain.
           name: "set_depth_gain",
           request_message_format: { value: "i32" },
           response_message_format: {
-            success: "bool",
-            message: "string",
             current_value: "i32",
           },
         },
@@ -90,22 +93,19 @@
           name: "set_depth_laser_power_mw",
           request_message_format: { value: "i32" },
           response_message_format: {
-            success: "bool",
-            message: "string",
             current_value: "i32",
           },
         },
         {
           // Spatial alignment between the streams: "none" emits raw sensor
           // frames; "depth_to_color" warps depth into color's viewpoint and
-          // resolution; "color_to_depth" is the inverse.
+          // resolution; "color_to_depth" is the inverse. An unknown mode
+          // gets an error reply with `rejected`.
           name: "set_align_mode",
           request_message_format: {
             mode: "string",
           },
           response_message_format: {
-            success: "bool",
-            message: "string",
             current_mode: "string",
           },
         },

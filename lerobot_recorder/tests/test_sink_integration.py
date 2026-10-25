@@ -334,8 +334,9 @@ def test_resume_removes_orphaned_encoder_scratch(tmp_path):
 
 def test_save_episode_reports_a_short_video(tmp_path):
     """A real save is checked against the metadata the library itself wrote,
-    so a genuinely recorded episode passes, and shortening that episode's
-    video span reads exactly as an encoder that dropped the difference."""
+    so a genuinely recorded episode misses no frame, and shortening that
+    episode's video span reads exactly as an encoder that dropped the
+    difference."""
     sink = _sink(tmp_path)
     key = "observation.images.cam0"
 
@@ -347,15 +348,17 @@ def test_save_episode_reports_a_short_video(tmp_path):
         latest = sink._dataset.meta.latest_episode
         start = latest[f"videos/{key}/from_timestamp"][0]
         latest[f"videos/{key}/to_timestamp"] = [start + (FRAMES - 3) / FPS]
-        short = sink._video_error()
+        short = sink._video_shortfall()
         await sink.finalize()
         return whole, short
 
     whole, short = asyncio.run(record_then_shorten())
-    assert whole is None, "the episode as recorded covers every row"
-    assert short is not None
-    assert f"{key} 3" in short
-    assert "should not be trained on" in short
+    assert whole.video_frames_missing == 0, "the episode as recorded covers every row"
+    assert whole.warning() is None
+    assert short.missing_by_camera == {key: 3}
+    assert short.video_frames_missing == 3
+    assert f"{key} 3" in short.warning()
+    assert "should not be trained on" in short.warning()
 
 
 def test_staged_encoding_saves_a_whole_video(tmp_path):
@@ -369,13 +372,13 @@ def test_staged_encoding_saves_a_whole_video(tmp_path):
         for i in range(FRAMES):
             sink.add_frame(row(i), task="smoke")
         staged = sink._dataset.writer._streaming_encoder is None
-        report = await sink.save_episode()
+        shortfall = await sink.save_episode()
         await sink.finalize()
-        return staged, report
+        return staged, shortfall
 
-    staged, report = asyncio.run(record_staged())
+    staged, shortfall = asyncio.run(record_staged())
     assert staged
-    assert report is None
+    assert shortfall.video_frames_missing == 0
 
 
 def test_resume_refuses_incompatible_live_sources(tmp_path):

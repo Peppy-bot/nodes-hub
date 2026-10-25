@@ -137,58 +137,49 @@ class FakeManipulator:
         self.stopped += 1
 
 
-def answer_the_camera(h, *, colour=None, mounts=None) -> None:
+def answer_the_camera(h, *, colour: bool = True, mounts=None) -> None:
     """The camera and robot mocks of a harness answer what the brain asks
-    at start: the depth unit, the geometry once per answer in `colour`, the
-    known colour intrinsics when none are given, and where the camera
-    stands once per answer in `mounts`, the chest camera at the origin
-    looking along the robot's +Z when none are given."""
+    at start: the depth unit, the depth intrinsics, the known colour
+    intrinsics unless `colour` is false and the test answers them itself,
+    and where the camera stands once per answer in `mounts`, the chest
+    camera at the origin looking along the robot's +Z when none are
+    given."""
     from peppygen.consumed_services.camera import depth_stream_info
     from peppygen.consumed_services.geometry import get_depth_intrinsics
 
     h.mocks.deps.camera.depth_stream_info.enqueue_response(
         depth_stream_info.ResponseData(width=16, height=12, frames_per_second=15, encoding="z16", depth_unit=0.001)
     )
-    for answer in colour if colour is not None else (colour_intrinsics(),):
-        h.mocks.deps.geometry.get_color_intrinsics.enqueue_response(answer)
-        h.mocks.deps.geometry.get_depth_intrinsics.enqueue_response(
-            get_depth_intrinsics.ResponseData(
-                success=True, message="", width=16, height=12, fx=6.0, fy=6.0, cx=8.0, cy=6.0, distortion_model="none", distortion=[],
-                depth_model="z", min_depth_m=0.1, max_depth_m=10.0, align_mode="depth_to_color",
-            )
+    if colour:
+        h.mocks.deps.geometry.get_color_intrinsics.enqueue_response(colour_intrinsics())
+    h.mocks.deps.geometry.get_depth_intrinsics.enqueue_response(
+        get_depth_intrinsics.ResponseData(
+            width=16, height=12, fx=6.0, fy=6.0, cx=8.0, cy=6.0, distortion_model="none", distortion=[],
+            depth_model="z", min_depth_m=0.1, max_depth_m=10.0, align_mode="depth_to_color",
         )
+    )
     for answer in mounts if mounts is not None else (camera_poses(),):
         h.mocks.deps.camera_mounts.get_camera_poses.enqueue_response(answer)
 
 
-def camera_poses(success: bool = True, message: str = "", names=("chest",)):
-    """The robot's answer: every camera of `names` at the origin, its
-    optical frame the robot frame's, or the answer of a robot that has not
-    measured its joints yet."""
+def camera_poses(names=("chest",)):
+    """The robot's response: every camera of `names` at the origin, its
+    optical frame the robot frame's."""
     from peppygen.consumed_services.camera_mounts import get_camera_poses
 
-    if not success:
-        return get_camera_poses.ResponseData(
-            success=False, message=message, timestamp=0.0, camera_names=[], positions=[], orientations=[], carried_by=[]
-        )
     return get_camera_poses.ResponseData(
-        success=True, message="", timestamp=7.0, camera_names=list(names),
+        timestamp=7.0, camera_names=list(names),
         positions=[0.0, 0.0, 0.0] * len(names), orientations=[0.0, 0.0, 0.0, 1.0] * len(names),
         carried_by=[""] * len(names),
     )
 
 
-def colour_intrinsics(success: bool = True, message: str = ""):
-    """The colour intrinsics of a 16 x 12 camera with a 90 degree lens, or
-    the answer of a camera that does not know them yet."""
+def colour_intrinsics():
+    """The colour intrinsics of a 16 x 12 camera with a 90 degree lens."""
     from peppygen.consumed_services.geometry import get_color_intrinsics
 
-    if not success:
-        return get_color_intrinsics.ResponseData(
-            success=False, message=message, width=0, height=0, fx=0.0, fy=0.0, cx=0.0, cy=0.0, distortion_model="", distortion=[]
-        )
     return get_color_intrinsics.ResponseData(
-        success=True, message="", width=16, height=12, fx=6.0, fy=6.0, cx=8.0, cy=6.0, distortion_model="none", distortion=[]
+        width=16, height=12, fx=6.0, fy=6.0, cx=8.0, cy=6.0, distortion_model="none", distortion=[]
     )
 
 

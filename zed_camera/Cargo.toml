@@ -10,7 +10,8 @@ unsafe_code = "deny"
 [features]
 default = ["capture", "cv"]
 # V4L2 mmap streaming and controls through the v4l crate; serial via sysfs.
-capture = ["dep:v4l"]
+# libc names the errno of a refused control write.
+capture = ["dep:v4l", "dep:libc"]
 # Rectify + SGBM depth through the maintained opencv crate. clang-runtime is
 # required for opencv's binding generator to coexist with v4l's bindgen.
 cv = ["dep:opencv"]
@@ -30,6 +31,7 @@ peppylib = { path = ".peppy/libs/peppylib" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 v4l = { version = "0.14", optional = true }
+libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

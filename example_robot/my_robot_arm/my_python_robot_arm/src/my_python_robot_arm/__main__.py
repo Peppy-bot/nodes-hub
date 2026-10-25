@@ -64,7 +64,9 @@ async def _run_action(
     def decide(request):
         print(f"[arm] received move_arm goal: {request.data.desired_position}")
         if busy[0]:
-            return move_arm.GoalDecision.reject("arm is already moving")
+            return move_arm.GoalDecision.refuse(
+                move_arm.FailureKind.PRECONDITION_FAILED, "arm is already moving"
+            )
         busy[0] = True
         return move_arm.GoalDecision.accept()
 
@@ -108,9 +110,10 @@ async def _drive_goal(ctx, current_position: list[int], busy: list[bool]):
             task.cancel()
         if cancel_task in done:
             last_known = list(current_position)
-            print(f"[arm] move_arm cancelled at position: {last_known}")
+            reason = ctx.cancel_reason()
+            print(f"[arm] move_arm cancelled ({reason}) at position: {last_known}")
             try:
-                await ctx.complete_cancelled(last_known)
+                await ctx.complete_cancelled(reason, last_known)
             except Exception as e:
                 print(f"[arm] complete_cancelled error: {e!r}")
         else:

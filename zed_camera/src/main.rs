@@ -29,8 +29,8 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 use zed_camera::calibration::fetch_conf;
 use zed_camera::capture::{
-    CID_AWB_AUTO, CID_AWB_TEMPERATURE, CID_BRIGHTNESS, CID_CONTRAST, CID_GAIN, Capture, Grab,
-    device_index, zed_serial,
+    CID_AWB_AUTO, CID_AWB_TEMPERATURE, CID_BRIGHTNESS, CID_CONTRAST, CID_GAIN, Capture,
+    ControlFailure, ControlFailureKind, Grab, device_index, zed_serial,
 };
 use zed_camera::cv_depth::CvDepth;
 use zed_camera::geometry::{Geometry, Pinhole};
@@ -47,9 +47,6 @@ const ALIGN_MODE: &str = "depth_to_color";
 const DISTORTION_MODEL: &str = "none";
 /// SGBM disparity becomes the distance along the optical axis.
 const DEPTH_MODEL: &str = "z";
-/// What a geometry answer says beside its numbers: where they came from.
-const GEOMETRY_MESSAGE: &str =
-    "geometry of the rectified streams, from the unit's factory calibration";
 
 /// The capture device shared between the pipeline loop and the control
 /// services; every access is a short lock.
@@ -411,116 +408,92 @@ fn spawn_stream_infos(
     });
 }
 
-/// get_color_intrinsics: the rectified left projection at the eye size.
-fn color_intrinsics(geometry: &SessionGeometry) -> get_color_intrinsics::Response {
-    match geometry {
-        Ok(g) => {
-            let Pinhole {
-                width,
-                height,
-                fx,
-                fy,
-                cx,
-                cy,
-            } = g.color;
-            get_color_intrinsics::Response::new(
-                true,
-                GEOMETRY_MESSAGE.to_string(),
-                width,
-                height,
-                fx,
-                fy,
-                cx,
-                cy,
-                DISTORTION_MODEL.to_string(),
-                Vec::new(),
-            )
-        }
-        Err(reason) => get_color_intrinsics::Response::new(
-            false,
+/// get_color_intrinsics: the rectified left projection at the eye size. A
+/// session without a geometry gives an error reply with `rejected`, as do
+/// the other two geometry services.
+fn color_intrinsics(
+    geometry: &SessionGeometry,
+) -> std::result::Result<get_color_intrinsics::Response, get_color_intrinsics::Failure> {
+    let g = geometry.as_ref().map_err(|reason| {
+        get_color_intrinsics::Failure::new(
+            get_color_intrinsics::FailureKind::Rejected,
             reason.clone(),
-            0,
-            0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            String::new(),
-            Vec::new(),
-        ),
-    }
+        )
+    })?;
+    let Pinhole {
+        width,
+        height,
+        fx,
+        fy,
+        cx,
+        cy,
+    } = g.color;
+    Ok(get_color_intrinsics::Response::new(
+        width,
+        height,
+        fx,
+        fy,
+        cx,
+        cy,
+        DISTORTION_MODEL.to_string(),
+        Vec::new(),
+    ))
 }
 
 /// get_depth_intrinsics: the same camera through the depth grid, and what a
 /// sample measures.
-fn depth_intrinsics(geometry: &SessionGeometry) -> get_depth_intrinsics::Response {
-    match geometry {
-        Ok(g) => {
-            let Pinhole {
-                width,
-                height,
-                fx,
-                fy,
-                cx,
-                cy,
-            } = g.depth;
-            get_depth_intrinsics::Response::new(
-                true,
-                GEOMETRY_MESSAGE.to_string(),
-                width,
-                height,
-                fx,
-                fy,
-                cx,
-                cy,
-                DISTORTION_MODEL.to_string(),
-                Vec::new(),
-                DEPTH_MODEL.to_string(),
-                g.min_depth_m,
-                g.max_depth_m,
-                ALIGN_MODE.to_string(),
-            )
-        }
-        Err(reason) => get_depth_intrinsics::Response::new(
-            false,
+fn depth_intrinsics(
+    geometry: &SessionGeometry,
+) -> std::result::Result<get_depth_intrinsics::Response, get_depth_intrinsics::Failure> {
+    let g = geometry.as_ref().map_err(|reason| {
+        get_depth_intrinsics::Failure::new(
+            get_depth_intrinsics::FailureKind::Rejected,
             reason.clone(),
-            0,
-            0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            String::new(),
-            Vec::new(),
-            String::new(),
-            0.0,
-            0.0,
-            String::new(),
-        ),
-    }
+        )
+    })?;
+    let Pinhole {
+        width,
+        height,
+        fx,
+        fy,
+        cx,
+        cy,
+    } = g.depth;
+    Ok(get_depth_intrinsics::Response::new(
+        width,
+        height,
+        fx,
+        fy,
+        cx,
+        cy,
+        DISTORTION_MODEL.to_string(),
+        Vec::new(),
+        DEPTH_MODEL.to_string(),
+        g.min_depth_m,
+        g.max_depth_m,
+        ALIGN_MODE.to_string(),
+    ))
 }
 
 /// get_depth_to_color_extrinsics: depth is matched in the colour stream's own
 /// view, so the two optical frames are one and the transform is the identity.
 fn depth_to_color_extrinsics(
     geometry: &SessionGeometry,
-) -> get_depth_to_color_extrinsics::Response {
-    match geometry {
-        Ok(_) => get_depth_to_color_extrinsics::Response::new(
-            true,
-            GEOMETRY_MESSAGE.to_string(),
-            ALIGN_MODE.to_string(),
-            [0.0, 0.0, 0.0],
-            [0.0, 0.0, 0.0, 1.0],
-        ),
-        Err(reason) => get_depth_to_color_extrinsics::Response::new(
-            false,
+) -> std::result::Result<
+    get_depth_to_color_extrinsics::Response,
+    get_depth_to_color_extrinsics::Failure,
+> {
+    geometry.as_ref().map_err(|reason| {
+        get_depth_to_color_extrinsics::Failure::new(
+            get_depth_to_color_extrinsics::FailureKind::Rejected,
             reason.clone(),
-            String::new(),
-            [0.0; 3],
-            [0.0; 4],
-        ),
-    }
+        )
+    })?;
+    Ok(get_depth_to_color_extrinsics::Response::new(
+        ALIGN_MODE.to_string(),
+        [0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ))
 }
 
 /// One camera_geometry service answering from the session's geometry.
@@ -533,7 +506,7 @@ macro_rules! spawn_geometry_service {
                     let result = tokio::select! {
                         _ = cancel.cancelled() => break,
                         result = $service::handle_next_request(&runner, |_req| {
-                            Ok($respond(&geometry))
+                            $respond(&geometry)
                         }) => result,
                     };
                     if let Err(e) = result {
@@ -567,41 +540,88 @@ fn lock_camera(camera: &Camera) -> std::sync::MutexGuard<'_, Capture> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Writes one control and reads it back, folding failures into the service
-/// response instead of a transport error.
-fn apply_control(camera: &Camera, cid: u32, value: i32) -> (bool, String, i32) {
+/// Writes one control and reads it back: the value the driver kept, or why
+/// the write gave none.
+fn apply_control(
+    camera: &Camera,
+    cid: u32,
+    value: i32,
+) -> std::result::Result<i32, ControlFailure> {
     let cam = lock_camera(camera);
-    let applied = cam.set_control(cid, value);
-    let current = cam.control(cid).unwrap_or(-1);
-    match applied {
-        Ok(()) => (true, String::new(), current),
-        Err(e) => (false, e, current),
+    cam.set_control(cid, value)?;
+    Ok(cam.control(cid).unwrap_or(-1))
+}
+
+/// The error reply of `$service` for a control that gave no value: the same
+/// kind, from the service's own kinds.
+macro_rules! control_failure {
+    ($service:ident, $failure:expr) => {{
+        let ControlFailure { kind, message } = $failure;
+        let kind = match kind {
+            ControlFailureKind::Rejected => $service::FailureKind::Rejected,
+            ControlFailureKind::PreconditionFailed => $service::FailureKind::PreconditionFailed,
+            ControlFailureKind::ResourceUnavailable => $service::FailureKind::ResourceUnavailable,
+            ControlFailureKind::AttemptFailed => $service::FailureKind::AttemptFailed,
+        };
+        $service::Failure::new(kind, message)
+    }};
+}
+
+/// The ZED runs auto exposure and exposes no exposure control over UVC: the
+/// service answers "auto" with the value of the request, and gives an error
+/// reply with `rejected` for any other mode.
+fn color_exposure(
+    req: set_color_exposure::Request,
+) -> std::result::Result<set_color_exposure::Response, set_color_exposure::Failure> {
+    let refuse = |message: String| {
+        set_color_exposure::Failure::new(set_color_exposure::FailureKind::Rejected, message)
+    };
+    match req.data.mode.as_str() {
+        "auto" => Ok(set_color_exposure::Response::new(req.data.value)),
+        "manual" => Err(refuse(
+            "manual exposure is not available on the zed over uvc".to_string(),
+        )),
+        other => Err(refuse(format!("mode must be auto|manual, got {other:?}"))),
     }
 }
 
-/// The ZED runs auto exposure and exposes no exposure control over UVC; the
-/// service reports that capability honestly instead of pretending to act.
 fn spawn_set_color_exposure(runner: Arc<NodeRunner>) {
     tokio::spawn(async move {
         let cancel = runner.cancellation_token().clone();
         loop {
             let result = tokio::select! {
                 _ = cancel.cancelled() => break,
-                result = set_color_exposure::handle_next_request(&runner, |req| {
-                    let accepted = req.data.mode == "auto";
-                    let message = if accepted {
-                        "the zed always runs auto exposure".to_string()
-                    } else {
-                        "manual exposure is not available on the zed over uvc".to_string()
-                    };
-                    Ok(set_color_exposure::Response::new(accepted, message, req.data.value))
-                }) => result,
+                result = set_color_exposure::handle_next_request(&runner, color_exposure) => result,
             };
             if let Err(e) = result {
                 error!("set_color_exposure: {e}");
             }
         }
     });
+}
+
+/// "auto" turns auto white balance on and answers the temperature it runs
+/// at; "manual" turns it off and writes the temperature of the request.
+fn color_white_balance(
+    camera: &Camera,
+    mode: &str,
+    temperature: i32,
+) -> std::result::Result<i32, ControlFailure> {
+    match mode {
+        "auto" => {
+            apply_control(camera, CID_AWB_AUTO, 1)?;
+            Ok(lock_camera(camera)
+                .control(CID_AWB_TEMPERATURE)
+                .unwrap_or(-1))
+        }
+        "manual" => {
+            apply_control(camera, CID_AWB_AUTO, 0)?;
+            apply_control(camera, CID_AWB_TEMPERATURE, temperature)
+        }
+        other => Err(ControlFailure::rejected(format!(
+            "mode must be auto|manual, got {other:?}"
+        ))),
+    }
 }
 
 fn spawn_set_color_white_balance(runner: Arc<NodeRunner>, camera: Camera) {
@@ -612,39 +632,9 @@ fn spawn_set_color_white_balance(runner: Arc<NodeRunner>, camera: Camera) {
             let result = tokio::select! {
                 _ = cancel.cancelled() => break,
                 result = set_color_white_balance::handle_next_request(&runner, move |req| {
-                    let response = match req.data.mode.as_str() {
-                        "auto" => {
-                            let (ok, message, _) = apply_control(&camera, CID_AWB_AUTO, 1);
-                            let current = lock_camera(&camera)
-                                .control(CID_AWB_TEMPERATURE)
-                                .unwrap_or(-1);
-                            set_color_white_balance::Response::new(ok, message, current)
-                        }
-                        "manual" => {
-                            let (auto_off, message, _) =
-                                apply_control(&camera, CID_AWB_AUTO, 0);
-                            if auto_off {
-                                let (ok, message, current) = apply_control(
-                                    &camera,
-                                    CID_AWB_TEMPERATURE,
-                                    req.data.temperature,
-                                );
-                                set_color_white_balance::Response::new(ok, message, current)
-                            } else {
-                                set_color_white_balance::Response::new(
-                                    false,
-                                    message,
-                                    req.data.temperature,
-                                )
-                            }
-                        }
-                        other => set_color_white_balance::Response::new(
-                            false,
-                            format!("mode must be auto|manual, got {other:?}"),
-                            req.data.temperature,
-                        ),
-                    };
-                    Ok(response)
+                    color_white_balance(&camera, &req.data.mode, req.data.temperature)
+                        .map(set_color_white_balance::Response::new)
+                        .map_err(|failure| control_failure!(set_color_white_balance, failure))
                 }) => result,
             };
             if let Err(e) = result {
@@ -654,10 +644,9 @@ fn spawn_set_color_white_balance(runner: Arc<NodeRunner>, camera: Camera) {
     });
 }
 
-/// One service driving a single V4L2 control by CID; a non-empty ok_message
-/// annotates successful writes (e.g. the device's value range).
+/// One service driving a single V4L2 control by CID.
 macro_rules! spawn_cid_control_service {
-    ($fn_name:ident, $service:ident, $cid:expr, $ok_message:expr) => {
+    ($fn_name:ident, $service:ident, $cid:expr) => {
         fn $fn_name(runner: Arc<NodeRunner>, camera: Camera) {
             tokio::spawn(async move {
                 let cancel = runner.cancellation_token().clone();
@@ -666,10 +655,9 @@ macro_rules! spawn_cid_control_service {
                     let result = tokio::select! {
                         _ = cancel.cancelled() => break,
                         result = $service::handle_next_request(&runner, move |req| {
-                            let (ok, message, current) =
-                                apply_control(&camera, $cid, req.data.value);
-                            let message = if ok { $ok_message.to_string() } else { message };
-                            Ok($service::Response::new(ok, message, current))
+                            apply_control(&camera, $cid, req.data.value)
+                                .map($service::Response::new)
+                                .map_err(|failure| control_failure!($service, failure))
                         }) => result,
                     };
                     if let Err(e) = result {
@@ -681,24 +669,14 @@ macro_rules! spawn_cid_control_service {
     };
 }
 
-spawn_cid_control_service!(
-    spawn_set_color_gain,
-    set_color_gain,
-    CID_GAIN,
-    "uvc gain (zed range 0..8)"
-);
+// The ZED takes a UVC gain of 0..8.
+spawn_cid_control_service!(spawn_set_color_gain, set_color_gain, CID_GAIN);
 spawn_cid_control_service!(
     spawn_set_color_brightness,
     set_color_brightness,
-    CID_BRIGHTNESS,
-    ""
+    CID_BRIGHTNESS
 );
-spawn_cid_control_service!(
-    spawn_set_color_contrast,
-    set_color_contrast,
-    CID_CONTRAST,
-    ""
-);
+spawn_cid_control_service!(spawn_set_color_contrast, set_color_contrast, CID_CONTRAST);
 
 #[cfg(test)]
 mod tests {
@@ -722,8 +700,7 @@ mod tests {
 
     #[test]
     fn each_answer_reads_its_own_stream_and_names_the_frames_alignment() {
-        let color = color_intrinsics(&session());
-        assert!(color.success);
+        let color = color_intrinsics(&session()).unwrap();
         assert_eq!((color.width, color.height), (1280, 720));
         assert_eq!(
             (color.fx, color.fy, color.cx, color.cy),
@@ -732,8 +709,7 @@ mod tests {
         assert_eq!(color.distortion_model, "none");
         assert!(color.distortion.is_empty());
 
-        let depth = depth_intrinsics(&session());
-        assert!(depth.success);
+        let depth = depth_intrinsics(&session()).unwrap();
         assert_eq!((depth.width, depth.height), (640, 360));
         assert_eq!((depth.fx, depth.cx), (350.125, 325.8125));
         assert_eq!(depth.depth_model, "z");
@@ -741,8 +717,7 @@ mod tests {
         // The value every frame header carries.
         assert_eq!(depth.align_mode, ALIGN_MODE);
 
-        let pose = depth_to_color_extrinsics(&session());
-        assert!(pose.success);
+        let pose = depth_to_color_extrinsics(&session()).unwrap();
         assert_eq!(pose.align_mode, depth.align_mode);
         assert_eq!(pose.depth_to_color_position, [0.0, 0.0, 0.0]);
         assert_eq!(pose.depth_to_color_orientation, [0.0, 0.0, 0.0, 1.0]);
@@ -752,19 +727,50 @@ mod tests {
     fn without_a_geometry_every_answer_refuses_with_the_reason() {
         let none: SessionGeometry =
             Err("the rectified focal lengths are not positive numbers".into());
-        let color = color_intrinsics(&none);
-        assert!(!color.success);
+        let color = color_intrinsics(&none).unwrap_err();
+        assert_eq!(color.kind, get_color_intrinsics::FailureKind::Rejected);
         assert!(color.message.contains("focal lengths"));
-        assert_eq!((color.width, color.fx), (0, 0.0));
 
-        let depth = depth_intrinsics(&none);
-        assert!(!depth.success);
+        let depth = depth_intrinsics(&none).unwrap_err();
+        assert_eq!(depth.kind, get_depth_intrinsics::FailureKind::Rejected);
         assert!(depth.message.contains("focal lengths"));
-        assert!(depth.depth_model.is_empty());
 
-        let pose = depth_to_color_extrinsics(&none);
-        assert!(!pose.success);
+        let pose = depth_to_color_extrinsics(&none).unwrap_err();
+        assert_eq!(
+            pose.kind,
+            get_depth_to_color_extrinsics::FailureKind::Rejected
+        );
         assert!(pose.message.contains("focal lengths"));
-        assert_eq!(pose.depth_to_color_orientation, [0.0; 4]);
+    }
+
+    fn exposure_request(mode: &str, value: i32) -> set_color_exposure::Request {
+        set_color_exposure::Request {
+            instance_id: "caller".to_string(),
+            core_node: "core".to_string(),
+            data: set_color_exposure::RequestData {
+                mode: mode.to_string(),
+                value,
+            },
+        }
+    }
+
+    #[test]
+    fn auto_exposure_is_answered_with_the_value_of_the_request() {
+        let response = color_exposure(exposure_request("auto", 120)).unwrap();
+        assert_eq!(response.current_value, 120);
+    }
+
+    #[test]
+    fn manual_exposure_and_an_unknown_mode_are_rejected() {
+        let manual = color_exposure(exposure_request("manual", 120)).unwrap_err();
+        assert_eq!(manual.kind, set_color_exposure::FailureKind::Rejected);
+        assert!(
+            manual.message.contains("not available"),
+            "{}",
+            manual.message
+        );
+        let unknown = color_exposure(exposure_request("dim", 120)).unwrap_err();
+        assert_eq!(unknown.kind, set_color_exposure::FailureKind::Rejected);
+        assert!(unknown.message.contains("\"dim\""), "{}", unknown.message);
     }
 }

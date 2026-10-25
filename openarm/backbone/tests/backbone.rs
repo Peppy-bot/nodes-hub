@@ -462,11 +462,22 @@ fn assert_all_close(what: &str, got: &[f64], expected: &[f64], tolerance: f64) {
     }
 }
 
+/// The error reply that `answer` holds, read by `of`, the `Failure::of` of
+/// the member. Fails the test on a response, or on an error that is not an
+/// error reply of the member.
+fn error_reply<T: std::fmt::Debug, F>(
+    answer: peppygen::Result<T>,
+    of: impl Fn(&peppygen::Error) -> Option<F>,
+) -> F {
+    match answer {
+        Ok(response) => panic!("a response, not an error reply: {response:?}"),
+        Err(e) => of(&e).unwrap_or_else(|| panic!("not an error reply of the member: {e}")),
+    }
+}
+
 /// The result of a posture goal, as either postures action gives it.
 #[derive(Debug)]
 struct PostureResult {
-    success: bool,
-    message: String,
     arm_names: Vec<String>,
     positions: Vec<f64>,
     orientations: Vec<f64>,
@@ -482,7 +493,7 @@ macro_rules! send_posture_goal {
             &$action::GoalRequestData {
                 duration_s: $duration_s,
             },
-            peppygen::QoSProfile::Reliable,
+            peppygen::DEFAULT_FEEDBACK_BOUND,
             DEADLINE,
         )
         .await?
@@ -490,17 +501,22 @@ macro_rules! send_posture_goal {
 }
 
 /// Send one goal of `$action` with `$duration_s`, and assert that the node
-/// refuses it as a duration outside the contract's bound.
+/// refuses it with the failure kind `$kind` and the message `$reason`.
 macro_rules! assert_posture_refused {
-    ($harness:expr, $action:ident, $duration_s:expr, $reason:expr) => {{
+    ($harness:expr, $action:ident, $duration_s:expr, $kind:ident, $reason:expr) => {{
+        use peppygen::fixtures::exposed_actions::postures::$action;
         let goal = send_posture_goal!($harness, $action, $duration_s);
-        assert!(
-            !goal.accepted,
-            "a {} s {} must be refused",
-            $duration_s,
-            stringify!($action)
+        let refusal = goal.refusal.unwrap_or_else(|| {
+            panic!(
+                "a {} s {} must be refused",
+                $duration_s,
+                stringify!($action)
+            )
+        });
+        assert_eq!(
+            refusal,
+            $action::Failure::new($action::FailureKind::$kind, $reason)
         );
-        assert_eq!(goal.reason.as_deref(), Some($reason));
     }};
 }
 
@@ -512,14 +528,12 @@ macro_rules! complete_posture {
         let goal = send_posture_goal!($harness, $action, $duration_s);
         assert!(
             goal.accepted,
-            "{} rejected: {:?}",
+            "{} refused: {:?}",
             stringify!($action),
-            goal.reason
+            goal.refusal
         );
         match goal.get_result(DEADLINE).await?.outcome {
             $action::ResultOutcome::Completed(data) => PostureResult {
-                success: data.success,
-                message: data.message,
                 arm_names: data.arm_names,
                 positions: data.positions,
                 orientations: data.orientations,
@@ -530,24 +544,25 @@ macro_rules! complete_posture {
 }
 
 /// Send one `move_arm_joints` goal for the left arm to `target` over
-/// `duration_s`, and assert that it completes with success.
+/// `duration_s`, and assert that it completes.
 async fn complete_left_arm_joint_move(
     harness: &Harness,
     target: [f64; 7],
     duration_s: f64,
 ) -> peppygen::Result<move_arm_joints::ResultData> {
-    let data = left_arm_joint_move(harness, target, duration_s).await?;
-    assert!(data.success, "{}", data.message);
-    Ok(data)
+    match left_arm_joint_move(harness, target, duration_s).await? {
+        move_arm_joints::ResultOutcome::Completed(data) => Ok(data),
+        other => panic!("move_arm_joints did not complete: {other:?}"),
+    }
 }
 
 /// Send one `move_arm_joints` goal for the left arm to `target` over
-/// `duration_s`, and wait for the result it completes with, success or not.
+/// `duration_s`, assert that the node accepts it, and wait for how it ends.
 async fn left_arm_joint_move(
     harness: &Harness,
     target: [f64; 7],
     duration_s: f64,
-) -> peppygen::Result<move_arm_joints::ResultData> {
+) -> peppygen::Result<move_arm_joints::ResultOutcome> {
     let goal = move_arm_joints::send_goal(
         harness,
         &move_arm_joints::GoalRequestData {
@@ -557,15 +572,12 @@ async fn left_arm_joint_move(
             settle_tolerances_rad: [SETTLE_TOLERANCE_RAD; 7],
             settle_timeout_s: SETTLE_TIMEOUT_S,
         },
-        peppygen::QoSProfile::Reliable,
+        peppygen::DEFAULT_FEEDBACK_BOUND,
         DEADLINE,
     )
     .await?;
-    assert!(goal.accepted, "goal rejected: {:?}", goal.reason);
-    match goal.get_result(DEADLINE).await?.outcome {
-        move_arm_joints::ResultOutcome::Completed(data) => Ok(data),
-        other => panic!("move_arm_joints did not complete: {other:?}"),
-    }
+    assert!(goal.accepted, "goal refused: {:?}", goal.refusal);
+    Ok(goal.get_result(DEADLINE).await?.outcome)
 }
 
 /// The plan slack the Cartesian moves of these tests are planned within: the
@@ -580,7 +592,7 @@ const SETTLE_POSITION_TOLERANCE_M: f64 = 0.005;
 const SETTLE_ORIENTATION_TOLERANCE_RAD: f64 = 0.05;
 const SETTLE_TIMEOUT_S: f64 = 0.5;
 
-/// The seconds a failed settle's message names after the planned end. The
+/// The seconds a settle timeout's message names after the planned end. The
 /// node formats the time it measured, so a stalled test host reads higher
 /// than the settle timeout, never lower.
 fn seconds_after_planned_end(message: &str) -> f64 {
@@ -606,19 +618,31 @@ async fn complete_left_gripper_move(
     opening: f64,
     max_effort: f64,
 ) -> peppygen::Result<move_gripper::ResultData> {
+    complete_left_gripper_move_within(harness, opening, max_effort, GRIPPER_SETTLE_TIMEOUT_S).await
+}
+
+/// Send one `move_gripper` goal for the left gripper to `opening` under
+/// `max_effort` with `settle_timeout_s`, and wait for the result it
+/// completes with.
+async fn complete_left_gripper_move_within(
+    harness: &Harness,
+    opening: f64,
+    max_effort: f64,
+    settle_timeout_s: f64,
+) -> peppygen::Result<move_gripper::ResultData> {
     let goal = move_gripper::send_goal(
         harness,
         &move_gripper::GoalRequestData {
             gripper_name: "left_gripper".to_string(),
             opening,
             max_effort,
-            settle_timeout_s: GRIPPER_SETTLE_TIMEOUT_S,
+            settle_timeout_s,
         },
-        peppygen::QoSProfile::Reliable,
+        peppygen::DEFAULT_FEEDBACK_BOUND,
         DEADLINE,
     )
     .await?;
-    assert!(goal.accepted, "goal rejected: {:?}", goal.reason);
+    assert!(goal.accepted, "goal refused: {:?}", goal.refusal);
     match goal.get_result(DEADLINE).await?.outcome {
         move_gripper::ResultOutcome::Completed(data) => Ok(data),
         other => panic!("move_gripper did not complete: {other:?}"),
@@ -691,10 +715,14 @@ async fn a_leader_command_fans_through_to_the_governed_arm_wire() -> peppygen::R
     harness.shutdown().await
 }
 
-/// A leader that is streaming has the limb: a goal on it is refused, and
-/// admitted once the stream has stopped for the streaming window.
+/// A leader that is streaming has the limb: a goal on it is refused with
+/// `leader_streaming`, a plan check on it gets an error reply of that kind,
+/// and the goal is admitted once the stream has stopped for the streaming
+/// window.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_goal_on_an_arm_a_leader_streams_waits_for_the_stream_to_stop() -> peppygen::Result<()> {
+    use peppygen::fixtures::exposed_services::limb_motion::check_arm_move;
+
     let (harness, mocks) = start_ready_vacant(params()).await?;
     pump_is_ready(
         mocks.deps.robot_init.is_ready,
@@ -707,26 +735,32 @@ async fn a_goal_on_an_arm_a_leader_streams_waits_for_the_stream_to_stop() -> pep
     .followed;
     pump_right_arm_and_grippers!(mocks);
     await_streaming(mocks.pairings.right_arm.joint_setpoints).await?;
-    let leader = mocks.pairings.leader_left_arm.joint_setpoints;
 
-    // The leader bends the elbow. The command has landed once the governed
-    // wire moves toward it, which the listener notes before the chase can
-    // read the command; the republish on an empty read window covers a
-    // best-effort drop.
+    // The leader streams a bent elbow every state period, as a leader arm
+    // does, until the test lets go.
     let mut target = HOME;
     target[3] = 0.4;
-    let deadline = tokio::time::Instant::now() + DEADLINE;
-    leader.publish(&leader_command(target)).await?;
-    while followed.borrow()[3] - HOME[3] < 0.01 {
-        match tokio::time::timeout(READ_WINDOW, followed.changed()).await {
-            Ok(changed) => changed.expect("the left arm follower runs"),
-            Err(_) => leader.publish(&leader_command(target)).await?,
+    let leader = mocks.pairings.leader_left_arm.joint_setpoints;
+    let (let_go, mut released) = oneshot::channel::<()>();
+    let streaming = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(STATE_PUMP_PERIOD);
+        loop {
+            tokio::select! {
+                _ = &mut released => return,
+                _ = ticker.tick() => {
+                    if leader.publish(&leader_command(target)).await.is_err() {
+                        return;
+                    }
+                }
+            }
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the leader's command never reached the governed wire"
-        );
-    }
+    });
+    // The stream has the arm once the governed wire moves toward it.
+    tokio::time::timeout(DEADLINE, followed.wait_for(|q| q[3] - HOME[3] >= 0.01))
+        .await
+        .expect("the leader's command never reached the governed wire")
+        .expect("the left arm follower runs");
+
     let refused = move_arm_joints::send_goal(
         &harness,
         &move_arm_joints::GoalRequestData {
@@ -736,27 +770,56 @@ async fn a_goal_on_an_arm_a_leader_streams_waits_for_the_stream_to_stop() -> pep
             settle_tolerances_rad: [SETTLE_TOLERANCE_RAD; 7],
             settle_timeout_s: SETTLE_TIMEOUT_S,
         },
-        peppygen::QoSProfile::Reliable,
+        peppygen::DEFAULT_FEEDBACK_BOUND,
         DEADLINE,
     )
     .await?;
-    assert!(!refused.accepted, "a streaming leader must keep the arm");
-    let reason = refused.reason.unwrap_or_default();
+    let refusal = refused
+        .refusal
+        .expect("a streaming leader must keep the arm");
+    assert_eq!(refusal.kind, move_arm_joints::FailureKind::LeaderStreaming);
     assert!(
-        reason.starts_with("a leader is streaming arm commands"),
-        "the refusal must say a leader streams: {reason}"
+        refusal
+            .message
+            .starts_with("a leader is streaming arm commands"),
+        "the refusal must say a leader streams: {}",
+        refusal.message
+    );
+
+    let check = check_arm_move::RequestData {
+        arm_name: "left_arm".to_string(),
+        position: [0.3, 0.2, 0.3],
+        orientation: [0.0, 0.0, 0.0, 1.0],
+        duration_s: 0.0,
+        plan_position_tolerance_m: PLAN_POSITION_TOLERANCE_M,
+        plan_orientation_tolerance_rad: PLAN_ORIENTATION_TOLERANCE_RAD,
+    };
+    let reply = error_reply(
+        check_arm_move::poll(&harness, &check, DEADLINE).await,
+        check_arm_move::Failure::of,
+    );
+    assert_eq!(
+        (reply.kind, reply.message),
+        (
+            check_arm_move::FailureKind::LeaderStreaming,
+            refusal.message
+        )
     );
 
     // The leader lets go: past the 250 ms streaming window, the arm takes
     // the goal.
+    let_go
+        .send(())
+        .expect("the leader streams until it lets go");
+    streaming.await.expect("the leader stops streaming");
     tokio::time::sleep(Duration::from_millis(400)).await;
     complete_left_arm_joint_move(&harness, HOME, 0.2).await?;
     harness.shutdown().await
 }
 
 /// Admission end-to-end: a goal on a limb whose follower has not reported is
-/// refused at the door, before the coordinator has seeded, with the refusal
-/// the so101 backbone gives.
+/// refused at the door with `resource_unavailable`, before the coordinator
+/// has seeded, in the words the so101 backbone gives.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_goal_on_a_limb_with_no_fresh_follower_state_is_refused_at_admission()
 -> peppygen::Result<()> {
@@ -786,14 +849,17 @@ async fn a_goal_on_a_limb_with_no_fresh_follower_state_is_refused_at_admission()
             settle_tolerances_rad: [SETTLE_TOLERANCE_RAD; 7],
             settle_timeout_s: SETTLE_TIMEOUT_S,
         },
-        peppygen::QoSProfile::Reliable,
+        peppygen::DEFAULT_FEEDBACK_BOUND,
         DEADLINE,
     )
     .await?;
-    assert!(!goal.accepted, "a goal on an unreported arm was accepted");
     assert_eq!(
-        goal.reason.as_deref(),
-        Some("no fresh follower state to anchor the move from")
+        goal.refusal
+            .expect("a goal on an unreported arm was accepted"),
+        move_arm_joints::Failure::new(
+            move_arm_joints::FailureKind::ResourceUnavailable,
+            "no fresh follower state to anchor the move from"
+        )
     );
     harness.shutdown().await
 }
@@ -801,8 +867,8 @@ async fn a_goal_on_a_limb_with_no_fresh_follower_state_is_refused_at_admission()
 /// Exposed action end-to-end: `move_arm_joints` through the real action
 /// engine, with the left arm mock playing a perfect follower (it adopts every
 /// governed setpoint as its measured state). The goal must be admitted, the
-/// trajectory streamed down the pairing wire, and the result must report
-/// success with the measured (echoed) pose on the commanded target.
+/// trajectory streamed down the pairing wire, and the goal must complete with
+/// the measured (echoed) pose on the commanded target.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn move_arm_joints_streams_a_trajectory_the_arm_follows_to_the_target() -> peppygen::Result<()>
 {
@@ -867,14 +933,13 @@ async fn move_arm_joints_streams_a_trajectory_the_arm_follows_to_the_target() ->
     harness.shutdown().await
 }
 
-/// A joint move that the collision governor holds short fails its settle
-/// when the settle timeout runs out after the planned end, naming the held
-/// joint. Its result gives the joints that the arm measured then, not the
-/// goal. Here the band is wide, so the rest pose sits under d_stop. A left
-/// wrist sent toward the centerline never gets there.
+/// A joint move that the collision governor holds short fails with
+/// `timeout` when the settle timeout runs out after the planned end, naming
+/// the held joint, and gives no result. Here the band is wide, so the rest
+/// pose sits under d_stop. A left wrist sent toward the centerline never
+/// gets there.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_joint_move_the_governor_holds_fails_its_settle_with_the_measured_pose()
--> peppygen::Result<()> {
+async fn a_joint_move_the_governor_holds_fails_its_settle_with_timeout() -> peppygen::Result<()> {
     let mut wide = params();
     wide.d_stop_m = 0.8;
     wide.d_safe_m = 1.0;
@@ -894,49 +959,43 @@ async fn a_joint_move_the_governor_holds_fails_its_settle_with_the_measured_pose
     let mut inward = HOME;
     inward[2] = 1.5;
     inward[3] = 0.4;
-    let data = left_arm_joint_move(&harness, inward, 1.0).await?;
+    let failure = match left_arm_joint_move(&harness, inward, 1.0).await? {
+        move_arm_joints::ResultOutcome::Failed(failure) => failure,
+        other => panic!("a held arm cannot have settled on its target: {other:?}"),
+    };
+    assert_eq!(failure.kind, move_arm_joints::FailureKind::Timeout);
     assert!(
-        !data.success,
-        "a held arm cannot have settled on its target"
-    );
-    assert!(
-        data.message.starts_with("still ")
-            && data.message.contains(" rad from the target at joint 3, "),
+        failure.message.starts_with("still ")
+            && failure
+                .message
+                .contains(" rad from the target at joint 3, "),
         "the failure names the held joint: {}",
-        data.message
+        failure.message
     );
     assert!(
-        seconds_after_planned_end(&data.message) >= SETTLE_TIMEOUT_S,
+        seconds_after_planned_end(&failure.message) >= SETTLE_TIMEOUT_S,
         "the failure came no sooner than the settle timeout: {}",
-        data.message
-    );
-    assert!(
-        (data.final_joint_positions[2] - inward[2]).abs() > 0.5,
-        "the governor let the wrist reach its goal: {:?}",
-        data.final_joint_positions
+        failure.message
     );
     let observed = *followed.borrow();
-    for (joint, (reported, observed)) in data
-        .final_joint_positions
-        .iter()
-        .zip(observed.iter())
-        .enumerate()
-    {
-        assert!(
-            (reported - observed).abs() < 0.05,
-            "joint {joint}: the result gives {reported}, the arm stands at {observed}"
-        );
-    }
+    assert!(
+        (observed[2] - inward[2]).abs() > 0.5,
+        "the governor let the wrist reach its goal: {observed:?}"
+    );
     harness.shutdown().await
 }
 
-/// A move_arm result gives the grasp pose of the joints that the arm
-/// measured when the move ended. Here the left arm stands still at Ready.
-/// A move 5 cm up runs to its planned end and fails its settle, naming the
-/// 50 mm the grasp point still stands from the target. Its result gives
-/// where the arm stands, as limb_state does, not the goal.
+/// A move_arm goal ends on the grasp point of the joints that the arm
+/// measures. Here the left arm stands still at Ready:
+/// - a plan check of a pose 5 cm up answers that a plan reaches it;
+/// - a move there runs to its planned end and fails with `timeout`, naming
+///   the 50 mm the grasp point still stands from the target, and gives no
+///   result;
+/// - the same move, cancelled by its caller, ends cancelled for that reason
+///   with where the arm stands, as limb_state gives it, not the goal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_pose_move_reports_the_grasp_point_of_the_measured_joints() -> peppygen::Result<()> {
+async fn a_pose_move_that_cannot_settle_fails_and_a_cancelled_one_reports_the_measured_grasp_point()
+-> peppygen::Result<()> {
     use peppygen::fixtures::exposed_actions::limb_motion::move_arm;
     use peppygen::fixtures::exposed_services::limb_motion::check_arm_move;
 
@@ -982,42 +1041,60 @@ async fn a_pose_move_reports_the_grasp_point_of_the_measured_joints() -> peppyge
         DEADLINE,
     )
     .await?;
-    assert!(check.success, "{}", check.message);
+    assert!(check.reachable, "{}", check.reason);
+    assert!(check.reason.is_empty(), "{}", check.reason);
 
+    let raise = |duration_s: f64| move_arm::GoalRequestData {
+        arm_name: "left_arm".to_string(),
+        position: raised,
+        orientation,
+        duration_s,
+        plan_position_tolerance_m: PLAN_POSITION_TOLERANCE_M,
+        plan_orientation_tolerance_rad: PLAN_ORIENTATION_TOLERANCE_RAD,
+        settle_position_tolerance_m: SETTLE_POSITION_TOLERANCE_M,
+        settle_orientation_tolerance_rad: SETTLE_ORIENTATION_TOLERANCE_RAD,
+        settle_timeout_s: SETTLE_TIMEOUT_S,
+    };
     let goal = move_arm::send_goal(
         &harness,
-        &move_arm::GoalRequestData {
-            arm_name: "left_arm".to_string(),
-            position: raised,
-            orientation,
-            duration_s: 1.0,
-            plan_position_tolerance_m: PLAN_POSITION_TOLERANCE_M,
-            plan_orientation_tolerance_rad: PLAN_ORIENTATION_TOLERANCE_RAD,
-            settle_position_tolerance_m: SETTLE_POSITION_TOLERANCE_M,
-            settle_orientation_tolerance_rad: SETTLE_ORIENTATION_TOLERANCE_RAD,
-            settle_timeout_s: SETTLE_TIMEOUT_S,
-        },
-        peppygen::QoSProfile::Reliable,
+        &raise(1.0),
+        peppygen::DEFAULT_FEEDBACK_BOUND,
         DEADLINE,
     )
     .await?;
-    assert!(goal.accepted, "goal rejected: {:?}", goal.reason);
-    let data = match goal.get_result(DEADLINE).await?.outcome {
-        move_arm::ResultOutcome::Completed(data) => data,
-        other => panic!("move_arm did not complete: {other:?}"),
+    assert!(goal.accepted, "goal refused: {:?}", goal.refusal);
+    let failure = match goal.get_result(DEADLINE).await?.outcome {
+        move_arm::ResultOutcome::Failed(failure) => failure,
+        other => panic!("an arm that never moved cannot have settled: {other:?}"),
     };
-    assert!(!data.success, "an arm that never moved cannot have settled");
+    assert_eq!(failure.kind, move_arm::FailureKind::Timeout);
     assert!(
-        data.message
+        failure
+            .message
             .starts_with("still 50.0 mm / 0.00 rad from the target, "),
         "the failure names the remaining error: {}",
-        data.message
+        failure.message
     );
     assert!(
-        seconds_after_planned_end(&data.message) >= SETTLE_TIMEOUT_S,
+        seconds_after_planned_end(&failure.message) >= SETTLE_TIMEOUT_S,
         "the failure came no sooner than the settle timeout: {}",
-        data.message
+        failure.message
     );
+
+    let goal = move_arm::send_goal(
+        &harness,
+        &raise(30.0),
+        peppygen::DEFAULT_FEEDBACK_BOUND,
+        DEADLINE,
+    )
+    .await?;
+    assert!(goal.accepted, "goal refused: {:?}", goal.refusal);
+    goal.cancel_goal(DEADLINE).await?;
+    let (reason, data) = match goal.get_result(DEADLINE).await?.outcome {
+        move_arm::ResultOutcome::Cancelled { reason, data } => (reason, data),
+        other => panic!("the cancelled move did not end cancelled: {other:?}"),
+    };
+    assert_eq!(reason, "cancelled by its caller");
     assert_all_close("final_position", &data.final_position, &start, 1e-9);
     assert_all_close(
         "final_orientation",
@@ -1025,25 +1102,14 @@ async fn a_pose_move_reports_the_grasp_point_of_the_measured_joints() -> peppyge
         &orientation,
         1e-9,
     );
-    let short_by = data
-        .final_position
-        .iter()
-        .zip(raised)
-        .map(|(reported, goal)| (reported - goal).powi(2))
-        .sum::<f64>()
-        .sqrt();
-    assert!(
-        short_by > 0.04,
-        "the result gives the goal, not the arm: {short_by} m"
-    );
     harness.shutdown().await
 }
 
 /// Exposed gripper action end-to-end: `move_gripper` with the left gripper
 /// played by a follower whose jaws lag their commands. The commanded ramp
 /// lands on the target while the jaws are still most of the way out; the
-/// result comes once they have stood still on it and reports the opening
-/// measured then.
+/// result comes once they have stood still on it, says they settled, and
+/// reports the opening measured then.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn move_gripper_answers_with_the_opening_the_lagging_jaws_stopped_at() -> peppygen::Result<()>
 {
@@ -1078,14 +1144,33 @@ async fn move_gripper_answers_with_the_opening_the_lagging_jaws_stopped_at() -> 
     // 70 ms, the lagging jaws need 40 state periods and then stand still.
     let target = 0.1;
     let data = complete_left_gripper_move(&harness, target, 0.0).await?;
-    assert!(data.success, "move failed: {}", data.message);
-    assert_eq!(data.message, "move complete");
+    assert!(data.settled, "the jaws stood still on the target: {data:?}");
     assert_eq!(
         data.final_opening, target,
         "final_opening must be the opening the jaws arrived at"
     );
     assert_eq!(*followed.borrow(), target, "the jaws stand on the target");
 
+    harness.shutdown().await
+}
+
+/// A gripper move whose jaws do not stand still by its settle timeout
+/// completes where they stand, and says they did not settle. Here the
+/// timeout is 0 s: the commanded ramp lands on the target long before the
+/// lagging jaws, which cannot have stood still for the 0.25 s window on the
+/// tick it lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_gripper_move_whose_jaws_are_not_still_by_its_timeout_completes_unsettled()
+-> peppygen::Result<()> {
+    let (harness, _) = start_with_left_followers(0.0).await?;
+
+    let target = 0.1;
+    let data = complete_left_gripper_move_within(&harness, target, 0.0, 0.0).await?;
+    assert!(!data.settled, "the jaws cannot have stood still: {data:?}");
+    assert!(
+        (target..=0.5).contains(&data.final_opening),
+        "the jaws stand between where they were and the target: {data:?}"
+    );
     harness.shutdown().await
 }
 
@@ -1107,8 +1192,7 @@ async fn a_gripper_held_by_an_object_keeps_its_closing_command_after_the_move()
         max_effort: 1.5,
     };
     let data = complete_left_gripper_move(&harness, squeeze.opening, squeeze.max_effort).await?;
-    assert!(data.success, "{}", data.message);
-    assert_eq!(data.message, "move complete");
+    assert!(data.settled, "the held jaws stood still: {data:?}");
     assert_eq!(data.final_opening, 0.3);
     let during = gripper.received_since(0);
     assert!(!during.is_empty(), "the move commanded the gripper");
@@ -1330,8 +1414,9 @@ async fn limb_names_are_answered_before_the_robot_is_ready() -> peppygen::Result
     harness.shutdown().await
 }
 
-/// A goal naming no limb of this robot is refused at admission with the name
-/// table quoted, for the arm and gripper moves alike.
+/// A goal naming no limb of this robot is refused at admission with
+/// `rejected` and the name table quoted, for the arm and gripper moves
+/// alike.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn goals_for_unknown_limb_names_are_refused() -> peppygen::Result<()> {
     let (harness, mocks) = start_ready_vacant(params()).await?;
@@ -1358,14 +1443,16 @@ async fn goals_for_unknown_limb_names_are_refused() -> peppygen::Result<()> {
             settle_tolerances_rad: [SETTLE_TOLERANCE_RAD; 7],
             settle_timeout_s: SETTLE_TIMEOUT_S,
         },
-        peppygen::QoSProfile::Reliable,
+        peppygen::DEFAULT_FEEDBACK_BOUND,
         DEADLINE,
     )
     .await?;
-    assert!(!goal.accepted, "a goal for \"torso\" must be refused");
     assert_eq!(
-        goal.reason.as_deref(),
-        Some(r#"unknown arm_name: this robot's arms are "left_arm" and "right_arm""#)
+        goal.refusal.expect("a goal for \"torso\" must be refused"),
+        move_arm_joints::Failure::new(
+            move_arm_joints::FailureKind::Rejected,
+            r#"unknown arm_name: this robot's arms are "left_arm" and "right_arm""#
+        )
     );
 
     // A gripper goal addressed with an ARM name is a mixup, not a gripper.
@@ -1377,17 +1464,15 @@ async fn goals_for_unknown_limb_names_are_refused() -> peppygen::Result<()> {
             max_effort: 0.0,
             settle_timeout_s: GRIPPER_SETTLE_TIMEOUT_S,
         },
-        peppygen::QoSProfile::Reliable,
+        peppygen::DEFAULT_FEEDBACK_BOUND,
         DEADLINE,
     )
     .await?;
-    assert!(
-        !goal.accepted,
-        "a gripper goal for \"left_arm\" must be refused"
-    );
     assert_eq!(
-        goal.reason.as_deref(),
-        Some(
+        goal.refusal
+            .expect("a gripper goal for \"left_arm\" must be refused"),
+        move_gripper::Failure::new(
+            move_gripper::FailureKind::Rejected,
             r#"unknown gripper_name: this robot's grippers are "left_gripper" and "right_gripper""#
         )
     );
@@ -1395,9 +1480,10 @@ async fn goals_for_unknown_limb_names_are_refused() -> peppygen::Result<()> {
 }
 
 /// The stop service ends the moves in flight, whoever started them: an arm
-/// move and a gripper move both end as cancelled with the stop's message,
-/// the answer names both limbs, a stop with nothing moving names none, and
-/// a goal that arrives after the stop runs to its end.
+/// move and a gripper move both end cancelled, for a reason that names the
+/// stop and the reason of its request, the answer names both limbs, a stop
+/// with nothing moving names none, and a goal that arrives after the stop
+/// runs to its end.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stop_ends_every_move_in_flight_and_a_later_goal_runs() -> peppygen::Result<()> {
     use peppygen::fixtures::exposed_services::limb_motion::stop;
@@ -1413,9 +1499,7 @@ async fn a_stop_ends_every_move_in_flight_and_a_later_goal_runs() -> peppygen::R
         DEADLINE,
     )
     .await?;
-    assert!(idle.success, "{}", idle.message);
     assert!(idle.stopped.is_empty(), "{:?}", idle.stopped);
-    assert_eq!(idle.message, "nothing was moving");
 
     // A long arm move and a gripper move whose jaws lag: both are in flight
     // when the stop arrives. The stop is gated on the jaws having moved,
@@ -1430,11 +1514,11 @@ async fn a_stop_ends_every_move_in_flight_and_a_later_goal_runs() -> peppygen::R
             settle_tolerances_rad: [SETTLE_TOLERANCE_RAD; 7],
             settle_timeout_s: SETTLE_TIMEOUT_S,
         },
-        peppygen::QoSProfile::Reliable,
+        peppygen::DEFAULT_FEEDBACK_BOUND,
         DEADLINE,
     )
     .await?;
-    assert!(arm_goal.accepted, "goal rejected: {:?}", arm_goal.reason);
+    assert!(arm_goal.accepted, "goal refused: {:?}", arm_goal.refusal);
     let gripper_goal = move_gripper::send_goal(
         &harness,
         &move_gripper::GoalRequestData {
@@ -1443,14 +1527,14 @@ async fn a_stop_ends_every_move_in_flight_and_a_later_goal_runs() -> peppygen::R
             max_effort: 0.0,
             settle_timeout_s: GRIPPER_SETTLE_TIMEOUT_S,
         },
-        peppygen::QoSProfile::Reliable,
+        peppygen::DEFAULT_FEEDBACK_BOUND,
         DEADLINE,
     )
     .await?;
     assert!(
         gripper_goal.accepted,
-        "goal rejected: {:?}",
-        gripper_goal.reason
+        "goal refused: {:?}",
+        gripper_goal.refusal
     );
     let mut moving = gripper.jaws.clone();
     tokio::time::timeout(
@@ -1469,24 +1553,21 @@ async fn a_stop_ends_every_move_in_flight_and_a_later_goal_runs() -> peppygen::R
         DEADLINE,
     )
     .await?;
-    assert!(answer.success, "{}", answer.message);
     assert_eq!(answer.stopped, ["left_arm", "left_gripper"]);
-    assert_eq!(answer.message, "stopped left_arm, left_gripper");
 
-    let result = arm_goal.get_result(DEADLINE).await?;
-    let data = match result.outcome {
-        move_arm_joints::ResultOutcome::Cancelled(data) => data,
+    match arm_goal.get_result(DEADLINE).await?.outcome {
+        move_arm_joints::ResultOutcome::Cancelled { reason, .. } => {
+            assert_eq!(reason, "stopped: the operator asked");
+        }
         other => panic!("the stopped arm move did not end cancelled: {other:?}"),
-    };
-    assert!(!data.success);
-    assert_eq!(data.message, "stopped: the operator asked");
-    let result = gripper_goal.get_result(DEADLINE).await?;
-    let data = match result.outcome {
-        move_gripper::ResultOutcome::Cancelled(data) => data,
+    }
+    match gripper_goal.get_result(DEADLINE).await?.outcome {
+        move_gripper::ResultOutcome::Cancelled { reason, data } => {
+            assert_eq!(reason, "stopped: the operator asked");
+            assert!(!data.settled, "a stopped gripper move did not settle");
+        }
         other => panic!("the stopped gripper move did not end cancelled: {other:?}"),
-    };
-    assert!(!data.success);
-    assert_eq!(data.message, "stopped: the operator asked");
+    }
     // The arm holds short of the target it was on its way to.
     let held = *arm.borrow();
     assert!(
@@ -1510,7 +1591,7 @@ async fn a_stop_leaves_a_settled_gripper_closed() -> peppygen::Result<()> {
     let (harness, LeftFollowers { gripper, .. }) = start_with_left_followers(0.0).await?;
 
     let data = complete_left_gripper_move(&harness, 0.1, 0.0).await?;
-    assert!(data.success, "{}", data.message);
+    assert!(data.settled, "{data:?}");
     assert_eq!(*gripper.jaws.borrow(), 0.1);
 
     let before_stop = gripper.received_count();
@@ -1522,7 +1603,6 @@ async fn a_stop_leaves_a_settled_gripper_closed() -> peppygen::Result<()> {
         DEADLINE,
     )
     .await?;
-    assert!(answer.success, "{}", answer.message);
     assert!(
         !answer.stopped.iter().any(|limb| limb == "left_gripper"),
         "{:?}",
@@ -1540,10 +1620,10 @@ async fn a_stop_leaves_a_settled_gripper_closed() -> peppygen::Result<()> {
 
 /// A posture result gives arm_names and, in that order, the grasp pose of
 /// each arm measured when the goal completes. limb_state gives the same
-/// pose for the same joints. Its success and its message say that the
-/// move's time ran out, not that the arms arrived. Here both arms stand
-/// still at HOME, so move_to_ready succeeds with neither arm at Ready.
-/// move_to_home gives its result the same way.
+/// pose for the same joints. A posture completes when the move's time ran
+/// out, not when the arms arrived. Here both arms stand still at HOME, so
+/// move_to_ready completes with neither arm at Ready. move_to_home gives
+/// its result the same way.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_posture_result_reports_each_arms_measured_grasp_point() -> peppygen::Result<()> {
     let (mut harness, mocks) = start_ready_vacant(params()).await?;
@@ -1560,12 +1640,7 @@ async fn a_posture_result_reports_each_arms_measured_grasp_point() -> peppygen::
 
     let ready = complete_posture!(harness, move_to_ready, 0.0);
     let home = complete_posture!(harness, move_to_home, 0.0);
-    for (result, done) in [
-        (ready, "move to ready completed"),
-        (home, "move to home completed"),
-    ] {
-        assert!(result.success, "{}", result.message);
-        assert_eq!(result.message, done);
+    for result in [ready, home] {
         assert_eq!(result.arm_names, ["left_arm", "right_arm"]);
         assert_all_close("positions", &result.positions, &snapshot.positions, 1e-9);
         assert_all_close(
@@ -1579,7 +1654,8 @@ async fn a_posture_result_reports_each_arms_measured_grasp_point() -> peppygen::
 }
 
 /// Before the arms report their first state, a posture goal is refused at
-/// admission, with the refusal every arm goal gets then.
+/// admission with `resource_unavailable`, in the words every arm goal gets
+/// then.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_posture_goal_before_the_first_measurement_is_refused() -> peppygen::Result<()> {
     let (harness, mocks) = start_ready_vacant(params()).await?;
@@ -1589,13 +1665,13 @@ async fn a_posture_goal_before_the_first_measurement_is_refused() -> peppygen::R
     );
     // No follower reports, so the coordinator waits for the first states.
     let refusal = "no fresh follower state to anchor the move from";
-    assert_posture_refused!(harness, move_to_ready, 1.0, refusal);
-    assert_posture_refused!(harness, move_to_home, 1.0, refusal);
+    assert_posture_refused!(harness, move_to_ready, 1.0, ResourceUnavailable, refusal);
+    assert_posture_refused!(harness, move_to_home, 1.0, ResourceUnavailable, refusal);
     harness.shutdown().await
 }
 
 /// A posture goal whose duration is above the robot's limit is refused at
-/// admission, for both postures.
+/// admission with `rejected`, for both postures.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_posture_goal_above_the_duration_ceiling_is_refused() -> peppygen::Result<()> {
     let (harness, mocks) = start_ready_vacant(params()).await?;
@@ -1611,8 +1687,8 @@ async fn a_posture_goal_above_the_duration_ceiling_is_refused() -> peppygen::Res
     await_streaming(mocks.pairings.right_arm.joint_setpoints).await?;
 
     let ceiling = "duration_s must be a number of seconds from 0 to 60";
-    assert_posture_refused!(harness, move_to_ready, 61.0, ceiling);
-    assert_posture_refused!(harness, move_to_home, 61.0, ceiling);
+    assert_posture_refused!(harness, move_to_ready, 61.0, Rejected, ceiling);
+    assert_posture_refused!(harness, move_to_home, 61.0, Rejected, ceiling);
     harness.shutdown().await
 }
 
@@ -1623,7 +1699,7 @@ async fn a_posture_goal_above_the_duration_ceiling_is_refused() -> peppygen::Res
 ///
 /// The test waits until the robot measures the braked left arm before the
 /// stop. Thus each arm rests where the robot measured it. The goal ends
-/// cancelled, with success false and with the poses that limb_state gives
+/// cancelled for the stop's reason, with the poses that limb_state gives
 /// for those joints.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stopped_posture_reports_where_the_arms_stopped() -> peppygen::Result<()> {
@@ -1643,7 +1719,7 @@ async fn a_stopped_posture_reports_where_the_arms_stopped() -> peppygen::Result<
     next_snapshot(&mut harness).await?;
 
     let goal = send_posture_goal!(harness, move_to_ready, 30.0);
-    assert!(goal.accepted, "goal rejected: {:?}", goal.reason);
+    assert!(goal.accepted, "goal refused: {:?}", goal.refusal);
     let mut moving = left.followed.clone();
     tokio::time::timeout(
         DEADLINE,
@@ -1675,15 +1751,15 @@ async fn a_stopped_posture_reports_where_the_arms_stopped() -> peppygen::Result<
         DEADLINE,
     )
     .await?;
-    assert!(answer.success, "{}", answer.message);
     assert_eq!(answer.stopped, ["left_arm", "right_arm"]);
 
     let data = match goal.get_result(DEADLINE).await?.outcome {
-        move_to_ready::ResultOutcome::Cancelled(data) => data,
+        move_to_ready::ResultOutcome::Cancelled { reason, data } => {
+            assert_eq!(reason, "stopped: the operator asked");
+            data
+        }
         other => panic!("the stopped posture did not end cancelled: {other:?}"),
     };
-    assert!(!data.success);
-    assert_eq!(data.message, "left: stopped: the operator asked");
     assert_eq!(data.arm_names, ["left_arm", "right_arm"]);
     assert_all_close("positions", &data.positions, &snapshot.positions, 1e-9);
     assert_all_close(
@@ -1703,15 +1779,13 @@ async fn a_posture_move_leaves_the_grippers_alone() -> peppygen::Result<()> {
     let (harness, LeftFollowers { gripper, .. }) = start_with_left_followers(0.0).await?;
 
     let data = complete_left_gripper_move(&harness, 0.2, 0.0).await?;
-    assert!(data.success, "{}", data.message);
+    assert!(data.settled, "{data:?}");
     assert_eq!(*gripper.jaws.borrow(), 0.2);
     let after_move = gripper.received_count();
 
-    let ready = complete_posture!(harness, move_to_ready, 1.0);
-    assert!(ready.success, "{}", ready.message);
+    complete_posture!(harness, move_to_ready, 1.0);
     assert_eq!(*gripper.jaws.borrow(), 0.2, "move_to_ready moved the jaws");
-    let home = complete_posture!(harness, move_to_home, 1.0);
-    assert!(home.success, "{}", home.message);
+    complete_posture!(harness, move_to_home, 1.0);
     assert_eq!(*gripper.jaws.borrow(), 0.2, "move_to_home moved the jaws");
     for setpoint in gripper.received_since(after_move) {
         assert_eq!(
@@ -1724,11 +1798,13 @@ async fn a_posture_move_leaves_the_grippers_alone() -> peppygen::Result<()> {
 
 /// The plan check answers whether a Cartesian goal has a plan and moves
 /// nothing: a pose a little above the grasp point has one, with the time the
-/// move would take; a pose two meters away is refused with the words a
-/// `move_arm` refusal gives; an unknown arm is refused; and the arm mock
-/// observes no motion throughout.
+/// move would take; a pose two meters away has none, and a move_arm goal to
+/// it fails with `unreachable` in the same words; an unknown arm gets an
+/// error reply with `rejected`; and the arm mock observes no motion
+/// throughout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_plan_check_answers_without_moving_the_arm() -> peppygen::Result<()> {
+    use peppygen::fixtures::exposed_actions::limb_motion::move_arm;
     use peppygen::fixtures::exposed_services::limb_motion::check_arm_move;
 
     let (mut harness, mocks) = start_ready_vacant(params()).await?;
@@ -1767,26 +1843,57 @@ async fn a_plan_check_answers_without_moving_the_arm() -> peppygen::Result<()> {
 
     let near = check("left_arm", [position[0], position[1], position[2] + 0.02]);
     let answer = check_arm_move::poll(&harness, &near, DEADLINE).await?;
-    assert!(answer.success, "{}", answer.message);
+    assert!(answer.reachable, "{}", answer.reason);
+    assert!(answer.reason.is_empty(), "{}", answer.reason);
     assert!(answer.duration_s > 0.0, "{}", answer.duration_s);
 
-    let far = check("left_arm", [position[0] + 2.0, position[1], position[2]]);
+    let far_position = [position[0] + 2.0, position[1], position[2]];
+    let far = check("left_arm", far_position);
     let answer = check_arm_move::poll(&harness, &far, DEADLINE).await?;
-    assert!(!answer.success);
+    assert!(!answer.reachable);
     assert!(
-        answer.message.starts_with("goal pose not planned within"),
+        answer.reason.starts_with("goal pose not planned within"),
         "{}",
-        answer.message
+        answer.reason
     );
     assert_eq!(answer.duration_s, 0.0);
 
+    let goal = move_arm::send_goal(
+        &harness,
+        &move_arm::GoalRequestData {
+            arm_name: "left_arm".to_string(),
+            position: far_position,
+            orientation,
+            duration_s: 0.0,
+            plan_position_tolerance_m: PLAN_POSITION_TOLERANCE_M,
+            plan_orientation_tolerance_rad: PLAN_ORIENTATION_TOLERANCE_RAD,
+            settle_position_tolerance_m: SETTLE_POSITION_TOLERANCE_M,
+            settle_orientation_tolerance_rad: SETTLE_ORIENTATION_TOLERANCE_RAD,
+            settle_timeout_s: SETTLE_TIMEOUT_S,
+        },
+        peppygen::DEFAULT_FEEDBACK_BOUND,
+        DEADLINE,
+    )
+    .await?;
+    assert!(goal.accepted, "goal refused: {:?}", goal.refusal);
+    match goal.get_result(DEADLINE).await?.outcome {
+        move_arm::ResultOutcome::Failed(failure) => assert_eq!(
+            failure,
+            move_arm::Failure::new(move_arm::FailureKind::Unreachable, answer.reason)
+        ),
+        other => panic!("a move no plan reaches did not fail: {other:?}"),
+    }
+
     let unknown = check("middle_arm", position);
-    let answer = check_arm_move::poll(&harness, &unknown, DEADLINE).await?;
-    assert!(!answer.success);
+    let reply = error_reply(
+        check_arm_move::poll(&harness, &unknown, DEADLINE).await,
+        check_arm_move::Failure::of,
+    );
+    assert_eq!(reply.kind, check_arm_move::FailureKind::Rejected);
     assert!(
-        answer.message.starts_with("unknown arm_name"),
+        reply.message.starts_with("unknown arm_name"),
         "{}",
-        answer.message
+        reply.message
     );
 
     // Nothing moved: the follower still adopts HOME from every setpoint.
@@ -1800,10 +1907,10 @@ async fn a_plan_check_answers_without_moving_the_arm() -> peppygen::Result<()> {
     harness.shutdown().await
 }
 
-/// The camera mounts service answers from bringup: refused until the
-/// coordinator has measured the arms, then every camera of the generation
-/// under the stamp of the snapshot the poses come from, a v1 robot with no
-/// camera at all.
+/// The camera mounts service answers from bringup: an error reply with
+/// `precondition_failed` until the coordinator has measured the arms, then
+/// every camera of the generation under the stamp of the snapshot the poses
+/// come from, a v1 robot with no camera at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn camera_poses_are_answered_once_the_arms_are_measured() -> peppygen::Result<()> {
     use peppygen::fixtures::exposed_services::camera_mounts::get_camera_poses;
@@ -1812,10 +1919,17 @@ async fn camera_poses_are_answered_once_the_arms_are_measured() -> peppygen::Res
     let ready = Arc::new(AtomicBool::new(false));
     pump_is_ready(mocks.deps.robot_init.is_ready, ready.clone());
 
-    let refused = get_camera_poses::poll(&harness, DEADLINE).await?;
-    assert!(!refused.success);
-    assert_eq!(refused.message, "the robot has not measured its joints yet");
-    assert!(refused.camera_names.is_empty());
+    let refused = error_reply(
+        get_camera_poses::poll(&harness, DEADLINE).await,
+        get_camera_poses::Failure::of,
+    );
+    assert_eq!(
+        refused,
+        get_camera_poses::Failure::new(
+            get_camera_poses::FailureKind::PreconditionFailed,
+            "the robot has not measured its joints yet"
+        )
+    );
 
     ready.store(true, Ordering::SeqCst);
     pump_arm_at_home!(
@@ -1826,19 +1940,17 @@ async fn camera_poses_are_answered_once_the_arms_are_measured() -> peppygen::Res
     await_streaming(mocks.pairings.right_arm.joint_setpoints).await?;
     let deadline = tokio::time::Instant::now() + DEADLINE;
     let answer = loop {
-        let answer = get_camera_poses::poll(&harness, DEADLINE).await?;
-        if answer.success {
-            break answer;
-        }
+        let refused = match get_camera_poses::poll(&harness, DEADLINE).await {
+            Ok(answer) => break answer,
+            Err(e) => get_camera_poses::Failure::of(&e).ok_or(e)?,
+        };
         assert!(
             tokio::time::Instant::now() < deadline,
-            "no measurement reached the service: {}",
-            answer.message
+            "no measurement reached the service: {refused}"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
-    // v1 carries no camera: a success with nothing listed.
-    assert_eq!(answer.message, "0 cameras");
+    // v1 carries no camera: an answer with nothing listed.
     assert!(answer.camera_names.is_empty() && answer.carried_by.is_empty());
     assert!(answer.positions.is_empty() && answer.orientations.is_empty());
     harness.shutdown().await
@@ -1864,7 +1976,6 @@ async fn a_v2_robot_lists_its_three_cameras_in_the_robot_frame() -> peppygen::Re
     let snapshot = next_snapshot(&mut harness).await?;
 
     let answer = get_camera_poses::poll(&harness, DEADLINE).await?;
-    assert!(answer.success, "{}", answer.message);
     assert!(answer.timestamp >= snapshot.timestamp);
     assert_eq!(answer.camera_names, ["wrist_left", "wrist_right", "chest"]);
     assert_eq!(answer.carried_by, ["left_arm", "right_arm", ""]);
@@ -1890,14 +2001,23 @@ async fn a_v2_robot_lists_its_three_cameras_in_the_robot_frame() -> peppygen::Re
 }
 
 /// Answers every poll of a request-less mock service with `$answer`, until
-/// the mock's session closes.
+/// the mock's session closes: `Ok` a response, `Err` an error reply with the
+/// failure's kind and message.
 macro_rules! pump_answers {
     ($service:expr, $answer:expr) => {{
         let service = $service;
         let answer = $answer;
         tokio::spawn(async move {
             while let Ok(responder) = service.next_request(PUMP_TIMEOUT).await {
-                if responder.respond(answer.clone()).await.is_err() {
+                let answered = match answer.clone() {
+                    Ok(response) => responder.respond(response).await,
+                    Err(failure) => {
+                        responder
+                            .respond_failure(failure.kind, failure.message)
+                            .await
+                    }
+                };
+                if answered.is_err() {
                     break;
                 }
             }
@@ -1906,8 +2026,9 @@ macro_rules! pump_answers {
 }
 
 /// Plays the mock bound to `perception_geometry` as the chest camera's
-/// camera_geometry, answering `$colour` and `$depth`, and holds the robot not
-/// ready. The other mocks stay with the test.
+/// camera_geometry, answering `$colour` and `$depth` (each a response or an
+/// error reply), and holds the robot not ready. The other mocks stay with
+/// the test.
 macro_rules! answer_as_the_chest_camera {
     ($mocks:ident, $colour:expr, $depth:expr) => {
         let geometry = $mocks
@@ -1946,8 +2067,6 @@ async fn start_v2_with_camera_geometry()
 fn chest_colour_intrinsics() -> get_color_intrinsics::ResponseData {
     let focal = 360.0 / 26f64.to_radians().tan();
     get_color_intrinsics::ResponseData {
-        success: true,
-        message: String::new(),
         width: 1280,
         height: 720,
         fx: focal,
@@ -1964,8 +2083,6 @@ fn chest_colour_intrinsics() -> get_color_intrinsics::ResponseData {
 fn chest_depth_intrinsics() -> get_depth_intrinsics::ResponseData {
     let colour = chest_colour_intrinsics();
     get_depth_intrinsics::ResponseData {
-        success: true,
-        message: String::new(),
         width: colour.width,
         height: colour.height,
         fx: colour.fx,
@@ -1981,31 +2098,19 @@ fn chest_depth_intrinsics() -> get_depth_intrinsics::ResponseData {
     }
 }
 
-/// What a camera that gives colour alone answers when asked for its depth
+/// The error reply of a camera that gives colour alone, asked for its depth
 /// intrinsics.
-fn no_depth_intrinsics() -> get_depth_intrinsics::ResponseData {
-    get_depth_intrinsics::ResponseData {
-        success: false,
-        message: "this camera has no depth stream".to_string(),
-        width: 0,
-        height: 0,
-        fx: 0.0,
-        fy: 0.0,
-        cx: 0.0,
-        cy: 0.0,
-        distortion_model: String::new(),
-        distortion: Vec::new(),
-        depth_model: String::new(),
-        min_depth_m: 0.0,
-        max_depth_m: 0.0,
-        align_mode: String::new(),
-    }
+fn no_depth_intrinsics() -> get_depth_intrinsics::Failure {
+    get_depth_intrinsics::Failure::new(
+        get_depth_intrinsics::FailureKind::Rejected,
+        "this camera has no depth stream",
+    )
 }
 
 /// With no camera geometry linked, describe_workspace answers from the
 /// design before the robot is ready: v2 still names the chest camera as its
-/// perception camera, reach alone decides, no part is said to be seen, and
-/// the message says why. A height that is not a number is refused.
+/// perception camera, reach alone decides, and no part is said to be seen.
+/// A height that is not a number gets an error reply with `rejected`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn without_camera_geometry_the_workspace_is_described_without_a_view_check()
 -> peppygen::Result<()> {
@@ -2021,25 +2126,25 @@ async fn without_camera_geometry_the_workspace_is_described_without_a_view_check
         surface_height: 0.45,
     };
     let answer = describe_workspace::poll(&harness, &table, DEADLINE).await?;
-    assert!(answer.success, "{}", answer.message);
     assert_eq!(answer.perception_camera, "chest");
-    assert!(answer.workable && answer.area > 0.0, "{}", answer.message);
+    assert!(answer.workable && answer.area > 0.0, "{answer:?}");
     assert!(answer.rectangle.is_some() && answer.reach.is_some());
     assert_eq!(answer.view, None);
-    assert!(
-        answer.message.ends_with(
-            "The view is not checked: no camera geometry is linked for the chest camera."
-        ),
-        "{}",
-        answer.message
-    );
 
     let not_a_number = describe_workspace::RequestData {
         surface_height: f64::NAN,
     };
-    let refused = describe_workspace::poll(&harness, &not_a_number, DEADLINE).await?;
-    assert!(!refused.success);
-    assert_eq!(refused.message, "surface_height must be a finite number");
+    let refused = error_reply(
+        describe_workspace::poll(&harness, &not_a_number, DEADLINE).await,
+        describe_workspace::Failure::of,
+    );
+    assert_eq!(
+        refused,
+        describe_workspace::Failure::new(
+            describe_workspace::FailureKind::Rejected,
+            "surface_height must be a finite number"
+        )
+    );
     harness.shutdown().await
 }
 
@@ -2047,20 +2152,23 @@ async fn without_camera_geometry_the_workspace_is_described_without_a_view_check
 /// point by reach and by what the camera sees through its own intrinsics: a
 /// point 0.30 m ahead at table height is workable, one a meter ahead is out
 /// of reach by how far the closest arm stops. A list that does not split
-/// into points is refused.
+/// into points gets an error reply with `rejected`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn with_camera_geometry_linked_check_positions_reports_what_the_chest_camera_sees()
 -> peppygen::Result<()> {
     use peppygen::fixtures::exposed_services::workspace::check_positions;
 
     let (harness, mocks) = start_v2_with_camera_geometry().await?;
-    answer_as_the_chest_camera!(mocks, chest_colour_intrinsics(), chest_depth_intrinsics());
+    answer_as_the_chest_camera!(
+        mocks,
+        Ok::<_, get_color_intrinsics::Failure>(chest_colour_intrinsics()),
+        Ok::<_, get_depth_intrinsics::Failure>(chest_depth_intrinsics())
+    );
 
     let points = check_positions::RequestData {
         positions: vec![0.30, 0.0, 0.45, 1.0, 0.0, 0.45],
     };
     let answer = check_positions::poll(&harness, &points, DEADLINE).await?;
-    assert!(answer.success, "{}", answer.message);
     assert_eq!(answer.perception_camera, "chest");
     let [near, far] = answer.results.as_slice() else {
         panic!("one result per point: {:?}", answer.results);
@@ -2087,47 +2195,61 @@ async fn with_camera_geometry_linked_check_positions_reports_what_the_chest_came
         far.short_by
     );
     assert!(!answer.all_workable);
-    assert_eq!(answer.message, "1 of the 2 points is workable.");
 
     let ragged = check_positions::RequestData {
         positions: vec![0.30, 0.0],
     };
-    let refused = check_positions::poll(&harness, &ragged, DEADLINE).await?;
-    assert!(!refused.success && refused.results.is_empty());
+    let refused = error_reply(
+        check_positions::poll(&harness, &ragged, DEADLINE).await,
+        check_positions::Failure::of,
+    );
     assert_eq!(
-        refused.message,
-        "positions must hold 3 values (x, y, z) per point"
+        refused,
+        check_positions::Failure::new(
+            check_positions::FailureKind::Rejected,
+            "positions must hold 3 values (x, y, z) per point"
+        )
     );
     harness.shutdown().await
 }
 
 /// A linked camera that gives no depth cannot be the chest camera, the
-/// perception camera: the answer is refused, naming it and saying why.
+/// perception camera: the answer is an error reply with
+/// `precondition_failed`, naming it and saying why.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_linked_camera_without_depth_is_refused_naming_the_chest_camera() -> peppygen::Result<()>
 {
     use peppygen::fixtures::exposed_services::workspace::check_positions;
 
     let (harness, mocks) = start_v2_with_camera_geometry().await?;
-    answer_as_the_chest_camera!(mocks, chest_colour_intrinsics(), no_depth_intrinsics());
+    answer_as_the_chest_camera!(
+        mocks,
+        Ok::<_, get_color_intrinsics::Failure>(chest_colour_intrinsics()),
+        Err::<get_depth_intrinsics::ResponseData, _>(no_depth_intrinsics())
+    );
 
     let point = check_positions::RequestData {
         positions: vec![0.30, 0.0, 0.45],
     };
-    let answer = check_positions::poll(&harness, &point, DEADLINE).await?;
-    assert!(!answer.success);
-    assert_eq!(
-        answer.message,
-        "the camera linked as the chest camera, the perception camera, gives no depth: \
-         this camera has no depth stream"
+    let refused = error_reply(
+        check_positions::poll(&harness, &point, DEADLINE).await,
+        check_positions::Failure::of,
     );
-    assert!(answer.results.is_empty() && answer.perception_camera.is_empty());
+    assert_eq!(
+        refused,
+        check_positions::Failure::new(
+            check_positions::FailureKind::PreconditionFailed,
+            "the camera linked as the chest camera, the perception camera, gives no depth: \
+             this camera has no depth stream"
+        )
+    );
     harness.shutdown().await
 }
 
 /// A linked camera whose depth stream gives a depth model camera_geometry:v1
 /// does not name leaves the chest camera's depth range without a meaning:
-/// the answer is refused, naming the model.
+/// the answer is an error reply with `precondition_failed`, naming the
+/// model.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_linked_camera_of_an_unknown_depth_model_is_refused_naming_the_model()
 -> peppygen::Result<()> {
@@ -2136,69 +2258,70 @@ async fn a_linked_camera_of_an_unknown_depth_model_is_refused_naming_the_model()
     let (harness, mocks) = start_v2_with_camera_geometry().await?;
     answer_as_the_chest_camera!(
         mocks,
-        chest_colour_intrinsics(),
-        get_depth_intrinsics::ResponseData {
+        Ok::<_, get_color_intrinsics::Failure>(chest_colour_intrinsics()),
+        Ok::<_, get_depth_intrinsics::Failure>(get_depth_intrinsics::ResponseData {
             depth_model: "disparity".to_string(),
             ..chest_depth_intrinsics()
-        }
+        })
     );
 
     let point = check_positions::RequestData {
         positions: vec![0.30, 0.0, 0.45],
     };
-    let answer = check_positions::poll(&harness, &point, DEADLINE).await?;
-    assert!(!answer.success);
-    assert_eq!(
-        answer.message,
-        "cannot read the depth intrinsics of the chest camera, the perception camera: \
-         unknown depth model 'disparity': camera_geometry:v1 names \"z\" and \"range\""
+    let refused = error_reply(
+        check_positions::poll(&harness, &point, DEADLINE).await,
+        check_positions::Failure::of,
     );
-    assert!(answer.results.is_empty() && answer.perception_camera.is_empty());
+    assert_eq!(
+        refused,
+        check_positions::Failure::new(
+            check_positions::FailureKind::PreconditionFailed,
+            "cannot read the depth intrinsics of the chest camera, the perception camera: \
+             unknown depth model 'disparity': camera_geometry:v1 names \"z\" and \"range\""
+        )
+    );
     harness.shutdown().await
 }
 
-/// What a simulated camera answers for its colour intrinsics before it
-/// hears from the simulation.
-fn unready_colour_intrinsics() -> get_color_intrinsics::ResponseData {
-    get_color_intrinsics::ResponseData {
-        success: false,
-        message: "no camera geometry has been received from the simulation".to_string(),
-        width: 0,
-        height: 0,
-        fx: 0.0,
-        fy: 0.0,
-        cx: 0.0,
-        cy: 0.0,
-        distortion_model: String::new(),
-        distortion: Vec::new(),
-    }
+/// The error reply of a simulated camera asked for its colour intrinsics
+/// before it hears from the simulation.
+fn unready_colour_intrinsics() -> get_color_intrinsics::Failure {
+    get_color_intrinsics::Failure::new(
+        get_color_intrinsics::FailureKind::PreconditionFailed,
+        "no camera geometry has been received from the simulation",
+    )
 }
 
 /// A linked camera that cannot give its colour intrinsics now leaves the
-/// chest camera's view unknown: the answer is refused with the camera's
-/// reason, and says nothing of what the robot reaches.
+/// chest camera's view unknown: the answer is an error reply with
+/// `precondition_failed` and the camera's reason, and says nothing of what
+/// the robot reaches.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_linked_camera_without_its_colour_intrinsics_is_refused_with_its_reason()
 -> peppygen::Result<()> {
     use peppygen::fixtures::exposed_services::workspace::describe_workspace;
 
     let (harness, mocks) = start_v2_with_camera_geometry().await?;
-    answer_as_the_chest_camera!(mocks, unready_colour_intrinsics(), no_depth_intrinsics());
+    answer_as_the_chest_camera!(
+        mocks,
+        Err::<get_color_intrinsics::ResponseData, _>(unready_colour_intrinsics()),
+        Err::<get_depth_intrinsics::ResponseData, _>(no_depth_intrinsics())
+    );
 
     let table = describe_workspace::RequestData {
         surface_height: 0.45,
     };
-    let answer = describe_workspace::poll(&harness, &table, DEADLINE).await?;
-    assert!(!answer.success);
-    assert_eq!(
-        answer.message,
-        "cannot read the colour intrinsics of the chest camera, the perception camera: \
-         no camera geometry has been received from the simulation"
+    let refused = error_reply(
+        describe_workspace::poll(&harness, &table, DEADLINE).await,
+        describe_workspace::Failure::of,
     );
-    assert!(!answer.workable && answer.area == 0.0);
     assert_eq!(
-        (answer.rectangle, answer.reach, answer.view),
-        (None, None, None)
+        refused,
+        describe_workspace::Failure::new(
+            describe_workspace::FailureKind::PreconditionFailed,
+            "cannot read the colour intrinsics of the chest camera, the perception camera: \
+             no camera geometry has been received from the simulation"
+        )
     );
     harness.shutdown().await
 }

@@ -104,8 +104,6 @@ async fn panel_commands_drive_backbone_and_recorder() -> peppygen::Result<()> {
     // The backbone judged the settle; the panel reports its verdict as it stands.
     active
         .complete(&move_arm_joints::ResultResponseData {
-            success: true,
-            message: "trajectory complete".to_string(),
             final_joint_positions: goal_joints,
             action_time: 0.42,
         })
@@ -155,8 +153,7 @@ async fn panel_commands_drive_backbone_and_recorder() -> peppygen::Result<()> {
     .await;
     active
         .complete(&move_gripper::ResultResponseData {
-            success: true,
-            message: "move complete".to_string(),
+            settled: true,
             final_opening: GRIPPER_OPENING,
             action_time: 0.3,
         })
@@ -194,20 +191,26 @@ async fn panel_commands_drive_backbone_and_recorder() -> peppygen::Result<()> {
     .await;
 
     // Stop = cancel-with-save: the node must request cancellation of the
-    // in-flight goal, and the cancelled result reports the saved episode.
+    // in-flight goal, and the cancelled result, for the reason of that
+    // cancel, reports the saved episode.
     ws.send_text(r#"{"cmd":"stop_recording"}"#)
         .await
         .expect("send stop_recording");
     tokio::time::timeout(Duration::from_secs(10), active.cancel_signal())
         .await
         .expect("Stop must cancel the record goal");
+    let cause = active
+        .cancel_cause()
+        .expect("a cancelled goal has its cause");
     active
-        .complete_cancelled(&record_episode::ResultResponseData {
-            episode_index: 3,
-            frames_recorded: 7,
-            discarded: false,
-            error: None,
-        })
+        .complete_cancelled(
+            cause.reason(),
+            &record_episode::ResultResponseData {
+                episode_index: 3,
+                frames_recorded: 7,
+                video_frames_missing: 0,
+            },
+        )
         .await?;
     ws.snapshot_until(Duration::from_secs(15), "episode saved", |s| {
         s["recorder"]["recording"] == false
@@ -228,7 +231,6 @@ async fn panel_commands_drive_backbone_and_recorder() -> peppygen::Result<()> {
     responder
         .respond(finish_session::ResponseData {
             session: "session_007".to_string(),
-            error: None,
         })
         .await?;
     ws.snapshot_until(Duration::from_secs(15), "session finished", |s| {

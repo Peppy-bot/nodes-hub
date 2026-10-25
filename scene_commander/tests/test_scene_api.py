@@ -43,6 +43,8 @@ _SCENE = {"asset_id": "scene/full_warehouse", "display_name": "Full Warehouse", 
 _FACTORY = "scene/factory_conveyor"
 _LOAD = {"asset_id": _FACTORY, "scale": 1.0}
 _LOAD_SUMMARY = f"load_scene(asset_id={_FACTORY}, scale=1.0)"
+# What the commander answers for a load that succeeded.
+_LOAD_DONE = f"{_LOAD_SUMMARY} done"
 _ROBOTS = [
     {"robot": "alpha", "model": "openarm_v2", "position": [0.0, 0.0, 0.0], "yaw": 0.0, "attached": True},
     {"robot": "bravo", "model": "openarm_v1", "position": [0.0, -1.5, 0.0], "yaw": 1.25, "attached": True},
@@ -94,6 +96,62 @@ class Status(enum.IntEnum):
     CANCELLED = 1
     ABANDONED = 2
     EXPIRED = 3
+    FAILED = 4
+
+
+class FailureKind(str, enum.Enum):
+    """The failure kinds of a member whose contract declares none of its
+    own, as the generated FailureKind names them."""
+
+    ATTEMPT_FAILED = "attempt_failed"
+    TIMEOUT = "timeout"
+    PRECONDITION_FAILED = "precondition_failed"
+    RESOURCE_UNAVAILABLE = "resource_unavailable"
+    REJECTED = "rejected"
+
+
+class FailureError(RuntimeError):
+    """peppylib.FailureError: an error reply, a refusal or a failed goal,
+    with args (kind, message)."""
+
+
+class FeedbackOverflowError(RuntimeError):
+    """peppylib.FeedbackOverflowError: the handle fell behind its feedback
+    bound and cancelled the goal."""
+
+
+class Failure(FailureError):
+    """The typed Failure of a generated member: its kind and its message,
+    read as `kind: message`."""
+
+    def __init__(self, kind, message):
+        self.kind = FailureKind(kind)
+        self.message = message
+        super().__init__(self.kind.value, message)
+
+    def __str__(self):
+        return f"{self.kind.value}: {self.message}"
+
+
+def _ended(status, data, failure=None, cancel_reason=None):
+    """The result of a goal that ended, as the generated binding reads it:
+    `data` only for an action that declares a result."""
+    result = SimpleNamespace(status=status, failure=failure, cancel_reason=cancel_reason)
+    if data:
+        result.data = SimpleNamespace(**data)
+    return result
+
+
+def _completed(**data):
+    return _ended(Status.COMPLETED, data)
+
+
+def _cancelled(reason, **data):
+    return _ended(Status.CANCELLED, data, cancel_reason=reason)
+
+
+def _failed(kind, message):
+    return _ended(Status.FAILED, {}, failure=Failure(kind, message))
 
 
 class CancelState(enum.IntEnum):
@@ -174,10 +232,10 @@ class FakeGoal:
     CancelState or an exception it raises, and SIGNALLED when none is queued.
     """
 
-    def __init__(self, name, clock, accepted, reason):
+    def __init__(self, name, clock, refusal):
         self.name = name
-        self.accepted = accepted
-        self.reason = reason
+        self.accepted = refusal is None
+        self.refusal = refusal
         # The timeout of every cancel and every result wait the commander asked for.
         self.cancels = []
         self.result_waits = []
@@ -202,22 +260,27 @@ class FakeGoal:
         """Send one feedback message, whatever its shape."""
         self._push(message)
 
-    def end(self, status, data):
+    def end(self, result):
         """End the goal: its result stands, then its feedback stream ends."""
-        self.end_without_stream_end(status, data)
+        self.end_without_stream_end(result)
         self.end_without_result()
 
-    def end_without_stream_end(self, status, data):
+    def end_without_stream_end(self, result):
         """End the goal and lose the message that ends its feedback stream."""
-        self._result = SimpleNamespace(status=status, data=data)
+        self._result = result
         self._clock.stamp()
 
     def end_without_result(self):
         """End the feedback stream of a goal whose result never comes."""
         self._push(RuntimeError(f"action '{self.name}' feedback stream closed"))
 
-    def complete(self, message, **fields):
-        self.end(Status.COMPLETED, SimpleNamespace(success=True, message=message, **fields))
+    def complete(self, **data):
+        self.end(_completed(**data))
+
+    def overflow(self):
+        """The commander falls behind its feedback bound: the handle cancels
+        the goal and the next read raises."""
+        self._push(FeedbackOverflowError(f"action '{self.name}' feedback fell behind its bound of 1024"))
 
     def vanish(self):
         """The simulator's process is gone: the stream breaks without an end."""
@@ -276,7 +339,7 @@ class FakeGoal:
         if self._result is not None:
             return self._result
         if self._gone:
-            return SimpleNamespace(status=Status.ABANDONED, data=None)
+            return _ended(Status.ABANDONED, {})
         raise TimeoutError(f"action '{self.name}' (alpha_waldo) has timed out waiting for result")
 
     async def cancel_goal(self, timeout):
@@ -299,6 +362,9 @@ class FakeProducer:
 class FakeService(ModuleType):
     """A consumed service: poll() answers the next queued response, the last one forever.
 
+    A queued exception is raised, as a Failure is for an error reply; a
+    queued None is the answer of a service that declares no response.
+
     Its producers are its link's, shared by every service of that link; every
     request polled is kept with the producer it went to.
     """
@@ -309,6 +375,8 @@ class FakeService(ModuleType):
         self.answers = []
         self.requests = []
         self.Request = lambda **fields: SimpleNamespace(**fields)
+        self.Failure = Failure
+        self.FailureKind = FailureKind
 
     def bound_producer(self, node_runner):
         return self.link.producers[0] if self.link.producers else None
@@ -322,6 +390,9 @@ class FakeService(ModuleType):
         answer = self.answers.pop(0) if len(self.answers) > 1 else self.answers[0]
         if isinstance(answer, Exception):
             raise answer
+        # A service that declares no response answers nothing.
+        if answer is None:
+            return None
         return SimpleNamespace(data=answer)
 
 
@@ -352,29 +423,26 @@ class FakeAction(ModuleType):
         self.goals = []
         self.admissions = []
         self.handles = []
-        self.accepted = True
-        self.reason = ""
+        # The failure the simulator refuses every goal with; None admits them.
+        self.refusal = None
         self.ends_at_once = True
         self.admission = None
-        self.result = SimpleNamespace(
-            status=Status.COMPLETED,
-            data=SimpleNamespace(success=True, message=f"{name} done", object_id="obj_1"),
-        )
+        # spawn_object is the one action that declares a result.
+        self.result = _completed(object_id="obj_1") if name == "spawn_object" else _completed()
         self._clock = clock
         action = self
 
         class ActionHandle:
             @staticmethod
-            async def fire_goal(node_runner, producer, *goal, timeout, feedback_qos):
-                assert feedback_qos == "standard"
+            async def fire_goal(node_runner, producer, *goal, timeout):
                 action.goals.append(goal[0] if goal else None)
                 action.admissions.append(timeout)
                 clock.stamp()
                 if action.admission is not None:
                     await action.admission.wait()
-                handle = FakeGoal(name, clock, action.accepted, action.reason)
+                handle = FakeGoal(name, clock, action.refusal)
                 if action.ends_at_once:
-                    handle.end(action.result.status, action.result.data)
+                    handle.end(action.result)
                 action.handles.append(handle)
                 clock.stamp()
                 return handle
@@ -394,11 +462,7 @@ class FakeAction(ModuleType):
 def commander(monkeypatch):
     services = _link("simulation", ["get_assets_list", "get_robots_list"], producers=["producer"])
     services.get_assets_list.answers = [_catalogue(_SCENE)]
-    services.get_robots_list.answers = [SimpleNamespace(
-        success=True,
-        message="2 robots standing",
-        robots=[SimpleNamespace(**robot) for robot in _ROBOTS],
-    )]
+    services.get_robots_list.answers = [SimpleNamespace(robots=[SimpleNamespace(**robot) for robot in _ROBOTS])]
     objects = _link("objects", ["get_object_states"], producers=["producer"])
     objects.get_object_states.answers = [_snapshot()]
     # The optional links start vacant; a test binds what its launch has.
@@ -420,7 +484,8 @@ def commander(monkeypatch):
     peppygen.NodeBuilder = Mock()
     peppygen.NodeRunner = object
     peppylib = ModuleType("peppylib")
-    peppylib.QoSProfile = SimpleNamespace(Standard="standard")
+    peppylib.FailureError = FailureError
+    peppylib.FeedbackOverflowError = FeedbackOverflowError
     for name, module in {
         "peppylib": peppylib,
         "peppygen": peppygen,
@@ -516,11 +581,11 @@ def _parameters(http_port, http_host="0.0.0.0"):
 
 
 def _busy():
-    return SimpleNamespace(success=False, message=_BUSY, assets_json="[]")
+    return Failure(FailureKind.PRECONDITION_FAILED, _BUSY)
 
 
 def _catalogue(*assets):
-    return SimpleNamespace(success=True, message=f"{len(assets)} assets available", assets_json=json.dumps(list(assets)))
+    return SimpleNamespace(assets_json=json.dumps(list(assets)))
 
 
 def _record(object_id, asset_id, physics, mass, scale, position, orientation, linear_velocity, angular_velocity):
@@ -532,45 +597,49 @@ def _record(object_id, asset_id, physics, mass, scale, position, orientation, li
 
 
 def _snapshot(*records):
-    return SimpleNamespace(
-        success=True, message=f"{len(records)} objects", timestamp=_CAPTURED, objects=list(records),
-    )
+    return SimpleNamespace(timestamp=_CAPTURED, objects=list(records))
 
 
-def _no_object_state():
-    # An unavailable answer carries no snapshot: zero time, no objects.
-    return SimpleNamespace(success=False, message=_NOT_READY, timestamp=0.0, objects=[])
+def _no_object_state(kind=FailureKind.PRECONDITION_FAILED, message=_NOT_READY):
+    # An unavailable answer is an error reply: it carries no snapshot.
+    return Failure(kind, message)
+
+
+# Every service that declares no response: it answers nothing.
+_RESETS = ("reset_lighting", "reset_materials", "reset_camera")
 
 
 def _done(name):
-    """A setter's answer when a test does not queue its own: success, no effective values."""
-    return SimpleNamespace(success=True, message=f"{name} done")
+    """A service's answer when a test does not queue its own: nothing for a
+    reset, a response with no effective values for any other."""
+    return None if name in _RESETS else SimpleNamespace()
 
 
-def _set(message, **current):
-    return SimpleNamespace(success=True, message=message, **current)
+def _set(**current):
+    """A setter's response: the effective values after the call."""
+    return SimpleNamespace(**current)
 
 
-def _refused(message, **current):
-    return SimpleNamespace(success=False, message=message, **current)
+def _refused(message):
+    """A setter's error reply: a value the provider does not take."""
+    return Failure(FailureKind.REJECTED, message)
 
 
 def _lighting(*lights):
-    return SimpleNamespace(success=True, message=f"{len(lights)} lights", lighting_json=json.dumps(_lighting_json(*lights)))
+    return SimpleNamespace(lighting_json=json.dumps(_lighting_json(*lights)))
 
 
 def _lighting_json(*lights):
     return {"scene": _SCENE["asset_id"], "ambient_lux": 120.0, "fill_lux": 40.0, "lights": list(lights)}
 
 
-def _no_lighting():
-    return SimpleNamespace(success=False, message=_NO_SCENE, lighting_json="")
+def _no_scene():
+    """The error reply of a read of lighting or materials before a scene is loaded."""
+    return Failure(FailureKind.PRECONDITION_FAILED, _NO_SCENE)
 
 
 def _materials(*materials):
-    return SimpleNamespace(
-        success=True, message=f"{len(materials)} materials", materials_json=json.dumps({"materials": list(materials)}),
-    )
+    return SimpleNamespace(materials_json=json.dumps({"materials": list(materials)}))
 
 
 def _listed(robot, camera, kind, width, height, frames_per_second):
@@ -582,15 +651,15 @@ def _listed(robot, camera, kind, width, height, frames_per_second):
 
 
 def _cameras(*listed):
-    return SimpleNamespace(success=True, message=f"{len(listed)} cameras rendered", cameras=list(listed))
+    return SimpleNamespace(cameras=list(listed))
 
 
 def _profile():
-    return SimpleNamespace(success=True, message=f"profile of {_PROFILE['label']}", profile_json=json.dumps(_PROFILE))
+    return SimpleNamespace(profile_json=json.dumps(_PROFILE))
 
 
 def _no_profile():
-    return SimpleNamespace(success=False, message=_NOT_ATTACHED, profile_json="")
+    return Failure(FailureKind.PRECONDITION_FAILED, _NOT_ATTACHED)
 
 
 def _requests(commander, *links):
@@ -701,11 +770,11 @@ def test_assets_answer_503_with_the_provider_reason_until_the_catalogue_arrives(
         return [await _get(client, "/api/assets") for _ in range(3)]
 
     first, second, third = _call(commander, scenario)
-    assert first == (503, {"success": False, "message": _BUSY})
+    assert first == (503, {"success": False, "message": f"precondition_failed: {_BUSY}"})
     assert second == first
     assert third == (200, {"success": True, "assets": [_SCENE], "count": 1})
     assert _node_log(commander, caplog) == [
-        (logging.INFO, f"Scene provider has no catalogue: {_BUSY}", None),
+        (logging.INFO, f"Scene provider has no catalogue: precondition_failed: {_BUSY}", None),
         (logging.INFO, "Scene provider catalogue ready: 1 assets", None),
     ]
 
@@ -721,20 +790,43 @@ def test_an_empty_scene_is_a_snapshot_with_no_objects_and_its_capture_time(comma
     ]
 
 
-def test_objects_answer_503_with_the_provider_reason_while_it_has_no_object_state(commander, caplog):
+@pytest.mark.parametrize(("kind", "reason"), [
+    (FailureKind.PRECONDITION_FAILED, _NOT_READY),
+    (FailureKind.REJECTED, "this engine does not inspect its scene"),
+], ids=["not-ready", "not-inspected"])
+def test_objects_answer_503_with_the_provider_reason_while_it_has_no_object_state(commander, caplog, kind, reason):
     caplog.set_level(logging.INFO)
-    commander.objects.get_object_states.answers = [_no_object_state(), _no_object_state(), _snapshot()]
+    no_state = _no_object_state(kind, reason)
+    commander.objects.get_object_states.answers = [no_state, no_state, _snapshot()]
 
     async def scenario(client):
         return [await _get(client, "/api/objects") for _ in range(3)]
 
     first, second, third = _call(commander, scenario)
-    assert first == (503, {"success": False, "message": _NOT_READY})
+    # Each error reply of get_object_states says there is no snapshot, and
+    # the page reads its kind with its reason.
+    assert first == (503, {"success": False, "message": f"{kind.value}: {reason}"})
     assert second == first
     assert third == (200, {"success": True, "objects": [], "count": 0, "timestamp": _CAPTURED})
     assert _node_log(commander, caplog) == [
-        (logging.INFO, f"Scene provider has no object state: {_NOT_READY}", None),
+        (logging.INFO, f"Scene provider has no object state: {kind.value}: {reason}", None),
         (logging.INFO, "Scene provider object state ready: 0 runtime objects", None),
+    ]
+
+
+@pytest.mark.parametrize(("path", "service"), [
+    ("/api/assets", lambda commander: commander.services.get_assets_list),
+    ("/api/robots", lambda commander: commander.services.get_robots_list),
+], ids=["assets", "robots"])
+def test_an_error_reply_that_is_no_wait_is_a_server_error_with_its_kind(commander, caplog, path, service):
+    caplog.set_level(logging.INFO)
+    service(commander).answers = [Failure(FailureKind.ATTEMPT_FAILED, "the scene graph did not answer")]
+
+    assert _call(commander, lambda client: _get(client, path)) == (
+        500, {"success": False, "message": "attempt_failed: the scene graph did not answer"},
+    )
+    assert _node_log(commander, caplog) == [
+        (logging.WARNING, f"GET {path} failed: attempt_failed: the scene graph did not answer", None),
     ]
 
 
@@ -791,39 +883,36 @@ def test_provider_transport_failures_are_server_errors_logged_in_one_line(comman
     ]
 
 
-def test_load_scene_fires_the_goal_and_streams_the_provider_answer(commander, caplog):
+def test_load_scene_fires_the_goal_and_streams_that_it_was_done(commander, caplog):
     caplog.set_level(logging.INFO)
     load = commander.actions.load_scene
-    load.result.data.message = "Loaded scene scene/full_warehouse"
+    done = "load_scene(asset_id=scene/full_warehouse, scale=1.5) done"
 
     status, content_type, lines = _call(commander, lambda client: _stream(
         client, "/api/scene/load", {"asset_id": "scene/full_warehouse", "scale": 1.5},
     ))
 
     assert (status, content_type) == (200, "application/x-ndjson")
-    assert lines == [{"goal": "1"}, {"success": True, "message": "Loaded scene scene/full_warehouse"}]
+    assert lines == [{"goal": "1"}, {"success": True, "message": done}]
     assert load.goals == [SimpleNamespace(asset_id="scene/full_warehouse", scale=1.5)]
     # Admission keeps its whole bound; the result is asked for once the
     # stream has ended, when the simulator answers it at once.
     assert load.admissions == [60.0]
     assert load.handles[0].result_waits == [10.0]
-    assert _node_log(commander, caplog) == [
-        (logging.INFO, "load_scene(asset_id=scene/full_warehouse, scale=1.5): Loaded scene scene/full_warehouse", None),
-    ]
+    assert _node_log(commander, caplog) == [(logging.INFO, done, None)]
 
 
-def test_a_rejected_load_answers_400_with_the_reason_and_opens_no_stream(commander, caplog):
+def test_a_refused_load_answers_400_with_the_kind_and_the_reason_and_opens_no_stream(commander, caplog):
     caplog.set_level(logging.INFO)
     load = commander.actions.load_scene
-    load.accepted = False
-    load.reason = "the simulator is shutting down"
+    load.refusal = Failure(FailureKind.REJECTED, "no scene of the catalogue is scene/factory_conveyor")
+    message = "load_scene was refused: rejected: no scene of the catalogue is scene/factory_conveyor"
 
     assert _call(commander, lambda client: _stream(client, "/api/scene/load", _LOAD)) == (
-        400, "application/json", [{"success": False, "message": "load_scene rejected: the simulator is shutting down"}],
+        400, "application/json", [{"success": False, "message": message}],
     )
-    assert _node_log(commander, caplog) == [
-        (logging.WARNING, "POST /api/scene/load failed: load_scene rejected: the simulator is shutting down", None),
-    ]
+    assert load.handles[0].result_waits == []
+    assert _node_log(commander, caplog) == [(logging.WARNING, f"POST /api/scene/load failed: {message}", None)]
 
 
 @pytest.mark.parametrize(("payload", "message"), [
@@ -847,26 +936,17 @@ def test_a_load_naming_no_scale_loads_the_scene_as_authored(commander):
     assert commander.actions.load_scene.goals == [SimpleNamespace(asset_id=_FACTORY, scale=1.0)]
 
 
-def _abandon(action):
-    action.result.status = Status.ABANDONED
-
-
-def _fail(action):
-    action.result.data = SimpleNamespace(success=False, message="Unknown asset_id: scene/none")
-
-
-def _no_data(action):
-    action.result.data = None
-
-
-@pytest.mark.parametrize(("outcome", "message"), [
-    (_abandon, "load_scene did not complete: ABANDONED"),
-    (_fail, "Unknown asset_id: scene/none"),
-    (_no_data, "load_scene completed without result data"),
-], ids=["abandoned", "failed", "no-data"])
-def test_a_load_that_fails_once_accepted_ends_its_stream_with_the_reason(commander, caplog, outcome, message):
+@pytest.mark.parametrize(("result", "message"), [
+    (_ended(Status.ABANDONED, {}), "load_scene did not complete: ABANDONED"),
+    (_ended(Status.EXPIRED, {}), "load_scene did not complete: EXPIRED"),
+    (
+        _failed(FailureKind.ATTEMPT_FAILED, "the scene did not load: its stage file does not parse"),
+        "load_scene failed: attempt_failed: the scene did not load: its stage file does not parse",
+    ),
+], ids=["abandoned", "expired", "failed"])
+def test_a_load_that_fails_once_accepted_ends_its_stream_with_the_reason(commander, caplog, result, message):
     caplog.set_level(logging.INFO)
-    outcome(commander.actions.load_scene)
+    commander.actions.load_scene.result = result
 
     assert _call(commander, lambda client: _stream(
         client, "/api/scene/load", {"asset_id": "scene/none", "scale": 1.0},
@@ -879,27 +959,24 @@ def test_a_load_that_fails_once_accepted_ends_its_stream_with_the_reason(command
 def test_spawn_object_reports_the_minted_object_id(commander, caplog):
     caplog.set_level(logging.INFO)
     spawn = commander.actions.spawn_object
-    spawn.result.data.object_id = "obj_42"
+    spawn.result = _completed(object_id="obj_42")
+    done = (
+        "spawn_object(asset_id=props/blocks/red_block, position=[0.5, 0.0, 0.8], yaw=0.0, physics=dynamic, "
+        "mass=0.2) done"
+    )
 
     status, _, lines = _call(commander, lambda client: _stream(client, "/api/objects/spawn", {
         "asset_id": "props/blocks/red_block", "position": [0.5, 0, 0.8], "physics": "dynamic", "mass": 0.2,
     }))
 
-    assert (status, lines) == (
-        200, [{"goal": "1"}, {"success": True, "message": "spawn_object done", "object_id": "obj_42"}],
-    )
+    assert (status, lines) == (200, [{"goal": "1"}, {"success": True, "message": done, "object_id": "obj_42"}])
     # A spawn naming no yaw stands as authored; the panel turns an object by
     # its yaw alone and names no orientation.
     assert spawn.goals == [SimpleNamespace(
         asset_id="props/blocks/red_block", position=[0.5, 0.0, 0.8], yaw=0.0, orientation=None, scale=1.0,
         physics="dynamic", mass=0.2, snap_to=None,
     )]
-    assert _node_log(commander, caplog) == [(
-        logging.INFO,
-        "spawn_object(asset_id=props/blocks/red_block, position=[0.5, 0.0, 0.8], yaw=0.0, physics=dynamic, "
-        "mass=0.2): spawn_object done",
-        None,
-    )]
+    assert _node_log(commander, caplog) == [(logging.INFO, done, None)]
 
 
 def test_a_move_names_its_position_alone(commander):
@@ -1015,7 +1092,7 @@ def test_setup_tolerates_a_provider_without_catalogue_but_not_an_unreachable_one
         # The socket is taken before the provider is waited on.
         (logging.INFO, "Scene panel bound at 127.0.0.1:9100", None),
         (logging.INFO, "Capabilities: scene manipulation only", None),
-        (logging.INFO, f"Scene provider has no catalogue: {_BUSY}", None),
+        (logging.INFO, f"Scene provider has no catalogue: precondition_failed: {_BUSY}", None),
         (logging.INFO, "Scene provider object state ready: 0 runtime objects", None),
     ]
 
@@ -1046,11 +1123,11 @@ def test_setup_tolerates_a_provider_without_object_state_and_the_page_asks_again
     [app] = served
     # The served page reads the same unavailable state, which is logged once.
     assert _call(commander, lambda client: _get(client, "/api/objects"), app) == (
-        503, {"success": False, "message": _NOT_READY},
+        503, {"success": False, "message": f"precondition_failed: {_NOT_READY}"},
     )
     assert _node_log(commander, caplog)[3:] == [
         (logging.INFO, "Scene provider catalogue ready: 1 assets", None),
-        (logging.INFO, f"Scene provider has no object state: {_NOT_READY}", None),
+        (logging.INFO, f"Scene provider has no object state: precondition_failed: {_NOT_READY}", None),
     ]
 
 
@@ -1190,8 +1267,14 @@ def _running(action):
     return action
 
 
-def _cancelled(message):
-    return SimpleNamespace(success=False, message=message)
+# The reason a simulator gives a goal that its caller cancelled.
+_BY_ITS_CALLER = "cancelled by its caller"
+
+
+def _cancelled_by_its_caller(name):
+    """How the simulator ends a goal of `name` that its caller cancelled
+    before it built anything: a spawn names no object."""
+    return _cancelled(_BY_ITS_CALLER, **({"object_id": ""} if name == "spawn_object" else {}))
 
 
 _SPAWN = {"asset_id": "props/furniture/desk", "position": [1.0, 0.0, 0.0], "physics": "static"}
@@ -1251,16 +1334,16 @@ def test_a_load_that_keeps_reporting_progress_past_one_window_completes(commande
             goal.report(bytes_fetched, files_ready, building)
             await goal.settled()
         clock.advance(40)
-        goal.complete(f"Loaded scene {_FACTORY}")
+        goal.complete()
         return await answer, goal
 
     (status, _, lines), goal = _call(commander, scenario)
 
     assert clock.now == 160
-    assert (status, lines[-1]) == (200, {"success": True, "message": f"Loaded scene {_FACTORY}"})
+    assert (status, lines[-1]) == (200, {"success": True, "message": _LOAD_DONE})
     assert goal.cancels == []
     assert _node_log(commander, caplog) == [
-        (logging.INFO, f"{_LOAD_SUMMARY}: Loaded scene {_FACTORY}", None),
+        (logging.INFO, _LOAD_DONE, None),
     ]
 
 
@@ -1272,7 +1355,7 @@ def test_the_stream_carries_the_goal_id_then_each_progress_report_then_the_resul
         for bytes_fetched, files_ready, building in ((0, 12, False), (5_000_000, 13, False), (5_000_000, 41, True)):
             goal.report(bytes_fetched, files_ready, building)
             await goal.settled()
-        goal.complete(f"Loaded scene {_FACTORY}")
+        goal.complete()
         return await answer
 
     assert _call(commander, scenario) == (200, "application/x-ndjson", [
@@ -1280,7 +1363,7 @@ def test_the_stream_carries_the_goal_id_then_each_progress_report_then_the_resul
         {"progress": {"bytes_fetched": 0, "files_ready": 12, "building": False}},
         {"progress": {"bytes_fetched": 5_000_000, "files_ready": 13, "building": False}},
         {"progress": {"bytes_fetched": 5_000_000, "files_ready": 41, "building": True}},
-        {"success": True, "message": f"Loaded scene {_FACTORY}"},
+        {"success": True, "message": _LOAD_DONE},
     ])
 
 
@@ -1295,7 +1378,7 @@ def test_a_silent_goal_is_cancelled_after_one_window_and_reported(commander, cap
         await goal.settled()
         await _stall(commander, client, goal)
         cancelled_in_the_window = list(goal.cancels)
-        goal.end(Status.CANCELLED, _cancelled("Cancelled while fetching"))
+        goal.end(_cancelled_by_its_caller(name))
         return await answer, goal, cancelled_in_the_window
 
     (status, _, lines), goal, cancelled_in_the_window = _call(commander, scenario)
@@ -1320,50 +1403,67 @@ def test_a_load_that_completes_after_the_cancel_is_reported_as_success(commander
         await goal.settled()
         # The build outlasts a window; the cancel comes too late to stop it.
         await _stall(commander, client, goal)
-        goal.complete(f"Loaded scene {_FACTORY}")
+        goal.complete()
         return await answer, goal
 
     (status, _, lines), goal = _call(commander, scenario)
 
-    assert (status, lines[-1]) == (200, {"success": True, "message": f"Loaded scene {_FACTORY}"})
+    assert (status, lines[-1]) == (200, {"success": True, "message": _LOAD_DONE})
     assert goal.cancels == [10.0]
     assert _node_log(commander, caplog) == [
         (logging.INFO, f"{_LOAD_SUMMARY}: no progress for 60 s; cancel SIGNALLED", None),
-        (logging.INFO, f"{_LOAD_SUMMARY}: Loaded scene {_FACTORY}", None),
+        (logging.INFO, _LOAD_DONE, None),
     ]
 
 
-@pytest.mark.parametrize(("name", "path", "payload", "summary", "cancel", "why", "end"), [
-    (
-        "load_scene", "/api/scene/load", _LOAD, _LOAD_SUMMARY, _stall, "no progress for 60 s",
-        {"success": True, "message": f"Loaded scene {_FACTORY}"},
-    ),
-    (
-        "spawn_object", "/api/objects/spawn", _SPAWN, _SPAWN_SUMMARY, _cancel_from_the_page, "the page asked",
-        {"success": True, "message": "Spawned props/furniture/desk", "object_id": "obj_7"},
-    ),
-], ids=["load-after-stall", "spawn-after-page-cancel"])
-def test_a_goal_the_simulator_built_despite_its_cancel_is_reported_as_success(
-    commander, caplog, name, path, payload, summary, cancel, why, end,
-):
+@pytest.mark.parametrize(("cancel", "why"), [
+    (_stall, "no progress for 60 s"), (_cancel_from_the_page, "the page asked"),
+], ids=_CANCELLER_IDS)
+def test_a_spawn_the_simulator_built_despite_its_cancel_is_reported_as_success(commander, caplog, cancel, why):
     caplog.set_level(logging.INFO)
-    action = _running(getattr(commander.actions, name))
+    spawn = _running(commander.actions.spawn_object)
 
     async def scenario(client):
-        answer, goal = await _start(client, action, path, payload)
+        answer, goal = await _start(client, spawn, "/api/objects/spawn", _SPAWN)
         await cancel(commander, client, goal)
         # The provider builds what it started, and ends the goal cancelled
-        # with success.
-        goal.end(Status.CANCELLED, SimpleNamespace(**end))
+        # with the object it built: the object stands.
+        goal.end(_cancelled(_BY_ITS_CALLER, object_id="obj_7"))
         return await answer, goal
 
     (status, _, lines), goal = _call(commander, scenario)
 
-    assert (status, lines[-1]) == (200, end)
+    message = f"{_SPAWN_SUMMARY} done; it ended cancelled after it built the object: {_BY_ITS_CALLER}"
+    assert (status, lines[-1]) == (200, {"success": True, "message": message, "object_id": "obj_7"})
     assert goal.cancels == [10.0]
     assert _node_log(commander, caplog) == [
-        (logging.INFO, f"{summary}: {why}; cancel SIGNALLED", None),
-        (logging.INFO, f"{summary}: {end['message']}", None),
+        (logging.INFO, f"{_SPAWN_SUMMARY}: {why}; cancel SIGNALLED", None),
+        (logging.INFO, message, None),
+    ]
+
+
+@pytest.mark.parametrize(("cancel", "why", "message", "by"), [
+    (_stall, "no progress for 60 s", "load_scene made no progress for 60 s; it was cancelled", "commander"),
+    (_cancel_from_the_page, "the page asked", "load_scene was cancelled from the page", "page"),
+], ids=_CANCELLER_IDS)
+def test_a_load_that_ends_cancelled_after_its_cancel_is_reported_as_cancelled(commander, caplog, cancel, why, message, by):
+    """A load declares no result, so a load that ends cancelled did not
+    succeed, whatever it built before its cancel took hold."""
+    caplog.set_level(logging.INFO)
+    load = _running(commander.actions.load_scene)
+
+    async def scenario(client):
+        answer, goal = await _start(client, load, "/api/scene/load", _LOAD)
+        await cancel(commander, client, goal)
+        goal.end(_cancelled(_BY_ITS_CALLER))
+        return await answer
+
+    status, _, lines = _call(commander, scenario)
+
+    assert (status, lines[-1]) == (200, {"success": False, "message": message, "cancelled_by": by})
+    assert _node_log(commander, caplog) == [
+        (logging.INFO, f"{_LOAD_SUMMARY}: {why}; cancel SIGNALLED", None),
+        (logging.WARNING, f"POST /api/scene/load failed: {message}", None),
     ]
 
 
@@ -1449,19 +1549,19 @@ def test_a_cancel_that_finds_the_load_ended_asks_for_its_result_at_once(commande
     async def scenario(client):
         answer, goal = await _start(client, load, "/api/scene/load", _LOAD)
         # The load has ended, and the message that ends its stream is lost.
-        goal.end_without_stream_end(Status.COMPLETED, SimpleNamespace(success=True, message=f"Loaded scene {_FACTORY}"))
+        goal.end_without_stream_end(_completed())
         goal.cancel_replies.append(CancelState.ALREADY_TERMINAL)
         await cancel(commander, client, goal)
         return await answer, goal
 
     (_, _, lines), goal = _call(commander, scenario)
 
-    assert lines[-1] == {"success": True, "message": f"Loaded scene {_FACTORY}"}
+    assert lines[-1] == {"success": True, "message": _LOAD_DONE}
     assert goal.cancels == [10.0]
     assert goal.result_waits == [10.0]
     assert _node_log(commander, caplog) == [
         (logging.INFO, f"{_LOAD_SUMMARY}: {why}; cancel ALREADY_TERMINAL", None),
-        (logging.INFO, f"{_LOAD_SUMMARY}: Loaded scene {_FACTORY}", None),
+        (logging.INFO, _LOAD_DONE, None),
     ]
 
 
@@ -1504,7 +1604,7 @@ def test_a_page_cancel_that_is_not_delivered_answers_502_and_the_next_one_is_sen
         goal.cancel_replies.append(failure)
         lost = await _post(client, "/api/goals/1/cancel", {})
         delivered = await _post(client, "/api/goals/1/cancel", {})
-        goal.end(Status.CANCELLED, _cancelled("Cancelled while fetching"))
+        goal.end(_cancelled(_BY_ITS_CALLER))
         return lost, delivered, await answer, goal
 
     lost, delivered, (_, _, lines), goal = _call(commander, scenario)
@@ -1529,7 +1629,7 @@ def test_a_stall_after_a_page_cancel_that_was_not_delivered_sends_the_cancel_aga
         goal.cancel_replies.append(TimeoutError("service 'cancel' timed out"))
         lost = await _post(client, "/api/goals/1/cancel", {})
         await _stall(commander, client, goal)
-        goal.end(Status.CANCELLED, _cancelled("Cancelled while fetching"))
+        goal.end(_cancelled(_BY_ITS_CALLER))
         return lost, await answer, goal
 
     (lost_status, _), (_, _, lines), goal = _call(commander, scenario)
@@ -1631,7 +1731,7 @@ def test_a_stall_cancel_that_is_not_delivered_is_sent_again_once_new_progress_fa
 
 
 @pytest.mark.parametrize(("reply", "end", "result_waits"), [
-    (CancelState.ALREADY_TERMINAL, {"success": True, "message": f"Loaded scene {_FACTORY}"}, [10.0]),
+    (CancelState.ALREADY_TERMINAL, {"success": True, "message": _LOAD_DONE}, [10.0]),
     (CancelState.UNKNOWN, {"success": False, "message": "load_scene: the simulator does not know the goal"}, []),
 ], ids=["ended", "unknown"])
 def test_a_stall_cancel_sent_again_that_finds_the_load_over_ends_it_with_what_the_simulator_knows(
@@ -1645,7 +1745,7 @@ def test_a_stall_cancel_sent_again_that_finds_the_load_over_ends_it_with_what_th
         goal.cancel_replies.extend([_LOST_STALL_CANCEL, reply])
         await _stall(commander, client, goal)
         # The load ends, and the message that ends its stream is lost.
-        goal.end_without_stream_end(Status.COMPLETED, SimpleNamespace(success=True, message=f"Loaded scene {_FACTORY}"))
+        goal.end_without_stream_end(_completed())
         await _window_passes(commander, client, goal)
         return await answer, goal
 
@@ -1668,12 +1768,12 @@ def test_a_load_whose_stall_cancel_was_not_delivered_is_followed_to_its_real_end
         answer, goal = await _start(client, load, "/api/scene/load", _LOAD)
         goal.cancel_replies.append(ConnectionError("service 'cancel' is unreachable"))
         await _stall(commander, client, goal)
-        goal.complete(f"Loaded scene {_FACTORY}")
+        goal.complete()
         return await answer
 
     (_, _, lines) = _call(commander, scenario)
 
-    assert lines[-1] == {"success": True, "message": f"Loaded scene {_FACTORY}"}
+    assert lines[-1] == {"success": True, "message": _LOAD_DONE}
 
 
 def test_a_simulator_that_is_gone_ends_the_load_at_once_without_asking_for_its_result(commander, caplog):
@@ -1697,6 +1797,35 @@ def test_a_simulator_that_is_gone_ends_the_load_at_once_without_asking_for_its_r
     assert _node_log(commander, caplog) == [
         (logging.WARNING, "POST /api/scene/load failed: load_scene ended: the simulator is gone", None),
     ]
+
+
+def test_a_load_whose_progress_falls_behind_the_feedback_bound_ends_with_the_cancel_of_its_handle(commander, caplog):
+    caplog.set_level(logging.INFO)
+    load = _running(commander.actions.load_scene)
+
+    async def scenario(client):
+        answer, goal = await _start(client, load, "/api/scene/load", _LOAD)
+        goal.report(1_000_000, 2)
+        await goal.settled()
+        goal.overflow()
+        return await answer, goal
+
+    (status, _, lines), goal = _call(commander, scenario)
+
+    message = (
+        "load_scene was cancelled: this commander fell behind its progress messages: "
+        "action 'load_scene' feedback fell behind its bound of 1024"
+    )
+    assert (status, lines) == (200, [
+        {"goal": "1"},
+        {"progress": {"bytes_fetched": 1_000_000, "files_ready": 2, "building": False}},
+        {"success": False, "message": message},
+    ])
+    # The handle sent the cancel itself: the commander sends none, and asks
+    # for no result.
+    assert goal.cancels == []
+    assert goal.result_waits == []
+    assert _node_log(commander, caplog) == [(logging.WARNING, f"POST /api/scene/load failed: {message}", None)]
 
 
 def test_a_load_whose_result_does_not_come_after_its_stream_ended_reports_the_timeout(commander, caplog):
@@ -1736,22 +1865,22 @@ def test_a_progress_message_the_commander_cannot_read_ends_the_stream_and_keeps_
     assert isinstance(exc_info[1], AttributeError)
 
 
-@pytest.mark.parametrize(("data", "message"), [
+@pytest.mark.parametrize(("reason", "message"), [
     (
-        _cancelled("load_scene(scene/factory_conveyor) was replaced by load_scene(scene/full_warehouse)"),
+        "load_scene(scene/factory_conveyor) was replaced by load_scene(scene/full_warehouse)",
         "load_scene was cancelled by the simulator: "
         "load_scene(scene/factory_conveyor) was replaced by load_scene(scene/full_warehouse)",
     ),
-    (None, "load_scene was cancelled by the simulator"),
+    ("", "load_scene was cancelled by the simulator"),
 ], ids=["with-reason", "without-reason"])
-def test_a_load_the_simulator_cancelled_itself_is_reported_as_cancelled_by_it(commander, caplog, data, message):
+def test_a_load_the_simulator_cancelled_itself_is_reported_as_cancelled_by_it(commander, caplog, reason, message):
     caplog.set_level(logging.INFO)
     load = _running(commander.actions.load_scene)
 
     async def scenario(client):
         answer, goal = await _start(client, load, "/api/scene/load", _LOAD)
         # A newer load replaces this one.
-        goal.end(Status.CANCELLED, data)
+        goal.end(_cancelled(reason))
         return await answer, goal
 
     (status, _, lines), goal = _call(commander, scenario)
@@ -1769,7 +1898,7 @@ def test_the_cancel_route_cancels_the_load_its_stream_names_once(commander, capl
         answer, goal = await _start(client, load, "/api/scene/load", _LOAD)
         first = await _post(client, "/api/goals/1/cancel", {})
         again = await _post(client, "/api/goals/1/cancel", {})
-        goal.end(Status.CANCELLED, _cancelled("Cancelled while fetching"))
+        goal.end(_cancelled(_BY_ITS_CALLER))
         streamed = await answer
         after_the_end = await _post(client, "/api/goals/1/cancel", {})
         return first, again, streamed, after_the_end, goal
@@ -1804,7 +1933,7 @@ def test_a_page_that_closes_its_stream_cancels_the_goal(commander, caplog):
         goal.report(2_000_000, 4)
         await goal.settled()
         cancelled_on_the_write = list(goal.cancels)
-        goal.end(Status.CANCELLED, _cancelled("Cancelled while fetching"))
+        goal.end(_cancelled(_BY_ITS_CALLER))
         await _load_handler_returned(commander, returned, answer)
         return goal, cancelled_on_the_write
 
@@ -1835,7 +1964,7 @@ def test_a_page_that_closes_before_its_load_is_admitted_cancels_it_on_the_first_
         goal = await load.fired()
         await goal.settled()
         cancelled_on_the_goal_line = list(goal.cancels)
-        goal.end(Status.CANCELLED, _cancelled("Cancelled while fetching"))
+        goal.end(_cancelled(_BY_ITS_CALLER))
         await _load_handler_returned(commander, returned, answer)
         return goal, cancelled_on_the_goal_line
 
@@ -1862,7 +1991,7 @@ def test_a_page_that_closes_while_its_load_is_silent_leaves_the_cancel_to_the_si
         # The page goes away while nothing is written to it.
         transports[0].close()
         await _stall(commander, client, goal)
-        goal.end(Status.CANCELLED, _cancelled("Cancelled while fetching"))
+        goal.end(_cancelled(_BY_ITS_CALLER))
         await _load_handler_returned(commander, returned, answer)
         return goal
 
@@ -1894,7 +2023,7 @@ def test_a_page_that_aborts_its_stream_then_asks_for_the_cancel_has_its_load_can
         # The next line finds the page gone; the cancel stands.
         goal.report(2_000_000, 4)
         await goal.settled()
-        goal.end(Status.CANCELLED, _cancelled("Cancelled while fetching"))
+        goal.end(_cancelled(_BY_ITS_CALLER))
         await _load_handler_returned(commander, returned, answer)
         return cancelled, goal
 
@@ -1911,8 +2040,8 @@ def test_a_page_that_aborts_its_stream_then_asks_for_the_cancel_has_its_load_can
 
 @pytest.mark.parametrize(("end", "end_log"), [
     (
-        lambda goal: goal.complete(f"Loaded scene {_FACTORY}"),
-        (logging.INFO, f"{_LOAD_SUMMARY}: Loaded scene {_FACTORY}", None),
+        lambda goal: goal.complete(),
+        (logging.INFO, _LOAD_DONE, None),
     ),
     (
         FakeGoal.vanish,
@@ -1955,14 +2084,14 @@ def test_a_spawn_streams_its_progress_and_reports_the_minted_object_id(commander
         await goal.settled()
         goal.report(1_900_000, 3, building=True)
         await goal.settled()
-        goal.complete("Spawned props/furniture/desk", object_id="obj_7")
+        goal.complete(object_id="obj_7")
         return await answer
 
     assert _call(commander, scenario) == (200, "application/x-ndjson", [
         {"goal": "1"},
         {"progress": {"bytes_fetched": 1_200_000, "files_ready": 2, "building": False}},
         {"progress": {"bytes_fetched": 1_900_000, "files_ready": 3, "building": True}},
-        {"success": True, "message": "Spawned props/furniture/desk", "object_id": "obj_7"},
+        {"success": True, "message": f"{_SPAWN_SUMMARY} done", "object_id": "obj_7"},
     ])
     assert spawn.admissions == [60.0]
 
@@ -1980,15 +2109,16 @@ def test_spawns_in_flight_together_are_each_followed_and_cancelled_by_their_own_
         block_goal = await spawn.fired(1)
         await block_goal.settled()
         cancelled = await _post(client, "/api/goals/2/cancel", {})
-        block_goal.end(Status.CANCELLED, _cancelled("Cancelled while fetching"))
-        desk_goal.complete("Spawned props/furniture/desk", object_id="obj_1")
+        block_goal.end(_cancelled(_BY_ITS_CALLER, object_id=""))
+        desk_goal.complete(object_id="obj_1")
         return cancelled, await desk_answer, await block_answer, desk_goal, block_goal
 
     cancelled, desk_answer, block_answer, desk_goal, block_goal = _call(commander, scenario)
 
     assert cancelled == (200, {"success": True, "message": "the simulator answered the cancel of spawn_object: SIGNALLED"})
     assert (desk_goal.cancels, block_goal.cancels) == ([], [10.0])
-    assert desk_answer[2] == [{"goal": "1"}, {"success": True, "message": "Spawned props/furniture/desk", "object_id": "obj_1"}]
+    desk_done = "spawn_object(asset_id=props/furniture/desk, position=[1.0, 0.0, 0.0], yaw=0.0, physics=none, mass=0.1) done"
+    assert desk_answer[2] == [{"goal": "1"}, {"success": True, "message": desk_done, "object_id": "obj_1"}]
     assert block_answer[2] == [
         {"goal": "2"},
         {"success": False, "message": "spawn_object was cancelled from the page", "cancelled_by": "page"},
@@ -2056,16 +2186,16 @@ def test_an_action_whose_bound_cancel_finds_it_ended_answers_its_result(commande
         await _whole_goal_bound_passes(commander, goal)
         # The goal ended as its bound expired; its result is asked for again.
         await commander.clock.until(lambda: len(goal.result_waits) == 2)
-        goal.complete("alpha moved")
+        goal.complete()
         return await answer, goal
 
     answer, goal = _call(commander, scenario)
 
-    assert answer == (200, {"success": True, "message": "alpha moved"})
+    assert answer == (200, {"success": True, "message": f"{_MOVE_ROBOT_SUMMARY} done"})
     assert goal.result_waits == [60.0, 10.0]
     assert _node_log(commander, caplog) == [
         (logging.INFO, f"{_MOVE_ROBOT_SUMMARY}: no result within 60 s; cancel ALREADY_TERMINAL", None),
-        (logging.INFO, f"{_MOVE_ROBOT_SUMMARY}: alpha moved", None),
+        (logging.INFO, f"{_MOVE_ROBOT_SUMMARY} done", None),
     ]
 
 
@@ -2102,6 +2232,42 @@ def test_an_action_whose_bound_cancel_does_not_take_says_why(commander, caplog, 
     assert goal.result_waits == [60.0]
     assert goal.cancels == [10.0]
     assert _node_log(commander, caplog) == [cancel_log, (logging.WARNING, f"POST /api/robot/move failed: {message}", None)]
+
+
+def test_a_refused_action_without_progress_answers_400_with_the_kind_and_the_reason(commander, caplog):
+    caplog.set_level(logging.INFO)
+    clear = commander.actions.clear_scene
+    clear.refusal = Failure(FailureKind.PRECONDITION_FAILED, "a scene load runs")
+    message = "clear_scene was refused: precondition_failed: a scene load runs"
+
+    assert _call(commander, lambda client: _post(client, "/api/scene/clear", {})) == (
+        400, {"success": False, "message": message},
+    )
+    assert clear.handles[0].result_waits == []
+    assert _node_log(commander, caplog) == [(logging.WARNING, f"POST /api/scene/clear failed: {message}", None)]
+
+
+@pytest.mark.parametrize(("end", "answer"), [
+    (
+        _failed(FailureKind.REJECTED, "no robot stands as 'alpha'"),
+        {"success": False, "message": "move_robot failed: rejected: no robot stands as 'alpha'"},
+    ),
+    (
+        _cancelled("stopped: the simulation resets"),
+        {
+            "success": False, "message": "move_robot was cancelled by the simulator: stopped: the simulation resets",
+            "cancelled_by": "simulator",
+        },
+    ),
+], ids=["failed", "cancelled-by-the-simulator"])
+def test_an_action_without_progress_that_does_not_succeed_answers_400_with_why(commander, caplog, end, answer):
+    caplog.set_level(logging.INFO)
+    commander.actions.move_robot.result = end
+
+    assert _call(commander, lambda client: _post(client, "/api/robot/move", _MOVE_ROBOT)) == (400, answer)
+    assert _node_log(commander, caplog) == [
+        (logging.WARNING, f"POST /api/robot/move failed: {answer['message']}", None),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -2165,7 +2331,7 @@ def test_the_page_carries_the_capability_cards_hidden_until_the_capabilities_say
 def test_bound_lighting_reaches_the_page_parsed_and_its_state_is_logged_once(commander, caplog):
     caplog.set_level(logging.INFO)
     commander.bind_lighting()
-    commander.lighting.get_lighting.answers = [_no_lighting(), _no_lighting(), _lighting(_SUN), _lighting(_SUN)]
+    commander.lighting.get_lighting.answers = [_no_scene(), _no_scene(), _lighting(_SUN), _lighting(_SUN)]
 
     async def scenario(client):
         capabilities = await _get(client, "/api/capabilities")
@@ -2173,14 +2339,27 @@ def test_bound_lighting_reaches_the_page_parsed_and_its_state_is_logged_once(com
 
     capabilities, (first, second, third, fourth) = _call(commander, scenario)
     assert capabilities == (200, {"success": True, "lighting": True, "materials": False, "cameras": False})
-    assert first == (503, {"success": False, "message": _NO_SCENE})
+    assert first == (503, {"success": False, "message": f"precondition_failed: {_NO_SCENE}"})
     assert second == first
     assert third == (200, {"success": True, "lighting": _lighting_json(_SUN)})
     assert fourth == third
     assert commander.lighting.get_lighting.requests == [(FakeProducer(*_SIMULATION), None)] * 4
     assert _node_log(commander, caplog) == [
-        (logging.INFO, f"Scene provider has no lighting: {_NO_SCENE}", None),
+        (logging.INFO, f"Scene provider has no lighting: precondition_failed: {_NO_SCENE}", None),
         (logging.INFO, "Scene provider lighting ready: 1 lights", None),
+    ]
+
+
+def test_a_panel_read_whose_error_reply_is_no_wait_is_a_server_error_with_its_kind(commander, caplog):
+    caplog.set_level(logging.INFO)
+    commander.bind_lighting()
+    commander.lighting.get_lighting.answers = [Failure(FailureKind.ATTEMPT_FAILED, "the stage did not answer")]
+
+    assert _call(commander, lambda client: _get(client, "/api/lighting")) == (
+        500, {"success": False, "message": "attempt_failed: the stage did not answer"},
+    )
+    assert _node_log(commander, caplog) == [
+        (logging.WARNING, "GET /api/lighting failed: attempt_failed: the stage did not answer", None),
     ]
 
 
@@ -2188,37 +2367,37 @@ def test_bound_lighting_reaches_the_page_parsed_and_its_state_is_logged_once(com
     (
         "intensity", {"light_id": "sun", "value": 1200},
         SimpleNamespace(light_id="sun", value=1200.0),
-        _set("Sun at 1200 lx", current_value=1200.0),
+        _set(current_value=1200.0),
         "set_light_intensity(light_id=sun, value=1200.0)",
     ),
     (
         "color", {"light_id": "sun", "color": [1, 0.9, 0.8]},
         SimpleNamespace(light_id="sun", color=[1.0, 0.9, 0.8]),
-        _set("Sun coloured", current_color=[1.0, 0.9, 0.8]),
+        _set(current_color=[1.0, 0.9, 0.8]),
         "set_light_color(light_id=sun, color=[1.0, 0.9, 0.8])",
     ),
     (
         "position", {"light_id": "lamp", "position": [1, 2, 3]},
         SimpleNamespace(light_id="lamp", position=[1.0, 2.0, 3.0]),
-        _set("Lamp moved", current_position=[1.0, 2.0, 3.0]),
+        _set(current_position=[1.0, 2.0, 3.0]),
         "set_light_position(light_id=lamp, position=[1.0, 2.0, 3.0])",
     ),
     (
         "direction", {"light_id": "sun", "direction": [0, 0, -1]},
         SimpleNamespace(light_id="sun", direction=[0.0, 0.0, -1.0]),
-        _set("Sun turned", current_direction=[0.0, 0.0, -1.0]),
+        _set(current_direction=[0.0, 0.0, -1.0]),
         "set_light_direction(light_id=sun, direction=[0.0, 0.0, -1.0])",
     ),
     (
         "cone", {"light_id": "lamp", "inner_angle": 0.2, "outer_angle": 0.5},
         SimpleNamespace(light_id="lamp", inner_angle=0.2, outer_angle=0.5),
-        _set("Lamp cone set", current_inner_angle=0.2, current_outer_angle=0.5),
+        _set(current_inner_angle=0.2, current_outer_angle=0.5),
         "set_light_cone(light_id=lamp, inner_angle=0.2, outer_angle=0.5)",
     ),
     (
         "orientation", {"light_id": "sky", "orientation": [0, 0, 0, 1]},
         SimpleNamespace(light_id="sky", orientation=[0.0, 0.0, 0.0, 1.0]),
-        _set("Sky turned", current_orientation=[0.0, 0.0, 0.0, 1.0]),
+        _set(current_orientation=[0.0, 0.0, 0.0, 1.0]),
         "set_light_orientation(light_id=sky, orientation=[0.0, 0.0, 0.0, 1.0])",
     ),
 ], ids=["intensity", "color", "position", "direction", "cone", "orientation"])
@@ -2232,57 +2411,52 @@ def test_a_light_setter_posts_the_request_and_answers_the_effective_value(
 
     status, body = _call(commander, lambda client: _post(client, f"/api/lighting/{route}", payload))
 
-    current = {key: value for key, value in vars(answer).items() if key.startswith("current_")}
-    assert (status, body) == (200, {"success": True, "message": answer.message, **current})
+    current = vars(answer)
+    assert (status, body) == (200, {"success": True, "message": f"{summary} done", **current})
     assert service.requests == [(FakeProducer(*_SIMULATION), sent)]
-    assert _node_log(commander, caplog) == [(logging.INFO, f"{summary}: {answer.message}", None)]
+    assert _node_log(commander, caplog) == [(logging.INFO, f"{summary} done", None)]
 
 
-def test_reset_lighting_calls_the_provider_once_and_answers_its_message(commander, caplog):
+def test_reset_lighting_calls_the_provider_once_and_answers_that_it_was_done(commander, caplog):
     caplog.set_level(logging.INFO)
     commander.bind_lighting()
-    commander.lighting.reset_lighting.answers = [_set("Lighting of scene/full_warehouse restored")]
 
     assert _call(commander, lambda client: _post(client, "/api/lighting/reset", {})) == (
-        200, {"success": True, "message": "Lighting of scene/full_warehouse restored"},
+        200, {"success": True, "message": "reset_lighting() done"},
     )
     assert commander.lighting.reset_lighting.requests == [(FakeProducer(*_SIMULATION), None)]
-    assert _node_log(commander, caplog) == [
-        (logging.INFO, "reset_lighting(): Lighting of scene/full_warehouse restored", None),
-    ]
+    assert _node_log(commander, caplog) == [(logging.INFO, "reset_lighting() done", None)]
 
 
-def test_a_refused_setter_answers_400_with_the_reason_and_what_stands(commander, caplog):
+def test_a_refused_setter_answers_400_with_the_kind_and_the_reason(commander, caplog):
     caplog.set_level(logging.INFO)
     commander.bind_lighting()
     commander.bind_cameras()
-    commander.lighting.set_light_intensity.answers = [
-        _refused("value 500000 is above the max of 200000 lx", current_value=1000.0),
-    ]
-    commander.cameras.set_camera_white_balance.answers = [
-        _refused("temperature 12000 K is outside 2000-8000 K", current_temperature=4500),
-    ]
+    commander.lighting.set_light_intensity.answers = [_refused("value 500000 is above the max of 200000 lx")]
+    commander.cameras.set_camera_white_balance.answers = [_refused("temperature 12000 K is outside 2000-8000 K")]
+    commander.lighting.reset_lighting.answers = [_no_scene()]
 
     async def scenario(client):
         return (
             await _post(client, "/api/lighting/intensity", {"light_id": "sun", "value": 500000}),
             await _post(client, "/api/cameras/alpha/wrist_left/white_balance", {"mode": "manual", "temperature": 12000}),
+            await _post(client, "/api/lighting/reset", {}),
         )
 
-    intensity, white_balance = _call(commander, scenario)
-    assert intensity == (
-        400, {"success": False, "message": "value 500000 is above the max of 200000 lx", "current_value": 1000.0},
-    )
-    assert white_balance == (
-        400, {"success": False, "message": "temperature 12000 K is outside 2000-8000 K", "current_temperature": 4500},
-    )
+    intensity, white_balance, reset = _call(commander, scenario)
+    # An error reply carries no effective values: the answer is the kind and
+    # the reason alone.
+    assert intensity == (400, {"success": False, "message": "rejected: value 500000 is above the max of 200000 lx"})
+    assert white_balance == (400, {"success": False, "message": "rejected: temperature 12000 K is outside 2000-8000 K"})
+    assert reset == (400, {"success": False, "message": f"precondition_failed: {_NO_SCENE}"})
     assert _node_log(commander, caplog) == [
-        (logging.WARNING, "POST /api/lighting/intensity failed: value 500000 is above the max of 200000 lx", None),
+        (logging.WARNING, "POST /api/lighting/intensity failed: rejected: value 500000 is above the max of 200000 lx", None),
         (
             logging.WARNING,
-            "POST /api/cameras/alpha/wrist_left/white_balance failed: temperature 12000 K is outside 2000-8000 K",
+            "POST /api/cameras/alpha/wrist_left/white_balance failed: rejected: temperature 12000 K is outside 2000-8000 K",
             None,
         ),
+        (logging.WARNING, f"POST /api/lighting/reset failed: precondition_failed: {_NO_SCENE}", None),
     ]
 
 
@@ -2345,11 +2519,10 @@ def test_bound_materials_reach_the_page_and_their_setters_address_the_material(c
     caplog.set_level(logging.INFO)
     commander.bind_materials()
     color = commander.materials.set_material_color
-    color.answers = [_set("Brushed steel coloured", current_color=[0.2, 0.2, 0.8])]
+    color.answers = [_set(current_color=[0.2, 0.2, 0.8])]
     finish = commander.materials.set_material_finish
-    finish.answers = [_set("Brushed steel finished", current_metallic=0.5, current_roughness=0.7)]
+    finish.answers = [_set(current_metallic=0.5, current_roughness=0.7)]
     reset = commander.materials.reset_materials
-    reset.answers = [_set("Materials restored")]
 
     async def scenario(client):
         return (
@@ -2363,39 +2536,39 @@ def test_bound_materials_reach_the_page_and_their_setters_address_the_material(c
     capabilities, materials, coloured, finished, restored = _call(commander, scenario)
     assert capabilities == (200, {"success": True, "lighting": False, "materials": True, "cameras": False})
     assert materials == (200, {"success": True, "materials": {"materials": [_STEEL]}})
-    assert coloured == (200, {"success": True, "message": "Brushed steel coloured", "current_color": [0.2, 0.2, 0.8]})
+    coloured_done = "set_material_color(material_id=steel, color=[0.2, 0.2, 0.8]) done"
+    finished_done = "set_material_finish(material_id=steel, metallic=0.5, roughness=0.7) done"
+    assert coloured == (200, {"success": True, "message": coloured_done, "current_color": [0.2, 0.2, 0.8]})
     assert finished == (
-        200, {"success": True, "message": "Brushed steel finished", "current_metallic": 0.5, "current_roughness": 0.7},
+        200, {"success": True, "message": finished_done, "current_metallic": 0.5, "current_roughness": 0.7},
     )
-    assert restored == (200, {"success": True, "message": "Materials restored"})
+    assert restored == (200, {"success": True, "message": "reset_materials() done"})
     producer = FakeProducer(*_SIMULATION)
     assert color.requests == [(producer, SimpleNamespace(material_id="steel", color=[0.2, 0.2, 0.8]))]
     assert finish.requests == [(producer, SimpleNamespace(material_id="steel", metallic=0.5, roughness=0.7))]
     assert reset.requests == [(producer, None)]
     assert _node_log(commander, caplog) == [
         (logging.INFO, "Scene provider materials ready: 1 materials", None),
-        (logging.INFO, "set_material_color(material_id=steel, color=[0.2, 0.2, 0.8]): Brushed steel coloured", None),
-        (logging.INFO, "set_material_finish(material_id=steel, metallic=0.5, roughness=0.7): Brushed steel finished", None),
-        (logging.INFO, "reset_materials(): Materials restored", None),
+        (logging.INFO, coloured_done, None),
+        (logging.INFO, finished_done, None),
+        (logging.INFO, "reset_materials() done", None),
     ]
 
 
 def test_materials_answer_503_with_the_provider_reason_until_a_scene_is_loaded(commander, caplog):
     caplog.set_level(logging.INFO)
     commander.bind_materials()
-    commander.materials.get_materials.answers = [
-        SimpleNamespace(success=False, message=_NO_SCENE, materials_json=""), _materials(_STEEL),
-    ]
+    commander.materials.get_materials.answers = [_no_scene(), _materials(_STEEL)]
 
     async def scenario(client):
         return [await _get(client, "/api/materials") for _ in range(2)]
 
     assert _call(commander, scenario) == [
-        (503, {"success": False, "message": _NO_SCENE}),
+        (503, {"success": False, "message": f"precondition_failed: {_NO_SCENE}"}),
         (200, {"success": True, "materials": {"materials": [_STEEL]}}),
     ]
     assert _node_log(commander, caplog) == [
-        (logging.INFO, f"Scene provider has no materials: {_NO_SCENE}", None),
+        (logging.INFO, f"Scene provider has no materials: precondition_failed: {_NO_SCENE}", None),
         (logging.INFO, "Scene provider materials ready: 1 materials", None),
     ]
 
@@ -2403,17 +2576,11 @@ def test_materials_answer_503_with_the_provider_reason_until_a_scene_is_loaded(c
 def test_the_simulation_lists_every_robots_cameras_and_each_control_names_its_camera(commander, caplog):
     caplog.set_level(logging.INFO)
     simulation = commander.bind_cameras()
-    commander.cameras.set_camera_exposure.answers = [
-        _set("alpha/wrist_left exposure set to 8000", current_value=8000),
-        _set("bravo/chest exposure set to auto", current_value=8300),
-    ]
-    commander.cameras.set_camera_white_balance.answers = [
-        _set("bravo/chest white balance set to 4500", current_temperature=4500),
-    ]
-    commander.cameras.set_camera_gain.answers = [_set("alpha/wrist_left gain set to 12", current_value=12)]
-    commander.cameras.set_camera_brightness.answers = [_set("bravo/chest brightness set to 100", current_value=100)]
-    commander.cameras.set_camera_contrast.answers = [_set("alpha/wrist_left contrast set to 40", current_value=40)]
-    commander.cameras.reset_camera.answers = [_set("alpha/wrist_left restored to its device defaults")]
+    commander.cameras.set_camera_exposure.answers = [_set(current_value=8000), _set(current_value=8300)]
+    commander.cameras.set_camera_white_balance.answers = [_set(current_temperature=4500)]
+    commander.cameras.set_camera_gain.answers = [_set(current_value=12)]
+    commander.cameras.set_camera_brightness.answers = [_set(current_value=100)]
+    commander.cameras.set_camera_contrast.answers = [_set(current_value=40)]
 
     async def scenario(client):
         return (
@@ -2432,26 +2599,33 @@ def test_the_simulation_lists_every_robots_cameras_and_each_control_names_its_ca
     assert capabilities == (200, {"success": True, "lighting": False, "materials": False, "cameras": True})
     # Every robot's cameras, as the simulation lists them, each with the
     # profile the simulation describes for it.
-    assert cameras == (200, {"success": True, "message": "2 cameras rendered", "count": 2, "cameras": [
+    assert cameras == (200, {"success": True, "count": 2, "cameras": [
         {
             "id": "alpha/wrist_left", "robot": "alpha", "camera": "wrist_left", "kind": "rgb",
             "info": {"width": 1280, "height": 720, "frames_per_second": 30, "encoding": "rgb8"},
-            "profile": _PROFILE, "profile_message": "profile of Logitech C920",
+            "profile": _PROFILE, "profile_message": "",
         },
         {
             "id": "bravo/chest", "robot": "bravo", "camera": "chest", "kind": "rgbd",
             "info": {"width": 640, "height": 480, "frames_per_second": 15, "encoding": "rgb8"},
-            "profile": _PROFILE, "profile_message": "profile of Logitech C920",
+            "profile": _PROFILE, "profile_message": "",
         },
     ]})
+    done = [
+        "set_camera_exposure(robot=alpha, camera=wrist_left, mode=manual, value=8000) done",
+        "set_camera_exposure(robot=bravo, camera=chest, mode=auto, value=0) done",
+        "set_camera_white_balance(robot=bravo, camera=chest, mode=manual, temperature=4500) done",
+        "set_camera_gain(robot=alpha, camera=wrist_left, value=12) done",
+        "set_camera_brightness(robot=bravo, camera=chest, value=100) done",
+        "set_camera_contrast(robot=alpha, camera=wrist_left, value=40) done",
+        "reset_camera(robot=alpha, camera=wrist_left) done",
+    ]
+    current = [
+        {"current_value": 8000}, {"current_value": 8300}, {"current_temperature": 4500}, {"current_value": 12},
+        {"current_value": 100}, {"current_value": 40}, {},
+    ]
     assert answers == [
-        (200, {"success": True, "message": "alpha/wrist_left exposure set to 8000", "current_value": 8000}),
-        (200, {"success": True, "message": "bravo/chest exposure set to auto", "current_value": 8300}),
-        (200, {"success": True, "message": "bravo/chest white balance set to 4500", "current_temperature": 4500}),
-        (200, {"success": True, "message": "alpha/wrist_left gain set to 12", "current_value": 12}),
-        (200, {"success": True, "message": "bravo/chest brightness set to 100", "current_value": 100}),
-        (200, {"success": True, "message": "alpha/wrist_left contrast set to 40", "current_value": 40}),
-        (200, {"success": True, "message": "alpha/wrist_left restored to its device defaults"}),
+        (200, {"success": True, "message": message, **values}) for message, values in zip(done, current)
     ]
     # Every call went to the simulation, naming the camera by its robot and
     # slot.
@@ -2476,39 +2650,7 @@ def test_the_simulation_lists_every_robots_cameras_and_each_control_names_its_ca
     assert _node_log(commander, caplog) == [
         (logging.INFO, "Camera alpha/wrist_left profile ready: 1 controls", None),
         (logging.INFO, "Camera bravo/chest profile ready: 1 controls", None),
-        (
-            logging.INFO,
-            "set_camera_exposure(robot=alpha, camera=wrist_left, mode=manual, value=8000): "
-            "alpha/wrist_left exposure set to 8000",
-            None,
-        ),
-        (
-            logging.INFO,
-            "set_camera_exposure(robot=bravo, camera=chest, mode=auto, value=0): bravo/chest exposure set to auto",
-            None,
-        ),
-        (
-            logging.INFO,
-            "set_camera_white_balance(robot=bravo, camera=chest, mode=manual, temperature=4500): "
-            "bravo/chest white balance set to 4500",
-            None,
-        ),
-        (logging.INFO, "set_camera_gain(robot=alpha, camera=wrist_left, value=12): alpha/wrist_left gain set to 12", None),
-        (
-            logging.INFO,
-            "set_camera_brightness(robot=bravo, camera=chest, value=100): bravo/chest brightness set to 100",
-            None,
-        ),
-        (
-            logging.INFO,
-            "set_camera_contrast(robot=alpha, camera=wrist_left, value=40): alpha/wrist_left contrast set to 40",
-            None,
-        ),
-        (
-            logging.INFO,
-            "reset_camera(robot=alpha, camera=wrist_left): alpha/wrist_left restored to its device defaults",
-            None,
-        ),
+        *((logging.INFO, message, None) for message in done),
     ]
 
 
@@ -2516,8 +2658,7 @@ def test_a_camera_the_simulation_does_not_render_is_refused_with_its_reason(comm
     caplog.set_level(logging.INFO)
     commander.bind_cameras()
     commander.cameras.set_camera_gain.answers = [
-        _refused("robot 'charlie' renders no camera 'wrist_left'; get_cameras lists the cameras rendered",
-                 current_value=-1),
+        _refused("robot 'charlie' renders no camera 'wrist_left'; get_cameras lists the cameras rendered"),
     ]
     commander.cameras.get_cameras.answers = [_cameras()]
 
@@ -2529,11 +2670,10 @@ def test_a_camera_the_simulation_does_not_render_is_refused_with_its_reason(comm
 
     cameras, gain = _call(commander, scenario)
     # No robot standing holds a camera pair: the list is empty, not refused.
-    assert cameras == (200, {"success": True, "message": "0 cameras rendered", "cameras": [], "count": 0})
+    assert cameras == (200, {"success": True, "cameras": [], "count": 0})
     assert gain == (400, {
         "success": False,
-        "message": "robot 'charlie' renders no camera 'wrist_left'; get_cameras lists the cameras rendered",
-        "current_value": -1,
+        "message": "rejected: robot 'charlie' renders no camera 'wrist_left'; get_cameras lists the cameras rendered",
     })
 
 
@@ -2551,12 +2691,12 @@ def test_a_profile_the_camera_cannot_give_yet_is_reported_with_its_reason(comman
     assert first[1]["cameras"] == [{
         "id": "alpha/chest", "robot": "alpha", "camera": "chest", "kind": "rgbd",
         "info": {"width": 640, "height": 480, "frames_per_second": 15, "encoding": "rgb8"},
-        "profile": None, "profile_message": _NOT_ATTACHED,
+        "profile": None, "profile_message": f"precondition_failed: {_NOT_ATTACHED}",
     }]
     assert second == first
-    assert third[1]["cameras"][0]["profile"] == _PROFILE
+    assert (third[1]["cameras"][0]["profile"], third[1]["cameras"][0]["profile_message"]) == (_PROFILE, "")
     assert _node_log(commander, caplog) == [
-        (logging.INFO, f"Camera alpha/chest has no profile: {_NOT_ATTACHED}", None),
+        (logging.INFO, f"Camera alpha/chest has no profile: precondition_failed: {_NOT_ATTACHED}", None),
         (logging.INFO, "Camera alpha/chest profile ready: 1 controls", None),
     ]
 

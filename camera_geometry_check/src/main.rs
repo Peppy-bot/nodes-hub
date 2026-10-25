@@ -68,6 +68,33 @@ async fn report_forever(runner: Arc<NodeRunner>, params: Parameters, latest: Lat
     }
 }
 
+/// One camera_geometry answer: the response, or the error reply the camera
+/// gave, as `kind: message`.
+type Answer<T> = std::result::Result<T, String>;
+
+/// The answer of one camera_geometry call to `service`: a response or an
+/// error reply, read by `reply_of`, the `Failure::of` of the service. A call
+/// that got no answer at all is the error, naming the service.
+fn answer_of<T, F: std::fmt::Display>(
+    service: &str,
+    polled: Result<T>,
+    reply_of: impl Fn(&peppygen::Error) -> Option<F>,
+) -> std::result::Result<Answer<T>, String> {
+    match polled {
+        Ok(response) => Ok(Ok(response)),
+        Err(e) => match reply_of(&e) {
+            Some(failure) => Ok(Err(failure.to_string())),
+            None => Err(format!("{service}: {e}")),
+        },
+    }
+}
+
+/// A check of the `checks` line: its verdict, or `not answered` when an
+/// answer it reads is an error reply.
+fn verdict(check: Option<bool>) -> String {
+    check.map_or_else(|| "not answered".to_string(), |holds| holds.to_string())
+}
+
 /// One report: the camera's answers as they came, how they agree with the
 /// streams, and the point the chosen depth pixel shows.
 async fn report(
@@ -91,71 +118,83 @@ async fn report(
     .await
     .map_err(|e| format!("depth_stream_info: {e}"))?
     .data;
-    let color = get_color_intrinsics::poll(
-        runner,
-        get_color_intrinsics::bound_producer(runner),
-        SERVICE_TIMEOUT,
-    )
-    .await
-    .map_err(|e| format!("get_color_intrinsics: {e}"))?
-    .data;
-    let depth = get_depth_intrinsics::poll(
-        runner,
-        get_depth_intrinsics::bound_producer(runner),
-        SERVICE_TIMEOUT,
-    )
-    .await
-    .map_err(|e| format!("get_depth_intrinsics: {e}"))?
-    .data;
-    let extrinsics = get_depth_to_color_extrinsics::poll(
-        runner,
-        get_depth_to_color_extrinsics::bound_producer(runner),
-        SERVICE_TIMEOUT,
-    )
-    .await
-    .map_err(|e| format!("get_depth_to_color_extrinsics: {e}"))?
-    .data;
+    let color = answer_of(
+        "get_color_intrinsics",
+        get_color_intrinsics::poll(
+            runner,
+            get_color_intrinsics::bound_producer(runner),
+            SERVICE_TIMEOUT,
+        )
+        .await
+        .map(|response| response.data),
+        get_color_intrinsics::Failure::of,
+    )?;
+    let depth = answer_of(
+        "get_depth_intrinsics",
+        get_depth_intrinsics::poll(
+            runner,
+            get_depth_intrinsics::bound_producer(runner),
+            SERVICE_TIMEOUT,
+        )
+        .await
+        .map(|response| response.data),
+        get_depth_intrinsics::Failure::of,
+    )?;
+    let extrinsics = answer_of(
+        "get_depth_to_color_extrinsics",
+        get_depth_to_color_extrinsics::poll(
+            runner,
+            get_depth_to_color_extrinsics::bound_producer(runner),
+            SERVICE_TIMEOUT,
+        )
+        .await
+        .map(|response| response.data),
+        get_depth_to_color_extrinsics::Failure::of,
+    )?;
 
     // The answers as they came, to read beside what the device's own tools
     // print (README.md says which).
-    println!(
-        "get_color_intrinsics          success {} ({}) | {}x{} fx {} fy {} cx {} cy {} | {} {:?}",
-        color.success,
-        color.message,
-        color.width,
-        color.height,
-        color.fx,
-        color.fy,
-        color.cx,
-        color.cy,
-        color.distortion_model,
-        color.distortion,
-    );
-    println!(
-        "get_depth_intrinsics          success {} ({}) | {}x{} fx {} fy {} cx {} cy {} | {} {:?} | {} {} m to {} m | {}",
-        depth.success,
-        depth.message,
-        depth.width,
-        depth.height,
-        depth.fx,
-        depth.fy,
-        depth.cx,
-        depth.cy,
-        depth.distortion_model,
-        depth.distortion,
-        depth.depth_model,
-        depth.min_depth_m,
-        depth.max_depth_m,
-        depth.align_mode,
-    );
-    println!(
-        "get_depth_to_color_extrinsics success {} ({}) | {} | t {:?} q {:?}",
-        extrinsics.success,
-        extrinsics.message,
-        extrinsics.align_mode,
-        extrinsics.depth_to_color_position,
-        extrinsics.depth_to_color_orientation,
-    );
+    match &color {
+        Ok(color) => println!(
+            "get_color_intrinsics          {}x{} fx {} fy {} cx {} cy {} | {} {:?}",
+            color.width,
+            color.height,
+            color.fx,
+            color.fy,
+            color.cx,
+            color.cy,
+            color.distortion_model,
+            color.distortion,
+        ),
+        Err(reply) => println!("get_color_intrinsics          error reply: {reply}"),
+    }
+    match &depth {
+        Ok(depth) => println!(
+            "get_depth_intrinsics          {}x{} fx {} fy {} cx {} cy {} | {} {:?} | {} {} m to {} m | {}",
+            depth.width,
+            depth.height,
+            depth.fx,
+            depth.fy,
+            depth.cx,
+            depth.cy,
+            depth.distortion_model,
+            depth.distortion,
+            depth.depth_model,
+            depth.min_depth_m,
+            depth.max_depth_m,
+            depth.align_mode,
+        ),
+        Err(reply) => println!("get_depth_intrinsics          error reply: {reply}"),
+    }
+    match &extrinsics {
+        Ok(extrinsics) => println!(
+            "get_depth_to_color_extrinsics {} | t {:?} q {:?}",
+            extrinsics.align_mode,
+            extrinsics.depth_to_color_position,
+            extrinsics.depth_to_color_orientation,
+        ),
+        Err(reply) => println!("get_depth_to_color_extrinsics error reply: {reply}"),
+    }
     println!(
         "stream infos                  colour {}x{} | depth {}x{} unit {} m",
         color_info.width,
@@ -170,20 +209,28 @@ async fn report(
         .unwrap_or_else(|p| p.into_inner())
         .clone()
         .ok_or("no depth frame received yet")?;
+    let answered_depth = depth.as_ref().ok();
     println!(
         "checks                        colour size = video_stream_info: {} | depth size = depth frame: {} | \
          align_mode = frame header: {} | both depth answers name one mode: {}",
-        (color.width, color.height) == (color_info.width, color_info.height),
-        (depth.width, depth.height) == (frame.width, frame.height),
-        depth.align_mode == frame.header.align_mode,
-        depth.align_mode == extrinsics.align_mode,
+        verdict(
+            color
+                .as_ref()
+                .ok()
+                .map(|color| (color.width, color.height) == (color_info.width, color_info.height))
+        ),
+        verdict(
+            answered_depth.map(|depth| (depth.width, depth.height) == (frame.width, frame.height))
+        ),
+        verdict(answered_depth.map(|depth| depth.align_mode == frame.header.align_mode)),
+        verdict(
+            answered_depth
+                .zip(extrinsics.as_ref().ok())
+                .map(|(depth, extrinsics)| depth.align_mode == extrinsics.align_mode)
+        ),
     );
-    if !depth.success {
-        return Err(format!(
-            "the camera refuses its depth intrinsics: {}",
-            depth.message
-        ));
-    }
+    let depth =
+        depth.map_err(|reply| format!("the camera refuses its depth intrinsics: {reply}"))?;
 
     let pixel = (
         pixel_at(params.pixel_u_fraction, frame.width),
@@ -228,13 +275,18 @@ async fn report(
         in_depth_frame[0], in_depth_frame[1], in_depth_frame[2],
     );
 
-    if !(color.success && extrinsics.success) {
-        println!(
-            "  in the colour frame        : not answered (colour: {} | extrinsics: {})",
-            color.message, extrinsics.message
-        );
-        return Ok(());
-    }
+    let (color, extrinsics) = match (color, extrinsics) {
+        (Ok(color), Ok(extrinsics)) => (color, extrinsics),
+        (color, extrinsics) => {
+            let answered = "answered".to_string();
+            println!(
+                "  in the colour frame        : not answered (colour: {} | extrinsics: {})",
+                color.err().unwrap_or_else(|| answered.clone()),
+                extrinsics.err().unwrap_or(answered),
+            );
+            return Ok(());
+        }
+    };
     let in_color_frame = Pose {
         position: extrinsics.depth_to_color_position,
         orientation: extrinsics.depth_to_color_orientation,

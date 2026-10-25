@@ -8,6 +8,7 @@ from peppygen.consumed_actions.recorder import record_episode
 from peppygen.consumed_services.recorder import finish_session
 
 from tests.helpers import (
+    CANCELLED_BY_CALLER,
     POSE,
     FakeToken,
     boot,
@@ -22,9 +23,9 @@ from xr_commander import config, publish, record
 from xr_commander.bus import FLASH_S
 from xr_commander.devices import HandSample, XrFrame
 
-# The terminal payload of an ordinary stop-and-save.
+# The result of an ordinary stop-and-save.
 SAVED = record_episode.ResultResponseData(
-    episode_index=0, frames_recorded=7, discarded=False, error=None
+    episode_index=0, frames_recorded=7, video_frames_missing=0
 )
 
 
@@ -142,8 +143,8 @@ async def test_x_already_held_at_first_tracking_does_not_start():
 async def test_one_physical_y_hold_finishes_once_across_a_gap():
     async with boot_recording() as h:
         fin = h.mocks.deps.recorder[0].finish_session
-        fin.enqueue_response(finish_session.ResponseData(session="s1", error=None))
-        fin.enqueue_response(finish_session.ResponseData(session="s2", error=None))
+        fin.enqueue_response(finish_session.ResponseData(session="s1"))
+        fin.enqueue_response(finish_session.ResponseData(session="s2"))
         async with recorder_buttons(h, timing=record.Timing(finish_hold_s=0.05)) as (
             session,
             _task,
@@ -181,7 +182,7 @@ async def test_x_again_stops_and_saves_instead_of_firing_twice():
             await asyncio.wait_for(active.cancel_signal(), 10.0)
             with pytest.raises(TimeoutError):
                 await rec.next_goal(0.4)
-            await active.complete_cancelled(SAVED)
+            await active.complete_cancelled(CANCELLED_BY_CALLER, SAVED)
             # The watcher fetched the recorder's verdict once the stream closed.
             await eventually(
                 lambda: status.note() == "saved episode 0", message="the verdict"
@@ -202,20 +203,23 @@ async def test_a_finished_episode_rearms_the_button():
             await pending.accept()
 
 
-async def test_a_rejected_goal_leaves_the_panel_idle_and_rearms():
+PRECONDITION_FAILED = record_episode.FailureKind.PRECONDITION_FAILED
+
+
+async def test_a_refused_goal_leaves_the_panel_idle_and_rearms():
     async with boot_recording() as h:
         rec = h.mocks.deps.recorder[0].record_episode
         status = record.RecorderStatus()
         async with recorder_buttons(h, status) as (session, _task):
             await tap_x(session)
             pending = await rec.next_goal(10.0)
-            await pending.reject("busy; try later")
+            await pending.refuse(PRECONDITION_FAILED, "busy; try later")
             await eventually(
                 lambda: status.note() == "record refused: busy", message="the cause"
             )
             # The refused goal re-arms the button immediately.
             pending = await press_until_goal(session, rec, {"x": False}, {"x": True})
-            await pending.reject("busy")
+            await pending.refuse(PRECONDITION_FAILED, "busy")
             assert not status.recording
 
 
@@ -249,7 +253,7 @@ async def test_feedback_reaches_the_panel_and_clears_at_the_end():
 async def test_y_must_be_held_to_finish():
     async with boot_recording() as h:
         fin = h.mocks.deps.recorder[0].finish_session
-        fin.enqueue_response(finish_session.ResponseData(session="s1", error=None))
+        fin.enqueue_response(finish_session.ResponseData(session="s1"))
         async with recorder_buttons(h, timing=record.Timing(finish_hold_s=0.3)) as (
             session,
             _task,
@@ -285,9 +289,7 @@ async def test_outcomes_reach_the_panel_as_notes():
             )
             session.press(x=False)
             await asyncio.sleep(0.05)
-            rec.finish_session.enqueue_response(
-                finish_session.ResponseData(session="s1", error=None)
-            )
+            rec.finish_session.enqueue_response(finish_session.ResponseData(session="s1"))
             session.press(y=True)
             await eventually(
                 lambda: status.note() == "session finished",
@@ -295,20 +297,29 @@ async def test_outcomes_reach_the_panel_as_notes():
             )
 
 
-async def test_a_refused_finish_notes_the_refusal():
+async def answer_the_finish_with_an_error_reply(fin, kind, message):
+    """Answers the next finish_session call with an error reply of `kind`."""
+    responder = await fin.next_request(10.0)
+    await responder.respond_failure(kind, message)
+
+
+@pytest.mark.parametrize(
+    ("kind", "note"),
+    [
+        (finish_session.FailureKind.PRECONDITION_FAILED, "finish refused"),
+        (finish_session.FailureKind.ATTEMPT_FAILED, "finish failed"),
+    ],
+)
+async def test_a_finish_error_reply_notes_the_refusal_or_the_failure(kind, note):
     async with boot_recording() as h:
         fin = h.mocks.deps.recorder[0].finish_session
-        fin.enqueue_response(
-            finish_session.ResponseData(session="", error="an episode is recording")
-        )
         status = record.RecorderStatus()
         async with recorder_buttons(
             h, status, timing=record.Timing(finish_hold_s=0.05)
         ) as (session, _task):
             session.press(y=True)
-            await eventually(
-                lambda: status.note() == "finish refused", message="the refusal note"
-            )
+            await answer_the_finish_with_an_error_reply(fin, kind, "an episode is recording")
+            await eventually(lambda: status.note() == note, message="the error reply note")
 
 
 def test_notes_expire():
@@ -321,16 +332,13 @@ def test_notes_expire():
 async def test_a_refused_finish_is_survived():
     async with boot_recording() as h:
         fin = h.mocks.deps.recorder[0].finish_session
-        fin.enqueue_response(
-            finish_session.ResponseData(session="", error="an episode is recording")
-        )
         async with recorder_buttons(h, timing=record.Timing(finish_hold_s=0.05)) as (
             session,
             task,
         ):
             session.press(y=True)
-            await eventually(
-                lambda: fin.captured_count() == 1, message="the refused finish"
+            await answer_the_finish_with_an_error_reply(
+                fin, finish_session.FailureKind.PRECONDITION_FAILED, "an episode is recording"
             )
             await asyncio.sleep(0.2)
             # One hold, one attempt, and the loop is still alive.
@@ -362,7 +370,8 @@ async def test_a_stop_racing_a_finished_watcher_does_not_claim_saving():
         status = record.RecorderStatus()
         handle, active = await _fired_episode(h)
         watcher = asyncio.create_task(record._watch_episode(handle, status))
-        await active.complete(SAVED)  # the episode ends on its own
+        # The recorder ends the episode on its own, with a save.
+        await active.complete_cancelled("max episode length reached", SAVED)
         await asyncio.wait_for(watcher, 10.0)
         # A watcher that finished while the stop was in flight already
         # cleared the row; the late stop must not wedge it as saving.
@@ -402,18 +411,53 @@ async def test_a_result_without_data_notes_the_goal_status():
         assert status.note() == "episode abandoned"
 
 
-async def test_a_discarded_episode_notes_the_discard():
+async def test_a_failed_episode_notes_the_discard(capsys):
     async with boot_recording() as h:
         status = record.RecorderStatus()
         handle, active = await _fired_episode(h)
         watcher = asyncio.create_task(record._watch_episode(handle, status))
-        await active.complete(
-            record_episode.ResultResponseData(
-                episode_index=-1, frames_recorded=0, discarded=True, error="boom"
-            )
+        await active.fail(
+            record_episode.FailureKind.ATTEMPT_FAILED, "episode save failed: disk full"
         )
         await asyncio.wait_for(watcher, 10.0)
         assert status.note() == "episode discarded"
+    assert "episode discarded: attempt_failed: episode save failed: disk full" in (
+        capsys.readouterr().out
+    )
+
+
+async def test_an_episode_the_recorder_ends_itself_notes_the_save_and_logs_the_cause(capsys):
+    async with boot_recording() as h:
+        status = record.RecorderStatus()
+        handle, active = await _fired_episode(h)
+        watcher = asyncio.create_task(record._watch_episode(handle, status))
+        await active.complete_cancelled("link backbone_inst/arm stale (0.30s behind)", SAVED)
+        await asyncio.wait_for(watcher, 10.0)
+        assert status.note() == "saved episode 0"
+    assert "episode 0 saved, 7 frames: link backbone_inst/arm stale (0.30s behind)" in (
+        capsys.readouterr().out
+    )
+
+
+async def test_a_saved_episode_whose_videos_miss_frames_says_so(capsys):
+    """The videos of the episode miss frames: the note and the log give the
+    count, and the log says not to train on the episode."""
+    async with boot_recording() as h:
+        status = record.RecorderStatus()
+        handle, active = await _fired_episode(h)
+        watcher = asyncio.create_task(record._watch_episode(handle, status))
+        await active.complete_cancelled(
+            "link backbone_inst/arm stale (0.30s behind)",
+            record_episode.ResultResponseData(
+                episode_index=2, frames_recorded=7, video_frames_missing=3
+            ),
+        )
+        await asyncio.wait_for(watcher, 10.0)
+        assert status.note() == "saved episode 2, 3 video frame(s) missing"
+    assert (
+        "episode 2 saved, 7 frames: link backbone_inst/arm stale (0.30s behind); "
+        "3 video frame(s) missing, do not train on it"
+    ) in capsys.readouterr().out
 
 
 class SpyStatus(record.RecorderStatus):
@@ -440,7 +484,7 @@ async def test_a_grazed_y_never_shows_finishing():
             session.press(y=False)
             await asyncio.sleep(0.4)
         assert True not in grazed.__dict__["seen"]
-        fin.enqueue_response(finish_session.ResponseData(session="s1", error=None))
+        fin.enqueue_response(finish_session.ResponseData(session="s1"))
         held = SpyStatus()
         async with recorder_buttons(h, held, timing=hold) as (session, _task):
             session.press(y=True)
@@ -461,7 +505,7 @@ async def test_x_stop_shows_saving_until_the_result():
         # The stop is delivered; the recorder has not answered yet.
         await record._stop_episode(record._Episode(handle, watcher, None), status)
         assert status.saving  # result pending: the recorder is saving
-        await active.complete_cancelled(SAVED)
+        await active.complete_cancelled(CANCELLED_BY_CALLER, SAVED)
         await asyncio.wait_for(watcher, 10.0)
         assert not status.saving and not status.recording
         assert status.note() == "saved episode 0"

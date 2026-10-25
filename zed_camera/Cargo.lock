@@ -4890,6 +4890,7 @@ dependencies = [
 name = "zed_camera"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "opencv",
  "peppygen",
  "peppylib",

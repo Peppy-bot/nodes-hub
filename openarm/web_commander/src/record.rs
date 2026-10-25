@@ -3,16 +3,16 @@
 // owner, and reports the saved episode when the goal ends. The stop token is
 // the Stop button: cancelling the goal ends the episode with a save. The
 // recorder also ends episodes on its own (stale source, disk floor); that
-// surfaces here as a result with an error message.
+// surfaces here as a cancelled result whose reason names the cause. An
+// episode the recorder cannot save fails, with its failure kind and message.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use peppygen::NodeRunner;
-use peppygen::QoSProfile;
 use peppygen::consumed_actions::recorder::record_episode;
 use peppygen::consumed_actions::recorder::record_episode::ResultOutcome;
 use peppygen::consumed_services::recorder::finish_session;
+use peppygen::{CancelCause, NodeRunner};
 use peppylib::runtime::CancellationToken;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -67,21 +67,22 @@ async fn run(
         target,
         GOAL_TIMEOUT,
         goal,
-        QoSProfile::Standard,
+        peppygen::DEFAULT_FEEDBACK_BOUND,
     )
     .await
     {
-        Ok(handle) if handle.accepted => handle,
-        Ok(handle) => {
-            let reason = handle.reason.unwrap_or_else(|| "no reason given".into());
-            finalize(
-                &feedback,
-                false,
-                format!("recorder refused the episode: {reason}"),
-            )
-            .await;
-            return;
-        }
+        Ok(handle) => match handle.refusal {
+            None => handle,
+            Some(refusal) => {
+                finalize(
+                    &feedback,
+                    false,
+                    format!("recorder refused the episode: {refusal}"),
+                )
+                .await;
+                return;
+            }
+        },
         Err(e) => {
             finalize(&feedback, false, format!("fire_goal failed: {e}")).await;
             return;
@@ -150,12 +151,11 @@ async fn run(
 
     let (success, summary) = match outcome {
         Ok(r) => match r.outcome {
-            ResultOutcome::Completed(data) | ResultOutcome::Cancelled(data) => episode_summary(
-                data.episode_index,
-                data.frames_recorded,
-                data.discarded,
-                data.error,
-            ),
+            ResultOutcome::Cancelled { reason, data } => {
+                episode_summary(&data, recorder_reason(reason))
+            }
+            ResultOutcome::Completed(data) => episode_summary(&data, None),
+            ResultOutcome::Failed(failure) => (false, format!("episode failed: {failure}")),
             ResultOutcome::Abandoned => (false, "recorder abandoned the episode".to_string()),
             ResultOutcome::Expired => (false, "episode result expired".to_string()),
         },
@@ -174,14 +174,14 @@ pub fn spawn_finish(runner: Arc<NodeRunner>, feedback: mpsc::Sender<Feedback>) {
             return;
         };
         let summary = match finish_session::poll(&runner, target, FINISH_TIMEOUT).await {
-            Ok(reply) => match reply.data.error {
-                Some(reason) => format!("session not finished: {reason}"),
-                None => format!(
-                    "session {} finished and ready for replay",
-                    reply.data.session
-                ),
+            Ok(reply) => format!(
+                "session {} finished and ready for replay",
+                reply.data.session
+            ),
+            Err(e) => match finish_session::Failure::of(&e) {
+                Some(failure) => format!("session not finished: {failure}"),
+                None => format!("finish_session failed: {e}"),
             },
-            Err(e) => format!("finish_session failed: {e}"),
         };
         finish_done(&feedback, summary).await;
     });
@@ -192,28 +192,37 @@ async fn finish_done(feedback: &mpsc::Sender<Feedback>, summary: String) {
     let _ = feedback.send(Feedback::SessionFinished { summary }).await;
 }
 
-// The one-line outcome for the status bar, from the recorder's result fields.
+// The reason of a cancelled episode, unless it is the reason of the
+// commander's own cancel: then the operator stopped it, and the recorder gave
+// no cause of its own.
+fn recorder_reason(reason: String) -> Option<String> {
+    (reason != CancelCause::Caller.reason()).then_some(reason)
+}
+
+// The one-line outcome for the status bar, from the recorder's result fields
+// and the reason the recorder gave when it ended the episode itself. The
+// outcome is a success only for an episode the operator stopped whose videos
+// hold every frame: an episode whose videos miss frames should not be trained
+// on.
 fn episode_summary(
-    episode_index: i64,
-    frames: u64,
-    discarded: bool,
-    error: Option<String>,
+    data: &record_episode::ResultResponseData,
+    recorder_reason: Option<String>,
 ) -> (bool, String) {
-    let ending = match &error {
+    let ending = match &recorder_reason {
         Some(reason) => format!(" ({reason})"),
         None => String::new(),
     };
-    if discarded {
-        (
-            false,
-            format!("episode discarded after {frames} frames{ending}"),
-        )
-    } else {
-        (
-            error.is_none(),
-            format!("episode {episode_index} saved, {frames} frames{ending}"),
-        )
-    }
+    let missing = match data.video_frames_missing {
+        0 => String::new(),
+        count => format!("; {count} video frame(s) missing, do not train on it"),
+    };
+    (
+        recorder_reason.is_none() && data.video_frames_missing == 0,
+        format!(
+            "episode {} saved, {} frames{ending}{missing}",
+            data.episode_index, data.frames_recorded
+        ),
+    )
 }
 
 // Report the episode outcome to the owner, which clears the recording state and
@@ -230,26 +239,59 @@ async fn finalize(feedback: &mpsc::Sender<Feedback>, success: bool, summary: imp
 
 #[cfg(test)]
 mod tests {
-    use super::episode_summary;
+    use peppygen::consumed_actions::recorder::record_episode::ResultResponseData;
+
+    use super::{episode_summary, recorder_reason};
+
+    fn saved(
+        episode_index: i64,
+        frames_recorded: u64,
+        video_frames_missing: u64,
+    ) -> ResultResponseData {
+        ResultResponseData {
+            episode_index,
+            frames_recorded,
+            video_frames_missing,
+        }
+    }
+
+    #[test]
+    fn the_commanders_own_cancel_gives_no_recorder_reason() {
+        assert_eq!(recorder_reason("cancelled by its caller".to_string()), None);
+        assert_eq!(
+            recorder_reason("source went stale".to_string()),
+            Some("source went stale".to_string())
+        );
+    }
 
     #[test]
     fn saved_episode_reports_index_and_frames() {
-        let (ok, msg) = episode_summary(4, 120, false, None);
+        let (ok, msg) = episode_summary(&saved(4, 120, 0), None);
         assert!(ok);
         assert_eq!(msg, "episode 4 saved, 120 frames");
     }
 
     #[test]
     fn auto_stop_reason_rides_the_summary() {
-        let (ok, msg) = episode_summary(2, 55, false, Some("source went stale".into()));
+        let (ok, msg) = episode_summary(&saved(2, 55, 0), Some("source went stale".into()));
         assert!(!ok);
         assert_eq!(msg, "episode 2 saved, 55 frames (source went stale)");
     }
 
     #[test]
-    fn discarded_episode_is_a_failure() {
-        let (ok, msg) = episode_summary(-1, 9, true, None);
+    fn missing_video_frames_ride_the_summary_and_are_not_a_success() {
+        let (ok, msg) = episode_summary(&saved(4, 120, 3), None);
         assert!(!ok);
-        assert_eq!(msg, "episode discarded after 9 frames");
+        assert_eq!(
+            msg,
+            "episode 4 saved, 120 frames; 3 video frame(s) missing, do not train on it"
+        );
+
+        let (ok, msg) = episode_summary(&saved(2, 55, 1), Some("source went stale".into()));
+        assert!(!ok);
+        assert_eq!(
+            msg,
+            "episode 2 saved, 55 frames (source went stale); 1 video frame(s) missing, do not train on it"
+        );
     }
 }

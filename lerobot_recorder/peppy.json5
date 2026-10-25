@@ -76,11 +76,12 @@
         // finish_session finalizes and mirrors the current session's dataset
         // and opens a fresh session in place; the finished directory is
         // immediately loadable. resume_session records into a past session
-        // again, appending to its dataset, and is refused when the live
-        // sources, rates, or source-to-limb bindings differ from what the
-        // session recorded. A session is a directory name, UTC
-        // YYYY-MM-DD_HH-MM-SS, exactly as finish_session returned it, never
-        // a path; a refused call answers an empty session and an error.
+        // again, appending to its dataset, and gets an error reply with
+        // `precondition_failed` when the live sources, rates, or
+        // source-to-limb bindings differ from what the session recorded. A
+        // session is a directory name, UTC YYYY-MM-DD_HH-MM-SS, exactly as
+        // finish_session returned it, never a path; a name that names no
+        // session of this node gets an error reply with `rejected`.
         { link_id: "recording", name: "finish_session" },
         { link_id: "recording", name: "resume_session" },
       ],
@@ -89,10 +90,11 @@
       exposes: [
         // record_episode records one episode under the goal's task, one
         // feedback message per recorded frame (frames written so far and the
-        // host's free disk, refreshed roughly once per second), and answers
-        // the saved episode index (-1 when discarded), the frames captured,
-        // whether they were dropped, and why the episode ended, absent for
-        // an operator stop.
+        // host's free disk, refreshed roughly once per second). A saved
+        // episode ends its goal cancelled, for the reason of the caller's
+        // cancel or of the recorder's own stop, with the saved episode
+        // index and the frames captured; an episode that cannot be written
+        // or saved fails its goal with `attempt_failed`.
         { link_id: "recording", name: "record_episode" },
       ],
     },

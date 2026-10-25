@@ -1,6 +1,6 @@
 import asyncio
 
-from peppygen import NodeBuilder, NodeRunner, QoSProfile
+from peppygen import NodeBuilder, NodeRunner
 from peppygen.consumed_actions.left_robot_arm import move_arm as left_robot_arm_move_arm
 from peppygen.consumed_actions.right_robot_arm import move_arm as right_robot_arm_move_arm
 from peppygen.exposed_actions import move_arm
@@ -16,6 +16,24 @@ ARM_MODULES = {
 GOAL_TIMEOUT = 5.0
 CANCEL_TIMEOUT = 2.0
 RESULT_TIMEOUT = 30.0
+
+
+def _relayed_cancel_reason(backbone_ctx, token, arm_reason: str) -> str:
+    """Why the backbone's goal ended cancelled: the reason of its own cancel
+    signal, the shutdown of the backbone, or else the arm's own reason."""
+    own_reason = backbone_ctx.cancel_reason()
+    if own_reason is not None:
+        return own_reason
+    if token.is_cancelled():
+        return "the backbone is shutting down"
+    return arm_reason
+
+
+def _relayed_refusal(failure) -> move_arm.GoalDecision:
+    """The backbone's refusal for the refusal of an arm. The move_arm of each
+    arm and that of the backbone give the kinds of peppy alone, so each kind
+    of an arm is the backbone's kind of the same name."""
+    return move_arm.GoalDecision.refuse(failure.kind.value, failure.message)
 
 
 def _arm_side(arm_id: int) -> str:
@@ -38,7 +56,7 @@ async def _run_arm_action(node_runner, token, active_handles, drive_tasks):
     action = await move_arm.ActionHandle.expose(node_runner)
     busy_arms: set[int] = set()
     # The decider pre-fires the arm goal so it can mirror the arm's
-    # accept/reject. On accept, the resulting handle lands here for drive_goal
+    # accept or refusal. On accept, the resulting handle lands here for drive_goal
     # to pick up — re-firing later would just produce a different goal_id.
     pending_handles: dict[int, object] = {}
 
@@ -47,9 +65,14 @@ async def _run_arm_action(node_runner, token, active_handles, drive_tasks):
         side = _arm_side(arm_id)
         print(f"[controller] {side} arm received goal: {request.data.desired_position}")
         if arm_id not in ARM_MODULES:
-            return move_arm.GoalDecision.reject(f"unknown arm_id {arm_id}")
+            return move_arm.GoalDecision.refuse(
+                move_arm.FailureKind.REJECTED, f"unknown arm_id {arm_id}"
+            )
         if arm_id in busy_arms:
-            return move_arm.GoalDecision.reject(f"arm {arm_id} is already moving")
+            return move_arm.GoalDecision.refuse(
+                move_arm.FailureKind.PRECONDITION_FAILED,
+                f"arm {arm_id} is already moving",
+            )
         arm_module = ARM_MODULES[arm_id]
         arm_request = arm_module.GoalRequest(
             desired_position=request.data.desired_position
@@ -60,14 +83,17 @@ async def _run_arm_action(node_runner, token, active_handles, drive_tasks):
                 arm_module.bound_producer(node_runner),
                 arm_request,
                 GOAL_TIMEOUT,
-                QoSProfile.Standard,
             )
         except Exception as e:
-            return move_arm.GoalDecision.reject(f"{side} fire_goal error: {e!r}")
-        if not arm_handle.accepted:
-            reason = arm_handle.reason or f"{side} arm rejected goal"
-            print(f"[controller] {side} arm rejected forwarded goal: {reason}")
-            return move_arm.GoalDecision.reject(reason)
+            return move_arm.GoalDecision.refuse(
+                move_arm.FailureKind.RESOURCE_UNAVAILABLE,
+                f"{side} fire_goal error: {e!r}",
+            )
+        if arm_handle.refusal is not None:
+            print(
+                f"[controller] {side} arm refused forwarded goal: {arm_handle.refusal}"
+            )
+            return _relayed_refusal(arm_handle.refusal)
         print(f"[controller] {side} arm accepted forwarded goal")
         busy_arms.add(arm_id)
         pending_handles[arm_id] = arm_handle
@@ -124,16 +150,17 @@ async def _drive_goal(
             # leaving backbone_ctx uncompleted surfaces as Abandoned upstream.
             print(f"[controller] {side} get_result error: {e!r}")
             return
-        await _relay_outcome(backbone_ctx, arm_module, side, result)
+        await _relay_outcome(backbone_ctx, arm_module, side, result, token)
     finally:
         busy_arms.discard(arm_id)
         active_handles.pop(arm_id, None)
 
 
-async def _relay_outcome(backbone_ctx, arm_module, side, result):
+async def _relay_outcome(backbone_ctx, arm_module, side, result, token):
     # Mirror the arm's typed outcome onto our own goal. Completed/Cancelled carry
-    # the final position; for Abandoned/Expired we leave backbone_ctx
-    # uncompleted, which the engine reports to our client as Abandoned.
+    # the final position, Failed the arm's failure kind and message; for
+    # Abandoned/Expired we leave backbone_ctx uncompleted, which the engine
+    # reports to our client as Abandoned.
     if result.status == arm_module.ResultStatus.COMPLETED:
         fp = result.data.final_position
         print(f"[controller] {side} arm completed at position: {fp}")
@@ -141,11 +168,19 @@ async def _relay_outcome(backbone_ctx, arm_module, side, result):
             await backbone_ctx.complete(fp)
         except Exception as e:
             print(f"[controller] {side} complete error: {e!r}")
+    elif result.status == arm_module.ResultStatus.FAILED:
+        failure = result.failure
+        print(f"[controller] {side} arm failed: {failure}")
+        try:
+            await backbone_ctx.fail(failure.kind.value, failure.message)
+        except Exception as e:
+            print(f"[controller] {side} fail error: {e!r}")
     elif result.status == arm_module.ResultStatus.CANCELLED:
         fp = result.data.final_position
-        print(f"[controller] {side} arm cancelled at position: {fp}")
+        reason = _relayed_cancel_reason(backbone_ctx, token, result.cancel_reason)
+        print(f"[controller] {side} arm cancelled ({reason}) at position: {fp}")
         try:
-            await backbone_ctx.complete_cancelled(fp)
+            await backbone_ctx.complete_cancelled(reason, fp)
         except Exception as e:
             print(f"[controller] {side} complete error: {e!r}")
     elif result.status == arm_module.ResultStatus.ABANDONED:

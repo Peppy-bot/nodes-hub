@@ -3,7 +3,7 @@ use peppygen::consumed_actions::{
     right_robot_arm::move_arm as right_robot_arm_move_arm,
 };
 use peppygen::exposed_actions::move_arm;
-use peppygen::{NodeBuilder, Parameters, QoSProfile, Result};
+use peppygen::{DEFAULT_FEEDBACK_BOUND, NodeBuilder, NodeRunner, Parameters, Result};
 use peppylib::runtime::CancellationToken;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -43,12 +43,35 @@ impl Arm {
     }
 }
 
+/// The backbone's failure for the failure `$failure` of the arm module
+/// `$arm`. The move_arm of each arm and that of the backbone give the kinds
+/// of peppy alone, so each kind of an arm is the backbone's kind of the same
+/// name.
+macro_rules! relayed_failure {
+    ($arm:ident, $failure:expr) => {{
+        let $arm::Failure { kind, message } = $failure;
+        let kind = match kind {
+            $arm::FailureKind::AttemptFailed => move_arm::FailureKind::AttemptFailed,
+            $arm::FailureKind::Timeout => move_arm::FailureKind::Timeout,
+            $arm::FailureKind::PreconditionFailed => move_arm::FailureKind::PreconditionFailed,
+            $arm::FailureKind::ResourceUnavailable => move_arm::FailureKind::ResourceUnavailable,
+            $arm::FailureKind::Rejected => move_arm::FailureKind::Rejected,
+        };
+        move_arm::Failure::new(kind, message)
+    }};
+}
+
 // The two arm modules generate distinct `ResultOutcome` enums with the same
 // shape; collapse them into one type so the forwarding loop maps the outcome
-// once. Completed/Cancelled carry the final position; Abandoned/Expired do not.
+// once. Completed/Cancelled carry the final position; Failed carries the
+// arm's failure in the backbone's kinds; Abandoned/Expired carry nothing.
 enum ArmOutcome {
     Completed([i32; 3]),
-    Cancelled([i32; 3]),
+    Failed(move_arm::Failure),
+    Cancelled {
+        reason: String,
+        final_position: [i32; 3],
+    },
     Abandoned,
     Expired,
 }
@@ -73,7 +96,7 @@ impl ArmHandle {
                     left_robot_arm_move_arm::bound_producer(node_runner),
                     GOAL_TIMEOUT,
                     request,
-                    QoSProfile::Standard,
+                    DEFAULT_FEEDBACK_BOUND,
                 )
                 .await?;
                 Ok(ArmHandle::Left(handle))
@@ -87,7 +110,7 @@ impl ArmHandle {
                     right_robot_arm_move_arm::bound_producer(node_runner),
                     GOAL_TIMEOUT,
                     request,
-                    QoSProfile::Standard,
+                    DEFAULT_FEEDBACK_BOUND,
                 )
                 .await?;
                 Ok(ArmHandle::Right(handle))
@@ -95,17 +118,18 @@ impl ArmHandle {
         }
     }
 
-    fn accepted(&self) -> bool {
+    /// The failure the arm refused the goal with, in the backbone's kinds;
+    /// `None` for an accepted goal.
+    fn refusal(&self) -> Option<move_arm::Failure> {
         match self {
-            ArmHandle::Left(h) => h.accepted,
-            ArmHandle::Right(h) => h.accepted,
-        }
-    }
-
-    fn rejection_reason(&self) -> Option<&str> {
-        match self {
-            ArmHandle::Left(h) => h.reason.as_deref(),
-            ArmHandle::Right(h) => h.reason.as_deref(),
+            ArmHandle::Left(h) => h
+                .refusal
+                .clone()
+                .map(|failure| relayed_failure!(left_robot_arm_move_arm, failure)),
+            ArmHandle::Right(h) => h
+                .refusal
+                .clone()
+                .map(|failure| relayed_failure!(right_robot_arm_move_arm, failure)),
         }
     }
 
@@ -135,8 +159,14 @@ impl ArmHandle {
                 left_robot_arm_move_arm::ResultOutcome::Completed(d) => {
                     ArmOutcome::Completed(d.final_position)
                 }
-                left_robot_arm_move_arm::ResultOutcome::Cancelled(d) => {
-                    ArmOutcome::Cancelled(d.final_position)
+                left_robot_arm_move_arm::ResultOutcome::Failed(failure) => {
+                    ArmOutcome::Failed(relayed_failure!(left_robot_arm_move_arm, failure))
+                }
+                left_robot_arm_move_arm::ResultOutcome::Cancelled { reason, data } => {
+                    ArmOutcome::Cancelled {
+                        reason,
+                        final_position: data.final_position,
+                    }
                 }
                 left_robot_arm_move_arm::ResultOutcome::Abandoned => ArmOutcome::Abandoned,
                 left_robot_arm_move_arm::ResultOutcome::Expired => ArmOutcome::Expired,
@@ -145,8 +175,14 @@ impl ArmHandle {
                 right_robot_arm_move_arm::ResultOutcome::Completed(d) => {
                     ArmOutcome::Completed(d.final_position)
                 }
-                right_robot_arm_move_arm::ResultOutcome::Cancelled(d) => {
-                    ArmOutcome::Cancelled(d.final_position)
+                right_robot_arm_move_arm::ResultOutcome::Failed(failure) => {
+                    ArmOutcome::Failed(relayed_failure!(right_robot_arm_move_arm, failure))
+                }
+                right_robot_arm_move_arm::ResultOutcome::Cancelled { reason, data } => {
+                    ArmOutcome::Cancelled {
+                        reason,
+                        final_position: data.final_position,
+                    }
                 }
                 right_robot_arm_move_arm::ResultOutcome::Abandoned => ArmOutcome::Abandoned,
                 right_robot_arm_move_arm::ResultOutcome::Expired => ArmOutcome::Expired,
@@ -212,9 +248,28 @@ async fn forward(
                 eprintln!("[controller] {side} complete error: {e:?}");
             }
         }
-        Ok(ArmOutcome::Cancelled(fp)) => {
-            println!("[controller] {side} arm cancelled at position: {fp:?}");
-            if let Err(e) = backbone_ctx.complete_cancelled(fp).await {
+        Ok(ArmOutcome::Failed(failure)) => {
+            println!("[controller] {side} arm failed: {failure}");
+            if let Err(e) = backbone_ctx.fail(failure.kind, failure.message).await {
+                eprintln!("[controller] {side} fail error: {e:?}");
+            }
+        }
+        Ok(ArmOutcome::Cancelled {
+            reason,
+            final_position,
+        }) => {
+            // A cancel of this goal gives the cause of its own cancel signal;
+            // a cancel of the arm alone gives the arm's reason.
+            let reason = backbone_ctx
+                .cancel_cause()
+                .map_or(reason, |cause| cause.reason().to_string());
+            println!(
+                "[controller] {side} arm cancelled ({reason}) at position: {final_position:?}"
+            );
+            if let Err(e) = backbone_ctx
+                .complete_cancelled(reason, final_position)
+                .await
+            {
                 eprintln!("[controller] {side} complete error: {e:?}");
             }
         }
@@ -245,9 +300,10 @@ async fn run_action(
         let next_request = action.handle_goal_next_request(move |request| {
             let arm_id = request.data.arm_id;
             let Some(arm) = Arm::from_id(arm_id) else {
-                return Ok(move_arm::GoalDecision::reject(format!(
-                    "unknown arm_id {arm_id}"
-                )));
+                return Ok(move_arm::GoalDecision::refuse(
+                    move_arm::FailureKind::Rejected,
+                    format!("unknown arm_id {arm_id}"),
+                ));
             };
             let side = arm.side();
             println!(
@@ -259,11 +315,12 @@ async fn run_action(
                 .expect("active lock poisoned")
                 .contains_key(&arm)
             {
-                return Ok(move_arm::GoalDecision::reject(format!(
-                    "{side} arm is already moving"
-                )));
+                return Ok(move_arm::GoalDecision::refuse(
+                    move_arm::FailureKind::PreconditionFailed,
+                    format!("{side} arm is already moving"),
+                ));
             }
-            // Pre-fire at the arm so we can mirror its accept/reject. The
+            // Pre-fire at the arm so we can mirror its accept or refusal. The
             // decider is sync, so bridge into async with block_in_place +
             // block_on — safe here because NodeBuilder uses a multi-thread
             // tokio runtime. The bridge must never outlive the cancellation
@@ -280,22 +337,22 @@ async fn run_action(
                         fired = ArmHandle::fire(&runner, arm, desired) => match fired {
                             Ok(handle) => handle,
                             Err(e) => {
-                                return Ok(move_arm::GoalDecision::reject(format!(
-                                    "{side} fire_goal error: {e:?}"
-                                )));
+                                return Ok(move_arm::GoalDecision::refuse(
+                                    move_arm::FailureKind::ResourceUnavailable,
+                                    format!("{side} fire_goal error: {e}"),
+                                ));
                             }
                         },
                         _ = token.cancelled() => {
-                            return Ok(move_arm::GoalDecision::reject("node is shutting down"));
+                            return Ok(move_arm::GoalDecision::refuse(
+                                move_arm::FailureKind::ResourceUnavailable,
+                                "node is shutting down",
+                            ));
                         }
                     };
-                    if !arm_handle.accepted() {
-                        let reason = arm_handle
-                            .rejection_reason()
-                            .unwrap_or("arm rejected")
-                            .to_string();
-                        println!("[controller] {side} arm rejected forwarded goal: {reason}");
-                        return Ok(move_arm::GoalDecision::reject(reason));
+                    if let Some(refusal) = arm_handle.refusal() {
+                        println!("[controller] {side} arm refused forwarded goal: {refusal}");
+                        return Ok(move_arm::GoalDecision::Refuse(refusal));
                     }
                     // Register under the registry lock with a token re-check:
                     // the shutdown hook snapshots the registry right after the
@@ -313,7 +370,10 @@ async fn run_action(
                     if let Err(e) = arm_handle.cancel(CANCEL_TIMEOUT).await {
                         eprintln!("[controller] {side} cancel_goal error: {e:?}");
                     }
-                    Ok(move_arm::GoalDecision::reject("node is shutting down"))
+                    Ok(move_arm::GoalDecision::refuse(
+                        move_arm::FailureKind::ResourceUnavailable,
+                        "node is shutting down",
+                    ))
                 })
             })
         });
@@ -375,48 +435,251 @@ async fn drive_goal(
 }
 
 fn main() -> Result<()> {
-    NodeBuilder::<Parameters>::new().run(|_args, node_runner| async move {
-        let active_handles: ActiveHandles = Arc::new(Mutex::new(HashMap::new()));
+    NodeBuilder::<Parameters>::new().run(setup)
+}
 
-        // The arms keep executing a forwarded goal even after this controller
-        // dies, so cancelling whatever is still in flight is an awaited
-        // shutdown obligation, not task cleanup: it lives in a hook, which the
-        // runtime runs while the messenger is still connected.
-        let active_for_shutdown = Arc::clone(&active_handles);
-        node_runner.on_shutdown(async move {
-            let handles: Vec<(Arm, Arc<AsyncMutex<ArmHandle>>)> = active_for_shutdown
-                .lock()
-                .expect("active lock poisoned")
-                .iter()
-                .map(|(arm, handle)| (*arm, Arc::clone(handle)))
-                .collect();
-            for (arm, handle) in handles {
-                let side = arm.side();
-                // forward() releases the handle guard once the token fires, so
-                // this acquire resolves promptly.
-                let handle = handle.lock().await;
-                match handle.cancel(CANCEL_TIMEOUT).await {
-                    Ok(()) => {
-                        println!("[controller] {side} arm goal cancelled at shutdown");
-                    }
-                    Err(e) => {
-                        eprintln!("[controller] {side} shutdown cancel_goal error: {e:?}");
-                    }
+/// The node's entry point: the shutdown hooks, and the move_arm action.
+async fn setup(_args: Parameters, node_runner: Arc<NodeRunner>) -> Result<()> {
+    let active_handles: ActiveHandles = Arc::new(Mutex::new(HashMap::new()));
+
+    // The arms keep executing a forwarded goal even after this controller
+    // dies, so cancelling whatever is still in flight is an awaited
+    // shutdown obligation, not task cleanup: it lives in a hook, which the
+    // runtime runs while the messenger is still connected.
+    let active_for_shutdown = Arc::clone(&active_handles);
+    node_runner.on_shutdown(async move {
+        let handles: Vec<(Arm, Arc<AsyncMutex<ArmHandle>>)> = active_for_shutdown
+            .lock()
+            .expect("active lock poisoned")
+            .iter()
+            .map(|(arm, handle)| (*arm, Arc::clone(handle)))
+            .collect();
+        for (arm, handle) in handles {
+            let side = arm.side();
+            // forward() releases the handle guard once the token fires, so
+            // this acquire resolves promptly.
+            let handle = handle.lock().await;
+            match handle.cancel(CANCEL_TIMEOUT).await {
+                Ok(()) => {
+                    println!("[controller] {side} arm goal cancelled at shutdown");
+                }
+                Err(e) => {
+                    eprintln!("[controller] {side} shutdown cancel_goal error: {e:?}");
                 }
             }
-        });
+        }
+    });
 
-        // Log when the shutdown/cancel signal is received so it is visible in
-        // the node's stdout.
-        node_runner.on_shutdown(async move {
-            println!("[controller] Shutdown signal received");
-        });
+    // Log when the shutdown/cancel signal is received so it is visible in
+    // the node's stdout.
+    node_runner.on_shutdown(async move {
+        println!("[controller] Shutdown signal received");
+    });
 
-        tokio::spawn(async move {
-            if let Err(error) = run_action(node_runner, active_handles).await {
-                tracing::error!("move_arm action error: {error:?}");
+    tokio::spawn(async move {
+        if let Err(error) = run_action(node_runner, active_handles).await {
+            tracing::error!("move_arm action error: {error:?}");
+        }
+    });
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! Wire-level boundary tests: the backbone's real `setup` booted through
+    //! the generated harness, with a mock arm on each dependency slot, on the
+    //! real action engine. A fixture caller sends move_arm goals to the
+    //! backbone, and the test plays the arm the backbone forwards each goal
+    //! to. No daemon, no launcher, no sleeps.
+
+    use super::*;
+    use peppygen::fixtures::exposed_actions::move_arm as backbone;
+    use peppygen::fixtures::harness::{Harness, Mocks};
+    use peppygen::mock::deps::left_robot_arm::move_arm as arm;
+
+    const TIMEOUT: Duration = Duration::from_secs(10);
+    const TARGET: [i32; 3] = [10, 20, 30];
+
+    fn request(arm_id: u16) -> backbone::GoalRequestData {
+        backbone::GoalRequestData {
+            arm_id,
+            desired_position: TARGET,
+        }
+    }
+
+    async fn send(harness: &Harness, arm_id: u16) -> backbone::GoalHandle {
+        backbone::send_goal(harness, &request(arm_id), DEFAULT_FEEDBACK_BOUND, TIMEOUT)
+            .await
+            .expect("the backbone answers the goal")
+    }
+
+    /// Sends a goal for the left arm and accepts the goal the backbone
+    /// forwards: the backbone admits its goal only once the arm admits.
+    async fn forwarded_and_accepted(
+        harness: &Harness,
+        mocks: &mut Mocks,
+    ) -> (backbone::GoalHandle, arm::ActiveGoal) {
+        let (handle, active) = tokio::join!(send(harness, ARM_ID_LEFT), async {
+            let pending = mocks
+                .deps
+                .left_robot_arm
+                .move_arm
+                .next_goal(TIMEOUT)
+                .await
+                .expect("the backbone forwards the goal");
+            assert_eq!(pending.request.desired_position, TARGET);
+            pending.accept().await.expect("the arm accepts")
+        });
+        assert!(handle.accepted);
+        (handle, active)
+    }
+
+    async fn outcome(handle: &backbone::GoalHandle) -> backbone::ResultOutcome {
+        handle
+            .get_result(TIMEOUT)
+            .await
+            .expect("the goal ends")
+            .outcome
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refusal_of_the_arm_reaches_the_caller_with_its_kind() {
+        let (harness, mut mocks) = Harness::start(setup).await.unwrap();
+        let (handle, ()) = tokio::join!(send(&harness, ARM_ID_LEFT), async {
+            let pending = mocks
+                .deps
+                .left_robot_arm
+                .move_arm
+                .next_goal(TIMEOUT)
+                .await
+                .unwrap();
+            pending
+                .refuse(
+                    arm::FailureKind::PreconditionFailed,
+                    "a leader streams the arm",
+                )
+                .await
+                .unwrap();
+        });
+        assert!(!handle.accepted);
+        assert_eq!(
+            handle.refusal,
+            Some(backbone::Failure::new(
+                backbone::FailureKind::PreconditionFailed,
+                "a leader streams the arm"
+            ))
+        );
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unknown_arm_is_rejected_and_a_busy_arm_fails_a_precondition() {
+        let (harness, mut mocks) = Harness::start(setup).await.unwrap();
+        let unknown = send(&harness, 7).await;
+        assert_eq!(
+            unknown.refusal,
+            Some(backbone::Failure::new(
+                backbone::FailureKind::Rejected,
+                "unknown arm_id 7"
+            ))
+        );
+
+        let (handle, active) = forwarded_and_accepted(&harness, &mut mocks).await;
+        let busy = send(&harness, ARM_ID_LEFT).await;
+        assert_eq!(
+            busy.refusal,
+            Some(backbone::Failure::new(
+                backbone::FailureKind::PreconditionFailed,
+                "Left arm is already moving"
+            ))
+        );
+
+        active
+            .complete(&arm::ResultResponseData {
+                final_position: TARGET,
+            })
+            .await
+            .unwrap();
+        match outcome(&handle).await {
+            backbone::ResultOutcome::Completed(data) => assert_eq!(data.final_position, TARGET),
+            other => panic!("expected a completed goal, got {other:?}"),
+        }
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failure_of_the_arm_fails_the_goal_with_its_kind() {
+        let (harness, mut mocks) = Harness::start(setup).await.unwrap();
+        let (handle, active) = forwarded_and_accepted(&harness, &mut mocks).await;
+        active
+            .fail(arm::FailureKind::AttemptFailed, "the arm stalled")
+            .await
+            .unwrap();
+        match outcome(&handle).await {
+            backbone::ResultOutcome::Failed(failure) => assert_eq!(
+                failure,
+                backbone::Failure::new(backbone::FailureKind::AttemptFailed, "the arm stalled")
+            ),
+            other => panic!("expected a failed goal, got {other:?}"),
+        }
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancel_of_the_arm_alone_ends_the_goal_with_the_reason_of_the_arm() {
+        let (harness, mut mocks) = Harness::start(setup).await.unwrap();
+        let (handle, active) = forwarded_and_accepted(&harness, &mut mocks).await;
+        active
+            .complete_cancelled(
+                "stopped by a stop request",
+                &arm::ResultResponseData {
+                    final_position: [1, 2, 3],
+                },
+            )
+            .await
+            .unwrap();
+        match outcome(&handle).await {
+            backbone::ResultOutcome::Cancelled { reason, data } => {
+                assert_eq!(reason, "stopped by a stop request");
+                assert_eq!(data.final_position, [1, 2, 3]);
             }
-        });
-        Ok(())
-    })
+            other => panic!("expected a cancelled goal, got {other:?}"),
+        }
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancel_of_the_caller_reaches_the_arm_and_ends_the_goal_for_its_own_cause() {
+        let (harness, mut mocks) = Harness::start(setup).await.unwrap();
+        let (handle, active) = forwarded_and_accepted(&harness, &mut mocks).await;
+        assert_eq!(
+            handle.cancel_goal(TIMEOUT).await.unwrap(),
+            backbone::CancelState::Signalled
+        );
+
+        // The backbone forwards the cancel: the arm's goal receives it from
+        // its own caller, the backbone.
+        tokio::time::timeout(TIMEOUT, active.cancel_signal())
+            .await
+            .expect("the backbone forwards the cancel");
+        assert_eq!(active.cancel_cause(), Some(peppygen::CancelCause::Caller));
+        active
+            .complete_cancelled(
+                "the arm stopped",
+                &arm::ResultResponseData {
+                    final_position: [4, 5, 6],
+                },
+            )
+            .await
+            .unwrap();
+
+        match outcome(&handle).await {
+            backbone::ResultOutcome::Cancelled { reason, data } => {
+                assert_eq!(reason, "cancelled by its caller");
+                assert_eq!(data.final_position, [4, 5, 6]);
+            }
+            other => panic!("expected a cancelled goal, got {other:?}"),
+        }
+        harness.shutdown().await.unwrap();
+    }
 }

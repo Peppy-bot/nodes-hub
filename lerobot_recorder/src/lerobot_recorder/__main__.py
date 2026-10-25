@@ -152,24 +152,32 @@ def _recorded_links(plan: plan_mod.RecordingPlan) -> dict:
 
 def _check_same_links(session_dir: Path, plan: plan_mod.RecordingPlan) -> None:
     """Refuse a session whose limbs were fed by different sources than this
-    launch binds. The dataset's own features cannot catch a swap: limbs are
-    named after their follower, so relaunching with the leaders bound in the
-    other order keeps every name and shape identical while mirroring the two
-    arms' setpoints into each other's action columns. Every session this node
-    opens records its links, so a session without them is not one of ours."""
+    launch binds, with `precondition_failed`. The dataset's own features
+    cannot catch a swap: limbs are named after their follower, so relaunching
+    with the leaders bound in the other order keeps every name and shape
+    identical while mirroring the two arms' setpoints into each other's
+    action columns. Every session this node opens records its links, so a
+    session without them is not one of ours, and is refused with
+    `rejected`."""
     provenance = session_dir / "session.json"
     try:
         recorded = json.loads(provenance.read_text())
     except (OSError, json.JSONDecodeError) as e:
-        raise ValueError(f"session.json unreadable: {e}") from e
+        raise resume_session_svc.Failure(
+            resume_session_svc.FailureKind.REJECTED, f"session.json unreadable: {e}"
+        ) from e
     for field, bound in _recorded_links(plan).items():
         was = recorded.get(field)
         if was is None:
-            raise ValueError(f"session.json records no {field}; not a session this node wrote")
+            raise resume_session_svc.Failure(
+                resume_session_svc.FailureKind.REJECTED,
+                f"session.json records no {field}; not a session this node wrote",
+            )
         if was != bound:
-            raise ValueError(
+            raise resume_session_svc.Failure(
+                resume_session_svc.FailureKind.PRECONDITION_FAILED,
                 f"session recorded {field} {was}, this launch binds {bound}; "
-                f"appending would cross the limbs already in the dataset"
+                f"appending would cross the limbs already in the dataset",
             )
 
 
@@ -178,11 +186,19 @@ def _resolve_existing_session(
 ) -> Path:
     """The one path where an operator-supplied name reaches the filesystem:
     validated before it touches a path, then checked against the session's
-    recorded provenance."""
-    storage.validate_session_name(name)
+    recorded provenance. Raises resume_session's Failure: `rejected` for a
+    name that names no session of this node, and as _check_same_links
+    does."""
+    try:
+        storage.validate_session_name(name)
+    except ValueError as e:
+        raise resume_session_svc.Failure(resume_session_svc.FailureKind.REJECTED, str(e)) from None
     session_dir = target.root / name
     if not session_dir.is_dir():
-        raise ValueError(f"no session named {name} under this storage target")
+        raise resume_session_svc.Failure(
+            resume_session_svc.FailureKind.REJECTED,
+            f"no session named {name} under this storage target",
+        )
     _check_same_links(session_dir, plan)
     return session_dir
 
@@ -346,19 +362,22 @@ async def _serve(
 
 
 def _resume_session_handler(node_runner: NodeRunner, recorder: Recorder):
+    """The resume_session handler: the resumed session, or the error reply
+    of the Failure that the recorder raises."""
+
     async def handler(request):
-        session, episodes, error = await recorder.resume_session(
-            request.data.session, node_runner
-        )
-        return resume_session_svc.Response(session=session, episodes=episodes, error=error)
+        session, episodes = await recorder.resume_session(request.data.session, node_runner)
+        return resume_session_svc.Response(session=session, episodes=episodes)
 
     return handler
 
 
 def _finish_session_handler(recorder: Recorder):
+    """The finish_session handler: the finished session, or the error reply
+    of the Failure that the recorder raises."""
+
     async def handler(_request):
-        session, error = await recorder.finish_session()
-        return finish_session_svc.Response(session=session, error=error)
+        return finish_session_svc.Response(session=await recorder.finish_session())
 
     return handler
 

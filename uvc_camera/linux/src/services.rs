@@ -4,7 +4,8 @@ use peppygen::exposed_services::camera::{
 use std::sync::Arc;
 
 use crate::camera::controls::{
-    CameraControlRequest, ControlResult, ExposureMode, WhiteBalanceMode,
+    CameraControlRequest, ControlFailure, ControlFailureKind, ControlResult, ExposureMode,
+    WhiteBalanceMode,
 };
 use crate::camera::v4l_device::{ControlHandle, StreamDescription};
 use crate::types::Encoding;
@@ -56,188 +57,79 @@ fn send_control(controls: &ControlHandle, request: CameraControlRequest) -> Cont
     tokio::task::block_in_place(|| controls.apply(&request))
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// set_exposure
-// ─────────────────────────────────────────────────────────────────────────────
+/// The error reply of `$service` for a control that gave no value: the same
+/// kind, from the service's own kinds.
+macro_rules! control_failure {
+    ($service:ident, $failure:expr) => {{
+        let ControlFailure { kind, message } = $failure;
+        let kind = match kind {
+            ControlFailureKind::Rejected => $service::FailureKind::Rejected,
+            ControlFailureKind::PreconditionFailed => $service::FailureKind::PreconditionFailed,
+            ControlFailureKind::ResourceUnavailable => $service::FailureKind::ResourceUnavailable,
+            ControlFailureKind::AttemptFailed => $service::FailureKind::AttemptFailed,
+        };
+        $service::Failure::new(kind, message)
+    }};
+}
 
-/// Listen for and handle `set_exposure` service requests
-pub async fn listen_for_set_exposure_requests(
-    node_runner: Arc<peppygen::NodeRunner>,
-    controls: ControlHandle,
-) {
-    let cancel_token = node_runner.cancellation_token().clone();
-    loop {
-        let result = tokio::select! {
-            _ = cancel_token.cancelled() => break,
-            result = set_exposure::handle_next_request(&node_runner, |request| {
-                let mode = match ExposureMode::try_from(request.data.mode.as_str()) {
-                    Ok(m) => m,
-                    Err(err) => {
-                        return Ok(set_exposure::Response::new(false, err, -1));
-                    }
+/// Listen for and handle the requests of one camera control service.
+/// `$control` turns a request into the control to apply, or refuses a request
+/// the node does not take. The response is the value the driver kept; a
+/// control that gave no value gets an error reply of its failure kind.
+macro_rules! listen_for_control_requests {
+    ($fn_name:ident, $service:ident, $control:expr) => {
+        pub async fn $fn_name(node_runner: Arc<peppygen::NodeRunner>, controls: ControlHandle) {
+            let control_of: fn(
+                &$service::RequestData,
+            ) -> Result<CameraControlRequest, ControlFailure> = $control;
+            let cancel_token = node_runner.cancellation_token().clone();
+            loop {
+                let result = tokio::select! {
+                    _ = cancel_token.cancelled() => break,
+                    result = $service::handle_next_request(&node_runner, |request| {
+                        control_of(&request.data)
+                            .and_then(|control| send_control(&controls, control))
+                            .map($service::Response::new)
+                            .map_err(|failure| control_failure!($service, failure))
+                    }) => result,
                 };
-
-                let result = send_control(
-                    &controls,
-                    CameraControlRequest::SetExposure {
-                        mode,
-                        value: request.data.value,
-                    },
-                );
-
-                Ok(set_exposure::Response::new(
-                    result.success,
-                    result.message,
-                    result.current_value,
-                ))
-            }) => result,
-        };
-        if let Err(e) = result {
-            tracing::error!("set_exposure service error: {e:?}");
+                if let Err(e) = result {
+                    tracing::error!("{} service error: {e:?}", stringify!($service));
+                }
+            }
         }
-    }
+    };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// set_white_balance
-// ─────────────────────────────────────────────────────────────────────────────
+listen_for_control_requests!(listen_for_set_exposure_requests, set_exposure, |data| {
+    let mode = ExposureMode::try_from(data.mode.as_str()).map_err(ControlFailure::rejected)?;
+    Ok(CameraControlRequest::SetExposure {
+        mode,
+        value: data.value,
+    })
+});
 
-/// Listen for and handle `set_white_balance` service requests
-pub async fn listen_for_set_white_balance_requests(
-    node_runner: Arc<peppygen::NodeRunner>,
-    controls: ControlHandle,
-) {
-    let cancel_token = node_runner.cancellation_token().clone();
-    loop {
-        let result = tokio::select! {
-            _ = cancel_token.cancelled() => break,
-            result = set_white_balance::handle_next_request(&node_runner, |request| {
-                let mode = match WhiteBalanceMode::try_from(request.data.mode.as_str()) {
-                    Ok(m) => m,
-                    Err(err) => {
-                        return Ok(set_white_balance::Response::new(false, err, -1));
-                    }
-                };
-
-                let result = send_control(
-                    &controls,
-                    CameraControlRequest::SetWhiteBalance {
-                        mode,
-                        temperature: request.data.temperature,
-                    },
-                );
-
-                Ok(set_white_balance::Response::new(
-                    result.success,
-                    result.message,
-                    result.current_value,
-                ))
-            }) => result,
-        };
-        if let Err(e) = result {
-            tracing::error!("set_white_balance service error: {e:?}");
-        }
+listen_for_control_requests!(
+    listen_for_set_white_balance_requests,
+    set_white_balance,
+    |data| {
+        let mode =
+            WhiteBalanceMode::try_from(data.mode.as_str()).map_err(ControlFailure::rejected)?;
+        Ok(CameraControlRequest::SetWhiteBalance {
+            mode,
+            temperature: data.temperature,
+        })
     }
-}
+);
 
-// ─────────────────────────────────────────────────────────────────────────────
-// set_gain
-// ─────────────────────────────────────────────────────────────────────────────
+listen_for_control_requests!(listen_for_set_gain_requests, set_gain, |data| {
+    Ok(CameraControlRequest::SetGain { value: data.value })
+});
 
-/// Listen for and handle `set_gain` service requests
-pub async fn listen_for_set_gain_requests(
-    node_runner: Arc<peppygen::NodeRunner>,
-    controls: ControlHandle,
-) {
-    let cancel_token = node_runner.cancellation_token().clone();
-    loop {
-        let result = tokio::select! {
-            _ = cancel_token.cancelled() => break,
-            result = set_gain::handle_next_request(&node_runner, |request| {
-                let result = send_control(
-                    &controls,
-                    CameraControlRequest::SetGain {
-                        value: request.data.value,
-                    },
-                );
+listen_for_control_requests!(listen_for_set_brightness_requests, set_brightness, |data| {
+    Ok(CameraControlRequest::SetBrightness { value: data.value })
+});
 
-                Ok(set_gain::Response::new(
-                    result.success,
-                    result.message,
-                    result.current_value,
-                ))
-            }) => result,
-        };
-        if let Err(e) = result {
-            tracing::error!("set_gain service error: {e:?}");
-        }
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// set_brightness
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Listen for and handle `set_brightness` service requests
-pub async fn listen_for_set_brightness_requests(
-    node_runner: Arc<peppygen::NodeRunner>,
-    controls: ControlHandle,
-) {
-    let cancel_token = node_runner.cancellation_token().clone();
-    loop {
-        let result = tokio::select! {
-            _ = cancel_token.cancelled() => break,
-            result = set_brightness::handle_next_request(&node_runner, |request| {
-                let result = send_control(
-                    &controls,
-                    CameraControlRequest::SetBrightness {
-                        value: request.data.value,
-                    },
-                );
-
-                Ok(set_brightness::Response::new(
-                    result.success,
-                    result.message,
-                    result.current_value,
-                ))
-            }) => result,
-        };
-        if let Err(e) = result {
-            tracing::error!("set_brightness service error: {e:?}");
-        }
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// set_contrast
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Listen for and handle `set_contrast` service requests
-pub async fn listen_for_set_contrast_requests(
-    node_runner: Arc<peppygen::NodeRunner>,
-    controls: ControlHandle,
-) {
-    let cancel_token = node_runner.cancellation_token().clone();
-    loop {
-        let result = tokio::select! {
-            _ = cancel_token.cancelled() => break,
-            result = set_contrast::handle_next_request(&node_runner, |request| {
-                let result = send_control(
-                    &controls,
-                    CameraControlRequest::SetContrast {
-                        value: request.data.value,
-                    },
-                );
-
-                Ok(set_contrast::Response::new(
-                    result.success,
-                    result.message,
-                    result.current_value,
-                ))
-            }) => result,
-        };
-        if let Err(e) = result {
-            tracing::error!("set_contrast service error: {e:?}");
-        }
-    }
-}
+listen_for_control_requests!(listen_for_set_contrast_requests, set_contrast, |data| {
+    Ok(CameraControlRequest::SetContrast { value: data.value })
+});

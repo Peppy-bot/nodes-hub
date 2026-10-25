@@ -2,8 +2,10 @@
 //! the robot, whoever started it, through the coordinator, and answers the
 //! limbs whose move was ended. The moves of both contracts run on the
 //! coordinator's tick, so the request is handed to it and its reply awaited
-//! ([`CoordinatorRequest::Stop`]); a goal a stop ends completes as cancelled
-//! with the stop's message, and the arm holds where it was last governed.
+//! ([`CoordinatorRequest::Stop`]); each goal a stop ends is cancelled with a
+//! reason that names the stop, and the arm holds where it was last governed.
+//! A coordinator that does not answer cannot carry the stop out: the caller
+//! gets an error reply with `attempt_failed`.
 
 use std::sync::Arc;
 
@@ -24,28 +26,19 @@ pub async fn run_stop(
     loop {
         stop::handle_next_request(&runner, |request| {
             let (reply, answer) = oneshot::channel();
-            let asked = blocking_ask_coordinator(
+            let stopped = blocking_ask_coordinator(
                 &requests,
                 CoordinatorRequest::Stop {
                     reason: request.data.reason,
                     reply,
                 },
                 answer,
-            );
-            Ok(match asked {
-                Ok(stopped) => {
-                    let message = if stopped.is_empty() {
-                        "nothing was moving".to_string()
-                    } else {
-                        format!("stopped {}", stopped.join(", "))
-                    };
-                    stop::Response::new(true, message, stopped)
-                }
-                Err(refusal) => {
-                    error!("stop: {refusal}");
-                    stop::Response::new(false, refusal, Vec::new())
-                }
-            })
+            )
+            .map_err(|reason| {
+                error!("stop: {reason}");
+                stop::Failure::new(stop::FailureKind::AttemptFailed, reason)
+            })?;
+            Ok(stop::Response::new(stopped))
         })
         .await?;
     }

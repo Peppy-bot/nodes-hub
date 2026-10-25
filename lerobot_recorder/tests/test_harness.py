@@ -15,7 +15,6 @@ import asyncio
 import json
 import time
 
-import peppylib
 import pytest
 
 from lerobot_recorder.__main__ import setup
@@ -46,8 +45,8 @@ CLOCK_NOT_READY = "clock not ready"
 
 def params(tmp_path) -> Parameters:
     # Staged-PNG encoding: its writer queue is unbounded, so a saved
-    # episode's video deterministically covers every row (no drop-driven
-    # video_error to race the result assertions against). Staleness is
+    # episode's video deterministically covers every row (no dropped video
+    # frames to race the result assertions against). Staleness is
     # generous: a loaded host importing torch mid-test must not read as a
     # dead source.
     return make_params(
@@ -117,13 +116,13 @@ async def first_goal_answer(h, settled, failure: str, deadline_s: float):
         goal = await record_episode.send_goal(
             h,
             record_episode.GoalRequestData(task="harness"),
-            peppylib.QoSProfile.Standard,
             30.0,
         )
         if settled(goal):
             return goal
-        reason = goal.reason
-        assert reason, "a rejection must carry the node's refusal reason"
+        assert goal.refusal.kind is record_episode.FailureKind.PRECONDITION_FAILED
+        reason = goal.refusal.message
+        assert reason, "a refusal must carry the node's reason"
         await asyncio.sleep(0.2)
     pytest.fail(f"{failure} within {deadline_s}s; last reason: {reason!r}")
 
@@ -143,24 +142,26 @@ async def goal_past_the_clock(h, deadline_s: float = 60.0):
     ticked is in flight to the node's clock."""
     return await first_goal_answer(
         h,
-        lambda goal: goal.accepted or CLOCK_NOT_READY not in goal.reason,
+        lambda goal: goal.accepted or CLOCK_NOT_READY not in goal.refusal.message,
         "the node never read the ticked instant",
         deadline_s,
     )
 
 
 async def finish_rolled(h, deadline_s: float = 60.0):
-    """Poll finish_session until the roll lands. The one refusal retried is
-    'an episode is recording': the recorder clears that flag a beat after
+    """Poll finish_session until the roll lands. The one error reply retried
+    is 'an episode is recording': the recorder clears that flag a beat after
     the goal's result is delivered, so a poll can race it."""
     loop = asyncio.get_running_loop()
     deadline = loop.time() + deadline_s
     while True:
-        response = await finish_session.poll(h, 30.0)
-        if response.error is None or "recording" not in response.error:
-            return response
-        if loop.time() > deadline:
-            pytest.fail(f"finish_session kept refusing: {response.error!r}")
+        try:
+            return await finish_session.poll(h, 30.0)
+        except finish_session.Failure as failure:
+            if failure.message != "an episode is recording":
+                raise
+            if loop.time() > deadline:
+                pytest.fail(f"finish_session kept refusing: {failure}")
         await asyncio.sleep(0.2)
 
 
@@ -172,7 +173,8 @@ async def test_boot_pairs_one_limb_and_refuses_goals_while_sources_are_silent(tm
     """Boot with 1 observed + 1 commanded joints source, 1 color camera and
     every other zero_or_more slot empty: discovery pairs one limb positionally
     and records the wire identities, and a goal sent before any mock has
-    published is rejected over the wire with the node's own reason."""
+    published is refused over the wire with `precondition_failed` and the
+    node's own reason."""
     async with boot(tmp_path) as h:
         # Empty zero_or_more slots start no mocks.
         assert h.mocks.observed.observed_grippers == []
@@ -182,11 +184,10 @@ async def test_boot_pairs_one_limb_and_refuses_goals_while_sources_are_silent(tm
         goal = await record_episode.send_goal(
             h,
             record_episode.GoalRequestData(task="too-early"),
-            peppylib.QoSProfile.Standard,
             30.0,
         )
-        assert not goal.accepted
-        assert "has not produced yet" in goal.reason
+        assert goal.refusal.kind is record_episode.FailureKind.PRECONDITION_FAILED
+        assert "has not produced yet" in goal.refusal.message
 
         # The session opened during setup, from the seeded membership: the
         # provenance names the limb after the link its command travels on and
@@ -216,11 +217,10 @@ async def test_a_driven_clock_gates_admission_until_the_test_ticks_it(tmp_path):
         goal = await record_episode.send_goal(
             h,
             record_episode.GoalRequestData(task="no-time-yet"),
-            peppylib.QoSProfile.Standard,
             30.0,
         )
-        assert not goal.accepted
-        assert CLOCK_NOT_READY in goal.reason
+        assert goal.refusal.kind is record_episode.FailureKind.PRECONDITION_FAILED
+        assert CLOCK_NOT_READY in goal.refusal.message
 
         # The test is the simulator: tick() waits for the node's clock
         # subscription (opened by the setup's clock init) and publishes the
@@ -230,7 +230,7 @@ async def test_a_driven_clock_gates_admission_until_the_test_ticks_it(tmp_path):
         await h.clock.tick(1_000_000_000)
         goal = await goal_past_the_clock(h)
         assert not goal.accepted
-        assert "has not produced yet" in goal.reason
+        assert "has not produced yet" in goal.refusal.message
 
 
 async def test_record_episode_feedback_flows_and_cancel_saves(tmp_path):
@@ -238,8 +238,8 @@ async def test_record_episode_feedback_flows_and_cancel_saves(tmp_path):
     goal is admitted once every source has produced, per-frame feedback flows
     while the mocks stream, a goal sent mid-episode is refused busy, and
     cancel (the operator stop) ends the episode with a save: a CANCELLED
-    result carrying episode_index 0, the frame count, discarded=False and no
-    error."""
+    result for the reason of the caller's cancel, carrying episode_index 0,
+    the frame count and no missing video frame."""
     async with boot(tmp_path) as h:
         stop = asyncio.Event()
         streamer = asyncio.create_task(stream(h, stop))
@@ -249,11 +249,11 @@ async def test_record_episode_feedback_flows_and_cancel_saves(tmp_path):
             busy = await record_episode.send_goal(
                 h,
                 record_episode.GoalRequestData(task="second"),
-                peppylib.QoSProfile.Standard,
                 30.0,
             )
-            assert not busy.accepted
-            assert "already recording" in busy.reason
+            assert busy.refusal == record_episode.Failure(
+                record_episode.FailureKind.PRECONDITION_FAILED, "an episode is already recording"
+            )
 
             # One feedback message per recorded frame; disk_free rides it.
             first = await asyncio.wait_for(goal.on_next_feedback(), 240.0)
@@ -267,27 +267,27 @@ async def test_record_episode_feedback_flows_and_cancel_saves(tmp_path):
 
             result = await goal.get_result(180.0)
             assert result.status == record_episode.ResultStatus.CANCELLED
+            assert result.cancel_reason == "cancelled by its caller"
             assert result.data is not None
-            assert result.data.discarded is False
             assert result.data.episode_index == 0
             assert result.data.frames_recorded >= second.frames_recorded
-            # An operator stop carries no error; staged encoding cannot come
-            # up short on video frames.
-            assert result.data.error is None
+            assert result.data.video_frames_missing == 0
 
             # d) finish_session rolls the saved session over to a fresh one.
             (recorded_dir,) = session_dirs(tmp_path)
             finished = await finish_rolled(h)
-            assert finished.error is None
             assert finished.session == recorded_dir.name
             assert (recorded_dir / "dataset" / "meta" / "info.json").is_file()
             # The roll opened a successor session directory in place.
             assert len(session_dirs(tmp_path)) == 2
 
-            # The rolled-to session holds no episodes yet, and the node says so.
-            empty = await finish_session.poll(h, 30.0)
-            assert empty.session == ""
-            assert empty.error == "nothing recorded this session"
+            # The rolled-to session holds no episodes yet: the node gives an
+            # error reply that says so.
+            with pytest.raises(finish_session.Failure) as raised:
+                await finish_session.poll(h, 30.0)
+            assert raised.value == finish_session.Failure(
+                finish_session.FailureKind.PRECONDITION_FAILED, "nothing recorded this session"
+            )
         finally:
             stop.set()
             await streamer

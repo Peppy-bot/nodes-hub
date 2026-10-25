@@ -15,7 +15,11 @@ choosing, and the engine answers with the limbs it gave the robot. The node
 keeps no list of models: a simulation refuses a model it does not stand,
 naming the ones it does. The goal stays open for as long as the robot is in
 the scene, and shutting the node down takes the robot out, within peppy's
-shutdown grace. A `placement` names where the robot's base stands; the
+shutdown grace. When the process of the node dies without shutting down,
+the engine keeps the robot for its pair grace time, which is the sender grace
+of the attach goal, and then takes the robot out. A node of the same copy
+that comes back within that time attaches the robot that still stands, and
+the goal of the node that died ends cancelled. A `placement` names where the robot's base stands; the
 default lets the engine choose a free spot on the lattice it parks robots on.
 
 The node starts only once the robot stands. Its setup waits for the engine to
@@ -117,23 +121,28 @@ only the aggregate; find the holdout in the drivers' own logs (`peppy node
 info <node>:v1` per limb node) or the simulation's.
 
 **the node fails at start, saying the simulation refused it or did not stand it**
-The message gives the reason. The engine refuses at once what it can know
-before it admits the robot: a model its catalogue does not carry, a name that
-another robot holds or that breaks the engine's name rule, or no spot that it
-can promise the robot (a `placement` within reach of a robot that stands or
-that is on its way in, or no free spot left). The message then says "the
-simulation refused this robot". What fails after the admission ends the goal
-before the robot stands: the robot's files could not be fetched, its model
-could not be built into the world, the scene covers a named `placement` by
-then, or the engine took the robot out because it could not say that the
-robot stands. The message then says "the simulation did not stand this
-robot" with the engine's reason. A robot that the simulation does not stand
-within the stand budget leaves the simulation, and the message says "the
-simulation did not stand this robot within 174.5 s". In each case the start
-of the copy fails: `peppy stack join` undoes the copy, and a launch that
-names the copy fails. Fix what the reason names (the robot's `model`, its
-name or its `placement`), or make room in the world, then `peppy stack join`
-the copy again.
+The message gives the engine's failure kind and its reason. The engine
+refuses at once what it can know before it admits the robot: with `rejected`
+a model its catalogue does not carry or that it cannot stand, a name that
+breaks the engine's name rule, or a `placement` that it does not take; and
+with `precondition_failed` a name that another robot holds, a name whose
+robot still joins or leaves the scene, or no spot that it can promise the
+robot (a `placement` within reach of a robot that stands or that is on its
+way in, or no free spot left). The message then says "the simulation
+refused this robot". What fails after the admission fails the goal before
+the robot stands: with `attempt_failed` when the robot's files could not be
+fetched or its model could not be built into the world, with
+`precondition_failed` when the scene covers a named `placement` by then, and
+with `resource_unavailable` when the engine took the robot out because it
+could not say that the robot stands. The message then says "the simulation
+did not stand this robot" with the engine's failure kind and reason. A
+robot that the simulation does not stand within the stand budget leaves the
+simulation, and the message says "the simulation did not stand this robot
+within 174.5 s". In each case the start of the copy fails: `peppy stack
+join` undoes the copy, and a launch that names the copy fails. Fix what the
+reason names (the robot's `model`, its name or its `placement`), make room
+in the world, or wait until the robot that still joins or leaves under the
+name is in or out, then `peppy stack join` the copy again.
 
 **the node stops right after it starts, saying `model` names the robot's model**
 The launcher left `model` empty. Give it the id the simulation's catalogue
@@ -143,5 +152,10 @@ names the robot by, `openarm_v2` or `so101` for example.
 A stay ends when the engine takes the robot out or its limbs hold no pair
 for the engine's pair grace time, and the node stops with it: a robot that is
 not in the scene has no readiness to serve. `peppy stack list` reports the
-instance finished, with the engine's own account of why in the node's run log.
-Nothing brings the copy back on its own: `peppy stack join` it again.
+instance finished, with the engine's own account of why in the node's run log:
+"the simulation took 'alpha' out of the scene: resource_unavailable: " and
+the engine's reason. A stay also ends when another node of the same copy
+attaches the robot: the robot stays in the scene for that node, and the run
+log says "the stay of 'alpha' in the simulation ended: another goal of the
+same caller holds the robot now". Nothing brings the copy back on its own:
+`peppy stack join` it again.

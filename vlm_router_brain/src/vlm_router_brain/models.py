@@ -4,19 +4,21 @@ models built into the node and the catalog.
 Each role accepts the models built into the node (`BUILT_IN`): "none",
 the role's missing model, for both, and "scripted", the scripted
 manipulator, for manipulation. Perception also accepts every catalog model
-that serves it. A name a role does not accept is refused pointing to
-list_models. `offered` gives the entry of a name for a role, a `BuiltIn`
-or a `RouterEntry` for a catalog model, so the entry carries the role it
-was offered for. A catalog model runs on the first of its routes whose key
-is set in the node's environment, the route the log names and no result
-does, and becomes the backend `BUILDERS` makes for its role.
+that serves it. A name a role does not accept is refused with `rejected`,
+pointing to list_models. `offered` gives the entry of a name for a role, a
+`BuiltIn` or a `RouterEntry` for a catalog model, so the entry carries the
+role it was offered for. A catalog model runs on the first of its routes
+whose key is set in the node's environment, the route the log names and
+no result does, and becomes the backend `BUILDERS` makes for its role.
 
 A built-in model makes no call, so a start and a switch build it alike.
 At the node's start (`start`) a catalog model makes no call either: the
 first search is its first call, and a provider failure fails that search
 alone. A switch to a catalog model (`prepare`) probes the route once
 before brain_core hands the role its new model, so a model that cannot be
-reached fails the switch and the role keeps its model.
+reached fails the switch and the role keeps its model: with
+`resource_unavailable` when no route of the model has its key, with
+`attempt_failed` when the probe fails.
 """
 
 from __future__ import annotations
@@ -30,7 +32,7 @@ from brain_core.manipulation.centre_proposer import CentreProposer
 from brain_core.manipulation.none import NoneManipulator
 from brain_core.manipulation.scripted import ScriptedManipulator
 from brain_core.perception.none import NoneDetector
-from brain_core.ports import Refusal, Role
+from brain_core.ports import FailureKind, Refusal, Role
 
 from .catalog import NONE, SCRIPTED, Catalog, CatalogEntry, Route
 from .keys import first_keyed, no_key_message
@@ -88,7 +90,7 @@ class RouterModels:
             return BuiltIn(role, name)
         catalog_entry = self._catalog.get(name)
         if catalog_entry is None or role not in catalog_entry.roles:
-            raise Refusal(f"'{name}' is not a {role} model here; see list_models")
+            raise Refusal(FailureKind.REJECTED, f"'{name}' is not a {role} model here; see list_models")
         return RouterEntry(role, catalog_entry)
 
     def start(self, entry: Entry):
@@ -106,7 +108,7 @@ class RouterModels:
         model = entry.catalog_entry
         route = first_keyed(model.routes, self._environ)
         if route is None:
-            raise Refusal(no_key_message(model.name, model.routes))
+            raise Refusal(FailureKind.RESOURCE_UNAVAILABLE, no_key_message(model.name, model.routes))
         await probe(self._provider, route)
         return self._build(entry, route)
 

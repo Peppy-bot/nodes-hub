@@ -20,15 +20,19 @@ a page on port 8765 by default, with three interaction modes:
   the grasp point's **position tolerance (m)** and **angle tolerance (rad)**.
   The group the next Execute does not fire dims. The backbone completes an arm
   move once the measured arm stands within the tolerance of the target at or
-  after the planned end, and fails it with the remaining error once the
-  timeout runs out. The inputs are prefilled with 2 s, 2 s, 0.1 rad, 20 mm and
-  0.15 rad, and send what the operator types; the backbone refuses a value out
-  of its range with a message on the status line. A pose's settle tolerances
-  must cover the panel's own plan tolerances of 5 mm and 5 degrees, since the
-  plan may sit that far from the composed pose. The gripper card's **settle
-  timeout (s)**, prefilled 2 s, is the longest the backbone waits after the
-  commanded travel for the jaws to stand still. The move then reports where
-  the jaws stand.
+  after the planned end, and fails it with `timeout` and the remaining error
+  once the timeout runs out. The inputs are prefilled with 2 s, 2 s, 0.1 rad,
+  20 mm and 0.15 rad, and send what the operator types; the backbone refuses a
+  value out of its range with `rejected`. The status line shows each refusal
+  and failure as its failure kind and message, such as `backbone refused the
+  goal: leader_streaming: ...` or `move_arm (left) failed: unreachable: ...`,
+  and a cancelled move with its reason. A pose's settle tolerances must cover
+  the panel's own plan tolerances of 5 mm and 5 degrees, since the plan may
+  sit that far from the composed pose. The gripper card's **settle timeout
+  (s)**, prefilled 2 s, is the longest the backbone waits after the commanded
+  travel for the jaws to stand still. The move then reports where the jaws
+  stand, and the status line says when they had not stood still by the
+  timeout.
 - **Gestures**: one button per baked choreography (wave, spiral, figure eight,
   shrug, clap) plus **Stop**. Gestures are
   authored in `src/gestures.rs` as joint keyframes or Cartesian curves, resolved

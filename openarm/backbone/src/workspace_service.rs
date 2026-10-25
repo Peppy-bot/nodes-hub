@@ -1,13 +1,15 @@
 //! The workspace contract's two services, describe_workspace and
 //! check_positions, answered for the life of the node by [`Workspace`] from
 //! the robot's design, so served from bringup, ahead of the readiness gate.
-//! Each request parses its fields first, then reads the perception camera's
-//! geometry from the camera linked as perception_geometry, when the robot
-//! has a perception camera and a camera is linked: the view then follows that
-//! camera's own intrinsics, depth model and depth range, and a camera that
-//! cannot give them now makes the answer a refusal. The generated handlers are
-//! synchronous, so each answers in place on the runtime: the camera's two
-//! answers are awaited together, for at most [`GEOMETRY_TIMEOUT`].
+//! Each request parses its fields first, a request that does not parse
+//! getting an error reply with `rejected`, then reads the perception
+//! camera's geometry from the camera linked as perception_geometry, when the
+//! robot has a perception camera and a camera is linked: the view then
+//! follows that camera's own intrinsics, depth model and depth range, and a
+//! camera that cannot give them now makes the answer an error reply with
+//! `precondition_failed`. The generated handlers are synchronous, so each
+//! answers in place on the runtime: the camera's two answers are awaited
+//! together, for at most [`GEOMETRY_TIMEOUT`].
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,7 +31,7 @@ use crate::workspace::{
 
 /// How long a request waits for each of the camera's answers: short, so a
 /// camera that does not answer leaves the caller's deadline room for the
-/// refusal that says so.
+/// error reply that says so.
 const GEOMETRY_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Serve both services for the life of the node, each on its own task, so a
@@ -56,9 +58,9 @@ async fn serve_describe(
 ) {
     serving::serve("describe_workspace", &token, || {
         describe_workspace::handle_next_request(&runner, |request| {
-            Ok(tokio::task::block_in_place(|| {
+            tokio::task::block_in_place(|| {
                 describe(&runner, &workspace, request.data.surface_height)
-            }))
+            })
         })
     })
     .await;
@@ -67,70 +69,45 @@ async fn serve_describe(
 async fn serve_check(runner: Arc<NodeRunner>, token: CancellationToken, workspace: Arc<Workspace>) {
     serving::serve("check_positions", &token, || {
         check_positions::handle_next_request(&runner, |request| {
-            Ok(tokio::task::block_in_place(|| {
-                check(&runner, &workspace, &request.data.positions)
-            }))
+            tokio::task::block_in_place(|| check(&runner, &workspace, &request.data.positions))
         })
     })
     .await;
 }
 
-/// The answer to one describe_workspace request, or its refusal.
+/// The answer to one describe_workspace request, or its error reply.
 fn describe(
     runner: &NodeRunner,
     workspace: &Workspace,
     surface_height: f64,
-) -> describe_workspace::Response {
-    let refused = |reason: String| {
-        describe_workspace::Response::new(
-            false,
-            reason,
-            String::new(),
-            false,
-            0.0,
-            None,
-            None,
-            None,
-        )
-    };
-    let height = match SurfaceHeight::from_wire(surface_height) {
-        Ok(height) => height,
-        Err(e) => return refused(e.to_string()),
-    };
-    let view_check = match read_view_check(runner, workspace) {
-        Ok(view_check) => view_check,
-        Err(e) => return refused(e.to_string()),
-    };
+) -> Result<describe_workspace::Response, describe_workspace::Failure> {
+    use describe_workspace::{Failure, FailureKind};
+    let height = SurfaceHeight::from_wire(surface_height)
+        .map_err(|e| Failure::new(FailureKind::Rejected, e.to_string()))?;
+    let view_check = read_view_check(runner, workspace)
+        .map_err(|e| Failure::new(FailureKind::PreconditionFailed, e.to_string()))?;
     let answer = workspace.describe(height, &view_check);
-    describe_workspace::Response::new(
-        true,
-        answer.message,
+    Ok(describe_workspace::Response::new(
         perception_camera_name(&view_check),
         answer.workable,
         answer.area,
         answer.rectangle,
         answer.reach,
         answer.view,
-    )
+    ))
 }
 
-/// The answer to one check_positions request, or its refusal.
+/// The answer to one check_positions request, or its error reply.
 fn check(
     runner: &NodeRunner,
     workspace: &Workspace,
     positions: &[f64],
-) -> check_positions::Response {
-    let refused = |reason: String| {
-        check_positions::Response::new(false, reason, String::new(), false, Vec::new())
-    };
-    let positions = match Positions::from_wire(positions) {
-        Ok(positions) => positions,
-        Err(e) => return refused(e.to_string()),
-    };
-    let view_check = match read_view_check(runner, workspace) {
-        Ok(view_check) => view_check,
-        Err(e) => return refused(e.to_string()),
-    };
+) -> Result<check_positions::Response, check_positions::Failure> {
+    use check_positions::{Failure, FailureKind};
+    let positions = Positions::from_wire(positions)
+        .map_err(|e| Failure::new(FailureKind::Rejected, e.to_string()))?;
+    let view_check = read_view_check(runner, workspace)
+        .map_err(|e| Failure::new(FailureKind::PreconditionFailed, e.to_string()))?;
     let answer = workspace.check(&positions, &view_check);
     let all_workable = answer.all_workable();
     let results = answer
@@ -147,13 +124,11 @@ fn check(
             message: point.message,
         })
         .collect();
-    check_positions::Response::new(
-        true,
-        answer.message,
+    Ok(check_positions::Response::new(
         perception_camera_name(&view_check),
         all_workable,
         results,
-    )
+    ))
 }
 
 /// The perception camera's name as the answers carry it: "" for a robot
@@ -193,8 +168,9 @@ fn read_view_check(
 }
 
 /// The perception camera seen through the linked camera's two answers, or
-/// why it cannot be: either answer missing or refused, or its values not a
-/// camera's.
+/// why it cannot be: either answer missing or an error reply, whose message
+/// is the reason, or its values not a camera's. A depth error reply with
+/// `rejected` is a camera that gives no depth.
 fn camera_from_answers(
     perception: &PerceptionCamera,
     colour: peppygen::Result<get_color_intrinsics::Response>,
@@ -205,15 +181,10 @@ fn camera_from_answers(
     let colour = colour
         .map_err(|e| Colour {
             camera,
-            reason: e.to_string(),
+            reason: get_color_intrinsics::Failure::of(&e)
+                .map_or_else(|| e.to_string(), |failure| failure.message),
         })?
         .data;
-    if !colour.success {
-        return Err(Colour {
-            camera,
-            reason: colour.message,
-        });
-    }
     let intrinsics = intrinsics_from_wire(
         colour.width,
         colour.height,
@@ -227,17 +198,23 @@ fn camera_from_answers(
         reason: reason.to_owned(),
     })?;
     let depth = depth
-        .map_err(|e| Depth {
-            camera,
-            reason: e.to_string(),
+        .map_err(|e| match get_depth_intrinsics::Failure::of(&e) {
+            Some(failure) if failure.kind == get_depth_intrinsics::FailureKind::Rejected => {
+                NoDepth {
+                    camera,
+                    reason: failure.message,
+                }
+            }
+            Some(failure) => Depth {
+                camera,
+                reason: failure.message,
+            },
+            None => Depth {
+                camera,
+                reason: e.to_string(),
+            },
         })?
         .data;
-    if !depth.success {
-        return Err(NoDepth {
-            camera,
-            reason: depth.message,
-        });
-    }
     let depth =
         depth_from_wire(&depth.depth_model, depth.min_depth_m, depth.max_depth_m).map_err(|e| {
             Depth {

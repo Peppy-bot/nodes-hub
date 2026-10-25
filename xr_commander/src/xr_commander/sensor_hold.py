@@ -15,9 +15,9 @@ it releases its hold on the robot it held before it holds the next one, and
 it releases its hold when the node stops. On a stack without a simulation
 the slot is vacant, and the headset holds nothing.
 
-A refused or failed hold is logged once and tried again after
-`Timing.retry_s`; until then the robot's sensors stream at 1 Hz, which the
-camera panels still show.
+A hold that gets an error reply, or whose call fails, is logged once and
+tried again after `Timing.retry_s`; until then the robot's sensors stream at
+1 Hz, which the camera panels still show.
 """
 
 from __future__ import annotations
@@ -27,6 +27,8 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from types import ModuleType
+
+import peppylib
 
 from xr_commander.bus import CancellationToken, Latch, log, ticks
 from xr_commander.devices import XrFrame
@@ -45,21 +47,11 @@ class Timing:
     follow_period_s: float = 0.2
     # A hold or a release is one round trip to the simulation.
     call_timeout_s: float = 2.0
-    # The wait before a refused or failed hold is tried again.
+    # The wait before a hold that got an error reply or failed is tried again.
     retry_s: float = 1.0
     # How long after its last XR frame a headset page still counts as in
     # session: a page reload or a short gap in tracking keeps the hold.
     session_timeout_s: float = 5.0
-
-
-@dataclass(frozen=True)
-class Answer:
-    """What the simulation answered to a hold or a release."""
-
-    success: bool
-    message: str
-    # How long a hold lasts from the call that made or renewed it (ms).
-    hold_ms: int
 
 
 class SensorStreams:
@@ -79,25 +71,29 @@ class SensorStreams:
         self._release = release_module
         self._timeout_s = timeout_s
 
-    async def hold(self, robot: str) -> Answer:
-        """Holds every sensor of `robot`, or renews that hold."""
+    async def hold(self, robot: str) -> int:
+        """Holds every sensor of `robot`, or renews that hold: how long the
+        hold lasts from this call (ms). An error reply raises the hold
+        module's Failure, a peppylib.FailureError."""
         request = self._hold.Request(robot=robot, holder=HOLDER, sensors=[])
         response = await self._hold.poll(
             self._node_runner, self._target, request, self._timeout_s
         )
-        return _answer(response.data)
+        return response.data.hold_ms
 
-    async def release(self, robot: str) -> Answer:
-        """Ends the headset's hold on `robot`."""
+    async def release(self, robot: str) -> None:
+        """Ends the headset's hold on `robot`. An error reply raises the
+        release module's Failure, a peppylib.FailureError."""
         request = self._release.Request(robot=robot, holder=HOLDER)
-        response = await self._release.poll(
-            self._node_runner, self._target, request, self._timeout_s
-        )
-        return _answer(response.data)
+        await self._release.poll(self._node_runner, self._target, request, self._timeout_s)
 
 
-def _answer(data) -> Answer:
-    return Answer(success=data.success, message=data.message, hold_ms=data.hold_ms)
+def _what_went_wrong(error: Exception) -> str:
+    """How a call to the simulation went wrong: refused, with the kind and
+    the message of its error reply, or failed."""
+    if isinstance(error, peppylib.FailureError):
+        return f"refused: {error}"
+    return f"failed: {error!r}"
 
 
 class ChosenRobotHold:
@@ -154,20 +150,16 @@ class ChosenRobotHold:
         # so the renewal lands early rather than late.
         now = self._monotonic()
         try:
-            answer = await self._streams.hold(robot)
+            hold_ms = await self._streams.hold(robot)
         except Exception as e:
-            self._failing.trip(f"sensor hold of {robot} failed: {e!r}")
-            self._renew_at = now + self.timing.retry_s
-            return
-        if not answer.success:
-            self._failing.trip(f"sensor hold of {robot} refused: {answer.message}")
+            self._failing.trip(f"sensor hold of {robot} {_what_went_wrong(e)}")
             self._renew_at = now + self.timing.retry_s
             return
         self._failing.clear()
         if not self._is_held:
             log(f"holding the sensors of {robot} at their own rate")
             self._is_held = True
-        renew_after_s = max(answer.hold_ms / 3000.0, self.timing.follow_period_s)
+        renew_after_s = max(hold_ms / 3000.0, self.timing.follow_period_s)
         self._renew_at = now + renew_after_s
 
     async def _release_held(self) -> None:
@@ -179,12 +171,9 @@ class ChosenRobotHold:
         # Not tried again: an unreleased hold lapses at the end of its hold
         # length.
         try:
-            answer = await self._streams.release(robot)
+            await self._streams.release(robot)
         except Exception as e:
-            log(f"sensor release of {robot} failed: {e!r}; the hold lapses")
-            return
-        if not answer.success:
-            log(f"sensor release of {robot} refused: {answer.message}; the hold lapses")
+            log(f"sensor release of {robot} {_what_went_wrong(e)}; the hold lapses")
             return
         if was_held:
             log(f"released the sensors of {robot}")

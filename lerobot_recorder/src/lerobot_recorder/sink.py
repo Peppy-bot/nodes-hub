@@ -203,6 +203,34 @@ def _encoded_frame_count(latest_episode: dict, video_key: str, fps: int) -> int:
     return round((end[0] - start[0]) * fps)
 
 
+@dataclass(frozen=True)
+class VideoShortfall:
+    """The frames each camera video of a saved episode misses against the
+    episode's state rows. Only the cameras whose video came up short appear
+    in `missing_by_camera`."""
+
+    missing_by_camera: dict[str, int]
+
+    @property
+    def video_frames_missing(self) -> int:
+        """The frames that the shortest video misses; 0 when every video
+        holds every frame."""
+        return max(self.missing_by_camera.values(), default=0)
+
+    def warning(self) -> str | None:
+        """An operator-grade sentence that names each short video, or None
+        when every video holds every frame."""
+        if not self.missing_by_camera:
+            return None
+        detail = ", ".join(
+            f"{key} {count}" for key, count in sorted(self.missing_by_camera.items())
+        )
+        return (
+            f"video is shorter than the state rows ({detail} frame(s) missing); "
+            f"this episode should not be trained on"
+        )
+
+
 def _vector_feature(names: list[str]) -> dict:
     return {"dtype": "float32", "shape": (len(names),), "names": names}
 
@@ -357,29 +385,21 @@ class Sink:
             frame[f"observation.images.{key}"] = image
         self._dataset.add_frame(frame)
 
-    async def save_episode(self) -> str | None:
-        """Save the open episode. Returns the reason its video cannot be
-        trusted, an operator-grade sentence, or None when the video covers
-        every row the episode wrote."""
+    async def save_episode(self) -> VideoShortfall:
+        """Save the open episode. Returns the frames its camera videos miss
+        against the rows the episode wrote."""
         assert self._dataset is not None
         assert not self._finalized, "session finalized; no further episodes"
         await asyncio.to_thread(self._dataset.save_episode)
-        return self._video_error()
+        return self._video_shortfall()
 
-    def _video_error(self) -> str | None:
-        """Name the cameras whose video came up short, or None when every one
-        of them covers the episode."""
+    def _video_shortfall(self) -> VideoShortfall:
+        """Read, from the metadata of the saved episode, the frames each of
+        its camera videos misses."""
         meta = self._dataset.meta
         latest = meta.latest_episode
         assert latest is not None, "metadata_buffer_size=1 flushes the episode on every save"
-        missing = missing_video_frames(latest, meta.video_keys, meta.fps)
-        if not missing:
-            return None
-        detail = ", ".join(f"{key} {count}" for key, count in sorted(missing.items()))
-        return (
-            f"video is shorter than the state rows ({detail} frame(s) missing); "
-            f"this episode should not be trained on"
-        )
+        return VideoShortfall(missing_video_frames(latest, meta.video_keys, meta.fps))
 
     def discard_open_frames(self) -> None:
         """Drop whatever the open episode buffered. Also the recovery path

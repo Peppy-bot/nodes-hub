@@ -1,7 +1,7 @@
 """The node under the generated harness: the answers its camera and robot
 mocks give the brain at its start, one capture of colour and depth, the
 robot's measured limbs and its moves, and the goals and services sent over
-the wire."""
+the wire, each read by how it ended."""
 
 from __future__ import annotations
 
@@ -11,7 +11,6 @@ from weakref import WeakKeyDictionary
 
 import numpy as np
 
-from peppygen import QoSProfile
 from peppygen.consumed_actions.limb_motion import move_arm, move_gripper
 from peppygen.consumed_services.camera import depth_stream_info
 from peppygen.consumed_services.camera_mounts import get_camera_poses
@@ -27,6 +26,9 @@ WAIT = 10.0
 # Search attempts made before the brain has the first capture and the
 # camera's answers; each one is a whole goal round trip.
 ATTEMPTS = 1000
+# What a search is refused with while the brain lacks the capture or the
+# camera's answers.
+NO_SOURCE = "no perception source: "
 
 PARAMS = {
     "limbs": "left_arm:left_gripper,right_arm:right_gripper",
@@ -48,20 +50,17 @@ def answer_the_camera(h) -> None:
         depth_stream_info.ResponseData(width=16, height=12, frames_per_second=15, encoding="z16", depth_unit=0.001)
     )
     h.mocks.deps.geometry.get_color_intrinsics.enqueue_response(
-        get_color_intrinsics.ResponseData(
-            success=True, message="", width=16, height=12, fx=6.0, fy=6.0, cx=8.0, cy=6.0, distortion_model="none", distortion=[]
-        )
+        get_color_intrinsics.ResponseData(width=16, height=12, fx=6.0, fy=6.0, cx=8.0, cy=6.0, distortion_model="none", distortion=[])
     )
     h.mocks.deps.geometry.get_depth_intrinsics.enqueue_response(
         get_depth_intrinsics.ResponseData(
-            success=True, message="", width=16, height=12, fx=6.0, fy=6.0, cx=8.0, cy=6.0, distortion_model="none", distortion=[],
+            width=16, height=12, fx=6.0, fy=6.0, cx=8.0, cy=6.0, distortion_model="none", distortion=[],
             depth_model="z", min_depth_m=0.1, max_depth_m=10.0, align_mode="depth_to_color",
         )
     )
     h.mocks.deps.camera_mounts.get_camera_poses.enqueue_response(
         get_camera_poses.ResponseData(
-            success=True, message="", timestamp=7.0, camera_names=["chest"], positions=[0.0, 0.0, 0.0],
-            orientations=[0.0, 0.0, 0.0, 1.0], carried_by=[""],
+            timestamp=7.0, camera_names=["chest"], positions=[0.0, 0.0, 0.0], orientations=[0.0, 0.0, 0.0, 1.0], carried_by=[""],
         )
     )
 
@@ -84,24 +83,49 @@ async def publish_a_capture(h, frame_id: int = 1) -> None:
     )
 
 
+async def ended(fixture, h, request):
+    """How a goal the node accepted ended: its result response, whose
+    status says how."""
+    goal = await fixture.send_goal(h, request, 5.0)
+    assert goal.accepted, goal.refusal
+    return await goal.get_result(WAIT)
+
+
 async def result_of(fixture, h, request):
-    goal = await fixture.send_goal(h, request, QoSProfile.Standard, 5.0)
-    assert goal.accepted, goal.reason
-    result = await goal.get_result(WAIT)
-    assert result.data is not None
+    """The result of a goal that completed."""
+    result = await ended(fixture, h, request)
+    assert result.status == fixture.ResultStatus.COMPLETED, result.failure or result.cancel_reason
     return result.data
 
 
+async def failure_of(fixture, h, request):
+    """The failure of a goal that the node accepted and that failed: its
+    kind and its message, and no result."""
+    result = await ended(fixture, h, request)
+    assert result.status == fixture.ResultStatus.FAILED, result
+    assert result.data is None
+    return result.failure
+
+
+async def refusal_of(fixture, h, request):
+    """The failure a goal the node refused carries."""
+    goal = await fixture.send_goal(h, request, 5.0)
+    assert not goal.accepted
+    return goal.refusal
+
+
 async def once_the_brain_sees(fixture, h, request):
-    """The result of the first search the brain does not refuse as having
+    """How the first search ended that the brain does not refuse as having
     no perception source: the capture and the camera's answers reach it
     after its goal loops are up. For a brain whose perception model can
     search."""
     for _ in range(ATTEMPTS):
-        data = await result_of(fixture, h, request)
-        if not data.message.startswith("no perception source: "):
-            return data
-    raise AssertionError(f"the brain never saw the capture: {data.message}")
+        goal = await fixture.send_goal(h, request, 5.0)
+        if goal.accepted:
+            return await goal.get_result(WAIT)
+        refusal = goal.refusal
+        assert refusal.kind is fixture.FailureKind.RESOURCE_UNAVAILABLE and refusal.message.startswith(NO_SOURCE), refusal
+    raise AssertionError(f"the brain never saw the capture: {refusal.message}")
 
 
 @dataclass
@@ -148,9 +172,9 @@ def grab_by_pose(position, orientation=None) -> grab_action.GoalRequestData:
 
 def plan(h, *answers: bool) -> None:
     """Scripts the backbone's next check_arm_move answers: True plans."""
-    for success in answers:
+    for reachable in answers:
         h.mocks.deps.limb_motion.check_arm_move.enqueue_response(
-            check_arm_move.ResponseData(success=success, message="" if success else "goal pose not planned", duration_s=1.0)
+            check_arm_move.ResponseData(reachable=reachable, reason="" if reachable else "goal pose not planned", duration_s=1.0)
         )
 
 
@@ -185,10 +209,7 @@ async def land_move(h) -> move_arm.GoalRequest:
     limbs.stamp += 1.0
     await publish_limbs(h)
     await active.complete(
-        move_arm.ResultResponseData(
-            success=True, message="move complete", final_position=request.position,
-            final_orientation=request.orientation, action_time=1.0,
-        )
+        move_arm.ResultResponseData(final_position=request.position, final_orientation=request.orientation, action_time=1.0)
     )
     return request
 
@@ -205,7 +226,7 @@ async def stop_grip_at(h, final_opening: float) -> move_gripper.GoalRequest:
     `final_opening`."""
     request, active = await accepted_grip(h)
     await active.complete(
-        move_gripper.ResultResponseData(success=True, message="move complete", final_opening=final_opening, action_time=0.5)
+        move_gripper.ResultResponseData(settled=True, final_opening=final_opening, action_time=0.5)
     )
     return request
 

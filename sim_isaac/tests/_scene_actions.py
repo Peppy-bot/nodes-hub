@@ -4,7 +4,9 @@ imports.
 peppygen exists only inside the node's image. The fakes are the action
 modules of the scene slot and the service modules of the scene and objects
 slots. Each generated type of a service answer builds a namespace of the
-fields it gets, so a test reads an answer with vars().
+fields it gets, so a test reads an answer with vars(). Each module has the
+Failure of its member, and each action module the GoalDecision a goal is
+admitted or refused with.
 """
 
 import importlib.util
@@ -32,10 +34,50 @@ def _answer(**fields):
     return SimpleNamespace(**fields)
 
 
-def _service_module(name: str) -> ModuleType:
+class Failure(Exception):
+    """Why a member refused or failed a goal, or gave an error reply, as the
+    generated Failure of a member holds it: a kind and a message."""
+
+    def __init__(self, kind: str, message: str) -> None:
+        super().__init__(f"{kind}: {message}")
+        self.kind = kind
+        self.message = message
+
+
+class GoalDecision:
+    """What admitting a goal answers, as the generated GoalDecision of an
+    action with no goal response holds it: the failure of a refused goal, or
+    None for an accepted one."""
+
+    def __init__(self, refusal: Failure | None) -> None:
+        self.refusal = refusal
+
+    @staticmethod
+    def accept() -> "GoalDecision":
+        return GoalDecision(None)
+
+    @staticmethod
+    def refuse(kind: str, message: str) -> "GoalDecision":
+        return GoalDecision(Failure(kind, message))
+
+
+def _member_module(name: str) -> ModuleType:
+    """A generated module of one member, with a Failure of its own."""
     module = ModuleType(name)
+    module.Failure = type("Failure", (Failure,), {"__module__": name})
+    return module
+
+
+def _service_module(name: str) -> ModuleType:
+    module = _member_module(name)
     for answer_type in _ANSWER_TYPES:
         setattr(module, answer_type, _answer)
+    return module
+
+
+def _action_module(name: str) -> ModuleType:
+    module = _member_module(name)
+    module.GoalDecision = GoalDecision
     return module
 
 
@@ -45,7 +87,7 @@ def scene_actions_module(monkeypatch, name: str) -> ModuleType:
     engine's launch puts them."""
     actions = ModuleType("peppygen.exposed_actions.scene")
     for action in _ACTIONS:
-        setattr(actions, action, ModuleType(f"{actions.__name__}.{action}"))
+        setattr(actions, action, _action_module(f"{actions.__name__}.{action}"))
     modules = {
         "peppygen": ModuleType("peppygen"),
         "peppygen.exposed_actions": ModuleType("peppygen.exposed_actions"),

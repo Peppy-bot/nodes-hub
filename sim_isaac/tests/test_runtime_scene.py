@@ -276,7 +276,6 @@ def _spawn(scene, scene_manipulation, yaw=0.0, scale=1.0):
         "asset_id": "props/blocks/red_block", "position": [0.5, 0.0, 0.8], "yaw": yaw, "scale": scale,
         "physics": "none", "mass": 0.1,
     })
-    assert result["success"]
     return result["object_id"]
 
 
@@ -346,7 +345,6 @@ def test_a_spawned_object_with_an_orientation_stands_turned_to_it_whatever_its_y
         "asset_id": "props/blocks/red_block", "position": [0.5, 0.0, 0.8], "yaw": 1.5,
         "orientation": [0.0, 0.0, 1.0, 0.0], "scale": 1.0, "physics": "none", "mass": 0.1,
     })
-    assert result["success"]
 
     prim = scene.stage.prims[f"{_OBJECTS}/{result['object_id']}"]
     assert prim.orientation == (0.0, 0.0, 1.0, 0.0)
@@ -360,7 +358,7 @@ def test_a_move_with_an_orientation_stands_the_object_anew_and_one_without_keeps
     result = scene_manipulation._execute(scene.launcher, "move_object", {
         "object_id": object_id, "position": [1.0, 0.0, 0.8], "orientation": [0.0, 0.0, 1.0, 0.0],
     })
-    assert result["success"]
+    assert result == {}
     scene.world.place.assert_called_once_with(prim, [1.0, 0.0, 0.8], (0.0, 0.0, 1.0, 0.0))
     assert (prim.translate, prim.orientation) == ((1.0, 0.0, 0.8), (0.0, 0.0, 1.0, 0.0))
 
@@ -368,7 +366,7 @@ def test_a_move_with_an_orientation_stands_the_object_anew_and_one_without_keeps
     result = scene_manipulation._execute(scene.launcher, "move_object", {
         "object_id": object_id, "position": [2.0, 0.0, 0.8],
     })
-    assert result["success"]
+    assert result == {}
     scene.world.place.assert_called_once_with(prim, [2.0, 0.0, 0.8], None)
     assert (prim.translate, prim.orientation) == ((2.0, 0.0, 0.8), (0.0, 0.0, 1.0, 0.0))
 
@@ -411,7 +409,7 @@ def test_scene_manipulation_still_removes_its_own_objects(scene, scene_manipulat
 
     result = scene_manipulation._execute(scene.launcher, "remove_object", {"object_id": object_id})
 
-    assert result == {"success": True, "message": f"Removed {object_id}"}
+    assert result == {}
     assert scene.stage.removed == [f"{_OBJECTS}/{object_id}"]
     assert not scene_manipulation.owns(object_id)
     assert _captured(scene_manipulation) == []

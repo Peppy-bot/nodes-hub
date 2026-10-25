@@ -1,9 +1,10 @@
 //! The Cartesian arm move end to end over the panel's WebSocket: firing a pose
 //! must land a `move_arm` goal on the limb_motion mock carrying the panel's
 //! plan tolerances and the operator's settle tolerances and timeout, the
-//! backbone's verdict must come back as the status as it stands, and a pose
-//! the panel's own exact IK cannot solve must still reach the backbone, whose
-//! refusal surfaces as the status.
+//! backbone's verdict must come back as the status as it stands, a pose the
+//! panel's own exact IK cannot solve must still reach the backbone, whose
+//! failure surfaces as the status, and a refusal of the backbone surfaces as
+//! the status with its kind.
 //!
 //! One booting test per binary: `ui::init_limits` is once-per-process.
 
@@ -28,6 +29,22 @@ const SETTLED_JOINTS: [f64; 7] = [0.1, 0.1, -0.2, 0.9, 0.1, -0.1, 0.0];
 const SETTLE_POSITION_TOLERANCE_M: f64 = 0.012;
 const SETTLE_ORIENTATION_TOLERANCE_RAD: f64 = 0.12;
 const SETTLE_TIMEOUT_S: f64 = 1.5;
+
+/// The panel's command that fires a pose move of the left arm to `position`
+/// and `rotation`, the fastest, with the settle fields above.
+fn left_pose_command(position: [f64; 3], rotation: &UnitQuaternion<f64>) -> String {
+    serde_json::json!({
+        "cmd": "fire_arm_pose",
+        "side": "left",
+        "position": position,
+        "orientation": [rotation.i, rotation.j, rotation.k, rotation.w],
+        "duration_s": 0.0,
+        "settle_position_tolerance_m": SETTLE_POSITION_TOLERANCE_M,
+        "settle_orientation_tolerance_rad": SETTLE_ORIENTATION_TOLERANCE_RAD,
+        "settle_timeout_s": SETTLE_TIMEOUT_S,
+    })
+    .to_string()
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn firing_a_pose_carries_the_plan_and_settle_fields_and_reports_the_backbone_verdict()
@@ -70,8 +87,6 @@ async fn firing_a_pose_carries_the_plan_and_settle_fields_and_reports_the_backbo
         .accept()
         .await?
         .complete(&move_arm_joints::ResultResponseData {
-            success: true,
-            message: String::new(),
             final_joint_positions: SETTLED_JOINTS,
             action_time: 0.1,
         })
@@ -94,21 +109,9 @@ async fn firing_a_pose_carries_the_plan_and_settle_fields_and_reports_the_backbo
     let position = [pose[0], pose[1], pose[2]];
     let rotation = UnitQuaternion::from_euler_angles(pose[3], pose[4], pose[5]);
 
-    ws.send_text(
-        &serde_json::json!({
-            "cmd": "fire_arm_pose",
-            "side": "left",
-            "position": position,
-            "orientation": [rotation.i, rotation.j, rotation.k, rotation.w],
-            "duration_s": 0.0,
-            "settle_position_tolerance_m": SETTLE_POSITION_TOLERANCE_M,
-            "settle_orientation_tolerance_rad": SETTLE_ORIENTATION_TOLERANCE_RAD,
-            "settle_timeout_s": SETTLE_TIMEOUT_S,
-        })
-        .to_string(),
-    )
-    .await
-    .expect("send fire_arm_pose");
+    ws.send_text(&left_pose_command(position, &rotation))
+        .await
+        .expect("send fire_arm_pose");
 
     let pending = mocks
         .deps
@@ -149,8 +152,6 @@ async fn firing_a_pose_carries_the_plan_and_settle_fields_and_reports_the_backbo
     // The backbone judged the settle; the panel reports its verdict as it stands.
     active
         .complete(&move_arm::ResultResponseData {
-            success: true,
-            message: "cartesian move complete".to_string(),
             final_position: goal_position,
             final_orientation: goal_orientation,
             action_time: 0.42,
@@ -165,22 +166,10 @@ async fn firing_a_pose_carries_the_plan_and_settle_fields_and_reports_the_backbo
     })
     .await;
 
-    // --- a failed settle surfaces the backbone's message --------------------
-    ws.send_text(
-        &serde_json::json!({
-            "cmd": "fire_arm_pose",
-            "side": "left",
-            "position": position,
-            "orientation": [rotation.i, rotation.j, rotation.k, rotation.w],
-            "duration_s": 0.0,
-            "settle_position_tolerance_m": SETTLE_POSITION_TOLERANCE_M,
-            "settle_orientation_tolerance_rad": SETTLE_ORIENTATION_TOLERANCE_RAD,
-            "settle_timeout_s": SETTLE_TIMEOUT_S,
-        })
-        .to_string(),
-    )
-    .await
-    .expect("send fire_arm_pose");
+    // --- a failed settle surfaces the backbone's failure ---------------------
+    ws.send_text(&left_pose_command(position, &rotation))
+        .await
+        .expect("send fire_arm_pose");
     let pending = mocks
         .deps
         .limb_motion
@@ -189,42 +178,26 @@ async fn firing_a_pose_carries_the_plan_and_settle_fields_and_reports_the_backbo
         .await?;
     let active = pending.accept().await?;
     active
-        .complete(&move_arm::ResultResponseData {
-            success: false,
-            message: "still 8.0 mm / 0.02 rad from the target, 2.0 s after the planned end"
-                .to_string(),
-            final_position: goal_position,
-            final_orientation: goal_orientation,
-            action_time: 2.9,
-        })
+        .fail(
+            move_arm::FailureKind::Timeout,
+            "still 8.0 mm / 0.02 rad from the target, 2.0 s after the planned end",
+        )
         .await?;
+    let timed_out = "move_arm (left) failed: timeout: still 8.0 mm / 0.02 rad from the target";
     ws.snapshot_until(Duration::from_secs(15), "failed settle surfaced", |s| {
         s["left_arm"]["in_flight"] == false
-            && s["status"].as_str().is_some_and(|t| {
-                t.contains("move_arm (left) failed: still 8.0 mm / 0.02 rad from the target, 2.0 s")
-            })
+            && s["status"].as_str().is_some_and(|t| t.contains(timed_out))
     })
     .await;
 
-    // --- no exact solution still fires; the backbone's refusal surfaces -----
+    // --- no exact solution still fires; the backbone's failure surfaces -----
     // Two metres out has no exact IK solution, so the preview cannot be
-    // solved; the goal must reach the backbone anyway, and its decision, the
+    // solved; the goal must reach the backbone anyway, and its failure, the
     // one naming the plan tolerance, must come back as the operator status.
-    ws.send_text(
-        &serde_json::json!({
-            "cmd": "fire_arm_pose",
-            "side": "left",
-            "position": [position[0] + 2.0, position[1], position[2]],
-            "orientation": [rotation.i, rotation.j, rotation.k, rotation.w],
-            "duration_s": 0.0,
-            "settle_position_tolerance_m": SETTLE_POSITION_TOLERANCE_M,
-            "settle_orientation_tolerance_rad": SETTLE_ORIENTATION_TOLERANCE_RAD,
-            "settle_timeout_s": SETTLE_TIMEOUT_S,
-        })
-        .to_string(),
-    )
-    .await
-    .expect("send far fire_arm_pose");
+    let far = [position[0] + 2.0, position[1], position[2]];
+    ws.send_text(&left_pose_command(far, &rotation))
+        .await
+        .expect("send far fire_arm_pose");
 
     let pending = mocks
         .deps
@@ -232,14 +205,42 @@ async fn firing_a_pose_carries_the_plan_and_settle_fields_and_reports_the_backbo
         .move_arm
         .next_goal(Duration::from_secs(10))
         .await?;
-    pending
-        .reject(Some("goal pose unreachable within 5.0 mm / 5.0 deg"))
+    let active = pending.accept().await?;
+    active
+        .fail(
+            move_arm::FailureKind::Unreachable,
+            "goal pose not planned within 5.0 mm / 5.0 deg",
+        )
         .await?;
+    let unreachable = "move_arm (left) failed: unreachable: goal pose not planned within 5.0 mm";
+    ws.snapshot_until(Duration::from_secs(15), "backbone failure surfaced", |s| {
+        s["left_arm"]["in_flight"] == false
+            && s["status"]
+                .as_str()
+                .is_some_and(|t| t.contains(unreachable))
+    })
+    .await;
+
+    // --- a refusal surfaces with its kind ------------------------------------
+    ws.send_text(&left_pose_command(position, &rotation))
+        .await
+        .expect("send fire_arm_pose");
+    let pending = mocks
+        .deps
+        .limb_motion
+        .move_arm
+        .next_goal(Duration::from_secs(10))
+        .await?;
+    pending
+        .refuse(
+            move_arm::FailureKind::LeaderStreaming,
+            "a leader is streaming arm commands",
+        )
+        .await?;
+    let refused = "backbone refused the pose goal: leader_streaming: a leader is streaming";
     ws.snapshot_until(Duration::from_secs(15), "backbone refusal surfaced", |s| {
         s["left_arm"]["in_flight"] == false
-            && s["status"].as_str().is_some_and(|t| {
-                t.contains("backbone rejected the pose goal") && t.contains("5.0 mm")
-            })
+            && s["status"].as_str().is_some_and(|t| t.contains(refused))
     })
     .await;
 

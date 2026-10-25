@@ -8,6 +8,7 @@ from lerobot_recorder.plan import assign_camera_names, sanitize_key
 from lerobot_recorder.recording import GRIPPER_LAYOUT, LinkLayout, SourceSchema
 from lerobot_recorder.sink import (
     Sink,
+    VideoShortfall,
     build_features,
     features_mismatch,
     missing_video_frames,
@@ -328,3 +329,20 @@ def test_missing_video_frames_counts_an_absent_video_as_wholly_missing():
     most complete form, not a camera to skip."""
     meta = episode_metadata(30, {"cam0": (0.0, 1.0)})
     assert missing_video_frames(meta, ["cam0", "cam1"], 30) == {"cam1": 30}
+
+
+def test_a_whole_episode_misses_no_video_frame_and_gives_no_warning():
+    whole = VideoShortfall({})
+    assert whole.video_frames_missing == 0
+    assert whole.warning() is None
+
+
+def test_the_shortest_video_gives_the_missing_frames():
+    """The result gives one number for the episode: the frames that its
+    shortest video misses. The warning names every short video."""
+    shortfall = VideoShortfall({"cam1": 6, "cam0": 2})
+    assert shortfall.video_frames_missing == 6
+    assert shortfall.warning() == (
+        "video is shorter than the state rows (cam0 2, cam1 6 frame(s) missing); "
+        "this episode should not be trained on"
+    )

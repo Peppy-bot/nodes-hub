@@ -5,8 +5,8 @@ Every route asks for `Answer` as its structured output, so an answer is
 JSON of that shape or it is unreadable: `read_answer` validates it with
 `Answer.model_validate_json` and raises `UnreadableAnswer` otherwise, with
 no repair. `{"boxes": []}` is a valid answer, "nothing of what was asked
-is visible", and an unreadable one fails the search: the robot never acts
-on an answer the brain could not read.
+is visible", and an unreadable one fails the search with `attempt_failed`:
+the robot never acts on an answer the brain could not read.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from typing import Optional, Sequence
 
 from pydantic import BaseModel, ValidationError
 
-from brain_core.ports import ExpectedFailure
+from brain_core.ports import ExpectedFailure, FailureKind
 
 UNREADABLE = "the model's answer could not be read"
 
@@ -35,7 +35,7 @@ class UnreadableAnswer(ExpectedFailure):
     the log, never to the goal's result."""
 
     def __init__(self, text: str) -> None:
-        super().__init__(UNREADABLE)
+        super().__init__(FailureKind.ATTEMPT_FAILED, UNREADABLE)
         self.text = text
 
 

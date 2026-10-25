@@ -8,7 +8,6 @@ import asyncio
 from dataclasses import dataclass, field
 from weakref import WeakKeyDictionary
 
-from peppygen import QoSProfile
 from peppygen.consumed_actions.limb_motion import move_arm, move_gripper
 from peppygen.consumed_services.limb_motion import check_arm_move
 from peppygen.consumed_topics.limb_state import limb_states
@@ -23,11 +22,19 @@ NO_SNAPSHOT = "no limb_states snapshot received from the robot yet"
 
 
 async def result_of(fixture, h, request):
-    goal = await fixture.send_goal(h, request, QoSProfile.Standard, 5.0)
-    assert goal.accepted, goal.reason
+    """The result of a goal the node accepted and that completed."""
+    goal = await fixture.send_goal(h, request, 5.0)
+    assert goal.accepted, goal.refusal
     result = await goal.get_result(WAIT)
-    assert result.data is not None
+    assert result.status == fixture.ResultStatus.COMPLETED, result.failure or result.cancel_reason
     return result.data
+
+
+async def refusal_of(fixture, h, request):
+    """The failure a goal the node refused carries."""
+    goal = await fixture.send_goal(h, request, 5.0)
+    assert not goal.accepted
+    return goal.refusal
 
 
 @dataclass
@@ -74,9 +81,9 @@ def grab_by_pose(position, orientation=None) -> grab_action.GoalRequestData:
 
 def plan(h, *answers: bool) -> None:
     """Scripts the backbone's next check_arm_move answers: True plans."""
-    for success in answers:
+    for reachable in answers:
         h.mocks.deps.limb_motion.check_arm_move.enqueue_response(
-            check_arm_move.ResponseData(success=success, message="" if success else "goal pose not planned", duration_s=1.0)
+            check_arm_move.ResponseData(reachable=reachable, reason="" if reachable else "goal pose not planned", duration_s=1.0)
         )
 
 
@@ -111,10 +118,7 @@ async def land_move(h) -> move_arm.GoalRequest:
     limbs.stamp += 1.0
     await publish_limbs(h)
     await active.complete(
-        move_arm.ResultResponseData(
-            success=True, message="move complete", final_position=request.position,
-            final_orientation=request.orientation, action_time=1.0,
-        )
+        move_arm.ResultResponseData(final_position=request.position, final_orientation=request.orientation, action_time=1.0)
     )
     return request
 
@@ -131,7 +135,7 @@ async def stop_grip_at(h, final_opening: float) -> move_gripper.GoalRequest:
     `final_opening`."""
     request, active = await accepted_grip(h)
     await active.complete(
-        move_gripper.ResultResponseData(success=True, message="move complete", final_opening=final_opening, action_time=0.5)
+        move_gripper.ResultResponseData(settled=True, final_opening=final_opening, action_time=0.5)
     )
     return request
 

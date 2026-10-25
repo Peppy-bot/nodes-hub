@@ -15,7 +15,7 @@ kinematics module.
 | `so101_follower` | The real arm. Pure follower: `joint_link` + `gripper_link` follower slots on one node (one process must own the serial port), `component_ready`, `motor_health`, `alert`. No motion logic. |
 | `so101_leader` | The passive leader arm as a teleop device. Open-loop `joint_link` + `gripper_link` leader; staleness is the deadman (the hardware has no engage button). |
 | [`robot_initializer`](../robot_initializer) | The node every robot uses, run with `model: "so101"`: answers who the robot is on `get_identity` and whether it is ready on `is_ready`, from the follower's readiness on hardware and from the simulation standing it in a simulation, which it joins as the `so101` model. |
-| `so101_backbone` | The motion authority in between. Follower role toward whatever leads (joint, pose, or gripper streams), leader role toward the follower; exposes the `limb_motion` and `postures` move actions, the `limb_motion` services (`stop` ends every planned move in flight, whoever started it, each goal then ending as cancelled with `stopped: <reason>`; `check_arm_move` runs a `move_arm` goal's solve from the same anchor and moves nothing), the `limb_state` readout and the `workspace` services (`describe_workspace` and `check_positions`: where the arm reaches, from the design alone; see [Workspace](#workspace)). Every pose is in the URDF's `base_link` frame, the robot frame the contracts define: `+x` the way the robot faces, `+z` up. A joints-led stream passes through under the end-effector-speed governor, its only limiter; a pose-led stream is reach-clipped, solved, and rate-stepped per joint before that same governor. Move actions run minimum-jerk plans sized by the per-joint velocity caps, and Cartesian moves additionally by the EE speed caps. Each arm move completes once the measured arm stands within the settle tolerances its goal names, at or after the planned end, and fails at its settle timeout. A gripper move ramps at the gripper rate cap and, from the planned end of that travel on, completes once the measured gripper stands still, on its target or short of it where an object holds the jaws, or at its settle timeout wherever the jaws stand. Everything gates on fresh follower state. A goal on a limb a leader is streaming is refused until the stream has been silent for the deadman timeout; an admitted goal owns its limb until it ends. |
+| `so101_backbone` | The motion authority in between. Follower role toward whatever leads (joint, pose, or gripper streams), leader role toward the follower; exposes the `limb_motion` and `postures` move actions, the `limb_motion` services (`stop` ends every planned move in flight, whoever started it, each goal then ending cancelled with the reason `stopped: <reason>`; `check_arm_move` runs a `move_arm` goal's solve from the same anchor and moves nothing, and gives an error reply with the kind of the refusal to a check that `move_arm` would refuse), the `limb_state` readout and the `workspace` services (`describe_workspace` and `check_positions`: where the arm reaches, from the design alone; see [Workspace](#workspace)). Every pose is in the URDF's `base_link` frame, the robot frame the contracts define: `+x` the way the robot faces, `+z` up. A joints-led stream passes through under the end-effector-speed governor, its only limiter; a pose-led stream is reach-clipped, solved, and rate-stepped per joint before that same governor. Move actions run minimum-jerk plans sized by the per-joint velocity caps, and Cartesian moves additionally by the EE speed caps. Each arm move completes once the measured arm stands within the settle tolerances its goal names, at or after the planned end, and fails with `timeout` at its settle timeout. A gripper move ramps at the gripper rate cap and, from the planned end of that travel on, completes once the measured gripper stands still, on its target or short of it where an object holds the jaws, or at its settle timeout wherever the jaws stand. Everything gates on fresh follower state: a goal is refused with `resource_unavailable` without it, and a move fails with `resource_unavailable` when it goes stale. A goal on a limb a leader is streaming is refused with `leader_streaming` until the stream has been silent for the deadman timeout, and a goal on a limb that runs another goal with `precondition_failed`; an admitted goal owns its limb until it ends. |
 
 ```text
 so101_leader ──joint+gripper──▶ so101_backbone ──joint+gripper──▶ so101_follower
@@ -94,7 +94,9 @@ streaming small deltas rather than for reaching a pose from anywhere.
 step up to `IK_MAX_ITERATIONS` and accepts only when forward kinematics puts
 the grasp point within the goal's `plan_position_tolerance_m` and
 `plan_orientation_tolerance_rad` of the target, so a `move_arm` never moves
-the arm to a pose it did not actually reach.
+the arm to a pose it did not actually reach. A `move_arm` goal whose solve
+finds no solution fails with `unreachable`, and `check_arm_move` answers
+`reachable` false with the same reason.
 
 That verification makes refusals honest, not rare. The search stays a local
 descent from the arm's current posture, so it finds solutions on that branch
@@ -200,17 +202,18 @@ gives, with nothing on it.
   grasp point of the contracts (see [URDF](#urdf)).
 - **View.** The robot has no perception camera: its one camera, `wrist`, is
   on the arm. Thus `perception_camera` is `""`, the view of each point is
-  `no_camera`, and the messages say that the view is not checked. A point is
-  workable when the arm reaches it.
+  `no_camera`, and the message of each point says that the view is not
+  checked. A point is workable when the arm reaches it.
 
 The grid, the limits, the parsing of a request and its refusals, the reach
 memo, and the composition of each answer and its messages come from
 `workspace_core_py`, the Python bindings of `workspace_core`. Thus these
 answers read the same as the answers of the OpenArm and of a simulation. The
-backbone refuses a height that is not a finite number or that is more than
-1000 m from the base point, an empty position list, a list that does not
-divide into points of 3 values, a value that is not a finite number, and a
-coordinate more than 1000 m from the base point.
+backbone gives an error reply with `rejected` to a height that is not a
+finite number or that is more than 1000 m from the base point, an empty
+position list, a list that does not divide into points of 3 values, a value
+that is not a finite number, and a coordinate more than 1000 m from the base
+point.
 Both services read nothing of the arm and move nothing, so they answer from
 bringup, also when no follower state comes in.
 
@@ -234,12 +237,13 @@ first.
 
 When the node stops, the worker stops after the chunk that it measures. The
 worker also stops when the process of the backbone stops without a shutdown.
-If the worker stops while it has a chunk, the backbone refuses the request
-of that chunk. If the worker stops while it has no chunk, the next chunk
-starts a new worker. But if that chunk goes to the process pool of the
-worker before the pool has seen that the worker stopped, the backbone
-refuses the request of that chunk, and the chunk after it starts a new
-worker.
+If the worker stops while it has a chunk, the request of that chunk gets an
+error reply with `attempt_failed`. If the worker stops while it has no chunk,
+the next chunk starts a new worker. But if that chunk goes to the process
+pool of the worker before the pool has seen that the worker stopped, the
+request of that chunk gets the same error reply, and the chunk after it
+starts a new worker. After the node stops, each request gets an error reply
+with `resource_unavailable`.
 
 ## Serial devices
 

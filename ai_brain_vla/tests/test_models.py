@@ -12,7 +12,7 @@ from brain_core.manipulation.none import NoneManipulator
 from brain_core.manipulation.scripted import ScriptedManipulator
 from brain_core.models import Models
 from brain_core.perception.none import NoneDetector
-from brain_core.ports import Refusal, Role
+from brain_core.ports import FailureKind, Refusal, Role
 from brain_core.sequencer import Sequencer
 from conftest import FakeDetector, FakeManipulator
 
@@ -74,10 +74,12 @@ def test_each_role_offers_its_running_model_alone_in_the_present_tense():
     assert models.roles() == (Role.PERCEPTION, Role.MANIPULATION)
     assert models.names(Role.PERCEPTION) == ["sam3_siglip"] and models.names(Role.MANIPULATION) == ["none"]
     assert models.offered(Role.PERCEPTION, "sam3_siglip") == VlaEntry(Role.PERCEPTION, "sam3_siglip")
-    with pytest.raises(Refusal, match="^this brain runs only 'sam3_siglip' for perception$"):
+    with pytest.raises(Refusal, match="^this brain runs only 'sam3_siglip' for perception$") as raised:
         models.offered(Role.PERCEPTION, "none")
-    with pytest.raises(Refusal, match="^this brain runs only 'none' for manipulation$"):
+    assert raised.value.kind is FailureKind.REJECTED
+    with pytest.raises(Refusal, match="^this brain runs only 'none' for manipulation$") as raised:
         models.offered(Role.MANIPULATION, "scripted")
+    assert raised.value.kind is FailureKind.REJECTED
 
 
 async def test_the_start_builds_each_model_once_and_a_switch_to_it_hands_back_the_same():

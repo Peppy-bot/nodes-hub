@@ -97,16 +97,16 @@
             },
           },
         },
-        // Refuses a share of reachable poses. The solver is lerobot's, a
-        // single QP step iterated until forward kinematics verifies the
-        // position, so the search is a local descent from the arm's current
-        // posture and finds only what that branch reaches. Measured on poses
-        // that are reachable by construction: 14% refused from the calibration
-        // middle (every joint at zero), 39% from an arbitrary posture,
-        // concentrated near the base (25% within 0.23 m, 7% beyond 0.45 m). A
-        // refusal means this branch did not reach the pose, not that the arm
-        // cannot; the same target often solves from a different starting
-        // posture. See so101/README.md.
+        // Fails a share of reachable poses with `unreachable`. The solver is
+        // lerobot's, a single QP step iterated until forward kinematics
+        // verifies the position, so the search is a local descent from the
+        // arm's current posture and finds only what that branch reaches.
+        // Measured on poses that are reachable by construction: 14% not
+        // solved from the calibration middle (every joint at zero), 39% from
+        // an arbitrary posture, concentrated near the base (25% within
+        // 0.23 m, 7% beyond 0.45 m). Such a failure means this branch did not
+        // reach the pose, not that the arm cannot; the same target often
+        // solves from a different starting posture. See so101/README.md.
         //
         // The solve is verified against the goal's plan tolerances: the
         // distance and the angle between the planned and the commanded

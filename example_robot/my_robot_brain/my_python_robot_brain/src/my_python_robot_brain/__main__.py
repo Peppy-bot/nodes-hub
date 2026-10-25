@@ -1,6 +1,6 @@
 import asyncio
 
-from peppygen import NodeBuilder, NodeRunner, QoSProfile
+from peppygen import NodeBuilder, NodeRunner
 from peppygen.parameters import Parameters
 from peppygen.consumed_actions.robot_controller import move_arm as arm
 from peppygen.consumed_topics.camera import video_stream as video_stream
@@ -8,14 +8,33 @@ from peppygen.consumed_topics.camera import video_stream as video_stream
 from my_python_robot_brain.frames import LatestValueMailbox
 
 
+def _accepted_handle(side: str, fired):
+    """The handle of a goal the arm accepted. A goal that could not be fired
+    or that the arm refused is logged, with the kind and message of the
+    refusal, and gives None."""
+    if isinstance(fired, Exception):
+        print(f"[brain] Failed to fire the {side} arm goal: {fired}")
+        return None
+    if fired.refusal is not None:
+        print(f"[brain] {side} arm goal refused: {fired.refusal}")
+        return None
+    print(f"[brain] {side} arm goal accepted")
+    return fired
+
+
 def _log_arm_result(side: str, result) -> None:
     # get_result returns a typed terminal outcome rather than raising, so map
-    # each status. Completed/Cancelled carry the result payload; Abandoned and
-    # Expired do not.
+    # each status. Completed/Cancelled carry the result payload, Failed the
+    # failure kind and message; Abandoned and Expired carry nothing.
     if result.status == arm.ResultStatus.COMPLETED:
         print(f"[brain] {side} arm completed at position: {result.data.final_position}")
+    elif result.status == arm.ResultStatus.FAILED:
+        print(f"[brain] {side} arm failed: {result.failure}")
     elif result.status == arm.ResultStatus.CANCELLED:
-        print(f"[brain] {side} arm cancelled at position: {result.data.final_position}")
+        print(
+            f"[brain] {side} arm cancelled ({result.cancel_reason}) "
+            f"at position: {result.data.final_position}"
+        )
     elif result.status == arm.ResultStatus.ABANDONED:
         print(f"[brain] {side} arm abandoned the goal without a result")
     else:  # ResultStatus.EXPIRED
@@ -77,36 +96,19 @@ async def ai_process(node_runner: NodeRunner, latest_frame: LatestValueMailbox):
                 arm.bound_producer(node_runner),
                 left_goal,
                 goal_timeout,
-                QoSProfile.Standard,
             ),
             arm.ActionHandle.fire_goal(
                 node_runner,
                 arm.bound_producer(node_runner),
                 right_goal,
                 goal_timeout,
-                QoSProfile.Standard,
             ),
             return_exceptions=True,
         )
 
         # Get the action handles from accepted goals
-        left_handle = None
-        if isinstance(left_goal_result, Exception):
-            print(f"Failed to fire left arm goal: {left_goal_result}")
-        elif left_goal_result.accepted:
-            print("[brain] Left arm goal accepted")
-            left_handle = left_goal_result
-        else:
-            print("[brain] Left arm goal rejected")
-
-        right_handle = None
-        if isinstance(right_goal_result, Exception):
-            print(f"Failed to fire right arm goal: {right_goal_result}")
-        elif right_goal_result.accepted:
-            print("[brain] Right arm goal accepted")
-            right_handle = right_goal_result
-        else:
-            print("[brain] Right arm goal rejected")
+        left_handle = _accepted_handle("Left", left_goal_result)
+        right_handle = _accepted_handle("Right", right_goal_result)
 
         # Wait for results from both arms concurrently (only if goals were accepted)
         if left_handle and right_handle:

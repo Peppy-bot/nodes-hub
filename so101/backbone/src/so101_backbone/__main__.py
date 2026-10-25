@@ -42,7 +42,7 @@ from so101_description.setpoints import parse_gripper_setpoint, parse_joint_setp
 
 from so101_backbone import params as params_mod
 from so101_backbone import workspace_service
-from so101_backbone.actions import HOME_DONE, READY_DONE, ActionLayer, PendingSlot, serve
+from so101_backbone.actions import ActionLayer, PendingSlot, Refusal, serve
 from so101_backbone.coordinator import (
     STALE_WIRE_TIMEOUT_S,
     Coordinator,
@@ -428,14 +428,10 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
                lambda p: layer.decide_arm_joints(move_arm_joints, p),
                layer.drive_arm, "move_arm_joints"),
         server(move_to_ready,
-               lambda p: layer.decide_posture(
-                   move_to_ready, postures.READY_POSITIONS_RAD, READY_DONE, p
-               ),
+               lambda p: layer.decide_posture(move_to_ready, postures.READY_POSITIONS_RAD, p),
                drive_posture, "move_to_ready"),
         server(move_to_home,
-               lambda p: layer.decide_posture(
-                   move_to_home, postures.HOME_POSITIONS_RAD, HOME_DONE, p
-               ),
+               lambda p: layer.decide_posture(move_to_home, postures.HOME_POSITIONS_RAD, p),
                drive_posture, "move_to_home"),
         server(move_arm,
                lambda p: layer.decide_pose(move_arm, p),
@@ -451,18 +447,23 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
     )
 
     def on_stop(request) -> stop.Response:
-        stopped = layer.stop_moves(request.data.reason)
-        message = f"stopped {', '.join(stopped)}" if stopped else "nothing was moving"
-        return stop.Response(success=True, message=message, stopped=stopped)
+        return stop.Response(stopped=layer.stop_moves(request.data.reason))
 
     async def on_check_arm_move(request) -> check_arm_move.Response:
         d = request.data
-        success, message, duration_s = await layer.check_arm_move(
-            d.arm_name, tuple(d.position), tuple(d.orientation), d.duration_s,
-            d.plan_position_tolerance_m, d.plan_orientation_tolerance_rad,
-            check_solver, kinematics,
+        try:
+            check = await layer.check_arm_move(
+                d.arm_name, tuple(d.position), tuple(d.orientation), d.duration_s,
+                d.plan_position_tolerance_m, d.plan_orientation_tolerance_rad,
+                check_solver, kinematics,
+            )
+        except Refusal as e:
+            # The error reply of a check that move_arm would refuse, with
+            # the kind of that refusal.
+            raise check_arm_move.Failure(e.kind, str(e)) from None
+        return check_arm_move.Response(
+            reachable=check.reachable, reason=check.reason, duration_s=check.duration_s
         )
-        return check_arm_move.Response(success=success, message=message, duration_s=duration_s)
 
     tasks.append(asyncio.create_task(runtime.serve(node_runner, stop, on_stop, "stop")))
     tasks.append(

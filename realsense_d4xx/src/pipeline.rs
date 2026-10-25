@@ -19,7 +19,7 @@ use realsense_rust::{
     config::Config,
     context::Context,
     frame::{ColorFrame, DepthFrame, ImageFrame},
-    kind::{Rs2DistortionModel, Rs2Format, Rs2Option, Rs2StreamKind},
+    kind::{OptionSetError, Rs2DistortionModel, Rs2Exception, Rs2Format, Rs2Option, Rs2StreamKind},
     pipeline::{ActivePipeline, FrameWaitError, InactivePipeline},
     processing_blocks::align::Align,
     sensor::Sensor,
@@ -104,6 +104,47 @@ pub struct Capture {
 struct Sensors {
     color: Sensor,
     depth: Sensor,
+}
+
+/// Why an option write gave no value: the failure kind of peppy that
+/// says why, and the reason in words.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlFailure {
+    pub kind: ControlFailureKind,
+    pub message: String,
+}
+
+/// The failure kinds of peppy that an option write gives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlFailureKind {
+    /// The device does not offer the option, or does not take the value.
+    Rejected,
+    /// The device is disconnected.
+    ResourceUnavailable,
+    /// The write failed for another reason.
+    AttemptFailed,
+}
+
+impl ControlFailure {
+    /// The failure of a write of `option` that librealsense refused.
+    fn of_option_write(option: Rs2Option, error: OptionSetError) -> Self {
+        let kind = match &error {
+            OptionSetError::OptionNotSupported
+            | OptionSetError::OptionIsReadOnly
+            | OptionSetError::CouldNotSetOption(
+                Rs2Exception::InvalidValue | Rs2Exception::NotImplemented,
+                _,
+            ) => ControlFailureKind::Rejected,
+            OptionSetError::CouldNotSetOption(Rs2Exception::CameraDisconnected, _) => {
+                ControlFailureKind::ResourceUnavailable
+            }
+            OptionSetError::CouldNotSetOption(..) => ControlFailureKind::AttemptFailed,
+        };
+        Self {
+            kind,
+            message: format!("set {option:?}: {error}"),
+        }
+    }
 }
 
 /// Handle for runtime control.
@@ -287,25 +328,29 @@ impl PipelineHandle {
             .map_err(Clone::clone)
     }
 
-    fn set_color_option(&self, option: Rs2Option, value: f32) -> Result<(), String> {
+    fn set_color_option(&self, option: Rs2Option, value: f32) -> Result<(), ControlFailure> {
         let mut sensors = self.sensors.lock().unwrap_or_else(|p| p.into_inner());
         sensors
             .color
             .set_option(option, value)
-            .map_err(|e| format!("{e}"))
+            .map_err(|error| ControlFailure::of_option_write(option, error))
     }
 
-    fn set_depth_option(&self, option: Rs2Option, value: f32) -> Result<(), String> {
+    fn set_depth_option(&self, option: Rs2Option, value: f32) -> Result<(), ControlFailure> {
         let mut sensors = self.sensors.lock().unwrap_or_else(|p| p.into_inner());
         sensors
             .depth
             .set_option(option, value)
-            .map_err(|e| format!("{e}"))
+            .map_err(|error| ControlFailure::of_option_write(option, error))
     }
 
     /// `mode = Auto` sets `EnableAutoExposure` on; `mode = Manual` sets
     /// it off and writes `value` (microseconds) to `Exposure`.
-    pub fn set_color_exposure(&self, mode: AutoManualMode, value: i32) -> Result<(), String> {
+    pub fn set_color_exposure(
+        &self,
+        mode: AutoManualMode,
+        value: i32,
+    ) -> Result<(), ControlFailure> {
         self.set_color_option(
             Rs2Option::EnableAutoExposure,
             if mode.is_auto() { 1.0 } else { 0.0 },
@@ -322,7 +367,7 @@ impl PipelineHandle {
         &self,
         mode: AutoManualMode,
         temperature: i32,
-    ) -> Result<(), String> {
+    ) -> Result<(), ControlFailure> {
         self.set_color_option(
             Rs2Option::EnableAutoWhiteBalance,
             if mode.is_auto() { 1.0 } else { 0.0 },
@@ -333,23 +378,23 @@ impl PipelineHandle {
         Ok(())
     }
 
-    pub fn set_color_gain(&self, value: i32) -> Result<(), String> {
+    pub fn set_color_gain(&self, value: i32) -> Result<(), ControlFailure> {
         self.set_color_option(Rs2Option::Gain, value as f32)
     }
 
-    pub fn set_color_brightness(&self, value: i32) -> Result<(), String> {
+    pub fn set_color_brightness(&self, value: i32) -> Result<(), ControlFailure> {
         self.set_color_option(Rs2Option::Brightness, value as f32)
     }
 
-    pub fn set_color_contrast(&self, value: i32) -> Result<(), String> {
+    pub fn set_color_contrast(&self, value: i32) -> Result<(), ControlFailure> {
         self.set_color_option(Rs2Option::Contrast, value as f32)
     }
 
-    pub fn set_depth_gain(&self, value: i32) -> Result<(), String> {
+    pub fn set_depth_gain(&self, value: i32) -> Result<(), ControlFailure> {
         self.set_depth_option(Rs2Option::Gain, value as f32)
     }
 
-    pub fn set_depth_laser_power_mw(&self, value: i32) -> Result<(), String> {
+    pub fn set_depth_laser_power_mw(&self, value: i32) -> Result<(), ControlFailure> {
         self.set_depth_option(Rs2Option::LaserPower, value as f32)
     }
 }
@@ -608,5 +653,68 @@ mod tests {
             Distortion::KannalaBrandt4
         );
         assert_eq!(distortion_of(9001), Distortion::Unknown(9001));
+    }
+
+    /// A device that does not offer the option or the value refuses it, a
+    /// device that is gone is unavailable, and any other refusal of
+    /// librealsense is a failed attempt.
+    #[test]
+    fn each_refused_option_write_gives_the_kind_of_its_cause() {
+        let kind_of = |error| ControlFailure::of_option_write(Rs2Option::Gain, error).kind;
+        let sdk = |exception| OptionSetError::CouldNotSetOption(exception, "why".to_string());
+        assert_eq!(
+            kind_of(OptionSetError::OptionNotSupported),
+            ControlFailureKind::Rejected
+        );
+        assert_eq!(
+            kind_of(OptionSetError::OptionIsReadOnly),
+            ControlFailureKind::Rejected
+        );
+        assert_eq!(
+            kind_of(sdk(Rs2Exception::InvalidValue)),
+            ControlFailureKind::Rejected
+        );
+        assert_eq!(
+            kind_of(sdk(Rs2Exception::NotImplemented)),
+            ControlFailureKind::Rejected
+        );
+        assert_eq!(
+            kind_of(sdk(Rs2Exception::CameraDisconnected)),
+            ControlFailureKind::ResourceUnavailable
+        );
+        for exception in [
+            Rs2Exception::Unknown,
+            Rs2Exception::Backend,
+            Rs2Exception::WrongApiCallSequence,
+            Rs2Exception::DeviceInRecoveryMode,
+            Rs2Exception::IoDeviceFailure,
+        ] {
+            assert_eq!(
+                kind_of(sdk(exception)),
+                ControlFailureKind::AttemptFailed,
+                "{exception}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refused_option_write_names_the_option_and_the_reason() {
+        let failure = ControlFailure::of_option_write(
+            Rs2Option::LaserPower,
+            OptionSetError::CouldNotSetOption(
+                Rs2Exception::InvalidValue,
+                "value out of range".to_string(),
+            ),
+        );
+        assert!(
+            failure.message.contains("LaserPower"),
+            "{}",
+            failure.message
+        );
+        assert!(
+            failure.message.contains("value out of range"),
+            "{}",
+            failure.message
+        );
     }
 }

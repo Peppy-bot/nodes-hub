@@ -5,10 +5,10 @@
     tag: "v1",
     implements: [
       { name: "rgb_camera", tag: "v1", link_id: "camera" },
-      // A UVC device carries no calibration, so every member refuses and
-      // says why. It is implemented so a consumer of a wrist camera meets
-      // the same surface on hardware as in simulation; the intrinsics
-      // arrive with calibration-file loading, a change of its own.
+      // A UVC device carries no calibration, so every member gives an
+      // error reply with `rejected` that says why. It is implemented so a
+      // consumer of a wrist camera meets the same surface on hardware as in
+      // simulation.
       { name: "camera_geometry", tag: "v1", link_id: "geometry" },
     ],
     labels: [

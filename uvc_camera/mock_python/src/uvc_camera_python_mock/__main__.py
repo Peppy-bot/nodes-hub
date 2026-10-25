@@ -299,9 +299,7 @@ async def listen_for_control_acks(
                 service.handle_next_request(
                     node_runner,
                     lambda request: service.Response(
-                        success=True,
-                        message=f"mock: {name} acknowledged",
-                        **{response_field: getattr(request.data, request_field)},
+                        **{response_field: getattr(request.data, request_field)}
                     ),
                 ),
                 token,

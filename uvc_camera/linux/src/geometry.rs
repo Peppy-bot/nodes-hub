@@ -3,9 +3,8 @@
 //! A UVC device carries no calibration: the driver knows the stream's size
 //! and nothing about where its pixels point. The contract is implemented so a
 //! consumer of a wrist camera meets the same surface on hardware as in
-//! simulation, and every member refuses and says why, so the consumer learns
-//! there is nothing to use instead of reading zeros as a pinhole model. The
-//! intrinsics arrive with calibration-file loading, a change of its own.
+//! simulation, and every member gives an error reply with `rejected` that
+//! says why, so the consumer learns there is nothing to use.
 
 use std::sync::Arc;
 
@@ -20,51 +19,29 @@ pub const NO_CALIBRATION_MESSAGE: &str = "no calibration: this camera needs a ca
 /// camera uses for the same question.
 pub const NO_DEPTH_STREAM_MESSAGE: &str = "a colour camera has no depth stream";
 
-pub fn color_intrinsics() -> get_color_intrinsics::Response {
-    get_color_intrinsics::Response::new(
-        false,
-        NO_CALIBRATION_MESSAGE.to_string(),
-        0,
-        0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        String::new(),
-        Vec::new(),
-    )
+pub fn color_intrinsics() -> Result<get_color_intrinsics::Response, get_color_intrinsics::Failure> {
+    Err(get_color_intrinsics::Failure::new(
+        get_color_intrinsics::FailureKind::Rejected,
+        NO_CALIBRATION_MESSAGE,
+    ))
 }
 
-pub fn depth_intrinsics() -> get_depth_intrinsics::Response {
-    get_depth_intrinsics::Response::new(
-        false,
-        NO_DEPTH_STREAM_MESSAGE.to_string(),
-        0,
-        0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        String::new(),
-        Vec::new(),
-        String::new(),
-        0.0,
-        0.0,
-        String::new(),
-    )
+pub fn depth_intrinsics() -> Result<get_depth_intrinsics::Response, get_depth_intrinsics::Failure> {
+    Err(get_depth_intrinsics::Failure::new(
+        get_depth_intrinsics::FailureKind::Rejected,
+        NO_DEPTH_STREAM_MESSAGE,
+    ))
 }
 
-pub fn depth_to_color_extrinsics() -> get_depth_to_color_extrinsics::Response {
-    get_depth_to_color_extrinsics::Response::new(
-        false,
-        NO_DEPTH_STREAM_MESSAGE.to_string(),
-        String::new(),
-        [0.0; 3],
-        [0.0; 4],
-    )
+pub fn depth_to_color_extrinsics()
+-> Result<get_depth_to_color_extrinsics::Response, get_depth_to_color_extrinsics::Failure> {
+    Err(get_depth_to_color_extrinsics::Failure::new(
+        get_depth_to_color_extrinsics::FailureKind::Rejected,
+        NO_DEPTH_STREAM_MESSAGE,
+    ))
 }
 
-/// One camera_geometry service answering its fixed refusal.
+/// One camera_geometry service answering its fixed error reply.
 macro_rules! listen_for_geometry_requests {
     ($fn_name:ident, $service:ident, $respond:ident) => {
         pub async fn $fn_name(node_runner: Arc<peppygen::NodeRunner>) {
@@ -73,7 +50,7 @@ macro_rules! listen_for_geometry_requests {
                 let result = tokio::select! {
                     _ = cancel_token.cancelled() => break,
                     result = $service::handle_next_request(&node_runner, |_request| {
-                        Ok($respond())
+                        $respond()
                     }) => result,
                 };
                 if let Err(e) = result {
@@ -106,32 +83,23 @@ mod tests {
 
     #[test]
     fn colour_intrinsics_refuse_for_want_of_a_calibration() {
-        let color = color_intrinsics();
-        assert!(!color.success);
-        assert_eq!(color.message, NO_CALIBRATION_MESSAGE);
-        // Nothing a consumer could take for a pinhole model.
-        assert_eq!((color.width, color.height), (0, 0));
-        assert_eq!(
-            (color.fx, color.fy, color.cx, color.cy),
-            (0.0, 0.0, 0.0, 0.0)
-        );
-        assert!(color.distortion_model.is_empty() && color.distortion.is_empty());
+        let refusal = color_intrinsics().unwrap_err();
+        assert_eq!(refusal.kind, get_color_intrinsics::FailureKind::Rejected);
+        assert_eq!(refusal.message, NO_CALIBRATION_MESSAGE);
     }
 
     #[test]
     fn the_depth_services_refuse_for_want_of_a_depth_stream() {
-        let depth = depth_intrinsics();
-        assert!(!depth.success);
-        assert_eq!(depth.message, NO_DEPTH_STREAM_MESSAGE);
-        assert_eq!((depth.width, depth.height, depth.fx), (0, 0, 0.0));
-        assert!(depth.depth_model.is_empty() && depth.align_mode.is_empty());
+        let refusal = depth_intrinsics().unwrap_err();
+        assert_eq!(refusal.kind, get_depth_intrinsics::FailureKind::Rejected);
+        assert_eq!(refusal.message, NO_DEPTH_STREAM_MESSAGE);
 
-        let pose = depth_to_color_extrinsics();
-        assert!(!pose.success);
-        assert_eq!(pose.message, NO_DEPTH_STREAM_MESSAGE);
-        assert!(pose.align_mode.is_empty());
-        // Not even an identity: all zeros is no rotation at all.
-        assert_eq!(pose.depth_to_color_orientation, [0.0; 4]);
+        let refusal = depth_to_color_extrinsics().unwrap_err();
+        assert_eq!(
+            refusal.kind,
+            get_depth_to_color_extrinsics::FailureKind::Rejected
+        );
+        assert_eq!(refusal.message, NO_DEPTH_STREAM_MESSAGE);
     }
 
     /// A consumer tells "this camera will never answer" from "not yet" by the

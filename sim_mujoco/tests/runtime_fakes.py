@@ -15,6 +15,8 @@ peer each payload was addressed to, so nothing here waits on a clock.
 
 from __future__ import annotations
 
+import asyncio
+import enum
 import sys
 import types
 from dataclasses import dataclass
@@ -80,22 +82,78 @@ class Subscription:
         return self._arrivals.pop(0) if self._arrivals else None
 
 
-class Decision:
-    """What admitting a goal answers: the decision, and what it carried."""
+class FailureKind(str, enum.Enum):
+    """The failure kinds of attach: the kinds of peppy, as the generated
+    module names them."""
 
-    def __init__(self, accepted: bool, payload) -> None:
-        self.accepted = accepted
-        self.payload = payload
+    ATTEMPT_FAILED = "attempt_failed"
+    TIMEOUT = "timeout"
+    PRECONDITION_FAILED = "precondition_failed"
+    RESOURCE_UNAVAILABLE = "resource_unavailable"
+    REJECTED = "rejected"
+
+
+@dataclass(frozen=True)
+class Failure:
+    """Why a goal was refused: a kind of attach and a message."""
+
+    kind: FailureKind
+    message: str
+
+
+# The reason the generated goal context gives for each cause of a cancel
+# signal, in peppy's words.
+CANCEL_REASONS = {"caller": "cancelled by its caller", "sender_gone": "its sender is gone"}
 
 
 class _GoalDecision:
-    @staticmethod
-    def accept(response) -> Decision:
-        return Decision(True, response)
+    """What admitting a goal answers, as the generated GoalDecision holds it:
+    the response of an accepted goal, or the failure of a refused one."""
+
+    def __init__(self, response, refusal: Optional[Failure]) -> None:
+        self.response = response
+        self.refusal = refusal
 
     @staticmethod
-    def reject(reason: str) -> Decision:
-        return Decision(False, reason)
+    def accept(response) -> "_GoalDecision":
+        return _GoalDecision(response, None)
+
+    @staticmethod
+    def refuse(kind, message: str) -> "_GoalDecision":
+        return _GoalDecision(None, Failure(FailureKind(kind), message))
+
+
+# Every attach action an engine exposed, in the order it exposed them.
+ATTACH_HANDLES: list = []
+
+
+class _AttachHandle:
+    """The attach action an engine exposes. It records the sender grace it
+    is given, and the sender grace it had when the engine first asked it for
+    a goal. Its goal stream is closed, as it is when the node shuts down."""
+
+    def __init__(self) -> None:
+        self.sender_grace_s: Optional[float] = None
+        self.sender_grace_s_when_served: Optional[float] = None
+
+    @classmethod
+    async def expose(cls, _node_runner) -> "_AttachHandle":
+        handle = cls()
+        ATTACH_HANDLES.append(handle)
+        return handle
+
+    async def set_sender_grace(self, seconds: float) -> None:
+        self.sender_grace_s = seconds
+
+    async def handle_goal_next_request(self, _admit) -> None:
+        self.sender_grace_s_when_served = self.sender_grace_s
+        return None
+
+
+async def _no_readiness_request(_runner, _handler) -> None:
+    """The readiness service of an engine nobody asks: it waits for a request
+    that never comes."""
+    await asyncio.Event().wait()
 
 
 @dataclass(frozen=True)
@@ -160,10 +218,13 @@ def _install() -> None:
     peppygen.clock = peppygen_clock
 
     attach = types.ModuleType("peppygen.exposed_actions.robots.attach")
+    attach.ActionHandle = _AttachHandle
+    attach.FailureKind = FailureKind
     attach.GoalDecision = _GoalDecision
     attach.GoalResponse = _GoalResponse
     is_ready = types.ModuleType("peppygen.exposed_services.robots.is_ready")
     is_ready.Response = _ReadyResponse
+    is_ready.handle_next_request = _no_readiness_request
     actions_robots = types.ModuleType("peppygen.exposed_actions.robots")
     actions_robots.attach = attach
     services_robots = types.ModuleType("peppygen.exposed_services.robots")

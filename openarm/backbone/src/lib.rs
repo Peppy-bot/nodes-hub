@@ -20,6 +20,7 @@ mod actions;
 mod arm_pair;
 mod camera_mounts;
 mod coordinator;
+mod failure;
 mod governor;
 mod liveness;
 mod node;

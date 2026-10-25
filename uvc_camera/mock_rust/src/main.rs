@@ -495,11 +495,7 @@ fn spawn_control_acks(node_runner: &Arc<peppygen::NodeRunner>) {
                     let result = tokio::select! {
                         _ = cancel_token.cancelled() => break,
                         result = $service::handle_next_request(&runner, |request| {
-                            Ok($service::Response::new(
-                                true,
-                                concat!("mock: ", stringify!($service), " acknowledged").to_string(),
-                                request.data.$request_field,
-                            ))
+                            Ok($service::Response::new(request.data.$request_field))
                         }) => result,
                     };
                     if let Err(e) = result {

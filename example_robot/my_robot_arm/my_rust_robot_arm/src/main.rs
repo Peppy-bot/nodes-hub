@@ -66,8 +66,9 @@ async fn run_action(
                 );
                 let mut flag = busy_for_decider.lock().expect("busy lock poisoned");
                 if *flag {
-                    Ok(move_arm::GoalDecision::reject(
-                        "arm is already moving".to_string(),
+                    Ok(move_arm::GoalDecision::refuse(
+                        move_arm::FailureKind::PreconditionFailed,
+                        "arm is already moving",
                     ))
                 } else {
                     *flag = true;
@@ -89,6 +90,15 @@ async fn run_action(
     Ok(())
 }
 
+/// How a goal of the arm ends.
+enum GoalEnd {
+    /// The arm reached the target of the goal, at this position.
+    Reached([i32; 3]),
+    /// The goal was cancelled, for this reason: the cause of its cancel
+    /// signal, or the arm's own words when the node stops.
+    Cancelled(&'static str),
+}
+
 async fn drive_goal(
     ctx: move_arm::GoalContext,
     current_position: Arc<Mutex<[i32; 3]>>,
@@ -101,25 +111,25 @@ async fn drive_goal(
         .expect("current_position lock poisoned");
     let duration = choose_action_duration();
 
-    let outcome = tokio::select! {
-        final_position = execute_goal(&ctx, start, target, duration, Arc::clone(&current_position)) => Some(final_position),
-        _ = ctx.cancel_signal() => None,
-        _ = token.cancelled() => None,
+    let end = tokio::select! {
+        final_position = execute_goal(&ctx, start, target, duration, Arc::clone(&current_position)) => GoalEnd::Reached(final_position),
+        _ = ctx.cancel_signal() => GoalEnd::Cancelled(ctx.cancel_cause().map_or("cancelled", |cause| cause.reason())),
+        _ = token.cancelled() => GoalEnd::Cancelled("the arm is shutting down"),
     };
 
-    match outcome {
-        Some(final_position) => {
+    match end {
+        GoalEnd::Reached(final_position) => {
             println!("[arm] move_arm completed at position: {final_position:?}");
             if let Err(e) = ctx.complete(final_position).await {
                 eprintln!("[arm] complete error: {e:?}");
             }
         }
-        None => {
+        GoalEnd::Cancelled(reason) => {
             let last_known = *current_position
                 .lock()
                 .expect("current_position lock poisoned");
-            println!("[arm] move_arm cancelled at position: {last_known:?}");
-            if let Err(e) = ctx.complete_cancelled(last_known).await {
+            println!("[arm] move_arm cancelled ({reason}) at position: {last_known:?}");
+            if let Err(e) = ctx.complete_cancelled(reason, last_known).await {
                 eprintln!("[arm] complete_cancelled error: {e:?}");
             }
         }

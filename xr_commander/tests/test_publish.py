@@ -53,21 +53,14 @@ def posture_settings():
     return config.from_parameters(default_parameters())
 
 
-def posture_result(module, success, message):
-    """A posture result as a robot sends it. The commander reads only the
-    status and the message, thus the arm pose in it is a fixed value."""
+def done(module):
+    """A posture result as a robot sends it. The commander reads only how the
+    goal ended, thus the arm pose in it is a fixed value."""
     return module.ResultResponseData(
-        success=success,
-        message=message,
         arm_names=["right_arm"],
         positions=[0.3, -0.2, 0.3],
         orientations=[0.0, 0.0, 0.0, 1.0],
     )
-
-
-def done(module):
-    """The action's success verdict, as each completed-goal assertion uses."""
-    return posture_result(module, success=True, message="done")
 
 
 class FakeSession:
@@ -167,17 +160,13 @@ async def test_a_failed_move_flashes_the_robots_reason():
             session.press(right=(True, False, False))
             pending = await mock.next_goal(10.0)
             active = await pending.accept()
-            await active.complete(
-                posture_result(
-                    move_to_home,
-                    success=False,
-                    message="the robot has not measured every limb yet",
-                )
+            await active.fail(
+                move_to_home.FailureKind.RESOURCE_UNAVAILABLE,
+                "the follower stopped reporting; check the arm's bus",
             )
             await eventually(
                 lambda: (
-                    status.state()
-                    == "move to home failed: the robot has not measured every limb yet"
+                    status.state() == "move to home failed: the follower stopped reporting"
                 )
             )
 
@@ -223,8 +212,9 @@ async def test_a_refused_posture_flashes_its_cause():
             await asyncio.sleep(0.05)
             session.press(right=(True, False, False))
             pending = await mock.next_goal(10.0)
-            await pending.reject(
-                "a leader is streaming arm commands; release the headset's grip, then retry"
+            await pending.refuse(
+                move_to_home.FailureKind.LEADER_STREAMING,
+                "a leader is streaming arm commands; release the headset's grip, then retry",
             )
             await eventually(
                 lambda: (
@@ -278,9 +268,7 @@ async def test_squeezing_cancels_the_move_in_flight():
             await asyncio.wait_for(active.cancel_signal(), 10.0)
             # The row stops claiming a move as soon as the cancel is delivered.
             await eventually(lambda: status.moving is None)
-            await active.complete_cancelled(
-                posture_result(move_to_home, success=False, message="cancelled")
-            )
+            await active.complete_cancelled("cancelled by its caller", done(move_to_home))
             await eventually(lambda: status.state() == "move to home cancelled")
             # The squeeze that cancelled must not have fired a fresh goal.
             with pytest.raises(TimeoutError):

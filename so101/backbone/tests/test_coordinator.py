@@ -6,16 +6,19 @@ from conftest import MEASURED, WIDE_LIMITS, WIDE_REACH, gripper_step, make_confi
 from control_core_py.minimum_jerk import plan
 
 from so101_backbone.coordinator import (
+    FOLLOWER_SILENT,
     GRIPPER_STILL_BAND,
     GRIPPER_STILL_WINDOW_S,
-    STALE_FOLLOWER_REFUSAL,
+    PUBLISH_FAILED,
     STALE_FOLLOWER_TIMEOUT_S,
     Coordinator,
+    PlanFailure,
     PostureEnd,
     StillRun,
     JointSettle,
     PoseSettle,
 )
+from so101_backbone.failures import FailureKind
 from so101_backbone.params import UpstreamMode
 
 FAR_TARGET = (1.0, 1.1, 1.2, 1.3, 1.4)
@@ -73,7 +76,7 @@ def test_plan_owns_the_arm_and_drops_mid_plan_stream_input(fake_kinematics):
     c = make_coordinator(fake_kinematics)
     c.measured_joints.set(MEASURED)
     assert c.try_claim_arm()
-    adopted = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 0.05, (100.0,) * 5), PostureEnd(""))
+    adopted = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 0.05, (100.0,) * 5), PostureEnd())
 
     c.leader_joints.set((9.0,) * 5)  # streamed input during the plan
     start = time.monotonic()
@@ -98,7 +101,7 @@ def test_abort_freezes_where_the_trajectory_stands(fake_kinematics):
     c = make_coordinator(fake_kinematics)
     c.measured_joints.set(MEASURED)
     assert c.try_claim_arm()
-    adopted = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 10.0, (100.0,) * 5), PostureEnd(""))
+    adopted = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 10.0, (100.0,) * 5), PostureEnd())
     # Run the trajectory well past its start before cutting it, so freezing
     # where it stands is distinguishable from reporting where it began.
     start = time.monotonic()
@@ -323,7 +326,8 @@ def test_follower_silence_fails_a_gripper_plan_in_flight(fake_kinematics, follow
     c.measured_gripper.clear()  # no measured opening left to report
     assert c.gripper_tick(1.0) is None
     assert adopted.done.is_set()
-    assert adopted.failed == STALE_FOLLOWER_REFUSAL
+    assert adopted.failed == FOLLOWER_SILENT
+    assert adopted.failed.kind is FailureKind.RESOURCE_UNAVAILABLE
     assert adopted.completed_on is None
     c.release_gripper()
 
@@ -339,7 +343,7 @@ def test_publish_failure_fails_a_gripper_plan_in_flight(fake_kinematics, followe
     assert c.gripper_tick(0.6) == 0.5
     c.gripper_published(False, None)
     assert adopted.done.is_set()
-    assert "publish failed" in adopted.failed
+    assert adopted.failed == PUBLISH_FAILED
     assert adopted.completed_on is None
     c.release_gripper()
 
@@ -416,7 +420,7 @@ def test_release_resets_anchors_to_measured(fake_kinematics):
     c = make_coordinator(fake_kinematics)
     c.measured_joints.set(MEASURED)
     assert c.try_claim_arm()
-    adopted = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 0.01, (100.0,) * 5), PostureEnd(""))
+    adopted = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 0.01, (100.0,) * 5), PostureEnd())
     start = time.monotonic()
     while not adopted.done.is_set():
         c.measured_joints.set(MEASURED)  # the live follower keeps streaming
@@ -456,12 +460,12 @@ def test_follower_staleness_fails_an_active_arm_plan(fake_kinematics):
     c = make_coordinator(fake_kinematics)
     c.measured_joints.set(MEASURED)
     assert c.try_claim_arm()
-    adopted = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 10.0, (100.0,) * 5), PostureEnd(""))
+    adopted = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 10.0, (100.0,) * 5), PostureEnd())
     assert c.arm_tick(time.monotonic()) is not None
     time.sleep(STALE_FOLLOWER_TIMEOUT_S * 1.5)
     assert c.arm_tick(time.monotonic()) is None
     assert adopted.done.is_set()
-    assert adopted.failed is not None
+    assert adopted.failed == FOLLOWER_SILENT
     c.release_arm()
 
 
@@ -475,7 +479,7 @@ def test_follower_staleness_fails_an_active_gripper_plan(fake_kinematics):
     time.sleep(STALE_FOLLOWER_TIMEOUT_S * 1.5)
     assert c.gripper_tick(time.monotonic()) is None
     assert adopted.done.is_set()
-    assert adopted.failed is not None
+    assert adopted.failed == FOLLOWER_SILENT
     c.release_gripper()
 
 
@@ -483,11 +487,11 @@ def test_publish_failure_fails_the_plan_the_setpoint_came_from(fake_kinematics):
     c = make_coordinator(fake_kinematics)
     c.measured_joints.set(MEASURED)
     assert c.try_claim_arm()
-    adopted = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 10.0, (100.0,) * 5), PostureEnd(""))
+    adopted = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 10.0, (100.0,) * 5), PostureEnd())
     assert c.arm_tick(time.monotonic()) is not None
     c.arm_published(False, None)
     assert adopted.done.is_set()
-    assert "publish failed" in adopted.failed
+    assert adopted.failed == PUBLISH_FAILED
     c.release_arm()
 
 
@@ -499,7 +503,7 @@ def test_publish_failure_with_no_plan_touches_nothing(fake_kinematics):
     # A failed streamed publish has no goal to fail; the plan installed
     # between the tick and the outcome must be untouched.
     assert c.try_claim_arm()
-    adopted = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 10.0, (100.0,) * 5), PostureEnd(""))
+    adopted = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 10.0, (100.0,) * 5), PostureEnd())
     c.arm_published(False, None)
     assert not adopted.done.is_set()
     assert adopted.failed is None
@@ -510,7 +514,7 @@ def test_final_sample_publish_failure_fails_the_goal(fake_kinematics):
     c = make_coordinator(fake_kinematics)
     c.measured_joints.set(MEASURED)
     assert c.try_claim_arm()
-    adopted = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 0.001, (1000.0,) * 5), PostureEnd(""))
+    adopted = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 0.001, (1000.0,) * 5), PostureEnd())
     start = time.monotonic()
     target = None
     while target is None:
@@ -522,7 +526,7 @@ def test_final_sample_publish_failure_fails_the_goal(fake_kinematics):
     assert not adopted.done.is_set(), "completion must wait for delivery"
     c.arm_published(False, None)
     assert adopted.done.is_set()
-    assert "publish failed" in adopted.failed
+    assert adopted.failed == PUBLISH_FAILED
     c.release_arm()
 
 
@@ -531,7 +535,7 @@ def test_gripper_streams_while_an_arm_plan_runs(fake_kinematics):
     c.measured_joints.set(MEASURED)
     c.measured_gripper.set(0.0)
     assert c.try_claim_arm()
-    c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 10.0, (100.0,) * 5), PostureEnd(""))
+    c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 10.0, (100.0,) * 5), PostureEnd())
     c.arm_tick(time.monotonic())
     # The operator can still work the gripper during a long arm move.
     c.leader_gripper.set(1.0)
@@ -592,7 +596,7 @@ def test_a_stop_cuts_every_installed_plan_with_its_message_and_names_the_limbs(f
     assert (c.stop_count, c.last_stop) == (1, "stopped: nothing yet")
 
     assert c.try_claim_arm() and c.try_claim_gripper()
-    arm_plan = c.adopt_arm_plan(make_profile(MEASURED, FAR_TARGET, 1.0, (100.0,) * 5), PostureEnd(""))
+    arm_plan = c.adopt_arm_plan(make_profile(MEASURED, FAR_TARGET, 1.0, (100.0,) * 5), PostureEnd())
     gripper_plan = adopt_gripper(c, 1.0)
     now = time.monotonic()
     sample = c.arm_tick(now)
@@ -665,7 +669,9 @@ def test_an_arm_plan_outside_its_tolerances_at_the_timeout_fails_naming_the_wors
     c.measured_joints.set(MEASURED)
     assert c.arm_tick(3.0) is None
     assert adopted.done.is_set()
-    assert adopted.failed == "still 0.700 rad from the target at joint 3, 2.0 s after the planned end"
+    assert adopted.failed == PlanFailure(
+        FailureKind.TIMEOUT, "still 0.700 rad from the target at joint 3, 2.0 s after the planned end"
+    )
     c.release_arm()
 
 

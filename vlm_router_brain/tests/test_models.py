@@ -13,7 +13,7 @@ from brain_core.manipulation.none import NoneManipulator
 from brain_core.manipulation.scripted import ScriptedManipulator
 from brain_core.models import Models
 from brain_core.perception.none import NoneDetector
-from brain_core.ports import Refusal, Role
+from brain_core.ports import FailureKind, Refusal, Role
 from brain_core.sequencer import Sequencer
 
 from vlm_router_brain.catalog import CATALOG_ROLES, load_catalog
@@ -61,12 +61,15 @@ def test_each_role_a_catalog_model_serves_has_a_builder_and_perception_builds_a_
 
 def test_a_name_the_role_does_not_accept_is_refused_pointing_to_list_models():
     models = router()
-    with pytest.raises(Refusal, match="^'sam9' is not a perception model here; see list_models$"):
+    with pytest.raises(Refusal, match="^'sam9' is not a perception model here; see list_models$") as raised:
         models.offered(Role.PERCEPTION, "sam9")
-    with pytest.raises(Refusal, match="^'fast' is not a manipulation model here; see list_models$"):
+    assert raised.value.kind is FailureKind.REJECTED
+    with pytest.raises(Refusal, match="^'fast' is not a manipulation model here; see list_models$") as raised:
         models.offered(Role.MANIPULATION, "fast")
-    with pytest.raises(Refusal, match="^'scripted' is not a perception model here; see list_models$"):
+    assert raised.value.kind is FailureKind.REJECTED
+    with pytest.raises(Refusal, match="^'scripted' is not a perception model here; see list_models$") as raised:
         models.offered(Role.PERCEPTION, "scripted")
+    assert raised.value.kind is FailureKind.REJECTED
 
 
 def test_the_start_runs_the_first_keyed_route_and_makes_no_call(caplog):
@@ -104,17 +107,19 @@ async def test_a_switch_probes_the_keyed_route_once_then_runs_on_it():
     assert len(provider.calls) == 1
 
 
-async def test_a_switch_to_a_model_with_no_keyed_route_is_refused_with_no_probe():
+async def test_a_switch_to_a_model_with_no_keyed_route_is_refused_unreachable_with_no_probe():
     provider = FakeProvider()
-    with pytest.raises(Refusal, match="^no key reaches 'careful': set OPENROUTER_API_KEY or GEMINI_API_KEY in the node's environment$"):
+    with pytest.raises(Refusal, match="^no key reaches 'careful': set OPENROUTER_API_KEY or GEMINI_API_KEY in the node's environment$") as raised:
         await router({}, provider).prepare(perceiving("careful"))
+    assert raised.value.kind is FailureKind.RESOURCE_UNAVAILABLE
     assert provider.calls == []
 
 
 async def test_a_probe_failure_fails_the_switch_with_the_providers_message():
     failure = ProviderFailure("fast", "ModelNotFoundError", "no such model", retryable=False)
-    with pytest.raises(ProviderFailure, match="^fast failed: ModelNotFoundError: no such model$"):
+    with pytest.raises(ProviderFailure, match="^fast failed: ModelNotFoundError: no such model$") as raised:
         await router(provider=FakeProvider(failure)).prepare(perceiving("fast"))
+    assert raised.value.kind is FailureKind.ATTEMPT_FAILED
 
 
 @pytest.mark.parametrize("perception, manipulation, environ, message", [

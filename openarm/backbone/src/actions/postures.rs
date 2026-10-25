@@ -1,17 +1,16 @@
 //! The postures contract's moves (move_to_ready, move_to_home): claim both
-//! arms, hand each planner an ordinary joint goal to the posture, and
-//! complete the one action goal from both terminals. Cancel flips a shared
-//! flag the moves poll, so each arm stops the way a cancelled joint move
-//! stops; the stop service ends both arms' moves the same way, and the goal
-//! ends as cancelled with the stop's message. The two actions share the
-//! arms' single-flight slots, so a posture goal arriving while the other
-//! posture runs is rejected busy.
+//! arms, hand each planner an ordinary joint goal to the posture, and end the
+//! one action goal from both terminals. Cancel flips a shared flag the moves
+//! poll, so each arm stops the way a cancelled joint move stops; the stop
+//! service ends both arms' moves the same way, and the goal ends cancelled
+//! for the stop's reason. The two actions share the arms' single-flight
+//! slots, so a posture goal arriving while the other posture runs is refused
+//! with `precondition_failed`.
 //!
-//! Whatever the terminal, the result gives the grasp pose of each arm, in
-//! limb_state's arm order. The coordinator measures both arms when the
-//! posture goal completes, after the shares of both arms ended. When an arm
-//! has no fresh measurement then, the result gives no pose, and its message
-//! says why.
+//! A goal that completes or ends cancelled gives the grasp pose of each arm,
+//! in limb_state's arm order. The coordinator measures both arms then, after
+//! the shares of both arms ended. When an arm has no fresh measurement then,
+//! the result gives no pose. A goal that fails gives no result.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,74 +19,100 @@ use peppygen::exposed_actions::postures::{move_to_home, move_to_ready};
 use peppygen::{NodeRunner, Result};
 use srs_model::nalgebra::Isometry3;
 use tokio::sync::{mpsc, oneshot};
-use tracing::error;
+use tracing::{error, warn};
 
-use crate::actions::{ARM_LEADER_STREAMING, ARM_NO_FRESH_STATE, ask_coordinator, claim};
+use crate::actions::{ARM_WORDS, ask_coordinator, check_limb_free, claim};
 use crate::arm_pair::ArmPair;
 use crate::coordinator::{CoordinatorRequest, MeasuredGrasp};
-use crate::planner::{Goal, JointReply, ReadyOutcome, ReadyReply, Unmeasured};
+use crate::failure::{Failure, FailureKind};
+use crate::planner::{Goal, JointReply, Outcome, ReadyReply, Unmeasured};
 use crate::streams::LeaderActivity;
 use crate::types::{Side, arm_pose_arrays, limb_names, move_seconds_from_wire};
 
-/// Claim both arms' single-flight slots, or name the busy arm. A failure on
-/// the second claim unwinds the first, so a refusal never leaves a slot held.
-fn claim_both(busy: &[Arc<AtomicBool>; 2]) -> std::result::Result<(), &'static str> {
+/// Claim both arms' single-flight slots, or refuse with
+/// `precondition_failed`, naming the busy arm. A failure on the second claim
+/// unwinds the first, so a refusal never leaves a slot held.
+fn claim_both(busy: &[Arc<AtomicBool>; 2]) -> std::result::Result<(), Failure> {
+    let busy_arm = |message: &str| Failure::new(FailureKind::PreconditionFailed, message);
     if !claim(&busy[Side::Left.index()]) {
-        return Err("the left arm is already executing a motion");
+        return Err(busy_arm("the left arm is already executing a motion"));
     }
     if !claim(&busy[Side::Right.index()]) {
         busy[Side::Left.index()].store(false, Ordering::Release);
-        return Err("the right arm is already executing a motion");
+        return Err(busy_arm("the right arm is already executing a motion"));
     }
     Ok(())
 }
 
-/// How the whole-robot goal completes.
-#[derive(Debug, PartialEq, Eq)]
-enum Terminal {
-    Success,
-    Failed,
-    Cancelled,
+/// Admit a posture goal of `duration_s`: a duration the robot takes
+/// (`rejected` otherwise), both arms free ([`check_limb_free`] over both),
+/// then both arms claimed.
+fn admit_posture(
+    duration_s: f64,
+    fresh: &[Arc<AtomicBool>; 2],
+    activity: &[LeaderActivity; 2],
+    busy: &[Arc<AtomicBool>; 2],
+) -> std::result::Result<(), Failure> {
+    move_seconds_from_wire("duration_s", duration_s)
+        .map_err(|reason| Failure::new(FailureKind::Rejected, reason))?;
+    check_limb_free(
+        fresh.iter().all(|arm| arm.load(Ordering::Acquire)),
+        activity.iter().any(LeaderActivity::streaming),
+        &ARM_WORDS,
+    )?;
+    claim_both(busy)
+}
+
+/// How a posture goal ends.
+#[derive(Debug, PartialEq)]
+enum PostureEnd {
+    /// Both moves ran their time out. The governor can hold an arm short and
+    /// an object can stop it, so it does not mean the arms arrived.
+    Completed,
+    /// Cancelled for this reason: by the goal's caller, or by the stop.
+    Cancelled(String),
+    /// A move failed, or a planner did not take or answer its share.
+    Failed(Failure),
 }
 
 /// Judge the end of a posture move from what actually came back: the goals
-/// dispatched, the outcomes received, and whether a cancel was seen. Cancel
-/// wins whatever the outcomes say; a stop ends the goal as cancelled with
-/// the stop's message; otherwise success requires both arms dispatched and
-/// both outcomes successful (reported as `done`), and the message names the
-/// first thing that went wrong.
-fn summarize(
-    pending: usize,
-    outcomes: &[ReadyOutcome],
-    cancelled: bool,
-    done: &str,
-) -> (Terminal, String) {
-    if cancelled {
-        return (Terminal::Cancelled, "goal cancelled".to_string());
+/// dispatched, the outcomes received, and `cancel`, the reason of the goal's
+/// own cancel. The goal's own cancel wins whatever the outcomes say; a share
+/// the stop ended ends the goal cancelled for the stop's reason; otherwise
+/// the goal completes when both arms were dispatched and both shares
+/// completed, and fails with the first thing that went wrong.
+fn summarize(pending: usize, outcomes: &[Outcome], cancel: Option<String>) -> PostureEnd {
+    if let Some(reason) = cancel {
+        return PostureEnd::Cancelled(reason);
     }
-    if let Some(stopped) = outcomes.iter().find(|o| o.stopped) {
-        return (Terminal::Cancelled, stopped.message.clone());
+    let stop = outcomes.iter().find_map(|outcome| match outcome {
+        Outcome::Cancelled(reason) => Some(reason),
+        _ => None,
+    });
+    if let Some(reason) = stop {
+        return PostureEnd::Cancelled(reason.clone());
     }
+    let planner_failure = |message: &str| Failure::new(FailureKind::AttemptFailed, message);
     if pending < 2 {
-        return (
-            Terminal::Failed,
-            "an arm's planner is unavailable".to_string(),
-        );
+        return PostureEnd::Failed(planner_failure("an arm's planner is unavailable"));
     }
     if outcomes.len() < pending {
-        return (Terminal::Failed, "a planner dropped the move".to_string());
+        return PostureEnd::Failed(planner_failure("a planner dropped the move"));
     }
-    match outcomes.iter().find(|o| !o.success) {
-        Some(failed) => (Terminal::Failed, failed.message.clone()),
-        None => (Terminal::Success, done.to_string()),
+    let failure = outcomes.iter().find_map(|outcome| match outcome {
+        Outcome::Failed(failure) => Some(failure),
+        _ => None,
+    });
+    match failure {
+        Some(failure) => PostureEnd::Failed(failure.clone()),
+        None => PostureEnd::Completed,
     }
 }
 
-/// What a posture goal completes with.
+/// The poses a posture result gives: the grasp pose of each arm in
+/// [`Side::ARM_NAMES`] order, or none.
 #[derive(Debug)]
-struct PostureResult {
-    terminal: Terminal,
-    message: String,
+struct ArmPoses {
     arm_names: Vec<String>,
     positions: Vec<f64>,
     orientations: Vec<f64>,
@@ -126,57 +151,39 @@ fn measured_poses(answer: GraspAnswer) -> std::result::Result<ArmPair<Isometry3<
     Ok(ArmPair::new(pose(Side::Left)?, pose(Side::Right)?))
 }
 
-/// The result of a posture goal:
-/// - the terminal and the message that [`summarize`] gives;
-/// - the grasp pose of every arm in `answer`, in [`Side::ARM_NAMES`] order.
-///
-/// The result gives the poses whatever the terminal. When an arm has no
-/// grasp pose, the three arrays are empty and the message says why.
-fn posture_result(
-    pending: usize,
-    outcomes: &[ReadyOutcome],
-    cancelled: bool,
-    done: &str,
-    answer: GraspAnswer,
-) -> PostureResult {
-    let (terminal, message) = summarize(pending, outcomes, cancelled, done);
+/// The poses of a posture result from `answer`: every arm's grasp pose, or
+/// no pose at all when an arm has no fresh measurement or the coordinator
+/// does not answer. The log of `action` says why there is none.
+fn arm_poses(answer: GraspAnswer, action: &str) -> ArmPoses {
     match measured_poses(answer) {
         Ok(poses) => {
             let (positions, orientations) = arm_pose_arrays(&poses);
-            PostureResult {
-                terminal,
-                message,
+            ArmPoses {
                 arm_names: limb_names().arm_names,
                 positions,
                 orientations,
             }
         }
-        Err(reason) => PostureResult {
-            terminal,
-            message: format!("{message}; no arm poses: {reason}"),
-            arm_names: Vec::new(),
-            positions: Vec::new(),
-            orientations: Vec::new(),
-        },
+        Err(reason) => {
+            warn!("{action}: the result gives no arm poses: {reason}");
+            ArmPoses {
+                arm_names: Vec::new(),
+                positions: Vec::new(),
+                orientations: Vec::new(),
+            }
+        }
     }
 }
 
-/// The message of a move_to_ready that succeeds. Success means both moves ran
-/// for their duration; the governor can hold an arm short and an object can
-/// stop it, so it does not mean the arms arrived.
-const READY_DONE: &str = "move to ready completed";
-
-/// The message of a move_to_home that succeeds, worded as [`READY_DONE`].
-const HOME_DONE: &str = "move to home completed";
-
 /// Expand one posture action's run loop: expose it, claim both arms per
-/// accepted goal, and run both joint moves. Once both report, complete the
-/// goal with the grasp poses that the coordinator measures then.
+/// accepted goal, and run both joint moves. Once both report, end the goal:
+/// a goal that completes or ends cancelled gives the grasp poses that the
+/// coordinator measures then.
 /// One goal at a time; a goal arriving mid-move waits unread until this one
-/// completes, then claims the freed arms. Written once here because the two
+/// ends, then claims the freed arms. Written once here because the two
 /// generated action modules carry distinct types with an identical surface.
 macro_rules! posture_runner {
-    ($fn_name:ident, $action:ident, $name:literal, $posture:expr, $done:expr) => {
+    ($fn_name:ident, $action:ident, $name:literal, $posture:expr) => {
         pub async fn $fn_name(
             runner: Arc<NodeRunner>,
             goal_txs: [mpsc::Sender<Goal>; 2],
@@ -189,21 +196,12 @@ macro_rules! posture_runner {
             loop {
                 let accepted = handle
                     .handle_goal_next_request(|req| {
-                        if let Err(reason) =
-                            move_seconds_from_wire("duration_s", req.data.duration_s)
-                        {
-                            return Ok($action::GoalDecision::reject(reason));
-                        }
-                        if fresh.iter().any(|arm| !arm.load(Ordering::Acquire)) {
-                            return Ok($action::GoalDecision::reject(ARM_NO_FRESH_STATE));
-                        }
-                        if activity.iter().any(LeaderActivity::streaming) {
-                            return Ok($action::GoalDecision::reject(ARM_LEADER_STREAMING));
-                        }
-                        if let Err(reason) = claim_both(&busy) {
-                            return Ok($action::GoalDecision::reject(reason));
-                        }
-                        Ok($action::GoalDecision::accept())
+                        Ok(
+                            match admit_posture(req.data.duration_s, &fresh, &activity, &busy) {
+                                Ok(()) => $action::GoalDecision::accept(),
+                                Err(f) => $action::GoalDecision::refuse(f.kind.into(), f.message),
+                            },
+                        )
                     })
                     .await?;
                 let Some(ctx) = accepted else { return Ok(()) };
@@ -211,7 +209,7 @@ macro_rules! posture_runner {
                     .expect("validated on accept");
 
                 let cancelled = Arc::new(AtomicBool::new(false));
-                let (done_tx, mut done_rx) = mpsc::channel::<ReadyOutcome>(2);
+                let (done_tx, mut done_rx) = mpsc::channel::<Outcome>(2);
                 let mut pending = 0usize;
                 for side in [Side::Left, Side::Right] {
                     let idx = side.index();
@@ -234,7 +232,7 @@ macro_rules! posture_runner {
                 }
                 drop(done_tx);
 
-                let mut outcomes: Vec<ReadyOutcome> = Vec::with_capacity(pending);
+                let mut outcomes: Vec<Outcome> = Vec::with_capacity(pending);
                 let mut cancel_seen = false;
                 while outcomes.len() < pending {
                     tokio::select! {
@@ -249,33 +247,29 @@ macro_rules! posture_runner {
                     }
                 }
 
-                let grasps = measure_grasps(&requests).await;
-                let PostureResult {
-                    terminal,
-                    message,
-                    arm_names,
-                    positions,
-                    orientations,
-                } = posture_result(
-                    pending,
-                    &outcomes,
-                    cancel_seen || ctx.is_cancelled(),
-                    $done,
-                    grasps,
-                );
-                let result = match terminal {
-                    Terminal::Success | Terminal::Failed => {
-                        let success = terminal == Terminal::Success;
-                        ctx.complete(success, message, arm_names, positions, orientations)
+                let cancel = ctx.cancel_cause().map(|cause| cause.reason().to_string());
+                let ended = match summarize(pending, &outcomes, cancel) {
+                    PostureEnd::Failed(failure) => {
+                        ctx.fail(failure.kind.into(), failure.message).await
+                    }
+                    PostureEnd::Completed => {
+                        let poses = arm_poses(measure_grasps(&requests).await, $name);
+                        ctx.complete(poses.arm_names, poses.positions, poses.orientations)
                             .await
                     }
-                    Terminal::Cancelled => {
-                        ctx.complete_cancelled(false, message, arm_names, positions, orientations)
-                            .await
+                    PostureEnd::Cancelled(reason) => {
+                        let poses = arm_poses(measure_grasps(&requests).await, $name);
+                        ctx.complete_cancelled(
+                            reason,
+                            poses.arm_names,
+                            poses.positions,
+                            poses.orientations,
+                        )
+                        .await
                     }
                 };
-                if let Err(e) = result {
-                    error!("{}: complete: {e}", $name);
+                if let Err(e) = ended {
+                    error!("{}: end: {e}", $name);
                 }
             }
         }
@@ -286,15 +280,13 @@ posture_runner!(
     run_move_to_ready,
     move_to_ready,
     "move_to_ready",
-    openarm_description::ready,
-    READY_DONE
+    openarm_description::ready
 );
 posture_runner!(
     run_move_to_home,
     move_to_home,
     "move_to_home",
-    openarm_description::home,
-    HOME_DONE
+    openarm_description::home
 );
 
 #[cfg(test)]
@@ -358,140 +350,128 @@ mod tests {
         ))
     }
 
-    /// An arm's share that ended with `success` and `message`.
-    fn outcome(success: bool, message: &str) -> ReadyOutcome {
-        ReadyOutcome {
-            success,
-            message: message.to_string(),
-            stopped: false,
-        }
+    /// An arm's share that failed with `kind` and `message`.
+    fn failed(kind: FailureKind, message: &str) -> Outcome {
+        Outcome::Failed(Failure::new(kind, message))
     }
 
     /// The shares of both arms, ended by the stop service.
-    fn stopped_outcomes() -> [ReadyOutcome; 2] {
+    fn stopped_outcomes() -> [Outcome; 2] {
         [
-            ReadyOutcome {
-                stopped: true,
-                ..outcome(false, "left: stopped: operator")
-            },
-            ReadyOutcome {
-                stopped: true,
-                ..outcome(false, "right: stopped: operator")
-            },
+            Outcome::Cancelled("stopped: operator".to_string()),
+            Outcome::Cancelled("stopped: operator".to_string()),
         ]
     }
 
-    /// Assert that `result` gives each arm at [`grasp_of`], in arm-name
-    /// order.
-    fn assert_both_poses(result: &PostureResult) {
-        let (positions, orientations) =
-            arm_pose_arrays(&ArmPair::new(grasp_of(Side::Left), grasp_of(Side::Right)));
-        assert_eq!(result.arm_names, ["left_arm", "right_arm"]);
-        assert_eq!(result.positions, positions);
-        assert_eq!(result.orientations, orientations);
-    }
+    const CALLER: &str = "cancelled by its caller";
 
-    /// Assert that `result` gives no arm pose.
-    fn assert_no_poses(result: &PostureResult) {
-        assert!(result.arm_names.is_empty(), "{:?}", result.arm_names);
-        assert!(result.positions.is_empty() && result.orientations.is_empty());
+    #[test]
+    fn both_complete_shares_complete_the_goal() {
+        let outcomes = [Outcome::Complete, Outcome::Complete];
+        assert_eq!(summarize(2, &outcomes, None), PostureEnd::Completed);
     }
 
     #[test]
-    fn both_successful_outcomes_complete_successfully() {
-        let outcomes = [
-            outcome(true, "trajectory complete"),
-            outcome(true, "trajectory complete"),
-        ];
-        let (terminal, message) = summarize(2, &outcomes, false, READY_DONE);
-        assert_eq!(terminal, Terminal::Success);
-        assert_eq!(message, READY_DONE);
+    fn a_failed_arm_fails_the_goal_with_its_failure() {
+        let stale = Failure::new(
+            FailureKind::ResourceUnavailable,
+            "right: the follower stopped reporting",
+        );
+        let outcomes = [Outcome::Complete, Outcome::Failed(stale.clone())];
+        assert_eq!(summarize(2, &outcomes, None), PostureEnd::Failed(stale));
     }
 
     #[test]
-    fn a_failed_arm_fails_the_goal_with_its_message() {
-        let outcomes = [
-            outcome(true, "trajectory complete"),
-            outcome(false, "goal cancelled"),
-        ];
-        let (terminal, message) = summarize(2, &outcomes, false, HOME_DONE);
-        assert_eq!(terminal, Terminal::Failed);
-        assert_eq!(message, "goal cancelled");
-    }
-
-    #[test]
-    fn a_dropped_planner_reply_fails_with_a_matching_message() {
-        // done_rx closed after one success: success and message must derive
-        // from the same predicate, so this cannot read READY_DONE.
-        let outcomes = [outcome(true, "trajectory complete")];
-        let (terminal, message) = summarize(2, &outcomes, false, READY_DONE);
-        assert_eq!(terminal, Terminal::Failed);
-        assert_eq!(message, "a planner dropped the move");
+    fn a_dropped_planner_reply_fails_with_attempt_failed() {
+        let outcomes = [Outcome::Complete];
+        assert_eq!(
+            summarize(2, &outcomes, None),
+            PostureEnd::Failed(Failure::new(
+                FailureKind::AttemptFailed,
+                "a planner dropped the move"
+            ))
+        );
     }
 
     #[test]
     fn no_dispatched_goal_is_a_planner_failure() {
-        let (terminal, message) = summarize(0, &[], false, READY_DONE);
-        assert_eq!(terminal, Terminal::Failed);
-        assert_eq!(message, "an arm's planner is unavailable");
-        let only_left = [outcome(true, "trajectory complete")];
-        let (terminal, _) = summarize(1, &only_left, false, "");
-        assert_eq!(terminal, Terminal::Failed);
+        let unavailable = PostureEnd::Failed(Failure::new(
+            FailureKind::AttemptFailed,
+            "an arm's planner is unavailable",
+        ));
+        assert_eq!(summarize(0, &[], None), unavailable);
+        assert_eq!(summarize(1, &[Outcome::Complete], None), unavailable);
     }
 
     #[test]
     fn two_failures_report_the_first_received() {
         let outcomes = [
-            outcome(false, "left: IK failed mid-trajectory"),
-            outcome(false, "right: motion timed out"),
+            failed(FailureKind::AttemptFailed, "left: IK failed mid-trajectory"),
+            failed(
+                FailureKind::ResourceUnavailable,
+                "right: the follower stopped reporting",
+            ),
         ];
-        let (terminal, message) = summarize(2, &outcomes, false, READY_DONE);
-        assert_eq!(terminal, Terminal::Failed);
-        assert_eq!(message, "left: IK failed mid-trajectory");
+        assert_eq!(
+            summarize(2, &outcomes, None),
+            PostureEnd::Failed(Failure::new(
+                FailureKind::AttemptFailed,
+                "left: IK failed mid-trajectory"
+            ))
+        );
     }
 
     #[test]
-    fn a_cancel_with_nothing_pending_still_completes_cancelled() {
-        let (terminal, message) = summarize(0, &[], true, READY_DONE);
-        assert_eq!(terminal, Terminal::Cancelled);
-        assert_eq!(message, "goal cancelled");
+    fn a_cancel_with_nothing_pending_still_ends_cancelled() {
+        assert_eq!(
+            summarize(0, &[], Some(CALLER.to_string())),
+            PostureEnd::Cancelled(CALLER.to_string())
+        );
     }
 
+    /// The stop service ended both arms' shares. The goal ends cancelled
+    /// for the stop's reason.
     #[test]
-    fn a_stopped_arm_ends_the_goal_cancelled_with_the_stops_message() {
-        // The stop service ended the left arm's share; the right arm's share
-        // ended with it. The goal ends as cancelled, naming the stop.
-        let (terminal, message) = summarize(2, &stopped_outcomes(), false, READY_DONE);
-        assert_eq!(terminal, Terminal::Cancelled);
-        assert_eq!(message, "left: stopped: operator");
+    fn a_stopped_arm_ends_the_goal_cancelled_for_the_stops_reason() {
+        assert_eq!(
+            summarize(2, &stopped_outcomes(), None),
+            PostureEnd::Cancelled("stopped: operator".to_string())
+        );
     }
 
+    /// The goal's own cancel wins over what its shares say: both completed,
+    /// one failed, or the stop ended them.
     #[test]
-    fn a_cancel_after_both_arms_succeeded_reads_as_cancelled() {
-        let outcomes = [
-            outcome(true, "trajectory complete"),
-            outcome(true, "trajectory complete"),
+    fn the_goals_own_cancel_wins_over_every_share() {
+        let completed = [Outcome::Complete, Outcome::Complete];
+        let one_failed = [
+            Outcome::Complete,
+            failed(
+                FailureKind::AttemptFailed,
+                "right: IK failed mid-trajectory",
+            ),
         ];
-        let (terminal, message) = summarize(2, &outcomes, true, READY_DONE);
-        assert_eq!(terminal, Terminal::Cancelled);
-        assert_eq!(message, "goal cancelled");
+        for outcomes in [&completed[..], &one_failed[..], &stopped_outcomes()[..]] {
+            assert_eq!(
+                summarize(2, outcomes, Some(CALLER.to_string())),
+                PostureEnd::Cancelled(CALLER.to_string())
+            );
+        }
     }
 
     /// The result gives the arms in limb_state's order, each with its own
     /// pose. Each orientation is `[x, y, z, w]`.
     #[test]
     fn the_posture_poses_come_in_arm_name_order() {
-        let outcomes = [
-            outcome(true, "trajectory complete"),
-            outcome(true, "trajectory complete"),
-        ];
-        let result = posture_result(2, &outcomes, false, READY_DONE, both_measured());
-        assert_eq!(result.terminal, Terminal::Success);
-        assert_eq!(result.message, READY_DONE);
-        assert_both_poses(&result);
+        let poses = arm_poses(both_measured(), "move_to_ready");
+        let (positions, orientations) =
+            arm_pose_arrays(&ArmPair::new(grasp_of(Side::Left), grasp_of(Side::Right)));
+        assert_eq!(poses.arm_names, ["left_arm", "right_arm"]);
+        assert_eq!(poses.positions, positions);
+        assert_eq!(poses.orientations, orientations);
         let (sin, cos) = 0.1f64.sin_cos();
         let expected = [0.0, 0.0, sin, cos, 0.0, 0.0, -sin, cos];
-        for (i, (got, want)) in result.orientations.iter().zip(expected).enumerate() {
+        for (i, (got, want)) in poses.orientations.iter().zip(expected).enumerate() {
             assert!(
                 (got - want).abs() < 1e-12,
                 "orientations[{i}] = {got}, expected {want}"
@@ -499,40 +479,13 @@ mod tests {
         }
     }
 
-    /// A posture that ends failed, cancelled or stopped still gives where
-    /// each arm is when the goal completes. So does a posture whose planner
-    /// dropped the move.
-    #[test]
-    fn a_posture_that_does_not_succeed_still_reports_both_poses() {
-        let failed = [
-            outcome(false, "left: IK failed mid-trajectory"),
-            outcome(true, "trajectory complete"),
-        ];
-        let stopped = stopped_outcomes();
-        let dropped = [outcome(true, "trajectory complete")];
-        for (outcomes, cancelled, terminal) in [
-            (&failed[..], false, Terminal::Failed),
-            (&failed[..], true, Terminal::Cancelled),
-            (&stopped[..], false, Terminal::Cancelled),
-            (&dropped[..], false, Terminal::Failed),
-        ] {
-            let result = posture_result(2, outcomes, cancelled, READY_DONE, both_measured());
-            assert_eq!(result.terminal, terminal);
-            assert_both_poses(&result);
-        }
-    }
-
     /// When an arm has no fresh measurement, or the coordinator does not
-    /// answer, the result gives no pose for any arm. The message adds why:
+    /// answer, the result gives no pose for any arm:
     /// - the seed wait is not over, so neither arm has a pose;
     /// - the follower of the right arm stopped reporting;
     /// - the coordinator is not running.
     #[test]
     fn an_arm_without_a_measured_pose_empties_the_posture_arrays() {
-        let succeeded = [
-            outcome(true, "trajectory complete"),
-            outcome(true, "trajectory complete"),
-        ];
         let unmeasured = [
             (
                 Ok(ArmPair::new(
@@ -554,13 +507,10 @@ mod tests {
             ),
         ];
         for (answer, reason) in unmeasured {
-            let result = posture_result(2, &succeeded, false, READY_DONE, answer);
-            assert_eq!(result.terminal, Terminal::Success);
-            assert_eq!(
-                result.message,
-                format!("{READY_DONE}; no arm poses: {reason}")
-            );
-            assert_no_poses(&result);
+            assert_eq!(measured_poses(answer.clone()), Err(reason.to_string()));
+            let poses = arm_poses(answer, "move_to_ready");
+            assert!(poses.arm_names.is_empty(), "{:?}", poses.arm_names);
+            assert!(poses.positions.is_empty() && poses.orientations.is_empty());
         }
     }
 }

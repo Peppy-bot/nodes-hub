@@ -87,11 +87,28 @@ pair is read for it through `sim_robot_core.pairs`:
 A robot's pair grace time (`robot_pair_grace_ms`) starts again only while its
 pairs are its model's: every limb of its model, and nothing its model lacks. A
 camera its model carries may go unpaired, since a camera nobody views is not
-rendered. When the pair grace time runs out the stay ends, saying either that
-none of the robot's limbs were paired or naming both lists: what its pairs name
-and what its model has. A robot is ready once it stands and holds a pair for
-every limb of its model, so an SO-101 is ready with its one arm and its one
-gripper. Each robot on the stage is held to its own model.
+rendered. When the pair grace time runs out the engine takes the robot out
+and fails its goal with `resource_unavailable`, saying either that none of the
+robot's limbs were paired or naming both lists: what its pairs name and what
+its model has. A robot is ready once it stands and holds a pair for every limb
+of its model, so an SO-101 is ready with its one arm and its one gripper. Each
+robot on the stage is held to its own model.
+
+An `attach` goal is refused with `rejected` for a model with no entry, a name
+the stage cannot stand a robot under or a placement that is not finite, and
+with `precondition_failed` for a name or a spot another robot holds, a second
+robot of the same caller, the robot of the caller while it still joins, or
+another model for the robot the caller stands.
+A cancel of its caller takes the robot out and ends the goal cancelled. The
+sender grace of `attach` is the pair grace time: when the process that sent
+the goal is gone, the robot stays for that time, and then peppy cancels the
+goal and the robot leaves. A caller that comes back within it attaches the
+robot that still stands, and the goal that held the robot ends cancelled,
+saying that another goal of the same caller holds the robot now. The engine
+fails the goal with `resource_unavailable` when it takes the robot out
+itself: the pair grace time ran out, the caller could not be told that the
+robot stands, or the simulation stops. A stage that cannot stand the robot
+fails the goal with `attempt_failed`.
 
 ## Models
 
@@ -344,14 +361,25 @@ the source `scene` lists nothing. `get_object` answers one of those objects
 from the same capture: its pose and its scale, as `get_objects_list` lists
 them. Isaac keeps no landmark and simulates no state of an object, so
 `landmarks` is empty and no state field is present. An object id that names
-no spawned object is refused, and before the first capture `get_object`
-answers as `get_objects_list` does: unavailable, with the reason. A
+no spawned object gets an error reply with `rejected`, and before the first
+capture `get_object` answers as `get_objects_list` and `get_object_states`
+do: an error reply with `precondition_failed` and the reason. A
 `spawn_object` or `move_object` goal that carries an `orientation`, a unit
 quaternion `[x, y, z, w]`, stands the object turned to it, whatever the
 spawn's `yaw`; a move without one keeps the orientation the object has.
 Isaac keeps no landmark, so a `spawn_object` or `move_object` goal that
 carries a `snap_to` is refused, naming the position to give instead, and
 nothing is spawned or moved.
+
+Each scene goal is checked as it arrives. A goal that names an asset or an
+object the stage does not hold, or a value it does not take, is refused with
+`rejected`. A `move_robot` goal for a robot that does not stand on the stage
+is refused with `resource_unavailable`, and a goal that arrives before the
+asset catalogue is discovered is refused with `precondition_failed`. The
+Isaac main thread checks the goal again when its command runs, since a
+command queued before it can remove its object, and its robot can leave the
+stage meanwhile: a check that fails there fails the goal with the same kind,
+and a command that Isaac does not carry out fails it with `attempt_failed`.
 
 ### Progress of a load or a spawn
 
@@ -368,8 +396,8 @@ object from Isaac's asset root, a remote root included. A caller that bounds
 the silence since the last message, as the scene commander does, bounds that
 step too: a resolve that stays silent for longer than the caller's window is
 reported as stalled, and the caller cancels the goal. A cancel does not stop
-a command: the scene or the object still loads, and the goal ends as
-cancelled with the command's result.
+a command: the scene or the object still loads, and the goal completes with
+the command's result.
 
 Each message waits at most 5 s to be sent. When one is not sent in that
 time, the goal sends no more progress messages, and the command runs and

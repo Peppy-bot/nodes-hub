@@ -106,10 +106,13 @@ with it disabled); the robot view is whatever camera you bind.
 - **Face buttons** (left controller): the chosen robot's dataset recorder.
   **X** starts an episode under the current task label; the next press stops
   and saves it, and the panel row shows `saving...` until the recorder's
-  result lands. Holding **Y** for a second finishes the session: the dataset
-  finalizes and a fresh one opens in place. If the robot changes during an
-  episode, the episode keeps its row and X still stops it. With no episode
-  in flight, the buttons do nothing while the chosen robot has no recorder.
+  result lands. The row then shows `saved episode <n>`, with the count of
+  video frames missing when the videos of the episode miss frames: do not
+  train on such an episode. Holding **Y** for a second finishes the session:
+  the dataset finalizes and a fresh one opens in place. If the robot changes
+  during an episode, the episode keeps its row and X still stops it. With no
+  episode in flight, the buttons do nothing while the chosen robot has no
+  recorder.
 - **Changing the robot**: choosing another robot releases both hands. The previous robot stops where it is, and the next squeeze engages the new one. A grip held through the change drives nothing until it is released; the status panel says so.
 
 The mapping assumes you share the robot's facing (natural once your view is
@@ -162,7 +165,7 @@ to the first robot paired, which would keep that robot's cameras live for
 nobody. The headset renews the hold a third of the way through each hold
 length (`hold_ms`) that the simulation answers with. When another robot is
 chosen, no robot is paired or the session ends, it releases its hold on the robot it held
-before, and it releases its hold when the node stops. A refused or failed hold is logged once and
+before, and it releases its hold when the node stops. A hold that gets an error reply, or whose call fails, is logged once and
 tried again a second later; until then the cameras stream at 1 Hz. The
 launcher binds the simulation to the `sensor_streams` slot. On a physical
 stack the slot is vacant, and the headset holds nothing.

@@ -18,7 +18,7 @@ from any_llm.exceptions import (
 )
 from conftest import BOTH_KEYS, TEST_CATALOG
 
-from brain_core.ports import ExpectedFailure
+from brain_core.ports import ExpectedFailure, FailureKind
 
 from vlm_router_brain import provider as provider_module
 from vlm_router_brain.parsing import Answer
@@ -128,6 +128,7 @@ async def test_each_failure_class_comes_out_retryable_or_not(clients, error, ret
         await AnyLlmProvider(BOTH_KEYS).ask(FAST, b"jpeg", "q", 10.0)
     failure = raised.value
     assert isinstance(failure, ExpectedFailure) and failure.retryable is retryable
+    assert failure.kind is FailureKind.ATTEMPT_FAILED
     assert failure.message == f"fast failed: {type(error).__name__}: {' '.join(str(error).split())}"
 
 

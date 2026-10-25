@@ -2,20 +2,21 @@
 limb_motion services that read or end what it runs.
 
 Admission (the goal decide callback) validates the request, its settle
-fields included, and claims the limb's single-flight busy slot; execution
-installs a plan and waits for the coordinator to stream it out: an arm move
-ends once the measured joints, or the measured grasp point, stand within the
-settle tolerance of the target, and fails when its settle timeout runs out
-past the planned end; a gripper move ends, past the planned end of its
+fields included, and claims the limb's single-flight busy slot, or refuses
+the goal with a failure kind; execution installs a plan and waits for the
+coordinator to stream it out: an arm move completes once the measured
+joints, or the measured grasp point, stand within the settle tolerance of
+the target, and fails with `timeout` when its settle timeout runs out past
+the planned end; a gripper move completes, past the planned end of its
 travel, once the jaws stand still or its settle timeout runs out, and
 reports the opening measured then, where an object may hold the jaws.
 Cancelling freezes the limb where the trajectory stands, and so does the
-stop service, whoever started the move: the goal then ends as cancelled with
-the stop's message. The plan
-check runs a move_arm goal's solve from the same anchor and installs
-nothing. Every terminal path releases the claimed slot, and no exception may
-ever kill an action server: an unforeseen failure rejects the goal and
-abandons anything admission installed.
+stop service, whoever started the move: the goal then ends cancelled, with
+the reason of the cancel or of the stop, and its result. A failed goal
+gives no result. The plan check runs a move_arm goal's solve from the same
+anchor and installs nothing. Every terminal path releases the claimed slot,
+and no exception may ever kill an action server: an unforeseen failure
+refuses or fails the goal and abandons anything admission installed.
 """
 
 from __future__ import annotations
@@ -35,7 +36,7 @@ from so101_description.transforms import relative_rotation_rad
 from so101_description.units import NUM_JOINTS
 
 from so101_backbone.coordinator import (
-    STALE_FOLLOWER_REFUSAL,
+    FOLLOWER_SILENT,
     ArmPlan,
     Coordinator,
     GripperPlan,
@@ -43,6 +44,7 @@ from so101_backbone.coordinator import (
     PoseSettle,
     PostureEnd,
 )
+from so101_backbone.failures import FailureKind
 from so101_backbone.params import Config
 
 # Backoff after a failed goal delivery, so a persistently broken action
@@ -61,16 +63,9 @@ QUATERNION_MIN_NORM = 1e-6
 # runs, and of a gripper goal while another gripper goal runs.
 ARM_BUSY = "arm is already executing a motion"
 GRIPPER_BUSY = "gripper is already executing a move"
-# The messages the posture moves complete with.
-READY_DONE = "move to ready completed"
-HOME_DONE = "move to home completed"
 # The refusals of a goal naming no limb of this robot.
 UNKNOWN_ARM_NAME = f'unknown arm_name: this robot\'s arm is "{ARM_LIMB}"'
 UNKNOWN_GRIPPER_NAME = f'unknown gripper_name: this robot\'s gripper is "{GRIPPER_LIMB}"'
-# The note a result adds when it reports the position commanded last, the
-# follower having stopped reporting.
-COMMANDED_JOINTS_NOTE = "the result comes from the joints commanded last"
-COMMANDED_OPENING_NOTE = "the result comes from the opening commanded last"
 # The refusal of an arm or gripper goal, or a check of one, while a leader
 # streams commands for that limb: the leader has it until its stream stops.
 ARM_LEADER_STREAMING = (
@@ -84,19 +79,36 @@ GRIPPER_LEADER_STREAMING = (
 # The refusal of an arm goal, or a check of one, while no follower state is
 # fresh enough to anchor the move from.
 NO_ANCHOR = "no fresh follower state to anchor the move from"
+# The failure of a goal whose admission a failed delivery walked back.
+WALKED_BACK = "goal admission was walked back"
 
 
-class Rejection(ValueError):
-    """A goal that must not run, with the operator-facing reason."""
+class Refusal(ValueError):
+    """A goal that must not run, or a check that gets an error reply: the
+    failure kind and the operator-facing reason."""
+
+    def __init__(self, kind: FailureKind, reason: str):
+        super().__init__(reason)
+        self.kind = kind
 
 
 class PlanRefused(ValueError):
     """A pose move that has no plan from where the arm is, with the reason a
-    move_arm goal completes with and check_arm_move answers."""
+    move_arm goal fails with, as `unreachable`, and check_arm_move answers."""
+
+
+@dataclass(frozen=True)
+class PlanCheck:
+    """The answer of check_arm_move: whether a plan reaches the pose, why
+    not, and the time the move would take (s)."""
+
+    reachable: bool
+    reason: str
+    duration_s: float
 
 
 def stop_message(reason: str) -> str:
-    """The message every goal a stop ends carries: the stop and its reason."""
+    """The reason of every goal a stop ends: the stop and its reason."""
     if not reason:
         return "stopped"
     return f"stopped: {reason}"
@@ -215,13 +227,13 @@ class ActionLayer:
         settle_timeout_s: float,
     ) -> ArmPlan:
         """Claim the arm's busy slot and install a move_arm_joints goal's
-        trajectory and settle, or raise Rejection."""
+        trajectory and settle, or raise Refusal."""
         assert len(target) == NUM_JOINTS
         if not all(math.isfinite(p) for p in target):
-            raise Rejection("non-finite joint target")
+            raise Refusal(FailureKind.REJECTED, "non-finite joint target")
         _require_duration(duration_s, "duration_s")
         if not self._limits.contains(target):
-            raise Rejection("target out of joint limits")
+            raise Refusal(FailureKind.REJECTED, "target out of joint limits")
         settle = _joint_settle(settle_tolerances_rad, settle_timeout_s)
         return self._admit_trajectory(target, duration_s, settle)
 
@@ -229,15 +241,9 @@ class ActionLayer:
         self, target: tuple[float, ...], duration_s: float, settle: JointSettle | PostureEnd
     ) -> ArmPlan:
         """Claim the arm's busy slot and install the trajectory to `target`
-        with `settle`, or raise Rejection. The claim happens last so a
-        rejected goal never leaves the slot held."""
-        anchor = self._coordinator.arm_anchor()
-        if anchor is None:
-            raise Rejection(NO_ANCHOR)
-        if self._coordinator.leader_streams_arm():
-            raise Rejection(ARM_LEADER_STREAMING)
-        if not self._coordinator.try_claim_arm():
-            raise Rejection(ARM_BUSY)
+        with `settle`, or raise Refusal. The claim happens last so a
+        refused goal never leaves the slot held."""
+        anchor = self._claim_free_arm()
         try:
             profile = minimum_jerk.plan(
                 anchor, target, duration_s, self._config.max_joint_velocity_rad_s
@@ -252,11 +258,13 @@ class ActionLayer:
         self, opening: float, max_effort: float, settle_timeout_s: float
     ) -> GripperPlan:
         if not math.isfinite(opening):
-            raise Rejection("non-finite gripper opening")
+            raise Refusal(FailureKind.REJECTED, "non-finite gripper opening")
         if not 0.0 <= opening <= 1.0:
-            raise Rejection(f"opening {opening} outside [0, 1]")
+            raise Refusal(FailureKind.REJECTED, f"opening {opening} outside [0, 1]")
         if not math.isfinite(max_effort) or max_effort < 0.0:
-            raise Rejection(f"max_effort {max_effort} is not a non-negative finite value")
+            raise Refusal(
+                FailureKind.REJECTED, f"max_effort {max_effort} is not a non-negative finite value"
+            )
         settle_timeout_s = _require_duration(settle_timeout_s, "settle_timeout_s")
         if max_effort > 0.0:
             # Same disposition as the streamed path: legal contract intent
@@ -269,11 +277,13 @@ class ActionLayer:
             self._effort_unsupported.clear()
         anchor = self._coordinator.gripper_anchor()
         if anchor is None:
-            raise Rejection("no fresh gripper state to anchor the move from")
+            raise Refusal(
+                FailureKind.RESOURCE_UNAVAILABLE, "no fresh gripper state to anchor the move from"
+            )
         if self._coordinator.leader_streams_gripper():
-            raise Rejection(GRIPPER_LEADER_STREAMING)
+            raise Refusal(FailureKind.LEADER_STREAMING, GRIPPER_LEADER_STREAMING)
         if not self._coordinator.try_claim_gripper():
-            raise Rejection(GRIPPER_BUSY)
+            raise Refusal(FailureKind.PRECONDITION_FAILED, GRIPPER_BUSY)
         try:
             return self._coordinator.adopt_gripper_plan(opening, settle_timeout_s, anchor)
         except BaseException:
@@ -295,7 +305,7 @@ class ActionLayer:
         drive task so a hard pose never stalls the event loop inside the
         goal decide callback, failing the accepted goal when no solution
         exists."""
-        # Parsed before the claim: a rejection past this point would strand
+        # Parsed before the claim: a refusal past this point would strand
         # the arm slot and teleop with it.
         move = _pose_move(
             _pose_goal(
@@ -306,21 +316,35 @@ class ActionLayer:
             settle_timeout_s,
             self._coordinator.stop_count,
         )
-        if self._coordinator.arm_anchor() is None:
-            raise Rejection(NO_ANCHOR)
-        if self._coordinator.leader_streams_arm():
-            raise Rejection(ARM_LEADER_STREAMING)
-        if not self._coordinator.try_claim_arm():
-            raise Rejection(ARM_BUSY)
+        self._claim_free_arm()
         return move
 
-    def _admit_posture(
-        self, target: tuple[float, ...], duration_s: float, completion: str
-    ) -> ArmPlan:
+    def _free_arm_anchor(self) -> tuple[float, ...]:
+        """Where a move of the arm starts from. Raises Refusal, in the order
+        every arm goal and check is refused: no fresh follower state, a
+        leader streaming the arm, an arm goal in flight. Claims nothing."""
+        anchor = self._coordinator.arm_anchor()
+        if anchor is None:
+            raise Refusal(FailureKind.RESOURCE_UNAVAILABLE, NO_ANCHOR)
+        if self._coordinator.leader_streams_arm():
+            raise Refusal(FailureKind.LEADER_STREAMING, ARM_LEADER_STREAMING)
+        if self._coordinator.arm_busy:
+            raise Refusal(FailureKind.PRECONDITION_FAILED, ARM_BUSY)
+        return anchor
+
+    def _claim_free_arm(self) -> tuple[float, ...]:
+        """Claim the arm's busy slot: the anchor its move starts from. Raises
+        Refusal, and claims nothing, as _free_arm_anchor does."""
+        anchor = self._free_arm_anchor()
+        claimed = self._coordinator.try_claim_arm()
+        assert claimed, "the arm was found free on this same event loop turn"
+        return anchor
+
+    def _admit_posture(self, target: tuple[float, ...], duration_s: float) -> ArmPlan:
         """A posture move runs to the planned end of its trajectory and
-        reports the measured grasp point with `completion` as its message."""
+        reports the measured grasp point."""
         _require_duration(duration_s, "duration_s")
-        return self._admit_trajectory(target, duration_s, PostureEnd(completion))
+        return self._admit_trajectory(target, duration_s, PostureEnd())
 
     # ----------------------------------------------------- decide constructors
 
@@ -340,13 +364,11 @@ class ActionLayer:
 
         return decide
 
-    def decide_posture(
-        self, module, target: tuple[float, ...], completion: str, pending: PendingSlot
-    ):
+    def decide_posture(self, module, target: tuple[float, ...], pending: PendingSlot):
         def decide(request):
             return self._decide(
                 module,
-                lambda: self._admit_posture(target, request.data.duration_s, completion),
+                lambda: self._admit_posture(target, request.data.duration_s),
                 pending,
             )
 
@@ -386,12 +408,14 @@ class ActionLayer:
     def _decide(self, module, admit, pending: PendingSlot):
         try:
             plan = admit()
-        except Rejection as e:
-            return module.GoalDecision.reject(str(e))
+        except Refusal as e:
+            return module.GoalDecision.refuse(e.kind, str(e))
         except Exception as e:
             # No admission failure may escape into the generated server loop.
             log(f"goal admission failed unexpectedly: {e!r}")
-            return module.GoalDecision.reject(f"admission failed: {e!r}")
+            return module.GoalDecision.refuse(
+                FailureKind.ATTEMPT_FAILED, f"admission failed: {e!r}"
+            )
         pending.plan = plan
         return module.GoalDecision.accept()
 
@@ -415,26 +439,25 @@ class ActionLayer:
     # -------------------------------------------------------------- execution
 
     async def _finish_plan(self, ctx, plan, abort, results, started: float) -> None:
-        """Wait out the plan, a cancel or a stop and complete the goal.
-        results(action_time) builds (note, payload) and runs after any abort,
-        so it reads the plan where it stopped. A stop has already cut the
-        plan, and the goal ends as cancelled with the stop's message."""
+        """Wait out the plan, a cancel or a stop, and end the goal.
+        results(action_time) builds the result fields and runs after any
+        abort, so it reads the plan where it stopped. A stop has already cut
+        the plan, and the goal ends cancelled with the stop's reason; a plan
+        the coordinator failed fails the goal with its kind."""
         cancel_task = asyncio.ensure_future(ctx.cancel_signal())
         done_task = asyncio.ensure_future(plan.done.wait())
         try:
             await asyncio.wait([cancel_task, done_task], return_when=asyncio.FIRST_COMPLETED)
             action_time = time.monotonic() - started
             if plan.stopped is not None:
-                note, payload = results(action_time)
-                await ctx.complete_cancelled(False, _join(plan.stopped, note), *payload)
+                await ctx.complete_cancelled(plan.stopped, *results(action_time))
+            elif plan.failed is not None:
+                await ctx.fail(plan.failed.kind, plan.failed.message)
             elif plan.done.is_set():
-                note, payload = results(action_time)
-                success, message = _terminal(plan, note)
-                await ctx.complete(success, message, *payload)
+                await ctx.complete(*results(action_time))
             else:
                 abort(plan)
-                note, payload = results(action_time)
-                await ctx.complete_cancelled(False, _join("goal cancelled", note), *payload)
+                await ctx.complete_cancelled(ctx.cancel_reason(), *results(action_time))
         except Exception as e:
             log(f"goal completion failed: {e!r}")
         finally:
@@ -442,17 +465,14 @@ class ActionLayer:
             done_task.cancel()
 
     async def drive_arm(self, ctx, plan: ArmPlan | None) -> None:
-        """Wait out the plan or a cancel, then complete with the measured
+        """Wait out the plan or a cancel, then end the goal with the measured
         landing point."""
         if plan is None:
-            await _complete_guarded(
-                ctx.complete, False, "goal admission was walked back", [0.0] * NUM_JOINTS, 0.0
-            )
+            await _end_guarded(ctx.fail, FailureKind.ATTEMPT_FAILED, WALKED_BACK)
             return
 
         def results(action_time):
-            positions, note = self._final_arm_positions(plan)
-            return note, (list(positions), action_time)
+            return list(self._final_arm_positions(plan)), action_time
 
         try:
             await self._finish_plan(
@@ -462,16 +482,12 @@ class ActionLayer:
             self._coordinator.release_arm()
 
     async def drive_posture(self, ctx, plan: ArmPlan | None, kinematics) -> None:
-        """Wait until the plan ends, a cancel comes or a stop comes. Then
-        complete the goal with the grasp pose of the arm, whatever the value
-        of success. The pose comes from the joints that the follower measures
-        at that time. All terminal paths, also a walked-back admission, use
-        the same rule (see _measured_grasp_pose)."""
+        """Wait until the plan ends, a cancel comes or a stop comes. Then end
+        the goal; a completed or cancelled goal gives the grasp pose of the
+        arm, from the joints that the follower measures at that time (see
+        _measured_grasp_pose)."""
         if plan is None:
-            note, pose = self._measured_grasp_pose(kinematics)
-            await _complete_guarded(
-                ctx.complete, False, _join("goal admission was walked back", note), *pose
-            )
+            await _end_guarded(ctx.fail, FailureKind.ATTEMPT_FAILED, WALKED_BACK)
             return
 
         def results(_action_time):
@@ -523,7 +539,7 @@ class ActionLayer:
             # The requested duration was admitted against this ceiling, but
             # the caps can raise it past one. Stretching anyway would hold
             # the arm slot for longer than any goal is allowed to, so the
-            # move is refused instead.
+            # move has no plan instead.
             raise PlanRefused(
                 f"the speed caps need {profile.duration_s:.0f}s for this "
                 f"move, beyond the {MAX_REQUESTED_DURATION_S:.0f}s ceiling"
@@ -540,35 +556,27 @@ class ActionLayer:
         orientation_tolerance_rad: float,
         solver,
         kinematics,
-    ) -> tuple[bool, str, float]:
+    ) -> PlanCheck:
         """Whether a move_arm goal with these planning fields has a plan from
-        where the arm is, without moving: (success, message, duration_s), the
-        message being the words the goal's refusal gives. Refused with the
-        same messages, in the same order, as a goal: no fresh follower state,
-        a leader streaming the arm, an arm goal in flight."""
-        try:
-            _require_arm_name(arm_name)
-            goal = _pose_goal(
-                position, orientation, duration_s, position_tolerance_m, orientation_tolerance_rad
-            )
-        except Rejection as e:
-            return False, str(e), 0.0
-        seed = self._coordinator.arm_anchor()
-        if seed is None:
-            return False, NO_ANCHOR, 0.0
-        if self._coordinator.leader_streams_arm():
-            return False, ARM_LEADER_STREAMING, 0.0
-        if self._coordinator.arm_busy:
-            return False, ARM_BUSY, 0.0
+        where the arm is, without moving, the reason being the words the
+        goal's `unreachable` failure gives. Raises Refusal with the kind and
+        the message of the goal's refusal, in the same order as a goal: a
+        field that move_arm does not take, no fresh follower state, a leader
+        streaming the arm, an arm goal in flight; and with `attempt_failed`
+        when the solve raises."""
+        _require_arm_name(arm_name)
+        goal = _pose_goal(
+            position, orientation, duration_s, position_tolerance_m, orientation_tolerance_rad
+        )
+        seed = self._free_arm_anchor()
         try:
             profile = await self._plan_pose(solver, kinematics, seed, goal)
         except PlanRefused as e:
-            return False, str(e), 0.0
+            return PlanCheck(reachable=False, reason=str(e), duration_s=0.0)
         except Exception as e:
             log(f"pose solve failed: {e!r}")
-            return False, f"pose solve failed: {e!r}", 0.0
-        planned_s = profile.duration_s
-        return True, f"a plan reaches the pose in {planned_s:.3f} s", planned_s
+            raise Refusal(FailureKind.ATTEMPT_FAILED, f"pose solve failed: {e!r}") from e
+        return PlanCheck(reachable=True, reason="", duration_s=profile.duration_s)
 
     def stop_moves(self, reason: str) -> list[str]:
         """End every planned move in flight for the stop service: the names
@@ -582,49 +590,42 @@ class ActionLayer:
         out. The solve runs off the event loop on a solver dedicated to
         point-to-point goals (the control tick's streaming solver is a
         separate instance). A stop that runs during the solve ends the goal
-        as cancelled with the stop's message, and nothing is installed."""
+        cancelled with the stop's reason, and nothing is installed. A pose
+        with no plan fails the goal with `unreachable`."""
         if move is None:
-            await _complete_guarded(
-                ctx.complete, False, "goal admission was walked back", *_no_pose(), 0.0
-            )
+            await _end_guarded(ctx.fail, FailureKind.ATTEMPT_FAILED, WALKED_BACK)
             return
         goal = move.goal
-        started = time.monotonic()
         try:
             seed = self._coordinator.arm_anchor()
             if seed is None:
-                note, pose = self._standing_pose(kinematics)
-                await _complete_guarded(
-                    ctx.complete, False, _join(STALE_FOLLOWER_REFUSAL, note), *pose, 0.0
-                )
+                await _end_guarded(ctx.fail, FOLLOWER_SILENT.kind, FOLLOWER_SILENT.message)
                 return
 
             async def end_stopped() -> None:
-                note, pose = self._standing_pose(kinematics)
-                await _complete_guarded(
-                    ctx.complete_cancelled, False, _join(self._coordinator.last_stop, note),
-                    *pose, 0.0,
+                await _end_guarded(
+                    ctx.complete_cancelled,
+                    self._coordinator.last_stop,
+                    *self._standing_pose(kinematics),
+                    0.0,
                 )
 
             if self._coordinator.stop_count != move.stops_before:
                 await end_stopped()
                 return
+            started = time.monotonic()
             try:
                 profile = await self._plan_pose(solver, kinematics, seed, goal)
             except PlanRefused as e:
-                position, orientation = kinematics.forward_kinematics(seed)
-                await _complete_guarded(
-                    ctx.complete, False, str(e), list(position), list(orientation), 0.0
-                )
+                await _end_guarded(ctx.fail, FailureKind.UNREACHABLE, str(e))
                 return
             except Exception as e:
-                # A solver surprise must still reach a terminal result; the
+                # A solver surprise must still reach a terminal outcome; the
                 # caller would otherwise wait out its whole timeout on an
                 # accepted goal.
                 log(f"pose solve failed: {e!r}")
-                await _complete_guarded(
-                    ctx.complete, False, f"pose solve failed: {e!r}",
-                    *_no_pose(), time.monotonic() - started,
+                await _end_guarded(
+                    ctx.fail, FailureKind.ATTEMPT_FAILED, f"pose solve failed: {e!r}"
                 )
                 return
             if self._coordinator.stop_count != move.stops_before:
@@ -633,9 +634,10 @@ class ActionLayer:
             plan = self._coordinator.adopt_arm_plan(profile, move.settle)
 
             def results(action_time):
-                positions, note = self._final_arm_positions(plan)
-                position, orientation = kinematics.forward_kinematics(positions)
-                return note, (list(position), list(orientation), action_time)
+                position, orientation = kinematics.forward_kinematics(
+                    self._final_arm_positions(plan)
+                )
+                return list(position), list(orientation), action_time
 
             await self._finish_plan(
                 ctx, plan, self._coordinator.abort_arm_plan, results, started
@@ -647,12 +649,11 @@ class ActionLayer:
 
     async def drive_gripper(self, ctx, plan: GripperPlan | None) -> None:
         if plan is None:
-            await _complete_guarded(ctx.complete, False, "goal admission was walked back", 0.0, 0.0)
+            await _end_guarded(ctx.fail, FailureKind.ATTEMPT_FAILED, WALKED_BACK)
             return
 
         def results(action_time):
-            opening, note = self._final_opening(plan)
-            return note, (opening, action_time)
+            return _settled(plan), self._final_opening(plan), action_time
 
         try:
             await self._finish_plan(
@@ -670,56 +671,50 @@ class ActionLayer:
             self._coordinator.follower_state_timeout_s
         )
 
-    def _final_arm_positions(self, plan: ArmPlan) -> tuple[tuple[float, ...], str]:
+    def _final_arm_positions(self, plan: ArmPlan) -> tuple[float, ...]:
         """Prefer the measured landing point; fall back to where the
-        trajectory stopped, saying so."""
+        trajectory stopped."""
         measured = self._fresh_measured_joints()
         if measured is not None:
-            return measured, ""
-        return plan.last_sample(time.monotonic()), COMMANDED_JOINTS_NOTE
+            return measured
+        return plan.last_sample(time.monotonic())
 
-    def _measured_grasp_pose(
-        self, kinematics
-    ) -> tuple[str, tuple[list[str], list[float], list[float]]]:
-        """The pose fields of a posture result and a note: (note, (arm_names,
-        positions, orientations)). The pose is the forward kinematics of the
-        measured joints. A posture result gives only a measured pose. Thus,
-        when the follower state is stale, the three arrays are empty and the
-        note gives the reason."""
+    def _measured_grasp_pose(self, kinematics) -> tuple[list[str], list[float], list[float]]:
+        """The pose fields of a posture result: (arm_names, positions,
+        orientations). The pose is the forward kinematics of the measured
+        joints. A posture result gives only a measured pose. Thus, when the
+        follower state is stale, the three arrays are empty."""
         measured = self._fresh_measured_joints()
         if measured is None:
-            return f"no arm poses: {ARM_LIMB} stopped reporting its joints", ([], [], [])
+            return [], [], []
         position, orientation = kinematics.forward_kinematics(measured)
-        return "", ([ARM_LIMB], list(position), list(orientation))
+        return [ARM_LIMB], list(position), list(orientation)
 
-    def _standing_pose(self, kinematics) -> tuple[str, tuple[list[float], list[float]]]:
+    def _standing_pose(self, kinematics) -> tuple[list[float], list[float]]:
         """Where the grasp point stands with no plan installed, as a move
         that never ran reports it: the forward kinematics of the fresh
-        measured joints, else of the joints commanded last with the note,
-        else no pose."""
-        measured = self._fresh_measured_joints()
-        if measured is not None:
-            position, orientation = kinematics.forward_kinematics(measured)
-            return "", (list(position), list(orientation))
-        commanded = self._coordinator.commanded_arm
-        if commanded is None:
-            return "", _no_pose()
-        position, orientation = kinematics.forward_kinematics(commanded)
-        return COMMANDED_JOINTS_NOTE, (list(position), list(orientation))
+        measured joints, else of the joints commanded last, else no pose."""
+        joints = self._fresh_measured_joints()
+        if joints is None:
+            joints = self._coordinator.commanded_arm
+        if joints is None:
+            return _no_pose()
+        position, orientation = kinematics.forward_kinematics(joints)
+        return list(position), list(orientation)
 
-    def _final_opening(self, plan: GripperPlan) -> tuple[float, str]:
+    def _final_opening(self, plan: GripperPlan) -> float:
         """The opening measured when the plan completed. Otherwise prefer the
         measured opening; fall back to where the ramp stood when the plan was
-        cut, saying so."""
+        cut."""
         if plan.completed_on is not None:
-            return plan.completed_on, ""
+            return plan.completed_on
         measured = self._coordinator.measured_gripper.fresh(
             self._coordinator.follower_state_timeout_s
         )
         if measured is not None:
-            return measured, ""
+            return measured
         assert plan.frozen is not None, "a plan that did not complete was cut"
-        return plan.frozen, COMMANDED_OPENING_NOTE
+        return plan.frozen
 
 
 def _pose_goal(
@@ -730,13 +725,13 @@ def _pose_goal(
     orientation_tolerance_rad: float,
 ) -> PoseGoal:
     """The pose goal these wire fields name, with its orientation normalized,
-    or Rejection: a pose that is no pose, a tolerance that is no bar, or a
+    or Refusal: a pose that is no pose, a tolerance that is no bar, or a
     duration out of its bound."""
     if not all(math.isfinite(v) for v in (*position, *orientation)):
-        raise Rejection("goal pose has non-finite values")
+        raise Refusal(FailureKind.REJECTED, "goal pose has non-finite values")
     norm = math.sqrt(sum(q * q for q in orientation))
     if norm <= QUATERNION_MIN_NORM:
-        raise Rejection("goal pose has an unnormalizable orientation")
+        raise Refusal(FailureKind.REJECTED, "goal pose has an unnormalizable orientation")
     position_tolerance_m = _require_tolerance(position_tolerance_m, "plan_position_tolerance_m")
     orientation_tolerance_rad = _require_tolerance(
         orientation_tolerance_rad, "plan_orientation_tolerance_rad"
@@ -758,7 +753,7 @@ def _pose_move(
     stops_before: int,
 ) -> PoseMove:
     """The move_arm goal `goal` settles into, admitted at stop count
-    `stops_before`, or Rejection: a settle tolerance that is no bar or below
+    `stops_before`, or Refusal: a settle tolerance that is no bar or below
     the plan tolerance of its axis, or a timeout out of its bound."""
     position_tolerance_m = _require_tolerance(
         settle_position_tolerance_m, "settle_position_tolerance_m"
@@ -781,11 +776,13 @@ def _pose_move(
 
 
 def _joint_settle(tolerances_rad: tuple[float, ...], timeout_s: float) -> JointSettle:
-    """The settle of a move_arm_joints goal, or Rejection: a positive finite
+    """The settle of a move_arm_joints goal, or Refusal: a positive finite
     tolerance per joint of the arm, and a timeout."""
     assert len(tolerances_rad) == NUM_JOINTS
     if not all(math.isfinite(v) and v > 0.0 for v in tolerances_rad):
-        raise Rejection("each settle_tolerances_rad entry must be a positive number")
+        raise Refusal(
+            FailureKind.REJECTED, "each settle_tolerances_rad entry must be a positive number"
+        )
     return JointSettle(
         tolerances_rad=tuple(tolerances_rad),
         timeout_s=_require_duration(timeout_s, "settle_timeout_s"),
@@ -793,20 +790,21 @@ def _joint_settle(tolerances_rad: tuple[float, ...], timeout_s: float) -> JointS
 
 
 def _require_duration(value: float, field: str) -> float:
-    """`value`, the seconds the wire field `field` carries, or Rejection
+    """`value`, the seconds the wire field `field` carries, or Refusal
     unless it is within the contract's bound."""
     if not (math.isfinite(value) and 0.0 <= value <= MAX_REQUESTED_DURATION_S):
-        raise Rejection(
-            f"{field} must be a number of seconds from 0 to {MAX_REQUESTED_DURATION_S:.0f}"
+        raise Refusal(
+            FailureKind.REJECTED,
+            f"{field} must be a number of seconds from 0 to {MAX_REQUESTED_DURATION_S:.0f}",
         )
     return value
 
 
 def _require_tolerance(value: float, field: str) -> float:
-    """`value`, the bar the wire field `field` carries, or Rejection unless
+    """`value`, the bar the wire field `field` carries, or Refusal unless
     it is positive and finite."""
     if not (math.isfinite(value) and value > 0.0):
-        raise Rejection(f"{field} must be a positive number")
+        raise Refusal(FailureKind.REJECTED, f"{field} must be a positive number")
     return value
 
 
@@ -814,13 +812,14 @@ def _require_settle_covers_plan(settle_bar: float, plan_bar: float, axis: str) -
     """Refuse a settle bar below the plan bar of its axis, naming the field
     to raise: the plan may sit that far from the pose."""
     if settle_bar < plan_bar:
-        raise Rejection(
-            f"settle_{axis} must be at least plan_{axis}: the plan may sit that far from the pose"
+        raise Refusal(
+            FailureKind.REJECTED,
+            f"settle_{axis} must be at least plan_{axis}: the plan may sit that far from the pose",
         )
 
 
 def _unreached(goal: PoseGoal) -> str:
-    """Why a solve refused, naming the bars it was judged against."""
+    """Why a solve found no plan, naming the bars it was judged against."""
     return (
         f"goal pose not planned within {goal.position_tolerance_m * 1000:.1f} mm / "
         f"{math.degrees(goal.orientation_tolerance_rad):.1f} deg: no solution reaches it "
@@ -831,52 +830,32 @@ def _unreached(goal: PoseGoal) -> str:
 
 def _require_arm_name(arm_name: str) -> None:
     if arm_name != ARM_LIMB:
-        raise Rejection(UNKNOWN_ARM_NAME)
+        raise Refusal(FailureKind.REJECTED, UNKNOWN_ARM_NAME)
 
 
 def _require_gripper_name(gripper_name: str) -> None:
     if gripper_name != GRIPPER_LIMB:
-        raise Rejection(UNKNOWN_GRIPPER_NAME)
+        raise Refusal(FailureKind.REJECTED, UNKNOWN_GRIPPER_NAME)
 
 
-def _terminal(plan: ArmPlan | GripperPlan, note: str) -> tuple[bool, str]:
-    """success and message for a done plan: a coordinator-failed plan is a
-    failed goal, whatever the wall clock says; a plan that did not fail
-    completed, an arm plan as its settle ends it and a gripper plan past the
-    planned end of its travel, with the message of that ending."""
-    if plan.failed is not None:
-        return False, _join(plan.failed, note)
-    return True, _join(_completion(plan), note)
-
-
-def _completion(plan: ArmPlan | GripperPlan) -> str:
-    """The words a completed plan reports."""
-    if isinstance(plan, ArmPlan):
-        return plan.settle.completion
-    if plan.still_moving_after_s is not None:
-        return (
-            "move complete: the jaws had not stood still by the settle timeout, "
-            f"{plan.still_moving_after_s:.1f} s after the planned end"
-        )
-    return "move complete"
+def _settled(plan: GripperPlan) -> bool:
+    """Whether the jaws of `plan` stood still before its settle timeout: a
+    plan that completed at the timeout, or that a cancel or a stop cut, did
+    not settle."""
+    return plan.completed_on is not None and plan.still_moving_after_s is None
 
 
 def _no_pose() -> tuple[list[float], list[float]]:
-    """The final-pose fields of a result with no pose to report: a walked-back
-    admission, a solve that raised, or a move that never ran with neither
-    fresh measured joints nor a commanded setpoint to place the arm. Fresh
-    lists per call, since they are handed to the generated completion API."""
+    """The final-pose fields of a move that never ran with neither fresh
+    measured joints nor a commanded setpoint to place the arm. Fresh lists
+    per call, since they are handed to the generated completion API."""
     return [0.0] * 3, [0.0, 0.0, 0.0, 1.0]
 
 
-async def _complete_guarded(complete, *args) -> None:
-    """Ends the goal through `complete`, the context's complete or
-    complete_cancelled, and logs a completion the runtime refused."""
+async def _end_guarded(end, *args) -> None:
+    """Ends the goal through `end`, the context's complete, fail or
+    complete_cancelled, and logs an end the runtime refused."""
     try:
-        await complete(*args)
+        await end(*args)
     except Exception as e:
         log(f"goal completion failed: {e!r}")
-
-
-def _join(*parts: str) -> str:
-    return "; ".join(p for p in parts if p)

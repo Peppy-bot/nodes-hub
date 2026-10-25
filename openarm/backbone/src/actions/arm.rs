@@ -2,13 +2,15 @@
 //! backbone exposes to the commander, and the `check_arm_move` service that
 //! asks whether a Cartesian goal has a plan without moving. Each validates
 //! the goal (arm_name, finiteness, duration, the settle it asks for, and
-//! joint limits for joint moves) and refuses it while a leader streams the
-//! arm; a move claims the target arm's single-flight slot, then hands the
-//! accepted goal to that arm's planner over its goal channel. The planner
-//! runs the motion - governed against the other arm - settles it, completes
-//! the goal, and releases the busy slot at the terminal. The check claims
-//! nothing: the coordinator asks the planner and answers the duration or the
-//! refusal.
+//! joint limits for joint moves), refusing a value it does not take with
+//! `rejected`, and refuses it while the arm's follower delivers no fresh
+//! state or a leader streams the arm ([`admit_limb`]); a move claims the
+//! target arm's single-flight slot, then hands the accepted goal to that
+//! arm's planner over its goal channel. The planner runs the motion -
+//! governed against the other arm - settles it, ends the goal, and releases
+//! the busy slot at the terminal. The check claims nothing: the coordinator
+//! asks the planner and answers whether a plan exists, or the refusal a
+//! goal would get, as an error reply.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,16 +23,16 @@ use srs_model::Limit;
 use tokio::sync::{mpsc, oneshot};
 use tracing::error;
 
+use crate::actions::{ARM_WORDS, admit_limb, blocking_ask_coordinator, check_limb_free};
 use crate::coordinator::CoordinatorRequest;
-use crate::planner::{ARM_BUSY, Goal, JointReply};
+use crate::failure::{Failure, FailureKind};
+use crate::planner::{Goal, JointReply, PlanCheck};
 use crate::settle::Settle;
+use crate::streams::LeaderActivity;
 use crate::types::{
     ARM_DOF, ArmMoveRequest, JointVec, PoseTolerance, Side, joint_tolerances_from_wire,
     move_seconds_from_wire,
 };
-
-use crate::actions::{ARM_LEADER_STREAMING, ARM_NO_FRESH_STATE, blocking_ask_coordinator, claim};
-use crate::streams::LeaderActivity;
 
 fn target_in_limits(q: &JointVec, limits: &[Limit; ARM_DOF]) -> bool {
     q.iter().zip(limits).all(|(&v, l)| v >= l.lo && v <= l.hi)
@@ -113,20 +115,16 @@ pub async fn run_move_arm_joints(
     loop {
         let accepted = handle
             .handle_goal_next_request(|req| {
-                let request = match joint_move_request(&req.data, &limits) {
-                    Ok(request) => request,
-                    Err(reason) => return Ok(move_arm_joints::GoalDecision::reject(reason)),
-                };
-                if !fresh[request.side.index()].load(Ordering::Acquire) {
-                    return Ok(move_arm_joints::GoalDecision::reject(ARM_NO_FRESH_STATE));
-                }
-                if activity[request.side.index()].streaming() {
-                    return Ok(move_arm_joints::GoalDecision::reject(ARM_LEADER_STREAMING));
-                }
-                if !claim(&busy[request.side.index()]) {
-                    return Ok(move_arm_joints::GoalDecision::reject(ARM_BUSY));
-                }
-                Ok(move_arm_joints::GoalDecision::accept())
+                let admitted = joint_move_request(&req.data, &limits)
+                    .map_err(|reason| Failure::new(FailureKind::Rejected, reason))
+                    .and_then(|request| {
+                        let idx = request.side.index();
+                        admit_limb(&fresh[idx], &activity[idx], &busy[idx], &ARM_WORDS)
+                    });
+                Ok(match admitted {
+                    Ok(()) => move_arm_joints::GoalDecision::accept(),
+                    Err(f) => move_arm_joints::GoalDecision::refuse(f.kind.into(), f.message),
+                })
             })
             .await?;
         let Some(ctx) = accepted else { return Ok(()) };
@@ -165,20 +163,16 @@ pub async fn run_move_arm(
     loop {
         let accepted = handle
             .handle_goal_next_request(|req| {
-                let side = match move_arm_goal(&req.data) {
-                    Ok(goal) => goal.request.side,
-                    Err(reason) => return Ok(move_arm::GoalDecision::reject(reason)),
-                };
-                if !fresh[side.index()].load(Ordering::Acquire) {
-                    return Ok(move_arm::GoalDecision::reject(ARM_NO_FRESH_STATE));
-                }
-                if activity[side.index()].streaming() {
-                    return Ok(move_arm::GoalDecision::reject(ARM_LEADER_STREAMING));
-                }
-                if !claim(&busy[side.index()]) {
-                    return Ok(move_arm::GoalDecision::reject(ARM_BUSY));
-                }
-                Ok(move_arm::GoalDecision::accept())
+                let admitted = move_arm_goal(&req.data)
+                    .map_err(|reason| Failure::new(FailureKind::Rejected, reason))
+                    .and_then(|goal| {
+                        let idx = goal.request.side.index();
+                        admit_limb(&fresh[idx], &activity[idx], &busy[idx], &ARM_WORDS)
+                    });
+                Ok(match admitted {
+                    Ok(()) => move_arm::GoalDecision::accept(),
+                    Err(f) => move_arm::GoalDecision::refuse(f.kind.into(), f.message),
+                })
             })
             .await?;
         let Some(ctx) = accepted else { return Ok(()) };
@@ -202,10 +196,12 @@ pub async fn run_move_arm(
 }
 
 /// Expose `check_arm_move`: validate the planning fields as `move_arm` does,
-/// refuse it as `move_arm` refuses (no fresh follower state, a streaming
-/// leader), then ask the coordinator, which asks the arm's planner for a plan
-/// from the held setpoint and moves nothing. The answer is the duration the
-/// move would take, or the words a `move_arm` refusal gives.
+/// give an error reply where `move_arm` refuses (a value it does not take,
+/// no fresh follower state, a streaming leader, the arm busy), then ask the
+/// coordinator, which asks the arm's planner for a plan from the held
+/// setpoint and moves nothing. The answer is whether a plan exists: the time
+/// the move would take, or the words a `move_arm` failure with `unreachable`
+/// gives. A coordinator that does not answer gives `attempt_failed`.
 pub async fn run_check_arm_move(
     runner: Arc<NodeRunner>,
     requests: mpsc::Sender<CoordinatorRequest>,
@@ -214,52 +210,50 @@ pub async fn run_check_arm_move(
 ) -> Result<()> {
     loop {
         check_arm_move::handle_next_request(&runner, |req| {
-            let d = &req.data;
-            let request = ArmMoveRequest::from_wire(
-                &d.arm_name,
-                d.position,
-                d.orientation,
-                d.duration_s,
-                d.plan_position_tolerance_m,
-                d.plan_orientation_tolerance_rad,
-            );
-            let request = match request {
-                Ok(request) => request,
-                Err(reason) => return Ok(check_arm_move::Response::new(false, reason, 0.0)),
-            };
-            if !fresh[request.side.index()].load(Ordering::Acquire) {
-                return Ok(check_arm_move::Response::new(
-                    false,
-                    ARM_NO_FRESH_STATE.to_string(),
-                    0.0,
-                ));
-            }
-            if activity[request.side.index()].streaming() {
-                return Ok(check_arm_move::Response::new(
-                    false,
-                    ARM_LEADER_STREAMING.to_string(),
-                    0.0,
-                ));
-            }
-            let (reply, answer) = oneshot::channel();
-            let asked = blocking_ask_coordinator(
-                &requests,
-                CoordinatorRequest::CheckArmMove { request, reply },
-                answer,
-            );
-            Ok(match asked {
-                Ok(Ok(duration)) => check_arm_move::Response::new(
-                    true,
-                    format!("a plan reaches the pose in {:.3} s", duration.as_secs_f64()),
-                    duration.as_secs_f64(),
-                ),
-                Ok(Err(refusal)) => check_arm_move::Response::new(false, refusal, 0.0),
-                Err(refusal) => {
-                    error!("check_arm_move: {refusal}");
-                    check_arm_move::Response::new(false, refusal, 0.0)
-                }
-            })
+            check_plan(&requests, &fresh, &activity, &req.data)
+                .map_err(|f| check_arm_move::Failure::new(f.kind.into(), f.message))
         })
         .await?;
     }
+}
+
+/// The answer to one plan check, or the refusal a `move_arm` goal with these
+/// fields would get.
+fn check_plan(
+    requests: &mpsc::Sender<CoordinatorRequest>,
+    fresh: &[Arc<AtomicBool>; 2],
+    activity: &[LeaderActivity; 2],
+    d: &check_arm_move::RequestData,
+) -> std::result::Result<check_arm_move::Response, Failure> {
+    let request = ArmMoveRequest::from_wire(
+        &d.arm_name,
+        d.position,
+        d.orientation,
+        d.duration_s,
+        d.plan_position_tolerance_m,
+        d.plan_orientation_tolerance_rad,
+    )
+    .map_err(|reason| Failure::new(FailureKind::Rejected, reason))?;
+    let idx = request.side.index();
+    check_limb_free(
+        fresh[idx].load(Ordering::Acquire),
+        activity[idx].streaming(),
+        &ARM_WORDS,
+    )?;
+    let (reply, answer) = oneshot::channel();
+    let checked = blocking_ask_coordinator(
+        requests,
+        CoordinatorRequest::CheckArmMove { request, reply },
+        answer,
+    )
+    .map_err(|reason| {
+        error!("check_arm_move: {reason}");
+        Failure::new(FailureKind::AttemptFailed, reason)
+    })??;
+    Ok(match checked {
+        PlanCheck::Reachable(duration) => {
+            check_arm_move::Response::new(true, String::new(), duration.as_secs_f64())
+        }
+        PlanCheck::Unreachable(reason) => check_arm_move::Response::new(false, reason, 0.0),
+    })
 }
