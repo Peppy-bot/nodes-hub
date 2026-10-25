@@ -61,9 +61,11 @@
     // In a simulation, the setup waits for the engine to accept the robot
     // and then to stand it: the engine fetches the robot's files, which
     // takes longest on a cold cache, builds its world again and places the
-    // robot. The two waits share this budget, less 5.5 s that the node
-    // keeps to leave the simulation when the robot does not stand, so the
-    // node fails with its own reason before peppy's limit.
+    // robot. While the engine refuses the robot with `busy`, because a
+    // robot in its way still joins or leaves the scene, the node sends its
+    // goal again every second. The waits share this budget, less 5.5 s that
+    // the node keeps to leave the simulation when the robot does not stand,
+    // so the node fails with its own reason before peppy's limit.
     setup_timeout_secs: 180,
     parameters: {
       // The robot's model id, as a simulation's catalogue names it, for

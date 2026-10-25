@@ -133,9 +133,12 @@ pub async fn shutdown_once_setup_returns(harness: Harness) -> peppygen::Result<(
 
 /// A clock that the test drives: the robot's wait for standing hears the
 /// moments the test sends, and no other, so no test reaches the stand
-/// budget unless it spends it.
+/// budget unless it spends it. A resend the test sends waits until the
+/// robot asks for one, so it never ends a wait the robot has not begun.
 pub struct ScriptedClock {
     moments: mpsc::UnboundedReceiver<Moment>,
+    resends: mpsc::UnboundedReceiver<()>,
+    resend_asked: bool,
     elapsed: Duration,
 }
 
@@ -144,25 +147,46 @@ impl StandClock for ScriptedClock {
         self.elapsed
     }
 
+    fn resend_soon(&mut self) {
+        self.resend_asked = true;
+    }
+
     async fn next(&mut self) -> Moment {
-        let Some(moment) = self.moments.recv().await else {
+        let heard = tokio::select! {
+            moment = self.moments.recv() => moment,
+            resend = self.resends.recv(), if self.resend_asked => resend.map(|()| Moment::Resend),
+        };
+        let Some(moment) = heard else {
             return std::future::pending().await;
         };
-        if let Moment::Progress(elapsed) = moment {
-            self.elapsed = elapsed;
+        match moment {
+            Moment::Progress(elapsed) => self.elapsed = elapsed,
+            Moment::Resend => self.resend_asked = false,
+            Moment::Spent => {}
         }
         moment
     }
 }
 
 /// The test's end of a [`ScriptedClock`].
-pub struct Clock(mpsc::UnboundedSender<Moment>);
+pub struct Clock {
+    moments: mpsc::UnboundedSender<Moment>,
+    resends: mpsc::UnboundedSender<()>,
+}
 
 impl Clock {
-    /// Tells the robot that it does not stand yet, `elapsed` after its goal
-    /// was sent.
+    /// Tells the robot that it does not stand yet, `elapsed` after its
+    /// first goal was sent.
     pub fn progress(&self, elapsed: Duration) {
         self.send(Moment::Progress(elapsed));
+    }
+
+    /// Ends the robot's wait before it sends a goal that the engine refused
+    /// with `busy` again, once the robot waits. A robot whose stay is over
+    /// reads its clock no more, and hears nothing: it sends nothing again
+    /// either way.
+    pub fn resend(&self) {
+        let _ = self.resends.send(());
     }
 
     /// Spends the robot's stand budget.
@@ -171,7 +195,7 @@ impl Clock {
     }
 
     fn send(&self, moment: Moment) {
-        self.0
+        self.moments
             .send(moment)
             .expect("the robot's wait for standing hears its clock");
     }
@@ -180,10 +204,13 @@ impl Clock {
 /// A clock for the test to drive, and the end of it that the node reads.
 pub fn scripted_clock() -> (Clock, ScriptedClock) {
     let (moments, heard) = mpsc::unbounded_channel();
+    let (resends, resend_heard) = mpsc::unbounded_channel();
     (
-        Clock(moments),
+        Clock { moments, resends },
         ScriptedClock {
             moments: heard,
+            resends: resend_heard,
+            resend_asked: false,
             elapsed: Duration::ZERO,
         },
     )
@@ -246,12 +273,18 @@ pub fn capture_logs() {
 /// Waits until a line that holds `text` is logged, failing the test after
 /// [`LOGGING`].
 pub async fn logged(text: &str) {
+    logged_times(text, 1).await;
+}
+
+/// Waits until `times` lines that hold `text` are logged, failing the test
+/// after [`LOGGING`]: how a test waits for a line its robot logs again.
+pub async fn logged_times(text: &str, times: usize) {
     let mut lines = LOGGED.subscribe();
     tokio::time::timeout(
         LOGGING,
-        lines.wait_for(|lines| lines.iter().any(|line| line.contains(text))),
+        lines.wait_for(|lines| lines.iter().filter(|line| line.contains(text)).count() >= times),
     )
     .await
-    .unwrap_or_else(|_| panic!("the node logs {text:?} within {LOGGING:?}"))
+    .unwrap_or_else(|_| panic!("the node logs {text:?} {times} times within {LOGGING:?}"))
     .expect("the log stays open for as long as the test binary runs");
 }

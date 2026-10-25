@@ -1,10 +1,11 @@
 //! Joining a simulation over the wire, the engine played by its generated
 //! mock: the node attaches as the name it runs under with the model it is,
 //! stands where it is told, starts only once the engine stands it, says so
-//! while it waits, fails with the engine's failure kind and reason or its
-//! own when the robot does not stand, cancels every goal the engine accepted
-//! when it stops, serves no readiness for a robot that does not stand, and
-//! says how the stay of a robot that stood ended.
+//! while it waits, attaches again while the engine refuses it with `busy`,
+//! fails with the engine's failure kind and reason or its own when the
+//! robot does not stand, cancels every goal the engine accepted when it
+//! stops, serves no readiness for a robot that does not stand, and says how
+//! the stay of a robot that stood ended.
 //!
 //! The tests of the wait for standing run it on a clock the test drives, on
 //! the stand budget of the node's manifest, so no test reaches a deadline it
@@ -18,7 +19,7 @@ use peppygen::mock::deps::simulation::attach;
 
 mod common;
 use common::{
-    ScriptedClock, await_setup_return, capture_logs, joining_a_simulation, logged,
+    ScriptedClock, await_setup_return, capture_logs, joining_a_simulation, logged, logged_times,
     on_its_own_hardware, scripted_clock, setup_on, shutdown_once_setup_returns, simulation_of,
     stood,
 };
@@ -38,6 +39,10 @@ const STAND_BUDGET: &str = "174.5 s";
 /// The reason the engine ends the goal of a robot it took out because its
 /// caller cancelled the goal.
 const CANCELLED_BY_ITS_CALLER: &str = "cancelled by its caller";
+
+/// What the engine says when it refuses a robot with `busy` because the
+/// robot of its name still leaves the scene.
+const STILL_LEAVING: &str = "'alpha' is leaving the world; attach again once it is out";
 
 /// Stops the node, and plays the engine that takes its robot out: the node
 /// cancels the robot's goal, and the engine ends it as cancelled. Answers
@@ -329,6 +334,192 @@ async fn a_robot_stopped_before_it_stands_leaves_the_scene() -> peppygen::Result
     // Admitted and not standing yet, the robot is stopped: it takes itself
     // out, and the stop is no failure.
     stop_and_take_out(harness, &stay).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_robot_refused_with_busy_attaches_again_and_stands() -> peppygen::Result<()> {
+    capture_logs();
+    let (clock, scripted) = scripted_clock();
+    let placed = Config {
+        parameters: Some(common::standing_at("openarm_v2", 1.0, -2.0, 0.0, 0.5)),
+        ..joining_a_simulation("openarm_v2")
+    };
+    let (harness, mut mocks) = Harness::start_with(placed, setup_on(scripted)).await?;
+    let mut simulation = simulation_of(&mut mocks);
+    let robot = harness.instance_id().to_owned();
+
+    // The robot of its name still leaves the scene: the engine refuses it
+    // with `busy`, and the robot says that it waits.
+    simulation
+        .attach
+        .next_goal(WIRE)
+        .await?
+        .refuse(attach::FailureKind::Busy, STILL_LEAVING)
+        .await?;
+    logged(&format!(
+        "the simulation cannot take '{robot}' yet (busy: {STILL_LEAVING}); it attaches again in 1 s"
+    ))
+    .await;
+    assert!(
+        simulation.attach.next_goal(UNSERVED).await.is_err(),
+        "the robot attaches again only once its wait is over"
+    );
+
+    // While it waits, it goes on saying that it does not stand yet.
+    clock.progress(Duration::from_secs(10));
+    logged(&format!(
+        "'{robot}' does not stand yet: 10 s of {STAND_BUDGET}"
+    ))
+    .await;
+    assert!(
+        !harness.setup_finished(),
+        "a robot that waits for its name has not failed"
+    );
+
+    // Its wait over, the robot sends the same goal again, and the engine
+    // admits it and stands it.
+    clock.resend();
+    let again = simulation.attach.next_goal(WIRE).await?;
+    assert_eq!(again.request.robot, robot);
+    assert_eq!(again.request.model, "openarm_v2");
+    let spot = again
+        .request
+        .placement
+        .clone()
+        .expect("the robot names its spot again");
+    assert_eq!((spot.position, spot.yaw), ([1.0, -2.0, 0.0], 0.5));
+    let stay = again.accept(stood()).await?;
+    stay.publish_feedback(&attach::FeedbackMessage { standing: true })
+        .await?;
+    await_setup_return(&harness).await;
+    robot_is_ready::poll(&harness, WIRE).await?;
+
+    stop_and_take_out(harness, &stay).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_robot_refused_for_another_reason_after_it_waited_fails_at_once() -> peppygen::Result<()>
+{
+    let (clock, scripted) = scripted_clock();
+    let (harness, mut mocks) =
+        Harness::start_with(joining_a_simulation("openarm_v2"), setup_on(scripted)).await?;
+    let mut simulation = simulation_of(&mut mocks);
+    simulation
+        .attach
+        .next_goal(WIRE)
+        .await?
+        .refuse(attach::FailureKind::Busy, STILL_LEAVING)
+        .await?;
+
+    // Once the robot of its name is out, another robot stands too close:
+    // a refusal that does not pass, so the robot fails without waiting.
+    clock.resend();
+    simulation
+        .attach
+        .next_goal(WIRE)
+        .await?
+        .refuse(
+            attach::FailureKind::PreconditionFailed,
+            "robot 'other' stands within 1.5 m",
+        )
+        .await?;
+    await_setup_return(&harness).await;
+    clock.resend();
+    assert!(
+        simulation.attach.next_goal(UNSERVED).await.is_err(),
+        "a robot refused for good attaches no more"
+    );
+    let failure = harness
+        .shutdown()
+        .await
+        .expect_err("a refused robot fails to start")
+        .to_string();
+    assert!(
+        failure.contains(
+            "the simulation refused this robot: precondition_failed: robot 'other' stands within 1.5 m"
+        ),
+        "{failure}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_robot_refused_with_busy_until_its_budget_is_spent_fails() -> peppygen::Result<()> {
+    capture_logs();
+    let (clock, scripted) = scripted_clock();
+    let (harness, mut mocks) =
+        Harness::start_with(joining_a_simulation("openarm_v2"), setup_on(scripted)).await?;
+    let mut simulation = simulation_of(&mut mocks);
+    let waits = format!("the simulation cannot take '{}' yet", harness.instance_id());
+    for _ in 0..2 {
+        simulation
+            .attach
+            .next_goal(WIRE)
+            .await?
+            .refuse(attach::FailureKind::Busy, STILL_LEAVING)
+            .await?;
+        clock.resend();
+    }
+    simulation
+        .attach
+        .next_goal(WIRE)
+        .await?
+        .refuse(attach::FailureKind::Busy, STILL_LEAVING)
+        .await?;
+
+    // The robot of its name is still not out when the stand budget is
+    // spent, while the robot waits after its third goal: the robot fails,
+    // with the engine's last refusal.
+    logged_times(&waits, 3).await;
+    clock.spend();
+    await_setup_return(&harness).await;
+    clock.resend();
+    assert!(
+        simulation.attach.next_goal(UNSERVED).await.is_err(),
+        "a robot out of budget attaches no more"
+    );
+    let failure = harness
+        .shutdown()
+        .await
+        .expect_err("a robot that did not stand in time fails to start")
+        .to_string();
+    assert!(
+        failure.contains(&format!(
+            "the simulation did not stand this robot within {STAND_BUDGET}: until then it refused this robot with busy: {STILL_LEAVING}"
+        )),
+        "{failure}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_robot_stopped_while_it_waits_to_attach_again_stops() -> peppygen::Result<()> {
+    capture_logs();
+    let (clock, scripted) = scripted_clock();
+    let (harness, mut mocks) =
+        Harness::start_with(joining_a_simulation("openarm_v2"), setup_on(scripted)).await?;
+    let mut simulation = simulation_of(&mut mocks);
+    let robot = harness.instance_id().to_owned();
+    simulation
+        .attach
+        .next_goal(WIRE)
+        .await?
+        .refuse(attach::FailureKind::Busy, STILL_LEAVING)
+        .await?;
+    logged(&format!("the simulation cannot take '{robot}' yet")).await;
+
+    // The node stops while it waits: the wait ends, and nothing more is
+    // sent, even once the wait would have been over.
+    harness.node_runner().cancellation_token().cancel();
+    await_setup_return(&harness).await;
+    clock.resend();
+    assert!(
+        simulation.attach.next_goal(UNSERVED).await.is_err(),
+        "a stopped robot attaches no more"
+    );
+
+    // A stop is no failure.
+    harness.shutdown().await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
