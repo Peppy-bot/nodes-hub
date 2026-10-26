@@ -210,16 +210,19 @@ const CAPTURED = 1757944800.25;
 // objectState: the provider's reason while it has no object state, which the
 // node answers with HTTP 503; null once it has a snapshot.
 // capabilities: what /api/capabilities reports bound beside the scene.
-// lighting, materials: what their providers list; null while no scene is
-// loaded, which the node answers with HTTP 503. cameras: what /api/cameras
-// lists, every camera the simulation renders.
+// lighting, daylight, materials: what their providers report; null while no
+// scene is loaded, which the node answers with HTTP 503. cameras: what
+// /api/cameras lists, every camera the simulation renders.
 // A load or a spawn answers with a stream that ends at once with success,
 // unless the test prepared the answer of the next request to its path.
 // Requests share the connections a browser keeps to one server over HTTP/1.1,
 // six at most: a request waits for a free one, and a streamed answer holds its
 // connection until it ends or the page aborts it.
 async function page(catalogue = [staticScene, dynamicScene, cage], objects = [],
-    { unavailable = 0, objectState = null, robots = [], capabilities = {}, lighting = null, materials = null, cameras = [] } = {}) {
+    {
+        unavailable = 0, objectState = null, robots = [], capabilities = {},
+        lighting = null, daylight = null, materials = null, cameras = [],
+    } = {}) {
     const elements = new Map();
     registerElements(html, elements);
     const requests = [];
@@ -233,6 +236,7 @@ async function page(catalogue = [staticScene, dynamicScene, cage], objects = [],
     let currentCatalogue = catalogue;
     let currentObjects = objects;
     let currentLighting = lighting;
+    let currentDaylight = daylight;
     let currentMaterials = materials;
     let currentCameras = cameras;
     let objectStateReason = objectState;
@@ -277,6 +281,9 @@ async function page(catalogue = [staticScene, dynamicScene, cage], objects = [],
         if (path === '/api/lighting' && currentLighting === null) {
             return refused(503, NO_SCENE);
         }
+        if (path === '/api/daylight' && currentDaylight === null) {
+            return refused(503, NO_SCENE);
+        }
         if (path === '/api/materials' && currentMaterials === null) {
             return refused(503, NO_SCENE);
         }
@@ -285,8 +292,9 @@ async function page(catalogue = [staticScene, dynamicScene, cage], objects = [],
                 ? { objects: currentObjects, count: currentObjects.length, timestamp: CAPTURED }
             : path === '/api/robots' ? { robots, count: robots.length }
             : path === '/api/capabilities'
-                ? { lighting: false, materials: false, cameras: false, ...capabilities }
+                ? { lighting: false, daylight: false, materials: false, cameras: false, ...capabilities }
             : path === '/api/lighting' ? { lighting: currentLighting }
+            : path === '/api/daylight' ? { daylight: currentDaylight }
             : path === '/api/materials' ? { materials: currentMaterials }
             : path === '/api/cameras'
                 ? { message: `${currentCameras.length} cameras rendered`, cameras: currentCameras, count: currentCameras.length }
@@ -349,6 +357,7 @@ async function page(catalogue = [staticScene, dynamicScene, cage], objects = [],
         setObjects: list => { currentObjects = list; objectStateReason = null; },
         setObjectStateUnavailable: reason => { objectStateReason = reason; },
         setLighting: state => { currentLighting = state; },
+        setDaylight: state => { currentDaylight = state; },
         setMaterials: state => { currentMaterials = state; },
         setCameras: list => { currentCameras = list; },
         // The stream the next request to `path` answers with, which the test feeds.
@@ -1033,17 +1042,18 @@ test('a spawn that fails once accepted shows the reason and reads nothing again'
     assert.equal(ui.element('status').style.borderColor, '#9b424c');
 });
 
-// What a launch may bind beside the scene, as the node reports it.
+// What a launch may bind beside the scene, as the node reports it. The sun
+// follows the daylight: it lists its values alone, no default and no bounds.
 const sun = {
-    id: 'sun', kind: 'directional', label: 'Sun',
+    id: 'sun', kind: 'sun', label: 'Sun', follows_daylight: true, baked_indirect: 'on',
     properties: {
-        illuminance_lux: { unit: 'lx', min: 0, max: 200000, default: 1000, value: 1200 },
-        color_rgb: { unit: 'linear rgb', default: [1, 1, 1], value: [1, 0.95, 0.9] },
-        direction: { unit: 'unit vector', default: [0, 0, -1], value: [0.3, 0, -0.95] },
+        illuminance_lux: { unit: 'lx', value: 98000 },
+        color_rgb: { unit: 'linear rgb', value: [1, 0.95, 0.9] },
+        direction: { unit: 'unit vector', value: [0.3, 0, -0.95] },
     },
 };
 const lamp = {
-    id: 'lamp', kind: 'spot', label: 'Desk lamp',
+    id: 'lamp', kind: 'spot', label: 'Desk lamp', follows_daylight: false, baked_indirect: 'on',
     properties: {
         luminous_flux_lm: { unit: 'lm', min: 0, max: 20000, default: 800, value: 800 },
         color_rgb: { unit: 'linear rgb', default: [1, 1, 1], value: [1, 1, 1] },
@@ -1053,14 +1063,27 @@ const lamp = {
         outer_angle_rad: { unit: 'rad', min: 0, max: 1.5, default: 0.5, value: 0.5 },
     },
 };
-const sky = {
-    id: 'sky', kind: 'environment', label: 'Sky',
+const environment = {
+    id: 'environment', kind: 'environment', label: 'Studio map', follows_daylight: false, baked_indirect: 'none',
     properties: {
         radiance_scale: { unit: 'ratio', min: 0, max: 10, default: 1, value: 1 },
         orientation_xyzw: { unit: 'quaternion', default: [0, 0, 0, 1], value: [0, 0, 0, 1] },
     },
 };
-const warehouseLighting = { scene: staticScene.asset_id, ambient_lux: 120, fill_lux: 40, lights: [sun, lamp, sky] };
+const warehouseLighting = { scene: staticScene.asset_id, lights: [sun, lamp, environment] };
+const warehouseDaylight = {
+    scene: staticScene.asset_id,
+    place: { latitude_deg: 48.85, longitude_deg: 2.35, utc_offset_h: 1, north_deg: 0 },
+    date: '2026-06-21', time: '10:00:00', rate: 0,
+    weather: { cloud_cover: 0, rain_mm_h: 0 },
+    sun: { azimuth_deg: 120.5, elevation_deg: 45.2, illuminance_lux: 98000, rise: '04:47:00', set: '20:58:00' },
+    moon: {
+        azimuth_deg: 60, elevation_deg: -10, illuminance_lux: 0, rise: '02:13:00', set: '18:40:00',
+        phase_angle_deg: 95, illuminated_fraction: 0.46, waxing: true,
+    },
+    sky: { illuminance_lux: 21000 },
+    defaults: { date: '2026-06-21', time: '10:00:00', rate: 0, weather: { cloud_cover: 0, rain_mm_h: 0 } },
+};
 const steel = {
     id: 'steel', label: 'Brushed steel',
     scope: { owner: 'scene', surfaces: 3, bodies: ['shelf_1', 'shelf_2'] },
@@ -1095,7 +1118,7 @@ const chest = {
     profile: null,
     profile_message: 'the simulation describes no profile for alpha/chest',
 };
-const cards = ['lightingCard', 'materialsCard', 'camerasCard'];
+const cards = ['lightingCard', 'daylightCard', 'materialsCard', 'camerasCard'];
 
 test('with only scene manipulation bound the capability cards stay hidden and nothing polls', async () => {
     const ui = await page();
@@ -1123,26 +1146,31 @@ test('bound lighting renders one control per listed property and applies a route
         ['/api/capabilities', '/api/assets', '/api/objects', '/api/robots', '/api/lighting']);
     assert.deepEqual(ui.intervals, [3000]);
     assert.equal(ui.element('lightingCard').hidden, false);
+    assert.equal(ui.element('daylightCard').hidden, true);
     assert.equal(ui.element('materialsCard').hidden, true);
     assert.equal(ui.element('camerasCard').hidden, true);
-    assert.equal(ui.element('lightingSummary').textContent,
-        `${staticScene.asset_id} | ambient 120 lx | fill 40 lx`);
+    assert.equal(ui.element('lightingSummary').textContent, `${staticScene.asset_id} | 3 lights`);
 
-    // A control per property the light lists, and none for the rest.
-    assert.equal(ui.element('lighting0_illuminance_lux_0').value, '1200');
-    assert.equal(ui.element('lighting0_illuminance_lux_0').attributes.min, '0');
-    assert.equal(ui.element('lighting0_illuminance_lux_0').attributes.max, '200000');
-    assert.equal(ui.element('lighting0_color_rgb_2').value, '0.9');
-    assert.equal(ui.element('lighting0_direction_2').value, '-0.95');
-    assert.equal(ui.element('lighting0_position_m_0'), undefined, 'a directional light has no position');
-    assert.equal(ui.element('lighting0_inner_angle_rad_0'), undefined, 'a directional light has no cone');
+    // A light that follows the daylight lists its values and has no input.
+    assert.equal(ui.element('lighting0_values').textContent,
+        'illuminance_lux 98000 lx | color_rgb [1, 0.95, 0.9] linear rgb | direction [0.3, 0, -0.95] unit vector');
+    for (const input of ['lighting0_illuminance_lux_0', 'lighting0_color_rgb_0', 'lighting0_direction_0']) {
+        assert.equal(ui.element(input), undefined, `the sun has no #${input}`);
+    }
+    assert.match(ui.element('lightingTargets').innerHTML, /sun \| sun \| follows the daylight/);
+    assert.doesNotMatch(ui.element('lightingTargets').innerHTML, /applyProperty\('lighting', 0,/);
+
+    // A control per property the lamp lists, and none for the rest.
+    assert.equal(ui.element('lighting1_luminous_flux_lm_0').value, '800');
+    assert.equal(ui.element('lighting1_luminous_flux_lm_0').attributes.min, '0');
+    assert.equal(ui.element('lighting1_luminous_flux_lm_0').attributes.max, '20000');
     assert.equal(ui.element('lighting1_position_m_2').value, '1.8');
     assert.equal(ui.element('lighting1_outer_angle_rad_0').value, '0.5');
+    assert.equal(ui.element('lighting1_values'), undefined, 'a lamp has an input for every property');
     assert.equal(ui.element('lighting2_orientation_xyzw_3').value, '1');
     assert.equal(ui.element('lighting2_color_rgb_0'), undefined, 'an environment light has no colour');
-    assert.equal(ui.element('lighting0_intensity_current').textContent, 'illuminance_lux 1200 (default 1000)');
-    assert.equal(ui.element('lighting0_color_current').textContent,
-        'color_rgb [1, 0.95, 0.9] (default [1, 1, 1])');
+    assert.equal(ui.element('lighting1_intensity_current').textContent, 'luminous_flux_lm 800 (default 800)');
+    assert.equal(ui.element('lighting1_color_current').textContent, 'color_rgb [1, 1, 1] (default [1, 1, 1])');
     assert.equal(ui.element('lighting1_cone_current').textContent,
         'inner_angle_rad 0.3 (default 0.3) | outer_angle_rad 0.5 (default 0.5)');
     assert.match(ui.element('lightingTargets').innerHTML, /spot \| lamp/);
@@ -1153,14 +1181,14 @@ test('bound lighting renders one control per listed property and applies a route
     assert.deepEqual(ui.requests.slice(-2).map(r => r.path), ['/api/lighting/cone', '/api/lighting']);
     assert.deepEqual(ui.requests.at(-2).body, { light_id: 'lamp', inner_angle: 0.2, outer_angle: 0.6 });
 
-    ui.element('lighting0_color_rgb_0').value = '0.5';
-    await ui.run("applyProperty('lighting', 0, 'color')");
-    assert.deepEqual(ui.requests.at(-2).body, { light_id: 'sun', color: [0.5, 0.95, 0.9] });
-    assert.equal(ui.element('lighting0_color_rgb_0').value, '0.5', 'an edit survives the read that follows');
+    ui.element('lighting1_color_rgb_0').value = '0.5';
+    await ui.run("applyProperty('lighting', 1, 'color')");
+    assert.deepEqual(ui.requests.at(-2).body, { light_id: 'lamp', color: [0.5, 1, 1] });
+    assert.equal(ui.element('lighting1_color_rgb_0').value, '0.5', 'an edit survives the read that follows');
 
     ui.element('lighting2_orientation_xyzw_0').value = '0.7';
     await ui.run("applyProperty('lighting', 2, 'orientation')");
-    assert.deepEqual(ui.requests.at(-2).body, { light_id: 'sky', orientation: [0.7, 0, 0, 1] });
+    assert.deepEqual(ui.requests.at(-2).body, { light_id: 'environment', orientation: [0.7, 0, 0, 1] });
 
     await ui.run("resetPanel('lighting')");
     assert.deepEqual(ui.requests.slice(-2).map(r => r.path), ['/api/lighting/reset', '/api/lighting']);
@@ -1170,17 +1198,21 @@ test('bound lighting renders one control per listed property and applies a route
 
 test('a refresh shows the values the provider reports and rebuilds the controls only when its lights change', async () => {
     const ui = await page([staticScene], [], { capabilities: { lighting: true }, lighting: warehouseLighting });
-    ui.element('lighting0_illuminance_lux_0').value = '3000';
-    const brighter = { ...sun.properties.illuminance_lux, value: 5000 };
-    ui.setLighting({ ...warehouseLighting, lights: [{ ...sun, properties: { ...sun.properties, illuminance_lux: brighter } }, lamp, sky] });
+    ui.element('lighting1_luminous_flux_lm_0').value = '3000';
+    const higher = { ...sun, properties: { ...sun.properties, illuminance_lux: { unit: 'lx', value: 105000 } } };
+    const brighter = { ...lamp, properties: { ...lamp.properties, luminous_flux_lm: { ...lamp.properties.luminous_flux_lm, value: 5000 } } };
+    ui.setLighting({ ...warehouseLighting, lights: [higher, brighter, environment] });
     await ui.run('refreshPanels()');
-    assert.equal(ui.element('lighting0_intensity_current').textContent, 'illuminance_lux 5000 (default 1000)');
-    assert.equal(ui.element('lighting0_illuminance_lux_0').value, '3000', 'the edit in progress is kept');
+    assert.equal(ui.element('lighting1_intensity_current').textContent, 'luminous_flux_lm 5000 (default 800)');
+    assert.equal(ui.element('lighting1_luminous_flux_lm_0').value, '3000', 'the edit in progress is kept');
+    assert.match(ui.element('lighting0_values').textContent, /^illuminance_lux 105000 lx \|/,
+        'the values of a light that follows the daylight show as they change');
 
-    ui.setLighting({ ...warehouseLighting, lights: [sun] });
+    ui.setLighting({ ...warehouseLighting, lights: [lamp] });
     await ui.run('refreshPanels()');
     assert.equal(ui.element('lighting1_cone_current'), undefined, 'a light that is gone takes its controls with it');
-    assert.equal(ui.element('lighting0_illuminance_lux_0').value, '1200');
+    assert.equal(ui.element('lighting0_values'), undefined, 'the sun is gone with its values');
+    assert.equal(ui.element('lighting0_luminous_flux_lm_0').value, '800');
 
     ui.setLighting(null);
     await ui.run('refreshPanels()');
@@ -1194,16 +1226,125 @@ test('a refresh shows the values the provider reports and rebuilds the controls 
         'inner_angle_rad 0.3 (default 0.3) | outer_angle_rad 0.5 (default 0.5)');
 });
 
+test('bound daylight shows the clock, the weather and the bodies, and posts each route as one request', async () => {
+    const ui = await page([staticScene], [], { capabilities: { daylight: true }, daylight: warehouseDaylight });
+    assert.deepEqual(ui.requests.map(r => r.path),
+        ['/api/capabilities', '/api/assets', '/api/objects', '/api/robots', '/api/daylight']);
+    assert.deepEqual(ui.intervals, [3000]);
+    assert.equal(ui.element('daylightCard').hidden, false);
+    assert.equal(ui.element('lightingCard').hidden, true);
+    assert.equal(ui.element('daylightSummary').textContent,
+        `${staticScene.asset_id} | latitude 48.85 deg | longitude 2.35 deg | UTC offset +1 h`);
+
+    // The inputs start at the values in effect.
+    assert.equal(ui.element('daylightDate').value, '2026-06-21');
+    assert.equal(ui.element('daylightTime').value, '10:00:00');
+    assert.equal(ui.element('daylightRate').value, '0');
+    assert.equal(ui.element('daylightCloudCover').value, '0');
+    assert.equal(ui.element('daylightRain').value, '0');
+    assert.equal(ui.element('daylight_time_current').textContent,
+        'date 2026-06-21 (default 2026-06-21) | time 10:00:00 (default 10:00:00)');
+    assert.equal(ui.element('daylight_rate_current').textContent, 'rate 0 (default 0)');
+    assert.equal(ui.element('daylight_weather_current').textContent,
+        'cloud_cover 0 (default 0) | rain_mm_h 0 (default 0)');
+    assert.equal(ui.element('daylightSun').textContent,
+        'Sun | azimuth 120.5 deg | elevation 45.2 deg | 98000 lx | rises 04:47:00 | sets 20:58:00');
+    assert.equal(ui.element('daylightMoon').textContent,
+        'Moon | azimuth 60 deg | elevation -10 deg | 0 lx | rises 02:13:00 | sets 18:40:00'
+        + ' | illuminated 0.46 (phase angle 95 deg, waxing)');
+    assert.equal(ui.element('daylightSky').textContent, 'Sky | 21000 lx');
+
+    // An empty date keeps the date: the page posts it as it is.
+    ui.element('daylightDate').value = '';
+    ui.element('daylightTime').value = '18:30';
+    await ui.run("applyDaylight('time')");
+    assert.deepEqual(ui.requests.slice(-2).map(r => r.path), ['/api/daylight/time', '/api/daylight']);
+    assert.deepEqual(ui.requests.at(-2).body, { date: '', time: '18:30' });
+    assert.equal(ui.element('daylightTime').value, '18:30', 'an edit survives the read that follows');
+
+    ui.element('daylightRate').value = '60';
+    await ui.run("applyDaylight('rate')");
+    assert.deepEqual(ui.requests.at(-2), { path: '/api/daylight/rate', body: { rate: 60 } });
+
+    ui.element('daylightCloudCover').value = '0.8';
+    ui.element('daylightRain').value = '4';
+    await ui.run("applyDaylight('weather')");
+    assert.deepEqual(ui.requests.at(-2), { path: '/api/daylight/weather', body: { cloud_cover: 0.8, rain_mm_h: 4 } });
+
+    await ui.run('resetDaylight()');
+    assert.deepEqual(ui.requests.slice(-2), [{ path: '/api/daylight/reset', body: {} }, { path: '/api/daylight', body: undefined }]);
+    assert.equal(ui.element('status').textContent, 'Scene loaded');
+});
+
+test('a daylight read shows the running clock, keeps the edits in progress and fills the inputs for a new scene', async () => {
+    const ui = await page([staticScene], [], { capabilities: { daylight: true }, daylight: warehouseDaylight });
+    ui.element('daylightTime').value = '18:30';
+    ui.setDaylight({
+        ...warehouseDaylight, time: '10:01:00', rate: 60,
+        sun: { ...warehouseDaylight.sun, rise: null, set: null },
+        moon: { ...warehouseDaylight.moon, waxing: false },
+    });
+    await ui.run('refreshPanels()');
+    assert.equal(ui.element('daylight_time_current').textContent,
+        'date 2026-06-21 (default 2026-06-21) | time 10:01:00 (default 10:00:00)');
+    assert.equal(ui.element('daylight_rate_current').textContent, 'rate 60 (default 0)');
+    assert.equal(ui.element('daylightTime').value, '18:30', 'the edit in progress is kept');
+    assert.equal(ui.element('daylightRate').value, '0', 'an input the user did not edit keeps its value too');
+    assert.match(ui.element('daylightSun').textContent, /\| does not rise \| does not set$/);
+    assert.match(ui.element('daylightMoon').textContent, /, waning\)$/);
+
+    ui.setDaylight(null);
+    await ui.run('refreshPanels()');
+    assert.equal(ui.element('daylightCard').hidden, true);
+    assert.equal(ui.element('status').textContent, 'Loaded 1 assets', 'a periodic read that fails is silent');
+
+    ui.setDaylight({
+        ...warehouseDaylight, scene: 'scene/kitchen', date: '2026-12-21', time: '08:00:00',
+        place: { ...warehouseDaylight.place, utc_offset_h: -5.5 },
+    });
+    await ui.run('refreshPanels()');
+    assert.equal(ui.element('daylightCard').hidden, false);
+    assert.equal(ui.element('daylightDate').value, '2026-12-21', 'the daylight of a new scene fills the inputs');
+    assert.equal(ui.element('daylightTime').value, '08:00:00');
+    assert.match(ui.element('daylightSummary').textContent, /^scene\/kitchen \| .* \| UTC offset -5.5 h$/);
+});
+
+test('a daylight change reads the lights that follow it again, and a refused one reads nothing', async () => {
+    const ui = await page([staticScene], [], {
+        capabilities: { lighting: true, daylight: true }, lighting: warehouseLighting, daylight: warehouseDaylight,
+    });
+    assert.deepEqual(ui.requests.slice(-2).map(r => r.path), ['/api/lighting', '/api/daylight']);
+
+    let since = ui.requests.length;
+    await ui.run("applyDaylight('time')");
+    await ui.run('resetDaylight()');
+    assert.deepEqual(ui.requests.slice(since).map(r => r.path), [
+        '/api/daylight/time', '/api/daylight', '/api/lighting',
+        '/api/daylight/reset', '/api/daylight', '/api/lighting',
+    ]);
+
+    since = ui.requests.length;
+    const refusal = 'rejected: rain needs a cloud cover of at least 0.5, and the cloud cover is 0.2';
+    ui.refuse('/api/daylight/weather', 400, refusal);
+    ui.element('daylightCloudCover').value = '0.2';
+    ui.element('daylightRain').value = '3';
+    await ui.run("applyDaylight('weather')");
+    assert.deepEqual(ui.requests.slice(since), [{ path: '/api/daylight/weather', body: { cloud_cover: 0.2, rain_mm_h: 3 } }]);
+    assert.equal(ui.element('status').textContent, refusal);
+    assert.equal(ui.element('status').style.borderColor, '#9b424c');
+});
+
 test('a scene load reads the capability panels again once its goal completes', async () => {
     const ui = await page([staticScene], [], {
-        capabilities: { lighting: true, materials: true }, lighting: warehouseLighting, materials: { materials: [steel] },
+        capabilities: { lighting: true, daylight: true, materials: true },
+        lighting: warehouseLighting, daylight: warehouseDaylight, materials: { materials: [steel] },
     });
     const since = ui.requests.length;
     await ui.run('loadScene()');
     await ui.run('clearScene()');
     assert.deepEqual(ui.requests.slice(since).map(r => r.path), [
-        '/api/scene/load', '/api/objects', '/api/lighting', '/api/materials',
-        '/api/scene/clear', '/api/objects', '/api/lighting', '/api/materials',
+        '/api/scene/load', '/api/objects', '/api/lighting', '/api/daylight', '/api/materials',
+        '/api/scene/clear', '/api/objects', '/api/lighting', '/api/daylight', '/api/materials',
     ]);
 });
 

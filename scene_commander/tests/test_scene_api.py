@@ -28,6 +28,7 @@ _OPTIONAL_LINKS = {
         "get_lighting", "set_light_intensity", "set_light_color", "set_light_position", "set_light_direction",
         "set_light_cone", "set_light_orientation", "reset_lighting",
     ),
+    "daylight": ("get_daylight", "set_daylight_time", "set_daylight_rate", "set_weather", "reset_daylight"),
     "materials": ("get_materials", "set_material_color", "set_material_finish", "reset_materials"),
     "cameras": (
         "get_cameras", "describe_camera", "set_camera_exposure", "set_camera_white_balance", "set_camera_gain",
@@ -52,15 +53,40 @@ _ROBOTS = [
 
 # A snapshot's capture time, as the generated binding decodes it: epoch seconds.
 _CAPTURED = 1_757_944_800.25
-# The simulation instance serving the scene, its lighting and its materials.
+# The simulation instance serving the scene, its lighting, its daylight and
+# its materials.
 _SIMULATION = ("alpha", "alpha_isaac")
+# A light that follows the daylight: its values alone, no default and no bounds.
 _SUN = {
-    "id": "sun", "kind": "directional", "label": "Sun",
+    "id": "sun", "kind": "sun", "label": "Sun", "follows_daylight": True, "baked_indirect": "on",
     "properties": {
-        "illuminance_lux": {"unit": "lx", "min": 0.0, "max": 200000.0, "default": 1000.0, "value": 1000.0},
-        "color_rgb": {"unit": "linear rgb", "default": [1.0, 1.0, 1.0], "value": [1.0, 0.95, 0.9]},
-        "direction": {"unit": "unit vector", "default": [0.0, 0.0, -1.0], "value": [0.3, 0.0, -0.95]},
+        "illuminance_lux": {"unit": "lx", "value": 98000.0},
+        "color_rgb": {"unit": "linear rgb", "value": [1.0, 0.95, 0.9]},
+        "direction": {"unit": "unit vector", "value": [0.3, 0.0, -0.95]},
     },
+}
+_LAMP = {
+    "id": "lamp", "kind": "point", "label": "Desk lamp", "follows_daylight": False, "baked_indirect": "on",
+    "properties": {
+        "luminous_flux_lm": {"unit": "lm", "min": 0.0, "max": 20000.0, "default": 800.0, "value": 800.0},
+        "color_rgb": {"unit": "linear rgb", "default": [1.0, 1.0, 1.0], "value": [1.0, 1.0, 1.0]},
+        "position_m": {"unit": "m", "default": [0.0, 0.0, 2.0], "value": [0.5, 0.2, 1.8]},
+    },
+}
+_DAYLIGHT = {
+    "scene": "scene/full_warehouse",
+    "place": {"latitude_deg": 48.85, "longitude_deg": 2.35, "utc_offset_h": 1.0, "north_deg": 0.0},
+    "date": "2026-06-21", "time": "10:00:00", "rate": 0.0,
+    "weather": {"cloud_cover": 0.0, "rain_mm_h": 0.0},
+    "sun": {
+        "azimuth_deg": 120.5, "elevation_deg": 45.2, "illuminance_lux": 98000.0, "rise": "04:47:00", "set": "20:58:00",
+    },
+    "moon": {
+        "azimuth_deg": 60.0, "elevation_deg": -10.0, "illuminance_lux": 0.0, "rise": "02:13:00", "set": "18:40:00",
+        "phase_angle_deg": 95.0, "illuminated_fraction": 0.46, "waxing": True,
+    },
+    "sky": {"illuminance_lux": 21000.0},
+    "defaults": {"date": "2026-06-21", "time": "10:00:00", "rate": 0.0, "weather": {"cloud_cover": 0.0, "rain_mm_h": 0.0}},
 }
 _STEEL = {
     "id": "steel", "label": "Brushed steel",
@@ -470,7 +496,8 @@ def commander(monkeypatch):
     for name, members in _OPTIONAL_LINKS.items():
         for member in members:
             getattr(optional[name], member).answers = [_done(member)]
-    optional["lighting"].get_lighting.answers = [_lighting(_SUN)]
+    optional["lighting"].get_lighting.answers = [_lighting(_SUN, _LAMP)]
+    optional["daylight"].get_daylight.answers = [_daylight()]
     optional["materials"].get_materials.answers = [_materials(_STEEL)]
     optional["cameras"].get_cameras.answers = [_cameras(
         _listed("alpha", "wrist_left", "rgb", 1280, 720, 30), _listed("bravo", "chest", "rgbd", 640, 480, 15),
@@ -505,6 +532,9 @@ def commander(monkeypatch):
     def bind_lighting():
         optional["lighting"].producers.append(FakeProducer(*_SIMULATION))
 
+    def bind_daylight():
+        optional["daylight"].producers.append(FakeProducer(*_SIMULATION))
+
     def bind_materials():
         optional["materials"].producers.append(FakeProducer(*_SIMULATION))
 
@@ -516,7 +546,8 @@ def commander(monkeypatch):
 
     return SimpleNamespace(
         module=module, services=services, objects=objects, actions=actions, clock=clock,
-        bind_lighting=bind_lighting, bind_materials=bind_materials, bind_cameras=bind_cameras, **optional,
+        bind_lighting=bind_lighting, bind_daylight=bind_daylight, bind_materials=bind_materials,
+        bind_cameras=bind_cameras, **optional,
     )
 
 
@@ -606,7 +637,7 @@ def _no_object_state(kind=FailureKind.PRECONDITION_FAILED, message=_NOT_READY):
 
 
 # Every service that declares no response: it answers nothing.
-_RESETS = ("reset_lighting", "reset_materials", "reset_camera")
+_RESETS = ("reset_lighting", "reset_daylight", "reset_materials", "reset_camera")
 
 
 def _done(name):
@@ -630,11 +661,15 @@ def _lighting(*lights):
 
 
 def _lighting_json(*lights):
-    return {"scene": _SCENE["asset_id"], "ambient_lux": 120.0, "fill_lux": 40.0, "lights": list(lights)}
+    return {"scene": _SCENE["asset_id"], "lights": list(lights)}
+
+
+def _daylight():
+    return SimpleNamespace(daylight_json=json.dumps(_DAYLIGHT))
 
 
 def _no_scene():
-    """The error reply of a read of lighting or materials before a scene is loaded."""
+    """The error reply of a read of lighting, daylight or materials before a scene is loaded."""
     return Failure(FailureKind.PRECONDITION_FAILED, _NO_SCENE)
 
 
@@ -2282,26 +2317,32 @@ def test_with_only_the_scene_bound_the_capabilities_are_absent_and_their_routes_
         return (
             await _get(client, "/api/capabilities"),
             await _get(client, "/api/lighting"),
-            await _post(client, "/api/lighting/intensity", {"light_id": "sun", "value": 1200}),
+            await _post(client, "/api/lighting/intensity", {"light_id": "lamp", "value": 1200}),
             await _post(client, "/api/lighting/reset", {}),
+            await _get(client, "/api/daylight"),
+            await _post(client, "/api/daylight/time", {"date": "", "time": "18:30"}),
             await _get(client, "/api/materials"),
             await _post(client, "/api/materials/color", {"material_id": "steel", "color": [1, 1, 1]}),
             await _get(client, "/api/cameras"),
             await _post(client, "/api/cameras/alpha/wrist_left/gain", {"value": 1}),
         )
 
-    capabilities, lighting, intensity, reset, materials, color, cameras, gain = _call(commander, scenario)
-    assert capabilities == (200, {"success": True, "lighting": False, "materials": False, "cameras": False})
+    capabilities, lighting, intensity, reset, daylight, time, materials, color, cameras, gain = _call(commander, scenario)
+    assert capabilities == (
+        200, {"success": True, "lighting": False, "daylight": False, "materials": False, "cameras": False},
+    )
     assert lighting == (404, {"success": False, "message": "lighting is not bound in this launch"})
     assert intensity == lighting
     assert reset == lighting
+    assert daylight == (404, {"success": False, "message": "daylight is not bound in this launch"})
+    assert time == daylight
     assert materials == (404, {"success": False, "message": "materials are not bound in this launch"})
     assert color == materials
     assert cameras == (404, {"success": False, "message": "cameras are not bound in this launch"})
     assert gain == cameras
     # No provider of a vacant slot is ever called.
-    assert _requests(commander, commander.lighting, commander.materials, commander.cameras) == {}
-    assert [level for level, _, _ in _node_log(commander, caplog)] == [logging.WARNING] * 7
+    assert _requests(commander, commander.lighting, commander.daylight, commander.materials, commander.cameras) == {}
+    assert [level for level, _, _ in _node_log(commander, caplog)] == [logging.WARNING] * 9
 
 
 def test_the_page_carries_the_capability_cards_hidden_until_the_capabilities_say_otherwise(commander):
@@ -2314,7 +2355,10 @@ def test_the_page_carries_the_capability_cards_hidden_until_the_capabilities_say
     assert status == 200
     # Each card is in the page, hidden; its content is markup the script
     # renders from what the provider lists.
-    for card, heading in (("lightingCard", "Lighting"), ("materialsCard", "Materials"), ("camerasCard", "Cameras")):
+    for card, heading in (
+        ("lightingCard", "Lighting"), ("daylightCard", "Daylight"), ("materialsCard", "Materials"),
+        ("camerasCard", "Cameras"),
+    ):
         assert f'<section class="card" id="{card}" hidden>\n<h2>{heading}</h2>' in html
     assert 'api("/api/capabilities")' in html
     assert "if (anyCapability()) {" in html
@@ -2322,6 +2366,7 @@ def test_the_page_carries_the_capability_cards_hidden_until_the_capabilities_say
         "function renderTargets(panel)", "function renderCameras()",
         "async function applyProperty(name, index, route)", "async function applyCamera(index, name)",
         "async function resetPanel(name)", "async function resetCamera(index)",
+        "async function applyDaylight(route)", "async function resetDaylight()",
     ):
         assert renderer in html
     assert 'document.visibilityState === "visible"' in html
@@ -2331,22 +2376,24 @@ def test_the_page_carries_the_capability_cards_hidden_until_the_capabilities_say
 def test_bound_lighting_reaches_the_page_parsed_and_its_state_is_logged_once(commander, caplog):
     caplog.set_level(logging.INFO)
     commander.bind_lighting()
-    commander.lighting.get_lighting.answers = [_no_scene(), _no_scene(), _lighting(_SUN), _lighting(_SUN)]
+    commander.lighting.get_lighting.answers = [_no_scene(), _no_scene(), _lighting(_SUN, _LAMP), _lighting(_SUN, _LAMP)]
 
     async def scenario(client):
         capabilities = await _get(client, "/api/capabilities")
         return capabilities, [await _get(client, "/api/lighting") for _ in range(4)]
 
     capabilities, (first, second, third, fourth) = _call(commander, scenario)
-    assert capabilities == (200, {"success": True, "lighting": True, "materials": False, "cameras": False})
+    assert capabilities == (
+        200, {"success": True, "lighting": True, "daylight": False, "materials": False, "cameras": False},
+    )
     assert first == (503, {"success": False, "message": f"precondition_failed: {_NO_SCENE}"})
     assert second == first
-    assert third == (200, {"success": True, "lighting": _lighting_json(_SUN)})
+    assert third == (200, {"success": True, "lighting": _lighting_json(_SUN, _LAMP)})
     assert fourth == third
     assert commander.lighting.get_lighting.requests == [(FakeProducer(*_SIMULATION), None)] * 4
     assert _node_log(commander, caplog) == [
         (logging.INFO, f"Scene provider has no lighting: precondition_failed: {_NO_SCENE}", None),
-        (logging.INFO, "Scene provider lighting ready: 1 lights", None),
+        (logging.INFO, "Scene provider lighting ready: 2 lights", None),
     ]
 
 
@@ -2365,16 +2412,16 @@ def test_a_panel_read_whose_error_reply_is_no_wait_is_a_server_error_with_its_ki
 
 @pytest.mark.parametrize(("route", "payload", "sent", "answer", "summary"), [
     (
-        "intensity", {"light_id": "sun", "value": 1200},
-        SimpleNamespace(light_id="sun", value=1200.0),
+        "intensity", {"light_id": "lamp", "value": 1200},
+        SimpleNamespace(light_id="lamp", value=1200.0),
         _set(current_value=1200.0),
-        "set_light_intensity(light_id=sun, value=1200.0)",
+        "set_light_intensity(light_id=lamp, value=1200.0)",
     ),
     (
-        "color", {"light_id": "sun", "color": [1, 0.9, 0.8]},
-        SimpleNamespace(light_id="sun", color=[1.0, 0.9, 0.8]),
+        "color", {"light_id": "lamp", "color": [1, 0.9, 0.8]},
+        SimpleNamespace(light_id="lamp", color=[1.0, 0.9, 0.8]),
         _set(current_color=[1.0, 0.9, 0.8]),
-        "set_light_color(light_id=sun, color=[1.0, 0.9, 0.8])",
+        "set_light_color(light_id=lamp, color=[1.0, 0.9, 0.8])",
     ),
     (
         "position", {"light_id": "lamp", "position": [1, 2, 3]},
@@ -2383,10 +2430,10 @@ def test_a_panel_read_whose_error_reply_is_no_wait_is_a_server_error_with_its_ki
         "set_light_position(light_id=lamp, position=[1.0, 2.0, 3.0])",
     ),
     (
-        "direction", {"light_id": "sun", "direction": [0, 0, -1]},
-        SimpleNamespace(light_id="sun", direction=[0.0, 0.0, -1.0]),
+        "direction", {"light_id": "lamp", "direction": [0, 0, -1]},
+        SimpleNamespace(light_id="lamp", direction=[0.0, 0.0, -1.0]),
         _set(current_direction=[0.0, 0.0, -1.0]),
-        "set_light_direction(light_id=sun, direction=[0.0, 0.0, -1.0])",
+        "set_light_direction(light_id=lamp, direction=[0.0, 0.0, -1.0])",
     ),
     (
         "cone", {"light_id": "lamp", "inner_angle": 0.2, "outer_angle": 0.5},
@@ -2395,10 +2442,10 @@ def test_a_panel_read_whose_error_reply_is_no_wait_is_a_server_error_with_its_ki
         "set_light_cone(light_id=lamp, inner_angle=0.2, outer_angle=0.5)",
     ),
     (
-        "orientation", {"light_id": "sky", "orientation": [0, 0, 0, 1]},
-        SimpleNamespace(light_id="sky", orientation=[0.0, 0.0, 0.0, 1.0]),
+        "orientation", {"light_id": "environment", "orientation": [0, 0, 0, 1]},
+        SimpleNamespace(light_id="environment", orientation=[0.0, 0.0, 0.0, 1.0]),
         _set(current_orientation=[0.0, 0.0, 0.0, 1.0]),
-        "set_light_orientation(light_id=sky, orientation=[0.0, 0.0, 0.0, 1.0])",
+        "set_light_orientation(light_id=environment, orientation=[0.0, 0.0, 0.0, 1.0])",
     ),
 ], ids=["intensity", "color", "position", "direction", "cone", "orientation"])
 def test_a_light_setter_posts_the_request_and_answers_the_effective_value(
@@ -2432,13 +2479,13 @@ def test_a_refused_setter_answers_400_with_the_kind_and_the_reason(commander, ca
     caplog.set_level(logging.INFO)
     commander.bind_lighting()
     commander.bind_cameras()
-    commander.lighting.set_light_intensity.answers = [_refused("value 500000 is above the max of 200000 lx")]
+    commander.lighting.set_light_intensity.answers = [_refused("value 50000 is above the max of 20000 lm")]
     commander.cameras.set_camera_white_balance.answers = [_refused("temperature 12000 K is outside 2000-8000 K")]
     commander.lighting.reset_lighting.answers = [_no_scene()]
 
     async def scenario(client):
         return (
-            await _post(client, "/api/lighting/intensity", {"light_id": "sun", "value": 500000}),
+            await _post(client, "/api/lighting/intensity", {"light_id": "lamp", "value": 50000}),
             await _post(client, "/api/cameras/alpha/wrist_left/white_balance", {"mode": "manual", "temperature": 12000}),
             await _post(client, "/api/lighting/reset", {}),
         )
@@ -2446,11 +2493,11 @@ def test_a_refused_setter_answers_400_with_the_kind_and_the_reason(commander, ca
     intensity, white_balance, reset = _call(commander, scenario)
     # An error reply carries no effective values: the answer is the kind and
     # the reason alone.
-    assert intensity == (400, {"success": False, "message": "rejected: value 500000 is above the max of 200000 lx"})
+    assert intensity == (400, {"success": False, "message": "rejected: value 50000 is above the max of 20000 lm"})
     assert white_balance == (400, {"success": False, "message": "rejected: temperature 12000 K is outside 2000-8000 K"})
     assert reset == (400, {"success": False, "message": f"precondition_failed: {_NO_SCENE}"})
     assert _node_log(commander, caplog) == [
-        (logging.WARNING, "POST /api/lighting/intensity failed: rejected: value 500000 is above the max of 200000 lx", None),
+        (logging.WARNING, "POST /api/lighting/intensity failed: rejected: value 50000 is above the max of 20000 lm", None),
         (
             logging.WARNING,
             "POST /api/cameras/alpha/wrist_left/white_balance failed: rejected: temperature 12000 K is outside 2000-8000 K",
@@ -2461,18 +2508,26 @@ def test_a_refused_setter_answers_400_with_the_kind_and_the_reason(commander, ca
 
 
 @pytest.mark.parametrize(("path", "payload", "message"), [
-    ("/api/lighting/intensity", {"light_id": "sun", "value": "bright"}, "value must be a finite number"),
-    ("/api/lighting/intensity", {"light_id": "sun", "value": float("nan")}, "value must be a finite number"),
-    ("/api/lighting/intensity", {"light_id": "sun", "value": float("inf")}, "value must be a finite number"),
-    ("/api/lighting/intensity", {"light_id": "sun", "value": True}, "value must be a finite number"),
+    ("/api/lighting/intensity", {"light_id": "lamp", "value": "bright"}, "value must be a finite number"),
+    ("/api/lighting/intensity", {"light_id": "lamp", "value": float("nan")}, "value must be a finite number"),
+    ("/api/lighting/intensity", {"light_id": "lamp", "value": float("inf")}, "value must be a finite number"),
+    ("/api/lighting/intensity", {"light_id": "lamp", "value": True}, "value must be a finite number"),
     ("/api/lighting/intensity", {"light_id": "", "value": 1}, "light_id must be a non-empty string"),
     ("/api/lighting/intensity", {"value": 1}, "light_id must be a non-empty string"),
-    ("/api/lighting/color", {"light_id": "sun", "color": [1, 0.9]}, "color must be 3 finite numbers"),
-    ("/api/lighting/color", {"light_id": "sun", "color": [1, 0.9, None]}, "color must be 3 finite numbers"),
+    ("/api/lighting/color", {"light_id": "lamp", "color": [1, 0.9]}, "color must be 3 finite numbers"),
+    ("/api/lighting/color", {"light_id": "lamp", "color": [1, 0.9, None]}, "color must be 3 finite numbers"),
     ("/api/lighting/position", {"light_id": "lamp", "position": "1,2,3"}, "position must be 3 finite numbers"),
-    ("/api/lighting/direction", {"light_id": "sun", "direction": [0, 0, 1, 0]}, "direction must be 3 finite numbers"),
+    ("/api/lighting/direction", {"light_id": "lamp", "direction": [0, 0, 1, 0]}, "direction must be 3 finite numbers"),
     ("/api/lighting/cone", {"light_id": "lamp", "inner_angle": 0.2}, "outer_angle must be a finite number"),
-    ("/api/lighting/orientation", {"light_id": "sky", "orientation": [0, 0, 0, "1"]}, "orientation must be 4 finite numbers"),
+    ("/api/lighting/orientation", {"light_id": "environment", "orientation": [0, 0, 0, "1"]}, "orientation must be 4 finite numbers"),
+    ("/api/daylight/time", {"date": 20260621, "time": "10:00"}, "date must be a string"),
+    ("/api/daylight/time", {"time": "10:00"}, "date must be a string"),
+    ("/api/daylight/time", {"date": "2026-06-21", "time": ""}, "time must be a non-empty string"),
+    ("/api/daylight/time", {"date": "2026-06-21"}, "time must be a non-empty string"),
+    ("/api/daylight/rate", {"rate": "fast"}, "rate must be a finite number"),
+    ("/api/daylight/rate", {"rate": float("inf")}, "rate must be a finite number"),
+    ("/api/daylight/weather", {"cloud_cover": True, "rain_mm_h": 0}, "cloud_cover must be a finite number"),
+    ("/api/daylight/weather", {"cloud_cover": 0.6}, "rain_mm_h must be a finite number"),
     ("/api/materials/color", {"material_id": "steel", "color": [0.5, 0.5, 0.5, 1]}, "color must be 3 finite numbers"),
     ("/api/materials/finish", {"material_id": "steel", "metallic": True, "roughness": 0.3}, "metallic must be a finite number"),
     ("/api/materials/finish", {"material_id": 7, "metallic": 0.5, "roughness": 0.3}, "material_id must be a non-empty string"),
@@ -2487,32 +2542,36 @@ def test_a_refused_setter_answers_400_with_the_kind_and_the_reason(commander, ca
 def test_invalid_capability_input_answers_400_and_never_reaches_a_provider(commander, caplog, path, payload, message):
     caplog.set_level(logging.INFO)
     commander.bind_lighting()
+    commander.bind_daylight()
     commander.bind_materials()
     commander.bind_cameras()
 
     assert _call(commander, lambda client: _post(client, path, payload)) == (400, {"success": False, "message": message})
-    assert _requests(commander, commander.lighting, commander.materials, commander.cameras) == {}
+    assert _requests(commander, commander.lighting, commander.daylight, commander.materials, commander.cameras) == {}
     assert _node_log(commander, caplog) == [(logging.WARNING, f"POST {path} failed: {message}", None)]
 
 
 def test_an_unknown_property_or_control_is_404_and_reaches_no_provider(commander):
     commander.bind_lighting()
+    commander.bind_daylight()
     commander.bind_materials()
     commander.bind_cameras()
 
     async def scenario(client):
         return (
-            await _post(client, "/api/lighting/temperature", {"light_id": "sun", "value": 1}),
+            await _post(client, "/api/lighting/temperature", {"light_id": "lamp", "value": 1}),
+            await _post(client, "/api/daylight/season", {"name": "summer"}),
             await _post(client, "/api/materials/opacity", {"material_id": "steel", "value": 1}),
             await _post(client, "/api/cameras/alpha/wrist_left/zoom", {"value": 1}),
         )
 
     assert _call(commander, scenario) == (
         (404, {"success": False, "message": "unknown lighting property: temperature"}),
+        (404, {"success": False, "message": "unknown daylight property: season"}),
         (404, {"success": False, "message": "unknown material property: opacity"}),
         (404, {"success": False, "message": "unknown camera control: zoom"}),
     )
-    assert _requests(commander, commander.lighting, commander.materials, commander.cameras) == {}
+    assert _requests(commander, commander.lighting, commander.daylight, commander.materials, commander.cameras) == {}
 
 
 def test_bound_materials_reach_the_page_and_their_setters_address_the_material(commander, caplog):
@@ -2534,7 +2593,9 @@ def test_bound_materials_reach_the_page_and_their_setters_address_the_material(c
         )
 
     capabilities, materials, coloured, finished, restored = _call(commander, scenario)
-    assert capabilities == (200, {"success": True, "lighting": False, "materials": True, "cameras": False})
+    assert capabilities == (
+        200, {"success": True, "lighting": False, "daylight": False, "materials": True, "cameras": False},
+    )
     assert materials == (200, {"success": True, "materials": {"materials": [_STEEL]}})
     coloured_done = "set_material_color(material_id=steel, color=[0.2, 0.2, 0.8]) done"
     finished_done = "set_material_finish(material_id=steel, metallic=0.5, roughness=0.7) done"
@@ -2573,6 +2634,109 @@ def test_materials_answer_503_with_the_provider_reason_until_a_scene_is_loaded(c
     ]
 
 
+def test_bound_daylight_reaches_the_page_parsed_and_its_state_is_logged_once(commander, caplog):
+    caplog.set_level(logging.INFO)
+    commander.bind_daylight()
+    commander.daylight.get_daylight.answers = [_no_scene(), _no_scene(), _daylight(), _daylight()]
+
+    async def scenario(client):
+        capabilities = await _get(client, "/api/capabilities")
+        return capabilities, [await _get(client, "/api/daylight") for _ in range(4)]
+
+    capabilities, (first, second, third, fourth) = _call(commander, scenario)
+    assert capabilities == (
+        200, {"success": True, "lighting": False, "daylight": True, "materials": False, "cameras": False},
+    )
+    assert first == (503, {"success": False, "message": f"precondition_failed: {_NO_SCENE}"})
+    assert second == first
+    assert third == (200, {"success": True, "daylight": _DAYLIGHT})
+    assert fourth == third
+    assert commander.daylight.get_daylight.requests == [(FakeProducer(*_SIMULATION), None)] * 4
+    # The daylight is one state: it is ready, with nothing to count.
+    assert _node_log(commander, caplog) == [
+        (logging.INFO, f"Scene provider has no daylight: precondition_failed: {_NO_SCENE}", None),
+        (logging.INFO, "Scene provider daylight ready", None),
+    ]
+
+
+@pytest.mark.parametrize(("route", "service", "payload", "sent", "answer", "summary"), [
+    (
+        "time", "set_daylight_time", {"date": "2026-12-21", "time": "18:30"},
+        SimpleNamespace(date="2026-12-21", time="18:30"),
+        _set(current_date="2026-12-21", current_time="18:30:00"),
+        "set_daylight_time(date=2026-12-21, time=18:30)",
+    ),
+    (
+        # An empty date keeps the daylight's date; the provider answers it.
+        "time", "set_daylight_time", {"date": "", "time": "06:15:30"},
+        SimpleNamespace(date="", time="06:15:30"),
+        _set(current_date="2026-06-21", current_time="06:15:30"),
+        "set_daylight_time(date=, time=06:15:30)",
+    ),
+    (
+        "rate", "set_daylight_rate", {"rate": 60},
+        SimpleNamespace(rate=60.0),
+        _set(current_rate=60.0),
+        "set_daylight_rate(rate=60.0)",
+    ),
+    (
+        "weather", "set_weather", {"cloud_cover": 0.8, "rain_mm_h": 4},
+        SimpleNamespace(cloud_cover=0.8, rain_mm_h=4.0),
+        _set(current_cloud_cover=0.8, current_rain_mm_h=4.0),
+        "set_weather(cloud_cover=0.8, rain_mm_h=4.0)",
+    ),
+], ids=["date-and-time", "time-alone", "rate", "weather"])
+def test_a_daylight_setter_posts_the_request_and_answers_the_effective_value(
+    commander, caplog, route, service, payload, sent, answer, summary,
+):
+    caplog.set_level(logging.INFO)
+    commander.bind_daylight()
+    setter = getattr(commander.daylight, service)
+    setter.answers = [answer]
+
+    status, body = _call(commander, lambda client: _post(client, f"/api/daylight/{route}", payload))
+
+    assert (status, body) == (200, {"success": True, "message": f"{summary} done", **vars(answer)})
+    # The daylight is one state: no request names a target.
+    assert setter.requests == [(FakeProducer(*_SIMULATION), sent)]
+    assert _node_log(commander, caplog) == [(logging.INFO, f"{summary} done", None)]
+
+
+def test_reset_daylight_calls_the_provider_once_and_answers_that_it_was_done(commander, caplog):
+    caplog.set_level(logging.INFO)
+    commander.bind_daylight()
+
+    assert _call(commander, lambda client: _post(client, "/api/daylight/reset", {})) == (
+        200, {"success": True, "message": "reset_daylight() done"},
+    )
+    assert commander.daylight.reset_daylight.requests == [(FakeProducer(*_SIMULATION), None)]
+    assert _node_log(commander, caplog) == [(logging.INFO, "reset_daylight() done", None)]
+
+
+def test_a_refused_daylight_or_natural_light_setter_answers_400_with_the_provider_reason(commander, caplog):
+    caplog.set_level(logging.INFO)
+    commander.bind_lighting()
+    commander.bind_daylight()
+    rain = "rain needs a cloud cover of at least 0.5, and the cloud cover is 0.2"
+    follows = "the light sun follows the daylight: set_daylight_time, set_daylight_rate and set_weather move it"
+    commander.daylight.set_weather.answers = [_refused(rain)]
+    commander.lighting.set_light_color.answers = [_refused(follows)]
+
+    async def scenario(client):
+        return (
+            await _post(client, "/api/daylight/weather", {"cloud_cover": 0.2, "rain_mm_h": 3}),
+            await _post(client, "/api/lighting/color", {"light_id": "sun", "color": [1, 0.5, 0.5]}),
+        )
+
+    weather, color = _call(commander, scenario)
+    assert weather == (400, {"success": False, "message": f"rejected: {rain}"})
+    assert color == (400, {"success": False, "message": f"rejected: {follows}"})
+    assert _node_log(commander, caplog) == [
+        (logging.WARNING, f"POST /api/daylight/weather failed: rejected: {rain}", None),
+        (logging.WARNING, f"POST /api/lighting/color failed: rejected: {follows}", None),
+    ]
+
+
 def test_the_simulation_lists_every_robots_cameras_and_each_control_names_its_camera(commander, caplog):
     caplog.set_level(logging.INFO)
     simulation = commander.bind_cameras()
@@ -2596,7 +2760,9 @@ def test_the_simulation_lists_every_robots_cameras_and_each_control_names_its_ca
         )
 
     capabilities, cameras, *answers = _call(commander, scenario)
-    assert capabilities == (200, {"success": True, "lighting": False, "materials": False, "cameras": True})
+    assert capabilities == (
+        200, {"success": True, "lighting": False, "daylight": False, "materials": False, "cameras": True},
+    )
     # Every robot's cameras, as the simulation lists them, each with the
     # profile the simulation describes for it.
     assert cameras == (200, {"success": True, "count": 2, "cameras": [
@@ -2717,6 +2883,7 @@ def test_a_camera_transport_failure_is_a_server_error_logged_in_one_line(command
 def test_setup_logs_the_bound_capabilities_and_calls_none_of_them(commander, node_runner, caplog, monkeypatch):
     caplog.set_level(logging.INFO)
     commander.bind_lighting()
+    commander.bind_daylight()
     commander.bind_materials()
     commander.bind_cameras()
     monkeypatch.setattr(commander.module.listen, "bind_listener", lambda *bound: _FakeListener("127.0.0.1", 9000))
@@ -2729,9 +2896,9 @@ def test_setup_logs_the_bound_capabilities_and_calls_none_of_them(commander, nod
     assert _node_log(commander, caplog) == [
         (logging.INFO, "Scene commander starting", None),
         (logging.INFO, "Scene panel bound at 127.0.0.1:9000", None),
-        (logging.INFO, "Capabilities: lighting, materials, cameras", None),
+        (logging.INFO, "Capabilities: lighting, daylight, materials, cameras", None),
         (logging.INFO, "Scene provider catalogue ready: 1 assets", None),
         (logging.INFO, "Scene provider object state ready: 0 runtime objects", None),
     ]
     # The slots say what is bound; the providers are asked once the page asks.
-    assert _requests(commander, commander.lighting, commander.materials, commander.cameras) == {}
+    assert _requests(commander, commander.lighting, commander.daylight, commander.materials, commander.cameras) == {}

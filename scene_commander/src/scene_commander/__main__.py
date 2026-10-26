@@ -3,9 +3,9 @@
 
 The panel edits the scene through scene_manipulation and reads object state
 through object_state, both of the same simulation. A launch may bind beside
-them the scene's lighting and materials and the cameras looking at it, each
-camera with its profile: the panel shows a card for every capability that
-is bound and asks nothing of the ones left vacant.
+them the scene's lighting, its daylight and its materials and the cameras
+looking at it, each camera with its profile: the panel shows a card for
+every capability that is bound and asks nothing of the ones left vacant.
 """
 
 from __future__ import annotations
@@ -46,6 +46,14 @@ from peppygen.consumed_services.cameras import (
     set_camera_exposure,
     set_camera_gain,
     set_camera_white_balance,
+)
+
+from peppygen.consumed_services.daylight import (
+    get_daylight,
+    reset_daylight,
+    set_daylight_rate,
+    set_daylight_time,
+    set_weather,
 )
 
 from peppygen.consumed_services.lighting import (
@@ -113,8 +121,8 @@ class StateUnavailable(RuntimeError):
     """A provider gave a read an error reply of the kind precondition_failed:
     the state it was asked for is absent for now.
 
-    Lighting and materials are absent until a scene is loaded; the provider's
-    message says why, and the page asks again.
+    Lighting, daylight and materials are absent until a scene is loaded; the
+    provider's message says why, and the page asks again.
     """
 
 
@@ -269,10 +277,11 @@ class _StateWatch:
     on every read.
 
     provider names who answers, name the state (its catalogue, its object
-    state, its lighting), unit what its count counts.
+    state, its lighting), unit what its count counts; a state that is one
+    whole (the daylight) has no unit and is logged without a count.
     """
 
-    def __init__(self, name: str, unit: str, provider: str = "Scene provider") -> None:
+    def __init__(self, name: str, unit: str | None, provider: str = "Scene provider") -> None:
         self._provider = provider
         self._name = name
         self._unit = unit
@@ -283,10 +292,17 @@ class _StateWatch:
             self._state = ("unavailable", message)
             logger.info("%s has no %s: %s", self._provider, self._name, message)
 
-    def ready(self, count: int) -> None:
-        if self._state != ("ready",):
-            self._state = ("ready",)
-            logger.info("%s %s ready: %d %s", self._provider, self._name, count, self._unit)
+    def ready(self, count: int | None = None) -> None:
+        if self._state == ("ready",):
+            return
+
+        self._state = ("ready",)
+
+        if count is None:
+            logger.info("%s %s ready", self._provider, self._name)
+            return
+
+        logger.info("%s %s ready: %d %s", self._provider, self._name, count, self._unit)
 
 
 # ---------------------------------------------------------------------------
@@ -304,6 +320,7 @@ class _Capabilities:
     """
 
     lighting: peppylib.ProducerRef | None
+    daylight: peppylib.ProducerRef | None
     materials: peppylib.ProducerRef | None
     cameras: peppylib.ProducerRef | None
 
@@ -312,6 +329,7 @@ class _Capabilities:
             name
             for name, producer in (
                 ("lighting", self.lighting),
+                ("daylight", self.daylight),
                 ("materials", self.materials),
                 ("cameras", self.cameras),
             )
@@ -326,6 +344,7 @@ def _probe_capabilities(node_runner: NodeRunner) -> _Capabilities:
 
     return _Capabilities(
         lighting=get_lighting.bound_producer(node_runner),
+        daylight=get_daylight.bound_producer(node_runner),
         materials=get_materials.bound_producer(node_runner),
         cameras=get_cameras.bound_producer(node_runner),
     )
@@ -398,9 +417,9 @@ def _current(data) -> dict:
 
 async def _fetch_json(service, node_runner: NodeRunner, producer, field: str) -> dict:
     """A provider's state as the JSON it carries in `field` (a scene's
-    lighting, its materials). An error reply of the kind precondition_failed
-    raises StateUnavailable; any other raises the typed failure of
-    `service`."""
+    lighting, its daylight, its materials). An error reply of the kind
+    precondition_failed raises StateUnavailable; any other raises the typed
+    failure of `service`."""
 
     try:
         response = await service.poll(node_runner, producer, timeout=SERVICE_TIMEOUT_S)
@@ -1117,15 +1136,17 @@ def _spawn_request(payload: dict):
 
 
 # ---------------------------------------------------------------------------
-# Panels: lighting and materials
+# Panels: lighting, daylight and materials
 # ---------------------------------------------------------------------------
 #
-# The two panels share one shape, as the page's PANELS table has it: a
-# getter answering the targets as JSON, setters by the route the page posts
-# to, each naming the target by its id field and taking the fields its
-# parser checks, and a reset. Every payload is checked in full before any
-# provider is called: a value that is not a finite number, a vector of the
-# wrong length or a mode the contract does not name is refused here.
+# The three panels share one shape: a getter answering the provider's state
+# as JSON, setters by the route the page posts to, each taking the fields
+# its parser checks, and a reset. The lighting and the materials list
+# targets, and each of their setters names its target by its id field; the
+# daylight is one state, and its setters name no target. Every payload is
+# checked in full before any provider is called: a value that is not a
+# finite number, a vector of the wrong length, a text that is not a string
+# or a mode the contract does not name is refused here.
 
 
 def _vector3(payload: dict, key: str) -> list[float]:
@@ -1136,23 +1157,47 @@ def _vector4(payload: dict, key: str) -> list[float]:
     return _vector(payload, key, 4)
 
 
+def _text(payload: dict, key: str) -> str:
+    """A string the provider reads, which may be empty (an empty date keeps
+    the daylight's date)."""
+
+    value = payload.get(key)
+
+    if not isinstance(value, str):
+        raise ValueError(f"{key} must be a string")
+
+    return value
+
+
+@dataclass(frozen=True)
+class _Targets:
+    """What a panel of several targets edits: the key of its state listing
+    the targets, and the id field its setters address a target by."""
+
+    list_key: str
+    id_field: str
+
+    def address(self, payload: dict) -> dict:
+        """The request field naming the target the page's payload names."""
+
+        return {self.id_field: _name(payload, self.id_field)}
+
+
 @dataclass(frozen=True)
 class _Panel:
     """One panel of the page: the capability slot it needs (a field of
     _Capabilities, and the refusal when the launch left it vacant), what a
     property belongs to in a refusal, the getter with the response field
-    carrying its JSON and the key listing its targets, the id field its
-    setters address a target by, the setters by route with the fields each
-    takes, the reset, and the watch logging whether the provider has the
-    state."""
+    carrying its JSON, its targets (none for a state that is one whole, the
+    daylight), the setters by route with the fields each takes, the reset,
+    and the watch logging whether the provider has the state."""
 
     name: str
     unbound: str
     owner: str
     get: ModuleType
     json_field: str
-    list_key: str
-    id_field: str
+    targets: _Targets | None
     setters: dict[str, tuple[ModuleType, dict[str, Callable[[dict, str], object]]]]
     reset: ModuleType
     watch: web.AppKey
@@ -1167,17 +1212,25 @@ class _Panel:
 
     def request(self, route: str, payload: dict):
         """The setter answering `route` and its request, built from the
-        page's payload: the target's id and every field the setter takes."""
+        page's payload: the target's id, for a panel of targets, and every
+        field the setter takes."""
 
         service, fields = self.setters[route]
-        target = {self.id_field: _name(payload, self.id_field)}
+        target = {} if self.targets is None else self.targets.address(payload)
 
         return service, service.Request(
             **target, **{key: parse(payload, key) for key, parse in fields.items()}
         )
 
+    def count(self, state: dict) -> int | None:
+        """How many targets `state` lists; none for a state that is one
+        whole."""
+
+        return None if self.targets is None else len(state[self.targets.list_key])
+
 
 _LIGHTING = web.AppKey("lighting", _StateWatch)
+_DAYLIGHT = web.AppKey("daylight", _StateWatch)
 _MATERIALS = web.AppKey("materials", _StateWatch)
 
 _PANELS = (
@@ -1187,8 +1240,7 @@ _PANELS = (
         owner="lighting",
         get=get_lighting,
         json_field="lighting_json",
-        list_key="lights",
-        id_field="light_id",
+        targets=_Targets(list_key="lights", id_field="light_id"),
         setters={
             "intensity": (set_light_intensity, {"value": _number}),
             "color": (set_light_color, {"color": _vector3}),
@@ -1201,13 +1253,27 @@ _PANELS = (
         watch=_LIGHTING,
     ),
     _Panel(
+        name="daylight",
+        unbound="daylight is not bound in this launch",
+        owner="daylight",
+        get=get_daylight,
+        json_field="daylight_json",
+        targets=None,
+        setters={
+            "time": (set_daylight_time, {"date": _text, "time": _name}),
+            "rate": (set_daylight_rate, {"rate": _number}),
+            "weather": (set_weather, {"cloud_cover": _number, "rain_mm_h": _number}),
+        },
+        reset=reset_daylight,
+        watch=_DAYLIGHT,
+    ),
+    _Panel(
         name="materials",
         unbound="materials are not bound in this launch",
         owner="material",
         get=get_materials,
         json_field="materials_json",
-        list_key="materials",
-        id_field="material_id",
+        targets=_Targets(list_key="materials", id_field="material_id"),
         setters={
             "color": (set_material_color, {"color": _vector3}),
             "finish": (set_material_finish, {"metallic": _number, "roughness": _number}),
@@ -1440,7 +1506,7 @@ async def _api_move_robot(request: web.Request) -> web.Response:
 
 
 # ---------------------------------------------------------------------------
-# HTTP API: lighting, materials, cameras
+# HTTP API: lighting, daylight, materials, cameras
 # ---------------------------------------------------------------------------
 
 
@@ -1451,6 +1517,7 @@ async def _api_capabilities(request: web.Request) -> web.Response:
         {
             "success": True,
             "lighting": capabilities.lighting is not None,
+            "daylight": capabilities.daylight is not None,
             "materials": capabilities.materials is not None,
             "cameras": capabilities.cameras is not None,
         }
@@ -1458,7 +1525,7 @@ async def _api_capabilities(request: web.Request) -> web.Response:
 
 
 async def _api_panel(panel: _Panel, request: web.Request) -> web.Response:
-    """The panel's targets as the provider lists them."""
+    """The panel's state as the provider reports it."""
 
     watch = request.app[panel.watch]
 
@@ -1470,7 +1537,7 @@ async def _api_panel(panel: _Panel, request: web.Request) -> web.Response:
             panel.json_field,
         )
 
-        count = len(state[panel.list_key])
+        count = panel.count(state)
 
     except CapabilityUnbound as exc:
         return _json_error(request, exc, status=404)
@@ -1492,7 +1559,8 @@ async def _api_panel(panel: _Panel, request: web.Request) -> web.Response:
 
 
 async def _api_set_panel(panel: _Panel, request: web.Request) -> web.Response:
-    """One property of one target, posted to the setter's route."""
+    """One property of the panel's state (of one target, for a panel of
+    targets), posted to the setter's route."""
 
     route = request.match_info["property"]
 
@@ -1947,6 +2015,49 @@ select:disabled {
 </div>
 
 <div id="lightingTargets"></div>
+</section>
+
+
+<section class="card" id="daylightCard" hidden>
+<h2>Daylight</h2>
+
+<div class="two">
+<button class="danger" onclick="resetDaylight()">Reset daylight</button>
+<div id="daylightSummary" class="small"></div>
+</div>
+
+<label>Date and hour, local to the scene (an empty date keeps the date)</label>
+<div class="two">
+<input id="daylightDate" type="date">
+<input id="daylightTime" type="time" step="1">
+</div>
+<div class="two">
+<button onclick="applyDaylight('time')">Apply time</button>
+<div class="small" id="daylight_time_current"></div>
+</div>
+
+<label>Clock rate (daylight seconds per simulated second, 0 holds the hour)</label>
+<input id="daylightRate" type="number" step="any" min="0" max="3600">
+<div class="two">
+<button onclick="applyDaylight('rate')">Apply rate</button>
+<div class="small" id="daylight_rate_current"></div>
+</div>
+
+<label>Cloud cover (0 clear to 1 overcast), rain (mm/h, needs a cloud cover of 0.5 or more)</label>
+<div class="two">
+<input id="daylightCloudCover" type="number" step="0.05" min="0" max="1">
+<input id="daylightRain" type="number" step="0.5" min="0" max="50">
+</div>
+<div class="two">
+<button onclick="applyDaylight('weather')">Apply weather</button>
+<div class="small" id="daylight_weather_current"></div>
+</div>
+
+<div class="target">
+<p class="small" id="daylightSun"></p>
+<p class="small" id="daylightMoon"></p>
+<p class="small" id="daylightSky"></p>
+</div>
 </section>
 
 
@@ -2729,31 +2840,38 @@ async function moveRobot() {
 }
 
 // ---------------------------------------------------------------------
-// Lighting, materials and cameras: what the launch bound beside the scene
+// Lighting, daylight, materials and cameras: what the launch bound beside
+// the scene
 // ---------------------------------------------------------------------
 
 // Read once at startup; a card is shown only for a capability that is
-// bound and whose provider lists something to edit.
-let capabilities = { lighting: false, materials: false, cameras: false };
+// bound and whose provider has something to show.
+let capabilities = { lighting: false, daylight: false, materials: false, cameras: false };
 
 // A change made from elsewhere (an MCP client, another copy of this page)
 // shows within this interval while the tab is visible.
 const PANEL_REFRESH_MS = 3000;
 
 // Lighting and materials share one shape: targets with an id, a label and
-// properties, each with its unit, its default and its current value. A
-// setter names the route a property posts to and the request field it
-// fills; the properties of one route are applied together (the two angles
-// of a cone, the metallic and roughness of a finish).
+// properties, each with its unit and its current value and, for a target a
+// caller can set, its default. A setter names the route a property posts
+// to and the request field it fills; the properties of one route are
+// applied together (the two angles of a cone, the metallic and roughness
+// of a finish). A target the panel shows read-only has no inputs: its
+// values are listed.
 //
 // A panel's elements: <name>Card, <name>Summary and <name>Targets are in
-// the page; a control's inputs are <name><index>_<property>_<component>
-// and its effective value <name><index>_<route>_current.
+// the page; a control's inputs are <name><index>_<property>_<component>,
+// its effective value <name><index>_<route>_current, and the values of the
+// properties without inputs <name><index>_values.
+//
+// The sun, the moon and the sky follow the daylight: every setter refuses
+// them, so the lighting card lists their values and the daylight card sets
+// what they follow.
 const LIGHTING = {
     name: "lighting",
     idField: "light_id",
     setters: {
-        illuminance_lux: { route: "intensity", field: "value" },
         luminous_flux_lm: { route: "intensity", field: "value" },
         radiance_scale: { route: "intensity", field: "value" },
         color_rgb: { route: "color", field: "color" },
@@ -2764,10 +2882,9 @@ const LIGHTING = {
         orientation_xyzw: { route: "orientation", field: "orientation" }
     },
     read: data => data.lighting.lights,
-    summary: data =>
-        `${data.lighting.scene} | ambient ${fmt(data.lighting.ambient_lux)} lx`
-        + ` | fill ${fmt(data.lighting.fill_lux)} lx`,
-    describe: light => `${light.kind} | ${light.id}`,
+    summary: data => `${data.lighting.scene} | ${data.lighting.lights.length} lights`,
+    describe: light => `${light.kind} | ${light.id}${light.follows_daylight ? " | follows the daylight" : ""}`,
+    readOnly: light => light.follows_daylight === true,
     list: [],
     shape: ""
 };
@@ -2786,6 +2903,7 @@ const MATERIALS = {
         const scope = material.scope || { surfaces: "?", bodies: [] };
         return `shared by ${scope.surfaces} surfaces on: ${(scope.bodies || []).join(", ")}`;
     },
+    readOnly: () => false,
     list: [],
     shape: ""
 };
@@ -2805,17 +2923,31 @@ function fmt(value) {
     return String(Number(Number(value).toPrecision(6)));
 }
 
+// What a card shows of a value beside its default.
+function withDefault(name, value, fallback) {
+    return `${name} ${value} (default ${fallback})`;
+}
+
 // A target's properties by the route they post to, in the provider's
-// order; a property without a setter here is listed but not edited.
-function routesOf(target, setters) {
+// order; a target the panel shows read-only has none.
+function routesOf(panel, target) {
     const routes = new Map();
+    if (panel.readOnly(target)) return routes;
     for (const name of Object.keys(target.properties || {})) {
-        const setter = setters[name];
+        const setter = panel.setters[name];
         if (!setter) continue;
         if (!routes.has(setter.route)) routes.set(setter.route, []);
         routes.get(setter.route).push(name);
     }
     return routes;
+}
+
+// A target's properties without inputs, which the card lists with their
+// values: every property of a target shown read-only, and a property
+// without a setter here.
+function fixedOf(panel, target) {
+    const routed = new Set([...routesOf(panel, target).values()].flat());
+    return Object.keys(target.properties || {}).filter(name => !routed.has(name));
 }
 
 const GRID = { 2: "two", 3: "row", 4: "four" };
@@ -2852,7 +2984,8 @@ function renderTargets(panel) {
     <div class="target">
         <code>${text(target.label || target.id)}</code>
         <div class="small">${text(panel.describe(target))}</div>
-        ${[...routesOf(target, panel.setters)].map(([route, names]) => `
+        ${fixedOf(panel, target).length ? `<div class="small" id="${panel.name}${index}_values"></div>` : ""}
+        ${[...routesOf(panel, target)].map(([route, names]) => `
         <label>${text(names.map(name => `${name} (${target.properties[name].unit})`).join(", "))}</label>
         ${names.map(name => inputsFor(`${panel.name}${index}_${name}`, target.properties[name])).join("")}
         <div class="two">
@@ -2864,12 +2997,19 @@ function renderTargets(panel) {
 
 function showValues(panel) {
     panel.list.forEach((target, index) => {
-        for (const [route, names] of routesOf(target, panel.setters)) {
+        for (const [route, names] of routesOf(panel, target)) {
             el(`${panel.name}${index}_${route}_current`).textContent = names.map(name => {
                 const property = target.properties[name];
-                return `${name} ${fmt(property.value)} (default ${fmt(property.default)})`;
+                return withDefault(name, fmt(property.value), fmt(property.default));
             }).join(" | ");
         }
+
+        const fixed = fixedOf(panel, target);
+        if (fixed.length === 0) return;
+        el(`${panel.name}${index}_values`).textContent = fixed.map(name => {
+            const property = target.properties[name];
+            return `${name} ${fmt(property.value)} ${property.unit}`;
+        }).join(" | ");
     });
 }
 
@@ -2892,7 +3032,7 @@ async function refreshPanel(panel) {
     // Inputs keep their edits across a refresh; only a change in what the
     // provider lists rebuilds them.
     const shape = JSON.stringify(
-        panel.list.map(target => [target.id, Object.keys(target.properties || {})])
+        panel.list.map(target => [target.id, panel.readOnly(target), Object.keys(target.properties || {})])
     );
     if (shape !== panel.shape) {
         panel.shape = shape;
@@ -2901,22 +3041,15 @@ async function refreshPanel(panel) {
     showValues(panel);
 }
 
-async function applyProperty(name, index, route) {
-    const panel = PANELS[name];
+// Post one change, read again what it changed, and show the node's answer.
+async function postChange(path, body, refresh) {
     try {
-        const target = panel.list[index];
-        const body = { [panel.idField]: target.id };
-        for (const property of routesOf(target, panel.setters).get(route)) {
-            body[panel.setters[property].field] =
-                readInputs(`${name}${index}_${property}`, target.properties[property]);
-        }
-
-        const data = await api(`/api/${name}/${route}`, {
+        const data = await api(path, {
             method: "POST",
             body: JSON.stringify(body)
         });
 
-        await refreshPanel(panel);
+        await refresh();
 
         status(data.message);
     }
@@ -2925,20 +3058,111 @@ async function applyProperty(name, index, route) {
     }
 }
 
+async function applyProperty(name, index, route) {
+    const panel = PANELS[name];
+    const target = panel.list[index];
+    const body = { [panel.idField]: target.id };
+    for (const property of routesOf(panel, target).get(route)) {
+        body[panel.setters[property].field] =
+            readInputs(`${name}${index}_${property}`, target.properties[property]);
+    }
+
+    await postChange(`/api/${name}/${route}`, body, () => refreshPanel(panel));
+}
+
 async function resetPanel(name) {
+    await postChange(`/api/${name}/reset`, {}, () => refreshPanel(PANELS[name]));
+}
+
+// The daylight is one state: the date and hour, the clock rate and the
+// weather in effect beside the scene's authored ones, and where the sun and
+// the moon stand. Its inputs take the values in effect when the daylight of
+// a scene first shows and keep their edits after; each read shows the
+// values in effect, which advance with the clock.
+let daylightScene = null;
+
+// The fields each daylight route posts, read from its inputs.
+const DAYLIGHT_ROUTES = {
+    time: () => ({ date: el("daylightDate").value, time: el("daylightTime").value }),
+    rate: () => ({ rate: number("daylightRate") }),
+    weather: () => ({ cloud_cover: number("daylightCloudCover"), rain_mm_h: number("daylightRain") })
+};
+
+function fillDaylightInputs(daylight) {
+    el("daylightDate").value = daylight.date;
+    el("daylightTime").value = daylight.time;
+    el("daylightRate").value = String(daylight.rate);
+    el("daylightCloudCover").value = String(daylight.weather.cloud_cover);
+    el("daylightRain").value = String(daylight.weather.rain_mm_h);
+}
+
+function signed(value) {
+    return value < 0 ? fmt(value) : `+${fmt(value)}`;
+}
+
+// Where a body stands, its light and when it rises and sets.
+function bodyLine(name, body) {
+    const rise = body.rise ? `rises ${body.rise}` : "does not rise";
+    const set = body.set ? `sets ${body.set}` : "does not set";
+    return `${name} | azimuth ${fmt(body.azimuth_deg)} deg | elevation ${fmt(body.elevation_deg)} deg`
+        + ` | ${fmt(body.illuminance_lux)} lx | ${rise} | ${set}`;
+}
+
+function showDaylight(daylight) {
+    const place = daylight.place;
+    const defaults = daylight.defaults;
+    const moon = daylight.moon;
+    el("daylightSummary").textContent = `${daylight.scene} | latitude ${fmt(place.latitude_deg)} deg`
+        + ` | longitude ${fmt(place.longitude_deg)} deg | UTC offset ${signed(place.utc_offset_h)} h`;
+    el("daylight_time_current").textContent = [
+        withDefault("date", daylight.date, defaults.date),
+        withDefault("time", daylight.time, defaults.time)
+    ].join(" | ");
+    el("daylight_rate_current").textContent = withDefault("rate", fmt(daylight.rate), fmt(defaults.rate));
+    el("daylight_weather_current").textContent = [
+        withDefault("cloud_cover", fmt(daylight.weather.cloud_cover), fmt(defaults.weather.cloud_cover)),
+        withDefault("rain_mm_h", fmt(daylight.weather.rain_mm_h), fmt(defaults.weather.rain_mm_h))
+    ].join(" | ");
+    el("daylightSun").textContent = bodyLine("Sun", daylight.sun);
+    el("daylightMoon").textContent = `${bodyLine("Moon", moon)} | illuminated ${fmt(moon.illuminated_fraction)}`
+        + ` (phase angle ${fmt(moon.phase_angle_deg)} deg, ${moon.waxing ? "waxing" : "waning"})`;
+    el("daylightSky").textContent = `Sky | ${fmt(daylight.sky.illuminance_lux)} lx`;
+}
+
+async function refreshDaylight() {
+    let data;
     try {
-        const data = await api(`/api/${name}/reset`, {
-            method: "POST",
-            body: "{}"
-        });
-
-        await refreshPanel(PANELS[name]);
-
-        status(data.message);
+        data = await api("/api/daylight");
     }
     catch (err) {
-        status(err.message, true);
+        // No scene is loaded: the card waits hidden, keeping what it showed.
+        el("daylightCard").hidden = true;
+        return;
     }
+
+    const daylight = data.daylight;
+    el("daylightCard").hidden = false;
+    if (daylight.scene !== daylightScene) {
+        daylightScene = daylight.scene;
+        fillDaylightInputs(daylight);
+    }
+    showDaylight(daylight);
+}
+
+// A daylight change moves the lights that follow it: the lighting card
+// reads them again with it.
+async function refreshDaylightAndLights() {
+    const refreshes = [refreshDaylight()];
+    if (capabilities.lighting) refreshes.push(refreshPanel(LIGHTING));
+    await Promise.all(refreshes);
+}
+
+async function applyDaylight(route) {
+    await postChange(`/api/daylight/${route}`, DAYLIGHT_ROUTES[route](), refreshDaylightAndLights);
+}
+
+async function resetDaylight() {
+    await postChange("/api/daylight/reset", {}, refreshDaylightAndLights);
 }
 
 // The camera controls a profile may list, each with the request field its
@@ -3036,44 +3260,18 @@ async function refreshCameras() {
 }
 
 async function applyCamera(index, name) {
-    try {
-        const camera = cameras[index];
-        const control = CAMERA_CONTROLS[name];
-        const body = { [control.field]: number(`camera${index}_${name}_0`) };
-        if (control.modes) {
-            body.mode = el(`camera${index}_${name}_mode`).value;
-        }
-
-        const data = await api(`/api/cameras/${cameraPath(camera)}/${name}`, {
-            method: "POST",
-            body: JSON.stringify(body)
-        });
-
-        await refreshCameras();
-
-        status(data.message);
+    const camera = cameras[index];
+    const control = CAMERA_CONTROLS[name];
+    const body = { [control.field]: number(`camera${index}_${name}_0`) };
+    if (control.modes) {
+        body.mode = el(`camera${index}_${name}_mode`).value;
     }
-    catch (err) {
-        status(err.message, true);
-    }
+
+    await postChange(`/api/cameras/${cameraPath(camera)}/${name}`, body, refreshCameras);
 }
 
 async function resetCamera(index) {
-    try {
-        const camera = cameras[index];
-
-        const data = await api(`/api/cameras/${cameraPath(camera)}/reset`, {
-            method: "POST",
-            body: "{}"
-        });
-
-        await refreshCameras();
-
-        status(data.message);
-    }
-    catch (err) {
-        status(err.message, true);
-    }
+    await postChange(`/api/cameras/${cameraPath(cameras[index])}/reset`, {}, refreshCameras);
 }
 
 async function loadCapabilities() {
@@ -3081,6 +3279,7 @@ async function loadCapabilities() {
         const data = await api("/api/capabilities");
         capabilities = {
             lighting: Boolean(data.lighting),
+            daylight: Boolean(data.daylight),
             materials: Boolean(data.materials),
             cameras: Boolean(data.cameras)
         };
@@ -3091,12 +3290,13 @@ async function loadCapabilities() {
 }
 
 function anyCapability() {
-    return capabilities.lighting || capabilities.materials || capabilities.cameras;
+    return capabilities.lighting || capabilities.daylight || capabilities.materials || capabilities.cameras;
 }
 
 async function refreshPanels() {
     const refreshes = [];
     if (capabilities.lighting) refreshes.push(refreshPanel(LIGHTING));
+    if (capabilities.daylight) refreshes.push(refreshDaylight());
     if (capabilities.materials) refreshes.push(refreshPanel(MATERIALS));
     if (capabilities.cameras) refreshes.push(refreshCameras());
     await Promise.all(refreshes);
@@ -3149,6 +3349,7 @@ def _build_app(
     app[_CATALOGUE] = _StateWatch("catalogue", "assets")
     app[_OBJECT_STATE] = _StateWatch("object state", "runtime objects")
     app[_LIGHTING] = _StateWatch("lighting", "lights")
+    app[_DAYLIGHT] = _StateWatch("daylight", None)
     app[_MATERIALS] = _StateWatch("materials", "materials")
     app[_PROFILES] = {}
 
