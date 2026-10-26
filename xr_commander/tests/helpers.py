@@ -1,21 +1,27 @@
 import asyncio
 import contextlib
+import heapq
+import itertools
 import time
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 
 import numpy as np
 import peppygen.clock
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
+from peppygen.consumed_actions.fleet import changes, lease
 from peppygen.consumed_topics.color_cameras import video_stream as color_video_stream
 from peppygen.fixtures import harness
 from peppygen.parameters import Parameters
 
+from xr_commander.bus import REAL_CLOCK, Answered, Clock, FlashNote, Outcome
 from xr_commander.clutch import HandClutch
 from xr_commander.devices import HandSample, XrFrame
+from xr_commander.drive import Driver, HandState
+from xr_commander.fleet import Fleet, FleetView, Following, Holder, Timing
 from xr_commander.frames import Pose
 from xr_commander.panel import HandSource
-from xr_commander.publish import HeldOverSqueeze, MeasuredPoses
+from xr_commander.publish import MeasuredPoses
 from xr_commander.robots import PairedRobots
 
 IDENTITY = np.array([0.0, 0.0, 0.0, 1.0])
@@ -55,6 +61,34 @@ def squeezing_hand():
     return HandSample(pose=POSE, squeezing=True, trigger=0.0)
 
 
+class ScriptedHeadset:
+    """A headset whose hands the test sets, its frames stamped on `clock`:
+    the FrameSource seam is a device surface, which a test drives itself."""
+
+    def __init__(self, clock: Clock = REAL_CLOCK) -> None:
+        self._clock = clock
+        self.hands = {}
+        # The trigger of every hand that `press` sets.
+        self.trigger = 0.0
+
+    def press(self, *, pose=POSE, **hands):
+        """Each hand as (primary button, secondary button, squeeze), at
+        `pose`."""
+        self.hands = {
+            side: HandSample(
+                pose=pose,
+                squeezing=squeeze,
+                trigger=self.trigger,
+                primary_button=primary,
+                secondary_button=secondary,
+            )
+            for side, (primary, secondary, squeeze) in hands.items()
+        }
+
+    def latest(self):
+        return XrFrame(received_monotonic_s=self._clock.monotonic(), hands=self.hands)
+
+
 # A stand-in for the chosen robot's pair on a slot, for tests that read the
 # panel and the streams without a wire.
 PEER = "peer"
@@ -73,7 +107,7 @@ def source(
     return HandSource(
         handedness=handedness,
         clutch=clutch,
-        squeeze=HeldOverSqueeze(),
+        state=HandState(FlashNote()),
         measured=measured,
         arm_peer=lambda: PEER if arm_bound else None,
         gripper_peer=lambda: PEER if gripper else None,
@@ -262,6 +296,24 @@ class FakeSubscription:
 
 
 @contextlib.asynccontextmanager
+async def running(*loops):
+    """Each of `loops`, a function of a cancellation token, as a task for
+    the body's duration: yields the tasks, and cancels and awaits them on
+    exit."""
+    token = FakeToken()
+    tasks = [asyncio.create_task(loop(token)) for loop in loops]
+    try:
+        yield tasks
+    finally:
+        token.cancel()
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+
+@contextlib.asynccontextmanager
 async def running_drain(make_drain):
     """One drain task for the body's duration: a hand-fired token cancels it
     on exit (never the runner's real token, which would converge the whole
@@ -353,3 +405,228 @@ class FakeRobots:
             return False
         self._chosen = name
         return True
+
+
+class ManualClock:
+    """A clock that moves only when a test advances it: each sleeper wakes,
+    in deadline order, once the time reaches its deadline."""
+
+    def __init__(self, start_s: float = 1000.0) -> None:
+        self._now = start_s
+        self._sleepers: list[tuple[float, int, asyncio.Future]] = []
+        self._order = itertools.count()
+        # The tasks asleep on this clock now.
+        self._asleep: set[asyncio.Task] = set()
+
+    def monotonic(self) -> float:
+        return self._now
+
+    async def sleep(self, seconds: float) -> None:
+        wake = asyncio.get_running_loop().create_future()
+        heapq.heappush(self._sleepers, (self._now + seconds, next(self._order), wake))
+        task = asyncio.current_task()
+        self._asleep.add(task)
+        try:
+            await wake
+        finally:
+            self._asleep.discard(task)
+
+    async def advance(self, seconds: float, *, parked=()) -> None:
+        """Wait until each task of `parked` sleeps on this clock or ended,
+        move the time on by `seconds`, wake each sleeper due by then, and
+        let the woken tasks run up to their next wait. With every loop of a
+        test parked, each advance by one period is one step of each loop."""
+        await settle()
+        await self._parked(lambda: parked)
+        self._now += seconds
+        while self._sleepers and self._sleepers[0][0] <= self._now:
+            _, _, wake = heapq.heappop(self._sleepers)
+            if not wake.done():
+                wake.set_result(None)
+        await settle()
+
+    async def idle(self) -> None:
+        """Wait until every other task of the loop sleeps on this clock or
+        ended: for a test with no wire, the tasks that the code under test
+        spawned have then done all they can before the time moves."""
+        me = asyncio.current_task()
+        await self._parked(lambda: asyncio.all_tasks() - {me})
+
+    async def _parked(self, tasks) -> None:
+        deadline = time.monotonic() + PARK_TIMEOUT_S
+        while not all(task.done() or task in self._asleep for task in tasks()):
+            assert time.monotonic() < deadline, "a task never came back to the clock"
+            await asyncio.sleep(PARK_POLL_S)
+
+
+# How long a loop may take to come back to the clock, on the wire, and how
+# often the test looks.
+PARK_TIMEOUT_S = 10.0
+PARK_POLL_S = 0.001
+# Each yield runs every task ready at that moment once; this many let a
+# woken task reach its next wait through a few awaits.
+SETTLE_YIELDS = 20
+
+
+async def settle() -> None:
+    """Let every ready task run up to its next wait through a few awaits."""
+    for _ in range(SETTLE_YIELDS):
+        await asyncio.sleep(0)
+
+
+# The headset as the fleet listing names it, in tests that script the fleet,
+# and a director that holds leases beside it.
+HEADSET = Holder("headset_inst", "fixture-core")
+DIRECTOR = Holder("director_inst", "fixture-core")
+# The halt of the tests, by `peppy-cli`, as a refusal and the card give it.
+HALTED = "the stack is halted by peppy-cli until peppy fleet clear-halt"
+# The bound of a call that the test answers, and the retry of the headset.
+CALL_S = 10.0
+RETRY_S = 1.0
+
+
+# The revision of a listing that a test gives no revision.
+FIRST_REVISION = 1
+
+
+def fleet_view(
+    robots=(), *, leases=None, halted_by=None, revision=FIRST_REVISION
+) -> FleetView:
+    return FleetView(
+        revision=revision,
+        robots=frozenset(robots),
+        leases=MappingProxyType(dict(leases or {})),
+        halted_by=halted_by,
+    )
+
+
+def following_fleet(*robots, **view) -> Fleet:
+    """A fleet whose goals run and whose listing holds `robots`."""
+    fleet = Fleet(HEADSET)
+    fleet.view = fleet_view(robots, **view)
+    fleet.status = Following()
+    return fleet
+
+
+AGREED = Answered(None)
+
+
+class FakeCalls:
+    """The daemon's answers to a lease holder, scripted per test: each call
+    goes to `log` in order, yields once as a call on the wire does, and
+    gets the outcome set for its member. A yes to a move check reads the
+    revision of the first listing of `fleet_view`."""
+
+    def __init__(self, log: list) -> None:
+        self._log = log
+        self.take_outcome: Outcome = AGREED
+        self.check_outcome: Outcome = Answered(FIRST_REVISION)
+        self.release_outcome: Outcome = AGREED
+
+    async def take(self, robot):
+        self._log.append(("take", robot))
+        await asyncio.sleep(0)
+        return self.take_outcome
+
+    async def release(self, robot):
+        self._log.append(("release", robot))
+        await asyncio.sleep(0)
+        return self.release_outcome
+
+    async def check_move(self, *, robot=None, instance=None):
+        self._log.append(("check_move", robot or instance))
+        await asyncio.sleep(0)
+        return self.check_outcome
+
+
+class FakeStops:
+    """A backbone's answers to `stop`, each call in `log`."""
+
+    def __init__(self, log: list) -> None:
+        self._log = log
+        self.refusal: str | None = None
+
+    async def stop(self, robot):
+        self._log.append(("stop", robot))
+        await asyncio.sleep(0)
+        return self.refusal
+
+
+def scripted_driver(*robots, clock=REAL_CLOCK, log=None) -> Driver:
+    """A driver whose fleet lists `robots` free, whose daemon agrees to
+    every call and whose backbones stop on demand; `log` records the
+    calls."""
+    log = log if log is not None else []
+    return Driver(
+        following_fleet(*robots),
+        FakeCalls(log),
+        FakeStops(log),
+        timing=Timing(),
+        on_change=lambda: None,
+        clock=clock,
+    )
+
+
+# The fleet listing and the lease events as the daemon sends them.
+
+
+def listing(robots=(), leases=(), halted_by=None):
+    """A fleet listing as the daemon sends it in a `changes` feedback."""
+    return changes.FeedbackMessageListing(
+        version="unknown",
+        core_node="fixture-core",
+        launcher="test",
+        halted=halted_by is not None,
+        halted_by=halted_by or "",
+        robots=[
+            changes.FeedbackMessageListingRobotsItem(
+                name=name,
+                option="openarm_sim",
+                core_node="fixture-core",
+                kind="simulated",
+                clock="simulation",
+                software="running",
+                robot_commander="",
+                instances=[],
+                contracts=[],
+            )
+            for name in robots
+        ],
+        leases=[
+            changes.FeedbackMessageListingLeasesItem(
+                robot=robot,
+                holder=holder.instance,
+                holder_core_node=holder.core_node,
+                name=name,
+                open=is_open,
+                giver="",
+                giver_core_node="",
+                receiver="",
+                receiver_core_node="",
+            )
+            for robot, holder, name, is_open in leases
+        ],
+        options=[],
+        documents=[],
+        nodes=[],
+    )
+
+
+def change(kind, robot="", revision=1, **listed):
+    return changes.FeedbackMessage(
+        change=kind, robot=robot, revision=revision, listing=listing(**listed)
+    )
+
+
+def lease_event(event, robot="alpha", cause=""):
+    return lease.FeedbackMessage(
+        event=event, robot=robot, giver="", giver_core_node="", cause=cause
+    )
+
+
+async def accept_both(mock):
+    """The two goals the headset starts, accepted by the mock daemon: the
+    changes goal, then the lease goal."""
+    follow = await (await mock.changes.next_goal(CALL_S)).accept()
+    hold = await (await mock.lease.next_goal(CALL_S)).accept()
+    return follow, hold

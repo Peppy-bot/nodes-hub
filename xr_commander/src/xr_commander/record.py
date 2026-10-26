@@ -15,15 +15,18 @@ from dataclasses import dataclass
 
 from xr_commander.bus import (
     GOAL_CANCEL_TIMEOUT_S,
+    REAL_CLOCK,
     CancellationToken,
+    Clock,
     FlashNote,
     Latch,
+    cause,
     log,
     ticks,
 )
 from xr_commander.config import Settings
 from xr_commander.devices import FrameSource, fresh_sample
-from xr_commander.publish import cause, fire_goal
+from xr_commander.publish import fire_goal
 from xr_commander.robots import PairedRobots
 
 
@@ -46,7 +49,7 @@ class Timing:
 class RecorderStatus:
     """The recorder as the panel shows it; every writer runs on the event loop."""
 
-    def __init__(self) -> None:
+    def __init__(self, clock: Clock = REAL_CLOCK) -> None:
         self.recording = False
         self.frames = 0
         # True from the operator's stop until the recorder's result: the
@@ -54,7 +57,7 @@ class RecorderStatus:
         self.saving = False
         # True once Y has been held to the finish threshold.
         self.finish_held = False
-        self._note = FlashNote()
+        self._note = FlashNote(clock)
 
     def set_note(self, text: str) -> None:
         """Flash an outcome on the panel row for the next few seconds."""
@@ -97,6 +100,7 @@ async def run_recorder_buttons(
     token: CancellationToken,
     read_task: Callable[[], str],
     timing: Timing = Timing(),
+    clock: Clock = REAL_CLOCK,
 ) -> None:
     """Drive the chosen robot's recorder from the left controller's face
     buttons.
@@ -121,12 +125,12 @@ async def run_recorder_buttons(
     episode: _Episode | None = None
 
     try:
-        async for _ in ticks(settings.tick_period_s, token):
-            left = fresh_sample(session, "left", settings.stale_timeout_s)
+        async for _ in ticks(settings.tick_period_s, token, clock):
+            left = fresh_sample(session, "left", settings.stale_timeout_s, clock)
             x = left.primary_button if left is not None else prev_x
             rising_x = bool(x) and prev_x is False
             y = bool(left and left.secondary_button)
-            loop_now = asyncio.get_running_loop().time()
+            loop_now = clock.monotonic()
 
             if episode is not None and episode.watcher.done():
                 episode = None
