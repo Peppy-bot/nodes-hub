@@ -428,7 +428,7 @@ class FakeAction(ModuleType):
         self.ends_at_once = True
         self.admission = None
         # spawn_object is the one action that declares a result.
-        self.result = _completed(object_id="obj_1") if name == "spawn_object" else _completed()
+        self.result = _completed(object_id="obj_1", name="crate") if name == "spawn_object" else _completed()
         self._clock = clock
         action = self
 
@@ -959,7 +959,7 @@ def test_a_load_that_fails_once_accepted_ends_its_stream_with_the_reason(command
 def test_spawn_object_reports_the_minted_object_id(commander, caplog):
     caplog.set_level(logging.INFO)
     spawn = commander.actions.spawn_object
-    spawn.result = _completed(object_id="obj_42")
+    spawn.result = _completed(object_id="obj_42", name="red_block")
     done = (
         "spawn_object(asset_id=props/blocks/red_block, position=[0.5, 0.0, 0.8], yaw=0.0, physics=dynamic, "
         "mass=0.2) done"
@@ -969,12 +969,14 @@ def test_spawn_object_reports_the_minted_object_id(commander, caplog):
         "asset_id": "props/blocks/red_block", "position": [0.5, 0, 0.8], "physics": "dynamic", "mass": 0.2,
     }))
 
-    assert (status, lines) == (200, [{"goal": "1"}, {"success": True, "message": done, "object_id": "obj_42"}])
+    assert (status, lines) == (
+        200, [{"goal": "1"}, {"success": True, "message": done, "object_id": "obj_42", "name": "red_block"}],
+    )
     # A spawn naming no yaw stands as authored; the panel turns an object by
     # its yaw alone and names no orientation.
     assert spawn.goals == [SimpleNamespace(
         asset_id="props/blocks/red_block", position=[0.5, 0.0, 0.8], yaw=0.0, orientation=None, scale=1.0,
-        physics="dynamic", mass=0.2, snap_to=None,
+        physics="dynamic", mass=0.2, name=None, feeder=None, snap_to=None,
     )]
     assert _node_log(commander, caplog) == [(logging.INFO, done, None)]
 
@@ -1008,7 +1010,7 @@ def test_a_spawn_naming_only_its_asset_and_position_takes_the_defaults(commander
     assert status == 200
     assert commander.actions.spawn_object.goals == [SimpleNamespace(
         asset_id="props/furniture/desk", position=[1.0, 0.0, 0.0], yaw=0.0, orientation=None, scale=1.0,
-        physics="none", mass=0.1, snap_to=None,
+        physics="none", mass=0.1, name=None, feeder=None, snap_to=None,
     )]
 
 
@@ -1274,7 +1276,7 @@ _BY_ITS_CALLER = "cancelled by its caller"
 def _cancelled_by_its_caller(name):
     """How the simulator ends a goal of `name` that its caller cancelled
     before it built anything: a spawn names no object."""
-    return _cancelled(_BY_ITS_CALLER, **({"object_id": ""} if name == "spawn_object" else {}))
+    return _cancelled(_BY_ITS_CALLER, **({"object_id": "", "name": ""} if name == "spawn_object" else {}))
 
 
 _SPAWN = {"asset_id": "props/furniture/desk", "position": [1.0, 0.0, 0.0], "physics": "static"}
@@ -1428,13 +1430,13 @@ def test_a_spawn_the_simulator_built_despite_its_cancel_is_reported_as_success(c
         await cancel(commander, client, goal)
         # The provider builds what it started, and ends the goal cancelled
         # with the object it built: the object stands.
-        goal.end(_cancelled(_BY_ITS_CALLER, object_id="obj_7"))
+        goal.end(_cancelled(_BY_ITS_CALLER, object_id="obj_7", name="desk"))
         return await answer, goal
 
     (status, _, lines), goal = _call(commander, scenario)
 
     message = f"{_SPAWN_SUMMARY} done; it ended cancelled after it built the object: {_BY_ITS_CALLER}"
-    assert (status, lines[-1]) == (200, {"success": True, "message": message, "object_id": "obj_7"})
+    assert (status, lines[-1]) == (200, {"success": True, "message": message, "object_id": "obj_7", "name": "desk"})
     assert goal.cancels == [10.0]
     assert _node_log(commander, caplog) == [
         (logging.INFO, f"{_SPAWN_SUMMARY}: {why}; cancel SIGNALLED", None),
@@ -2084,14 +2086,14 @@ def test_a_spawn_streams_its_progress_and_reports_the_minted_object_id(commander
         await goal.settled()
         goal.report(1_900_000, 3, building=True)
         await goal.settled()
-        goal.complete(object_id="obj_7")
+        goal.complete(object_id="obj_7", name="desk")
         return await answer
 
     assert _call(commander, scenario) == (200, "application/x-ndjson", [
         {"goal": "1"},
         {"progress": {"bytes_fetched": 1_200_000, "files_ready": 2, "building": False}},
         {"progress": {"bytes_fetched": 1_900_000, "files_ready": 3, "building": True}},
-        {"success": True, "message": f"{_SPAWN_SUMMARY} done", "object_id": "obj_7"},
+        {"success": True, "message": f"{_SPAWN_SUMMARY} done", "object_id": "obj_7", "name": "desk"},
     ])
     assert spawn.admissions == [60.0]
 
@@ -2109,8 +2111,8 @@ def test_spawns_in_flight_together_are_each_followed_and_cancelled_by_their_own_
         block_goal = await spawn.fired(1)
         await block_goal.settled()
         cancelled = await _post(client, "/api/goals/2/cancel", {})
-        block_goal.end(_cancelled(_BY_ITS_CALLER, object_id=""))
-        desk_goal.complete(object_id="obj_1")
+        block_goal.end(_cancelled(_BY_ITS_CALLER, object_id="", name=""))
+        desk_goal.complete(object_id="obj_1", name="desk")
         return cancelled, await desk_answer, await block_answer, desk_goal, block_goal
 
     cancelled, desk_answer, block_answer, desk_goal, block_goal = _call(commander, scenario)
@@ -2118,7 +2120,9 @@ def test_spawns_in_flight_together_are_each_followed_and_cancelled_by_their_own_
     assert cancelled == (200, {"success": True, "message": "the simulator answered the cancel of spawn_object: SIGNALLED"})
     assert (desk_goal.cancels, block_goal.cancels) == ([], [10.0])
     desk_done = "spawn_object(asset_id=props/furniture/desk, position=[1.0, 0.0, 0.0], yaw=0.0, physics=none, mass=0.1) done"
-    assert desk_answer[2] == [{"goal": "1"}, {"success": True, "message": desk_done, "object_id": "obj_1"}]
+    assert desk_answer[2] == [
+        {"goal": "1"}, {"success": True, "message": desk_done, "object_id": "obj_1", "name": "desk"},
+    ]
     assert block_answer[2] == [
         {"goal": "2"},
         {"success": False, "message": "spawn_object was cancelled from the page", "cancelled_by": "page"},

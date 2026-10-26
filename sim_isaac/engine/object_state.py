@@ -29,9 +29,10 @@ _AT_REST = (0.0, 0.0, 0.0)
 class ObjectRecord:
     """One spawned object in a snapshot: its world pose (orientation a unit
     quaternion x, y, z, w), its world-axis velocities at its origin, and the
-    asset, physics, mass and scale it was spawned with."""
+    name, asset, physics, mass and scale it was spawned with."""
 
     object_id: str
+    name: str
     asset_id: str
     physics: str
     mass: float
@@ -116,6 +117,7 @@ class IsaacObjectReader:
             records.append(
                 ObjectRecord(
                     object_id=obj["object_id"],
+                    name=obj["name"],
                     asset_id=obj["asset_id"],
                     physics=obj["physics"],
                     mass=float(obj["mass"]),

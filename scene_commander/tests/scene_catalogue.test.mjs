@@ -1013,11 +1013,11 @@ test('a spawn shows its progress and reads the objects again once it succeeded',
     assert.equal(ui.element('status').textContent, `Building ${block.asset_id}`);
     assert.deepEqual(ui.requests.slice(since).map(r => r.path), ['/api/objects/spawn']);
 
-    stream.push({ success: true, message: `Spawned ${block.asset_id}`, object_id: 'obj_9' });
+    stream.push({ success: true, message: `Spawned ${block.asset_id} as red_block`, object_id: 'obj_9', name: 'red_block' });
     stream.end();
     await spawning;
     assert.deepEqual(ui.requests.slice(since).map(r => r.path), ['/api/objects/spawn', '/api/objects']);
-    assert.equal(ui.element('status').textContent, `Spawned ${block.asset_id}\nobject_id=obj_9`);
+    assert.equal(ui.element('status').textContent, `Spawned ${block.asset_id} as red_block\nname=red_block object_id=obj_9`);
 });
 
 test('a spawn that fails once accepted shows the reason and reads nothing again', async () => {
