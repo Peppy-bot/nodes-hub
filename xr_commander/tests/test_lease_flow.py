@@ -574,7 +574,11 @@ async def test_a_lease_end_that_a_listing_settles_against_the_headset_lets_go():
     async with rig("pose_stream") as r, running(r.follow):
         follow, hold = await accept_both(r.daemon)
         await follow.publish_feedback(change("listing", robots=[ROBOT]))
-        await eventually(lambda: r.fleet.unavailable() is None)
+        # The rig's fleet follows from its start: wait for the listing of
+        # the goals just started.
+        await eventually(
+            lambda: r.fleet.generation == 1 and r.fleet.unavailable() is None
+        )
         await r.squeeze_and_take()
         await hold.publish_feedback(
             lease_event("lease_end", robot=ROBOT, cause="the stack was reset")
