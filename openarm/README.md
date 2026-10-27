@@ -314,13 +314,13 @@ Then press:
 Spawn Object
 ```
 
-Isaac assigns each spawned object a unique ID similar to:
+Isaac Sim or Waldo names each spawned object after its asset, adding `_2`, `_3` and so on while the name is taken, and assigns it a unique ID. The status line shows both once the object stands:
 
 ```text
-obj_626b16769f97
+name=red_block object_id=obj_626b16769f97
 ```
 
-Runtime objects are created under:
+Isaac Sim creates its runtime objects under:
 
 ```text
 /World/RuntimeObjects/<object_id>

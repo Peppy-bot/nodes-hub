@@ -591,6 +591,7 @@ class _Goal:
 
         if self.action is spawn_object:
             answer["object_id"] = self._spawned(result)
+            answer["name"] = result.data.name
 
         return answer
 
@@ -1112,6 +1113,10 @@ def _spawn_request(payload: dict):
         scale=_optional(_number, payload, "scale", 1.0),
         physics=_optional(_physics, payload, "physics", "none"),
         mass=_optional(_number, payload, "mass", 0.1),
+        # The simulation names the object from its asset; the panel's spawns
+        # are setup, by no feeder.
+        name=None,
+        feeder=None,
         snap_to=None,
     )
 
@@ -2356,7 +2361,7 @@ async function spawnObject() {
         await refreshObjects();
 
         status(
-            `${result.message}\nobject_id=${result.object_id}`
+            `${result.message}\nname=${result.name} object_id=${result.object_id}`
         );
     }
     catch (err) {
