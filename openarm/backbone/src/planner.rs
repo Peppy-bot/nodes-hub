@@ -1236,7 +1236,7 @@ mod tests {
         use openarm_description::{HardwareVersion, home, ready};
         let horizontal = |pose: &Isometry3<f64>| pose.translation.x.hypot(pose.translation.y);
         for version in [HardwareVersion::V1, HardwareVersion::V2] {
-            for side in [Side::Left, Side::Right] {
+            for side in Side::BOTH {
                 let model = crate::arm_model(version, side.model()).expect("build the arm");
                 let planner = Planner::new(side, model, test_cfg());
                 let r = planner.world_ee_pose(&ready(side.model()));
@@ -1276,7 +1276,7 @@ mod tests {
             let off_rad = pose.rotation.angle_to(&expected);
             off_m < 1e-3 && off_rad < 5e-3
         };
-        for side in [Side::Left, Side::Right] {
+        for side in Side::BOTH {
             let (ready_grasp, home_grasp) = match side {
                 Side::Right => (right_ready, right_home),
                 Side::Left => (mirror(right_ready), mirror(right_home)),

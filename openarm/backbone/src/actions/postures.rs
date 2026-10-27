@@ -142,13 +142,13 @@ fn measured_poses(answer: GraspAnswer) -> std::result::Result<ArmPair<Isometry3<
     let grasps = answer?;
     let pose = |side: Side| {
         let arm = side.arm_name();
-        let grasp: MeasuredGrasp = *grasps.get(side);
+        let grasp: MeasuredGrasp = grasps[side];
         grasp.map_err(|unmeasured| match unmeasured {
             Unmeasured::NotYet => "the robot has not measured every limb yet".to_string(),
             Unmeasured::Stale => format!("{arm} stopped reporting its joints"),
         })
     };
-    Ok(ArmPair::new(pose(Side::Left)?, pose(Side::Right)?))
+    ArmPair::from_fn(pose).transpose()
 }
 
 /// The poses of a posture result from `answer`: every arm's grasp pose, or
@@ -211,7 +211,7 @@ macro_rules! posture_runner {
                 let cancelled = Arc::new(AtomicBool::new(false));
                 let (done_tx, mut done_rx) = mpsc::channel::<Outcome>(2);
                 let mut pending = 0usize;
-                for side in [Side::Left, Side::Right] {
+                for side in Side::BOTH {
                     let idx = side.index();
                     let goal = Goal::Joint {
                         target: $posture(side.model()),
@@ -304,7 +304,7 @@ mod tests {
         // srs_model arm actually used.
         use openarm_description::{HardwareVersion, JointPosture, home, ready};
         for version in [HardwareVersion::V1, HardwareVersion::V2] {
-            for side in [Side::Left, Side::Right] {
+            for side in Side::BOTH {
                 let model = crate::arm_model(version, side.model())
                     .expect("build arm from the bundled URDF");
                 let limits = model.limits();
@@ -344,10 +344,7 @@ mod tests {
 
     /// The coordinator's answer with each arm measured at [`grasp_of`].
     fn both_measured() -> GraspAnswer {
-        Ok(ArmPair::new(
-            Ok(grasp_of(Side::Left)),
-            Ok(grasp_of(Side::Right)),
-        ))
+        Ok(ArmPair::from_fn(|side| Ok(grasp_of(side))))
     }
 
     /// An arm's share that failed with `kind` and `message`.
@@ -464,8 +461,7 @@ mod tests {
     #[test]
     fn the_posture_poses_come_in_arm_name_order() {
         let poses = arm_poses(both_measured(), "move_to_ready");
-        let (positions, orientations) =
-            arm_pose_arrays(&ArmPair::new(grasp_of(Side::Left), grasp_of(Side::Right)));
+        let (positions, orientations) = arm_pose_arrays(&ArmPair::from_fn(grasp_of));
         assert_eq!(poses.arm_names, ["left_arm", "right_arm"]);
         assert_eq!(poses.positions, positions);
         assert_eq!(poses.orientations, orientations);

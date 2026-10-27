@@ -209,6 +209,10 @@ pub enum Side {
 }
 
 impl Side {
+    /// Both sides, left then right: the order of every per-arm table on the
+    /// wire, and the order [`ArmPair::from_fn`] builds a pair in.
+    pub const BOTH: [Side; 2] = [Side::Left, Side::Right];
+
     /// This robot's arm names in their fixed left-then-right order: the wire
     /// values limb_motion goals carry and limb_state's arm_names reports.
     pub const ARM_NAMES: [&'static str; 2] = ["left_arm", "right_arm"];
@@ -321,7 +325,7 @@ mod tests {
             Side::from_gripper_name(Side::GRIPPER_NAMES[1]),
             Some(Side::Right)
         );
-        for side in [Side::Left, Side::Right] {
+        for side in Side::BOTH {
             assert_eq!(Side::from_arm_name(side.arm_name()), Some(side));
             assert_eq!(Side::from_gripper_name(side.gripper_name()), Some(side));
         }

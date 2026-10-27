@@ -1,6 +1,8 @@
 //! A value held once per arm. The backbone works on the two arms together almost
-//! everywhere (governing, streaming, the per-tick math), so a named `left`/`right`
-//! pair reads far better than `[_; 2]` indexed by 0/1 or a bare tuple.
+//! everywhere (governing, streaming, the per-tick math), so it keeps per-arm
+//! values in an [`ArmPair`], indexed by [`Side`].
+
+use std::ops::{Index, IndexMut};
 
 use crate::types::Side;
 
@@ -17,19 +19,84 @@ impl<T> ArmPair<T> {
         Self { left, right }
     }
 
-    /// The value held for `side`.
-    pub fn get(&self, side: Side) -> &T {
+    /// The values, in [`Side::BOTH`] order.
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
+        [&self.left, &self.right].into_iter()
+    }
+
+    /// The pair holding `f(side)` for each side, in [`Side::BOTH`] order: `f`
+    /// runs for the left side first.
+    pub fn from_fn(mut f: impl FnMut(Side) -> T) -> Self {
+        let left = f(Side::Left);
+        let right = f(Side::Right);
+        Self { left, right }
+    }
+}
+
+impl<T> Index<Side> for ArmPair<T> {
+    type Output = T;
+
+    fn index(&self, side: Side) -> &T {
         match side {
             Side::Left => &self.left,
             Side::Right => &self.right,
         }
     }
+}
 
-    /// The value held for `side`, to change.
-    pub fn get_mut(&mut self, side: Side) -> &mut T {
+impl<T> IndexMut<Side> for ArmPair<T> {
+    fn index_mut(&mut self, side: Side) -> &mut T {
         match side {
             Side::Left => &mut self.left,
             Side::Right => &mut self.right,
         }
+    }
+}
+
+impl<T, E> ArmPair<Result<T, E>> {
+    /// Both values, or the first error in [`Side::BOTH`] order.
+    pub fn transpose(self) -> Result<ArmPair<T>, E> {
+        Ok(ArmPair::new(self.left?, self.right?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_side_reads_and_writes_its_own_value() {
+        let mut pair = ArmPair::new("left", "right");
+        assert_eq!(pair[Side::Left], "left");
+        assert_eq!(pair[Side::Right], "right");
+        pair[Side::Left] = "new left";
+        assert_eq!(pair, ArmPair::new("new left", "right"));
+        pair[Side::Right] = "new right";
+        assert_eq!(pair, ArmPair::new("new left", "new right"));
+    }
+
+    #[test]
+    fn iter_walks_the_values_left_first() {
+        assert_eq!(ArmPair::new(1, 2).iter().collect::<Vec<_>>(), [&1, &2]);
+    }
+
+    #[test]
+    fn transpose_gives_both_values_or_the_first_error() {
+        let pair = |left: Result<i32, &'static str>, right| ArmPair::new(left, right);
+        assert_eq!(pair(Ok(1), Ok(2)).transpose(), Ok(ArmPair::new(1, 2)));
+        assert_eq!(pair(Ok(1), Err("right")).transpose(), Err("right"));
+        assert_eq!(pair(Err("left"), Ok(2)).transpose(), Err("left"));
+        assert_eq!(pair(Err("left"), Err("right")).transpose(), Err("left"));
+    }
+
+    #[test]
+    fn from_fn_builds_each_side_from_its_own_side_left_first() {
+        let mut calls = Vec::new();
+        let pair = ArmPair::from_fn(|side| {
+            calls.push(side);
+            side.label()
+        });
+        assert_eq!(pair, ArmPair::new("left", "right"));
+        assert_eq!(calls, Side::BOTH);
     }
 }

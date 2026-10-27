@@ -474,13 +474,13 @@ pub async fn run(
             now,
             stale_limit,
         );
-        for side in [Side::Left, Side::Right] {
-            let arm = channels.get(side);
+        for side in Side::BOTH {
+            let arm = &channels[side];
             let fresh = |admission: Admission| admission != Admission::Stale;
             arm.fresh
-                .store(fresh(*arm_admission.get(side)), Ordering::Release);
+                .store(fresh(arm_admission[side]), Ordering::Release);
             arm.gripper_fresh
-                .store(fresh(*gripper_admission.get(side)), Ordering::Release);
+                .store(fresh(gripper_admission[side]), Ordering::Release);
         }
         // The services are answered ahead of the tick's advance: a stop ends
         // every move before the planners would step it once more.
@@ -693,10 +693,10 @@ async fn serve_request(
             let reason = stop_reason(&reason);
             info!("stop requested: {reason}");
             let mut stopped = Vec::new();
-            for side in [Side::Left, Side::Right] {
-                let arm = channels.get_mut(side);
-                let planner = planners.get_mut(side);
-                let measured = seeded_measurement(arm, *arm_admission.get(side));
+            for side in Side::BOTH {
+                let arm = &mut channels[side];
+                let planner = &mut planners[side];
+                let measured = seeded_measurement(arm, arm_admission[side]);
                 if planner.stop_active(&reason, measured, now).await {
                     stopped.push(side.arm_name().to_string());
                 }
@@ -705,7 +705,7 @@ async fn serve_request(
                     goal.stop(&reason, measured, planner).await;
                 }
                 let measured_frac = gripper_fraction(&arm.gripper);
-                if let Some(m) = gripper_moves.get_mut(side).take() {
+                if let Some(m) = gripper_moves[side].take() {
                     let elapsed_s = now.duration_since(m.motion.admitted).as_secs_f64();
                     end_gripper_move(
                         m,
@@ -724,7 +724,7 @@ async fn serve_request(
             let _ = reply.send(stopped);
         }
         CoordinatorRequest::CheckArmMove { request, reply } => {
-            let _ = reply.send(planners.get_mut(request.side).check_cartesian(
+            let _ = reply.send(planners[request.side].check_cartesian(
                 &request.target,
                 request.tolerance,
                 request.duration,
@@ -954,11 +954,10 @@ fn measured_grasps(
     planners: &mut ArmPair<Planner>,
     arm_admission: ArmPair<Admission>,
 ) -> ArmPair<MeasuredGrasp> {
-    let mut grasp = |side: Side| {
-        seeded_measurement(channels.get(side), *arm_admission.get(side))
-            .map(|q| planners.get_mut(side).world_ee_pose(&q))
-    };
-    ArmPair::new(grasp(Side::Left), grasp(Side::Right))
+    ArmPair::from_fn(|side| {
+        seeded_measurement(&channels[side], arm_admission[side])
+            .map(|q| planners[side].world_ee_pose(&q))
+    })
 }
 
 /// Gather one whole-robot snapshot for the limb_state readout: every limb's
@@ -2063,8 +2062,8 @@ mod tests {
         }
 
         let start = Instant::now();
-        for side in [Side::Left, Side::Right] {
-            let (arm, planner) = (channels.get_mut(side), planners.get_mut(side));
+        for side in Side::BOTH {
+            let (arm, planner) = (&mut channels[side], &mut planners[side]);
             tick_arm(arm, planner, Admission::Live, start).await;
         }
         assert!(done_rx.try_recv().is_err(), "both shares are in flight");
