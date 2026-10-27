@@ -350,7 +350,8 @@ The robot's own body is not checked for hiding a point from the camera.
 
 | Module | Owns | Why it lives here |
 |---|---|---|
-| `main.rs` | bringup: params, models, channels, task supervision | first task exit is fatal; the daemon restarts a clean process |
+| `main.rs` | tracing, then the node runtime running `setup` | all node logic lives in the library, so the integration tests boot the same entry point |
+| `node.rs` | bringup: params, models, channels, task supervision | first task exit is fatal; the daemon restarts a clean process |
 | `startup.rs` | the robot_initializer gate | nothing streams before the robot is ready |
 | `streams.rs` | every subscription + parse-at-the-boundary types (`GripperCommand`, `ArmState`, `GripperState`) | one receive policy (`subscribe_pair` + `accept`); a malformed message is dropped with a reason, never driven |
 | `upstream.rs` | `UpstreamMode` (which upstream slot kind is followed) + `Upstream` (the parsed joint or pose command) | one command authority per arm is unrepresentable, not checked per tick |
@@ -365,13 +366,14 @@ The robot's own body is not checked for hiding a point from the camera.
 | `governor/limiters/` | the `Limiter` trait, one module per limiter, and `allowance.rs` (the `Allowance`/`Limits` currency they speak) | everything expressible as a per-DOF fraction lives together |
 | `governor/barrier.rs` | the projection and the floor scan | the two stages that are not per-DOF fractions |
 | `torso.rs` | the torso clip regions the URDF does not carry | geometry facts, versioned with the node |
-| `actions/` | goal admission (validate + claim), nothing else | execution belongs to the planner/coordinator that owns the state |
+| `actions/` | the actions and services a caller reaches: move goal admission (validate + claim), the posture goals run to their one result, and the stop and plan-check services that ask the coordinator | execution belongs to the planner/coordinator that owns the state |
 | `failure.rs` | the failure kinds of the moves and of `check_arm_move`, each given to every generated member | one failure crosses from a posture share to its posture goal |
 | `workspace.rs` | the OpenArm's part of the workspace answer from the design: reach per grasp orientation, the perception camera, the per-height reach memo it keeps, the parsing of the camera's geometry; `workspace_core::design` parses the request and composes the answer | pure: no messaging, so every answer is unit-tested without a node |
+| `camera_mounts.rs` | the camera_mounts contract: each camera resolved once at bringup into the frame that carries it, then composed with the grasp poses measured last | a mount the backbone cannot place stops bringup |
 | `workspace_service.rs` | the two workspace services and the read of the linked camera's geometry | the thin edge between the generated handlers and `workspace.rs` |
 | `serving.rs` | the loop of each service answered for the life of the node (`get_limb_names`, `get_camera_poses`, the workspace services): ended by the node's cancel, an error logged and waited out for 1 s | one loop, so no service can hot-spin on a broken transport or outlive the node |
-| `side.rs` | `Side` (with its wire names) and `ArmPair`, the value held per side | one way to address a side: a pair indexed by `Side`, walked in `Side::BOTH` order |
-| `types.rs` | `ARM_DOF`, `JointVec`, the limb tables, the world-pose wire decomposition, the tolerances and times a move is parsed by | shared primitives |
+| `side.rs` | `Side` (with its wire names, their parsing and refusals), `ArmPair`, the value held per side, and the limb tables | one way to address a side: a pair indexed by `Side`, walked in `Side::BOTH` order |
+| `types.rs` | `ARM_DOF`, `JointVec`, the world-pose wire decomposition, the tolerances and times a move is parsed by | shared primitives |
 
 ## Parameters and links
 

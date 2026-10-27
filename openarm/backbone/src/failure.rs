@@ -9,6 +9,8 @@ use peppygen::exposed_actions::limb_motion::{move_arm, move_arm_joints, move_gri
 use peppygen::exposed_actions::postures::{move_to_home, move_to_ready};
 use peppygen::exposed_services::limb_motion::check_arm_move;
 
+use crate::side::Side;
+
 /// A failure kind of the moves and of `check_arm_move`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FailureKind {
@@ -45,11 +47,11 @@ impl Failure {
         }
     }
 
-    /// The same failure with `label` before its message, such as the side
-    /// of the arm whose share of a posture goal failed.
-    pub fn labelled(self, label: &str) -> Self {
+    /// The same failure with `side` before its message: the side of the
+    /// arm whose share of a posture goal failed.
+    pub fn labelled(self, side: Side) -> Self {
         Self {
-            message: format!("{label}: {}", self.message),
+            message: format!("{side}: {}", self.message),
             ..self
         }
     }
@@ -128,7 +130,7 @@ mod tests {
     fn a_labelled_failure_keeps_its_kind_and_names_the_label_first() {
         let failure = Failure::new(FailureKind::Timeout, "still 0.2 rad from the target");
         assert_eq!(
-            failure.labelled("left"),
+            failure.labelled(Side::Left),
             Failure::new(FailureKind::Timeout, "left: still 0.2 rad from the target")
         );
     }

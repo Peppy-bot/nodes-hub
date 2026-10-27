@@ -357,7 +357,7 @@ enum GripperTerminal {
 
 /// Run the coordination loop. Holds the governor and both planners. Runs until
 /// the node's cancellation token fires; returns `Err` if a publisher cannot be
-/// declared at bringup. Any return takes the node down (the supervisor in `main`
+/// declared at bringup. Any return takes the node down (the supervisor in `node.rs`
 /// treats it as fatal).
 #[expect(
     clippy::too_many_arguments,
@@ -414,7 +414,7 @@ pub async fn run(
     let mut gripper_moves: ArmPair<Option<GripperMove>> = ArmPair::from_fn(|_| None);
 
     let dt = cycle_period.as_secs_f64();
-    // One low-pass per joint per arm, smoothing the published desired velocity. `main`
+    // One low-pass per joint per arm, smoothing the published desired velocity. `node`
     // validates `0 < cutoff < Nyquist` at bringup, a strict superset of what `from_cutoff`
     // rejects, so construction cannot fail: build one filter and copy it per joint (the
     // same bringup-invariant pattern as `Pacer::new(...).expect(...)`).
@@ -754,7 +754,6 @@ fn admit_arms(
 /// follower_state_rate_hz is a promise the follower is not keeping, ahead of
 /// the stale limit freezing the limb.
 fn report_cadence(side: Side, limb: &str, change: Option<CadenceChange>) {
-    let side = side.label();
     match change {
         Some(CadenceChange::Degraded {
             delivered,
@@ -1079,15 +1078,12 @@ async fn wait_for_first<T>(
         match tokio::time::timeout(SEED_WAIT_WARN_PERIOD, latest.wait_for(Option::is_some)).await {
             Ok(Ok(_)) => return Ok(()),
             Ok(Err(_)) => {
-                error!(
-                    "{} {what} channel closed before its first value",
-                    side.label()
-                );
+                error!("{} {what} channel closed before its first value", side);
                 return Err(Shutdown);
             }
             Err(_) => warn!(
                 "{} {what} not reported yet; backbone waiting to stream",
-                side.label()
+                side
             ),
         }
     }
@@ -1896,7 +1892,10 @@ mod tests {
         .await;
 
         let outcome = done_rx.recv().await.expect("a failed goal must report");
-        assert_eq!(outcome, Outcome::Failed(stale_failure().labelled("left")));
+        assert_eq!(
+            outcome,
+            Outcome::Failed(stale_failure().labelled(Side::Left))
+        );
         assert!(
             !channels.busy.load(Ordering::Acquire),
             "the failure releases the claim"
@@ -1958,7 +1957,10 @@ mod tests {
         )
         .await;
         let outcome = done_rx.try_recv().expect("the stale tick ends the share");
-        assert_eq!(outcome, Outcome::Failed(stale_failure().labelled("left")));
+        assert_eq!(
+            outcome,
+            Outcome::Failed(stale_failure().labelled(Side::Left))
+        );
         assert!(
             !channels.busy.load(Ordering::Acquire),
             "the failure releases the claim"
@@ -2019,7 +2021,7 @@ mod tests {
         let right_end = done_rx.try_recv().expect("the right share ends");
         assert_eq!(
             right_end,
-            Outcome::Failed(stale_failure().labelled("right"))
+            Outcome::Failed(stale_failure().labelled(Side::Right))
         );
 
         let recovered = [0.2, -0.6, 0.1, 1.0, 0.0, 0.0, 0.0];

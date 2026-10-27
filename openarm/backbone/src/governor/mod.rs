@@ -243,8 +243,7 @@ impl Governor {
     pub fn build(
         urdf: &str,
         meshes_dir: &str,
-        left_base: &str,
-        right_base: &str,
+        bases: ArmPair<&str>,
         d_stop: f64,
         d_safe: f64,
         max_joint_velocity_rad_s: f64,
@@ -269,9 +268,7 @@ impl Governor {
         if !valid_gripper_rate(max_gripper_rate_frac_s) {
             return Err(GovernorError::GripperRate(max_gripper_rate_frac_s));
         }
-        let model = ConfiguredModel::new(build_collision_model(
-            urdf, meshes_dir, left_base, right_base,
-        )?);
+        let model = ConfiguredModel::new(build_collision_model(urdf, meshes_dir, bases)?);
         Ok(Self {
             model,
             d_stop,
@@ -568,15 +565,14 @@ impl Governor {
 }
 
 /// Build the bimanual collision model with the shared tight torso proxy, from
-/// the embedded URDF and its materialized meshes.
+/// the embedded URDF, its materialized meshes, and the base link of each arm.
 fn build_collision_model(
     urdf: &str,
     meshes_dir: &str,
-    left_base: &str,
-    right_base: &str,
+    bases: ArmPair<&str>,
 ) -> Result<BimanualCollisionModel, GovernorError> {
     Ok(
-        BimanualCollisionModel::builder(urdf, meshes_dir, left_base, right_base)
+        BimanualCollisionModel::builder(urdf, meshes_dir, bases.left, bases.right)
             .regions(TORSO_BODY, torso_regions()?)
             .build()?,
     )
@@ -715,8 +711,7 @@ mod tests {
         Governor::build(
             version.urdf(),
             meshes_dir.to_str().expect("meshes dir path is valid UTF-8"),
-            version.base_link(openarm_description::Side::Left),
-            version.base_link(openarm_description::Side::Right),
+            ArmPair::from_fn(|side| version.base_link(side.model())),
             D_STOP,
             D_SAFE,
             MAX_JOINT_VELOCITY_RAD_S,
@@ -852,7 +847,7 @@ mod tests {
             assert!(
                 arm[3] > home_elbow + 0.1,
                 "the {} elbow reached {:.4}, Home is {home_elbow}",
-                side.label(),
+                side,
                 arm[3]
             );
         }
@@ -864,7 +859,7 @@ mod tests {
             assert!(
                 arm.iter().zip(rest).all(|(q, r)| (q - r).abs() < 1e-3),
                 "with closed grippers the {} arm stalled at {arm:?}",
-                side.label()
+                side
             );
         }
     }
@@ -963,8 +958,9 @@ mod tests {
         let mut g = Governor::build(
             openarm_description::HardwareVersion::V1.urdf(),
             meshes_dir.to_str().expect("meshes dir path is valid UTF-8"),
-            openarm_description::HardwareVersion::V1.base_link(openarm_description::Side::Left),
-            openarm_description::HardwareVersion::V1.base_link(openarm_description::Side::Right),
+            ArmPair::from_fn(|side| {
+                openarm_description::HardwareVersion::V1.base_link(side.model())
+            }),
             D_STOP,
             D_SAFE,
             velocity,
@@ -2067,7 +2063,6 @@ max={} us | over budget {over}/{}",
             parked[pushing] = wrists_inward(0.55)[pushing];
             let q = at(parked);
             let d_wall = distance(&mut g, &q);
-            let label = retreating.label();
             assert!(
                 (D_STOP..D_SAFE).contains(&d_wall),
                 "setup: parked in the band, got {d_wall:+.5}"
@@ -2087,7 +2082,7 @@ max={} us | over budget {over}/{}",
             let solo_retreat = distance(&mut g, &with(retreating, pulled));
             assert!(
                 solo_retreat > d_wall + 1e-3,
-                "setup: the {label} retreat alone opens the clearance, got {solo_retreat:+.5}"
+                "setup: the {retreating} retreat alone opens the clearance, got {solo_retreat:+.5}"
             );
 
             let mut commanded = q.arms;
@@ -2096,13 +2091,13 @@ max={} us | over budget {over}/{}",
             let governed = g.govern(&q, &GovState::new(commanded, q.grippers), &q, NO_HANDS, DT);
             assert!(
                 distance(&mut g, &governed) >= D_STOP - 1e-6,
-                "the governed step breached the stop floor, {label} arm retreating"
+                "the governed step breached the stop floor, {retreating} arm retreating"
             );
             // The shared clip alone would cut the retreat with the push.
             let opened = distance(&mut g, &with(retreating, governed.arms[retreating]));
             assert!(
                 opened >= d_wall + 0.9 * (solo_retreat - d_wall),
-                "the {label} retreat was cut short: opened to {opened:+.5} of solo \
+                "the {retreating} retreat was cut short: opened to {opened:+.5} of solo \
                  {solo_retreat:+.5} from wall {d_wall:+.5}"
             );
         }

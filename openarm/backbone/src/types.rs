@@ -1,7 +1,6 @@
 //! Shared primitives for the bimanual backbone: arm DOF, the joint vector,
-//! this robot's limb tables, the world-pose wire decomposition, the pose slack
-//! a move is planned and settled within, and the tolerances and times every
-//! move goal is parsed by.
+//! the world-pose wire decomposition, the pose slack a move is planned and
+//! settled within, and the tolerances and times every move goal is parsed by.
 
 use std::time::Duration;
 
@@ -145,8 +144,7 @@ impl ArmMoveRequest {
         plan_position_tolerance_m: f64,
         plan_orientation_tolerance_rad: f64,
     ) -> Result<Self, String> {
-        let side =
-            Side::from_arm_name(arm_name).ok_or_else(|| Side::UNKNOWN_ARM_NAME.to_string())?;
+        let side = Side::from_arm_name(arm_name)?;
         let target = pose_from_wire(position, orientation)
             .map_err(|reason| format!("goal pose has {reason}"))?;
         let tolerance = PoseTolerance::from_wire(
@@ -197,53 +195,9 @@ pub fn move_seconds_from_wire(field: &str, value: f64) -> Result<Duration, Strin
 /// One joint-space vector (positions, velocities, or torques), j1..j7.
 pub type JointVec = [f64; ARM_DOF];
 
-/// This robot's limb tables as the limb_state contract carries them, wire
-/// shaped and in [`Side::BOTH`] order.
-pub struct LimbNames {
-    pub arm_names: Vec<String>,
-    pub joints_per_arm: Vec<u32>,
-    pub gripper_names: Vec<String>,
-}
-
-/// The one reading of the name tables: the labels on every limb_states
-/// snapshot and the answer get_limb_names gives.
-pub fn limb_names() -> LimbNames {
-    LimbNames {
-        arm_names: Side::BOTH.map(|side| side.arm_name().to_owned()).to_vec(),
-        joints_per_arm: vec![ARM_DOF as u32; Side::BOTH.len()],
-        gripper_names: Side::BOTH
-            .map(|side| side.gripper_name().to_owned())
-            .to_vec(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // Pins the name tables to the parsers and the refusals: a name the tables
-    // advertise (on limb_state's arm_names/gripper_names) must parse back to
-    // its side and appear in the refusal that lists this robot's limbs, and a
-    // foreign name must be refused, not misrouted.
-    #[test]
-    fn advertised_names_parse_and_foreign_names_refuse() {
-        let names = limb_names();
-        for (side, (arm, gripper)) in Side::BOTH
-            .into_iter()
-            .zip(names.arm_names.iter().zip(&names.gripper_names))
-        {
-            assert_eq!(Side::from_arm_name(arm), Some(side));
-            assert_eq!(Side::from_gripper_name(gripper), Some(side));
-        }
-        for side in Side::BOTH {
-            assert!(Side::UNKNOWN_ARM_NAME.contains(&format!("\"{}\"", side.arm_name())));
-            assert!(Side::UNKNOWN_GRIPPER_NAME.contains(&format!("\"{}\"", side.gripper_name())));
-        }
-        assert_eq!(Side::from_arm_name("left_gripper"), None);
-        assert_eq!(Side::from_gripper_name("left_arm"), None);
-        assert_eq!(Side::from_arm_name("LEFT_ARM"), None);
-        assert_eq!(Side::from_arm_name(""), None);
-    }
 
     // Pins the outbound wire ordering to the inbound one: a scalar-first slip
     // on either side breaks the round trip.

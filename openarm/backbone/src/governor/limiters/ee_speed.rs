@@ -187,14 +187,13 @@ mod tests {
             let governed = split(&ee.allow(&step).apply(&step));
             for side in Side::BOTH {
                 let first_joint = governed.arms[side][0];
-                let label = side.label();
                 if side == streamed {
                     assert!(
                         (first_joint - 0.25 * DT).abs() < 1e-12,
-                        "streamed {label} side not scaled to the cap: {first_joint}"
+                        "streamed {side} side not scaled to the cap: {first_joint}"
                     );
                 } else {
-                    assert_eq!(first_joint, 0.2, "planned {label} side is not capped");
+                    assert_eq!(first_joint, 0.2, "planned {side} side is not capped");
                 }
             }
         }

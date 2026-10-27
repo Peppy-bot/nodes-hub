@@ -238,12 +238,12 @@ async fn accept<Raw, Parsed>(
                 }
             }
             Err(reason) => warn_throttled(last_reject_warn, || {
-                warn!("{what}: dropping {} message with {reason}", side.label());
+                warn!("{what}: dropping {} message with {reason}", side);
             }),
         },
         Ok(None) => return false,
         Err(e) => {
-            error!("{what} receive ({}): {e}", side.label());
+            error!("{what} receive ({}): {e}", side);
             tokio::time::sleep(RECEIVE_ERROR_BACKOFF).await;
         }
     }

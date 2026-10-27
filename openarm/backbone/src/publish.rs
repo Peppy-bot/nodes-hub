@@ -31,9 +31,9 @@ use tokio::sync::watch;
 use tracing::{error, warn};
 
 use crate::camera_mounts::MeasuredGrasps;
-use crate::side::{ArmPair, Side};
+use crate::side::{ArmPair, Side, limb_names};
 use crate::streams::{GripperState, warn_throttled};
-use crate::types::{JointVec, arm_pose_arrays, limb_names, world_pose_arrays};
+use crate::types::{JointVec, arm_pose_arrays, world_pose_arrays};
 
 /// Pairing timestamp from this instance's bound clock, so consumers age
 /// samples on the same timeline they read. Errors until the clock delivers
@@ -88,7 +88,7 @@ pub struct LimbStateSnapshot {
 pub struct Publisher<Build> {
     publisher: TopicPublisher,
     build: Build,
-    what: &'static str,
+    what: String,
     /// Throttles this slot's failure logs: a stalled clock or a persistently
     /// failing wire hits every cycle, and the log must say so once per
     /// [`crate::streams::THROTTLED_WARN_PERIOD`] per slot, not at the control
@@ -101,12 +101,12 @@ pub struct Publisher<Build> {
 
 impl<Build> Publisher<Build> {
     async fn declare(
-        what: &'static str,
+        what: String,
         declaring: impl Future<Output = peppygen::Result<TopicPublisher>>,
         build: Build,
     ) -> peppygen::Result<Self> {
         Ok(Self {
-            publisher: declare(what, declaring).await?,
+            publisher: declare(&what, declaring).await?,
             build,
             what,
             last_error: Mutex::new(None),
@@ -274,13 +274,13 @@ impl Publishers {
             measured_grasps,
             arm_setpoints: ArmPair::new(
                 Publisher::declare(
-                    "left joint_setpoints",
+                    format!("{} joint_setpoints", Side::Left),
                     left_arm::joint_setpoints::declare_publisher(runner),
                     left_arm::joint_setpoints::build_message as JointBuild,
                 )
                 .await?,
                 Publisher::declare(
-                    "right joint_setpoints",
+                    format!("{} joint_setpoints", Side::Right),
                     right_arm::joint_setpoints::declare_publisher(runner),
                     right_arm::joint_setpoints::build_message as JointBuild,
                 )
@@ -288,13 +288,13 @@ impl Publishers {
             ),
             gripper_setpoints: ArmPair::new(
                 Publisher::declare(
-                    "left gripper_setpoints",
+                    format!("{} gripper_setpoints", Side::Left),
                     left_gripper::gripper_setpoints::declare_publisher(runner),
                     left_gripper::gripper_setpoints::build_message as OpeningBuild,
                 )
                 .await?,
                 Publisher::declare(
-                    "right gripper_setpoints",
+                    format!("{} gripper_setpoints", Side::Right),
                     right_gripper::gripper_setpoints::declare_publisher(runner),
                     right_gripper::gripper_setpoints::build_message as OpeningBuild,
                 )
@@ -302,13 +302,13 @@ impl Publishers {
             ),
             arm_states: ArmPair::new(
                 Publisher::declare(
-                    "upstream left joint_states",
+                    format!("upstream {} joint_states", Side::Left),
                     leader_left_arm::joint_states::declare_publisher(runner),
                     leader_left_arm::joint_states::build_message as JointBuild,
                 )
                 .await?,
                 Publisher::declare(
-                    "upstream right joint_states",
+                    format!("upstream {} joint_states", Side::Right),
                     leader_right_arm::joint_states::declare_publisher(runner),
                     leader_right_arm::joint_states::build_message as JointBuild,
                 )
@@ -316,13 +316,13 @@ impl Publishers {
             ),
             gripper_states: ArmPair::new(
                 Publisher::declare(
-                    "upstream left gripper_states",
+                    format!("upstream {} gripper_states", Side::Left),
                     leader_left_gripper::gripper_states::declare_publisher(runner),
                     leader_left_gripper::gripper_states::build_message as ApertureBuild,
                 )
                 .await?,
                 Publisher::declare(
-                    "upstream right gripper_states",
+                    format!("upstream {} gripper_states", Side::Right),
                     leader_right_gripper::gripper_states::declare_publisher(runner),
                     leader_right_gripper::gripper_states::build_message as ApertureBuild,
                 )
@@ -330,26 +330,26 @@ impl Publishers {
             ),
             arm_pose_states: ArmPair::new(
                 Publisher::declare(
-                    "upstream left pose_states",
+                    format!("upstream {} pose_states", Side::Left),
                     leader_left_arm_pose::pose_states::declare_publisher(runner),
                     leader_left_arm_pose::pose_states::build_message as PoseBuild,
                 )
                 .await?,
                 Publisher::declare(
-                    "upstream right pose_states",
+                    format!("upstream {} pose_states", Side::Right),
                     leader_right_arm_pose::pose_states::declare_publisher(runner),
                     leader_right_arm_pose::pose_states::build_message as PoseBuild,
                 )
                 .await?,
             ),
             status: Publisher::declare(
-                "collision_status",
+                "collision_status".to_owned(),
                 collision_status::declare_publisher(runner),
                 collision_status::build_message as StatusBuild,
             )
             .await?,
             limb_states: Publisher::declare(
-                "limb_states",
+                "limb_states".to_owned(),
                 limb_states::declare_publisher(runner),
                 limb_states::build_message as LimbStateBuild,
             )

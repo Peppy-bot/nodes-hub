@@ -40,8 +40,7 @@ struct GripperGoalRequest {
 }
 
 fn gripper_goal_request(d: &GoalRequestData) -> std::result::Result<GripperGoalRequest, String> {
-    let side = Side::from_gripper_name(&d.gripper_name)
-        .ok_or_else(|| Side::UNKNOWN_GRIPPER_NAME.to_string())?;
+    let side = Side::from_gripper_name(&d.gripper_name)?;
     if !d.opening.is_finite() {
         return Err("non-finite gripper opening".to_string());
     }

@@ -25,16 +25,16 @@ use crate::actions::{ARM_WORDS, ask_coordinator, check_limb_free, claim};
 use crate::coordinator::{CoordinatorRequest, MeasuredGrasp};
 use crate::failure::{Failure, FailureKind};
 use crate::planner::{Goal, JointReply, Outcome, ReadyReply, Unmeasured};
-use crate::side::{ArmPair, Side};
+use crate::side::{ArmPair, Side, limb_names};
 use crate::streams::LeaderActivity;
-use crate::types::{arm_pose_arrays, limb_names, move_seconds_from_wire};
+use crate::types::{arm_pose_arrays, move_seconds_from_wire};
 
 /// Claim both arms' single-flight slots, or refuse with
 /// `precondition_failed`, naming the busy arm. A failure on the second claim
 /// unwinds the first, so a refusal never leaves a slot held.
 fn claim_both(busy: &ArmPair<Arc<AtomicBool>>) -> std::result::Result<(), Failure> {
     let busy_arm = |side: Side| {
-        let message = format!("the {} {}", side.label(), ARM_WORDS.busy);
+        let message = format!("the {side} {}", ARM_WORDS.busy);
         Failure::new(FailureKind::PreconditionFailed, message)
     };
     if !claim(&busy[Side::Left]) {
@@ -227,7 +227,7 @@ macro_rules! posture_runner {
                         // The planner is gone; release the claim its goal
                         // would have held.
                         busy[side].store(false, Ordering::Release);
-                        error!("{}: {} goal channel closed", $name, side.label());
+                        error!("{}: {} goal channel closed", $name, side);
                     } else {
                         pending += 1;
                     }
@@ -355,7 +355,7 @@ mod tests {
                         assert!(
                             q >= limit.lo && q <= limit.hi,
                             "{version:?} {} {name} j{}: {q} outside [{}, {}]",
-                            side.label(),
+                            side,
                             j + 1,
                             limit.lo,
                             limit.hi

@@ -1,12 +1,12 @@
-// Node composition: validates every parameter up front, builds the arm models
-// and the self-collision governor, wires the channels, and spawns the services
-// answered from bringup (limb names, camera mounts, workspace) plus the
-// readiness-gated coordination loop, every action handler and every stream
-// listener. All motion and stream logic lives in the sibling modules; this is
-// only the assembly.
+//! Node composition: validates every parameter up front, builds the arm models
+//! and the self-collision governor, wires the channels, and spawns the services
+//! answered from bringup (limb names, camera mounts, workspace) plus the
+//! readiness-gated coordination loop, every action handler and every stream
+//! listener. All motion and stream logic lives in the sibling modules; this is
+//! only the assembly.
 
-use crate::side::{ArmPair, Side};
-use crate::types::{JointVec, limb_names};
+use crate::side::{ArmPair, Side, limb_names};
+use crate::types::JointVec;
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -99,7 +99,7 @@ pub enum NodeError {
 
     #[error("build the {side} arm model")]
     ArmModel {
-        side: &'static str,
+        side: Side,
         source: srs_model::SrsError,
     },
 
@@ -293,13 +293,10 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     // resolved from the description rather than configured, so a v2 launch cannot
     // inherit a v1 name. The collision model walks the same chains and takes the
     // base links directly.
-    let left_base = hardware_version.base_link(openarm_description::Side::Left);
-    let right_base = hardware_version.base_link(openarm_description::Side::Right);
+    let bases = ArmPair::from_fn(|side| hardware_version.base_link(side.model()));
     let build_arm = |side: Side| {
-        arm_model(hardware_version, side.model()).map_err(|source| NodeError::ArmModel {
-            side: side.label(),
-            source,
-        })
+        arm_model(hardware_version, side.model())
+            .map_err(|source| NodeError::ArmModel { side, source })
     };
     let build_arms = || ArmPair::from_fn(&build_arm).transpose();
     let models = build_arms()?;
@@ -326,8 +323,7 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     let governor = governor::Governor::build(
         hardware_version.urdf(),
         meshes_dir,
-        left_base,
-        right_base,
+        bases,
         params.d_stop_m,
         params.d_safe_m,
         max_joint_velocity_rad_s

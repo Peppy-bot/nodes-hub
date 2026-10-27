@@ -201,7 +201,7 @@ impl JointReply {
             Outcome::Failed(failure) => ctx.fail(failure.kind.into(), failure.message).await,
         };
         if let Err(e) = ended {
-            error!("{}: move_arm_joints end: {e}", side.label());
+            error!("{}: move_arm_joints end: {e}", side);
         }
     }
 
@@ -211,7 +211,7 @@ impl JointReply {
         match self {
             Self::MoveArmJoints { ctx, .. } => {
                 if let Err(e) = ctx.fail(failure.kind.into(), failure.message).await {
-                    error!("{}: move_arm_joints end: {e}", side.label());
+                    error!("{}: move_arm_joints end: {e}", side);
                 }
             }
             Self::Ready(r) => r.report(side, Outcome::Failed(failure)).await,
@@ -224,11 +224,11 @@ impl ReadyReply {
     /// with the side.
     async fn report(self, side: Side, outcome: Outcome) {
         let outcome = match outcome {
-            Outcome::Failed(failure) => Outcome::Failed(failure.labelled(side.label())),
+            Outcome::Failed(failure) => Outcome::Failed(failure.labelled(side)),
             other => other,
         };
         if self.done_tx.send(outcome).await.is_err() {
-            error!("{}: ready outcome aggregation closed", side.label());
+            error!("{}: ready outcome aggregation closed", side);
         }
     }
 }
@@ -804,7 +804,7 @@ impl Planner {
                 duration,
                 reply,
             } => {
-                info!("{}: joint move start", self.side.label());
+                info!("{}: joint move start", self.side);
                 Mode::JointMove(JointMove {
                     traj: JointTrajectory::new(
                         self.setpoint,
@@ -876,7 +876,7 @@ impl Planner {
             }) => {
                 info!(
                     "{}: move_arm start ({elbow:?} elbow, {swivel:?}), duration={:.3}s",
-                    self.side.label(),
+                    self.side,
                     duration.as_secs_f64(),
                 );
                 MovePath::Line(Box::new(LineTrack {
@@ -896,7 +896,7 @@ impl Planner {
             CartesianPlan::Servo(ServoPlan { duration, path }) => {
                 info!(
                     "{}: move_arm start (servo-guided), duration={:.3}s",
-                    self.side.label(),
+                    self.side,
                     duration.as_secs_f64(),
                 );
                 MovePath::Servo(ServoTrajectory::new(path, duration, now))
@@ -947,14 +947,14 @@ impl Planner {
             Outcome::Failed(failure) => return self.fail_cartesian(ctx, failure).await,
         };
         if let Err(e) = ended {
-            error!("{}: move_arm end: {e}", self.side.label());
+            error!("{}: move_arm end: {e}", self.side);
         }
     }
 
     /// Fail a Cartesian goal with `failure`, with no result.
     async fn fail_cartesian(&self, ctx: &move_arm::GoalContext, failure: Failure) {
         if let Err(e) = ctx.fail(failure.kind.into(), failure.message).await {
-            error!("{}: move_arm end: {e}", self.side.label());
+            error!("{}: move_arm end: {e}", self.side);
         }
     }
 }
@@ -1086,7 +1086,7 @@ mod tests {
         );
         planner.fail_active(stale.clone()).await;
         let outcome = done_rx.recv().await.expect("the failed move must report");
-        assert_eq!(outcome, Outcome::Failed(stale.clone().labelled("left")));
+        assert_eq!(outcome, Outcome::Failed(stale.clone().labelled(Side::Left)));
         assert!(
             !busy.load(Ordering::Acquire),
             "the failure releases the slot"
@@ -1242,7 +1242,7 @@ mod tests {
                 let planner = Planner::new(side, model, test_cfg());
                 let r = planner.world_ee_pose(&ready(side.model()));
                 let h = planner.world_ee_pose(&home(side.model()));
-                let label = format!("{version:?} {}", side.label());
+                let label = format!("{version:?} {}", side);
                 assert!(
                     h.translation.z < r.translation.z,
                     "{label}: home z {} is not below ready z {}",
@@ -1289,13 +1289,13 @@ mod tests {
             assert!(
                 at(&r, ready_grasp),
                 "v2 {} ready grasp point at {:?}",
-                side.label(),
+                side,
                 world_pose_arrays(&r)
             );
             assert!(
                 at(&h, home_grasp),
                 "v2 {} home grasp point at {:?}",
-                side.label(),
+                side,
                 world_pose_arrays(&h)
             );
         }
@@ -1333,7 +1333,7 @@ mod tests {
         let failure = Failure::new(FailureKind::PreconditionFailed, ANOTHER_MOVE_IN_FLIGHT);
         assert_eq!(
             second_rx.try_recv().expect("the second goal ends at once"),
-            Outcome::Failed(failure.labelled("left"))
+            Outcome::Failed(failure.labelled(Side::Left))
         );
         assert!(running_rx.try_recv().is_err(), "the first move runs on");
         assert!(

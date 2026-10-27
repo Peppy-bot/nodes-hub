@@ -81,8 +81,7 @@ fn joint_move_request(
     d: &move_arm_joints::GoalRequestData,
     limits: &ArmPair<[Limit; ARM_DOF]>,
 ) -> std::result::Result<JointMoveRequest, String> {
-    let side =
-        Side::from_arm_name(&d.arm_name).ok_or_else(|| Side::UNKNOWN_ARM_NAME.to_string())?;
+    let side = Side::from_arm_name(&d.arm_name)?;
     if !d.joint_positions.iter().all(|v| v.is_finite()) {
         return Err("non-finite joint target".to_string());
     }

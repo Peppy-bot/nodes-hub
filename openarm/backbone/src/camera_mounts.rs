@@ -101,7 +101,7 @@ pub enum CameraMountError {
     },
 
     #[error("the URDF names no tool-centre-point joint for the {side} arm")]
-    NoToolJoint { side: &'static str },
+    NoToolJoint { side: Side },
 }
 
 /// The robot's cameras, each placed in the frame that carries it.
@@ -120,7 +120,7 @@ impl CameraMounts {
         let tree = Tree::from_robot(&robot).expect("bundled URDF must be one tree");
         for side in Side::BOTH {
             if tree.link_index(version.tcp_link(side.model())).is_none() {
-                return Err(CameraMountError::NoToolJoint { side: side.label() });
+                return Err(CameraMountError::NoToolJoint { side });
             }
         }
         let mounts = version
