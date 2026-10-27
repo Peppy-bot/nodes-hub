@@ -7,12 +7,12 @@ assumes the operator shares the robot's facing.
 from __future__ import annotations
 
 import math
-import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Literal, Protocol
 
+from xr_commander.bus import REAL_CLOCK, Clock
 from xr_commander.frames import Pose
 
 # The closed set WebXR reports; anything else is untracked.
@@ -66,7 +66,9 @@ class FrameSource(Protocol):
     def latest(self) -> XrFrame | None: ...
 
 
-def fresh_frame(source: FrameSource, stale_timeout_s: float) -> XrFrame | None:
+def fresh_frame(
+    source: FrameSource, stale_timeout_s: float, clock: Clock = REAL_CLOCK
+) -> XrFrame | None:
     """The newest XR frame if it is recent enough.
 
     Past the timeout the hands are unknown, not unchanged: a frozen headset is
@@ -75,16 +77,19 @@ def fresh_frame(source: FrameSource, stale_timeout_s: float) -> XrFrame | None:
     frame = source.latest()
     if frame is None:
         return None
-    if time.monotonic() - frame.received_monotonic_s > stale_timeout_s:
+    if clock.monotonic() - frame.received_monotonic_s > stale_timeout_s:
         return None
     return frame
 
 
 def fresh_sample(
-    source: FrameSource, handedness: Handedness, stale_timeout_s: float
+    source: FrameSource,
+    handedness: Handedness,
+    stale_timeout_s: float,
+    clock: Clock = REAL_CLOCK,
 ) -> HandSample | None:
     """This hand's sample if the frame carrying it is recent enough."""
-    frame = fresh_frame(source, stale_timeout_s)
+    frame = fresh_frame(source, stale_timeout_s, clock)
     return frame.hand(handedness) if frame else None
 
 

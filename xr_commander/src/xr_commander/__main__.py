@@ -1,4 +1,5 @@
-"""Wiring: parameters, the WebXR server, the paired robots, one task per stream.
+"""Wiring: parameters, the WebXR server, the paired robots, the fleet, one
+task per stream.
 
 The server is started, never awaited: the health probe registers only once
 `setup` returns.
@@ -14,6 +15,8 @@ from types import ModuleType
 
 import peppygen.clock
 from peppygen import NodeBuilder, NodeRunner
+from peppygen.consumed_actions.fleet import changes as fleet_changes
+from peppygen.consumed_actions.fleet import lease as fleet_lease
 from peppygen.consumed_actions.postures import (
     move_to_home as postures_move_to_home,
 )
@@ -23,6 +26,10 @@ from peppygen.consumed_actions.postures import (
 from peppygen.consumed_actions.recorder import (
     record_episode as recorder_record_episode,
 )
+from peppygen.consumed_services.fleet import check_move as fleet_check_move
+from peppygen.consumed_services.fleet import release as fleet_release
+from peppygen.consumed_services.fleet import take as fleet_take
+from peppygen.consumed_services.limb_motion import stop as limb_motion_stop
 from peppygen.consumed_services.recorder import (
     finish_session as recorder_finish_session,
 )
@@ -58,6 +65,8 @@ from xr_commander import (
     addresses,
     alerts,
     config,
+    drive,
+    fleet,
     motor_health,
     page,
     panel,
@@ -181,13 +190,39 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
         arms={hand: wiring.pose_setpoints for hand, wiring in _HANDS.items()},
         grippers={hand: wiring.gripper_setpoints for hand, wiring in _HANDS.items()},
     )
+    # The robot leases: the headset holds the lease of the robot a person
+    # drives, and follows the fleet listing.
+    fleet_timing = fleet.Timing()
+    the_fleet = fleet.Fleet(
+        fleet.Holder(node_runner.bound_instance_id(), node_runner.bound_core_node())
+    )
+    # The page follows the robots, their states and the choice; the driver
+    # sends each change it makes.
+    robot_states = robot_choice.RobotStates(
+        robots, state_of=lambda name: driver.state_of(name)
+    )
+    driver = drive.Driver(
+        the_fleet,
+        fleet.FleetCalls(
+            node_runner,
+            take_module=fleet_take,
+            release_module=fleet_release,
+            check_move_module=fleet_check_move,
+            timing=fleet_timing,
+        ),
+        drive.LimbStops(node_runner, robots, limb_motion_stop, fleet_timing),
+        timing=fleet_timing,
+        on_change=robot_states.refresh,
+    )
     # The routes behind the page's Robot card, and the task page beside the
     # page.
-    session.serve(robot_choice.build_router(robots))
+    session.serve(robot_choice.build_router(robots, robot_states))
     session.serve(task_page.build_router(task_label))
 
     async def stop_session() -> None:
         log("shutdown signal received")
+        # The page's streams end, so the server stops without waiting on them.
+        robot_states.close()
         # Joins the server thread, so keep it off the event loop.
         await asyncio.to_thread(session.stop)
 
@@ -233,7 +268,20 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
             p.instance_id for p in motor_health_topic.bound_producers(node_runner)
         ),
     )
-    tasks = []
+    tasks = [
+        asyncio.create_task(
+            fleet.follow_fleet(
+                node_runner,
+                the_fleet,
+                driver,
+                changes_module=fleet_changes,
+                lease_module=fleet_lease,
+                timing=fleet_timing,
+                token=token,
+            )
+        ),
+        asyncio.create_task(robot_choice.follow_robot_states(robot_states, token)),
+    ]
     posture_status = publish.PostureStatus()
     tasks.extend(
         asyncio.create_task(
@@ -243,6 +291,7 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
                 pressed=pressed,
                 session=session,
                 robots=robots,
+                driver=driver,
                 status=posture_status,
                 settings=settings,
                 token=token,
@@ -369,7 +418,7 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
         panel.HandSource(
             handedness=handedness,
             clutch=HandClutch(settings.motion_scale),
-            squeeze=publish.HeldOverSqueeze(),
+            state=driver.hands[handedness],
             measured=MeasuredPoses(),
             arm_peer=slot_peer(wiring.pose_setpoints),
             gripper_peer=slot_peer(wiring.gripper_setpoints),
@@ -377,7 +426,6 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
         for handedness, wiring in _HANDS.items()
     )
     clutches = {hand.handedness: hand.clutch for hand in hands}
-    squeezes = {hand.handedness: hand.squeeze for hand in hands}
     measured = {hand.handedness: hand.measured for hand in hands}
     if panel_sink is not None:
         tasks.append(
@@ -393,6 +441,7 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
                     recorder=recorder_row,
                     read_task=task_label.current,
                     posture=posture_status,
+                    robot=lambda: driver.robot_line(robots.chosen()),
                 )
             )
         )
@@ -414,9 +463,11 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
                 publish.stream_pose(
                     node_runner,
                     topic_module=wiring.pose_setpoints,
+                    gripper_module=wiring.gripper_setpoints,
                     handedness=handedness,
+                    hand=driver.hands[handedness],
+                    driver=driver,
                     clutch=clutches[handedness],
-                    squeeze=squeezes[handedness],
                     session=session,
                     measured=measured[handedness],
                     robots=robots,
@@ -431,7 +482,7 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
                     node_runner,
                     topic_module=wiring.gripper_setpoints,
                     handedness=handedness,
-                    squeeze=squeezes[handedness],
+                    hand=driver.hands[handedness],
                     session=session,
                     robots=robots,
                     settings=settings,

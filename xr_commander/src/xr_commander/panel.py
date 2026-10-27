@@ -1,10 +1,11 @@
 """The in-headset status panel: node state drawn onto a synthetic track.
 
 A headset has no console, so anything the node only logs is invisible to the
-operator wearing it. This carries the state that decides whether a hand can
-drive at all, the alerts the robot is raising about itself, and each motor's
-health. teleop_xr renders every declared view as a floating panel, so nothing
-in the web stack needs to know this one is not a camera.
+operator wearing it. This carries the chosen robot and who holds it, the
+state that decides whether a hand can drive at all, the alerts the robot is
+raising about itself, and each motor's health. teleop_xr renders every
+declared view as a floating panel, so nothing in the web stack needs to know
+this one is not a camera.
 """
 
 from __future__ import annotations
@@ -24,11 +25,12 @@ from xr_commander.alerts import (
     Alert,
     fit_text,
 )
-from xr_commander.bus import CancellationToken, Latch, ticks
+from xr_commander.bus import REAL_CLOCK, CancellationToken, Clock, Latch, ticks
 from xr_commander.clutch import HandClutch
 from xr_commander.config import Settings
 from xr_commander.devices import FrameSource, fresh_frame
-from xr_commander.publish import HeldOverSqueeze, MeasuredPoses, PostureStatus
+from xr_commander.drive import HandState, RobotLine
+from xr_commander.publish import MeasuredPoses, PostureStatus
 from xr_commander.record import RecorderStatus
 from xr_commander.video import FrameSink
 
@@ -50,16 +52,17 @@ _STATE_X = 340
 _TITLE_BASELINE = 48
 _LINK_BASELINE = 92
 _FIRST_ROW_BASELINE = 148
-_ROW_STEP = 44
+_ROW_STEP = 40
 
-# One row per hand plus the recorder's. The alert section sits below the space
-# they can occupy, so it does not shift when the recorder binds mid-session.
-_MAX_STATUS_ROWS = 3
+# The robot's row, one row per hand, and the recorder's. The alert section
+# sits below the space they can occupy, so it does not shift when the
+# recorder binds mid-session.
+_MAX_STATUS_ROWS = 4
 _RULE_Y = _FIRST_ROW_BASELINE + _MAX_STATUS_ROWS * _ROW_STEP - 20
 _RULE_HEIGHT = 2
 _ALERTS_TITLE_BASELINE = _RULE_Y + 36
 _FIRST_ALERT_BASELINE = _ALERTS_TITLE_BASELINE + 34
-_ALERT_STEP = 32
+_ALERT_STEP = 28
 # What the alert band holds; further alerts collapse into the last line.
 _MAX_ALERT_LINES = 2
 # Room below a baseline for the glyphs that hang under it.
@@ -71,7 +74,7 @@ _MOTORS_RULE_Y = (
 )
 _MOTORS_TITLE_BASELINE = _MOTORS_RULE_Y + 30
 _FIRST_HEALTH_BASELINE = _MOTORS_TITLE_BASELINE + 32
-_HEALTH_STEP = 30
+_HEALTH_STEP = 24
 # A collapsed line per component plus a detail row; further rows fold into
 # the last line.
 _MAX_HEALTH_LINES = 5
@@ -127,8 +130,9 @@ class HandSource:
 
     handedness: str
     clutch: HandClutch
-    # The arm stream's gate: whether a squeeze must be released first.
-    squeeze: HeldOverSqueeze
+    # The hand's hold on its robot, shared with its streams: whether a
+    # squeeze must be released first, and the cause of a refused squeeze.
+    state: HandState
     measured: MeasuredPoses
     arm_peer: Callable[[], object | None]
     gripper_peer: Callable[[], object | None]
@@ -186,6 +190,8 @@ class PanelState:
 
     headset_live: bool
     hands: tuple[Row, ...]
+    # The chosen robot and who holds it; None draws no robot row.
+    robot: Row | None = None
     # Worst first, capped at what the canvas holds.
     alerts: tuple[PanelLine, ...] = ()
     # Whether anything is wired to the alert slot at all.
@@ -239,17 +245,17 @@ def hand_line(
     gripper_bound: bool,
     tracked: bool,
     squeezing: bool,
-    held_over: bool,
+    wait_release: bool,
     follower_fresh: bool,
     engaged: bool,
     note: str | None = None,
 ) -> Row:
     """Read one hand's row off the same conditions the clutch gates on, in the
     order the operator hits them: a bound slot, a controller, a grip, a grip
-    released since the robot changed, a follower, a snapshot. The earliest
-    unmet one is what to fix. `note`, a posture move, its outcome or why a
-    press was ignored, takes the row while it stands, on a hand with a
-    binding.
+    released since a refusal, a let-go or a change of robot, a follower, a
+    snapshot. The earliest unmet one is what to fix. `note`, why a squeeze
+    was refused, a posture move, its outcome or why a press was ignored,
+    takes the row while it stands, on a hand with a binding.
     """
     if not arm_bound and not gripper_bound:
         return Row(label, "nothing bound", _RESTING)
@@ -259,7 +265,7 @@ def hand_line(
         return Row(label, "no controller", _RESTING)
     if not squeezing:
         return Row(label, "grip released", _RESTING)
-    if held_over:
+    if wait_release:
         return Row(label, "release the grip, then squeeze again", _WAITING)
     if not arm_bound:
         # A gripper-only hand's grip is the whole story: no pose to anchor,
@@ -270,6 +276,15 @@ def hand_line(
     if not engaged:
         return Row(label, "re-anchoring", _WAITING)
     return Row(label, "driving", _DRIVING)
+
+
+_ROBOT_COLOURS = {"driving": _DRIVING, "waiting": _WAITING, "resting": _RESTING}
+
+
+def robot_row(line: RobotLine) -> Row:
+    """The robot's row: the chosen robot and who holds it, or why the
+    headset let go of it or cannot ask the fleet."""
+    return Row("ROBOT", line.text, _ROBOT_COLOURS[line.tone])
 
 
 def recorder_row(status: RecorderStatus | None) -> Row | None:
@@ -312,11 +327,14 @@ def snapshot(
     recorder: RecorderStatus | None = None,
     task: str | None = None,
     posture: PostureStatus | None = None,
+    robot: RobotLine | None = None,
+    clock: Clock = REAL_CLOCK,
 ) -> PanelState:
     """This tick's panel content, read from the sources the streams read.
     The posture buttons are the right controller's, so their state goes on
-    the right hand's row, or on the only row when the right hand has none."""
-    frame = fresh_frame(session, stale_timeout_s)
+    the right hand's row, or on the only row when the right hand has none.
+    A hand's own note, why its squeeze was refused, comes first."""
+    frame = fresh_frame(session, stale_timeout_s, clock)
     # Only hands something listens to get a row; with nothing wired at all,
     # every hand shows so a misconfigured stack says why nothing drives.
     bound = [hand.bound() for hand in hands]
@@ -328,6 +346,11 @@ def snapshot(
     for binding in shown:
         hand = binding.hand
         sample = frame.hand(hand.handedness) if frame else None
+        posture_note = (
+            posture.state()
+            if posture is not None and hand.handedness == noted
+            else None
+        )
         rows.append(
             hand_line(
                 binding.label(lone=len(wired) == 1),
@@ -335,20 +358,23 @@ def snapshot(
                 gripper_bound=binding.gripper is not None,
                 tracked=sample is not None,
                 squeezing=bool(sample and sample.squeezing),
-                held_over=hand.squeeze.held_over(),
+                wait_release=hand.state.wait_release,
                 follower_fresh=hand.measured.fresh(binding.arm, stale_timeout_s)
                 is not None,
                 engaged=hand.clutch.engaged,
-                note=posture.state()
-                if posture is not None and hand.handedness == noted
-                else None,
+                note=hand.state.note.text() or posture_note,
             )
         )
     recorder_line = recorder_row(recorder)
-    assert len(rows) + (1 if recorder_line else 0) <= _MAX_STATUS_ROWS
+    robot_line = robot_row(robot) if robot is not None else None
+    assert (
+        len(rows) + (1 if recorder_line else 0) + (1 if robot_line else 0)
+        <= _MAX_STATUS_ROWS
+    )
     return PanelState(
         headset_live=frame is not None,
         hands=tuple(rows),
+        robot=robot_line,
         alerts=alert_lines(alerts.active()),
         alerts_bound=alerts.producers_bound,
         health=health_lines(motor_health.health_rows(health.by_instance())),
@@ -392,7 +418,11 @@ def render(state: PanelState) -> np.ndarray:
     if state.task is not None:
         fitted, scale = _fitted(state.task, _BODY_SCALE, _WIDTH - _MARGIN_X - _STATE_X)
         _text(frame, fitted, (_STATE_X, _LINK_BASELINE), scale, _HEADING)
-    rows = state.hands + ((state.recorder,) if state.recorder else ())
+    rows = (
+        ((state.robot,) if state.robot else ())
+        + state.hands
+        + ((state.recorder,) if state.recorder else ())
+    )
     for index, row in enumerate(rows):
         baseline = _FIRST_ROW_BASELINE + index * _ROW_STEP
         _text(frame, row.label, (_MARGIN_X, baseline), _BODY_SCALE, _HEADING)
@@ -478,11 +508,14 @@ async def stream_status(
     recorder: Callable[[], RecorderStatus | None],
     read_task: Callable[[], str | None],
     posture: PostureStatus,
+    robot: Callable[[], RobotLine],
+    clock: Clock = REAL_CLOCK,
 ) -> None:
     """Publish the panel until shutdown, re-drawing only on a change.
 
-    `recorder` and `read_task` are read per frame: the chosen robot decides
-    whether a recorder row and a task line are drawn.
+    `recorder`, `read_task` and `robot` are read per frame: the chosen robot
+    decides whether a recorder row and a task line are drawn, and what the
+    robot row says.
 
     Latched: a failing render would repeat every frame, and the panel going
     dark is not worth killing a session over.
@@ -490,7 +523,7 @@ async def stream_status(
     failing = Latch()
     drawn: PanelState | None = None
     frame: np.ndarray | None = None
-    async for _ in ticks(1.0 / _PUBLISH_HZ, token):
+    async for _ in ticks(1.0 / _PUBLISH_HZ, token, clock):
         try:
             state = snapshot(
                 session,
@@ -501,6 +534,8 @@ async def stream_status(
                 recorder(),
                 read_task(),
                 posture=posture,
+                robot=robot(),
+                clock=clock,
             )
             if state != drawn or frame is None:
                 frame, drawn = render(state), state
