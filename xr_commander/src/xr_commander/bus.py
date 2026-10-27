@@ -1,11 +1,49 @@
-"""Small helpers shared by every stream task: logging and bus receive."""
+"""Small helpers shared by every stream task: the clock, logging, the
+outcomes of service calls and bus receive."""
 
 from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable
+from dataclasses import dataclass
 from typing import Any, Protocol
+
+
+class Clock(Protocol):
+    """Where the node reads time: the ticks of its loops, the freshness of a
+    frame and of a measured pose, the release burst, the panel notes and the
+    retries toward the daemon. Tests inject their own. The alert, motor
+    health and sensor hold stores read the time through a `monotonic`
+    callable of their own."""
+
+    def monotonic(self) -> float: ...
+    async def sleep(self, seconds: float) -> None: ...
+
+
+class RealClock:
+    """The host's monotonic clock and the event loop's sleep."""
+
+    def monotonic(self) -> float:
+        return time.monotonic()
+
+    async def sleep(self, seconds: float) -> None:
+        await asyncio.sleep(seconds)
+
+
+REAL_CLOCK = RealClock()
+
+# The tasks that `spawn` started, until each ends: the event loop keeps a weak
+# reference to a task only.
+_SPAWNED: set[asyncio.Task] = set()
+
+
+def spawn(coroutine) -> asyncio.Task:
+    """Run `coroutine` as a task that nothing awaits, kept until it ends."""
+    task = asyncio.create_task(coroutine)
+    _SPAWNED.add(task)
+    task.add_done_callback(_SPAWNED.discard)
+    return task
 
 
 class CancellationToken(Protocol):
@@ -57,17 +95,70 @@ FLASH_S = 3.0
 class FlashNote:
     """A line that shows for `FLASH_S` after it is set, then clears."""
 
-    def __init__(self) -> None:
+    def __init__(self, clock: Clock = REAL_CLOCK) -> None:
+        self._clock = clock
         self._text = ""
         self._until_monotonic = 0.0
 
     def set(self, text: str) -> None:
         self._text = text
-        self._until_monotonic = time.monotonic() + FLASH_S
+        self._until_monotonic = self._clock.monotonic() + FLASH_S
 
     def text(self, now_monotonic: float | None = None) -> str:
-        now = time.monotonic() if now_monotonic is None else now_monotonic
+        now = self._clock.monotonic() if now_monotonic is None else now_monotonic
         return self._text if now < self._until_monotonic else ""
+
+
+def cause(message: str) -> str:
+    """The clause of the message of a refusal or a failure that names the
+    cause, ahead of the remedy a backbone appends after a semicolon."""
+    return (message or "no reason given").split(";", 1)[0]
+
+
+@dataclass(frozen=True)
+class Answered:
+    """The answer of a call."""
+
+    response: object
+
+
+@dataclass(frozen=True)
+class Failed:
+    """The error reply of a call, by its cause."""
+
+    cause: str
+
+
+@dataclass(frozen=True)
+class Unanswered:
+    """A call that got no answer: it timed out, or its producer is gone."""
+
+
+Outcome = Answered | Failed | Unanswered
+
+
+async def outcome_of(call: Awaitable, failure: type[Exception], what: str) -> Outcome:
+    """How a service call ended; a call that got no answer is logged as
+    `what`."""
+    try:
+        return Answered(await call)
+    except failure as error:
+        return Failed(cause(error.message))
+    except Exception as e:
+        log(f"{what} unanswered: {e!r}")
+        return Unanswered()
+
+
+def refusal_of(outcome: Outcome, unanswered: str) -> str | None:
+    """The cause of a call that was not answered with a yes, None for a yes;
+    `unanswered` says a call that got no answer."""
+    match outcome:
+        case Answered():
+            return None
+        case Failed(cause=refused):
+            return refused
+        case Unanswered():
+            return unanswered
 
 
 async def next_message(subscription: Subscription, token: CancellationToken) -> Any:
@@ -99,21 +190,23 @@ async def next_message(subscription: Subscription, token: CancellationToken) -> 
             receive.cancel()
 
 
-async def ticks(period_s: float, token: CancellationToken) -> AsyncIterator[None]:
+async def ticks(
+    period_s: float, token: CancellationToken, clock: Clock = REAL_CLOCK
+) -> AsyncIterator[None]:
     """Yield once per `period_s` until the token cancels.
 
     Deadline-paced so the cadence does not drift; a slipped tick resyncs
     instead of bursting, and a saturated loop still yields to the rest of the
     event loop.
     """
-    deadline = time.monotonic()
+    deadline = clock.monotonic()
     while not token.is_cancelled():
         deadline += period_s
-        delay = deadline - time.monotonic()
+        delay = deadline - clock.monotonic()
         if delay > 0.0:
-            await asyncio.sleep(delay)
+            await clock.sleep(delay)
         else:
-            deadline = time.monotonic()
+            deadline = clock.monotonic()
             await asyncio.sleep(0)
         # Re-checked after the sleep: a shutdown that lands mid-wait must not
         # buy one more tick of work.
