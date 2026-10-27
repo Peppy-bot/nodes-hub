@@ -26,9 +26,9 @@ use srs_model::nalgebra::{Isometry3, UnitQuaternion, Vector3};
 use tokio::sync::watch;
 use tracing::info;
 
-use crate::arm_pair::ArmPair;
 use crate::serving;
-use crate::types::{Side, pose_from_wire, world_pose_arrays};
+use crate::side::{ArmPair, Side};
+use crate::types::{pose_from_wire, world_pose_arrays};
 
 /// The message of the error reply while the coordinator has measured
 /// nothing yet.

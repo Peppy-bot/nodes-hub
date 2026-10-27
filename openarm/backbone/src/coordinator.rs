@@ -35,15 +35,15 @@ use tracing::{error, info, warn};
 use control_core::filters::LowPassFilter;
 use control_core::pacer::Pacer;
 
-use crate::arm_pair::ArmPair;
 use crate::camera_mounts::MeasuredGrasps;
 use crate::failure::{Failure, FailureKind};
 use crate::governor::{GovState, Governor, Guard};
 use crate::liveness::{Admission, Cadence, CadenceChange, Liveness};
 use crate::planner::{self, BusyGuard, Goal, Measurement, PlanCheck, Planner, Unmeasured};
 use crate::publish::{LimbStateSnapshot, Publishers};
+use crate::side::{ArmPair, Side};
 use crate::streams::{ArmState, GovernorConfig, GripperCommand, GripperState, LeaderActivity};
-use crate::types::{ARM_DOF, ArmMoveRequest, JointVec, Side};
+use crate::types::{ARM_DOF, ArmMoveRequest, JointVec};
 use crate::upstream::{Upstream, UpstreamMode};
 use control_core::chase::rate_limited;
 

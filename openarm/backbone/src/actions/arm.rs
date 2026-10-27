@@ -24,14 +24,14 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::error;
 
 use crate::actions::{ARM_WORDS, admit_limb, blocking_ask_coordinator, check_limb_free};
-use crate::arm_pair::ArmPair;
 use crate::coordinator::CoordinatorRequest;
 use crate::failure::{Failure, FailureKind};
 use crate::planner::{Goal, JointReply, PlanCheck};
 use crate::settle::Settle;
+use crate::side::{ArmPair, Side};
 use crate::streams::LeaderActivity;
 use crate::types::{
-    ARM_DOF, ArmMoveRequest, JointVec, PoseTolerance, Side, joint_tolerances_from_wire,
+    ARM_DOF, ArmMoveRequest, JointVec, PoseTolerance, joint_tolerances_from_wire,
     move_seconds_from_wire,
 };
 

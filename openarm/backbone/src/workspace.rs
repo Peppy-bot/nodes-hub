@@ -25,9 +25,8 @@ use workspace_core::{
     REACH_TOLERANCE, Reach, UnknownDepthModel,
 };
 
-use crate::arm_pair::ArmPair;
 use crate::camera_mounts::{CameraMounts, DesignCamera};
-use crate::types::Side;
+use crate::side::{ArmPair, Side};
 
 /// Why the perception camera's view cannot be checked now, from what the
 /// camera linked as perception_geometry answered.

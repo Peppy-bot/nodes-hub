@@ -30,10 +30,10 @@ use srs_model::nalgebra::Isometry3;
 use tokio::sync::watch;
 use tracing::{error, warn};
 
-use crate::arm_pair::ArmPair;
 use crate::camera_mounts::MeasuredGrasps;
+use crate::side::{ArmPair, Side};
 use crate::streams::{GripperState, warn_throttled};
-use crate::types::{JointVec, Side, arm_pose_arrays, limb_names, world_pose_arrays};
+use crate::types::{JointVec, arm_pose_arrays, limb_names, world_pose_arrays};
 
 /// Pairing timestamp from this instance's bound clock, so consumers age
 /// samples on the same timeline they read. Errors until the clock delivers

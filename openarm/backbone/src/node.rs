@@ -5,8 +5,8 @@
 // listener. All motion and stream logic lives in the sibling modules; this is
 // only the assembly.
 
-use crate::arm_pair::ArmPair;
-use crate::types::{JointVec, Side, limb_names};
+use crate::side::{ArmPair, Side};
+use crate::types::{JointVec, limb_names};
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;

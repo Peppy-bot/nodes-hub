@@ -38,7 +38,8 @@ use tracing::{error, info};
 
 use crate::failure::{Failure, FailureKind};
 use crate::settle::{Settle, Verdict, joint_shortfall, pose_shortfall, verdict};
-use crate::types::{ARM_DOF, ArmMoveRequest, JointVec, PoseTolerance, Side, world_pose_arrays};
+use crate::side::Side;
+use crate::types::{ARM_DOF, ArmMoveRequest, JointVec, PoseTolerance, world_pose_arrays};
 use crate::upstream::Upstream;
 
 /// Slack the runtime per-tick velocity guard of a line allows over the planned

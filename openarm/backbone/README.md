@@ -370,7 +370,8 @@ The robot's own body is not checked for hiding a point from the camera.
 | `workspace.rs` | the OpenArm's part of the workspace answer from the design: reach per grasp orientation, the perception camera, the per-height reach memo it keeps, the parsing of the camera's geometry; `workspace_core::design` parses the request and composes the answer | pure: no messaging, so every answer is unit-tested without a node |
 | `workspace_service.rs` | the two workspace services and the read of the linked camera's geometry | the thin edge between the generated handlers and `workspace.rs` |
 | `serving.rs` | the loop of each service answered for the life of the node (`get_limb_names`, `get_camera_poses`, the workspace services): ended by the node's cancel, an error logged and waited out for 1 s | one loop, so no service can hot-spin on a broken transport or outlive the node |
-| `types.rs`, `arm_pair.rs` | `ARM_DOF`, `JointVec`, `Side`, the tolerances and times a move is parsed by, `ArmPair` | shared primitives |
+| `side.rs` | `Side` (with its wire names) and `ArmPair`, the value held per side | one way to address a side: a pair indexed by `Side`, walked in `Side::BOTH` order |
+| `types.rs` | `ARM_DOF`, `JointVec`, the limb tables, the world-pose wire decomposition, the tolerances and times a move is parsed by | shared primitives |
 
 ## Parameters and links
 

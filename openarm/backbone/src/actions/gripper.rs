@@ -22,11 +22,11 @@ use tokio::sync::mpsc;
 use tracing::error;
 
 use crate::actions::{GRIPPER_WORDS, admit_limb};
-use crate::arm_pair::ArmPair;
 use crate::coordinator::GripperGoal;
 use crate::failure::{Failure, FailureKind};
+use crate::side::{ArmPair, Side};
 use crate::streams::LeaderActivity;
-use crate::types::{Side, move_seconds_from_wire};
+use crate::types::move_seconds_from_wire;
 
 /// A `move_gripper` goal parsed off the wire: the side, a finite opening in
 /// [0, 1], the effort cap (`None` for the wire's 0, no preference, which

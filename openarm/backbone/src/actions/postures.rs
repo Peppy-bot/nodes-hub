@@ -22,12 +22,12 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{error, warn};
 
 use crate::actions::{ARM_WORDS, ask_coordinator, check_limb_free, claim};
-use crate::arm_pair::ArmPair;
 use crate::coordinator::{CoordinatorRequest, MeasuredGrasp};
 use crate::failure::{Failure, FailureKind};
 use crate::planner::{Goal, JointReply, Outcome, ReadyReply, Unmeasured};
+use crate::side::{ArmPair, Side};
 use crate::streams::LeaderActivity;
-use crate::types::{Side, arm_pose_arrays, limb_names, move_seconds_from_wire};
+use crate::types::{arm_pose_arrays, limb_names, move_seconds_from_wire};
 
 /// Claim both arms' single-flight slots, or refuse with
 /// `precondition_failed`, naming the busy arm. A failure on the second claim

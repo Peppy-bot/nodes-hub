@@ -24,8 +24,8 @@ use peppygen::paired_topics::{
 use tokio::sync::watch;
 use tracing::{error, warn};
 
-use crate::arm_pair::ArmPair;
-use crate::types::{JointVec, Side, pose_from_wire};
+use crate::side::{ArmPair, Side};
+use crate::types::{JointVec, pose_from_wire};
 use crate::upstream::Upstream;
 
 /// At most one dropped-message warning per stream (and one build/timestamp error
