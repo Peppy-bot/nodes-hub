@@ -32,14 +32,17 @@ use crate::types::{Side, arm_pose_arrays, limb_names, move_seconds_from_wire};
 /// Claim both arms' single-flight slots, or refuse with
 /// `precondition_failed`, naming the busy arm. A failure on the second claim
 /// unwinds the first, so a refusal never leaves a slot held.
-fn claim_both(busy: &[Arc<AtomicBool>; 2]) -> std::result::Result<(), Failure> {
-    let busy_arm = |message: &str| Failure::new(FailureKind::PreconditionFailed, message);
-    if !claim(&busy[Side::Left.index()]) {
-        return Err(busy_arm("the left arm is already executing a motion"));
+fn claim_both(busy: &ArmPair<Arc<AtomicBool>>) -> std::result::Result<(), Failure> {
+    let busy_arm = |side: Side| {
+        let message = format!("the {} {}", side.label(), ARM_WORDS.busy);
+        Failure::new(FailureKind::PreconditionFailed, message)
+    };
+    if !claim(&busy[Side::Left]) {
+        return Err(busy_arm(Side::Left));
     }
-    if !claim(&busy[Side::Right.index()]) {
-        busy[Side::Left.index()].store(false, Ordering::Release);
-        return Err(busy_arm("the right arm is already executing a motion"));
+    if !claim(&busy[Side::Right]) {
+        busy[Side::Left].store(false, Ordering::Release);
+        return Err(busy_arm(Side::Right));
     }
     Ok(())
 }
@@ -49,14 +52,14 @@ fn claim_both(busy: &[Arc<AtomicBool>; 2]) -> std::result::Result<(), Failure> {
 /// then both arms claimed.
 fn admit_posture(
     duration_s: f64,
-    fresh: &[Arc<AtomicBool>; 2],
-    activity: &[LeaderActivity; 2],
-    busy: &[Arc<AtomicBool>; 2],
+    fresh: &ArmPair<Arc<AtomicBool>>,
+    activity: &ArmPair<LeaderActivity>,
+    busy: &ArmPair<Arc<AtomicBool>>,
 ) -> std::result::Result<(), Failure> {
     move_seconds_from_wire("duration_s", duration_s)
         .map_err(|reason| Failure::new(FailureKind::Rejected, reason))?;
     check_limb_free(
-        fresh.iter().all(|arm| arm.load(Ordering::Acquire)),
+        fresh.iter().all(|fresh| fresh.load(Ordering::Acquire)),
         activity.iter().any(LeaderActivity::streaming),
         &ARM_WORDS,
     )?;
@@ -110,7 +113,7 @@ fn summarize(pending: usize, outcomes: &[Outcome], cancel: Option<String>) -> Po
 }
 
 /// The poses a posture result gives: the grasp pose of each arm in
-/// [`Side::ARM_NAMES`] order, or none.
+/// [`Side::BOTH`] order, or none.
 #[derive(Debug)]
 struct ArmPoses {
     arm_names: Vec<String>,
@@ -186,10 +189,10 @@ macro_rules! posture_runner {
     ($fn_name:ident, $action:ident, $name:literal, $posture:expr) => {
         pub async fn $fn_name(
             runner: Arc<NodeRunner>,
-            goal_txs: [mpsc::Sender<Goal>; 2],
-            busy: [Arc<AtomicBool>; 2],
-            fresh: [Arc<AtomicBool>; 2],
-            activity: [LeaderActivity; 2],
+            goal_txs: ArmPair<mpsc::Sender<Goal>>,
+            busy: ArmPair<Arc<AtomicBool>>,
+            fresh: ArmPair<Arc<AtomicBool>>,
+            activity: ArmPair<LeaderActivity>,
             requests: mpsc::Sender<CoordinatorRequest>,
         ) -> Result<()> {
             let mut handle = $action::ActionHandle::expose(&runner).await?;
@@ -212,7 +215,6 @@ macro_rules! posture_runner {
                 let (done_tx, mut done_rx) = mpsc::channel::<Outcome>(2);
                 let mut pending = 0usize;
                 for side in Side::BOTH {
-                    let idx = side.index();
                     let goal = Goal::Joint {
                         target: $posture(side.model()),
                         duration,
@@ -221,10 +223,10 @@ macro_rules! posture_runner {
                             cancelled: cancelled.clone(),
                         }),
                     };
-                    if goal_txs[idx].send(goal).await.is_err() {
+                    if goal_txs[side].send(goal).await.is_err() {
                         // The planner is gone; release the claim its goal
                         // would have held.
-                        busy[idx].store(false, Ordering::Release);
+                        busy[side].store(false, Ordering::Release);
                         error!("{}: {} goal channel closed", $name, side.label());
                     } else {
                         pending += 1;
@@ -294,6 +296,38 @@ mod tests {
     use super::*;
 
     use srs_model::nalgebra::Vector3;
+
+    #[test]
+    fn claiming_both_arms_names_the_busy_arm_and_holds_no_slot_it_refused() {
+        let slots = |left, right| {
+            ArmPair::new(
+                Arc::new(AtomicBool::new(left)),
+                Arc::new(AtomicBool::new(right)),
+            )
+        };
+        let held = |busy: &ArmPair<Arc<AtomicBool>>| {
+            ArmPair::from_fn(|side| busy[side].load(Ordering::Acquire))
+        };
+        let refused = |message: &str| Err(Failure::new(FailureKind::PreconditionFailed, message));
+
+        let free = slots(false, false);
+        assert_eq!(claim_both(&free), Ok(()));
+        assert_eq!(held(&free), ArmPair::new(true, true));
+
+        let left_busy = slots(true, false);
+        assert_eq!(
+            claim_both(&left_busy),
+            refused("the left arm is already executing a motion")
+        );
+        assert_eq!(held(&left_busy), ArmPair::new(true, false));
+
+        let right_busy = slots(false, true);
+        assert_eq!(
+            claim_both(&right_busy),
+            refused("the right arm is already executing a motion")
+        );
+        assert_eq!(held(&right_busy), ArmPair::new(false, true));
+    }
 
     #[test]
     fn both_postures_sit_inside_both_generations_joint_limits() {

@@ -31,6 +31,30 @@ impl<T> ArmPair<T> {
         let right = f(Side::Right);
         Self { left, right }
     }
+
+    /// The pair holding `f(side, value)` for each side's value, in
+    /// [`Side::BOTH`] order.
+    pub fn map<U>(self, mut f: impl FnMut(Side, T) -> U) -> ArmPair<U> {
+        let left = f(Side::Left, self.left);
+        let right = f(Side::Right, self.right);
+        ArmPair { left, right }
+    }
+
+    /// The pair holding each side's value of `self` and of `other` together.
+    pub fn zip<U>(self, other: ArmPair<U>) -> ArmPair<(T, U)> {
+        ArmPair::new((self.left, other.left), (self.right, other.right))
+    }
+}
+
+impl<A, B> ArmPair<(A, B)> {
+    /// The pair of first values and the pair of second values.
+    pub fn unzip(self) -> (ArmPair<A>, ArmPair<B>) {
+        let ArmPair {
+            left: (left_a, left_b),
+            right: (right_a, right_b),
+        } = self;
+        (ArmPair::new(left_a, right_a), ArmPair::new(left_b, right_b))
+    }
 }
 
 impl<T> Index<Side> for ArmPair<T> {
@@ -98,5 +122,26 @@ mod tests {
         });
         assert_eq!(pair, ArmPair::new("left", "right"));
         assert_eq!(calls, Side::BOTH);
+    }
+
+    #[test]
+    fn map_hands_each_value_its_own_side_left_first() {
+        let mut calls = Vec::new();
+        let pair = ArmPair::new(1, 2).map(|side, value| {
+            calls.push(side);
+            format!("{} {value}", side.label())
+        });
+        assert_eq!(
+            pair,
+            ArmPair::new("left 1".to_owned(), "right 2".to_owned())
+        );
+        assert_eq!(calls, Side::BOTH);
+    }
+
+    #[test]
+    fn zip_and_unzip_keep_each_value_on_its_side() {
+        let zipped = ArmPair::new(1, 2).zip(ArmPair::new("a", "b"));
+        assert_eq!(zipped, ArmPair::new((1, "a"), (2, "b")));
+        assert_eq!(zipped.unzip(), (ArmPair::new(1, 2), ArmPair::new("a", "b")));
     }
 }

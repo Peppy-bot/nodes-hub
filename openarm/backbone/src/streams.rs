@@ -24,6 +24,7 @@ use peppygen::paired_topics::{
 use tokio::sync::watch;
 use tracing::{error, warn};
 
+use crate::arm_pair::ArmPair;
 use crate::types::{JointVec, Side, pose_from_wire};
 use crate::upstream::Upstream;
 
@@ -224,16 +225,16 @@ async fn accept<Raw, Parsed>(
     side: Side,
     received: peppygen::Result<Option<Raw>>,
     parse: impl Fn(Raw) -> Result<Parsed, &'static str>,
-    latest: &[watch::Sender<Option<Parsed>>; 2],
-    activity: Option<&[LeaderActivity; 2]>,
+    latest: &ArmPair<watch::Sender<Option<Parsed>>>,
+    activity: Option<&ArmPair<LeaderActivity>>,
     last_reject_warn: &mut Option<Instant>,
 ) -> bool {
     match received {
         Ok(Some(raw)) => match parse(raw) {
             Ok(parsed) => {
-                latest[side.index()].send_replace(Some(parsed));
+                latest[side].send_replace(Some(parsed));
                 if let Some(activity) = activity {
-                    activity[side.index()].note();
+                    activity[side].note();
                 }
             }
             Err(reason) => warn_throttled(last_reject_warn, || {
@@ -255,8 +256,8 @@ async fn accept<Raw, Parsed>(
 /// two.
 pub async fn run_pose_command_listener(
     runner: Arc<NodeRunner>,
-    latest: [watch::Sender<Option<Upstream>>; 2],
-    activity: [LeaderActivity; 2],
+    latest: ArmPair<watch::Sender<Option<Upstream>>>,
+    activity: ArmPair<LeaderActivity>,
 ) {
     const WHAT: &str = "upstream pose_setpoints";
     let Some((mut left, mut right)) = subscribe_pair(
@@ -297,8 +298,8 @@ pub async fn run_pose_command_listener(
 /// stays queued in its own subscription, so neither side can starve the other.
 pub async fn run_joint_command_listener(
     runner: Arc<NodeRunner>,
-    latest: [watch::Sender<Option<Upstream>>; 2],
-    activity: [LeaderActivity; 2],
+    latest: ArmPair<watch::Sender<Option<Upstream>>>,
+    activity: ArmPair<LeaderActivity>,
 ) {
     const WHAT: &str = "upstream joint_setpoints";
     let Some((mut left, mut right)) = subscribe_pair(
@@ -337,8 +338,8 @@ pub async fn run_joint_command_listener(
 /// [`run_joint_command_listener`].
 pub async fn run_gripper_command_listener(
     runner: Arc<NodeRunner>,
-    latest: [watch::Sender<Option<GripperCommand>>; 2],
-    activity: [LeaderActivity; 2],
+    latest: ArmPair<watch::Sender<Option<GripperCommand>>>,
+    activity: ArmPair<LeaderActivity>,
 ) {
     const WHAT: &str = "upstream gripper_setpoints";
     let Some((mut left, mut right)) = subscribe_pair(
@@ -379,7 +380,7 @@ pub async fn run_gripper_command_listener(
 /// trajectory or a governor query on a bad measurement.
 pub async fn run_joint_state_listener(
     runner: Arc<NodeRunner>,
-    latest: [watch::Sender<Option<ArmState>>; 2],
+    latest: ArmPair<watch::Sender<Option<ArmState>>>,
 ) {
     const WHAT: &str = "joint_states";
     let Some((mut left, mut right)) = subscribe_pair(
@@ -419,7 +420,7 @@ pub async fn run_joint_state_listener(
 /// so a stray broadcast producer cannot spoof the modeled fingers.
 pub async fn run_gripper_state_listener(
     runner: Arc<NodeRunner>,
-    latest: [watch::Sender<Option<GripperState>>; 2],
+    latest: ArmPair<watch::Sender<Option<GripperState>>>,
 ) {
     const WHAT: &str = "gripper_states";
     let Some((mut left, mut right)) = subscribe_pair(

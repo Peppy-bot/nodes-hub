@@ -29,14 +29,13 @@ pub fn world_pose_arrays(pose: &Isometry3<f64>) -> ([f64; 3], [f64; 4]) {
 
 /// Both arms' grasp poses as limb_state and the posture results carry them.
 /// The positions have 3 values per arm. The orientations have 4 values per
-/// arm, `[x, y, z, w]`. Both are in [`Side::ARM_NAMES`] order.
+/// arm, `[x, y, z, w]`. Both are in [`Side::BOTH`] order.
 pub fn arm_pose_arrays(poses: &ArmPair<Isometry3<f64>>) -> (Vec<f64>, Vec<f64>) {
-    let (left_position, left_orientation) = world_pose_arrays(&poses.left);
-    let (right_position, right_orientation) = world_pose_arrays(&poses.right);
-    (
-        [left_position, right_position].concat(),
-        [left_orientation, right_orientation].concat(),
-    )
+    let (positions, orientations): (Vec<[f64; 3]>, Vec<[f64; 4]>) = Side::BOTH
+        .into_iter()
+        .map(|side| world_pose_arrays(&poses[side]))
+        .unzip();
+    (positions.concat(), orientations.concat())
 }
 
 /// Parse a world-frame pose off the wire: three finite position components
@@ -213,13 +212,6 @@ impl Side {
     /// wire, and the order [`ArmPair::from_fn`] builds a pair in.
     pub const BOTH: [Side; 2] = [Side::Left, Side::Right];
 
-    /// This robot's arm names in their fixed left-then-right order: the wire
-    /// values limb_motion goals carry and limb_state's arm_names reports.
-    pub const ARM_NAMES: [&'static str; 2] = ["left_arm", "right_arm"];
-
-    /// This robot's gripper names, same order and role as [`Self::ARM_NAMES`].
-    pub const GRIPPER_NAMES: [&'static str; 2] = ["left_gripper", "right_gripper"];
-
     /// Refusal for a goal naming no arm of this robot.
     pub const UNKNOWN_ARM_NAME: &'static str =
         r#"unknown arm_name: this robot's arms are "left_arm" and "right_arm""#;
@@ -228,23 +220,20 @@ impl Side {
     pub const UNKNOWN_GRIPPER_NAME: &'static str =
         r#"unknown gripper_name: this robot's grippers are "left_gripper" and "right_gripper""#;
 
-    /// Parse a wire `arm_name`, or `None` for a name not in [`Self::ARM_NAMES`].
+    /// Parse a wire `arm_name`, or `None` for a name no side's
+    /// [`Self::arm_name`] gives.
     pub fn from_arm_name(arm_name: &str) -> Option<Self> {
-        match arm_name {
-            "left_arm" => Some(Side::Left),
-            "right_arm" => Some(Side::Right),
-            _ => None,
-        }
+        Side::BOTH
+            .into_iter()
+            .find(|side| side.arm_name() == arm_name)
     }
 
-    /// Parse a wire `gripper_name`, or `None` for a name not in
-    /// [`Self::GRIPPER_NAMES`].
+    /// Parse a wire `gripper_name`, or `None` for a name no side's
+    /// [`Self::gripper_name`] gives.
     pub fn from_gripper_name(gripper_name: &str) -> Option<Self> {
-        match gripper_name {
-            "left_gripper" => Some(Side::Left),
-            "right_gripper" => Some(Side::Right),
-            _ => None,
-        }
+        Side::BOTH
+            .into_iter()
+            .find(|side| side.gripper_name() == gripper_name)
     }
 
     /// This side in the description's vocabulary.
@@ -255,25 +244,25 @@ impl Side {
         }
     }
 
-    /// Index into a left-then-right `[T; 2]`.
-    pub fn index(self) -> usize {
+    /// This side's arm name on the wire: the value limb_motion goals carry
+    /// and limb_state's arm_names reports.
+    pub fn arm_name(self) -> &'static str {
         match self {
-            Side::Left => 0,
-            Side::Right => 1,
+            Side::Left => "left_arm",
+            Side::Right => "right_arm",
         }
     }
 
-    /// This side's arm name, as [`Self::ARM_NAMES`] gives it.
-    pub fn arm_name(self) -> &'static str {
-        Self::ARM_NAMES[self.index()]
-    }
-
-    /// This side's gripper name, as [`Self::GRIPPER_NAMES`] gives it.
+    /// This side's gripper name on the wire, in the same role as
+    /// [`Self::arm_name`].
     pub fn gripper_name(self) -> &'static str {
-        Self::GRIPPER_NAMES[self.index()]
+        match self {
+            Side::Left => "left_gripper",
+            Side::Right => "right_gripper",
+        }
     }
 
-    /// Label for logs.
+    /// The side's name in logs and in the messages of refusals and failures.
     pub fn label(self) -> &'static str {
         match self {
             Side::Left => "left",
@@ -283,7 +272,7 @@ impl Side {
 }
 
 /// This robot's limb tables as the limb_state contract carries them, wire
-/// shaped and in [`Side::ARM_NAMES`] order.
+/// shaped and in [`Side::BOTH`] order.
 pub struct LimbNames {
     pub arm_names: Vec<String>,
     pub joints_per_arm: Vec<u32>,
@@ -294,9 +283,11 @@ pub struct LimbNames {
 /// snapshot and the answer get_limb_names gives.
 pub fn limb_names() -> LimbNames {
     LimbNames {
-        arm_names: Side::ARM_NAMES.map(String::from).to_vec(),
-        joints_per_arm: vec![ARM_DOF as u32; Side::ARM_NAMES.len()],
-        gripper_names: Side::GRIPPER_NAMES.map(String::from).to_vec(),
+        arm_names: Side::BOTH.map(|side| side.arm_name().to_owned()).to_vec(),
+        joints_per_arm: vec![ARM_DOF as u32; Side::BOTH.len()],
+        gripper_names: Side::BOTH
+            .map(|side| side.gripper_name().to_owned())
+            .to_vec(),
     }
 }
 
@@ -310,24 +301,23 @@ mod tests {
         assert_eq!(Side::Right.model(), openarm_description::Side::Right);
     }
 
-    // Pins the name tables to the parsers: a name the tables advertise (on
-    // limb_state's arm_names/gripper_names) or a side gives must parse back
-    // to its side, and a foreign name must be refused, not misrouted.
+    // Pins the name tables to the parsers and the refusals: a name the tables
+    // advertise (on limb_state's arm_names/gripper_names) must parse back to
+    // its side and appear in the refusal that lists this robot's limbs, and a
+    // foreign name must be refused, not misrouted.
     #[test]
     fn advertised_names_parse_and_foreign_names_refuse() {
-        assert_eq!(Side::from_arm_name(Side::ARM_NAMES[0]), Some(Side::Left));
-        assert_eq!(Side::from_arm_name(Side::ARM_NAMES[1]), Some(Side::Right));
-        assert_eq!(
-            Side::from_gripper_name(Side::GRIPPER_NAMES[0]),
-            Some(Side::Left)
-        );
-        assert_eq!(
-            Side::from_gripper_name(Side::GRIPPER_NAMES[1]),
-            Some(Side::Right)
-        );
+        let names = limb_names();
+        for (side, (arm, gripper)) in Side::BOTH
+            .into_iter()
+            .zip(names.arm_names.iter().zip(&names.gripper_names))
+        {
+            assert_eq!(Side::from_arm_name(arm), Some(side));
+            assert_eq!(Side::from_gripper_name(gripper), Some(side));
+        }
         for side in Side::BOTH {
-            assert_eq!(Side::from_arm_name(side.arm_name()), Some(side));
-            assert_eq!(Side::from_gripper_name(side.gripper_name()), Some(side));
+            assert!(Side::UNKNOWN_ARM_NAME.contains(&format!("\"{}\"", side.arm_name())));
+            assert!(Side::UNKNOWN_GRIPPER_NAME.contains(&format!("\"{}\"", side.gripper_name())));
         }
         assert_eq!(Side::from_arm_name("left_gripper"), None);
         assert_eq!(Side::from_gripper_name("left_arm"), None);

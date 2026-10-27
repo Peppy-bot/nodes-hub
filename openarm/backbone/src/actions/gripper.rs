@@ -22,6 +22,7 @@ use tokio::sync::mpsc;
 use tracing::error;
 
 use crate::actions::{GRIPPER_WORDS, admit_limb};
+use crate::arm_pair::ArmPair;
 use crate::coordinator::GripperGoal;
 use crate::failure::{Failure, FailureKind};
 use crate::streams::LeaderActivity;
@@ -66,10 +67,10 @@ fn gripper_goal_request(d: &GoalRequestData) -> std::result::Result<GripperGoalR
 /// coordinator. The coordinator releases the busy slot when the move ends.
 pub async fn run_move_gripper(
     runner: Arc<NodeRunner>,
-    goal_txs: [mpsc::Sender<GripperGoal>; 2],
-    busy: [Arc<AtomicBool>; 2],
-    fresh: [Arc<AtomicBool>; 2],
-    activity: [LeaderActivity; 2],
+    goal_txs: ArmPair<mpsc::Sender<GripperGoal>>,
+    busy: ArmPair<Arc<AtomicBool>>,
+    fresh: ArmPair<Arc<AtomicBool>>,
+    activity: ArmPair<LeaderActivity>,
 ) -> Result<()> {
     let mut handle = ActionHandle::expose(&runner).await?;
     loop {
@@ -78,8 +79,8 @@ pub async fn run_move_gripper(
                 let admitted = gripper_goal_request(&req.data)
                     .map_err(|reason| Failure::new(FailureKind::Rejected, reason))
                     .and_then(|request| {
-                        let idx = request.side.index();
-                        admit_limb(&fresh[idx], &activity[idx], &busy[idx], &GRIPPER_WORDS)
+                        let side = request.side;
+                        admit_limb(&fresh[side], &activity[side], &busy[side], &GRIPPER_WORDS)
                     });
                 Ok(match admitted {
                     Ok(()) => GoalDecision::accept(),
@@ -94,8 +95,7 @@ pub async fn run_move_gripper(
             max_effort,
             settle_timeout,
         } = gripper_goal_request(&ctx.request().data).expect("validated on accept");
-        let idx = side.index();
-        if goal_txs[idx]
+        if goal_txs[side]
             .send(GripperGoal {
                 opening,
                 max_effort,
@@ -105,7 +105,7 @@ pub async fn run_move_gripper(
             .await
             .is_err()
         {
-            busy[idx].store(false, std::sync::atomic::Ordering::Release);
+            busy[side].store(false, std::sync::atomic::Ordering::Release);
             error!("move_gripper: coordinator channel closed");
             return Ok(());
         }

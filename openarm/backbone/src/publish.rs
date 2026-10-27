@@ -33,7 +33,7 @@ use tracing::{error, warn};
 use crate::arm_pair::ArmPair;
 use crate::camera_mounts::MeasuredGrasps;
 use crate::streams::{GripperState, warn_throttled};
-use crate::types::{JointVec, arm_pose_arrays, limb_names, world_pose_arrays};
+use crate::types::{JointVec, Side, arm_pose_arrays, limb_names, world_pose_arrays};
 
 /// Pairing timestamp from this instance's bound clock, so consumers age
 /// samples on the same timeline they read. Errors until the clock delivers
@@ -76,7 +76,7 @@ type LimbStateBuild = fn(
 
 /// One whole-robot state snapshot, gathered by the coordinator at the readout
 /// cadence: every limb's measured joints, grasp-point pose, and gripper
-/// opening, left-then-right like every [`ArmPair`].
+/// opening, in [`Side::BOTH`] order like every [`ArmPair`].
 pub struct LimbStateSnapshot {
     pub joints: ArmPair<JointVec>,
     pub poses: ArmPair<Isometry3<f64>>,
@@ -195,11 +195,11 @@ impl Publisher<LimbStateBuild> {
                 timestamp,
                 names.arm_names,
                 names.joints_per_arm,
-                [s.joints.left, s.joints.right].concat(),
+                Side::BOTH.map(|side| s.joints[side]).concat(),
                 positions,
                 orientations,
                 names.gripper_names,
-                vec![s.openings.left, s.openings.right],
+                Side::BOTH.map(|side| s.openings[side]).to_vec(),
             )
         })
         .await
