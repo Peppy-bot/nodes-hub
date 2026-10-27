@@ -1,0 +1,97 @@
+// The workflow director: it checks workflows (workflow/v1) against the
+// contracts of the fleet listing and runs them (run/v1) on the robots of the
+// stack, under robot leases. It calls the members that a workflow names
+// through the codec API of peppy, so a workflow can name contracts this node
+// was not built with, and finds the robots in the fleet listing, with no
+// launcher link to a robot. It keeps the journal of each run on the disk of
+// its machine, in the directory that journal_root names.
+{
+  peppy_schema: "node/v1",
+  manifest: {
+    name: "workflow_director",
+    tag: "v1",
+    implements: [
+      { name: "workflow_director", tag: "v1", link_id: "director" },
+    ],
+    depends_on: {
+      daemon: [
+        { name: "robot_leases", tag: "v1", link_id: "fleet" },
+      ],
+    },
+  },
+  interfaces: {
+    topics: {
+      emits: [
+        { link_id: "director", name: "run_events" },
+      ],
+    },
+    services: {
+      exposes: [
+        { link_id: "director", name: "robots" },
+        { link_id: "director", name: "check" },
+        { link_id: "director", name: "confirm" },
+        { link_id: "director", name: "suspend" },
+        { link_id: "director", name: "runs" },
+        { link_id: "director", name: "status" },
+        { link_id: "director", name: "journal" },
+        { link_id: "director", name: "replay" },
+      ],
+      consumes: [
+        { link_id: "fleet", name: "list" },
+        { link_id: "fleet", name: "contract" },
+        { link_id: "fleet", name: "take" },
+        { link_id: "fleet", name: "release" },
+        { link_id: "fleet", name: "open" },
+        { link_id: "fleet", name: "close" },
+        { link_id: "fleet", name: "check_move" },
+      ],
+    },
+    actions: {
+      exposes: [
+        { link_id: "director", name: "run" },
+        { link_id: "director", name: "resume" },
+        { link_id: "director", name: "abort" },
+        { link_id: "director", name: "locations" },
+      ],
+      consumes: [
+        { link_id: "fleet", name: "changes" },
+        { link_id: "fleet", name: "lease" },
+      ],
+    },
+  },
+  framework: {
+    restart: "on_failure",
+  },
+  execution: {
+    language: "rust",
+    codec_api: true,
+    container: {
+      def_file: "apptainer.def",
+      // The journals and the record of runs outlive the container and each
+      // launch, so the directory is bound explicitly.
+      mount_paths: [
+        "${parameters:journal_root}",
+      ],
+    },
+    setup_timeout_secs: 60,
+    parameters: {
+      // The contracts that runs may command and observe, as `name:tag`
+      // items separated by commas, such as "postures:v1, limb_motion:v1".
+      // An empty text lets no run start.
+      allowed_contracts: "string",
+      // The poll interval (s) of each step without a poll_s of its own.
+      poll_s: "f64",
+      // How long (s, wall time) a cancelled goal has to end before its
+      // robot counts as in an unknown state.
+      cancel_timeout_s: "f64",
+      // Absolute host directory of the journals, bind-mounted same-path
+      // above. Not a top-level system directory (peppy refuses those as
+      // mount sources).
+      journal_root: "string",
+      // The journals of ended runs kept: the oldest go first beyond either
+      // bound. The journal of a run that has not ended is always kept.
+      journal_max_runs: "u32",
+      journal_max_mib: "u32",
+    },
+  },
+}

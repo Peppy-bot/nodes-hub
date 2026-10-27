@@ -1,0 +1,55 @@
+// An arm for the tests of the director.
+{
+  peppy_schema: "contract/v1",
+  manifest: { name: "test_arm", tag: "v1" },
+  failure_kinds: { unreachable: "No plan to the target" },
+  interfaces: {
+    services: [
+      {
+        name: "check_reach",
+        request_message_format: { position: { $type: "array", $items: "f64", $length: 3, $marks: ["robot_frame"] } },
+        response_message_format: { reachable: "bool", margin: "f64" },
+      },
+      {
+        name: "find",
+        request_message_format: { description: "string" },
+        response_message_format: {
+          found: "bool",
+          item_id: { $type: "string", $marks: ["item_id"] },
+          position: { $type: "array", $items: "f64", $length: 3, $marks: ["robot_frame"] },
+          kind: { $type: "string", $enum: ["block", "cup", "unknown"] },
+          count: "u64",
+          note: { $type: "string", $optional: true },
+        },
+      },
+    ],
+    actions: [
+      {
+        name: "grab",
+        goal_service: { request_message_format: {
+          item_id: { $type: "string", $marks: ["item_id"] },
+          position: { $type: "array", $items: "f64", $length: 3, $marks: ["robot_frame"] },
+          speed: "u32",
+        } },
+        result_service: { response_message_format: { success: "bool", item_id: { $type: "string", $marks: ["item_id"] } } },
+        failure_kinds: ["unreachable"],
+        marks: ["moves_robot", "reaches_for_item"],
+      },
+      {
+        name: "home",
+        goal_service: { request_message_format: { duration_s: "f64" } },
+        result_service: { response_message_format: { at_home: "bool" } },
+        marks: ["moves_robot"],
+      },
+      {
+        name: "go_to",
+        goal_service: { request_message_format: { place: { $type: "string", $marks: ["location"] } } },
+        result_service: { response_message_format: { arrived: "bool" } },
+        marks: ["moves_robot"],
+      },
+    ],
+    topics: [
+      { name: "state", qos_profile: "standard", message_format: { busy: "bool", holding: "bool" } },
+    ],
+  },
+}

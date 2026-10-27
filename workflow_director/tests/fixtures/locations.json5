@@ -1,0 +1,96 @@
+// The locations a skill knows: the named places of a work cell, or of the
+// world in simulation, that a workflow names with `{ $location }` in a field
+// with the mark `location`. A node with such a field implements this
+// contract. teach replaces the locations the node knows with the ones
+// given, and list gives them. The applier of worlds teaches the locations
+// of a world to each robot of the world after it builds the world, and the
+// workflow director lists them before a run and refuses a run that names a
+// location the skill of its role does not know. People and programs teach
+// through the locations member of the director, which refuses a teach on a
+// robot with a lease, or through this contract with `peppy node call`,
+// which no lease guards: teach has no mark `moves_robot`, and a provider
+// reads no lease.
+//
+// Each location is in the world frame of the simulation, or in the frame
+// the work cell measures its places in: a position, an orientation and an
+// extent. The orientation gives the axes of the location: z is the normal
+// of a landmark or a surface (up), x runs along the axis of a landmark or
+// the first edge of a surface, and y completes the right hand. The node
+// maps a location into its own frame, from the stand of its robot.
+{
+  peppy_schema: "contract/v1",
+  manifest: {
+    name: "locations",
+    tag: "v1",
+  },
+  interfaces: {
+    services: [
+      {
+        // Replaces the known locations with `locations`, and gives the
+        // known locations after the call, as list does. Refused with
+        // rejected, and the known locations stay, for a name that is not a
+        // name of `locations` of workflow/v1 (a lowercase letter first, then
+        // lowercase letters, digits and `_`, at most 64 characters, and not
+        // a word of CEL such as `in` or `true`), a name given twice, an
+        // orientation that is not a unit quaternion, or a size with a
+        // negative entry.
+        name: "teach",
+        request_message_format: {
+          locations: {
+            $type: "array",
+            $items: {
+              $type: "object",
+              name: "string",
+              // What the location is: a pose, the landmark of an object, a
+              // level surface or a region of space.
+              kind: { $type: "string", $enum: ["pose", "landmark", "surface", "region"] },
+              // The position of the pose, the landmark, the center of the
+              // surface or of the region, in meters.
+              position: { $type: "array", $items: "f64", $length: 3 },
+              // The orientation of the pose, the landmark, the surface or
+              // the region, as a unit quaternion [x, y, z, w].
+              orientation: { $type: "array", $items: "f64", $length: 4 },
+              // The extent of the location in meters, size[0] along its x:
+              // a surface's along its x and y (0 along z), a region's along
+              // its own axes, a landmark's along its axis and across it as
+              // get_object of scene_manipulation gives it (0 along z), and
+              // zero for a pose.
+              size: { $type: "array", $items: "f64", $length: 3 },
+            },
+          },
+        },
+        response_message_format: {
+          locations: {
+            $type: "array",
+            $items: {
+              $type: "object",
+              name: "string",
+              kind: { $type: "string", $enum: ["pose", "landmark", "surface", "region"] },
+              position: { $type: "array", $items: "f64", $length: 3 },
+              orientation: { $type: "array", $items: "f64", $length: 4 },
+              size: { $type: "array", $items: "f64", $length: 3 },
+            },
+          },
+        },
+      },
+      {
+        // The known locations, in the order of the last teach; none before
+        // the first teach.
+        name: "list",
+        response_message_format: {
+          locations: {
+            $type: "array",
+            $items: {
+              $type: "object",
+              name: "string",
+              kind: { $type: "string", $enum: ["pose", "landmark", "surface", "region"] },
+              position: { $type: "array", $items: "f64", $length: 3 },
+              orientation: { $type: "array", $items: "f64", $length: 4 },
+              size: { $type: "array", $items: "f64", $length: 3 },
+            },
+          },
+        },
+      },
+    ],
+  },
+}
