@@ -84,6 +84,13 @@ impl<T, E> ArmPair<Result<T, E>> {
     }
 }
 
+impl<T> ArmPair<Option<T>> {
+    /// Both values, or `None` when either side holds none.
+    pub fn transpose(self) -> Option<ArmPair<T>> {
+        Some(ArmPair::new(self.left?, self.right?))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,6 +118,16 @@ mod tests {
         assert_eq!(pair(Ok(1), Err("right")).transpose(), Err("right"));
         assert_eq!(pair(Err("left"), Ok(2)).transpose(), Err("left"));
         assert_eq!(pair(Err("left"), Err("right")).transpose(), Err("left"));
+    }
+
+    #[test]
+    fn transpose_gives_both_values_or_none() {
+        assert_eq!(
+            ArmPair::new(Some(1), Some(2)).transpose(),
+            Some(ArmPair::new(1, 2))
+        );
+        assert_eq!(ArmPair::new(Some(1), None).transpose(), None);
+        assert_eq!(ArmPair::new(None, Some(2)).transpose(), None);
     }
 
     #[test]

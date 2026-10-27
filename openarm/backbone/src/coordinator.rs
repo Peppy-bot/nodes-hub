@@ -408,12 +408,10 @@ pub async fn run(
     // measured grippers (here and whenever a side idles) so governing always
     // ramps from where the fingers really are; the opening rate is read from
     // the governor, its single owner.
-    let mut commanded_grippers = ArmPair::new(
-        CommandedOpening::idle(gripper_fraction(&channels.left.gripper)),
-        CommandedOpening::idle(gripper_fraction(&channels.right.gripper)),
-    );
+    let mut commanded_grippers =
+        ArmPair::from_fn(|side| CommandedOpening::idle(gripper_fraction(&channels[side].gripper)));
     // In-flight backbone-executed gripper moves, one single-flight slot per side.
-    let mut gripper_moves: ArmPair<Option<GripperMove>> = ArmPair::new(None, None);
+    let mut gripper_moves: ArmPair<Option<GripperMove>> = ArmPair::from_fn(|_| None);
 
     let dt = cycle_period.as_secs_f64();
     // One low-pass per joint per arm, smoothing the published desired velocity. `main`
@@ -422,7 +420,7 @@ pub async fn run(
     // same bringup-invariant pattern as `Pacer::new(...).expect(...)`).
     let filter = LowPassFilter::from_cutoff(velocity_filter_cutoff_hz, dt)
         .expect("velocity_filter_cutoff_hz is bringup-validated in (0, Nyquist)");
-    let mut dq_filters = ArmPair::new([filter; ARM_DOF], [filter; ARM_DOF]);
+    let mut dq_filters = ArmPair::from_fn(|_| [filter; ARM_DOF]);
     // The proximity readout is for human eyes, so publish it at ~20 Hz rather than
     // the control rate: one extra distance query every `readout_every` ticks.
     let readout_every = (0.05 / dt).round().max(1.0) as u64;
@@ -434,10 +432,10 @@ pub async fn run(
         let seeded = Instant::now();
         let cadence = || Cadence::new(follower_state_rate_hz, seeded);
         (
-            ArmPair::new(Liveness::seeded(seeded), Liveness::seeded(seeded)),
-            ArmPair::new(Liveness::seeded(seeded), Liveness::seeded(seeded)),
-            ArmPair::new(cadence(), cadence()),
-            ArmPair::new(cadence(), cadence()),
+            ArmPair::from_fn(|_| Liveness::seeded(seeded)),
+            ArmPair::from_fn(|_| Liveness::seeded(seeded)),
+            ArmPair::from_fn(|_| cadence()),
+            ArmPair::from_fn(|_| cadence()),
         )
     };
     // The grippers chase their target at the gripper rate exactly as the planner
@@ -497,26 +495,18 @@ pub async fn run(
             .await;
         }
         let arm_ticks = advance_arms(&mut channels, &mut planners, arm_admission, now).await;
-        let arm_candidate = ArmPair::new(arm_ticks.left.candidate, arm_ticks.right.candidate);
-        let hands = ArmPair::new(arm_ticks.left.streamed_hand, arm_ticks.right.streamed_hand);
-        let measured_grippers = ArmPair::new(
-            gripper_fraction(&channels.left.gripper),
-            gripper_fraction(&channels.right.gripper),
-        );
+        let (arm_candidate, hands) = arm_ticks
+            .map(|_, tick| (tick.candidate, tick.streamed_hand))
+            .unzip();
+        let measured_grippers = ArmPair::from_fn(|side| gripper_fraction(&channels[side].gripper));
         service_gripper_moves(
             &mut gripper_moves,
             &mut channels,
             commanded_grippers,
-            ArmPair::new(
-                MeasuredOpening {
-                    frac: measured_grippers.left,
-                    fresh: gripper_delivered.left,
-                },
-                MeasuredOpening {
-                    frac: measured_grippers.right,
-                    fresh: gripper_delivered.right,
-                },
-            ),
+            ArmPair::from_fn(|side| MeasuredOpening {
+                frac: measured_grippers[side],
+                fresh: gripper_delivered[side],
+            }),
             gripper_admission,
             now,
         )
@@ -526,99 +516,65 @@ pub async fn run(
         // opening; otherwise the latest leader command drives it; otherwise the
         // side idles (never commanded, or unpaired), silent on the wire with the
         // governed opening re-anchored on the measured grippers.
-        let targets = ArmPair::new(
-            gripper_target(&gripper_moves.left, &channels.left),
-            gripper_target(&gripper_moves.right, &channels.right),
-        );
-        if targets.left.is_none() {
-            commanded_grippers.left = CommandedOpening::idle(measured_grippers.left);
-        }
-        if targets.right.is_none() {
-            commanded_grippers.right = CommandedOpening::idle(measured_grippers.right);
+        let targets =
+            ArmPair::from_fn(|side| gripper_target(&gripper_moves[side], &channels[side]));
+        for side in Side::BOTH {
+            if targets[side].is_none() {
+                commanded_grippers[side] = CommandedOpening::idle(measured_grippers[side]);
+            }
         }
 
         // One governed configuration: the last published setpoints and grippers
         // as `prev`, the rate-limited chases as the candidate. The governor
         // throttles, holds, scans and monitors everything through one barrier.
         let prev = GovState::new(
-            ArmPair::new(planners.left.setpoint(), planners.right.setpoint()),
-            ArmPair::new(commanded_grippers.left.frac, commanded_grippers.right.frac),
+            ArmPair::from_fn(|side| planners[side].setpoint()),
+            ArmPair::from_fn(|side| commanded_grippers[side].frac),
         );
         let cand = GovState::new(
             arm_candidate,
-            ArmPair::new(
-                chase_gripper(prev.grippers.left, targets.left, gripper_rate),
-                chase_gripper(prev.grippers.right, targets.right, gripper_rate),
-            ),
+            ArmPair::from_fn(|side| {
+                chase_gripper(prev.grippers[side], targets[side], gripper_rate)
+            }),
         );
         let measured = measured_config(&channels, &prev, measured_grippers);
         let governed = governor.govern(&prev, &cand, &measured, &hands, dt);
-        commanded_grippers = ArmPair::new(
+        commanded_grippers = ArmPair::from_fn(|side| {
             CommandedOpening::published(
-                governed.grippers.left,
-                prev.grippers.left,
-                cand.grippers.left,
-            ),
-            CommandedOpening::published(
-                governed.grippers.right,
-                prev.grippers.right,
-                cand.grippers.right,
-            ),
-        );
+                governed.grippers[side],
+                prev.grippers[side],
+                cand.grippers[side],
+            )
+        });
 
         // Publish one governed setpoint per arm on its pairing slot; the slot
         // scopes the stream to its paired arm, so the message names no side.
-        for (planner, filters, wire, prev_q, governed_q, admission) in [
-            (
-                &mut planners.left,
-                &mut dq_filters.left,
-                &publishers.arm_setpoints.left,
-                prev.arms.left,
-                governed.arms.left,
-                arm_admission.left,
-            ),
-            (
-                &mut planners.right,
-                &mut dq_filters.right,
-                &publishers.arm_setpoints.right,
-                prev.arms.right,
-                governed.arms.right,
-                arm_admission.right,
-            ),
-        ] {
+        for side in Side::BOTH {
+            let governed_q = governed.arms[side];
             // Desired velocity is the per-tick position delta; low-pass it per joint so a
             // noisy stream does not drive the arm's Kd term into buzz. The published
             // position (`governed_q`) is untouched, so tracking is unaffected.
-            let dq = filtered_velocity(filters, &governed_q, &prev_q, dt);
+            let dq = filtered_velocity(&mut dq_filters[side], &governed_q, &prev.arms[side], dt);
             // Every side commits (identity for a stale one, whose candidate was
             // the frozen setpoint), but a stale side stays silent so its
             // follower holds its own last setpoint rather than tracking one the
             // backbone can no longer vouch for.
-            planner.commit(governed_q);
-            if admission == Admission::Stale {
+            planners[side].commit(governed_q);
+            if arm_admission[side] == Admission::Stale {
                 continue;
             }
-            wire.send(&governed_q, &dq).await;
+            publishers.arm_setpoints[side].send(&governed_q, &dq).await;
         }
 
         // Publish each active side's governed opening fraction on its pairing
         // slot (the slot scopes the stream to its paired gripper, so the message
         // names no side); an idle side stays silent and its gripper holds its
         // opening.
-        for (wire, gripper_frac, target) in [
-            (
-                &publishers.gripper_setpoints.left,
-                commanded_grippers.left.frac,
-                targets.left,
-            ),
-            (
-                &publishers.gripper_setpoints.right,
-                commanded_grippers.right.frac,
-                targets.right,
-            ),
-        ] {
-            if let Some(target) = target {
-                wire.send(gripper_frac, target.max_effort).await;
+        for side in Side::BOTH {
+            if let Some(target) = targets[side] {
+                publishers.gripper_setpoints[side]
+                    .send(commanded_grippers[side].frac, target.max_effort)
+                    .await;
             }
         }
 
@@ -744,7 +700,8 @@ async fn serve_request(
 /// and Follow resumes. Streaming and discrete moves are mutually exclusive per
 /// side, so this never drops a command the operator still wants.
 fn consume_streams_of_busy_sides(channels: &ArmPair<ArmChannels>) {
-    for ch in [&channels.left, &channels.right] {
+    for side in Side::BOTH {
+        let ch = &channels[side];
         if ch.busy.load(Ordering::Acquire) {
             ch.command.send_replace(None);
         }
@@ -765,8 +722,9 @@ fn apply_controls(governor: &mut Governor, planners: &mut ArmPair<Planner>, cfg:
     // poses with it.
     governor.set_ee_cap(cfg.max_ee_velocity_m_s);
     governor.set_gripper_rate(cfg.max_gripper_rate_frac_s);
-    planners.left.set_max_ee_velocity(cfg.max_ee_velocity_m_s);
-    planners.right.set_max_ee_velocity(cfg.max_ee_velocity_m_s);
+    for side in Side::BOTH {
+        planners[side].set_max_ee_velocity(cfg.max_ee_velocity_m_s);
+    }
 }
 
 /// Judge each arm's follower before commanding it.
@@ -784,32 +742,33 @@ fn admit_arms(
     now: Instant,
     stale_limit: Duration,
 ) -> ArmPair<Admission> {
-    let delivered_left = channels.left.measured.has_changed().unwrap_or(false);
-    let delivered_right = channels.right.measured.has_changed().unwrap_or(false);
-    report_cadence("left arm", cadence.left.observe(delivered_left, now));
-    report_cadence("right arm", cadence.right.observe(delivered_right, now));
-    ArmPair::new(
-        liveness.left.admit(delivered_left, now, stale_limit),
-        liveness.right.admit(delivered_right, now, stale_limit),
-    )
+    ArmPair::from_fn(|side| {
+        let delivered = channels[side].measured.has_changed().unwrap_or(false);
+        report_cadence(side, "arm", cadence[side].observe(delivered, now));
+        liveness[side].admit(delivered, now, stale_limit)
+    })
 }
 
-/// Log a follower's delivery cadence crossing the threshold under its declared
-/// rate: the signal that the launcher's follower_state_rate_hz is a promise
-/// the follower is not keeping, ahead of the stale limit freezing the limb.
-fn report_cadence(limb: &str, change: Option<CadenceChange>) {
+/// Log the delivery cadence of the follower of `side`'s `limb` crossing the
+/// threshold under its declared rate: the signal that the launcher's
+/// follower_state_rate_hz is a promise the follower is not keeping, ahead of
+/// the stale limit freezing the limb.
+fn report_cadence(side: Side, limb: &str, change: Option<CadenceChange>) {
+    let side = side.label();
     match change {
         Some(CadenceChange::Degraded {
             delivered,
             expected,
         }) => warn!(
-            "{limb} follower delivered {delivered} states in the last second, \
+            "{side} {limb} follower delivered {delivered} states in the last second, \
              under its declared {expected}"
         ),
         Some(CadenceChange::Recovered {
             delivered,
             expected,
-        }) => info!("{limb} follower delivery back to {delivered} of its declared {expected}"),
+        }) => {
+            info!("{side} {limb} follower delivery back to {delivered} of its declared {expected}")
+        }
         None => {}
     }
 }
@@ -824,10 +783,7 @@ fn take_gripper_deliveries(channels: &mut ArmPair<ArmChannels>) -> ArmPair<bool>
         let _ = gripper.borrow_and_update();
         delivered
     };
-    ArmPair::new(
-        take(&mut channels.left.gripper),
-        take(&mut channels.right.gripper),
-    )
+    ArmPair::from_fn(|side| take(&mut channels[side].gripper))
 }
 
 /// Judge each gripper follower's delivery, the opening analog of
@@ -846,12 +802,10 @@ fn admit_grippers(
     now: Instant,
     stale_limit: Duration,
 ) -> ArmPair<Admission> {
-    report_cadence("left gripper", cadence.left.observe(delivered.left, now));
-    report_cadence("right gripper", cadence.right.observe(delivered.right, now));
-    ArmPair::new(
-        liveness.left.admit(delivered.left, now, stale_limit),
-        liveness.right.admit(delivered.right, now, stale_limit),
-    )
+    ArmPair::from_fn(|side| {
+        report_cadence(side, "gripper", cadence[side].observe(delivered[side], now));
+        liveness[side].admit(delivered[side], now, stale_limit)
+    })
 }
 
 /// Advance both planners to this tick's candidate setpoints and hand bases.
@@ -886,24 +840,17 @@ async fn service_gripper_moves(
     admission: ArmPair<Admission>,
     now: Instant,
 ) {
-    service_gripper_move(
-        &mut moves.left,
-        &mut channels.left,
-        commanded.left,
-        measured.left,
-        admission.left,
-        now,
-    )
-    .await;
-    service_gripper_move(
-        &mut moves.right,
-        &mut channels.right,
-        commanded.right,
-        measured.right,
-        admission.right,
-        now,
-    )
-    .await;
+    for side in Side::BOTH {
+        service_gripper_move(
+            &mut moves[side],
+            &mut channels[side],
+            commanded[side],
+            measured[side],
+            admission[side],
+            now,
+        )
+        .await;
+    }
 }
 
 /// The real configuration the governor's measured-state monitor judges against.
@@ -915,14 +862,14 @@ fn measured_config(
     prev: &GovState,
     grippers: ArmPair<f64>,
 ) -> GovState {
-    let positions = |ch: &ArmChannels, held: JointVec| {
-        ch.measured.borrow().as_ref().map_or(held, |m| m.positions)
-    };
     GovState::new(
-        ArmPair::new(
-            positions(&channels.left, prev.arms.left),
-            positions(&channels.right, prev.arms.right),
-        ),
+        ArmPair::from_fn(|side| {
+            channels[side]
+                .measured
+                .borrow()
+                .as_ref()
+                .map_or(prev.arms[side], |m| m.positions)
+        }),
         grippers,
     )
 }
@@ -930,6 +877,19 @@ fn measured_config(
 /// A stale side reads as nothing to report, whatever the measurement is.
 fn live<T>(admission: Admission, read: impl FnOnce() -> Option<T>) -> Option<T> {
     (admission != Admission::Stale).then(read).flatten()
+}
+
+/// Every limb's live measurement, as [`live`] reads it: the joint state of
+/// each arm and the gripper state of each gripper.
+fn live_limbs(
+    channels: &ArmPair<ArmChannels>,
+    arm_admission: ArmPair<Admission>,
+    gripper_admission: ArmPair<Admission>,
+) -> (ArmPair<Option<ArmState>>, ArmPair<Option<GripperState>>) {
+    (
+        ArmPair::from_fn(|side| live(arm_admission[side], || *channels[side].measured.borrow())),
+        ArmPair::from_fn(|side| live(gripper_admission[side], || *channels[side].gripper.borrow())),
+    )
 }
 
 /// The joints an arm's move results report after the seed: its latest
@@ -969,17 +929,12 @@ fn limb_state_snapshot(
     arm_admission: ArmPair<Admission>,
     gripper_admission: ArmPair<Admission>,
 ) -> Option<LimbStateSnapshot> {
-    let left = live(arm_admission.left, || *channels.left.measured.borrow())?;
-    let right = live(arm_admission.right, || *channels.right.measured.borrow())?;
-    let left_gripper = live(gripper_admission.left, || *channels.left.gripper.borrow())?;
-    let right_gripper = live(gripper_admission.right, || *channels.right.gripper.borrow())?;
+    let (arms, grippers) = live_limbs(channels, arm_admission, gripper_admission);
+    let (arms, grippers) = (arms.transpose()?, grippers.transpose()?);
     Some(LimbStateSnapshot {
-        joints: ArmPair::new(left.positions, right.positions),
-        poses: ArmPair::new(
-            planners.left.world_ee_pose(&left.positions),
-            planners.right.world_ee_pose(&right.positions),
-        ),
-        openings: ArmPair::new(left_gripper.fraction, right_gripper.fraction),
+        joints: arms.map(|_, arm| arm.positions),
+        poses: arms.map(|side, arm| planners[side].world_ee_pose(&arm.positions)),
+        openings: grippers.map(|_, gripper| gripper.fraction),
     })
 }
 
@@ -998,44 +953,24 @@ async fn relay_upstream(
     gripper_admission: ArmPair<Admission>,
     upstream_mode: UpstreamMode,
 ) {
-    let arms = ArmPair::new(
-        live(arm_admission.left, || *channels.left.measured.borrow()),
-        live(arm_admission.right, || *channels.right.measured.borrow()),
-    );
-    let grippers = ArmPair::new(
-        live(gripper_admission.left, || *channels.left.gripper.borrow()),
-        live(gripper_admission.right, || *channels.right.gripper.borrow()),
-    );
+    let (arms, grippers) = live_limbs(channels, arm_admission, gripper_admission);
     // In pose mode the arm back-channel also carries the same measurement as
     // the end-effector pose, FK'd here; joints mode has no pose_link peer, so
     // that work is skipped.
-    for (wire, pose_wire, planner, measured) in [
-        (
-            &publishers.arm_states.left,
-            &publishers.arm_pose_states.left,
-            &mut planners.left,
-            arms.left,
-        ),
-        (
-            &publishers.arm_states.right,
-            &publishers.arm_pose_states.right,
-            &mut planners.right,
-            arms.right,
-        ),
-    ] {
-        if let Some(m) = measured {
-            wire.send(&m.positions, &m.velocities).await;
+    for side in Side::BOTH {
+        if let Some(m) = arms[side] {
+            publishers.arm_states[side]
+                .send(&m.positions, &m.velocities)
+                .await;
             if upstream_mode == UpstreamMode::Pose {
-                pose_wire.send(&planner.world_ee_pose(&m.positions)).await;
+                let pose = planners[side].world_ee_pose(&m.positions);
+                publishers.arm_pose_states[side].send(&pose).await;
             }
         }
     }
-    for (wire, measured) in [
-        (&publishers.gripper_states.left, grippers.left),
-        (&publishers.gripper_states.right, grippers.right),
-    ] {
-        if let Some(g) = measured {
-            wire.send(&g).await;
+    for side in Side::BOTH {
+        if let Some(g) = grippers[side] {
+            publishers.gripper_states[side].send(&g).await;
         }
     }
 }
@@ -1116,21 +1051,18 @@ async fn seed_all(
                 }
                 CoordinatorRequest::MeasureGrasps { reply } => {
                     let unseeded = Err(Unmeasured::NotYet);
-                    let _ = reply.send(ArmPair::new(unseeded, unseeded));
+                    let _ = reply.send(ArmPair::from_fn(|_| unseeded));
                 }
             }
         }
     }
-    for (channels, planner) in [
-        (&channels.left, &mut planners.left),
-        (&channels.right, &mut planners.right),
-    ] {
-        let q0 = channels
+    for side in Side::BOTH {
+        let q0 = channels[side]
             .measured
             .borrow()
             .expect("gated on first state")
             .positions;
-        planner.seed_from_measured(q0);
+        planners[side].seed_from_measured(q0);
     }
     Ok(())
 }
