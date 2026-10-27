@@ -19,8 +19,7 @@ use bimanual_collision_model::CollisionError;
 use tracing::error;
 
 use super::limiters::Tripwire;
-use super::{ARM_DOF, DUAL_DOF, GOV_DOF, GovState, Governor, LEFT_GRIPPER, concat};
-use super::{NearestPair, RIGHT_GRIPPER};
+use super::{GOV_DOF, GovState, Governor, NearestPair, concat, governed_gradient};
 
 /// Everything the collision stages read, sampled once at `prev`.
 pub(super) struct Sensed {
@@ -53,23 +52,16 @@ impl Governor {
         let tripwire = self.sense_tripwire(prev, cand, measured);
 
         match self.model.gradient(&concat(prev)) {
-            Ok(g) => {
-                let mut grad = [0.0; GOV_DOF];
-                grad[..ARM_DOF].copy_from_slice(&g.grad_left);
-                grad[ARM_DOF..DUAL_DOF].copy_from_slice(&g.grad_right);
-                grad[LEFT_GRIPPER] = g.grad_openings[0];
-                grad[RIGHT_GRIPPER] = g.grad_openings[1];
-                Some(Sensed {
-                    d_prev: g.proximity.distance,
-                    grad: Some(grad),
-                    pair: NearestPair {
-                        distance: g.proximity.distance,
-                        link_a: g.proximity.link_a.to_string(),
-                        link_b: g.proximity.link_b.to_string(),
-                    },
-                    tripwire,
-                })
-            }
+            Ok(g) => Some(Sensed {
+                d_prev: g.proximity.distance,
+                grad: Some(governed_gradient(&g)),
+                pair: NearestPair {
+                    distance: g.proximity.distance,
+                    link_a: g.proximity.link_a.to_string(),
+                    link_b: g.proximity.link_b.to_string(),
+                },
+                tripwire,
+            }),
             Err(CollisionError::WitnessesCoincide { .. }) => {
                 // Deep penetration. There is no gradient to steer on, but there
                 // is still a distance to hold, so report the reading without one

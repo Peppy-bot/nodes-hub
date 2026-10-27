@@ -17,7 +17,6 @@
 #![forbid(unsafe_code)]
 
 mod actions;
-mod arm_pair;
 mod camera_mounts;
 mod coordinator;
 mod failure;
@@ -28,6 +27,7 @@ mod planner;
 mod publish;
 mod serving;
 mod settle;
+mod side;
 mod startup;
 mod streams;
 #[cfg(test)]

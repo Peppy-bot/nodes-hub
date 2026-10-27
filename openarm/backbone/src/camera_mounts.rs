@@ -26,9 +26,9 @@ use srs_model::nalgebra::{Isometry3, UnitQuaternion, Vector3};
 use tokio::sync::watch;
 use tracing::info;
 
-use crate::arm_pair::ArmPair;
 use crate::serving;
-use crate::types::{Side, pose_from_wire, world_pose_arrays};
+use crate::side::{ArmPair, Side};
+use crate::types::{pose_from_wire, world_pose_arrays};
 
 /// The message of the error reply while the coordinator has measured
 /// nothing yet.
@@ -101,7 +101,7 @@ pub enum CameraMountError {
     },
 
     #[error("the URDF names no tool-centre-point joint for the {side} arm")]
-    NoToolJoint { side: &'static str },
+    NoToolJoint { side: Side },
 }
 
 /// The robot's cameras, each placed in the frame that carries it.
@@ -118,9 +118,9 @@ impl CameraMounts {
     pub fn resolve(version: HardwareVersion) -> Result<Self, CameraMountError> {
         let robot = urdf_rs::read_from_string(version.urdf()).expect("bundled URDF must parse");
         let tree = Tree::from_robot(&robot).expect("bundled URDF must be one tree");
-        for side in [Side::Left, Side::Right] {
+        for side in Side::BOTH {
             if tree.link_index(version.tcp_link(side.model())).is_none() {
-                return Err(CameraMountError::NoToolJoint { side: side.label() });
+                return Err(CameraMountError::NoToolJoint { side });
             }
         }
         let mounts = version
@@ -139,7 +139,7 @@ impl CameraMounts {
             .map(|mount| {
                 let (carried_by, pose) = match mount.carrier {
                     Carrier::Base => ("", mount.pose),
-                    Carrier::Arm(side) => (side.arm_name(), grasps.get(side) * mount.pose),
+                    Carrier::Arm(side) => (side.arm_name(), grasps[side] * mount.pose),
                 };
                 CameraPose {
                     name: mount.name,
@@ -187,7 +187,7 @@ fn resolve_mount(
             link: mount.parent_link.to_string(),
         });
     };
-    for side in [Side::Left, Side::Right] {
+    for side in Side::BOTH {
         // The grasp point hangs off the camera's link over fixed joints: the
         // camera in the grasp point's frame is the tool transform undone,
         // then the mount.
@@ -307,14 +307,14 @@ mod tests {
     #[test]
     fn v1_carries_no_camera() {
         let mounts = CameraMounts::resolve(HardwareVersion::V1).expect("resolves");
-        let grasps = ArmPair::new(Isometry3::identity(), Isometry3::identity());
+        let grasps = ArmPair::from_fn(|_| Isometry3::identity());
         assert!(mounts.poses(&grasps).is_empty());
     }
 
     #[test]
     fn the_chest_camera_is_the_models_pose_turned_into_the_optical_frame() {
         let mounts = v2_mounts();
-        let grasps = ArmPair::new(Isometry3::identity(), Isometry3::identity());
+        let grasps = ArmPair::from_fn(|_| Isometry3::identity());
         let poses = mounts.poses(&grasps);
         assert_eq!(
             poses.iter().map(|c| c.name).collect::<Vec<_>>(),
@@ -345,7 +345,7 @@ mod tests {
             cameras.iter().map(|c| c.name).collect::<Vec<_>>(),
             ["wrist_left", "wrist_right", "chest"]
         );
-        let reported = mounts.poses(&ArmPair::new(Isometry3::identity(), Isometry3::identity()));
+        let reported = mounts.poses(&ArmPair::from_fn(|_| Isometry3::identity()));
         let chest = &cameras[2];
         assert_eq!(chest.fixed_pose, Some(by_name(&reported, "chest").pose));
         assert_eq!(chest.depth_range, Some([0.1, 10.0]));
@@ -422,7 +422,7 @@ mod tests {
         let home: JointVec = [0.0, 0.0, 0.0, 0.05, 0.0, 0.0, 0.0];
         let measured = MeasuredGrasps {
             timestamp: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(7),
-            poses: ArmPair::new(grasp(Side::Left, &home), grasp(Side::Right, &home)),
+            poses: ArmPair::from_fn(|side| grasp(side, &home)),
         };
         let reply = answer(&mounts, Some(&measured)).expect("the arms are measured");
         assert_eq!(reply.timestamp, measured.timestamp);

@@ -18,9 +18,9 @@
 //! order-independence safe rather than merely convenient.
 
 use super::{
-    APPROACH_VELOCITY_AT_SAFE_M_S, Clip, DUAL_DOF, GOV_DOF, Governor, MAX_PROBE_ARC_RAD,
-    MAX_PROBE_GRIPPER_FRAC, MIN_GRADIENT_NORM_SQ, RECOVERY_LOSS_M_PER_S, SEGMENT_SAMPLES_MIN, dot,
-    is_left_dof, split,
+    APPROACH_VELOCITY_AT_SAFE_M_S, ArmPair, Clip, DUAL_DOF, GOV_DOF, Governor, MAX_PROBE_ARC_RAD,
+    MAX_PROBE_GRIPPER_FRAC, MIN_GRADIENT_NORM_SQ, RECOVERY_LOSS_M_PER_S, SEGMENT_SAMPLES_MIN, Side,
+    dof_side, dot, step_change,
 };
 
 impl Governor {
@@ -126,25 +126,21 @@ impl Governor {
         target: &[f64; GOV_DOF],
         d_prev: f64,
     ) -> [bool; GOV_DOF] {
-        let side_dofs = |left: bool| (0..GOV_DOF).filter(move |&i| is_left_dof(i) == left);
-        let solo = |left: bool| -> [f64; GOV_DOF] {
+        let side_dofs = |side: Side| (0..GOV_DOF).filter(move |&i| dof_side(i) == side);
+        let solo = |side: Side| -> [f64; GOV_DOF] {
             let mut q = *prev;
-            for i in side_dofs(left) {
+            for i in side_dofs(side) {
                 q[i] = target[i];
             }
             q
         };
-        let moves = |left: bool| side_dofs(left).any(|i| target[i] != prev[i]);
+        let moves = |side: Side| side_dofs(side).any(|i| target[i] != prev[i]);
         let separates =
             |g: &mut Self, q: &[f64; GOV_DOF]| g.distance_at(q).is_some_and(|d| d >= d_prev);
-        let (solo_left, solo_right) = (solo(true), solo(false));
-        let sep_left = moves(true) && separates(self, &solo_left);
-        let sep_right = moves(false) && separates(self, &solo_right);
-        std::array::from_fn(|i| match (sep_left, sep_right) {
-            (true, false) => is_left_dof(i),
-            (false, true) => !is_left_dof(i),
-            _ => false,
-        })
+        let held = held_side(ArmPair::from_fn(|side| {
+            moves(side) && separates(self, &solo(side))
+        }));
+        std::array::from_fn(|i| Some(dof_side(i)) == held)
     }
 
     /// Retract `target` to the furthest point along the segment from `prev`
@@ -259,13 +255,7 @@ impl Governor {
         // `d` vouches for `(d - floor) / bound` of blend beyond its own point.
         // A zero bound means the step cannot change the clearance at all, and
         // vouches for everything.
-        let step_q: [f64; GOV_DOF] = std::array::from_fn(|i| target[i] - prev[i]);
-        let dq = split(&step_q);
-        let bound = self.model.step_bound(
-            &dq.arms.left,
-            &dq.arms.right,
-            &[dq.grippers.left, dq.grippers.right],
-        );
+        let bound = self.model.step_bound(&step_change(prev, target));
         let vouches_until = |t: f64, d: f64| -> f64 {
             if bound > 0.0 {
                 t + (d - floor) / bound
@@ -310,5 +300,30 @@ impl Governor {
             }
         }
         Clip::Clear
+    }
+}
+
+/// The side the separating hold pins at its target: the one side whose own
+/// motion separates the arms, and none when neither or both do.
+fn held_side(separating: ArmPair<bool>) -> Option<Side> {
+    match (separating.left, separating.right) {
+        (true, false) => Some(Side::Left),
+        (false, true) => Some(Side::Right),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The separating hold's side choice, pinned as a table without any
+    /// geometry.
+    #[test]
+    fn the_hold_pins_the_one_side_that_separates_alone() {
+        assert_eq!(held_side(ArmPair::new(true, false)), Some(Side::Left));
+        assert_eq!(held_side(ArmPair::new(false, true)), Some(Side::Right));
+        assert_eq!(held_side(ArmPair::new(true, true)), None);
+        assert_eq!(held_side(ArmPair::new(false, false)), None);
     }
 }

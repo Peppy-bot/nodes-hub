@@ -1,3 +1,9 @@
+//! The actions and services a caller reaches the arms through. Each move
+//! goal is admitted here (validated, then its limb claimed) and handed to the
+//! planner or the coordinator that runs it; a posture goal also waits for the
+//! shares of both arms and ends with their one result; the stop and the plan
+//! check ask the coordinator and answer what it says.
+
 pub mod arm;
 pub mod gripper;
 pub mod postures;
