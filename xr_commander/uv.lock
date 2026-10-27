@@ -830,8 +830,8 @@ wheels = [
 
 [[package]]
 name = "teleop-xr"
-version = "1.3.5+peppy.1"
-source = { url = "https://github.com/Peppy-bot/teleop_xr/releases/download/v1.3.5%2Bpeppy.1/teleop_xr-1.3.5%2Bpeppy.1-py3-none-any.whl" }
+version = "1.3.5+peppy.2"
+source = { url = "https://github.com/Peppy-bot/teleop_xr/releases/download/v1.3.5%2Bpeppy.2/teleop_xr-1.3.5%2Bpeppy.2-py3-none-any.whl" }
 dependencies = [
     { name = "aiortc" },
     { name = "av" },
@@ -849,7 +849,7 @@ dependencies = [
     { name = "websocket-client" },
 ]
 wheels = [
-    { url = "https://github.com/Peppy-bot/teleop_xr/releases/download/v1.3.5%2Bpeppy.1/teleop_xr-1.3.5%2Bpeppy.1-py3-none-any.whl", hash = "sha256:f6da572c301c971d17b8542b6ec2bdae28a43166c9a0dec590a455108b47c0d1" },
+    { url = "https://github.com/Peppy-bot/teleop_xr/releases/download/v1.3.5%2Bpeppy.2/teleop_xr-1.3.5%2Bpeppy.2-py3-none-any.whl", hash = "sha256:d364fd3356c92f8332d6f7292a7303f13665fa6a04e56163abcef2da8940edd9" },
 ]
 
 [package.metadata]
@@ -1122,7 +1122,7 @@ requires-dist = [
     { name = "opencv-python", specifier = ">=4.9" },
     { name = "peppygen", directory = ".peppy/libs/peppygen" },
     { name = "peppylib", directory = ".peppy/libs/peppylib" },
-    { name = "teleop-xr", url = "https://github.com/Peppy-bot/teleop_xr/releases/download/v1.3.5%2Bpeppy.1/teleop_xr-1.3.5%2Bpeppy.1-py3-none-any.whl" },
+    { name = "teleop-xr", url = "https://github.com/Peppy-bot/teleop_xr/releases/download/v1.3.5%2Bpeppy.2/teleop_xr-1.3.5%2Bpeppy.2-py3-none-any.whl" },
     { name = "uvicorn", specifier = ">=0.30" },
 ]
 
