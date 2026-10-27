@@ -32,13 +32,13 @@
 //! modes and never touch the collision readout, so the toggle gates collision
 //! avoidance and nothing else.
 
-use bimanual_collision_model::BimanualCollisionModel;
+use bimanual_collision_model::{BimanualCollisionModel, DistanceGradient};
 use srs_model::Jacobian;
 use tracing::{info, warn};
 
 use crate::arm_pair::ArmPair;
 use crate::torso::{TORSO_BODY, torso_regions};
-use crate::types::{ARM_DOF, JointVec};
+use crate::types::{ARM_DOF, JointVec, Side};
 
 mod barrier;
 mod limiters;
@@ -617,9 +617,28 @@ fn split(q: &[f64; GOV_DOF]) -> GovState {
     }
 }
 
-/// True if governed DOF `i` belongs to the left half (arm joints or opening).
-fn is_left_dof(i: usize) -> bool {
-    i < ARM_DOF || i == LEFT_GRIPPER
+/// The change of every governed DOF from `prev` to `target`.
+fn step_change(prev: &[f64; GOV_DOF], target: &[f64; GOV_DOF]) -> GovState {
+    split(&std::array::from_fn(|i| target[i] - prev[i]))
+}
+
+/// Pack the collision model's distance gradient into one governed vector, in
+/// the layout [`concat`] packs a configuration in.
+fn governed_gradient(g: &DistanceGradient<'_>) -> [f64; GOV_DOF] {
+    concat(&GovState::new(
+        ArmPair::new(g.grad_left, g.grad_right),
+        ArmPair::new(g.grad_openings[0], g.grad_openings[1]),
+    ))
+}
+
+/// The side governed DOF `i` belongs to: the joints of its arm and its
+/// opening.
+fn dof_side(i: usize) -> Side {
+    if i < ARM_DOF || i == LEFT_GRIPPER {
+        Side::Left
+    } else {
+        Side::Right
+    }
 }
 
 fn dot(a: &[f64; GOV_DOF], b: &[f64; GOV_DOF]) -> f64 {
@@ -758,12 +777,12 @@ mod tests {
             );
         }
         let arrived = drive(&mut g, at(home()), &at(ready()), 300);
-        for side in [arrived.arms.left, arrived.arms.right] {
+        for arm in arrived.arms.iter() {
             assert!(
-                side.iter()
+                arm.iter()
                     .zip(openarm_description::READY_R)
                     .all(|(q, r)| (q.abs() - r.abs()).abs() < 1e-3),
-                "the governed move to Ready stalled at {side:?}"
+                "the governed move to Ready stalled at {arm:?}"
             );
         }
     }
@@ -828,23 +847,24 @@ mod tests {
         let held = drive(&mut g, at(ready()), &at(home()), 400);
         assert!(distance(&mut g, &held) >= D_STOP - 1e-9);
         let home_elbow = home().left[3];
-        for (side, arm) in [("left", held.arms.left), ("right", held.arms.right)] {
+        for side in Side::BOTH {
+            let arm = held.arms[side];
             assert!(
                 arm[3] > home_elbow + 0.1,
-                "the {side} elbow reached {:.4}, Home is {home_elbow}",
+                "the {} elbow reached {:.4}, Home is {home_elbow}",
+                side.label(),
                 arm[3]
             );
         }
 
         let closed = |arms| GovState::new(arms, ArmPair::new(0.0, 0.0));
         let arrived = drive(&mut g, closed(ready()), &closed(home()), 1000);
-        for (side, arm, rest) in [
-            ("left", arrived.arms.left, home().left),
-            ("right", arrived.arms.right, home().right),
-        ] {
+        for side in Side::BOTH {
+            let (arm, rest) = (arrived.arms[side], home()[side]);
             assert!(
                 arm.iter().zip(rest).all(|(q, r)| (q - r).abs() < 1e-3),
-                "with closed grippers the {side} arm stalled at {arm:?}"
+                "with closed grippers the {} arm stalled at {arm:?}",
+                side.label()
             );
         }
     }
@@ -996,7 +1016,7 @@ mod tests {
     /// the velocity-limited chase that feeds the governor in the real loop.
     fn chase(from: &ArmPair<JointVec>, to: &ArmPair<JointVec>, max: f64) -> ArmPair<JointVec> {
         let one = |f: &JointVec, t: &JointVec| chase_step(f, t, &[max; ARM_DOF], 1.0);
-        ArmPair::new(one(&from.left, &to.left), one(&from.right, &to.right))
+        ArmPair::from_fn(|side| one(&from[side], &to[side]))
     }
 
     /// Govern a chase from home toward a deeply folded pose until the clearance
@@ -1147,12 +1167,7 @@ mod tests {
         let q = drive_into_band(&mut g);
         // Build a step orthogonal to the distance gradient (purely tangential): it
         // does not change clearance, so the barrier must pass it unthrottled.
-        let grad_pair = g.model.gradient(&concat(&q)).expect("gradient");
-        let mut grad = [0.0; GOV_DOF];
-        grad[..ARM_DOF].copy_from_slice(&grad_pair.grad_left);
-        grad[ARM_DOF..DUAL_DOF].copy_from_slice(&grad_pair.grad_right);
-        grad[LEFT_GRIPPER] = grad_pair.grad_openings[0];
-        grad[RIGHT_GRIPPER] = grad_pair.grad_openings[1];
+        let grad = governed_gradient(&g.model.gradient(&concat(&q)).expect("gradient"));
         let raw: [f64; GOV_DOF] = std::array::from_fn(|i| {
             if i < DUAL_DOF {
                 ((i % 3) as f64 - 1.0) * 0.01
@@ -1194,12 +1209,7 @@ mod tests {
         let prev16 = concat(&q);
         let toward16 = concat(&at(chase(&q.arms, &wrists_inward(1.5), 0.02)));
         let step16: [f64; GOV_DOF] = std::array::from_fn(|i| toward16[i] - prev16[i]);
-        let dq = split(&step16);
-        let bound = g.model.step_bound(
-            &dq.arms.left,
-            &dq.arms.right,
-            &[dq.grippers.left, dq.grippers.right],
-        );
+        let bound = g.model.step_bound(&split(&step16));
         assert!(bound > 0.0, "setup: a closing step has a positive bound");
 
         for (scale, expect_skip) in [(0.9 * margin / bound, true), (1.1 * margin / bound, false)] {
@@ -1207,12 +1217,7 @@ mod tests {
             // The two cases must actually straddle the skip predicate
             // (margin > bound of the scaled step), or a reshaped bound would
             // quietly turn this into a generic floor sweep.
-            let scaled = split(&std::array::from_fn(|i| target16[i] - prev16[i]));
-            let scaled_bound = g.model.step_bound(
-                &scaled.arms.left,
-                &scaled.arms.right,
-                &[scaled.grippers.left, scaled.grippers.right],
-            );
+            let scaled_bound = g.model.step_bound(&step_change(&prev16, &target16));
             assert_eq!(
                 margin > scaled_bound,
                 expect_skip,
@@ -1327,7 +1332,7 @@ mod tests {
                     self.in_range(-1.2, 1.2),
                 ]
             };
-            ArmPair::new(one(), one())
+            ArmPair::from_fn(|_| one())
         }
     }
 
@@ -1648,10 +1653,7 @@ max={} us | over budget {over}/{}",
         for _ in 0..200 {
             let cand = GovState::new(
                 q.arms,
-                ArmPair::new(
-                    rate_limited(q.grippers.left, 0.0, rate, DT),
-                    rate_limited(q.grippers.right, 0.0, rate, DT),
-                ),
+                ArmPair::from_fn(|side| rate_limited(q.grippers[side], 0.0, rate, DT)),
             );
             q = g.govern(&q, &cand, &q, NO_HANDS, DT);
         }
@@ -1722,10 +1724,9 @@ max={} us | over budget {over}/{}",
                 };
                 let cand = GovState::new(
                     chase(&prev.arms, &target.arms, 0.02),
-                    ArmPair::new(
-                        rate_limited(prev.grippers.left, target.grippers.left, rate, DT),
-                        rate_limited(prev.grippers.right, target.grippers.right, rate, DT),
-                    ),
+                    ArmPair::from_fn(|side| {
+                        rate_limited(prev.grippers[side], target.grippers[side], rate, DT)
+                    }),
                 );
                 q = g.govern(&prev, &cand, &prev, NO_HANDS, DT);
                 if d_prev >= D_SAFE {
@@ -1813,10 +1814,7 @@ max={} us | over budget {over}/{}",
         for _ in 0..200 {
             let cand = GovState::new(
                 q.arms,
-                ArmPair::new(
-                    rate_limited(q.grippers.left, 0.0, rate, DT),
-                    rate_limited(q.grippers.right, 0.0, rate, DT),
-                ),
+                ArmPair::from_fn(|side| rate_limited(q.grippers[side], 0.0, rate, DT)),
             );
             q = g.govern(&q, &cand, &q, NO_HANDS, DT);
         }
@@ -2054,67 +2052,60 @@ max={} us | over budget {over}/{}",
 
     #[test]
     fn barrier_frees_a_retreating_arm_while_the_other_pushes() {
-        // The field scenario at the BARRIER (monitor untripped): parked at the
-        // wall, one operator keeps pushing an arm in (its solo motion closes)
-        // while the other retreats (its solo motion opens). The shared-segment
-        // clip once retracted both to the same parameter, freezing the escape;
-        // the separating-side hold must let the retreating arm move nearly its
-        // full commanded step while the pushing arm is held at the floor.
-        let mut g = governor(true);
-        let q = drive_into_band(&mut g);
-        let d_wall = distance(&mut g, &q);
-        assert!(
-            (D_STOP..D_SAFE).contains(&d_wall),
-            "setup: parked in-band near the wall, got {d_wall:+.5}"
-        );
-        // Search a push/retreat pair that is genuinely mixed: solo-left closes
-        // below the floor while solo-right opens.
-        let mut found = None;
-        for (push, pull) in [
-            (0.05, 0.02),
-            (0.1, 0.02),
-            (0.15, 0.03),
-            (0.2, 0.02),
-            (0.2, 0.05),
-        ] {
-            let cl = chase(&q.arms, &wrists_inward(1.6), push).left;
-            let cr = chase(&q.arms, &home(), pull).right;
-            let solo_left = distance(
-                &mut g,
-                &GovState::new(ArmPair::new(cl, q.arms.right), q.grippers),
+        // The field scenario at the BARRIER (monitor untripped): parked in the
+        // band, one operator keeps pushing an arm in (its solo motion closes
+        // past the stop floor) while the other retreats (its solo motion
+        // opens). The shared-segment clip retracts both arms to the same
+        // parameter; the separating-side hold must let the retreating arm move
+        // its full commanded step while the pushing arm is held at the floor.
+        // The retreating arm parks deeper than the pushing one, so its finger
+        // alone binds the clearance and its retreat opens it. Either arm can
+        // be the one retreating.
+        for (pushing, retreating) in [(Side::Left, Side::Right), (Side::Right, Side::Left)] {
+            let mut g = governor(true);
+            let mut parked = wrists_inward(0.6);
+            parked[pushing] = wrists_inward(0.55)[pushing];
+            let q = at(parked);
+            let d_wall = distance(&mut g, &q);
+            let label = retreating.label();
+            assert!(
+                (D_STOP..D_SAFE).contains(&d_wall),
+                "setup: parked in the band, got {d_wall:+.5}"
             );
-            let solo_right = distance(
-                &mut g,
-                &GovState::new(ArmPair::new(q.arms.left, cr), q.grippers),
+            // `q` with the joints of `side` at `joints`.
+            let with = |side: Side, joints: JointVec| {
+                let mut arms = q.arms;
+                arms[side] = joints;
+                GovState::new(arms, q.grippers)
+            };
+            let pushed = chase(&q.arms, &wrists_inward(1.6), 0.2)[pushing];
+            let pulled = chase(&q.arms, &home(), 0.05)[retreating];
+            assert!(
+                distance(&mut g, &with(pushing, pushed)) < D_STOP,
+                "setup: the push alone closes past the stop floor"
             );
-            if solo_left < d_wall && solo_right > d_wall {
-                found = Some((GovState::new(ArmPair::new(cl, cr), q.grippers), solo_right));
-                break;
-            }
-        }
-        let (cand, solo_right) = found.expect("setup: some push/retreat pair is mixed");
+            let solo_retreat = distance(&mut g, &with(retreating, pulled));
+            assert!(
+                solo_retreat > d_wall + 1e-3,
+                "setup: the {label} retreat alone opens the clearance, got {solo_retreat:+.5}"
+            );
 
-        let governed = g.govern(&q, &cand, &q, NO_HANDS, DT);
-        // The retreating (right) arm must actually move; the governed config
-        // stays at or above the stop floor.
-        assert_ne!(
-            governed.arms.right, q.arms.right,
-            "the retreating arm was frozen"
-        );
-        assert!(
-            distance(&mut g, &governed) >= D_STOP - 1e-6,
-            "the governed step breached the stop floor"
-        );
-        // It should recover most of the way to the solo-retreat clearance, not a
-        // token sliver (the frozen-arm bug clipped it to a few percent).
-        let opened = distance(
-            &mut g,
-            &GovState::new(ArmPair::new(q.arms.left, governed.arms.right), q.grippers),
-        );
-        assert!(
-            opened >= d_wall + 0.5 * (solo_right - d_wall),
-            "retreat barely moved: opened to {opened:+.5} of solo {solo_right:+.5} from wall {d_wall:+.5}"
-        );
+            let mut commanded = q.arms;
+            commanded[pushing] = pushed;
+            commanded[retreating] = pulled;
+            let governed = g.govern(&q, &GovState::new(commanded, q.grippers), &q, NO_HANDS, DT);
+            assert!(
+                distance(&mut g, &governed) >= D_STOP - 1e-6,
+                "the governed step breached the stop floor, {label} arm retreating"
+            );
+            // The shared clip alone would cut the retreat with the push.
+            let opened = distance(&mut g, &with(retreating, governed.arms[retreating]));
+            assert!(
+                opened >= d_wall + 0.9 * (solo_retreat - d_wall),
+                "the {label} retreat was cut short: opened to {opened:+.5} of solo \
+                 {solo_retreat:+.5} from wall {d_wall:+.5}"
+            );
+        }
     }
 
     #[test]
@@ -2441,6 +2432,18 @@ max={} us | over budget {over}/{}",
     }
 
     #[test]
+    fn each_governed_dof_belongs_to_the_side_concat_packs_it_from() {
+        let marked = GovState::new(
+            ArmPair::new([1.0; ARM_DOF], [-1.0; ARM_DOF]),
+            ArmPair::new(1.0, -1.0),
+        );
+        for (i, value) in concat(&marked).into_iter().enumerate() {
+            let packed_from = if value > 0.0 { Side::Left } else { Side::Right };
+            assert_eq!(dof_side(i), packed_from, "governed DOF {i}");
+        }
+    }
+
+    #[test]
     fn concat_split_round_trip() {
         let state = GovState::new(
             ArmPair::new(
@@ -2538,10 +2541,7 @@ max={} us | over budget {over}/{}",
         for _ in 0..ticks {
             let cand = GovState::new(
                 chase(&s.arms, &target.arms, 0.02),
-                ArmPair::new(
-                    chase_frac(s.grippers.left, target.grippers.left),
-                    chase_frac(s.grippers.right, target.grippers.right),
-                ),
+                ArmPair::from_fn(|side| chase_frac(s.grippers[side], target.grippers[side])),
             );
             s = g.govern(&s, &cand, &s, NO_HANDS, DT);
             let d = distance(g, &s);

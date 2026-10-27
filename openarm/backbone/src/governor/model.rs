@@ -19,7 +19,7 @@ use tracing::warn;
 
 use crate::streams::warn_throttled;
 
-use super::{GOV_DOF, JointVec, NearestPair, split};
+use super::{GOV_DOF, GovState, NearestPair, split};
 
 pub(super) struct ConfiguredModel {
     inner: BimanualCollisionModel,
@@ -86,11 +86,14 @@ impl ConfiguredModel {
         self.inner.checked_pairs()
     }
 
-    /// Upper bound (m) on how much the clearance can change over a step.
-    /// Placement-free by the library's construction (precomputed levers), so
-    /// it takes only the step.
-    pub fn step_bound(&self, dq_left: &JointVec, dq_right: &JointVec, dopenings: &[f64; 2]) -> f64 {
-        self.inner
-            .clearance_step_bound(dq_left, dq_right, dopenings)
+    /// Upper bound (m) on how much the clearance can change over `step`, the
+    /// change of every governed DOF. Placement-free by the library's
+    /// construction (precomputed levers), so it takes only the step.
+    pub fn step_bound(&self, step: &GovState) -> f64 {
+        self.inner.clearance_step_bound(
+            &step.arms.left,
+            &step.arms.right,
+            &[step.grippers.left, step.grippers.right],
+        )
     }
 }
