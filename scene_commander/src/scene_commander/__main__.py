@@ -1158,8 +1158,8 @@ def _vector4(payload: dict, key: str) -> list[float]:
 
 
 def _text(payload: dict, key: str) -> str:
-    """A string the provider reads, which may be empty (an empty date keeps
-    the daylight's date)."""
+    """A string the provider reads, which may be empty (an empty date or
+    hour keeps the daylight's own)."""
 
     value = payload.get(key)
 
@@ -1260,7 +1260,7 @@ _PANELS = (
         json_field="daylight_json",
         targets=None,
         setters={
-            "time": (set_daylight_time, {"date": _text, "time": _name}),
+            "time": (set_daylight_time, {"date": _text, "time": _text}),
             "rate": (set_daylight_rate, {"rate": _number}),
             "weather": (set_weather, {"cloud_cover": _number, "rain_mm_h": _number}),
         },
@@ -2026,7 +2026,7 @@ select:disabled {
 <div id="daylightSummary" class="small"></div>
 </div>
 
-<label>Date and hour, local to the scene (an empty date keeps the date)</label>
+<label>Date and hour, local to the scene (an empty date or hour keeps its value)</label>
 <div class="two">
 <input id="daylightDate" type="date">
 <input id="daylightTime" type="time" step="1">
@@ -2094,8 +2094,11 @@ const CATALOGUE_RETRY_MS = 3000;
 
 const el = id => document.getElementById(id);
 
+// The number an input holds; NaN for an empty one, which JSON writes as
+// null and every route refuses, naming the field.
 function number(id) {
-    return Number(el(id).value);
+    const value = String(el(id).value);
+    return value.trim() === "" ? NaN : Number(value);
 }
 
 function position(prefix) {

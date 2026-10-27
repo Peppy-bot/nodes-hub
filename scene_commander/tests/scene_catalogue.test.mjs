@@ -1262,9 +1262,29 @@ test('bound daylight shows the clock, the weather and the bodies, and posts each
     assert.deepEqual(ui.requests.at(-2).body, { date: '', time: '18:30' });
     assert.equal(ui.element('daylightTime').value, '18:30', 'an edit survives the read that follows');
 
+    // An empty hour keeps the hour: the page posts it as it is.
+    ui.element('daylightDate').value = '2026-12-21';
+    ui.element('daylightTime').value = '';
+    await ui.run("applyDaylight('time')");
+    assert.deepEqual(ui.requests.at(-2).body, { date: '2026-12-21', time: '' });
+
     ui.element('daylightRate').value = '60';
     await ui.run("applyDaylight('rate')");
     assert.deepEqual(ui.requests.at(-2), { path: '/api/daylight/rate', body: { rate: 60 } });
+
+    // A cleared field is no number: the page posts null, which the node
+    // refuses, and shows the refusal instead of setting 0.
+    ui.element('daylightRate').value = '';
+    ui.refuse('/api/daylight/rate', 400, 'rate must be a finite number');
+    await ui.run("applyDaylight('rate')");
+    assert.deepEqual(ui.requests.at(-1), { path: '/api/daylight/rate', body: { rate: null } });
+    assert.equal(ui.element('status').textContent, 'rate must be a finite number');
+    ui.element('daylightCloudCover').value = ' ';
+    ui.element('daylightRain').value = '4';
+    ui.refuse('/api/daylight/weather', 400, 'cloud_cover must be a finite number');
+    await ui.run("applyDaylight('weather')");
+    assert.deepEqual(ui.requests.at(-1).body, { cloud_cover: null, rain_mm_h: 4 });
+    assert.equal(ui.element('status').textContent, 'cloud_cover must be a finite number');
 
     ui.element('daylightCloudCover').value = '0.8';
     ui.element('daylightRain').value = '4';

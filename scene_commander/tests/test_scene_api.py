@@ -2522,10 +2522,13 @@ def test_a_refused_setter_answers_400_with_the_kind_and_the_reason(commander, ca
     ("/api/lighting/orientation", {"light_id": "environment", "orientation": [0, 0, 0, "1"]}, "orientation must be 4 finite numbers"),
     ("/api/daylight/time", {"date": 20260621, "time": "10:00"}, "date must be a string"),
     ("/api/daylight/time", {"time": "10:00"}, "date must be a string"),
-    ("/api/daylight/time", {"date": "2026-06-21", "time": ""}, "time must be a non-empty string"),
-    ("/api/daylight/time", {"date": "2026-06-21"}, "time must be a non-empty string"),
+    ("/api/daylight/time", {"date": "2026-06-21", "time": 1030}, "time must be a string"),
+    ("/api/daylight/time", {"date": "2026-06-21"}, "time must be a string"),
     ("/api/daylight/rate", {"rate": "fast"}, "rate must be a finite number"),
     ("/api/daylight/rate", {"rate": float("inf")}, "rate must be a finite number"),
+    # A field the page's user cleared: the page posts it as null.
+    ("/api/daylight/rate", {"rate": None}, "rate must be a finite number"),
+    ("/api/daylight/weather", {"cloud_cover": None, "rain_mm_h": 4}, "cloud_cover must be a finite number"),
     ("/api/daylight/weather", {"cloud_cover": True, "rain_mm_h": 0}, "cloud_cover must be a finite number"),
     ("/api/daylight/weather", {"cloud_cover": 0.6}, "rain_mm_h must be a finite number"),
     ("/api/materials/color", {"material_id": "steel", "color": [0.5, 0.5, 0.5, 1]}, "color must be 3 finite numbers"),
@@ -2674,6 +2677,13 @@ def test_bound_daylight_reaches_the_page_parsed_and_its_state_is_logged_once(com
         "set_daylight_time(date=, time=06:15:30)",
     ),
     (
+        # An empty hour keeps the daylight's hour, as the provider has it.
+        "time", "set_daylight_time", {"date": "2026-12-21", "time": ""},
+        SimpleNamespace(date="2026-12-21", time=""),
+        _set(current_date="2026-12-21", current_time="10:04:12"),
+        "set_daylight_time(date=2026-12-21, time=)",
+    ),
+    (
         "rate", "set_daylight_rate", {"rate": 60},
         SimpleNamespace(rate=60.0),
         _set(current_rate=60.0),
@@ -2685,7 +2695,7 @@ def test_bound_daylight_reaches_the_page_parsed_and_its_state_is_logged_once(com
         _set(current_cloud_cover=0.8, current_rain_mm_h=4.0),
         "set_weather(cloud_cover=0.8, rain_mm_h=4.0)",
     ),
-], ids=["date-and-time", "time-alone", "rate", "weather"])
+], ids=["date-and-time", "time-alone", "date-alone", "rate", "weather"])
 def test_a_daylight_setter_posts_the_request_and_answers_the_effective_value(
     commander, caplog, route, service, payload, sent, answer, summary,
 ):
