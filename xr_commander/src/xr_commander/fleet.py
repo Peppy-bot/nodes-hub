@@ -2,14 +2,14 @@
 daemon target `fleet`, the two long goals that keep it, and the calls of a
 lease holder.
 
-From its start the headset keeps two goals of `fleet:v1` running: `changes`,
-whose feedback is the fleet listing and then the listing after each change,
-and `lease`, during which the headset holds leases and whose feedback gives
-the end of each of them. When either goal ends, the headset lets go of every
-robot and starts both again as soon as the daemon answers. While the daemon
-still ends the last lease goal of the headset, it refuses a new one, and the
-headset asks again after `Timing.retry_s`. Any other refusal of a start
-leaves the headset unable to drive until the next launch.
+From its start the headset keeps two goals of `robot_leases:v1` running:
+`changes`, whose feedback is the fleet listing and then the listing after each
+change, and `lease`, during which the headset holds leases and whose feedback
+gives the end of each of them. When either goal ends, the headset lets go of
+every robot and starts both again as soon as the daemon answers. While the
+daemon still ends the last lease goal of the headset, it refuses a new one,
+and the headset asks again after `Timing.retry_s`. Any other refusal of a
+start leaves the headset unable to drive until the next launch.
 """
 
 from __future__ import annotations
