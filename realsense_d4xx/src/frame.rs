@@ -6,6 +6,7 @@
 use std::time::SystemTime;
 
 use crate::modes::AlignMode;
+use crate::stream::StreamPair;
 
 pub struct FrameSet {
     pub frame_id: u32,
@@ -13,10 +14,10 @@ pub struct FrameSet {
     /// Alignment the payload was captured under, so each emitted frame is
     /// self-describing even as `set_align_mode` is toggled at runtime.
     pub align_mode: AlignMode,
-    /// Color in the configured pixel format (rgb8/bgr8/yuyv/mjpeg).
-    pub color: Image,
-    /// Z16 little-endian depth; multiply samples by `depth_stream_info.depth_unit`.
-    pub depth: Image,
+    /// Color in the configured pixel format (rgb8/bgr8/yuyv/mjpeg), and Z16
+    /// little-endian depth; multiply depth samples by
+    /// `depth_stream_info.depth_unit`.
+    pub images: StreamPair<Image>,
 }
 
 pub struct Image {

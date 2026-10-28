@@ -14,6 +14,9 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use camera_core::controls::{AutoManualMode, ControlFailure, ControlFailureKind};
+use camera_core::encoding::ColorEncoding;
+use control_core::sync::lock_ignoring_poison;
 use peppylib::runtime::CancellationToken;
 use realsense_rust::{
     config::Config,
@@ -30,12 +33,12 @@ use tracing::{error, info, warn};
 
 use crate::frame::{FrameSet, Image};
 use crate::geometry::{Calibration, Distortion, Published, StreamExtrinsics, StreamIntrinsics};
-use crate::modes::{AlignMode, AutoManualMode, ColorFormat};
+use crate::modes::{AlignMode, rs2_format};
+use crate::stream::{Stream, StreamPair};
 
-/// Timestamp from this instance's bound clock: the OS clock under wall time,
-/// the domain's instant under a clock domain. Requires
-/// `peppygen::clock::init`, which setup runs before the capture loop spawns.
-fn timestamp_now() -> std::result::Result<SystemTime, String> {
+/// Now on this instance's bound clock: the timeline its messages are
+/// stamped and aged on. Errors until the clock delivers its first tick.
+fn clock_now() -> std::result::Result<SystemTime, String> {
     let ns = peppygen::clock::now_ns().map_err(|e| e.to_string())?;
     Ok(UNIX_EPOCH + Duration::from_nanos(ns))
 }
@@ -45,11 +48,9 @@ fn timestamp_now() -> std::result::Result<SystemTime, String> {
 /// match `sensor_data` QoS.
 pub const EMIT_CHANNEL_CAPACITY: usize = 4;
 
-/// D-series RealSense depth sensors only emit Z16. `DEPTH_RS2_FORMAT` is
-/// internal to `open()`; `DEPTH_TOPIC_ENCODING` is the matching wire
-/// encoding string consumers see on the topic.
+/// D-series RealSense depth sensors only emit Z16, which consumers see on
+/// the topic as [`camera_core::encoding::DEPTH_ENCODING`].
 const DEPTH_RS2_FORMAT: Rs2Format = Rs2Format::Z16;
-pub const DEPTH_TOPIC_ENCODING: &str = "z16";
 
 /// Bounds how long `Pipeline::wait` blocks before we re-check `cancel`.
 /// A timeout just re-polls (no frame is lost), so any fps works. Kept small:
@@ -72,6 +73,13 @@ const ALIGN_WAIT: Duration = Duration::from_millis(200);
 /// from the outside).
 const STATUS_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
+/// The size and frame rate one stream is opened at.
+pub struct StreamSettings {
+    pub width: u32,
+    pub height: u32,
+    pub fps: NonZeroU8,
+}
+
 /// Parsed pipeline configuration. Construct via plain struct literal; the
 /// field types make invalid states unrepresentable. `NonZeroU8` rejects
 /// `fps = 0` and over-u8 wrap at the type level, so there's no separate
@@ -79,13 +87,8 @@ const STATUS_LOG_INTERVAL: Duration = Duration::from_secs(10);
 pub struct PipelineConfig {
     /// `None` selects the first device reported by `Context::query_devices`.
     pub serial: Option<String>,
-    pub color_width: u32,
-    pub color_height: u32,
-    pub color_fps: NonZeroU8,
-    pub color_format: ColorFormat,
-    pub depth_width: u32,
-    pub depth_height: u32,
-    pub depth_fps: NonZeroU8,
+    pub streams: StreamPair<StreamSettings>,
+    pub color_format: ColorEncoding,
     /// The align mode the capture loop starts in.
     pub align_mode: AlignMode,
 }
@@ -97,59 +100,37 @@ pub struct Capture {
     handle: Arc<PipelineHandle>,
 }
 
-/// The color and depth sensors. On D405 both resolve to the *same* physical
-/// sensor, so a single mutex guards them together: `set_option` writes stay
-/// serialized even when the handles alias one device. Option writes are
-/// infrequent, so giving up color/depth concurrency costs nothing.
-struct Sensors {
-    color: Sensor,
-    depth: Sensor,
-}
-
-/// Why an option write gave no value: the failure kind of peppy that
-/// says why, and the reason in words.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ControlFailure {
-    pub kind: ControlFailureKind,
-    pub message: String,
-}
-
-/// The failure kinds of peppy that an option write gives.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ControlFailureKind {
-    /// The device does not offer the option, or does not take the value.
-    Rejected,
-    /// The device is disconnected.
-    ResourceUnavailable,
-    /// The write failed for another reason.
-    AttemptFailed,
-}
-
-impl ControlFailure {
-    /// The failure of a write of `option` that librealsense refused.
-    fn of_option_write(option: Rs2Option, error: OptionSetError) -> Self {
-        let kind = match &error {
-            OptionSetError::OptionNotSupported
-            | OptionSetError::OptionIsReadOnly
-            | OptionSetError::CouldNotSetOption(
-                Rs2Exception::InvalidValue | Rs2Exception::NotImplemented,
-                _,
-            ) => ControlFailureKind::Rejected,
-            OptionSetError::CouldNotSetOption(Rs2Exception::CameraDisconnected, _) => {
-                ControlFailureKind::ResourceUnavailable
-            }
-            OptionSetError::CouldNotSetOption(..) => ControlFailureKind::AttemptFailed,
-        };
-        Self {
-            kind,
-            message: format!("set {option:?}: {error}"),
+/// The failure of a write of `option` that librealsense refused: rejected
+/// when the device does not offer the option or does not take the value,
+/// unavailable when the device is disconnected, and a failed attempt for any
+/// other reason.
+fn option_write_failure(option: Rs2Option, error: OptionSetError) -> ControlFailure {
+    let kind = match &error {
+        OptionSetError::OptionNotSupported
+        | OptionSetError::OptionIsReadOnly
+        | OptionSetError::CouldNotSetOption(
+            Rs2Exception::InvalidValue | Rs2Exception::NotImplemented,
+            _,
+        ) => ControlFailureKind::Rejected,
+        OptionSetError::CouldNotSetOption(Rs2Exception::CameraDisconnected, _) => {
+            ControlFailureKind::ResourceUnavailable
         }
+        OptionSetError::CouldNotSetOption(..) => ControlFailureKind::AttemptFailed,
+    };
+    ControlFailure {
+        kind,
+        message: format!("set {option:?}: {error}"),
     }
 }
 
 /// Handle for runtime control.
 pub struct PipelineHandle {
-    sensors: Mutex<Sensors>,
+    /// The color and depth sensors. On D405 both resolve to the *same*
+    /// physical sensor, so a single mutex guards them together: `set_option`
+    /// writes stay serialized even when the handles alias one device. Option
+    /// writes are infrequent, so giving up color/depth concurrency costs
+    /// nothing.
+    sensors: Mutex<StreamPair<Sensor>>,
     align_mode: Mutex<AlignMode>,
     /// Meters per Z16 depth sample, read from the device at open(). Static for
     /// the session; surfaced to consumers via `depth_stream_info`.
@@ -210,7 +191,7 @@ impl Capture {
                 }
             };
 
-            let mode = *handle.align_mode.lock().unwrap_or_else(|p| p.into_inner());
+            let mode = *lock_ignoring_poison(&handle.align_mode);
             let processed = match mode {
                 AlignMode::None => frames,
                 AlignMode::DepthToColor => {
@@ -241,7 +222,7 @@ impl Capture {
                 continue;
             };
 
-            let Ok(timestamp) = timestamp_now() else {
+            let Ok(timestamp) = clock_now() else {
                 continue; // clock not ready yet: skip rather than mis-stamp
             };
             let id = frame_id;
@@ -252,15 +233,17 @@ impl Capture {
                 frame_id: id,
                 timestamp,
                 align_mode: mode,
-                color: Image {
-                    bytes: frame_bytes(&color),
-                    width: color.width() as u32,
-                    height: color.height() as u32,
-                },
-                depth: Image {
-                    bytes: frame_bytes(&depth),
-                    width: depth.width() as u32,
-                    height: depth.height() as u32,
+                images: StreamPair {
+                    color: Image {
+                        bytes: frame_bytes(&color),
+                        width: color.width() as u32,
+                        height: color.height() as u32,
+                    },
+                    depth: Image {
+                        bytes: frame_bytes(&depth),
+                        width: depth.width() as u32,
+                        height: depth.height() as u32,
+                    },
                 },
             };
 
@@ -278,8 +261,8 @@ impl Capture {
         }
         info!("capture loop stopped");
         // Drops `pipeline` here, which calls `rs2_pipeline_stop` cleanly. The
-        // shutdown hook registered in main awaits this loop's completion, so
-        // the stop runs inside the bounded hook phase.
+        // shutdown hook that `node::setup` registers awaits this loop's
+        // completion, so the stop runs inside the bounded hook phase.
     }
 
     fn new_align(target: Rs2StreamKind) -> Align {
@@ -304,13 +287,18 @@ impl Capture {
     }
 }
 
+/// What [`PipelineHandle::published_geometry`] hands the services: the
+/// geometry under the current align mode, or why the calibration could not be
+/// read.
+pub type PublishedGeometry = Result<Published, String>;
+
 impl PipelineHandle {
     pub fn set_align_mode(&self, mode: AlignMode) {
-        *self.align_mode.lock().unwrap_or_else(|p| p.into_inner()) = mode;
+        *lock_ignoring_poison(&self.align_mode) = mode;
     }
 
     pub fn align_mode(&self) -> AlignMode {
-        *self.align_mode.lock().unwrap_or_else(|p| p.into_inner())
+        *lock_ignoring_poison(&self.align_mode)
     }
 
     pub fn depth_unit(&self) -> f32 {
@@ -321,27 +309,24 @@ impl PipelineHandle {
     /// or why the device's calibration could not be read. The mode is read
     /// here, once per answer, so every part of one answer describes the same
     /// mode.
-    pub fn published_geometry(&self) -> Result<Published, String> {
+    pub fn published_geometry(&self) -> PublishedGeometry {
         self.calibration
             .as_ref()
             .map(|calibration| calibration.published(self.align_mode()))
             .map_err(Clone::clone)
     }
 
-    fn set_color_option(&self, option: Rs2Option, value: f32) -> Result<(), ControlFailure> {
-        let mut sensors = self.sensors.lock().unwrap_or_else(|p| p.into_inner());
+    fn set_option(
+        &self,
+        stream: Stream,
+        option: Rs2Option,
+        value: f32,
+    ) -> Result<(), ControlFailure> {
+        let mut sensors = lock_ignoring_poison(&self.sensors);
         sensors
-            .color
+            .get_mut(stream)
             .set_option(option, value)
-            .map_err(|error| ControlFailure::of_option_write(option, error))
-    }
-
-    fn set_depth_option(&self, option: Rs2Option, value: f32) -> Result<(), ControlFailure> {
-        let mut sensors = self.sensors.lock().unwrap_or_else(|p| p.into_inner());
-        sensors
-            .depth
-            .set_option(option, value)
-            .map_err(|error| ControlFailure::of_option_write(option, error))
+            .map_err(|error| option_write_failure(option, error))
     }
 
     /// `mode = Auto` sets `EnableAutoExposure` on; `mode = Manual` sets
@@ -351,14 +336,12 @@ impl PipelineHandle {
         mode: AutoManualMode,
         value: i32,
     ) -> Result<(), ControlFailure> {
-        self.set_color_option(
+        self.set_color_auto_manual(
             Rs2Option::EnableAutoExposure,
-            if mode.is_auto() { 1.0 } else { 0.0 },
-        )?;
-        if !mode.is_auto() {
-            self.set_color_option(Rs2Option::Exposure, value as f32)?;
-        }
-        Ok(())
+            Rs2Option::Exposure,
+            mode,
+            value,
+        )
     }
 
     /// `mode = Auto` sets `EnableAutoWhiteBalance`; `mode = Manual` writes
@@ -368,34 +351,48 @@ impl PipelineHandle {
         mode: AutoManualMode,
         temperature: i32,
     ) -> Result<(), ControlFailure> {
-        self.set_color_option(
+        self.set_color_auto_manual(
             Rs2Option::EnableAutoWhiteBalance,
-            if mode.is_auto() { 1.0 } else { 0.0 },
-        )?;
-        if !mode.is_auto() {
-            self.set_color_option(Rs2Option::WhiteBalance, temperature as f32)?;
+            Rs2Option::WhiteBalance,
+            mode,
+            temperature,
+        )
+    }
+
+    /// `mode = Auto` sets the colour option `auto_option` on; `mode = Manual`
+    /// sets it off and writes `value` to `setpoint_option`.
+    fn set_color_auto_manual(
+        &self,
+        auto_option: Rs2Option,
+        setpoint_option: Rs2Option,
+        mode: AutoManualMode,
+        value: i32,
+    ) -> Result<(), ControlFailure> {
+        if mode.is_auto() {
+            return self.set_option(Stream::Color, auto_option, 1.0);
         }
-        Ok(())
+        self.set_option(Stream::Color, auto_option, 0.0)?;
+        self.set_option(Stream::Color, setpoint_option, value as f32)
     }
 
     pub fn set_color_gain(&self, value: i32) -> Result<(), ControlFailure> {
-        self.set_color_option(Rs2Option::Gain, value as f32)
+        self.set_option(Stream::Color, Rs2Option::Gain, value as f32)
     }
 
     pub fn set_color_brightness(&self, value: i32) -> Result<(), ControlFailure> {
-        self.set_color_option(Rs2Option::Brightness, value as f32)
+        self.set_option(Stream::Color, Rs2Option::Brightness, value as f32)
     }
 
     pub fn set_color_contrast(&self, value: i32) -> Result<(), ControlFailure> {
-        self.set_color_option(Rs2Option::Contrast, value as f32)
+        self.set_option(Stream::Color, Rs2Option::Contrast, value as f32)
     }
 
     pub fn set_depth_gain(&self, value: i32) -> Result<(), ControlFailure> {
-        self.set_depth_option(Rs2Option::Gain, value as f32)
+        self.set_option(Stream::Depth, Rs2Option::Gain, value as f32)
     }
 
     pub fn set_depth_laser_power_mw(&self, value: i32) -> Result<(), ControlFailure> {
-        self.set_depth_option(Rs2Option::LaserPower, value as f32)
+        self.set_option(Stream::Depth, Rs2Option::LaserPower, value as f32)
     }
 }
 
@@ -423,19 +420,19 @@ pub fn open(config: PipelineConfig) -> Result<Capture, String> {
         .enable_stream(
             Rs2StreamKind::Depth,
             None,
-            config.depth_width as usize,
-            config.depth_height as usize,
+            config.streams.depth.width as usize,
+            config.streams.depth.height as usize,
             DEPTH_RS2_FORMAT,
-            config.depth_fps.get() as usize,
+            config.streams.depth.fps.get() as usize,
         )
         .map_err(|e| format!("enable depth stream: {e}"))?
         .enable_stream(
             Rs2StreamKind::Color,
             None,
-            config.color_width as usize,
-            config.color_height as usize,
-            config.color_format.rs2_format(),
-            config.color_fps.get() as usize,
+            config.streams.color.width as usize,
+            config.streams.color.height as usize,
+            rs2_format(config.color_format),
+            config.streams.color.fps.get() as usize,
         )
         .map_err(|e| format!("enable color stream: {e}"))?;
 
@@ -444,14 +441,16 @@ pub fn open(config: PipelineConfig) -> Result<Capture, String> {
         .map_err(|e| format!("start pipeline: {e}"))?;
 
     let device = pipeline.profile().device();
-    let color_sensor = find_sensor_for_stream(device, Rs2StreamKind::Color)
-        .ok_or("device has no sensor exposing the Color stream")?;
-    let depth_sensor = find_sensor_for_stream(device, Rs2StreamKind::Depth)
-        .ok_or("device has no sensor exposing the Depth stream")?;
+    let sensors = StreamPair::STREAMS.try_map(|stream| {
+        let kind = rs2_kind(stream);
+        find_sensor_for_stream(device, kind)
+            .ok_or_else(|| format!("device has no sensor exposing the {kind:?} stream"))
+    })?;
 
     // Metric depth scale (meters per Z16 LSB). Static per device/config; read
     // once here so depth_stream_info can report it without touching the sensor.
-    let depth_unit = depth_sensor
+    let depth_unit = sensors
+        .depth
         .get_option(Rs2Option::DepthUnits)
         .unwrap_or_else(|| {
             warn!("depth sensor did not report DepthUnits; defaulting to 0.001 m/LSB");
@@ -461,42 +460,39 @@ pub fn open(config: PipelineConfig) -> Result<Capture, String> {
     let serial_log = device_serial(device).unwrap_or_else(|| "<unknown>".into());
     info!(
         "pipeline started for device serial={serial_log} color={}x{}@{}fps depth={}x{}@{}fps depth_unit={depth_unit}",
-        config.color_width,
-        config.color_height,
-        config.color_fps,
-        config.depth_width,
-        config.depth_height,
-        config.depth_fps,
+        config.streams.color.width,
+        config.streams.color.height,
+        config.streams.color.fps,
+        config.streams.depth.width,
+        config.streams.depth.height,
+        config.streams.depth.fps,
     );
 
     let calibration = read_calibration(pipeline.profile().streams(), depth_unit);
     match &calibration {
         Ok(c) => info!(
             "calibration: colour {}x{} fx {} fy {} ppx {} ppy {} {:?}, depth {}x{} fx {} fy {} ppx {} ppy {} {:?}, depth to colour t {:?}",
-            c.color.width,
-            c.color.height,
-            c.color.fx,
-            c.color.fy,
-            c.color.ppx,
-            c.color.ppy,
-            c.color.distortion,
-            c.depth.width,
-            c.depth.height,
-            c.depth.fx,
-            c.depth.fy,
-            c.depth.ppx,
-            c.depth.ppy,
-            c.depth.distortion,
+            c.streams.color.width,
+            c.streams.color.height,
+            c.streams.color.fx,
+            c.streams.color.fy,
+            c.streams.color.ppx,
+            c.streams.color.ppy,
+            c.streams.color.distortion,
+            c.streams.depth.width,
+            c.streams.depth.height,
+            c.streams.depth.fx,
+            c.streams.depth.fy,
+            c.streams.depth.ppx,
+            c.streams.depth.ppy,
+            c.streams.depth.distortion,
             c.depth_to_color.translation,
         ),
         Err(e) => warn!("no calibration read, the geometry services refuse: {e}"),
     }
 
     let handle = Arc::new(PipelineHandle {
-        sensors: Mutex::new(Sensors {
-            color: color_sensor,
-            depth: depth_sensor,
-        }),
+        sensors: Mutex::new(sensors),
         align_mode: Mutex::new(config.align_mode),
         depth_unit,
         calibration,
@@ -509,19 +505,19 @@ pub fn open(config: PipelineConfig) -> Result<Capture, String> {
 /// of librealsense's types. The streams do not depend on it, so a read that
 /// fails costs the geometry services their answer, not the node its frames.
 fn read_calibration(streams: &[StreamProfile], depth_unit: f32) -> Result<Calibration, String> {
-    let stream = |kind: Rs2StreamKind| {
+    let profiles = StreamPair::STREAMS.try_map(|stream| {
+        let kind = rs2_kind(stream);
         streams
             .iter()
             .find(|profile| profile.kind() == kind)
             .ok_or_else(|| format!("the started pipeline has no {kind:?} stream profile"))
-    };
-    let (color, depth) = (stream(Rs2StreamKind::Color)?, stream(Rs2StreamKind::Depth)?);
-    let depth_to_color = depth
-        .extrinsics(color)
+    })?;
+    let depth_to_color = profiles
+        .depth
+        .extrinsics(profiles.color)
         .map_err(|e| format!("read the depth-to-colour extrinsics: {e}"))?;
     Ok(Calibration {
-        color: read_intrinsics(color)?,
-        depth: read_intrinsics(depth)?,
+        streams: profiles.try_map(read_intrinsics)?,
         depth_to_color: StreamExtrinsics {
             rotation: depth_to_color.rotation(),
             translation: depth_to_color.translation(),
@@ -591,6 +587,14 @@ fn frame_bytes<K>(frame: &ImageFrame<K>) -> Vec<u8> {
     }
 }
 
+/// The librealsense kind of `stream`.
+fn rs2_kind(stream: Stream) -> Rs2StreamKind {
+    match stream {
+        Stream::Color => Rs2StreamKind::Color,
+        Stream::Depth => Rs2StreamKind::Depth,
+    }
+}
+
 /// Return the first sensor on `device` that advertises a stream profile of
 /// `kind`. On D435/D455 this distinguishes the color and depth sensors;
 /// on D405 the same sensor satisfies both lookups.
@@ -615,13 +619,10 @@ fn device_serial(device: &realsense_rust::device::Device) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// Tripwire: if anyone edits the literal `"z16"` or swaps the `Rs2Format`,
-    /// this test fails. The depth wire encoding is part of the public topic
-    /// contract; consumers parse it as a string.
+    /// The depth stream opens in librealsense's Z16 format.
     #[test]
-    fn pinned_depth_formats_match() {
+    fn the_depth_stream_opens_in_z16() {
         assert_eq!(DEPTH_RS2_FORMAT, Rs2Format::Z16);
-        assert_eq!(DEPTH_TOPIC_ENCODING, "z16");
     }
 
     /// Every model librealsense names maps to this node's name for it, and a
@@ -660,7 +661,7 @@ mod tests {
     /// librealsense is a failed attempt.
     #[test]
     fn each_refused_option_write_gives_the_kind_of_its_cause() {
-        let kind_of = |error| ControlFailure::of_option_write(Rs2Option::Gain, error).kind;
+        let kind_of = |error| option_write_failure(Rs2Option::Gain, error).kind;
         let sdk = |exception| OptionSetError::CouldNotSetOption(exception, "why".to_string());
         assert_eq!(
             kind_of(OptionSetError::OptionNotSupported),
@@ -699,7 +700,7 @@ mod tests {
 
     #[test]
     fn a_refused_option_write_names_the_option_and_the_reason() {
-        let failure = ControlFailure::of_option_write(
+        let failure = option_write_failure(
             Rs2Option::LaserPower,
             OptionSetError::CouldNotSetOption(
                 Rs2Exception::InvalidValue,

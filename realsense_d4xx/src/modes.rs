@@ -1,71 +1,35 @@
-//! Typed mode enums: color pixel format, RGB-D alignment mode, and a shared
-//! auto/manual mode for sensor options that toggle between automatic control
-//! and an explicit setpoint (exposure, white_balance, ...).
+//! The modes the node parses from its parameters and requests: the colour
+//! encoding with its librealsense format, the RGB-D alignment mode, and the
+//! auto/manual mode of a sensor option with a setpoint (exposure,
+//! white_balance, ...).
 //!
 //! All public string forms are case-sensitive (`"auto"`, not `"Auto"`).
 
 use std::fmt;
 
+use camera_core::controls::AutoManualMode;
+use camera_core::encoding::ColorEncoding;
 use realsense_rust::kind::Rs2Format;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ColorFormat {
-    /// 8-bit packed `R,G,B`. 3 bytes/pixel. Universal; tensor-friendly.
-    Rgb8,
-    /// 8-bit packed `B,G,R`. OpenCV's default channel order.
-    Bgr8,
-    /// YCbCr 4:2:2 packed (Y0,U,Y1,V). 2 bytes/pixel; ~33% wire savings
-    /// vs Rgb8.
-    Yuyv,
-    /// JPEG-compressed (variable, ~10:1 typical). Smallest on the wire but
-    /// consumers need a JPEG decoder.
-    Mjpeg,
+use crate::stream::StreamPair;
+
+/// Human-readable list of the colour formats [`parse_color_format`] accepts.
+const SUPPORTED_COLOR_FORMATS: &str = "rgb8/bgr8/yuyv/mjpeg";
+
+/// The colour encoding the `color_format` parameter names.
+pub fn parse_color_format(name: &str) -> Result<ColorEncoding, String> {
+    ColorEncoding::from_name(name).ok_or_else(|| {
+        format!("unknown color format '{name}' (expected {SUPPORTED_COLOR_FORMATS})")
+    })
 }
 
-impl ColorFormat {
-    /// Human-readable list of formats `TryFrom<&str>` accepts. Update
-    /// alongside the match arms below.
-    pub const SUPPORTED: &'static str = "rgb8/bgr8/yuyv/mjpeg";
-
-    pub fn rs2_format(self) -> Rs2Format {
-        match self {
-            Self::Rgb8 => Rs2Format::Rgb8,
-            Self::Bgr8 => Rs2Format::Bgr8,
-            Self::Yuyv => Rs2Format::Yuyv,
-            Self::Mjpeg => Rs2Format::Mjpeg,
-        }
-    }
-
-    pub fn topic_encoding(self) -> &'static str {
-        match self {
-            Self::Rgb8 => "rgb8",
-            Self::Bgr8 => "bgr8",
-            Self::Yuyv => "yuyv",
-            Self::Mjpeg => "mjpeg",
-        }
-    }
-}
-
-impl TryFrom<&str> for ColorFormat {
-    type Error = String;
-
-    fn try_from(s: &str) -> Result<Self, Self::Error> {
-        match s {
-            "rgb8" => Ok(Self::Rgb8),
-            "bgr8" => Ok(Self::Bgr8),
-            "yuyv" => Ok(Self::Yuyv),
-            "mjpeg" => Ok(Self::Mjpeg),
-            other => Err(format!(
-                "unknown color format '{other}' (expected {})",
-                Self::SUPPORTED
-            )),
-        }
-    }
-}
-
-impl fmt::Display for ColorFormat {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.topic_encoding())
+/// The librealsense format the colour stream is opened in for `encoding`.
+pub fn rs2_format(encoding: ColorEncoding) -> Rs2Format {
+    match encoding {
+        ColorEncoding::Rgb8 => Rs2Format::Rgb8,
+        ColorEncoding::Bgr8 => Rs2Format::Bgr8,
+        ColorEncoding::Yuyv => Rs2Format::Yuyv,
+        ColorEncoding::Mjpeg => Rs2Format::Mjpeg,
     }
 }
 
@@ -87,6 +51,23 @@ impl AlignMode {
             Self::None => "none",
             Self::DepthToColor => "depth_to_color",
             Self::ColorToDepth => "color_to_depth",
+        }
+    }
+
+    /// What each stream is published with under this mode, of what each is
+    /// opened with: librealsense warps an aligned stream into the other's
+    /// viewpoint and resolution, so the aligned stream takes the target's.
+    pub fn published<T: Clone>(self, opened: StreamPair<T>) -> StreamPair<T> {
+        match self {
+            Self::None => opened,
+            Self::DepthToColor => StreamPair {
+                color: opened.color.clone(),
+                depth: opened.color,
+            },
+            Self::ColorToDepth => StreamPair {
+                color: opened.depth.clone(),
+                depth: opened.depth,
+            },
         }
     }
 }
@@ -113,39 +94,11 @@ impl fmt::Display for AlignMode {
     }
 }
 
-/// Auto/manual toggle for sensor options that pair a mode with a numeric
-/// setpoint (exposure, white_balance, ...).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AutoManualMode {
-    Auto,
-    Manual,
-}
-
-impl AutoManualMode {
-    pub fn is_auto(self) -> bool {
-        matches!(self, Self::Auto)
-    }
-
-    /// Parse the wire string. `kind` names the parameter for error messages
-    /// (e.g. `"exposure"`, `"white_balance"`).
-    pub fn parse(s: &str, kind: &str) -> Result<Self, String> {
-        match s {
-            "auto" => Ok(Self::Auto),
-            "manual" => Ok(Self::Manual),
-            other => Err(format!(
-                "unknown {kind} mode '{other}' (expected 'auto' or 'manual')"
-            )),
-        }
-    }
-}
-
-impl fmt::Display for AutoManualMode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Auto => "auto",
-            Self::Manual => "manual",
-        })
-    }
+/// The auto/manual mode a request spells. `kind` names the parameter in the
+/// refusal of any other spelling (e.g. `"exposure"`, `"white_balance"`).
+pub fn parse_mode(s: &str, kind: &str) -> Result<AutoManualMode, String> {
+    AutoManualMode::from_name(s)
+        .ok_or_else(|| format!("unknown {kind} mode '{s}' (expected 'auto' or 'manual')"))
 }
 
 #[cfg(test)]
@@ -154,22 +107,17 @@ mod tests {
 
     #[test]
     fn color_format_parse_round_trip() {
-        for fmt in [
-            ColorFormat::Rgb8,
-            ColorFormat::Bgr8,
-            ColorFormat::Yuyv,
-            ColorFormat::Mjpeg,
-        ] {
-            let parsed = ColorFormat::try_from(fmt.topic_encoding()).unwrap();
+        for fmt in ColorEncoding::ALL {
+            let parsed = parse_color_format(fmt.name()).unwrap();
             assert_eq!(parsed, fmt);
         }
     }
 
     #[test]
     fn color_format_rejects_unknown() {
-        assert!(ColorFormat::try_from("z16").is_err());
-        assert!(ColorFormat::try_from("").is_err());
-        assert!(ColorFormat::try_from("RGB8").is_err());
+        assert!(parse_color_format("z16").is_err());
+        assert!(parse_color_format("").is_err());
+        assert!(parse_color_format("RGB8").is_err());
     }
 
     #[test]
@@ -192,22 +140,19 @@ mod tests {
 
     #[test]
     fn auto_manual_parses_known_strings() {
-        assert_eq!(AutoManualMode::parse("auto", "x"), Ok(AutoManualMode::Auto));
-        assert_eq!(
-            AutoManualMode::parse("manual", "x"),
-            Ok(AutoManualMode::Manual)
-        );
+        assert_eq!(parse_mode("auto", "x"), Ok(AutoManualMode::Auto));
+        assert_eq!(parse_mode("manual", "x"), Ok(AutoManualMode::Manual));
     }
 
     #[test]
     fn auto_manual_is_case_sensitive() {
-        assert!(AutoManualMode::parse("Auto", "x").is_err());
-        assert!(AutoManualMode::parse("AUTO", "x").is_err());
+        assert!(parse_mode("Auto", "x").is_err());
+        assert!(parse_mode("AUTO", "x").is_err());
     }
 
     #[test]
     fn auto_manual_error_carries_kind() {
-        let err = AutoManualMode::parse("foo", "exposure").unwrap_err();
+        let err = parse_mode("foo", "exposure").unwrap_err();
         assert!(err.contains("exposure"), "missing kind: {err}");
         assert!(err.contains("foo"), "missing input: {err}");
     }
