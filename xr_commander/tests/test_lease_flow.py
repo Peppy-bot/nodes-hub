@@ -45,8 +45,9 @@ from tests.helpers import (
     running,
     settle,
 )
-from xr_commander import config, fleet, publish
+from xr_commander import config, fleet, postures, publish
 from xr_commander.clutch import HandClutch
+from xr_commander.devices import primary_pressed
 from xr_commander.drive import Driver, LimbStops
 from xr_commander.fleet import LEASE_NAME, Fleet, FleetCalls, Following, Timing
 from xr_commander.frames import Pose
@@ -103,7 +104,7 @@ class Rig:
         self.stops = h.mocks.deps.limb_motion[0].limb_motion_stop
         self.postures = h.mocks.deps.postures[0].move_to_home
         self.wire = h.mocks.pairings.right_arm[0].pose_setpoints
-        self.status = publish.PostureStatus(clock)
+        self.status = postures.PostureStatus(clock)
         # The loops of the test, which each tick waits for.
         self.loops: list[asyncio.Task] = []
 
@@ -139,10 +140,10 @@ class Rig:
         )
 
     def posture_button(self, token):
-        return publish.run_posture_button(
+        return postures.run_posture_button(
             self.h.node_runner,
             action_module=move_to_home,
-            pressed=lambda sample: sample.primary_button,
+            pressed=primary_pressed,
             session=self.session,
             robots=self.robots,
             driver=self.driver,

@@ -16,7 +16,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import recording
-from .plan import RecordingPlan
+from .log import log
+from .plan import RecordingPlan, depth_image_key
 from .recording import FrameRow, SourceSchema
 
 # The bookkeeping features lerobot's create() merges into every dataset's
@@ -27,27 +28,37 @@ DATASET_ADDED_FEATURES = frozenset(
     {"timestamp", "frame_index", "episode_index", "index", "task_index"}
 )
 
+_STATE_KEY = "observation.state"
+_ACTION_KEY = "action"
+_VELOCITIES_KEY = "observation.velocities"
+_EFFORTS_KEY = "observation.efforts"
+
+
+def _image_key(name: str) -> str:
+    """The dataset feature key of the image named `name`."""
+    return f"observation.images.{name}"
+
 
 def build_features(schema: SourceSchema, plan: RecordingPlan) -> dict:
     features: dict = {
-        "observation.state": _vector_feature(list(recording.state_dim_names(plan, schema))),
-        "action": _vector_feature(list(recording.action_dim_names(plan, schema))),
+        _STATE_KEY: _vector_feature(list(recording.state_dim_names(plan, schema))),
+        _ACTION_KEY: _vector_feature(list(recording.action_dim_names(plan, schema))),
     }
     # Optional vectors cover exactly the sources whose wire delivers them,
     # named per dimension so the subset is self-describing.
     velocities = recording.velocities_dim_names(plan, schema)
     if velocities:
-        features["observation.velocities"] = _vector_feature(list(velocities))
+        features[_VELOCITIES_KEY] = _vector_feature(list(velocities))
     efforts = recording.efforts_dim_names(plan, schema)
     if efforts:
-        features["observation.efforts"] = _vector_feature(list(efforts))
+        features[_EFFORTS_KEY] = _vector_feature(list(efforts))
     for entry, (w, h) in zip(plan.color_cameras, schema.color_geometry, strict=True):
-        features[f"observation.images.{entry.name}"] = _video_feature(w, h)
+        features[_image_key(entry.name)] = _video_feature(w, h)
     for i, entry in enumerate(plan.rgbd_cameras):
         w, h = schema.rgbd_geometry[i]
-        features[f"observation.images.{entry.name}"] = _video_feature(w, h)
+        features[_image_key(entry.name)] = _video_feature(w, h)
         dw, dh = schema.depth_geometry[i]
-        features[f"observation.images.{entry.name}_depth"] = {
+        features[_image_key(depth_image_key(entry.name))] = {
             "dtype": "video",
             "shape": (dh, dw, 1),
             "names": ["height", "width", "channels"],
@@ -89,7 +100,7 @@ class ResumeManifest:
     total_episodes: int
 
 
-def read_resume_manifest(dataset_root: Path) -> ResumeManifest:
+def _read_resume_manifest(dataset_root: Path) -> ResumeManifest:
     """Everything resume must know about a session's dataset, read without
     constructing it. Raises ValueError with an operator-grade reason when the
     session cannot be resumed. Blocking; run in a worker thread.
@@ -148,8 +159,8 @@ def _warn_on_unreadable_tail(dataset_root: Path) -> None:
 
         _ = pq.ParquetFile(chunks[-1]).metadata
     except Exception:
-        print(
-            "[recorder] resuming after an unclean stop; episodes since the "
+        log(
+            "resuming after an unclean stop; episodes since the "
             "last chunk rotation may be unreadable",
             flush=True,
         )
@@ -167,9 +178,9 @@ def _remove_orphaned_encoder_dirs(dataset_root: Path) -> None:
             continue
         try:
             shutil.rmtree(path)
-            print(f"[recorder] removed orphaned encoder scratch {path.name}", flush=True)
+            log(f"removed orphaned encoder scratch {path.name}", flush=True)
         except OSError as e:
-            print(f"[recorder] could not remove {path}: {e!r}", flush=True)
+            log(f"could not remove {path}: {e!r}", flush=True)
 
 
 def missing_video_frames(latest_episode: dict, video_keys: list[str], fps: int) -> dict[str, int]:
@@ -307,7 +318,7 @@ class Sink:
         session before gating on live sources. Returns the manifest to hand
         back to `resume`, so the session is read once; raises ValueError with
         the refusal reason."""
-        return await asyncio.to_thread(read_resume_manifest, self._root)
+        return await asyncio.to_thread(_read_resume_manifest, self._root)
 
     async def resume(
         self, manifest: ResumeManifest, schema: SourceSchema, plan: RecordingPlan
@@ -373,16 +384,16 @@ class Sink:
         assert self._dataset is not None, "created before the first frame"
         assert not self._finalized, "session finalized; no further episodes"
         frame = {
-            "observation.state": row.state,
-            "action": row.action,
+            _STATE_KEY: row.state,
+            _ACTION_KEY: row.action,
             "task": task,
         }
         if row.velocities is not None:
-            frame["observation.velocities"] = row.velocities
+            frame[_VELOCITIES_KEY] = row.velocities
         if row.efforts is not None:
-            frame["observation.efforts"] = row.efforts
+            frame[_EFFORTS_KEY] = row.efforts
         for key, image in row.images.items():
-            frame[f"observation.images.{key}"] = image
+            frame[_image_key(key)] = image
         self._dataset.add_frame(frame)
 
     async def save_episode(self) -> VideoShortfall:

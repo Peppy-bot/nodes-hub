@@ -11,14 +11,10 @@
 #![forbid(unsafe_code)]
 
 mod control;
+mod drive;
 mod friction;
 mod health;
 mod node;
 mod stream;
-
-/// Degrees of freedom of the arm.
-pub const ARM_DOF: usize = openarm_description::ARM_DOF;
-/// One joint-space vector (positions, velocities, or torques), j1..j7.
-pub use srs_model::JointVec;
 
 pub use node::{NodeError, hard_fault_latched, setup};

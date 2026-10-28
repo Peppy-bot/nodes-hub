@@ -401,13 +401,13 @@ impl Gripper {
 mod tests {
     use super::*;
 
-    /// The DM4310 both generations drive, resolved the way `Gripper` does.
-    fn full_scale_nm() -> f64 {
-        torque_full_scale_nm(v20::GRIPPER_MOTOR_TYPE)
-    }
-
     /// Both generations drive this motor.
     const MOTOR: MotorType = v20::GRIPPER_MOTOR_TYPE;
+
+    /// The DM4310 both generations drive, resolved the way `Gripper` does.
+    fn full_scale_nm() -> f64 {
+        torque_full_scale_nm(MOTOR)
+    }
 
     fn limits(speed_rad_s: f64, max_effort_nm: f64) -> PosForceLimits {
         PosForceLimits::new(MOTOR, speed_rad_s, max_effort_nm).expect("valid limits")

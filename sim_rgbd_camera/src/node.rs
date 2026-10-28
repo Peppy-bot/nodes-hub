@@ -1,14 +1,24 @@
-// The relay loops and their assembly: frames forward to the contract
-// surface, the stream descriptions feed the info services, the camera
-// geometry feeds the geometry services, the colour controls and the profile
-// forward to the simulation's camera response model under the camera's name,
-// which is this relay's name in its copy, and `setup` wires them together.
+//! The relay loops and their assembly: frames forward to the contract
+//! surface, the stream descriptions feed the info services, the camera
+//! geometry feeds the geometry services, the colour controls and the profile
+//! forward to the simulation's camera response model under the camera's name,
+//! which is this relay's name in its copy, and `setup` wires them together.
 
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
+use camera_core::geometry::{
+    depth_range_is_valid, depth_unit_is_valid, pinhole_is_valid, pose_is_valid,
+};
+use camera_core::relay::{
+    CONTROL_TIMEOUT, NO_GEOMETRY_MESSAGE, NO_RESPONSE_MODEL_MESSAGE, TransportFailure, Unanswered,
+    camera_name, timestamp_is_valid,
+};
+use control_core::latched_log::LatchedLog;
+use control_core::report_once::ReportOnce;
+use control_core::sync::{lock_ignoring_poison, wait_for};
+use control_core::time::RECEIVE_ERROR_BACKOFF;
 use peppygen::consumed_services::control::{
     describe_camera, reset_camera as control_reset_camera, set_camera_brightness,
     set_camera_contrast, set_camera_exposure, set_camera_gain, set_camera_white_balance,
@@ -43,33 +53,6 @@ pub fn leg_died() -> bool {
     LEG_DIED.load(Ordering::SeqCst)
 }
 
-/// Pause after a receive error before retrying, so a persistently broken
-/// subscription cannot hot-spin the relay or flood the log.
-const RECEIVE_ERROR_BACKOFF: Duration = Duration::from_millis(100);
-
-/// Bounds every call forwarded to the simulation's camera response model. A
-/// control is one round trip through the simulation's device model, so an
-/// answer later than this means the model is gone, and the caller gets an
-/// error reply of the kind `timeout` rather than a service that hangs.
-const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// The message of the error reply every forwarded call (a control, the
-/// profile, the reset) gets while the control slot is vacant: the launch
-/// linked this relay to a simulation without a camera response model, so
-/// there is nothing behind the controls to adjust, describe or reset.
-const NO_RESPONSE_MODEL_MESSAGE: &str =
-    "no camera response model is linked: nothing to adjust, describe or reset";
-
-/// The message of the error reply every geometry service gives until the
-/// simulation's first geometry arrives. The relay has no camera model of its
-/// own, and zeros handed over as a pinhole model would have a consumer divide
-/// by them.
-const NO_GEOMETRY_MESSAGE: &str = "no camera geometry received from the simulation yet";
-
-/// How far from 1 the length of the depth-to-colour quaternion may be. A
-/// quaternion that is not of unit length scales every point it turns.
-const UNIT_QUATERNION_TOLERANCE: f64 = 1e-6;
-
 /// The simulation's latest stream description; zeros until the first one arrives.
 #[derive(Clone, Default)]
 struct StreamDescription {
@@ -88,43 +71,6 @@ type SharedDescription = Arc<Mutex<StreamDescription>>;
 /// The simulation's latest camera geometry, kept as it came; none until the
 /// first one arrives.
 type SharedGeometry = Arc<Mutex<Option<simulation_geometry::Message>>>;
-
-fn timestamp_is_valid(timestamp: std::time::SystemTime) -> bool {
-    timestamp > std::time::SystemTime::UNIX_EPOCH
-}
-
-fn depth_unit_is_valid(depth_unit: f32) -> bool {
-    depth_unit.is_finite() && depth_unit > 0.0
-}
-
-/// A pinhole model a consumer can use: an image with a size, focal lengths it
-/// can divide by and a principal point that is a number.
-fn pinhole_is_valid(width: u32, height: u32, fx: f64, fy: f64, cx: f64, cy: f64) -> bool {
-    width > 0
-        && height > 0
-        && fx.is_finite()
-        && fx > 0.0
-        && fy.is_finite()
-        && fy > 0.0
-        && cx.is_finite()
-        && cy.is_finite()
-}
-
-/// A depth range a consumer can clip against: two distances, the far one
-/// beyond the near one.
-fn depth_range_is_valid(min_depth_m: f64, max_depth_m: f64) -> bool {
-    min_depth_m.is_finite()
-        && max_depth_m.is_finite()
-        && min_depth_m >= 0.0
-        && max_depth_m > min_depth_m
-}
-
-/// A pose a consumer can apply: a position made of numbers and a quaternion
-/// of unit length.
-fn pose_is_valid(position: &[f64; 3], orientation: &[f64; 4]) -> bool {
-    let length = orientation.iter().map(|c| c * c).sum::<f64>().sqrt();
-    position.iter().all(|c| c.is_finite()) && (length - 1.0).abs() <= UNIT_QUATERNION_TOLERANCE
-}
 
 /// The part of a geometry that makes it unusable, if any. A consumer turns a
 /// pixel and a depth into a position with these numbers, so one bad part
@@ -199,78 +145,19 @@ fn depth_to_color_extrinsics(
     )
 }
 
-/// Logs the first error of a run and suppresses the rest until something
-/// succeeds, then waits out the backoff. A loop whose only outcome is an error
-/// retries at the backoff interval, so without this it writes ten lines a
-/// second for the life of the node.
-#[derive(Default)]
-struct RepeatedError {
-    reported: bool,
-}
-
-impl RepeatedError {
-    /// Reports one failure, then backs off before the caller retries.
-    async fn report(&mut self, what: &str, error: impl std::fmt::Display) {
-        if !self.reported {
-            self.reported = true;
-            error!("{what} failing, suppressing repeats: {error}");
-        }
-        tokio::time::sleep(RECEIVE_ERROR_BACKOFF).await;
+/// Why a poll of the model failed with `error`. `refusal` is the error reply
+/// of the model that `error` holds, read by the member the poll went to, or
+/// `None` when `error` is no error reply.
+fn unanswered_of(error: &peppygen::Error, refusal: Option<(&'static str, String)>) -> Unanswered {
+    if let Some((kind, message)) = refusal {
+        return Unanswered::Refused { kind, message };
     }
-
-    /// Ends the run, so the next failure is reported again.
-    fn clear(&mut self) {
-        self.reported = false;
-    }
-}
-
-/// Why a forwarded call has no answer of the simulation's camera response
-/// model. Each cause gives the caller an error reply of its own kind, which
-/// `relayed_failure!` names.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Unanswered {
-    /// The model gave an error reply. Its kind, by its wire name, and its
-    /// message pass on as they came.
-    Refused { kind: &'static str, message: String },
-    /// No model is linked: the control slot is vacant.
-    NoModel,
-    /// This relay's instance id names no camera.
-    NoCamera(String),
-    /// The model gave no answer within [`CONTROL_TIMEOUT`].
-    TimedOut(String),
-    /// No model answers on the control slot.
-    Unreachable(String),
-    /// The call failed in another way, such as a request or an answer that
-    /// does not encode or decode.
-    Broken(String),
-}
-
-impl Unanswered {
-    /// Why a poll of the model failed with `error`. `refusal` is the error
-    /// reply of the model that `error` holds, read by the member the poll
-    /// went to, or `None` when `error` is no error reply.
-    fn of(error: &peppygen::Error, refusal: Option<(&'static str, String)>) -> Self {
-        if let Some((kind, message)) = refusal {
-            return Self::Refused { kind, message };
-        }
-        let message =
-            format!("forwarding to the simulation's camera response model failed: {error}");
-        match error {
-            peppygen::Error::ServiceTimeout { .. } => Self::TimedOut(message),
-            peppygen::Error::ServiceUnreachable { .. } => Self::Unreachable(message),
-            _ => Self::Broken(message),
-        }
-    }
-
-    /// Whether the call failed on its way to the model or back. An error
-    /// reply is an answer of the model, and a vacant slot or a relay that
-    /// names no camera is fixed for the life of the node.
-    fn in_transport(&self) -> bool {
-        matches!(
-            self,
-            Self::TimedOut(_) | Self::Unreachable(_) | Self::Broken(_)
-        )
-    }
+    let failure = match error {
+        peppygen::Error::ServiceTimeout { .. } => TransportFailure::TimedOut,
+        peppygen::Error::ServiceUnreachable { .. } => TransportFailure::Unreachable,
+        _ => TransportFailure::Broken,
+    };
+    Unanswered::of_transport(failure, error)
 }
 
 /// The error reply of the exposed member `$service` for a forwarded call
@@ -302,52 +189,20 @@ macro_rules! relayed_failure {
             Unanswered::NoCamera(message) => {
                 $service::Failure::new($service::FailureKind::PreconditionFailed, message)
             }
-            Unanswered::TimedOut(message) => {
-                $service::Failure::new($service::FailureKind::Timeout, message)
-            }
-            Unanswered::Unreachable(message) => {
-                $service::Failure::new($service::FailureKind::ResourceUnavailable, message)
-            }
-            Unanswered::Broken(message) => {
-                $service::Failure::new($service::FailureKind::AttemptFailed, message)
-            }
+            Unanswered::Transport {
+                failure: TransportFailure::TimedOut,
+                message,
+            } => $service::Failure::new($service::FailureKind::Timeout, message),
+            Unanswered::Transport {
+                failure: TransportFailure::Unreachable,
+                message,
+            } => $service::Failure::new($service::FailureKind::ResourceUnavailable, message),
+            Unanswered::Transport {
+                failure: TransportFailure::Broken,
+                message,
+            } => $service::Failure::new($service::FailureKind::AttemptFailed, message),
         }
     };
-}
-
-/// The camera this relay is, as the simulation names it: the relay's name
-/// in its copy. A launch mints a copy's instance ids as `<copy>_<id>`, so
-/// relay `alpha_wrist_left` of copy `alpha` is camera `wrist_left`, and a
-/// relay launched outside a copy runs under the id the launcher wrote, which
-/// is the camera's name as it is. The simulation's slot holds a pair per
-/// camera of its kind, so the slot says nothing of which camera a pair is;
-/// the relay's requests name no robot, which the simulation tells by the
-/// pair the relay holds. `Err` says why the id names no camera.
-fn camera_name(copy: Option<&str>, instance_id: &str) -> std::result::Result<String, String> {
-    let Some(copy) = copy else {
-        return Ok(instance_id.to_owned());
-    };
-    instance_id
-        .strip_prefix(copy)
-        .and_then(|rest| rest.strip_prefix('_'))
-        .filter(|name| !name.is_empty())
-        .map(str::to_owned)
-        .ok_or_else(|| {
-            format!(
-                "this relay names no camera: its instance id {instance_id:?} is not `{copy}_` followed by the camera's name in copy {copy:?}"
-            )
-        })
-}
-
-/// Runs a forwarded poll to completion from inside a synchronous service
-/// handler. The generated handlers take a plain closure, while a poll is
-/// awaitable; `block_in_place` hands this worker's queue to another runtime
-/// thread for the duration, so the relay legs and the other services keep
-/// running while this one waits on the simulation. Legal only on a
-/// multi-thread runtime, which `NodeBuilder::run` and the harness both
-/// provide.
-fn wait_for<T>(future: impl Future<Output = T>) -> T {
-    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(future))
 }
 
 /// The route from a contract call to the simulation's camera response model,
@@ -357,11 +212,11 @@ struct ControlRoute {
     /// The camera every forwarded request names, worked out once: the copy
     /// and the instance id are fixed for the life of the node.
     camera: std::result::Result<String, String>,
-    /// Whether the last forwarded call failed in transport. The first failure
-    /// is logged and the rest are suppressed until a call reaches the model:
-    /// a caller retrying against a simulation that is gone would otherwise
-    /// write a line per attempt.
-    transport_failing: AtomicBool,
+    /// The run of forwarded calls failing in transport. The first failure of
+    /// the run is logged and the rest are suppressed until a call reaches the
+    /// model, so a caller retrying against a simulation that is gone leaves
+    /// one line for the whole run.
+    transport_failures: LatchedLog,
 }
 
 impl ControlRoute {
@@ -370,7 +225,7 @@ impl ControlRoute {
         Self {
             runner,
             camera,
-            transport_failing: AtomicBool::new(false),
+            transport_failures: LatchedLog::warn("forwarding to the camera response model"),
         }
     }
 
@@ -399,7 +254,7 @@ impl ControlRoute {
         let camera = self.camera.clone().map_err(Unanswered::NoCamera)?;
         match wait_for(call(camera, target.clone())) {
             Ok(answer) => {
-                self.transport_failing.store(false, Ordering::SeqCst);
+                self.transport_failures.success();
                 Ok(answer)
             }
             Err(error) => Err(self.unanswered(&error, refusal_of(&error))),
@@ -413,11 +268,11 @@ impl ControlRoute {
         error: &peppygen::Error,
         refusal: Option<(&'static str, String)>,
     ) -> Unanswered {
-        let unanswered = Unanswered::of(error, refusal);
-        if !unanswered.in_transport() {
-            self.transport_failing.store(false, Ordering::SeqCst);
-        } else if !self.transport_failing.swap(true, Ordering::SeqCst) {
-            warn!("forwarding to the camera response model failing, suppressing repeats: {error}");
+        let unanswered = unanswered_of(error, refusal);
+        if unanswered.in_transport() {
+            self.transport_failures.failure(error);
+        } else {
+            self.transport_failures.success();
         }
         unanswered
     }
@@ -436,10 +291,10 @@ macro_rules! relay_stream {
                 Ok(p) => p,
                 Err(e) => return error!(concat!("declare ", $label, " publisher: {}"), e),
             };
-            let mut failing = false;
-            let mut dropping = false;
+            let publish_failures = LatchedLog::warn(concat!($label, " publish"));
+            let invalid_timestamps = ReportOnce::default();
             let mut first = true;
-            let mut receive_errors = RepeatedError::default();
+            let receive_errors = LatchedLog::error(concat!("simulation ", $label, " receive"));
             loop {
                 let received = tokio::select! {
                     _ = token.cancelled() => return,
@@ -449,16 +304,14 @@ macro_rules! relay_stream {
                     Ok(Some((_, msg))) => msg,
                     Ok(None) => return,
                     Err(e) => {
-                        receive_errors
-                            .report(concat!("simulation ", $label, " receive"), e)
-                            .await;
+                        receive_errors.failure(e);
+                        tokio::time::sleep(RECEIVE_ERROR_BACKOFF).await;
                         continue;
                     }
                 };
-                receive_errors.clear();
+                receive_errors.success();
                 if !timestamp_is_valid(msg.header.timestamp) {
-                    if !dropping {
-                        dropping = true;
+                    if invalid_timestamps.first_of_run() {
                         warn!(
                             concat!(
                                 "dropping ",
@@ -470,7 +323,7 @@ macro_rules! relay_stream {
                     }
                     continue;
                 }
-                dropping = false;
+                invalid_timestamps.clear();
                 let header = $emit::MessageHeader {
                     timestamp: msg.header.timestamp,
                     frame_id: msg.header.frame_id,
@@ -488,7 +341,7 @@ macro_rules! relay_stream {
                 };
                 match result {
                     Ok(()) => {
-                        failing = false;
+                        publish_failures.success();
                         if first {
                             first = false;
                             info!(concat!(
@@ -498,14 +351,7 @@ macro_rules! relay_stream {
                             ));
                         }
                     }
-                    Err(e) if !failing => {
-                        failing = true;
-                        warn!(
-                            concat!($label, " publish failing, suppressing repeats: {}"),
-                            e
-                        );
-                    }
-                    Err(_) => {}
+                    Err(e) => publish_failures.failure(e),
                 }
             }
         }
@@ -525,8 +371,8 @@ async fn track_stream_info(
         Ok(s) => s,
         Err(e) => return error!("simulation stream_info subscribe: {e}"),
     };
-    let mut rejecting = false;
-    let mut receive_errors = RepeatedError::default();
+    let invalid_stream_infos = ReportOnce::default();
+    let receive_errors = LatchedLog::error("simulation stream_info receive");
     loop {
         let received = tokio::select! {
             _ = token.cancelled() => return,
@@ -535,8 +381,7 @@ async fn track_stream_info(
         match received {
             Ok(Some((_, msg))) => {
                 if !depth_unit_is_valid(msg.depth_unit) {
-                    if !rejecting {
-                        rejecting = true;
+                    if invalid_stream_infos.first_of_run() {
                         warn!(
                             "ignoring stream_info with invalid depth_unit {}, suppressing repeats",
                             msg.depth_unit
@@ -544,10 +389,8 @@ async fn track_stream_info(
                     }
                     continue;
                 }
-                rejecting = false;
-                *description
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = StreamDescription {
+                invalid_stream_infos.clear();
+                *lock_ignoring_poison(&description) = StreamDescription {
                     width: msg.width,
                     height: msg.height,
                     frames_per_second: msg.frames_per_second,
@@ -560,9 +403,8 @@ async fn track_stream_info(
             }
             Ok(None) => return,
             Err(e) => {
-                receive_errors
-                    .report("simulation stream_info receive", e)
-                    .await;
+                receive_errors.failure(e);
+                tokio::time::sleep(RECEIVE_ERROR_BACKOFF).await;
             }
         }
     }
@@ -578,8 +420,8 @@ async fn track_geometry(
         Ok(s) => s,
         Err(e) => return error!("simulation geometry subscribe: {e}"),
     };
-    let mut rejecting = false;
-    let mut receive_errors = RepeatedError::default();
+    let unusable_geometries = ReportOnce::default();
+    let receive_errors = LatchedLog::error("simulation geometry receive");
     loop {
         let received = tokio::select! {
             _ = token.cancelled() => return,
@@ -588,55 +430,61 @@ async fn track_geometry(
         match received {
             Ok(Some((_, msg))) => {
                 if let Some(part) = unusable_part(&msg) {
-                    if !rejecting {
-                        rejecting = true;
+                    if unusable_geometries.first_of_run() {
                         warn!("ignoring geometry with an unusable {part}, suppressing repeats");
                     }
                     continue;
                 }
-                rejecting = false;
-                *geometry
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(msg);
+                unusable_geometries.clear();
+                *lock_ignoring_poison(&geometry) = Some(msg);
             }
             Ok(None) => return,
             Err(e) => {
-                receive_errors
-                    .report("simulation geometry receive", e)
-                    .await;
+                receive_errors.failure(e);
+                tokio::time::sleep(RECEIVE_ERROR_BACKOFF).await;
             }
         }
     }
 }
 
-/// Answer one service from what the simulation last said: a stream-info
-/// service from the shared stream description, a geometry service from the
-/// shared geometry. `$respond` gives the response, or the failure of an error
-/// reply.
-macro_rules! spawn_info_service {
-    ($runner:expr, $description:expr, $service:ident, $respond:expr) => {{
+/// Answer every request of `$service` with `$respond`, which maps the
+/// request to the response or the failure of an error reply, until the node
+/// stops. The first error of a run of failed requests is logged.
+macro_rules! spawn_service {
+    ($runner:expr, $service:ident, $respond:expr) => {{
         let runner = $runner.clone();
-        let description = $description.clone();
+        let respond = $respond;
         tokio::spawn(async move {
             let cancel = runner.cancellation_token().clone();
-            let mut service_errors = RepeatedError::default();
+            let service_errors = LatchedLog::error(stringify!($service));
             loop {
                 let result = tokio::select! {
                     _ = cancel.cancelled() => break,
-                    result = $service::handle_next_request(&runner, |_req| {
-                        let d = description
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .clone();
-                        $respond(d)
-                    }) => result,
+                    result = $service::handle_next_request(&runner, &respond) => result,
                 };
                 match result {
-                    Ok(()) => service_errors.clear(),
-                    Err(e) => service_errors.report(stringify!($service), e).await,
+                    Ok(()) => service_errors.success(),
+                    Err(e) => {
+                        service_errors.failure(e);
+                        tokio::time::sleep(RECEIVE_ERROR_BACKOFF).await;
+                    }
                 }
             }
         });
+    }};
+}
+
+/// Answer one service from what the simulation last said in `$said`:
+/// a stream-info service from the shared stream description, a geometry
+/// service from the shared geometry. `$respond` gives the response, or the
+/// failure of an error reply.
+macro_rules! spawn_info_service {
+    ($runner:expr, $said:expr, $service:ident, $respond:expr) => {{
+        let said = $said.clone();
+        spawn_service!($runner, $service, move |_request| {
+            let latest = lock_ignoring_poison(&said).clone();
+            $respond(latest)
+        })
     }};
 }
 
@@ -662,23 +510,8 @@ macro_rules! spawn_geometry_service {
 macro_rules! spawn_forwarding_service {
     ($route:expr, $service:ident, $answer:expr) => {{
         let route: Arc<ControlRoute> = $route.clone();
-        tokio::spawn(async move {
-            let runner = route.runner.clone();
-            let cancel = runner.cancellation_token().clone();
-            let mut service_errors = RepeatedError::default();
-            loop {
-                let result = tokio::select! {
-                    _ = cancel.cancelled() => break,
-                    result = $service::handle_next_request(&runner, |request| {
-                        ($answer)(&route, request)
-                    }) => result,
-                };
-                match result {
-                    Ok(()) => service_errors.clear(),
-                    Err(e) => service_errors.report(stringify!($service), e).await,
-                }
-            }
-        });
+        let runner = route.runner.clone();
+        spawn_service!(runner, $service, move |request| ($answer)(&route, request))
     }};
 }
 
@@ -841,66 +674,6 @@ pub async fn setup(_params: Parameters, node_runner: Arc<NodeRunner>) -> Result<
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_relay_in_a_copy_is_the_camera_its_id_names_after_the_copy() {
-        assert_eq!(
-            camera_name(Some("alpha"), "alpha_wrist_left"),
-            Ok("wrist_left".to_owned())
-        );
-        // Only the copy's own prefix comes off: a camera may carry the
-        // copy's name in its own.
-        assert_eq!(
-            camera_name(Some("alpha"), "alpha_alpha_front"),
-            Ok("alpha_front".to_owned())
-        );
-    }
-
-    #[test]
-    fn a_relay_outside_a_copy_is_the_camera_its_id_names() {
-        assert_eq!(camera_name(None, "wrist_left"), Ok("wrist_left".to_owned()));
-        assert_eq!(
-            camera_name(None, "alpha_wrist_left"),
-            Ok("alpha_wrist_left".to_owned())
-        );
-    }
-
-    #[test]
-    fn an_id_that_is_no_name_in_its_copy_names_no_camera() {
-        // Another copy's prefix, the copy's name run into the camera's, the
-        // copy's name alone, and the bare prefix.
-        for instance_id in ["bravo_wrist_left", "alphawrist_left", "alpha", "alpha_"] {
-            let unnamed = camera_name(Some("alpha"), instance_id).unwrap_err();
-            assert!(
-                unnamed.contains("names no camera") && unnamed.contains(instance_id),
-                "{unnamed}"
-            );
-        }
-    }
-
-    #[test]
-    fn timestamp_guard_rejects_epoch_and_earlier() {
-        use std::time::{Duration, SystemTime};
-
-        assert!(timestamp_is_valid(
-            SystemTime::UNIX_EPOCH + Duration::from_secs(1)
-        ));
-        assert!(!timestamp_is_valid(SystemTime::UNIX_EPOCH));
-        assert!(!timestamp_is_valid(
-            SystemTime::UNIX_EPOCH - Duration::from_secs(1)
-        ));
-    }
-
-    #[test]
-    fn depth_unit_guard_rejects_nonpositive_and_nonfinite() {
-        assert!(depth_unit_is_valid(0.001));
-        assert!(!depth_unit_is_valid(0.0));
-        assert!(!depth_unit_is_valid(-0.0));
-        assert!(!depth_unit_is_valid(-0.001));
-        assert!(!depth_unit_is_valid(f32::NAN));
-        assert!(!depth_unit_is_valid(f32::INFINITY));
-        assert!(!depth_unit_is_valid(f32::NEG_INFINITY));
-    }
-
     /// The chest camera as the engines publish it: 1280x720 colour, 640x360
     /// depth from the same 52 degree view, aligned.
     fn chest_geometry() -> simulation_geometry::Message {
@@ -928,56 +701,6 @@ mod tests {
             depth_to_color_position: [0.0, 0.0, 0.0],
             depth_to_color_orientation: [0.0, 0.0, 0.0, 1.0],
         }
-    }
-
-    #[test]
-    fn pinhole_guard_wants_a_size_and_focal_lengths_to_divide_by() {
-        assert!(pinhole_is_valid(1280, 720, 738.1, 738.1, 639.5, 359.5));
-        // A principal point off the image is still a camera: a cropped or
-        // shifted sensor has one.
-        assert!(pinhole_is_valid(1280, 720, 738.1, 738.1, -12.0, 900.0));
-        assert!(!pinhole_is_valid(0, 720, 738.1, 738.1, 639.5, 359.5));
-        assert!(!pinhole_is_valid(1280, 0, 738.1, 738.1, 639.5, 359.5));
-        for focal in [0.0, -738.1, f64::NAN, f64::INFINITY] {
-            assert!(!pinhole_is_valid(1280, 720, focal, 738.1, 639.5, 359.5));
-            assert!(!pinhole_is_valid(1280, 720, 738.1, focal, 639.5, 359.5));
-        }
-        assert!(!pinhole_is_valid(1280, 720, 738.1, 738.1, f64::NAN, 359.5));
-        assert!(!pinhole_is_valid(
-            1280,
-            720,
-            738.1,
-            738.1,
-            639.5,
-            f64::INFINITY
-        ));
-    }
-
-    #[test]
-    fn depth_range_guard_wants_the_far_limit_beyond_the_near_one() {
-        assert!(depth_range_is_valid(0.1, 10.0));
-        assert!(depth_range_is_valid(0.0, 10.0));
-        assert!(!depth_range_is_valid(10.0, 0.1));
-        assert!(!depth_range_is_valid(1.0, 1.0));
-        assert!(!depth_range_is_valid(-0.1, 10.0));
-        assert!(!depth_range_is_valid(f64::NAN, 10.0));
-        assert!(!depth_range_is_valid(0.1, f64::INFINITY));
-    }
-
-    #[test]
-    fn pose_guard_wants_a_unit_quaternion() {
-        // Ten degrees about the optical axis, as a unit quaternion.
-        let half_angle = 5f64.to_radians();
-        assert!(pose_is_valid(&[0.0; 3], &[0.0, 0.0, 0.0, 1.0]));
-        assert!(pose_is_valid(
-            &[-0.015, 0.0, 0.0],
-            &[0.0, 0.0, half_angle.sin(), half_angle.cos()]
-        ));
-        // All zeros is what an unset field reads, and it turns nothing.
-        assert!(!pose_is_valid(&[0.0; 3], &[0.0; 4]));
-        assert!(!pose_is_valid(&[0.0; 3], &[0.0, 0.0, 0.0, 2.0]));
-        assert!(!pose_is_valid(&[0.0; 3], &[f64::NAN, 0.0, 0.0, 1.0]));
-        assert!(!pose_is_valid(&[f64::NAN, 0.0, 0.0], &[0.0, 0.0, 0.0, 1.0]));
     }
 
     #[test]
@@ -1045,7 +768,7 @@ mod tests {
     fn an_error_reply_of_the_model_passes_on_with_its_kind_and_its_message() {
         for kind in set_camera_gain::FailureKind::ALL {
             let error = peppygen::Error::Deserialization("an error reply".to_owned());
-            let unanswered = Unanswered::of(
+            let unanswered = unanswered_of(
                 &error,
                 Some((kind.as_str(), "gain 9000 is above 255".to_owned())),
             );
@@ -1059,21 +782,21 @@ mod tests {
 
     #[test]
     fn a_call_that_gets_no_answer_gives_the_kind_of_its_cause() {
-        let timed_out = Unanswered::of(
+        let timed_out = unanswered_of(
             &peppygen::Error::ServiceTimeout {
                 instance_id: Some("sim".to_owned()),
                 service_name: "set_camera_gain".to_owned(),
             },
             None,
         );
-        let unreachable = Unanswered::of(
+        let unreachable = unanswered_of(
             &peppygen::Error::ServiceUnreachable {
                 instance_id: Some("sim".to_owned()),
                 service_name: "set_camera_gain".to_owned(),
             },
             None,
         );
-        let broken = Unanswered::of(
+        let broken = unanswered_of(
             &peppygen::Error::Deserialization("a response that does not decode".to_owned()),
             None,
         );

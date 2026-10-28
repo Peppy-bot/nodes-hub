@@ -1422,7 +1422,7 @@ class SimLauncher:
                         "Scene loaded; states will flow"
                     )
 
-            # Execute commands received by commander.py.
+            # Execute commands received by scripts/runtime_command.py.
             #
             # This deliberately happens in the Isaac simulation
             # thread rather than the TCP listener thread.

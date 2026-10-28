@@ -25,7 +25,7 @@ from peppygen.fixtures.exposed_services.recording import finish_session
 from peppygen.paired_topics.commanded_joints import joint_setpoints
 from peppygen.paired_topics.observed_joints import joint_states
 from peppygen.parameters import Parameters
-from tests.test_recording import make_params
+from tests.support import make_params
 
 FPS = 10
 # The geometry the sink integration suite proves out: smaller frames stall

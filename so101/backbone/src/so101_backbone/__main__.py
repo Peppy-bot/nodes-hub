@@ -18,20 +18,20 @@ from peppygen.exposed_actions.limb_motion import move_arm, move_arm_joints, move
 from peppygen.exposed_actions.postures import move_to_home, move_to_ready
 from peppygen.exposed_services.limb_motion import check_arm_move, stop
 from peppygen.exposed_services.limb_state import get_limb_names
-from peppygen.paired_topics.arm import joint_setpoints as down_joint_setpoints
-from peppygen.paired_topics.arm import joint_states as down_joint_states
+from peppygen.paired_topics.arm import joint_setpoints as follower_joint_setpoints
+from peppygen.paired_topics.arm import joint_states as follower_joint_states
 from peppygen.paired_topics.gripper import (
-    gripper_setpoints as down_gripper_setpoints,
+    gripper_setpoints as follower_gripper_setpoints,
 )
-from peppygen.paired_topics.gripper import gripper_states as down_gripper_states
-from peppygen.paired_topics.leader_arm import joint_setpoints as up_joint_setpoints
-from peppygen.paired_topics.leader_arm import joint_states as up_joint_states
+from peppygen.paired_topics.gripper import gripper_states as follower_gripper_states
+from peppygen.paired_topics.leader_arm import joint_setpoints as leader_joint_setpoints
+from peppygen.paired_topics.leader_arm import joint_states as leader_joint_states
 from peppygen.paired_topics.leader_gripper import (
-    gripper_setpoints as up_gripper_setpoints,
+    gripper_setpoints as leader_gripper_setpoints,
 )
-from peppygen.paired_topics.leader_gripper import gripper_states as up_gripper_states
-from peppygen.paired_topics.leader_pose import pose_setpoints as up_pose_setpoints
-from peppygen.paired_topics.leader_pose import pose_states as up_pose_states
+from peppygen.paired_topics.leader_gripper import gripper_states as leader_gripper_states
+from peppygen.paired_topics.leader_pose import pose_setpoints as leader_pose_setpoints
+from peppygen.paired_topics.leader_pose import pose_states as leader_pose_states
 from peppygen.parameters import Parameters
 from so101_description import limits as limits_mod
 from so101_description import postures, units
@@ -39,17 +39,22 @@ from so101_description.kinematics import Kinematics
 from so101_description.limbs import ARM_LIMB, GRIPPER_LIMB
 from so101_description.model import KINEMATICS_URDF_PATH
 from so101_description.setpoints import parse_gripper_setpoint, parse_joint_setpoints
+from so101_description.staleness import WIRE_AGE_LIMIT_S
 
 from so101_backbone import params as params_mod
 from so101_backbone import workspace_service
-from so101_backbone.actions import ActionLayer, PendingSlot, Refusal, serve
-from so101_backbone.coordinator import (
-    STALE_WIRE_TIMEOUT_S,
-    Coordinator,
+from so101_backbone.actions import (
+    ActionLayer,
+    PendingSlot,
+    drive_taking,
+    note_ignored_max_effort,
+    serve_action,
 )
+from so101_backbone.coordinator import Coordinator
+from so101_backbone.failures import Refusal
 from so101_backbone.params import UpstreamMode
 from so101_backbone.reach import fit_reach_ball
-from so101_backbone.setpoints import parse_pose_setpoint
+from so101_backbone.wire import parse_arm_states, parse_gripper_states, parse_pose_setpoint
 from so101_backbone.workspace import ReachWorker
 
 runtime.configure("so101_backbone")
@@ -82,8 +87,8 @@ def _limb_names(_request) -> get_limb_names.Response:
 async def _run_control(
     node_runner: NodeRunner, coordinator: Coordinator, period_s: float, token: CancellationToken
 ):
-    arm_pub = await down_joint_setpoints.declare_publisher(node_runner)
-    gripper_pub = await down_gripper_setpoints.declare_publisher(node_runner)
+    arm_pub = await follower_joint_setpoints.declare_publisher(node_runner)
+    gripper_pub = await follower_gripper_setpoints.declare_publisher(node_runner)
     arm_computing = runtime.Latch()
     gripper_computing = runtime.Latch()
     arm_failing = runtime.Latch()
@@ -134,7 +139,7 @@ async def _run_control(
                 arm_failing,
                 coordinator.arm_published,
                 arm_target,
-                lambda command: down_joint_setpoints.build_message(
+                lambda command: follower_joint_setpoints.build_message(
                     stamped(coordinator.arm_tick_stamp_s), list(command), [], []
                 ),
                 "arm setpoint",
@@ -145,7 +150,7 @@ async def _run_control(
                 gripper_failing,
                 coordinator.gripper_published,
                 gripper_target,
-                lambda command: down_gripper_setpoints.build_message(
+                lambda command: follower_gripper_setpoints.build_message(
                     stamped(coordinator.gripper_tick_stamp_s), command, 0.0
                 ),
                 "gripper setpoint",
@@ -209,22 +214,10 @@ async def _relay_states(
             failing.trip(f"{label} relay failing: {e!r}")
 
 
-def _parse_arm_states(m):
-    positions = tuple(m.positions)
-    if (
-        len(positions) != units.NUM_JOINTS
-        or len(m.velocities) not in (0, units.NUM_JOINTS)
-        or len(m.efforts) not in (0, units.NUM_JOINTS)
-        or not all(math.isfinite(v) for v in (*positions, *m.velocities, *m.efforts))
-    ):
-        return None
-    return positions
-
-
 def _adopt_arm_states(coordinator: Coordinator):
     def apply(m, positions):
         coordinator.measured_joints.set(positions, wire_timestamp_s=m.timestamp)
-        return up_joint_states.build_message(
+        return leader_joint_states.build_message(
             m.timestamp, list(m.positions), list(m.velocities), list(m.efforts)
         )
 
@@ -234,16 +227,9 @@ def _adopt_arm_states(coordinator: Coordinator):
 def _adopt_gripper_states(coordinator: Coordinator):
     def apply(m, opening):
         coordinator.measured_gripper.set(opening, wire_timestamp_s=m.timestamp)
-        return up_gripper_states.build_message(m.timestamp, opening, m.effort, m.max_effort)
+        return leader_gripper_states.build_message(m.timestamp, opening, m.effort, m.max_effort)
 
     return apply
-
-
-def _parse_gripper_states(m):
-    if not all(math.isfinite(v) for v in (m.opening, m.effort, m.max_effort)):
-        return None
-    # One truth: the contract-range opening anchors motion and relays.
-    return min(max(float(m.opening), 0.0), 1.0)
 
 
 async def _publish_readouts(
@@ -251,7 +237,6 @@ async def _publish_readouts(
     coordinator: Coordinator,
     kinematics: Kinematics,
     pose_mode: bool,
-    state_timeout_s: float,
     token: CancellationToken,
 ):
     """The FK-backed readouts, one solve per snapshot: limb_states (the
@@ -259,10 +244,10 @@ async def _publish_readouts(
     partial robot is not a snapshot) and, in pose mode, the pose_states
     relay on the leader slot. Stamps are the measurement's capture time."""
     limb_publisher = await limb_states.declare_publisher(node_runner)
-    pose_publisher = await up_pose_states.declare_publisher(node_runner) if pose_mode else None
+    pose_publisher = await leader_pose_states.declare_publisher(node_runner) if pose_mode else None
     failing = runtime.Latch()
     async for _ in runtime.ticks(_READOUT_PERIOD_S, token):
-        measured = coordinator.measured_joints.fresh(state_timeout_s)
+        measured = coordinator.fresh_measured_joints()
         if measured is None:
             continue
         try:
@@ -273,9 +258,9 @@ async def _publish_readouts(
             position, orientation = kinematics.forward_kinematics(measured)
             if pose_publisher is not None:
                 await pose_publisher.publish(
-                    up_pose_states.build_message(timestamp, list(position), list(orientation))
+                    leader_pose_states.build_message(timestamp, list(position), list(orientation))
                 )
-            opening = coordinator.measured_gripper.fresh(state_timeout_s)
+            opening = coordinator.fresh_measured_gripper()
             if opening is not None:
                 await limb_publisher.publish(
                     limb_states.build_message(
@@ -340,15 +325,9 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
 
     def on_gripper_setpoints(m):
         opening = parse_gripper_setpoint(m.opening, m.max_effort)
-        if m.max_effort > 0.0:
-            # Legal leader intent this hardware cannot honor; the opening
-            # still streams, and the follower's states already advertise
-            # max_effort 0 (no effort control).
-            effort_unsupported.trip(
-                "leader max_effort ignored: gripper ceiling is fixed in firmware"
-            )
-        else:
-            effort_unsupported.clear()
+        # The opening still streams, and the follower's states already
+        # advertise max_effort 0 (no effort control).
+        note_ignored_max_effort(effort_unsupported, m.max_effort, "leader")
         coordinator.leader_gripper.set(opening, wire_timestamp_s=m.timestamp)
 
     tasks = [
@@ -356,30 +335,30 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
         asyncio.create_task(
             _relay_states(
                 node_runner,
-                source_module=down_joint_states,
-                sink_module=up_joint_states,
+                source_module=follower_joint_states,
+                sink_module=leader_joint_states,
                 label="arm joint_states",
-                state_timeout_s=STALE_WIRE_TIMEOUT_S,
+                state_timeout_s=WIRE_AGE_LIMIT_S,
                 token=token,
-                parse=_parse_arm_states,
+                parse=parse_arm_states,
                 apply=_adopt_arm_states(coordinator),
             )
         ),
         asyncio.create_task(
             _relay_states(
                 node_runner,
-                source_module=down_gripper_states,
-                sink_module=up_gripper_states,
+                source_module=follower_gripper_states,
+                sink_module=leader_gripper_states,
                 label="gripper_states",
-                state_timeout_s=STALE_WIRE_TIMEOUT_S,
+                state_timeout_s=WIRE_AGE_LIMIT_S,
                 token=token,
-                parse=_parse_gripper_states,
+                parse=parse_gripper_states,
                 apply=_adopt_gripper_states(coordinator),
             )
         ),
         asyncio.create_task(
             _consume(
-                node_runner, up_gripper_setpoints, STALE_WIRE_TIMEOUT_S, token,
+                node_runner, leader_gripper_setpoints, WIRE_AGE_LIMIT_S, token,
                 "leader gripper_setpoints", on_gripper_setpoints,
             )
         ),
@@ -393,7 +372,7 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
         tasks.append(
             asyncio.create_task(
                 _consume(
-                    node_runner, up_joint_setpoints, STALE_WIRE_TIMEOUT_S, token,
+                    node_runner, leader_joint_setpoints, WIRE_AGE_LIMIT_S, token,
                     "leader joint_setpoints", on_joint_setpoints,
                 )
             )
@@ -402,23 +381,17 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
         tasks.append(
             asyncio.create_task(
                 _consume(
-                    node_runner, up_pose_setpoints, STALE_WIRE_TIMEOUT_S, token,
+                    node_runner, leader_pose_setpoints, WIRE_AGE_LIMIT_S, token,
                     "leader pose_setpoints", on_pose_setpoints,
                 )
             )
         )
 
-    def drive_with(driver, pending):
-        def spawn(ctx):
-            return driver(ctx, pending.take())
-
-        return spawn
-
     def server(module, make_decide, driver, label):
         # One pending slot per server: a failed delivery on one action can
         # only ever walk back its own admission.
         pending = PendingSlot()
-        return (module, make_decide(pending), drive_with(driver, pending), pending, label)
+        return (module, make_decide(pending), drive_taking(pending, driver), pending, label)
 
     def drive_posture(ctx, plan):
         return layer.drive_posture(ctx, plan, kinematics)
@@ -442,7 +415,9 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
                layer.drive_gripper, "move_gripper"),
     ]
     tasks.extend(
-        asyncio.create_task(serve(node_runner, module, token, decide, drive, layer, pending, label))
+        asyncio.create_task(
+            serve_action(node_runner, module, token, decide, drive, layer, pending, label)
+        )
         for module, decide, drive, pending, label in action_servers
     )
 
@@ -475,8 +450,7 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
         asyncio.create_task(
             _publish_readouts(
                 node_runner, coordinator, kinematics,
-                config.upstream_mode is UpstreamMode.POSE,
-                coordinator.follower_state_timeout_s, token,
+                config.upstream_mode is UpstreamMode.POSE, token,
             )
         )
     )

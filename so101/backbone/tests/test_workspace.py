@@ -37,11 +37,10 @@ from workspace_core_py import (
 )
 
 from so101_backbone import workspace as workspace_module
-from so101_backbone.failures import FailureKind
+from so101_backbone.failures import FailureKind, Refusal
 from so101_backbone.workspace import (
     CHUNK_TARGETS,
     ReachWorker,
-    Refused,
     Target,
     Workspace,
     reach_of,
@@ -228,10 +227,10 @@ async def test_a_surface_height_asked_again_answers_from_the_reach_measured_for_
 async def test_a_reach_not_measured_refuses_the_request_and_stores_nothing():
     reaches = FakeReaches(
         reached_near_the_middle,
-        failures=[Refused(FailureKind.ATTEMPT_FAILED, "the worker ended")],
+        failures=[Refusal(FailureKind.ATTEMPT_FAILED, "the worker ended")],
     )
     workspace = Workspace(reaches)
-    with pytest.raises(Refused, match="^the worker ended$") as raised:
+    with pytest.raises(Refusal, match="^the worker ended$") as raised:
         await workspace.describe(0.1)
     assert raised.value.kind is FailureKind.ATTEMPT_FAILED
     answer = await workspace.describe(0.1)
@@ -273,7 +272,7 @@ async def test_a_height_that_is_not_a_surface_height_of_a_request_is_refused_unm
     surface_height, reason
 ):
     reaches = FakeReaches(reached_near_the_middle)
-    with pytest.raises(Refused, match=f"^{reason}$") as raised:
+    with pytest.raises(Refusal, match=f"^{reason}$") as raised:
         await Workspace(reaches).describe(surface_height)
     assert raised.value.kind is FailureKind.REJECTED
     assert reaches.calls == []
@@ -293,7 +292,7 @@ async def test_a_height_that_is_not_a_surface_height_of_a_request_is_refused_unm
 )
 async def test_values_that_are_not_points_of_a_request_are_refused_unmeasured(wire, reason):
     reaches = FakeReaches(reached_near_the_middle)
-    with pytest.raises(Refused, match=f"^{reason}$") as raised:
+    with pytest.raises(Refusal, match=f"^{reason}$") as raised:
         await Workspace(reaches).check(wire)
     assert raised.value.kind is FailureKind.REJECTED
     assert reaches.calls == []
@@ -365,7 +364,7 @@ async def test_one_spawned_worker_serves_every_request_and_ends_on_close(worker)
 
     worker.close()
     assert_ends(process.sentinel)
-    with pytest.raises(Refused, match="^the node is shutting down$") as raised:
+    with pytest.raises(Refusal, match="^the node is shutting down$") as raised:
         await worker.reaches([NEAR])
     assert raised.value.kind is FailureKind.RESOURCE_UNAVAILABLE
     assert spawned_since(before | {process.pid}) == []
@@ -374,7 +373,7 @@ async def test_one_spawned_worker_serves_every_request_and_ends_on_close(worker)
 async def test_a_target_the_solver_refuses_refuses_the_request_and_the_worker_serves_on(worker):
     before = children_pids()
     with pytest.raises(
-        Refused, match=r"^the reach could not be measured: ValueError\("
+        Refusal, match=r"^the reach could not be measured: ValueError\("
     ) as raised:
         await worker.reaches([NEAR, (math.nan, 0.0, 0.0)])
     assert raised.value.kind is FailureKind.ATTEMPT_FAILED
@@ -451,7 +450,7 @@ async def test_a_worker_that_ends_while_it_holds_a_chunk_refuses_its_request(wor
     await next_sent(sent_chunks)
     os.kill(ended.pid, signal.SIGKILL)
 
-    with pytest.raises(Refused, match="^the reach worker ended: ") as raised:
+    with pytest.raises(Refusal, match="^the reach worker ended: ") as raised:
         await outcome_of(request)
     assert raised.value.kind is FailureKind.ATTEMPT_FAILED
     # The next request starts another worker.
@@ -517,7 +516,7 @@ async def test_a_stored_height_answers_without_the_worker(worker):
     worker.close()
     stored = await workspace.describe(0.0)
     assert surface_fields(stored) == surface_fields(measured)
-    with pytest.raises(Refused, match="^the node is shutting down$"):
+    with pytest.raises(Refusal, match="^the node is shutting down$"):
         await workspace.describe(0.1)
 
 
@@ -636,6 +635,6 @@ async def test_close_lets_the_worker_end_after_the_chunk_it_holds_and_refuses_th
     # close() does not wait for the worker: the event loop goes on.
     assert held_pool.shutdowns == [False]
     held.set_result(answered(first))
-    with pytest.raises(Refused, match="^the node is shutting down$"):
+    with pytest.raises(Refusal, match="^the node is shutting down$"):
         await outcome_of(request)
     assert held_pool.sent.empty()

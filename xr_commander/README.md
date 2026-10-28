@@ -301,10 +301,11 @@ full list and defaults.
 
 ## Development
 
-`frames`, `devices`, `clutch`, `config`, `addresses`, `tls`, `robot_choice`,
-`robots`, `sensor_hold`, and the decode half of `video` are pure of peppy;
-`publish` and `status` import the generated modules, so the full suite needs
-the synced environment (and nothing served):
+`__main__`, `publish` and `page` import the generated modules, `panel`
+imports them through `publish`, and `sensor_hold` imports peppylib; every
+other module is pure of peppy. The tests drive the generated modules through
+the peppygen harness, so the full suite needs the synced environment (and
+nothing served):
 
 ```bash
 peppy node sync   # resolves the peppygen/peppylib path dependencies uv needs

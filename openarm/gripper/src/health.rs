@@ -9,54 +9,37 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use control_core::latched_log::LatchedLog;
 use control_core::motor_health::{
     AlertRaiser, DriverTempC, HEALTH_PERIOD, MOTOR_ALERT_KIND, MotorHealth, MotorHealthFilter,
     MotorSample, Ratings, STATE_STALE_AFTER, WindingTempC,
 };
+use control_core::sync::lock_ignoring_poison;
+use control_core::time;
 use openarm_can::GripperState;
 use peppygen::NodeRunner;
 use peppygen::emitted_topics::alerts::alerts;
 use peppygen::emitted_topics::motor_health::motor_health;
 use peppylib::runtime::CancellationToken;
-use tracing::{error, warn};
+use tracing::error;
 
-use crate::drive;
 use crate::hardware::Gripper;
 
-/// Warn once per failure burst instead of once per tick: one line when a
-/// publish starts failing, silence while it keeps failing, re-armed by the
-/// first success.
-pub(crate) struct LatchedWarn {
-    context: &'static str,
-    failing: bool,
-}
-
-impl LatchedWarn {
-    pub(crate) fn new(context: &'static str) -> Self {
-        Self {
-            context,
-            failing: false,
-        }
-    }
-
-    pub(crate) fn failure(&mut self, error: &str) {
-        if !self.failing {
-            self.failing = true;
-            warn!("{} failing, suppressing repeats: {error}", self.context);
-        }
-    }
-
-    pub(crate) fn success(&mut self) {
-        self.failing = false;
-    }
-}
-
-/// Capture timestamp from this instance's bound clock, so consumers age
-/// samples on the same timeline they read. Errors until the clock delivers
-/// its first tick.
-pub(crate) fn capture_timestamp() -> Result<SystemTime, String> {
+/// Now on this instance's bound clock: the timeline its messages are
+/// stamped and aged on. Errors until the clock delivers its first tick.
+pub(crate) fn clock_now() -> Result<SystemTime, String> {
     let ns = peppygen::clock::now_ns().map_err(|e| format!("clock not ready: {e}"))?;
     Ok(UNIX_EPOCH + Duration::from_nanos(ns))
+}
+
+/// One round's health report, the instantaneous effort fractions it was
+/// judged from (against the continuous rating and against the peak), and the
+/// clock reading it was taken at.
+struct HealthSample {
+    report: MotorHealth,
+    effort_fraction_rated: f64,
+    effort_fraction_peak: f64,
+    captured: SystemTime,
 }
 
 /// One tick's health for the single gripper motor: the filter's report, fed
@@ -122,14 +105,14 @@ pub async fn run(
         Ok(p) => p,
         Err(e) => return error!("declare alerts publisher: {e}"),
     };
-    let stale_after = drive::ticks_within(STATE_STALE_AFTER, cycle_period);
+    let stale_after = time::ticks_within(STATE_STALE_AFTER, cycle_period);
     let mut filter = MotorHealthFilter::new(ratings);
     let mut raiser = AlertRaiser::new([alert_source]);
     let mut ticker = tokio::time::interval(HEALTH_PERIOD);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut health_warn = LatchedWarn::new("motor_health publish");
-    let mut readings_warn = LatchedWarn::new("health readings");
-    let mut alert_warn = LatchedWarn::new("alert publish");
+    let health_warn = LatchedLog::warn("motor_health publish");
+    let readings_warn = LatchedLog::warn("health readings");
+    let alert_warn = LatchedLog::warn("alert publish");
     let mut last_step: Option<SystemTime> = None;
     let mut final_round = false;
     loop {
@@ -145,10 +128,10 @@ pub async fn run(
         // timestamps are read on. A backward step falls back to the cadence;
         // a paused clock yields dt 0, which the filter takes as no elapsed
         // time.
-        let timestamp = match capture_timestamp() {
+        let timestamp = match clock_now() {
             Ok(timestamp) => timestamp,
             Err(e) => {
-                health_warn.failure(&e);
+                health_warn.failure(e);
                 if final_round {
                     return;
                 }
@@ -160,24 +143,18 @@ pub async fn run(
             .unwrap_or(HEALTH_PERIOD)
             .as_secs_f64();
         last_step = Some(timestamp);
-        let state = gripper
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get_state();
+        let state = lock_ignoring_poison(&gripper).get_state();
         let report = judge(&state, &mut filter, stale_after, dt_s);
-        let (now_rated, now_peak) = fractions(&state, ratings);
+        let (effort_fraction_rated, effort_fraction_peak) = fractions(&state, ratings);
+        let sample = HealthSample {
+            report,
+            effort_fraction_rated,
+            effort_fraction_peak,
+            captured: timestamp,
+        };
 
-        publish_report(
-            &health_pub,
-            timestamp,
-            &report,
-            now_rated,
-            now_peak,
-            &mut health_warn,
-            &mut readings_warn,
-        )
-        .await;
-        publish_due_alerts(&alert_pub, &mut raiser, &report, &mut alert_warn).await;
+        publish_report(&health_pub, &sample, &health_warn, &readings_warn).await;
+        publish_due_alerts(&alert_pub, &mut raiser, &sample.report, &alert_warn).await;
 
         if final_round {
             return;
@@ -191,17 +168,13 @@ pub async fn run(
 /// enable confirmation is supposed to make impossible.
 async fn publish_report(
     publisher: &peppylib::TopicPublisher,
-    timestamp: SystemTime,
-    report: &MotorHealth,
-    now_rated: f64,
-    now_peak: f64,
-    publish_warn: &mut LatchedWarn,
-    readings_warn: &mut LatchedWarn,
+    sample: &HealthSample,
+    publish_warn: &LatchedLog,
+    readings_warn: &LatchedLog,
 ) {
-    let built = build_health_message(timestamp, report, now_rated, now_peak);
-    let (message, degraded) = match built {
+    let (message, degraded) = match build_health_message(sample) {
         Ok(built) => built,
-        Err(e) => return publish_warn.failure(&e),
+        Err(e) => return publish_warn.failure(e),
     };
     match degraded {
         true => readings_warn.failure("the motor carries a non-finite reading"),
@@ -209,7 +182,7 @@ async fn publish_report(
     }
     match publisher.publish(message).await {
         Ok(()) => publish_warn.success(),
-        Err(e) => publish_warn.failure(&e.to_string()),
+        Err(e) => publish_warn.failure(e),
     }
 }
 
@@ -221,7 +194,7 @@ async fn publish_due_alerts(
     publisher: &peppylib::TopicPublisher,
     raiser: &mut AlertRaiser<1>,
     report: &MotorHealth,
-    warn: &mut LatchedWarn,
+    warn: &LatchedLog,
 ) {
     let now = Instant::now();
     let Some(set) = raiser.due(std::array::from_ref(report), now) else {
@@ -238,7 +211,7 @@ async fn publish_due_alerts(
                 message: alert.message.clone(),
             })
             .collect();
-        let msg = alerts::build_message(capture_timestamp()?, active).map_err(|e| e.to_string())?;
+        let msg = alerts::build_message(clock_now()?, active).map_err(|e| e.to_string())?;
         publisher.publish(msg).await.map_err(|e| e.to_string())
     }
     .await;
@@ -247,11 +220,11 @@ async fn publish_due_alerts(
             raiser.mark_sent(&set, now);
             warn.success();
         }
-        Err(e) => warn.failure(&e),
+        Err(e) => warn.failure(e),
     }
 }
 
-/// One wire message from a tick's report, and whether it was degraded to
+/// One wire message from a round's sample, and whether it was degraded to
 /// levels-only.
 ///
 /// The level always publishes. The reading vectors publish all together or
@@ -259,16 +232,12 @@ async fn publish_due_alerts(
 /// value (a motor that never reported, which bring-up refuses) empties every
 /// reading vector rather than fabricating a number. The level still names
 /// the quiet motor.
-fn build_health_message(
-    timestamp: SystemTime,
-    report: &MotorHealth,
-    now_rated: f64,
-    now_peak: f64,
-) -> Result<(peppylib::Payload, bool), String> {
+fn build_health_message(sample: &HealthSample) -> Result<(peppylib::Payload, bool), String> {
+    let report = &sample.report;
     let readings = [
-        now_rated,
+        sample.effort_fraction_rated,
         report.torque_fraction,
-        now_peak,
+        sample.effort_fraction_peak,
         report.driver_temp.0,
         report.winding_temp.0,
     ];
@@ -278,7 +247,7 @@ fn build_health_message(
         false => readings.map(|v| vec![v]),
     };
     let payload = motor_health::build_message(
-        timestamp,
+        sample.captured,
         vec![report.level.wire()],
         rated,
         sustained,
@@ -399,10 +368,14 @@ mod tests {
         let mut f = filter();
         let state = driving(0);
         let report = judge(&state, &mut f, 50, 0.2);
-        let (now_rated, now_peak) = fractions(&state, datasheet_ratings());
-        let (_, degraded) =
-            build_health_message(SystemTime::UNIX_EPOCH, &report, now_rated, now_peak)
-                .expect("builds");
+        let (effort_fraction_rated, effort_fraction_peak) = fractions(&state, datasheet_ratings());
+        let sample = HealthSample {
+            report,
+            effort_fraction_rated,
+            effort_fraction_peak,
+            captured: SystemTime::UNIX_EPOCH,
+        };
+        let (_, degraded) = build_health_message(&sample).expect("builds");
         assert!(!degraded, "finite readings publish in full");
     }
 
@@ -411,12 +384,16 @@ mod tests {
         // A never-reported motor has no measurements to carry; the level
         // still publishes (naming it as not reporting) with every reading
         // vector empty, per the contract's not-sensed convention.
-        let report = filter().silent();
-        let (_, degraded) =
-            build_health_message(SystemTime::UNIX_EPOCH, &report, 0.0, 0.0).expect("still builds");
+        let sample = HealthSample {
+            report: filter().silent(),
+            effort_fraction_rated: 0.0,
+            effort_fraction_peak: 0.0,
+            captured: SystemTime::UNIX_EPOCH,
+        };
+        let (_, degraded) = build_health_message(&sample).expect("still builds");
         assert!(degraded, "NaN readings must degrade, not refuse or encode");
         assert_eq!(
-            report.level,
+            sample.report.level,
             HealthLevel::NotReporting,
             "the level still names the quiet motor"
         );

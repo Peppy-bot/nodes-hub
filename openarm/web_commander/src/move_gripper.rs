@@ -1,26 +1,22 @@
-// Spawned per fire_gripper command (the gripper card's Execute in Actions mode). Fires
-// the limb_motion slot's move_gripper (a discrete governed open/close), then reports the
-// outcome to the owner. Cancel-aware so a shutdown can't wedge an in-flight goal. A second Execute
-// is refused while one is in flight (the owner gates it), so this needs no per-goal
-// preempt the way the longer arm moves do.
+//! Spawned per fire_gripper command (the gripper card's Execute in Actions mode). Fires
+//! the limb_motion slot's move_gripper (a discrete governed open/close), then reports the
+//! outcome to the owner. Cancel-aware so a shutdown can't wedge an in-flight goal. A second Execute
+//! is refused while one is in flight (the owner gates it), so this needs no per-goal
+//! preempt the way the longer arm moves do.
 
 use std::sync::Arc;
-use std::time::Duration;
 
+use openarm_description::Side;
 use peppygen::NodeRunner;
 use peppygen::consumed_actions::limb_motion::move_gripper as limb_motion_move_gripper;
-use peppygen::consumed_actions::limb_motion::move_gripper::ResultOutcome;
 use peppylib::runtime::CancellationToken;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::owner::Feedback;
-use crate::result_wait::{RESULT_POLL, RESULT_RETRY_DELAY, result_poll_retryable};
-use crate::state::Side;
+use crate::result_wait::{GOAL_TIMEOUT, Waited, limb_goal_handle, summarize, wait_for_end};
 
-// Goal-accept round-trip to a pinned producer; answered directly, so this only needs to
-// cover the decider, not a discovery probe.
-const GOAL_TIMEOUT: Duration = Duration::from_secs(2);
+limb_goal_handle!(move_gripper);
 
 /// One discrete gripper move, as fired at the backbone: the side, the opening
 /// fraction, the effort cap in its wire encoding (0 = no preference), and the
@@ -56,8 +52,11 @@ async fn run(
         max_effort,
         settle_timeout_s,
     } = goal;
-    let label = side.label();
-    info!(side = label, opening, max_effort, "fire move_gripper");
+    let label = side.to_string();
+    info!(
+        side = label.as_str(),
+        opening, max_effort, "fire move_gripper"
+    );
 
     let goal = limb_motion_move_gripper::GoalRequest {
         gripper_name: side.gripper_name().to_string(),
@@ -99,67 +98,35 @@ async fn run(
     // arm moves there is no preempt branch. The wait re-arms its bounded poll until
     // a terminal outcome (see result_wait); the backbone's own deadline bounds the
     // move itself.
-    let outcome = loop {
-        let result_fut = downstream.get_result(RESULT_POLL);
-        tokio::pin!(result_fut);
-        tokio::select! {
-            _ = token.cancelled() => {
-                // Best-effort cancel so shutdown leaves no unsupervised motion.
-                if let Err(e) = downstream.cancel_goal(GOAL_TIMEOUT).await {
-                    warn!(side = side.label(), error = %e, "shutdown cancel failed");
-                }
-                finalize(&feedback, side, false, "shutting down; move cancelled").await;
-                return;
-            }
-            result = &mut result_fut => match result {
-                Err(e) if result_poll_retryable(&e) => {
-                    tokio::time::sleep(RESULT_RETRY_DELAY).await;
-                }
-                result => break result,
-            }
-        }
-    };
-    // A result error leaves the goal's fate unknown; cancel best-effort so a move
-    // somehow still running does not continue unsupervised.
-    if outcome.is_err()
-        && let Err(e) = downstream.cancel_goal(GOAL_TIMEOUT).await
+    let ended = match wait_for_end(
+        &downstream,
+        &token,
+        None,
+        |trigger, e| warn!(side = label.as_str(), error = %e, "{}", trigger.failure_message()),
+    )
+    .await
     {
-        warn!(side = side.label(), error = %e, "cancel after result error failed");
-    }
-    let (success, summary) = match outcome {
-        Ok(r) => match r.outcome {
-            ResultOutcome::Completed(data) => {
-                // The backbone reports where the jaws measured once they stood
-                // still, or settle_timeout_s after the planned end of the travel:
-                // on the target, or where an object or the effort cap stopped
-                // them, which a grasp reads as its result.
-                let settle = if data.settled {
-                    ""
-                } else {
-                    ", the jaws had not stood still by the settle timeout"
-                };
-                (
-                    true,
-                    format!(
-                        "move_gripper ({label}): success in {:.2}s, opening {:.2}{settle}",
-                        data.action_time, data.final_opening
-                    ),
-                )
-            }
-            ResultOutcome::Failed(failure) => {
-                (false, format!("move_gripper ({label}) failed: {failure}"))
-            }
-            ResultOutcome::Cancelled { reason, .. } => {
-                (false, format!("move_gripper ({label}) cancelled: {reason}"))
-            }
-            ResultOutcome::Abandoned => (
-                false,
-                format!("move_gripper ({label}) abandoned by backbone"),
-            ),
-            ResultOutcome::Expired => (false, format!("move_gripper ({label}) result expired")),
-        },
-        Err(e) => (false, format!("move_gripper ({label}) result error: {e}")),
+        Waited::Shutdown => {
+            finalize(&feedback, side, false, "shutting down; move cancelled").await;
+            return;
+        }
+        Waited::Ended(ended) => ended,
     };
+    let (success, summary) = summarize("move_gripper", &label, ended, |data| {
+        // The backbone reports where the jaws measured once they stood
+        // still, or settle_timeout_s after the planned end of the travel:
+        // on the target, or where an object or the effort cap stopped
+        // them, which a grasp reads as its result.
+        let settle = if data.settled {
+            ""
+        } else {
+            ", the jaws had not stood still by the settle timeout"
+        };
+        format!(
+            "success in {:.2}s, opening {:.2}{settle}",
+            data.action_time, data.final_opening
+        )
+    });
     finalize(&feedback, side, success, summary).await;
 }
 
@@ -172,10 +139,11 @@ async fn finalize(
     summary: impl Into<String>,
 ) {
     let summary = summary.into();
+    let label = side.to_string();
     if success {
-        info!(side = side.label(), %summary, "move_gripper done");
+        info!(side = label.as_str(), %summary, "move_gripper done");
     } else {
-        warn!(side = side.label(), %summary, "move_gripper done");
+        warn!(side = label.as_str(), %summary, "move_gripper done");
     }
     let _ = feedback
         .send(Feedback::GripperGoalDone { side, summary })

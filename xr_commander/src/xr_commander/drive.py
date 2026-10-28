@@ -37,7 +37,7 @@ from xr_commander.bus import (
     refusal_of,
     spawn,
 )
-from xr_commander.devices import Handedness, HandSample
+from xr_commander.devices import Hand, HandSample
 from xr_commander.fleet import (
     DAEMON_SILENT,
     LEASE_NAME,
@@ -54,9 +54,9 @@ from xr_commander.fleet import (
 from xr_commander.robots import JOIN_COMMAND, PairedRobots
 
 # Why the headset holds a robot: a hand that drives it, or a posture move.
-Reason = Handedness | Literal["posture"]
+Reason = Hand | Literal["posture"]
 POSTURE: Reason = "posture"
-HANDS: tuple[Handedness, ...] = ("left", "right")
+_HANDS: tuple[Hand, ...] = tuple(Hand)
 
 # Why a press does nothing while a hand holds the chosen robot.
 GRIP_HELD = "release the grip first"
@@ -247,7 +247,7 @@ class Driver:
         self._timing = timing
         self._on_change = on_change
         self._clock = clock
-        self.hands = {hand: HandState(FlashNote(clock)) for hand in HANDS}
+        self.hands = {hand: HandState(FlashNote(clock)) for hand in _HANDS}
         # Why the headset let go last, for the panel.
         self.note = FlashNote(clock)
         self._holds: dict[str, Hold] = {}
@@ -265,7 +265,7 @@ class Driver:
     def hand_holds(self, robot: str | None) -> bool:
         """Whether a hand holds `robot`, driving it or in its release
         burst."""
-        return any(self.holds_for(robot, hand) for hand in HANDS)
+        return any(self.holds_for(robot, hand) for hand in _HANDS)
 
     def driven_under_open(self, robot: str) -> bool:
         hold = self._holds.get(robot)
@@ -284,7 +284,7 @@ class Driver:
         return any(hand.engaged and hand.robot == robot for hand in self.hands.values())
 
     async def acquire(
-        self, robot: str, hand: Handedness, wanted: Callable[[], bool]
+        self, robot: str, hand: Hand, wanted: Callable[[], bool]
     ) -> Refusal | Withdrawn | None:
         """Take `robot` for a squeeze of `hand`: None once the headset holds
         it for the hand, else why not. `wanted` says whether the squeeze

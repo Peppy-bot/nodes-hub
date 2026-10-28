@@ -11,15 +11,19 @@
 //! the output matches the Stereolabs reference recipe.
 
 use opencv::calib3d::{self, StereoMatcherTrait, StereoSGBM, StereoSGBM_MODE_SGBM_3WAY};
-use opencv::core::{CV_32FC1, CV_64FC1, Mat, MatTraitConst, Rect, Scalar, Size, ToInputArray};
+use opencv::core::{
+    CV_32FC1, CV_64FC1, Mat, MatTraitConst, Rect, Scalar, Size as CvSize, ToInputArray,
+};
 use opencv::imgproc::{
     self, COLOR_BGR2GRAY, COLOR_BGR2RGB, COLOR_YUV2BGR_YUYV, INTER_AREA, INTER_LINEAR,
 };
 use opencv::prelude::MatTraitConstManual;
 
-use crate::calibration::{StereoConf, resolution_key};
+use crate::calibration::StereoConf;
 use crate::depth_settings::{DepthSettings, num_disparities_for};
 use crate::geometry::{MAX_Z16_DEPTH_MM, RectifiedLeft, depth_mm as depth_mm_of};
+use crate::resolution::Resolution;
+use crate::size::Size;
 
 /// Millimetre depth for a fixed geometry, backed by OpenCV.
 pub struct CvDepth {
@@ -31,7 +35,6 @@ pub struct CvDepth {
     eye_width: i32,
     eye_height: i32,
     downscale: i32,
-    fx: f64,
     /// The rectified left projection the colour image is remapped into.
     rectified_left: RectifiedLeft,
     baseline_mm: f64,
@@ -40,20 +43,21 @@ pub struct CvDepth {
 }
 
 impl CvDepth {
+    /// The matcher for `resolution`'s eye size, through its section of the
+    /// factory calibration `conf_text`.
     pub fn create(
         conf_text: &str,
-        eye_width: u32,
-        eye_height: u32,
+        resolution: Resolution,
         settings: DepthSettings,
     ) -> Result<Self, String> {
         let block = settings.block_size() as i32;
         let downscale = settings.downscale() as i32;
-        let key = resolution_key(eye_width);
-        let conf =
-            StereoConf::from_conf_str(conf_text, key).map_err(|e| format!("calibration: {e}"))?;
+        let eye = resolution.eye_size();
+        let conf = StereoConf::from_conf_str(conf_text, resolution)
+            .map_err(|e| format!("calibration: {e}"))?;
 
-        let (w, h) = (eye_width as i32, eye_height as i32);
-        let size = Size::new(w, h);
+        let (w, h) = (eye.width as i32, eye.height as i32);
+        let size = CvSize::new(w, h);
         let k_left = matrix_3x3(conf.left.fx, conf.left.cx, conf.left.fy, conf.left.cy)?;
         let k_right = matrix_3x3(conf.right.fx, conf.right.cx, conf.right.fy, conf.right.cy)?;
         let dist_left = dist_coeffs(&conf.left)?;
@@ -170,7 +174,6 @@ impl CvDepth {
             eye_width: w,
             eye_height: h,
             downscale,
-            fx,
             rectified_left,
             baseline_mm,
             numerator,
@@ -178,12 +181,9 @@ impl CvDepth {
         })
     }
 
-    pub fn fx(&self) -> f64 {
-        self.fx
-    }
-
     /// The derived disparity search range.
-    pub fn num_disparities(&self) -> u32 {
+    #[cfg(test)]
+    fn num_disparities(&self) -> u32 {
         self.num_disparities
     }
 
@@ -195,7 +195,8 @@ impl CvDepth {
 
     /// The nearest depth the derived search range can measure.
     pub fn min_depth_floor_mm(&self) -> f64 {
-        self.fx / self.downscale as f64 * self.baseline_mm / self.num_disparities as f64
+        self.rectified_left.fx / self.downscale as f64 * self.baseline_mm
+            / self.num_disparities as f64
     }
 
     /// The farthest depth the stream can report: the depth of the smallest
@@ -205,15 +206,11 @@ impl CvDepth {
         self.numerator.min(MAX_Z16_DEPTH_MM)
     }
 
-    pub fn baseline_mm(&self) -> f64 {
-        self.baseline_mm
-    }
-
-    pub fn out_size(&self) -> (u32, u32) {
-        (
-            (self.eye_width / self.downscale) as u32,
-            (self.eye_height / self.downscale) as u32,
-        )
+    pub fn out_size(&self) -> Size {
+        Size {
+            width: (self.eye_width / self.downscale) as u32,
+            height: (self.eye_height / self.downscale) as u32,
+        }
     }
 
     /// Rectify + match one side-by-side YUYV frame. `left_rgb` is
@@ -270,7 +267,7 @@ impl CvDepth {
         imgproc::cvt_color_def(&left_rect, &mut left_gray, COLOR_BGR2GRAY).map_err(cv)?;
         imgproc::cvt_color_def(&right_rect, &mut right_gray, COLOR_BGR2GRAY).map_err(cv)?;
         let (left_gray, right_gray) = if self.downscale > 1 {
-            let small = Size::new(w / self.downscale, h / self.downscale);
+            let small = CvSize::new(w / self.downscale, h / self.downscale);
             (
                 downscaled(&left_gray, small)?,
                 downscaled(&right_gray, small)?,
@@ -345,7 +342,7 @@ fn remap_linear(
     .map_err(cv)
 }
 
-fn downscaled(gray: &Mat, size: Size) -> Result<Mat, String> {
+fn downscaled(gray: &Mat, size: CvSize) -> Result<Mat, String> {
     let mut out = Mat::default();
     imgproc::resize(gray, &mut out, size, 0.0, 0.0, INTER_AREA).map_err(cv)?;
     Ok(out)
@@ -355,8 +352,7 @@ fn downscaled(gray: &Mat, size: Size) -> Result<Mat, String> {
 mod tests {
     use super::*;
 
-    const EYE_WIDTH: u32 = 672;
-    const EYE_HEIGHT: u32 = 376;
+    const RESOLUTION: Resolution = Resolution::Vga;
     const FOCAL_PX: f64 = 350.0;
     const BASELINE_MM: f64 = 120.0;
 
@@ -390,7 +386,8 @@ mod tests {
     /// A side-by-side YUYV frame whose right eye sees the left eye's texture
     /// moved `shift` pixels to the left: a disparity of `shift` everywhere.
     fn side_by_side_yuyv(shift: usize) -> Vec<u8> {
-        let (width, height) = (EYE_WIDTH as usize, EYE_HEIGHT as usize);
+        let eye = RESOLUTION.eye_size();
+        let (width, height) = (eye.width as usize, eye.height as usize);
         let texture = noise_rows(width + shift, height);
         let mut frame = Vec::with_capacity(2 * width * height * 2);
         for row in &texture {
@@ -408,10 +405,14 @@ mod tests {
     fn an_ideal_rig_reads_a_uniform_disparity_as_its_depth() {
         let shift = 20;
         let settings = DepthSettings::new(0.5, 5, 1).unwrap();
-        let mut depth = CvDepth::create(&ideal_vga_conf(), EYE_WIDTH, EYE_HEIGHT, settings)
+        let mut depth = CvDepth::create(&ideal_vga_conf(), RESOLUTION, settings)
             .expect("an ideal calibration rectifies");
-        let (out_width, out_height) = depth.out_size();
-        let mut left_rgb = vec![0; (EYE_WIDTH * EYE_HEIGHT * 3) as usize];
+        let Size {
+            width: out_width,
+            height: out_height,
+        } = depth.out_size();
+        let eye = RESOLUTION.eye_size();
+        let mut left_rgb = vec![0; (eye.width * eye.height * 3) as usize];
         let mut depth_mm = vec![0; (out_width * out_height) as usize];
 
         depth

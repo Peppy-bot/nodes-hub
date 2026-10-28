@@ -8,6 +8,7 @@ binds rgbd cameras unless a test says so."""
 
 import asyncio
 import time
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -15,7 +16,7 @@ from peppygen.exposed_actions.recording import record_episode
 from peppygen.exposed_services.recording import finish_session, resume_session
 
 from lerobot_recorder import episode, recording
-from lerobot_recorder.episode import Recorder, Timing
+from lerobot_recorder.episode import Activity, Recorder, Session, Timing
 from lerobot_recorder.recording import (
     Cache,
     CameraFrame,
@@ -24,7 +25,7 @@ from lerobot_recorder.recording import (
     SourceSchema,
 )
 from lerobot_recorder.sink import ResumeManifest, VideoShortfall
-from tests.test_recording import ARM0, STALENESS_S, joint_entry, make_plan
+from tests.support import ARM0, STALENESS_S, joint_entry, make_plan
 
 
 async def no_depth_units(_node_runner, _plan):
@@ -223,11 +224,12 @@ class FakeToken:
         await self._event.wait()
 
 
-def recorder_with(plan, sink, tmp_path, **overrides) -> tuple[Recorder, Cache]:
+def recorder_with(plan, sink, tmp_path, mirror=None, **overrides) -> tuple[Recorder, Cache]:
     cache = Cache.for_plan(plan)
     overrides.setdefault("now_ns", time.time_ns)
     overrides.setdefault("depth_probe", no_depth_units)
-    recorder = Recorder(plan, cache, sink, tmp_path, STALENESS_S, 1 << 30, **overrides)
+    session = Session(directory=tmp_path, sink=sink, mirror=mirror)
+    recorder = Recorder(plan, cache, session, STALENESS_S, 1 << 30, **overrides)
     return recorder, cache
 
 
@@ -441,7 +443,7 @@ def test_feedback_per_frame_with_slow_disk_field(tmp_path):
 
 def test_decide_refuses_while_recording(tmp_path):
     recorder, _ = recorder_with(arm_plan(), FakeSink(), tmp_path)
-    recorder._recording = True
+    recorder._activity = Activity.RECORDING
     decision = recorder._decide(goal_request())
     assert decision.refusal == record_episode.Failure(
         PRECONDITION_FAILED, "an episode is already recording"
@@ -456,7 +458,7 @@ def test_decide_claims_the_slot_at_admission(tmp_path):
     recorder._schema = capture_now(cache, arm_plan())
 
     assert recorder._decide(goal_request()).refusal is None
-    assert recorder._recording
+    assert recorder._activity is Activity.RECORDING
     second = recorder._decide(goal_request())
     assert second.refusal.kind is PRECONDITION_FAILED
     assert "already recording" in second.refusal.message
@@ -464,12 +466,12 @@ def test_decide_claims_the_slot_at_admission(tmp_path):
 
 def test_decide_refuses_while_finishing(tmp_path):
     recorder, _ = recorder_with(arm_plan(), FakeSink(), tmp_path)
-    recorder._finishing = True
+    recorder._activity = Activity.FINISHING
     decision = recorder._decide(goal_request())
     assert decision.refusal == record_episode.Failure(
         PRECONDITION_FAILED, "finishing the session"
     )
-    assert not recorder._recording
+    assert recorder._activity is not Activity.RECORDING
 
 
 def test_decide_refuses_instead_of_raising(tmp_path):
@@ -485,7 +487,7 @@ def test_decide_refuses_instead_of_raising(tmp_path):
     decision = recorder._decide(goal_request())
     assert decision.refusal.kind is ATTEMPT_FAILED
     assert "cannot start an episode" in decision.refusal.message
-    assert not recorder._recording
+    assert recorder._activity is not Activity.RECORDING
 
 
 def test_goal_refused_below_the_disk_floor(tmp_path):
@@ -494,7 +496,7 @@ def test_goal_refused_below_the_disk_floor(tmp_path):
     assert decision.refusal == record_episode.Failure(
         PRECONDITION_FAILED, "only 0 MB free under the session directory"
     )
-    assert not recorder._recording
+    assert recorder._activity is not Activity.RECORDING
 
 
 def test_goal_refused_before_the_clock_is_ready(tmp_path):
@@ -596,7 +598,7 @@ def test_recorder_rejects_nonpositive_staleness(tmp_path):
     plan = arm_plan()
     for bad in (0.0, -1.0, float("nan")):
         with pytest.raises(ValueError, match="max_staleness_s"):
-            Recorder(plan, Cache.for_plan(plan), FakeSink(), tmp_path, bad, 1 << 30)
+            Recorder(plan, Cache.for_plan(plan), Session(tmp_path, FakeSink(), None), bad, 1 << 30)
 
 
 def test_max_episode_length_ends_with_save(tmp_path):
@@ -753,7 +755,7 @@ def resume_recorder(tmp_path, current=None, existing=None, **overrides):
                     resume_session.FailureKind.REJECTED,
                     f"no session named {name} under this storage target",
                 )
-            return target_dir, existing, None
+            return Session(directory=target_dir, sink=existing, mirror=None)
 
         recorder._open_existing = open_existing
     return recorder, cache
@@ -768,12 +770,12 @@ def test_resume_swaps_onto_the_existing_session(tmp_path):
         cache.links[ARM0] = fresh_joints()
         session, episodes = await recorder.resume_session("2026-07-27_10-00-00", None)
         assert (session, episodes) == ("2026-07-27_10-00-00", 3)
-        assert recorder._sink is existing
-        assert recorder._session_dir.name == "2026-07-27_10-00-00"
+        assert recorder._session.sink is existing
+        assert recorder._session.directory.name == "2026-07-27_10-00-00"
         assert recorder._schema is not None
-        assert not recorder._resuming
+        assert recorder._activity is not Activity.RESUMING
         # Recording continues where the session left off.
-        assert recorder._sink.episodes_saved == 3
+        assert recorder._session.sink.episodes_saved == 3
 
     asyncio.run(run())
 
@@ -801,26 +803,26 @@ RESUME_ATTEMPT_FAILED = resume_session.FailureKind.ATTEMPT_FAILED
 def test_resume_error_replies_leave_state_untouched(tmp_path):
     existing = FakeSink(created=False)
     recorder, cache = resume_recorder(tmp_path, existing=existing)
-    original_sink = recorder._sink
-    original_dir = recorder._session_dir
+    original_sink = recorder._session.sink
+    original_dir = recorder._session.directory
 
     async def refused(name="2026-07-27_10-00-00") -> tuple:
         with pytest.raises(resume_session.Failure) as raised:
             await recorder.resume_session(name, None)
-        assert recorder._sink is original_sink
-        assert recorder._session_dir is original_dir
+        assert recorder._session.sink is original_sink
+        assert recorder._session.directory is original_dir
         assert recorder._schema is None
-        assert not recorder._resuming
+        assert recorder._activity is not Activity.RESUMING
         return raised.value.kind, raised.value.message
 
     async def run():
-        recorder._recording = True
+        recorder._activity = Activity.RECORDING
         assert await refused() == (RESUME_PRECONDITION_FAILED, "an episode is recording")
-        recorder._recording = False
+        recorder._activity = Activity.IDLE
 
-        recorder._finishing = True
+        recorder._activity = Activity.FINISHING
         assert await refused() == (RESUME_PRECONDITION_FAILED, "finishing the session")
-        recorder._finishing = False
+        recorder._activity = Activity.IDLE
 
         recorder._roll_pending = True
         kind, message = await refused()
@@ -853,8 +855,8 @@ def test_resume_error_replies_leave_state_untouched(tmp_path):
         existing.resume_error = None
 
         # A current session with saved episodes must be finished first.
-        recorder._sink.created = True
-        recorder._sink.saves = 2
+        recorder._session.sink.created = True
+        recorder._session.sink.saves = 2
         kind, message = await refused()
         assert kind is RESUME_PRECONDITION_FAILED and "finish it first" in message
 
@@ -864,7 +866,7 @@ def test_resume_error_replies_leave_state_untouched(tmp_path):
 def test_resume_refuses_the_current_session_name(tmp_path):
     recorder, _ = resume_recorder(tmp_path)
     recorder._open_existing = lambda name: (_ for _ in ()).throw(AssertionError)
-    recorder._session_dir = tmp_path / "2026-07-27_10-00-00"
+    recorder._session = replace(recorder._session, directory=tmp_path / "2026-07-27_10-00-00")
 
     async def run():
         with pytest.raises(resume_session.Failure) as raised:
@@ -891,7 +893,7 @@ def test_resume_unavailable_without_a_factory(tmp_path):
 
 def test_goals_and_finish_refused_while_resuming(tmp_path):
     recorder, _cache = resume_recorder(tmp_path)
-    recorder._resuming = True
+    recorder._activity = Activity.RESUMING
     decision = recorder._decide(goal_request())
     assert decision.refusal == record_episode.Failure(PRECONDITION_FAILED, "resuming a session")
 
@@ -957,7 +959,7 @@ def test_resume_serializes_against_a_warmup_create_in_flight(tmp_path):
         # saw a create, and the schema is resume's capture.
         assert current.created and current.finalized
         assert existing.creates == 0
-        assert recorder._sink is existing
+        assert recorder._session.sink is existing
         assert recorder._schema is not None
         token._event.set()
         await asyncio.wait_for(warmup, timeout=5)
@@ -1016,7 +1018,7 @@ def test_warmup_rearms_the_session_finish_session_rolls_to(tmp_path):
 
     def open_session():
         next_dir.mkdir()
-        return next_dir, second_sink, None
+        return Session(directory=next_dir, sink=second_sink, mirror=None)
 
     def keep_live():
         cache.links[ARM0] = fresh_joints()
@@ -1050,7 +1052,7 @@ def test_finish_session_rolls_to_a_fresh_session(tmp_path):
 
     def open_session():
         next_dir.mkdir()
-        return next_dir, second_sink, None
+        return Session(directory=next_dir, sink=second_sink, mirror=None)
 
     recorder._open_session = open_session
 
@@ -1061,8 +1063,8 @@ def test_finish_session_rolls_to_a_fresh_session(tmp_path):
         name = await recorder.finish_session()
         assert name == tmp_path.name
         assert first_sink.finalized
-        assert recorder._sink is second_sink
-        assert recorder._session_dir == next_dir
+        assert recorder._session.sink is second_sink
+        assert recorder._session.directory == next_dir
         assert recorder._schema is None
 
     asyncio.run(run())
@@ -1081,19 +1083,18 @@ async def finish_error_reply(recorder) -> finish_session.Failure:
 
 def test_finish_session_refuses_when_empty_or_recording(tmp_path):
     recorder, _ = recorder_with(arm_plan(), FakeSink(), tmp_path)
-    recorder._open_session = lambda: (tmp_path, FakeSink(created=False), None)
+    recorder._open_session = lambda: Session(tmp_path, FakeSink(created=False), None)
 
     async def run():
         assert await finish_error_reply(recorder) == finish_session.Failure(
             FINISH_PRECONDITION_FAILED, "nothing recorded this session"
         )
-        recorder._sink.saves = 1
-        recorder._recording = True
+        recorder._session.sink.saves = 1
+        recorder._activity = Activity.RECORDING
         assert await finish_error_reply(recorder) == finish_session.Failure(
             FINISH_PRECONDITION_FAILED, "an episode is recording"
         )
-        recorder._recording = False
-        recorder._finishing = True
+        recorder._activity = Activity.FINISHING
         assert await finish_error_reply(recorder) == finish_session.Failure(
             FINISH_PRECONDITION_FAILED, "already finishing"
         )
@@ -1105,7 +1106,7 @@ def test_finish_session_refuses_before_the_dataset_exists(tmp_path):
     """An uncreated dataset cannot answer episodes_saved, so the emptiness
     guard must lead with it rather than letting the assertion escape."""
     recorder, _ = recorder_with(arm_plan(), FakeSink(created=False), tmp_path)
-    recorder._open_session = lambda: (tmp_path, FakeSink(created=False), None)
+    recorder._open_session = lambda: Session(tmp_path, FakeSink(created=False), None)
 
     async def run():
         assert await finish_error_reply(recorder) == finish_session.Failure(
@@ -1143,7 +1144,7 @@ def test_finish_session_roll_failure_refuses_goals_until_retried(tmp_path):
         attempts.append(True)
         if len(attempts) == 1:
             raise OSError("mkdir failed")
-        return tmp_path / "next", next_sink, None
+        return Session(directory=tmp_path / "next", sink=next_sink, mirror=None)
 
     recorder._open_session = failing_then_working
 
@@ -1156,12 +1157,12 @@ def test_finish_session_roll_failure_refuses_goals_until_retried(tmp_path):
         decision = recorder._decide(goal_request())
         assert decision.refusal.kind is PRECONDITION_FAILED
         assert "retry finish_session" in decision.refusal.message
-        assert not recorder._recording
+        assert recorder._activity is not Activity.RECORDING
         name = await recorder.finish_session()
         assert name == tmp_path.name
         # The retry rolled without closing the already-finalized sink again.
         assert sink.finalizes == 1
-        assert recorder._sink is next_sink
+        assert recorder._session.sink is next_sink
         assert not recorder._roll_pending
 
     asyncio.run(run())
@@ -1184,21 +1185,19 @@ def test_shutdown_skips_final_mirror_when_finalize_fails(tmp_path):
         raise OSError("disk full")
 
     sink.finalize = failing_finalize
-    recorder, _ = recorder_with(arm_plan(), sink, tmp_path)
     mirror = CountingMirror()
-    recorder._mirror = mirror
+    recorder, _ = recorder_with(arm_plan(), sink, tmp_path, mirror)
 
     asyncio.run(recorder.close_for_shutdown())
     assert mirror.syncs == 0
 
 
 def test_shutdown_runs_final_mirror_after_successful_finalize(tmp_path):
-    recorder, _ = recorder_with(arm_plan(), FakeSink(), tmp_path)
     mirror = CountingMirror()
-    recorder._mirror = mirror
+    recorder, _ = recorder_with(arm_plan(), FakeSink(), tmp_path, mirror)
 
     asyncio.run(recorder.close_for_shutdown())
-    assert recorder._sink.finalized
+    assert recorder._session.sink.finalized
     assert mirror.syncs == 1
 
 
@@ -1218,9 +1217,9 @@ def test_finish_session_keeps_the_session_when_finalize_fails(tmp_path):
         assert await finish_error_reply(recorder) == finish_session.Failure(
             FINISH_ATTEMPT_FAILED, "finish failed: parquet footer failed"
         )
-        assert recorder._sink is sink
+        assert recorder._session.sink is sink
         # Not left latched: a retry is allowed once the fault clears.
-        assert not recorder._finishing
+        assert recorder._activity is not Activity.FINISHING
 
     asyncio.run(run())
 

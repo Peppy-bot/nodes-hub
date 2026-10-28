@@ -23,11 +23,12 @@ from urllib.parse import urlparse
 SESSION_NAME_FORMAT = "%Y-%m-%d_%H-%M-%S"
 # The same shape spelled for the operators and clients who read a refusal;
 # strftime is this node's business, not theirs.
-SESSION_NAME_SHAPE = "YYYY-MM-DD_HH-MM-SS"
+_SESSION_NAME_SHAPE = "YYYY-MM-DD_HH-MM-SS"
 
 
-def validate_session_name(name: str) -> None:
-    """Reject anything that is not exactly a session directory name. The
+def parse_session_name(name: str) -> str:
+    """The name, when it is exactly a session directory name; ValueError for
+    anything else. The
     round-trip check refuses non-canonical spellings, and with them every
     path-traversal shape (separators, dots, absolute paths)."""
     try:
@@ -37,7 +38,8 @@ def validate_session_name(name: str) -> None:
     except ValueError:
         canonical = None
     if canonical != name:
-        raise ValueError(f"{name!r} is not a session name (UTC {SESSION_NAME_SHAPE})")
+        raise ValueError(f"{name!r} is not a session name (UTC {_SESSION_NAME_SHAPE})")
+    return name
 
 
 @dataclass(frozen=True)
@@ -119,9 +121,9 @@ FRAME_STAGING_DIR = "images"
 # Upload bounds; without them botocore's defaults let one hung endpoint
 # consume the whole shutdown grace window. total_max_attempts counts the
 # initial request, so this is three requests, not three retries.
-S3_CONNECT_TIMEOUT_S = 10
-S3_READ_TIMEOUT_S = 60
-S3_TOTAL_MAX_ATTEMPTS = 3
+_S3_CONNECT_TIMEOUT_S = 10
+_S3_READ_TIMEOUT_S = 60
+_S3_TOTAL_MAX_ATTEMPTS = 3
 
 
 @dataclass
@@ -157,9 +159,9 @@ class Mirror:
             self._client = boto3.client(
                 "s3",
                 config=Config(
-                    connect_timeout=S3_CONNECT_TIMEOUT_S,
-                    read_timeout=S3_READ_TIMEOUT_S,
-                    retries={"total_max_attempts": S3_TOTAL_MAX_ATTEMPTS, "mode": "standard"},
+                    connect_timeout=_S3_CONNECT_TIMEOUT_S,
+                    read_timeout=_S3_READ_TIMEOUT_S,
+                    retries={"total_max_attempts": _S3_TOTAL_MAX_ATTEMPTS, "mode": "standard"},
                 ),
             )
         files = 0

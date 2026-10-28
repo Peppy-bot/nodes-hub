@@ -24,32 +24,30 @@ use peppygen::exposed_actions::limb_motion::{move_arm, move_arm_joints};
 
 use control_core::chase::{chase_step, exceeds_rate};
 use control_core::path_timing::JointTrajectory;
+use control_core::positive_finite::PositiveFinite;
 use control_core::timing::MotionClock;
+use openarm_description::{ARM_DOF, Side};
 use srs_model::chain_kinematics::{
     EeCaps, JointSmoothing, ServoPlan, ServoTrajectory, Smoother, clamp_into, rate_step_toward,
 };
 use srs_model::nalgebra::Isometry3;
 use srs_model::{
-    Arm, CartesianPlan, Jacobian, Limit, LineCursor, LinePlan, LineTrajectory, PlanLimits,
-    PlanRejection, plan_cartesian,
+    Arm, CartesianPlan, Jacobian, JointVec, Limit, LineCursor, LinePlan, LineTrajectory,
+    PlanLimits, PlanRejection, plan_cartesian,
 };
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
 use crate::failure::{Failure, FailureKind};
-use crate::settle::{Settle, Verdict, joint_shortfall, pose_shortfall, verdict};
-use crate::side::Side;
-use crate::types::{ARM_DOF, ArmMoveRequest, JointVec, PoseTolerance, world_pose_arrays};
+use crate::move_slot::{ARM_BUSY, MoveSlot, SlotRelease};
+use crate::settle::{PoseTolerance, Settle, Verdict, joint_shortfall, pose_shortfall, verdict};
+use crate::types::world_pose_arrays;
 use crate::upstream::Upstream;
 
 /// Slack the runtime per-tick velocity guard of a line allows over the planned
 /// limit before aborting the move: the plan sized the line at its own
 /// resolution, and the ticks that run it land where the clock puts them.
 const VELOCITY_GUARD_MARGIN: f64 = 1.5;
-
-/// The refusal of a goal, or a plan check, that reaches an arm executing a
-/// move: the one message for both, whichever gate answers it.
-pub const ARM_BUSY: &str = "arm is already executing a motion";
 
 /// The failure of a goal that reaches the planner while another move is in
 /// flight on its arm.
@@ -233,6 +231,17 @@ impl ReadyReply {
     }
 }
 
+/// A Cartesian move as `move_arm` plans it and `check_arm_move` checks it,
+/// parsed once off the wire: both carry the same planning fields with the
+/// same meaning, and both refuse the same values with the same words.
+#[derive(Clone, Copy, Debug)]
+pub struct ArmMoveRequest {
+    pub side: Side,
+    pub target: Isometry3<f64>,
+    pub tolerance: PoseTolerance,
+    pub duration: Duration,
+}
+
 /// A goal accepted by an action handler and handed to the planner.
 pub enum Goal {
     Joint {
@@ -262,7 +271,7 @@ impl Goal {
         }
     }
 
-    /// Fail unstarted with `failure`, with no result. The busy flag is the
+    /// Fail unstarted with `failure`, with no result. The move slot is the
     /// caller's concern.
     pub async fn fail(self, failure: Failure, planner: &Planner) {
         match self {
@@ -272,7 +281,7 @@ impl Goal {
     }
 
     /// End unstarted as cancelled by the stop service, for `reason`, which
-    /// names the stop, reporting `measured`. The busy flag is the caller's
+    /// names the stop, reporting `measured`. The move slot is the caller's
     /// concern.
     pub async fn stop(self, reason: &str, measured: Measurement, planner: &Planner) {
         let outcome = Outcome::Cancelled(reason.to_string());
@@ -282,18 +291,6 @@ impl Goal {
                 planner.finish_cartesian(&ctx, outcome, measured, 0.0).await
             }
         }
-    }
-}
-
-/// Releases a single-flight busy flag on drop. Held for the lifetime of a move
-/// (an arm's mode here, a gripper move in the coordinator), so a move can never
-/// end (success, failure, cancel, or an unreachable plan) without freeing the
-/// slot the action handler claimed: no terminal path can leak it.
-pub(crate) struct BusyGuard(pub(crate) Arc<AtomicBool>);
-
-impl Drop for BusyGuard {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
     }
 }
 
@@ -310,7 +307,7 @@ enum Mode {
 struct JointMove {
     traj: JointTrajectory<ARM_DOF>,
     reply: JointReply,
-    _busy: BusyGuard,
+    _move_slot: SlotRelease,
 }
 
 struct CartesianMove {
@@ -321,7 +318,7 @@ struct CartesianMove {
     settle: Settle<PoseTolerance>,
     // Last commanded joint target: held on cancel/failure so the arm never snaps.
     prev_q_des: JointVec,
-    _busy: BusyGuard,
+    _move_slot: SlotRelease,
 }
 
 /// A line-tracking move's cursor: the trajectory, the walk along it the plan
@@ -473,8 +470,8 @@ impl Planner {
     /// live angular control would read as doing nothing on a joint stream, so
     /// it stays a launch parameter until the governor limits turn rate too.
     pub fn set_max_ee_velocity(&mut self, v: f64) {
-        if v.is_finite() && v > 0.0 {
-            self.cfg.ee.linear_m_s = v;
+        if let Ok(cap) = PositiveFinite::parse(v) {
+            self.cfg.ee.linear_m_s = cap.get();
         }
     }
 
@@ -490,14 +487,16 @@ impl Planner {
         measured_q: JointVec,
         command: Option<Upstream>,
         goals: &mut mpsc::Receiver<Goal>,
-        busy: &Arc<AtomicBool>,
+        move_slot: &MoveSlot,
         now: Instant,
     ) -> Tick {
         let mut mode = std::mem::replace(&mut self.mode, Mode::Follow);
         // Drain fully: every queued goal is answered, never left parked.
         while let Ok(goal) = goals.try_recv() {
             if matches!(mode, Mode::Follow) {
-                mode = self.start_goal(goal, busy.clone(), now).await;
+                mode = self
+                    .start_goal(goal, move_slot.release_on_drop(), now)
+                    .await;
             } else {
                 let failure = Failure::new(FailureKind::PreconditionFailed, ANOTHER_MOVE_IN_FLIGHT);
                 goal.fail(failure, self).await;
@@ -529,7 +528,7 @@ impl Planner {
 
     /// Fail the active move with `failure` and answer its caller, with no
     /// result: for a follower gone stale, where the move can neither
-    /// progress nor be verified. Ambient Follow mode is untouched; the busy
+    /// progress nor be verified. Ambient Follow mode is untouched; the move
     /// slot releases with the mode.
     pub async fn fail_active(&mut self, failure: Failure) {
         match std::mem::replace(&mut self.mode, Mode::Follow) {
@@ -542,13 +541,17 @@ impl Planner {
     /// End the active move for the stop service: its goal ends cancelled
     /// for `reason`, which names the stop, reporting `measured`, the joints
     /// measured when the stop came. The arm holds the setpoint it was last
-    /// governed to, as after a cancel, and the busy slot releases with the
+    /// governed to, as after a cancel, and the move slot releases with the
     /// mode. Whether a move was in flight.
     pub async fn stop_active(&mut self, reason: &str, measured: Measurement, now: Instant) -> bool {
         let outcome = Outcome::Cancelled(reason.to_string());
         match std::mem::replace(&mut self.mode, Mode::Follow) {
             Mode::Follow => false,
-            Mode::JointMove(JointMove { traj, reply, _busy }) => {
+            Mode::JointMove(JointMove {
+                traj,
+                reply,
+                _move_slot,
+            }) => {
                 let elapsed = traj.clock().elapsed_secs(now);
                 reply.finish(self, outcome, measured, elapsed).await;
                 true
@@ -650,9 +653,13 @@ impl Planner {
     /// One joint-trajectory tick: sample the trajectory, and end the goal on
     /// cancel, or from the planned end on as the reply's settle judges the
     /// measured arm against the trajectory's end. Any terminal drops `m` (and
-    /// with it the busy guard), releasing the slot.
+    /// with it the slot release), releasing the move slot.
     async fn advance_joint(&mut self, m: JointMove, measured_q: JointVec, now: Instant) -> Advance {
-        let JointMove { traj, reply, _busy } = m;
+        let JointMove {
+            traj,
+            reply,
+            _move_slot,
+        } = m;
         let q_des = traj.sample(now);
         let outcome = match reply.cancel_reason() {
             Some(reason) => Some(Outcome::Cancelled(reason)),
@@ -664,7 +671,11 @@ impl Planner {
         let Some(outcome) = outcome else {
             return Advance {
                 target: q_des,
-                next_mode: Mode::JointMove(JointMove { traj, reply, _busy }),
+                next_mode: Mode::JointMove(JointMove {
+                    traj,
+                    reply,
+                    _move_slot,
+                }),
                 origin: Origin::PlannedMove,
             };
         };
@@ -680,8 +691,8 @@ impl Planner {
     /// guarded servo) and end the goal on cancel, on the path giving up, or
     /// from the planned end on as the settle judges the measured grasp point
     /// against the commanded pose; a path at its end keeps giving its last
-    /// target. Any terminal drops `m` (and with it the busy guard), releasing
-    /// the slot.
+    /// target. Any terminal drops `m` (and with it the slot release),
+    /// releasing the move slot.
     async fn advance_cartesian(
         &mut self,
         mut m: CartesianMove,
@@ -795,9 +806,8 @@ impl Planner {
     }
 
     /// Start an accepted goal in the mode that executes it.
-    async fn start_goal(&mut self, goal: Goal, busy: Arc<AtomicBool>, now: Instant) -> Mode {
+    async fn start_goal(&mut self, goal: Goal, move_slot: SlotRelease, now: Instant) -> Mode {
         self.stream_smoothing.reset();
-        let busy = BusyGuard(busy);
         match goal {
             Goal::Joint {
                 target,
@@ -815,14 +825,17 @@ impl Planner {
                         now,
                     ),
                     reply,
-                    _busy: busy,
+                    _move_slot: move_slot,
                 })
             }
             Goal::Cartesian {
                 request,
                 settle,
                 ctx,
-            } => self.start_cartesian(request, settle, ctx, busy, now).await,
+            } => {
+                self.start_cartesian(request, settle, ctx, move_slot, now)
+                    .await
+            }
         }
     }
 
@@ -838,7 +851,7 @@ impl Planner {
         request: ArmMoveRequest,
         settle: Settle<PoseTolerance>,
         ctx: Box<move_arm::GoalContext>,
-        busy: BusyGuard,
+        move_slot: SlotRelease,
         now: Instant,
     ) -> Mode {
         let ArmMoveRequest {
@@ -862,7 +875,8 @@ impl Planner {
                 let failure =
                     Failure::new(FailureKind::Unreachable, not_planned(tolerance, &rejection));
                 self.fail_cartesian(&ctx, failure).await;
-                // `busy` drops here: the slot is released even on this early exit.
+                // `move_slot` drops here: the slot is released even on this
+                // early exit.
                 return Mode::Follow;
             }
         };
@@ -918,7 +932,7 @@ impl Planner {
             target,
             settle,
             prev_q_des,
-            _busy: busy,
+            _move_slot: move_slot,
         })
     }
 
@@ -1007,37 +1021,16 @@ mod tests {
 
     use srs_model::nalgebra::{UnitQuaternion, Vector3};
 
-    fn test_cfg() -> PlanConfig {
-        PlanConfig {
-            cycle_period: Duration::from_millis(10),
-            smoothing: srs_model::chain_kinematics::command_smoothing(Duration::from_millis(10))
-                .unwrap(),
-            max_joint_velocity_rad_s: [10.0; ARM_DOF],
-            max_joint_acceleration_rad_s2: crate::test_support::A_MAX,
-            ee: EeCaps {
-                linear_m_s: 1.0,
-                angular_rad_s: 0.8,
-            },
-            limits: [Limit {
-                lo: -10.0,
-                hi: 10.0,
-            }; ARM_DOF],
-        }
-    }
+    use crate::test_support::{bundled_arm, claimed_move_slot, plan_config, planner_holding};
 
     fn joint_cmd(positions: JointVec) -> Upstream {
         Upstream::Joints(positions)
     }
 
-    fn left_arm_model() -> Arm {
-        let version = openarm_description::HardwareVersion::V1;
-        crate::arm_model(version, openarm_description::Side::Left)
-            .expect("build left arm from bundled URDF")
-    }
-
     /// A planner over the bundled V1 left arm, with permissive test limits.
     fn test_planner(held: JointVec) -> Planner {
-        let mut planner = Planner::new(Side::Left, left_arm_model(), test_cfg());
+        let model = bundled_arm(openarm_description::HardwareVersion::V1, Side::Left);
+        let mut planner = Planner::new(Side::Left, model, plan_config());
         planner.commit(held);
         planner
     }
@@ -1049,36 +1042,26 @@ mod tests {
     /// clamps into model limits, so an off-limit seed would make the tests
     /// measure the seed correction instead of the motion.
     fn pose_planner() -> Planner {
-        let model = left_arm_model();
-        let cfg = PlanConfig {
-            limits: model.limits(),
-            ..test_cfg()
-        };
-        let mut planner = Planner::new(Side::Left, model, cfg);
-        planner.commit(POSE_TEST_Q);
-        planner
+        planner_holding(Side::Left, POSE_TEST_Q)
     }
 
     /// The failure of a follower gone stale fails the move with its kind,
     /// labelled with the side, and frees the slot.
     #[tokio::test]
-    async fn failing_the_active_move_fails_it_and_frees_the_busy_slot() {
+    async fn failing_the_active_move_fails_it_and_frees_the_move_slot() {
         let mut planner = test_planner([0.0; ARM_DOF]);
         let (done_tx, mut done_rx) = mpsc::channel(1);
         let (goal_tx, mut goals) = mpsc::channel(1);
-        let busy = Arc::new(AtomicBool::new(true)); // claimed at accept
+        let move_slot = claimed_move_slot();
         goal_tx
             .send(Goal::posture_share([0.5; ARM_DOF], done_tx))
             .await
             .expect("queue the goal");
         let now = Instant::now();
         planner
-            .tick([0.0; ARM_DOF], None, &mut goals, &busy, now)
+            .tick([0.0; ARM_DOF], None, &mut goals, &move_slot, now)
             .await;
-        assert!(
-            busy.load(Ordering::Acquire),
-            "move in flight holds the slot"
-        );
+        assert!(move_slot.is_claimed(), "move in flight holds the slot");
 
         let stale = Failure::new(
             FailureKind::ResourceUnavailable,
@@ -1087,10 +1070,7 @@ mod tests {
         planner.fail_active(stale.clone()).await;
         let outcome = done_rx.recv().await.expect("the failed move must report");
         assert_eq!(outcome, Outcome::Failed(stale.clone().labelled(Side::Left)));
-        assert!(
-            !busy.load(Ordering::Acquire),
-            "the failure releases the slot"
-        );
+        assert!(!move_slot.is_claimed(), "the failure releases the slot");
         // With nothing active the failure is a no-op.
         planner.fail_active(stale).await;
     }
@@ -1104,17 +1084,14 @@ mod tests {
         let mut planner = test_planner(held);
         let (done_tx, mut done_rx) = mpsc::channel(1);
         let (goal_tx, mut goals) = mpsc::channel(1);
-        let busy = Arc::new(AtomicBool::new(true));
+        let move_slot = claimed_move_slot();
         goal_tx
             .send(Goal::posture_share([0.5; ARM_DOF], done_tx))
             .await
             .expect("queue the goal");
         let now = Instant::now();
-        planner.tick(held, None, &mut goals, &busy, now).await;
-        assert!(
-            busy.load(Ordering::Acquire),
-            "move in flight holds the slot"
-        );
+        planner.tick(held, None, &mut goals, &move_slot, now).await;
+        assert!(move_slot.is_claimed(), "move in flight holds the slot");
 
         let measured_at_stop = [0.1; ARM_DOF];
         let stopped = planner
@@ -1123,7 +1100,7 @@ mod tests {
         assert!(stopped, "a move was in flight");
         let outcome = done_rx.recv().await.expect("the stopped move reports");
         assert_eq!(outcome, Outcome::Cancelled("stopped: operator".to_string()));
-        assert!(!busy.load(Ordering::Acquire), "the stop releases the slot");
+        assert!(!move_slot.is_claimed(), "the stop releases the slot");
         assert_eq!(
             planner.setpoint(),
             held,
@@ -1138,13 +1115,16 @@ mod tests {
 
         // The stop does not latch: a goal that arrives after it runs.
         let (done_tx, mut done_rx) = mpsc::channel(1);
-        busy.store(true, Ordering::Release);
+        assert!(
+            move_slot.claim(),
+            "the next goal's admission claims the slot"
+        );
         goal_tx
             .send(Goal::posture_share([0.2; ARM_DOF], done_tx))
             .await
             .expect("queue the goal");
-        planner.tick(held, None, &mut goals, &busy, now).await;
-        assert!(busy.load(Ordering::Acquire), "the later goal runs");
+        planner.tick(held, None, &mut goals, &move_slot, now).await;
+        assert!(move_slot.is_claimed(), "the later goal runs");
         assert!(
             done_rx.try_recv().is_err(),
             "the later goal is in flight, not ended"
@@ -1160,7 +1140,7 @@ mod tests {
         let target = [0.5; ARM_DOF];
         let mut planner = test_planner(held);
         let (goal_tx, mut goals) = mpsc::channel(1);
-        let busy = Arc::new(AtomicBool::new(true));
+        let move_slot = claimed_move_slot();
 
         // The governor holds every step: no candidate is committed.
         let (done_tx, mut done_rx) = mpsc::channel(1);
@@ -1169,31 +1149,34 @@ mod tests {
             .await
             .expect("queue the goal");
         let now = Instant::now();
-        planner.tick(held, None, &mut goals, &busy, now).await;
-        assert!(busy.load(Ordering::Acquire), "the move is in flight");
+        planner.tick(held, None, &mut goals, &move_slot, now).await;
+        assert!(move_slot.is_claimed(), "the move is in flight");
         planner
             .tick(
                 held,
                 None,
                 &mut goals,
-                &busy,
+                &move_slot,
                 now + Duration::from_secs(3600),
             )
             .await;
         let outcome = done_rx.try_recv().expect("the move ends on its clock");
         assert_eq!(outcome, Outcome::Complete);
         assert_eq!(planner.setpoint(), held, "the arm never left its pose");
-        assert!(!busy.load(Ordering::Acquire), "the end releases the slot");
+        assert!(!move_slot.is_claimed(), "the end releases the slot");
 
         // The governor lets every step through, but the arm stands still.
         let (done_tx, mut done_rx) = mpsc::channel(1);
-        busy.store(true, Ordering::Release);
+        assert!(
+            move_slot.claim(),
+            "the next goal's admission claims the slot"
+        );
         goal_tx
             .send(Goal::posture_share(target, done_tx))
             .await
             .expect("queue the goal");
         let now = Instant::now();
-        let tick = planner.tick(held, None, &mut goals, &busy, now).await;
+        let tick = planner.tick(held, None, &mut goals, &move_slot, now).await;
         planner.commit(tick.candidate);
         let Mode::JointMove(JointMove { traj, .. }) = &planner.mode else {
             panic!("the goal starts a joint move");
@@ -1206,7 +1189,7 @@ mod tests {
                     held,
                     None,
                     &mut goals,
-                    &busy,
+                    &move_slot,
                     motion_start + Duration::from_millis(100 * step),
                 )
                 .await;
@@ -1219,13 +1202,13 @@ mod tests {
                 held,
                 None,
                 &mut goals,
-                &busy,
+                &move_slot,
                 now + Duration::from_secs(3600),
             )
             .await;
         let outcome = done_rx.try_recv().expect("the move ends on its clock");
         assert_eq!(outcome, Outcome::Complete);
-        assert!(!busy.load(Ordering::Acquire), "the end releases the slot");
+        assert!(!move_slot.is_claimed(), "the end releases the slot");
     }
 
     /// The rest posture puts each grasp point lower and closer to the
@@ -1238,10 +1221,10 @@ mod tests {
         let horizontal = |pose: &Isometry3<f64>| pose.translation.x.hypot(pose.translation.y);
         for version in [HardwareVersion::V1, HardwareVersion::V2] {
             for side in Side::BOTH {
-                let model = crate::arm_model(version, side.model()).expect("build the arm");
-                let planner = Planner::new(side, model, test_cfg());
-                let r = planner.world_ee_pose(&ready(side.model()));
-                let h = planner.world_ee_pose(&home(side.model()));
+                let model = bundled_arm(version, side);
+                let planner = Planner::new(side, model, plan_config());
+                let r = planner.world_ee_pose(&ready(side));
+                let h = planner.world_ee_pose(&home(side));
                 let label = format!("{version:?} {}", side);
                 assert!(
                     h.translation.z < r.translation.z,
@@ -1282,10 +1265,10 @@ mod tests {
                 Side::Right => (right_ready, right_home),
                 Side::Left => (mirror(right_ready), mirror(right_home)),
             };
-            let model = crate::arm_model(HardwareVersion::V2, side.model()).expect("build the arm");
-            let planner = Planner::new(side, model, test_cfg());
-            let r = planner.world_ee_pose(&ready(side.model()));
-            let h = planner.world_ee_pose(&home(side.model()));
+            let model = bundled_arm(HardwareVersion::V2, side);
+            let planner = Planner::new(side, model, plan_config());
+            let r = planner.world_ee_pose(&ready(side));
+            let h = planner.world_ee_pose(&home(side));
             assert!(
                 at(&r, ready_grasp),
                 "v2 {} ready grasp point at {:?}",
@@ -1320,7 +1303,7 @@ mod tests {
         let (goal_tx, mut goals) = mpsc::channel(2);
         let (running_tx, mut running_rx) = mpsc::channel(1);
         let (second_tx, mut second_rx) = mpsc::channel(1);
-        let busy = Arc::new(AtomicBool::new(true));
+        let move_slot = claimed_move_slot();
         for (target, done_tx) in [([0.5; ARM_DOF], running_tx), ([0.2; ARM_DOF], second_tx)] {
             goal_tx
                 .send(Goal::posture_share(target, done_tx))
@@ -1328,7 +1311,7 @@ mod tests {
                 .expect("queue the goal");
         }
         planner
-            .tick([0.0; ARM_DOF], None, &mut goals, &busy, Instant::now())
+            .tick([0.0; ARM_DOF], None, &mut goals, &move_slot, Instant::now())
             .await;
         let failure = Failure::new(FailureKind::PreconditionFailed, ANOTHER_MOVE_IN_FLIGHT);
         assert_eq!(
@@ -1336,10 +1319,7 @@ mod tests {
             Outcome::Failed(failure.labelled(Side::Left))
         );
         assert!(running_rx.try_recv().is_err(), "the first move runs on");
-        assert!(
-            busy.load(Ordering::Acquire),
-            "the first move holds the slot"
-        );
+        assert!(move_slot.is_claimed(), "the first move holds the slot");
     }
 
     /// An arm move whose settle times out fails with `timeout`, the verdict's
@@ -1409,13 +1389,13 @@ mod tests {
         // While a move executes, the check is refused as a goal is.
         let (done_tx, _done_rx) = mpsc::channel(1);
         let (goal_tx, mut goals) = mpsc::channel(1);
-        let busy = Arc::new(AtomicBool::new(true));
+        let move_slot = claimed_move_slot();
         goal_tx
             .send(Goal::posture_share(POSE_TEST_Q, done_tx))
             .await
             .expect("queue the goal");
         planner
-            .tick(POSE_TEST_Q, None, &mut goals, &busy, Instant::now())
+            .tick(POSE_TEST_Q, None, &mut goals, &move_slot, Instant::now())
             .await;
         assert_eq!(
             planner.check_cartesian(&near, STREAMED_POSE_TOLERANCE, Duration::ZERO),
@@ -1429,13 +1409,11 @@ mod tests {
         // of ~0.05 (the singularity floor applied by crate::arm_model), hard against the
         // boundary singularity. A power-up pose with the elbow below it must seed at the
         // limit, not off it.
-        let version = openarm_description::HardwareVersion::V1;
-        let model = crate::arm_model(version, openarm_description::Side::Left)
-            .expect("build left arm from bundled URDF");
+        let model = bundled_arm(openarm_description::HardwareVersion::V1, Side::Left);
         let limits = model.limits();
         let cfg = PlanConfig {
             limits,
-            ..test_cfg()
+            ..plan_config()
         };
         let mut planner = Planner::new(Side::Left, model, cfg);
 
@@ -1453,19 +1431,6 @@ mod tests {
             "vendored URDF elbow lower limit is ~0.05"
         );
         assert_eq!(seeded[0], 0.0, "an in-range joint is untouched");
-    }
-
-    #[test]
-    fn busy_guard_releases_slot_on_drop() {
-        let busy = Arc::new(AtomicBool::new(true));
-        {
-            let _g = BusyGuard(busy.clone());
-            assert!(busy.load(Ordering::Acquire));
-        }
-        assert!(
-            !busy.load(Ordering::Acquire),
-            "guard must free the slot on drop, so no move terminal can leak it"
-        );
     }
 
     #[test]
@@ -1502,7 +1467,7 @@ mod tests {
             after < before,
             "the step must close the gap: {before} -> {after}"
         );
-        let cfg = test_cfg();
+        let cfg = plan_config();
         let budget = cfg.ee.linear_m_s * cfg.cycle_period.as_secs_f64();
         assert!(
             after >= before - budget * 1.01,
@@ -1525,7 +1490,7 @@ mod tests {
         let stepped = planner.follow_target(&Some(Upstream::Pose(far)));
         let moved = planner.world_ee_pose(&stepped);
         let travelled = (moved.translation.vector - start.translation.vector).norm();
-        let cfg = test_cfg();
+        let cfg = plan_config();
         let budget = cfg.ee.linear_m_s * cfg.cycle_period.as_secs_f64();
         assert!(
             travelled <= budget * 1.01,
@@ -1544,7 +1509,7 @@ mod tests {
 
         let stepped = planner.follow_target(&Some(Upstream::Pose(twisted)));
         let moved = planner.world_ee_pose(&stepped);
-        let cfg = test_cfg();
+        let cfg = plan_config();
         let budget = cfg.ee.angular_rad_s * cfg.cycle_period.as_secs_f64();
         let turned = moved.rotation.angle_to(&start.rotation);
         assert!(
@@ -1576,12 +1541,13 @@ mod tests {
 
     #[test]
     fn a_consumed_command_holds_the_move_endpoint_until_a_newer_one() {
-        // The move -> Follow handoff at the command-watch seam. An accepted move
-        // clears the side's command watch (what the action handler does with
-        // `send_replace(None)`), so Follow holds at the move's endpoint instead
-        // of chasing the pre-move streamed target, until a command that arrives
-        // after the clear. This locks the contract Follow relies on; that the
-        // handler performs the clear is covered by the live regression.
+        // The move -> Follow handoff at the command-watch seam. While a move
+        // holds the side's move slot, the coordinator's
+        // `consume_streams_of_busy_sides` clears the side's command watch
+        // (`send_replace(None)`) every tick, so Follow holds at the move's
+        // endpoint instead of chasing the pre-move streamed target, until a
+        // command that arrives after the clear. This locks the contract Follow
+        // relies on.
         let (tx, rx) = tokio::sync::watch::channel(None);
         let endpoint = [0.2; ARM_DOF];
         let mut planner = test_planner(endpoint);
@@ -1619,8 +1585,7 @@ mod tests {
     fn a_streamed_pose_arriving_every_second_tick_is_followed_smoothly() {
         use openarm_description::ready;
         let side = Side::Right;
-        let model = crate::arm_model(openarm_description::HardwareVersion::V2, side.model())
-            .expect("build the v2 right arm");
+        let model = bundled_arm(openarm_description::HardwareVersion::V2, side);
         let cfg = PlanConfig {
             max_joint_velocity_rad_s: [
                 16.754666, 16.754666, 5.445426, 5.445426, 20.943946, 20.943946, 20.943946,
@@ -1630,9 +1595,9 @@ mod tests {
                 angular_rad_s: 0.8,
             },
             limits: model.limits(),
-            ..test_cfg()
+            ..plan_config()
         };
-        let start_q = ready(side.model());
+        let start_q = ready(side);
         let mut planner = Planner::new(side, model, cfg);
         planner.commit(start_q);
         let start = planner.world_ee_pose(&start_q);

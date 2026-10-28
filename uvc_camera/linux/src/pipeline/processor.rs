@@ -1,4 +1,9 @@
-use crate::types::{Encoding, Error, Frame, FrameId, Result};
+//! The conversion of a captured frame from the camera's encoding to the
+//! topic's, through RGB8.
+
+use camera_core::encoding::ColorEncoding;
+
+use crate::types::{Error, Frame, FrameId, Result};
 
 /// JPEG encoding quality (1-100)
 const JPEG_QUALITY: u8 = 85;
@@ -109,7 +114,11 @@ fn decode_jpeg(data: &[u8], expected_width: u32, expected_height: u32) -> Result
 ///
 /// When camera encoding already matches the target the frame data is
 /// passed through unchanged.
-pub fn process_frame(frame: Frame, frame_id: FrameId, target_encoding: Encoding) -> Result<Frame> {
+pub fn process_frame(
+    frame: Frame,
+    frame_id: FrameId,
+    target_encoding: ColorEncoding,
+) -> Result<Frame> {
     let camera_encoding = frame.encoding();
 
     // Fast path: no conversion needed
@@ -119,18 +128,20 @@ pub fn process_frame(frame: Frame, frame_id: FrameId, target_encoding: Encoding)
 
     // Step 1: decode camera format to RGB8
     let rgb_data = match camera_encoding {
-        Encoding::Rgb8 => frame.data().to_vec(),
-        Encoding::Bgr8 => rgb_to_bgr(frame.data()), // BGR→RGB is the same channel swap
-        Encoding::Mjpeg => decode_jpeg(frame.data(), frame.width(), frame.height())?,
-        Encoding::Yuyv => yuyv_to_rgb(frame.data(), frame.width(), frame.height())?,
+        ColorEncoding::Rgb8 => frame.data().to_vec(),
+        ColorEncoding::Bgr8 => rgb_to_bgr(frame.data()), // BGR→RGB is the same channel swap
+        ColorEncoding::Mjpeg => decode_jpeg(frame.data(), frame.width(), frame.height())?,
+        ColorEncoding::Yuyv => yuyv_to_rgb(frame.data(), frame.width(), frame.height())?,
     };
 
     // Step 2: encode RGB8 to target
     let data = match target_encoding {
-        Encoding::Rgb8 => rgb_data,
-        Encoding::Bgr8 => rgb_to_bgr(&rgb_data),
-        Encoding::Mjpeg => encode_jpeg(&rgb_data, frame.width(), frame.height(), JPEG_QUALITY)?,
-        Encoding::Yuyv => {
+        ColorEncoding::Rgb8 => rgb_data,
+        ColorEncoding::Bgr8 => rgb_to_bgr(&rgb_data),
+        ColorEncoding::Mjpeg => {
+            encode_jpeg(&rgb_data, frame.width(), frame.height(), JPEG_QUALITY)?
+        }
+        ColorEncoding::Yuyv => {
             return Err(Error::EncodingError(
                 "yuyv topic_encoding is passthrough-only: it requires yuyv camera_encoding"
                     .to_string(),
@@ -151,34 +162,34 @@ mod tests {
     #[test]
     fn test_process_frame_rgb8() {
         let data = vec![255, 0, 0, 0, 255, 0, 0, 0, 255]; // 3 pixels
-        let raw = Frame::from_capture(data.clone(), 3, 1, SystemTime::now(), Encoding::Rgb8);
-        let frame = process_frame(raw, FrameId::default(), Encoding::Rgb8).unwrap();
+        let raw = Frame::from_capture(data.clone(), 3, 1, SystemTime::now(), ColorEncoding::Rgb8);
+        let frame = process_frame(raw, FrameId::default(), ColorEncoding::Rgb8).unwrap();
 
         assert_eq!(frame.data(), &data);
         assert_eq!(frame.width(), 3);
         assert_eq!(frame.height(), 1);
-        assert_eq!(frame.encoding(), Encoding::Rgb8);
+        assert_eq!(frame.encoding(), ColorEncoding::Rgb8);
     }
 
     #[test]
     fn test_process_frame_bgr8() {
         let rgb = vec![255, 0, 0, 0, 255, 0, 0, 0, 255];
-        let raw = Frame::from_capture(rgb, 3, 1, SystemTime::now(), Encoding::Rgb8);
-        let frame = process_frame(raw, FrameId::default(), Encoding::Bgr8).unwrap();
+        let raw = Frame::from_capture(rgb, 3, 1, SystemTime::now(), ColorEncoding::Rgb8);
+        let frame = process_frame(raw, FrameId::default(), ColorEncoding::Bgr8).unwrap();
 
         assert_eq!(frame.data(), &[0, 0, 255, 0, 255, 0, 255, 0, 0]);
-        assert_eq!(frame.encoding(), Encoding::Bgr8);
+        assert_eq!(frame.encoding(), ColorEncoding::Bgr8);
     }
 
     #[test]
     fn test_process_frame_mjpeg() {
         let rgb = vec![255, 0, 0, 0, 255, 0, 0, 0, 255];
-        let raw = Frame::from_capture(rgb, 3, 1, SystemTime::now(), Encoding::Rgb8);
-        let frame = process_frame(raw, FrameId::default(), Encoding::Mjpeg).unwrap();
+        let raw = Frame::from_capture(rgb, 3, 1, SystemTime::now(), ColorEncoding::Rgb8);
+        let frame = process_frame(raw, FrameId::default(), ColorEncoding::Mjpeg).unwrap();
 
         // Check JPEG header
         assert!(frame.data().starts_with(&[0xFF, 0xD8]));
-        assert_eq!(frame.encoding(), Encoding::Mjpeg);
+        assert_eq!(frame.encoding(), ColorEncoding::Mjpeg);
     }
 
     #[test]
@@ -189,10 +200,10 @@ mod tests {
             2,
             1,
             SystemTime::now(),
-            Encoding::Yuyv,
+            ColorEncoding::Yuyv,
         );
-        let frame = process_frame(raw, FrameId::default(), Encoding::Rgb8).unwrap();
-        assert_eq!(frame.encoding(), Encoding::Rgb8);
+        let frame = process_frame(raw, FrameId::default(), ColorEncoding::Rgb8).unwrap();
+        assert_eq!(frame.encoding(), ColorEncoding::Rgb8);
         assert_eq!(frame.data(), &[130, 130, 130, 130, 130, 130]);
     }
 
@@ -227,17 +238,17 @@ mod tests {
     #[test]
     fn test_process_frame_yuyv_passthrough() {
         let data = vec![10u8, 20, 30, 40];
-        let raw = Frame::from_capture(data.clone(), 2, 1, SystemTime::now(), Encoding::Yuyv);
-        let frame = process_frame(raw, FrameId::default(), Encoding::Yuyv).unwrap();
+        let raw = Frame::from_capture(data.clone(), 2, 1, SystemTime::now(), ColorEncoding::Yuyv);
+        let frame = process_frame(raw, FrameId::default(), ColorEncoding::Yuyv).unwrap();
         assert_eq!(frame.data(), &data);
-        assert_eq!(frame.encoding(), Encoding::Yuyv);
+        assert_eq!(frame.encoding(), ColorEncoding::Yuyv);
     }
 
     #[test]
     fn test_yuyv_target_requires_passthrough() {
         let rgb = vec![255, 0, 0, 0, 255, 0, 0, 0, 255];
-        let raw = Frame::from_capture(rgb, 3, 1, SystemTime::now(), Encoding::Rgb8);
-        assert!(process_frame(raw, FrameId::default(), Encoding::Yuyv).is_err());
+        let raw = Frame::from_capture(rgb, 3, 1, SystemTime::now(), ColorEncoding::Rgb8);
+        assert!(process_frame(raw, FrameId::default(), ColorEncoding::Yuyv).is_err());
     }
 
     #[test]
@@ -257,7 +268,7 @@ mod tests {
     fn test_process_frame_fast_path_preserves_data() {
         // When camera encoding == topic encoding, data must be bit-for-bit identical.
         let data = vec![10u8, 20, 30, 40, 50, 60, 70, 80, 90];
-        for enc in [Encoding::Rgb8, Encoding::Bgr8] {
+        for enc in [ColorEncoding::Rgb8, ColorEncoding::Bgr8] {
             let raw = Frame::from_capture(data.clone(), 3, 1, SystemTime::now(), enc);
             let frame = process_frame(raw, FrameId::default(), enc).unwrap();
             assert_eq!(frame.data(), &data, "Fast path altered data for {enc:?}");
@@ -268,9 +279,9 @@ mod tests {
     #[test]
     fn test_process_frame_frame_id_is_set() {
         let data = vec![255u8, 0, 0, 0, 255, 0, 0, 0, 255];
-        let raw = Frame::from_capture(data, 3, 1, SystemTime::now(), Encoding::Rgb8);
+        let raw = Frame::from_capture(data, 3, 1, SystemTime::now(), ColorEncoding::Rgb8);
         let frame_id = FrameId::new(42);
-        let frame = process_frame(raw, frame_id, Encoding::Rgb8).unwrap();
+        let frame = process_frame(raw, frame_id, ColorEncoding::Rgb8).unwrap();
         assert_eq!(frame.frame_id(), frame_id);
     }
 
@@ -281,22 +292,22 @@ mod tests {
         // Two pixels: BGR (0,128,255) and (10,20,30)
         // After BGR→RGB swap they become (255,128,0) and (30,20,10)
         let bgr = vec![0u8, 128, 255, 10, 20, 30];
-        let raw = Frame::from_capture(bgr, 2, 1, SystemTime::now(), Encoding::Bgr8);
-        let frame = process_frame(raw, FrameId::default(), Encoding::Rgb8).unwrap();
+        let raw = Frame::from_capture(bgr, 2, 1, SystemTime::now(), ColorEncoding::Bgr8);
+        let frame = process_frame(raw, FrameId::default(), ColorEncoding::Rgb8).unwrap();
         assert_eq!(frame.data(), &[255u8, 128, 0, 30, 20, 10]);
-        assert_eq!(frame.encoding(), Encoding::Rgb8);
+        assert_eq!(frame.encoding(), ColorEncoding::Rgb8);
     }
 
     #[test]
     fn test_process_frame_bgr8_to_mjpeg() {
         let bgr = vec![0u8; 4 * 3 * 3]; // 4×3 black frame in BGR
-        let raw = Frame::from_capture(bgr, 4, 3, SystemTime::now(), Encoding::Bgr8);
-        let frame = process_frame(raw, FrameId::default(), Encoding::Mjpeg).unwrap();
+        let raw = Frame::from_capture(bgr, 4, 3, SystemTime::now(), ColorEncoding::Bgr8);
+        let frame = process_frame(raw, FrameId::default(), ColorEncoding::Mjpeg).unwrap();
         assert!(
             frame.data().starts_with(&[0xFF, 0xD8]),
             "Expected JPEG header"
         );
-        assert_eq!(frame.encoding(), Encoding::Mjpeg);
+        assert_eq!(frame.encoding(), ColorEncoding::Mjpeg);
     }
 
     // ── MJPEG camera source ───────────────────────────────────────────────────
@@ -306,9 +317,9 @@ mod tests {
         // Encode a 1×1 red pixel as JPEG then decode via process_frame.
         // JPEG is lossy so we only check that the red channel dominates.
         let jpeg = encode_jpeg(&[255u8, 0, 0], 1, 1, JPEG_QUALITY).unwrap();
-        let raw = Frame::from_capture(jpeg, 1, 1, SystemTime::now(), Encoding::Mjpeg);
-        let frame = process_frame(raw, FrameId::default(), Encoding::Rgb8).unwrap();
-        assert_eq!(frame.encoding(), Encoding::Rgb8);
+        let raw = Frame::from_capture(jpeg, 1, 1, SystemTime::now(), ColorEncoding::Mjpeg);
+        let frame = process_frame(raw, FrameId::default(), ColorEncoding::Rgb8).unwrap();
+        assert_eq!(frame.encoding(), ColorEncoding::Rgb8);
         assert_eq!(frame.data().len(), 3);
         assert!(frame.data()[0] > 200, "R channel should be high");
         assert!(frame.data()[1] < 50, "G channel should be low");
@@ -320,9 +331,9 @@ mod tests {
         // Encode a 1×1 pure-blue pixel (RGB: 0,0,255) as JPEG then decode to BGR.
         // In BGR output the blue value moves to index 0.
         let jpeg = encode_jpeg(&[0u8, 0, 255], 1, 1, JPEG_QUALITY).unwrap();
-        let raw = Frame::from_capture(jpeg, 1, 1, SystemTime::now(), Encoding::Mjpeg);
-        let frame = process_frame(raw, FrameId::default(), Encoding::Bgr8).unwrap();
-        assert_eq!(frame.encoding(), Encoding::Bgr8);
+        let raw = Frame::from_capture(jpeg, 1, 1, SystemTime::now(), ColorEncoding::Mjpeg);
+        let frame = process_frame(raw, FrameId::default(), ColorEncoding::Bgr8).unwrap();
+        assert_eq!(frame.encoding(), ColorEncoding::Bgr8);
         assert_eq!(frame.data().len(), 3);
         assert!(
             frame.data()[0] > 200,
@@ -349,10 +360,10 @@ mod tests {
             )
             .unwrap();
 
-        let raw = Frame::from_capture(jpeg, 2, 2, SystemTime::now(), Encoding::Mjpeg);
-        let frame = process_frame(raw, FrameId::default(), Encoding::Rgb8).unwrap();
+        let raw = Frame::from_capture(jpeg, 2, 2, SystemTime::now(), ColorEncoding::Mjpeg);
+        let frame = process_frame(raw, FrameId::default(), ColorEncoding::Rgb8).unwrap();
 
-        assert_eq!(frame.encoding(), Encoding::Rgb8);
+        assert_eq!(frame.encoding(), ColorEncoding::Rgb8);
         assert_eq!(
             frame.data().len(),
             2 * 2 * 3,
@@ -371,8 +382,8 @@ mod tests {
         // the decoded surface is allocated; a hostile header cannot OOM the
         // capture thread.
         let big = encode_jpeg(&[0u8; 4 * 4 * 3], 4, 4, JPEG_QUALITY).unwrap();
-        let raw = Frame::from_capture(big, 2, 2, SystemTime::now(), Encoding::Mjpeg);
-        let err = process_frame(raw, FrameId::default(), Encoding::Rgb8).unwrap_err();
+        let raw = Frame::from_capture(big, 2, 2, SystemTime::now(), ColorEncoding::Mjpeg);
+        let err = process_frame(raw, FrameId::default(), ColorEncoding::Rgb8).unwrap_err();
         assert!(
             err.to_string().contains("Failed to decode JPEG"),
             "expected a decode-limit rejection, got: {err}"
@@ -386,8 +397,8 @@ mod tests {
         // renegotiation mid-stream) must fail instead of publishing a payload
         // that contradicts its width and height.
         let jpeg = encode_jpeg(&[255u8, 0, 0], 1, 1, JPEG_QUALITY).unwrap();
-        let raw = Frame::from_capture(jpeg, 2, 2, SystemTime::now(), Encoding::Mjpeg);
-        let err = process_frame(raw, FrameId::default(), Encoding::Rgb8).unwrap_err();
+        let raw = Frame::from_capture(jpeg, 2, 2, SystemTime::now(), ColorEncoding::Mjpeg);
+        let err = process_frame(raw, FrameId::default(), ColorEncoding::Rgb8).unwrap_err();
         assert!(
             err.to_string()
                 .contains("decoded JPEG is 1x1, expected 2x2"),
@@ -399,10 +410,10 @@ mod tests {
     fn test_process_frame_mjpeg_fast_path() {
         // MJPEG → MJPEG: the encoded bytes must be returned unchanged.
         let jpeg = encode_jpeg(&[128u8, 64, 32], 1, 1, JPEG_QUALITY).unwrap();
-        let raw = Frame::from_capture(jpeg.clone(), 1, 1, SystemTime::now(), Encoding::Mjpeg);
-        let frame = process_frame(raw, FrameId::default(), Encoding::Mjpeg).unwrap();
+        let raw = Frame::from_capture(jpeg.clone(), 1, 1, SystemTime::now(), ColorEncoding::Mjpeg);
+        let frame = process_frame(raw, FrameId::default(), ColorEncoding::Mjpeg).unwrap();
         assert_eq!(frame.data(), &jpeg);
-        assert_eq!(frame.encoding(), Encoding::Mjpeg);
+        assert_eq!(frame.encoding(), ColorEncoding::Mjpeg);
     }
 
     #[test]
@@ -420,10 +431,10 @@ mod tests {
             width,
             height,
             SystemTime::now(),
-            Encoding::Rgb8,
+            ColorEncoding::Rgb8,
         );
-        let mjpeg_frame = process_frame(raw, FrameId::new(1), Encoding::Mjpeg).unwrap();
-        assert_eq!(mjpeg_frame.encoding(), Encoding::Mjpeg);
+        let mjpeg_frame = process_frame(raw, FrameId::new(1), ColorEncoding::Mjpeg).unwrap();
+        assert_eq!(mjpeg_frame.encoding(), ColorEncoding::Mjpeg);
         assert!(mjpeg_frame.data().starts_with(&[0xFF, 0xD8]));
 
         // Step 2: MJPEG → RGB
@@ -432,10 +443,10 @@ mod tests {
             width,
             height,
             SystemTime::now(),
-            Encoding::Mjpeg,
+            ColorEncoding::Mjpeg,
         );
-        let rgb_frame = process_frame(mjpeg_raw, FrameId::new(2), Encoding::Rgb8).unwrap();
-        assert_eq!(rgb_frame.encoding(), Encoding::Rgb8);
+        let rgb_frame = process_frame(mjpeg_raw, FrameId::new(2), ColorEncoding::Rgb8).unwrap();
+        assert_eq!(rgb_frame.encoding(), ColorEncoding::Rgb8);
         assert_eq!(rgb_frame.data().len(), original.len());
 
         for (i, (&orig, &recovered)) in original.iter().zip(rgb_frame.data()).enumerate() {

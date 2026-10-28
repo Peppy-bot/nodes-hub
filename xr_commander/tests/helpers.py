@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import heapq
 import itertools
+import math
 import time
 from types import MappingProxyType, SimpleNamespace
 
@@ -14,17 +15,29 @@ from peppygen.consumed_topics.color_cameras import video_stream as color_video_s
 from peppygen.fixtures import harness
 from peppygen.parameters import Parameters
 
+from xr_commander import config
 from xr_commander.bus import REAL_CLOCK, Answered, Clock, FlashNote, Outcome
 from xr_commander.clutch import HandClutch
 from xr_commander.devices import HandSample, XrFrame
 from xr_commander.drive import Driver, HandState
 from xr_commander.fleet import Fleet, FleetView, Following, Holder, Timing
+from xr_commander import frames
 from xr_commander.frames import Pose
 from xr_commander.panel import HandSource
 from xr_commander.publish import MeasuredPoses
 from xr_commander.robots import PairedRobots
 
 IDENTITY = np.array([0.0, 0.0, 0.0, 1.0])
+
+
+def quat_from_axis_angle(axis: np.ndarray, angle: float) -> np.ndarray:
+    """Rotation of `angle` about `axis`; degenerate axis or zero angle is identity."""
+    axis = np.asarray(axis, dtype=np.float64)
+    norm = float(np.linalg.norm(axis))
+    if norm < frames._EPS or angle == 0.0:
+        return np.array([0.0, 0.0, 0.0, 1.0])
+    half = 0.5 * angle
+    return np.concatenate([(axis / norm) * math.sin(half), [math.cos(half)]])
 
 
 def frame_message(width=1, height=1, encoding="bgr8", data=None):
@@ -44,30 +57,21 @@ Y = np.array([0.0, 1.0, 0.0])
 POSE = Pose(np.zeros(3), IDENTITY)
 
 
-class FakeSession:
-    """A frame source holding one hand-set, stamped now."""
-
-    def __init__(self, hands=None, age_s=0.0):
-        self._hands = hands or {}
-        self._age_s = age_s
-
-    def latest(self):
-        return XrFrame(
-            received_monotonic_s=time.monotonic() - self._age_s, hands=self._hands
-        )
-
-
 def squeezing_hand():
     return HandSample(pose=POSE, squeezing=True, trigger=0.0)
 
 
 class ScriptedHeadset:
-    """A headset whose hands the test sets, its frames stamped on `clock`:
-    the FrameSource seam is a device surface, which a test drives itself."""
+    """A headset whose hands the test sets, its frames stamped on `clock`
+    `age_s` in the past: the FrameSource seam is a device surface, which a
+    test drives itself."""
 
-    def __init__(self, clock: Clock = REAL_CLOCK) -> None:
+    def __init__(
+        self, clock: Clock = REAL_CLOCK, *, hands=None, age_s: float = 0.0
+    ) -> None:
         self._clock = clock
-        self.hands = {}
+        self._age_s = age_s
+        self.hands = hands or {}
         # The trigger of every hand that `press` sets.
         self.trigger = 0.0
 
@@ -86,7 +90,15 @@ class ScriptedHeadset:
         }
 
     def latest(self):
-        return XrFrame(received_monotonic_s=self._clock.monotonic(), hands=self.hands)
+        return XrFrame(
+            received_monotonic_s=self._clock.monotonic() - self._age_s,
+            hands=self.hands,
+        )
+
+
+def left_buttons(*, x=False, y=False) -> dict:
+    """`ScriptedHeadset.press`'s left hand with X and Y as given, no squeeze."""
+    return {"left": (x, y, False)}
 
 
 # A stand-in for the chosen robot's pair on a slot, for tests that read the
@@ -129,6 +141,11 @@ def default_parameters(**overrides) -> SimpleNamespace:
     }
     values.update(overrides)
     return SimpleNamespace(**values)
+
+
+def default_settings(**overrides) -> config.Settings:
+    """The settings `default_parameters(**overrides)` parse into."""
+    return config.from_parameters(default_parameters(**overrides))
 
 
 async def idle_setup(params, node_runner):
@@ -249,9 +266,9 @@ async def press_until_goal(session, mock_action, release, press):
 async def tap_x(session, *, settle=0.05):
     """One observed X press edge: release, let the tracker see it, press.
     The sleep spans the tracker's frame cadence, not a node wait."""
-    session.press(x=False)
+    session.press(**left_buttons(x=False))
     await asyncio.sleep(settle)
-    session.press(x=True)
+    session.press(**left_buttons(x=True))
 
 
 # The reason of a goal that its caller cancelled.
@@ -262,9 +279,9 @@ async def stop_and_save(session, active, cancelled_result, *, settle=0.05):
     """The second X press of an episode: stop-and-save, not a fresh goal. It
     cancels the active goal, and the recorder ends the goal cancelled, for
     the reason of the caller's cancel, with its result."""
-    session.press(x=False)
+    session.press(**left_buttons(x=False))
     await asyncio.sleep(settle)
-    session.press(x=True)
+    session.press(**left_buttons(x=True))
     await asyncio.wait_for(active.cancel_signal(), 10.0)
     await active.complete_cancelled(CANCELLED_BY_CALLER, cancelled_result)
 

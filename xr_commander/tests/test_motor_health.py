@@ -7,9 +7,8 @@ from peppygen.consumed_topics.motor_health import motor_health as motor_health_t
 from tests.helpers import FakeToken, boot, eventually, running_drain
 from xr_commander.motor_health import (
     HEALTH_STALE_AFTER_MS,
-    NOT_REPORTING,
-    WARNING,
     HealthRow,
+    Level,
     MotorHealthReports,
     drain_motor_health,
     health_rows,
@@ -150,7 +149,7 @@ def test_a_stale_instance_collapses_to_one_not_reporting_row():
     clock["now"] += 0.001
     rows = health_rows(store.by_instance())
     assert [row.text for row in rows] == ["LEFT ARM not reporting"]
-    assert rows[0].level == NOT_REPORTING
+    assert rows[0].level == Level.NOT_REPORTING
 
 
 def test_a_re_emit_refreshes_the_staleness_clock():
@@ -195,7 +194,7 @@ def test_a_single_motor_instance_is_one_row_carrying_its_name():
     report(store, instance="left_gripper", levels=(1,))
     (row,) = health_rows(store.by_instance())
     assert row.text.startswith("LEFT GRIPPER WARNING")
-    assert row.level == WARNING
+    assert row.level == Level.WARNING
 
 
 def test_a_sensed_motor_row_reads_compactly():
@@ -212,7 +211,7 @@ def test_a_sensed_motor_row_reads_compactly():
     rows = health_rows(store.by_instance())
     assert rows[0].text == "LEFT ARM (6 nominal)"
     assert rows[1].text == "j2 WARNING peak 48% rated 96% sust 93% 41C/38C"
-    assert rows[1].level == WARNING
+    assert rows[1].level == Level.WARNING
 
 
 def test_an_unsensed_report_shows_state_words_only():
@@ -221,7 +220,7 @@ def test_an_unsensed_report_shows_state_words_only():
     rows = health_rows(store.by_instance())
     assert rows[0].text == "LEFT ARM (6 nominal)"
     assert rows[1].text == "j2 NOT REPORTING"
-    assert rows[1].level == NOT_REPORTING
+    assert rows[1].level == Level.NOT_REPORTING
 
 
 def test_an_unsensed_all_nominal_report_is_the_bare_state_word():

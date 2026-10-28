@@ -19,8 +19,9 @@ import numpy as np
 
 
 def rate_step(current: float, target: float, max_step: float) -> float:
-    """The gripper's scalar form: the target itself once within one step's
-    cap (exact landing, no float residue), else one cap-sized step."""
+    """One scalar step toward `target`: the target itself once within the
+    cap (exact landing, no float residue), else one cap-sized step. The
+    gripper's ramp and each joint of the pose path step through it."""
     delta = target - current
     if abs(delta) <= max_step:
         return target

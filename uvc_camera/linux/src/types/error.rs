@@ -9,9 +9,6 @@ pub enum Error {
     /// Image encoding failed
     EncodingError(String),
 
-    /// Device path parsing failed
-    InvalidDevicePath(String),
-
     /// Generic error with context
     Other(String),
 }
@@ -21,7 +18,6 @@ impl fmt::Display for Error {
         match self {
             Self::Camera(msg) => write!(f, "Camera error: {msg}"),
             Self::EncodingError(msg) => write!(f, "Encoding error: {msg}"),
-            Self::InvalidDevicePath(path) => write!(f, "Invalid device path: {path}"),
             Self::Other(msg) => write!(f, "{msg}"),
         }
     }

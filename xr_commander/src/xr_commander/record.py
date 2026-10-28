@@ -21,12 +21,18 @@ from xr_commander.bus import (
     FlashNote,
     Latch,
     cause,
+    fire_goal,
     log,
     ticks,
 )
 from xr_commander.config import Settings
-from xr_commander.devices import FrameSource, fresh_sample
-from xr_commander.publish import fire_goal
+from xr_commander.devices import (
+    RECORDER_HAND,
+    FrameSource,
+    RisingEdge,
+    fresh_sample,
+    primary_pressed,
+)
 from xr_commander.robots import PairedRobots
 
 
@@ -116,19 +122,17 @@ async def run_recorder_buttons(
     """
     unbound = Latch()
 
-    # None until X has been observed at all: a thumb already down on the
-    # first tracked frame is not a press, and neither is one held across a
-    # stale gap. Rising edges exist only against an observed release.
-    prev_x: bool | None = None
+    x_button = RisingEdge()
     held_y_since: float | None = None
     finish_fired = False
     episode: _Episode | None = None
 
     try:
         async for _ in ticks(settings.tick_period_s, token, clock):
-            left = fresh_sample(session, "left", settings.stale_timeout_s, clock)
-            x = left.primary_button if left is not None else prev_x
-            rising_x = bool(x) and prev_x is False
+            left = fresh_sample(session, RECORDER_HAND, settings.stale_timeout_s, clock)
+            rising_x = x_button.step(
+                primary_pressed(left) if left is not None else None
+            )
             y = bool(left and left.secondary_button)
             loop_now = clock.monotonic()
 
@@ -181,7 +185,6 @@ async def run_recorder_buttons(
                 held_y_since is not None
                 and loop_now - held_y_since >= timing.finish_hold_s
             )
-            prev_x = x
     finally:
         if episode is not None:
             episode.watcher.cancel()

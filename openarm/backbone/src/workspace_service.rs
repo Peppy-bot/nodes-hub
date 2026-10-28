@@ -14,6 +14,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use control_core::sync::wait_for;
 use peppygen::NodeRunner;
 use peppygen::consumed_services::perception_geometry::{
     get_color_intrinsics, get_depth_intrinsics,
@@ -155,7 +156,7 @@ fn read_view_check(
     ) else {
         return Ok(workspace.unlinked_view_check());
     };
-    let (colour, depth) = tokio::runtime::Handle::current().block_on(async {
+    let (colour, depth) = wait_for(async {
         tokio::join!(
             get_color_intrinsics::poll(runner, linked, GEOMETRY_TIMEOUT),
             get_depth_intrinsics::poll(runner, linked, GEOMETRY_TIMEOUT),

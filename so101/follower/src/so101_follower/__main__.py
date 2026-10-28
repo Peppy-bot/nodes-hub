@@ -19,15 +19,12 @@ from peppygen.paired_topics.arm import joint_setpoints, joint_states
 from peppygen.paired_topics.gripper import gripper_setpoints, gripper_states
 from peppygen.parameters import Parameters
 from so101_description import units
+from so101_description.device import PositionSample
 from so101_description.setpoints import parse_gripper_setpoint, parse_joint_setpoints
+from so101_description.staleness import WIRE_AGE_LIMIT_S
 
 from so101_follower import params as params_mod
-from so101_follower.device import (
-    STALE_WIRE_TIMEOUT_S,
-    DeviceLoop,
-    LerobotFollower,
-    StateSnapshot,
-)
+from so101_follower.device import DeviceLoop, LerobotFollower
 from so101_follower.health import (
     EWMA_TAU_S,
     HEALTH_RATE_HZ,
@@ -73,19 +70,19 @@ async def _stream_states(
     period_s: float,
     token: CancellationToken,
 ):
-    """One measured-state stream: publish build(snapshot) for every snapshot
+    """One measured-state stream: publish build(sample) for every sample
     the hardware loop refreshed. A tick it did not refresh is skipped, so a
     wedged loop goes silent rather than streaming stale-as-fresh."""
     publisher = await topic_module.declare_publisher(node_runner)
     failing = runtime.Latch()
     last_captured = 0.0
     async for _ in runtime.ticks(period_s, token):
-        snapshot = device.latest_state()
-        if snapshot is None or snapshot.captured_monotonic == last_captured:
+        sample = device.latest_sample()
+        if sample is None or sample.captured_monotonic == last_captured:
             continue
-        last_captured = snapshot.captured_monotonic
+        last_captured = sample.captured_monotonic
         try:
-            await publisher.publish(build(snapshot))
+            await publisher.publish(build(sample))
             failing.clear()
         except Exception as e:
             failing.trip(f"{topic_module.TOPIC_NAME} publish failing: {e!r}")
@@ -103,7 +100,7 @@ async def _consume_setpoints(
     carries motor conditions only."""
     subscription = await topic_module.subscribe(node_runner)
     await runtime.consume_gated(
-        subscription, token, label, _now_s, STALE_WIRE_TIMEOUT_S, parse_and_submit,
+        subscription, token, label, _now_s, WIRE_AGE_LIMIT_S, parse_and_submit,
     )
 
 
@@ -207,9 +204,9 @@ async def _stream_health(
 
 def _bus_age_s(device: DeviceLoop) -> float:
     """Seconds since the last successful state read."""
-    snapshot = device.latest_state()
-    assert snapshot is not None, "bringup verifies a first read before the watcher starts"
-    return time.monotonic() - snapshot.captured_monotonic
+    sample = device.latest_sample()
+    assert sample is not None, "bringup verifies a first read before the watcher starts"
+    return time.monotonic() - sample.captured_monotonic
 
 
 async def _watch_bus(
@@ -255,12 +252,12 @@ def make_setup(hardware_factory=_lerobot_hardware):
         device.start()
         runtime.log(f"connected and calibrated ({config.robot_id} on {config.device_path})")
 
-        async def release_arm():
+        async def release_device():
             # Off the event loop: joining the device thread must not stall
             # the rest of shutdown inside the daemon's grace window.
             await asyncio.to_thread(device.stop)
 
-        node_runner.on_shutdown(release_arm)
+        node_runner.on_shutdown(release_device)
 
         alert_publisher = await alerts_topic.declare_publisher(node_runner)
         alert_bus = _AlertBus(alert_publisher)
@@ -275,17 +272,17 @@ def make_setup(hardware_factory=_lerobot_hardware):
             opening = parse_gripper_setpoint(message.opening, message.max_effort)
             device.submit_gripper_target(units.gripper_percent_from_fraction(opening))
 
-        def build_joint_states(snapshot: StateSnapshot):
-            positions = list(units.joints_rad_from_deg(snapshot.positions_deg))
-            stamp = _captured_timestamp_s(snapshot.captured_monotonic)
+        def build_joint_states(sample: PositionSample):
+            positions = list(units.joints_rad_from_deg(sample.positions_deg))
+            stamp = _captured_timestamp_s(sample.captured_monotonic)
             return joint_states.build_message(stamp, positions, [], [])
 
-        def build_gripper_states(snapshot: StateSnapshot):
-            opening = units.gripper_fraction_from_percent(snapshot.gripper_percent)
+        def build_gripper_states(sample: PositionSample):
+            opening = units.gripper_fraction_from_percent(sample.gripper_percent)
             # The gripper's load reading has no torque constant to convert it
             # to the wire's opening-frame effort, and the firmware ceiling is
             # not per-command, so effort and max_effort ride 0 per the contract.
-            stamp = _captured_timestamp_s(snapshot.captured_monotonic)
+            stamp = _captured_timestamp_s(sample.captured_monotonic)
             return gripper_states.build_message(stamp, opening, 0.0, 0.0)
 
         token = node_runner.cancellation_token()

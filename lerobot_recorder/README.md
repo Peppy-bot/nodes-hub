@@ -83,7 +83,7 @@ with different cameras, rates, or joints gets the same error reply, with
 the difference named. Each session also records which source fed which
 dimension (`session.json`), and a launch that binds the same sources to
 different limbs gets that error reply too: features alone cannot catch that
-swap, since limbs keep their follower-derived names either way. A name that
+swap, since limbs keep the names of their command links either way. A name that
 names no session of this node, or a session with no saved episode, gets an
 error reply with `rejected`. After an error reply the open session stays as
 it was. After

@@ -5,18 +5,17 @@
 //! listener. All motion and stream logic lives in the sibling modules; this is
 //! only the assembly.
 
-use crate::side::{ArmPair, Side, limb_names};
-use crate::types::JointVec;
-
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use control_core::positive_finite::{NotPositiveFinite, PositiveFinite};
 use control_core::time::{RateOutOfRange, period_from_hz};
-use openarm_description::HardwareVersion;
+use openarm_description::{ArmPair, HardwareVersion, Side};
 use peppygen::consumed_topics::collision_ctrl::governor_control;
 use peppygen::exposed_services::limb_state::get_limb_names;
 use peppygen::{NodeRunner, Parameters, Result};
+use srs_model::JointVec;
+use srs_model::chain_kinematics::EeCaps;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tracing::{error, info};
@@ -26,15 +25,16 @@ use crate::camera_mounts::{self, CameraMounts};
 use crate::coordinator::{self, ArmChannels};
 use crate::governor;
 use crate::liveness;
+use crate::move_slot::MoveSlot;
 use crate::planner::{PlanConfig, Planner};
 use crate::serving;
 use crate::startup;
 use crate::streams;
 use crate::streams::LeaderActivity;
+use crate::types::limb_names;
 use crate::upstream::UpstreamMode;
 use crate::workspace::Workspace;
 use crate::workspace_service;
-use srs_model::chain_kinematics::EeCaps;
 
 /// The fastest the coordination loop is driven. It paces the same 1 Mbit
 /// CAN FD arms as openarm_arm; the stack runs at 100 Hz.
@@ -293,10 +293,9 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     // resolved from the description rather than configured, so a v2 launch cannot
     // inherit a v1 name. The collision model walks the same chains and takes the
     // base links directly.
-    let bases = ArmPair::from_fn(|side| hardware_version.base_link(side.model()));
+    let bases = ArmPair::from_fn(|side| hardware_version.base_link(side));
     let build_arm = |side: Side| {
-        arm_model(hardware_version, side.model())
-            .map_err(|source| NodeError::ArmModel { side, source })
+        arm_model(hardware_version, side).map_err(|source| NodeError::ArmModel { side, source })
     };
     let build_arms = || ArmPair::from_fn(&build_arm).transpose();
     let models = build_arms()?;
@@ -330,7 +329,7 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
             .iter()
             .copied()
             .fold(0.0_f64, f64::max),
-        max_ee_velocity.get(),
+        max_ee_velocity,
         params.max_gripper_rate_frac_s,
         params.collision_governor_enabled,
     )?;
@@ -397,8 +396,8 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     // The grasp poses of the last limb_state snapshot, for the camera
     // mounts service.
     let (grasps_tx, grasps_rx) = watch::channel(None);
-    let busy = ArmPair::from_fn(|_| Arc::new(AtomicBool::new(false)));
-    let gripper_busy = ArmPair::from_fn(|_| Arc::new(AtomicBool::new(false)));
+    let move_slots = ArmPair::from_fn(|_| MoveSlot::default());
+    let gripper_move_slots = ArmPair::from_fn(|_| MoveSlot::default());
     // Whether each limb's follower delivers fresh state: the coordinator
     // writes these every tick, and the goal handlers refuse on them.
     let fresh = ArmPair::from_fn(|_| Arc::new(AtomicBool::new(false)));
@@ -425,9 +424,9 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
             measured: measured_txs[side].subscribe(),
             gripper: gripper_state_txs[side].subscribe(),
             goals,
-            busy: busy[side].clone(),
+            move_slot: move_slots[side].clone(),
             gripper_goals,
-            gripper_busy: gripper_busy[side].clone(),
+            gripper_move_slot: gripper_move_slots[side].clone(),
             fresh: fresh[side].clone(),
             gripper_fresh: gripper_fresh[side].clone(),
         });
@@ -501,7 +500,7 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         set.spawn(actions::arm::run_move_arm_joints(
             runner.clone(),
             goal_txs.clone(),
-            busy.clone(),
+            move_slots.clone(),
             fresh.clone(),
             arm_activity.clone(),
             limits,
@@ -509,14 +508,14 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         set.spawn(actions::arm::run_move_arm(
             runner.clone(),
             goal_txs.clone(),
-            busy.clone(),
+            move_slots.clone(),
             fresh.clone(),
             arm_activity.clone(),
         ));
         set.spawn(actions::postures::run_move_to_ready(
             runner.clone(),
             goal_txs.clone(),
-            busy.clone(),
+            move_slots.clone(),
             fresh.clone(),
             arm_activity.clone(),
             request_tx.clone(),
@@ -524,7 +523,7 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         set.spawn(actions::postures::run_move_to_home(
             runner.clone(),
             goal_txs,
-            busy,
+            move_slots,
             fresh.clone(),
             arm_activity.clone(),
             request_tx.clone(),
@@ -532,7 +531,7 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         set.spawn(actions::gripper::run_move_gripper(
             runner.clone(),
             gripper_goal_txs,
-            gripper_busy,
+            gripper_move_slots,
             gripper_fresh.clone(),
             gripper_activity.clone(),
         ));

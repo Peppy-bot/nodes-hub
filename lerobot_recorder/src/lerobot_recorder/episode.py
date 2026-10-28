@@ -26,20 +26,46 @@ import asyncio
 import contextlib
 import math
 import shutil
+from collections.abc import Callable
 from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
 
 import peppygen.clock
 from peppygen.exposed_actions.recording import record_episode
 from peppygen.exposed_services.recording import finish_session, resume_session
 
 from . import recording
+from .log import log
 from .plan import RecordingPlan
 from .recording import Cache, NotReady, SampleGap, SourceSchema
 from .sink import Sink
+from .storage import Mirror
 
 # Generous for one local service round-trip; a camera that cannot answer
 # depth_stream_info in this long is not going to stream either.
-DEPTH_INFO_TIMEOUT_S = 5.0
+_DEPTH_INFO_TIMEOUT_S = 5.0
+
+
+class Activity(Enum):
+    """What the recorder does: at most one of recording an episode,
+    finishing the session and resuming another session at a time."""
+
+    IDLE = "idle"
+    RECORDING = "recording"
+    FINISHING = "finishing"
+    RESUMING = "resuming"
+
+
+@dataclass(frozen=True)
+class Session:
+    """One recording session: its directory, the sink that writes its
+    dataset, and the mirror that uploads it, None without an S3
+    destination."""
+
+    directory: Path
+    sink: Sink
+    mirror: Mirror | None
 
 
 @dataclass(frozen=True)
@@ -54,7 +80,7 @@ class Timing:
     max_schedule_lag_s: float = recording.MAX_SCHEDULE_LAG_S
 
 
-async def poll_depth_units(node_runner, plan: RecordingPlan) -> list[float]:
+async def _poll_depth_units(node_runner, plan: RecordingPlan) -> list[float]:
     """Each bound rgbd camera's current depth unit, from the wire."""
     from peppygen.consumed_services.rgbd_cameras import (
         depth_stream_info as rgbd_cameras_depth_stream_info,
@@ -66,7 +92,7 @@ async def poll_depth_units(node_runner, plan: RecordingPlan) -> list[float]:
     units = [
         (
             await rgbd_cameras_depth_stream_info.poll(
-                node_runner, producer, DEPTH_INFO_TIMEOUT_S
+                node_runner, producer, _DEPTH_INFO_TIMEOUT_S
             )
         ).data.depth_unit
         for producer in rgbd_cameras_video_stream.bound_producers(node_runner)
@@ -80,7 +106,7 @@ def _log_sync_failure(task: asyncio.Task) -> None:
         return
     error = task.exception()
     if error is not None:
-        print(f"[recorder] mirror sync failed (next sync retries): {error!r}")
+        log(f"mirror sync failed (next sync retries): {error!r}")
 
 
 def _low_disk(free: int) -> str:
@@ -100,7 +126,7 @@ async def _end_goal(end, *args) -> None:
     try:
         await end(*args)
     except Exception as e:
-        print(f"[recorder] result delivery failed: {e!r}")
+        log(f"result delivery failed: {e!r}")
 
 
 class _TickReport:
@@ -128,8 +154,8 @@ class _TickReport:
     def flush(self) -> None:
         if self._overruns:
             total, sample_s, append_s = self._worst
-            print(
-                f"[recorder] {self._overruns} tick overrun(s): worst "
+            log(
+                f"{self._overruns} tick overrun(s): worst "
                 f"{total * 1000:.0f} ms (sample {sample_s * 1000:.0f} ms, "
                 f"append {append_s * 1000:.0f} ms) against {self._period_s * 1000:.0f} ms"
             )
@@ -145,33 +171,29 @@ class Recorder:
         self,
         plan: RecordingPlan,
         cache: Cache,
-        sink: Sink,
-        session_dir,
+        session: Session,
         max_staleness_s: float,
         min_remaining_disk_bytes: int,
-        mirror=None,
-        open_session=None,
-        open_existing=None,
+        open_session: Callable[[], Session] | None = None,
+        open_existing: Callable[[str], Session] | None = None,
         *,
         now_ns=peppygen.clock.now_ns,
         disk_usage=shutil.disk_usage,
-        depth_probe=poll_depth_units,
+        depth_probe=_poll_depth_units,
         timing: Timing = Timing(),
     ):
         if not math.isfinite(max_staleness_s) or max_staleness_s <= 0:
             raise ValueError(f"max_staleness_s must be positive, got {max_staleness_s}")
         self._plan = plan
         self._cache = cache
-        self._sink = sink
-        self._session_dir = session_dir
+        self._session = session
         self._max_staleness_s = max_staleness_s
         self._min_remaining_disk_bytes = min_remaining_disk_bytes
-        self._mirror = mirror
-        # () -> (session_dir, sink, mirror): opens the next session when the
-        # current one finishes; None disables finish_session.
+        # Opens the next session when the current one finishes; None disables
+        # finish_session.
         self._open_session = open_session
-        # (name) -> (session_dir, sink, mirror) for an existing session,
-        # raising resume_session.Failure: `rejected` for a name that names no
+        # Opens an existing session by its name, raising
+        # resume_session.Failure: `rejected` for a name that names no
         # session of this recorder, `precondition_failed` for a session whose
         # sources differ from the ones this launch binds. None disables
         # resume_session.
@@ -180,15 +202,19 @@ class Recorder:
         self._disk_usage = disk_usage
         self._depth_probe = depth_probe
         self._timing = timing
-        self._finishing = False
-        self._resuming = False
+        self._activity = Activity.IDLE
         # Set between a session's successful finalize and the roll to its
         # successor; while pending the finalized sink must not take frames.
         self._roll_pending = False
         self._sync_task: asyncio.Task | None = None
         self._schema: SourceSchema | None = None
-        self._recording = False
         self._create_lock = asyncio.Lock()
+
+    def _end(self, activity: Activity) -> None:
+        """Back to idle once `activity` ends, if it is what the recorder
+        does."""
+        if self._activity is activity:
+            self._activity = Activity.IDLE
 
     async def run(self, node_runner) -> None:
         token = node_runner.cancellation_token()
@@ -208,8 +234,8 @@ class Recorder:
                     # Serving one goal must not end the goal server: without
                     # this, every later goal would hang undecided for the
                     # node's life with nothing logged until shutdown.
-                    print(f"[recorder] goal request failed: {e!r}")
-                    self._recording = False
+                    log(f"goal request failed: {e!r}")
+                    self._end(Activity.RECORDING)
                     pending = asyncio.ensure_future(
                         action.handle_goal_next_request(self._decide)
                     )
@@ -226,7 +252,7 @@ class Recorder:
                 except Exception as e:
                     await self._contain_episode_failure(ctx, e)
                 finally:
-                    self._recording = False
+                    self._end(Activity.RECORDING)
         finally:
             pending.cancel()
             cancelled.cancel()
@@ -252,7 +278,7 @@ class Recorder:
                 # without a line every retry.
                 if repr(e) != last_reason:
                     last_reason = repr(e)
-                    print(f"[recorder] dataset not ready yet: {last_reason}")
+                    log(f"dataset not ready yet: {last_reason}")
                 await asyncio.sleep(self._timing.warmup_retry_s)
 
     async def _ensure_created(self, node_runner) -> None:
@@ -262,9 +288,9 @@ class Recorder:
             if self._schema is not None:
                 return
             schema = await self._capture_schema(node_runner)
-            await self._sink.create(schema, self._plan)
+            await self._session.sink.create(schema, self._plan)
             self._schema = schema
-            print("[recorder] dataset ready")
+            log("dataset ready")
 
     async def finish_session(self) -> str:
         """Finalize and mirror the current dataset (the end of a lerobot
@@ -278,40 +304,40 @@ class Recorder:
         refusal = self._finish_refusal()
         if refusal is not None:
             raise finish_session.Failure(finish_session.FailureKind.PRECONDITION_FAILED, refusal)
-        self._finishing = True
+        self._activity = Activity.FINISHING
         try:
-            name = self._session_dir.name
+            name = self._session.directory.name
             if not self._roll_pending:
                 await self.drain_mirror()
-                await self._sink.finalize()
-                if self._mirror is not None:
-                    await asyncio.to_thread(self._mirror.sync)
+                await self._session.sink.finalize()
+                if self._session.mirror is not None:
+                    await asyncio.to_thread(self._session.mirror.sync)
                 # The old dataset is finalized from here on; until the roll
                 # lands, goals must be refused rather than recorded into it.
                 self._roll_pending = True
-            self._session_dir, self._sink, self._mirror = self._open_session()
+            self._session = self._open_session()
             self._roll_pending = False
             self._schema = None
-            print(f"[recorder] session {name} finished and ready for replay")
+            log(f"session {name} finished and ready for replay")
             return name
         except Exception as e:
             raise finish_session.Failure(
                 finish_session.FailureKind.ATTEMPT_FAILED, f"finish failed: {e}"
             ) from e
         finally:
-            self._finishing = False
+            self._end(Activity.FINISHING)
 
     def _finish_refusal(self) -> str | None:
         """Why the recorder cannot finish the session now, or None."""
-        if self._recording:
+        if self._activity is Activity.RECORDING:
             return "an episode is recording"
-        if self._finishing:
+        if self._activity is Activity.FINISHING:
             return "already finishing"
-        if self._resuming:
+        if self._activity is Activity.RESUMING:
             return "resuming a session"
         # An uncreated dataset holds no episodes and cannot answer
         # episodes_saved, so the emptiness check leads with it.
-        if not self._sink.created or self._sink.episodes_saved == 0:
+        if not self._session.sink.created or self._session.sink.episodes_saved == 0:
             return "nothing recorded this session"
         if self._open_session is None:
             return "session rolling unavailable"
@@ -330,11 +356,11 @@ class Recorder:
         refusal = self._resume_refusal(name)
         if refusal is not None:
             raise resume_session.Failure(resume_session.FailureKind.PRECONDITION_FAILED, refusal)
-        self._resuming = True
+        self._activity = Activity.RESUMING
         try:
-            session_dir, new_sink, new_mirror = self._open_existing(name)
+            session = self._open_existing(name)
             try:
-                manifest = await new_sink.preflight_resume()
+                manifest = await session.sink.preflight_resume()
             except ValueError as e:
                 # The dataset on disk holds nothing this recorder can append
                 # to: no dataset, no saved episode, unreadable metadata.
@@ -354,14 +380,14 @@ class Recorder:
                         f"not ready to resume: {e}",
                     ) from None
                 try:
-                    await new_sink.resume(manifest, schema, self._plan)
+                    await session.sink.resume(manifest, schema, self._plan)
                 except ValueError as e:
                     raise resume_session.Failure(
                         resume_session.FailureKind.PRECONDITION_FAILED,
                         f"cannot resume {name}: {e}",
                     ) from None
-                old_sink = self._sink
-                self._session_dir, self._sink, self._mirror = session_dir, new_sink, new_mirror
+                old_sink = self._session.sink
+                self._session = session
                 self._schema = schema
             # The abandoned session's dataset (if warm-up created one) holds
             # image-writer threads only finalize stops; on a zero-episode
@@ -370,9 +396,9 @@ class Recorder:
                 try:
                     await old_sink.finalize()
                 except Exception as e:
-                    print(f"[recorder] abandoned session close failed: {e!r}")
-            episodes = new_sink.episodes_saved
-            print(f"[recorder] session {name} resumed with {episodes} episode(s)")
+                    log(f"abandoned session close failed: {e!r}")
+            episodes = session.sink.episodes_saved
+            log(f"session {name} resumed with {episodes} episode(s)")
             return name, episodes
         except resume_session.Failure:
             raise
@@ -381,25 +407,25 @@ class Recorder:
                 resume_session.FailureKind.ATTEMPT_FAILED, f"resume failed: {e}"
             ) from e
         finally:
-            self._resuming = False
+            self._end(Activity.RESUMING)
 
     def _resume_refusal(self, name: str) -> str | None:
         """Why the recorder cannot change to the session `name` now, or
         None."""
-        if self._recording:
+        if self._activity is Activity.RECORDING:
             return "an episode is recording"
-        if self._finishing:
+        if self._activity is Activity.FINISHING:
             return "finishing the session"
-        if self._resuming:
+        if self._activity is Activity.RESUMING:
             return "already resuming"
         if self._roll_pending:
             return "session finished but not rolled; retry finish_session"
-        if self._sink.created and self._sink.episodes_saved > 0:
+        if self._session.sink.created and self._session.sink.episodes_saved > 0:
             return (
                 f"current session already holds "
-                f"{self._sink.episodes_saved} episode(s); finish it first"
+                f"{self._session.sink.episodes_saved} episode(s); finish it first"
             )
-        if name == self._session_dir.name:
+        if name == self._session.directory.name:
             return "that session is currently recording"
         if self._open_existing is None:
             return "session resume unavailable"
@@ -411,28 +437,28 @@ class Recorder:
         now-valid files. The storage root keeps the local dataset."""
         await self.drain_mirror()
         try:
-            await self._sink.finalize()
+            await self._session.sink.finalize()
         except Exception as e:
             # Without footers the files are not the "now-valid" set the final
             # pass exists to publish; syncing them would stamp a broken remote
             # copy as final. The incremental mirror state stays as-is.
-            print(f"[recorder] dataset finalize failed; final mirror pass skipped: {e!r}")
+            log(f"dataset finalize failed; final mirror pass skipped: {e!r}")
             return
-        if self._mirror is not None:
+        if self._session.mirror is not None:
             # The whole shutdown hook runs inside the daemon's
             # shutdown_grace_secs window; the start line makes a cut-off pass
             # visible (no completion line) and the README documents recovery.
             # Flushed: a force-kill mid-pass must not eat the marker it exists
             # to leave behind.
-            print("[recorder] final mirror pass starting", flush=True)
+            log("final mirror pass starting", flush=True)
             try:
-                files, size = await asyncio.to_thread(self._mirror.sync)
+                files, size = await asyncio.to_thread(self._session.mirror.sync)
             except Exception as e:
-                print(f"[recorder] final mirror sync failed, local copy kept: {e!r}", flush=True)
+                log(f"final mirror sync failed, local copy kept: {e!r}", flush=True)
             else:
-                print(
-                    f"[recorder] mirror complete ({files} files, {size >> 20} MB); "
-                    f"local copy kept at {self._session_dir}",
+                log(
+                    f"mirror complete ({files} files, {size >> 20} MB); "
+                    f"local copy kept at {self._session.directory}",
                     flush=True,
                 )
 
@@ -461,15 +487,15 @@ class Recorder:
             )
         # Claimed at admission, not when the run loop wakes: finish_session
         # must not slip between accepting a goal and starting its episode.
-        self._recording = True
+        self._activity = Activity.RECORDING
         return record_episode.GoalDecision.accept()
 
     def _goal_refusal(self) -> str | None:
-        if self._recording:
+        if self._activity is Activity.RECORDING:
             return "an episode is already recording"
-        if self._finishing:
+        if self._activity is Activity.FINISHING:
             return "finishing the session"
-        if self._resuming:
+        if self._activity is Activity.RESUMING:
             return "resuming a session"
         if self._roll_pending:
             return "session finished but not rolled; retry finish_session"
@@ -480,7 +506,7 @@ class Recorder:
             now_ns = self._now_ns()
         except RuntimeError as e:
             return f"recorder clock not ready: {e}"
-        free = self._disk_usage(self._session_dir).free
+        free = self._disk_usage(self._session.directory).free
         if free < self._min_remaining_disk_bytes:
             return _low_disk(free)
         # Probed on every goal, so a refusal names the first unmet
@@ -542,9 +568,9 @@ class Recorder:
     async def _record(self, ctx, token) -> None:
         assert self._schema is not None
         task = ctx.request().data.task
-        episode_index = self._sink.episodes_saved
-        period = 1.0 / self._sink.fps
-        max_frames = self._timing.max_episode_s * self._sink.fps
+        episode_index = self._session.sink.episodes_saved
+        period = 1.0 / self._session.sink.fps
+        max_frames = self._timing.max_episode_s * self._session.sink.fps
         frames = 0
         loop = asyncio.get_running_loop()
         next_tick = loop.time()
@@ -601,7 +627,7 @@ class Recorder:
                 fresh_measurement = now >= next_disk_check
                 if fresh_measurement:
                     next_disk_check = now + self._timing.disk_check_period_s
-                    disk_free = self._disk_usage(self._session_dir).free
+                    disk_free = self._disk_usage(self._session.directory).free
                 # Progress reporting is best-effort: a subscriber that went
                 # away must not end the episode.
                 with contextlib.suppress(Exception):
@@ -616,7 +642,7 @@ class Recorder:
                 delay = next_tick - loop.time()
                 if delay < -self._timing.max_schedule_lag_s:
                     ended_because = (
-                        f"cannot sustain {self._sink.fps} fps "
+                        f"cannot sustain {self._session.sink.fps} fps "
                         f"(sampling {-delay:.2f}s behind)"
                     )
                     break
@@ -636,7 +662,7 @@ class Recorder:
             )
             return
         try:
-            shortfall = await self._sink.save_episode()
+            shortfall = await self._session.sink.save_episode()
         except Exception as e:
             # The library's buffer is unusable after a failed save; drop it
             # so the next goal starts clean.
@@ -651,7 +677,7 @@ class Recorder:
             # The episode saved, but its video does not line up with its
             # rows. The result gives the frames the shortest video misses;
             # the run log names each camera that came up short.
-            print(f"[recorder] episode {episode_index}: {warning}", flush=True)
+            log(f"episode {episode_index}: {warning}", flush=True)
         await _end_goal(
             ctx.complete_cancelled,
             ended_because,
@@ -665,20 +691,20 @@ class Recorder:
         worker thread; calls are sequential (one per tick), so the sink never
         sees concurrent frames."""
         recording.decode_images(row, pending)
-        self._sink.add_frame(row, task)
+        self._session.sink.add_frame(row, task)
 
     def _discard(self) -> None:
-        if not self._sink.created:
+        if not self._session.sink.created:
             return
         try:
-            self._sink.discard_open_frames()
+            self._session.sink.discard_open_frames()
         except Exception as e:
-            print(f"[recorder] discard failed: {e!r}")
+            log(f"discard failed: {e!r}")
 
     async def _contain_episode_failure(self, ctx, error: Exception) -> None:
         """Last resort: an unexpected episode error must fail the goal, not
         end the goal loop (a dead setup task takes the whole node with it)."""
-        print(f"[recorder] episode failed: {error!r}")
+        log(f"episode failed: {error!r}")
         self._discard()
         await _end_goal(
             ctx.fail, record_episode.FailureKind.ATTEMPT_FAILED, f"internal error: {error}"
@@ -687,9 +713,9 @@ class Recorder:
     def _kick_mirror(self) -> None:
         """Mirror the session in the background; a sync still running keeps
         going and the next episode's kick uploads whatever it missed."""
-        if self._mirror is None:
+        if self._session.mirror is None:
             return
         if self._sync_task is not None and not self._sync_task.done():
             return
-        self._sync_task = asyncio.create_task(asyncio.to_thread(self._mirror.sync))
+        self._sync_task = asyncio.create_task(asyncio.to_thread(self._session.mirror.sync))
         self._sync_task.add_done_callback(_log_sync_failure)

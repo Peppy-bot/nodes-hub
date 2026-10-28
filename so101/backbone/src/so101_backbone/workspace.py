@@ -65,7 +65,7 @@ from workspace_core_py import (
     describe_without_perception_camera,
 )
 
-from so101_backbone.failures import FailureKind
+from so101_backbone.failures import FailureKind, Refusal
 
 # A point of the robot frame (m): (x, y, z).
 Target = tuple[float, float, float]
@@ -73,15 +73,6 @@ Target = tuple[float, float, float]
 # How many targets the worker measures at a time: the grid targets of one
 # surface (663).
 CHUNK_TARGETS = len(SurfaceHeight.from_wire(0.0).grid_targets())
-
-
-class Refused(Exception):
-    """A workspace request the robot does not answer: the failure kind of its
-    error reply, and the message, its reason."""
-
-    def __init__(self, kind: FailureKind, reason: str):
-        super().__init__(reason)
-        self.kind = kind
 
 
 def reach_of(solver: ApproachSolver, target: Target) -> Reach:
@@ -179,7 +170,7 @@ class ReachWorker:
         self._sent_last: Future | None = None
 
     async def reaches(self, targets: Sequence[Target]) -> list[Reach]:
-        """The reach of each target, in order. Raises Refused when the worker
+        """The reach of each target, in order. Raises Refusal when the worker
         cannot measure them."""
         targets = list(targets)
         reaches: list[Reach] = []
@@ -205,9 +196,9 @@ class ReachWorker:
             try:
                 return await asyncio.wrap_future(in_worker)
             except BrokenProcessPool as e:
-                raise Refused(FailureKind.ATTEMPT_FAILED, f"the reach worker ended: {e}") from e
+                raise Refusal(FailureKind.ATTEMPT_FAILED, f"the reach worker ended: {e}") from e
             except Exception as e:
-                raise Refused(
+                raise Refusal(
                     FailureKind.ATTEMPT_FAILED, f"the reach could not be measured: {e!r}"
                 ) from e
 
@@ -232,7 +223,7 @@ class ReachWorker:
 
     def _running_pool(self) -> ProcessPoolExecutor:
         if self._closed:
-            raise Refused(FailureKind.RESOURCE_UNAVAILABLE, "the node is shutting down")
+            raise Refusal(FailureKind.RESOURCE_UNAVAILABLE, "the node is shutting down")
         if self._pool is None:
             self._pool = ProcessPoolExecutor(
                 max_workers=1,
@@ -258,14 +249,14 @@ class Workspace:
 
     async def describe(self, surface_height: float) -> SurfaceAnswer:
         """The describe_workspace answer of the surface at `surface_height`
-        (m). Raises Refused for a height that SurfaceHeight.from_wire
+        (m). Raises Refusal for a height that SurfaceHeight.from_wire
         refuses, with its reason, and when the reach cannot be measured."""
         height = _parsed(SurfaceHeight.from_wire, surface_height)
         return describe_without_perception_camera(await self._surface_reach(height))
 
     async def check(self, positions: Sequence[float]) -> PositionsAnswer:
         """The check_positions answer of `positions`, 3 values (x, y, z, m)
-        per point. Raises Refused for values that are not points of a
+        per point. Raises Refusal for values that are not points of a
         request, and when the reach cannot be measured."""
         points = _parsed(Positions.from_wire, positions)
         reaches = await self._measure_reaches(points.points)
@@ -280,9 +271,9 @@ class Workspace:
 
 
 def _parsed(parse, wire):
-    """What `parse` makes of `wire`; Refused, `rejected`, with its reason
+    """What `parse` makes of `wire`; Refusal, `rejected`, with its reason
     when it raises ValueError."""
     try:
         return parse(wire)
     except ValueError as e:
-        raise Refused(FailureKind.REJECTED, str(e)) from None
+        raise Refusal(FailureKind.REJECTED, str(e)) from None

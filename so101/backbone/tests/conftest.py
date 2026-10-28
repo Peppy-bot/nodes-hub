@@ -1,6 +1,6 @@
 """Shared fixtures:
 
-- a config;
+- a config, and a coordinator and an action layer built on one;
 - wide limits;
 - the measured joints;
 - a fake kinematics;
@@ -16,6 +16,8 @@ import math
 import pytest
 from so101_description.limits import JointLimits
 
+from so101_backbone.actions import ActionLayer
+from so101_backbone.coordinator import Coordinator
 from so101_backbone.params import Config, UpstreamMode
 from so101_backbone.reach import ReachBall
 
@@ -107,6 +109,27 @@ def make_config(**overrides) -> Config:
         "max_gripper_rate_frac_s": 1e9,
     }
     return Config(**{**base, **overrides})
+
+
+def _coordinator_on(config, kinematics, limits, reach) -> Coordinator:
+    """A coordinator on `config`, a FakeKinematics unless `kinematics` is
+    given."""
+    return Coordinator(config, kinematics or FakeKinematics(), limits, reach)
+
+
+def make_coordinator(kinematics=None, limits=WIDE_LIMITS, reach=WIDE_REACH, **config_overrides):
+    """A coordinator on make_config(**config_overrides), a FakeKinematics
+    unless `kinematics` is given, wide limits and an unbounded reach."""
+    return _coordinator_on(make_config(**config_overrides), kinematics, limits, reach)
+
+
+def make_layer(kinematics=None, limits=WIDE_LIMITS, **config_overrides):
+    """A coordinator and the action layer over it, both on one
+    make_config(**config_overrides) config, with a FakeKinematics unless
+    `kinematics` is given, wide limits and an unbounded reach."""
+    config = make_config(**config_overrides)
+    coordinator = _coordinator_on(config, kinematics, limits, WIDE_REACH)
+    return coordinator, ActionLayer(coordinator, config, limits)
 
 
 def assert_rectangle_inside_reach(answer) -> None:

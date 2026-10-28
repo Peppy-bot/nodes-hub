@@ -22,7 +22,7 @@ from lerobot_recorder.__main__ import (
 )
 from lerobot_recorder.plan import LinkKind, PairingEnd, SourceEntry, SourceKey
 from lerobot_recorder.recording import Cache, GripperSample, JointSample
-from tests.test_recording import (
+from tests.support import (
     NOW_NS,
     action_entry,
     joint_entry,

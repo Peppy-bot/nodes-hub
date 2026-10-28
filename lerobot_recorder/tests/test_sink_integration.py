@@ -10,7 +10,7 @@ import pytest
 
 from lerobot_recorder.recording import FrameRow, LinkLayout, SourceSchema
 from lerobot_recorder.sink import Sink
-from tests.test_recording import action_entry, joint_entry, make_plan
+from tests.support import action_entry, joint_entry, make_plan
 
 lerobot = pytest.importorskip("lerobot")
 

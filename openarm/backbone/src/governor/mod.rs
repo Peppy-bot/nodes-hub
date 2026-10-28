@@ -33,12 +33,12 @@
 //! avoidance and nothing else.
 
 use bimanual_collision_model::{BimanualCollisionModel, DistanceGradient};
-use srs_model::Jacobian;
+use control_core::positive_finite::PositiveFinite;
+use openarm_description::{ARM_DOF, ArmPair, Side};
+use srs_model::{Jacobian, JointVec};
 use tracing::{info, warn};
 
-use crate::side::{ArmPair, Side};
 use crate::torso::{TORSO_BODY, torso_regions};
-use crate::types::{ARM_DOF, JointVec};
 
 mod barrier;
 mod limiters;
@@ -51,10 +51,11 @@ use sense::Sensed;
 
 /// Why the governor refused to build.
 ///
-/// The node parses these same launcher values by name before it gets here, so
-/// in a launch these fire only if the two ever disagree. The governor still
-/// checks them: it is the component that has to hold the caps, and it is built
-/// directly by tests and by any future caller.
+/// A refusal of the band or of the opening rate is the launch's refusal of
+/// that parameter. The joint speed cap is the largest of the per-joint caps
+/// the node parsed by name, so its refusal fires only if the node's parse and
+/// this check disagree; the governor checks it because it holds the cap. The
+/// end-effector speed cap arrives parsed, as a [`PositiveFinite`].
 #[derive(Debug, thiserror::Error)]
 pub enum GovernorError {
     #[error(
@@ -219,7 +220,7 @@ pub struct Governor {
     max_joint_velocity_rad_s: f64,
     /// The operator's cap on a streamed hand's linear speed (m/s), applied by
     /// the EE-speed limiter to each side that carries a stream basis.
-    max_ee_velocity_m_s: f64,
+    max_ee_velocity_m_s: PositiveFinite,
     /// Largest rate (opening fraction per second) the coordinator's chase may
     /// drive an opening: the opening analog of the joint speed cap, bounding
     /// each tick's opening step. The `DofSpeed` clamp and the floor scan's
@@ -247,7 +248,7 @@ impl Governor {
         d_stop: f64,
         d_safe: f64,
         max_joint_velocity_rad_s: f64,
-        max_ee_velocity_m_s: f64,
+        max_ee_velocity_m_s: PositiveFinite,
         max_gripper_rate_frac_s: f64,
         enabled: bool,
     ) -> Result<Self, GovernorError> {
@@ -257,13 +258,11 @@ impl Governor {
                 d_safe_m: d_safe,
             });
         }
-        for (name, got) in [
-            ("max_joint_velocity_rad_s", max_joint_velocity_rad_s),
-            ("max_ee_velocity_m_s", max_ee_velocity_m_s),
-        ] {
-            if !(got.is_finite() && got > 0.0) {
-                return Err(GovernorError::NotPositiveFinite { name, got });
-            }
+        if PositiveFinite::parse(max_joint_velocity_rad_s).is_err() {
+            return Err(GovernorError::NotPositiveFinite {
+                name: "max_joint_velocity_rad_s",
+                got: max_joint_velocity_rad_s,
+            });
         }
         if !valid_gripper_rate(max_gripper_rate_frac_s) {
             return Err(GovernorError::GripperRate(max_gripper_rate_frac_s));
@@ -343,15 +342,15 @@ impl Governor {
     /// control). Rejects a non-positive or non-finite value, keeping the
     /// current cap, and is a no-op when unchanged so it can be called every tick.
     pub fn set_ee_cap(&mut self, max_ee_velocity_m_s: f64) {
-        if max_ee_velocity_m_s == self.max_ee_velocity_m_s {
+        if max_ee_velocity_m_s == self.max_ee_velocity_m_s.get() {
             return;
         }
-        if !(max_ee_velocity_m_s.is_finite() && max_ee_velocity_m_s > 0.0) {
+        let Ok(cap) = PositiveFinite::parse(max_ee_velocity_m_s) else {
             warn!("collision: ignoring invalid EE speed cap ({max_ee_velocity_m_s})");
             return;
-        }
+        };
         info!("EE speed cap set to {max_ee_velocity_m_s} m/s");
-        self.max_ee_velocity_m_s = max_ee_velocity_m_s;
+        self.max_ee_velocity_m_s = cap;
     }
 
     /// Govern one bimanual step from `prev` to `cand` over `dt`, returning the
@@ -411,7 +410,7 @@ impl Governor {
         // overlap floor unbounded, so it holds exactly as a non-finite
         // candidate does. Production cannot produce one (the control rate is
         // bringup-asserted), which is no reason for the boundary to trust it.
-        if !(dt.is_finite() && dt > 0.0) {
+        if PositiveFinite::parse(dt).is_err() {
             self.report(Guard::Stopped, None, None);
             return *prev;
         }
@@ -471,7 +470,7 @@ impl Governor {
             max_step: std::array::from_fn(|i| self.dof_speed_limit(i) * dt),
         };
         let ee_speed = EeSpeed {
-            cap_m_s: self.max_ee_velocity_m_s,
+            cap_m_s: self.max_ee_velocity_m_s.get(),
             hands,
             dt,
         };
@@ -580,14 +579,14 @@ fn build_collision_model(
 
 /// A valid band requires finite `0 < d_stop < d_safe` (the ramp denominator
 /// `d_safe - d_stop` is then positive).
-pub(crate) fn valid_band(d_stop: f64, d_safe: f64) -> bool {
+fn valid_band(d_stop: f64, d_safe: f64) -> bool {
     d_stop.is_finite() && d_safe.is_finite() && d_stop > 0.0 && d_safe > d_stop
 }
 
 /// A valid opening rate is finite and at least [`MIN_GRIPPER_RATE_FRAC_S`], so
 /// the chase always makes progress and the floor scan's probe count stays
 /// finite.
-pub(crate) fn valid_gripper_rate(rate_frac_s: f64) -> bool {
+fn valid_gripper_rate(rate_frac_s: f64) -> bool {
     rate_frac_s.is_finite() && rate_frac_s >= MIN_GRIPPER_RATE_FRAC_S
 }
 
@@ -647,6 +646,7 @@ mod tests {
 
     use super::limiters::measured_tripwire::MONITOR_TRIP_FRACTION;
     use super::*;
+    use crate::test_support::bundled_arm;
     use control_core::chase::{chase_step, rate_limited};
 
     /// Materialize a generation's bundled collision meshes so the file-based collision
@@ -688,6 +688,11 @@ mod tests {
     /// Positive as build requires; irrelevant to these tests, which pass no
     /// stream basis, so the EE limiter never engages.
     const TEST_EE_CAP_M_S: f64 = 0.5;
+
+    /// [`TEST_EE_CAP_M_S`] as build takes it.
+    fn test_ee_cap() -> PositiveFinite {
+        PositiveFinite::parse(TEST_EE_CAP_M_S).expect("the test EE cap is positive and finite")
+    }
     /// Fast enough that a test never sees the opening rate bind first.
     const TEST_GRIPPER_RATE_FRAC_S: f64 = 6.0;
 
@@ -711,11 +716,11 @@ mod tests {
         Governor::build(
             version.urdf(),
             meshes_dir.to_str().expect("meshes dir path is valid UTF-8"),
-            ArmPair::from_fn(|side| version.base_link(side.model())),
+            ArmPair::from_fn(|side| version.base_link(side)),
             D_STOP,
             D_SAFE,
             MAX_JOINT_VELOCITY_RAD_S,
-            TEST_EE_CAP_M_S,
+            test_ee_cap(),
             TEST_GRIPPER_RATE_FRAC_S,
             enabled,
         )
@@ -958,13 +963,11 @@ mod tests {
         let mut g = Governor::build(
             openarm_description::HardwareVersion::V1.urdf(),
             meshes_dir.to_str().expect("meshes dir path is valid UTF-8"),
-            ArmPair::from_fn(|side| {
-                openarm_description::HardwareVersion::V1.base_link(side.model())
-            }),
+            ArmPair::from_fn(|side| openarm_description::HardwareVersion::V1.base_link(side)),
             D_STOP,
             D_SAFE,
             velocity,
-            TEST_EE_CAP_M_S,
+            test_ee_cap(),
             TEST_GRIPPER_RATE_FRAC_S,
             true,
         )
@@ -1500,8 +1503,7 @@ max={} us | over budget {over}/{}",
         // whole-loop picture: the Jacobian a streamed tick hands out.
         {
             let version = openarm_description::HardwareVersion::V2;
-            let arm =
-                crate::arm_model(version, openarm_description::Side::Left).expect("arm model");
+            let arm = bundled_arm(version, Side::Left);
             let q = [0.1, -0.2, 0.3, 0.5, 0.1, -0.1, 0.2];
             time_us(
                 "planner: jacobian at measured",

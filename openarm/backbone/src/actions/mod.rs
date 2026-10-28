@@ -2,7 +2,9 @@
 //! goal is admitted here (validated, then its limb claimed) and handed to the
 //! planner or the coordinator that runs it; a posture goal also waits for the
 //! shares of both arms and ends with their one result; the stop and the plan
-//! check ask the coordinator and answer what it says.
+//! check ask the coordinator and answer what it says. The times and the
+//! tolerances every move goal names are parsed here, and each action's own
+//! fields in its module.
 
 pub mod arm;
 pub mod gripper;
@@ -12,11 +14,13 @@ pub mod stop;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use control_core::positive_finite::PositiveFinite;
+use control_core::sync::wait_for;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::coordinator::CoordinatorRequest;
 use crate::failure::{Failure, FailureKind};
-use crate::planner::ARM_BUSY;
+use crate::move_slot::{ARM_BUSY, GRIPPER_BUSY, MoveSlot};
 use crate::streams::LeaderActivity;
 
 /// How long a service waits for the coordinator's answer before it gives an
@@ -24,29 +28,55 @@ use crate::streams::LeaderActivity;
 /// has stopped ticking runs it out.
 const COORDINATOR_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The longest a move may be asked to take, and the longest it may be given
+/// to settle after its planned end: the bound the limb_motion contract states
+/// for every duration and timeout. A plan walks the control ticks of the
+/// request, so the bound also bounds its work.
+const MAX_MOVE_DURATION_S: f64 = 60.0;
+
+/// Parse a tolerance off the wire: a positive finite number, or the refusal
+/// naming `field`.
+fn tolerance_from_wire(field: &str, value: f64) -> Result<f64, String> {
+    PositiveFinite::parse(value)
+        .map(PositiveFinite::get)
+        .map_err(|_| format!("{field} must be a positive number"))
+}
+
+/// Parse a number of seconds a move may be asked for off the wire, `field`
+/// being `duration_s` or `settle_timeout_s`: from 0 to
+/// [`MAX_MOVE_DURATION_S`], or the refusal naming the field.
+fn move_seconds_from_wire(field: &str, value: f64) -> Result<Duration, String> {
+    if value.is_finite() && (0.0..=MAX_MOVE_DURATION_S).contains(&value) {
+        return Ok(Duration::from_secs_f64(value));
+    }
+    Err(format!(
+        "{field} must be a number of seconds from 0 to {MAX_MOVE_DURATION_S:.0}"
+    ))
+}
+
 /// The words of the refusals of a move on one kind of limb.
-pub struct LimbWords {
+struct LimbWords {
     /// The follower of the limb delivers no fresh state: before its first
     /// state, or after it stopped.
-    pub no_fresh_state: &'static str,
+    no_fresh_state: &'static str,
     /// A leader streams the limb: the leader has it until its stream stops.
-    pub leader_streaming: &'static str,
+    leader_streaming: &'static str,
     /// The limb executes another move.
-    pub busy: &'static str,
+    busy: &'static str,
 }
 
 /// The refusals of an arm goal, and of a plan check.
-pub const ARM_WORDS: LimbWords = LimbWords {
+const ARM_WORDS: LimbWords = LimbWords {
     no_fresh_state: "no fresh follower state to anchor the move from",
     leader_streaming: "a leader is streaming arm commands; release the headset's grip, switch off the browser panel's stream, or stop the leader node, then retry",
     busy: ARM_BUSY,
 };
 
 /// The refusals of a gripper goal.
-pub const GRIPPER_WORDS: LimbWords = LimbWords {
+const GRIPPER_WORDS: LimbWords = LimbWords {
     no_fresh_state: "no fresh gripper state to anchor the move from",
     leader_streaming: "a leader is streaming gripper commands; release the headset's grip, switch off the browser panel's stream, or stop the leader node, then retry",
-    busy: "gripper is already executing a move",
+    busy: GRIPPER_BUSY,
 };
 
 /// Whether a limb can take a move now, by its follower's freshness and its
@@ -70,27 +100,19 @@ fn check_limb_free(fresh: bool, streaming: bool, words: &LimbWords) -> Result<()
 }
 
 /// Admit a move on one limb: [`check_limb_free`], then claim the limb's
-/// single-flight slot, or `precondition_failed` while the limb executes
-/// another move. The matching release rides the move's busy guard.
+/// move slot, or `precondition_failed` while the limb executes another move.
+/// The move that runs the goal releases the slot.
 fn admit_limb(
     fresh: &AtomicBool,
     leader: &LeaderActivity,
-    busy: &AtomicBool,
+    move_slot: &MoveSlot,
     words: &LimbWords,
 ) -> Result<(), Failure> {
     check_limb_free(fresh.load(Ordering::Acquire), leader.streaming(), words)?;
-    if !claim(busy) {
+    if !move_slot.claim() {
         return Err(Failure::new(FailureKind::PreconditionFailed, words.busy));
     }
     Ok(())
-}
-
-/// Claim a side's single-flight move slot, or report it already busy. Shared
-/// by the limb and posture admissions; the matching release rides the move's
-/// busy guard.
-fn claim(busy: &AtomicBool) -> bool {
-    busy.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_ok()
 }
 
 /// Hand `request` to the coordinator and wait for the answer it sends on
@@ -127,9 +149,7 @@ fn blocking_ask_coordinator<T>(
     request: CoordinatorRequest,
     answer: oneshot::Receiver<T>,
 ) -> std::result::Result<T, String> {
-    tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(ask_coordinator(requests, request, answer))
-    })
+    wait_for(ask_coordinator(requests, request, answer))
 }
 
 #[cfg(test)]
@@ -158,20 +178,77 @@ mod tests {
     fn admitting_a_move_claims_the_limb_once() {
         let fresh = AtomicBool::new(true);
         let idle = LeaderActivity::default();
-        let busy = AtomicBool::new(false);
-        assert_eq!(admit_limb(&fresh, &idle, &busy, &ARM_WORDS), Ok(()));
-        assert!(busy.load(Ordering::Acquire), "the move holds the limb");
+        let move_slot = MoveSlot::default();
+        assert_eq!(admit_limb(&fresh, &idle, &move_slot, &ARM_WORDS), Ok(()));
+        assert!(move_slot.is_claimed(), "the move holds the limb");
         assert_eq!(
-            admit_limb(&fresh, &idle, &busy, &ARM_WORDS),
+            admit_limb(&fresh, &idle, &move_slot, &ARM_WORDS),
             Err(Failure::new(FailureKind::PreconditionFailed, ARM_BUSY))
         );
 
         let stale = AtomicBool::new(false);
-        let free = AtomicBool::new(false);
+        let free = MoveSlot::default();
         assert_eq!(
             admit_limb(&stale, &idle, &free, &ARM_WORDS).map_err(|f| f.kind),
             Err(FailureKind::ResourceUnavailable)
         );
-        assert!(!free.load(Ordering::Acquire), "a refusal claims nothing");
+        assert!(!free.is_claimed(), "a refusal claims nothing");
+    }
+
+    // --- Tolerances and times off the wire ---------------------------------
+
+    use hegel::TestCase;
+    use hegel::generators as gs;
+
+    fn admitted_tolerance(value: f64) -> bool {
+        value.is_finite() && value > 0.0
+    }
+
+    // A tolerance off the wire is exactly a positive finite number, kept as it
+    // came; anything else is refused naming the field.
+    #[hegel::test]
+    fn a_tolerance_is_accepted_exactly_when_positive_and_finite(tc: TestCase) {
+        let value: f64 = tc.draw(gs::floats());
+        match tolerance_from_wire("settle_tolerance", value) {
+            Ok(parsed) => {
+                assert!(admitted_tolerance(value), "{value} was accepted");
+                assert_eq!(parsed, value);
+            }
+            Err(refusal) => {
+                assert!(!admitted_tolerance(value), "{value} was refused");
+                assert_eq!(refusal, "settle_tolerance must be a positive number");
+            }
+        }
+    }
+
+    #[test]
+    fn non_finite_zero_and_negative_tolerances_are_refused() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -1e-9, -1.0] {
+            assert!(
+                tolerance_from_wire("settle_tolerance", bad).is_err(),
+                "tolerance {bad} must be refused"
+            );
+        }
+    }
+
+    // A number of seconds off the wire is exactly a finite value from 0 to the
+    // move ceiling, carried as a duration.
+    #[hegel::test]
+    fn move_seconds_are_accepted_exactly_within_the_ceiling(tc: TestCase) {
+        let value: f64 = tc.draw(gs::floats());
+        let admitted = value.is_finite() && (0.0..=MAX_MOVE_DURATION_S).contains(&value);
+        match move_seconds_from_wire("settle_timeout_s", value) {
+            Ok(duration) => {
+                assert!(admitted, "{value} s was accepted");
+                assert_eq!(duration, Duration::from_secs_f64(value));
+            }
+            Err(refusal) => {
+                assert!(!admitted, "{value} s was refused");
+                assert_eq!(
+                    refusal,
+                    "settle_timeout_s must be a number of seconds from 0 to 60"
+                );
+            }
+        }
     }
 }

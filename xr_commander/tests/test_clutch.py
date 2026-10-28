@@ -1,9 +1,9 @@
 import numpy as np
 import pytest
 
-from tests.helpers import IDENTITY, X, Y
+from tests.helpers import IDENTITY, X, Y, quat_from_axis_angle
 from xr_commander.clutch import _MEASURED_JUMP_M, _MEASURED_JUMP_RAD, HandClutch
-from xr_commander.frames import Pose, quat_axis_angle, quat_from_axis_angle
+from xr_commander.frames import Pose, quat_axis_angle
 
 HOME = Pose(np.array([0.4, 0.0, 0.3]), IDENTITY)
 HAND = Pose(np.array([0.0, 0.0, 1.0]), IDENTITY)

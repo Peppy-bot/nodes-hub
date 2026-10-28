@@ -80,7 +80,7 @@ class SourceKey:
         return f"{self.source.label}->{self.peer.label}"
 
 
-def peer_end(peer) -> PairingEnd | None:
+def _peer_end(peer) -> PairingEnd | None:
     """The far end of the pair a source was named by; None for a source named
     directly."""
     if peer is None:
@@ -93,7 +93,7 @@ def source_key(source) -> SourceKey:
         source=PairingEnd(
             source.producer.core_node, source.producer.instance_id, source.source_link_id
         ),
-        peer=peer_end(source.peer),
+        peer=_peer_end(source.peer),
     )
 
 
@@ -122,6 +122,11 @@ def sanitize_key(instance_id: str) -> str:
     return key or "source"
 
 
+def depth_image_key(name: str) -> str:
+    """The dataset image key of rgbd camera `name`'s depth stream."""
+    return f"{name}_depth"
+
+
 def assign_camera_names(
     used_names: set[str], instance_ids: list[str], *, with_depth: bool
 ) -> list[str]:
@@ -131,11 +136,11 @@ def assign_camera_names(
     names = []
     for instance_id in instance_ids:
         name = sanitize_key(instance_id)
-        while name in used_names or (with_depth and f"{name}_depth" in used_names):
+        while name in used_names or (with_depth and depth_image_key(name) in used_names):
             name = f"{name}_cam"
         used_names.add(name)
         if with_depth:
-            used_names.add(f"{name}_depth")
+            used_names.add(depth_image_key(name))
         names.append(name)
     return names
 

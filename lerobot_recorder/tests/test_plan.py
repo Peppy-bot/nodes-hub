@@ -9,13 +9,11 @@ from lerobot_recorder.plan import (
     BoundSources,
     LinkKind,
     PairingEnd,
-    SourceKey,
     discover,
     limb_name,
     snapshot_sources,
 )
-
-CORE = "cn"
+from tests.support import CORE, key
 
 
 def peer(instance_id: str, link_id: str):
@@ -32,10 +30,6 @@ def source(instance_id: str, link_id: str = "link", peer=None):
         source_link_id=link_id,
         peer=peer,
     )
-
-
-def key(instance_id: str, link_id: str = "link", peer: PairingEnd | None = None) -> SourceKey:
-    return SourceKey(source=PairingEnd(CORE, instance_id, link_id), peer=peer)
 
 
 def bind(*, joints=((), ()), grippers=((), ())) -> BoundSources:

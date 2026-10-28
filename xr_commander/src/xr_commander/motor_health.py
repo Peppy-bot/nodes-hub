@@ -13,24 +13,42 @@ import math
 import time
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
+from enum import IntEnum
 
-from xr_commander.bus import CancellationToken, Latch, log, messages
+from xr_commander.bus import (
+    CancellationToken,
+    Latch,
+    latch_for,
+    log,
+    messages,
+    subscribe_or_log,
+)
 
-# Level encoding of the motor_health contract: nominal, then warning <
-# critical < fault, and 4 for a motor whose feedback went quiet (its
-# readings are last-known, not current).
-NOMINAL = 0
-WARNING = 1
-CRITICAL = 2
-FAULT = 3
-NOT_REPORTING = 4
+
+class Level(IntEnum):
+    """Level encoding of the motor_health contract: nominal, then warning <
+    critical < fault, and 4 for a motor whose feedback went quiet (its
+    readings are last-known, not current). The alert contract's severities
+    are its warning to fault."""
+
+    NOMINAL = 0
+    WARNING = 1
+    CRITICAL = 2
+    FAULT = 3
+    NOT_REPORTING = 4
+
+    @property
+    def word(self) -> str:
+        """The panel's word for this level."""
+        return _LEVEL_WORDS[self]
+
 
 _LEVEL_WORDS = {
-    NOMINAL: "nominal",
-    WARNING: "WARNING",
-    CRITICAL: "CRITICAL",
-    FAULT: "FAULT",
-    NOT_REPORTING: "NOT REPORTING",
+    Level.NOMINAL: "nominal",
+    Level.WARNING: "WARNING",
+    Level.CRITICAL: "CRITICAL",
+    Level.FAULT: "FAULT",
+    Level.NOT_REPORTING: "NOT REPORTING",
 }
 
 # Reports age out this long after arrival: 3x the contract's 500 ms report
@@ -52,7 +70,7 @@ class HealthReport:
     empty (not sensed) or exactly level-length, and the arrival time."""
 
     instance: str
-    levels: tuple[int, ...]
+    levels: tuple[Level, ...]
     effort_fraction_rated: tuple[float, ...]
     effort_fraction_rated_sustained: tuple[float, ...]
     effort_fraction_peak: tuple[float, ...]
@@ -70,8 +88,8 @@ class InstanceHealth:
     report: HealthReport | None
 
 
-def _levels(values: Iterable[int]) -> tuple[int, ...]:
-    """The level vector as ints; ValueError on anything undefined."""
+def _levels(values: Iterable[int]) -> tuple[Level, ...]:
+    """The level vector as Levels; ValueError on anything undefined."""
     try:
         levels = tuple(int(value) for value in values)
     except (TypeError, ValueError):
@@ -79,9 +97,9 @@ def _levels(values: Iterable[int]) -> tuple[int, ...]:
     if not levels:
         raise ValueError("a report naming no motors describes nothing")
     for level in levels:
-        if not NOMINAL <= level <= NOT_REPORTING:
+        if not Level.NOMINAL <= level <= Level.NOT_REPORTING:
             raise ValueError(f"undefined level {level}")
-    return levels
+    return tuple(Level(level) for level in levels)
 
 
 def _readings(
@@ -198,7 +216,7 @@ class HealthRow:
     own)."""
 
     text: str
-    level: int | None
+    level: Level | None
 
 
 def _percent(value: float) -> str:
@@ -211,7 +229,7 @@ def _celsius(value: float) -> str:
 
 def _motor_text(report: HealthReport, index: int) -> str:
     """One motor's state word plus whichever readings its producer senses."""
-    parts = [_LEVEL_WORDS[report.levels[index]]]
+    parts = [report.levels[index].word]
     if report.effort_fraction_peak:
         parts.append(f"peak {_percent(report.effort_fraction_peak[index])}")
     if report.effort_fraction_rated:
@@ -248,13 +266,13 @@ def _instance_rows(entry: InstanceHealth) -> tuple[HealthRow, ...]:
     if entry.report is None:
         # The producer went quiet: one row for the whole instance, since any
         # per-motor row would be describing motors nobody has heard from.
-        return (HealthRow(f"{name} not reporting", NOT_REPORTING),)
+        return (HealthRow(f"{name} not reporting", Level.NOT_REPORTING),)
     report = entry.report
-    trouble = [i for i, level in enumerate(report.levels) if level != NOMINAL]
+    trouble = [i for i, level in enumerate(report.levels) if level != Level.NOMINAL]
     if not trouble:
         # Nominal is the panel's steady state, so it compresses to one line
         # per component; the numbers say how close the worst motor runs.
-        return (HealthRow(_collapsed_text(name, report), NOMINAL),)
+        return (HealthRow(_collapsed_text(name, report), Level.NOMINAL),)
     if len(report.levels) == 1:
         # A single-motor instance (a gripper) is one row carrying its name.
         return (HealthRow(f"{name} {_motor_text(report, 0)}", report.levels[0]),)
@@ -281,20 +299,16 @@ async def drain_motor_health(
     token: CancellationToken,
 ) -> None:
     """Keep `reports` at every producer's newest health report."""
-    try:
-        subscription = await topic_module.subscribe(node_runner)
-    except Exception as e:
+    subscription = await subscribe_or_log(node_runner, topic_module, "motor health")
+    if subscription is None:
         # Loud and fail-safe, matching the alert drain: no health rows
         # rather than a task that dies and takes its failure with it.
-        log(f"motor health subscribe failed: {e!r}")
         return
     # Latched per producer: a malformed producer repeats every report, and a
     # shared latch would be cleared by any other producer's good message.
     unusable: dict[str, Latch] = {}
     async for producer, message in messages(subscription, token, "motor health"):
-        latch = unusable.get(producer.instance_id)
-        if latch is None:
-            latch = unusable[producer.instance_id] = Latch()
+        latch = latch_for(unusable, producer.instance_id)
         try:
             reports.update(
                 producer.instance_id,

@@ -63,7 +63,7 @@ Re-run with `--force` after code changes. The node shows up at `Stage: Ready` in
 ## Run
 
 It needs a running backbone, so the usual way is through a launcher; the
-[top-level README](../README.md) has the complete sequence:
+[openarm README](../README.md) has the complete sequence:
 
 ```sh
 peppy stack launch openarm_simulation --with mujoco

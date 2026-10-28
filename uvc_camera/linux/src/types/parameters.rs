@@ -1,5 +1,8 @@
-use super::Encoding;
+use super::encoding::parse_encoding;
 use super::error::{Error, Result};
+use camera_core::encoding::ColorEncoding;
+use peppygen::Parameters;
+use std::io;
 use std::num::NonZeroU8;
 
 /// A validated frame rate in 1..=255.
@@ -11,8 +14,6 @@ use std::num::NonZeroU8;
 pub struct FrameRate(NonZeroU8);
 
 impl FrameRate {
-    pub const DEFAULT: u16 = 30;
-
     /// Parse a frame rate, rejecting values outside 1..=255.
     pub fn new(fps: u16) -> Result<Self> {
         u8::try_from(fps)
@@ -31,9 +32,72 @@ impl FrameRate {
     }
 }
 
+/// Resolution - no artificial limits, hardware determines valid values
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Resolution {
+    width: u32,
+    height: u32,
+}
+
+impl Resolution {
+    pub fn new(width: u32, height: u32) -> Self {
+        Self { width, height }
+    }
+
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+}
+
+/// Complete camera configuration
+#[derive(Debug, Clone)]
+pub struct CameraConfig {
+    pub device_path: String,
+    pub resolution: Resolution,
+    pub frame_rate: FrameRate,
+    /// Encoding requested when opening the camera (hardware wire format)
+    pub camera_encoding: ColorEncoding,
+    /// Encoding used for published topic frames
+    pub topic_encoding: ColorEncoding,
+}
+
+impl CameraConfig {
+    /// The configuration the node's parameters describe, read in the order
+    /// setup checks them: the camera encoding, the topic encoding, then the
+    /// frame rate. A refusal is the error setup fails with.
+    pub fn from_parameters(params: &Parameters) -> io::Result<Self> {
+        let video = &params.video;
+        let camera_encoding = parse_encoding(&video.camera_encoding).map_err(|e| {
+            io::Error::other(format!(
+                "Invalid camera_encoding '{}': {e}",
+                video.camera_encoding
+            ))
+        })?;
+        let topic_encoding = parse_encoding(&video.topic_encoding).map_err(|e| {
+            io::Error::other(format!(
+                "Invalid topic_encoding '{}': {e}",
+                video.topic_encoding
+            ))
+        })?;
+        let frame_rate = FrameRate::new(video.frame_rate).map_err(io::Error::other)?;
+        Ok(Self {
+            device_path: params.device_path.clone(),
+            resolution: Resolution::new(video.resolution.width, video.resolution.height),
+            frame_rate,
+            camera_encoding,
+            topic_encoding,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use peppygen::parameters::video::{Video, VideoResolution};
 
     #[test]
     fn test_frame_rate_accepts_valid_range() {
@@ -55,131 +119,52 @@ mod tests {
         let err = FrameRate::new(300).unwrap_err();
         assert!(err.to_string().contains("must be in 1..=255 (got 300)"));
     }
-}
 
-/// Resolution - no artificial limits, hardware determines valid values
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Resolution {
-    width: u32,
-    height: u32,
-}
-
-impl Resolution {
-    pub const DEFAULT_WIDTH: u32 = 640;
-    pub const DEFAULT_HEIGHT: u32 = 480;
-
-    pub fn new(width: u32, height: u32) -> Self {
-        Self { width, height }
-    }
-
-    pub fn width(&self) -> u32 {
-        self.width
-    }
-
-    pub fn height(&self) -> u32 {
-        self.height
-    }
-}
-
-impl Default for Resolution {
-    fn default() -> Self {
-        Self::new(Self::DEFAULT_WIDTH, Self::DEFAULT_HEIGHT)
-    }
-}
-
-/// Complete camera configuration
-#[derive(Debug, Clone)]
-pub struct CameraConfig {
-    pub device_path: String,
-    pub resolution: Resolution,
-    pub frame_rate: FrameRate,
-    /// Encoding requested when opening the camera (hardware wire format)
-    pub camera_encoding: Encoding,
-    /// Encoding used for published topic frames
-    pub topic_encoding: Encoding,
-}
-
-impl CameraConfig {
-    pub fn new(
-        device_path: String,
-        resolution: Resolution,
-        frame_rate: FrameRate,
-        camera_encoding: Encoding,
-        topic_encoding: Encoding,
-    ) -> Self {
-        Self {
-            device_path,
-            resolution,
-            frame_rate,
-            camera_encoding,
-            topic_encoding,
+    fn parameters(camera_encoding: &str, topic_encoding: &str, frame_rate: u16) -> Parameters {
+        Parameters {
+            device_path: "/dev/video10".to_string(),
+            video: Video {
+                camera_encoding: camera_encoding.to_string(),
+                frame_rate,
+                resolution: VideoResolution {
+                    width: 640,
+                    height: 480,
+                },
+                topic_encoding: topic_encoding.to_string(),
+            },
         }
     }
-}
 
-/// Builder for CameraConfig with validation
-#[derive(Default)]
-pub struct CameraConfigBuilder {
-    device_path: Option<String>,
-    width: Option<u32>,
-    height: Option<u32>,
-    frame_rate: Option<u16>,
-    camera_encoding: Option<Encoding>,
-    topic_encoding: Option<Encoding>,
-}
-
-impl CameraConfigBuilder {
-    pub fn new() -> Self {
-        Self::default()
+    #[test]
+    fn the_parameters_describe_the_camera() {
+        let config = CameraConfig::from_parameters(&parameters("MJPEG", "rgb8", 30)).unwrap();
+        assert_eq!(config.device_path, "/dev/video10");
+        assert_eq!(config.resolution, Resolution::new(640, 480));
+        assert_eq!(config.frame_rate.as_u8(), 30);
+        assert_eq!(config.camera_encoding, ColorEncoding::Mjpeg);
+        assert_eq!(config.topic_encoding, ColorEncoding::Rgb8);
     }
 
-    pub fn device_path(mut self, path: String) -> Self {
-        self.device_path = Some(path);
-        self
-    }
-
-    pub fn resolution(mut self, width: u32, height: u32) -> Self {
-        self.width = Some(width);
-        self.height = Some(height);
-        self
-    }
-
-    pub fn frame_rate(mut self, fps: u16) -> Self {
-        self.frame_rate = Some(fps);
-        self
-    }
-
-    pub fn camera_encoding(mut self, encoding: Encoding) -> Self {
-        self.camera_encoding = Some(encoding);
-        self
-    }
-
-    pub fn topic_encoding(mut self, encoding: Encoding) -> Self {
-        self.topic_encoding = Some(encoding);
-        self
-    }
-
-    pub fn build(self) -> Result<CameraConfig> {
-        let device_path = self
-            .device_path
-            .ok_or_else(|| Error::Other("Device path is required".to_string()))?;
-
-        let resolution = Resolution::new(
-            self.width.unwrap_or(Resolution::DEFAULT_WIDTH),
-            self.height.unwrap_or(Resolution::DEFAULT_HEIGHT),
+    #[test]
+    fn each_refusal_names_its_parameter_in_the_order_setup_checks_them() {
+        let refusal = |params| {
+            CameraConfig::from_parameters(&params)
+                .unwrap_err()
+                .to_string()
+        };
+        assert_eq!(
+            refusal(parameters("nv12", "z16", 0)),
+            "Invalid camera_encoding 'nv12': Invalid encoding 'nv12'. \
+             Supported encodings are: rgb8, bgr8, mjpeg, yuyv"
         );
-
-        let frame_rate = FrameRate::new(self.frame_rate.unwrap_or(FrameRate::DEFAULT))?;
-
-        let camera_encoding = self.camera_encoding.unwrap_or(Encoding::Mjpeg);
-        let topic_encoding = self.topic_encoding.unwrap_or(Encoding::Rgb8);
-
-        Ok(CameraConfig::new(
-            device_path,
-            resolution,
-            frame_rate,
-            camera_encoding,
-            topic_encoding,
-        ))
+        assert_eq!(
+            refusal(parameters("mjpeg", "z16", 0)),
+            "Invalid topic_encoding 'z16': Invalid encoding 'z16'. \
+             Supported encodings are: rgb8, bgr8, mjpeg, yuyv"
+        );
+        assert_eq!(
+            refusal(parameters("mjpeg", "rgb8", 0)),
+            "video.frame_rate must be in 1..=255 (got 0)"
+        );
     }
 }

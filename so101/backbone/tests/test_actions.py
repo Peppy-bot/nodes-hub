@@ -11,37 +11,31 @@ from types import SimpleNamespace
 import pytest
 from conftest import (
     MEASURED,
-    WIDE_LIMITS,
-    WIDE_REACH,
     FakeKinematics,
     gripper_step,
-    make_config,
+    make_layer,
 )
 from control_core_py import minimum_jerk
 from so101_description import limits as limits_mod
 from so101_description.kinematics import Kinematics
 from so101_description.model import KINEMATICS_URDF_PATH
 from so101_description.postures import READY_POSITIONS_RAD
+from so101_description.staleness import COMMAND_SILENCE_LIMIT_S
 
 from so101_backbone.actions import (
-    ARM_BUSY,
-    ARM_LEADER_STREAMING,
-    GRIPPER_LEADER_STREAMING,
+    ARM_WORDS,
+    GRIPPER_WORDS,
     MAX_REQUESTED_DURATION_S,
-    NO_ANCHOR,
     WALKED_BACK,
-    ActionLayer,
     PendingSlot,
     PoseMove,
-    Refusal,
+    drive_taking,
 )
 from so101_backbone.coordinator import (
     FOLLOWER_SILENT,
     GRIPPER_STILL_WINDOW_S,
-    STALE_LEADER_TIMEOUT_S,
-    Coordinator,
 )
-from so101_backbone.failures import FailureKind
+from so101_backbone.failures import FailureKind, Refusal
 
 # The reason the generated goal context gives for each cause of a cancel
 # signal, in peppy's words.
@@ -115,20 +109,14 @@ def refusal_of(raised) -> tuple[FailureKind, str]:
     return raised.value.kind, str(raised.value)
 
 
-def make_layer(kinematics=None, limits=WIDE_LIMITS, **config_overrides):
-    config = make_config(**config_overrides)
-    coordinator = Coordinator(config, kinematics or FakeKinematics(), limits, WIDE_REACH)
-    return coordinator, ActionLayer(coordinator, config, limits)
-
-
 async def installed_plan(coordinator):
     async def poll():
         # The coordinator installs a plan synchronously and owns no event to
         # wait on; adding one to production code for a test's benefit would
         # be the wrong trade, so this polls under a timeout.
-        while coordinator._arm_plan is None:  # noqa: ASYNC110
+        while coordinator._arm.plan is None:  # noqa: ASYNC110
             await asyncio.sleep(0.001)
-        return coordinator._arm_plan
+        return coordinator._arm.plan
 
     return await asyncio.wait_for(poll(), timeout=2.0)
 
@@ -359,18 +347,10 @@ async def test_a_failed_plan_fails_the_goal_with_its_kind_and_no_result():
     assert coordinator.try_claim_arm()
 
 
-@pytest.mark.parametrize("limb", ["arm", "gripper", "pose", "posture"])
-async def test_a_walked_back_admission_fails_the_goal_and_leaves_the_server_alive(limb):
-    kinematics = FakeKinematics()
-    _coordinator, layer = make_layer(kinematics)
-    drive = {
-        "arm": layer.drive_arm,
-        "gripper": layer.drive_gripper,
-        "pose": lambda ctx, plan: layer.drive_pose(ctx, plan, kinematics, kinematics),
-        "posture": lambda ctx, plan: layer.drive_posture(ctx, plan, kinematics),
-    }[limb]
+async def test_a_walked_back_admission_fails_the_goal_and_leaves_the_server_alive():
+    _coordinator, layer = make_layer()
     ctx = FakeGoalContext()
-    await drive(ctx, None)
+    await drive_taking(PendingSlot(), layer.drive_arm)(ctx)
     assert ctx.failed == (FailureKind.ATTEMPT_FAILED, WALKED_BACK)
     assert ctx.completed is None and ctx.cancelled is None
 
@@ -551,7 +531,7 @@ def test_pose_admission_refuses_busy_before_solving():
     admit_joints(layer, (0.1,) * 5, 0.0)
     with pytest.raises(Refusal) as raised:
         admit_pose(layer, (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0))
-    assert refusal_of(raised) == (FailureKind.PRECONDITION_FAILED, ARM_BUSY)
+    assert refusal_of(raised) == (FailureKind.PRECONDITION_FAILED, ARM_WORDS.busy)
     # The expensive verified solve never ran for the doomed goal.
     assert kinematics.solve_calls == []
 
@@ -623,16 +603,16 @@ def test_a_goal_on_a_limb_a_leader_streams_is_refused_with_leader_streaming():
     posture = SimpleNamespace(data=SimpleNamespace(duration_s=0.0))
 
     for decision, module, reason in (
-        (layer.decide_pose(move_arm, PendingSlot())(pose), move_arm, ARM_LEADER_STREAMING),
+        (layer.decide_pose(move_arm, PendingSlot())(pose), move_arm, ARM_WORDS.leader_streaming),
         (
             layer.decide_gripper(move_gripper, PendingSlot())(gripper),
             move_gripper,
-            GRIPPER_LEADER_STREAMING,
+            GRIPPER_WORDS.leader_streaming,
         ),
         (
             layer.decide_posture(move_to_home, READY_POSITIONS_RAD, PendingSlot())(posture),
             move_to_home,
-            ARM_LEADER_STREAMING,
+            ARM_WORDS.leader_streaming,
         ),
     ):
         assert decision.refusal == module.Failure(module.FailureKind.LEADER_STREAMING, reason)
@@ -654,7 +634,7 @@ async def test_pose_goal_solves_in_drive_and_streams_a_plan():
             sample = coordinator.arm_tick(time.monotonic())
             if sample is not None:
                 coordinator.arm_published(True, sample)
-                if coordinator._arm_plan is None:
+                if coordinator._arm.plan is None:
                     return
             await asyncio.sleep(0.001)
 
@@ -1001,7 +981,7 @@ async def test_a_stop_during_the_pose_solve_ends_the_goal_without_a_plan():
     assert ctx.completed is None
     reason, _position, _orientation, _t = ctx.cancelled
     assert reason == "stopped: the operator asked"
-    assert coordinator._arm_plan is None, "nothing was installed after the stop"
+    assert coordinator._arm.plan is None, "nothing was installed after the stop"
     assert coordinator.try_claim_arm()
 
 
@@ -1021,7 +1001,7 @@ async def test_a_stop_before_the_pose_drive_runs_ends_the_goal_as_stopped():
     assert reason == "stopped: the operator asked"
     assert position == list(kinematics.forward_kinematics((0.0,) * 5)[0])
     assert kinematics.solve_calls == []
-    assert coordinator._arm_plan is None
+    assert coordinator._arm.plan is None
     assert coordinator.try_claim_arm()
 
 
@@ -1072,7 +1052,7 @@ async def test_the_plan_check_answers_the_duration_and_installs_nothing():
     assert (check.reachable, check.reason) == (True, "")
     assert check.duration_s > 0.0
     assert ("solve",) == tuple(c[0] for c in kinematics.solve_calls)
-    assert coordinator._arm_plan is None
+    assert coordinator._arm.plan is None
     assert coordinator.try_claim_arm(), "the check claims nothing"
 
 
@@ -1108,7 +1088,7 @@ async def test_the_plan_check_answers_unreachable_and_refuses_as_the_move_would(
         await layer.check_arm_move(
             "arm", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, *PLAN, kinematics, kinematics
         )
-    assert refusal_of(raised) == (FailureKind.PRECONDITION_FAILED, ARM_BUSY)
+    assert refusal_of(raised) == (FailureKind.PRECONDITION_FAILED, ARM_WORDS.busy)
     assert len(kinematics.solve_calls) == 1, "a refused check pays no solve"
 
 
@@ -1119,7 +1099,7 @@ async def test_the_plan_check_needs_fresh_follower_state():
         await layer.check_arm_move(
             "arm", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, *PLAN, kinematics, kinematics
         )
-    assert refusal_of(raised) == (FailureKind.RESOURCE_UNAVAILABLE, NO_ANCHOR)
+    assert refusal_of(raised) == (FailureKind.RESOURCE_UNAVAILABLE, ARM_WORDS.no_fresh_state)
 
 
 async def test_a_solve_that_raises_fails_the_plan_check_with_attempt_failed():
@@ -1148,13 +1128,13 @@ def test_a_streaming_leader_keeps_the_limbs_until_its_stream_stops(monkeypatch):
     pose = ((0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0))
     with pytest.raises(Refusal) as raised:
         admit_joints(layer, (0.1,) * 5, 0.0)
-    assert refusal_of(raised) == (FailureKind.LEADER_STREAMING, ARM_LEADER_STREAMING)
+    assert refusal_of(raised) == (FailureKind.LEADER_STREAMING, ARM_WORDS.leader_streaming)
     with pytest.raises(Refusal) as raised:
         admit_pose(layer, *pose)
-    assert refusal_of(raised) == (FailureKind.LEADER_STREAMING, ARM_LEADER_STREAMING)
+    assert refusal_of(raised) == (FailureKind.LEADER_STREAMING, ARM_WORDS.leader_streaming)
     with pytest.raises(Refusal) as raised:
         admit_gripper(layer, 0.2, 0.0)
-    assert refusal_of(raised) == (FailureKind.LEADER_STREAMING, GRIPPER_LEADER_STREAMING)
+    assert refusal_of(raised) == (FailureKind.LEADER_STREAMING, GRIPPER_WORDS.leader_streaming)
     # The refusals held no slot.
     assert coordinator.try_claim_arm() and coordinator.try_claim_gripper()
     coordinator.release_arm()
@@ -1166,7 +1146,7 @@ def test_a_streaming_leader_keeps_the_limbs_until_its_stream_stops(monkeypatch):
         admit_gripper(layer, 0.2, 0.0)
     # The leader lets go: past the deadman, the limbs take goals again. The
     # follower state is refreshed so only the leader's age moves.
-    later = time.monotonic() + STALE_LEADER_TIMEOUT_S + 0.01
+    later = time.monotonic() + COMMAND_SILENCE_LIMIT_S + 0.01
     monkeypatch.setattr(time, "monotonic", lambda: later)
     coordinator.measured_joints.set((0.0,) * 5)
     coordinator.measured_gripper.set(0.5)
@@ -1184,10 +1164,10 @@ async def test_the_move_check_refuses_in_the_goals_order():
     pose = ((0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0))
     with pytest.raises(Refusal) as raised:
         await layer.check_arm_move("arm", *pose, 0.0, *PLAN, None, None)
-    assert refusal_of(raised) == (FailureKind.RESOURCE_UNAVAILABLE, NO_ANCHOR)
+    assert refusal_of(raised) == (FailureKind.RESOURCE_UNAVAILABLE, ARM_WORDS.no_fresh_state)
     with pytest.raises(Refusal) as raised:
         admit_pose(layer, *pose)
-    assert refusal_of(raised) == (FailureKind.RESOURCE_UNAVAILABLE, NO_ANCHOR)
+    assert refusal_of(raised) == (FailureKind.RESOURCE_UNAVAILABLE, ARM_WORDS.no_fresh_state)
 
 
 async def test_the_move_check_gives_the_streaming_refusal_without_claiming():
@@ -1198,5 +1178,5 @@ async def test_the_move_check_gives_the_streaming_refusal_without_claiming():
         await layer.check_arm_move(
             "arm", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, *PLAN, None, None
         )
-    assert refusal_of(raised) == (FailureKind.LEADER_STREAMING, ARM_LEADER_STREAMING)
+    assert refusal_of(raised) == (FailureKind.LEADER_STREAMING, ARM_WORDS.leader_streaming)
     assert coordinator.try_claim_arm()

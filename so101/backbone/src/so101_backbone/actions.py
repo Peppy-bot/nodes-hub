@@ -25,6 +25,7 @@ import asyncio
 import functools
 import math
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from control_core_py import minimum_jerk
@@ -44,7 +45,7 @@ from so101_backbone.coordinator import (
     PoseSettle,
     PostureEnd,
 )
-from so101_backbone.failures import FailureKind
+from so101_backbone.failures import FailureKind, Refusal
 from so101_backbone.params import Config
 
 # Backoff after a failed goal delivery, so a persistently broken action
@@ -57,42 +58,49 @@ _GOAL_RETRY_S = 1.0
 MAX_REQUESTED_DURATION_S = 60.0
 
 # A quaternion of a smaller norm has no direction to normalize.
-QUATERNION_MIN_NORM = 1e-6
+_QUATERNION_MIN_NORM = 1e-6
 
-# The refusal of an arm goal, or a check of one, while another arm goal
-# runs, and of a gripper goal while another gripper goal runs.
-ARM_BUSY = "arm is already executing a motion"
-GRIPPER_BUSY = "gripper is already executing a move"
 # The refusals of a goal naming no limb of this robot.
-UNKNOWN_ARM_NAME = f'unknown arm_name: this robot\'s arm is "{ARM_LIMB}"'
-UNKNOWN_GRIPPER_NAME = f'unknown gripper_name: this robot\'s gripper is "{GRIPPER_LIMB}"'
-# The refusal of an arm or gripper goal, or a check of one, while a leader
-# streams commands for that limb: the leader has it until its stream stops.
-ARM_LEADER_STREAMING = (
-    "a leader is streaming arm commands; release the headset's grip, switch off"
-    " the browser panel's stream, or stop the leader node, then retry"
+_UNKNOWN_ARM_NAME = f'unknown arm_name: this robot\'s arm is "{ARM_LIMB}"'
+_UNKNOWN_GRIPPER_NAME = f'unknown gripper_name: this robot\'s gripper is "{GRIPPER_LIMB}"'
+
+
+@dataclass(frozen=True)
+class _LimbWords:
+    """The words of the refusals of a move on one kind of limb."""
+
+    # The follower of the limb delivers no fresh state to anchor the move
+    # from.
+    no_fresh_state: str
+    # A leader streams the limb: the leader has it until its stream stops.
+    leader_streaming: str
+    # The limb executes another move.
+    busy: str
+
+
+# The refusals of an arm goal, and of a plan check.
+ARM_WORDS = _LimbWords(
+    no_fresh_state="no fresh follower state to anchor the move from",
+    leader_streaming=(
+        "a leader is streaming arm commands; release the headset's grip, switch off"
+        " the browser panel's stream, or stop the leader node, then retry"
+    ),
+    busy="arm is already executing a motion",
 )
-GRIPPER_LEADER_STREAMING = (
-    "a leader is streaming gripper commands; release the headset's grip, switch"
-    " off the browser panel's stream, or stop the leader node, then retry"
+# The refusals of a gripper goal.
+GRIPPER_WORDS = _LimbWords(
+    no_fresh_state="no fresh gripper state to anchor the move from",
+    leader_streaming=(
+        "a leader is streaming gripper commands; release the headset's grip, switch"
+        " off the browser panel's stream, or stop the leader node, then retry"
+    ),
+    busy="gripper is already executing a move",
 )
-# The refusal of an arm goal, or a check of one, while no follower state is
-# fresh enough to anchor the move from.
-NO_ANCHOR = "no fresh follower state to anchor the move from"
 # The failure of a goal whose admission a failed delivery walked back.
 WALKED_BACK = "goal admission was walked back"
 
 
-class Refusal(ValueError):
-    """A goal that must not run, or a check that gets an error reply: the
-    failure kind and the operator-facing reason."""
-
-    def __init__(self, kind: FailureKind, reason: str):
-        super().__init__(reason)
-        self.kind = kind
-
-
-class PlanRefused(ValueError):
+class _PlanRefused(ValueError):
     """A pose move that has no plan from where the arm is, with the reason a
     move_arm goal fails with, as `unreachable`, and check_arm_move answers."""
 
@@ -107,7 +115,7 @@ class PlanCheck:
     duration_s: float
 
 
-def stop_message(reason: str) -> str:
+def _stop_message(reason: str) -> str:
     """The reason of every goal a stop ends: the stop and its reason."""
     if not reason:
         return "stopped"
@@ -153,7 +161,32 @@ class PendingSlot:
         return plan
 
 
-async def serve(
+def note_ignored_max_effort(latch: Latch, max_effort: float, source: str) -> None:
+    """Log once, on `latch`, while `source` asks for a max_effort: legal
+    contract intent this hardware cannot honor, since the gripper's ceiling
+    is fixed in firmware. Re-armed once `source` asks for none."""
+    if max_effort > 0.0:
+        latch.trip(f"{source} max_effort ignored: gripper ceiling is fixed in firmware")
+    else:
+        latch.clear()
+
+
+def drive_taking(pending: PendingSlot, drive):
+    """The drive of one server's accepted goals: `drive(ctx, plan)` with the
+    plan the goal's admission left in `pending`, taken as the goal is
+    accepted. A goal whose admission a failed delivery walked back fails with
+    `attempt_failed`."""
+
+    def spawn(ctx):
+        plan = pending.take()
+        if plan is None:
+            return _end_guarded(ctx.fail, FailureKind.ATTEMPT_FAILED, WALKED_BACK)
+        return drive(ctx, plan)
+
+    return spawn
+
+
+async def serve_action(
     node_runner, module, token, decide, drive, layer: ActionLayer, pending: PendingSlot, label: str
 ) -> None:
     """Expose one action and run accepted goals until shutdown. Nothing that
@@ -266,24 +299,15 @@ class ActionLayer:
                 FailureKind.REJECTED, f"max_effort {max_effort} is not a non-negative finite value"
             )
         settle_timeout_s = _require_duration(settle_timeout_s, "settle_timeout_s")
-        if max_effort > 0.0:
-            # Same disposition as the streamed path: legal contract intent
-            # this hardware cannot honor (the ceiling is fixed in firmware),
-            # so the opening runs and the preference is dropped, not refused.
-            self._effort_unsupported.trip(
-                "move_gripper max_effort ignored: gripper ceiling is fixed in firmware"
-            )
-        else:
-            self._effort_unsupported.clear()
-        anchor = self._coordinator.gripper_anchor()
-        if anchor is None:
-            raise Refusal(
-                FailureKind.RESOURCE_UNAVAILABLE, "no fresh gripper state to anchor the move from"
-            )
-        if self._coordinator.leader_streams_gripper():
-            raise Refusal(FailureKind.LEADER_STREAMING, GRIPPER_LEADER_STREAMING)
-        if not self._coordinator.try_claim_gripper():
-            raise Refusal(FailureKind.PRECONDITION_FAILED, GRIPPER_BUSY)
+        # Same disposition as the streamed path: the opening runs and the
+        # effort preference is dropped, not refused.
+        note_ignored_max_effort(self._effort_unsupported, max_effort, "move_gripper")
+        anchor = _admit_limb(
+            self._coordinator.gripper_anchor(),
+            self._coordinator.leader_streams_gripper,
+            self._coordinator.try_claim_gripper,
+            GRIPPER_WORDS,
+        )
         try:
             return self._coordinator.adopt_gripper_plan(opening, settle_timeout_s, anchor)
         except BaseException:
@@ -323,22 +347,22 @@ class ActionLayer:
         """Where a move of the arm starts from. Raises Refusal, in the order
         every arm goal and check is refused: no fresh follower state, a
         leader streaming the arm, an arm goal in flight. Claims nothing."""
-        anchor = self._coordinator.arm_anchor()
-        if anchor is None:
-            raise Refusal(FailureKind.RESOURCE_UNAVAILABLE, NO_ANCHOR)
-        if self._coordinator.leader_streams_arm():
-            raise Refusal(FailureKind.LEADER_STREAMING, ARM_LEADER_STREAMING)
+        anchor = _check_limb_free(
+            self._coordinator.arm_anchor(), self._coordinator.leader_streams_arm, ARM_WORDS
+        )
         if self._coordinator.arm_busy:
-            raise Refusal(FailureKind.PRECONDITION_FAILED, ARM_BUSY)
+            raise Refusal(FailureKind.PRECONDITION_FAILED, ARM_WORDS.busy)
         return anchor
 
     def _claim_free_arm(self) -> tuple[float, ...]:
         """Claim the arm's busy slot: the anchor its move starts from. Raises
         Refusal, and claims nothing, as _free_arm_anchor does."""
-        anchor = self._free_arm_anchor()
-        claimed = self._coordinator.try_claim_arm()
-        assert claimed, "the arm was found free on this same event loop turn"
-        return anchor
+        return _admit_limb(
+            self._coordinator.arm_anchor(),
+            self._coordinator.leader_streams_arm,
+            self._coordinator.try_claim_arm,
+            ARM_WORDS,
+        )
 
     def _admit_posture(self, target: tuple[float, ...], duration_s: float) -> ArmPlan:
         """A posture move runs to the planned end of its trajectory and
@@ -464,35 +488,29 @@ class ActionLayer:
             cancel_task.cancel()
             done_task.cancel()
 
-    async def drive_arm(self, ctx, plan: ArmPlan | None) -> None:
+    async def drive_arm(self, ctx, plan: ArmPlan) -> None:
         """Wait out the plan or a cancel, then end the goal with the measured
         landing point."""
-        if plan is None:
-            await _end_guarded(ctx.fail, FailureKind.ATTEMPT_FAILED, WALKED_BACK)
-            return
 
         def results(action_time):
             return list(self._final_arm_positions(plan)), action_time
 
-        try:
-            await self._finish_plan(
-                ctx, plan, self._coordinator.abort_arm_plan, results, time.monotonic()
-            )
-        finally:
-            self._coordinator.release_arm()
+        await self._drive_arm_plan(ctx, plan, results)
 
-    async def drive_posture(self, ctx, plan: ArmPlan | None, kinematics) -> None:
+    async def drive_posture(self, ctx, plan: ArmPlan, kinematics) -> None:
         """Wait until the plan ends, a cancel comes or a stop comes. Then end
         the goal; a completed or cancelled goal gives the grasp pose of the
         arm, from the joints that the follower measures at that time (see
         _measured_grasp_pose)."""
-        if plan is None:
-            await _end_guarded(ctx.fail, FailureKind.ATTEMPT_FAILED, WALKED_BACK)
-            return
 
         def results(_action_time):
             return self._measured_grasp_pose(kinematics)
 
+        await self._drive_arm_plan(ctx, plan, results)
+
+    async def _drive_arm_plan(self, ctx, plan: ArmPlan, results) -> None:
+        """Finish the goal of an installed arm `plan` with `results`, then
+        release the arm."""
         try:
             await self._finish_plan(
                 ctx, plan, self._coordinator.abort_arm_plan, results, time.monotonic()
@@ -516,7 +534,7 @@ class ActionLayer:
     async def _plan_pose(self, solver, kinematics, seed, goal: PoseGoal) -> Profile:
         """The trajectory of `goal` from `seed`: the joint solution reached in
         the requested duration, floored by the joint velocity caps and the
-        end-effector speed caps. PlanRefused with the reason when no solution
+        end-effector speed caps. _PlanRefused with the reason when no solution
         lies inside the joint limits, or the caps push the duration past the
         ceiling. The solve runs off the event loop."""
         solution = await asyncio.to_thread(
@@ -530,7 +548,7 @@ class ActionLayer:
             )
         )
         if solution is None or not self._limits.contains(solution):
-            raise PlanRefused(_unreached(goal))
+            raise _PlanRefused(_unreached(goal))
         duration_s = max(goal.duration_s, self._ee_floor_s(kinematics, seed, goal))
         profile = minimum_jerk.plan(
             seed, solution, duration_s, self._config.max_joint_velocity_rad_s
@@ -540,7 +558,7 @@ class ActionLayer:
             # the caps can raise it past one. Stretching anyway would hold
             # the arm slot for longer than any goal is allowed to, so the
             # move has no plan instead.
-            raise PlanRefused(
+            raise _PlanRefused(
                 f"the speed caps need {profile.duration_s:.0f}s for this "
                 f"move, beyond the {MAX_REQUESTED_DURATION_S:.0f}s ceiling"
             )
@@ -571,7 +589,7 @@ class ActionLayer:
         seed = self._free_arm_anchor()
         try:
             profile = await self._plan_pose(solver, kinematics, seed, goal)
-        except PlanRefused as e:
+        except _PlanRefused as e:
             return PlanCheck(reachable=False, reason=str(e), duration_s=0.0)
         except Exception as e:
             log(f"pose solve failed: {e!r}")
@@ -581,20 +599,17 @@ class ActionLayer:
     def stop_moves(self, reason: str) -> list[str]:
         """End every planned move in flight for the stop service: the names
         of the limbs whose move was cut."""
-        message = stop_message(reason)
+        message = _stop_message(reason)
         log(f"stop requested: {message}")
         return self._coordinator.stop_all(message)
 
-    async def drive_pose(self, ctx, move: PoseMove | None, solver, kinematics) -> None:
+    async def drive_pose(self, ctx, move: PoseMove, solver, kinematics) -> None:
         """Solve, install the trajectory with the move's settle, and wait it
         out. The solve runs off the event loop on a solver dedicated to
         point-to-point goals (the control tick's streaming solver is a
         separate instance). A stop that runs during the solve ends the goal
         cancelled with the stop's reason, and nothing is installed. A pose
         with no plan fails the goal with `unreachable`."""
-        if move is None:
-            await _end_guarded(ctx.fail, FailureKind.ATTEMPT_FAILED, WALKED_BACK)
-            return
         goal = move.goal
         try:
             seed = self._coordinator.arm_anchor()
@@ -616,7 +631,7 @@ class ActionLayer:
             started = time.monotonic()
             try:
                 profile = await self._plan_pose(solver, kinematics, seed, goal)
-            except PlanRefused as e:
+            except _PlanRefused as e:
                 await _end_guarded(ctx.fail, FailureKind.UNREACHABLE, str(e))
                 return
             except Exception as e:
@@ -647,11 +662,7 @@ class ActionLayer:
         finally:
             self._coordinator.release_arm()
 
-    async def drive_gripper(self, ctx, plan: GripperPlan | None) -> None:
-        if plan is None:
-            await _end_guarded(ctx.fail, FailureKind.ATTEMPT_FAILED, WALKED_BACK)
-            return
-
+    async def drive_gripper(self, ctx, plan: GripperPlan) -> None:
         def results(action_time):
             return _settled(plan), self._final_opening(plan), action_time
 
@@ -664,17 +675,10 @@ class ActionLayer:
 
     # ---------------------------------------------------------------- results
 
-    def _fresh_measured_joints(self) -> tuple[float, ...] | None:
-        """The joints the follower measured, or None when its state is
-        stale: the one freshness rule of every arm and posture result."""
-        return self._coordinator.measured_joints.fresh(
-            self._coordinator.follower_state_timeout_s
-        )
-
     def _final_arm_positions(self, plan: ArmPlan) -> tuple[float, ...]:
         """Prefer the measured landing point; fall back to where the
         trajectory stopped."""
-        measured = self._fresh_measured_joints()
+        measured = self._coordinator.fresh_measured_joints()
         if measured is not None:
             return measured
         return plan.last_sample(time.monotonic())
@@ -684,7 +688,7 @@ class ActionLayer:
         orientations). The pose is the forward kinematics of the measured
         joints. A posture result gives only a measured pose. Thus, when the
         follower state is stale, the three arrays are empty."""
-        measured = self._fresh_measured_joints()
+        measured = self._coordinator.fresh_measured_joints()
         if measured is None:
             return [], [], []
         position, orientation = kinematics.forward_kinematics(measured)
@@ -694,7 +698,7 @@ class ActionLayer:
         """Where the grasp point stands with no plan installed, as a move
         that never ran reports it: the forward kinematics of the fresh
         measured joints, else of the joints commanded last, else no pose."""
-        joints = self._fresh_measured_joints()
+        joints = self._coordinator.fresh_measured_joints()
         if joints is None:
             joints = self._coordinator.commanded_arm
         if joints is None:
@@ -708,9 +712,7 @@ class ActionLayer:
         cut."""
         if plan.completed_on is not None:
             return plan.completed_on
-        measured = self._coordinator.measured_gripper.fresh(
-            self._coordinator.follower_state_timeout_s
-        )
+        measured = self._coordinator.fresh_measured_gripper()
         if measured is not None:
             return measured
         assert plan.frozen is not None, "a plan that did not complete was cut"
@@ -730,7 +732,7 @@ def _pose_goal(
     if not all(math.isfinite(v) for v in (*position, *orientation)):
         raise Refusal(FailureKind.REJECTED, "goal pose has non-finite values")
     norm = math.sqrt(sum(q * q for q in orientation))
-    if norm <= QUATERNION_MIN_NORM:
+    if norm <= _QUATERNION_MIN_NORM:
         raise Refusal(FailureKind.REJECTED, "goal pose has an unnormalizable orientation")
     position_tolerance_m = _require_tolerance(position_tolerance_m, "plan_position_tolerance_m")
     orientation_tolerance_rad = _require_tolerance(
@@ -828,14 +830,37 @@ def _unreached(goal: PoseGoal) -> str:
     )
 
 
+def _check_limb_free(anchor, leader_streams: Callable[[], bool], words: _LimbWords):
+    """`anchor`, where a move of one limb starts from, or Refusal in this
+    order: no fresh follower state of the limb (`anchor` is None),
+    `resource_unavailable`; a leader streaming the limb, `leader_streaming`."""
+    if anchor is None:
+        raise Refusal(FailureKind.RESOURCE_UNAVAILABLE, words.no_fresh_state)
+    if leader_streams():
+        raise Refusal(FailureKind.LEADER_STREAMING, words.leader_streaming)
+    return anchor
+
+
+def _admit_limb(
+    anchor, leader_streams: Callable[[], bool], try_claim: Callable[[], bool], words: _LimbWords
+):
+    """`anchor` once the limb's single-flight slot is claimed for a move:
+    _check_limb_free, then the claim, or `precondition_failed` while the limb
+    executes another move. The matching release rides the goal's drive."""
+    anchor = _check_limb_free(anchor, leader_streams, words)
+    if not try_claim():
+        raise Refusal(FailureKind.PRECONDITION_FAILED, words.busy)
+    return anchor
+
+
 def _require_arm_name(arm_name: str) -> None:
     if arm_name != ARM_LIMB:
-        raise Refusal(FailureKind.REJECTED, UNKNOWN_ARM_NAME)
+        raise Refusal(FailureKind.REJECTED, _UNKNOWN_ARM_NAME)
 
 
 def _require_gripper_name(gripper_name: str) -> None:
     if gripper_name != GRIPPER_LIMB:
-        raise Refusal(FailureKind.REJECTED, UNKNOWN_GRIPPER_NAME)
+        raise Refusal(FailureKind.REJECTED, _UNKNOWN_GRIPPER_NAME)
 
 
 def _settled(plan: GripperPlan) -> bool:

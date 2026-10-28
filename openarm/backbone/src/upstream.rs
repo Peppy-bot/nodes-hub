@@ -10,9 +10,8 @@
 use std::fmt;
 use std::str::FromStr;
 
+use srs_model::JointVec;
 use srs_model::nalgebra::Isometry3;
-
-use crate::types::JointVec;
 
 /// Which upstream slot kind this instance follows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,7 +24,7 @@ pub enum UpstreamMode {
 }
 
 impl UpstreamMode {
-    pub fn label(self) -> &'static str {
+    fn label(self) -> &'static str {
         match self {
             Self::Joints => "joints",
             Self::Pose => "pose",

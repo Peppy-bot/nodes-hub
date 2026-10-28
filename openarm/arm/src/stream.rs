@@ -6,58 +6,24 @@
 //! monitor observes the pairing). All run for the life of the node.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
+use control_core::latched_log::LatchedLog;
 use control_core::pacer::Pacer;
 use control_core::throttle::Throttle;
+use openarm_description::ARM_DOF;
 use peppygen::NodeRunner;
 use peppygen::paired_topics::backbone;
+use srs_model::JointVec;
 use tokio::sync::watch;
 use tracing::{error, warn};
 
-use crate::health::HealthSample;
-use crate::{ARM_DOF, JointVec};
+use crate::health::{HealthSample, clock_now};
 
 /// At most one reject warning in this window, so a persistently malformed
 /// setpoint stream is visible in the log without flooding it at the stream
 /// rate. Every bad message still clears the target; only the warn throttles.
 const REJECT_WARN_PERIOD: Duration = Duration::from_secs(1);
-
-/// Warn once per failure burst instead of once per tick: one line when a
-/// publish starts failing, silence while it keeps failing, re-armed by the
-/// first success.
-pub(crate) struct LatchedWarn {
-    context: &'static str,
-    failing: bool,
-}
-
-impl LatchedWarn {
-    pub(crate) fn new(context: &'static str) -> Self {
-        Self {
-            context,
-            failing: false,
-        }
-    }
-
-    pub(crate) fn failure(&mut self, error: &str) {
-        if !self.failing {
-            self.failing = true;
-            warn!("{} failing, suppressing repeats: {error}", self.context);
-        }
-    }
-
-    pub(crate) fn success(&mut self) {
-        self.failing = false;
-    }
-}
-
-/// Capture timestamp from this instance's bound clock, so consumers age
-/// samples on the same timeline they read. Errors until the clock delivers
-/// its first tick.
-pub(crate) fn capture_timestamp() -> Result<SystemTime, String> {
-    let ns = peppygen::clock::now_ns().map_err(|e| format!("clock not ready: {e}"))?;
-    Ok(UNIX_EPOCH + Duration::from_nanos(ns))
-}
 
 /// The latest governed setpoint for this arm: the position/velocity the MIT loop
 /// tracks. Produced by the backbone, already collision-governed and rate-limited.
@@ -186,7 +152,7 @@ pub async fn run_state_publisher(
     }
     let mut pacer =
         Pacer::new(period).expect("state publish period is non-zero (derives from state_rate_hz)");
-    let mut peer_warn = LatchedWarn::new("paired state publish");
+    let peer_warn = LatchedLog::warn("paired state publish");
     let mut last_published: Option<Instant> = None;
     loop {
         if measured.has_changed().is_err() {
@@ -200,7 +166,7 @@ pub async fn run_state_publisher(
         last_published = Some(m.captured);
         let peer_result = async {
             let joints = backbone::joint_states::build_message(
-                capture_timestamp()?,
+                clock_now()?,
                 m.positions.to_vec(),
                 m.velocities.to_vec(),
                 m.torques.to_vec(),
@@ -212,7 +178,7 @@ pub async fn run_state_publisher(
         .await;
         match peer_result {
             Ok(()) => peer_warn.success(),
-            Err(e) => peer_warn.failure(&e),
+            Err(e) => peer_warn.failure(e),
         }
         pacer.pace().await;
     }
@@ -220,6 +186,8 @@ pub async fn run_state_publisher(
 
 #[cfg(test)]
 mod tests {
+    use std::time::SystemTime;
+
     use super::*;
 
     fn setpoint_msg(

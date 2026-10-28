@@ -1,28 +1,30 @@
-// Ambient following of a streamed gripper opening fraction: drive the motor
-// toward the latest command; with none yet, hold (the motor keeps its last
-// setpoint, so we simply do not re-command). Either way the loop
-// receives and refreshes the motor state every tick, so the always-on state
-// publisher serves a live reading rather than one frozen at bring-up until the
-// first command (the arm control loop reads state every tick the same way).
-// The opening is commanded directly; the motor eases to it. Which control mode
-// carries that command, and whether the effort cap reaches the wire, is the
-// gripper's own business (hardware.rs), so this loop is the same for both
-// generations.
+//! Ambient following of a streamed gripper opening fraction: drive the motor
+//! toward the latest streamed setpoint; with none yet, hold (the motor keeps
+//! its last setpoint, so we simply do not re-command). Either way the loop
+//! receives and refreshes the motor state every tick, so the always-on state
+//! publisher serves a live reading rather than one frozen at bring-up until the
+//! first setpoint (the arm control loop reads state every tick the same way).
+//! The opening is commanded directly; the motor eases to it. Which control mode
+//! carries that command, and whether the effort cap reaches the wire, is the
+//! gripper's own business (hardware.rs), so this loop is the same for both
+//! generations.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use control_core::motor_health::{NOT_DRIVING_ESCALATE_AFTER, STATE_STALE_AFTER};
+use control_core::sync::lock_ignoring_poison;
+use control_core::time;
 use openarm_can::CanErrorThrottle;
 use peppylib::runtime::CancellationToken;
 use tokio::sync::{oneshot, watch};
 use tokio::time::MissedTickBehavior;
 use tracing::error;
 
-use crate::command_stream::GripperCommand;
 use crate::drive::{self, Verdict};
 use crate::hardware::Gripper;
+use crate::stream::GripperSetpoint;
 
 /// Set when the loop stops on a hard fault, so main can exit non-zero after
 /// the shutdown hooks have run and the daemon records the instance as failed
@@ -31,16 +33,15 @@ pub static HARD_FAULT: AtomicBool = AtomicBool::new(false);
 
 const CONTEXT: &str = "gripper follow";
 
-#[derive(Clone)]
-pub struct ControlConfig {
+pub struct FollowConfig {
     pub cycle_period: Duration,
     pub recv_timeout_us: u32,
 }
 
 pub async fn run(
     gripper: Arc<Mutex<Gripper>>,
-    cmd: watch::Receiver<Option<GripperCommand>>,
-    cfg: ControlConfig,
+    setpoints: watch::Receiver<Option<GripperSetpoint>>,
+    cfg: FollowConfig,
     token: CancellationToken,
     started_tx: oneshot::Sender<()>,
 ) {
@@ -49,8 +50,8 @@ pub async fn run(
     let mut ticker = tokio::time::interval(cfg.cycle_period);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut throttle = CanErrorThrottle::new();
-    let stale_after_ticks = drive::ticks_within(STATE_STALE_AFTER, cfg.cycle_period);
-    let escalate_after_ticks = drive::ticks_within(NOT_DRIVING_ESCALATE_AFTER, cfg.cycle_period);
+    let stale_after_ticks = time::ticks_within(STATE_STALE_AFTER, cfg.cycle_period);
+    let escalate_after_ticks = time::ticks_within(NOT_DRIVING_ESCALATE_AFTER, cfg.cycle_period);
     let mut not_driving = 0u32;
 
     loop {
@@ -59,11 +60,11 @@ pub async fn run(
             _ = ticker.tick() => {}
         }
 
-        let command = *cmd.borrow();
+        let setpoint = *setpoints.borrow();
 
-        // unwrap_or_else: drive even if the mutex was poisoned by a panic
+        // Drive even if the mutex was poisoned by a panic
         // elsewhere, so a transient fault doesn't strand the follow loop.
-        let mut g = gripper.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = lock_ignoring_poison(&gripper);
         // Checked under the lock the disable hook shares: cancellation
         // precedes the hooks, so a tick that passed the select before
         // shutdown cannot issue CAN work the hook would then race.
@@ -96,8 +97,8 @@ pub async fn run(
 
         // Command only when there is a target; refresh state every tick either way.
         let sent = (|| {
-            if let Some(command) = command {
-                g.command(command.opening, command.max_effort)?;
+            if let Some(setpoint) = setpoint {
+                g.command(setpoint.opening, setpoint.max_effort)?;
             }
             g.refresh_all()
         })();

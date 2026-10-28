@@ -14,6 +14,8 @@ import threading
 from collections.abc import Mapping
 from types import ModuleType
 
+from xr_commander.devices import Hand
+
 # How a robot joins the stack as a copy, which the fleet listing names and the
 # headset leads.
 JOIN_COMMAND = "peppy stack join OPTION:NAME --with robot_commander=none"
@@ -45,8 +47,8 @@ class PairedRobots:
     def __init__(
         self,
         node_runner,
-        arms: Mapping[str, ModuleType],
-        grippers: Mapping[str, ModuleType],
+        arms: Mapping[Hand, ModuleType],
+        grippers: Mapping[Hand, ModuleType],
     ) -> None:
         """`arms` and `grippers` are the pose and gripper slots' modules by
         the hand that drives them."""
@@ -90,7 +92,7 @@ class PairedRobots:
         """The robot the hands drive, as `standing` reads it."""
         return self.standing()[1]
 
-    def arm_sides(self, robot: str) -> frozenset[str]:
+    def arm_sides(self, robot: str) -> frozenset[Hand]:
         """The hands `robot` pairs an arm with."""
         return frozenset(
             side

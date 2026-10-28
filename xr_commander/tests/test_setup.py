@@ -20,8 +20,8 @@ def wired(monkeypatch):
     monkeypatch.setattr(wiring, "XrSession", MagicMock(return_value=session))
     monkeypatch.setattr(wiring.alerts_topic, "bound_producers", lambda _: [])
     monkeypatch.setattr(wiring.motor_health_topic, "bound_producers", lambda _: [])
+    monkeypatch.setattr(wiring.postures, "run_posture_button", AsyncMock())
     for operation in (
-        "run_posture_button",
         "drain_pose_states",
         "stream_pose",
         "stream_gripper",

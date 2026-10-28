@@ -15,18 +15,48 @@ import asyncio
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 from types import ModuleType
 from typing import Protocol
 
 import cv2
 import numpy as np
 
-from xr_commander.bus import CancellationToken, Latch, log, messages, ticks
+from xr_commander.bus import (
+    CancellationToken,
+    Latch,
+    latch_for,
+    log,
+    messages,
+    producer_key,
+    subscribe_or_log,
+    ticks,
+)
+from xr_commander.devices import Hand
 from xr_commander.robots import PairedRobots
 
-# The colour encodings the rgb_camera / rgbd_camera contracts declare. A camera
-# announcing anything else is refused rather than guessed at.
-_BYTES_PER_PIXEL = {"rgb8": 3, "bgr8": 3, "yuyv": 2}
+
+class _Encoding(StrEnum):
+    """The color encodings the rgb_camera / rgbd_camera contracts declare. A
+    camera announcing any other encoding is refused by name."""
+
+    MJPEG = "mjpeg"
+    RGB8 = "rgb8"
+    BGR8 = "bgr8"
+    YUYV = "yuyv"
+
+
+# The raw encodings, by the bytes each pixel takes.
+_BYTES_PER_PIXEL = {_Encoding.RGB8: 3, _Encoding.BGR8: 3, _Encoding.YUYV: 2}
+
+
+def _parse_encoding(encoding: str) -> _Encoding | None:
+    """`encoding` as an _Encoding, or None for one the panels do not decode."""
+    try:
+        return _Encoding(encoding)
+    except ValueError:
+        return None
+
 
 # A camera that has delivered nothing for this long gets its track blanked: in
 # the headset a frozen frame is indistinguishable from live video.
@@ -42,9 +72,9 @@ _NO_SIGNAL_WIDTH = 320
 # newest frame at exactly this rate, whatever rate its camera publishes at.
 TRACK_HZ = 30
 # The role of the one wrist camera of a robot with one arm.
-LONE_WRIST_ROLE = "wrist"
+_LONE_WRIST_ROLE = "wrist"
 # The panels teleop_xr anchors to the controllers, by hand.
-WRIST_PANELS = {"left": "wrist_left", "right": "wrist_right"}
+_WRIST_PANELS = {Hand.LEFT: "wrist_left", Hand.RIGHT: "wrist_right"}
 
 
 class FrameSink(Protocol):
@@ -59,13 +89,14 @@ def decode_to_bgr(encoding: str, width: int, height: int, data: bytes) -> np.nda
     Raw encodings are checked against their declared geometry; mjpeg carries
     its own, so only the decode itself vouches for it.
     """
-    if encoding == "mjpeg":
+    parsed = _parse_encoding(encoding)
+    if parsed is _Encoding.MJPEG:
         frame = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
         if frame is None:
             raise ValueError("mjpeg frame failed to decode")
         return frame
 
-    stride = _BYTES_PER_PIXEL.get(encoding)
+    stride = _BYTES_PER_PIXEL.get(parsed)
     if stride is None:
         raise ValueError(f"unsupported encoding {encoding!r}")
     if width <= 0 or height <= 0:
@@ -79,11 +110,11 @@ def decode_to_bgr(encoding: str, width: int, height: int, data: bytes) -> np.nda
 
     raw = np.frombuffer(data, dtype=np.uint8).reshape(height, width, stride)
     try:
-        if encoding == "bgr8":
+        if parsed is _Encoding.BGR8:
             # Copy: a frombuffer view aliases the wire buffer, which is
             # recycled while the encoder still holds the frame.
             return raw.copy()
-        if encoding == "rgb8":
+        if parsed is _Encoding.RGB8:
             return cv2.cvtColor(raw, cv2.COLOR_RGB2BGR)
         return cv2.cvtColor(raw, cv2.COLOR_YUV2BGR_YUY2)
     except cv2.error as e:
@@ -108,7 +139,7 @@ def camera_source(member) -> CameraSource:
 
 
 def panel_of(
-    source: CameraSource, arm_sides: Callable[[str], frozenset[str]]
+    source: CameraSource, arm_sides: Callable[[str], frozenset[Hand]]
 ) -> str | None:
     """The panel a camera fills: its role, or for the `wrist` camera of a
     robot that pairs one arm, the wrist panel of the hand driving that arm.
@@ -119,9 +150,9 @@ def panel_of(
     sides = arm_sides(source.robot)
     if not sides:
         return None
-    if source.role == LONE_WRIST_ROLE and len(sides) == 1:
+    if source.role == _LONE_WRIST_ROLE and len(sides) == 1:
         (side,) = sides
-        return WRIST_PANELS[side]
+        return _WRIST_PANELS[side]
     return source.role
 
 
@@ -131,7 +162,7 @@ def shows_for(source: CameraSource, chosen_robot: str | None) -> bool:
     return source.robot is None or source.robot == chosen_robot
 
 
-def panel_for(source: CameraSource, robots: PairedRobots) -> str | None:
+def _panel_for(source: CameraSource, robots: PairedRobots) -> str | None:
     """The panel a camera fills now, None while it is not the chosen
     robot's."""
     if not shows_for(source, robots.chosen()):
@@ -245,7 +276,7 @@ def chosen_panels(
         for member in module.bound_members(node_runner)
     )
     return {
-        name for source in sources if (name := panel_for(source, robots)) is not None
+        name for source in sources if (name := _panel_for(source, robots)) is not None
     }
 
 
@@ -305,30 +336,26 @@ async def drain_frames(
     (panel to its newest frame) is stamped per delivered frame for the
     silence watchdog.
     """
-    try:
-        subscription = await topic_module.subscribe(node_runner)
-    except Exception as e:
+    subscription = await subscribe_or_log(node_runner, topic_module, label)
+    if subscription is None:
         # Loud and fail-safe: the affected panels simply never show video.
-        log(f"{label} subscribe failed: {e!r}")
         return
     # Latched per producer: a bad encoding repeats every frame.
     unusable: dict[str, Latch] = {}
     async for producer, message in messages(subscription, token, label):
         # The set follows the stack's joins, so it is read per frame.
         sources = {
-            (m.producer.core_node, m.producer.instance_id): camera_source(m)
+            producer_key(m.producer): camera_source(m)
             for m in topic_module.bound_members(node_runner)
         }
-        source = sources.get((producer.core_node, producer.instance_id))
-        name = panel_for(source, robots) if source is not None else None
+        source = sources.get(producer_key(producer))
+        name = _panel_for(source, robots) if source is not None else None
         if name is None:
             continue
-        latch = unusable.get(producer.instance_id)
-        if latch is None:
-            latch = unusable[producer.instance_id] = Latch()
+        latch = latch_for(unusable, producer.instance_id)
         try:
             frame = await asyncio.to_thread(_decode_and_shrink, message, view_max_width)
-            if panel_for(source, robots) != name:
+            if _panel_for(source, robots) != name:
                 # The choice changed while the frame decoded.
                 continue
             panels.show(name, frame, source)

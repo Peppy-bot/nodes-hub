@@ -1,26 +1,24 @@
-// Spawned per fire_arm_pose command (the panel's Execute-pose in Actions mode). Fires
-// the limb_motion slot's Cartesian move_arm (planned straight-line pose move), then
-// reports the outcome to the owner. Each goal is its own task; cancel-aware so a shutdown can't
-// wedge an in-flight goal, and preempt-aware so a new move can cancel it.
+//! Spawned per fire_arm_pose command (the panel's Execute-pose in Actions mode). Fires
+//! the limb_motion slot's Cartesian move_arm (planned straight-line pose move), then
+//! reports the outcome to the owner. Each goal is its own task; cancel-aware so a shutdown can't
+//! wedge an in-flight goal, and preempt-aware so a new move can cancel it.
 
 use std::sync::Arc;
-use std::time::Duration;
 
+use openarm_description::Side;
 use peppygen::NodeRunner;
 use peppygen::consumed_actions::limb_motion::move_arm as limb_motion_move_arm;
-use peppygen::consumed_actions::limb_motion::move_arm::ResultOutcome;
 use peppylib::runtime::CancellationToken;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::owner::{Feedback, PREEMPT_GRACE};
+use crate::owner::Feedback;
 use crate::pose::{PLAN_ANGLE_TOL_RAD, PLAN_POS_TOL_M};
-use crate::result_wait::{RESULT_POLL, RESULT_RETRY_DELAY, result_poll_retryable};
-use crate::state::Side;
+use crate::result_wait::{
+    GOAL_TIMEOUT, Waited, limb_goal_handle, preempt_grace_elapsed, summarize, wait_for_end,
+};
 
-// Goal-accept round-trip to a pinned producer; answered directly, so this only needs to
-// cover the decider, not a discovery probe.
-const GOAL_TIMEOUT: Duration = Duration::from_secs(2);
+limb_goal_handle!(move_arm);
 
 /// One discrete pose move, as fired at the backbone: the side, the world-frame target
 /// (position m, orientation quaternion `[x, y, z, w]`), the requested duration
@@ -70,14 +68,16 @@ async fn run(
         settle_timeout_s,
     } = goal;
     // A queued preempt fires only after the backbone releases its single-flight gate.
-    if grace {
-        tokio::select! {
-            _ = token.cancelled() => return finalize(&feedback, side, false, "shutting down; move dropped").await,
-            _ = tokio::time::sleep(PREEMPT_GRACE) => {}
-        }
+    if grace && !preempt_grace_elapsed(&token).await {
+        return finalize(&feedback, side, false, "shutting down; move dropped").await;
     }
-    let label = side.label();
-    info!(side = label, ?position, ?orientation, "fire move_arm");
+    let label = side.to_string();
+    info!(
+        side = label.as_str(),
+        ?position,
+        ?orientation,
+        "fire move_arm"
+    );
 
     let goal = limb_motion_move_arm::GoalRequest {
         arm_name: side.arm_name().to_string(),
@@ -120,66 +120,30 @@ async fn run(
     };
 
     // Await the move result, honoring preempt (a new Execute cancels this goal) and
-    // shutdown. Live progress is shown from the arm_states stream. The wait re-arms
+    // shutdown. Live progress is shown from the joint_states stream. The wait re-arms
     // its bounded poll until a terminal outcome (see result_wait); the backbone's
     // proportional deadline bounds the move itself.
-    let mut preempted = false;
-    let outcome = loop {
-        let result_fut = downstream.get_result(RESULT_POLL);
-        tokio::pin!(result_fut);
-        tokio::select! {
-            _ = token.cancelled() => {
-                // Best-effort cancel so shutdown leaves no unsupervised motion.
-                if let Err(e) = downstream.cancel_goal(GOAL_TIMEOUT).await {
-                    warn!(side = side.label(), error = %e, "shutdown cancel failed");
-                }
-                finalize(&feedback, side, false, "shutting down; move cancelled").await;
-                return;
-            }
-            _ = preempt.cancelled(), if !preempted => {
-                preempted = true;
-                if let Err(e) = downstream.cancel_goal(GOAL_TIMEOUT).await {
-                    warn!(side = side.label(), error = %e, "preempt cancel failed");
-                }
-            }
-            result = &mut result_fut => match result {
-                Err(e) if result_poll_retryable(&e) => {
-                    tokio::time::sleep(RESULT_RETRY_DELAY).await;
-                }
-                result => break result,
-            }
-        }
-    };
-    // A result error leaves the goal's fate unknown; cancel best-effort so a move
-    // somehow still running does not continue unsupervised.
-    if outcome.is_err()
-        && let Err(e) = downstream.cancel_goal(GOAL_TIMEOUT).await
+    let ended = match wait_for_end(
+        &downstream,
+        &token,
+        Some(&preempt),
+        |trigger, e| warn!(side = label.as_str(), error = %e, "{}", trigger.failure_message()),
+    )
+    .await
     {
-        warn!(side = side.label(), error = %e, "cancel after result error failed");
-    }
+        Waited::Shutdown => {
+            finalize(&feedback, side, false, "shutting down; move cancelled").await;
+            return;
+        }
+        Waited::Ended(ended) => ended,
+    };
     // The backbone judges arrival: a completed move means the measured grasp
     // point settled within the goal's tolerances, and a failure's kind and
     // message say why not, such as `unreachable`, or `timeout` and how far
     // off it stood.
-    let (success, summary) = match outcome {
-        Ok(r) => match r.outcome {
-            ResultOutcome::Completed(data) => (
-                true,
-                format!("move_arm ({label}): success in {:.2}s", data.action_time),
-            ),
-            ResultOutcome::Failed(failure) => {
-                (false, format!("move_arm ({label}) failed: {failure}"))
-            }
-            ResultOutcome::Cancelled { reason, .. } => {
-                (false, format!("move_arm ({label}) cancelled: {reason}"))
-            }
-            ResultOutcome::Abandoned => {
-                (false, format!("move_arm ({label}) abandoned by backbone"))
-            }
-            ResultOutcome::Expired => (false, format!("move_arm ({label}) result expired")),
-        },
-        Err(e) => (false, format!("move_arm ({label}) result error: {e}")),
-    };
+    let (success, summary) = summarize("move_arm", &label, ended, |data| {
+        format!("success in {:.2}s", data.action_time)
+    });
     finalize(&feedback, side, success, summary).await;
 }
 
@@ -192,10 +156,11 @@ async fn finalize(
     summary: impl Into<String>,
 ) {
     let summary = summary.into();
+    let label = side.to_string();
     if success {
-        info!(side = side.label(), %summary, "move_arm done");
+        info!(side = label.as_str(), %summary, "move_arm done");
     } else {
-        warn!(side = side.label(), %summary, "move_arm done");
+        warn!(side = label.as_str(), %summary, "move_arm done");
     }
     let _ = feedback.send(Feedback::ArmGoalDone { side, summary }).await;
 }

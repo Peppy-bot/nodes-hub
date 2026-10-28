@@ -1,19 +1,20 @@
-// The device thread: owns the transport, handshakes, decodes and maps frames,
-// and keeps the newest mapped sample on a watch channel for the publish
-// tasks. Device I/O is blocking, so this runs on a dedicated OS thread.
-//
-// Failure policy: a device this node's channel map does not describe (wrong
-// hardware generation, too few channels, an undecodable schema) cancels the
-// node so the launch fails loudly; everything transient (unplug, bad
-// checksums, silence) clears the sample, backs off and reconnects.
-//
-// One EngageLatch per session is constructed here: the four publish tasks all
-// read the engagement it folds into each sample, so a side's arm and gripper
-// always agree. The policy itself lives in engage.
+//! The device thread: owns the transport, handshakes, decodes and maps frames,
+//! and keeps the newest mapped sample on a watch channel for the publish
+//! tasks. Device I/O is blocking, so this runs on a dedicated OS thread.
+//!
+//! Failure policy: a device this node's channel map does not describe (wrong
+//! hardware generation, too few channels, an undecodable schema) cancels the
+//! node so the launch fails loudly; everything transient (unplug, bad
+//! checksums, silence) clears the sample, backs off and reconnects.
+//!
+//! One EngageLatch per session is constructed here: the four publish tasks all
+//! read the engagement it folds into each sample, so a side's arm and gripper
+//! always agree. The policy itself lives in engage.
 
 use std::time::{Duration, Instant};
 
-use openarm_description::{ARM_DOF, HardwareVersion, Side};
+use control_core::report_once::ReportOnce;
+use openarm_description::{ARM_DOF, ArmPair, HardwareVersion};
 use peppylib::runtime::CancellationToken;
 use tokio::sync::{oneshot, watch};
 use tracing::{error, info, warn};
@@ -23,7 +24,6 @@ use crate::mapping::{ChannelMap, GripperOpenFraction, MappedFrame};
 use crate::protocol::{
     CMD_PING, CMD_STANDBY, CMD_STREAM, Deframer, FrameLayout, KerFrame, PingParse, Schema,
 };
-use crate::side::{SideFlags, SideValues};
 use crate::transport::{self, KerTransport, TransportConfig};
 
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(3);
@@ -47,29 +47,20 @@ const _: () = assert!(MAX_HANDSHAKE_BUFFER > crate::protocol::MAX_PING_RESPONSE_
 /// arm while fresh.
 #[derive(Debug, Clone)]
 pub struct KerSample {
-    pub left_joints: [f64; ARM_DOF],
-    pub right_joints: [f64; ARM_DOF],
-    pub gripper_openings: SideValues,
-    pub engaged: SideFlags,
+    pub joints: ArmPair<[f64; ARM_DOF]>,
+    pub gripper_openings: ArmPair<f64>,
+    pub engaged: ArmPair<bool>,
     pub received_at: Instant,
 }
 
 impl KerSample {
     /// One mapped frame plus the engagement the latch folded in.
-    fn from_mapped(mapped: MappedFrame, engaged: SideFlags, received_at: Instant) -> Self {
+    fn from_mapped(mapped: MappedFrame, engaged: ArmPair<bool>, received_at: Instant) -> Self {
         Self {
-            left_joints: mapped.left_joints,
-            right_joints: mapped.right_joints,
+            joints: mapped.joints,
             gripper_openings: mapped.gripper_openings,
             engaged,
             received_at,
-        }
-    }
-
-    pub fn joints(&self, side: Side) -> [f64; ARM_DOF] {
-        match side {
-            Side::Left => self.left_joints,
-            Side::Right => self.right_joints,
         }
     }
 }
@@ -207,10 +198,10 @@ fn run_session(
         Ok(device) => device,
         Err(end) => return SessionReport::refused(end),
     };
-    let (end, streamed) = stream_frames(transport, cfg, &device, tx, token);
+    let report = stream_frames(transport, cfg, &device, tx, token);
     // Best effort: stop the stream on the way out, whether or not it started.
     let _ = transport.write_all(&[CMD_STANDBY]);
-    SessionReport { end, streamed }
+    report
 }
 
 /// Handshake and check the device against the channel map this node reads.
@@ -245,10 +236,13 @@ fn stream_frames(
     device: &Connected,
     tx: &watch::Sender<Option<KerSample>>,
     token: &CancellationToken,
-) -> (SessionEnd, bool) {
+) -> SessionReport {
     // The firmware answers PING in standby; frames flow once STREAM arrives.
     if let Err(e) = transport.write_all(&[CMD_STREAM]) {
-        return (SessionEnd::Transient(format!("start stream: {e}")), false);
+        return SessionReport {
+            end: SessionEnd::Transient(format!("start stream: {e}")),
+            streamed: false,
+        };
     }
     let mut deframer = Deframer::new(device.layout.payload_len());
     deframer.push(&device.leftover);
@@ -257,13 +251,18 @@ fn stream_frames(
     let mut last_frame_at = Instant::now();
     let mut last_raw_log = Instant::now();
     let mut consecutive_bad = 0u32;
-    let mut mapping_warned = false;
+    let mapping_failures = ReportOnce::default();
     let mut streamed = false;
 
     while !token.is_cancelled() {
         let read = match transport.read(&mut chunk) {
             Ok(n) => n,
-            Err(e) => return (SessionEnd::Transient(format!("read: {e}")), streamed),
+            Err(e) => {
+                return SessionReport {
+                    end: SessionEnd::Transient(format!("read: {e}")),
+                    streamed,
+                };
+            }
         };
         // Pushed before the silence check, so bytes that arrive after a long
         // quiet spell count as the recovery they are.
@@ -275,12 +274,12 @@ fn stream_frames(
                 Err(_) => {
                     consecutive_bad += 1;
                     if consecutive_bad >= MAX_CONSECUTIVE_BAD_CHECKSUMS {
-                        return (
-                            SessionEnd::Transient(format!(
+                        return SessionReport {
+                            end: SessionEnd::Transient(format!(
                                 "{consecutive_bad} corrupt frames in a row"
                             )),
                             streamed,
-                        );
+                        };
                     }
                     continue;
                 }
@@ -294,37 +293,43 @@ fn stream_frames(
             }
             match device.channels.map(&frame, cfg.gripper_open_fraction) {
                 Ok(mapped) => {
-                    mapping_warned = false;
+                    mapping_failures.clear();
                     let received_at = Instant::now();
                     let engaged = engage.update(mapped.triggers, received_at);
                     if tx
                         .send(Some(KerSample::from_mapped(mapped, engaged, received_at)))
                         .is_err()
                     {
-                        return (SessionEnd::Stop, streamed);
+                        return SessionReport {
+                            end: SessionEnd::Stop,
+                            streamed,
+                        };
                     }
                     streamed = true;
                 }
                 // A non-finite reading is a frame to skip, not a stream to
                 // kill; latch the warning so a flaky encoder cannot spam.
-                Err(e) if !mapping_warned => {
-                    mapping_warned = true;
-                    warn!("KER frame dropped, suppressing repeats: {e}");
+                Err(e) => {
+                    if mapping_failures.first_of_run() {
+                        warn!("KER frame dropped, suppressing repeats: {e}");
+                    }
                 }
-                Err(_) => {}
             }
         }
 
         if last_frame_at.elapsed() > SILENCE_RECONNECT {
-            return (
-                SessionEnd::Transient(format!(
+            return SessionReport {
+                end: SessionEnd::Transient(format!(
                     "no valid frames for {SILENCE_RECONNECT:?} while connected"
                 )),
                 streamed,
-            );
+            };
         }
     }
-    (SessionEnd::Stop, streamed)
+    SessionReport {
+        end: SessionEnd::Stop,
+        streamed,
+    }
 }
 
 /// STANDBY, flush, then ping until the schema arrives (or the deadline).
@@ -390,15 +395,13 @@ fn sleep_cancellable(total: Duration, token: &CancellationToken) {
 mod tests {
     use std::sync::{Arc, Mutex};
 
+    use openarm_description::Side;
+
     use super::*;
-    use crate::mapping::fixtures::{
-        CHANNELS, LEFT_SQUEEZE_DEG, LEFT_TRIGGER, RIGHT_SQUEEZE_DEG, RIGHT_TRIGGER, numbered_frame,
-        probe_radians,
-    };
+    use crate::engage::fixtures::{BOTH_ENGAGED, NEITHER_ENGAGED, STALE, engage_trigger_opening};
+    use crate::mapping::fixtures::{CHANNELS, SQUEEZE_DEG, TRIGGER, numbered_frame, probe_radians};
     use crate::protocol::fixtures::{ping_response_for, stream_packet};
 
-    const STALE: Duration = Duration::from_millis(250);
-    const ENGAGE_AT: f64 = 0.2;
     const OPEN_FRACTION: f64 = 0.5;
     /// How long a session test waits for what it expects, and then for the
     /// session thread to notice cancellation.
@@ -407,16 +410,16 @@ mod tests {
     /// A frame with both triggers released, every other channel numbered.
     fn released_frame() -> Vec<f32> {
         let mut angles = numbered_frame();
-        angles[RIGHT_TRIGGER] = 0.0;
-        angles[LEFT_TRIGGER] = 0.0;
+        angles[TRIGGER.right] = 0.0;
+        angles[TRIGGER.left] = 0.0;
         angles
     }
 
     /// A frame with both triggers at their stops.
     fn squeezed_frame() -> Vec<f32> {
         let mut angles = released_frame();
-        angles[RIGHT_TRIGGER] = RIGHT_SQUEEZE_DEG as f32;
-        angles[LEFT_TRIGGER] = LEFT_SQUEEZE_DEG as f32;
+        angles[TRIGGER.right] = SQUEEZE_DEG.right as f32;
+        angles[TRIGGER.left] = SQUEEZE_DEG.left as f32;
         angles
     }
 
@@ -519,7 +522,7 @@ mod tests {
         ReaderConfig {
             transport: TransportConfig::Usb,
             version: HardwareVersion::V2,
-            engage_trigger_opening: EngageTriggerOpening::try_from(ENGAGE_AT).expect("in range"),
+            engage_trigger_opening: engage_trigger_opening(),
             gripper_open_fraction: GripperOpenFraction::try_from(OPEN_FRACTION).expect("in range"),
             stale_timeout: STALE,
             log_raw: false,
@@ -595,7 +598,7 @@ mod tests {
         let sample = run.sample.expect("a frame reached the sample channel");
         // Released triggers: nothing engages, and each gripper rests at the
         // open fraction.
-        assert_eq!(sample.engaged, SideFlags::NONE);
+        assert_eq!(sample.engaged, NEITHER_ENGAGED);
         assert_eq!(sample.gripper_openings.left, OPEN_FRACTION);
         assert_eq!(sample.gripper_openings.right, OPEN_FRACTION);
         // Each arm reads its own channels, end to end through the session.
@@ -603,10 +606,10 @@ mod tests {
         for (side, first_channel) in [(Side::Right, 0), (Side::Left, 8)] {
             for (j, expected) in probe_radians(&frame, first_channel).into_iter().enumerate() {
                 assert!(
-                    (sample.joints(side)[j] - expected).abs() < 1e-12,
+                    (sample.joints[side][j] - expected).abs() < 1e-12,
                     "{side:?} j{}: {} != {expected}",
                     j + 1,
-                    sample.joints(side)[j]
+                    sample.joints[side][j]
                 );
             }
         }
@@ -617,7 +620,7 @@ mod tests {
         // Left half squeezed, right released: the two openings must differ, so
         // a side swap anywhere from the channel to the sample fails here.
         let mut angles = released_frame();
-        angles[LEFT_TRIGGER] = LEFT_SQUEEZE_DEG as f32 / 2.0;
+        angles[TRIGGER.left] = SQUEEZE_DEG.left as f32 / 2.0;
         let run = run_one(FakeKer::new(vec![angles]));
 
         let sample = run.sample.expect("a frame arrived");
@@ -635,16 +638,12 @@ mod tests {
         let mut script = vec![released_frame(); 8];
         script.push(squeezed_frame());
         let run = run_until(FakeKer::new(script), |sample| {
-            sample.engaged != SideFlags::NONE
+            sample.engaged.iter().any(|&engaged| engaged)
         });
 
         let sample = run.sample.expect("a frame arrived");
         assert_eq!(
-            sample.engaged,
-            SideFlags {
-                left: true,
-                right: true
-            },
+            sample.engaged, BOTH_ENGAGED,
             "a squeeze after a run of open frames engages both arms"
         );
         assert_eq!(sample.gripper_openings.left, 0.0, "a full squeeze closes");
@@ -726,8 +725,7 @@ mod tests {
 
         let sample = run.sample.expect("a frame arrived");
         assert_eq!(
-            sample.engaged,
-            SideFlags::NONE,
+            sample.engaged, NEITHER_ENGAGED,
             "a session opening under a held trigger must not engage"
         );
         assert_eq!(

@@ -273,9 +273,7 @@ repository, consumed as uv git dependencies like the Rust nodes consume
   a PyO3 extension that uv builds from its source, so the image of the
   backbone installs a Rust toolchain for the build and removes it after.
 
-The follower and the leader follow `main`, like the Rust nodes'
-`control_core`. The backbone pins its three libs at one commit (`rev`), so
-they always come from one state of that repository.
+All three nodes follow `main`, like the Rust nodes' `control_core`.
 
 ## Testing
 

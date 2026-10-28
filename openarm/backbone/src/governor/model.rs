@@ -12,12 +12,11 @@
 //! queries are sequential by construction; what this boundary adds is that
 //! their *order* no longer matters.
 
-use std::time::Instant;
-
 use bimanual_collision_model::{BimanualCollisionModel, CollisionError, DistanceGradient};
+use control_core::throttle::Throttle;
 use tracing::warn;
 
-use crate::streams::warn_throttled;
+use crate::streams::THROTTLED_WARN_PERIOD;
 
 use super::{GOV_DOF, GovState, NearestPair, split};
 
@@ -27,14 +26,14 @@ pub(super) struct ConfiguredModel {
     /// reads as a breach in the scan and as "no pair" in the readout), but a
     /// persistently failing model must be visible in the log, not
     /// indistinguishable from geometry.
-    last_query_error: Option<Instant>,
+    query_error_log: Throttle,
 }
 
 impl ConfiguredModel {
     pub fn new(inner: BimanualCollisionModel) -> Self {
         Self {
             inner,
-            last_query_error: None,
+            query_error_log: Throttle::new(THROTTLED_WARN_PERIOD),
         }
     }
 
@@ -48,9 +47,9 @@ impl ConfiguredModel {
         match self.inner.min_distance(&s.arms.left, &s.arms.right) {
             Ok(p) => Some(p),
             Err(e) => {
-                warn_throttled(&mut self.last_query_error, || {
+                if self.query_error_log.admit() {
                     warn!("collision model query failed (treated as a breach): {e}");
-                });
+                }
                 None
             }
         }

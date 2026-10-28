@@ -1,9 +1,6 @@
-"""Process environment the suites depend on. The fake peppygen that used to
-live here is gone: `peppy node sync` generates the real bindings plus the
-`mock`/`fixtures` test packages under .peppy/libs/peppygen, and every suite
-now imports those real modules (the harness suite boots the node over a real
-ephemeral router). What remains are the two env side effects that must be in
-place before pyarrow / huggingface_hub first import anywhere in the run."""
+"""Process environment the suites depend on: the environment that must be
+in place before pyarrow and huggingface_hub first import anywhere in the
+run."""
 
 import os
 import tempfile

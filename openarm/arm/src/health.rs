@@ -5,8 +5,9 @@
 //! `control`; this module observes and reports.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use control_core::latched_log::LatchedLog;
 use control_core::motor_health::{
     AlertRaiser, DriverTempC, HEALTH_PERIOD, MOTOR_ALERT_KIND, MotorHealth, MotorHealthFilter,
     MotorSample, Ratings, STATE_STALE_AFTER, TEMP_WINDING_CRIT_C, TEMP_WINDING_WARN_C,
@@ -14,7 +15,9 @@ use control_core::motor_health::{
 };
 use control_core::pacer::Pacer;
 use control_core::throttle::Throttle;
+use control_core::time;
 use openarm_can::{ArmCan, ArmState, EffectiveRatings, MotorParam};
+use openarm_description::ARM_DOF;
 use peppygen::NodeRunner;
 use peppygen::emitted_topics::alerts::alerts as alerts_topic;
 use peppygen::emitted_topics::motor_health::motor_health;
@@ -22,14 +25,10 @@ use peppylib::runtime::CancellationToken;
 use tokio::sync::watch;
 use tracing::{error, info, warn};
 
-use crate::ARM_DOF;
-
 /// `ARM_MOTOR_TYPES` below is indexed by this crate's joint numbering; the two
 /// crates declare their DOF independently, so a skew would be an
 /// out-of-bounds panic mid-bring-up rather than a compile error without this.
 const _: () = assert!(openarm_can::ARM_MOTOR_TYPES.len() == ARM_DOF);
-use crate::control::ticks_within;
-use crate::stream::{LatchedWarn, StreamWiring, capture_timestamp};
 
 /// Axes whose motor reports a full scale the decode table disagrees with.
 ///
@@ -61,6 +60,13 @@ pub struct HealthSample {
     pub captured: SystemTime,
 }
 
+/// Now on this instance's bound clock: the timeline its messages are
+/// stamped and aged on. Errors until the clock delivers its first tick.
+pub(crate) fn clock_now() -> Result<SystemTime, String> {
+    let ns = peppygen::clock::now_ns().map_err(|e| format!("clock not ready: {e}"))?;
+    Ok(UNIX_EPOCH + Duration::from_nanos(ns))
+}
+
 /// The per-tick health observer: owns the filters, the staleness edge state,
 /// and the clock-warning throttle, so the control loop makes one call per
 /// tick and stays motion logic.
@@ -78,7 +84,7 @@ impl Monitor {
         Self {
             filters: std::array::from_fn(|i| MotorHealthFilter::new(ratings[i])),
             ratings,
-            stale_after_ticks: ticks_within(STATE_STALE_AFTER, cycle_period),
+            stale_after_ticks: time::ticks_within(STATE_STALE_AFTER, cycle_period),
             stale: [false; ARM_DOF],
             clock_warn: Throttle::new(CLOCK_WARN_PERIOD),
             last_step: None,
@@ -92,7 +98,11 @@ impl Monitor {
     /// nominally periodic, and "the last 5 seconds" must mean seconds on a
     /// stopwatch. A clock outage costs this tick's telemetry and nothing
     /// else; the filters keep integrating.
-    pub fn observe(&mut self, state: &ArmState, wiring: &StreamWiring) -> [bool; ARM_DOF] {
+    pub fn observe(
+        &mut self,
+        state: &ArmState,
+        health: &watch::Sender<Option<HealthSample>>,
+    ) -> [bool; ARM_DOF] {
         let stale = stale_flags(&state.passes_since_state, self.stale_after_ticks);
         self.log_stale_edges(state, &stale);
 
@@ -105,9 +115,9 @@ impl Monitor {
 
         let reports = judge(&mut self.filters, state, &stale, dt_s);
         let (effort_fractions_rated, effort_fractions_peak) = fractions(&self.ratings, state);
-        match capture_timestamp() {
+        match clock_now() {
             Ok(captured) => {
-                wiring.health.send_replace(Some(HealthSample {
+                health.send_replace(Some(HealthSample {
                     reports,
                     effort_fractions_rated,
                     effort_fractions_peak,
@@ -197,7 +207,7 @@ fn fractions(ratings: &[Ratings; ARM_DOF], state: &ArmState) -> ([f64; ARM_DOF],
 /// producer.
 ///
 /// On cancellation the loop runs one final round before returning,
-/// flushing the terminal verdict the follow loop wrote before it
+/// flushing the terminal verdict the control loop wrote before it
 /// cancelled.
 pub async fn run_publisher(
     runner: Arc<NodeRunner>,
@@ -219,9 +229,9 @@ pub async fn run_publisher(
     let mut pacer = Pacer::new(HEALTH_PERIOD).expect("HEALTH_PERIOD is non-zero");
     let sources = std::array::from_fn(|j| format!("{alert_source} j{}", j + 1));
     let mut raiser = AlertRaiser::new(sources);
-    let mut health_warn = LatchedWarn::new("motor_health publish");
-    let mut readings_warn = LatchedWarn::new("health readings");
-    let mut alert_warn = LatchedWarn::new("alert publish");
+    let health_warn = LatchedLog::warn("motor_health publish");
+    let readings_warn = LatchedLog::warn("health readings");
+    let alert_warn = LatchedLog::warn("alert publish");
     let mut final_round = false;
     let mut last_published: Option<SystemTime> = None;
     loop {
@@ -235,14 +245,8 @@ pub async fn run_publisher(
         let frozen = last_published == Some(sample.captured) && !final_round;
         if !frozen {
             last_published = Some(sample.captured);
-            publish_report(&publisher, &sample, &mut health_warn, &mut readings_warn).await;
-            publish_due_alerts(
-                &alert_publisher,
-                &mut raiser,
-                &sample.reports,
-                &mut alert_warn,
-            )
-            .await;
+            publish_report(&publisher, &sample, &health_warn, &readings_warn).await;
+            publish_due_alerts(&alert_publisher, &mut raiser, &sample.reports, &alert_warn).await;
         }
 
         if final_round {
@@ -271,12 +275,12 @@ pub async fn run_publisher(
 async fn publish_report(
     publisher: &peppylib::TopicPublisher,
     sample: &HealthSample,
-    publish_warn: &mut LatchedWarn,
-    readings_warn: &mut LatchedWarn,
+    publish_warn: &LatchedLog,
+    readings_warn: &LatchedLog,
 ) {
     let (message, degraded) = match build_health_message(sample) {
         Ok(built) => built,
-        Err(e) => return publish_warn.failure(&e),
+        Err(e) => return publish_warn.failure(e),
     };
     match degraded {
         true => readings_warn.failure("a motor carries a non-finite reading"),
@@ -284,7 +288,7 @@ async fn publish_report(
     }
     match publisher.publish(message).await {
         Ok(()) => publish_warn.success(),
-        Err(e) => publish_warn.failure(&e.to_string()),
+        Err(e) => publish_warn.failure(e),
     }
 }
 
@@ -299,7 +303,7 @@ async fn publish_due_alerts(
     publisher: &peppylib::TopicPublisher,
     raiser: &mut AlertRaiser<ARM_DOF>,
     reports: &[MotorHealth; ARM_DOF],
-    warn: &mut LatchedWarn,
+    warn: &LatchedLog,
 ) {
     let now = Instant::now();
     let Some(set) = raiser.due(reports, now) else {
@@ -316,8 +320,7 @@ async fn publish_due_alerts(
                 message: alert.message.clone(),
             })
             .collect();
-        let msg =
-            alerts_topic::build_message(capture_timestamp()?, active).map_err(|e| e.to_string())?;
+        let msg = alerts_topic::build_message(clock_now()?, active).map_err(|e| e.to_string())?;
         publisher.publish(msg).await.map_err(|e| e.to_string())
     }
     .await;
@@ -326,7 +329,7 @@ async fn publish_due_alerts(
             raiser.mark_sent(&set, now);
             warn.success();
         }
-        Err(e) => warn.failure(&e),
+        Err(e) => warn.failure(e),
     }
 }
 
@@ -661,18 +664,11 @@ mod tests {
 
     #[test]
     fn observe_returns_the_stale_joints_and_holds_telemetry_without_a_clock() {
-        let (health_tx, health_rx) = tokio::sync::watch::channel(None);
-        let (_governed_tx, governed_rx) = tokio::sync::watch::channel(None);
-        let (measured_tx, _measured_rx) = tokio::sync::watch::channel(None);
-        let wiring = StreamWiring {
-            governed: governed_rx,
-            measured: measured_tx,
-            health: health_tx,
-        };
+        let (health_tx, health_rx) = watch::channel(None);
         let mut monitor = Monitor::new(datasheet_ratings(), Duration::from_millis(10));
         let mut state = live_state();
         state.passes_since_state[4] = u32::MAX;
-        let stale = monitor.observe(&state, &wiring);
+        let stale = monitor.observe(&state, &health_tx);
         assert!(stale[4]);
         assert!(!stale[0]);
         // No daemon clock in a unit test: the tick's telemetry is skipped

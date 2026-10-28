@@ -26,7 +26,7 @@ const STALE_PERIODS: u32 = 4;
 /// The longest silence any follower rate may buy. Past this the watchdog no
 /// longer bounds the divergence it exists to catch; the relays' motor_health
 /// gate sits at the same 500 ms.
-pub const MAX_STALE_LIMIT: Duration = Duration::from_millis(500);
+const MAX_STALE_LIMIT: Duration = Duration::from_millis(500);
 
 /// How long each delivery-cadence sample runs before it is judged.
 const CADENCE_WINDOW: Duration = Duration::from_secs(1);

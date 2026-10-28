@@ -46,9 +46,6 @@ def test_the_installed_solver_accepts_the_planning_bars():
     """The fakes in this suite accept the tolerance keywords by construction,
     so nothing else here would notice a so101_description that predates them.
     The real node would TypeError on its first move_arm instead."""
-    from so101_description.kinematics import Kinematics
-    from so101_description.model import KINEMATICS_URDF_PATH
-
     solver = Kinematics(KINEMATICS_URDF_PATH)
     target = solver.forward_kinematics(postures.READY_POSITIONS_RAD)
     solver.inverse_kinematics(

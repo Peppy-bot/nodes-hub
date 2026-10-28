@@ -29,7 +29,7 @@ from xr_commander.robots import JOIN_HINT, PairedRobots
 
 ROBOT_PATH = "/robot"
 EVENTS_PATH = "/robot/events"
-ROBOT_FIELD = "robot"
+_ROBOT_FIELD = "robot"
 NO_ROBOT_TEXT = f"No robot is paired with the headset. {JOIN_HINT}"
 
 # How often the node reads the robots and the choice for a change to send;
@@ -44,7 +44,7 @@ class RobotOffer(TypedDict):
     state: str
 
 
-class RobotChoice(TypedDict):
+class _RobotChoice(TypedDict):
     """What the card reads: the paired robots, the one driven, and what to
     say while there is none."""
 
@@ -55,7 +55,7 @@ class RobotChoice(TypedDict):
 
 def robot_choice(
     names: Sequence[str], chosen: str | None, states: Mapping[str, str]
-) -> RobotChoice:
+) -> _RobotChoice:
     return {
         "robots": [{"name": name, "state": states.get(name, "")} for name in names],
         "chosen": chosen,
@@ -63,7 +63,7 @@ def robot_choice(
     }
 
 
-def _offer_latest(queue: asyncio.Queue, choice: RobotChoice | None) -> None:
+def _offer_latest(queue: asyncio.Queue, choice: _RobotChoice | None) -> None:
     """Put `choice` in a one-place queue, in place of a choice not read
     yet: a page that falls behind gets the latest only. None ends the
     page's stream, and stays in the queue until the stream reads it."""
@@ -84,7 +84,7 @@ class RobotStates:
         self._robots = robots
         self._state_of = state_of
         self._states: Mapping[str, str] = MappingProxyType({})
-        self._shown: RobotChoice | None = None
+        self._shown: _RobotChoice | None = None
         self._lock = threading.Lock()
         self._followers: dict[asyncio.Queue, asyncio.AbstractEventLoop] = {}
 
@@ -100,7 +100,7 @@ class RobotStates:
         self._states = MappingProxyType(states)
         self._send(choice)
 
-    def current(self) -> RobotChoice:
+    def current(self) -> _RobotChoice:
         """The robots and the choice as they stand, with the states last
         sent: for a page's request, on the page server's thread."""
         return robot_choice(*self._robots.standing(), self._states)
@@ -109,7 +109,7 @@ class RobotStates:
         """End every page's stream, as the node stops."""
         self._send(None)
 
-    def _send(self, choice: RobotChoice | None) -> None:
+    def _send(self, choice: _RobotChoice | None) -> None:
         with self._lock:
             followers = list(self._followers.items())
         for queue, loop in followers:
@@ -136,7 +136,7 @@ async def follow_robot_states(
         states.refresh()
 
 
-def _event(choice: RobotChoice) -> str:
+def _event(choice: _RobotChoice) -> str:
     return f"data: {json.dumps(choice)}\n\n"
 
 
@@ -172,7 +172,7 @@ def build_router(robots: PairedRobots, states: RobotStates) -> APIRouter:
             name = form_field(
                 request.headers.get("content-type", ""),
                 await read_capped_body(request),
-                ROBOT_FIELD,
+                _ROBOT_FIELD,
             )
         except ValueError as e:
             return Response(str(e), status_code=BAD_REQUEST, media_type="text/plain")

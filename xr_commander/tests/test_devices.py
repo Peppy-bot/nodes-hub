@@ -1,9 +1,16 @@
 import math
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
-from xr_commander.devices import gripper_opening, parse_hands
+from tests.helpers import ScriptedHeadset, squeezing_hand
+from xr_commander.devices import (
+    RisingEdge,
+    fresh_sample,
+    gripper_opening,
+    parse_hands,
+)
 
 
 def controller(
@@ -123,6 +130,9 @@ def test_a_non_controller_or_unknown_handedness_is_skipped():
     devices = [
         {"role": "hand", "handedness": "left"},
         controller("none"),
+        controller("LEFT"),
+        controller(["left"]),
+        controller(None),
     ]
     assert parse_hands(devices) == {}
 
@@ -157,3 +167,47 @@ def test_malformed_browser_json_drops_the_device_not_the_frame(devices):
     # The payload is unauthenticated browser JSON; any shape must parse to
     # an empty frame rather than raise into the server callback.
     assert parse_hands(devices) == {}
+
+
+def test_a_rising_edge_is_a_press_against_an_observed_release():
+    edge = RisingEdge()
+    # Already down when first observed, then held across an untracked gap.
+    assert [edge.step(held) for held in (True, None, True)] == [False] * 3
+    # Released, then pressed: one press, held through a gap.
+    assert [edge.step(held) for held in (False, True, None, True)] == [
+        False,
+        True,
+        False,
+        False,
+    ]
+    # Untracked before any reading: still no press on the first observed down.
+    fresh = RisingEdge()
+    assert [fresh.step(held) for held in (None, True, False, True)] == [
+        False,
+        False,
+        False,
+        True,
+    ]
+
+
+def test_no_frame_yet_reads_as_no_sample():
+    no_frame = SimpleNamespace(latest=lambda: None)
+    assert fresh_sample(no_frame, "left", 0.25) is None
+
+
+def test_a_recent_frame_yields_its_hand():
+    source = ScriptedHeadset(hands={"left": squeezing_hand()})
+    assert fresh_sample(source, "left", 0.25) is not None
+
+
+def test_a_hand_missing_from_a_recent_frame_reads_as_no_sample():
+    source = ScriptedHeadset(hands={"left": squeezing_hand()})
+    assert fresh_sample(source, "right", 0.25) is None
+
+
+def test_a_stale_frame_is_discarded_rather_than_held():
+    # A frozen headset is still reporting whatever button it last held. Treating
+    # that as current would leave the robot engaged to an absent operator, so
+    # age, not content, decides.
+    source = ScriptedHeadset(hands={"left": squeezing_hand()}, age_s=1.0)
+    assert fresh_sample(source, "left", 0.25) is None

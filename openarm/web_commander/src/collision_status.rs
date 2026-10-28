@@ -1,7 +1,7 @@
-// Live self-collision proximity for the UI. Consumes the collision_status
-// contract's stream and reports the nearest-pair distance and link names to the
-// owner, so the panel can show how close the arms are and color it against the
-// governor band.
+//! Live self-collision proximity for the UI. Consumes the collision_status
+//! contract's stream and reports the nearest-pair distance and link names to the
+//! owner, so the panel can show how close the arms are and color it against the
+//! governor band.
 
 use std::sync::Arc;
 use std::time::Instant;

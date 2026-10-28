@@ -6,18 +6,13 @@ from dataclasses import dataclass
 from enum import Enum
 
 from control_core_py.params import require_positive, require_rate
+from so101_description.device import BUS_MAX_RATE_HZ
 from so101_description.units import NUM_JOINTS
 
 
 class UpstreamMode(Enum):
     JOINTS = "joints"
     POSE = "pose"
-
-
-# The fastest the coordination loop is driven. This node touches no serial
-# bus of its own; the ceiling is the downstream follower's, since setpoints
-# it cannot write are setpoints not worth computing. The stack runs at 60 Hz.
-MAX_RATE_HZ = 1000
 
 
 @dataclass(frozen=True)
@@ -40,7 +35,10 @@ def parse(params) -> Config:
         raise ValueError(
             f'upstream_mode must be "joints" or "pose", got {params.upstream_mode!r}'
         ) from None
-    control_rate_hz = require_rate("control_rate_hz", params.control_rate_hz, MAX_RATE_HZ)
+    # This node touches no serial bus of its own; the ceiling is the
+    # downstream follower's bus, since setpoints it cannot write are
+    # setpoints not worth computing. The stack runs at 60 Hz.
+    control_rate_hz = require_rate("control_rate_hz", params.control_rate_hz, BUS_MAX_RATE_HZ)
 
     velocity_caps = tuple(
         require_positive(

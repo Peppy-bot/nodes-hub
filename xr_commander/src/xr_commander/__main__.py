@@ -70,6 +70,7 @@ from xr_commander import (
     motor_health,
     page,
     panel,
+    postures,
     publish,
     record,
     robot_choice,
@@ -78,9 +79,9 @@ from xr_commander import (
     tls,
     video,
 )
-from xr_commander.bus import log
+from xr_commander.bus import log, producer_key
 from xr_commander.clutch import HandClutch
-from xr_commander.devices import HandSample
+from xr_commander.devices import Hand, primary_pressed, secondary_pressed
 from xr_commander.publish import MeasuredPoses
 from xr_commander.robots import PairedRobots
 from xr_commander.xr import XrSession
@@ -97,12 +98,12 @@ class _HandWiring:
 
 # Keyed by WebXR handedness; the launcher decides which limb a hand drives.
 _HANDS = {
-    "left": _HandWiring(
+    Hand.LEFT: _HandWiring(
         pose_setpoints=left_arm_pose_setpoints,
         pose_states=left_arm_pose_states,
         gripper_setpoints=left_gripper_setpoints,
     ),
-    "right": _HandWiring(
+    Hand.RIGHT: _HandWiring(
         pose_setpoints=right_arm_pose_setpoints,
         pose_states=right_arm_pose_states,
         gripper_setpoints=right_gripper_setpoints,
@@ -116,19 +117,11 @@ _CAMERA_SLOTS = (
 )
 
 
-def _primary_pressed(sample: HandSample) -> bool:
-    return sample.primary_button
-
-
-def _secondary_pressed(sample: HandSample) -> bool:
-    return sample.secondary_button
-
-
 # The right controller's face buttons: A (the lower button) goes home, B goes
 # ready. Each entry is (consumed action module, its button).
 _POSTURE_BUTTONS = (
-    (postures_move_to_home, _primary_pressed),
-    (postures_move_to_ready, _secondary_pressed),
+    (postures_move_to_home, primary_pressed),
+    (postures_move_to_ready, secondary_pressed),
 )
 
 
@@ -257,8 +250,7 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
     # section.
     active_alerts = alerts.ActiveAlerts(
         bound_now=lambda: (
-            (p.core_node, p.instance_id)
-            for p in alerts_topic.bound_producers(node_runner)
+            producer_key(p) for p in alerts_topic.bound_producers(node_runner)
         ),
     )
     # Shared by the health listener and the status panel, on the same
@@ -282,10 +274,10 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
         ),
         asyncio.create_task(robot_choice.follow_robot_states(robot_states, token)),
     ]
-    posture_status = publish.PostureStatus()
+    posture_status = postures.PostureStatus()
     tasks.extend(
         asyncio.create_task(
-            publish.run_posture_button(
+            postures.run_posture_button(
                 node_runner,
                 action_module=action_module,
                 pressed=pressed,
@@ -307,11 +299,7 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
             alerts.drain_alerts(node_runner, alerts_topic, active_alerts, token)
         )
     )
-    tasks.append(
-        asyncio.create_task(
-            alerts.follow_producers(node_runner, alerts_topic, active_alerts, token)
-        )
-    )
+    tasks.append(asyncio.create_task(alerts.follow_producers(active_alerts, token)))
     tasks.append(
         asyncio.create_task(
             motor_health.drain_motor_health(
@@ -425,8 +413,6 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
         )
         for handedness, wiring in _HANDS.items()
     )
-    clutches = {hand.handedness: hand.clutch for hand in hands}
-    measured = {hand.handedness: hand.measured for hand in hands}
     if panel_sink is not None:
         tasks.append(
             asyncio.create_task(
@@ -446,14 +432,15 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
             )
         )
 
-    for handedness, wiring in _HANDS.items():
+    for hand in hands:
+        wiring = _HANDS[hand.handedness]
         tasks.append(
             asyncio.create_task(
                 publish.drain_pose_states(
                     node_runner,
                     wiring.pose_states,
-                    measured[handedness],
-                    handedness,
+                    hand.measured,
+                    hand.handedness,
                     token,
                 )
             )
@@ -464,12 +451,12 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
                     node_runner,
                     topic_module=wiring.pose_setpoints,
                     gripper_module=wiring.gripper_setpoints,
-                    handedness=handedness,
-                    hand=driver.hands[handedness],
+                    handedness=hand.handedness,
+                    hand=hand.state,
                     driver=driver,
-                    clutch=clutches[handedness],
+                    clutch=hand.clutch,
                     session=session,
-                    measured=measured[handedness],
+                    measured=hand.measured,
                     robots=robots,
                     settings=settings,
                     token=token,
@@ -481,8 +468,8 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
                 publish.stream_gripper(
                     node_runner,
                     topic_module=wiring.gripper_setpoints,
-                    handedness=handedness,
-                    hand=driver.hands[handedness],
+                    handedness=hand.handedness,
+                    hand=hand.state,
                     session=session,
                     robots=robots,
                     settings=settings,
