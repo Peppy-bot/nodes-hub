@@ -86,7 +86,7 @@ that stops delivering reads NO SIGNAL.
 The headset holds the robot lease of the robot a person drives, so a program
 that asks the stack before it moves a robot never takes that robot from a
 person, and a person never drives a robot that a program holds. Its daemon
-target `fleet` (`fleet:v1`) needs a scope with `changes` and `lease`; the
+target `fleet` (`robot_leases:v1`) needs a scope with `changes` and `lease`; the
 launcher gives it on the instance, which runs on the coordinator machine,
 outside any copy:
 
