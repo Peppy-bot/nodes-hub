@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+use crate::size::Size;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Resolution {
     Vga,
@@ -23,17 +25,28 @@ impl Resolution {
         }
     }
 
-    /// One eye's geometry; the wire carries both eyes side by side.
-    pub fn eye_size(self) -> (u32, u32) {
+    /// The suffix of this mode's sections and keys in a factory calibration.
+    pub fn conf_key(self) -> &'static str {
         match self {
+            Self::Vga => "VGA",
+            Self::Hd720 => "HD",
+            Self::Hd1080 => "FHD",
+            Self::Hd2k => "2K",
+        }
+    }
+
+    /// One eye's geometry; the wire carries both eyes side by side.
+    pub fn eye_size(self) -> Size {
+        let (width, height) = match self {
             Self::Vga => (672, 376),
             Self::Hd720 => (1280, 720),
             Self::Hd1080 => (1920, 1080),
             Self::Hd2k => (2208, 1242),
-        }
+        };
+        Size { width, height }
     }
 
-    pub fn legal_fps(self) -> &'static [u32] {
+    fn legal_fps(self) -> &'static [u8] {
         match self {
             Self::Vga => &[15, 30, 60, 100],
             Self::Hd720 => &[15, 30, 60],
@@ -42,14 +55,34 @@ impl Resolution {
         }
     }
 
-    pub fn validate_fps(self, fps: u32) -> Result<(), String> {
-        if self.legal_fps().contains(&fps) {
-            return Ok(());
-        }
-        Err(format!(
-            "frame rate {fps} is not legal for {self}; legal: {:?}",
-            self.legal_fps()
-        ))
+    /// `fps` as a frame rate this mode runs at.
+    pub fn frame_rate(self, fps: u32) -> Result<LegalFrameRate, String> {
+        self.legal_fps()
+            .iter()
+            .find(|&&legal| u32::from(legal) == fps)
+            .map(|&legal| LegalFrameRate(legal))
+            .ok_or_else(|| {
+                format!(
+                    "frame rate {fps} is not legal for {self}; legal: {:?}",
+                    self.legal_fps()
+                )
+            })
+    }
+}
+
+/// A frame rate legal for the mode it was parsed against, frames per second.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct LegalFrameRate(u8);
+
+impl LegalFrameRate {
+    pub fn per_second(self) -> u8 {
+        self.0
+    }
+}
+
+impl fmt::Display for LegalFrameRate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
@@ -84,8 +117,8 @@ mod tests {
 
     #[test]
     fn fps_legality_follows_the_mode_tables() {
-        assert!(Resolution::Vga.validate_fps(100).is_ok());
-        assert!(Resolution::Hd2k.validate_fps(30).is_err());
-        assert!(Resolution::Hd720.validate_fps(60).is_ok());
+        assert_eq!(Resolution::Vga.frame_rate(100).unwrap().per_second(), 100);
+        assert!(Resolution::Hd2k.frame_rate(30).is_err());
+        assert_eq!(Resolution::Hd720.frame_rate(60).unwrap().per_second(), 60);
     }
 }

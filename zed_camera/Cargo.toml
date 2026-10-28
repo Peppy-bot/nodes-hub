@@ -10,8 +10,7 @@ unsafe_code = "deny"
 [features]
 default = ["capture", "cv"]
 # V4L2 mmap streaming and controls through the v4l crate; serial via sysfs.
-# libc names the errno of a refused control write.
-capture = ["dep:v4l", "dep:libc"]
+capture = ["dep:v4l"]
 # Rectify + SGBM depth through the maintained opencv crate. clang-runtime is
 # required for opencv's binding generator to coexist with v4l's bindgen.
 cv = ["dep:opencv"]
@@ -28,10 +27,11 @@ tracing-subscriber = "0.3"
 ureq = "3"
 peppygen = { path = ".peppy/libs/peppygen" }
 peppylib = { path = ".peppy/libs/peppylib" }
+camera_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "camera_core" }
+control_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "control_core" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 v4l = { version = "0.14", optional = true }
-libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

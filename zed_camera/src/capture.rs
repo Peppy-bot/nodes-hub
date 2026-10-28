@@ -14,7 +14,9 @@ use v4l::prelude::*;
 use v4l::video::Capture as _;
 use v4l::{Format, FourCC};
 
-use crate::resolution::Resolution;
+use camera_core::controls::ControlFailure;
+
+use crate::resolution::{LegalFrameRate, Resolution};
 
 /// Two buffers bound the queue: the newest completed frame is at most one
 /// frame behind the sensor, with no drain logic.
@@ -24,68 +26,9 @@ const ZED_VENDOR_ID: &str = "2b03";
 /// The ZED's HID (IMU) interface; its USB descriptor carries the unit serial.
 const ZED_HID_PRODUCT_IDS: [&str; 3] = ["f681", "f781", "f881"];
 
-// V4L2_CID_* ids (<linux/v4l2-controls.h>) the ZED exposes, for callers
-// driving [`Capture::control`]/[`Capture::set_control`].
-pub const CID_BRIGHTNESS: u32 = 0x0098_0900;
-pub const CID_CONTRAST: u32 = 0x0098_0901;
-pub const CID_SATURATION: u32 = 0x0098_0902;
-pub const CID_HUE: u32 = 0x0098_0903;
-pub const CID_AWB_AUTO: u32 = 0x0098_090c;
-pub const CID_GAMMA: u32 = 0x0098_0910;
-pub const CID_GAIN: u32 = 0x0098_0913;
-pub const CID_AWB_TEMPERATURE: u32 = 0x0098_091a;
-pub const CID_SHARPNESS: u32 = 0x0098_091b;
-
-/// Why a control write gave no value: the failure kind of peppy that says
-/// why, and the reason in words.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ControlFailure {
-    pub kind: ControlFailureKind,
-    pub message: String,
-}
-
-/// The failure kinds of peppy that a control gives.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ControlFailureKind {
-    /// The device does not offer the control, or does not take the value.
-    Rejected,
-    /// The control does not take a write now: it is read-only, inactive in
-    /// the current mode, or held by another application.
-    PreconditionFailed,
-    /// The device is gone.
-    ResourceUnavailable,
-    /// The write failed for another reason.
-    AttemptFailed,
-}
-
-impl ControlFailure {
-    /// A request the node does not take, such as an unknown mode.
-    pub fn rejected(message: impl Into<String>) -> Self {
-        Self {
-            kind: ControlFailureKind::Rejected,
-            message: message.into(),
-        }
-    }
-
-    /// The failure of a write of control `cid` that the driver refused with
-    /// `error`, by the errno that VIDIOC_S_EXT_CTRLS documents for it.
-    fn of_write(cid: u32, error: &io::Error) -> Self {
-        let kind = match error.raw_os_error() {
-            Some(libc::EINVAL | libc::ERANGE) => ControlFailureKind::Rejected,
-            Some(libc::EACCES | libc::EBUSY) => ControlFailureKind::PreconditionFailed,
-            Some(libc::ENODEV) => ControlFailureKind::ResourceUnavailable,
-            _ => ControlFailureKind::AttemptFailed,
-        };
-        Self {
-            kind,
-            message: format!("set control {cid:#x}: {error}"),
-        }
-    }
-}
-
 /// The result of one grab attempt.
 pub enum Grab {
-    Frame { hw_stamp_ns: u64 },
+    Frame,
     Timeout,
     Dead,
 }
@@ -102,10 +45,13 @@ impl Capture {
     /// Opens `/dev/video<dev_id>`, negotiates the side-by-side geometry at
     /// `fps`, resets every control to its driver default (so a restart never
     /// inherits the previous session), and starts streaming.
-    pub fn open(dev_id: usize, resolution: Resolution, fps: u32) -> Result<Self, String> {
-        resolution.validate_fps(fps)?;
-        let (eye_width, height) = resolution.eye_size();
-        let full_width = eye_width * 2;
+    pub fn open(
+        dev_id: usize,
+        resolution: Resolution,
+        fps: LegalFrameRate,
+    ) -> Result<Self, String> {
+        let eye = resolution.eye_size();
+        let (full_width, height) = (eye.width * 2, eye.height);
 
         let device = Device::new(dev_id).map_err(|e| format!("open /dev/video{dev_id}: {e}"))?;
         let yuyv = FourCC::new(b"YUYV");
@@ -119,7 +65,9 @@ impl Capture {
             ));
         }
         device
-            .set_params(&v4l::video::capture::Parameters::with_fps(fps))
+            .set_params(&v4l::video::capture::Parameters::with_fps(u32::from(
+                fps.per_second(),
+            )))
             .map_err(|e| format!("set frame rate: {e}"))?;
         reset_controls_to_defaults(&device);
 
@@ -131,11 +79,6 @@ impl Capture {
             full_width,
             height,
         })
-    }
-
-    /// Full side-by-side geometry (width spans both eyes).
-    pub fn frame_size(&self) -> (u32, u32) {
-        (self.full_width, self.height)
     }
 
     /// Copy the next full side-by-side YUYV frame into `yuyv`, waiting up to
@@ -154,10 +97,7 @@ impl Capture {
         }
         let n = yuyv.len().min(expected);
         yuyv[..n].copy_from_slice(&frame[..n]);
-        Grab::Frame {
-            hw_stamp_ns: meta.timestamp.sec as u64 * 1_000_000_000
-                + meta.timestamp.usec as u64 * 1_000,
-        }
+        Grab::Frame
     }
 
     /// Reads an integer control by CID.
@@ -176,8 +116,14 @@ impl Capture {
                 id: cid,
                 value: Value::Integer(value as i64),
             })
-            .map_err(|error| ControlFailure::of_write(cid, &error))
+            .map_err(|error| write_failure(cid, &error))
     }
+}
+
+/// The failure of a write of control `cid` that the driver refused with
+/// `error`, of the kind its errno names.
+fn write_failure(cid: u32, error: &io::Error) -> ControlFailure {
+    ControlFailure::of_refused_write(error, format!("set control {cid:#x}: {error}"))
 }
 
 /// Best-effort sweep of every exposed control back to its driver default.
@@ -244,6 +190,7 @@ fn zed_serial_under(usb_devices: &Path) -> Result<i32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use camera_core::v4l2::CID_CONTRAST;
 
     #[test]
     fn device_index_parses_only_video_paths() {
@@ -251,50 +198,9 @@ mod tests {
         assert!(device_index("/dev/ttyUSB0").is_err());
     }
 
-    fn kind_of_errno(errno: i32) -> ControlFailureKind {
-        ControlFailure::of_write(CID_GAIN, &io::Error::from_raw_os_error(errno)).kind
-    }
-
-    #[test]
-    fn a_control_or_a_value_the_device_does_not_take_is_rejected() {
-        assert_eq!(kind_of_errno(libc::EINVAL), ControlFailureKind::Rejected);
-        assert_eq!(kind_of_errno(libc::ERANGE), ControlFailureKind::Rejected);
-    }
-
-    #[test]
-    fn a_control_that_takes_no_write_now_fails_a_precondition() {
-        assert_eq!(
-            kind_of_errno(libc::EACCES),
-            ControlFailureKind::PreconditionFailed
-        );
-        assert_eq!(
-            kind_of_errno(libc::EBUSY),
-            ControlFailureKind::PreconditionFailed
-        );
-    }
-
-    #[test]
-    fn a_device_that_is_gone_is_unavailable() {
-        assert_eq!(
-            kind_of_errno(libc::ENODEV),
-            ControlFailureKind::ResourceUnavailable
-        );
-    }
-
-    #[test]
-    fn any_other_refusal_of_the_driver_is_a_failed_attempt() {
-        assert_eq!(kind_of_errno(libc::EIO), ControlFailureKind::AttemptFailed);
-        let without_errno = io::Error::other("no errno");
-        assert_eq!(
-            ControlFailure::of_write(CID_GAIN, &without_errno).kind,
-            ControlFailureKind::AttemptFailed
-        );
-    }
-
     #[test]
     fn a_failed_write_names_the_control() {
-        let failure =
-            ControlFailure::of_write(CID_CONTRAST, &io::Error::from_raw_os_error(libc::ERANGE));
+        let failure = write_failure(CID_CONTRAST, &io::Error::other("out of range"));
         assert!(failure.message.contains("0x980901"), "{}", failure.message);
     }
 

@@ -14,14 +14,10 @@
 use std::fmt::Write as _;
 use std::time::Instant;
 
-use zed_camera::DepthSettings;
 use zed_camera::cv_depth::CvDepth;
+use zed_camera::{DepthSettings, Resolution};
 
-const MODES: [(&str, u32, u32); 3] = [
-    ("vga", 672, 376),
-    ("hd720", 1280, 720),
-    ("hd1080", 1920, 1080),
-];
+const MODES: [Resolution; 3] = [Resolution::Vga, Resolution::Hd720, Resolution::Hd1080];
 const BLOCK_SIZE: u32 = 3;
 const DOWNSCALES: [u32; 2] = [1, 2];
 const FLAT_DISPARITY: f64 = 24.0;
@@ -89,11 +85,13 @@ fn synthetic_yuyv(eye_width: usize, height: usize, scene: Scene) -> Vec<u8> {
 
 /// A ZED-format calibration with identical near-ideal pinholes on both eyes and
 /// a pure-x baseline: rectification is near-identity, so a horizontally shifted
-/// synthetic scene stays epipolar-valid. k1/k2 are negligibly non-zero because
-/// the reader treats all-zero distortion as a locale parsing failure.
+/// synthetic scene stays epipolar-valid. k1/k2 are negligibly non-zero.
 fn ideal_calibration_conf() -> String {
     let mut conf = format!("[STEREO]\nBaseline={IDEAL_BASELINE}\n");
-    for (section, width, height) in [("VGA", 672, 376), ("HD", 1280, 720), ("FHD", 1920, 1080)] {
+    for mode in MODES {
+        let section = mode.conf_key();
+        let eye = mode.eye_size();
+        let (width, height) = (eye.width, eye.height);
         for side in ["LEFT", "RIGHT"] {
             let _ = write!(
                 conf,
@@ -107,17 +105,12 @@ fn ideal_calibration_conf() -> String {
     conf
 }
 
-fn out_size(width: u32, height: u32, downscale: u32) -> (usize, usize) {
-    ((width / downscale) as usize, (height / downscale) as usize)
-}
-
-fn open(calib: &str, width: u32, height: u32, downscale: u32) -> CvDepth {
+fn open(calib: &str, mode: Resolution, downscale: u32) -> CvDepth {
     CvDepth::create(
         calib,
-        width,
-        height,
+        mode,
         DepthSettings::new(
-            min_depth_for_96_disparities(width, downscale),
+            min_depth_for_96_disparities(mode.eye_size().width, downscale),
             BLOCK_SIZE,
             downscale,
         )
@@ -138,13 +131,15 @@ fn main() {
 
     println!("== timing (real calibration: {real_calib_path}) ==");
     println!("mode    downscale  ms/frame");
-    for (name, width, height) in MODES {
+    for mode in MODES {
+        let (name, eye) = (mode.to_string(), mode.eye_size());
+        let (width, height) = (eye.width, eye.height);
         let yuyv = synthetic_yuyv(width as usize, height as usize, Scene::Flat);
         for downscale in DOWNSCALES {
-            let (dw, dh) = out_size(width, height, downscale);
+            let mut backend = open(&real_calib, mode, downscale);
+            let out = backend.out_size();
             let mut left_rgb = vec![0u8; (width * height * 3) as usize];
-            let mut depth = vec![0u16; dw * dh];
-            let mut backend = open(&real_calib, width, height, downscale);
+            let mut depth = vec![0u16; (out.width * out.height) as usize];
             backend
                 .process(&yuyv, &mut left_rgb, &mut depth)
                 .expect("warm"); // warm
@@ -162,14 +157,18 @@ fn main() {
     println!();
     println!("== accuracy vs ground truth (ideal calibration) ==");
     println!("mode    ds scene  valid%  mean|err|px  p99px  wrong%(>1px)");
-    for (name, width, height) in MODES {
+    for mode in MODES {
+        let (name, eye) = (mode.to_string(), mode.eye_size());
+        let (width, height) = (eye.width, eye.height);
         for scene in [Scene::Flat, Scene::Ramp] {
             let yuyv = synthetic_yuyv(width as usize, height as usize, scene);
             for downscale in DOWNSCALES {
-                let (dw, dh) = out_size(width, height, downscale);
+                let mut backend = open(&ideal_calib, mode, downscale);
+                let out = backend.out_size();
+                let (dw, dh) = (out.width as usize, out.height as usize);
                 let mut left_rgb = vec![0u8; (width * height * 3) as usize];
                 let mut depth = vec![0u16; dw * dh];
-                open(&ideal_calib, width, height, downscale)
+                backend
                     .process(&yuyv, &mut left_rgb, &mut depth)
                     .expect("process");
                 let acc = accuracy(&depth, scene, width as usize, dw, dh, downscale as usize);
