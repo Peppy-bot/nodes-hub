@@ -441,10 +441,10 @@ impl Governor {
             .add(tripwire.name(), trip_allowance)
             .apply(&step);
 
-        // The barrier stands down in deep penetration: with the witness points
+        // The barrier stands down at a touch: with the witness points
         // coincident there is no separating direction to steer on. The floor
         // scan below still lets the operator drive out and still refuses to let
-        // the penetration deepen, so standing down never traps them inside it.
+        // the contact deepen, so standing down never traps them in it.
         let (projected, throttled) = match sensed.grad {
             Some(grad) => self.project_closing(&step.prev, &limited, &grad, sensed.d_prev, dt),
             None => (limited, false),
@@ -1097,10 +1097,11 @@ mod tests {
 
     #[test]
     fn the_clip_stage_alone_allows_escape_and_never_deepens() {
-        // In deep penetration the witnesses coincide, no gradient exists, and
-        // the barrier stands down: `govern` runs the clip stage alone. That
-        // stage by itself must still let the operator drive out and still
-        // refuse to let the penetration deepen, so exercise it directly.
+        // At a touch the witnesses coincide, no gradient exists, and the
+        // barrier stands down: `govern` runs the clip stage alone. That stage
+        // by itself must still let the operator drive out and still refuse to
+        // let the penetration deepen, so exercise it directly, deep in an
+        // overlap.
         let mut g = governor(true);
         let deep = at(wrists_inward(1.5));
         let d0 = distance(&mut g, &deep);

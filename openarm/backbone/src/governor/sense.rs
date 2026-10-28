@@ -25,8 +25,8 @@ use super::{GOV_DOF, GovState, Governor, NearestPair, concat, governed_gradient}
 pub(super) struct Sensed {
     /// Signed surface clearance at `prev` (m; negative is penetration).
     pub d_prev: f64,
-    /// `d(clearance)/d(dof)` at `prev`. `None` in deep penetration, where the
-    /// witness points coincide and no separating direction exists: the barrier
+    /// `d(clearance)/d(dof)` at `prev`. `None` at a touch, where the witness
+    /// points coincide and no separating direction exists: the barrier
     /// stands down there and the floor scan alone guards the step, so the
     /// operator can still drive out of the contact.
     pub grad: Option<[f64; GOV_DOF]>,
@@ -63,10 +63,10 @@ impl Governor {
                 tripwire,
             }),
             Err(CollisionError::WitnessesCoincide { .. }) => {
-                // Deep penetration. There is no gradient to steer on, but there
-                // is still a distance to hold, so report the reading without one
-                // rather than failing: freezing here would trap the operator
-                // inside the collision.
+                // A touch, where no direction is defined. There is no gradient to
+                // steer on, but there is still a distance to hold, so report the
+                // reading without one: freezing here would trap the operator in
+                // the contact.
                 let pair = self.proximity(prev)?;
                 Some(Sensed {
                     d_prev: pair.distance,
