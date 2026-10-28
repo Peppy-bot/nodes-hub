@@ -29,7 +29,7 @@ use peppygen::mock::deps::perception_geometry::{get_color_intrinsics, get_depth_
 use tokio::sync::{mpsc, oneshot, watch};
 
 mod helpers;
-use helpers::params;
+use helpers::params::params;
 
 /// How long a mock pump waits parked for the node's next poll or for the
 /// node's subscription to appear; only expires once the harness is gone.

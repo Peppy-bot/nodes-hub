@@ -17,10 +17,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use control_core::positive_finite::PositiveFinite;
+use control_core::serving;
 use openarm_description::{ARM_DOF, ArmPair, Side};
 use peppygen::exposed_actions::limb_motion::{move_arm, move_arm_joints};
 use peppygen::exposed_services::limb_motion::check_arm_move;
 use peppygen::{NodeRunner, Result};
+use peppylib::runtime::CancellationToken;
 use srs_model::{JointVec, Limit};
 use tokio::sync::{mpsc, oneshot};
 use tracing::error;
@@ -256,20 +258,22 @@ pub async fn run_move_arm(
 /// coordinator, which asks the arm's planner for a plan from the held
 /// setpoint and moves nothing. The answer is whether a plan exists: the time
 /// the move would take, or the words a `move_arm` failure with `unreachable`
-/// gives. A coordinator that does not answer gives `attempt_failed`.
+/// gives. A coordinator that does not answer gives `attempt_failed`. Serves
+/// until `token` cancels.
 pub async fn run_check_arm_move(
     runner: Arc<NodeRunner>,
+    token: CancellationToken,
     requests: mpsc::Sender<CoordinatorRequest>,
     fresh: ArmPair<Arc<AtomicBool>>,
     activity: ArmPair<LeaderActivity>,
-) -> Result<()> {
-    loop {
+) {
+    serving::serve("check_arm_move", token.cancelled(), || {
         check_arm_move::handle_next_request(&runner, |req| {
             check_plan(&requests, &fresh, &activity, &req.data)
                 .map_err(|f| check_arm_move::Failure::new(f.kind.into(), f.message))
         })
-        .await?;
-    }
+    })
+    .await;
 }
 
 /// The answer to one plan check, or the refusal a `move_arm` goal with these

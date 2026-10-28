@@ -153,8 +153,9 @@ gripper's **grasp point** (midway between the pads on the jaw closing axis,
 `openarm_description` carries the offset per generation and `arm_model` builds
 the model with it, so the pose solved for, the pose reported, and the point the
 EE speed cap applies to are one frame. One move per side at a time (a
-single-flight move slot whose release rides a drop guard, so no terminal can
-leak it). `move_arm` plans the quietest tier that works (`srs_model::plan_cartesian`): a
+single-flight move slot whose release rides a drop guard, held by the move,
+or by the coordinator for a goal it ends before the move starts, so every
+terminal frees it). `move_arm` plans the quietest tier that works (`srs_model::plan_cartesian`): a
 line with the elbow held, a line with the elbow swiveled toward the widest
 joint-limit margin or the highest manipulability, or the guarded servo
 (`chain_kinematics::plan_servo`, a damped resolved-rate law that can cross
@@ -359,7 +360,7 @@ The robot's own body is not checked for hiding a point from the camera.
 | `coordinator.rs` | the tick, each gripper's target and chase, the upstream relay | IO orchestration; its seam with the safety core is exactly one `govern` call, which is why the governor is not folded into it |
 | `gripper_move.rs` | gripper move execution: a `move_gripper` goal admitted into a free side, the terminal it gets once the jaws stand still or its settle timeout passes, and the end of its goal | the gripper analog of `planner.rs` + `settle.rs`; the coordinator drives it each tick |
 | `liveness.rs` | follower admission (`Live` / `Reanchor` / `Stale`) | delivery-cadence policy for the coordinator, independent of any message type |
-| `move_slot.rs` | `MoveSlot`, each limb's single-flight move slot (claim, release, and the `SlotRelease` a move holds), and the refusals of a busy limb | one owner for the slot the action handlers claim, and release when a goal never reaches the coordinator, and the planners and the coordinator release at a move's end |
+| `move_slot.rs` | `MoveSlot`, each limb's single-flight move slot (claim, release, and the `SlotRelease` a move holds), and the refusals of a busy limb | one owner for the slot the action handlers claim, and release when a goal never reaches the coordinator, and the planners and the coordinator release when they end a goal or its move |
 | `planner.rs` | per-arm mode machine (Follow / joint move / Cartesian move) -> one rate-limited candidate + the stream-tick Jacobian | knows one arm only; never the other arm, never the collision model |
 | `settle.rs` | `Settle`, `PoseTolerance` (the slack a Cartesian move is planned and settled within), the verdict an arm move gets from its planned end on, and how far a joint target or a grasp point still stands from its target | one rule for the joint and the Cartesian move |
 | `governor/mod.rs` | `GovState`, the pipeline, the runtime controls, disposition and readout | the only mutable resource is the collision model |
@@ -373,7 +374,6 @@ The robot's own body is not checked for hiding a point from the camera.
 | `workspace.rs` | the OpenArm's part of the workspace answer from the design: reach per grasp orientation, the perception camera, the per-height reach memo it keeps, the parsing of the camera's geometry; `workspace_core::design` parses the request and composes the answer | pure: no messaging, so every answer is unit-tested without a node |
 | `camera_mounts.rs` | the camera_mounts contract: each camera resolved once at bringup into the frame that carries it, then composed with the grasp poses measured last | a mount the backbone cannot place stops bringup |
 | `workspace_service.rs` | the two workspace services and the read of the linked camera's geometry | the thin edge between the generated handlers and `workspace.rs` |
-| `serving.rs` | the loop of each service answered for the life of the node (`get_limb_names`, `get_camera_poses`, the workspace services): ended by the node's cancel, an error logged and waited out for 1 s | one loop, so no service can hot-spin on a broken transport or outlive the node |
 | `types.rs` | the limb tables, the world-pose wire codec | shared primitives; `ARM_DOF`, `Side` and `ArmPair` come from `openarm_description`, `JointVec` from `srs_model` |
 
 ## Parameters and links

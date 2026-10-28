@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use control_core::positive_finite::{NotPositiveFinite, PositiveFinite};
+use control_core::serving;
 use control_core::time::{RateOutOfRange, period_from_hz};
 use openarm_description::{ArmPair, HardwareVersion, Side};
 use peppygen::consumed_topics::collision_ctrl::governor_control;
@@ -27,7 +28,6 @@ use crate::governor;
 use crate::liveness;
 use crate::move_slot::MoveSlot;
 use crate::planner::{PlanConfig, Planner};
-use crate::serving;
 use crate::startup;
 use crate::streams;
 use crate::streams::LeaderActivity;
@@ -153,24 +153,20 @@ impl From<NodeError> for peppygen::Error {
     }
 }
 
-/// Spawn a never-returning inbound listener into the backbone's supervised task set,
-/// adapting its `()` output to the set's `Result` so its exit trips the
-/// fatal-first-exit like any other backbone task.
-fn spawn_listener<F>(set: &mut JoinSet<Result<()>>, listener: F)
+/// Spawn a task meant to run for the life of the node (an inbound listener
+/// or a service loop) into the backbone's supervised task set, adapting its
+/// `()` output to the set's `Result` so its exit trips the fatal-first-exit
+/// like any other backbone task.
+fn spawn_supervised<F>(set: &mut JoinSet<Result<()>>, task: F)
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
     set.spawn(async move {
-        listener.await;
+        task.await;
         Ok(())
     });
 }
 
-/// Build one side's arm model from the embedded OpenArm description: the elbow
-/// singularity margin applied, and the URDF's tcp frame mounted so every pose the
-/// backbone solves, reports, or caps the speed of is at the gripper's grasp point.
-/// This is the single site the backbone imposes either, so the model's `limits()`
-/// carry the margin for IK seeding, trajectory sizing and the chase clamp.
 /// The per-joint caps of one kind, each a positive finite number, or the
 /// refusal `refuse` builds naming the joint (counted from 1) and what was
 /// wrong with its value.
@@ -184,6 +180,11 @@ fn joint_caps(
     Ok(caps)
 }
 
+/// Build one side's arm model from the embedded OpenArm description: the elbow
+/// singularity margin applied, and the URDF's tcp frame mounted so every pose the
+/// backbone solves, reports, or caps the speed of is at the gripper's grasp point.
+/// This is the single site the backbone imposes either, so the model's `limits()`
+/// carry the margin for IK seeding, trajectory sizing and the chase clamp.
 pub fn arm_model(
     version: HardwareVersion,
     side: openarm_description::Side,
@@ -438,7 +439,7 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         let runner = node_runner.clone();
         let token = node_runner.cancellation_token().clone();
         tokio::spawn(async move {
-            serving::serve("get_limb_names", &token, || {
+            serving::serve("get_limb_names", token.cancelled(), || {
                 get_limb_names::handle_next_request(&runner, |_request| {
                     let names = limb_names();
                     Ok(get_limb_names::Response::new(
@@ -535,13 +536,20 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
             gripper_fresh.clone(),
             gripper_activity.clone(),
         ));
-        set.spawn(actions::stop::run_stop(runner.clone(), request_tx.clone()));
-        set.spawn(actions::arm::run_check_arm_move(
-            runner.clone(),
-            request_tx,
-            fresh.clone(),
-            arm_activity.clone(),
-        ));
+        spawn_supervised(
+            &mut set,
+            actions::stop::run_stop(runner.clone(), token.clone(), request_tx.clone()),
+        );
+        spawn_supervised(
+            &mut set,
+            actions::arm::run_check_arm_move(
+                runner.clone(),
+                token.clone(),
+                request_tx,
+                fresh.clone(),
+                arm_activity.clone(),
+            ),
+        );
 
         // Inbound listeners buffer the latest message into the watch slots. They
         // run under the same fatal-first-exit supervision as the rest of the backbone,
@@ -551,16 +559,16 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         // Exactly one upstream listener; the other slot kind is never
         // subscribed.
         match upstream_mode {
-            UpstreamMode::Joints => spawn_listener(
+            UpstreamMode::Joints => spawn_supervised(
                 &mut set,
                 streams::run_joint_command_listener(runner.clone(), command_txs, arm_activity),
             ),
-            UpstreamMode::Pose => spawn_listener(
+            UpstreamMode::Pose => spawn_supervised(
                 &mut set,
                 streams::run_pose_command_listener(runner.clone(), command_txs, arm_activity),
             ),
         }
-        spawn_listener(
+        spawn_supervised(
             &mut set,
             streams::run_gripper_command_listener(
                 runner.clone(),
@@ -568,15 +576,15 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
                 gripper_activity,
             ),
         );
-        spawn_listener(
+        spawn_supervised(
             &mut set,
             streams::run_joint_state_listener(runner.clone(), measured_txs),
         );
-        spawn_listener(
+        spawn_supervised(
             &mut set,
             streams::run_gripper_state_listener(runner.clone(), gripper_state_txs),
         );
-        spawn_listener(
+        spawn_supervised(
             &mut set,
             streams::run_governor_config_listener(runner.clone(), config_tx),
         );

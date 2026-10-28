@@ -5,58 +5,17 @@
 #![allow(dead_code)]
 
 pub mod fixtures;
+pub mod params;
 
 use std::time::Duration;
 
 use peppygen::fixtures::harness::Harness;
-
-/// Control rate for the tests: 20 ms cycle (Nyquist 25 Hz, above the 15 Hz
-/// velocity-filter default).
-const CONTROL_RATE_HZ: u32 = 50;
-
-/// Declared follower rate for the tests: four of its periods make an 80 ms
-/// stale window, comfortably above the 10 ms state pumps even on a loaded
-/// machine.
-const FOLLOWER_STATE_RATE_HZ: u32 = 50;
 
 /// How long a test waits for the node's `setup` to return.
 const SETUP_BUDGET: Duration = Duration::from_secs(30);
 
 /// How often a test checks whether the node's `setup` has returned.
 const SETUP_POLL: Duration = Duration::from_millis(50);
-
-/// The node's full parameter set (most have no schema default, so every test
-/// passes them explicitly): v1 hardware, joints-mode upstream, the validated
-/// collision band, and a permissive EE cap so streamed chases converge fast.
-pub fn params() -> peppygen::Parameters {
-    peppygen::Parameters {
-        collision_governor_enabled: true,
-        control_rate_hz: CONTROL_RATE_HZ,
-        d_safe_m: 0.02,
-        d_stop_m: 0.005,
-        follower_state_rate_hz: FOLLOWER_STATE_RATE_HZ,
-        hardware_version: "v1".to_string(),
-        max_ee_angular_velocity_rad_s: 0.8,
-        max_ee_velocity_m_s: 2.0,
-        max_gripper_rate_frac_s: 6.0,
-        max_joint_velocity_rad_s_1: 16.754666,
-        max_joint_velocity_rad_s_2: 16.754666,
-        max_joint_velocity_rad_s_3: 5.445426,
-        max_joint_velocity_rad_s_4: 5.445426,
-        max_joint_velocity_rad_s_5: 20.943946,
-        max_joint_velocity_rad_s_6: 20.943946,
-        max_joint_velocity_rad_s_7: 20.943946,
-        max_joint_acceleration_rad_s2_1: 5.0,
-        max_joint_acceleration_rad_s2_2: 5.0,
-        max_joint_acceleration_rad_s2_3: 5.0,
-        max_joint_acceleration_rad_s2_4: 5.0,
-        max_joint_acceleration_rad_s2_5: 5.0,
-        max_joint_acceleration_rad_s2_6: 5.0,
-        max_joint_acceleration_rad_s2_7: 5.0,
-        upstream_mode: "joints".to_string(),
-        velocity_filter_cutoff_hz: 15.0,
-    }
-}
 
 /// Waits for the node's `setup` to return, failing the test after
 /// `SETUP_BUDGET`.
