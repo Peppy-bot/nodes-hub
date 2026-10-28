@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use camera_core::geometry::NO_DEPTH_STREAM_MESSAGE;
+use control_core::serving;
 use peppygen::exposed_services::geometry::{
     get_color_intrinsics, get_depth_intrinsics, get_depth_to_color_extrinsics,
 };
@@ -42,7 +43,12 @@ pub fn depth_to_color_extrinsics()
 macro_rules! listen_for_geometry_requests {
     ($fn_name:ident, $service:ident, $respond:ident) => {
         pub async fn $fn_name(node_runner: Arc<peppygen::NodeRunner>) {
-            serve_requests!(node_runner, $service, |_request| $respond());
+            serving::serve(
+                stringify!($service),
+                node_runner.cancellation_token().cancelled(),
+                || $service::handle_next_request(&node_runner, |_request| $respond()),
+            )
+            .await;
         }
     };
 }

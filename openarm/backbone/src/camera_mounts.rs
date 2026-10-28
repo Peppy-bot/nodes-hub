@@ -17,6 +17,7 @@ use std::f64::consts::PI;
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use control_core::serving;
 use openarm_description::{ArmPair, CameraMount, HardwareVersion, Side};
 use peppygen::NodeRunner;
 use peppygen::exposed_services::camera_mounts::get_camera_poses;
@@ -26,7 +27,6 @@ use srs_model::nalgebra::{Isometry3, UnitQuaternion, Vector3};
 use tokio::sync::watch;
 use tracing::info;
 
-use crate::serving;
 use crate::types::{pose_from_wire, world_pose_arrays};
 
 /// The message of the error reply while the coordinator has measured
@@ -268,7 +268,7 @@ pub async fn serve(
     measured: watch::Receiver<Option<MeasuredGrasps>>,
 ) {
     info!("camera mounts: {} cameras", mounts.mounts.len());
-    serving::serve("get_camera_poses", &token, || {
+    serving::serve("get_camera_poses", token.cancelled(), || {
         get_camera_poses::handle_next_request(&runner, |_request| {
             answer(&mounts, measured.borrow().as_ref())
         })

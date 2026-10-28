@@ -531,18 +531,20 @@ def test_schema_rejects_degenerate_camera_geometry():
         capture(cache, plan)
 
 
-def test_the_minimum_frame_count_closes_the_librarys_stats_fork():
-    # MIN_EPISODE_FRAMES exists only to keep every saved episode on one side
-    # of the library's two-sample stats fork, which otherwise writes integer
-    # columns as int64 below it and float64 at or above it, and a dataset
-    # cannot hold both. Pinned against the library so this fails if it stops
-    # forking (drop the guard) or moves the boundary (retune the constant).
+def test_the_minimum_frame_count_clears_the_librarys_stats_fork():
+    # MIN_EPISODE_FRAMES keeps every saved episode on one side of the
+    # library's two-sample stats fork, which otherwise writes integer columns
+    # as int64 below it and float64 at or above it, and a dataset cannot hold
+    # both. Pinned against the library so this fails if it moves the fork.
+    # The depth encoder sets the floor above the fork; test_sink_integration
+    # pins that reason.
     from lerobot.datasets.compute_stats import get_feature_stats
 
     def min_dtype(rows: int):
         column = np.arange(rows, dtype=np.int64).reshape(rows, 1)
         return get_feature_stats(column, axis=0, keepdims=True)["min"].dtype
 
-    assert min_dtype(MIN_EPISODE_FRAMES - 1) != min_dtype(MIN_EPISODE_FRAMES)
+    assert min_dtype(1) != min_dtype(2)
     # Every length the guard admits agrees with every other one.
+    assert min_dtype(MIN_EPISODE_FRAMES) == min_dtype(2)
     assert min_dtype(MIN_EPISODE_FRAMES) == min_dtype(MIN_EPISODE_FRAMES + 8)

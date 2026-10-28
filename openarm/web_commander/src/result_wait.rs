@@ -13,6 +13,7 @@
 use std::future::Future;
 use std::time::Duration;
 
+use control_core::time::sleep_unless_cancelled;
 use peppygen::Error;
 use peppylib::runtime::CancellationToken;
 use tokio_util::sync::CancellationToken as GoalToken;
@@ -109,10 +110,7 @@ pub(crate) use limb_goal_handle;
 /// Wait out the preempt grace before firing a queued move. False when the node
 /// shuts down first, and the move is dropped.
 pub async fn preempt_grace_elapsed(token: &CancellationToken) -> bool {
-    tokio::select! {
-        _ = token.cancelled() => false,
-        _ = tokio::time::sleep(PREEMPT_GRACE) => true,
-    }
+    sleep_unless_cancelled(PREEMPT_GRACE, token.cancelled()).await
 }
 
 /// Why the wait asked the backbone to cancel the goal.
@@ -178,7 +176,10 @@ pub async fn wait_for_end<H: GoalHandle>(
             }
             ended = &mut end => match ended {
                 Err(e) if result_poll_retryable(&e) => {
-                    tokio::time::sleep(RESULT_RETRY_DELAY).await;
+                    if !sleep_unless_cancelled(RESULT_RETRY_DELAY, token.cancelled()).await {
+                        cancel(CancelTrigger::Shutdown).await;
+                        return Waited::Shutdown;
+                    }
                 }
                 ended => break ended,
             }
@@ -220,7 +221,59 @@ pub fn summarize<D>(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
+
+    use crate::test_support::retryable_result_error;
+
+    /// A goal whose every result poll fails retryably at once, counting its
+    /// polls and the cancels asked of it.
+    #[derive(Default)]
+    struct Unanswered {
+        polls: Cell<u32>,
+        cancels: Cell<u32>,
+    }
+
+    impl GoalHandle for Unanswered {
+        type Data = ();
+
+        fn end(
+            &self,
+            _poll: Duration,
+        ) -> impl Future<Output = peppygen::Result<GoalEnd<()>>> + Send {
+            self.polls.set(self.polls.get() + 1);
+            std::future::ready(Err(retryable_result_error()))
+        }
+
+        fn cancel(&self) -> impl Future<Output = peppygen::Result<()>> + Send {
+            self.cancels.set(self.cancels.get() + 1);
+            std::future::ready(Ok(()))
+        }
+    }
+
+    /// On a paused clock that moves only when every task waits: the delay
+    /// is the clock's, not the host's.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_while_a_retry_is_waited_out_cancels_the_goal_at_once() {
+        let goal = Unanswered::default();
+        let token = CancellationToken::default();
+        let start = tokio::time::Instant::now();
+        let cancel_once_polled = async {
+            while goal.polls.get() == 0 {
+                tokio::task::yield_now().await;
+            }
+            token.cancel();
+        };
+        let (waited, ()) = tokio::join!(
+            wait_for_end(&goal, &token, None, |_, _| {}),
+            cancel_once_polled
+        );
+        assert!(matches!(waited, Waited::Shutdown));
+        assert_eq!(goal.polls.get(), 1);
+        assert_eq!(goal.cancels.get(), 1);
+        assert!(tokio::time::Instant::now() - start < RESULT_RETRY_DELAY);
+    }
 
     #[test]
     fn every_end_but_a_success_is_worded_the_same_for_each_move() {

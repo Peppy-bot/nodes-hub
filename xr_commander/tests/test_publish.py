@@ -19,10 +19,10 @@ from tests.helpers import (
     POSE,
     FakeCalls,
     FakeStops,
-    FakeSubscription,
     FakeToken,
     ManualClock,
     ScriptedHeadset,
+    StubTopic,
     boot,
     boot_clocked,
     default_settings,
@@ -569,11 +569,6 @@ def test_drain_pose_states_survives_garbage():
     # Kept on a stub: every decodable wire message builds a Pose (the schema
     # carries float lists), so the unusable-pose latch is reachable only
     # through a hand-built message the generated modules cannot produce.
-
-    class StubTopic(FakeSubscription):
-        async def subscribe(self, _runner):
-            return self
-
     good = SimpleNamespace(position=[0.1, 0.2, 0.3], orientation=[0, 0, 0, 1])
     bad = SimpleNamespace(position=None, orientation=None)
     # The peer is the key the holder files the pose under.

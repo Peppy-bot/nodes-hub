@@ -1,10 +1,11 @@
 //! A limb's single-flight move slot: an action handler claims it when it
 //! admits a goal on the limb, so a limb runs one move at a time and a second
 //! goal on it is refused while the first runs. The handler releases the slot
-//! when the goal never reaches the coordinator; otherwise the move that runs
-//! the goal (an arm's mode in the planner, a `GripperMove` the coordinator
-//! holds) holds a [`SlotRelease`], which frees the slot on every end of the
-//! move.
+//! when the goal never reaches the coordinator, and the coordinator releases
+//! it with a [`SlotRelease`] for a goal it ends before the goal's move starts
+//! (before the seed, on a stop, on a stale follower). The move that runs a
+//! goal (an arm's mode in the planner, a `GripperMove` the coordinator holds)
+//! holds a [`SlotRelease`], which frees the slot on every end of the move.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

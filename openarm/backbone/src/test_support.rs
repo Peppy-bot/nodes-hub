@@ -1,6 +1,7 @@
 //! What the unit tests share: the arms built from the bundled description,
-//! the planner config and the planners of the tests, and a move slot claimed
-//! as at a goal's admission.
+//! the planner config and the planners of the tests, a move slot claimed as
+//! at a goal's admission, and the node's parameter set the integration tests
+//! boot the harness with.
 
 use std::time::Duration;
 
@@ -10,6 +11,11 @@ use srs_model::{Arm, JointVec, Limit};
 
 use crate::move_slot::MoveSlot;
 use crate::planner::{PlanConfig, Planner};
+
+#[path = "../tests/helpers/params.rs"]
+mod params;
+
+pub(crate) use params::params;
 
 /// The launcher-default per-joint acceleration limits (peppy.json5).
 const A_MAX: JointVec = [5.0; ARM_DOF];

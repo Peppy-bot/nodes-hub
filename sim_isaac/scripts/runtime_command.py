@@ -27,36 +27,14 @@ def main() -> None:
 
     sub = parser.add_subparsers(dest="subcommand", required=True)
 
-    # arm
-    arm_parser = sub.add_parser("arm")
-    arm_parser.add_argument("side", choices=["left", "right"])
-    arm_parser.add_argument("positions", nargs=7, type=float)
-
-    # release
-    release_parser = sub.add_parser("release")
-    release_parser.add_argument("side", choices=["left", "right"])
-
-    # joints
-    sub.add_parser("joints")
-
-    # robot root translation
+    # robot root placement
     robot_parser = sub.add_parser("robot")
+    robot_parser.add_argument("robot", help="The name the robot joined under.")
     robot_parser.add_argument("x", type=float)
     robot_parser.add_argument("y", type=float)
     robot_parser.add_argument("z", type=float)
+    robot_parser.add_argument("yaw", type=float, help="Radians about +Z.")
 
-    # built-in scene
-    scene_parser = sub.add_parser("scene")
-    scene_parser.add_argument(
-        "scene_name",
-        choices=["tabletop", "shelf_reach"],
-    )
-    scene_parser.add_argument(
-        "--scale",
-        type=float,
-        default=1.0,
-        help="Uniform scale for the built-in scene.",
-    )
     # arbitrary USD scene
     scene_usd_parser = sub.add_parser("scene-usd")
     scene_usd_parser.add_argument("path")
@@ -142,41 +120,13 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    if args.subcommand == "arm":
-        command = {
-            "command": "move_arm",
-            "side": args.side,
-            "positions": args.positions,
-        }
-
-    elif args.subcommand == "release":
-        command = {
-            "command": "release_arm",
-            "side": args.side,
-        }
-
-    elif args.subcommand == "joints":
-        command = {
-            "command": "list_joints",
-        }
-
-    elif args.subcommand == "robot":
+    if args.subcommand == "robot":
         command = {
             "command": "move_robot_root",
+            "robot": args.robot,
             "position": [args.x, args.y, args.z],
+            "yaw": args.yaw,
         }
-
-    elif args.subcommand == "scene":
-        if args.scene_name == "tabletop":
-            command = {
-                "command": "load_tabletop_scene",
-                "scale": args.scale,
-            }
-        else:
-            command = {
-                "command": "load_shelf_reach_scene",
-                "scale": args.scale,
-            }
 
     elif args.subcommand == "scene-usd":
         command = {

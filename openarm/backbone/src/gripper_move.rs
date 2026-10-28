@@ -285,7 +285,8 @@ fn gripper_move_terminal(
 /// `commanded` is the opening the governor published last tick and whether
 /// the guard held it. A terminal with a result reports the opening measured
 /// that tick as `final_opening` and the time since admission as
-/// `action_time`. The move slot releases with the move on every path.
+/// `action_time`. A goal failed on a stale follower releases the move slot
+/// its admission claimed, and the move releases it on every end.
 pub async fn service_gripper_move(
     mv: &mut Option<GripperMove>,
     goals: &mut mpsc::Receiver<GripperGoal>,
@@ -298,6 +299,7 @@ pub async fn service_gripper_move(
     // Drain fully: every queued goal is answered, never left parked.
     while let Ok(goal) = goals.try_recv() {
         if admission == Admission::Stale {
+            let _release = move_slot.release_on_drop();
             goal.fail(stale_failure()).await;
         } else if mv.is_none() {
             *mv = Some(GripperMove {
@@ -357,6 +359,11 @@ pub async fn end_gripper_move(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use peppygen::fixtures::exposed_actions::limb_motion::move_gripper as fixture;
+    use peppygen::fixtures::harness::{Config, Harness};
+
+    use crate::test_support::{claimed_move_slot, params};
 
     // The gripper move's terminal decision. Every instant is handed to the
     // decision as an offset from one anchor, so no test waits on a clock.
@@ -724,5 +731,128 @@ mod tests {
             fails(&mut settling, free(MOVE_TARGET), end + ms(10)),
             Some(GripperTerminal::FollowerStale)
         );
+    }
+
+    // A queued goal the coordinator ends unstarted. The goals are real: a
+    // harness node exposes `move_gripper` and accepts every goal.
+
+    /// How long the test waits on the harness for a goal or its result.
+    const GOAL_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// A harness whose node accepts every `move_gripper` goal, and the
+    /// contexts of the goals it accepted.
+    async fn accepting_gripper_goals() -> (Harness, mpsc::Receiver<move_gripper::GoalContext>) {
+        let (contexts, accepted) = mpsc::channel(1);
+        let (harness, _mocks) = Harness::start_with(
+            Config {
+                parameters: Some(params()),
+                collision_ctrl_vacant: true,
+                perception_geometry_vacant: true,
+                ..Default::default()
+            },
+            move |_parameters, runner| async move {
+                let mut action = move_gripper::ActionHandle::expose(&runner).await?;
+                while let Some(ctx) = action
+                    .handle_goal_next_request(|_| Ok(move_gripper::GoalDecision::accept()))
+                    .await?
+                {
+                    if contexts.send(ctx).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(())
+            },
+        )
+        .await
+        .expect("start the harness");
+        (harness, accepted)
+    }
+
+    /// Send a goal for the left gripper to [`MOVE_TARGET`], and give its
+    /// handle and the goal the node accepted.
+    async fn send_left_gripper_goal(
+        harness: &Harness,
+        accepted: &mut mpsc::Receiver<move_gripper::GoalContext>,
+    ) -> (fixture::GoalHandle, GripperGoal) {
+        let request = move_gripper::GoalRequestData {
+            gripper_name: "left_gripper".to_string(),
+            opening: MOVE_TARGET,
+            max_effort: 0.0,
+            settle_timeout_s: MOVE_TIMEOUT.as_secs_f64(),
+        };
+        let handle = fixture::send_goal(
+            harness,
+            &request,
+            peppygen::DEFAULT_FEEDBACK_BOUND,
+            GOAL_TIMEOUT,
+        )
+        .await
+        .expect("send the goal");
+        let ctx = accepted.recv().await.expect("the node accepts the goal");
+        let goal = GripperGoal {
+            opening: MOVE_TARGET,
+            max_effort: None,
+            settle_timeout: MOVE_TIMEOUT,
+            ctx,
+        };
+        (handle, goal)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_queued_goal_failed_on_a_stale_follower_frees_the_side_for_the_next_goal() {
+        let (harness, mut accepted) = accepting_gripper_goals().await;
+        let move_slot = claimed_move_slot();
+        let (queue, mut goals) = mpsc::channel(1);
+        let mut mv = None;
+        let start = Instant::now();
+
+        let (stale_goal, goal) = send_left_gripper_goal(&harness, &mut accepted).await;
+        queue.try_send(goal).expect("queue the goal");
+        service_gripper_move(
+            &mut mv,
+            &mut goals,
+            &move_slot,
+            CommandedOpening::idle(1.0),
+            fresh(1.0),
+            Admission::Stale,
+            start,
+        )
+        .await;
+        let stale = stale_failure();
+        match stale_goal
+            .get_result(GOAL_TIMEOUT)
+            .await
+            .expect("the goal ends")
+            .outcome
+        {
+            fixture::ResultOutcome::Failed(failure) => assert_eq!(
+                failure,
+                fixture::Failure::new(stale.kind.into(), stale.message)
+            ),
+            other => panic!("a goal on a stale follower fails: {other:?}"),
+        }
+        assert!(mv.is_none(), "no move starts");
+        assert!(
+            !move_slot.is_claimed(),
+            "the failure releases the claim of its admission"
+        );
+
+        assert!(move_slot.claim(), "the handler admits the next goal");
+        let (_next_goal, goal) = send_left_gripper_goal(&harness, &mut accepted).await;
+        queue.try_send(goal).expect("queue the goal");
+        service_gripper_move(
+            &mut mv,
+            &mut goals,
+            &move_slot,
+            CommandedOpening::idle(1.0),
+            fresh(1.0),
+            Admission::Live,
+            start + ms(10),
+        )
+        .await;
+        assert!(mv.is_some(), "the next goal's move starts");
+        drop(mv);
+        assert!(!move_slot.is_claimed(), "the move releases the claim");
+        harness.shutdown().await.expect("shut the harness down");
     }
 }

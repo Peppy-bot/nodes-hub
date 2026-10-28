@@ -8,7 +8,7 @@ import importlib
 import numpy as np
 import pytest
 
-from lerobot_recorder.recording import FrameRow, LinkLayout, SourceSchema
+from lerobot_recorder.recording import MIN_EPISODE_FRAMES, FrameRow, LinkLayout, SourceSchema
 from lerobot_recorder.sink import Sink
 from tests.support import action_entry, joint_entry, make_plan
 
@@ -359,6 +359,102 @@ def test_save_episode_reports_a_short_video(tmp_path):
     assert short.video_frames_missing == 3
     assert f"{key} 3" in short.warning()
     assert "should not be trained on" in short.warning()
+
+
+# Large enough for the depth encoder (HEVC) to take the frame.
+DEPTH_W, DEPTH_H = 64, 48
+
+
+def rgbd_row(i: int) -> FrameRow:
+    return FrameRow(
+        state=np.zeros(7, dtype=np.float32) + i,
+        action=np.zeros(7, dtype=np.float32) + i + ACTION_OFFSET,
+        velocities=np.zeros(7, dtype=np.float32),
+        efforts=None,
+        images={
+            "rgbd0": np.full((DEPTH_H, DEPTH_W, 3), (i * 20) % 255, dtype=np.uint8),
+            "rgbd0_depth": np.full((DEPTH_H, DEPTH_W, 1), 0.5 + i / 100, dtype=np.float32),
+        },
+    )
+
+
+def rgbd_schema() -> SourceSchema:
+    return SourceSchema(
+        layouts=(ARM_LAYOUT,),
+        action_layouts=(ARM_LAYOUT,),
+        color_geometry=(),
+        rgbd_geometry=((DEPTH_W, DEPTH_H),),
+        depth_geometry=((DEPTH_W, DEPTH_H),),
+        depth_units=(0.001,),
+    )
+
+
+def rgbd_plan():
+    return make_plan(state=(joint_entry(),), action=(action_entry(),), rgbd=1)
+
+
+def _save_after_an_episode_of(tmp_path, first_frames: int) -> int:
+    """Records an rgbd episode of `first_frames` frames and then one of
+    FRAMES, saving each until a save fails, and returns the episodes the
+    dataset holds."""
+    sink = _sink(tmp_path)
+
+    async def record():
+        await sink.create(rgbd_schema(), rgbd_plan())
+        try:
+            for frames in (first_frames, FRAMES):
+                for i in range(frames):
+                    sink.add_frame(rgbd_row(i), task="smoke")
+                await sink.save_episode()
+        except (ValueError, RuntimeError) as e:
+            # The library refuses the save; the count of saved episodes
+            # shows which one it refused.
+            assert "Not yet implemented" in str(e) or "Invalid argument" in str(e), e
+            sink.discard_open_frames()
+        finally:
+            await sink.finalize()
+
+    asyncio.run(record())
+    return sink.episodes_saved
+
+
+def test_the_shortest_saved_episode_takes_a_later_one_into_its_depth_video(tmp_path):
+    """The library's depth encoder gives every video of three frames or more
+    a two-frame decode delay. A two-frame video fails its own save, or saves
+    without the delay, and then the next episode appended to its file starts
+    at or before its last timestamp and the muxer refuses that save. Pinned
+    against the library: the shortest episode the recorder saves takes the
+    next one, and one frame fewer does not."""
+    assert _save_after_an_episode_of(tmp_path / "floor", MIN_EPISODE_FRAMES) == 2
+    assert _save_after_an_episode_of(tmp_path / "below", MIN_EPISODE_FRAMES - 1) < 2
+
+
+def test_the_episode_after_a_discarded_two_frame_rgbd_episode_saves_whole(tmp_path):
+    """The recorder discards an episode below MIN_EPISODE_FRAMES through
+    discard_open_frames, which cancels the open episode in the streaming
+    encoder. The next episode saves every frame into its videos, whether the
+    discarded one opened the session or followed a saved episode."""
+    short_frames = 2
+    assert short_frames < MIN_EPISODE_FRAMES
+    sink = _sink(tmp_path)
+
+    async def record():
+        await sink.create(rgbd_schema(), rgbd_plan())
+        saved = []
+        for _ in range(2):
+            for i in range(short_frames):
+                sink.add_frame(rgbd_row(i), task="smoke")
+            sink.discard_open_frames()
+            for i in range(FRAMES):
+                sink.add_frame(rgbd_row(i), task="smoke")
+            shortfall = await sink.save_episode()
+            length = int(sink._dataset.meta.latest_episode["length"][0])
+            saved.append((length, shortfall.video_frames_missing))
+        await sink.finalize()
+        return saved
+
+    assert asyncio.run(record()) == [(FRAMES, 0), (FRAMES, 0)]
+    assert sink.episodes_saved == 2
 
 
 def test_staged_encoding_saves_a_whole_video(tmp_path):

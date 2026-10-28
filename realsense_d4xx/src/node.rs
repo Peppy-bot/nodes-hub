@@ -21,6 +21,7 @@ use tracing::{error, info};
 
 use camera_core::encoding::DEPTH_ENCODING;
 use camera_core::geometry::Z_DEPTH_MODEL;
+use control_core::serving;
 
 use crate::frame::FrameSet;
 use crate::geometry::Pinhole;
@@ -30,24 +31,6 @@ use crate::pipeline::{
     StreamSettings, open,
 };
 use crate::stream::StreamPair;
-
-/// Answer every request of `$service` with `$respond`, which maps the request
-/// to the response or the failure of an error reply, until the node stops.
-/// Each request that fails is logged with the service's name.
-macro_rules! serve_requests {
-    ($runner:expr, $service:ident, $respond:expr) => {{
-        let cancel = $runner.cancellation_token().clone();
-        loop {
-            let result = tokio::select! {
-                _ = cancel.cancelled() => break,
-                result = $service::handle_next_request(&$runner, $respond) => result,
-            };
-            if let Err(e) = result {
-                error!("{}: {e}", stringify!($service));
-            }
-        }
-    }};
-}
 
 /// Opens the pipeline, starts the capture loop and the emit task, and serves
 /// every service until the node stops.
@@ -299,15 +282,22 @@ fn spawn_video_stream_info(
     encoding: String,
 ) {
     tokio::spawn(async move {
-        serve_requests!(runner, video_stream_info, |_req| {
-            let (width, height) = handle.align_mode().published(configured).color;
-            Ok(video_stream_info::Response::new(
-                width,
-                height,
-                fps,
-                encoding.clone(),
-            ))
-        });
+        serving::serve(
+            "video_stream_info",
+            runner.cancellation_token().cancelled(),
+            || {
+                video_stream_info::handle_next_request(&runner, |_req| {
+                    let (width, height) = handle.align_mode().published(configured).color;
+                    Ok(video_stream_info::Response::new(
+                        width,
+                        height,
+                        fps,
+                        encoding.clone(),
+                    ))
+                })
+            },
+        )
+        .await;
     });
 }
 
@@ -322,16 +312,23 @@ fn spawn_depth_stream_info(
     depth_unit: f32,
 ) {
     tokio::spawn(async move {
-        serve_requests!(runner, depth_stream_info, |_req| {
-            let (width, height) = handle.align_mode().published(configured).depth;
-            Ok(depth_stream_info::Response::new(
-                width,
-                height,
-                fps,
-                encoding.clone(),
-                depth_unit,
-            ))
-        });
+        serving::serve(
+            "depth_stream_info",
+            runner.cancellation_token().cancelled(),
+            || {
+                depth_stream_info::handle_next_request(&runner, |_req| {
+                    let (width, height) = handle.align_mode().published(configured).depth;
+                    Ok(depth_stream_info::Response::new(
+                        width,
+                        height,
+                        fps,
+                        encoding.clone(),
+                        depth_unit,
+                    ))
+                })
+            },
+        )
+        .await;
     });
 }
 
@@ -433,9 +430,16 @@ macro_rules! spawn_geometry_service {
     ($fn_name:ident, $service:ident, $respond:ident) => {
         fn $fn_name(runner: Arc<NodeRunner>, handle: Arc<PipelineHandle>) {
             tokio::spawn(async move {
-                serve_requests!(runner, $service, |_req| {
-                    $respond(&handle.published_geometry())
-                });
+                serving::serve(
+                    stringify!($service),
+                    runner.cancellation_token().cancelled(),
+                    || {
+                        $service::handle_next_request(&runner, |_req| {
+                            $respond(&handle.published_geometry())
+                        })
+                    },
+                )
+                .await;
             });
         }
     };
@@ -465,15 +469,22 @@ macro_rules! spawn_mode_control_service {
     ($fn_name:ident, $service:ident, $set:ident, $value:ident, $label:literal) => {
         fn $fn_name(runner: Arc<NodeRunner>, handle: Arc<PipelineHandle>) {
             tokio::spawn(async move {
-                serve_requests!(runner, $service, |req| {
-                    let mode = parse_mode(&req.data.mode, $label).map_err(|reason| {
-                        $service::Failure::new($service::FailureKind::Rejected, reason)
-                    })?;
-                    handle
-                        .$set(mode, req.data.$value)
-                        .map(|()| $service::Response::new(req.data.$value))
-                        .map_err(|failure| camera_core::control_failure!($service, failure))
-                });
+                serving::serve(
+                    stringify!($service),
+                    runner.cancellation_token().cancelled(),
+                    || {
+                        $service::handle_next_request(&runner, |req| {
+                            let mode = parse_mode(&req.data.mode, $label).map_err(|reason| {
+                                $service::Failure::new($service::FailureKind::Rejected, reason)
+                            })?;
+                            handle
+                                .$set(mode, req.data.$value)
+                                .map(|()| $service::Response::new(req.data.$value))
+                                .map_err(|failure| camera_core::control_failure!($service, failure))
+                        })
+                    },
+                )
+                .await;
             });
         }
     };
@@ -500,12 +511,19 @@ macro_rules! spawn_value_control_service {
     ($fn_name:ident, $service:ident, $set:ident) => {
         fn $fn_name(runner: Arc<NodeRunner>, handle: Arc<PipelineHandle>) {
             tokio::spawn(async move {
-                serve_requests!(runner, $service, |req| {
-                    handle
-                        .$set(req.data.value)
-                        .map(|()| $service::Response::new(req.data.value))
-                        .map_err(|failure| camera_core::control_failure!($service, failure))
-                });
+                serving::serve(
+                    stringify!($service),
+                    runner.cancellation_token().cancelled(),
+                    || {
+                        $service::handle_next_request(&runner, |req| {
+                            handle
+                                .$set(req.data.value)
+                                .map(|()| $service::Response::new(req.data.value))
+                                .map_err(|failure| camera_core::control_failure!($service, failure))
+                        })
+                    },
+                )
+                .await;
             });
         }
     };
@@ -533,13 +551,20 @@ spawn_value_control_service!(
 /// next frame on. An unknown mode gives an error reply with `rejected`.
 fn spawn_set_align_mode(runner: Arc<NodeRunner>, handle: Arc<PipelineHandle>) {
     tokio::spawn(async move {
-        serve_requests!(runner, set_align_mode, |req| {
-            let mode = AlignMode::try_from(req.data.mode.as_str()).map_err(|reason| {
-                set_align_mode::Failure::new(set_align_mode::FailureKind::Rejected, reason)
-            })?;
-            handle.set_align_mode(mode);
-            Ok(set_align_mode::Response::new(mode.as_str().to_string()))
-        });
+        serving::serve(
+            "set_align_mode",
+            runner.cancellation_token().cancelled(),
+            || {
+                set_align_mode::handle_next_request(&runner, |req| {
+                    let mode = AlignMode::try_from(req.data.mode.as_str()).map_err(|reason| {
+                        set_align_mode::Failure::new(set_align_mode::FailureKind::Rejected, reason)
+                    })?;
+                    handle.set_align_mode(mode);
+                    Ok(set_align_mode::Response::new(mode.as_str().to_string()))
+                })
+            },
+        )
+        .await;
     });
 }
 

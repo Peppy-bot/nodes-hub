@@ -1,4 +1,5 @@
 use control_core::report_once::ReportOnce;
+use control_core::time::block_until_unless_cancelled;
 use peppygen::emitted_topics::camera::video_stream::{self, MessageHeader};
 use peppylib::runtime::CancellationToken;
 use std::fmt;
@@ -13,8 +14,6 @@ use crate::types::{CameraConfig, Error, FrameId, Result};
 /// Pause after a failed frame before trying the next one.
 const FRAME_RETRY_DELAY: Duration = Duration::from_millis(10);
 const STATUS_LOG_INTERVAL: Duration = Duration::from_secs(3);
-/// Granularity at which rate-limiting sleeps re-check the cancellation token
-const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// How long the loop tolerates back-to-back frame failures before giving up.
 /// Driver hiccups clear in milliseconds, but a deterministic failure (an
 /// unplugged camera, a stream the pipeline cannot convert) never clears, and
@@ -279,26 +278,15 @@ fn run_camera_capture_loop(
 
         frame_id = frame_id.next();
 
-        sleep_until_unless_cancelled(next_frame_time, cancel_token);
+        if !block_until_unless_cancelled(next_frame_time, || cancel_token.is_cancelled()) {
+            break;
+        }
         next_frame_time =
             advance_frame_deadline(next_frame_time, target_frame_duration, Instant::now());
     }
 
     tracing::info!("shutdown requested, stopping camera capture loop");
     Ok(())
-}
-
-/// Sleep until `deadline` in short slices, returning early once the token is
-/// cancelled, so the rate limiter (up to a full frame interval at low fps)
-/// does not eat into the shutdown grace window.
-fn sleep_until_unless_cancelled(deadline: Instant, cancel_token: &CancellationToken) {
-    while !cancel_token.is_cancelled() {
-        let now = Instant::now();
-        if now >= deadline {
-            break;
-        }
-        std::thread::sleep((deadline - now).min(CANCEL_POLL_INTERVAL));
-    }
 }
 
 /// Advance the frame deadline by one period, accumulating to avoid drift.

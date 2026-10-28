@@ -9,6 +9,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use control_core::serving;
+use control_core::time::sleep_unless_cancelled;
 use peppygen::consumed_services::limbs::is_ready as limb_is_ready;
 use peppygen::consumed_services::simulation::is_ready as simulation_is_ready;
 use peppygen::exposed_services::robot_ready::is_ready;
@@ -45,21 +47,12 @@ async fn run(runner: Arc<NodeRunner>, token: CancellationToken) {
     tokio::spawn(poll_sources(runner.clone(), ready.clone(), token.clone()));
 
     tracing::info!("is_ready service started");
-    loop {
-        tokio::select! {
-            _ = token.cancelled() => {
-                tracing::info!("is_ready service shutting down");
-                break;
-            }
-            result = is_ready::handle_next_request(&runner, |_req| {
-                Ok(is_ready::Response::new(ready.load(Ordering::SeqCst)))
-            }) => {
-                if let Err(e) = result {
-                    tracing::warn!("is_ready handler error: {e}");
-                }
-            }
-        }
-    }
+    serving::serve("is_ready", token.cancelled(), || {
+        is_ready::handle_next_request(&runner, |_req| {
+            Ok(is_ready::Response::new(ready.load(Ordering::SeqCst)))
+        })
+    })
+    .await;
 }
 
 async fn poll_sources(runner: Arc<NodeRunner>, ready: Arc<AtomicBool>, token: CancellationToken) {
@@ -68,9 +61,8 @@ async fn poll_sources(runner: Arc<NodeRunner>, ready: Arc<AtomicBool>, token: Ca
     // pass.
     loop {
         ready.store(every_source_ready(&runner).await, Ordering::SeqCst);
-        tokio::select! {
-            _ = token.cancelled() => break,
-            _ = tokio::time::sleep(POLL_INTERVAL) => {}
+        if !sleep_unless_cancelled(POLL_INTERVAL, token.cancelled()).await {
+            break;
         }
     }
 }

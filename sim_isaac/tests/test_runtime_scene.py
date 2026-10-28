@@ -4,6 +4,7 @@ runtime commands may touch an object scene_manipulation spawned."""
 
 import importlib.util
 import logging
+import re
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -15,6 +16,7 @@ from _scene_actions import scene_actions_module
 from _world import world_module
 
 _ENGINE_DIR = Path(__file__).resolve().parents[1] / "engine"
+_RUNTIME_COMMAND = Path(__file__).resolve().parents[1] / "scripts" / "runtime_command.py"
 _SCENE = "/World/RuntimeScene"
 _OBJECTS = "/World/RuntimeObjects"
 _ASSET_ROOT = "https://assets.example/Isaac/6.1"
@@ -413,3 +415,53 @@ def test_scene_manipulation_still_removes_its_own_objects(scene, scene_manipulat
     assert scene.stage.removed == [f"{_OBJECTS}/{object_id}"]
     assert not scene_manipulation.owns(object_id)
     assert _captured(scene_manipulation) == []
+
+
+def _runtime_command_script():
+    spec = importlib.util.spec_from_file_location("_runtime_command_under_test", _RUNTIME_COMMAND)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_every_runtime_command_script_subcommand_runs_its_runtime_handler(scene, monkeypatch, capsys, tmp_path):
+    scene_usd = tmp_path / "scene.usd"
+    prop_usd = tmp_path / "prop.usd"
+    for usd in (scene_usd, prop_usd):
+        usd.write_text("#usda 1.0\n")
+    # One invocation of each subcommand, in an order each handler can act on.
+    invocations = {
+        "robot": ["robot", "alpha", "1.5", "0.0", "0.0", "1.57"],
+        "scene-usd": ["scene-usd", str(scene_usd)],
+        "scene-isaac": ["scene-isaac", "Isaac/Environments/Office/office.usd"],
+        "clear-scene": ["clear-scene"],
+        "spawn": ["spawn", "MyObject", str(prop_usd), "1.0", "0.0", "0.8"],
+        "spawn-isaac": ["spawn-isaac", "MyBlock", "Isaac/Props/Blocks/blue_block.usd", "1.0", "0.5", "0.8"],
+        "move": ["move", "MyObject", "1.2", "0.2", "0.8"],
+        "remove": ["remove", "MyObject"],
+    }
+    script = _runtime_command_script()
+    monkeypatch.setattr(sys, "argv", ["runtime_command.py", "--help"])
+    with pytest.raises(SystemExit):
+        script.main()
+    offered = re.search(r"\{([^}]*)\}", capsys.readouterr().out).group(1).split(",")
+    assert sorted(offered) == sorted(invocations)
+
+    sent = []
+    monkeypatch.setattr(script, "send_command", sent.append)
+    scene.scene_actions.owns.return_value = False
+    for argv in invocations.values():
+        monkeypatch.setattr(sys, "argv", ["runtime_command.py", *argv])
+        script.main()
+        scene.launcher.execute_runtime_command(sent[-1])
+
+    scene.world.move.assert_called_once_with("alpha", [1.5, 0.0, 0.0], 1.57)
+    assert scene.stage.removed == [_SCENE, _SCENE, f"{_OBJECTS}/MyObject"]
+    assert [(call.args[0].path, call.args[1]) for call in scene.world.place.call_args_list] == [
+        (f"{_OBJECTS}/MyObject", [1.0, 0.0, 0.8]),
+        (f"{_OBJECTS}/MyBlock", [1.0, 0.5, 0.8]),
+        (f"{_OBJECTS}/MyObject", [1.2, 0.2, 0.8]),
+    ]
+    assert scene.stage.prims[f"{_OBJECTS}/MyBlock"].references == [
+        f"{_ASSET_ROOT}/Isaac/Props/Blocks/blue_block.usd"
+    ]

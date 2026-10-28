@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+control_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "control_core" }
 peppygen = { path = ".peppy/libs/peppygen" }
 peppylib = { path = ".peppy/libs/peppylib" }
 futures  = "0.3"
@@ -13,6 +14,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 peppygen = { path = ".peppy/libs/peppygen", features = ["testing"] }
-# Paused time, for the tests of the host's clock that the wait for standing
-# runs on.
 tokio = { version = "1", features = ["test-util"] }

@@ -5,6 +5,7 @@
 //! which is this relay's name in its copy, and `setup` wires them together.
 
 use std::future::Future;
+use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -16,9 +17,10 @@ use camera_core::relay::{
     camera_name, timestamp_is_valid,
 };
 use control_core::latched_log::LatchedLog;
+use control_core::receiving::receive;
 use control_core::report_once::ReportOnce;
+use control_core::serving;
 use control_core::sync::{lock_ignoring_poison, wait_for};
-use control_core::time::RECEIVE_ERROR_BACKOFF;
 use peppygen::consumed_services::control::{
     describe_camera, reset_camera as control_reset_camera, set_camera_brightness,
     set_camera_contrast, set_camera_exposure, set_camera_gain, set_camera_white_balance,
@@ -294,66 +296,58 @@ macro_rules! relay_stream {
             let publish_failures = LatchedLog::warn(concat!($label, " publish"));
             let invalid_timestamps = ReportOnce::default();
             let mut first = true;
-            let receive_errors = LatchedLog::error(concat!("simulation ", $label, " receive"));
-            loop {
-                let received = tokio::select! {
-                    _ = token.cancelled() => return,
-                    received = sub.next() => received,
-                };
-                let msg = match received {
-                    Ok(Some((_, msg))) => msg,
-                    Ok(None) => return,
-                    Err(e) => {
-                        receive_errors.failure(e);
-                        tokio::time::sleep(RECEIVE_ERROR_BACKOFF).await;
-                        continue;
-                    }
-                };
-                receive_errors.success();
-                if !timestamp_is_valid(msg.header.timestamp) {
-                    if invalid_timestamps.first_of_run() {
-                        warn!(
-                            concat!(
-                                "dropping ",
-                                $label,
-                                " frames with invalid timestamps, suppressing repeats (first {:?})"
-                            ),
-                            msg.header.timestamp
-                        );
-                    }
-                    continue;
-                }
-                invalid_timestamps.clear();
-                let header = $emit::MessageHeader {
-                    timestamp: msg.header.timestamp,
-                    frame_id: msg.header.frame_id,
-                    align_mode: msg.header.align_mode,
-                };
-                let result = match $emit::build_message(
-                    header,
-                    msg.encoding,
-                    msg.width,
-                    msg.height,
-                    msg.frame,
-                ) {
-                    Ok(payload) => publisher.publish(payload).await.map_err(|e| e.to_string()),
-                    Err(e) => Err(e.to_string()),
-                };
-                match result {
-                    Ok(()) => {
-                        publish_failures.success();
-                        if first {
-                            first = false;
-                            info!(concat!(
-                                "first ",
-                                $label,
-                                " frame relayed from the simulation"
-                            ));
+            receive(
+                concat!("simulation ", $label),
+                token.cancelled(),
+                async move || sub.next().await,
+                async move |(_, msg)| {
+                    if !timestamp_is_valid(msg.header.timestamp) {
+                        if invalid_timestamps.first_of_run() {
+                            warn!(
+                                concat!(
+                                    "dropping ",
+                                    $label,
+                                    " frames with invalid timestamps, suppressing repeats (first {:?})"
+                                ),
+                                msg.header.timestamp
+                            );
                         }
+                        return ControlFlow::Continue(());
                     }
-                    Err(e) => publish_failures.failure(e),
-                }
-            }
+                    invalid_timestamps.clear();
+                    let header = $emit::MessageHeader {
+                        timestamp: msg.header.timestamp,
+                        frame_id: msg.header.frame_id,
+                        align_mode: msg.header.align_mode,
+                    };
+                    let result = match $emit::build_message(
+                        header,
+                        msg.encoding,
+                        msg.width,
+                        msg.height,
+                        msg.frame,
+                    ) {
+                        Ok(payload) => publisher.publish(payload).await.map_err(|e| e.to_string()),
+                        Err(e) => Err(e.to_string()),
+                    };
+                    match result {
+                        Ok(()) => {
+                            publish_failures.success();
+                            if first {
+                                first = false;
+                                info!(concat!(
+                                    "first ",
+                                    $label,
+                                    " frame relayed from the simulation"
+                                ));
+                            }
+                        }
+                        Err(e) => publish_failures.failure(e),
+                    }
+                    ControlFlow::Continue(())
+                },
+            )
+            .await;
         }
     };
 }
@@ -372,42 +366,46 @@ async fn track_stream_info(
         Err(e) => return error!("simulation stream_info subscribe: {e}"),
     };
     let invalid_stream_infos = ReportOnce::default();
-    let receive_errors = LatchedLog::error("simulation stream_info receive");
-    loop {
-        let received = tokio::select! {
-            _ = token.cancelled() => return,
-            received = sub.next() => received,
-        };
-        match received {
-            Ok(Some((_, msg))) => {
-                if !depth_unit_is_valid(msg.depth_unit) {
-                    if invalid_stream_infos.first_of_run() {
-                        warn!(
-                            "ignoring stream_info with invalid depth_unit {}, suppressing repeats",
-                            msg.depth_unit
-                        );
-                    }
-                    continue;
-                }
-                invalid_stream_infos.clear();
-                *lock_ignoring_poison(&description) = StreamDescription {
-                    width: msg.width,
-                    height: msg.height,
-                    frames_per_second: msg.frames_per_second,
-                    encoding: msg.encoding,
-                    depth_width: msg.depth_width,
-                    depth_height: msg.depth_height,
-                    depth_encoding: msg.depth_encoding,
-                    depth_unit: msg.depth_unit,
-                };
-            }
-            Ok(None) => return,
-            Err(e) => {
-                receive_errors.failure(e);
-                tokio::time::sleep(RECEIVE_ERROR_BACKOFF).await;
-            }
+    receive(
+        "simulation stream_info",
+        token.cancelled(),
+        async move || sub.next().await,
+        async move |(_, msg)| {
+            keep_stream_info(&description, &invalid_stream_infos, msg);
+            ControlFlow::Continue(())
+        },
+    )
+    .await;
+}
+
+/// Keeps `msg` as the simulation's latest stream description. A description
+/// with an invalid depth unit is ignored whole; the first of a run of them
+/// is logged.
+fn keep_stream_info(
+    description: &SharedDescription,
+    invalid_stream_infos: &ReportOnce,
+    msg: stream_info::Message,
+) {
+    if !depth_unit_is_valid(msg.depth_unit) {
+        if invalid_stream_infos.first_of_run() {
+            warn!(
+                "ignoring stream_info with invalid depth_unit {}, suppressing repeats",
+                msg.depth_unit
+            );
         }
+        return;
     }
+    invalid_stream_infos.clear();
+    *lock_ignoring_poison(description) = StreamDescription {
+        width: msg.width,
+        height: msg.height,
+        frames_per_second: msg.frames_per_second,
+        encoding: msg.encoding,
+        depth_width: msg.depth_width,
+        depth_height: msg.depth_height,
+        depth_encoding: msg.depth_encoding,
+        depth_unit: msg.depth_unit,
+    };
 }
 
 /// Track the simulation's latest camera geometry for the geometry services.
@@ -421,55 +419,48 @@ async fn track_geometry(
         Err(e) => return error!("simulation geometry subscribe: {e}"),
     };
     let unusable_geometries = ReportOnce::default();
-    let receive_errors = LatchedLog::error("simulation geometry receive");
-    loop {
-        let received = tokio::select! {
-            _ = token.cancelled() => return,
-            received = sub.next() => received,
-        };
-        match received {
-            Ok(Some((_, msg))) => {
-                if let Some(part) = unusable_part(&msg) {
-                    if unusable_geometries.first_of_run() {
-                        warn!("ignoring geometry with an unusable {part}, suppressing repeats");
-                    }
-                    continue;
-                }
-                unusable_geometries.clear();
-                *lock_ignoring_poison(&geometry) = Some(msg);
-            }
-            Ok(None) => return,
-            Err(e) => {
-                receive_errors.failure(e);
-                tokio::time::sleep(RECEIVE_ERROR_BACKOFF).await;
-            }
-        }
-    }
+    receive(
+        "simulation geometry",
+        token.cancelled(),
+        async move || sub.next().await,
+        async move |(_, msg)| {
+            keep_geometry(&geometry, &unusable_geometries, msg);
+            ControlFlow::Continue(())
+        },
+    )
+    .await;
 }
 
-/// Answer every request of `$service` with `$respond`, which maps the
-/// request to the response or the failure of an error reply, until the node
-/// stops. The first error of a run of failed requests is logged.
+/// Keeps `msg` as the simulation's latest camera geometry. A geometry with
+/// an unusable part is ignored whole; the first of a run of them is logged.
+fn keep_geometry(
+    geometry: &SharedGeometry,
+    unusable_geometries: &ReportOnce,
+    msg: simulation_geometry::Message,
+) {
+    if let Some(part) = unusable_part(&msg) {
+        if unusable_geometries.first_of_run() {
+            warn!("ignoring geometry with an unusable {part}, suppressing repeats");
+        }
+        return;
+    }
+    unusable_geometries.clear();
+    *lock_ignoring_poison(geometry) = Some(msg);
+}
+
+/// Serve `$service` with `$respond`, which maps the request to the response
+/// or the failure of an error reply, until the node stops.
 macro_rules! spawn_service {
     ($runner:expr, $service:ident, $respond:expr) => {{
         let runner = $runner.clone();
         let respond = $respond;
         tokio::spawn(async move {
-            let cancel = runner.cancellation_token().clone();
-            let service_errors = LatchedLog::error(stringify!($service));
-            loop {
-                let result = tokio::select! {
-                    _ = cancel.cancelled() => break,
-                    result = $service::handle_next_request(&runner, &respond) => result,
-                };
-                match result {
-                    Ok(()) => service_errors.success(),
-                    Err(e) => {
-                        service_errors.failure(e);
-                        tokio::time::sleep(RECEIVE_ERROR_BACKOFF).await;
-                    }
-                }
-            }
+            serving::serve(
+                stringify!($service),
+                runner.cancellation_token().cancelled(),
+                || $service::handle_next_request(&runner, &respond),
+            )
+            .await
         });
     }};
 }
@@ -833,5 +824,32 @@ mod tests {
             )
         );
         assert!(!Unanswered::NoModel.in_transport());
+    }
+
+    #[test]
+    fn a_received_stream_description_is_kept() {
+        let description = SharedDescription::default();
+        keep_stream_info(
+            &description,
+            &ReportOnce::default(),
+            stream_info::Message {
+                width: 1280,
+                height: 720,
+                frames_per_second: 30,
+                encoding: "rgb8".to_owned(),
+                depth_width: 640,
+                depth_height: 360,
+                depth_encoding: "16UC1".to_owned(),
+                depth_unit: 0.001,
+            },
+        );
+        assert_eq!(lock_ignoring_poison(&description).width, 1280);
+    }
+
+    #[test]
+    fn a_received_geometry_is_kept() {
+        let geometry = SharedGeometry::default();
+        keep_geometry(&geometry, &ReportOnce::default(), chest_geometry());
+        assert!(lock_ignoring_poison(&geometry).is_some());
     }
 }

@@ -529,6 +529,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "control_core"
+version = "0.1.0"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#eb844c23f88e1f526981fbb91a55b4ef89f2a107"
+dependencies = [
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2936,6 +2946,7 @@ dependencies = [
 name = "robot_initializer"
 version = "0.1.0"
 dependencies = [
+ "control_core",
  "futures",
  "peppygen",
  "peppylib",

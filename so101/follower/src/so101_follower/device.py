@@ -18,6 +18,7 @@ from control_core_py.runtime import Latch, RateMeter
 from so101_description.device import (
     PositionSample,
     connect_calibrated,
+    motor_positions,
     position_channels,
     read_position_sample,
 )
@@ -96,8 +97,7 @@ class LerobotFollower:
         connect_calibrated(self._robot, "arm")
 
     def read_positions(self) -> dict[str, float]:
-        observation = self._robot.get_observation()
-        return {key.removesuffix(".pos"): value for key, value in observation.items()}
+        return motor_positions(self._robot.get_observation())
 
     def write_goals(self, goals_by_motor: dict[str, float]) -> None:
         # The servo EPROM position limits, written by calibration, are the

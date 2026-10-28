@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use camera_core::controls::ControlFailure;
 use camera_core::encoding::ColorEncoding;
+use control_core::serving;
 
 use crate::camera::controls::{CameraControlRequest, ControlResult, parse_mode};
 use crate::camera::v4l_device::{ControlHandle, StreamDescription};
@@ -22,14 +23,21 @@ pub async fn listen_for_video_stream_info_requests(
     stream: StreamDescription,
     topic_encoding: ColorEncoding,
 ) {
-    serve_requests!(node_runner, video_stream_info, |_request| {
-        Ok(video_stream_info::Response::new(
-            stream.width,
-            stream.height,
-            stream.frames_per_second,
-            topic_encoding.to_string(),
-        ))
-    });
+    serving::serve(
+        "video_stream_info",
+        node_runner.cancellation_token().cancelled(),
+        || {
+            video_stream_info::handle_next_request(&node_runner, |_request| {
+                Ok(video_stream_info::Response::new(
+                    stream.width,
+                    stream.height,
+                    stream.frames_per_second,
+                    topic_encoding.to_string(),
+                ))
+            })
+        },
+    )
+    .await;
 }
 
 /// Apply a control synchronously and report what actually happened.
@@ -52,12 +60,19 @@ macro_rules! listen_for_control_requests {
             let control_of: fn(
                 &$service::RequestData,
             ) -> Result<CameraControlRequest, ControlFailure> = $control;
-            serve_requests!(node_runner, $service, |request| {
-                control_of(&request.data)
-                    .and_then(|control| send_control(&controls, control))
-                    .map($service::Response::new)
-                    .map_err(|failure| camera_core::control_failure!($service, failure))
-            });
+            serving::serve(
+                stringify!($service),
+                node_runner.cancellation_token().cancelled(),
+                || {
+                    $service::handle_next_request(&node_runner, |request| {
+                        control_of(&request.data)
+                            .and_then(|control| send_control(&controls, control))
+                            .map($service::Response::new)
+                            .map_err(|failure| camera_core::control_failure!($service, failure))
+                    })
+                },
+            )
+            .await;
         }
     };
 }

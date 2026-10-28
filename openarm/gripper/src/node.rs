@@ -7,6 +7,7 @@
 use crate::follow::{self, FollowConfig};
 use crate::hardware::{Gripper, PosForceLimits, gripper_motor_type};
 use crate::{health, stream};
+use control_core::serving;
 use control_core::sync::lock_ignoring_poison;
 use control_core::time::{RateOutOfRange, period_from_hz};
 use openarm_description::{HardwareVersion, Side};
@@ -379,19 +380,16 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         let ready = ready.clone();
         let token = node_runner.cancellation_token().clone();
         tokio::spawn(async move {
-            loop {
-                if let Err(e) = is_ready::handle_next_request(&runner, |_req| {
+            serving::serve("is_ready", token.cancelled(), || {
+                is_ready::handle_next_request(&runner, |_req| {
                     Ok(is_ready::Response::new(reports_ready(
                         ready.load(Ordering::SeqCst),
                         follow::HARD_FAULT.load(Ordering::SeqCst),
                         token.is_cancelled(),
                     )))
                 })
-                .await
-                {
-                    error!("is_ready: {e}");
-                }
-            }
+            })
+            .await;
         });
     }
 

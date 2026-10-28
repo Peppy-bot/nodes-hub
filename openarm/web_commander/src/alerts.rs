@@ -11,15 +11,16 @@
 //! The producer is the transport-authenticated instance, so no producer can
 //! replace or clear another's alert through the wire strings.
 
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
+use control_core::receiving::receive;
 use control_core::throttle::Throttle;
-use control_core::time::RECEIVE_ERROR_BACKOFF;
 use peppygen::NodeRunner;
 use peppygen::consumed_topics::alerts::alerts;
-use peppylib::messaging::ProducerRef;
+use peppylib::messaging::{BoundSetState, ProducerRef};
 use peppylib::runtime::{CancellationToken, watch_bound_set};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{error, warn};
 
 use crate::consumer::{self, ALERT_STALE_AFTER, REJECT_WARN_PERIOD, parse_timestamp_validity};
@@ -65,80 +66,95 @@ pub async fn run(
             return;
         }
     };
-    let mut producers = producers;
+    follow_alerts(
+        producers,
+        async move || subscription.next().await,
+        feedback,
+        token,
+    )
+    .await;
+}
+
+/// Hand the owner the slot's membership in `producers`, then each change of
+/// it and each alert set `next_set` receives, until `token` cancels, the
+/// subscription or the membership watch closes, or the owner is gone.
+async fn follow_alerts(
+    mut producers: watch::Receiver<BoundSetState>,
+    mut next_set: impl AsyncFnMut() -> peppygen::Result<Option<(ProducerRef, alerts::Message)>>,
+    feedback: mpsc::Sender<Feedback>,
+    token: CancellationToken,
+) {
     let mut reject_warn = Throttle::new(REJECT_WARN_PERIOD);
     // The membership in hand before the first set, so a producer that was
     // already bound renders its alerts.
-    if !send_producers(&feedback, &mut producers).await {
+    let initial = held_producers(&mut producers);
+    if feedback
+        .send(Feedback::AlertProducers(initial))
+        .await
+        .is_err()
+    {
         return;
     }
-    loop {
-        let received = tokio::select! {
-            _ = token.cancelled() => return,
-            changed = producers.changed() => {
-                if changed.is_err() {
-                    return;
+    receive(
+        "alerts",
+        token.cancelled(),
+        async move || {
+            tokio::select! {
+                changed = producers.changed() => {
+                    Ok(changed.ok().map(|()| Event::Membership(held_producers(&mut producers))))
                 }
-                if !send_producers(&feedback, &mut producers).await {
-                    return;
-                }
-                continue;
-            }
-            received = subscription.next() => received,
-        };
-        let (producer, msg) = match received {
-            Ok(Some(pair)) => pair,
-            Ok(None) => return,
-            Err(e) => {
-                error!(error = %e, "alerts receive");
-                tokio::select! {
-                    _ = token.cancelled() => return,
-                    _ = tokio::time::sleep(RECEIVE_ERROR_BACKOFF) => {}
-                }
-                continue;
-            }
-        };
-        // An unresolved daemon clock cannot certify a set's age, so the set
-        // drops on the same throttled-warn path as a malformed one.
-        let parsed = consumer::clock_now()
-            .and_then(|clock_now| parse_alert_set(&msg, clock_now, std::time::Instant::now()));
-        match parsed {
-            Ok(Parsed { set, refused }) => {
-                if let Some(reason) = refused.filter(|_| reject_warn.admit()) {
-                    warn!(producer = %producer.instance_id, "alerts entry dropped: {reason}");
-                }
-                let feedback_sent = feedback
-                    .send(Feedback::AlertSet {
-                        producer: producer.clone(),
-                        set,
-                    })
-                    .await;
-                if feedback_sent.is_err() {
-                    return;
+                received = next_set() => {
+                    received.map(|pair| pair.map(|(producer, msg)| Event::Set(producer, msg)))
                 }
             }
-            Err(e) => {
-                if reject_warn.admit() {
-                    warn!(producer = %producer.instance_id, "alerts set dropped: {e}");
+        },
+        async move |event| {
+            let sent = match event {
+                Event::Membership(held) => feedback.send(Feedback::AlertProducers(held)).await,
+                Event::Set(producer, msg) => {
+                    // An unresolved daemon clock cannot certify a set's age, so
+                    // the set drops on the same throttled-warn path as a
+                    // malformed one.
+                    let parsed = consumer::clock_now().and_then(|clock_now| {
+                        parse_alert_set(&msg, clock_now, std::time::Instant::now())
+                    });
+                    let Parsed { set, refused } = match parsed {
+                        Ok(parsed) => parsed,
+                        Err(e) => {
+                            if reject_warn.admit() {
+                                warn!(producer = %producer.instance_id, "alerts set dropped: {e}");
+                            }
+                            return ControlFlow::Continue(());
+                        }
+                    };
+                    if let Some(reason) = refused.filter(|_| reject_warn.admit()) {
+                        warn!(producer = %producer.instance_id, "alerts entry dropped: {reason}");
+                    }
+                    feedback.send(Feedback::AlertSet { producer, set }).await
                 }
-            }
-        }
-    }
+            };
+            consumer::forwarded(sent)
+        },
+    )
+    .await;
 }
 
-/// Tell the owner which producers the slot holds, so the alerts of one that
-/// left go with it. Answers false when the owner is gone.
-async fn send_producers(
-    feedback: &mpsc::Sender<Feedback>,
-    producers: &mut tokio::sync::watch::Receiver<peppylib::messaging::BoundSetState>,
-) -> bool {
-    let held: Vec<ProducerRef> = producers
+/// What the alerts listener receives: the slot's membership after it
+/// changes, or one producer's alert set.
+enum Event {
+    Membership(Vec<ProducerRef>),
+    Set(ProducerRef, alerts::Message),
+}
+
+/// The producers the slot holds, which the owner keeps the alerts of: the
+/// alerts of a producer that left go with it.
+fn held_producers(producers: &mut watch::Receiver<BoundSetState>) -> Vec<ProducerRef> {
+    producers
         .borrow_and_update()
         .producers
         .iter()
         .map(|member| member.producer.clone())
-        .collect();
-    feedback.send(Feedback::AlertProducers(held)).await.is_ok()
+        .collect()
 }
 
 /// One parsed set, and the first entry it dropped.
@@ -282,6 +298,33 @@ mod tests {
         let parsed = parse(long);
         assert_eq!(parsed.set.alerts.len(), MAX_ACTIVE_ALERTS);
         assert!(parsed.refused.is_some());
+    }
+
+    #[tokio::test]
+    async fn each_membership_of_the_slot_reaches_the_owner() {
+        let (membership, producers) = watch::channel(BoundSetState::seeded(Default::default()));
+        let (feedback, mut owner) = mpsc::channel(1);
+        let token = CancellationToken::default();
+        let joined = ProducerRef::new("core", "alerts_inst");
+        let following = follow_alerts(
+            producers,
+            async || std::future::pending().await,
+            feedback,
+            token.clone(),
+        );
+        let checking = async {
+            let Some(Feedback::AlertProducers(initial)) = owner.recv().await else {
+                panic!("the owner gets the membership in hand first");
+            };
+            assert!(initial.is_empty());
+            membership.send_replace(BoundSetState::seeded(joined.clone().into()));
+            let Some(Feedback::AlertProducers(changed)) = owner.recv().await else {
+                panic!("the owner gets the changed membership");
+            };
+            assert_eq!(changed, [joined]);
+            token.cancel();
+        };
+        tokio::join!(following, checking);
     }
 
     #[test]

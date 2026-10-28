@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import math
 import shutil
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -182,8 +181,6 @@ class Recorder:
         depth_probe=_poll_depth_units,
         timing: Timing = Timing(),
     ):
-        if not math.isfinite(max_staleness_s) or max_staleness_s <= 0:
-            raise ValueError(f"max_staleness_s must be positive, got {max_staleness_s}")
         self._plan = plan
         self._cache = cache
         self._session = session

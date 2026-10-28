@@ -6,6 +6,7 @@
 use crate::control::{self, ControlConfig};
 use crate::health;
 use crate::stream;
+use control_core::serving;
 use control_core::sync::lock_ignoring_poison;
 use control_core::time::{RateOutOfRange, period_from_hz};
 use openarm_can::ArmCan;
@@ -357,19 +358,16 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         let ready = ready.clone();
         let token = node_runner.cancellation_token().clone();
         tokio::spawn(async move {
-            loop {
-                if let Err(e) = is_ready::handle_next_request(&runner, |_req| {
+            serving::serve("is_ready", token.cancelled(), || {
+                is_ready::handle_next_request(&runner, |_req| {
                     Ok(is_ready::Response::new(reports_ready(
                         ready.load(Ordering::SeqCst),
                         control::HARD_FAULT.load(Ordering::SeqCst),
                         token.is_cancelled(),
                     )))
                 })
-                .await
-                {
-                    error!("is_ready: {e}");
-                }
-            }
+            })
+            .await;
         });
     }
 
@@ -384,6 +382,7 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     let listener = tokio::spawn(stream::run_governed_setpoint_listener(
         node_runner.clone(),
         governed_tx,
+        node_runner.cancellation_token().clone(),
     ));
     let publisher = tokio::spawn(stream::run_state_publisher(
         node_runner.clone(),

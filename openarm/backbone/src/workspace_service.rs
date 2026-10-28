@@ -14,6 +14,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use control_core::serving;
 use control_core::sync::wait_for;
 use peppygen::NodeRunner;
 use peppygen::consumed_services::perception_geometry::{
@@ -25,7 +26,6 @@ use tracing::info;
 use workspace_core::Camera;
 use workspace_core::design::{Positions, SurfaceHeight, ViewCheck};
 
-use crate::serving;
 use crate::workspace::{
     CameraGeometryError, PerceptionCamera, Workspace, depth_from_wire, intrinsics_from_wire,
 };
@@ -57,7 +57,7 @@ async fn serve_describe(
     token: CancellationToken,
     workspace: Arc<Workspace>,
 ) {
-    serving::serve("describe_workspace", &token, || {
+    serving::serve("describe_workspace", token.cancelled(), || {
         describe_workspace::handle_next_request(&runner, |request| {
             tokio::task::block_in_place(|| {
                 describe(&runner, &workspace, request.data.surface_height)
@@ -68,7 +68,7 @@ async fn serve_describe(
 }
 
 async fn serve_check(runner: Arc<NodeRunner>, token: CancellationToken, workspace: Arc<Workspace>) {
-    serving::serve("check_positions", &token, || {
+    serving::serve("check_positions", token.cancelled(), || {
         check_positions::handle_next_request(&runner, |request| {
             tokio::task::block_in_place(|| check(&runner, &workspace, &request.data.positions))
         })

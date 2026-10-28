@@ -284,7 +284,7 @@ async def setup(
         plan,
         cache,
         session,
-        params.max_staleness_s,
+        config.max_staleness_s,
         params.min_remaining_disk_bytes,
         open_session,
         open_existing,

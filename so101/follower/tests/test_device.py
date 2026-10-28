@@ -3,7 +3,7 @@ import time
 
 import pytest
 from conftest import wait_for
-from so101_description.units import GRIPPER_NAME, JOINT_NAMES
+from so101_description.units import GRIPPER_NAME, JOINT_NAMES, MOTOR_NAMES
 
 from so101_follower import __main__ as main_mod
 from so101_follower.device import DeviceLoop
@@ -213,6 +213,41 @@ async def test_bus_watchdog_terminates_after_the_exit_horizon(fake_hardware, mon
         assert fake_hardware.disconnected
     finally:
         loop.stop()
+
+
+class ScriptedRobot:
+    """The lerobot robot surface the follower's reads call, answering one
+    fixed observation."""
+
+    def __init__(self, observation):
+        self._observation = observation
+        self.is_connected = False
+        self.is_calibrated = True
+
+    def connect(self, calibrate):
+        self.is_connected = True
+
+    def get_observation(self):
+        return dict(self._observation)
+
+    def disconnect(self):
+        self.is_connected = False
+
+
+def test_two_channels_naming_one_motor_fail_the_launch(tmp_path):
+    from so101_follower.device import LerobotFollower
+
+    follower = LerobotFollower("/dev/null", str(tmp_path), "follower")
+    robot = ScriptedRobot(
+        {**{f"{motor}.pos": 0.0 for motor in MOTOR_NAMES}, "wrist_flex": 1.0}
+    )
+    follower._robot = robot
+    loop = make_loop(follower)
+    with pytest.raises(ValueError, match="two channels name motor wrist_flex"):
+        loop.start()
+    assert not loop.ready()
+    # The refused bringup releases the arm.
+    assert not robot.is_connected
 
 
 def test_lerobot_follower_constructs(tmp_path):
