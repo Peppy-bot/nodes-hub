@@ -5,7 +5,7 @@
 //!
 //!   τ_fric[i] = Fo[i] + Fv[i]·ω[i] + Fc[i]·tanh(k[i]·ω[i])
 
-use crate::JointVec;
+use srs_model::JointVec;
 
 /// Per-joint friction-model constants for the tanh model above.
 #[derive(Debug, Clone, Copy)]
@@ -47,7 +47,7 @@ pub fn torques(p: &Params, qdot: &JointVec) -> JointVec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ARM_DOF;
+    use openarm_description::ARM_DOF;
 
     /// Self-contained constants for the `torques` math (distinct, non-zero per
     /// joint), independent of the production [`NOMINAL`] values.

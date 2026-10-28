@@ -1,11 +1,12 @@
-// Node composition: parses every parameter up front, builds the srs_model
-// arm, takes the per-arm instance lock, brings up the CAN hardware, and wires
-// the control loop to the stream tasks. All control, health, and stream logic
-// lives in the sibling modules; this is only the assembly.
+//! Node composition: parses every parameter up front, builds the srs_model
+//! arm, takes the per-arm instance lock, brings up the CAN hardware, and wires
+//! the control loop to the stream tasks. All control, health, and stream logic
+//! lives in the sibling modules; this is only the assembly.
 
 use crate::control::{self, ControlConfig};
 use crate::health;
 use crate::stream;
+use control_core::sync::lock_ignoring_poison;
 use control_core::time::{RateOutOfRange, period_from_hz};
 use openarm_can::ArmCan;
 use openarm_description::{HardwareVersion, Side};
@@ -134,6 +135,50 @@ impl From<NodeError> for peppygen::Error {
     }
 }
 
+/// Names this arm's motors on the alert wire: "left arm" extends to
+/// "left arm j2" per joint.
+fn alert_source(side: Side) -> String {
+    format!("{side} arm")
+}
+
+/// What the launch parameters resolve to, parsed once before any device
+/// contact.
+#[derive(Debug)]
+struct Config {
+    cycle_period: Duration,
+    state_period: Duration,
+    recv_timeout_us: u32,
+    side: Side,
+    hardware_version: HardwareVersion,
+}
+
+/// Parse every launch parameter, refusing the first that cannot drive an arm.
+fn parse_config(params: &Parameters) -> NodeResult<Config> {
+    let cycle_period =
+        period_from_hz(params.control_rate_hz, MAX_RATE_HZ).map_err(NodeError::ControlRate)?;
+    let state_period =
+        period_from_hz(params.state_rate_hz, MAX_RATE_HZ).map_err(NodeError::StateRate)?;
+    // Bounded above so a config typo cannot park recv_all in a long ppoll
+    // while it holds the CAN mutex the shutdown hooks need: 100 ms keeps
+    // the whole hook sequence inside even the minimum 1 s grace window,
+    // and real configs run around 1 ms. Bounded below because the driver
+    // refuses a zero wait on its other receive passes, and a receive that
+    // never waits turns every quiet tick into a silence pass.
+    if !(1..=MAX_RECV_TIMEOUT_US).contains(&params.recv_timeout_us) {
+        return Err(NodeError::RecvTimeout(params.recv_timeout_us));
+    }
+    let side = side_for(params.arm_id)?;
+    // Which OpenArm generation this arm drives; selects the embedded description.
+    let hardware_version: HardwareVersion = params.hardware_version.parse()?;
+    Ok(Config {
+        cycle_period,
+        state_period,
+        recv_timeout_us: params.recv_timeout_us,
+        side,
+        hardware_version,
+    })
+}
+
 /// Readiness as the initializer sees it. A latched fault or a started
 /// shutdown revokes it: peppy keeps services reachable while the shutdown
 /// hooks run, so without the cancellation term a leader polling during a
@@ -160,27 +205,17 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     // consumers age samples on one timeline.
     peppygen::clock::init(&node_runner).await?;
 
+    // Parse every parameter up front (parse, don't validate): a bad launch
+    // fails here with the reason, before touching the CAN bus.
+    let Config {
+        cycle_period,
+        state_period,
+        recv_timeout_us,
+        side,
+        hardware_version,
+    } = parse_config(&params)?;
     let arm_id = params.arm_id;
     let can_interface = params.can_interface.clone();
-
-    let cycle_period =
-        period_from_hz(params.control_rate_hz, MAX_RATE_HZ).map_err(NodeError::ControlRate)?;
-    let state_period =
-        period_from_hz(params.state_rate_hz, MAX_RATE_HZ).map_err(NodeError::StateRate)?;
-    // Bounded above so a config typo cannot park recv_all in a long ppoll
-    // while it holds the CAN mutex the shutdown hooks need: 100 ms keeps
-    // the whole hook sequence inside even the minimum 1 s grace window,
-    // and real configs run around 1 ms. Bounded below because the driver
-    // refuses a zero wait on its other receive passes, and a receive that
-    // never waits turns every quiet tick into a silence pass.
-    if !(1..=MAX_RECV_TIMEOUT_US).contains(&params.recv_timeout_us) {
-        return Err(NodeError::RecvTimeout(params.recv_timeout_us));
-    }
-
-    let side = side_for(arm_id)?;
-
-    // Which OpenArm generation this arm drives; selects the embedded description.
-    let hardware_version: HardwareVersion = params.hardware_version.parse()?;
 
     // The chain base link this side's SRS model is walked out from: a fact of the
     // generation's URDF, resolved from the description rather than configured, so a
@@ -227,7 +262,7 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     ];
     info!(
         "config: arm_id={arm_id} ({side:?}) rate={}Hz recv_timeout={}us",
-        params.control_rate_hz, params.recv_timeout_us
+        params.control_rate_hz, recv_timeout_us
     );
     info!("config: kp={kp:?} kd={kd:?}");
 
@@ -268,7 +303,7 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     {
         let arm = arm.clone();
         node_runner.on_shutdown(async move {
-            let mut a = arm.lock().unwrap_or_else(|e| e.into_inner());
+            let mut a = lock_ignoring_poison(&arm);
             if let Err(e) = a.disable_all() {
                 error!("disable motors: {e}");
             }
@@ -285,7 +320,7 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         let arm = arm.clone();
         let token = node_runner.cancellation_token().clone();
         tokio::task::spawn_blocking(move || -> NodeResult<_> {
-            let mut a = arm.lock().unwrap_or_else(|e| e.into_inner());
+            let mut a = lock_ignoring_poison(&arm);
             // A cancellation that drops the setup future leaves this
             // queued task to run detached, and spawn_blocking cannot be
             // aborted. Cancellation precedes the shutdown hooks and the
@@ -308,7 +343,7 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         kp,
         kd,
         cycle_period,
-        recv_timeout_us: params.recv_timeout_us,
+        recv_timeout_us,
         limits: model.limits(),
         ratings,
     };
@@ -355,13 +390,7 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         state_period,
         measured_rx,
     ));
-    // Names this arm's motors on the alert wire: "left arm" extends to
-    // "left arm j2" per joint.
-    let alert_source = match side {
-        Side::Left => "left arm",
-        Side::Right => "right arm",
-    }
-    .to_string();
+    let alert_source = alert_source(side);
     // The final flush round after cancellation is only awaited if a
     // shutdown hook waits for it: the runtime awaits hooks, not plain
     // tasks racing the token. Dropping the sender (return or panic)
@@ -455,6 +484,150 @@ fn bring_up(arm: &mut ArmCan) -> std::result::Result<(), openarm_can::EnableFail
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A launch the node accepts, one field per parameter the manifest names.
+    fn params() -> Parameters {
+        Parameters {
+            arm_id: ARM_ID_LEFT,
+            can_interface: "can0".to_string(),
+            control_rate_hz: 100,
+            hardware_version: "v2".to_string(),
+            kd1: 1.0,
+            kd2: 1.0,
+            kd3: 1.0,
+            kd4: 1.0,
+            kd5: 1.0,
+            kd6: 1.0,
+            kd7: 1.0,
+            kp1: 10.0,
+            kp2: 10.0,
+            kp3: 10.0,
+            kp4: 10.0,
+            kp5: 10.0,
+            kp6: 10.0,
+            kp7: 10.0,
+            recv_timeout_us: 1000,
+            state_rate_hz: 100,
+        }
+    }
+
+    /// A parameter's name and the edit that makes it acceptable.
+    type ParameterFix = (&'static str, fn(&mut Parameters));
+
+    fn refusal(params: Parameters) -> String {
+        let error = parse_config(&params).expect_err("refused");
+        // The source carries the reason; the variant names the parameter.
+        match std::error::Error::source(&error) {
+            Some(source) => format!("{error}: {source}"),
+            None => error.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_launch_with_every_parameter_set_parses() {
+        let config = parse_config(&params()).expect("parses");
+        assert_eq!(config.cycle_period, Duration::from_millis(10));
+        assert_eq!(config.state_period, Duration::from_millis(10));
+        assert_eq!(config.recv_timeout_us, 1000);
+        assert_eq!(config.side, Side::Left);
+        assert_eq!(config.hardware_version, HardwareVersion::V2);
+    }
+
+    #[test]
+    fn every_refusal_names_its_parameter() {
+        let cases = [
+            (
+                "control_rate_hz",
+                Parameters {
+                    control_rate_hz: 0,
+                    ..params()
+                },
+            ),
+            (
+                "control_rate_hz",
+                Parameters {
+                    control_rate_hz: MAX_RATE_HZ + 1,
+                    ..params()
+                },
+            ),
+            (
+                "state_rate_hz",
+                Parameters {
+                    state_rate_hz: 0,
+                    ..params()
+                },
+            ),
+            (
+                "recv_timeout_us",
+                Parameters {
+                    recv_timeout_us: 0,
+                    ..params()
+                },
+            ),
+            (
+                "recv_timeout_us",
+                Parameters {
+                    recv_timeout_us: MAX_RECV_TIMEOUT_US + 1,
+                    ..params()
+                },
+            ),
+            (
+                "arm_id",
+                Parameters {
+                    arm_id: 2,
+                    ..params()
+                },
+            ),
+            (
+                "hardware_version",
+                Parameters {
+                    hardware_version: "v3".into(),
+                    ..params()
+                },
+            ),
+        ];
+        for (parameter, params) in cases {
+            let refused = refusal(params);
+            assert!(
+                refused.contains(parameter),
+                "a refusal must name {parameter}: {refused}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_launch_wrong_in_every_parameter_is_refused_in_parameter_order() {
+        let fixes: [ParameterFix; 5] = [
+            ("control_rate_hz", |p| p.control_rate_hz = 100),
+            ("state_rate_hz", |p| p.state_rate_hz = 100),
+            ("recv_timeout_us", |p| p.recv_timeout_us = 1000),
+            ("arm_id", |p| p.arm_id = ARM_ID_LEFT),
+            ("hardware_version", |p| p.hardware_version = "v2".into()),
+        ];
+        let mut launch = Parameters {
+            control_rate_hz: 0,
+            state_rate_hz: 0,
+            recv_timeout_us: 0,
+            arm_id: 2,
+            hardware_version: "v3".into(),
+            ..params()
+        };
+        for (parameter, fix) in fixes {
+            let refused = refusal(launch.clone());
+            assert!(
+                refused.contains(parameter),
+                "the next refusal must name {parameter}: {refused}"
+            );
+            fix(&mut launch);
+        }
+        parse_config(&launch).expect("every parameter fixed");
+    }
+
+    #[test]
+    fn the_alert_source_names_the_side() {
+        assert_eq!(alert_source(Side::Left), "left arm");
+        assert_eq!(alert_source(Side::Right), "right arm");
+    }
 
     #[test]
     fn readiness_needs_bringup_and_is_revoked_by_a_fault_or_a_shutdown() {
