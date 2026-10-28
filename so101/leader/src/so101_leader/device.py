@@ -17,6 +17,7 @@ from control_core_py.runtime import Latch, RateMeter, log
 from so101_description.device import (
     PositionSample,
     connect_calibrated,
+    motor_positions,
     read_position_sample,
 )
 
@@ -72,8 +73,7 @@ class LerobotLeader:
         connect_calibrated(self._teleop, "leader arm")
 
     def read_positions(self) -> dict[str, float]:
-        action = self._teleop.get_action()
-        return {key.removesuffix(".pos"): value for key, value in action.items()}
+        return motor_positions(self._teleop.get_action())
 
     def disconnect(self) -> None:
         # Idempotent: the calibration-failure path disconnects before

@@ -1,5 +1,6 @@
 import pytest
 from conftest import wait_for
+from so101_description.units import MOTOR_NAMES
 
 from so101_leader.device import DeviceLoop
 
@@ -74,6 +75,41 @@ def test_lerobot_leader_rebuilds_a_stale_teleop_before_reconnecting(tmp_path):
     assert leader._fresh_teleop() is not leader._teleop
     leader._teleop.bus.port_handler.is_open = False
     assert leader._fresh_teleop() is leader._teleop
+
+
+class ScriptedTeleop:
+    """The lerobot teleop surface the leader calls, answering one fixed
+    action."""
+
+    def __init__(self, action):
+        self._action = action
+        self.is_connected = False
+        self.is_calibrated = True
+
+    def connect(self, calibrate):
+        self.is_connected = True
+
+    def get_action(self):
+        return dict(self._action)
+
+    def disconnect(self):
+        self.is_connected = False
+
+
+def test_two_channels_naming_one_motor_fail_the_launch(tmp_path):
+    from so101_leader.device import LerobotLeader
+
+    leader = LerobotLeader("/dev/null", str(tmp_path), "leader")
+    teleop = ScriptedTeleop(
+        {**{f"{motor}.pos": 0.0 for motor in MOTOR_NAMES}, "wrist_flex": 1.0}
+    )
+    leader._teleop = teleop
+    loop = DeviceLoop(leader, read_rate_hz=200)
+    with pytest.raises(ValueError, match="two channels name motor wrist_flex"):
+        loop.start()
+    assert not loop.ready()
+    # The refused bringup releases the bus.
+    assert not teleop.is_connected
 
 
 def test_lerobot_leader_constructs(tmp_path):
