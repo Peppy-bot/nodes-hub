@@ -280,7 +280,7 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     }
 
     // Which OpenArm generation the arms are; selects the embedded description for both
-    // the srs_model arms and the bimanual collision model.
+    // the srs_model arms and the self-collision model.
     let hardware_version: HardwareVersion = params.hardware_version.parse()?;
 
     // Which upstream command kind this instance follows; parsed once, and
@@ -289,12 +289,11 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     info!("following upstream {upstream_mode} commands");
 
     // Two arm models (FK/IK/Jacobian/limits, with the elbow singularity margin)
-    // and the bimanual collision model, all from the embedded OpenArm description.
+    // and the self-collision model, all from the embedded OpenArm description.
     // The per-side chain base and tcp links are facts of the generation's URDF,
     // resolved from the description rather than configured, so a v2 launch cannot
-    // inherit a v1 name. The collision model walks the same chains and takes the
-    // base links directly.
-    let bases = ArmPair::from_fn(|side| hardware_version.base_link(side));
+    // inherit a v1 name. The collision model walks the same chains from the same
+    // base links.
     let build_arm = |side: Side| {
         arm_model(hardware_version, side).map_err(|source| NodeError::ArmModel { side, source })
     };
@@ -321,9 +320,8 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         .ok_or_else(|| NodeError::MeshesPathNotUtf8(meshes_tmp.path().to_path_buf()))?;
 
     let governor = governor::Governor::build(
-        hardware_version.urdf(),
+        hardware_version,
         meshes_dir,
-        bases,
         params.d_stop_m,
         params.d_safe_m,
         max_joint_velocity_rad_s

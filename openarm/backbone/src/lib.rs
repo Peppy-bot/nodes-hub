@@ -32,7 +32,6 @@ mod startup;
 mod streams;
 #[cfg(test)]
 mod test_support;
-mod torso;
 mod types;
 mod upstream;
 mod workspace;

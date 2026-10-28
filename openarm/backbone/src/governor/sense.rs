@@ -3,7 +3,7 @@
 //! before any of them run.
 //!
 //! The model rewrites its finger placement on every query
-//! ([`BimanualCollisionModel::set_gripper_openings`]), so a design where
+//! ([`SelfCollisionModel::set_gripper_openings`]), so a design where
 //! limiters query it directly would make their order load-bearing: whoever
 //! asks last leaves the model configured for whoever asks next, and the
 //! gradient becomes one taken at the wrong finger placement. Sampling once
@@ -15,7 +15,7 @@
 //! query through it takes the whole configuration, so a read at a stale
 //! placement is unrepresentable rather than merely avoided.
 
-use bimanual_collision_model::CollisionError;
+use self_collision_model::CollisionError;
 use tracing::error;
 
 use super::limiters::Tripwire;

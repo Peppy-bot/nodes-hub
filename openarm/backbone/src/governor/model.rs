@@ -12,8 +12,8 @@
 //! queries are sequential by construction; what this boundary adds is that
 //! their *order* no longer matters.
 
-use bimanual_collision_model::{BimanualCollisionModel, CollisionError, DistanceGradient};
 use control_core::throttle::Throttle;
+use self_collision_model::{CollisionError, DistanceGradient, SelfCollisionModel};
 use tracing::warn;
 
 use crate::streams::THROTTLED_WARN_PERIOD;
@@ -21,7 +21,7 @@ use crate::streams::THROTTLED_WARN_PERIOD;
 use super::{GOV_DOF, GovState, NearestPair, split};
 
 pub(super) struct ConfiguredModel {
-    inner: BimanualCollisionModel,
+    inner: SelfCollisionModel,
     /// Throttles the failed-query log. A failed query stays fail-safe (`None`
     /// reads as a breach in the scan and as "no pair" in the readout), but a
     /// persistently failing model must be visible in the log, not
@@ -30,7 +30,7 @@ pub(super) struct ConfiguredModel {
 }
 
 impl ConfiguredModel {
-    pub fn new(inner: BimanualCollisionModel) -> Self {
+    pub fn new(inner: SelfCollisionModel) -> Self {
         Self {
             inner,
             query_error_log: Throttle::new(THROTTLED_WARN_PERIOD),
@@ -40,7 +40,7 @@ impl ConfiguredModel {
     fn min_distance_at(
         &mut self,
         q: &[f64; GOV_DOF],
-    ) -> Option<bimanual_collision_model::Proximity<'_>> {
+    ) -> Option<self_collision_model::Proximity<'_>> {
         let s = split(q);
         self.inner
             .set_gripper_openings(s.grippers.left, s.grippers.right);

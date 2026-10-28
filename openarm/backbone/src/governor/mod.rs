@@ -1,5 +1,5 @@
-//! Self-collision governor: a closing-velocity barrier over the bimanual
-//! collision model. Each tick it limits only the component of the commanded joint
+//! Self-collision governor: a closing-velocity barrier over the self-collision
+//! model. Each tick it limits only the component of the commanded joint
 //! step that closes the nearest gap between the two arms, leaving tangential and
 //! separating motion at full speed. The permitted approach speed ramps from a full
 //! approach at `d_safe` down to zero at `d_stop` (a Faverjon-Tournassoud velocity
@@ -32,13 +32,11 @@
 //! modes and never touch the collision readout, so the toggle gates collision
 //! avoidance and nothing else.
 
-use bimanual_collision_model::{BimanualCollisionModel, DistanceGradient};
 use control_core::positive_finite::PositiveFinite;
-use openarm_description::{ARM_DOF, ArmPair, Side};
+use openarm_description::{ARM_DOF, ArmPair, HardwareVersion, Side};
+use self_collision_model::{DistanceGradient, SelfCollisionModel};
 use srs_model::{Jacobian, JointVec};
 use tracing::{info, warn};
-
-use crate::torso::{TORSO_BODY, torso_regions};
 
 mod barrier;
 mod limiters;
@@ -71,11 +69,8 @@ pub enum GovernorError {
     )]
     GripperRate(f64),
 
-    #[error(transparent)]
-    TorsoRegion(#[from] crate::torso::InvalidTorsoRegion),
-
     #[error("build the collision model")]
-    CollisionModel(#[from] bimanual_collision_model::CollisionError),
+    CollisionModel(#[from] self_collision_model::CollisionError),
 }
 
 /// Joints across both arms, left (0..7) then right (7..14).
@@ -237,14 +232,13 @@ pub struct Governor {
 }
 
 impl Governor {
-    /// Build the bimanual model (with the tight torso proxy) and validate the band.
-    /// Fails loudly on a bad URDF / mesh dir / base link or an invalid band, so a
+    /// Build the self-collision model of `version` (with the tight torso proxy) and
+    /// validate the band. Fails loudly on a bad mesh dir or an invalid band, so a
     /// misconfigured backbone aborts at bringup instead of running ungoverned.
     #[allow(clippy::too_many_arguments)] // distinct model inputs + band + speed bound + toggle
     pub fn build(
-        urdf: &str,
+        version: HardwareVersion,
         meshes_dir: &str,
-        bases: ArmPair<&str>,
         d_stop: f64,
         d_safe: f64,
         max_joint_velocity_rad_s: f64,
@@ -267,7 +261,7 @@ impl Governor {
         if !valid_gripper_rate(max_gripper_rate_frac_s) {
             return Err(GovernorError::GripperRate(max_gripper_rate_frac_s));
         }
-        let model = ConfiguredModel::new(build_collision_model(urdf, meshes_dir, bases)?);
+        let model = ConfiguredModel::new(build_collision_model(version, meshes_dir)?);
         Ok(Self {
             model,
             d_stop,
@@ -563,16 +557,16 @@ impl Governor {
     }
 }
 
-/// Build the bimanual collision model with the shared tight torso proxy, from
-/// the embedded URDF, its materialized meshes, and the base link of each arm.
+/// Build the self-collision model of `version` with its tight torso proxy, from the
+/// embedded URDF, its materialized meshes, and the base link of each arm.
 fn build_collision_model(
-    urdf: &str,
+    version: HardwareVersion,
     meshes_dir: &str,
-    bases: ArmPair<&str>,
-) -> Result<BimanualCollisionModel, GovernorError> {
+) -> Result<SelfCollisionModel, GovernorError> {
+    let bases = ArmPair::from_fn(|side| version.base_link(side));
     Ok(
-        BimanualCollisionModel::builder(urdf, meshes_dir, bases.left, bases.right)
-            .regions(TORSO_BODY, torso_regions()?)
+        SelfCollisionModel::builder(version.urdf(), meshes_dir, bases.left, bases.right)
+            .regions(version.torso_body(), version.torso_regions())
             .build()?,
     )
 }
@@ -714,9 +708,8 @@ mod tests {
     fn governor_for(version: openarm_description::HardwareVersion, enabled: bool) -> Governor {
         let meshes_dir = fixture_meshes_dir(version);
         Governor::build(
-            version.urdf(),
+            version,
             meshes_dir.to_str().expect("meshes dir path is valid UTF-8"),
-            ArmPair::from_fn(|side| version.base_link(side)),
             D_STOP,
             D_SAFE,
             MAX_JOINT_VELOCITY_RAD_S,
@@ -961,9 +954,8 @@ mod tests {
         let velocity = 0.05;
         let meshes_dir = fixture_meshes_dir(openarm_description::HardwareVersion::V1);
         let mut g = Governor::build(
-            openarm_description::HardwareVersion::V1.urdf(),
+            openarm_description::HardwareVersion::V1,
             meshes_dir.to_str().expect("meshes dir path is valid UTF-8"),
-            ArmPair::from_fn(|side| openarm_description::HardwareVersion::V1.base_link(side)),
             D_STOP,
             D_SAFE,
             velocity,

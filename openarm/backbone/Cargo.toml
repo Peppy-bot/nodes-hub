@@ -12,7 +12,7 @@ tempfile = "3"
 peppygen = { path = ".peppy/libs/peppygen" }
 peppylib = { path = ".peppy/libs/peppylib" }
 srs_model = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "srs_model" }
-bimanual_collision_model = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "bimanual_collision_model" }
+self_collision_model = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "self_collision_model" }
 openarm_description = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "openarm_description", features = ["meshes"] }
 control_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "control_core" }
 workspace_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "workspace_core" }
@@ -27,7 +27,10 @@ urdf-rs = "0.10"
 # simulation-loop tests, which fire thousands of distance queries, run ~100x
 # slower (~100s vs <1s). Optimizing only these geometry crates keeps this crate
 # itself unoptimized and debuggable while making the tests usable.
-[profile.dev.package.bimanual_collision_model]
+[profile.dev.package.self_collision_model]
+opt-level = 3
+
+[profile.dev.package.collision_geometry]
 opt-level = 3
 
 [profile.dev.package.srs_model]
