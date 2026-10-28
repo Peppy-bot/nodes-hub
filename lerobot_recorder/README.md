@@ -183,8 +183,10 @@ riding along about once per second.
 
 An episode that cannot be written or saved fails its goal with
 `attempt_failed`, and its frames are dropped. So does an episode of fewer
-than two frames, which is discarded instead of saved. LeRobot
+than three frames. LeRobot
 computes episode stats differently below two samples and the two branches
 disagree on dtype for the integer columns, so a one-frame episode writes a
 dataset schema every later episode is rejected against, which wedges the
-session past rescue by `finish_session`.
+session past rescue by `finish_session`. LeRobot's depth encoder gives a
+two-frame video timestamps that the mp4 muxer refuses, in that episode's own
+save or in the save of every later episode appended to the same video file.

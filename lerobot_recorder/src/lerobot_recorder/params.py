@@ -3,6 +3,7 @@ an immutable config."""
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from . import storage
@@ -12,6 +13,7 @@ from . import storage
 class Config:
     fps: int
     image_writer_threads: int
+    max_staleness_s: float
     storage: storage.StorageTarget
 
 
@@ -24,8 +26,12 @@ def parse(params) -> Config:
     # the sampler and the drains behind it.
     if params.image_writer_threads <= 0:
         raise ValueError("image_writer_threads must be positive")
+    target = storage.parse_storage(params.storage_root, params.s3_uri)
+    if not math.isfinite(params.max_staleness_s) or params.max_staleness_s <= 0:
+        raise ValueError(f"max_staleness_s must be positive, got {params.max_staleness_s}")
     return Config(
         fps=params.fps,
         image_writer_threads=params.image_writer_threads,
-        storage=storage.parse_storage(params.storage_root, params.s3_uri),
+        max_staleness_s=params.max_staleness_s,
+        storage=target,
     )

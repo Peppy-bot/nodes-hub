@@ -283,12 +283,12 @@ def test_a_too_short_failure_reports_the_shortfall_and_what_ended_it():
     # Both halves are needed: an episode cut short by a low disk is a disk
     # problem, not a recording-technique problem.
     both = episode._too_short(1, "only 12 MB free under the session directory")
-    assert "need 2" in both and "12 MB free" in both
+    assert "need 3" in both and "12 MB free" in both
     # Nothing captured at all still says why it ended.
     assert "cancelled by its caller" in episode._too_short(0, "cancelled by its caller")
 
 
-def test_a_one_frame_episode_fails_rather_than_being_saved(tmp_path):
+def test_a_one_frame_episode_fails_and_is_discarded(tmp_path):
     # The library's episode stats change dtype below two samples, so saving
     # this would write a schema every later episode is rejected against.
     plan = arm_plan()
@@ -302,7 +302,7 @@ def test_a_one_frame_episode_fails_rather_than_being_saved(tmp_path):
         await recorder._record(ctx, FakeToken())
         ending, kind, message = ctx.ending()
         assert (ending, kind) == ("failed", ATTEMPT_FAILED)
-        assert "too short to save: 1 frame(s), need 2" in message
+        assert "too short to save: 1 frame(s), need 3" in message
         # What ended it survives alongside the shortfall.
         assert "stale" in message
         assert sink.saves == 0
@@ -594,13 +594,6 @@ def test_tick_report_prints_only_overruns(capsys):
     assert capsys.readouterr().out == ""
 
 
-def test_recorder_rejects_nonpositive_staleness(tmp_path):
-    plan = arm_plan()
-    for bad in (0.0, -1.0, float("nan")):
-        with pytest.raises(ValueError, match="max_staleness_s"):
-            Recorder(plan, Cache.for_plan(plan), Session(tmp_path, FakeSink(), None), bad, 1 << 30)
-
-
 def test_max_episode_length_ends_with_save(tmp_path):
     # 5 frames at fps=100: the bound trips within the first fresh window.
     plan = arm_plan()
@@ -656,12 +649,12 @@ def recorder_on_a_still_clock(tmp_path, sink):
 def test_a_cancel_saves_the_episode_and_ends_the_goal_cancelled(tmp_path, cause, reason):
     sink = FakeSink(fps=100)
     recorder = recorder_on_a_still_clock(tmp_path, sink)
-    ctx = StopAtFrame(2, lambda ctx: ctx.request_cancel(cause))
+    ctx = StopAtFrame(recording.MIN_EPISODE_FRAMES, lambda ctx: ctx.request_cancel(cause))
 
     asyncio.run(recorder._record(ctx, FakeToken()))
     # The episode saved: the goal ends cancelled with its result, for the
     # reason of the cause of the cancel.
-    assert ctx.ending() == ("cancelled", reason, 0, 2, 0)
+    assert ctx.ending() == ("cancelled", reason, 0, recording.MIN_EPISODE_FRAMES, 0)
     assert sink.saves == 1
 
 
@@ -669,17 +662,23 @@ def test_a_shutdown_saves_the_episode_and_ends_the_goal_cancelled(tmp_path):
     sink = FakeSink(fps=100)
     recorder = recorder_on_a_still_clock(tmp_path, sink)
     token = FakeToken()
-    ctx = StopAtFrame(2, lambda _ctx: token._event.set())
+    ctx = StopAtFrame(recording.MIN_EPISODE_FRAMES, lambda _ctx: token._event.set())
 
     async def run():
         await recorder._record(ctx, token)
 
     asyncio.run(run())
-    assert ctx.ending() == ("cancelled", "recorder shutting down", 0, 2, 0)
+    assert ctx.ending() == (
+        "cancelled",
+        "recorder shutting down",
+        0,
+        recording.MIN_EPISODE_FRAMES,
+        0,
+    )
     assert sink.saves == 1
 
 
-def test_a_cancel_before_two_frames_fails_the_goal_with_nothing_saved(tmp_path):
+def test_a_cancel_before_any_frame_fails_the_goal_with_nothing_saved(tmp_path):
     sink = FakeSink(fps=100)
     recorder = recorder_on_a_still_clock(tmp_path, sink)
 
@@ -690,11 +689,27 @@ def test_a_cancel_before_two_frames_fails_the_goal_with_nothing_saved(tmp_path):
         assert ctx.ending() == (
             "failed",
             ATTEMPT_FAILED,
-            "too short to save: 0 frame(s), need 2 (cancelled by its caller)",
+            "too short to save: 0 frame(s), need 3 (cancelled by its caller)",
         )
         assert sink.saves == 0
 
     asyncio.run(run())
+
+
+def test_a_two_frame_episode_fails_and_is_discarded(tmp_path):
+    # The library's depth encoder writes a two-frame video that the mp4 muxer
+    # refuses to append a later episode to.
+    sink = FakeSink(fps=100)
+    recorder = recorder_on_a_still_clock(tmp_path, sink)
+    ctx = StopAtFrame(2, lambda ctx: ctx.request_cancel())
+
+    asyncio.run(recorder._record(ctx, FakeToken()))
+    assert ctx.ending() == (
+        "failed",
+        ATTEMPT_FAILED,
+        "too short to save: 2 frame(s), need 3 (cancelled by its caller)",
+    )
+    assert (sink.saves, sink.discards) == (0, 1)
 
 
 def test_create_failure_fails_a_cancelled_goal(tmp_path):

@@ -44,8 +44,13 @@ MAX_SCHEDULE_LAG_S = 1.0
 # episode stats on two sides of a two-sample fork (compute_stats.py, `if
 # reshaped.shape[0] < 2`) whose branches disagree on dtype for the integer
 # columns, so a one-frame episode writes a schema every later episode is
-# rejected against, wedging the session.
-MIN_EPISODE_FRAMES = 2
+# rejected against, wedging the session. Its depth encoder (HEVC) gives every
+# video of three frames or more a two-frame decode delay, and a two-frame video
+# either fails its own save (the muxer's "pts/dts pair unsupported") or saves
+# without the delay; the next episode appended to that video file then starts
+# at or before its last timestamp, and the muxer refuses every later save into
+# the file.
+MIN_EPISODE_FRAMES = 3
 
 
 @dataclass(frozen=True)
