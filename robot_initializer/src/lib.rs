@@ -11,7 +11,8 @@
 //!
 //! Every robot says who it is as well: the name it stands under, the model
 //! it is and the core node hosting it, which is the name it joins a scene
-//! under.
+//! under. And it gives its guide: the park pose of each arm that its
+//! launcher wrote one for.
 
 #![forbid(unsafe_code)]
 
@@ -20,10 +21,12 @@ use std::time::Duration;
 
 use peppygen::{NodeRunner, Parameters, Result};
 
+mod guide;
 mod identity;
 mod join;
 mod readiness;
 
+use guide::Guide;
 use identity::Identity;
 use join::Joined;
 pub use join::{HostClock, Moment, StandClock};
@@ -59,7 +62,9 @@ pub async fn setup_with_clock<C: StandClock>(
     clock: impl FnOnce(Duration) -> C + Send,
 ) -> Result<()> {
     let identity = Identity::of(&runner, model_of(&params.model)?);
+    let guide = Guide::from_park_poses(&params.park_poses)?;
     identity::serve(identity.clone(), runner.clone());
+    guide::serve(guide, runner.clone());
     match join::scene(&identity, &params.placement, &runner, clock).await? {
         Joined::OwnHardware | Joined::Standing => readiness::serve(runner),
         // A node that is stopping serves no readiness.

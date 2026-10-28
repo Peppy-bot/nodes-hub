@@ -4,7 +4,7 @@
 
 | Component | What it does |
 |---|---|
-| [`robot_initializer`](../robot_initializer) | the node every robot uses: joins a simulation as this robot's model, answers who the robot is on `get_identity`, and aggregates per-limb readiness into `is_ready` |
+| [`robot_initializer`](../robot_initializer) | the node every robot uses: joins a simulation as this robot's model, answers who the robot is on `get_identity` and the park pose of each arm on `get_guide`, and aggregates per-limb readiness into `is_ready` |
 | [`openarm_arm`](./arm) | drives one arm side (7 joints) |
 | [`openarm_gripper`](./gripper) | drives one gripper side (v1.0 prismatic or v2.0 pinch, by `hardware_version`) |
 | [`sim_mujoco`](../sim_mujoco) | MuJoCo simulation: stands any number of robots, of any model it carries, in one composed scene |

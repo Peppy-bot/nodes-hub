@@ -98,6 +98,27 @@ entry a simulation lists for this robot carries the same `robot`. The answer
 is fixed when the node starts and is served from then on, before the robot
 joins a scene and whether or not it is ready.
 
+## The robot's guide
+
+The node exposes `get_guide` of the `robot_guide` contract: the park pose of
+each arm that the robot's launcher wrote one for. The park poses belong to the
+robot's model, so the launcher writes them beside `model`, and a caller that
+drives robots of many models, such as a chat agent, asks each robot. The node
+keeps no fact about any model.
+
+A node parameter is a primitive or a group, so the launcher writes the park
+poses in one string, `park_poses`: an entry `<arm>:<joint>,<joint>,...` for
+each arm that has a park pose, its joints in radians in the arm's joint order,
+and `;` between entries, for example
+`"left_arm:0.0584,-0.4923,-1.0367,1.7119,-0.4582,-0.1219,-1.1645"`.
+
+`park_poses` defaults to empty, and the guide of a robot whose launcher wrote
+none answers empty arrays. The node reads it when it starts and refuses to
+start on a value it cannot read: an entry with no arm or no joint, a joint
+that is not a finite number, an arm named twice. The refusal names the entry.
+The answer is fixed from then on and served whether or not the robot is
+ready.
+
 ## Build
 
 ```sh

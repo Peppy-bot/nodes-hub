@@ -10,7 +10,9 @@
 //
 // It also says who the robot is: get_identity answers the name the robot
 // stands under, the model it is and the core node hosting it, for as long as
-// the node runs.
+// the node runs. And it gives the robot's guide: get_guide answers the park
+// poses the launcher wrote for the robot's model, so the facts of a model
+// live with the robot and no caller keeps a list of models.
 //
 // In a simulation it also joins the scene: it attaches as this robot, naming
 // the copy it runs as, the model to stand and where, and holds that goal for
@@ -25,6 +27,7 @@
     implements: [
       { name: "robot_ready", tag: "v1", link_id: "robot_ready" },
       { name: "robot_identity", tag: "v1", link_id: "robot_identity" },
+      { name: "robot_guide", tag: "v1", link_id: "robot_guide" },
     ],
     depends_on: {
       contracts: [
@@ -43,6 +46,7 @@
       exposes: [
         { link_id: "robot_ready", name: "is_ready" },
         { link_id: "robot_identity", name: "get_identity" },
+        { link_id: "robot_guide", name: "get_guide" },
       ],
       consumes: [
         { link_id: "limbs", name: "is_ready" },
@@ -74,6 +78,12 @@
       // model it does not stand, naming the ones it does; on a robot that
       // drives its own hardware the model is identity only.
       model: "string",
+      // The park pose of each arm that has one, as the robot's launcher
+      // measured it for the model: `<arm>:<joint>,<joint>,...`, the arm's
+      // joints in radians in its joint order, and `;` between arms, for
+      // example "left_arm:0.06,-0.49,-1.04,1.71,-0.46,-0.12,-1.16". get_guide
+      // answers them. Empty gives no arm a park pose.
+      park_poses: { $type: "string", $default: "" },
       // Where the robot stands. `auto` lets the engine park it on a free spot
       // of its own, which is what a fleet of robots wants; turn it off to
       // stand this robot at x, y, z (metres) turned yaw (radians) about the

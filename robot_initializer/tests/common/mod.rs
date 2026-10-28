@@ -33,6 +33,7 @@ pub const LIMBS: usize = 4;
 pub fn parameters(model: &str) -> Parameters {
     Parameters {
         model: model.into(),
+        park_poses: String::new(),
         placement: Placement {
             auto: true,
             x: 0.0,
