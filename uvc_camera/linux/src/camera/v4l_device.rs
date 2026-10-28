@@ -19,28 +19,15 @@ use v4l::prelude::*;
 use v4l::video::Capture as _;
 use v4l::{Format, FourCC};
 
-use crate::camera::controls::{
-    CameraControlRequest, ControlFailure, ControlResult, ExposureMode, VALUE_UNAVAILABLE,
-    WhiteBalanceMode,
+use camera_core::controls::{AutoManualMode, ControlFailure, VALUE_UNAVAILABLE};
+use camera_core::encoding::ColorEncoding;
+use camera_core::v4l2::{
+    CID_AUTO_WHITE_BALANCE, CID_BRIGHTNESS, CID_CONTRAST, CID_EXPOSURE_ABSOLUTE, CID_EXPOSURE_AUTO,
+    CID_GAIN, CID_WHITE_BALANCE_TEMPERATURE, EXPOSURE_AUTO, EXPOSURE_MANUAL,
 };
-use crate::types::{CameraConfig, Encoding, Error, Frame, Result};
 
-/// Control ids from `<linux/v4l2-controls.h>`. Written out rather than
-/// generated: they are stable kernel ABI, and seven constants do not justify a
-/// libclang build dependency. Pinned by `cids_match_the_kernel_abi`.
-const V4L2_CID_BASE: u32 = 0x0098_0900;
-const V4L2_CID_BRIGHTNESS: u32 = V4L2_CID_BASE;
-const V4L2_CID_CONTRAST: u32 = V4L2_CID_BASE + 1;
-const V4L2_CID_AUTO_WHITE_BALANCE: u32 = V4L2_CID_BASE + 12;
-const V4L2_CID_GAIN: u32 = V4L2_CID_BASE + 19;
-const V4L2_CID_WHITE_BALANCE_TEMPERATURE: u32 = V4L2_CID_BASE + 26;
-const V4L2_CID_CAMERA_CLASS_BASE: u32 = 0x009a_0900;
-const V4L2_CID_EXPOSURE_AUTO: u32 = V4L2_CID_CAMERA_CLASS_BASE + 1;
-const V4L2_CID_EXPOSURE_ABSOLUTE: u32 = V4L2_CID_CAMERA_CLASS_BASE + 2;
-
-/// `V4L2_EXPOSURE_AUTO` / `V4L2_EXPOSURE_MANUAL` from `enum v4l2_exposure_auto_type`.
-const V4L2_EXPOSURE_AUTO_VALUE: i64 = 0;
-const V4L2_EXPOSURE_MANUAL_VALUE: i64 = 1;
+use crate::camera::controls::{CameraControlRequest, ControlResult};
+use crate::types::{CameraConfig, Error, Frame, Result};
 
 /// Buffers in the mmap queue: deep enough to ride out a scheduling hiccup,
 /// shallow enough that a late dequeue does not hand back a stale frame.
@@ -59,11 +46,9 @@ const OVERFLOW_GID: u32 = 65534;
 /// runtime (the loopback integration tests) can use the wall clock directly.
 pub type TimestampSource = fn() -> Result<SystemTime>;
 
-/// Timestamp from this instance's bound clock: the OS clock under wall time,
-/// the domain's instant under a clock domain. Requires
-/// `peppygen::clock::init` to have run, which setup does before the capture
-/// loop spawns.
-pub fn clock_timestamp() -> Result<SystemTime> {
+/// Now on this instance's bound clock: the timeline its messages are
+/// stamped and aged on. Errors until the clock delivers its first tick.
+pub fn clock_now() -> Result<SystemTime> {
     let ns =
         peppygen::clock::now_ns().map_err(|e| Error::Other(format!("clock not ready: {e}")))?;
     Ok(UNIX_EPOCH + Duration::from_nanos(ns))
@@ -76,7 +61,7 @@ pub fn wall_timestamp() -> Result<SystemTime> {
 
 /// The format the driver actually accepted, which may differ from the request.
 struct Negotiated {
-    encoding: Encoding,
+    encoding: ColorEncoding,
     width: u32,
     height: u32,
 }
@@ -111,17 +96,19 @@ impl ControlHandle {
         let device = self.device.as_ref();
         match request {
             CameraControlRequest::SetBrightness { value } => {
-                set_integer_control(device, V4L2_CID_BRIGHTNESS, "brightness", *value)
+                set_integer_control(device, CID_BRIGHTNESS, "brightness", *value)
             }
             CameraControlRequest::SetContrast { value } => {
-                set_integer_control(device, V4L2_CID_CONTRAST, "contrast", *value)
+                set_integer_control(device, CID_CONTRAST, "contrast", *value)
             }
             CameraControlRequest::SetGain { value } => {
-                set_integer_control(device, V4L2_CID_GAIN, "gain", *value)
+                set_integer_control(device, CID_GAIN, "gain", *value)
             }
-            CameraControlRequest::SetExposure { mode, value } => set_exposure(device, mode, *value),
+            CameraControlRequest::SetExposure { mode, value } => {
+                set_auto_manual(device, &EXPOSURE, *mode, *value)
+            }
             CameraControlRequest::SetWhiteBalance { mode, temperature } => {
-                set_white_balance(device, mode, *temperature)
+                set_auto_manual(device, &WHITE_BALANCE, *mode, *temperature)
             }
         }
     }
@@ -220,7 +207,7 @@ impl CameraDevice {
         // A yuyv topic encoding is passthrough-only, so a driver that negotiated
         // anything else would fail every single frame downstream. Refuse here
         // instead of streaming into a loop that can never publish.
-        if config.topic_encoding == Encoding::Yuyv && encoding != Encoding::Yuyv {
+        if config.topic_encoding == ColorEncoding::Yuyv && encoding != ColorEncoding::Yuyv {
             return Err(Error::Camera(format!(
                 "topic_encoding yuyv requires a yuyv camera stream, but {path} negotiated \
                  {encoding}; set camera_encoding to yuyv on a camera that supports it, or pick \
@@ -395,50 +382,59 @@ fn set_integer_control(device: &Device, cid: u32, name: &str, value: i32) -> Con
     Ok(read_control(device, cid).unwrap_or(value))
 }
 
-/// Set exposure mode and, in manual mode, the absolute exposure value.
-fn set_exposure(device: &Device, mode: &ExposureMode, value: i32) -> ControlResult {
-    let auto_value = match mode {
-        ExposureMode::Auto => V4L2_EXPOSURE_AUTO_VALUE,
-        ExposureMode::Manual => V4L2_EXPOSURE_MANUAL_VALUE,
-    };
-    write_control(device, V4L2_CID_EXPOSURE_AUTO, "exposure mode", auto_value)?;
-
-    match mode {
-        ExposureMode::Auto => Ok(VALUE_UNAVAILABLE),
-        ExposureMode::Manual => {
-            // Absolute exposure is in 100us units for V4L2.
-            write_control(
-                device,
-                V4L2_CID_EXPOSURE_ABSOLUTE,
-                "exposure value (the mode is manual)",
-                i64::from(value),
-            )?;
-            Ok(read_control(device, V4L2_CID_EXPOSURE_ABSOLUTE).unwrap_or(value))
-        }
-    }
+/// A control that runs on its own or at a setpoint: the control that switches
+/// its mode, with its value in each mode, and the control that holds the
+/// setpoint. Each name says which control in a failure.
+struct AutoManualControl {
+    mode_cid: u32,
+    mode_name: &'static str,
+    auto_value: i64,
+    manual_value: i64,
+    setpoint_cid: u32,
+    setpoint_name: &'static str,
 }
 
-/// Set white balance mode and, in manual mode, the colour temperature.
-fn set_white_balance(device: &Device, mode: &WhiteBalanceMode, temperature: i32) -> ControlResult {
-    let auto = i64::from(matches!(mode, WhiteBalanceMode::Auto));
-    write_control(
-        device,
-        V4L2_CID_AUTO_WHITE_BALANCE,
-        "white balance mode",
-        auto,
-    )?;
+/// Exposure, whose setpoint is the absolute exposure in 100 us units.
+const EXPOSURE: AutoManualControl = AutoManualControl {
+    mode_cid: CID_EXPOSURE_AUTO,
+    mode_name: "exposure mode",
+    auto_value: EXPOSURE_AUTO,
+    manual_value: EXPOSURE_MANUAL,
+    setpoint_cid: CID_EXPOSURE_ABSOLUTE,
+    setpoint_name: "exposure value (the mode is manual)",
+};
 
+/// White balance, whose mode control is a boolean and whose setpoint is the
+/// colour temperature.
+const WHITE_BALANCE: AutoManualControl = AutoManualControl {
+    mode_cid: CID_AUTO_WHITE_BALANCE,
+    mode_name: "white balance mode",
+    auto_value: 1,
+    manual_value: 0,
+    setpoint_cid: CID_WHITE_BALANCE_TEMPERATURE,
+    setpoint_name: "white balance temperature (the mode is manual)",
+};
+
+/// Set `control`'s mode and, in manual mode, its setpoint.
+fn set_auto_manual(
+    device: &Device,
+    control: &AutoManualControl,
+    mode: AutoManualMode,
+    setpoint: i32,
+) -> ControlResult {
+    let mode_value = match mode {
+        AutoManualMode::Auto => control.auto_value,
+        AutoManualMode::Manual => control.manual_value,
+    };
+    write_control(device, control.mode_cid, control.mode_name, mode_value)?;
     match mode {
-        WhiteBalanceMode::Auto => Ok(VALUE_UNAVAILABLE),
-        WhiteBalanceMode::Manual => {
-            write_control(
-                device,
-                V4L2_CID_WHITE_BALANCE_TEMPERATURE,
-                "white balance temperature (the mode is manual)",
-                i64::from(temperature),
-            )?;
-            Ok(read_control(device, V4L2_CID_WHITE_BALANCE_TEMPERATURE).unwrap_or(temperature))
-        }
+        AutoManualMode::Auto => Ok(VALUE_UNAVAILABLE),
+        AutoManualMode::Manual => set_integer_control(
+            device,
+            control.setpoint_cid,
+            control.setpoint_name,
+            setpoint,
+        ),
     }
 }
 
@@ -454,7 +450,12 @@ fn write_control(
             id: cid,
             value: Value::Integer(value),
         })
-        .map_err(|error| ControlFailure::of_write(name, &error))
+        .map_err(|error| refused_write(name, &error))
+}
+
+/// The failure of a write of `name` that the driver refused with `error`.
+fn refused_write(name: &str, error: &std::io::Error) -> ControlFailure {
+    ControlFailure::of_refused_write(error, format!("Failed to set {name}: {error}"))
 }
 
 fn read_control(device: &Device, cid: u32) -> Option<i32> {
@@ -465,24 +466,24 @@ fn read_control(device: &Device, cid: u32) -> Option<i32> {
     }
 }
 
-/// The pixel format to request for an [`Encoding`].
-fn fourcc_for(encoding: Encoding) -> FourCC {
+/// The pixel format to request for a [`ColorEncoding`].
+fn fourcc_for(encoding: ColorEncoding) -> FourCC {
     match encoding {
-        Encoding::Rgb8 => FourCC::new(b"RGB3"),
-        Encoding::Bgr8 => FourCC::new(b"BGR3"),
-        Encoding::Mjpeg => FourCC::new(b"MJPG"),
-        Encoding::Yuyv => FourCC::new(b"YUYV"),
+        ColorEncoding::Rgb8 => FourCC::new(b"RGB3"),
+        ColorEncoding::Bgr8 => FourCC::new(b"BGR3"),
+        ColorEncoding::Mjpeg => FourCC::new(b"MJPG"),
+        ColorEncoding::Yuyv => FourCC::new(b"YUYV"),
     }
 }
 
-/// The [`Encoding`] a negotiated pixel format corresponds to, if this node can
-/// decode it.
-fn encoding_for(fourcc: FourCC) -> Option<Encoding> {
+/// The [`ColorEncoding`] a negotiated pixel format corresponds to, if this node
+/// can decode it.
+fn encoding_for(fourcc: FourCC) -> Option<ColorEncoding> {
     match &fourcc.repr {
-        b"RGB3" => Some(Encoding::Rgb8),
-        b"BGR3" => Some(Encoding::Bgr8),
-        b"MJPG" | b"JPEG" => Some(Encoding::Mjpeg),
-        b"YUYV" => Some(Encoding::Yuyv),
+        b"RGB3" => Some(ColorEncoding::Rgb8),
+        b"BGR3" => Some(ColorEncoding::Bgr8),
+        b"MJPG" | b"JPEG" => Some(ColorEncoding::Mjpeg),
+        b"YUYV" => Some(ColorEncoding::Yuyv),
         _ => None,
     }
 }
@@ -506,26 +507,20 @@ mod tests {
     }
 
     #[test]
-    fn cids_match_the_kernel_abi() {
-        // Values from <linux/v4l2-controls.h>, checked against the generated
-        // v4l2-sys bindings before that dependency was dropped.
-        assert_eq!(V4L2_CID_BRIGHTNESS, 0x0098_0900);
-        assert_eq!(V4L2_CID_CONTRAST, 0x0098_0901);
-        assert_eq!(V4L2_CID_AUTO_WHITE_BALANCE, 0x0098_090c);
-        assert_eq!(V4L2_CID_GAIN, 0x0098_0913);
-        assert_eq!(V4L2_CID_WHITE_BALANCE_TEMPERATURE, 0x0098_091a);
-        assert_eq!(V4L2_CID_EXPOSURE_AUTO, 0x009a_0901);
-        assert_eq!(V4L2_CID_EXPOSURE_ABSOLUTE, 0x009a_0902);
+    fn a_refused_write_names_the_control_and_the_cause() {
+        let error = std::io::Error::other("value out of range");
+        let failure = refused_write("contrast", &error);
+        assert!(failure.message.contains("contrast"), "{}", failure.message);
+        assert!(
+            failure.message.contains(&error.to_string()),
+            "{}",
+            failure.message
+        );
     }
 
     #[test]
     fn every_encoding_round_trips_through_its_fourcc() {
-        for encoding in [
-            Encoding::Rgb8,
-            Encoding::Bgr8,
-            Encoding::Mjpeg,
-            Encoding::Yuyv,
-        ] {
+        for encoding in ColorEncoding::ALL {
             assert_eq!(
                 encoding_for(fourcc_for(encoding)),
                 Some(encoding),

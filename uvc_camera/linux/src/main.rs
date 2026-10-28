@@ -11,7 +11,7 @@ use uvc_camera_linux::services::{
     listen_for_set_exposure_requests, listen_for_set_gain_requests,
     listen_for_set_white_balance_requests, listen_for_video_stream_info_requests,
 };
-use uvc_camera_linux::types::{CameraConfigBuilder, Encoding};
+use uvc_camera_linux::types::CameraConfig;
 
 fn main() -> Result<()> {
     // INFO by default, but honour RUST_LOG so the device-open path's debug
@@ -34,52 +34,20 @@ fn main() -> Result<()> {
 
     NodeBuilder::new().standalone(standalone_config).run(
         move |args: Parameters, node_runner| async move {
-            let video_params = args.video.clone();
-            let device_path = args.device_path.clone();
-
+            let video = &args.video;
             tracing::info!(
-                "device {device_path}: {}x{} @ {} fps, camera_encoding {}, topic_encoding {}",
-                video_params.resolution.width,
-                video_params.resolution.height,
-                video_params.frame_rate,
-                video_params.camera_encoding,
-                video_params.topic_encoding
+                "device {}: {}x{} @ {} fps, camera_encoding {}, topic_encoding {}",
+                args.device_path,
+                video.resolution.width,
+                video.resolution.height,
+                video.frame_rate,
+                video.camera_encoding,
+                video.topic_encoding
             );
 
-            // Parse encodings up front: an unusable value is a misconfiguration
-            // that should fail the node, not surface later as a frame error.
-            let camera_encoding =
-                video_params
-                    .camera_encoding
-                    .parse::<Encoding>()
-                    .map_err(|e| {
-                        std::io::Error::other(format!(
-                            "Invalid camera_encoding '{}': {e}",
-                            video_params.camera_encoding
-                        ))
-                    })?;
-            let topic_encoding = video_params
-                .topic_encoding
-                .parse::<Encoding>()
-                .map_err(|e| {
-                    std::io::Error::other(format!(
-                        "Invalid topic_encoding '{}': {e}",
-                        video_params.topic_encoding
-                    ))
-                })?;
-
-            // Create camera configuration
-            let camera_config = CameraConfigBuilder::new()
-                .device_path(device_path.clone())
-                .resolution(
-                    video_params.resolution.width,
-                    video_params.resolution.height,
-                )
-                .frame_rate(video_params.frame_rate)
-                .camera_encoding(camera_encoding)
-                .topic_encoding(topic_encoding)
-                .build()
-                .map_err(std::io::Error::other)?;
+            // An unusable parameter is a misconfiguration that fails the node
+            // here, not later as a frame error.
+            let camera_config = CameraConfig::from_parameters(&args)?;
 
             // The clock stamping every frame: the OS clock under wall time,
             // the domain's instant under a clock domain. Must be ready before
@@ -109,44 +77,34 @@ fn main() -> Result<()> {
                 .map_err(std::io::Error::other)?;
             let controls = readout.controls;
 
-            // Services come up only once the loop is draining controls. Exposing
-            // them earlier lets a control enqueue against a camera that is still
-            // opening: the caller times out after two seconds and is told the
-            // write failed, then the loop starts and applies it anyway.
-            let info_runner = Arc::clone(&node_runner);
-            let stream = readout.description;
-            tokio::spawn(async move {
-                listen_for_video_stream_info_requests(info_runner, stream, topic_encoding).await;
-            });
-
-            let exposure_runner = Arc::clone(&node_runner);
-            let exposure_controls = controls.clone();
-            tokio::spawn(async move {
-                listen_for_set_exposure_requests(exposure_runner, exposure_controls).await;
-            });
-
-            let wb_runner = Arc::clone(&node_runner);
-            let wb_controls = controls.clone();
-            tokio::spawn(async move {
-                listen_for_set_white_balance_requests(wb_runner, wb_controls).await;
-            });
-
-            let gain_runner = Arc::clone(&node_runner);
-            let gain_controls = controls.clone();
-            tokio::spawn(async move {
-                listen_for_set_gain_requests(gain_runner, gain_controls).await;
-            });
-
-            let brightness_runner = Arc::clone(&node_runner);
-            let brightness_controls = controls.clone();
-            tokio::spawn(async move {
-                listen_for_set_brightness_requests(brightness_runner, brightness_controls).await;
-            });
-
-            let contrast_runner = Arc::clone(&node_runner);
-            tokio::spawn(async move {
-                listen_for_set_contrast_requests(contrast_runner, controls).await;
-            });
+            // Services come up only once the camera is streaming, so every
+            // control applies to an open device and the stream description is
+            // the negotiated one.
+            tokio::spawn(listen_for_video_stream_info_requests(
+                Arc::clone(&node_runner),
+                readout.description,
+                topic_encoding,
+            ));
+            tokio::spawn(listen_for_set_exposure_requests(
+                Arc::clone(&node_runner),
+                controls.clone(),
+            ));
+            tokio::spawn(listen_for_set_white_balance_requests(
+                Arc::clone(&node_runner),
+                controls.clone(),
+            ));
+            tokio::spawn(listen_for_set_gain_requests(
+                Arc::clone(&node_runner),
+                controls.clone(),
+            ));
+            tokio::spawn(listen_for_set_brightness_requests(
+                Arc::clone(&node_runner),
+                controls.clone(),
+            ));
+            tokio::spawn(listen_for_set_contrast_requests(
+                Arc::clone(&node_runner),
+                controls,
+            ));
 
             // camera_geometry: a UVC device carries no calibration, so each
             // member gives an error reply with `rejected`.

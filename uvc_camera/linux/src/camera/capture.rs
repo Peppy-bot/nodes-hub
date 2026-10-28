@@ -1,3 +1,4 @@
+use control_core::report_once::ReportOnce;
 use peppygen::emitted_topics::camera::video_stream::{self, MessageHeader};
 use peppylib::runtime::CancellationToken;
 use std::fmt;
@@ -5,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
-use crate::camera::v4l_device::{CameraDevice, ControlHandle, StreamDescription, clock_timestamp};
+use crate::camera::v4l_device::{CameraDevice, ControlHandle, StreamDescription, clock_now};
 use crate::pipeline;
 use crate::types::{CameraConfig, Error, FrameId, Result};
 
@@ -47,20 +48,21 @@ impl Drop for CancelOnExit {
 /// another's retry path.
 struct PublishWindow {
     last_publish: Instant,
-    episode_logged: bool,
+    /// The run of failed frames since the last publish; only its first warns.
+    failures: ReportOnce,
 }
 
 impl PublishWindow {
     fn new() -> Self {
         Self {
             last_publish: Instant::now(),
-            episode_logged: false,
+            failures: ReportOnce::default(),
         }
     }
 
     fn published(&mut self) {
         self.last_publish = Instant::now();
-        self.episode_logged = false;
+        self.failures.clear();
     }
 
     /// Record a failed frame and pause before the next attempt.
@@ -76,13 +78,12 @@ impl PublishWindow {
                 "nothing published for {stalled:?}; last failure: {context}: {error}"
             )));
         }
-        // Only the first failure of an episode warns; a wedged camera would
-        // otherwise emit hundreds of identical lines before the window closes.
-        if self.episode_logged {
-            tracing::debug!("{context}: {error}");
-        } else {
+        // Only the first failure of a run warns and the rest log at debug, so
+        // a wedged camera warns once before the window closes.
+        if self.failures.first_of_run() {
             tracing::warn!("{context}: {error}");
-            self.episode_logged = true;
+        } else {
+            tracing::debug!("{context}: {error}");
         }
         std::thread::sleep(FRAME_RETRY_DELAY);
         Ok(())
@@ -128,7 +129,7 @@ pub fn spawn_capture_loop(
     std::thread::spawn(move || {
         // The camera is dropped at the end of this closure either way, so by the
         // time `done_tx` fires the device is closed.
-        if let Some(camera) = open_camera(CameraDevice::new(clock_timestamp), &config, open_tx) {
+        if let Some(camera) = open_camera(CameraDevice::new(clock_now), &config, open_tx) {
             // Armed only once the camera is streaming. Arming it any earlier
             // would race the open report: setup selects over its own future and
             // the cancellation token, so a cancel landing alongside the failure

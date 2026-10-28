@@ -1,38 +1,37 @@
-use std::fmt;
-use std::str::FromStr;
+//! The colour encodings this node takes in its parameters.
 
-/// Video encoding format
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Encoding {
-    Rgb8,
-    Bgr8,
-    Mjpeg,
-    Yuyv,
+use camera_core::encoding::ColorEncoding;
+
+/// The encoding `name` spells in any case.
+pub(crate) fn parse_encoding(name: &str) -> Result<ColorEncoding, String> {
+    ColorEncoding::from_name(&name.to_lowercase()).ok_or_else(|| {
+        format!("Invalid encoding '{name}'. Supported encodings are: rgb8, bgr8, mjpeg, yuyv")
+    })
 }
 
-impl FromStr for Encoding {
-    type Err = String;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "rgb8" => Ok(Self::Rgb8),
-            "bgr8" => Ok(Self::Bgr8),
-            "mjpeg" => Ok(Self::Mjpeg),
-            "yuyv" => Ok(Self::Yuyv),
-            _ => Err(format!(
-                "Invalid encoding '{s}'. Supported encodings are: rgb8, bgr8, mjpeg, yuyv"
-            )),
+    #[test]
+    fn an_encoding_is_taken_in_any_case() {
+        for encoding in ColorEncoding::ALL {
+            assert_eq!(parse_encoding(encoding.name()), Ok(encoding));
+            assert_eq!(
+                parse_encoding(&encoding.name().to_uppercase()),
+                Ok(encoding)
+            );
         }
     }
-}
 
-impl fmt::Display for Encoding {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Rgb8 => write!(f, "rgb8"),
-            Self::Bgr8 => write!(f, "bgr8"),
-            Self::Mjpeg => write!(f, "mjpeg"),
-            Self::Yuyv => write!(f, "yuyv"),
-        }
+    #[test]
+    fn an_unknown_encoding_names_the_supported_ones() {
+        assert_eq!(
+            parse_encoding("z16"),
+            Err(
+                "Invalid encoding 'z16'. Supported encodings are: rgb8, bgr8, mjpeg, yuyv"
+                    .to_string()
+            )
+        );
     }
 }

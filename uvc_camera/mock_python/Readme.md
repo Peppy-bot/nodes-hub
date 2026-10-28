@@ -6,7 +6,7 @@ service. Use it to bring a consumer up without a camera or a sim engine.
 
 It is not a simulation. The footage has no relationship to any robot's pose, so
 anything that cares what the camera is looking at wants the sim engine's camera
-relay instead; see [../Readme.md](../Readme.md).
+relay instead; see [../README.md](../README.md).
 
 ## Running
 

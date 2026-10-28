@@ -1,18 +1,16 @@
+//! The rgb_camera services: the stream description and the camera controls,
+//! each applied to the open device.
+
 use peppygen::exposed_services::camera::{
     set_brightness, set_contrast, set_exposure, set_gain, set_white_balance, video_stream_info,
 };
 use std::sync::Arc;
 
-use crate::camera::controls::{
-    CameraControlRequest, ControlFailure, ControlFailureKind, ControlResult, ExposureMode,
-    WhiteBalanceMode,
-};
-use crate::camera::v4l_device::{ControlHandle, StreamDescription};
-use crate::types::Encoding;
+use camera_core::controls::ControlFailure;
+use camera_core::encoding::ColorEncoding;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Existing: video_stream_info
-// ─────────────────────────────────────────────────────────────────────────────
+use crate::camera::controls::{CameraControlRequest, ControlResult, parse_mode};
+use crate::camera::v4l_device::{ControlHandle, StreamDescription};
 
 /// Listen for and handle video stream info service requests.
 ///
@@ -22,30 +20,17 @@ use crate::types::Encoding;
 pub async fn listen_for_video_stream_info_requests(
     node_runner: Arc<peppygen::NodeRunner>,
     stream: StreamDescription,
-    topic_encoding: Encoding,
+    topic_encoding: ColorEncoding,
 ) {
-    let cancel_token = node_runner.cancellation_token().clone();
-    loop {
-        let result = tokio::select! {
-            _ = cancel_token.cancelled() => break,
-            result = video_stream_info::handle_next_request(&node_runner, |_request| {
-                Ok(video_stream_info::Response::new(
-                    stream.width,
-                    stream.height,
-                    stream.frames_per_second,
-                    topic_encoding.to_string(),
-                ))
-            }) => result,
-        };
-        if let Err(e) = result {
-            tracing::error!("video_stream_info service error: {e:?}");
-        }
-    }
+    serve_requests!(node_runner, video_stream_info, |_request| {
+        Ok(video_stream_info::Response::new(
+            stream.width,
+            stream.height,
+            stream.frames_per_second,
+            topic_encoding.to_string(),
+        ))
+    });
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Apply a control synchronously and report what actually happened.
 ///
@@ -55,21 +40,6 @@ pub async fn listen_for_video_stream_info_requests(
 /// hardware state is settled.
 fn send_control(controls: &ControlHandle, request: CameraControlRequest) -> ControlResult {
     tokio::task::block_in_place(|| controls.apply(&request))
-}
-
-/// The error reply of `$service` for a control that gave no value: the same
-/// kind, from the service's own kinds.
-macro_rules! control_failure {
-    ($service:ident, $failure:expr) => {{
-        let ControlFailure { kind, message } = $failure;
-        let kind = match kind {
-            ControlFailureKind::Rejected => $service::FailureKind::Rejected,
-            ControlFailureKind::PreconditionFailed => $service::FailureKind::PreconditionFailed,
-            ControlFailureKind::ResourceUnavailable => $service::FailureKind::ResourceUnavailable,
-            ControlFailureKind::AttemptFailed => $service::FailureKind::AttemptFailed,
-        };
-        $service::Failure::new(kind, message)
-    }};
 }
 
 /// Listen for and handle the requests of one camera control service.
@@ -82,27 +52,18 @@ macro_rules! listen_for_control_requests {
             let control_of: fn(
                 &$service::RequestData,
             ) -> Result<CameraControlRequest, ControlFailure> = $control;
-            let cancel_token = node_runner.cancellation_token().clone();
-            loop {
-                let result = tokio::select! {
-                    _ = cancel_token.cancelled() => break,
-                    result = $service::handle_next_request(&node_runner, |request| {
-                        control_of(&request.data)
-                            .and_then(|control| send_control(&controls, control))
-                            .map($service::Response::new)
-                            .map_err(|failure| control_failure!($service, failure))
-                    }) => result,
-                };
-                if let Err(e) = result {
-                    tracing::error!("{} service error: {e:?}", stringify!($service));
-                }
-            }
+            serve_requests!(node_runner, $service, |request| {
+                control_of(&request.data)
+                    .and_then(|control| send_control(&controls, control))
+                    .map($service::Response::new)
+                    .map_err(|failure| camera_core::control_failure!($service, failure))
+            });
         }
     };
 }
 
 listen_for_control_requests!(listen_for_set_exposure_requests, set_exposure, |data| {
-    let mode = ExposureMode::try_from(data.mode.as_str()).map_err(ControlFailure::rejected)?;
+    let mode = parse_mode(&data.mode, "exposure").map_err(ControlFailure::rejected)?;
     Ok(CameraControlRequest::SetExposure {
         mode,
         value: data.value,
@@ -113,8 +74,7 @@ listen_for_control_requests!(
     listen_for_set_white_balance_requests,
     set_white_balance,
     |data| {
-        let mode =
-            WhiteBalanceMode::try_from(data.mode.as_str()).map_err(ControlFailure::rejected)?;
+        let mode = parse_mode(&data.mode, "white balance").map_err(ControlFailure::rejected)?;
         Ok(CameraControlRequest::SetWhiteBalance {
             mode,
             temperature: data.temperature,
