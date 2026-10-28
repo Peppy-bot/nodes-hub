@@ -4,14 +4,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from lerobot_recorder.plan import (
-    CameraEntry,
-    LinkKind,
-    PairingEnd,
-    RecordingPlan,
-    SourceEntry,
-    SourceKey,
-)
+from lerobot_recorder.plan import LinkKind, SourceEntry
 from lerobot_recorder.recording import (
     GRIPPER_LAYOUT,
     MAX_EPISODE_S,
@@ -38,62 +31,19 @@ from lerobot_recorder.recording import (
     validate_depth_units,
     velocities_dim_names,
 )
+from tests.support import (
+    ARM0,
+    NOW_NS,
+    STALENESS_S,
+    action_entry,
+    gripper_entry,
+    joint_entry,
+    key,
+    make_plan,
+)
 
-NOW_NS = 1_000_000_000_000
-STALENESS_S = 0.25
-
-
-CORE = "cn"
-
-
-def key(instance_id: str, link_id: str = "link", peer: PairingEnd | None = None) -> SourceKey:
-    """A source on `CORE`, named directly unless a peer names its pair."""
-    return SourceKey(source=PairingEnd(CORE, instance_id, link_id), peer=peer)
-
-
-def joint_entry(i=0) -> SourceEntry:
-    return SourceEntry(key=key(f"arm{i}"), kind=LinkKind.JOINT, feature_key=f"arm{i}")
-
-
-def gripper_entry(i=0) -> SourceEntry:
-    return SourceEntry(key=key(f"grip{i}"), kind=LinkKind.GRIPPER, feature_key=f"grip{i}")
-
-
-# The commanded source of a limb sits on its own instance but records under
-# the limb's name, exactly as discovery pairs them.
-def action_entry(i=0) -> SourceEntry:
-    return SourceEntry(key=key(f"commanded_arm{i}"), kind=LinkKind.JOINT, feature_key=f"arm{i}")
-
-
-ARM0 = joint_entry().key
 GRIP0 = gripper_entry().key
 COMMANDED_ARM0 = action_entry().key
-
-
-def make_plan(state=None, action=(), color=0, rgbd=0) -> RecordingPlan:
-    state = (joint_entry(),) if state is None else state
-    color_entries = tuple(
-        CameraEntry(key=("core", f"cam{i}"), name=f"cam{i}") for i in range(color)
-    )
-    rgbd_entries = tuple(
-        CameraEntry(key=("core", f"rgbd{i}"), name=f"rgbd{i}") for i in range(rgbd)
-    )
-    # Discovery pairs a commanded source with the measured source of its own
-    # limb; here the shared feature key stands in for that binding order.
-    measured = {(s.feature_key, s.kind): s.key for s in state}
-    return RecordingPlan(
-        state=tuple(state),
-        action=tuple(action),
-        color_cameras=color_entries,
-        rgbd_cameras=rgbd_entries,
-        color_index={e.key: i for i, e in enumerate(color_entries)},
-        rgbd_index={e.key: i for i, e in enumerate(rgbd_entries)},
-        action_fallback={
-            a.key: measured[(a.feature_key, a.kind)]
-            for a in action
-            if (a.feature_key, a.kind) in measured
-        },
-    )
 
 
 def joints(n, timestamp_ns=NOW_NS, velocities=True, efforts=False) -> JointSample:
@@ -425,6 +375,20 @@ def test_decode_bgr8_swaps_channels():
     assert rgb[0, 0].tolist() == [30, 20, 10]
 
 
+@pytest.mark.parametrize("encoding", ["z16", "nv12"])
+def test_decode_color_names_an_unsupported_encoding(encoding):
+    frame = CameraFrame(encoding=encoding, width=1, height=1, data=bytes(3), timestamp_ns=NOW_NS)
+    with pytest.raises(ValueError, match=f"^unsupported color encoding '{encoding}'$"):
+        decode_color(frame)
+
+
+@pytest.mark.parametrize("encoding", ["rgb8", "nv12"])
+def test_decode_depth_names_an_unsupported_encoding(encoding):
+    frame = CameraFrame(encoding=encoding, width=1, height=1, data=bytes(2), timestamp_ns=NOW_NS)
+    with pytest.raises(ValueError, match=f"^unsupported depth encoding '{encoding}'$"):
+        decode_depth(frame, 0.001)
+
+
 def test_decode_depth_scales_to_meters():
     z16 = np.array([[1000, 2000]], dtype="<u2").tobytes()
     frame = CameraFrame(encoding="z16", width=2, height=1, data=z16, timestamp_ns=NOW_NS)
@@ -582,24 +546,3 @@ def test_the_minimum_frame_count_closes_the_librarys_stats_fork():
     assert min_dtype(MIN_EPISODE_FRAMES - 1) != min_dtype(MIN_EPISODE_FRAMES)
     # Every length the guard admits agrees with every other one.
     assert min_dtype(MIN_EPISODE_FRAMES) == min_dtype(MIN_EPISODE_FRAMES + 8)
-
-
-def make_params(**overrides):
-    """The generated Parameters dataclass carries no field defaults, so the
-    schema's defaulted fields are spelled out once here (same values the
-    manifest defaults to, except the test-sized disk floor). Suites with
-    different pacing override the fields they care about."""
-    from peppygen.parameters import Parameters
-
-    values = dict(
-        robot_type="bot",
-        fps=30,
-        storage_root="/tmp/unused",
-        s3_uri="",
-        image_writer_threads=1,
-        streaming_encoding=True,
-        max_staleness_s=0.5,
-        min_remaining_disk_bytes=1,
-    )
-    values.update(overrides)
-    return Parameters(**values)
