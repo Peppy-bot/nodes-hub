@@ -15,12 +15,12 @@ from peppygen import NodeRunner
 from peppygen.exposed_services.workspace import check_positions, describe_workspace
 from workspace_core_py import PointAnswer, PositionsAnswer, SurfaceAnswer
 
-from so101_backbone.failures import FailureKind
-from so101_backbone.workspace import ReachWorker, Refused, Workspace
+from so101_backbone.failures import FailureKind, Refusal
+from so101_backbone.workspace import ReachWorker, Workspace
 
 # The answers' perception_camera: the SO-101 has none. Its one camera, wrist,
 # rides the arm.
-NO_PERCEPTION_CAMERA = ""
+_NO_PERCEPTION_CAMERA = ""
 
 
 async def serve(node_runner: NodeRunner, worker: ReachWorker) -> None:
@@ -65,7 +65,7 @@ async def _answer(
     caller gets an answer and the service keeps serving."""
     try:
         return respond(await ask())
-    except Refused as e:
+    except Refusal as e:
         raise failure(e.kind, str(e)) from None
     except Exception as e:
         runtime.log(f"{service} failed unexpectedly: {e!r}")
@@ -74,7 +74,7 @@ async def _answer(
 
 def _described(answer: SurfaceAnswer) -> describe_workspace.Response:
     return describe_workspace.Response(
-        perception_camera=NO_PERCEPTION_CAMERA,
+        perception_camera=_NO_PERCEPTION_CAMERA,
         workable=answer.workable,
         area=answer.area,
         rectangle=_listed(answer.rectangle),
@@ -85,7 +85,7 @@ def _described(answer: SurfaceAnswer) -> describe_workspace.Response:
 
 def _checked(answer: PositionsAnswer) -> check_positions.Response:
     return check_positions.Response(
-        perception_camera=NO_PERCEPTION_CAMERA,
+        perception_camera=_NO_PERCEPTION_CAMERA,
         all_workable=answer.all_workable,
         results=[_result(point) for point in answer.points],
     )

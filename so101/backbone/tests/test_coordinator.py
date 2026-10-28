@@ -2,7 +2,7 @@ import math
 import time
 
 import pytest
-from conftest import MEASURED, WIDE_LIMITS, WIDE_REACH, gripper_step, make_config
+from conftest import MEASURED, gripper_step, make_coordinator
 from control_core_py.minimum_jerk import plan
 
 from so101_backbone.coordinator import (
@@ -11,7 +11,6 @@ from so101_backbone.coordinator import (
     GRIPPER_STILL_WINDOW_S,
     PUBLISH_FAILED,
     STALE_FOLLOWER_TIMEOUT_S,
-    Coordinator,
     PlanFailure,
     PostureEnd,
     StillRun,
@@ -22,10 +21,6 @@ from so101_backbone.failures import FailureKind
 from so101_backbone.params import UpstreamMode
 
 FAR_TARGET = (1.0, 1.1, 1.2, 1.3, 1.4)
-
-
-def make_coordinator(fake_kinematics, reach=WIDE_REACH, **config_overrides):
-    return Coordinator(make_config(**config_overrides), fake_kinematics, WIDE_LIMITS, reach)
 
 
 def adopt_gripper(c, target, settle_timeout_s=5.0):
@@ -58,7 +53,7 @@ def test_stream_without_measured_state_stays_silent(fake_kinematics):
 
 
 def test_leader_silence_goes_quiet_then_resumes_pass_through(fake_kinematics, monkeypatch):
-    monkeypatch.setattr("so101_backbone.coordinator.STALE_LEADER_TIMEOUT_S", 0.01)
+    monkeypatch.setattr("so101_backbone.coordinator.COMMAND_SILENCE_LIMIT_S", 0.01)
     c = make_coordinator(fake_kinematics)
     c.measured_joints.set(MEASURED)
     c.leader_joints.set(FAR_TARGET)

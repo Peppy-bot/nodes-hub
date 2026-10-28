@@ -1,6 +1,7 @@
 import pytest
+from control_core_py.runtime import SetpointError
 
-from so101_backbone.setpoints import SetpointError, parse_pose_setpoint
+from so101_backbone.wire import parse_pose_setpoint
 
 
 def test_pose_validated():

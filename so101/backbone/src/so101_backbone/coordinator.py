@@ -33,10 +33,12 @@ import asyncio
 import math
 import time
 from dataclasses import dataclass, field
+from typing import Generic, TypeVar
 from control_core_py.minimum_jerk import Profile
 from control_core_py.runtime import Latch
 from so101_description.limbs import ARM_LIMB, GRIPPER_LIMB
 from so101_description.limits import JointLimits
+from so101_description.staleness import COMMAND_SILENCE_LIMIT_S
 from so101_description.transforms import relative_rotation_rad
 
 from so101_backbone.failures import FailureKind
@@ -44,15 +46,6 @@ from so101_backbone.governor import EEGovernor, rate_step
 from so101_backbone.params import Config, UpstreamMode
 from so101_backbone.reach import ReachBall
 
-# The leader-stream deadman: samples that arrived longer ago than this are
-# not followed and silence resets the standing command.
-STALE_LEADER_TIMEOUT_S = 0.25
-# The wire-age gate every inbound stream passes, leader commands and
-# follower states alike: a sample stamped this far from now, past or future,
-# is a replayed backlog or a clock fault, not something current. Distinct
-# from the deadman above, which judges arrival recency rather than the
-# producer's stamp, even though both currently sit at a quarter second.
-STALE_WIRE_TIMEOUT_S = 0.25
 # Follower liveness: measured state older than this silences the wire and
 # fails active plans. Absolute rather than derived from this node's control
 # period, because the follower publishes state on its own independent rate;
@@ -82,7 +75,7 @@ PUBLISH_FAILED = PlanFailure(
 )
 
 
-class LatestValue:
+class _LatestValue:
     """Latest-wins holder with an arrival stamp, plus the producer's capture
     stamp and a clear().
 
@@ -283,17 +276,71 @@ class GripperPlan:
         return True
 
 
+Command = TypeVar("Command")
+Plan = TypeVar("Plan")
+
+
+@dataclass
+class _LimbChannel(Generic[Command, Plan]):
+    """What the coordinator holds for one limb between ticks: the command
+    the stream stands at, its plan, and its single-flight slot."""
+
+    # The command produced last, or None while the wire is silent.
+    commanded: Command | None = None
+    # The last command the follower actually received; anchors bind to
+    # delivered state, never to a step nobody executed.
+    delivered: Command | None = None
+    # The admitted plan that owns the limb.
+    plan: Plan | None = None
+    # Captured per tick so completion and publish failure bind to the plan
+    # the sample came from, not whatever is installed later.
+    tick_plan: Plan | None = None
+    completing: Plan | None = None
+    # Whether a goal holds the limb, from admission to release.
+    busy: bool = False
+    # The wire stamp to publish with this tick's setpoint: the leader's
+    # capture time for streamed samples, None (meaning now) for plans.
+    tick_stamp_s: float | None = None
+
+    def try_claim(self) -> bool:
+        """Claim the single-flight slot; False while a goal holds it."""
+        if self.busy:
+            return False
+        self.busy = True
+        return True
+
+    def reset_command(self) -> None:
+        """Forget the command and the delivered command: the next command
+        anchors on the measured position."""
+        self.commanded = None
+        self.delivered = None
+
+    def take_tick(self) -> tuple[Plan | None, Plan | None]:
+        """The plan this tick's command came from and the plan it completes,
+        both cleared, for reporting the command's fate."""
+        taken = (self.tick_plan, self.completing)
+        self.tick_plan = None
+        self.completing = None
+        return taken
+
+    def begin_tick(self) -> None:
+        """Clear what the last tick captured, before this tick computes."""
+        self.tick_plan = None
+        self.completing = None
+        self.tick_stamp_s = None
+
+
 class Coordinator:
     def __init__(self, config: Config, kinematics, limits: JointLimits, reach: ReachBall):
         self._config = config
         self._kinematics = kinematics
         self._limits = limits
         self._reach = reach
-        self.leader_joints = LatestValue()
-        self.leader_pose = LatestValue()
-        self.leader_gripper = LatestValue()
-        self.measured_joints = LatestValue()
-        self.measured_gripper = LatestValue()
+        self.leader_joints = _LatestValue()
+        self.leader_pose = _LatestValue()
+        self.leader_gripper = _LatestValue()
+        self.measured_joints = _LatestValue()
+        self.measured_gripper = _LatestValue()
 
         period_s = 1.0 / config.control_rate_hz
         self._governor = EEGovernor(
@@ -312,27 +359,8 @@ class Coordinator:
         self._pose_joint_tick_caps = tuple(
             v * period_s for v in config.max_joint_velocity_rad_s
         )
-        # The wire stamp to publish with this tick's setpoint: the leader's
-        # capture time for streamed samples, None (meaning now) for plans.
-        self.arm_tick_stamp_s: float | None = None
-        self.gripper_tick_stamp_s: float | None = None
-
-        self._commanded_arm: tuple[float, ...] | None = None
-        self._commanded_gripper: float | None = None
-        # The last command the follower actually received; anchors bind to
-        # delivered state, never to a step nobody executed.
-        self._delivered_arm: tuple[float, ...] | None = None
-        self._delivered_gripper: float | None = None
-        self._arm_plan: ArmPlan | None = None
-        self._gripper_plan: GripperPlan | None = None
-        # Captured per tick so completion and publish failure bind to the
-        # plan the sample came from, not whatever is installed later.
-        self._arm_tick_plan: ArmPlan | None = None
-        self._arm_completing: ArmPlan | None = None
-        self._gripper_tick_plan: GripperPlan | None = None
-        self._gripper_completing: GripperPlan | None = None
-        self._arm_busy = False
-        self._gripper_busy = False
+        self._arm = _LimbChannel[tuple[float, ...], ArmPlan]()
+        self._gripper = _LimbChannel[float, GripperPlan]()
         self._ik_failing = Latch()
         self._out_of_reach = Latch()
         # How many stops have run, and the message of the last one: a goal
@@ -347,41 +375,50 @@ class Coordinator:
         """Single-flight admission for the arm: a second arm goal is refused
         rather than queued, and streamed arm input is ignored while one runs.
         The gripper claims independently."""
-        if self._arm_busy:
-            return False
-        self._arm_busy = True
-        return True
+        return self._arm.try_claim()
 
     def try_claim_gripper(self) -> bool:
-        if self._gripper_busy:
-            return False
-        self._gripper_busy = True
-        return True
+        return self._gripper.try_claim()
 
     @property
     def arm_busy(self) -> bool:
         """Whether an arm goal holds the arm, from admission to release."""
-        return self._arm_busy
+        return self._arm.busy
+
+    @property
+    def arm_tick_stamp_s(self) -> float | None:
+        """The wire stamp to publish with this tick's arm setpoint."""
+        return self._arm.tick_stamp_s
+
+    @property
+    def gripper_tick_stamp_s(self) -> float | None:
+        """The wire stamp to publish with this tick's gripper setpoint."""
+        return self._gripper.tick_stamp_s
 
     def leader_streams_arm(self) -> bool:
         """True while a leader's arm command arrived within the deadman. Reads
         the arrival time, which goal boundaries do not clear, so a leader
         keeps the arm across them."""
-        return self._upstream_arm.set_within(STALE_LEADER_TIMEOUT_S)
+        return self._leader_arm.set_within(COMMAND_SILENCE_LIMIT_S)
 
     def leader_streams_gripper(self) -> bool:
         """Whether a leader's gripper command arrived within the deadman."""
-        return self.leader_gripper.set_within(STALE_LEADER_TIMEOUT_S)
+        return self.leader_gripper.set_within(COMMAND_SILENCE_LIMIT_S)
 
     # ------------------------------------------------------------------ anchors
 
-    @property
-    def follower_state_timeout_s(self) -> float:
-        """The liveness window measured state must beat."""
-        return STALE_FOLLOWER_TIMEOUT_S
+    def fresh_measured_joints(self) -> tuple[float, ...] | None:
+        """The joints the follower measured, or None once its state is older
+        than the follower liveness window."""
+        return self.measured_joints.fresh(STALE_FOLLOWER_TIMEOUT_S)
+
+    def fresh_measured_gripper(self) -> float | None:
+        """The opening the follower measured, or None once its state is older
+        than the follower liveness window."""
+        return self.measured_gripper.fresh(STALE_FOLLOWER_TIMEOUT_S)
 
     @property
-    def _upstream_arm(self) -> LatestValue:
+    def _leader_arm(self) -> _LatestValue:
         """The holder the configured mode drives the arm from: it owns both
         the streamed target and the capture stamp that rides downstream with
         it."""
@@ -393,21 +430,21 @@ class Coordinator:
         """Where arm motion continues from: the last delivered command for
         continuity, else the measured position. None without fresh follower
         state, whatever stands: a limb nobody can see must not be driven."""
-        measured = self.measured_joints.fresh(STALE_FOLLOWER_TIMEOUT_S)
+        measured = self.fresh_measured_joints()
         if measured is None:
             return None
-        return self._delivered_arm if self._delivered_arm is not None else measured
+        return self._arm.delivered if self._arm.delivered is not None else measured
 
     def gripper_anchor(self) -> float | None:
-        measured = self.measured_gripper.fresh(STALE_FOLLOWER_TIMEOUT_S)
+        measured = self.fresh_measured_gripper()
         if measured is None:
             return None
-        return self._delivered_gripper if self._delivered_gripper is not None else measured
+        return self._gripper.delivered if self._gripper.delivered is not None else measured
 
     @property
     def commanded_arm(self) -> tuple[float, ...] | None:
         """The joints commanded last, or None while the wire is silent."""
-        return self._commanded_arm
+        return self._arm.commanded
 
     # ------------------------------------------------------------------- plans
 
@@ -419,32 +456,32 @@ class Coordinator:
         ends, so the arm's leader holders are dropped here and again at
         release."""
         self._drop_arm_leader_input()
-        self._arm_plan = ArmPlan(profile=profile, settle=settle)
-        return self._arm_plan
+        self._arm.plan = ArmPlan(profile=profile, settle=settle)
+        return self._arm.plan
 
     def adopt_gripper_plan(
         self, target: float, settle_timeout_s: float, chase_base: float
     ) -> GripperPlan:
         self.leader_gripper.clear()
-        self._gripper_plan = GripperPlan(
+        self._gripper.plan = GripperPlan(
             target=target, settle_timeout_s=settle_timeout_s, chase_base=chase_base
         )
-        return self._gripper_plan
+        return self._gripper.plan
 
     def abort_arm_plan(self, plan: ArmPlan) -> None:
         """Cut the trajectory: the stream goes silent at the sample where it
         stood, so the follower keeps holding its last received setpoint."""
-        if self._arm_plan is plan:
+        if self._arm.plan is plan:
             plan.frozen = plan.last_sample(time.monotonic())
-            self._commanded_arm = plan.frozen
-            self._arm_plan = None
+            self._arm.commanded = plan.frozen
+            self._arm.plan = None
         plan.aborted = True
         plan.done.set()
 
     def abort_gripper_plan(self, plan: GripperPlan) -> None:
-        if self._gripper_plan is plan:
+        if self._gripper.plan is plan:
             plan.frozen = self._ramp_stands(plan)
-            self._gripper_plan = None
+            self._gripper.plan = None
         plan.aborted = True
         plan.done.set()
 
@@ -456,12 +493,12 @@ class Coordinator:
         self.stop_count += 1
         self.last_stop = message
         stopped = []
-        arm_plan = self._arm_plan
+        arm_plan = self._arm.plan
         if arm_plan is not None:
             arm_plan.stopped = message
             self.abort_arm_plan(arm_plan)
             stopped.append(ARM_LIMB)
-        gripper_plan = self._gripper_plan
+        gripper_plan = self._gripper.plan
         if gripper_plan is not None:
             gripper_plan.stopped = message
             self.abort_gripper_plan(gripper_plan)
@@ -475,26 +512,22 @@ class Coordinator:
         wall clock alone never declares a goal done. The delivered value is
         passed rather than re-read, so an abort landing during the publish
         cannot make the next step anchor on a sample nobody received."""
-        plan = self._arm_tick_plan
-        completing = self._arm_completing
-        self._arm_tick_plan = None
-        self._arm_completing = None
+        plan, completing = self._arm.take_tick()
         if not delivered:
             # Plan or stream alike: an undelivered command must not stand as
             # the next anchor; the governor must measure its step from what
             # the follower actually received.
-            self._commanded_arm = None
-            self._delivered_arm = None
+            self._arm.reset_command()
             if plan is None:
                 return
-            if self._arm_plan is plan:
-                self._arm_plan = None
+            if self._arm.plan is plan:
+                self._arm.plan = None
             plan.frozen = plan.last_sample(time.monotonic())
             plan.failed = PUBLISH_FAILED
             plan.done.set()
             return
         assert command is not None, "a delivered setpoint must name the value that went out"
-        self._delivered_arm = command
+        self._arm.delivered = command
         if plan is not None and completing is not None:
             completing.done.set()
 
@@ -503,24 +536,20 @@ class Coordinator:
         value that went out. An undelivered sample fails the plan it belonged
         to. A plan at its planned end completes on the delivery of that
         tick's target."""
-        plan = self._gripper_tick_plan
-        completing = self._gripper_completing
-        self._gripper_tick_plan = None
-        self._gripper_completing = None
+        plan, completing = self._gripper.take_tick()
         if not delivered:
-            frozen = self._commanded_gripper
-            self._commanded_gripper = None
-            self._delivered_gripper = None
+            frozen = self._gripper.commanded
+            self._gripper.reset_command()
             if plan is None:
                 return
-            if self._gripper_plan is plan:
-                self._gripper_plan = None
+            if self._gripper.plan is plan:
+                self._gripper.plan = None
             plan.frozen = frozen
             plan.failed = PUBLISH_FAILED
             plan.done.set()
             return
         assert command is not None, "a delivered setpoint must name the value that went out"
-        self._delivered_gripper = command
+        self._gripper.delivered = command
         if completing is not None:
             completing.done.set()
 
@@ -529,15 +558,13 @@ class Coordinator:
         state. The standing command resets too: the arm may have been
         displaced during the goal window, so the next stream must re-anchor
         on the measured position exactly like the silence path."""
-        self._arm_busy = False
-        self._commanded_arm = None
-        self._delivered_arm = None
+        self._arm.busy = False
+        self._arm.reset_command()
         self._drop_arm_leader_input()
 
     def release_gripper(self) -> None:
-        self._gripper_busy = False
-        self._commanded_gripper = None
-        self._delivered_gripper = None
+        self._gripper.busy = False
+        self._gripper.reset_command()
         self.leader_gripper.clear()
 
     def _drop_arm_leader_input(self) -> None:
@@ -546,22 +573,20 @@ class Coordinator:
 
     def _fail_arm_plan(self, plan: ArmPlan, failure: PlanFailure) -> None:
         plan.frozen = plan.last_sample(time.monotonic())
-        self._arm_plan = None
-        self._commanded_arm = None
-        self._delivered_arm = None
+        self._arm.plan = None
+        self._arm.reset_command()
         plan.failed = failure
         plan.done.set()
 
     def _ramp_stands(self, plan: GripperPlan) -> float:
         """Where the ramp of `plan` stands: the opening commanded last, or
         the chase base before its first tick."""
-        return self._commanded_gripper if self._commanded_gripper is not None else plan.chase_base
+        return self._gripper.commanded if self._gripper.commanded is not None else plan.chase_base
 
     def _fail_gripper_plan(self, plan: GripperPlan, failure: PlanFailure) -> None:
-        self._gripper_plan = None
+        self._gripper.plan = None
         plan.frozen = self._ramp_stands(plan)
-        self._commanded_gripper = None
-        self._delivered_gripper = None
+        self._gripper.reset_command()
         plan.failed = failure
         plan.done.set()
 
@@ -570,11 +595,9 @@ class Coordinator:
     def arm_tick(self, now: float) -> tuple[float, ...] | None:
         """The joint setpoint to publish this tick, or None for silence. The
         caller reports each returned setpoint's fate through arm_published."""
-        self._arm_tick_plan = None
-        self._arm_completing = None
-        self.arm_tick_stamp_s = None
-        measured = self.measured_joints.fresh(STALE_FOLLOWER_TIMEOUT_S)
-        plan = self._arm_plan
+        self._arm.begin_tick()
+        measured = self.fresh_measured_joints()
+        plan = self._arm.plan
         if plan is not None:
             if measured is None:
                 # A move in the dark can neither progress nor be verified.
@@ -583,13 +606,13 @@ class Coordinator:
             if plan.started_monotonic is None:
                 plan.started_monotonic = now
             t = now - plan.started_monotonic
-            self._commanded_arm = plan.profile.sample(t)
-            self._arm_tick_plan = plan
+            self._arm.commanded = plan.profile.sample(t)
+            self._arm.tick_plan = plan
             if plan.profile.done(t):
                 return self._end_arm_plan(plan, t, measured)
-            return self._commanded_arm
+            return self._arm.commanded
 
-        if self._arm_busy:
+        if self._arm.busy:
             # A goal is in flight (or just ended, until release runs):
             # streamed input stays ignored so an action never fights a live
             # teleop stream. Release resets the anchors.
@@ -599,13 +622,12 @@ class Coordinator:
         if desired is None or anchor is None:
             # Silence (leader or follower) resets the standing command; the
             # next input re-engages from measured under the governor.
-            self._commanded_arm = None
-            self._delivered_arm = None
+            self._arm.reset_command()
             return None
         # Within the EE caps the leader's value goes downstream as-is.
-        self._commanded_arm = self._governor.govern(anchor, desired)
-        self.arm_tick_stamp_s = self._upstream_arm.wire_timestamp_s
-        return self._commanded_arm
+        self._arm.commanded = self._governor.govern(anchor, desired)
+        self._arm.tick_stamp_s = self._leader_arm.wire_timestamp_s
+        return self._arm.commanded
 
     def _end_arm_plan(self, plan: ArmPlan, t_s: float, measured) -> tuple[float, ...] | None:
         """A tick at or after the planned end of `plan`, its end sample
@@ -617,16 +639,16 @@ class Coordinator:
         settle = plan.settle
         shortfall = settle.shortfall(measured, plan.profile.end, self._kinematics)
         if shortfall is None:
-            self._arm_plan = None
+            self._arm.plan = None
             # Streamed input that arrived mid-plan must not re-target the
             # arm on the very next tick; the leader re-engages fresh.
             self._drop_arm_leader_input()
-            self._arm_completing = plan
-            return self._commanded_arm
+            self._arm.completing = plan
+            return self._arm.commanded
         since_end_s = t_s - plan.profile.duration_s
         if since_end_s < settle.timeout_s:
-            return self._commanded_arm
-        self._arm_tick_plan = None
+            return self._arm.commanded
+        self._arm.tick_plan = None
         self._fail_arm_plan(
             plan,
             PlanFailure(
@@ -644,13 +666,11 @@ class Coordinator:
         target, and keeps commanding the target past it; it completes on the
         delivery of the tick that finds the jaws standing still, or of the
         tick its settle timeout runs out on."""
-        self._gripper_tick_plan = None
-        self._gripper_completing = None
-        self.gripper_tick_stamp_s = None
-        plan = self._gripper_plan
+        self._gripper.begin_tick()
+        plan = self._gripper.plan
         if plan is not None:
             anchor = self.gripper_anchor()
-            measured = self.measured_gripper.fresh(STALE_FOLLOWER_TIMEOUT_S)
+            measured = self.fresh_measured_gripper()
             if anchor is None or measured is None:
                 self._fail_gripper_plan(plan, FOLLOWER_SILENT)
                 return None
@@ -664,35 +684,32 @@ class Coordinator:
             if plan.planned_end is not None and plan.settles(
                 measured, fresh, now - plan.planned_end, now
             ):
-                self._gripper_plan = None
+                self._gripper.plan = None
                 # Streamed input that arrived mid-plan must not re-target the
                 # gripper once the goal releases it.
                 self.leader_gripper.clear()
                 plan.completed_on = measured
-                self._gripper_completing = plan
+                self._gripper.completing = plan
             # rate_step returns the target itself once within one tick's
             # cap, so the ramp lands by exact equality, never a snap past it.
-            self._commanded_gripper = rate_step(anchor, plan.target, self._gripper_tick_cap)
-            self._gripper_tick_plan = plan
-            return self._commanded_gripper
+            self._gripper.commanded = rate_step(anchor, plan.target, self._gripper_tick_cap)
+            self._gripper.tick_plan = plan
+            return self._gripper.commanded
 
-        if self._gripper_busy:
+        if self._gripper.busy:
             # See arm_tick: goals own the wire until release resets anchors.
             return None
-        desired = self.leader_gripper.fresh(STALE_LEADER_TIMEOUT_S)
-        if desired is None:
-            self._commanded_gripper = None
-            self._delivered_gripper = None
-            return None
+        desired = self.leader_gripper.fresh(COMMAND_SILENCE_LIMIT_S)
         anchor = self.gripper_anchor()
-        if anchor is None:
-            self._commanded_gripper = None
-            self._delivered_gripper = None
+        if desired is None or anchor is None:
+            # Silence (leader or follower) resets the standing command, as in
+            # arm_tick.
+            self._gripper.reset_command()
             return None
         # Within one tick's cap the leader's opening passes through exactly.
-        self._commanded_gripper = rate_step(anchor, desired, self._gripper_tick_cap)
-        self.gripper_tick_stamp_s = self.leader_gripper.wire_timestamp_s
-        return self._commanded_gripper
+        self._gripper.commanded = rate_step(anchor, desired, self._gripper_tick_cap)
+        self._gripper.tick_stamp_s = self.leader_gripper.wire_timestamp_s
+        return self._gripper.commanded
 
     def _streamed_arm_target(self, seed: tuple[float, ...] | None) -> tuple[float, ...] | None:
         """The streamed target, or None for silence. The pose path is best
@@ -700,7 +717,7 @@ class Coordinator:
         the bounded streaming solver, seeded on the anchor the caller
         already resolved, and its solution is limit-clamped and rate-stepped
         per joint from that anchor."""
-        streamed = self._upstream_arm.fresh(STALE_LEADER_TIMEOUT_S)
+        streamed = self._leader_arm.fresh(COMMAND_SILENCE_LIMIT_S)
         if self._config.upstream_mode is UpstreamMode.JOINTS:
             # Unclamped, like the reference teleop; the follower's servo
             # EPROM limits are the travel guard.
