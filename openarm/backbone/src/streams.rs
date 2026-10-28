@@ -15,28 +15,26 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use control_core::throttle::Throttle;
+use control_core::time::RECEIVE_ERROR_BACKOFF;
+use openarm_description::{ArmPair, Side};
 use peppygen::NodeRunner;
 use peppygen::consumed_topics::collision_ctrl::governor_control as collision_ctrl_governor_control;
 use peppygen::paired_topics::{
     leader_left_arm, leader_left_arm_pose, leader_left_gripper, leader_right_arm,
     leader_right_arm_pose, leader_right_gripper, left_arm, left_gripper, right_arm, right_gripper,
 };
+use srs_model::JointVec;
 use tokio::sync::watch;
 use tracing::{error, warn};
 
-use crate::side::{ArmPair, Side};
-use crate::types::{JointVec, pose_from_wire};
+use crate::types::pose_from_wire;
 use crate::upstream::Upstream;
 
 /// At most one dropped-message warning per stream (and one build/timestamp error
 /// per publisher) in this window, so a misrouted producer or a stalled clock
 /// is visible in the log without flooding it at the stream rate.
 pub(crate) const THROTTLED_WARN_PERIOD: Duration = Duration::from_secs(1);
-
-/// Pause after a receive error before retrying, so a persistently broken
-/// subscription cannot spin the listener at full CPU or flood the log at the stream
-/// rate. Transient errors still recover; a genuinely dead stream just idles.
-const RECEIVE_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
 /// The latest commanded opening for one gripper, fed by the upstream
 /// pairing's `gripper_setpoints`: the raw wire opening fraction, clamped into
@@ -69,18 +67,9 @@ pub struct GripperState {
     pub max_effort: f64,
 }
 
-/// Run `emit` at most once per [`THROTTLED_WARN_PERIOD`] per `last` state.
-pub(crate) fn warn_throttled(last: &mut Option<Instant>, emit: impl FnOnce()) {
-    let now = Instant::now();
-    if last.is_none_or(|t| now.duration_since(t) >= THROTTLED_WARN_PERIOD) {
-        emit();
-        *last = Some(now);
-    }
-}
-
 /// Parses one paired arm's inbound joint_states payload. This backbone drives
 /// fixed 7-joint arms whose followers always measure velocity, so a message
-/// must carry exactly [`crate::types::ARM_DOF`] positions with matching velocities,
+/// must carry exactly [`openarm_description::ARM_DOF`] positions with matching velocities,
 /// all finite; the generic contract's empty-velocities form is deliberately
 /// rejected here rather than half-accepted.
 fn parse_joint_state(positions: Vec<f64>, velocities: Vec<f64>) -> Result<ArmState, &'static str> {
@@ -103,7 +92,7 @@ fn parse_joint_state(positions: Vec<f64>, velocities: Vec<f64>) -> Result<ArmSta
     })
 }
 
-/// Parses one commanded arm setpoint: exactly [`crate::types::ARM_DOF`] finite
+/// Parses one commanded arm setpoint: exactly [`openarm_description::ARM_DOF`] finite
 /// positions. The wire's velocities and efforts are not parsed: the backbone
 /// plans its own velocity shaping over the governed position stream.
 fn parse_joint_command(positions: Vec<f64>) -> Result<Upstream, &'static str> {
@@ -227,7 +216,7 @@ async fn accept<Raw, Parsed>(
     parse: impl Fn(Raw) -> Result<Parsed, &'static str>,
     latest: &ArmPair<watch::Sender<Option<Parsed>>>,
     activity: Option<&ArmPair<LeaderActivity>>,
-    last_reject_warn: &mut Option<Instant>,
+    reject_warn: &mut Throttle,
 ) -> bool {
     match received {
         Ok(Some(raw)) => match parse(raw) {
@@ -237,9 +226,11 @@ async fn accept<Raw, Parsed>(
                     activity[side].note();
                 }
             }
-            Err(reason) => warn_throttled(last_reject_warn, || {
-                warn!("{what}: dropping {} message with {reason}", side);
-            }),
+            Err(reason) => {
+                if reject_warn.admit() {
+                    warn!("{what}: dropping {} message with {reason}", side);
+                }
+            }
         },
         Ok(None) => return false,
         Err(e) => {
@@ -269,7 +260,7 @@ pub async fn run_pose_command_listener(
     else {
         return;
     };
-    let mut warned = None;
+    let mut reject_warn = Throttle::new(THROTTLED_WARN_PERIOD);
     loop {
         let (side, received) = tokio::select! {
             r = left.next() => (Side::Left, r.map(|m| m.map(|(_, msg)| (msg.position, msg.orientation)))),
@@ -282,7 +273,7 @@ pub async fn run_pose_command_listener(
             |(position, orientation)| parse_pose_command(position, orientation),
             &latest,
             Some(&activity),
-            &mut warned,
+            &mut reject_warn,
         )
         .await;
         if !applied {
@@ -311,7 +302,7 @@ pub async fn run_joint_command_listener(
     else {
         return;
     };
-    let mut warned = None;
+    let mut reject_warn = Throttle::new(THROTTLED_WARN_PERIOD);
     loop {
         let (side, received) = tokio::select! {
             r = left.next() => (Side::Left, r.map(|m| m.map(|(_, msg)| msg.positions))),
@@ -324,7 +315,7 @@ pub async fn run_joint_command_listener(
             parse_joint_command,
             &latest,
             Some(&activity),
-            &mut warned,
+            &mut reject_warn,
         )
         .await;
         if !applied {
@@ -351,7 +342,7 @@ pub async fn run_gripper_command_listener(
     else {
         return;
     };
-    let mut warned = None;
+    let mut reject_warn = Throttle::new(THROTTLED_WARN_PERIOD);
     loop {
         let (side, received) = tokio::select! {
             r = left.next() => (Side::Left, r.map(|m| m.map(|(_, msg)| (msg.opening, msg.max_effort)))),
@@ -364,7 +355,7 @@ pub async fn run_gripper_command_listener(
             |(opening, max_effort)| parse_gripper_command(opening, max_effort),
             &latest,
             Some(&activity),
-            &mut warned,
+            &mut reject_warn,
         )
         .await;
         if !applied {
@@ -392,7 +383,7 @@ pub async fn run_joint_state_listener(
     else {
         return;
     };
-    let mut warned = None;
+    let mut reject_warn = Throttle::new(THROTTLED_WARN_PERIOD);
     loop {
         let (side, received) = tokio::select! {
             r = left.next() => (Side::Left, r.map(|m| m.map(|(_, msg)| (msg.positions, msg.velocities)))),
@@ -405,7 +396,7 @@ pub async fn run_joint_state_listener(
             |(positions, velocities)| parse_joint_state(positions, velocities),
             &latest,
             None,
-            &mut warned,
+            &mut reject_warn,
         )
         .await;
         if !applied {
@@ -432,7 +423,7 @@ pub async fn run_gripper_state_listener(
     else {
         return;
     };
-    let mut warned = None;
+    let mut reject_warn = Throttle::new(THROTTLED_WARN_PERIOD);
     loop {
         let (side, received) = tokio::select! {
             r = left.next() => (Side::Left, r.map(|m| m.map(|(_, msg)| (msg.opening, msg.effort, msg.max_effort)))),
@@ -445,7 +436,7 @@ pub async fn run_gripper_state_listener(
             |(opening, effort, max_effort)| parse_gripper_state(opening, effort, max_effort),
             &latest,
             None,
-            &mut warned,
+            &mut reject_warn,
         )
         .await;
         if !applied {
@@ -502,7 +493,7 @@ pub async fn run_governor_config_listener(
 mod tests {
     use super::*;
 
-    use crate::types::ARM_DOF;
+    use openarm_description::ARM_DOF;
     use srs_model::nalgebra::{Isometry3, Vector3};
 
     #[test]

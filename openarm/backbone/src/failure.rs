@@ -5,11 +5,10 @@
 //! failure between them (a posture share ends its posture goal), so the
 //! backbone keeps its own kind and gives each member its own.
 
+use openarm_description::Side;
 use peppygen::exposed_actions::limb_motion::{move_arm, move_arm_joints, move_gripper};
 use peppygen::exposed_actions::postures::{move_to_home, move_to_ready};
 use peppygen::exposed_services::limb_motion::check_arm_move;
-
-use crate::side::Side;
 
 /// A failure kind of the moves and of `check_arm_move`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,6 +54,15 @@ impl Failure {
             ..self
         }
     }
+}
+
+/// The failure of a goal that reaches a limb whose follower stream has gone
+/// stale, and of a move whose follower goes stale while it runs.
+pub fn stale_failure() -> Failure {
+    Failure::new(
+        FailureKind::ResourceUnavailable,
+        "the follower stopped reporting",
+    )
 }
 
 /// Gives the generated `FailureKind` of `member` the kind of the same name,

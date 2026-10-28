@@ -21,13 +21,14 @@ mod camera_mounts;
 mod coordinator;
 mod failure;
 mod governor;
+mod gripper_move;
 mod liveness;
+mod move_slot;
 mod node;
 mod planner;
 mod publish;
 mod serving;
 mod settle;
-mod side;
 mod startup;
 mod streams;
 #[cfg(test)]

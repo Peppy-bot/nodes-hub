@@ -11,7 +11,9 @@
 
 use tracing::{info, warn};
 
-use super::super::{ArmPair, GovState, Governor, Side, Step, concat, dof_side};
+use openarm_description::{ArmPair, Side};
+
+use super::super::{GovState, Governor, Step, concat, dof_side};
 use super::Limiter;
 use super::allowance::Allowance;
 

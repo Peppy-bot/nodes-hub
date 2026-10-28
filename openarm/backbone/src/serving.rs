@@ -10,7 +10,7 @@ use tracing::error;
 
 /// Pause after a service error before the loop listens again, so a broken
 /// transport cannot hot-spin a loop or flood the log.
-pub(crate) const RETRY_BACKOFF: Duration = Duration::from_secs(1);
+const RETRY_BACKOFF: Duration = Duration::from_secs(1);
 
 /// Serves `service` one request at a time until `token` is cancelled:
 /// `next_request` listens for the next request and answers it (a generated

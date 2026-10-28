@@ -26,24 +26,28 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use peppygen::NodeRunner;
-use peppygen::exposed_actions::limb_motion::move_gripper;
 use peppylib::runtime::CancellationToken;
+use srs_model::JointVec;
 use srs_model::nalgebra::Isometry3;
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{error, info, warn};
 
 use control_core::filters::LowPassFilter;
 use control_core::pacer::Pacer;
+use openarm_description::{ARM_DOF, ArmPair, Side};
 
 use crate::camera_mounts::MeasuredGrasps;
-use crate::failure::{Failure, FailureKind};
+use crate::failure::{Failure, FailureKind, stale_failure};
 use crate::governor::{GovState, Governor, Guard};
+use crate::gripper_move::{
+    CommandedOpening, GripperGoal, GripperMove, GripperTerminal, MeasuredOpening, end_gripper_move,
+    service_gripper_move,
+};
 use crate::liveness::{Admission, Cadence, CadenceChange, Liveness};
-use crate::planner::{self, BusyGuard, Goal, Measurement, PlanCheck, Planner, Unmeasured};
+use crate::move_slot::MoveSlot;
+use crate::planner::{self, ArmMoveRequest, Goal, Measurement, PlanCheck, Planner, Unmeasured};
 use crate::publish::{LimbStateSnapshot, Publishers};
-use crate::side::{ArmPair, Side};
 use crate::streams::{ArmState, GovernorConfig, GripperCommand, GripperState, LeaderActivity};
-use crate::types::{ARM_DOF, ArmMoveRequest, JointVec};
 use crate::upstream::{Upstream, UpstreamMode};
 use control_core::chase::rate_limited;
 
@@ -54,8 +58,8 @@ const SEED_WAIT_WARN_PERIOD: Duration = Duration::from_secs(2);
 
 /// One arm's inbound channels into the coordinator: the leading node's arm
 /// command stream, its gripper opening command stream, the measured arm state,
-/// the measured gripper opening, the accepted-goal queues, and the single-flight
-/// busy flags (one for arm moves, one for gripper moves).
+/// the measured gripper opening, the accepted-goal queues, and the move slots
+/// (one for arm moves, one for gripper moves).
 ///
 /// The two command streams are held as their `watch::Sender`, not a receiver: the
 /// coordinator both reads the latest (`borrow`) and clears it (`send_replace`)
@@ -72,9 +76,9 @@ pub struct ArmChannels {
     pub measured: watch::Receiver<Option<ArmState>>,
     pub gripper: watch::Receiver<Option<GripperState>>,
     pub goals: mpsc::Receiver<Goal>,
-    pub busy: Arc<AtomicBool>,
+    pub move_slot: MoveSlot,
     pub gripper_goals: mpsc::Receiver<GripperGoal>,
-    pub gripper_busy: Arc<AtomicBool>,
+    pub gripper_move_slot: MoveSlot,
     /// Whether the arm's and the gripper's followers deliver fresh state,
     /// written every tick for the goal handlers, which refuse a goal on a
     /// limb whose follower is stale or has not reported yet.
@@ -106,7 +110,7 @@ pub struct RunConfig {
 
 /// The grasp pose of one arm in the robot frame, from the joints it
 /// measured, or why it has no fresh measurement of them.
-pub type MeasuredGrasp = Result<Isometry3<f64>, Unmeasured>;
+pub type GraspMeasurement = Result<Isometry3<f64>, Unmeasured>;
 
 /// What the limb_motion services and the posture moves ask of the loop,
 /// answered on the reply channel each carries. A reply that the asker no
@@ -128,231 +132,17 @@ pub enum CoordinatorRequest {
     /// request: what a posture result gives when its goal completes or ends
     /// cancelled.
     MeasureGrasps {
-        reply: oneshot::Sender<ArmPair<MeasuredGrasp>>,
+        reply: oneshot::Sender<ArmPair<GraspMeasurement>>,
     },
 }
 
 /// The reason every goal a stop ends is cancelled for: the stop, and the
 /// reason of the stop request.
-pub fn stop_reason(reason: &str) -> String {
+fn stop_reason(reason: &str) -> String {
     if reason.is_empty() {
         return "stopped".to_string();
     }
     format!("stopped: {reason}")
-}
-
-/// An accepted `move_gripper` goal handed to the coordinator, which executes it
-/// through the same per-tick governing as everything else (the gripper analog of
-/// [`Goal`] for the arms). The opening is the validated goal fraction; the
-/// effort cap is validated non-negative, `None` when the goal carried no
-/// preference.
-pub struct GripperGoal {
-    pub opening: f64,
-    pub max_effort: Option<f64>,
-    /// The longest the move waits, after the planned end of the commanded
-    /// travel, for the jaws to stand still.
-    pub settle_timeout: Duration,
-    pub ctx: move_gripper::GoalContext,
-}
-
-impl GripperGoal {
-    /// Fail unstarted with `failure`, with no result. The busy flag is the
-    /// caller's concern.
-    pub async fn fail(self, failure: Failure) {
-        fail_gripper_goal(&self.ctx, failure).await;
-    }
-
-    /// End unstarted as cancelled by the stop service, for `reason`, which
-    /// names the stop, reporting `reported_frac`. The busy flag is the
-    /// caller's concern.
-    pub async fn stop(self, reason: &str, reported_frac: f64) {
-        if let Err(e) = self
-            .ctx
-            .complete_cancelled(reason, false, reported_frac, 0.0)
-            .await
-        {
-            error!("move_gripper end: {e}");
-        }
-    }
-}
-
-/// Fail a gripper goal with `failure`, with no result.
-async fn fail_gripper_goal(ctx: &move_gripper::GoalContext, failure: Failure) {
-    if let Err(e) = ctx.fail(failure.kind.into(), failure.message).await {
-        error!("move_gripper end: {e}");
-    }
-}
-
-/// A backbone-executed gripper move in flight: the motion its terminal is
-/// decided from, the effort cap it relays, and the goal it answers. The move
-/// holds the side's single-flight slot until it ends, so a second gripper goal
-/// on the side is refused until then; the busy guard releases the slot on any
-/// exit.
-struct GripperMove {
-    motion: GripperMotion,
-    max_effort: Option<f64>,
-    ctx: move_gripper::GoalContext,
-    _busy: BusyGuard,
-}
-
-/// What a gripper move's terminal is decided from (see
-/// [`gripper_move_terminal`]): the target, when it was admitted, the planned
-/// end of the commanded travel, the goal's settle timeout, and the run of
-/// openings the jaws are judged still on. The commanded opening ramps to the
-/// target through the governor at the opening rate the operator sets, re-read
-/// every tick, and holds it while the jaws follow.
-#[derive(Clone, Copy, Debug)]
-struct GripperMotion {
-    target_frac: f64,
-    admitted: Instant,
-    /// The first tick of the commanded travel's current rest, on the target
-    /// or held by the collision guard. `None` while it travels.
-    planned_end: Option<Instant>,
-    settle_timeout: Duration,
-    /// The latest run of openings the follower delivered since admission
-    /// that lie within [`GRIPPER_STILL_BAND`] of one another. `None` before
-    /// the first.
-    still: Option<StillRun>,
-}
-
-/// A run of measured openings that all lie within [`GRIPPER_STILL_BAND`] of
-/// one another: the lowest and the highest of them, and when the first was
-/// measured.
-#[derive(Clone, Copy, Debug)]
-struct StillRun {
-    low: f64,
-    high: f64,
-    since: Instant,
-}
-
-impl StillRun {
-    fn starting(frac: f64, now: Instant) -> Self {
-        Self {
-            low: frac,
-            high: frac,
-            since: now,
-        }
-    }
-
-    /// This run with `frac` measured at `now` added, or a new run from it
-    /// when it lies farther than the band from an opening of this one.
-    fn extended(self, frac: f64, now: Instant) -> Self {
-        let (low, high) = (self.low.min(frac), self.high.max(frac));
-        if high - low > GRIPPER_STILL_BAND {
-            return Self::starting(frac, now);
-        }
-        Self { low, high, ..self }
-    }
-}
-
-/// The jaws stand still once every opening measured over
-/// [`GRIPPER_STILL_WINDOW`] lies within this fraction of the jaw travel of
-/// the others: the band the limb_motion contract states.
-const GRIPPER_STILL_BAND: f64 = 0.01;
-
-/// How long the measured openings must stay within [`GRIPPER_STILL_BAND`] of
-/// one another for the jaws to stand still, as the limb_motion contract
-/// states.
-const GRIPPER_STILL_WINDOW: Duration = Duration::from_millis(250);
-
-impl GripperMotion {
-    /// A move to `target_frac` admitted at `now`.
-    fn new(target_frac: f64, settle_timeout: Duration, now: Instant) -> Self {
-        Self {
-            target_frac,
-            admitted: now,
-            planned_end: None,
-            settle_timeout,
-            still: None,
-        }
-    }
-
-    /// Note the opening the governor published last tick, and return the
-    /// planned end while the commanded travel rests: on each tick after
-    /// admission on which the commanded opening stands on the target, or the
-    /// collision guard held it where it stood. The planned
-    /// end is the first tick of the current rest. The travel moving on clears
-    /// it, with the openings judged during the rest, so a hold the guard lets
-    /// go of leaves nothing behind. Whatever the opening rate, and however the
-    /// operator retunes it during the move, the travel rests only there.
-    fn travel_end(&mut self, commanded: CommandedOpening, now: Instant) -> Option<Instant> {
-        let rests = now > self.admitted && (commanded.frac == self.target_frac || commanded.held);
-        let rest_start = self.planned_end.unwrap_or(now);
-        self.planned_end = rests.then_some(rest_start);
-        if !rests {
-            self.still = None;
-        }
-        self.planned_end
-    }
-
-    /// Add one opening the follower delivered this tick to the run, and
-    /// whether the jaws stand still: the openings of the run lie within
-    /// [`GRIPPER_STILL_BAND`] of one another, and the first of them is
-    /// [`GRIPPER_STILL_WINDOW`] old.
-    fn stands_still(&mut self, frac: f64, now: Instant) -> bool {
-        let run = self.still.map_or_else(
-            || StillRun::starting(frac, now),
-            |run| run.extended(frac, now),
-        );
-        self.still = Some(run);
-        now.duration_since(run.since) >= GRIPPER_STILL_WINDOW
-    }
-}
-
-/// A gripper follower's measured opening as one tick sees it: the latest
-/// opening, and whether the follower delivered it since the last tick.
-#[derive(Clone, Copy, Debug)]
-struct MeasuredOpening {
-    frac: f64,
-    fresh: bool,
-}
-
-/// A gripper's commanded opening as one tick sees it: the opening the
-/// governor published last tick, and whether its collision guard held the
-/// opening where it stood then.
-#[derive(Clone, Copy, Debug)]
-struct CommandedOpening {
-    frac: f64,
-    held: bool,
-}
-
-/// The largest part of the chase's step the governor may let through for the
-/// guard to count as holding the opening: a hold leaves float dust, orders of
-/// magnitude under any throttle, which still moves the opening and is travel.
-const GUARD_HOLD_STEP_FRAC: f64 = 0.01;
-
-impl CommandedOpening {
-    /// An idle side's opening, re-anchored on the measured gripper.
-    fn idle(frac: f64) -> Self {
-        Self { frac, held: false }
-    }
-
-    /// The opening the governor published, `governed`, from the chase's step
-    /// from `prev` to `chased`: held when the governor let through under
-    /// [`GUARD_HOLD_STEP_FRAC`] of that step.
-    fn published(governed: f64, prev: f64, chased: f64) -> Self {
-        Self {
-            frac: governed,
-            held: (governed - prev).abs() < GUARD_HOLD_STEP_FRAC * (chased - prev).abs(),
-        }
-    }
-}
-
-/// How a gripper move ended.
-#[derive(Debug, PartialEq)]
-enum GripperTerminal {
-    /// The measured opening stood still, on the target or short of it where
-    /// an object or the effort cap stopped the jaws.
-    Settled,
-    /// The settle timeout passed before the jaws stood still; the move
-    /// completes where they stand, with `settled` false.
-    SettleTimedOut,
-    /// The follower stopped reporting; the move fails with
-    /// `resource_unavailable`.
-    FollowerStale,
-    /// The goal was cancelled, for this reason: by its caller, or by the
-    /// stop service, whose reason names the stop.
-    Cancelled(String),
 }
 
 /// Run the coordination loop. Holds the governor and both planners. Runs until
@@ -410,7 +200,7 @@ pub async fn run(
     // the governor, its single owner.
     let mut commanded_grippers =
         ArmPair::from_fn(|side| CommandedOpening::idle(gripper_fraction(&channels[side].gripper)));
-    // In-flight backbone-executed gripper moves, one single-flight slot per side.
+    // In-flight backbone-executed gripper moves, at most one per side.
     let mut gripper_moves: ArmPair<Option<GripperMove>> = ArmPair::from_fn(|_| None);
 
     let dt = cycle_period.as_secs_f64();
@@ -657,23 +447,22 @@ async fn serve_request(
                     stopped.push(side.arm_name().to_string());
                 }
                 while let Ok(goal) = arm.goals.try_recv() {
-                    let _release = BusyGuard(arm.busy.clone());
+                    let _release = arm.move_slot.release_on_drop();
                     goal.stop(&reason, measured, planner).await;
                 }
                 let measured_frac = gripper_fraction(&arm.gripper);
                 if let Some(m) = gripper_moves[side].take() {
-                    let elapsed_s = now.duration_since(m.motion.admitted).as_secs_f64();
                     end_gripper_move(
                         m,
                         GripperTerminal::Cancelled(reason.clone()),
                         measured_frac,
-                        elapsed_s,
+                        now,
                     )
                     .await;
                     stopped.push(side.gripper_name().to_string());
                 }
                 while let Ok(goal) = arm.gripper_goals.try_recv() {
-                    let _release = BusyGuard(arm.gripper_busy.clone());
+                    let _release = arm.gripper_move_slot.release_on_drop();
                     goal.stop(&reason, measured_frac).await;
                 }
             }
@@ -702,10 +491,10 @@ async fn serve_request(
 fn consume_streams_of_busy_sides(channels: &ArmPair<ArmChannels>) {
     for side in Side::BOTH {
         let ch = &channels[side];
-        if ch.busy.load(Ordering::Acquire) {
+        if ch.move_slot.is_claimed() {
             ch.command.send_replace(None);
         }
-        if ch.gripper_busy.load(Ordering::Acquire) {
+        if ch.gripper_move_slot.is_claimed() {
             ch.gripper_command.send_replace(None);
         }
     }
@@ -840,9 +629,11 @@ async fn service_gripper_moves(
     now: Instant,
 ) {
     for side in Side::BOTH {
+        let arm = &mut channels[side];
         service_gripper_move(
             &mut moves[side],
-            &mut channels[side],
+            &mut arm.gripper_goals,
+            &arm.gripper_move_slot,
             commanded[side],
             measured[side],
             admission[side],
@@ -912,7 +703,7 @@ fn measured_grasps(
     channels: &ArmPair<ArmChannels>,
     planners: &mut ArmPair<Planner>,
     arm_admission: ArmPair<Admission>,
-) -> ArmPair<MeasuredGrasp> {
+) -> ArmPair<GraspMeasurement> {
     ArmPair::from_fn(|side| {
         seeded_measurement(&channels[side], arm_admission[side])
             .map(|q| planners[side].world_ee_pose(&q))
@@ -987,20 +778,11 @@ fn seed_failure() -> Failure {
     )
 }
 
-/// The failure of a goal that reaches a limb whose follower stream has gone
-/// stale, and of a move whose follower goes stale while it runs.
-fn stale_failure() -> Failure {
-    Failure::new(
-        FailureKind::ResourceUnavailable,
-        "the follower stopped reporting",
-    )
-}
-
 /// Wait for both arms' first measured states and both grippers' first
 /// gripper fractions, then seed each planner's held setpoint from its measured pose
 /// (clamped into the joint limits). One wait over all four goal queues: a
 /// goal accepted for EITHER side before its follower reports fails with
-/// [`seed_failure`], its busy claim released, so a silent side cannot strand
+/// [`seed_failure`], its move slot released, so a silent side cannot strand
 /// the other side's goals. Warns periodically while a stream stays silent; `Err(Shutdown)` if
 /// a channel closes first.
 async fn seed_all(
@@ -1022,19 +804,19 @@ async fn seed_all(
                 break;
             }
             Some(goal) = channels.left.goals.recv() => {
-                let _release = BusyGuard(channels.left.busy.clone());
+                let _release = channels.left.move_slot.release_on_drop();
                 goal.fail(seed_failure(), &planners.left).await;
             }
             Some(goal) = channels.right.goals.recv() => {
-                let _release = BusyGuard(channels.right.busy.clone());
+                let _release = channels.right.move_slot.release_on_drop();
                 goal.fail(seed_failure(), &planners.right).await;
             }
             Some(goal) = channels.left.gripper_goals.recv() => {
-                let _release = BusyGuard(channels.left.gripper_busy.clone());
+                let _release = channels.left.gripper_move_slot.release_on_drop();
                 goal.fail(seed_failure()).await;
             }
             Some(goal) = channels.right.gripper_goals.recv() => {
-                let _release = BusyGuard(channels.right.gripper_busy.clone());
+                let _release = channels.right.gripper_move_slot.release_on_drop();
                 goal.fail(seed_failure()).await;
             }
             // Nothing moves before the seed, so a stop stops nothing and a
@@ -1107,7 +889,7 @@ async fn tick_arm(
     if admission == Admission::Stale {
         planner.fail_active(stale_failure()).await;
         while let Ok(goal) = channels.goals.try_recv() {
-            let _release = BusyGuard(channels.busy.clone());
+            let _release = channels.move_slot.release_on_drop();
             goal.fail(stale_failure(), planner).await;
         }
         return planner::Tick {
@@ -1141,120 +923,10 @@ async fn tick_arm(
             measured_q,
             command,
             &mut channels.goals,
-            &channels.busy,
+            &channels.move_slot,
             now,
         )
         .await
-}
-
-/// Decide whether a gripper move ends this tick, and how. No I/O and no
-/// clock: everything the decision reads is passed in, and the only state it
-/// writes is the move's own planned end and still run.
-///
-/// A cancel, `cancel` giving its reason, ends the move ahead of any other
-/// verdict of the same tick, and a follower gone stale fails it: the move
-/// can neither progress nor be verified. Nothing else is judged while the commanded travel runs
-/// ([`GripperMotion::travel_end`], fed `commanded`, the opening the governor
-/// published last tick). From the planned end on the move completes as soon
-/// as the openings delivered since it stand still, and at the latest once its
-/// settle timeout has passed, where the jaws stand: a gripper move never fails
-/// on its settle, since a grasp is expected to stop short of the target. An
-/// opening that merely stands since an earlier tick is no evidence that the
-/// jaws stopped.
-fn gripper_move_terminal(
-    motion: &mut GripperMotion,
-    commanded: CommandedOpening,
-    measured: MeasuredOpening,
-    admission: Admission,
-    cancel: Option<String>,
-    now: Instant,
-) -> Option<GripperTerminal> {
-    if let Some(reason) = cancel {
-        return Some(GripperTerminal::Cancelled(reason));
-    }
-    if admission == Admission::Stale {
-        return Some(GripperTerminal::FollowerStale);
-    }
-    let planned_end = motion.travel_end(commanded, now)?;
-    if measured.fresh && motion.stands_still(measured.frac, now) {
-        return Some(GripperTerminal::Settled);
-    }
-    let since_end = now.duration_since(planned_end);
-    (since_end >= motion.settle_timeout).then_some(GripperTerminal::SettleTimedOut)
-}
-
-/// Admit a queued gripper goal into a free side, failing it while the
-/// follower is stale or another gripper move is in flight, and end an
-/// in-flight move on the terminal [`gripper_move_terminal`] decides.
-/// `commanded` is the opening the governor published last tick and whether
-/// the guard held it. A terminal with a result reports the opening measured
-/// that tick as `final_opening` and the time since admission as
-/// `action_time`. The busy slot releases with the move on every path.
-async fn service_gripper_move(
-    mv: &mut Option<GripperMove>,
-    channels: &mut ArmChannels,
-    commanded: CommandedOpening,
-    measured: MeasuredOpening,
-    admission: Admission,
-    now: Instant,
-) {
-    // Drain fully: every queued goal is answered, never left parked.
-    while let Ok(goal) = channels.gripper_goals.try_recv() {
-        if admission == Admission::Stale {
-            goal.fail(stale_failure()).await;
-        } else if mv.is_none() {
-            *mv = Some(GripperMove {
-                motion: GripperMotion::new(goal.opening, goal.settle_timeout, now),
-                max_effort: goal.max_effort,
-                ctx: goal.ctx,
-                _busy: BusyGuard(channels.gripper_busy.clone()),
-            });
-        } else {
-            let failure = Failure::new(
-                FailureKind::PreconditionFailed,
-                "another gripper move is in flight",
-            );
-            goal.fail(failure).await;
-        }
-    }
-    let Some(m) = mv.as_mut() else { return };
-    let cancel = m.ctx.cancel_cause().map(|cause| cause.reason().to_string());
-    let Some(terminal) =
-        gripper_move_terminal(&mut m.motion, commanded, measured, admission, cancel, now)
-    else {
-        return;
-    };
-    let m = mv.take().expect("in-flight move checked above");
-    let elapsed_s = now.duration_since(m.motion.admitted).as_secs_f64();
-    end_gripper_move(m, terminal, measured.frac, elapsed_s).await;
-}
-
-/// End a gripper move's goal on `terminal`. A goal that completes or ends
-/// cancelled reports `measured_frac` as `final_opening` and `elapsed_s` as
-/// `action_time`, and `settled` true only when the jaws stood still; a
-/// follower gone stale fails the goal with no result. The busy slot releases
-/// with the move.
-async fn end_gripper_move(
-    m: GripperMove,
-    terminal: GripperTerminal,
-    measured_frac: f64,
-    elapsed_s: f64,
-) {
-    let ended = match terminal {
-        GripperTerminal::Settled => m.ctx.complete(true, measured_frac, elapsed_s).await,
-        GripperTerminal::SettleTimedOut => m.ctx.complete(false, measured_frac, elapsed_s).await,
-        GripperTerminal::FollowerStale => {
-            return fail_gripper_goal(&m.ctx, stale_failure()).await;
-        }
-        GripperTerminal::Cancelled(reason) => {
-            m.ctx
-                .complete_cancelled(reason, false, measured_frac, elapsed_s)
-                .await
-        }
-    };
-    if let Err(e) = ended {
-        error!("move_gripper end: {e}");
-    }
 }
 
 /// One side's resolved tick command: the opening fraction to chase and the
@@ -1274,8 +946,8 @@ struct GripperTarget {
 fn gripper_target(mv: &Option<GripperMove>, channels: &ArmChannels) -> Option<GripperTarget> {
     if let Some(m) = mv {
         return Some(GripperTarget {
-            frac: m.motion.target_frac,
-            max_effort: m.max_effort,
+            frac: m.target_frac(),
+            max_effort: m.max_effort(),
         });
     }
     channels
@@ -1314,6 +986,7 @@ fn filtered_velocity(
 mod tests {
     use super::*;
     use crate::planner::Outcome;
+    use crate::test_support::{claimed_move_slot, planner_holding};
 
     fn cmd(opening: f64) -> Option<GripperCommand> {
         Some(GripperCommand {
@@ -1407,11 +1080,11 @@ mod tests {
 
     #[test]
     fn a_consumed_command_holds_the_move_endpoint_until_a_newer_one() {
-        // The gripper twin of the arm handoff: an accepted move_gripper clears
-        // the side's command watch (`send_replace(None)` in the handler), so the
+        // The gripper twin of the arm handoff: while a move_gripper goal holds
+        // the side's move slot, `consume_streams_of_busy_sides` clears the
+        // side's command watch (`send_replace(None)`) every tick, so the
         // gripper follows nothing new and holds the move's endpoint until a
-        // command that arrives after the clear. Locks the contract; the handler
-        // performing the clear is covered by the live regression.
+        // command that arrives after the clear. Locks that contract.
         let (tx, rx) = watch::channel(None);
 
         tx.send_replace(cmd(0.6));
@@ -1436,404 +1109,7 @@ mod tests {
         );
     }
 
-    // The gripper move's terminal decision. Every instant is handed to the
-    // decision as an offset from one anchor, so no test waits on a clock.
-
-    /// The target of the moves below: a half close from fully open.
-    const MOVE_TARGET: f64 = 0.5;
-    /// The settle timeout of the moves below.
-    const MOVE_TIMEOUT: Duration = Duration::from_secs(2);
-
-    fn ms(millis: u64) -> Duration {
-        Duration::from_millis(millis)
-    }
-
-    fn fresh(frac: f64) -> MeasuredOpening {
-        MeasuredOpening { frac, fresh: true }
-    }
-
-    fn stale_cached(frac: f64) -> MeasuredOpening {
-        MeasuredOpening { frac, fresh: false }
-    }
-
-    /// The governor published `frac`, the chase's own step.
-    fn free(frac: f64) -> CommandedOpening {
-        CommandedOpening { frac, held: false }
-    }
-
-    /// The governor held the opening at `frac` against the chase's step.
-    fn held(frac: f64) -> CommandedOpening {
-        CommandedOpening { frac, held: true }
-    }
-
-    #[test]
-    fn the_guard_holds_an_opening_it_lets_creep_and_throttles_one_it_lets_travel() {
-        let (prev, chased) = (0.94, 0.88);
-        assert!(!CommandedOpening::published(chased, prev, chased).held);
-        assert!(
-            !CommandedOpening::published(0.91, prev, chased).held,
-            "a throttle is travel"
-        );
-        assert!(CommandedOpening::published(prev, prev, chased).held);
-        assert!(
-            CommandedOpening::published(prev - 4e-9, prev, chased).held,
-            "a creep is a hold"
-        );
-        assert!(
-            !CommandedOpening::published(prev, prev, prev).held,
-            "no step asked for"
-        );
-    }
-
-    /// A move to [`MOVE_TARGET`] whose commanded travel came to rest at
-    /// `planned_end`.
-    fn motion_ending_at(planned_end: Instant) -> GripperMotion {
-        GripperMotion {
-            planned_end: Some(planned_end),
-            ..GripperMotion::new(MOVE_TARGET, MOVE_TIMEOUT, planned_end - ms(100))
-        }
-    }
-
-    /// The verdict on `motion` at `now` with the command on the target, the
-    /// follower live and the goal not cancelled.
-    fn judge(
-        motion: &mut GripperMotion,
-        measured: MeasuredOpening,
-        now: Instant,
-    ) -> Option<GripperTerminal> {
-        gripper_move_terminal(
-            motion,
-            free(MOVE_TARGET),
-            measured,
-            Admission::Live,
-            None,
-            now,
-        )
-    }
-
-    #[test]
-    fn the_commanded_travel_ends_the_tick_the_commanded_opening_lands() {
-        // Admitted fully open; the operator slows the rate mid-move, so the
-        // steps shrink, and the travel ends only when the target is reached.
-        let start = Instant::now();
-        let mut motion = GripperMotion::new(MOVE_TARGET, MOVE_TIMEOUT, start);
-        assert_eq!(
-            motion.travel_end(free(1.0), start),
-            None,
-            "the admission tick"
-        );
-        for (tick, commanded) in [0.94, 0.88, 0.87, 0.86, 0.85].into_iter().enumerate() {
-            let now = start + ms(10) * (tick as u32 + 1);
-            assert_eq!(
-                motion.travel_end(free(commanded), now),
-                None,
-                "still travelling at {commanded}"
-            );
-        }
-        let landed = start + ms(60);
-        assert_eq!(motion.travel_end(free(MOVE_TARGET), landed), Some(landed));
-        assert_eq!(
-            motion.travel_end(free(MOVE_TARGET), landed + ms(10)),
-            Some(landed)
-        );
-    }
-
-    #[test]
-    fn a_commanded_opening_the_guard_holds_rests_until_the_guard_lets_go() {
-        let start = Instant::now();
-        let mut motion = GripperMotion::new(MOVE_TARGET, MOVE_TIMEOUT, start);
-        assert_eq!(motion.travel_end(free(0.94), start + ms(10)), None);
-        let held_at = start + ms(20);
-        assert_eq!(motion.travel_end(held(0.94), held_at), Some(held_at));
-        assert_eq!(
-            motion.travel_end(held(0.94), held_at + ms(10)),
-            Some(held_at),
-            "the rest goes on"
-        );
-        assert_eq!(
-            motion.travel_end(held(0.94 - 1e-9), held_at + ms(20)),
-            Some(held_at),
-            "a creeping hold is a rest"
-        );
-        assert_eq!(
-            motion.travel_end(free(0.88), held_at + ms(30)),
-            None,
-            "the travel moved on"
-        );
-        let landed = held_at + ms(40);
-        assert_eq!(motion.travel_end(free(MOVE_TARGET), landed), Some(landed));
-    }
-
-    #[test]
-    fn a_move_with_no_travel_ends_it_on_the_tick_after_admission() {
-        let start = Instant::now();
-        let mut motion = GripperMotion::new(MOVE_TARGET, MOVE_TIMEOUT, start);
-        assert_eq!(
-            motion.travel_end(free(MOVE_TARGET), start),
-            None,
-            "the admission tick"
-        );
-        assert_eq!(
-            motion.travel_end(free(MOVE_TARGET), start + ms(10)),
-            Some(start + ms(10))
-        );
-    }
-
-    #[test]
-    fn jaws_standing_still_while_the_command_travels_are_not_judged() {
-        let start = Instant::now();
-        let mut motion = GripperMotion::new(MOVE_TARGET, MOVE_TIMEOUT, start);
-        for tick in 1..=40u32 {
-            let commanded = 1.0 - 0.01 * f64::from(tick);
-            assert_eq!(
-                gripper_move_terminal(
-                    &mut motion,
-                    free(commanded),
-                    fresh(0.9),
-                    Admission::Live,
-                    None,
-                    start + ms(10) * tick
-                ),
-                None
-            );
-        }
-        assert!(
-            motion.still.is_none(),
-            "the still run starts at the planned end"
-        );
-    }
-
-    #[test]
-    fn a_hold_the_guard_lets_go_of_mid_travel_leaves_nothing_behind() {
-        // The guard holds the command for two ticks mid-travel with the jaws
-        // standing at 0.9; once it lets go, nothing judged then counts.
-        let start = Instant::now();
-        let mut motion = GripperMotion::new(MOVE_TARGET, MOVE_TIMEOUT, start);
-        let ends = |m: &mut GripperMotion, commanded, now| {
-            gripper_move_terminal(m, commanded, fresh(0.9), Admission::Live, None, now)
-        };
-        assert_eq!(ends(&mut motion, free(0.94), start + ms(10)), None);
-        assert_eq!(ends(&mut motion, held(0.94), start + ms(20)), None);
-        assert_eq!(ends(&mut motion, held(0.94), start + ms(30)), None);
-        assert!(motion.still.is_some(), "judged while the guard held it");
-        assert_eq!(ends(&mut motion, free(0.88), start + ms(40)), None);
-        assert_eq!(motion.planned_end, None);
-        assert!(motion.still.is_none());
-        // Landed on the target, the still run starts over: the move settles
-        // a window after landing, never on the hold's openings.
-        let landed = start + ms(50);
-        assert_eq!(ends(&mut motion, free(MOVE_TARGET), landed), None);
-        assert_eq!(
-            ends(
-                &mut motion,
-                free(MOVE_TARGET),
-                landed + GRIPPER_STILL_WINDOW - ms(1)
-            ),
-            None
-        );
-        assert_eq!(
-            ends(
-                &mut motion,
-                free(MOVE_TARGET),
-                landed + GRIPPER_STILL_WINDOW
-            ),
-            Some(GripperTerminal::Settled)
-        );
-    }
-
-    #[test]
-    fn jaws_standing_still_for_the_window_from_the_planned_end_settle_the_move() {
-        let end = Instant::now();
-        let mut motion = motion_ending_at(end);
-        assert_eq!(judge(&mut motion, fresh(0.5), end), None);
-        assert_eq!(
-            judge(&mut motion, fresh(0.5), end + GRIPPER_STILL_WINDOW - ms(1)),
-            None
-        );
-        assert_eq!(
-            judge(&mut motion, fresh(0.5), end + GRIPPER_STILL_WINDOW),
-            Some(GripperTerminal::Settled)
-        );
-    }
-
-    #[test]
-    fn jaws_stopped_short_by_an_item_settle_the_move_where_they_stand() {
-        // An object holds the jaws at 0.8 on their way to the half close.
-        let end = Instant::now();
-        let mut motion = motion_ending_at(end);
-        assert_eq!(judge(&mut motion, fresh(0.8), end), None);
-        assert_eq!(
-            judge(&mut motion, fresh(0.8), end + GRIPPER_STILL_WINDOW),
-            Some(GripperTerminal::Settled)
-        );
-    }
-
-    #[test]
-    fn a_grasp_that_creeps_inside_the_band_settles_the_move() {
-        // A can slipping in the jaws after contact: 0.0034 of the travel per
-        // 0.25 s, measured on an openarm_v2, inside the band.
-        let end = Instant::now();
-        let mut motion = motion_ending_at(end);
-        assert_eq!(judge(&mut motion, fresh(0.6), end), None);
-        assert_eq!(judge(&mut motion, fresh(0.5983), end + ms(125)), None);
-        assert_eq!(
-            judge(&mut motion, fresh(0.5966), end + GRIPPER_STILL_WINDOW),
-            Some(GripperTerminal::Settled)
-        );
-    }
-
-    #[test]
-    fn a_change_larger_than_the_band_restarts_the_window() {
-        let end = Instant::now();
-        let mut motion = motion_ending_at(end);
-        assert_eq!(judge(&mut motion, fresh(0.7), end), None);
-        let moved = 0.7 - GRIPPER_STILL_BAND * 1.5;
-        let restart = end + ms(200);
-        assert_eq!(judge(&mut motion, fresh(moved), restart), None);
-        assert_eq!(
-            judge(&mut motion, fresh(moved), end + GRIPPER_STILL_WINDOW),
-            None
-        );
-        assert_eq!(
-            judge(&mut motion, fresh(moved), restart + GRIPPER_STILL_WINDOW),
-            Some(GripperTerminal::Settled)
-        );
-    }
-
-    #[test]
-    fn openings_spread_wider_than_the_band_within_the_window_are_not_still() {
-        // Each opening lies within the band of the first, yet the lowest and
-        // the highest lie farther apart than the band: the jaws moved that much.
-        let end = Instant::now();
-        let mut motion = motion_ending_at(end);
-        assert_eq!(judge(&mut motion, fresh(0.7), end), None);
-        assert_eq!(
-            judge(
-                &mut motion,
-                fresh(0.7 + 0.8 * GRIPPER_STILL_BAND),
-                end + ms(100)
-            ),
-            None
-        );
-        let low = 0.7 - 0.8 * GRIPPER_STILL_BAND;
-        let restart = end + ms(200);
-        assert_eq!(judge(&mut motion, fresh(low), restart), None);
-        assert_eq!(
-            judge(&mut motion, fresh(low), end + GRIPPER_STILL_WINDOW),
-            None,
-            "the run restarted on the low opening"
-        );
-        assert_eq!(
-            judge(&mut motion, fresh(low), restart + GRIPPER_STILL_WINDOW),
-            Some(GripperTerminal::Settled)
-        );
-    }
-
-    #[test]
-    fn an_opening_not_delivered_this_tick_never_completes_the_window() {
-        let end = Instant::now();
-        let mut motion = motion_ending_at(end);
-        assert_eq!(judge(&mut motion, fresh(0.5), end), None);
-        assert_eq!(
-            judge(&mut motion, stale_cached(0.5), end + GRIPPER_STILL_WINDOW),
-            None,
-            "the follower delivered nothing new"
-        );
-        assert_eq!(
-            judge(&mut motion, fresh(0.5), end + GRIPPER_STILL_WINDOW + ms(10)),
-            Some(GripperTerminal::Settled)
-        );
-    }
-
-    #[test]
-    fn jaws_not_still_by_the_settle_timeout_complete_the_move_where_they_stand() {
-        // The jaws close 0.02 every 100 ms and never stand still.
-        let end = Instant::now();
-        let mut motion = motion_ending_at(end);
-        for step in 0..20u32 {
-            assert_eq!(
-                judge(
-                    &mut motion,
-                    fresh(0.9 - 0.02 * f64::from(step)),
-                    end + ms(100) * step
-                ),
-                None
-            );
-        }
-        assert_eq!(
-            judge(&mut motion, fresh(0.5), end + MOVE_TIMEOUT),
-            Some(GripperTerminal::SettleTimedOut)
-        );
-    }
-
-    #[test]
-    fn a_cancel_ends_the_move_cancelled_for_its_reason_ahead_of_any_verdict() {
-        let start = Instant::now();
-        let reason = "cancelled by its caller";
-        let cancelled = Some(GripperTerminal::Cancelled(reason.to_string()));
-        let mut travelling = GripperMotion::new(MOVE_TARGET, MOVE_TIMEOUT, start);
-        let ends = |m: &mut GripperMotion, commanded, now| {
-            let cancel = Some(reason.to_string());
-            gripper_move_terminal(m, commanded, fresh(0.8), Admission::Live, cancel, now)
-        };
-        assert_eq!(ends(&mut travelling, free(0.94), start + ms(10)), cancelled);
-        let end = Instant::now();
-        let mut settling = motion_ending_at(end);
-        assert_eq!(
-            ends(&mut settling, free(MOVE_TARGET), end + MOVE_TIMEOUT),
-            cancelled
-        );
-    }
-
-    #[test]
-    fn a_follower_gone_stale_fails_the_move_before_and_after_the_planned_end() {
-        let start = Instant::now();
-        let fails = |m: &mut GripperMotion, commanded, now| {
-            gripper_move_terminal(m, commanded, fresh(0.9), Admission::Stale, None, now)
-        };
-        let mut travelling = GripperMotion::new(MOVE_TARGET, MOVE_TIMEOUT, start);
-        assert_eq!(
-            fails(&mut travelling, free(0.94), start + ms(10)),
-            Some(GripperTerminal::FollowerStale)
-        );
-        let end = Instant::now();
-        let mut settling = motion_ending_at(end);
-        assert_eq!(
-            fails(&mut settling, free(MOVE_TARGET), end + ms(10)),
-            Some(GripperTerminal::FollowerStale)
-        );
-    }
-
-    /// A planner of the `side` arm of v1 hardware, holding `held`.
-    fn planner_holding(side: Side, held: JointVec) -> Planner {
-        use crate::planner::PlanConfig;
-        use srs_model::chain_kinematics::EeCaps;
-
-        const TEST_PERIOD: Duration = Duration::from_millis(10);
-        let version = openarm_description::HardwareVersion::V1;
-        let model =
-            crate::arm_model(version, side.model()).expect("build arm from the bundled URDF");
-        let limits = model.limits();
-        let mut planner = Planner::new(
-            side,
-            model,
-            PlanConfig {
-                cycle_period: TEST_PERIOD,
-                smoothing: srs_model::chain_kinematics::command_smoothing(TEST_PERIOD).unwrap(),
-                max_joint_velocity_rad_s: [10.0; ARM_DOF],
-                max_joint_acceleration_rad_s2: crate::test_support::A_MAX,
-                ee: EeCaps {
-                    linear_m_s: 1.0,
-                    angular_rad_s: 0.8,
-                },
-                limits,
-            },
-        );
-        planner.commit(held);
-        planner
-    }
-
-    /// One arm's channels, with its busy slot claimed as at a goal's
+    /// One arm's channels, with its move slot claimed as at a goal's
     /// accept. The test drives them through the two senders it also gets:
     /// the measured state and the goal queue.
     fn claimed_arm_channels() -> (
@@ -1855,9 +1131,9 @@ mod tests {
             measured,
             gripper,
             goals,
-            busy: Arc::new(AtomicBool::new(true)),
+            move_slot: claimed_move_slot(),
             gripper_goals,
-            gripper_busy: Arc::new(AtomicBool::new(false)),
+            gripper_move_slot: MoveSlot::default(),
             fresh: Arc::new(AtomicBool::new(false)),
             gripper_fresh: Arc::new(AtomicBool::new(false)),
         };
@@ -1897,7 +1173,7 @@ mod tests {
             Outcome::Failed(stale_failure().labelled(Side::Left))
         );
         assert!(
-            !channels.busy.load(Ordering::Acquire),
+            !channels.move_slot.is_claimed(),
             "the failure releases the claim"
         );
         assert_eq!(tick.candidate, planner.setpoint(), "a stale side holds");
@@ -1947,7 +1223,7 @@ mod tests {
         let start = Instant::now();
         tick_arm(&mut channels, &mut planner, Admission::Live, start).await;
         assert!(done_rx.try_recv().is_err(), "the share is in flight");
-        assert!(channels.busy.load(Ordering::Acquire));
+        assert!(channels.move_slot.is_claimed());
 
         tick_arm(
             &mut channels,
@@ -1962,7 +1238,7 @@ mod tests {
             Outcome::Failed(stale_failure().labelled(Side::Left))
         );
         assert!(
-            !channels.busy.load(Ordering::Acquire),
+            !channels.move_slot.is_claimed(),
             "the failure releases the claim"
         );
     }
@@ -2102,8 +1378,8 @@ mod tests {
             stopped
         );
         assert_eq!(queued.try_recv().expect("the queued goal ends"), stopped);
-        assert!(!channels.left.busy.load(Ordering::Acquire));
-        assert!(!channels.right.busy.load(Ordering::Acquire));
+        assert!(!channels.left.move_slot.is_claimed());
+        assert!(!channels.right.move_slot.is_claimed());
     }
 
     #[test]

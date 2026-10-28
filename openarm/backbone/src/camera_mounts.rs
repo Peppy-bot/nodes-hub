@@ -17,7 +17,7 @@ use std::f64::consts::PI;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use openarm_description::{CameraMount, HardwareVersion};
+use openarm_description::{ArmPair, CameraMount, HardwareVersion, Side};
 use peppygen::NodeRunner;
 use peppygen::exposed_services::camera_mounts::get_camera_poses;
 use peppylib::runtime::CancellationToken;
@@ -27,7 +27,6 @@ use tokio::sync::watch;
 use tracing::info;
 
 use crate::serving;
-use crate::side::{ArmPair, Side};
 use crate::types::{pose_from_wire, world_pose_arrays};
 
 /// The message of the error reply while the coordinator has measured
@@ -76,12 +75,12 @@ pub struct DesignCamera {
 
 /// The pose of one camera at one measurement, as the service reports it.
 #[derive(Clone, Debug, PartialEq)]
-pub struct CameraPose {
-    pub name: &'static str,
+struct CameraPose {
+    name: &'static str,
     /// The arm that carries the camera, or "" for one fixed to the base.
-    pub carried_by: &'static str,
+    carried_by: &'static str,
     /// The camera's optical frame in the robot frame.
-    pub pose: Isometry3<f64>,
+    pose: Isometry3<f64>,
 }
 
 /// A mount the robot's description carries that this backbone cannot place.
@@ -119,7 +118,7 @@ impl CameraMounts {
         let robot = urdf_rs::read_from_string(version.urdf()).expect("bundled URDF must parse");
         let tree = Tree::from_robot(&robot).expect("bundled URDF must be one tree");
         for side in Side::BOTH {
-            if tree.link_index(version.tcp_link(side.model())).is_none() {
+            if tree.link_index(version.tcp_link(side)).is_none() {
                 return Err(CameraMountError::NoToolJoint { side });
             }
         }
@@ -133,7 +132,7 @@ impl CameraMounts {
 
     /// The pose of every camera in the robot frame at the grasp poses
     /// `grasps`, in the description's order.
-    pub fn poses(&self, grasps: &ArmPair<Isometry3<f64>>) -> Vec<CameraPose> {
+    fn poses(&self, grasps: &ArmPair<Isometry3<f64>>) -> Vec<CameraPose> {
         self.mounts
             .iter()
             .map(|mount| {
@@ -191,7 +190,7 @@ fn resolve_mount(
         // The grasp point hangs off the camera's link over fixed joints: the
         // camera in the grasp point's frame is the tool transform undone,
         // then the mount.
-        if let Some(tool) = tree.fixed_path_to(link, version.tcp_link(side.model())) {
+        if let Some(tool) = tree.fixed_path_to(link, version.tcp_link(side)) {
             return Ok(ResolvedMount {
                 name: mount.name,
                 carrier: Carrier::Arm(side),
@@ -281,19 +280,16 @@ pub async fn serve(
 mod tests {
     use super::*;
 
-    use crate::types::JointVec;
+    use crate::test_support::bundled_arm;
+    use srs_model::JointVec;
 
     fn v2_mounts() -> CameraMounts {
         CameraMounts::resolve(HardwareVersion::V2).expect("the v2 mounts resolve")
     }
 
-    fn v2_arm(side: Side) -> srs_model::Arm {
-        crate::arm_model(HardwareVersion::V2, side.model()).expect("build the arm")
-    }
-
     /// The grasp pose of `side` at `q`, in the robot frame.
     fn grasp(side: Side, q: &JointVec) -> Isometry3<f64> {
-        let arm = v2_arm(side);
+        let arm = bundled_arm(HardwareVersion::V2, side);
         arm.world_pose(&arm.at(q).ee_pose())
     }
 
@@ -393,7 +389,7 @@ mod tests {
 
         // By hand: the tip link's pose from the chain, then the model's
         // mount in that link, then the half turn into the optical frame.
-        let arm = v2_arm(Side::Left);
+        let arm = bundled_arm(HardwareVersion::V2, Side::Left);
         let tip_in_root = arm.world_pose(&arm.at(&bent).tip_pose());
         let expected = tip_in_root
             * mount_pose(&HardwareVersion::V2.camera_mounts()[0])

@@ -15,7 +15,9 @@
 use srs_model::Jacobian;
 use srs_model::nalgebra::SVector;
 
-use super::super::{ARM_DOF, ArmPair, DUAL_DOF, dof_side, step_change};
+use openarm_description::{ARM_DOF, ArmPair};
+
+use super::super::{DUAL_DOF, dof_side, step_change};
 use super::allowance::Allowance;
 use super::{Limiter, Step};
 
@@ -71,7 +73,9 @@ impl Limiter for EeSpeed<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::{GOV_DOF, Side, Step, split};
+    use openarm_description::Side;
+
+    use super::super::super::{GOV_DOF, Step, split};
     use super::*;
 
     const DT: f64 = 0.01;

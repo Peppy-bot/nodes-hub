@@ -5,9 +5,10 @@
 
 use std::time::{Duration, Instant};
 
+use openarm_description::ARM_DOF;
+use srs_model::JointVec;
+use srs_model::chain_kinematics::{ServoTolerances, ToleranceError};
 use srs_model::nalgebra::Isometry3;
-
-use crate::types::{ARM_DOF, JointVec, PoseTolerance};
 
 /// The slack a move's measured limb must stand within, judged from the
 /// planned end of its motion on, and how long after that end it may stand
@@ -16,6 +17,42 @@ use crate::types::{ARM_DOF, JointVec, PoseTolerance};
 pub struct Settle<T> {
     pub tolerance: T,
     pub timeout: Duration,
+}
+
+/// A slack around a grasp-point pose: a position (m) and an orientation
+/// (rad). A `move_arm` goal is planned within one, judged against the goal
+/// pose alone and never the path, and settles within another.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PoseTolerance {
+    pub position_m: f64,
+    pub orientation_rad: f64,
+}
+
+impl PoseTolerance {
+    /// The same slack as the guarded servo's arrival bar, or the refusal of a
+    /// value that is not a slack.
+    pub fn servo(&self) -> Result<ServoTolerances, ToleranceError> {
+        ServoTolerances::new(self.position_m, self.orientation_rad)
+    }
+
+    /// Refuse this settle slack where it lies below `plan`'s on an axis,
+    /// naming the field to raise: the plan may sit that far from the pose.
+    pub fn covers(&self, plan: &Self) -> Result<(), String> {
+        let axes = [
+            (self.position_m, plan.position_m, "position_tolerance_m"),
+            (
+                self.orientation_rad,
+                plan.orientation_rad,
+                "orientation_tolerance_rad",
+            ),
+        ];
+        match axes.iter().find(|(settle, plan, _)| settle < plan) {
+            None => Ok(()),
+            Some((_, _, axis)) => Err(format!(
+                "settle_{axis} must be at least plan_{axis}: the plan may sit that far from the pose"
+            )),
+        }
+    }
 }
 
 /// How a move at or past its planned end ends.
@@ -243,5 +280,35 @@ mod tests {
                 )
             );
         }
+    }
+
+    // A pose slack covers another exactly when it is at least as wide on
+    // both axes.
+    #[hegel::test]
+    fn a_pose_tolerance_covers_another_exactly_when_wider_on_both_axes(tc: TestCase) {
+        let [settle_m, plan_m, settle_rad, plan_rad]: [f64; 4] =
+            tc.draw(gs::arrays(gs::floats().min_value(0.0).max_value(1.0)));
+        let settle = PoseTolerance {
+            position_m: settle_m,
+            orientation_rad: settle_rad,
+        };
+        let plan = PoseTolerance {
+            position_m: plan_m,
+            orientation_rad: plan_rad,
+        };
+        let expected = if settle_m < plan_m {
+            Err(
+                "settle_position_tolerance_m must be at least plan_position_tolerance_m: \
+                 the plan may sit that far from the pose"
+                    .to_string(),
+            )
+        } else if settle_rad < plan_rad {
+            Err("settle_orientation_tolerance_rad must be at least \
+                 plan_orientation_tolerance_rad: the plan may sit that far from the pose"
+                .to_string())
+        } else {
+            Ok(())
+        };
+        assert_eq!(settle.covers(&plan), expected);
     }
 }

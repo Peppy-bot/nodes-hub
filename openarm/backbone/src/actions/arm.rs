@@ -5,10 +5,10 @@
 //! joint limits for joint moves), refusing a value it does not take with
 //! `rejected`, and refuses it while the arm's follower delivers no fresh
 //! state or a leader streams the arm ([`admit_limb`]); a move claims the
-//! target arm's single-flight slot, then hands the accepted goal to that
-//! arm's planner over its goal channel. The planner runs the motion -
-//! governed against the other arm - settles it, ends the goal, and releases
-//! the busy slot at the terminal. The check claims nothing: the coordinator
+//! target arm's move slot, then hands the accepted goal to that arm's
+//! planner over its goal channel. The planner runs the motion - governed
+//! against the other arm - settles it, ends the goal, and releases the move
+//! slot at the terminal. The check claims nothing: the coordinator
 //! asks the planner and answers whether a plan exists, or the refusal a
 //! goal would get, as an error reply.
 
@@ -16,24 +16,79 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use control_core::positive_finite::PositiveFinite;
+use openarm_description::{ARM_DOF, ArmPair, Side};
 use peppygen::exposed_actions::limb_motion::{move_arm, move_arm_joints};
 use peppygen::exposed_services::limb_motion::check_arm_move;
 use peppygen::{NodeRunner, Result};
-use srs_model::Limit;
+use srs_model::{JointVec, Limit};
 use tokio::sync::{mpsc, oneshot};
 use tracing::error;
 
-use crate::actions::{ARM_WORDS, admit_limb, blocking_ask_coordinator, check_limb_free};
+use crate::actions::{
+    ARM_WORDS, admit_limb, blocking_ask_coordinator, check_limb_free, move_seconds_from_wire,
+    tolerance_from_wire,
+};
 use crate::coordinator::CoordinatorRequest;
 use crate::failure::{Failure, FailureKind};
-use crate::planner::{Goal, JointReply, PlanCheck};
-use crate::settle::Settle;
-use crate::side::{ArmPair, Side};
+use crate::move_slot::MoveSlot;
+use crate::planner::{ArmMoveRequest, Goal, JointReply, PlanCheck};
+use crate::settle::{PoseTolerance, Settle};
 use crate::streams::LeaderActivity;
-use crate::types::{
-    ARM_DOF, ArmMoveRequest, JointVec, PoseTolerance, joint_tolerances_from_wire,
-    move_seconds_from_wire,
-};
+use crate::types::pose_from_wire;
+
+/// Parse the wire pair of the `{field}_position_tolerance_m` and
+/// `{field}_orientation_tolerance_rad` goal fields, each a positive finite
+/// number, or the refusal naming the field.
+fn pose_tolerance_from_wire(
+    field: &str,
+    position_m: f64,
+    orientation_rad: f64,
+) -> std::result::Result<PoseTolerance, String> {
+    Ok(PoseTolerance {
+        position_m: tolerance_from_wire(&format!("{field}_position_tolerance_m"), position_m)?,
+        orientation_rad: tolerance_from_wire(
+            &format!("{field}_orientation_tolerance_rad"),
+            orientation_rad,
+        )?,
+    })
+}
+
+/// Parse the per-joint settle tolerances off the wire, one per joint in the
+/// arm's joint order: each a positive finite number, or the refusal.
+fn joint_tolerances_from_wire(tolerances: JointVec) -> std::result::Result<JointVec, String> {
+    if tolerances.iter().all(|&v| PositiveFinite::parse(v).is_ok()) {
+        return Ok(tolerances);
+    }
+    Err("each settle_tolerances_rad entry must be a positive number".to_string())
+}
+
+/// Parse the planning fields `move_arm` and `check_arm_move` share into the
+/// [`ArmMoveRequest`] both take, or the refusal both give.
+fn arm_move_request(
+    arm_name: &str,
+    position: [f64; 3],
+    orientation: [f64; 4],
+    duration_s: f64,
+    plan_position_tolerance_m: f64,
+    plan_orientation_tolerance_rad: f64,
+) -> std::result::Result<ArmMoveRequest, String> {
+    let side = Side::from_arm_name(arm_name).map_err(|e| e.to_string())?;
+    let target = pose_from_wire(position, orientation)
+        .map_err(|reason| format!("goal pose has {reason}"))?;
+    let tolerance = pose_tolerance_from_wire(
+        "plan",
+        plan_position_tolerance_m,
+        plan_orientation_tolerance_rad,
+    )?;
+    let duration = move_seconds_from_wire("duration_s", duration_s)?;
+    Ok(ArmMoveRequest {
+        side,
+        target,
+        tolerance,
+        duration,
+    })
+}
 
 fn target_in_limits(q: &JointVec, limits: &[Limit; ARM_DOF]) -> bool {
     q.iter().zip(limits).all(|(&v, l)| v >= l.lo && v <= l.hi)
@@ -47,7 +102,7 @@ struct MoveArmGoal {
 }
 
 fn move_arm_goal(d: &move_arm::GoalRequestData) -> std::result::Result<MoveArmGoal, String> {
-    let request = ArmMoveRequest::from_wire(
+    let request = arm_move_request(
         &d.arm_name,
         d.position,
         d.orientation,
@@ -55,7 +110,7 @@ fn move_arm_goal(d: &move_arm::GoalRequestData) -> std::result::Result<MoveArmGo
         d.plan_position_tolerance_m,
         d.plan_orientation_tolerance_rad,
     )?;
-    let tolerance = PoseTolerance::from_wire(
+    let tolerance = pose_tolerance_from_wire(
         "settle",
         d.settle_position_tolerance_m,
         d.settle_orientation_tolerance_rad,
@@ -81,7 +136,7 @@ fn joint_move_request(
     d: &move_arm_joints::GoalRequestData,
     limits: &ArmPair<[Limit; ARM_DOF]>,
 ) -> std::result::Result<JointMoveRequest, String> {
-    let side = Side::from_arm_name(&d.arm_name)?;
+    let side = Side::from_arm_name(&d.arm_name).map_err(|e| e.to_string())?;
     if !d.joint_positions.iter().all(|v| v.is_finite()) {
         return Err("non-finite joint target".to_string());
     }
@@ -102,11 +157,11 @@ fn joint_move_request(
 }
 
 /// Expose `move_arm_joints`: validate + claim, then hand the goal to the arm's
-/// planner. The planner releases the busy slot when the move ends.
+/// planner. The planner releases the move slot when the move ends.
 pub async fn run_move_arm_joints(
     runner: Arc<NodeRunner>,
     goal_txs: ArmPair<mpsc::Sender<Goal>>,
-    busy: ArmPair<Arc<AtomicBool>>,
+    move_slots: ArmPair<MoveSlot>,
     fresh: ArmPair<Arc<AtomicBool>>,
     activity: ArmPair<LeaderActivity>,
     limits: ArmPair<[Limit; ARM_DOF]>,
@@ -119,7 +174,7 @@ pub async fn run_move_arm_joints(
                     .map_err(|reason| Failure::new(FailureKind::Rejected, reason))
                     .and_then(|request| {
                         let side = request.side;
-                        admit_limb(&fresh[side], &activity[side], &busy[side], &ARM_WORDS)
+                        admit_limb(&fresh[side], &activity[side], &move_slots[side], &ARM_WORDS)
                     });
                 Ok(match admitted {
                     Ok(()) => move_arm_joints::GoalDecision::accept(),
@@ -143,7 +198,7 @@ pub async fn run_move_arm_joints(
             .await
             .is_err()
         {
-            busy[side].store(false, Ordering::Release);
+            move_slots[side].release();
             error!("move_arm_joints: coordinator channel closed");
             return Ok(());
         }
@@ -155,7 +210,7 @@ pub async fn run_move_arm_joints(
 pub async fn run_move_arm(
     runner: Arc<NodeRunner>,
     goal_txs: ArmPair<mpsc::Sender<Goal>>,
-    busy: ArmPair<Arc<AtomicBool>>,
+    move_slots: ArmPair<MoveSlot>,
     fresh: ArmPair<Arc<AtomicBool>>,
     activity: ArmPair<LeaderActivity>,
 ) -> Result<()> {
@@ -167,7 +222,7 @@ pub async fn run_move_arm(
                     .map_err(|reason| Failure::new(FailureKind::Rejected, reason))
                     .and_then(|goal| {
                         let side = goal.request.side;
-                        admit_limb(&fresh[side], &activity[side], &busy[side], &ARM_WORDS)
+                        admit_limb(&fresh[side], &activity[side], &move_slots[side], &ARM_WORDS)
                     });
                 Ok(match admitted {
                     Ok(()) => move_arm::GoalDecision::accept(),
@@ -188,7 +243,7 @@ pub async fn run_move_arm(
             .await
             .is_err()
         {
-            busy[side].store(false, Ordering::Release);
+            move_slots[side].release();
             error!("move_arm: coordinator channel closed");
             return Ok(());
         }
@@ -225,7 +280,7 @@ fn check_plan(
     activity: &ArmPair<LeaderActivity>,
     d: &check_arm_move::RequestData,
 ) -> std::result::Result<check_arm_move::Response, Failure> {
-    let request = ArmMoveRequest::from_wire(
+    let request = arm_move_request(
         &d.arm_name,
         d.position,
         d.orientation,
@@ -256,4 +311,52 @@ fn check_plan(
         }
         PlanCheck::Unreachable(reason) => check_arm_move::Response::new(false, reason, 0.0),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use hegel::TestCase;
+    use hegel::generators as gs;
+
+    // Per-joint tolerances are accepted exactly when every entry is a
+    // positive finite value, kept in order.
+    #[hegel::test]
+    fn joint_tolerances_need_a_positive_value_per_joint(tc: TestCase) {
+        let values: JointVec = tc.draw(gs::arrays(gs::floats()));
+        let admitted = values.iter().all(|v| v.is_finite() && *v > 0.0);
+        match joint_tolerances_from_wire(values) {
+            Ok(parsed) => {
+                assert!(admitted, "{values:?} was accepted");
+                assert_eq!(parsed, values);
+            }
+            Err(refusal) => {
+                assert!(!admitted, "{values:?} was refused");
+                assert_eq!(
+                    refusal,
+                    "each settle_tolerances_rad entry must be a positive number"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_pose_tolerance_names_the_axis_it_refuses() {
+        assert_eq!(
+            pose_tolerance_from_wire("plan", 0.0, 0.1).unwrap_err(),
+            "plan_position_tolerance_m must be a positive number"
+        );
+        assert_eq!(
+            pose_tolerance_from_wire("settle", 0.01, -1.0).unwrap_err(),
+            "settle_orientation_tolerance_rad must be a positive number"
+        );
+        assert_eq!(
+            pose_tolerance_from_wire("plan", 0.005, 0.087),
+            Ok(PoseTolerance {
+                position_m: 0.005,
+                orientation_rad: 0.087,
+            })
+        );
+    }
 }
