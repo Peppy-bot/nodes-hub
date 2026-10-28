@@ -15,11 +15,14 @@
 //!   bus; the follow loop refreshes that cache every tick, so the reading is
 //!   always current.
 
+use std::ops::ControlFlow;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use control_core::latched_log::LatchedLog;
+use control_core::receiving::receive;
 use control_core::sync::lock_ignoring_poison;
+use control_core::time::sleep_unless_cancelled;
 use peppygen::NodeRunner;
 use peppygen::paired_topics::backbone;
 use peppylib::runtime::CancellationToken;
@@ -39,6 +42,8 @@ pub struct GripperSetpoint {
     pub max_effort: Option<MaxEffortNm>,
 }
 
+/// Keep the latest setpoint the paired backbone streams in `latest` until
+/// the subscription closes or `token` cancels.
 pub async fn run_setpoint_listener(
     runner: Arc<NodeRunner>,
     latest: watch::Sender<Option<GripperSetpoint>>,
@@ -51,38 +56,33 @@ pub async fn run_setpoint_listener(
             return;
         }
     };
-    loop {
-        let received = tokio::select! {
-            _ = token.cancelled() => return,
-            received = subscription.next() => received,
-        };
-        let (_peer, msg) = match received {
-            Ok(Some(pair)) => pair,
-            Ok(None) => return,
-            Err(e) => {
-                error!(error = %e, "gripper_setpoints receive");
-                continue;
+    receive(
+        "gripper_setpoints",
+        token.cancelled(),
+        async move || subscription.next().await,
+        async move |(_peer, msg)| {
+            if !msg.opening.is_finite() {
+                warn!(
+                    "gripper_setpoints: dropping a setpoint with a non-finite opening {}",
+                    msg.opening
+                );
+                return ControlFlow::Continue(());
             }
-        };
-        if !msg.opening.is_finite() {
-            warn!(
-                "gripper_setpoints: dropping a setpoint with a non-finite opening {}",
-                msg.opening
-            );
-            continue;
-        }
-        let max_effort = match MaxEffortNm::parse(msg.max_effort) {
-            Ok(max_effort) => max_effort,
-            Err(reason) => {
-                warn!("gripper_setpoints: dropping a setpoint, {reason}");
-                continue;
-            }
-        };
-        latest.send_replace(Some(GripperSetpoint {
-            opening: msg.opening,
-            max_effort,
-        }));
-    }
+            let max_effort = match MaxEffortNm::parse(msg.max_effort) {
+                Ok(max_effort) => max_effort,
+                Err(reason) => {
+                    warn!("gripper_setpoints: dropping a setpoint, {reason}");
+                    return ControlFlow::Continue(());
+                }
+            };
+            latest.send_replace(Some(GripperSetpoint {
+                opening: msg.opening,
+                max_effort,
+            }));
+            ControlFlow::Continue(())
+        },
+    )
+    .await;
 }
 
 pub async fn run_state_publisher(
@@ -97,9 +97,8 @@ pub async fn run_state_publisher(
     };
     let peer_warn = LatchedLog::warn("paired gripper_states publish");
     loop {
-        tokio::select! {
-            _ = token.cancelled() => return,
-            _ = tokio::time::sleep(period) => {}
+        if !sleep_unless_cancelled(period, token.cancelled()).await {
+            return;
         }
         let state = lock_ignoring_poison(&gripper).wire_state();
         // Skip a poisoned sample rather than publishing NaN/Inf to consumers,

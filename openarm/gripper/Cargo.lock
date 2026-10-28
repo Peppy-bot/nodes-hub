@@ -537,7 +537,7 @@ dependencies = [
 [[package]]
 name = "control_core"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#7511ffc9fd5923ec1ee7cff61e8f2b11b1fc0ece"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#eb844c23f88e1f526981fbb91a55b4ef89f2a107"
 dependencies = [
  "thiserror 2.0.21",
  "tokio",
@@ -1755,7 +1755,7 @@ dependencies = [
 [[package]]
 name = "instance_lock"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#7511ffc9fd5923ec1ee7cff61e8f2b11b1fc0ece"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#eb844c23f88e1f526981fbb91a55b4ef89f2a107"
 dependencies = [
  "thiserror 2.0.21",
 ]
@@ -2424,7 +2424,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 [[package]]
 name = "openarm_can"
 version = "0.2.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#7511ffc9fd5923ec1ee7cff61e8f2b11b1fc0ece"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#eb844c23f88e1f526981fbb91a55b4ef89f2a107"
 dependencies = [
  "control_core",
  "nix 0.31.3",
@@ -2436,7 +2436,7 @@ dependencies = [
 [[package]]
 name = "openarm_description"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#7511ffc9fd5923ec1ee7cff61e8f2b11b1fc0ece"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#eb844c23f88e1f526981fbb91a55b4ef89f2a107"
 dependencies = [
  "urdf-rs",
 ]
