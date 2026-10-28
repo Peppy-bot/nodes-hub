@@ -14,6 +14,7 @@
 use std::time::{Duration, Instant};
 
 use control_core::report_once::ReportOnce;
+use control_core::time::block_until_unless_cancelled;
 use openarm_description::{ARM_DOF, ArmPair, HardwareVersion};
 use peppylib::runtime::CancellationToken;
 use tokio::sync::{oneshot, watch};
@@ -140,7 +141,9 @@ fn run(
                     warn!("KER connection lost ({reason}); retrying every {RECONNECT_BACKOFF:?}");
                     warned = Some(reason);
                 }
-                sleep_cancellable(RECONNECT_BACKOFF, &token);
+                block_until_unless_cancelled(Instant::now() + RECONNECT_BACKOFF, || {
+                    token.is_cancelled()
+                });
             }
             SessionEnd::Fatal(reason) => {
                 let _ = tx.send(None);
@@ -382,13 +385,6 @@ fn format_raw(frame: &KerFrame) -> String {
         .map(|(i, a)| format!("CH{:02}={a:.2}", i + 1))
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-fn sleep_cancellable(total: Duration, token: &CancellationToken) {
-    let deadline = Instant::now() + total;
-    while Instant::now() < deadline && !token.is_cancelled() {
-        std::thread::sleep(Duration::from_millis(50));
-    }
 }
 
 #[cfg(test)]
