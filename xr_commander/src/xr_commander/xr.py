@@ -2,7 +2,8 @@
 
 Owns the server lifecycle only; what an XR frame is lives in `devices`, so the
 clutch and publishers never import a web stack. teleop_xr serves the page at
-'/' itself; the routes behind the page's Robot card are `robot_choice`'s.
+'/' itself; the routes behind the page's Robot card are `robot_choice`'s,
+and the task page beside it is `task_page`'s.
 """
 
 from __future__ import annotations

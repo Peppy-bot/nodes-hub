@@ -12,25 +12,21 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 
 import cv2
 import numpy as np
 
 from xr_commander import motor_health
-from xr_commander.alerts import (
-    CRITICAL,
-    FAULT,
-    WARNING,
-    ActiveAlerts,
-    Alert,
-    fit_text,
-)
+from xr_commander.alerts import ActiveAlerts, Alert
 from xr_commander.bus import REAL_CLOCK, CancellationToken, Clock, Latch, ticks
 from xr_commander.clutch import HandClutch
 from xr_commander.config import Settings
-from xr_commander.devices import FrameSource, fresh_frame
+from xr_commander.devices import POSTURE_HAND, FrameSource, Hand, fresh_frame
 from xr_commander.drive import HandState, RobotLine
-from xr_commander.publish import MeasuredPoses, PostureStatus
+from xr_commander.motor_health import Level
+from xr_commander.postures import PostureStatus
+from xr_commander.publish import MeasuredPoses
 from xr_commander.record import RecorderStatus
 from xr_commander.video import FrameSink
 
@@ -99,16 +95,14 @@ _FAULT_RED = (90, 90, 255)
 # Magenta for a producer or motor gone quiet: its state is unknown, which is
 # neither healthy grey nor alert red.
 _NOT_REPORTING_MAGENTA = (230, 120, 230)
-# Alert text by severity: amber warns, red demands a stop.
-_ALERT_COLOURS = {WARNING: _WAITING, CRITICAL: _CRITICAL_RED, FAULT: _FAULT_RED}
-# Health rows by level, sharing the alert palette from warning up; a None
-# level is a source-name heading.
-_HEALTH_COLOURS = {
-    motor_health.NOMINAL: _RESTING,
-    motor_health.WARNING: _WAITING,
-    motor_health.CRITICAL: _CRITICAL_RED,
-    motor_health.FAULT: _FAULT_RED,
-    motor_health.NOT_REPORTING: _NOT_REPORTING_MAGENTA,
+# Alert text and health rows by level: amber warns, red demands a stop. A
+# None level is a source-name heading.
+_LEVEL_COLOURS = {
+    Level.NOMINAL: _RESTING,
+    Level.WARNING: _WAITING,
+    Level.CRITICAL: _CRITICAL_RED,
+    Level.FAULT: _FAULT_RED,
+    Level.NOT_REPORTING: _NOT_REPORTING_MAGENTA,
     None: _HEADING,
 }
 
@@ -128,7 +122,7 @@ class HandSource:
     each snapshot: the pairs follow the stack's joins and the choice.
     """
 
-    handedness: str
+    handedness: Hand
     clutch: HandClutch
     # The hand's hold on its robot, shared with its streams: whether a
     # squeeze must be released first, and the cause of a refused squeeze.
@@ -214,11 +208,11 @@ def alert_lines(active: Sequence[Alert]) -> tuple[PanelLine, ...]:
     dropping it silently, so the panel never understates how much is wrong.
     """
     if len(active) <= _MAX_ALERT_LINES:
-        return tuple(PanelLine(a.text, _ALERT_COLOURS[a.severity]) for a in active)
+        return tuple(PanelLine(a.text, _LEVEL_COLOURS[a.severity]) for a in active)
     shown = active[: _MAX_ALERT_LINES - 1]
     hidden = active[_MAX_ALERT_LINES - 1 :]
-    return tuple(PanelLine(a.text, _ALERT_COLOURS[a.severity]) for a in shown) + (
-        PanelLine(f"+{len(hidden)} more", _ALERT_COLOURS[hidden[0].severity]),
+    return tuple(PanelLine(a.text, _LEVEL_COLOURS[a.severity]) for a in shown) + (
+        PanelLine(f"+{len(hidden)} more", _LEVEL_COLOURS[hidden[0].severity]),
     )
 
 
@@ -228,13 +222,13 @@ def health_lines(rows: Sequence[motor_health.HealthRow]) -> tuple[PanelLine, ...
     Past what the canvas holds the last line counts the remainder, wearing
     the highest hidden level so a buried fault still colours the panel.
     """
-    lines = tuple(PanelLine(row.text, _HEALTH_COLOURS[row.level]) for row in rows)
+    lines = tuple(PanelLine(row.text, _LEVEL_COLOURS[row.level]) for row in rows)
     if len(lines) <= _MAX_HEALTH_LINES:
         return lines
     hidden = rows[_MAX_HEALTH_LINES - 1 :]
     worst = max((row.level for row in hidden if row.level is not None), default=None)
     return lines[: _MAX_HEALTH_LINES - 1] + (
-        PanelLine(f"+{len(hidden)} more", _HEALTH_COLOURS[worst]),
+        PanelLine(f"+{len(hidden)} more", _LEVEL_COLOURS[worst]),
     )
 
 
@@ -340,8 +334,12 @@ def snapshot(
     bound = [hand.bound() for hand in hands]
     wired = [binding for binding in bound if binding.wired]
     shown = wired if wired else bound
-    has_right = any(b.hand.handedness == "right" for b in shown)
-    noted = "right" if has_right else (shown[0].hand.handedness if shown else None)
+    has_posture_hand = any(b.hand.handedness == POSTURE_HAND for b in shown)
+    noted = (
+        POSTURE_HAND
+        if has_posture_hand
+        else (shown[0].hand.handedness if shown else None)
+    )
     rows = []
     for binding in shown:
         hand = binding.hand
@@ -394,6 +392,54 @@ def _text(
     colour: tuple[int, int, int],
 ) -> None:
     cv2.putText(frame, body, origin, _FONT, scale, colour, _STROKE, cv2.LINE_AA)
+
+
+# Below this fraction of the intended scale the glyphs stop surviving VP8,
+# which blurs fine strokes. Past it the text is truncated rather than shrunk
+# further: a readable prefix naming the joint beats an unreadable smear of
+# the whole message.
+_MIN_SCALE_FRACTION = 0.55
+_ELLIPSIS = "..."
+
+
+# Memoized: the status panel refits its rows on every redraw, and the
+# truncation branch measures once per dropped character. The result is
+# pure in the arguments, so a re-drawn row costs one cache lookup.
+@lru_cache(maxsize=256)
+def fit_text(
+    text: str, font: int, scale: float, thickness: int, available_px: int
+) -> tuple[str, float]:
+    """`text` and the scale to draw it at, fitted inside `available_px`.
+
+    Shrinks first, then truncates once shrinking would cost legibility.
+    """
+    if available_px <= 0:
+        return "", scale
+    if cv2.getTextSize(text, font, scale, thickness)[0][0] <= available_px:
+        return text, scale
+    floor = scale * _MIN_SCALE_FRACTION
+    if cv2.getTextSize(text, font, floor, thickness)[0][0] > available_px:
+        # Even the legibility floor cannot hold the whole text: keep the
+        # floor and drop characters off the end instead.
+        kept = text
+        while kept and (
+            cv2.getTextSize(kept + _ELLIPSIS, font, floor, thickness)[0][0]
+            > available_px
+        ):
+            kept = kept[:-1]
+        return (kept + _ELLIPSIS if kept else ""), floor
+    # The whole text fits at the floor but not at full scale, so the largest
+    # fitting scale lies between them. Rendered widths are a stair-stepped
+    # function of scale (glyph widths round up), which defeats proportional
+    # estimation near the boundary; bisection pins it in a dozen passes.
+    lo, hi = floor, scale
+    for _ in range(12):
+        mid = (lo + hi) / 2.0
+        if cv2.getTextSize(text, font, mid, thickness)[0][0] <= available_px:
+            lo = mid
+        else:
+            hi = mid
+    return text, lo
 
 
 def _fitted(body: str, scale: float, width: int) -> tuple[str, float]:

@@ -25,7 +25,7 @@ def quat_normalize(q: np.ndarray) -> np.ndarray:
     return q / norm
 
 
-def quat_canonical(q: np.ndarray) -> np.ndarray:
+def _quat_canonical(q: np.ndarray) -> np.ndarray:
     """The non-negative-scalar representative: q and -q are one rotation."""
     return -q if q[3] < 0.0 else q
 
@@ -50,19 +50,9 @@ def quat_multiply(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     )
 
 
-def quat_from_axis_angle(axis: np.ndarray, angle: float) -> np.ndarray:
-    """Rotation of `angle` about `axis`; degenerate axis or zero angle is identity."""
-    axis = np.asarray(axis, dtype=np.float64)
-    norm = float(np.linalg.norm(axis))
-    if norm < _EPS or angle == 0.0:
-        return np.array([0.0, 0.0, 0.0, 1.0])
-    half = 0.5 * angle
-    return np.concatenate([(axis / norm) * math.sin(half), [math.cos(half)]])
-
-
 def quat_axis_angle(q: np.ndarray) -> tuple[np.ndarray, float]:
     """(axis, angle) with angle in [0, pi]; identity yields (+Z, 0)."""
-    q = quat_canonical(q)
+    q = _quat_canonical(q)
     vec_norm = float(np.linalg.norm(q[:3]))
     if vec_norm < _EPS:
         return np.array([0.0, 0.0, 1.0]), 0.0
@@ -87,7 +77,7 @@ class Pose:
             raise ValueError(f"position is not finite: {position}")
         position.setflags(write=False)
         object.__setattr__(self, "position", position)
-        orientation = quat_canonical(quat_normalize(self.orientation))
+        orientation = _quat_canonical(quat_normalize(self.orientation))
         orientation.setflags(write=False)
         object.__setattr__(self, "orientation", orientation)
 

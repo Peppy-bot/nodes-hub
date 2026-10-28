@@ -3,13 +3,12 @@ import math
 import numpy as np
 import pytest
 
-from tests.helpers import IDENTITY, X, Y
+from tests.helpers import IDENTITY, X, Y, quat_from_axis_angle
 from xr_commander.frames import (
     Pose,
     apply_offset,
     quat_axis_angle,
     quat_conjugate,
-    quat_from_axis_angle,
     quat_multiply,
     quat_normalize,
     relative_rotation,

@@ -1,5 +1,5 @@
-"""Small helpers shared by every stream task: the clock, logging, the
-outcomes of service calls and bus receive."""
+"""Small helpers shared by every stream task: the clock, logging, firing a
+goal, the outcomes of service calls and bus receive."""
 
 from __future__ import annotations
 
@@ -88,6 +88,20 @@ class Latch:
         self._tripped = False
 
 
+def latch_for(latches: dict[Any, Latch], key: Any) -> Latch:
+    """`key`'s latch in `latches`, made on first use."""
+    latch = latches.get(key)
+    if latch is None:
+        latch = latches[key] = Latch()
+    return latch
+
+
+def producer_key(producer) -> tuple[str, str]:
+    """A producer's (core node, instance id): unique across the mesh, where
+    an instance id alone is unique only within one stack."""
+    return (producer.core_node, producer.instance_id)
+
+
 # How long an outcome flashes on a panel row.
 FLASH_S = 3.0
 
@@ -113,6 +127,23 @@ def cause(message: str) -> str:
     """The clause of the message of a refusal or a failure that names the
     cause, ahead of the remedy a backbone appends after a semicolon."""
     return (message or "no reason given").split(";", 1)[0]
+
+
+async def fire_goal(node_runner, action_module, target, name: str, **request_fields):
+    """The goal handle, accepted or refused with the refusal logged, or None
+    with the send failure logged. Builds the request too, so a constructor
+    that raises is logged as a send failure and the button loop goes on."""
+    try:
+        request = action_module.GoalRequest(**request_fields)
+        fired = await action_module.ActionHandle.fire_goal(
+            node_runner, target, request, GOAL_SEND_TIMEOUT_S
+        )
+    except Exception as e:
+        log(f"{name} failed to send: {e!r}")
+        return None
+    if not fired.accepted:
+        log(f"{name} refused: {fired.refusal}")
+    return fired
 
 
 @dataclass(frozen=True)
@@ -213,6 +244,16 @@ async def ticks(
         if token.is_cancelled():
             return
         yield
+
+
+async def subscribe_or_log(node_runner, topic_module, label: str):
+    """`topic_module`'s subscription, or None with the failure logged as
+    `label`'s."""
+    try:
+        return await topic_module.subscribe(node_runner)
+    except Exception as e:
+        log(f"{label} subscribe failed: {e!r}")
+        return None
 
 
 async def messages(

@@ -1,25 +1,17 @@
 import math
-from types import SimpleNamespace
 
 import pytest
 
+from tests.helpers import default_parameters
 from xr_commander import config
-
-BASE = {
-    "command_rate_hz": 100,
-    "https_port": 4443,
-    "https_host": "0.0.0.0",
-    "motion_scale": 1.0,
-    "gripper_open_fraction": 1.0,
-    "posture_move_duration_s": 2.0,
-    "stale_timeout_s": 0.25,
-    "view_max_width": 640,
-    "status_panel_enabled": True,
-}
 
 
 def params(**overrides):
-    return SimpleNamespace(**{**BASE, **overrides})
+    """The default parameters at a 100 Hz command rate and a 0.25 s stale
+    timeout."""
+    return default_parameters(
+        **{"command_rate_hz": 100, "stale_timeout_s": 0.25, **overrides}
+    )
 
 
 def test_the_defaults_parse_and_derive_the_tick_period():

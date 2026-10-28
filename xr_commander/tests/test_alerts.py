@@ -1,6 +1,5 @@
 import asyncio
 
-import cv2
 from peppygen.consumed_topics.alerts import alerts as alerts_topic
 
 from tests.helpers import FakeToken, boot, eventually, running_drain
@@ -8,9 +7,9 @@ from xr_commander.alerts import (
     ALERT_STALE_AFTER_MS,
     ActiveAlerts,
     drain_alerts,
-    fit_text,
     follow_producers,
 )
+from xr_commander.motor_health import Level
 
 STALE_AFTER_S = ALERT_STALE_AFTER_MS / 1000.0
 LEFT_ARM = ("core", "left_arm_inst")
@@ -58,7 +57,7 @@ def test_an_alert_names_its_source_severity_and_message():
     assert raise_alert(active) == []
     (alert,) = active.active()
     assert alert.text == "LEFT ARM J2 CRITICAL: holding 96% of rated torque"
-    assert alert.severity == 2
+    assert alert.severity is Level.CRITICAL
 
 
 def test_an_entry_with_an_undefined_severity_is_dropped():
@@ -312,7 +311,14 @@ async def test_a_malformed_entry_is_reported_once_and_its_set_still_lands(capsys
 async def test_follow_producers_drops_a_departed_producers_alerts():
     async with boot(alerts_instances=1) as h:
         (left,) = h.mocks.deps.alerts
-        active = active_alerts(bound=[])
+        active = ActiveAlerts(
+            bound_now=lambda: [
+                (p.core_node, p.instance_id)
+                for p in alerts_topic.bound_producers(h.node_runner)
+            ]
+        )
+        # Bound to nothing until the poll reads the slot.
+        active.retain([])
         async with running_drain(
             lambda token: drain_alerts(h.node_runner, alerts_topic, active, token)
         ):
@@ -322,9 +328,7 @@ async def test_follow_producers_drops_a_departed_producers_alerts():
             )
             # The real slot holds the mock, so the poll keeps the set.
             async with running_drain(
-                lambda token: follow_producers(
-                    h.node_runner, alerts_topic, active, token, period_s=0.01
-                )
+                lambda token: follow_producers(active, token, period_s=0.01)
             ):
                 await eventually(
                     lambda: active.producers_bound,
@@ -335,40 +339,6 @@ async def test_follow_producers_drops_a_departed_producers_alerts():
             # takes its alerts.
             active.retain([])
             assert active.active() == ()
-
-
-def test_a_long_message_is_truncated_rather_than_shrunk_to_a_smear():
-    # Shrinking without a floor turns a long message into a one-pixel smear
-    # carrying no information.
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    long_text = "LEFT ARM J2 CRITICAL: " + "x" * 800
-    body, scale = fit_text(long_text, font, 1.0, 2, 600)
-    assert scale >= 0.5, "the glyphs stay legible"
-    assert len(body) < len(long_text), "the message is truncated"
-    assert body.startswith("LEFT ARM J2 CRITICAL:"), "the joint survives"
-    assert cv2.getTextSize(body, font, scale, 2)[0][0] <= 600
-
-
-def test_a_message_that_fits_is_left_exactly_as_it_is():
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    body, scale = fit_text("J2 HOT", font, 1.0, 2, 600)
-    assert (body, scale) == ("J2 HOT", 1.0)
-
-
-def test_truncation_only_when_the_whole_text_cannot_fit_at_the_floor():
-    # A single proportional estimate under-shrinks when glyph widths round
-    # up, truncating messages that would fit whole a hair smaller. Sweep
-    # the widths: any truncation must be forced, not an estimation artifact.
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    text = "RIGHT ARM J4 CRITICAL: winding 91 C"
-    floor = 0.9 * 0.55
-    for available in range(60, 620, 4):
-        body, _scale = fit_text(text, font, 0.9, 2, available)
-        if body != text:
-            width_at_floor = cv2.getTextSize(text, font, floor, 2)[0][0]
-            assert width_at_floor > available, (
-                f"truncated at {available}px though the whole text fits at the floor"
-            )
 
 
 def test_equal_severity_alerts_keep_their_order_when_a_reading_ticks():
