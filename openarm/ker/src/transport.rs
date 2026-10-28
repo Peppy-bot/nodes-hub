@@ -1,7 +1,7 @@
-// Blocking byte transports to the KER's M5Stack CoreS3: USB vendor mode
-// (rusb) or the ESP32's serial device (serialport). Both poll reads with a short timeout so
-// the reader thread can check cancellation between reads; a timeout surfaces
-// as `Ok(0)`, device loss as `Err`.
+//! Blocking byte transports to the KER's M5Stack CoreS3: USB vendor mode
+//! (rusb) or the ESP32's serial device (serialport). Both poll reads with a short timeout so
+//! the reader thread can check cancellation between reads; a timeout surfaces
+//! as `Ok(0)`, device loss as `Err`.
 
 use std::fmt;
 use std::io;

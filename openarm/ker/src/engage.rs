@@ -1,15 +1,13 @@
-// Engagement policy: which arms track the KER, and what it takes to get
-// there. An arm engages when its trigger is squeezed to the engage opening,
-// having first read back above it, so a hand that never let go cannot start
-// motion. A gap between usable frames of at least the stale timeout, or a new
-// session, disengages both arms and takes that release requirement back.
+//! Engagement policy: which arms track the KER, and what it takes to get
+//! there. An arm engages when its trigger is squeezed to the engage opening,
+//! having first read back above it, so a hand that never let go cannot start
+//! motion. A gap between usable frames of at least the stale timeout, or a new
+//! session, disengages both arms and takes that release requirement back.
 
 use std::time::{Duration, Instant};
 
-use openarm_description::Side;
+use openarm_description::{ArmPair, Side};
 use tracing::info;
-
-use crate::side::{SideFlags, SideValues, index, label};
 
 /// Consecutive frames a trigger must read open before a squeeze can engage
 /// its arm. A checksum-passing frame can still carry a wrong angle, so the
@@ -51,10 +49,10 @@ impl TryFrom<f64> for EngageTriggerOpening {
 pub struct EngageLatch {
     engage_trigger_opening: EngageTriggerOpening,
     stale_timeout: Duration,
-    engaged: SideFlags,
+    engaged: ArmPair<bool>,
     /// Consecutive frames each trigger has read open for, held at
     /// [`FRAMES_TO_ARM`] once armed and cleared by a squeeze or a stall.
-    open_frames: [u8; 2],
+    open_frames: ArmPair<u8>,
     last_frame_at: Option<Instant>,
 }
 
@@ -63,31 +61,31 @@ impl EngageLatch {
         Self {
             engage_trigger_opening,
             stale_timeout,
-            engaged: SideFlags::NONE,
-            open_frames: [0; 2],
+            engaged: ArmPair::new(false, false),
+            open_frames: ArmPair::new(0, 0),
             last_frame_at: None,
         }
     }
 
     /// Fold in one usable frame's trigger openings, captured at `at`.
-    pub fn update(&mut self, triggers: SideValues, at: Instant) -> SideFlags {
+    pub fn update(&mut self, triggers: ArmPair<f64>, at: Instant) -> ArmPair<bool> {
         if self.stalled(at) {
-            if self.engaged != SideFlags::NONE {
+            if self.engaged.iter().any(|&engaged| engaged) {
                 info!("KER frames stalled; both arms disengaged, release and squeeze to re-engage");
             }
-            self.engaged = SideFlags::NONE;
-            self.open_frames = [0; 2];
+            self.engaged = ArmPair::new(false, false);
+            self.open_frames = ArmPair::new(0, 0);
         }
         let threshold = self.engage_trigger_opening.fraction();
-        for side in [Side::Left, Side::Right] {
-            let open_frames = &mut self.open_frames[index(side)];
-            if triggers.side(side) > threshold {
+        for side in Side::BOTH {
+            let open_frames = &mut self.open_frames[side];
+            if triggers[side] > threshold {
                 *open_frames = (*open_frames + 1).min(FRAMES_TO_ARM);
                 continue;
             }
-            if *open_frames >= FRAMES_TO_ARM && !self.engaged.side(side) {
-                self.engaged.set(side, true);
-                info!("KER {} arm engaged, tracking the leader", label(side));
+            if *open_frames >= FRAMES_TO_ARM && !self.engaged[side] {
+                self.engaged[side] = true;
+                info!("KER {side} arm engaged, tracking the leader");
             }
             // A squeeze ends the run of open frames, armed or not.
             *open_frames = 0;
@@ -102,33 +100,39 @@ impl EngageLatch {
     }
 }
 
+/// The engagement settings and states this crate's tests share.
 #[cfg(test)]
-mod tests {
+pub(crate) mod fixtures {
     use super::*;
 
-    const STALE: Duration = Duration::from_millis(250);
+    /// The stale window a test launch runs with.
+    pub(crate) const STALE: Duration = Duration::from_millis(250);
+    /// The trigger opening a test launch engages at.
+    pub(crate) const ENGAGE_AT: f64 = 0.2;
+    pub(crate) const NEITHER_ENGAGED: ArmPair<bool> = ArmPair::new(false, false);
+    pub(crate) const BOTH_ENGAGED: ArmPair<bool> = ArmPair::new(true, true);
+
+    pub(crate) fn engage_trigger_opening() -> EngageTriggerOpening {
+        EngageTriggerOpening::try_from(ENGAGE_AT).expect("in range")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixtures::*;
+    use super::*;
+
     const FRAME: Duration = Duration::from_millis(5);
-    const ENGAGE_AT: f64 = 0.2;
     const OPEN: f64 = 1.0;
     const SQUEEZED: f64 = 0.02;
-    const LEFT: SideFlags = SideFlags {
-        left: true,
-        right: false,
-    };
-    const BOTH: SideFlags = SideFlags {
-        left: true,
-        right: true,
-    };
+    const LEFT_ENGAGED: ArmPair<bool> = ArmPair::new(true, false);
 
     fn latch() -> EngageLatch {
-        EngageLatch::new(
-            EngageTriggerOpening::try_from(ENGAGE_AT).expect("in range"),
-            STALE,
-        )
+        EngageLatch::new(engage_trigger_opening(), STALE)
     }
 
-    fn triggers(left: f64, right: f64) -> SideValues {
-        SideValues { left, right }
+    fn triggers(left: f64, right: f64) -> ArmPair<f64> {
+        ArmPair::new(left, right)
     }
 
     /// Feed `frames` open frames to both triggers, returning the time of the
@@ -169,27 +173,24 @@ mod tests {
         let at = arm_both(&mut latch, Instant::now());
         assert_eq!(
             latch.update(triggers(OPEN, SQUEEZED), at),
-            SideFlags {
-                left: false,
-                right: true
-            }
+            ArmPair::new(false, true)
         );
         assert_eq!(
             latch.update(triggers(OPEN, OPEN), at + FRAME),
-            SideFlags {
-                left: false,
-                right: true
-            },
+            ArmPair::new(false, true),
             "releasing keeps the arm tracking"
         );
-        assert_eq!(latch.update(triggers(SQUEEZED, OPEN), at + FRAME * 2), BOTH);
+        assert_eq!(
+            latch.update(triggers(SQUEEZED, OPEN), at + FRAME * 2),
+            BOTH_ENGAGED
+        );
     }
 
     #[test]
     fn the_engage_trigger_opening_itself_engages() {
         let mut latch = latch();
         let at = arm_both(&mut latch, Instant::now());
-        assert_eq!(latch.update(triggers(ENGAGE_AT, OPEN), at), LEFT);
+        assert_eq!(latch.update(triggers(ENGAGE_AT, OPEN), at), LEFT_ENGAGED);
     }
 
     #[test]
@@ -199,13 +200,13 @@ mod tests {
         for tick in 0..8 {
             assert_eq!(
                 latch.update(triggers(SQUEEZED, SQUEEZED), at),
-                SideFlags::NONE,
+                NEITHER_ENGAGED,
                 "tick {tick}: a hand already on the trigger must not engage"
             );
             at += FRAME;
         }
         let at = arm_both(&mut latch, at);
-        assert_eq!(latch.update(triggers(SQUEEZED, SQUEEZED), at), BOTH);
+        assert_eq!(latch.update(triggers(SQUEEZED, SQUEEZED), at), BOTH_ENGAGED);
     }
 
     #[test]
@@ -220,7 +221,7 @@ mod tests {
         at += FRAME;
         assert_eq!(
             latch.update(triggers(SQUEEZED, SQUEEZED), at),
-            SideFlags::NONE
+            NEITHER_ENGAGED
         );
     }
 
@@ -234,7 +235,7 @@ mod tests {
             at += FRAME;
             assert_eq!(
                 latch.update(triggers(SQUEEZED, SQUEEZED), at),
-                SideFlags::NONE,
+                NEITHER_ENGAGED,
                 "a squeeze between open frames restarts the run"
             );
             at += FRAME;
@@ -247,13 +248,16 @@ mod tests {
         let at = open_for(&mut one_short, Instant::now(), FRAMES_TO_ARM - 1);
         assert_eq!(
             one_short.update(triggers(SQUEEZED, SQUEEZED), at),
-            SideFlags::NONE,
+            NEITHER_ENGAGED,
             "one frame short of the run must not engage"
         );
 
         let mut whole_run = latch();
         let at = open_for(&mut whole_run, Instant::now(), FRAMES_TO_ARM);
-        assert_eq!(whole_run.update(triggers(SQUEEZED, SQUEEZED), at), BOTH);
+        assert_eq!(
+            whole_run.update(triggers(SQUEEZED, SQUEEZED), at),
+            BOTH_ENGAGED
+        );
     }
 
     #[test]
@@ -264,11 +268,11 @@ mod tests {
         let just_inside = at + STALE - FRAME;
         assert_eq!(
             latch.update(triggers(SQUEEZED, SQUEEZED), just_inside),
-            BOTH
+            BOTH_ENGAGED
         );
         assert_eq!(
             latch.update(triggers(SQUEEZED, SQUEEZED), just_inside + STALE),
-            SideFlags::NONE
+            NEITHER_ENGAGED
         );
     }
 
@@ -281,7 +285,7 @@ mod tests {
         for tick in 0..FRAMES_TO_ARM + 1 {
             assert_eq!(
                 latch.update(triggers(SQUEEZED, SQUEEZED), returned + FRAME * tick as u32),
-                SideFlags::NONE,
+                NEITHER_ENGAGED,
                 "a trigger held across the stall must not re-engage"
             );
         }
@@ -291,6 +295,6 @@ mod tests {
             latch.update(triggers(OPEN, SQUEEZED), at);
             at += FRAME;
         }
-        assert_eq!(latch.update(triggers(SQUEEZED, SQUEEZED), at), LEFT);
+        assert_eq!(latch.update(triggers(SQUEEZED, SQUEEZED), at), LEFT_ENGAGED);
     }
 }

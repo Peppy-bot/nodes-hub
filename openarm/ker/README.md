@@ -79,12 +79,12 @@ other generation, naming what it reported.
 To watch the channels a running node reads, set `log_raw`, which logs the raw
 table (`CH01=.. CH02=..`, degrees) at 1 Hz:
 
-    peppy stack join openarm_v2 -i echo --with ker_commander \
+    peppy stack join openarm:echo --with v2,ker_commander \
       --set-arguments 'commander_inst.log_raw=true'
 
 First engaged run: keep the backbone's `max_ee_velocity_m_s` conservative. An
 arm engaged far from the follower's pose streams that distant target at once,
 and the backbone's rate-limited follow chase moves the follower toward it:
 
-    peppy stack join openarm_v2 -i echo --with ker_commander \
+    peppy stack join openarm:echo --with v2,ker_commander \
       --set-arguments 'backbone_inst.max_ee_velocity_m_s=0.1'

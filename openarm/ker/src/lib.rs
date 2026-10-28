@@ -16,7 +16,6 @@ mod node;
 mod protocol;
 mod publish;
 mod reader;
-mod side;
 mod transport;
 
 pub use node::{NodeError, setup, task_failed};
