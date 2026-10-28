@@ -1,11 +1,15 @@
-"""The one call the brain makes to a model: a picture and a question to one
-route, one answer back. `Provider` is the port the detector and the switch
-probe call; `AnyLlmProvider`, any-llm behind it, is the one implementation,
-and the tests pass a scripted fake.
+"""The one call the brain makes to a model: pictures and a question to one
+route, one answer back. `Provider` is the port the detector, the step
+model and the switch probes call; `AnyLlmProvider`, any-llm behind it, is
+the one implementation, and the tests pass a scripted fake.
 
-`AnyLlmProvider` sends the picture as a base64 JPEG data URL before the
-question, in an OpenAI-style user message, with the route's reasoning
-effort and `parsing.Answer` as the structured output. It awaits any-llm's
+`AnyLlmProvider` sends each picture as a base64 JPEG data URL, in order,
+before the question, in an OpenAI-style user message, with the route's
+reasoning effort and the schema the caller asks for as the structured
+output: a pydantic model (`parsing.Answer` for a search) or a JSON schema
+mapping in the `json_schema` form (the loop's flat schema for an alignment
+step), which any-llm passes to OpenRouter and converts for Gemini. It
+awaits any-llm's
 `acompletion`, so a call never blocks the event loop. Each provider's
 client is made once, with the key of its route from the node's environment
 passed explicitly (so gemini never falls back to another variable),
@@ -27,7 +31,7 @@ import base64
 import os
 import time
 from dataclasses import dataclass
-from typing import Mapping, Protocol
+from typing import Mapping, Protocol, Sequence
 
 from any_llm import AnyLLM
 from any_llm.exceptions import (
@@ -42,7 +46,6 @@ from brain_core.ports import ExpectedFailure, FailureKind
 
 from .catalog import Route
 from .keys import KEY_VARIABLES, key_for
-from .parsing import Answer
 
 # The longest provider message a failure carries.
 DETAIL_CHARS = 300
@@ -68,8 +71,9 @@ class ProviderFailure(ExpectedFailure):
 
 
 class Provider(Protocol):
-    async def ask(self, route: Route, image: bytes, prompt: str, timeout_s: float) -> Reply:
-        """One answer from `route` within `timeout_s`, or a ProviderFailure."""
+    async def ask(self, route: Route, images: Sequence[bytes], prompt: str, schema: object, timeout_s: float) -> Reply:
+        """One answer from `route` within `timeout_s`, held to `schema`, or
+        a ProviderFailure."""
         ...
 
 
@@ -83,16 +87,15 @@ def is_retryable(error: AnyLLMError) -> bool:
     return False
 
 
-def image_message(image: bytes, prompt: str) -> list[dict]:
-    """The picture, then the question, as one OpenAI-style user message."""
-    url = "data:image/jpeg;base64," + base64.b64encode(image).decode("ascii")
-    return [{
-        "role": "user",
-        "content": [
-            {"type": "image_url", "image_url": {"url": url}},
-            {"type": "text", "text": prompt},
-        ],
-    }]
+def image_message(images: Sequence[bytes], prompt: str) -> list[dict]:
+    """The pictures in order, then the question, as one OpenAI-style user
+    message."""
+    parts: list[dict] = [
+        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(image).decode("ascii")}}
+        for image in images
+    ]
+    parts.append({"type": "text", "text": prompt})
+    return [{"role": "user", "content": parts}]
 
 
 class AnyLlmProvider:
@@ -101,15 +104,15 @@ class AnyLlmProvider:
         # Each provider's client, and the key it was made with.
         self._clients: dict[str, tuple[AnyLLM, str]] = {}
 
-    async def ask(self, route: Route, image: bytes, prompt: str, timeout_s: float) -> Reply:
+    async def ask(self, route: Route, images: Sequence[bytes], prompt: str, schema: object, timeout_s: float) -> Reply:
         client, key = self._client(route)
         started = time.perf_counter()
         try:
             response = await client.acompletion(
                 model=route.model,
-                messages=image_message(image, prompt),
+                messages=image_message(images, prompt),
                 reasoning_effort=route.reasoning_effort,
-                response_format=Answer,
+                response_format=schema,
                 timeout=timeout_s,
             )
         except AnyLLMError as error:

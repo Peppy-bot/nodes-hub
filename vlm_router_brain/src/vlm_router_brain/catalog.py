@@ -31,8 +31,9 @@ from .keys import KEY_VARIABLES
 
 CATALOG_FILE = "catalog.json"
 # The roles a catalog model serves in this node: perception, through the
-# node's detector. Manipulation runs the models built into the node alone.
-CATALOG_ROLES = frozenset({Role.PERCEPTION})
+# node's detector, and manipulation, as the model that aligns the gripper
+# above the item in the scripted grab (manipulators/vlm).
+CATALOG_ROLES = frozenset({Role.PERCEPTION, Role.MANIPULATION})
 # The coordinate formats the node reads, each with its prompt wording
 # (prompts.py) and its converter (parsing.py): yx_0_1000 is a box as
 # [y_min, x_min, y_max, x_max] normalised to 0-1000.

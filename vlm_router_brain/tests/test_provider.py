@@ -73,7 +73,7 @@ def clients(monkeypatch):
 
 async def test_a_call_sends_the_picture_then_the_question_with_the_routes_settings(clients):
     clients.outcome = response('{"boxes": []}')
-    reply = await AnyLlmProvider(BOTH_KEYS).ask(FAST, b"\xff\xd8jpeg", "Find the cup.", 12.5)
+    reply = await AnyLlmProvider(BOTH_KEYS).ask(FAST, [b"\xff\xd8jpeg"], "Find the cup.", Answer, 12.5)
     [(name, options, client)] = clients
     # The key is passed explicitly, every provider raises any-llm's
     # classes, and the SDK never retries on its own.
@@ -92,9 +92,9 @@ async def test_a_call_sends_the_picture_then_the_question_with_the_routes_settin
 
 async def test_one_client_per_provider_with_its_own_key(clients):
     provider = AnyLlmProvider(BOTH_KEYS)
-    await provider.ask(FAST, b"jpeg", "q", 10.0)
-    await provider.ask(FAST, b"jpeg", "q", 10.0)
-    await provider.ask(CAREFUL, b"jpeg", "q", 10.0)
+    await provider.ask(FAST, [b"jpeg"], "q", Answer, 10.0)
+    await provider.ask(FAST, [b"jpeg"], "q", Answer, 10.0)
+    await provider.ask(CAREFUL, [b"jpeg"], "q", Answer, 10.0)
     assert [(name, options["api_key"]) for name, options, _ in clients] == [
         ("gemini", "test-gemini-key"), ("openrouter", "test-openrouter-key"),
     ]
@@ -102,7 +102,7 @@ async def test_one_client_per_provider_with_its_own_key(clients):
 
 async def test_an_answer_with_no_usage_reports_no_tokens(clients):
     clients.outcome = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=None))], usage=None)
-    reply = await AnyLlmProvider(BOTH_KEYS).ask(FAST, b"jpeg", "q", 10.0)
+    reply = await AnyLlmProvider(BOTH_KEYS).ask(FAST, [b"jpeg"], "q", Answer, 10.0)
     assert (reply.text, reply.input_tokens, reply.output_tokens, reply.reasoning_tokens) == ("", 0, 0, 0)
 
 
@@ -125,7 +125,7 @@ async def test_each_failure_class_comes_out_retryable_or_not(clients, error, ret
     assert is_retryable(error) is retryable
     clients.outcome = error
     with pytest.raises(ProviderFailure) as raised:
-        await AnyLlmProvider(BOTH_KEYS).ask(FAST, b"jpeg", "q", 10.0)
+        await AnyLlmProvider(BOTH_KEYS).ask(FAST, [b"jpeg"], "q", Answer, 10.0)
     failure = raised.value
     assert isinstance(failure, ExpectedFailure) and failure.retryable is retryable
     assert failure.kind is FailureKind.ATTEMPT_FAILED
@@ -135,13 +135,13 @@ async def test_each_failure_class_comes_out_retryable_or_not(clients, error, ret
 async def test_a_long_provider_message_is_one_line_cut_to_its_limit(clients):
     clients.outcome = ProviderError("line one\n" + "x" * 1000)
     with pytest.raises(ProviderFailure) as raised:
-        await AnyLlmProvider(BOTH_KEYS).ask(FAST, b"jpeg", "q", 10.0)
+        await AnyLlmProvider(BOTH_KEYS).ask(FAST, [b"jpeg"], "q", Answer, 10.0)
     detail = raised.value.message.removeprefix("fast failed: ProviderError: ")
     assert "\n" not in detail and len(detail) == provider_module.DETAIL_CHARS and detail.endswith("...")
 
 
 async def test_a_provider_with_no_key_fails_without_a_client(clients):
     with pytest.raises(ProviderFailure) as raised:
-        await AnyLlmProvider({"OPENROUTER_API_KEY": "set"}).ask(FAST, b"jpeg", "q", 10.0)
+        await AnyLlmProvider({"OPENROUTER_API_KEY": "set"}).ask(FAST, [b"jpeg"], "q", Answer, 10.0)
     assert raised.value.message == "fast failed: MissingApiKeyError: GEMINI_API_KEY is not set"
     assert raised.value.retryable is False and list(clients) == []

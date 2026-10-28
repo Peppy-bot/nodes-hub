@@ -28,6 +28,7 @@ from wire import (
     WAIT,
     accepted_grip,
     answer_the_camera,
+    answer_the_cameras,
     failure_of,
     grab_by_pose,
     land_move,
@@ -37,12 +38,14 @@ from wire import (
     plan,
     publish_a_capture,
     publish_limbs_until,
+    publish_wrist_until,
     refusal_of,
     result_of,
     stop_grip_at,
 )
 
 from vlm_router_brain.__main__ import setup
+from vlm_router_brain.manipulators.vlm.step_model import PROBE_PROMPT as ALIGNMENT_PROBE_PROMPT
 from vlm_router_brain.provider import ProviderFailure, Reply
 
 ER = "gemini-robotics-er-2-preview"
@@ -147,8 +150,9 @@ async def test_get_model_and_list_models_name_the_catalog_models_never_a_provide
         current = await get_model_fx.poll(h, 5.0)
         assert (current.roles, current.models) == (["perception", "manipulation"], [ER, "scripted"])
         offered = await list_models_fx.poll(h, 5.0)
-        assert offered.roles == ["perception"] * 5 + ["manipulation"] * 2
-        assert offered.models == ["none", ER, "gemini-4-argon", OPUS, "gpt-6-astra", "none", "scripted"]
+        catalog = [ER, "gemini-4-argon", OPUS, "gpt-6-astra"]
+        assert offered.roles == ["perception"] * 5 + ["manipulation"] * 6
+        assert offered.models == ["none", *catalog, "none", "scripted", *catalog]
         assert not any(":" in name or "/" in name for name in current.models + offered.models)
 
 
@@ -200,13 +204,23 @@ async def test_perception_switches_to_none_and_back():
         assert (await get_model_fx.poll(h, 5.0)).models == [ER, "scripted"]
 
 
-async def test_manipulation_switches_to_none_which_refuses_every_grab_and_back_to_scripted():
-    async with harness.start(partial(setup, provider=FakeProvider()), parameters=params()) as h:
+async def test_manipulation_switches_to_none_which_refuses_every_grab_to_a_catalog_model_and_back_to_scripted():
+    provider = FakeProvider(Reply('{"action": "give_up"}'))
+    async with harness.start(partial(setup, provider=provider), parameters=params()) as h:
         answer_the_camera(h)
         kept = await result_of(switch_fx, h, switch("manipulation", "none"))
         assert (kept.role, kept.model) == ("manipulation", "none")
-        refused = await refusal_of(switch_fx, h, switch("manipulation", OPUS))
-        assert refused == switch_fx.Failure("rejected", f"'{OPUS}' is not a manipulation model here; see list_models")
+        refused = await refusal_of(switch_fx, h, switch("manipulation", "fast"))
+        assert refused == switch_fx.Failure("rejected", "'fast' is not a manipulation model here; see list_models")
+        # A catalog model aligns the grab: the switch probes it with the
+        # alignment's question.
+        aligning = await result_of(switch_fx, h, switch("manipulation", OPUS))
+        assert (aligning.role, aligning.model) == ("manipulation", OPUS)
+        [probe_call] = provider.calls
+        assert probe_call.prompt == ALIGNMENT_PROBE_PROMPT and len(probe_call.images) == 1
+        assert (await get_model_fx.poll(h, 5.0)).models == [ER, OPUS]
+        kept = await result_of(switch_fx, h, switch("manipulation", "none"))
+        assert (kept.role, kept.model) == ("manipulation", "none")
         unknown = await refusal_of(switch_fx, h, switch("arm", "none"))
         assert unknown == switch_fx.Failure("rejected", "this brain runs no model for the role 'arm'")
         # item_manipulation reports in its result.
@@ -353,3 +367,67 @@ async def test_a_grab_during_a_grab_is_refused_and_abort_ends_the_first():
         assert (stopped.success, stopped.aborted_action) == (True, "grab_item"), stopped.message
         state = await get_state_fx.poll(h, 5.0)
         assert (state.current_action, state.holding) == ("", [False, False])
+
+
+async def test_identify_then_an_aligned_grab_moves_turns_and_holds_the_item(caplog):
+    from brain_core.manipulators.scripted.grasp import jaw_line_deg
+
+    provider = FakeProvider(
+        answer(("the cup", [250, 250, 750, 750])),
+        Reply('{"action": "give_up"}'),
+        Reply('{"action": "move", "dx": 1.0, "dy": -2.0, "roll_deg": 45}'),
+        Reply('{"action": "ready"}', 2800, 40, 30, 9.4),
+    )
+    async with harness.start(
+        partial(setup, provider=provider), parameters=params(), wrist_cameras_instance_ids=["wrist_left"]
+    ) as h:
+        # The learner's answer and one per alignment step.
+        answer_the_cameras(h, mounts_answers=3)
+        await publish_a_capture(h)
+        seen = await once_the_brain_sees(identify_fx, h, identify())
+        assert seen.status == identify_fx.ResultStatus.COMPLETED, seen.failure
+        found = seen.data
+        await once_the_brain_has_limbs(h)
+        switched = await result_of(switch_fx, h, switch("manipulation", OPUS))
+        assert (switched.role, switched.model) == ("manipulation", OPUS)
+        done = asyncio.Event()
+        wrist = asyncio.create_task(publish_wrist_until(h, done))
+        plan(h, True, True, True)
+        with records_of(caplog, "brain_core.manipulators.scripted.manipulator") as log:
+            grab = await grab_fx.send_goal(
+                h, grab_action.GoalRequestData(gripper_name="", item_id=found.item_id, position=[0.0] * 3, orientation=None, max_effort=15.0),
+                5.0,
+            )
+            assert grab.accepted, grab.reason
+            assert (await stop_grip_at(h, 1.0)).opening == 1.0
+            pre = await land_move(h)
+            assert [round(v, 6) for v in pre.position] == [0.0, 0.0, 1.05]
+            # Step 1: the model moves 1 cm in x, -2 cm in y and turns 45
+            # degrees; the three points are checked, then the move is sent at
+            # the same height, the jaw line turned from 90 to 135 degrees.
+            plan(h, True, True, True)
+            aligned = await land_move(h)
+            assert [round(v, 6) for v in aligned.position] == [0.01, -0.02, 1.05]
+            assert jaw_line_deg(aligned.orientation) == pytest.approx(135.0, abs=0.01)
+            # Step 2: ready. The descent, the close and the lift use the
+            # aligned points.
+            reach = await land_move(h)
+            assert [round(v, 6) for v in reach.position] == [0.01, -0.02, 0.975] and reach.orientation == aligned.orientation
+            closed = await stop_grip_at(h, 0.3)
+            assert closed.max_effort == 15.0
+            limbs_done = asyncio.Event()
+            stream = asyncio.create_task(publish_limbs_until(h, limbs_done, 0.3))
+            lift = await land_move(h)
+            assert [round(v, 6) for v in lift.position] == [0.01, -0.02, 1.05]
+            result = (await grab.get_result(WAIT)).data
+            limbs_done.set()
+            done.set()
+            await asyncio.gather(stream, wrist)
+        assert (result.success, result.gripper_name, result.item_id) == (True, "left_gripper", found.item_id), result.message
+        line = next(record.getMessage() for record in log.records if "grab of item" in record.getMessage())
+        assert "aligned in 2 steps: the grasp point moved 2.2 cm, the jaws close along 135 degrees" in line
+        # The identify, the probe and the two steps, each with two pictures.
+        assert [len(call.images) for call in provider.calls] == [1, 1, 2, 2]
+        step = provider.calls[2]
+        assert "Now: step 1 of 5." in step.prompt and "+x points toward 6 o'clock and +y toward 3 o'clock" in step.prompt
+        assert step.schema["json_schema"]["strict"] is False

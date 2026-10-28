@@ -13,7 +13,8 @@ from peppygen.parameters import Parameters
 
 from brain_core import node
 from brain_core.bindings import Bindings
-from brain_core.ports import Detector, Manipulator
+from brain_core.manipulators import Manipulator
+from brain_core.ports import Detector
 
 from .models import MANIPULATORS, VlaModels
 from .perception import DETECTORS

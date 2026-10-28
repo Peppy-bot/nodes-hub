@@ -32,6 +32,14 @@
         // judged from the gripper's opening alone cannot tell a hold from
         // a slip.
         { name: "limb_state", tag: "v1", link_id: "limb_state" },
+        // The cameras the arms carry, one rgb producer each, through which
+        // a catalog model in the manipulation role looks down past the
+        // open jaws and corrects the gripper's place and turn above an
+        // item before the descent. The `wrist_cameras` parameter names
+        // each arm's camera by the instance id it runs under. Without a
+        // camera for the arm, a grab with such a model fails before it
+        // moves, naming the arm; the scripted model needs none.
+        { name: "rgb_camera", tag: "v1", link_id: "wrist_cameras", cardinality: "zero_or_more" },
         // The camera the brain looks through: colour and depth from one
         // rgbd producer, so a detection's pixel becomes a world position
         // through the depth at that pixel and the camera model below.
@@ -75,6 +83,7 @@
         { link_id: "camera", name: "video_stream" },
         { link_id: "camera", name: "depth_stream" },
         { link_id: "limb_state", name: "limb_states" },
+        { link_id: "wrist_cameras", name: "video_stream" },
       ],
     },
     services: {
@@ -112,10 +121,20 @@
       // needs GEMINI_API_KEY. switch_model changes it while the brain runs.
       perception_model: { $type: "string", $default: "gemini-robotics-er-2-preview" },
       // The model manipulation starts on: "scripted", the default, grabs
-      // from above at the item's seen point and needs no model call; "none"
-      // refuses every sequence naming the missing model, while abort and
-      // get_state work. No catalog model serves manipulation.
+      // from above at the item's seen point and needs no model call; a
+      // catalog model that serves manipulation runs the same grab with an
+      // alignment step, in which that model looks through the arm's wrist
+      // camera and the chest camera above the item and corrects the
+      // gripper's place and turn before the descent, at most five steps of
+      // at most 3 cm and 90 degrees; "none" refuses every sequence naming
+      // the missing model, while abort and get_state work.
       manipulation_model: { $type: "string", $default: "scripted" },
+      // Each arm with the wrist camera it carries, comma separated, by the
+      // instance id the camera runs under in the stack:
+      // "left_arm:wrist_left,right_arm:wrist_right" on the OpenArm. An arm
+      // named here must be one of `limbs`; an arm not named has no wrist
+      // camera. Empty names none.
+      wrist_cameras: { $type: "string", $default: "left_arm:wrist_left,right_arm:wrist_right" },
       // The name the camera the brain looks through runs under on the
       // robot, as the robot's camera_mounts lists it: the brain reads the
       // pose of that camera, in the robot frame, from the `camera_mounts`

@@ -5,21 +5,24 @@ the keys that pick a route."""
 import logging
 
 import pytest
-from conftest import BOTH_KEYS, TEST_CATALOG, FakeProvider, records_of
+from conftest import BOTH_KEYS, TEST_CATALOG, FakeProvider, catalog_of, model, records_of
 
 from brain_core.limb_state import LimbStateStore
-from brain_core.manipulation.centre_proposer import CentreProposer
-from brain_core.manipulation.none import NoneManipulator
-from brain_core.manipulation.scripted import ScriptedManipulator
+from brain_core.manipulators.none import NoneManipulator
+from brain_core.manipulators.scripted import CentreProposer, ScriptedManipulator
 from brain_core.models import Models
 from brain_core.perception.none import NoneDetector
-from brain_core.ports import FailureKind, Refusal, Role
+from brain_core.ports import FailureKind, Refusal, Role, Senses
 from brain_core.sequencer import Sequencer
 
 from vlm_router_brain.catalog import CATALOG_ROLES, load_catalog
-from vlm_router_brain.models import BUILDERS, BUILT_IN, BuiltIn, RouterEntry, RouterModels
-from vlm_router_brain.provider import ProviderFailure
-from vlm_router_brain.vlm_detector import PROBE_PROMPT, VlmDetector
+from vlm_router_brain.manipulators.vlm.aligner import ModelAligner
+from vlm_router_brain.manipulators.vlm.step_model import PROBE_PROMPT as ALIGNMENT_PROBE_PROMPT
+from vlm_router_brain.manipulators.vlm.step_model import PROBE_SCHEMA, RouterStepModel, probe_alignment
+from vlm_router_brain.models import BUILDERS, BUILT_IN, PROBES, BuiltIn, RouterEntry, RouterModels
+from vlm_router_brain.parsing import UnreadableAnswer
+from vlm_router_brain.provider import ProviderFailure, Reply
+from vlm_router_brain.vlm_detector import PROBE_PROMPT, VlmDetector, probe
 
 ONLY_GEMINI = {"GEMINI_API_KEY": "test-gemini-key"}
 
@@ -53,10 +56,32 @@ def test_an_entry_carries_the_role_it_was_offered_for():
     assert offered.role is Role.PERCEPTION and offered.catalog_entry is TEST_CATALOG.get("fast")
 
 
-def test_each_role_a_catalog_model_serves_has_a_builder_and_perception_builds_a_vlm_detector():
-    assert BUILDERS == {Role.PERCEPTION: VlmDetector}
-    assert set(BUILDERS) == CATALOG_ROLES
+def test_each_role_a_catalog_model_serves_has_a_builder_and_a_probe():
+    assert set(BUILDERS) == CATALOG_ROLES == {Role.PERCEPTION, Role.MANIPULATION} == set(PROBES)
+    assert BUILDERS[Role.PERCEPTION] is VlmDetector and PROBES[Role.PERCEPTION] is probe
+    assert PROBES[Role.MANIPULATION] is probe_alignment
     assert isinstance(router().start(perceiving("fast")), VlmDetector)
+
+
+def test_a_catalog_model_in_manipulation_is_the_scripted_grab_aligned_by_that_model():
+    aligning = catalog_of({**model("fast", "gemini:gemini-fast"), "roles": ["perception", "manipulation"]})
+    models = RouterModels(aligning, FakeProvider(), BOTH_KEYS)
+    assert models.names(Role.MANIPULATION) == ["none", "scripted", "fast"]
+    manipulator = models.start(models.offered(Role.MANIPULATION, "fast"))
+    assert isinstance(manipulator, ScriptedManipulator) and isinstance(manipulator.aligner, ModelAligner)
+    assert isinstance(manipulator.aligner.model, RouterStepModel) and manipulator.aligner.model.name == "fast"
+    assert manipulator.aligner.model.route.spelled == "gemini:gemini-fast"
+
+
+async def test_a_switch_to_a_manipulation_model_probes_with_the_alignments_question():
+    aligning = catalog_of({**model("fast", "gemini:gemini-fast"), "roles": ["perception", "manipulation"]})
+    provider = FakeProvider(Reply('{"action": "give_up"}'))
+    manipulator = await RouterModels(aligning, provider, BOTH_KEYS).prepare(RouterEntry(Role.MANIPULATION, aligning.get("fast")))
+    [call] = provider.calls
+    assert call.prompt == ALIGNMENT_PROBE_PROMPT and call.schema is PROBE_SCHEMA
+    assert isinstance(manipulator, ScriptedManipulator)
+    with pytest.raises(UnreadableAnswer):
+        await RouterModels(aligning, FakeProvider(Reply('{"boxes": []}')), BOTH_KEYS).prepare(RouterEntry(Role.MANIPULATION, aligning.get("fast")))
 
 
 def test_a_name_the_role_does_not_accept_is_refused_pointing_to_list_models():
@@ -129,7 +154,7 @@ async def test_a_probe_failure_fails_the_switch_with_the_providers_message():
 ])
 async def test_brain_core_stops_the_node_on_a_starting_model_the_router_cannot_run(perception, manipulation, environ, message):
     provider = FakeProvider()
-    models = Models(router(environ, provider), Sequencer(), None, LimbStateStore())
+    models = Models(router(environ, provider), Sequencer(), Senses(None, LimbStateStore(), None, None, None))
     with pytest.raises(ValueError, match=message):
         await models.start({Role.PERCEPTION: perception, Role.MANIPULATION: manipulation})
     assert provider.calls == []
@@ -168,7 +193,7 @@ def test_each_built_in_model_runs_under_its_own_name():
 
 async def test_brain_core_starts_on_scripted_and_hands_it_the_robot_and_the_limbs():
     store = LimbStateStore()
-    models = Models(router(), Sequencer(), "robot", store)
+    models = Models(router(), Sequencer(), Senses("robot", store, None, None, None))
     await models.start({Role.PERCEPTION: "none", Role.MANIPULATION: "scripted"})
     manipulator = models.current(Role.MANIPULATION)
     assert isinstance(manipulator, ScriptedManipulator)

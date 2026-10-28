@@ -19,10 +19,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Mapping, Sequence
 
-from brain_core.manipulation.centre_proposer import CentreProposer
-from brain_core.manipulation.none import NoneManipulator
-from brain_core.manipulation.scripted import ScriptedManipulator
-from brain_core.ports import Detector, FailureKind, Manipulator, Refusal, Role
+from brain_core.manipulators import Manipulator
+from brain_core.manipulators.none import NoneManipulator
+from brain_core.manipulators.scripted import CentreProposer, ScriptedManipulator
+from brain_core.ports import Detector, FailureKind, Refusal, Role
 
 from .perception import DETECTORS, TAKES_A_GALLERY
 from .perception.gallery import shipped_root

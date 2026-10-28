@@ -18,6 +18,7 @@ from peppygen.consumed_services.geometry import get_color_intrinsics, get_depth_
 from peppygen.consumed_services.limb_motion import check_arm_move
 from peppygen.consumed_topics.camera import depth_stream, video_stream
 from peppygen.consumed_topics.limb_state import limb_states
+from peppygen.consumed_topics.wrist_cameras import video_stream as wrist_video_stream
 from peppygen.exposed_actions.item_manipulation import grab_item as grab_action
 from peppygen.fixtures.exposed_actions.item_manipulation import grab_item as grab_fx
 from peppygen.parameters import Parameters
@@ -35,6 +36,7 @@ PARAMS = {
     "perception_model": "gemini-robotics-er-2-preview",
     "manipulation_model": "scripted",
     "camera_name": "chest",
+    "wrist_cameras": "left_arm:wrist_left,right_arm:wrist_right",
 }
 NO_SNAPSHOT = "no limb_states snapshot received from the robot yet"
 
@@ -242,4 +244,41 @@ async def publish_limbs_until(h, done: asyncio.Event, left_opening: float) -> No
     while not done.is_set():
         limbs.stamp += 1.0
         await publish_limbs(h)
+        await asyncio.sleep(0.01)
+
+
+def answer_the_cameras(h, mounts_answers: int = 1) -> None:
+    """The camera answers of `answer_the_camera`, with the robot carrying a
+    wrist camera beside the chest one: the chest at the robot's origin
+    looking along +Z, `wrist_left` looking straight down with its picture's
+    right along the robot's +Y, 0.5 m up. `mounts_answers` is how many
+    get_camera_poses answers to queue: one for the brain's learner at its
+    start, one for each alignment step."""
+    answer_the_camera(h)
+    mounts = h.mocks.deps.camera_mounts.get_camera_poses
+    for _ in range(mounts_answers - 1):
+        mounts.enqueue_response(
+            get_camera_poses.ResponseData(
+                timestamp=7.0, camera_names=["chest", "wrist_left"],
+                positions=[0.0, 0.0, 0.0, 0.2, 0.2, 0.5], orientations=[0.0, 0.0, 0.0, 1.0, 0.7071, 0.7071, 0.0, 0.0],
+                carried_by=["", "left_arm"],
+            )
+        )
+
+
+async def publish_wrist_until(h, done: asyncio.Event) -> None:
+    """The wrist camera's stream: one grey 16 x 12 frame with a later stamp
+    after another until `done`, so a step that waits for a frame captured
+    after its move always gets one."""
+    [camera] = h.mocks.deps.wrist_cameras
+    assert await camera.video_stream.wait_for_subscriber(WAIT)
+    stamp = 0
+    while not done.is_set():
+        stamp += 1
+        await camera.video_stream.publish(
+            wrist_video_stream.Message(
+                header=wrist_video_stream.MessageHeader(timestamp=float(stamp), frame_id=stamp), encoding="rgb8", width=16, height=12,
+                frame=bytes([128]) * (16 * 12 * 3),
+            )
+        )
         await asyncio.sleep(0.01)

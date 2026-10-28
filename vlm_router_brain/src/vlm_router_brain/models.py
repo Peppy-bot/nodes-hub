@@ -3,8 +3,12 @@ models built into the node and the catalog.
 
 Each role accepts the models built into the node (`BUILT_IN`): "none",
 the role's missing model, for both, and "scripted", the scripted
-manipulator, for manipulation. Perception also accepts every catalog model
-that serves it. A name a role does not accept is refused with `rejected`,
+manipulator with no model call, for manipulation. Each role also accepts
+every catalog model that serves it: for perception the model is the
+detector; for manipulation it is the model that aligns the gripper above
+the item in the scripted grab and above the spot in the scripted place
+(`manipulators.vlm`). A name a role does not accept is refused with
+`rejected`,
 pointing to list_models. `offered` gives the entry of a name for a role, a
 `BuiltIn` or a `RouterEntry` for a catalog model, so the entry carries the
 role it was offered for. A catalog model runs on the first of its routes
@@ -13,12 +17,13 @@ no result does, and becomes the backend `BUILDERS` makes for its role.
 
 A built-in model makes no call, so a start and a switch build it alike.
 At the node's start (`start`) a catalog model makes no call either: the
-first search is its first call, and a provider failure fails that search
-alone. A switch to a catalog model (`prepare`) probes the route once
-before brain_core hands the role its new model, so a model that cannot be
-reached fails the switch and the role keeps its model: with
-`resource_unavailable` when no route of the model has its key, with
-`attempt_failed` when the probe fails.
+first search or the first grab is its first call, and a provider failure
+fails that goal alone. A switch to a catalog model (`prepare`) probes the
+route once, with the probe of the role (`PROBES`), before brain_core hands
+the role its new model, so a model that cannot be reached, or that does
+not answer the role's question, fails the switch and the role keeps its
+model: with `resource_unavailable` when no route of the model has its
+key, with `attempt_failed` when the probe fails.
 """
 
 from __future__ import annotations
@@ -26,16 +31,16 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
-from typing import Callable, Mapping, Sequence, Union
+from typing import Awaitable, Callable, Mapping, Sequence, Union
 
-from brain_core.manipulation.centre_proposer import CentreProposer
-from brain_core.manipulation.none import NoneManipulator
-from brain_core.manipulation.scripted import ScriptedManipulator
+from brain_core.manipulators.none import NoneManipulator
+from brain_core.manipulators.scripted import CentreProposer, ScriptedManipulator
 from brain_core.perception.none import NoneDetector
 from brain_core.ports import FailureKind, Refusal, Role
 
 from .catalog import NONE, SCRIPTED, Catalog, CatalogEntry, Route
 from .keys import first_keyed, no_key_message
+from .manipulators.vlm import probe_alignment, vlm_manipulator
 from .provider import Provider
 from .vlm_detector import VlmDetector, probe
 
@@ -66,10 +71,18 @@ BUILT_IN: Mapping[Role, Mapping[str, Callable[[], object]]] = {
     Role.MANIPULATION: {NONE: NoneManipulator, SCRIPTED: lambda: ScriptedManipulator(CentreProposer())},
 }
 
+
 # What a catalog model runs as in each role a catalog model serves
 # (catalog.CATALOG_ROLES), built from the model, its route and the provider.
 BUILDERS: Mapping[Role, Callable[[CatalogEntry, Route, Provider], object]] = {
     Role.PERCEPTION: VlmDetector,
+    Role.MANIPULATION: vlm_manipulator,
+}
+# The probe a switch to a catalog model runs, by role: each asks the
+# role's own question.
+PROBES: Mapping[Role, Callable[[Provider, Route], Awaitable[None]]] = {
+    Role.PERCEPTION: probe,
+    Role.MANIPULATION: probe_alignment,
 }
 
 
@@ -109,7 +122,7 @@ class RouterModels:
         route = first_keyed(model.routes, self._environ)
         if route is None:
             raise Refusal(FailureKind.RESOURCE_UNAVAILABLE, no_key_message(model.name, model.routes))
-        await probe(self._provider, route)
+        await PROBES[entry.role](self._provider, route)
         return self._build(entry, route)
 
     def _build(self, entry: RouterEntry, route: Route):
