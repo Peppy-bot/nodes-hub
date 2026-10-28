@@ -5,6 +5,7 @@
 //! which is this relay's name in its copy, and `setup` wires them together.
 
 use std::future::Future;
+use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -14,9 +15,10 @@ use camera_core::relay::{
     camera_name, timestamp_is_valid,
 };
 use control_core::latched_log::LatchedLog;
+use control_core::receiving::receive;
 use control_core::report_once::ReportOnce;
+use control_core::serving;
 use control_core::sync::{lock_ignoring_poison, wait_for};
-use control_core::time::RECEIVE_ERROR_BACKOFF;
 use peppygen::consumed_services::control::{
     describe_camera, reset_camera as control_reset_camera, set_camera_brightness,
     set_camera_contrast, set_camera_exposure, set_camera_gain, set_camera_white_balance,
@@ -208,57 +210,49 @@ async fn relay_frames(runner: Arc<NodeRunner>, token: CancellationToken) {
     let publish_failures = LatchedLog::warn("video_stream publish");
     let invalid_timestamps = ReportOnce::default();
     let mut first = true;
-    let receive_errors = LatchedLog::error("simulation video_stream receive");
-    loop {
-        let received = tokio::select! {
-            _ = token.cancelled() => return,
-            received = sub.next() => received,
-        };
-        let msg = match received {
-            Ok(Some((_, msg))) => msg,
-            Ok(None) => return,
-            Err(e) => {
-                receive_errors.failure(e);
-                tokio::time::sleep(RECEIVE_ERROR_BACKOFF).await;
-                continue;
-            }
-        };
-        receive_errors.success();
-        if !timestamp_is_valid(msg.header.timestamp) {
-            if invalid_timestamps.first_of_run() {
-                warn!(
-                    "dropping frames with invalid timestamps, suppressing repeats (first {:?})",
-                    msg.header.timestamp
-                );
-            }
-            continue;
-        }
-        invalid_timestamps.clear();
-        let header = camera_video::MessageHeader {
-            timestamp: msg.header.timestamp,
-            frame_id: msg.header.frame_id,
-        };
-        let result = match camera_video::build_message(
-            header,
-            msg.encoding,
-            msg.width,
-            msg.height,
-            msg.frame,
-        ) {
-            Ok(payload) => publisher.publish(payload).await.map_err(|e| e.to_string()),
-            Err(e) => Err(e.to_string()),
-        };
-        match result {
-            Ok(()) => {
-                publish_failures.success();
-                if first {
-                    first = false;
-                    info!("first frame relayed from the simulation");
+    receive(
+        "simulation video_stream",
+        token.cancelled(),
+        async move || sub.next().await,
+        async move |(_, msg)| {
+            if !timestamp_is_valid(msg.header.timestamp) {
+                if invalid_timestamps.first_of_run() {
+                    warn!(
+                        "dropping frames with invalid timestamps, suppressing repeats (first {:?})",
+                        msg.header.timestamp
+                    );
                 }
+                return ControlFlow::Continue(());
             }
-            Err(e) => publish_failures.failure(e),
-        }
-    }
+            invalid_timestamps.clear();
+            let header = camera_video::MessageHeader {
+                timestamp: msg.header.timestamp,
+                frame_id: msg.header.frame_id,
+            };
+            let result = match camera_video::build_message(
+                header,
+                msg.encoding,
+                msg.width,
+                msg.height,
+                msg.frame,
+            ) {
+                Ok(payload) => publisher.publish(payload).await.map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
+            };
+            match result {
+                Ok(()) => {
+                    publish_failures.success();
+                    if first {
+                        first = false;
+                        info!("first frame relayed from the simulation");
+                    }
+                }
+                Err(e) => publish_failures.failure(e),
+            }
+            ControlFlow::Continue(())
+        },
+    )
+    .await;
 }
 
 /// get_color_intrinsics: the stream's pinhole model as the simulation
@@ -310,28 +304,26 @@ async fn track_stream_info(
         Ok(s) => s,
         Err(e) => return error!("simulation stream_info subscribe: {e}"),
     };
-    let receive_errors = LatchedLog::error("simulation stream_info receive");
-    loop {
-        let received = tokio::select! {
-            _ = token.cancelled() => return,
-            received = sub.next() => received,
-        };
-        match received {
-            Ok(Some((_, msg))) => {
-                *lock_ignoring_poison(&description) = StreamDescription {
-                    width: msg.width,
-                    height: msg.height,
-                    frames_per_second: msg.frames_per_second,
-                    encoding: msg.encoding,
-                };
-            }
-            Ok(None) => return,
-            Err(e) => {
-                receive_errors.failure(e);
-                tokio::time::sleep(RECEIVE_ERROR_BACKOFF).await;
-            }
-        }
-    }
+    receive(
+        "simulation stream_info",
+        token.cancelled(),
+        async move || sub.next().await,
+        async move |(_, msg)| {
+            keep_stream_info(&description, msg);
+            ControlFlow::Continue(())
+        },
+    )
+    .await;
+}
+
+/// Keeps `msg` as the simulation's latest stream description.
+fn keep_stream_info(description: &SharedDescription, msg: stream_info::Message) {
+    *lock_ignoring_poison(description) = StreamDescription {
+        width: msg.width,
+        height: msg.height,
+        frames_per_second: msg.frames_per_second,
+        encoding: msg.encoding,
+    };
 }
 
 /// Track the simulation's latest camera geometry for get_color_intrinsics.
@@ -345,59 +337,49 @@ async fn track_geometry(
         Err(e) => return error!("simulation geometry subscribe: {e}"),
     };
     let unusable_geometries = ReportOnce::default();
-    let receive_errors = LatchedLog::error("simulation geometry receive");
-    loop {
-        let received = tokio::select! {
-            _ = token.cancelled() => return,
-            received = sub.next() => received,
-        };
-        match received {
-            Ok(Some((_, msg))) => {
-                // A consumer turns a pixel into a ray with these numbers, so
-                // a model it cannot divide by is ignored whole.
-                if !pinhole_is_valid(msg.width, msg.height, msg.fx, msg.fy, msg.cx, msg.cy) {
-                    if unusable_geometries.first_of_run() {
-                        warn!(
-                            "ignoring geometry with an unusable pinhole model, suppressing repeats"
-                        );
-                    }
-                    continue;
-                }
-                unusable_geometries.clear();
-                *lock_ignoring_poison(&geometry) = Some(msg);
-            }
-            Ok(None) => return,
-            Err(e) => {
-                receive_errors.failure(e);
-                tokio::time::sleep(RECEIVE_ERROR_BACKOFF).await;
-            }
-        }
-    }
+    receive(
+        "simulation geometry",
+        token.cancelled(),
+        async move || sub.next().await,
+        async move |(_, msg)| {
+            keep_geometry(&geometry, &unusable_geometries, msg);
+            ControlFlow::Continue(())
+        },
+    )
+    .await;
 }
 
-/// Answer every request of `$service` with `$respond`, which maps the
-/// request to the response or the failure of an error reply, until the node
-/// stops. The first error of a run of failed requests is logged.
+/// Keeps `msg` as the simulation's latest camera geometry. A consumer turns
+/// a pixel into a ray with these numbers, so a model it cannot divide by is
+/// ignored whole; the first of a run of such models is logged.
+fn keep_geometry(
+    geometry: &SharedGeometry,
+    unusable_geometries: &ReportOnce,
+    msg: simulation_geometry::Message,
+) {
+    if !pinhole_is_valid(msg.width, msg.height, msg.fx, msg.fy, msg.cx, msg.cy) {
+        if unusable_geometries.first_of_run() {
+            warn!("ignoring geometry with an unusable pinhole model, suppressing repeats");
+        }
+        return;
+    }
+    unusable_geometries.clear();
+    *lock_ignoring_poison(geometry) = Some(msg);
+}
+
+/// Serve `$service` with `$respond`, which maps the request to the response
+/// or the failure of an error reply, until the node stops.
 macro_rules! spawn_service {
     ($runner:expr, $service:ident, $respond:expr) => {{
         let runner = $runner.clone();
         let respond = $respond;
         tokio::spawn(async move {
-            let cancel = runner.cancellation_token().clone();
-            let service_errors = LatchedLog::error(stringify!($service));
-            loop {
-                let result = tokio::select! {
-                    _ = cancel.cancelled() => break,
-                    result = $service::handle_next_request(&runner, &respond) => result,
-                };
-                match result {
-                    Ok(()) => service_errors.success(),
-                    Err(e) => {
-                        service_errors.failure(e);
-                        tokio::time::sleep(RECEIVE_ERROR_BACKOFF).await;
-                    }
-                }
-            }
+            serving::serve(
+                stringify!($service),
+                runner.cancellation_token().cancelled(),
+                || $service::handle_next_request(&runner, &respond),
+            )
+            .await
         });
     }};
 }
@@ -685,5 +667,27 @@ mod tests {
             )
         );
         assert!(!Unanswered::NoModel.in_transport());
+    }
+
+    #[test]
+    fn a_received_stream_description_is_kept() {
+        let description = SharedDescription::default();
+        keep_stream_info(
+            &description,
+            stream_info::Message {
+                width: 960,
+                height: 600,
+                frames_per_second: 30,
+                encoding: "rgb8".to_owned(),
+            },
+        );
+        assert_eq!(lock_ignoring_poison(&description).width, 960);
+    }
+
+    #[test]
+    fn a_received_geometry_is_kept() {
+        let geometry = SharedGeometry::default();
+        keep_geometry(&geometry, &ReportOnce::default(), wrist_geometry());
+        assert!(lock_ignoring_poison(&geometry).is_some());
     }
 }
