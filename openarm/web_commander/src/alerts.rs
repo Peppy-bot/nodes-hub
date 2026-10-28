@@ -13,8 +13,8 @@
 
 use std::sync::Arc;
 
-use control_core::motor_health::AlertSeverity;
 use control_core::throttle::Throttle;
+use control_core::time::RECEIVE_ERROR_BACKOFF;
 use peppygen::NodeRunner;
 use peppygen::consumed_topics::alerts::alerts;
 use peppylib::messaging::ProducerRef;
@@ -22,9 +22,9 @@ use peppylib::runtime::{CancellationToken, watch_bound_set};
 use tokio::sync::mpsc;
 use tracing::{error, warn};
 
-use crate::consumer;
+use crate::consumer::{self, ALERT_STALE_AFTER, REJECT_WARN_PERIOD, parse_timestamp_validity};
 use crate::owner::Feedback;
-use crate::state::{ALERT_STALE_AFTER, Alert, AlertSet, REJECT_WARN_PERIOD};
+use crate::state::{Alert, AlertSet, AlertSeverity};
 
 /// The slot this node consumes alerts on, as its manifest declares it.
 ///
@@ -93,7 +93,7 @@ pub async fn run(
                 error!(error = %e, "alerts receive");
                 tokio::select! {
                     _ = token.cancelled() => return,
-                    _ = tokio::time::sleep(consumer::RECEIVE_ERROR_BACKOFF) => {}
+                    _ = tokio::time::sleep(RECEIVE_ERROR_BACKOFF) => {}
                 }
                 continue;
             }
@@ -160,12 +160,8 @@ fn parse_alert_set(
     clock_now: std::time::SystemTime,
     received_at: std::time::Instant,
 ) -> Result<Parsed, String> {
-    let validity = crate::state::parse_timestamp_validity(
-        msg.timestamp,
-        clock_now,
-        received_at,
-        ALERT_STALE_AFTER,
-    )?;
+    let validity =
+        parse_timestamp_validity(msg.timestamp, clock_now, received_at, ALERT_STALE_AFTER)?;
     let mut alerts: Vec<Alert> = Vec::with_capacity(msg.active.len().min(MAX_ACTIVE_ALERTS));
     let mut seen: Vec<(&str, &str)> = Vec::with_capacity(alerts.capacity());
     let mut refused: Option<String> = None;

@@ -1,6 +1,6 @@
-// Library crate root: `setup` is the node's real entry point, importable both
-// by `main.rs` (which passes it to `NodeBuilder::run`) and by the integration
-// tests, whose generated harness boots the node by calling `setup` directly.
+//! Library crate root: `setup` is the node's real entry point, importable both
+//! by `main.rs` (which passes it to `NodeBuilder::run`) and by the integration
+//! tests, whose generated harness boots the node by calling `setup` directly.
 
 #![forbid(unsafe_code)]
 
@@ -11,6 +11,7 @@ mod consumer;
 mod gestures;
 mod gripper_states;
 mod joint_states;
+mod limits;
 mod motor_health;
 mod move_arm;
 mod move_arm_joints;
@@ -20,7 +21,10 @@ mod owner;
 mod pose;
 mod record;
 mod result_wait;
+mod snapshot;
 mod state;
+#[cfg(test)]
+mod test_support;
 mod ui;
 
 pub use node::{NodeError, setup, ui_failed};

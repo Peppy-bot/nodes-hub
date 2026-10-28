@@ -1,10 +1,10 @@
-// Spawned per start_recording command (the panel's Record button). Fires the
-// recorder's record_episode goal, drains its frame-count feedback into the
-// owner, and reports the saved episode when the goal ends. The stop token is
-// the Stop button: cancelling the goal ends the episode with a save. The
-// recorder also ends episodes on its own (stale source, disk floor); that
-// surfaces here as a cancelled result whose reason names the cause. An
-// episode the recorder cannot save fails, with its failure kind and message.
+//! Spawned per start_recording command (the panel's Record button). Fires the
+//! recorder's record_episode goal, drains its frame-count feedback into the
+//! owner, and reports the saved episode when the goal ends. The stop token is
+//! the Stop button: cancelling the goal ends the episode with a save. The
+//! recorder also ends episodes on its own (stale source, disk floor); that
+//! surfaces here as a cancelled result whose reason names the cause. An
+//! episode the recorder cannot save fails, with its failure kind and message.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,11 +18,8 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::owner::Feedback;
-use crate::result_wait::{RESULT_POLL, RESULT_RETRY_DELAY, result_poll_retryable};
+use crate::result_wait::{GOAL_TIMEOUT, RESULT_POLL, RESULT_RETRY_DELAY, result_poll_retryable};
 
-// Goal-accept round-trip to a pinned producer; answered directly, so this only
-// needs to cover the decider, not a discovery probe.
-const GOAL_TIMEOUT: Duration = Duration::from_secs(2);
 // finish_session finalizes the dataset and completes the mirror before
 // answering, which can carry a large upload on a long session.
 const FINISH_TIMEOUT: Duration = Duration::from_secs(300);

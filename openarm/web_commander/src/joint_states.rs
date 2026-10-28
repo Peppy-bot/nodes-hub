@@ -1,26 +1,23 @@
-// Live arm joint state for the UI. Observes each side's backbone<->arm pairing
-// and reports the follower's measured positions to the owner. The observer slot
-// fixes the side (an observed pairing delivers only its one follower), so there
-// is no id demux. It runs continuously and works in every deployment, including
-// ones where another node commands; the owner decides how to fold each
-// measurement into the target.
+//! Live arm joint state for the UI. Observes each side's backbone<->arm pairing
+//! and reports the follower's measured positions to the owner. The observer slot
+//! fixes the side (an observed pairing delivers only its one follower), so there
+//! is no id demux. It runs continuously and works in every deployment, including
+//! ones where another node commands; the owner decides how to fold each
+//! measurement into the target.
 
 use std::sync::Arc;
 
+use control_core::time::RECEIVE_ERROR_BACKOFF;
+use openarm_description::Side;
 use peppygen::NodeRunner;
 use peppygen::paired_topics::observed_left_arm::joint_states as observed_left_arm_joint_states;
 use peppygen::paired_topics::observed_right_arm::joint_states as observed_right_arm_joint_states;
 use peppylib::runtime::CancellationToken;
+use srs_model::JointVec;
 use tokio::sync::mpsc;
 use tracing::{error, warn};
 
 use crate::owner::Feedback;
-use crate::state::{ARM_DOF, Side};
-
-/// Pause after a receive error before retrying, so a persistently broken subscription
-/// cannot spin a listener at full CPU or flood the log at the stream rate (shared with
-/// the gripper-states listener).
-pub(crate) const RECEIVE_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
 
 pub async fn run(
     runner: Arc<NodeRunner>,
@@ -72,7 +69,7 @@ pub async fn run(
         };
         // The generic contract carries a Vec; this panel drives fixed 7-joint
         // arms, so anything else is malformed and dropped.
-        let Ok(joints) = <[f64; ARM_DOF]>::try_from(positions) else {
+        let Ok(joints) = <JointVec>::try_from(positions) else {
             warn!(
                 slot,
                 "joint_states: dropping message with a non-arm joint count"

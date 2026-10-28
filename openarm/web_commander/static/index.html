@@ -366,6 +366,8 @@
 <script>
 const PI = Math.PI;
 const ARM_DOF = 7;
+// The two arms, in the order the panel renders them.
+const SIDES = ['left', 'right'];
 // Gripper axis is the unitless opening fraction: 0 closed, 1 fully open.
 const GRIPPER_MAX = 1;
 // Shared full-width axis for every joint track: +-200deg exactly spans the widest
@@ -930,7 +932,7 @@ function set_ui_mode(mode) {
   for (const m of UI_MODES) $(`mode_${m}`).classList.toggle('on', mode === m);
   refresh_row_visibility();
   if (mode !== 'streaming') {
-    for (const side of ['left', 'right']) {
+    for (const side of SIDES) {
       if (enabled[side] && ws && ws.readyState === 1) {
         ws.send(JSON.stringify({cmd: 'set_enabled', side, on: false}));
       }
@@ -939,7 +941,7 @@ function set_ui_mode(mode) {
       touched[side] = null;
     }
   }
-  for (const side of ['left', 'right']) { refresh_primary(side); refresh_mode_buttons(side); }
+  for (const side of SIDES) { refresh_primary(side); refresh_mode_buttons(side); }
 }
 
 function run_gesture(name) {
@@ -1050,10 +1052,10 @@ function apply_snapshot(snap) {
   document.body.classList.toggle('actions-mode', composing);
   // Shared world-position axis across both arms: every x/y/z track spans it, so
   // the six rows align; each side's reachable band is grayed per axis below.
-  const posBounds = ['left', 'right'].flatMap(s => snap[`${s}_arm`].pos_bounds);
+  const posBounds = SIDES.flatMap(s => snap[`${s}_arm`].pos_bounds);
   const posMin = Math.min(...posBounds.map(b => b[0]));
   const posMax = Math.max(...posBounds.map(b => b[1]));
-  for (const side of ['left', 'right']) {
+  for (const side of SIDES) {
     const on = snap[`${side}_enabled`];
     enabled[side] = on;
     const held = gestureHeld[side];
@@ -1269,7 +1271,7 @@ function motor_tooltip(m) {
 // colored by the server-sent level, with the side's worst label appended.
 // A non-live side renders the server's status word instead of dots.
 function update_health_chips(snap) {
-  for (const side of ['left', 'right']) {
+  for (const side of SIDES) {
     const chip = $(`health_${side}`);
     const view = snap.health[side];
     if (view.status !== 'live') {
@@ -1334,7 +1336,7 @@ function motor_row(m) {
 // The Motors tab: rows and severity come from the server; a non-live side
 // shows its status note instead of a table.
 function update_motors(snap) {
-  for (const side of ['left', 'right']) {
+  for (const side of SIDES) {
     const panel = $(`${side}_motors`);
     panel.classList.remove('stale');
     const view = snap.health[side];
@@ -1475,7 +1477,7 @@ function connect() {
     $('gesture_stop').disabled = true;
     // Health would latch its last snapshot otherwise: gray the chips, drop
     // the banner and alerts, and fade the motors tables until reconnect.
-    for (const side of ['left', 'right']) {
+    for (const side of SIDES) {
       const chip = $(`health_${side}`);
       chip.className = 'health-chip dim';
       delete chip.dataset.sev;

@@ -1,12 +1,14 @@
-// Live gripper opening and effort ceiling for the UI. Observes each side's
-// backbone<->gripper pairing and reports the follower's measured opening and
-// its reported effort ceiling to the owner. The observer slot fixes the side,
-// so there is no id demux. Mirrors joint_states.rs for the arm: it runs
-// continuously, so the panel shows live aperture whether or not a move is in
-// flight.
+//! Live gripper opening and effort ceiling for the UI. Observes each side's
+//! backbone<->gripper pairing and reports the follower's measured opening and
+//! its reported effort ceiling to the owner. The observer slot fixes the side,
+//! so there is no id demux. Mirrors joint_states.rs for the arm: it runs
+//! continuously, so the panel shows live aperture whether or not a move is in
+//! flight.
 
 use std::sync::Arc;
 
+use control_core::time::RECEIVE_ERROR_BACKOFF;
+use openarm_description::Side;
 use peppygen::NodeRunner;
 use peppygen::paired_topics::observed_left_gripper::gripper_states as observed_left_gripper_gripper_states;
 use peppygen::paired_topics::observed_right_gripper::gripper_states as observed_right_gripper_gripper_states;
@@ -14,9 +16,7 @@ use peppylib::runtime::CancellationToken;
 use tokio::sync::mpsc;
 use tracing::error;
 
-use crate::joint_states::RECEIVE_ERROR_BACKOFF;
 use crate::owner::Feedback;
-use crate::state::Side;
 
 pub async fn run(
     runner: Arc<NodeRunner>,

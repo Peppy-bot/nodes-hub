@@ -1,44 +1,85 @@
-// Always-on command publisher. Reads the owner's per-tick `CommandFrame` and streams
-// each enabled side's arm setpoint and gripper opening on that limb's pairing
-// slot toward the backbone (the slot is the side, so no id demux), plus the
-// operator's governor controls on `governor_control`. The backbone governs each
-// stream and re-streams the governed value the followers track. A side with
-// `None` in the frame has its deadman off, so nothing is published and the
-// backbone holds that side at its last governed setpoint. Re-publishing every
-// tick (even an unchanged frame) keeps the stream trivially fresh for a
-// backbone that starts or re-pairs mid-session.
-//
-// The owner is the sole writer of state and the sole jog integrator; these tasks only
-// forward the latest frame. Each side+stream runs its own publish task on its own
-// interval, cloning the shared per-topic publisher and the frame receiver. A single
-// shared loop publishing Left then Right would leave Right permanently second (zenoh
-// publish resolves synchronously), so independent tasks avoid that bias.
+//! Always-on command publisher. Reads the owner's per-tick `CommandFrame` and streams
+//! each enabled side's arm setpoint and gripper opening on that limb's pairing
+//! slot toward the backbone (the slot is the side, so no id demux), plus the
+//! operator's governor controls on `governor_control`. The backbone governs each
+//! stream and re-streams the governed value the followers track. A side with
+//! `None` in the frame has its deadman off, so nothing is published and the
+//! backbone holds that side at its last governed setpoint. Re-publishing every
+//! tick (even an unchanged frame) keeps the stream trivially fresh for a
+//! backbone that starts or re-pairs mid-session.
+//!
+//! The owner is the sole writer of state and the sole jog integrator; these tasks only
+//! forward the latest frame. Each side+stream runs its own publish task on its own
+//! interval, owning its pairing slot's publisher and a clone of the frame receiver.
+//! Zenoh publish resolves synchronously, and each task publishes on its own tick, so
+//! neither side's setpoint waits behind the other's.
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
+use control_core::report_once::ReportOnce;
+use control_core::setpoint_stream::{SetpointSink, stream_setpoints};
+use openarm_description::{ArmPair, Side};
 use peppygen::NodeRunner;
 use peppygen::emitted_topics::governor::governor_control;
 use peppygen::paired_topics::{left_arm, left_gripper, right_arm, right_gripper};
 use peppylib::runtime::CancellationToken;
 use peppylib::{Payload, TopicPublisher};
+use srs_model::JointVec;
 use tokio::sync::watch;
-use tokio::time::MissedTickBehavior;
-use tracing::{error, warn};
+use tracing::error;
 
-use crate::owner::{CommandFrame, GovernorFrame};
-use crate::state::Side;
-
-/// Pairing timestamp from this instance's bound clock, so the backbone ages
-/// setpoints on the same timeline it reads. Errors until the clock delivers
-/// its first tick.
-fn pairing_timestamp() -> Result<SystemTime, String> {
-    let ns = peppygen::clock::now_ns().map_err(|e| format!("clock not ready: {e}"))?;
-    Ok(UNIX_EPOCH + Duration::from_nanos(ns))
-}
+use crate::consumer::clock_now;
+use crate::state::{GovernorSettings, Limb, UiState};
 
 type BuildJointSetpoint = fn(SystemTime, Vec<f64>, Vec<f64>, Vec<f64>) -> peppygen::Result<Payload>;
 type BuildGripperSetpoint = fn(SystemTime, f64, f64) -> peppygen::Result<Payload>;
+
+/// Each arm's pairing slot message builder.
+const BUILD_ARM_SETPOINT: ArmPair<BuildJointSetpoint> = ArmPair::new(
+    left_arm::joint_setpoints::build_message,
+    right_arm::joint_setpoints::build_message,
+);
+/// Each gripper's pairing slot message builder.
+const BUILD_GRIPPER_SETPOINT: ArmPair<BuildGripperSetpoint> = ArmPair::new(
+    left_gripper::gripper_setpoints::build_message,
+    right_gripper::gripper_setpoints::build_message,
+);
+
+/// The setpoints to stream this tick. `None` for a side means its deadman is off, so
+/// the publisher emits nothing and the backbone holds the last setpoint. Recomputed
+/// every command tick and read by the publisher tasks on their own cadence.
+#[derive(Clone, Copy, Debug)]
+pub struct CommandFrame {
+    pub arms: ArmPair<Option<JointVec>>,
+    pub grippers: ArmPair<Option<GripperFrame>>,
+    pub governor: GovernorSettings,
+}
+
+/// One gripper's streamed setpoint: the opening fraction and the operator's
+/// effort cap in its wire encoding (0 = no preference).
+#[derive(Clone, Copy, Debug)]
+pub struct GripperFrame {
+    pub opening: f64,
+    pub max_effort: f64,
+}
+
+impl CommandFrame {
+    pub(crate) fn from_state(s: &UiState) -> Self {
+        let arm = |side: Side| s.side_active(side).then_some(s.arms[side].joints);
+        let grip = |side: Side| {
+            s.side_active(side).then_some(GripperFrame {
+                opening: s.grippers[side].opening,
+                max_effort: s.grippers[side].max_effort.unwrap_or(0.0),
+            })
+        };
+        Self {
+            arms: ArmPair::from_fn(arm),
+            grippers: ArmPair::from_fn(grip),
+            governor: s.governor,
+        }
+    }
+}
 
 pub async fn run(
     runner: Arc<NodeRunner>,
@@ -62,6 +103,8 @@ pub async fn run(
             return token.cancel();
         }
     };
+    let publishers = ArmPair::new(left_arm_pub, right_arm_pub)
+        .zip(ArmPair::new(left_gripper_pub, right_gripper_pub));
     let governor_pub = match governor_control::declare_publisher(&runner).await {
         Ok(p) => p,
         Err(e) => {
@@ -80,34 +123,20 @@ pub async fn run(
         frame_rx.clone(),
         token.clone(),
     ));
-    for (side, arm_pub, build_arm, gripper_pub, build_gripper) in [
-        (
-            Side::Left,
-            left_arm_pub,
-            left_arm::joint_setpoints::build_message as BuildJointSetpoint,
-            left_gripper_pub,
-            left_gripper::gripper_setpoints::build_message as BuildGripperSetpoint,
-        ),
-        (
-            Side::Right,
-            right_arm_pub,
-            right_arm::joint_setpoints::build_message as BuildJointSetpoint,
-            right_gripper_pub,
-            right_gripper::gripper_setpoints::build_message as BuildGripperSetpoint,
-        ),
-    ] {
+    for (side, (arm_pub, gripper_pub)) in publishers {
         // Arm: stream the 7-joint setpoint while enabled (None in the frame =
         // disabled). Velocities and efforts stay empty: the backbone shapes its
         // own velocity feedforward over the governed stream.
+        let build_arm = BUILD_ARM_SETPOINT[side];
         let arm_rx = frame_rx.clone();
         tasks.spawn(stream_setpoints(
-            arm_pub,
+            SetpointPublisher(arm_pub),
             command_period,
-            token.clone(),
-            format!("{} arm", side.label()),
+            cancelled(token.clone()),
+            format!("{side} {}", Limb::Arm),
             move || {
                 let joints = arm_rx.borrow().arms[side]?;
-                Some(pairing_timestamp().and_then(|timestamp| {
+                Some(clock_now().and_then(|timestamp| {
                     build_arm(timestamp, joints.to_vec(), Vec::new(), Vec::new())
                         .map_err(|e| e.to_string())
                 }))
@@ -115,15 +144,16 @@ pub async fn run(
         ));
         // Gripper: stream the opening fraction and the operator's effort cap
         // while enabled (mirror of the arm stream above).
+        let build_gripper = BUILD_GRIPPER_SETPOINT[side];
         let gripper_rx = frame_rx.clone();
         tasks.spawn(stream_setpoints(
-            gripper_pub,
+            SetpointPublisher(gripper_pub),
             command_period,
-            token.clone(),
-            format!("{} gripper", side.label()),
+            cancelled(token.clone()),
+            format!("{side} {}", Limb::Gripper),
             move || {
                 let frame = gripper_rx.borrow().grippers[side]?;
-                Some(pairing_timestamp().and_then(|timestamp| {
+                Some(clock_now().and_then(|timestamp| {
                     build_gripper(timestamp, frame.opening, frame.max_effort)
                         .map_err(|e| e.to_string())
                 }))
@@ -141,24 +171,6 @@ pub async fn run(
     }
 }
 
-// Publish the latest setpoint from `next_message` every `period`, skipping a tick
-// whenever it returns None (the side is disabled). Failures latch so a stuck side warns
-// once, not every tick. The period arrives already validated, so this side never
-// divides by a rate it has to trust.
-impl GovernorFrame {
-    /// Whether this is the same setting as `other`, compared on the bits of
-    /// each control so the answer is total: a non-finite value the UI should
-    /// never send would otherwise compare unequal to itself and publish the
-    /// same setting at the frame rate.
-    pub fn same_setting(&self, other: &Self) -> bool {
-        self.collision_enabled == other.collision_enabled
-            && self.d_stop.to_bits() == other.d_stop.to_bits()
-            && self.d_safe.to_bits() == other.d_safe.to_bits()
-            && self.max_ee_velocity_m_s.to_bits() == other.max_ee_velocity_m_s.to_bits()
-            && self.max_gripper_rate_frac_s.to_bits() == other.max_gripper_rate_frac_s.to_bits()
-    }
-}
-
 /// Publish the operator's governor controls whenever they change, until
 /// shutdown.
 ///
@@ -171,8 +183,8 @@ async fn stream_governor_control(
     mut frame_rx: watch::Receiver<CommandFrame>,
     token: CancellationToken,
 ) {
-    let mut sent: Option<GovernorFrame> = None;
-    let mut failing = false;
+    let mut sent: Option<GovernorSettings> = None;
+    let publish_failures = ReportOnce::default();
     loop {
         let governor = frame_rx.borrow_and_update().governor;
         if !sent
@@ -196,13 +208,13 @@ async fn stream_governor_control(
                 // is sent again on the next frame.
                 Ok(()) => {
                     sent = Some(governor);
-                    failing = false;
+                    publish_failures.clear();
                 }
-                Err(e) if !failing => {
-                    failing = true;
-                    error!("governor control publish failing: {e}");
+                Err(e) => {
+                    if publish_failures.first_of_run() {
+                        error!("governor control publish failing: {e}");
+                    }
                 }
-                Err(_) => {}
             }
         }
         tokio::select! {
@@ -216,98 +228,18 @@ async fn stream_governor_control(
     }
 }
 
-async fn stream_setpoints(
-    publisher: TopicPublisher,
-    period: Duration,
-    token: CancellationToken,
-    label: String,
-    mut next_message: impl FnMut() -> Option<Result<Payload, String>>,
-) {
-    // interval (not sleep) so the publish cadence holds at the commanded rate
-    // instead of drifting by the per-tick work time; Delay avoids a catch-up
-    // burst after a scheduling hiccup.
-    let mut ticker = tokio::time::interval(period);
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut failing = false;
+/// One pairing slot's publisher, as the sink of its setpoint stream.
+struct SetpointPublisher(TopicPublisher);
 
-    loop {
-        tokio::select! {
-            _ = token.cancelled() => return,
-            _ = ticker.tick() => {}
-        }
+impl SetpointSink for SetpointPublisher {
+    type Message = Payload;
 
-        let Some(built) = next_message() else {
-            continue;
-        };
-        let result = match built {
-            Ok(msg) => publisher.publish(msg).await.map_err(|e| e.to_string()),
-            Err(e) => Err(e),
-        };
-        match result {
-            Ok(()) => failing = false,
-            Err(e) if !failing => {
-                failing = true;
-                warn!("{label} command publish failing, suppressing repeats: {e}");
-            }
-            Err(_) => {}
-        }
+    async fn send(&self, message: Payload) -> Result<(), String> {
+        self.0.publish(message).await.map_err(|e| e.to_string())
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_governor_setting_compares_equal_to_itself_including_a_non_finite_one() {
-        // The publisher sends only on a change, so a control that compared
-        // unequal to itself would publish the setting in force at the frame
-        // rate on a reliable topic.
-        let setting = GovernorFrame {
-            collision_enabled: true,
-            d_stop: 0.005,
-            d_safe: 0.02,
-            max_ee_velocity_m_s: 0.25,
-            max_gripper_rate_frac_s: 6.0,
-        };
-        assert!(setting.same_setting(&setting));
-
-        let nan = GovernorFrame {
-            d_stop: f64::NAN,
-            ..setting
-        };
-        assert!(
-            nan.same_setting(&nan),
-            "a non-finite control is still the same setting as itself"
-        );
-        assert!(!nan.same_setting(&setting));
-
-        for moved in [
-            GovernorFrame {
-                collision_enabled: false,
-                ..setting
-            },
-            GovernorFrame {
-                d_stop: 0.006,
-                ..setting
-            },
-            GovernorFrame {
-                d_safe: 0.03,
-                ..setting
-            },
-            GovernorFrame {
-                max_ee_velocity_m_s: 0.3,
-                ..setting
-            },
-            GovernorFrame {
-                max_gripper_rate_frac_s: 7.0,
-                ..setting
-            },
-        ] {
-            assert!(
-                !setting.same_setting(&moved),
-                "every control is compared: {moved:?}"
-            );
-        }
-    }
+/// Resolves once `token` is cancelled.
+async fn cancelled(token: CancellationToken) {
+    token.cancelled().await;
 }
