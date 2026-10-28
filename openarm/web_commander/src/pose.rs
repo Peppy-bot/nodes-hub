@@ -12,11 +12,11 @@
 
 use std::sync::{Arc, Mutex};
 
-use openarm_description::HardwareVersion;
+use control_core::sync::lock_ignoring_poison;
+use openarm_description::{ARM_DOF, ArmPair, HardwareVersion, Side};
+use srs_model::JointVec;
 use srs_model::nalgebra::{Isometry3, Translation3, UnitQuaternion, Vector3};
 use srs_model::{Arm, ArmAnglePolicy};
-
-use crate::state::{ARM_DOF, Side};
 
 /// A world-frame end-effector pose as `[x, y, z, roll, pitch, yaw]` (metres,
 /// radians): the form the panel edits and displays.
@@ -38,14 +38,11 @@ pub const PLAN_ANGLE_TOL_RAD: f64 = 5.0 * DEG;
 /// (`at` takes `&mut self`) behind `ArmModels`'s shared `&self` methods.
 #[derive(Clone)]
 pub struct ArmModels {
-    left: Arc<Mutex<Arm>>,
-    right: Arc<Mutex<Arm>>,
-    left_velocity_limits: [f64; ARM_DOF],
-    right_velocity_limits: [f64; ARM_DOF],
+    arms: ArmPair<Arc<Mutex<Arm>>>,
+    velocity_limits: ArmPair<JointVec>,
     // World-frame x/y/z reachable bounds per side, from the FK envelope (computed once
     // at construction); the panel sizes its position sliders to these.
-    left_bounds: [[f64; 2]; 3],
-    right_bounds: [[f64; 2]; 3],
+    bounds: ArmPair<[[f64; 2]; 3]>,
 }
 
 impl ArmModels {
@@ -55,31 +52,26 @@ impl ArmModels {
     /// come from the same URDF: the budget the gesture bake asserts its trajectories
     /// against.
     pub fn from_version(version: HardwareVersion) -> Self {
-        let mut left = build_arm(version, Side::Left);
-        let mut right = build_arm(version, Side::Right);
-        let left_bounds = workspace_aabb(&mut left);
-        let right_bounds = workspace_aabb(&mut right);
+        let mut arms = ArmPair::from_fn(|side| build_arm(version, side));
+        let bounds = ArmPair::from_fn(|side| workspace_aabb(&mut arms[side]));
         Self {
-            left_velocity_limits: velocity_limits(version.urdf(), Side::Left),
-            right_velocity_limits: velocity_limits(version.urdf(), Side::Right),
-            left: Arc::new(Mutex::new(left)),
-            right: Arc::new(Mutex::new(right)),
-            left_bounds,
-            right_bounds,
+            velocity_limits: ArmPair::from_fn(|side| velocity_limits(version.urdf(), side)),
+            arms: arms.map(|_, arm| Arc::new(Mutex::new(arm))),
+            bounds,
         }
     }
 
     /// World-frame end-effector pose of `joints` for `side`.
-    pub fn ee_pose_world(&self, side: Side, joints: &[f64; ARM_DOF]) -> Pose {
-        let model = self.get(side).lock().unwrap_or_else(|p| p.into_inner());
+    pub fn ee_pose_world(&self, side: Side, joints: &JointVec) -> Pose {
+        let model = lock_ignoring_poison(self.get(side));
         let base = model.at(joints).ee_pose();
         decompose(&model.world_pose(&base))
     }
 
     /// World-frame end-effector orientation of `joints` as a quaternion `[x, y, z, w]`,
     /// for the panel's arcball (which composes orientation on quaternions, never euler).
-    pub fn ee_quat_world(&self, side: Side, joints: &[f64; ARM_DOF]) -> [f64; 4] {
-        let model = self.get(side).lock().unwrap_or_else(|p| p.into_inner());
+    pub fn ee_quat_world(&self, side: Side, joints: &JointVec) -> [f64; 4] {
+        let model = lock_ignoring_poison(self.get(side));
         let base = model.at(joints).ee_pose();
         let q = model.world_pose(&base).rotation;
         [q.i, q.j, q.k, q.w]
@@ -96,9 +88,9 @@ impl ArmModels {
         side: Side,
         position: [f64; 3],
         rotation: UnitQuaternion<f64>,
-        seed: &[f64; ARM_DOF],
-    ) -> Option<[f64; ARM_DOF]> {
-        let model = self.get(side).lock().unwrap_or_else(|p| p.into_inner());
+        seed: &JointVec,
+    ) -> Option<JointVec> {
+        let model = lock_ignoring_poison(self.get(side));
         let world = Isometry3::from_parts(
             Translation3::new(position[0], position[1], position[2]),
             rotation,
@@ -110,36 +102,19 @@ impl ArmModels {
     }
 
     fn get(&self, side: Side) -> &Arc<Mutex<Arm>> {
-        match side {
-            Side::Left => &self.left,
-            Side::Right => &self.right,
-        }
+        &self.arms[side]
     }
 
     /// Per-joint URDF velocity limits (rad/s) for `side`: the budget the backbone's
     /// chase enforces, which the gesture bake asserts its trajectories against.
-    pub(crate) fn velocity_limits(&self, side: Side) -> &[f64; ARM_DOF] {
-        match side {
-            Side::Left => &self.left_velocity_limits,
-            Side::Right => &self.right_velocity_limits,
-        }
-    }
-
-    /// Per-joint [lo, hi] position limits (rad) for `side`, from the same model the
-    /// IK solves against (elbow singularity floor included).
-    pub(crate) fn joint_ranges(&self, side: Side) -> [[f64; 2]; ARM_DOF] {
-        let model = self.get(side).lock().unwrap_or_else(|p| p.into_inner());
-        let lims = model.limits();
-        std::array::from_fn(|i| [lims[i].lo, lims[i].hi])
+    pub(crate) fn velocity_limits(&self, side: Side) -> &JointVec {
+        &self.velocity_limits[side]
     }
 
     /// World-frame x/y/z reachable bounds `[[min, max]; 3]` for `side`, so the panel
     /// sizes its position sliders to the arm's actual reach (correct per generation).
     pub fn pos_bounds(&self, side: Side) -> [[f64; 2]; 3] {
-        match side {
-            Side::Left => self.left_bounds,
-            Side::Right => self.right_bounds,
-        }
+        self.bounds[side]
     }
 }
 
@@ -148,8 +123,8 @@ impl ArmModels {
 const JOINT_JOG_CONVERGED_RAD: f64 = 1e-4;
 const JOINT_JOG_STOP_RAD_S: f64 = 1e-3;
 
-/// The rates a joint jog ramps under, and the tick it is integrated at.
-#[derive(Clone, Copy)]
+/// The rates a joint jog ramps under.
+#[derive(Clone, Copy, Debug)]
 pub struct JogCaps {
     /// Joint-jog acceleration limit (rad/s^2): the jog ramps up under it and brakes
     /// to rest by the target.
@@ -158,8 +133,6 @@ pub struct JogCaps {
     /// under it, so a far slider target closes at this speed, not at the speed the
     /// braking distance alone would allow.
     pub joint_velocity_rad_s: f64,
-    /// The command tick (s) the physics is integrated against.
-    pub dt_s: f64,
 }
 
 /// The operator's active drive for one arm, reconciled toward once per stream tick:
@@ -169,8 +142,8 @@ pub struct JogCaps {
 /// preserved across those refreshes so a continuous drag keeps its momentum.
 #[derive(Clone, Copy, Debug)]
 pub struct JointJog {
-    pub target: [f64; ARM_DOF],
-    pub vel: [f64; ARM_DOF],
+    pub target: JointVec,
+    pub vel: JointVec,
 }
 
 /// One joint-jog tick's outcome. Targets are pre-clamped to joint limits by the
@@ -178,31 +151,28 @@ pub struct JointJog {
 pub enum JointJogStep {
     /// Every joint arrived and stopped; the setpoint lands exactly on the target and the
     /// jog retires.
-    Converged([f64; ARM_DOF]),
+    Converged(JointVec),
     /// Advanced one acceleration-limited step: the new joint setpoint to stream and the
     /// carried per-joint velocity for the next tick.
-    Stepped {
-        joints: [f64; ARM_DOF],
-        vel: [f64; ARM_DOF],
-    },
+    Stepped { joints: JointVec, vel: JointVec },
 }
 
-/// Advance a joint jog one tick: walk each joint of `current` toward `target` under an
-/// acceleration limit (`caps.joint_accel_rad_s2`) and a speed limit
-/// (`caps.joint_velocity_rad_s`), carrying `vel` so the velocity stays continuous. The
+/// Advance a joint jog one command tick of `dt_s` seconds: walk each joint of `current`
+/// toward `target` under an acceleration limit (`caps.joint_accel_rad_s2`) and a speed
+/// limit (`caps.joint_velocity_rad_s`), carrying `vel` so the velocity stays continuous. The
 /// approach speed is the lower of the speed limit and the speed the acceleration limit
 /// can brake to rest from by the target, and the position is clamped there so it never
 /// overshoots; the carried velocity then bleeds to rest over the next few ticks under
 /// the same cap.
 pub fn joint_jog_tick(
-    current: &[f64; ARM_DOF],
-    target: &[f64; ARM_DOF],
-    vel: &[f64; ARM_DOF],
+    current: &JointVec,
+    target: &JointVec,
+    vel: &JointVec,
     caps: JogCaps,
+    dt_s: f64,
 ) -> JointJogStep {
-    let dt = caps.dt_s;
     let a_max = caps.joint_accel_rad_s2;
-    let dv_max = a_max * dt;
+    let dv_max = a_max * dt_s;
 
     let next: [(f64, f64); ARM_DOF] = std::array::from_fn(|i| {
         let error = target[i] - current[i];
@@ -213,7 +183,7 @@ pub fn joint_jog_tick(
         // |v_next - vel| <= dv_max, so the acceleration bound holds on every tick,
         // including the last: the velocity is never teleported to zero.
         let v_next = vel[i] + (v_desired - vel[i]).clamp(-dv_max, dv_max);
-        let step = v_next * dt;
+        let step = v_next * dt_s;
         // Land on the target only when this step is directed at it and would reach or
         // cross it (`step*error >= error^2`), clamping the position there so it never
         // overshoots. A mid-drag reversal (velocity still opposing `error`) fails this
@@ -225,8 +195,8 @@ pub fn joint_jog_tick(
         };
         (joint, v_next)
     });
-    let joints: [f64; ARM_DOF] = std::array::from_fn(|i| next[i].0);
-    let vel: [f64; ARM_DOF] = std::array::from_fn(|i| next[i].1);
+    let joints: JointVec = std::array::from_fn(|i| next[i].0);
+    let vel: JointVec = std::array::from_fn(|i| next[i].1);
 
     let settled = (0..ARM_DOF).all(|i| {
         (target[i] - joints[i]).abs() < JOINT_JOG_CONVERGED_RAD
@@ -245,24 +215,24 @@ pub fn joint_jog_tick(
 /// same frame). A bad base link or tcp link aborts bringup, matching how the
 /// backbone fails.
 fn build_arm(version: HardwareVersion, side: Side) -> Arm {
-    let base = version.base_link(side.description());
+    let base = version.base_link(side);
     Arm::from_urdf(version.urdf(), base)
-        .unwrap_or_else(|e| panic!("build {} arm model from base '{base}': {e}", side.label()))
+        .unwrap_or_else(|e| panic!("build {side} arm model from base '{base}': {e}"))
         .with_lower_floor(
             version.elbow_joint_index(),
             version.elbow_singularity_floor_rad(),
         )
-        .with_tool_link(version.tcp_link(side.description()))
-        .unwrap_or_else(|e| panic!("mount the {} gripper tcp frame: {e}", side.label()))
+        .with_tool_link(version.tcp_link(side))
+        .unwrap_or_else(|e| panic!("mount the {side} gripper tcp frame: {e}"))
 }
 
 /// Per-joint velocity limits (rad/s) for `side`, j1..j7, from the bundled URDF:
 /// the same numbers the backbone's chase enforces, so the gesture bake and the
 /// backbone's follow capability agree by construction.
-fn velocity_limits(urdf: &str, side: Side) -> [f64; ARM_DOF] {
+fn velocity_limits(urdf: &str, side: Side) -> JointVec {
     let robot = urdf_rs::read_from_string(urdf).expect("bundled URDF must parse");
     std::array::from_fn(|i| {
-        let name = format!("openarm_{}_joint{}", side.label(), i + 1);
+        let name = format!("openarm_{side}_joint{}", i + 1);
         let joint = robot
             .joints
             .iter()
@@ -310,7 +280,7 @@ fn workspace_aabb(arm: &mut Arm) -> [[f64; 2]; 3] {
     let mut best = [[(f64::NEG_INFINITY, [0.0; ARM_DOF]); 2]; 3];
     for idx in 0..N.pow(ARM_DOF as u32) {
         let mut rem = idx;
-        let q: [f64; ARM_DOF] = std::array::from_fn(|j| {
+        let q: JointVec = std::array::from_fn(|j| {
             let step = rem % N;
             rem /= N;
             let t = step as f64 / (N - 1) as f64;
@@ -339,7 +309,7 @@ fn workspace_aabb(arm: &mut Arm) -> [[f64; 2]; 3] {
 fn ascend(
     arm: &mut Arm,
     limits: &[srs_model::Limit; ARM_DOF],
-    start: [f64; ARM_DOF],
+    start: JointVec,
     axis: usize,
     sign: f64,
 ) -> f64 {
@@ -350,7 +320,7 @@ fn ascend(
     let world_from_base = arm.base_from_world().inverse().rotation;
     let mut q = start;
     let mut step = 0.2_f64;
-    let value = |arm: &mut Arm, q: &[f64; ARM_DOF]| {
+    let value = |arm: &mut Arm, q: &JointVec| {
         let base = arm.at(q).ee_pose();
         sign * arm.world_pose(&base).translation.vector[axis]
     };
@@ -360,7 +330,7 @@ fn ascend(
             break;
         }
         let jacobian = arm.at(&q).jacobian();
-        let gradient: [f64; ARM_DOF] = std::array::from_fn(|j| {
+        let gradient: JointVec = std::array::from_fn(|j| {
             let column = jacobian.column(j);
             let linear = Vector3::new(column[0], column[1], column[2]);
             sign * (world_from_base * linear)[axis]
@@ -369,7 +339,7 @@ fn ascend(
         if norm < f64::EPSILON {
             break;
         }
-        let candidate: [f64; ARM_DOF] = std::array::from_fn(|j| {
+        let candidate: JointVec = std::array::from_fn(|j| {
             (q[j] + step * gradient[j] / norm).clamp(limits[j].lo, limits[j].hi)
         });
         let next = value(arm, &candidate);
@@ -385,23 +355,10 @@ fn ascend(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{caps, models};
 
-    // Representative joint-jog rates for the tests (production values are params).
-    const JOG_A: f64 = 10.0;
-    const JOG_V: f64 = 1.0;
-
-    fn models() -> ArmModels {
-        ArmModels::from_version(HardwareVersion::V2)
-    }
-
-    // The caps of a 100 Hz tick.
-    fn caps() -> JogCaps {
-        JogCaps {
-            joint_accel_rad_s2: JOG_A,
-            joint_velocity_rad_s: JOG_V,
-            dt_s: 0.01,
-        }
-    }
+    /// A 100 Hz command tick.
+    const DT_S: f64 = 0.01;
 
     #[test]
     fn no_reachable_pose_falls_outside_the_bounds() {
@@ -412,7 +369,7 @@ mod tests {
         // nothing reachable sits outside them. Walks a golden-ratio lattice rather
         // than the grid the bounds were built from, so the poses are ones the
         // construction never saw.
-        const GOLDEN: [f64; ARM_DOF] = [
+        const GOLDEN: JointVec = [
             0.618_033_988_75,
             0.381_966_011_25,
             0.236_067_977_5,
@@ -422,11 +379,11 @@ mod tests {
             0.034_441_853_75,
         ];
         let m = models();
-        for side in [Side::Left, Side::Right] {
+        for side in Side::BOTH {
             let bounds = m.pos_bounds(side);
-            let limits = HardwareVersion::V2.joint_limits(side.description());
+            let limits = HardwareVersion::V2.joint_limits(side);
             for step in 0..5000 {
-                let q: [f64; ARM_DOF] = std::array::from_fn(|i| {
+                let q: JointVec = std::array::from_fn(|i| {
                     let t = (GOLDEN[i] * (step + 1) as f64).fract();
                     limits[i][0] + t * (limits[i][1] - limits[i][0])
                 });
@@ -446,7 +403,7 @@ mod tests {
     #[test]
     fn workspace_bounds_are_sane_and_contain_home() {
         let m = models();
-        for side in [Side::Left, Side::Right] {
+        for side in Side::BOTH {
             let b = m.pos_bounds(side);
             for [lo, hi] in b {
                 assert!(lo < hi, "bound [{lo}, {hi}] must be non-empty");
@@ -500,7 +457,7 @@ mod tests {
         let target = [3.0; ARM_DOF];
         let mut peak = 0.0f64;
         for _ in 0..200 {
-            match joint_jog_tick(&current, &target, &vel, caps) {
+            match joint_jog_tick(&current, &target, &vel, caps, DT_S) {
                 JointJogStep::Stepped { joints, vel: v } => {
                     current = joints;
                     vel = v;
@@ -509,9 +466,12 @@ mod tests {
             }
             peak = peak.max(vel.iter().cloned().fold(0.0, f64::max));
         }
-        assert!(peak <= JOG_V + 1e-12, "speed held at the limit: {peak}");
         assert!(
-            peak > 0.99 * JOG_V,
+            peak <= caps.joint_velocity_rad_s + 1e-12,
+            "speed held at the limit: {peak}"
+        );
+        assert!(
+            peak > 0.99 * caps.joint_velocity_rad_s,
             "the limit is reached, not hovered under: {peak}"
         );
         // Two seconds at the limit after a 0.1 s ramp: 2 rad minus the ramp's shortfall.
@@ -531,13 +491,13 @@ mod tests {
         // From rest, one tick may add at most a_max*dt to the velocity, so the position
         // step is bounded by that: a small ramp, not a snap.
         let JointJogStep::Stepped { joints, vel } =
-            joint_jog_tick(&current, &target, &current, caps)
+            joint_jog_tick(&current, &target, &current, caps, DT_S)
         else {
             panic!("a far target does not converge in one tick");
         };
         for i in 0..ARM_DOF {
             assert!(
-                vel[i] <= caps.joint_accel_rad_s2 * caps.dt_s + 1e-12,
+                vel[i] <= caps.joint_accel_rad_s2 * DT_S + 1e-12,
                 "accel-capped"
             );
             assert!(
@@ -556,7 +516,7 @@ mod tests {
         let mut max_overshoot: f64 = 0.0;
         let mut converged = false;
         for _ in 0..5000 {
-            match joint_jog_tick(&q, &target, &v, caps) {
+            match joint_jog_tick(&q, &target, &v, caps, DT_S) {
                 JointJogStep::Stepped { joints, vel } => {
                     for i in 0..ARM_DOF {
                         // Never crosses past the target (monotone approach, no overshoot).
@@ -586,30 +546,31 @@ mod tests {
     #[test]
     fn joint_jog_tick_reversal_stays_within_the_acceleration_cap() {
         let caps = caps();
-        let dv_max = caps.joint_accel_rad_s2 * caps.dt_s;
+        let dv_max = caps.joint_accel_rad_s2 * DT_S;
         let up = [3.0; ARM_DOF];
         let mut q = [0.0; ARM_DOF];
         let mut v = [0.0; ARM_DOF];
         // Build up to cruise speed toward a far target.
         for _ in 0..20 {
-            let JointJogStep::Stepped { joints, vel } = joint_jog_tick(&q, &up, &v, caps) else {
+            let JointJogStep::Stepped { joints, vel } = joint_jog_tick(&q, &up, &v, caps, DT_S)
+            else {
                 unreachable!("a far target does not converge yet")
             };
             q = joints;
             v = vel;
         }
         assert!(
-            v[0] > 0.99 * JOG_V,
+            v[0] > 0.99 * caps.joint_velocity_rad_s,
             "the joint is at cruise speed before the reversal"
         );
         // Reverse mid-drag: re-target just behind the current position while still moving
         // forward. The joint must decelerate under the cap and turn around.
-        let down: [f64; ARM_DOF] = std::array::from_fn(|i| q[i] - 0.01);
+        let down: JointVec = std::array::from_fn(|i| q[i] - 0.01);
         let mut worst_accel: f64 = 0.0;
         let mut max_overshoot: f64 = 0.0;
         let mut converged = false;
         for _ in 0..5000 {
-            match joint_jog_tick(&q, &down, &v, caps) {
+            match joint_jog_tick(&q, &down, &v, caps, DT_S) {
                 JointJogStep::Stepped { joints, vel } => {
                     for i in 0..ARM_DOF {
                         worst_accel = worst_accel.max((vel[i] - v[i]).abs());
@@ -640,7 +601,7 @@ mod tests {
     #[test]
     fn velocity_limits_load_from_the_urdf() {
         let m = models();
-        for side in [Side::Left, Side::Right] {
+        for side in Side::BOTH {
             let v = m.velocity_limits(side);
             assert!(v.iter().all(|x| x.is_finite() && *x > 0.0));
             // j3/j4 are the slow pair in both generations' datasheets; sanity-pin

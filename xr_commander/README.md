@@ -25,6 +25,7 @@ side and bind them in a launcher. No code here changes.
 | `rgb_camera/v1` | contract | implementer | `color_cameras` (any number) |
 | `rgbd_camera/v1` | contract | implementer | `rgbd_cameras` (any number, colour half only) |
 | `postures/v1` | contract | implementer | `postures` (any number; the chosen robot's takes the face buttons) |
+| `limb_motion/v1` | contract | implementer | `limb_motion` (any number; a squeeze stops the moves in flight on the robot it takes) |
 | `episode_recording/v1` | contract | implementer | `recorder` (any number; the chosen robot's takes the left face buttons) |
 
 Both pairings are defined in `pairings-hub` (`robot/pose_link.json5`,
@@ -34,11 +35,13 @@ are unit quaternions `[x, y, z, w]` (scalar last), and both directions of
 of full travel, 0 closed to 1 fully open; `max_effort` 0 means the follower's
 configured ceiling.
 
-Every slot is optional. A robot is identified by the copy its backbone runs
-in, or by the backbone's instance id outside a copy. It pairs only the sides
-it has: a single-arm robot pairs the right side, and a robot without
-grippers leaves the gripper slots alone. The robot declares the pairs from
-its own side, naming this node's slots:
+Every slot is optional. A robot is named by the copy its backbone runs in,
+or, outside any copy, by its backbone's instance id. The headset drives only
+the robots of the fleet listing, the copies of the stack: a robot that a
+launcher deploys outside any copy shows on the page, and a squeeze on it
+does nothing. A robot pairs only the sides it has: a single-arm robot pairs
+the right side, and a robot without grippers leaves the gripper slots alone.
+The robot declares the pairs from its own side, naming this node's slots:
 
 ```json5
 {
@@ -55,10 +58,11 @@ its own side, naming this node's slots:
 }
 ```
 
-and the launcher adds the robot's postures, recorder and cameras to the
-headset under the option that selects the robot, so a robot that joins later
-brings them with it: `add_links: { postures: ["backbone_inst"],
-rgbd_cameras: ["chest"] }` on `headset_inst`. The page's **Robot** card
+and the launcher adds the robot's postures, limb_motion, recorder and cameras
+to the headset under the option that selects the robot, so a robot that
+joins later brings them with it: `add_links: { postures: ["backbone_inst"],
+limb_motion: ["backbone_inst"], rgbd_cameras: ["chest"] }` on
+`headset_inst`. The page's **Robot** card
 lists the paired robots in name order and picks the one to drive; it works from a laptop's
 browser as well as the headset's. Until a robot is chosen, or while the
 chosen one is away, the controllers keep the robot they are driving; if that
@@ -77,19 +81,77 @@ for and adds its own. Every panel is fed the chosen robot's newest frame 30
 times a second, the rate the headset's video tracks play at, and a camera
 that stops delivering reads NO SIGNAL.
 
+## Robot leases
+
+The headset holds the robot lease of the robot a person drives, so a program
+that asks the stack before it moves a robot never takes that robot from a
+person, and a person never drives a robot that a program holds. Its daemon
+target `fleet` (`robot_leases:v1`) needs a scope with `changes` and `lease`; the
+launcher gives it on the instance, which runs on the coordinator machine,
+outside any copy:
+
+```json5
+{ instance_id: "headset_inst", daemon_scopes: { fleet: { members: ["changes", "lease"] } } }
+```
+
+- **The lease follows the grip.** A squeeze on a robot that the headset does
+  not drive yet takes the robot's lease under the name `driven from the
+  headset`, stops the planned moves in flight on the robot (`stop` of
+  `limb_motion`, with that name as the reason), and only then streams. The
+  headset releases the lease once no hand drives the robot, after the
+  release burst of the last hand, and no posture move of its own runs.
+- **A held robot.** While another client holds the lease, a squeeze does
+  nothing and the hand's row names the holder and the lease name. The other
+  clients see the lease in the fleet listing under the holder
+  `headset_inst`, and each of their refusals names it.
+- **Take-over.** While the holder opened its lease for a take-over, such as a
+  suspended run, a squeeze asks the daemon whether the headset may move the
+  robot (`check_move`), stops the moves in flight and drives, with no lease
+  of its own. When the holder closes the lease, the headset lets go.
+- **The halt.** At `peppy fleet halt` the lease ends, and the headset lets go
+  as at a grip release: the release burst holds the arm where it is
+  measured. Each squeeze and press then does nothing, and the panel says
+  that the stack is halted. After `peppy fleet clear-halt` nothing starts by
+  itself: a new squeeze takes the lease again.
+- **Letting go.** The headset also lets go when its lease ends, and at once
+  when its `changes` or `lease` goal ends. The lease feedback names the
+  robot of each lease that ends: the headset asks the daemon (`check_move`)
+  whether it may still move that robot, and lets go unless a fleet listing
+  as recent as a yes names it as the holder. A grip held through a let-go
+  drives nothing until it is released. The headset starts the goals again
+  as soon as its daemon answers; while the daemon does not answer, each
+  squeeze and press does nothing. When the daemon refuses a goal, nothing
+  drives until the next launch, except for a `lease` goal refused while the
+  daemon still ends the last one, which the headset asks for again.
+- **Lost answers.** The headset releases the lease of a take whose answer
+  does not come; the daemon refuses that release when the take never
+  reached it. A posture move whose goal send or result is lost on the
+  robot's backbone is stopped before its lease is released. After a
+  let-go, such as at a halt, it is stopped too, unless another client
+  holds the robot by then.
+
+After the headset releases a lease, a program that takes it at once can see
+the backbone refuse its first goals with `leader_streaming` for up to 250
+ms. After a let-go at once, the refusals can last until the headset sees the
+change, then for the release burst, and for 250 ms more.
+
 ## Operating it
 
 Open the URL the node prints at startup in the headset's browser and press
 **Start**, or **Start Passthrough** to see the room around the panels. The
-page is teleop_xr's; it holds the **Robot** card, read from this node's
-`/robot` route, and the camera feeds, which list the headset's panels from
-the first load. Without a bound camera only the status panel shows (nothing at all
-with it disabled); the robot view is whatever camera you bind.
+page is teleop_xr's; it holds the **Robot** card, which lists each paired
+robot with who holds it, read from this node's `/robot` route and kept
+current by its `/robot/events` stream, and the camera feeds, which list the
+headset's panels from the first load. Without a bound camera only the
+status panel shows (nothing at all with it disabled); the robot view is
+whatever camera you bind.
 
 - **Grip button**: the deadman and clutch, per hand. Squeeze to engage that
-  hand, release to let go. Letting go streams the measured pose for a quarter
-  second, so the follower stops where it is, and then that hand's slots fall
-  silent until the next squeeze.
+  hand: the headset takes the robot first (see Robot leases), and a refused
+  squeeze says why on the hand's row for three seconds; the grip drives
+  nothing until it is released. Release to let go. Letting go streams the
+  measured pose for a quarter second, so the follower stops where it is,
+  and then that hand's slots fall silent until the next squeeze.
 - **Motion**: relative to the squeeze. The commanded pose is where the
   end-effector was when you engaged, displaced by your hand's motion since,
   scaled by `motion_scale` (orientation is never scaled). Release, reposition,
@@ -101,8 +163,10 @@ with it disabled); the robot view is whatever camera you bind.
 - **Face buttons** (right controller): **A** (the lower button) fires the
   chosen robot's whole-robot `move_to_home` action, **B** fires
   `move_to_ready`; each is a planned move that runs to completion on its own.
-  Squeezing either grip cancels the move in flight and takes manual control
-  back. Does nothing while the chosen robot has no postures action.
+  A press takes the robot as a squeeze does and keeps it for the move. A
+  squeeze stops the move in flight and takes manual control back. A press
+  does nothing while a grip is held, just after a grip is released, while a
+  posture move runs, or while the chosen robot has no postures action.
 - **Face buttons** (left controller): the chosen robot's dataset recorder.
   **X** starts an episode under the current task label; the next press stops
   and saves it, and the panel row shows `saving...` until the recorder's
@@ -122,19 +186,23 @@ mostly costs intuition, not correctness.
 ### The status panel
 
 A headset has no console, so a floating `status` panel carries the state
-that decides whether a hand can drive: whether the headset link is live, and
-per hand whether it has a controller, a held grip, a fresh measurement from
-its follower, and an engagement. It answers "why is nothing moving" without
-taking the headset off. It floats above the middle of the row of camera
-panels (above the chest camera's panel when that is the only floating one)
-and moves like a camera panel. It is on by default; `status_panel_enabled:
+that decides whether a hand can drive: whether the headset link is live, the
+chosen robot and who holds it, and per hand whether it has a controller, a
+held grip, a fresh measurement from its follower, and an engagement. The
+`ROBOT` row gives the chosen robot's state with the Robot card's words, why
+the headset let go of it for three seconds, or why the headset cannot ask
+the fleet: the daemon is lost, or refused the fleet. It answers "why is
+nothing moving" without taking the headset off. It floats above the middle
+of the row of camera panels (above the chest camera's panel when that is the
+only floating one) and moves like a camera panel. It is on by default; `status_panel_enabled:
 false` hides it. The right hand's row (the only row, on a one-armed robot)
 reports the posture buttons: "moving to home..." while the move runs, then
 "move to home completed", "move to home cancelled", "move to home failed:
 <cause>" or "move to home refused: <cause>" for three seconds. A press that
 does nothing says why for three seconds: "move to home ignored: release the
 grip first", "move to home ignored: still moving to ready", "move to home:
-bravo has no postures".
+bravo has no postures". A refused squeeze says why on its hand's row for
+three seconds: "squeeze refused: <cause>".
 
 While the chosen robot has a recorder it also carries the task line: what
 the next episode records as, so the label is visible without taking the
@@ -233,10 +301,11 @@ full list and defaults.
 
 ## Development
 
-`frames`, `devices`, `clutch`, `config`, `addresses`, `tls`, `robot_choice`,
-`robots`, `sensor_hold`, and the decode half of `video` are pure of peppy;
-`publish` and `status` import the generated modules, so the full suite needs
-the synced environment (and nothing served):
+`__main__`, `publish` and `page` import the generated modules, `panel`
+imports them through `publish`, and `sensor_hold` imports peppylib; every
+other module is pure of peppy. The tests drive the generated modules through
+the peppygen harness, so the full suite needs the synced environment (and
+nothing served):
 
 ```bash
 peppy node sync   # resolves the peppygen/peppylib path dependencies uv needs

@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use control_core::serving;
 use peppygen::NodeRunner;
 use peppygen::exposed_services::robot_identity::get_identity;
 use peppylib::runtime::CancellationToken;
@@ -60,25 +61,16 @@ async fn run(identity: Identity, runner: Arc<NodeRunner>, token: CancellationTok
         identity.model,
         identity.core_node
     );
-    loop {
-        tokio::select! {
-            _ = token.cancelled() => {
-                tracing::info!("get_identity service shutting down");
-                break;
-            }
-            result = get_identity::handle_next_request(&runner, |_req| {
-                Ok(get_identity::Response::new(
-                    identity.robot.clone(),
-                    identity.model.clone(),
-                    identity.core_node.clone(),
-                ))
-            }) => {
-                if let Err(e) = result {
-                    tracing::warn!("get_identity handler error: {e}");
-                }
-            }
-        }
-    }
+    serving::serve("get_identity", token.cancelled(), || {
+        get_identity::handle_next_request(&runner, |_req| {
+            Ok(get_identity::Response::new(
+                identity.robot.clone(),
+                identity.model.clone(),
+                identity.core_node.clone(),
+            ))
+        })
+    })
+    .await;
 }
 
 #[cfg(test)]

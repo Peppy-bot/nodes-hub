@@ -270,7 +270,7 @@ wheels = [
 [[package]]
 name = "control-core-py"
 version = "0.1.0"
-source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=control_core_py#1ddcb57d3a5b2887aaaab2a5c59708abcab4bacc" }
+source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=control_core_py#7511ffc9fd5923ec1ee7cff61e8f2b11b1fc0ece" }
 
 [[package]]
 name = "eigenpy"
@@ -936,7 +936,7 @@ dev = [
 [[package]]
 name = "so101-description"
 version = "0.1.0"
-source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=so101_description#1ddcb57d3a5b2887aaaab2a5c59708abcab4bacc" }
+source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=so101_description#7511ffc9fd5923ec1ee7cff61e8f2b11b1fc0ece" }
 dependencies = [
     { name = "control-core-py" },
     { name = "numpy" },
@@ -1028,4 +1028,4 @@ wheels = [
 [[package]]
 name = "workspace-core-py"
 version = "0.1.0"
-source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=workspace_core_py#1ddcb57d3a5b2887aaaab2a5c59708abcab4bacc" }
+source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=workspace_core_py#7511ffc9fd5923ec1ee7cff61e8f2b11b1fc0ece" }

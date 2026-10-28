@@ -1,9 +1,10 @@
 # uvc_camera
 
 Nodes that present a USB Video Class (UVC) camera as the `rgb_camera:v1`
-contract. Every variant here is interchangeable with the others, and with any
-other `rgb_camera:v1` implementation (including the sim relay), so launchers bind
-the contract rather than a specific node.
+contract; `uvc_camera_linux` also implements `camera_geometry:v1`. Every variant
+here is interchangeable with the others, and with any other `rgb_camera:v1`
+implementation (including the sim relay), so launchers bind the contract rather
+than a specific node.
 
 | Directory | Node name | Use |
 |---|---|---|
@@ -28,17 +29,22 @@ relay instead, which renders the robot's actual views through this same
 
 ## Interfaces
 
-All members sit under `link_id: "camera"`.
+The `rgb_camera:v1` members sit under `link_id: "camera"`, and the
+`camera_geometry:v1` members of `uvc_camera_linux` under `link_id: "geometry"`.
 
 - **Emits** `video_stream`: frame data plus encoding and dimensions. The header
-  carries a `frame_id` (a wrapping counter) and `stamp`, sampled when the driver
-  hands the frame over rather than after conversion, so consumers can age
+  carries a `frame_id` (a wrapping counter) and `timestamp`, sampled when the
+  driver hands the frame over rather than after conversion, so consumers can age
   samples on capture time.
 - **Exposes** `video_stream_info`, `set_exposure`, `set_white_balance`,
   `set_gain`, `set_brightness`, `set_contrast`. `video_stream_info` reports the
   driver-negotiated stream (geometry and effective rate), not the requested one.
   Controls apply synchronously in the handler, so the response reflects what
   actually happened to the hardware, including the value the driver clamped to.
+- **Exposes** (`uvc_camera_linux`) `get_color_intrinsics`,
+  `get_depth_intrinsics`, `get_depth_to_color_extrinsics` under `geometry`. A
+  UVC device carries no calibration and a colour camera has no depth stream, so
+  each gives an error reply of the kind `rejected` that says why.
 
 A control service answers the value the driver kept, or `-1` for an automatic
 mode. A control that gives no value gets an error reply with a failure kind and
@@ -95,7 +101,7 @@ deadline, and the cancel-on-exit guard. The integration tests under
 ```sh
 cd linux
 sudo ./tests/setup_v4l2loopback.sh
-cargo test -- --ignored
+cargo test -- --ignored --test-threads=1
 ```
 
 See `linux/tests/INTEGRATION_TESTS.md` for details.

@@ -8,16 +8,14 @@
 
 use std::sync::Arc;
 
+use camera_core::geometry::NO_DEPTH_STREAM_MESSAGE;
+use control_core::serving;
 use peppygen::exposed_services::geometry::{
     get_color_intrinsics, get_depth_intrinsics, get_depth_to_color_extrinsics,
 };
 
 /// The refusal of get_color_intrinsics: what is missing and what would fix it.
 pub const NO_CALIBRATION_MESSAGE: &str = "no calibration: this camera needs a calibration file";
-
-/// The refusal of the two depth services, in the words the simulated colour
-/// camera uses for the same question.
-pub const NO_DEPTH_STREAM_MESSAGE: &str = "a colour camera has no depth stream";
 
 pub fn color_intrinsics() -> Result<get_color_intrinsics::Response, get_color_intrinsics::Failure> {
     Err(get_color_intrinsics::Failure::new(
@@ -45,18 +43,12 @@ pub fn depth_to_color_extrinsics()
 macro_rules! listen_for_geometry_requests {
     ($fn_name:ident, $service:ident, $respond:ident) => {
         pub async fn $fn_name(node_runner: Arc<peppygen::NodeRunner>) {
-            let cancel_token = node_runner.cancellation_token().clone();
-            loop {
-                let result = tokio::select! {
-                    _ = cancel_token.cancelled() => break,
-                    result = $service::handle_next_request(&node_runner, |_request| {
-                        $respond()
-                    }) => result,
-                };
-                if let Err(e) = result {
-                    tracing::error!("{} service error: {e:?}", stringify!($service));
-                }
-            }
+            serving::serve(
+                stringify!($service),
+                node_runner.cancellation_token().cancelled(),
+                || $service::handle_next_request(&node_runner, |_request| $respond()),
+            )
+            .await;
         }
     };
 }

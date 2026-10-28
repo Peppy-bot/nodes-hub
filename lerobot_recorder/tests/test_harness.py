@@ -18,6 +18,7 @@ import time
 import pytest
 
 from lerobot_recorder.__main__ import setup
+from lerobot_recorder.recording import MIN_EPISODE_FRAMES
 from peppygen.consumed_topics.color_cameras import video_stream
 from peppygen.fixtures import harness
 from peppygen.fixtures.exposed_actions.recording import record_episode
@@ -25,7 +26,7 @@ from peppygen.fixtures.exposed_services.recording import finish_session
 from peppygen.paired_topics.commanded_joints import joint_setpoints
 from peppygen.paired_topics.observed_joints import joint_states
 from peppygen.parameters import Parameters
-from tests.test_recording import make_params
+from tests.support import make_params
 
 FPS = 10
 # The geometry the sink integration suite proves out: smaller frames stall
@@ -261,6 +262,10 @@ async def test_record_episode_feedback_flows_and_cancel_saves(tmp_path):
             assert first.frames_recorded >= 1
             assert second.frames_recorded > first.frames_recorded
             assert first.disk_free_bytes > 0
+            # Cancelled once the episode holds enough frames to be saved.
+            latest = second
+            while latest.frames_recorded < MIN_EPISODE_FRAMES:
+                latest = await asyncio.wait_for(goal.on_next_feedback(), 60.0)
 
             cancel = await goal.cancel_goal(30.0)
             assert cancel.state == record_episode.CancelState.SIGNALLED
@@ -270,7 +275,7 @@ async def test_record_episode_feedback_flows_and_cancel_saves(tmp_path):
             assert result.cancel_reason == "cancelled by its caller"
             assert result.data is not None
             assert result.data.episode_index == 0
-            assert result.data.frames_recorded >= second.frames_recorded
+            assert result.data.frames_recorded >= latest.frames_recorded
             assert result.data.video_frames_missing == 0
 
             # d) finish_session rolls the saved session over to a fresh one.

@@ -129,7 +129,7 @@ def test_the_chosen_robots_producer_is_found_on_a_contract_slot():
     assert one_slot().producer_for(module) is None
 
 
-def test_a_producer_outside_any_copy_serves_every_robot_unless_it_is_one():
+def test_a_robot_has_its_own_producers_only():
     # The robot outside any copy pairs first, so the hands drive it.
     paired = [peer("backbone_inst")]
     robots = PairedRobots(None, arms={"right": live_slot(paired)}, grippers={})
@@ -144,11 +144,11 @@ def test_a_producer_outside_any_copy_serves_every_robot_unless_it_is_one():
     recorders = SimpleNamespace(bound_members=lambda _runner: [recorder])
     postures = SimpleNamespace(bound_members=lambda _runner: [backbone])
     # Its own backbone serves it.
-    assert robots.chosen() == "backbone_inst"
     assert robots.producer_for(postures) is backbone.producer
     robots.choose("alpha")
-    # A lone recorder serves alpha too; another robot's backbone does not.
-    assert robots.producer_for(recorders) is recorder.producer
+    # Neither a producer outside any copy nor another robot's backbone
+    # serves alpha: a squeeze stops the moves of the robot it takes alone.
+    assert robots.producer_for(recorders) is None
     assert robots.producer_for(postures) is None
 
 

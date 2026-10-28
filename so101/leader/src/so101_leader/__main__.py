@@ -15,16 +15,18 @@ from peppygen.parameters import Parameters
 from so101_description import units
 
 from so101_leader import params as params_mod
-from so101_leader.device import DeviceLoop, LeaderSample, LerobotLeader
+from so101_leader.device import DeviceLoop, LerobotLeader
 
 runtime.configure("so101_leader")
 
 
-def _sample_timestamp_s(sample: LeaderSample) -> float:
-    return runtime.wire_timestamp_s(peppygen.clock.now_ns(), sample.captured_monotonic)
+def _captured_timestamp_s(captured_monotonic: float) -> float:
+    """The wire stamp naming when the bus read happened, not when this tick
+    published it."""
+    return runtime.wire_timestamp_s(peppygen.clock.now_ns(), captured_monotonic)
 
 
-async def _stream(node_runner, topic_module, period_s, token, build):
+async def _stream_setpoints(node_runner, topic_module, period_s, token, build):
     """Publish build(sample) every tick a fresh sample exists. The whole
     tick body is guarded: a raising build (e.g. a sim clock before its first
     tick) must log and retry, never kill the stream task."""
@@ -78,7 +80,8 @@ def make_setup(hardware_factory=_lerobot_hardware):
             positions = list(units.joints_rad_from_deg(sample.positions_deg))
             # Positions only: the backbone shapes its own pacing, and no
             # consumer of this stream takes velocity or effort feedforward.
-            return joint_setpoints.build_message(_sample_timestamp_s(sample), positions, [], [])
+            stamp = _captured_timestamp_s(sample.captured_monotonic)
+            return joint_setpoints.build_message(stamp, positions, [], [])
 
         def build_gripper():
             sample = device.fresh_sample(config.stale_timeout_s)
@@ -86,16 +89,17 @@ def make_setup(hardware_factory=_lerobot_hardware):
                 return None
             opening = units.gripper_fraction_from_percent(sample.gripper_percent)
             # A leader arm carries no effort intent; 0 leaves the follower's ceiling.
-            return gripper_setpoints.build_message(_sample_timestamp_s(sample), opening, 0.0)
+            stamp = _captured_timestamp_s(sample.captured_monotonic)
+            return gripper_setpoints.build_message(stamp, opening, 0.0)
 
         token = node_runner.cancellation_token()
         period_s = 1.0 / config.command_rate_hz
         return [
             asyncio.create_task(
-                _stream(node_runner, joint_setpoints, period_s, token, build_arm)
+                _stream_setpoints(node_runner, joint_setpoints, period_s, token, build_arm)
             ),
             asyncio.create_task(
-                _stream(node_runner, gripper_setpoints, period_s, token, build_gripper)
+                _stream_setpoints(node_runner, gripper_setpoints, period_s, token, build_gripper)
             ),
         ]
 

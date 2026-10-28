@@ -48,28 +48,10 @@ impl VirtualCamera {
             return Err("ffmpeg not found. Install with: sudo apt-get install ffmpeg".to_string());
         }
 
-        // Start ffmpeg streaming test pattern
-        let ffmpeg_process = Command::new("ffmpeg")
-            .args([
-                "-re", // Read input at native frame rate
-                "-f",
-                "lavfi", // Use libavfilter virtual input
-                "-i",
-                &format!("testsrc=size={width}x{height}:rate={fps}"),
-                "-pix_fmt",
-                "rgb24", // Pixel format (must match nokhwa's RgbFormat)
-                "-f",
-                "v4l2", // Output to V4L2 device
-                &device_path,
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("Failed to start ffmpeg: {e}"))?;
-
-        // Wait for stream to be ready - increased for v4l2loopback
-        std::thread::sleep(Duration::from_secs(5));
+        let ffmpeg_process = stream(
+            &device_path,
+            &format!("testsrc=size={width}x{height}:rate={fps}"),
+        )?;
 
         println!(
             "[VirtualCamera] Started streaming to {device_path} ({width}x{height} @ {fps} fps)"
@@ -95,26 +77,10 @@ impl VirtualCamera {
             return Err(format!("Device {device_path} not found"));
         }
 
-        let ffmpeg_process = Command::new("ffmpeg")
-            .args([
-                "-re",
-                "-f",
-                "lavfi",
-                "-i",
-                &format!("smptebars=size={width}x{height}:rate={fps}"),
-                "-pix_fmt",
-                "rgb24",
-                "-f",
-                "v4l2",
-                &device_path,
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("Failed to start ffmpeg: {e}"))?;
-
-        std::thread::sleep(Duration::from_secs(5));
+        let ffmpeg_process = stream(
+            &device_path,
+            &format!("smptebars=size={width}x{height}:rate={fps}"),
+        )?;
 
         println!("[VirtualCamera] Started color bars on {device_path}");
 
@@ -142,6 +108,33 @@ impl VirtualCamera {
             .ok()
             .is_some_and(|status| status.is_none())
     }
+}
+
+/// Streams the libavfilter source `source` to `device_path` through ffmpeg,
+/// and waits for the stream to be ready.
+fn stream(device_path: &str, source: &str) -> Result<Child, String> {
+    let ffmpeg_process = Command::new("ffmpeg")
+        .args([
+            "-re", // Read input at native frame rate
+            "-f",
+            "lavfi", // Use libavfilter virtual input
+            "-i",
+            source,
+            "-pix_fmt",
+            "rgb24", // RGB3 on the device, the format the tests open it in
+            "-f",
+            "v4l2", // Output to V4L2 device
+            device_path,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Failed to start ffmpeg: {e}"))?;
+
+    // Give ffmpeg time to start streaming to the device.
+    std::thread::sleep(Duration::from_secs(5));
+    Ok(ffmpeg_process)
 }
 
 impl Drop for VirtualCamera {

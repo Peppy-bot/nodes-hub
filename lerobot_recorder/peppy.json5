@@ -12,8 +12,8 @@
 // launcher's to declare, not this node's: it binds as many pairings as the
 // robot has, and a limb is one measured source paired with the commanded
 // source bound at the same position in its slot. Pairing wire messages carry
-// no joint names, so dimension names derive from the follower instance
-// observed for each limb plus a joint index; joint counts and which optional
+// no joint names, so dimension names derive from the link id of each limb's
+// command source plus a joint index; joint counts and which optional
 // vectors (velocities, efforts) a source delivers are discovered from its
 // first message, so everything recorded comes from the wire with no layout
 // config.

@@ -52,7 +52,7 @@ from peppygen.fixtures.exposed_services.workspace import (
     describe_workspace as describe_workspace_fx,
 )
 from peppygen.paired_topics.arm import joint_states as arm_states_topic
-from peppygen.paired_topics.leader_arm import joint_states as upstream_states_topic
+from peppygen.paired_topics.leader_arm import joint_states as leader_joint_states_topic
 from peppygen.paired_topics.gripper import gripper_states as gripper_states_topic
 from peppygen.paired_topics.leader_arm import joint_setpoints as leader_setpoints_topic
 from peppygen.paired_topics.leader_pose import pose_setpoints as leader_pose_topic
@@ -612,7 +612,7 @@ async def test_the_wire_refuses_a_joint_vector_of_the_wrong_width():
     block is easy to drop from a manifest by accident, and its loss would be
     invisible: the node would simply go back to trusting whatever arrived."""
     with pytest.raises(ValueError, match="expected 5"):
-        upstream_states_topic.build_message(
+        leader_joint_states_topic.build_message(
             timestamp=time.time(), positions=[0.0] * 4, velocities=[], efforts=[]
         )
 

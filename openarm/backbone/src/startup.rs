@@ -4,6 +4,7 @@
 
 use std::time::Duration;
 
+use control_core::time::sleep_unless_cancelled;
 use peppygen::NodeRunner;
 use peppygen::consumed_services::robot_init::is_ready as robot_init_is_ready;
 use peppylib::runtime::CancellationToken;
@@ -31,9 +32,8 @@ pub async fn wait_until_ready(runner: &NodeRunner, token: &CancellationToken) {
             Ok(_) => {}
             Err(e) => warn!(error = %e, "is_ready poll failed; retrying"),
         }
-        tokio::select! {
-            _ = token.cancelled() => return,
-            _ = tokio::time::sleep(IS_READY_POLL_INTERVAL) => {}
+        if !sleep_unless_cancelled(IS_READY_POLL_INTERVAL, token.cancelled()).await {
+            return;
         }
     }
 }

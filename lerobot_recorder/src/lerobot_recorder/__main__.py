@@ -29,16 +29,18 @@ from peppygen.exposed_services.recording import finish_session as finish_session
 from peppygen.exposed_services.recording import resume_session as resume_session_svc
 from peppygen.parameters import Parameters
 
+from . import params as params_mod
 from . import plan as plan_mod
 from . import recording, storage
-from .episode import Recorder
+from .episode import Recorder, Session
+from .log import log
 from .recording import Cache, CameraFrame, timestamp_to_ns
 from .sink import Sink
 
 # Backoff after a failed receive or service request, so a persistently
 # failing endpoint logs at a readable rate instead of spinning.
-RECEIVE_RETRY_S = 0.1
-SERVICE_RETRY_S = 1.0
+_RECEIVE_RETRY_S = 0.1
+_SERVICE_RETRY_S = 1.0
 
 
 async def _drain(topic_module, route, token, label: str) -> None:
@@ -59,8 +61,8 @@ async def _drain(topic_module, route, token, label: str) -> None:
             try:
                 received = receive.result()
             except Exception as e:
-                print(f"[recorder] {label} receive error: {e!r}")
-                await asyncio.sleep(RECEIVE_RETRY_S)
+                log(f"{label} receive error: {e!r}")
+                await asyncio.sleep(_RECEIVE_RETRY_S)
                 continue
             if received is None:
                 return  # subscription closed: node shutting down
@@ -69,7 +71,7 @@ async def _drain(topic_module, route, token, label: str) -> None:
                 route(tag, message)
             except Exception as e:
                 # One bad message must not kill the drain for the stream.
-                print(f"[recorder] {label} route error: {e!r}")
+                log(f"{label} route error: {e!r}")
     finally:
         cancelled.cancel()
 
@@ -153,11 +155,11 @@ def _recorded_links(plan: plan_mod.RecordingPlan) -> dict:
 def _check_same_links(session_dir: Path, plan: plan_mod.RecordingPlan) -> None:
     """Refuse a session whose limbs were fed by different sources than this
     launch binds, with `precondition_failed`. The dataset's own features
-    cannot catch a swap: limbs are named after their follower, so relaunching
-    with the leaders bound in the other order keeps every name and shape
-    identical while mirroring the two arms' setpoints into each other's
-    action columns. Every session this node opens records its links, so a
-    session without them is not one of ours, and is refused with
+    cannot catch a swap: limbs are named after the link their command
+    travels on, so relaunching with the sources bound in another order keeps
+    every name and shape identical while crossing one limb's measured stream
+    with another's commands. Every session this node opens records its
+    links, so a session without them is not one of ours, and is refused with
     `rejected`."""
     provenance = session_dir / "session.json"
     try:
@@ -185,12 +187,12 @@ def _resolve_existing_session(
     target: storage.StorageTarget, name: str, plan: plan_mod.RecordingPlan
 ) -> Path:
     """The one path where an operator-supplied name reaches the filesystem:
-    validated before it touches a path, then checked against the session's
+    parsed before it touches a path, then checked against the session's
     recorded provenance. Raises resume_session's Failure: `rejected` for a
     name that names no session of this node, and as _check_same_links
     does."""
     try:
-        storage.validate_session_name(name)
+        name = storage.parse_session_name(name)
     except ValueError as e:
         raise resume_session_svc.Failure(resume_session_svc.FailureKind.REJECTED, str(e)) from None
     session_dir = target.root / name
@@ -223,21 +225,15 @@ async def setup(
     read_sources=plan_mod.read_bound_sources,
     clock_init=peppygen.clock.init,
 ) -> list[asyncio.Task]:
-    if params.fps <= 0:
-        raise ValueError("fps must be positive")
-    # add_frame runs on the event loop, so the library must encode images on
-    # its own threads: at zero it writes every frame's PNG inline and stalls
-    # the sampler and the drains behind it.
-    if params.image_writer_threads <= 0:
-        raise ValueError("image_writer_threads must be positive")
-    target = storage.parse_storage(params.storage_root, params.s3_uri)
+    config = params_mod.parse(params)
+    target = config.storage
     storage.ensure_mounted(target)
     await asyncio.to_thread(storage.probe_credentials, target)
     if target.s3 is not None:
         # The full resolved destination, so a wrong or missing endpoint
         # environment is visible at launch instead of at the first upload.
-        print(
-            f"[recorder] mirroring to {storage.resolved_endpoint()}, "
+        log(
+            f"mirroring to {storage.resolved_endpoint()}, "
             f"bucket {target.s3.bucket!r}, prefix {target.s3.prefix!r}"
         )
 
@@ -248,18 +244,18 @@ async def setup(
     # The boot config seeds every observer slot with the launch's membership,
     # so the robot's shape is readable right here in setup.
     plan = plan_mod.discover(read_sources(node_runner))
-    print(
-        f"[recorder] {len(plan.state)} state link(s), "
+    log(
+        f"{len(plan.state)} state link(s), "
         f"{len(plan.color_cameras)} color camera(s), {len(plan.rgbd_cameras)} rgbd camera(s)"
     )
 
-    def session_handles(session_dir: Path, session_name: str):
+    def session_at(session_dir: Path, session_name: str) -> Session:
         sink = Sink(
             root=session_dir / "dataset",
             repo_id=f"{plan_mod.sanitize_key(params.robot_type)}/session",
             robot_type=params.robot_type,
-            fps=params.fps,
-            image_writer_threads=params.image_writer_threads,
+            fps=config.fps,
+            image_writer_threads=config.image_writer_threads,
             streaming_encoding=params.streaming_encoding,
         )
         mirror = (
@@ -267,31 +263,29 @@ async def setup(
             if target.s3 is not None
             else None
         )
-        return session_dir, sink, mirror
+        return Session(directory=session_dir, sink=sink, mirror=mirror)
 
-    def open_session():
+    def open_session() -> Session:
         session_name = datetime.datetime.now(datetime.UTC).strftime(storage.SESSION_NAME_FORMAT)
         session_dir = target.root / session_name
         # exist_ok=False: two sessions opened in the same second must not
         # interleave into one directory.
         session_dir.mkdir(parents=True, exist_ok=False)
-        print(f"[recorder] session at {session_dir}")
+        log(f"session at {session_dir}")
         _write_session_json(session_dir, params, plan)
-        return session_handles(session_dir, session_name)
+        return session_at(session_dir, session_name)
 
-    def open_existing(name: str):
-        return session_handles(_resolve_existing_session(target, name, plan), name)
+    def open_existing(name: str) -> Session:
+        return session_at(_resolve_existing_session(target, name, plan), name)
 
-    session_dir, sink, mirror = open_session()
+    session = open_session()
     cache = Cache.for_plan(plan)
     recorder = Recorder(
         plan,
         cache,
-        sink,
-        session_dir,
-        params.max_staleness_s,
+        session,
+        config.max_staleness_s,
         params.min_remaining_disk_bytes,
-        mirror,
         open_session,
         open_existing,
     )
@@ -323,7 +317,7 @@ async def setup(
         try:
             await recorder_task
         except Exception as e:
-            print(f"[recorder] recorder task failed: {e!r}")
+            log(f"recorder task failed: {e!r}")
         await recorder.close_for_shutdown()
 
     node_runner.on_shutdown(close_session)
@@ -347,7 +341,7 @@ async def setup(
 
 
 async def _serve(
-    node_runner: NodeRunner, svc, handler, label: str, retry_s: float = SERVICE_RETRY_S
+    node_runner: NodeRunner, svc, handler, label: str, retry_s: float = _SERVICE_RETRY_S
 ) -> None:
     """Answer one exposed service until the node shuts down. A handler that
     raises must not end the loop: the service would then never answer again."""
@@ -357,7 +351,7 @@ async def _serve(
             await svc.handle_next_request(node_runner, handler)
         except Exception as e:
             # CancelledError is a BaseException, so shutdown's cancel passes.
-            print(f"[recorder] {label} service error: {e!r}")
+            log(f"{label} service error: {e!r}")
             await asyncio.sleep(retry_s)
 
 

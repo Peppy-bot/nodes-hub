@@ -9,50 +9,24 @@ from peppygen.consumed_services.recorder import finish_session
 
 from tests.helpers import (
     CANCELLED_BY_CALLER,
-    POSE,
     FakeToken,
+    ScriptedHeadset,
     boot,
-    default_parameters,
+    default_settings,
     eventually,
+    left_buttons,
     press_until_goal,
     robots_of,
     stop_and_save,
     tap_x,
 )
-from xr_commander import config, publish, record
+from xr_commander import bus, record
 from xr_commander.bus import FLASH_S
-from xr_commander.devices import HandSample, XrFrame
 
 # The result of an ordinary stop-and-save.
 SAVED = record_episode.ResultResponseData(
     episode_index=0, frames_recorded=7, video_frames_missing=0
 )
-
-
-class FakeSession:
-    """A scripted headset (the FrameSource seam is a device surface, not a
-    generated module)."""
-
-    def __init__(self):
-        self.hands = {}
-
-    def press(self, *, x=False, y=False):
-        self.hands = {
-            "left": HandSample(
-                pose=POSE,
-                squeezing=False,
-                trigger=0.0,
-                primary_button=x,
-                secondary_button=y,
-            )
-        }
-
-    def latest(self):
-        return XrFrame(received_monotonic_s=time.monotonic(), hands=self.hands)
-
-
-def settings():
-    return config.from_parameters(default_parameters())
 
 
 # The label the task page hands the button loop unless a test scripts its own.
@@ -72,7 +46,7 @@ def boot_recording():
 async def recorder_buttons(h, status=None, timing=None, read_task=None):
     """`run_recorder_buttons` running against the real runner and the real
     recorder modules; yields the scripted headset session and the task."""
-    session = FakeSession()
+    session = ScriptedHeadset()
     token = FakeToken()
     task = asyncio.create_task(
         record.run_recorder_buttons(
@@ -82,7 +56,7 @@ async def recorder_buttons(h, status=None, timing=None, read_task=None):
             status=status or record.RecorderStatus(),
             session=session,
             robots=robots_of(h),
-            settings=settings(),
+            settings=default_settings(),
             token=token,
             read_task=read_task or (lambda: TASK),
             timing=timing or record.Timing(),
@@ -102,7 +76,7 @@ async def _fired_episode(h):
     node-side handle, the mock-side active goal, and the target."""
     target = robots_of(h).producer_for(record_episode)
     fire = asyncio.create_task(
-        publish.fire_goal(
+        bus.fire_goal(
             h.node_runner, record_episode, target, "record_episode", task=TASK
         )
     )
@@ -130,7 +104,7 @@ async def test_x_already_held_at_first_tracking_does_not_start():
     async with boot_recording() as h:
         rec = h.mocks.deps.recorder[0].record_episode
         async with recorder_buttons(h) as (session, _task):
-            session.press(x=True)
+            session.press(**left_buttons(x=True))
             with pytest.raises(TimeoutError):
                 await rec.next_goal(0.4)
             # An observed release and then a press is the first real edge.
@@ -149,7 +123,7 @@ async def test_one_physical_y_hold_finishes_once_across_a_gap():
             session,
             _task,
         ):
-            session.press(y=True)
+            session.press(**left_buttons(y=True))
             await eventually(
                 lambda: fin.captured_count() == 1, message="the held finish"
             )
@@ -157,13 +131,13 @@ async def test_one_physical_y_hold_finishes_once_across_a_gap():
             # not finish twice: the fired latch survives the gap.
             session.hands = {}
             await asyncio.sleep(0.05)
-            session.press(y=True)
+            session.press(**left_buttons(y=True))
             await asyncio.sleep(0.2)
             assert fin.captured_count() == 1
             # An observed release re-arms the finish.
-            session.press(y=False)
+            session.press(**left_buttons(y=False))
             await asyncio.sleep(0.05)
-            session.press(y=True)
+            session.press(**left_buttons(y=True))
             await eventually(
                 lambda: fin.captured_count() == 2, message="the re-armed finish"
             )
@@ -198,7 +172,9 @@ async def test_a_finished_episode_rearms_the_button():
             active = await pending.accept()
             await stop_and_save(session, active, SAVED)
             # The finished episode re-arms X for a second one.
-            pending = await press_until_goal(session, rec, {"x": False}, {"x": True})
+            pending = await press_until_goal(
+                session, rec, left_buttons(x=False), left_buttons(x=True)
+            )
             assert pending.request.task == TASK
             await pending.accept()
 
@@ -218,7 +194,9 @@ async def test_a_refused_goal_leaves_the_panel_idle_and_rearms():
                 lambda: status.note() == "record refused: busy", message="the cause"
             )
             # The refused goal re-arms the button immediately.
-            pending = await press_until_goal(session, rec, {"x": False}, {"x": True})
+            pending = await press_until_goal(
+                session, rec, left_buttons(x=False), left_buttons(x=True)
+            )
             await pending.refuse(PRECONDITION_FAILED, "busy")
             assert not status.recording
 
@@ -259,13 +237,13 @@ async def test_y_must_be_held_to_finish():
             _task,
         ):
             # A graze: released well before the hold threshold.
-            session.press(y=True)
+            session.press(**left_buttons(y=True))
             await asyncio.sleep(0.05)
-            session.press(y=False)
+            session.press(**left_buttons(y=False))
             await asyncio.sleep(0.4)
             assert fin.captured_count() == 0
             # A real hold finishes exactly once.
-            session.press(y=True)
+            session.press(**left_buttons(y=True))
             await eventually(
                 lambda: fin.captured_count() == 1, message="the held finish"
             )
@@ -287,10 +265,10 @@ async def test_outcomes_reach_the_panel_as_notes():
             await eventually(
                 lambda: status.note() == "saved episode 0", message="the saved note"
             )
-            session.press(x=False)
+            session.press(**left_buttons(x=False))
             await asyncio.sleep(0.05)
             rec.finish_session.enqueue_response(finish_session.ResponseData(session="s1"))
-            session.press(y=True)
+            session.press(**left_buttons(y=True))
             await eventually(
                 lambda: status.note() == "session finished",
                 message="the finished note",
@@ -317,7 +295,7 @@ async def test_a_finish_error_reply_notes_the_refusal_or_the_failure(kind, note)
         async with recorder_buttons(
             h, status, timing=record.Timing(finish_hold_s=0.05)
         ) as (session, _task):
-            session.press(y=True)
+            session.press(**left_buttons(y=True))
             await answer_the_finish_with_an_error_reply(fin, kind, "an episode is recording")
             await eventually(lambda: status.note() == note, message="the error reply note")
 
@@ -336,7 +314,7 @@ async def test_a_refused_finish_is_survived():
             session,
             task,
         ):
-            session.press(y=True)
+            session.press(**left_buttons(y=True))
             await answer_the_finish_with_an_error_reply(
                 fin, finish_session.FailureKind.PRECONDITION_FAILED, "an episode is recording"
             )
@@ -358,7 +336,7 @@ async def test_a_stale_gap_does_not_stop_a_recording_with_x_still_held():
             # The headset drops out with X still down, then comes back held.
             session.hands = {}
             await asyncio.sleep(0.05)
-            session.press(x=True)
+            session.press(**left_buttons(x=True))
             await asyncio.sleep(0.2)
             assert not active.is_cancelled()
             # A real release and press still stops it.
@@ -479,15 +457,15 @@ async def test_a_grazed_y_never_shows_finishing():
         fin = h.mocks.deps.recorder[0].finish_session
         grazed = SpyStatus()
         async with recorder_buttons(h, grazed, timing=hold) as (session, _task):
-            session.press(y=True)
+            session.press(**left_buttons(y=True))
             await asyncio.sleep(0.05)
-            session.press(y=False)
+            session.press(**left_buttons(y=False))
             await asyncio.sleep(0.4)
         assert True not in grazed.__dict__["seen"]
         fin.enqueue_response(finish_session.ResponseData(session="s1"))
         held = SpyStatus()
         async with recorder_buttons(h, held, timing=hold) as (session, _task):
-            session.press(y=True)
+            session.press(**left_buttons(y=True))
             await eventually(
                 lambda: True in held.__dict__.get("seen", []),
                 message="the finishing row",
@@ -543,14 +521,16 @@ async def test_each_episode_carries_the_label_live_when_it_started():
             active = await pending.accept()
             await stop_and_save(session, active, SAVED)
             # The next take is fired with the label live by then.
-            pending = await press_until_goal(session, rec, {"x": False}, {"x": True})
+            pending = await press_until_goal(
+                session, rec, left_buttons(x=False), left_buttons(x=True)
+            )
             assert pending.request.task == "stack the blocks"
             await pending.accept()
 
 
 async def test_a_press_with_no_recorder_on_the_chosen_robot_is_inert(capsys):
     async with boot() as h:  # nothing paired, nothing bound: no robot to record
-        session = FakeSession()
+        session = ScriptedHeadset()
         token = FakeToken()
         task = asyncio.create_task(
             record.run_recorder_buttons(
@@ -560,7 +540,7 @@ async def test_a_press_with_no_recorder_on_the_chosen_robot_is_inert(capsys):
                 status=record.RecorderStatus(),
                 session=session,
                 robots=robots_of(h),
-                settings=settings(),
+                settings=default_settings(),
                 token=token,
                 read_task=lambda: TASK,
             )

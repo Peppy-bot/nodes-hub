@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 peppygen = { path = ".peppy/libs/peppygen" }
 peppylib = { path = ".peppy/libs/peppylib" }
-openarm_description = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "openarm_description" }
+openarm_description = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "openarm_description", features = ["serde"] }
 srs_model = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "srs_model" }
 control_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "control_core" }
 # The version public-peppy-libs uses, so the velocity limits come from the
@@ -23,3 +23,4 @@ tokio-util = "0.7"
 
 [dev-dependencies]
 peppygen = { path = ".peppy/libs/peppygen", features = ["testing"] }
+tokio = { version = "1", features = ["test-util"] }

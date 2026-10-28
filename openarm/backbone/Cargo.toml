@@ -42,6 +42,3 @@ opt-level = 3
 [dev-dependencies]
 hegeltest = { version = "0.50", features = ["static-engine"] }
 peppygen = { path = ".peppy/libs/peppygen", features = ["testing"] }
-# A paused clock, so a test waits out the service loop's pause without the
-# host's time.
-tokio = { version = "1", features = ["full", "test-util"] }

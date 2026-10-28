@@ -8,6 +8,7 @@
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
+use openarm_description::Side;
 use peppygen::NodeRunner;
 use peppygen::consumed_topics::motor_health::motor_health;
 use peppygen::paired_topics::{
@@ -21,23 +22,13 @@ use peppylib::runtime::CancellationToken;
 use tokio::sync::mpsc;
 use tracing::error;
 
-use crate::consumer;
+use crate::consumer::{self, HEALTH_STALE_AFTER, parse_timestamp_validity};
 use crate::owner::Feedback;
-use crate::state::{
-    HEALTH_STALE_AFTER, HealthLevel, HealthReport, MotorHealthReading, Side,
-    parse_timestamp_validity,
-};
+use crate::state::{HealthLevel, HealthReport, Limb, MotorHealthReading};
 
 /// Whether this deployment binds any motor_health producer.
 pub fn available(runner: &NodeRunner) -> bool {
     !motor_health::bound_producers(runner).is_empty()
-}
-
-impl consumer::Subscription for motor_health::Subscription {
-    type Message = motor_health::Message;
-    async fn recv(&mut self) -> peppygen::Result<Option<(ProducerRef, Self::Message)>> {
-        self.next().await
-    }
 }
 
 pub async fn run(
@@ -55,7 +46,7 @@ pub async fn run(
             return;
         }
     };
-    let subscription = match motor_health::subscribe(&runner).await {
+    let mut subscription = match motor_health::subscribe(&runner).await {
         Ok(subscription) => subscription,
         Err(e) => {
             error!(error = %e, "motor_health subscribe");
@@ -66,7 +57,7 @@ pub async fn run(
         "motor_health",
         token,
         feedback,
-        subscription,
+        async move || subscription.next().await,
         // An unresolved daemon clock cannot certify a timestamp's age, so the
         // report drops on the same throttled-warn path as a malformed one.
         move |producer, msg| {
@@ -82,36 +73,29 @@ pub async fn run(
     .await;
 }
 
-/// The component kind a producing instance reports as.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Kind {
-    Arm,
-    Gripper,
-}
-
-type HealthSources = [(ProducerRef, Side, Kind); 4];
+type HealthSources = [(ProducerRef, Side, Limb); 4];
 
 fn observed_sources(runner: &NodeRunner) -> peppygen::Result<HealthSources> {
     Ok([
-        (left_arm::source(runner)?.producer, Side::Left, Kind::Arm),
-        (right_arm::source(runner)?.producer, Side::Right, Kind::Arm),
+        (left_arm::source(runner)?.producer, Side::Left, Limb::Arm),
+        (right_arm::source(runner)?.producer, Side::Right, Limb::Arm),
         (
             left_gripper::source(runner)?.producer,
             Side::Left,
-            Kind::Gripper,
+            Limb::Gripper,
         ),
         (
             right_gripper::source(runner)?.producer,
             Side::Right,
-            Kind::Gripper,
+            Limb::Gripper,
         ),
     ])
 }
 
 /// Match the full wire identity to exactly one observed limb.
-fn classify(sources: &HealthSources, producer: &ProducerRef) -> Result<(Side, Kind), String> {
+fn classify(sources: &HealthSources, producer: &ProducerRef) -> Result<(Side, Limb), String> {
     let mut matches = sources.iter().filter(|(source, _, _)| source == producer);
-    let Some((_, side, kind)) = matches.next() else {
+    let Some((_, side, limb)) = matches.next() else {
         return Err(format!(
             "producer {producer:?} is outside this panel's observed limbs; wire motor_health to the observed followers"
         ));
@@ -121,7 +105,7 @@ fn classify(sources: &HealthSources, producer: &ProducerRef) -> Result<(Side, Ki
             "producer {producer:?} fills multiple observed limbs; bind each limb to its own follower"
         ));
     }
-    Ok((*side, *kind))
+    Ok((*side, *limb))
 }
 
 /// Parse one wire report into the owner feedback it routes to: a producing
@@ -139,13 +123,13 @@ fn parse_report(
     clock_now: SystemTime,
     received_at: Instant,
 ) -> Result<Feedback, String> {
-    let (side, kind) = classify(sources, producer)?;
-    match kind {
-        Kind::Arm => Ok(Feedback::MotorHealth {
+    let (side, limb) = classify(sources, producer)?;
+    match limb {
+        Limb::Arm => Ok(Feedback::ArmMotorHealth {
             side,
             health: Box::new(parse_component(msg, clock_now, received_at)?),
         }),
-        Kind::Gripper => Ok(Feedback::GripperMotorHealth {
+        Limb::Gripper => Ok(Feedback::GripperMotorHealth {
             side,
             health: parse_component(msg, clock_now, received_at)?,
         }),
@@ -212,7 +196,9 @@ fn parse_reading_vector<const MOTORS: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{ARM_DOF, ArmHealth, GripperHealth, TIMESTAMP_SKEW_ALLOWANCE};
+    use crate::consumer::TIMESTAMP_SKEW_ALLOWANCE;
+    use crate::state::{ArmHealth, GripperHealth};
+    use openarm_description::ARM_DOF;
     use std::time::Duration;
 
     fn msg() -> motor_health::Message {
@@ -236,21 +222,21 @@ mod tests {
 
     fn sources() -> HealthSources {
         [
-            (ProducerRef::new("core", "left_arm"), Side::Left, Kind::Arm),
+            (ProducerRef::new("core", "left_arm"), Side::Left, Limb::Arm),
             (
                 ProducerRef::new("core", "right_arm"),
                 Side::Right,
-                Kind::Arm,
+                Limb::Arm,
             ),
             (
                 ProducerRef::new("core", "left_gripper"),
                 Side::Left,
-                Kind::Gripper,
+                Limb::Gripper,
             ),
             (
                 ProducerRef::new("core", "right_gripper"),
                 Side::Right,
-                Kind::Gripper,
+                Limb::Gripper,
             ),
         ]
     }
@@ -258,7 +244,7 @@ mod tests {
     /// Unwrap an arm parse, panicking on any other routing.
     fn arm(feedback: Feedback) -> (Side, ArmHealth) {
         match feedback {
-            Feedback::MotorHealth { side, health } => (side, *health),
+            Feedback::ArmMotorHealth { side, health } => (side, *health),
             _ => panic!("routed off the arm slot"),
         }
     }

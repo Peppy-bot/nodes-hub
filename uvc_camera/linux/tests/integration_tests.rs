@@ -9,37 +9,46 @@
 
 mod helpers;
 
+use camera_core::encoding::ColorEncoding;
 use helpers::virtual_camera::VirtualCamera;
 use std::time::{Duration, Instant};
 use uvc_camera_linux::camera::{CameraDevice, wall_timestamp};
-use uvc_camera_linux::types::{CameraConfig, Encoding, FrameRate, Resolution};
+use uvc_camera_linux::types::{CameraConfig, FrameRate, Resolution};
 
 fn config_for(device_path: &str) -> CameraConfig {
     CameraConfig {
         device_path: device_path.to_string(),
         resolution: Resolution::new(640, 480),
         frame_rate: FrameRate::new(30).unwrap(),
-        camera_encoding: Encoding::Rgb8,
-        topic_encoding: Encoding::Rgb8,
+        camera_encoding: ColorEncoding::Rgb8,
+        topic_encoding: ColorEncoding::Rgb8,
     }
+}
+
+/// The virtual camera `start` brought up, or `None` with the reason printed
+/// when the host cannot stream one.
+fn virtual_camera(start: Result<VirtualCamera, String>) -> Option<VirtualCamera> {
+    start.inspect_err(|e| eprintln!("Skipping test: {e}")).ok()
+}
+
+/// The node's camera, open on the virtual device.
+fn open_camera() -> CameraDevice {
+    let mut camera = CameraDevice::new(wall_timestamp);
+    camera
+        .open(&config_for("/dev/video10"))
+        .expect("Failed to open camera");
+    camera
 }
 
 /// Open a virtual camera through the node's own API.
 #[test]
 #[ignore = "Requires v4l2loopback setup"]
 fn test_open_virtual_camera() {
-    let vcam = match VirtualCamera::new(10, 640, 480, 30) {
-        Ok(cam) => cam,
-        Err(e) => {
-            eprintln!("Skipping test: {e}");
-            return;
-        }
+    let Some(vcam) = virtual_camera(VirtualCamera::new(10, 640, 480, 30)) else {
+        return;
     };
 
-    let mut camera = CameraDevice::new(wall_timestamp);
-    camera
-        .open(&config_for("/dev/video10"))
-        .expect("Should open the virtual camera");
+    let camera = open_camera();
     assert!(camera.is_open(), "Camera should report open");
 
     drop(camera); // Release the device before tearing down the loopback
@@ -50,18 +59,11 @@ fn test_open_virtual_camera() {
 #[test]
 #[ignore = "Requires v4l2loopback setup"]
 fn test_capture_frames_from_virtual_camera() {
-    let vcam = match VirtualCamera::new(10, 640, 480, 30) {
-        Ok(cam) => cam,
-        Err(e) => {
-            eprintln!("Skipping test: {e}");
-            return;
-        }
+    let Some(vcam) = virtual_camera(VirtualCamera::new(10, 640, 480, 30)) else {
+        return;
     };
 
-    let mut camera = CameraDevice::new(wall_timestamp);
-    camera
-        .open(&config_for("/dev/video10"))
-        .expect("Failed to open camera");
+    let mut camera = open_camera();
 
     for i in 0..5 {
         let frame = camera.capture_frame();
@@ -79,18 +81,11 @@ fn test_capture_frames_from_virtual_camera() {
 #[test]
 #[ignore = "Requires v4l2loopback setup"]
 fn test_capture_color_bars() {
-    let vcam = match VirtualCamera::new_with_color_bars(10, 640, 480, 30) {
-        Ok(cam) => cam,
-        Err(e) => {
-            eprintln!("Skipping test: {e}");
-            return;
-        }
+    let Some(vcam) = virtual_camera(VirtualCamera::new_with_color_bars(10, 640, 480, 30)) else {
+        return;
     };
 
-    let mut camera = CameraDevice::new(wall_timestamp);
-    camera
-        .open(&config_for("/dev/video10"))
-        .expect("Failed to open camera");
+    let mut camera = open_camera();
 
     let frame = camera
         .capture_frame()
@@ -111,23 +106,16 @@ fn test_camera_device_end_to_end() {
     use uvc_camera_linux::pipeline::process_frame;
     use uvc_camera_linux::types::FrameId;
 
-    let vcam = match VirtualCamera::new(10, 640, 480, 30) {
-        Ok(cam) => cam,
-        Err(e) => {
-            eprintln!("Skipping test: {e}");
-            return;
-        }
+    let Some(vcam) = virtual_camera(VirtualCamera::new(10, 640, 480, 30)) else {
+        return;
     };
 
-    let mut camera = CameraDevice::new(wall_timestamp);
-    camera
-        .open(&config_for("/dev/video10"))
-        .expect("Failed to open camera");
+    let mut camera = open_camera();
 
     let raw = camera.capture_frame().expect("Should capture a frame");
     let frame =
-        process_frame(raw, FrameId::new(1), Encoding::Bgr8).expect("Should convert to BGR8");
-    assert_eq!(frame.encoding(), Encoding::Bgr8);
+        process_frame(raw, FrameId::new(1), ColorEncoding::Bgr8).expect("Should convert to BGR8");
+    assert_eq!(frame.encoding(), ColorEncoding::Bgr8);
     assert_eq!(frame.width(), 640);
     assert_eq!(frame.height(), 480);
     assert_eq!(frame.frame_id(), FrameId::new(1));
@@ -140,18 +128,11 @@ fn test_camera_device_end_to_end() {
 #[test]
 #[ignore = "Requires v4l2loopback setup"]
 fn test_frame_rate_timing() {
-    let vcam = match VirtualCamera::new(10, 640, 480, 30) {
-        Ok(cam) => cam,
-        Err(e) => {
-            eprintln!("Skipping test: {e}");
-            return;
-        }
+    let Some(vcam) = virtual_camera(VirtualCamera::new(10, 640, 480, 30)) else {
+        return;
     };
 
-    let mut camera = CameraDevice::new(wall_timestamp);
-    camera
-        .open(&config_for("/dev/video10"))
-        .expect("Failed to open camera");
+    let mut camera = open_camera();
 
     let start = Instant::now();
     let mut captured = 0;

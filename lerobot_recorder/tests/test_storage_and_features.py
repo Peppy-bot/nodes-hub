@@ -19,12 +19,12 @@ from lerobot_recorder.storage import (
     S3Destination,
     StorageTarget,
     ensure_mounted,
+    parse_session_name,
     parse_storage,
     probe_credentials,
     resolved_endpoint,
-    validate_session_name,
 )
-from tests.test_recording import action_entry, gripper_entry, joint_entry, make_plan
+from tests.support import action_entry, gripper_entry, joint_entry, make_plan
 
 
 def test_parse_local_only():
@@ -47,12 +47,12 @@ def test_ensure_mounted_requires_the_bound_directory(tmp_path):
         ensure_mounted(StorageTarget(root=tmp_path / "missing", s3=None))
 
 
-def test_validate_session_name():
-    validate_session_name("2026-07-27_14-03-22")
+def test_parse_session_name():
+    assert parse_session_name("2026-07-27_14-03-22") == "2026-07-27_14-03-22"
     for bad in ("", "../2026-07-27_14-03-22", "a/b", "/etc/passwd",
                 "2026-1-2_3-4-5", "2026-07-27_14-03-22x", "2026-07-27 14:03:22"):
         with pytest.raises(ValueError):
-            validate_session_name(bad)
+            parse_session_name(bad)
 
 
 @pytest.mark.parametrize(

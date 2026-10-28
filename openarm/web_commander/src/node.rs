@@ -1,7 +1,7 @@
-// Node composition: parses every parameter up front, bakes the arm models and
-// gesture registry, then wires the state owner, feedback streams, command
-// publisher, and UI server together. All the real logic lives in the sibling
-// modules; this is only the assembly.
+//! Node composition: parses every parameter up front, bakes the arm models and
+//! gesture registry, then wires the state owner, feedback streams, command
+//! publisher, and UI server together. All the real logic lives in the sibling
+//! modules; this is only the assembly.
 
 use std::net::{AddrParseError, IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -19,6 +19,7 @@ use crate::command_stream;
 use crate::gestures;
 use crate::gripper_states;
 use crate::joint_states;
+use crate::limits;
 use crate::motor_health;
 use crate::owner;
 use crate::pose;
@@ -76,7 +77,7 @@ pub enum NodeError {
     HardwareVersion(#[from] openarm_description::UnknownHardwareVersion),
 
     #[error(transparent)]
-    Limits(#[from] ui::LimitsAlreadySet),
+    Limits(#[from] limits::LimitsAlreadySet),
 
     #[error("the operator panel stopped: {0}")]
     Ui(&'static str),
@@ -131,13 +132,14 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     // gripper axis is the unitless opening fraction and everything else in
     // the commander is version-blind.
     let version: HardwareVersion = params.hardware_version.parse()?;
-    ui::init_limits(version)?;
+    limits::init_limits(version)?;
     // Arm models for the panel's Cartesian pose fields (pose <-> joints), built
     // from the same generation the ranges came from so FK/IK match the backbone's chain.
     let models = pose::ArmModels::from_version(version);
-    // Bake the gesture roster against those models: every gesture is resolved
-    // to a feasible joint trajectory here or the node aborts bringup.
-    let registry = gestures::Registry::bake(&models);
+    // Bake the gesture roster against those models and the ranges the panel
+    // clamps into: every gesture is resolved to a feasible joint trajectory
+    // here or the node aborts bringup.
+    let registry = gestures::Registry::bake(&models, limits::arm_ranges());
     // The operator streams the governor controls live; their launch defaults are
     // node parameters, kept in step with the backbone's, so the real arm starts
     // conservative (tight band, slow cap) and the sim launchers start fast.
@@ -154,24 +156,24 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         PositiveFinite::parse(params.max_gripper_rate_frac_s).map_err(NodeError::GripperRate)?;
     // The panel and the backbone's governor must reject the same bands, or the
     // operator can stream one the backbone will not take.
-    if !(params.d_stop.is_finite()
-        && params.d_safe.is_finite()
-        && params.d_stop > 0.0
-        && params.d_stop < params.d_safe)
-    {
+    if !state::valid_governor_band(params.d_stop, params.d_safe) {
         return Err(NodeError::GovernorBand {
             d_stop: params.d_stop,
             d_safe: params.d_safe,
         });
     }
     let state = state::UiState::new(
-        params.collision_governor_enabled,
-        params.d_stop,
-        params.d_safe,
-        max_ee_velocity.get(),
-        gripper_rate.get(),
-        jog_acceleration.get(),
-        jog_velocity.get(),
+        state::GovernorSettings {
+            collision_enabled: params.collision_governor_enabled,
+            d_stop: params.d_stop,
+            d_safe: params.d_safe,
+            max_ee_velocity_m_s: max_ee_velocity.get(),
+            max_gripper_rate_frac_s: gripper_rate.get(),
+        },
+        pose::JogCaps {
+            joint_accel_rad_s2: jog_acceleration.get(),
+            joint_velocity_rad_s: jog_velocity.get(),
+        },
     );
 
     let command_period =
@@ -201,10 +203,11 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     // per-tick command frame the publishers stream.
     let (command_tx, command_rx) = mpsc::channel::<owner::UiMsg>(COMMAND_CAP);
     let (feedback_tx, feedback_rx) = mpsc::channel::<owner::Feedback>(FEEDBACK_CAP);
-    let (frame_tx, frame_rx) = watch::channel(owner::CommandFrame::from_state(&state));
+    let (frame_tx, frame_rx) = watch::channel(command_stream::CommandFrame::from_state(&state));
     let (snapshot_tx, snapshot_rx) = watch::channel(String::new());
 
-    // Feed the owner live arm + gripper + proximity state off the always-on streams.
+    // Feed the owner live arm, gripper, proximity, motor health and alert state off
+    // the always-on streams.
     tokio::spawn(joint_states::run(
         node_runner.clone(),
         feedback_tx.clone(),
@@ -362,9 +365,9 @@ mod tests {
         // Sibling tests resolve the same process-wide ranges, so this call may
         // be the one that wins or one that already lost; either way the ranges
         // are resolved afterwards and the next call must be refused.
-        ui::init_limits(HardwareVersion::V2).ok();
+        limits::init_limits(HardwareVersion::V2).ok();
         assert!(
-            ui::init_limits(HardwareVersion::V1).is_err(),
+            limits::init_limits(HardwareVersion::V1).is_err(),
             "a second init_limits must be refused, not accepted silently"
         );
     }

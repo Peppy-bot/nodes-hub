@@ -7,16 +7,28 @@ assumes the operator shares the robot's facing.
 from __future__ import annotations
 
 import math
-import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from enum import StrEnum
 from types import MappingProxyType
-from typing import Literal, Protocol
+from typing import Protocol
 
+from xr_commander.bus import REAL_CLOCK, Clock
 from xr_commander.frames import Pose
 
-# The closed set WebXR reports; anything else is untracked.
-Handedness = Literal["left", "right"]
+
+class Hand(StrEnum):
+    """A controller's handedness: the closed set WebXR reports; anything
+    else is untracked."""
+
+    LEFT = "left"
+    RIGHT = "right"
+
+
+# The controller whose face buttons move the robot to its postures.
+POSTURE_HAND = Hand.RIGHT
+# The controller whose face buttons drive the recorder.
+RECORDER_HAND = Hand.LEFT
 
 # WebXR `xr-standard` gamepad indices (oculus-touch-v3).
 TRIGGER_BUTTON = 0
@@ -49,14 +61,14 @@ class XrFrame:
     # Local monotonic arrival time: staleness is judged on our clock, not the
     # headset's, which is what may have died.
     received_monotonic_s: float
-    hands: Mapping[Handedness, HandSample]
+    hands: Mapping[Hand, HandSample]
 
     def __post_init__(self) -> None:
         # Frozen in depth: the frame crosses threads, so the mapping must not
         # alias a caller's mutable dict.
         object.__setattr__(self, "hands", MappingProxyType(dict(self.hands)))
 
-    def hand(self, handedness: Handedness) -> HandSample | None:
+    def hand(self, handedness: Hand) -> HandSample | None:
         return self.hands.get(handedness)
 
 
@@ -66,7 +78,9 @@ class FrameSource(Protocol):
     def latest(self) -> XrFrame | None: ...
 
 
-def fresh_frame(source: FrameSource, stale_timeout_s: float) -> XrFrame | None:
+def fresh_frame(
+    source: FrameSource, stale_timeout_s: float, clock: Clock = REAL_CLOCK
+) -> XrFrame | None:
     """The newest XR frame if it is recent enough.
 
     Past the timeout the hands are unknown, not unchanged: a frozen headset is
@@ -75,17 +89,46 @@ def fresh_frame(source: FrameSource, stale_timeout_s: float) -> XrFrame | None:
     frame = source.latest()
     if frame is None:
         return None
-    if time.monotonic() - frame.received_monotonic_s > stale_timeout_s:
+    if clock.monotonic() - frame.received_monotonic_s > stale_timeout_s:
         return None
     return frame
 
 
 def fresh_sample(
-    source: FrameSource, handedness: Handedness, stale_timeout_s: float
+    source: FrameSource,
+    handedness: Hand,
+    stale_timeout_s: float,
+    clock: Clock = REAL_CLOCK,
 ) -> HandSample | None:
     """This hand's sample if the frame carrying it is recent enough."""
-    frame = fresh_frame(source, stale_timeout_s)
+    frame = fresh_frame(source, stale_timeout_s, clock)
     return frame.hand(handedness) if frame else None
+
+
+def primary_pressed(sample: HandSample) -> bool:
+    return sample.primary_button
+
+
+def secondary_pressed(sample: HandSample) -> bool:
+    return sample.secondary_button
+
+
+class RisingEdge:
+    """A button's presses, read tick by tick. A press is a rise against an
+    observed release: a button already down on the first tracked frame is
+    not a press, and neither is one held across a stale gap."""
+
+    def __init__(self) -> None:
+        # None until the button has been observed at all.
+        self._last: bool | None = None
+
+    def step(self, held: bool | None) -> bool:
+        """Whether this tick's reading is a press. `held` is None while the
+        hand is untracked, which keeps the last observed reading."""
+        reading = self._last if held is None else held
+        rising = reading and self._last is False
+        self._last = reading
+        return bool(rising)
 
 
 def gripper_opening(trigger: float, open_fraction: float) -> float:
@@ -114,18 +157,25 @@ def _parse_pose(pose_data: dict) -> Pose:
     )
 
 
-def parse_hands(devices: list[object]) -> dict[Handedness, HandSample]:
+def _parse_hand(value: object) -> Hand | None:
+    try:
+        return Hand(value)
+    except ValueError:
+        return None
+
+
+def parse_hands(devices: list[object]) -> dict[Hand, HandSample]:
     """The tracked controllers in one frame, keyed by handedness.
 
     A device missing its grip pose or gamepad, or carrying an unusable pose,
     is simply untracked this frame: partial frames are normal in XR.
     """
-    hands: dict[Handedness, HandSample] = {}
+    hands: dict[Hand, HandSample] = {}
     for device in devices:
         if not isinstance(device, dict) or device.get("role") != "controller":
             continue
-        handedness = device.get("handedness")
-        if handedness not in ("left", "right"):
+        handedness = _parse_hand(device.get("handedness"))
+        if handedness is None:
             continue
         # Browser-supplied JSON: any shape violation inside one device drops
         # that device, never the frame.

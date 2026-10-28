@@ -18,7 +18,12 @@
 //! answered with a guess: a distortion model the contract has no name for, a
 //! focal length that is not a positive number, a rotation that is not one.
 
+use camera_core::geometry::{
+    depth_unit_is_valid, focal_lengths_are_valid, principal_point_is_valid,
+};
+
 use crate::modes::AlignMode;
+use crate::stream::{Stream, StreamPair};
 
 /// Below this a distortion coefficient moves no pixel by a thousandth: the
 /// image is an ideal pinhole, whatever model the device names.
@@ -74,8 +79,7 @@ pub struct StreamExtrinsics {
 /// The device's calibration for the two streams the node opened, read once.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Calibration {
-    pub color: StreamIntrinsics,
-    pub depth: StreamIntrinsics,
+    pub streams: StreamPair<StreamIntrinsics>,
     pub depth_to_color: StreamExtrinsics,
     /// Metres per z16 sample.
     pub depth_unit: f32,
@@ -116,8 +120,7 @@ impl Pose {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Published {
     pub align_mode: AlignMode,
-    pub color: Result<Pinhole, String>,
-    pub depth: Result<Pinhole, String>,
+    pub pinholes: StreamPair<Result<Pinhole, String>>,
     pub depth_to_color: Result<Pose, String>,
     /// The depths a sample can carry, metres; refused with the depth unit.
     pub depth_range_m: Result<(f64, f64), String>,
@@ -126,28 +129,19 @@ pub struct Published {
 impl Calibration {
     /// The geometry of the streams as `align_mode` publishes them.
     pub fn published(&self, align_mode: AlignMode) -> Published {
-        let (color, depth, depth_to_color) = match align_mode {
-            AlignMode::None => (
-                pinhole("colour", &self.color),
-                pinhole("depth", &self.depth),
-                pose(&self.depth_to_color),
-            ),
-            // Depth is warped into the colour stream's viewpoint, size and
-            // distortion: the depth frames are colour-shaped.
-            AlignMode::DepthToColor => {
-                let target = pinhole("colour", &self.color);
-                (target.clone(), target, Ok(Pose::IDENTITY))
-            }
-            // The inverse: the colour frames are depth-shaped.
-            AlignMode::ColorToDepth => {
-                let target = pinhole("depth", &self.depth);
-                (target.clone(), target, Ok(Pose::IDENTITY))
-            }
+        let pinholes = StreamPair {
+            color: pinhole(Stream::Color, &self.streams.color),
+            depth: pinhole(Stream::Depth, &self.streams.depth),
+        };
+        let depth_to_color = match align_mode {
+            AlignMode::None => pose(&self.depth_to_color),
+            // One stream is warped into the other's viewpoint, so both
+            // frames are the target's.
+            AlignMode::DepthToColor | AlignMode::ColorToDepth => Ok(Pose::IDENTITY),
         };
         Published {
             align_mode,
-            color,
-            depth,
+            pinholes: align_mode.published(pinholes),
             depth_to_color,
             depth_range_m: depth_range_m(self.depth_unit),
         }
@@ -158,7 +152,7 @@ impl Calibration {
 /// applies no threshold of its own, so this is the whole range: one sample
 /// step to the last sample.
 fn depth_range_m(depth_unit: f32) -> Result<(f64, f64), String> {
-    if !(depth_unit.is_finite() && depth_unit > 0.0) {
+    if !depth_unit_is_valid(depth_unit) {
         return Err(format!(
             "the device's depth unit is not a positive number: {depth_unit}"
         ));
@@ -168,7 +162,8 @@ fn depth_range_m(depth_unit: f32) -> Result<(f64, f64), String> {
 }
 
 /// One stream's model in the contract's terms. `stream` names it in a refusal.
-fn pinhole(stream: &str, sdk: &StreamIntrinsics) -> Result<Pinhole, String> {
+fn pinhole(stream: Stream, sdk: &StreamIntrinsics) -> Result<Pinhole, String> {
+    let stream = stream.label();
     let StreamIntrinsics {
         width,
         height,
@@ -181,12 +176,12 @@ fn pinhole(stream: &str, sdk: &StreamIntrinsics) -> Result<Pinhole, String> {
     if width == 0 || height == 0 {
         return Err(format!("the {stream} stream has no size: {width}x{height}"));
     }
-    if !(fx.is_finite() && fx > 0.0 && fy.is_finite() && fy > 0.0) {
+    if !focal_lengths_are_valid(f64::from(fx), f64::from(fy)) {
         return Err(format!(
             "the {stream} focal lengths are not positive numbers: fx {fx}, fy {fy}"
         ));
     }
-    if !(ppx.is_finite() && ppy.is_finite()) {
+    if !principal_point_is_valid(f64::from(ppx), f64::from(ppy)) {
         return Err(format!(
             "the {stream} principal point is not a number: ppx {ppx}, ppy {ppy}"
         ));
@@ -331,34 +326,36 @@ fn pose(sdk: &StreamExtrinsics) -> Result<Pose, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A D435 as it reports itself: 1280x720 colour under the inverse model
     /// with zero coefficients, 848x480 rectified depth, the depth imager
     /// 15 mm to the side of the colour one and turned by a fraction of a
     /// degree.
-    fn d435() -> Calibration {
+    pub(crate) fn d435() -> Calibration {
         Calibration {
-            color: StreamIntrinsics {
-                width: 1280,
-                height: 720,
-                fx: 915.25,
-                fy: 914.75,
-                ppx: 641.5,
-                ppy: 362.25,
-                distortion: Distortion::InverseBrownConrady,
-                coeffs: [0.0; 5],
-            },
-            depth: StreamIntrinsics {
-                width: 848,
-                height: 480,
-                fx: 423.5,
-                fy: 423.5,
-                ppx: 421.75,
-                ppy: 238.125,
-                distortion: Distortion::BrownConrady,
-                coeffs: [0.0; 5],
+            streams: StreamPair {
+                color: StreamIntrinsics {
+                    width: 1280,
+                    height: 720,
+                    fx: 915.25,
+                    fy: 914.75,
+                    ppx: 641.5,
+                    ppy: 362.25,
+                    distortion: Distortion::InverseBrownConrady,
+                    coeffs: [0.0; 5],
+                },
+                depth: StreamIntrinsics {
+                    width: 848,
+                    height: 480,
+                    fx: 423.5,
+                    fy: 423.5,
+                    ppx: 421.75,
+                    ppy: 238.125,
+                    distortion: Distortion::BrownConrady,
+                    coeffs: [0.0; 5],
+                },
             },
             depth_to_color: StreamExtrinsics {
                 rotation: column_major(rotation_about_z(0.4_f64.to_radians())),
@@ -407,13 +404,13 @@ mod tests {
     #[test]
     fn unaligned_each_stream_keeps_its_own_model_and_the_sdk_values_cross_unchanged() {
         let p = d435().published(AlignMode::None);
-        let color = p.color.unwrap();
+        let color = p.pinholes.color.unwrap();
         assert_eq!((color.width, color.height), (1280, 720));
         assert_eq!(
             (color.fx, color.fy, color.cx, color.cy),
             (915.25, 914.75, 641.5, 362.25)
         );
-        let depth = p.depth.unwrap();
+        let depth = p.pinholes.depth.unwrap();
         assert_eq!((depth.width, depth.height), (848, 480));
         assert_eq!(
             (depth.fx, depth.fy, depth.cx, depth.cy),
@@ -428,16 +425,16 @@ mod tests {
     #[test]
     fn depth_aligned_to_colour_is_colour_shaped_and_the_transform_is_the_identity() {
         let p = d435().published(AlignMode::DepthToColor);
-        assert_eq!(p.depth, p.color);
-        assert_eq!(p.depth.unwrap().width, 1280);
+        assert_eq!(p.pinholes.depth, p.pinholes.color);
+        assert_eq!(p.pinholes.depth.unwrap().width, 1280);
         assert_eq!(p.depth_to_color.unwrap(), Pose::IDENTITY);
     }
 
     #[test]
     fn colour_aligned_to_depth_is_depth_shaped_and_the_transform_is_the_identity() {
         let p = d435().published(AlignMode::ColorToDepth);
-        assert_eq!(p.color, p.depth);
-        let color = p.color.unwrap();
+        assert_eq!(p.pinholes.color, p.pinholes.depth);
+        let color = p.pinholes.color.unwrap();
         assert_eq!((color.width, color.fx), (848, 423.5));
         assert_eq!(p.depth_to_color.unwrap(), Pose::IDENTITY);
     }
@@ -462,9 +459,13 @@ mod tests {
             Distortion::InverseBrownConrady,
         ] {
             let mut calibration = d435();
-            calibration.color.distortion = model;
-            calibration.color.coeffs = [1e-9, 0.0, -1e-8, 0.0, 0.0];
-            let color = calibration.published(AlignMode::None).color.unwrap();
+            calibration.streams.color.distortion = model;
+            calibration.streams.color.coeffs = [1e-9, 0.0, -1e-8, 0.0, 0.0];
+            let color = calibration
+                .published(AlignMode::None)
+                .pinholes
+                .color
+                .unwrap();
             assert_eq!(color.distortion_model, "none", "{model:?}");
             assert!(color.distortion.is_empty());
         }
@@ -473,9 +474,13 @@ mod tests {
     #[test]
     fn plain_brown_conrady_crosses_as_plumb_bob_coefficient_for_coefficient() {
         let mut calibration = d435();
-        calibration.color.distortion = Distortion::BrownConrady;
-        calibration.color.coeffs = [-0.055, 0.066, -0.0007, 0.0005, -0.021];
-        let color = calibration.published(AlignMode::None).color.unwrap();
+        calibration.streams.color.distortion = Distortion::BrownConrady;
+        calibration.streams.color.coeffs = [-0.055, 0.066, -0.0007, 0.0005, -0.021];
+        let color = calibration
+            .published(AlignMode::None)
+            .pinholes
+            .color
+            .unwrap();
         assert_eq!(color.distortion_model, "plumb_bob");
         assert_eq!(
             color.distortion,
@@ -489,10 +494,10 @@ mod tests {
         // real coefficients. The numbers cross unchanged; only the name says
         // which way the polynomial runs.
         let mut calibration = d435();
-        calibration.color.distortion = Distortion::InverseBrownConrady;
-        calibration.color.coeffs = [-0.055, 0.066, -0.0007, 0.0005, -0.021];
+        calibration.streams.color.distortion = Distortion::InverseBrownConrady;
+        calibration.streams.color.coeffs = [-0.055, 0.066, -0.0007, 0.0005, -0.021];
         let p = calibration.published(AlignMode::None);
-        let color = p.color.unwrap();
+        let color = p.pinholes.color.unwrap();
         assert_eq!(color.distortion_model, "inverse_plumb_bob");
         assert_eq!(
             color.distortion,
@@ -501,6 +506,7 @@ mod tests {
         // Aligned to colour, the depth frames take the colour lens with them.
         let depth = calibration
             .published(AlignMode::DepthToColor)
+            .pinholes
             .depth
             .unwrap();
         assert_eq!(depth.distortion_model, "inverse_plumb_bob");
@@ -516,26 +522,33 @@ mod tests {
             Distortion::Unknown(42),
         ] {
             let mut calibration = d435();
-            calibration.color.distortion = model;
-            calibration.color.coeffs = [-0.055, 0.066, -0.0007, 0.0005, -0.021];
+            calibration.streams.color.distortion = model;
+            calibration.streams.color.coeffs = [-0.055, 0.066, -0.0007, 0.0005, -0.021];
             let p = calibration.published(AlignMode::None);
-            let refused = p.color.unwrap_err();
+            let refused = p.pinholes.color.unwrap_err();
             assert!(
                 refused.contains("colour") && refused.contains("cannot express"),
                 "{refused}"
             );
             // Unaligned, the depth stream is its own camera and still answers.
-            assert!(p.depth.is_ok());
+            assert!(p.pinholes.depth.is_ok());
             // Aligned to colour, the depth frames take the colour distortion
             // with them, so the depth answer refuses as well.
             assert!(
                 calibration
                     .published(AlignMode::DepthToColor)
+                    .pinholes
                     .depth
                     .is_err()
             );
             // Aligned to depth, the colour frames are depth-shaped and answer.
-            assert!(calibration.published(AlignMode::ColorToDepth).color.is_ok());
+            assert!(
+                calibration
+                    .published(AlignMode::ColorToDepth)
+                    .pinholes
+                    .color
+                    .is_ok()
+            );
         }
     }
 
@@ -543,31 +556,43 @@ mod tests {
     fn values_a_consumer_cannot_divide_by_are_refused_with_the_reason() {
         for bad in [0.0, -915.0, f32::NAN, f32::INFINITY] {
             let mut calibration = d435();
-            calibration.color.fx = bad;
-            let refused = calibration.published(AlignMode::None).color.unwrap_err();
+            calibration.streams.color.fx = bad;
+            let refused = calibration
+                .published(AlignMode::None)
+                .pinholes
+                .color
+                .unwrap_err();
             assert!(refused.contains("focal lengths"), "{refused}");
         }
         let mut calibration = d435();
-        calibration.depth.ppy = f32::NAN;
+        calibration.streams.depth.ppy = f32::NAN;
         assert!(
             calibration
                 .published(AlignMode::None)
+                .pinholes
                 .depth
                 .unwrap_err()
                 .contains("principal point")
         );
         let mut calibration = d435();
-        calibration.depth.width = 0;
+        calibration.streams.depth.width = 0;
         assert!(
             calibration
                 .published(AlignMode::None)
+                .pinholes
                 .depth
                 .unwrap_err()
                 .contains("no size")
         );
         let mut calibration = d435();
-        calibration.color.coeffs[1] = f32::NAN;
-        assert!(calibration.published(AlignMode::None).color.is_err());
+        calibration.streams.color.coeffs[1] = f32::NAN;
+        assert!(
+            calibration
+                .published(AlignMode::None)
+                .pinholes
+                .color
+                .is_err()
+        );
     }
 
     #[test]

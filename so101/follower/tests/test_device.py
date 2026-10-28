@@ -2,7 +2,8 @@ import asyncio
 import time
 
 import pytest
-from so101_description.units import GRIPPER_NAME, JOINT_NAMES
+from conftest import wait_for
+from so101_description.units import GRIPPER_NAME, JOINT_NAMES, MOTOR_NAMES
 
 from so101_follower import __main__ as main_mod
 from so101_follower.device import DeviceLoop
@@ -15,18 +16,6 @@ def make_loop(hardware, stale_s=0.25):
     loop._health_every_ticks = 4
     loop._stale_timeout_s = stale_s
     return loop
-
-
-def wait_for(predicate, timeout_s=2.0):
-    """Block until the predicate holds, or fail the test. Raising rather than
-    returning false matches the harness helper of the same name, so a call
-    site copied between the two files cannot silently stop checking."""
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        if predicate():
-            return
-        time.sleep(0.005)
-    raise AssertionError(f"condition never held within {timeout_s}s")
 
 
 def test_bringup_failure_raises_and_never_reports_ready(fake_hardware):
@@ -170,18 +159,18 @@ def test_stale_targets_stop_goal_writes(fake_hardware):
         loop.stop()
 
 
-def test_failed_state_reads_never_fabricate_snapshots(fake_hardware):
+def test_failed_state_reads_never_fabricate_samples(fake_hardware):
     loop = make_loop(fake_hardware)
     loop.start()
     try:
-        wait_for(lambda: loop.latest_state() is not None)
+        wait_for(lambda: loop.latest_sample() is not None)
         fake_hardware.fail_position_reads = 10_000_000
         time.sleep(0.02)  # let any in-flight good read land
-        before = loop.latest_state()
+        before = loop.latest_sample()
         time.sleep(0.1)
-        # The last snapshot stands untouched: no new capture stamp appears
+        # The last sample stands untouched: no new capture stamp appears
         # while every read fails, so its age is the evidence downstream.
-        assert loop.latest_state().captured_monotonic == before.captured_monotonic
+        assert loop.latest_sample().captured_monotonic == before.captured_monotonic
     finally:
         loop.stop()
 
@@ -190,7 +179,7 @@ async def test_bus_watchdog_terminates_after_the_exit_horizon(fake_hardware, mon
     loop = make_loop(fake_hardware)
     loop.start()
     try:
-        wait_for(lambda: loop.latest_state() is not None)
+        wait_for(lambda: loop.latest_sample() is not None)
         monkeypatch.setattr(main_mod, "_BUS_DEAD_EXIT_S", 0.05)
         monkeypatch.setattr(main_mod, "_BUS_WATCH_PERIOD_S", 0.01)
         fake_hardware.fail_position_reads = 10_000_000
@@ -224,3 +213,53 @@ async def test_bus_watchdog_terminates_after_the_exit_horizon(fake_hardware, mon
         assert fake_hardware.disconnected
     finally:
         loop.stop()
+
+
+class ScriptedRobot:
+    """The lerobot robot surface the follower's reads call, answering one
+    fixed observation."""
+
+    def __init__(self, observation):
+        self._observation = observation
+        self.is_connected = False
+        self.is_calibrated = True
+
+    def connect(self, calibrate):
+        self.is_connected = True
+
+    def get_observation(self):
+        return dict(self._observation)
+
+    def disconnect(self):
+        self.is_connected = False
+
+
+def test_two_channels_naming_one_motor_fail_the_launch(tmp_path):
+    from so101_follower.device import LerobotFollower
+
+    follower = LerobotFollower("/dev/null", str(tmp_path), "follower")
+    robot = ScriptedRobot(
+        {**{f"{motor}.pos": 0.0 for motor in MOTOR_NAMES}, "wrist_flex": 1.0}
+    )
+    follower._robot = robot
+    loop = make_loop(follower)
+    with pytest.raises(ValueError, match="two channels name motor wrist_flex"):
+        loop.start()
+    assert not loop.ready()
+    # The refused bringup releases the arm.
+    assert not robot.is_connected
+
+
+def test_lerobot_follower_constructs(tmp_path):
+    """The real hardware seam must at least construct: this is the layer no
+    fake covers, and a str/Path mismatch here once broke every launch."""
+    from so101_follower.device import LerobotFollower
+
+    follower = LerobotFollower(
+        device_path="/dev/null",
+        calibration_dir=str(tmp_path),
+        robot_id="smoke",
+    )
+    assert set(follower._robot.bus.motors) == {
+        "shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"
+    }

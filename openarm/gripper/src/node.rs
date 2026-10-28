@@ -1,12 +1,14 @@
-// Node composition: parses every parameter up front, takes the per-gripper
-// instance lock, brings the motor up over CAN in its generation's control
-// mode, then wires the command stream to the follow loop and the state/health
-// publishers. All device and stream logic lives in the sibling modules; this
-// is only the assembly.
+//! Node composition: parses every parameter up front, takes the per-gripper
+//! instance lock, brings the motor up over CAN in its generation's control
+//! mode, then wires the setpoint stream to the follow loop and the state/health
+//! publishers. All device and stream logic lives in the sibling modules; this
+//! is only the assembly.
 
-use crate::follow::{self, ControlConfig};
+use crate::follow::{self, FollowConfig};
 use crate::hardware::{Gripper, PosForceLimits, gripper_motor_type};
-use crate::{command_stream, health, stream};
+use crate::{health, stream};
+use control_core::serving;
+use control_core::sync::lock_ignoring_poison;
 use control_core::time::{RateOutOfRange, period_from_hz};
 use openarm_description::{HardwareVersion, Side};
 use peppygen::exposed_services::ready::is_ready;
@@ -34,8 +36,20 @@ const HEALTH_FLUSH_TIMEOUT: Duration = Duration::from_millis(300);
 /// Ceiling on the per-cycle CAN read deadline; see its use for the rationale.
 const MAX_RECV_TIMEOUT_US: u32 = 100_000;
 
+/// `gripper_id` values (0 = left, 1 = right), selecting the side whose
+/// opening geometry this instance drives.
 const GRIPPER_ID_LEFT: u8 = 0;
 const GRIPPER_ID_RIGHT: u8 = 1;
+
+/// The gripper side for the given `gripper_id`, refused on an unknown value
+/// so a misconfigured run fails at startup with the value in the message.
+fn side_for(gripper_id: u8) -> NodeResult<Side> {
+    match gripper_id {
+        GRIPPER_ID_LEFT => Ok(Side::Left),
+        GRIPPER_ID_RIGHT => Ok(Side::Right),
+        other => Err(NodeError::GripperId(other)),
+    }
+}
 
 /// The fastest this node drives the gripper. The motor shares the arm's
 /// 1 Mbit CAN FD bus and is paced the same way; the stack runs at 100 Hz.
@@ -108,6 +122,61 @@ impl From<NodeError> for peppygen::Error {
     }
 }
 
+/// Names this gripper's motor on the alert wire.
+fn alert_source(side: Side) -> String {
+    format!("{side} gripper")
+}
+
+/// What the launch parameters resolve to, parsed once before any device
+/// contact.
+#[derive(Debug)]
+struct Config {
+    side: Side,
+    hardware_version: HardwareVersion,
+    cycle_period: Duration,
+    state_period: Duration,
+    recv_timeout_us: u32,
+    limits: PosForceLimits,
+}
+
+/// Parse every launch parameter, refusing the first that cannot drive a
+/// gripper.
+fn parse_config(params: &Parameters) -> NodeResult<Config> {
+    let side = side_for(params.gripper_id)?;
+    // Which OpenArm generation this gripper drives; selects the control
+    // mode the motor is opened in and this side's opening geometry.
+    let hardware_version: HardwareVersion = params.hardware_version.parse()?;
+    let cycle_period =
+        period_from_hz(params.control_rate_hz, MAX_RATE_HZ).map_err(NodeError::ControlRate)?;
+    let state_period =
+        period_from_hz(params.state_rate_hz, MAX_RATE_HZ).map_err(NodeError::StateRate)?;
+    // Bounded above so a config typo cannot park recv_all in a long ppoll
+    // while it holds the CAN mutex the shutdown hooks need: 100 ms keeps
+    // the whole hook sequence inside even the minimum 1 s grace window,
+    // and real configs run around 1 ms. Bounded below because the driver
+    // refuses a zero wait on its other receive passes, and a receive that
+    // never waits turns every quiet tick into a silence pass.
+    if !(1..=MAX_RECV_TIMEOUT_US).contains(&params.recv_timeout_us) {
+        return Err(NodeError::RecvTimeout(params.recv_timeout_us));
+    }
+    // Checked whatever the generation: the ranges are properties of the
+    // parameters, not of the gripper that reads them. Only the v2
+    // POS_FORCE command path puts them on the wire.
+    let limits = PosForceLimits::new(
+        gripper_motor_type(hardware_version),
+        params.speed_rad_s,
+        params.max_effort_nm,
+    )?;
+    Ok(Config {
+        side,
+        hardware_version,
+        cycle_period,
+        state_period,
+        recv_timeout_us: params.recv_timeout_us,
+        limits,
+    })
+}
+
 /// Cancel the node when a supervised task exits while it should still be
 /// running. An unsupervised dead loop leaves the node reachable but inert;
 /// a dead follow loop is worse, because the health task would keep judging
@@ -150,54 +219,26 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     // consumers age samples on one timeline.
     peppygen::clock::init(&node_runner).await?;
 
+    // Parse every parameter up front (parse, don't validate): a bad launch
+    // fails here with the reason, before touching the CAN bus.
+    let Config {
+        side,
+        hardware_version,
+        cycle_period,
+        state_period,
+        recv_timeout_us,
+        limits,
+    } = parse_config(&params)?;
     let gripper_id = params.gripper_id;
-    // One parse of gripper_id: the side whose opening geometry this
-    // instance drives, and the label naming it on the alert wire.
-    // Exhaustive so a value outside the convention is refused rather than
-    // published as the wrong side.
-    let (side, alert_source) = match gripper_id {
-        GRIPPER_ID_LEFT => (Side::Left, "left gripper"),
-        GRIPPER_ID_RIGHT => (Side::Right, "right gripper"),
-        other => {
-            return Err(NodeError::GripperId(other));
-        }
-    };
-
-    // Which OpenArm generation this gripper drives; selects the control
-    // mode the motor is opened in and this side's opening geometry.
-    let hardware_version: HardwareVersion = params.hardware_version.parse()?;
-
     let can_interface = params.can_interface.clone();
-
-    let cycle_period =
-        period_from_hz(params.control_rate_hz, MAX_RATE_HZ).map_err(NodeError::ControlRate)?;
-    let state_period =
-        period_from_hz(params.state_rate_hz, MAX_RATE_HZ).map_err(NodeError::StateRate)?;
-    // Bounded above so a config typo cannot park recv_all in a long ppoll
-    // while it holds the CAN mutex the shutdown hooks need: 100 ms keeps
-    // the whole hook sequence inside even the minimum 1 s grace window,
-    // and real configs run around 1 ms. Bounded below because the driver
-    // refuses a zero wait on its other receive passes, and a receive that
-    // never waits turns every quiet tick into a silence pass.
-    if !(1..=MAX_RECV_TIMEOUT_US).contains(&params.recv_timeout_us) {
-        return Err(NodeError::RecvTimeout(params.recv_timeout_us));
-    }
-
-    // Checked whatever the generation: the ranges are properties of the
-    // parameters, not of the gripper that reads them. Only the v2
-    // POS_FORCE command path puts them on the wire.
-    let limits = PosForceLimits::new(
-        gripper_motor_type(hardware_version),
-        params.speed_rad_s,
-        params.max_effort_nm,
-    )?;
+    let alert_source = alert_source(side);
 
     // The resolved configuration, so a parameter that this generation
     // does not read is visibly absent rather than silently ignored.
     info!(
         "config: {alert_source} ({hardware_version}) rate={}Hz state_rate={}Hz \
          recv_timeout={}us",
-        params.control_rate_hz, params.state_rate_hz, params.recv_timeout_us
+        params.control_rate_hz, params.state_rate_hz, recv_timeout_us
     );
     if hardware_version == HardwareVersion::V2 {
         info!(
@@ -206,9 +247,9 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         );
     }
 
-    let cfg = ControlConfig {
+    let cfg = FollowConfig {
         cycle_period,
-        recv_timeout_us: params.recv_timeout_us,
+        recv_timeout_us,
     };
 
     // One instance per gripper: two instances sharing a `gripper_id` command one
@@ -249,9 +290,9 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
             // still-live follow loop can't interleave CAN traffic before
             // the disable ACKs are drained. Blocking sleep (not tokio) keeps the
             // guard held, which it could not be across an await.
-            // unwrap_or_else: recover even if poisoned (panic in control loop)
+            // Recover even if poisoned (panic in control loop)
             // so disable_all() always runs and the motor doesn't stay energised.
-            let mut g = gripper.lock().unwrap_or_else(|e| e.into_inner());
+            let mut g = lock_ignoring_poison(&gripper);
             if let Err(e) = g.disable_all() {
                 error!("disable motor: {e}");
             }
@@ -271,16 +312,13 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     // return to closed (motor angle = 0.0 rad) before serving requests.
     // Errors return through the runtime so the hooks above disable the
     // motor and release the lock.
-    gripper
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .enable_and_confirm(
-            openarm_can::ENABLE_ATTEMPTS,
-            POST_ENABLE_SLEEP,
-            BRINGUP_RECV_US,
-        )?;
+    lock_ignoring_poison(&gripper).enable_and_confirm(
+        openarm_can::ENABLE_ATTEMPTS,
+        POST_ENABLE_SLEEP,
+        BRINGUP_RECV_US,
+    )?;
     {
-        let mut g = gripper.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = lock_ignoring_poison(&gripper);
         info!("returning to zero");
         g.command(0.0, None)?;
         g.recv_all(BRINGUP_RECV_US)?;
@@ -291,7 +329,7 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     // state_rate_hz and emits the opening, effort, and effort ceiling. It
     // issues no CAN traffic of its own, so it never contends with the
     // follow loop for the bus.
-    let publisher = tokio::spawn(stream::run(
+    let publisher = tokio::spawn(stream::run_state_publisher(
         node_runner.clone(),
         state_period,
         gripper.clone(),
@@ -311,7 +349,6 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     let (health_done_tx, health_done_rx) = oneshot::channel::<()>();
     let health_task = tokio::spawn({
         let runner = node_runner.clone();
-        let alert_source = alert_source.to_string();
         let gripper = gripper.clone();
         let cycle_period = cfg.cycle_period;
         let token = node_runner.cancellation_token().clone();
@@ -343,40 +380,37 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         let ready = ready.clone();
         let token = node_runner.cancellation_token().clone();
         tokio::spawn(async move {
-            loop {
-                if let Err(e) = is_ready::handle_next_request(&runner, |_req| {
+            serving::serve("is_ready", token.cancelled(), || {
+                is_ready::handle_next_request(&runner, |_req| {
                     Ok(is_ready::Response::new(reports_ready(
                         ready.load(Ordering::SeqCst),
                         follow::HARD_FAULT.load(Ordering::SeqCst),
                         token.is_cancelled(),
                     )))
                 })
-                .await
-                {
-                    error!("is_ready: {e}");
-                }
-            }
+            })
+            .await;
         });
     }
 
     // Stream listener -> follow loop: the listener keeps the latest streamed
     // opening addressed to this gripper, the follow loop drives the motor
     // toward it.
-    let (cmd_tx, cmd_rx) = watch::channel(None);
-    let commands = tokio::spawn(command_stream::run(
+    let (setpoint_tx, setpoint_rx) = watch::channel(None);
+    let setpoints = tokio::spawn(stream::run_setpoint_listener(
         node_runner.clone(),
-        cmd_tx,
+        setpoint_tx,
         node_runner.cancellation_token().clone(),
     ));
     supervise(
-        commands,
+        setpoints,
         "command stream",
         node_runner.cancellation_token().clone(),
     );
     let (follow_started_tx, follow_started_rx) = oneshot::channel::<()>();
     let follower = tokio::spawn(follow::run(
         gripper,
-        cmd_rx,
+        setpoint_rx,
         cfg,
         node_runner.cancellation_token().clone(),
         follow_started_tx,
@@ -402,6 +436,166 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A launch the node accepts, one field per parameter the manifest names.
+    fn params() -> Parameters {
+        Parameters {
+            can_interface: "can0".to_string(),
+            control_rate_hz: 100,
+            gripper_id: GRIPPER_ID_LEFT,
+            hardware_version: "v2".to_string(),
+            max_effort_nm: 3.0,
+            recv_timeout_us: 1000,
+            speed_rad_s: 25.0,
+            state_rate_hz: 100,
+        }
+    }
+
+    /// A parameter's name and the edit that makes it acceptable.
+    type ParameterFix = (&'static str, fn(&mut Parameters));
+
+    fn refusal(params: Parameters) -> String {
+        let error = parse_config(&params).expect_err("refused");
+        // The source carries the reason; the variant names the parameter.
+        match std::error::Error::source(&error) {
+            Some(source) => format!("{error}: {source}"),
+            None => error.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_launch_with_every_parameter_set_parses() {
+        let config = parse_config(&params()).expect("parses");
+        assert_eq!(config.side, Side::Left);
+        assert_eq!(config.hardware_version, HardwareVersion::V2);
+        assert_eq!(config.cycle_period, Duration::from_millis(10));
+        assert_eq!(config.state_period, Duration::from_millis(10));
+        assert_eq!(config.recv_timeout_us, 1000);
+    }
+
+    #[test]
+    fn every_refusal_names_its_parameter() {
+        let cases = [
+            (
+                "gripper_id",
+                Parameters {
+                    gripper_id: 2,
+                    ..params()
+                },
+            ),
+            (
+                "hardware_version",
+                Parameters {
+                    hardware_version: "v3".into(),
+                    ..params()
+                },
+            ),
+            (
+                "control_rate_hz",
+                Parameters {
+                    control_rate_hz: 0,
+                    ..params()
+                },
+            ),
+            (
+                "control_rate_hz",
+                Parameters {
+                    control_rate_hz: MAX_RATE_HZ + 1,
+                    ..params()
+                },
+            ),
+            (
+                "state_rate_hz",
+                Parameters {
+                    state_rate_hz: 0,
+                    ..params()
+                },
+            ),
+            (
+                "recv_timeout_us",
+                Parameters {
+                    recv_timeout_us: 0,
+                    ..params()
+                },
+            ),
+            (
+                "recv_timeout_us",
+                Parameters {
+                    recv_timeout_us: MAX_RECV_TIMEOUT_US + 1,
+                    ..params()
+                },
+            ),
+            (
+                "speed_rad_s",
+                Parameters {
+                    speed_rad_s: 0.0,
+                    ..params()
+                },
+            ),
+            (
+                "max_effort_nm",
+                Parameters {
+                    max_effort_nm: f64::NAN,
+                    ..params()
+                },
+            ),
+        ];
+        for (parameter, params) in cases {
+            let refused = refusal(params);
+            assert!(
+                refused.contains(parameter),
+                "a refusal must name {parameter}: {refused}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_launch_wrong_in_every_parameter_is_refused_in_parameter_order() {
+        let fixes: [ParameterFix; 6] = [
+            ("gripper_id", |p| p.gripper_id = GRIPPER_ID_LEFT),
+            ("hardware_version", |p| p.hardware_version = "v2".into()),
+            ("control_rate_hz", |p| p.control_rate_hz = 100),
+            ("state_rate_hz", |p| p.state_rate_hz = 100),
+            ("recv_timeout_us", |p| p.recv_timeout_us = 1000),
+            ("speed_rad_s", |p| p.speed_rad_s = 25.0),
+        ];
+        let mut launch = Parameters {
+            gripper_id: 2,
+            hardware_version: "v3".into(),
+            control_rate_hz: 0,
+            state_rate_hz: 0,
+            recv_timeout_us: 0,
+            speed_rad_s: 0.0,
+            ..params()
+        };
+        for (parameter, fix) in fixes {
+            let refused = refusal(launch.clone());
+            assert!(
+                refused.contains(parameter),
+                "the next refusal must name {parameter}: {refused}"
+            );
+            fix(&mut launch);
+        }
+        parse_config(&launch).expect("every parameter fixed");
+    }
+
+    #[test]
+    fn an_unknown_gripper_id_is_named_not_panicked() {
+        assert!(matches!(side_for(GRIPPER_ID_LEFT), Ok(Side::Left)));
+        assert!(matches!(side_for(GRIPPER_ID_RIGHT), Ok(Side::Right)));
+        let refusal = side_for(7).expect_err("an id outside the convention must be refused");
+        assert!(matches!(refusal, NodeError::GripperId(7)), "got {refusal}");
+        assert!(
+            refusal.to_string().ends_with("got 7"),
+            "the message must name the offending value, got {refusal}"
+        );
+    }
+
+    #[test]
+    fn the_alert_source_names_the_side() {
+        assert_eq!(alert_source(Side::Left), "left gripper");
+        assert_eq!(alert_source(Side::Right), "right gripper");
+    }
 
     #[test]
     fn readiness_needs_bringup_and_is_revoked_by_a_fault_or_a_shutdown() {

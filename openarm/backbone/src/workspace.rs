@@ -14,6 +14,8 @@
 use std::str::FromStr;
 use std::sync::{Mutex, MutexGuard};
 
+use control_core::positive_finite::PositiveFinite;
+use openarm_description::{ArmPair, Side};
 use srs_model::nalgebra::{Isometry3, Matrix3, Rotation3, Translation3, UnitQuaternion, Vector3};
 use srs_model::{Arm, ArmAnglePolicy};
 use workspace_core::design::{
@@ -25,9 +27,7 @@ use workspace_core::{
     REACH_TOLERANCE, Reach, UnknownDepthModel,
 };
 
-use crate::arm_pair::ArmPair;
 use crate::camera_mounts::{CameraMounts, DesignCamera};
-use crate::types::Side;
 
 /// Why the perception camera's view cannot be checked now, from what the
 /// camera linked as perception_geometry answered.
@@ -72,7 +72,7 @@ pub fn intrinsics_from_wire(
     if width == 0 || height == 0 {
         return Err("its image has no pixels");
     }
-    if !(fx.is_finite() && fx > 0.0 && fy.is_finite() && fy > 0.0) {
+    if PositiveFinite::parse(fx).is_err() || PositiveFinite::parse(fy).is_err() {
         return Err("its focal lengths are not positive numbers");
     }
     if !(cx.is_finite() && cy.is_finite()) {
@@ -174,7 +174,7 @@ impl PerceptionCamera {
 /// robot frame. The tool frame `arm_model` mounts is the grasp frame of
 /// `workspace_core`: +Z the approach out of the gripper, +Y the jaw closing
 /// axis.
-pub fn grasp_pose(orientation: GraspOrientation, target: [f64; 3]) -> Isometry3<f64> {
+fn grasp_pose(orientation: GraspOrientation, target: [f64; 3]) -> Isometry3<f64> {
     let rotation =
         Rotation3::from_matrix_unchecked(Matrix3::from_row_slice(&orientation.rotation()));
     Isometry3::from_parts(
@@ -184,7 +184,7 @@ pub fn grasp_pose(orientation: GraspOrientation, target: [f64; 3]) -> Isometry3<
 }
 
 /// The grasps at `target`, in the robot frame, in the 16 grasp orientations.
-pub fn grasp_poses(target: [f64; 3]) -> impl Iterator<Item = Isometry3<f64>> {
+fn grasp_poses(target: [f64; 3]) -> impl Iterator<Item = Isometry3<f64>> {
     GraspOrientation::all().map(move |orientation| grasp_pose(orientation, target))
 }
 
@@ -280,10 +280,10 @@ impl Workspace {
     fn sides_nearest_first(&self, target: [f64; 3]) -> [Side; 2] {
         let target = Vector3::new(target[0], target[1], target[2]);
         let distance = |side: Side| {
-            let base = self.arms.get(side).world_pose(&Isometry3::identity());
+            let base = self.arms[side].world_pose(&Isometry3::identity());
             (base.translation.vector - target).norm()
         };
-        let mut sides = [Side::Left, Side::Right];
+        let mut sides = Side::BOTH;
         sides.sort_by(|a, b| distance(*a).total_cmp(&distance(*b)));
         sides
     }
@@ -295,8 +295,8 @@ impl Workspace {
     /// or inside it, for the grasp moved into that reach by less than the
     /// tolerance, in the same orientation ([`Arm::solve_ik_within`]).
     fn reaches(&self, side: Side, grasps: &[Isometry3<f64>]) -> bool {
-        let arm = self.arms.get(side);
-        let seed = openarm_description::ready(side.model());
+        let arm = &self.arms[side];
+        let seed = openarm_description::ready(side);
         grasps.iter().any(|grasp| {
             arm.solve_ik_within(
                 &arm.base_pose(grasp),
@@ -314,12 +314,9 @@ impl Workspace {
     /// target lies within an arm's reach in some orientation.
     fn shortfall(&self, target: [f64; 3]) -> f64 {
         let point = Isometry3::translation(target[0], target[1], target[2]);
-        [Side::Left, Side::Right]
-            .into_iter()
-            .map(|side| {
-                let arm = self.arms.get(side);
-                arm.position_shortfall(&arm.base_pose(&point).translation.vector)
-            })
+        self.arms
+            .iter()
+            .map(|arm| arm.position_shortfall(&arm.base_pose(&point).translation.vector))
             .fold(f64::INFINITY, f64::min)
     }
 }
@@ -334,9 +331,10 @@ mod tests {
     use workspace_core::messages::robot_frame_placement;
     use workspace_core::{GraspDirection, View};
 
+    use crate::test_support::bundled_arm;
+
     fn arms(version: HardwareVersion) -> ArmPair<Arm> {
-        let arm = |side: Side| crate::arm_model(version, side.model()).expect("build the arm");
-        ArmPair::new(arm(Side::Left), arm(Side::Right))
+        ArmPair::from_fn(|side| bundled_arm(version, side))
     }
 
     /// Poses at `target`, in the robot frame, in orientations spread over
@@ -376,10 +374,8 @@ mod tests {
         poses
             .into_iter()
             .flat_map(|pose| {
-                [Side::Left, Side::Right].map(|side| {
-                    let arm = arms.get(side);
-                    arm.reach_shortfall(&arm.base_pose(&pose))
-                })
+                arms.iter()
+                    .map(move |arm| arm.reach_shortfall(&arm.base_pose(&pose)))
             })
             .fold(f64::INFINITY, f64::min)
     }
@@ -398,11 +394,11 @@ mod tests {
         side: Side,
         pose: &Isometry3<f64>,
     ) -> Option<Solution> {
-        let arm = arms.get(side);
+        let arm = &arms[side];
         arm.solve_ik(
             &arm.base_pose(pose),
             ArmAnglePolicy::FromSeed,
-            &openarm_description::ready(side.model()),
+            &openarm_description::ready(side),
         )
     }
 
@@ -413,7 +409,7 @@ mod tests {
         poses: impl IntoIterator<Item = Isometry3<f64>>,
     ) -> bool {
         poses.into_iter().any(|pose| {
-            [Side::Left, Side::Right]
+            Side::BOTH
                 .into_iter()
                 .any(|side| solve_from_ready(arms, side, &pose).is_some())
         })
@@ -462,8 +458,8 @@ mod tests {
     fn a_grasp_orientation_is_the_tool_pose_the_solved_gripper_takes() {
         let target = [0.30, 0.0, 0.45];
         let arms = arms(HardwareVersion::V2);
-        for side in [Side::Left, Side::Right] {
-            let arm = arms.get(side);
+        for side in Side::BOTH {
+            let arm = &arms[side];
             let mut solved_directions = Vec::new();
             for orientation in GraspOrientation::all() {
                 let Some(solution) =

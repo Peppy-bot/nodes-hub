@@ -1,44 +1,51 @@
-// Always-on command publisher, the same shape as the commander's: for each
-// side, one task streams the arm setpoint at command_rate_hz on that limb's
-// joint_link pairing slot and one streams the commanded gripper opening on
-// its gripper_link slot (the slot is the side, so no id demux); the backbone
-// governs everything before it reaches a follower. A tick publishes nothing
-// when the newest sample is missing or stale, or its arm is not engaged, so
-// that limb holds at its last governed setpoints: skipping is the deadman. Re-publishing an
-// unchanged sample every tick keeps the stream trivially fresh for a backbone
-// that starts mid-session.
-//
-// Each side+stream runs its own publish task on its own interval, cloning the
-// shared per-topic publisher. A single shared loop publishing Left then Right
-// would leave Right permanently second (zenoh publish resolves synchronously),
-// so independent tasks avoid that bias.
+//! Always-on command publisher, the same shape as the commander's: for each
+//! side, one task streams the arm setpoint at command_rate_hz on that limb's
+//! joint_link pairing slot and one streams the commanded gripper opening on
+//! its gripper_link slot (the slot is the side, so no id demux); the backbone
+//! governs everything before it reaches a follower. A tick publishes nothing
+//! when the newest sample is missing or stale, or its arm is not engaged, so
+//! that limb holds at its last governed setpoints: skipping is the deadman. Re-publishing an
+//! unchanged sample every tick keeps the stream trivially fresh for a backbone
+//! that starts mid-session.
+//!
+//! Each side+stream runs its own publish task on its own interval, owning its
+//! pairing slot's publisher. Zenoh publish resolves synchronously, and each
+//! task publishes on its own tick, so neither side's setpoint waits behind the
+//! other's.
 
-use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use openarm_description::Side;
+use control_core::setpoint_stream::{SetpointSink, stream_setpoints};
+use openarm_description::{ArmPair, Side};
 use peppygen::NodeRunner;
 use peppygen::paired_topics::{left_arm, left_gripper, right_arm, right_gripper};
 use peppylib::runtime::CancellationToken;
 use peppylib::{Payload, TopicPublisher};
 use tokio::sync::watch;
-use tokio::time::MissedTickBehavior;
-use tracing::warn;
 
 use crate::reader::KerSample;
-use crate::side::label;
 
-/// Pairing timestamp from the daemon-resolved clock, so the backbone ages
-/// setpoints on the same timeline it reads. Errors until the clock delivers
-/// its first tick.
-fn pairing_timestamp() -> Result<SystemTime, String> {
+/// Now on this instance's bound clock: the timeline its messages are
+/// stamped and aged on. Errors until the clock delivers its first tick.
+fn clock_now() -> Result<SystemTime, String> {
     let ns = peppygen::clock::now_ns().map_err(|e| format!("clock not ready: {e}"))?;
     Ok(UNIX_EPOCH + Duration::from_nanos(ns))
 }
 
 type BuildJointSetpoint = fn(SystemTime, Vec<f64>, Vec<f64>, Vec<f64>) -> peppygen::Result<Payload>;
 type BuildGripperSetpoint = fn(SystemTime, f64, f64) -> peppygen::Result<Payload>;
+
+/// Each arm's pairing slot message builder.
+const BUILD_ARM_SETPOINT: ArmPair<BuildJointSetpoint> = ArmPair::new(
+    left_arm::joint_setpoints::build_message,
+    right_arm::joint_setpoints::build_message,
+);
+/// Each gripper's pairing slot message builder.
+const BUILD_GRIPPER_SETPOINT: ArmPair<BuildGripperSetpoint> = ArmPair::new(
+    left_gripper::gripper_setpoints::build_message,
+    right_gripper::gripper_setpoints::build_message,
+);
 
 /// Why the publisher stopped commanding. The supervisor decides what that
 /// means for the node; this only reports.
@@ -68,36 +75,24 @@ pub async fn run(
         right_gripper::gripper_setpoints::declare_publisher(&runner),
     )
     .map_err(PublishFault::Declare)?;
+    let publishers = ArmPair::new(left_arm_pub, right_arm_pub)
+        .zip(ArmPair::new(left_gripper_pub, right_gripper_pub));
 
     let mut tasks = tokio::task::JoinSet::new();
 
-    for (side, arm_pub, build_arm, gripper_pub, build_gripper) in [
-        (
-            Side::Left,
-            left_arm_pub,
-            left_arm::joint_setpoints::build_message as BuildJointSetpoint,
-            left_gripper_pub,
-            left_gripper::gripper_setpoints::build_message as BuildGripperSetpoint,
-        ),
-        (
-            Side::Right,
-            right_arm_pub,
-            right_arm::joint_setpoints::build_message as BuildJointSetpoint,
-            right_gripper_pub,
-            right_gripper::gripper_setpoints::build_message as BuildGripperSetpoint,
-        ),
-    ] {
+    for (side, (arm_pub, gripper_pub)) in publishers {
         // Arm: velocities and efforts stay empty; the backbone shapes its own
         // velocity feedforward over the governed stream.
+        let build_arm = BUILD_ARM_SETPOINT[side];
         let sample_rx = rx.clone();
         tasks.spawn(stream_setpoints(
-            arm_pub,
+            SetpointPublisher(arm_pub),
             command_period,
-            token.clone(),
-            format!("{} arm", label(side)),
+            cancelled(token.clone()),
+            format!("{side} arm"),
             move || {
-                let target = streamable(&sample_rx, stale_timeout, side)?.joints(side);
-                Some(pairing_timestamp().and_then(|timestamp| {
+                let target = streamable(&sample_rx, stale_timeout, side)?.joints[side];
+                Some(clock_now().and_then(|timestamp| {
                     build_arm(timestamp, target.to_vec(), Vec::new(), Vec::new())
                         .map_err(|e| e.to_string())
                 }))
@@ -106,17 +101,16 @@ pub async fn run(
         // Gripper: stream the commanded opening while its arm streams. The
         // leader trigger carries no effort source: max_effort 0 (no
         // preference) leaves the follower's ceiling in charge.
+        let build_gripper = BUILD_GRIPPER_SETPOINT[side];
         let sample_rx = rx.clone();
         tasks.spawn(stream_setpoints(
-            gripper_pub,
+            SetpointPublisher(gripper_pub),
             command_period,
-            token.clone(),
-            format!("{} gripper", label(side)),
+            cancelled(token.clone()),
+            format!("{side} gripper"),
             move || {
-                let opening = streamable(&sample_rx, stale_timeout, side)?
-                    .gripper_openings
-                    .side(side);
-                Some(pairing_timestamp().and_then(|timestamp| {
+                let opening = streamable(&sample_rx, stale_timeout, side)?.gripper_openings[side];
+                Some(clock_now().and_then(|timestamp| {
                     build_gripper(timestamp, opening, 0.0).map_err(|e| e.to_string())
                 }))
             },
@@ -139,178 +133,23 @@ fn streamable(
     side: Side,
 ) -> Option<KerSample> {
     let sample = rx.borrow().clone()?;
-    (sample.engaged.side(side) && sample.received_at.elapsed() < stale_timeout).then_some(sample)
+    (sample.engaged[side] && sample.received_at.elapsed() < stale_timeout).then_some(sample)
 }
 
-/// One pairing slot's setpoint sink, so the stream loop can be driven without
-/// a publisher in a test.
-trait SetpointSink {
-    type Message;
+/// One pairing slot's publisher, as the sink of its setpoint stream.
+struct SetpointPublisher(TopicPublisher);
 
-    fn send(&self, message: Self::Message) -> impl Future<Output = Result<(), String>> + Send;
-}
-
-impl SetpointSink for TopicPublisher {
+impl SetpointSink for SetpointPublisher {
     type Message = Payload;
 
     async fn send(&self, message: Payload) -> Result<(), String> {
-        self.publish(message).await.map_err(|e| e.to_string())
+        self.0.publish(message).await.map_err(|e| e.to_string())
     }
 }
 
-// Publish the latest setpoint from `next_message` every `period`, skipping a
-// tick whenever it returns None. Failures latch so a stuck channel warns once,
-// not every tick. The period arrives already validated, so this side never
-// divides by a rate it has to trust.
-async fn stream_setpoints<S: SetpointSink>(
-    sink: S,
-    period: Duration,
-    token: CancellationToken,
-    label: String,
-    mut next_message: impl FnMut() -> Option<Result<S::Message, String>>,
-) {
-    // interval (not sleep) so the publish cadence holds at the commanded rate
-    // instead of drifting by the per-tick work time; Delay avoids a catch-up
-    // burst after a scheduling hiccup.
-    let mut ticker = tokio::time::interval(period);
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut failing = false;
-
-    loop {
-        tokio::select! {
-            _ = token.cancelled() => return,
-            _ = ticker.tick() => {}
-        }
-
-        let Some(built) = next_message() else {
-            continue;
-        };
-        let result = match built {
-            Ok(msg) => sink.send(msg).await,
-            Err(e) => Err(e),
-        };
-        match result {
-            Ok(()) => failing = false,
-            Err(e) if !failing => {
-                failing = true;
-                warn!("{label} command publish failing, suppressing repeats: {e}");
-            }
-            Err(_) => {}
-        }
-    }
-}
-
-#[cfg(test)]
-mod loop_tests {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use super::*;
-
-    const PERIOD: Duration = Duration::from_millis(5);
-    /// Ticks to let run before judging what was published.
-    const TICKS: u32 = 20;
-    /// Only every third tick has something to stream, as a disengaged arm
-    /// does: the rest must skip.
-    const TICKS_PER_MESSAGE: usize = 3;
-
-    /// A sink that counts what reached it, and can refuse every send.
-    struct Recorder {
-        sent: Arc<AtomicUsize>,
-        fails: bool,
-    }
-
-    impl SetpointSink for Recorder {
-        type Message = u8;
-
-        async fn send(&self, _message: u8) -> Result<(), String> {
-            self.sent.fetch_add(1, Ordering::SeqCst);
-            if self.fails {
-                return Err("publisher is down".to_string());
-            }
-            Ok(())
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_tick_with_nothing_to_stream_is_skipped_and_the_stream_lives_on() {
-        let sent = Arc::new(AtomicUsize::new(0));
-        let asked = Arc::new(AtomicUsize::new(0));
-        let token = CancellationToken::new();
-        let stream = {
-            let (sent, asked, token) = (sent.clone(), asked.clone(), token.clone());
-            tokio::spawn(async move {
-                stream_setpoints(
-                    Recorder { sent, fails: false },
-                    PERIOD,
-                    token,
-                    "test".to_string(),
-                    move || {
-                        let tick = asked.fetch_add(1, Ordering::SeqCst);
-                        (tick % TICKS_PER_MESSAGE == TICKS_PER_MESSAGE - 1).then_some(Ok(1u8))
-                    },
-                )
-                .await
-            })
-        };
-
-        tokio::time::sleep(PERIOD * TICKS).await;
-        let asked_count = asked.load(Ordering::SeqCst);
-        let sent_count = sent.load(Ordering::SeqCst);
-        assert!(
-            asked_count >= TICKS as usize,
-            "every tick asks for a message: {asked_count}"
-        );
-        assert_eq!(
-            sent_count,
-            asked_count / TICKS_PER_MESSAGE,
-            "only the ticks with a message publish, and none repeats"
-        );
-        assert!(
-            !stream.is_finished(),
-            "a skipped tick must not end the task"
-        );
-
-        token.cancel();
-        tokio::time::timeout(PERIOD * TICKS, stream)
-            .await
-            .expect("cancellation ends the task")
-            .expect("task");
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_failing_send_keeps_the_stream_running() {
-        let sent = Arc::new(AtomicUsize::new(0));
-        let token = CancellationToken::new();
-        let stream = {
-            let (sent, token) = (sent.clone(), token.clone());
-            tokio::spawn(async move {
-                stream_setpoints(
-                    Recorder { sent, fails: true },
-                    PERIOD,
-                    token,
-                    "test".to_string(),
-                    || Some(Ok(1u8)),
-                )
-                .await
-            })
-        };
-
-        tokio::time::sleep(PERIOD * TICKS).await;
-        assert!(
-            sent.load(Ordering::SeqCst) >= TICKS as usize,
-            "a failed publish is retried on the next tick"
-        );
-        assert!(
-            !stream.is_finished(),
-            "a failing publisher must not end the task"
-        );
-        token.cancel();
-        tokio::time::timeout(PERIOD * TICKS, stream)
-            .await
-            .expect("cancellation ends the task")
-            .expect("task");
-    }
+/// Resolves once `token` is cancelled.
+async fn cancelled(token: CancellationToken) {
+    token.cancelled().await;
 }
 
 #[cfg(test)]
@@ -318,29 +157,17 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
-    use crate::side::{SideFlags, SideValues};
+    use crate::engage::fixtures::{BOTH_ENGAGED, STALE};
 
-    const STALE: Duration = Duration::from_millis(250);
-    const RIGHT_ONLY: SideFlags = SideFlags {
-        left: false,
-        right: true,
-    };
-    const BOTH: SideFlags = SideFlags {
-        left: true,
-        right: true,
-    };
+    const RIGHT_ENGAGED: ArmPair<bool> = ArmPair::new(false, true);
     /// Distinguishable per side, so a swapped accessor cannot pass.
     const LEFT_OPENING: f64 = 0.25;
     const RIGHT_OPENING: f64 = 0.75;
 
-    fn sample(engaged: SideFlags, age: Duration) -> KerSample {
+    fn sample(engaged: ArmPair<bool>, age: Duration) -> KerSample {
         KerSample {
-            left_joints: [0.1; 7],
-            right_joints: [0.2; 7],
-            gripper_openings: SideValues {
-                left: LEFT_OPENING,
-                right: RIGHT_OPENING,
-            },
+            joints: ArmPair::new([0.1; 7], [0.2; 7]),
+            gripper_openings: ArmPair::new(LEFT_OPENING, RIGHT_OPENING),
             engaged,
             received_at: Instant::now() - age,
         }
@@ -354,14 +181,15 @@ mod tests {
             "no sample yet"
         );
 
-        tx.send(Some(sample(RIGHT_ONLY, Duration::ZERO))).unwrap();
+        tx.send(Some(sample(RIGHT_ENGAGED, Duration::ZERO)))
+            .unwrap();
         assert!(streamable(&rx, STALE, Side::Right).is_some());
         assert!(
             streamable(&rx, STALE, Side::Left).is_none(),
             "an unengaged arm holds"
         );
 
-        tx.send(Some(sample(RIGHT_ONLY, STALE))).unwrap();
+        tx.send(Some(sample(RIGHT_ENGAGED, STALE))).unwrap();
         assert!(streamable(&rx, STALE, Side::Right).is_none(), "stale holds");
 
         tx.send(None).unwrap();
@@ -374,15 +202,21 @@ mod tests {
     #[test]
     fn the_stale_window_holds_at_its_own_edge() {
         let (tx, rx) = watch::channel(None);
-        tx.send(Some(sample(BOTH, STALE - Duration::from_millis(100))))
-            .unwrap();
+        tx.send(Some(sample(
+            BOTH_ENGAGED,
+            STALE - Duration::from_millis(100),
+        )))
+        .unwrap();
         assert!(
             streamable(&rx, STALE, Side::Left).is_some(),
             "inside the window still streams"
         );
 
-        tx.send(Some(sample(BOTH, STALE + Duration::from_millis(100))))
-            .unwrap();
+        tx.send(Some(sample(
+            BOTH_ENGAGED,
+            STALE + Duration::from_millis(100),
+        )))
+        .unwrap();
         assert!(
             streamable(&rx, STALE, Side::Left).is_none(),
             "past the window holds"
@@ -392,12 +226,12 @@ mod tests {
     #[test]
     fn each_side_reads_its_own_values() {
         let (tx, rx) = watch::channel(None);
-        tx.send(Some(sample(BOTH, Duration::ZERO))).unwrap();
+        tx.send(Some(sample(BOTH_ENGAGED, Duration::ZERO))).unwrap();
         let left = streamable(&rx, STALE, Side::Left).expect("engaged");
         let right = streamable(&rx, STALE, Side::Right).expect("engaged");
-        assert_eq!(left.gripper_openings.side(Side::Left), LEFT_OPENING);
-        assert_eq!(right.gripper_openings.side(Side::Right), RIGHT_OPENING);
-        assert_eq!(left.joints(Side::Left), [0.1; 7]);
-        assert_eq!(right.joints(Side::Right), [0.2; 7]);
+        assert_eq!(left.gripper_openings[Side::Left], LEFT_OPENING);
+        assert_eq!(right.gripper_openings[Side::Right], RIGHT_OPENING);
+        assert_eq!(left.joints[Side::Left], [0.1; 7]);
+        assert_eq!(right.joints[Side::Right], [0.2; 7]);
     }
 }

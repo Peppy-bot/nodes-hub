@@ -21,7 +21,7 @@ ls /dev/video*
 ### Load v4l2loopback Module
 ```bash
 # Load the module and create a virtual device at /dev/video10
-# Note: exclusive_caps=0 is required for compatibility with nokhwa
+# The tests need exclusive_caps=0 and max_buffers=2
 sudo modprobe v4l2loopback devices=1 video_nr=10 exclusive_caps=0 max_buffers=2 card_label="TestCamera"
 
 # Verify the device was created
@@ -45,7 +45,7 @@ sudo modprobe -r v4l2loopback
 
 ### Run All Integration Tests
 ```bash
-# From the uvc_camera directory
+# From the uvc_camera/linux directory
 # IMPORTANT: Use --test-threads=1 to avoid device conflicts
 cargo test --test integration_tests -- --ignored --test-threads=1
 
@@ -68,7 +68,7 @@ cargo test -- --include-ignored --test-threads=1
 1. **test_open_virtual_camera** - Verifies basic camera opening
 2. **test_capture_frames_from_virtual_camera** - Captures and validates multiple frames
 3. **test_capture_color_bars** - Tests with SMPTE color bars pattern
-4. **test_parse_device_and_capture** - Tests device path parsing with real device
+4. **test_camera_device_end_to_end** - Captures a frame and converts it to BGR8
 5. **test_frame_rate_timing** - Validates frame rate timing
 
 ### Test Helper: VirtualCamera
@@ -195,4 +195,3 @@ Note: Docker approach requires `--privileged` flag for module loading.
 
 - [v4l2loopback Documentation](https://github.com/umlaeute/v4l2loopback)
 - [FFmpeg Virtual Devices](https://trac.ffmpeg.org/wiki/Capture/Webcam#Linux)
-- [nokhwa Camera Library](https://docs.rs/nokhwa/)

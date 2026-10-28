@@ -5,6 +5,7 @@
 //! failure between them (a posture share ends its posture goal), so the
 //! backbone keeps its own kind and gives each member its own.
 
+use openarm_description::Side;
 use peppygen::exposed_actions::limb_motion::{move_arm, move_arm_joints, move_gripper};
 use peppygen::exposed_actions::postures::{move_to_home, move_to_ready};
 use peppygen::exposed_services::limb_motion::check_arm_move;
@@ -45,14 +46,23 @@ impl Failure {
         }
     }
 
-    /// The same failure with `label` before its message, such as the side
-    /// of the arm whose share of a posture goal failed.
-    pub fn labelled(self, label: &str) -> Self {
+    /// The same failure with `side` before its message: the side of the
+    /// arm whose share of a posture goal failed.
+    pub fn labelled(self, side: Side) -> Self {
         Self {
-            message: format!("{label}: {}", self.message),
+            message: format!("{side}: {}", self.message),
             ..self
         }
     }
+}
+
+/// The failure of a goal that reaches a limb whose follower stream has gone
+/// stale, and of a move whose follower goes stale while it runs.
+pub fn stale_failure() -> Failure {
+    Failure::new(
+        FailureKind::ResourceUnavailable,
+        "the follower stopped reporting",
+    )
 }
 
 /// Gives the generated `FailureKind` of `member` the kind of the same name,
@@ -128,7 +138,7 @@ mod tests {
     fn a_labelled_failure_keeps_its_kind_and_names_the_label_first() {
         let failure = Failure::new(FailureKind::Timeout, "still 0.2 rad from the target");
         assert_eq!(
-            failure.labelled("left"),
+            failure.labelled(Side::Left),
             Failure::new(FailureKind::Timeout, "left: still 0.2 rad from the target")
         );
     }

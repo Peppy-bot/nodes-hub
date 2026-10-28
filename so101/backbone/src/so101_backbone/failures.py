@@ -1,5 +1,7 @@
-"""The failure kinds this node gives: the kinds of peppy and the kinds that
-the limb_motion and postures contracts declare. Each generated member has a
+"""The failure kinds this node gives, and the refusal that carries one.
+
+The kinds are the kinds of peppy and the kinds that the limb_motion,
+postures and workspace contracts declare. Each generated member has a
 FailureKind of its own; its Failure takes each kind of this one by its name,
 and refuses a kind that the member does not declare."""
 
@@ -24,3 +26,12 @@ class FailureKind(StrEnum):
     UNREACHABLE = "unreachable"
     # A leader streams a limb of the goal.
     LEADER_STREAMING = "leader_streaming"
+
+
+class Refusal(Exception):
+    """A goal that must not run, or a request that gets an error reply: the
+    failure kind and the operator-facing reason."""
+
+    def __init__(self, kind: FailureKind, reason: str):
+        super().__init__(reason)
+        self.kind = kind

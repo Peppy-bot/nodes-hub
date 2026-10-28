@@ -2,24 +2,16 @@
 //! the follow loop. The arm follower's policy sized down to one motor, so
 //! both ends of the robot respond to a limp motor the same way.
 
-use std::time::Duration;
-
 use openarm_can::MotorStatus;
 use tracing::warn;
 
 /// What one tick's motor status requires of the follow loop.
 #[derive(Debug, PartialEq, Eq)]
-pub enum Verdict {
+pub(crate) enum Verdict {
     Continue,
     /// The motor reports Disabled without a fault: send a re-enable this tick.
     Reenable,
     HardFault(String),
-}
-
-/// Whole loop ticks covering `window`, at least one. Integer math, so a
-/// mis-sized period fails the division loudly instead of saturating.
-pub fn ticks_within(window: Duration, cycle_period: Duration) -> u32 {
-    window.as_nanos().div_ceil(cycle_period.as_nanos()).max(1) as u32
 }
 
 /// Classify the tick against the not-driving streak, which this advances
@@ -34,7 +26,7 @@ pub fn ticks_within(window: Duration, cycle_period: Duration) -> u32 {
 /// Each earns a re-enable only where that is the answer, Disabled, and
 /// escalates to a hard fault after `escalate_after_ticks` consecutive
 /// not-driving ticks.
-pub fn assess(
+pub(crate) fn assess(
     status: MotorStatus,
     silent: bool,
     streak: &mut u32,
@@ -44,35 +36,22 @@ pub fn assess(
         return Verdict::HardFault(format!("motor fault: {}", kind.name()));
     }
 
-    let (driving, how) = drive_condition(status, silent);
-    *streak = if driving { 0 } else { *streak + 1 };
+    let state = status.drive_state(silent);
+    *streak = if state.is_driving() { 0 } else { *streak + 1 };
     if *streak == 1 {
-        warn!("motor {how}: not driving");
+        warn!("motor {}: not driving", state.words());
     }
 
     if *streak >= escalate_after_ticks {
         return Verdict::HardFault(format!(
-            "motor not driving for {streak} consecutive ticks, currently {how}"
+            "motor not driving for {streak} consecutive ticks, currently {}",
+            state.words()
         ));
     }
 
     match status {
         MotorStatus::Disabled if !silent => Verdict::Reenable,
         _ => Verdict::Continue,
-    }
-}
-
-/// Whether the motor is confirmed driving this tick, with the word for its
-/// state when it is not. Silence outranks the cached status: past the stale
-/// window the cache is not a measurement.
-fn drive_condition(status: MotorStatus, silent: bool) -> (bool, &'static str) {
-    if silent || status == MotorStatus::Unreported {
-        return (false, "silent");
-    }
-    match status {
-        MotorStatus::Disabled => (false, "disabled"),
-        MotorStatus::Unknown(_) => (false, "in an unrecognised status"),
-        _ => (true, "driving"),
     }
 }
 
@@ -214,31 +193,5 @@ mod tests {
             }
         }
         panic!("a motor that is never driving must escalate however it flaps");
-    }
-
-    #[test]
-    fn escalation_ticks_cover_the_window_and_never_hit_zero() {
-        assert_eq!(
-            ticks_within(Duration::from_secs(1), Duration::from_millis(10)),
-            100
-        );
-        assert_eq!(
-            ticks_within(Duration::from_millis(500), Duration::from_millis(10)),
-            50
-        );
-        assert_eq!(
-            ticks_within(Duration::from_secs(1), Duration::from_secs(5)),
-            1
-        );
-        // A partial trailing tick still counts toward covering the window.
-        assert_eq!(
-            ticks_within(Duration::from_millis(500), Duration::from_millis(200)),
-            3
-        );
-        // Exact division adds no extra tick.
-        assert_eq!(
-            ticks_within(Duration::from_millis(400), Duration::from_millis(200)),
-            2
-        );
     }
 }

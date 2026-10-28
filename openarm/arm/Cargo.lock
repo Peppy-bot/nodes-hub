@@ -430,7 +430,7 @@ dependencies = [
 [[package]]
 name = "chain_kinematics"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#8beb25fd11174fff1f95d5dbaab15549b0eb2e42"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#eb844c23f88e1f526981fbb91a55b4ef89f2a107"
 dependencies = [
  "control_core",
  "nalgebra",
@@ -563,7 +563,7 @@ dependencies = [
 [[package]]
 name = "control_core"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#8beb25fd11174fff1f95d5dbaab15549b0eb2e42"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#eb844c23f88e1f526981fbb91a55b4ef89f2a107"
 dependencies = [
  "thiserror 2.0.21",
  "tokio",
@@ -1018,7 +1018,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1805,7 +1805,7 @@ dependencies = [
 [[package]]
 name = "instance_lock"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#8beb25fd11174fff1f95d5dbaab15549b0eb2e42"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#eb844c23f88e1f526981fbb91a55b4ef89f2a107"
 dependencies = [
  "thiserror 2.0.21",
 ]
@@ -2532,7 +2532,7 @@ dependencies = [
 [[package]]
 name = "openarm_can"
 version = "0.2.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#8beb25fd11174fff1f95d5dbaab15549b0eb2e42"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#eb844c23f88e1f526981fbb91a55b4ef89f2a107"
 dependencies = [
  "control_core",
  "nix 0.31.3",
@@ -2544,7 +2544,7 @@ dependencies = [
 [[package]]
 name = "openarm_description"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#8beb25fd11174fff1f95d5dbaab15549b0eb2e42"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#eb844c23f88e1f526981fbb91a55b4ef89f2a107"
 dependencies = [
  "urdf-rs",
 ]
@@ -2819,6 +2819,7 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 name = "pmi"
 version = "0.0.1"
 dependencies = [
+ "base64 0.22.1",
  "build-helpers",
  "bytes",
  "derive_more",
@@ -2826,11 +2827,13 @@ dependencies = [
  "libc",
  "peppy-config-model",
  "rand 0.10.3",
+ "ring",
  "rustls-native-certs",
  "rustls-pemfile",
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
  "tracing",
@@ -2992,7 +2995,7 @@ dependencies = [
  "once_cell",
  "socket2 0.5.10",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3308,7 +3311,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3376,7 +3379,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3864,7 +3867,7 @@ dependencies = [
 [[package]]
 name = "srs_model"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#8beb25fd11174fff1f95d5dbaab15549b0eb2e42"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#eb844c23f88e1f526981fbb91a55b4ef89f2a107"
 dependencies = [
  "chain_kinematics",
  "control_core",
@@ -4015,7 +4018,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4771,7 +4774,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

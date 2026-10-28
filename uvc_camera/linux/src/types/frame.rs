@@ -1,4 +1,4 @@
-use super::Encoding;
+use camera_core::encoding::ColorEncoding;
 use std::time::SystemTime;
 
 /// Frame identifier (wrapping counter)
@@ -27,7 +27,7 @@ pub struct Frame {
     height: u32,
     frame_id: FrameId,
     captured_at: SystemTime,
-    encoding: Encoding,
+    encoding: ColorEncoding,
 }
 
 impl Frame {
@@ -44,7 +44,7 @@ impl Frame {
         width: u32,
         height: u32,
         captured_at: SystemTime,
-        encoding: Encoding,
+        encoding: ColorEncoding,
     ) -> Self {
         Self {
             data,
@@ -76,12 +76,12 @@ impl Frame {
         self.captured_at
     }
 
-    pub fn encoding(&self) -> Encoding {
+    pub fn encoding(&self) -> ColorEncoding {
         self.encoding
     }
 
     /// Replace the pixel data and encoding, keeping the capture metadata.
-    pub fn with_encoding(self, data: Vec<u8>, encoding: Encoding) -> Self {
+    pub fn with_encoding(self, data: Vec<u8>, encoding: ColorEncoding) -> Self {
         Self {
             data,
             encoding,

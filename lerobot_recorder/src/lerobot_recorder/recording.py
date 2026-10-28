@@ -9,6 +9,9 @@ a fresher value, so no future data leaks into a frame.
 Link vector layouts (joint counts, which optional vectors a source delivers)
 come from each source's first message and are locked into the schema; a wire
 message that no longer fits ends the episode.
+Camera frames are cached and sampled undecoded; `decode_images` then decodes
+a frame's color (rgb8, bgr8, yuyv, mjpeg) and depth (z16) payloads into
+images, off the event loop.
 Throughout this module "action" is LeRobot's action feature (the commanded
 setpoints recorded per frame), not a peppy action.
 """
@@ -18,11 +21,12 @@ from __future__ import annotations
 import io
 import math
 from dataclasses import dataclass, field
+from enum import StrEnum
 
 import cv2
 import numpy as np
 
-from .plan import LinkKind, RecordingPlan, SourceEntry, SourceKey
+from .plan import LinkKind, RecordingPlan, SourceEntry, SourceKey, depth_image_key
 
 # Episodes auto-stop at this length. The library stores frame timestamps as
 # float32 k/fps and reads them back against a fixed 1e-4 s tolerance; float32
@@ -40,8 +44,13 @@ MAX_SCHEDULE_LAG_S = 1.0
 # episode stats on two sides of a two-sample fork (compute_stats.py, `if
 # reshaped.shape[0] < 2`) whose branches disagree on dtype for the integer
 # columns, so a one-frame episode writes a schema every later episode is
-# rejected against, wedging the session.
-MIN_EPISODE_FRAMES = 2
+# rejected against, wedging the session. Its depth encoder (HEVC) gives every
+# video of three frames or more a two-frame decode delay, and a two-frame video
+# either fails its own save (the muxer's "pts/dts pair unsupported") or saves
+# without the delay; the next episode appended to that video file then starts
+# at or before its last timestamp, and the muxer refuses every later save into
+# the file.
+MIN_EPISODE_FRAMES = 3
 
 
 @dataclass(frozen=True)
@@ -59,7 +68,7 @@ class GripperSample:
     timestamp_ns: int
 
 
-LinkSample = JointSample | GripperSample
+_LinkSample = JointSample | GripperSample
 
 
 @dataclass(frozen=True)
@@ -77,7 +86,7 @@ class Cache:
     written by the drain tasks and read by the sampler; all access stays on
     the event loop."""
 
-    links: dict[SourceKey, LinkSample | None]
+    links: dict[SourceKey, _LinkSample | None]
     color: list[CameraFrame | None]
     rgbd_video: list[CameraFrame | None]
     rgbd_depth: list[CameraFrame | None]
@@ -100,7 +109,7 @@ def timestamp_to_ns(timestamp_s: float) -> int | None:
     return int(timestamp_s * 1_000_000_000)
 
 
-def state_sample(kind: LinkKind, message) -> LinkSample | None:
+def state_sample(kind: LinkKind, message) -> _LinkSample | None:
     """Cacheable sample from one measured-stream message; None when it cannot
     anchor a frame (pre-epoch timestamp or non-finite values)."""
     if kind is LinkKind.JOINT:
@@ -123,7 +132,7 @@ def _joint_sample(message) -> JointSample | None:
     )
 
 
-def action_sample(kind: LinkKind, message) -> LinkSample | None:
+def action_sample(kind: LinkKind, message) -> _LinkSample | None:
     """Cacheable sample from one setpoint message. Joint setpoints share the
     state wire shape; gripper setpoints carry no effort (the cap is not the
     action), so the sample's effort stays 0 and is never recorded."""
@@ -230,7 +239,7 @@ class SampleGap(Exception):
 
 def _fresh_link_sample(
     cache: Cache, entry: SourceEntry, now_ns: int, staleness_s: float, gap: type[Exception]
-) -> LinkSample:
+) -> _LinkSample:
     sample = cache.links[entry.key]
     if sample is None:
         raise gap(f"link {entry.label} has not produced yet")
@@ -240,7 +249,7 @@ def _fresh_link_sample(
     return sample
 
 
-def _hold_in_place(sample: LinkSample) -> LinkSample:
+def _hold_in_place(sample: _LinkSample) -> _LinkSample:
     """The action recorded before any command exists: the measured pose as a
     setpoint. The gripper cap is not the action, so effort stays 0 exactly as
     it does for a real gripper setpoint."""
@@ -253,7 +262,7 @@ def _hold_in_place(sample: LinkSample) -> LinkSample:
 
 def _held_link_sample(
     cache: Cache, entry: SourceEntry, fallback_keys: dict[SourceKey, SourceKey], gap: type[Exception]
-) -> LinkSample:
+) -> _LinkSample:
     """A setpoint is a latest-wins command: the last one remains the action
     until replaced, so age never gates it. Before the first command, the
     paired state link stands in (see _hold_in_place); with neither, the
@@ -272,7 +281,7 @@ def _dims_only(layout: LinkLayout) -> LinkLayout:
     return LinkLayout(dims=layout.dims, has_velocities=False, has_efforts=False)
 
 
-def _link_layout(entry: SourceEntry, sample: LinkSample) -> LinkLayout:
+def _link_layout(entry: SourceEntry, sample: _LinkSample) -> LinkLayout:
     if isinstance(sample, GripperSample):
         return GRIPPER_LAYOUT
     dims = len(sample.positions)
@@ -365,7 +374,7 @@ class FrameRow:
 
 
 @dataclass(frozen=True)
-class PendingImage:
+class _PendingImage:
     """One camera frame sampled fresh, awaiting decode. Kept undecoded so
     `sample` stays cheap on the event loop; `decode_images` runs elsewhere."""
 
@@ -378,13 +387,22 @@ class PendingImage:
     depth_unit_m: float | None
 
 
+def _require_locked_joint_count(entry: SourceEntry, s: JointSample, dims: int) -> None:
+    """SampleGap when a joint sample carries other than the schema's locked
+    joint count."""
+    if len(s.positions) != dims:
+        raise SampleGap(
+            f"link {entry.label} carries {len(s.positions)} joints, schema locked {dims}"
+        )
+
+
 def sample(
     cache: Cache,
     schema: SourceSchema,
     plan: RecordingPlan,
     now_ns: int,
     staleness_s: float,
-) -> tuple[FrameRow, tuple[PendingImage, ...]]:
+) -> tuple[FrameRow, tuple[_PendingImage, ...]]:
     """Assemble one frame: vectors filled, camera frames freshness-checked but
     undecoded; `decode_images` finishes the row off the event loop."""
     state: list[float] = []
@@ -393,11 +411,7 @@ def sample(
     for entry, layout in zip(plan.state, schema.layouts, strict=True):
         s = _fresh_link_sample(cache, entry, now_ns, staleness_s, SampleGap)
         if isinstance(s, JointSample):
-            if len(s.positions) != layout.dims:
-                raise SampleGap(
-                    f"link {entry.label} carries {len(s.positions)} joints, "
-                    f"schema locked {layout.dims}"
-                )
+            _require_locked_joint_count(entry, s, layout.dims)
             state.extend(s.positions)
             if layout.has_velocities:
                 if len(s.velocities) != layout.dims:
@@ -415,11 +429,7 @@ def sample(
     for entry, layout in zip(plan.action, schema.action_layouts, strict=True):
         s = _held_link_sample(cache, entry, plan.action_fallback, SampleGap)
         if isinstance(s, JointSample):
-            if len(s.positions) != layout.dims:
-                raise SampleGap(
-                    f"link {entry.label} carries {len(s.positions)} joints, "
-                    f"schema locked {layout.dims}"
-                )
+            _require_locked_joint_count(entry, s, layout.dims)
             action.extend(s.positions)
         else:
             action.append(s.opening)
@@ -439,7 +449,7 @@ def sample(
             raise SampleGap(f"camera {entry.name} silent ({age_s:.2f}s behind)")
         if (frame.width, frame.height) != geometry:
             raise SampleGap(f"camera {entry.name} changed resolution")
-        return PendingImage(
+        return _PendingImage(
             name=name,
             camera=entry.name,
             frame=frame,
@@ -458,14 +468,14 @@ def sample(
                 cache.rgbd_depth[i],
                 schema.depth_geometry[i],
                 entry,
-                f"{entry.name}_depth",
+                depth_image_key(entry.name),
                 depth_unit_m=schema.depth_units[i],
             )
         )
     return row, tuple(pending)
 
 
-def decode_images(row: FrameRow, pending: tuple[PendingImage, ...]) -> FrameRow:
+def decode_images(row: FrameRow, pending: tuple[_PendingImage, ...]) -> FrameRow:
     """Decode the sampled camera frames into `row.images`. Split from `sample`
     so the decode cost lands off the event loop, which must stay free for the
     drain tasks that keep the cache fresh."""
@@ -488,26 +498,46 @@ def decode_images(row: FrameRow, pending: tuple[PendingImage, ...]) -> FrameRow:
     return row
 
 
+class _Encoding(StrEnum):
+    """The camera payload encodings this recorder decodes."""
+
+    RGB8 = "rgb8"
+    BGR8 = "bgr8"
+    YUYV = "yuyv"
+    MJPEG = "mjpeg"
+    Z16 = "z16"
+
+
+def _parse_encoding(frame: CameraFrame) -> _Encoding | None:
+    """The frame's encoding, or None for one this recorder does not decode."""
+    try:
+        return _Encoding(frame.encoding)
+    except ValueError:
+        return None
+
+
 def decode_color(frame: CameraFrame) -> np.ndarray:
     """Camera payload as HxWx3 RGB uint8."""
     h, w = frame.height, frame.width
-    if frame.encoding == "rgb8":
-        return np.frombuffer(frame.data, dtype=np.uint8).reshape(h, w, 3)
-    if frame.encoding == "bgr8":
-        return np.frombuffer(frame.data, dtype=np.uint8).reshape(h, w, 3)[:, :, ::-1]
-    if frame.encoding == "yuyv":
-        return _yuyv_to_rgb(np.frombuffer(frame.data, dtype=np.uint8).reshape(h, w, 2))
-    if frame.encoding == "mjpeg":
-        from PIL import Image
+    match _parse_encoding(frame):
+        case _Encoding.RGB8:
+            return np.frombuffer(frame.data, dtype=np.uint8).reshape(h, w, 3)
+        case _Encoding.BGR8:
+            return np.frombuffer(frame.data, dtype=np.uint8).reshape(h, w, 3)[:, :, ::-1]
+        case _Encoding.YUYV:
+            return _yuyv_to_rgb(np.frombuffer(frame.data, dtype=np.uint8).reshape(h, w, 2))
+        case _Encoding.MJPEG:
+            from PIL import Image
 
-        return np.asarray(Image.open(io.BytesIO(frame.data)).convert("RGB"))
-    raise ValueError(f"unsupported color encoding {frame.encoding!r}")
+            return np.asarray(Image.open(io.BytesIO(frame.data)).convert("RGB"))
+        case _:
+            raise ValueError(f"unsupported color encoding {frame.encoding!r}")
 
 
 def decode_depth(frame: CameraFrame, depth_unit_m: float) -> np.ndarray:
     """z16 payload as HxWx1 float32 meters (what lerobot's depth encoder
     quantizes)."""
-    if frame.encoding != "z16":
+    if _parse_encoding(frame) is not _Encoding.Z16:
         raise ValueError(f"unsupported depth encoding {frame.encoding!r}")
     z16 = np.frombuffer(frame.data, dtype="<u2").reshape(frame.height, frame.width)
     return (z16.astype(np.float32) * depth_unit_m)[:, :, np.newaxis]

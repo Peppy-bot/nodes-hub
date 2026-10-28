@@ -1,3 +1,5 @@
+use control_core::report_once::ReportOnce;
+use control_core::time::block_until_unless_cancelled;
 use peppygen::emitted_topics::camera::video_stream::{self, MessageHeader};
 use peppylib::runtime::CancellationToken;
 use std::fmt;
@@ -5,15 +7,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
-use crate::camera::v4l_device::{CameraDevice, ControlHandle, StreamDescription, clock_timestamp};
+use crate::camera::v4l_device::{CameraDevice, ControlHandle, StreamDescription, clock_now};
 use crate::pipeline;
 use crate::types::{CameraConfig, Error, FrameId, Result};
 
 /// Pause after a failed frame before trying the next one.
 const FRAME_RETRY_DELAY: Duration = Duration::from_millis(10);
 const STATUS_LOG_INTERVAL: Duration = Duration::from_secs(3);
-/// Granularity at which rate-limiting sleeps re-check the cancellation token
-const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// How long the loop tolerates back-to-back frame failures before giving up.
 /// Driver hiccups clear in milliseconds, but a deterministic failure (an
 /// unplugged camera, a stream the pipeline cannot convert) never clears, and
@@ -47,20 +47,21 @@ impl Drop for CancelOnExit {
 /// another's retry path.
 struct PublishWindow {
     last_publish: Instant,
-    episode_logged: bool,
+    /// The run of failed frames since the last publish; only its first warns.
+    failures: ReportOnce,
 }
 
 impl PublishWindow {
     fn new() -> Self {
         Self {
             last_publish: Instant::now(),
-            episode_logged: false,
+            failures: ReportOnce::default(),
         }
     }
 
     fn published(&mut self) {
         self.last_publish = Instant::now();
-        self.episode_logged = false;
+        self.failures.clear();
     }
 
     /// Record a failed frame and pause before the next attempt.
@@ -76,13 +77,12 @@ impl PublishWindow {
                 "nothing published for {stalled:?}; last failure: {context}: {error}"
             )));
         }
-        // Only the first failure of an episode warns; a wedged camera would
-        // otherwise emit hundreds of identical lines before the window closes.
-        if self.episode_logged {
-            tracing::debug!("{context}: {error}");
-        } else {
+        // Only the first failure of a run warns and the rest log at debug, so
+        // a wedged camera warns once before the window closes.
+        if self.failures.first_of_run() {
             tracing::warn!("{context}: {error}");
-            self.episode_logged = true;
+        } else {
+            tracing::debug!("{context}: {error}");
         }
         std::thread::sleep(FRAME_RETRY_DELAY);
         Ok(())
@@ -128,7 +128,7 @@ pub fn spawn_capture_loop(
     std::thread::spawn(move || {
         // The camera is dropped at the end of this closure either way, so by the
         // time `done_tx` fires the device is closed.
-        if let Some(camera) = open_camera(CameraDevice::new(clock_timestamp), &config, open_tx) {
+        if let Some(camera) = open_camera(CameraDevice::new(clock_now), &config, open_tx) {
             // Armed only once the camera is streaming. Arming it any earlier
             // would race the open report: setup selects over its own future and
             // the cancellation token, so a cancel landing alongside the failure
@@ -278,26 +278,15 @@ fn run_camera_capture_loop(
 
         frame_id = frame_id.next();
 
-        sleep_until_unless_cancelled(next_frame_time, cancel_token);
+        if !block_until_unless_cancelled(next_frame_time, || cancel_token.is_cancelled()) {
+            break;
+        }
         next_frame_time =
             advance_frame_deadline(next_frame_time, target_frame_duration, Instant::now());
     }
 
     tracing::info!("shutdown requested, stopping camera capture loop");
     Ok(())
-}
-
-/// Sleep until `deadline` in short slices, returning early once the token is
-/// cancelled, so the rate limiter (up to a full frame interval at low fps)
-/// does not eat into the shutdown grace window.
-fn sleep_until_unless_cancelled(deadline: Instant, cancel_token: &CancellationToken) {
-    while !cancel_token.is_cancelled() {
-        let now = Instant::now();
-        if now >= deadline {
-            break;
-        }
-        std::thread::sleep((deadline - now).min(CANCEL_POLL_INTERVAL));
-    }
 }
 
 /// Advance the frame deadline by one period, accumulating to avoid drift.

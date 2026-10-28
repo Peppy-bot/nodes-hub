@@ -10,7 +10,7 @@
 | [`sim_mujoco`](../sim_mujoco) | MuJoCo simulation: stands any number of robots, of any model it carries, in one composed scene |
 | [`sim_isaac`](../sim_isaac) | Isaac Sim simulation: stands any number of robots, of any model it carries, in one scene |
 | `waldo` | Waldo simulation: stands any number of robots' limbs in one world, with a Bevy browser viewer; lives in the separate `private-nodes-hub` repository, not in this hub |
-| [`openarm_backbone`](./backbone) | routes goals to the correct side |
+| [`openarm_backbone`](./backbone) | the bimanual motion authority: plans, governs and streams the moves of both arms and grippers |
 | [`openarm_web_commander`](./web_commander) | browser control panel |
 | [`openarm_ker`](./ker) | streams joint setpoints from a real leader arm |
 | [`isaac_webviewer`](../isaac_webviewer) | serves the Isaac Sim WebRTC browser viewer |
@@ -105,7 +105,7 @@ For Waldo, the simulation node comes from the `private-nodes-hub` repository: re
 peppy node add /path/to/ws/private-nodes-hub/waldo -sb --idle-timeout 18000
 ```
 
-The `cameras_sim` launcher option, on any simulation, additionally needs the camera relay nodes, which live in the separate [nodes-hub](https://github.com/Peppy-bot/nodes-hub) repo because nothing in them is OpenArm-specific:
+The `cameras_sim` launcher option, on any simulation, additionally needs the camera relay nodes [`sim_rgb_camera`](../sim_rgb_camera) and [`sim_rgbd_camera`](../sim_rgbd_camera), which sit at the top of this repository because nothing in them is OpenArm-specific:
 
 ```sh
 peppy node add /path/to/ws/nodes-hub/sim_rgb_camera -sb --idle-timeout 1800
@@ -121,8 +121,6 @@ peppy node add /path/to/ws/nodes-hub/openarm/gripper -sb --idle-timeout 1800
 ```
 
 Both hardware generations run the same nodes; the launcher's `hardware_version` argument selects which one each arm and gripper drives.
-
-Upgrading a v2.0 rig from `openarm_gripper_v2`: stop and remove any gripper instance running that node before launching. Both nodes drive the same motor id on the same bus, but the old one holds a different instance lock, so nothing would stop the two from commanding one gripper at once.
 
 After changing a node's code, rebuild it by re-running the same command with `--force` added.
 
@@ -314,13 +312,13 @@ Then press:
 Spawn Object
 ```
 
-Isaac assigns each spawned object a unique ID similar to:
+Isaac Sim or Waldo names each spawned object after its asset, adding `_2`, `_3` and so on while the name is taken, and assigns it a unique ID. The status line shows both once the object stands:
 
 ```text
-obj_626b16769f97
+name=red_block object_id=obj_626b16769f97
 ```
 
-Runtime objects are created under:
+Isaac Sim creates its runtime objects under:
 
 ```text
 /World/RuntimeObjects/<object_id>
@@ -649,16 +647,4 @@ peppy node info openarm_web_commander:v1     # or scene_commander:v1; lists each
 
 ## Adding an item to this repository
 
-This repository publishes what `peppy_repository.json5` says it publishes, and nothing else. An item
-that is not listed there is invisible to peppy, so after adding, moving, or renaming a node, run:
-
-```sh
-peppy repo index .
-```
-
-Commit the updated `peppy_repository.json5` alongside your change. CI runs `peppy repo index --check`
-on every pull request and fails if the index has drifted from the repository, naming the file and the
-identity involved.
-
-Generation refuses, naming both files, if your change claims a `name:tag` another one already
-publishes. Rename yours: within one repository, a `name:tag` is claimed by exactly one file.
+The [repository README](../README.md#adding-an-item-to-this-repository) covers it.

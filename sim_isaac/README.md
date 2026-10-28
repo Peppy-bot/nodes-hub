@@ -56,7 +56,8 @@ sim_isaac/
     models/            one entry per model this engine stands
     isaac_models.py    parses them, strictly, at node setup
     config/sim_isaac.kit
-  scripts/             CPU-only maintenance tools for the OpenArm bundle
+  scripts/             CPU-only tools: maintenance of the OpenArm bundle, and
+                       runtime_command.py, a client of the runtime command port
   tests/               GPU-free suites, their own uv project
 ```
 
@@ -360,18 +361,29 @@ loaded last and its scale, and an empty asset id while the stage stands
 empty. `get_assets_list` narrows the catalogue by the `kind`, `category`
 and `query` its request sets, and `get_asset_categories` counts it per
 category. `get_objects_list` lists every object scene_manipulation spawned
-with its pose as of the latest capture, each in its asset's category and
-with the source `spawned`: an environment places no object of its own, so
-the source `scene` lists nothing. `get_object` answers one of those objects
-from the same capture: its pose and its scale, as `get_objects_list` lists
-them. Isaac keeps no landmark and simulates no state of an object, so
-`landmarks` is empty and no state field is present. An object id that names
-no spawned object gets an error reply with `rejected`, and before the first
-capture `get_object` answers as `get_objects_list` and `get_object_states`
-do: an error reply with `precondition_failed` and the reason. A
-`spawn_object` or `move_object` goal that carries an `orientation`, a unit
-quaternion `[x, y, z, w]`, stands the object turned to it, whatever the
-spawn's `yaw`; a move without one keeps the orientation the object has.
+with its name and its pose as of the latest capture, each in its asset's
+category and with the source `spawned`: an environment places no object of
+its own, so the source `scene` lists nothing. `get_object` answers one of
+those objects from the same capture: its name, its pose and its scale, as
+`get_objects_list` lists them. Isaac keeps no landmark and simulates no
+state of an object, so `landmarks` is empty and no state field is present.
+An object id that names no spawned object gets an error reply with
+`rejected`, and before the first capture `get_object` answers as
+`get_objects_list` and `get_object_states` do: an error reply with
+`precondition_failed` and the reason. A `spawn_object` goal takes a `name`,
+lowercase letters, digits and `_`, and the object stands under it; a name of
+another form, or one a spawned object holds, is refused with `rejected`, and
+nothing is spawned. A goal that gives no name, or an empty one, is named
+after the last segment of its asset id: that segment lowercased, with each
+character other than a lowercase letter, a digit or `_` made `_`, or
+`object` when it is empty. So `props/blocks/red_block` gives `red_block`,
+numbered `red_block_2`, `red_block_3` while that name is taken. The result
+reports the name with the object id. A `feeder` of another form is refused
+the same way, and an empty one names no feeder; Isaac keeps no setup record,
+so a `feeder` that is a name changes nothing. A `spawn_object` or
+`move_object` goal that carries an `orientation`, a unit quaternion
+`[x, y, z, w]`, stands the object turned to it, whatever the spawn's `yaw`;
+a move without one keeps the orientation the object has.
 Isaac keeps no landmark, so a `spawn_object` or `move_object` goal that
 carries a `snap_to` is refused, naming the position to give instead, and
 nothing is spawned or moved.
@@ -385,6 +397,8 @@ Isaac main thread checks the goal again when its command runs, since a
 command queued before it can remove its object, and its robot can leave the
 stage meanwhile: a check that fails there fails the goal with the same kind,
 and a command that Isaac does not carry out fails it with `attempt_failed`.
+Isaac serves `spawn_object` goals one at a time, so a spawn's name is
+checked as its goal arrives, after every earlier spawn has ended.
 
 ### Progress of a load or a spawn
 

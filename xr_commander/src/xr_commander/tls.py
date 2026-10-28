@@ -23,6 +23,9 @@ from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 from xr_commander import addresses
 
+# The certificate and key files under the TLS directory.
+_CERT_FILE = "cert.pem"
+_KEY_FILE = "key.pem"
 _VALID_FOR = datetime.timedelta(days=3650)
 # Regenerate ahead of expiry so a long-lived install never serves a cert the
 # browser rejects outright (an expired cert cannot be clicked through).
@@ -101,8 +104,8 @@ def _generate(directory: Path, valid_for: datetime.timedelta) -> tuple[Path, Pat
         )
         .sign(key, hashes.SHA256())
     )
-    cert_path = directory / "cert.pem"
-    key_path = directory / "key.pem"
+    cert_path = directory / _CERT_FILE
+    key_path = directory / _KEY_FILE
     # Key first: a die between the writes leaves a mismatched pair, which the
     # reuse check detects and regenerates rather than serving.
     _write_private(
@@ -141,8 +144,8 @@ def ensure_certificate(
     interleave their writes into a mismatched pair."""
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(directory, 0o700)  # exist_ok skips the mode on a pre-existing dir
-    cert_path = directory / "cert.pem"
-    key_path = directory / "key.pem"
+    cert_path = directory / _CERT_FILE
+    key_path = directory / _KEY_FILE
     with open(directory / ".lock", "w") as lockfile:
         fcntl.flock(lockfile, fcntl.LOCK_EX)
         try:

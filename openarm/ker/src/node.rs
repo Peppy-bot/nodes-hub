@@ -1,7 +1,8 @@
-// Node composition: parses every parameter up front, takes the single-instance
-// lock, then wires the reader thread to the publish tasks. All device and
-// stream logic lives in the sibling modules; this is only the assembly.
+//! Node composition: parses every parameter up front, takes the single-instance
+//! lock, then wires the reader thread to the publish tasks. All device and
+//! stream logic lives in the sibling modules; this is only the assembly.
 
+use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,7 +31,36 @@ const MAX_RATE_HZ: u32 = 1_000;
 const MIN_STALE_TIMEOUT: Duration = Duration::from_millis(5);
 
 /// Latched when a task stopped on its own rather than in reaction to shutdown.
-static TASK_FAILED: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+static TASK_FAILED: std::sync::OnceLock<Task> = std::sync::OnceLock::new();
+
+/// A task whose stop ends the node.
+#[derive(Clone, Copy)]
+pub enum Task {
+    Reader,
+    Publisher,
+}
+
+impl Task {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Reader => "reader",
+            Self::Publisher => "publisher",
+        }
+    }
+}
+
+impl fmt::Display for Task {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// The quoted name, which is how the error `main` returns prints a task.
+impl fmt::Debug for Task {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self.name(), f)
+    }
+}
 
 /// Everything this node refuses to run on, or stops for.
 ///
@@ -72,7 +102,7 @@ pub enum NodeError {
     ReaderThread(#[source] std::io::Error),
 
     #[error("the KER {0} stopped this node; the log has its reason")]
-    TaskStopped(&'static str),
+    TaskStopped(Task),
 
     /// The runtime's own failures pass through unchanged rather than being
     /// re-wrapped, so a messaging or config error keeps the variant it was
@@ -140,7 +170,7 @@ fn parse_config(params: &Parameters) -> NodeResult<Config> {
 /// Which task stopped on its own, if one did; read by `main` after the
 /// runtime returns, so a reader or publisher death is recorded as a failure
 /// that names the task.
-pub fn task_failed() -> Option<&'static str> {
+pub fn task_failed() -> Option<Task> {
     TASK_FAILED.get().copied()
 }
 
@@ -223,21 +253,21 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     {
         let token = node_runner.cancellation_token().clone();
         tokio::spawn(async move {
-            let fault: Option<&'static str> = tokio::select! {
+            let fault: Option<Task> = tokio::select! {
                 exit = reader_exited => match exit {
                     Ok(reader::ReaderExit::Cancelled) => None,
                     // Fatal reports and a reader panic (closed channel) alike.
-                    Ok(reader::ReaderExit::Fatal) | Err(_) => Some("reader"),
+                    Ok(reader::ReaderExit::Fatal) | Err(_) => Some(Task::Reader),
                 },
                 joined = publisher => match joined {
                     Ok(Ok(())) => None,
                     Ok(Err(fault)) => {
                         error!("publisher stopped: {fault}");
-                        Some("publisher")
+                        Some(Task::Publisher)
                     }
                     Err(join) => {
                         error!("publisher panicked: {join}");
-                        Some("publisher")
+                        Some(Task::Publisher)
                     }
                 },
             };
@@ -277,6 +307,19 @@ mod tests {
             Some(source) => format!("{error}: {source}"),
             None => error.to_string(),
         }
+    }
+
+    #[test]
+    fn a_stopped_task_is_named_by_its_word() {
+        let stopped = NodeError::TaskStopped(Task::Publisher);
+        assert_eq!(
+            stopped.to_string(),
+            "the KER publisher stopped this node; the log has its reason"
+        );
+        assert_eq!(
+            format!("{:?}", NodeError::TaskStopped(Task::Reader)),
+            r#"TaskStopped("reader")"#
+        );
     }
 
     #[test]

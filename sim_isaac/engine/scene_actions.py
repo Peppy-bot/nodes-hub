@@ -15,9 +15,11 @@ its response, or an error reply with the same kinds.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import logging
 import math
+import re
 import threading
 import uuid
 from concurrent.futures import Future
@@ -146,6 +148,9 @@ class _Spawn:
     scale: float
     physics: str
     mass: float
+    # The object's name: the one the spawn asked for, or the one the stage
+    # gave it.
+    name: str
 
 
 @dataclass(frozen=True)
@@ -272,6 +277,43 @@ def _duration_of(payload: dict) -> float:
         raise _rejected(f"duration_s must be > 0 and <= {_LONGEST_PUSH_S:g} seconds")
 
     return duration_s
+
+
+# The name of an object or of a feeder: lowercase letters, digits and `_`,
+# at least one of them.
+_NAME = re.compile(r"[a-z0-9_]+")
+
+
+def _refuse_malformed_name(kind: str, text: str) -> None:
+    """Refuses with `rejected` `text`, the `kind` a spawn names, when it is
+    not a name."""
+
+    if not _NAME.fullmatch(text):
+        raise _rejected(
+            f"{kind} '{text}' is not a name: lowercase letters, digits and _"
+        )
+
+
+def _object_name(asked: str | None, asset_id: str, taken: set[str]) -> str:
+    """The name a spawn gets: the one it asks for, refused with `rejected`
+    when it is not a name or is taken; with none, or an empty one, a name
+    made from the last segment of the asset id, with `_2`, `_3`, ... until
+    it is free."""
+
+    if asked:
+        _refuse_malformed_name("object name", asked)
+        if asked in taken:
+            raise _rejected(
+                f"object name '{asked}' is taken by a spawned object; "
+                "give another name, or leave name out and the simulation "
+                "names it"
+            )
+        return asked
+    last_segment = asset_id.rsplit("/", 1)[-1].lower()
+    stem = re.sub(r"[^a-z0-9_]", "_", last_segment) or "object"
+    numbered = (f"{stem}_{number}" for number in itertools.count(2))
+    candidates = itertools.chain([stem], numbered)
+    return next(name for name in candidates if name not in taken)
 
 
 def _payload_of(operation: str, request) -> dict:
@@ -766,6 +808,7 @@ class SceneActionIO:
                 objects.append(
                     get_objects_list.ResponseObjectsItem(
                         object_id=record.object_id,
+                        name=record.name,
                         asset_id=record.asset_id,
                         category=asset_category,
                         source="spawned",
@@ -802,6 +845,7 @@ class SceneActionIO:
         return get_object.Response(
             timestamp=snapshot.timestamp_s,
             object_id=record.object_id,
+            name=record.name,
             asset_id=record.asset_id,
             position=list(record.position),
             orientation=list(record.orientation),
@@ -1117,6 +1161,14 @@ class SceneActionIO:
     def _spawn_of(self, payload: dict) -> _Spawn:
         _refuse_snap(payload)
         asset = self._catalogue_asset(payload["asset_id"], "object")
+        feeder = payload.get("feeder")
+
+        # Absent or empty, the spawn names no feeder.
+        if feeder:
+            _refuse_malformed_name("feeder", feeder)
+
+        with self._lock:
+            taken = {obj["name"] for obj in self._objects.values()}
 
         return _Spawn(
             asset_id=payload["asset_id"],
@@ -1127,6 +1179,7 @@ class SceneActionIO:
             scale=_positive_of(payload, "scale"),
             physics=_physics_of(payload),
             mass=_positive_of(payload, "mass"),
+            name=_object_name(payload.get("name"), payload["asset_id"], taken),
         )
 
     def _spawn_object(self, launcher, spawn: _Spawn) -> dict:
@@ -1157,13 +1210,14 @@ class SceneActionIO:
         with self._lock:
             self._objects[object_id] = {
                 "object_id": object_id,
+                "name": spawn.name,
                 "asset_id": spawn.asset_id,
                 "scale": spawn.scale,
                 "physics": spawn.physics,
                 "mass": spawn.mass,
             }
 
-        return {"object_id": object_id}
+        return {"object_id": object_id, "name": spawn.name}
 
     def _spawned_object(self, object_id: str) -> dict:
         """The spawned object `object_id` names. Refused with `rejected` for

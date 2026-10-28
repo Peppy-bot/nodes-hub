@@ -5,13 +5,13 @@ use std::time::{Duration, Instant};
 
 use control_core::servo::{ORIENTATION_TOLERANCE_RAD, POSITION_TOLERANCE_M};
 use openarm_backbone::arm_model;
-use openarm_description::{HardwareVersion, Side};
+use openarm_description::{ARM_DOF, HardwareVersion, Side};
 use srs_model::chain_kinematics::{
     EeCaps, JointSmoothing, LEASH_M, MAX_SERVO_S, ServoState, ServoTolerances, ServoTrajectory,
     command_smoothing, rollout,
 };
 use srs_model::nalgebra::{Isometry3, Quaternion, Translation3, UnitQuaternion};
-use srs_model::{ARM_DOF, Arm, ArmAnglePolicy, CartesianPlan, JointVec, PlanLimits};
+use srs_model::{Arm, ArmAnglePolicy, CartesianPlan, JointVec, PlanLimits};
 
 pub const EPS: f64 = 1e-9;
 

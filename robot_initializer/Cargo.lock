@@ -529,6 +529,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "control_core"
+version = "0.1.0"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#eb844c23f88e1f526981fbb91a55b4ef89f2a107"
+dependencies = [
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2524,6 +2534,7 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 name = "pmi"
 version = "0.0.1"
 dependencies = [
+ "base64 0.22.1",
  "build-helpers",
  "bytes",
  "derive_more",
@@ -2531,11 +2542,13 @@ dependencies = [
  "libc",
  "peppy-config-model",
  "rand 0.10.3",
+ "ring",
  "rustls-native-certs",
  "rustls-pemfile",
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
  "tracing",
@@ -2933,6 +2946,7 @@ dependencies = [
 name = "robot_initializer"
 version = "0.1.0"
 dependencies = [
+ "control_core",
  "futures",
  "peppygen",
  "peppylib",

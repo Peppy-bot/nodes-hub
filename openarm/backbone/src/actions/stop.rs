@@ -9,8 +9,10 @@
 
 use std::sync::Arc;
 
+use control_core::serving;
+use peppygen::NodeRunner;
 use peppygen::exposed_services::limb_motion::stop;
-use peppygen::{NodeRunner, Result};
+use peppylib::runtime::CancellationToken;
 use tokio::sync::{mpsc, oneshot};
 use tracing::error;
 
@@ -19,11 +21,13 @@ use crate::coordinator::CoordinatorRequest;
 
 /// Expose `stop`: every request goes to the coordinator, which ends the
 /// moves at the start of its next tick and answers the limbs it stopped.
+/// Serves until `token` cancels.
 pub async fn run_stop(
     runner: Arc<NodeRunner>,
+    token: CancellationToken,
     requests: mpsc::Sender<CoordinatorRequest>,
-) -> Result<()> {
-    loop {
+) {
+    serving::serve("stop", token.cancelled(), || {
         stop::handle_next_request(&runner, |request| {
             let (reply, answer) = oneshot::channel();
             let stopped = blocking_ask_coordinator(
@@ -40,6 +44,6 @@ pub async fn run_stop(
             })?;
             Ok(stop::Response::new(stopped))
         })
-        .await?;
-    }
+    })
+    .await;
 }

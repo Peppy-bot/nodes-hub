@@ -22,7 +22,7 @@ from lerobot_recorder.__main__ import (
 )
 from lerobot_recorder.plan import LinkKind, PairingEnd, SourceEntry, SourceKey
 from lerobot_recorder.recording import Cache, GripperSample, JointSample
-from tests.test_recording import (
+from tests.support import (
     NOW_NS,
     action_entry,
     joint_entry,
@@ -329,15 +329,12 @@ def test_a_session_json_without_links_is_refused(tmp_path):
     assert raised.value.kind is resume_session.FailureKind.REJECTED
 
 
-def test_setup_discovers_the_seeded_membership_inline(tmp_path):
-    """The boot config seeds the observer slots before the process starts, so
-    setup reads the robot's shape directly and the session exists the moment
-    setup returns; nothing is deferred behind Running anymore. The scripted
-    membership arrives through setup's injection points: one arm pairing,
-    no grippers, no cameras."""
-    from lerobot_recorder.plan import BoundSources, LinkKind
+def one_arm_sources(_runner):
+    """The launch membership setup reads: one arm pairing, no grippers, no
+    cameras."""
+    from lerobot_recorder.plan import BoundSources
 
-    bound = BoundSources(
+    return BoundSources(
         limbs=(
             (
                 LinkKind.JOINT,
@@ -350,9 +347,17 @@ def test_setup_discovers_the_seeded_membership_inline(tmp_path):
         rgbd_producers=(),
     )
 
-    async def clock_ready(_runner):
-        return None
 
+async def clock_ready(_runner):
+    return None
+
+
+def test_setup_discovers_the_seeded_membership_inline(tmp_path):
+    """The boot config seeds the observer slots before the process starts, so
+    setup reads the robot's shape directly and the session exists the moment
+    setup returns; nothing is deferred behind Running anymore. The scripted
+    membership arrives through setup's injection points: one arm pairing,
+    no grippers, no cameras."""
     runner = SimpleNamespace(
         cancellation_token=lambda: NeverCancelledToken(), on_shutdown=lambda _hook: None
     )
@@ -364,7 +369,7 @@ def test_setup_discovers_the_seeded_membership_inline(tmp_path):
     async def run():
         tasks = await asyncio.wait_for(
             main_mod.setup(
-                params, runner, read_sources=lambda _r: bound, clock_init=clock_ready
+                params, runner, read_sources=one_arm_sources, clock_init=clock_ready
             ),
             timeout=5.0,
         )
@@ -376,14 +381,24 @@ def test_setup_discovers_the_seeded_membership_inline(tmp_path):
     asyncio.run(run())
 
 
-def test_setup_refuses_unusable_parameters(tmp_path):
-    runner = SimpleNamespace(cancellation_token=lambda: NeverCancelledToken())
+def test_setup_refuses_unusable_parameters_before_writing_anything(tmp_path):
+    """A refused launch leaves the storage root as it found it. The sources
+    and the clock are ready, so the launch gets as far as opening the session
+    unless a parameter is refused first."""
+    runner = SimpleNamespace(
+        cancellation_token=lambda: NeverCancelledToken(), on_shutdown=lambda _hook: None
+    )
     for bad in (
         make_params(storage_root=str(tmp_path), fps=0),
         make_params(storage_root=str(tmp_path), image_writer_threads=0),
+        make_params(storage_root=str(tmp_path), max_staleness_s=0.0),
+        make_params(storage_root=str(tmp_path), max_staleness_s=float("nan")),
     ):
         with pytest.raises(ValueError, match="must be positive"):
-            asyncio.run(main_mod.setup(bad, runner))
+            asyncio.run(
+                main_mod.setup(bad, runner, read_sources=one_arm_sources, clock_init=clock_ready)
+            )
+        assert list(tmp_path.iterdir()) == []
 
 
 def test_resolving_a_session_validates_the_operator_supplied_name(tmp_path):

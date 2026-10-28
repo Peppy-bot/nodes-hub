@@ -2,7 +2,8 @@
 
 Owns the server lifecycle only; what an XR frame is lives in `devices`, so the
 clutch and publishers never import a web stack. teleop_xr serves the page at
-'/' itself; the routes behind the page's Robot card are `robot_choice`'s.
+'/' itself; the routes behind the page's Robot card are `robot_choice`'s,
+and the task page beside it is `task_page`'s.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ from fastapi import APIRouter, FastAPI
 from teleop_xr.config import TeleopSettings, ViewConfig
 from teleop_xr.video_stream import VideoSource
 
-from xr_commander.bus import log
+from xr_commander.bus import REAL_CLOCK, log
 from xr_commander.devices import XrFrame, parse_hands
 
 _SERVER_START_TIMEOUT_S = 5.0
@@ -121,7 +122,7 @@ class XrSession:
     def _on_xr_update(self, _pose, message) -> None:
         devices = (message or {}).get("devices") or []
         frame = XrFrame(
-            received_monotonic_s=time.monotonic(),
+            received_monotonic_s=REAL_CLOCK.monotonic(),
             hands=parse_hands(devices),
         )
         with self._lock:

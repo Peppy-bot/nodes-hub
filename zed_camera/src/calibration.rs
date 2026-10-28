@@ -6,6 +6,8 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use crate::resolution::Resolution;
+
 /// Where Stereolabs publishes the per-serial factory calibration.
 const CALIBRATION_HOST: &str = "https://calib.stereolabs.com/";
 /// Time to establish the connection before giving up.
@@ -76,21 +78,11 @@ pub struct StereoConf {
     pub rz: f64,
 }
 
-/// The conf section/key suffix for a full eye width (VGA/HD/FHD/2K).
-pub fn resolution_key(eye_width: u32) -> &'static str {
-    match eye_width {
-        2208 => "2K",
-        1920 => "FHD",
-        672 => "VGA",
-        _ => "HD",
-    }
-}
-
 impl StereoConf {
     /// Parse the calibration for one resolution from conf text.
-    pub fn from_conf_str(text: &str, res_key: &str) -> Result<Self, String> {
+    pub fn from_conf_str(text: &str, resolution: Resolution) -> Result<Self, String> {
         let ini = parse_ini(text);
-        let res = res_key.to_ascii_lowercase();
+        let res = resolution.conf_key().to_ascii_lowercase();
         let get = |section: &str, key: &str| -> Result<Option<f64>, String> {
             match ini.get(&(section.to_string(), key.to_string())) {
                 Some(v) if !v.is_finite() => {
@@ -240,7 +232,7 @@ mod tests {
                     [RIGHT_CAM_HD]\nfx=1\nfy=1\ncx=1\ncy=1\n\
                     [STEREO]\nBaseline=62.902\nCV_HD=0.004\nRZ_HD=-0.0005\n";
         assert!(
-            StereoConf::from_conf_str(conf, "HD")
+            StereoConf::from_conf_str(conf, Resolution::Hd720)
                 .unwrap_err()
                 .contains("missing rx_hd")
         );
@@ -249,7 +241,7 @@ mod tests {
     #[test]
     fn rejects_a_body_without_calibration_geometry() {
         assert!(
-            StereoConf::from_conf_str("<html>301 Moved Permanently</html>", "HD")
+            StereoConf::from_conf_str("<html>301 Moved Permanently</html>", Resolution::Hd720)
                 .unwrap_err()
                 .contains("missing fx")
         );
@@ -272,7 +264,7 @@ mod tests {
         ];
         for (valid, broken, expected_error) in cases {
             let poisoned = base.replace(valid, broken);
-            let err = StereoConf::from_conf_str(&poisoned, "HD").unwrap_err();
+            let err = StereoConf::from_conf_str(&poisoned, Resolution::Hd720).unwrap_err();
             assert!(err.contains(expected_error), "got: {err}");
         }
     }
@@ -283,7 +275,7 @@ mod tests {
                     k1=-0.03\nk2=-0.004\nk3=0.037\nk4=-0.02\n\
                     [RIGHT_CAM_HD]\nfx=770.8\nfy=770.6\ncx=644.6\ncy=345.6\nk1=-0.03\nk2=-0.004\nk3=0.02\n\
                     [STEREO]\nBaseline=62.902\nTY=0.062\nTZ=-0.0006\nRX_HD=-0.0023\nCV_HD=0.0046\nRZ_HD=-0.0005\n";
-        let s = StereoConf::from_conf_str(conf, resolution_key(1280)).unwrap();
+        let s = StereoConf::from_conf_str(conf, Resolution::Hd720).unwrap();
         assert_eq!(s.left.fx, 772.22);
         assert_eq!(s.left.cx, 636.985);
         assert_eq!(s.baseline, 62.902);

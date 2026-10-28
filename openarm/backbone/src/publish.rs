@@ -16,8 +16,10 @@
 
 use std::future::Future;
 use std::sync::Mutex;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use control_core::throttle::Throttle;
+use openarm_description::{ArmPair, Side};
 use peppygen::NodeRunner;
 use peppygen::emitted_topics::collision_status::collision_status;
 use peppygen::emitted_topics::limb_state::limb_states;
@@ -26,19 +28,18 @@ use peppygen::paired_topics::{
     leader_right_arm_pose, leader_right_gripper, left_arm, left_gripper, right_arm, right_gripper,
 };
 use peppylib::{Payload, TopicPublisher};
+use srs_model::JointVec;
 use srs_model::nalgebra::Isometry3;
 use tokio::sync::watch;
 use tracing::{error, warn};
 
-use crate::arm_pair::ArmPair;
 use crate::camera_mounts::MeasuredGrasps;
-use crate::streams::{GripperState, warn_throttled};
-use crate::types::{JointVec, arm_pose_arrays, limb_names, world_pose_arrays};
+use crate::streams::{GripperState, THROTTLED_WARN_PERIOD};
+use crate::types::{arm_pose_arrays, limb_names, world_pose_arrays};
 
-/// Pairing timestamp from this instance's bound clock, so consumers age
-/// samples on the same timeline they read. Errors until the clock delivers
-/// its first tick.
-fn pairing_timestamp() -> Result<SystemTime, String> {
+/// Now on this instance's bound clock: the timeline its messages are
+/// stamped and aged on. Errors until the clock delivers its first tick.
+fn clock_now() -> Result<SystemTime, String> {
     let ns = peppygen::clock::now_ns().map_err(|e| format!("clock not ready: {e}"))?;
     Ok(UNIX_EPOCH + Duration::from_nanos(ns))
 }
@@ -76,7 +77,7 @@ type LimbStateBuild = fn(
 
 /// One whole-robot state snapshot, gathered by the coordinator at the readout
 /// cadence: every limb's measured joints, grasp-point pose, and gripper
-/// opening, left-then-right like every [`ArmPair`].
+/// opening, in [`Side::BOTH`] order like every [`ArmPair`].
 pub struct LimbStateSnapshot {
     pub joints: ArmPair<JointVec>,
     pub poses: ArmPair<Isometry3<f64>>,
@@ -88,7 +89,7 @@ pub struct LimbStateSnapshot {
 pub struct Publisher<Build> {
     publisher: TopicPublisher,
     build: Build,
-    what: &'static str,
+    what: String,
     /// Throttles this slot's failure logs: a stalled clock or a persistently
     /// failing wire hits every cycle, and the log must say so once per
     /// [`crate::streams::THROTTLED_WARN_PERIOD`] per slot, not at the control
@@ -96,20 +97,20 @@ pub struct Publisher<Build> {
     /// or fails to publish, never both). A mutex only because the coordinator
     /// future must be `Send`; it is touched exclusively on error paths, by one
     /// task.
-    last_error: Mutex<Option<Instant>>,
+    error_log: Mutex<Throttle>,
 }
 
 impl<Build> Publisher<Build> {
     async fn declare(
-        what: &'static str,
+        what: String,
         declaring: impl Future<Output = peppygen::Result<TopicPublisher>>,
         build: Build,
     ) -> peppygen::Result<Self> {
         Ok(Self {
-            publisher: declare(what, declaring).await?,
+            publisher: declare(&what, declaring).await?,
             build,
             what,
-            last_error: Mutex::new(None),
+            error_log: Mutex::new(Throttle::new(THROTTLED_WARN_PERIOD)),
         })
     }
 }
@@ -195,11 +196,11 @@ impl Publisher<LimbStateBuild> {
                 timestamp,
                 names.arm_names,
                 names.joints_per_arm,
-                [s.joints.left, s.joints.right].concat(),
+                Side::BOTH.map(|side| s.joints[side]).concat(),
                 positions,
                 orientations,
                 names.gripper_names,
-                vec![s.openings.left, s.openings.right],
+                Side::BOTH.map(|side| s.openings[side]).to_vec(),
             )
         })
         .await
@@ -209,8 +210,10 @@ impl Publisher<LimbStateBuild> {
 impl<Build> Publisher<Build> {
     /// Emit one failure line for this slot, at most once per throttle window.
     fn log_throttled(&self, emit: impl FnOnce()) {
-        let mut last = self.last_error.lock().expect("no panic while logging");
-        warn_throttled(&mut last, emit);
+        let mut error_log = self.error_log.lock().expect("no panic while logging");
+        if error_log.admit() {
+            emit();
+        }
     }
 
     /// Stamp, build and publish, naming the slot in either failure. A publish
@@ -222,7 +225,7 @@ impl<Build> Publisher<Build> {
         &self,
         build: impl FnOnce(SystemTime) -> peppygen::Result<Payload>,
     ) -> Option<SystemTime> {
-        let stamped = pairing_timestamp().and_then(|timestamp| {
+        let stamped = clock_now().and_then(|timestamp| {
             build(timestamp)
                 .map(|msg| (timestamp, msg))
                 .map_err(|e| e.to_string())
@@ -274,13 +277,13 @@ impl Publishers {
             measured_grasps,
             arm_setpoints: ArmPair::new(
                 Publisher::declare(
-                    "left joint_setpoints",
+                    format!("{} joint_setpoints", Side::Left),
                     left_arm::joint_setpoints::declare_publisher(runner),
                     left_arm::joint_setpoints::build_message as JointBuild,
                 )
                 .await?,
                 Publisher::declare(
-                    "right joint_setpoints",
+                    format!("{} joint_setpoints", Side::Right),
                     right_arm::joint_setpoints::declare_publisher(runner),
                     right_arm::joint_setpoints::build_message as JointBuild,
                 )
@@ -288,13 +291,13 @@ impl Publishers {
             ),
             gripper_setpoints: ArmPair::new(
                 Publisher::declare(
-                    "left gripper_setpoints",
+                    format!("{} gripper_setpoints", Side::Left),
                     left_gripper::gripper_setpoints::declare_publisher(runner),
                     left_gripper::gripper_setpoints::build_message as OpeningBuild,
                 )
                 .await?,
                 Publisher::declare(
-                    "right gripper_setpoints",
+                    format!("{} gripper_setpoints", Side::Right),
                     right_gripper::gripper_setpoints::declare_publisher(runner),
                     right_gripper::gripper_setpoints::build_message as OpeningBuild,
                 )
@@ -302,13 +305,13 @@ impl Publishers {
             ),
             arm_states: ArmPair::new(
                 Publisher::declare(
-                    "upstream left joint_states",
+                    format!("upstream {} joint_states", Side::Left),
                     leader_left_arm::joint_states::declare_publisher(runner),
                     leader_left_arm::joint_states::build_message as JointBuild,
                 )
                 .await?,
                 Publisher::declare(
-                    "upstream right joint_states",
+                    format!("upstream {} joint_states", Side::Right),
                     leader_right_arm::joint_states::declare_publisher(runner),
                     leader_right_arm::joint_states::build_message as JointBuild,
                 )
@@ -316,13 +319,13 @@ impl Publishers {
             ),
             gripper_states: ArmPair::new(
                 Publisher::declare(
-                    "upstream left gripper_states",
+                    format!("upstream {} gripper_states", Side::Left),
                     leader_left_gripper::gripper_states::declare_publisher(runner),
                     leader_left_gripper::gripper_states::build_message as ApertureBuild,
                 )
                 .await?,
                 Publisher::declare(
-                    "upstream right gripper_states",
+                    format!("upstream {} gripper_states", Side::Right),
                     leader_right_gripper::gripper_states::declare_publisher(runner),
                     leader_right_gripper::gripper_states::build_message as ApertureBuild,
                 )
@@ -330,26 +333,26 @@ impl Publishers {
             ),
             arm_pose_states: ArmPair::new(
                 Publisher::declare(
-                    "upstream left pose_states",
+                    format!("upstream {} pose_states", Side::Left),
                     leader_left_arm_pose::pose_states::declare_publisher(runner),
                     leader_left_arm_pose::pose_states::build_message as PoseBuild,
                 )
                 .await?,
                 Publisher::declare(
-                    "upstream right pose_states",
+                    format!("upstream {} pose_states", Side::Right),
                     leader_right_arm_pose::pose_states::declare_publisher(runner),
                     leader_right_arm_pose::pose_states::build_message as PoseBuild,
                 )
                 .await?,
             ),
             status: Publisher::declare(
-                "collision_status",
+                "collision_status".to_owned(),
                 collision_status::declare_publisher(runner),
                 collision_status::build_message as StatusBuild,
             )
             .await?,
             limb_states: Publisher::declare(
-                "limb_states",
+                "limb_states".to_owned(),
                 limb_states::declare_publisher(runner),
                 limb_states::build_message as LimbStateBuild,
             )

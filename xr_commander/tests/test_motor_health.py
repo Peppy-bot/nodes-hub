@@ -1,15 +1,15 @@
 import asyncio
 import math
+from types import SimpleNamespace
 
 import pytest
 from peppygen.consumed_topics.motor_health import motor_health as motor_health_topic
 
-from tests.helpers import FakeToken, boot, eventually, running_drain
+from tests.helpers import FakeToken, StubTopic, boot, eventually, running_drain
 from xr_commander.motor_health import (
     HEALTH_STALE_AFTER_MS,
-    NOT_REPORTING,
-    WARNING,
     HealthRow,
+    Level,
     MotorHealthReports,
     drain_motor_health,
     health_rows,
@@ -18,6 +18,9 @@ from xr_commander.motor_health import (
 STALE_AFTER_S = HEALTH_STALE_AFTER_MS / 1000.0
 
 ARM_LEVELS = (0, 0, 0, 0, 0, 0, 0)
+
+# The core node every store-level report comes from.
+CORE = "core"
 
 
 def report(
@@ -38,7 +41,7 @@ def report(
         "winding_temp_c": (31.0,) * count,
     } | readings
     store.update(
-        instance,
+        (CORE, instance),
         levels,
         values["effort_fraction_rated"],
         values["effort_fraction_rated_sustained"],
@@ -100,7 +103,7 @@ def test_a_non_finite_reading_is_refused():
 def test_wire_levels_arrive_as_bytes_and_are_accepted():
     # The generated module deserializes the u8 vector as bytes.
     store = MotorHealthReports()
-    store.update("left_arm", bytes(ARM_LEVELS), (), (), (), (), ())
+    store.update((CORE, "left_arm"), bytes(ARM_LEVELS), (), (), (), (), ())
     assert len(store.by_instance()) == 1
 
 
@@ -119,7 +122,10 @@ def test_an_instance_never_received_renders_nothing():
 @pytest.mark.parametrize("prefix", ["", "alpha_", "right_"])
 def test_instances_follow_configured_producer_order(prefix):
     store = MotorHealthReports(
-        bound_now=lambda: (f"{prefix}right_arm_inst", f"{prefix}left_gripper_inst")
+        bound_now=lambda: (
+            (CORE, f"{prefix}right_arm_inst"),
+            (CORE, f"{prefix}left_gripper_inst"),
+        )
     )
     report(store, instance=f"{prefix}left_gripper_inst", levels=(0,))
     report(store, instance=f"{prefix}right_arm_inst")
@@ -150,7 +156,7 @@ def test_a_stale_instance_collapses_to_one_not_reporting_row():
     clock["now"] += 0.001
     rows = health_rows(store.by_instance())
     assert [row.text for row in rows] == ["LEFT ARM not reporting"]
-    assert rows[0].level == NOT_REPORTING
+    assert rows[0].level == Level.NOT_REPORTING
 
 
 def test_a_re_emit_refreshes_the_staleness_clock():
@@ -195,13 +201,13 @@ def test_a_single_motor_instance_is_one_row_carrying_its_name():
     report(store, instance="left_gripper", levels=(1,))
     (row,) = health_rows(store.by_instance())
     assert row.text.startswith("LEFT GRIPPER WARNING")
-    assert row.level == WARNING
+    assert row.level == Level.WARNING
 
 
 def test_a_sensed_motor_row_reads_compactly():
     store = MotorHealthReports()
     store.update(
-        "left_arm",
+        (CORE, "left_arm"),
         (0, 1, 0, 0, 0, 0, 0),
         (0.10, 0.96, 0.10, 0.10, 0.10, 0.10, 0.10),
         (0.09, 0.93, 0.09, 0.09, 0.09, 0.09, 0.09),
@@ -212,21 +218,21 @@ def test_a_sensed_motor_row_reads_compactly():
     rows = health_rows(store.by_instance())
     assert rows[0].text == "LEFT ARM (6 nominal)"
     assert rows[1].text == "j2 WARNING peak 48% rated 96% sust 93% 41C/38C"
-    assert rows[1].level == WARNING
+    assert rows[1].level == Level.WARNING
 
 
 def test_an_unsensed_report_shows_state_words_only():
     store = MotorHealthReports()
-    store.update("left_arm", (0, 4, 0, 0, 0, 0, 0), (), (), (), (), ())
+    store.update((CORE, "left_arm"), (0, 4, 0, 0, 0, 0, 0), (), (), (), (), ())
     rows = health_rows(store.by_instance())
     assert rows[0].text == "LEFT ARM (6 nominal)"
     assert rows[1].text == "j2 NOT REPORTING"
-    assert rows[1].level == NOT_REPORTING
+    assert rows[1].level == Level.NOT_REPORTING
 
 
 def test_an_unsensed_all_nominal_report_is_the_bare_state_word():
     store = MotorHealthReports()
-    store.update("left_arm", (0,) * 7, (), (), (), (), ())
+    store.update((CORE, "left_arm"), (0,) * 7, (), (), (), (), ())
     (row,) = health_rows(store.by_instance())
     assert row == HealthRow("LEFT ARM nominal", 0)
 
@@ -336,9 +342,36 @@ async def test_a_malformed_producer_is_reported_once_not_every_report(capsys):
         assert by_name[good_id].levels == (0,) * 7
 
 
+async def test_one_instance_id_on_two_core_nodes_is_two_producers(capsys):
+    # Two stacks on one mesh may each run a `left_arm_inst`. Every harness
+    # mock shares the harness's core node, so the producers are scripted.
+    # core-a's instance sends a bad report, core-b's a good one, then core-a's
+    # a bad one and a good one. The test checks that both producers' reports
+    # are stored and that core-a's bad reports log one refusal.
+    here = SimpleNamespace(core_node="core-a", instance_id="left_arm_inst")
+    there = SimpleNamespace(core_node="core-b", instance_id="left_arm_inst")
+    bad = _wire(levels=(9,) * 7)
+    store = MotorHealthReports()
+    async with running_drain(
+        lambda token: drain_motor_health(
+            None,
+            StubTopic(
+                [(here, bad), (there, _wire()), (here, bad), (here, _wire((0,)))]
+            ),
+            store,
+            token,
+        )
+    ):
+        await eventually(
+            lambda: len(store.by_instance()) == 2, message="both producers' reports"
+        )
+    assert [len(entry.report.levels) for entry in store.by_instance()] == [1, 7]
+    assert capsys.readouterr().out.count("unusable") == 1
+
+
 def test_an_unwired_health_slot_is_distinguishable_from_a_quiet_one():
     unwired = MotorHealthReports(bound_now=lambda: ())
-    wired = MotorHealthReports(bound_now=lambda: ("motor_inst",))
+    wired = MotorHealthReports(bound_now=lambda: ((CORE, "motor_inst"),))
     assert unwired.by_instance() == wired.by_instance() == ()
     assert not unwired.producers_bound
     assert wired.producers_bound

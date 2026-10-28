@@ -1,25 +1,23 @@
-// KER wire protocol: pure byte parsing, no transport. The device (an M5Stack
-// CoreS3) speaks a small framed protocol over USB vendor mode or the ESP32's
-// serial device:
-//
-// - Host commands are single bytes (`CMD_*`).
-// - The PING response (`PING_HEADER`) carries device metadata and a
-//   self-describing schema: firmware[16] hardware[16] updated[12] (NUL-padded
-//   utf8), a field count, then per field a key[16], a type id and an element
-//   count.
-// - Stream packets (`STREAM_HEADER`) carry the schema's fields packed
-//   little-endian, followed by one XOR checksum byte over the payload.
-//
-// Parsing is staged parse-don't-validate: `Schema::parse_ping` turns the
-// handshake bytes into a typed [`Schema`] once, [`FrameLayout::try_new`]
-// resolves the field offsets this node consumes once (failing loudly on an
-// incompatible schema), and per packet only `Deframer` + [`FrameLayout::parse`]
-// run, both infallible on checksum-verified payloads.
-//
-// Under `cfg(test)` this module also carries `fixtures`, the device-side byte
-// builders this crate's tests share (they need the field widths above).
-
-use std::fmt;
+//! KER wire protocol: pure byte parsing, no transport. The device (an M5Stack
+//! CoreS3) speaks a small framed protocol over USB vendor mode or the ESP32's
+//! serial device:
+//!
+//! - Host commands are single bytes (`CMD_*`).
+//! - The PING response (`PING_HEADER`) carries device metadata and a
+//!   self-describing schema: firmware[16] hardware[16] updated[12] (NUL-padded
+//!   utf8), a field count, then per field a key[16], a type id and an element
+//!   count.
+//! - Stream packets (`STREAM_HEADER`) carry the schema's fields packed
+//!   little-endian, followed by one XOR checksum byte over the payload.
+//!
+//! Parsing is staged parse-don't-validate: `Schema::parse_ping` turns the
+//! handshake bytes into a typed [`Schema`] once, [`FrameLayout::try_new`]
+//! resolves the field offsets this node consumes once (failing loudly on an
+//! incompatible schema), and per packet only `Deframer` + [`FrameLayout::parse`]
+//! run, both infallible on checksum-verified payloads.
+//!
+//! Under `cfg(test)` this module also carries `fixtures`, the device-side byte
+//! builders this crate's tests share (they need the field widths above).
 
 pub const CMD_PING: u8 = 0x00;
 pub const CMD_STANDBY: u8 = 0x01;
@@ -52,27 +50,16 @@ enum Candidate {
     NotAResponse,
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
+    #[error("schema is missing the '{0}' field")]
     MissingField(&'static str),
+    #[error("schema field '{key}' is not {expected}")]
     WrongFieldType {
         key: &'static str,
         expected: &'static str,
     },
 }
-
-impl fmt::Display for ProtocolError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::MissingField(key) => write!(f, "schema is missing the '{key}' field"),
-            Self::WrongFieldType { key, expected } => {
-                write!(f, "schema field '{key}' is not {expected}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ProtocolError {}
 
 /// A stream field's element type, from the schema's type id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -626,6 +613,22 @@ mod tests {
             FrameLayout::try_new(&wrong_type),
             Err(ProtocolError::WrongFieldType { key: "angles", .. })
         ));
+    }
+
+    #[test]
+    fn a_schema_refusal_names_the_field() {
+        assert_eq!(
+            ProtocolError::MissingField("angles").to_string(),
+            "schema is missing the 'angles' field"
+        );
+        assert_eq!(
+            ProtocolError::WrongFieldType {
+                key: "angles",
+                expected: "f32"
+            }
+            .to_string(),
+            "schema field 'angles' is not f32"
+        );
     }
 
     #[test]

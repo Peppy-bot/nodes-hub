@@ -5,7 +5,10 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from peppygen.consumed_actions.postures import move_to_home, move_to_ready
+from peppygen.paired_topics.left_arm import pose_setpoints as left_arm_pose_setpoints
+from peppygen.paired_topics.left_gripper import (
+    gripper_setpoints as left_gripper_setpoints,
+)
 from peppygen.paired_topics.right_arm import pose_setpoints as right_arm_pose_setpoints
 from peppygen.paired_topics.right_arm import pose_states as right_arm_pose_states
 from peppygen.paired_topics.right_gripper import (
@@ -14,20 +17,33 @@ from peppygen.paired_topics.right_gripper import (
 
 from tests.helpers import (
     POSE,
-    FakeSubscription,
+    FakeCalls,
+    FakeStops,
     FakeToken,
+    ManualClock,
+    ScriptedHeadset,
+    StubTopic,
     boot,
     boot_clocked,
-    default_parameters,
+    default_settings,
     eventually,
+    following_fleet,
     peer_of,
-    press_until_goal,
     robots_of,
+    running,
     running_drain,
+    scripted_driver,
+    settle,
 )
-from xr_commander import config, publish
+from xr_commander import publish
+from xr_commander.bus import REAL_CLOCK, FlashNote
 from xr_commander.clutch import HandClutch
-from xr_commander.devices import HandSample, XrFrame
+from xr_commander.devices import (
+    HandSample,
+    XrFrame,
+)
+from xr_commander.drive import Driver, HandState
+from xr_commander.fleet import Timing
 from xr_commander.frames import Pose
 
 
@@ -49,329 +65,6 @@ ONE_ROBOT = {
 }
 
 
-def posture_settings():
-    return config.from_parameters(default_parameters())
-
-
-def done(module):
-    """A posture result as a robot sends it. The commander reads only how the
-    goal ended, thus the arm pose in it is a fixed value."""
-    return module.ResultResponseData(
-        arm_names=["right_arm"],
-        positions=[0.3, -0.2, 0.3],
-        orientations=[0.0, 0.0, 0.0, 1.0],
-    )
-
-
-class FakeSession:
-    """A scripted headset: the FrameSource seam is a device surface, not a
-    generated module, so tests feed it hand states directly."""
-
-    def __init__(self):
-        self.hands = {}
-
-    def press(self, **hands):
-        self.hands = {
-            side: HandSample(
-                pose=POSE,
-                squeezing=squeeze,
-                trigger=0.0,
-                primary_button=primary,
-                secondary_button=secondary,
-            )
-            for side, (primary, secondary, squeeze) in hands.items()
-        }
-
-    def latest(self):
-        return XrFrame(received_monotonic_s=time.monotonic(), hands=self.hands)
-
-
-def _primary(sample):
-    return sample.primary_button
-
-
-def _secondary(sample):
-    return sample.secondary_button
-
-
-def boot_postures():
-    """A stack whose one paired robot, outside any copy, offers the
-    postures: the same instance id names the pair and the producer."""
-    return boot(
-        postures_instance_ids=["backbone_inst"],
-        right_arm_members={"backbone_inst": None},
-    )
-
-
-@contextlib.asynccontextmanager
-async def posture_button(h, *, action_module, pressed, status=None):
-    """`run_posture_button` running against the real runner; yields the
-    scripted headset session."""
-    session = FakeSession()
-    token = FakeToken()
-    task = asyncio.create_task(
-        publish.run_posture_button(
-            h.node_runner,
-            action_module=action_module,
-            pressed=pressed,
-            session=session,
-            robots=robots_of(h),
-            status=status or publish.PostureStatus(),
-            settings=posture_settings(),
-            token=token,
-        )
-    )
-    try:
-        yield session
-    finally:
-        token.cancel()
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
-
-
-async def test_a_posture_move_shows_in_flight_then_its_outcome():
-    async with boot_postures() as h:
-        mock = h.mocks.deps.postures[0].move_to_home
-        status = publish.PostureStatus()
-        async with posture_button(
-            h, action_module=move_to_home, pressed=_primary, status=status
-        ) as session:
-            session.press(right=(False, False, False))
-            await asyncio.sleep(0.05)
-            session.press(right=(True, False, False))
-            pending = await mock.next_goal(10.0)
-            active = await pending.accept()
-            await eventually(lambda: status.state() == "moving to home...")
-            await active.complete(done(move_to_home))
-            await eventually(lambda: status.state() == "move to home completed")
-            assert status.moving is None
-
-
-async def test_a_failed_move_flashes_the_robots_reason():
-    async with boot_postures() as h:
-        mock = h.mocks.deps.postures[0].move_to_home
-        status = publish.PostureStatus()
-        async with posture_button(
-            h, action_module=move_to_home, pressed=_primary, status=status
-        ) as session:
-            session.press(right=(False, False, False))
-            await asyncio.sleep(0.05)
-            session.press(right=(True, False, False))
-            pending = await mock.next_goal(10.0)
-            active = await pending.accept()
-            await active.fail(
-                move_to_home.FailureKind.RESOURCE_UNAVAILABLE,
-                "the follower stopped reporting; check the arm's bus",
-            )
-            await eventually(
-                lambda: (
-                    status.state() == "move to home failed: the follower stopped reporting"
-                )
-            )
-
-
-async def test_a_press_while_another_posture_runs_is_ignored_and_says_so():
-    async with boot_postures() as h:
-        home = h.mocks.deps.postures[0].move_to_home
-        ready = h.mocks.deps.postures[0].move_to_ready
-        status = publish.PostureStatus()
-        async with (
-            posture_button(
-                h, action_module=move_to_home, pressed=_primary, status=status
-            ) as session_a,
-            posture_button(
-                h, action_module=move_to_ready, pressed=_secondary, status=status
-            ) as session_b,
-        ):
-            session_a.press(right=(False, False, False))
-            session_b.press(right=(False, False, False))
-            await asyncio.sleep(0.05)
-            session_a.press(right=(True, False, False))
-            pending = await home.next_goal(10.0)
-            active = await pending.accept()
-            await eventually(lambda: status.moving == "home")
-            session_b.press(right=(False, True, False))
-            await eventually(
-                lambda: status.state() == "move to ready ignored: still moving to home"
-            )
-            with pytest.raises(TimeoutError):
-                await ready.next_goal(0.4)
-            await active.complete(done(move_to_home))
-            await eventually(lambda: status.state() == "move to home completed")
-
-
-async def test_a_refused_posture_flashes_its_cause():
-    async with boot_postures() as h:
-        mock = h.mocks.deps.postures[0].move_to_home
-        status = publish.PostureStatus()
-        async with posture_button(
-            h, action_module=move_to_home, pressed=_primary, status=status
-        ) as session:
-            session.press(right=(False, False, False))
-            await asyncio.sleep(0.05)
-            session.press(right=(True, False, False))
-            pending = await mock.next_goal(10.0)
-            await pending.refuse(
-                move_to_home.FailureKind.LEADER_STREAMING,
-                "a leader is streaming arm commands; release the headset's grip, then retry",
-            )
-            await eventually(
-                lambda: (
-                    status.state()
-                    == "move to home refused: a leader is streaming arm commands"
-                )
-            )
-            assert status.moving is None
-
-
-def test_the_result_wait_scales_with_long_posture_moves():
-    assert publish._result_timeout_s(2.0) == 120.0
-    assert publish._result_timeout_s(100.0) == 300.0
-
-
-async def test_the_button_fires_once_per_rising_edge():
-    async with boot_postures() as h:
-        mock = h.mocks.deps.postures[0].move_to_home
-        async with posture_button(
-            h, action_module=move_to_home, pressed=_primary
-        ) as session:
-            session.press(right=(False, False, False))
-            await asyncio.sleep(0.05)
-            session.press(right=(True, False, False))
-            pending = await mock.next_goal(10.0)
-            # The goal reached the real move_to_home producer, carrying the
-            # configured posture duration.
-            assert pending.request.duration_s == 2.0
-            active = await pending.accept()
-            # Still held: one edge, one goal.
-            with pytest.raises(TimeoutError):
-                await mock.next_goal(0.4)
-            await active.complete(done(move_to_home))
-
-
-async def test_squeezing_cancels_the_move_in_flight():
-    async with boot_postures() as h:
-        mock = h.mocks.deps.postures[0].move_to_home
-        status = publish.PostureStatus()
-        async with posture_button(
-            h, action_module=move_to_home, pressed=_primary, status=status
-        ) as session:
-            session.press(right=(False, False, False))
-            await asyncio.sleep(0.05)
-            session.press(right=(True, False, False))
-            pending = await mock.next_goal(10.0)
-            active = await pending.accept()
-            await eventually(lambda: status.moving == "home")
-            # Taking manual control back is the cancel gesture.
-            session.press(right=(False, False, True))
-            await asyncio.wait_for(active.cancel_signal(), 10.0)
-            # The row stops claiming a move as soon as the cancel is delivered.
-            await eventually(lambda: status.moving is None)
-            await active.complete_cancelled("cancelled by its caller", done(move_to_home))
-            await eventually(lambda: status.state() == "move to home cancelled")
-            # The squeeze that cancelled must not have fired a fresh goal.
-            with pytest.raises(TimeoutError):
-                await mock.next_goal(0.4)
-
-
-async def test_a_press_landing_with_a_squeeze_does_not_fire_and_says_to_let_go():
-    async with boot_postures() as h:
-        mock = h.mocks.deps.postures[0].move_to_home
-        status = publish.PostureStatus()
-        async with posture_button(
-            h, action_module=move_to_home, pressed=_primary, status=status
-        ) as session:
-            session.press(right=(False, False, False))
-            await asyncio.sleep(0.05)
-            session.press(right=(True, False, True))
-            with pytest.raises(TimeoutError):
-                await mock.next_goal(0.4)
-            assert status.state() == "move to home ignored: release the grip first"
-
-
-async def test_a_button_already_held_at_first_tracking_does_not_fire():
-    async with boot_postures() as h:
-        mock = h.mocks.deps.postures[0].move_to_home
-        async with posture_button(
-            h, action_module=move_to_home, pressed=_primary
-        ) as session:
-            # A thumb already down on the first tracked frame is not a press.
-            session.press(right=(True, False, False))
-            with pytest.raises(TimeoutError):
-                await mock.next_goal(0.4)
-            # An observed release and then a press is the first real edge.
-            session.press(right=(False, False, False))
-            await asyncio.sleep(0.05)
-            session.press(right=(True, False, False))
-            pending = await mock.next_goal(10.0)
-            await (await pending.accept()).complete(done(move_to_home))
-
-
-async def test_a_stale_gap_does_not_refire_a_held_button():
-    """A dropout while the thumb stays down must not read as a fresh press:
-    the gap makes the input unknown, not released."""
-    async with boot_postures() as h:
-        mock = h.mocks.deps.postures[0].move_to_home
-        async with posture_button(
-            h, action_module=move_to_home, pressed=_primary
-        ) as session:
-            session.press(right=(False, False, False))
-            await asyncio.sleep(0.05)
-            session.press(right=(True, False, False))
-            pending = await mock.next_goal(10.0)
-            await (await pending.accept()).complete(done(move_to_home))
-            # The headset drops out while the thumb stays down...
-            session.hands = {}
-            await asyncio.sleep(0.05)
-            # ...and comes back with the button still held: not a press.
-            session.press(right=(True, False, False))
-            with pytest.raises(TimeoutError):
-                await mock.next_goal(0.4)
-            # A real release and press after the gap re-arms the button.
-            pending = await press_until_goal(
-                session,
-                mock,
-                {"right": (False, False, False)},
-                {"right": (True, False, False)},
-            )
-            await (await pending.accept()).complete(done(move_to_home))
-
-
-async def test_the_selector_decides_which_button_fires_the_action():
-    # Under a secondary-button selector (the real move_to_ready wiring),
-    # primary presses stay quiet and a secondary press fires.
-    async with boot_postures() as h:
-        ready = h.mocks.deps.postures[0].move_to_ready
-        async with posture_button(
-            h, action_module=move_to_ready, pressed=_secondary
-        ) as session:
-            session.press(right=(False, False, False))
-            await asyncio.sleep(0.05)
-            session.press(right=(True, False, False))
-            with pytest.raises(TimeoutError):
-                await ready.next_goal(0.4)
-            session.press(right=(False, False, False))
-            await asyncio.sleep(0.05)
-            session.press(right=(False, True, False))
-            pending = await ready.next_goal(10.0)
-            await (await pending.accept()).complete(done(move_to_ready))
-
-
-@contextlib.asynccontextmanager
-async def _running(make_stream):
-    """One stream task under a hand-fired token, torn down on exit."""
-    token = FakeToken()
-    task = asyncio.create_task(make_stream(token))
-    try:
-        yield
-    finally:
-        token.cancel()
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
-
-
 def test_a_failed_publisher_declaration_ends_the_stream_loudly(capsys):
     # A broken transport cannot be scripted onto the real wire; the stub
     # stands in for the runner refusing the declaration.
@@ -382,7 +75,13 @@ def test_a_failed_publisher_declaration_ends_the_stream_loudly(capsys):
     async def run():
         await asyncio.wait_for(
             publish._run_stream(
-                None, NoPublisherTopic(), 0.001, "left arm", FakeToken(), lambda: None
+                None,
+                NoPublisherTopic(),
+                0.001,
+                "left arm",
+                FakeToken(),
+                lambda: None,
+                REAL_CLOCK,
             ),
             1.0,
         )
@@ -393,17 +92,18 @@ def test_a_failed_publisher_declaration_ends_the_stream_loudly(capsys):
 
 async def test_the_gripper_stream_is_silent_without_the_squeeze_deadman():
     async with boot_clocked(**ONE_ROBOT) as h:
-        session = FakeSession()
+        hand = HandState(FlashNote())
+        session = ScriptedHeadset()
         session.press(right=(False, False, False))
-        async with _running(
+        async with running(
             lambda token: publish.stream_gripper(
                 h.node_runner,
                 topic_module=right_gripper_setpoints,
                 handedness="right",
-                squeeze=publish.HeldOverSqueeze(),
+                hand=hand,
                 session=session,
                 robots=robots_of(h),
-                settings=posture_settings(),
+                settings=default_settings(),
                 token=token,
             )
         ):
@@ -413,19 +113,20 @@ async def test_the_gripper_stream_is_silent_without_the_squeeze_deadman():
                 )
 
 
-async def test_the_gripper_stream_publishes_openings_while_squeezing():
+async def test_the_gripper_stream_publishes_openings_while_the_hand_is_engaged():
     async with boot_clocked(**ONE_ROBOT) as h:
-        session = FakeSession()
+        hand = HandState(FlashNote(), engaged=True, robot="backbone_inst")
+        session = ScriptedHeadset()
         session.press(right=(False, False, True))
-        async with _running(
+        async with running(
             lambda token: publish.stream_gripper(
                 h.node_runner,
                 topic_module=right_gripper_setpoints,
                 handedness="right",
-                squeeze=publish.HeldOverSqueeze(),
+                hand=hand,
                 session=session,
                 robots=robots_of(h),
-                settings=posture_settings(),
+                settings=default_settings(),
                 token=token,
             )
         ):
@@ -439,19 +140,22 @@ async def test_the_gripper_stream_publishes_openings_while_squeezing():
 
 async def test_the_pose_stream_refuses_to_engage_without_a_fresh_measured_pose():
     async with boot_clocked(**ONE_ROBOT) as h:
-        session = FakeSession()
+        driver = scripted_driver("backbone_inst")
+        session = ScriptedHeadset()
         session.press(right=(False, False, True))
-        async with _running(
+        async with running(
             lambda token: publish.stream_pose(
                 h.node_runner,
                 topic_module=right_arm_pose_setpoints,
+                gripper_module=right_gripper_setpoints,
                 handedness="right",
+                hand=driver.hands["right"],
+                driver=driver,
                 clutch=HandClutch(1.0),
-                squeeze=publish.HeldOverSqueeze(),
                 session=session,
                 measured=publish.MeasuredPoses(),
                 robots=robots_of(h),
-                settings=posture_settings(),
+                settings=default_settings(),
                 token=token,
             )
         ):
@@ -463,21 +167,24 @@ async def test_the_pose_stream_refuses_to_engage_without_a_fresh_measured_pose()
 
 async def test_the_pose_stream_engages_once_the_follower_reports():
     async with boot_clocked(**ONE_ROBOT) as h:
-        session = FakeSession()
+        driver = scripted_driver("backbone_inst")
+        session = ScriptedHeadset()
         session.press(right=(False, False, True))
         measured = publish.MeasuredPoses()
         measured.set(peer_of(h, right_arm_pose_setpoints), POSE)
-        async with _running(
+        async with running(
             lambda token: publish.stream_pose(
                 h.node_runner,
                 topic_module=right_arm_pose_setpoints,
+                gripper_module=right_gripper_setpoints,
                 handedness="right",
+                hand=driver.hands["right"],
+                driver=driver,
                 clutch=HandClutch(1.0),
-                squeeze=publish.HeldOverSqueeze(),
                 session=session,
                 measured=measured,
                 robots=robots_of(h),
-                settings=posture_settings(),
+                settings=default_settings(),
                 token=token,
             )
         ):
@@ -521,6 +228,7 @@ async def received_within(subscription, seconds: float) -> list:
 
 async def test_a_robot_change_mid_squeeze_releases_the_robot_left_behind_alone():
     async with boot_clocked(**TWO_ROBOTS) as h:
+        driver = scripted_driver("alpha", "bravo")
         robots = robots_of(h)
         peers = peers_by_robot(h, right_arm_pose_setpoints)
         alpha_wire, bravo_wire = (
@@ -530,15 +238,17 @@ async def test_a_robot_change_mid_squeeze_releases_the_robot_left_behind_alone()
         measured.set(peers["alpha"], POSE)
         measured.set(peers["bravo"], Pose(np.array([0.5, 0.0, 0.0]), POSE.orientation))
         session = MovableSession()
-        settings = config.from_parameters(default_parameters(command_rate_hz=200))
+        settings = default_settings(command_rate_hz=200)
         session.press(right=(False, False, True))
-        async with _running(
+        async with running(
             lambda token: publish.stream_pose(
                 h.node_runner,
                 topic_module=right_arm_pose_setpoints,
+                gripper_module=right_gripper_setpoints,
                 handedness="right",
+                hand=driver.hands["right"],
+                driver=driver,
                 clutch=HandClutch(1.0),
-                squeeze=publish.HeldOverSqueeze(),
                 session=session,
                 measured=measured,
                 robots=robots,
@@ -570,23 +280,46 @@ async def test_a_robot_change_mid_squeeze_releases_the_robot_left_behind_alone()
 
 async def test_a_grip_held_across_a_robot_change_leaves_the_new_gripper_alone():
     async with boot_clocked(**TWO_ROBOTS) as h:
+        driver = scripted_driver("alpha", "bravo")
         robots = robots_of(h)
         alpha_wire, bravo_wire = (
             mock.gripper_setpoints for mock in h.mocks.pairings.right_gripper
         )
-        session = FakeSession()
+        measured = publish.MeasuredPoses()
+        for peer in peers_by_robot(h, right_arm_pose_setpoints).values():
+            measured.set(peer, POSE)
+        session = ScriptedHeadset()
         session.press(right=(False, False, True))
-        async with _running(
-            lambda token: publish.stream_gripper(
-                h.node_runner,
-                topic_module=right_gripper_setpoints,
-                handedness="right",
-                squeeze=publish.HeldOverSqueeze(),
-                session=session,
-                robots=robots,
-                settings=posture_settings(),
-                token=token,
-            )
+        settings = default_settings()
+        async with (
+            running(
+                lambda token: publish.stream_pose(
+                    h.node_runner,
+                    topic_module=right_arm_pose_setpoints,
+                    gripper_module=right_gripper_setpoints,
+                    handedness="right",
+                    hand=driver.hands["right"],
+                    driver=driver,
+                    clutch=HandClutch(1.0),
+                    session=session,
+                    measured=measured,
+                    robots=robots,
+                    settings=settings,
+                    token=token,
+                )
+            ),
+            running(
+                lambda token: publish.stream_gripper(
+                    h.node_runner,
+                    topic_module=right_gripper_setpoints,
+                    handedness="right",
+                    hand=driver.hands["right"],
+                    session=session,
+                    robots=robots,
+                    settings=settings,
+                    token=token,
+                )
+            ),
         ):
             await asyncio.wait_for(alpha_wire.next(), 10.0)
             assert robots.choose("bravo")
@@ -597,45 +330,7 @@ async def test_a_grip_held_across_a_robot_change_leaves_the_new_gripper_alone():
             await asyncio.wait_for(bravo_wire.next(), 10.0)
 
 
-async def test_a_posture_press_is_inert_while_the_chosen_robot_offers_none(capsys):
-    async with boot(
-        postures_instance_ids=["backbone_inst"],
-        right_arm_members={"backbone_inst": None, "bravo_backbone_inst": "bravo"},
-    ) as h:
-        mock = h.mocks.deps.postures[0].move_to_home
-        robots = robots_of(h)
-        assert robots.choose("bravo")
-        session = FakeSession()
-        token = FakeToken()
-        status = publish.PostureStatus()
-        task = asyncio.create_task(
-            publish.run_posture_button(
-                h.node_runner,
-                action_module=move_to_home,
-                pressed=_primary,
-                session=session,
-                robots=robots,
-                status=status,
-                settings=posture_settings(),
-                token=token,
-            )
-        )
-        try:
-            session.press(right=(False, False, False))
-            await asyncio.sleep(0.05)
-            session.press(right=(True, False, False))
-            with pytest.raises(TimeoutError):
-                await mock.next_goal(0.4)
-            assert status.state() == "move to home: bravo has no postures"
-        finally:
-            token.cancel()
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
-        assert capsys.readouterr().out.count("bravo has no postures") == 1
-
-
-class FrozenSession(FakeSession):
+class FrozenSession(ScriptedHeadset):
     """A session whose frames stop aging forward: presses stamp once."""
 
     def __init__(self):
@@ -656,10 +351,11 @@ async def test_the_pose_stream_goes_silent_when_frames_stop_mid_squeeze():
     hand, so the release burst fires first and the stream then falls
     permanently silent."""
     async with boot_clocked(**ONE_ROBOT) as h:
+        driver = scripted_driver("backbone_inst")
         session = FrozenSession()
         session.press(right=(False, False, True))
         measured = publish.MeasuredPoses()
-        settings = config.from_parameters(default_parameters(stale_timeout_s=0.05))
+        settings = default_settings(stale_timeout_s=0.05)
         token = FakeToken()
 
         # Measured stays fresh throughout: only the headset link dies.
@@ -673,9 +369,11 @@ async def test_the_pose_stream_goes_silent_when_frames_stop_mid_squeeze():
             publish.stream_pose(
                 h.node_runner,
                 topic_module=right_arm_pose_setpoints,
+                gripper_module=right_gripper_setpoints,
                 handedness="right",
+                hand=driver.hands["right"],
+                driver=driver,
                 clutch=HandClutch(1.0),
-                squeeze=publish.HeldOverSqueeze(),
                 session=session,
                 measured=measured,
                 robots=robots_of(h),
@@ -711,7 +409,7 @@ async def test_the_pose_stream_goes_silent_when_frames_stop_mid_squeeze():
                 await refresher
 
 
-class MovableSession(FakeSession):
+class MovableSession(ScriptedHeadset):
     """A session whose hand pose can be moved, so a driven target is
     distinguishable on the wire from the measured pose."""
 
@@ -739,10 +437,11 @@ async def test_releasing_the_clutch_streams_the_measured_pose_not_the_last_hand_
     the follower stops where it is instead of walking to the last hand
     target."""
     async with boot_clocked(**ONE_ROBOT) as h:
+        driver = scripted_driver("backbone_inst")
         session = MovableSession()
         measured = publish.MeasuredPoses()
         measured.set(peer_of(h, right_arm_pose_setpoints), POSE)
-        settings = config.from_parameters(default_parameters(command_rate_hz=200))
+        settings = default_settings(command_rate_hz=200)
         token = FakeToken()
 
         session.press(right=(False, False, True))
@@ -750,9 +449,11 @@ async def test_releasing_the_clutch_streams_the_measured_pose_not_the_last_hand_
             publish.stream_pose(
                 h.node_runner,
                 topic_module=right_arm_pose_setpoints,
+                gripper_module=right_gripper_setpoints,
                 handedness="right",
+                hand=driver.hands["right"],
+                driver=driver,
                 clutch=HandClutch(1.0),
-                squeeze=publish.HeldOverSqueeze(),
                 session=session,
                 measured=measured,
                 robots=robots_of(h),
@@ -868,11 +569,6 @@ def test_drain_pose_states_survives_garbage():
     # Kept on a stub: every decodable wire message builds a Pose (the schema
     # carries float lists), so the unusable-pose latch is reachable only
     # through a hand-built message the generated modules cannot produce.
-
-    class StubTopic(FakeSubscription):
-        async def subscribe(self, _runner):
-            return self
-
     good = SimpleNamespace(position=[0.1, 0.2, 0.3], orientation=[0, 0, 0, 1])
     bad = SimpleNamespace(position=None, orientation=None)
     # The peer is the key the holder files the pose under.
@@ -898,20 +594,6 @@ def test_drain_pose_states_survives_garbage():
     pose = holder.fresh(producer, 10.0)
     assert pose is not None
     assert pose.position[0] == 0.1
-
-
-def test_the_face_buttons_wire_home_low_and_ready_high():
-    # The wiring table is the one place a swap could hide: pin module to
-    # button, so exchanging the two entries fails here and nowhere else.
-    from xr_commander import __main__ as main
-
-    (home_module, home_pressed), (ready_module, ready_pressed) = main._POSTURE_BUTTONS
-    assert home_module.TARGET_ACTION_NAME == "move_to_home"
-    assert ready_module.TARGET_ACTION_NAME == "move_to_ready"
-    a_only = HandSample(pose=POSE, squeezing=False, trigger=0.0, primary_button=True)
-    b_only = HandSample(pose=POSE, squeezing=False, trigger=0.0, secondary_button=True)
-    assert home_pressed(a_only) and not home_pressed(b_only)
-    assert ready_pressed(b_only) and not ready_pressed(a_only)
 
 
 # Fast enough that the burst's message floor never sets the hold length.
@@ -1017,29 +699,212 @@ def frame_of(squeezing: bool) -> HandSample:
     )
 
 
+def gate_engages(hand: HandState, chosen, sample) -> bool:
+    """One tick of the hand's gate: whether its squeeze asks to engage."""
+    hand.observe(chosen, sample)
+    return hand.may_engage(sample)
+
+
 def test_the_first_robot_engages_a_squeeze_already_held():
-    gate = publish.HeldOverSqueeze()
-    gate.note_chosen("alpha")
-    assert gate.engages(frame_of(True))
+    assert gate_engages(HandState(FlashNote()), "alpha", frame_of(True))
 
 
 def test_a_squeeze_held_across_any_change_of_robot_waits_for_a_fresh_release():
-    gate = publish.HeldOverSqueeze()
-    # The arm and gripper streams both note the robot; a second note of the
-    # same robot changes nothing.
-    gate.note_chosen("charlie")
-    gate.note_chosen("charlie")
-    assert gate.engages(frame_of(True))
+    hand = HandState(FlashNote())
+    assert gate_engages(hand, "charlie", frame_of(True))
+    assert gate_engages(hand, "charlie", frame_of(True))
     # Charlie pairs no left arm: the gate follows the robot, not the pair.
-    gate.note_chosen("alpha")
-    assert not gate.engages(frame_of(True))
+    assert not gate_engages(hand, "alpha", frame_of(True))
     # A stale tick says nothing about the grip.
-    assert not gate.engages(None)
-    assert not gate.engages(frame_of(True))
-    assert gate.held_over()
-    assert not gate.engages(frame_of(False))
-    assert gate.engages(frame_of(True))
+    assert not gate_engages(hand, "alpha", None)
+    assert not gate_engages(hand, "alpha", frame_of(True))
+    assert hand.wait_release
+    assert not gate_engages(hand, "alpha", frame_of(False))
+    assert gate_engages(hand, "alpha", frame_of(True))
     # Gone and back through no robot at all: still a change.
-    gate.note_chosen(None)
-    gate.note_chosen("bravo")
-    assert not gate.engages(frame_of(True))
+    assert not gate_engages(hand, None, frame_of(True))
+    assert not gate_engages(hand, "bravo", frame_of(True))
+
+
+@contextlib.asynccontextmanager
+async def parked(clock, *streams):
+    """`streams` running on `clock`: yields a step that runs `count`
+    iterations of every stream, each to its end."""
+    period = default_settings().tick_period_s
+    async with running(*streams) as tasks:
+
+        async def step(count=1):
+            for _ in range(count):
+                await clock.advance(period, parked=tasks)
+
+        yield step
+
+
+def pose_stream(h, clock, driver, session, measured, robots, handedness="right"):
+    """The pose stream of one hand, on `clock`."""
+    arm, gripper = {
+        "left": (left_arm_pose_setpoints, left_gripper_setpoints),
+        "right": (right_arm_pose_setpoints, right_gripper_setpoints),
+    }[handedness]
+    return lambda token: publish.stream_pose(
+        h.node_runner,
+        topic_module=arm,
+        gripper_module=gripper,
+        handedness=handedness,
+        hand=driver.hands[handedness],
+        driver=driver,
+        clutch=HandClutch(1.0),
+        session=session,
+        measured=measured,
+        robots=robots,
+        settings=default_settings(),
+        token=token,
+        clock=clock,
+    )
+
+
+async def test_a_squeeze_with_no_pair_or_no_fresh_pose_takes_nothing():
+    async with boot_clocked(**ONE_ROBOT) as h:
+        clock = ManualClock()
+        log = []
+        driver = scripted_driver("backbone_inst", clock=clock, log=log)
+        session = ScriptedHeadset(clock)
+        # The left hand has no pair on the robot; the right hand has one,
+        # with no measured pose of its arm.
+        session.press(left=(False, False, True), right=(False, False, True))
+        measured = publish.MeasuredPoses(clock)
+        robots = robots_of(h)
+        async with parked(
+            clock,
+            pose_stream(h, clock, driver, session, measured, robots, "left"),
+            pose_stream(h, clock, driver, session, measured, robots, "right"),
+        ) as step:
+            await step(5)
+            assert log == []
+            # The arm reports: the right hand's squeeze takes the robot.
+            measured.set(peer_of(h, right_arm_pose_setpoints), POSE)
+            await step(2)
+            assert log == [("take", "backbone_inst"), ("stop", "backbone_inst")]
+
+
+async def test_the_gripper_is_silent_while_its_hand_is_in_its_release_burst():
+    async with boot_clocked(**ONE_ROBOT) as h:
+        clock = ManualClock()
+        session = ScriptedHeadset(clock)
+        session.press(right=(False, False, True))
+        # The hand holds the robot through its burst, no longer engaged.
+        hand = HandState(FlashNote(clock), robot="backbone_inst")
+        gripper = h.mocks.pairings.right_gripper[0].gripper_setpoints
+
+        def stream(token):
+            return publish.stream_gripper(
+                h.node_runner,
+                topic_module=right_gripper_setpoints,
+                handedness="right",
+                hand=hand,
+                session=session,
+                robots=robots_of(h),
+                settings=default_settings(),
+                token=token,
+                clock=clock,
+            )
+
+        async with parked(clock, stream) as step:
+            await step(5)
+            # Engaged again with the trigger pulled: the first opening on the
+            # wire is the closed one, so nothing went out in the burst.
+            session.trigger = 1.0
+            session.press(right=(False, False, True))
+            hand.engaged = True
+            await step()
+            message = await asyncio.wait_for(gripper.next(), 10.0)
+            assert message.opening == 0.0
+
+
+async def test_a_change_of_robot_in_the_release_burst_releases_the_robot_left_behind():
+    async with boot_clocked(**TWO_ROBOTS) as h:
+        clock = ManualClock()
+        log = []
+        driver = scripted_driver("alpha", "bravo", clock=clock, log=log)
+        robots = robots_of(h)
+        measured = publish.MeasuredPoses(clock)
+        session = ScriptedHeadset(clock)
+        session.press(right=(False, False, True))
+        async with parked(
+            clock, pose_stream(h, clock, driver, session, measured, robots)
+        ) as step:
+
+            async def report():
+                for peer in peers_by_robot(h, right_arm_pose_setpoints).values():
+                    measured.set(peer, POSE)
+                await step()
+
+            await report()
+            assert driver.hand_holds("alpha")
+            # Release, choose bravo and squeeze again inside alpha's burst.
+            session.press(right=(False, False, False))
+            await report()
+            assert robots.choose("bravo")
+            await report()
+            session.press(right=(False, False, True))
+            await report()
+            assert driver.hand_holds("bravo")
+            assert not driver.holds("alpha")
+            assert ("release", "alpha") in log
+
+
+async def a_take_interrupted_by(change) -> tuple[list, Driver]:
+    """A squeeze on alpha whose take answers only once `change(robots,
+    session)` ran: the calls the driver made, and the driver."""
+    async with boot_clocked(**TWO_ROBOTS) as h:
+        clock = ManualClock()
+        log = []
+        calls = FakeCalls(log)
+        driver = Driver(
+            following_fleet("alpha", "bravo"),
+            calls,
+            FakeStops(log),
+            timing=Timing(),
+            on_change=lambda: None,
+            clock=clock,
+        )
+        take = calls.take
+        taking = asyncio.Event()
+        go_on = asyncio.Event()
+
+        async def slow_take(robot):
+            taking.set()
+            await go_on.wait()
+            return await take(robot)
+
+        calls.take = slow_take
+        robots = robots_of(h)
+        assert robots.choose("alpha")
+        measured = publish.MeasuredPoses(clock)
+        for peer in peers_by_robot(h, right_arm_pose_setpoints).values():
+            measured.set(peer, POSE)
+        session = ScriptedHeadset(clock)
+        session.press(right=(False, False, True))
+        async with parked(
+            clock, pose_stream(h, clock, driver, session, measured, robots)
+        ) as step:
+            await step()
+            await taking.wait()
+            change(robots, session)
+            go_on.set()
+            await settle()
+        return log, driver
+
+
+async def test_a_robot_chosen_during_the_take_stops_nothing_and_releases_the_lease():
+    log, driver = await a_take_interrupted_by(
+        lambda robots, _session: robots.choose("bravo")
+    )
+    assert log == [("take", "alpha"), ("release", "alpha")]
+    assert not driver.holds("alpha")
+
+
+async def test_a_frame_lost_during_the_take_stops_nothing_and_releases_the_lease():
+    log, driver = await a_take_interrupted_by(lambda _robots, session: session.press())
+    assert log == [("take", "alpha"), ("release", "alpha")]
+    assert not driver.holds("alpha")

@@ -1,103 +1,38 @@
+//! The panel's state: [`UiState`], which the owner task holds outright (see
+//! [`crate::owner`]), with the per-side targets, the governor and jog
+//! settings, gesture playback and the recorder panel, and the parsed reports
+//! the feeds hand the owner (motor health, alerts, proximity).
+
 use std::collections::BTreeMap;
+use std::fmt;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
+
+use serde::Serialize;
+use srs_model::JointVec;
 
 use crate::gestures::BakedGesture;
-use crate::pose::JointJog;
+use crate::pose::{JogCaps, JointJog};
 
 pub use control_core::motor_health::{AlertSeverity, HealthLevel};
-pub use openarm_description::ARM_DOF;
+use openarm_description::{ARM_DOF, ArmPair, Side};
 use peppylib::messaging::ProducerRef;
 // The gripper axis is the unitless opening fraction (0 = closed, 1 = open);
 // this is only the startup default for the gripper target.
-pub const GRIPPER_CLOSED: f64 = 0.0;
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum Side {
-    Left,
-    Right,
-}
-
-impl Side {
-    /// The wire `arm_name` limb_motion goals carry for this side.
-    pub fn arm_name(self) -> &'static str {
-        match self {
-            Self::Left => "left_arm",
-            Self::Right => "right_arm",
-        }
-    }
-
-    /// The wire `gripper_name` limb_motion goals carry for this side.
-    pub fn gripper_name(self) -> &'static str {
-        match self {
-            Self::Left => "left_gripper",
-            Self::Right => "right_gripper",
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Left => "left",
-            Self::Right => "right",
-        }
-    }
-
-    /// The description crate's side selector, for its per-side lookups in the embedded
-    /// URDF (the arm chain base link).
-    pub fn description(self) -> openarm_description::Side {
-        match self {
-            Self::Left => openarm_description::Side::Left,
-            Self::Right => openarm_description::Side::Right,
-        }
-    }
-}
-
-/// Both sides in a fixed iteration order, for per-side loops.
-pub const SIDES: [Side; 2] = [Side::Left, Side::Right];
-
-/// A value stored per side, indexed by [`Side`]: `things[side]` reads or writes the
-/// right one, with no left/right accessor split. `Copy` when `T` is, so the small
-/// per-tick frames pass by value.
-#[derive(Clone, Copy, Debug)]
-pub struct BySide<T>([T; 2]);
-
-impl<T> BySide<T> {
-    pub const fn new(left: T, right: T) -> Self {
-        Self([left, right])
-    }
-}
-
-impl<T: Clone> BySide<T> {
-    pub fn splat(value: T) -> Self {
-        Self([value.clone(), value])
-    }
-}
-
-impl<T> std::ops::Index<Side> for BySide<T> {
-    type Output = T;
-    fn index(&self, side: Side) -> &T {
-        &self.0[side as usize]
-    }
-}
-
-impl<T> std::ops::IndexMut<Side> for BySide<T> {
-    fn index_mut(&mut self, side: Side) -> &mut T {
-        &mut self.0[side as usize]
-    }
-}
+const GRIPPER_CLOSED: f64 = 0.0;
 
 #[derive(Clone, Debug)]
 pub struct ArmTarget {
-    pub joints: [f64; ARM_DOF],
-    pub last_feedback: Option<[f64; ARM_DOF]>,
+    pub joints: JointVec,
+    pub last_feedback: Option<JointVec>,
     // Whether `joints` has been initialized from a real measured pose yet. Set once,
-    // from the first arm_states feedback, so the target starts where the arm is
+    // from the first joint_states feedback, so the target starts where the arm is
     // instead of at the home default; thereafter only streaming and discrete moves
     // move it. Prevents re-seeding the gravity-sagged measured every disable, which
     // ratcheted the arm down across enable/disable cycles.
     pub established: bool,
     pub in_flight: bool,
-    // Cancels the in-flight goal so a new Send preempts instead of being
+    // Cancels the in-flight goal so a new move preempts instead of being
     // rejected by the arm's single-flight gate.
     pub preempt: Option<tokio_util::sync::CancellationToken>,
     // The joint target the operator is driving this side toward: the setpoint ramps
@@ -121,7 +56,7 @@ impl ArmTarget {
 
 #[derive(Clone, Debug)]
 pub struct GripperTarget {
-    pub position: f64,
+    pub opening: f64,
     // Measured gripper opening fraction from the gripper_states stream.
     pub last_feedback: Option<f64>,
     // The operator's effort cap (the gripper's effort unit), sent with both the
@@ -140,12 +75,28 @@ pub struct GripperTarget {
 impl GripperTarget {
     pub fn closed() -> Self {
         Self {
-            position: GRIPPER_CLOSED,
+            opening: GRIPPER_CLOSED,
             last_feedback: None,
             max_effort: None,
             effort_ceiling: None,
             in_flight: false,
         }
+    }
+}
+
+/// A limb of one side: its arm or its gripper.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Limb {
+    Arm,
+    Gripper,
+}
+
+impl fmt::Display for Limb {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Arm => "arm",
+            Self::Gripper => "gripper",
+        })
     }
 }
 
@@ -197,8 +148,8 @@ pub struct GesturePlayback {
 #[derive(Clone, Copy, Debug)]
 pub enum GesturePhase {
     LeadIn {
-        from: BySide<Option<[f64; ARM_DOF]>>,
-        gripper_from: BySide<Option<f64>>,
+        from: ArmPair<Option<JointVec>>,
+        gripper_from: ArmPair<Option<f64>>,
         t: f64,
         duration_s: f64,
     },
@@ -209,8 +160,8 @@ pub enum GesturePhase {
 
 #[derive(Clone, Debug)]
 pub struct UiState {
-    pub arms: BySide<ArmTarget>,
-    pub grippers: BySide<GripperTarget>,
+    pub arms: ArmPair<ArmTarget>,
+    pub grippers: ArmPair<GripperTarget>,
     // The gesture being played, if any. Playback owns its involved sides: their
     // deadmen stay off, discrete fires are refused, and the player writes their
     // arm/gripper targets each tick.
@@ -218,22 +169,17 @@ pub struct UiState {
     // Streaming deadman, one per side: while false the commander emits no
     // commands for that side's arm or gripper. The arm and gripper share the
     // deadman because the operator enables a whole side at once.
-    pub enabled: BySide<bool>,
+    pub enabled: ArmPair<bool>,
     // Operator controls for the backbone's self-collision governor, streamed to the
     // backbone on governor_control; the backbone holds its own defaults until the first
-    // message. All four launch defaults are node parameters, kept in step with the
+    // message. All five launch defaults are node parameters, kept in step with the
     // backbone's, so a deployment tunes startup from one place; the operator then drives
     // them live from the UI.
-    pub collision_enabled: bool,
-    pub d_stop: f64,
-    pub d_safe: f64,
-    pub max_ee_velocity_m_s: f64,
-    pub max_gripper_rate_frac_s: f64,
+    pub governor: GovernorSettings,
     // Joint-slider jog feel, node parameters so a deployment tunes the ramp without a
     // rebuild: the acceleration the streamed target ramps toward the slider under, and the
     // speed it is held at or under. The backbone still governs the final ramp.
-    pub joint_jog_acceleration_rad_s2: f64,
-    pub joint_jog_velocity_rad_s: f64,
+    pub jog_caps: JogCaps,
     // The launch governor-enable state, restored on operator disconnect so an
     // operator who turned avoidance off cannot leave the backbone latched ungoverned,
     // while a deployment that launched ungoverned is not force-armed either.
@@ -250,9 +196,9 @@ pub struct UiState {
     // retained thereafter. The retained entry doubles as the has-ever-reported
     // bit: one aged past its validity renders as not reporting, never as a
     // fresh launch still inside its grace.
-    pub health: BySide<Option<ArmHealth>>,
+    pub arm_health: ArmPair<Option<ArmHealth>>,
     // Latest per-gripper motor health, keyed, retained, and aged the same way.
-    pub gripper_health: BySide<Option<GripperHealth>>,
+    pub gripper_health: ArmPair<Option<GripperHealth>>,
     // When this state was created; the startup grace for components that have
     // never reported counts from here.
     pub created_at: Instant,
@@ -272,35 +218,47 @@ pub struct UiState {
     pub status: String,
 }
 
-/// How often a listener may warn about a producer it is rejecting: enough to
-/// notice a persistently malformed producer, not enough to bury the log at
-/// that producer's own rate.
-pub const REJECT_WARN_PERIOD: Duration = Duration::from_secs(1);
+/// The operator's self-collision governor controls. The command stream
+/// publishes them on governor_control when the operator moves one; the topic
+/// retains the newest message, so a backbone that starts later reads the
+/// controls in force without the operator touching anything.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct GovernorSettings {
+    pub collision_enabled: bool,
+    pub d_stop: f64,
+    pub d_safe: f64,
+    pub max_ee_velocity_m_s: f64,
+    pub max_gripper_rate_frac_s: f64,
+}
 
-/// The motor_health contract's producer cadence mandate: every producer
-/// reports each component at least this often.
-const HEALTH_REPORT_PERIOD: Duration = Duration::from_millis(500);
+impl GovernorSettings {
+    /// Whether the panel may stream these controls: a valid band and positive,
+    /// finite rates. The backbone validates again before applying.
+    pub fn is_streamable(&self) -> bool {
+        valid_governor_band(self.d_stop, self.d_safe)
+            && [self.max_ee_velocity_m_s, self.max_gripper_rate_frac_s]
+                .iter()
+                .all(|v| v.is_finite() && *v > 0.0)
+    }
 
-/// Health reports age out three contract periods (1500 ms) after receipt:
-/// one missed report is transport jitter, three in a row is a producer gone
-/// quiet, and the panel falls to not-reporting rather than latching.
-pub const HEALTH_STALE_AFTER: Duration = HEALTH_REPORT_PERIOD.saturating_mul(3);
+    /// Whether this is the same setting as `other`, compared on the bits of
+    /// each control so the answer is total: a non-finite value the UI should
+    /// never send would otherwise compare unequal to itself and publish the
+    /// same setting at the frame rate.
+    pub fn same_setting(&self, other: &Self) -> bool {
+        self.collision_enabled == other.collision_enabled
+            && self.d_stop.to_bits() == other.d_stop.to_bits()
+            && self.d_safe.to_bits() == other.d_safe.to_bits()
+            && self.max_ee_velocity_m_s.to_bits() == other.max_ee_velocity_m_s.to_bits()
+            && self.max_gripper_rate_frac_s.to_bits() == other.max_gripper_rate_frac_s.to_bits()
+    }
+}
 
-/// The alert contract's producer cadence ceiling: every producer publishes
-/// its active set at least this often while it runs.
-const ALERT_SET_PERIOD: Duration = Duration::from_millis(2000);
-
-/// A producer's alert set ages out three cadence periods (6000 ms) after
-/// receipt, the same three-missed-periods patience as [`HEALTH_STALE_AFTER`].
-/// An aged-out set means the producer went quiet and its conditions are
-/// unknown; the contract says only an omitted entry says cleared.
-pub const ALERT_STALE_AFTER: Duration = ALERT_SET_PERIOD.saturating_mul(3);
-
-/// Slack allowed between a wire timestamp and this consumer's clock before the
-/// timestamp counts as pre-aged. Producers timestamp from the daemon-resolved clock
-/// this node also reads, so the allowance absorbs scheduling skew, not clock
-/// disagreement.
-pub const TIMESTAMP_SKEW_ALLOWANCE: Duration = Duration::from_millis(500);
+/// A governor band the panel and the backbone both accept: finite, with
+/// 0 < d_stop < d_safe.
+pub fn valid_governor_band(d_stop: f64, d_safe: f64) -> bool {
+    d_stop.is_finite() && d_safe.is_finite() && d_stop > 0.0 && d_stop < d_safe
+}
 
 /// A report's receipt time plus the fixed window it stays renderable for.
 /// A report older than its window has a quiet producer and drops.
@@ -321,30 +279,6 @@ impl Validity {
     pub fn is_live_at(self, now: Instant) -> bool {
         now.duration_since(self.received_at) < self.live_for
     }
-}
-
-/// Parse a wire timestamp into a report's [`Validity`], rejecting a timestamp already
-/// older than the aging window plus [`TIMESTAMP_SKEW_ALLOWANCE`] on the
-/// daemon-resolved clock both ends read. A consumer working through a backlog
-/// re-stamps queued reports as fresh at receipt; the timestamp check refuses what is already older than the window.
-pub fn parse_timestamp_validity(
-    timestamp: SystemTime,
-    clock_now: SystemTime,
-    received_at: Instant,
-    live_for: Duration,
-) -> Result<Validity, String> {
-    // A timestamp ahead of the clock reads as age zero: forward skew is not backlog.
-    let age = clock_now
-        .duration_since(timestamp)
-        .unwrap_or(Duration::ZERO);
-    if age > live_for + TIMESTAMP_SKEW_ALLOWANCE {
-        return Err(format!(
-            "timestamp {} ms old is past its {} ms window",
-            age.as_millis(),
-            live_for.as_millis()
-        ));
-    }
-    Ok(Validity::new(received_at, live_for))
 }
 
 /// One operator alert as its producer listed it.
@@ -444,32 +378,19 @@ impl Disposition {
 }
 
 impl UiState {
-    pub fn new(
-        collision_enabled: bool,
-        d_stop: f64,
-        d_safe: f64,
-        max_ee_velocity_m_s: f64,
-        max_gripper_rate_frac_s: f64,
-        joint_jog_acceleration_rad_s2: f64,
-        joint_jog_velocity_rad_s: f64,
-    ) -> Self {
+    pub fn new(governor: GovernorSettings, jog_caps: JogCaps) -> Self {
         Self {
-            arms: BySide::splat(ArmTarget::home()),
-            grippers: BySide::splat(GripperTarget::closed()),
+            arms: ArmPair::from_fn(|_| ArmTarget::home()),
+            grippers: ArmPair::from_fn(|_| GripperTarget::closed()),
             gesture: None,
-            enabled: BySide::splat(false),
-            collision_enabled,
-            collision_enabled_default: collision_enabled,
-            d_stop,
-            d_safe,
-            max_ee_velocity_m_s,
-            max_gripper_rate_frac_s,
-            joint_jog_acceleration_rad_s2,
-            joint_jog_velocity_rad_s,
+            enabled: ArmPair::new(false, false),
+            governor,
+            collision_enabled_default: governor.collision_enabled,
+            jog_caps,
             proximity: None,
             recorder: RecorderState::unavailable(),
-            health: BySide::splat(None),
-            gripper_health: BySide::splat(None),
+            arm_health: ArmPair::new(None, None),
+            gripper_health: ArmPair::new(None, None),
             created_at: Instant::now(),
             health_bound: false,
             alerts_bound: false,
@@ -512,6 +433,8 @@ impl UiState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::consumer::HEALTH_STALE_AFTER;
+    use crate::test_support::reading;
 
     #[test]
     fn every_defined_level_survives_the_wire_round_trip() {
@@ -524,12 +447,6 @@ mod tests {
     }
 
     #[test]
-    fn aging_windows_are_three_contract_periods() {
-        assert_eq!(HEALTH_STALE_AFTER, Duration::from_millis(1500));
-        assert_eq!(ALERT_STALE_AFTER, Duration::from_millis(6000));
-    }
-
-    #[test]
     fn a_report_is_live_strictly_inside_its_window() {
         let t0 = Instant::now();
         let validity = Validity::new(t0, HEALTH_STALE_AFTER);
@@ -539,38 +456,7 @@ mod tests {
     }
 
     #[test]
-    fn a_pre_aged_timestamp_rejects_and_a_fresh_or_future_one_parses() {
-        let clock = SystemTime::now();
-        let t0 = Instant::now();
-        let parse = |timestamp| parse_timestamp_validity(timestamp, clock, t0, HEALTH_STALE_AFTER);
-        assert!(parse(clock).is_ok());
-        assert!(
-            parse(clock - (HEALTH_STALE_AFTER + TIMESTAMP_SKEW_ALLOWANCE)).is_ok(),
-            "exactly at the allowance still parses"
-        );
-        assert!(
-            parse(
-                clock - (HEALTH_STALE_AFTER + TIMESTAMP_SKEW_ALLOWANCE + Duration::from_millis(1))
-            )
-            .is_err(),
-            "a backlogged report must not be re-stamped fresh"
-        );
-        assert!(
-            parse(clock + Duration::from_secs(5)).is_ok(),
-            "forward skew is not backlog"
-        );
-    }
-
-    #[test]
     fn worst_reports_the_most_severe_motor() {
-        let reading = |level| MotorHealthReading {
-            level,
-            effort_fraction_rated: None,
-            effort_fraction_rated_sustained: None,
-            effort_fraction_peak: None,
-            driver_temp_c: None,
-            winding_temp_c: None,
-        };
         let mut readings = [reading(HealthLevel::Nominal); ARM_DOF];
         readings[4] = reading(HealthLevel::Critical);
         let report = HealthReport {
@@ -578,5 +464,89 @@ mod tests {
             validity: Validity::new(Instant::now(), HEALTH_STALE_AFTER),
         };
         assert_eq!(report.worst(), HealthLevel::Critical);
+    }
+
+    #[test]
+    fn a_governor_setting_compares_equal_to_itself_including_a_non_finite_one() {
+        // The publisher sends only on a change, so a control that compared
+        // unequal to itself would publish the setting in force at the frame
+        // rate on a reliable topic.
+        let setting = GovernorSettings {
+            collision_enabled: true,
+            d_stop: 0.005,
+            d_safe: 0.02,
+            max_ee_velocity_m_s: 0.25,
+            max_gripper_rate_frac_s: 6.0,
+        };
+        assert!(setting.same_setting(&setting));
+
+        let nan = GovernorSettings {
+            d_stop: f64::NAN,
+            ..setting
+        };
+        assert!(
+            nan.same_setting(&nan),
+            "a non-finite control is still the same setting as itself"
+        );
+        assert!(!nan.same_setting(&setting));
+
+        for moved in [
+            GovernorSettings {
+                collision_enabled: false,
+                ..setting
+            },
+            GovernorSettings {
+                d_stop: 0.006,
+                ..setting
+            },
+            GovernorSettings {
+                d_safe: 0.03,
+                ..setting
+            },
+            GovernorSettings {
+                max_ee_velocity_m_s: 0.3,
+                ..setting
+            },
+            GovernorSettings {
+                max_gripper_rate_frac_s: 7.0,
+                ..setting
+            },
+        ] {
+            assert!(
+                !setting.same_setting(&moved),
+                "every control is compared: {moved:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_governor_band_boundaries() {
+        assert!(valid_governor_band(0.005, 0.02));
+        assert!(
+            !valid_governor_band(0.02, 0.02),
+            "d_stop == d_safe is degenerate"
+        );
+        assert!(
+            !valid_governor_band(0.03, 0.02),
+            "d_stop > d_safe is inverted"
+        );
+        assert!(!valid_governor_band(0.0, 0.02), "non-positive d_stop");
+        assert!(!valid_governor_band(f64::NAN, 0.02), "non-finite d_stop");
+        let settings = GovernorSettings {
+            collision_enabled: true,
+            d_stop: 0.005,
+            d_safe: 0.02,
+            max_ee_velocity_m_s: 1.0,
+            max_gripper_rate_frac_s: 6.0,
+        };
+        assert!(settings.is_streamable());
+        assert!(
+            !GovernorSettings {
+                max_ee_velocity_m_s: 0.0,
+                ..settings
+            }
+            .is_streamable(),
+            "non-positive speed cap"
+        );
     }
 }

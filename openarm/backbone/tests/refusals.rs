@@ -9,7 +9,7 @@
 use peppygen::fixtures::harness::{Config, Harness};
 
 mod helpers;
-use helpers::{params, shutdown_once_setup_returns};
+use helpers::{params::params, shutdown_once_setup_returns};
 
 /// Boot the node with one parameter spoiled and return the refusal as an
 /// operator reads it: the whole Display chain, since a wrapping variant names

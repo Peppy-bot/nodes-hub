@@ -1,9 +1,9 @@
-"""The device loop: targets in, state and health snapshots out.
+"""The device loop: targets in, position samples and health snapshots out.
 
 Built on control_core_py's DeviceThread: one OS thread owns the serial bus for the
 process lifetime, and the asyncio side exchanges data through latest-wins
-slots. A failed read leaves the last snapshot standing with its old capture
-stamp, so staleness is visible downstream instead of papered over.
+slots. A failed read leaves the last position sample standing with its old
+capture stamp, so staleness shows downstream.
 """
 
 from __future__ import annotations
@@ -15,21 +15,17 @@ from typing import Protocol
 
 from control_core_py.device import DeviceThread, LatestSlot
 from control_core_py.runtime import Latch, RateMeter
-from so101_description.device import connect_calibrated, read_positions_validated
+from so101_description.device import (
+    PositionSample,
+    connect_calibrated,
+    motor_positions,
+    position_channels,
+    read_position_sample,
+)
+from so101_description.staleness import COMMAND_SILENCE_LIMIT_S
 from so101_description.units import GRIPPER_NAME, JOINT_NAMES, MOTOR_NAMES
 
 from so101_follower.health import HEALTH_RATE_HZ, describe_faults
-
-# Setpoints whose wire stamp sits this far from now are refused on arrival:
-# a replayed backlog or a clock fault is not a current command.
-STALE_WIRE_TIMEOUT_S = 0.25
-
-# Setpoints that arrived longer ago than this stop being written; the servo
-# PID holds the last goal, the deadman for a commander that goes silent (the
-# leader has no engage switch). The two gates compose rather than overlap, so
-# a command that passed the wire gate at its limit can still be written for
-# this long after: the worst-case stop is their sum.
-STALE_SETPOINT_TIMEOUT_S = 0.25
 
 # Present_Load arrives sign-decoded by lerobot (direction bit already folded
 # into the sign); the magnitude is per-mille of stall torque.
@@ -40,13 +36,6 @@ _LOAD_PER_MILLE = 1000.0
 HealthReadings = tuple[
     tuple[float, ...], tuple[float, ...], tuple[bool, ...], tuple[int, ...]
 ]
-
-
-@dataclass(frozen=True)
-class StateSnapshot:
-    positions_deg: tuple[float, ...]
-    gripper_percent: float
-    captured_monotonic: float
 
 
 @dataclass(frozen=True)
@@ -61,7 +50,7 @@ class HealthSnapshot:
     # cutting output, so this is the only register that shows it).
     fault_bits: tuple[int, ...]
     # Health-read failures in a row; state reads keep their own evidence
-    # (the state snapshot's age) and never touch this.
+    # (the position sample's age) and never touch this.
     consecutive_missed_reads: int
     # When the readings were captured (advances only on a good read).
     readings_captured_monotonic: float
@@ -108,13 +97,12 @@ class LerobotFollower:
         connect_calibrated(self._robot, "arm")
 
     def read_positions(self) -> dict[str, float]:
-        observation = self._robot.get_observation()
-        return {key.removesuffix(".pos"): value for key, value in observation.items()}
+        return motor_positions(self._robot.get_observation())
 
     def write_goals(self, goals_by_motor: dict[str, float]) -> None:
         # The servo EPROM position limits, written by calibration, are the
         # travel guard.
-        self._robot.send_action({f"{motor}.pos": value for motor, value in goals_by_motor.items()})
+        self._robot.send_action(position_channels(goals_by_motor))
 
     def read_health(self) -> HealthReadings:
         retries = self._robot.config.num_read_retries
@@ -150,11 +138,13 @@ class DeviceLoop(DeviceThread):
         # Floored so the actual read rate never lands below HEALTH_RATE_HZ
         # on odd ratios.
         self._health_every_ticks = control_rate_hz // HEALTH_RATE_HZ
-        self._stale_timeout_s = STALE_SETPOINT_TIMEOUT_S
+        # Setpoints that arrived longer ago than this stop being written; the
+        # servo PID holds the last goal.
+        self._stale_timeout_s = COMMAND_SILENCE_LIMIT_S
 
         self._arm_target = LatestSlot()
         self._gripper_target = LatestSlot()
-        self._state = LatestSlot()
+        self._sample = LatestSlot()
         self._health = LatestSlot()
         self._tick_count = 0
         self._write_failing = Latch()
@@ -169,14 +159,14 @@ class DeviceLoop(DeviceThread):
     def submit_gripper_target(self, percent: float) -> None:
         self._gripper_target.put(percent)
 
-    def latest_state(self) -> StateSnapshot | None:
-        return self._state.get()
+    def latest_sample(self) -> PositionSample | None:
+        return self._sample.get()
 
     def latest_health(self) -> HealthSnapshot | None:
         return self._health.get()
 
     def _verify_first_read(self) -> None:
-        self._read_state(raise_on_error=True)
+        self._read_sample(raise_on_error=True)
         # Enable-and-confirm: connect's torque writes are acknowledged, but
         # an ack does not prove the servo stays enabled (its own protection
         # can re-disable it), and a disabled motor still answers position
@@ -200,7 +190,7 @@ class DeviceLoop(DeviceThread):
     def _tick(self) -> None:
         self._rate.tick()
         self._write_fresh_targets()
-        self._read_state()
+        self._read_sample()
         if self._tick_count % self._health_every_ticks == 0:
             self._read_health()
         self._tick_count += 1
@@ -222,24 +212,19 @@ class DeviceLoop(DeviceThread):
         except Exception as e:
             self._write_failing.trip(f"goal write failing: {e!r}")
 
-    def _read_state(self, raise_on_error: bool = False) -> None:
+    def _read_sample(self, raise_on_error: bool = False) -> None:
         try:
-            positions_deg, gripper_percent = read_positions_validated(self._hardware)
-            snapshot = StateSnapshot(
-                positions_deg=positions_deg,
-                gripper_percent=gripper_percent,
-                captured_monotonic=time.monotonic(),
-            )
+            sample = read_position_sample(self._hardware)
         except Exception as e:
             if raise_on_error:
                 raise
-            # No fabrication: the last snapshot stands and its age shows. The
+            # No fabrication: the last sample stands and its age shows. The
             # edge is logged, matching the leader's read loop, so a bus going
             # intermittent is visible before the watchdog's exit horizon.
             self._read_failing.trip(f"state read failing: {e!r}")
             return
         self._read_failing.clear()
-        self._state.put(snapshot)
+        self._sample.put(sample)
 
     def _read_health_validated(self) -> HealthReadings:
         """One health read, refused unless every scalar is finite: a corrupt

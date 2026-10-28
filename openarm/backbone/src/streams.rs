@@ -12,30 +12,30 @@
 //! receives.
 
 use std::future::Future;
+use std::ops::ControlFlow;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use control_core::receiving::{Tagged, receive, tagged};
+use control_core::throttle::Throttle;
+use openarm_description::{ArmPair, Side};
 use peppygen::NodeRunner;
 use peppygen::consumed_topics::collision_ctrl::governor_control as collision_ctrl_governor_control;
 use peppygen::paired_topics::{
     leader_left_arm, leader_left_arm_pose, leader_left_gripper, leader_right_arm,
     leader_right_arm_pose, leader_right_gripper, left_arm, left_gripper, right_arm, right_gripper,
 };
+use srs_model::JointVec;
 use tokio::sync::watch;
 use tracing::{error, warn};
 
-use crate::types::{JointVec, Side, pose_from_wire};
+use crate::types::pose_from_wire;
 use crate::upstream::Upstream;
 
 /// At most one dropped-message warning per stream (and one build/timestamp error
 /// per publisher) in this window, so a misrouted producer or a stalled clock
 /// is visible in the log without flooding it at the stream rate.
 pub(crate) const THROTTLED_WARN_PERIOD: Duration = Duration::from_secs(1);
-
-/// Pause after a receive error before retrying, so a persistently broken
-/// subscription cannot spin the listener at full CPU or flood the log at the stream
-/// rate. Transient errors still recover; a genuinely dead stream just idles.
-const RECEIVE_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
 /// The latest commanded opening for one gripper, fed by the upstream
 /// pairing's `gripper_setpoints`: the raw wire opening fraction, clamped into
@@ -68,18 +68,9 @@ pub struct GripperState {
     pub max_effort: f64,
 }
 
-/// Run `emit` at most once per [`THROTTLED_WARN_PERIOD`] per `last` state.
-pub(crate) fn warn_throttled(last: &mut Option<Instant>, emit: impl FnOnce()) {
-    let now = Instant::now();
-    if last.is_none_or(|t| now.duration_since(t) >= THROTTLED_WARN_PERIOD) {
-        emit();
-        *last = Some(now);
-    }
-}
-
 /// Parses one paired arm's inbound joint_states payload. This backbone drives
 /// fixed 7-joint arms whose followers always measure velocity, so a message
-/// must carry exactly [`crate::types::ARM_DOF`] positions with matching velocities,
+/// must carry exactly [`openarm_description::ARM_DOF`] positions with matching velocities,
 /// all finite; the generic contract's empty-velocities form is deliberately
 /// rejected here rather than half-accepted.
 fn parse_joint_state(positions: Vec<f64>, velocities: Vec<f64>) -> Result<ArmState, &'static str> {
@@ -102,7 +93,7 @@ fn parse_joint_state(positions: Vec<f64>, velocities: Vec<f64>) -> Result<ArmSta
     })
 }
 
-/// Parses one commanded arm setpoint: exactly [`crate::types::ARM_DOF`] finite
+/// Parses one commanded arm setpoint: exactly [`openarm_description::ARM_DOF`] finite
 /// positions. The wire's velocities and efforts are not parsed: the backbone
 /// plans its own velocity shaping over the governed position stream.
 fn parse_joint_command(positions: Vec<f64>) -> Result<Upstream, &'static str> {
@@ -208,45 +199,44 @@ impl LeaderActivity {
     }
 }
 
-/// Apply one received message to its side's watch, and report whether the
-/// listener should keep going.
+/// Receive a paired stream until `cancelled` resolves or either side's
+/// subscription closes, keeping the latest well-formed message per side:
+/// `next_message` selects over both sides' subscriptions, so whichever side
+/// delivers next wins and the other stays queued in its own subscription.
 ///
 /// This is the whole receive policy, in one place: a well-formed message
 /// replaces that side's latest and, on a leader's stream, notes the leader's
-/// activity; a malformed one is dropped with a throttled reason rather than
-/// driving an arm, a receive error backs off instead of
-/// spinning, and a closed subscription ends the listener (the node is shutting
-/// down). Each generated slot has its own message type and the subscriptions
-/// share no trait, so the select that produced `received` stays with its
-/// listener; everything after it is here.
-async fn accept<Raw, Parsed>(
+/// activity, and a malformed one is dropped with a throttled reason and
+/// drives no arm. Receive errors take control_core's receive policy. Each
+/// generated slot has its own message type and the subscriptions share no
+/// trait, so the select stays with its listener; everything after it is here.
+async fn follow_pair<Raw, Parsed>(
     what: &'static str,
-    side: Side,
-    received: peppygen::Result<Option<Raw>>,
+    cancelled: impl Future<Output = ()>,
+    next_message: impl AsyncFnMut() -> Result<Option<(Side, Raw)>, Tagged<Side, peppygen::Error>>,
     parse: impl Fn(Raw) -> Result<Parsed, &'static str>,
-    latest: &[watch::Sender<Option<Parsed>>; 2],
-    activity: Option<&[LeaderActivity; 2]>,
-    last_reject_warn: &mut Option<Instant>,
-) -> bool {
-    match received {
-        Ok(Some(raw)) => match parse(raw) {
+    latest: ArmPair<watch::Sender<Option<Parsed>>>,
+    activity: Option<ArmPair<LeaderActivity>>,
+) {
+    let mut reject_warn = Throttle::new(THROTTLED_WARN_PERIOD);
+    let stream = what.to_owned();
+    receive(what, cancelled, next_message, async move |(side, raw)| {
+        match parse(raw) {
             Ok(parsed) => {
-                latest[side.index()].send_replace(Some(parsed));
-                if let Some(activity) = activity {
-                    activity[side.index()].note();
+                latest[side].send_replace(Some(parsed));
+                if let Some(activity) = &activity {
+                    activity[side].note();
                 }
             }
-            Err(reason) => warn_throttled(last_reject_warn, || {
-                warn!("{what}: dropping {} message with {reason}", side.label());
-            }),
-        },
-        Ok(None) => return false,
-        Err(e) => {
-            error!("{what} receive ({}): {e}", side.label());
-            tokio::time::sleep(RECEIVE_ERROR_BACKOFF).await;
+            Err(reason) => {
+                if reject_warn.admit() {
+                    warn!("{stream}: dropping {side} message with {reason}");
+                }
+            }
         }
-    }
-    true
+        ControlFlow::Continue(())
+    })
+    .await;
 }
 
 /// Receive both arms' upstream pose streams forever, keeping the latest
@@ -255,8 +245,8 @@ async fn accept<Raw, Parsed>(
 /// two.
 pub async fn run_pose_command_listener(
     runner: Arc<NodeRunner>,
-    latest: [watch::Sender<Option<Upstream>>; 2],
-    activity: [LeaderActivity; 2],
+    latest: ArmPair<watch::Sender<Option<Upstream>>>,
+    activity: ArmPair<LeaderActivity>,
 ) {
     const WHAT: &str = "upstream pose_setpoints";
     let Some((mut left, mut right)) = subscribe_pair(
@@ -268,26 +258,18 @@ pub async fn run_pose_command_listener(
     else {
         return;
     };
-    let mut warned = None;
-    loop {
-        let (side, received) = tokio::select! {
-            r = left.next() => (Side::Left, r.map(|m| m.map(|(_, msg)| (msg.position, msg.orientation)))),
-            r = right.next() => (Side::Right, r.map(|m| m.map(|(_, msg)| (msg.position, msg.orientation)))),
-        };
-        let applied = accept(
-            WHAT,
-            side,
-            received,
-            |(position, orientation)| parse_pose_command(position, orientation),
-            &latest,
-            Some(&activity),
-            &mut warned,
-        )
-        .await;
-        if !applied {
-            return;
-        }
-    }
+    follow_pair(
+        WHAT,
+        runner.cancellation_token().cancelled(),
+        async move || tokio::select! {
+            r = left.next() => tagged(Side::Left, r.map(|m| m.map(|(_, msg)| (msg.position, msg.orientation)))),
+            r = right.next() => tagged(Side::Right, r.map(|m| m.map(|(_, msg)| (msg.position, msg.orientation)))),
+        },
+        |(position, orientation)| parse_pose_command(position, orientation),
+        latest,
+        Some(activity),
+    )
+    .await;
 }
 
 /// Receive both upstream arm setpoint streams forever (the leading node's
@@ -297,8 +279,8 @@ pub async fn run_pose_command_listener(
 /// stays queued in its own subscription, so neither side can starve the other.
 pub async fn run_joint_command_listener(
     runner: Arc<NodeRunner>,
-    latest: [watch::Sender<Option<Upstream>>; 2],
-    activity: [LeaderActivity; 2],
+    latest: ArmPair<watch::Sender<Option<Upstream>>>,
+    activity: ArmPair<LeaderActivity>,
 ) {
     const WHAT: &str = "upstream joint_setpoints";
     let Some((mut left, mut right)) = subscribe_pair(
@@ -310,26 +292,20 @@ pub async fn run_joint_command_listener(
     else {
         return;
     };
-    let mut warned = None;
-    loop {
-        let (side, received) = tokio::select! {
-            r = left.next() => (Side::Left, r.map(|m| m.map(|(_, msg)| msg.positions))),
-            r = right.next() => (Side::Right, r.map(|m| m.map(|(_, msg)| msg.positions))),
-        };
-        let applied = accept(
-            WHAT,
-            side,
-            received,
-            parse_joint_command,
-            &latest,
-            Some(&activity),
-            &mut warned,
-        )
-        .await;
-        if !applied {
-            return;
-        }
-    }
+    follow_pair(
+        WHAT,
+        runner.cancellation_token().cancelled(),
+        async move || {
+            tokio::select! {
+                r = left.next() => tagged(Side::Left, r.map(|m| m.map(|(_, msg)| msg.positions))),
+                r = right.next() => tagged(Side::Right, r.map(|m| m.map(|(_, msg)| msg.positions))),
+            }
+        },
+        parse_joint_command,
+        latest,
+        Some(activity),
+    )
+    .await;
 }
 
 /// Receive both upstream gripper setpoint streams forever, keeping the latest
@@ -337,8 +313,8 @@ pub async fn run_joint_command_listener(
 /// [`run_joint_command_listener`].
 pub async fn run_gripper_command_listener(
     runner: Arc<NodeRunner>,
-    latest: [watch::Sender<Option<GripperCommand>>; 2],
-    activity: [LeaderActivity; 2],
+    latest: ArmPair<watch::Sender<Option<GripperCommand>>>,
+    activity: ArmPair<LeaderActivity>,
 ) {
     const WHAT: &str = "upstream gripper_setpoints";
     let Some((mut left, mut right)) = subscribe_pair(
@@ -350,26 +326,18 @@ pub async fn run_gripper_command_listener(
     else {
         return;
     };
-    let mut warned = None;
-    loop {
-        let (side, received) = tokio::select! {
-            r = left.next() => (Side::Left, r.map(|m| m.map(|(_, msg)| (msg.opening, msg.max_effort)))),
-            r = right.next() => (Side::Right, r.map(|m| m.map(|(_, msg)| (msg.opening, msg.max_effort)))),
-        };
-        let applied = accept(
-            WHAT,
-            side,
-            received,
-            |(opening, max_effort)| parse_gripper_command(opening, max_effort),
-            &latest,
-            Some(&activity),
-            &mut warned,
-        )
-        .await;
-        if !applied {
-            return;
-        }
-    }
+    follow_pair(
+        WHAT,
+        runner.cancellation_token().cancelled(),
+        async move || tokio::select! {
+            r = left.next() => tagged(Side::Left, r.map(|m| m.map(|(_, msg)| (msg.opening, msg.max_effort)))),
+            r = right.next() => tagged(Side::Right, r.map(|m| m.map(|(_, msg)| (msg.opening, msg.max_effort)))),
+        },
+        |(opening, max_effort)| parse_gripper_command(opening, max_effort),
+        latest,
+        Some(activity),
+    )
+    .await;
 }
 
 /// Receive both paired arms' measured state forever (the joint_link
@@ -379,7 +347,7 @@ pub async fn run_gripper_command_listener(
 /// trajectory or a governor query on a bad measurement.
 pub async fn run_joint_state_listener(
     runner: Arc<NodeRunner>,
-    latest: [watch::Sender<Option<ArmState>>; 2],
+    latest: ArmPair<watch::Sender<Option<ArmState>>>,
 ) {
     const WHAT: &str = "joint_states";
     let Some((mut left, mut right)) = subscribe_pair(
@@ -391,26 +359,18 @@ pub async fn run_joint_state_listener(
     else {
         return;
     };
-    let mut warned = None;
-    loop {
-        let (side, received) = tokio::select! {
-            r = left.next() => (Side::Left, r.map(|m| m.map(|(_, msg)| (msg.positions, msg.velocities)))),
-            r = right.next() => (Side::Right, r.map(|m| m.map(|(_, msg)| (msg.positions, msg.velocities)))),
-        };
-        let applied = accept(
-            WHAT,
-            side,
-            received,
-            |(positions, velocities)| parse_joint_state(positions, velocities),
-            &latest,
-            None,
-            &mut warned,
-        )
-        .await;
-        if !applied {
-            return;
-        }
-    }
+    follow_pair(
+        WHAT,
+        runner.cancellation_token().cancelled(),
+        async move || tokio::select! {
+            r = left.next() => tagged(Side::Left, r.map(|m| m.map(|(_, msg)| (msg.positions, msg.velocities)))),
+            r = right.next() => tagged(Side::Right, r.map(|m| m.map(|(_, msg)| (msg.positions, msg.velocities)))),
+        },
+        |(positions, velocities)| parse_joint_state(positions, velocities),
+        latest,
+        None,
+    )
+    .await;
 }
 
 /// Receive both paired grippers' measured aperture forever (the gripper_link
@@ -419,7 +379,7 @@ pub async fn run_joint_state_listener(
 /// so a stray broadcast producer cannot spoof the modeled fingers.
 pub async fn run_gripper_state_listener(
     runner: Arc<NodeRunner>,
-    latest: [watch::Sender<Option<GripperState>>; 2],
+    latest: ArmPair<watch::Sender<Option<GripperState>>>,
 ) {
     const WHAT: &str = "gripper_states";
     let Some((mut left, mut right)) = subscribe_pair(
@@ -431,26 +391,18 @@ pub async fn run_gripper_state_listener(
     else {
         return;
     };
-    let mut warned = None;
-    loop {
-        let (side, received) = tokio::select! {
-            r = left.next() => (Side::Left, r.map(|m| m.map(|(_, msg)| (msg.opening, msg.effort, msg.max_effort)))),
-            r = right.next() => (Side::Right, r.map(|m| m.map(|(_, msg)| (msg.opening, msg.effort, msg.max_effort)))),
-        };
-        let applied = accept(
-            WHAT,
-            side,
-            received,
-            |(opening, effort, max_effort)| parse_gripper_state(opening, effort, max_effort),
-            &latest,
-            None,
-            &mut warned,
-        )
-        .await;
-        if !applied {
-            return;
-        }
-    }
+    follow_pair(
+        WHAT,
+        runner.cancellation_token().cancelled(),
+        async move || tokio::select! {
+            r = left.next() => tagged(Side::Left, r.map(|m| m.map(|(_, msg)| (msg.opening, msg.effort, msg.max_effort)))),
+            r = right.next() => tagged(Side::Right, r.map(|m| m.map(|(_, msg)| (msg.opening, msg.effort, msg.max_effort)))),
+        },
+        |(opening, effort, max_effort)| parse_gripper_state(opening, effort, max_effort),
+        latest,
+        None,
+    )
+    .await;
 }
 
 /// The backbone's runtime governor controls from the commander: the on/off toggle plus
@@ -473,35 +425,33 @@ pub async fn run_governor_config_listener(
     runner: Arc<NodeRunner>,
     config: watch::Sender<GovernorConfig>,
 ) {
-    let mut sub = match collision_ctrl_governor_control::subscribe(&runner).await {
+    let mut subscription = match collision_ctrl_governor_control::subscribe(&runner).await {
         Ok(s) => s,
         Err(e) => return error!("governor_control subscribe: {e}"),
     };
-    loop {
-        match sub.next().await {
-            Ok(Some((_, msg))) => {
-                config.send_replace(GovernorConfig {
-                    enabled: msg.collision_governor_enabled,
-                    d_stop: msg.d_stop,
-                    d_safe: msg.d_safe,
-                    max_ee_velocity_m_s: msg.max_ee_velocity_m_s,
-                    max_gripper_rate_frac_s: msg.max_gripper_rate_frac_s,
-                });
-            }
-            Ok(None) => return,
-            Err(e) => {
-                error!("governor_control receive: {e}");
-                tokio::time::sleep(RECEIVE_ERROR_BACKOFF).await;
-            }
-        }
-    }
+    receive(
+        "governor_control",
+        runner.cancellation_token().cancelled(),
+        async move || subscription.next().await,
+        async move |(_, msg)| {
+            config.send_replace(GovernorConfig {
+                enabled: msg.collision_governor_enabled,
+                d_stop: msg.d_stop,
+                d_safe: msg.d_safe,
+                max_ee_velocity_m_s: msg.max_ee_velocity_m_s,
+                max_gripper_rate_frac_s: msg.max_gripper_rate_frac_s,
+            });
+            ControlFlow::Continue(())
+        },
+    )
+    .await;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use crate::types::ARM_DOF;
+    use openarm_description::ARM_DOF;
     use srs_model::nalgebra::{Isometry3, Vector3};
 
     #[test]

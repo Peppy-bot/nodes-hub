@@ -3,17 +3,18 @@
 //! (gripper_name, finiteness, the [0, 1] opening range, a non-negative effort
 //! cap, a settle timeout from 0 to 60 s), refusing a value it does not take
 //! with `rejected`, refuse it while the gripper's follower delivers no fresh
-//! state or a leader streams the gripper, claim the side's single-flight
-//! slot, and hand the accepted goal to the coordinator over its gripper goal
-//! channel. The coordinator runs the motion through the same per-tick
-//! governing as every other DOF, completes the goal once the jaws stand
-//! still after the planned end of the commanded travel or at the goal's
-//! settle timeout, and releases the busy slot at the terminal.
+//! state or a leader streams the gripper, claim the side's move slot, and
+//! hand the accepted goal to the coordinator over its gripper goal channel.
+//! The coordinator runs the motion through the same per-tick governing as
+//! every other DOF, completes the goal once the jaws stand still after the
+//! planned end of the commanded travel or at the goal's settle timeout, and
+//! releases the move slot at the terminal.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
+use openarm_description::{ArmPair, Side};
 use peppygen::exposed_actions::limb_motion::move_gripper::{
     ActionHandle, GoalDecision, GoalRequestData,
 };
@@ -21,11 +22,11 @@ use peppygen::{NodeRunner, Result};
 use tokio::sync::mpsc;
 use tracing::error;
 
-use crate::actions::{GRIPPER_WORDS, admit_limb};
-use crate::coordinator::GripperGoal;
+use crate::actions::{GRIPPER_WORDS, admit_limb, move_seconds_from_wire};
 use crate::failure::{Failure, FailureKind};
+use crate::gripper_move::GripperGoal;
+use crate::move_slot::MoveSlot;
 use crate::streams::LeaderActivity;
-use crate::types::{Side, move_seconds_from_wire};
 
 /// A `move_gripper` goal parsed off the wire: the side, a finite opening in
 /// [0, 1], the effort cap (`None` for the wire's 0, no preference, which
@@ -39,8 +40,7 @@ struct GripperGoalRequest {
 }
 
 fn gripper_goal_request(d: &GoalRequestData) -> std::result::Result<GripperGoalRequest, String> {
-    let side = Side::from_gripper_name(&d.gripper_name)
-        .ok_or_else(|| Side::UNKNOWN_GRIPPER_NAME.to_string())?;
+    let side = Side::from_gripper_name(&d.gripper_name).map_err(|e| e.to_string())?;
     if !d.opening.is_finite() {
         return Err("non-finite gripper opening".to_string());
     }
@@ -63,13 +63,13 @@ fn gripper_goal_request(d: &GoalRequestData) -> std::result::Result<GripperGoalR
 }
 
 /// Expose `move_gripper`: validate + claim, then hand the goal to the
-/// coordinator. The coordinator releases the busy slot when the move ends.
+/// coordinator. The coordinator releases the move slot when the move ends.
 pub async fn run_move_gripper(
     runner: Arc<NodeRunner>,
-    goal_txs: [mpsc::Sender<GripperGoal>; 2],
-    busy: [Arc<AtomicBool>; 2],
-    fresh: [Arc<AtomicBool>; 2],
-    activity: [LeaderActivity; 2],
+    goal_txs: ArmPair<mpsc::Sender<GripperGoal>>,
+    move_slots: ArmPair<MoveSlot>,
+    fresh: ArmPair<Arc<AtomicBool>>,
+    activity: ArmPair<LeaderActivity>,
 ) -> Result<()> {
     let mut handle = ActionHandle::expose(&runner).await?;
     loop {
@@ -78,8 +78,13 @@ pub async fn run_move_gripper(
                 let admitted = gripper_goal_request(&req.data)
                     .map_err(|reason| Failure::new(FailureKind::Rejected, reason))
                     .and_then(|request| {
-                        let idx = request.side.index();
-                        admit_limb(&fresh[idx], &activity[idx], &busy[idx], &GRIPPER_WORDS)
+                        let side = request.side;
+                        admit_limb(
+                            &fresh[side],
+                            &activity[side],
+                            &move_slots[side],
+                            &GRIPPER_WORDS,
+                        )
                     });
                 Ok(match admitted {
                     Ok(()) => GoalDecision::accept(),
@@ -94,8 +99,7 @@ pub async fn run_move_gripper(
             max_effort,
             settle_timeout,
         } = gripper_goal_request(&ctx.request().data).expect("validated on accept");
-        let idx = side.index();
-        if goal_txs[idx]
+        if goal_txs[side]
             .send(GripperGoal {
                 opening,
                 max_effort,
@@ -105,7 +109,7 @@ pub async fn run_move_gripper(
             .await
             .is_err()
         {
-            busy[idx].store(false, std::sync::atomic::Ordering::Release);
+            move_slots[side].release();
             error!("move_gripper: coordinator channel closed");
             return Ok(());
         }

@@ -10,6 +10,7 @@ from peppygen.consumed_topics.color_cameras import video_stream as color_video_s
 from tests.helpers import (
     FakeToken,
     RecordingSink,
+    StubTopic,
     boot,
     eventually,
     frame_message,
@@ -92,10 +93,11 @@ def test_a_payload_that_contradicts_its_header_is_refused():
         decode_to_bgr("rgb8", 2, 2, b"\x00" * 11)
 
 
-def member(instance_id, copy=None, in_copy_id=None):
+def member(instance_id, copy=None, in_copy_id=None, core_node="core"):
     """A bound camera as the generated slot answers it."""
     tag = None if copy is None else SimpleNamespace(name=copy, instance_id=in_copy_id)
-    return SimpleNamespace(copy=tag, producer=SimpleNamespace(instance_id=instance_id))
+    producer = SimpleNamespace(core_node=core_node, instance_id=instance_id)
+    return SimpleNamespace(copy=tag, producer=producer)
 
 
 def test_a_camera_is_named_by_its_robot_and_the_id_its_copy_wrote():
@@ -344,6 +346,52 @@ async def test_an_undecodable_frame_is_dropped_and_logged_once(capsys):
         assert len(sinks["chest"].frames) == 1
         assert capsys.readouterr().out.count("frame unusable") == 1  # latched
         assert health["chest"].source == CameraSource(robot=None, role="chest")
+
+
+class StubCameras(StubTopic):
+    """A camera slot module answering `members` as bound, whose subscription
+    yields queued (producer, message) items."""
+
+    def __init__(self, items, *members):
+        super().__init__(items)
+        self._members = members
+
+    def bound_members(self, _runner):
+        return list(self._members)
+
+
+async def test_one_instance_id_on_two_core_nodes_is_two_producers(capsys):
+    # Two stacks on one mesh may each run a `chest` camera. Every harness
+    # mock shares the harness's core node, so the producers are scripted.
+    # core-a's chest sends a bad frame, core-b's chest a good one, then
+    # core-a's chest a bad one; the last frame, from a third camera, lands
+    # once the rest are processed. The test checks that core-a's bad frames
+    # log one "frame unusable" line.
+    here = member("chest", core_node="core-a")
+    there = member("chest", core_node="core-b")
+    wrist = member("wrist_left", core_node="core-a")
+    bad = frame_message(encoding="z16", data=b"xx")
+    cameras = StubCameras(
+        [
+            (here.producer, bad),
+            (there.producer, bgr_message()),
+            (here.producer, bad),
+            (wrist.producer, bgr_message()),
+        ],
+        here,
+        there,
+        wrist,
+    )
+    panels, _sinks, _told = recording_panels()
+    panels.show_only(["chest", "wrist_left"])
+    health: dict[str, LastFrame] = {}
+    async with running_drain(
+        lambda token: drain_frames(
+            None, cameras, panels, NO_ROBOTS, token, "test", 0, health
+        )
+    ):
+        await eventually(lambda: "wrist_left" in health, message="the last frame")
+    assert capsys.readouterr().out.count("frame unusable") == 1
 
 
 def test_a_failed_camera_subscribe_is_loud_and_fatal_to_the_drain(capsys):

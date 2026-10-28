@@ -15,15 +15,24 @@ from dataclasses import dataclass
 
 from xr_commander.bus import (
     GOAL_CANCEL_TIMEOUT_S,
+    REAL_CLOCK,
     CancellationToken,
+    Clock,
     FlashNote,
     Latch,
+    cause,
+    fire_goal,
     log,
     ticks,
 )
 from xr_commander.config import Settings
-from xr_commander.devices import FrameSource, fresh_sample
-from xr_commander.publish import cause, fire_goal
+from xr_commander.devices import (
+    RECORDER_HAND,
+    FrameSource,
+    RisingEdge,
+    fresh_sample,
+    primary_pressed,
+)
 from xr_commander.robots import PairedRobots
 
 
@@ -46,7 +55,7 @@ class Timing:
 class RecorderStatus:
     """The recorder as the panel shows it; every writer runs on the event loop."""
 
-    def __init__(self) -> None:
+    def __init__(self, clock: Clock = REAL_CLOCK) -> None:
         self.recording = False
         self.frames = 0
         # True from the operator's stop until the recorder's result: the
@@ -54,7 +63,7 @@ class RecorderStatus:
         self.saving = False
         # True once Y has been held to the finish threshold.
         self.finish_held = False
-        self._note = FlashNote()
+        self._note = FlashNote(clock)
 
     def set_note(self, text: str) -> None:
         """Flash an outcome on the panel row for the next few seconds."""
@@ -97,6 +106,7 @@ async def run_recorder_buttons(
     token: CancellationToken,
     read_task: Callable[[], str],
     timing: Timing = Timing(),
+    clock: Clock = REAL_CLOCK,
 ) -> None:
     """Drive the chosen robot's recorder from the left controller's face
     buttons.
@@ -112,21 +122,19 @@ async def run_recorder_buttons(
     """
     unbound = Latch()
 
-    # None until X has been observed at all: a thumb already down on the
-    # first tracked frame is not a press, and neither is one held across a
-    # stale gap. Rising edges exist only against an observed release.
-    prev_x: bool | None = None
+    x_button = RisingEdge()
     held_y_since: float | None = None
     finish_fired = False
     episode: _Episode | None = None
 
     try:
-        async for _ in ticks(settings.tick_period_s, token):
-            left = fresh_sample(session, "left", settings.stale_timeout_s)
-            x = left.primary_button if left is not None else prev_x
-            rising_x = bool(x) and prev_x is False
+        async for _ in ticks(settings.tick_period_s, token, clock):
+            left = fresh_sample(session, RECORDER_HAND, settings.stale_timeout_s, clock)
+            rising_x = x_button.step(
+                primary_pressed(left) if left is not None else None
+            )
             y = bool(left and left.secondary_button)
-            loop_now = asyncio.get_running_loop().time()
+            loop_now = clock.monotonic()
 
             if episode is not None and episode.watcher.done():
                 episode = None
@@ -177,7 +185,6 @@ async def run_recorder_buttons(
                 held_y_since is not None
                 and loop_now - held_y_since >= timing.finish_hold_s
             )
-            prev_x = x
     finally:
         if episode is not None:
             episode.watcher.cancel()

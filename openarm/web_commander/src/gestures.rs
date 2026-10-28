@@ -12,12 +12,13 @@
 use std::sync::Arc;
 
 use control_core::minimum_jerk::{QUINTIC_PEAK_VELOCITY, blend};
+use srs_model::JointVec;
 use srs_model::nalgebra::{Quaternion, UnitQuaternion};
 
 use crate::pose::ArmModels;
-use openarm_description::{READY_R, Side as ModelSide, mirror};
+use openarm_description::{ARM_DOF, ArmPair, READY_R, Side, mirror};
 
-use crate::state::{ARM_DOF, BySide, GesturePhase, GesturePlayback, SIDES, Side};
+use crate::state::{GesturePhase, GesturePlayback};
 
 /// Dense bake grid (s). Playback interpolates linearly between grid samples, so
 /// the command tick rate need not match.
@@ -46,17 +47,17 @@ const LEAD_IN_MAX_S: f64 = 4.0;
 /// postures (the backbone's move_to_ready lands on the same values). The
 /// panel's Ready Pose button drives the same pose, served to it through the
 /// snapshot, so the whole system has exactly one definition.
-pub(crate) const READY: BySide<[f64; ARM_DOF]> = BySide::new(
-    openarm_description::ready(ModelSide::Left),
-    openarm_description::ready(ModelSide::Right),
+pub(crate) const READY: ArmPair<JointVec> = ArmPair::new(
+    openarm_description::ready(Side::Left),
+    openarm_description::ready(Side::Right),
 );
 
 /// The Home park pose per side, from the same canonical postures: the elbow
 /// sits on the description's floor rather than the straight-arm singularity.
 /// The panel's Home Pose button and the backbone's move_to_home land here.
-pub(crate) const HOME: BySide<[f64; ARM_DOF]> = BySide::new(
-    openarm_description::home(ModelSide::Left),
-    openarm_description::home(ModelSide::Right),
+pub(crate) const HOME: ArmPair<JointVec> = ArmPair::new(
+    openarm_description::home(Side::Left),
+    openarm_description::home(Side::Right),
 );
 
 // --------------------------- authoring types ---------------------------
@@ -65,7 +66,7 @@ pub(crate) const HOME: BySide<[f64; ARM_DOF]> = BySide::new(
 /// optional gripper opening key (fraction, 0..1).
 struct Keyframe {
     t: f64,
-    joints: [f64; ARM_DOF],
+    joints: JointVec,
     gripper: Option<f64>,
 }
 
@@ -74,8 +75,8 @@ struct Keyframe {
 type Curve = fn(f64) -> [f64; 3];
 
 enum Motion {
-    Joint(BySide<Option<Vec<Keyframe>>>),
-    Cartesian(BySide<Option<Curve>>),
+    Joint(ArmPair<Option<Vec<Keyframe>>>),
+    Cartesian(ArmPair<Option<Curve>>),
 }
 
 struct GestureDef {
@@ -92,7 +93,7 @@ struct GestureDef {
 /// opening measured at start).
 #[derive(Debug)]
 struct BakedTrack {
-    joints: Vec<[f64; ARM_DOF]>,
+    joints: Vec<JointVec>,
     gripper: Option<Vec<f64>>,
 }
 
@@ -103,7 +104,7 @@ pub struct BakedGesture {
     pub name: &'static str,
     pub label: &'static str,
     pub duration_s: f64,
-    tracks: BySide<Option<BakedTrack>>,
+    tracks: ArmPair<Option<BakedTrack>>,
 }
 
 impl BakedGesture {
@@ -112,12 +113,12 @@ impl BakedGesture {
     }
 
     /// The joint pose the lead-in blends toward.
-    pub fn first_joints(&self, side: Side) -> Option<[f64; ARM_DOF]> {
+    pub fn first_joints(&self, side: Side) -> Option<JointVec> {
         self.tracks[side].as_ref().map(|t| t.joints[0])
     }
 
     /// The opening the gripper track starts at, when the gesture drives the jaw.
-    pub fn first_gripper(&self, side: Side) -> Option<f64> {
+    fn first_gripper(&self, side: Side) -> Option<f64> {
         self.tracks[side]
             .as_ref()
             .and_then(|t| t.gripper.as_ref())
@@ -126,7 +127,7 @@ impl BakedGesture {
 
     /// Sample the track at `t` seconds (clamped to the trajectory), linearly
     /// interpolated between grid samples. `None` for an uninvolved side.
-    pub fn sample(&self, side: Side, t: f64) -> Option<([f64; ARM_DOF], Option<f64>)> {
+    pub fn sample(&self, side: Side, t: f64) -> Option<(JointVec, Option<f64>)> {
         let track = self.tracks[side].as_ref()?;
         let last = track.joints.len() - 1;
         let x = (t / BAKE_DT_S).clamp(0.0, last as f64);
@@ -146,14 +147,16 @@ impl BakedGesture {
 pub struct Registry(Vec<Arc<BakedGesture>>);
 
 impl Registry {
-    /// Bake every definition against the live arm models. Panics on an
-    /// infeasible definition: a gesture that cannot be streamed safely is a
-    /// build error surfaced at bringup, not a runtime condition.
-    pub fn bake(models: &ArmModels) -> Self {
+    /// Bake every definition against the live arm models, keeping each
+    /// side's joints within `ranges`, the per-joint `[min, max]` (rad) the
+    /// panel clamps commands into. Panics on an infeasible definition: a
+    /// gesture that cannot be streamed safely is a build error that bringup
+    /// surfaces.
+    pub fn bake(models: &ArmModels, ranges: &ArmPair<[[f64; 2]; ARM_DOF]>) -> Self {
         Self(
             defs()
                 .iter()
-                .map(|def| Arc::new(bake(models, def)))
+                .map(|def| Arc::new(bake(models, ranges, def)))
                 .collect(),
         )
     }
@@ -171,15 +174,11 @@ impl Registry {
 
 /// Per-side playback output for one tick: the joint setpoint and, when the
 /// gesture drives it, the gripper opening.
-pub type GestureSamples = BySide<Option<([f64; ARM_DOF], Option<f64>)>>;
+pub type GestureSamples = ArmPair<Option<(JointVec, Option<f64>)>>;
 
 /// Size the lead-in blend so the fastest joint peaks at
 /// [`LEAD_IN_SPEED_FRACTION`] of its velocity budget, within the comfort band.
-pub fn lead_in_duration(
-    from: &[f64; ARM_DOF],
-    to: &[f64; ARM_DOF],
-    velocity_limits: &[f64; ARM_DOF],
-) -> f64 {
+pub fn lead_in_duration(from: &JointVec, to: &JointVec, velocity_limits: &JointVec) -> f64 {
     let slowest = (0..ARM_DOF)
         .map(|i| (to[i] - from[i]).abs() / (LEAD_IN_SPEED_FRACTION * velocity_limits[i]))
         .fold(0.0_f64, f64::max);
@@ -214,10 +213,9 @@ pub fn advance_gesture_step(
                 );
             }
             let s = blend(t / duration_s);
-            let mut out = BySide::new(None, None);
-            for side in SIDES {
+            let out = ArmPair::from_fn(|side| {
                 let (Some(start), Some(first)) = (from[side], pb.gesture.first_joints(side)) else {
-                    continue;
+                    return None;
                 };
                 let joints = std::array::from_fn(|i| lerp(start[i], first[i], s));
                 // A driven gripper eases from its measured opening to the
@@ -227,8 +225,8 @@ pub fn advance_gesture_step(
                     .gesture
                     .first_gripper(side)
                     .and_then(|g0| gripper_from[side].map(|seed| lerp(seed, g0, s)));
-                out[side] = Some((joints, gripper));
-            }
+                Some((joints, gripper))
+            });
             (
                 retained(GesturePhase::LeadIn {
                     from,
@@ -252,10 +250,7 @@ pub fn advance_gesture_step(
 }
 
 fn sample_all(gesture: &BakedGesture, t: f64) -> GestureSamples {
-    BySide::new(
-        gesture.sample(Side::Left, t),
-        gesture.sample(Side::Right, t),
-    )
+    ArmPair::from_fn(|side| gesture.sample(side, t))
 }
 
 fn lerp(a: f64, b: f64, s: f64) -> f64 {
@@ -264,7 +259,11 @@ fn lerp(a: f64, b: f64, s: f64) -> f64 {
 
 // --------------------------- baking ---------------------------
 
-fn bake(models: &ArmModels, def: &GestureDef) -> BakedGesture {
+fn bake(
+    models: &ArmModels,
+    ranges: &ArmPair<[[f64; 2]; ARM_DOF]>,
+    def: &GestureDef,
+) -> BakedGesture {
     assert!(
         def.duration_s.is_finite() && def.duration_s > 0.0,
         "gesture '{}': duration must be positive",
@@ -274,20 +273,20 @@ fn bake(models: &ArmModels, def: &GestureDef) -> BakedGesture {
     let track = |side: Side| match &def.motion {
         Motion::Joint(tracks) => tracks[side]
             .as_ref()
-            .map(|keys| bake_joint(models, def, side, keys, clock_s)),
+            .map(|keys| bake_joint(models, &ranges[side], def, side, keys, clock_s)),
         Motion::Cartesian(curves) => {
             curves[side].map(|curve| bake_cartesian(models, def, side, curve, clock_s))
         }
     };
-    let mut tracks = BySide::new(track(Side::Left), track(Side::Right));
+    let mut tracks = ArmPair::from_fn(track);
     assert!(
-        SIDES.iter().any(|&s| tracks[s].is_some()),
+        tracks.iter().any(Option::is_some),
         "gesture '{}': at least one side must have a track",
         def.name
     );
     let coda_s = append_ready_coda(models, &mut tracks);
     // The coda samples answer to the same guards as the gesture proper.
-    for side in SIDES {
+    for side in Side::BOTH {
         if let Some(track) = tracks[side].as_ref() {
             assert_steps_within_budget(models, def, side, &track.joints, &|k| k as f64 * BAKE_DT_S);
         }
@@ -305,10 +304,10 @@ fn bake(models: &ArmModels, def: &GestureDef) -> BakedGesture {
 /// lead-in), holding any gripper track at its final value. Returns the coda
 /// duration added to the shared clock, 0 when every track already ends at
 /// Ready.
-fn append_ready_coda(models: &ArmModels, tracks: &mut BySide<Option<BakedTrack>>) -> f64 {
-    let coda_s = SIDES
-        .iter()
-        .filter_map(|&side| {
+fn append_ready_coda(models: &ArmModels, tracks: &mut ArmPair<Option<BakedTrack>>) -> f64 {
+    let coda_s = Side::BOTH
+        .into_iter()
+        .filter_map(|side| {
             let track = tracks[side].as_ref()?;
             let last = track.joints.last().expect("baked tracks are never empty");
             let moved = (0..ARM_DOF).any(|j| (last[j] - READY[side][j]).abs() > 1e-9);
@@ -320,7 +319,7 @@ fn append_ready_coda(models: &ArmModels, tracks: &mut BySide<Option<BakedTrack>>
     }
     let coda_s = snap_to_grid(coda_s);
     let (n, at) = grid(coda_s);
-    for side in SIDES {
+    for side in Side::BOTH {
         let Some(track) = tracks[side].as_mut() else {
             continue;
         };
@@ -353,6 +352,7 @@ fn grid(clock_s: f64) -> (usize, impl Fn(usize) -> f64) {
 
 fn bake_joint(
     models: &ArmModels,
+    ranges: &[[f64; 2]; ARM_DOF],
     def: &GestureDef,
     side: Side,
     keys: &[Keyframe],
@@ -374,17 +374,16 @@ fn bake_joint(
 
     let tangents = monotone_tangents(keys);
     let (n, at) = grid(clock_s);
-    let joints: Vec<[f64; ARM_DOF]> = (0..n)
+    let joints: Vec<JointVec> = (0..n)
         .map(|k| hermite_sample(keys, &tangents, at(k)))
         .collect();
 
-    let ranges = models.joint_ranges(side);
     for (k, q) in joints.iter().enumerate() {
         for j in 0..ARM_DOF {
             assert!(
                 q[j] >= ranges[j][0] - LIMIT_SLACK_RAD && q[j] <= ranges[j][1] + LIMIT_SLACK_RAD,
                 "gesture '{name}' {side_l}: j{j1} = {v:.4} outside [{lo:.4}, {hi:.4}] at sample {k}",
-                side_l = side.label(),
+                side_l = side,
                 j1 = j + 1,
                 v = q[j],
                 lo = ranges[j][0],
@@ -404,7 +403,7 @@ fn bake_joint(
 /// zero wherever a joint plateaus or reverses (repeated keyframes hold truly
 /// still), and magnitude-clamped to three times the smaller adjacent secant
 /// (Fritsch-Carlson), so a segment never overshoots its authored endpoints.
-fn monotone_tangents(keys: &[Keyframe]) -> Vec<[f64; ARM_DOF]> {
+fn monotone_tangents(keys: &[Keyframe]) -> Vec<JointVec> {
     (0..keys.len())
         .map(|i| {
             if i == 0 || i == keys.len() - 1 {
@@ -426,7 +425,7 @@ fn monotone_tangents(keys: &[Keyframe]) -> Vec<[f64; ARM_DOF]> {
 }
 
 /// Sample the keyframe spline at `t`: cubic Hermite on each segment.
-fn hermite_sample(keys: &[Keyframe], tangents: &[[f64; ARM_DOF]], t: f64) -> [f64; ARM_DOF] {
+fn hermite_sample(keys: &[Keyframe], tangents: &[JointVec], t: f64) -> JointVec {
     let seg = keys.partition_point(|k| k.t <= t).clamp(1, keys.len() - 1) - 1;
     let (a, b) = (&keys[seg], &keys[seg + 1]);
     let dt = b.t - a.t;
@@ -497,7 +496,7 @@ fn bake_cartesian(
 
     let (n, at) = grid(clock_s);
     let mut prev = READY[side];
-    let joints: Vec<[f64; ARM_DOF]> = (0..n)
+    let joints: Vec<JointVec> = (0..n)
         .map(|k| {
             let off = curve(blend(at(k) / def.duration_s));
             let p = [
@@ -508,17 +507,13 @@ fn bake_cartesian(
             let q = models
                 .solve_ik(side, p, rotation, &prev)
                 .unwrap_or_else(|| {
-                    panic!(
-                        "gesture '{name}' {}: unreachable curve point {p:?} at sample {k}",
-                        side.label()
-                    )
+                    panic!("gesture '{name}' {side}: unreachable curve point {p:?} at sample {k}")
                 });
             let ee = models.ee_pose_world(side, &q);
             let err = crate::pose::dist3([ee[0], ee[1], ee[2]], p);
             assert!(
                 err < CURVE_TRACK_TOL_M,
-                "gesture '{name}' {}: IK landed {err:.4} m off the curve at sample {k}",
-                side.label()
+                "gesture '{name}' {side}: IK landed {err:.4} m off the curve at sample {k}"
             );
             prev = q;
             q
@@ -544,7 +539,7 @@ fn assert_steps_within_budget(
     models: &ArmModels,
     def: &GestureDef,
     side: Side,
-    joints: &[[f64; ARM_DOF]],
+    joints: &[JointVec],
     at: &impl Fn(usize) -> f64,
 ) {
     let budget = models.velocity_limits(side);
@@ -559,7 +554,7 @@ fn assert_steps_within_budget(
                 step < MAX_BAKE_STEP_RAD,
                 "gesture '{}' {}: j{} steps {step:.3} rad at sample {k} (adjacent-sample guard; on an IK path this means a branch flip)",
                 def.name,
-                side.label(),
+                side,
                 j + 1
             );
             let cap = VELOCITY_BUDGET_FRACTION * budget[j] * dt;
@@ -567,7 +562,7 @@ fn assert_steps_within_budget(
                 step <= cap,
                 "gesture '{}' {}: j{} needs {:.2} rad/s at sample {k}, budget {:.2}",
                 def.name,
-                side.label(),
+                side,
                 j + 1,
                 step / dt,
                 VELOCITY_BUDGET_FRACTION * budget[j]
@@ -578,7 +573,7 @@ fn assert_steps_within_budget(
 
 // --------------------------- the roster ---------------------------
 
-fn kf(t: f64, joints: [f64; ARM_DOF]) -> Keyframe {
+fn kf(t: f64, joints: JointVec) -> Keyframe {
     Keyframe {
         t,
         joints,
@@ -586,7 +581,7 @@ fn kf(t: f64, joints: [f64; ARM_DOF]) -> Keyframe {
     }
 }
 
-fn kfg(t: f64, joints: [f64; ARM_DOF], gripper: f64) -> Keyframe {
+fn kfg(t: f64, joints: JointVec, gripper: f64) -> Keyframe {
     Keyframe {
         t,
         joints,
@@ -606,7 +601,7 @@ fn wave() -> GestureDef {
         name: "wave",
         label: "Wave",
         duration_s: 8.0,
-        motion: Motion::Joint(BySide::new(
+        motion: Motion::Joint(ArmPair::new(
             None,
             Some(vec![
                 kfg(0.0, READY_R, 0.0),
@@ -631,7 +626,7 @@ fn spiral() -> GestureDef {
         name: "spiral",
         label: "Spiral",
         duration_s: 11.0,
-        motion: Motion::Cartesian(BySide::new(None, Some(spiral_curve as Curve))),
+        motion: Motion::Cartesian(ArmPair::new(None, Some(spiral_curve as Curve))),
     }
 }
 
@@ -655,7 +650,7 @@ fn figure_eight() -> GestureDef {
         name: "figure_eight",
         label: "Figure Eight",
         duration_s: 10.0,
-        motion: Motion::Cartesian(BySide::new(None, Some(figure_eight_curve as Curve))),
+        motion: Motion::Cartesian(ArmPair::new(None, Some(figure_eight_curve as Curve))),
     }
 }
 
@@ -686,7 +681,7 @@ fn shrug() -> GestureDef {
         name: "shrug",
         label: "Shrug",
         duration_s: 6.0,
-        motion: Motion::Joint(BySide::new(Some(left), Some(right))),
+        motion: Motion::Joint(ArmPair::new(Some(left), Some(right))),
     }
 }
 
@@ -720,18 +715,16 @@ fn clap() -> GestureDef {
         name: "clap",
         label: "Clap",
         duration_s,
-        motion: Motion::Joint(BySide::new(Some(left), Some(right))),
+        motion: Motion::Joint(ArmPair::new(Some(left), Some(right))),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::limits::{arm_limits, init_limits_for_tests};
+    use crate::test_support::{models, registry};
     use openarm_description::HardwareVersion;
-
-    fn models() -> ArmModels {
-        ArmModels::from_version(HardwareVersion::V2)
-    }
 
     fn test_keys() -> Vec<Keyframe> {
         vec![
@@ -838,29 +831,49 @@ mod tests {
 
     #[test]
     fn registry_bakes_every_gesture_on_v2() {
-        let registry = Registry::bake(&models());
+        let registry = registry();
         let names: Vec<&str> = registry.iter().map(|g| g.name).collect();
         assert_eq!(names, ["wave", "spiral", "figure_eight", "shrug", "clap"]);
+    }
+
+    /// The clap holds the right elbow (j4) at 1.45 rad, so a right j4 range
+    /// that ends at 1.40 refuses it.
+    #[test]
+    #[should_panic(expected = "gesture 'clap' right: j4")]
+    fn a_gesture_outside_the_ranges_it_is_given_is_refused() {
+        let ranges = ArmPair::from_fn(|side| {
+            let mut ranges = HardwareVersion::V2.joint_limits(side);
+            if side == Side::Right {
+                ranges[3][1] = 1.40;
+            }
+            ranges
+        });
+        bake(&models(), &ranges, &clap());
     }
 
     #[test]
     fn registry_bakes_every_gesture_on_v1() {
         // The commander launches on either generation and the bake panics on an
         // infeasible definition, so v1 feasibility is a build gate too.
-        Registry::bake(&ArmModels::from_version(HardwareVersion::V1));
+        let version = HardwareVersion::V1;
+        Registry::bake(
+            &ArmModels::from_version(version),
+            &ArmPair::from_fn(|side| version.joint_limits(side)),
+        );
     }
 
     #[test]
     fn every_baked_step_respects_velocity_budget_and_limits() {
         // Re-assert outside the constructor so a relaxed bake cannot silently pass.
+        init_limits_for_tests();
         let m = models();
-        for g in Registry::bake(&m).iter() {
-            for side in SIDES {
+        for g in registry().iter() {
+            for side in Side::BOTH {
                 let Some(track) = g.tracks[side].as_ref() else {
                     continue;
                 };
                 let budget = m.velocity_limits(side);
-                let ranges = m.joint_ranges(side);
+                let ranges = arm_limits(side);
                 for (k, w) in track.joints.windows(2).enumerate() {
                     for j in 0..ARM_DOF {
                         let step = (w[1][j] - w[0][j]).abs();
@@ -869,7 +882,7 @@ mod tests {
                             step <= VELOCITY_BUDGET_FRACTION * budget[j] * BAKE_DT_S + 1e-12,
                             "{} {} j{}: over budget at sample {k}",
                             g.name,
-                            side.label(),
+                            side,
                             j + 1
                         );
                     }
@@ -880,7 +893,7 @@ mod tests {
                             q[j] >= ranges[j][0] - 1e-9 && q[j] <= ranges[j][1] + 1e-9,
                             "{} {}: j{} out of limits",
                             g.name,
-                            side.label(),
+                            side,
                             j + 1
                         );
                     }
@@ -896,10 +909,10 @@ mod tests {
     #[test]
     fn cartesian_bakes_track_their_curves() {
         let m = models();
-        let registry = Registry::bake(&m);
+        let registry = registry();
         for name in ["spiral", "figure_eight"] {
             let g = registry.find(name).unwrap();
-            for side in SIDES {
+            for side in Side::BOTH {
                 let Some(track) = g.tracks[side].as_ref() else {
                     continue;
                 };
@@ -909,7 +922,7 @@ mod tests {
                     let a = m.ee_pose_world(side, &w[0]);
                     let b = m.ee_pose_world(side, &w[1]);
                     let d = crate::pose::dist3([a[0], a[1], a[2]], [b[0], b[1], b[2]]);
-                    assert!(d < 0.01, "{name} {}: {d:.4} m EE jump", side.label());
+                    assert!(d < 0.01, "{name} {side}: {d:.4} m EE jump");
                 }
             }
         }
@@ -917,8 +930,8 @@ mod tests {
 
     #[test]
     fn every_gesture_ends_at_ready() {
-        for g in Registry::bake(&models()).iter() {
-            for side in SIDES {
+        for g in registry().iter() {
+            for side in Side::BOTH {
                 let Some((last, _)) = g.sample(side, g.duration_s) else {
                     continue;
                 };
@@ -927,7 +940,7 @@ mod tests {
                         (last[j] - READY[side][j]).abs() < 1e-9,
                         "gesture '{}' {} j{} ends at {} not Ready",
                         g.name,
-                        side.label(),
+                        side,
                         j + 1,
                         last[j]
                     );
@@ -945,7 +958,7 @@ mod tests {
         // and reading its proximity feed: the closest untouched pair (the clap)
         // settles at 23 mm surface clearance with EE frames ~0.26 m apart.
         let m = models();
-        for g in Registry::bake(&m).iter() {
+        for g in registry().iter() {
             let (Some(l), Some(r)) = (
                 g.tracks[Side::Left].as_ref(),
                 g.tracks[Side::Right].as_ref(),
@@ -971,7 +984,7 @@ mod tests {
 
     #[test]
     fn sampling_interpolates_and_clamps() {
-        let g = Registry::bake(&models()).find("wave").unwrap();
+        let g = registry().find("wave").unwrap();
         let (q0, _) = g.sample(Side::Right, 0.0).unwrap();
         assert_eq!(q0, g.first_joints(Side::Right).unwrap());
         assert!(
@@ -1008,13 +1021,13 @@ mod tests {
 
     #[test]
     fn playback_leads_in_plays_and_completes() {
-        let gesture = Registry::bake(&models()).find("wave").unwrap();
+        let gesture = registry().find("wave").unwrap();
         let start = [0.1, 0.2, -0.1, 0.8, 0.0, 0.1, 0.0];
         let mut pb = GesturePlayback {
             gesture: gesture.clone(),
             phase: GesturePhase::LeadIn {
-                from: BySide::new(None, Some(start)),
-                gripper_from: BySide::new(None, Some(0.7)),
+                from: ArmPair::new(None, Some(start)),
+                gripper_from: ArmPair::new(None, Some(0.7)),
                 t: 0.0,
                 duration_s: 1.0,
             },

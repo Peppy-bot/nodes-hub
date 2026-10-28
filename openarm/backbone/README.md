@@ -153,8 +153,9 @@ gripper's **grasp point** (midway between the pads on the jaw closing axis,
 `openarm_description` carries the offset per generation and `arm_model` builds
 the model with it, so the pose solved for, the pose reported, and the point the
 EE speed cap applies to are one frame. One move per side at a time (a
-single-flight busy slot whose release rides a drop guard, so no terminal can
-leak it). `move_arm` plans the quietest tier that works (`srs_model::plan_cartesian`): a
+single-flight move slot whose release rides a drop guard, held by the move,
+or by the coordinator for a goal it ends before the move starts, so every
+terminal frees it). `move_arm` plans the quietest tier that works (`srs_model::plan_cartesian`): a
 line with the elbow held, a line with the elbow swiveled toward the widest
 joint-limit margin or the highest manipulability, or the guarded servo
 (`chain_kinematics::plan_servo`, a damped resolved-rate law that can cross
@@ -198,7 +199,7 @@ command: the gripper motor's own position loop drives them at a speed in
 proportion to the distance still to go (measured on an openarm_v2, a time
 constant of about 0.18 s, so they stand still within about 1 s of any move).
 From the planned end on, the move keeps commanding the target and holding the
-side's busy slot until the measured opening has stood still: every opening
+side's move slot until the measured opening has stood still: every opening
 the follower delivered over 0.25 s lies within 0.01 of the travel of the
 others, the band and window the limb_motion contract states. Jaws an object
 or the effort cap stops short of the target stand still there too. At the latest `settle_timeout_s` after the planned end the move
@@ -350,27 +351,30 @@ The robot's own body is not checked for hiding a point from the camera.
 
 | Module | Owns | Why it lives here |
 |---|---|---|
-| `main.rs` | bringup: params, models, channels, task supervision | first task exit is fatal; the daemon restarts a clean process |
+| `main.rs` | tracing, then the node runtime running `setup` | all node logic lives in the library, so the integration tests boot the same entry point |
+| `node.rs` | bringup: params, models, channels, task supervision | first task exit is fatal; the daemon restarts a clean process |
 | `startup.rs` | the robot_initializer gate | nothing streams before the robot is ready |
 | `streams.rs` | every subscription + parse-at-the-boundary types (`GripperCommand`, `ArmState`, `GripperState`) | one receive policy (`subscribe_pair` + `accept`); a malformed message is dropped with a reason, never driven |
 | `upstream.rs` | `UpstreamMode` (which upstream slot kind is followed) + `Upstream` (the parsed joint or pose command) | one command authority per arm is unrepresentable, not checked per tick |
 | `publish.rs` | every publisher (`Publishers`), one stamp/build/publish/log path | peppy vocabulary: a publisher on a slot; "wire" means the transport encoding only |
-| `coordinator.rs` | the tick, gripper move execution, the upstream relay | IO orchestration; its seam with the safety core is exactly one `govern` call, which is why the governor is not folded into it |
+| `coordinator.rs` | the tick, each gripper's target and chase, the upstream relay | IO orchestration; its seam with the safety core is exactly one `govern` call, which is why the governor is not folded into it |
+| `gripper_move.rs` | gripper move execution: a `move_gripper` goal admitted into a free side, the terminal it gets once the jaws stand still or its settle timeout passes, and the end of its goal | the gripper analog of `planner.rs` + `settle.rs`; the coordinator drives it each tick |
 | `liveness.rs` | follower admission (`Live` / `Reanchor` / `Stale`) | delivery-cadence policy for the coordinator, independent of any message type |
+| `move_slot.rs` | `MoveSlot`, each limb's single-flight move slot (claim, release, and the `SlotRelease` a move holds), and the refusals of a busy limb | one owner for the slot the action handlers claim, and release when a goal never reaches the coordinator, and the planners and the coordinator release when they end a goal or its move |
 | `planner.rs` | per-arm mode machine (Follow / joint move / Cartesian move) -> one rate-limited candidate + the stream-tick Jacobian | knows one arm only; never the other arm, never the collision model |
-| `settle.rs` | `Settle`, the verdict an arm move gets from its planned end on, and how far a joint target or a grasp point still stands from its target | one rule for the joint and the Cartesian move |
+| `settle.rs` | `Settle`, `PoseTolerance` (the slack a Cartesian move is planned and settled within), the verdict an arm move gets from its planned end on, and how far a joint target or a grasp point still stands from its target | one rule for the joint and the Cartesian move |
 | `governor/mod.rs` | `GovState`, the pipeline, the runtime controls, disposition and readout | the only mutable resource is the collision model |
 | `governor/sense.rs` | the pre-projection model read (`Sensed`) | limiters and the projection decide on one snapshot |
 | `governor/model.rs` | `ConfiguredModel`, the only door to the collision model | every query takes the whole configuration; stale-placement reads are unrepresentable |
 | `governor/limiters/` | the `Limiter` trait, one module per limiter, and `allowance.rs` (the `Allowance`/`Limits` currency they speak) | everything expressible as a per-DOF fraction lives together |
 | `governor/barrier.rs` | the projection and the floor scan | the two stages that are not per-DOF fractions |
 | `torso.rs` | the torso clip regions the URDF does not carry | geometry facts, versioned with the node |
-| `actions/` | goal admission (validate + claim), nothing else | execution belongs to the planner/coordinator that owns the state |
-| `failure.rs` | the failure kinds of the moves and of `check_arm_move`, each given to every generated member | one failure crosses from a posture share to its posture goal |
+| `actions/` | the actions and services a caller reaches: move goal admission (validate + claim), the posture goals run to their one result, and the stop and plan-check services that ask the coordinator; each action's goal fields are parsed off the wire in its module, the times and tolerances every move goal names in `actions/mod.rs` | execution belongs to the planner/coordinator that owns the state |
+| `failure.rs` | the failure kinds of the moves and of `check_arm_move`, each given to every generated member, and the failure of a follower that stopped reporting | one failure crosses from a posture share to its posture goal |
 | `workspace.rs` | the OpenArm's part of the workspace answer from the design: reach per grasp orientation, the perception camera, the per-height reach memo it keeps, the parsing of the camera's geometry; `workspace_core::design` parses the request and composes the answer | pure: no messaging, so every answer is unit-tested without a node |
+| `camera_mounts.rs` | the camera_mounts contract: each camera resolved once at bringup into the frame that carries it, then composed with the grasp poses measured last | a mount the backbone cannot place stops bringup |
 | `workspace_service.rs` | the two workspace services and the read of the linked camera's geometry | the thin edge between the generated handlers and `workspace.rs` |
-| `serving.rs` | the loop of each service answered for the life of the node (`get_limb_names`, `get_camera_poses`, the workspace services): ended by the node's cancel, an error logged and waited out for 1 s | one loop, so no service can hot-spin on a broken transport or outlive the node |
-| `types.rs`, `arm_pair.rs` | `ARM_DOF`, `JointVec`, `Side`, the tolerances and times a move is parsed by, `ArmPair` | shared primitives |
+| `types.rs` | the limb tables, the world-pose wire codec | shared primitives; `ARM_DOF`, `Side` and `ArmPair` come from `openarm_description`, `JointVec` from `srs_model` |
 
 ## Parameters and links
 

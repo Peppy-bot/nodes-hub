@@ -8,7 +8,11 @@
 // they drive while it stays paired, else the first robot paired. Carries no
 // kinematics: solving a pose into joints is the follower's business. The
 // deadman is the grip button, per hand; released streams the measured pose
-// for a quarter second, then nothing, and the follower holds.
+// for a quarter second, then nothing, and the follower holds. The headset
+// holds the robot lease of the robot a person drives: a squeeze takes it and
+// stops the moves in flight on that robot, the headset releases it after the
+// release burst of the last hand once no posture move of its own runs, and it
+// drives only the robots of the fleet listing.
 {
   peppy_schema: "node/v1",
   manifest: {
@@ -36,6 +40,9 @@
         { name: "rgbd_camera", tag: "v1", link_id: "rgbd_cameras", cardinality: "zero_or_more" },
         // Whole-robot posture moves.
         { name: "postures", tag: "v1", link_id: "postures", cardinality: "zero_or_more" },
+        // The planned moves of each robot: a squeeze stops the moves in
+        // flight on the robot it takes.
+        { name: "limb_motion", tag: "v1", link_id: "limb_motion", cardinality: "zero_or_more" },
         // Operator alerts from any producer the launcher wires, listed on
         // the status panel: the headset has no text channel of its own.
         // Unbound, the panel draws no alert section.
@@ -60,6 +67,11 @@
         // The same hand's opening loop.
         { name: "gripper_link", tag: "v1", role: "leader", link_id: "left_gripper", cardinality: "zero_or_more" },
         { name: "gripper_link", tag: "v1", role: "leader", link_id: "right_gripper", cardinality: "zero_or_more" },
+      ],
+      // The robot leases and the halt of the stack: the fleet listing and
+      // its changes, and the lease of the robot a person drives.
+      daemon: [
+        { name: "robot_leases", tag: "v1", link_id: "fleet" },
       ],
     },
   },
@@ -89,10 +101,21 @@
         // Holds, renews and releases the sensors of the chosen robot.
         { link_id: "sensor_streams", name: "hold" },
         { link_id: "sensor_streams", name: "release" },
+        // Ends the planned moves in flight on the robot a squeeze takes.
+        { link_id: "limb_motion", name: "stop" },
+        // The lease of the robot a person drives, and whether the headset
+        // may move a robot whose lease is open or that it calls.
+        { link_id: "fleet", name: "take" },
+        { link_id: "fleet", name: "release" },
+        { link_id: "fleet", name: "check_move" },
       ],
     },
     actions: {
       consumes: [
+        // The fleet listing and each change of it, and the long goal during
+        // which the headset holds leases.
+        { link_id: "fleet", name: "changes" },
+        { link_id: "fleet", name: "lease" },
         { link_id: "postures", name: "move_to_ready" },
         { link_id: "postures", name: "move_to_home" },
         // One dataset episode per goal; cancelling stops and saves it.

@@ -10,19 +10,22 @@ from __future__ import annotations
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from functools import lru_cache
 
-import cv2
+from xr_commander.bus import (
+    CancellationToken,
+    Latch,
+    latch_for,
+    log,
+    messages,
+    producer_key,
+    subscribe_or_log,
+    ticks,
+)
+from xr_commander.motor_health import Level
 
-from xr_commander.bus import CancellationToken, Latch, log, messages, ticks
-
-# Severity encoding of the alert contract: warning < critical < fault. A
-# listed alert is active; a set that omits one clears it.
-WARNING = 1
-CRITICAL = 2
-FAULT = 3
-
-_LEVEL_LABELS = {WARNING: "WARNING", CRITICAL: "CRITICAL", FAULT: "FAULT"}
+# The alert contract's severities: warning < critical < fault. A listed
+# alert is active; a set that omits one clears it.
+_SEVERITIES = frozenset({Level.WARNING, Level.CRITICAL, Level.FAULT})
 
 # A producer's set ages out this long after arrival: three times the
 # contract's 2000 ms cadence ceiling, so a set survives two dropped
@@ -33,14 +36,22 @@ ALERT_STALE_AFTER_MS = 6000
 
 # How often the slot's membership is read, so a producer that leaves takes
 # its alerts with it sooner than the aging window would.
-MEMBERSHIP_POLL_S = 0.5
+_MEMBERSHIP_POLL_S = 0.5
+
+
+def _parse_severity(value: int) -> Level | None:
+    """`value` as an alert severity, or None for one outside the alert
+    contract's warning to fault."""
+    if value not in _SEVERITIES:
+        return None
+    return Level(value)
 
 
 @dataclass(frozen=True)
 class Alert:
     """One active alert: its severity and operator text."""
 
-    severity: int
+    severity: Level
     text: str
 
 
@@ -105,7 +116,8 @@ class ActiveAlerts:
             if not source or not kind:
                 refused.append("alert identity needs a source and a kind")
                 continue
-            if item.severity not in _LEVEL_LABELS:
+            severity = _parse_severity(item.severity)
+            if severity is None:
                 refused.append(f"undefined severity {item.severity}")
                 continue
             if (source, kind) in seen:
@@ -114,14 +126,18 @@ class ActiveAlerts:
             seen.add((source, kind))
             alerts.append(
                 Alert(
-                    severity=item.severity,
-                    text=f"{source.upper()} {_LEVEL_LABELS[item.severity]}: {item.message}",
+                    severity=severity,
+                    text=f"{source.upper()} {severity.word}: {item.message}",
                 )
             )
         self._by_producer[producer] = _ProducerSet(
             alerts=tuple(alerts), received_monotonic_s=self._monotonic()
         )
         return refused
+
+    def refresh(self) -> None:
+        """Keep the sets of the producers the slot holds now."""
+        self.retain(self._bound_now())
 
     def retain(self, producers: Iterable[tuple[str, str]]) -> None:
         """Keep the sets of the producers the slot holds, and record them."""
@@ -159,55 +175,6 @@ class ActiveAlerts:
         return tuple(row[3] for row in ordered)
 
 
-# Below this fraction of the intended scale the glyphs stop surviving VP8,
-# which blurs fine strokes. Past it the text is truncated rather than shrunk
-# further: a readable prefix naming the joint beats an unreadable smear of
-# the whole message.
-_MIN_SCALE_FRACTION = 0.55
-_ELLIPSIS = "..."
-
-
-# Memoized: the status panel refits its rows on every redraw, and the
-# truncation branch measures once per dropped character. The result is
-# pure in the arguments, so a re-drawn row costs one cache lookup.
-@lru_cache(maxsize=256)
-def fit_text(
-    text: str, font: int, scale: float, thickness: int, available_px: int
-) -> tuple[str, float]:
-    """`text` and the scale to draw it at, fitted inside `available_px`.
-
-    Shrinks first, then truncates once shrinking would cost legibility.
-    """
-    if available_px <= 0:
-        return "", scale
-    if cv2.getTextSize(text, font, scale, thickness)[0][0] <= available_px:
-        return text, scale
-    floor = scale * _MIN_SCALE_FRACTION
-    if cv2.getTextSize(text, font, floor, thickness)[0][0] > available_px:
-        # Even the legibility floor cannot hold the whole text: keep the
-        # floor and drop characters off the end instead.
-        kept = text
-        while kept and (
-            cv2.getTextSize(kept + _ELLIPSIS, font, floor, thickness)[0][0]
-            > available_px
-        ):
-            kept = kept[:-1]
-        return (kept + _ELLIPSIS if kept else ""), floor
-    # The whole text fits at the floor but not at full scale, so the largest
-    # fitting scale lies between them. Rendered widths are a stair-stepped
-    # function of scale (glyph widths round up), which defeats proportional
-    # estimation near the boundary; bisection pins it in a dozen passes.
-    lo, hi = floor, scale
-    for _ in range(12):
-        mid = (lo + hi) / 2.0
-        if cv2.getTextSize(text, font, mid, thickness)[0][0] <= available_px:
-            lo = mid
-        else:
-            hi = mid
-    return text, lo
-
-
-
 async def drain_alerts(
     node_runner,
     topic_module,
@@ -215,21 +182,17 @@ async def drain_alerts(
     token: CancellationToken,
 ) -> None:
     """Keep `active` at every producer's newest alert set."""
-    try:
-        subscription = await topic_module.subscribe(node_runner)
-    except Exception as e:
+    subscription = await subscribe_or_log(node_runner, topic_module, "alerts")
+    if subscription is None:
         # Loud and fail-safe, matching the camera drains: no alerts rather
         # than a task that dies and takes its failure with it.
-        log(f"alerts subscribe failed: {e!r}")
         return
     # Latched per producer: a producer's refusal logs once, until a set from
     # that same producer parses clean.
     unusable: dict[tuple[str, str], Latch] = {}
     async for producer, message in messages(subscription, token, "alerts"):
-        key = (producer.core_node, producer.instance_id)
-        latch = unusable.get(key)
-        if latch is None:
-            latch = unusable[key] = Latch()
+        key = producer_key(producer)
+        latch = latch_for(unusable, key)
         try:
             refused = active.replace(key, message.active)
         except Exception as e:
@@ -243,12 +206,10 @@ async def drain_alerts(
 
 
 async def follow_producers(
-    node_runner,
-    topic_module,
     active: ActiveAlerts,
     token: CancellationToken,
     *,
-    period_s: float = MEMBERSHIP_POLL_S,
+    period_s: float = _MEMBERSHIP_POLL_S,
 ) -> None:
     """Keep `active` at the producers the alert slot holds.
 
@@ -260,10 +221,7 @@ async def follow_producers(
     failing = Latch()
     async for _ in ticks(period_s, token):
         try:
-            active.retain(
-                (p.core_node, p.instance_id)
-                for p in topic_module.bound_producers(node_runner)
-            )
+            active.refresh()
             failing.clear()
         except BaseException as e:  # a slot the manifest lost raises through pyo3
             failing.trip(f"alerts bound set unreadable: {e!r}")

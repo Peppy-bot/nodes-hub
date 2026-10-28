@@ -3,9 +3,9 @@
 //! one action goal from both terminals. Cancel flips a shared flag the moves
 //! poll, so each arm stops the way a cancelled joint move stops; the stop
 //! service ends both arms' moves the same way, and the goal ends cancelled
-//! for the stop's reason. The two actions share the arms' single-flight
-//! slots, so a posture goal arriving while the other posture runs is refused
-//! with `precondition_failed`.
+//! for the stop's reason. The two actions share the arms' move slots, so a
+//! posture goal arriving while the other posture runs is refused with
+//! `precondition_failed`.
 //!
 //! A goal that completes or ends cancelled gives the grasp pose of each arm,
 //! in limb_state's arm order. The coordinator measures both arms then, after
@@ -15,31 +15,35 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use openarm_description::{ArmPair, Side};
 use peppygen::exposed_actions::postures::{move_to_home, move_to_ready};
 use peppygen::{NodeRunner, Result};
 use srs_model::nalgebra::Isometry3;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, warn};
 
-use crate::actions::{ARM_WORDS, ask_coordinator, check_limb_free, claim};
-use crate::arm_pair::ArmPair;
-use crate::coordinator::{CoordinatorRequest, MeasuredGrasp};
+use crate::actions::{ARM_WORDS, ask_coordinator, check_limb_free, move_seconds_from_wire};
+use crate::coordinator::{CoordinatorRequest, GraspMeasurement};
 use crate::failure::{Failure, FailureKind};
+use crate::move_slot::MoveSlot;
 use crate::planner::{Goal, JointReply, Outcome, ReadyReply, Unmeasured};
 use crate::streams::LeaderActivity;
-use crate::types::{Side, arm_pose_arrays, limb_names, move_seconds_from_wire};
+use crate::types::{arm_pose_arrays, limb_names};
 
-/// Claim both arms' single-flight slots, or refuse with
-/// `precondition_failed`, naming the busy arm. A failure on the second claim
-/// unwinds the first, so a refusal never leaves a slot held.
-fn claim_both(busy: &[Arc<AtomicBool>; 2]) -> std::result::Result<(), Failure> {
-    let busy_arm = |message: &str| Failure::new(FailureKind::PreconditionFailed, message);
-    if !claim(&busy[Side::Left.index()]) {
-        return Err(busy_arm("the left arm is already executing a motion"));
+/// Claim both arms' move slots, or refuse with `precondition_failed`,
+/// naming the busy arm. A failure on the second claim unwinds the first, so
+/// a refusal never leaves a slot held.
+fn claim_both(move_slots: &ArmPair<MoveSlot>) -> std::result::Result<(), Failure> {
+    let busy_arm = |side: Side| {
+        let message = format!("the {side} {}", ARM_WORDS.busy);
+        Failure::new(FailureKind::PreconditionFailed, message)
+    };
+    if !move_slots[Side::Left].claim() {
+        return Err(busy_arm(Side::Left));
     }
-    if !claim(&busy[Side::Right.index()]) {
-        busy[Side::Left.index()].store(false, Ordering::Release);
-        return Err(busy_arm("the right arm is already executing a motion"));
+    if !move_slots[Side::Right].claim() {
+        move_slots[Side::Left].release();
+        return Err(busy_arm(Side::Right));
     }
     Ok(())
 }
@@ -49,18 +53,18 @@ fn claim_both(busy: &[Arc<AtomicBool>; 2]) -> std::result::Result<(), Failure> {
 /// then both arms claimed.
 fn admit_posture(
     duration_s: f64,
-    fresh: &[Arc<AtomicBool>; 2],
-    activity: &[LeaderActivity; 2],
-    busy: &[Arc<AtomicBool>; 2],
+    fresh: &ArmPair<Arc<AtomicBool>>,
+    activity: &ArmPair<LeaderActivity>,
+    move_slots: &ArmPair<MoveSlot>,
 ) -> std::result::Result<(), Failure> {
     move_seconds_from_wire("duration_s", duration_s)
         .map_err(|reason| Failure::new(FailureKind::Rejected, reason))?;
     check_limb_free(
-        fresh.iter().all(|arm| arm.load(Ordering::Acquire)),
+        fresh.iter().all(|fresh| fresh.load(Ordering::Acquire)),
         activity.iter().any(LeaderActivity::streaming),
         &ARM_WORDS,
     )?;
-    claim_both(busy)
+    claim_both(move_slots)
 }
 
 /// How a posture goal ends.
@@ -110,7 +114,7 @@ fn summarize(pending: usize, outcomes: &[Outcome], cancel: Option<String>) -> Po
 }
 
 /// The poses a posture result gives: the grasp pose of each arm in
-/// [`Side::ARM_NAMES`] order, or none.
+/// [`Side::BOTH`] order, or none.
 #[derive(Debug)]
 struct ArmPoses {
     arm_names: Vec<String>,
@@ -120,7 +124,7 @@ struct ArmPoses {
 
 /// What the coordinator answers when the goal asks for the grasp pose of
 /// each arm, or why it did not answer.
-type GraspAnswer = std::result::Result<ArmPair<MeasuredGrasp>, String>;
+type GraspAnswer = std::result::Result<ArmPair<GraspMeasurement>, String>;
 
 /// Ask the coordinator for the grasp pose of each arm, measured when it
 /// serves the request.
@@ -142,13 +146,13 @@ fn measured_poses(answer: GraspAnswer) -> std::result::Result<ArmPair<Isometry3<
     let grasps = answer?;
     let pose = |side: Side| {
         let arm = side.arm_name();
-        let grasp: MeasuredGrasp = *grasps.get(side);
+        let grasp: GraspMeasurement = grasps[side];
         grasp.map_err(|unmeasured| match unmeasured {
             Unmeasured::NotYet => "the robot has not measured every limb yet".to_string(),
             Unmeasured::Stale => format!("{arm} stopped reporting its joints"),
         })
     };
-    Ok(ArmPair::new(pose(Side::Left)?, pose(Side::Right)?))
+    ArmPair::from_fn(pose).transpose()
 }
 
 /// The poses of a posture result from `answer`: every arm's grasp pose, or
@@ -186,10 +190,10 @@ macro_rules! posture_runner {
     ($fn_name:ident, $action:ident, $name:literal, $posture:expr) => {
         pub async fn $fn_name(
             runner: Arc<NodeRunner>,
-            goal_txs: [mpsc::Sender<Goal>; 2],
-            busy: [Arc<AtomicBool>; 2],
-            fresh: [Arc<AtomicBool>; 2],
-            activity: [LeaderActivity; 2],
+            goal_txs: ArmPair<mpsc::Sender<Goal>>,
+            move_slots: ArmPair<MoveSlot>,
+            fresh: ArmPair<Arc<AtomicBool>>,
+            activity: ArmPair<LeaderActivity>,
             requests: mpsc::Sender<CoordinatorRequest>,
         ) -> Result<()> {
             let mut handle = $action::ActionHandle::expose(&runner).await?;
@@ -197,7 +201,8 @@ macro_rules! posture_runner {
                 let accepted = handle
                     .handle_goal_next_request(|req| {
                         Ok(
-                            match admit_posture(req.data.duration_s, &fresh, &activity, &busy) {
+                            match admit_posture(req.data.duration_s, &fresh, &activity, &move_slots)
+                            {
                                 Ok(()) => $action::GoalDecision::accept(),
                                 Err(f) => $action::GoalDecision::refuse(f.kind.into(), f.message),
                             },
@@ -211,21 +216,20 @@ macro_rules! posture_runner {
                 let cancelled = Arc::new(AtomicBool::new(false));
                 let (done_tx, mut done_rx) = mpsc::channel::<Outcome>(2);
                 let mut pending = 0usize;
-                for side in [Side::Left, Side::Right] {
-                    let idx = side.index();
+                for side in Side::BOTH {
                     let goal = Goal::Joint {
-                        target: $posture(side.model()),
+                        target: $posture(side),
                         duration,
                         reply: JointReply::Ready(ReadyReply {
                             done_tx: done_tx.clone(),
                             cancelled: cancelled.clone(),
                         }),
                     };
-                    if goal_txs[idx].send(goal).await.is_err() {
+                    if goal_txs[side].send(goal).await.is_err() {
                         // The planner is gone; release the claim its goal
                         // would have held.
-                        busy[idx].store(false, Ordering::Release);
-                        error!("{}: {} goal channel closed", $name, side.label());
+                        move_slots[side].release();
+                        error!("{}: {} goal channel closed", $name, side);
                     } else {
                         pending += 1;
                     }
@@ -295,6 +299,41 @@ mod tests {
 
     use srs_model::nalgebra::Vector3;
 
+    use crate::test_support::bundled_arm;
+
+    #[test]
+    fn claiming_both_arms_names_the_busy_arm_and_holds_no_slot_it_refused() {
+        let slot = |claimed: bool| {
+            let move_slot = MoveSlot::default();
+            if claimed {
+                assert!(move_slot.claim());
+            }
+            move_slot
+        };
+        let slots = |left, right| ArmPair::new(slot(left), slot(right));
+        let held =
+            |move_slots: &ArmPair<MoveSlot>| ArmPair::from_fn(|side| move_slots[side].is_claimed());
+        let refused = |message: &str| Err(Failure::new(FailureKind::PreconditionFailed, message));
+
+        let free = slots(false, false);
+        assert_eq!(claim_both(&free), Ok(()));
+        assert_eq!(held(&free), ArmPair::new(true, true));
+
+        let left_busy = slots(true, false);
+        assert_eq!(
+            claim_both(&left_busy),
+            refused("the left arm is already executing a motion")
+        );
+        assert_eq!(held(&left_busy), ArmPair::new(true, false));
+
+        let right_busy = slots(false, true);
+        assert_eq!(
+            claim_both(&right_busy),
+            refused("the right arm is already executing a motion")
+        );
+        assert_eq!(held(&right_busy), ArmPair::new(false, true));
+    }
+
     #[test]
     fn both_postures_sit_inside_both_generations_joint_limits() {
         // The planner sends postures unclamped, so an out-of-limit posture
@@ -304,9 +343,8 @@ mod tests {
         // srs_model arm actually used.
         use openarm_description::{HardwareVersion, JointPosture, home, ready};
         for version in [HardwareVersion::V1, HardwareVersion::V2] {
-            for side in [Side::Left, Side::Right] {
-                let model = crate::arm_model(version, side.model())
-                    .expect("build arm from the bundled URDF");
+            for side in Side::BOTH {
+                let model = bundled_arm(version, side);
                 let limits = model.limits();
                 let postures = [
                     (
@@ -316,12 +354,12 @@ mod tests {
                     ("home", home),
                 ];
                 for (name, posture) in postures {
-                    let q_all = posture(side.model());
+                    let q_all = posture(side);
                     for (j, (&q, limit)) in q_all.iter().zip(&limits).enumerate() {
                         assert!(
                             q >= limit.lo && q <= limit.hi,
                             "{version:?} {} {name} j{}: {q} outside [{}, {}]",
-                            side.label(),
+                            side,
                             j + 1,
                             limit.lo,
                             limit.hi
@@ -344,10 +382,7 @@ mod tests {
 
     /// The coordinator's answer with each arm measured at [`grasp_of`].
     fn both_measured() -> GraspAnswer {
-        Ok(ArmPair::new(
-            Ok(grasp_of(Side::Left)),
-            Ok(grasp_of(Side::Right)),
-        ))
+        Ok(ArmPair::from_fn(|side| Ok(grasp_of(side))))
     }
 
     /// An arm's share that failed with `kind` and `message`.
@@ -464,8 +499,7 @@ mod tests {
     #[test]
     fn the_posture_poses_come_in_arm_name_order() {
         let poses = arm_poses(both_measured(), "move_to_ready");
-        let (positions, orientations) =
-            arm_pose_arrays(&ArmPair::new(grasp_of(Side::Left), grasp_of(Side::Right)));
+        let (positions, orientations) = arm_pose_arrays(&ArmPair::from_fn(grasp_of));
         assert_eq!(poses.arm_names, ["left_arm", "right_arm"]);
         assert_eq!(poses.positions, positions);
         assert_eq!(poses.orientations, orientations);

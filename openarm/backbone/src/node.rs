@@ -1,22 +1,22 @@
-// Node composition: validates every parameter up front, builds the arm models
-// and the self-collision governor, wires the channels, and spawns the services
-// answered from bringup (limb names, camera mounts, workspace) plus the
-// readiness-gated coordination loop, every action handler and every stream
-// listener. All motion and stream logic lives in the sibling modules; this is
-// only the assembly.
-
-use crate::arm_pair::ArmPair;
-use crate::types::{JointVec, Side, limb_names};
+//! Node composition: validates every parameter up front, builds the arm models
+//! and the self-collision governor, wires the channels, and spawns the services
+//! answered from bringup (limb names, camera mounts, workspace) plus the
+//! readiness-gated coordination loop, every action handler and every stream
+//! listener. All motion and stream logic lives in the sibling modules; this is
+//! only the assembly.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use control_core::positive_finite::{NotPositiveFinite, PositiveFinite};
+use control_core::serving;
 use control_core::time::{RateOutOfRange, period_from_hz};
-use openarm_description::HardwareVersion;
+use openarm_description::{ArmPair, HardwareVersion, Side};
 use peppygen::consumed_topics::collision_ctrl::governor_control;
 use peppygen::exposed_services::limb_state::get_limb_names;
 use peppygen::{NodeRunner, Parameters, Result};
+use srs_model::JointVec;
+use srs_model::chain_kinematics::EeCaps;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tracing::{error, info};
@@ -26,15 +26,15 @@ use crate::camera_mounts::{self, CameraMounts};
 use crate::coordinator::{self, ArmChannels};
 use crate::governor;
 use crate::liveness;
+use crate::move_slot::MoveSlot;
 use crate::planner::{PlanConfig, Planner};
-use crate::serving;
 use crate::startup;
 use crate::streams;
 use crate::streams::LeaderActivity;
+use crate::types::limb_names;
 use crate::upstream::UpstreamMode;
 use crate::workspace::Workspace;
 use crate::workspace_service;
-use srs_model::chain_kinematics::EeCaps;
 
 /// The fastest the coordination loop is driven. It paces the same 1 Mbit
 /// CAN FD arms as openarm_arm; the stack runs at 100 Hz.
@@ -99,7 +99,7 @@ pub enum NodeError {
 
     #[error("build the {side} arm model")]
     ArmModel {
-        side: &'static str,
+        side: Side,
         source: srs_model::SrsError,
     },
 
@@ -153,24 +153,20 @@ impl From<NodeError> for peppygen::Error {
     }
 }
 
-/// Spawn a never-returning inbound listener into the backbone's supervised task set,
-/// adapting its `()` output to the set's `Result` so its exit trips the
-/// fatal-first-exit like any other backbone task.
-fn spawn_listener<F>(set: &mut JoinSet<Result<()>>, listener: F)
+/// Spawn a task meant to run for the life of the node (an inbound listener
+/// or a service loop) into the backbone's supervised task set, adapting its
+/// `()` output to the set's `Result` so its exit trips the fatal-first-exit
+/// like any other backbone task.
+fn spawn_supervised<F>(set: &mut JoinSet<Result<()>>, task: F)
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
     set.spawn(async move {
-        listener.await;
+        task.await;
         Ok(())
     });
 }
 
-/// Build one side's arm model from the embedded OpenArm description: the elbow
-/// singularity margin applied, and the URDF's tcp frame mounted so every pose the
-/// backbone solves, reports, or caps the speed of is at the gripper's grasp point.
-/// This is the single site the backbone imposes either, so the model's `limits()`
-/// carry the margin for IK seeding, trajectory sizing and the chase clamp.
 /// The per-joint caps of one kind, each a positive finite number, or the
 /// refusal `refuse` builds naming the joint (counted from 1) and what was
 /// wrong with its value.
@@ -184,6 +180,11 @@ fn joint_caps(
     Ok(caps)
 }
 
+/// Build one side's arm model from the embedded OpenArm description: the elbow
+/// singularity margin applied, and the URDF's tcp frame mounted so every pose the
+/// backbone solves, reports, or caps the speed of is at the gripper's grasp point.
+/// This is the single site the backbone imposes either, so the model's `limits()`
+/// carry the margin for IK seeding, trajectory sizing and the chase clamp.
 pub fn arm_model(
     version: HardwareVersion,
     side: openarm_description::Side,
@@ -293,16 +294,12 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     // resolved from the description rather than configured, so a v2 launch cannot
     // inherit a v1 name. The collision model walks the same chains and takes the
     // base links directly.
-    let left_base = hardware_version.base_link(openarm_description::Side::Left);
-    let right_base = hardware_version.base_link(openarm_description::Side::Right);
+    let bases = ArmPair::from_fn(|side| hardware_version.base_link(side));
     let build_arm = |side: Side| {
-        arm_model(hardware_version, side.model()).map_err(|source| NodeError::ArmModel {
-            side: side.label(),
-            source,
-        })
+        arm_model(hardware_version, side).map_err(|source| NodeError::ArmModel { side, source })
     };
-    let left_model = build_arm(Side::Left)?;
-    let right_model = build_arm(Side::Right)?;
+    let build_arms = || ArmPair::from_fn(&build_arm).transpose();
+    let models = build_arms()?;
     info!("arm models loaded");
 
     // The collision model needs the URDF string (joint limits are irrelevant to it,
@@ -326,15 +323,14 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     let governor = governor::Governor::build(
         hardware_version.urdf(),
         meshes_dir,
-        left_base,
-        right_base,
+        bases,
         params.d_stop_m,
         params.d_safe_m,
         max_joint_velocity_rad_s
             .iter()
             .copied()
             .fold(0.0_f64, f64::max),
-        max_ee_velocity.get(),
+        max_ee_velocity,
         params.max_gripper_rate_frac_s,
         params.collision_governor_enabled,
     )?;
@@ -356,19 +352,15 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     // Where the robot can work, judged from its design on a pair of arm
     // models of its own (the planners own theirs) and its perception
     // camera: a design with more than one candidate stops bringup here.
-    let workspace = Arc::new(Workspace::new(
-        ArmPair::new(build_arm(Side::Left)?, build_arm(Side::Right)?),
-        &mounts,
-    )?);
+    let workspace = Arc::new(Workspace::new(build_arms()?, &mounts)?);
 
-    let left_limits = left_model.limits();
-    let right_limits = right_model.limits();
+    let limits = ArmPair::from_fn(|side| models[side].limits());
     // The chase clamps every streamed/planned target into these limits with
     // `f64::clamp`, which is total only for finite, well-ordered bounds. Refuse
     // here so a malformed URDF stops bringup, not a mid-tick clamp.
-    if !left_limits
+    if !limits
         .iter()
-        .chain(right_limits.iter())
+        .flatten()
         .all(|l| l.lo.is_finite() && l.hi.is_finite() && l.lo <= l.hi)
     {
         return Err(NodeError::JointLimits);
@@ -384,28 +376,20 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         },
         limits,
     };
-    let planners = ArmPair::new(
-        Planner::new(Side::Left, left_model, plan_cfg(left_limits)),
-        Planner::new(Side::Right, right_model, plan_cfg(right_limits)),
-    );
+    let planners = models.map(|side, model| Planner::new(side, model, plan_cfg(limits[side])));
 
     // Per-arm channels. Listeners fill the watch slots; action handlers send
     // accepted goals; the coordinator reads all of it and, while a move runs,
     // clears that side's command watch. The command streams are held by the
-    // coordinator as their sender (read + clear); the listener keeps a clone,
-    // so no separate receiver is needed. State streams stay reader-side.
-    let (cmd_tx0, _) = watch::channel(None);
-    let (cmd_tx1, _) = watch::channel(None);
-    let (gripcmd_tx0, _) = watch::channel(None);
-    let (gripcmd_tx1, _) = watch::channel(None);
-    let (meas_tx0, meas_rx0) = watch::channel(None);
-    let (meas_tx1, meas_rx1) = watch::channel(None);
-    let (grip_tx0, grip_rx0) = watch::channel(None);
-    let (grip_tx1, grip_rx1) = watch::channel(None);
-    let (goal_tx0, goal_rx0) = mpsc::channel(1);
-    let (goal_tx1, goal_rx1) = mpsc::channel(1);
-    let (grip_goal_tx0, grip_goal_rx0) = mpsc::channel(1);
-    let (grip_goal_tx1, grip_goal_rx1) = mpsc::channel(1);
+    // coordinator as their sender (read + clear); the listener keeps a clone.
+    // State streams stay reader-side: the coordinator reads a receiver
+    // subscribed to the listener's sender.
+    let command_txs = ArmPair::from_fn(|_| watch::channel(None).0);
+    let gripper_command_txs = ArmPair::from_fn(|_| watch::channel(None).0);
+    let measured_txs = ArmPair::from_fn(|_| watch::channel(None).0);
+    let gripper_state_txs = ArmPair::from_fn(|_| watch::channel(None).0);
+    let (goal_txs, goal_rxs) = ArmPair::from_fn(|_| mpsc::channel(1)).unzip();
+    let (gripper_goal_txs, gripper_goal_rxs) = ArmPair::from_fn(|_| mpsc::channel(1)).unzip();
     // The limb_motion services and the posture moves send their requests to
     // the coordinator here: a stop, a plan check or a grasp request. The
     // coordinator answers each on the tick after it is queued.
@@ -413,24 +397,12 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     // The grasp poses of the last limb_state snapshot, for the camera
     // mounts service.
     let (grasps_tx, grasps_rx) = watch::channel(None);
-    let busy = [
-        Arc::new(AtomicBool::new(false)),
-        Arc::new(AtomicBool::new(false)),
-    ];
-    let gripper_busy = [
-        Arc::new(AtomicBool::new(false)),
-        Arc::new(AtomicBool::new(false)),
-    ];
+    let move_slots = ArmPair::from_fn(|_| MoveSlot::default());
+    let gripper_move_slots = ArmPair::from_fn(|_| MoveSlot::default());
     // Whether each limb's follower delivers fresh state: the coordinator
     // writes these every tick, and the goal handlers refuse on them.
-    let fresh = [
-        Arc::new(AtomicBool::new(false)),
-        Arc::new(AtomicBool::new(false)),
-    ];
-    let gripper_fresh = [
-        Arc::new(AtomicBool::new(false)),
-        Arc::new(AtomicBool::new(false)),
-    ];
+    let fresh = ArmPair::from_fn(|_| Arc::new(AtomicBool::new(false)));
+    let gripper_fresh = ArmPair::from_fn(|_| Arc::new(AtomicBool::new(false)));
     let (config_tx, config_rx) = watch::channel(streams::GovernorConfig {
         enabled: params.collision_governor_enabled,
         d_stop: params.d_stop_m,
@@ -439,38 +411,26 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         max_gripper_rate_frac_s: params.max_gripper_rate_frac_s,
     });
 
-    let arm_activity = [LeaderActivity::default(), LeaderActivity::default()];
-    let gripper_activity = [LeaderActivity::default(), LeaderActivity::default()];
-    let channels = ArmPair::new(
-        ArmChannels {
-            command: cmd_tx0.clone(),
-            gripper_command: gripcmd_tx0.clone(),
-            leader: arm_activity[0].clone(),
-            gripper_leader: gripper_activity[0].clone(),
-            measured: meas_rx0,
-            gripper: grip_rx0,
-            goals: goal_rx0,
-            busy: busy[0].clone(),
-            gripper_goals: grip_goal_rx0,
-            gripper_busy: gripper_busy[0].clone(),
-            fresh: fresh[0].clone(),
-            gripper_fresh: gripper_fresh[0].clone(),
-        },
-        ArmChannels {
-            command: cmd_tx1.clone(),
-            gripper_command: gripcmd_tx1.clone(),
-            leader: arm_activity[1].clone(),
-            gripper_leader: gripper_activity[1].clone(),
-            measured: meas_rx1,
-            gripper: grip_rx1,
-            goals: goal_rx1,
-            busy: busy[1].clone(),
-            gripper_goals: grip_goal_rx1,
-            gripper_busy: gripper_busy[1].clone(),
-            fresh: fresh[1].clone(),
-            gripper_fresh: gripper_fresh[1].clone(),
-        },
-    );
+    // When a leader last streamed each limb: the goal handlers refuse a goal
+    // on a limb a leader is streaming.
+    let arm_activity = ArmPair::from_fn(|_| LeaderActivity::default());
+    let gripper_activity = ArmPair::from_fn(|_| LeaderActivity::default());
+    let channels = goal_rxs
+        .zip(gripper_goal_rxs)
+        .map(|side, (goals, gripper_goals)| ArmChannels {
+            command: command_txs[side].clone(),
+            gripper_command: gripper_command_txs[side].clone(),
+            leader: arm_activity[side].clone(),
+            gripper_leader: gripper_activity[side].clone(),
+            measured: measured_txs[side].subscribe(),
+            gripper: gripper_state_txs[side].subscribe(),
+            goals,
+            move_slot: move_slots[side].clone(),
+            gripper_goals,
+            gripper_move_slot: gripper_move_slots[side].clone(),
+            fresh: fresh[side].clone(),
+            gripper_fresh: gripper_fresh[side].clone(),
+        });
 
     // The limb name tables, answered for the life of the node and ahead of the
     // readiness gate below: they are fixed, so a consumer learns which limbs
@@ -479,7 +439,7 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         let runner = node_runner.clone();
         let token = node_runner.cancellation_token().clone();
         tokio::spawn(async move {
-            serving::serve("get_limb_names", &token, || {
+            serving::serve("get_limb_names", token.cancelled(), || {
                 get_limb_names::handle_next_request(&runner, |_request| {
                     let names = limb_names();
                     Ok(get_limb_names::Response::new(
@@ -514,9 +474,6 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     // task so this setup closure returns promptly for the health probe.
     let runner = node_runner.clone();
     let token = node_runner.cancellation_token().clone();
-    let goal_busy = [busy[0].clone(), busy[1].clone()];
-    // When a leader last streamed each limb: the goal handlers refuse a goal
-    // on a limb a leader is streaming.
     tokio::spawn(async move {
         startup::wait_until_ready(&runner, &token).await;
 
@@ -543,49 +500,56 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         ));
         set.spawn(actions::arm::run_move_arm_joints(
             runner.clone(),
-            [goal_tx0.clone(), goal_tx1.clone()],
-            [goal_busy[0].clone(), goal_busy[1].clone()],
+            goal_txs.clone(),
+            move_slots.clone(),
             fresh.clone(),
             arm_activity.clone(),
-            [left_limits, right_limits],
+            limits,
         ));
         set.spawn(actions::arm::run_move_arm(
             runner.clone(),
-            [goal_tx0.clone(), goal_tx1.clone()],
-            [goal_busy[0].clone(), goal_busy[1].clone()],
+            goal_txs.clone(),
+            move_slots.clone(),
             fresh.clone(),
             arm_activity.clone(),
         ));
         set.spawn(actions::postures::run_move_to_ready(
             runner.clone(),
-            [goal_tx0.clone(), goal_tx1.clone()],
-            [goal_busy[0].clone(), goal_busy[1].clone()],
+            goal_txs.clone(),
+            move_slots.clone(),
             fresh.clone(),
             arm_activity.clone(),
             request_tx.clone(),
         ));
         set.spawn(actions::postures::run_move_to_home(
             runner.clone(),
-            [goal_tx0, goal_tx1],
-            [goal_busy[0].clone(), goal_busy[1].clone()],
+            goal_txs,
+            move_slots,
             fresh.clone(),
             arm_activity.clone(),
             request_tx.clone(),
         ));
         set.spawn(actions::gripper::run_move_gripper(
             runner.clone(),
-            [grip_goal_tx0, grip_goal_tx1],
-            [gripper_busy[0].clone(), gripper_busy[1].clone()],
+            gripper_goal_txs,
+            gripper_move_slots,
             gripper_fresh.clone(),
             gripper_activity.clone(),
         ));
-        set.spawn(actions::stop::run_stop(runner.clone(), request_tx.clone()));
-        set.spawn(actions::arm::run_check_arm_move(
-            runner.clone(),
-            request_tx,
-            fresh.clone(),
-            arm_activity.clone(),
-        ));
+        spawn_supervised(
+            &mut set,
+            actions::stop::run_stop(runner.clone(), token.clone(), request_tx.clone()),
+        );
+        spawn_supervised(
+            &mut set,
+            actions::arm::run_check_arm_move(
+                runner.clone(),
+                token.clone(),
+                request_tx,
+                fresh.clone(),
+                arm_activity.clone(),
+            ),
+        );
 
         // Inbound listeners buffer the latest message into the watch slots. They
         // run under the same fatal-first-exit supervision as the rest of the backbone,
@@ -595,40 +559,32 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         // Exactly one upstream listener; the other slot kind is never
         // subscribed.
         match upstream_mode {
-            UpstreamMode::Joints => spawn_listener(
+            UpstreamMode::Joints => spawn_supervised(
                 &mut set,
-                streams::run_joint_command_listener(
-                    runner.clone(),
-                    [cmd_tx0, cmd_tx1],
-                    arm_activity,
-                ),
+                streams::run_joint_command_listener(runner.clone(), command_txs, arm_activity),
             ),
-            UpstreamMode::Pose => spawn_listener(
+            UpstreamMode::Pose => spawn_supervised(
                 &mut set,
-                streams::run_pose_command_listener(
-                    runner.clone(),
-                    [cmd_tx0, cmd_tx1],
-                    arm_activity,
-                ),
+                streams::run_pose_command_listener(runner.clone(), command_txs, arm_activity),
             ),
         }
-        spawn_listener(
+        spawn_supervised(
             &mut set,
             streams::run_gripper_command_listener(
                 runner.clone(),
-                [gripcmd_tx0, gripcmd_tx1],
+                gripper_command_txs,
                 gripper_activity,
             ),
         );
-        spawn_listener(
+        spawn_supervised(
             &mut set,
-            streams::run_joint_state_listener(runner.clone(), [meas_tx0, meas_tx1]),
+            streams::run_joint_state_listener(runner.clone(), measured_txs),
         );
-        spawn_listener(
+        spawn_supervised(
             &mut set,
-            streams::run_gripper_state_listener(runner.clone(), [grip_tx0, grip_tx1]),
+            streams::run_gripper_state_listener(runner.clone(), gripper_state_txs),
         );
-        spawn_listener(
+        spawn_supervised(
             &mut set,
             streams::run_governor_config_listener(runner.clone(), config_tx),
         );

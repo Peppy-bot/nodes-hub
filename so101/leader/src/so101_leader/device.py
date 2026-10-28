@@ -10,25 +10,22 @@ deadman.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
 from typing import Protocol
 
 from control_core_py.device import DeviceThread, LatestSlot
 from control_core_py.runtime import Latch, RateMeter, log
-from so101_description.device import connect_calibrated, read_positions_validated
+from so101_description.device import (
+    PositionSample,
+    connect_calibrated,
+    motor_positions,
+    read_position_sample,
+)
 
 # Sustained read failure before a reconnect attempt, and the pace of further
 # attempts: USB serial adapters drop and re-enumerate under the same udev
 # symlink, and the staleness deadman keeps the follower safe meanwhile.
 RECONNECT_AFTER_S = 1.0
 RECONNECT_BACKOFF_S = 5.0
-
-
-@dataclass(frozen=True)
-class LeaderSample:
-    positions_deg: tuple[float, ...]
-    gripper_percent: float
-    captured_monotonic: float
 
 
 class LeaderHardware(Protocol):
@@ -76,8 +73,7 @@ class LerobotLeader:
         connect_calibrated(self._teleop, "leader arm")
 
     def read_positions(self) -> dict[str, float]:
-        action = self._teleop.get_action()
-        return {key.removesuffix(".pos"): value for key, value in action.items()}
+        return motor_positions(self._teleop.get_action())
 
     def disconnect(self) -> None:
         # Idempotent: the calibration-failure path disconnects before
@@ -114,17 +110,17 @@ class DeviceLoop(DeviceThread):
         self._last_success_monotonic = 0.0
         self._last_reconnect_monotonic = 0.0
 
-    def fresh_sample(self, stale_timeout_s: float) -> LeaderSample | None:
+    def fresh_sample(self, stale_timeout_s: float) -> PositionSample | None:
         """The newest sample, or None once it is older than the deadman gate."""
         return self._sample.fresh(stale_timeout_s)
 
     def _verify_first_read(self) -> None:
-        self._read_once(raise_on_error=True)
+        self._read_sample(raise_on_error=True)
         self._last_success_monotonic = time.monotonic()
 
     def _tick(self) -> None:
         self._rate.tick()
-        self._read_once()
+        self._read_sample()
         self._maybe_reconnect()
 
     def _maybe_reconnect(self) -> None:
@@ -148,14 +144,9 @@ class DeviceLoop(DeviceThread):
         self._reconnect_failing.clear()
         log("leader bus reconnected")
 
-    def _read_once(self, raise_on_error: bool = False) -> None:
+    def _read_sample(self, raise_on_error: bool = False) -> None:
         try:
-            positions_deg, gripper_percent = read_positions_validated(self._hardware)
-            sample = LeaderSample(
-                positions_deg=positions_deg,
-                gripper_percent=gripper_percent,
-                captured_monotonic=time.monotonic(),
-            )
+            sample = read_position_sample(self._hardware)
         except Exception as e:
             if raise_on_error:
                 raise

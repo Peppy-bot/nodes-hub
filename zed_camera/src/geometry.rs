@@ -1,5 +1,5 @@
 //! Where the two published streams' pixels point, in the terms of
-//! camera_geometry:v1.
+//! camera_geometry:v1, and the millimetres of depth a disparity sample is.
 //!
 //! Nothing here touches OpenCV or the device: it takes the rectified left
 //! projection `stereo_rectify` produced and the sizes the node publishes, and
@@ -18,10 +18,16 @@
 //! A value the contract cannot carry (a focal length that is not a positive
 //! number, a depth range that is not one) is refused with the reason rather
 //! than answered: a consumer divides by these numbers.
+//!
+//! [`depth_mm`] turns one SGBM disparity sample into the z16 reading the
+//! depth stream carries, at most [`MAX_Z16_DEPTH_MM`].
 
-/// The largest reading the depth stream carries, millimetres. The conversion
-/// below keeps 65535 out of the stream, so the last z16 value is never a
-/// reading.
+use camera_core::geometry::{focal_lengths_are_valid, principal_point_is_valid};
+
+use crate::size::Size;
+
+/// The largest reading the depth stream carries, millimetres. [`depth_mm`]
+/// keeps 65535 out of the stream, so the last z16 value is never a reading.
 pub const MAX_Z16_DEPTH_MM: f64 = 65534.0;
 
 /// One stream's pinhole model as camera_geometry:v1 answers it. Both streams
@@ -65,12 +71,12 @@ impl Pinhole {
     /// whole numbers the principal point moves to (c + 0.5) * s - 0.5 and the
     /// focal length scales by s. The scale is the ratio of the sizes, per
     /// axis, which is what the resize really applied.
-    pub fn resized(&self, width: u32, height: u32) -> Self {
-        let sx = f64::from(width) / f64::from(self.width);
-        let sy = f64::from(height) / f64::from(self.height);
+    pub fn resized(&self, size: Size) -> Self {
+        let sx = f64::from(size.width) / f64::from(self.width);
+        let sy = f64::from(size.height) / f64::from(self.height);
         Self {
-            width,
-            height,
+            width: size.width,
+            height: size.height,
             fx: self.fx * sx,
             fy: self.fy * sy,
             cx: (self.cx + 0.5) * sx - 0.5,
@@ -80,30 +86,30 @@ impl Pinhole {
 }
 
 impl Geometry {
-    /// The geometry of the two published streams. `eye` is the size of the
+    /// The geometry of the two published streams. `color` is the size of the
     /// colour stream, `left` the projection it was rectified into, `depth`
     /// the size of the depth stream, and the depth range is the matcher's, in
     /// millimetres as the matcher counts them.
     pub fn new(
-        eye: (u32, u32),
+        color: Size,
         left: RectifiedLeft,
-        depth: (u32, u32),
+        depth: Size,
         min_depth_mm: f64,
         max_depth_mm: f64,
     ) -> Result<Self, String> {
         let RectifiedLeft { fx, fy, cx, cy } = left;
-        if eye.0 == 0 || eye.1 == 0 || depth.0 == 0 || depth.1 == 0 {
+        if color.width == 0 || color.height == 0 || depth.width == 0 || depth.height == 0 {
             return Err(format!(
                 "a published stream has no size: colour {}x{}, depth {}x{}",
-                eye.0, eye.1, depth.0, depth.1
+                color.width, color.height, depth.width, depth.height
             ));
         }
-        if !(fx.is_finite() && fx > 0.0 && fy.is_finite() && fy > 0.0) {
+        if !focal_lengths_are_valid(fx, fy) {
             return Err(format!(
                 "the rectified focal lengths are not positive numbers: fx {fx}, fy {fy}"
             ));
         }
-        if !(cx.is_finite() && cy.is_finite()) {
+        if !principal_point_is_valid(cx, cy) {
             return Err(format!(
                 "the rectified principal point is not a number: cx {cx}, cy {cy}"
             ));
@@ -118,8 +124,8 @@ impl Geometry {
             ));
         }
         let color = Pinhole {
-            width: eye.0,
-            height: eye.1,
+            width: color.width,
+            height: color.height,
             fx,
             fy,
             cx,
@@ -127,7 +133,7 @@ impl Geometry {
         };
         Ok(Self {
             color,
-            depth: color.resized(depth.0, depth.1),
+            depth: color.resized(depth),
             min_depth_m: min_depth_mm / 1000.0,
             max_depth_m: max_depth_mm / 1000.0,
         })
@@ -165,13 +171,17 @@ mod tests {
         cy: 351.5,
     };
 
-    fn geometry(depth: (u32, u32)) -> Geometry {
-        Geometry::new((1280, 720), LEFT, depth, 100.0, 65534.0).unwrap()
+    fn size(width: u32, height: u32) -> Size {
+        Size { width, height }
+    }
+
+    fn geometry(depth: Size) -> Geometry {
+        Geometry::new(size(1280, 720), LEFT, depth, 100.0, 65534.0).unwrap()
     }
 
     #[test]
     fn the_colour_model_is_the_rectified_projection_unchanged() {
-        let color = geometry((640, 360)).color;
+        let color = geometry(size(640, 360)).color;
         assert_eq!((color.width, color.height), (1280, 720));
         assert_eq!((color.fx, color.fy), (LEFT.fx, LEFT.fy));
         assert_eq!((color.cx, color.cy), (LEFT.cx, LEFT.cy));
@@ -179,7 +189,7 @@ mod tests {
 
     #[test]
     fn the_depth_model_is_the_colour_one_through_the_resized_grid() {
-        let depth = geometry((640, 360)).depth;
+        let depth = geometry(size(640, 360)).depth;
         assert_eq!((depth.width, depth.height), (640, 360));
         assert_eq!((depth.fx, depth.fy), (350.125, 350.375));
         // (c + 0.5) / 2 - 0.5, not c / 2: halving the principal point would
@@ -191,7 +201,7 @@ mod tests {
 
     #[test]
     fn a_depth_stream_at_full_size_shares_the_colour_model() {
-        let g = geometry((1280, 720));
+        let g = geometry(size(1280, 720));
         assert_eq!(g.depth, g.color);
     }
 
@@ -199,7 +209,7 @@ mod tests {
     fn a_resized_grid_keeps_every_ray_where_it_was() {
         // A point of the scene projects to the same place in both grids: a
         // pixel of the small grid is the centre of the block it averages.
-        let g = geometry((320, 180));
+        let g = geometry(size(320, 180));
         let (x, y, z) = (0.3, -0.2, 1.5);
         let u_color = g.color.fx * x / z + g.color.cx;
         let v_color = g.color.fy * y / z + g.color.cy;
@@ -213,14 +223,14 @@ mod tests {
     fn the_scale_is_the_ratio_of_the_sizes_on_each_axis() {
         // hd2k is 1242 high: a downscale of 4 publishes 310 rows, and the
         // resize scaled the rows by 310 / 1242, not by a quarter.
-        let g = Geometry::new((2208, 1242), LEFT, (552, 310), 100.0, 65534.0).unwrap();
+        let g = Geometry::new(size(2208, 1242), LEFT, size(552, 310), 100.0, 65534.0).unwrap();
         assert_eq!(g.depth.fx, LEFT.fx * 0.25);
         assert_eq!(g.depth.fy, LEFT.fy * 310.0 / 1242.0);
     }
 
     #[test]
     fn the_depth_range_is_answered_in_metres() {
-        let g = Geometry::new((1280, 720), LEFT, (640, 360), 98.5, 65534.0).unwrap();
+        let g = Geometry::new(size(1280, 720), LEFT, size(640, 360), 98.5, 65534.0).unwrap();
         assert_eq!(g.min_depth_m, 0.0985);
         assert_eq!(g.max_depth_m, 65.534);
     }
@@ -229,9 +239,9 @@ mod tests {
     fn values_a_consumer_cannot_divide_by_are_refused_with_the_reason() {
         for bad in [0.0, -700.0, f64::NAN, f64::INFINITY] {
             let refused = Geometry::new(
-                (1280, 720),
+                size(1280, 720),
                 RectifiedLeft { fx: bad, ..LEFT },
-                (640, 360),
+                size(640, 360),
                 100.0,
                 65534.0,
             )
@@ -239,9 +249,9 @@ mod tests {
             assert!(refused.contains("focal lengths"), "{refused}");
             assert!(
                 Geometry::new(
-                    (1280, 720),
+                    size(1280, 720),
                     RectifiedLeft { fy: bad, ..LEFT },
-                    (640, 360),
+                    size(640, 360),
                     100.0,
                     65534.0
                 )
@@ -249,26 +259,27 @@ mod tests {
             );
         }
         let refused = Geometry::new(
-            (1280, 720),
+            size(1280, 720),
             RectifiedLeft {
                 cx: f64::NAN,
                 ..LEFT
             },
-            (640, 360),
+            size(640, 360),
             100.0,
             65534.0,
         )
         .unwrap_err();
         assert!(refused.contains("principal point"), "{refused}");
-        assert!(Geometry::new((1280, 720), LEFT, (0, 360), 100.0, 65534.0).is_err());
-        assert!(Geometry::new((0, 720), LEFT, (640, 360), 100.0, 65534.0).is_err());
+        assert!(Geometry::new(size(1280, 720), LEFT, size(0, 360), 100.0, 65534.0).is_err());
+        assert!(Geometry::new(size(0, 720), LEFT, size(640, 360), 100.0, 65534.0).is_err());
         for (min, max) in [
             (0.0, 65534.0),
             (100.0, 100.0),
             (f64::NAN, 65534.0),
             (100.0, f64::INFINITY),
         ] {
-            let refused = Geometry::new((1280, 720), LEFT, (640, 360), min, max).unwrap_err();
+            let refused =
+                Geometry::new(size(1280, 720), LEFT, size(640, 360), min, max).unwrap_err();
             assert!(refused.contains("depth range"), "{refused}");
         }
     }
