@@ -1,6 +1,6 @@
-"""The headset's side of fleet:v1: the listing, the robot states, the two
-long goals and the calls of a lease holder, against the generated mock of the
-daemon target."""
+"""The headset's side of robot_leases:v1: the listing, the robot states, the
+two long goals and the calls of a lease holder, against the generated mock of
+the daemon target."""
 
 import asyncio
 import contextlib

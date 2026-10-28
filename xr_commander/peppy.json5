@@ -71,7 +71,7 @@
       // The robot leases and the halt of the stack: the fleet listing and
       // its changes, and the lease of the robot a person drives.
       daemon: [
-        { name: "fleet", tag: "v1", link_id: "fleet" },
+        { name: "robot_leases", tag: "v1", link_id: "fleet" },
       ],
     },
   },
