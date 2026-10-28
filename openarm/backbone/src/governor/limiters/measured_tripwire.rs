@@ -11,7 +11,7 @@
 
 use tracing::{info, warn};
 
-use super::super::{ArmPair, GovState, Governor, Step, concat, is_left_dof};
+use super::super::{ArmPair, GovState, Governor, Side, Step, concat, dof_side};
 use super::Limiter;
 use super::allowance::Allowance;
 
@@ -79,30 +79,22 @@ impl Governor {
         }
 
         let d_cand = self.distance_at(&concat(cand))?;
-        let solo = |side_is_left: bool| GovState {
-            arms: ArmPair::new(
-                if side_is_left { cand } else { prev }.arms.left,
-                if side_is_left { prev } else { cand }.arms.right,
-            ),
-            grippers: ArmPair::new(
-                if side_is_left { cand } else { prev }.grippers.left,
-                if side_is_left { prev } else { cand }.grippers.right,
-            ),
+        let solo = |side: Side| {
+            let state_of = |each: Side| if each == side { cand } else { prev };
+            GovState::new(
+                ArmPair::from_fn(|each| state_of(each).arms[each]),
+                ArmPair::from_fn(|each| state_of(each).grippers[each]),
+            )
         };
-        let moves = |side_is_left: bool| {
-            let (c, p) = (cand, prev);
-            if side_is_left {
-                c.arms.left != p.arms.left || c.grippers.left != p.grippers.left
-            } else {
-                c.arms.right != p.arms.right || c.grippers.right != p.grippers.right
-            }
+        let moves = |side: Side| {
+            cand.arms[side] != prev.arms[side] || cand.grippers[side] != prev.grippers[side]
         };
-        let sample = |g: &mut Self, side_is_left: bool| -> Option<f64> {
-            moves(side_is_left)
-                .then(|| g.distance_at(&concat(&solo(side_is_left))))
+        let sample = |g: &mut Self, side: Side| -> Option<f64> {
+            moves(side)
+                .then(|| g.distance_at(&concat(&solo(side))))
                 .flatten()
         };
-        let d_solo = ArmPair::new(sample(self, true), sample(self, false));
+        let d_solo = ArmPair::from_fn(|side| sample(self, side));
         Some(Tripwire { d_cand, d_solo })
     }
 }
@@ -144,22 +136,28 @@ impl Limiter for MeasuredTripwire<'_> {
         if tripwire.d_cand >= self.d_prev {
             return Allowance::FULL;
         }
-        // The joint candidate closes, so free at most one side: the two can
-        // each open alone yet still converge on the same gap together.
-        match (opens(tripwire.d_solo.left), opens(tripwire.d_solo.right)) {
-            (Some(left), Some(right)) => Allowance::gate(|i| is_left_dof(i) == (left >= right)),
-            (Some(_), None) => Allowance::gate(is_left_dof),
-            (None, Some(_)) => Allowance::gate(|i| !is_left_dof(i)),
-            (None, None) => Allowance::FREEZE,
-        }
+        // The joint candidate closes, so free at most one side, the one that
+        // opens more and the left one on a tie: the two can each open alone
+        // yet still converge on the same gap together.
+        let freed = match (opens(tripwire.d_solo.left), opens(tripwire.d_solo.right)) {
+            (Some(left), Some(right)) => {
+                if left >= right {
+                    Side::Left
+                } else {
+                    Side::Right
+                }
+            }
+            (Some(_), None) => Side::Left,
+            (None, Some(_)) => Side::Right,
+            (None, None) => return Allowance::FREEZE,
+        };
+        Allowance::gate(|i| dof_side(i) == freed)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::types::ARM_DOF;
-
-    use super::super::super::{GOV_DOF, LEFT_GRIPPER, RIGHT_GRIPPER};
+    use super::super::super::{GOV_DOF, split};
     use super::*;
 
     const D_PREV: f64 = 0.004;
@@ -177,19 +175,15 @@ mod tests {
         })
     }
 
-    fn frees(a: &Allowance, left_side: bool) -> bool {
-        let arm = if left_side { 0 } else { ARM_DOF };
-        let gripper = if left_side {
-            LEFT_GRIPPER
-        } else {
-            RIGHT_GRIPPER
-        };
+    /// Whether `a` frees each side: its first joint and its opening take the
+    /// whole of a unit step.
+    fn freed(a: &Allowance) -> ArmPair<bool> {
         let step = Step {
             prev: [0.0; GOV_DOF],
             target: [1.0; GOV_DOF],
         };
-        let governed = a.apply(&step);
-        governed[arm] == 1.0 && governed[gripper] == 1.0
+        let governed = split(&a.apply(&step));
+        ArmPair::from_fn(|side| governed.arms[side][0] == 1.0 && governed.grippers[side] == 1.0)
     }
 
     /// The four-way side-freeing decision, pinned as a table without any
@@ -203,24 +197,24 @@ mod tests {
 
         // Both sides open alone: the one opening more is freed, the other held.
         let a = allowance_for(ArmPair::new(opens_a_little, opens_more), 0.0);
-        assert!(!frees(&a, true) && frees(&a, false));
+        assert_eq!(freed(&a), ArmPair::new(false, true));
         let a = allowance_for(ArmPair::new(opens_more, opens_a_little), 0.0);
-        assert!(frees(&a, true) && !frees(&a, false));
+        assert_eq!(freed(&a), ArmPair::new(true, false));
 
         // A tie frees the left side (the match's documented >= choice).
         let a = allowance_for(ArmPair::new(opens_more, opens_more), 0.0);
-        assert!(frees(&a, true) && !frees(&a, false));
+        assert_eq!(freed(&a), ArmPair::new(true, false));
 
         // Exactly one side opens alone: that side and only that side is free.
         let a = allowance_for(ArmPair::new(opens_more, closing), 0.0);
-        assert!(frees(&a, true) && !frees(&a, false));
+        assert_eq!(freed(&a), ArmPair::new(true, false));
         let a = allowance_for(ArmPair::new(closing, opens_more), 0.0);
-        assert!(!frees(&a, true) && frees(&a, false));
+        assert_eq!(freed(&a), ArmPair::new(false, true));
 
         // A side that does not move (or whose query failed) reads None and is
         // held, exactly like a closing one.
         let a = allowance_for(ArmPair::new(None, opens_more), 0.0);
-        assert!(!frees(&a, true) && frees(&a, false));
+        assert_eq!(freed(&a), ArmPair::new(false, true));
 
         // Neither opens alone: everything freezes.
         let a = allowance_for(ArmPair::new(closing, None), 0.0);

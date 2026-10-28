@@ -14,6 +14,11 @@ import threading
 from collections.abc import Mapping
 from types import ModuleType
 
+# How a robot joins the stack as a copy, which the fleet listing names and the
+# headset leads.
+JOIN_COMMAND = "peppy stack join OPTION:NAME --with robot_commander=none"
+JOIN_HINT = f"Join one with robot_commander=none: {JOIN_COMMAND}"
+
 
 def robot_of_peer(member) -> str:
     """A pair's robot: the copy its backbone runs in, or the backbone's
@@ -113,20 +118,12 @@ class PairedRobots:
         return self.producer_of(module, self.chosen())
 
     def producer_of(self, module: ModuleType, robot: str | None):
-        """The producer on `module`'s contract slot that serves `robot`, or
-        None while none does: the robot's own, else one outside any copy
-        that is no robot itself (a recorder the launcher deploys beside the
-        robots serves each of them)."""
+        """The producer on `module`'s contract slot that serves `robot`: the
+        robot's own, or None while it has none."""
         if robot is None:
             return None
         members = module.bound_members(self._node_runner)
-        own = (m for m in members if robot_of_producer(m) == robot)
-        # A robot that ever paired is a robot, its pairs restarting or not.
-        robots = self._first_paired
-        shared = (
-            m for m in members if m.copy is None and robot_of_producer(m) not in robots
-        )
-        member = next(own, None) or next(shared, None)
+        member = next((m for m in members if robot_of_producer(m) == robot), None)
         return member.producer if member is not None else None
 
     def choose(self, name: str) -> bool:

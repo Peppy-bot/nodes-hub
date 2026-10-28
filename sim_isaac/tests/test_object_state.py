@@ -15,7 +15,10 @@ _HALF_TURN = 2 ** -0.5  # a 90 degree yaw is (0, 0, sin 45, cos 45) in x, y, z, 
 
 
 def _spawned(object_id, physics, mass=0.5, scale=2.0):
-    return {"object_id": object_id, "asset_id": f"props/{object_id}", "physics": physics, "mass": mass, "scale": scale}
+    return {
+        "object_id": object_id, "name": object_id.removeprefix("obj_"), "asset_id": f"props/{object_id}",
+        "physics": physics, "mass": mass, "scale": scale,
+    }
 
 
 class FakeBodyView:
@@ -82,6 +85,7 @@ def test_static_and_visual_only_objects_report_their_authored_pose_at_rest(engin
             "linear_velocity": [0.0, 0.0, 0.0], "angular_velocity": [0.0, 0.0, 0.0],
         },
     ]
+    assert [record.name for record in records] == ["table", "marker"]
     assert engine.trace == [], "nothing dynamic, so PhysX is not asked"
 
 

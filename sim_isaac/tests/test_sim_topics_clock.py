@@ -187,7 +187,8 @@ def test_object_snapshots_publish_whole_and_drop_while_one_is_in_flight(io, loop
     def snapshot(timestamp_s, *object_ids):
         return object_state.ObjectStateSnapshot(timestamp_s=timestamp_s, objects=tuple(
             object_state.ObjectRecord(
-                object_id=object_id, asset_id="props/blocks/red_block", physics="dynamic", mass=0.1, scale=1.0,
+                object_id=object_id, name=object_id, asset_id="props/blocks/red_block", physics="dynamic", mass=0.1,
+                scale=1.0,
                 position=(0.5, 0.0, 0.8), orientation=(0.0, 0.0, 0.0, 1.0),
                 linear_velocity=(0.0, 0.0, -0.2), angular_velocity=(0.0, 0.0, 0.0),
             )

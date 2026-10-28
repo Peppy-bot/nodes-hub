@@ -106,7 +106,7 @@ class FakeReader:
             raise RuntimeError(self.failure)
         return [
             self._record(
-                object_id=obj["object_id"], asset_id=obj["asset_id"], physics=obj["physics"],
+                object_id=obj["object_id"], name=obj["name"], asset_id=obj["asset_id"], physics=obj["physics"],
                 mass=obj["mass"], scale=obj["scale"], position=tuple(self._stage[obj["object_id"]]),
                 orientation=(0.0, 0.0, 0.0, 1.0), linear_velocity=(0.0, 0.0, 0.0), angular_velocity=(0.0, 0.0, 0.0),
             )
@@ -214,12 +214,14 @@ def test_the_inventory_lists_every_spawned_object_with_its_category_and_pose(pro
     assert response.timestamp == 10.0
     assert [vars(item) for item in response.objects] == [
         {
-            "object_id": red, "asset_id": "props/blocks/red_block", "category": "Blocks", "source": "spawned",
+            "object_id": red, "name": "red_block", "asset_id": "props/blocks/red_block", "category": "Blocks",
+            "source": "spawned",
             "physics": "dynamic", "mass": 0.1, "scale": 1.0, "position": [0.5, 0.0, 0.8],
             "orientation": [0.0, 0.0, 0.0, 1.0],
         },
         {
-            "object_id": blue, "asset_id": "props/blocks/blue_block", "category": "Blocks", "source": "spawned",
+            "object_id": blue, "name": "blue_block", "asset_id": "props/blocks/blue_block", "category": "Blocks",
+            "source": "spawned",
             "physics": "dynamic", "mass": 0.1, "scale": 1.0, "position": [1.0, 2.0, 3.0],
             "orientation": [0.0, 0.0, 0.0, 1.0],
         },
@@ -264,6 +266,23 @@ def _assert_no_object(provider, object_id, kind, reason):
     assert _refused(provider, lambda: provider.io._handle_get_object(_object_request(object_id)), kind) == reason
 
 
+def test_the_inventory_and_one_object_give_the_asked_name_as_the_capture_holds_it(provider):
+    """Both give the name the spawn asked for, whatever its feeder, read
+    from the capture that gives the pose: an object removed after that
+    capture answers under its name until the next one."""
+    provider.io.set_assets(_CATALOGUE)
+    crate = provider.io._execute(provider.launcher, "spawn_object", _spawn_request(name="crate", feeder="hopper_1"))
+    object_id = crate["object_id"]
+    provider.io.capture_object_states()
+    provider.io._execute(provider.launcher, "remove_object", {"object_id": object_id})
+
+    listed = provider.io._handle_get_objects_list(_objects_request()).objects
+    one = provider.io._handle_get_object(_object_request(object_id))
+
+    assert [(item.object_id, item.name) for item in listed] == [(object_id, "crate")]
+    assert (one.object_id, one.name) == (object_id, "crate")
+
+
 def test_one_object_answers_its_pose_and_scale_with_no_landmark_and_no_state(provider):
     provider.io.set_assets(_CATALOGUE)
     _spawn(provider)
@@ -278,7 +297,7 @@ def test_one_object_answers_its_pose_and_scale_with_no_landmark_and_no_state(pro
     response = provider.io._handle_get_object(_object_request(blue))
 
     assert vars(response) == {
-        "timestamp": 10.0, "object_id": blue, "asset_id": "props/blocks/blue_block",
+        "timestamp": 10.0, "object_id": blue, "name": "blue_block", "asset_id": "props/blocks/blue_block",
         "position": [1.0, 2.0, 3.0], "orientation": [0.0, 0.0, 0.0, 1.0], "scale": 1.5,
         **_NO_LANDMARK_AND_NO_STATE,
     }
@@ -326,12 +345,18 @@ def test_the_loaded_scene_is_named_after_a_load_and_empty_after_a_clear(provider
     assert (cleared.asset_id, cleared.scale) == ("", 1.0)
 
 
+def _spawn_request(**fields):
+    """A spawn goal's payload, a red block at one place, with `fields` over
+    it."""
+    return {
+        "asset_id": "props/blocks/red_block", "position": [0.5, 0.0, 0.8], "yaw": 0.0, "scale": 1.0,
+        "physics": "dynamic", "mass": 0.1, **fields,
+    }
+
+
 def _spawn(provider, asset_id="props/blocks/red_block"):
-    result = provider.io._execute(provider.launcher, "spawn_object", {
-        "asset_id": asset_id, "position": [0.5, 0.0, 0.8], "yaw": 0.0, "scale": 1.0, "physics": "dynamic",
-        "mass": 0.1,
-    })
-    assert list(result) == ["object_id"]
+    result = provider.io._execute(provider.launcher, "spawn_object", _spawn_request(asset_id=asset_id))
+    assert list(result) == ["object_id", "name"]
     return result["object_id"]
 
 
@@ -567,6 +592,94 @@ def test_a_spawn_at_a_yaw_that_is_no_number_is_refused_and_mints_nothing(provide
     assert _spawned_ids(provider) == []
 
 
+def test_a_spawn_that_gives_no_name_is_named_after_its_asset_and_numbered_while_taken(provider):
+    provider.io.set_assets(_CATALOGUE)
+
+    results = [provider.io._execute(provider.launcher, "spawn_object", _spawn_request()) for _ in range(3)]
+
+    assert [result["name"] for result in results] == ["red_block", "red_block_2", "red_block_3"]
+
+
+@pytest.mark.parametrize(
+    "fields", [{"name": "", "feeder": ""}, {"feeder": "hopper_1"}], ids=["empty_name_and_feeder", "feeder_only"],
+)
+def test_a_spawn_with_an_empty_name_or_only_a_feeder_is_named_after_its_asset(provider, fields):
+    provider.io.set_assets(_CATALOGUE)
+
+    result = provider.io._execute(provider.launcher, "spawn_object", _spawn_request(**fields))
+
+    assert result["name"] == "red_block"
+    assert _spawned_ids(provider) == [result["object_id"]]
+
+
+def test_an_asset_id_with_an_empty_last_segment_names_its_object_object(provider):
+    assert provider.module._object_name(None, "props/blocks/", set()) == "object"
+    assert provider.module._object_name(None, "props/blocks/", {"object"}) == "object_2"
+
+
+def test_the_last_segment_of_an_asset_id_is_made_a_name_lowercase_with_underscores(provider):
+    assert provider.module._object_name(None, "props/x/Red-Block", set()) == "red_block"
+
+
+@pytest.mark.parametrize("name", ["Red_Block", "red-block", "red block"])
+def test_a_spawn_asking_a_name_of_another_form_is_refused_and_mints_nothing(provider, name):
+    provider.io.set_assets(_CATALOGUE)
+
+    refusal = _refused(
+        provider, lambda: provider.io._execute(provider.launcher, "spawn_object", _spawn_request(name=name)), "rejected",
+    )
+
+    assert refusal == f"object name '{name}' is not a name: lowercase letters, digits and _"
+    assert provider.launcher.mock_calls == []
+    assert _spawned_ids(provider) == []
+
+
+def test_a_spawn_asking_a_taken_name_is_refused_and_mints_nothing(provider):
+    provider.io.set_assets(_CATALOGUE)
+    first = provider.io._execute(provider.launcher, "spawn_object", _spawn_request(name="crate"))
+    assert first["name"] == "crate"
+
+    refusal = _refused(
+        provider, lambda: provider.io._execute(provider.launcher, "spawn_object", _spawn_request(name="crate")), "rejected",
+    )
+
+    assert refusal == (
+        "object name 'crate' is taken by a spawned object; give another name, or leave name out and the simulation "
+        "names it"
+    )
+    assert _spawned_ids(provider) == [first["object_id"]]
+
+
+@pytest.mark.parametrize("removal", ["remove_object", "load_scene", "clear_scene"])
+def test_a_name_is_free_again_once_its_object_is_removed(provider, removal):
+    provider.io.set_assets(_CATALOGUE)
+    first = provider.io._execute(provider.launcher, "spawn_object", _spawn_request(name="crate"))
+    provider.io._execute(provider.launcher, removal, {
+        "remove_object": {"object_id": first["object_id"]},
+        "load_scene": {"asset_id": "scene/full_warehouse", "scale": 1.0},
+        "clear_scene": {},
+    }[removal])
+
+    again = provider.io._execute(provider.launcher, "spawn_object", _spawn_request(name="crate"))
+
+    assert again["name"] == "crate"
+    assert _spawned_ids(provider) == [again["object_id"]]
+
+
+@pytest.mark.parametrize("feeder", ["Hopper-1", "hopper 1"])
+def test_a_spawn_naming_a_feeder_of_another_form_is_refused_and_mints_nothing(provider, feeder):
+    provider.io.set_assets(_CATALOGUE)
+
+    refusal = _refused(
+        provider, lambda: provider.io._execute(provider.launcher, "spawn_object", _spawn_request(feeder=feeder)),
+        "rejected",
+    )
+
+    assert refusal == f"feeder '{feeder}' is not a name: lowercase letters, digits and _"
+    assert provider.launcher.mock_calls == []
+    assert _spawned_ids(provider) == []
+
+
 def test_it_owns_exactly_the_objects_it_spawned_and_has_not_removed(provider):
     provider.io.set_assets(_CATALOGUE)
     first, second = _spawn(provider), _spawn(provider)
@@ -668,10 +781,7 @@ def test_a_read_once_an_edit_completes_observes_it(provider):
     provider.io.process_pending(provider.launcher)
 
     provider.stamps.now_s = 11.0
-    spawned = _submit(provider, "spawn_object", {
-        "asset_id": "props/blocks/red_block", "position": [0.5, 0.0, 0.8], "yaw": 0.0, "scale": 1.0,
-        "physics": "dynamic", "mass": 0.1,
-    })
+    spawned = _submit(provider, "spawn_object", _spawn_request())
     provider.io.process_pending(provider.launcher)
     ((result, response),) = spawned
     object_id = result["object_id"]
@@ -844,9 +954,9 @@ _SPAWN = SimpleNamespace(
     action="spawn_object", build="_runtime_spawn_isaac_asset",
     request=SimpleNamespace(
         asset_id="props/blocks/red_block", position=[0.5, 0.0, 0.8], yaw=0.0, orientation=None, scale=1.0,
-        physics="dynamic", mass=0.1, snap_to=None,
+        physics="dynamic", mass=0.1, name=None, feeder=None, snap_to=None,
     ),
-    result=["object_id"],
+    result=["object_id", "name"],
 )
 _REPORTING_ACTIONS = pytest.mark.parametrize("goal", [_LOAD, _SPAWN], ids=lambda goal: goal.action)
 
@@ -1017,6 +1127,10 @@ def _refusal(decision):
     ("remove_object", SimpleNamespace(object_id="obj_missing"), ("rejected", "Unknown object_id: obj_missing")),
     ("apply_force", SimpleNamespace(object_id="obj_missing", force=[1.0, 0.0, 0.0], duration_s=0.5),
      ("rejected", "Unknown object_id: obj_missing")),
+    ("spawn_object", SimpleNamespace(**{**vars(_SPAWN.request), "name": "Crate"}),
+     ("rejected", "object name 'Crate' is not a name: lowercase letters, digits and _")),
+    ("spawn_object", SimpleNamespace(**{**vars(_SPAWN.request), "feeder": "Hopper-1"}),
+     ("rejected", "feeder 'Hopper-1' is not a name: lowercase letters, digits and _")),
     ("move_robot", SimpleNamespace(robot="ghost", position=[0.0, 0.0, 0.0], yaw=0.0),
      ("resource_unavailable", "no robot stands as 'ghost' in this simulation, which stands alpha")),
 ])
@@ -1076,6 +1190,34 @@ def test_a_goal_whose_object_is_gone_by_the_time_its_command_runs_fails_with_the
     provider.launcher._runtime_apply_force.assert_not_called()
 
 
+def test_the_main_thread_checks_a_spawns_name_again_before_it_spawns(provider):
+    """The Isaac main thread checks a spawn's name again before it spawns:
+    a goal admitted while its name is free, whose name a spawned object
+    holds when its command runs, fails with `rejected` and spawns
+    nothing."""
+    provider.io.set_assets(_CATALOGUE)
+    events = []
+    spawn = _Goal(SimpleNamespace(**{**vars(_SPAWN.request), "name": "crate"}), events)
+    assert provider.io._decide(provider.module.spawn_object, "spawn_object", spawn.request()).refusal is None
+    first = provider.io._execute(provider.launcher, "spawn_object", _spawn_request(name="crate"))
+
+    async def run_the_spawn():
+        spawning = asyncio.create_task(provider.io._run_goal("spawn_object", spawn))
+        while not spawning.done():
+            provider.io.process_pending(provider.launcher)
+            await asyncio.sleep(0)
+
+    asyncio.run(asyncio.wait_for(run_the_spawn(), _LIVENESS_S))
+
+    assert [event for event in events if event[0] != "progress"] == [(
+        "failed", "rejected",
+        "object name 'crate' is taken by a spawned object; give another name, or leave name out and the simulation "
+        "names it",
+    )]
+    assert _spawned_ids(provider) == [first["object_id"]]
+    provider.launcher._runtime_spawn_isaac_asset.assert_called_once()
+
+
 def test_a_move_of_a_robot_that_left_before_its_command_ran_fails_with_resource_unavailable(provider):
     """A move is admitted while its robot stands, and the robot leaves the
     stage before the move's command reaches the main thread: the check there
@@ -1112,14 +1254,26 @@ def test_a_command_isaac_does_not_carry_out_fails_its_goal_with_attempt_failed(p
 @pytest.mark.parametrize("cause", ["caller", "sender_gone"])
 def test_a_goal_cancelled_while_its_command_ran_completes_with_what_the_command_did(provider, cause):
     """A cancel does not stop a command once it is queued: the spawned
-    object stands, so the goal completes and gives its id."""
+    object stands, so the goal completes and gives its id and its name."""
     provider.io.set_assets(_CATALOGUE)
     events = []
 
     _serve_goals(provider, "spawn_object", _Goal(_SPAWN.request, events, cause=cause))
 
     (outcome, result) = events[-1]
-    assert outcome == "completed"
+    assert (outcome, result["name"]) == ("completed", "red_block")
+    assert provider.io.owns(result["object_id"])
+
+
+def test_a_served_spawn_stands_its_object_under_the_name_its_goal_gives(provider):
+    provider.io.set_assets(_CATALOGUE)
+    events = []
+    request = SimpleNamespace(**{**vars(_SPAWN.request), "name": "crate", "feeder": "hopper_1"})
+
+    _serve_goals(provider, "spawn_object", _Goal(request, events))
+
+    (outcome, result) = events[-1]
+    assert (outcome, result["name"]) == ("completed", "crate")
     assert provider.io.owns(result["object_id"])
 
 

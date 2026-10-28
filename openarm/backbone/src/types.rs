@@ -1,14 +1,13 @@
-//! Shared primitives for the bimanual backbone: arm DOF, the joint vector, the
-//! arm side identifier, this robot's limb tables, the world-pose wire
-//! decomposition, the pose slack a move is planned and settled within, and the
-//! tolerances and times every move goal is parsed by.
+//! Shared primitives for the bimanual backbone: arm DOF, the joint vector,
+//! the world-pose wire decomposition, the pose slack a move is planned and
+//! settled within, and the tolerances and times every move goal is parsed by.
 
 use std::time::Duration;
 
 use srs_model::chain_kinematics::{ServoTolerances, ToleranceError};
 use srs_model::nalgebra::{Isometry3, Quaternion, Translation3, UnitQuaternion};
 
-use crate::arm_pair::ArmPair;
+use crate::side::{ArmPair, Side};
 
 /// Degrees of freedom of one arm, from the description that also supplies the
 /// URDF the governor and planner run against.
@@ -29,14 +28,13 @@ pub fn world_pose_arrays(pose: &Isometry3<f64>) -> ([f64; 3], [f64; 4]) {
 
 /// Both arms' grasp poses as limb_state and the posture results carry them.
 /// The positions have 3 values per arm. The orientations have 4 values per
-/// arm, `[x, y, z, w]`. Both are in [`Side::ARM_NAMES`] order.
+/// arm, `[x, y, z, w]`. Both are in [`Side::BOTH`] order.
 pub fn arm_pose_arrays(poses: &ArmPair<Isometry3<f64>>) -> (Vec<f64>, Vec<f64>) {
-    let (left_position, left_orientation) = world_pose_arrays(&poses.left);
-    let (right_position, right_orientation) = world_pose_arrays(&poses.right);
-    (
-        [left_position, right_position].concat(),
-        [left_orientation, right_orientation].concat(),
-    )
+    let (positions, orientations): (Vec<[f64; 3]>, Vec<[f64; 4]>) = Side::BOTH
+        .into_iter()
+        .map(|side| world_pose_arrays(&poses[side]))
+        .unzip();
+    (positions.concat(), orientations.concat())
 }
 
 /// Parse a world-frame pose off the wire: three finite position components
@@ -146,8 +144,7 @@ impl ArmMoveRequest {
         plan_position_tolerance_m: f64,
         plan_orientation_tolerance_rad: f64,
     ) -> Result<Self, String> {
-        let side =
-            Side::from_arm_name(arm_name).ok_or_else(|| Side::UNKNOWN_ARM_NAME.to_string())?;
+        let side = Side::from_arm_name(arm_name)?;
         let target = pose_from_wire(position, orientation)
             .map_err(|reason| format!("goal pose has {reason}"))?;
         let tolerance = PoseTolerance::from_wire(
@@ -198,138 +195,9 @@ pub fn move_seconds_from_wire(field: &str, value: f64) -> Result<Duration, Strin
 /// One joint-space vector (positions, velocities, or torques), j1..j7.
 pub type JointVec = [f64; ARM_DOF];
 
-/// Which arm a message addresses. The wire carries the limb's name
-/// ("left_arm" / "right_arm"); [`Side::from_arm_name`] parses that at the
-/// boundary so the rest of the backbone carries a side it cannot get wrong,
-/// never a raw string.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Side {
-    Left,
-    Right,
-}
-
-impl Side {
-    /// This robot's arm names in their fixed left-then-right order: the wire
-    /// values limb_motion goals carry and limb_state's arm_names reports.
-    pub const ARM_NAMES: [&'static str; 2] = ["left_arm", "right_arm"];
-
-    /// This robot's gripper names, same order and role as [`Self::ARM_NAMES`].
-    pub const GRIPPER_NAMES: [&'static str; 2] = ["left_gripper", "right_gripper"];
-
-    /// Refusal for a goal naming no arm of this robot.
-    pub const UNKNOWN_ARM_NAME: &'static str =
-        r#"unknown arm_name: this robot's arms are "left_arm" and "right_arm""#;
-
-    /// Refusal for a goal naming no gripper of this robot.
-    pub const UNKNOWN_GRIPPER_NAME: &'static str =
-        r#"unknown gripper_name: this robot's grippers are "left_gripper" and "right_gripper""#;
-
-    /// Parse a wire `arm_name`, or `None` for a name not in [`Self::ARM_NAMES`].
-    pub fn from_arm_name(arm_name: &str) -> Option<Self> {
-        match arm_name {
-            "left_arm" => Some(Side::Left),
-            "right_arm" => Some(Side::Right),
-            _ => None,
-        }
-    }
-
-    /// Parse a wire `gripper_name`, or `None` for a name not in
-    /// [`Self::GRIPPER_NAMES`].
-    pub fn from_gripper_name(gripper_name: &str) -> Option<Self> {
-        match gripper_name {
-            "left_gripper" => Some(Side::Left),
-            "right_gripper" => Some(Side::Right),
-            _ => None,
-        }
-    }
-
-    /// This side in the description's vocabulary.
-    pub fn model(self) -> openarm_description::Side {
-        match self {
-            Side::Left => openarm_description::Side::Left,
-            Side::Right => openarm_description::Side::Right,
-        }
-    }
-
-    /// Index into a left-then-right `[T; 2]`.
-    pub fn index(self) -> usize {
-        match self {
-            Side::Left => 0,
-            Side::Right => 1,
-        }
-    }
-
-    /// This side's arm name, as [`Self::ARM_NAMES`] gives it.
-    pub fn arm_name(self) -> &'static str {
-        Self::ARM_NAMES[self.index()]
-    }
-
-    /// This side's gripper name, as [`Self::GRIPPER_NAMES`] gives it.
-    pub fn gripper_name(self) -> &'static str {
-        Self::GRIPPER_NAMES[self.index()]
-    }
-
-    /// Label for logs.
-    pub fn label(self) -> &'static str {
-        match self {
-            Side::Left => "left",
-            Side::Right => "right",
-        }
-    }
-}
-
-/// This robot's limb tables as the limb_state contract carries them, wire
-/// shaped and in [`Side::ARM_NAMES`] order.
-pub struct LimbNames {
-    pub arm_names: Vec<String>,
-    pub joints_per_arm: Vec<u32>,
-    pub gripper_names: Vec<String>,
-}
-
-/// The one reading of the name tables: the labels on every limb_states
-/// snapshot and the answer get_limb_names gives.
-pub fn limb_names() -> LimbNames {
-    LimbNames {
-        arm_names: Side::ARM_NAMES.map(String::from).to_vec(),
-        joints_per_arm: vec![ARM_DOF as u32; Side::ARM_NAMES.len()],
-        gripper_names: Side::GRIPPER_NAMES.map(String::from).to_vec(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn side_model_maps_this_crate_onto_the_description() {
-        assert_eq!(Side::Left.model(), openarm_description::Side::Left);
-        assert_eq!(Side::Right.model(), openarm_description::Side::Right);
-    }
-
-    // Pins the name tables to the parsers: a name the tables advertise (on
-    // limb_state's arm_names/gripper_names) or a side gives must parse back
-    // to its side, and a foreign name must be refused, not misrouted.
-    #[test]
-    fn advertised_names_parse_and_foreign_names_refuse() {
-        assert_eq!(Side::from_arm_name(Side::ARM_NAMES[0]), Some(Side::Left));
-        assert_eq!(Side::from_arm_name(Side::ARM_NAMES[1]), Some(Side::Right));
-        assert_eq!(
-            Side::from_gripper_name(Side::GRIPPER_NAMES[0]),
-            Some(Side::Left)
-        );
-        assert_eq!(
-            Side::from_gripper_name(Side::GRIPPER_NAMES[1]),
-            Some(Side::Right)
-        );
-        for side in [Side::Left, Side::Right] {
-            assert_eq!(Side::from_arm_name(side.arm_name()), Some(side));
-            assert_eq!(Side::from_gripper_name(side.gripper_name()), Some(side));
-        }
-        assert_eq!(Side::from_arm_name("left_gripper"), None);
-        assert_eq!(Side::from_gripper_name("left_arm"), None);
-        assert_eq!(Side::from_arm_name("LEFT_ARM"), None);
-        assert_eq!(Side::from_arm_name(""), None);
-    }
 
     // Pins the outbound wire ordering to the inbound one: a scalar-first slip
     // on either side breaks the round trip.

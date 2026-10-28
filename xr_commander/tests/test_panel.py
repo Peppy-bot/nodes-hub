@@ -1,7 +1,7 @@
 import numpy as np
 from peppygen.consumed_topics.alerts import alerts as alerts_topic
 
-from tests.helpers import FakeSession, source, squeezing_hand
+from tests.helpers import FakeSession, ManualClock, source, squeezing_hand
 from xr_commander import panel
 from xr_commander.alerts import ActiveAlerts
 from xr_commander.clutch import HandClutch
@@ -17,7 +17,9 @@ from xr_commander.panel import (
     render,
     snapshot,
 )
-from xr_commander.publish import HeldOverSqueeze, MeasuredPoses, PostureStatus
+from xr_commander.bus import FlashNote
+from xr_commander.drive import HandState, RobotLine
+from xr_commander.publish import MeasuredPoses, PostureStatus
 from xr_commander.record import RecorderStatus
 from xr_commander.task_page import UNNAMED_TASK
 
@@ -76,7 +78,7 @@ def states(**overrides):
         "gripper_bound": True,
         "tracked": True,
         "squeezing": True,
-        "held_over": False,
+        "wait_release": False,
         "follower_fresh": True,
         "engaged": True,
     }
@@ -141,7 +143,7 @@ def test_each_gate_the_operator_hits_gets_its_own_wording():
     assert state_of(arm_bound=False, gripper_bound=False) == "nothing bound"
     assert state_of(tracked=False) == "no controller"
     assert state_of(squeezing=False) == "grip released"
-    assert state_of(held_over=True) == "release the grip, then squeeze again"
+    assert state_of(wait_release=True) == "release the grip, then squeeze again"
     assert state_of(follower_fresh=False) == "waiting for arm"
     assert state_of(engaged=False) == "re-anchoring"
     assert state_of() == "driving"
@@ -217,7 +219,7 @@ def test_a_pair_established_after_boot_reaches_the_panel():
     hand = HandSource(
         handedness="left",
         clutch=HandClutch(1.0),
-        squeeze=HeldOverSqueeze(),
+        state=HandState(FlashNote()),
         measured=MeasuredPoses(),
         arm_peer=lambda: paired[0] if paired else None,
         gripper_peer=lambda: None,
@@ -676,3 +678,71 @@ def test_a_task_too_long_for_its_column_stays_inside_the_canvas():
     frame = render(PanelState(headset_live=True, hands=(), task=long_task))
     lit = np.nonzero(np.any(frame != panel._BACKGROUND, axis=2).any(axis=0))[0]
     assert lit.max() < panel._WIDTH - 1
+
+
+def test_the_robot_row_comes_first_and_wears_the_colour_of_who_holds_the_robot():
+    driving = panel.robot_row(RobotLine("alpha: driven from this headset", "driving"))
+    leased = panel.robot_row(
+        RobotLine("alpha: leased by director_inst (tidy the table)", "waiting")
+    )
+    assert (driving.label, driving.colour) == ("ROBOT", panel._DRIVING)
+    assert leased.colour == panel._WAITING
+    session = FakeSession({"left": squeezing_hand()})
+    state = snapshot(
+        session,
+        [source("left")],
+        10.0,
+        quiet(),
+        no_health(),
+        robot=RobotLine("alpha: free", "resting"),
+    )
+    assert state.robot == panel.Row("ROBOT", "alpha: free", panel._RESTING)
+    rows = (hand_line("LEFT", **states()),)
+    without = render(PanelState(headset_live=True, hands=rows))
+    with_robot = render(PanelState(headset_live=True, hands=rows, robot=driving))
+    first_band = slice(panel._FIRST_ROW_BASELINE - 30, panel._FIRST_ROW_BASELINE + 6)
+    assert not np.array_equal(without[first_band], with_robot[first_band])
+
+
+def test_a_refused_squeeze_flashes_its_cause_on_the_hand_that_squeezed():
+    clock = ManualClock()
+    hand = HandSource(
+        handedness="left",
+        clutch=HandClutch(1.0),
+        state=HandState(FlashNote(clock)),
+        measured=MeasuredPoses(),
+        arm_peer=lambda: "peer",
+        gripper_peer=lambda: None,
+    )
+    hand.state.note.set("squeeze refused: robot `alpha` is leased by `director_inst`")
+    rows = snapshot(
+        FakeSession({"left": squeezing_hand()}), [hand], 10.0, quiet(), no_health()
+    ).hands
+    assert (
+        rows[0].state == "squeeze refused: robot `alpha` is leased by `director_inst`"
+    )
+
+
+def test_the_four_status_rows_end_above_the_alerts_and_the_motors_inside_the_canvas():
+    last_row = (
+        panel._FIRST_ROW_BASELINE + (panel._MAX_STATUS_ROWS - 1) * panel._ROW_STEP
+    )
+    assert panel._MAX_STATUS_ROWS == 4
+    assert last_row + panel._DESCENDER < panel._RULE_Y
+    last_health = (
+        panel._FIRST_HEALTH_BASELINE
+        + (panel._MAX_HEALTH_LINES - 1) * panel._HEALTH_STEP
+    )
+    assert last_health + panel._DESCENDER <= panel._HEIGHT
+    # Drawn with every row, the rule under the rows stays clear of text.
+    state = PanelState(
+        headset_live=True,
+        robot=panel.robot_row(RobotLine("alpha: driven from this headset", "driving")),
+        hands=(hand_line("LEFT", **states()), hand_line("RIGHT", **states())),
+        recorder=recorder_row(recording_status()),
+    )
+    rule = render(state)[
+        panel._RULE_Y : panel._RULE_Y + panel._RULE_HEIGHT,
+        panel._MARGIN_X : panel._WIDTH - panel._MARGIN_X,
+    ]
+    assert np.all(rule == panel._RULE)

@@ -15,7 +15,7 @@
 use srs_model::Jacobian;
 use srs_model::nalgebra::SVector;
 
-use super::super::{ARM_DOF, ArmPair, is_left_dof};
+use super::super::{ARM_DOF, ArmPair, DUAL_DOF, dof_side, step_change};
 use super::allowance::Allowance;
 use super::{Limiter, Step};
 
@@ -56,19 +56,14 @@ impl Limiter for EeSpeed<'_> {
     }
 
     fn allow(&self, step: &Step) -> Allowance {
-        let arm_step = |left: bool| -> [f64; ARM_DOF] {
-            let base = if left { 0 } else { ARM_DOF };
-            std::array::from_fn(|j| step.target[base + j] - step.prev[base + j])
-        };
-        let left = self.side_fraction(&self.hands.left, &arm_step(true));
-        let right = self.side_fraction(&self.hands.right, &arm_step(false));
+        let arm_steps = step_change(&step.prev, &step.target).arms;
+        let fractions =
+            ArmPair::from_fn(|side| self.side_fraction(&self.hands[side], &arm_steps[side]));
         Allowance::new(std::array::from_fn(|i| {
-            if i >= 2 * ARM_DOF {
+            if i >= DUAL_DOF {
                 1.0
-            } else if is_left_dof(i) {
-                left
             } else {
-                right
+                fractions[dof_side(i)]
             }
         }))
     }
@@ -76,7 +71,7 @@ impl Limiter for EeSpeed<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::{GOV_DOF, Step};
+    use super::super::super::{GOV_DOF, Side, Step, split};
     use super::*;
 
     const DT: f64 = 0.01;
@@ -171,23 +166,36 @@ mod tests {
 
     #[test]
     fn the_cap_is_per_side() {
-        // Both sides command the same hand-moving step; only the streamed
-        // (basis-carrying) left side is capped.
-        let hands = ArmPair::new(Some(x_only_jacobian()), None);
-        let ee = EeSpeed {
-            cap_m_s: 0.25,
-            hands: &hands,
-            dt: DT,
-        };
-        let mut target = [0.0; GOV_DOF];
-        target[0] = 0.1;
-        target[ARM_DOF] = 0.1;
-        let step = Step {
-            prev: [0.0; GOV_DOF],
-            target,
-        };
-        let governed = ee.allow(&step).apply(&step);
-        assert!(governed[0] < 0.1, "streamed left side is capped");
-        assert_eq!(governed[ARM_DOF], 0.1, "planned right side is not");
+        // Each side commands its own hand-moving step, 0.1 rad on the
+        // streamed (basis-carrying) side and 0.2 rad on the planned one: the
+        // streamed side alone is scaled to the cap, whichever side streams.
+        for streamed in Side::BOTH {
+            let hands = ArmPair::from_fn(|side| (side == streamed).then(x_only_jacobian));
+            let ee = EeSpeed {
+                cap_m_s: 0.25,
+                hands: &hands,
+                dt: DT,
+            };
+            let commanded = ArmPair::from_fn(|side| if side == streamed { 0.1 } else { 0.2 });
+            let mut target = [0.0; GOV_DOF];
+            target[0] = commanded.left;
+            target[ARM_DOF] = commanded.right;
+            let step = Step {
+                prev: [0.0; GOV_DOF],
+                target,
+            };
+            let governed = split(&ee.allow(&step).apply(&step));
+            for side in Side::BOTH {
+                let first_joint = governed.arms[side][0];
+                if side == streamed {
+                    assert!(
+                        (first_joint - 0.25 * DT).abs() < 1e-12,
+                        "streamed {side} side not scaled to the cap: {first_joint}"
+                    );
+                } else {
+                    assert_eq!(first_joint, 0.2, "planned {side} side is not capped");
+                }
+            }
+        }
     }
 }
