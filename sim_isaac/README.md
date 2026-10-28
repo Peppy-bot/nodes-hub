@@ -56,7 +56,8 @@ sim_isaac/
     models/            one entry per model this engine stands
     isaac_models.py    parses them, strictly, at node setup
     config/sim_isaac.kit
-  scripts/             CPU-only maintenance tools for the OpenArm bundle
+  scripts/             CPU-only tools: maintenance of the OpenArm bundle, and
+                       runtime_command.py, a client of the runtime command port
   tests/               GPU-free suites, their own uv project
 ```
 
