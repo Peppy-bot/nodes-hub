@@ -54,6 +54,12 @@ pub(crate) fn arm_limits(side: Side) -> &'static [[f64; 2]; ARM_DOF] {
     &joint_limits().arms[side]
 }
 
+/// The per-joint `[min, max]` ranges (rad) of both arms, the ranges
+/// [`arm_limits`] gives per side; the gesture bake keeps its tracks in them.
+pub(crate) fn arm_ranges() -> &'static ArmPair<[[f64; 2]; ARM_DOF]> {
+    &joint_limits().arms
+}
+
 /// The gripper opening range `[closed, open]` as a fraction of full jaw travel;
 /// the owner clamps gripper commands into it, the same single source the
 /// sliders bound against.

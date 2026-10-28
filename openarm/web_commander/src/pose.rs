@@ -111,14 +111,6 @@ impl ArmModels {
         &self.velocity_limits[side]
     }
 
-    /// Per-joint [lo, hi] position limits (rad) for `side`, from the same model the
-    /// IK solves against (elbow singularity floor included).
-    pub(crate) fn joint_ranges(&self, side: Side) -> [[f64; 2]; ARM_DOF] {
-        let model = lock_ignoring_poison(self.get(side));
-        let lims = model.limits();
-        std::array::from_fn(|i| [lims[i].lo, lims[i].hi])
-    }
-
     /// World-frame x/y/z reachable bounds `[[min, max]; 3]` for `side`, so the panel
     /// sizes its position sliders to the arm's actual reach (correct per generation).
     pub fn pos_bounds(&self, side: Side) -> [[f64; 2]; 3] {

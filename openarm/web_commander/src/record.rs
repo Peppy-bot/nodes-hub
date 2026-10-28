@@ -9,6 +9,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use control_core::time::sleep_unless_cancelled;
 use peppygen::consumed_actions::recorder::record_episode;
 use peppygen::consumed_actions::recorder::record_episode::ResultOutcome;
 use peppygen::consumed_services::recorder::finish_session;
@@ -129,21 +130,9 @@ async fn run(
         Ended::Terminal => {}
     }
 
-    let outcome = loop {
-        let result_fut = downstream.get_result(RESULT_POLL);
-        tokio::pin!(result_fut);
-        tokio::select! {
-            _ = token.cancelled() => {
-                finalize(&feedback, false, "shutting down; episode result unknown").await;
-                return;
-            }
-            result = &mut result_fut => match result {
-                Err(e) if result_poll_retryable(&e) => {
-                    tokio::time::sleep(RESULT_RETRY_DELAY).await;
-                }
-                result => break result,
-            }
-        }
+    let Some(outcome) = episode_result(|| downstream.get_result(RESULT_POLL), &token).await else {
+        finalize(&feedback, false, "shutting down; episode result unknown").await;
+        return;
     };
 
     let (success, summary) = match outcome {
@@ -222,6 +211,32 @@ fn episode_summary(
     )
 }
 
+/// The episode's result, polled with `get_result` and re-polled
+/// [`RESULT_RETRY_DELAY`] after each retryable error; `None` when `token`
+/// cancels first, while a poll or a retry delay is under way.
+async fn episode_result<R, F>(
+    mut get_result: impl FnMut() -> F,
+    token: &CancellationToken,
+) -> Option<peppygen::Result<R>>
+where
+    F: Future<Output = peppygen::Result<R>>,
+{
+    loop {
+        let result = tokio::select! {
+            _ = token.cancelled() => return None,
+            result = get_result() => result,
+        };
+        match result {
+            Err(e) if result_poll_retryable(&e) => {
+                if !sleep_unless_cancelled(RESULT_RETRY_DELAY, token.cancelled()).await {
+                    return None;
+                }
+            }
+            result => return Some(result),
+        }
+    }
+}
+
 // Report the episode outcome to the owner, which clears the recording state and
 // writes the status line; a dropped channel means the owner is gone (shutdown).
 async fn finalize(feedback: &mpsc::Sender<Feedback>, success: bool, summary: impl Into<String>) {
@@ -236,9 +251,37 @@ async fn finalize(feedback: &mpsc::Sender<Feedback>, success: bool, summary: imp
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use peppygen::consumed_actions::recorder::record_episode::ResultResponseData;
 
-    use super::{episode_summary, recorder_reason};
+    use super::{episode_result, episode_summary, recorder_reason};
+    use crate::result_wait::RESULT_RETRY_DELAY;
+    use crate::test_support::retryable_result_error;
+    use peppylib::runtime::CancellationToken;
+
+    /// On a paused clock that moves only when every task waits: the delay
+    /// is the clock's, not the host's.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_while_a_retry_is_waited_out_ends_the_result_wait_at_once() {
+        let token = CancellationToken::default();
+        let start = tokio::time::Instant::now();
+        let polls = Cell::new(0);
+        let poll = || {
+            polls.set(polls.get() + 1);
+            std::future::ready(Err::<(), _>(retryable_result_error()))
+        };
+        let cancel_once_polled = async {
+            while polls.get() == 0 {
+                tokio::task::yield_now().await;
+            }
+            token.cancel();
+        };
+        let (result, ()) = tokio::join!(episode_result(poll, &token), cancel_once_polled);
+        assert!(result.is_none());
+        assert_eq!(polls.get(), 1);
+        assert!(tokio::time::Instant::now() - start < RESULT_RETRY_DELAY);
+    }
 
     fn saved(
         episode_index: i64,

@@ -147,14 +147,16 @@ impl BakedGesture {
 pub struct Registry(Vec<Arc<BakedGesture>>);
 
 impl Registry {
-    /// Bake every definition against the live arm models. Panics on an
-    /// infeasible definition: a gesture that cannot be streamed safely is a
-    /// build error surfaced at bringup, not a runtime condition.
-    pub fn bake(models: &ArmModels) -> Self {
+    /// Bake every definition against the live arm models, keeping each
+    /// side's joints within `ranges`, the per-joint `[min, max]` (rad) the
+    /// panel clamps commands into. Panics on an infeasible definition: a
+    /// gesture that cannot be streamed safely is a build error that bringup
+    /// surfaces.
+    pub fn bake(models: &ArmModels, ranges: &ArmPair<[[f64; 2]; ARM_DOF]>) -> Self {
         Self(
             defs()
                 .iter()
-                .map(|def| Arc::new(bake(models, def)))
+                .map(|def| Arc::new(bake(models, ranges, def)))
                 .collect(),
         )
     }
@@ -257,7 +259,11 @@ fn lerp(a: f64, b: f64, s: f64) -> f64 {
 
 // --------------------------- baking ---------------------------
 
-fn bake(models: &ArmModels, def: &GestureDef) -> BakedGesture {
+fn bake(
+    models: &ArmModels,
+    ranges: &ArmPair<[[f64; 2]; ARM_DOF]>,
+    def: &GestureDef,
+) -> BakedGesture {
     assert!(
         def.duration_s.is_finite() && def.duration_s > 0.0,
         "gesture '{}': duration must be positive",
@@ -267,7 +273,7 @@ fn bake(models: &ArmModels, def: &GestureDef) -> BakedGesture {
     let track = |side: Side| match &def.motion {
         Motion::Joint(tracks) => tracks[side]
             .as_ref()
-            .map(|keys| bake_joint(models, def, side, keys, clock_s)),
+            .map(|keys| bake_joint(models, &ranges[side], def, side, keys, clock_s)),
         Motion::Cartesian(curves) => {
             curves[side].map(|curve| bake_cartesian(models, def, side, curve, clock_s))
         }
@@ -346,6 +352,7 @@ fn grid(clock_s: f64) -> (usize, impl Fn(usize) -> f64) {
 
 fn bake_joint(
     models: &ArmModels,
+    ranges: &[[f64; 2]; ARM_DOF],
     def: &GestureDef,
     side: Side,
     keys: &[Keyframe],
@@ -371,7 +378,6 @@ fn bake_joint(
         .map(|k| hermite_sample(keys, &tangents, at(k)))
         .collect();
 
-    let ranges = models.joint_ranges(side);
     for (k, q) in joints.iter().enumerate() {
         for j in 0..ARM_DOF {
             assert!(
@@ -716,6 +722,7 @@ fn clap() -> GestureDef {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::limits::{arm_limits, init_limits_for_tests};
     use crate::test_support::{models, registry};
     use openarm_description::HardwareVersion;
 
@@ -829,16 +836,36 @@ mod tests {
         assert_eq!(names, ["wave", "spiral", "figure_eight", "shrug", "clap"]);
     }
 
+    /// The clap holds the right elbow (j4) at 1.45 rad, so a right j4 range
+    /// that ends at 1.40 refuses it.
+    #[test]
+    #[should_panic(expected = "gesture 'clap' right: j4")]
+    fn a_gesture_outside_the_ranges_it_is_given_is_refused() {
+        let ranges = ArmPair::from_fn(|side| {
+            let mut ranges = HardwareVersion::V2.joint_limits(side);
+            if side == Side::Right {
+                ranges[3][1] = 1.40;
+            }
+            ranges
+        });
+        bake(&models(), &ranges, &clap());
+    }
+
     #[test]
     fn registry_bakes_every_gesture_on_v1() {
         // The commander launches on either generation and the bake panics on an
         // infeasible definition, so v1 feasibility is a build gate too.
-        Registry::bake(&ArmModels::from_version(HardwareVersion::V1));
+        let version = HardwareVersion::V1;
+        Registry::bake(
+            &ArmModels::from_version(version),
+            &ArmPair::from_fn(|side| version.joint_limits(side)),
+        );
     }
 
     #[test]
     fn every_baked_step_respects_velocity_budget_and_limits() {
         // Re-assert outside the constructor so a relaxed bake cannot silently pass.
+        init_limits_for_tests();
         let m = models();
         for g in registry().iter() {
             for side in Side::BOTH {
@@ -846,7 +873,7 @@ mod tests {
                     continue;
                 };
                 let budget = m.velocity_limits(side);
-                let ranges = m.joint_ranges(side);
+                let ranges = arm_limits(side);
                 for (k, w) in track.joints.windows(2).enumerate() {
                     for j in 0..ARM_DOF {
                         let step = (w[1][j] - w[0][j]).abs();

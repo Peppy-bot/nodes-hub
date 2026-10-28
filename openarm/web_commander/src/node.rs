@@ -136,9 +136,10 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     // Arm models for the panel's Cartesian pose fields (pose <-> joints), built
     // from the same generation the ranges came from so FK/IK match the backbone's chain.
     let models = pose::ArmModels::from_version(version);
-    // Bake the gesture roster against those models: every gesture is resolved
-    // to a feasible joint trajectory here or the node aborts bringup.
-    let registry = gestures::Registry::bake(&models);
+    // Bake the gesture roster against those models and the ranges the panel
+    // clamps into: every gesture is resolved to a feasible joint trajectory
+    // here or the node aborts bringup.
+    let registry = gestures::Registry::bake(&models, limits::arm_ranges());
     // The operator streams the governor controls live; their launch defaults are
     // node parameters, kept in step with the backbone's, so the real arm starts
     // conservative (tight band, slow cap) and the sim launchers start fast.

@@ -31,13 +31,6 @@ pub fn available(runner: &NodeRunner) -> bool {
     !motor_health::bound_producers(runner).is_empty()
 }
 
-impl consumer::Subscription for motor_health::Subscription {
-    type Message = motor_health::Message;
-    async fn recv(&mut self) -> peppygen::Result<Option<(ProducerRef, Self::Message)>> {
-        self.next().await
-    }
-}
-
 pub async fn run(
     runner: Arc<NodeRunner>,
     feedback: mpsc::Sender<Feedback>,
@@ -53,7 +46,7 @@ pub async fn run(
             return;
         }
     };
-    let subscription = match motor_health::subscribe(&runner).await {
+    let mut subscription = match motor_health::subscribe(&runner).await {
         Ok(subscription) => subscription,
         Err(e) => {
             error!(error = %e, "motor_health subscribe");
@@ -64,7 +57,7 @@ pub async fn run(
         "motor_health",
         token,
         feedback,
-        subscription,
+        async move || subscription.next().await,
         // An unresolved daemon clock cannot certify a timestamp's age, so the
         // report drops on the same throttled-warn path as a malformed one.
         move |producer, msg| {
