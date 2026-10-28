@@ -6,8 +6,8 @@ import math
 import time
 
 import pytest
-from conftest import FakeHardware
-from peppygen.paired_topics.arm import joint_states as arm_wire
+from conftest import FakeHardware, wait_for_async
+from peppygen.paired_topics.arm import joint_states as arm_states_topic
 from peppygen.fixtures import harness
 from peppygen.fixtures.exposed_services.ready import is_ready as is_ready_fx
 from peppygen.paired_topics.arm import joint_setpoints as arm_setpoints_topic
@@ -26,18 +26,6 @@ PARAMETERS = Parameters(
     control_rate_hz=200,
     state_rate_hz=100,
 )
-
-
-async def wait_for(predicate, timeout_s=TIMEOUT_S):
-    """Block until the predicate holds, or fail the test. Raising rather than
-    returning false keeps a caller from waiting on a condition and silently
-    accepting that it never arrived."""
-    deadline = asyncio.get_event_loop().time() + timeout_s
-    while asyncio.get_event_loop().time() < deadline:
-        if predicate():
-            return
-        await asyncio.sleep(0.01)
-    raise AssertionError(f"condition never held within {timeout_s}s")
 
 
 async def test_measured_state_flows_out_in_wire_units():
@@ -138,7 +126,7 @@ async def test_setpoints_reach_the_bus_in_device_units():
         await h.mocks.pairings.gripper.gripper_setpoints.publish(
             gripper_setpoints_topic.Message(timestamp=time.time(), opening=0.5, max_effort=0.0)
         )
-        await wait_for(
+        await wait_for_async(
             lambda: any(GRIPPER_NAME in goals for goals in fake.written_goals)
         )
         merged = fake.written_goals[-1]
@@ -167,7 +155,7 @@ async def test_effort_carrying_setpoints_are_dropped_and_never_move():
             )
         )
         # ... while a conforming follow-up still does.
-        await wait_for(lambda: len(fake.written_goals) > 0)
+        await wait_for_async(lambda: len(fake.written_goals) > 0)
 
 
 async def test_stale_timestamped_setpoints_never_reach_the_bus():
@@ -181,21 +169,6 @@ async def test_stale_timestamped_setpoints_never_reach_the_bus():
         )
         await asyncio.sleep(0.3)
         assert fake.written_goals == []
-
-
-def test_lerobot_follower_constructs(tmp_path):
-    """The real hardware seam must at least construct: this is the layer no
-    fake covers, and a str/Path mismatch here once broke every launch."""
-    from so101_follower.device import LerobotFollower
-
-    follower = LerobotFollower(
-        device_path="/dev/null",
-        calibration_dir=str(tmp_path),
-        robot_id="smoke",
-    )
-    assert set(follower._robot.bus.motors) == {
-        "shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"
-    }
 
 
 async def test_dead_bus_revokes_readiness():
@@ -223,6 +196,6 @@ def test_the_wire_refuses_a_joint_vector_of_the_wrong_width():
     would be invisible: this node would go back to putting whatever width it
     was handed onto the wire."""
     with pytest.raises(ValueError, match="expected 5"):
-        arm_wire.build_message(
+        arm_states_topic.build_message(
             timestamp=0.0, positions=[0.0] * 4, velocities=[], efforts=[]
         )

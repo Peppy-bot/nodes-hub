@@ -1,6 +1,10 @@
-"""Shared fakes: a scripted FollowerHardware with injectable failures."""
+"""Shared fakes and waits: a scripted FollowerHardware with injectable
+failures, and a blocking and an async wait on a condition."""
 
 from __future__ import annotations
+
+import asyncio
+import time
 
 import pytest
 from so101_description.units import MOTOR_NAMES
@@ -51,3 +55,23 @@ class FakeHardware:
 @pytest.fixture
 def fake_hardware():
     return FakeHardware()
+
+
+def wait_for(predicate, timeout_s=2.0):
+    """Block until the predicate holds, or fail the test."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.005)
+    raise AssertionError(f"condition never held within {timeout_s}s")
+
+
+async def wait_for_async(predicate, timeout_s=10.0):
+    """Wait on the event loop until the predicate holds, or fail the test."""
+    deadline = asyncio.get_event_loop().time() + timeout_s
+    while asyncio.get_event_loop().time() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"condition never held within {timeout_s}s")
