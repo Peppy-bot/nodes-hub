@@ -19,6 +19,7 @@ use camera_core::v4l2::{
     CID_AUTO_WHITE_BALANCE, CID_BRIGHTNESS, CID_CONTRAST, CID_GAIN, CID_WHITE_BALANCE_TEMPERATURE,
 };
 use control_core::latched_log::LatchedLog;
+use control_core::serving;
 use control_core::sync::lock_ignoring_poison;
 
 use peppygen::emitted_topics::camera::{depth_stream, video_stream};
@@ -81,24 +82,6 @@ struct FrameSet {
     timestamp: SystemTime,
     left_rgb: Vec<u8>,
     depth_z16: Vec<u8>,
-}
-
-/// Answer every request of `$service` with `$respond`, which maps the request
-/// to the response or the failure of an error reply, until the node stops.
-/// Each request that fails is logged with the service's name.
-macro_rules! serve_requests {
-    ($runner:expr, $service:ident, $respond:expr) => {{
-        let cancel = $runner.cancellation_token().clone();
-        loop {
-            let result = tokio::select! {
-                _ = cancel.cancelled() => break,
-                result = $service::handle_next_request(&$runner, $respond) => result,
-            };
-            if let Err(e) = result {
-                error!("{}: {e}", stringify!($service));
-            }
-        }
-    }};
 }
 
 /// Now on this instance's bound clock: the timeline its messages are
@@ -353,25 +336,39 @@ fn spawn_emit_task(
 fn spawn_stream_infos(runner: Arc<NodeRunner>, color: Size, depth: Size, fps: u8) {
     let video_runner = runner.clone();
     tokio::spawn(async move {
-        serve_requests!(video_runner, video_stream_info, |_req| {
-            Ok(video_stream_info::Response::new(
-                color.width,
-                color.height,
-                fps,
-                COLOR_ENCODING.name().to_string(),
-            ))
-        });
+        serving::serve(
+            "video_stream_info",
+            video_runner.cancellation_token().cancelled(),
+            || {
+                video_stream_info::handle_next_request(&video_runner, |_req| {
+                    Ok(video_stream_info::Response::new(
+                        color.width,
+                        color.height,
+                        fps,
+                        COLOR_ENCODING.name().to_string(),
+                    ))
+                })
+            },
+        )
+        .await;
     });
     tokio::spawn(async move {
-        serve_requests!(runner, depth_stream_info, |_req| {
-            Ok(depth_stream_info::Response::new(
-                depth.width,
-                depth.height,
-                fps,
-                DEPTH_ENCODING.to_string(),
-                DEPTH_UNIT_M_PER_LSB,
-            ))
-        });
+        serving::serve(
+            "depth_stream_info",
+            runner.cancellation_token().cancelled(),
+            || {
+                depth_stream_info::handle_next_request(&runner, |_req| {
+                    Ok(depth_stream_info::Response::new(
+                        depth.width,
+                        depth.height,
+                        fps,
+                        DEPTH_ENCODING.to_string(),
+                        DEPTH_UNIT_M_PER_LSB,
+                    ))
+                })
+            },
+        )
+        .await;
     });
 }
 
@@ -468,7 +465,12 @@ macro_rules! spawn_geometry_service {
     ($fn_name:ident, $service:ident, $respond:ident) => {
         fn $fn_name(runner: Arc<NodeRunner>, geometry: Arc<SessionGeometry>) {
             tokio::spawn(async move {
-                serve_requests!(runner, $service, |_req| { $respond(&geometry) });
+                serving::serve(
+                    stringify!($service),
+                    runner.cancellation_token().cancelled(),
+                    || $service::handle_next_request(&runner, |_req| $respond(&geometry)),
+                )
+                .await;
             });
         }
     };
@@ -527,7 +529,12 @@ fn color_exposure(
 
 fn spawn_set_color_exposure(runner: Arc<NodeRunner>) {
     tokio::spawn(async move {
-        serve_requests!(runner, set_color_exposure, color_exposure);
+        serving::serve(
+            "set_color_exposure",
+            runner.cancellation_token().cancelled(),
+            || set_color_exposure::handle_next_request(&runner, color_exposure),
+        )
+        .await;
     });
 }
 
@@ -554,11 +561,20 @@ fn color_white_balance(
 
 fn spawn_set_color_white_balance(runner: Arc<NodeRunner>, camera: Camera) {
     tokio::spawn(async move {
-        serve_requests!(runner, set_color_white_balance, |req| {
-            color_white_balance(&camera, &req.data.mode, req.data.temperature)
-                .map(set_color_white_balance::Response::new)
-                .map_err(|failure| camera_core::control_failure!(set_color_white_balance, failure))
-        });
+        serving::serve(
+            "set_color_white_balance",
+            runner.cancellation_token().cancelled(),
+            || {
+                set_color_white_balance::handle_next_request(&runner, |req| {
+                    color_white_balance(&camera, &req.data.mode, req.data.temperature)
+                        .map(set_color_white_balance::Response::new)
+                        .map_err(|failure| {
+                            camera_core::control_failure!(set_color_white_balance, failure)
+                        })
+                })
+            },
+        )
+        .await;
     });
 }
 
@@ -567,11 +583,18 @@ macro_rules! spawn_cid_control_service {
     ($fn_name:ident, $service:ident, $cid:expr) => {
         fn $fn_name(runner: Arc<NodeRunner>, camera: Camera) {
             tokio::spawn(async move {
-                serve_requests!(runner, $service, |req| {
-                    apply_control(&camera, $cid, req.data.value)
-                        .map($service::Response::new)
-                        .map_err(|failure| camera_core::control_failure!($service, failure))
-                });
+                serving::serve(
+                    stringify!($service),
+                    runner.cancellation_token().cancelled(),
+                    || {
+                        $service::handle_next_request(&runner, |req| {
+                            apply_control(&camera, $cid, req.data.value)
+                                .map($service::Response::new)
+                                .map_err(|failure| camera_core::control_failure!($service, failure))
+                        })
+                    },
+                )
+                .await;
             });
         }
     };
