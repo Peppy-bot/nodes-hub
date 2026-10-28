@@ -1,6 +1,9 @@
-"""Shared fakes: a scripted LeaderHardware with injectable failures."""
+"""Shared fakes and a wait: a scripted LeaderHardware with injectable
+failures, and a blocking wait on a condition."""
 
 from __future__ import annotations
+
+import time
 
 import pytest
 from so101_description.units import MOTOR_NAMES
@@ -43,3 +46,13 @@ class FakeHardware:
 @pytest.fixture
 def fake_hardware():
     return FakeHardware()
+
+
+def wait_for(predicate, timeout_s=2.0):
+    """Block until the predicate holds, or fail the test."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.005)
+    raise AssertionError(f"condition never held within {timeout_s}s")

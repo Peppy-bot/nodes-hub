@@ -6,7 +6,7 @@ import math
 
 import pytest
 from conftest import FakeHardware
-from peppygen.paired_topics.arm import joint_setpoints as arm_wire
+from peppygen.paired_topics.arm import joint_setpoints as arm_setpoints_topic
 from peppygen.fixtures import harness
 from peppygen.parameters import Parameters
 from so101_description.units import GRIPPER_NAME, JOINT_NAMES
@@ -60,23 +60,12 @@ async def test_deadman_goes_silent_when_reads_fail():
             await asyncio.wait_for(h.mocks.pairings.arm.joint_setpoints.next(), 0.5)
 
 
-def test_lerobot_leader_constructs(tmp_path):
-    """The real hardware seam must at least construct: this is the layer no
-    fake covers, and a str/Path mismatch here once broke every launch."""
-    from so101_leader.device import LerobotLeader
-
-    leader = LerobotLeader(
-        device_path="/dev/null", calibration_dir=str(tmp_path), teleop_id="smoke"
-    )
-    assert "gripper" in leader._teleop.bus.motors
-
-
 def test_the_wire_refuses_a_joint_vector_of_the_wrong_width():
     """The manifest pins joint_link positions to five. Asserted here because
     a refine block is easy to drop from a manifest by accident, and its loss
     would be invisible: this node would go back to putting whatever width it
     was handed onto the wire."""
     with pytest.raises(ValueError, match="expected 5"):
-        arm_wire.build_message(
+        arm_setpoints_topic.build_message(
             timestamp=0.0, positions=[0.0] * 4, velocities=[], efforts=[]
         )

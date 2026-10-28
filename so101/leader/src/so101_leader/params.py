@@ -5,10 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from control_core_py.params import require_non_empty, require_positive, require_rate
-
-# The fastest this node polls the bus: six STS3215s share one 1 Mbaud
-# half-duplex serial line; the stack reads the leader at 60 Hz.
-MAX_RATE_HZ = 1000
+from so101_description.device import BUS_MAX_RATE_HZ
 
 
 @dataclass(frozen=True)
@@ -21,7 +18,8 @@ class Config:
 
 
 def parse(params) -> Config:
-    command_rate_hz = require_rate("command_rate_hz", params.command_rate_hz, MAX_RATE_HZ)
+    # The bus ceiling; the stack reads the leader at 60 Hz.
+    command_rate_hz = require_rate("command_rate_hz", params.command_rate_hz, BUS_MAX_RATE_HZ)
     stale_timeout_s = require_positive("stale_timeout_s", params.stale_timeout_s)
     if stale_timeout_s < 2.0 / command_rate_hz:
         # Publish ticks are phase-independent of read ticks, so a healthy
