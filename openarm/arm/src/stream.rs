@@ -5,15 +5,18 @@
 //! `joint_states` (the exclusive command loop the governor anchors on; any
 //! monitor observes the pairing). All run for the life of the node.
 
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use control_core::latched_log::LatchedLog;
 use control_core::pacer::Pacer;
+use control_core::receiving::receive;
 use control_core::throttle::Throttle;
 use openarm_description::ARM_DOF;
 use peppygen::NodeRunner;
 use peppygen::paired_topics::backbone;
+use peppylib::runtime::CancellationToken;
 use srs_model::JointVec;
 use tokio::sync::watch;
 use tracing::{error, warn};
@@ -54,31 +57,32 @@ pub struct StreamWiring {
     pub health: watch::Sender<Option<HealthSample>>,
 }
 
-/// Receive the paired backbone's `joint_setpoints` forever, folding each message
-/// into `latest` via [`apply_setpoint`]. The slot delivers only the paired peer's
-/// messages, so there is no arm_id filter; subscribing while unpaired is legal
-/// (the slot stays silent until a backbone pairs). One held subscription, looped: no
+/// Receive the paired backbone's `joint_setpoints` until the subscription
+/// closes or `token` cancels, folding each message into `latest` via
+/// [`apply_setpoint`]. The slot delivers only the paired peer's messages, so
+/// there is no arm_id filter; subscribing while unpaired is legal (the slot
+/// stays silent until a backbone pairs). One held subscription, looped: no
 /// re-subscribe gap, so a setpoint is never dropped between receives.
 pub async fn run_governed_setpoint_listener(
     runner: Arc<NodeRunner>,
     latest: watch::Sender<Option<GovernedSetpoint>>,
+    token: CancellationToken,
 ) {
-    let mut sub = match backbone::joint_setpoints::subscribe(&runner).await {
+    let mut subscription = match backbone::joint_setpoints::subscribe(&runner).await {
         Ok(s) => s,
         Err(e) => return error!("joint_setpoints subscribe: {e}"),
     };
     let mut reject_warn = Throttle::new(REJECT_WARN_PERIOD);
-    loop {
-        let msg = match sub.next().await {
-            Ok(Some((_, msg))) => msg,
-            Ok(None) => return, // subscription closed: node shutting down
-            Err(e) => {
-                error!("joint_setpoints receive: {e}");
-                continue;
-            }
-        };
-        apply_setpoint(&latest, &mut reject_warn, &msg);
-    }
+    receive(
+        "joint_setpoints",
+        token.cancelled(),
+        async move || subscription.next().await,
+        async move |(_, msg)| {
+            apply_setpoint(&latest, &mut reject_warn, &msg);
+            ControlFlow::Continue(())
+        },
+    )
+    .await;
 }
 
 /// Fold one received setpoint into the watch: publish it when it parses,

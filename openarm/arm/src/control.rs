@@ -123,7 +123,7 @@ async fn run_control(
     started_tx: oneshot::Sender<()>,
 ) {
     let mut pacer =
-        Pacer::new(cfg.cycle_period).expect("main asserts the period is non-zero before spawn");
+        Pacer::new(cfg.cycle_period).expect("parse_config's period_from_hz refuses a zero period");
     let mut can_errors = CanErrorThrottle::new();
     let mut monitor = Monitor::new(cfg.ratings, cfg.cycle_period);
     let escalate_after_ticks = time::ticks_within(NOT_DRIVING_ESCALATE_AFTER, cfg.cycle_period);
