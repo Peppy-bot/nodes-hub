@@ -257,7 +257,7 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
     # unwired-is-not-healthy reasoning as the alerts.
     motor_reports = motor_health.MotorHealthReports(
         bound_now=lambda: tuple(
-            p.instance_id for p in motor_health_topic.bound_producers(node_runner)
+            producer_key(p) for p in motor_health_topic.bound_producers(node_runner)
         ),
     )
     tasks = [

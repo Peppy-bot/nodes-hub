@@ -299,9 +299,10 @@ class RecordingSink:
 class FakeSubscription:
     """Yields queued items, then pends forever like the generated one.
 
-    Kept for the pure bus-plumbing tests (`messages`/`next_message`), which
+    For the pure bus-plumbing tests (`messages`/`next_message`), which
     exercise receive-loop edge cases no real subscription can be scripted
-    into (mid-stream exceptions, self-cancelling receives)."""
+    into (mid-stream exceptions, self-cancelling receives), and under
+    `StubTopic`."""
 
     def __init__(self, items):
         self._items = list(items)
@@ -310,6 +311,16 @@ class FakeSubscription:
         if self._items:
             return self._items.pop(0)
         await asyncio.Event().wait()
+
+
+class StubTopic(FakeSubscription):
+    """A topic module whose subscription yields queued (producer, message)
+    items, for a drain fed what the harness cannot publish: a message the
+    generated modules cannot build, or producers on more than one core node
+    (every harness mock shares the harness's)."""
+
+    async def subscribe(self, _runner):
+        return self
 
 
 @contextlib.asynccontextmanager

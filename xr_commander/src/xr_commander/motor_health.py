@@ -21,6 +21,7 @@ from xr_commander.bus import (
     latch_for,
     log,
     messages,
+    producer_key,
     subscribe_or_log,
 )
 
@@ -119,8 +120,12 @@ def _readings(
 
 
 class MotorHealthReports:
-    """Latest report per producing instance, loop-confined: the listener
-    writes and the panel reads, with no await between a read and its purge.
+    """Latest report per producer, loop-confined: the listener writes and the
+    panel reads, with no await between a read and its purge.
+
+    A producer is addressed by the (core node, instance id) pair the wire
+    gives, which is unique across the mesh where an instance id alone is
+    unique only within one stack.
 
     A malformed report is refused (ValueError) rather than rendered: a wrong
     vector length has no defensible motor alignment, and a non-finite
@@ -132,7 +137,7 @@ class MotorHealthReports:
     def __init__(
         self,
         *,
-        bound_now: Callable[[], Sequence[str]] = tuple,
+        bound_now: Callable[[], Sequence[tuple[str, str]]] = tuple,
         monotonic=time.monotonic,
     ) -> None:
         # The producers wired to the slot now, read live: the slot follows
@@ -140,7 +145,7 @@ class MotorHealthReports:
         self._bound_now = bound_now
         # Injectable so staleness tests can move time instead of sleeping.
         self._monotonic = monotonic
-        self._by_instance: dict[str, HealthReport] = {}
+        self._by_producer: dict[tuple[str, str], HealthReport] = {}
 
     @property
     def producers_bound(self) -> bool:
@@ -154,7 +159,7 @@ class MotorHealthReports:
 
     def update(
         self,
-        instance: str,
+        producer: tuple[str, str],
         level: Iterable[int],
         effort_fraction_rated: Iterable[float],
         effort_fraction_rated_sustained: Iterable[float],
@@ -162,11 +167,12 @@ class MotorHealthReports:
         driver_temp_c: Iterable[float],
         winding_temp_c: Iterable[float],
     ) -> None:
+        instance = producer[1]
         if not instance:
             raise ValueError("a health report needs a producing instance")
         levels = _levels(level)
         count = len(levels)
-        self._by_instance[instance] = HealthReport(
+        self._by_producer[producer] = HealthReport(
             instance=instance,
             levels=levels,
             effort_fraction_rated=_readings(
@@ -186,7 +192,7 @@ class MotorHealthReports:
         )
 
     def by_instance(self) -> tuple[InstanceHealth, ...]:
-        """Every instance ever received, the bound producers' order first and
+        """Every producer ever received, the bound producers' order first and
         the rest sorted; a report older than the staleness window reads as None.
 
         An instance never received is absent entirely: the launcher may not
@@ -201,12 +207,18 @@ class MotorHealthReports:
                 instance=report.instance, report=report if live else None
             )
 
-        known = self._by_instance
-        bound_order = {name: index for index, name in enumerate(self._bound_now())}
+        known = self._by_producer
+        bound_order = {
+            producer: index for index, producer in enumerate(self._bound_now())
+        }
         ordered = sorted(
-            known, key=lambda name: (bound_order.get(name, len(bound_order)), name)
+            known,
+            key=lambda producer: (
+                bound_order.get(producer, len(bound_order)),
+                producer,
+            ),
         )
-        return tuple(entry(known[name]) for name in ordered)
+        return tuple(entry(known[producer]) for producer in ordered)
 
 
 @dataclass(frozen=True)
@@ -306,12 +318,13 @@ async def drain_motor_health(
         return
     # Latched per producer: a malformed producer repeats every report, and a
     # shared latch would be cleared by any other producer's good message.
-    unusable: dict[str, Latch] = {}
+    unusable: dict[tuple[str, str], Latch] = {}
     async for producer, message in messages(subscription, token, "motor health"):
-        latch = latch_for(unusable, producer.instance_id)
+        key = producer_key(producer)
+        latch = latch_for(unusable, key)
         try:
             reports.update(
-                producer.instance_id,
+                key,
                 message.level,
                 message.effort_fraction_rated,
                 message.effort_fraction_rated_sustained,
@@ -321,5 +334,5 @@ async def drain_motor_health(
             )
             latch.clear()
         except Exception as e:
-            latch.trip(f"health report unusable from {producer.instance_id}: {e!r}")
+            latch.trip(f"health report unusable from {key[1]}: {e!r}")
     log("motor health stream ended")

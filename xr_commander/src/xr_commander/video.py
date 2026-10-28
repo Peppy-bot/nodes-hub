@@ -341,18 +341,19 @@ async def drain_frames(
         # Loud and fail-safe: the affected panels simply never show video.
         return
     # Latched per producer: a bad encoding repeats every frame.
-    unusable: dict[str, Latch] = {}
+    unusable: dict[tuple[str, str], Latch] = {}
     async for producer, message in messages(subscription, token, label):
         # The set follows the stack's joins, so it is read per frame.
         sources = {
             producer_key(m.producer): camera_source(m)
             for m in topic_module.bound_members(node_runner)
         }
-        source = sources.get(producer_key(producer))
+        key = producer_key(producer)
+        source = sources.get(key)
         name = _panel_for(source, robots) if source is not None else None
         if name is None:
             continue
-        latch = latch_for(unusable, producer.instance_id)
+        latch = latch_for(unusable, key)
         try:
             frame = await asyncio.to_thread(_decode_and_shrink, message, view_max_width)
             if _panel_for(source, robots) != name:

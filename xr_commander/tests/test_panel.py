@@ -64,7 +64,7 @@ def health_with(*sources):
     for source_name, levels in sources:
         count = len(levels)
         store.update(
-            source_name,
+            ("core", source_name),
             levels,
             (0.10,) * count,
             (0.09,) * count,
