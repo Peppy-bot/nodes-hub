@@ -73,32 +73,34 @@ fn geometry() -> simulation_geometry::Message {
     }
 }
 
-/// Polls get_color_intrinsics until `ready` accepts the response: the
-/// geometry arrives on its own leg, so one round trip does not order the two.
-/// The error reply of a relay that has no geometry yet is polled again.
-async fn color_intrinsics_once(
-    harness: &Harness,
-    ready: impl Fn(&get_color_intrinsics::Response) -> bool,
-) -> peppygen::Result<get_color_intrinsics::Response> {
-    let deadline = tokio::time::Instant::now() + TIMEOUT;
-    loop {
-        match get_color_intrinsics::poll(harness, TIMEOUT).await {
-            Ok(response) if ready(&response) => return Ok(response),
-            Ok(_) => {}
-            Err(error) => {
-                let early = get_color_intrinsics::Failure::of(&error)
-                    .is_some_and(|failure| failure.message == NO_GEOMETRY_MESSAGE);
-                if !early {
-                    return Err(error);
+/// Polls `service` until `ready` accepts the response, so a test never assumes
+/// one round trip ordered the info leg against the service leg. The error
+/// reply of a geometry service that has no geometry yet is polled again.
+macro_rules! poll_until {
+    ($service:ident, $harness:expr, $ready:expr) => {{
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        loop {
+            match $service::poll($harness, TIMEOUT).await {
+                Ok(response) if $ready(&response) => break response,
+                Ok(_) => {}
+                Err(error) => {
+                    let early = $service::Failure::of(&error)
+                        .is_some_and(|failure| failure.message == NO_GEOMETRY_MESSAGE);
+                    if !early {
+                        return Err(error);
+                    }
                 }
             }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                concat!(
+                    stringify!($service),
+                    " never reflected the simulation's description"
+                )
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the simulation's geometry never reached get_color_intrinsics"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    }};
 }
 
 fn frame(timestamp: SystemTime, frame_id: u32, fill: u8) -> simulation_video::Message {
@@ -182,22 +184,15 @@ async fn stream_info_service_answers_from_the_simulation_description() -> peppyg
 
     // The description arrives on its own leg, so poll until it lands rather
     // than assuming one round trip ordered the two.
-    let deadline = tokio::time::Instant::now() + TIMEOUT;
-    loop {
-        let response = video_stream_info::poll(&harness, TIMEOUT).await?;
-        if response.width != 0 {
-            assert_eq!(response.width, 960);
-            assert_eq!(response.height, 600);
-            assert_eq!(response.frames_per_second, 15);
-            assert_eq!(response.encoding, "rgb8");
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the simulation's stream description never reached the info service"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    let response = poll_until!(
+        video_stream_info,
+        &harness,
+        |r: &video_stream_info::Response| r.width != 0
+    );
+    assert_eq!(response.width, 960);
+    assert_eq!(response.height, 600);
+    assert_eq!(response.frames_per_second, 15);
+    assert_eq!(response.encoding, "rgb8");
 
     harness.shutdown().await
 }
@@ -494,7 +489,11 @@ async fn color_intrinsics_answer_from_the_simulation_geometry() -> peppygen::Res
         .publish(&geometry())
         .await?;
 
-    let color = color_intrinsics_once(&harness, |_| true).await?;
+    let color = poll_until!(
+        get_color_intrinsics,
+        &harness,
+        |_: &get_color_intrinsics::Response| true
+    );
     assert_eq!((color.width, color.height), (960, 600));
     assert_eq!((color.fx, color.fy), (461.9595, 461.9595));
     assert_eq!((color.cx, color.cy), (479.5, 299.5));
@@ -546,7 +545,11 @@ async fn the_depth_services_refuse_on_a_colour_camera() -> peppygen::Result<()> 
         .geometry
         .publish(&geometry())
         .await?;
-    color_intrinsics_once(&harness, |_| true).await?;
+    poll_until!(
+        get_color_intrinsics,
+        &harness,
+        |_: &get_color_intrinsics::Response| true
+    );
     assert_no_depth_stream!();
 
     harness.shutdown().await
@@ -564,7 +567,11 @@ async fn an_unusable_geometry_is_ignored() -> peppygen::Result<()> {
         .geometry
         .publish(&geometry())
         .await?;
-    color_intrinsics_once(&harness, |_| true).await?;
+    poll_until!(
+        get_color_intrinsics,
+        &harness,
+        |_: &get_color_intrinsics::Response| true
+    );
 
     // A consumer divides by the focal lengths, so a model without usable ones
     // is ignored whole; each bad one carries a width the good one does not,
@@ -604,7 +611,11 @@ async fn an_unusable_geometry_is_ignored() -> peppygen::Result<()> {
             ..geometry()
         })
         .await?;
-    let settled = color_intrinsics_once(&harness, |r| r.width == 1280).await?;
+    let settled = poll_until!(
+        get_color_intrinsics,
+        &harness,
+        |r: &get_color_intrinsics::Response| r.width == 1280
+    );
     assert_eq!(settled.width, 1280);
 
     harness.shutdown().await
