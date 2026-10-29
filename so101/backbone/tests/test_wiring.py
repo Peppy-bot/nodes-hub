@@ -13,16 +13,24 @@ from conftest import (
     CLOSE,
     FAR,
     FAR_SHORT_BY_MORE_THAN,
+    MAX_JOINT_ACCELERATION_RAD_S2,
     MEASURED,
     NEAR,
+    START_TOLERANCE_RAD,
     assert_rectangle_inside_reach,
+    joint_path_goal,
+    path_result_joints,
 )
+from control_core_py import joint_path
 from peppygen.exposed_actions.limb_motion import move_arm as move_arm_prod
 from peppygen.exposed_actions.limb_motion import move_arm_joints as move_arm_joints_prod
 from peppygen.exposed_actions.limb_motion import move_gripper as move_gripper_prod
 from peppygen.exposed_actions.postures import move_to_home as move_to_home_prod
 from peppygen.exposed_actions.postures import move_to_ready as move_to_ready_prod
 from peppygen.fixtures import harness
+from peppygen.fixtures.exposed_actions.limb_motion import (
+    execute_joint_path as execute_joint_path_fx,
+)
 from peppygen.fixtures.exposed_actions.limb_motion import move_arm as move_arm_fx
 from peppygen.fixtures.exposed_actions.limb_motion import (
     move_arm_joints as move_arm_joints_fx,
@@ -80,9 +88,15 @@ def make_parameters(**overrides) -> Parameters:
         "max_joint_velocity_rad_s_3": 8.0,
         "max_joint_velocity_rad_s_4": 8.0,
         "max_joint_velocity_rad_s_5": 8.0,
+        "max_joint_acceleration_rad_s2_1": MAX_JOINT_ACCELERATION_RAD_S2,
+        "max_joint_acceleration_rad_s2_2": MAX_JOINT_ACCELERATION_RAD_S2,
+        "max_joint_acceleration_rad_s2_3": MAX_JOINT_ACCELERATION_RAD_S2,
+        "max_joint_acceleration_rad_s2_4": MAX_JOINT_ACCELERATION_RAD_S2,
+        "max_joint_acceleration_rad_s2_5": MAX_JOINT_ACCELERATION_RAD_S2,
         "max_ee_velocity_m_s": 1e9,
         "max_ee_angular_velocity_rad_s": 1e9,
         "max_gripper_rate_frac_s": 8.0,
+        "start_tolerance_rad": START_TOLERANCE_RAD,
     }
     return Parameters(**{**base, **overrides})
 
@@ -292,6 +306,38 @@ async def test_move_arm_joints_completes_and_reports():
             feeder.cancel()
 
 
+async def test_a_joint_path_completes_and_reports():
+    async with harness.start(setup, parameters=make_parameters()) as h:
+        feeder = await feeding_measured(h)
+        try:
+            # The path turns at its inner waypoint and ends on the target. The
+            # mocked follower keeps measuring MEASURED, within the 0.1 rad
+            # settle tolerance of every joint's target, so the move completes
+            # at its planned end.
+            inner = [MEASURED[0] + 0.3, *MEASURED[1:]]
+            target = [p + 0.05 for p in MEASURED]
+            goal = await execute_joint_path_fx.send_goal(
+                h, joint_path_goal(inner, target, expected_start=MEASURED), TIMEOUT_S
+            )
+            assert goal.accepted
+            result = await goal.get_result(TIMEOUT_S)
+            assert result.status == execute_joint_path_fx.ResultStatus.COMPLETED
+            assert path_result_joints(result.data.arms) == pytest.approx(MEASURED)
+            # The trajectory's last downstream setpoint lands on the target.
+            last = None
+            while True:
+                try:
+                    last = await asyncio.wait_for(
+                        h.mocks.pairings.arm.joint_setpoints.next(), 0.5
+                    )
+                except TimeoutError:
+                    break
+            assert last is not None
+            assert last.positions == pytest.approx(target)
+        finally:
+            feeder.cancel()
+
+
 async def test_move_arm_joints_outside_its_tolerances_fails_with_timeout():
     async with harness.start(setup, parameters=make_parameters()) as h:
         feeder = await feeding_measured(h)
@@ -315,6 +361,31 @@ async def test_move_arm_joints_outside_its_tolerances_fails_with_timeout():
             # A failed goal gives no result.
             assert result.data is None
             assert result.failure.kind is move_arm_joints_fx.FailureKind.TIMEOUT
+            # Every joint is 0.2 rad short; the one named is whichever float
+            # sum lands a few ulps farther out.
+            assert re.fullmatch(
+                r"still 0\.200 rad from the target at joint [1-5], \d+\.\d s after the planned end",
+                result.failure.message,
+            ), result.failure.message
+        finally:
+            feeder.cancel()
+
+
+async def test_a_joint_path_outside_its_tolerances_fails_with_timeout():
+    async with harness.start(setup, parameters=make_parameters()) as h:
+        feeder = await feeding_measured(h)
+        try:
+            # The mocked follower never leaves MEASURED, 0.2 rad from every
+            # joint's target, outside the 0.1 rad tolerance.
+            goal = await execute_joint_path_fx.send_goal(
+                h, joint_path_goal([p + 0.2 for p in MEASURED], settle_timeout_s=0.3), TIMEOUT_S
+            )
+            assert goal.accepted
+            result = await goal.get_result(TIMEOUT_S)
+            assert result.status == execute_joint_path_fx.ResultStatus.FAILED
+            # A failed goal gives no result.
+            assert result.data is None
+            assert result.failure.kind is execute_joint_path_fx.FailureKind.TIMEOUT
             # Every joint is 0.2 rad short; the one named is whichever float
             # sum lands a few ulps farther out.
             assert re.fullmatch(
@@ -365,6 +436,44 @@ async def test_second_goal_is_refused_while_busy_and_a_cancel_ends_the_first():
             feeder.cancel()
 
 
+async def test_a_goal_of_either_joint_member_is_refused_while_a_path_runs():
+    async with harness.start(setup, parameters=make_parameters()) as h:
+        feeder = await feeding_measured(h)
+        try:
+            slow = await execute_joint_path_fx.send_goal(
+                h, joint_path_goal([p + 0.5 for p in MEASURED], duration_s=5.0), TIMEOUT_S
+            )
+            assert slow.accepted
+            # A second goal of either joint-space member finds the arm busy.
+            second = await execute_joint_path_fx.send_goal(
+                h, joint_path_goal(MEASURED), TIMEOUT_S
+            )
+            assert second.refusal == execute_joint_path_fx.Failure(
+                execute_joint_path_fx.FailureKind.PRECONDITION_FAILED,
+                "arm is already executing a motion",
+            )
+            joints = await move_arm_joints_fx.send_goal(
+                h,
+                move_arm_joints_prod.GoalRequestData(
+                    arm_name="arm", joint_positions=MEASURED, duration_s=0.0,
+                    settle_tolerances_rad=[0.1] * 5, settle_timeout_s=2.0,
+                ),
+                TIMEOUT_S,
+            )
+            assert joints.refusal == move_arm_joints_fx.Failure(
+                move_arm_joints_fx.FailureKind.PRECONDITION_FAILED,
+                "arm is already executing a motion",
+            )
+            cancel = await slow.cancel_goal(TIMEOUT_S)
+            assert cancel.state == execute_joint_path_fx.CancelState.SIGNALLED
+            result = await slow.get_result(TIMEOUT_S)
+            assert result.status == execute_joint_path_fx.ResultStatus.CANCELLED
+            assert result.cancel_reason == "cancelled by its caller"
+            assert len(path_result_joints(result.data.arms)) == 5
+        finally:
+            feeder.cancel()
+
+
 async def test_goal_without_follower_state_is_refused():
     async with harness.start(setup, parameters=make_parameters()) as h:
         goal = await move_arm_joints_fx.send_goal(
@@ -376,6 +485,13 @@ async def test_goal_without_follower_state_is_refused():
             TIMEOUT_S,
         )
         assert goal.refusal.kind is move_arm_joints_fx.FailureKind.RESOURCE_UNAVAILABLE
+        assert "no fresh follower state" in goal.refusal.message
+
+
+async def test_a_joint_path_without_follower_state_is_refused():
+    async with harness.start(setup, parameters=make_parameters()) as h:
+        goal = await execute_joint_path_fx.send_goal(h, joint_path_goal(MEASURED), TIMEOUT_S)
+        assert goal.refusal.kind is execute_joint_path_fx.FailureKind.RESOURCE_UNAVAILABLE
         assert "no fresh follower state" in goal.refusal.message
 
 
@@ -582,6 +698,100 @@ async def test_unknown_arm_name_is_refused():
         assert "unknown arm_name" in goal.refusal.message
 
 
+async def test_a_joint_path_goal_this_robot_does_not_take_is_refused():
+    async with harness.start(setup, parameters=make_parameters()) as h:
+        await publish_measured(h)
+        for goal_data, refusal in (
+            (joint_path_goal(MEASURED, [9.0] * 5), "waypoint 2 out of joint limits"),
+            (
+                joint_path_goal(MEASURED, arm_names=["left_arm"]),
+                'unknown arm_name: this robot\'s arm is "arm"',
+            ),
+            (
+                joint_path_goal(MEASURED, arm_names=["arm", "arm"]),
+                'arms must name this robot\'s arm, "arm", once',
+            ),
+            (
+                joint_path_goal(MEASURED, arm_names=[]),
+                'arms must name this robot\'s arm, "arm", once',
+            ),
+            # The manifest leaves the expected start free, since an empty one
+            # is not checked: the handler refuses another length.
+            (
+                joint_path_goal(MEASURED, expected_start=[0.0] * 4),
+                "expected_start_joint_positions has 4 joint positions: give one per joint of "
+                "the arm, 5, or none to skip the check",
+            ),
+        ):
+            goal = await execute_joint_path_fx.send_goal(h, goal_data, TIMEOUT_S)
+            assert goal.refusal == execute_joint_path_fx.Failure(
+                execute_joint_path_fx.FailureKind.REJECTED, refusal
+            )
+
+
+async def test_a_path_runs_on_its_expected_start_or_none_and_fails_away_from_it():
+    async with harness.start(setup, parameters=make_parameters()) as h:
+        feeder = await feeding_measured(h)
+        try:
+            # Joint 2 stands 0.2 rad from where the caller expects it, past
+            # the start tolerance: the goal is accepted, and fails with no
+            # result.
+            assert START_TOLERANCE_RAD < 0.2
+            expected = [MEASURED[0], MEASURED[1] + 0.2, *MEASURED[2:]]
+            target = [p + 0.05 for p in MEASURED]
+            away = await execute_joint_path_fx.send_goal(
+                h, joint_path_goal(target, expected_start=expected), TIMEOUT_S
+            )
+            assert away.accepted
+            failed = await away.get_result(TIMEOUT_S)
+            assert failed.status == execute_joint_path_fx.ResultStatus.FAILED
+            assert failed.data is None
+            assert failed.failure.kind is execute_joint_path_fx.FailureKind.PRECONDITION_FAILED
+            assert failed.failure.message.startswith(
+                "arm stands 0.200 rad from expected_start_joint_positions at joint 2"
+            ), failed.failure.message
+            # The arm stands on the expected start, or the goal names none,
+            # which is not checked: the path runs.
+            for expected_start in (MEASURED, []):
+                on = await execute_joint_path_fx.send_goal(
+                    h, joint_path_goal(target, expected_start=expected_start), TIMEOUT_S
+                )
+                assert on.accepted
+                result = await on.get_result(TIMEOUT_S)
+                assert result.status == execute_joint_path_fx.ResultStatus.COMPLETED
+        finally:
+            feeder.cancel()
+
+
+async def test_a_path_past_the_ceiling_at_the_caps_fails_with_rejected():
+    # At 0.03 rad/s a leg of 1 rad on joint 1 takes some 33 s, and the path
+    # out and back some 67 s, past the 60 s ceiling: the goal is accepted,
+    # and fails with no result.
+    slow = {f"max_joint_velocity_rad_s_{joint}": 0.03 for joint in range(1, 6)}
+    out = [MEASURED[0] + 1.0, *MEASURED[1:]]
+    out_and_back_s = joint_path.plan(
+        (MEASURED, out, MEASURED), 0.0, (0.03,) * 5, (MAX_JOINT_ACCELERATION_RAD_S2,) * 5
+    ).duration_s
+    assert out_and_back_s > 60.0
+    async with harness.start(setup, parameters=make_parameters(**slow)) as h:
+        feeder = await feeding_measured(h)
+        try:
+            goal = await execute_joint_path_fx.send_goal(
+                h, joint_path_goal(out, MEASURED), TIMEOUT_S
+            )
+            assert goal.accepted
+            result = await goal.get_result(TIMEOUT_S)
+            assert result.status == execute_joint_path_fx.ResultStatus.FAILED
+            assert result.data is None
+            assert result.failure == execute_joint_path_fx.Failure(
+                execute_joint_path_fx.FailureKind.REJECTED,
+                f"the joint velocity and acceleration caps take {out_and_back_s:.1f} s to run "
+                "this path, past the 60 s a move may take; split it into paths of fewer waypoints",
+            )
+        finally:
+            feeder.cancel()
+
+
 async def test_stale_timestamped_leader_input_is_dropped():
     async with harness.start(setup, parameters=make_parameters()) as h:
         feeder = await feeding_measured(h)
@@ -604,6 +814,17 @@ async def test_stale_timestamped_leader_input_is_dropped():
                 )
         finally:
             feeder.cancel()
+
+
+async def test_the_wire_refuses_a_joint_path_waypoint_of_the_wrong_width():
+    """The manifest pins each waypoint of a joint path to five joints, so a
+    goal with a waypoint of another width cannot be put on the wire. Asserted
+    here for the reason the test below gives."""
+    async with harness.start(setup, parameters=make_parameters()) as h:
+        with pytest.raises(ValueError, match="expected 5"):
+            await execute_joint_path_fx.send_goal(
+                h, joint_path_goal(MEASURED, [0.0] * 4), TIMEOUT_S
+            )
 
 
 async def test_the_wire_refuses_a_joint_vector_of_the_wrong_width():
@@ -802,6 +1023,23 @@ async def test_a_streaming_leader_refuses_goals_and_checks_with_leader_streaming
             with pytest.raises(check_arm_move_fx.Failure) as raised:
                 await check_arm_move_fx.poll(h, check, TIMEOUT_S)
             assert raised.value.kind is check_arm_move_fx.FailureKind.LEADER_STREAMING
+        finally:
+            streamer.cancel()
+            feeder.cancel()
+
+
+async def test_a_streaming_leader_refuses_a_joint_path_with_leader_streaming():
+    async with harness.start(setup, parameters=make_parameters()) as h:
+        feeder = await feeding_measured(h)
+        streamer = asyncio.create_task(_stream_leader_target(h, list(MEASURED), []))
+        try:
+            # The leader's target reached the follower: the node follows the
+            # leader, which holds the arm while it streams.
+            await asyncio.wait_for(h.mocks.pairings.arm.joint_setpoints.next(), TIMEOUT_S)
+
+            path = await execute_joint_path_fx.send_goal(h, joint_path_goal(MEASURED), TIMEOUT_S)
+            assert path.refusal.kind is execute_joint_path_fx.FailureKind.LEADER_STREAMING
+            assert path.refusal.message.startswith("a leader is streaming arm commands")
         finally:
             streamer.cancel()
             feeder.cancel()

@@ -19,13 +19,22 @@ class UpstreamMode(Enum):
 class Config:
     upstream_mode: UpstreamMode
     control_rate_hz: int
-    # Sizes action trajectories (postures, move_arm) and bounds the
-    # machine-generated pose stream's per-tick joint steps. Never shapes
-    # the joints-led teleop stream, which only the EE governor may limit.
+    # Sizes action trajectories (postures, joint moves, joint paths,
+    # move_arm) and bounds the machine-generated pose stream's per-tick joint
+    # steps. Never shapes the joints-led teleop stream, which only the EE
+    # governor may limit.
     max_joint_velocity_rad_s: tuple[float, ...]
+    # Times joint paths with the velocity caps: the peak acceleration
+    # (rad/s²) of each joint.
+    max_joint_acceleration_rad_s2: tuple[float, ...]
     max_ee_velocity_m_s: float
     max_ee_angular_velocity_rad_s: float
     max_gripper_rate_frac_s: float
+    # The farthest (rad) any measured joint may stand from a joint path's
+    # expected start as the path starts, and, clamped into the joint limits,
+    # from where the arm holds once the path is planned, before the goal
+    # fails.
+    start_tolerance_rad: float
 
 
 def parse(params) -> Config:
@@ -40,17 +49,13 @@ def parse(params) -> Config:
     # setpoints not worth computing. The stack runs at 60 Hz.
     control_rate_hz = require_rate("control_rate_hz", params.control_rate_hz, BUS_MAX_RATE_HZ)
 
-    velocity_caps = tuple(
-        require_positive(
-            f"max_joint_velocity_rad_s_{i + 1}",
-            getattr(params, f"max_joint_velocity_rad_s_{i + 1}"),
-        )
-        for i in range(NUM_JOINTS)
-    )
+    velocity_caps = _per_joint(params, "max_joint_velocity_rad_s")
+    acceleration_caps = _per_joint(params, "max_joint_acceleration_rad_s2")
     return Config(
         upstream_mode=mode,
         control_rate_hz=control_rate_hz,
         max_joint_velocity_rad_s=velocity_caps,
+        max_joint_acceleration_rad_s2=acceleration_caps,
         max_ee_velocity_m_s=require_positive("max_ee_velocity_m_s", params.max_ee_velocity_m_s),
         max_ee_angular_velocity_rad_s=require_positive(
             "max_ee_angular_velocity_rad_s", params.max_ee_angular_velocity_rad_s
@@ -58,4 +63,14 @@ def parse(params) -> Config:
         max_gripper_rate_frac_s=require_positive(
             "max_gripper_rate_frac_s", params.max_gripper_rate_frac_s
         ),
+        start_tolerance_rad=require_positive("start_tolerance_rad", params.start_tolerance_rad),
+    )
+
+
+def _per_joint(params, prefix: str) -> tuple[float, ...]:
+    """The values of the parameters `prefix`_1 onward, one per joint in the
+    arm's joint order, each positive and finite."""
+    return tuple(
+        require_positive(f"{prefix}_{i + 1}", getattr(params, f"{prefix}_{i + 1}"))
+        for i in range(NUM_JOINTS)
     )

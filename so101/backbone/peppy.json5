@@ -18,9 +18,9 @@
       // Whole-robot state snapshots for consumers that hold no pairing:
       // joint positions, the end-effector pose, and the gripper opening.
       { name: "limb_state", tag: "v1", link_id: "limb_state" },
-      // The per-limb moves: the arm to a joint target or an end-effector
-      // pose, the gripper to an opening. This robot's limb names are "arm"
-      // and "gripper".
+      // The per-limb moves: the arm to a joint target, through a joint path
+      // or to an end-effector pose, the gripper to an opening. This robot's
+      // limb names are "arm" and "gripper".
       { name: "limb_motion", tag: "v1", link_id: "limb_motion" },
       // Whole-robot posture moves, executed through the same admission and
       // trajectory path as move_arm_joints.
@@ -80,6 +80,31 @@
             },
             result_service: {
               response_message_format: { final_joint_positions: { $length: 5 } },
+            },
+          },
+        },
+        // The joint path pins each waypoint, the settle tolerances and the
+        // final joints of its one arm to the five joints the same way. An
+        // empty expected start is not checked, so that vector keeps its free
+        // length, and the handler refuses any length but 0 and 5.
+        {
+          link_id: "limb_motion",
+          name: "execute_joint_path",
+          refine: {
+            goal_service: {
+              request_message_format: {
+                arms: {
+                  $items: {
+                    waypoints: { $items: { joint_positions: { $length: 5 } } },
+                    settle_tolerances_rad: { $length: 5 },
+                  },
+                },
+              },
+            },
+            result_service: {
+              response_message_format: {
+                arms: { $items: { final_joint_positions: { $length: 5 } } },
+              },
             },
           },
         },
@@ -172,16 +197,32 @@
       // runs inside the tick, so higher rates are untested there.
       control_rate_hz: "u32",
       // Per-joint peak velocity (rad/s), shoulder_pan..wrist_roll: sizes the
-      // action trajectories (postures, move_arm) and bounds the per-tick
-      // joint steps of the pose stream's machine-generated IK output. Never
-      // shapes a joints-led teleop stream, which passes through under the
-      // end-effector governor alone. Universal control constants for this
-      // arm, so they keep node defaults like gains.
+      // action trajectories (postures, joint moves, joint paths, move_arm)
+      // and bounds the per-tick joint steps of the pose stream's
+      // machine-generated IK output. Never shapes a joints-led teleop stream,
+      // which passes through under the end-effector governor alone. Universal
+      // control constants for this arm, so they keep node defaults like
+      // gains.
       max_joint_velocity_rad_s_1: { $type: "f64", $default: 2.0 },
       max_joint_velocity_rad_s_2: { $type: "f64", $default: 2.0 },
       max_joint_velocity_rad_s_3: { $type: "f64", $default: 2.0 },
       max_joint_velocity_rad_s_4: { $type: "f64", $default: 2.0 },
       max_joint_velocity_rad_s_5: { $type: "f64", $default: 2.0 },
+      // Per-joint peak acceleration (rad/s²), shoulder_pan..wrist_roll, that
+      // a joint path (execute_joint_path) is timed within, with the velocity
+      // caps above. The arm's acceleration is bounded by the ramp each
+      // STS3215 runs its position goals at: the follower connects through
+      // lerobot 0.6.1, whose SOFollower.configure writes the servo's
+      // Acceleration register (address 41, in units of 100 steps/s², 4096
+      // steps a turn) to 254 on every motor, which is 25,400 steps/s², 38.96
+      // rad/s². A path timed within it asks no joint to speed up faster than
+      // its servo ramps. Universal control constants for this arm, so they
+      // keep node defaults like the velocity caps.
+      max_joint_acceleration_rad_s2_1: { $type: "f64", $default: 38.96 },
+      max_joint_acceleration_rad_s2_2: { $type: "f64", $default: 38.96 },
+      max_joint_acceleration_rad_s2_3: { $type: "f64", $default: 38.96 },
+      max_joint_acceleration_rad_s2_4: { $type: "f64", $default: 38.96 },
+      max_joint_acceleration_rad_s2_5: { $type: "f64", $default: 38.96 },
       // The joints-led stream's one sanctioned limiter: max end-effector
       // speed. A streamed sample within the caps passes through untouched;
       // one that would exceed them moves the end effector at cap speed
@@ -193,6 +234,16 @@
       // Peak gripper travel rate (fraction of full travel per second);
       // within one tick's step the leader's opening passes through exactly.
       max_gripper_rate_frac_s: "f64",
+      // The farthest (rad) any measured joint may stand from a joint path
+      // goal's expected_start_joint_positions as the path starts, and from
+      // where the arm holds once the path is planned: while the path is
+      // planned the arm holds at its measured joints, moved inside the joint
+      // limits where it stood past one, and a measured joint, clamped the
+      // same way, that then stands farther from there has moved. Past it the
+      // goal fails with precondition_failed and runs none of the path. An
+      // operational choice with no safe universal value, so the launcher
+      // states it.
+      start_tolerance_rad: "f64",
     },
   },
 }

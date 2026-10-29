@@ -34,7 +34,8 @@ import math
 import time
 from dataclasses import dataclass, field
 from typing import Generic, TypeVar
-from control_core_py.minimum_jerk import Profile
+
+from control_core_py import joint_path, minimum_jerk
 from control_core_py.runtime import Latch
 from so101_description.limbs import ARM_LIMB, GRIPPER_LIMB
 from so101_description.limits import JointLimits
@@ -73,6 +74,25 @@ FOLLOWER_SILENT = PlanFailure(FailureKind.RESOURCE_UNAVAILABLE, "the follower st
 PUBLISH_FAILED = PlanFailure(
     FailureKind.ATTEMPT_FAILED, "downstream setpoint publish failed mid-goal"
 )
+
+# The trajectory an arm plan plays: a minimum-jerk move to one target, or a
+# joint path through waypoints. Both play through sample, done, duration_s,
+# start and end.
+ArmProfile = minimum_jerk.Profile | joint_path.Profile
+
+
+def joint_past_tolerance(
+    measured: tuple[float, ...], target: tuple[float, ...], tolerances_rad: tuple[float, ...]
+) -> tuple[int, float] | None:
+    """The joint (from 0) that stands farthest past its tolerance from its
+    target, and how far it stands from the target, or None while every joint
+    stands within its tolerance."""
+    errors = [abs(m - t) for m, t in zip(measured, target, strict=True)]
+    excesses = [e - bar for e, bar in zip(errors, tolerances_rad, strict=True)]
+    worst = max(range(len(excesses)), key=excesses.__getitem__)
+    if excesses[worst] <= 0.0:
+        return None
+    return worst, errors[worst]
 
 
 class _LatestValue:
@@ -118,9 +138,10 @@ class _LatestValue:
 
 @dataclass(frozen=True)
 class JointSettle:
-    """How a joint move ends past the planned end of its trajectory: each
-    measured joint within its own tolerance (rad, one per joint in the
-    arm's joint order) of its target, within timeout_s."""
+    """How a joint move or a joint path ends past the planned end of its
+    trajectory: each measured joint within its own tolerance (rad, one per
+    joint in the arm's joint order) of the move's target or the path's last
+    waypoint, within timeout_s."""
 
     tolerances_rad: tuple[float, ...]
     timeout_s: float
@@ -128,12 +149,11 @@ class JointSettle:
     def shortfall(self, measured, target, _kinematics) -> str | None:
         """How far the joint farthest outside its tolerance still stands
         from `target`, or None once every joint is within its tolerance."""
-        errors = [abs(m - t) for m, t in zip(measured, target, strict=True)]
-        excesses = [e - bar for e, bar in zip(errors, self.tolerances_rad, strict=True)]
-        worst = max(range(len(excesses)), key=excesses.__getitem__)
-        if excesses[worst] <= 0.0:
+        past = joint_past_tolerance(measured, target, self.tolerances_rad)
+        if past is None:
             return None
-        return f"still {errors[worst]:.3f} rad from the target at joint {worst + 1}"
+        joint, error = past
+        return f"still {error:.3f} rad from the target at joint {joint + 1}"
 
 
 @dataclass(frozen=True)
@@ -174,7 +194,7 @@ class PostureEnd:
 
 @dataclass
 class ArmPlan:
-    profile: Profile
+    profile: ArmProfile
     # How the plan ends past the planned end of its profile, judged on the
     # measured joints each tick.
     settle: JointSettle | PoseSettle | PostureEnd
@@ -298,6 +318,9 @@ class _LimbChannel(Generic[Command, Plan]):
     completing: Plan | None = None
     # Whether a goal holds the limb, from admission to release.
     busy: bool = False
+    # Where the goal that holds the limb keeps it until its plan is
+    # installed, or None.
+    held: Command | None = None
     # The wire stamp to publish with this tick's setpoint: the leader's
     # capture time for streamed samples, None (meaning now) for plans.
     tick_stamp_s: float | None = None
@@ -449,15 +472,22 @@ class Coordinator:
     # ------------------------------------------------------------------- plans
 
     def adopt_arm_plan(
-        self, profile: Profile, settle: JointSettle | PoseSettle | PostureEnd
+        self, profile: ArmProfile, settle: JointSettle | PoseSettle | PostureEnd
     ) -> ArmPlan:
         """Install an admitted action's trajectory and its settle. Streamed
         input already in flight must not re-target the arm when the plan
         ends, so the arm's leader holders are dropped here and again at
         release."""
         self._drop_arm_leader_input()
+        self._arm.held = None
         self._arm.plan = ArmPlan(profile=profile, settle=settle)
         return self._arm.plan
+
+    def hold_arm(self, joints: tuple[float, ...]) -> None:
+        """Command the arm to hold at `joints` each tick, for the goal that
+        claimed it, until its plan is installed or the arm is released."""
+        assert self._arm.busy, "only the goal that claimed the arm holds it"
+        self._arm.held = joints
 
     def adopt_gripper_plan(
         self, target: float, settle_timeout_s: float, chase_base: float
@@ -559,6 +589,7 @@ class Coordinator:
         displaced during the goal window, so the next stream must re-anchor
         on the measured position exactly like the silence path."""
         self._arm.busy = False
+        self._arm.held = None
         self._arm.reset_command()
         self._drop_arm_leader_input()
 
@@ -615,8 +646,13 @@ class Coordinator:
         if self._arm.busy:
             # A goal is in flight (or just ended, until release runs):
             # streamed input stays ignored so an action never fights a live
-            # teleop stream. Release resets the anchors.
-            return None
+            # teleop stream. Release resets the anchors. A goal that holds
+            # the arm while it plans commands the hold while the follower
+            # reports.
+            if self._arm.held is None or measured is None:
+                return None
+            self._arm.commanded = self._arm.held
+            return self._arm.commanded
         anchor = self.arm_anchor()
         desired = self._streamed_arm_target(anchor)
         if desired is None or anchor is None:

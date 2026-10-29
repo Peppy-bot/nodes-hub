@@ -14,7 +14,12 @@ from control_core_py import runtime
 from control_core_py.runtime import CancellationToken
 from peppygen import NodeBuilder, NodeRunner
 from peppygen.emitted_topics.limb_state import limb_states
-from peppygen.exposed_actions.limb_motion import move_arm, move_arm_joints, move_gripper
+from peppygen.exposed_actions.limb_motion import (
+    execute_joint_path,
+    move_arm,
+    move_arm_joints,
+    move_gripper,
+)
 from peppygen.exposed_actions.postures import move_to_home, move_to_ready
 from peppygen.exposed_services.limb_motion import check_arm_move, stop
 from peppygen.exposed_services.limb_state import get_limb_names
@@ -400,6 +405,8 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
         server(move_arm_joints,
                lambda p: layer.decide_arm_joints(move_arm_joints, p),
                layer.drive_arm, "move_arm_joints"),
+        server(execute_joint_path, layer.decide_joint_path, layer.drive_joint_path,
+               "execute_joint_path"),
         server(move_to_ready,
                lambda p: layer.decide_posture(move_to_ready, postures.READY_POSITIONS_RAD, p),
                drive_posture, "move_to_ready"),

@@ -6,6 +6,7 @@
 - a fake kinematics;
 - a follower whose liveness does not ride the host's clock;
 - one gripper control tick;
+- an execute_joint_path goal, and the joints of its result;
 - the targets and checks of the workspace tests.
 """
 
@@ -14,6 +15,7 @@ from __future__ import annotations
 import math
 
 import pytest
+from peppygen.exposed_actions.limb_motion import execute_joint_path
 from so101_description.limits import JointLimits
 
 from so101_backbone.actions import ActionLayer
@@ -38,6 +40,14 @@ NEAR = (0.2, 0.0, 0.04)
 CLOSE = (0.4, 0.1, 0.1)
 FAR = (1.0, 0.0, 0.2)
 FAR_SHORT_BY_MORE_THAN = 0.4
+
+# How far (rad) each measured joint may stand from a joint path's expected
+# start in the tests.
+START_TOLERANCE_RAD = 0.05
+
+# The peak acceleration (rad/s²) of each joint that joint paths are timed
+# within in the tests, near the ramp of the SO-101's servos.
+MAX_JOINT_ACCELERATION_RAD_S2 = 40.0
 
 # The sentence each workspace answer of this robot, which has no perception
 # camera, ends with.
@@ -102,11 +112,13 @@ def make_config(**overrides) -> Config:
         "upstream_mode": UpstreamMode.JOINTS,
         "control_rate_hz": 100,
         "max_joint_velocity_rad_s": (2.0,) * 5,
+        "max_joint_acceleration_rad_s2": (MAX_JOINT_ACCELERATION_RAD_S2,) * 5,
         # Transparent by default: parity tests must see pure pass-through.
         # Governor- and rate-specific tests override these downward.
         "max_ee_velocity_m_s": 1e9,
         "max_ee_angular_velocity_rad_s": 1e9,
         "max_gripper_rate_frac_s": 1e9,
+        "start_tolerance_rad": START_TOLERANCE_RAD,
     }
     return Config(**{**base, **overrides})
 
@@ -149,6 +161,45 @@ def gripper_step(coordinator, measured: float, now: float) -> float | None:
     if opening is not None:
         coordinator.gripper_published(True, opening)
     return opening
+
+
+def joint_path_goal(
+    *waypoints,
+    duration_s=0.0,
+    settle_timeout_s=2.0,
+    tolerances=(0.1,) * 5,
+    expected_start=(),
+    arm_names=("arm",),
+) -> execute_joint_path.GoalRequestData:
+    """An execute_joint_path goal with an entry per name in `arm_names`, each
+    through `waypoints`, settling within `tolerances` of the last and
+    expecting the arm at `expected_start`."""
+    return execute_joint_path.GoalRequestData(
+        arms=[
+            execute_joint_path.GoalRequestDataArmsItem(
+                arm_name=name,
+                waypoints=[
+                    execute_joint_path.GoalRequestDataArmsItemWaypointsItem(
+                        joint_positions=list(w)
+                    )
+                    for w in waypoints
+                ],
+                expected_start_joint_positions=list(expected_start),
+                settle_tolerances_rad=list(tolerances),
+            )
+            for name in arm_names
+        ],
+        duration_s=duration_s,
+        settle_timeout_s=settle_timeout_s,
+    )
+
+
+def path_result_joints(arms) -> list[float]:
+    """The joints of the `arms` of an execute_joint_path result: those of its
+    one entry, the arm's."""
+    [arm] = arms
+    assert arm.arm_name == "arm"
+    return arm.final_joint_positions
 
 
 @pytest.fixture
