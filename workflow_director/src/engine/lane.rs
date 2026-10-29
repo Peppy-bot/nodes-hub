@@ -305,7 +305,8 @@ impl<'a, H: Host> Lane<'a, H> {
     /// Runs a step, and meets an incident at the step where it happens: an
     /// attended run suspends the lane, parks the branch here and runs the
     /// step again from its first attempt at the resume; an unattended run
-    /// fails the lane.
+    /// fails the lane. A wait goes on at the resume with the time it had
+    /// left, since the lane time counts nothing while the lane is suspended.
     fn run_step<'s>(
         &'s self,
         step: &'s Step,
@@ -314,8 +315,13 @@ impl<'a, H: Host> Lane<'a, H> {
     ) -> Boxed<'s, StepEnd> {
         Box::pin(async move {
             let name = self.name_in(step, &within);
+            let first_start = self.lane_now();
             loop {
-                let end = self.attempts(step, scope, within.clone()).await;
+                let started = match &step.kind {
+                    StepKind::WaitFor { .. } | StepKind::WaitUntil { .. } => first_start,
+                    _ => self.lane_now(),
+                };
+                let end = self.attempts(step, scope, within.clone(), started).await;
                 let failure = match end {
                     StepEnd::Failed(f) if f.class != Class::Lane && within.pass.is_some() => {
                         return StepEnd::Failed(f);
@@ -347,16 +353,17 @@ impl<'a, H: Host> Lane<'a, H> {
         })
     }
 
-    /// The attempts of a step within its bound and under its invariant,
-    /// which it checks at the start and at each poll tick.
+    /// The attempts of a step within its bound from `started`, a lane time,
+    /// and under its invariant, which it checks at the start and at each
+    /// poll tick.
     async fn attempts<'s>(
         &'s self,
         step: &'s Step,
         scope: &mut Scope,
         within: Within<'s>,
+        started: u64,
     ) -> StepEnd {
         let name = self.name_in(step, &within);
-        let started = self.lane_now();
         let own = step.timeout.map(|bound| started + bound.nanos());
         // A bound of an enclosing step that passes no later than this
         // step's own takes the failure: the outermost step whose bound

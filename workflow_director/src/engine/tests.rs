@@ -646,6 +646,34 @@ async fn a_lane_that_waits_only_on_suspended_lanes_suspends_with_them_and_resume
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_wait_goes_on_at_the_resume_with_the_time_it_had_left() {
+    // The suspension at 5 s finds beta 5 s into its 12 s wait. The resume at
+    // 30 s leaves it 7 s, so it fails at 37 s, before alpha, which runs its
+    // 10 s rest again from 30 s, tells it at 40 s.
+    let mut slow = rest("rest");
+    slow["timeout_s"] = json!(200);
+    let alpha = json!({ "id": "first", "sequence": [slow, { "id": "tell", "signal": "ready" }] });
+    let value = lanes(&[("alpha", alpha), ("beta", hears_within(12))]);
+    let plan = plan(&value, Attendance::Attended);
+    let host =
+        ScriptedHost::new().answer("home", vec![Answer::after(10, json!({ "at_home": true }))]);
+    let (reply, resumed) = oneshot::channel();
+    let commands = vec![
+        (5, RunCommand::Suspend),
+        (30, RunCommand::Resume { reply }),
+        (200, RunCommand::Abort),
+    ];
+    let (result, _) = run(&plan, &host, commands).await;
+    assert_eq!(resumed.await.unwrap(), Ok(()));
+    let incidents: Vec<(&str, &str)> = result
+        .incidents
+        .iter()
+        .map(|incident| (incident.step.as_str(), incident.failure_kind.as_str()))
+        .collect();
+    assert_eq!(incidents, [("beta.hear", "timeout")], "{result:#?}");
+}
+
 /// The failure that the clock watch gives a lane of `role` once the
 /// simulation clock stopped.
 fn clock_stopped(role: &str) -> RunCommand {
