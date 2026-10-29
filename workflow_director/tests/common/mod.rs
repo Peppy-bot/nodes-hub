@@ -825,6 +825,11 @@ impl Rig {
         journals: tempfile::TempDir,
         journal_max_runs: u32,
     ) -> peppygen::Result<Rig> {
+        // The codec writes the Cap'n Proto compiler the process carries into
+        // this directory, once per process.
+        let compilers = std::env::temp_dir().join("workflow_director_tests");
+        std::fs::create_dir_all(&compilers).expect("a directory for the compiler");
+        peppy_codec::compiler::extract_into(compilers);
         let config = Config {
             parameters: Some(parameters(journals.path(), journal_max_runs)),
             ..Config::default()
