@@ -1,7 +1,9 @@
 //! The alerts of the physical robots of a run, from the `alert:v1` instances
-//! of each robot in the fleet listing. An alert of severity 2 or 3 is an
-//! incident of the lane of its robot, once while its `(source, kind)` stands;
-//! an alert of severity 1 goes to the journal. A set that is not refreshed for
+//! of each robot in the fleet listing. An alert of severity 2 or 3 in the
+//! first set of a producer refuses the run; during the run it is an incident
+//! of the lane of its robot, once while its `(source, kind)` stands, and a
+//! resume of that lane is refused while it stands. An alert of severity 1
+//! goes to the journal. A set that is not refreshed for
 //! three cadence periods leaves the conditions of its robot unknown, which
 //! is an incident too.
 
@@ -120,6 +122,9 @@ pub async fn watch(
                     ALERTS_STALE.as_secs()
                 ));
             };
+            if let Some(refusal) = refusal_at_binding(&robot.name, &first) {
+                return Err(refusal);
+            }
             let role = role.clone();
             let commands = commands.clone();
             let note = Arc::clone(&note);
@@ -169,9 +174,59 @@ fn stale_alerts(source: &str) -> Failure {
     }))
 }
 
+/// One active alert of a set of `alert:v1`.
+struct Active {
+    pair: AlertPair,
+    severity: u64,
+    message: String,
+    alert: Json,
+}
+
+/// The active alerts of `set`, a severity given as a number or as its text.
+fn active(set: &Json) -> Vec<Active> {
+    set["active"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|alert| Active {
+            pair: (
+                alert["source"].as_str().unwrap_or_default().to_owned(),
+                alert["kind"].as_str().unwrap_or_default().to_owned(),
+            ),
+            severity: alert["severity"]
+                .as_u64()
+                .or_else(|| alert["severity"].as_str().and_then(|s| s.parse().ok()))
+                .unwrap_or(0),
+            message: alert["message"].as_str().unwrap_or_default().to_owned(),
+            alert: alert.clone(),
+        })
+        .collect()
+}
+
+/// The refusal of a run whose robot `robot` has an incident alert in the
+/// first set `set` of one of its producers.
+fn refusal_at_binding(robot: &str, set: &Json) -> Option<String> {
+    let alert = active(set)
+        .into_iter()
+        .find(|alert| alert.severity >= INCIDENT_SEVERITY)?;
+    Some(format!(
+        "`{robot}` has an active alert of severity {}, {} ({}): {}; start the run once it clears",
+        alert.severity, alert.pair.0, alert.pair.1, alert.message
+    ))
+}
+
+/// The text of each alert of `raised`, as a refused resume names it.
+fn standing_texts(raised: &BTreeSet<AlertPair>) -> Vec<String> {
+    raised
+        .iter()
+        .map(|(source, kind)| format!("{source} ({kind})"))
+        .collect()
+}
+
 /// Raises each alert of `set` of severity 2 or 3 that is not raised yet,
-/// notes each of severity 1 that is not noted yet, and gives the alerts that
-/// stand after it.
+/// notes each of severity 1 that is not noted yet, reports the incident
+/// alerts that stand when they change, and gives the alerts that stand
+/// after it.
 fn raise(
     role: &Name,
     source: &str,
@@ -180,17 +235,14 @@ fn raise(
     commands: &mpsc::UnboundedSender<RunCommand>,
     note: &Note,
 ) -> Standing {
-    let active = set["active"].as_array().cloned().unwrap_or_default();
     let mut now = Standing::default();
-    for alert in &active {
-        let pair = (
-            alert["source"].as_str().unwrap_or_default().to_owned(),
-            alert["kind"].as_str().unwrap_or_default().to_owned(),
-        );
-        let severity = alert["severity"]
-            .as_u64()
-            .or_else(|| alert["severity"].as_str().and_then(|s| s.parse().ok()))
-            .unwrap_or(0);
+    for Active {
+        pair,
+        severity,
+        message,
+        alert,
+    } in active(set)
+    {
         if severity < INCIDENT_SEVERITY {
             if !standing.noted.contains(&pair) {
                 note(json!({ "role": role, "producer": source, "alert": alert }));
@@ -199,12 +251,7 @@ fn raise(
             continue;
         }
         if !standing.raised.contains(&pair) {
-            let message = format!(
-                "{} ({}): {}",
-                pair.0,
-                pair.1,
-                alert["message"].as_str().unwrap_or_default()
-            );
+            let message = format!("{} ({}): {message}", pair.0, pair.1);
             let cause = Cause::Alert(AlertCause {
                 source: pair.0.clone(),
                 kind: pair.1.clone(),
@@ -217,6 +264,13 @@ fn raise(
             });
         }
         now.raised.insert(pair);
+    }
+    if now.raised != standing.raised {
+        let _ = commands.send(RunCommand::Alerts {
+            role: role.clone(),
+            source: source.to_owned(),
+            standing: standing_texts(&now.raised),
+        });
     }
     now
 }
@@ -231,13 +285,87 @@ mod tests {
     /// The `(role, kind, message)` of each fault that the watch sent.
     fn faults(commands: &mut mpsc::UnboundedReceiver<RunCommand>) -> Vec<(String, String, String)> {
         std::iter::from_fn(|| commands.try_recv().ok())
-            .map(|command| match command {
+            .filter_map(|command| match command {
                 RunCommand::Fault { role, failure } => {
-                    (role.to_string(), failure.kind, failure.message)
+                    Some((role.to_string(), failure.kind, failure.message))
                 }
-                _ => panic!("the watch sends faults alone"),
+                RunCommand::Alerts { .. } => None,
+                _ => panic!("the watch sends faults and the alerts that stand"),
             })
             .collect()
+    }
+
+    /// The `(role, producer, alerts)` of each report of the incident alerts
+    /// that stand that the watch sent.
+    fn reports(
+        commands: &mut mpsc::UnboundedReceiver<RunCommand>,
+    ) -> Vec<(String, String, Vec<String>)> {
+        std::iter::from_fn(|| commands.try_recv().ok())
+            .filter_map(|command| match command {
+                RunCommand::Alerts {
+                    role,
+                    source,
+                    standing,
+                } => Some((role.to_string(), source, standing)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The incident alerts that stand are reported each time they change: at
+    /// their first raise, never while they stand, and as none once they went;
+    /// an alert of severity 1 is never one of them.
+    #[test]
+    fn the_incident_alerts_that_stand_are_reported_each_time_they_change() {
+        let (commands, mut sent) = mpsc::unbounded_channel();
+        let note: Note = Box::new(|_| {});
+        let raised = |set: Json, standing: Standing| {
+            raise(
+                &name("arm"),
+                "health_inst",
+                &set,
+                standing,
+                &commands,
+                &note,
+            )
+        };
+        let hot =
+            json!({ "source": "motor_3", "kind": "overheat", "severity": 2, "message": "82 C" });
+        let low = json!({ "source": "fan", "kind": "slow", "severity": 1, "message": "800 rpm" });
+        let report = |alerts: &[&str]| {
+            (
+                "arm".to_owned(),
+                "health_inst".to_owned(),
+                alerts.iter().map(|alert| (*alert).to_owned()).collect(),
+            )
+        };
+
+        let standing = raised(set(json!([hot, low])), Standing::default());
+        assert_eq!(reports(&mut sent), [report(&["motor_3 (overheat)"])]);
+        let standing = raised(set(json!([hot, low])), standing);
+        assert!(
+            reports(&mut sent).is_empty(),
+            "a set that stands reports nothing"
+        );
+        raised(set(json!([low])), standing);
+        assert_eq!(reports(&mut sent), [report(&[])]);
+    }
+
+    /// An alert of severity 2 or 3 in the first set of a producer refuses the
+    /// run, naming the robot and the alert; one of severity 1 does not.
+    #[test]
+    fn an_incident_alert_in_the_first_set_refuses_the_run() {
+        let hot =
+            json!({ "source": "motor_3", "kind": "overheat", "severity": "3", "message": "90 C" });
+        let low = json!({ "source": "fan", "kind": "slow", "severity": 1, "message": "800 rpm" });
+        assert_eq!(
+            refusal_at_binding("arm", &set(json!([low.clone(), hot]))).as_deref(),
+            Some(
+                "`arm` has an active alert of severity 3, motor_3 (overheat): 90 C; start the run once it clears"
+            )
+        );
+        assert_eq!(refusal_at_binding("arm", &set(json!([low]))), None);
+        assert_eq!(refusal_at_binding("arm", &set(json!([]))), None);
     }
 
     fn set(active: Json) -> Json {

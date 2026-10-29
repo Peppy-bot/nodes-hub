@@ -64,8 +64,9 @@ sent.
 An incident of an attended run suspends its lane: the lane runs its safe
 state, the lease of its robot opens for a take-over, and `resume` closes it,
 checks the lane and runs the failed step again. An incident of an unattended
-run fails its lane. The alerts of severity 2 and 3 of each bound physical
-robot are incidents of its lane.
+run fails its lane. An alert of severity 2 or 3 of a bound physical robot
+refuses the run when it stands at the start, is an incident of the robot's
+lane during the run, and refuses a resume of that lane while it stands.
 
 `run`, `resume` and `abort` give each event of the run as feedback, and the
 status of the run every 5 s; `run_events` gives every event of every run.

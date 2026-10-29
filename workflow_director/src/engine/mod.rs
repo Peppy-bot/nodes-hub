@@ -67,6 +67,14 @@ pub enum RunCommand {
         halted: bool,
         reason: String,
     },
+    /// The incident alerts that stand on the robot of a lane, as one
+    /// producer of its alert:v1 gave them last: a resume of the lane is
+    /// refused while one stands.
+    Alerts {
+        role: Name,
+        source: String,
+        standing: Vec<String>,
+    },
     /// A fault of one lane: an alert of its robot, or a stopped clock.
     Fault {
         role: Name,
@@ -213,6 +221,27 @@ impl<H: Host> RunCtx<'_, H> {
         if let Some(fault) = self.faults.get(role) {
             fault.send_replace(Some(failure));
         }
+    }
+
+    /// Keeps the incident alerts that stand on the robot of `role`, as its
+    /// producer `source` gave them last.
+    fn alerts_stand(&self, role: &Name, source: String, standing: Vec<String>) {
+        self.shared.change(|s| {
+            let of_role = s.alerts.entry(role.clone()).or_default();
+            match standing.is_empty() {
+                true => of_role.remove(&source),
+                false => of_role.insert(source, standing),
+            };
+        });
+    }
+
+    /// An incident alert that stands on the robot of `role`.
+    fn standing_alert(&self, role: &Name) -> Option<String> {
+        self.shared.read(|s| {
+            s.alerts
+                .get(role)
+                .and_then(|by_source| by_source.values().flatten().next().cloned())
+        })
     }
 
     /// Takes the fault of `role` that no branch of its lane met yet.
@@ -898,6 +927,14 @@ fn before_the_lanes<H: Host>(ctx: &RunCtx<'_, H>, command: RunCommand) -> Option
             ctx.fault(&role, failure);
             None
         }
+        RunCommand::Alerts {
+            role,
+            source,
+            standing,
+        } => {
+            ctx.alerts_stand(&role, source, standing);
+            None
+        }
     }
 }
 
@@ -1079,6 +1116,11 @@ async fn command_while_running<'a, H: Host>(
             ctx.stop_run(Stop::of_halt(halted), &reason);
         }
         RunCommand::Fault { role, failure } => ctx.fault(&role, failure),
+        RunCommand::Alerts {
+            role,
+            source,
+            standing,
+        } => ctx.alerts_stand(&role, source, standing),
     }
 }
 
@@ -1121,6 +1163,17 @@ async fn resume<H: Host>(
                         message: format!("the lease of `{robot}` did not close: {error}"),
                     });
                 }
+            }
+        }
+        for role in &parked {
+            if let Some(alert) = ctx.standing_alert(role) {
+                let robot = &ctx.plan.roles[role].robot;
+                break 'checks Some(Located {
+                    at: role.to_string(),
+                    message: format!(
+                        "an alert of severity 2 or 3 stands on `{robot}`: {alert}; resume once it clears"
+                    ),
+                });
             }
         }
         for role in &parked {

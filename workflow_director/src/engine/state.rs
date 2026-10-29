@@ -33,6 +33,9 @@ pub(crate) struct State {
     pub last_values: BTreeMap<Name, Json>,
     pub loops: BTreeMap<String, LoopCount>,
     pub incidents: Vec<IncidentRecord>,
+    /// The incident alerts that stand on the robot of each role, by the
+    /// producer that gave them.
+    pub alerts: BTreeMap<Name, BTreeMap<String, Vec<String>>>,
 }
 
 /// Where a lane stands.

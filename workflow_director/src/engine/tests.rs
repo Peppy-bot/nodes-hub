@@ -1312,6 +1312,64 @@ fn nothing() -> Json {
     json!({ "found": false, "item_id": "", "position": [0.0, 0.0, 0.0], "kind": "unknown", "count": "0" })
 }
 
+/// The incident alerts that stand on the robot of `alpha`, as the watch of its
+/// alerts reports them.
+fn standing_on_alpha(alerts: &[&str]) -> RunCommand {
+    RunCommand::Alerts {
+        role: name("alpha"),
+        source: "gripper_inst".to_owned(),
+        standing: alerts.iter().map(|alert| (*alert).to_owned()).collect(),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_resume_is_refused_while_an_alert_stands_on_the_robot_of_its_lane() {
+    // The alert at 1 s suspends the lane during its 10 s rest. The resume at
+    // 20 s is refused while the alert stands; the one at 40 s, after it
+    // cleared at 30 s, runs the rest again.
+    let plan = plan(
+        &one_arm("alpha", rest("rest"), json!([])),
+        Attendance::Attended,
+    );
+    let at_home = json!({ "at_home": true });
+    let host = arm().answer(
+        "home",
+        vec![Answer::after(10, at_home.clone()), Answer::now(at_home)],
+    );
+    let (refused_reply, refused) = oneshot::channel();
+    let (reply, resumed) = oneshot::channel();
+    let commands = vec![
+        (1, hot_gripper()),
+        (1, standing_on_alpha(&["gripper_left (overheat)"])),
+        (
+            20,
+            RunCommand::Resume {
+                reply: refused_reply,
+            },
+        ),
+        (30, standing_on_alpha(&[])),
+        (40, RunCommand::Resume { reply }),
+        (200, RunCommand::Abort),
+    ];
+    let (result, _) = run(&plan, &host, commands).await;
+    let Err(ResumeRefusal::Check(refusal)) = refused.await.unwrap() else {
+        panic!("the resume at 20 s is refused");
+    };
+    assert_eq!(refusal.at, "alpha");
+    assert!(
+        refusal.message.contains("gripper_left (overheat)"),
+        "{}",
+        refusal.message
+    );
+    assert_eq!(resumed.await.unwrap(), Ok(()));
+    assert_eq!(result.ending, Ending::Completed, "{result:#?}");
+    assert_eq!(
+        host.calls_of("home").len(),
+        2,
+        "the resume runs the rest again"
+    );
+}
+
 /// An alert of the gripper of `alpha`, as the watch of its alerts gives it.
 fn hot_gripper() -> RunCommand {
     RunCommand::Fault {

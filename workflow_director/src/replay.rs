@@ -135,12 +135,25 @@ pub fn journal_command(
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 enum CommandRecord {
-    Confirm { assumption: Name },
+    Confirm {
+        assumption: Name,
+    },
     Suspend,
     Resume,
     Abort,
-    Stop { halted: bool, reason: String },
-    Fault { role: Name, failure: Failure },
+    Stop {
+        halted: bool,
+        reason: String,
+    },
+    Fault {
+        role: Name,
+        failure: Failure,
+    },
+    Alerts {
+        role: Name,
+        source: String,
+        standing: Vec<String>,
+    },
 }
 
 impl CommandRecord {
@@ -155,6 +168,15 @@ impl CommandRecord {
             RunCommand::Stop { halted, reason } => CommandRecord::Stop {
                 halted: *halted,
                 reason: reason.clone(),
+            },
+            RunCommand::Alerts {
+                role,
+                source,
+                standing,
+            } => CommandRecord::Alerts {
+                role: role.clone(),
+                source: source.clone(),
+                standing: standing.clone(),
             },
             RunCommand::Fault { role, failure } => CommandRecord::Fault {
                 role: role.clone(),
@@ -173,6 +195,15 @@ impl CommandRecord {
             CommandRecord::Abort => RunCommand::Abort,
             CommandRecord::Stop { halted, reason } => RunCommand::Stop { halted, reason },
             CommandRecord::Fault { role, failure } => RunCommand::Fault { role, failure },
+            CommandRecord::Alerts {
+                role,
+                source,
+                standing,
+            } => RunCommand::Alerts {
+                role,
+                source,
+                standing,
+            },
         }
     }
 }
