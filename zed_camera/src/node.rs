@@ -36,7 +36,8 @@ use peppylib::runtime::CancellationToken;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 use zed_camera::calibration::fetch_conf;
-use zed_camera::capture::{Capture, Grab, device_index, zed_serial};
+use zed_camera::capture::{self, Capture, Grab, device_index, zed_serial};
+use zed_camera::capture_time::captured_at;
 use zed_camera::cv_depth::CvDepth;
 use zed_camera::geometry::Geometry;
 use zed_camera::{DepthSettings, LegalFrameRate, Resolution, Size};
@@ -188,19 +189,34 @@ fn run_pipeline(
     let mut depth_mm = vec![0u16; (depth.width * depth.height) as usize];
     let mut frame_id: u32 = 0;
     let processing_failures = LatchedLog::warn("depth processing");
+    let capture_stamps = LatchedLog::warn("capture stamps");
 
     while !cancel.is_cancelled() {
         let grabbed = lock_ignoring_poison(&camera).grab(&mut yuyv, GRAB_TIMEOUT);
-        match grabbed {
+        let captured = match grabbed {
             Grab::Timeout => continue,
             Grab::Dead => {
                 error!("capture stream died");
                 return;
             }
-            Grab::Frame => {}
-        }
-        let Ok(timestamp) = clock_now() else {
+            Grab::Frame { captured } => captured,
+        };
+        let monotonic_now = capture::monotonic_now();
+        let Ok(now) = clock_now() else {
             continue; // clock not ready yet: skip rather than mis-stamp
+        };
+        let stamped = captured.and_then(|captured| captured_at(now, monotonic_now?, captured));
+        let timestamp = match stamped {
+            Ok(at) => {
+                capture_stamps.success();
+                at
+            }
+            Err(reason) => {
+                capture_stamps.failure(format!(
+                    "{reason}; frames carry the instant they were dequeued"
+                ));
+                now
+            }
         };
         if let Err(e) = matcher.process(&yuyv, &mut left_rgb, &mut depth_mm) {
             processing_failures.failure(e);

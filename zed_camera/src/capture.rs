@@ -7,7 +7,7 @@ use std::io::{self, ErrorKind};
 use std::path::Path;
 use std::time::Duration;
 
-use v4l::buffer::Type;
+use v4l::buffer::{Flags, Metadata, Type};
 use v4l::control::{Control, Value};
 use v4l::io::traits::CaptureStream;
 use v4l::prelude::*;
@@ -28,9 +28,46 @@ const ZED_HID_PRODUCT_IDS: [&str; 3] = ["f681", "f781", "f881"];
 
 /// The result of one grab attempt.
 pub enum Grab {
-    Frame,
+    /// A frame, and its buffer's capture stamp by the monotonic clock, or why it has
+    /// none.
+    Frame {
+        captured: Result<Duration, String>,
+    },
     Timeout,
     Dead,
+}
+
+/// The monotonic clock's reading, the clock the buffers' flags name.
+pub fn monotonic_now() -> Result<Duration, String> {
+    nix::time::clock_gettime(nix::time::ClockId::CLOCK_MONOTONIC)
+        .map(Duration::from)
+        .map_err(|e| format!("the monotonic clock cannot be read: {e}"))
+}
+
+/// The buffer's capture stamp, which its flags say the driver took by the monotonic
+/// clock at the start of the frame's exposure. uvcvideo flags every buffer so. Its stamp
+/// is the host's clock when the driver decodes the frame's first packet, unless the
+/// module runs with `hwtimestamps=1`, when it is the camera's presentation stamp, the
+/// start of the frame's exposure, carried onto the host's clock. The module's
+/// `clock=realtime` stamps by the realtime clock under the same flags. A buffer flagged
+/// otherwise, or a stamp with a negative field, has none.
+fn capture_stamp(meta: &Metadata) -> Result<Duration, String> {
+    if meta.flags & Flags::TIMESTAMP_MASK != Flags::TIMESTAMP_MONOTONIC
+        || meta.flags & Flags::TSTAMP_SRC_MASK != Flags::TSTAMP_SRC_SOE
+    {
+        return Err(
+            "the driver flags its stamps as taken by another clock than the monotonic one, \
+             or at the end of the frame"
+                .to_string(),
+        );
+    }
+    let (sec, usec) = (meta.timestamp.sec, meta.timestamp.usec);
+    match (u64::try_from(sec), u64::try_from(usec)) {
+        (Ok(whole), Ok(micros)) => Ok(Duration::from_secs(whole) + Duration::from_micros(micros)),
+        _ => Err(format!(
+            "the driver stamps a frame {sec} s and {usec} us, a negative field"
+        )),
+    }
 }
 
 /// Open ZED capture stream (V4L2 mmap streaming via `v4l`).
@@ -82,8 +119,8 @@ impl Capture {
     }
 
     /// Copy the next full side-by-side YUYV frame into `yuyv`, waiting up to
-    /// `timeout`. A short transfer is dropped as Timeout rather than
-    /// returned with a stale tail.
+    /// `timeout`, with its buffer's capture stamp. A short transfer is dropped as
+    /// Timeout.
     pub fn grab(&mut self, yuyv: &mut [u8], timeout: Duration) -> Grab {
         self.stream.set_timeout(timeout);
         let (frame, meta) = match self.stream.next() {
@@ -97,7 +134,9 @@ impl Capture {
         }
         let n = yuyv.len().min(expected);
         yuyv[..n].copy_from_slice(&frame[..n]);
-        Grab::Frame
+        Grab::Frame {
+            captured: capture_stamp(meta),
+        }
     }
 
     /// Reads an integer control by CID.
@@ -202,6 +241,54 @@ mod tests {
     fn a_failed_write_names_the_control() {
         let failure = write_failure(CID_CONTRAST, &io::Error::other("out of range"));
         assert!(failure.message.contains("0x980901"), "{}", failure.message);
+    }
+
+    /// The metadata of a buffer stamped 12.5 s by `flags`'s clock and instant.
+    fn stamped(flags: Flags) -> Metadata {
+        Metadata {
+            bytesused: 0,
+            flags,
+            field: 0,
+            timestamp: v4l::Timestamp::new(12, 500_000),
+            sequence: 0,
+        }
+    }
+
+    // A buffer flagged as stamped by the monotonic clock at the start of its exposure,
+    // as uvcvideo flags every buffer, gives its stamp, whatever other flags it carries;
+    // one flagged as stamped at the end of the frame, or by another clock, gives none,
+    // and says so. A stamp with a negative field gives none, and names the stamp.
+    #[test]
+    fn a_frame_carries_its_stamp_by_the_monotonic_clock_alone() {
+        let start = Flags::TIMESTAMP_MONOTONIC | Flags::TSTAMP_SRC_SOE;
+        let stamp = Ok(Duration::from_millis(12_500));
+        assert_eq!(capture_stamp(&stamped(start)), stamp);
+        assert_eq!(
+            capture_stamp(&stamped(start | Flags::MAPPED | Flags::DONE)),
+            stamp
+        );
+        let flagged_otherwise = Err("the driver flags its stamps as taken by another clock \
+                                     than the monotonic one, or at the end of the frame"
+            .to_string());
+        for flags in [
+            Flags::TIMESTAMP_MONOTONIC | Flags::TSTAMP_SRC_EOF,
+            Flags::TIMESTAMP_COPY | Flags::TSTAMP_SRC_SOE,
+            Flags::TIMESTAMP_UNKNOWN | Flags::TSTAMP_SRC_SOE,
+        ] {
+            assert_eq!(
+                capture_stamp(&stamped(flags)),
+                flagged_otherwise,
+                "{flags:?}"
+            );
+        }
+        let early = Metadata {
+            timestamp: v4l::Timestamp::new(-1, 500_000),
+            ..stamped(start)
+        };
+        assert_eq!(
+            capture_stamp(&early),
+            Err("the driver stamps a frame -1 s and 500000 us, a negative field".to_string())
+        );
     }
 
     #[test]

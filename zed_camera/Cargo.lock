@@ -4932,6 +4932,7 @@ version = "0.1.0"
 dependencies = [
  "camera_core",
  "control_core",
+ "nix",
  "opencv",
  "peppygen",
  "peppylib",
