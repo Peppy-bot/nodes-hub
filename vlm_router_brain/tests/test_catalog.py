@@ -28,9 +28,10 @@ def test_the_shipped_catalog_parses_into_the_models_step_0_passed():
         "gemini-robotics-er-2-preview", "gemini-4-argon", "claude-opus-5.5", "gpt-6-astra",
     ]
     assert catalog.names_for(Role.PERCEPTION) == [entry.name for entry in catalog.entries]
-    assert catalog.names_for(Role.MANIPULATION) == []
+    # Every shipped model passed step 0 of the alignment too (2026-10-24).
+    assert catalog.names_for(Role.MANIPULATION) == [entry.name for entry in catalog.entries]
     er = catalog.get("gemini-robotics-er-2-preview")
-    assert er.coordinates == "yx_0_1000" and er.roles == frozenset({Role.PERCEPTION})
+    assert er.coordinates == "yx_0_1000" and er.roles == frozenset({Role.PERCEPTION, Role.MANIPULATION})
     [route] = er.routes
     assert (route.provider, route.model, route.min_call_timeout_s, route.reasoning_effort) == (
         "gemini", "gemini-robotics-er-2-preview", 10.0, "medium",
@@ -68,8 +69,7 @@ def route_with(**changes) -> dict:
     ({"models": [entry_with(name="none")]}, "model 'none': 'none' names a model built into the node, never a catalog model"),
     ({"models": [entry_with(name="scripted")]}, "model 'scripted': 'scripted' names a model built into the node, never a catalog model"),
     ({"models": [entry_with(roles=[])]}, "model 'fast': roles must be a list of at least one role"),
-    ({"models": [entry_with(roles=["arm"])]}, "model 'fast': the role 'arm' is not one a catalog model serves here (perception)"),
-    ({"models": [entry_with(roles=["manipulation"])]}, "the role 'manipulation' is not one a catalog model serves here"),
+    ({"models": [entry_with(roles=["arm"])]}, "model 'fast': the role 'arm' is not one a catalog model serves here (manipulation, perception)"),
     ({"models": [entry_with(coordinates="xy_0_1")]}, "model 'fast': unknown coordinates 'xy_0_1'; known: yx_0_1000"),
     ({"models": [entry_with(routes=[])]}, "model 'fast': routes must be a list of at least one route"),
     ({"models": [route_with(route="gemini-fast")]}, "routes[0]: route 'gemini-fast' must be written provider:model"),

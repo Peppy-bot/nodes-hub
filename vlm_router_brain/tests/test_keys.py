@@ -7,6 +7,7 @@ from conftest import TEST_CATALOG
 
 from vlm_router_brain import provider as provider_module
 from vlm_router_brain.keys import KEY_VARIABLES, first_keyed, key_for, no_key_message
+from vlm_router_brain.parsing import Answer
 from vlm_router_brain.provider import DETAIL_CHARS, AnyLlmProvider, ProviderFailure
 
 CAREFUL = TEST_CATALOG.get("careful")
@@ -47,7 +48,7 @@ async def failure_of(monkeypatch, error: Exception) -> ProviderFailure:
 
     monkeypatch.setattr(provider_module.AnyLLM, "create", staticmethod(lambda provider, **kwargs: FailingClient()))
     with pytest.raises(ProviderFailure) as raised:
-        await AnyLlmProvider({"OPENROUTER_API_KEY": SENTINEL}).ask(CAREFUL.routes[0], b"jpeg", "q", 10.0)
+        await AnyLlmProvider({"OPENROUTER_API_KEY": SENTINEL}).ask(CAREFUL.routes[0], [b"jpeg"], "q", Answer, 10.0)
     assert SENTINEL not in raised.value.message and SENTINEL not in repr(raised.value)
     return raised.value
 

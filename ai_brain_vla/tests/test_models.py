@@ -7,12 +7,11 @@ from pathlib import Path
 
 import pytest
 from brain_core.limb_state import LimbStateStore
-from brain_core.manipulation.centre_proposer import CentreProposer
-from brain_core.manipulation.none import NoneManipulator
-from brain_core.manipulation.scripted import ScriptedManipulator
+from brain_core.manipulators.none import NoneManipulator
+from brain_core.manipulators.scripted import CentreProposer, ScriptedManipulator
 from brain_core.models import Models
 from brain_core.perception.none import NoneDetector
-from brain_core.ports import FailureKind, Refusal, Role
+from brain_core.ports import FailureKind, Refusal, Role, Senses
 from brain_core.sequencer import Sequencer
 from conftest import FakeDetector, FakeManipulator
 
@@ -89,7 +88,7 @@ async def test_the_start_builds_each_model_once_and_a_switch_to_it_hands_back_th
         "sam3_siglip", "scripted", " waldo_catalogue ",
         detectors={"sam3_siglip": built}, manipulators={"scripted": lambda: manipulator},
     )
-    core = Models(models, Sequencer(), robot=None, limb_states=LimbStateStore())
+    core = Models(models, Sequencer(), Senses(None, LimbStateStore(), None, None, None))
     await core.start({Role.PERCEPTION: "sam3_siglip", Role.MANIPULATION: "scripted"})
     assert core.current(Role.PERCEPTION) is built.detector and core.current(Role.MANIPULATION) is manipulator
     assert built.galleries == [" waldo_catalogue "]
@@ -99,7 +98,7 @@ async def test_the_start_builds_each_model_once_and_a_switch_to_it_hands_back_th
 
 async def test_brain_core_starts_on_scripted_and_hands_it_the_limbs():
     models = VlaModels("none", "scripted", "")
-    core = Models(models, Sequencer(), robot="robot", limb_states=LimbStateStore())
+    core = Models(models, Sequencer(), Senses("robot", LimbStateStore(), None, None, None))
     await core.start({Role.PERCEPTION: "none", Role.MANIPULATION: "scripted"})
     manipulator = core.current(Role.MANIPULATION)
     assert isinstance(manipulator, ScriptedManipulator)

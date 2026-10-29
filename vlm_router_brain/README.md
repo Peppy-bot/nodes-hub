@@ -35,12 +35,15 @@ A catalog the node cannot read stops it at its start, naming the entry and
 the field.
 
 Both roles also accept `none`, the role's missing model: its goals are
-refused naming it, a search with `precondition_failed`. No catalog model
-serves manipulation. Manipulation runs a model built into the node:
-`scripted`, its default, or `none`, which refuses `grab_item`, `drop_item`
-and `place_item` in their result with
-`no manipulation model: manipulation_model is 'none'`. A catalog model is
-never named `none` or `scripted`.
+refused naming it, a search with `precondition_failed`. Manipulation runs
+a model built into the node, `scripted`, its default, or `none`, which
+refuses `grab_item`, `drop_item` and `place_item` in their result with
+`no manipulation model: manipulation_model is 'none'`, or a catalog model
+that serves manipulation, which runs the scripted grab with an alignment
+step the model answers (below). Every shipped model serves both roles:
+each passed the real-call check of the alignment on 2026-10-24 (a cube 45
+degrees off the jaws, one `move` with `roll_deg` 45 or 37). A catalog
+model is never named `none` or `scripted`.
 
 ## The scripted manipulator
 
@@ -75,6 +78,46 @@ brain reads where the arm stopped from `limb_states`.
 Known limitation: an abort while the arm climbs back after a `place_item`
 released the item leaves the held flag set, though the jaws are open and the
 item is down; `get_state`'s gripper opening shows the open jaws.
+
+## The alignment step
+
+With a catalog model as `manipulation_model`, the grab is the scripted one
+with one more step between the move to the pre-grasp point and the descent:
+the model looks and corrects (this node's `ModelAligner` over its
+`RouterStepModel`, both in `manipulators/vlm`). Each step, at most 5, the
+model gets the picture of the wrist camera of the gripper's arm, captured
+after the arm settled, the chest picture, and the state as text (where the
+grasp point stands against the item's seen centre, how high above the close,
+the line the jaws close along, the jaws' opening, and where the robot's +x and
++y point in each picture, as clock hours), and answers one JSON object: `move`
+(dx, dy in centimetres and roll_deg about the vertical, counter-clockwise seen
+from above, at the same height), `ready` (go down, close with the goal's
+`max_effort`, lift) or `give_up`. The code holds the limits: a step moves at
+most 3 cm and turns at most 90 degrees, the gripper stays within 10 cm of the
+item's seen centre, the height never changes, and the backbone must have a
+plan for the new pre-grasp, grasp and lifted points before the move is sent. A
+step over a limit, or one with no plan, or an answer the loop cannot read,
+moves nothing, counts, and the model reads why in its next step. The schema of
+the answer is one flat JSON object with `"strict": false`, the shape every
+route accepts. A model that gives up, runs out of steps or has a move stopped
+ends the grab before the descent, so nothing retreats. Each step leaves two
+log lines: the call's route, tokens and latency, and the answer with what came
+of it. The wrist cameras come through the `wrist_cameras` slot, and the
+`wrist_cameras` parameter names each arm's camera; an arm without one cannot
+be aligned, and such a grab fails before it moves, naming the arm.
+
+A `place_item` whose jaws stand closed on air (the item slipped since the
+grab) is refused before any move, naming it; a `drop_item` then lets the brain
+forget the item. A `place_item` with the same model gets the same step above
+the spot the held item goes to: the model centres the held item over the
+container or the free patch the target point is in, within 10 cm of that point
+(a container that already holds items is still the spot: the item may rest on
+them), and `ready` lowers the item until it rests or the point is reached,
+opens and climbs back. An arm the backbone stops short on the way down,
+anywhere from the pre-place point down and within 5 cm of the line down, has
+set the item on what is under it (a tall fruit meets a bowl's floor well above
+the target; a fruit set on another slides off its top by a few centimetres),
+and the place opens there.
 
 ## Keys
 
@@ -235,14 +278,17 @@ sequenceDiagram
 |---|---|---|
 | `limbs` | required | Each arm with its gripper, `"left_arm:left_gripper,right_arm:right_gripper"` |
 | `perception_model` | `gemini-robotics-er-2-preview` | A catalog model that serves perception, or `none` |
-| `manipulation_model` | `scripted` | `scripted` or `none` |
+| `manipulation_model` | `scripted` | `scripted`, `none`, or a catalog model that serves manipulation, which aligns the scripted grab |
 | `camera_name` | required | The camera the brain looks through, as the robot's `camera_mounts` names it |
+| `wrist_cameras` | `left_arm:wrist_left,right_arm:wrist_right` | Each arm with the instance id of the wrist camera it carries; an arm not named has no wrist camera |
 
 ## Tests
 
 `uv run --locked --with pytest pytest` runs the suite with no network and no
 key: the catalog, the keys, the any-llm adapter against any-llm's own
-exception classes, the parser, the detector and the switch against a scripted
-provider, and the whole node over the wire under the generated harness, its
-camera and backbone mocked: a search, a switch, and the scripted grab from
-the identified item to the held flag.
+exception classes, the parser, the detector, the alignment (its loop, the
+aligner's guards and ends, the picture directions, the step model and its
+probe), the switch against a scripted provider, and the whole node over the
+wire under the generated harness, its camera and backbone mocked: a search, a
+switch (a manipulation switch to a catalog model probes with the alignment's
+question), and the scripted grab from the identified item to the held flag.

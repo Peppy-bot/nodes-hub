@@ -8,7 +8,8 @@ import asyncio
 import json
 import logging
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Iterator, Optional
 
 import pytest
@@ -22,9 +23,16 @@ NOTHING = '{"boxes": []}'
 @dataclass(frozen=True)
 class Call:
     route: Route
-    image: bytes
+    images: tuple[bytes, ...]
     prompt: str
+    schema: object
     timeout_s: float
+
+    @property
+    def image(self) -> bytes:
+        """The one picture of a search or a probe."""
+        (image,) = self.images
+        return image
 
 
 class FakeProvider:
@@ -39,8 +47,8 @@ class FakeProvider:
         self.gate: Optional[asyncio.Event] = None
         self.called = asyncio.Event()
 
-    async def ask(self, route: Route, image: bytes, prompt: str, timeout_s: float) -> Reply:
-        self.calls.append(Call(route, image, prompt, timeout_s))
+    async def ask(self, route: Route, images, prompt: str, schema: object, timeout_s: float) -> Reply:
+        self.calls.append(Call(route, tuple(images), prompt, schema, timeout_s))
         self.called.set()
         if self.gate is not None:
             await self.gate.wait()
@@ -93,3 +101,54 @@ def records_of(caplog, name: str, level: int = logging.INFO) -> Iterator[pytest.
         logger.removeHandler(caplog.handler)
         logger.setLevel(previous)
         logger.propagate = propagated
+
+
+# --- what the aligner's tests need: a limb_states message and a frame, as
+# brain_core's own tests build them.
+
+@dataclass
+class LimbStatesMessage:
+    """A limb_states message, as the generated module gives it."""
+
+    timestamp: float
+    arm_names: list[str] = field(default_factory=list)
+    joints_per_arm: list[int] = field(default_factory=list)
+    joint_positions: list[float] = field(default_factory=list)
+    positions: list[float] = field(default_factory=list)
+    orientations: list[float] = field(default_factory=list)
+    gripper_names: list[str] = field(default_factory=list)
+    gripper_openings: list[float] = field(default_factory=list)
+
+
+# Where each grasp point stands at rest in a snapshot.
+LEFT_AT_REST = ((0.4, 0.2, 0.9), (0.0, 1.0, 0.0, 0.0))
+RIGHT_AT_REST = ((0.4, -0.2, 0.9), (0.0, 1.0, 0.0, 0.0))
+
+
+def limb_states_message(timestamp: float, *, left_arm=LEFT_AT_REST, **openings: float) -> LimbStatesMessage:
+    """A snapshot of the two-armed robot of seven joints per arm, every
+    joint at 0, the left grasp point at `left_arm`, a position and an
+    orientation, and the right one at rest, with the grippers `openings`
+    names, by name."""
+    (left_position, left_orientation), (right_position, right_orientation) = left_arm, RIGHT_AT_REST
+    return LimbStatesMessage(
+        timestamp=timestamp,
+        arm_names=["left_arm", "right_arm"],
+        joints_per_arm=[7, 7],
+        joint_positions=[0.0] * 14,
+        positions=[*left_position, *right_position],
+        orientations=[*left_orientation, *right_orientation],
+        gripper_names=list(openings),
+        gripper_openings=list(openings.values()),
+    )
+
+
+def rgb_frame(width: int = 16, height: int = 12, *, frame_id: int = 1, align_mode: str = "depth_to_color"):
+    """A video_stream message of the given size, plain grey."""
+    return SimpleNamespace(
+        header=SimpleNamespace(timestamp=1.0, frame_id=frame_id, align_mode=align_mode),
+        encoding="rgb8",
+        width=width,
+        height=height,
+        frame=bytes([128]) * (width * height * 3),
+    )

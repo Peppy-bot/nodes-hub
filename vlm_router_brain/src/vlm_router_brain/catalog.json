@@ -2,7 +2,7 @@
   "models": [
     {
       "name": "gemini-robotics-er-2-preview",
-      "roles": ["perception"],
+      "roles": ["perception", "manipulation"],
       "coordinates": "yx_0_1000",
       "routes": [
         { "route": "gemini:gemini-robotics-er-2-preview", "min_call_timeout_s": 10.0, "reasoning_effort": "medium" }
@@ -10,7 +10,7 @@
     },
     {
       "name": "gemini-4-argon",
-      "roles": ["perception"],
+      "roles": ["perception", "manipulation"],
       "coordinates": "yx_0_1000",
       "routes": [
         { "route": "openrouter:google/gemini-4-argon", "min_call_timeout_s": 10.0, "reasoning_effort": "medium" }
@@ -18,7 +18,7 @@
     },
     {
       "name": "claude-opus-5.5",
-      "roles": ["perception"],
+      "roles": ["perception", "manipulation"],
       "coordinates": "yx_0_1000",
       "routes": [
         { "route": "openrouter:anthropic/claude-opus-5.5", "min_call_timeout_s": 10.0, "reasoning_effort": "medium" }
@@ -26,7 +26,7 @@
     },
     {
       "name": "gpt-6-astra",
-      "roles": ["perception"],
+      "roles": ["perception", "manipulation"],
       "coordinates": "yx_0_1000",
       "routes": [
         { "route": "openrouter:openai/gpt-6-astra", "min_call_timeout_s": 10.0, "reasoning_effort": "medium" }
