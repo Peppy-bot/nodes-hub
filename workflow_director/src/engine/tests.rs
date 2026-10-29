@@ -674,6 +674,30 @@ async fn a_wait_goes_on_at_the_resume_with_the_time_it_had_left() {
     assert_eq!(incidents, [("beta.hear", "timeout")], "{result:#?}");
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_service_call_that_an_error_reply_answers_fails_its_step_with_the_kind_of_the_reply() {
+    // The reach check reads `find` first; the look then gets an error reply,
+    // which the live host gives as a refusal with the reply's failure.
+    let tree = json!({ "id": "look", "timeout_s": 5, "call": { "member": "arm.find", "args": { "description": "block" }, "as": "seen" } });
+    let plan = plan(&one_arm("alpha", tree, json!([])), Attendance::Unattended);
+    let error_reply = Answer {
+        end: CallEnd::Refused(Failure::new("precondition_failed", "the camera is covered")),
+        ..Answer::now(found())
+    };
+    let host = arm().answer("find", vec![Answer::now(found()), error_reply]);
+    let (result, _) = run(&plan, &host, Vec::new()).await;
+    assert_eq!(result.ending, Ending::Failed, "{result:#?}");
+    let failed = result.failed.as_ref().expect("a failed step");
+    assert_eq!(
+        (
+            failed.step.as_str(),
+            failed.failure_kind.as_str(),
+            failed.message.as_str()
+        ),
+        ("alpha.look", "precondition_failed", "the camera is covered")
+    );
+}
+
 /// The failure that the clock watch gives a lane of `role` once the
 /// simulation clock stopped.
 fn clock_stopped(role: &str) -> RunCommand {

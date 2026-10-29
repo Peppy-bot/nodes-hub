@@ -96,6 +96,69 @@ fn an_item_id_or_a_position_takes_only_a_ref() {
     );
 }
 
+/// A position reaches a marked field only by a `$ref`: a literal row of a table, or a literal that a lane group
+/// gives as a parameter, is refused like a literal.
+#[test]
+fn a_position_takes_no_table_row_and_no_parameter() {
+    let fleet = snapshot(vec![robot("alpha")]);
+    let mut by_table = picker();
+    by_table["tables"] = json!({ "spots": {
+        "block": [0.3, 0.0, 0.1], "cup": [0.3, 0.1, 0.1], "unknown": [0.3, 0.2, 0.1],
+    } });
+    by_table["actions"]["alpha"]["tree"]["sequence"][1]["call"]["args"]["position"] =
+        json!({ "$table": "spots", "key": { "$ref": "seen.kind" } });
+    refuses(
+        &errors(&by_table, &fleet, None),
+        "`position` holds a position, a pose or an item id; give it a `$ref`",
+    );
+    let mut by_param = picker();
+    let tree = by_param["actions"]["alpha"]["tree"].clone();
+    by_param["actions"] = json!({ "pickers": {
+        "roles": ["alpha"],
+        "params": { "alpha": { "spot": [0.3, 0.0, 0.1] } },
+        "tree": tree,
+    } });
+    by_param["actions"]["pickers"]["tree"]["sequence"][1]["call"]["args"]["position"] =
+        json!({ "$param": "spot" });
+    refuses(
+        &errors(&by_param, &fleet, None),
+        "`position` holds a position, a pose or an item id",
+    );
+}
+
+/// The `signal` field of a `wait_for` result is an enum of the signals it waits for: a comparison with another
+/// literal is refused.
+#[test]
+fn the_signal_a_wait_for_heard_is_an_enum_of_its_signals() {
+    let fleet = snapshot(vec![robot("alpha"), robot("beta")]);
+    let heard = |literal: &str| {
+        json!({
+            "workflow_schema": "workflow/v1",
+            "manifest": { "name": "relay", "revision": 1 },
+            "task": { "objective": "One arm rests once the other tells it which way" },
+            "contracts": { "arm": "test_arm:v1" },
+            "roles": { "alpha": {}, "beta": {} },
+            "success": "true",
+            "actions": {
+                "alpha": { "tree": { "id": "first", "sequence": [
+                    { "id": "hear", "wait_for": ["left", "right"], "as": "heard", "timeout_s": 5 },
+                    { "id": "which", "if": format!("heard.signal == '{literal}'"), "then":
+                        { "id": "rest", "timeout_s": 10, "call": { "member": "arm.home", "args": { "duration_s": 1 } } } },
+                ] } },
+                "beta": { "tree": { "id": "tell", "sequence": [
+                    { "id": "go_left", "signal": "left" },
+                    { "id": "go_right", "signal": "right" },
+                ] } },
+            },
+        })
+    };
+    assert_eq!(errors(&heard("right"), &fleet, None), Vec::<String>::new());
+    refuses(
+        &errors(&heard("up"), &fleet, None),
+        "'up' is not a value of",
+    );
+}
+
 #[test]
 fn an_item_id_is_valid_only_on_the_instance_that_gives_it() {
     // The robot serves perception on one instance and the arm on another.

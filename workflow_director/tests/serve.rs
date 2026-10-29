@@ -809,6 +809,52 @@ async fn locations_teaches_the_skills_of_a_robot_and_lists_what_they_know() -> p
     rig.harness.shutdown().await
 }
 
+/// A service call that the robot answers with an error reply fails its step with the kind and the message of the
+/// reply.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_service_call_answered_by_an_error_reply_fails_its_step_with_its_kind()
+-> peppygen::Result<()> {
+    let rig = Rig::start(Home::AtOnce).await?;
+    *rig.arm.find_fails.lock().unwrap() = Some((
+        "precondition_failed".to_owned(),
+        "the camera is covered".to_owned(),
+    ));
+    rig.arm.finds.add_permits(1);
+    let mut workflow: Value = serde_json::from_str(&home_workflow()).expect("the workflow is JSON");
+    workflow["actions"]["arm"]["tree"] = json!({ "id": "look", "timeout_s": 5, "call": { "member": "arm.find", "args": { "description": "block" } } });
+    let mut goal = run_on_alpha(&rig, workflow.to_string()).await?;
+    let mut step_kind = None;
+    let mut suspension = None;
+    while let Ok(feedback) = goal.on_next_feedback().await {
+        if feedback.event == "step_ends" && feedback.step == "arm.look" {
+            step_kind = Some(feedback.failure_kind);
+        }
+        if feedback.event == "run_suspends" {
+            suspension = Some(feedback.details);
+            break;
+        }
+    }
+    assert_eq!(step_kind.as_deref(), Some("precondition_failed"));
+    // The attended run suspends on the incident of the step, which keeps the message of the reply.
+    let suspension: Value = serde_json::from_str(&suspension.expect("the run suspends"))
+        .expect("the suspension is JSON");
+    let incident = &suspension["incidents"][0];
+    assert_eq!(
+        (
+            incident["step"].as_str(),
+            incident["failure_kind"].as_str(),
+            incident["message"].as_str()
+        ),
+        (
+            Some("arm.look"),
+            Some("precondition_failed"),
+            Some("the camera is covered")
+        ),
+        "{suspension}"
+    );
+    rig.harness.shutdown().await
+}
+
 /// A suspend of a run whose lanes ended, while it checks its `success`, is refused with `precondition_failed`: the
 /// run is ending. Its `success` reads `find`, which the arm answers only once the test lets it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

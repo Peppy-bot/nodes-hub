@@ -33,6 +33,7 @@ use peppygen::consumed_services::fleet::list::{
 use peppygen::fixtures::harness::{Config, Harness, Mocks};
 use peppygen::mock::deps::fleet;
 use peppylib::Payload;
+use peppylib::messaging::{Failure, FailureKindName};
 use peppylib::messaging::{SenderTarget, TopicMessenger};
 use peppylib::testing::{MockActionServerCore, MockServiceCore};
 use serde_json::{Value, json};
@@ -549,6 +550,8 @@ pub struct ScriptedArm {
     pub visited: Arc<Mutex<Vec<String>>>,
     pub known: Arc<Mutex<Vec<String>>>,
     pub finds: Arc<tokio::sync::Semaphore>,
+    /// The error reply, a failure kind and its message, that each answer of `find` gives while it is set.
+    pub find_fails: Arc<Mutex<Option<(String, String)>>>,
     /// Told when a `DiesOnCancel` arm gets the cancel of its goal.
     pub cancelled: Arc<tokio::sync::Notify>,
 }
@@ -642,6 +645,7 @@ impl ScriptedArm {
         }
         let target = SenderTarget::contract("test_arm", "v1")?;
         let finds = Arc::new(tokio::sync::Semaphore::new(0));
+        let find_fails: Arc<Mutex<Option<(String, String)>>> = Arc::new(Mutex::new(None));
         let finding = MockServiceCore::listen(
             harness.session(),
             core_node,
@@ -652,6 +656,7 @@ impl ScriptedArm {
         .await?;
         {
             let finds = Arc::clone(&finds);
+            let find_fails = Arc::clone(&find_fails);
             let arm =
                 PeppyContractParser::from_content(TEST_ARM).expect("the arm of the tests parses");
             let response = arm
@@ -665,6 +670,13 @@ impl ScriptedArm {
                         return;
                     };
                     permit.forget();
+                    let fails = find_fails.lock().unwrap().clone();
+                    if let Some((kind, message)) = fails {
+                        let kind =
+                            FailureKindName::parse(&kind).expect("a failure kind of the tests");
+                        let _ = responder.respond_failure(Failure::new(kind, message)).await;
+                        continue;
+                    }
                     let found = json!({ "found": true, "item_id": "b1", "position": [0.3, 0.0, 0.1], "kind": "block", "count": "1" });
                     let payload = codec.encode(&found).expect("a find response encodes");
                     let _ = responder.respond(Payload::from(payload)).await;
@@ -780,6 +792,7 @@ impl ScriptedArm {
             visited,
             known,
             finds,
+            find_fails,
             cancelled,
         })
     }

@@ -1089,6 +1089,68 @@ mod tests {
         journals.text(&run).unwrap()
     }
 
+    /// An anomaly of a severity that an unattended run lets pass leaves no
+    /// incident, and the journal keeps the monitor's answer, anomaly and all.
+    #[tokio::test(start_paused = true)]
+    async fn the_journal_keeps_the_anomaly_that_an_unattended_run_lets_pass() {
+        let tree = json!({ "id": "pick", "sequence": [
+            { "id": "look", "timeout_s": 5, "call": { "member": "arm.find", "args": { "description": "block" }, "as": "seen" } },
+            { "id": "grab", "timeout_s": 30, "call": {
+                "member": "arm.grab",
+                "args": { "item_id": { "$ref": "seen.item_id" }, "position": { "$ref": "seen.position" }, "speed": 1 },
+                "as": "grabbed",
+                "done_when": "grabbed.success",
+            } },
+        ] });
+        let mut plan =
+            crate::testing::plan(&one_arm("alpha", tree, json!([])), Attendance::Unattended);
+        let arm = plan.calls.values().next().unwrap().target.clone();
+        plan.monitor = Some(crate::engine::plan::MonitorPlan {
+            target: Target {
+                member: name("check"),
+                ..arm
+            },
+            continue_on_severity: [workflow_documents::run::Severity::Low]
+                .into_iter()
+                .collect(),
+        });
+        let scripted = ScriptedHost::new()
+            .answer("find", vec![Answer::now(found())])
+            .answer("grab", vec![Answer::now(json!({ "success": true, "item_id": "b1" }))])
+            .answer(
+                "check",
+                vec![Answer::now(json!({ "anomaly": true, "kind": "slip", "severity": "low", "description": "the block slipped" }))],
+            );
+        let dir = tempfile::tempdir().unwrap();
+        let journals = Journals::open(dir.path(), 10, u64::MAX).unwrap();
+        let run = journals.next_run().unwrap();
+        let host = Recorded::new(scripted, &journals, &run);
+        let (_commands, commands_rx) = mpsc::unbounded_channel();
+        let (phase, _phases) = watch::channel(Phase::Preparing);
+        let result = drive(
+            &plan,
+            &host,
+            ResultBase {
+                result: crate::director::empty_result(),
+            },
+            commands_rx,
+            phase,
+            host.now(),
+        )
+        .await;
+        assert_eq!(result.ending, Ending::Completed, "{result:#?}");
+        assert!(result.incidents.is_empty(), "{:?}", result.incidents);
+        let journal = journals.text(&run).unwrap();
+        let check = journal
+            .lines()
+            .find(|line| line.contains(r#""member":"check""#))
+            .expect("the monitor's call is in the journal");
+        assert!(
+            check.contains("the block slipped") && check.contains(r#""severity":"low""#),
+            "{check}"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn the_replay_of_a_journal_makes_the_decisions_of_its_run() {
         let journal = journal_of_a_run().await;
