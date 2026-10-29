@@ -911,16 +911,14 @@ impl Director {
             base.unlocked_nodes = unlocked;
             if !differences.is_empty() {
                 self.run_event(run, EventKind::Differences, json!(differences));
-                if run_document.versions == VersionPolicy::Refuse {
-                    let message = format!(
-                        "the stack differs from the lock of the bundle in {} ways; to run on this stack as it is, give the run document `versions: \"warn\"`",
-                        differences.len()
-                    );
+            }
+            match under_the_policy(run_document.versions, differences) {
+                Ok(differences) => base.differences = differences,
+                Err((message, differences)) => {
                     let mut refused = refuse(base, message, Vec::new());
                     refused.differences = differences;
                     return Err(refused);
                 }
-                base.differences = differences;
             }
         }
         let mut taken: Vec<RobotName> = Vec::new();
@@ -1393,6 +1391,25 @@ fn versions(snapshot: &Snapshot, plan: &Plan, nodes: &[RunNode]) -> Result<Lock,
     })
 }
 
+/// The differences of a run from the lock of its bundle as its versions
+/// policy takes them: with `warn`, or with no difference, the run goes on and
+/// its result names each; with `refuse`, a difference refuses the run, and
+/// the refusal says how many and what to give the run document to run on
+/// this stack as it is.
+fn under_the_policy(
+    policy: VersionPolicy,
+    differences: Vec<Difference>,
+) -> Result<Vec<Difference>, (String, Vec<Difference>)> {
+    if differences.is_empty() || policy == VersionPolicy::Warn {
+        return Ok(differences);
+    }
+    let message = format!(
+        "the stack differs from the lock of the bundle in {} ways; to run on this stack as it is, give the run document `versions: \"warn\"`",
+        differences.len()
+    );
+    Err((message, differences))
+}
+
 /// The differences of a run from the lock of its bundle, and the nodes it
 /// uses that the lock does not name and that no `call` step calls.
 fn differences(lock: &Lock, stack: &Lock, nodes: &[RunNode]) -> (Vec<Difference>, Vec<NameTag>) {
@@ -1819,10 +1836,7 @@ mod tests {
     }
 
     fn compared(lock: &Lock, brain_commit: &str) -> (Vec<String>, Vec<NameTag>) {
-        let (fleet, plan) = stack(brain_commit, true);
-        let nodes = run_nodes(&fleet, &plan, &me());
-        let (found, unlocked) =
-            differences(lock, &versions(&fleet, &plan, &nodes).unwrap(), &nodes);
+        let (found, unlocked) = differences_of(lock, brain_commit);
         (
             found
                 .into_iter()
@@ -1830,6 +1844,14 @@ mod tests {
                 .collect(),
             unlocked,
         )
+    }
+
+    /// The differences from `lock` of the stack whose brain runs the commit `brain_commit`, and the nodes the lock
+    /// does not name.
+    fn differences_of(lock: &Lock, brain_commit: &str) -> (Vec<Difference>, Vec<NameTag>) {
+        let (fleet, plan) = stack(brain_commit, true);
+        let nodes = run_nodes(&fleet, &plan, &me());
+        differences(lock, &versions(&fleet, &plan, &nodes).unwrap(), &nodes)
     }
 
     fn lock_of_the_stack() -> Lock {
@@ -1852,6 +1874,32 @@ mod tests {
             Some("c1")
         );
         assert_eq!(compared(&lock, "c1"), (Vec::new(), Vec::new()));
+    }
+
+    /// With `refuse`, the differences of a stack from the lock refuse the run, which names how many and what to give
+    /// instead, and keeps them; with `warn` the run goes on with them; no difference refuses nothing.
+    #[test]
+    fn a_difference_refuses_a_run_with_versions_refuse_and_goes_into_the_result_with_warn() {
+        let found = differences_of(&lock_of_the_stack(), "c7").0;
+        assert!(!found.is_empty(), "a changed commit is a difference");
+        let Err((message, kept)) = under_the_policy(VersionPolicy::Refuse, found.clone()) else {
+            panic!("`refuse` refuses a run whose stack differs");
+        };
+        assert_eq!(
+            message,
+            format!(
+                "the stack differs from the lock of the bundle in {} ways; to run on this stack as it is, give the run document `versions: \"warn\"`",
+                found.len()
+            )
+        );
+        assert_eq!(kept, found);
+        assert_eq!(
+            under_the_policy(VersionPolicy::Warn, found.clone()),
+            Ok(found)
+        );
+        for policy in [VersionPolicy::Refuse, VersionPolicy::Warn] {
+            assert_eq!(under_the_policy(policy, Vec::new()), Ok(Vec::new()));
+        }
     }
 
     #[test]
