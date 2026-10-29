@@ -5,7 +5,9 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use camera_geometry_check::{Pinhole, Pose, median_reading_m, pixel_at};
+use camera_core::pinhole::{DepthModel, Intrinsics, Pinhole};
+use camera_core::pose::Pose;
+use camera_geometry_check::{median_reading_m, pixel_at};
 use peppygen::consumed_services::camera::{depth_stream_info, video_stream_info};
 use peppygen::consumed_services::geometry::{
     get_color_intrinsics, get_depth_intrinsics, get_depth_to_color_extrinsics,
@@ -243,29 +245,33 @@ async fn report(
         pixel,
         params.window,
         depth_info.depth_unit,
-    )?
+    )
+    .map_err(|error| error.to_string())?
     .ok_or_else(|| {
         format!(
             "depth pixel ({}, {}) has no reading in its window: put the target there",
             pixel.0, pixel.1
         )
     })?;
-    let depth_camera = Pinhole {
+    let depth_camera = Pinhole::parse(&Intrinsics {
         width: depth.width,
         height: depth.height,
         fx: depth.fx,
         fy: depth.fy,
         cx: depth.cx,
         cy: depth.cy,
-        distortion_model: depth.distortion_model,
-        distortion: depth.distortion,
-    };
+        distortion_model: &depth.distortion_model,
+        distortion: &depth.distortion,
+    })
+    .map_err(|error| format!("the depth intrinsics: {error}"))?;
+    let depth_model = DepthModel::parse(&depth.depth_model)
+        .map_err(|error| format!("the depth intrinsics: {error}"))?;
     let in_depth_frame = depth_camera.deproject(
         f64::from(pixel.0),
         f64::from(pixel.1),
         reading_m,
-        &depth.depth_model,
-    )?;
+        depth_model,
+    );
     println!(
         "depth pixel ({}, {}) of frame {} reads {:.4} m (median of {} readings)",
         pixel.0, pixel.1, frame.header.frame_id, reading_m, readings,
@@ -287,22 +293,29 @@ async fn report(
             return Ok(());
         }
     };
-    let in_color_frame = Pose {
-        position: extrinsics.depth_to_color_position,
-        orientation: extrinsics.depth_to_color_orientation,
-    }
+    let in_color_frame = Pose::new(
+        extrinsics.depth_to_color_position,
+        extrinsics.depth_to_color_orientation,
+    )
+    .map_err(|error| format!("the depth-to-colour extrinsics: {error}"))?
     .apply(in_depth_frame);
-    let color_camera = Pinhole {
+    let color_camera = Pinhole::parse(&Intrinsics {
         width: color.width,
         height: color.height,
         fx: color.fx,
         fy: color.fy,
         cx: color.cx,
         cy: color.cy,
-        distortion_model: color.distortion_model,
-        distortion: color.distortion,
-    };
-    let (u, v) = color_camera.project(in_color_frame)?;
+        distortion_model: &color.distortion_model,
+        distortion: &color.distortion,
+    })
+    .map_err(|error| format!("the colour intrinsics: {error}"))?;
+    let (u, v) = color_camera.project(in_color_frame).ok_or_else(|| {
+        format!(
+            "no pixel of the colour camera shows the point {in_color_frame:?}, behind the \
+             camera or beyond where its lens holds: put the target where both cameras see it"
+        )
+    })?;
     println!(
         "  in the colour optical frame: X {:+.4} m (right)  Y {:+.4} m (down)  Z {:+.4} m (forward)",
         in_color_frame[0], in_color_frame[1], in_color_frame[2],
