@@ -1,0 +1,66 @@
+Bootstrap: docker
+From: peppybot/rust-cargo-base:latest
+
+%files
+    . /opt/motion_planner
+
+%post
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+
+    apt-get update -y
+    apt-get install -y --no-install-recommends libclang-dev libboost-serialization-dev libeigen3-dev pkg-config
+
+    cd /opt/motion_planner
+    cargo build --release
+    # The binary links Qhull through qhull-sys, so Qhull's license ships
+    # beside it, led by where Qhull's source is. The license is read from
+    # the one qhull-sys package that cargo metadata names for the host; the
+    # metadata fetches the host's packages that the build did not, such as
+    # the dev-dependencies.
+    host=$(rustc -vV | sed -n 's/^host: //p')
+    cargo metadata --format-version 1 --locked --filter-platform "$host" \
+        > /tmp/metadata.json
+    manifests=$(grep -o '"manifest_path":"[^"]*/qhull-sys-[^/"]*/Cargo.toml"' \
+        /tmp/metadata.json) || {
+        echo "the build resolved no qhull-sys package, whose license the image ships" >&2
+        exit 1
+    }
+    rm /tmp/metadata.json
+    if [ "$(printf '%s\n' "$manifests" | wc -l)" -ne 1 ]; then
+        echo "the build resolved more than one qhull-sys package: $manifests" >&2
+        exit 1
+    fi
+    qhull_sys=${manifests#\"manifest_path\":\"}
+    qhull_sys=${qhull_sys%/Cargo.toml\"}
+    {
+        echo "motion_planner links Qhull. Its source is at http://www.qhull.org."
+        echo
+        cat "$qhull_sys/qhull/COPYING.txt"
+    } > target/release/QHULL_COPYING.txt
+    # The binary links OMPL through ompl_bridge, whose build writes OMPL's license
+    # to ompl-2.0.2/LICENSE in its output directory, so OMPL's license ships beside
+    # it too, led by where OMPL's source is. The output directory is the one cargo
+    # names for ompl_bridge's build script when it reports the build again.
+    out_dirs=$(cargo build --release --message-format=json \
+        | grep -o '"out_dir":"[^"]*/build/ompl_bridge-[^/"]*/out"') || {
+        echo "the build ran no ompl_bridge build script, whose OMPL license the image ships" >&2
+        exit 1
+    }
+    if [ "$(printf '%s\n' "$out_dirs" | wc -l)" -ne 1 ]; then
+        echo "the build ran more than one ompl_bridge build script: $out_dirs" >&2
+        exit 1
+    fi
+    ompl_out=${out_dirs#\"out_dir\":\"}
+    ompl_out=${ompl_out%\"}
+    {
+        echo "motion_planner links OMPL. Its source is at https://github.com/ompl/ompl."
+        echo
+        cat "$ompl_out/ompl-2.0.2/LICENSE"
+    } > target/release/OMPL_LICENSE.txt
+
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+%runscript
+    cd /opt/motion_planner
+    exec ./target/release/motion_planner "$@"
