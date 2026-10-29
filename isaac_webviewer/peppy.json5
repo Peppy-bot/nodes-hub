@@ -4,6 +4,10 @@
   manifest: {
     name: "isaac_webviewer",
     tag: "v1",
+    description: [
+      "A web page that shows the stream of the Isaac Sim simulation (sim_isaac) in a browser, through the NVIDIA WebRTC client. It needs no GPU itself, but the browser must reach the host of the page on TCP 49100 and UDP 47998, where Isaac streams.",
+      "The viewer and the simulator are separate nodes: a page that loads does not prove that the simulator streams. The browser shows WAITING FOR STREAM... while the client tries to connect. The page sends its console warnings and errors to the run log of the node. The page has no authentication: use it on a trusted network only.",
+    ],
   },
 
   execution: {

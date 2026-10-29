@@ -3,6 +3,10 @@
   manifest: {
     name: "deliberative_planner",
     tag: "v1",
+    description: [
+      "The slow half of an example manipulation stack that runs on two machines. It plans at about 1 Hz from the images of the robot camera (any rgb_camera:v1), so it can run away from the robot, for example on a server with an accelerator. It is the planner of a deliberation pairing with reactive_policy.",
+      "A mock, to read rather than to deploy: it runs no inference and needs no model weights. It reads the situation that the executor reports and sends subgoals back. It has no access to an actuator.",
+    ],
     depends_on: {
       // The same camera contract the policy consumes. Nothing here records
       // which machine the camera runs on: placement is declared once, on the

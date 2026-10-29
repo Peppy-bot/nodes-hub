@@ -1,16 +1,12 @@
-// The MuJoCo simulation node. It stands any number of robots, each joining
-// by attaching over the simulation_robot contract, naming the copy it runs
-// as, the model it is and where it stands; the engine composes its scene
-// from the models standing in it and steps them for as long as they stay.
-// The engine plays the follower role of every limb pairing of every robot:
-// a robot's backbone leads each pair and the simulation's measured state
-// streams back on it. Whether a robot stands with a pair for every limb of
-// its model is its readiness, answered on the same contract.
 {
   peppy_schema: "node/v1",
   manifest: {
     name: "sim_mujoco",
     tag: "v1",
+    description: [
+      "The MuJoCo simulation: it stands any number of robots, of any model it has an entry for, in one composed scene, and serves a viser viewer to a browser. It needs no GPU, but it renders the robot cameras much faster on an NVIDIA GPU.",
+      "Each robot joins by attaching over the simulation_robot contract, naming the copy it runs as, the model it is and where it stands; the engine composes its scene from the models standing in it and steps them for as long as they stay. The engine plays the follower role of every limb pairing of every robot: a robot's backbone leads each pair and the simulation's measured state streams back on it. Whether a robot stands with a pair for every limb of its model is its readiness, answered on the same contract.",
+    ],
     implements: [
       // How a robot joins this scene: it attaches with the copy it runs as,
       // its model and the spot it stands on, and stays for as long as its

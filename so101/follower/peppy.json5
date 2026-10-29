@@ -1,20 +1,18 @@
-// One SO-101 follower arm (real hardware): five revolute joints plus the
-// gripper, six Feetech STS3215 servos on one half-duplex serial bus, so one
-// node owns the whole device. A pure follower of the so101_backbone:
-// setpoints stream in on the two pairing slots and the measured state streams
-// back on them; the node carries no motion logic of its own.
-//
-// The servos run position control in firmware (the STS3215 has no torque or
-// current mode), so there is no dynamics model, no gravity or friction
-// feedforward, and any setpoint carrying a non-empty efforts vector is
-// dropped with a logged refusal. The write path is the lerobot reference
-// teleop's own: goals reach the bus unclamped and unfiltered; the servo
-// EPROM position limits (written by lerobot calibration) are the guard.
+// so101_follower: six servos on one bus, so one node owns the whole device.
+// The STS3215 has no torque or current mode, so there is no dynamics model
+// and no gravity or friction feedforward. The write path is the lerobot
+// reference teleop's own: goals reach the bus unclamped and unfiltered; the
+// servo EPROM position limits (written by lerobot calibration) are the
+// guard.
 {
   peppy_schema: "node/v1",
   manifest: {
     name: "so101_follower",
     tag: "v1",
+    description: [
+      "One real SO-101 follower arm: five revolute joints and the gripper, six Feetech STS3215 servos on one half-duplex serial bus. It needs the arm on a serial device of its host and its lerobot calibration file: it refuses to start uncalibrated.",
+      "A pure follower of so101_backbone: setpoints stream in on its two pairing slots and the measured state streams back on them; the node carries no motion logic of its own. The servos run position control in firmware, so the node drops any setpoint that carries a non-empty efforts vector, with a logged refusal. It also reports its readiness, the health of each motor, and alerts for a motor that runs hot, is overloaded, has a fault, is disabled or does not report.",
+    ],
     implements: [
       // Ready once the bus is connected, calibration is verified, and the
       // first full position read has landed.

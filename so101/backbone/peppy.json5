@@ -1,33 +1,19 @@
-// so101_backbone: the single-arm motion authority between the commander
-// (so101_leader, xr_commander, a policy runner) and the so101_follower.
-// "Leader" and "follower" below name pairing roles, not the lerobot arms:
-// this node plays the follower role toward the commander (raw setpoints
-// stream in on the leader_* slots and the measured state relays back up
-// them) and the leader role toward the arm. Exposes the joint /
-// Cartesian / gripper move actions and executes them itself; answers where
-// the robot can work (workspace), from its design alone; drives the arm
-// and gripper over the downstream pairings (leader role). Everything the
-// follower executes leaves through the arm / gripper slots, so a recorder
-// observing those slots captures teleop and actions identically.
-//
-// The upstream command is joints (joint_link) or an end-effector pose
-// (pose_link), never both: `upstream_mode` picks one per instance and only
-// that slot kind is subscribed. Poses are solved with lerobot's placo-based
-// kinematics against so101_description's embedded kinematics URDF, the same
-// bytes its postures and limits are verified against.
+// so101_backbone: the upstream command is joints (joint_link) or an
+// end-effector pose (pose_link), never both: `upstream_mode` picks one per
+// instance and only that slot kind is subscribed. Poses are solved with
+// lerobot's placo-based kinematics against so101_description's embedded
+// kinematics URDF, the same bytes its postures and limits are verified
+// against.
 {
   peppy_schema: "node/v1",
   manifest: {
     name: "so101_backbone",
     tag: "v1",
-    // Every pose this node reports or takes names the URDF's fixed
-    // gripper_frame_link TCP:
-    // - the limb_state poses;
-    // - the limb_motion goal and result poses;
-    // - the postures result poses;
-    // - the grasp point of the workspace answers.
-    // On this single-moving-jaw gripper the pad midpoint shifts with the
-    // opening. Thus no static frame is exactly the contracts' grasp point.
+    description: [
+      "The motion authority of an SO-101 robot, one arm with a gripper: it plans and streams every move of the arm and its gripper. It opens no device: it drives so101_follower, or a simulation, over the downstream pairings.",
+      "\"Leader\" and \"follower\" here name pairing roles, not the lerobot arms. The node plays the follower role toward the commander (so101_leader, xr_commander, a policy runner): raw setpoints stream in on the leader_* slots and the measured state relays back up them. It plays the leader role toward the arm and the gripper. It runs the joint, Cartesian and gripper moves itself, and answers where the robot can work (workspace) from its design alone. Everything the follower executes leaves through the arm and gripper slots, so a recorder that observes those slots captures teleoperation and moves identically.",
+      "Every pose this node reports or takes is the fixed gripper_frame_link TCP of the URDF: the limb_state poses, the limb_motion goal and result poses, the postures result poses and the grasp point of the workspace answers. On this gripper, with one moving jaw, the midpoint of the pads shifts with the opening, so no static frame is exactly the grasp point of the contracts.",
+    ],
     implements: [
       // Whole-robot state snapshots for consumers that hold no pairing:
       // joint positions, the end-effector pose, and the gripper opening.

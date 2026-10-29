@@ -1,13 +1,6 @@
 // ============================================================================
 // lerobot_recorder node manifest
 // ============================================================================
-// A LeRobot recorder for any robot built out of these pairings. It observes
-// pairing traffic read-only: per limb, the follower's measured stream
-// (observation) and the leader's setpoint stream (LeRobot's `action` feature,
-// not to be confused with the peppy action below) of the same pairing, plus
-// any bound cameras. Every source is sampled onto a fixed fps grid and written
-// as a LeRobot v3 dataset.
-//
 // The observer slots below are `zero_or_more`, so the robot's shape is the
 // launcher's to declare, not this node's: it binds as many pairings as the
 // robot has, and a limb is one measured source paired with the commanded
@@ -22,6 +15,10 @@
   manifest: {
     name: "lerobot_recorder",
     tag: "v1",
+    description: [
+      "A recorder that writes what a robot does as a LeRobot v3 dataset: the motions of its joints and grippers, from its joint_link and gripper_link pairings, and the images of its cameras. It opens no device. It needs a host directory for the datasets, and it can also copy them to an S3 bucket.",
+      "It observes the pairings read-only, without claiming an endpoint. Per limb, it records the measured stream of the follower (observation.state) and the setpoint stream of the leader of the same pairing (the LeRobot action feature, which is not a peppy action). It samples every source onto a fixed fps grid. It implements episode_recording: each record_episode goal records one episode, and finish_session finalizes the dataset of the current session and opens a new session.",
+    ],
     // The recorder's own surface, the episode_recording contract: its
     // sessions as services and one episode per long-running goal.
     implements: [

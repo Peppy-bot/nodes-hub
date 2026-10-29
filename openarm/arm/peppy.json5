@@ -1,15 +1,15 @@
-// One arm of the openarm robot (real hardware); instantiate twice, one per
-// side, with a distinct `arm_id`. A follower of the bimanual backbone: it owns the
-// hardware control loop (gravity/Coriolis/friction feedforward from the
-// in-process srs_model, plus MIT control) and tracks the backbone's governed
-// setpoint, reporting measured state on the pairing's always-on `joint_states` stream. The
-// backbone (openarm_backbone) owns all trajectory generation, stream following, and
-// self-collision governing, so the arm carries no motion logic of its own.
+// Instantiate openarm_arm twice, one per side, with a distinct `arm_id`. The
+// feedforward comes from the in-process srs_model, built from the embedded
+// description of `hardware_version`.
 {
   peppy_schema: "node/v1",
   manifest: {
     name: "openarm_arm",
     tag: "v1",
+    description: [
+      "One arm of a real OpenArm robot, v1.0 or v2.0: it drives the seven joint motors of the arm over a CAN interface of its host. It needs the arm hardware on that CAN interface. A robot runs one instance per arm.",
+      "It follows the governed setpoints of openarm_backbone over a joint_link pairing and streams the measured joint states back. It runs the control loop of the hardware (gravity, Coriolis and friction feedforward, plus MIT control) and has no motion logic of its own: the backbone plans and governs every move. It also reports its readiness, the health of each motor, and alerts for a motor that runs hot, is overloaded or has a fault.",
+    ],
     implements: [
       // Per-component readiness a real robot's robot_initializer aggregates:
       // ready once motors are enabled and the control loop is serving.

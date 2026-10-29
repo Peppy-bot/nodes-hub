@@ -3,6 +3,10 @@
   manifest: {
     name: "uvc_camera_linux",
     tag: "v1",
+    description: [
+      "A USB Video Class (UVC) camera on Linux, through V4L2: it publishes the colour stream of the camera and answers the camera controls of rgb_camera. It needs a UVC camera on a V4L2 device of its host, such as /dev/video0.",
+      "It implements rgb_camera and camera_geometry. video_stream_info reports the stream that the driver negotiated, not the requested one. A control applies synchronously, so its reply gives the value that the driver kept, or -1 for an automatic mode. A UVC device carries no calibration and a colour camera has no depth stream, so each camera_geometry service gives an error reply with `rejected` that says why.",
+    ],
     implements: [
       { name: "rgb_camera", tag: "v1", link_id: "camera" },
       // A UVC device carries no calibration, so every member gives an

@@ -1,29 +1,18 @@
-// robot_initializer: the node that brings one robot into being and says when
-// it is ready. It serves a robot of any model, an OpenArm and an SO-101
-// alike: the model is a parameter, and nothing else here is about one.
-//
-// It exposes the robot-level is_ready the backbone gates on, true only once
-// everything that answers for the robot reports ready: the drivers of its
-// limbs on a real robot, and the simulation on a simulated one, which answers
-// for every limb of the robot it stands. One initializer serves the real
-// robot and every simulation.
-//
-// It also says who the robot is: get_identity answers the name the robot
-// stands under, the model it is and the core node hosting it, for as long as
-// the node runs. And it gives the robot's guide: get_guide answers the park
-// poses the launcher wrote for the robot's model, so the facts of a model
-// live with the robot and no caller keeps a list of models.
-//
-// In a simulation it also joins the scene: it attaches as this robot, naming
-// the copy it runs as, the model to stand and where, and holds that goal for
-// as long as the robot is in the scene; the robot's limbs pair to the engine
-// through the backbone. Its setup ends once the simulation stands the robot,
-// so the start of its copy ends only for a robot that stands.
+// robot_initializer: the model is a parameter, and nothing else here is
+// about one model. get_guide answers from what the launcher wrote for the
+// robot's model, so the facts of a model live with the robot and no caller
+// keeps a list of models.
 {
   peppy_schema: "node/v1",
   manifest: {
     name: "robot_initializer",
     tag: "v1",
+    description: [
+      "The node that brings one robot into being and says when it is ready, for a robot of any model, an OpenArm and an SO-101 alike, real or simulated. It opens no device: on a real robot it reads the readiness of the drivers of the limbs, and on a simulated robot it joins the simulation.",
+      "It exposes the robot-level is_ready the backbone gates on, true only once everything that answers for the robot reports ready: the drivers of its limbs on a real robot, and the simulation on a simulated one, which answers for every limb of the robot it stands.",
+      "It also says who the robot is: get_identity answers the name the robot stands under, the model it is and the core node hosting it, for as long as the node runs. And it gives the robot's guide: get_guide answers the park poses the launcher wrote for the robot's model.",
+      "In a simulation it also joins the scene: it attaches as this robot, naming the copy it runs as, the model to stand and where, and holds that goal for as long as the robot is in the scene; the robot's limbs pair to the engine through the backbone. Its setup ends once the simulation stands the robot.",
+    ],
     implements: [
       { name: "robot_ready", tag: "v1", link_id: "robot_ready" },
       { name: "robot_identity", tag: "v1", link_id: "robot_identity" },

@@ -3,6 +3,10 @@
   manifest: {
     name: "my_rust_robot_arm",
     tag: "v1",
+    description: [
+      "An example arm with three joints that moves in software only. It opens no device, so it runs on any machine. It publishes its joint states and moves to a target position on a move_arm goal.",
+      "A reference node, to read rather than to deploy. my_python_robot_arm is the same node in Python.",
+    ],
     labels: [
       "arm",
       "openarm01",
@@ -25,6 +29,7 @@
       emits: [
         {
           name: "joint_states",
+          description: "The position and the velocity of each of the three joints, two times a second. The velocities are always 0.",
           qos_profile: "sensor_data",
           message_format: {
             positions: {
@@ -46,13 +51,14 @@
       exposes: [
         {
           name: "move_arm",
+          description: "Move the arm to desired_position in 1 to 3 s. The feedback gives the position on the way, about every 200 ms. The result gives the final position, or the position at which a cancel stopped the arm. The arm refuses a goal while it moves.",
           goal_service: {
             request_message_format: {
-              // x, y, z
               desired_position: {
                 $type: "array",
                 $items: "i32",
-                $length: 3
+                $length: 3,
+                $description: "The target position, as x, y, z.",
               }
             }
           },

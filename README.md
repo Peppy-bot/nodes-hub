@@ -57,10 +57,12 @@ Interchangeable nodes are connected through contracts defined in [`contracts-hub
 
 ```text
 peppy_schema: "node/v1"
-manifest:    { name, tag, labels?, implements?, depends_on? }   # tag is an id like "v1" (no dots)
+manifest:    { name, tag, description, labels?, implements?, depends_on? }   # tag is an id like "v1" (no dots)
 execution:   { language, container?, build_cmd?, run_cmd?, parameters? }
 interfaces:  { topics?, services?, actions? }
 ```
+
+`manifest.description` is a list of paragraphs. The first paragraph is the summary that `peppy repo search` prints: it says what the node does and what it needs to run, such as a GPU, a device or a simulation. A topic, service or action that the node declares itself (an entry with no `link_id`) has a `description` too, one text; an entry that a contract or a pairing backs takes its text from that document and has none. Notes for the maintainers, such as what each parameter does, stay comments.
 
 Parameters are typed (`device_path: "string"`) or typed with a default (`{ $type: "u16", $default: 30 }`).
 

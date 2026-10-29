@@ -1,20 +1,16 @@
-// Intel RealSense D4xx-series RGB-D camera (D405, D435, D435i, D455, ...).
-// Wraps librealsense2 via realsense-rust; publishes synchronized
-// video_stream + depth_stream with a shared frame_id. Implements the shared
-// rgbd_camera contract, so consumers (and sim/mock RGB-D nodes) bind against
-// the contract rather than this concrete node. The stereo IR pair that
-// depth is derived from and the IMU streams (D435i/D455) are not exposed; add a
-// node implementing an additional contract if a consumer needs them.
-// camera_geometry answers from the device's own calibration, read from
-// librealsense at startup, for the streams as the current align mode
-// publishes them: unaligned, each stream has its own pinhole model and the
-// depth-to-colour transform is the device's; aligned, both streams share the
-// target stream's model and the transform is the identity.
+// realsense_d4xx wraps librealsense2 via realsense-rust. Consumers (and
+// sim/mock RGB-D nodes) bind against the rgbd_camera contract rather than
+// this concrete node. For the stereo IR pair or the IMU streams, add a node
+// implementing an additional contract if a consumer needs them.
 {
   peppy_schema: "node/v1",
   manifest: {
     name: "realsense_d4xx",
     tag: "v1",
+    description: [
+      "An Intel RealSense D4xx RGB-D camera (D405, D435, D435i, D455 and others): it publishes synchronized colour and depth streams with a shared frame_id. It needs a RealSense D4xx device on its host.",
+      "It implements rgbd_camera and camera_geometry. camera_geometry answers from the calibration of the device, read from librealsense at startup, for the streams as the current align mode publishes them: unaligned, each stream has its own pinhole model and the depth-to-colour transform is that of the device; aligned, both streams share the model of the target stream and the transform is the identity. The stereo IR pair that gives the depth and the IMU streams (D435i, D455) are not published.",
+    ],
     implements: [
       { name: "rgbd_camera", tag: "v1", link_id: "camera" },
       { name: "camera_geometry", tag: "v1", link_id: "geometry" },
@@ -75,33 +71,25 @@
         { link_id: "geometry", name: "get_depth_to_color_extrinsics" },
         // RealSense-specific hardware knobs, native to this node (the
         // rgbd_camera contract carries only what every device can honor).
-        // set_depth_gain and set_depth_laser_power_mw write a device option.
-        // A write gets an error reply with `rejected` when the device does
-        // not offer the option or does not take the value, with
-        // `resource_unavailable` when the device is disconnected, and with
-        // `attempt_failed` when it fails for another reason.
         {
-          // Depth imager gain.
           name: "set_depth_gain",
+          description: "Set the gain of the depth imager, a device option. The reply gives the value that the node wrote. A write gets an error reply with `rejected` when the device does not offer the option or does not take the value, with `resource_unavailable` when the device is disconnected, and with `attempt_failed` when it fails for another reason.",
           request_message_format: { value: "i32" },
           response_message_format: {
             current_value: "i32",
           },
         },
         {
-          // IR projector power (mW); 0 disables the projector.
           name: "set_depth_laser_power_mw",
+          description: "Set the power of the IR projector, in mW, a device option: 0 disables the projector. The reply gives the value that the node wrote. A write gets an error reply with `rejected` when the device does not offer the option or does not take the value, with `resource_unavailable` when the device is disconnected, and with `attempt_failed` when it fails for another reason.",
           request_message_format: { value: "i32" },
           response_message_format: {
             current_value: "i32",
           },
         },
         {
-          // Spatial alignment between the streams: "none" emits raw sensor
-          // frames; "depth_to_color" warps depth into color's viewpoint and
-          // resolution; "color_to_depth" is the inverse. An unknown mode
-          // gets an error reply with `rejected`.
           name: "set_align_mode",
+          description: "Set the spatial alignment between the streams: \"none\" emits raw sensor frames; \"depth_to_color\" warps depth into color's viewpoint and resolution; \"color_to_depth\" is the inverse. The reply gives the mode that the node applies from then on. An unknown mode gets an error reply with `rejected`.",
           request_message_format: {
             mode: "string",
           },
