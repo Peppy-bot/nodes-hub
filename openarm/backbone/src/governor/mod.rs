@@ -31,6 +31,15 @@
 //! stages. They are motion shaping, not collision avoidance: they run in both
 //! modes and never touch the collision readout, so the toggle gates collision
 //! avoidance and nothing else.
+//!
+//! An arm on a joint path is governed along it: every stage scales the step
+//! of the path's arms as a whole, so the governed setpoints stay on the line
+//! from where the arms stand to the next point of their path, and the
+//! planners play the path on by the share the governor allowed. A path moves
+//! one arm or both ([`PathArms`]). Before such a move starts, a
+//! [`PathChecker`] walks its whole path against the floor the step floor
+//! holds, the other limbs where they stand ([`GuardAt`]), on a copy of the
+//! governor's collision model.
 
 use control_core::positive_finite::PositiveFinite;
 use openarm_description::{ARM_DOF, ArmPair, HardwareVersion, Side};
@@ -38,13 +47,17 @@ use self_collision_model::{DistanceGradient, SelfCollisionModel};
 use srs_model::{Jacobian, JointVec};
 use tracing::{info, warn};
 
+use crate::types::{DUAL_DOF, DualJointVec, arm_joints};
+
 mod barrier;
 mod limiters;
 mod model;
+mod path_check;
 mod sense;
 
 use limiters::{DofSpeed, EeSpeed, Limiter, Limits, MeasuredTripwire};
 use model::ConfiguredModel;
+pub use path_check::{GuardAt, PathBlocked, PathChecker};
 use sense::Sensed;
 
 /// Why the governor refused to build.
@@ -73,9 +86,6 @@ pub enum GovernorError {
     CollisionModel(#[from] self_collision_model::CollisionError),
 }
 
-/// Joints across both arms, left (0..7) then right (7..14).
-const DUAL_DOF: usize = 2 * ARM_DOF;
-
 /// Every governed degree of freedom: both arms' joints, then the left and
 /// right grippers. One vector so the barrier, the floor scan, the separating
 /// hold, and the measured-state monitor treat a gripper exactly like a joint.
@@ -84,7 +94,7 @@ const LEFT_GRIPPER: usize = DUAL_DOF;
 const RIGHT_GRIPPER: usize = DUAL_DOF + 1;
 
 /// One governed configuration: both arms' joints and both grippers. The single
-/// state [`Governor::govern`] throttles, scans, and monitors, so every
+/// state [`Governor::govern_along`] throttles, scans, and monitors, so every
 /// guarantee the arms get covers the fingers identically.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GovState {
@@ -96,6 +106,45 @@ pub struct GovState {
 impl GovState {
     pub fn new(arms: ArmPair<JointVec>, grippers: ArmPair<f64>) -> Self {
         Self { arms, grippers }
+    }
+}
+
+/// The arms a joint path moves. Each point of the path carries both arms'
+/// joints, the left arm's then the right's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PathArms {
+    One(Side),
+    Both,
+}
+
+impl PathArms {
+    /// The governed DOF of the joints the path moves.
+    fn joints(self) -> impl Iterator<Item = usize> + Clone {
+        (0..DUAL_DOF).filter(move |&i| self.moves(dof_side(i)))
+    }
+
+    /// Whether the path moves `side`'s arm.
+    fn moves(self, side: Side) -> bool {
+        match self {
+            Self::One(moved) => moved == side,
+            Self::Both => true,
+        }
+    }
+
+    /// `held` with the path's arms where `point`, a point of the path, puts
+    /// them.
+    fn placed(self, held: &GovState, point: &[f64]) -> GovState {
+        let point: &DualJointVec = point.try_into().expect("a point of both arms' joints");
+        GovState {
+            arms: ArmPair::from_fn(|side| {
+                if self.moves(side) {
+                    arm_joints(point, side)
+                } else {
+                    held.arms[side]
+                }
+            }),
+            grippers: held.grippers,
+        }
     }
 }
 
@@ -198,6 +247,7 @@ enum Clip {
 /// The nearest checked pair at a configuration: signed surface distance (m;
 /// positive is clearance, negative is penetration) and the two link names. The
 /// operator proximity readout.
+#[derive(Debug)]
 pub struct NearestPair {
     pub distance: f64,
     pub link_a: String,
@@ -387,16 +437,22 @@ impl Governor {
     /// Jacobian at the measured pose while that side follows the operator's
     /// stream; a planned move rides with `None` there, because it was budgeted
     /// against the cap at admission and capping it again per tick would stretch
-    /// it past its validated duration. A disabled governor skips stages 3
-    /// through 6; the stage 1 fault hold and the stage 2 speed caps still
-    /// apply, so a non-finite candidate is never streamed and the speed
-    /// controls do not vanish with the collision toggle.
-    pub fn govern(
+    /// it past its validated duration. The arms of each path in `paths` are
+    /// governed along their step: the limits take one fraction across the
+    /// path's joints ([`Limits::along_paths`]), the barrier removes closing
+    /// motion along the step alone ([`along_paths`]), and the floor scan
+    /// retracts along the step, its separating hold never parting the arms of
+    /// a path of both, so the governed setpoints stay on the step. A disabled
+    /// governor skips stages 3 through 6; the stage 1 fault hold and the stage
+    /// 2 speed caps still apply, so a non-finite candidate is never streamed
+    /// and the speed controls do not vanish with the collision toggle.
+    pub fn govern_along(
         &mut self,
         prev: &GovState,
         cand: &GovState,
         measured: &GovState,
         hands: &ArmPair<Option<Jacobian>>,
+        paths: &[PathArms],
         dt: f64,
     ) -> GovState {
         // The tick period is an input like any other: a non-finite or
@@ -415,7 +471,7 @@ impl Governor {
         let speed_limits = self.limit_speed(&step, hands, dt);
         if !self.enabled {
             self.report(Guard::Clear, None, None);
-            return split(&speed_limits.apply(&step));
+            return split(&speed_limits.along_paths(paths).apply(&step));
         }
         let Some(sensed) = self.sense(prev, cand, measured) else {
             self.report(Guard::Stopped, None, None);
@@ -433,6 +489,7 @@ impl Governor {
         let trip_limits = Limits::unrestricted().add(tripwire.name(), trip_allowance);
         let limited = speed_limits
             .add(tripwire.name(), trip_allowance)
+            .along_paths(paths)
             .apply(&step);
 
         // The barrier stands down at a touch: with the witness points
@@ -440,12 +497,18 @@ impl Governor {
         // scan below still lets the operator drive out and still refuses to let
         // the contact deepen, so standing down never traps them in it.
         let (projected, throttled) = match sensed.grad {
-            Some(grad) => self.project_closing(&step.prev, &limited, &grad, sensed.d_prev, dt),
+            Some(grad) => self.project_closing(
+                &step.prev,
+                &limited,
+                &along_paths(&grad, &step, paths),
+                sensed.d_prev,
+                dt,
+            ),
             None => (limited, false),
         };
 
         let (governed, clipped) =
-            match self.clip_to_floor(&step.prev, &projected, sensed.d_prev, dt) {
+            match self.clip_to_floor_along(&step.prev, &projected, paths, sensed.d_prev, dt) {
                 Clip::Clear => (projected, false),
                 Clip::Clipped(q) => (q, true),
             };
@@ -620,6 +683,29 @@ fn governed_gradient(g: &DistanceGradient<'_>) -> [f64; GOV_DOF] {
     ))
 }
 
+/// The clearance gradient `grad` with the joints of each of `paths` reduced
+/// to their component along that path's step: the barrier removes closing
+/// motion along the gradient it is handed, so a joint path's step is then
+/// scaled along its path, never turned off it. The barrier's predicted change
+/// of clearance is unchanged, since the step of such a path lies along its
+/// own direction.
+fn along_paths(grad: &[f64; GOV_DOF], step: &Step, paths: &[PathArms]) -> [f64; GOV_DOF] {
+    let mut along = *grad;
+    for arms in paths {
+        let delta = |i: usize| step.target[i] - step.prev[i];
+        let length_sq: f64 = arms.joints().map(|i| delta(i) * delta(i)).sum();
+        let rate = if length_sq > 0.0 {
+            arms.joints().map(|i| grad[i] * delta(i)).sum::<f64>() / length_sq
+        } else {
+            0.0
+        };
+        for i in arms.joints() {
+            along[i] = rate * delta(i);
+        }
+    }
+    along
+}
+
 /// The side governed DOF `i` belongs to: the joints of its arm and its
 /// opening.
 fn dof_side(i: usize) -> Side {
@@ -637,11 +723,15 @@ fn dot(a: &[f64; GOV_DOF], b: &[f64; GOV_DOF]) -> f64 {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::sync::atomic::AtomicBool;
 
     use super::limiters::measured_tripwire::MONITOR_TRIP_FRACTION;
     use super::*;
     use crate::test_support::bundled_arm;
+    use crate::test_support::{NO_PATHS, NO_STOP};
+    use crate::types::dual_joints;
     use control_core::chase::{chase_step, rate_limited};
+    use control_core::path_timing::RoundedPath;
 
     /// Materialize a generation's bundled collision meshes so the file-based collision
     /// builder can fit hulls; the URDF itself comes from the same `HardwareVersion`.
@@ -881,7 +971,7 @@ mod tests {
         for _ in 0..250 {
             let prev = q;
             let cand = at(chase(&prev.arms, &target, 0.02));
-            q = g.govern(&prev, &cand, &prev, NO_HANDS, DT);
+            q = g.govern_along(&prev, &cand, &prev, NO_HANDS, NO_PATHS, DT);
             let d = distance(&mut g, &q);
             assert!(
                 d >= D_STOP,
@@ -968,7 +1058,7 @@ mod tests {
         let mut cand = prev;
         cand.arms.left[0] += 0.5; // 0.5 rad >> the 5e-4 rad velocity-limited bound
 
-        let governed = g.govern(&prev, &cand, &prev, NO_HANDS, DT);
+        let governed = g.govern_along(&prev, &cand, &prev, NO_HANDS, NO_PATHS, DT);
         let bound = velocity * DT;
         let taken = governed.arms.left[0] - prev.arms.left[0];
         assert!(
@@ -1021,9 +1111,674 @@ mod tests {
                 break;
             }
             let cand = at(chase(&q.arms, &target, 0.05));
-            q = g.govern(&q, &cand, &q, NO_HANDS, DT);
+            q = g.govern_along(&q, &cand, &q, NO_HANDS, NO_PATHS, DT);
         }
         q
+    }
+
+    /// The arm of the one-arm paths of these tests.
+    const LEFT_ARM: PathArms = PathArms::One(Side::Left);
+
+    /// The path through `waypoints`, each both arms' joints, its corners
+    /// rounded as a joint path's.
+    fn path_through(waypoints: &[ArmPair<JointVec>]) -> RoundedPath {
+        let waypoints: Vec<Vec<f64>> = waypoints
+            .iter()
+            .map(|arms| dual_joints(arms).to_vec())
+            .collect();
+        RoundedPath::joint_path(&waypoints)
+    }
+
+    /// The left arm at `left`, the right arm at home.
+    fn left_at(left: JointVec) -> ArmPair<JointVec> {
+        ArmPair::new(left, home().right)
+    }
+
+    // A left path that folds the wrist into the torso fails the check, naming
+    // the pair inside the stop distance, and one that stays out passes; a
+    // disabled guard passes both. From a start already inside the stop
+    // distance, a path fails only where it closes in further.
+    #[test]
+    fn a_path_the_guard_would_hold_short_fails_the_check_and_a_clear_one_passes() {
+        let mut g = governor(true);
+        let mut checker = g.path_checker();
+        let held = at(home());
+        let guard = g.guard_at(held);
+        let folded = at(left_at(wrists_inward(1.2).left));
+        assert!(distance(&mut g, &held) > D_SAFE, "the arms start clear");
+        assert!(
+            distance(&mut g, &folded) < D_STOP,
+            "the fold meets the body"
+        );
+        let clear = path_through(&[home(), left_at(wrists_inward(0.4).left)]);
+        assert!(
+            checker
+                .check_path(LEFT_ARM, &guard, &clear, &NO_STOP)
+                .is_ok()
+        );
+        let into = path_through(&[home(), folded.arms]);
+        let blocked = checker
+            .check_path(LEFT_ARM, &guard, &into, &NO_STOP)
+            .expect_err("a path into the body fails the check");
+        assert!(
+            matches!(blocked, PathBlocked::UnderStop { .. }),
+            "{blocked}"
+        );
+        assert!(blocked.to_string().contains("stop distance"), "{blocked}");
+        let disabled = governor(false).guard_at(held);
+        assert!(
+            checker
+                .check_path(LEFT_ARM, &disabled, &into, &NO_STOP)
+                .is_ok()
+        );
+
+        let inside = at(left_at(wrists_inward(0.8).left));
+        assert!(distance(&mut g, &inside) < D_STOP, "the start is inside");
+        let deeper = path_through(&[inside.arms, folded.arms]);
+        assert!(matches!(
+            checker.check_path(LEFT_ARM, &g.guard_at(inside), &deeper, &NO_STOP),
+            Err(PathBlocked::ClosesInsideStop { .. } | PathBlocked::DeeperInContact { .. })
+        ));
+        let back_out = path_through(&[inside.arms, home()]);
+        assert!(
+            checker
+                .check_path(LEFT_ARM, &g.guard_at(inside), &back_out, &NO_STOP)
+                .is_ok()
+        );
+    }
+
+    // The guard of a path is the governor's when the path starts: a toggle
+    // after it leaves the check of that path as it was, and the check of a
+    // path that starts after it takes the toggle.
+    #[test]
+    fn a_path_is_checked_against_the_guard_the_governor_held_when_it_started() {
+        let mut g = governor(true);
+        let mut checker = g.path_checker();
+        let held = at(home());
+        let into = path_through(&[home(), left_at(wrists_inward(1.2).left)]);
+        let enabled = g.guard_at(held);
+        g.set_enabled(false);
+        assert!(matches!(
+            checker.check_path(LEFT_ARM, &enabled, &into, &NO_STOP),
+            Err(PathBlocked::UnderStop { .. })
+        ));
+        assert!(
+            checker
+                .check_path(LEFT_ARM, &g.guard_at(held), &into, &NO_STOP)
+                .is_ok()
+        );
+    }
+
+    // A check whose stop is raised ends at the first probe it measures, on a
+    // path that fails the check with its stop down.
+    #[test]
+    fn a_raised_stop_ends_the_path_check_at_its_next_probe() {
+        let g = governor(true);
+        let mut checker = g.path_checker();
+        let guard = g.guard_at(at(home()));
+        let into = path_through(&[home(), left_at(wrists_inward(1.2).left)]);
+        assert!(matches!(
+            checker.check_path(LEFT_ARM, &guard, &into, &NO_STOP),
+            Err(PathBlocked::UnderStop { .. })
+        ));
+        let stop = AtomicBool::new(true);
+        assert!(matches!(
+            checker.check_path(LEFT_ARM, &guard, &into, &stop),
+            Err(PathBlocked::Stopped)
+        ));
+    }
+
+    // The check judges a path from its start, the arms it moves standing
+    // there, wherever the guard holds them: a path that starts inside the
+    // stop distance passes its way out and fails its way further in as alike
+    // with the guard holding its arm clear at home as with the guard holding
+    // it at the start. A path whose start and whole run are clear passes
+    // though the straight step to its start from where the guard holds the
+    // arm dips under the stop: the left shoulder swung from home round the
+    // right arm.
+    #[test]
+    fn the_check_judges_a_path_from_its_start_wherever_the_guard_holds_its_arms() {
+        let mut g = governor(true);
+        let mut checker = g.path_checker();
+        let inside = at(left_at(wrists_inward(0.8).left));
+        assert!(distance(&mut g, &inside) < D_STOP, "the start is inside");
+        let out = path_through(&[inside.arms, home()]);
+        let deeper = path_through(&[inside.arms, left_at(wrists_inward(1.2).left)]);
+        for held in [at(home()), inside] {
+            let guard = g.guard_at(held);
+            assert!(checker.check_path(LEFT_ARM, &guard, &out, &NO_STOP).is_ok());
+            assert!(matches!(
+                checker.check_path(LEFT_ARM, &guard, &deeper, &NO_STOP),
+                Err(PathBlocked::ClosesInsideStop { .. } | PathBlocked::DeeperInContact { .. })
+            ));
+        }
+
+        let swung = |shoulder: f64| {
+            let mut q = at(home());
+            q.arms.left[1] = shoulder;
+            q
+        };
+        let (far, farther) = (swung(3.2), swung(3.3));
+        assert!(
+            segment_min(&mut g, &far, &farther, 128) >= D_SAFE,
+            "the path runs clear"
+        );
+        assert!(
+            segment_min(&mut g, &at(home()), &far, 128) < D_STOP,
+            "the step in from home dips under the stop"
+        );
+        let clear_run = path_through(&[far.arms, farther.arms]);
+        assert!(
+            checker
+                .check_path(LEFT_ARM, &g.guard_at(at(home())), &clear_run, &NO_STOP)
+                .is_ok()
+        );
+    }
+
+    // A path that starts inside the stop distance, opens past it and closes
+    // back inside fails the check, as the guard holds each tick's step at the
+    // floor from where the step starts: once the limbs stand past the stop
+    // distance, it holds them there. The same path without the way back
+    // passes.
+    #[test]
+    fn a_path_that_opens_past_the_stop_and_closes_back_inside_fails_the_check() {
+        let mut g = governor(true);
+        let mut checker = g.path_checker();
+        let inside = at(left_at(wrists_inward(0.8).left));
+        assert!(distance(&mut g, &inside) < D_STOP, "the start is inside");
+        assert!(
+            distance(&mut g, &at(home())) > D_STOP,
+            "home stands past it"
+        );
+        let guard = g.guard_at(inside);
+        let out = path_through(&[inside.arms, home()]);
+        assert!(checker.check_path(LEFT_ARM, &guard, &out, &NO_STOP).is_ok());
+        let out_and_back = path_through(&[inside.arms, home(), inside.arms]);
+        assert!(matches!(
+            checker.check_path(LEFT_ARM, &guard, &out_and_back, &NO_STOP),
+            Err(PathBlocked::UnderStop { .. })
+        ));
+    }
+
+    // A path that starts inside the stop distance and closes the gap before
+    // it opens it, within one probe's spacing, fails the check: each of its
+    // probes stands at or above the clearance before it, or past the stop
+    // distance, but the guard's closing barrier holds its first step however
+    // short, so the path would stall at its start. The left wrist turns in
+    // 0.002 rad past its start, then out 0.3 rad on a corner the path rounds,
+    // rolling 0.03 rad as it goes.
+    #[test]
+    fn a_path_that_closes_the_gap_between_its_probes_inside_the_stop_fails_the_check() {
+        let mut g = governor(true);
+        let mut checker = g.path_checker();
+        let wrist_in = |t: f64| left_at(wrists_inward(t).left);
+        let t = (400..1200)
+            .map(|k| f64::from(k) * 0.001)
+            .find(|&t| distance(&mut g, &at(wrist_in(t))) < D_STOP)
+            .expect("the wrist turns in to the stop distance");
+        let inside = at(wrist_in(t));
+        assert!(distance(&mut g, &inside) > 0.0, "the start is clear");
+        let mut out = wrist_in(t - 0.3);
+        out.left[6] += 0.03;
+        let path = path_through(&[inside.arms, wrist_in(t + 0.002), out]);
+        let spacing = PositiveFinite::parse(MAX_PROBE_ARC_RAD).expect("a positive resolution");
+        let probed: Vec<f64> = path
+            .arcs_every(spacing)
+            .iter()
+            .map(|&s| distance(&mut g, &LEFT_ARM.placed(&inside, &path.at(s))))
+            .collect();
+        assert!(
+            probed.windows(2).all(|w| w[1] >= w[0].min(D_STOP)),
+            "the probes alone pass the path: {probed:?}"
+        );
+        let first_step = LEFT_ARM.placed(&inside, &path.at(1e-4));
+        assert!(distance(&mut g, &first_step) < distance(&mut g, &inside));
+        assert_eq!(
+            g.govern_along(&inside, &first_step, &inside, NO_HANDS, &[LEFT_ARM], DT),
+            inside,
+            "the guard holds the path's first step"
+        );
+        let blocked = checker
+            .check_path(LEFT_ARM, &g.guard_at(inside), &path, &NO_STOP)
+            .expect_err("the guard holds the path's first step");
+        assert!(
+            matches!(blocked, PathBlocked::ClosesInsideStop { .. }),
+            "{blocked}"
+        );
+        let from_turn = path_through(&[wrist_in(t + 0.002), out]);
+        let turned = at(wrist_in(t + 0.002));
+        assert!(
+            checker
+                .check_path(LEFT_ARM, &g.guard_at(turned), &from_turn, &NO_STOP)
+                .is_ok(),
+            "the path out from its turn passes"
+        );
+    }
+
+    // A path that starts inside the stop distance, opens the gap and closes
+    // it again, inside the stop distance and farther apart than it started,
+    // fails the check, its refusal naming the clearance it starts from and
+    // the one where it closes the gap, the farther of the two: the left
+    // wrist turns out 0.006 rad and back in 0.003, all within one probe's
+    // spacing, and the path rests where it turns.
+    #[test]
+    fn a_path_that_opens_the_gap_and_closes_it_inside_the_stop_names_where_it_closes_it() {
+        let mut g = governor(true);
+        let mut checker = g.path_checker();
+        let wrist_in = |t: f64| left_at(wrists_inward(t).left);
+        let t = (400..1200)
+            .map(|k| f64::from(k) * 0.001)
+            .find(|&t| distance(&mut g, &at(wrist_in(t))) < D_STOP)
+            .expect("the wrist turns in to the stop distance")
+            + 0.01;
+        let inside = at(wrist_in(t));
+        let d_start = distance(&mut g, &inside);
+        assert!(d_start > 0.0, "the start is clear");
+        let path = path_through(&[inside.arms, wrist_in(t - 0.006), wrist_in(t - 0.003)]);
+        assert!(
+            distance(&mut g, &at(wrist_in(t - 0.006))) < D_STOP,
+            "the path stays inside the stop distance"
+        );
+        let blocked = checker
+            .check_path(LEFT_ARM, &g.guard_at(inside), &path, &NO_STOP)
+            .expect_err("the path closes the gap inside the stop distance");
+        let PathBlocked::ClosesInsideStop { pair, start } = &blocked else {
+            panic!("{blocked}");
+        };
+        assert_eq!(*start, d_start);
+        assert!(pair.distance > d_start, "{blocked}");
+        let words = blocked.to_string();
+        let mm = |m: f64| m * 1000.0;
+        assert!(
+            words.contains(&format!(
+                "starts with two of its links {:.1} mm apart",
+                mm(d_start)
+            )) && words.contains(&format!(
+                "where they stand {:.1} mm apart",
+                mm(pair.distance)
+            )),
+            "{words}"
+        );
+    }
+
+    // A path that starts in contact and sweeps deeper fails the check, its
+    // refusal saying that the guard lets a step lose clearance at its
+    // recovery rate there and the check lets it lose none; the same start
+    // passes on a path out of the contact.
+    #[test]
+    fn a_path_that_starts_in_contact_and_sweeps_deeper_fails_in_the_words_of_a_contact() {
+        let mut g = governor(true);
+        let mut checker = g.path_checker();
+        let wrist_in = |t: f64| left_at(wrists_inward(t).left);
+        let t = (400..1200)
+            .map(|k| f64::from(k) * 0.001)
+            .find(|&t| distance(&mut g, &at(wrist_in(t))) < -0.001)
+            .expect("the wrist turns in to a contact 1 mm deep");
+        let contact = at(wrist_in(t));
+        let guard = g.guard_at(contact);
+        let deeper = path_through(&[contact.arms, wrist_in(t + 0.05)]);
+        let blocked = checker
+            .check_path(LEFT_ARM, &guard, &deeper, &NO_STOP)
+            .expect_err("the path sweeps deeper");
+        assert!(
+            matches!(blocked, PathBlocked::DeeperInContact { .. }),
+            "{blocked}"
+        );
+        let words = blocked.to_string();
+        assert!(
+            words.contains("mm deep in contact with itself")
+                && words.contains("lose clearance at up to 200 mm/s while the arm escapes"),
+            "{words}"
+        );
+        let out = path_through(&[contact.arms, wrist_in(t - 0.3)]);
+        assert!(checker.check_path(LEFT_ARM, &guard, &out, &NO_STOP).is_ok());
+    }
+
+    // Inside the stop distance no stretch of a path is vouched for between
+    // its probes: the floor there is the clearance itself, so a probe leaves
+    // no margin over it, and the check measures the next probe however short
+    // the step to it. A raised stop, which ends the check at its next
+    // measured probe, ends there a path that rolls the left wrist 0.0011 rad
+    // the way that keeps the gap, a step whose lever bound lies under 1 mm;
+    // with no stop the same path passes.
+    #[test]
+    fn inside_the_stop_distance_a_probe_vouches_for_no_stretch_after_it() {
+        let mut g = governor(true);
+        let mut checker = g.path_checker();
+        let wrist_in = |t: f64| left_at(wrists_inward(t).left);
+        let t = (400..1200)
+            .map(|k| f64::from(k) * 0.001)
+            .find(|&t| distance(&mut g, &at(wrist_in(t))) < D_STOP)
+            .expect("the wrist turns in to the stop distance");
+        let inside = at(wrist_in(t));
+        assert!(distance(&mut g, &inside) > 0.0, "the start is clear");
+        let guard = g.guard_at(inside);
+        let rolled = |roll: f64| {
+            let mut q = inside;
+            q.arms.left[6] += roll;
+            q
+        };
+        let roll_out = |roll: f64| path_through(&[inside.arms, rolled(roll).arms]);
+        let roll = [0.0011, -0.0011]
+            .into_iter()
+            .find(|&roll| {
+                checker
+                    .check_path(LEFT_ARM, &guard, &roll_out(roll), &NO_STOP)
+                    .is_ok()
+            })
+            .expect("a roll of the wrist one way or the other keeps the gap");
+        let bound = g
+            .model
+            .step_bound(&step_change(&concat(&inside), &concat(&rolled(roll))));
+        assert!(bound < 1e-3, "the roll may close the gap by {bound} m");
+        let out = roll_out(roll);
+        let stop = AtomicBool::new(true);
+        assert!(matches!(
+            checker.check_path(LEFT_ARM, &guard, &out, &stop),
+            Err(PathBlocked::Stopped)
+        ));
+    }
+
+    // A path of both arms puts both arms where each probe puts them: a path
+    // whose left half stands still and whose right half folds the right
+    // wrist into the body fails the check, where the same path of the left
+    // arm alone, the right arm where it stands, passes.
+    #[test]
+    fn a_path_is_checked_with_its_arms_where_it_puts_them_and_the_others_where_they_stand() {
+        let mut g = governor(true);
+        let mut checker = g.path_checker();
+        let guard = g.guard_at(at(home()));
+        let folded = ArmPair::new(home().left, wrists_inward(1.2).right);
+        assert!(
+            distance(&mut g, &at(folded)) < D_STOP,
+            "the right fold meets the body"
+        );
+        let path = path_through(&[home(), folded]);
+        let blocked = checker
+            .check_path(PathArms::Both, &guard, &path, &NO_STOP)
+            .expect_err("the right half folds into the body");
+        assert!(blocked.to_string().contains("stop distance"), "{blocked}");
+        assert!(
+            checker
+                .check_path(LEFT_ARM, &guard, &path, &NO_STOP)
+                .is_ok()
+        );
+    }
+
+    // A path the check passes from where the left arm stood when the goal
+    // was taken, whose arm moves 0.008 rad out while the path is judged, is
+    // judged again from where the arm then stands, before it plays, and
+    // fails there with `unreachable`, the arm's command holding where it
+    // stood: from there the path's first leg heads back in, inside the stop
+    // distance, where the guard holds it. The left wrist stands 4.0 mm from
+    // the body when the goal is taken and 4.8 mm when the path would start.
+    #[tokio::test]
+    async fn a_path_whose_arm_moved_while_judged_is_judged_again_before_it_plays() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        use crate::failure::FailureKind;
+        use crate::planner::{
+            ArmOrder, Outcome, Resumed, judge_path, resume_judged_path, start_path,
+        };
+        use crate::settle::Settle;
+        use crate::test_support::{claimed, path_goal_through, planner_holding, share_reply};
+
+        let mut g = governor(true);
+        let mut checker = g.path_checker();
+        let wrist_in = |t: f64| left_at(wrists_inward(t).left);
+        let t = (400..1200)
+            .map(|k| f64::from(k) * 0.001)
+            .find(|&t| distance(&mut g, &at(wrist_in(t))) < D_STOP)
+            .expect("the wrist turns in to the stop distance");
+        let (taken, run) = (at(wrist_in(t + 0.01)), at(wrist_in(t + 0.002)));
+        assert!(
+            (0.0..D_STOP).contains(&distance(&mut g, &taken))
+                && (0.0..D_STOP).contains(&distance(&mut g, &run)),
+            "both starts stand inside the stop distance"
+        );
+        let mut planners = ArmPair::from_fn(|side| planner_holding(side, taken.arms[side]));
+        let arms = ArmOrder::parse(&["left_arm"]).expect("the left arm");
+        let move_slots = claimed(&arms);
+        let (reply, mut done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
+        let settle = Settle {
+            tolerance: vec![0.1; ARM_DOF],
+            timeout: Duration::from_secs(1),
+        };
+        let goal = path_goal_through(
+            &arms,
+            &[wrist_in(t + 0.008), wrist_in(t - 0.3)],
+            Duration::ZERO,
+            settle,
+            reply,
+            |side| &move_slots[side],
+        );
+        let measuring = |q: &GovState| ArmPair::from_fn(|side| Ok(q.arms[side]));
+        let judgment =
+            start_path(&mut planners, goal, &measuring(&taken)).expect("the goal is taken");
+        let guard = g.guard_at(taken);
+        let verdict = judge_path(
+            &judgment.plan,
+            judgment.arms,
+            &guard,
+            &mut checker,
+            &NO_STOP,
+        );
+        assert_eq!(verdict, Ok(()), "the path passes from where the arm stood");
+        let now = Instant::now();
+        let resumed = resume_judged_path(&mut planners, &judgment, &verdict, &measuring(&run), now);
+        assert_eq!(
+            planners.left.setpoint(),
+            taken.arms.left,
+            "the command holds while the path is judged again"
+        );
+        let Resumed::JudgeAgain(again) = resumed else {
+            panic!("the path is judged again from where the arm stands");
+        };
+        let guard = g.guard_at(run);
+        let verdict = judge_path(&again.plan, again.arms, &guard, &mut checker, &NO_STOP);
+        let failure = verdict
+            .clone()
+            .expect_err("from where the arm stands, the guard holds the path");
+        assert_eq!(
+            failure.kind,
+            FailureKind::Unreachable,
+            "{}",
+            failure.message
+        );
+        let resumed = resume_judged_path(&mut planners, &again, &verdict, &measuring(&run), now);
+        assert!(matches!(resumed, Resumed::Done), "the path ends");
+        assert!(!again.is_awaited(&planners), "no share waits for the path");
+        assert_eq!(
+            planners.left.setpoint(),
+            taken.arms.left,
+            "the command holds"
+        );
+        let report = done_rx.try_recv().expect("the share reports");
+        assert_eq!(report.outcome, Outcome::Failed(failure));
+    }
+
+    // A path of both arms that turns the wrists in toward each other, the
+    // v2's open fingers meeting across the centerline, fails its judgment
+    // with `unreachable`, naming a link of each arm. Each arm alone along the
+    // same path, the other where it stands, stays clear, so the check walks
+    // both arms at once.
+    #[test]
+    fn a_path_of_both_arms_into_each_other_fails_its_judgment_unreachable() {
+        use crate::failure::FailureKind;
+        use crate::planner::{PathPlan, judge_path};
+
+        let mut g = v2_governor(true);
+        let mut checker = g.path_checker();
+        let start = wrists_inward(0.0);
+        let guard = g.guard_at(at(start));
+        let meet = wrists_inward(0.3);
+        assert!(distance(&mut g, &at(meet)) < D_STOP, "the hands meet");
+        let plan = PathPlan::through(
+            vec![dual_joints(&start), dual_joints(&meet)],
+            [1.0; DUAL_DOF],
+            [1.0; DUAL_DOF],
+            std::time::Duration::ZERO,
+        );
+        for alone in [PathArms::One(Side::Left), PathArms::One(Side::Right)] {
+            let judged = judge_path(&plan, alone, &guard, &mut checker, &NO_STOP);
+            assert!(judged.is_ok(), "{alone:?} alone stays clear: {judged:?}");
+        }
+        let judged = judge_path(&plan, PathArms::Both, &guard, &mut checker, &NO_STOP)
+            .expect_err("the hands meet on the path");
+        assert_eq!(judged.kind, FailureKind::Unreachable, "{}", judged.message);
+        let pair = judged
+            .message
+            .strip_prefix("the path brings ")
+            .and_then(|rest| rest.split_once(" to "))
+            .and_then(|(names, _)| names.split_once(" and "));
+        let Some((a, b)) = pair else {
+            panic!("the path brings a pair under the stop: {}", judged.message);
+        };
+        let arm_of = |link: &str| {
+            ["openarm_left_", "openarm_right_"]
+                .iter()
+                .position(|arm| link.starts_with(arm))
+        };
+        let mut arms = [arm_of(a), arm_of(b)];
+        arms.sort();
+        assert_eq!(arms, [Some(0), Some(1)], "a link of each arm: {a} and {b}");
+    }
+
+    // A joint path's step that the barrier throttles stays on its line:
+    // the governed step of the arm on its path is one share of the commanded
+    // step in every joint, where the same step streamed is shaped joint by
+    // joint and turned off the line.
+    #[test]
+    fn a_step_along_a_path_is_scaled_along_it_and_never_turned() {
+        let mut g = governor(true);
+        let folded = ArmPair::new(wrists_inward(1.2).left, home().right);
+        let mut start = at(home());
+        while distance(&mut g, &start) >= D_SAFE {
+            let cand = at(chase(&start.arms, &folded, 0.01));
+            start = g.govern_along(&start, &cand, &start, NO_HANDS, NO_PATHS, DT);
+        }
+        // Closing on the wrist and moving two more joints, so the step is not
+        // a single joint's and the gradient lies off it.
+        let mut cand = start;
+        for (joint, by) in [(1, 0.005), (2, 0.04), (4, 0.03)] {
+            cand.arms.left[joint] += by;
+        }
+        let step: JointVec = std::array::from_fn(|i| cand.arms.left[i] - start.arms.left[i]);
+        let taken = |governed: &GovState| -> JointVec {
+            std::array::from_fn(|i| governed.arms.left[i] - start.arms.left[i])
+        };
+        let share_of = |taken: &JointVec| {
+            taken.iter().zip(&step).map(|(t, s)| t * s).sum::<f64>()
+                / step.iter().map(|s| s * s).sum::<f64>()
+        };
+        let off_line = |taken: &JointVec| {
+            let share = share_of(taken);
+            (0..ARM_DOF)
+                .map(|i| (taken[i] - share * step[i]).abs())
+                .fold(0.0, f64::max)
+        };
+        let on_left = &[PathArms::One(Side::Left)];
+        let along = taken(&g.govern_along(&start, &cand, &start, NO_HANDS, on_left, DT));
+        assert!(share_of(&along) < 1.0, "the barrier throttles the step");
+        assert!(
+            off_line(&along) <= 1e-12,
+            "the path step turned by {}",
+            off_line(&along)
+        );
+        let streamed = taken(&g.govern_along(&start, &cand, &start, NO_HANDS, NO_PATHS, DT));
+        assert!(
+            off_line(&streamed) > 1e-6,
+            "the streamed step stayed on the line, so this case shows nothing"
+        );
+    }
+
+    // A step along a path through both arms' joints that the barrier
+    // throttles stays on its line: both arms take one share of the commanded
+    // step in every joint, the arm the barrier does not close on included.
+    #[test]
+    fn a_step_along_a_both_arms_path_is_scaled_as_one() {
+        let mut g = governor(true);
+        let folded = ArmPair::new(wrists_inward(1.2).left, home().right);
+        let mut start = at(home());
+        while distance(&mut g, &start) >= D_SAFE {
+            let cand = at(chase(&start.arms, &folded, 0.01));
+            start = g.govern_along(&start, &cand, &start, NO_HANDS, NO_PATHS, DT);
+        }
+        let mut cand = start;
+        for (joint, by) in [(1, 0.005), (2, 0.04), (4, 0.03)] {
+            cand.arms.left[joint] += by;
+        }
+        cand.arms.right[3] += 0.02;
+        let step = dual_joints(&ArmPair::from_fn(|side| {
+            std::array::from_fn(|i| cand.arms[side][i] - start.arms[side][i])
+        }));
+        let governed = g.govern_along(&start, &cand, &start, NO_HANDS, &[PathArms::Both], DT);
+        let taken = dual_joints(&ArmPair::from_fn(|side| {
+            std::array::from_fn(|i| governed.arms[side][i] - start.arms[side][i])
+        }));
+        let share = taken.iter().zip(&step).map(|(t, s)| t * s).sum::<f64>()
+            / step.iter().map(|s| s * s).sum::<f64>();
+        assert!(share < 1.0, "the barrier throttles the step");
+        let off_line = (0..DUAL_DOF)
+            .map(|i| (taken[i] - share * step[i]).abs())
+            .fold(0.0, f64::max);
+        assert!(off_line <= 1e-12, "the path step turned by {off_line}");
+    }
+
+    // On v2 at Home, the left gripper opening toward the torso brings its jaw
+    // under the stop while both arms take a step of a path of both arms, so
+    // the floor scan clips the step. Both arms take one share of their step:
+    // the right arm, whose own step leaves the clearance where it is, stops
+    // with the left. The same step streamed lets the right arm take its whole
+    // step while the left is clipped, so this case exercises the separating
+    // hold.
+    #[test]
+    fn a_clip_keeps_the_arms_of_a_path_of_both_on_one_share_of_their_step() {
+        let mut g = v2_governor(true);
+        let prev = GovState::new(home(), ArmPair::new(0.0, 0.0));
+        let mut target = prev;
+        target.grippers.left = 1.0;
+        target.arms.left[0] += 0.004;
+        target.arms.right[0] += 0.004;
+        let d_now = distance(&mut g, &prev);
+        let clip = |g: &mut Governor, paths: &[PathArms]| match g.clip_to_floor_along(
+            &concat(&prev),
+            &concat(&target),
+            paths,
+            d_now,
+            DT,
+        ) {
+            Clip::Clipped(q) => split(&q),
+            Clip::Clear => panic!("the opening jaw is not clipped: d_now {d_now:+.5}"),
+        };
+        let step = dual_joints(&ArmPair::from_fn(|side| {
+            std::array::from_fn(|i| target.arms[side][i] - prev.arms[side][i])
+        }));
+        let taken = |governed: &GovState| {
+            dual_joints(&ArmPair::from_fn(|side| {
+                std::array::from_fn(|i| governed.arms[side][i] - prev.arms[side][i])
+            }))
+        };
+
+        let along = taken(&clip(&mut g, &[PathArms::Both]));
+        let share = along.iter().zip(&step).map(|(t, s)| t * s).sum::<f64>()
+            / step.iter().map(|s| s * s).sum::<f64>();
+        assert!(share < 1.0, "the floor scan clips the step");
+        let off_line = (0..DUAL_DOF)
+            .map(|i| (along[i] - share * step[i]).abs())
+            .fold(0.0, f64::max);
+        assert!(off_line <= 1e-12, "the arms parted by {off_line} rad");
+
+        let streamed = clip(&mut g, NO_PATHS);
+        assert_eq!(
+            streamed.arms.right, target.arms.right,
+            "the streamed right arm did not take its whole step, so this case shows nothing"
+        );
+        assert_ne!(
+            streamed.arms.left, target.arms.left,
+            "the left arm is clipped"
+        );
     }
 
     #[test]
@@ -1035,7 +1790,7 @@ mod tests {
         let mut g = governor(false);
         let deep = at(wrists_inward(1.2));
         assert_eq!(
-            g.govern(&at(home()), &deep, &at(home()), NO_HANDS, DT),
+            g.govern_along(&at(home()), &deep, &at(home()), NO_HANDS, NO_PATHS, DT),
             deep
         );
         assert_eq!(g.guard(), Guard::Clear, "disabled restricts no collision");
@@ -1051,7 +1806,7 @@ mod tests {
             "home should sit outside the band"
         );
         assert_eq!(
-            g.govern(&at(home()), &cand, &at(home()), NO_HANDS, DT),
+            g.govern_along(&at(home()), &cand, &at(home()), NO_HANDS, NO_PATHS, DT),
             cand
         );
         assert_eq!(g.guard(), Guard::Clear, "unrestricted motion reads clear");
@@ -1073,7 +1828,10 @@ mod tests {
             "the step must close faster than the in-band allowance or it proves \
              nothing: closed {closing:.4} m in {DT} s"
         );
-        assert_eq!(g.govern(&start, &cand, &start, NO_HANDS, DT), cand);
+        assert_eq!(
+            g.govern_along(&start, &cand, &start, NO_HANDS, NO_PATHS, DT),
+            cand
+        );
         assert_eq!(g.guard(), Guard::Clear, "outside the band reads clear");
     }
 
@@ -1084,7 +1842,7 @@ mod tests {
         // (clearance increasing) is never throttled.
         let q = drive_into_band(&mut g);
         let cand = at(chase(&q.arms, &home(), 0.02));
-        assert_eq!(g.govern(&q, &cand, &q, NO_HANDS, DT), cand);
+        assert_eq!(g.govern_along(&q, &cand, &q, NO_HANDS, NO_PATHS, DT), cand);
     }
 
     #[test]
@@ -1098,12 +1856,9 @@ mod tests {
         let deep = at(wrists_inward(1.5));
         let d0 = distance(&mut g, &deep);
         let floor = d0.min(D_STOP);
-        let clip_only = |g: &mut Governor, from: &GovState, to: &GovState| match g.clip_to_floor(
-            &concat(from),
-            &concat(to),
-            d0,
-            DT,
-        ) {
+        let clip_only = |g: &mut Governor, from: &GovState, to: &GovState| match g
+            .clip_to_floor_along(&concat(from), &concat(to), NO_PATHS, d0, DT)
+        {
             Clip::Clear => *to,
             Clip::Clipped(q) => split(&q),
         };
@@ -1135,7 +1890,7 @@ mod tests {
         // the right exactly where it is.
         let pushed = chase(&q.arms, &wrists_inward(1.5), 0.02);
         let cand = GovState::new(ArmPair::new(pushed.left, q.arms.right), q.grippers);
-        let governed = g.govern(&q, &cand, &q, NO_HANDS, DT);
+        let governed = g.govern_along(&q, &cand, &q, NO_HANDS, NO_PATHS, DT);
         // The held right arm must not be jogged by the barrier's correction.
         assert_eq!(
             governed.arms.right, q.arms.right,
@@ -1171,7 +1926,7 @@ mod tests {
         let tangential: [f64; GOV_DOF] = std::array::from_fn(|i| raw[i] - comp * grad[i]);
         let q16 = concat(&q);
         let cand = split(&std::array::from_fn(|i| q16[i] + tangential[i]));
-        let governed = g.govern(&q, &cand, &q, NO_HANDS, DT);
+        let governed = g.govern_along(&q, &cand, &q, NO_HANDS, NO_PATHS, DT);
         for i in 0..ARM_DOF {
             assert!(
                 (governed.arms.left[i] - cand.arms.left[i]).abs() < 1e-9,
@@ -1244,7 +1999,7 @@ mod tests {
         for _ in 0..250 {
             let prev = q;
             let cand = at(chase(&prev.arms, &target, 0.02));
-            q = g.govern(&prev, &cand, &prev, NO_HANDS, DT);
+            q = g.govern_along(&prev, &cand, &prev, NO_HANDS, NO_PATHS, DT);
             let d = distance(&mut g, &q);
             entered_band |= d < D_SAFE;
             // The exact backstop holds the realized clearance at the floor, so the
@@ -1280,7 +2035,7 @@ mod tests {
             let prev = q;
             let d_prev = distance(&mut g, &prev);
             let cand = at(chase(&prev.arms, &target, 0.25));
-            q = g.govern(&prev, &cand, &prev, NO_HANDS, DT);
+            q = g.govern_along(&prev, &cand, &prev, NO_HANDS, NO_PATHS, DT);
             let d = distance(&mut g, &q);
             // What makes this a fast entry rather than a slower rerun: the tick
             // that crosses d_safe closes faster than the in-band allowance.
@@ -1362,7 +2117,7 @@ mod tests {
                 }
                 let cand = GovState::new(chase(&q.arms, &target, J12_LIMIT_RAD_S * dt), q.grippers);
                 let t0 = Instant::now();
-                q = g.govern(&q, &cand, &q, NO_HANDS, dt);
+                q = g.govern_along(&q, &cand, &q, NO_HANDS, NO_PATHS, dt);
                 times.push(t0.elapsed().as_micros());
             }
             let over = times.iter().filter(|&&t| t as f64 > budget_us).count();
@@ -1488,7 +2243,9 @@ max={} us | over budget {over}/{}",
                 "tick: governor disabled",
                 20000,
                 Box::new(move || {
-                    std::hint::black_box(g.govern(&prev, &cand, &prev, NO_HANDS, DT));
+                    std::hint::black_box(
+                        g.govern_along(&prev, &cand, &prev, NO_HANDS, NO_PATHS, DT),
+                    );
                 }),
             );
         }
@@ -1518,7 +2275,7 @@ max={} us | over budget {over}/{}",
             let mut parked = at(wrists_inward(1.05));
             for _ in 0..250 {
                 let cand = at(chase(&parked.arms, &wrists_inward(1.5), 0.02));
-                parked = g.govern(&parked, &cand, &parked, NO_HANDS, DT);
+                parked = g.govern_along(&parked, &cand, &parked, NO_HANDS, NO_PATHS, DT);
             }
             let mut cand = parked;
             cand.arms.left = chase(&parked.arms, &home(), 0.02).left;
@@ -1527,7 +2284,9 @@ max={} us | over budget {over}/{}",
                 "tick: wall, one side escaping (exemption)",
                 300,
                 Box::new(move || {
-                    std::hint::black_box(g.govern(&parked, &cand, &parked, NO_HANDS, DT));
+                    std::hint::black_box(
+                        g.govern_along(&parked, &cand, &parked, NO_HANDS, NO_PATHS, DT),
+                    );
                 }),
             );
         }
@@ -1537,7 +2296,102 @@ max={} us | over budget {over}/{}",
                 label,
                 500,
                 Box::new(move || {
-                    std::hint::black_box(g.govern(&prev, &cand, &measured, NO_HANDS, DT));
+                    std::hint::black_box(
+                        g.govern_along(&prev, &cand, &measured, NO_HANDS, NO_PATHS, DT),
+                    );
+                }),
+            );
+        }
+
+        // The check of a joint path runs beside the control loop, on the
+        // path checker's own model, and the tick goes on without it. A long
+        // path of both arms, ten times from Home to the wrists folded in
+        // toward each other and back, probes densely where it passes through
+        // the band: the fold is the deepest of the wrists' folds, 0.05 rad
+        // apart, that stays 3 mm clear of the stop.
+        {
+            let mut g = v2_governor(true);
+            let mut checker = g.path_checker();
+            let guard = g.guard_at(closed(home()));
+            let fold = (0..=24)
+                .map(|k| wrists_inward(1.2 - 0.05 * k as f64))
+                .find(|arms| distance(&mut g, &closed(*arms)) > D_STOP + 0.003)
+                .expect("a fold clear of the stop");
+            assert!(
+                distance(&mut g, &closed(fold)) < D_SAFE,
+                "the fold passes through the band"
+            );
+            let waypoints: Vec<ArmPair<JointVec>> = std::iter::once(home())
+                .chain((0..10).flat_map(|_| [fold, home()]))
+                .collect();
+            let path = path_through(&waypoints);
+            let checked = checker.check_path(PathArms::Both, &guard, &path, &NO_STOP);
+            assert!(checked.is_ok(), "the path runs whole: {checked:?}");
+            println!(
+                "TIMING path check: {:.1} rad of path through both arms' joints",
+                path.length()
+            );
+            time_us(
+                "path check: 20 legs of both arms into the band",
+                20,
+                Box::new(move || {
+                    std::hint::black_box(
+                        checker
+                            .check_path(PathArms::Both, &guard, &path, &NO_STOP)
+                            .is_ok(),
+                    );
+                }),
+            );
+        }
+
+        // The judgment of the longest path a goal admits, as the coordinator
+        // judges an execute_joint_path goal before the path plays: the same
+        // legs of both arms into the band and back, as many as the
+        // launcher's joint limits run within 60 s.
+        {
+            use crate::actions::MAX_MOVE_DURATION_S;
+            use crate::planner::{PathPlan, judge_path};
+
+            let mut g = v2_governor(true);
+            let mut checker = g.path_checker();
+            let guard = g.guard_at(closed(home()));
+            let fold = (0..=24)
+                .map(|k| wrists_inward(1.2 - 0.05 * k as f64))
+                .find(|arms| distance(&mut g, &closed(*arms)) > D_STOP + 0.003)
+                .expect("a fold clear of the stop");
+            let arm_velocity = [
+                16.754666, 16.754666, 5.445426, 5.445426, 20.943946, 20.943946, 20.943946,
+            ];
+            let plan_of = |legs: usize| {
+                let waypoints = std::iter::once(home())
+                    .chain((0..legs).map(|leg| if leg % 2 == 0 { fold } else { home() }))
+                    .map(|arms| dual_joints(&arms))
+                    .collect();
+                PathPlan::through(
+                    waypoints,
+                    dual_joints(&ArmPair::new(arm_velocity, arm_velocity)),
+                    [5.0; DUAL_DOF],
+                    std::time::Duration::ZERO,
+                )
+            };
+            let legs = (1..)
+                .take_while(|&legs| plan_of(legs).duration().as_secs_f64() <= MAX_MOVE_DURATION_S)
+                .last()
+                .expect("a leg runs within the ceiling");
+            let plan = plan_of(legs);
+            let judged = judge_path(&plan, PathArms::Both, &guard, &mut checker, &NO_STOP);
+            assert!(judged.is_ok(), "the path runs whole: {judged:?}");
+            println!(
+                "TIMING judge_path: {legs} legs of both arms, {:.1} s at the launcher's limits",
+                plan.duration().as_secs_f64()
+            );
+            time_us(
+                "judge_path: the longest path a goal admits",
+                5,
+                Box::new(move || {
+                    std::hint::black_box(
+                        judge_path(&plan, PathArms::Both, &guard, &mut checker, &NO_STOP).is_ok(),
+                    );
                 }),
             );
         }
@@ -1572,7 +2426,7 @@ max={} us | over budget {over}/{}",
                 }
                 let cand = GovState::new(chase(&q.arms, &target, chase_rad), q.grippers);
                 let t0 = Instant::now();
-                q = g.govern(&q, &cand, &q, NO_HANDS, DT);
+                q = g.govern_along(&q, &cand, &q, NO_HANDS, NO_PATHS, DT);
                 times.push(t0.elapsed().as_micros());
             }
             times.sort_unstable();
@@ -1630,7 +2484,7 @@ max={} us | over budget {over}/{}",
         let mut q = wedge;
         for _ in 0..100 {
             let cand = GovState::new(chase(&q.arms, &tucked, 0.02), q.grippers);
-            q = g.govern(&q, &cand, &q, NO_HANDS, DT);
+            q = g.govern_along(&q, &cand, &q, NO_HANDS, NO_PATHS, DT);
             let d = distance(&mut g, &q);
             assert!(
                 d >= d0.min(D_STOP) - 1e-9,
@@ -1646,7 +2500,7 @@ max={} us | over budget {over}/{}",
                 q.arms,
                 ArmPair::from_fn(|side| rate_limited(q.grippers[side], 0.0, rate, DT)),
             );
-            q = g.govern(&q, &cand, &q, NO_HANDS, DT);
+            q = g.govern_along(&q, &cand, &q, NO_HANDS, NO_PATHS, DT);
         }
         let grippers_closed = distance(&mut g, &q);
         assert!(
@@ -1665,7 +2519,7 @@ max={} us | over budget {over}/{}",
         );
         for _ in 0..300 {
             let cand = GovState::new(chase(&q.arms, &outward, 0.02), q.grippers);
-            q = g.govern(&q, &cand, &q, NO_HANDS, DT);
+            q = g.govern_along(&q, &cand, &q, NO_HANDS, NO_PATHS, DT);
         }
         let out = distance(&mut g, &q);
         assert!(
@@ -1719,7 +2573,7 @@ max={} us | over budget {over}/{}",
                         rate_limited(prev.grippers[side], target.grippers[side], rate, DT)
                     }),
                 );
-                q = g.govern(&prev, &cand, &prev, NO_HANDS, DT);
+                q = g.govern_along(&prev, &cand, &prev, NO_HANDS, NO_PATHS, DT);
                 if d_prev >= D_SAFE {
                     continue;
                 }
@@ -1807,7 +2661,7 @@ max={} us | over budget {over}/{}",
                 q.arms,
                 ArmPair::from_fn(|side| rate_limited(q.grippers[side], 0.0, rate, DT)),
             );
-            q = g.govern(&q, &cand, &q, NO_HANDS, DT);
+            q = g.govern_along(&q, &cand, &q, NO_HANDS, NO_PATHS, DT);
         }
         assert!(
             distance(&mut g, &q) > 0.0,
@@ -1821,7 +2675,7 @@ max={} us | over budget {over}/{}",
         out.right[1] = 0.6;
         for _ in 0..200 {
             let cand = GovState::new(chase(&q.arms, &out, 0.02), q.grippers);
-            q = g.govern(&q, &cand, &q, NO_HANDS, DT);
+            q = g.govern_along(&q, &cand, &q, NO_HANDS, NO_PATHS, DT);
         }
         assert!(
             distance(&mut g, &q) > 0.0,
@@ -1845,7 +2699,7 @@ max={} us | over budget {over}/{}",
             distance(&mut g, &deep) < D_STOP,
             "target should be past the stop floor"
         );
-        let governed = g.govern(&start, &deep, &start, NO_HANDS, DT);
+        let governed = g.govern_along(&start, &deep, &start, NO_HANDS, NO_PATHS, DT);
         assert_ne!(governed, deep, "oversized step passed unfloored");
         assert!(
             distance(&mut g, &governed) >= D_STOP,
@@ -1860,14 +2714,17 @@ max={} us | over budget {over}/{}",
         let cand = at(wrists_inward(0.4));
         for dt in [0.0, -0.01, f64::NAN, f64::INFINITY] {
             assert_eq!(
-                g.govern(&prev, &cand, &prev, NO_HANDS, dt),
+                g.govern_along(&prev, &cand, &prev, NO_HANDS, NO_PATHS, dt),
                 prev,
                 "dt={dt} must hold"
             );
             assert_eq!(g.guard(), Guard::Stopped);
         }
         // A valid tick immediately after is unaffected.
-        assert_eq!(g.govern(&prev, &cand, &prev, NO_HANDS, DT), cand);
+        assert_eq!(
+            g.govern_along(&prev, &cand, &prev, NO_HANDS, NO_PATHS, DT),
+            cand
+        );
     }
 
     #[test]
@@ -1877,15 +2734,24 @@ max={} us | over budget {over}/{}",
         let mut bad = at(wrists_inward(0.2));
         bad.arms.left[0] = f64::NAN;
         // Enabled: the up-front guard holds prev rather than steering on NaN.
-        assert_eq!(g.govern(&prev, &bad, &prev, NO_HANDS, DT), prev);
+        assert_eq!(
+            g.govern_along(&prev, &bad, &prev, NO_HANDS, NO_PATHS, DT),
+            prev
+        );
         assert_eq!(g.guard(), Guard::Stopped, "a fault hold reads stopped");
         // A non-finite OPENING is the same class of upstream glitch.
         let mut bad_opening = at(wrists_inward(0.2));
         bad_opening.grippers.left = f64::NAN;
-        assert_eq!(g.govern(&prev, &bad_opening, &prev, NO_HANDS, DT), prev);
+        assert_eq!(
+            g.govern_along(&prev, &bad_opening, &prev, NO_HANDS, NO_PATHS, DT),
+            prev
+        );
         // Disabled fast path: still never passes a non-finite candidate through.
         g.set_enabled(false);
-        assert_eq!(g.govern(&prev, &bad, &prev, NO_HANDS, DT), prev);
+        assert_eq!(
+            g.govern_along(&prev, &bad, &prev, NO_HANDS, NO_PATHS, DT),
+            prev
+        );
     }
 
     #[test]
@@ -1898,14 +2764,20 @@ max={} us | over budget {over}/{}",
             distance(&mut g, &near) < D_SAFE,
             "near pose should be in the band"
         );
-        assert_ne!(g.govern(&near, &closer, &near, NO_HANDS, DT), closer);
+        assert_ne!(
+            g.govern_along(&near, &closer, &near, NO_HANDS, NO_PATHS, DT),
+            closer
+        );
         assert_ne!(
             g.guard(),
             Guard::Clear,
             "a limited step must read restricted"
         );
         g.set_enabled(false);
-        assert_eq!(g.govern(&near, &closer, &near, NO_HANDS, DT), closer);
+        assert_eq!(
+            g.govern_along(&near, &closer, &near, NO_HANDS, NO_PATHS, DT),
+            closer
+        );
         assert_eq!(g.guard(), Guard::Clear, "disabling resets the readout");
     }
 
@@ -2022,7 +2894,7 @@ max={} us | over budget {over}/{}",
             distance(&mut g, &retreat) > distance(&mut g, &measured),
             "retreat opens the gap"
         );
-        let governed = g.govern(&prev, &retreat, &measured, NO_HANDS, DT);
+        let governed = g.govern_along(&prev, &retreat, &measured, NO_HANDS, NO_PATHS, DT);
         assert_ne!(
             governed, prev,
             "separation was blocked while the monitor was tripped"
@@ -2083,7 +2955,14 @@ max={} us | over budget {over}/{}",
             let mut commanded = q.arms;
             commanded[pushing] = pushed;
             commanded[retreating] = pulled;
-            let governed = g.govern(&q, &GovState::new(commanded, q.grippers), &q, NO_HANDS, DT);
+            let governed = g.govern_along(
+                &q,
+                &GovState::new(commanded, q.grippers),
+                &q,
+                NO_HANDS,
+                NO_PATHS,
+                DT,
+            );
             assert!(
                 distance(&mut g, &governed) >= D_STOP - 1e-6,
                 "the governed step breached the stop floor, {retreating} arm retreating"
@@ -2156,7 +3035,7 @@ max={} us | over budget {over}/{}",
         }
         let cand = found.expect("setup: some push/pull pair produces the mixed case");
 
-        let governed = g.govern(&prev, &cand, &measured, NO_HANDS, DT);
+        let governed = g.govern_along(&prev, &cand, &measured, NO_HANDS, NO_PATHS, DT);
         assert_eq!(
             governed.arms.left, prev.arms.left,
             "the pushing arm must be held"
@@ -2197,7 +3076,7 @@ max={} us | over budget {over}/{}",
             "deep is a closing command"
         );
         assert_eq!(
-            g.govern(&prev, &deep, &measured, NO_HANDS, DT),
+            g.govern_along(&prev, &deep, &measured, NO_HANDS, NO_PATHS, DT),
             prev,
             "a closing command was not held on a measured breach"
         );
@@ -2226,7 +3105,7 @@ max={} us | over budget {over}/{}",
             "setup: the candidate closes on the held setpoint"
         );
         assert_eq!(
-            g.govern(&prev, &cand, &measured, NO_HANDS, DT),
+            g.govern_along(&prev, &cand, &measured, NO_HANDS, NO_PATHS, DT),
             prev,
             "a closing command passed the tripped monitor under a tracking offset"
         );
@@ -2238,7 +3117,7 @@ max={} us | over budget {over}/{}",
             "setup: the retreat opens on the held setpoint"
         );
         assert_ne!(
-            g.govern(&prev, &retreat, &measured, NO_HANDS, DT),
+            g.govern_along(&prev, &retreat, &measured, NO_HANDS, NO_PATHS, DT),
             prev,
             "a separating command was frozen by the cross-space baseline"
         );
@@ -2256,7 +3135,7 @@ max={} us | over budget {over}/{}",
             "precondition: home sits outside the band"
         );
         assert_eq!(
-            g.govern(&prev, &cand, &prev, NO_HANDS, DT),
+            g.govern_along(&prev, &cand, &prev, NO_HANDS, NO_PATHS, DT),
             cand,
             "monitor tripped under good tracking"
         );
@@ -2292,20 +3171,20 @@ max={} us | over budget {over}/{}",
 
         // Breach trips the latch: the closing command is held at prev.
         assert_eq!(
-            g.govern(&prev, &deep, &breaching, NO_HANDS, DT),
+            g.govern_along(&prev, &deep, &breaching, NO_HANDS, NO_PATHS, DT),
             prev,
             "closing command not held on a breach"
         );
         // In-band measurement (above the trip floor, below d_stop): still held (hysteresis).
         assert_eq!(
-            g.govern(&prev, &deep, &in_band, NO_HANDS, DT),
+            g.govern_along(&prev, &deep, &in_band, NO_HANDS, NO_PATHS, DT),
             prev,
             "released before recovering past d_stop"
         );
         // Recovered past d_stop: the latch releases, so the command is governed
         // normally (clipped toward the floor), not force-held at prev.
         assert_ne!(
-            g.govern(&prev, &deep, &at(home()), NO_HANDS, DT),
+            g.govern_along(&prev, &deep, &at(home()), NO_HANDS, NO_PATHS, DT),
             prev,
             "did not release after recovery"
         );
@@ -2314,7 +3193,7 @@ max={} us | over budget {over}/{}",
         // from the untripped threshold and not re-hold. A latch stuck set would
         // force-hold here forever.
         assert_ne!(
-            g.govern(&prev, &deep, &in_band, NO_HANDS, DT),
+            g.govern_along(&prev, &deep, &in_band, NO_HANDS, NO_PATHS, DT),
             prev,
             "the latch did not clear on recovery"
         );
@@ -2327,7 +3206,10 @@ max={} us | over budget {over}/{}",
         // measured arms breach the floor.
         let cand = at(wrists_inward(0.2));
         let breaching = at(wrists_inward(2.0));
-        assert_eq!(g.govern(&at(home()), &cand, &breaching, NO_HANDS, DT), cand);
+        assert_eq!(
+            g.govern_along(&at(home()), &cand, &breaching, NO_HANDS, NO_PATHS, DT),
+            cand
+        );
     }
 
     #[test]
@@ -2341,7 +3223,7 @@ max={} us | over budget {over}/{}",
         let mut measured = at(home());
         measured.arms.left[0] = f64::NAN;
         assert_eq!(
-            g.govern(&prev, &cand, &measured, NO_HANDS, DT),
+            g.govern_along(&prev, &cand, &measured, NO_HANDS, NO_PATHS, DT),
             cand,
             "monitor blocked a command on a failed measured query"
         );
@@ -2365,7 +3247,7 @@ max={} us | over budget {over}/{}",
             "setup: in_band not in the hysteresis band"
         );
         assert_ne!(
-            g.govern(&at(home()), &deep, &in_band, NO_HANDS, DT),
+            g.govern_along(&at(home()), &deep, &in_band, NO_HANDS, NO_PATHS, DT),
             at(home()),
             "an in-band measurement tripped from a clear state"
         );
@@ -2394,7 +3276,7 @@ max={} us | over budget {over}/{}",
 
         // One velocity-limited tick toward home must not be frozen.
         let one = at(chase(&trapped.arms, &home(), 0.02));
-        let governed = g.govern(&trapped, &one, &trapped, NO_HANDS, DT);
+        let governed = g.govern_along(&trapped, &one, &trapped, NO_HANDS, NO_PATHS, DT);
         assert_ne!(
             governed, trapped,
             "escape frozen: a penetrated arm must never be trapped by the governor"
@@ -2406,7 +3288,7 @@ max={} us | over budget {over}/{}",
         for _ in 0..400 {
             let before = distance(&mut g, &state);
             let cand = GovState::new(chase(&state.arms, &home(), 0.02), state.grippers);
-            state = g.govern(&state, &cand, &state, NO_HANDS, DT);
+            state = g.govern_along(&state, &cand, &state, NO_HANDS, NO_PATHS, DT);
             let after = distance(&mut g, &state);
             assert!(
                 after >= before - budget,
@@ -2492,7 +3374,7 @@ max={} us | over budget {over}/{}",
 
         // Trusting the (clear) endpoints would pass `cand` through; the segment scan
         // must clip it to a setpoint that is itself clear of the stop.
-        let governed = g.govern(&prev, &cand, &prev, NO_HANDS, DT);
+        let governed = g.govern_along(&prev, &cand, &prev, NO_HANDS, NO_PATHS, DT);
         assert_ne!(
             governed, cand,
             "a clear-ended segment with a sub-stop interior was passed unclipped"
@@ -2533,7 +3415,7 @@ max={} us | over budget {over}/{}",
                 chase(&s.arms, &target.arms, 0.02),
                 ArmPair::from_fn(|side| chase_frac(s.grippers[side], target.grippers[side])),
             );
-            s = g.govern(&s, &cand, &s, NO_HANDS, DT);
+            s = g.govern_along(&s, &cand, &s, NO_HANDS, NO_PATHS, DT);
             let d = distance(g, &s);
             assert!(d >= D_STOP - 1e-9, "floor breached mid-drive: d={d:+.6}");
         }
@@ -2693,13 +3575,13 @@ max={} us | over budget {over}/{}",
             "setup: at this pose opening must deepen and closing must recover"
         );
         // Opening further is fully frozen (the floor is the current clearance).
-        let held = g.govern(&stuck, &deeper, &stuck, NO_HANDS, DT);
+        let held = g.govern_along(&stuck, &deeper, &stuck, NO_HANDS, NO_PATHS, DT);
         assert!(
             distance(&mut g, &held) >= d_stuck - 1e-9,
             "an opening below the floor deepened the breach"
         );
         // Closing recovers: the escape passes and clearance increases.
-        let governed = g.govern(&stuck, &closing, &stuck, NO_HANDS, DT);
+        let governed = g.govern_along(&stuck, &closing, &stuck, NO_HANDS, NO_PATHS, DT);
         assert_eq!(governed, closing, "the closing escape was throttled");
         assert!(
             distance(&mut g, &governed) > d_stuck,
@@ -2723,7 +3605,7 @@ max={} us | over budget {over}/{}",
             let mut cand = prev;
             cand.arms.left[0] += 0.1;
             cand.arms.right[0] += 0.1;
-            let governed = g.govern(&prev, &cand, &prev, &hands, DT);
+            let governed = g.govern_along(&prev, &cand, &prev, &hands, NO_PATHS, DT);
             let expected = prev.arms.left[0] + TEST_EE_CAP_M_S * DT;
             assert!(
                 (governed.arms.left[0] - expected).abs() < 1e-12,
@@ -2755,13 +3637,15 @@ max={} us | over budget {over}/{}",
         let prev = GovState::new(arms, ArmPair::new(0.0, 0.0));
         let open = GovState::new(arms, ArmPair::new(legal_step, 0.0));
         assert_eq!(
-            g.govern(&prev, &open, &prev, NO_HANDS, DT),
+            g.govern_along(&prev, &open, &prev, NO_HANDS, NO_PATHS, DT),
             open,
             "disabled governor throttled a rate-legal colliding opening"
         );
         let jump = GovState::new(arms, ArmPair::new(1.0, 0.0));
         assert_eq!(
-            g.govern(&prev, &jump, &prev, NO_HANDS, DT).grippers.left,
+            g.govern_along(&prev, &jump, &prev, NO_HANDS, NO_PATHS, DT)
+                .grippers
+                .left,
             legal_step,
             "an over-rate jump is rate-limited even while disabled"
         );
@@ -2792,7 +3676,7 @@ max={} us | over budget {over}/{}",
             "setup: opening closes the gap"
         );
         assert_eq!(
-            g.govern(&prev, &open_more, &measured, NO_HANDS, DT),
+            g.govern_along(&prev, &open_more, &measured, NO_HANDS, NO_PATHS, DT),
             prev,
             "the monitor passed an opening during a measured finger breach"
         );
@@ -2800,7 +3684,7 @@ max={} us | over budget {over}/{}",
         // Closing (separation) still passes: the operator is never trapped.
         let close = GovState::new(arms, ArmPair::new(0.1 - gripper_step, 0.0));
         assert_ne!(
-            g.govern(&prev, &close, &measured, NO_HANDS, DT),
+            g.govern_along(&prev, &close, &measured, NO_HANDS, NO_PATHS, DT),
             prev,
             "the monitor froze the closing escape"
         );

@@ -58,7 +58,9 @@ fn pose_tolerance_from_wire(
 
 /// Parse the per-joint settle tolerances off the wire, one per joint in the
 /// arm's joint order: each a positive finite number, or the refusal.
-fn joint_tolerances_from_wire(tolerances: JointVec) -> std::result::Result<JointVec, String> {
+pub(super) fn joint_tolerances_from_wire(
+    tolerances: JointVec,
+) -> std::result::Result<JointVec, String> {
     if tolerances.iter().all(|&v| PositiveFinite::parse(v).is_ok()) {
         return Ok(tolerances);
     }
@@ -93,7 +95,13 @@ fn arm_move_request(
 }
 
 fn target_in_limits(q: &JointVec, limits: &[Limit; ARM_DOF]) -> bool {
-    q.iter().zip(limits).all(|(&v, l)| v >= l.lo && v <= l.hi)
+    joint_outside_limits(q, limits).is_none()
+}
+
+/// The joint, counted from 0, whose position in `q` lies outside `limits`,
+/// if any.
+pub(super) fn joint_outside_limits(q: &JointVec, limits: &[Limit; ARM_DOF]) -> Option<usize> {
+    (0..ARM_DOF).find(|&j| !(limits[j].lo..=limits[j].hi).contains(&q[j]))
 }
 
 /// A `move_arm` goal parsed off the wire: the move to plan, and the settle it

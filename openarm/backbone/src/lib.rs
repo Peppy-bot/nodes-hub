@@ -25,6 +25,7 @@ mod gripper_move;
 mod liveness;
 mod move_slot;
 mod node;
+mod path_checks;
 mod planner;
 mod publish;
 mod settle;

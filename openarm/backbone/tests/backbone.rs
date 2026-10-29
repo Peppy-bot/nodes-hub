@@ -23,6 +23,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
+use peppygen::exposed_actions::limb_motion::execute_joint_path::{
+    GoalArmsItem, GoalArmsItemWaypointsItem,
+};
+use peppygen::fixtures::exposed_actions::limb_motion::execute_joint_path;
 use peppygen::fixtures::exposed_actions::limb_motion::{move_arm_joints, move_gripper};
 use peppygen::fixtures::harness::{Config, Harness};
 use peppygen::mock::deps::perception_geometry::{get_color_intrinsics, get_depth_intrinsics};
@@ -164,14 +168,34 @@ fn leader_command(
     }
 }
 
-/// The left arm played by [`spawn_left_arm_follower`]: the latest position
-/// it adopted, and its brake.
+/// An arm played by [`spawn_arm_follower`]: the latest position it adopted,
+/// every setpoint it received, in order, and its brake.
 struct ArmFollower {
     followed: watch::Receiver<[f64; 7]>,
+    received: Arc<Mutex<Vec<[f64; 7]>>>,
     brake: mpsc::Sender<oneshot::Sender<[f64; 7]>>,
 }
 
 impl ArmFollower {
+    /// Every setpoint the arm received so far.
+    fn received(&self) -> Vec<[f64; 7]> {
+        self.received
+            .lock()
+            .expect("no panic while recording")
+            .clone()
+    }
+
+    /// Wait until the arm adopts its first setpoint: the backbone streams to
+    /// an arm only while its follower delivers fresh states, so a goal sent
+    /// then finds the arm's measurement fresh.
+    async fn first_setpoint(&self) {
+        let mut followed = self.followed.clone();
+        tokio::time::timeout(DEADLINE, followed.changed())
+            .await
+            .expect("the backbone never streamed to the arm")
+            .expect("the follower runs");
+    }
+
     /// Stop the arm where it stands: from now on it adopts no setpoint and
     /// publishes the position this returns.
     async fn brake(&self) -> [f64; 7] {
@@ -184,58 +208,121 @@ impl ArmFollower {
     }
 }
 
-/// Plays the left arm as a perfect follower, starting at [`HOME`]:
-/// - it publishes its measured state every [`STATE_PUMP_PERIOD`] on
-///   `states`;
+/// Plays an arm as a follower that stands `$standing_error` off each
+/// setpoint, as a servo held against gravity stands off its command,
+/// starting at [`HOME`]:
+/// - it publishes its measured state, a `$message`, every
+///   [`STATE_PUMP_PERIOD`] on `$states`;
 /// - it adopts each governed setpoint that the node streams down
-///   `setpoints` as the new measurement, until the test brakes it.
+///   `$setpoints`, plus the standing error, as the new measurement, until
+///   the test brakes it.
 ///
-/// Its `followed` watch carries the latest adopted position. Thus a test can
-/// assert what motion the arm mock observed.
-fn spawn_left_arm_follower(
-    states: peppygen::mock::pairings::left_arm::joint_states::Publisher,
-    mut setpoints: peppygen::mock::pairings::left_arm::joint_setpoints::Subscription,
-) -> ArmFollower {
-    let (tx, followed) = watch::channel(HOME);
-    let (brake, mut brakes) = mpsc::channel::<oneshot::Sender<[f64; 7]>>(1);
-    tokio::spawn(async move {
-        if !matches!(states.wait_for_subscriber(PUMP_TIMEOUT).await, Ok(true)) {
-            return;
-        }
-        let mut positions = HOME;
-        let mut braked = false;
-        let mut ticker = tokio::time::interval(STATE_PUMP_PERIOD);
-        loop {
-            tokio::select! {
-                _ = ticker.tick() => {
-                    let message = peppygen::paired_topics::left_arm::joint_states::Message {
-                        timestamp: SystemTime::now(),
-                        positions: positions.to_vec(),
-                        velocities: vec![0.0; 7],
-                        efforts: Vec::new(),
-                    };
-                    if states.publish(&message).await.is_err() {
-                        return;
-                    }
-                }
-                received = setpoints.next() => match received {
-                    Ok(Some(m)) if !braked && m.positions.len() == 7 => {
-                        for (slot, v) in positions.iter_mut().zip(&m.positions) {
-                            *slot = *v;
+/// Its `followed` watch carries the latest adopted position, and `received`
+/// every setpoint in order. Thus a test can assert what motion the arm mock
+/// observed.
+macro_rules! spawn_arm_follower {
+    ($states:expr, $setpoints:expr, $message:path, $standing_error:expr) => {{
+        let states = $states;
+        let mut setpoints = $setpoints;
+        let standing_error: [f64; 7] = $standing_error;
+        let (tx, followed) = watch::channel(HOME);
+        let (brake, mut brakes) = mpsc::channel::<oneshot::Sender<[f64; 7]>>(1);
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let record = received.clone();
+        tokio::spawn(async move {
+            if !matches!(states.wait_for_subscriber(PUMP_TIMEOUT).await, Ok(true)) {
+                return;
+            }
+            let mut positions = HOME;
+            let mut braked = false;
+            let mut ticker = tokio::time::interval(STATE_PUMP_PERIOD);
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        use $message as message;
+                        let state = message::Message {
+                            timestamp: SystemTime::now(),
+                            positions: positions.to_vec(),
+                            velocities: vec![0.0; 7],
+                            efforts: Vec::new(),
+                        };
+                        if states.publish(&state).await.is_err() {
+                            return;
                         }
-                        tx.send_replace(positions);
                     }
-                    Ok(Some(_)) | Err(_) => {}
-                    Ok(None) => return,
-                },
-                Some(reply) = brakes.recv(), if !braked => {
-                    braked = true;
-                    let _ = reply.send(positions);
+                    received = setpoints.next() => match received {
+                        Ok(Some(m)) if !braked && m.positions.len() == 7 => {
+                            let setpoint: [f64; 7] =
+                                m.positions.try_into().expect("seven joint positions");
+                            positions = std::array::from_fn(|i| setpoint[i] + standing_error[i]);
+                            record.lock().expect("no panic while recording").push(setpoint);
+                            tx.send_replace(positions);
+                        }
+                        Ok(Some(_)) | Err(_) => {}
+                        Ok(None) => return,
+                    },
+                    Some(reply) = brakes.recv(), if !braked => {
+                        braked = true;
+                        let _ = reply.send(positions);
+                    }
                 }
             }
+        });
+        ArmFollower {
+            followed,
+            received,
+            brake,
         }
-    });
-    ArmFollower { followed, brake }
+    }};
+}
+
+/// The standing error of a perfect follower: it stands at each setpoint.
+const NO_STANDING_ERROR: [f64; 7] = [0.0; 7];
+
+/// Plays the left arm as a perfect follower ([`spawn_arm_follower`]).
+fn spawn_left_arm_follower(
+    states: peppygen::mock::pairings::left_arm::joint_states::Publisher,
+    setpoints: peppygen::mock::pairings::left_arm::joint_setpoints::Subscription,
+) -> ArmFollower {
+    spawn_left_arm_follower_off_by(states, setpoints, NO_STANDING_ERROR)
+}
+
+/// Plays the left arm as a follower that stands `standing_error` off each
+/// setpoint ([`spawn_arm_follower`]).
+fn spawn_left_arm_follower_off_by(
+    states: peppygen::mock::pairings::left_arm::joint_states::Publisher,
+    setpoints: peppygen::mock::pairings::left_arm::joint_setpoints::Subscription,
+    standing_error: [f64; 7],
+) -> ArmFollower {
+    spawn_arm_follower!(
+        states,
+        setpoints,
+        peppygen::paired_topics::left_arm::joint_states,
+        standing_error
+    )
+}
+
+/// Plays the right arm as a perfect follower ([`spawn_arm_follower`]).
+fn spawn_right_arm_follower(
+    states: peppygen::mock::pairings::right_arm::joint_states::Publisher,
+    setpoints: peppygen::mock::pairings::right_arm::joint_setpoints::Subscription,
+) -> ArmFollower {
+    spawn_right_arm_follower_off_by(states, setpoints, NO_STANDING_ERROR)
+}
+
+/// Plays the right arm as a follower that stands `standing_error` off each
+/// setpoint ([`spawn_arm_follower`]).
+fn spawn_right_arm_follower_off_by(
+    states: peppygen::mock::pairings::right_arm::joint_states::Publisher,
+    setpoints: peppygen::mock::pairings::right_arm::joint_setpoints::Subscription,
+    standing_error: [f64; 7],
+) -> ArmFollower {
+    spawn_arm_follower!(
+        states,
+        setpoints,
+        peppygen::paired_topics::right_arm::joint_states,
+        standing_error
+    )
 }
 
 /// Jaw travel (opening fraction) the lagging gripper follower covers per
@@ -2361,6 +2448,1269 @@ async fn a_linked_camera_without_its_colour_intrinsics_is_refused_with_its_reaso
             "cannot read the colour intrinsics of the chest camera, the perception camera: \
              no camera geometry has been received from the simulation"
         )
+    );
+    harness.shutdown().await
+}
+
+/// Static aperture pump for one gripper follower, standing at `$opening`.
+macro_rules! pump_gripper_at {
+    ($publisher:expr, $message:path, $opening:expr) => {
+        pump_states!($publisher, || {
+            use $message as message;
+            message::Message {
+                timestamp: SystemTime::now(),
+                opening: $opening,
+                effort: 0.0,
+                max_effort: 1.0,
+            }
+        })
+    };
+}
+
+/// One arm of an `execute_joint_path` goal: `arm_name` through `waypoints`,
+/// with no expected start and these tests' settle tolerance on every joint.
+fn path_arm(arm_name: &str, waypoints: &[[f64; 7]]) -> GoalArmsItem {
+    GoalArmsItem {
+        arm_name: arm_name.to_string(),
+        waypoints: waypoints
+            .iter()
+            .map(|&joint_positions| GoalArmsItemWaypointsItem { joint_positions })
+            .collect(),
+        expected_start_joint_positions: Vec::new(),
+        settle_tolerances_rad: [SETTLE_TOLERANCE_RAD; 7],
+    }
+}
+
+/// An `execute_joint_path` goal of `arms`, in that order, over `duration_s`,
+/// with these tests' settle timeout.
+fn joint_path(arms: Vec<GoalArmsItem>, duration_s: f64) -> execute_joint_path::GoalRequestData {
+    execute_joint_path::GoalRequestData {
+        arms,
+        duration_s,
+        settle_timeout_s: SETTLE_TIMEOUT_S,
+    }
+}
+
+/// An `execute_joint_path` goal of the left arm through `waypoints` over
+/// `duration_s` (see [`joint_path`]).
+fn left_joint_path(waypoints: &[[f64; 7]], duration_s: f64) -> execute_joint_path::GoalRequestData {
+    joint_path(vec![path_arm("left_arm", waypoints)], duration_s)
+}
+
+/// Send `goal` and give the node's answer to it.
+async fn send_path_goal(
+    harness: &Harness,
+    goal: &execute_joint_path::GoalRequestData,
+) -> peppygen::Result<execute_joint_path::GoalHandle> {
+    execute_joint_path::send_goal(harness, goal, peppygen::DEFAULT_FEEDBACK_BOUND, DEADLINE).await
+}
+
+/// Send `goal` and assert that the node accepts it.
+async fn send_joint_path(
+    harness: &Harness,
+    goal: &execute_joint_path::GoalRequestData,
+) -> peppygen::Result<execute_joint_path::GoalHandle> {
+    let sent = send_path_goal(harness, goal).await?;
+    assert!(sent.accepted, "goal refused: {:?}", sent.refusal);
+    Ok(sent)
+}
+
+/// Send `goal`, assert that the node accepts it, and wait for how it ends.
+async fn run_joint_path(
+    harness: &Harness,
+    goal: &execute_joint_path::GoalRequestData,
+) -> peppygen::Result<execute_joint_path::ResultOutcome> {
+    let sent = send_joint_path(harness, goal).await?;
+    Ok(sent.get_result(DEADLINE).await?.outcome)
+}
+
+/// Send `goal`, and assert that it completes: the result it completes with.
+async fn complete_joint_path(
+    harness: &Harness,
+    goal: &execute_joint_path::GoalRequestData,
+) -> peppygen::Result<execute_joint_path::ResultData> {
+    match run_joint_path(harness, goal).await? {
+        execute_joint_path::ResultOutcome::Completed(data) => Ok(data),
+        other => panic!("execute_joint_path did not complete: {other:?}"),
+    }
+}
+
+/// Send `goal`, and assert that it fails: the failure it fails with.
+async fn fail_joint_path(
+    harness: &Harness,
+    goal: &execute_joint_path::GoalRequestData,
+) -> peppygen::Result<execute_joint_path::Failure> {
+    match run_joint_path(harness, goal).await? {
+        execute_joint_path::ResultOutcome::Failed(failure) => Ok(failure),
+        other => panic!("execute_joint_path did not fail: {other:?}"),
+    }
+}
+
+/// A move_arm_joints goal on an arm that executes another move is refused
+/// with `precondition_failed` in the words of a busy arm, which name no side:
+/// the goal names its one arm itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_move_arm_joints_goal_on_a_busy_arm_is_refused_in_the_words_of_a_busy_arm()
+-> peppygen::Result<()> {
+    let (harness, _arm) = start_with_left_arm().await?;
+    let goal = move_arm_joints::GoalRequestData {
+        arm_name: "left_arm".to_string(),
+        joint_positions: [0.0, -0.8, 0.0, 1.2, 0.0, 0.0, 0.0],
+        duration_s: 30.0,
+        settle_tolerances_rad: [SETTLE_TOLERANCE_RAD; 7],
+        settle_timeout_s: SETTLE_TIMEOUT_S,
+    };
+    let send =
+        || move_arm_joints::send_goal(&harness, &goal, peppygen::DEFAULT_FEEDBACK_BOUND, DEADLINE);
+    let running = send().await?;
+    assert!(running.accepted, "goal refused: {:?}", running.refusal);
+    let refused = send().await?;
+    assert_eq!(
+        refused.refusal,
+        Some(move_arm_joints::Failure::new(
+            move_arm_joints::FailureKind::PreconditionFailed,
+            "arm is already executing a motion"
+        ))
+    );
+    running.cancel_goal(DEADLINE).await?;
+    assert!(matches!(
+        running.get_result(DEADLINE).await?.outcome,
+        move_arm_joints::ResultOutcome::Cancelled { .. }
+    ));
+    harness.shutdown().await
+}
+
+/// A joint path whose arm stops short of its last waypoint fails with
+/// `timeout` when the settle timeout runs out after the planned end, naming
+/// the joint farthest from its target, and gives no result. Here the arm is
+/// braked at HOME before the path starts, so it never moves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_joint_path_whose_arm_stops_short_fails_its_settle_with_timeout() -> peppygen::Result<()>
+{
+    let (harness, mocks) = start_ready_vacant(params()).await?;
+    pump_is_ready(
+        mocks.deps.robot_init.is_ready,
+        Arc::new(AtomicBool::new(true)),
+    );
+    let arm = spawn_left_arm_follower(
+        mocks.pairings.left_arm.joint_states,
+        mocks.pairings.left_arm.joint_setpoints,
+    );
+    pump_right_arm_and_grippers!(mocks);
+    await_streaming(mocks.pairings.right_arm.joint_setpoints).await?;
+    assert_eq!(arm.brake().await, HOME);
+
+    let mut out = HOME;
+    out[2] = 0.3;
+    out[3] = 0.4;
+    let failure = fail_joint_path(&harness, &left_joint_path(&[out], 1.0)).await?;
+    assert_eq!(failure.kind, execute_joint_path::FailureKind::Timeout);
+    assert!(
+        failure.message.starts_with("still ")
+            && failure
+                .message
+                .contains(" rad from the target at joint 4, "),
+        "the failure names the joint farthest from its target: {}",
+        failure.message
+    );
+    assert!(
+        seconds_after_planned_end(&failure.message) >= SETTLE_TIMEOUT_S,
+        "the failure came no sooner than the settle timeout: {}",
+        failure.message
+    );
+    harness.shutdown().await
+}
+
+// --- Joint paths (execute_joint_path) -------------------------------------
+
+/// How far a commanded position may stand from the rounded path (rad), in
+/// the path tests: a tick the guard slows lands on the chord between two
+/// points of the path, a fraction of a milliradian off the arc it cuts.
+const ON_PATH_RAD: f64 = 1e-3;
+
+/// How far apart the points stand that the path tests draw a rounded path
+/// with (rad): close enough that the polyline through them lies within a
+/// micro-radian of the arcs.
+const PATH_SPACING_RAD: f64 = 1e-3;
+
+/// Five waypoints of the left arm out from [`HOME`] to the working posture
+/// and back toward it, every corner turning, clear of the robot's body.
+const FIVE_WAYPOINTS: [[f64; 7]; 5] = [
+    [0.0, -0.3, 0.0, 0.6, 0.0, 0.0, 0.0],
+    [0.3, -0.5, 0.0, 0.9, 0.0, 0.0, 0.0],
+    [0.2, -0.8, 0.2, 1.2, 0.0, 0.0, 0.0],
+    [0.0, -0.8, 0.0, 1.2, 0.0, 0.0, 0.0],
+    [0.0, -0.5, 0.0, 0.9, 0.0, 0.0, 0.0],
+];
+
+fn distance_between(a: &[f64], b: &[f64]) -> f64 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y) * (x - y))
+        .sum::<f64>()
+        .sqrt()
+}
+
+/// The distance in joint space from `q` to the nearest of the straight
+/// segments between consecutive `points`.
+fn distance_to_segments(q: &[f64], points: &[Vec<f64>]) -> f64 {
+    points
+        .windows(2)
+        .map(|w| {
+            let run: Vec<f64> = w[1].iter().zip(&w[0]).map(|(b, a)| b - a).collect();
+            let length_sq: f64 = run.iter().map(|r| r * r).sum();
+            let along = q
+                .iter()
+                .zip(&w[0])
+                .zip(&run)
+                .map(|((q, a), r)| (q - a) * r)
+                .sum::<f64>();
+            let t = if length_sq > 0.0 {
+                (along / length_sq).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let nearest: Vec<f64> = w[0].iter().zip(&run).map(|(a, r)| a + t * r).collect();
+            distance_between(q, &nearest)
+        })
+        .fold(f64::INFINITY, f64::min)
+}
+
+/// The rounded path a joint path takes from `start` through `waypoints`,
+/// drawn as points [`PATH_SPACING_RAD`] apart along it.
+fn rounded_path(start: &[f64], waypoints: &[Vec<f64>]) -> Vec<Vec<f64>> {
+    use control_core::path_timing::RoundedPath;
+    use control_core::positive_finite::PositiveFinite;
+    let points: Vec<Vec<f64>> = std::iter::once(start.to_vec())
+        .chain(waypoints.iter().cloned())
+        .collect();
+    let path = RoundedPath::joint_path(&points);
+    path.arcs_every(PositiveFinite::parse(PATH_SPACING_RAD).expect("a positive spacing"))
+        .iter()
+        .map(|&s| path.at(s))
+        .collect()
+}
+
+/// The left arm's waypoints as the arrays of a goal of the left arm.
+fn left_waypoints(waypoints: &[[f64; 7]]) -> Vec<Vec<f64>> {
+    waypoints.iter().map(|q| q.to_vec()).collect()
+}
+
+/// The trajectory of one arm through `points`, the first where the arm
+/// stands, at the fastest the joint velocity and acceleration caps of
+/// `parameters` allow, starting
+/// now: the timing the node gives a path of that arm.
+fn fastest_path(
+    parameters: &peppygen::Parameters,
+    points: &[[f64; 7]],
+) -> control_core::path_timing::JointTrajectory<7> {
+    let p = parameters;
+    let velocity = [
+        p.max_joint_velocity_rad_s_1,
+        p.max_joint_velocity_rad_s_2,
+        p.max_joint_velocity_rad_s_3,
+        p.max_joint_velocity_rad_s_4,
+        p.max_joint_velocity_rad_s_5,
+        p.max_joint_velocity_rad_s_6,
+        p.max_joint_velocity_rad_s_7,
+    ];
+    let acceleration = [
+        p.max_joint_acceleration_rad_s2_1,
+        p.max_joint_acceleration_rad_s2_2,
+        p.max_joint_acceleration_rad_s2_3,
+        p.max_joint_acceleration_rad_s2_4,
+        p.max_joint_acceleration_rad_s2_5,
+        p.max_joint_acceleration_rad_s2_6,
+        p.max_joint_acceleration_rad_s2_7,
+    ];
+    control_core::path_timing::JointTrajectory::through(
+        points,
+        &velocity,
+        &acceleration,
+        Duration::ZERO,
+        std::time::Instant::now(),
+    )
+}
+
+/// The step `traj` takes each control tick of `parameters` when it plays at
+/// full pace, each with the arc length, along the path, where it starts.
+fn unslowed_steps(
+    traj: &control_core::path_timing::JointTrajectory<7>,
+    parameters: &peppygen::Parameters,
+) -> Vec<(f64, f64)> {
+    let period = Duration::from_secs(1) / parameters.control_rate_hz;
+    let start = traj.clock().motion_start();
+    let ticks = traj.clock().duration().div_duration_f64(period).ceil() as u32;
+    let points: Vec<[f64; 7]> = (0..=ticks)
+        .map(|k| traj.sample(start + period * k))
+        .collect();
+    steps_along(&points)
+}
+
+/// The steps between consecutive positions of `points`, each with the arc
+/// length, along them, where it starts.
+fn steps_along(points: &[[f64; 7]]) -> Vec<(f64, f64)> {
+    points
+        .windows(2)
+        .scan(0.0, |arc, w| {
+            let step = distance_between(&w[0], &w[1]);
+            let from = *arc;
+            *arc += step;
+            Some((from, step))
+        })
+        .collect()
+}
+
+/// The steps between consecutive positions of `trail`.
+fn steps(trail: &[[f64; 7]]) -> Vec<f64> {
+    trail
+        .windows(2)
+        .map(|w| distance_between(&w[0], &w[1]))
+        .collect()
+}
+
+/// The index of the position of `trail` nearest to `q`.
+fn nearest_index(trail: &[[f64; 7]], q: &[f64; 7]) -> usize {
+    (0..trail.len())
+        .min_by(|&a, &b| distance_between(&trail[a], q).total_cmp(&distance_between(&trail[b], q)))
+        .expect("the arm received setpoints")
+}
+
+/// The larger of the steps into and out of position `k` of a trail with
+/// `steps`: how fast the arm passes there.
+fn speed_at(steps: &[f64], k: usize) -> f64 {
+    steps[k.saturating_sub(1)].max(steps[k.min(steps.len() - 1)])
+}
+
+/// Assert that every position of `trail` lies within [`ON_PATH_RAD`] of
+/// `path`, and that some position cuts a corner of the straight segments
+/// between `corners` by more than ten times that: the path is the rounded
+/// one, not its segments.
+fn assert_on_rounded_path(trail: &[Vec<f64>], path: &[Vec<f64>], corners: &[Vec<f64>]) {
+    for (k, q) in trail.iter().enumerate() {
+        let off = distance_to_segments(q, path);
+        assert!(
+            off <= ON_PATH_RAD,
+            "setpoint {k} lies {off} rad off the rounded path: {q:?}"
+        );
+    }
+    let cut = trail
+        .iter()
+        .map(|q| distance_to_segments(q, corners))
+        .fold(0.0, f64::max);
+    assert!(
+        cut > 10.0 * ON_PATH_RAD,
+        "no setpoint cuts a corner, so this case shows nothing: {cut} rad at most"
+    );
+}
+
+/// Start the node with the robot ready, the left arm a perfect follower
+/// (see [`spawn_left_arm_follower`]), the right arm at [`HOME`] and both
+/// grippers half open, and wait until the backbone streams to both arms.
+async fn start_with_left_arm() -> peppygen::Result<(Harness, ArmFollower)> {
+    let (harness, mocks) = start_ready_vacant(params()).await?;
+    pump_is_ready(
+        mocks.deps.robot_init.is_ready,
+        Arc::new(AtomicBool::new(true)),
+    );
+    let arm = spawn_left_arm_follower(
+        mocks.pairings.left_arm.joint_states,
+        mocks.pairings.left_arm.joint_setpoints,
+    );
+    pump_right_arm_and_grippers!(mocks);
+    await_streaming(mocks.pairings.right_arm.joint_setpoints).await?;
+    arm.first_setpoint().await;
+    Ok((harness, arm))
+}
+
+/// A joint path of five waypoints keeps the arm moving through each inner
+/// waypoint and settles at the last, and every position the governor
+/// commands lies on the rounded path from where the arm stood.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_joint_path_keeps_moving_through_its_inner_waypoints_on_its_rounded_path()
+-> peppygen::Result<()> {
+    let (harness, arm) = start_with_left_arm().await?;
+
+    let data = complete_joint_path(&harness, &left_joint_path(&FIVE_WAYPOINTS, 0.0)).await?;
+    assert_all_close(
+        "final_joint_positions",
+        &data.arms[0].final_joint_positions,
+        &FIVE_WAYPOINTS[4],
+        SETTLE_TOLERANCE_RAD,
+    );
+    let trail = arm.received();
+    let corners: Vec<Vec<f64>> = std::iter::once(HOME.to_vec())
+        .chain(left_waypoints(&FIVE_WAYPOINTS))
+        .collect();
+    assert_on_rounded_path(
+        &left_waypoints(&trail),
+        &rounded_path(&HOME, &left_waypoints(&FIVE_WAYPOINTS)),
+        &corners,
+    );
+    let steps = steps(&trail);
+    let peak = steps.iter().copied().fold(0.0, f64::max);
+    for waypoint in &FIVE_WAYPOINTS[..4] {
+        let through = speed_at(&steps, nearest_index(&trail, waypoint));
+        assert!(
+            through > 0.1 * peak,
+            "the arm slowed to {through} rad a tick at {waypoint:?}, against a peak of {peak}"
+        );
+    }
+    harness.shutdown().await
+}
+
+/// A joint path whose expected start lies past the start tolerance of where
+/// the arm measures fails with `precondition_failed` before the arm moves,
+/// naming the arm and the joint. The same path with no expected start runs
+/// from wherever the arm stands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_expected_start_off_the_measured_arm_fails_the_path_before_it_moves()
+-> peppygen::Result<()> {
+    let (harness, arm) = start_with_left_arm().await?;
+
+    let mut expected = HOME;
+    expected[1] -= 0.2;
+    let mut goal = left_joint_path(&FIVE_WAYPOINTS[..1], 0.0);
+    goal.arms[0].expected_start_joint_positions = expected.to_vec();
+    let failure = fail_joint_path(&harness, &goal).await?;
+    assert_eq!(
+        failure,
+        execute_joint_path::Failure::new(
+            execute_joint_path::FailureKind::PreconditionFailed,
+            "left_arm stands 0.200 rad from expected_start_joint_positions at joint 2, past the \
+             0.010 rad start tolerance; plan the path from where the arm stands"
+        )
+    );
+    assert!(
+        arm.received().iter().all(|q| *q == HOME),
+        "the arm moved: {:?}",
+        arm.received()
+    );
+
+    goal.arms[0].expected_start_joint_positions = Vec::new();
+    complete_joint_path(&harness, &goal).await?;
+    harness.shutdown().await
+}
+
+/// A joint path whose straight legs keep the left hand clear of the right hand,
+/// folded in toward it, but whose rounded corner cuts across the right hand
+/// fails with `unreachable`, running none of the path, naming the stop
+/// distance; the same path with its corner repeated stops there, runs its
+/// straight legs and stays clear. The path runs in the plane of the left arm's
+/// first two joints, around the right hand: out from under it and back up
+/// beside it. Both grippers stand fully open, the widest fingers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_joint_path_whose_rounded_corner_cuts_the_other_arm_fails_unreachable()
+-> peppygen::Result<()> {
+    use peppygen::fixtures::exposed_actions::postures::move_to_ready;
+
+    let (mut harness, mocks) = start_ready_vacant(params()).await?;
+    pump_is_ready(
+        mocks.deps.robot_init.is_ready,
+        Arc::new(AtomicBool::new(true)),
+    );
+    let left = spawn_left_arm_follower(
+        mocks.pairings.left_arm.joint_states,
+        mocks.pairings.left_arm.joint_setpoints,
+    );
+    let right = spawn_right_arm_follower(
+        mocks.pairings.right_arm.joint_states,
+        mocks.pairings.right_arm.joint_setpoints,
+    );
+    pump_gripper_at!(
+        mocks.pairings.left_gripper.gripper_states,
+        peppygen::paired_topics::left_gripper::gripper_states,
+        1.0
+    );
+    pump_gripper_at!(
+        mocks.pairings.right_gripper.gripper_states,
+        peppygen::paired_topics::right_gripper::gripper_states,
+        1.0
+    );
+    // The first limb_states snapshot says that every limb reported, so the
+    // posture admits both arms.
+    next_snapshot(&mut harness).await?;
+    let ready = move_to_ready::send_goal(
+        &harness,
+        &move_to_ready::GoalRequestData { duration_s: 0.0 },
+        peppygen::DEFAULT_FEEDBACK_BOUND,
+        DEADLINE,
+    )
+    .await?;
+    assert!(ready.accepted, "goal refused: {:?}", ready.refusal);
+    assert!(matches!(
+        ready.get_result(DEADLINE).await?.outcome,
+        move_to_ready::ResultOutcome::Completed(_)
+    ));
+    let ready_left = *left.followed.borrow();
+    let shift = |by_j1: f64, by_j2: f64| {
+        let mut to = ready_left;
+        to[0] += by_j1;
+        to[1] += by_j2;
+        to
+    };
+    let mut right_in = *right.followed.borrow();
+    right_in[1] -= 0.45;
+    complete_joint_path(
+        &harness,
+        &joint_path(vec![path_arm("right_arm", &[right_in])], 0.0),
+    )
+    .await?;
+    let (start, corner, end) = (shift(-0.46, 0.51), shift(-0.09, 0.09), shift(0.33, 0.26));
+    complete_joint_path(&harness, &left_joint_path(&[shift(-0.46, 0.0)], 0.0)).await?;
+    complete_joint_path(&harness, &left_joint_path(&[start], 0.0)).await?;
+
+    let before = left.received().len();
+    let failure = fail_joint_path(&harness, &left_joint_path(&[corner, end], 0.0)).await?;
+    assert_eq!(failure.kind, execute_joint_path::FailureKind::Unreachable);
+    assert!(
+        failure.message.contains("stop distance"),
+        "{}",
+        failure.message
+    );
+    let stood = left.received()[before - 1];
+    assert!(
+        left.received()[before..].iter().all(|q| *q == stood),
+        "the arm moved before the path failed"
+    );
+
+    // The same path stopping at its corner runs its straight legs clear.
+    complete_joint_path(&harness, &left_joint_path(&[corner, corner, end], 0.0)).await?;
+    harness.shutdown().await
+}
+
+/// While the right arm moves in and the collision guard slows the left arm
+/// on a joint path, every position the governor commands the left arm stays
+/// on the rounded path, and the path still ends at its last waypoint. The
+/// band is wide, 40 mm to 200 mm: with the right arm moving in alongside, the
+/// guard holds some tick of the left arm, where the path runs at speed, to
+/// under half the step the path takes there unslowed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_joint_path_the_guard_slows_stays_on_its_rounded_path_and_ends_at_its_last_waypoint()
+-> peppygen::Result<()> {
+    use peppygen::fixtures::exposed_actions::postures::move_to_ready;
+
+    let mut wide = params();
+    wide.d_stop_m = 0.04;
+    wide.d_safe_m = 0.2;
+    let (mut harness, mocks) = start_ready_vacant(wide.clone()).await?;
+    pump_is_ready(
+        mocks.deps.robot_init.is_ready,
+        Arc::new(AtomicBool::new(true)),
+    );
+    let left = spawn_left_arm_follower(
+        mocks.pairings.left_arm.joint_states,
+        mocks.pairings.left_arm.joint_setpoints,
+    );
+    let right = spawn_right_arm_follower(
+        mocks.pairings.right_arm.joint_states,
+        mocks.pairings.right_arm.joint_setpoints,
+    );
+    pump_gripper_at!(
+        mocks.pairings.left_gripper.gripper_states,
+        peppygen::paired_topics::left_gripper::gripper_states,
+        0.5
+    );
+    pump_gripper_at!(
+        mocks.pairings.right_gripper.gripper_states,
+        peppygen::paired_topics::right_gripper::gripper_states,
+        0.5
+    );
+    // The first limb_states snapshot says that every limb reported, so the
+    // posture admits both arms.
+    next_snapshot(&mut harness).await?;
+    let ready = move_to_ready::send_goal(
+        &harness,
+        &move_to_ready::GoalRequestData { duration_s: 0.0 },
+        peppygen::DEFAULT_FEEDBACK_BOUND,
+        DEADLINE,
+    )
+    .await?;
+    assert!(ready.accepted, "goal refused: {:?}", ready.refusal);
+    assert!(matches!(
+        ready.get_result(DEADLINE).await?.outcome,
+        move_to_ready::ResultOutcome::Completed(_)
+    ));
+
+    let ready_left = *left.followed.borrow();
+    let mut right_in = *right.followed.borrow();
+    right_in[1] -= 0.2;
+    let shift = |from: [f64; 7], joint: usize, by: f64| {
+        let mut to = from;
+        to[joint] += by;
+        to
+    };
+    let w1 = shift(ready_left, 0, -0.3);
+    let w2 = shift(w1, 1, 0.2);
+    let w3 = shift(w2, 0, 0.3);
+    let waypoints = [w1, w2, w3];
+
+    let before = left.received().len();
+    let mut right_goal = joint_path(vec![path_arm("right_arm", &[right_in])], 1.0);
+    right_goal.settle_timeout_s = 30.0;
+    let right_goal = send_joint_path(&harness, &right_goal).await?;
+    let mut goal = left_joint_path(&waypoints, 0.0);
+    goal.settle_timeout_s = 30.0;
+    let left_goal = send_joint_path(&harness, &goal).await?;
+    let data = match left_goal.get_result(DEADLINE).await?.outcome {
+        execute_joint_path::ResultOutcome::Completed(data) => data,
+        other => panic!("the slowed path did not end at its last waypoint: {other:?}"),
+    };
+    assert_all_close(
+        "final_joint_positions",
+        &data.arms[0].final_joint_positions,
+        &w3,
+        SETTLE_TOLERANCE_RAD,
+    );
+    let trail = &left.received()[before..];
+    let unslowed = unslowed_steps(&fastest_path(&wide, &[ready_left, w1, w2, w3]), &wide);
+    let peak = unslowed.iter().map(|&(_, step)| step).fold(0.0, f64::max);
+    let unslowed_at = |arc: f64| {
+        unslowed
+            .iter()
+            .take_while(|&&(from, _)| from <= arc)
+            .last()
+            .map_or(0.0, |&(_, step)| step)
+    };
+    let slowed = steps_along(trail)
+        .into_iter()
+        .filter(|&(from, _)| unslowed_at(from) >= 0.5 * peak)
+        .map(|(from, step)| step / unslowed_at(from))
+        .fold(f64::INFINITY, f64::min);
+    assert!(
+        slowed < 0.5,
+        "the guard never held the left arm under half its unslowed step where the path \
+         runs at speed: {slowed} of it at the least"
+    );
+    let corners: Vec<Vec<f64>> = std::iter::once(ready_left.to_vec())
+        .chain(left_waypoints(&waypoints))
+        .collect();
+    assert_on_rounded_path(
+        &left_waypoints(trail),
+        &rounded_path(&ready_left, &left_waypoints(&waypoints)),
+        &corners,
+    );
+    assert!(matches!(
+        right_goal.get_result(DEADLINE).await?.outcome,
+        execute_joint_path::ResultOutcome::Completed(_)
+    ));
+    harness.shutdown().await
+}
+
+/// A joint path that turns back at a waypoint stops there and turns back,
+/// and a waypoint within 0.001 rad of the one before it is a stop: the arm
+/// comes to rest at it before it goes on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_joint_path_stops_where_it_turns_back_and_at_a_repeated_waypoint() -> peppygen::Result<()>
+{
+    let (harness, arm) = start_with_left_arm().await?;
+
+    let rests_at = |trail: &[[f64; 7]], waypoint: &[f64; 7], what: &str| {
+        let k = nearest_index(trail, waypoint);
+        assert!(
+            distance_between(&trail[k], waypoint) <= 1e-3,
+            "the arm {what} {} rad short of the waypoint",
+            distance_between(&trail[k], waypoint)
+        );
+        let steps = steps(trail);
+        let peak = steps.iter().copied().fold(0.0, f64::max);
+        let at = steps[k.saturating_sub(1)].min(steps[k.min(steps.len() - 1)]);
+        assert!(
+            at <= 0.1 * peak,
+            "the arm {what} at {at} rad a tick, against a peak of {peak}"
+        );
+    };
+
+    let out = FIVE_WAYPOINTS[0];
+    complete_joint_path(&harness, &left_joint_path(&[out, HOME], 0.0)).await?;
+    rests_at(&arm.received(), &out, "turned back");
+
+    let corner = FIVE_WAYPOINTS[1];
+    let mut repeat = corner;
+    repeat[0] += 0.0005;
+    let before = arm.received().len();
+    complete_joint_path(
+        &harness,
+        &left_joint_path(&[FIVE_WAYPOINTS[0], corner, repeat, FIVE_WAYPOINTS[2]], 0.0),
+    )
+    .await?;
+    rests_at(&arm.received()[before..], &corner, "stopped at the repeat");
+    harness.shutdown().await
+}
+
+/// A cancel and a stop each end a joint path, the result giving where the
+/// arm stood; a second goal on the arm while one runs is refused; and a path
+/// of 4 s at full speed asked to take 10 s ends no earlier than 10 s after
+/// the test sends it, on the test's own clock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_joint_path_ends_on_a_cancel_or_a_stop_and_takes_the_duration_asked()
+-> peppygen::Result<()> {
+    use peppygen::fixtures::exposed_services::limb_motion::stop;
+
+    let (harness, LeftFollowers { arm, .. }) = start_with_left_followers(0.0).await?;
+    let mut moving = arm.clone();
+
+    let goal = send_joint_path(&harness, &left_joint_path(&FIVE_WAYPOINTS, 30.0)).await?;
+    tokio::time::timeout(
+        DEADLINE,
+        moving.wait_for(|q| distance_between(q, &HOME) > 0.01),
+    )
+    .await
+    .expect("the arm never started moving")
+    .expect("follower watch open");
+    for second in [
+        left_joint_path(&FIVE_WAYPOINTS, 0.0),
+        joint_path(
+            vec![
+                path_arm("right_arm", &[HOME]),
+                path_arm("left_arm", &[HOME]),
+            ],
+            0.0,
+        ),
+    ] {
+        let refused = send_path_goal(&harness, &second).await?;
+        assert!(!refused.accepted, "a second goal on a busy arm ran");
+        assert_eq!(
+            refused.refusal.as_ref().map(|r| r.kind),
+            Some(execute_joint_path::FailureKind::PreconditionFailed),
+            "{:?}",
+            refused.refusal
+        );
+    }
+    goal.cancel_goal(DEADLINE).await?;
+    let (reason, data) = match goal.get_result(DEADLINE).await?.outcome {
+        execute_joint_path::ResultOutcome::Cancelled { reason, data } => (reason, data),
+        other => panic!("the cancelled path did not end cancelled: {other:?}"),
+    };
+    assert_eq!(reason, "cancelled by its caller");
+    let stood = *arm.borrow();
+    assert_all_close(
+        "final_joint_positions",
+        &data.arms[0].final_joint_positions,
+        &stood,
+        0.05,
+    );
+    assert!(
+        distance_between(&stood, &HOME) > 0.01,
+        "the arm never moved"
+    );
+
+    let goal = send_joint_path(&harness, &left_joint_path(&[HOME], 30.0)).await?;
+    tokio::time::timeout(
+        DEADLINE,
+        moving.wait_for(|q| distance_between(q, &stood) > 0.01),
+    )
+    .await
+    .expect("the arm never started back")
+    .expect("follower watch open");
+    let answer = stop::poll(
+        &harness,
+        &stop::RequestData {
+            reason: "the operator asked".to_string(),
+        },
+        DEADLINE,
+    )
+    .await?;
+    assert_eq!(answer.stopped, ["left_arm"]);
+    let (reason, data) = match goal.get_result(DEADLINE).await?.outcome {
+        execute_joint_path::ResultOutcome::Cancelled { reason, data } => (reason, data),
+        other => panic!("the stopped path did not end cancelled: {other:?}"),
+    };
+    assert_eq!(reason, "stopped: the operator asked");
+    assert_all_close(
+        "final_joint_positions",
+        &data.arms[0].final_joint_positions,
+        &*arm.borrow(),
+        0.05,
+    );
+
+    // Back and forth over 0.8 rad of the second joint, stopping at each
+    // turn: five runs of 0.8 s each at the arm's acceleration limit.
+    let here = *arm.borrow();
+    let mut out = here;
+    out[1] -= 0.8;
+    let shuttle = [out, here, out, here, out];
+    let fastest = fastest_path(&params(), &[here, out, here, out, here, out])
+        .clock()
+        .duration()
+        .as_secs_f64();
+    assert!(
+        (3.9..4.1).contains(&fastest),
+        "the shuttle takes {fastest} s at full speed"
+    );
+    let asked_s = 10.0;
+    let sent = std::time::Instant::now();
+    complete_joint_path(&harness, &left_joint_path(&shuttle, asked_s)).await?;
+    let took_s = sent.elapsed().as_secs_f64();
+    assert!(
+        took_s >= asked_s,
+        "a path asked to take {asked_s} s ended {took_s} s after it was sent"
+    );
+    harness.shutdown().await
+}
+
+/// A goal the backbone does not take is refused at admission with
+/// `rejected`, before any arm moves: an arm named twice, arms through
+/// different numbers of waypoints, an expected start of the wrong length, a
+/// non-finite expected start, and a waypoint outside the joint limits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_joint_path_goal_the_backbone_does_not_take_is_refused_at_admission()
+-> peppygen::Result<()> {
+    let (harness, arm) = start_with_left_arm().await?;
+
+    let twice = joint_path(
+        vec![path_arm("left_arm", &[HOME]), path_arm("left_arm", &[HOME])],
+        0.0,
+    );
+    let uneven = joint_path(
+        vec![
+            path_arm("right_arm", &[HOME]),
+            path_arm("left_arm", &[HOME, HOME]),
+        ],
+        0.0,
+    );
+    let mut short_start = left_joint_path(&[HOME], 0.0);
+    short_start.arms[0].expected_start_joint_positions = HOME[..6].to_vec();
+    let mut not_finite = left_joint_path(&[HOME], 0.0);
+    not_finite.arms[0].expected_start_joint_positions = vec![f64::NAN; 7];
+    let mut beyond = HOME;
+    beyond[1] = 1.0;
+    let past_limits = left_joint_path(&[beyond], 0.0);
+    let refusals = [
+        (twice, "arms names \"left_arm\" twice: name each arm once"),
+        (
+            uneven,
+            "left_arm holds 2 waypoints, where right_arm holds 1: every arm passes through as \
+             many",
+        ),
+        (
+            short_start,
+            "expected_start_joint_positions of left_arm holds 6 values, where the arm has 7 \
+             joints: give none, or one per joint",
+        ),
+        (
+            not_finite,
+            "expected_start_joint_positions of left_arm holds a non-finite value",
+        ),
+    ];
+    for (goal, reason) in refusals {
+        let refused = send_path_goal(&harness, &goal).await?;
+        assert_eq!(
+            refused.refusal,
+            Some(execute_joint_path::Failure::new(
+                execute_joint_path::FailureKind::Rejected,
+                reason
+            ))
+        );
+    }
+    let refused = send_path_goal(&harness, &past_limits).await?;
+    let refusal = refused.refusal.expect("a waypoint past the limits");
+    assert_eq!(refusal.kind, execute_joint_path::FailureKind::Rejected);
+    assert!(
+        refusal
+            .message
+            .starts_with("waypoint 1 of left_arm puts joint 2 at 1.0000 rad"),
+        "{}",
+        refusal.message
+    );
+    assert!(arm.received().iter().all(|q| *q == HOME), "an arm moved");
+    harness.shutdown().await
+}
+
+/// A joint path the joint velocity and acceleration caps cannot run within 60 s
+/// fails with `rejected`, running none of the path, the message giving the time
+/// they take: a hundred runs of 0.8 rad of the second joint, the arm stopping
+/// at each turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_joint_path_the_caps_cannot_run_within_60_s_fails_rejected() -> peppygen::Result<()> {
+    let (harness, arm) = start_with_left_arm().await?;
+
+    let mut out = HOME;
+    out[1] -= 0.8;
+    let shuttle: Vec<[f64; 7]> = (0..100)
+        .map(|run| if run % 2 == 0 { out } else { HOME })
+        .collect();
+    let points: Vec<[f64; 7]> = std::iter::once(HOME)
+        .chain(shuttle.iter().copied())
+        .collect();
+    let time_s = fastest_path(&params(), &points)
+        .clock()
+        .duration()
+        .as_secs_f64();
+    assert!(time_s > 60.0, "the shuttle takes {time_s} s at full speed");
+    let failure = fail_joint_path(&harness, &left_joint_path(&shuttle, 0.0)).await?;
+    assert_eq!(
+        failure,
+        execute_joint_path::Failure::new(
+            execute_joint_path::FailureKind::Rejected,
+            format!(
+                "the joint velocity and acceleration caps take {time_s:.1} s to run this path, \
+                 past the 60 s a move may take; split it into paths of fewer waypoints"
+            )
+        )
+    );
+    assert!(
+        arm.received().iter().all(|q| *q == HOME),
+        "the arm moved: {:?}",
+        arm.received()
+    );
+    harness.shutdown().await
+}
+
+/// Where the paths of both arms take the arms from [`HOME`], each clear of
+/// the robot's body: through the first waypoint of [`FIVE_WAYPOINTS`] and
+/// the second, the right arm the mirror of half the left arm's travel.
+const BOTH_ARMS_WAYPOINTS: [([f64; 7], [f64; 7]); 2] = [
+    (
+        [0.0, -0.3, 0.0, 0.6, 0.0, 0.0, 0.0],
+        [0.0, 0.15, 0.0, 0.325, 0.0, 0.0, 0.0],
+    ),
+    (
+        [0.3, -0.5, 0.0, 0.9, 0.0, 0.0, 0.0],
+        [-0.15, 0.25, 0.0, 0.475, 0.0, 0.0, 0.0],
+    ),
+];
+
+/// Start the node with the robot ready, both arms perfect followers (see
+/// [`spawn_arm_follower`]) and both grippers half open, and wait for the
+/// first limb_states snapshot, which says that streaming began.
+async fn start_with_arm_followers() -> peppygen::Result<(Harness, ArmFollower, ArmFollower)> {
+    start_with_arm_followers_off_by(params(), NO_STANDING_ERROR, NO_STANDING_ERROR).await
+}
+
+/// Start the node on `parameters` as [`start_with_arm_followers`] does, the
+/// left arm standing `left_error` off each setpoint and the right arm
+/// `right_error`.
+async fn start_with_arm_followers_off_by(
+    parameters: peppygen::Parameters,
+    left_error: [f64; 7],
+    right_error: [f64; 7],
+) -> peppygen::Result<(Harness, ArmFollower, ArmFollower)> {
+    let (mut harness, mocks) = start_ready_vacant(parameters).await?;
+    pump_is_ready(
+        mocks.deps.robot_init.is_ready,
+        Arc::new(AtomicBool::new(true)),
+    );
+    let left = spawn_left_arm_follower_off_by(
+        mocks.pairings.left_arm.joint_states,
+        mocks.pairings.left_arm.joint_setpoints,
+        left_error,
+    );
+    let right = spawn_right_arm_follower_off_by(
+        mocks.pairings.right_arm.joint_states,
+        mocks.pairings.right_arm.joint_setpoints,
+        right_error,
+    );
+    pump_gripper_at!(
+        mocks.pairings.left_gripper.gripper_states,
+        peppygen::paired_topics::left_gripper::gripper_states,
+        0.5
+    );
+    pump_gripper_at!(
+        mocks.pairings.right_gripper.gripper_states,
+        peppygen::paired_topics::right_gripper::gripper_states,
+        0.5
+    );
+    next_snapshot(&mut harness).await?;
+    Ok((harness, left, right))
+}
+
+/// The arrays of the path through [`BOTH_ARMS_WAYPOINTS`] through both
+/// arms' joints, the right arm's first.
+fn right_first(waypoints: &[([f64; 7], [f64; 7])]) -> Vec<Vec<f64>> {
+    waypoints
+        .iter()
+        .map(|(left, right)| [*right, *left].concat())
+        .collect()
+}
+
+/// A goal of both arms through [`BOTH_ARMS_WAYPOINTS`], naming the right arm
+/// first.
+fn both_arms_path() -> execute_joint_path::GoalRequestData {
+    let (left, right): (Vec<[f64; 7]>, Vec<[f64; 7]>) = BOTH_ARMS_WAYPOINTS.into_iter().unzip();
+    joint_path(
+        vec![path_arm("right_arm", &right), path_arm("left_arm", &left)],
+        0.0,
+    )
+}
+
+/// Both arms through one path of two waypoints: from the tick they leave
+/// HOME, every tick the two arms' governed setpoints, together, lie on the
+/// rounded path through both arms' joints, so the arms pass each waypoint
+/// together; they reach the last waypoint on the same tick; and the result
+/// gives both arms' joints in the order of the goal's arms.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn both_arms_move_along_one_path_and_reach_each_waypoint_together() -> peppygen::Result<()> {
+    let (harness, left, right) = start_with_arm_followers().await?;
+
+    let data = complete_joint_path(&harness, &both_arms_path()).await?;
+    let (left_end, right_end) = BOTH_ARMS_WAYPOINTS[1];
+    let names: Vec<&str> = data.arms.iter().map(|arm| arm.arm_name.as_str()).collect();
+    assert_eq!(names, ["right_arm", "left_arm"]);
+    for (arm, end) in data.arms.iter().zip([right_end, left_end]) {
+        assert_all_close(
+            "final_joint_positions",
+            &arm.final_joint_positions,
+            &end,
+            SETTLE_TOLERANCE_RAD,
+        );
+    }
+    // From the tick the arms leave HOME, which both do on the path's first
+    // step: each follower's trail starts at the first setpoint it received.
+    let moving = |follower: &ArmFollower| -> Vec<[f64; 7]> {
+        follower
+            .received()
+            .into_iter()
+            .skip_while(|q| *q == HOME)
+            .collect()
+    };
+    let (left_trail, right_trail) = (moving(&left), moving(&right));
+    let together: Vec<Vec<f64>> = right_trail
+        .iter()
+        .zip(&left_trail)
+        .map(|(right, left)| [*right, *left].concat())
+        .collect();
+    let start = [HOME, HOME].concat();
+    let corners: Vec<Vec<f64>> = std::iter::once(start.clone())
+        .chain(right_first(&BOTH_ARMS_WAYPOINTS))
+        .collect();
+    assert_on_rounded_path(
+        &together,
+        &rounded_path(&start, &right_first(&BOTH_ARMS_WAYPOINTS)),
+        &corners,
+    );
+    let arrived = |trail: &[[f64; 7]], end: &[f64; 7]| {
+        trail.iter().position(|q| distance_between(q, end) < 1e-9)
+    };
+    assert_eq!(
+        arrived(&left_trail, &left_end),
+        arrived(&right_trail, &right_end)
+    );
+    assert!(
+        arrived(&left_trail, &left_end).is_some(),
+        "the arms reach the end"
+    );
+    harness.shutdown().await
+}
+
+/// A path of both arms whose expected start lies past the start tolerance of
+/// either arm fails with `precondition_failed` before either arm moves,
+/// naming the arm and its joint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_expected_start_of_either_arm_off_its_tolerance_fails_the_path_before_either_moves()
+-> peppygen::Result<()> {
+    let (harness, left, right) = start_with_arm_followers().await?;
+
+    // The second joints run the other way on the two arms, so each start
+    // stays inside its arm's limits.
+    let shoulder_by = |by: f64| {
+        let mut q = HOME;
+        q[1] += by;
+        q
+    };
+    let off_starts = [
+        ((shoulder_by(-0.2), HOME), "left_arm"),
+        ((HOME, shoulder_by(0.2)), "right_arm"),
+    ];
+    for ((left_start, right_start), arm) in off_starts {
+        let mut goal = both_arms_path();
+        goal.arms[0].expected_start_joint_positions = right_start.to_vec();
+        goal.arms[1].expected_start_joint_positions = left_start.to_vec();
+        let failure = fail_joint_path(&harness, &goal).await?;
+        assert_eq!(
+            failure,
+            execute_joint_path::Failure::new(
+                execute_joint_path::FailureKind::PreconditionFailed,
+                format!(
+                    "{arm} stands 0.200 rad from expected_start_joint_positions at joint 2, past \
+                     the 0.010 rad start tolerance; plan the path from where the arm stands"
+                )
+            )
+        );
+    }
+    for (arm, follower) in [("left", &left), ("right", &right)] {
+        assert!(
+            follower.received().iter().all(|q| *q == HOME),
+            "the {arm} arm moved"
+        );
+    }
+    harness.shutdown().await
+}
+
+// --- Leaving the stop distance ---------------------------------------------
+
+/// Both arms with the elbow bent square, the pose the paths that leave the
+/// stop distance start from.
+const ELBOW_SQUARE: [f64; 7] = [0.0, 0.0, 0.0, std::f64::consts::FRAC_PI_2, 0.0, 0.0, 0.0];
+
+/// How far the left arm stands off each setpoint in the tests that hold it
+/// at the stop distance: 1 mrad on at its third joint, which turns its hand
+/// in toward the right arm from [`ELBOW_SQUARE`].
+const LEFT_STANDS_IN: [f64; 7] = [0.0, 0.0, 1e-3, 0.0, 0.0, 0.0, 0.0];
+
+/// How far the right arm stands off each setpoint in those tests: 1 mrad
+/// back at its third joint, which turns its hand in toward the left arm.
+const RIGHT_STANDS_IN: [f64; 7] = [0.0, 0.0, -1e-3, 0.0, 0.0, 0.0, 0.0];
+
+/// [`ELBOW_SQUARE`] with the third joint at `j3`.
+fn square_turned(j3: f64) -> [f64; 7] {
+    let mut q = ELBOW_SQUARE;
+    q[2] = j3;
+    q
+}
+
+/// The command the node holds `arm` at once the move that brought it there
+/// has ended: the first setpoint the arm receives twice in a row. While the
+/// collision guard holds a move short, the held command creeps on by less
+/// each tick; once the move ends, the command stands still.
+async fn held_command(arm: &ArmFollower) -> [f64; 7] {
+    let mut followed = arm.followed.clone();
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    loop {
+        if let [.., last, next] = arm.received()[..]
+            && last == next
+        {
+            return next;
+        }
+        tokio::time::timeout_at(deadline, followed.changed())
+            .await
+            .expect("the arm's command never stood still")
+            .expect("the follower runs");
+    }
+}
+
+/// Start the node on v2 with the robot ready, the left arm standing
+/// `left_error` off each setpoint and the right arm `right_error`
+/// ([`start_with_arm_followers_off_by`]); bring both arms to
+/// [`ELBOW_SQUARE`] on one path; then send the left hand in toward the right
+/// arm at its third joint, where the collision guard holds the left arm's
+/// command at the stop distance and the move fails with `timeout`. Gives the
+/// harness, both followers and the left arm's held command.
+async fn start_with_the_left_arm_held_at_the_stop_distance(
+    left_error: [f64; 7],
+    right_error: [f64; 7],
+) -> peppygen::Result<(Harness, ArmFollower, ArmFollower, [f64; 7])> {
+    let (harness, left, right) =
+        start_with_arm_followers_off_by(v2_params(), left_error, right_error).await?;
+    let both_square = joint_path(
+        vec![
+            path_arm("left_arm", &[ELBOW_SQUARE]),
+            path_arm("right_arm", &[ELBOW_SQUARE]),
+        ],
+        0.0,
+    );
+    complete_joint_path(&harness, &both_square).await?;
+    match left_arm_joint_move(&harness, square_turned(1.2), 1.0).await? {
+        move_arm_joints::ResultOutcome::Failed(failure) => assert_eq!(
+            failure.kind,
+            move_arm_joints::FailureKind::Timeout,
+            "{}",
+            failure.message
+        ),
+        other => panic!("the guard holds the left hand short of the right arm: {other:?}"),
+    }
+    let held = held_command(&left).await;
+    assert!(
+        held[2] > 0.3 && held[2] < 1.1,
+        "the guard holds the left arm on its way in: {held:?}"
+    );
+    Ok((harness, left, right, held))
+}
+
+/// An arm the collision guard holds at the stop distance leaves it on a
+/// joint path. The left arm, sent in toward the right arm, stands 1 mrad
+/// further in than its held command, so it measures inside the stop
+/// distance: a path from there further in fails with `unreachable` before
+/// the arm moves, its command left where the guard held it, and a path back
+/// out completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_joint_path_leaves_the_stop_distance_the_guard_holds_an_arm_at() -> peppygen::Result<()> {
+    let (harness, left, _right, held) =
+        start_with_the_left_arm_held_at_the_stop_distance(LEFT_STANDS_IN, NO_STANDING_ERROR)
+            .await?;
+
+    let before = left.received().len();
+    let further_in = left_joint_path(&[square_turned(held[2] + 0.2)], 0.0);
+    let failure = fail_joint_path(&harness, &further_in).await?;
+    assert_eq!(
+        failure.kind,
+        execute_joint_path::FailureKind::Unreachable,
+        "{}",
+        failure.message
+    );
+    assert!(
+        failure.message.contains("stop distance"),
+        "{}",
+        failure.message
+    );
+    assert!(
+        left.received()[before..].iter().all(|q| *q == held),
+        "the refused path moved the left arm's command off where the guard held it"
+    );
+
+    let data = complete_joint_path(&harness, &left_joint_path(&[ELBOW_SQUARE], 0.0)).await?;
+    assert_all_close(
+        "final_joint_positions",
+        &data.arms[0].final_joint_positions,
+        &ELBOW_SQUARE,
+        SETTLE_TOLERANCE_RAD,
+    );
+    harness.shutdown().await
+}
+
+/// The other arm leaves the stop distance the collision guard holds an arm
+/// at on a joint path of its own: with the left arm held there, the right
+/// arm, standing 1 mrad in toward the left arm, turns its hand away along a
+/// path of the right arm alone, which completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_joint_path_of_the_other_arm_leaves_the_stop_distance_an_arm_is_held_at()
+-> peppygen::Result<()> {
+    let (harness, _left, _right, _held) =
+        start_with_the_left_arm_held_at_the_stop_distance(LEFT_STANDS_IN, RIGHT_STANDS_IN).await?;
+
+    let away = [square_turned(0.3), square_turned(0.6)];
+    let data = complete_joint_path(
+        &harness,
+        &joint_path(vec![path_arm("right_arm", &away)], 0.0),
+    )
+    .await?;
+    assert_all_close(
+        "final_joint_positions",
+        &data.arms[0].final_joint_positions,
+        &away[1],
+        SETTLE_TOLERANCE_RAD,
+    );
+    harness.shutdown().await
+}
+
+/// A joint path of both arms leaves the stop distance the collision guard
+/// holds an arm at: with the left arm held there and both arms standing 1
+/// mrad in toward each other, a path of both arms that keeps the left arm
+/// where it stands and turns the right hand away completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_joint_path_of_both_arms_leaves_the_stop_distance_an_arm_is_held_at()
+-> peppygen::Result<()> {
+    let (harness, left, _right, _held) =
+        start_with_the_left_arm_held_at_the_stop_distance(LEFT_STANDS_IN, RIGHT_STANDS_IN).await?;
+
+    let left_stands = *left.followed.borrow();
+    let away = square_turned(0.6);
+    let data = complete_joint_path(
+        &harness,
+        &joint_path(
+            vec![
+                path_arm("left_arm", &[left_stands]),
+                path_arm("right_arm", &[away]),
+            ],
+            0.0,
+        ),
+    )
+    .await?;
+    assert_all_close(
+        "final_joint_positions",
+        &data.arms[1].final_joint_positions,
+        &away,
+        SETTLE_TOLERANCE_RAD,
     );
     harness.shutdown().await
 }

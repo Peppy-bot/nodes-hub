@@ -18,6 +18,9 @@
 //! - a stop ends every move in flight on both sides;
 //! - a plan check asks one arm's planner whether a Cartesian goal has a plan
 //!   from where it stands;
+//! - the path of an execute_joint_path goal starts on every arm it moves at
+//!   once, or fails before any arm moves, and is judged beside the loop
+//!   ([`crate::path_checks`]), its arms held until the judgment comes;
 //! - a posture goal that completes or ends cancelled asks for the grasp pose
 //!   of each arm.
 
@@ -38,14 +41,18 @@ use openarm_description::{ARM_DOF, ArmPair, Side};
 
 use crate::camera_mounts::MeasuredGrasps;
 use crate::failure::{Failure, FailureKind, stale_failure};
-use crate::governor::{GovState, Governor, Guard};
+use crate::governor::{GovState, Governor, Guard, GuardAt, PathArms};
 use crate::gripper_move::{
     CommandedOpening, GripperGoal, GripperMove, GripperTerminal, MeasuredOpening, end_gripper_move,
     service_gripper_move,
 };
 use crate::liveness::{Admission, Cadence, CadenceChange, Liveness};
 use crate::move_slot::MoveSlot;
-use crate::planner::{self, ArmMoveRequest, Goal, Measurement, PlanCheck, Planner, Unmeasured};
+use crate::path_checks::PathChecks;
+use crate::planner::{
+    self, ArmMoveRequest, Goal, Measurement, PathGoal, PathJudgment, PlanCheck, Planner,
+    Unmeasured, chase_together, commit_both, start_path,
+};
 use crate::publish::{LimbStateSnapshot, Publishers};
 use crate::streams::{ArmState, GovernorConfig, GripperCommand, GripperState, LeaderActivity};
 use crate::upstream::{Upstream, UpstreamMode};
@@ -112,9 +119,9 @@ pub struct RunConfig {
 /// measured, or why it has no fresh measurement of them.
 pub type GraspMeasurement = Result<Isometry3<f64>, Unmeasured>;
 
-/// What the limb_motion services and the posture moves ask of the loop,
-/// answered on the reply channel each carries. A reply that the asker no
-/// longer waits for is dropped.
+/// What the limb_motion services, the posture moves and execute_joint_path
+/// ask of the loop, answered on the reply channel each carries. A reply that
+/// the asker no longer waits for is dropped.
 pub enum CoordinatorRequest {
     /// End every planned move in flight on both sides, answering the names of
     /// the limbs whose move was ended.
@@ -133,6 +140,15 @@ pub enum CoordinatorRequest {
     /// cancelled.
     MeasureGrasps {
         reply: oneshot::Sender<ArmPair<GraspMeasurement>>,
+    },
+    /// Start the path of an execute_joint_path goal on every arm it moves at
+    /// once, answering that the loop took it, or the failure it ended with
+    /// before any arm moved. Its shares report how they end, the failure of
+    /// the path's judgment among them, and a stop that comes before the path
+    /// starts ends each of them.
+    StartPath {
+        goal: PathGoal,
+        started: oneshot::Sender<Result<(), Failure>>,
     },
 }
 
@@ -159,6 +175,7 @@ pub async fn run(
     mut planners: ArmPair<Planner>,
     mut channels: ArmPair<ArmChannels>,
     mut requests: mpsc::Receiver<CoordinatorRequest>,
+    mut path_checks: PathChecks,
     governor_config: watch::Receiver<GovernorConfig>,
     measured_grasps: watch::Sender<Option<MeasuredGrasps>>,
     config: RunConfig,
@@ -247,13 +264,6 @@ pub async fn run(
         let gripper_rate = governor.max_gripper_rate_frac_s();
         let now = Instant::now();
 
-        let arm_admission = admit_arms(
-            &mut arm_liveness,
-            &mut arm_cadence,
-            &channels,
-            now,
-            stale_limit,
-        );
         let gripper_delivered = take_gripper_deliveries(&mut channels);
         let gripper_admission = admit_grippers(
             &mut gripper_liveness,
@@ -262,6 +272,24 @@ pub async fn run(
             now,
             stale_limit,
         );
+        let tick_state = TickState {
+            arm_liveness: &mut arm_liveness,
+            arm_cadence: &mut arm_cadence,
+            channels: &mut channels,
+            planners: &mut planners,
+            commanded_grippers: &commanded_grippers,
+            requests: &mut requests,
+            gripper_moves: &mut gripper_moves,
+            path_checks: &mut path_checks,
+        };
+        let arm_admission = admit_and_serve(
+            tick_state,
+            &gripper_fraction,
+            |held| governor.guard_at(held),
+            now,
+            stale_limit,
+        )
+        .await;
         for side in Side::BOTH {
             let arm = &channels[side];
             let fresh = |admission: Admission| admission != Admission::Stale;
@@ -270,24 +298,12 @@ pub async fn run(
             arm.gripper_fresh
                 .store(fresh(gripper_admission[side]), Ordering::Release);
         }
-        // The services are answered ahead of the tick's advance: a stop ends
-        // every move before the planners would step it once more.
-        while let Ok(request) = requests.try_recv() {
-            serve_request(
-                request,
-                &mut channels,
-                &mut planners,
-                arm_admission,
-                &mut gripper_moves,
-                &gripper_fraction,
-                now,
-            )
-            .await;
-        }
         let arm_ticks = advance_arms(&mut channels, &mut planners, arm_admission, now).await;
+        let paths = paths_of(ArmPair::from_fn(|side| arm_ticks[side].on_path));
         let (arm_candidate, hands) = arm_ticks
             .map(|_, tick| (tick.candidate, tick.streamed_hand))
             .unzip();
+        let arm_candidate = chase_together(&planners, arm_candidate);
         let measured_grippers = ArmPair::from_fn(|side| gripper_fraction(&channels[side].gripper));
         service_gripper_moves(
             &mut gripper_moves,
@@ -317,10 +333,7 @@ pub async fn run(
         // One governed configuration: the last published setpoints and grippers
         // as `prev`, the rate-limited chases as the candidate. The governor
         // throttles, holds, scans and monitors everything through one barrier.
-        let prev = GovState::new(
-            ArmPair::from_fn(|side| planners[side].setpoint()),
-            ArmPair::from_fn(|side| commanded_grippers[side].frac),
-        );
+        let prev = last_governed(&planners, &commanded_grippers);
         let cand = GovState::new(
             arm_candidate,
             ArmPair::from_fn(|side| {
@@ -328,7 +341,7 @@ pub async fn run(
             }),
         );
         let measured = measured_config(&channels, &prev, measured_grippers);
-        let governed = governor.govern(&prev, &cand, &measured, &hands, dt);
+        let governed = governor.govern_along(&prev, &cand, &measured, &hands, paths, dt);
         commanded_grippers = ArmPair::from_fn(|side| {
             CommandedOpening::published(
                 governed.grippers[side],
@@ -337,6 +350,10 @@ pub async fn run(
             )
         });
 
+        // Every side commits (identity for a stale one, whose candidate was
+        // the frozen setpoint), and a stale side stays silent, so its
+        // follower holds its own last setpoint.
+        commit_both(&mut planners, &governed.arms);
         // Publish one governed setpoint per arm on its pairing slot; the slot
         // scopes the stream to its paired arm, so the message names no side.
         for side in Side::BOTH {
@@ -345,11 +362,6 @@ pub async fn run(
             // noisy stream does not drive the arm's Kd term into buzz. The published
             // position (`governed_q`) is untouched, so tracking is unaffected.
             let dq = filtered_velocity(&mut dq_filters[side], &governed_q, &prev.arms[side], dt);
-            // Every side commits (identity for a stale one, whose candidate was
-            // the frozen setpoint), but a stale side stays silent so its
-            // follower holds its own last setpoint rather than tracking one the
-            // backbone can no longer vouch for.
-            planners[side].commit(governed_q);
             if arm_admission[side] == Admission::Stale {
                 continue;
             }
@@ -413,6 +425,127 @@ pub async fn run(
     }
 }
 
+/// The loop's state that the first half of a tick reads and writes
+/// ([`admit_and_serve`]), borrowed for that half: each arm follower's
+/// delivery watchdog and cadence, both arms' channels and planners, the
+/// openings the last tick commanded, the requests queued for the loop, the
+/// gripper moves in flight, and the judgments of joint paths.
+struct TickState<'a> {
+    arm_liveness: &'a mut ArmPair<Liveness>,
+    arm_cadence: &'a mut ArmPair<Cadence>,
+    channels: &'a mut ArmPair<ArmChannels>,
+    planners: &'a mut ArmPair<Planner>,
+    commanded_grippers: &'a ArmPair<CommandedOpening>,
+    requests: &'a mut mpsc::Receiver<CoordinatorRequest>,
+    gripper_moves: &'a mut ArmPair<Option<GripperMove>>,
+    path_checks: &'a mut PathChecks,
+}
+
+/// The first half of a tick at `now`, in its order, ahead of the arms'
+/// advance, on the loop's `state`:
+/// - admit each arm's follower against `stale_limit`, which re-anchors an
+///   arm whose follower recovered on its measured pose ([`admit_arms`]);
+/// - answer the queued requests ([`serve_queued`]) ahead of the advance, so a
+///   stop ends every move before the planners step it once more, and a plan
+///   check or a path that starts plans from where a recovered arm stands, as
+///   a move_arm goal its planner takes this tick does;
+/// - judge each path that starts against the guard `guard_at` gives for the
+///   limbs where the last tick governed them, a recovered arm re-anchored
+///   ([`PathChecks::judge`]);
+/// - resume the shares of each path whose judgment came, a path judged again
+///   from where its arms stand against the guard `guard_at` gives for the
+///   limbs where the last tick governed them ([`PathChecks::resume_judged`]).
+///
+/// The arms' admissions this tick.
+async fn admit_and_serve(
+    state: TickState<'_>,
+    gripper_fraction: &impl Fn(&watch::Receiver<Option<GripperState>>) -> f64,
+    guard_at: impl Fn(GovState) -> GuardAt,
+    now: Instant,
+    stale_limit: Duration,
+) -> ArmPair<Admission> {
+    let TickState {
+        arm_liveness,
+        arm_cadence,
+        channels,
+        planners,
+        commanded_grippers,
+        requests,
+        gripper_moves,
+        path_checks,
+    } = state;
+    let arm_admission = admit_arms(
+        arm_liveness,
+        arm_cadence,
+        channels,
+        planners,
+        now,
+        stale_limit,
+    );
+    let held = last_governed(planners, commanded_grippers);
+    let judgments = serve_queued(
+        requests,
+        channels,
+        planners,
+        arm_admission,
+        gripper_moves,
+        gripper_fraction,
+        now,
+    )
+    .await;
+    for judgment in judgments {
+        path_checks.judge(judgment, guard_at(held));
+    }
+    let measured =
+        ArmPair::from_fn(|side| seeded_measurement(&channels[side], arm_admission[side]));
+    path_checks.resume_judged(planners, &measured, guard_at(held), now);
+    arm_admission
+}
+
+/// Answer every request queued on `requests` ([`serve_request`]), giving
+/// the judgments of the paths that start and still wait for them, for the
+/// loop to judge: a stop ends the paths started before it among these
+/// requests before they are judged. A stop also ends each
+/// execute_joint_path goal queued behind it before its path starts
+/// ([`stop_unstarted_path`]), as it ends the goals queued for an arm.
+async fn serve_queued(
+    requests: &mut mpsc::Receiver<CoordinatorRequest>,
+    channels: &mut ArmPair<ArmChannels>,
+    planners: &mut ArmPair<Planner>,
+    arm_admission: ArmPair<Admission>,
+    gripper_moves: &mut ArmPair<Option<GripperMove>>,
+    gripper_fraction: &impl Fn(&watch::Receiver<Option<GripperState>>) -> f64,
+    now: Instant,
+) -> Vec<PathJudgment> {
+    let mut judgments = Vec::new();
+    let mut stopped: Option<String> = None;
+    while let Ok(request) = requests.try_recv() {
+        let request = match (request, &stopped) {
+            (CoordinatorRequest::StartPath { goal, started }, Some(reason)) => {
+                stop_unstarted_path(goal, started, reason, channels, planners, arm_admission);
+                continue;
+            }
+            (request, _) => request,
+        };
+        if let CoordinatorRequest::Stop { reason, .. } = &request {
+            stopped = Some(stop_reason(reason));
+        }
+        let judgment = serve_request(
+            request,
+            channels,
+            planners,
+            arm_admission,
+            gripper_moves,
+            gripper_fraction,
+            now,
+        )
+        .await;
+        judgments.extend(judgment);
+    }
+    judgments.retain(|judgment| judgment.is_awaited(planners));
+    judgments
+}
+
 /// Answer one request:
 /// - A stop ends the moves in flight on both sides and the goals admitted
 ///   but not started. The planner ends an arm's move; the gripper's
@@ -422,9 +555,13 @@ pub async fn run(
 ///   setpoints hold where they were last governed.
 /// - A check asks the named arm's planner and moves nothing.
 /// - A grasp request answers the grasp pose of each arm.
+/// - The path of an execute_joint_path goal starts on every arm it moves, or
+///   fails before any arm moves ([`start_path`]): the path's judgment is what
+///   this gives, for the loop to judge. A path whose action no longer waits
+///   for it starts nowhere, and its arms are freed.
 ///
-/// The results and the grasp poses come from each arm's
-/// [`seeded_measurement`] under `arm_admission`.
+/// The results, the grasp poses and the measurement a path starts from come
+/// from each arm's [`seeded_measurement`] under `arm_admission`.
 async fn serve_request(
     request: CoordinatorRequest,
     channels: &mut ArmPair<ArmChannels>,
@@ -433,7 +570,7 @@ async fn serve_request(
     gripper_moves: &mut ArmPair<Option<GripperMove>>,
     gripper_fraction: &impl Fn(&watch::Receiver<Option<GripperState>>) -> f64,
     now: Instant,
-) {
+) -> Option<PathJudgment> {
     match request {
         CoordinatorRequest::Stop { reason, reply } => {
             let reason = stop_reason(&reason);
@@ -467,6 +604,7 @@ async fn serve_request(
                 }
             }
             let _ = reply.send(stopped);
+            None
         }
         CoordinatorRequest::CheckArmMove { request, reply } => {
             let _ = reply.send(planners[request.side].check_cartesian(
@@ -474,11 +612,57 @@ async fn serve_request(
                 request.tolerance,
                 request.duration,
             ));
+            None
         }
         CoordinatorRequest::MeasureGrasps { reply } => {
             let _ = reply.send(measured_grasps(channels, planners, arm_admission));
+            None
+        }
+        CoordinatorRequest::StartPath { goal, started } => {
+            if started.is_closed() {
+                return None;
+            }
+            let sides = goal.path.arms.sides().to_vec();
+            let measured =
+                ArmPair::from_fn(|side| seeded_measurement(&channels[side], arm_admission[side]));
+            match start_path(planners, goal, &measured) {
+                Ok(judgment) => {
+                    if started.send(Ok(())).is_ok() {
+                        return Some(judgment);
+                    }
+                    for side in sides {
+                        planners[side].drop_share();
+                    }
+                    None
+                }
+                Err(failure) => {
+                    let _ = started.send(Err(failure));
+                    None
+                }
+            }
         }
     }
+}
+
+/// End the path of an execute_joint_path goal that a stop came before, for
+/// `reason`, which names the stop: each of its arms reports the joints it
+/// measures, its arms are freed, and its action learns that the loop took
+/// it. A goal whose action no longer waits is dropped.
+fn stop_unstarted_path(
+    goal: PathGoal,
+    started: oneshot::Sender<Result<(), Failure>>,
+    reason: &str,
+    channels: &ArmPair<ArmChannels>,
+    planners: &ArmPair<Planner>,
+    arm_admission: ArmPair<Admission>,
+) {
+    if started.is_closed() {
+        return;
+    }
+    let measured =
+        ArmPair::from_fn(|side| seeded_measurement(&channels[side], arm_admission[side]));
+    goal.stop(reason, &measured, planners);
+    let _ = started.send(Ok(()));
 }
 
 /// Wipe the streamed command of any side running a discrete move.
@@ -522,20 +706,43 @@ fn apply_controls(governor: &mut Governor, planners: &mut ArmPair<Planner>, cfg:
 /// freezes at the held setpoint and its wire goes silent, so the follower holds
 /// its own last setpoint instead of tracking one that keeps advancing on the
 /// operator's stream while the real arm drifts. The first delivery back
-/// re-anchors the held setpoint on the measured pose, so the limb never steps
-/// by the drift it accumulated unseen.
+/// re-anchors the held setpoint on the measured pose here, as the tick
+/// admits the follower and before it serves its requests, so the limb never
+/// steps by the drift it accumulated unseen, and a path that starts on that
+/// tick is checked and runs from where the arm stands. The per-joint
+/// velocity limit in the chase then walks the setpoint back to the
+/// operator's command, a tick's step at a time.
 fn admit_arms(
     liveness: &mut ArmPair<Liveness>,
     cadence: &mut ArmPair<Cadence>,
     channels: &ArmPair<ArmChannels>,
+    planners: &mut ArmPair<Planner>,
     now: Instant,
     stale_limit: Duration,
 ) -> ArmPair<Admission> {
     ArmPair::from_fn(|side| {
         let delivered = channels[side].measured.has_changed().unwrap_or(false);
         report_cadence(side, "arm", cadence[side].observe(delivered, now));
-        liveness[side].admit(delivered, now, stale_limit)
+        let admission = liveness[side].admit(delivered, now, stale_limit);
+        if admission == Admission::Reanchor {
+            warn!("arm follower stream recovered; re-anchoring on the measured pose");
+            let measured = channels[side]
+                .measured
+                .borrow()
+                .expect("seed gated on the first state");
+            planners[side].seed_from_measured(measured.positions);
+        }
+        admission
     })
+}
+
+/// The configuration the last tick governed: each arm's setpoint and each
+/// gripper's commanded opening.
+fn last_governed(planners: &ArmPair<Planner>, grippers: &ArmPair<CommandedOpening>) -> GovState {
+    GovState::new(
+        ArmPair::from_fn(|side| planners[side].setpoint()),
+        ArmPair::from_fn(|side| grippers[side].frac),
+    )
 }
 
 /// Log the delivery cadence of the follower of `side`'s `limb` crossing the
@@ -596,13 +803,35 @@ fn admit_grippers(
     })
 }
 
+/// The paths the arms step along this tick, from what each arm's tick
+/// stepped along: one path of both arms when both step along their shares of
+/// it, else each arm's own.
+fn paths_of(on_path: ArmPair<Option<PathArms>>) -> &'static [PathArms] {
+    match (on_path.left, on_path.right) {
+        (Some(PathArms::Both), Some(PathArms::Both)) => &[PathArms::Both],
+        (Some(_), Some(_)) => &[PathArms::One(Side::Left), PathArms::One(Side::Right)],
+        (Some(_), None) => &[PathArms::One(Side::Left)],
+        (None, Some(_)) => &[PathArms::One(Side::Right)],
+        (None, None) => &[],
+    }
+}
+
 /// Advance both planners to this tick's candidate setpoints and hand bases.
+/// The share of a path of an arm whose follower is stale fails before either
+/// arm advances, so it ends the other arm's share of a path of both arms on
+/// the same tick; any other move of a stale arm fails as its arm ticks
+/// ([`tick_arm`]).
 async fn advance_arms(
     channels: &mut ArmPair<ArmChannels>,
     planners: &mut ArmPair<Planner>,
     admission: ArmPair<Admission>,
     now: Instant,
 ) -> ArmPair<planner::Tick> {
+    for side in Side::BOTH {
+        if admission[side] == Admission::Stale {
+            planners[side].fail_path_share(stale_failure());
+        }
+    }
     ArmPair::new(
         tick_arm(&mut channels.left, &mut planners.left, admission.left, now).await,
         tick_arm(
@@ -819,10 +1048,10 @@ async fn seed_all(
                 let _release = channels.right.gripper_move_slot.release_on_drop();
                 goal.fail(seed_failure()).await;
             }
-            // Nothing moves before the seed, so a stop stops nothing and a
-            // check has no held pose to plan from. The seed judges no
-            // liveness, so no measurement is known to be fresh: a grasp
-            // request gets no pose for either arm.
+            // Nothing moves before the seed, so a stop stops nothing, and a
+            // check or a joint path has no held pose to start from. The seed
+            // judges no liveness, so no measurement is known to be fresh: a
+            // grasp request gets no pose for either arm.
             Some(request) = requests.recv() => match request {
                 CoordinatorRequest::Stop { reply, .. } => {
                     let _ = reply.send(Vec::new());
@@ -833,6 +1062,9 @@ async fn seed_all(
                 CoordinatorRequest::MeasureGrasps { reply } => {
                     let unseeded = Err(Unmeasured::NotYet);
                     let _ = reply.send(ArmPair::from_fn(|_| unseeded));
+                }
+                CoordinatorRequest::StartPath { started, .. } => {
+                    let _ = started.send(Err(seed_failure()));
                 }
             }
         }
@@ -871,9 +1103,11 @@ async fn wait_for_first<T>(
     }
 }
 
-/// Advance one arm's planner to its candidate setpoint for this tick: anchor on the
-/// measured pose, feed the latest leader command, and admit any pending move
-/// goal. Runs only after the seed, which gated on the arm's first measurement.
+/// Advance one arm's planner to its candidate setpoint for this tick: feed it
+/// the measured pose and the latest leader command, and admit any pending move
+/// goal. An arm whose follower recovered this tick was re-anchored as the tick
+/// admitted it ([`admit_arms`]). Runs only after the seed, which gated on the
+/// arm's first measurement.
 async fn tick_arm(
     channels: &mut ArmChannels,
     planner: &mut Planner,
@@ -895,6 +1129,7 @@ async fn tick_arm(
         return planner::Tick {
             candidate: planner.setpoint(),
             streamed_hand: None,
+            on_path: None,
         };
     }
     let measured_q = channels
@@ -902,14 +1137,6 @@ async fn tick_arm(
         .borrow_and_update()
         .expect("seed gated on the first state")
         .positions;
-    // First delivery after a gap: the held setpoint is now fiction, so adopt
-    // the measured pose before advancing. The per-joint velocity limit in the
-    // chase then walks it back to the operator's command instead of the
-    // follower stepping the whole divergence in one tick.
-    if admission == Admission::Reanchor {
-        warn!("arm follower stream recovered; re-anchoring on the measured pose");
-        planner.seed_from_measured(measured_q);
-    }
     // Read out so no watch borrow guard is held across the await below. A
     // leader that has stopped streaming leaves nothing to follow: its last
     // command is dropped and the limb holds its setpoint.
@@ -986,7 +1213,20 @@ fn filtered_velocity(
 mod tests {
     use super::*;
     use crate::planner::Outcome;
-    use crate::test_support::{claimed_move_slot, planner_holding};
+    use crate::test_support::{
+        ARMS_WOULD_MEET, BOTH_HELD, OpenGuard, Refusing, claimed_move_slot, distance_to_segment,
+        measured_at_setpoints, path_goal_through, planner_holding, share_reply, test_guard,
+        test_settle,
+    };
+
+    use std::sync::Mutex;
+
+    use control_core::path_timing::RoundedPath;
+
+    use crate::planner::{ArmOrder, PathGuard, ShareReport};
+    use crate::settle::PoseTolerance;
+    use crate::types::dual_joints;
+    use srs_model::nalgebra::Vector3;
 
     fn cmd(opening: f64) -> Option<GripperCommand> {
         Some(GripperCommand {
@@ -1446,5 +1686,1027 @@ mod tests {
             seeded_measurement(&channels, Admission::Stale),
             Err(Unmeasured::Stale)
         );
+    }
+    // --- execute_joint_path ------------------------------------------------
+
+    /// Each arm measuring [`BOTH_HELD`].
+    fn measuring_held() -> ArmPair<Measurement> {
+        ArmPair::from_fn(|side| Ok(BOTH_HELD[side]))
+    }
+
+    const LIVE: ArmPair<Admission> = ArmPair {
+        left: Admission::Live,
+        right: Admission::Live,
+    };
+
+    /// Both arms' channels, each arm measuring [`BOTH_HELD`] with its move slot
+    /// free, the sender of each follower's measured state, and both planners
+    /// holding [`BOTH_HELD`].
+    fn followed_arms() -> (ArmPair<ArmChannels>, ArmPair<Follower>, ArmPair<Planner>) {
+        let (channels, followers) = ArmPair::from_fn(|side| {
+            let (channels, measured_tx, _goals) = claimed_arm_channels();
+            channels.move_slot.release();
+            measured_tx.send_replace(standing_at(BOTH_HELD[side]));
+            (channels, measured_tx)
+        })
+        .unzip();
+        let planners = ArmPair::from_fn(|side| planner_holding(side, BOTH_HELD[side]));
+        (channels, followers, planners)
+    }
+
+    /// Where a follower's measured state comes from.
+    type Follower = watch::Sender<Option<ArmState>>;
+
+    /// Both arms' channels and planners as [`followed_arms`] gives them, the
+    /// followers' senders dropped.
+    fn both_arms() -> (ArmPair<ArmChannels>, ArmPair<Planner>) {
+        let (channels, _followers, planners) = followed_arms();
+        (channels, planners)
+    }
+
+    /// Both arms as [`both_arms`] gives them, the left planner holding 0.2
+    /// rad off [`BOTH_HELD`], where the left arm measures, at joint 1 and 0.3 rad
+    /// at joint 3.
+    fn left_lagging() -> (ArmPair<ArmChannels>, ArmPair<Planner>) {
+        let (channels, mut planners) = both_arms();
+        let mut lagging = BOTH_HELD.left;
+        lagging[0] += 0.2;
+        lagging[2] += 0.3;
+        planners.left = planner_holding(Side::Left, lagging);
+        (channels, planners)
+    }
+
+    /// The goal of a path of the arms `arm_names` names, 0.3 rad out at their
+    /// first joint over one second, claiming their slots as the action's
+    /// admission does, its shares reporting on the receiver this gives.
+    fn path_goal(
+        channels: &ArmPair<ArmChannels>,
+        arm_names: &[&str],
+    ) -> (PathGoal, mpsc::Receiver<ShareReport>) {
+        let arms = ArmOrder::parse(arm_names).expect("the arms of this robot");
+        let to = BOTH_HELD.map(|_, mut q| {
+            q[0] += 0.3;
+            q
+        });
+        for &side in arms.sides() {
+            assert!(channels[side].move_slot.claim(), "the arm is free");
+        }
+        let (reply, done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
+        let goal = path_goal_through(
+            &arms,
+            &[to],
+            Duration::from_secs(1),
+            test_settle(&arms),
+            reply,
+            |side| &channels[side].move_slot,
+        );
+        (goal, done_rx)
+    }
+
+    /// Serve every request queued on `requests` at `now`, the arms admitted
+    /// as `admission`: the judgments of the paths that start.
+    async fn serve_all(
+        requests: &mut mpsc::Receiver<CoordinatorRequest>,
+        channels: &mut ArmPair<ArmChannels>,
+        planners: &mut ArmPair<Planner>,
+        admission: ArmPair<Admission>,
+        now: Instant,
+    ) -> Vec<PathJudgment> {
+        serve_queued(
+            requests,
+            channels,
+            planners,
+            admission,
+            &mut ArmPair::new(None, None),
+            &|_: &watch::Receiver<Option<GripperState>>| 0.0,
+            now,
+        )
+        .await
+    }
+
+    /// Ask the loop to start the path of `goal` at `now`: the loop's answer,
+    /// and the judgment of a path that starts.
+    async fn start_path_of(
+        goal: PathGoal,
+        channels: &mut ArmPair<ArmChannels>,
+        planners: &mut ArmPair<Planner>,
+        admission: ArmPair<Admission>,
+        now: Instant,
+    ) -> (Result<(), Failure>, Option<PathJudgment>) {
+        let (requests_tx, mut requests) = mpsc::channel(1);
+        let (started, answer) = oneshot::channel();
+        requests_tx
+            .try_send(CoordinatorRequest::StartPath { goal, started })
+            .expect("queue the start");
+        let mut judgments = serve_all(&mut requests, channels, planners, admission, now).await;
+        (answer.await.expect("the loop answers"), judgments.pop())
+    }
+
+    /// A path on an arm whose follower is stale fails before any arm moves,
+    /// labelled with that arm, and frees the arms it claimed; with both arms
+    /// live, its shares hold their arms until it is judged.
+    #[tokio::test]
+    async fn a_path_on_a_stale_arm_fails_before_any_arm_moves() {
+        let (mut channels, mut planners) = both_arms();
+        let both = ["left_arm", "right_arm"];
+        let right_stale = ArmPair::new(Admission::Live, Admission::Stale);
+        let now = Instant::now();
+        let (goal, _done_rx) = path_goal(&channels, &both);
+        let (failed, judgment) =
+            start_path_of(goal, &mut channels, &mut planners, right_stale, now).await;
+        assert_eq!(
+            failed,
+            Err(stale_failure().labelled(Side::Right.arm_name()))
+        );
+        assert!(judgment.is_none());
+        assert!(channels.iter().all(|arm| !arm.move_slot.is_claimed()));
+
+        let (goal, mut done_rx) = path_goal(&channels, &both);
+        let (started, judgment) =
+            start_path_of(goal, &mut channels, &mut planners, LIVE, now).await;
+        assert_eq!(started, Ok(()));
+        assert!(judgment.is_some(), "the path waits for its judgment");
+        assert!(done_rx.try_recv().is_err(), "both shares are in flight");
+        assert!(channels.iter().all(|arm| arm.move_slot.is_claimed()));
+    }
+
+    /// A path whose action no longer waits for it starts on no arm, and its
+    /// arms are freed.
+    #[tokio::test]
+    async fn a_path_whose_action_is_gone_starts_nowhere() {
+        let (mut channels, mut planners) = both_arms();
+        let (goal, _done_rx) = path_goal(&channels, &["left_arm"]);
+        let (requests_tx, mut requests) = mpsc::channel(1);
+        let (started, answer) = oneshot::channel();
+        drop(answer);
+        requests_tx
+            .try_send(CoordinatorRequest::StartPath { goal, started })
+            .expect("queue the start");
+        let judgments = serve_all(
+            &mut requests,
+            &mut channels,
+            &mut planners,
+            LIVE,
+            Instant::now(),
+        )
+        .await;
+        assert!(judgments.is_empty());
+        assert!(!channels.left.move_slot.is_claimed(), "the arm is freed");
+        let (goal, _done_rx) = path_goal(&channels, &["left_arm"]);
+        let (started, _) =
+            start_path_of(goal, &mut channels, &mut planners, LIVE, Instant::now()).await;
+        assert_eq!(started, Ok(()), "the arm takes the next path");
+    }
+
+    /// A stop ends the path of every execute_joint_path goal queued behind
+    /// it before the path starts, each arm cancelled for the stop's reason
+    /// with the joints it measures, and frees its arms; a path queued after
+    /// the stop's tick starts.
+    #[tokio::test]
+    async fn a_stop_ends_a_path_queued_behind_it_before_the_path_starts() {
+        let (mut channels, mut planners) = both_arms();
+        let (requests_tx, mut requests) = mpsc::channel(2);
+        let (reply, stopped) = oneshot::channel();
+        requests_tx
+            .try_send(CoordinatorRequest::Stop {
+                reason: "the operator asked".to_string(),
+                reply,
+            })
+            .expect("queue the stop");
+        let (goal, mut done_rx) = path_goal(&channels, &["right_arm", "left_arm"]);
+        let (started, answer) = oneshot::channel();
+        requests_tx
+            .try_send(CoordinatorRequest::StartPath { goal, started })
+            .expect("queue the start");
+        let now = Instant::now();
+        let judgments = serve_all(&mut requests, &mut channels, &mut planners, LIVE, now).await;
+        assert!(judgments.is_empty(), "no path starts");
+        assert!(stopped.await.expect("the loop answers the stop").is_empty());
+        assert_eq!(answer.await.expect("the loop takes the path"), Ok(()));
+        for side in [Side::Right, Side::Left] {
+            let report = done_rx.try_recv().expect("each arm reports");
+            assert_eq!(report.side, side);
+            assert_eq!(
+                report.outcome,
+                Outcome::Cancelled("stopped: the operator asked".to_string())
+            );
+            assert_eq!(report.joints, BOTH_HELD[side]);
+            assert_eq!(report.elapsed_s, 0.0);
+        }
+        assert!(channels.iter().all(|arm| !arm.move_slot.is_claimed()));
+
+        let (goal, _done_rx) = path_goal(&channels, &["left_arm"]);
+        let (started, judgment) =
+            start_path_of(goal, &mut channels, &mut planners, LIVE, now).await;
+        assert_eq!(started, Ok(()));
+        assert!(judgment.is_some(), "a later path starts");
+    }
+
+    /// When the follower of one arm of a path of both arms goes stale, the
+    /// shares of both arms end on that tick, the stale arm's first with the
+    /// stale failure, and the live arm holds where it stands, whichever arm
+    /// goes stale.
+    #[tokio::test]
+    async fn a_stale_arm_ends_both_shares_of_a_path_on_the_same_tick() {
+        for stale in Side::BOTH {
+            let (mut channels, mut planners) = both_arms();
+            let (goal, mut done_rx) = path_goal(&channels, &["left_arm", "right_arm"]);
+            let start = Instant::now();
+            let (started, judgment) =
+                start_path_of(goal, &mut channels, &mut planners, LIVE, start).await;
+            assert_eq!(started, Ok(()));
+            let judgment = judgment.expect("the path waits for its judgment");
+            let mut checks = PathChecks::new(Arc::new(Mutex::new(OpenGuard)));
+            checks.judge(
+                judgment,
+                GuardAt::disabled(GovState::new(BOTH_HELD, ArmPair::new(1.0, 1.0))),
+            );
+            checks.resume_once_judged(&mut planners, start).await;
+            let ticks = advance_arms(&mut channels, &mut planners, LIVE, start).await;
+            commit_both(&mut planners, &ticks.map(|_, tick| tick.candidate));
+            assert!(done_rx.try_recv().is_err(), "both shares are in flight");
+
+            let live = match stale {
+                Side::Left => Side::Right,
+                Side::Right => Side::Left,
+            };
+            let admission = ArmPair::from_fn(|side| {
+                if side == stale {
+                    Admission::Stale
+                } else {
+                    Admission::Live
+                }
+            });
+            let held = planners[live].setpoint();
+            let ticks = advance_arms(
+                &mut channels,
+                &mut planners,
+                admission,
+                start + Duration::from_millis(20),
+            )
+            .await;
+            assert_eq!(ticks[live].candidate, held, "the live arm holds");
+            assert!(ticks[live].on_path.is_none());
+            let first = done_rx.try_recv().expect("both shares end on this tick");
+            assert_eq!(first.side, stale, "the stale arm's share reports first");
+            assert_eq!(
+                first.outcome,
+                Outcome::Failed(stale_failure().labelled(stale.arm_name()))
+            );
+            let second = done_rx.try_recv().expect("both shares end on this tick");
+            assert_eq!(second.side, live);
+            assert!(matches!(second.outcome, Outcome::Failed(_)), "{second:?}");
+        }
+    }
+
+    /// What the test hands a check of [`Gated`] at each of its probes.
+    enum Gate {
+        Shut,
+        Open,
+    }
+
+    /// What a check of [`Gated`] did at a probe the test handed it.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Probed {
+        /// The gate was shut: the check goes on to its next probe.
+        Shut,
+        /// The gate was open: the check lets the path through.
+        Opened,
+        /// The judgment's stop was raised: the check ended.
+        Stopped,
+    }
+
+    /// The words of a check of [`Gated`] that ended with its test.
+    const TEST_ENDED: &str = "the test ended";
+
+    /// A checker the test steps probe by probe, as a long path keeps the
+    /// checker busy until its check ends. At each probe it waits for the gate
+    /// the test hands it, ends the check once its stop is raised, as the path
+    /// checker does at its next measured probe, else lets the path through when
+    /// the gate is open, and tells the test what it did.
+    struct Gated {
+        gates: std::sync::mpsc::Receiver<Gate>,
+        probes: mpsc::UnboundedSender<Probed>,
+    }
+
+    impl PathGuard for Gated {
+        fn check(
+            &mut self,
+            _arms: PathArms,
+            _guard: &GuardAt,
+            _path: &RoundedPath,
+            stop: &AtomicBool,
+        ) -> Result<(), String> {
+            loop {
+                let Ok(gate) = self.gates.recv() else {
+                    return Err(TEST_ENDED.to_string());
+                };
+                let probed = match (stop.load(Ordering::Acquire), gate) {
+                    (true, _) => Probed::Stopped,
+                    (false, Gate::Open) => Probed::Opened,
+                    (false, Gate::Shut) => Probed::Shut,
+                };
+                if self.probes.send(probed).is_err() {
+                    return Err(TEST_ENDED.to_string());
+                }
+                match probed {
+                    Probed::Shut => {}
+                    Probed::Opened => return Ok(()),
+                    Probed::Stopped => return Err("the check stopped".to_string()),
+                }
+            }
+        }
+    }
+
+    /// The judgments of a [`Gated`] checker: where the test hands it a gate
+    /// at each probe, and what it did there.
+    fn gated_checks() -> (
+        std::sync::mpsc::Sender<Gate>,
+        mpsc::UnboundedReceiver<Probed>,
+        PathChecks,
+    ) {
+        let (gates_tx, gates) = std::sync::mpsc::channel();
+        let (probes_tx, probes) = mpsc::unbounded_channel();
+        let checker = Gated {
+            gates,
+            probes: probes_tx,
+        };
+        (
+            gates_tx,
+            probes,
+            PathChecks::new(Arc::new(Mutex::new(checker))),
+        )
+    }
+
+    /// The first probe of the check of the first path being judged: a
+    /// judgment that ends before its check probes fails the test. The check
+    /// reports each probe before it ends, so a probe that came wins.
+    async fn first_probe(
+        probes: &mut mpsc::UnboundedReceiver<Probed>,
+        path_checks: &mut PathChecks,
+    ) -> Probed {
+        tokio::select! {
+            biased;
+            probed = probes.recv() => probed.expect("the checker holds its probes"),
+            verdict = path_checks.first_verdict() => {
+                panic!("the judgment ended before its check probed: {verdict:?}")
+            }
+        }
+    }
+
+    /// The loop ticks on while the path of an execute_joint_path goal is
+    /// judged. Serving the goal returns while the checker has not judged the
+    /// path, and each tick until the judgment comes holds the path's arm
+    /// where it stands while the other arm follows its leader. The first
+    /// tick after the judgment starts the path. No tick waits on the checker:
+    /// here the checker judges nothing until the test opens its gate, after
+    /// a hundred ticks.
+    #[tokio::test]
+    async fn the_loop_ticks_on_while_a_path_is_judged() {
+        let (mut channels, mut planners) = both_arms();
+        let (gates, mut probes, mut path_checks) = gated_checks();
+        let start = Instant::now();
+        let (goal, mut done_rx) = path_goal(&channels, &["left_arm"]);
+        let (started, judgment) =
+            start_path_of(goal, &mut channels, &mut planners, LIVE, start).await;
+        assert_eq!(started, Ok(()));
+        let judgment = judgment.expect("the path waits for its judgment");
+        let held = GovState::new(BOTH_HELD, ArmPair::new(1.0, 1.0));
+        path_checks.judge(judgment, GuardAt::disabled(held));
+
+        let mut reach = BOTH_HELD.right;
+        reach[0] += 0.3;
+        channels
+            .right
+            .command
+            .send_replace(Some(Upstream::Joints(reach)));
+        let period = Duration::from_millis(10);
+        let mut now = start;
+        for _ in 0..100 {
+            channels.right.leader.note();
+            let held = measured_at_setpoints(&planners);
+            path_checks.resume_judged_by_test_guard(&mut planners, &held, now);
+            let ticks = advance_arms(&mut channels, &mut planners, LIVE, now).await;
+            assert_eq!(ticks.left.candidate, BOTH_HELD.left, "the path's arm holds");
+            commit_both(&mut planners, &ticks.map(|_, tick| tick.candidate));
+            now += period;
+        }
+        assert_eq!(
+            planners.right.setpoint(),
+            reach,
+            "the other arm followed its leader all the way"
+        );
+        assert!(path_checks.is_judging(), "the path waits for its judgment");
+        assert!(done_rx.try_recv().is_err(), "the share waits");
+        assert!(channels.left.move_slot.is_claimed(), "and holds its arm");
+
+        gates
+            .send(Gate::Open)
+            .expect("the checker waits at the gate");
+        path_checks.resume_once_judged(&mut planners, now).await;
+        assert_eq!(probes.try_recv(), Ok(Probed::Opened));
+        let ticks = advance_arms(&mut channels, &mut planners, LIVE, now + period).await;
+        assert_eq!(ticks.left.on_path, Some(PathArms::One(Side::Left)));
+        assert_ne!(ticks.left.candidate, BOTH_HELD.left, "the path's arm moves");
+    }
+
+    /// The stop ends a path while its judgment runs, and the stop's own tick
+    /// stops the judgment at its next measured probe, which frees the checker:
+    /// the judgment of the next path runs, and that path starts. The test steps
+    /// the checker probe by probe, its gate shut until the next path's check,
+    /// so the first check ends on its stop alone.
+    #[tokio::test]
+    async fn a_stop_while_a_path_is_judged_stops_its_judgment() {
+        let (mut channels, mut planners) = both_arms();
+        let (gates, mut probes, mut path_checks) = gated_checks();
+        let guard = GuardAt::disabled(GovState::new(BOTH_HELD, ArmPair::new(1.0, 1.0)));
+        let now = Instant::now();
+        let (goal, mut done_rx) = path_goal(&channels, &["left_arm"]);
+        let (started, judgment) =
+            start_path_of(goal, &mut channels, &mut planners, LIVE, now).await;
+        assert_eq!(started, Ok(()));
+        path_checks.judge(judgment.expect("the path waits for its judgment"), guard);
+        gates
+            .send(Gate::Shut)
+            .expect("the checker waits at the gate");
+        assert_eq!(
+            first_probe(&mut probes, &mut path_checks).await,
+            Probed::Shut,
+            "the check runs on"
+        );
+
+        let (requests_tx, mut requests) = mpsc::channel(1);
+        let (reply, stopped) = oneshot::channel();
+        requests_tx
+            .try_send(CoordinatorRequest::Stop {
+                reason: "the operator asked".to_string(),
+                reply,
+            })
+            .expect("queue the stop");
+        serve_all(&mut requests, &mut channels, &mut planners, LIVE, now).await;
+        stopped.await.expect("the loop answers the stop");
+        let report = done_rx.try_recv().expect("the stop ends the path's share");
+        assert_eq!(
+            report.outcome,
+            Outcome::Cancelled("stopped: the operator asked".to_string())
+        );
+
+        let held = measured_at_setpoints(&planners);
+        path_checks.resume_judged_by_test_guard(&mut planners, &held, now);
+        assert!(!path_checks.is_judging(), "no path waits for a judgment");
+        gates
+            .send(Gate::Shut)
+            .expect("the checker waits at the gate");
+        assert_eq!(
+            probes.recv().await,
+            Some(Probed::Stopped),
+            "the next probe stops"
+        );
+
+        let (goal, _done_rx) = path_goal(&channels, &["left_arm"]);
+        let (started, judgment) =
+            start_path_of(goal, &mut channels, &mut planners, LIVE, now).await;
+        assert_eq!(started, Ok(()));
+        path_checks.judge(
+            judgment.expect("the next path waits for its judgment"),
+            guard,
+        );
+        gates
+            .send(Gate::Open)
+            .expect("the checker waits at the gate");
+        path_checks.resume_once_judged(&mut planners, now).await;
+        assert_eq!(probes.try_recv(), Ok(Probed::Opened));
+        let ticks = advance_arms(
+            &mut channels,
+            &mut planners,
+            LIVE,
+            now + Duration::from_millis(10),
+        )
+        .await;
+        assert_eq!(ticks.left.on_path, Some(PathArms::One(Side::Left)));
+    }
+
+    /// A path whose goal a stop served on the same tick ends is never judged:
+    /// the stop ends the path's share, and the requests served give no
+    /// judgment.
+    #[tokio::test]
+    async fn a_path_the_stop_ends_on_the_tick_it_starts_is_never_judged() {
+        let (mut channels, mut planners) = both_arms();
+        let (requests_tx, mut requests) = mpsc::channel(2);
+        let (goal, mut done_rx) = path_goal(&channels, &["left_arm"]);
+        let (started, answer) = oneshot::channel();
+        requests_tx
+            .try_send(CoordinatorRequest::StartPath { goal, started })
+            .expect("queue the start");
+        let (reply, stopped) = oneshot::channel();
+        requests_tx
+            .try_send(CoordinatorRequest::Stop {
+                reason: "the operator asked".to_string(),
+                reply,
+            })
+            .expect("queue the stop");
+        let now = Instant::now();
+        let judgments = serve_all(&mut requests, &mut channels, &mut planners, LIVE, now).await;
+        assert!(judgments.is_empty(), "no path waits for a judgment");
+        assert_eq!(answer.await.expect("the loop takes the path"), Ok(()));
+        stopped.await.expect("the loop answers the stop");
+        let report = done_rx.try_recv().expect("the stop ends the path's share");
+        assert_eq!(
+            report.outcome,
+            Outcome::Cancelled("stopped: the operator asked".to_string())
+        );
+        assert!(!channels.left.move_slot.is_claimed(), "the arm is freed");
+    }
+
+    /// Dropping the loop's judgments stops each judgment still running: its
+    /// check, here past its first probe, ends at its next one.
+    #[tokio::test]
+    async fn dropping_the_judgments_stops_each_running_judgment() {
+        let (mut channels, mut planners) = both_arms();
+        let (gates, mut probes, mut path_checks) = gated_checks();
+        let (goal, _done_rx) = path_goal(&channels, &["left_arm"]);
+        let (started, judgment) =
+            start_path_of(goal, &mut channels, &mut planners, LIVE, Instant::now()).await;
+        assert_eq!(started, Ok(()));
+        let guard = GuardAt::disabled(GovState::new(BOTH_HELD, ArmPair::new(1.0, 1.0)));
+        path_checks.judge(judgment.expect("the path waits for its judgment"), guard);
+        gates
+            .send(Gate::Shut)
+            .expect("the checker waits at the gate");
+        assert_eq!(
+            first_probe(&mut probes, &mut path_checks).await,
+            Probed::Shut,
+            "the check runs"
+        );
+        drop(path_checks);
+        gates
+            .send(Gate::Shut)
+            .expect("the checker waits at the gate");
+        assert_eq!(probes.recv().await, Some(Probed::Stopped));
+    }
+
+    /// A path of an arm whose command lags where the arm measures holds the
+    /// command where it stands while the path is judged, and starts on the
+    /// judgment with the command moved onto the path's run start, where the
+    /// arm measures: the path's first step runs from there.
+    #[tokio::test]
+    async fn a_path_starts_with_its_arms_command_moved_onto_where_the_arm_measures() {
+        let (mut channels, mut planners) = left_lagging();
+        let lagging = planners.left.setpoint();
+        let (gates, mut probes, mut path_checks) = gated_checks();
+        let start = Instant::now();
+        let (goal, mut done_rx) = path_goal(&channels, &["left_arm"]);
+        let (started, judgment) =
+            start_path_of(goal, &mut channels, &mut planners, LIVE, start).await;
+        assert_eq!(started, Ok(()));
+        path_checks.judge(
+            judgment.expect("the path waits for its judgment"),
+            GuardAt::disabled(GovState::new(BOTH_HELD, ArmPair::new(1.0, 1.0))),
+        );
+        let period = Duration::from_millis(10);
+        let measured = measuring_held();
+        let mut now = start;
+        for _ in 0..10 {
+            path_checks.resume_judged_by_test_guard(&mut planners, &measured, now);
+            let ticks = advance_arms(&mut channels, &mut planners, LIVE, now).await;
+            assert_eq!(
+                ticks.left.candidate, lagging,
+                "the command holds while the path is judged"
+            );
+            commit_both(&mut planners, &ticks.map(|_, tick| tick.candidate));
+            now += period;
+        }
+
+        gates
+            .send(Gate::Open)
+            .expect("the checker waits at the gate");
+        path_checks
+            .first_verdict()
+            .await
+            .expect("the check lets the path through");
+        assert_eq!(probes.try_recv(), Ok(Probed::Opened));
+        path_checks.resume_judged_by_test_guard(&mut planners, &measured, now);
+        assert_eq!(
+            planners.left.setpoint(),
+            BOTH_HELD.left,
+            "the command moves onto the path's run start"
+        );
+        let ticks = advance_arms(&mut channels, &mut planners, LIVE, now + period).await;
+        assert_eq!(ticks.left.on_path, Some(PathArms::One(Side::Left)));
+        let mut to = BOTH_HELD.left;
+        to[0] += 0.3;
+        let off = distance_to_segment(&ticks.left.candidate, &BOTH_HELD.left, &to);
+        assert!(off < 1e-12, "the first step runs {off} rad off the path");
+        assert_ne!(ticks.left.candidate, BOTH_HELD.left, "the path's arm moves");
+        assert!(done_rx.try_recv().is_err(), "and nothing failed");
+    }
+
+    /// A path its judgment refuses fails with the judgment's failure, running
+    /// none of the path, frees its arm and leaves the arm's command where it
+    /// held, off where the arm measures.
+    #[tokio::test]
+    async fn a_refused_path_leaves_its_arms_command_where_it_held() {
+        let (mut channels, mut planners) = left_lagging();
+        let lagging = planners.left.setpoint();
+        let start = Instant::now();
+        let (goal, mut done_rx) = path_goal(&channels, &["left_arm"]);
+        let (started, judgment) =
+            start_path_of(goal, &mut channels, &mut planners, LIVE, start).await;
+        assert_eq!(started, Ok(()));
+        let mut path_checks = PathChecks::new(Arc::new(Mutex::new(Refusing)));
+        path_checks.judge(
+            judgment.expect("the path waits for its judgment"),
+            GuardAt::disabled(GovState::new(BOTH_HELD, ArmPair::new(1.0, 1.0))),
+        );
+        let refused = Failure::new(FailureKind::Unreachable, ARMS_WOULD_MEET);
+        assert_eq!(path_checks.first_verdict().await, Err(refused.clone()));
+        path_checks.resume_judged_by_test_guard(&mut planners, &measuring_held(), start);
+        let report = done_rx.try_recv().expect("the path ends on this tick");
+        assert_eq!(report.outcome, Outcome::Failed(refused));
+        assert!(!channels.left.move_slot.is_claimed(), "the arm is freed");
+        assert!(!path_checks.is_judging(), "no path waits for a judgment");
+        let ticks = advance_arms(&mut channels, &mut planners, LIVE, start).await;
+        assert_eq!(
+            ticks.left.candidate, lagging,
+            "the command holds where it held"
+        );
+    }
+
+    /// A checker that panics.
+    struct Panicking;
+
+    impl PathGuard for Panicking {
+        fn check(
+            &mut self,
+            _arms: PathArms,
+            _guard: &GuardAt,
+            _path: &RoundedPath,
+            _stop: &AtomicBool,
+        ) -> Result<(), String> {
+            panic!("the test's checker panics");
+        }
+    }
+
+    /// A path whose checker panics fails with `attempt_failed` once the loop
+    /// finds the verdict its checker's thread dropped, and frees its arm.
+    #[test]
+    fn a_path_whose_checker_panics_fails_with_attempt_failed() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a runtime");
+        let (mut channels, mut planners) = both_arms();
+        let (goal, mut done_rx) = path_goal(&channels, &["left_arm"]);
+        let mut path_checks = PathChecks::new(Arc::new(Mutex::new(Panicking)));
+        let now = Instant::now();
+        runtime.block_on(async {
+            let (started, judgment) =
+                start_path_of(goal, &mut channels, &mut planners, LIVE, now).await;
+            assert_eq!(started, Ok(()));
+            path_checks.judge(
+                judgment.expect("the path waits for its judgment"),
+                GuardAt::disabled(GovState::new(BOTH_HELD, ArmPair::new(1.0, 1.0))),
+            );
+        });
+        // Dropping the runtime waits for its blocking threads: the checker's
+        // thread has panicked and dropped the verdict.
+        drop(runtime);
+        path_checks.resume_judged_by_test_guard(&mut planners, &measuring_held(), now);
+        let report = done_rx.try_recv().expect("the path ends");
+        assert_eq!(
+            report.outcome,
+            Outcome::Failed(Failure::new(
+                FailureKind::AttemptFailed,
+                "the check of the path against the robot's body failed"
+            ))
+        );
+        assert!(!channels.left.move_slot.is_claimed(), "the arm is freed");
+        assert!(!path_checks.is_judging(), "no path waits for a judgment");
+    }
+
+    /// The silence after which a test follower's arm freezes.
+    const STALE_LIMIT: Duration = Duration::from_millis(100);
+
+    /// Run the first half of the tick ([`admit_and_serve`]) on which the
+    /// right arm's follower delivers again after a silence that froze its
+    /// arm, the left one delivering throughout, each measuring its arm of
+    /// `measuring`, with `requests` queued and each path that starts judged on
+    /// `path_checks` against a disabled guard: that tick's admissions and its
+    /// instant.
+    async fn serve_as_right_recovers(
+        channels: &mut ArmPair<ArmChannels>,
+        followers: &ArmPair<Follower>,
+        planners: &mut ArmPair<Planner>,
+        measuring: ArmPair<JointVec>,
+        requests: Vec<CoordinatorRequest>,
+        path_checks: &mut PathChecks,
+    ) -> (ArmPair<Admission>, Instant) {
+        let start = Instant::now();
+        let mut liveness = ArmPair::from_fn(|_| Liveness::seeded(start));
+        let mut cadence = ArmPair::from_fn(|_| Cadence::new(100, start));
+        for side in Side::BOTH {
+            let _ = channels[side].measured.borrow_and_update();
+        }
+        let silent = start + 2 * STALE_LIMIT;
+        followers.left.send_replace(standing_at(measuring.left));
+        let frozen = admit_arms(
+            &mut liveness,
+            &mut cadence,
+            channels,
+            planners,
+            silent,
+            STALE_LIMIT,
+        );
+        assert_eq!(frozen, ArmPair::new(Admission::Live, Admission::Stale));
+        let _ = channels.left.measured.borrow_and_update();
+        for side in Side::BOTH {
+            followers[side].send_replace(standing_at(measuring[side]));
+        }
+        let (requests_tx, mut queued) = mpsc::channel(requests.len().max(1));
+        for request in requests {
+            requests_tx.try_send(request).expect("queue the request");
+        }
+        let back = silent + Duration::from_millis(10);
+        let state = TickState {
+            arm_liveness: &mut liveness,
+            arm_cadence: &mut cadence,
+            channels,
+            planners,
+            commanded_grippers: &ArmPair::from_fn(|_| CommandedOpening::idle(1.0)),
+            requests: &mut queued,
+            gripper_moves: &mut ArmPair::new(None, None),
+            path_checks,
+        };
+        let admission = admit_and_serve(
+            state,
+            &|_: &watch::Receiver<Option<GripperState>>| 0.0,
+            GuardAt::disabled,
+            back,
+            STALE_LIMIT,
+        )
+        .await;
+        assert_eq!(
+            admission,
+            ArmPair::new(Admission::Live, Admission::Reanchor)
+        );
+        (admission, back)
+    }
+
+    /// A plan check served on the tick the arm's follower recovers plans from
+    /// the arm's measured pose, where the tick re-anchors it, as a move_arm
+    /// goal the arm's planner takes on that tick does.
+    #[tokio::test]
+    async fn a_plan_check_as_the_follower_recovers_plans_from_where_the_arm_stands() {
+        let (mut channels, followers, mut planners) = followed_arms();
+        let mut recovered = BOTH_HELD.right;
+        recovered[0] += 0.2;
+        let tolerance = PoseTolerance {
+            position_m: 0.001,
+            orientation_rad: 0.01,
+        };
+        let pose = planner_holding(Side::Right, recovered).world_ee_pose(&recovered);
+        let target = Isometry3::from_parts(
+            (pose.translation.vector + Vector3::new(0.0, 0.0, 0.02)).into(),
+            pose.rotation,
+        );
+        let check_from = |held: JointVec| {
+            planner_holding(Side::Right, held).check_cartesian(&target, tolerance, Duration::ZERO)
+        };
+        let (from_recovered, from_frozen) = (check_from(recovered), check_from(BOTH_HELD.right));
+        assert_ne!(from_recovered, from_frozen, "the two starts plan apart");
+        let (reply, answer) = oneshot::channel();
+        let request = ArmMoveRequest {
+            side: Side::Right,
+            target,
+            tolerance,
+            duration: Duration::ZERO,
+        };
+        serve_as_right_recovers(
+            &mut channels,
+            &followers,
+            &mut planners,
+            ArmPair::new(BOTH_HELD.left, recovered),
+            vec![CoordinatorRequest::CheckArmMove { request, reply }],
+            &mut PathChecks::new(Arc::new(Mutex::new(OpenGuard))),
+        )
+        .await;
+        assert_eq!(answer.await.expect("the loop answers"), from_recovered);
+    }
+
+    /// A checker that lets every path through, recording the guard each
+    /// path is checked against and where each path starts.
+    #[derive(Default)]
+    struct Recording(Vec<(GuardAt, Vec<f64>)>);
+
+    impl PathGuard for Recording {
+        fn check(
+            &mut self,
+            _arms: PathArms,
+            guard: &GuardAt,
+            path: &RoundedPath,
+            _stop: &AtomicBool,
+        ) -> Result<(), String> {
+            self.0.push((*guard, path.at(0.0)));
+            Ok(())
+        }
+    }
+
+    /// A path whose arm measures elsewhere once its judgment comes, within
+    /// its start tolerance, is checked again from where the arm stands,
+    /// against the guard as the tick holds it, the command holding, and
+    /// starts once that judgment comes, its command moved onto where the arm
+    /// measures: the left shoulder moves 0.005 rad, and the right arm's
+    /// command 0.2 rad between the two checks.
+    #[tokio::test]
+    async fn a_path_whose_arm_moved_while_judged_is_checked_again_from_where_it_stands() {
+        let (mut channels, mut planners) = both_arms();
+        let recording = Arc::new(Mutex::new(Recording::default()));
+        let mut path_checks = PathChecks::new(recording.clone());
+        let start = Instant::now();
+        let (goal, _done_rx) = path_goal(&channels, &["left_arm"]);
+        let (started, judgment) =
+            start_path_of(goal, &mut channels, &mut planners, LIVE, start).await;
+        assert_eq!(started, Ok(()));
+        let judgment = judgment.expect("the path waits for its judgment");
+        path_checks.judge(judgment, test_guard(&planners));
+        path_checks
+            .first_verdict()
+            .await
+            .expect("the check lets the path through");
+        let mut moved = BOTH_HELD.left;
+        moved[0] += 0.005;
+        let measured = ArmPair::new(Ok(moved), Ok(BOTH_HELD.right));
+        let mut right = BOTH_HELD.right;
+        right[0] += 0.2;
+        planners.right.seed_from_measured(right);
+        path_checks.resume_judged_by_test_guard(&mut planners, &measured, start);
+        assert!(
+            path_checks.is_judging(),
+            "the path waits for its next judgment"
+        );
+        assert_eq!(
+            planners.left.setpoint(),
+            BOTH_HELD.left,
+            "the command holds"
+        );
+        path_checks
+            .first_verdict()
+            .await
+            .expect("the check lets the path through again");
+        path_checks.resume_judged_by_test_guard(&mut planners, &measured, start);
+        assert!(!path_checks.is_judging(), "the path starts");
+        assert_eq!(
+            planners.left.setpoint(),
+            moved,
+            "the command moves onto where the arm measures"
+        );
+        let recorded = recording.lock().expect("the checks ended");
+        let starts: Vec<&[f64]> = recorded
+            .0
+            .iter()
+            .map(|(_, path_start)| &path_start[..ARM_DOF])
+            .collect();
+        assert_eq!(starts, [&BOTH_HELD.left[..], &moved[..]]);
+        let guards: Vec<GuardAt> = recorded.0.iter().map(|(guard, _)| *guard).collect();
+        let right_at = |right| {
+            GuardAt::disabled(GovState::new(
+                ArmPair::new(BOTH_HELD.left, right),
+                ArmPair::new(1.0, 1.0),
+            ))
+        };
+        assert_eq!(guards, [right_at(BOTH_HELD.right), right_at(right)]);
+    }
+
+    /// A path of the left arm that starts on the tick the right arm's
+    /// follower recovers is checked with the right arm where it stands: the
+    /// tick re-anchors the right arm on its measured pose as it admits the
+    /// followers, before it serves the path's goal.
+    #[tokio::test]
+    async fn a_path_that_starts_as_the_other_follower_recovers_is_checked_where_that_arm_stands() {
+        let (mut channels, followers, mut planners) = followed_arms();
+        let mut recovered = BOTH_HELD.right;
+        recovered[0] += 0.2;
+        let recording = Arc::new(Mutex::new(Recording::default()));
+        let mut path_checks = PathChecks::new(recording.clone());
+        let (goal, _done_rx) = path_goal(&channels, &["left_arm"]);
+        let (started, answer) = oneshot::channel();
+        serve_as_right_recovers(
+            &mut channels,
+            &followers,
+            &mut planners,
+            ArmPair::new(BOTH_HELD.left, recovered),
+            vec![CoordinatorRequest::StartPath { goal, started }],
+            &mut path_checks,
+        )
+        .await;
+        assert_eq!(answer.await.expect("the loop takes the path"), Ok(()));
+        path_checks
+            .first_verdict()
+            .await
+            .expect("the check lets the path through");
+        let recorded = recording.lock().expect("the check ended");
+        let [(guard, path_start)] = &recorded.0[..] else {
+            panic!("the path is checked once: {:?}", recorded.0);
+        };
+        assert_eq!(
+            *guard,
+            GuardAt::disabled(GovState::new(
+                ArmPair::new(BOTH_HELD.left, recovered),
+                ArmPair::new(1.0, 1.0)
+            ))
+        );
+        assert_eq!(
+            path_start[ARM_DOF..],
+            recovered,
+            "the path holds the right arm there"
+        );
+    }
+
+    /// A path of both arms that starts on the tick the right arm's follower
+    /// recovers runs from where both arms measure: the recovery re-anchors
+    /// the right arm's command on its measured pose, the left arm's command
+    /// holds off its measured pose while the path is judged, and the path
+    /// starts with both commands moved onto its run start. Every command
+    /// from then on lies on the path from there.
+    #[tokio::test]
+    async fn a_path_of_both_arms_that_starts_as_a_follower_recovers_runs_from_where_both_measure() {
+        let (mut channels, followers, mut planners) = followed_arms();
+        let mut recovered = BOTH_HELD.right;
+        recovered[0] += 0.2;
+        let mut left = BOTH_HELD.left;
+        left[0] += 0.3;
+        let start = ArmPair::new(left, recovered);
+        let (gates, mut probes, mut path_checks) = gated_checks();
+        let (goal, _done_rx) = path_goal(&channels, &["left_arm", "right_arm"]);
+        let (started, answer) = oneshot::channel();
+        let (admission, now) = serve_as_right_recovers(
+            &mut channels,
+            &followers,
+            &mut planners,
+            start,
+            vec![CoordinatorRequest::StartPath { goal, started }],
+            &mut path_checks,
+        )
+        .await;
+        assert_eq!(answer.await.expect("the loop takes the path"), Ok(()));
+        assert_eq!(
+            ArmPair::from_fn(|side| planners[side].setpoint()),
+            ArmPair::new(BOTH_HELD.left, recovered),
+            "the recovery re-anchors the right arm's command and the left one holds"
+        );
+        gates
+            .send(Gate::Open)
+            .expect("the checker waits at the gate");
+        path_checks
+            .first_verdict()
+            .await
+            .expect("the check lets the path through");
+        assert_eq!(probes.try_recv(), Ok(Probed::Opened));
+
+        let measured = start.map(|_, q| Ok(q));
+        path_checks.resume_judged_by_test_guard(&mut planners, &measured, now);
+        assert_eq!(
+            ArmPair::from_fn(|side| planners[side].setpoint()),
+            start,
+            "both commands move onto the path's run start"
+        );
+        let to = BOTH_HELD.map(|_, mut q| {
+            q[0] += 0.3;
+            q
+        });
+        let (from, to) = (dual_joints(&start), dual_joints(&to));
+        let period = Duration::from_millis(10);
+        let mut tick_admission = admission;
+        for k in 0..10 {
+            let at = now + period * k;
+            let ticks = advance_arms(&mut channels, &mut planners, tick_admission, at).await;
+            tick_admission = LIVE;
+            let candidates = chase_together(&planners, ticks.map(|_, tick| tick.candidate));
+            commit_both(&mut planners, &candidates);
+            let commanded = dual_joints(&ArmPair::from_fn(|side| planners[side].setpoint()));
+            let off = distance_to_segment(&commanded, &from, &to);
+            assert!(off < 1e-12, "tick {k} commands {off} rad off the path");
+        }
+        assert_ne!(
+            ArmPair::from_fn(|side| planners[side].setpoint()),
+            start,
+            "the path moves the arms"
+        );
+    }
+
+    /// Both arms on their shares of one path of both arms step along that
+    /// path; otherwise each arm on a path steps along its own.
+    #[test]
+    fn the_arms_step_along_one_path_only_when_both_follow_its_shares() {
+        let both = Some(PathArms::Both);
+        assert_eq!(paths_of(ArmPair::new(both, both)), [PathArms::Both]);
+        assert_eq!(
+            paths_of(ArmPair::new(both, None)),
+            [PathArms::One(Side::Left)]
+        );
+        assert_eq!(
+            paths_of(ArmPair::new(Some(PathArms::One(Side::Left)), both)),
+            [PathArms::One(Side::Left), PathArms::One(Side::Right)]
+        );
+        assert!(paths_of(ArmPair::new(None, None)).is_empty());
     }
 }

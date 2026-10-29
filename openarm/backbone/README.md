@@ -16,7 +16,8 @@ each slot.
  collision_ctrl --> +--------------------------------+ --> collision_status, limb_states
  (governor_control) |          coordinator           |     (readout topics)
  move_arm[_joints]  |  planners --> GOVERNOR --> pub | --> get_limb_names (service)
- move_gripper ----> |  (per arm)    (16 DOF)         |     (answered from bringup)
+ execute_joint_path |  (per arm)    (16 DOF)         |     (answered from bringup)
+ move_gripper ----> |                                |
                     +--------------------------------+
                            v             v
                   joint_setpoints        |    gripper_setpoints  [pairing slots, follower side]
@@ -44,15 +45,28 @@ fingers identically.
    silent; the first delivery back re-anchors the setpoint on the measured
    pose, so a restarted follower is never handed the drift it accumulated
    while nobody could see the arm.
-4. **Advance the arms** - each planner turns its inputs (streamed command or an
+4. **Serve the requests** (`admit_and_serve`) - the stop, the plan checks,
+   the grasp measurements and the starts of `execute_joint_path` paths queued
+   since the last tick, after the followers are admitted: a plan check, or a
+   path that starts, on the tick an arm's follower recovers plans from the
+   arm's re-anchored setpoint, where the arm stands, as a `move_arm` goal its
+   planner takes that tick does. Each path that starts is handed to its
+   judgment, and the shares of each path whose judgment came resume.
+5. **Advance the arms** - each planner turns its inputs (streamed command or an
    in-flight move) into a rate-limited candidate, and hands out the side's
-   end-effector Jacobian when the target came from the operator's stream.
-5. **Service gripper moves** - `move_gripper` goals chase through the same
+   end-effector Jacobian when the target came from the operator's stream. An
+   arm on an `execute_joint_path` path holds its command until the path
+   plays, then proposes the next point of its path, at one pace with the
+   other arm of a path of both.
+6. **Service gripper moves** - `move_gripper` goals chase through the same
    governed configuration as everything else, then hold their target until
    the jaws stand still, or the goal's settle timeout passes, after the
    planned end of the commanded travel, then report where the jaws stand.
-6. **Govern** - one `Governor::govern` call over the whole 16-DOF step.
-7. **Publish** - governed setpoints to the follower slots, measured states
+7. **Govern** - one `Governor::govern_along` call over the whole 16-DOF step.
+   The arms of an `execute_joint_path` path are scaled along their step as a
+   whole, and their planners play the path's clock on by the share of the
+   step they got.
+8. **Publish** - governed setpoints to the follower slots, measured states
    relayed up the leader slots, and the proximity readout at ~20 Hz.
 
 The action handlers admit goals before the loop runs them, and refuse each
@@ -72,10 +86,14 @@ of the same kind. A goal on a limb that executes a move is refused with
 quarter second, so a posture button pressed within about half a second of
 letting go is refused; a later press goes through.
 
+A refusal of an `execute_joint_path` goal of both arms leads with the arm's
+name (`right_arm: no fresh follower state to anchor the move from`,
+`right_arm: arm is already executing a motion`).
+
 ## The governed pipeline
 
-`Governor::govern(prev, cand, measured, hands, dt)` runs six stages, each
-contractive with respect to the last:
+`Governor::govern_along(prev, cand, measured, hands, paths, dt)` runs six
+stages, each contractive with respect to the last:
 
 ```text
  parse -> limit(speed) -> sense -> limit(tripwire) -> project -> clip
@@ -138,6 +156,7 @@ field pose.
 | Action | Goal | Refused when (`rejected`, `leader_streaming`, `precondition_failed` for a busy side) |
 |---|---|---|
 | `move_arm_joints` | `arm_name`, 7 joint positions (rad), `duration_s`, `settle_tolerances_rad` (one per joint), `settle_timeout_s` (the limb_motion contract) | non-finite, a duration or timeout outside 0 to 60 s, out of joint limits, a tolerance that is not positive or not one per joint, a leader streaming the arm, side busy |
+| `execute_joint_path` | `arms` (one arm or both, each once), each with its `arm_name`, one or more `waypoints` of 7 joint positions (rad), `expected_start_joint_positions` (empty, or 7 joint positions) and `settle_tolerances_rad` (one per joint); `duration_s`, `settle_timeout_s` (the limb_motion contract) | an unknown or repeated arm name, no waypoint, arms with different numbers of waypoints, an array that does not hold 7 values, a non-finite value, a waypoint out of an arm's joint limits, a tolerance that is not positive, a duration or timeout outside 0 to 60 s, a leader streaming a named arm, a named arm busy |
 | `move_arm` | `arm_name`, robot-frame pose (position m + quaternion `[x, y, z, w]`), `duration_s`, the plan and settle tolerances (position m, orientation rad), `settle_timeout_s` (the limb_motion contract) | non-finite, degenerate quaternion, a duration or timeout outside 0 to 60 s, a tolerance that is not positive, a settle tolerance below the plan's on its axis, a leader streaming the arm, side busy |
 | `move_gripper` | `gripper_name`, opening fraction in [0, 1], `max_effort`, `settle_timeout_s` (the limb_motion contract) | non-finite, out of range, negative effort cap, a timeout outside 0 to 60 s, a leader streaming the gripper, side busy |
 | `move_to_ready` | `duration_s` (the postures contract; both arms to the Ready posture) | non-finite, a duration outside 0 to 60 s, a leader streaming either arm, either arm busy |
@@ -219,6 +238,124 @@ sends the gripper nothing until the next gripper move or a leader's gripper
 stream. Thus the gripper
 keeps the move's target opening and `max_effort` (relayed unchanged), and
 goes on squeezing what it holds.
+
+`execute_joint_path` moves the arms its `arms` names along one path: from
+the joints each named arm measures when the path starts to play, within
+0.001 rad (below), clamped into its joint limits, whether or not the goal
+gives an expected start, through each of their waypoints in turn, the arms
+passing their k-th waypoints together, each inner corner rounded on an arc
+within 0.1 of the corner as MoveIt's time-optimal trajectory generation
+blends it, stopping where the path turns back and where every named arm's
+waypoint lies within 0.001 rad of its waypoint before in every joint
+(`control_core::path_timing::JointTrajectory`). `move_arm_joints`,
+`move_arm` and the postures start from the held setpoint. The path runs
+through both arms' joints, an arm it does not name held at its setpoint, so
+a path of one arm and a path of both are one trajectory: where one arm
+repeats its waypoint and the other does not, the path runs on, the other arm
+moving. Each goal waits until the coordinator takes it. The coordinator
+takes the goal on every named arm at once, or fails it before any arm moves
+(`planner::start_path`), with `precondition_failed` when a named arm runs
+another move, or stands farther from its `expected_start_joint_positions`,
+when it gives one, than the `start_tolerance_rad` parameter in some joint,
+the message naming the arm and the joint, counted from 1 (`left_arm stands
+0.200 rad from expected_start_joint_positions at joint 2, past the 0.010 rad
+start tolerance; plan the path from where the arm stands`). A stop ends a
+goal the coordinator has not taken, as it ends the goals queued for an arm.
+
+From then on, the named arms' commands hold where they stand, their slots
+claimed, while the path is judged beside the coordination loop
+(`path_checks.rs`) from where each named arm measures when the coordinator
+takes the goal, clamped into its joint limits, against the guard as the
+governor holds it and the other limbs where they stand then. A long path
+takes the judgment many control ticks, and the loop ticks on meanwhile. The
+path fails, running none of it:
+
+- with `rejected` when the joint velocity and acceleration caps cannot run
+  the path within 60 s, the message giving the time they take (`the joint
+  velocity and acceleration caps take 80.0 s to run this path, past the 60 s
+  a move may take; split it into paths of fewer waypoints`);
+- with `unreachable` when the path checker (`governor::PathChecker`), which
+  walks the whole path from its start on a copy of the governor's collision
+  model, the named arms where the path puts them and the other limbs where
+  they stand, each probe against the floor the guard holds a step at from
+  where the step starts, finds that the floor scan would hold an arm short,
+  or that the path closes the gap along it from a probe at or inside the
+  stop distance, where the guard's closing barrier holds every closing step
+  however short (`the robot starts with two of its links 5.0 mm apart,
+  inside the collision guard's stop distance, where the guard holds every
+  step that closes the gap, and the path closes the gap between
+  openarm_right_ee_base_link and openarm_left_ee_link1 where they stand 5.0
+  mm apart, so the guard would hold the arm short`). An arm the guard holds
+  at the stop distance can measure inside it, standing off its command
+  toward the other body; from such a start the floor is the clearance
+  there, so the path may open the gap and fails where it closes it. Inside
+  a contact the check allows none of the loss the guard's recovery rate
+  allows each tick, so it refuses a path that starts in a contact and sweeps
+  deeper on its way out, an escape the guard runs, in words that say so
+  (`the robot starts 1.2 mm deep in contact with itself, where the collision
+  guard lets a step lose clearance at up to 200 mm/s while the arm escapes
+  and the check lets it lose none, ...`). The check reads the clearance at
+  its probes, at most 0.01 rad apart along the path and at each rest: inside
+  the stop distance the floor is the clearance itself, so a probe vouches
+  for no stretch after it, and a stretch that closes the gap strictly
+  between two probes, both of which open it, the later no closer than the
+  earlier, passes the check, and the guard holds it there.
+
+A path that fails before it plays leaves each named arm's command where it
+held, and runs none of the path; once the path plays, a failure holds each
+arm where it stands.
+
+A cancel, the stop or a follower gone stale ends the goal while it waits
+for the judgment, as it ends a path that runs, and the loop stops the
+judgment at its next measured probe, which frees the checker for the next
+path: on the stop's own tick, and on the tick after a cancel or a stale
+follower ends the goal. A goal the stop ends on the tick the coordinator
+takes it is never judged. Once a judgment lets the path run, each named
+arm's run start is the joints it measures on the first tick with every
+named arm measured, clamped into its joint limits. An arm that then
+measures farther than `start_tolerance_rad` from its
+`expected_start_joint_positions`, when the goal gives one, fails the goal
+with `precondition_failed` in the words of the coordinator's first check,
+and one whose run start stands that far from where it measured when the
+goal was taken fails it with `precondition_failed` too (`left_arm stands
+0.020 rad at joint 2 from where it stood when the path was taken, past the
+0.010 rad start tolerance; send the path again`). A run start farther
+than 0.001 rad from the start the path was judged from, in some joint, has
+the path judged again from the run starts, the commands still holding, so
+the path that plays is the path a judgment passed, with its `unreachable`
+and `rejected` refusals; an arm still that far after 20 judgments fails the
+goal with `precondition_failed` (`left_arm still moved 0.008 rad at joint 1
+while its path was judged 20 times; let the arm settle and send the path
+again`). All of these come before the path plays. Otherwise each named
+arm's command moves onto the path's start, within 0.001 rad of where the
+arm stands, as a recovered follower's moves onto its measured pose, and
+each named arm's planner follows its arm's share of the judged path from
+there. Thus an arm still settling while the path is judged runs the path on
+from where it stands, and the path that runs starts within
+`start_tolerance_rad` of where the goal was taken, and of the expected
+start, in every joint. Each tick a share proposes the path's next point,
+and the governor scales the step of the path's arms as one: every stage
+takes one share of the step across the path's joints, and the floor scan's
+separating hold never parts the arms of a path of both. The path's clock
+(`control_core::timing::MotionClock`) plays on by that share; on a path of
+both arms each arm's share plays its own clone of the path's trajectory,
+and both clocks play at one pace (`planner::commit_both`). Thus the arms
+stay on the rounded path while the guard slows them, and pass each waypoint
+together. A share is judged on each tick from the first at or after its
+planned end: once its clock has played to the end and every joint stands
+within its `settle_tolerances_rad` entry of the arm's last waypoint, it
+completes, and `settle_timeout_s` after the planned end it fails with
+`timeout`: naming the joint farthest outside its tolerance of the last
+waypoint and by how much (`still 0.120 rad from the target at joint 3, 2.0
+s after the planned end`), or, with every joint within its tolerance while
+the guard held the path's clock back short of its end, `still short of the
+end of its path, 2.0 s after the planned end`. A share that fails ends the
+others, on the same tick when a follower goes stale; on a path of both arms
+its failure leads with its arm's name (`right_arm: the follower stopped
+reporting`), and the goal fails with the failure of the share that failed
+first. The goal completes once every named arm settles, and gives each
+arm's joints as its share measured them when it ended, in the order of
+`arms`, and the time since the path started.
 
 `move_to_ready` and `move_to_home` give each arm's planner a joint move to
 the posture. The goal completes when both moves ran their time out, not when
@@ -358,23 +495,26 @@ The robot's own body is not checked for hiding a point from the camera.
 | `streams.rs` | every subscription + parse-at-the-boundary types (`GripperCommand`, `ArmState`, `GripperState`) | one receive policy (`subscribe_pair` + `accept`); a malformed message is dropped with a reason, never driven |
 | `upstream.rs` | `UpstreamMode` (which upstream slot kind is followed) + `Upstream` (the parsed joint or pose command) | one command authority per arm is unrepresentable, not checked per tick |
 | `publish.rs` | every publisher (`Publishers`), one stamp/build/publish/log path | peppy vocabulary: a publisher on a slot; "wire" means the transport encoding only |
-| `coordinator.rs` | the tick, each gripper's target and chase, the upstream relay | IO orchestration; its seam with the safety core is exactly one `govern` call, which is why the governor is not folded into it |
+| `coordinator.rs` | the tick, each gripper's target and chase, the upstream relay | IO orchestration; its seam with the safety core is exactly one `govern_along` call, which is why the governor is not folded into it |
 | `gripper_move.rs` | gripper move execution: a `move_gripper` goal admitted into a free side, the terminal it gets once the jaws stand still or its settle timeout passes, and the end of its goal | the gripper analog of `planner.rs` + `settle.rs`; the coordinator drives it each tick |
 | `liveness.rs` | follower admission (`Live` / `Reanchor` / `Stale`) | delivery-cadence policy for the coordinator, independent of any message type |
 | `move_slot.rs` | `MoveSlot`, each limb's single-flight move slot (claim, release, and the `SlotRelease` a move holds), and the refusals of a busy limb | one owner for the slot the action handlers claim, and release when a goal never reaches the coordinator, and the planners and the coordinator release when they end a goal or its move |
-| `planner.rs` | per-arm mode machine (Follow / joint move / Cartesian move) -> one rate-limited candidate + the stream-tick Jacobian | knows one arm only; never the other arm, never the collision model |
+| `planner.rs` | per-arm mode machine (Follow / joint move / Cartesian move / share of an `execute_joint_path` path) -> one rate-limited candidate + the stream-tick Jacobian | knows one arm only, but for the path its share follows; never the collision model |
+| `planner/path.rs` | the shares of an `execute_joint_path` path: its start on the arms it names (`start_path`), its judgment (`judge_path`, `resume_judged_path`), the pace a committed step plays its clock at, one pace for the two clocks of a path of both arms (`commit_both`) | reaches the collision model only through the `PathGuard` `judge_path` is handed |
+| `path_checks.rs` | the judgments of `execute_joint_path` paths on a blocking thread, and the resumption of their shares on the tick each judgment comes | the loop never waits on a judgment |
 | `settle.rs` | `Settle`, `PoseTolerance` (the slack a Cartesian move is planned and settled within), the verdict an arm move gets from its planned end on, and how far a joint target or a grasp point still stands from its target | one rule for the joint and the Cartesian move |
 | `governor/mod.rs` | `GovState`, the pipeline, the runtime controls, disposition and readout | the only mutable resource is the collision model |
 | `governor/sense.rs` | the pre-projection model read (`Sensed`) | limiters and the projection decide on one snapshot |
 | `governor/model.rs` | `ConfiguredModel`, the only door to the collision model | every query takes the whole configuration; stale-placement reads are unrepresentable |
 | `governor/limiters/` | the `Limiter` trait, one module per limiter, and `allowance.rs` (the `Allowance`/`Limits` currency they speak) | everything expressible as a per-DOF fraction lives together |
+| `governor/path_check.rs` | `PathChecker`, a joint path walked against the step floor before the move starts on a copy of the governor's collision model, and `GuardAt`, the guard it is walked against | the floor scan's resolution and floor, over a whole path |
 | `governor/barrier.rs` | the projection and the floor scan | the two stages that are not per-DOF fractions |
-| `actions/` | the actions and services a caller reaches: move goal admission (validate + claim), the posture goals run to their one result, and the stop and plan-check services that ask the coordinator; each action's goal fields are parsed off the wire in its module, the times and tolerances every move goal names in `actions/mod.rs` | execution belongs to the planner/coordinator that owns the state |
+| `actions/` | the actions and services a caller reaches: move goal admission (validate + claim), the posture and `execute_joint_path` goals run to their one result, and the stop and plan-check services that ask the coordinator; each action's goal fields are parsed off the wire in its module, the times and tolerances every move goal names in `actions/mod.rs` | execution belongs to the planner/coordinator that owns the state |
 | `failure.rs` | the failure kinds of the moves and of `check_arm_move`, each given to every generated member, and the failure of a follower that stopped reporting | one failure crosses from a posture share to its posture goal |
 | `workspace.rs` | the OpenArm's part of the workspace answer from the design: reach per grasp orientation, the perception camera, the per-height reach memo it keeps, the parsing of the camera's geometry; `workspace_core::design` parses the request and composes the answer | pure: no messaging, so every answer is unit-tested without a node |
 | `camera_mounts.rs` | the camera_mounts contract: each camera resolved once at bringup into the frame that carries it, then composed with the grasp poses measured last | a mount the backbone cannot place stops bringup |
 | `workspace_service.rs` | the two workspace services and the read of the linked camera's geometry | the thin edge between the generated handlers and `workspace.rs` |
-| `types.rs` | the limb tables, the world-pose wire codec | shared primitives; `ARM_DOF`, `Side` and `ArmPair` come from `openarm_description`, `JointVec` from `srs_model` |
+| `types.rs` | the limb tables, the world-pose wire codec, both arms' joints in one vector | shared primitives; `ARM_DOF`, `Side` and `ArmPair` come from `openarm_description`, `JointVec` from `srs_model` |
 
 ## Parameters and links
 
@@ -393,15 +533,23 @@ subscribed. Link the leader into the slots that kind names, or nothing it
 streams is read and the arms never move.
 `max_ee_angular_velocity_rad_s`, required like the linear cap, caps the
 rotation of streamed poses and the servo reference; unlike the linear cap it
-is launch-time only, not retuned by the live speed control. All ten pairing slots (six toward the
-leading node, four toward the followers) are optional and established by the
-launcher: each one either names a peer, from this instance's `links` or the
-peer's own, or is declared `{ vacant: "<why>" }`, and a slot left unmentioned
-by both ends fails launch validation. Publishing on a vacant slot is a legal
-no-op, so partial deployments and monitors boot cleanly. The
-`perception_geometry` dependency slot is optional too: bind it to the
-camera_geometry provider of the perception camera (`chest` on v2) for the
-workspace answers to check the view, or leave it vacant for reach alone.
+is launch-time only, not retuned by the live speed control.
+`start_tolerance_rad`, required too, is how far (rad, each joint) an arm's
+measured joints may stand from the start of an `execute_joint_path` path:
+from the goal's `expected_start_joint_positions` when the coordinator takes
+the goal and again at the path's run start, where the arm measures once the
+path is judged; and at the run start from where it measured when the
+coordinator took the goal, both clamped into its joint limits. Set it to the
+most an arm may stand off the start its caller planned from, or move while
+its path is judged. All ten pairing slots (six toward the leading node, four
+toward the followers) are optional and established by the launcher: each one
+either names a peer, from this instance's `links` or the peer's own, or is
+declared `{ vacant: "<why>" }`, and a slot left unmentioned by both ends
+fails launch validation. Publishing on a vacant slot is a legal no-op, so
+partial deployments and monitors boot cleanly. The `perception_geometry`
+dependency slot is optional too: bind it to the camera_geometry provider of
+the perception camera (`chest` on v2) for the workspace answers to check the
+view, or leave it vacant for reach alone.
 
 ## Build, run, test
 

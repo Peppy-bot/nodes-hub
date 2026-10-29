@@ -97,17 +97,28 @@ pub fn joint_shortfall(
     target: &JointVec,
     tolerances: &JointVec,
 ) -> Option<String> {
-    // Scanned last to first, so the first of equally far joints is named,
-    // as the so101 backbone names it.
-    let (joint, error_rad) = (0..ARM_DOF)
-        .rev()
-        .map(|j| (j, (measured[j] - target[j]).abs()))
-        .filter(|&(j, error_rad)| error_rad > tolerances[j])
-        .max_by(|a, b| (a.1 - tolerances[a.0]).total_cmp(&(b.1 - tolerances[b.0])))?;
+    let (joint, error_rad) = farthest_outside(measured, target, tolerances)?;
     Some(format!(
         "{error_rad:.3} rad from the target at joint {}",
         joint + 1
     ))
+}
+
+/// The joint, counted from 0, at which `measured` stands farthest outside
+/// its tolerance in `tolerances` of `target`, and how far it stands from the
+/// target there; `None` with every joint within its tolerance.
+pub fn farthest_outside(
+    measured: &JointVec,
+    target: &JointVec,
+    tolerances: &JointVec,
+) -> Option<(usize, f64)> {
+    // Scanned last to first, so the first of equally far joints is named,
+    // as the so101 backbone names it.
+    (0..ARM_DOF)
+        .rev()
+        .map(|j| (j, (measured[j] - target[j]).abs()))
+        .filter(|&(j, error_rad)| error_rad > tolerances[j])
+        .max_by(|a, b| (a.1 - tolerances[a.0]).total_cmp(&(b.1 - tolerances[b.0])))
 }
 
 /// Where `measured` stands outside `tolerance` of `target`: the distance

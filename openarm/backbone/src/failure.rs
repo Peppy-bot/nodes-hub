@@ -2,11 +2,13 @@
 //! plan check: a failure kind that peppy or the limb_motion and postures
 //! contracts declare, and a message for a person. Each generated member has
 //! a `FailureKind` of its own with these names, and the moves pass one
-//! failure between them (a posture share ends its posture goal), so the
-//! backbone keeps its own kind and gives each member its own.
+//! failure between them (a posture share ends its posture goal, and a share
+//! of a joint path its execute_joint_path goal), so the backbone keeps its
+//! own kind and gives each member its own.
 
-use openarm_description::Side;
-use peppygen::exposed_actions::limb_motion::{move_arm, move_arm_joints, move_gripper};
+use peppygen::exposed_actions::limb_motion::{
+    execute_joint_path, move_arm, move_arm_joints, move_gripper,
+};
 use peppygen::exposed_actions::postures::{move_to_home, move_to_ready};
 use peppygen::exposed_services::limb_motion::check_arm_move;
 
@@ -16,7 +18,11 @@ pub enum FailureKind {
     /// A limb name or a value the backbone does not take.
     Rejected,
     /// A valid goal the state of the limb does not allow now: the limb
-    /// executes another move.
+    /// executes another move, or an arm of a joint path stands past the start
+    /// tolerance from the path's expected start, when the coordinator takes
+    /// the goal or at the path's run start, or at its run start from where it
+    /// stood when the goal was taken, or still moves after the path's last
+    /// judgment.
     PreconditionFailed,
     /// The follower of a limb delivers no fresh state: before its first
     /// state, or after it stopped reporting.
@@ -46,11 +52,13 @@ impl Failure {
         }
     }
 
-    /// The same failure with `side` before its message: the side of the
-    /// arm whose share of a posture goal failed.
-    pub fn labelled(self, side: Side) -> Self {
+    /// The same failure with `label` before its message: the side of the
+    /// arm whose share of a posture goal failed, or the name of the arm whose
+    /// share of a path of both arms failed, or that refused a path of both
+    /// arms.
+    pub fn labelled(self, label: impl std::fmt::Display) -> Self {
         Self {
-            message: format!("{side}: {}", self.message),
+            message: format!("{label}: {}", self.message),
             ..self
         }
     }
@@ -85,7 +93,8 @@ macro_rules! member_failure_kinds {
     };
 }
 
-// The Cartesian move and the postures list `unreachable`.
+// The joint path, the Cartesian move and the postures list `unreachable`.
+member_failure_kinds!(execute_joint_path::FailureKind, unreachable => Unreachable);
 member_failure_kinds!(move_arm::FailureKind, unreachable => Unreachable);
 member_failure_kinds!(move_to_ready::FailureKind, unreachable => Unreachable);
 member_failure_kinds!(move_to_home::FailureKind, unreachable => Unreachable);
@@ -99,6 +108,8 @@ member_failure_kinds!(check_arm_move::FailureKind, unreachable => AttemptFailed)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use openarm_description::Side;
 
     /// Each member gets the kind of the same name, and a member whose
     /// contract lists no `unreachable` gets `attempt_failed` for it.
@@ -141,5 +152,23 @@ mod tests {
             failure.labelled(Side::Left),
             Failure::new(FailureKind::Timeout, "left: still 0.2 rad from the target")
         );
+    }
+
+    /// execute_joint_path gets the kind of the same name for each kind, and
+    /// lists `unreachable`.
+    #[test]
+    fn execute_joint_path_gets_the_kind_of_the_same_name() {
+        let kinds = [
+            (FailureKind::Rejected, "rejected"),
+            (FailureKind::PreconditionFailed, "precondition_failed"),
+            (FailureKind::ResourceUnavailable, "resource_unavailable"),
+            (FailureKind::AttemptFailed, "attempt_failed"),
+            (FailureKind::Timeout, "timeout"),
+            (FailureKind::Unreachable, "unreachable"),
+            (FailureKind::LeaderStreaming, "leader_streaming"),
+        ];
+        for (kind, name) in kinds {
+            assert_eq!(execute_joint_path::FailureKind::from(kind).as_str(), name);
+        }
     }
 }
