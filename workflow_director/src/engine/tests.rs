@@ -12,7 +12,7 @@ use workflow_documents::result::{
 };
 use workflow_documents::run::{Attendance, Severity};
 
-use super::failure::{Cause, Failure};
+use super::failure::{Cause, DirectorKind, Failure};
 use super::host::{CallEnd, Host};
 use super::plan::{MonitorPlan, Plan, Target};
 use super::{Phase, ResultBase, ResumeRefusal, RunCommand, drive};
@@ -491,6 +491,218 @@ async fn a_lane_waits_for_the_signal_of_another() {
     let at = |role: &str| calls.iter().find(|sent| sent.role == role).unwrap().at_s;
     assert_eq!(at("alpha"), 0.0);
     assert!(at("beta") >= 2.0, "beta rests once alpha has: {calls:?}");
+}
+
+/// A workflow of the lanes `lanes`, each a role and its tree, on test_arm:v1.
+fn lanes(lanes: &[(&str, Json)]) -> Json {
+    let roles: serde_json::Map<String, Json> = lanes
+        .iter()
+        .map(|(role, _)| ((*role).to_owned(), json!({})))
+        .collect();
+    let actions: serde_json::Map<String, Json> = lanes
+        .iter()
+        .map(|(role, tree)| ((*role).to_owned(), json!({ "tree": tree })))
+        .collect();
+    json!({
+        "workflow_schema": "workflow/v1",
+        "manifest": { "name": "relay", "revision": 1 },
+        "task": { "objective": "An arm rests once another tells it to" },
+        "contracts": { "arm": "test_arm:v1" },
+        "roles": roles,
+        "success": "true",
+        "actions": actions,
+    })
+}
+
+/// A lane that can emit `ready`, and ends at once without emitting it.
+fn never_tells() -> Json {
+    json!({ "id": "maybe", "if": "false", "then": { "id": "tell", "signal": "ready" } })
+}
+
+/// A lane that rests, then emits `ready`.
+fn tells_after_a_rest() -> Json {
+    json!({ "id": "first", "sequence": [rest("rest"), { "id": "tell", "signal": "ready" }] })
+}
+
+/// A lane that waits for `ready` within `timeout_s`, then rests.
+fn hears_within(timeout_s: u64) -> Json {
+    json!({ "id": "second", "sequence": [
+        { "id": "hear", "wait_for": ["ready"], "timeout_s": timeout_s },
+        rest("rest"),
+    ] })
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_wait_for_on_the_signals_of_two_lanes_goes_on_while_one_of_them_runs() {
+    // alpha can tell and ends at once without telling; beta tells after its
+    // 2 s rest, and gamma hears it then.
+    let value = lanes(&[
+        ("alpha", never_tells()),
+        ("beta", tells_after_a_rest()),
+        ("gamma", hears_within(30)),
+    ]);
+    let plan = plan(&value, Attendance::Unattended);
+    let host =
+        ScriptedHost::new().answer("home", vec![Answer::after(2, json!({ "at_home": true }))]);
+    let (result, _) = run(&plan, &host, Vec::new()).await;
+    assert_eq!(result.ending, Ending::Completed, "{result:#?}");
+    let calls = host.calls_of("home");
+    let gamma = calls.iter().find(|sent| sent.role == "gamma");
+    assert!(
+        gamma.is_some_and(|sent| sent.at_s >= 2.0),
+        "gamma rests once beta told it: {calls:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_wait_for_whose_signal_does_not_come_fails_at_its_bound() {
+    // alpha can tell only after its 100 s rest, within 200 s; gamma waits 5 s
+    // for it. The abort at 300 s ends a run whose wait never ends.
+    let mut slow = rest("rest");
+    slow["timeout_s"] = json!(200);
+    let alpha = json!({ "id": "first", "sequence": [slow, { "id": "tell", "signal": "ready" }] });
+    let value = lanes(&[("alpha", alpha), ("gamma", hears_within(5))]);
+    let plan = plan(&value, Attendance::Unattended);
+    let host =
+        ScriptedHost::new().answer("home", vec![Answer::after(100, json!({ "at_home": true }))]);
+    let (result, _) = run(&plan, &host, vec![(300, RunCommand::Abort)]).await;
+    assert_eq!(result.ending, Ending::Failed, "{result:#?}");
+    let failed = result.failed.as_ref().expect("a failed step");
+    assert_eq!(
+        (failed.step.as_str(), failed.failure_kind.as_str()),
+        ("gamma.hear", "timeout")
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_wait_for_on_the_signals_of_two_lanes_fails_signal_unreachable_once_both_ended() {
+    let value = lanes(&[
+        ("alpha", never_tells()),
+        ("beta", never_tells()),
+        ("gamma", hears_within(30)),
+    ]);
+    let plan = plan(&value, Attendance::Unattended);
+    let host = ScriptedHost::new().answer("home", vec![Answer::now(json!({ "at_home": true }))]);
+    let (result, _) = run(&plan, &host, vec![(300, RunCommand::Abort)]).await;
+    assert_eq!(result.ending, Ending::Failed, "{result:#?}");
+    let failed = result.failed.as_ref().expect("a failed step");
+    assert_eq!(
+        (failed.step.as_str(), failed.failure_kind.as_str()),
+        ("gamma.hear", "signal_unreachable")
+    );
+    assert!(host.calls_of("home").is_empty(), "gamma never rests");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_lane_that_waits_only_on_suspended_lanes_suspends_with_them_and_resumes() {
+    // alpha's alert at 1 s suspends it during its 10 s rest; beta, which
+    // waits for alpha's signal alone, suspends too and runs its 2 s safe
+    // state. The resume at 30 s runs alpha's rest again, 2 s this time, and
+    // beta hears it at 32 s.
+    let mut value = lanes(&[("alpha", tells_after_a_rest()), ("beta", hears_within(20))]);
+    value["actions"]["beta"]["safe_state"] = home();
+    let plan = plan(&value, Attendance::Attended);
+    let at_home = json!({ "at_home": true });
+    let host = ScriptedHost::new().answer(
+        "home",
+        vec![
+            Answer::after(10, at_home.clone()),
+            Answer::after(2, at_home),
+        ],
+    );
+    let (reply, resumed) = oneshot::channel();
+    let commands = vec![
+        (1, hot_gripper()),
+        (30, RunCommand::Resume { reply }),
+        (200, RunCommand::Abort),
+    ];
+    let (result, _) = run(&plan, &host, commands).await;
+    assert_eq!(resumed.await.unwrap(), Ok(()));
+    assert_eq!(result.ending, Ending::Completed, "{result:#?}");
+    assert_eq!(
+        count_of(&host, EventKind::LaneSuspends),
+        2,
+        "both lanes suspend"
+    );
+    let calls = host.calls_of("home");
+    let beta_safe_state: Vec<f64> = calls
+        .iter()
+        .filter(|sent| sent.role == "beta" && sent.request["duration_s"] == json!(2))
+        .map(|sent| sent.at_s)
+        .collect();
+    assert_eq!(
+        beta_safe_state,
+        [1.0],
+        "beta suspends with alpha and runs its safe state then: {calls:?}"
+    );
+    let beta_rests: Vec<f64> = calls
+        .iter()
+        .filter(|sent| sent.role == "beta" && sent.request["duration_s"] == json!(1))
+        .map(|sent| sent.at_s)
+        .collect();
+    assert!(
+        beta_rests.len() == 1 && beta_rests[0] >= 32.0,
+        "beta rests once, after alpha told it: {calls:?}"
+    );
+}
+
+/// The failure that the clock watch gives a lane of `role` once the
+/// simulation clock stopped.
+fn clock_stopped(role: &str) -> RunCommand {
+    RunCommand::Fault {
+        role: name(role),
+        failure: Failure::of(
+            DirectorKind::ClockStopped,
+            "the simulation clock gave no tick for 10 s of wall time",
+        ),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stopped_clock_fails_each_running_lane_of_an_unattended_run() {
+    let value = with_beta(one_arm("alpha", rest("rest"), json!([])), rest("rest"));
+    let plan = plan(&value, Attendance::Unattended);
+    let host = arm().answer("home", vec![Answer::after(10, json!({ "at_home": true }))]);
+    let commands = vec![(2, clock_stopped("alpha")), (2, clock_stopped("beta"))];
+    let (result, _) = run(&plan, &host, commands).await;
+    assert_eq!(result.ending, Ending::Failed, "{result:#?}");
+    let kinds: Vec<(&str, Option<&str>)> = result
+        .lanes
+        .iter()
+        .map(|lane| (lane.role.as_str(), lane.failure_kind.as_deref()))
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            ("alpha", Some("clock_stopped")),
+            ("beta", Some("clock_stopped"))
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stopped_clock_suspends_each_running_lane_of_an_attended_run() {
+    let value = with_beta(one_arm("alpha", rest("rest"), json!([])), rest("rest"));
+    let plan = plan(&value, Attendance::Attended);
+    let host = arm().answer("home", vec![Answer::after(10, json!({ "at_home": true }))]);
+    let commands = vec![
+        (2, clock_stopped("alpha")),
+        (2, clock_stopped("beta")),
+        (60, RunCommand::Abort),
+    ];
+    let (result, _) = run(&plan, &host, commands).await;
+    assert_eq!(result.ending, Ending::Aborted, "{result:#?}");
+    assert_eq!(
+        count_of(&host, EventKind::LaneSuspends),
+        2,
+        "both lanes suspend"
+    );
+    let kinds: Vec<&str> = result
+        .incidents
+        .iter()
+        .map(|incident| incident.failure_kind.as_str())
+        .collect();
+    assert_eq!(kinds, ["clock_stopped", "clock_stopped"]);
 }
 
 /// A look, then a grab beside a rest of the same arm.
