@@ -19,7 +19,7 @@ use workflow_documents::result::{
 };
 use workflow_documents::run::{RoleBinding, RunDocument, VersionPolicy};
 use workflow_documents::{
-    EventKind, KnownLocation, Located, Name, NameTag, RobotName, Run, Sha256, Workflow,
+    EventKind, KnownLocation, Located, Name, NameTag, RobotName, Run, Sha256, WorkCell, Workflow,
     run_lease_name,
 };
 
@@ -794,7 +794,7 @@ impl Director {
                         return Err(refuse(base, format!("roles: {reason}"), Vec::new()));
                     }
                 };
-                RunDocument::of_roles(&workflow, named).map_err(|refusals| {
+                RunDocument::of_roles(&workflow, named, WorkCell::new()).map_err(|refusals| {
                     refuse(
                         base.clone(),
                         "the roles do not fit the workflow".to_owned(),
@@ -1511,6 +1511,9 @@ pub fn empty_result() -> RunResult {
         differences: Vec::new(),
         unlocked_nodes: Vec::new(),
         incidents: Vec::new(),
+        work_cell: WorkCell::new(),
+        watch: BTreeMap::new(),
+        uncovered: Vec::new(),
     }
 }
 
@@ -1598,7 +1601,7 @@ mod tests {
     ) -> Result<BTreeMap<Name, RobotName>, Vec<String>> {
         let workflow = workflow(&rest());
         let named: BTreeMap<Name, RobotName> = serde_json::from_value(roles).unwrap();
-        let mut document = RunDocument::of_roles(&workflow, named).unwrap();
+        let mut document = RunDocument::of_roles(&workflow, named, WorkCell::new()).unwrap();
         document.attendance = attendance;
         bind(
             &workflow,
@@ -1660,7 +1663,7 @@ mod tests {
             .contracts
             .retain(|contract| contract.name != "locations");
         let fleet = snapshot(vec![unknowing, robot("baker")]);
-        let document = RunDocument::of_roles(&workflow, BTreeMap::new()).unwrap();
+        let document = RunDocument::of_roles(&workflow, BTreeMap::new(), WorkCell::new()).unwrap();
         let binding = bind(
             &workflow,
             &document,
@@ -1698,7 +1701,8 @@ mod tests {
         physical.kind = "physical".to_owned();
         let fleet = snapshot(vec![physical, robot("baker")]);
         let workflow = workflow(&rest());
-        let mut document = RunDocument::of_roles(&workflow, BTreeMap::new()).unwrap();
+        let mut document =
+            RunDocument::of_roles(&workflow, BTreeMap::new(), WorkCell::new()).unwrap();
         document.attendance = Attendance::Attended;
         document.confirmed = [name("clear")].into();
         let binding = bind(
@@ -1752,7 +1756,12 @@ mod tests {
         let workflow = workflow(&rest());
         let elsewhere = BTreeMap::from([(robot_name("alpha"), Holder::Run("r1".to_owned()))]);
         let document = |roles: serde_json::Value| {
-            RunDocument::of_roles(&workflow, serde_json::from_value(roles).unwrap()).unwrap()
+            RunDocument::of_roles(
+                &workflow,
+                serde_json::from_value(roles).unwrap(),
+                WorkCell::new(),
+            )
+            .unwrap()
         };
         let named = bind(
             &workflow,

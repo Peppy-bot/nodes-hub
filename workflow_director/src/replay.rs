@@ -914,6 +914,7 @@ fn compare(
 mod tests {
     use serde_json::json;
     use tokio::sync::{mpsc, watch};
+    use workflow_documents::WorkCell;
     use workflow_documents::run::{Attendance, RunDocument};
 
     use super::*;
@@ -1035,7 +1036,7 @@ mod tests {
             binding: binding.clone(),
             run_document: RunDocument {
                 attendance,
-                ..RunDocument::of_roles(&workflow, binding).unwrap()
+                ..RunDocument::of_roles(&workflow, binding, WorkCell::new()).unwrap()
             },
             poll_s: 0.5,
             cancel_timeout_ns: 10_000_000_000,

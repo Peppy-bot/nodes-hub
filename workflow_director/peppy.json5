@@ -32,6 +32,9 @@
         { link_id: "director", name: "status" },
         { link_id: "director", name: "journal" },
         { link_id: "director", name: "replay" },
+        { link_id: "director", name: "judge_checks" },
+        { link_id: "director", name: "judge_ending" },
+        { link_id: "director", name: "forget_robot" },
       ],
       consumes: [
         { link_id: "fleet", name: "list" },
@@ -49,6 +52,8 @@
         { link_id: "director", name: "resume" },
         { link_id: "director", name: "abort" },
         { link_id: "director", name: "locations" },
+        { link_id: "director", name: "trial" },
+        { link_id: "director", name: "next_run" },
       ],
       consumes: [
         { link_id: "fleet", name: "changes" },

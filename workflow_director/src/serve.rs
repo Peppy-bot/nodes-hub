@@ -361,7 +361,7 @@ fn answer_runs(
             }
         })
         .collect::<Vec<_>>();
-    Ok(runs::Response::new(newest_first(runs)))
+    Ok(runs::Response::new(Vec::new(), newest_first(runs)))
 }
 
 /// The runs by their number, newest first.

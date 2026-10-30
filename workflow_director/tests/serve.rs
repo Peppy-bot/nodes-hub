@@ -85,6 +85,7 @@ async fn run_on_alpha(rig: &Rig, workflow: String) -> peppygen::Result<run::Goal
         bundle: None,
         run_document: None,
         roles: Some(on_alpha()),
+        work_cell: None,
         started_by: Some("tests".to_owned()),
         caller_data: None,
     };
@@ -399,6 +400,7 @@ async fn a_run_whose_workflow_breaks_its_schema_starts_and_is_refused() -> peppy
         bundle: None,
         run_document: None,
         roles: Some(on_alpha()),
+        work_cell: None,
         started_by: Some("tests".to_owned()),
         caller_data: None,
     };
