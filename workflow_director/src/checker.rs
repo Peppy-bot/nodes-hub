@@ -23,7 +23,7 @@ use crate::config::AllowedContracts;
 use crate::contract::{ContractShape, Field, FieldKind, Format, Member};
 use crate::engine::plan::{
     BoundArg, BoundCall, BoundObservation, BoundRole, CallSite, MemberKind, MonitorPlan,
-    ObservationRead, Plan, Producer, SkillLocations, Target,
+    ObservationRead, Plan, Producer, SkillLocations, Target, Watch,
 };
 use crate::fleet::{LOCATIONS, Robot, Snapshot};
 
@@ -34,6 +34,7 @@ pub struct RunChoices<'a> {
     pub incidents: &'a Incidents,
     pub poll: workflow_documents::Bound,
     pub cancel_timeout: std::time::Duration,
+    pub watch: Watch,
 }
 
 /// Where each name of a role comes from: the role whose call or
@@ -469,6 +470,7 @@ impl<'a> Checker<'a> {
             Ok(ty) => {
                 let fits = match want {
                     Want::Bool => ty == Type::Bool,
+                    Want::Number => is_number(&ty),
                     Want::Enum => matches!(ty, Type::Enum(_)),
                     Want::List => matches!(ty, Type::List(_)),
                 };
@@ -1094,12 +1096,18 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn check_whole_run_expressions(&mut self) {
+    /// The scope of the expressions outside the trees: the observations and
+    /// the tables.
+    fn whole_run_scope(&self) -> TypeScope {
         let mut names = self.observation_types();
         for (table, (_, ty)) in &self.tables {
             names.insert(table.clone(), ty.clone());
         }
-        let scope = TypeScope::new(names);
+        TypeScope::new(names)
+    }
+
+    fn check_whole_run_expressions(&mut self) {
+        let scope = self.whole_run_scope();
         let workflow = self.workflow;
         self.typed("success", &workflow.success, &scope, Want::Bool);
         if let Some(minimum) = &workflow.minimum {
@@ -1114,6 +1122,14 @@ impl<'a> Checker<'a> {
                     Want::Bool,
                 );
             }
+        }
+    }
+
+    /// Each watch parameter reads a number.
+    fn check_watch(&mut self, watch: &Watch) {
+        let scope = self.whole_run_scope();
+        for (name, observation) in &watch.observations {
+            self.typed(&format!("watch.{name}"), observation, &scope, Want::Number);
         }
     }
 
@@ -1164,6 +1180,7 @@ impl<'a> Checker<'a> {
 
 enum Want {
     Bool,
+    Number,
     Enum,
     List,
 }
@@ -1172,6 +1189,7 @@ impl Want {
     fn says(&self) -> &'static str {
         match self {
             Want::Bool => "the field takes a bool",
+            Want::Number => "a watch parameter reads a number",
             Want::Enum => "a `match` takes an enum",
             Want::List => "a `for_each` takes a list",
         }
@@ -1276,7 +1294,7 @@ pub fn plan(
     binding: &BTreeMap<Name, RobotName>,
     choices: RunChoices<'_>,
 ) -> Result<Plan, Vec<Located>> {
-    let checker = run_checker(
+    let mut checker = run_checker(
         &workflow,
         snapshot,
         allowed,
@@ -1284,6 +1302,7 @@ pub fn plan(
         choices.attendance,
         &choices.confirmed,
     );
+    checker.check_watch(&choices.watch);
     let mut errors = checker.errors.clone();
     let monitor = match choices.incidents {
         Incidents::None => None,
@@ -1344,6 +1363,7 @@ pub fn plan(
         locations: checker.locations,
         poll: choices.poll,
         cancel_timeout: choices.cancel_timeout,
+        watch: choices.watch,
         workflow,
     })
 }

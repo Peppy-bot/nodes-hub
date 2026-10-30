@@ -24,8 +24,9 @@ use workflow_documents::result::{
     LaneState, RUN_SUSPENDED, RunRefusal, RunResult, RunState, RunStatus, SafeStateResult,
     SuspendedLane, Suspension, ToConfirm,
 };
+use workflow_documents::work_cell::Uncovered;
 use workflow_documents::workflow::StepKind;
-use workflow_documents::{EventKind, Located, Name};
+use workflow_documents::{EventKind, Located, Name, uncovered_watch};
 
 use failure::{
     Cause, DirectorKind, Failure, LEADER_STREAMING, PRECONDITION_FAILED, RESOURCE_UNAVAILABLE,
@@ -558,13 +559,29 @@ impl<H: Host> RunCtx<'_, H> {
         truth
     }
 
+    /// The number that an expression outside a lane gives, as `truth` reads
+    /// it: the value of a watch parameter.
+    async fn number(&self, expression: &Expression) -> Result<f64, Failure> {
+        let Ok(value) = self
+            .value(expression, &Scope::new(), None, &NoInterrupt)
+            .await;
+        match value? {
+            Value::Int(int) => Ok(int as f64),
+            Value::Double(double) => Ok(double),
+            _ => Err(Failure::new(
+                PRECONDITION_FAILED,
+                format!("`{}` gives no number", expression.source()),
+            )),
+        }
+    }
+
     /// The answer of `check`, a check outside a step, within its bound
     /// ([`CHECK_BOUND_NS`]); a read that a leader's stream refuses goes
     /// again every second. `what` names the check in a timeout.
-    pub async fn bounded_check<F, Fut>(&self, what: &str, check: F) -> Result<bool, Failure>
+    pub async fn bounded_check<T, F, Fut>(&self, what: &str, check: F) -> Result<T, Failure>
     where
         F: Fn() -> Fut,
-        Fut: Future<Output = Result<bool, Failure>>,
+        Fut: Future<Output = Result<T, Failure>>,
     {
         let deadline = self.host.now() + CHECK_BOUND_NS;
         let answer = async {
@@ -672,7 +689,12 @@ async fn run_to_its_end<H: Host>(
         stop = stopped_while_checking(&ctx, &mut commands) => {
             return finish(&ctx, base, ending_of(stop), None, outcome, started).await;
         }
-        refused = assumptions(&ctx, &mut outcome) => refused,
+        refused = async {
+            match watch(&ctx, &base.result.uncovered, &mut outcome).await {
+                Some(refusal) => Some(refusal),
+                None => assumptions(&ctx, &mut outcome).await,
+            }
+        } => refused,
     };
     if let Some(refusal) = refused {
         return finish(&ctx, base, Ending::Refused, Some(refusal), outcome, started).await;
@@ -763,6 +785,10 @@ fn failed_success(read: Result<bool, Failure>) -> FailedStep {
 struct Outcome {
     assumptions: Vec<AssumptionOutcome>,
     failed: Option<FailedStep>,
+    /// The value of each watch parameter.
+    watch: BTreeMap<Name, f64>,
+    /// Each watch value that no test covered.
+    uncovered: Vec<Uncovered>,
 }
 
 fn ending_of(stop: Stop) -> Ending {
@@ -783,6 +809,47 @@ fn first_failure(ends: &BTreeMap<Name, StepEnd>) -> Option<FailedStep> {
         }),
         _ => None,
     })
+}
+
+/// Reads each watch parameter through the robots, each within the bound of
+/// a check, and gives the event `uncovered` with each value of the work cell
+/// (`work_cell`, which the director named) and each watch value that no test
+/// covered. A watch value that does not read refuses the run, naming it.
+async fn watch<H: Host>(
+    ctx: &RunCtx<'_, H>,
+    work_cell: &[Uncovered],
+    outcome: &mut Outcome,
+) -> Option<RunRefusal> {
+    let watch = &ctx.plan.watch;
+    for (name, observation) in &watch.observations {
+        let what = format!("the watch parameter `{name}`");
+        match ctx.bounded_check(&what, || ctx.number(observation)).await {
+            Ok(value) => {
+                outcome.watch.insert(name.clone(), value);
+            }
+            Err(failure) => {
+                return Some(RunRefusal {
+                    message: format!("{what} did not read: {failure}"),
+                    errors: Vec::new(),
+                    assumption: None,
+                    says: None,
+                });
+            }
+        }
+    }
+    outcome.uncovered = uncovered_watch(watch.validation.as_ref(), &outcome.watch);
+    let uncovered: Vec<&Uncovered> = work_cell.iter().chain(&outcome.uncovered).collect();
+    if !uncovered.is_empty() {
+        let message = listed(&uncovered);
+        ctx.run_event(EventKind::Uncovered, "", message, json!(uncovered));
+    }
+    None
+}
+
+/// Each value of `uncovered`, as its text says it, separated by `; `.
+pub fn listed(uncovered: &[&Uncovered]) -> String {
+    let texts: Vec<String> = uncovered.iter().map(ToString::to_string).collect();
+    texts.join("; ")
 }
 
 /// Evaluates the check of each assumption, within its bound; a false check
@@ -1291,6 +1358,9 @@ async fn finish<H: Host>(
         )
     });
     let ns = |from: u64, to: u64| to.saturating_sub(from) as f64 / 1e9;
+    let ResultBase { mut result } = base;
+    let mut uncovered = std::mem::take(&mut result.uncovered);
+    uncovered.extend(outcome.uncovered);
     RunResult {
         ending,
         lanes,
@@ -1304,7 +1374,9 @@ async fn finish<H: Host>(
             wall_s: ns(started.1, ctx.host.wall_now()),
         },
         incidents,
-        ..base.result
+        watch: outcome.watch,
+        uncovered,
+        ..result
     }
 }
 

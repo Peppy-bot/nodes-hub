@@ -692,6 +692,7 @@ async fn serve_run(director: Arc<Director>) -> peppygen::Result<()> {
                 }),
                 run_document: data.run_document,
                 roles: data.roles,
+                work_cell: data.work_cell,
                 started_by: data
                     .started_by
                     .unwrap_or_else(|| format!("{}@{}", caller.instance, caller.core_node)),
@@ -720,19 +721,21 @@ async fn serve_run(director: Arc<Director>) -> peppygen::Result<()> {
 /// fields, and text that does not parse as JSON5.
 fn decide_run(request: &run::GoalRequest) -> peppygen::Result<run::GoalDecision> {
     let data = &request.data;
-    let shape = RunRequest {
+    let request = RunRequest {
         workflow: data.workflow.clone(),
         bundle: data.bundle.as_ref().map(|_| Vec::new()),
         run_document: data.run_document.clone(),
         roles: data.roles.clone(),
+        work_cell: data.work_cell.clone(),
         started_by: String::new(),
         caller_data: None,
-    }
-    .shape();
+    };
+    let shape = request.shape().err();
     let texts = [
         ("workflow", &data.workflow),
         ("run_document", &data.run_document),
         ("roles", &data.roles),
+        ("work_cell", &data.work_cell),
         ("caller_data", &data.caller_data),
     ];
     let unparsed = texts.iter().find_map(|(field, text)| {
@@ -740,7 +743,7 @@ fn decide_run(request: &run::GoalRequest) -> peppygen::Result<run::GoalDecision>
             .and_then(|text| parses(text).err())
             .map(|reason| format!("{field}: {reason}"))
     });
-    Ok(match shape.err().or(unparsed) {
+    Ok(match shape.or(unparsed) {
         Some(message) => run::GoalDecision::refuse(run::FailureKind::Rejected, message),
         None => run::GoalDecision::accept(),
     })

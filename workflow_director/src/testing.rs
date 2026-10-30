@@ -11,7 +11,7 @@ use serde_json::{Value as Json, json};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use workflow_documents::run::{Attendance, Incidents};
-use workflow_documents::{EventKind, Name, RobotName, Workflow};
+use workflow_documents::{EventKind, Name, RobotName, Validation, Workflow};
 
 use crate::checker::{self, RunChoices};
 use crate::config::AllowedContracts;
@@ -165,6 +165,7 @@ pub fn plan_on(workflow: &Json, attendance: Attendance, snapshot: &Snapshot) -> 
         incidents: &Incidents::None,
         poll: workflow_documents::Bound::from_seconds(0.5).unwrap(),
         cancel_timeout: Duration::from_secs(10),
+        watch: Default::default(),
     };
     checker::plan(Arc::new(workflow), snapshot, &allowed(), &binding, choices)
         .unwrap_or_else(|errors| panic!("the workflow does not hold: {errors:#?}"))
@@ -206,6 +207,22 @@ pub fn with_beta(mut value: Json, beta_tree: Json) -> Json {
     value["roles"]["beta"] = json!({});
     value["actions"]["beta"] = json!({ "tree": beta_tree, "safe_state": [] });
     value
+}
+
+/// The validation of a signed-off sweep with the work cell parameters and
+/// the envelope given as JSON, and thresholds that a run of each that counts
+/// meets.
+pub fn validation(parameters: Json, envelope: Json) -> Validation {
+    let thresholds = json!({
+        "completed_at_least": 1.0, "unsafe_events_at_most": 0,
+        "false_successes_at_most": 0.0, "false_assumption_checks_at_most": 0,
+    });
+    Validation::new(
+        serde_json::from_value(thresholds).unwrap(),
+        serde_json::from_value(parameters).unwrap(),
+        serde_json::from_value(envelope).unwrap(),
+    )
+    .unwrap()
 }
 
 /// The answer of a scripted call: after how long, how it ends, and how

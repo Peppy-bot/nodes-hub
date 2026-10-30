@@ -19,8 +19,8 @@ use workflow_documents::result::{
 };
 use workflow_documents::run::{RoleBinding, RunDocument, VersionPolicy};
 use workflow_documents::{
-    EventKind, KnownLocation, Located, Name, NameTag, RobotName, Run, Sha256, WorkCell, Workflow,
-    run_lease_name,
+    EventKind, KnownLocation, Located, Name, NameTag, RobotName, Run, Sha256, Validation, WorkCell,
+    Workflow, run_lease_name, uncovered_work_cell,
 };
 
 use crate::alerts;
@@ -28,7 +28,7 @@ use crate::checker::{self, RunChoices};
 use crate::clock::{self, ClockSource};
 use crate::config::Config;
 use crate::engine::host::{Event, Host};
-use crate::engine::plan::Plan;
+use crate::engine::plan::{Plan, Watch};
 use crate::engine::{self, Phase, ResultBase, RunCommand};
 use crate::fleet::{self, Fleet, Snapshot};
 use crate::journal::{self, Journals, Record, wall_ns};
@@ -50,22 +50,54 @@ pub struct RunRequest {
     pub bundle: Option<Vec<BundleFile>>,
     pub run_document: Option<String>,
     pub roles: Option<String>,
+    pub work_cell: Option<String>,
     pub started_by: String,
     pub caller_data: Option<String>,
 }
 
+/// Where the workflow of a run comes from: its text, or a bundle.
+pub enum Source<'r> {
+    Workflow(&'r str),
+    Bundle(&'r [BundleFile]),
+}
+
+/// How a run binds its roles: by a run document, or by roles and a work
+/// cell block, each optional.
+pub enum Binding<'r> {
+    Document(&'r str),
+    Roles {
+        roles: Option<&'r str>,
+        work_cell: Option<&'r str>,
+    },
+}
+
 impl RunRequest {
-    /// Refuses a request that gives both a run document and roles, or
-    /// neither or both of a workflow and a bundle.
-    pub fn shape(&self) -> Result<(), String> {
-        if self.run_document.is_some() && self.roles.is_some() {
-            return Err("give a run_document or roles, not both".to_owned());
-        }
-        match (&self.workflow, &self.bundle) {
-            (Some(_), Some(_)) => Err("give a workflow or a bundle, not both".to_owned()),
-            (None, None) => Err("give a workflow or a bundle".to_owned()),
-            _ => Ok(()),
-        }
+    /// The source and the binding of the run. Refuses a request that gives
+    /// a run document with roles or with a work cell block, or neither or
+    /// both of a workflow and a bundle.
+    pub fn shape(&self) -> Result<(Source<'_>, Binding<'_>), String> {
+        let source = match (&self.workflow, &self.bundle) {
+            (Some(text), None) => Source::Workflow(text),
+            (None, Some(files)) => Source::Bundle(files),
+            (Some(_), Some(_)) => return Err("give a workflow or a bundle, not both".to_owned()),
+            (None, None) => return Err("give a workflow or a bundle".to_owned()),
+        };
+        let binding = match (&self.run_document, &self.roles, &self.work_cell) {
+            (Some(text), None, None) => Binding::Document(text),
+            (None, roles, work_cell) => Binding::Roles {
+                roles: roles.as_deref(),
+                work_cell: work_cell.as_deref(),
+            },
+            (Some(_), Some(_), _) => {
+                return Err("give a run_document or roles, not both".to_owned());
+            }
+            (Some(_), None, Some(_)) => {
+                return Err(
+                    "a run_document gives its own work_cell: give work_cell with roles".to_owned(),
+                );
+            }
+        };
+        Ok((source, binding))
     }
 }
 
@@ -367,7 +399,8 @@ impl Director {
             .insert(run.clone(), entry);
         let opened = json!({
             "workflow": request.workflow, "bundle": request.bundle, "run_document": request.run_document,
-            "roles": request.roles, "started_by": request.started_by, "caller_data": request.caller_data,
+            "roles": request.roles, "work_cell": request.work_cell, "started_by": request.started_by,
+            "caller_data": request.caller_data,
             "caller": { "instance": caller.instance, "core_node": caller.core_node },
         });
         self.journal(&run, 0, journal::OPENED, opened);
@@ -742,8 +775,11 @@ impl Director {
         let refuse = |base: RunResult, message: String, errors: Vec<Located>| {
             refusal_of(base, &message, errors, started)
         };
-        let (workflow, bundle) = match (&request.workflow, &request.bundle) {
-            (Some(text), None) => match Workflow::parse(text) {
+        let (source, binding) = request
+            .shape()
+            .map_err(|message| refuse(empty_result(), message, Vec::new()))?;
+        let (workflow, bundle) = match source {
+            Source::Workflow(text) => match Workflow::parse(text) {
                 Ok(workflow) => (workflow, None),
                 Err(refusals) => {
                     return Err(refuse(
@@ -753,7 +789,7 @@ impl Director {
                     ));
                 }
             },
-            (None, Some(files)) => match Bundle::open(files.clone()) {
+            Source::Bundle(files) => match Bundle::open(files.to_vec()) {
                 Ok(bundle) => (bundle.workflow.clone(), Some(bundle)),
                 Err(refusals) => {
                     return Err(refuse(
@@ -763,13 +799,6 @@ impl Director {
                     ));
                 }
             },
-            _ => {
-                return Err(refuse(
-                    empty_result(),
-                    "give a workflow or a bundle".to_owned(),
-                    Vec::new(),
-                ));
-            }
         };
         let workflow = Arc::new(workflow);
         self.update(run, |entry| entry.workflow = Some(Arc::clone(&workflow)));
@@ -779,35 +808,34 @@ impl Director {
             .caller_data
             .as_deref()
             .and_then(|text| parses(text).ok());
-        let document = match (&request.run_document, &request.roles) {
-            (Some(text), None) => RunDocument::parse(text).map_err(|refusals| {
+        let document = match binding {
+            Binding::Document(text) => RunDocument::parse(text).map_err(|refusals| {
                 refuse(
                     base.clone(),
                     "the run document does not parse".to_owned(),
                     located(refusals),
                 )
             })?,
-            (None, roles) => {
-                let named = match roles.as_deref().map(named_roles).transpose() {
+            Binding::Roles { roles, work_cell } => {
+                let named = match roles.map(named_roles).transpose() {
                     Ok(named) => named.unwrap_or_default(),
                     Err(reason) => {
                         return Err(refuse(base, format!("roles: {reason}"), Vec::new()));
                     }
                 };
-                RunDocument::of_roles(&workflow, named, WorkCell::new()).map_err(|refusals| {
+                let work_cell = match work_cell.map(work_cell_of).transpose() {
+                    Ok(work_cell) => work_cell.unwrap_or_default(),
+                    Err(reason) => {
+                        return Err(refuse(base, format!("work_cell: {reason}"), Vec::new()));
+                    }
+                };
+                RunDocument::of_roles(&workflow, named, work_cell).map_err(|refusals| {
                     refuse(
                         base.clone(),
                         "the roles do not fit the workflow".to_owned(),
                         located(refusals),
                     )
                 })?
-            }
-            (Some(_), Some(_)) => {
-                return Err(refuse(
-                    base,
-                    "give a run_document or roles, not both".to_owned(),
-                    Vec::new(),
-                ));
             }
         };
         let run_document = Run::new(&workflow, document)
@@ -819,6 +847,15 @@ impl Director {
                 )
             })?
             .document;
+        base.work_cell = run_document.work_cell.clone();
+        let misfits = bundle_misfits(validation_of(bundle.as_ref()), &run_document);
+        if !misfits.is_empty() {
+            return Err(refuse(
+                base,
+                "the run does not fit its bundle".to_owned(),
+                misfits,
+            ));
+        }
         Ok(Box::new(ParsedRun {
             workflow,
             bundle,
@@ -881,12 +918,14 @@ impl Director {
         let binding = self
             .bind_and_reserve(run, &workflow, &run_document, &snapshot, caller, &me)
             .map_err(|errors| refuse(base.clone(), "the roles do not bind".to_owned(), errors))?;
+        let validation = validation_of(bundle.as_ref());
         let choices = RunChoices {
             attendance: run_document.attendance,
             confirmed: run_document.confirmed.clone(),
             incidents: &run_document.incidents,
             poll: self.config.poll,
             cancel_timeout: self.config.cancel_timeout,
+            watch: Watch::of(&run_document, validation),
         };
         let plan = checker::plan(
             Arc::clone(&workflow),
@@ -921,6 +960,7 @@ impl Director {
                 }
             }
         }
+        base.uncovered = uncovered_work_cell(validation, &run_document.work_cell);
         let mut taken: Vec<RobotName> = Vec::new();
         for robot in binding.values() {
             if let Err(refused) = self.leases.take(robot.as_str(), &run_lease_name(run)).await {
@@ -1048,10 +1088,20 @@ pub fn workflow_of(opened: &Json) -> Result<Workflow, String> {
         return Workflow::parse(text)
             .map_err(|refusals| format!("the workflow of the journal does not parse: {refusals}"));
     }
+    bundle_of(opened)?
+        .map(|bundle| bundle.workflow)
+        .ok_or_else(|| "the journal opened with no workflow and no bundle".to_owned())
+}
+
+/// The bundle a journal opened with, when it gave one.
+pub fn bundle_of(opened: &Json) -> Result<Option<Bundle>, String> {
+    if opened["bundle"].is_null() {
+        return Ok(None);
+    }
     let files: Vec<BundleFile> = serde_json::from_value(opened["bundle"].clone())
         .map_err(|e| format!("the bundle of the journal: {e}"))?;
     Bundle::open(files)
-        .map(|bundle| bundle.workflow)
+        .map(Some)
         .map_err(|refusals| format!("the bundle of the journal does not open: {refusals}"))
 }
 
@@ -1069,6 +1119,39 @@ fn reads_the_clock(domain: &str, plan: &Plan, fleet: &Fleet) -> bool {
 /// Parses JSON5 text within the limits of a document.
 pub fn parses(text: &str) -> Result<Json, String> {
     workflow_documents::parse(text).map_err(|e| e.to_string())
+}
+
+/// The work cell block of a run made from roles, from its JSON5 text.
+fn work_cell_of(text: &str) -> Result<WorkCell, String> {
+    serde_json::from_value(parses(text)?).map_err(|e| e.to_string())
+}
+
+/// The validation of `bundle`, when it has one.
+fn validation_of(bundle: Option<&Bundle>) -> Option<&Validation> {
+    bundle.and_then(|bundle| bundle.document.validation.as_ref())
+}
+
+/// What of a run does not fit the validation of its bundle: each value of
+/// its work cell block of another shape than its parameter, or of a watch
+/// parameter, and each of its own watch parameters that the bundle names,
+/// whose value the director reads by the parameter of the bundle.
+fn bundle_misfits(validation: Option<&Validation>, document: &RunDocument) -> Vec<Located> {
+    let Some(validation) = validation else {
+        return Vec::new();
+    };
+    let work_cell = validation
+        .work_cell_refusals("work_cell", &document.work_cell)
+        .into_iter()
+        .map(|refusal| refusal.located());
+    let watch = document
+        .watch
+        .keys()
+        .filter(|name| validation.work_cell_parameters.contains_key(*name))
+        .map(|name| Located {
+            at: format!("watch.{name}"),
+            message: "is a parameter of the bundle, which the director reads by the bundle; name the watch parameter of the run another way".to_owned(),
+        });
+    work_cell.chain(watch).collect()
 }
 
 /// The roles a run names: a JSON5 map of each role to a robot name or
@@ -1612,6 +1695,80 @@ mod tests {
             &BTreeMap::new(),
         )
         .map_err(|errors| errors.into_iter().map(|e| e.message).collect())
+    }
+
+    /// A request of a run with no workflow source, a run document with roles or with a work cell block, has no
+    /// shape, each named.
+    #[test]
+    fn a_run_document_goes_with_neither_roles_nor_a_work_cell() {
+        let request = RunRequest {
+            workflow: Some("{}".to_owned()),
+            bundle: None,
+            run_document: Some("{}".to_owned()),
+            roles: None,
+            work_cell: None,
+            started_by: String::new(),
+            caller_data: None,
+        };
+        assert!(request.shape().is_ok());
+        let refused = |request: RunRequest| request.shape().err().unwrap_or_default();
+        assert_eq!(
+            refused(RunRequest {
+                roles: Some("{}".to_owned()),
+                ..request.clone()
+            }),
+            "give a run_document or roles, not both"
+        );
+        assert_eq!(
+            refused(RunRequest {
+                work_cell: Some("{}".to_owned()),
+                ..request.clone()
+            }),
+            "a run_document gives its own work_cell: give work_cell with roles"
+        );
+        assert_eq!(
+            refused(RunRequest {
+                workflow: None,
+                ..request
+            }),
+            "give a workflow or a bundle"
+        );
+    }
+
+    /// A value of the work cell of another shape than its parameter in the bundle, and a watch parameter of the run
+    /// that the bundle names, do not fit the bundle; with no bundle, nothing misfits.
+    #[test]
+    fn a_work_cell_of_another_shape_or_a_watch_the_bundle_names_does_not_fit_the_bundle() {
+        let validation = crate::testing::validation(
+            json!({
+                "belt_speed_mps": { "unit": "m/s", "kind": "control" },
+                "loose": { "unit": "items", "kind": "watch", "observation": "target.count" },
+            }),
+            json!({ "belt_speed_mps": [0.05, 0.25], "loose": [0, 3] }),
+        );
+        let workflow = workflow(&rest());
+        let mut document = RunDocument::of_roles(
+            &workflow,
+            BTreeMap::new(),
+            serde_json::from_value(json!({ "belt_speed_mps": { "arm": 0.2 } })).unwrap(),
+        )
+        .unwrap();
+        document.watch = serde_json::from_value(
+            json!({ "loose": { "unit": "items", "observation": "target.count" } }),
+        )
+        .unwrap();
+        let found: Vec<String> = bundle_misfits(Some(&validation), &document)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            found,
+            [
+                "work_cell.belt_speed_mps: has one value in the bundle; give one value, not a value per role",
+                "watch.loose: is a parameter of the bundle, which the director reads by the bundle; name the watch parameter of the run another way",
+            ]
+        );
+        assert!(bundle_misfits(None, &document).is_empty());
     }
 
     #[test]

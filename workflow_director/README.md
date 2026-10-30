@@ -71,6 +71,21 @@ lane during the run, and refuses a resume of that lane while it stands.
 `run`, `resume` and `abort` give each event of the run as feedback, and the
 status of the run every 5 s; `run_events` gives every event of every run.
 
+## The work cell
+
+A run made from roles takes its work cell block as `work_cell` (JSON5), and a
+run document gives its own `work_cell` and `watch`; a request that gives a
+run document with roles or with `work_cell` is refused with `rejected`. A run
+of a bundle whose work cell block gives a value of another shape than its
+parameter in the bundle, or a value of a watch parameter, or whose own watch
+parameter has the name of a parameter of the bundle, is refused. After the
+locations, the run reads each watch parameter of the run and of its bundle
+through the robots, as it reads the check of an assumption, and a value
+that does not read refuses the run. The event `uncovered` and the run
+result name each value of the work cell block and each watch value that no
+test covered: missing, outside the envelope of the bundle, or with no
+envelope. The run result gives the work cell block and each watch value.
+
 `locations` teaches each locations:v1 instance of a robot the locations
 given, or lists what each knows; a teach is refused on a robot with a lease,
 naming its holder. A teach holds the robot while it runs: it takes the lease

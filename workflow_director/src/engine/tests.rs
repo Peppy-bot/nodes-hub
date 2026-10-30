@@ -14,9 +14,11 @@ use workflow_documents::run::{Attendance, Severity};
 
 use super::failure::{Cause, DirectorKind, Failure};
 use super::host::{CallEnd, Host};
-use super::plan::{MonitorPlan, Plan, Target};
+use super::plan::{MonitorPlan, Plan, Target, Watch};
 use super::{Phase, ResultBase, ResumeRefusal, RunCommand, drive};
-use crate::testing::{Answer, ScriptedHost, found, home, name, one_arm, plan, rest, with_beta};
+use crate::testing::{
+    Answer, ScriptedHost, found, home, name, one_arm, plan, rest, validation, with_beta,
+};
 
 /// The refusal of a resume that a check of it refused.
 fn refused_by_a_check(answer: Result<(), ResumeRefusal>) -> workflow_documents::Located {
@@ -2255,4 +2257,146 @@ async fn a_suspension_during_the_test_of_a_loop_keeps_its_passes() {
         .collect();
     assert_eq!(loops, [("alpha.fill".to_owned(), 3, 0)]);
     assert_eq!(host.calls_of("home").len(), 3, "one `place` per pass");
+}
+
+/// The plan of a rest of `alpha` that watches `loose`, the count of blocks
+/// that `find` gives, against `validation`.
+fn watching_loose(validation: Option<workflow_documents::Validation>) -> Plan {
+    let mut plan = plan(
+        &one_arm("alpha", rest("rest"), home()),
+        Attendance::Attended,
+    );
+    plan.watch = Watch {
+        observations: [(
+            name("loose"),
+            serde_json::from_value(json!("target.count")).unwrap(),
+        )]
+        .into(),
+        validation,
+    };
+    plan
+}
+
+/// The validation whose envelope tests `loose` from `min` to `max`.
+fn loose_tested(min: f64, max: f64) -> workflow_documents::Validation {
+    validation(
+        json!({ "loose": { "unit": "items", "kind": "watch", "observation": "target.count" } }),
+        json!({ "loose": [min, max] }),
+    )
+}
+
+/// A run reads each watch parameter through the robots before its
+/// assumptions, keeps its value in the run result, and names a value that
+/// no envelope covers in the event `uncovered`, before its initialization.
+#[tokio::test(start_paused = true)]
+async fn a_run_reads_its_watch_values_before_its_assumptions_and_names_each_uncovered() {
+    let host = arm();
+    let (result, _) = run(&watching_loose(None), &host, Vec::new()).await;
+    assert_eq!(result.ending, Ending::Completed, "{result:#?}");
+    assert_eq!(result.watch, [(name("loose"), 1.0)].into());
+    let [uncovered] = &result.uncovered[..] else {
+        panic!("{:?}", result.uncovered)
+    };
+    assert_eq!(
+        uncovered.to_string(),
+        "`loose` is 1, and no envelope gives it a range"
+    );
+    let kinds: Vec<EventKind> = host
+        .event_kinds()
+        .into_iter()
+        .map(|(kind, _)| kind)
+        .collect();
+    assert_eq!(
+        kinds[..2],
+        [EventKind::Uncovered, EventKind::InitializationStarts],
+        "{kinds:?}"
+    );
+    let event = &host.events.lock().unwrap()[0];
+    assert_eq!(
+        event.details[0]["why"],
+        json!("no_envelope"),
+        "{:?}",
+        event.details
+    );
+}
+
+/// A watch value inside the envelope of the bundle is covered: no event names it.
+#[tokio::test(start_paused = true)]
+async fn a_watch_value_inside_the_envelope_is_covered() {
+    let host = arm();
+    let (result, _) = run(
+        &watching_loose(Some(loose_tested(0.0, 3.0))),
+        &host,
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(result.ending, Ending::Completed, "{result:#?}");
+    assert!(result.uncovered.is_empty(), "{:?}", result.uncovered);
+    assert!(
+        !host
+            .event_kinds()
+            .iter()
+            .any(|(kind, _)| *kind == EventKind::Uncovered)
+    );
+}
+
+/// The values of the work cell that the director named come first in the
+/// event `uncovered` and in the run result, then each watch value outside
+/// its range.
+#[tokio::test(start_paused = true)]
+async fn the_work_cell_values_and_the_watch_values_no_test_covered_go_together() {
+    let plan = watching_loose(Some(loose_tested(2.0, 3.0)));
+    let host = arm();
+    let missing = workflow_documents::Uncovered {
+        parameter: name("belt_speed_mps"),
+        role: None,
+        value: None,
+        why: workflow_documents::work_cell::NotCovered::Missing,
+    };
+    let mut base = crate::director::empty_result();
+    base.uncovered = vec![missing.clone()];
+    let (commands, commands_rx) = mpsc::unbounded_channel::<RunCommand>();
+    let (phase, _) = watch::channel(Phase::Preparing);
+    let result = drive(
+        &plan,
+        &host,
+        ResultBase { result: base },
+        commands_rx,
+        phase,
+        host.now(),
+    )
+    .await;
+    drop(commands);
+    let named: Vec<String> = result.uncovered.iter().map(ToString::to_string).collect();
+    assert_eq!(
+        named,
+        [
+            "`belt_speed_mps` has no value in the work cell block",
+            "`loose` is 1, outside the tested range [2, 3]",
+        ]
+    );
+    let events = host.events.lock().unwrap();
+    let uncovered = events
+        .iter()
+        .find(|event| event.kind == EventKind::Uncovered)
+        .expect("the event uncovered");
+    assert_eq!(uncovered.details.as_array().map(Vec::len), Some(2));
+}
+
+/// A watch value that does not read refuses the run before its assumptions,
+/// naming the watch parameter.
+#[tokio::test(start_paused = true)]
+async fn a_watch_value_that_does_not_read_refuses_the_run_naming_it() {
+    let host = arm().answer("find", vec![Answer::failing("unreachable")]);
+    let (result, _) = run(&watching_loose(None), &host, Vec::new()).await;
+    assert_eq!(result.ending, Ending::Refused, "{result:#?}");
+    let refusal = result.refusal.expect("a refusal");
+    assert!(
+        refusal
+            .message
+            .starts_with("the watch parameter `loose` did not read: "),
+        "{}",
+        refusal.message
+    );
+    assert!(result.assumptions.is_empty(), "no assumption was checked");
 }

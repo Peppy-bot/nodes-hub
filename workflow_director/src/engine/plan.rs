@@ -8,9 +8,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::Value as Json;
-use workflow_documents::expression::{PathStep, RefPath, Type};
-use workflow_documents::run::{Attendance, Severity};
-use workflow_documents::{Bound, Name, RobotName, StepId, Workflow};
+use workflow_documents::expression::{Expression, PathStep, RefPath, Type};
+use workflow_documents::run::{Attendance, RunDocument, Severity};
+use workflow_documents::work_cell::ParameterKind;
+use workflow_documents::{Bound, Name, RobotName, StepId, Validation, Workflow};
 
 /// The node instance that serves a call or an observation.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -117,6 +118,38 @@ pub struct SkillLocations {
     pub names: BTreeSet<Name>,
 }
 
+/// The watch parameters of a run, which the engine reads through the robots
+/// before the assumptions: the observation that gives the value of each, and
+/// the validation of the bundle of the run, whose envelope says which values
+/// a test covered.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Watch {
+    pub observations: BTreeMap<Name, Expression>,
+    pub validation: Option<Validation>,
+}
+
+impl Watch {
+    /// The watch parameters of `document` and those of the validation of
+    /// its bundle.
+    pub fn of(document: &RunDocument, validation: Option<&Validation>) -> Watch {
+        let of_the_run = document
+            .watch
+            .iter()
+            .map(|(name, watch)| (name.clone(), watch.observation.clone()));
+        let of_the_bundle = validation
+            .into_iter()
+            .flat_map(|validation| &validation.work_cell_parameters)
+            .filter_map(|(name, parameter)| match &parameter.kind {
+                ParameterKind::Watch { observation } => Some((name.clone(), observation.clone())),
+                ParameterKind::Control | ParameterKind::Distance { .. } => None,
+            });
+        Watch {
+            observations: of_the_run.chain(of_the_bundle).collect(),
+            validation: validation.cloned(),
+        }
+    }
+}
+
 /// A call step of a role.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CallSite {
@@ -145,6 +178,7 @@ pub struct Plan {
     pub poll: Bound,
     /// How long, on wall time, a cancelled goal has to end.
     pub cancel_timeout: Duration,
+    pub watch: Watch,
 }
 
 /// Why a value at a path cannot be read.

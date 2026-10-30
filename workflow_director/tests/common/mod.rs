@@ -30,6 +30,8 @@ use peppygen::consumed_services::fleet::list::{
     ResponseDataRobotsItem, ResponseDataRobotsItemContractsItem,
     ResponseDataRobotsItemInstancesItem,
 };
+use peppygen::fixtures::exposed_actions::director::run;
+use peppygen::fixtures::exposed_services::director::robots;
 use peppygen::fixtures::harness::{Config, Harness, Mocks};
 use peppygen::mock::deps::fleet;
 use peppylib::Payload;
@@ -42,6 +44,8 @@ use workflow_director::Fault;
 
 /// How long the wire may take for any one exchange.
 pub const WIRE: Duration = Duration::from_secs(10);
+/// How often a test reads the director again while it waits for the director to see the fleet.
+pub const SETTLE: Duration = Duration::from_millis(50);
 /// How long a mock waits for the next request of the director.
 const IDLE: Duration = Duration::from_secs(3600);
 /// The arm of the tests, as the fleet serves it.
@@ -935,4 +939,29 @@ pub fn home_workflow() -> String {
 /// The roles of a run of `home_workflow` on `alpha`.
 pub fn on_alpha() -> String {
     json!({ "arm": ROBOT }).to_string()
+}
+
+/// The robots of the director, once it lists `alpha`: before the first feedback of the fleet, `robots` answers
+/// `resource_unavailable`.
+pub async fn listed_robots(rig: &Rig) -> peppygen::Result<robots::Response> {
+    loop {
+        match robots::poll(&rig.harness, WIRE).await {
+            Ok(listed) if !listed.robots.is_empty() => return Ok(listed),
+            Ok(_) => {}
+            Err(error)
+                if robots::Failure::of(&error)
+                    .is_some_and(|failure| failure.kind.to_string() == "resource_unavailable") => {}
+            Err(error) => return Err(error),
+        }
+        tokio::time::sleep(SETTLE).await;
+    }
+}
+
+/// The events of the feedback of the run `goal` up to the end of its stream.
+pub async fn feedback_of(goal: &mut run::GoalHandle) -> Vec<String> {
+    let mut events = Vec::new();
+    while let Ok(feedback) = goal.on_next_feedback().await {
+        events.push(feedback.event);
+    }
+    events
 }

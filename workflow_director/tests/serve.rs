@@ -10,26 +10,10 @@ use peppygen::fixtures::exposed_services::director::{confirm, robots, runs, stat
 use serde_json::{Value, json};
 
 mod common;
-use common::{ARM_INSTANCE, ARM_PIN, Home, Lease, ROBOT, Rig, WIRE, home_workflow, on_alpha};
-
-/// How often a test reads the director again while it waits for the director to see the fleet.
-const SETTLE: Duration = Duration::from_millis(50);
-
-/// The robots of the director, once it lists `alpha`: before the first feedback of the fleet, `robots` answers
-/// `resource_unavailable`.
-async fn listed_robots(rig: &Rig) -> peppygen::Result<robots::Response> {
-    loop {
-        match robots::poll(&rig.harness, WIRE).await {
-            Ok(listed) if !listed.robots.is_empty() => return Ok(listed),
-            Ok(_) => {}
-            Err(error)
-                if robots::Failure::of(&error)
-                    .is_some_and(|failure| failure.kind.to_string() == "resource_unavailable") => {}
-            Err(error) => return Err(error),
-        }
-        tokio::time::sleep(SETTLE).await;
-    }
-}
+use common::{
+    ARM_INSTANCE, ARM_PIN, Home, Lease, ROBOT, Rig, SETTLE, WIRE, feedback_of, home_workflow,
+    listed_robots, on_alpha,
+};
 
 /// The goal of a run of `home_workflow` on `alpha`, once the director lists `alpha`.
 async fn run_home(rig: &Rig) -> peppygen::Result<run::GoalHandle> {
@@ -119,15 +103,6 @@ async fn kind_of_suspend(rig: &Rig, run: &str) -> Option<String> {
     let error = suspend::poll(&rig.harness, &request, WIRE).await.err()?;
     let failure = suspend::Failure::of(&error).unwrap_or_else(|| panic!("{error}"));
     Some(failure.kind.to_string())
-}
-
-/// The events of the feedback of the run `goal` up to the end of its stream.
-async fn feedback_of(goal: &mut run::GoalHandle) -> Vec<String> {
-    let mut events = Vec::new();
-    while let Ok(feedback) = goal.on_next_feedback().await {
-        events.push(feedback.event);
-    }
-    events
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
