@@ -46,11 +46,11 @@ pub struct ArmModels {
 }
 
 impl ArmModels {
-    /// Build both arm models from the generation's embedded description, mirroring
-    /// the backbone's `arm_model` (same URDF, same elbow singularity floor) so the panel
-    /// solves against the identical chain the backbone governs. Joint velocity limits
-    /// come from the same URDF: the budget the gesture bake asserts its trajectories
-    /// against.
+    /// Build both arm models from the generation's embedded description, as the
+    /// backbone builds its own (`HardwareVersion::arm_model`: same URDF, same elbow
+    /// singularity floor), so the panel solves against the identical chain the backbone
+    /// governs. Joint velocity limits come from the same URDF: the budget the gesture
+    /// bake asserts its trajectories against.
     pub fn from_version(version: HardwareVersion) -> Self {
         let mut arms = ArmPair::from_fn(|side| build_arm(version, side));
         let bounds = ArmPair::from_fn(|side| workspace_aabb(&mut arms[side]));
@@ -209,21 +209,15 @@ pub fn joint_jog_tick(
     }
 }
 
-/// Build one arm model from the generation's embedded description, with the elbow
-/// singularity floor applied and the URDF's tcp frame mounted (mirrors
-/// `openarm_backbone`'s `arm_model`, so the panel's poses and the backbone's are the
-/// same frame). A bad base link or tcp link aborts bringup, matching how the
-/// backbone fails.
+/// Build one arm model from the generation's embedded description
+/// (`HardwareVersion::arm_model`, as the backbone builds its own, so the panel's poses
+/// and the backbone's are the same frame): the elbow singularity floor applied and the
+/// URDF's tcp frame mounted. A bad base link or tcp link aborts bringup, matching how
+/// the backbone fails.
 fn build_arm(version: HardwareVersion, side: Side) -> Arm {
-    let base = version.base_link(side);
-    Arm::from_urdf(version.urdf(), base)
-        .unwrap_or_else(|e| panic!("build {side} arm model from base '{base}': {e}"))
-        .with_lower_floor(
-            version.elbow_joint_index(),
-            version.elbow_singularity_floor_rad(),
-        )
-        .with_tool_link(version.tcp_link(side))
-        .unwrap_or_else(|e| panic!("mount the {side} gripper tcp frame: {e}"))
+    version
+        .arm_model(side)
+        .unwrap_or_else(|e| panic!("build the {side} arm model: {e}"))
 }
 
 /// Per-joint velocity limits (rad/s) for `side`, j1..j7, from the bundled URDF:
