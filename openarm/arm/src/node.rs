@@ -223,18 +223,14 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     // v2 arm can't be launched with a v1 base-link name.
     let base_link = hardware_version.base_link(side);
 
-    // Build the srs_model arm from this generation's embedded OpenArm description:
-    // forward kinematics for the in-process gravity/Coriolis feedforward, plus joint
-    // limits off the same parsed chain. The elbow singularity margin is a control
-    // policy the description exports per generation; apply it so limits() carries it.
-    // A non-SRS or short chain from base_link errors here.
-    let model = srs_model::Arm::from_urdf(hardware_version.urdf(), base_link)
-        .map(|arm| {
-            arm.with_lower_floor(
-                hardware_version.elbow_joint_index(),
-                hardware_version.elbow_singularity_floor_rad(),
-            )
-        })
+    // Build the srs_model arm from this generation's embedded OpenArm description
+    // (`HardwareVersion::arm_model`): forward kinematics for the in-process
+    // gravity/Coriolis feedforward, plus joint limits off the same parsed chain, the
+    // elbow singularity margin applied so limits() carries it. Its tool at the grasp
+    // point moves the end-effector frame, not the masses the feedforward weighs. A
+    // non-SRS or short chain from base_link errors here.
+    let model = hardware_version
+        .arm_model(side)
         .map_err(|source| NodeError::ArmModel {
             version: hardware_version,
             base: base_link.to_string(),

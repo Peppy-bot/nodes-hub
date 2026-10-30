@@ -11,7 +11,7 @@ tracing-subscriber = "0.3"
 openarm_can = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "openarm_can" }
 # Kinematics + dynamics library (FK + gravity/Coriolis), computed in-process.
 srs_model = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "srs_model" }
-openarm_description = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "openarm_description" }
+openarm_description = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "openarm_description", features = ["kinematics"] }
 control_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "control_core" }
 instance_lock = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "instance_lock" }
 peppygen = { path = ".peppy/libs/peppygen" }
