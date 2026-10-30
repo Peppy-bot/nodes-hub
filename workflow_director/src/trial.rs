@@ -310,9 +310,9 @@ impl TrialRecord {
     }
 
     /// Counts the run that waits for the judgement of its ending: completed
-    /// only when it completed and its task is done, with each emergency stop
-    /// and each other unsafe event as an unsafe event, and a completed run
-    /// whose task is not done as a false success.
+    /// when it completed, a false success when it completed and its task is
+    /// not done, and each emergency stop and each other unsafe event as an
+    /// unsafe event.
     pub fn judge_ending(
         &mut self,
         judged: EndingJudged,
@@ -328,13 +328,13 @@ impl TrialRecord {
             return Err(format!("the trial `{}` has no run `{run}`", self.trial));
         };
         let completed = last.ending == Some(Ending::Completed);
-        let count = match completed && judged.task_done {
+        let count = match completed {
             true => Count::Completed,
             false => Count::NotCompleted,
         };
         self.measures = Measures {
             runs: self.measures.runs + 1,
-            completed: self.measures.completed + u32::from(count == Count::Completed),
+            completed: self.measures.completed + u32::from(completed),
             false_successes: self.measures.false_successes
                 + u32::from(completed && !judged.task_done),
             unsafe_events: self.measures.unsafe_events + judged.unsafe_events(),
@@ -1229,8 +1229,8 @@ mod tests {
     }
 
     /// A run that starts waits for the judgement of its ending, and counts
-    /// as completed when it completed and its task is done; the operator
-    /// then prepares the next run.
+    /// as completed when it completed; the operator then prepares the next
+    /// run.
     #[test]
     fn a_run_that_starts_counts_by_the_judgement_of_its_ending() {
         let mut record = trial(3);
@@ -1311,8 +1311,8 @@ mod tests {
 
     /// An aborted run that started waits for the judgement of its ending,
     /// and counts as not completed whatever the task; a completed run whose
-    /// task is not done is a false success; each emergency stop and other
-    /// unsafe event counts.
+    /// task is not done counts as completed and as a false success; each
+    /// emergency stop and other unsafe event counts.
     #[test]
     fn the_judgement_of_an_ending_counts_false_successes_and_unsafe_events() {
         let mut record = trial(5);
@@ -1331,12 +1331,12 @@ mod tests {
             unsafe_events: vec!["the box fell off the belt".to_owned()],
         };
         let (count, _) = record.judge_ending(unsafe_and_undone, &lenient()).unwrap();
-        assert_eq!(count, Count::NotCompleted);
+        assert_eq!(count, Count::Completed);
         assert_eq!(
             record.measures,
             Measures {
                 runs: 2,
-                completed: 0,
+                completed: 1,
                 false_successes: 1,
                 unsafe_events: 2,
                 false_assumption_checks: 0,
@@ -1345,7 +1345,8 @@ mod tests {
     }
 
     /// The trial ends after its last run that counts, and signs off only
-    /// when the runs meet the thresholds.
+    /// when the runs meet the thresholds: a trial of a false success does
+    /// not meet `false_successes_at_most`.
     #[test]
     fn the_trial_signs_off_after_its_last_run_only_when_its_runs_meet_the_thresholds() {
         let mut record = trial(2);
@@ -1370,10 +1371,13 @@ mod tests {
         assert_eq!(
             next,
             Next::NotSignedOff(
-                "the 1 runs that count do not meet the thresholds of the bundle: `completed_at_least`".to_owned()
+                "the 1 runs that count do not meet the thresholds of the bundle: `false_successes_at_most`".to_owned()
             )
         );
-        assert_eq!(record.measures.false_successes, 1);
+        assert_eq!(
+            (record.measures.completed, record.measures.false_successes),
+            (1, 1)
+        );
     }
 
     /// A trial ends, signing off nothing, once the runs left cannot meet

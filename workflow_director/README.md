@@ -152,9 +152,9 @@ included, gives `checks_to_judge`, and waits for `judge_checks`: `starts`,
 `not_ready` (the run does not count) or `false_check` (the run counts as not
 completed, and each wrong check as a false check). The run then runs
 unattended, and `suspend` refuses it, naming the trial. Once it ends,
-`judge_ending` counts it: completed only when it completed and its task is
-done, and each emergency stop and other unsafe event counts as an unsafe
-event. A run that ends before it starts counts as not completed. A cancel
+`judge_ending` counts it: completed when it completed, a false success when
+it completed and its task is not done, and each emergency stop and other
+unsafe event as an unsafe event. A run that ends before it starts counts as not completed. A cancel
 of `next_run`, or the loss of its sender, aborts its run.
 
 The trial ends after its last run that counts, or once the runs left cannot
