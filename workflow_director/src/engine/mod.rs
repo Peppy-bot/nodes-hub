@@ -15,14 +15,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use workflow_documents::expression::{Expression, Type, Value};
 use workflow_documents::result::{
-    AssumptionKind, AssumptionOutcome, Duration, Ending, FailedStep, IncidentRecord, LaneOutcome,
-    LaneState, RUN_SUSPENDED, RunRefusal, RunResult, RunState, RunStatus, SafeStateResult,
-    SuspendedLane, Suspension, ToConfirm,
+    AssumptionKind, AssumptionOutcome, CheckToJudge, Duration, Ending, FailedStep, IncidentRecord,
+    LaneOutcome, LaneState, RUN_SUSPENDED, RunRefusal, RunResult, RunState, RunStatus,
+    SafeStateResult, SuspendedLane, Suspension, ToConfirm,
 };
 use workflow_documents::work_cell::Uncovered;
 use workflow_documents::workflow::StepKind;
@@ -81,6 +82,50 @@ pub enum RunCommand {
         role: Name,
         failure: Failure,
     },
+    /// The judgement of the operator on the checks of a run of a trial,
+    /// while the run waits for it. The `judge_checks` service admits it from
+    /// the phase of the run, and a judgement the run no longer waits for
+    /// changes nothing.
+    JudgeChecks {
+        judged: ChecksJudged,
+    },
+}
+
+/// The judgement of the operator on the checks of a run of a trial, which
+/// the operator compares with the work cell.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChecksJudged {
+    /// Each check is true and none is wrong: the run starts.
+    Starts,
+    /// A check is false and the operator agrees with each value: the work
+    /// cell is not ready, and the run does not count.
+    NotReady,
+    /// The operator names each check whose value differs from the work
+    /// cell: the run counts as not completed.
+    FalseCheck { wrong: Vec<Name> },
+}
+
+impl ChecksJudged {
+    /// The judgement of `checks` when the operator names `wrong`.
+    pub fn of(checks: &[CheckToJudge], wrong: Vec<Name>) -> ChecksJudged {
+        if !wrong.is_empty() {
+            return ChecksJudged::FalseCheck { wrong };
+        }
+        match checks.iter().all(|check| check.value) {
+            true => ChecksJudged::Starts,
+            false => ChecksJudged::NotReady,
+        }
+    }
+
+    /// The word of `judge_checks` for this judgement.
+    pub fn outcome(&self) -> &'static str {
+        match self {
+            ChecksJudged::Starts => "starts",
+            ChecksJudged::NotReady => "not_ready",
+            ChecksJudged::FalseCheck { .. } => "false_check",
+        }
+    }
 }
 
 /// Why a resume did not resume its run.
@@ -98,6 +143,9 @@ pub enum ResumeRefusal {
 pub enum Phase {
     Preparing,
     Confirming(Vec<ToConfirm>),
+    /// A run of a trial waits for the judgement of the operator on each of
+    /// its checks.
+    Judging(Vec<CheckToJudge>),
     Running,
     Suspended(Suspension),
     /// The engine of the run ends: from the end of its lanes, when the run
@@ -113,7 +161,7 @@ impl Phase {
     pub fn state(&self) -> RunState {
         match self {
             Phase::Preparing => RunState::Preparing,
-            Phase::Confirming(_) => RunState::Confirming,
+            Phase::Confirming(_) | Phase::Judging(_) => RunState::Confirming,
             Phase::Running => RunState::Running,
             Phase::Suspended(_) => RunState::Suspended,
             Phase::Ending => RunState::Ending,
@@ -699,6 +747,17 @@ async fn run_to_its_end<H: Host>(
     if let Some(refusal) = refused {
         return finish(&ctx, base, Ending::Refused, Some(refusal), outcome, started).await;
     }
+    if plan.of_a_trial {
+        match judgement(&ctx, &outcome, &mut commands, phase).await {
+            Judgement::Starts => {}
+            Judgement::Refused(refusal) => {
+                return finish(&ctx, base, Ending::Refused, Some(refusal), outcome, started).await;
+            }
+            Judgement::Stopped(stop) => {
+                return finish(&ctx, base, ending_of(stop), None, outcome, started).await;
+            }
+        }
+    }
     if let Some(stop) = confirmations(&ctx, &mut outcome, &mut commands, phase).await {
         return finish(&ctx, base, ending_of(stop), None, outcome, started).await;
     }
@@ -871,7 +930,8 @@ pub fn outside_the_envelope(uncovered: &[&Uncovered]) -> String {
 }
 
 /// Evaluates the check of each assumption, within its bound; a false check
-/// refuses the run and names the assumption.
+/// refuses the run and names the assumption, but in a run of a trial, whose
+/// checks the operator judges. A check that gives no value refuses the run.
 async fn assumptions<H: Host>(ctx: &RunCtx<'_, H>, outcome: &mut Outcome) -> Option<RunRefusal> {
     for (name, assumption) in &ctx.plan.workflow.assumptions {
         let Some(check) = &assumption.check else {
@@ -894,6 +954,7 @@ async fn assumptions<H: Host>(ctx: &RunCtx<'_, H>, outcome: &mut Outcome) -> Opt
         });
         match value {
             Ok(true) => {}
+            Ok(false) if ctx.plan.of_a_trial => {}
             Ok(false) => {
                 return Some(RunRefusal {
                     message: format!("the assumption `{name}` is false: {}", assumption.says),
@@ -913,6 +974,81 @@ async fn assumptions<H: Host>(ctx: &RunCtx<'_, H>, outcome: &mut Outcome) -> Opt
         }
     }
     None
+}
+
+/// How the judgement of the checks of a run of a trial ends its wait.
+enum Judgement {
+    Starts,
+    Refused(RunRefusal),
+    Stopped(Stop),
+}
+
+/// Gives each check of a run of a trial with its value (`checks_to_judge`)
+/// and waits for the judgement of the operator; a stop ends the wait. A work
+/// cell that is not ready, or a wrong check, refuses the run, naming the
+/// checks.
+async fn judgement<H: Host>(
+    ctx: &RunCtx<'_, H>,
+    outcome: &Outcome,
+    commands: &mut mpsc::UnboundedReceiver<RunCommand>,
+    phase: &watch::Sender<Phase>,
+) -> Judgement {
+    let assumptions = &ctx.plan.workflow.assumptions;
+    let checks: Vec<CheckToJudge> = outcome
+        .assumptions
+        .iter()
+        .filter_map(|checked| {
+            let check = assumptions.get(&checked.name)?.check.as_ref()?;
+            Some(CheckToJudge {
+                assumption: checked.name.clone(),
+                says: checked.says.clone(),
+                check: check.source().to_owned(),
+                value: checked.value?,
+            })
+        })
+        .collect();
+    phase.send_replace(Phase::Judging(checks.clone()));
+    ctx.run_event(EventKind::ChecksToJudge, "", String::new(), json!(checks));
+    loop {
+        let Some(command) = commands.recv().await else {
+            return Judgement::Stopped(Stop::Interrupted);
+        };
+        let judged = match command {
+            RunCommand::JudgeChecks { judged } => judged,
+            other => match before_the_lanes(ctx, other) {
+                Some(stop) => return Judgement::Stopped(stop),
+                None => continue,
+            },
+        };
+        let named = |names: Vec<&Name>| {
+            let quoted: Vec<String> = names.iter().map(|name| format!("`{name}`")).collect();
+            quoted.join(", ")
+        };
+        let message = match judged {
+            ChecksJudged::Starts => return Judgement::Starts,
+            ChecksJudged::NotReady => {
+                let false_checks = checks
+                    .iter()
+                    .filter(|check| !check.value)
+                    .map(|check| &check.assumption)
+                    .collect();
+                format!(
+                    "the work cell is not ready: the check of {} is false, and the operator agrees with each value",
+                    named(false_checks)
+                )
+            }
+            ChecksJudged::FalseCheck { wrong } => format!(
+                "the operator names the check of {} wrong: its value differs from the work cell",
+                named(wrong.iter().collect())
+            ),
+        };
+        return Judgement::Refused(RunRefusal {
+            message,
+            errors: Vec::new(),
+            assumption: None,
+            says: None,
+        });
+    }
 }
 
 /// Waits for a confirmation of each assumption without a check that the
@@ -1001,7 +1137,7 @@ async fn stopped_while_checking<H: Host>(
 /// run.
 fn before_the_lanes<H: Host>(ctx: &RunCtx<'_, H>, command: RunCommand) -> Option<Stop> {
     match command {
-        RunCommand::Confirm { .. } | RunCommand::Suspend => None,
+        RunCommand::Confirm { .. } | RunCommand::Suspend | RunCommand::JudgeChecks { .. } => None,
         RunCommand::Resume { reply } => {
             let _ = reply.send(Err(ResumeRefusal::NotSuspended));
             None
@@ -1175,7 +1311,7 @@ async fn command_while_running<'a, H: Host>(
     resuming: &mut Option<Resuming<'a>>,
 ) {
     match command {
-        RunCommand::Confirm { .. } => {}
+        RunCommand::Confirm { .. } | RunCommand::JudgeChecks { .. } => {}
         RunCommand::Suspend => {
             for park in parks.values() {
                 let _ = park.send(ParkCommand::Suspend);
@@ -1404,7 +1540,9 @@ pub fn status_of(phase: &Phase) -> RunStatus {
         Phase::Confirming(to_confirm) => (to_confirm.clone(), None, None),
         Phase::Suspended(suspension) => (Vec::new(), Some(suspension.clone()), None),
         Phase::Ended(result) => (Vec::new(), None, Some((**result).clone())),
-        Phase::Preparing | Phase::Running | Phase::Ending => (Vec::new(), None, None),
+        Phase::Preparing | Phase::Judging(_) | Phase::Running | Phase::Ending => {
+            (Vec::new(), None, None)
+        }
     };
     RunStatus {
         state: phase.state(),

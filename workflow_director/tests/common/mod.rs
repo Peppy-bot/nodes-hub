@@ -107,7 +107,8 @@ pub struct FleetState {
 
 /// The fleet of the tests, on the fleet mock of the harness: it lists `alpha` with the arm of the tests, answers
 /// each member that the director calls from its state, keeps each call as `<member> <robot> <name>` in order, and
-/// sends each change of its state as a feedback of the `changes` goal of the director.
+/// sends each change of its state as a feedback of the `changes` goal of the director. A take is refused while the
+/// stack is halted, and while another client leases the robot.
 pub struct ScriptedFleet {
     pub state: watch::Sender<FleetState>,
     pub calls: Arc<Mutex<Vec<String>>>,
@@ -169,6 +170,31 @@ impl ScriptedFleet {
                         .lock()
                         .unwrap()
                         .push(format!("take {} {}", request.robot, request.name));
+                    let refusal = {
+                        let state = state.borrow();
+                        let other = state
+                            .leases
+                            .iter()
+                            .find(|lease| lease.robot == request.robot && lease.holder != director);
+                        match (state.halted, other) {
+                            (true, _) => Some((
+                                fleet::take::FailureKind::Halted,
+                                "the stack is halted".to_owned(),
+                            )),
+                            (false, Some(lease)) => Some((
+                                fleet::take::FailureKind::Leased,
+                                format!(
+                                    "`{}` is leased by {} under `{}`",
+                                    lease.robot, lease.holder, lease.name
+                                ),
+                            )),
+                            (false, None) => None,
+                        }
+                    };
+                    if let Some((kind, message)) = refusal {
+                        let _ = responder.respond_failure(kind, message).await;
+                        continue;
+                    }
                     state.send_modify(|state| {
                         state.leases.retain(|lease| lease.robot != request.robot);
                         if state.lease_ends_at_take {

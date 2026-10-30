@@ -2428,3 +2428,141 @@ async fn an_unattended_run_on_a_physical_robot_is_refused_on_a_watch_value_no_te
         assert_eq!(result.watch, [(name("loose"), 1.0)].into());
     }
 }
+
+/// The plan of a run of a trial of a rest of `alpha`, whose reach check
+/// reads `find`.
+fn of_a_trial() -> Plan {
+    let mut plan = plan(
+        &one_arm("alpha", rest("rest"), home()),
+        Attendance::Unattended,
+    );
+    plan.roles
+        .values_mut()
+        .for_each(|role| role.physical = true);
+    plan.of_a_trial = true;
+    plan
+}
+
+/// The checks that a run of a trial gave to judge, from its phases.
+fn judged_checks(phases: &[Phase]) -> Vec<workflow_documents::result::CheckToJudge> {
+    phases
+        .iter()
+        .find_map(|phase| match phase {
+            Phase::Judging(checks) => Some(checks.clone()),
+            _ => None,
+        })
+        .expect("the run waits for the judgement of its checks")
+}
+
+/// A run of a trial gives each check with its value, a false one included,
+/// and waits for the judgement of the operator: a judgement that it starts
+/// runs it to its end.
+#[tokio::test(start_paused = true)]
+async fn a_run_of_a_trial_waits_for_the_judgement_of_its_checks_and_starts_on_it() {
+    let host = arm();
+    let judged = super::ChecksJudged::Starts;
+    let (result, phases) = run(
+        &of_a_trial(),
+        &host,
+        vec![(5, RunCommand::JudgeChecks { judged })],
+    )
+    .await;
+    assert_eq!(result.ending, Ending::Completed, "{result:#?}");
+    let checks = judged_checks(&phases);
+    assert_eq!(checks.len(), 1);
+    assert_eq!(
+        (
+            checks[0].assumption.as_str(),
+            checks[0].check.as_str(),
+            checks[0].value
+        ),
+        ("in_reach", "target.found", true)
+    );
+    let calls = host.calls_of("home");
+    assert_eq!(calls[0].at_s, 5.0, "the lane starts at the judgement");
+    let kinds: Vec<EventKind> = host
+        .event_kinds()
+        .into_iter()
+        .map(|(kind, _)| kind)
+        .collect();
+    assert_eq!(
+        kinds[..2],
+        [EventKind::ChecksToJudge, EventKind::InitializationStarts]
+    );
+}
+
+/// A false check does not refuse a run of a trial: the operator judges it.
+/// When the operator agrees with it, the work cell is not ready; when the
+/// operator names a check wrong, the check is false. Each refuses the run,
+/// naming the checks.
+#[tokio::test(start_paused = true)]
+async fn a_judgement_that_the_work_cell_is_not_ready_or_a_check_is_wrong_refuses_the_run() {
+    let not_found = json!({ "found": false, "item_id": "b1", "position": [0.3, 0.0, 0.1], "kind": "block", "count": "1" });
+    let host = arm().answer("find", vec![Answer::now(not_found)]);
+    let judged = super::ChecksJudged::NotReady;
+    let (result, phases) = run(
+        &of_a_trial(),
+        &host,
+        vec![(1, RunCommand::JudgeChecks { judged })],
+    )
+    .await;
+    assert!(!judged_checks(&phases)[0].value);
+    assert_eq!(result.ending, Ending::Refused, "{result:#?}");
+    assert_eq!(
+        result.refusal.unwrap().message,
+        "the work cell is not ready: the check of `in_reach` is false, and the operator agrees with each value"
+    );
+    assert!(host.calls_of("home").is_empty(), "the run moved no robot");
+    let judged = super::ChecksJudged::FalseCheck {
+        wrong: vec![name("in_reach")],
+    };
+    let (result, _) = run(
+        &of_a_trial(),
+        &arm(),
+        vec![(1, RunCommand::JudgeChecks { judged })],
+    )
+    .await;
+    assert_eq!(
+        result.refusal.unwrap().message,
+        "the operator names the check of `in_reach` wrong: its value differs from the work cell"
+    );
+}
+
+/// An abort of a run of a trial that waits for the judgement of its checks
+/// ends it aborted.
+#[tokio::test(start_paused = true)]
+async fn an_abort_of_a_run_of_a_trial_that_waits_for_its_judgement_ends_it_aborted() {
+    let host = arm();
+    let (result, _) = run(&of_a_trial(), &host, vec![(3, RunCommand::Abort)]).await;
+    assert_eq!(result.ending, Ending::Aborted, "{result:#?}");
+    assert!(host.calls_of("home").is_empty());
+}
+
+/// The judgement of the checks: a wrong check first, then a false check,
+/// else the run starts.
+#[test]
+fn the_judgement_of_the_checks_names_a_wrong_check_first_then_a_false_one() {
+    use super::ChecksJudged;
+    use workflow_documents::result::CheckToJudge;
+    let check = |value: bool| CheckToJudge {
+        assumption: name("in_reach"),
+        says: "The block is in reach".to_owned(),
+        check: "target.found".to_owned(),
+        value,
+    };
+    assert_eq!(
+        ChecksJudged::of(&[check(true)], Vec::new()),
+        ChecksJudged::Starts
+    );
+    assert_eq!(
+        ChecksJudged::of(&[check(true), check(false)], Vec::new()),
+        ChecksJudged::NotReady
+    );
+    let wrong = vec![name("in_reach")];
+    assert_eq!(
+        ChecksJudged::of(&[check(false)], wrong.clone()),
+        ChecksJudged::FalseCheck { wrong }
+    );
+    assert_eq!(ChecksJudged::Starts.outcome(), "starts");
+    assert_eq!(ChecksJudged::NotReady.outcome(), "not_ready");
+}

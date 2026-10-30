@@ -1,10 +1,13 @@
 //! The director over the wire, against a scripted fleet and a scripted arm, for the validation of workflows: the
-//! work cell of a run and the values that no test covered, and the gates of an unattended run on a physical robot.
+//! work cell of a run and the values that no test covered, the gates of an unattended run on a physical robot, and
+//! the trials that sign off a bundle.
 
 use peppygen::DEFAULT_FEEDBACK_BOUND;
 use peppygen::exposed_actions::director::run::GoalBundleItem;
-use peppygen::fixtures::exposed_actions::director::run;
-use peppygen::fixtures::exposed_services::director::forget_robot;
+use peppygen::fixtures::exposed_actions::director::{next_run, run, trial};
+use peppygen::fixtures::exposed_services::director::{
+    forget_robot, judge_checks, judge_ending, runs, status, suspend,
+};
 use serde_json::{Value, json};
 use workflow_documents::lock::{Lock, LockedNode};
 use workflow_documents::{Bundle, NameTag, Sha256, Validation, Workflow};
@@ -40,7 +43,8 @@ fn lock_at(commit: &str) -> Lock {
     }
 }
 
-/// The validation of a sweep of `home_workflow` that tested a belt speed from 0.05 to 0.25 m/s.
+/// The validation of a sweep of `home_workflow` that tested a belt speed from 0.05 to 0.25 m/s, whose thresholds a
+/// trial meets only when each of its runs completes, with no unsafe event, false success or false check.
 fn belt_speed_tested() -> Validation {
     let thresholds = json!({
         "completed_at_least": 1.0, "unsafe_events_at_most": 0,
@@ -57,7 +61,12 @@ fn belt_speed_tested() -> Validation {
 
 /// The files of the bundle of `home_workflow` with `lock`, signed off with `validation` when it gives one.
 fn bundle_of_home(lock: Lock, validation: Option<Validation>) -> Vec<GoalBundleItem> {
-    let workflow = Workflow::parse(&home_workflow()).unwrap();
+    bundle_of(&home_workflow(), lock, validation)
+}
+
+/// The files of the bundle of the workflow `text` with `lock`, signed off with `validation` when it gives one.
+fn bundle_of(text: &str, lock: Lock, validation: Option<Validation>) -> Vec<GoalBundleItem> {
+    let workflow = Workflow::parse(text).unwrap();
     let files = match validation {
         Some(validation) => Bundle::write_signed_off(&workflow, Vec::new(), lock, validation),
         None => Bundle::write(&workflow, Vec::new(), lock),
@@ -384,5 +393,510 @@ async fn a_sign_off_record_admits_an_unattended_run_until_forget_robot_removes_i
         ),
         "{refused}"
     );
+    rig.harness.shutdown().await
+}
+
+/// `home_workflow` with the assumption `belt_runs`, whose check is `check`.
+fn home_checking(check: &str) -> String {
+    let mut workflow: Value = serde_json::from_str(&home_workflow()).unwrap();
+    workflow["assumptions"] = json!({ "belt_runs": { "says": "The belt runs", "check": check } });
+    workflow.to_string()
+}
+
+/// The trial document of `runs` runs of `home_workflow` on `alpha`, in a work cell whose belt runs at 0.2 m/s.
+fn trial_of_home(runs: u32) -> String {
+    json!({
+        "workflow_schema": "trial/v1",
+        "manifest": { "name": "home_line", "revision": 1 },
+        "workflow": { "name": "go_home", "revision": 1 },
+        "roles": { "arm": ROBOT },
+        "work_cell": { "belt_speed_mps": 0.2 },
+        "runs": runs,
+    })
+    .to_string()
+}
+
+/// The goal of a trial of `runs` runs of the bundle `bundle`, which `trial_ends` and its result end.
+async fn start_trial(
+    rig: &Rig,
+    runs: u32,
+    bundle: Vec<GoalBundleItem>,
+) -> peppygen::Result<trial::GoalHandle> {
+    let request = trial::GoalRequestData {
+        trial: trial_of_home(runs),
+        bundle: bundle
+            .into_iter()
+            .map(
+                |file| peppygen::exposed_actions::director::trial::GoalBundleItem {
+                    path: file.path,
+                    content: file.content,
+                },
+            )
+            .collect(),
+        started_by: Some("tests".to_owned()),
+    };
+    let goal = trial::send_goal(&rig.harness, &request, DEFAULT_FEEDBACK_BOUND, WIRE).await?;
+    assert!(goal.accepted, "{:?}", goal.refusal);
+    Ok(goal)
+}
+
+/// The next feedback of the trial `goal` whose event is `event`.
+async fn until_trial(
+    goal: &mut trial::GoalHandle,
+    event: &str,
+) -> peppygen::Result<trial::Feedback> {
+    loop {
+        let feedback = goal.on_next_feedback().await?;
+        if feedback.event == event {
+            return Ok(feedback);
+        }
+    }
+}
+
+/// The goal of the next run of the trial `trial`, once its run waits for the judgement of its checks, with the run.
+async fn next_run_judging(
+    rig: &Rig,
+    trial: &str,
+) -> peppygen::Result<(next_run::GoalHandle, String)> {
+    let request = next_run::GoalRequestData {
+        trial: trial.to_owned(),
+    };
+    let mut goal =
+        next_run::send_goal(&rig.harness, &request, DEFAULT_FEEDBACK_BOUND, WIRE).await?;
+    assert!(goal.accepted, "{:?}", goal.refusal);
+    loop {
+        let feedback = goal.on_next_feedback().await?;
+        if feedback.event == "checks_to_judge" {
+            return Ok((goal, feedback.run));
+        }
+    }
+}
+
+/// The outcome that `judge_checks` gives for `wrong` in the trial `trial`, or the kind of its refusal.
+async fn judge_checks_of(rig: &Rig, trial: &str, wrong: &[&str]) -> Result<String, String> {
+    let request = judge_checks::RequestData {
+        trial: trial.to_owned(),
+        wrong: wrong.iter().map(|name| (*name).to_owned()).collect(),
+    };
+    match judge_checks::poll(&rig.harness, &request, WIRE).await {
+        Ok(response) => Ok(response.outcome),
+        Err(error) => Err(judge_checks::Failure::of(&error)
+            .map(|failure| failure.kind.to_string())
+            .unwrap_or_else(|| error.to_string())),
+    }
+}
+
+/// The answer of `judge_ending` for a run of the trial `trial` whose task is done as `task_done`.
+async fn judge_ending_of(
+    rig: &Rig,
+    trial: &str,
+    task_done: bool,
+) -> peppygen::Result<judge_ending::Response> {
+    let request = judge_ending::RequestData {
+        trial: trial.to_owned(),
+        task_done,
+        emergency_stop: false,
+        unsafe_events: Vec::new(),
+    };
+    judge_ending::poll(&rig.harness, &request, WIRE).await
+}
+
+/// The report of the trial that `goal` gave at its end, and how the goal ended.
+async fn trial_ended(
+    mut goal: trial::GoalHandle,
+) -> peppygen::Result<(Value, trial::ResultOutcome)> {
+    let ends = until_trial(&mut goal, "trial_ends").await?;
+    let ended = goal.get_result(WIRE).await?;
+    Ok((serde_json::from_str(&ends.details).unwrap(), ended.outcome))
+}
+
+/// A rig over a physical `alpha`, which the director lists.
+async fn physical_rig() -> peppygen::Result<Rig> {
+    let rig = Rig::start(Home::AtOnce).await?;
+    rig.fleet.state.send_modify(|state| state.physical = true);
+    listed_robots(&rig).await?;
+    Ok(rig)
+}
+
+/// A trial takes the lease of its robot, opens it while the operator prepares the work cell, and closes it at
+/// `next_run`; its run gives each check to judge, runs once the operator judges that it starts, and counts by the
+/// judgement of its ending. After its last run, the trial signs off its bundle: its goal completes with its report,
+/// the director keeps a sign-off record, and an unattended run of the bundle on that robot then runs. The runs of
+/// the director list the trial, its run has the trial as its `started_by`, and `status` gives its report.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_trial_whose_runs_meet_the_thresholds_signs_off_its_bundle() -> peppygen::Result<()> {
+    let rig = physical_rig().await?;
+    let bundle = bundle_of(
+        &home_checking("true"),
+        lock_at(ARM_NODE.2),
+        Some(belt_speed_tested()),
+    );
+    let mut goal = start_trial(&rig, 1, bundle.clone()).await?;
+    let starts = goal.on_next_feedback().await?;
+    assert_eq!(
+        (starts.event.as_str(), starts.trial.as_str()),
+        ("trial_starts", "t1")
+    );
+    let prepares = until_trial(&mut goal, "prepares").await?;
+    assert_eq!(
+        serde_json::from_str::<Value>(&prepares.details).unwrap()["number"],
+        1
+    );
+    assert_eq!(
+        judge_checks_of(&rig, "t1", &[]).await,
+        Err("precondition_failed".to_owned())
+    );
+    let (mut run_goal, run) = next_run_judging(&rig, "t1").await?;
+    assert_eq!(
+        judge_checks_of(&rig, "t1", &["no_such_check"]).await,
+        Err("rejected".to_owned())
+    );
+    let request = suspend::RequestData { run: run.clone() };
+    let refused = suspend::poll(&rig.harness, &request, WIRE)
+        .await
+        .unwrap_err();
+    let failure = suspend::Failure::of(&refused).expect("a refusal of suspend");
+    assert!(
+        failure.message.contains("a run of the trial `t1`"),
+        "{failure:?}"
+    );
+    assert_eq!(
+        judge_checks_of(&rig, "t1", &[]).await,
+        Ok("starts".to_owned())
+    );
+    while run_goal.on_next_feedback().await.is_ok() {}
+    let ran = run_goal.get_result(WIRE).await?;
+    assert!(
+        matches!(ran.outcome, next_run::ResultOutcome::Completed(_)),
+        "{:?}",
+        ran.outcome
+    );
+    let counted = judge_ending_of(&rig, "t1", true).await?;
+    assert_eq!((counted.runs_counted, counted.goes_on), (1, false));
+    let (report, outcome) = trial_ended(goal).await?;
+    assert!(
+        matches!(outcome, trial::ResultOutcome::Completed(_)),
+        "{outcome:?}"
+    );
+    assert_eq!(report["signs_off"], true, "{report}");
+    assert_eq!(report["sign_off"]["trial"], "t1");
+    assert_eq!(report["runs"][0]["count"], "completed");
+    assert!(
+        report["runs"][0]["journal"]
+            .as_array()
+            .is_some_and(|journal| !journal.is_empty())
+    );
+    let calls = rig.fleet.calls();
+    let order: Vec<&str> = calls
+        .iter()
+        .map(String::as_str)
+        .filter(|call| {
+            [
+                "take alpha trial t1",
+                "open alpha",
+                "close alpha",
+                "release alpha",
+            ]
+            .contains(call)
+        })
+        .collect();
+    assert_eq!(
+        order,
+        [
+            "take alpha trial t1",
+            "open alpha",
+            "close alpha",
+            "release alpha"
+        ],
+        "{calls:?}"
+    );
+    assert!(
+        !calls.iter().any(|call| call.starts_with("take alpha run")),
+        "a run of a trial takes no lease"
+    );
+
+    let document = unattended(json!({ "arm": ROBOT }), json!({ "belt_speed_mps": 0.2 }));
+    let (admitted, _) = run_bundle(&rig, bundle, document).await?;
+    assert_eq!(admitted["ending"], "completed", "{admitted}");
+    let listed = runs::poll(&rig.harness, WIRE).await?;
+    let trials: Vec<(&str, &str, u32)> = listed
+        .trials
+        .iter()
+        .map(|trial| {
+            (
+                trial.trial.as_str(),
+                trial.state.as_str(),
+                trial.runs_counted,
+            )
+        })
+        .collect();
+    assert_eq!(trials, [("t1", "signed_off", 1)]);
+    let of_the_trial = listed
+        .runs
+        .iter()
+        .find(|item| item.run == run)
+        .expect("the run of the trial");
+    assert_eq!(of_the_trial.started_by, "t1");
+    let request = status::RequestData {
+        run: "t1".to_owned(),
+    };
+    let status = status::poll(&rig.harness, &request, WIRE).await?;
+    assert_eq!(status.state, "signed_off");
+    assert!(status.details.contains("\"journal\""), "{}", status.details);
+    rig.harness.shutdown().await
+}
+
+/// The director refuses a trial before its first run, naming each cause: a simulated robot, a bundle with no
+/// envelope, a stack that differs from the lock, a robot that another client leases, and a halted stack. A refused
+/// trial takes no lease it keeps.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_trial_is_refused_naming_each_cause() -> peppygen::Result<()> {
+    let rig = Rig::start(Home::AtOnce).await?;
+    listed_robots(&rig).await?;
+    let signed_off = || bundle_of_home(lock_at(ARM_NODE.2), Some(belt_speed_tested()));
+    let refusal = |outcome: trial::ResultOutcome| match outcome {
+        trial::ResultOutcome::Failed(failure) => {
+            assert_eq!(failure.kind.to_string(), "trial_refused", "{failure:?}");
+            failure.message
+        }
+        other => panic!("{other:?}"),
+    };
+    let (_, simulated) = trial_ended(start_trial(&rig, 1, signed_off()).await?).await?;
+    assert!(
+        refusal(simulated).contains("`alpha` is simulated; a trial binds only physical robots")
+    );
+    rig.fleet.state.send_modify(|state| state.physical = true);
+    let no_envelope = bundle_of_home(lock_at(ARM_NODE.2), None);
+    let (_, outcome) = trial_ended(start_trial(&rig, 1, no_envelope).await?).await?;
+    assert!(refusal(outcome).contains("the bundle has no envelope"));
+    let other_commit = bundle_of_home(lock_at("7654321"), Some(belt_speed_tested()));
+    let (_, outcome) = trial_ended(start_trial(&rig, 1, other_commit).await?).await?;
+    assert!(
+        refusal(outcome).starts_with("the stack differs from the lock of the bundle in 1 ways")
+    );
+    rig.fleet.state.send_modify(|state| {
+        state.leases.push(common::Lease {
+            robot: ROBOT.to_owned(),
+            holder: "headset".to_owned(),
+            holder_core_node: "elsewhere".to_owned(),
+            name: "teleop".to_owned(),
+            open: false,
+        })
+    });
+    let (report, outcome) = trial_ended(start_trial(&rig, 1, signed_off()).await?).await?;
+    let leased = refusal(outcome);
+    assert!(
+        leased.starts_with("the lease of `alpha` was refused (leased)"),
+        "{leased}"
+    );
+    assert_eq!(report["state"], "refused");
+    rig.fleet.state.send_modify(|state| state.leases.clear());
+    rig.fleet.halt();
+    let (_, outcome) = trial_ended(start_trial(&rig, 1, signed_off()).await?).await?;
+    assert!(refusal(outcome).starts_with("the stack is halted"));
+    rig.harness.shutdown().await
+}
+
+/// Runs the trial `trial` of one run of `bundle` to its sign-off: the operator judges that its run starts and that
+/// its task is done. Gives the report.
+async fn sign_off_in_one_run(
+    rig: &Rig,
+    trial: &str,
+    bundle: Vec<GoalBundleItem>,
+) -> peppygen::Result<Value> {
+    let mut goal = start_trial(rig, 1, bundle).await?;
+    until_trial(&mut goal, "prepares").await?;
+    let (mut run_goal, _) = next_run_judging(rig, trial).await?;
+    assert_eq!(
+        judge_checks_of(rig, trial, &[]).await,
+        Ok("starts".to_owned())
+    );
+    while run_goal.on_next_feedback().await.is_ok() {}
+    judge_ending_of(rig, trial, true).await?;
+    let (report, outcome) = trial_ended(goal).await?;
+    assert!(
+        matches!(outcome, trial::ResultOutcome::Completed(_)),
+        "{outcome:?}"
+    );
+    Ok(report)
+}
+
+/// The kind and the message of the failure that ended the trial goal with `outcome`.
+fn failed(outcome: trial::ResultOutcome) -> (String, String) {
+    match outcome {
+        trial::ResultOutcome::Failed(failure) => (failure.kind.to_string(), failure.message),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A trial removes, at its start, the sign-off record of its bundle and binding. A cancel of `next_run` aborts its
+/// run, which counts as not completed; the trial then ends, as the runs left cannot meet the thresholds, and signs
+/// off nothing, so an unattended run of the bundle is refused after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_trial_that_ends_early_signs_off_nothing_and_leaves_no_record() -> peppygen::Result<()> {
+    let rig = physical_rig().await?;
+    let bundle = bundle_of(
+        &home_checking("true"),
+        lock_at(ARM_NODE.2),
+        Some(belt_speed_tested()),
+    );
+    sign_off_in_one_run(&rig, "t1", bundle.clone()).await?;
+    let mut goal = start_trial(&rig, 2, bundle.clone()).await?;
+    until_trial(&mut goal, "prepares").await?;
+    let (run_goal, run) = next_run_judging(&rig, "t2").await?;
+    run_goal.cancel_goal(WIRE).await?;
+    let aborted = run_goal.get_result(WIRE).await?;
+    assert!(
+        matches!(aborted.outcome, next_run::ResultOutcome::Cancelled { .. }),
+        "{:?}",
+        aborted.outcome
+    );
+    let counted = until_trial(&mut goal, "run_counted").await?;
+    assert_eq!(counted.run, run);
+    assert_eq!(
+        serde_json::from_str::<Value>(&counted.details).unwrap()["count"],
+        "not_completed"
+    );
+    let (report, outcome) = trial_ended(goal).await?;
+    let (kind, message) = failed(outcome);
+    assert_eq!(kind, "trial_not_signed_off");
+    assert!(
+        message.contains("cannot meet the thresholds of the bundle any more"),
+        "{message}"
+    );
+    assert_eq!(report["signs_off"], false);
+    assert!(report["sign_off"].is_null(), "{report}");
+    let document = unattended(json!({ "arm": ROBOT }), json!({ "belt_speed_mps": 0.2 }));
+    let (refused, _) = run_bundle(&rig, bundle, document).await?;
+    assert!(
+        refusal_of(&refused).starts_with("no trial signed off the bundle"),
+        "{refused}"
+    );
+    rig.harness.shutdown().await
+}
+
+/// A run whose work cell the operator judges not ready does not count, and the trial waits for the next run; a
+/// check that the operator names wrong counts the run as not completed and the check as false.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_not_ready_does_not_count_and_a_wrong_check_counts_as_false() -> peppygen::Result<()>
+{
+    let rig = physical_rig().await?;
+    let bundle = bundle_of(
+        &home_checking("false"),
+        lock_at(ARM_NODE.2),
+        Some(belt_speed_tested()),
+    );
+    let mut goal = start_trial(&rig, 3, bundle).await?;
+    until_trial(&mut goal, "prepares").await?;
+    let (not_ready, _) = next_run_judging(&rig, "t1").await?;
+    assert_eq!(
+        judge_checks_of(&rig, "t1", &[]).await,
+        Ok("not_ready".to_owned())
+    );
+    let refused = not_ready.get_result(WIRE).await?;
+    match refused.outcome {
+        next_run::ResultOutcome::Failed(failure) => {
+            assert_eq!(failure.kind.to_string(), "run_refused")
+        }
+        other => panic!("{other:?}"),
+    }
+    let not_counted = until_trial(&mut goal, "run_not_counted").await?;
+    assert_eq!(
+        serde_json::from_str::<Value>(&not_counted.details).unwrap()["measures"]["runs"],
+        0
+    );
+    let prepares = until_trial(&mut goal, "prepares").await?;
+    assert_eq!(
+        serde_json::from_str::<Value>(&prepares.details).unwrap()["number"],
+        1
+    );
+    let (_wrong, _) = next_run_judging(&rig, "t1").await?;
+    assert_eq!(
+        judge_checks_of(&rig, "t1", &["belt_runs"]).await,
+        Ok("false_check".to_owned())
+    );
+    let counted = until_trial(&mut goal, "run_counted").await?;
+    let measures = &serde_json::from_str::<Value>(&counted.details).unwrap()["measures"];
+    assert_eq!(
+        (
+            measures["runs"].as_u64(),
+            measures["false_assumption_checks"].as_u64()
+        ),
+        (Some(1), Some(1))
+    );
+    let (_, outcome) = trial_ended(goal).await?;
+    assert_eq!(failed(outcome).0, "trial_not_signed_off");
+    rig.harness.shutdown().await
+}
+
+/// A halt ends a trial that waits for its next run halted, signing off nothing, and refuses every new trial.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_halt_ends_a_running_trial_halted_and_refuses_a_new_one() -> peppygen::Result<()> {
+    let rig = physical_rig().await?;
+    let bundle = bundle_of_home(lock_at(ARM_NODE.2), Some(belt_speed_tested()));
+    let mut goal = start_trial(&rig, 1, bundle.clone()).await?;
+    until_trial(&mut goal, "prepares").await?;
+    rig.fleet.halt();
+    let (report, outcome) = trial_ended(goal).await?;
+    assert_eq!(failed(outcome).0, "trial_halted");
+    assert_eq!(report["state"], "halted");
+    let (_, refused) = trial_ended(start_trial(&rig, 1, bundle).await?).await?;
+    let (kind, message) = failed(refused);
+    assert_eq!(kind, "trial_refused");
+    assert!(message.starts_with("the stack is halted"), "{message}");
+    rig.harness.shutdown().await
+}
+
+/// A cancel of the goal of a trial aborts it: the goal ends cancelled with the report, which signs off nothing, and
+/// the trial gives its lease back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancel_of_a_trial_aborts_it_and_it_signs_off_nothing() -> peppygen::Result<()> {
+    let rig = physical_rig().await?;
+    let bundle = bundle_of_home(lock_at(ARM_NODE.2), Some(belt_speed_tested()));
+    let mut goal = start_trial(&rig, 1, bundle).await?;
+    until_trial(&mut goal, "prepares").await?;
+    goal.cancel_goal(WIRE).await?;
+    let (report, outcome) = trial_ended(goal).await?;
+    assert!(
+        matches!(outcome, trial::ResultOutcome::Cancelled { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        (report["state"].as_str(), report["signs_off"].as_bool()),
+        (Some("aborted"), Some(false))
+    );
+    assert!(rig.fleet.calls().contains(&format!("release {ROBOT}")));
+    rig.harness.shutdown().await
+}
+
+/// A restart of the director ends a running trial interrupted: the director that starts again lists it so, and
+/// its report signs off nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_of_the_director_ends_a_running_trial_interrupted() -> peppygen::Result<()> {
+    let rig = physical_rig().await?;
+    let bundle = bundle_of_home(lock_at(ARM_NODE.2), Some(belt_speed_tested()));
+    let mut goal = start_trial(&rig, 1, bundle).await?;
+    until_trial(&mut goal, "prepares").await?;
+    let Rig {
+        harness, journals, ..
+    } = rig;
+    harness.shutdown().await?;
+    let rig = Rig::start_on(Home::AtOnce, &[], journals).await?;
+    let listed = runs::poll(&rig.harness, WIRE).await?;
+    assert_eq!(listed.trials.len(), 1);
+    assert_eq!(
+        (
+            listed.trials[0].trial.as_str(),
+            listed.trials[0].state.as_str()
+        ),
+        ("t1", "interrupted")
+    );
+    let request = status::RequestData {
+        run: "t1".to_owned(),
+    };
+    let status = status::poll(&rig.harness, &request, WIRE).await?;
+    assert_eq!(status.state, "interrupted");
+    let report: Value = serde_json::from_str(&status.details).unwrap();
+    assert_eq!(report["signs_off"], false);
     rig.harness.shutdown().await
 }

@@ -77,6 +77,7 @@ fn plan_errors_watching(
         poll: workflow_documents::Bound::from_seconds(0.5).unwrap(),
         cancel_timeout: Duration::from_secs(10),
         watch,
+        of_a_trial: false,
     };
     match plan(
         Arc::new(workflow(value)),
@@ -346,6 +347,7 @@ fn a_location_goes_by_its_name_to_a_marked_field_of_a_skill_that_knows_locations
             poll: workflow_documents::Bound::from_seconds(0.5).unwrap(),
             cancel_timeout: Duration::from_secs(10),
             watch: Default::default(),
+            of_a_trial: false,
         },
     )
     .unwrap();

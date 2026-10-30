@@ -129,6 +129,15 @@ impl SignOff {
         self.binding.values().map(|robot| &robot.name).collect()
     }
 
+    /// Whether this sign-off binds each role to the robot of `binding`, and
+    /// no other role.
+    pub fn has_binding(&self, binding: &BTreeMap<Name, RobotName>) -> bool {
+        self.binding.len() == binding.len()
+            && binding
+                .iter()
+                .all(|(role, robot)| self.binding.get(role).is_some_and(|b| b.name == *robot))
+    }
+
     /// Whether this sign-off binds the robot named `robot`.
     pub fn binds(&self, robot: &str) -> bool {
         self.binding
@@ -322,6 +331,18 @@ impl SignOffs {
         of_bundle
     }
 
+    /// Keeps `record` in its file.
+    pub fn keep(&self, record: SignOffRecord) -> std::io::Result<()> {
+        let mut records = self.records.lock().expect("no sign-off panics");
+        let text = serde_json::to_string_pretty(&record).map_err(std::io::Error::other)?;
+        let path = self.path(&record.trial);
+        let written = path.with_extension("json.part");
+        fs::write(&written, text)?;
+        fs::rename(&written, &path)?;
+        records.insert(record.trial.clone(), record);
+        Ok(())
+    }
+
     /// Removes each record that `removes` holds, and gives how many.
     fn remove_each(&self, removes: impl Fn(&SignOffRecord) -> bool) -> std::io::Result<u32> {
         let mut records = self.records.lock().expect("no sign-off panics");
@@ -340,6 +361,17 @@ impl SignOffs {
     /// Removes each record that binds the robot named `robot`.
     pub fn forget_robot(&self, robot: &str) -> std::io::Result<u32> {
         self.remove_each(|record| record.sign_off.binds(robot))
+    }
+
+    /// Removes each record of the bundle `bundle` with the binding `binding`.
+    pub fn forget_binding(
+        &self,
+        bundle: &Sha256,
+        binding: &BTreeMap<Name, RobotName>,
+    ) -> std::io::Result<u32> {
+        self.remove_each(|record| {
+            record.sign_off.bundle == *bundle && record.sign_off.has_binding(binding)
+        })
     }
 }
 
@@ -536,6 +568,38 @@ pub(crate) mod tests {
         assert_eq!(store.forget_robot("charlie").unwrap(), 1);
         assert_eq!(store.forget_robot("delta").unwrap(), 0);
         assert_eq!(trials(&SignOffs::open(dir.path()).unwrap()), ["t2", "t3"]);
+    }
+
+    /// A kept record stays across an open of the store, and a trial of the
+    /// same bundle and binding removes it and no other.
+    #[test]
+    fn a_kept_record_stays_until_a_trial_of_its_bundle_and_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SignOffs::open(dir.path()).unwrap();
+        let bundle = Sha256::parse(BUNDLE).unwrap();
+        store
+            .keep(record("t1", &[("left", "alpha"), ("right", "bravo")]))
+            .unwrap();
+        store
+            .keep(record("t2", &[("left", "bravo"), ("right", "alpha")]))
+            .unwrap();
+        let reopened = SignOffs::open(dir.path()).unwrap();
+        assert_eq!(reopened.of_bundle(&bundle).len(), 2);
+        let binding = BTreeMap::from([
+            (name("left"), robot_name("alpha")),
+            (name("right"), robot_name("bravo")),
+        ]);
+        let mut other_bundle = binding.clone();
+        other_bundle.insert(name("courier"), robot_name("charlie"));
+        assert_eq!(reopened.forget_binding(&bundle, &other_bundle).unwrap(), 0);
+        assert_eq!(reopened.forget_binding(&bundle, &binding).unwrap(), 1);
+        let left: Vec<String> = SignOffs::open(dir.path())
+            .unwrap()
+            .of_bundle(&bundle)
+            .into_iter()
+            .map(|record| record.trial)
+            .collect();
+        assert_eq!(left, ["t2"]);
     }
 
     #[test]

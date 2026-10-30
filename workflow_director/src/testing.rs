@@ -166,6 +166,7 @@ pub fn plan_on(workflow: &Json, attendance: Attendance, snapshot: &Snapshot) -> 
         poll: workflow_documents::Bound::from_seconds(0.5).unwrap(),
         cancel_timeout: Duration::from_secs(10),
         watch: Default::default(),
+        of_a_trial: false,
     };
     checker::plan(Arc::new(workflow), snapshot, &allowed(), &binding, choices)
         .unwrap_or_else(|errors| panic!("the workflow does not hold: {errors:#?}"))

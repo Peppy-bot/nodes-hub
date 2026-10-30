@@ -179,6 +179,10 @@ pub struct Plan {
     /// How long, on wall time, a cancelled goal has to end.
     pub cancel_timeout: Duration,
     pub watch: Watch,
+    /// Whether the run is a run of a trial: the engine evaluates each check
+    /// of its assumptions, a false one included, and waits for the
+    /// judgement of the operator before the initialization.
+    pub of_a_trial: bool,
 }
 
 impl Plan {

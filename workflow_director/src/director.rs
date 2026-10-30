@@ -37,6 +37,7 @@ use crate::leases::{LeaseEventKind, Leases};
 use crate::live::{LiveHost, RunClock};
 use crate::replay::{Planned, Recorded, journal_command};
 use crate::sign_off::{SignOff, SignOffRecord, SignOffs, refusal_of_no_record};
+use crate::trial::{TrialEntry, TrialState, Trials};
 
 /// The caller of a run: the instance and the machine that sent its goal.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,6 +56,8 @@ pub struct RunRequest {
     pub work_cell: Option<String>,
     pub started_by: String,
     pub caller_data: Option<String>,
+    /// The trial of a run of a trial, `t<N>`.
+    pub trial: Option<String>,
 }
 
 /// Where the workflow of a run comes from: its text, or a bundle.
@@ -104,23 +107,26 @@ impl RunRequest {
 }
 
 /// A run the director keeps: its workflow once it parsed, who started it,
-/// its robots once bound, where it stands and how to reach its engine.
+/// the trial of a run of a trial, its robots once bound, where it stands and
+/// how to reach its engine.
 pub struct RunEntry {
     pub workflow: Option<Arc<Workflow>>,
     pub started_by: String,
+    pub trial: Option<String>,
     pub robots: Vec<(Name, RobotName)>,
     pub phase: watch::Receiver<Phase>,
     pub commands: Option<mpsc::UnboundedSender<RunCommand>>,
 }
 
 /// What a member of the director reads of a run: where it stands, and the
-/// receiver that follows it, how to reach its engine while it goes, and its
-/// workflow once it parsed.
+/// receiver that follows it, how to reach its engine while it goes, its
+/// workflow once it parsed, and its trial.
 pub struct RunView {
     pub phase: Phase,
     pub phases: watch::Receiver<Phase>,
     pub commands: Option<mpsc::UnboundedSender<RunCommand>>,
     pub workflow: Option<Arc<Workflow>>,
+    pub trial: Option<String>,
 }
 
 /// The director.
@@ -131,6 +137,8 @@ pub struct Director {
     pub snapshots: watch::Receiver<Arc<Snapshot>>,
     pub journals: Journals,
     pub sign_offs: SignOffs,
+    pub trial_records: Trials,
+    pub trials: Mutex<BTreeMap<String, TrialEntry>>,
     pub runs: Mutex<BTreeMap<String, RunEntry>>,
     /// The robots that a teach of their locations holds. Read under the
     /// lock of `runs`, so a run and a teach never hold one robot.
@@ -139,23 +147,28 @@ pub struct Director {
     pub clock: ClockSource,
 }
 
-/// What of this director holds a robot: another of its runs, or a teach of
-/// its locations.
+/// What of this director holds a robot: another of its runs, a teach of its
+/// locations, or a running trial.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Holder {
+pub enum Holder {
     Run(String),
     Teach,
+    Trial(String),
 }
 
 impl Holder {
-    /// Why a run does not bind `robot`, which this holds, and what to do.
-    fn why(&self, robot: &str) -> String {
+    /// Why a run or a trial does not bind `robot`, which this holds, and
+    /// what to do.
+    pub fn why(&self, robot: &str) -> String {
         match self {
             Holder::Run(run) => format!(
                 "`{robot}` takes part in run {run} of this director: wait for its end, or abort it"
             ),
             Holder::Teach => format!(
                 "`{robot}` is being taught its locations by this director: run again once the teach ends"
+            ),
+            Holder::Trial(trial) => format!(
+                "`{robot}` takes part in trial {trial} of this director: wait for its end, or cancel it"
             ),
         }
     }
@@ -193,11 +206,14 @@ impl Drop for TeachHold {
     }
 }
 
-/// What a run needs from its preparation.
+/// What a run needs from its preparation: its plan, the base of its result,
+/// the leases it took, the robots whose leases it uses (those it took, or
+/// those of its trial), the inputs of its plan and its fleet.
 struct Prepared {
     plan: Plan,
     base: ResultBase,
     taken: Vec<RobotName>,
+    leased: Vec<RobotName>,
     planned: Planned,
     snapshot: Snapshot,
 }
@@ -233,7 +249,7 @@ fn located(refusals: workflow_documents::Refusals) -> Vec<Located> {
 pub const EVENTS_KEPT: usize = 4096;
 
 /// What a run refused or ended by a halt of the stack tells its caller to do.
-const HALTED: &str = "the stack is halted; run `peppy fleet clear-halt`, then run again";
+pub const HALTED: &str = "the stack is halted; run `peppy fleet clear-halt`, then run again";
 
 impl Director {
     fn journal(&self, run: &str, run_ns: u64, kind: &str, body: Json) {
@@ -250,6 +266,7 @@ impl Director {
             phases: entry.phase.clone(),
             commands: entry.commands.clone(),
             workflow: entry.workflow.clone(),
+            trial: entry.trial.clone(),
         })
     }
 
@@ -266,7 +283,7 @@ impl Director {
 
     /// The instance and the machine of the director, as the daemon names a
     /// client.
-    fn me(&self) -> Caller {
+    pub fn me(&self) -> Caller {
         let processor = self.runner.processor();
         Caller {
             instance: processor.bound_instance_id().to_owned(),
@@ -358,9 +375,11 @@ impl Director {
             };
             let (_, phase) = watch::channel(Phase::Ended(Box::new(result)));
             let started_by = opened["started_by"].as_str().unwrap_or_default().to_owned();
+            let trial = opened["trial"].as_str().map(str::to_owned);
             let entry = RunEntry {
                 workflow,
                 started_by,
+                trial,
                 robots,
                 phase,
                 commands: None,
@@ -392,6 +411,7 @@ impl Director {
         let entry = RunEntry {
             workflow: None,
             started_by: request.started_by.clone(),
+            trial: request.trial.clone(),
             robots: Vec::new(),
             phase: phase_rx.clone(),
             commands: Some(commands_tx.clone()),
@@ -403,7 +423,7 @@ impl Director {
         let opened = json!({
             "workflow": request.workflow, "bundle": request.bundle, "run_document": request.run_document,
             "roles": request.roles, "work_cell": request.work_cell, "started_by": request.started_by,
-            "caller_data": request.caller_data,
+            "caller_data": request.caller_data, "trial": request.trial,
             "caller": { "instance": caller.instance, "core_node": caller.core_node },
         });
         self.journal(&run, 0, journal::OPENED, opened);
@@ -438,6 +458,7 @@ impl Director {
             plan,
             base,
             taken,
+            leased,
             mut planned,
             snapshot,
         } = prepared;
@@ -498,7 +519,7 @@ impl Director {
         planned.run_ns = host.now();
         planned.wall_ns = host.wall_now();
         self.journal(run, planned.run_ns, journal::PLANNED, json!(planned));
-        let stopper = self.follow_leases(run, &taken, commands_tx).await;
+        let stopper = self.follow_leases(run, &leased, commands_tx).await;
         let (engine_tx, engine_rx) = mpsc::unbounded_channel();
         let pass_on = |command: RunCommand, queued: bool| {
             let at = if queued { planned.run_ns } else { host.now() };
@@ -554,24 +575,26 @@ impl Director {
         result
     }
 
-    /// Follows the lease events and the halt for the robots of `run`: the
-    /// end of one of its leases, or a halt, stops the run; the end of a lease
-    /// in a halt stops it halted. A fresh listing first gives each lease that
-    /// ended between its take and this follow, and its stop reaches the
-    /// commands before the engine starts.
+    /// Follows the lease events and the halt for the robots of `run`, whose
+    /// leases are `leased`: the end of one of its leases, or a halt, stops
+    /// the run; the end of a lease in a halt stops it halted. A fresh listing
+    /// first gives each lease that ended between its take and this follow,
+    /// and its stop reaches the commands before the engine starts.
     async fn follow_leases(
         &self,
         run: &str,
-        taken: &[RobotName],
+        leased: &[RobotName],
         commands: mpsc::UnboundedSender<RunCommand>,
     ) -> tokio::task::JoinHandle<()> {
-        let mut events = self.leases.events();
-        let mut snapshots = self.snapshots.clone();
-        let runner = Arc::clone(&self.runner);
-        let robots: BTreeSet<String> = taken.iter().map(|r| r.to_string()).collect();
+        let mut follower = LeaseFollower {
+            events: self.leases.events(),
+            snapshots: self.snapshots.clone(),
+            runner: Arc::clone(&self.runner),
+            robots: leased.iter().map(|r| r.to_string()).collect(),
+        };
         match fleet::read_fleet(&self.runner).await {
             Ok(fleet) => {
-                if let Some(stop) = lost_leases(&fleet, &robots, &self.me()) {
+                if let Some(stop) = lost_leases(&fleet, &follower.robots, &self.me()) {
                     let _ = commands.send(stop);
                 }
             }
@@ -580,31 +603,8 @@ impl Director {
             }
         }
         tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    event = events.recv() => match event {
-                        Ok(event) if event.kind == LeaseEventKind::LeaseEnd && robots.contains(&event.robot) => {
-                            // The daemon ends every lease when it halts the stack, before the listing of the halt
-                            // reaches the follower of the fleet: a fresh listing tells a halt from a lost lease.
-                            let halted = fleet::read_fleet(&runner).await.is_ok_and(|fleet| fleet.halted);
-                            let reason = match halted {
-                                true => HALTED.to_owned(),
-                                false => format!("the lease of {} ended: {}", event.robot, event.cause),
-                            };
-                            let _ = commands.send(RunCommand::Stop { halted, reason });
-                        }
-                        Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                        Err(broadcast::error::RecvError::Closed) => return,
-                    },
-                    changed = snapshots.changed() => {
-                        if changed.is_err() {
-                            return;
-                        }
-                        if snapshots.borrow().fleet.halted {
-                            let _ = commands.send(RunCommand::Stop { halted: true, reason: HALTED.to_owned() });
-                        }
-                    }
-                }
+            while let Some(LeaseStop { halted, reason }) = follower.next_stop().await {
+                let _ = commands.send(RunCommand::Stop { halted, reason });
             }
         })
     }
@@ -621,16 +621,7 @@ impl Director {
         records: &[SignOffRecord],
     ) -> Result<BTreeMap<Name, RobotName>, Vec<Located>> {
         let mut runs = self.runs.lock().expect("no run panics holding the runs");
-        let teaching = self
-            .teaching
-            .lock()
-            .expect("no teach panics holding the robots it teaches")
-            .clone();
-        let held: BTreeMap<RobotName, Holder> = robots_of_runs(&runs, run)
-            .into_iter()
-            .map(|(robot, run)| (robot, Holder::Run(run)))
-            .chain(teaching.into_iter().map(|robot| (robot, Holder::Teach)))
-            .collect();
+        let held = self.holders(&runs, run, parties.trial);
         let binding = bind(workflow, document, snapshot, parties, &held, records)?;
         if let Some(entry) = runs.get_mut(run) {
             entry.robots = binding
@@ -639,6 +630,51 @@ impl Director {
                 .collect();
         }
         Ok(binding)
+    }
+
+    /// The robots that the director holds, with what holds each: the runs
+    /// of `runs` other than `run` while they have not ended, the teaches,
+    /// and the running trials other than `trial`. The caller holds the lock
+    /// of the runs, then this takes those of the teaches and of the trials.
+    pub fn holders(
+        &self,
+        runs: &BTreeMap<String, RunEntry>,
+        run: &str,
+        trial: Option<&str>,
+    ) -> BTreeMap<RobotName, Holder> {
+        let teaching = self
+            .teaching
+            .lock()
+            .expect("no teach panics holding the robots it teaches")
+            .clone();
+        let trials = self
+            .trials
+            .lock()
+            .expect("no trial panics holding the trials");
+        let of_trials: Vec<(RobotName, Holder)> = trials
+            .iter()
+            .filter(|(id, _)| Some(id.as_str()) != trial)
+            .filter(|(_, entry)| entry.record.borrow().state == TrialState::Running)
+            .flat_map(|(id, entry)| {
+                let robots: Vec<RobotName> = entry
+                    .record
+                    .borrow()
+                    .document
+                    .roles
+                    .values()
+                    .cloned()
+                    .collect();
+                robots
+                    .into_iter()
+                    .map(|robot| (robot, Holder::Trial(id.clone())))
+            })
+            .collect();
+        robots_of_runs(runs, run)
+            .into_iter()
+            .map(|(robot, run)| (robot, Holder::Run(run)))
+            .chain(teaching.into_iter().map(|robot| (robot, Holder::Teach)))
+            .chain(of_trials)
+            .collect()
     }
 
     /// Lists the locations each skill of the run knows, into the journal,
@@ -765,6 +801,18 @@ impl Director {
             }
             Err(error) => tracing::warn!("the journals were not pruned: {error}"),
         }
+    }
+
+    /// The snapshot of the fresh fleet listing `fleet`, with the documents
+    /// and the models that the director knows already.
+    pub async fn snapshot_of_listing(&self, fleet: Fleet) -> Snapshot {
+        let (known, known_models) = {
+            let latest = self.snapshots.borrow();
+            (latest.contracts.clone(), latest.models.clone())
+        };
+        let mut snapshot = fleet::snapshot_of(&self.runner, fleet, &known).await;
+        snapshot.models = fleet::models_of(&self.runner, &snapshot, &known_models).await;
+        snapshot
     }
 
     /// The workflow, the bundle and the run document of `request`, and
@@ -910,12 +958,7 @@ impl Director {
         if fleet.halted {
             return Err(refuse(base, HALTED.to_owned(), Vec::new()));
         }
-        let (known, known_models) = {
-            let latest = self.snapshots.borrow();
-            (latest.contracts.clone(), latest.models.clone())
-        };
-        let mut snapshot = fleet::snapshot_of(&self.runner, fleet, &known).await;
-        snapshot.models = fleet::models_of(&self.runner, &snapshot, &known_models).await;
+        let snapshot = self.snapshot_of_listing(fleet).await;
         base.core_node = snapshot.fleet.core_node.clone();
         let me = self.me();
         let digest = bundle.as_ref().map(digest_of);
@@ -929,7 +972,11 @@ impl Director {
                 &workflow,
                 &run_document,
                 &snapshot,
-                &Parties { caller, me: &me },
+                &Parties {
+                    caller,
+                    me: &me,
+                    trial: request.trial.as_deref(),
+                },
                 &records,
             )
             .map_err(|errors| refuse(base.clone(), "the roles do not bind".to_owned(), errors))?;
@@ -941,6 +988,7 @@ impl Director {
             poll: self.config.poll,
             cancel_timeout: self.config.cancel_timeout,
             watch: Watch::of(&run_document, validation),
+            of_a_trial: request.trial.is_some(),
         };
         let plan = checker::plan(
             Arc::clone(&workflow),
@@ -990,7 +1038,8 @@ impl Director {
             }
             return Err(refuse(base, message, Vec::new()));
         }
-        if let (true, Some(digest)) = (gated, digest) {
+        // A run of a trial needs no sign-off record: the trial makes it.
+        if let (true, None, Some(digest)) = (gated, &request.trial, digest) {
             let sign_off = SignOff::of_run(
                 digest,
                 &snapshot,
@@ -1002,8 +1051,15 @@ impl Director {
                 return Err(refuse(base, message, Vec::new()));
             }
         }
+        let leased: Vec<RobotName> = binding.values().cloned().collect();
         let mut taken: Vec<RobotName> = Vec::new();
-        for robot in binding.values() {
+        // A run of a trial uses the leases of its trial, which hold the
+        // robots from one run to the next.
+        let to_take = match request.trial {
+            Some(_) => Vec::new(),
+            None => leased.clone(),
+        };
+        for robot in &to_take {
             if let Err(refused) = self.leases.take(robot.as_str(), &run_lease_name(run)).await {
                 for robot in &taken {
                     self.leases.release(robot.as_str()).await;
@@ -1039,6 +1095,7 @@ impl Director {
             plan,
             base: ResultBase { result: base },
             taken,
+            leased,
             planned,
             snapshot,
         })
@@ -1099,6 +1156,52 @@ impl TeachHint<'_> {
             "{refused}. A teach gives every locations:v1 skill of the robot the list it names, in place of what each knows, so teach the locations its skills keep and `{missing}`, with the pose of `{missing}` in its entry: `peppy node call {director} locations --set robot={robot} --set 'teach=[{}]'`, where an orientation is a unit quaternion [x, y, z, w] and a pose has the size [0, 0, 0]; or apply a world that names it",
             entries.join(", ")
         )
+    }
+}
+
+/// The end of a lease of a run or a trial, or a halt.
+pub struct LeaseStop {
+    pub halted: bool,
+    pub reason: String,
+}
+
+/// Follows the lease events and the halt for the robots `robots`, whose
+/// leases the director holds.
+pub struct LeaseFollower {
+    pub events: broadcast::Receiver<crate::leases::LeaseEvent>,
+    pub snapshots: watch::Receiver<Arc<Snapshot>>,
+    pub runner: Arc<NodeRunner>,
+    pub robots: BTreeSet<String>,
+}
+
+impl LeaseFollower {
+    /// The next end of a lease of the robots, or halt: the end of a lease in
+    /// a halt is the halt. None once the director stops.
+    pub async fn next_stop(&mut self) -> Option<LeaseStop> {
+        loop {
+            tokio::select! {
+                event = self.events.recv() => match event {
+                    Ok(event) if event.kind == LeaseEventKind::LeaseEnd && self.robots.contains(&event.robot) => {
+                        // The daemon ends every lease when it halts the stack, before the listing of the halt
+                        // reaches the follower of the fleet: a fresh listing tells a halt from a lost lease.
+                        let halted = fleet::read_fleet(&self.runner).await.is_ok_and(|fleet| fleet.halted);
+                        let reason = match halted {
+                            true => HALTED.to_owned(),
+                            false => format!("the lease of {} ended: {}", event.robot, event.cause),
+                        };
+                        return Some(LeaseStop { halted, reason });
+                    }
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => return None,
+                },
+                changed = self.snapshots.changed() => {
+                    changed.ok()?;
+                    if self.snapshots.borrow().fleet.halted {
+                        return Some(LeaseStop { halted: true, reason: HALTED.to_owned() });
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1252,12 +1355,19 @@ fn leased_by(robot: &str, lease: &fleet::Lease, caller: &Caller) -> String {
     }
 }
 
-/// Who a binding is for: the caller of the run, and the director, to which
-/// the caller offers its leases.
+/// Who a binding is for: the caller of the run, the director, to which the
+/// caller offers its leases, and the trial of a run of a trial, whose leases
+/// the director holds for its runs.
 #[derive(Clone, Copy)]
 struct Parties<'p> {
     caller: &'p Caller,
     me: &'p Caller,
+    trial: Option<&'p str>,
+}
+
+/// The name of the leases that a trial `trial` takes.
+pub fn trial_lease_name(trial: &str) -> String {
+    format!("trial {trial}")
 }
 
 /// The roles of a run bound to robots: the named roles first, then the
@@ -1277,14 +1387,21 @@ fn bind(
     held: &BTreeMap<RobotName, Holder>,
     records: &[SignOffRecord],
 ) -> Result<BTreeMap<Name, RobotName>, Vec<Located>> {
-    let Parties { caller, me } = *parties;
+    let Parties { caller, me, trial } = *parties;
     let fleet = &snapshot.fleet;
+    let of_the_trial = trial.map(trial_lease_name);
     let offered: BTreeSet<&str> = fleet
         .leases
         .iter()
-        .filter(|lease| lease.receiver == me.instance && lease.receiver_core_node == me.core_node)
         .filter(|lease| {
-            lease.holder == caller.instance && lease.holder_core_node == caller.core_node
+            let offered_by_the_caller = lease.receiver == me.instance
+                && lease.receiver_core_node == me.core_node
+                && lease.holder == caller.instance
+                && lease.holder_core_node == caller.core_node;
+            let held_for_the_trial = lease.holder == me.instance
+                && lease.holder_core_node == me.core_node
+                && Some(&lease.name) == of_the_trial.as_ref();
+            offered_by_the_caller || held_for_the_trial
         })
         .map(|lease| lease.robot.as_str())
         .collect();
@@ -1426,7 +1543,7 @@ const LIMB_STATE: (&str, &str) = ("limb_state", "v1");
 /// run calls it, and whether each call it serves is of a role bound to a
 /// fleet entry with no limbs.
 #[derive(Clone, Debug, PartialEq)]
-struct RunNode {
+pub struct RunNode {
     name: NameTag,
     locked: LockedNode,
     called: bool,
@@ -1435,7 +1552,7 @@ struct RunNode {
 
 /// The nodes a run uses: the director, the anomaly monitor and each node of
 /// the copy of each robot it binds.
-fn run_nodes(snapshot: &Snapshot, plan: &Plan, me: &Caller) -> Vec<RunNode> {
+pub fn run_nodes(snapshot: &Snapshot, plan: &Plan, me: &Caller) -> Vec<RunNode> {
     let fleet = &snapshot.fleet;
     let robots: BTreeSet<&str> = plan
         .roles
@@ -1507,7 +1624,7 @@ fn run_nodes(snapshot: &Snapshot, plan: &Plan, me: &Caller) -> Vec<RunNode> {
 /// robot; so does a contract that the run reads at two shas, naming the
 /// robot when both reads are of one robot, else the robots of the run; and
 /// a pin of the listing that does not read.
-fn versions(snapshot: &Snapshot, plan: &Plan, nodes: &[RunNode]) -> Result<Lock, String> {
+pub fn versions(snapshot: &Snapshot, plan: &Plan, nodes: &[RunNode]) -> Result<Lock, String> {
     let targets = plan
         .calls
         .values()
@@ -1618,7 +1735,11 @@ fn under_the_policy(
 
 /// The differences of a run from the lock of its bundle, and the nodes it
 /// uses that the lock does not name and that no `call` step calls.
-fn differences(lock: &Lock, stack: &Lock, nodes: &[RunNode]) -> (Vec<Difference>, Vec<NameTag>) {
+pub fn differences(
+    lock: &Lock,
+    stack: &Lock,
+    nodes: &[RunNode],
+) -> (Vec<Difference>, Vec<NameTag>) {
     let difference =
         |kind: DifferenceKind, subject: String, locked: Option<String>, stack: Option<String>| {
             Difference {
@@ -1816,6 +1937,7 @@ mod tests {
             &Parties {
                 caller: &chat(),
                 me: &me(),
+                trial: None,
             },
             &BTreeMap::new(),
             &[],
@@ -1835,6 +1957,7 @@ mod tests {
             work_cell: None,
             started_by: String::new(),
             caller_data: None,
+            trial: None,
         };
         assert!(request.shape().is_ok());
         let refused = |request: RunRequest| request.shape().err().unwrap_or_default();
@@ -1954,6 +2077,7 @@ mod tests {
             &Parties {
                 caller: &chat(),
                 me: &me(),
+                trial: None,
             },
             &BTreeMap::new(),
             &[],
@@ -1998,6 +2122,7 @@ mod tests {
             &Parties {
                 caller: &chat(),
                 me: &me(),
+                trial: None,
             },
             &BTreeMap::new(),
             &[],
@@ -2059,6 +2184,7 @@ mod tests {
             &Parties {
                 caller: &chat(),
                 me: &me(),
+                trial: None,
             },
             &elsewhere,
             &[],
@@ -2079,6 +2205,7 @@ mod tests {
                 &Parties {
                     caller: &chat(),
                     me: &me(),
+                    trial: None,
                 },
                 &elsewhere,
                 &[],
@@ -2093,6 +2220,7 @@ mod tests {
             &Parties {
                 caller: &chat(),
                 me: &me(),
+                trial: None,
             },
             &taught,
             &[],
@@ -2133,6 +2261,7 @@ mod tests {
             &Parties {
                 caller: &chat(),
                 me: &me(),
+                trial: None,
             },
             &BTreeMap::new(),
             records,

@@ -73,6 +73,12 @@ lane during the run, and refuses a resume of that lane while it stands.
 `run`, `resume` and `abort` give each event of the run as feedback, and the
 status of the run every 5 s; `run_events` gives every event of every run.
 
+`locations` teaches each locations:v1 instance of a robot the locations
+given, or lists what each knows; a teach is refused on a robot with a lease,
+naming its holder. A teach holds the robot while it runs: it takes the lease
+of the robot under the name `locations`, and no run of the director binds
+the robot until the teach ends.
+
 ## The work cell
 
 A run made from roles takes its work cell block as `work_cell` (JSON5), and a
@@ -122,11 +128,50 @@ With no such record, `"auto"` binds only simulated robots. `forget_robot`
 removes each record that binds a robot, after a change of its body, and
 gives how many it removed.
 
-`locations` teaches each locations:v1 instance of a robot the locations
-given, or lists what each knows; a teach is refused on a robot with a lease,
-naming its holder. A teach holds the robot while it runs: it takes the lease
-of the robot under the name `locations`, and no run of the director binds
-the robot until the teach ends.
+## Trials
+
+`trial` runs a trial (`trial/v1`) of a bundle on the physical robots of the
+stack, and gets the id `t<N>`. The director refuses it (`trial_refused`)
+before its first run, naming each cause, unless the stack is not halted, the
+bundle opens with its digests and has an envelope, each value of its work
+cell is inside the envelope, each assumption of the workflow has a check,
+each bound robot is physical and held by no run, teach or other trial of
+the director, the workflow holds for the robots, and the stack matches the
+lock of the bundle with no version policy. The trial then takes the lease
+of each robot under the name `trial t<N>` (a refused take refuses it, naming
+the robot and the cause), holds them to its end, and removes each sign-off
+record of its bundle and binding.
+
+Each run has four steps. While the operator prepares the work cell, the
+leases stand open for a take-over, and `prepares` gives the number of the
+run and the measures so far. `next_run` closes the leases and starts the
+run, whose `started_by` is the trial: the run uses the leases of the trial,
+takes and releases none, and has the checks of an unattended run on physical
+robots but the sign-off record. It evaluates every check, a false one
+included, gives `checks_to_judge`, and waits for `judge_checks`: `starts`,
+`not_ready` (the run does not count) or `false_check` (the run counts as not
+completed, and each wrong check as a false check). The run then runs
+unattended, and `suspend` refuses it, naming the trial. Once it ends,
+`judge_ending` counts it: completed only when it completed and its task is
+done, and each emergency stop and other unsafe event counts as an unsafe
+event. A run that ends before it starts counts as not completed. A cancel
+of `next_run`, or the loss of its sender, aborts its run.
+
+The trial ends after its last run that counts, or once the runs left cannot
+meet the thresholds of the bundle (plain rates and counts). It then releases
+its leases, keeps a sign-off record when its runs meet the thresholds, and
+gives `trial_ends` with its report: the trial document, each run with its
+ending, its journal and the judgements of the operator, the four measures,
+the core node, whether it signs off, and its sign-off record. Its goal
+completes only for a sign-off; it ends cancelled when its caller cancels it
+or is gone, and fails with `trial_not_signed_off`, `trial_halted` (a halt)
+or `trial_interrupted` (a lease that ended with no halt). A halt refuses
+every new trial, and a trial that ends early signs off nothing.
+
+Each trial has its record, `<journal_root>/workflow_director/trials/t<N>.json`,
+and a trial that the director did not end when it stopped ends interrupted
+when it starts again. `runs` lists the trials, and `status` gives the report
+of a trial `t<N>`.
 
 ## Journals
 
@@ -138,7 +183,9 @@ daemon to an open or a close of a lease with when it came, each command and
 each event, and its end. A run that the node did not
 end when it stopped ends `interrupted` when it starts again. `journal` gives
 the journal of a run, and `replay` drives the engine again from a journal and
-compares its decisions with those of the run.
+compares its decisions with those of the run. The journal of a run of a
+trial stays with the report of its trial: the bounds of the journals neither
+count nor remove it.
 
 ## Tests
 
@@ -147,3 +194,7 @@ cargo test
 ```
 
 The engine tests run whole runs against a scripted host on a paused clock.
+The tests of `tests/` run the director over the wire, against a scripted
+fleet and a scripted arm: `serve.rs` its runs, and `validation.rs` the work
+cell, the gates of an unattended run on a physical robot and the trials.
+They need `PEPPY_ZENOHD_PATH` to name a `zenohd` binary.

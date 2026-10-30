@@ -25,7 +25,7 @@ use crate::contract::ContractShape;
 use crate::engine::failure::Failure;
 use crate::engine::host::{CallEnd, Event, Host, Join, Joining};
 use crate::engine::plan::{Target, TopicKey, Watch};
-use crate::engine::{self, Phase, ResultBase, RunCommand};
+use crate::engine::{self, ChecksJudged, Phase, ResultBase, RunCommand};
 use crate::fleet::{Fleet, Snapshot};
 use crate::journal::{self, Journals, Record};
 
@@ -154,6 +154,9 @@ enum CommandRecord {
         source: String,
         standing: Vec<String>,
     },
+    JudgeChecks {
+        judged: ChecksJudged,
+    },
 }
 
 impl CommandRecord {
@@ -182,6 +185,9 @@ impl CommandRecord {
                 role: role.clone(),
                 failure: failure.clone(),
             },
+            RunCommand::JudgeChecks { judged } => CommandRecord::JudgeChecks {
+                judged: judged.clone(),
+            },
         }
     }
 
@@ -204,6 +210,7 @@ impl CommandRecord {
                 source,
                 standing,
             },
+            CommandRecord::JudgeChecks { judged } => RunCommand::JudgeChecks { judged },
         }
     }
 }
@@ -420,6 +427,8 @@ type Shares = BTreeMap<(Name, u64), (u64, Join)>;
 /// The journal of a run, read for its replay.
 struct Recording {
     workflow: Workflow,
+    /// Whether the run is a run of a trial.
+    of_a_trial: bool,
     /// The validation of the bundle of the run, when it has one.
     validation: Option<Validation>,
     planned: Planned,
@@ -460,6 +469,7 @@ impl Recording {
         let planned: Planned = body(planned)?;
         let mut recording = Recording {
             workflow,
+            of_a_trial: opened.body["trial"].is_string(),
             validation,
             planned,
             calls: BTreeMap::new(),
@@ -747,6 +757,7 @@ pub fn replay(text: &str) -> Result<Outcome, String> {
             .map_err(|e| format!("poll: {e}"))?,
         cancel_timeout: Duration::from_nanos(planned.cancel_timeout_ns),
         watch: Watch::of(document, recording.validation.as_ref()),
+        of_a_trial: recording.of_a_trial,
     };
     let plan = checker::plan(
         Arc::new(recording.workflow.clone()),
@@ -967,11 +978,14 @@ mod tests {
     }
 
     /// The commands of a run of a test: those that wait before the engine
-    /// starts, and those that come at their second of the run.
+    /// starts, and those that come at their second of the run; and the
+    /// trial of a run of a trial, whose operator gives the judgement of its
+    /// checks as a command.
     #[derive(Default)]
     struct Commands {
         queued: Vec<RunCommand>,
         later: Vec<(u64, RunCommand)>,
+        trial: Option<&'static str>,
     }
 
     /// The journal of the run of `journal_of_a_run_until` on `scripted`, with
@@ -1050,7 +1064,12 @@ mod tests {
         let journals = Journals::open(dir.path(), 10, u64::MAX).unwrap();
         let run = journals.next_run().unwrap();
         journals
-            .append(&run, 0, journal::OPENED, json!({ "workflow": text }))
+            .append(
+                &run,
+                0,
+                journal::OPENED,
+                json!({ "workflow": text, "trial": commands.trial }),
+            )
             .unwrap();
         let mut planned = Planned {
             fleet: fleet.fleet.clone(),
@@ -1070,6 +1089,7 @@ mod tests {
         };
         let mut plan = crate::testing::plan(value, planned.run_document.attendance);
         plan.watch = Watch::of(&planned.run_document, None);
+        plan.of_a_trial = commands.trial.is_some();
         let host = Recorded::new(scripted, &journals, &run);
         planned.run_ns = host.now();
         planned.wall_ns = host.wall_now();
@@ -1306,6 +1326,7 @@ mod tests {
         let commands = Commands {
             queued: vec![RunCommand::Abort],
             later: Vec::new(),
+            trial: None,
         };
         let journal = journal_of(scripted, Attendance::Attended, commands, |_| false).await;
         assert!(!journal.contains(r#""type":"call""#), "{journal}");
@@ -1327,6 +1348,7 @@ mod tests {
         let commands = Commands {
             queued: Vec::new(),
             later: vec![(60, RunCommand::Resume { reply }), (70, RunCommand::Abort)],
+            trial: None,
         };
         let journal = journal_of(scripted, Attendance::Attended, commands, |_| false).await;
         assert!(journal.contains(r#""type":"lease""#), "{journal}");
@@ -1444,6 +1466,7 @@ mod tests {
         let commands = Commands {
             queued: Vec::new(),
             later: vec![(1, RunCommand::Suspend), (30, RunCommand::Abort)],
+            trial: None,
         };
         let journal =
             journal_of_a_run_of(&value, scripted, Attendance::Attended, commands, |_| false).await;
@@ -1531,6 +1554,7 @@ mod tests {
         let commands = Commands {
             queued: Vec::new(),
             later: vec![(6, RunCommand::Abort)],
+            trial: None,
         };
         let journal =
             journal_of_a_run_of(&value, scripted, Attendance::Attended, commands, |_| false).await;
@@ -1562,5 +1586,35 @@ mod tests {
         assert!(text.contains("\"uncovered\""), "{text}");
         let outcome = replay(&text).unwrap();
         assert!(outcome.same, "{}", outcome.difference);
+    }
+
+    /// The journal of a run of a trial, whose checks wait for the judgement
+    /// of the operator, replays to its decisions with the judgement at its
+    /// run time.
+    #[tokio::test(start_paused = true)]
+    async fn the_journal_of_a_run_of_a_trial_replays_with_the_judgement_of_its_checks() {
+        let scripted = ScriptedHost::new()
+            .answer("find", vec![Answer::now(found())])
+            .answer(
+                "grab",
+                vec![Answer::now(json!({ "success": true, "item_id": "b1" }))],
+            )
+            .answer("home", vec![Answer::now(json!({ "at_home": true }))]);
+        let commands = Commands {
+            later: vec![(
+                4,
+                RunCommand::JudgeChecks {
+                    judged: ChecksJudged::Starts,
+                },
+            )],
+            trial: Some("t1"),
+            ..Commands::default()
+        };
+        let text = journal_of(scripted, Attendance::Unattended, commands, |_| false).await;
+        assert!(text.contains("\"checks_to_judge\""), "{text}");
+        assert!(text.contains("\"judge_checks\""), "{text}");
+        let outcome = replay(&text).unwrap();
+        assert!(outcome.same, "{}", outcome.difference);
+        assert!(outcome.decisions > 2, "{}", outcome.decisions);
     }
 }

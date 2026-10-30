@@ -35,6 +35,7 @@ pub struct RunChoices<'a> {
     pub poll: workflow_documents::Bound,
     pub cancel_timeout: std::time::Duration,
     pub watch: Watch,
+    pub of_a_trial: bool,
 }
 
 /// Where each name of a role comes from: the role whose call or
@@ -1347,6 +1348,7 @@ pub fn plan(
         poll: choices.poll,
         cancel_timeout: choices.cancel_timeout,
         watch: choices.watch,
+        of_a_trial: choices.of_a_trial,
         workflow,
     })
 }
