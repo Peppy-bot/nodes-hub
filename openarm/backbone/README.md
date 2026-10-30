@@ -169,7 +169,7 @@ is the root link of the URDF: the bottom of the pedestal's base plate on the
 column axis, `+x` to the robot's front, `+y` to its left, `+z` up. It is the
 gripper's **grasp point** (midway between the pads on the jaw closing axis,
 `+z` out of the gripper), not the wrist flange they mount on:
-`openarm_description` carries the offset per generation and `arm_model` builds
+`openarm_description` carries the offset per generation and its `arm_model` builds
 the model with it, so the pose solved for, the pose reported, and the point the
 EE speed cap applies to are one frame. One move per side at a time (a
 single-flight move slot whose release rides a drop guard, held by the move,

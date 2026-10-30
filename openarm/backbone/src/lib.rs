@@ -38,4 +38,4 @@ mod upstream;
 mod workspace;
 mod workspace_service;
 
-pub use node::{NodeError, arm_model, setup};
+pub use node::{NodeError, setup};

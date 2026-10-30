@@ -1462,7 +1462,7 @@ mod tests {
     #[test]
     fn seed_from_measured_clamps_a_below_limit_pose_to_the_joint_limits() {
         // Build the real arm: the elbow (j4, index 3) carries a one-sided lower bound
-        // of ~0.05 (the singularity floor applied by crate::arm_model), hard against the
+        // of ~0.05 (the singularity floor `HardwareVersion::arm_model` applies), hard against the
         // boundary singularity. A power-up pose with the elbow below it must seed at the
         // limit, not off it.
         let model = bundled_arm(openarm_description::HardwareVersion::V1, Side::Left);
