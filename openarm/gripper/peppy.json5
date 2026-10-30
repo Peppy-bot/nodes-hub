@@ -1,17 +1,16 @@
-// One gripper of the openarm robot (real hardware); instantiate twice, one per
-// side, with a distinct `gripper_id`. Both hardware generations run through this
-// node, selected by `hardware_version`: the v1.0 prismatic parallel jaws (MIT
-// position hold, no force control) and the v2.0 revolute pinch fingers
-// (POS_FORCE, with a speed limit, a grip-force ceiling, and force feedback).
-// This is a root component node; openarm_backbone depends on it, not the other
-// way around. It carries no motion logic: it relays the backbone's governed
-// opening to the motor and reports the measured opening, grip effort, and
-// effort ceiling back.
+// Instantiate openarm_gripper twice, one per side, with a distinct
+// `gripper_id`. `hardware_version` selects the generation: v1.0 runs MIT
+// position hold, v2.0 runs POS_FORCE. This is a root component node;
+// openarm_backbone depends on it, not the other way around.
 {
   peppy_schema: "node/v1",
   manifest: {
     name: "openarm_gripper",
     tag: "v1",
+    description: [
+      "One gripper of a real OpenArm robot: it drives the gripper motor over a CAN interface of its host. It needs the gripper hardware on that CAN interface. A robot runs one instance per gripper.",
+      "It drives both hardware generations: the v1.0 parallel jaws (a position hold, no force control) and the v2.0 pinch fingers (a speed limit, a grip force limit and force feedback). It follows the opening setpoints of openarm_backbone over a gripper_link pairing and streams back the measured opening, the grip effort and the effort limit. It has no motion logic of its own. It also reports its readiness, the health of its motor, and alerts from that health.",
+    ],
     implements: [
       // Per-component readiness for a real robot's robot_initializer.
       { name: "component_ready", tag: "v1", link_id: "ready" },

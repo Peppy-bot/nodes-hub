@@ -1,26 +1,17 @@
-// sim_rgbd_camera: the sim RGB-D camera, a relay between the simulation's
-// sim_rgbd_camera_link pairing and the rgbd_camera contract surface. Toward
-// consumers it is a camera exactly like the real rgbd nodes (color + depth
-// frames out, stream infos and control services answered) that also
-// describes itself through camera_profile; toward the simulation it views
-// a pair of the simulation's RGB-D camera slot and, when a launch links its
-// control slot to the simulation, forwards every colour control there under
-// the camera's name, so the simulation's device model answers them. Without
-// that link every control refuses. Frames relay timestamps, frame_ids and
-// align_mode untouched, so consumers age samples on the capture time and
-// correlate pairs on the shared frame_id. It also says where its pixels
-// point, through camera_geometry: the simulation publishes the pinhole model
-// of both streams and how the depth sits against the colour on the pairing's
-// geometry topic, and the three geometry services answer from the latest
-// one, refusing until the first arrives. One instance per camera, and the
-// camera's name is the instance's own in its copy: relay alpha_wrist_left of
-// copy alpha is camera wrist_left, and a relay launched outside a copy is
-// the camera its instance id names.
+// sim_rgbd_camera: one instance per camera, and the camera's name is the
+// instance's own in its copy: relay alpha_wrist_left of copy alpha is camera
+// wrist_left, and a relay launched outside a copy is the camera its instance
+// id names.
 {
   peppy_schema: "node/v1",
   manifest: {
     name: "sim_rgbd_camera",
     tag: "v1",
+    description: [
+      "A simulated RGB-D camera: a relay between the RGB-D camera slot of a simulation (the sim_rgbd_camera_link pairing) and the rgbd_camera contract. It opens no device: it needs a simulation that renders the camera, such as sim_mujoco, sim_isaac or Waldo.",
+      "Toward consumers it is a camera exactly like the real RGB-D nodes (colour and depth frames out, stream infos and control services answered) that also describes itself through camera_profile. When a launch links its control slot to the simulation, it forwards every colour control there under the name of the camera, so the device model of the simulation answers them; without that link every control refuses. Frames relay timestamps, frame_ids and align_mode untouched, so consumers age samples on the capture time and correlate pairs on the shared frame_id.",
+      "It also says where its pixels point, through camera_geometry: the simulation publishes the pinhole model of both streams and how the depth sits against the colour on the geometry topic of the pairing, and the three geometry services answer from the latest one, refusing until the first arrives.",
+    ],
     implements: [
       { name: "rgbd_camera", tag: "v1", link_id: "camera" },
       { name: "camera_profile", tag: "v1", link_id: "profile" },

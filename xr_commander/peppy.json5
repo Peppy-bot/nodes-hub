@@ -1,23 +1,16 @@
-// xr_commander: a robot-agnostic teleoperation leader driven from a WebXR
-// headset. Serves the WebXR page (teleop_xr), streams a Cartesian setpoint per
-// hand on pose_link and an opening per hand on gripper_link to the robot it
-// drives, relays bound cameras into the headset as WebRTC tracks, and
-// publishes where its page is: the page's URLs. One headset per
-// stack: the backbone of every robot it leads pairs into its slots, and the
-// robot card on its page chooses the one the hands drive, else the robot
-// they drive while it stays paired, else the first robot paired. Carries no
-// kinematics: solving a pose into joints is the follower's business. The
-// deadman is the grip button, per hand; released streams the measured pose
-// for a quarter second, then nothing, and the follower holds. The headset
-// holds the robot lease of the robot a person drives: a squeeze takes it and
-// stops the moves in flight on that robot, the headset releases it after the
-// release burst of the last hand once no posture move of its own runs, and it
-// drives only the robots of the fleet listing.
+// xr_commander serves the WebXR page with teleop_xr. One headset per stack:
+// the backbone of every robot it leads pairs into its slots. Carries no
+// kinematics: solving a pose into joints is the follower's business.
 {
   peppy_schema: "node/v1",
   manifest: {
     name: "xr_commander",
     tag: "v1",
+    description: [
+      "A teleoperation leader driven from a WebXR headset, for any robot. It needs a headset whose browser reaches its HTTPS page; it opens no device on its host.",
+      "It streams a Cartesian setpoint per hand on pose_link and an opening per hand on gripper_link to the robot it drives, relays bound cameras into the headset as WebRTC tracks, and publishes where its page is: the page's URLs. The robot card on its page chooses the robot the hands drive, else the robot they drive while it stays paired, else the first robot paired. The deadman is the grip button, per hand; released streams the measured pose for a quarter second, then nothing, and the follower holds.",
+      "The headset holds the robot lease of the robot a person drives: a squeeze takes it and stops the moves in flight on that robot, the headset releases it after the release burst of the last hand once no posture move of its own runs, and it drives only the robots of the fleet listing.",
+    ],
     labels: [
       "teleop",
       "xr",

@@ -3,6 +3,10 @@
   manifest: {
     name: "reactive_policy",
     tag: "v1",
+    description: [
+      "The fast half of an example manipulation stack that runs on two machines. It runs on the robot, on the machine of its camera (any rgb_camera:v1) and its arm (my_python_robot_arm), and is the executor of a deliberation pairing with deliberative_planner.",
+      "A mock, to read rather than to deploy: it runs no inference and moves no joint. It reports its situation to the planner ten times a second and adopts the subgoals of the planner. A subgoal stays in force for subgoal_ttl_ms after the policy adopts it. Past that time, the policy falls back to its own local behavior, so a slow or lost link to the planner does not stop it.",
+    ],
     depends_on: {
       // The camera by CONTRACT, not by node: any `rgb_camera:v1` implementation
       // can drive this policy, and the launcher picks which one.

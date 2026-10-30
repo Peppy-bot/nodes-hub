@@ -3,6 +3,10 @@
   manifest: {
     name: "uvc_camera_python_mock",
     tag: "v1",
+    description: [
+      "A camera with no hardware, in Python: it replays a bundled video file as the video_stream of rgb_camera and acknowledges every camera control. It opens no device, so it runs on any machine.",
+      "Use it to bring a consumer up without a camera or a simulation. It is not a simulation: the footage has no relationship to the pose of any robot. The controls echo the value they get and check nothing, so do not use it to test control semantics. uvc_camera_rust_mock is the same node in Rust.",
+    ],
     implements: [
       { name: "rgb_camera", tag: "v1", link_id: "camera" },
     ],

@@ -3,6 +3,10 @@
   manifest: {
     name: "episode_recorder",
     tag: "v1",
+    description: [
+      "An example recorder that observes the executor of a deliberation pairing and counts the situations it receives. It needs no device, so it runs on any machine, for example beside the planner.",
+      "A mock, to read rather than to deploy: it writes no dataset. It observes without joining the pairing: it claims no endpoint and emits nothing, so it cannot change the control loop that it records. Any number of recorders can observe the same executor.",
+    ],
     depends_on: {
       // An OBSERVER slot, not a participant one. It taps whatever the
       // `executor` role publishes without joining the 1:1 pair: it claims no

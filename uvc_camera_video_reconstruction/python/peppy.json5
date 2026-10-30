@@ -3,6 +3,10 @@
   manifest: {
     name: "uvc_camera_video_reconstruction_python",
     tag: "v1",
+    description: [
+      "A recorder that writes video_duration_seconds of the video stream of a camera that implements rgb_camera:v1 into an H.264 MP4 file, /tmp/video_reconstruction/reconstructed_video.mp4 on its host. It needs such a camera, real or mock; it opens no device itself.",
+      "It reads each frame as rgb8 and encodes it as it arrives. A stop before the end closes the file with the frames recorded up to then. At the end, the node stops itself. uvc_camera_video_reconstruction_rust records the same file in Rust.",
+    ],
     depends_on: {
       contracts: [
         {

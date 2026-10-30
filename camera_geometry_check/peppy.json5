@@ -1,18 +1,15 @@
-// camera_geometry_check: a bench tool for a camera that serves
-// camera_geometry:v1 beside rgbd_camera:v1, the real ones first: zed_camera
-// and realsense_d4xx answer from a calibration no test bench here has checked
-// against a device. It is a consumer like any other: it asks the camera where
-// its pixels point, takes one depth pixel near a corner of the image, and
-// prints the point that pixel is, in the camera's optical frame. Someone with
-// the device puts a target there, measures where it really is from the lens
-// (X to the right, Y down, Z forward) and compares. README.md has the
-// procedure. It knows no device and no SDK, so it checks a simulated camera
-// the same way.
+// camera_geometry_check is for the real cameras first: zed_camera and
+// realsense_d4xx answer from a calibration no test bench here has checked
+// against a device. It is a consumer like any other.
 {
   peppy_schema: "node/v1",
   manifest: {
     name: "camera_geometry_check",
     tag: "v1",
+    description: [
+      "A bench tool that checks where the pixels of a camera point, for a camera that serves camera_geometry:v1 beside rgbd_camera:v1. It knows no device and no SDK, so it checks a real camera and a simulated camera the same way.",
+      "It asks the camera for its geometry, takes one depth pixel near a corner of the image, and prints the point that this pixel is, in the optical frame of the camera (X to the right, Y down, Z forward). A person with the device puts a target at that point, measures where it really is from the lens, and compares. README.md has the procedure.",
+    ],
     depends_on: {
       contracts: [
         { name: "rgbd_camera", tag: "v1", link_id: "camera" },

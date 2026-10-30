@@ -1,11 +1,7 @@
-// vlm_router_brain: a brain whose models are hosted vision-language models,
-// reached over the network. It implements item_perception and
-// item_manipulation, the contracts that scan for items, find one, pick it
-// up and put it down, and brain_model, which names the model of each role
-// and switches one while the brain runs. It depends on limb_motion, the
-// backbone's discrete arm and gripper moves; the launcher binds that slot to
-// the instance that governs the arms, so any move sent through it is
-// collision governed on the way down.
+// vlm_router_brain depends on limb_motion, the backbone's discrete arm and
+// gripper moves; the launcher binds that slot to the instance that governs
+// the arms, so any move sent through it is collision governed on the way
+// down.
 //
 // The models are the entries of the node's catalog (catalog.json): each has
 // a name of its own, the roles it serves, and the routes that reach it, a
@@ -18,6 +14,10 @@
   manifest: {
     name: "vlm_router_brain",
     tag: "v1",
+    description: [
+      "A brain whose models are hosted vision-language models that it reaches over the network. It finds items by words in the images of the robot, then picks them up and puts them down. It needs no GPU, but it needs the network and the API key of a model provider.",
+      "It implements item_perception, item_manipulation and brain_model, which also switches the model of a role while the brain runs. It reads the API key from its environment: GEMINI_API_KEY for Google, OPENROUTER_API_KEY for OpenRouter. It finds items through one RGB-D camera, the geometry of that camera and its mount on the robot: without them, it refuses each search. The default perception model is Gemini Robotics-ER on the Google API. The default manipulation model grabs an item from above at the point where the brain saw it, and calls no model. A catalog model in the manipulation role also looks through the wrist camera of the arm and corrects the place and the turn of the gripper before the descent.",
+    ],
     implements: [
       { name: "item_perception", tag: "v1", link_id: "item_perception" },
       { name: "item_manipulation", tag: "v1", link_id: "item_manipulation" },

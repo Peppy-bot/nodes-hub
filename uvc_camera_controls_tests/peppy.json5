@@ -3,6 +3,10 @@
   manifest: {
     name: "uvc_camera_controls_tests",
     tag: "v1",
+    description: [
+      "A manual test of the controls of a camera that implements rgb_camera:v1. It needs such a camera, real or mock; it opens no device itself.",
+      "It sets exposure, white balance, gain, brightness and contrast in turn, prints the value that the camera kept or its error reply, records three seconds of video after each change, and then restores the control. It encodes the recorded frames into an MP4 file in a new temporary directory and prints its path. A stop in the middle of a test restores the controls that it changed.",
+    ],
     depends_on: {
       contracts: [
         {
