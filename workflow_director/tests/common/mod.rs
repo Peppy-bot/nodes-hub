@@ -93,14 +93,16 @@ pub struct Lease {
     pub open: bool,
 }
 
-/// How the scripted fleet stands: its halt, its leases, whether it refuses each close of a lease, and whether each
-/// lease ends as it is taken, with no event, as a removal of the robot right after the take ends it.
+/// How the scripted fleet stands: its halt, its leases, whether it refuses each close of a lease, whether each
+/// lease ends as it is taken, with no event, as a removal of the robot right after the take ends it, and whether
+/// `alpha` is a physical robot.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FleetState {
     pub halted: bool,
     pub leases: Vec<Lease>,
     pub close_refused: bool,
     pub lease_ends_at_take: bool,
+    pub physical: bool,
 }
 
 /// The fleet of the tests, on the fleet mock of the harness: it lists `alpha` with the arm of the tests, answers
@@ -398,8 +400,8 @@ impl LeaseAnswer {
     }
 }
 
-/// The listing of `state` on `core_node`, as the generated type of the member that `$root` names: `alpha`, simulated,
-/// on wall time, whose instance `alpha_arm` serves the arm of the tests, the document of that arm, the node of that
+/// The listing of `state` on `core_node`, as the generated type of the member that `$root` names: `alpha`, physical
+/// or simulated as `state` says, on wall time, whose instance `alpha_arm` serves the arm of the tests, the document of that arm, the node of that
 /// instance, and the leases of `state`.
 macro_rules! listing {
     ($core_node:expr, $state:expr, $listing:ident, $robot:ident, $instance:ident, $contract:ident, $lease:ident,
@@ -416,7 +418,10 @@ macro_rules! listing {
                 name: ROBOT.to_owned(),
                 option: "test_sim".to_owned(),
                 core_node: core_node.to_owned(),
-                kind: "simulated".to_owned(),
+                kind: match state.physical {
+                    true => "physical".to_owned(),
+                    false => "simulated".to_owned(),
+                },
                 clock: "wall".to_owned(),
                 software: "running".to_owned(),
                 robot_commander: String::new(),

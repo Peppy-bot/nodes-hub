@@ -14,7 +14,7 @@ use serde_json::Value as Json;
 use peppygen::emitted_topics::director::run_events;
 use peppygen::exposed_actions::director::{abort, locations, resume, run};
 use peppygen::exposed_services::director::{
-    check, confirm, journal, replay, robots, runs, status, suspend,
+    check, confirm, forget_robot, journal, replay, robots, runs, status, suspend,
 };
 use serde_json::json;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
@@ -113,6 +113,7 @@ fn serve_services(director: &Arc<Director>) {
     serve_service!(director, status, answer_status);
     serve_service!(director, journal, answer_journal);
     serve_service!(director, replay, answer_replay);
+    serve_service!(director, forget_robot, answer_forget_robot);
 }
 
 /// The fleet snapshot of the director once it read the first listing, and
@@ -400,6 +401,20 @@ fn answer_journal(
                 format!("no journal of `{run}`"),
             )
         })
+}
+
+fn answer_forget_robot(
+    director: &Director,
+    request: forget_robot::Request,
+) -> Result<forget_robot::Response, forget_robot::Failure> {
+    let robot = &request.data.robot;
+    let removed = director.sign_offs.forget_robot(robot).map_err(|error| {
+        forget_robot::Failure::new(
+            forget_robot::FailureKind::AttemptFailed,
+            format!("the sign-off records of `{robot}` were not all removed: {error}"),
+        )
+    })?;
+    Ok(forget_robot::Response::new(removed))
 }
 
 fn answer_replay(

@@ -181,6 +181,15 @@ pub struct Plan {
     pub watch: Watch,
 }
 
+impl Plan {
+    /// Whether the run is unattended and binds a physical robot: it runs
+    /// only inside the envelope of its bundle, as a sign-off record admits
+    /// it.
+    pub fn is_unattended_on_a_physical_robot(&self) -> bool {
+        self.attendance == Attendance::Unattended && self.roles.values().any(|role| role.physical)
+    }
+}
+
 /// Why a value at a path cannot be read.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("`{path}` has no value")]

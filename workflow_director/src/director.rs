@@ -17,7 +17,8 @@ use workflow_documents::lock::{Lock, LockedNode, UNKNOWN_PEPPY};
 use workflow_documents::result::{
     Difference, DifferenceKind, Duration as RunDuration, Ending, RunRefusal, RunResult, RunWorkflow,
 };
-use workflow_documents::run::{RoleBinding, RunDocument, VersionPolicy};
+use workflow_documents::run::{Attendance, RoleBinding, RunDocument, VersionPolicy};
+use workflow_documents::work_cell::Uncovered;
 use workflow_documents::{
     EventKind, KnownLocation, Located, Name, NameTag, RobotName, Run, Sha256, Validation, WorkCell,
     Workflow, run_lease_name, uncovered_work_cell,
@@ -29,12 +30,13 @@ use crate::clock::{self, ClockSource};
 use crate::config::Config;
 use crate::engine::host::{Event, Host};
 use crate::engine::plan::{Plan, Watch};
-use crate::engine::{self, Phase, ResultBase, RunCommand};
+use crate::engine::{self, Phase, ResultBase, RunCommand, outside_the_envelope};
 use crate::fleet::{self, Fleet, Snapshot};
 use crate::journal::{self, Journals, Record, wall_ns};
 use crate::leases::{LeaseEventKind, Leases};
 use crate::live::{LiveHost, RunClock};
 use crate::replay::{Planned, Recorded, journal_command};
+use crate::sign_off::{SignOff, SignOffRecord, SignOffs, refusal_of_no_record};
 
 /// The caller of a run: the instance and the machine that sent its goal.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -128,6 +130,7 @@ pub struct Director {
     pub leases: Arc<Leases>,
     pub snapshots: watch::Receiver<Arc<Snapshot>>,
     pub journals: Journals,
+    pub sign_offs: SignOffs,
     pub runs: Mutex<BTreeMap<String, RunEntry>>,
     /// The robots that a teach of their locations holds. Read under the
     /// lock of `runs`, so a run and a teach never hold one robot.
@@ -614,8 +617,8 @@ impl Director {
         workflow: &Workflow,
         document: &RunDocument,
         snapshot: &Snapshot,
-        caller: &Caller,
-        me: &Caller,
+        parties: &Parties<'_>,
+        records: &[SignOffRecord],
     ) -> Result<BTreeMap<Name, RobotName>, Vec<Located>> {
         let mut runs = self.runs.lock().expect("no run panics holding the runs");
         let teaching = self
@@ -628,7 +631,7 @@ impl Director {
             .map(|(robot, run)| (robot, Holder::Run(run)))
             .chain(teaching.into_iter().map(|robot| (robot, Holder::Teach)))
             .collect();
-        let binding = bind(workflow, document, snapshot, caller, me, &held)?;
+        let binding = bind(workflow, document, snapshot, parties, &held, records)?;
         if let Some(entry) = runs.get_mut(run) {
             entry.robots = binding
                 .iter()
@@ -915,8 +918,20 @@ impl Director {
         snapshot.models = fleet::models_of(&self.runner, &snapshot, &known_models).await;
         base.core_node = snapshot.fleet.core_node.clone();
         let me = self.me();
+        let digest = bundle.as_ref().map(digest_of);
+        let records = digest
+            .as_ref()
+            .map(|digest| self.sign_offs.of_bundle(digest))
+            .unwrap_or_default();
         let binding = self
-            .bind_and_reserve(run, &workflow, &run_document, &snapshot, caller, &me)
+            .bind_and_reserve(
+                run,
+                &workflow,
+                &run_document,
+                &snapshot,
+                &Parties { caller, me: &me },
+                &records,
+            )
             .map_err(|errors| refuse(base.clone(), "the roles do not bind".to_owned(), errors))?;
         let validation = validation_of(bundle.as_ref());
         let choices = RunChoices {
@@ -944,6 +959,14 @@ impl Director {
         let nodes = run_nodes(&snapshot, &plan, &me);
         base.versions = versions(&snapshot, &plan, &nodes)
             .map_err(|message| refuse(base.clone(), message, Vec::new()))?;
+        let gated = plan.is_unattended_on_a_physical_robot();
+        if gated && run_document.versions == VersionPolicy::Warn {
+            return Err(refuse(
+                base,
+                WARN_ON_A_PHYSICAL_ROBOT.to_owned(),
+                Vec::new(),
+            ));
+        }
         if let Some(bundle) = &bundle {
             let (differences, unlocked) =
                 differences(&bundle.document.lock, &base.versions, &nodes);
@@ -961,6 +984,24 @@ impl Director {
             }
         }
         base.uncovered = uncovered_work_cell(validation, &run_document.work_cell);
+        if gated && let Some(message) = work_cell_unfit(bundle.as_ref(), &base.uncovered) {
+            if !base.uncovered.is_empty() {
+                self.run_event(run, EventKind::Uncovered, json!(base.uncovered));
+            }
+            return Err(refuse(base, message, Vec::new()));
+        }
+        if let (true, Some(digest)) = (gated, digest) {
+            let sign_off = SignOff::of_run(
+                digest,
+                &snapshot,
+                &binding,
+                &base.versions,
+                &run_document.incidents,
+            );
+            if let Some(message) = refusal_of_no_record(&records, &sign_off) {
+                return Err(refuse(base, message, Vec::new()));
+            }
+        }
         let mut taken: Vec<RobotName> = Vec::new();
         for robot in binding.values() {
             if let Err(refused) = self.leases.take(robot.as_str(), &run_lease_name(run)).await {
@@ -1168,6 +1209,34 @@ fn named_roles(text: &str) -> Result<BTreeMap<Name, RobotName>, String> {
         .collect())
 }
 
+/// What a run of an unattended run on a physical robot whose run document
+/// gives `versions: "warn"` is told.
+const WARN_ON_A_PHYSICAL_ROBOT: &str = "an unattended run on a physical robot runs only on a stack that matches the lock of its bundle: give its run document `versions: \"refuse\"`, or no `versions`";
+
+/// The digest of `bundle`, without its trials.
+pub fn digest_of(bundle: &Bundle) -> Sha256 {
+    Sha256::parse(&bundle.document.digest().to_string())
+        .expect("a digest is 64 lowercase hex digits")
+}
+
+/// Why the work cell of an unattended run on a physical robot does not fit
+/// its bundle, given the values `uncovered` that no test covered: the run
+/// has no bundle, its bundle has no envelope, or a value is missing or
+/// outside the envelope. None when it fits.
+fn work_cell_unfit(bundle: Option<&Bundle>, uncovered: &[Uncovered]) -> Option<String> {
+    let Some(bundle) = bundle else {
+        return Some("an unattended run on a physical robot runs the bundle of a signed-off sweep, inside its envelope: give the bundle in place of the workflow".to_owned());
+    };
+    if bundle.document.validation.is_none() {
+        return Some("the bundle has no envelope: an unattended run on a physical robot runs only the bundle of a signed-off sweep".to_owned());
+    }
+    if uncovered.is_empty() {
+        return None;
+    }
+    let uncovered: Vec<&Uncovered> = uncovered.iter().collect();
+    Some(outside_the_envelope(&uncovered))
+}
+
 /// Why a run of `caller` does not bind `robot`, which `lease` holds: a
 /// lease of the caller itself goes to the director with an offer.
 fn leased_by(robot: &str, lease: &fleet::Lease, caller: &Caller) -> String {
@@ -1183,18 +1252,32 @@ fn leased_by(robot: &str, lease: &fleet::Lease, caller: &Caller) -> String {
     }
 }
 
-/// The roles of a run bound to robots: the named roles first, then each
-/// `"auto"` role in name order to the first fitting robot in name order.
-/// `held` gives each robot that another run or a teach of the director
+/// Who a binding is for: the caller of the run, and the director, to which
+/// the caller offers its leases.
+#[derive(Clone, Copy)]
+struct Parties<'p> {
+    caller: &'p Caller,
+    me: &'p Caller,
+}
+
+/// The roles of a run bound to robots: the named roles first, then the
+/// `"auto"` roles. In an unattended run, the `"auto"` roles take the robots
+/// of the first record of `records` (the sign-off records of the bundle of
+/// the run, in their order) whose binding agrees with the named roles and
+/// whose robots are all present and free by the rule of `"auto"`; with no
+/// such record, and in an attended run, each `"auto"` role in name order
+/// takes the first fitting robot in name order, simulated in an unattended
+/// run. `held` gives each robot that another run or a teach of the director
 /// holds.
 fn bind(
     workflow: &Workflow,
     document: &RunDocument,
     snapshot: &Snapshot,
-    caller: &Caller,
-    me: &Caller,
+    parties: &Parties<'_>,
     held: &BTreeMap<RobotName, Holder>,
+    records: &[SignOffRecord],
 ) -> Result<BTreeMap<Name, RobotName>, Vec<Located>> {
+    let Parties { caller, me } = *parties;
     let fleet = &snapshot.fleet;
     let offered: BTreeSet<&str> = fleet
         .leases
@@ -1230,45 +1313,85 @@ fn bind(
         }
         binding.insert(role.clone(), robot.clone());
     }
-    for (role, bound) in &document.roles {
-        if *bound != RoleBinding::Auto {
-            continue;
+    let autos: Vec<&Name> = document
+        .roles
+        .iter()
+        .filter(|(_, bound)| **bound == RoleBinding::Auto)
+        .map(|(role, _)| role)
+        .collect();
+    // The first reason `robot` cannot take `role` by the rule of `"auto"`,
+    // none when it can, with the robots `taken` by other roles.
+    let free = |role: &Name, robot: &fleet::Robot, taken: &BTreeSet<&str>| -> Option<String> {
+        let name = &robot.name;
+        if taken.contains(name.as_str()) {
+            return Some(format!("`{name}` takes another role of the run"));
         }
+        if let Some(holder) = RobotName::parse(name)
+            .ok()
+            .and_then(|robot| held.get(&robot))
+        {
+            return Some(holder.why(name));
+        }
+        match offered.is_empty() {
+            true => {
+                if let Some(lease) = fleet.lease_of(name) {
+                    return Some(leased_by(name, lease, caller));
+                }
+            }
+            false => {
+                if !offered.contains(name.as_str()) {
+                    return Some(format!("the caller offered `{name}` no lease"));
+                }
+            }
+        }
+        checker::misfits(workflow, snapshot, role, robot, &document.confirmed)
+            .into_iter()
+            .next()
+    };
+    let unattended = document.attendance == Attendance::Unattended;
+    let by_record = (unattended && !autos.is_empty()).then(|| {
+        let taken: BTreeSet<&str> = binding.values().map(RobotName::as_str).collect();
+        let fits = |record: &&SignOffRecord| {
+            let binds = &record.sign_off.binding;
+            let agrees = document.roles.iter().all(|(role, bound)| match bound {
+                RoleBinding::Robot(robot) => binds.get(role).is_some_and(|b| b.name == *robot),
+                RoleBinding::Auto => binds.contains_key(role),
+            });
+            agrees
+                && autos.iter().all(|role| {
+                    let robot = binds[*role].name.as_str();
+                    fleet
+                        .robots
+                        .get(robot)
+                        .is_some_and(|robot| free(role, robot, &taken).is_none())
+                })
+        };
+        records.iter().find(fits).map(|record| {
+            autos
+                .iter()
+                .map(|role| ((*role).clone(), record.sign_off.binding[*role].name.clone()))
+                .collect::<Vec<_>>()
+        })
+    });
+    // The roles that the robots of a record do not bind, each to its own robot.
+    let one_by_one = match by_record.flatten() {
+        Some(bound) => {
+            binding.extend(bound);
+            Vec::new()
+        }
+        None => autos,
+    };
+    for role in one_by_one {
         let taken: BTreeSet<&str> = binding.values().map(RobotName::as_str).collect();
         // The first reason `robot` cannot take the role, none when it can.
         let why_not = |robot: &fleet::Robot| -> Option<String> {
-            let name = &robot.name;
-            if taken.contains(name.as_str()) {
-                return Some(format!("`{name}` takes another role of the run"));
+            if unattended && robot.is_physical() {
+                return Some(format!(
+                    "`{}` is physical: in an unattended run, \"auto\" binds a physical robot only as a sign-off record of the bundle binds it",
+                    robot.name
+                ));
             }
-            if let Some(holder) = RobotName::parse(name)
-                .ok()
-                .and_then(|robot| held.get(&robot))
-            {
-                return Some(holder.why(name));
-            }
-            match offered.is_empty() {
-                true => {
-                    if let Some(lease) = fleet.lease_of(name) {
-                        return Some(leased_by(name, lease, caller));
-                    }
-                }
-                false => {
-                    if !offered.contains(name.as_str()) {
-                        return Some(format!("the caller offered `{name}` no lease"));
-                    }
-                }
-            }
-            checker::misfits(
-                workflow,
-                snapshot,
-                role,
-                robot,
-                document.attendance,
-                &document.confirmed,
-            )
-            .into_iter()
-            .next()
+            free(role, robot, &taken)
         };
         match fleet.robots.values().find(|robot| why_not(robot).is_none()) {
             Some(robot) => {
@@ -1690,9 +1813,12 @@ mod tests {
             &workflow,
             &document,
             fleet,
-            &chat(),
-            &me(),
+            &Parties {
+                caller: &chat(),
+                me: &me(),
+            },
             &BTreeMap::new(),
+            &[],
         )
         .map_err(|errors| errors.into_iter().map(|e| e.message).collect())
     }
@@ -1825,9 +1951,12 @@ mod tests {
             &workflow,
             &document,
             &fleet,
-            &chat(),
-            &me(),
+            &Parties {
+                caller: &chat(),
+                me: &me(),
+            },
             &BTreeMap::new(),
+            &[],
         )
         .unwrap();
         assert_eq!(binding[&name("arm")], robot_name("baker"));
@@ -1866,9 +1995,12 @@ mod tests {
             &workflow,
             &document,
             &fleet,
-            &chat(),
-            &me(),
+            &Parties {
+                caller: &chat(),
+                me: &me(),
+            },
             &BTreeMap::new(),
+            &[],
         )
         .unwrap();
         assert_eq!(binding[&name("arm")], robot_name("baker"));
@@ -1924,9 +2056,12 @@ mod tests {
             &workflow,
             &document(json!({ "arm": "alpha" })),
             &fleet,
-            &chat(),
-            &me(),
+            &Parties {
+                caller: &chat(),
+                me: &me(),
+            },
             &elsewhere,
+            &[],
         );
         let held = "`alpha` takes part in run r1 of this director: wait for its end, or abort it";
         assert_eq!(
@@ -1941,9 +2076,12 @@ mod tests {
                 &workflow,
                 &document(json!({})),
                 &fleet,
-                &chat(),
-                &me(),
-                &elsewhere
+                &Parties {
+                    caller: &chat(),
+                    me: &me(),
+                },
+                &elsewhere,
+                &[],
             )
             .is_err()
         );
@@ -1952,13 +2090,155 @@ mod tests {
             &workflow,
             &document(json!({ "arm": "alpha" })),
             &fleet,
-            &chat(),
-            &me(),
+            &Parties {
+                caller: &chat(),
+                me: &me(),
+            },
             &taught,
+            &[],
         );
         assert_eq!(
             teaching.unwrap_err()[0].message,
             "`alpha` is being taught its locations by this director: run again once the teach ends"
+        );
+    }
+
+    /// A physical robot named `name`, with the contracts of the tests.
+    fn physical(name: &str) -> crate::fleet::Robot {
+        let mut robot = robot(name);
+        robot.kind = "physical".to_owned();
+        robot
+    }
+
+    /// The binding of the roles of an unattended run of `value` that names
+    /// the robots `named`, on `fleet`, with the sign-off records `records`.
+    fn bound_by_records(
+        value: &serde_json::Value,
+        named: serde_json::Value,
+        fleet: &Snapshot,
+        records: &[SignOffRecord],
+    ) -> Result<BTreeMap<Name, RobotName>, Vec<Located>> {
+        let workflow = workflow(value);
+        let mut document = RunDocument::of_roles(
+            &workflow,
+            serde_json::from_value(named).unwrap(),
+            WorkCell::new(),
+        )
+        .unwrap();
+        document.attendance = Attendance::Unattended;
+        bind(
+            &workflow,
+            &document,
+            fleet,
+            &Parties {
+                caller: &chat(),
+                me: &me(),
+            },
+            &BTreeMap::new(),
+            records,
+        )
+    }
+
+    /// In an unattended run, `"auto"` binds a physical robot as the first
+    /// sign-off record that fits binds it, in the order of their robots; a
+    /// lease of a robot of the first gives the binding of the second, and
+    /// with no record that fits, `"auto"` binds only a simulated robot.
+    #[test]
+    fn auto_binds_physical_robots_only_as_the_first_record_that_fits_binds_them() {
+        use crate::sign_off::tests::record;
+        let mut fleet = snapshot(vec![physical("arm_a"), physical("arm_b"), robot("sim")]);
+        let records = [
+            record("t2", &[("arm", "arm_a")]),
+            record("t1", &[("arm", "arm_b")]),
+        ];
+        let arm = |fleet: &Snapshot, records: &[SignOffRecord]| {
+            bound_by_records(&rest(), json!({}), fleet, records).unwrap()[&name("arm")].clone()
+        };
+        assert_eq!(arm(&fleet, &records), robot_name("arm_a"));
+        assert_eq!(
+            arm(&fleet, &records),
+            arm(&fleet, &records),
+            "the same listing and records give the same binding"
+        );
+        fleet.fleet.leases.push(lease("arm_a", &chat(), None));
+        assert_eq!(arm(&fleet, &records), robot_name("arm_b"));
+        fleet.fleet.leases.push(lease("arm_b", &chat(), None));
+        assert_eq!(arm(&fleet, &records), robot_name("sim"));
+        assert_eq!(
+            arm(&snapshot(vec![physical("arm_a"), robot("sim")]), &[]),
+            robot_name("sim")
+        );
+    }
+
+    /// A record binds the `"auto"` roles only when its binding agrees with
+    /// the named roles; with none that agrees, an `"auto"` role takes a
+    /// simulated robot, and with none either, the refusal names why each
+    /// physical robot does not fit.
+    #[test]
+    fn a_record_binds_the_auto_roles_only_when_it_agrees_with_the_named_roles() {
+        use crate::sign_off::tests::record;
+        let mut value = rest();
+        value["roles"] = json!({ "arm": {}, "helper": {} });
+        value["actions"]["helper"] = value["actions"]["arm"].clone();
+        let fleet = snapshot(vec![
+            physical("arm_a"),
+            physical("arm_b"),
+            physical("arm_c"),
+        ]);
+        let records = [
+            record("t1", &[("arm", "arm_a"), ("helper", "arm_b")]),
+            record("t2", &[("arm", "arm_c"), ("helper", "arm_a")]),
+        ];
+        let bound = bound_by_records(&value, json!({ "arm": "arm_c" }), &fleet, &records).unwrap();
+        assert_eq!(bound[&name("helper")], robot_name("arm_a"));
+        let refused =
+            bound_by_records(&value, json!({ "arm": "arm_b" }), &fleet, &records).unwrap_err();
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(
+            refused[0].message.contains(
+                "`arm_a` is physical: in an unattended run, \"auto\" binds a physical robot only as a sign-off record of the bundle binds it"
+            ),
+            "{refused:?}"
+        );
+    }
+
+    /// The work cell of an unattended run on a physical robot fits only a
+    /// bundle with an envelope, each value inside it, and each refusal names
+    /// its cause.
+    #[test]
+    fn the_work_cell_of_an_unattended_run_on_a_physical_robot_fits_only_inside_an_envelope() {
+        let workflow = workflow(&rest());
+        let validation = crate::testing::validation(
+            json!({ "belt_speed_mps": { "unit": "m/s", "kind": "control" } }),
+            json!({ "belt_speed_mps": [0.05, 0.25] }),
+        );
+        let lock = Lock::default();
+        let open = |validation: Option<workflow_documents::Validation>| {
+            let files = match validation {
+                Some(validation) => {
+                    Bundle::write_signed_off(&workflow, Vec::new(), lock.clone(), validation)
+                }
+                None => Bundle::write(&workflow, Vec::new(), lock.clone()),
+            };
+            Bundle::open(files.unwrap()).unwrap()
+        };
+        assert!(
+            work_cell_unfit(None, &[])
+                .unwrap()
+                .contains("give the bundle in place of the workflow")
+        );
+        assert!(
+            work_cell_unfit(Some(&open(None)), &[])
+                .unwrap()
+                .starts_with("the bundle has no envelope")
+        );
+        let with_envelope = open(Some(validation.clone()));
+        assert_eq!(work_cell_unfit(Some(&with_envelope), &[]), None);
+        let outside: WorkCell = serde_json::from_value(json!({ "belt_speed_mps": 0.3 })).unwrap();
+        let uncovered = uncovered_work_cell(Some(&validation), &outside);
+        assert_eq!(
+            work_cell_unfit(Some(&with_envelope), &uncovered).unwrap(),
+            "an unattended run on a physical robot runs inside the envelope of its bundle, and no test covered `belt_speed_mps` is 0.3, outside the tested range [0.05, 0.25]"
         );
     }
 

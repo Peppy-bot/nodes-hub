@@ -214,7 +214,7 @@ impl<'a> Checker<'a> {
 
     /// The binding rules: each role bound, to a present robot of its own,
     /// with the contracts and the model of the role and no robot commander.
-    fn check_binding(&mut self, attendance: Attendance, confirmed: &BTreeSet<Name>) {
+    fn check_binding(&mut self, confirmed: &BTreeSet<Name>) {
         let Some(binding) = self.binding else {
             return;
         };
@@ -242,14 +242,7 @@ impl<'a> Checker<'a> {
                 );
                 continue;
             };
-            let reasons = misfits(
-                self.workflow,
-                self.snapshot,
-                role,
-                robot,
-                attendance,
-                confirmed,
-            );
+            let reasons = misfits(self.workflow, self.snapshot, role, robot, confirmed);
             for reason in reasons {
                 self.error(format!("roles.{role}"), reason);
             }
@@ -1238,15 +1231,7 @@ pub fn check(
     allowed: &AllowedContracts,
     binding: Option<&BTreeMap<Name, RobotName>>,
 ) -> Vec<Located> {
-    run_checker(
-        workflow,
-        snapshot,
-        allowed,
-        binding,
-        Attendance::Attended,
-        &BTreeSet::new(),
-    )
-    .errors
+    run_checker(workflow, snapshot, allowed, binding, &BTreeSet::new()).errors
 }
 
 fn run_checker<'a>(
@@ -1254,7 +1239,6 @@ fn run_checker<'a>(
     snapshot: &'a Snapshot,
     allowed: &'a AllowedContracts,
     binding: Option<&'a BTreeMap<Name, RobotName>>,
-    attendance: Attendance,
     confirmed: &BTreeSet<Name>,
 ) -> Checker<'a> {
     let mut checker = Checker {
@@ -1272,7 +1256,7 @@ fn run_checker<'a>(
         locations: Vec::new(),
     };
     checker.check_contracts();
-    checker.check_binding(attendance, confirmed);
+    checker.check_binding(confirmed);
     checker.check_tables();
     checker.check_observations();
     checker.check_trees();
@@ -1299,7 +1283,6 @@ pub fn plan(
         snapshot,
         allowed,
         Some(binding),
-        choices.attendance,
         &choices.confirmed,
     );
     checker.check_watch(&choices.watch);
@@ -1560,8 +1543,8 @@ fn skills_that_know_no_locations(workflow: &Workflow, role: &Name, robot: &Robot
 }
 
 /// Why `robot` cannot take `role`, none when it can: its software runs, it
-/// has no robot commander of its own, it is simulated when the run is
-/// unattended or its caller confirms assumptions, it implements each
+/// has no robot commander of its own, it is simulated when the caller of the
+/// run confirms assumptions, it implements each
 /// contract, each of its instances that serves a call of the role that
 /// gives a location implements locations:v1, and it reports the model of
 /// the role. A named role and an
@@ -1571,7 +1554,6 @@ pub fn misfits(
     snapshot: &Snapshot,
     role: &Name,
     robot: &Robot,
-    attendance: Attendance,
     confirmed: &BTreeSet<Name>,
 ) -> Vec<String> {
     let name = &robot.name;
@@ -1582,8 +1564,10 @@ pub fn misfits(
     if !robot.robot_commander.is_empty() {
         reasons.push(format!("`{name}` has the robot commander `{}`, which moves it outside the leases; bind a robot without one", robot.robot_commander));
     }
-    if robot.is_physical() && (attendance == Attendance::Unattended || !confirmed.is_empty()) {
-        reasons.push(format!("`{name}` is physical: an unattended run, or one whose caller confirms assumptions, binds only simulated robots"));
+    if robot.is_physical() && !confirmed.is_empty() {
+        reasons.push(format!(
+            "`{name}` is physical: a run whose caller confirms assumptions binds only simulated robots"
+        ));
     }
     for alias in aliases_of_role(workflow, role) {
         let Some(contract) = workflow.contracts.get(&alias) else {

@@ -2400,3 +2400,31 @@ async fn a_watch_value_that_does_not_read_refuses_the_run_naming_it() {
     );
     assert!(result.assumptions.is_empty(), "no assumption was checked");
 }
+
+/// An unattended run on a physical robot runs only with each watch value
+/// inside the envelope of its bundle: a value outside it, or with no
+/// envelope, refuses the run before its assumptions, naming the value. The
+/// same values let an attended run go on.
+#[tokio::test(start_paused = true)]
+async fn an_unattended_run_on_a_physical_robot_is_refused_on_a_watch_value_no_test_covered() {
+    for validation in [Some(loose_tested(2.0, 3.0)), None] {
+        let mut plan = watching_loose(validation);
+        plan.attendance = Attendance::Unattended;
+        plan.roles
+            .values_mut()
+            .for_each(|role| role.physical = true);
+        let host = arm();
+        let (result, _) = run(&plan, &host, Vec::new()).await;
+        assert_eq!(result.ending, Ending::Refused, "{result:#?}");
+        let refusal = result.refusal.expect("a refusal");
+        assert!(
+            refusal.message.starts_with(
+                "an unattended run on a physical robot runs inside the envelope of its bundle, and no test covered `loose` is 1"
+            ),
+            "{}",
+            refusal.message
+        );
+        assert!(result.assumptions.is_empty(), "no assumption was checked");
+        assert_eq!(result.watch, [(name("loose"), 1.0)].into());
+    }
+}

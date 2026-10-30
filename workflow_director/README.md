@@ -43,7 +43,9 @@ A `run` goal that is well formed is accepted and gets the id `r<N>`. The run
 reads a fresh fleet listing, refuses a halted stack, binds its roles (the
 named roles, then each `"auto"` role to the first fitting robot in name
 order, among the robots the caller offered to the director when it offered
-any), and checks the workflow with those robots. For a bundle it compares
+any, and simulated in an unattended run; see the sign-off records for the
+physical robots of an unattended run), and checks the workflow with those
+robots. For a bundle it compares
 the stack with the lock of the bundle. Then it takes the lease of each robot
 under the name `run r<N>`, lists the locations of each skill instance the
 workflow gives a location to (`locations:v1`, whatever the allowed
@@ -85,6 +87,40 @@ that does not read refuses the run. The event `uncovered` and the run
 result name each value of the work cell block and each watch value that no
 test covered: missing, outside the envelope of the bundle, or with no
 envelope. The run result gives the work cell block and each watch value.
+
+## Unattended runs on physical robots
+
+An attended run may bind physical robots, and goes on with values that no
+test covered. An unattended run that binds a physical robot needs, before
+its initialization: `versions: "refuse"` (a run document with
+`versions: "warn"` is refused), checked before the lock; then a bundle
+whose validation gives an envelope, with each value of its work cell block
+inside it, and a sign-off record that matches the run; then, after the
+locations, each watch value inside the envelope. Each refusal names its
+cause. A run whose caller confirms assumptions binds no physical robot.
+
+## Sign-off records
+
+A sign-off record names what a trial of a bundle tested: the bundle digest,
+the core node of the stack, the binding with the name, the model and the
+core node of each bound robot, the versions of the director, of the nodes of
+the bound robots and of the node of the anomaly monitor, the incidents
+policy and the peppy version. Each is a file,
+`<journal_root>/workflow_director/sign_offs/<trial>.json`, which the director
+reads at its start; a record that does not read stops the start, naming its
+file. A run matches a record when each of these is the same, or when only
+its incidents policy differs and is stricter: the same monitor, and each
+severity of its `continue_on_severity` also in that of the record. A node
+with no commit matches no record. The refusal of an unattended run that no
+record matches names how each record of its bundle differs.
+
+In an unattended run, `"auto"` binds physical robots only as one whole
+record of the bundle binds them: the first record, in the order of the robot
+names of its roles in role name order, whose binding agrees with the named
+roles and whose robots are all present and free by the rule of `"auto"`.
+With no such record, `"auto"` binds only simulated robots. `forget_robot`
+removes each record that binds a robot, after a change of its body, and
+gives how many it removed.
 
 `locations` teaches each locations:v1 instance of a robot the locations
 given, or lists what each knows; a teach is refused on a robot with a lease,

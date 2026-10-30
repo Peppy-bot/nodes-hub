@@ -286,9 +286,10 @@ fn the_binding_refuses_each_robot_that_cannot_take_the_role() {
         change(&mut robot);
         plan_errors(&picker(), vec![robot], Attendance::Unattended)
     };
-    refuses(
-        &unattended(|r| r.kind = "physical".to_owned()),
-        "`alpha` is physical",
+    // The gates of an unattended run on a physical robot follow its plan.
+    assert_eq!(
+        unattended(|r| r.kind = "physical".to_owned()),
+        Vec::<String>::new()
     );
     refuses(
         &unattended(|r| r.robot_commander = "headset".to_owned()),

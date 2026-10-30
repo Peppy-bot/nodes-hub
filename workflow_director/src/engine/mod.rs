@@ -843,13 +843,31 @@ async fn watch<H: Host>(
         let message = listed(&uncovered);
         ctx.run_event(EventKind::Uncovered, "", message, json!(uncovered));
     }
-    None
+    if !ctx.plan.is_unattended_on_a_physical_robot() || outcome.uncovered.is_empty() {
+        return None;
+    }
+    let watched: Vec<&Uncovered> = outcome.uncovered.iter().collect();
+    Some(RunRefusal {
+        message: outside_the_envelope(&watched),
+        errors: Vec::new(),
+        assumption: None,
+        says: None,
+    })
 }
 
 /// Each value of `uncovered`, as its text says it, separated by `; `.
 pub fn listed(uncovered: &[&Uncovered]) -> String {
     let texts: Vec<String> = uncovered.iter().map(ToString::to_string).collect();
     texts.join("; ")
+}
+
+/// The refusal of an unattended run on a physical robot with the values
+/// `uncovered`, which no test covered.
+pub fn outside_the_envelope(uncovered: &[&Uncovered]) -> String {
+    format!(
+        "an unattended run on a physical robot runs inside the envelope of its bundle, and no test covered {}",
+        listed(uncovered)
+    )
 }
 
 /// Evaluates the check of each assumption, within its bound; a false check

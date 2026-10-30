@@ -30,6 +30,7 @@ mod leases;
 mod live;
 mod replay;
 mod serve;
+mod sign_off;
 #[cfg(test)]
 mod testing;
 
@@ -39,6 +40,7 @@ use director::{Director, EVENTS_KEPT};
 use fleet::Snapshot;
 use journal::Journals;
 use leases::Leases;
+use sign_off::SignOffs;
 
 /// The director's own error: a fact about its parameters or its machine,
 /// which is what a launcher reads back when the node refuses to start.
@@ -91,6 +93,12 @@ pub async fn setup(params: Parameters, runner: Arc<NodeRunner>, fault: Fault) ->
             config.journal_root.display()
         ))
     })?;
+    let sign_offs = SignOffs::open(&config.journal_root).map_err(|error| {
+        refused(format!(
+            "the sign-off records under journal_root `{}` did not read: {error}",
+            config.journal_root.display()
+        ))
+    })?;
     let clock = ClockSource::of(&runner, fault.clone()).await?;
     let leases = Leases::start(Arc::clone(&runner), fault).await?;
     let (snapshots_tx, snapshots) = watch::channel(Arc::new(Snapshot::default()));
@@ -102,6 +110,7 @@ pub async fn setup(params: Parameters, runner: Arc<NodeRunner>, fault: Fault) ->
         leases,
         snapshots,
         journals,
+        sign_offs,
         runs: Mutex::new(Default::default()),
         teaching: Mutex::new(Default::default()),
         events,

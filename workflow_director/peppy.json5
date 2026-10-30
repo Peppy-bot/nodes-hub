@@ -5,7 +5,8 @@
     tag: "v1",
     description: [
       "The workflow director: it checks workflows (workflow/v1) against the contracts of the fleet listing and runs them (run/v1) on the robots of the stack, under robot leases. It opens no device and needs no simulation.",
-      "It calls the members that a workflow names through the codec API of peppy, so a workflow can name contracts this node was not built with, and finds the robots in the fleet listing, with no launcher link to a robot. It keeps the journal of each run on the disk of its machine, in the directory that journal_root names.",
+      "It calls the members that a workflow names through the codec API of peppy, so a workflow can name contracts this node was not built with, and finds the robots in the fleet listing, with no launcher link to a robot. It keeps the journal of each run and the sign-off records of trials on the disk of its machine, in the directory that journal_root names.",
+      "An unattended run that binds a physical robot runs only on versions refuse, inside the envelope of a bundle of a signed-off sweep, with a sign-off record that matches it.",
     ],
     implements: [
       { name: "workflow_director", tag: "v1", link_id: "director" },
@@ -69,8 +70,8 @@
     codec_api: true,
     container: {
       def_file: "apptainer.def",
-      // The journals and the record of runs outlive the container and each
-      // launch, so the directory is bound explicitly.
+      // The journals, the record of runs and the sign-off records outlive
+      // the container and each launch, so the directory is bound explicitly.
       mount_paths: [
         "${parameters:journal_root}",
       ],
@@ -86,9 +87,9 @@
       // How long (s, wall time) a cancelled goal has to end before its
       // robot counts as in an unknown state.
       cancel_timeout_s: "f64",
-      // Absolute host directory of the journals, bind-mounted same-path
-      // above. Not a top-level system directory (peppy refuses those as
-      // mount sources).
+      // Absolute host directory of the journals and the sign-off records,
+      // bind-mounted same-path above. Not a top-level system directory
+      // (peppy refuses those as mount sources).
       journal_root: "string",
       // The journals of ended runs kept: the oldest go first beyond either
       // bound. The journal of a run that has not ended is always kept.
