@@ -3,6 +3,10 @@
   manifest: {
     name: "my_python_robot_brain",
     tag: "v1",
+    description: [
+      "An example brain that moves both arms of the example backbone from the images of a camera. It needs a camera that implements rgb_camera:v1 and a my_python_robot_backbone. It opens no device itself.",
+      "A reference node, to read rather than to deploy. It runs no model: it takes the first three bytes of the newest frame as a target position and sends that position to both arms. my_rust_robot_brain is the same node in Rust.",
+    ],
     labels: [
       "brain"
     ],

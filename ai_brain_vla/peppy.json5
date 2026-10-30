@@ -1,19 +1,20 @@
-// ai_brain_vla: a brain whose models run beside the robot, on its GPU. It
-// implements item_perception and item_manipulation, the contracts that scan
-// for items, find one, pick it up and put it down, and brain_model, which
-// names the model of each role. It depends on limb_motion, the backbone's
-// discrete arm and gripper moves; the launcher binds that slot to the
-// instance that governs the arms, so any move sent through it is collision
-// governed on the way down. brain_core enforces every contract rule; what
-// it cannot know, finding an item in an image and moving an arm to it, is
-// the model of each role, which the parameters below name. Perception
-// defaults to "sam3_siglip" and manipulation to "scripted". A role on
-// "none" refuses its goals, naming the missing model.
+// ai_brain_vla depends on limb_motion, the backbone's discrete arm and
+// gripper moves; the launcher binds that slot to the instance that governs
+// the arms, so any move sent through it is collision governed on the way
+// down. brain_core enforces every contract rule; what it cannot know,
+// finding an item in an image and moving an arm to it, is the model of each
+// role, which the parameters below name. Perception defaults to
+// "sam3_siglip" and manipulation to "scripted". A role on "none" refuses its
+// goals, naming the missing model.
 {
   peppy_schema: "node/v1",
   manifest: {
     name: "ai_brain_vla",
     tag: "v1",
+    description: [
+      "A brain whose models run beside the robot, on its GPU. It finds items by words in the images of the robot, then picks them up and puts them down. It needs an NVIDIA GPU on its machine: without one, it runs slowly.",
+      "It implements item_perception, item_manipulation and brain_model. It finds items through one RGB-D camera, the geometry of that camera and its mount on the robot: without them, it refuses each search. By default, SAM 3 finds what is in view and SigLIP names each item by words from a general vocabulary. Its first load on a machine downloads about 7 GB of weights. The default manipulation model grabs an item from above at the point where the brain saw it, and calls no model.",
+    ],
     implements: [
       { name: "item_perception", tag: "v1", link_id: "item_perception" },
       { name: "item_manipulation", tag: "v1", link_id: "item_manipulation" },

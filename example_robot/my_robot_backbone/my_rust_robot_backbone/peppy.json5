@@ -3,6 +3,10 @@
   manifest: {
     name: "my_rust_robot_backbone",
     tag: "v1",
+    description: [
+      "An example backbone that drives two example arms, left_robot_arm and right_robot_arm, behind one move_arm action. It opens no device: its arms are my_rust_robot_arm nodes, which move in software only.",
+      "A reference node, to read rather than to deploy. my_python_robot_backbone is the same node in Python.",
+    ],
     labels: [
       "openarm01"
     ],
@@ -37,14 +41,15 @@
       exposes: [
         {
           name: "move_arm",
+          description: "Move the arm that arm_id selects to desired_position. The backbone sends the goal to that arm and relays the decision of the arm, its feedback (the position on the way) and its result (the final position). It refuses an unknown arm_id, and a goal for an arm that moves.",
           goal_service: {
             request_message_format: {
-              arm_id: "u16", // 0 left, 1 right
-              // x, y, z
+              arm_id: { $type: "u16", $description: "The arm to move: 0 for the left arm, 1 for the right arm." },
               desired_position: {
                 $type: "array",
                 $items: "i32",
-                $length: 3
+                $length: 3,
+                $description: "The target position, as x, y, z.",
               }
             }
           },

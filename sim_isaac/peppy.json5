@@ -1,28 +1,16 @@
-// The Isaac Sim simulation node.
-//
-// It hosts any number of robots, of any model it has an entry for, on one
-// stage. A robot joins by attaching over the simulation_robot contract,
-// naming the copy it runs as, the model it is and where it stands; the engine
-// references that model's stage and drives it for as long as the robot stays.
-// The engine plays the follower role of every one of the robot's limb
-// pairings: the robot's backbone leads each pair and the simulation's
-// measured state streams back on it. Whether a robot stands with a pair for
-// every limb of its model is its readiness, answered on the same contract.
-//
-// The node also implements the scene_manipulation contract on its scene slot:
-// runtime scene/object services and actions consumed by higher-level tools
-// such as scene_commander. The object_state contract on its objects slot
-// reports what those tools spawned, streamed and on demand.
-//
-// Public Peppy interfaces use stable asset_id and object_id identifiers rather
-// than exposing Isaac USD paths directly. The existing TCP runtime commander
-// remains available as a developer/debug path for raw USD/path operations.
+// sim_isaac: the TCP runtime commander (port 5556) is a developer/debug path
+// for raw USD/path operations.
 {
   peppy_schema: "node/v1",
 
   manifest: {
     name: "sim_isaac",
     tag: "v1",
+    description: [
+      "The Isaac Sim simulation: it stands any number of robots, of any model it has an entry for, on one stage, and streams its view over WebRTC. It needs an NVIDIA GPU with the proprietary driver on its machine.",
+      "A robot joins by attaching over the simulation_robot contract, naming the copy it runs as, the model it is and where it stands; the engine references that model's stage and drives it for as long as the robot stays. The engine plays the follower role of every one of the robot's limb pairings: the robot's backbone leads each pair and the simulation's measured state streams back on it. Whether a robot stands with a pair for every limb of its model is its readiness, answered on the same contract.",
+      "The node also implements scene_manipulation, the runtime scene and object services and actions that tools such as scene_commander consume, and object_state, which reports what those tools spawned, streamed and on demand. These interfaces use stable asset_id and object_id identifiers rather than Isaac USD paths.",
+    ],
 
     // The scene-editing contract, implemented on the scene slot: any
     // commander that speaks scene_manipulation can drive this simulation. The

@@ -1,16 +1,14 @@
-// openarm_web_commander: the browser-based commander. Serves a control
-// panel (HTTP + WebSocket on http_host, on http_port when it is free and on
-// an operating-system port otherwise) that streams arm and gripper setpoints
-// to the backbone over the joint_link / gripper_link
-// pairings (the backbone governs and re-streams them), reads live state by
-// observing the backbone's downstream pairings, jogs the arm in joint space,
-// and fires move_arm_joints / move_arm / move_gripper goals through the
-// limb_motion contract slot (the backbone).
+// openarm_web_commander serves HTTP + WebSocket on http_host, on http_port
+// when it is free and on an operating-system port otherwise.
 {
   peppy_schema: "node/v1",
   manifest: {
     name: "openarm_web_commander",
     tag: "v1",
+    description: [
+      "The browser control panel of an OpenArm robot, either hardware generation. It opens no device: it needs only a browser that reaches its page.",
+      "The panel streams arm and gripper setpoints to openarm_backbone over the joint_link and gripper_link pairings (the backbone governs and streams them again), reads the live state by observing the downstream pairings of the backbone, jogs the arm in joint space, and sends move_arm_joints, move_arm and move_gripper goals through the limb_motion slot. It also controls the self-collision governor of the backbone at run time, and records episodes when a recorder is bound.",
+    ],
     implements: [
       // Runtime on/off for the backbone's self-collision governor, driven by the UI.
       { name: "openarm_governor_control", tag: "v1", link_id: "governor" },

@@ -4,6 +4,10 @@
   manifest: {
     name: "scene_commander",
     tag: "v1",
+    description: [
+      "A browser panel that edits the scene of a simulation: it loads and clears scenes, spawns, moves and removes objects, pushes them with a force, and moves robots. It needs a simulation that implements scene_manipulation and object_state, such as sim_isaac or Waldo, and a browser that reaches its page.",
+      "It lists the objects that the simulation spawned, from object_state. A launch can also bind the lighting, the daylight, the materials and the cameras of the scene: the panel shows a card for each capability that is bound, and lists in the camera card every camera that the simulation renders, of every robot in it.",
+    ],
 
     labels: [
       "simulation",

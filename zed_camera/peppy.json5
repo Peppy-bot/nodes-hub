@@ -1,20 +1,16 @@
-// Stereolabs ZED stereo camera (ZED, ZED Mini, ZED 2/2i over USB3) as an
-// rgbd_camera producer without the ZED SDK. video_stream is the rectified
-// left eye; depth_stream (z16, millimetres) is computed in that same frame,
-// so the pair is always color-aligned and align_mode is depth_to_color.
-// The device runs auto exposure; there is no manual exposure control.
-// Factory calibration is fetched per unit serial at startup from
-// https://calib.stereolabs.com/, so the node needs outbound network access.
-// The same calibration answers camera_geometry: the colour stream is the
-// rectified left eye, so its pinhole model is the rectified projection
-// OpenCV's stereoRectify produced, without distortion; the depth stream is
-// that same view resized by depth.downscale, so its model is the colour one
-// rescaled, and the depth-to-colour transform is the identity.
+// zed_camera runs without the ZED SDK: depth comes from OpenCV's SGBM on the
+// rectified pair. The colour pinhole model is the rectified projection
+// OpenCV's stereoRectify produced.
 {
   peppy_schema: "node/v1",
   manifest: {
     name: "zed_camera",
     tag: "v1",
+    description: [
+      "A Stereolabs ZED stereo camera (ZED, ZED Mini, ZED 2/2i over USB3) as an RGB-D camera, without the ZED SDK. It needs the camera on USB3 on its host, and outbound network access: at startup it fetches the factory calibration of the unit from https://calib.stereolabs.com/.",
+      "video_stream is the rectified left eye; depth_stream (z16, millimetres) is computed in that same frame, so the pair is always color-aligned and align_mode is depth_to_color. The device runs auto exposure; there is no manual exposure control.",
+      "The same calibration answers camera_geometry: the colour stream is the rectified left eye, so its pinhole model has no distortion; the depth stream is that same view resized by depth.downscale, so its model is the colour one rescaled, and the depth-to-colour transform is the identity.",
+    ],
     implements: [
       { name: "rgbd_camera", tag: "v1", link_id: "camera" },
       { name: "camera_geometry", tag: "v1", link_id: "geometry" },

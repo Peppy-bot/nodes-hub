@@ -1,23 +1,18 @@
-// openarm_backbone: the bimanual coordination node. Plays the follower role
-// toward the one leading node (panel, KER, or headset): raw setpoints stream in
-// on those pairs and the measured state relays back up them. Exposes the joint /
-// Cartesian / gripper move actions and executes them itself; emits
-// collision_status; and drives each arm and each gripper over its own downstream
-// pairing (leader role): governed setpoints stream down each pair and the
-// measured state streams back on it. See src/main.rs.
+// openarm_backbone: see src/main.rs.
 //
 // An arm's upstream command is joints (joint_link) or an end-effector pose
 // (pose_link), never both: `upstream_mode` picks one per instance and only
 // that slot kind is subscribed.
-//
-// Every end-effector pose here, commanded or reported, is the gripper's grasp
-// point: on the jaw closing axis midway between the pads, not the wrist flange
-// they mount on. Commanding an object's centre puts the pads around it.
 {
   peppy_schema: "node/v1",
   manifest: {
     name: "openarm_backbone",
     tag: "v1",
+    description: [
+      "The motion authority of an OpenArm robot: it plans, governs and streams every move of both arms and both grippers against one self-collision model. It opens no device: it drives the arm and gripper nodes, or a simulation, over their pairings, so the same node runs on the real robot and in MuJoCo, Isaac Sim or Waldo.",
+      "It plays the follower role toward the one leading node (the web panel, the KER leader arm or a headset): raw setpoints stream in on those pairs and the measured state relays back up them. It plays the leader role toward each arm and each gripper: governed setpoints stream down each pair and the measured state streams back on it. It runs the joint, Cartesian, gripper and posture moves itself, and publishes the collision status.",
+      "Every end-effector pose here, commanded or reported, is the grasp point of the gripper: on the jaw closing axis midway between the pads, not the wrist flange they mount on. Commanding the centre of an object puts the pads around it.",
+    ],
     implements: [
       // Whole-robot state snapshots for consumers that hold no pairing:
       // joint positions, grasp-point poses, and gripper openings.

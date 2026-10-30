@@ -1,22 +1,16 @@
-// openarm_ker: the commander driven by the OpenArm KER (Kinematic
-// Equivalent Replica), enactic's motorless bimanual leader arm. Reads the
-// KER's encoder frames from its M5Stack CoreS3 over USB vendor mode (or
-// its serial device), maps the channels to per-side joint radians and commanded
-// gripper openings, and streams both to the backbone over the
-// joint_link / gripper_link pairings exactly like openarm_web_commander (the
-// backbone governs everything before it reaches a follower). An arm engages
-// when its trigger is squeezed to engage_trigger_opening, having read back
-// above it first, and then tracks the KER; for an unengaged arm, a stale KER,
-// or a disconnected one the node emits nothing and those limbs hold at their
-// last setpoints.
-// KER's joint structure matches OpenArm v2 1:1 (links scaled to 70%), so no
-// coordinate transform is involved; v1 followers accept the same joint-space
-// stream but are not geometrically equivalent.
+// openarm_ker maps the KER channels to per-side joint radians and commanded
+// gripper openings. KER's joint structure matches OpenArm v2 1:1 (links
+// scaled to 70%), so no coordinate transform is involved; v1 followers
+// accept the same joint-space stream but are not geometrically equivalent.
 {
   peppy_schema: "node/v1",
   manifest: {
     name: "openarm_ker",
     tag: "v1",
+    description: [
+      "The commander driven by the OpenArm KER (Kinematic Equivalent Replica), the motorless bimanual leader arm of enactic. It needs a KER on its host: it reads the encoder frames of its M5Stack CoreS3 over USB vendor mode, or over its serial device.",
+      "It streams the joint angles and the gripper openings of each side to openarm_backbone over the joint_link and gripper_link pairings, as openarm_web_commander does; the backbone governs them before they reach a follower. An arm engages when its trigger is squeezed to engage_trigger_opening, after it read back above that value first, and then tracks the KER. For an arm that is not engaged, and for a KER that is stale or disconnected, the node emits nothing, and those limbs hold their last setpoints. The KER has the joint structure of an OpenArm v2.",
+    ],
     depends_on: {
       pairings: [
         // The exclusive command loop with the backbone, one slot per driven
