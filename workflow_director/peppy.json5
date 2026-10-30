@@ -1,15 +1,12 @@
-// The workflow director: it checks workflows (workflow/v1) against the
-// contracts of the fleet listing and runs them (run/v1) on the robots of the
-// stack, under robot leases. It calls the members that a workflow names
-// through the codec API of peppy, so a workflow can name contracts this node
-// was not built with, and finds the robots in the fleet listing, with no
-// launcher link to a robot. It keeps the journal of each run on the disk of
-// its machine, in the directory that journal_root names.
 {
   peppy_schema: "node/v1",
   manifest: {
     name: "workflow_director",
     tag: "v1",
+    description: [
+      "The workflow director: it checks workflows (workflow/v1) against the contracts of the fleet listing and runs them (run/v1) on the robots of the stack, under robot leases. It opens no device and needs no simulation.",
+      "It calls the members that a workflow names through the codec API of peppy, so a workflow can name contracts this node was not built with, and finds the robots in the fleet listing, with no launcher link to a robot. It keeps the journal of each run on the disk of its machine, in the directory that journal_root names.",
+    ],
     implements: [
       { name: "workflow_director", tag: "v1", link_id: "director" },
     ],

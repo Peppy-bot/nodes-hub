@@ -27,16 +27,18 @@ use crate::fleet::{Fleet, Instance, Robot, RobotContract, Snapshot};
 const TEST_PERCEPTION: &str = r#"
 {
   peppy_schema: "contract/v1",
-  manifest: { name: "test_perception", tag: "v1" },
+  manifest: { name: "test_perception", tag: "v1", description: ["A perception for the tests of the director."] },
   interfaces: {
     services: [
       {
         name: "scan",
+        description: "The ids of the items that a description names.",
         request_message_format: { description: "string" },
         response_message_format: { item_ids: { $type: "array", $items: { $type: "string", $marks: ["item_id"] } } },
       },
       {
         name: "locate",
+        description: "The position of one item.",
         request_message_format: { item_id: { $type: "string", $marks: ["item_id"] } },
         response_message_format: { found: "bool", position: { $type: "array", $items: "f64", $length: 3, $marks: ["robot_frame"] } },
       },
