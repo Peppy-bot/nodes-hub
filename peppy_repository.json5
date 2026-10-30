@@ -176,6 +176,11 @@
         path: "vlm_router_brain/peppy.json5"
       }
     },
+    workflow_director: {
+      v1: {
+        path: "workflow_director/peppy.json5"
+      }
+    },
     xr_commander: {
       v1: {
         path: "xr_commander/peppy.json5"
