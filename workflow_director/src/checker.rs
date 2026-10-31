@@ -23,7 +23,7 @@ use crate::config::AllowedContracts;
 use crate::contract::{ContractShape, Field, FieldKind, Format, Member};
 use crate::engine::plan::{
     BoundArg, BoundCall, BoundObservation, BoundRole, CallSite, MemberKind, MonitorPlan,
-    ObservationRead, Plan, Producer, SkillLocations, Target,
+    ObservationRead, Plan, Producer, SkillLocations, Target, Watch,
 };
 use crate::fleet::{LOCATIONS, Robot, Snapshot};
 
@@ -34,6 +34,8 @@ pub struct RunChoices<'a> {
     pub incidents: &'a Incidents,
     pub poll: workflow_documents::Bound,
     pub cancel_timeout: std::time::Duration,
+    pub watch: Watch,
+    pub of_a_trial: bool,
 }
 
 /// Where each name of a role comes from: the role whose call or
@@ -213,7 +215,7 @@ impl<'a> Checker<'a> {
 
     /// The binding rules: each role bound, to a present robot of its own,
     /// with the contracts and the model of the role and no robot commander.
-    fn check_binding(&mut self, attendance: Attendance, confirmed: &BTreeSet<Name>) {
+    fn check_binding(&mut self, confirmed: &BTreeSet<Name>) {
         let Some(binding) = self.binding else {
             return;
         };
@@ -241,14 +243,7 @@ impl<'a> Checker<'a> {
                 );
                 continue;
             };
-            let reasons = misfits(
-                self.workflow,
-                self.snapshot,
-                role,
-                robot,
-                attendance,
-                confirmed,
-            );
+            let reasons = misfits(self.workflow, self.snapshot, role, robot, confirmed);
             for reason in reasons {
                 self.error(format!("roles.{role}"), reason);
             }
@@ -469,6 +464,7 @@ impl<'a> Checker<'a> {
             Ok(ty) => {
                 let fits = match want {
                     Want::Bool => ty == Type::Bool,
+                    Want::Number => is_number(&ty),
                     Want::Enum => matches!(ty, Type::Enum(_)),
                     Want::List => matches!(ty, Type::List(_)),
                 };
@@ -1094,12 +1090,18 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn check_whole_run_expressions(&mut self) {
+    /// The scope of the expressions outside the trees: the observations and
+    /// the tables.
+    fn whole_run_scope(&self) -> TypeScope {
         let mut names = self.observation_types();
         for (table, (_, ty)) in &self.tables {
             names.insert(table.clone(), ty.clone());
         }
-        let scope = TypeScope::new(names);
+        TypeScope::new(names)
+    }
+
+    fn check_whole_run_expressions(&mut self) {
+        let scope = self.whole_run_scope();
         let workflow = self.workflow;
         self.typed("success", &workflow.success, &scope, Want::Bool);
         if let Some(minimum) = &workflow.minimum {
@@ -1114,6 +1116,14 @@ impl<'a> Checker<'a> {
                     Want::Bool,
                 );
             }
+        }
+    }
+
+    /// Each watch parameter reads a number.
+    fn check_watch(&mut self, watch: &Watch) {
+        let scope = self.whole_run_scope();
+        for (name, observation) in &watch.observations {
+            self.typed(&format!("watch.{name}"), observation, &scope, Want::Number);
         }
     }
 
@@ -1164,6 +1174,7 @@ impl<'a> Checker<'a> {
 
 enum Want {
     Bool,
+    Number,
     Enum,
     List,
 }
@@ -1172,6 +1183,7 @@ impl Want {
     fn says(&self) -> &'static str {
         match self {
             Want::Bool => "the field takes a bool",
+            Want::Number => "a watch parameter reads a number",
             Want::Enum => "a `match` takes an enum",
             Want::List => "a `for_each` takes a list",
         }
@@ -1220,15 +1232,7 @@ pub fn check(
     allowed: &AllowedContracts,
     binding: Option<&BTreeMap<Name, RobotName>>,
 ) -> Vec<Located> {
-    run_checker(
-        workflow,
-        snapshot,
-        allowed,
-        binding,
-        Attendance::Attended,
-        &BTreeSet::new(),
-    )
-    .errors
+    run_checker(workflow, snapshot, allowed, binding, &BTreeSet::new()).errors
 }
 
 fn run_checker<'a>(
@@ -1236,7 +1240,6 @@ fn run_checker<'a>(
     snapshot: &'a Snapshot,
     allowed: &'a AllowedContracts,
     binding: Option<&'a BTreeMap<Name, RobotName>>,
-    attendance: Attendance,
     confirmed: &BTreeSet<Name>,
 ) -> Checker<'a> {
     let mut checker = Checker {
@@ -1254,7 +1257,7 @@ fn run_checker<'a>(
         locations: Vec::new(),
     };
     checker.check_contracts();
-    checker.check_binding(attendance, confirmed);
+    checker.check_binding(confirmed);
     checker.check_tables();
     checker.check_observations();
     checker.check_trees();
@@ -1276,14 +1279,14 @@ pub fn plan(
     binding: &BTreeMap<Name, RobotName>,
     choices: RunChoices<'_>,
 ) -> Result<Plan, Vec<Located>> {
-    let checker = run_checker(
+    let mut checker = run_checker(
         &workflow,
         snapshot,
         allowed,
         Some(binding),
-        choices.attendance,
         &choices.confirmed,
     );
+    checker.check_watch(&choices.watch);
     let mut errors = checker.errors.clone();
     let monitor = match choices.incidents {
         Incidents::None => None,
@@ -1344,6 +1347,8 @@ pub fn plan(
         locations: checker.locations,
         poll: choices.poll,
         cancel_timeout: choices.cancel_timeout,
+        watch: choices.watch,
+        of_a_trial: choices.of_a_trial,
         workflow,
     })
 }
@@ -1540,8 +1545,8 @@ fn skills_that_know_no_locations(workflow: &Workflow, role: &Name, robot: &Robot
 }
 
 /// Why `robot` cannot take `role`, none when it can: its software runs, it
-/// has no robot commander of its own, it is simulated when the run is
-/// unattended or its caller confirms assumptions, it implements each
+/// has no robot commander of its own, it is simulated when the caller of the
+/// run confirms assumptions, it implements each
 /// contract, each of its instances that serves a call of the role that
 /// gives a location implements locations:v1, and it reports the model of
 /// the role. A named role and an
@@ -1551,7 +1556,6 @@ pub fn misfits(
     snapshot: &Snapshot,
     role: &Name,
     robot: &Robot,
-    attendance: Attendance,
     confirmed: &BTreeSet<Name>,
 ) -> Vec<String> {
     let name = &robot.name;
@@ -1562,8 +1566,10 @@ pub fn misfits(
     if !robot.robot_commander.is_empty() {
         reasons.push(format!("`{name}` has the robot commander `{}`, which moves it outside the leases; bind a robot without one", robot.robot_commander));
     }
-    if robot.is_physical() && (attendance == Attendance::Unattended || !confirmed.is_empty()) {
-        reasons.push(format!("`{name}` is physical: an unattended run, or one whose caller confirms assumptions, binds only simulated robots"));
+    if robot.is_physical() && !confirmed.is_empty() {
+        reasons.push(format!(
+            "`{name}` is physical: a run whose caller confirms assumptions binds only simulated robots"
+        ));
     }
     for alias in aliases_of_role(workflow, role) {
         let Some(contract) = workflow.contracts.get(&alias) else {

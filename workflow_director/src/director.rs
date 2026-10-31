@@ -12,15 +12,16 @@ use std::sync::{Arc, Mutex};
 use peppygen::NodeRunner;
 use serde_json::{Value as Json, json};
 use tokio::sync::{broadcast, mpsc, watch};
-use workflow_documents::bundle::{Bundle, BundleFile};
+use workflow_documents::bundle::{BUNDLE_PATH, Bundle, BundleDocument, BundleFile, WORKFLOW_PATH};
 use workflow_documents::lock::{Lock, LockedNode, UNKNOWN_PEPPY};
 use workflow_documents::result::{
     Difference, DifferenceKind, Duration as RunDuration, Ending, RunRefusal, RunResult, RunWorkflow,
 };
-use workflow_documents::run::{RoleBinding, RunDocument, VersionPolicy};
+use workflow_documents::run::{Attendance, RoleBinding, RunDocument, VersionPolicy};
+use workflow_documents::work_cell::Uncovered;
 use workflow_documents::{
-    EventKind, KnownLocation, Located, Name, NameTag, RobotName, Run, Sha256, Workflow,
-    run_lease_name,
+    EventKind, KnownLocation, Located, Name, NameTag, RobotName, Run, Sha256, Validation, WorkCell,
+    Workflow, run_lease_name, uncovered_work_cell,
 };
 
 use crate::alerts;
@@ -28,13 +29,15 @@ use crate::checker::{self, RunChoices};
 use crate::clock::{self, ClockSource};
 use crate::config::Config;
 use crate::engine::host::{Event, Host};
-use crate::engine::plan::Plan;
-use crate::engine::{self, Phase, ResultBase, RunCommand};
+use crate::engine::plan::{Plan, Watch};
+use crate::engine::{self, Phase, ResultBase, RunCommand, outside_the_envelope};
 use crate::fleet::{self, Fleet, Snapshot};
 use crate::journal::{self, Journals, Record, wall_ns};
 use crate::leases::{LeaseEventKind, Leases};
 use crate::live::{LiveHost, RunClock};
 use crate::replay::{Planned, Recorded, journal_command};
+use crate::sign_off::{SignOff, SignOffRecord, SignOffs, refusal_of_no_record};
+use crate::trial::{TrialEntry, Trials, robots_of_trials};
 
 /// The caller of a run: the instance and the machine that sent its goal.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,43 +53,80 @@ pub struct RunRequest {
     pub bundle: Option<Vec<BundleFile>>,
     pub run_document: Option<String>,
     pub roles: Option<String>,
+    pub work_cell: Option<String>,
     pub started_by: String,
     pub caller_data: Option<String>,
+    /// The trial of a run of a trial, `t<N>`.
+    pub trial: Option<String>,
+}
+
+/// Where the workflow of a run comes from: its text, or a bundle.
+pub enum Source<'r> {
+    Workflow(&'r str),
+    Bundle(&'r [BundleFile]),
+}
+
+/// How a run binds its roles: by a run document, or by roles and a work
+/// cell block, each optional.
+pub enum Binding<'r> {
+    Document(&'r str),
+    Roles {
+        roles: Option<&'r str>,
+        work_cell: Option<&'r str>,
+    },
 }
 
 impl RunRequest {
-    /// Refuses a request that gives both a run document and roles, or
-    /// neither or both of a workflow and a bundle.
-    pub fn shape(&self) -> Result<(), String> {
-        if self.run_document.is_some() && self.roles.is_some() {
-            return Err("give a run_document or roles, not both".to_owned());
-        }
-        match (&self.workflow, &self.bundle) {
-            (Some(_), Some(_)) => Err("give a workflow or a bundle, not both".to_owned()),
-            (None, None) => Err("give a workflow or a bundle".to_owned()),
-            _ => Ok(()),
-        }
+    /// The source and the binding of the run. Refuses a request that gives
+    /// a run document with roles or with a work cell block, or neither or
+    /// both of a workflow and a bundle.
+    pub fn shape(&self) -> Result<(Source<'_>, Binding<'_>), String> {
+        let source = match (&self.workflow, &self.bundle) {
+            (Some(text), None) => Source::Workflow(text),
+            (None, Some(files)) => Source::Bundle(files),
+            (Some(_), Some(_)) => return Err("give a workflow or a bundle, not both".to_owned()),
+            (None, None) => return Err("give a workflow or a bundle".to_owned()),
+        };
+        let binding = match (&self.run_document, &self.roles, &self.work_cell) {
+            (Some(text), None, None) => Binding::Document(text),
+            (None, roles, work_cell) => Binding::Roles {
+                roles: roles.as_deref(),
+                work_cell: work_cell.as_deref(),
+            },
+            (Some(_), Some(_), _) => {
+                return Err("give a run_document or roles, not both".to_owned());
+            }
+            (Some(_), None, Some(_)) => {
+                return Err(
+                    "a run_document gives its own work_cell: give work_cell with roles".to_owned(),
+                );
+            }
+        };
+        Ok((source, binding))
     }
 }
 
 /// A run the director keeps: its workflow once it parsed, who started it,
-/// its robots once bound, where it stands and how to reach its engine.
+/// the trial of a run of a trial, its robots once bound, where it stands and
+/// how to reach its engine.
 pub struct RunEntry {
     pub workflow: Option<Arc<Workflow>>,
     pub started_by: String,
+    pub trial: Option<String>,
     pub robots: Vec<(Name, RobotName)>,
     pub phase: watch::Receiver<Phase>,
     pub commands: Option<mpsc::UnboundedSender<RunCommand>>,
 }
 
 /// What a member of the director reads of a run: where it stands, and the
-/// receiver that follows it, how to reach its engine while it goes, and its
-/// workflow once it parsed.
+/// receiver that follows it, how to reach its engine while it goes, its
+/// workflow once it parsed, and its trial.
 pub struct RunView {
     pub phase: Phase,
     pub phases: watch::Receiver<Phase>,
     pub commands: Option<mpsc::UnboundedSender<RunCommand>>,
     pub workflow: Option<Arc<Workflow>>,
+    pub trial: Option<String>,
 }
 
 /// The director.
@@ -96,6 +136,9 @@ pub struct Director {
     pub leases: Arc<Leases>,
     pub snapshots: watch::Receiver<Arc<Snapshot>>,
     pub journals: Journals,
+    pub sign_offs: SignOffs,
+    pub trial_records: Trials,
+    pub trials: Mutex<BTreeMap<String, TrialEntry>>,
     pub runs: Mutex<BTreeMap<String, RunEntry>>,
     /// The robots that a teach of their locations holds. Read under the
     /// lock of `runs`, so a run and a teach never hold one robot.
@@ -104,23 +147,28 @@ pub struct Director {
     pub clock: ClockSource,
 }
 
-/// What of this director holds a robot: another of its runs, or a teach of
-/// its locations.
+/// What of this director holds a robot: another of its runs, a teach of its
+/// locations, or a running trial.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Holder {
+pub enum Holder {
     Run(String),
     Teach,
+    Trial(String),
 }
 
 impl Holder {
-    /// Why a run does not bind `robot`, which this holds, and what to do.
-    fn why(&self, robot: &str) -> String {
+    /// Why a run or a trial does not bind `robot`, which this holds, and
+    /// what to do.
+    pub fn why(&self, robot: &str) -> String {
         match self {
             Holder::Run(run) => format!(
                 "`{robot}` takes part in run {run} of this director: wait for its end, or abort it"
             ),
             Holder::Teach => format!(
                 "`{robot}` is being taught its locations by this director: run again once the teach ends"
+            ),
+            Holder::Trial(trial) => format!(
+                "`{robot}` takes part in trial {trial} of this director: wait for its end, or cancel it"
             ),
         }
     }
@@ -158,11 +206,14 @@ impl Drop for TeachHold {
     }
 }
 
-/// What a run needs from its preparation.
+/// What a run needs from its preparation: its plan, the base of its result,
+/// the leases it took, the robots whose leases it uses (those it took, or
+/// those of its trial), the inputs of its plan and its fleet.
 struct Prepared {
     plan: Plan,
     base: ResultBase,
     taken: Vec<RobotName>,
+    leased: Vec<RobotName>,
     planned: Planned,
     snapshot: Snapshot,
 }
@@ -198,7 +249,7 @@ fn located(refusals: workflow_documents::Refusals) -> Vec<Located> {
 pub const EVENTS_KEPT: usize = 4096;
 
 /// What a run refused or ended by a halt of the stack tells its caller to do.
-const HALTED: &str = "the stack is halted; run `peppy fleet clear-halt`, then run again";
+pub const HALTED: &str = "the stack is halted; run `peppy fleet clear-halt`, then run again";
 
 impl Director {
     fn journal(&self, run: &str, run_ns: u64, kind: &str, body: Json) {
@@ -215,6 +266,7 @@ impl Director {
             phases: entry.phase.clone(),
             commands: entry.commands.clone(),
             workflow: entry.workflow.clone(),
+            trial: entry.trial.clone(),
         })
     }
 
@@ -231,7 +283,7 @@ impl Director {
 
     /// The instance and the machine of the director, as the daemon names a
     /// client.
-    fn me(&self) -> Caller {
+    pub fn me(&self) -> Caller {
         let processor = self.runner.processor();
         Caller {
             instance: processor.bound_instance_id().to_owned(),
@@ -323,9 +375,11 @@ impl Director {
             };
             let (_, phase) = watch::channel(Phase::Ended(Box::new(result)));
             let started_by = opened["started_by"].as_str().unwrap_or_default().to_owned();
+            let trial = opened["trial"].as_str().map(str::to_owned);
             let entry = RunEntry {
                 workflow,
                 started_by,
+                trial,
                 robots,
                 phase,
                 commands: None,
@@ -357,6 +411,7 @@ impl Director {
         let entry = RunEntry {
             workflow: None,
             started_by: request.started_by.clone(),
+            trial: request.trial.clone(),
             robots: Vec::new(),
             phase: phase_rx.clone(),
             commands: Some(commands_tx.clone()),
@@ -365,9 +420,11 @@ impl Director {
             .lock()
             .expect("no run panics holding the runs")
             .insert(run.clone(), entry);
+        let bundle = request.bundle.as_deref().map(journaled_bundle);
         let opened = json!({
-            "workflow": request.workflow, "bundle": request.bundle, "run_document": request.run_document,
-            "roles": request.roles, "started_by": request.started_by, "caller_data": request.caller_data,
+            "workflow": request.workflow, "bundle": bundle, "run_document": request.run_document,
+            "roles": request.roles, "work_cell": request.work_cell, "started_by": request.started_by,
+            "caller_data": request.caller_data, "trial": request.trial,
             "caller": { "instance": caller.instance, "core_node": caller.core_node },
         });
         self.journal(&run, 0, journal::OPENED, opened);
@@ -402,6 +459,7 @@ impl Director {
             plan,
             base,
             taken,
+            leased,
             mut planned,
             snapshot,
         } = prepared;
@@ -462,7 +520,7 @@ impl Director {
         planned.run_ns = host.now();
         planned.wall_ns = host.wall_now();
         self.journal(run, planned.run_ns, journal::PLANNED, json!(planned));
-        let stopper = self.follow_leases(run, &taken, commands_tx).await;
+        let stopper = self.follow_leases(run, &leased, commands_tx).await;
         let (engine_tx, engine_rx) = mpsc::unbounded_channel();
         let pass_on = |command: RunCommand, queued: bool| {
             let at = if queued { planned.run_ns } else { host.now() };
@@ -518,24 +576,26 @@ impl Director {
         result
     }
 
-    /// Follows the lease events and the halt for the robots of `run`: the
-    /// end of one of its leases, or a halt, stops the run; the end of a lease
-    /// in a halt stops it halted. A fresh listing first gives each lease that
-    /// ended between its take and this follow, and its stop reaches the
-    /// commands before the engine starts.
+    /// Follows the lease events and the halt for the robots of `run`, whose
+    /// leases are `leased`: the end of one of its leases, or a halt, stops
+    /// the run; the end of a lease in a halt stops it halted. A fresh listing
+    /// first gives each lease that ended between its take and this follow,
+    /// and its stop reaches the commands before the engine starts.
     async fn follow_leases(
         &self,
         run: &str,
-        taken: &[RobotName],
+        leased: &[RobotName],
         commands: mpsc::UnboundedSender<RunCommand>,
     ) -> tokio::task::JoinHandle<()> {
-        let mut events = self.leases.events();
-        let mut snapshots = self.snapshots.clone();
-        let runner = Arc::clone(&self.runner);
-        let robots: BTreeSet<String> = taken.iter().map(|r| r.to_string()).collect();
+        let mut follower = LeaseFollower {
+            events: self.leases.events(),
+            snapshots: self.snapshots.clone(),
+            runner: Arc::clone(&self.runner),
+            robots: leased.iter().map(|r| r.to_string()).collect(),
+        };
         match fleet::read_fleet(&self.runner).await {
             Ok(fleet) => {
-                if let Some(stop) = lost_leases(&fleet, &robots, &self.me()) {
+                if let Some(stop) = lost_leases(&fleet, &follower.robots, &self.me()) {
                     let _ = commands.send(stop);
                 }
             }
@@ -544,31 +604,8 @@ impl Director {
             }
         }
         tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    event = events.recv() => match event {
-                        Ok(event) if event.kind == LeaseEventKind::LeaseEnd && robots.contains(&event.robot) => {
-                            // The daemon ends every lease when it halts the stack, before the listing of the halt
-                            // reaches the follower of the fleet: a fresh listing tells a halt from a lost lease.
-                            let halted = fleet::read_fleet(&runner).await.is_ok_and(|fleet| fleet.halted);
-                            let reason = match halted {
-                                true => HALTED.to_owned(),
-                                false => format!("the lease of {} ended: {}", event.robot, event.cause),
-                            };
-                            let _ = commands.send(RunCommand::Stop { halted, reason });
-                        }
-                        Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                        Err(broadcast::error::RecvError::Closed) => return,
-                    },
-                    changed = snapshots.changed() => {
-                        if changed.is_err() {
-                            return;
-                        }
-                        if snapshots.borrow().fleet.halted {
-                            let _ = commands.send(RunCommand::Stop { halted: true, reason: HALTED.to_owned() });
-                        }
-                    }
-                }
+            while let Some(LeaseStop { halted, reason }) = follower.next_stop().await {
+                let _ = commands.send(RunCommand::Stop { halted, reason });
             }
         })
     }
@@ -581,21 +618,12 @@ impl Director {
         workflow: &Workflow,
         document: &RunDocument,
         snapshot: &Snapshot,
-        caller: &Caller,
-        me: &Caller,
+        parties: &Parties<'_>,
+        records: &[SignOffRecord],
     ) -> Result<BTreeMap<Name, RobotName>, Vec<Located>> {
         let mut runs = self.runs.lock().expect("no run panics holding the runs");
-        let teaching = self
-            .teaching
-            .lock()
-            .expect("no teach panics holding the robots it teaches")
-            .clone();
-        let held: BTreeMap<RobotName, Holder> = robots_of_runs(&runs, run)
-            .into_iter()
-            .map(|(robot, run)| (robot, Holder::Run(run)))
-            .chain(teaching.into_iter().map(|robot| (robot, Holder::Teach)))
-            .collect();
-        let binding = bind(workflow, document, snapshot, caller, me, &held)?;
+        let held = self.holders(&runs, run, parties.trial);
+        let binding = bind(workflow, document, snapshot, parties, &held, records)?;
         if let Some(entry) = runs.get_mut(run) {
             entry.robots = binding
                 .iter()
@@ -603,6 +631,40 @@ impl Director {
                 .collect();
         }
         Ok(binding)
+    }
+
+    /// The robots that the director holds, with what holds each: the runs
+    /// of `runs` other than `run` while they have not ended, the teaches,
+    /// and the trials other than `trial` that hold their robots
+    /// ([`robots_of_trials`]). The caller holds the lock of the runs, then
+    /// this takes those of the teaches and of the trials.
+    pub fn holders(
+        &self,
+        runs: &BTreeMap<String, RunEntry>,
+        run: &str,
+        trial: Option<&str>,
+    ) -> BTreeMap<RobotName, Holder> {
+        let teaching = self
+            .teaching
+            .lock()
+            .expect("no teach panics holding the robots it teaches")
+            .clone();
+        let of_trials: Vec<(RobotName, Holder)> = robots_of_trials(
+            &self
+                .trials
+                .lock()
+                .expect("no trial panics holding the trials"),
+            trial,
+        )
+        .into_iter()
+        .map(|(robot, trial)| (robot, Holder::Trial(trial)))
+        .collect();
+        robots_of_runs(runs, run)
+            .into_iter()
+            .map(|(robot, run)| (robot, Holder::Run(run)))
+            .chain(teaching.into_iter().map(|robot| (robot, Holder::Teach)))
+            .chain(of_trials)
+            .collect()
     }
 
     /// Lists the locations each skill of the run knows, into the journal,
@@ -731,6 +793,18 @@ impl Director {
         }
     }
 
+    /// The snapshot of the fresh fleet listing `fleet`, with the documents
+    /// and the models that the director knows already.
+    pub async fn snapshot_of_listing(&self, fleet: Fleet) -> Snapshot {
+        let (known, known_models) = {
+            let latest = self.snapshots.borrow();
+            (latest.contracts.clone(), latest.models.clone())
+        };
+        let mut snapshot = fleet::snapshot_of(&self.runner, fleet, &known).await;
+        snapshot.models = fleet::models_of(&self.runner, &snapshot, &known_models).await;
+        snapshot
+    }
+
     /// The workflow, the bundle and the run document of `request`, and
     /// the base of its run result.
     fn parse_run(
@@ -742,8 +816,11 @@ impl Director {
         let refuse = |base: RunResult, message: String, errors: Vec<Located>| {
             refusal_of(base, &message, errors, started)
         };
-        let (workflow, bundle) = match (&request.workflow, &request.bundle) {
-            (Some(text), None) => match Workflow::parse(text) {
+        let (source, binding) = request
+            .shape()
+            .map_err(|message| refuse(empty_result(), message, Vec::new()))?;
+        let (workflow, bundle) = match source {
+            Source::Workflow(text) => match Workflow::parse(text) {
                 Ok(workflow) => (workflow, None),
                 Err(refusals) => {
                     return Err(refuse(
@@ -753,7 +830,7 @@ impl Director {
                     ));
                 }
             },
-            (None, Some(files)) => match Bundle::open(files.clone()) {
+            Source::Bundle(files) => match Bundle::open(files.to_vec()) {
                 Ok(bundle) => (bundle.workflow.clone(), Some(bundle)),
                 Err(refusals) => {
                     return Err(refuse(
@@ -763,13 +840,6 @@ impl Director {
                     ));
                 }
             },
-            _ => {
-                return Err(refuse(
-                    empty_result(),
-                    "give a workflow or a bundle".to_owned(),
-                    Vec::new(),
-                ));
-            }
         };
         let workflow = Arc::new(workflow);
         self.update(run, |entry| entry.workflow = Some(Arc::clone(&workflow)));
@@ -779,35 +849,34 @@ impl Director {
             .caller_data
             .as_deref()
             .and_then(|text| parses(text).ok());
-        let document = match (&request.run_document, &request.roles) {
-            (Some(text), None) => RunDocument::parse(text).map_err(|refusals| {
+        let document = match binding {
+            Binding::Document(text) => RunDocument::parse(text).map_err(|refusals| {
                 refuse(
                     base.clone(),
                     "the run document does not parse".to_owned(),
                     located(refusals),
                 )
             })?,
-            (None, roles) => {
-                let named = match roles.as_deref().map(named_roles).transpose() {
+            Binding::Roles { roles, work_cell } => {
+                let named = match roles.map(named_roles).transpose() {
                     Ok(named) => named.unwrap_or_default(),
                     Err(reason) => {
                         return Err(refuse(base, format!("roles: {reason}"), Vec::new()));
                     }
                 };
-                RunDocument::of_roles(&workflow, named).map_err(|refusals| {
+                let work_cell = match work_cell.map(work_cell_of).transpose() {
+                    Ok(work_cell) => work_cell.unwrap_or_default(),
+                    Err(reason) => {
+                        return Err(refuse(base, format!("work_cell: {reason}"), Vec::new()));
+                    }
+                };
+                RunDocument::of_roles(&workflow, named, work_cell).map_err(|refusals| {
                     refuse(
                         base.clone(),
                         "the roles do not fit the workflow".to_owned(),
                         located(refusals),
                     )
                 })?
-            }
-            (Some(_), Some(_)) => {
-                return Err(refuse(
-                    base,
-                    "give a run_document or roles, not both".to_owned(),
-                    Vec::new(),
-                ));
             }
         };
         let run_document = Run::new(&workflow, document)
@@ -819,6 +888,15 @@ impl Director {
                 )
             })?
             .document;
+        base.work_cell = run_document.work_cell.clone();
+        let misfits = bundle_misfits(validation_of(bundle.as_ref()), &run_document);
+        if !misfits.is_empty() {
+            return Err(refuse(
+                base,
+                "the run does not fit its bundle".to_owned(),
+                misfits,
+            ));
+        }
         Ok(Box::new(ParsedRun {
             workflow,
             bundle,
@@ -870,23 +948,37 @@ impl Director {
         if fleet.halted {
             return Err(refuse(base, HALTED.to_owned(), Vec::new()));
         }
-        let (known, known_models) = {
-            let latest = self.snapshots.borrow();
-            (latest.contracts.clone(), latest.models.clone())
-        };
-        let mut snapshot = fleet::snapshot_of(&self.runner, fleet, &known).await;
-        snapshot.models = fleet::models_of(&self.runner, &snapshot, &known_models).await;
+        let snapshot = self.snapshot_of_listing(fleet).await;
         base.core_node = snapshot.fleet.core_node.clone();
         let me = self.me();
+        let digest = bundle.as_ref().map(digest_of);
+        let records = digest
+            .as_ref()
+            .map(|digest| self.sign_offs.of_bundle(digest))
+            .unwrap_or_default();
         let binding = self
-            .bind_and_reserve(run, &workflow, &run_document, &snapshot, caller, &me)
+            .bind_and_reserve(
+                run,
+                &workflow,
+                &run_document,
+                &snapshot,
+                &Parties {
+                    caller,
+                    me: &me,
+                    trial: request.trial.as_deref(),
+                },
+                &records,
+            )
             .map_err(|errors| refuse(base.clone(), "the roles do not bind".to_owned(), errors))?;
+        let validation = validation_of(bundle.as_ref());
         let choices = RunChoices {
             attendance: run_document.attendance,
             confirmed: run_document.confirmed.clone(),
             incidents: &run_document.incidents,
             poll: self.config.poll,
             cancel_timeout: self.config.cancel_timeout,
+            watch: Watch::of(&run_document, validation),
+            of_a_trial: request.trial.is_some(),
         };
         let plan = checker::plan(
             Arc::clone(&workflow),
@@ -905,6 +997,14 @@ impl Director {
         let nodes = run_nodes(&snapshot, &plan, &me);
         base.versions = versions(&snapshot, &plan, &nodes)
             .map_err(|message| refuse(base.clone(), message, Vec::new()))?;
+        let gated = plan.is_unattended_on_a_physical_robot();
+        if gated && run_document.versions == VersionPolicy::Warn {
+            return Err(refuse(
+                base,
+                WARN_ON_A_PHYSICAL_ROBOT.to_owned(),
+                Vec::new(),
+            ));
+        }
         if let Some(bundle) = &bundle {
             let (differences, unlocked) =
                 differences(&bundle.document.lock, &base.versions, &nodes);
@@ -921,8 +1021,35 @@ impl Director {
                 }
             }
         }
+        base.uncovered = uncovered_work_cell(validation, &run_document.work_cell);
+        if gated && let Some(message) = work_cell_unfit(bundle.as_ref(), &base.uncovered) {
+            if !base.uncovered.is_empty() {
+                self.run_event(run, EventKind::Uncovered, json!(base.uncovered));
+            }
+            return Err(refuse(base, message, Vec::new()));
+        }
+        // A run of a trial needs no sign-off record: the trial makes it.
+        if let (true, None, Some(digest)) = (gated, &request.trial, digest) {
+            let sign_off = SignOff::of_run(
+                digest,
+                &snapshot,
+                &binding,
+                &base.versions,
+                &run_document.incidents,
+            );
+            if let Some(message) = refusal_of_no_record(&records, &sign_off) {
+                return Err(refuse(base, message, Vec::new()));
+            }
+        }
+        let leased: Vec<RobotName> = binding.values().cloned().collect();
         let mut taken: Vec<RobotName> = Vec::new();
-        for robot in binding.values() {
+        // A run of a trial uses the leases of its trial, which hold the
+        // robots from one run to the next.
+        let to_take = match request.trial {
+            Some(_) => Vec::new(),
+            None => leased.clone(),
+        };
+        for robot in &to_take {
             if let Err(refused) = self.leases.take(robot.as_str(), &run_lease_name(run)).await {
                 for robot in &taken {
                     self.leases.release(robot.as_str()).await;
@@ -958,6 +1085,7 @@ impl Director {
             plan,
             base: ResultBase { result: base },
             taken,
+            leased,
             planned,
             snapshot,
         })
@@ -1021,6 +1149,52 @@ impl TeachHint<'_> {
     }
 }
 
+/// The end of a lease of a run or a trial, or a halt.
+pub struct LeaseStop {
+    pub halted: bool,
+    pub reason: String,
+}
+
+/// Follows the lease events and the halt for the robots `robots`, whose
+/// leases the director holds.
+pub struct LeaseFollower {
+    pub events: broadcast::Receiver<crate::leases::LeaseEvent>,
+    pub snapshots: watch::Receiver<Arc<Snapshot>>,
+    pub runner: Arc<NodeRunner>,
+    pub robots: BTreeSet<String>,
+}
+
+impl LeaseFollower {
+    /// The next end of a lease of the robots, or halt: the end of a lease in
+    /// a halt is the halt. None once the director stops.
+    pub async fn next_stop(&mut self) -> Option<LeaseStop> {
+        loop {
+            tokio::select! {
+                event = self.events.recv() => match event {
+                    Ok(event) if event.kind == LeaseEventKind::LeaseEnd && self.robots.contains(&event.robot) => {
+                        // The daemon ends every lease when it halts the stack, before the listing of the halt
+                        // reaches the follower of the fleet: a fresh listing tells a halt from a lost lease.
+                        let halted = fleet::read_fleet(&self.runner).await.is_ok_and(|fleet| fleet.halted);
+                        let reason = match halted {
+                            true => HALTED.to_owned(),
+                            false => format!("the lease of {} ended: {}", event.robot, event.cause),
+                        };
+                        return Some(LeaseStop { halted, reason });
+                    }
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => return None,
+                },
+                changed = self.snapshots.changed() => {
+                    changed.ok()?;
+                    if self.snapshots.borrow().fleet.halted {
+                        return Some(LeaseStop { halted: true, reason: HALTED.to_owned() });
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// The stop of a run whose robots `robots` the fleet listing gives halted,
 /// or not leased by `me`, the director.
 fn lost_leases(fleet: &Fleet, robots: &BTreeSet<String>, me: &Caller) -> Option<RunCommand> {
@@ -1044,15 +1218,50 @@ fn lost_leases(fleet: &Fleet, robots: &BTreeSet<String>, me: &Caller) -> Option<
 /// The workflow a journal opened with: its text, or the workflow of its
 /// bundle.
 pub fn workflow_of(opened: &Json) -> Result<Workflow, String> {
-    if let Some(text) = opened["workflow"].as_str() {
-        return Workflow::parse(text)
-            .map_err(|refusals| format!("the workflow of the journal does not parse: {refusals}"));
+    let text = match opened["workflow"].as_str() {
+        Some(text) => text.to_owned(),
+        None => journaled_text(opened, WORKFLOW_PATH)?
+            .ok_or_else(|| "the journal opened with no workflow and no bundle".to_owned())?,
+    };
+    Workflow::parse(&text)
+        .map_err(|refusals| format!("the workflow of the journal does not parse: {refusals}"))
+}
+
+/// The bundle document a journal opened with, when it gave a bundle.
+pub fn bundle_document_of(opened: &Json) -> Result<Option<BundleDocument>, String> {
+    let Some(text) = journaled_text(opened, BUNDLE_PATH)? else {
+        return Ok(None);
+    };
+    BundleDocument::parse(&text).map(Some).map_err(|refusals| {
+        format!("the bundle document of the journal does not parse: {refusals}")
+    })
+}
+
+/// The documents of `bundle` that the journal of a run keeps: the bundle
+/// document and the workflow, which the director parses. The bundle
+/// document names each other file by its digest, and a file of `files/`,
+/// such as the report of a sweep with the journal of each of its runs, can
+/// be large.
+fn journaled_bundle(bundle: &[BundleFile]) -> Vec<&BundleFile> {
+    bundle
+        .iter()
+        .filter(|file| file.path == BUNDLE_PATH || file.path == WORKFLOW_PATH)
+        .collect()
+}
+
+/// The text of the document at `path` of the bundle a journal opened with;
+/// none for a journal that opened with no bundle.
+fn journaled_text(opened: &Json, path: &str) -> Result<Option<String>, String> {
+    if opened["bundle"].is_null() {
+        return Ok(None);
     }
     let files: Vec<BundleFile> = serde_json::from_value(opened["bundle"].clone())
         .map_err(|e| format!("the bundle of the journal: {e}"))?;
-    Bundle::open(files)
-        .map(|bundle| bundle.workflow)
-        .map_err(|refusals| format!("the bundle of the journal does not open: {refusals}"))
+    files
+        .into_iter()
+        .find(|file| file.path == path)
+        .map(|file| Some(file.content))
+        .ok_or_else(|| format!("the bundle of the journal has no `{path}`"))
 }
 
 /// Whether a run reads the simulation clock `domain` of the director:
@@ -1071,6 +1280,39 @@ pub fn parses(text: &str) -> Result<Json, String> {
     workflow_documents::parse(text).map_err(|e| e.to_string())
 }
 
+/// The work cell block of a run made from roles, from its JSON5 text.
+fn work_cell_of(text: &str) -> Result<WorkCell, String> {
+    serde_json::from_value(parses(text)?).map_err(|e| e.to_string())
+}
+
+/// The validation of `bundle`, when it has one.
+fn validation_of(bundle: Option<&Bundle>) -> Option<&Validation> {
+    bundle.and_then(|bundle| bundle.document.validation.as_ref())
+}
+
+/// What of a run does not fit the validation of its bundle: each value of
+/// its work cell block of another shape than its parameter, or of a watch
+/// parameter, and each of its own watch parameters that the bundle names,
+/// whose value the director reads by the parameter of the bundle.
+fn bundle_misfits(validation: Option<&Validation>, document: &RunDocument) -> Vec<Located> {
+    let Some(validation) = validation else {
+        return Vec::new();
+    };
+    let work_cell = validation
+        .work_cell_refusals("work_cell", &document.work_cell)
+        .into_iter()
+        .map(|refusal| refusal.located());
+    let watch = document
+        .watch
+        .keys()
+        .filter(|name| validation.work_cell_parameters.contains_key(*name))
+        .map(|name| Located {
+            at: format!("watch.{name}"),
+            message: "is a parameter of the bundle, which the director reads by the bundle; name the watch parameter of the run another way".to_owned(),
+        });
+    work_cell.chain(watch).collect()
+}
+
 /// The roles a run names: a JSON5 map of each role to a robot name or
 /// `"auto"`; a role it leaves out binds `"auto"` too.
 fn named_roles(text: &str) -> Result<BTreeMap<Name, RobotName>, String> {
@@ -1083,6 +1325,34 @@ fn named_roles(text: &str) -> Result<BTreeMap<Name, RobotName>, String> {
             RoleBinding::Auto => None,
         })
         .collect())
+}
+
+/// What a run of an unattended run on a physical robot whose run document
+/// gives `versions: "warn"` is told.
+const WARN_ON_A_PHYSICAL_ROBOT: &str = "an unattended run on a physical robot runs only on a stack that matches the lock of its bundle: give its run document `versions: \"refuse\"`, or no `versions`";
+
+/// The digest of `bundle`, without its trials.
+pub fn digest_of(bundle: &Bundle) -> Sha256 {
+    Sha256::parse(&bundle.document.digest().to_string())
+        .expect("a digest is 64 lowercase hex digits")
+}
+
+/// Why the work cell of an unattended run on a physical robot does not fit
+/// its bundle, given the values `uncovered` that no test covered: the run
+/// has no bundle, its bundle has no envelope, or a value is missing or
+/// outside the envelope. None when it fits.
+fn work_cell_unfit(bundle: Option<&Bundle>, uncovered: &[Uncovered]) -> Option<String> {
+    let Some(bundle) = bundle else {
+        return Some("an unattended run on a physical robot runs the bundle of a signed-off sweep, inside its envelope: give the bundle in place of the workflow".to_owned());
+    };
+    if bundle.document.validation.is_none() {
+        return Some("the bundle has no envelope: an unattended run on a physical robot runs only the bundle of a signed-off sweep".to_owned());
+    }
+    if uncovered.is_empty() {
+        return None;
+    }
+    let uncovered: Vec<&Uncovered> = uncovered.iter().collect();
+    Some(outside_the_envelope(&uncovered))
 }
 
 /// Why a run of `caller` does not bind `robot`, which `lease` holds: a
@@ -1100,25 +1370,53 @@ fn leased_by(robot: &str, lease: &fleet::Lease, caller: &Caller) -> String {
     }
 }
 
-/// The roles of a run bound to robots: the named roles first, then each
-/// `"auto"` role in name order to the first fitting robot in name order.
-/// `held` gives each robot that another run or a teach of the director
+/// Who a binding is for: the caller of the run, the director, to which the
+/// caller offers its leases, and the trial of a run of a trial, whose leases
+/// the director holds for its runs.
+#[derive(Clone, Copy)]
+struct Parties<'p> {
+    caller: &'p Caller,
+    me: &'p Caller,
+    trial: Option<&'p str>,
+}
+
+/// The name of the leases that a trial `trial` takes.
+pub fn trial_lease_name(trial: &str) -> String {
+    format!("trial {trial}")
+}
+
+/// The roles of a run bound to robots: the named roles first, then the
+/// `"auto"` roles. In an unattended run, the `"auto"` roles take the robots
+/// of the first record of `records` (the sign-off records of the bundle of
+/// the run, in their order) whose binding agrees with the named roles and
+/// whose robots are all present and free by the rule of `"auto"`; with no
+/// such record, and in an attended run, each `"auto"` role in name order
+/// takes the first fitting robot in name order, simulated in an unattended
+/// run. `held` gives each robot that another run or a teach of the director
 /// holds.
 fn bind(
     workflow: &Workflow,
     document: &RunDocument,
     snapshot: &Snapshot,
-    caller: &Caller,
-    me: &Caller,
+    parties: &Parties<'_>,
     held: &BTreeMap<RobotName, Holder>,
+    records: &[SignOffRecord],
 ) -> Result<BTreeMap<Name, RobotName>, Vec<Located>> {
+    let Parties { caller, me, trial } = *parties;
     let fleet = &snapshot.fleet;
+    let of_the_trial = trial.map(trial_lease_name);
     let offered: BTreeSet<&str> = fleet
         .leases
         .iter()
-        .filter(|lease| lease.receiver == me.instance && lease.receiver_core_node == me.core_node)
         .filter(|lease| {
-            lease.holder == caller.instance && lease.holder_core_node == caller.core_node
+            let offered_by_the_caller = lease.receiver == me.instance
+                && lease.receiver_core_node == me.core_node
+                && lease.holder == caller.instance
+                && lease.holder_core_node == caller.core_node;
+            let held_for_the_trial = lease.holder == me.instance
+                && lease.holder_core_node == me.core_node
+                && Some(&lease.name) == of_the_trial.as_ref();
+            offered_by_the_caller || held_for_the_trial
         })
         .map(|lease| lease.robot.as_str())
         .collect();
@@ -1147,45 +1445,85 @@ fn bind(
         }
         binding.insert(role.clone(), robot.clone());
     }
-    for (role, bound) in &document.roles {
-        if *bound != RoleBinding::Auto {
-            continue;
+    let autos: Vec<&Name> = document
+        .roles
+        .iter()
+        .filter(|(_, bound)| **bound == RoleBinding::Auto)
+        .map(|(role, _)| role)
+        .collect();
+    // The first reason `robot` cannot take `role` by the rule of `"auto"`,
+    // none when it can, with the robots `taken` by other roles.
+    let free = |role: &Name, robot: &fleet::Robot, taken: &BTreeSet<&str>| -> Option<String> {
+        let name = &robot.name;
+        if taken.contains(name.as_str()) {
+            return Some(format!("`{name}` takes another role of the run"));
         }
+        if let Some(holder) = RobotName::parse(name)
+            .ok()
+            .and_then(|robot| held.get(&robot))
+        {
+            return Some(holder.why(name));
+        }
+        match offered.is_empty() {
+            true => {
+                if let Some(lease) = fleet.lease_of(name) {
+                    return Some(leased_by(name, lease, caller));
+                }
+            }
+            false => {
+                if !offered.contains(name.as_str()) {
+                    return Some(format!("the caller offered `{name}` no lease"));
+                }
+            }
+        }
+        checker::misfits(workflow, snapshot, role, robot, &document.confirmed)
+            .into_iter()
+            .next()
+    };
+    let unattended = document.attendance == Attendance::Unattended;
+    let by_record = (unattended && !autos.is_empty()).then(|| {
+        let taken: BTreeSet<&str> = binding.values().map(RobotName::as_str).collect();
+        let fits = |record: &&SignOffRecord| {
+            let binds = &record.sign_off.binding;
+            let agrees = document.roles.iter().all(|(role, bound)| match bound {
+                RoleBinding::Robot(robot) => binds.get(role).is_some_and(|b| b.name == *robot),
+                RoleBinding::Auto => binds.contains_key(role),
+            });
+            agrees
+                && autos.iter().all(|role| {
+                    let robot = binds[*role].name.as_str();
+                    fleet
+                        .robots
+                        .get(robot)
+                        .is_some_and(|robot| free(role, robot, &taken).is_none())
+                })
+        };
+        records.iter().find(fits).map(|record| {
+            autos
+                .iter()
+                .map(|role| ((*role).clone(), record.sign_off.binding[*role].name.clone()))
+                .collect::<Vec<_>>()
+        })
+    });
+    // The roles that the robots of a record do not bind, each to its own robot.
+    let one_by_one = match by_record.flatten() {
+        Some(bound) => {
+            binding.extend(bound);
+            Vec::new()
+        }
+        None => autos,
+    };
+    for role in one_by_one {
         let taken: BTreeSet<&str> = binding.values().map(RobotName::as_str).collect();
         // The first reason `robot` cannot take the role, none when it can.
         let why_not = |robot: &fleet::Robot| -> Option<String> {
-            let name = &robot.name;
-            if taken.contains(name.as_str()) {
-                return Some(format!("`{name}` takes another role of the run"));
+            if unattended && robot.is_physical() {
+                return Some(format!(
+                    "`{}` is physical: in an unattended run, \"auto\" binds a physical robot only as a sign-off record of the bundle binds it",
+                    robot.name
+                ));
             }
-            if let Some(holder) = RobotName::parse(name)
-                .ok()
-                .and_then(|robot| held.get(&robot))
-            {
-                return Some(holder.why(name));
-            }
-            match offered.is_empty() {
-                true => {
-                    if let Some(lease) = fleet.lease_of(name) {
-                        return Some(leased_by(name, lease, caller));
-                    }
-                }
-                false => {
-                    if !offered.contains(name.as_str()) {
-                        return Some(format!("the caller offered `{name}` no lease"));
-                    }
-                }
-            }
-            checker::misfits(
-                workflow,
-                snapshot,
-                role,
-                robot,
-                document.attendance,
-                &document.confirmed,
-            )
-            .into_iter()
-            .next()
+            free(role, robot, &taken)
         };
         match fleet.robots.values().find(|robot| why_not(robot).is_none()) {
             Some(robot) => {
@@ -1220,7 +1558,7 @@ const LIMB_STATE: (&str, &str) = ("limb_state", "v1");
 /// run calls it, and whether each call it serves is of a role bound to a
 /// fleet entry with no limbs.
 #[derive(Clone, Debug, PartialEq)]
-struct RunNode {
+pub struct RunNode {
     name: NameTag,
     locked: LockedNode,
     called: bool,
@@ -1229,7 +1567,7 @@ struct RunNode {
 
 /// The nodes a run uses: the director, the anomaly monitor and each node of
 /// the copy of each robot it binds.
-fn run_nodes(snapshot: &Snapshot, plan: &Plan, me: &Caller) -> Vec<RunNode> {
+pub fn run_nodes(snapshot: &Snapshot, plan: &Plan, me: &Caller) -> Vec<RunNode> {
     let fleet = &snapshot.fleet;
     let robots: BTreeSet<&str> = plan
         .roles
@@ -1301,7 +1639,7 @@ fn run_nodes(snapshot: &Snapshot, plan: &Plan, me: &Caller) -> Vec<RunNode> {
 /// robot; so does a contract that the run reads at two shas, naming the
 /// robot when both reads are of one robot, else the robots of the run; and
 /// a pin of the listing that does not read.
-fn versions(snapshot: &Snapshot, plan: &Plan, nodes: &[RunNode]) -> Result<Lock, String> {
+pub fn versions(snapshot: &Snapshot, plan: &Plan, nodes: &[RunNode]) -> Result<Lock, String> {
     let targets = plan
         .calls
         .values()
@@ -1412,7 +1750,11 @@ fn under_the_policy(
 
 /// The differences of a run from the lock of its bundle, and the nodes it
 /// uses that the lock does not name and that no `call` step calls.
-fn differences(lock: &Lock, stack: &Lock, nodes: &[RunNode]) -> (Vec<Difference>, Vec<NameTag>) {
+pub fn differences(
+    lock: &Lock,
+    stack: &Lock,
+    nodes: &[RunNode],
+) -> (Vec<Difference>, Vec<NameTag>) {
     let difference =
         |kind: DifferenceKind, subject: String, locked: Option<String>, stack: Option<String>| {
             Difference {
@@ -1511,6 +1853,9 @@ pub fn empty_result() -> RunResult {
         differences: Vec::new(),
         unlocked_nodes: Vec::new(),
         incidents: Vec::new(),
+        work_cell: WorkCell::new(),
+        watch: BTreeMap::new(),
+        uncovered: Vec::new(),
     }
 }
 
@@ -1598,17 +1943,96 @@ mod tests {
     ) -> Result<BTreeMap<Name, RobotName>, Vec<String>> {
         let workflow = workflow(&rest());
         let named: BTreeMap<Name, RobotName> = serde_json::from_value(roles).unwrap();
-        let mut document = RunDocument::of_roles(&workflow, named).unwrap();
+        let mut document = RunDocument::of_roles(&workflow, named, WorkCell::new()).unwrap();
         document.attendance = attendance;
         bind(
             &workflow,
             &document,
             fleet,
-            &chat(),
-            &me(),
+            &Parties {
+                caller: &chat(),
+                me: &me(),
+                trial: None,
+            },
             &BTreeMap::new(),
+            &[],
         )
         .map_err(|errors| errors.into_iter().map(|e| e.message).collect())
+    }
+
+    /// A request of a run with no workflow source, a run document with roles or with a work cell block, has no
+    /// shape, each named.
+    #[test]
+    fn a_run_document_goes_with_neither_roles_nor_a_work_cell() {
+        let request = RunRequest {
+            workflow: Some("{}".to_owned()),
+            bundle: None,
+            run_document: Some("{}".to_owned()),
+            roles: None,
+            work_cell: None,
+            started_by: String::new(),
+            caller_data: None,
+            trial: None,
+        };
+        assert!(request.shape().is_ok());
+        let refused = |request: RunRequest| request.shape().err().unwrap_or_default();
+        assert_eq!(
+            refused(RunRequest {
+                roles: Some("{}".to_owned()),
+                ..request.clone()
+            }),
+            "give a run_document or roles, not both"
+        );
+        assert_eq!(
+            refused(RunRequest {
+                work_cell: Some("{}".to_owned()),
+                ..request.clone()
+            }),
+            "a run_document gives its own work_cell: give work_cell with roles"
+        );
+        assert_eq!(
+            refused(RunRequest {
+                workflow: None,
+                ..request
+            }),
+            "give a workflow or a bundle"
+        );
+    }
+
+    /// A value of the work cell of another shape than its parameter in the bundle, and a watch parameter of the run
+    /// that the bundle names, do not fit the bundle; with no bundle, nothing misfits.
+    #[test]
+    fn a_work_cell_of_another_shape_or_a_watch_the_bundle_names_does_not_fit_the_bundle() {
+        let validation = crate::testing::validation(
+            json!({
+                "belt_speed_mps": { "unit": "m/s", "kind": "control" },
+                "loose": { "unit": "items", "kind": "watch", "observation": "target.count" },
+            }),
+            json!({ "belt_speed_mps": [0.05, 0.25], "loose": [0, 3] }),
+        );
+        let workflow = workflow(&rest());
+        let mut document = RunDocument::of_roles(
+            &workflow,
+            BTreeMap::new(),
+            serde_json::from_value(json!({ "belt_speed_mps": { "arm": 0.2 } })).unwrap(),
+        )
+        .unwrap();
+        document.watch = serde_json::from_value(
+            json!({ "loose": { "unit": "items", "observation": "target.count" } }),
+        )
+        .unwrap();
+        let found: Vec<String> = bundle_misfits(Some(&validation), &document)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            found,
+            [
+                "work_cell.belt_speed_mps: has one value in the bundle; give one value, not a value per role",
+                "watch.loose: is a parameter of the bundle, which the director reads by the bundle; name the watch parameter of the run another way",
+            ]
+        );
+        assert!(bundle_misfits(None, &document).is_empty());
     }
 
     #[test]
@@ -1660,14 +2084,18 @@ mod tests {
             .contracts
             .retain(|contract| contract.name != "locations");
         let fleet = snapshot(vec![unknowing, robot("baker")]);
-        let document = RunDocument::of_roles(&workflow, BTreeMap::new()).unwrap();
+        let document = RunDocument::of_roles(&workflow, BTreeMap::new(), WorkCell::new()).unwrap();
         let binding = bind(
             &workflow,
             &document,
             &fleet,
-            &chat(),
-            &me(),
+            &Parties {
+                caller: &chat(),
+                me: &me(),
+                trial: None,
+            },
             &BTreeMap::new(),
+            &[],
         )
         .unwrap();
         assert_eq!(binding[&name("arm")], robot_name("baker"));
@@ -1698,16 +2126,21 @@ mod tests {
         physical.kind = "physical".to_owned();
         let fleet = snapshot(vec![physical, robot("baker")]);
         let workflow = workflow(&rest());
-        let mut document = RunDocument::of_roles(&workflow, BTreeMap::new()).unwrap();
+        let mut document =
+            RunDocument::of_roles(&workflow, BTreeMap::new(), WorkCell::new()).unwrap();
         document.attendance = Attendance::Attended;
         document.confirmed = [name("clear")].into();
         let binding = bind(
             &workflow,
             &document,
             &fleet,
-            &chat(),
-            &me(),
+            &Parties {
+                caller: &chat(),
+                me: &me(),
+                trial: None,
+            },
             &BTreeMap::new(),
+            &[],
         )
         .unwrap();
         assert_eq!(binding[&name("arm")], robot_name("baker"));
@@ -1752,15 +2185,24 @@ mod tests {
         let workflow = workflow(&rest());
         let elsewhere = BTreeMap::from([(robot_name("alpha"), Holder::Run("r1".to_owned()))]);
         let document = |roles: serde_json::Value| {
-            RunDocument::of_roles(&workflow, serde_json::from_value(roles).unwrap()).unwrap()
+            RunDocument::of_roles(
+                &workflow,
+                serde_json::from_value(roles).unwrap(),
+                WorkCell::new(),
+            )
+            .unwrap()
         };
         let named = bind(
             &workflow,
             &document(json!({ "arm": "alpha" })),
             &fleet,
-            &chat(),
-            &me(),
+            &Parties {
+                caller: &chat(),
+                me: &me(),
+                trial: None,
+            },
             &elsewhere,
+            &[],
         );
         let held = "`alpha` takes part in run r1 of this director: wait for its end, or abort it";
         assert_eq!(
@@ -1775,9 +2217,13 @@ mod tests {
                 &workflow,
                 &document(json!({})),
                 &fleet,
-                &chat(),
-                &me(),
-                &elsewhere
+                &Parties {
+                    caller: &chat(),
+                    me: &me(),
+                    trial: None,
+                },
+                &elsewhere,
+                &[],
             )
             .is_err()
         );
@@ -1786,13 +2232,194 @@ mod tests {
             &workflow,
             &document(json!({ "arm": "alpha" })),
             &fleet,
-            &chat(),
-            &me(),
+            &Parties {
+                caller: &chat(),
+                me: &me(),
+                trial: None,
+            },
             &taught,
+            &[],
         );
         assert_eq!(
             teaching.unwrap_err()[0].message,
             "`alpha` is being taught its locations by this director: run again once the teach ends"
+        );
+    }
+
+    /// A physical robot named `name`, with the contracts of the tests.
+    fn physical(name: &str) -> crate::fleet::Robot {
+        let mut robot = robot(name);
+        robot.kind = "physical".to_owned();
+        robot
+    }
+
+    /// The binding of the roles of an unattended run of `value` that names
+    /// the robots `named`, on `fleet`, with the sign-off records `records`.
+    fn bound_by_records(
+        value: &serde_json::Value,
+        named: serde_json::Value,
+        fleet: &Snapshot,
+        records: &[SignOffRecord],
+    ) -> Result<BTreeMap<Name, RobotName>, Vec<Located>> {
+        let workflow = workflow(value);
+        let mut document = RunDocument::of_roles(
+            &workflow,
+            serde_json::from_value(named).unwrap(),
+            WorkCell::new(),
+        )
+        .unwrap();
+        document.attendance = Attendance::Unattended;
+        bind(
+            &workflow,
+            &document,
+            fleet,
+            &Parties {
+                caller: &chat(),
+                me: &me(),
+                trial: None,
+            },
+            &BTreeMap::new(),
+            records,
+        )
+    }
+
+    /// In an unattended run, `"auto"` binds a physical robot as the first
+    /// sign-off record that fits binds it, in the order of their robots; a
+    /// lease of a robot of the first gives the binding of the second, and
+    /// with no record that fits, `"auto"` binds only a simulated robot.
+    #[test]
+    fn auto_binds_physical_robots_only_as_the_first_record_that_fits_binds_them() {
+        use crate::sign_off::tests::record;
+        let mut fleet = snapshot(vec![physical("arm_a"), physical("arm_b"), robot("sim")]);
+        let records = [
+            record("t2", &[("arm", "arm_a")]),
+            record("t1", &[("arm", "arm_b")]),
+        ];
+        let arm = |fleet: &Snapshot, records: &[SignOffRecord]| {
+            bound_by_records(&rest(), json!({}), fleet, records).unwrap()[&name("arm")].clone()
+        };
+        assert_eq!(arm(&fleet, &records), robot_name("arm_a"));
+        assert_eq!(
+            arm(&fleet, &records),
+            arm(&fleet, &records),
+            "the same listing and records give the same binding"
+        );
+        fleet.fleet.leases.push(lease("arm_a", &chat(), None));
+        assert_eq!(arm(&fleet, &records), robot_name("arm_b"));
+        fleet.fleet.leases.push(lease("arm_b", &chat(), None));
+        assert_eq!(arm(&fleet, &records), robot_name("sim"));
+        assert_eq!(
+            arm(&snapshot(vec![physical("arm_a"), robot("sim")]), &[]),
+            robot_name("sim")
+        );
+    }
+
+    /// A record binds the `"auto"` roles only when its binding agrees with
+    /// the named roles; with none that agrees, an `"auto"` role takes a
+    /// simulated robot, and with none either, the refusal names why each
+    /// physical robot does not fit.
+    #[test]
+    fn a_record_binds_the_auto_roles_only_when_it_agrees_with_the_named_roles() {
+        use crate::sign_off::tests::record;
+        let mut value = rest();
+        value["roles"] = json!({ "arm": {}, "helper": {} });
+        value["actions"]["helper"] = value["actions"]["arm"].clone();
+        let fleet = snapshot(vec![
+            physical("arm_a"),
+            physical("arm_b"),
+            physical("arm_c"),
+        ]);
+        let records = [
+            record("t1", &[("arm", "arm_a"), ("helper", "arm_b")]),
+            record("t2", &[("arm", "arm_c"), ("helper", "arm_a")]),
+        ];
+        let bound = bound_by_records(&value, json!({ "arm": "arm_c" }), &fleet, &records).unwrap();
+        assert_eq!(bound[&name("helper")], robot_name("arm_a"));
+        let refused =
+            bound_by_records(&value, json!({ "arm": "arm_b" }), &fleet, &records).unwrap_err();
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(
+            refused[0].message.contains(
+                "`arm_a` is physical: in an unattended run, \"auto\" binds a physical robot only as a sign-off record of the bundle binds it"
+            ),
+            "{refused:?}"
+        );
+    }
+
+    /// The journal of a run of a bundle keeps the bundle document and the
+    /// workflow, which the director parses, and no file of `files/`, which
+    /// the bundle document names by its digest: the workflow and the
+    /// envelope read back from it.
+    #[test]
+    fn the_journal_of_a_run_of_a_bundle_keeps_only_the_documents_the_director_parses() {
+        let workflow = workflow(&rest());
+        let validation = crate::testing::validation(
+            json!({ "belt_speed_mps": { "unit": "m/s", "kind": "control" } }),
+            json!({ "belt_speed_mps": [0.05, 0.25] }),
+        );
+        let report = BundleFile {
+            path: "files/sweep.report.json5".to_owned(),
+            content: "{ runs: [\"the journal of each run of the sweep\"] }".to_owned(),
+        };
+        let files =
+            Bundle::write_signed_off(&workflow, vec![report], Lock::default(), validation.clone())
+                .unwrap();
+        let opened = json!({ "workflow": null, "bundle": journaled_bundle(&files) });
+        let paths: Vec<&str> = opened["bundle"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|file| file["path"].as_str())
+            .collect();
+        assert_eq!(paths.len(), 2, "{paths:?}");
+        assert!(paths.contains(&BUNDLE_PATH) && paths.contains(&WORKFLOW_PATH));
+        assert_eq!(workflow_of(&opened).unwrap(), workflow);
+        assert_eq!(
+            bundle_document_of(&opened).unwrap().unwrap().validation,
+            Some(validation)
+        );
+        let without = json!({ "workflow": null, "bundle": null });
+        assert_eq!(bundle_document_of(&without).unwrap(), None);
+        assert!(workflow_of(&without).is_err());
+    }
+
+    /// The work cell of an unattended run on a physical robot fits only a
+    /// bundle with an envelope, each value inside it, and each refusal names
+    /// its cause.
+    #[test]
+    fn the_work_cell_of_an_unattended_run_on_a_physical_robot_fits_only_inside_an_envelope() {
+        let workflow = workflow(&rest());
+        let validation = crate::testing::validation(
+            json!({ "belt_speed_mps": { "unit": "m/s", "kind": "control" } }),
+            json!({ "belt_speed_mps": [0.05, 0.25] }),
+        );
+        let lock = Lock::default();
+        let open = |validation: Option<workflow_documents::Validation>| {
+            let files = match validation {
+                Some(validation) => {
+                    Bundle::write_signed_off(&workflow, Vec::new(), lock.clone(), validation)
+                }
+                None => Bundle::write(&workflow, Vec::new(), lock.clone()),
+            };
+            Bundle::open(files.unwrap()).unwrap()
+        };
+        assert!(
+            work_cell_unfit(None, &[])
+                .unwrap()
+                .contains("give the bundle in place of the workflow")
+        );
+        assert!(
+            work_cell_unfit(Some(&open(None)), &[])
+                .unwrap()
+                .starts_with("the bundle has no envelope")
+        );
+        let with_envelope = open(Some(validation.clone()));
+        assert_eq!(work_cell_unfit(Some(&with_envelope), &[]), None);
+        let outside: WorkCell = serde_json::from_value(json!({ "belt_speed_mps": 0.3 })).unwrap();
+        let uncovered = uncovered_work_cell(Some(&validation), &outside);
+        assert_eq!(
+            work_cell_unfit(Some(&with_envelope), &uncovered).unwrap(),
+            "an unattended run on a physical robot runs inside the envelope of its bundle, and no test covered `belt_speed_mps` is 0.3, outside the tested range [0.05, 0.25]"
         );
     }
 

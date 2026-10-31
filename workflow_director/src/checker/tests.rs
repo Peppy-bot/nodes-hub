@@ -12,6 +12,7 @@ use workflow_documents::{Name, RobotName};
 use super::{RunChoices, check, plan};
 use crate::contract::ContractShape;
 use crate::contract::tests::TEST_ARM;
+use crate::engine::plan::Watch;
 use crate::fleet::{Instance, Robot, Snapshot};
 use crate::testing::{ARM_PIN, allowed, name, one_arm, robot, robot_name, snapshot, workflow};
 
@@ -58,12 +59,25 @@ fn refuses(found: &[String], part: &str) {
 
 /// The errors of the plan of a run of `attendance` on `robots`.
 fn plan_errors(value: &Json, robots: Vec<Robot>, attendance: Attendance) -> Vec<String> {
+    plan_errors_watching(value, robots, attendance, Watch::default())
+}
+
+/// The errors of the plan of a run of `attendance` on `robots` that reads
+/// the watch parameters of `watch`.
+fn plan_errors_watching(
+    value: &Json,
+    robots: Vec<Robot>,
+    attendance: Attendance,
+    watch: Watch,
+) -> Vec<String> {
     let choices = RunChoices {
         attendance,
         confirmed: Default::default(),
         incidents: &Incidents::None,
         poll: workflow_documents::Bound::from_seconds(0.5).unwrap(),
         cancel_timeout: Duration::from_secs(10),
+        watch,
+        of_a_trial: false,
     };
     match plan(
         Arc::new(workflow(value)),
@@ -273,9 +287,10 @@ fn the_binding_refuses_each_robot_that_cannot_take_the_role() {
         change(&mut robot);
         plan_errors(&picker(), vec![robot], Attendance::Unattended)
     };
-    refuses(
-        &unattended(|r| r.kind = "physical".to_owned()),
-        "`alpha` is physical",
+    // The gates of an unattended run on a physical robot follow its plan.
+    assert_eq!(
+        unattended(|r| r.kind = "physical".to_owned()),
+        Vec::<String>::new()
     );
     refuses(
         &unattended(|r| r.robot_commander = "headset".to_owned()),
@@ -331,6 +346,8 @@ fn a_location_goes_by_its_name_to_a_marked_field_of_a_skill_that_knows_locations
             incidents: &Incidents::None,
             poll: workflow_documents::Bound::from_seconds(0.5).unwrap(),
             cancel_timeout: Duration::from_secs(10),
+            watch: Default::default(),
+            of_a_trial: false,
         },
     )
     .unwrap();
@@ -410,4 +427,42 @@ fn a_check_that_binds_one_robot_to_two_roles_refuses_the_second() {
         &errors(&value, &snapshot(vec![robot("alpha")]), Some(&binding)),
         "roles.right: `alpha` is the robot of the role `left` too: name another robot for each role",
     );
+}
+
+/// A watch parameter reads a number: one that reads a bool or a string
+/// refuses the plan at `watch.<name>`, and one that reads a count or a
+/// coordinate holds.
+#[test]
+fn a_watch_parameter_reads_a_number() {
+    let watching = |pairs: &[(&str, &str)]| Watch {
+        observations: pairs
+            .iter()
+            .map(|(name, text)| {
+                let observation = serde_json::from_value(json!(text)).unwrap();
+                (self::name(name), observation)
+            })
+            .collect(),
+        validation: None,
+    };
+    let numbers = watching(&[("loose", "target.count"), ("x", "target.position[0]")]);
+    let found = plan_errors_watching(
+        &picker(),
+        vec![robot("alpha")],
+        Attendance::Attended,
+        numbers,
+    );
+    assert!(found.is_empty(), "{found:#?}");
+    let others = watching(&[("found", "target.found"), ("kind", "target.kind")]);
+    let found = plan_errors_watching(
+        &picker(),
+        vec![robot("alpha")],
+        Attendance::Attended,
+        others,
+    );
+    assert_eq!(found.len(), 2, "{found:#?}");
+    refuses(
+        &found,
+        "watch.found: `target.found` is bool; a watch parameter reads a number",
+    );
+    refuses(&found, "watch.kind: `target.kind`");
 }

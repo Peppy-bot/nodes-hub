@@ -1,8 +1,9 @@
 //! The members of `workflow_director:v1`. The services answer from the kept
-//! state of the director: its fleet snapshot, its runs and its journals. The
-//! actions follow a run: `run` from its start, `resume` from a resume and
-//! `abort` from an abort, each to the end of the run, and the first two to
-//! its suspension as well.
+//! state of the director: its fleet snapshot, its runs, its trials and its
+//! journals. The actions follow a run: `run` from its start, `resume` from a
+//! resume, `abort` from an abort and `next_run` from the start of the next
+//! run of a trial, each to the end of the run, and `run` and `resume` to its
+//! suspension as well; `trial` follows a trial to its end.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -12,22 +13,26 @@ use std::time::Duration;
 use serde_json::Value as Json;
 
 use peppygen::emitted_topics::director::run_events;
-use peppygen::exposed_actions::director::{abort, locations, resume, run};
+use peppygen::exposed_actions::director::{abort, locations, next_run, resume, run, trial};
 use peppygen::exposed_services::director::{
-    check, confirm, journal, replay, robots, runs, status, suspend,
+    check, confirm, forget_robot, journal, judge_checks, judge_ending, replay, robots, runs,
+    status, suspend,
 };
 use serde_json::json;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use workflow_documents::result::{Ending, RUN_SUSPENDED, RunRefusal, RunResult};
-use workflow_documents::{EventKind, KnownLocation, Name, RobotName, Workflow, run_lease_name};
+use workflow_documents::{
+    EventKind, KnownLocation, Name, RobotName, TrialDocument, Workflow, run_lease_name,
+};
 
 use crate::Snapshot;
 use crate::checker;
 use crate::director::{Caller, Director, RunRequest, RunView, TeachHold, parses};
 use crate::engine::failure::{PRECONDITION_FAILED, REJECTED};
 use crate::engine::host::Event;
-use crate::engine::{Phase, ResumeRefusal, RunCommand, status_of};
+use crate::engine::{ChecksJudged, Phase, ResumeRefusal, RunCommand, status_of};
 use crate::fleet::{self, Robot};
+use crate::trial::{EndingJudged, Next, TrialCommand, TrialRecord, TrialStep, trial_number};
 
 /// How often a goal that follows a run gives its progress, in wall time.
 const PROGRESS_EVERY: Duration = Duration::from_secs(5);
@@ -41,6 +46,8 @@ pub async fn serve(director: Arc<Director>) -> peppygen::Result<()> {
     serve_run(Arc::clone(&director)).await?;
     serve_resume(Arc::clone(&director)).await?;
     serve_locations(Arc::clone(&director)).await?;
+    serve_trial(Arc::clone(&director)).await?;
+    serve_next_run(Arc::clone(&director)).await?;
     serve_abort(director).await?;
     Ok(())
 }
@@ -113,6 +120,9 @@ fn serve_services(director: &Arc<Director>) {
     serve_service!(director, status, answer_status);
     serve_service!(director, journal, answer_journal);
     serve_service!(director, replay, answer_replay);
+    serve_service!(director, forget_robot, answer_forget_robot);
+    serve_service!(director, judge_checks, answer_judge_checks);
+    serve_service!(director, judge_ending, answer_judge_ending);
 }
 
 /// The fleet snapshot of the director once it read the first listing, and
@@ -280,10 +290,21 @@ fn answer_confirm(director: &Director, request: confirm::Request) -> Result<(), 
 fn answer_suspend(director: &Director, request: suspend::Request) -> Result<(), suspend::Failure> {
     let run = &request.data.run;
     let RunView {
-        phase, commands, ..
+        phase,
+        commands,
+        trial,
+        ..
     } = director.view_of(run).ok_or_else(|| {
         suspend::Failure::new(suspend::FailureKind::Rejected, format!("no run `{run}`"))
     })?;
+    if let Some(trial) = trial {
+        return Err(suspend::Failure::new(
+            suspend::FailureKind::PreconditionFailed,
+            format!(
+                "the run `{run}` is a run of the trial `{trial}`, which runs unattended and does not suspend; abort it to stop it"
+            ),
+        ));
+    }
     if phase != Phase::Running {
         return Err(suspend::Failure::new(
             suspend::FailureKind::PreconditionFailed,
@@ -361,7 +382,39 @@ fn answer_runs(
             }
         })
         .collect::<Vec<_>>();
-    Ok(runs::Response::new(newest_first(runs)))
+    let trials = director
+        .trials
+        .lock()
+        .expect("no trial panics holding the trials")
+        .values()
+        .map(|entry| trial_item(&entry.record.borrow()))
+        .collect();
+    Ok(runs::Response::new(
+        newest_trials_first(trials),
+        newest_first(runs),
+    ))
+}
+
+/// A trial as `runs` lists it.
+fn trial_item(record: &TrialRecord) -> runs::ResponseTrialsItem {
+    let document = &record.document;
+    runs::ResponseTrialsItem {
+        trial: record.trial.clone(),
+        name: document.manifest.name.to_string(),
+        revision: document.manifest.revision.get(),
+        workflow: document.workflow.name.to_string(),
+        workflow_revision: document.workflow.revision.get(),
+        state: record.state.name().to_owned(),
+        started_by: record.started_by.clone(),
+        runs_counted: record.measures.runs,
+        runs: document.runs,
+    }
+}
+
+/// The trials by their number, newest first.
+fn newest_trials_first(mut trials: Vec<runs::ResponseTrialsItem>) -> Vec<runs::ResponseTrialsItem> {
+    trials.sort_by_key(|item| std::cmp::Reverse(trial_number(&item.trial)));
+    trials
 }
 
 /// The runs by their number, newest first.
@@ -375,6 +428,17 @@ fn answer_status(
     request: status::Request,
 ) -> Result<status::Response, status::Failure> {
     let run = &request.data.run;
+    if trial_number(run).is_some() {
+        let (record, _) = director.trial_entry(run).ok_or_else(|| {
+            status::Failure::new(status::FailureKind::Rejected, format!("no trial `{run}`"))
+        })?;
+        let record = record.borrow().clone();
+        let report = director.trial_report(&record).to_string();
+        return Ok(status::Response::new(
+            record.state.name().to_owned(),
+            report,
+        ));
+    }
     let RunView { phase, .. } = director.view_of(run).ok_or_else(|| {
         status::Failure::new(
             status::FailureKind::Rejected,
@@ -400,6 +464,125 @@ fn answer_journal(
                 format!("no journal of `{run}`"),
             )
         })
+}
+
+fn answer_forget_robot(
+    director: &Director,
+    request: forget_robot::Request,
+) -> Result<forget_robot::Response, forget_robot::Failure> {
+    let robot = &request.data.robot;
+    let removed = director.sign_offs.forget_robot(robot).map_err(|error| {
+        forget_robot::Failure::new(
+            forget_robot::FailureKind::AttemptFailed,
+            format!("the sign-off records of `{robot}` were not all removed: {error}"),
+        )
+    })?;
+    Ok(forget_robot::Response::new(removed))
+}
+
+fn answer_judge_checks(
+    director: &Director,
+    request: judge_checks::Request,
+) -> Result<judge_checks::Response, judge_checks::Failure> {
+    use judge_checks::{Failure, FailureKind};
+    let rejected = |message: String| Failure::new(FailureKind::Rejected, message);
+    let precondition = |message: String| Failure::new(FailureKind::PreconditionFailed, message);
+    let trial = &request.data.trial;
+    let (record, live) = director
+        .trial_entry(trial)
+        .ok_or_else(|| rejected(format!("no trial `{trial}`")))?;
+    let Some(live) = live else {
+        return Err(precondition(format!(
+            "the trial `{trial}` runs no run: it has ended, or it has not started its runs"
+        )));
+    };
+    let mut wrong = std::collections::BTreeSet::new();
+    for text in &request.data.wrong {
+        let name = Name::parse(text).map_err(|error| rejected(format!("wrong: {error}")))?;
+        let has_a_check = live
+            .workflow
+            .assumptions
+            .get(&name)
+            .is_some_and(|assumption| assumption.check.is_some());
+        if !has_a_check {
+            return Err(rejected(format!(
+                "the workflow has no check of an assumption `{name}`"
+            )));
+        }
+        wrong.insert(name);
+    }
+    let waits = |run: &str| {
+        format!("the run `{run}` of the trial `{trial}` waits for no judgement of its checks")
+    };
+    let run = record
+        .borrow()
+        .current_run()
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            precondition(format!(
+                "no run of the trial `{trial}` waits for the judgement of its checks"
+            ))
+        })?;
+    let view = director
+        .view_of(&run)
+        .ok_or_else(|| precondition(waits(&run)))?;
+    let Phase::Judging(checks) = view.phase else {
+        return Err(precondition(waits(&run)));
+    };
+    let judged = ChecksJudged::of(&checks, wrong.into_iter().collect());
+    let mut kept = Ok(());
+    record.send_if_modified(|record| {
+        kept = record.judge_checks(&run, &judged);
+        kept.is_ok()
+    });
+    kept.map_err(precondition)?;
+    let command = RunCommand::JudgeChecks {
+        judged: judged.clone(),
+    };
+    if let Err(message) = send(view.commands, command) {
+        record.send_modify(|record| record.unjudge_checks(&run));
+        return Err(precondition(message));
+    }
+    Ok(judge_checks::Response::new(judged.outcome().to_owned()))
+}
+
+fn answer_judge_ending(
+    director: &Director,
+    request: judge_ending::Request,
+) -> Result<judge_ending::Response, judge_ending::Failure> {
+    use judge_ending::{Failure, FailureKind};
+    let data = request.data;
+    let trial = &data.trial;
+    let (record, live) = director
+        .trial_entry(trial)
+        .ok_or_else(|| Failure::new(FailureKind::Rejected, format!("no trial `{trial}`")))?;
+    let precondition = |message: String| Failure::new(FailureKind::PreconditionFailed, message);
+    let Some(live) = live else {
+        return Err(precondition(format!(
+            "no ending of a run of the trial `{trial}` waits for its judgement: the trial runs no run"
+        )));
+    };
+    let judged = EndingJudged {
+        task_done: data.task_done,
+        emergency_stop: data.emergency_stop,
+        unsafe_events: data.unsafe_events,
+    };
+    let mut counted = None;
+    record.send_if_modified(|record| {
+        let outcome = record.judge_ending(judged.clone(), &live.thresholds);
+        let changed = outcome.is_ok();
+        counted = Some(outcome);
+        changed
+    });
+    let (count, next) = counted
+        .expect("the record judged the ending")
+        .map_err(precondition)?;
+    let runs_counted = record.borrow().measures.runs;
+    let goes_on = next == Next::GoesOn;
+    let _ = live
+        .commands
+        .send(TrialCommand::EndingJudged { count, next });
+    Ok(judge_ending::Response::new(runs_counted, goes_on))
 }
 
 fn answer_replay(
@@ -516,6 +699,7 @@ macro_rules! run_goal {
 run_goal!(run);
 run_goal!(resume);
 run_goal!(abort);
+run_goal!(next_run);
 
 fn result_text(result: &RunResult) -> String {
     serde_json::to_string(result).expect("a run result serializes")
@@ -692,6 +876,8 @@ async fn serve_run(director: Arc<Director>) -> peppygen::Result<()> {
                 }),
                 run_document: data.run_document,
                 roles: data.roles,
+                work_cell: data.work_cell,
+                trial: None,
                 started_by: data
                     .started_by
                     .unwrap_or_else(|| format!("{}@{}", caller.instance, caller.core_node)),
@@ -720,19 +906,22 @@ async fn serve_run(director: Arc<Director>) -> peppygen::Result<()> {
 /// fields, and text that does not parse as JSON5.
 fn decide_run(request: &run::GoalRequest) -> peppygen::Result<run::GoalDecision> {
     let data = &request.data;
-    let shape = RunRequest {
+    let request = RunRequest {
         workflow: data.workflow.clone(),
         bundle: data.bundle.as_ref().map(|_| Vec::new()),
         run_document: data.run_document.clone(),
         roles: data.roles.clone(),
+        work_cell: data.work_cell.clone(),
         started_by: String::new(),
         caller_data: None,
-    }
-    .shape();
+        trial: None,
+    };
+    let shape = request.shape().err();
     let texts = [
         ("workflow", &data.workflow),
         ("run_document", &data.run_document),
         ("roles", &data.roles),
+        ("work_cell", &data.work_cell),
         ("caller_data", &data.caller_data),
     ];
     let unparsed = texts.iter().find_map(|(field, text)| {
@@ -740,7 +929,7 @@ fn decide_run(request: &run::GoalRequest) -> peppygen::Result<run::GoalDecision>
             .and_then(|text| parses(text).err())
             .map(|reason| format!("{field}: {reason}"))
     });
-    Ok(match shape.err().or(unparsed) {
+    Ok(match shape.or(unparsed) {
         Some(message) => run::GoalDecision::refuse(run::FailureKind::Rejected, message),
         None => run::GoalDecision::accept(),
     })
@@ -1049,6 +1238,117 @@ async fn serve_locations(director: Arc<Director>) -> peppygen::Result<()> {
                 }
             };
             tokio::spawn(work_locations(Arc::clone(&director), goal));
+        }
+    });
+    Ok(())
+}
+
+/// Admits a `trial` goal whose trial document parses.
+fn decide_trial(request: &trial::GoalRequest) -> trial::GoalDecision {
+    match TrialDocument::parse(&request.data.trial) {
+        Ok(_) => trial::GoalDecision::accept(),
+        Err(refusals) => {
+            trial::GoalDecision::refuse(trial::FailureKind::Rejected, format!("trial: {refusals}"))
+        }
+    }
+}
+
+async fn serve_trial(director: Arc<Director>) -> peppygen::Result<()> {
+    let mut handle = trial::ActionHandle::expose(&director.runner).await?;
+    tokio::spawn(async move {
+        loop {
+            let goal = match handle
+                .handle_goal_next_request(|request| Ok(decide_trial(request)))
+                .await
+            {
+                Ok(Some(goal)) => goal,
+                Ok(None) => return,
+                Err(error) => {
+                    tracing::warn!("trial: {error}");
+                    tokio::time::sleep(RETRY_BACKOFF).await;
+                    continue;
+                }
+            };
+            tokio::spawn(Arc::clone(&director).run_trial(goal));
+        }
+    });
+    Ok(())
+}
+
+/// Admits a `next_run` goal of a trial that the director keeps and that
+/// waits for its next run.
+fn decide_next_run(director: &Director, trial: &str) -> next_run::GoalDecision {
+    use next_run::{FailureKind, GoalDecision};
+    let Some((record, live)) = director.trial_entry(trial) else {
+        return GoalDecision::refuse(FailureKind::Rejected, format!("no trial `{trial}`"));
+    };
+    let waits = matches!(record.borrow().step, TrialStep::Prepares { .. });
+    match (waits, live) {
+        (true, Some(_)) => GoalDecision::accept(),
+        _ => GoalDecision::refuse(
+            FailureKind::PreconditionFailed,
+            format!("the trial `{trial}` does not wait for its next run"),
+        ),
+    }
+}
+
+async fn serve_next_run(director: Arc<Director>) -> peppygen::Result<()> {
+    let mut handle = next_run::ActionHandle::expose(&director.runner).await?;
+    tokio::spawn(async move {
+        loop {
+            let decided = {
+                let director = Arc::clone(&director);
+                handle
+                    .handle_goal_next_request(move |request| {
+                        Ok(decide_next_run(&director, &request.data.trial))
+                    })
+                    .await
+            };
+            let goal = match decided {
+                Ok(Some(goal)) => goal,
+                Ok(None) => return,
+                Err(error) => {
+                    tracing::warn!("next_run: {error}");
+                    tokio::time::sleep(RETRY_BACKOFF).await;
+                    continue;
+                }
+            };
+            let director = Arc::clone(&director);
+            tokio::spawn(async move {
+                let trial = goal.request().data.trial.clone();
+                let Some(live) = director.trial_entry(&trial).and_then(|(_, live)| live) else {
+                    goal.failed(
+                        PRECONDITION_FAILED,
+                        format!("the trial `{trial}` has ended"),
+                    )
+                    .await;
+                    return;
+                };
+                // The goal subscribes before the run starts, so it sees the
+                // first event of the run.
+                let events = director.events.subscribe();
+                let (reply, started) = oneshot::channel();
+                let caller = RunGoal::sender(&goal);
+                let asked = live.commands.send(TrialCommand::NextRun { caller, reply });
+                let started = match asked {
+                    Ok(()) => started.await.ok(),
+                    Err(_) => None,
+                };
+                match started {
+                    Some(Ok((run, phase))) => {
+                        let commands = director.view_of(&run).and_then(|view| view.commands);
+                        follow(goal, run, events, phase, Follow::ToSuspension { commands }).await
+                    }
+                    Some(Err((kind, message))) => goal.failed(kind, message).await,
+                    None => {
+                        goal.failed(
+                            PRECONDITION_FAILED,
+                            format!("the trial `{trial}` has ended"),
+                        )
+                        .await
+                    }
+                }
+            });
         }
     });
     Ok(())

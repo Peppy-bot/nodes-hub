@@ -14,9 +14,11 @@ use workflow_documents::run::{Attendance, Severity};
 
 use super::failure::{Cause, DirectorKind, Failure};
 use super::host::{CallEnd, Host};
-use super::plan::{MonitorPlan, Plan, Target};
+use super::plan::{MonitorPlan, Plan, Target, Watch};
 use super::{Phase, ResultBase, ResumeRefusal, RunCommand, drive};
-use crate::testing::{Answer, ScriptedHost, found, home, name, one_arm, plan, rest, with_beta};
+use crate::testing::{
+    Answer, ScriptedHost, found, home, name, one_arm, plan, rest, validation, with_beta,
+};
 
 /// The refusal of a resume that a check of it refused.
 fn refused_by_a_check(answer: Result<(), ResumeRefusal>) -> workflow_documents::Located {
@@ -931,6 +933,40 @@ async fn the_assumptions_that_wait_are_sent_again_after_each_confirmation() {
         ],
         "a to_confirm event goes again after the confirmation, naming what still waits"
     );
+}
+
+/// An unattended run has no person to confirm an assumption without a
+/// check: it starts only when its run document confirms each one, and
+/// refuses the first one it does not confirm, naming it, before the
+/// initialization.
+#[tokio::test(start_paused = true)]
+async fn an_unattended_run_refuses_an_assumption_without_a_check_it_does_not_confirm() {
+    let mut value = one_arm("alpha", rest("rest"), home());
+    value["assumptions"]["clear"] = json!({ "says": "The table is clear" });
+    value["assumptions"]["dry"] = json!({ "says": "The table is dry" });
+    let mut unconfirmed = plan(&value, Attendance::Unattended);
+    unconfirmed.confirmed = [name("dry")].into();
+    let host = arm();
+    let (result, phases) = run(&unconfirmed, &host, Vec::new()).await;
+    assert_eq!(result.ending, Ending::Refused, "{result:#?}");
+    let refusal = result.refusal.as_ref().unwrap();
+    assert_eq!(refusal.assumption, Some(name("clear")));
+    assert_eq!(
+        refusal.message,
+        "the assumption `clear` has no check and the run document does not confirm it, and no person confirms an assumption of an unattended run: The table is clear"
+    );
+    assert!(
+        !phases
+            .iter()
+            .any(|phase| matches!(phase, Phase::Confirming(_))),
+        "{phases:?}"
+    );
+    assert!(host.calls_of("home").is_empty(), "no lane runs");
+
+    let mut confirmed = plan(&value, Attendance::Unattended);
+    confirmed.confirmed = [name("clear"), name("dry")].into();
+    let (result, _) = run(&confirmed, &arm(), Vec::new()).await;
+    assert_eq!(result.ending, Ending::Completed, "{result:#?}");
 }
 
 #[tokio::test(start_paused = true)]
@@ -2255,4 +2291,312 @@ async fn a_suspension_during_the_test_of_a_loop_keeps_its_passes() {
         .collect();
     assert_eq!(loops, [("alpha.fill".to_owned(), 3, 0)]);
     assert_eq!(host.calls_of("home").len(), 3, "one `place` per pass");
+}
+
+/// The plan of a rest of `alpha` that watches `loose`, the count of blocks
+/// that `find` gives, against `validation`.
+fn watching_loose(validation: Option<workflow_documents::Validation>) -> Plan {
+    let mut plan = plan(
+        &one_arm("alpha", rest("rest"), home()),
+        Attendance::Attended,
+    );
+    plan.watch = Watch {
+        observations: [(
+            name("loose"),
+            serde_json::from_value(json!("target.count")).unwrap(),
+        )]
+        .into(),
+        validation,
+    };
+    plan
+}
+
+/// The validation whose envelope tests `loose` from `min` to `max`.
+fn loose_tested(min: f64, max: f64) -> workflow_documents::Validation {
+    validation(
+        json!({ "loose": { "unit": "items", "kind": "watch", "observation": "target.count" } }),
+        json!({ "loose": [min, max] }),
+    )
+}
+
+/// A run reads each watch parameter through the robots before its
+/// assumptions, keeps its value in the run result, and names a value that
+/// no envelope covers in the event `uncovered`, before its initialization.
+#[tokio::test(start_paused = true)]
+async fn a_run_reads_its_watch_values_before_its_assumptions_and_names_each_uncovered() {
+    let host = arm();
+    let (result, _) = run(&watching_loose(None), &host, Vec::new()).await;
+    assert_eq!(result.ending, Ending::Completed, "{result:#?}");
+    assert_eq!(result.watch, [(name("loose"), 1.0)].into());
+    let [uncovered] = &result.uncovered[..] else {
+        panic!("{:?}", result.uncovered)
+    };
+    assert_eq!(
+        uncovered.to_string(),
+        "`loose` is 1, and no envelope gives it a range"
+    );
+    let kinds: Vec<EventKind> = host
+        .event_kinds()
+        .into_iter()
+        .map(|(kind, _)| kind)
+        .collect();
+    assert_eq!(
+        kinds[..2],
+        [EventKind::Uncovered, EventKind::InitializationStarts],
+        "{kinds:?}"
+    );
+    let event = &host.events.lock().unwrap()[0];
+    assert_eq!(
+        event.details[0]["why"],
+        json!("no_envelope"),
+        "{:?}",
+        event.details
+    );
+}
+
+/// A watch value inside the envelope of the bundle is covered: no event names it.
+#[tokio::test(start_paused = true)]
+async fn a_watch_value_inside_the_envelope_is_covered() {
+    let host = arm();
+    let (result, _) = run(
+        &watching_loose(Some(loose_tested(0.0, 3.0))),
+        &host,
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(result.ending, Ending::Completed, "{result:#?}");
+    assert!(result.uncovered.is_empty(), "{:?}", result.uncovered);
+    assert!(
+        !host
+            .event_kinds()
+            .iter()
+            .any(|(kind, _)| *kind == EventKind::Uncovered)
+    );
+}
+
+/// The values of the work cell that the director named come first in the
+/// event `uncovered` and in the run result, then each watch value outside
+/// its range.
+#[tokio::test(start_paused = true)]
+async fn the_work_cell_values_and_the_watch_values_no_test_covered_go_together() {
+    let plan = watching_loose(Some(loose_tested(2.0, 3.0)));
+    let host = arm();
+    let missing = workflow_documents::Uncovered {
+        parameter: name("belt_speed_mps"),
+        role: None,
+        value: None,
+        why: workflow_documents::work_cell::NotCovered::Missing,
+    };
+    let mut base = crate::director::empty_result();
+    base.uncovered = vec![missing.clone()];
+    let (commands, commands_rx) = mpsc::unbounded_channel::<RunCommand>();
+    let (phase, _) = watch::channel(Phase::Preparing);
+    let result = drive(
+        &plan,
+        &host,
+        ResultBase { result: base },
+        commands_rx,
+        phase,
+        host.now(),
+    )
+    .await;
+    drop(commands);
+    let named: Vec<String> = result.uncovered.iter().map(ToString::to_string).collect();
+    assert_eq!(
+        named,
+        [
+            "`belt_speed_mps` has no value in the work cell block",
+            "`loose` is 1, outside the tested range [2, 3]",
+        ]
+    );
+    let events = host.events.lock().unwrap();
+    let uncovered = events
+        .iter()
+        .find(|event| event.kind == EventKind::Uncovered)
+        .expect("the event uncovered");
+    assert_eq!(uncovered.details.as_array().map(Vec::len), Some(2));
+}
+
+/// A watch value that does not read refuses the run before its assumptions,
+/// naming the watch parameter.
+#[tokio::test(start_paused = true)]
+async fn a_watch_value_that_does_not_read_refuses_the_run_naming_it() {
+    let host = arm().answer("find", vec![Answer::failing("unreachable")]);
+    let (result, _) = run(&watching_loose(None), &host, Vec::new()).await;
+    assert_eq!(result.ending, Ending::Refused, "{result:#?}");
+    let refusal = result.refusal.expect("a refusal");
+    assert!(
+        refusal
+            .message
+            .starts_with("the watch parameter `loose` did not read: "),
+        "{}",
+        refusal.message
+    );
+    assert!(result.assumptions.is_empty(), "no assumption was checked");
+}
+
+/// An unattended run on a physical robot runs only with each watch value
+/// inside the envelope of its bundle: a value outside it, or with no
+/// envelope, refuses the run before its assumptions, naming the value. The
+/// same values let an attended run go on.
+#[tokio::test(start_paused = true)]
+async fn an_unattended_run_on_a_physical_robot_is_refused_on_a_watch_value_no_test_covered() {
+    for validation in [Some(loose_tested(2.0, 3.0)), None] {
+        let mut plan = watching_loose(validation);
+        plan.attendance = Attendance::Unattended;
+        plan.roles
+            .values_mut()
+            .for_each(|role| role.physical = true);
+        let host = arm();
+        let (result, _) = run(&plan, &host, Vec::new()).await;
+        assert_eq!(result.ending, Ending::Refused, "{result:#?}");
+        let refusal = result.refusal.expect("a refusal");
+        assert!(
+            refusal.message.starts_with(
+                "an unattended run on a physical robot runs inside the envelope of its bundle, and no test covered `loose` is 1"
+            ),
+            "{}",
+            refusal.message
+        );
+        assert!(result.assumptions.is_empty(), "no assumption was checked");
+        assert_eq!(result.watch, [(name("loose"), 1.0)].into());
+    }
+}
+
+/// The plan of a run of a trial of a rest of `alpha`, whose reach check
+/// reads `find`.
+fn of_a_trial() -> Plan {
+    let mut plan = plan(
+        &one_arm("alpha", rest("rest"), home()),
+        Attendance::Unattended,
+    );
+    plan.roles
+        .values_mut()
+        .for_each(|role| role.physical = true);
+    plan.of_a_trial = true;
+    plan
+}
+
+/// The checks that a run of a trial gave to judge, from its phases.
+fn judged_checks(phases: &[Phase]) -> Vec<workflow_documents::result::CheckToJudge> {
+    phases
+        .iter()
+        .find_map(|phase| match phase {
+            Phase::Judging(checks) => Some(checks.clone()),
+            _ => None,
+        })
+        .expect("the run waits for the judgement of its checks")
+}
+
+/// A run of a trial gives each check with its value, a false one included,
+/// and waits for the judgement of the operator: a judgement that it starts
+/// runs it to its end.
+#[tokio::test(start_paused = true)]
+async fn a_run_of_a_trial_waits_for_the_judgement_of_its_checks_and_starts_on_it() {
+    let host = arm();
+    let judged = super::ChecksJudged::Starts;
+    let (result, phases) = run(
+        &of_a_trial(),
+        &host,
+        vec![(5, RunCommand::JudgeChecks { judged })],
+    )
+    .await;
+    assert_eq!(result.ending, Ending::Completed, "{result:#?}");
+    let checks = judged_checks(&phases);
+    assert_eq!(checks.len(), 1);
+    assert_eq!(
+        (
+            checks[0].assumption.as_str(),
+            checks[0].check.as_str(),
+            checks[0].value
+        ),
+        ("in_reach", "target.found", true)
+    );
+    let calls = host.calls_of("home");
+    assert_eq!(calls[0].at_s, 5.0, "the lane starts at the judgement");
+    let kinds: Vec<EventKind> = host
+        .event_kinds()
+        .into_iter()
+        .map(|(kind, _)| kind)
+        .collect();
+    assert_eq!(
+        kinds[..2],
+        [EventKind::ChecksToJudge, EventKind::InitializationStarts]
+    );
+}
+
+/// A false check does not refuse a run of a trial: the operator judges it.
+/// When the operator agrees with it, the work cell is not ready; when the
+/// operator names a check wrong, the check is false. Each refuses the run,
+/// naming the checks.
+#[tokio::test(start_paused = true)]
+async fn a_judgement_that_the_work_cell_is_not_ready_or_a_check_is_wrong_refuses_the_run() {
+    let not_found = json!({ "found": false, "item_id": "b1", "position": [0.3, 0.0, 0.1], "kind": "block", "count": "1" });
+    let host = arm().answer("find", vec![Answer::now(not_found)]);
+    let judged = super::ChecksJudged::NotReady;
+    let (result, phases) = run(
+        &of_a_trial(),
+        &host,
+        vec![(1, RunCommand::JudgeChecks { judged })],
+    )
+    .await;
+    assert!(!judged_checks(&phases)[0].value);
+    assert_eq!(result.ending, Ending::Refused, "{result:#?}");
+    assert_eq!(
+        result.refusal.unwrap().message,
+        "the work cell is not ready: the check of `in_reach` is false, and the operator agrees with each value"
+    );
+    assert!(host.calls_of("home").is_empty(), "the run moved no robot");
+    let judged = super::ChecksJudged::FalseCheck {
+        wrong: vec![name("in_reach")],
+    };
+    let (result, _) = run(
+        &of_a_trial(),
+        &arm(),
+        vec![(1, RunCommand::JudgeChecks { judged })],
+    )
+    .await;
+    assert_eq!(
+        result.refusal.unwrap().message,
+        "the operator names the check of `in_reach` wrong: its value differs from the work cell"
+    );
+}
+
+/// An abort of a run of a trial that waits for the judgement of its checks
+/// ends it aborted.
+#[tokio::test(start_paused = true)]
+async fn an_abort_of_a_run_of_a_trial_that_waits_for_its_judgement_ends_it_aborted() {
+    let host = arm();
+    let (result, _) = run(&of_a_trial(), &host, vec![(3, RunCommand::Abort)]).await;
+    assert_eq!(result.ending, Ending::Aborted, "{result:#?}");
+    assert!(host.calls_of("home").is_empty());
+}
+
+/// The judgement of the checks: a wrong check first, then a false check,
+/// else the run starts.
+#[test]
+fn the_judgement_of_the_checks_names_a_wrong_check_first_then_a_false_one() {
+    use super::ChecksJudged;
+    use workflow_documents::result::CheckToJudge;
+    let check = |value: bool| CheckToJudge {
+        assumption: name("in_reach"),
+        says: "The block is in reach".to_owned(),
+        check: "target.found".to_owned(),
+        value,
+    };
+    assert_eq!(
+        ChecksJudged::of(&[check(true)], Vec::new()),
+        ChecksJudged::Starts
+    );
+    assert_eq!(
+        ChecksJudged::of(&[check(true), check(false)], Vec::new()),
+        ChecksJudged::NotReady
+    );
+    let wrong = vec![name("in_reach")];
+    assert_eq!(
+        ChecksJudged::of(&[check(false)], wrong.clone()),
+        ChecksJudged::FalseCheck { wrong }
+    );
+    assert_eq!(ChecksJudged::Starts.outcome(), "starts");
+    assert_eq!(ChecksJudged::NotReady.outcome(), "not_ready");
 }
