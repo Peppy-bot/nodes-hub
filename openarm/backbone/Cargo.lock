@@ -459,7 +459,7 @@ dependencies = [
 [[package]]
 name = "chain_kinematics"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#c556a59df0824cce450175e397937ad8b9398ad1"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#f596cbc6ccc1dd3b654c3a1a757186f7427760c8"
 dependencies = [
  "control_core",
  "nalgebra",
@@ -554,7 +554,7 @@ dependencies = [
 [[package]]
 name = "collision_geometry"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#c556a59df0824cce450175e397937ad8b9398ad1"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#f596cbc6ccc1dd3b654c3a1a757186f7427760c8"
 dependencies = [
  "chain_kinematics",
  "nalgebra",
@@ -615,7 +615,7 @@ dependencies = [
 [[package]]
 name = "control_core"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#c556a59df0824cce450175e397937ad8b9398ad1"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#f596cbc6ccc1dd3b654c3a1a757186f7427760c8"
 dependencies = [
  "thiserror 2.0.21",
  "tokio",
@@ -2506,7 +2506,7 @@ dependencies = [
 [[package]]
 name = "openarm_description"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#c556a59df0824cce450175e397937ad8b9398ad1"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#f596cbc6ccc1dd3b654c3a1a757186f7427760c8"
 dependencies = [
  "urdf-rs",
 ]
@@ -3510,7 +3510,7 @@ dependencies = [
 [[package]]
 name = "self_collision_model"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#c556a59df0824cce450175e397937ad8b9398ad1"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#f596cbc6ccc1dd3b654c3a1a757186f7427760c8"
 dependencies = [
  "collision_geometry",
  "srs_model",
@@ -3855,7 +3855,7 @@ dependencies = [
 [[package]]
 name = "srs_model"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#c556a59df0824cce450175e397937ad8b9398ad1"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#f596cbc6ccc1dd3b654c3a1a757186f7427760c8"
 dependencies = [
  "chain_kinematics",
  "control_core",
@@ -4948,7 +4948,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 [[package]]
 name = "workspace_core"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#c556a59df0824cce450175e397937ad8b9398ad1"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#f596cbc6ccc1dd3b654c3a1a757186f7427760c8"
 dependencies = [
  "thiserror 2.0.21",
 ]
