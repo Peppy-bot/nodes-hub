@@ -10,8 +10,7 @@
 //! bundle and binding, and at `forget_robot`.
 
 use std::collections::BTreeMap;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
@@ -20,6 +19,7 @@ use workflow_documents::run::Incidents;
 use workflow_documents::{Name, NameTag, RobotName, Sha256};
 
 use crate::fleet::Snapshot;
+use crate::records::RecordDir;
 
 /// A bound robot as a sign-off names it: its name, the model it reports
 /// (empty with none) and the core node of its machine.
@@ -281,7 +281,7 @@ pub fn refusal_of_no_record(records: &[SignOffRecord], run: &SignOff) -> Option<
 /// The sign-off records of the director, each in its file
 /// `<journal_root>/workflow_director/sign_offs/<trial>.json`.
 pub struct SignOffs {
-    dir: PathBuf,
+    dir: RecordDir<SignOffRecord>,
     records: Mutex<BTreeMap<String, SignOffRecord>>,
 }
 
@@ -289,31 +289,16 @@ impl SignOffs {
     /// Opens the records under `root` and reads each. A record that does
     /// not read refuses the start, naming its file.
     pub fn open(root: &Path) -> std::io::Result<SignOffs> {
-        let dir = root.join("workflow_director").join("sign_offs");
-        fs::create_dir_all(&dir)?;
-        let mut records = BTreeMap::new();
-        for entry in fs::read_dir(&dir)? {
-            let path = entry?.path();
-            if path.extension().is_none_or(|extension| extension != "json") {
-                continue;
-            }
-            let text = fs::read_to_string(&path)?;
-            let record: SignOffRecord = serde_json::from_str(&text).map_err(|error| {
-                std::io::Error::other(format!(
-                    "{}: {error}; move this sign-off record out of its directory, and the director starts without it",
-                    path.display()
-                ))
-            })?;
-            records.insert(record.trial.clone(), record);
-        }
+        let dir = RecordDir::open(root, "sign_offs", "sign-off record")?;
+        let records = dir
+            .read_all()?
+            .into_iter()
+            .map(|record: SignOffRecord| (record.trial.clone(), record))
+            .collect();
         Ok(SignOffs {
             dir,
             records: Mutex::new(records),
         })
-    }
-
-    fn path(&self, trial: &str) -> PathBuf {
-        self.dir.join(format!("{trial}.json"))
     }
 
     /// The records of the bundle `bundle`, ordered by the robot names of
@@ -334,11 +319,7 @@ impl SignOffs {
     /// Keeps `record` in its file.
     pub fn keep(&self, record: SignOffRecord) -> std::io::Result<()> {
         let mut records = self.records.lock().expect("no sign-off panics");
-        let text = serde_json::to_string_pretty(&record).map_err(std::io::Error::other)?;
-        let path = self.path(&record.trial);
-        let written = path.with_extension("json.part");
-        fs::write(&written, text)?;
-        fs::rename(&written, &path)?;
+        self.dir.write(&record.trial, &record)?;
         records.insert(record.trial.clone(), record);
         Ok(())
     }
@@ -352,7 +333,7 @@ impl SignOffs {
             .map(|record| record.trial.clone())
             .collect();
         for trial in &trials {
-            fs::remove_file(self.path(trial))?;
+            self.dir.remove(trial)?;
             records.remove(trial);
         }
         Ok(trials.len() as u32)
@@ -536,10 +517,9 @@ pub(crate) mod tests {
     /// Writes `record` into the directory of the records under `root`, as a
     /// trial keeps it.
     pub(crate) fn write(root: &Path, record: &SignOffRecord) {
-        let dir = root.join("workflow_director").join("sign_offs");
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(format!("{}.json", record.trial));
-        fs::write(path, serde_json::to_string(record).unwrap()).unwrap();
+        let dir: RecordDir<SignOffRecord> =
+            RecordDir::open(root, "sign_offs", "sign-off record").unwrap();
+        dir.write(&record.trial, record).unwrap();
     }
 
     /// The records stay across an open of the store, come in the order of
@@ -606,7 +586,11 @@ pub(crate) mod tests {
     fn a_record_that_does_not_read_names_its_file() {
         let dir = tempfile::tempdir().unwrap();
         let store = SignOffs::open(dir.path()).unwrap();
-        fs::write(store.path("t9"), json!({ "trial": "t9" }).to_string()).unwrap();
+        std::fs::write(
+            store.dir.dir().join("t9.json"),
+            json!({ "trial": "t9" }).to_string(),
+        )
+        .unwrap();
         let error = SignOffs::open(dir.path())
             .err()
             .expect("refused")

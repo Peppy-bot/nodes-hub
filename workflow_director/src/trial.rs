@@ -12,9 +12,8 @@
 //! end when it stopped ends interrupted when it starts again.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use peppygen::exposed_actions::director::trial as trial_goal;
@@ -22,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
 use tokio::sync::{mpsc, oneshot, watch};
 use workflow_documents::bundle::{Bundle, BundleFile};
-use workflow_documents::result::{Difference, Ending, RunResult};
+use workflow_documents::result::{Difference, Ending, RefusalCause, RunResult};
 use workflow_documents::run::Attendance;
 use workflow_documents::sign_off::Unmet;
 use workflow_documents::{
@@ -37,6 +36,7 @@ use crate::director::{
 use crate::engine::plan::Watch;
 use crate::engine::{ChecksJudged, Phase, RunCommand};
 use crate::journal::next_number;
+use crate::records::RecordDir;
 use crate::sign_off::{SignOff, SignOffRecord};
 
 /// How often a trial gives its progress, in wall time.
@@ -292,7 +292,7 @@ impl TrialRecord {
                     ..self.measures
                 },
             ),
-            None if refused_on_the_watch(result) => (Count::NotCounted, self.measures),
+            None if refused_on_a_watch_value(result) => (Count::NotCounted, self.measures),
             None => (
                 Count::NotCompleted,
                 Measures {
@@ -393,12 +393,11 @@ fn why_it_ended(result: &RunResult) -> Option<String> {
 /// outside the envelope: the work cell is not ready. A run of a trial is
 /// unattended on physical robots, so the director refuses it on each watch
 /// value that no test covered, before it evaluates any check.
-fn refused_on_the_watch(result: &RunResult) -> bool {
-    result.ending == Ending::Refused
-        && result
-            .uncovered
-            .iter()
-            .any(|uncovered| result.watch.contains_key(&uncovered.parameter))
+fn refused_on_a_watch_value(result: &RunResult) -> bool {
+    result
+        .refusal
+        .as_ref()
+        .is_some_and(|refusal| refusal.cause == RefusalCause::WatchOutsideTheEnvelope)
 }
 
 /// The names of the thresholds `unmet`, as the bundle writes them.
@@ -496,7 +495,10 @@ pub fn robots_of_trials(
 /// The records of the trials on the disk of the director, each in its file
 /// `<journal_root>/workflow_director/trials/<trial>.json`.
 pub struct Trials {
-    dir: PathBuf,
+    records: RecordDir<TrialRecord>,
+    /// Held while a trial id is given, so two trials that start together
+    /// never get one id.
+    numbering: Mutex<()>,
 }
 
 /// The file that keeps the next trial number, so ids grow.
@@ -513,22 +515,12 @@ impl Trials {
     /// stopped, ends interrupted. A record that does not read refuses the
     /// start, naming its file.
     pub fn open(root: &Path) -> std::io::Result<(Trials, Vec<TrialRecord>)> {
-        let dir = root.join("workflow_director").join("trials");
-        fs::create_dir_all(&dir)?;
-        let trials = Trials { dir };
+        let trials = Trials {
+            records: RecordDir::open(root, "trials", "trial record")?,
+            numbering: Mutex::new(()),
+        };
         let mut records = Vec::new();
-        for entry in fs::read_dir(&trials.dir)? {
-            let path = entry?.path();
-            if path.extension().is_none_or(|extension| extension != "json") {
-                continue;
-            }
-            let text = fs::read_to_string(&path)?;
-            let mut record: TrialRecord = serde_json::from_str(&text).map_err(|error| {
-                std::io::Error::other(format!(
-                    "{}: {error}; move this trial record out of its directory, and the director starts without it",
-                    path.display()
-                ))
-            })?;
+        for mut record in trials.records.read_all()? {
             if record.state == TrialState::Running {
                 record.state = TrialState::Interrupted;
                 record.step = TrialStep::Ended;
@@ -540,26 +532,24 @@ impl Trials {
         Ok((trials, records))
     }
 
-    /// The next trial id, `t<N>`, one more than every id given before.
+    /// The next trial id, `t<N>`, one more than every id given before,
+    /// each id given once however many trials start together.
     pub fn next_trial(&self) -> std::io::Result<String> {
-        let mut on_disk = 0;
-        for entry in fs::read_dir(&self.dir)? {
-            let name = entry?.file_name().to_string_lossy().into_owned();
-            if let Some(number) = name.strip_suffix(".json").and_then(trial_number) {
-                on_disk = on_disk.max(number);
-            }
-        }
-        let next = next_number(&self.dir.join(NEXT_TRIAL_FILE), on_disk)?;
+        let _numbering = self.numbering.lock().expect("no trial panics giving an id");
+        let on_disk = self
+            .records
+            .ids()?
+            .iter()
+            .filter_map(|id| trial_number(id))
+            .max()
+            .unwrap_or(0);
+        let next = next_number(&self.records.dir().join(NEXT_TRIAL_FILE), on_disk)?;
         Ok(format!("t{next}"))
     }
 
     /// Keeps `record` in its file.
     pub fn keep(&self, record: &TrialRecord) -> std::io::Result<()> {
-        let text = serde_json::to_string_pretty(record).map_err(std::io::Error::other)?;
-        let path = self.dir.join(format!("{}.json", record.trial));
-        let written = path.with_extension("json.part");
-        fs::write(&written, text)?;
-        fs::rename(&written, &path)
+        self.records.write(&record.trial, record)
     }
 }
 
@@ -617,12 +607,17 @@ impl Director {
         }
     }
 
-    /// The report of a trial: its record, the trial document, whether it
-    /// signs off, and the journal of each of its runs.
+    /// The report of a trial: its record, the trial document and whether
+    /// it signs off; once the trial ended, with the journal of each of its
+    /// runs. The report of a running trial leaves the journals out, which
+    /// `journal` gives, so a poll of its status reads no journal.
     pub fn trial_report(&self, record: &TrialRecord) -> Json {
         let mut report = json!(record);
         report["document"] = record.document.document().tree().clone();
         report["signs_off"] = json!(record.state == TrialState::SignedOff);
+        if record.state == TrialState::Running {
+            return report;
+        }
         for (index, run) in record.runs.iter().enumerate() {
             let journal = self.journals.read(&run.run).unwrap_or_default();
             report["runs"][index]["journal"] = json!(journal);
@@ -1365,25 +1360,38 @@ mod tests {
 
     /// A run that the director refused on a watch value outside the
     /// envelope does not count: the work cell is not ready, and the operator
-    /// prepares the same run again. A watch value that does not read is no
-    /// work cell that is not ready: the run counts as not completed.
+    /// prepares the same run again. The cause of the refusal decides, not
+    /// the values it names: a watch value that does not read, and a refusal
+    /// of the checks of the run with a watch value outside the envelope, are
+    /// no work cell that is not ready, and count as not completed.
     #[test]
     fn a_run_refused_on_a_watch_value_outside_the_envelope_does_not_count() {
+        use workflow_documents::result::RunRefusal;
         use workflow_documents::work_cell::{NotCovered, TestedRange};
+        let refused = |cause: RefusalCause| {
+            let mut result = ended(Ending::Refused);
+            result.watch.insert(name("loose_tapes"), 9.0);
+            result.uncovered.push(workflow_documents::Uncovered {
+                parameter: name("loose_tapes"),
+                role: None,
+                value: Some(9.0),
+                why: NotCovered::Outside {
+                    tested: TestedRange { min: 0.0, max: 2.0 },
+                },
+            });
+            result.refusal = Some(RunRefusal {
+                message: "refused".to_owned(),
+                cause,
+                errors: Vec::new(),
+                assumption: None,
+                says: None,
+            });
+            result
+        };
         let mut record = trial(3);
         judged(&mut record, "r1", None);
-        let mut outside = ended(Ending::Refused);
-        outside.watch.insert(name("loose_tapes"), 9.0);
-        outside.uncovered.push(workflow_documents::Uncovered {
-            parameter: name("loose_tapes"),
-            role: None,
-            value: Some(9.0),
-            why: NotCovered::Outside {
-                tested: TestedRange { min: 0.0, max: 2.0 },
-            },
-        });
         assert_eq!(
-            record.run_ended(&outside, &strict()),
+            record.run_ended(&refused(RefusalCause::WatchOutsideTheEnvelope), &strict()),
             AfterRun::Counted {
                 count: Count::NotCounted,
                 next: Next::GoesOn
@@ -1392,16 +1400,47 @@ mod tests {
         assert_eq!(record.measures, Measures::default());
         assert_eq!(record.step, TrialStep::Prepares { number: 1 });
 
-        judged(&mut record, "r2", None);
-        let unread = ended(Ending::Refused);
-        assert!(matches!(
-            record.run_ended(&unread, &lenient()),
-            AfterRun::Counted {
-                count: Count::NotCompleted,
-                ..
-            }
-        ));
-        assert_eq!(record.measures.runs, 1);
+        for (run, cause) in [
+            ("r2", RefusalCause::WatchUnread),
+            ("r3", RefusalCause::Checks),
+        ] {
+            judged(&mut record, run, None);
+            assert!(matches!(
+                record.run_ended(&refused(cause), &lenient()),
+                AfterRun::Counted {
+                    count: Count::NotCompleted,
+                    ..
+                }
+            ));
+        }
+        assert_eq!(record.measures.runs, 2);
+    }
+
+    /// Two trials that start together never get one id: each call gives
+    /// the next number, and the numbers grow across an open of the store.
+    #[test]
+    fn trials_that_start_together_get_ids_of_their_own() {
+        let root = tempfile::tempdir().unwrap();
+        let (trials, _) = Trials::open(root.path()).unwrap();
+        let trials = Arc::new(trials);
+        let start = Arc::new(std::sync::Barrier::new(8));
+        let callers: Vec<_> = (0..8)
+            .map(|_| {
+                let (trials, start) = (Arc::clone(&trials), Arc::clone(&start));
+                std::thread::spawn(move || {
+                    start.wait();
+                    trials.next_trial().unwrap()
+                })
+            })
+            .collect();
+        let mut ids: Vec<u64> = callers
+            .into_iter()
+            .map(|caller| trial_number(&caller.join().unwrap()).unwrap())
+            .collect();
+        ids.sort();
+        assert_eq!(ids, (1..=8).collect::<Vec<u64>>());
+        let (reopened, _) = Trials::open(root.path()).unwrap();
+        assert_eq!(reopened.next_trial().unwrap(), "t9");
     }
 
     /// A wrong check counts the run as not completed and each wrong check

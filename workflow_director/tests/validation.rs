@@ -522,7 +522,8 @@ async fn physical_rig() -> peppygen::Result<Rig> {
 /// `next_run`; its run gives each check to judge, runs once the operator judges that it starts, and counts by the
 /// judgement of its ending. After its last run, the trial signs off its bundle: its goal completes with its report,
 /// the director keeps a sign-off record, and an unattended run of the bundle on that robot then runs. The runs of
-/// the director list the trial, its run has the trial as its `started_by`, and `status` gives its report.
+/// the director list the trial, its run has the trial as its `started_by`, and `status` gives its report: without
+/// the journals while the trial runs, with them once it ended.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_trial_whose_runs_meet_the_thresholds_signs_off_its_bundle() -> peppygen::Result<()> {
     let rig = physical_rig().await?;
@@ -571,6 +572,14 @@ async fn a_trial_whose_runs_meet_the_thresholds_signs_off_its_bundle() -> peppyg
         "{:?}",
         ran.outcome
     );
+    let running = status::RequestData {
+        run: "t1".to_owned(),
+    };
+    let running = status::poll(&rig.harness, &running, WIRE).await?;
+    assert_eq!(running.state, "running");
+    let so_far: Value = serde_json::from_str(&running.details).unwrap();
+    assert_eq!(so_far["runs"][0]["run"], run.as_str(), "{so_far}");
+    assert!(so_far["runs"][0].get("journal").is_none(), "{so_far}");
     let counted = judge_ending_of(&rig, "t1", true).await?;
     assert_eq!((counted.runs_counted, counted.goes_on), (1, false));
     let (report, outcome) = trial_ended(goal).await?;

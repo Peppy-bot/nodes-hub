@@ -1443,6 +1443,7 @@ mod tests {
     use std::sync::Mutex;
 
     use workflow_documents::Located;
+    use workflow_documents::result::RefusalCause;
 
     use super::*;
 
@@ -1564,6 +1565,7 @@ mod tests {
         let held = "`alpha` takes part in run r1 of this director: wait for its end, or abort it";
         let refusal = |errors: Vec<Located>| RunRefusal {
             message: "the roles do not bind".to_owned(),
+            cause: RefusalCause::Checks,
             errors,
             assumption: None,
             says: None,

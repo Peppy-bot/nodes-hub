@@ -22,8 +22,8 @@ use tokio_util::sync::CancellationToken;
 use workflow_documents::expression::{Expression, Type, Value};
 use workflow_documents::result::{
     AssumptionKind, AssumptionOutcome, CheckToJudge, Duration, Ending, FailedStep, IncidentRecord,
-    LaneOutcome, LaneState, RUN_SUSPENDED, RunRefusal, RunResult, RunState, RunStatus,
-    SafeStateResult, SuspendedLane, Suspension, ToConfirm,
+    LaneOutcome, LaneState, RUN_SUSPENDED, RefusalCause, RunRefusal, RunResult, RunState,
+    RunStatus, SafeStateResult, SuspendedLane, Suspension, ToConfirm,
 };
 use workflow_documents::run::Attendance;
 use workflow_documents::work_cell::Uncovered;
@@ -890,6 +890,7 @@ async fn watch<H: Host>(
             Err(failure) => {
                 return Some(RunRefusal {
                     message: format!("{what} did not read: {failure}"),
+                    cause: RefusalCause::WatchUnread,
                     errors: Vec::new(),
                     assumption: None,
                     says: None,
@@ -909,6 +910,7 @@ async fn watch<H: Host>(
     let watched: Vec<&Uncovered> = outcome.uncovered.iter().collect();
     Some(RunRefusal {
         message: outside_the_envelope(&watched),
+        cause: RefusalCause::WatchOutsideTheEnvelope,
         errors: Vec::new(),
         assumption: None,
         says: None,
@@ -965,6 +967,7 @@ fn unconfirmed(plan: &Plan, outcome: &mut Outcome) -> Option<RunRefusal> {
             "the assumption `{name}` has no check and the run document does not confirm it, and no person confirms an assumption of an unattended run: {}",
             assumption.says
         ),
+        cause: RefusalCause::Assumption,
         errors: Vec::new(),
         assumption: Some(name.clone()),
         says: Some(assumption.says.clone()),
@@ -1001,6 +1004,7 @@ async fn checked_assumptions<H: Host>(
             Ok(false) => {
                 return Some(RunRefusal {
                     message: format!("the assumption `{name}` is false: {}", assumption.says),
+                    cause: RefusalCause::Assumption,
                     errors: Vec::new(),
                     assumption: Some(name.clone()),
                     says: Some(assumption.says.clone()),
@@ -1009,6 +1013,7 @@ async fn checked_assumptions<H: Host>(
             Err(failure) => {
                 return Some(RunRefusal {
                     message: format!("the check of `{name}` failed: {failure}"),
+                    cause: RefusalCause::Assumption,
                     errors: Vec::new(),
                     assumption: Some(name.clone()),
                     says: Some(assumption.says.clone()),
@@ -1087,6 +1092,7 @@ async fn judgement<H: Host>(
         };
         return Judgement::Refused(RunRefusal {
             message,
+            cause: RefusalCause::OperatorJudgement,
             errors: Vec::new(),
             assumption: None,
             says: None,

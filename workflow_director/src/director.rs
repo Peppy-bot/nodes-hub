@@ -15,7 +15,8 @@ use tokio::sync::{broadcast, mpsc, watch};
 use workflow_documents::bundle::{BUNDLE_PATH, Bundle, BundleDocument, BundleFile, WORKFLOW_PATH};
 use workflow_documents::lock::{Lock, LockedNode, UNKNOWN_PEPPY};
 use workflow_documents::result::{
-    Difference, DifferenceKind, Duration as RunDuration, Ending, RunRefusal, RunResult, RunWorkflow,
+    Difference, DifferenceKind, Duration as RunDuration, Ending, RefusalCause, RunRefusal,
+    RunResult, RunWorkflow,
 };
 use workflow_documents::run::{Attendance, RoleBinding, RunDocument, VersionPolicy};
 use workflow_documents::work_cell::Uncovered;
@@ -1864,6 +1865,7 @@ fn refused_result(base: RunResult, message: &str, started: u64) -> RunResult {
         ending: Ending::Refused,
         refusal: Some(RunRefusal {
             message: message.to_owned(),
+            cause: RefusalCause::Checks,
             errors: Vec::new(),
             assumption: None,
             says: None,

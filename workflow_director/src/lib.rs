@@ -32,6 +32,7 @@ mod fleet;
 mod journal;
 mod leases;
 mod live;
+mod records;
 mod replay;
 mod serve;
 mod sign_off;

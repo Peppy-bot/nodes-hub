@@ -159,7 +159,8 @@ unattended, and `suspend` refuses it, naming the trial. Once it ends,
 `judge_ending` counts it: completed when it completed, a false success when
 it completed and its task is not done, and each emergency stop and other
 unsafe event as an unsafe event. A run that the director refuses on a watch
-value outside the envelope does not count: the work cell is not ready. Any
+value outside the envelope does not count (its refusal names that cause,
+`watch_outside_the_envelope`): the work cell is not ready. Any
 other run that ends before it starts counts as not completed. A run that
 does not start opens the leases again, and `next_run` fails with
 `attempt_failed`. A cancel of `next_run`, or the loss of its sender, aborts
@@ -178,8 +179,10 @@ every new trial, and a trial that ends early signs off nothing.
 
 Each trial has its record, `<journal_root>/workflow_director/trials/t<N>.json`,
 and a trial that the director did not end when it stopped ends interrupted
-when it starts again. `runs` lists the trials, and `status` gives the report
-of a trial `t<N>`.
+when it starts again. Two trials that start together get ids of their own.
+`runs` lists the trials, and `status` gives the report of a trial `t<N>`:
+while the trial runs, each of its runs without its journal, which `journal`
+gives; once the trial ended, with the journal of each run.
 
 ## Journals
 
