@@ -5,8 +5,40 @@ From: peppybot/rust-cargo-base:latest
     . /opt/openarm_backbone
 
 %post
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+
+    apt-get update -qq
+    apt-get install -qqy --no-install-recommends libclang-dev
+    rm -rf /var/lib/apt/lists/*
+
     cd /opt/openarm_backbone
     cargo build --release
+    # The binary links Qhull through qhull-sys, so Qhull's license ships
+    # beside it, led by where Qhull's source is. The license is read from
+    # the one qhull-sys package that cargo metadata names for the host; the
+    # metadata fetches the host's packages that the build did not, such as
+    # the dev-dependencies.
+    host=$(rustc -vV | sed -n 's/^host: //p')
+    cargo metadata --format-version 1 --locked --filter-platform "$host" \
+        > /tmp/metadata.json
+    manifests=$(grep -o '"manifest_path":"[^"]*/qhull-sys-[^/"]*/Cargo.toml"' \
+        /tmp/metadata.json) || {
+        echo "the build resolved no qhull-sys package, whose license the image ships" >&2
+        exit 1
+    }
+    rm /tmp/metadata.json
+    if [ "$(printf '%s\n' "$manifests" | wc -l)" -ne 1 ]; then
+        echo "the build resolved more than one qhull-sys package: $manifests" >&2
+        exit 1
+    fi
+    qhull_sys=${manifests#\"manifest_path\":\"}
+    qhull_sys=${qhull_sys%/Cargo.toml\"}
+    {
+        echo "openarm_backbone links Qhull. Its source is at http://www.qhull.org."
+        echo
+        cat "$qhull_sys/qhull/COPYING.txt"
+    } > target/release/QHULL_COPYING.txt
 
 %runscript
     cd /opt/openarm_backbone

@@ -215,10 +215,9 @@
     },
     parameters: {
       // Which OpenArm hardware generation the arms are: "v1" or "v2". Selects the embedded
-      // description (openarm_description) the srs_model arms and the bimanual collision
-      // model are built from. The wrong generation mis-models the arms, so the
-      // launcher says which. The torso proxy is shared across generations (the
-      // bimanual stand is unchanged).
+      // description (openarm_description) the srs_model arms and the self-collision
+      // model, its torso regions included, are built from. The wrong generation
+      // mis-models the arms, so the launcher says which.
       hardware_version: "string",
       // Which upstream command kind this instance follows: "joints"
       // (joint_link: panel, KER) or "pose" (pose_link: a Cartesian leader).
