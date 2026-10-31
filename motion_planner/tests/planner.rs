@@ -13,15 +13,13 @@ mod common;
 use chain_kinematics::nalgebra::{Point3, Quaternion, UnitQuaternion, Vector3};
 use motion_planner::fingers::riders;
 use motion_planner::node::NO_DEPTH_FRAME;
-use motion_planner::request::{MAX_PLANNING_TIME_S, OBJECTIVE};
+use motion_planner::request::MAX_PLANNING_TIME_S;
 use openarm_description::{ARM_DOF, HardwareVersion, Side, ready};
-use peppygen::Parameters;
 use peppygen::exposed_actions::motion_planning::plan_joint_path::{
-    GoalArmsItem, GoalGoalJointConstraintsItem, GoalGoalOrientationConstraintsItem,
-    GoalGoalPositionConstraintsItem,
+    GoalArmsItem, GoalGoalOrientationConstraintsItem, GoalGoalPositionConstraintsItem,
 };
 use peppygen::fixtures::exposed_actions::motion_planning::plan_joint_path::{
-    CancelState, Failure, FailureKind, GoalRequestData, ResultData, ResultOutcome, send_goal,
+    CancelState, FailureKind, GoalRequestData, ResultData, ResultOutcome, send_goal,
 };
 use peppygen::fixtures::exposed_services::motion_planning::{
     check_joint_path, clear_occupancy_map, describe_arms,
@@ -29,10 +27,11 @@ use peppygen::fixtures::exposed_services::motion_planning::{
 use peppygen::fixtures::harness::{Config, Harness};
 
 use common::{
-    LEFT_READY, OPENARM_V2, PLANNING_TIME_S, RIGHT_READY, Solid, TIMEOUT, arms, at_ms, check,
-    describe_camera, facing_the_robot, left_elbow, left_path, looking_at, parameters, publish_arms,
-    render, start, start_identified_as, start_with_camera, start_without_camera,
-    start_without_camera_with, start_without_the_rig, take_frame, take_frame_aligned,
+    Ended, LEFT_READY, OPENARM_V2, OVER_THE_TABLE, RIGHT_READY, TIMEOUT, UNDER_THE_TABLE, along,
+    arms, at_ms, check, describe_camera, facing_the_robot, left_elbow, left_path, looking_at,
+    parameters, plan, plan_from, plan_to, planned_waypoints, publish_arms, render, start,
+    start_identified_as, start_with_camera, start_without_camera, start_without_camera_with,
+    start_without_the_rig, table_across, take_frame, take_frame_aligned,
 };
 
 /// How near the forearm ends to a pose a plan holds it at: meters, and radians.
@@ -45,86 +44,6 @@ const APPROACH_AXIS_RAD: f64 = 0.05;
 /// How near an axis describe_arms names lies to the grasp frame's axis the model gives
 /// (rad).
 const GRASP_AXIS_RAD: f64 = 0.01;
-
-/// The configuration `t` of the way along the straight joint motion from `from` to
-/// `to`.
-fn along(from: &[f64; ARM_DOF], to: &[f64; ARM_DOF], t: f64) -> [f64; ARM_DOF] {
-    std::array::from_fn(|i| from[i] + (to[i] - from[i]) * t)
-}
-
-/// A plan of the left arm from where it stands to every joint within 0.01 of `q`.
-fn plan_to(q: &[f64; ARM_DOF]) -> GoalRequestData {
-    plan_from(&[], q)
-}
-
-/// A plan of the left arm from `start` (empty: where it stands) to every joint within
-/// 0.01 of `q`.
-fn plan_from(start: &[f64], q: &[f64; ARM_DOF]) -> GoalRequestData {
-    GoalRequestData {
-        arms: vec![GoalArmsItem {
-            arm_name: "left_arm".to_string(),
-            start_joint_positions: start.to_vec(),
-        }],
-        goal_joint_constraints: OPENARM_V2.arms[Side::Left]
-            .joint_names
-            .iter()
-            .zip(q)
-            .map(|(name, &position)| GoalGoalJointConstraintsItem {
-                joint_name: name.clone(),
-                position,
-                tolerance_above: 0.01,
-                tolerance_below: 0.01,
-            })
-            .collect(),
-        goal_position_constraints: Vec::new(),
-        goal_orientation_constraints: Vec::new(),
-        objective: OBJECTIVE.to_string(),
-        allowed_planning_time_s: PLANNING_TIME_S,
-    }
-}
-
-/// How a plan ends without a path.
-#[derive(Debug)]
-enum Ended {
-    /// The node refused the goal: it took nothing.
-    Refused(Failure),
-    /// The node took the goal and failed it.
-    Failed(Failure),
-}
-
-/// How a plan ends: its result, or the failure it was refused or failed with.
-async fn plan(harness: &Harness, goal: &GoalRequestData) -> Result<ResultData, Ended> {
-    let handle = send_goal(harness, goal, peppygen::DEFAULT_FEEDBACK_BOUND, TIMEOUT)
-        .await
-        .expect("the goal is sent");
-    if let Some(refusal) = handle.refusal {
-        return Err(Ended::Refused(refusal));
-    }
-    match handle
-        .get_result(TIMEOUT)
-        .await
-        .expect("the result arrives")
-        .outcome
-    {
-        ResultOutcome::Completed(data) => Ok(data),
-        ResultOutcome::Failed(failure) => Err(Ended::Failed(failure)),
-        other => panic!("the plan ends {other:?}"),
-    }
-}
-
-/// The waypoints of a plan's arm, as a check takes them.
-fn planned_waypoints(result: &ResultData) -> Vec<[f64; ARM_DOF]> {
-    result.arms[0]
-        .waypoints
-        .iter()
-        .map(|w| {
-            w.joint_positions
-                .as_slice()
-                .try_into()
-                .expect("a position for each joint")
-        })
-        .collect()
-}
 
 // Before the camera's first depth frame a plan and a check are refused; after it a
 // plan answers its path, each waypoint with the grasp-point pose limb_state reports
@@ -271,32 +190,11 @@ async fn the_arms_own_points_mark_nothing_while_they_move() -> peppygen::Result<
 // planned path around the table passes whole.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_check_passes_a_planned_path_and_stops_before_the_table() -> peppygen::Result<()> {
-    let (under_q, over_q) = (left_elbow(0.6), left_elbow(2.0));
-    let left = OPENARM_V2.arms[Side::Left].geometry.chain();
-    let hand = |q: &[f64; ARM_DOF]| left.world_ee_pose(q).translation.vector;
-    let (low, high) = (hand(&under_q).z, hand(&over_q).z);
-    assert!(high - low > 0.15, "the hand rises from {low} to {high}");
-    // The table's top lies where the hand crosses two fifths of the way up, found by
-    // bisection.
-    let height = low + (high - low) * 0.4;
-    let (mut crossing_t, mut past_t) = (0.0, 1.0);
-    while past_t - crossing_t > 1e-6 {
-        let t = (crossing_t + past_t) / 2.0;
-        if hand(&along(&under_q, &over_q, t)).z < height {
-            crossing_t = t;
-        } else {
-            past_t = t;
-        }
-    }
-    let crossing = hand(&along(&under_q, &over_q, crossing_t));
-    let table: Solid = (
-        [crossing.x - 0.1, crossing.y - 0.1, height - 0.05],
-        [crossing.x + 0.1, crossing.y + 0.1, height],
-    );
-    let camera = looking_at(
-        Vector3::new(crossing.x + 0.5, crossing.y, height + 0.7),
-        Vector3::new(crossing.x, crossing.y, height),
-    );
+    let (under_q, over_q) = (UNDER_THE_TABLE, OVER_THE_TABLE);
+    let (table, crossing_t) = table_across(&under_q, &over_q);
+    let ([x0, y0, _], [x1, y1, top]) = table;
+    let (x, y) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+    let camera = looking_at(Vector3::new(x + 0.5, y, top + 0.7), Vector3::new(x, y, top));
     let (harness, mocks) = start_with_camera(&camera).await?;
     publish_arms(&mocks, at_ms(0), &arms(under_q, RIGHT_READY)).await?;
     take_frame(
@@ -315,7 +213,7 @@ async fn a_check_passes_a_planned_path_and_stops_before_the_table() -> peppygen:
         !through.clear
             && through.clear_waypoints == 0
             && through.reason.starts_with("on the run from the start, ")
-            && through.reason.contains(" from the map, "),
+            && through.reason.contains(" from the map and the objects, "),
         "the straight path through the table: {through:?}"
     );
     let below = left_elbow(0.3);
@@ -333,7 +231,7 @@ async fn a_check_passes_a_planned_path_and_stops_before_the_table() -> peppygen:
         !stopped.clear
             && stopped.clear_waypoints == 1
             && stopped.reason.starts_with("on the run from waypoint 1, ")
-            && stopped.reason.contains(" from the map, "),
+            && stopped.reason.contains(" from the map and the objects, "),
         "the path through the table after a waypoint below it: {stopped:?}"
     );
 
@@ -625,25 +523,17 @@ async fn a_plan_holds_the_grasp_point_free_about_its_approach_axis() -> peppygen
     harness.shutdown().await
 }
 
-/// The goal samples of the plan a cancel ends: each draw runs the arm's inverse
-/// kinematics, and no host draws this many within the longest time a plan may take.
-const CANCEL_GOAL_SAMPLES: u32 = u32::MAX;
-
 /// A grasp point 5 m before the robot, out of either arm's reach.
 const OUT_OF_REACH: [f64; 3] = [5.0, 0.0, 1.0];
 
 // A cancel of a plan that nothing else ends before it arrives ends the goal cancelled:
-// the plan's goal sampling draws CANCEL_GOAL_SAMPLES configurations for a grasp point out
-// of reach, none of which meets it, until its deadline, the longest a plan may take. The
-// stop the cancel sets ends the plan itself (`node::tests::a_set_stop_ends_the_plan_stopped`).
+// the plan's goal sampling searches for a grasp point out of reach, which no search
+// meets, until its 1000 samples or its deadline, the longest a plan may take. The stop
+// the cancel sets ends the plan itself (`node::tests::a_set_stop_ends_the_plan_stopped`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cancel_ends_the_goal_cancelled() -> peppygen::Result<()> {
-    let params = Parameters {
-        goal_samples: CANCEL_GOAL_SAMPLES,
-        ..parameters()
-    };
     let (harness, _mocks) =
-        start_without_camera_with(params, &arms(LEFT_READY, RIGHT_READY)).await?;
+        start_without_camera_with(parameters(), &arms(LEFT_READY, RIGHT_READY)).await?;
     let long = GoalRequestData {
         allowed_planning_time_s: MAX_PLANNING_TIME_S,
         goal_joint_constraints: Vec::new(),

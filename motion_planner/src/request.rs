@@ -5,11 +5,12 @@
 
 use std::time::Duration;
 
-use chain_kinematics::nalgebra::{Isometry3, Quaternion, UnitQuaternion, Vector3};
+use chain_kinematics::nalgebra::{Isometry3, Vector3};
 use collision_geometry::chain::Rider;
 use control_core::positive_finite::PositiveFinite;
 use motion_planning_core::{
     Axis, Frame, Goal, GoalError, JointTarget, OrientationTarget, PositionTarget,
+    orientation_from_parts,
 };
 use openarm_description::{ARM_DOF, ArmPair, Side};
 use peppygen::exposed_actions::motion_planning::plan_joint_path::{
@@ -20,9 +21,6 @@ use peppygen::exposed_services::motion_planning::check_joint_path;
 
 use crate::robot::ArmModel;
 
-/// How far a quaternion's norm may lie from 1 and still name an orientation, which is
-/// then normalized.
-const UNIT_NORM_SLACK: f64 = 1e-3;
 /// The longest a plan may plan, in seconds.
 pub const MAX_PLANNING_TIME_S: f64 = 60.0;
 
@@ -295,11 +293,8 @@ fn frame(arm: &ArmModel, fingers: &[Rider], link: &str) -> Result<Frame, String>
     if link == arm.grasp_link {
         return Ok(Frame::GraspPoint);
     }
-    if let Some(finger) = fingers.iter().find(|finger| finger.link == link) {
-        return Ok(Frame::Link {
-            segment: finger.segment,
-            offset: finger.offset,
-        });
+    if let Some(finger) = fingers.iter().find(|finger| finger.name == link) {
+        return Ok(Frame::from(finger));
     }
     let chain = arm.geometry.chain();
     let tree = chain.tree();
@@ -348,14 +343,7 @@ fn orientation_target(
     c: &GoalGoalOrientationConstraintsItem,
 ) -> Result<OrientationTarget, String> {
     let frame = frame(arm, fingers, &c.link_name)?;
-    let [x, y, z, w] = c.orientation;
-    let quaternion = Quaternion::new(w, x, y, z);
-    if !(1.0 - UNIT_NORM_SLACK..=1.0 + UNIT_NORM_SLACK).contains(&quaternion.norm()) {
-        return Err(format!(
-            "an orientation is a unit quaternion [x, y, z, w]; [{x}, {y}, {z}, {w}] has norm {}",
-            quaternion.norm()
-        ));
-    }
+    let orientation = orientation_from_parts(c.orientation)?;
     let free_axis = match c.free_axis.as_str() {
         "none" => None,
         "x" => Some(Axis::X),
@@ -369,7 +357,7 @@ fn orientation_target(
     };
     Ok(OrientationTarget {
         frame,
-        orientation: UnitQuaternion::from_quaternion(quaternion),
+        orientation,
         tolerance_rad: tolerance("tolerance_rad", &c.link_name, c.tolerance_rad)?,
         free_axis,
     })
@@ -662,8 +650,8 @@ mod tests {
             .expect("the left arm's fingers");
         let finger = fingers.first().expect("a left finger");
         assert_eq!(
-            frame_of(finger.link),
-            held(Frame::Link {
+            frame_of(finger.name),
+            held(Frame::Part {
                 segment: finger.segment,
                 offset: finger.offset,
             })

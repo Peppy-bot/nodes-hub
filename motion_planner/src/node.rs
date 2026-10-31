@@ -1,21 +1,24 @@
 //! The node: its state, the followers of the arms' joint positions and of the depth
-//! frames, and the action and the services of motion_planning.
+//! frames, and the action and the services of motion_planning, the planning scene's
+//! among them.
 
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use camera_core::encoding::DEPTH_ENCODING;
 use camera_core::pinhole::{DepthModel, Intrinsics, Pinhole};
 use camera_core::pose::Pose;
+use chain_kinematics::nalgebra::Isometry3;
 use collision_geometry::chain::BodyGeometry;
 use control_core::latched_log::LatchedLog;
 use control_core::{receiving, serving};
 use motion_planning_core::{
-    Arm, CheckFailure, CheckRequest, DepthCamera, IkGoalSampler, PlanFailure, PlanRequest, Scene,
-    StartFault, check_arm_path, insert_cut_out, plan_arm_path, start_inside_limits,
+    Arm, CheckFailure, CheckRequest, DepthCamera, IkGoalSampler, PlanFailure, PlanRequest,
+    PlanningScene, RobotLinks, RobotPart, Scene, SceneError, StartFault, check_arm_path,
+    insert_cut_out, plan_arm_path, start_inside_limits,
 };
 use occupancy_map::{DistanceField, Frame, Scan, VoxelMap};
 use ompl_bridge::{PLANNING_THREADS, Planner};
@@ -28,11 +31,12 @@ use peppygen::consumed_services::workspace::describe_workspace;
 use peppygen::consumed_topics::camera::depth_stream;
 use peppygen::consumed_topics::limb_state::limb_states;
 use peppygen::exposed_actions::motion_planning::plan_joint_path::{
-    ActionHandle, FailureKind, GoalContext, GoalDecision, GoalRequestData,
+    self, ActionHandle, FailureKind, GoalContext, GoalDecision, GoalRequestData,
     PlanJointPathResultArmsItem, PlanJointPathResultArmsItemWaypointsItem,
 };
 use peppygen::exposed_services::motion_planning::{
-    check_joint_path, clear_occupancy_map, describe_arms,
+    apply_attached_collision_object, apply_collision_objects, check_joint_path,
+    clear_occupancy_map, describe_arms, get_planning_scene, set_allowed_collision,
 };
 use peppygen::{NodeRunner, Parameters, ProducerRef, Result};
 use self_collision_model::SelfCollisionModel;
@@ -40,11 +44,12 @@ use tokio::sync::watch;
 use tracing::{error, info};
 
 use crate::config::Config;
-use crate::fingers::{FingerFault, riders, riders_of_both_arms};
+use crate::fingers::{FingerFault, riders, riders_of_both_arms, with_held_objects};
 use crate::history::{Arms, History, Measured};
 use crate::intake::robot_mask;
 use crate::request::{CheckQuery, PlanQuery, parse_check, parse_plan};
 use crate::robot::{ArmModel, Robot, RobotModel};
+use crate::scene::{attach_request, object_requests, scene_response};
 use crate::self_model::HeldOtherArm;
 
 /// Bounds every call to another node.
@@ -69,7 +74,8 @@ pub const NO_DEPTH_FRAME: &str =
     "the map has taken in no depth frame since the planner started or the map was cleared";
 /// What the map waits on while no fault holds the camera's frames back.
 const AWAITING_FRAME: &str = "no depth frame has reached the map yet";
-/// Why a plan or a check is refused before the arms' joint positions are measured.
+/// Why a plan, a check or an attach is refused before the arms' joint positions are
+/// measured.
 const NO_JOINTS: &str = "no joint positions of the arms have been measured yet; ask again \
                          once limb_state publishes both arms' joints and both grippers' openings";
 /// What the node logs on a robot whose launcher linked no depth camera.
@@ -195,6 +201,9 @@ struct Node {
     body: BodyGeometry,
     /// The self model, its grippers at the openings it was built with.
     self_model: SelfCollisionModel,
+    /// The collision objects, the objects attached to the arms' grasp links, and the
+    /// pairs allowed to touch.
+    scene: Mutex<PlanningScene>,
     map: Mutex<Map>,
     /// The measured joint positions and gripper openings, which a depth frame waits on
     /// until they reach its stamp.
@@ -205,13 +214,33 @@ struct Node {
     camera_linked: bool,
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// The pose in the robot frame of the grasp link `link` with the arms at `arms`.
+///
+/// # Panics
+///
+/// When `link` is no arm's grasp link: the scene attaches objects to grasp links alone.
+fn grasp_pose(models: &ArmPair<ArmModel>, arms: &Arms, link: &str) -> Isometry3<f64> {
+    let arm = models
+        .iter()
+        .find(|arm| arm.grasp_link == link)
+        .expect("the scene attaches objects to grasp links alone");
+    arm.geometry.chain().world_ee_pose(&arms[arm.side])
+}
+
 impl Node {
+    /// The planning scene and the map, held together: every holder of both takes them
+    /// here, the scene first.
+    fn scene_and_map(&self) -> (MutexGuard<'_, PlanningScene>, MutexGuard<'_, Map>) {
+        let scene = lock(&self.scene);
+        (scene, lock(&self.map))
+    }
+
     /// Notes the passing fault the map waits on while it holds no frame.
     fn wait_on(&self, reason: impl Into<String>) {
         lock(&self.map).wait_on(Waiting::Passing(reason.into()));
@@ -308,6 +337,10 @@ async fn serve_once_identified(runner: Arc<NodeRunner>, config: Config, fault: F
     }
     tokio::spawn(serve_descriptions(runner.clone(), node.clone()));
     tokio::spawn(serve_clear(runner.clone(), node.clone()));
+    tokio::spawn(serve_objects(runner.clone(), node.clone()));
+    tokio::spawn(serve_attachments(runner.clone(), node.clone()));
+    tokio::spawn(serve_allowed_pairs(runner.clone(), node.clone()));
+    tokio::spawn(serve_scene(runner.clone(), node.clone()));
     tokio::spawn(serve_checks(runner.clone(), node.clone()));
     tokio::spawn(serve_plans(runner, node));
 }
@@ -333,7 +366,8 @@ async fn identify(runner: &NodeRunner) -> Option<String> {
     }
 }
 
-/// The node at start: the robot's model fitted to its meshes, and an empty map.
+/// The node at start: the robot's model fitted to its meshes, an empty scene of the
+/// robot's links, and an empty map.
 fn start(
     config: Config,
     robot: Robot,
@@ -345,6 +379,12 @@ fn start(
         body,
         self_model,
     } = robot.model()?;
+    let links = RobotLinks::new(
+        arms.iter()
+            .flat_map(|arm| arm.link_names.iter().cloned())
+            .chain(body.link_names().map(str::to_string)),
+        arms.iter().map(|arm| arm.grasp_link.to_string()),
+    );
     let voxels = VoxelMap::new(frame.clone(), config.voxel_size, config.bounds)?;
     info!(
         "motion planner: {}, {} m voxels, clearance {} m, {} attempts",
@@ -359,6 +399,7 @@ fn start(
         arms,
         body,
         self_model,
+        scene: Mutex::new(PlanningScene::new(links)),
         map: Mutex::new(Map {
             voxels,
             stamp: None,
@@ -404,7 +445,8 @@ fn record(node: &Node, message: &limb_states::Message, malformed: &LatchedLog) {
             malformed.success();
         }
         None => malformed.failure(
-            "a message holds no seven joints for each arm, or no opening for each gripper",
+            "a message holds no seven finite joint positions for each arm, or no opening for \
+             each gripper",
         ),
     }
 }
@@ -431,7 +473,7 @@ fn push_measured(node: &Node, at: SystemTime, measured: &Measured) {
     }
 }
 
-/// Both arms' joint positions in a limb_states message.
+/// Both arms' joint positions in a limb_states message, each finite.
 fn arms_of(message: &limb_states::Message) -> Option<Arms> {
     let mut offset = 0;
     let mut found: ArmPair<Option<[f64; ARM_DOF]>> = ArmPair::new(None, None);
@@ -440,7 +482,9 @@ fn arms_of(message: &limb_states::Message) -> Option<Arms> {
         let values = message.joint_positions.get(offset..offset + count)?;
         offset += count;
         if let Ok(side) = Side::from_arm_name(name) {
-            found[side] = values.try_into().ok();
+            found[side] = <[f64; ARM_DOF]>::try_from(values)
+                .ok()
+                .filter(|q| q.iter().all(|v| v.is_finite()));
         }
     }
     found.transpose()
@@ -872,10 +916,11 @@ impl Intake {
     }
 
     /// Takes `frame` into the map, with the robot cut out where it stood at the frame's
-    /// stamp, its grippers at their openings then, unless it comes within a frame
-    /// interval after the last one taken, or the camera took it at or before the newest
-    /// joint positions measured when the map was last cleared, whenever it arrives. A
-    /// frame of another encoding than `DEPTH_ENCODING` is skipped.
+    /// stamp, its grippers at their openings then and the objects attached to its grasp
+    /// links held there, and the planning scene's other objects where they stand, unless
+    /// it comes within a frame interval after the last one taken, or the camera took it at
+    /// or before the newest joint positions measured when the map was last cleared,
+    /// whenever it arrives. A frame of another encoding than `DEPTH_ENCODING` is skipped.
     fn take(&mut self, frame: &depth_stream::Message) {
         let node = &self.node;
         if frame.encoding != DEPTH_ENCODING {
@@ -905,17 +950,20 @@ impl Intake {
             Ok(fingers) => fingers,
             Err(e) => return self.skip(format!("the self model's fingers: {e}")),
         };
+        let (scene, mut map) = node.scene_and_map();
+        if map.cleared_at.is_some_and(|cleared| at <= cleared) {
+            return;
+        }
+        let carried =
+            fingers.map(|side, fingers| with_held_objects(fingers, &node.arms[side], &scene));
         let robot = robot_mask(
             &node.arms,
             &node.body,
             &measured.arms,
-            &fingers,
+            &carried,
+            &scene,
             node.config.padding,
         );
-        let mut map = lock(&node.map);
-        if map.cleared_at.is_some_and(|cleared| at <= cleared) {
-            return;
-        }
         insert_cut_out(
             &mut map.voxels,
             &Scan {
@@ -940,9 +988,10 @@ impl Intake {
     }
 }
 
-/// Why a request is refused, or ends with no answer: it does not parse, the planner
-/// cannot plan or check yet, a check runs past `CHECK_TIME`, or a finger of the self
-/// model does not fit its arm, which the robot's model refuses at start.
+/// Why a request is refused, or ends with no answer: it does not parse or the planning
+/// scene refuses it, the planner cannot plan or check yet, a check runs past
+/// `CHECK_TIME`, or a finger of the self model does not fit its arm, which the robot's
+/// model refuses at start.
 #[derive(Debug, PartialEq)]
 enum Refusal {
     Rejected(String),
@@ -951,28 +1000,47 @@ enum Refusal {
     AttemptFailed(String),
 }
 
-impl Refusal {
-    fn plan_failure(self) -> (FailureKind, String) {
-        match self {
-            Self::Rejected(message) => (FailureKind::Rejected, message),
-            Self::PreconditionFailed(message) => (FailureKind::PreconditionFailed, message),
-            Self::TimedOut(message) => (FailureKind::Timeout, message),
-            Self::AttemptFailed(message) => (FailureKind::AttemptFailed, message),
-        }
-    }
-
-    fn check_failure(self) -> check_joint_path::Failure {
-        use check_joint_path::{Failure, FailureKind};
-        match self {
-            Self::Rejected(message) => Failure::new(FailureKind::Rejected, message),
-            Self::PreconditionFailed(message) => {
-                Failure::new(FailureKind::PreconditionFailed, message)
-            }
-            Self::TimedOut(message) => Failure::new(FailureKind::Timeout, message),
-            Self::AttemptFailed(message) => Failure::new(FailureKind::AttemptFailed, message),
+impl From<SceneError> for Refusal {
+    /// The scene refuses a request with rejected, but one whose grasp link stands where
+    /// no measured joint positions place it yet, which plans and checks refuse with the
+    /// same message.
+    fn from(error: SceneError) -> Self {
+        match error {
+            SceneError::Unplaced(_) => Self::PreconditionFailed(NO_JOINTS.to_string()),
+            _ => Self::Rejected(error.to_string()),
         }
     }
 }
+
+/// Gives the failure of each member `$member`, the plan's goal and each service, for a
+/// refusal: the kind of the same name.
+macro_rules! member_failures {
+    ($($member:ident),+) => {$(
+        impl From<Refusal> for $member::Failure {
+            fn from(refusal: Refusal) -> Self {
+                use $member::{Failure, FailureKind};
+                match refusal {
+                    Refusal::Rejected(message) => Failure::new(FailureKind::Rejected, message),
+                    Refusal::PreconditionFailed(message) => {
+                        Failure::new(FailureKind::PreconditionFailed, message)
+                    }
+                    Refusal::TimedOut(message) => Failure::new(FailureKind::Timeout, message),
+                    Refusal::AttemptFailed(message) => {
+                        Failure::new(FailureKind::AttemptFailed, message)
+                    }
+                }
+            }
+        }
+    )+};
+}
+
+member_failures!(
+    plan_joint_path,
+    check_joint_path,
+    apply_collision_objects,
+    apply_attached_collision_object,
+    set_allowed_collision
+);
 
 /// Refuses `map` while a linked camera has given it no frame, naming what it waits on.
 fn framed(node: &Node, map: &Map) -> std::result::Result<(), Refusal> {
@@ -985,10 +1053,11 @@ fn framed(node: &Node, map: &Map) -> std::result::Result<(), Refusal> {
     Ok(())
 }
 
-/// What a plan or a check runs on, taken at once: the map as it stands and the stamp
-/// of its newest frame, the arms' last measured joint positions, and the self model
-/// with the grippers at their measured openings.
+/// What a plan or a check runs on, taken at once: the planning scene and the map as they
+/// stand and the stamp of the map's newest frame, the arms' last measured joint
+/// positions, and the self model with the grippers at their measured openings.
 struct Snapshot {
+    scene: PlanningScene,
     voxels: VoxelMap,
     stamp: Option<SystemTime>,
     measured: Arms,
@@ -996,23 +1065,24 @@ struct Snapshot {
 }
 
 impl Snapshot {
-    /// The snapshot of `node`'s map now, with the arms where `latest` measured them and
-    /// `self_model` at its openings; refused while a linked camera has given the map no
-    /// frame, and before the arms' joint positions are measured.
+    /// The snapshot of `node`'s planning scene and map now, with the arms where `latest`
+    /// measured them and `self_model` at its openings; refused while a linked camera has
+    /// given the map no frame, and before the arms' joint positions are measured.
     fn of(
         node: &Node,
         latest: Option<Measured>,
         self_model: SelfCollisionModel,
     ) -> std::result::Result<Self, Refusal> {
-        let (voxels, stamp) = {
-            let map = lock(&node.map);
+        let (scene, voxels, stamp) = {
+            let (scene, map) = node.scene_and_map();
             framed(node, &map)?;
-            (map.voxels.clone(), map.stamp)
+            (scene.clone(), map.voxels.clone(), map.stamp)
         };
         let measured = latest
             .map(|measured| measured.arms)
             .ok_or_else(|| Refusal::PreconditionFailed(NO_JOINTS.to_string()))?;
         Ok(Self {
+            scene,
             voxels,
             stamp,
             measured,
@@ -1021,11 +1091,13 @@ impl Snapshot {
     }
 
     /// Runs `run` on the arm on `side` as a plan or a check moves it: its fingers
-    /// carried by its hand at the gripper's opening, the other arm held where it was
-    /// measured, the robot's own body checked over a copy of the self model for each of
-    /// `threads` threads that ask at once; with the arm's measured joint positions. A
-    /// finger that does not fit the arm, which the robot's model refuses at start, runs
-    /// nothing.
+    /// carried by its hand at the gripper's opening and the objects attached to its grasp
+    /// link carried with them, the other arm held where it was measured, the robot's own
+    /// body checked over a copy of the self model for each of `threads` threads that ask
+    /// at once, the scene's other objects where they stand or where the other arm holds
+    /// them, and the self model's bodies the arm does not move, which a carried object
+    /// keeps clear of; with the arm's measured joint positions. A finger that does not
+    /// fit the arm, which the robot's model refuses at start, runs nothing.
     fn run<T>(
         &self,
         node: &Node,
@@ -1033,11 +1105,18 @@ impl Snapshot {
         threads: NonZeroUsize,
         run: impl FnOnce(&Arm<ARM_DOF>, &Scene, &[f64; ARM_DOF]) -> T,
     ) -> std::result::Result<T, FingerFault> {
+        let model = &node.arms[side];
         let field = DistanceField::of(&self.voxels);
         let self_model =
             HeldOtherArm::new(&self.self_model, threads, side, self.measured[side.other()]);
-        let riders = riders(&self.self_model, &node.arms[side].geometry, side)?;
-        let arm = Arm::new(&node.arms[side].geometry, Some(&self_model)).riding(&riders)?;
+        let fingers = riders(&self.self_model, &model.geometry, side)?;
+        let carried = with_held_objects(fingers, model, &self.scene);
+        let arm = Arm::new(&model.geometry, Some(&self_model)).riding(&carried)?;
+        let objects = self.scene.for_arm(model.grasp_link, |link| {
+            grasp_pose(&node.arms, &self.measured, link)
+        });
+        let mut placed_model = self.self_model.clone();
+        let parts = unmoved_parts(&mut placed_model, &self.measured, model);
         let stamp_ns = self
             .stamp
             .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
@@ -1046,9 +1125,31 @@ impl Snapshot {
             map: &self.voxels,
             field: &field,
             stamp: stamp_ns,
+            objects: objects.objects(&parts),
         };
         Ok(run(&arm, &scene, &self.measured[side]))
     }
+}
+
+/// The pieces of the bodies of `model`, the self model, with the arms at `measured`, that
+/// a plan of `arm` does not move: the other arm's with its fingers, and the body's, each
+/// by the name of its link.
+fn unmoved_parts<'m>(
+    model: &'m mut SelfCollisionModel,
+    measured: &Arms,
+    arm: &ArmModel,
+) -> Vec<RobotPart<'m>> {
+    model
+        .world_pieces(&measured[Side::Left], &measured[Side::Right])
+        .expect("the history holds finite joint positions")
+        .into_iter()
+        .filter(|(link, _)| !arm.link_names.iter().any(|own| own == link))
+        .flat_map(|(link, pieces)| {
+            pieces
+                .into_iter()
+                .map(move |piece| RobotPart { link, piece })
+        })
+        .collect()
 }
 
 /// A start tolerance for each joint of an arm.
@@ -1114,6 +1215,104 @@ fn clear(node: &Node) {
     }
 }
 
+/// Serves apply_collision_objects: a call blocks its handler's thread in place while it
+/// waits on the scene and the map, which a frame's intake holds, and clears the map, and
+/// the runtime moves its other tasks off that thread.
+async fn serve_objects(runner: Arc<NodeRunner>, node: Arc<Node>) {
+    let token = runner.cancellation_token().clone();
+    serving::serve("apply_collision_objects", token.cancelled(), || {
+        apply_collision_objects::handle_next_request(&runner, |request| {
+            tokio::task::block_in_place(|| apply_objects(&node, &request.data))
+                .map_err(apply_collision_objects::Failure::from)
+        })
+    })
+    .await;
+}
+
+/// Applies apply_collision_objects' `request`: the scene applies its objects in order, all
+/// or none, and clears from the map every voxel an object it places intersects.
+fn apply_objects(
+    node: &Node,
+    request: &apply_collision_objects::RequestData,
+) -> std::result::Result<(), Refusal> {
+    let (mut scene, mut map) = node.scene_and_map();
+    scene
+        .apply_collision_objects(&object_requests(request), &mut map.voxels)
+        .map_err(Refusal::from)
+}
+
+/// Serves apply_attached_collision_object: a call blocks its handler's thread in place as
+/// apply_collision_objects' does.
+async fn serve_attachments(runner: Arc<NodeRunner>, node: Arc<Node>) {
+    let token = runner.cancellation_token().clone();
+    serving::serve("apply_attached_collision_object", token.cancelled(), || {
+        apply_attached_collision_object::handle_next_request(&runner, |request| {
+            tokio::task::block_in_place(|| apply_attachment(&node, &request.data))
+                .map_err(apply_attached_collision_object::Failure::from)
+        })
+    })
+    .await;
+}
+
+/// Applies apply_attached_collision_object's `request`: an object attaches to a grasp
+/// link, or detaches from it, where the link stands at the arms' last measured joint
+/// positions, and an attached object clears from the map every voxel it intersects.
+fn apply_attachment(
+    node: &Node,
+    request: &apply_attached_collision_object::RequestData,
+) -> std::result::Result<(), Refusal> {
+    let measured = node.latest().map(|measured| measured.arms);
+    let (mut scene, mut map) = node.scene_and_map();
+    scene
+        .apply_attached_collision_object(
+            &attach_request(request),
+            |link| measured.map(|arms| grasp_pose(&node.arms, &arms, link)),
+            &mut map.voxels,
+        )
+        .map_err(Refusal::from)
+}
+
+/// Serves set_allowed_collision: a call blocks its handler's thread in place while it waits
+/// on the scene, which a frame's intake holds.
+async fn serve_allowed_pairs(runner: Arc<NodeRunner>, node: Arc<Node>) {
+    let token = runner.cancellation_token().clone();
+    serving::serve("set_allowed_collision", token.cancelled(), || {
+        set_allowed_collision::handle_next_request(&runner, |request| {
+            tokio::task::block_in_place(|| allow_pairs(&node, &request.data))
+                .map_err(set_allowed_collision::Failure::from)
+        })
+    })
+    .await;
+}
+
+/// Applies set_allowed_collision's `request`: the scene lets its object touch each of its
+/// other names, or stops it.
+fn allow_pairs(
+    node: &Node,
+    request: &set_allowed_collision::RequestData,
+) -> std::result::Result<(), Refusal> {
+    lock(&node.scene)
+        .set_allowed_collision(&request.name, &request.other_names, request.allowed)
+        .map_err(Refusal::from)
+}
+
+/// Serves get_planning_scene: the scene, the clearance each state keeps, and the side of
+/// the map's voxels. A call blocks its handler's thread in place while it waits on the
+/// scene, which a frame's intake holds.
+async fn serve_scene(runner: Arc<NodeRunner>, node: Arc<Node>) {
+    let token = runner.cancellation_token().clone();
+    serving::serve("get_planning_scene", token.cancelled(), || {
+        get_planning_scene::handle_next_request(&runner, |_request| {
+            let snapshot = tokio::task::block_in_place(|| {
+                lock(&node.scene)
+                    .snapshot(node.config.min_clearance_m, node.config.voxel_size.get())
+            });
+            Ok(scene_response(snapshot))
+        })
+    })
+    .await;
+}
+
 /// The instant a check asked at `asked_at` ends by.
 fn check_deadline(asked_at: Instant) -> Instant {
     asked_at + CHECK_TIME
@@ -1129,7 +1328,7 @@ async fn serve_checks(runner: Arc<NodeRunner>, node: Arc<Node>) {
             tokio::task::block_in_place(|| {
                 check(&node, &request.data, check_deadline(Instant::now()))
             })
-            .map_err(Refusal::check_failure)
+            .map_err(check_joint_path::Failure::from)
         })
     })
     .await;
@@ -1200,8 +1399,8 @@ async fn serve_plans(runner: Arc<NodeRunner>, node: Arc<Node>) {
                         GoalDecision::accept()
                     }
                     Err(refusal) => {
-                        let (kind, message) = refusal.plan_failure();
-                        GoalDecision::refuse(kind, message)
+                        let failure = plan_joint_path::Failure::from(refusal);
+                        GoalDecision::refuse(failure.kind, failure.message)
                     }
                 })
             }) => next,
@@ -1424,11 +1623,16 @@ mod tests {
 
     use std::task::{Context, Poll, Waker};
 
-    use chain_kinematics::nalgebra::{Isometry3, Point3, UnitQuaternion, Vector3};
-    use collision_geometry::chain::Padding;
+    use chain_kinematics::nalgebra::{Point3, UnitQuaternion, Vector3};
+    use collision_geometry::chain::{Padding, RiderBody};
+    use motion_planning_core::OCCUPANCY_MAP;
+    use occupancy_map::Voxel;
     use openarm_description::ready;
     use peppygen::exposed_actions::motion_planning::plan_joint_path::{
         GoalArmsItem, GoalGoalJointConstraintsItem,
+    };
+    use peppygen::exposed_services::motion_planning::apply_collision_objects::{
+        ApplyCollisionObjectsObjectsItem, ApplyCollisionObjectsObjectsItemShapesItem,
     };
     use peppygen::exposed_services::motion_planning::check_joint_path::{
         CheckJointPathArmsItem, CheckJointPathArmsItemWaypointsItem,
@@ -1466,9 +1670,9 @@ mod tests {
         let mut turned = ready(Side::Left);
         turned[0] += 0.1;
         let request = path_of(Side::Left, &[turned]);
-        let late = check(&node, &request, Instant::now())
-            .expect_err("a check with no time left")
-            .check_failure();
+        let late = check_joint_path::Failure::from(
+            check(&node, &request, Instant::now()).expect_err("a check with no time left"),
+        );
         assert_eq!(late.kind, check_joint_path::FailureKind::Timeout);
         assert_eq!(
             late.message,
@@ -2053,7 +2257,7 @@ mod tests {
 
     // A limb_states message records both arms' joints and both grippers' openings, which
     // plans and checks then read in the self model; a message that lacks a gripper's
-    // opening records nothing.
+    // opening, or one whose joint position is not finite, records nothing.
     #[test]
     fn a_message_records_the_joints_and_the_openings() {
         let node = started(&parameters(), false);
@@ -2079,6 +2283,14 @@ mod tests {
         record(
             &node,
             &limb_states_at(after(1_100), right, left, &[0.5]),
+            &malformed,
+        );
+        assert_eq!(node.latest(), Some(measured));
+        let mut broken = left;
+        broken[3] = f64::NAN;
+        record(
+            &node,
+            &limb_states_at(after(1_200), broken, right, &[0.5, 0.5]),
             &malformed,
         );
         assert_eq!(node.latest(), Some(measured));
@@ -2201,10 +2413,18 @@ mod tests {
         let unpadded = Padding::new(1.0, 0.0).expect("the padding that grows nothing");
         let robot_holds = |model: &SelfCollisionModel, point: &Point3<f64>| {
             let fingers = riders_of_both_arms(model, &node.arms).expect("the arms' fingers");
-            robot_mask(&node.arms, &node.body, &closed.arms, &fingers, unpadded)
-                .placed()
-                .iter()
-                .any(|part| part.contains(point))
+            let scene = lock(&node.scene);
+            robot_mask(
+                &node.arms,
+                &node.body,
+                &closed.arms,
+                &fingers,
+                &scene,
+                unpadded,
+            )
+            .placed()
+            .iter()
+            .any(|part| part.contains(point))
         };
         let shut_fingers = riders_of_both_arms(&shut, &node.arms).expect("the arms' fingers");
         let point = Side::BOTH
@@ -2215,10 +2435,10 @@ mod tests {
                     .iter()
                     .flat_map(move |finger| {
                         let placed = posed.link_pose_world(finger.segment) * finger.offset;
-                        finger
-                            .pieces
-                            .iter()
-                            .map(move |piece| placed * piece.center())
+                        let RiderBody::Pieces(pieces) = finger.body else {
+                            panic!("a finger is a part of the robot");
+                        };
+                        pieces.iter().map(move |piece| placed * piece.center())
                     })
                     .collect::<Vec<_>>()
             })
@@ -2235,6 +2455,201 @@ mod tests {
         intake.take(&frame_seeing(after(1_050), 300));
         assert_eq!(map_stamp(&node), Some(after(1_050)));
         assert_eq!(lock(&node.map).voxels.occupied().count(), 0);
+    }
+
+    /// A point to the right of the robot and in front of it, about 0.2 m above the floor,
+    /// at the center of a voxel of the launcher's 2 cm map, so the hit of a ray that ends
+    /// on it lands in that voxel whatever the rounding.
+    const BESIDE: [f64; 3] = [0.51, -0.61, 0.21];
+
+    /// A camera 0.3 m above `point`, looking down at it.
+    fn above(point: [f64; 3]) -> Pose {
+        let down = UnitQuaternion::from_axis_angle(&Vector3::x_axis(), std::f64::consts::PI);
+        Pose::new(
+            [point[0], point[1], point[2] + 0.3],
+            [down.i, down.j, down.k, down.w],
+        )
+        .expect("the camera's pose")
+    }
+
+    /// The entry of apply_collision_objects that applies `operation` to the cube `id`,
+    /// 5 cm on a side, about `center`.
+    fn cube(operation: &str, id: &str, center: [f64; 3]) -> ApplyCollisionObjectsObjectsItem {
+        ApplyCollisionObjectsObjectsItem {
+            id: id.to_string(),
+            operation: operation.to_string(),
+            position: center,
+            orientation: [0.0, 0.0, 0.0, 1.0],
+            shapes: vec![ApplyCollisionObjectsObjectsItemShapesItem {
+                kind: "box".to_string(),
+                dimensions: vec![0.05; 3],
+                mesh_vertices: Vec::new(),
+                mesh_triangles: Vec::new(),
+                position: [0.0; 3],
+                orientation: [0.0, 0.0, 0.0, 1.0],
+            }],
+        }
+    }
+
+    fn objects(
+        objects: Vec<ApplyCollisionObjectsObjectsItem>,
+    ) -> apply_collision_objects::RequestData {
+        apply_collision_objects::RequestData { objects }
+    }
+
+    /// The attach of the object `id` to the left arm's grasp link, touching nothing else.
+    fn attach_to_the_left_hand(id: &str) -> apply_attached_collision_object::RequestData {
+        apply_attached_collision_object::RequestData {
+            object_id: id.to_string(),
+            link_name: "openarm_left_tcp".to_string(),
+            touch_links: Vec::new(),
+            operation: "attach".to_string(),
+        }
+    }
+
+    /// Marks the voxel of `point` in the map of `node` with three hits from a camera above
+    /// it: OctoMap's hit adds 0.85 to a voxel's log-odds, which a cleared voxel holds at
+    /// its floor, -2.0, and a voxel at 0 or above is occupied.
+    fn mark(node: &Node, point: [f64; 3]) {
+        let mut map = lock(&node.map);
+        let scan = Scan {
+            frame: &node.frame,
+            sensor: above(point),
+            points: &[[0.0, 0.0, 0.3]],
+            max_range_m: node.config.max_range_m,
+        };
+        for _ in 0..3 {
+            map.voxels
+                .insert(&scan, &[])
+                .expect("the scan stands in the map's frame");
+        }
+    }
+
+    /// Whether the voxel of `point` in the map of `node` is occupied.
+    fn occupied_at(node: &Node, point: [f64; 3]) -> bool {
+        let map = lock(&node.map);
+        let key = map.voxels.key(point).expect("a point inside the map");
+        map.voxels.is_occupied(key)
+    }
+
+    // An object clears from the map every voxel it intersects where a call leaves it: an
+    // add elsewhere leaves a voxel occupied, a move onto the voxel clears it, and an attach
+    // clears it again under the object where it stands. A refused batch clears nothing and
+    // places nothing.
+    #[test]
+    fn objects_clear_the_voxels_they_intersect_where_a_call_leaves_them() {
+        let node = started(&parameters(), false);
+        measure_at(&node, after(1_000), still());
+        let elsewhere = [BESIDE[0], BESIDE[1], BESIDE[2] + 0.4];
+        mark(&node, BESIDE);
+        assert!(occupied_at(&node, BESIDE), "the voxel the camera marks");
+        apply_objects(&node, &objects(vec![cube("add", "box", elsewhere)])).expect("added");
+        assert!(occupied_at(&node, BESIDE), "with the box elsewhere");
+        let refused = apply_objects(
+            &node,
+            &objects(vec![
+                cube("move", "box", BESIDE),
+                cube("remove", "nothing", BESIDE),
+            ]),
+        );
+        assert!(matches!(refused, Err(Refusal::Rejected(_))), "{refused:?}");
+        assert!(occupied_at(&node, BESIDE), "after a refused batch");
+        apply_objects(&node, &objects(vec![cube("move", "box", BESIDE)])).expect("moved");
+        assert!(!occupied_at(&node, BESIDE), "with the box moved onto it");
+        mark(&node, BESIDE);
+        apply_attachment(&node, &attach_to_the_left_hand("box")).expect("attached");
+        assert!(
+            !occupied_at(&node, BESIDE),
+            "with the box attached where it stands"
+        );
+    }
+
+    /// Every voxel of the map of `node` a ray has reached, by its center, with what it holds.
+    fn known_voxels(node: &Node) -> Vec<([f64; 3], Voxel)> {
+        let map = lock(&node.map);
+        map.voxels
+            .known()
+            .map(|key| (map.voxels.center(key), map.voxels.voxel(key)))
+            .collect()
+    }
+
+    // An apply_collision_objects call of no objects, and a set_allowed_collision call of no
+    // other names, allowing or stopping, change nothing: the scene and the map stay as
+    // they were.
+    #[test]
+    fn a_call_of_no_objects_or_no_names_changes_nothing() {
+        let node = started(&parameters(), false);
+        measure_at(&node, after(1_000), still());
+        let elsewhere = [BESIDE[0], BESIDE[1], BESIDE[2] + 0.4];
+        mark(&node, BESIDE);
+        apply_objects(&node, &objects(vec![cube("add", "box", elsewhere)])).expect("added");
+        let pair = |other_names: Vec<String>, allowed: bool| set_allowed_collision::RequestData {
+            name: "box".to_string(),
+            other_names,
+            allowed,
+        };
+        allow_pairs(&node, &pair(vec![OCCUPANCY_MAP.to_string()], true)).expect("allowed");
+        assert_eq!(
+            lock(&node.scene).snapshot(0.0, 0.0).allowed_pairs,
+            [["box".to_string(), OCCUPANCY_MAP.to_string()]]
+        );
+        let (scene, voxels) = (lock(&node.scene).clone(), known_voxels(&node));
+        apply_objects(&node, &objects(Vec::new())).expect("an empty list applies");
+        for allowed in [true, false] {
+            allow_pairs(&node, &pair(Vec::new(), allowed)).expect("no other names apply");
+        }
+        assert_eq!(*lock(&node.scene), scene);
+        assert_eq!(known_voxels(&node), voxels);
+    }
+
+    // An attach before the arms' joint positions are measured is refused with
+    // precondition_failed and the message a plan or a check gives for the same cause.
+    #[test]
+    fn an_attach_before_the_arms_are_measured_names_what_it_waits_on() {
+        let node = started(&parameters(), false);
+        apply_objects(&node, &objects(vec![cube("add", "box", BESIDE)])).expect("added");
+        let unmeasured = Err(Refusal::PreconditionFailed(NO_JOINTS.to_string()));
+        assert_eq!(
+            apply_attachment(&node, &attach_to_the_left_hand("box")),
+            unmeasured
+        );
+        assert_eq!(snapshot(&node), unmeasured);
+    }
+
+    // Three frames that see a point inside an object mark nothing, and nor do three that see
+    // it inside an object the left arm holds, where the arm held it at their stamps, though
+    // the arm was measured elsewhere since; three frames taken once the arm had moved the
+    // object away mark the point's voxel.
+    #[test]
+    fn a_frame_marks_nothing_inside_an_object_where_it_stood_at_the_stamp() {
+        let node = Arc::new(started(&parameters(), true));
+        let mut intake = intake_at(node.clone(), &above(BESIDE));
+        let three_frames = |intake: &mut Intake, from_ms: u64| {
+            for ms in [from_ms, from_ms + 200, from_ms + 400] {
+                intake.take(&frame_seeing(after(ms), 300));
+                assert_eq!(map_stamp(&node), Some(after(ms)));
+            }
+        };
+        measure(&node, 1_000, 2_100);
+        apply_objects(&node, &objects(vec![cube("add", "box", BESIDE)])).expect("added");
+        three_frames(&mut intake, 1_100);
+        assert!(!occupied_at(&node, BESIDE), "a point inside the box");
+        apply_attachment(&node, &attach_to_the_left_hand("box")).expect("attached");
+        let mut moved = still();
+        moved.arms[Side::Left][3] += 0.5;
+        for ms in (2_300..=2_900).step_by(100) {
+            measure_at(&node, after(ms), moved);
+        }
+        three_frames(&mut intake, 1_700);
+        assert!(
+            !occupied_at(&node, BESIDE),
+            "a point inside the box the hand held at the frames' stamps"
+        );
+        three_frames(&mut intake, 2_400);
+        assert!(
+            occupied_at(&node, BESIDE),
+            "the point once the hand moved the box away"
+        );
     }
 
     // Of three frames that arrive while the intake is busy, it takes the newest, and then

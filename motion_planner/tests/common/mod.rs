@@ -1,7 +1,8 @@
 //! What the node's tests share: the parameters the launchers give the planner and the
 //! planning time each plan asks for, OpenArm v2's model, a depth camera and the frames it
-//! renders of the robot and of boxes, and the node over the generated harness with that
-//! camera linked or vacant.
+//! renders of the robot and of boxes, a table across the left arm's motion, the node over
+//! the generated harness with that camera linked or vacant, and the plans and checks of
+//! the left arm.
 //!
 //! Each integration test is its own crate, so items unused by one suite are expected;
 //! the allow keeps clippy's -D warnings gate meaningful for the rest.
@@ -15,14 +16,21 @@ use std::time::{Duration, SystemTime};
 use chain_kinematics::nalgebra::{
     Isometry3, Matrix3, Point3, Rotation3, Translation3, UnitQuaternion, Vector3,
 };
-use collision_geometry::chain::{BodyMask, Padding, PlacedMask};
+use collision_geometry::chain::{BodyMask, Padding, PlacedMask, RiderBody};
 use motion_planner::fingers::riders;
 use motion_planner::history::Arms;
 use motion_planner::node::Fault;
+use motion_planner::request::OBJECTIVE;
 use motion_planner::robot::{Robot, RobotModel};
 use openarm_description::{ARM_DOF, ArmPair, Side, ready};
 use peppygen::Parameters;
 use peppygen::consumed_topics::camera::depth_stream::{Message as DepthFrame, MessageHeader};
+use peppygen::exposed_actions::motion_planning::plan_joint_path::{
+    GoalArmsItem, GoalGoalJointConstraintsItem,
+};
+use peppygen::fixtures::exposed_actions::motion_planning::plan_joint_path::{
+    Failure, GoalRequestData, ResultData, ResultOutcome, send_goal,
+};
 use peppygen::fixtures::exposed_services::motion_planning::check_joint_path;
 use peppygen::fixtures::harness::{Config, Harness, Mocks};
 use peppygen::mock::deps::{camera, camera_mounts, geometry, identity, limb_state, workspace};
@@ -103,7 +111,10 @@ pub fn render(
                     .into_iter()
                     .map(move |finger| {
                         let hand = posed.link_pose_world(finger.segment);
-                        (finger.link, finger.pieces, hand * finger.offset)
+                        let RiderBody::Pieces(pieces) = finger.body else {
+                            panic!("a finger is a part of the robot");
+                        };
+                        (finger.name, pieces, hand * finger.offset)
                     })
             }),
             none,
@@ -163,10 +174,48 @@ pub const LEFT_READY: [f64; ARM_DOF] = ready(Side::Left);
 pub const RIGHT_READY: [f64; ARM_DOF] = ready(Side::Right);
 
 /// The left arm at Ready with its elbow at `angle`.
-pub fn left_elbow(angle: f64) -> [f64; ARM_DOF] {
+pub const fn left_elbow(angle: f64) -> [f64; ARM_DOF] {
     let mut q = LEFT_READY;
     q[3] = angle;
     q
+}
+
+/// The left arm with its hand under the table of `table_across`, the elbow open, and
+/// over it, the elbow bent.
+pub const UNDER_THE_TABLE: [f64; ARM_DOF] = left_elbow(0.6);
+pub const OVER_THE_TABLE: [f64; ARM_DOF] = left_elbow(2.0);
+
+/// The configuration `t` of the way along the straight joint motion from `from` to
+/// `to`.
+pub fn along(from: &[f64; ARM_DOF], to: &[f64; ARM_DOF], t: f64) -> [f64; ARM_DOF] {
+    std::array::from_fn(|i| from[i] + (to[i] - from[i]) * t)
+}
+
+/// A table 20 cm square and 5 cm thick across the straight joint motion of the left arm
+/// from `under` to `over`, along which the grasp point rises at least 15 cm: its top
+/// lies where the grasp point crosses two fifths of the way up, found by bisection. The
+/// table, and the share of the motion at which the grasp point crosses its top.
+pub fn table_across(under: &[f64; ARM_DOF], over: &[f64; ARM_DOF]) -> (Solid, f64) {
+    let left = OPENARM_V2.arms[Side::Left].geometry.chain();
+    let hand = |q: &[f64; ARM_DOF]| left.world_ee_pose(q).translation.vector;
+    let (low, high) = (hand(under).z, hand(over).z);
+    assert!(high - low > 0.15, "the hand rises from {low} to {high}");
+    let height = low + (high - low) * 0.4;
+    let (mut crossing_t, mut past_t) = (0.0, 1.0);
+    while past_t - crossing_t > 1e-6 {
+        let t = (crossing_t + past_t) / 2.0;
+        if hand(&along(under, over, t)).z < height {
+            crossing_t = t;
+        } else {
+            past_t = t;
+        }
+    }
+    let crossing = hand(&along(under, over, crossing_t));
+    let table = (
+        [crossing.x - 0.1, crossing.y - 0.1, height - 0.05],
+        [crossing.x + 0.1, crossing.y + 0.1, height],
+    );
+    (table, crossing_t)
 }
 
 /// The node over the harness with the four camera slots vacant, once the arms' joint
@@ -250,13 +299,21 @@ pub async fn start_identified_as(
 async fn start_vacant(config: Config, arms: &Arms) -> peppygen::Result<(Harness, Mocks)> {
     let (harness, mocks) = start(config).await?;
     publish_arms(&mocks, at_ms(0), arms).await?;
-    let still = left_path(&[], &[arms[Side::Left]]);
+    let answer = wait_for_the_arms(&harness, arms[Side::Left]).await;
+    assert_eq!(answer.map_stamp, None, "{answer:?}");
+    Ok((harness, mocks))
+}
+
+/// The answer of a check of the left arm standing still at `left`, once it stops being
+/// refused: once the arms' joint positions have arrived, on a node that reads no camera.
+pub async fn wait_for_the_arms(
+    harness: &Harness,
+    left: [f64; ARM_DOF],
+) -> check_joint_path::Response {
+    let still = left_path(&[], &[left]);
     for _ in 0..TIMEOUT.as_secs() {
-        match check(&harness, &still).await {
-            Ok(answer) => {
-                assert_eq!(answer.map_stamp, None, "{answer:?}");
-                return Ok((harness, mocks));
-            }
+        match check(harness, &still).await {
+            Ok(answer) => return answer,
             Err(failure) => assert_eq!(
                 failure.kind,
                 check_joint_path::FailureKind::PreconditionFailed,
@@ -427,6 +484,80 @@ pub async fn publish_frame(
             frame: depth_frame(render),
         })
         .await
+}
+
+/// A plan of the left arm from where it stands to every joint within 0.01 of `q`.
+pub fn plan_to(q: &[f64; ARM_DOF]) -> GoalRequestData {
+    plan_from(&[], q)
+}
+
+/// A plan of the left arm from `start` (empty: where it stands) to every joint within
+/// 0.01 of `q`.
+pub fn plan_from(start: &[f64], q: &[f64; ARM_DOF]) -> GoalRequestData {
+    GoalRequestData {
+        arms: vec![GoalArmsItem {
+            arm_name: "left_arm".to_string(),
+            start_joint_positions: start.to_vec(),
+        }],
+        goal_joint_constraints: OPENARM_V2.arms[Side::Left]
+            .joint_names
+            .iter()
+            .zip(q)
+            .map(|(name, &position)| GoalGoalJointConstraintsItem {
+                joint_name: name.clone(),
+                position,
+                tolerance_above: 0.01,
+                tolerance_below: 0.01,
+            })
+            .collect(),
+        goal_position_constraints: Vec::new(),
+        goal_orientation_constraints: Vec::new(),
+        objective: OBJECTIVE.to_string(),
+        allowed_planning_time_s: PLANNING_TIME_S,
+    }
+}
+
+/// How a plan ends without a path.
+#[derive(Debug)]
+pub enum Ended {
+    /// The node refused the goal: it took nothing.
+    Refused(Failure),
+    /// The node took the goal and failed it.
+    Failed(Failure),
+}
+
+/// How a plan ends: its result, or the failure it was refused or failed with.
+pub async fn plan(harness: &Harness, goal: &GoalRequestData) -> Result<ResultData, Ended> {
+    let handle = send_goal(harness, goal, peppygen::DEFAULT_FEEDBACK_BOUND, TIMEOUT)
+        .await
+        .expect("the goal is sent");
+    if let Some(refusal) = handle.refusal {
+        return Err(Ended::Refused(refusal));
+    }
+    match handle
+        .get_result(TIMEOUT)
+        .await
+        .expect("the result arrives")
+        .outcome
+    {
+        ResultOutcome::Completed(data) => Ok(data),
+        ResultOutcome::Failed(failure) => Err(Ended::Failed(failure)),
+        other => panic!("the plan ends {other:?}"),
+    }
+}
+
+/// The waypoints of a plan's arm, as a check takes them.
+pub fn planned_waypoints(result: &ResultData) -> Vec<[f64; ARM_DOF]> {
+    result.arms[0]
+        .waypoints
+        .iter()
+        .map(|w| {
+            w.joint_positions
+                .as_slice()
+                .try_into()
+                .expect("a position for each joint")
+        })
+        .collect()
 }
 
 /// The check of the left arm's path from `start` (empty: where it stands) through

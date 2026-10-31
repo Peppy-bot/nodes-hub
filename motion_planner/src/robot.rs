@@ -7,7 +7,7 @@ use std::fmt;
 use std::str::FromStr;
 
 use chain_kinematics::{ChainSpec, JointSelection};
-use collision_geometry::chain::{BodyGeometry, CarriedPart, ChainGeometry, Rider};
+use collision_geometry::chain::{BodyGeometry, CarriedPart, ChainGeometry, Rider, RiderBody};
 use motion_planning_core::{Arm, RiderOffTheArm};
 use occupancy_map::{Frame, FrameError};
 use openarm_description::{ARM_DOF, ArmPair, HardwareVersion, Side};
@@ -209,7 +209,10 @@ fn with_pieces(geometry: &ChainGeometry<ARM_DOF>, links: Vec<String>) -> Vec<Str
                 .carried()
                 .iter()
                 .map(CarriedPart::rider)
-                .any(|carried| carried.link == link && !carried.pieces.is_empty())
+                .any(|carried| {
+                    carried.name == link
+                        && matches!(carried.body, RiderBody::Pieces(pieces) if !pieces.is_empty())
+                })
     };
     links.into_iter().filter(|link| has_pieces(link)).collect()
 }
@@ -305,11 +308,9 @@ pub(crate) mod tests {
             assert_eq!(fingers_fit(model, arm), Ok(()));
             let fingers = riders(model, &arm.geometry, arm.side).expect("the arm's fingers");
             assert_eq!(fingers.len(), 2, "{:?}", arm.side);
-            let finger = fingers[0].link;
+            let finger = fingers[0].name;
             let crossed = ModelError::from(FingerFault::from(
-                riders(model, &arm.geometry, arm.side.other())
-                    .err()
-                    .expect("the other arm's fault"),
+                riders(model, &arm.geometry, arm.side.other()).expect_err("the other arm's fault"),
             ));
             assert!(
                 crossed.to_string().starts_with(&format!(

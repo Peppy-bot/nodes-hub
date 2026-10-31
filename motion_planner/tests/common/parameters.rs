@@ -7,7 +7,7 @@ use peppygen::Parameters;
 /// The parameters the OpenArm v2 launchers give the planner.
 pub fn parameters() -> Parameters {
     Parameters {
-        goal_samples: 64,
+        goal_samples: 10,
         map_max_x_m: 0.66,
         map_max_y_m: 0.82,
         map_max_z_m: 1.36,
