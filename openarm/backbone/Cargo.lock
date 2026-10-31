@@ -247,22 +247,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
-name = "bimanual_collision_model"
-version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#5810a45a6409d594bdb7ee142076c0a5ed8409e2"
-dependencies = [
- "srs_model",
- "thiserror 2.0.21",
- "urdf-rs",
-]
-
-[[package]]
 name = "bincode"
 version = "1.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "bindgen"
+version = "0.72.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "993776b509cfb49c750f11b8f07a46fa23e0a1386ffc01fb1e7d343efc387895"
+dependencies = [
+ "bitflags 2.13.2",
+ "cexpr",
+ "clang-sys",
+ "itertools 0.13.0",
+ "log",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "regex",
+ "rustc-hash",
+ "shlex 1.3.0",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -411,7 +421,16 @@ dependencies = [
  "find-msvc-tools",
  "jobserver",
  "libc",
- "shlex",
+ "shlex 2.0.1",
+]
+
+[[package]]
+name = "cexpr"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6fac387a98bb7c37292057cffc56d62ecb629900026402633ae9160df93a8766"
+dependencies = [
+ "nom",
 ]
 
 [[package]]
@@ -440,7 +459,7 @@ dependencies = [
 [[package]]
 name = "chain_kinematics"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#5810a45a6409d594bdb7ee142076c0a5ed8409e2"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#f596cbc6ccc1dd3b654c3a1a757186f7427760c8"
 dependencies = [
  "control_core",
  "nalgebra",
@@ -470,6 +489,17 @@ checksum = "773f3b9af64447d2ce9850330c473515014aa235e6a783b02db81ff39e4a3dad"
 dependencies = [
  "crypto-common 0.1.7",
  "inout",
+]
+
+[[package]]
+name = "clang-sys"
+version = "1.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "157a8ba7b480713b56f4c09fd13fc3e0a22a5dfab8097ba61cbc5feef950788a"
+dependencies = [
+ "glob",
+ "libc",
+ "libloading",
 ]
 
 [[package]]
@@ -519,6 +549,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
 dependencies = [
  "cc",
+]
+
+[[package]]
+name = "collision_geometry"
+version = "0.1.0"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#f596cbc6ccc1dd3b654c3a1a757186f7427760c8"
+dependencies = [
+ "chain_kinematics",
+ "nalgebra",
+ "qhull",
+ "thiserror 2.0.21",
+ "urdf-rs",
 ]
 
 [[package]]
@@ -573,7 +615,7 @@ dependencies = [
 [[package]]
 name = "control_core"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#5810a45a6409d594bdb7ee142076c0a5ed8409e2"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#f596cbc6ccc1dd3b654c3a1a757186f7427760c8"
 dependencies = [
  "thiserror 2.0.21",
  "tokio",
@@ -964,7 +1006,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1354,6 +1396,12 @@ name = "glam"
 version = "0.33.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37bfe73dc8ec21f54d181e5a60554327ec3f1c600c455a75ccbfc65d2106a6c4"
+
+[[package]]
+name = "glob"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
 name = "h2"
@@ -1797,6 +1845,15 @@ name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
+
+[[package]]
+name = "itertools"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186"
+dependencies = [
+ "either",
+]
 
 [[package]]
 name = "itertools"
@@ -2430,12 +2487,12 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 name = "openarm_backbone"
 version = "0.1.0"
 dependencies = [
- "bimanual_collision_model",
  "control_core",
  "hegeltest",
  "openarm_description",
  "peppygen",
  "peppylib",
+ "self_collision_model",
  "srs_model",
  "tempfile",
  "thiserror 2.0.21",
@@ -2449,7 +2506,7 @@ dependencies = [
 [[package]]
 name = "openarm_description"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#5810a45a6409d594bdb7ee142076c0a5ed8409e2"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#f596cbc6ccc1dd3b654c3a1a757186f7427760c8"
 dependencies = [
  "urdf-rs",
 ]
@@ -2817,6 +2874,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "prettyplease"
+version = "0.2.37"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "479ca8adacdd7ce8f1fb39ce9ecccbfe93a3f1344b3d0d97f20bc0196208f62b"
+dependencies = [
+ "proc-macro2",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "proc-macro-crate"
 version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2832,6 +2899,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "qhull"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b049d90ab6627f28a11c06624a71776f6431930150fe66af83c7fd1138350e2c"
+dependencies = [
+ "qhull-sys",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "qhull-sys"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9eedbc2b46373cf01e45f86d44feca2074ce5712ffb25c4fffca5eef649a2cd6"
+dependencies = [
+ "bindgen",
+ "cc",
 ]
 
 [[package]]
@@ -2857,7 +2944,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -2897,9 +2984,9 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3215,7 +3302,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3283,7 +3370,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3418,6 +3505,16 @@ checksum = "6ce2691df843ecc5d231c0b14ece2acc3efb62c0a398c7e1d875f3983ce020e3"
 dependencies = [
  "core-foundation-sys",
  "libc",
+]
+
+[[package]]
+name = "self_collision_model"
+version = "0.1.0"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#f596cbc6ccc1dd3b654c3a1a757186f7427760c8"
+dependencies = [
+ "collision_geometry",
+ "srs_model",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -3628,6 +3725,12 @@ dependencies = [
 
 [[package]]
 name = "shlex"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
+
+[[package]]
+name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
@@ -3752,7 +3855,7 @@ dependencies = [
 [[package]]
 name = "srs_model"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#5810a45a6409d594bdb7ee142076c0a5ed8409e2"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#f596cbc6ccc1dd3b654c3a1a757186f7427760c8"
 dependencies = [
  "chain_kinematics",
  "control_core",
@@ -3903,7 +4006,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4671,7 +4774,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4845,7 +4948,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 [[package]]
 name = "workspace_core"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#5810a45a6409d594bdb7ee142076c0a5ed8409e2"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#f596cbc6ccc1dd3b654c3a1a757186f7427760c8"
 dependencies = [
  "thiserror 2.0.21",
 ]
@@ -4928,7 +5031,7 @@ dependencies = [
  "flume 0.11.1",
  "futures",
  "git-version",
- "itertools",
+ "itertools 0.14.0",
  "json5",
  "lazy_static",
  "nonempty-collections",
