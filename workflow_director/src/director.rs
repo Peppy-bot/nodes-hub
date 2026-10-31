@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use peppygen::NodeRunner;
 use serde_json::{Value as Json, json};
 use tokio::sync::{broadcast, mpsc, watch};
-use workflow_documents::bundle::{Bundle, BundleFile};
+use workflow_documents::bundle::{BUNDLE_PATH, Bundle, BundleDocument, BundleFile, WORKFLOW_PATH};
 use workflow_documents::lock::{Lock, LockedNode, UNKNOWN_PEPPY};
 use workflow_documents::result::{
     Difference, DifferenceKind, Duration as RunDuration, Ending, RunRefusal, RunResult, RunWorkflow,
@@ -37,7 +37,7 @@ use crate::leases::{LeaseEventKind, Leases};
 use crate::live::{LiveHost, RunClock};
 use crate::replay::{Planned, Recorded, journal_command};
 use crate::sign_off::{SignOff, SignOffRecord, SignOffs, refusal_of_no_record};
-use crate::trial::{TrialEntry, TrialState, Trials};
+use crate::trial::{TrialEntry, Trials, robots_of_trials};
 
 /// The caller of a run: the instance and the machine that sent its goal.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -420,8 +420,9 @@ impl Director {
             .lock()
             .expect("no run panics holding the runs")
             .insert(run.clone(), entry);
+        let bundle = request.bundle.as_deref().map(journaled_bundle);
         let opened = json!({
-            "workflow": request.workflow, "bundle": request.bundle, "run_document": request.run_document,
+            "workflow": request.workflow, "bundle": bundle, "run_document": request.run_document,
             "roles": request.roles, "work_cell": request.work_cell, "started_by": request.started_by,
             "caller_data": request.caller_data, "trial": request.trial,
             "caller": { "instance": caller.instance, "core_node": caller.core_node },
@@ -634,8 +635,9 @@ impl Director {
 
     /// The robots that the director holds, with what holds each: the runs
     /// of `runs` other than `run` while they have not ended, the teaches,
-    /// and the running trials other than `trial`. The caller holds the lock
-    /// of the runs, then this takes those of the teaches and of the trials.
+    /// and the trials other than `trial` that hold their robots
+    /// ([`robots_of_trials`]). The caller holds the lock of the runs, then
+    /// this takes those of the teaches and of the trials.
     pub fn holders(
         &self,
         runs: &BTreeMap<String, RunEntry>,
@@ -647,28 +649,16 @@ impl Director {
             .lock()
             .expect("no teach panics holding the robots it teaches")
             .clone();
-        let trials = self
-            .trials
-            .lock()
-            .expect("no trial panics holding the trials");
-        let of_trials: Vec<(RobotName, Holder)> = trials
-            .iter()
-            .filter(|(id, _)| Some(id.as_str()) != trial)
-            .filter(|(_, entry)| entry.record.borrow().state == TrialState::Running)
-            .flat_map(|(id, entry)| {
-                let robots: Vec<RobotName> = entry
-                    .record
-                    .borrow()
-                    .document
-                    .roles
-                    .values()
-                    .cloned()
-                    .collect();
-                robots
-                    .into_iter()
-                    .map(|robot| (robot, Holder::Trial(id.clone())))
-            })
-            .collect();
+        let of_trials: Vec<(RobotName, Holder)> = robots_of_trials(
+            &self
+                .trials
+                .lock()
+                .expect("no trial panics holding the trials"),
+            trial,
+        )
+        .into_iter()
+        .map(|(robot, trial)| (robot, Holder::Trial(trial)))
+        .collect();
         robots_of_runs(runs, run)
             .into_iter()
             .map(|(robot, run)| (robot, Holder::Run(run)))
@@ -1228,25 +1218,50 @@ fn lost_leases(fleet: &Fleet, robots: &BTreeSet<String>, me: &Caller) -> Option<
 /// The workflow a journal opened with: its text, or the workflow of its
 /// bundle.
 pub fn workflow_of(opened: &Json) -> Result<Workflow, String> {
-    if let Some(text) = opened["workflow"].as_str() {
-        return Workflow::parse(text)
-            .map_err(|refusals| format!("the workflow of the journal does not parse: {refusals}"));
-    }
-    bundle_of(opened)?
-        .map(|bundle| bundle.workflow)
-        .ok_or_else(|| "the journal opened with no workflow and no bundle".to_owned())
+    let text = match opened["workflow"].as_str() {
+        Some(text) => text.to_owned(),
+        None => journaled_text(opened, WORKFLOW_PATH)?
+            .ok_or_else(|| "the journal opened with no workflow and no bundle".to_owned())?,
+    };
+    Workflow::parse(&text)
+        .map_err(|refusals| format!("the workflow of the journal does not parse: {refusals}"))
 }
 
-/// The bundle a journal opened with, when it gave one.
-pub fn bundle_of(opened: &Json) -> Result<Option<Bundle>, String> {
+/// The bundle document a journal opened with, when it gave a bundle.
+pub fn bundle_document_of(opened: &Json) -> Result<Option<BundleDocument>, String> {
+    let Some(text) = journaled_text(opened, BUNDLE_PATH)? else {
+        return Ok(None);
+    };
+    BundleDocument::parse(&text).map(Some).map_err(|refusals| {
+        format!("the bundle document of the journal does not parse: {refusals}")
+    })
+}
+
+/// The documents of `bundle` that the journal of a run keeps: the bundle
+/// document and the workflow, which the director parses. The bundle
+/// document names each other file by its digest, and a file of `files/`,
+/// such as the report of a sweep with the journal of each of its runs, can
+/// be large.
+fn journaled_bundle(bundle: &[BundleFile]) -> Vec<&BundleFile> {
+    bundle
+        .iter()
+        .filter(|file| file.path == BUNDLE_PATH || file.path == WORKFLOW_PATH)
+        .collect()
+}
+
+/// The text of the document at `path` of the bundle a journal opened with;
+/// none for a journal that opened with no bundle.
+fn journaled_text(opened: &Json, path: &str) -> Result<Option<String>, String> {
     if opened["bundle"].is_null() {
         return Ok(None);
     }
     let files: Vec<BundleFile> = serde_json::from_value(opened["bundle"].clone())
         .map_err(|e| format!("the bundle of the journal: {e}"))?;
-    Bundle::open(files)
-        .map(Some)
-        .map_err(|refusals| format!("the bundle of the journal does not open: {refusals}"))
+    files
+        .into_iter()
+        .find(|file| file.path == path)
+        .map(|file| Some(file.content))
+        .ok_or_else(|| format!("the bundle of the journal has no `{path}`"))
 }
 
 /// Whether a run reads the simulation clock `domain` of the director:
@@ -2329,6 +2344,43 @@ mod tests {
             ),
             "{refused:?}"
         );
+    }
+
+    /// The journal of a run of a bundle keeps the bundle document and the
+    /// workflow, which the director parses, and no file of `files/`, which
+    /// the bundle document names by its digest: the workflow and the
+    /// envelope read back from it.
+    #[test]
+    fn the_journal_of_a_run_of_a_bundle_keeps_only_the_documents_the_director_parses() {
+        let workflow = workflow(&rest());
+        let validation = crate::testing::validation(
+            json!({ "belt_speed_mps": { "unit": "m/s", "kind": "control" } }),
+            json!({ "belt_speed_mps": [0.05, 0.25] }),
+        );
+        let report = BundleFile {
+            path: "files/sweep.report.json5".to_owned(),
+            content: "{ runs: [\"the journal of each run of the sweep\"] }".to_owned(),
+        };
+        let files =
+            Bundle::write_signed_off(&workflow, vec![report], Lock::default(), validation.clone())
+                .unwrap();
+        let opened = json!({ "workflow": null, "bundle": journaled_bundle(&files) });
+        let paths: Vec<&str> = opened["bundle"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|file| file["path"].as_str())
+            .collect();
+        assert_eq!(paths.len(), 2, "{paths:?}");
+        assert!(paths.contains(&BUNDLE_PATH) && paths.contains(&WORKFLOW_PATH));
+        assert_eq!(workflow_of(&opened).unwrap(), workflow);
+        assert_eq!(
+            bundle_document_of(&opened).unwrap().unwrap().validation,
+            Some(validation)
+        );
+        let without = json!({ "workflow": null, "bundle": null });
+        assert_eq!(bundle_document_of(&without).unwrap(), None);
+        assert!(workflow_of(&without).is_err());
     }
 
     /// The work cell of an unattended run on a physical robot fits only a

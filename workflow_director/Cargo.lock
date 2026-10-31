@@ -951,7 +951,7 @@ dependencies = [
 [[package]]
 name = "documents_core"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#a7355f625f19f54bb16b7801b897df108e5fdf56"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#c5872eb648794a3d507440e2ce6abeaada29d521"
 dependencies = [
  "json5 1.3.4",
  "serde",
@@ -4846,7 +4846,7 @@ dependencies = [
 [[package]]
 name = "workflow_documents"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#a7355f625f19f54bb16b7801b897df108e5fdf56"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#c5872eb648794a3d507440e2ce6abeaada29d521"
 dependencies = [
  "cel",
  "documents_core",

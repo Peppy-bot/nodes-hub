@@ -935,6 +935,40 @@ async fn the_assumptions_that_wait_are_sent_again_after_each_confirmation() {
     );
 }
 
+/// An unattended run has no person to confirm an assumption without a
+/// check: it starts only when its run document confirms each one, and
+/// refuses the first one it does not confirm, naming it, before the
+/// initialization.
+#[tokio::test(start_paused = true)]
+async fn an_unattended_run_refuses_an_assumption_without_a_check_it_does_not_confirm() {
+    let mut value = one_arm("alpha", rest("rest"), home());
+    value["assumptions"]["clear"] = json!({ "says": "The table is clear" });
+    value["assumptions"]["dry"] = json!({ "says": "The table is dry" });
+    let mut unconfirmed = plan(&value, Attendance::Unattended);
+    unconfirmed.confirmed = [name("dry")].into();
+    let host = arm();
+    let (result, phases) = run(&unconfirmed, &host, Vec::new()).await;
+    assert_eq!(result.ending, Ending::Refused, "{result:#?}");
+    let refusal = result.refusal.as_ref().unwrap();
+    assert_eq!(refusal.assumption, Some(name("clear")));
+    assert_eq!(
+        refusal.message,
+        "the assumption `clear` has no check and the run document does not confirm it, and no person confirms an assumption of an unattended run: The table is clear"
+    );
+    assert!(
+        !phases
+            .iter()
+            .any(|phase| matches!(phase, Phase::Confirming(_))),
+        "{phases:?}"
+    );
+    assert!(host.calls_of("home").is_empty(), "no lane runs");
+
+    let mut confirmed = plan(&value, Attendance::Unattended);
+    confirmed.confirmed = [name("clear"), name("dry")].into();
+    let (result, _) = run(&confirmed, &arm(), Vec::new()).await;
+    assert_eq!(result.ending, Ending::Completed, "{result:#?}");
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_fault_before_the_lanes_is_met_once_by_the_first_call() {
     let mut value = one_arm("alpha", find_then_grab(grab(0, "grabbed.success")), home());

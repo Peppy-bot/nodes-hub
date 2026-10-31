@@ -50,7 +50,9 @@ the stack with the lock of the bundle. Then it takes the lease of each robot
 under the name `run r<N>`, lists the locations of each skill instance the
 workflow gives a location to (`locations:v1`, whatever the allowed
 contracts) and refuses a run that names one the skill does not know. Then it
-checks the assumptions, waits for the confirmations of an attended run, runs
+checks the assumptions, refuses an unattended run that does not confirm each
+assumption without a check (naming the first one: no person confirms it),
+waits for the confirmations of an attended run, runs
 the initialization and the lanes, and at its end releases each lease before
 the event `run_ends`. The lock of the run names each contract it reads: those
 of its calls, observations and monitor, `locations:v1` of each skill it gives
@@ -137,7 +139,9 @@ bundle opens with its digests and has an envelope, each value of its work
 cell is inside the envelope, each assumption of the workflow has a check,
 each bound robot is physical and held by no run, teach or other trial of
 the director, the workflow holds for the robots, and the stack matches the
-lock of the bundle with no version policy. The trial then takes the lease
+lock of the bundle with no version policy. A trial holds its robots from the
+check of their holders to its end, so a trial in its other checks refuses
+neither another trial nor a run. The trial then takes the lease
 of each robot under the name `trial t<N>` (a refused take refuses it, naming
 the robot and the cause), holds them to its end, and removes each sign-off
 record of its bundle and binding.
@@ -154,8 +158,12 @@ completed, and each wrong check as a false check). The run then runs
 unattended, and `suspend` refuses it, naming the trial. Once it ends,
 `judge_ending` counts it: completed when it completed, a false success when
 it completed and its task is not done, and each emergency stop and other
-unsafe event as an unsafe event. A run that ends before it starts counts as not completed. A cancel
-of `next_run`, or the loss of its sender, aborts its run.
+unsafe event as an unsafe event. A run that the director refuses on a watch
+value outside the envelope does not count: the work cell is not ready. Any
+other run that ends before it starts counts as not completed. A run that
+does not start opens the leases again, and `next_run` fails with
+`attempt_failed`. A cancel of `next_run`, or the loss of its sender, aborts
+its run. Once the trial ends, `judge_ending` takes no judgement.
 
 The trial ends after its last run that counts, or once the runs left cannot
 meet the thresholds of the bundle (plain rates and counts). It then releases
@@ -176,7 +184,8 @@ of a trial `t<N>`.
 ## Journals
 
 Each run has a journal, `<journal_root>/workflow_director/journals/r<N>.jsonl`:
-the request, the inputs of its plan, the locations each skill knows, each
+the request (of a bundle, the bundle document and the workflow alone: the
+bundle document names each other file by its digest), the inputs of its plan, the locations each skill knows, each
 call with how it ended, each topic read with how old its message was, each
 read that took the answer of another reader's read, each answer of the
 daemon to an open or a close of a lease with when it came, each command and

@@ -15,9 +15,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
-use workflow_documents::result::Ending;
+use workflow_documents::result::{Ending, RunResult};
 use workflow_documents::run::RunDocument;
-use workflow_documents::{EventKind, Name, RobotName, Validation, Workflow};
+use workflow_documents::{EventKind, Name, RobotName, Validation, Workflow, uncovered_work_cell};
 
 use crate::checker::{self, RunChoices};
 use crate::config::AllowedContracts;
@@ -460,8 +460,8 @@ impl Recording {
             .find(|r| r.kind == journal::OPENED)
             .ok_or("the journal has no opened record")?;
         let workflow = crate::director::workflow_of(&opened.body)?;
-        let validation =
-            crate::director::bundle_of(&opened.body)?.and_then(|bundle| bundle.document.validation);
+        let validation = crate::director::bundle_document_of(&opened.body)?
+            .and_then(|document| document.validation);
         let planned = records
             .iter()
             .find(|r| r.kind == journal::PLANNED)
@@ -834,8 +834,17 @@ pub fn replay(text: &str) -> Result<Outcome, String> {
                         })
                     };
                     let (phase, _) = watch::channel(Phase::Preparing);
+                    // The base of the result gives the engine the values of
+                    // the work cell that no test covered, as the director
+                    // gave them to the run.
                     let base = ResultBase {
-                        result: crate::director::empty_result(),
+                        result: RunResult {
+                            uncovered: uncovered_work_cell(
+                                recording.validation.as_ref(),
+                                &document.work_cell,
+                            ),
+                            ..crate::director::empty_result()
+                        },
                     };
                     let result =
                         engine::drive(&plan, &host, base, commands_rx, phase, planned.run_ns).await;
@@ -1111,11 +1120,17 @@ mod tests {
             std::future::pending::<()>().await
         };
         let (phase, mut phases) = watch::channel(Phase::Preparing);
+        // As the director gives it, the base names each value of the work
+        // cell that no test covered: with no bundle, every one.
+        let uncovered = uncovered_work_cell(None, &planned.run_document.work_cell);
         let driven = drive(
             &plan,
             &host,
             ResultBase {
-                result: crate::director::empty_result(),
+                result: RunResult {
+                    uncovered,
+                    ..crate::director::empty_result()
+                },
             },
             commands_rx,
             phase,
@@ -1196,6 +1211,33 @@ mod tests {
             check.contains("the block slipped") && check.contains(r#""severity":"low""#),
             "{check}"
         );
+    }
+
+    /// A run whose work cell no test covered gives the event `uncovered`,
+    /// and its replay gives it too: the replay reads the work cell of the
+    /// run document, as the director does.
+    #[tokio::test(start_paused = true)]
+    async fn the_replay_of_a_run_with_a_work_cell_no_test_covered_gives_its_uncovered_event() {
+        use workflow_documents::work_cell::RoleValues;
+        let value = picking();
+        let workflow = Workflow::parse(&value.to_string()).unwrap();
+        let work_cell = WorkCell::from([(name("belt_speed_mps"), RoleValues::Single(0.3))]);
+        let document = RunDocument {
+            attendance: Attendance::Attended,
+            ..RunDocument::of_roles(&workflow, binding_of(&workflow), work_cell).unwrap()
+        };
+        let scripted = ScriptedHost::new()
+            .answer("find", vec![Answer::now(found()), Answer::now(found())])
+            .answer(
+                "grab",
+                vec![Answer::now(json!({ "success": true, "item_id": "b1" }))],
+            )
+            .answer("home", vec![Answer::now(json!({ "at_home": true }))]);
+        let journal =
+            journal_of_a_document(&value, scripted, document, Commands::default(), |_| false).await;
+        assert!(journal.contains(r#""event":"uncovered""#), "{journal}");
+        let outcome = replay(&journal).unwrap();
+        assert!(outcome.same, "{outcome:#?}");
     }
 
     #[tokio::test(start_paused = true)]

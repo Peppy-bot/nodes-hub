@@ -25,6 +25,7 @@ use workflow_documents::result::{
     LaneOutcome, LaneState, RUN_SUSPENDED, RunRefusal, RunResult, RunState, RunStatus,
     SafeStateResult, SuspendedLane, Suspension, ToConfirm,
 };
+use workflow_documents::run::Attendance;
 use workflow_documents::work_cell::Uncovered;
 use workflow_documents::workflow::StepKind;
 use workflow_documents::{EventKind, Located, Name, uncovered_watch};
@@ -932,7 +933,49 @@ pub fn outside_the_envelope(uncovered: &[&Uncovered]) -> String {
 /// Evaluates the check of each assumption, within its bound; a false check
 /// refuses the run and names the assumption, but in a run of a trial, whose
 /// checks the operator judges. A check that gives no value refuses the run.
+/// An unattended run then refuses the first assumption without a check that
+/// its run document does not confirm, naming it: no person confirms it.
 async fn assumptions<H: Host>(ctx: &RunCtx<'_, H>, outcome: &mut Outcome) -> Option<RunRefusal> {
+    if let Some(refusal) = checked_assumptions(ctx, outcome).await {
+        return Some(refusal);
+    }
+    if ctx.plan.attendance == Attendance::Unattended {
+        return unconfirmed(ctx.plan, outcome);
+    }
+    None
+}
+
+/// The refusal of the first assumption without a check that the plan does
+/// not confirm, kept in `outcome` as not confirmed.
+fn unconfirmed(plan: &Plan, outcome: &mut Outcome) -> Option<RunRefusal> {
+    let (name, assumption) = plan
+        .workflow
+        .assumptions
+        .iter()
+        .find(|(name, assumption)| assumption.check.is_none() && !plan.confirmed.contains(*name))?;
+    outcome.assumptions.push(AssumptionOutcome {
+        name: name.clone(),
+        says: assumption.says.clone(),
+        kind: AssumptionKind::Confirmation,
+        value: None,
+        confirmed: false,
+    });
+    Some(RunRefusal {
+        message: format!(
+            "the assumption `{name}` has no check and the run document does not confirm it, and no person confirms an assumption of an unattended run: {}",
+            assumption.says
+        ),
+        errors: Vec::new(),
+        assumption: Some(name.clone()),
+        says: Some(assumption.says.clone()),
+    })
+}
+
+/// Evaluates the check of each assumption, as [`assumptions`] says.
+async fn checked_assumptions<H: Host>(
+    ctx: &RunCtx<'_, H>,
+    outcome: &mut Outcome,
+) -> Option<RunRefusal> {
     for (name, assumption) in &ctx.plan.workflow.assumptions {
         let Some(check) = &assumption.check else {
             continue;

@@ -243,22 +243,19 @@ impl TrialRecord {
         Ok(())
     }
 
-    /// Takes the end `ending` of the run that goes: the trial waits for the
+    /// Takes the result of the run that goes: the trial waits for the
     /// judgement of the ending of a run that started, counts every other
-    /// run (not at all when its work cell was not ready), and ends with a
-    /// run that ended halted or interrupted.
-    pub fn run_ended(
-        &mut self,
-        ending: Ending,
-        message: &str,
-        thresholds: &Thresholds,
-    ) -> AfterRun {
+    /// run (not at all when its work cell was not ready, by the judgement of
+    /// the operator or by a watch value outside the envelope), and ends with
+    /// a run that ended halted or interrupted.
+    pub fn run_ended(&mut self, result: &RunResult, thresholds: &Thresholds) -> AfterRun {
         let Some(last) = self.runs.last_mut() else {
             return AfterRun::Ends {
                 state: TrialState::Interrupted,
                 message: "the trial has no run that goes".to_owned(),
             };
         };
+        let ending = result.ending;
         last.ending = Some(ending);
         let run = last.run.clone();
         match ending {
@@ -269,9 +266,9 @@ impl TrialRecord {
                 };
             }
             Ending::Interrupted => {
-                let why = match message.is_empty() {
-                    true => String::new(),
-                    false => format!(": {message}"),
+                let why = match why_it_ended(result) {
+                    Some(message) => format!(": {message}"),
+                    None => String::new(),
                 };
                 return AfterRun::Ends {
                     state: TrialState::Interrupted,
@@ -295,6 +292,7 @@ impl TrialRecord {
                     ..self.measures
                 },
             ),
+            None if refused_on_the_watch(result) => (Count::NotCounted, self.measures),
             None => (
                 Count::NotCompleted,
                 Measures {
@@ -348,32 +346,59 @@ impl TrialRecord {
     /// What the trial does after the runs that count so far: it ends after
     /// its last run that counts, signing off only when the runs meet the
     /// thresholds, or once the runs left cannot meet them; else the
-    /// operator prepares the next run.
+    /// operator prepares the next run. A trial that ends waits for no other
+    /// judgement.
     fn next(&mut self, thresholds: &Thresholds) -> Next {
         let measures = &self.measures;
         let remaining = self.document.runs.saturating_sub(measures.runs);
         let unmet = thresholds.unmet_by(measures);
-        if remaining == 0 {
-            return match unmet.is_empty() {
+        let next = if remaining == 0 {
+            match unmet.is_empty() {
                 true => Next::SignsOff,
                 false => Next::NotSignedOff(format!(
                     "the {} runs that count do not meet the thresholds of the bundle: {}",
                     measures.runs,
                     unmet_words(&unmet)
                 )),
-            };
-        }
-        if !thresholds.can_still_be_met(measures, remaining) {
-            return Next::NotSignedOff(format!(
+            }
+        } else if !thresholds.can_still_be_met(measures, remaining) {
+            Next::NotSignedOff(format!(
                 "the {remaining} runs left cannot meet the thresholds of the bundle any more: {}",
                 unmet_words(&unmet)
-            ));
-        }
-        self.step = TrialStep::Prepares {
-            number: self.number(),
+            ))
+        } else {
+            Next::GoesOn
         };
-        Next::GoesOn
+        self.step = match next {
+            Next::GoesOn => TrialStep::Prepares {
+                number: self.number(),
+            },
+            Next::SignsOff | Next::NotSignedOff(_) => TrialStep::Ended,
+        };
+        next
     }
+}
+
+/// Why the run of `result` ended, as its refusal or its failed step says.
+fn why_it_ended(result: &RunResult) -> Option<String> {
+    result
+        .refusal
+        .as_ref()
+        .map(|refusal| refusal.message.clone())
+        .or_else(|| result.failed.as_ref().map(|failed| failed.message.clone()))
+        .filter(|message| !message.is_empty())
+}
+
+/// Whether the director refused the run of `result` on a watch value
+/// outside the envelope: the work cell is not ready. A run of a trial is
+/// unattended on physical robots, so the director refuses it on each watch
+/// value that no test covered, before it evaluates any check.
+fn refused_on_the_watch(result: &RunResult) -> bool {
+    result.ending == Ending::Refused
+        && result
+            .uncovered
+            .iter()
+            .any(|uncovered| result.watch.contains_key(&uncovered.parameter))
 }
 
 /// The names of the thresholds `unmet`, as the bundle writes them.
@@ -430,11 +455,42 @@ pub struct LiveTrial {
     pub commands: mpsc::UnboundedSender<TrialCommand>,
 }
 
-/// A trial the director keeps: its record, and what judges it while it
-/// runs.
+/// A trial the director keeps: its record, what judges it while it runs,
+/// and whether it holds its robots: from the check of its admission that
+/// no other run, teach or trial holds them, to its end.
 pub struct TrialEntry {
     pub record: Arc<watch::Sender<TrialRecord>>,
     pub live: Option<LiveTrial>,
+    pub holds_robots: bool,
+}
+
+/// The robots that the trials of `trials` other than `trial` hold, each with
+/// the id of its trial: those of each running trial past the check of its
+/// admission. A trial in its other checks holds no robot, so it refuses
+/// neither another trial nor a run.
+pub fn robots_of_trials(
+    trials: &BTreeMap<String, TrialEntry>,
+    trial: Option<&str>,
+) -> Vec<(RobotName, String)> {
+    trials
+        .iter()
+        .filter(|(id, entry)| {
+            Some(id.as_str()) != trial
+                && entry.holds_robots
+                && entry.record.borrow().state == TrialState::Running
+        })
+        .flat_map(|(id, entry)| {
+            let robots: Vec<RobotName> = entry
+                .record
+                .borrow()
+                .document
+                .roles
+                .values()
+                .cloned()
+                .collect();
+            robots.into_iter().map(move |robot| (robot, id.clone()))
+        })
+        .collect()
 }
 
 /// The records of the trials on the disk of the director, each in its file
@@ -555,6 +611,7 @@ impl Director {
             let entry = TrialEntry {
                 record: Arc::new(watch::Sender::new(record.clone())),
                 live: None,
+                holds_robots: false,
             };
             trials.insert(record.trial, entry);
         }
@@ -643,6 +700,7 @@ impl Director {
                 TrialEntry {
                     record: Arc::clone(&record),
                     live: None,
+                    holds_robots: false,
                 },
             );
         self.keep_trial(&record.borrow());
@@ -846,17 +904,7 @@ impl Director {
             &stack,
             &document.incidents,
         );
-        let held = {
-            let runs = self.runs.lock().expect("no run panics holding the runs");
-            self.holders(&runs, "", Some(trial))
-        };
-        let holders: Vec<String> = binding
-            .values()
-            .filter_map(|robot| held.get(robot).map(|holder| holder.why(robot.as_str())))
-            .collect();
-        if !holders.is_empty() {
-            return Err(format!("the trial is refused: {}", holders.join("; ")));
-        }
+        self.hold_robots(trial, &binding)?;
         let mut taken: Vec<RobotName> = Vec::new();
         for robot in binding.values() {
             if let Err(refused) = self
@@ -892,6 +940,30 @@ impl Director {
         })
     }
 
+    /// Refuses the trial `trial` when another run, teach or trial holds a
+    /// robot of `binding`, naming each; else the trial holds its robots
+    /// from now on. The check and the hold are under the lock of the runs,
+    /// so two trials, or a trial and a run, never hold one robot.
+    fn hold_robots(&self, trial: &str, binding: &BTreeMap<Name, RobotName>) -> Result<(), String> {
+        let runs = self.runs.lock().expect("no run panics holding the runs");
+        let held = self.holders(&runs, "", Some(trial));
+        let holders: Vec<String> = binding
+            .values()
+            .filter_map(|robot| held.get(robot).map(|holder| holder.why(robot.as_str())))
+            .collect();
+        if !holders.is_empty() {
+            return Err(format!("the trial is refused: {}", holders.join("; ")));
+        }
+        let mut trials = self
+            .trials
+            .lock()
+            .expect("no trial panics holding the trials");
+        if let Some(entry) = trials.get_mut(trial) {
+            entry.holds_robots = true;
+        }
+        Ok(())
+    }
+
     /// Opens the leases of the trial for a take-over while the operator
     /// prepares the work cell, and gives `prepares`.
     async fn prepares(
@@ -917,8 +989,9 @@ impl Director {
     }
 
     /// Closes the leases of the trial and starts its next run for `caller`;
-    /// a lease that does not close opens the others again, and starts no
-    /// run.
+    /// a lease that does not close, or a run that does not start, opens the
+    /// leases again, so the operator can prepare the work cell, and starts
+    /// no run.
     async fn next_run(
         self: &Arc<Self>,
         trial: &str,
@@ -936,9 +1009,7 @@ impl Director {
         let mut closed: Vec<&RobotName> = Vec::new();
         for robot in &admitted.robots {
             if let Err(error) = self.leases.set_open(robot.as_str(), false).await {
-                for robot in closed {
-                    let _ = self.leases.set_open(robot.as_str(), true).await;
-                }
+                self.open_again(trial, &closed).await;
                 return Err((
                     precondition,
                     format!(
@@ -958,9 +1029,16 @@ impl Director {
             caller_data: None,
             trial: Some(trial.to_owned()),
         };
-        let (run, phase) = self
-            .start(request, caller)
-            .map_err(|message| ("attempt_failed", message))?;
+        let (run, phase) = match self.start(request, caller) {
+            Ok(started) => started,
+            Err(message) => {
+                self.open_again(trial, &closed).await;
+                return Err((
+                    "attempt_failed",
+                    format!("{message}; prepare the work cell, then call next_run again"),
+                ));
+            }
+        };
         record.send_modify(|record| {
             record.runs.push(TrialRun {
                 run: run.clone(),
@@ -973,6 +1051,16 @@ impl Director {
         });
         self.keep_trial(&record.borrow());
         Ok((run, phase))
+    }
+
+    /// Opens the leases of `robots` again for a take-over, after a next run
+    /// of the trial `trial` that did not start.
+    async fn open_again(&self, trial: &str, robots: &[&RobotName]) {
+        for robot in robots {
+            if let Err(error) = self.leases.set_open(robot.as_str(), true).await {
+                tracing::warn!("the lease of {robot} did not open again for {trial}: {error}");
+            }
+        }
     }
 
     /// The runs of an admitted trial, to the end of the trial: the operator
@@ -1020,16 +1108,10 @@ impl Director {
                     if aborted {
                         return TrialEnd::new(TrialState::Aborted, "the caller of the trial aborted it");
                     }
-                    let message = result
-                        .refusal
-                        .as_ref()
-                        .map(|refusal| refusal.message.clone())
-                        .or_else(|| result.failed.as_ref().map(|failed| failed.message.clone()))
-                        .unwrap_or_default();
                     let after = {
                         let mut after = None;
                         record.send_modify(|record| {
-                            after = Some(record.run_ended(result.ending, &message, &admitted.thresholds));
+                            after = Some(record.run_ended(&result, &admitted.thresholds));
                         });
                         after.expect("the record took the end of the run")
                     };
@@ -1220,6 +1302,14 @@ mod tests {
         }
     }
 
+    /// The result of a run that ended `ending`.
+    fn ended(ending: Ending) -> RunResult {
+        RunResult {
+            ending,
+            ..crate::director::empty_result()
+        }
+    }
+
     fn done() -> EndingJudged {
         EndingJudged {
             task_done: true,
@@ -1236,7 +1326,7 @@ mod tests {
         let mut record = trial(3);
         judged(&mut record, "r1", Some(ChecksJudged::Starts));
         assert_eq!(
-            record.run_ended(Ending::Completed, "", &strict()),
+            record.run_ended(&ended(Ending::Completed), &strict()),
             AfterRun::JudgesEnding
         );
         assert_eq!(
@@ -1261,7 +1351,7 @@ mod tests {
     fn a_run_whose_work_cell_is_not_ready_does_not_count() {
         let mut record = trial(3);
         judged(&mut record, "r1", Some(ChecksJudged::NotReady));
-        let after = record.run_ended(Ending::Refused, "", &strict());
+        let after = record.run_ended(&ended(Ending::Refused), &strict());
         assert_eq!(
             after,
             AfterRun::Counted {
@@ -1273,6 +1363,47 @@ mod tests {
         assert_eq!(record.step, TrialStep::Prepares { number: 1 });
     }
 
+    /// A run that the director refused on a watch value outside the
+    /// envelope does not count: the work cell is not ready, and the operator
+    /// prepares the same run again. A watch value that does not read is no
+    /// work cell that is not ready: the run counts as not completed.
+    #[test]
+    fn a_run_refused_on_a_watch_value_outside_the_envelope_does_not_count() {
+        use workflow_documents::work_cell::{NotCovered, TestedRange};
+        let mut record = trial(3);
+        judged(&mut record, "r1", None);
+        let mut outside = ended(Ending::Refused);
+        outside.watch.insert(name("loose_tapes"), 9.0);
+        outside.uncovered.push(workflow_documents::Uncovered {
+            parameter: name("loose_tapes"),
+            role: None,
+            value: Some(9.0),
+            why: NotCovered::Outside {
+                tested: TestedRange { min: 0.0, max: 2.0 },
+            },
+        });
+        assert_eq!(
+            record.run_ended(&outside, &strict()),
+            AfterRun::Counted {
+                count: Count::NotCounted,
+                next: Next::GoesOn
+            }
+        );
+        assert_eq!(record.measures, Measures::default());
+        assert_eq!(record.step, TrialStep::Prepares { number: 1 });
+
+        judged(&mut record, "r2", None);
+        let unread = ended(Ending::Refused);
+        assert!(matches!(
+            record.run_ended(&unread, &lenient()),
+            AfterRun::Counted {
+                count: Count::NotCompleted,
+                ..
+            }
+        ));
+        assert_eq!(record.measures.runs, 1);
+    }
+
     /// A wrong check counts the run as not completed and each wrong check
     /// as a false check; a run that ended before the judgement of its
     /// checks, as a refused or an aborted run, counts as not completed.
@@ -1281,7 +1412,7 @@ mod tests {
         let mut record = trial(5);
         let wrong = vec![name("belt_runs"), name("in_reach")];
         judged(&mut record, "r1", Some(ChecksJudged::FalseCheck { wrong }));
-        let after = record.run_ended(Ending::Refused, "", &lenient());
+        let after = record.run_ended(&ended(Ending::Refused), &lenient());
         assert_eq!(
             after,
             AfterRun::Counted {
@@ -1299,7 +1430,7 @@ mod tests {
         for ending in [Ending::Refused, Ending::Aborted] {
             judged(&mut record, "r2", None);
             assert!(matches!(
-                record.run_ended(ending, "", &lenient()),
+                record.run_ended(&ended(ending), &lenient()),
                 AfterRun::Counted {
                     count: Count::NotCompleted,
                     ..
@@ -1318,13 +1449,13 @@ mod tests {
         let mut record = trial(5);
         judged(&mut record, "r1", Some(ChecksJudged::Starts));
         assert_eq!(
-            record.run_ended(Ending::Aborted, "aborted", &lenient()),
+            record.run_ended(&ended(Ending::Aborted), &lenient()),
             AfterRun::JudgesEnding
         );
         let (count, _) = record.judge_ending(done(), &lenient()).unwrap();
         assert_eq!(count, Count::NotCompleted);
         judged(&mut record, "r2", Some(ChecksJudged::Starts));
-        record.run_ended(Ending::Completed, "", &lenient());
+        record.run_ended(&ended(Ending::Completed), &lenient());
         let unsafe_and_undone = EndingJudged {
             task_done: false,
             emergency_stop: true,
@@ -1352,7 +1483,7 @@ mod tests {
         let mut record = trial(2);
         for run in ["r1", "r2"] {
             judged(&mut record, run, Some(ChecksJudged::Starts));
-            record.run_ended(Ending::Completed, "", &strict());
+            record.run_ended(&ended(Ending::Completed), &strict());
             let (_, next) = record.judge_ending(done(), &strict()).unwrap();
             let expected = match run {
                 "r1" => Next::GoesOn,
@@ -1360,9 +1491,15 @@ mod tests {
             };
             assert_eq!(next, expected);
         }
+        assert_eq!(record.step, TrialStep::Ended);
+        assert!(
+            record.judge_ending(done(), &strict()).is_err(),
+            "a trial that ends counts no judgement again"
+        );
+        assert_eq!(record.measures.runs, 2);
         let mut record = trial(1);
         judged(&mut record, "r1", Some(ChecksJudged::Starts));
-        record.run_ended(Ending::Completed, "", &strict());
+        record.run_ended(&ended(Ending::Completed), &strict());
         let undone = EndingJudged {
             task_done: false,
             ..done()
@@ -1374,6 +1511,7 @@ mod tests {
                 "the 1 runs that count do not meet the thresholds of the bundle: `false_successes_at_most`".to_owned()
             )
         );
+        assert!(record.judge_ending(done(), &strict()).is_err());
         assert_eq!(
             (record.measures.completed, record.measures.false_successes),
             (1, 1)
@@ -1386,7 +1524,7 @@ mod tests {
     fn the_trial_ends_early_once_its_thresholds_cannot_be_met() {
         let mut record = trial(20);
         judged(&mut record, "r1", None);
-        let after = record.run_ended(Ending::Refused, "", &strict());
+        let after = record.run_ended(&ended(Ending::Refused), &strict());
         assert_eq!(
             after,
             AfterRun::Counted {
@@ -1408,13 +1546,44 @@ mod tests {
         ] {
             let mut record = trial(3);
             judged(&mut record, "r1", Some(ChecksJudged::Starts));
-            let after = record.run_ended(ending, "the lease of arm_left ended", &strict());
+            let after = record.run_ended(&ended(ending), &strict());
             assert!(
                 matches!(&after, AfterRun::Ends { state: ended, .. } if *ended == state),
                 "{after:?}"
             );
             assert_eq!(record.measures, Measures::default());
         }
+    }
+
+    /// A running trial holds its robots only once the check of its admission
+    /// passed, and no more once it ended; the trial that asks holds none of
+    /// its own.
+    #[test]
+    fn a_trial_holds_its_robots_from_its_admission_to_its_end() {
+        let entry = |state: TrialState, holds_robots: bool| {
+            let mut record = trial(3);
+            record.state = state;
+            TrialEntry {
+                record: Arc::new(watch::Sender::new(record)),
+                live: None,
+                holds_robots,
+            }
+        };
+        let trials = BTreeMap::from([
+            ("t1".to_owned(), entry(TrialState::Running, false)),
+            ("t2".to_owned(), entry(TrialState::Running, true)),
+            ("t3".to_owned(), entry(TrialState::Refused, true)),
+        ]);
+        let arm = RobotName::parse("arm_left").unwrap();
+        assert_eq!(
+            robots_of_trials(&trials, None),
+            [(arm.clone(), "t2".to_owned())]
+        );
+        assert!(robots_of_trials(&trials, Some("t2")).is_empty());
+        assert_eq!(
+            robots_of_trials(&trials, Some("t1")),
+            [(arm, "t2".to_owned())]
+        );
     }
 
     /// The checks of a run are judged once, and only for the run that goes.

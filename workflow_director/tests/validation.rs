@@ -829,6 +829,64 @@ async fn a_run_not_ready_does_not_count_and_a_wrong_check_counts_as_false() -> p
     rig.harness.shutdown().await
 }
 
+/// A next run that does not start, as when the journal of its run does not open, fails with `attempt_failed` and
+/// opens the lease of the trial again, so the operator can go on preparing the work cell; the next `next_run` then
+/// starts the run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_next_run_that_does_not_start_opens_the_leases_again() -> peppygen::Result<()> {
+    let rig = physical_rig().await?;
+    let bundle = bundle_of_home(lock_at(ARM_NODE.2), Some(belt_speed_tested()));
+    let mut goal = start_trial(&rig, 1, bundle).await?;
+    until_trial(&mut goal, "prepares").await?;
+    // A directory where the journals keep the number of the next run: the journal of the run cannot open.
+    let next_run_number = rig
+        .journals
+        .path()
+        .join("workflow_director")
+        .join("journals")
+        .join("next_run");
+    let _ = std::fs::remove_file(&next_run_number);
+    std::fs::create_dir(&next_run_number).unwrap();
+    let request = next_run::GoalRequestData {
+        trial: "t1".to_owned(),
+    };
+    let not_started =
+        next_run::send_goal(&rig.harness, &request, DEFAULT_FEEDBACK_BOUND, WIRE).await?;
+    match not_started.get_result(WIRE).await?.outcome {
+        next_run::ResultOutcome::Failed(failure) => {
+            assert_eq!(failure.kind.to_string(), "attempt_failed");
+            assert!(
+                failure
+                    .message
+                    .starts_with("the journal of the run did not open"),
+                "{failure:?}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    let leases = |calls: Vec<String>| -> Vec<String> {
+        calls
+            .into_iter()
+            .filter(|call| [format!("open {ROBOT}"), format!("close {ROBOT}")].contains(call))
+            .collect()
+    };
+    assert_eq!(
+        leases(rig.fleet.calls()),
+        [
+            format!("open {ROBOT}"),
+            format!("close {ROBOT}"),
+            format!("open {ROBOT}")
+        ]
+    );
+    std::fs::remove_dir(&next_run_number).unwrap();
+    let (_run_goal, run) = next_run_judging(&rig, "t1").await?;
+    assert!(!run.is_empty());
+    goal.cancel_goal(WIRE).await?;
+    let (report, _) = trial_ended(goal).await?;
+    assert_eq!(report["state"], "aborted", "{report}");
+    rig.harness.shutdown().await
+}
+
 /// A halt ends a trial that waits for its next run halted, signing off nothing, and refuses every new trial.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_halt_ends_a_running_trial_halted_and_refuses_a_new_one() -> peppygen::Result<()> {
