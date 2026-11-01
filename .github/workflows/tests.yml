@@ -40,10 +40,12 @@ name: Tests
 # cargo registries, per-crate target dirs, uv's downloads) lives on the test
 # job's sticky disk, which RunsOn snapshots after the job and restores for the
 # next run on the same branch, or from main's newest snapshot for a branch's
-# first run. A pull request's run reads main's snapshot but never writes it;
-# the push to main is what keeps it current. A pull request from a fork runs
-# on the same runners, so what holds fork code is the repository's fork-PR
-# approval gate.
+# first run. The disk restores lazily (`lazy-init` in the job's label), so a
+# block comes from the snapshot when the job first reads it and no restore
+# pays for a provisioned initialization rate. A pull request's run reads
+# main's snapshot but never writes it; the push to main is what keeps it
+# current. A pull request from a fork runs on the same runners, so what holds
+# fork code is the repository's fork-PR approval gate.
 #
 # Each job runs on a RunsOn spot instance in attempts 1 and 2 of its run, and
 # on an on-demand instance from attempt 3. When AWS interrupts a spot
@@ -194,7 +196,7 @@ jobs:
     # this job onto an arm runner starts from an empty cache rather than a
     # wrong-arch one. The base images and the librealsense apt repository are
     # published for both.
-    runs-on: runs-on=${{ github.run_id }}/runner=peppy-ci-ubuntu-24.04-x86_64/image=peppy-ubuntu24/cpu=8/ram=16+32/family=c8a+c7a+m8a+m7a/volume=60gb:gp3:500mbs:6000iops/sticky=node-tests:200gb${{ fromJSON(github.run_attempt) >= 3 && '/spot=false' || '' }}  # custom Peppy AMI
+    runs-on: runs-on=${{ github.run_id }}/runner=peppy-ci-ubuntu-24.04-x86_64/image=peppy-ubuntu24/cpu=8/ram=16+32/family=c8a+c7a+m8a+m7a/volume=60gb:gp3:500mbs:6000iops/sticky=node-tests:200gb:lazy-init${{ fromJSON(github.run_attempt) >= 3 && '/spot=false' || '' }}  # custom Peppy AMI
     # A cold run compiles nine crates' full dependency trees and resolves
     # lerobot's, torch included. The sticky disk keeps warm runs far under
     # this, but a run that starts from an empty disk is legitimately slow.
