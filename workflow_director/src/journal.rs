@@ -3,7 +3,9 @@
 //! times. A journal holds the run's inputs, its events and its end; the
 //! records of runs survive a restart of the director, and a run that has no
 //! end when the director starts ends interrupted. The store reads each
-//! journal once, when it opens, and keeps the size and the end of each.
+//! journal once, when it opens, and keeps the size and the end of each. The
+//! journal of a run of a trial stays with the report of its trial: the
+//! bounds of the store neither count nor remove it.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, OpenOptions};
@@ -61,12 +63,32 @@ pub struct Journals {
 }
 
 /// What the store keeps of one journal: the sequence number of its next
-/// record, its size and whether it has its end.
+/// record, its size, whether it has its end, and whether it is the journal
+/// of a run of a trial.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct Kept {
     next_seq: u64,
     bytes: u64,
     ended: bool,
+    of_a_trial: bool,
+}
+
+/// Whether the record of `kind` with `body` opens the journal of a run of a
+/// trial.
+fn opens_a_run_of_a_trial(kind: &str, body: &Json) -> bool {
+    kind == OPENED && body["trial"].is_string()
+}
+
+/// The next number of a counter kept in `file`: one more than the number it
+/// holds and than `at_least`. The file keeps it, so the numbers grow.
+pub fn next_number(file: &Path, at_least: u64) -> std::io::Result<u64> {
+    let given = fs::read_to_string(file)
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    let next = given.max(at_least) + 1;
+    fs::write(file, next.to_string())?;
+    Ok(next)
 }
 
 /// The file that keeps the next run number, so ids grow after pruning.
@@ -129,18 +151,12 @@ impl Journals {
     /// The next run id, `r<N>`, one more than every id given before.
     pub fn next_run(&self) -> std::io::Result<String> {
         let kept = self.kept.lock().expect("no journal writer panics");
-        let file = self.dir.join(NEXT_RUN_FILE);
-        let given = fs::read_to_string(&file)
-            .ok()
-            .and_then(|text| text.trim().parse::<u64>().ok())
-            .unwrap_or(0);
         let on_disk = kept
             .keys()
             .filter_map(|run| run_number(run))
             .max()
             .unwrap_or(0);
-        let next = given.max(on_disk) + 1;
-        fs::write(&file, next.to_string())?;
+        let next = next_number(&self.dir.join(NEXT_RUN_FILE), on_disk)?;
         Ok(format!("r{next}"))
     }
 
@@ -155,6 +171,7 @@ impl Journals {
     pub fn append(&self, run: &str, run_ns: u64, kind: &str, body: Json) -> std::io::Result<()> {
         let mut kept = self.kept.lock().expect("no journal writer panics");
         let journal = kept.entry(run.to_owned()).or_default();
+        let of_a_trial = opens_a_run_of_a_trial(kind, &body);
         let record = Record {
             seq: journal.next_seq,
             run_ns,
@@ -172,6 +189,7 @@ impl Journals {
         journal.next_seq += 1;
         journal.bytes += line.len() as u64;
         journal.ended |= kind == END;
+        journal.of_a_trial |= of_a_trial;
         Ok(())
     }
 
@@ -189,12 +207,13 @@ impl Journals {
     }
 
     /// Removes the journals of ended runs, oldest first, beyond the bounds,
-    /// and gives the runs it removed.
+    /// and gives the runs it removed. The journals of the runs of trials
+    /// stay, and count toward neither bound.
     pub fn prune(&self) -> std::io::Result<Vec<String>> {
         let mut kept = self.kept.lock().expect("no journal writer panics");
         let mut ended: VecDeque<String> = oldest_first(kept.keys())
             .into_iter()
-            .filter(|run| kept[run].ended)
+            .filter(|run| kept[run].ended && !kept[run].of_a_trial)
             .collect();
         let mut bytes: u64 = ended.iter().map(|run| kept[run].bytes).sum();
         let mut removed = Vec::new();
@@ -245,6 +264,9 @@ fn repaired(path: &Path) -> std::io::Result<Kept> {
         next_seq: records.len() as u64,
         bytes,
         ended: records.iter().any(|record| record.kind == END),
+        of_a_trial: records
+            .iter()
+            .any(|record| opens_a_run_of_a_trial(&record.kind, &record.body)),
     })
 }
 
@@ -357,6 +379,29 @@ mod tests {
             message.contains("move this journal out of its directory"),
             "{message}"
         );
+    }
+
+    /// The journal of a run of a trial stays past both bounds, and the
+    /// bounds count the other journals only; it stays as the store opens
+    /// again.
+    #[test]
+    fn the_journal_of_a_run_of_a_trial_stays_past_the_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let journals = Journals::open(dir.path(), 1, u64::MAX).unwrap();
+        let of_a_trial = journals.next_run().unwrap();
+        journals
+            .append(&of_a_trial, 0, OPENED, serde_json::json!({ "trial": "t1" }))
+            .unwrap();
+        journals.append(&of_a_trial, 1, END, Json::Null).unwrap();
+        let runs: Vec<String> = (0..2).map(|_| journals.next_run().unwrap()).collect();
+        for run in &runs {
+            journals.append(run, 0, OPENED, Json::Null).unwrap();
+            journals.append(run, 1, END, Json::Null).unwrap();
+        }
+        assert_eq!(journals.prune().unwrap(), vec![runs[0].clone()]);
+        let reopened = Journals::open(dir.path(), 0, 1).unwrap();
+        assert_eq!(reopened.prune().unwrap(), vec![runs[1].clone()]);
+        assert_eq!(reopened.runs(), vec![of_a_trial]);
     }
 
     #[test]

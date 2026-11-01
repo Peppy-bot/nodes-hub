@@ -15,17 +15,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
-use workflow_documents::result::Ending;
+use workflow_documents::result::{Ending, RunResult};
 use workflow_documents::run::RunDocument;
-use workflow_documents::{EventKind, Name, RobotName, Workflow};
+use workflow_documents::{EventKind, Name, RobotName, Validation, Workflow, uncovered_work_cell};
 
 use crate::checker::{self, RunChoices};
 use crate::config::AllowedContracts;
 use crate::contract::ContractShape;
 use crate::engine::failure::Failure;
 use crate::engine::host::{CallEnd, Event, Host, Join, Joining};
-use crate::engine::plan::{Target, TopicKey};
-use crate::engine::{self, Phase, ResultBase, RunCommand};
+use crate::engine::plan::{Target, TopicKey, Watch};
+use crate::engine::{self, ChecksJudged, Phase, ResultBase, RunCommand};
 use crate::fleet::{Fleet, Snapshot};
 use crate::journal::{self, Journals, Record};
 
@@ -154,6 +154,9 @@ enum CommandRecord {
         source: String,
         standing: Vec<String>,
     },
+    JudgeChecks {
+        judged: ChecksJudged,
+    },
 }
 
 impl CommandRecord {
@@ -182,6 +185,9 @@ impl CommandRecord {
                 role: role.clone(),
                 failure: failure.clone(),
             },
+            RunCommand::JudgeChecks { judged } => CommandRecord::JudgeChecks {
+                judged: judged.clone(),
+            },
         }
     }
 
@@ -204,6 +210,7 @@ impl CommandRecord {
                 source,
                 standing,
             },
+            CommandRecord::JudgeChecks { judged } => RunCommand::JudgeChecks { judged },
         }
     }
 }
@@ -420,6 +427,10 @@ type Shares = BTreeMap<(Name, u64), (u64, Join)>;
 /// The journal of a run, read for its replay.
 struct Recording {
     workflow: Workflow,
+    /// Whether the run is a run of a trial.
+    of_a_trial: bool,
+    /// The validation of the bundle of the run, when it has one.
+    validation: Option<Validation>,
     planned: Planned,
     calls: Calls,
     reads: Reads,
@@ -449,6 +460,8 @@ impl Recording {
             .find(|r| r.kind == journal::OPENED)
             .ok_or("the journal has no opened record")?;
         let workflow = crate::director::workflow_of(&opened.body)?;
+        let validation = crate::director::bundle_document_of(&opened.body)?
+            .and_then(|document| document.validation);
         let planned = records
             .iter()
             .find(|r| r.kind == journal::PLANNED)
@@ -456,6 +469,8 @@ impl Recording {
         let planned: Planned = body(planned)?;
         let mut recording = Recording {
             workflow,
+            of_a_trial: opened.body["trial"].is_string(),
+            validation,
             planned,
             calls: BTreeMap::new(),
             reads: BTreeMap::new(),
@@ -741,6 +756,8 @@ pub fn replay(text: &str) -> Result<Outcome, String> {
         poll: workflow_documents::Bound::from_seconds(planned.poll_s)
             .map_err(|e| format!("poll: {e}"))?,
         cancel_timeout: Duration::from_nanos(planned.cancel_timeout_ns),
+        watch: Watch::of(document, recording.validation.as_ref()),
+        of_a_trial: recording.of_a_trial,
     };
     let plan = checker::plan(
         Arc::new(recording.workflow.clone()),
@@ -817,8 +834,17 @@ pub fn replay(text: &str) -> Result<Outcome, String> {
                         })
                     };
                     let (phase, _) = watch::channel(Phase::Preparing);
+                    // The base of the result gives the engine the values of
+                    // the work cell that no test covered, as the director
+                    // gave them to the run.
                     let base = ResultBase {
-                        result: crate::director::empty_result(),
+                        result: RunResult {
+                            uncovered: uncovered_work_cell(
+                                recording.validation.as_ref(),
+                                &document.work_cell,
+                            ),
+                            ..crate::director::empty_result()
+                        },
                     };
                     let result =
                         engine::drive(&plan, &host, base, commands_rx, phase, planned.run_ns).await;
@@ -914,6 +940,7 @@ fn compare(
 mod tests {
     use serde_json::json;
     use tokio::sync::{mpsc, watch};
+    use workflow_documents::WorkCell;
     use workflow_documents::run::{Attendance, RunDocument};
 
     use super::*;
@@ -960,11 +987,14 @@ mod tests {
     }
 
     /// The commands of a run of a test: those that wait before the engine
-    /// starts, and those that come at their second of the run.
+    /// starts, and those that come at their second of the run; and the
+    /// trial of a run of a trial, whose operator gives the judgement of its
+    /// checks as a command.
     #[derive(Default)]
     struct Commands {
         queued: Vec<RunCommand>,
         later: Vec<(u64, RunCommand)>,
+        trial: Option<&'static str>,
     }
 
     /// The journal of the run of `journal_of_a_run_until` on `scripted`, with
@@ -1004,13 +1034,35 @@ mod tests {
         commands: Commands,
         stops: impl Fn(&Phase) -> bool,
     ) -> String {
-        let text = value.to_string();
-        let workflow = Workflow::parse(&text).unwrap();
-        let binding: BTreeMap<Name, RobotName> = workflow
+        let workflow = Workflow::parse(&value.to_string()).unwrap();
+        let document = RunDocument {
+            attendance,
+            ..RunDocument::of_roles(&workflow, binding_of(&workflow), WorkCell::new()).unwrap()
+        };
+        journal_of_a_document(value, scripted, document, commands, stops).await
+    }
+
+    /// Each role of `workflow` bound to the robot of its name.
+    fn binding_of(workflow: &Workflow) -> BTreeMap<Name, RobotName> {
+        workflow
             .roles
             .keys()
             .map(|role| (role.clone(), robot_name(role.as_str())))
-            .collect();
+            .collect()
+    }
+
+    /// The journal of a run of `value` by `document`, as
+    /// `journal_of_a_run_of` gives it.
+    async fn journal_of_a_document(
+        value: &Json,
+        scripted: ScriptedHost,
+        document: RunDocument,
+        commands: Commands,
+        stops: impl Fn(&Phase) -> bool,
+    ) -> String {
+        let text = value.to_string();
+        let workflow = Workflow::parse(&text).unwrap();
+        let binding = binding_of(&workflow);
         let fleet = snapshot(
             binding
                 .values()
@@ -1021,7 +1073,12 @@ mod tests {
         let journals = Journals::open(dir.path(), 10, u64::MAX).unwrap();
         let run = journals.next_run().unwrap();
         journals
-            .append(&run, 0, journal::OPENED, json!({ "workflow": text }))
+            .append(
+                &run,
+                0,
+                journal::OPENED,
+                json!({ "workflow": text, "trial": commands.trial }),
+            )
             .unwrap();
         let mut planned = Planned {
             fleet: fleet.fleet.clone(),
@@ -1032,17 +1089,16 @@ mod tests {
                 .collect(),
             models: BTreeMap::new(),
             allowed: crate::testing::allowed().to_string(),
-            binding: binding.clone(),
-            run_document: RunDocument {
-                attendance,
-                ..RunDocument::of_roles(&workflow, binding).unwrap()
-            },
+            binding,
+            run_document: document,
             poll_s: 0.5,
             cancel_timeout_ns: 10_000_000_000,
             run_ns: 0,
             wall_ns: 0,
         };
-        let plan = crate::testing::plan(value, planned.run_document.attendance);
+        let mut plan = crate::testing::plan(value, planned.run_document.attendance);
+        plan.watch = Watch::of(&planned.run_document, None);
+        plan.of_a_trial = commands.trial.is_some();
         let host = Recorded::new(scripted, &journals, &run);
         planned.run_ns = host.now();
         planned.wall_ns = host.wall_now();
@@ -1064,11 +1120,17 @@ mod tests {
             std::future::pending::<()>().await
         };
         let (phase, mut phases) = watch::channel(Phase::Preparing);
+        // As the director gives it, the base names each value of the work
+        // cell that no test covered: with no bundle, every one.
+        let uncovered = uncovered_work_cell(None, &planned.run_document.work_cell);
         let driven = drive(
             &plan,
             &host,
             ResultBase {
-                result: crate::director::empty_result(),
+                result: RunResult {
+                    uncovered,
+                    ..crate::director::empty_result()
+                },
             },
             commands_rx,
             phase,
@@ -1149,6 +1211,33 @@ mod tests {
             check.contains("the block slipped") && check.contains(r#""severity":"low""#),
             "{check}"
         );
+    }
+
+    /// A run whose work cell no test covered gives the event `uncovered`,
+    /// and its replay gives it too: the replay reads the work cell of the
+    /// run document, as the director does.
+    #[tokio::test(start_paused = true)]
+    async fn the_replay_of_a_run_with_a_work_cell_no_test_covered_gives_its_uncovered_event() {
+        use workflow_documents::work_cell::RoleValues;
+        let value = picking();
+        let workflow = Workflow::parse(&value.to_string()).unwrap();
+        let work_cell = WorkCell::from([(name("belt_speed_mps"), RoleValues::Single(0.3))]);
+        let document = RunDocument {
+            attendance: Attendance::Attended,
+            ..RunDocument::of_roles(&workflow, binding_of(&workflow), work_cell).unwrap()
+        };
+        let scripted = ScriptedHost::new()
+            .answer("find", vec![Answer::now(found()), Answer::now(found())])
+            .answer(
+                "grab",
+                vec![Answer::now(json!({ "success": true, "item_id": "b1" }))],
+            )
+            .answer("home", vec![Answer::now(json!({ "at_home": true }))]);
+        let journal =
+            journal_of_a_document(&value, scripted, document, Commands::default(), |_| false).await;
+        assert!(journal.contains(r#""event":"uncovered""#), "{journal}");
+        let outcome = replay(&journal).unwrap();
+        assert!(outcome.same, "{outcome:#?}");
     }
 
     #[tokio::test(start_paused = true)]
@@ -1279,6 +1368,7 @@ mod tests {
         let commands = Commands {
             queued: vec![RunCommand::Abort],
             later: Vec::new(),
+            trial: None,
         };
         let journal = journal_of(scripted, Attendance::Attended, commands, |_| false).await;
         assert!(!journal.contains(r#""type":"call""#), "{journal}");
@@ -1300,6 +1390,7 @@ mod tests {
         let commands = Commands {
             queued: Vec::new(),
             later: vec![(60, RunCommand::Resume { reply }), (70, RunCommand::Abort)],
+            trial: None,
         };
         let journal = journal_of(scripted, Attendance::Attended, commands, |_| false).await;
         assert!(journal.contains(r#""type":"lease""#), "{journal}");
@@ -1417,6 +1508,7 @@ mod tests {
         let commands = Commands {
             queued: Vec::new(),
             later: vec![(1, RunCommand::Suspend), (30, RunCommand::Abort)],
+            trial: None,
         };
         let journal =
             journal_of_a_run_of(&value, scripted, Attendance::Attended, commands, |_| false).await;
@@ -1504,10 +1596,67 @@ mod tests {
         let commands = Commands {
             queued: Vec::new(),
             later: vec![(6, RunCommand::Abort)],
+            trial: None,
         };
         let journal =
             journal_of_a_run_of(&value, scripted, Attendance::Attended, commands, |_| false).await;
         let outcome = replay(&journal).unwrap();
         assert!(outcome.same, "{outcome:#?}");
+    }
+
+    /// The journal of a run that reads a watch parameter before its
+    /// assumptions replays to its decisions, the event `uncovered` included.
+    #[tokio::test(start_paused = true)]
+    async fn the_journal_of_a_run_that_watches_replays_to_its_decisions() {
+        let value = picking();
+        let workflow = Workflow::parse(&value.to_string()).unwrap();
+        let mut document =
+            RunDocument::of_roles(&workflow, binding_of(&workflow), WorkCell::new()).unwrap();
+        document.watch = serde_json::from_value(
+            json!({ "loose": { "unit": "items", "observation": "target.count" } }),
+        )
+        .unwrap();
+        let scripted = ScriptedHost::new()
+            .answer("find", vec![Answer::now(found())])
+            .answer(
+                "grab",
+                vec![Answer::now(json!({ "success": true, "item_id": "b1" }))],
+            )
+            .answer("home", vec![Answer::now(json!({ "at_home": true }))]);
+        let text =
+            journal_of_a_document(&value, scripted, document, Commands::default(), |_| false).await;
+        assert!(text.contains("\"uncovered\""), "{text}");
+        let outcome = replay(&text).unwrap();
+        assert!(outcome.same, "{}", outcome.difference);
+    }
+
+    /// The journal of a run of a trial, whose checks wait for the judgement
+    /// of the operator, replays to its decisions with the judgement at its
+    /// run time.
+    #[tokio::test(start_paused = true)]
+    async fn the_journal_of_a_run_of_a_trial_replays_with_the_judgement_of_its_checks() {
+        let scripted = ScriptedHost::new()
+            .answer("find", vec![Answer::now(found())])
+            .answer(
+                "grab",
+                vec![Answer::now(json!({ "success": true, "item_id": "b1" }))],
+            )
+            .answer("home", vec![Answer::now(json!({ "at_home": true }))]);
+        let commands = Commands {
+            later: vec![(
+                4,
+                RunCommand::JudgeChecks {
+                    judged: ChecksJudged::Starts,
+                },
+            )],
+            trial: Some("t1"),
+            ..Commands::default()
+        };
+        let text = journal_of(scripted, Attendance::Unattended, commands, |_| false).await;
+        assert!(text.contains("\"checks_to_judge\""), "{text}");
+        assert!(text.contains("\"judge_checks\""), "{text}");
+        let outcome = replay(&text).unwrap();
+        assert!(outcome.same, "{}", outcome.difference);
+        assert!(outcome.decisions > 2, "{}", outcome.decisions);
     }
 }

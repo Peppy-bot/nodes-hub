@@ -8,7 +8,11 @@
 //! and calls the members its workflow names through the codec API, so a
 //! workflow can name contracts this node was not built with. The engine
 //! runs one lane per role on the run clock. The journal of each run keeps
-//! its inputs, its events and its end, and gives its replay.
+//! its inputs, its events and its end, and gives its replay. A trial
+//! (`trial/v1`) runs a bundle on physical robots, a person preparing and
+//! judging each run, and keeps a sign-off record when its runs meet the
+//! thresholds of the bundle; an unattended run on physical robots runs only
+//! as such a record admits it.
 
 #![forbid(unsafe_code)]
 
@@ -28,10 +32,13 @@ mod fleet;
 mod journal;
 mod leases;
 mod live;
+mod records;
 mod replay;
 mod serve;
+mod sign_off;
 #[cfg(test)]
 mod testing;
+mod trial;
 
 use clock::ClockSource;
 use config::Config;
@@ -39,6 +46,8 @@ use director::{Director, EVENTS_KEPT};
 use fleet::Snapshot;
 use journal::Journals;
 use leases::Leases;
+use sign_off::SignOffs;
+use trial::Trials;
 
 /// The director's own error: a fact about its parameters or its machine,
 /// which is what a launcher reads back when the node refuses to start.
@@ -91,6 +100,18 @@ pub async fn setup(params: Parameters, runner: Arc<NodeRunner>, fault: Fault) ->
             config.journal_root.display()
         ))
     })?;
+    let sign_offs = SignOffs::open(&config.journal_root).map_err(|error| {
+        refused(format!(
+            "the sign-off records under journal_root `{}` did not read: {error}",
+            config.journal_root.display()
+        ))
+    })?;
+    let (trial_records, trials) = Trials::open(&config.journal_root).map_err(|error| {
+        refused(format!(
+            "the trial records under journal_root `{}` did not read: {error}",
+            config.journal_root.display()
+        ))
+    })?;
     let clock = ClockSource::of(&runner, fault.clone()).await?;
     let leases = Leases::start(Arc::clone(&runner), fault).await?;
     let (snapshots_tx, snapshots) = watch::channel(Arc::new(Snapshot::default()));
@@ -102,11 +123,15 @@ pub async fn setup(params: Parameters, runner: Arc<NodeRunner>, fault: Fault) ->
         leases,
         snapshots,
         journals,
+        sign_offs,
+        trial_records,
+        trials: Mutex::new(Default::default()),
         runs: Mutex::new(Default::default()),
         teaching: Mutex::new(Default::default()),
         events,
         clock,
     });
+    director.restore_trials(trials);
     serve::publish_run_events(&director).await?;
     director.restore().await.map_err(|error| {
         refused(format!(

@@ -30,6 +30,8 @@ use peppygen::consumed_services::fleet::list::{
     ResponseDataRobotsItem, ResponseDataRobotsItemContractsItem,
     ResponseDataRobotsItemInstancesItem,
 };
+use peppygen::fixtures::exposed_actions::director::run;
+use peppygen::fixtures::exposed_services::director::robots;
 use peppygen::fixtures::harness::{Config, Harness, Mocks};
 use peppygen::mock::deps::fleet;
 use peppylib::Payload;
@@ -42,6 +44,8 @@ use workflow_director::Fault;
 
 /// How long the wire may take for any one exchange.
 pub const WIRE: Duration = Duration::from_secs(10);
+/// How often a test reads the director again while it waits for the director to see the fleet.
+pub const SETTLE: Duration = Duration::from_millis(50);
 /// How long a mock waits for the next request of the director.
 const IDLE: Duration = Duration::from_secs(3600);
 /// The arm of the tests, as the fleet serves it.
@@ -89,19 +93,22 @@ pub struct Lease {
     pub open: bool,
 }
 
-/// How the scripted fleet stands: its halt, its leases, whether it refuses each close of a lease, and whether each
-/// lease ends as it is taken, with no event, as a removal of the robot right after the take ends it.
+/// How the scripted fleet stands: its halt, its leases, whether it refuses each close of a lease, whether each
+/// lease ends as it is taken, with no event, as a removal of the robot right after the take ends it, and whether
+/// `alpha` is a physical robot.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FleetState {
     pub halted: bool,
     pub leases: Vec<Lease>,
     pub close_refused: bool,
     pub lease_ends_at_take: bool,
+    pub physical: bool,
 }
 
 /// The fleet of the tests, on the fleet mock of the harness: it lists `alpha` with the arm of the tests, answers
 /// each member that the director calls from its state, keeps each call as `<member> <robot> <name>` in order, and
-/// sends each change of its state as a feedback of the `changes` goal of the director.
+/// sends each change of its state as a feedback of the `changes` goal of the director. A take is refused while the
+/// stack is halted, and while another client leases the robot.
 pub struct ScriptedFleet {
     pub state: watch::Sender<FleetState>,
     pub calls: Arc<Mutex<Vec<String>>>,
@@ -163,6 +170,31 @@ impl ScriptedFleet {
                         .lock()
                         .unwrap()
                         .push(format!("take {} {}", request.robot, request.name));
+                    let refusal = {
+                        let state = state.borrow();
+                        let other = state
+                            .leases
+                            .iter()
+                            .find(|lease| lease.robot == request.robot && lease.holder != director);
+                        match (state.halted, other) {
+                            (true, _) => Some((
+                                fleet::take::FailureKind::Halted,
+                                "the stack is halted".to_owned(),
+                            )),
+                            (false, Some(lease)) => Some((
+                                fleet::take::FailureKind::Leased,
+                                format!(
+                                    "`{}` is leased by {} under `{}`",
+                                    lease.robot, lease.holder, lease.name
+                                ),
+                            )),
+                            (false, None) => None,
+                        }
+                    };
+                    if let Some((kind, message)) = refusal {
+                        let _ = responder.respond_failure(kind, message).await;
+                        continue;
+                    }
                     state.send_modify(|state| {
                         state.leases.retain(|lease| lease.robot != request.robot);
                         if state.lease_ends_at_take {
@@ -394,8 +426,8 @@ impl LeaseAnswer {
     }
 }
 
-/// The listing of `state` on `core_node`, as the generated type of the member that `$root` names: `alpha`, simulated,
-/// on wall time, whose instance `alpha_arm` serves the arm of the tests, the document of that arm, the node of that
+/// The listing of `state` on `core_node`, as the generated type of the member that `$root` names: `alpha`, physical
+/// or simulated as `state` says, on wall time, whose instance `alpha_arm` serves the arm of the tests, the document of that arm, the node of that
 /// instance, and the leases of `state`.
 macro_rules! listing {
     ($core_node:expr, $state:expr, $listing:ident, $robot:ident, $instance:ident, $contract:ident, $lease:ident,
@@ -412,7 +444,10 @@ macro_rules! listing {
                 name: ROBOT.to_owned(),
                 option: "test_sim".to_owned(),
                 core_node: core_node.to_owned(),
-                kind: "simulated".to_owned(),
+                kind: match state.physical {
+                    true => "physical".to_owned(),
+                    false => "simulated".to_owned(),
+                },
                 clock: "wall".to_owned(),
                 software: "running".to_owned(),
                 robot_commander: String::new(),
@@ -935,4 +970,29 @@ pub fn home_workflow() -> String {
 /// The roles of a run of `home_workflow` on `alpha`.
 pub fn on_alpha() -> String {
     json!({ "arm": ROBOT }).to_string()
+}
+
+/// The robots of the director, once it lists `alpha`: before the first feedback of the fleet, `robots` answers
+/// `resource_unavailable`.
+pub async fn listed_robots(rig: &Rig) -> peppygen::Result<robots::Response> {
+    loop {
+        match robots::poll(&rig.harness, WIRE).await {
+            Ok(listed) if !listed.robots.is_empty() => return Ok(listed),
+            Ok(_) => {}
+            Err(error)
+                if robots::Failure::of(&error)
+                    .is_some_and(|failure| failure.kind.to_string() == "resource_unavailable") => {}
+            Err(error) => return Err(error),
+        }
+        tokio::time::sleep(SETTLE).await;
+    }
+}
+
+/// The events of the feedback of the run `goal` up to the end of its stream.
+pub async fn feedback_of(goal: &mut run::GoalHandle) -> Vec<String> {
+    let mut events = Vec::new();
+    while let Ok(feedback) = goal.on_next_feedback().await {
+        events.push(feedback.event);
+    }
+    events
 }
