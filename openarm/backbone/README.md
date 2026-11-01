@@ -310,7 +310,8 @@ short of it in any orientation, its joint limits aside: at most 0.01 when
 the grasp point gets within 1 cm of it, but in no grasp orientation, which
 the point's message words as `no arm reaches it with its gripper pointing
 down or forward`. A point is in view when it lies inside the perception camera's
-field of view and its depth, by the depth model the camera gives (`z`, the
+field of view, a pixel of its colour image showing it through the lens the
+camera gives, and its depth, by the depth model the camera gives (`z`, the
 depth along the optical axis, or `range`, the straight-line distance), lies
 inside the camera's depth range. The perception camera is derived
 from the description, never configured: the one camera that gives depth
@@ -324,7 +325,7 @@ within 2 s for each of its two answers.
 |---|---|
 | vacant | no view check: each point's `view` is `no_camera`, and `view` is absent |
 | linked, answering | the view is checked through the camera's own intrinsics and depth stream |
-| linked, colour intrinsics an error reply, not answered in time, or not a pinhole model | error reply, `precondition_failed`: `cannot read the colour intrinsics of the chest camera, the perception camera: <reason>` |
+| linked, colour intrinsics an error reply, not answered in time, not a pinhole model, or of a lens `camera_geometry:v1` does not name | error reply, `precondition_failed`: `cannot read the colour intrinsics of the chest camera, the perception camera: <reason>` |
 | linked, depth intrinsics an error reply other than `rejected`, not answered in time, not a depth range, or of a depth model `camera_geometry:v1` does not name | error reply, `precondition_failed`: `cannot read the depth intrinsics of the chest camera, the perception camera: <reason>` |
 | linked, depth intrinsics an error reply with `rejected` (a camera that gives no depth) | error reply, `precondition_failed`: `the camera linked as the chest camera, the perception camera, gives no depth: <reason>` |
 

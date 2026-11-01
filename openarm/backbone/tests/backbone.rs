@@ -2277,7 +2277,46 @@ async fn a_linked_camera_of_an_unknown_depth_model_is_refused_naming_the_model()
         check_positions::Failure::new(
             check_positions::FailureKind::PreconditionFailed,
             "cannot read the depth intrinsics of the chest camera, the perception camera: \
-             unknown depth model 'disparity': camera_geometry:v1 names \"z\" and \"range\""
+             unknown depth_model 'disparity' (expected 'z' or 'range')"
+        )
+    );
+    harness.shutdown().await
+}
+
+/// A linked camera whose colour stream gives a lens camera_geometry:v1 does
+/// not name leaves the chest camera's image without a model: the answer is
+/// an error reply with `precondition_failed`, naming the lens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_linked_camera_of_an_unknown_colour_lens_is_refused_naming_the_lens()
+-> peppygen::Result<()> {
+    use peppygen::fixtures::exposed_services::workspace::check_positions;
+
+    let (harness, mocks) = start_v2_with_camera_geometry().await?;
+    answer_as_the_chest_camera!(
+        mocks,
+        Ok::<_, get_color_intrinsics::Failure>(get_color_intrinsics::ResponseData {
+            distortion_model: "kannala_brandt".to_string(),
+            distortion: vec![0.1, 0.0, 0.0, 0.0],
+            ..chest_colour_intrinsics()
+        }),
+        Ok::<_, get_depth_intrinsics::Failure>(chest_depth_intrinsics())
+    );
+
+    let point = check_positions::RequestData {
+        positions: vec![0.30, 0.0, 0.45],
+    };
+    let refused = error_reply(
+        check_positions::poll(&harness, &point, DEADLINE).await,
+        check_positions::Failure::of,
+    );
+    assert_eq!(
+        refused,
+        check_positions::Failure::new(
+            check_positions::FailureKind::PreconditionFailed,
+            "cannot read the colour intrinsics of the chest camera, the perception camera: \
+             unknown distortion 'kannala_brandt' with coefficients [0.1, 0.0, 0.0, 0.0] \
+             (expected 'none' with none, or 'plumb_bob' or 'inverse_plumb_bob' with the five \
+             numbers k1, k2, p1, p2, k3)"
         )
     );
     harness.shutdown().await

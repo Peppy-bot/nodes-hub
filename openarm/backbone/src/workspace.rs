@@ -4,17 +4,18 @@
 //! kinematics, the grasp point at the target, to within the reach tolerance,
 //! in each grasp orientation `workspace_core` lists; the view is
 //! `workspace_core`'s field-of-view and depth test of the perception camera,
-//! placed where the design fixes it and seen through the intrinsics and the
-//! depth stream its camera gives. The parsing of a request, the reach of the
-//! surfaces measured last and the composition of each answer are
+//! placed where the design fixes it and seen through the pinhole model of the
+//! colour stream and the depth model its camera gives, each parsed by
+//! `camera_core`. The parsing of a request, the reach of the surfaces
+//! measured last and the composition of each answer are
 //! `workspace_core::design`'s, so this answer reads as every robot's and as a
 //! simulation's; the refusals of the perception camera's geometry are this
-//! module's own.
+//! module's own, around `camera_core`'s reasons.
 
-use std::str::FromStr;
 use std::sync::{Mutex, MutexGuard};
 
-use control_core::positive_finite::PositiveFinite;
+use camera_core::geometry::depth_range_is_valid;
+use camera_core::pinhole::{DepthModel, Pinhole, UnknownDepthModel};
 use openarm_description::{ArmPair, Side};
 use srs_model::nalgebra::{Isometry3, Matrix3, Rotation3, Translation3, UnitQuaternion, Vector3};
 use srs_model::{Arm, ArmAnglePolicy};
@@ -23,8 +24,7 @@ use workspace_core::design::{
     SurfaceReach, ViewCheck,
 };
 use workspace_core::{
-    Camera, CameraFacts, Depth, DepthModel, GraspOrientation, Intrinsics, PerceptionCameraError,
-    REACH_TOLERANCE, Reach, UnknownDepthModel,
+    Camera, CameraFacts, Depth, GraspOrientation, PerceptionCameraError, REACH_TOLERANCE, Reach,
 };
 
 use crate::camera_mounts::{CameraMounts, DesignCamera};
@@ -58,36 +58,6 @@ pub enum CameraGeometryError {
     },
 }
 
-/// The pinhole model of a colour stream as camera_geometry:v1 gives it,
-/// parsed: an image with pixels, positive focal lengths and a finite
-/// principal point.
-pub fn intrinsics_from_wire(
-    width: u32,
-    height: u32,
-    fx: f64,
-    fy: f64,
-    cx: f64,
-    cy: f64,
-) -> Result<Intrinsics, &'static str> {
-    if width == 0 || height == 0 {
-        return Err("its image has no pixels");
-    }
-    if PositiveFinite::parse(fx).is_err() || PositiveFinite::parse(fy).is_err() {
-        return Err("its focal lengths are not positive numbers");
-    }
-    if !(cx.is_finite() && cy.is_finite()) {
-        return Err("its principal point is not a finite point");
-    }
-    Ok(Intrinsics {
-        width,
-        height,
-        fx,
-        fy,
-        cx,
-        cy,
-    })
-}
-
 /// Why a depth stream's answer is not a depth stream camera_geometry:v1
 /// describes.
 #[derive(Debug, PartialEq, thiserror::Error)]
@@ -109,8 +79,8 @@ pub fn depth_from_wire(
     nearest: f64,
     farthest: f64,
 ) -> Result<Depth, DepthFromWireError> {
-    let model = DepthModel::from_str(depth_model)?;
-    if !(nearest.is_finite() && farthest.is_finite() && 0.0 <= nearest && nearest < farthest) {
+    let model = DepthModel::parse(depth_model)?;
+    if !depth_range_is_valid(nearest, farthest) {
         return Err(DepthFromWireError::Range);
     }
     Ok(Depth {
@@ -158,13 +128,13 @@ impl PerceptionCamera {
         }))
     }
 
-    /// The camera at the design's pose, seen through the `intrinsics` of its
-    /// colour stream and measuring `depth`.
-    pub fn camera(&self, intrinsics: Intrinsics, depth: Depth) -> Camera {
+    /// The camera at the design's pose, seen through the `pinhole` model of
+    /// its colour stream and measuring `depth`.
+    pub fn camera(&self, pinhole: Pinhole, depth: Depth) -> Camera {
         Camera {
             position: self.position,
             rotation: self.rotation,
-            intrinsics,
+            pinhole,
             depth: Some(depth),
         }
     }
@@ -427,7 +397,7 @@ mod tests {
             .perception_camera()
             .expect("v2 has a perception camera")
             .camera(
-                Intrinsics::from_vertical_fov(52f64.to_radians(), 1280, 720),
+                Pinhole::from_vertical_fov(52f64.to_radians(), 1280, 720).expect("a model"),
                 Depth {
                     model: DepthModel::Z,
                     range: [0.1, 10.0],
@@ -442,7 +412,7 @@ mod tests {
             .expect("v2 has a perception camera");
         ViewCheck::Checked {
             camera: perception.name,
-            geometry: chest(workspace),
+            geometry: Box::new(chest(workspace)),
         }
     }
 
@@ -771,26 +741,6 @@ mod tests {
     }
 
     #[test]
-    fn a_camera_geometry_that_is_no_pinhole_is_refused() {
-        let model = intrinsics_from_wire(1280, 720, 738.1, 738.1, 639.5, 359.5).expect("valid");
-        assert_eq!((model.width, model.fx, model.cy), (1280, 738.1, 359.5));
-        for (width, height, fx, fy, cx, cy) in [
-            (0, 720, 738.1, 738.1, 639.5, 359.5),
-            (1280, 0, 738.1, 738.1, 639.5, 359.5),
-            (1280, 720, 0.0, 738.1, 639.5, 359.5),
-            (1280, 720, 738.1, -1.0, 639.5, 359.5),
-            (1280, 720, f64::NAN, 738.1, 639.5, 359.5),
-            (1280, 720, 738.1, 738.1, f64::INFINITY, 359.5),
-            (1280, 720, 738.1, 738.1, 639.5, f64::NAN),
-        ] {
-            assert!(
-                intrinsics_from_wire(width, height, fx, fy, cx, cy).is_err(),
-                "{width}x{height} fx {fx} fy {fy} cx {cx} cy {cy}"
-            );
-        }
-    }
-
-    #[test]
     fn a_depth_stream_is_parsed_with_its_model_and_one_of_an_unknown_model_or_range_is_refused() {
         assert_eq!(
             depth_from_wire("z", 0.1, 10.0),
@@ -810,7 +760,9 @@ mod tests {
             let refused = depth_from_wire(model, 0.1, 10.0);
             assert_eq!(
                 refused,
-                Err(DepthFromWireError::Model(UnknownDepthModel(model.into())))
+                Err(DepthFromWireError::Model(
+                    DepthModel::parse(model).unwrap_err()
+                ))
             );
             let reason = refused.unwrap_err().to_string();
             assert!(reason.contains(&format!("'{model}'")), "{reason}");
@@ -828,10 +780,10 @@ mod tests {
     fn a_range_camera_does_not_see_a_point_whose_distance_passes_its_farthest_depth() {
         let v2 = workspace(HardwareVersion::V2);
         let perception = v2.perception_camera().expect("v2 has one");
-        let intrinsics = Intrinsics::from_vertical_fov(52f64.to_radians(), 1280, 720);
+        let pinhole = Pinhole::from_vertical_fov(52f64.to_radians(), 1280, 720).expect("a model");
         let camera = |model: &str| {
             perception.camera(
-                intrinsics,
+                pinhole,
                 depth_from_wire(model, 0.1, 0.6).expect("a depth stream"),
             )
         };
