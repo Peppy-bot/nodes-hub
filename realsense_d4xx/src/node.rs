@@ -21,10 +21,10 @@ use tracing::{error, info};
 
 use camera_core::encoding::DEPTH_ENCODING;
 use camera_core::geometry::Z_DEPTH_MODEL;
+use camera_core::pinhole::Intrinsics;
 use control_core::serving;
 
 use crate::frame::FrameSet;
-use crate::geometry::Pinhole;
 use crate::modes::{AlignMode, parse_color_format, parse_mode};
 use crate::pipeline::{
     Capture, EMIT_CHANNEL_CAPACITY, PipelineConfig, PipelineHandle, PublishedGeometry,
@@ -345,25 +345,28 @@ fn color_intrinsics(
         )
     };
     match published.as_ref().map(|p| &p.pinholes.color) {
-        Ok(Ok(Pinhole {
-            width,
-            height,
-            fx,
-            fy,
-            cx,
-            cy,
-            distortion_model,
-            distortion,
-        })) => Ok(get_color_intrinsics::Response::new(
-            *width,
-            *height,
-            *fx,
-            *fy,
-            *cx,
-            *cy,
-            distortion_model.to_string(),
-            distortion.clone(),
-        )),
+        Ok(Ok(color)) => {
+            let Intrinsics {
+                width,
+                height,
+                fx,
+                fy,
+                cx,
+                cy,
+                distortion_model,
+                distortion,
+            } = color.intrinsics();
+            Ok(get_color_intrinsics::Response::new(
+                width,
+                height,
+                fx,
+                fy,
+                cx,
+                cy,
+                distortion_model.to_string(),
+                distortion.to_vec(),
+            ))
+        }
         Ok(Err(reason)) | Err(reason) => Err(refuse(reason)),
     }
 }
@@ -382,20 +385,32 @@ fn depth_intrinsics(
     };
     let published = published.as_ref().map_err(refuse)?;
     match (&published.pinholes.depth, &published.depth_range_m) {
-        (Ok(depth), Ok((min_depth_m, max_depth_m))) => Ok(get_depth_intrinsics::Response::new(
-            depth.width,
-            depth.height,
-            depth.fx,
-            depth.fy,
-            depth.cx,
-            depth.cy,
-            depth.distortion_model.to_string(),
-            depth.distortion.clone(),
-            Z_DEPTH_MODEL.to_string(),
-            *min_depth_m,
-            *max_depth_m,
-            published.align_mode.as_str().to_string(),
-        )),
+        (Ok(depth), Ok((min_depth_m, max_depth_m))) => {
+            let Intrinsics {
+                width,
+                height,
+                fx,
+                fy,
+                cx,
+                cy,
+                distortion_model,
+                distortion,
+            } = depth.intrinsics();
+            Ok(get_depth_intrinsics::Response::new(
+                width,
+                height,
+                fx,
+                fy,
+                cx,
+                cy,
+                distortion_model.to_string(),
+                distortion.to_vec(),
+                Z_DEPTH_MODEL.to_string(),
+                *min_depth_m,
+                *max_depth_m,
+                published.align_mode.as_str().to_string(),
+            ))
+        }
         (Err(reason), _) | (_, Err(reason)) => Err(refuse(reason)),
     }
 }
@@ -724,8 +739,8 @@ mod tests {
                 published.pinholes.color.unwrap(),
                 published.pinholes.depth.unwrap(),
             );
-            assert_eq!(sizes.color, (color.width, color.height), "{mode}");
-            assert_eq!(sizes.depth, (depth.width, depth.height), "{mode}");
+            assert_eq!(sizes.color, (color.width(), color.height()), "{mode}");
+            assert_eq!(sizes.depth, (depth.width(), depth.height()), "{mode}");
         }
     }
 
