@@ -13,6 +13,7 @@ const FOLLOWER_STATE_RATE_HZ: u32 = 50;
 /// The node's full parameter set (most have no schema default, so every test
 /// passes them explicitly): v1 hardware, joints-mode upstream, the validated
 /// collision band, and a permissive EE cap so streamed chases converge fast.
+/// The start tolerance of a joint path is 0.01 rad.
 pub fn params() -> peppygen::Parameters {
     peppygen::Parameters {
         collision_governor_enabled: true,
@@ -38,6 +39,7 @@ pub fn params() -> peppygen::Parameters {
         max_joint_acceleration_rad_s2_5: 5.0,
         max_joint_acceleration_rad_s2_6: 5.0,
         max_joint_acceleration_rad_s2_7: 5.0,
+        start_tolerance_rad: 0.01,
         upstream_mode: "joints".to_string(),
         velocity_filter_cutoff_hz: 15.0,
     }

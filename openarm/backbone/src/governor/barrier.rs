@@ -11,7 +11,7 @@
 //! a limiter. It runs after the limiters so its guarantee holds on the step that is
 //! actually published rather than on an intermediate one.
 //!
-//! [`Governor::clip_to_floor`] is the exact backstop, and it runs last. Surface
+//! [`Governor::clip_to_floor_along`] is the exact backstop, and it runs last. Surface
 //! distance is not monotone along a joint-space segment, so no upstream stage
 //! can prove the realized path stays clear; this one walks the segment and
 //! retracts to the furthest point that does. It is what makes the limiters'
@@ -19,25 +19,26 @@
 
 use super::{
     APPROACH_VELOCITY_AT_SAFE_M_S, ArmPair, Clip, DUAL_DOF, GOV_DOF, Governor, MAX_PROBE_ARC_RAD,
-    MAX_PROBE_GRIPPER_FRAC, MIN_GRADIENT_NORM_SQ, RECOVERY_LOSS_M_PER_S, SEGMENT_SAMPLES_MIN, Side,
-    dof_side, dot, step_change,
+    MAX_PROBE_GRIPPER_FRAC, MIN_GRADIENT_NORM_SQ, PathArms, RECOVERY_LOSS_M_PER_S,
+    SEGMENT_SAMPLES_MIN, Side, dof_side, dot, step_change,
 };
 
-impl Governor {
-    /// The clearance this tick's governed step must not drop below.
-    ///
-    /// `d_stop` on an approach, or the current clearance if the arms are inside
-    /// it, so closing further is refused. Once the bodies actually overlap the
-    /// rule relaxes to a bounded rate of loss: escaping an interpenetration
-    /// routinely sweeps deeper before it separates, and a floor that forbids any
-    /// loss refuses that whole segment every tick. See [`RECOVERY_LOSS_M_PER_S`].
-    fn step_floor(&self, d_now: f64, dt: f64) -> f64 {
-        if d_now >= 0.0 {
-            return d_now.min(self.d_stop);
-        }
-        d_now - RECOVERY_LOSS_M_PER_S * dt
+/// The clearance a step of `dt` from a clearance of `d_now` must not drop
+/// below, under a guard that stops at `d_stop`.
+///
+/// `d_stop` on an approach, or the current clearance if the arms are inside
+/// it, so closing further is refused. Once the bodies actually overlap the
+/// rule relaxes to a bounded rate of loss: escaping an interpenetration
+/// routinely sweeps deeper before it separates, and a floor that forbids any
+/// loss refuses that whole segment every tick. See [`RECOVERY_LOSS_M_PER_S`].
+pub(super) fn step_floor(d_stop: f64, d_now: f64, dt: f64) -> f64 {
+    if d_now >= 0.0 {
+        return d_now.min(d_stop);
     }
+    d_now - RECOVERY_LOSS_M_PER_S * dt
+}
 
+impl Governor {
     /// The closing-velocity barrier: scale back only the gap-closing component of the
     /// step (minimum-norm, along the distance gradient) so the clearance loses no more
     /// than `allowed_closing(d_now) * dt`, then clamp each DOF's step into
@@ -99,34 +100,38 @@ impl Governor {
         }
     }
 
-    /// The per-DOF hold mask for [`clip_to_floor`]. When exactly one side's own
-    /// motion (the other held at `prev`) opens the clearance, that separating
-    /// side is held at `target` while the floor scan clips the other, so the
-    /// approaching side's clip cannot drag the separating side's escape back
-    /// with it: the shared segment parameter would otherwise retract both to the
-    /// same point. Two operators can then retreat independently even while one
-    /// pushes in. When both sides approach (nothing separates), or both separate
-    /// alone yet may jointly close, nothing is held and the shared-segment
-    /// backstop governs both.
+    /// The per-DOF hold mask for [`Self::clip_to_floor_along`]. When exactly
+    /// one side's own motion (the other held at `prev`) opens the clearance,
+    /// that separating side's [`holdable`] DOF are held at `target` while the
+    /// floor scan clips the rest, so the separating side keeps its escape while
+    /// the approaching side is clipped. Two operators can then retreat
+    /// independently even while one pushes in. When both sides approach
+    /// (nothing separates), or both separate alone yet may jointly close,
+    /// nothing is held and the shared-segment backstop governs both. A side's
+    /// motion is the motion of its holdable DOF: on a path of both arms, its
+    /// gripper alone.
     ///
     /// A hold pins that side at `target` for the whole scan, so the exempted
     /// scan never probes the held side's own sweep. What proves that sweep is
-    /// the re-scan in [`clip_to_floor`], which walks the true `prev`-to-published
-    /// line with nothing held and therefore covers both sides moving together:
-    /// the point that goes out is proved on the path the arms travel, however
-    /// the hold was decided. So the hold only has to leave the exempted scan a
-    /// legal starting point, which the endpoint check does by requiring the solo
-    /// configuration to be at or above `d_prev`.
+    /// the re-scan in [`Self::clip_to_floor_along`], which walks the true
+    /// `prev`-to-published line with nothing held and therefore covers both
+    /// sides moving together: the point that goes out is proved on the path the
+    /// arms travel, however the hold was decided. So the hold only has to leave
+    /// the exempted scan a legal starting point, which the endpoint check does
+    /// by requiring the solo configuration to be at or above `d_prev`.
     ///
-    /// A side that does not move is never held: pinning it would be a no-op that
-    /// only disables the scan's Lipschitz skip.
+    /// A side whose holdable DOF do not move is never held: pinning them is a
+    /// no-op that only disables the scan's Lipschitz skip.
     fn separating_hold(
         &mut self,
         prev: &[f64; GOV_DOF],
         target: &[f64; GOV_DOF],
         d_prev: f64,
+        paths: &[PathArms],
     ) -> [bool; GOV_DOF] {
-        let side_dofs = |side: Side| (0..GOV_DOF).filter(move |&i| dof_side(i) == side);
+        let holdable = holdable(paths);
+        let side_dofs =
+            move |side: Side| (0..GOV_DOF).filter(move |&i| holdable[i] && dof_side(i) == side);
         let solo = |side: Side| -> [f64; GOV_DOF] {
             let mut q = *prev;
             for i in side_dofs(side) {
@@ -140,7 +145,7 @@ impl Governor {
         let held = held_side(ArmPair::from_fn(|side| {
             moves(side) && separates(self, &solo(side))
         }));
-        std::array::from_fn(|i| Some(dof_side(i)) == held)
+        std::array::from_fn(|i| holdable[i] && Some(dof_side(i)) == held)
     }
 
     /// Retract `target` to the furthest point along the segment from `prev`
@@ -159,10 +164,16 @@ impl Governor {
     /// exemption survives as the endpoint it aims for rather than as an
     /// unverified shortcut. When the exemption changes nothing, the strict
     /// clip stands.
-    pub(super) fn clip_to_floor(
+    ///
+    /// The arms of each path in `paths` step along their path: the hold
+    /// never parts the joints of a path of both arms ([`holdable`]), since
+    /// the scan moves them by one share of their step, so a clip keeps both
+    /// arms on their path.
+    pub(super) fn clip_to_floor_along(
         &mut self,
         prev: &[f64; GOV_DOF],
         target: &[f64; GOV_DOF],
+        paths: &[PathArms],
         d_now: f64,
         dt: f64,
     ) -> Clip {
@@ -171,7 +182,7 @@ impl Governor {
             Clip::Clear => return Clip::Clear,
             Clip::Clipped(q) => q,
         };
-        let hold = self.separating_hold(prev, target, d_now);
+        let hold = self.separating_hold(prev, target, d_now, paths);
         if hold == NO_HOLD {
             return Clip::Clipped(strict);
         }
@@ -190,7 +201,7 @@ impl Governor {
     /// Walk from `prev` toward `target` and return [`Clip::Clipped`] at the first
     /// point where the straight segment drops below the step floor, or
     /// [`Clip::Clear`] if every probed point stays at or above it. `d_now` is the
-    /// clearance at `prev`; the floor is [`step_floor`](Self::step_floor)`(d_now)`,
+    /// clearance at `prev`; the floor is [`step_floor`]`(d_stop, d_now, dt)`,
     /// so `prev` itself is at or above it by construction. Bimanual distance is
     /// not monotone along a joint-space segment, so this probes interior points
     /// (one per `MAX_PROBE_ARC_RAD` of joint motion, at least
@@ -225,7 +236,7 @@ impl Governor {
         d_now: f64,
         dt: f64,
     ) -> Clip {
-        let floor = self.step_floor(d_now, dt);
+        let floor = step_floor(self.d_stop, d_now, dt);
         // Held DOF (a separating side) sit at `target` for the whole scan; the
         // rest interpolate, so the clip retracts only the approaching side.
         let point_at = |t: f64| -> [f64; GOV_DOF] {
@@ -303,6 +314,16 @@ impl Governor {
     }
 }
 
+/// The DOF the separating hold may pin at their target: every DOF but the
+/// joints of a path of both arms in `paths`, which move by one share of
+/// their step together. A path of one arm has its joints on one side, which
+/// a hold pins or leaves whole.
+fn holdable(paths: &[PathArms]) -> [bool; GOV_DOF] {
+    let on_a_path_of_both =
+        |i: usize| paths.contains(&PathArms::Both) && PathArms::Both.joints().any(|j| j == i);
+    std::array::from_fn(|i| !on_a_path_of_both(i))
+}
+
 /// The side the separating hold pins at its target: the one side whose own
 /// motion separates the arms, and none when neither or both do.
 fn held_side(separating: ArmPair<bool>) -> Option<Side> {
@@ -316,6 +337,7 @@ fn held_side(separating: ArmPair<bool>) -> Option<Side> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::NO_PATHS;
 
     /// The separating hold's side choice, pinned as a table without any
     /// geometry.
@@ -325,5 +347,17 @@ mod tests {
         assert_eq!(held_side(ArmPair::new(false, true)), Some(Side::Right));
         assert_eq!(held_side(ArmPair::new(true, true)), None);
         assert_eq!(held_side(ArmPair::new(false, false)), None);
+    }
+
+    /// On a path of both arms the hold may pin the grippers alone; on paths
+    /// of one arm, or none, it may pin every DOF.
+    #[test]
+    fn a_path_of_both_arms_leaves_only_the_grippers_holdable() {
+        let grippers_only: [bool; GOV_DOF] = std::array::from_fn(|i| i >= DUAL_DOF);
+        assert_eq!(holdable(&[PathArms::Both]), grippers_only);
+        let every_dof = [true; GOV_DOF];
+        assert_eq!(holdable(NO_PATHS), every_dof);
+        let one_arm_each = [PathArms::One(Side::Left), PathArms::One(Side::Right)];
+        assert_eq!(holdable(&one_arm_each), every_dof);
     }
 }

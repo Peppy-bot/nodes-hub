@@ -234,3 +234,8 @@ async fn a_gripper_rate_too_slow_to_make_progress_is_refused_by_name() {
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_non_positive_start_tolerance_is_refused_by_name() {
+    refusal_names("start_tolerance_rad", |p| p.start_tolerance_rad = 0.0).await;
+}

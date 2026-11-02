@@ -17,6 +17,10 @@ gives no result. The plan check runs a move_arm goal's solve from the same
 anchor and installs nothing. Every terminal path releases the claimed slot,
 and no exception may ever kill an action server: an unforeseen failure
 refuses or fails the goal and abandons anything admission installed.
+A joint path or a pose move is planned in its drive, from where the arm
+stands, and the planning may fail the goal: a joint path then runs none of
+its path, its arm held, once its expected start is met, at its measured
+joints, moved inside its joint limits where it stood past one.
 """
 
 from __future__ import annotations
@@ -25,12 +29,15 @@ import asyncio
 import functools
 import math
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
+from typing import TypeVar
 
 from control_core_py import minimum_jerk
 from control_core_py.minimum_jerk import Profile
 from control_core_py.runtime import Latch, log
+from path_timing_py import JointTrajectory
+from peppygen.exposed_actions.limb_motion import execute_joint_path
 from so101_description.limbs import ARM_LIMB, GRIPPER_LIMB
 from so101_description.limits import JointLimits
 from so101_description.transforms import relative_rotation_rad
@@ -39,11 +46,13 @@ from so101_description.units import NUM_JOINTS
 from so101_backbone.coordinator import (
     FOLLOWER_SILENT,
     ArmPlan,
+    ArmProfile,
     Coordinator,
     GripperPlan,
     JointSettle,
     PoseSettle,
     PostureEnd,
+    joint_past_tolerance,
 )
 from so101_backbone.failures import FailureKind, Refusal
 from so101_backbone.params import Config
@@ -53,8 +62,9 @@ from so101_backbone.params import Config
 # event loop.
 _GOAL_RETRY_S = 1.0
 
-# The contract's bound on every duration and timeout a goal carries: a
-# number of seconds from 0 to 60. The posture moves share it.
+# The contract's bound on every duration and timeout a goal carries, a
+# number of seconds from 0 to 60, and on the time a joint path or a pose move
+# takes. The posture moves share it.
 MAX_REQUESTED_DURATION_S = 60.0
 
 # A quaternion of a smaller norm has no direction to normalize.
@@ -100,9 +110,31 @@ GRIPPER_WORDS = _LimbWords(
 WALKED_BACK = "goal admission was walked back"
 
 
-class _PlanRefused(ValueError):
+@dataclass(frozen=True)
+class _MoveWords:
+    """The words of a drive of an arm move that breaks."""
+
+    # Leads the failure and the log line of a planning that raises.
+    planning: str
+    # Leads the log line of a goal whose ending raises.
+    goal: str
+
+
+# The words of a joint path's drive, and of a pose move's.
+_PATH_MOVE_WORDS = _MoveWords(planning="path planning", goal="path goal")
+_POSE_MOVE_WORDS = _MoveWords(planning="pose solve", goal="pose goal")
+
+# Where a drive plans an arm move from: the _PathStart of a joint path, the
+# anchor joints of a pose move.
+_Start = TypeVar("_Start")
+
+
+class _PlanRefused(Refusal):
     """A pose move that has no plan from where the arm is, with the reason a
     move_arm goal fails with, as `unreachable`, and check_arm_move answers."""
+
+    def __init__(self, reason: str):
+        super().__init__(FailureKind.UNREACHABLE, reason)
 
 
 @dataclass(frozen=True)
@@ -123,6 +155,29 @@ def _stop_message(reason: str) -> str:
 
 
 @dataclass(frozen=True)
+class _JointPathGoal:
+    """A path to plan, of execute_joint_path on this robot's one arm: the
+    waypoints to pass, each inside the joint limits; the joints the caller
+    expects the arm to stand at, when it names them; and the requested
+    duration."""
+
+    waypoints: tuple[tuple[float, ...], ...]
+    expected_start: tuple[float, ...] | None
+    duration_s: float
+
+
+@dataclass(frozen=True)
+class _PathStart:
+    """Where a joint path starts, from one measurement of the arm: the
+    joints the follower measured, which the goal's expected start is
+    checked against, and those joints clamped into the joint limits, where
+    the arm holds while the path is planned and where the path begins."""
+
+    measured: tuple[float, ...]
+    held: tuple[float, ...]
+
+
+@dataclass(frozen=True)
 class PoseGoal:
     """A pose to plan: the fields move_arm and check_arm_move share."""
 
@@ -133,6 +188,20 @@ class PoseGoal:
     # the path.
     position_tolerance_m: float
     orientation_tolerance_rad: float
+
+
+@dataclass(frozen=True)
+class JointPathMove:
+    """An admitted execute_joint_path goal whose path is planned in the drive
+    task: the arm slot is already claimed, so no other move or stream
+    commands the arm under the planning."""
+
+    goal: _JointPathGoal
+    # How the move ends past the planned end of its trajectory.
+    settle: JointSettle
+    # The stop count at admission: a stop since ends the goal before it
+    # moves, the planning included.
+    stops_before: int
 
 
 @dataclass(frozen=True)
@@ -153,9 +222,9 @@ class PendingSlot:
     delivery on one action can only ever walk back its own admission."""
 
     def __init__(self) -> None:
-        self.plan: ArmPlan | GripperPlan | PoseMove | None = None
+        self.plan: ArmPlan | GripperPlan | JointPathMove | PoseMove | None = None
 
-    def take(self) -> ArmPlan | GripperPlan | PoseMove | None:
+    def take(self) -> ArmPlan | GripperPlan | JointPathMove | PoseMove | None:
         plan = self.plan
         self.plan = None
         return plan
@@ -287,6 +356,119 @@ class ActionLayer:
             self._coordinator.release_arm()
             raise
 
+    def _admit_joint_path(
+        self,
+        arms: Sequence[execute_joint_path.GoalRequestDataArmsItem],
+        duration_s: float,
+        settle_timeout_s: float,
+    ) -> JointPathMove:
+        """Claim the arm's busy slot for an execute_joint_path goal of
+        `arms`, whose drive plans its path, or raise Refusal: the fields'
+        refusals first, then the claim's, so a refused goal leaves the arm
+        unclaimed."""
+        arm = _the_arm_entry(arms)
+        move = JointPathMove(
+            goal=_joint_path_goal(arm, duration_s, self._limits),
+            settle=_joint_settle(tuple(arm.settle_tolerances_rad), settle_timeout_s),
+            stops_before=self._coordinator.stop_count,
+        )
+        self._claim_free_arm()
+        return move
+
+    def _measured_start(self) -> _PathStart | None:
+        """Where a joint path starts: the measured joints, and those joints
+        clamped into the joint limits. None without fresh follower state."""
+        measured = self._coordinator.fresh_measured_joints()
+        if measured is None:
+            return None
+        return _PathStart(measured=measured, held=self._limits.clamp(measured))
+
+    async def _plan_joint_path(
+        self, start: _PathStart, goal: _JointPathGoal
+    ) -> JointTrajectory:
+        """The trajectory of `goal` from where `start` holds the arm through
+        its waypoints, or Refusal with the kind the goal fails with, running
+        none of the path: `precondition_failed` when the measured joints of
+        `start` lie away from the goal's expected start, when it names one,
+        or the arm moves away from where it holds while the path is planned;
+        `rejected` when the joint velocity and acceleration caps need longer
+        than MAX_REQUESTED_DURATION_S for the path; `resource_unavailable`
+        when the follower stops reporting. Once the expected start is met,
+        the arm is commanded to hold where `start` holds it, its measured
+        joints moved inside the joint limits where it stood past one, until
+        the plan is installed. The path is planned off the event loop, so a long path
+        never stalls the control tick."""
+        if goal.expected_start is not None:
+            self._require_start_at_expected(start.measured, goal.expected_start)
+        self._coordinator.hold_arm(start.held)
+        profile = await asyncio.to_thread(
+            JointTrajectory.through,
+            (start.held, *goal.waypoints),
+            self._config.max_joint_velocity_rad_s,
+            self._config.max_joint_acceleration_rad_s2,
+            goal.duration_s,
+        )
+        # The requested duration is at most the ceiling, so a profile past
+        # the ceiling runs at the floor that the caps set for the whole path.
+        if profile.duration_s > MAX_REQUESTED_DURATION_S:
+            raise Refusal(
+                FailureKind.REJECTED,
+                f"the joint velocity and acceleration caps take {profile.duration_s:.1f} s to run "
+                f"this path, past the {MAX_REQUESTED_DURATION_S:.0f} s a move may take; split it "
+                "into paths of fewer waypoints",
+            )
+        self._require_still_at(start.held)
+        return profile
+
+    def _past_start_tolerance(
+        self, joints: tuple[float, ...], reference: tuple[float, ...]
+    ) -> tuple[int, float] | None:
+        """The joint of `joints` (from 0) farthest past the start tolerance
+        from `reference`, and how far it stands, or None while every joint
+        is within it."""
+        tolerance_rad = self._config.start_tolerance_rad
+        return joint_past_tolerance(joints, reference, (tolerance_rad,) * NUM_JOINTS)
+
+    def _require_start_at_expected(
+        self, measured: tuple[float, ...], expected: tuple[float, ...]
+    ) -> None:
+        """Raise Refusal with `precondition_failed`, naming the joint from 1
+        in the arm's joint order, unless every joint of `measured`, the
+        joints the follower measured as the path starts, stands within the
+        start tolerance of `expected`."""
+        past = self._past_start_tolerance(measured, expected)
+        if past is None:
+            return
+        joint, error = past
+        raise Refusal(
+            FailureKind.PRECONDITION_FAILED,
+            f"{ARM_LIMB} stands {error:.3f} rad from expected_start_joint_positions at joint "
+            f"{joint + 1}, past the {self._config.start_tolerance_rad:.3f} rad start "
+            "tolerance; plan the path from where the arm stands",
+        )
+
+    def _require_still_at(self, held: tuple[float, ...]) -> None:
+        """Raise Refusal unless the measured joints, clamped into the joint
+        limits as `held` is, stand within the start tolerance of `held`, the
+        joints the path was planned from and the arm held at: with
+        `precondition_failed`, naming the joint from 1 in the arm's joint
+        order, when the arm moved away from `held` while the path was
+        planned, and with `resource_unavailable` when the follower stopped
+        reporting."""
+        measured = self._coordinator.fresh_measured_joints()
+        if measured is None:
+            raise Refusal(FOLLOWER_SILENT.kind, FOLLOWER_SILENT.message)
+        past = self._past_start_tolerance(self._limits.clamp(measured), held)
+        if past is None:
+            return
+        joint, error = past
+        raise Refusal(
+            FailureKind.PRECONDITION_FAILED,
+            f"{ARM_LIMB} stands {error:.3f} rad at joint {joint + 1} from where it stood when "
+            f"the path was taken, past the {self._config.start_tolerance_rad:.3f} rad start "
+            "tolerance; send the path again",
+        )
+
     def _admit_gripper_move(
         self, opening: float, max_effort: float, settle_timeout_s: float
     ) -> GripperPlan:
@@ -388,6 +570,16 @@ class ActionLayer:
 
         return decide
 
+    def decide_joint_path(self, pending: PendingSlot):
+        def decide(request):
+            def admit():
+                d = request.data
+                return self._admit_joint_path(d.arms, d.duration_s, d.settle_timeout_s)
+
+            return self._decide(execute_joint_path, admit, pending)
+
+        return decide
+
     def decide_posture(self, module, target: tuple[float, ...], pending: PendingSlot):
         def decide(request):
             return self._decide(
@@ -452,9 +644,9 @@ class ActionLayer:
         if isinstance(plan, ArmPlan):
             self._coordinator.abort_arm_plan(plan)
             self._coordinator.release_arm()
-        elif isinstance(plan, PoseMove):
-            # Nothing installed yet: the solve had not run. Only the claim
-            # is walked back.
+        elif isinstance(plan, (JointPathMove, PoseMove)):
+            # Nothing installed yet: the planning had not run. Only the
+            # claim is walked back.
             self._coordinator.release_arm()
         else:
             self._coordinator.abort_gripper_plan(plan)
@@ -497,6 +689,35 @@ class ActionLayer:
 
         await self._drive_arm_plan(ctx, plan, results)
 
+    async def drive_joint_path(self, ctx, move: JointPathMove) -> None:
+        """Plan the path of `move` and run it, as _drive_arm_move does. The
+        path runs from the joints the follower measures as the drive starts,
+        clamped into the joint limits, whatever setpoint the arm was sent
+        last, and the arm holds there while the path is planned (see
+        _plan_joint_path). The goal ends with the arm's entry, its joints
+        where it stands (see _standing_joints for a goal that a stop ends
+        before its plan), and fails, running none of the path, as
+        _plan_joint_path says."""
+
+        async def plan_from(start):
+            return await self._plan_joint_path(start, move.goal)
+
+        def results(joints, action_time):
+            arm = execute_joint_path.ResultArmsItem(
+                arm_name=ARM_LIMB, final_joint_positions=list(joints)
+            )
+            return [arm], action_time
+
+        await self._drive_arm_move(
+            ctx,
+            move,
+            _PATH_MOVE_WORDS,
+            self._measured_start,
+            plan_from,
+            results,
+            lambda start: results(self._standing_joints(start.held), 0.0),
+        )
+
     async def drive_posture(self, ctx, plan: ArmPlan, kinematics) -> None:
         """Wait until the plan ends, a cancel comes or a stop comes. Then end
         the goal; a completed or cancelled goal gives the grasp pose of the
@@ -515,6 +736,75 @@ class ActionLayer:
             await self._finish_plan(
                 ctx, plan, self._coordinator.abort_arm_plan, results, time.monotonic()
             )
+        finally:
+            self._coordinator.release_arm()
+
+    async def _drive_arm_move(
+        self,
+        ctx,
+        move: JointPathMove | PoseMove,
+        words: _MoveWords,
+        find_start: Callable[[], _Start | None],
+        plan_from: Callable[[_Start], Awaitable[ArmProfile]],
+        results: Callable[[tuple[float, ...], float], tuple],
+        unmoved_results: Callable[[_Start], tuple],
+    ) -> None:
+        """Plan `move` from `find_start()`, where it starts, or None without
+        fresh follower state, install the trajectory with the move's settle,
+        wait it out as _finish_plan does, and release the arm. A move with no
+        start fails with `resource_unavailable`. `plan_from(start)` plans the
+        trajectory, or raises Refusal with the kind and the message the goal
+        fails with, nothing installed; any other exception fails the goal with
+        `attempt_failed`, its message led by the planning of `words`, the
+        caller's name for it. A stop since admission ends the goal cancelled
+        with the stop's reason and `unmoved_results(start)`, nothing
+        installed: a stop before the planning, and a stop during it whose
+        planning gives a trajectory. A planning that raises fails the goal as
+        above, whether or not a stop came during it. Otherwise the goal ends
+        with `results(joints, action_time)`: `joints` where the arm stands as
+        the goal ends (see _final_arm_positions), `action_time` the
+        wall-clock time of the action."""
+        try:
+            start = find_start()
+            if start is None:
+                await _end_guarded(ctx.fail, FOLLOWER_SILENT.kind, FOLLOWER_SILENT.message)
+                return
+
+            async def end_stopped() -> None:
+                await _end_guarded(
+                    ctx.complete_cancelled, self._coordinator.last_stop, *unmoved_results(start)
+                )
+
+            if self._coordinator.stop_count != move.stops_before:
+                await end_stopped()
+                return
+            started = time.monotonic()
+            try:
+                profile = await plan_from(start)
+            except Refusal as e:
+                await _end_guarded(ctx.fail, e.kind, str(e))
+                return
+            except Exception as e:
+                # A planning surprise ends the accepted goal too, so its
+                # caller gets an answer.
+                log(f"{words.planning} failed: {e!r}")
+                await _end_guarded(
+                    ctx.fail, FailureKind.ATTEMPT_FAILED, f"{words.planning} failed: {e!r}"
+                )
+                return
+            if self._coordinator.stop_count != move.stops_before:
+                await end_stopped()
+                return
+            plan = self._coordinator.adopt_arm_plan(profile, move.settle)
+            await self._finish_plan(
+                ctx,
+                plan,
+                self._coordinator.abort_arm_plan,
+                lambda action_time: results(self._final_arm_positions(plan), action_time),
+                started,
+            )
+        except Exception as e:
+            log(f"{words.goal} completion failed: {e!r}")
         finally:
             self._coordinator.release_arm()
 
@@ -554,10 +844,9 @@ class ActionLayer:
             seed, solution, duration_s, self._config.max_joint_velocity_rad_s
         )
         if profile.duration_s > MAX_REQUESTED_DURATION_S:
-            # The requested duration was admitted against this ceiling, but
-            # the caps can raise it past one. Stretching anyway would hold
-            # the arm slot for longer than any goal is allowed to, so the
-            # move has no plan instead.
+            # The requested duration was admitted against this ceiling, and
+            # the caps can raise it past the ceiling. No goal holds the arm
+            # slot longer than the ceiling, so the move has no plan.
             raise _PlanRefused(
                 f"the speed caps need {profile.duration_s:.0f}s for this "
                 f"move, beyond the {MAX_REQUESTED_DURATION_S:.0f}s ceiling"
@@ -604,63 +893,30 @@ class ActionLayer:
         return self._coordinator.stop_all(message)
 
     async def drive_pose(self, ctx, move: PoseMove, solver, kinematics) -> None:
-        """Solve, install the trajectory with the move's settle, and wait it
-        out. The solve runs off the event loop on a solver dedicated to
+        """Solve the pose of `move` and run the move, as _drive_arm_move does;
+        the goal ends with the grasp pose of the joints where the arm stands
+        (see _standing_pose for a goal that a stop ends before its plan).
+        The solve runs off the event loop on a solver dedicated to
         point-to-point goals (the control tick's streaming solver is a
-        separate instance). A stop that runs during the solve ends the goal
-        cancelled with the stop's reason, and nothing is installed. A pose
-        with no plan fails the goal with `unreachable`."""
-        goal = move.goal
-        try:
-            seed = self._coordinator.arm_anchor()
-            if seed is None:
-                await _end_guarded(ctx.fail, FOLLOWER_SILENT.kind, FOLLOWER_SILENT.message)
-                return
+        separate instance). A pose with no plan fails the goal with
+        `unreachable`."""
 
-            async def end_stopped() -> None:
-                await _end_guarded(
-                    ctx.complete_cancelled,
-                    self._coordinator.last_stop,
-                    *self._standing_pose(kinematics),
-                    0.0,
-                )
+        async def plan_from(anchor):
+            return await self._plan_pose(solver, kinematics, anchor, move.goal)
 
-            if self._coordinator.stop_count != move.stops_before:
-                await end_stopped()
-                return
-            started = time.monotonic()
-            try:
-                profile = await self._plan_pose(solver, kinematics, seed, goal)
-            except _PlanRefused as e:
-                await _end_guarded(ctx.fail, FailureKind.UNREACHABLE, str(e))
-                return
-            except Exception as e:
-                # A solver surprise must still reach a terminal outcome; the
-                # caller would otherwise wait out its whole timeout on an
-                # accepted goal.
-                log(f"pose solve failed: {e!r}")
-                await _end_guarded(
-                    ctx.fail, FailureKind.ATTEMPT_FAILED, f"pose solve failed: {e!r}"
-                )
-                return
-            if self._coordinator.stop_count != move.stops_before:
-                await end_stopped()
-                return
-            plan = self._coordinator.adopt_arm_plan(profile, move.settle)
+        def results(joints, action_time):
+            position, orientation = kinematics.forward_kinematics(joints)
+            return list(position), list(orientation), action_time
 
-            def results(action_time):
-                position, orientation = kinematics.forward_kinematics(
-                    self._final_arm_positions(plan)
-                )
-                return list(position), list(orientation), action_time
-
-            await self._finish_plan(
-                ctx, plan, self._coordinator.abort_arm_plan, results, started
-            )
-        except Exception as e:
-            log(f"pose goal completion failed: {e!r}")
-        finally:
-            self._coordinator.release_arm()
+        await self._drive_arm_move(
+            ctx,
+            move,
+            _POSE_MOVE_WORDS,
+            self._coordinator.arm_anchor,
+            plan_from,
+            results,
+            lambda _anchor: (*self._standing_pose(kinematics), 0.0),
+        )
 
     async def drive_gripper(self, ctx, plan: GripperPlan) -> None:
         def results(action_time):
@@ -705,6 +961,13 @@ class ActionLayer:
             return _no_pose()
         position, orientation = kinematics.forward_kinematics(joints)
         return list(position), list(orientation)
+
+    def _standing_joints(self, anchor: tuple[float, ...]) -> tuple[float, ...]:
+        """Where the arm stands with no plan installed, as a move that never
+        ran reports it: the fresh measured joints, else `anchor`, the joints
+        its drive planned from."""
+        measured = self._coordinator.fresh_measured_joints()
+        return anchor if measured is None else measured
 
     def _final_opening(self, plan: GripperPlan) -> float:
         """The opening measured when the plan completed. Otherwise prefer the
@@ -777,9 +1040,70 @@ def _pose_move(
     return PoseMove(goal=goal, settle=settle, stops_before=stops_before)
 
 
+def _the_arm_entry(
+    arms: Sequence[execute_joint_path.GoalRequestDataArmsItem],
+) -> execute_joint_path.GoalRequestDataArmsItem:
+    """The entry of this robot's arm in an execute_joint_path goal's `arms`,
+    or Refusal with `rejected`: an entry naming another arm, or arms that do
+    not name the arm once."""
+    for entry in arms:
+        _require_arm_name(entry.arm_name)
+    if len(arms) != 1:
+        raise Refusal(
+            FailureKind.REJECTED, f'arms must name this robot\'s arm, "{ARM_LIMB}", once'
+        )
+    return arms[0]
+
+
+def _joint_path_goal(
+    arm: execute_joint_path.GoalRequestDataArmsItem, duration_s: float, limits: JointLimits
+) -> _JointPathGoal:
+    """The joint path of the goal entry `arm`, or Refusal with `rejected`: no
+    waypoint, a non-finite joint position, a waypoint outside `limits`, an
+    expected start that _expected_start refuses, or a duration out of its
+    bound."""
+    waypoints = tuple(tuple(w.joint_positions) for w in arm.waypoints)
+    if not waypoints:
+        raise Refusal(FailureKind.REJECTED, "waypoints is empty: give at least one waypoint")
+    for number, waypoint in enumerate(waypoints, start=1):
+        assert len(waypoint) == NUM_JOINTS
+        if not all(math.isfinite(p) for p in waypoint):
+            raise Refusal(
+                FailureKind.REJECTED, f"waypoint {number} has a non-finite joint position"
+            )
+        if not limits.contains(waypoint):
+            raise Refusal(FailureKind.REJECTED, f"waypoint {number} out of joint limits")
+    return _JointPathGoal(
+        waypoints=waypoints,
+        expected_start=_expected_start(tuple(arm.expected_start_joint_positions)),
+        duration_s=_require_duration(duration_s, "duration_s"),
+    )
+
+
+def _expected_start(positions: tuple[float, ...]) -> tuple[float, ...] | None:
+    """The joints a joint path expects the arm to stand at: None for an
+    empty expected_start_joint_positions, which is not checked, or Refusal
+    with `rejected` for another length than the arm's joints or a non-finite
+    position."""
+    if not positions:
+        return None
+    if len(positions) != NUM_JOINTS:
+        raise Refusal(
+            FailureKind.REJECTED,
+            f"expected_start_joint_positions has {len(positions)} joint positions: give one "
+            f"per joint of the arm, {NUM_JOINTS}, or none to skip the check",
+        )
+    if not all(math.isfinite(p) for p in positions):
+        raise Refusal(
+            FailureKind.REJECTED, "expected_start_joint_positions has a non-finite joint position"
+        )
+    return positions
+
+
 def _joint_settle(tolerances_rad: tuple[float, ...], timeout_s: float) -> JointSettle:
-    """The settle of a move_arm_joints goal, or Refusal: a positive finite
-    tolerance per joint of the arm, and a timeout."""
+    """The settle of a move_arm_joints or execute_joint_path goal, or
+    Refusal: a positive finite tolerance per joint of the arm, and a
+    timeout."""
     assert len(tolerances_rad) == NUM_JOINTS
     if not all(math.isfinite(v) and v > 0.0 for v in tolerances_rad):
         raise Refusal(

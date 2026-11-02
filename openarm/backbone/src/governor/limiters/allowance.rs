@@ -10,7 +10,7 @@
 //! line and the operator readout can name the mechanism that is actually
 //! binding instead of reconstructing it from flags threaded across the module.
 
-use super::super::{GOV_DOF, Step};
+use super::super::{GOV_DOF, PathArms, Step};
 
 /// Name reported for a DOF no limiter has restricted.
 const UNRESTRICTED: &str = "unrestricted";
@@ -120,6 +120,25 @@ impl Limits {
             .filter(|&i| self.allowance.get(i) < 1.0)
             .min_by(|&a, &b| self.allowance.get(a).total_cmp(&self.allowance.get(b)))
             .map(|i| self.binding[i])
+    }
+
+    /// Hold the joints of each of `paths` to one fraction, the tightest any
+    /// of them has, named by the limiter that set it: the step of a joint
+    /// path then keeps its direction, scaled along its path and never turned
+    /// off it.
+    pub fn along_paths(mut self, paths: &[PathArms]) -> Self {
+        for &arms in paths {
+            let joints = || arms.joints();
+            let tightest = joints()
+                .min_by(|&a, &b| self.allowance.get(a).total_cmp(&self.allowance.get(b)))
+                .expect("an arm has joints");
+            let (fraction, name) = (self.allowance.get(tightest), self.binding[tightest]);
+            for i in joints() {
+                self.allowance.0[i] = fraction;
+                self.binding[i] = name;
+            }
+        }
+        self
     }
 
     pub fn apply(&self, step: &Step) -> [f64; GOV_DOF] {

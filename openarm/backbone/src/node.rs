@@ -5,8 +5,8 @@
 //! listener. All motion and stream logic lives in the sibling modules; this is
 //! only the assembly.
 
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 
 use control_core::positive_finite::{NotPositiveFinite, PositiveFinite};
 use control_core::serving;
@@ -27,7 +27,8 @@ use crate::coordinator::{self, ArmChannels};
 use crate::governor;
 use crate::liveness;
 use crate::move_slot::MoveSlot;
-use crate::planner::{PlanConfig, Planner};
+use crate::path_checks::PathChecks;
+use crate::planner::{PathGuard, PlanConfig, Planner};
 use crate::startup;
 use crate::streams;
 use crate::streams::LeaderActivity;
@@ -70,6 +71,9 @@ pub enum NodeError {
 
     #[error("parameter max_ee_angular_velocity_rad_s")]
     EeAngularVelocity(#[source] NotPositiveFinite),
+
+    #[error("parameter start_tolerance_rad")]
+    StartTolerance(#[source] NotPositiveFinite),
 
     #[error("parameter max_joint_velocity_rad_s_{joint}")]
     JointVelocityCap {
@@ -258,6 +262,8 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         PositiveFinite::parse(params.max_ee_velocity_m_s).map_err(NodeError::EeVelocity)?;
     let max_ee_angular = PositiveFinite::parse(params.max_ee_angular_velocity_rad_s)
         .map_err(NodeError::EeAngularVelocity)?;
+    let start_tolerance =
+        PositiveFinite::parse(params.start_tolerance_rad).map_err(NodeError::StartTolerance)?;
     // Enforce the documented contract: the cutoff must sit below the control loop's
     // Nyquist frequency, or the low-pass does not attenuate (and above it is
     // meaningless). A hard bound at Nyquist; the node default sits well under it.
@@ -332,6 +338,9 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         params.max_gripper_rate_frac_s,
         params.collision_governor_enabled,
     )?;
+    // The joint paths are checked beside the coordination loop, on a copy of
+    // the governor's collision model.
+    let path_checker: Arc<Mutex<dyn PathGuard>> = Arc::new(Mutex::new(governor.path_checker()));
     info!(
         "self-collision governor ready (d_stop_m={} d_safe_m={} default {})",
         params.d_stop_m,
@@ -373,6 +382,7 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
             angular_rad_s: max_ee_angular.get(),
         },
         limits,
+        start_tolerance_rad: start_tolerance.get(),
     };
     let planners = models.map(|side, model| Planner::new(side, model, plan_cfg(limits[side])));
 
@@ -388,9 +398,10 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     let gripper_state_txs = ArmPair::from_fn(|_| watch::channel(None).0);
     let (goal_txs, goal_rxs) = ArmPair::from_fn(|_| mpsc::channel(1)).unzip();
     let (gripper_goal_txs, gripper_goal_rxs) = ArmPair::from_fn(|_| mpsc::channel(1)).unzip();
-    // The limb_motion services and the posture moves send their requests to
-    // the coordinator here: a stop, a plan check or a grasp request. The
-    // coordinator answers each on the tick after it is queued.
+    // The limb_motion services, the posture moves and execute_joint_path send
+    // their requests to the coordinator here: a stop, a plan check, a grasp
+    // request or the start of a joint path. The coordinator answers each on
+    // the tick after it is queued.
     let (request_tx, request_rx) = mpsc::channel(8);
     // The grasp poses of the last limb_state snapshot, for the camera
     // mounts service.
@@ -485,6 +496,7 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
             planners,
             channels,
             request_rx,
+            PathChecks::new(path_checker),
             config_rx,
             grasps_tx,
             coordinator::RunConfig {
@@ -503,6 +515,14 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
             fresh.clone(),
             arm_activity.clone(),
             limits,
+        ));
+        set.spawn(actions::path::run_execute_joint_path(
+            runner.clone(),
+            move_slots.clone(),
+            fresh.clone(),
+            arm_activity.clone(),
+            limits,
+            request_tx.clone(),
         ));
         set.spawn(actions::arm::run_move_arm(
             runner.clone(),

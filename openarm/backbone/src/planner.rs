@@ -15,6 +15,10 @@
 //! planner hands out); a joint move's target is its trajectory's sample; a
 //! Cartesian move's is the IK of the line's pose sample, or the servo path's
 //! own sample.
+//!
+//! An execute_joint_path goal moves the arms it names along one path through
+//! both arms' joints, each arm's planner following its arm's share of it
+//! ([`path`]): the one mode an arm's planner shares with the other arm's.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use peppygen::exposed_actions::limb_motion::{move_arm, move_arm_joints};
 
-use control_core::chase::{chase_step, exceeds_rate};
+use control_core::chase::{chase_along, chase_step, exceeds_rate};
 use control_core::path_timing::JointTrajectory;
 use control_core::positive_finite::PositiveFinite;
 use control_core::timing::MotionClock;
@@ -39,10 +43,20 @@ use tokio::sync::mpsc;
 use tracing::{error, info};
 
 use crate::failure::{Failure, FailureKind};
+use crate::governor::PathArms;
 use crate::move_slot::{ARM_BUSY, MoveSlot, SlotRelease};
 use crate::settle::{PoseTolerance, Settle, Verdict, joint_shortfall, pose_shortfall, verdict};
 use crate::types::world_pose_arrays;
 use crate::upstream::Upstream;
+
+mod path;
+
+pub use path::{
+    ArmOrder, JointPath, PathGoal, PathGuard, PathJudgment, Resumed, ShareReply, ShareReport,
+    chase_together, commit_both, judge_path, resume_judged_path, start_path,
+};
+#[cfg(test)]
+pub(crate) use path::{OTHER_SHARE_FAILED, PathPlan};
 
 /// Slack the runtime per-tick velocity guard of a line allows over the planned
 /// limit before aborting the move: the plan sized the line at its own
@@ -68,6 +82,11 @@ pub struct PlanConfig {
     pub max_joint_acceleration_rad_s2: JointVec,
     pub ee: EeCaps,
     pub limits: [Limit; ARM_DOF],
+    /// How far (rad, each joint) the measured arm may stand from a joint
+    /// path's start: from its expected start when the coordinator takes the
+    /// goal and at its run start, and at its run start from where it stood
+    /// when the goal was taken.
+    pub start_tolerance_rad: f64,
 }
 
 /// Why an arm has no fresh measurement of its joints.
@@ -302,6 +321,8 @@ enum Mode {
     /// Tracking a Cartesian plan for an accepted move_arm goal: a line solved
     /// by IK each tick, or the servo's path played.
     CartesianMove(CartesianMove),
+    /// The arm's share of an execute_joint_path goal's path.
+    PathShare(path::PathShare),
 }
 
 struct JointMove {
@@ -365,14 +386,21 @@ enum PathStep {
 enum Origin {
     Streamed,
     PlannedMove,
+    /// The next point of the arm's share of the path of these arms, or
+    /// its setpoint while the path is judged.
+    OnPath(PathArms),
 }
 
 /// One planner tick's product: the velocity-limited candidate setpoint, and
 /// the end-effector Jacobian at the measured pose when the target came from
 /// the operator's stream (the governor's EE-speed limiter caps only those).
+/// A tick of the arm's share of a path, which holds the arm while the path is
+/// judged and steps it along the path once it runs, names the path's arms,
+/// which the governor scales along the step and never turns off it.
 pub struct Tick {
     pub candidate: JointVec,
     pub streamed_hand: Option<Jacobian>,
+    pub on_path: Option<PathArms>,
 }
 
 /// One mode's advance result: the joint target this tick, the next mode (the
@@ -401,6 +429,9 @@ pub struct Planner {
     mode: Mode,
     /// Last governed setpoint: the chase base and the value held when idle.
     setpoint: JointVec,
+    /// The step a share of a path proposed this tick, which the commit of the
+    /// governed setpoint plays the path's clock on by.
+    proposed: Option<path::ProposedStep>,
     /// The smoother a streamed pose's steps pass through, one Butterworth per
     /// joint as a planned servo move's; reset whenever the stream is not a
     /// pose, so a resumed stream seeds on the setpoint.
@@ -419,13 +450,17 @@ impl Planner {
             cfg,
             mode: Mode::Follow,
             setpoint: [0.0; ARM_DOF],
+            proposed: None,
         }
     }
 
     /// Adopt the governed setpoint the coordinator actually published, so the next
-    /// tick chases from there (not from the ungoverned candidate).
+    /// tick chases from there (not from the ungoverned candidate). A share of
+    /// a path plays the path's clock on by the share of its proposed step the
+    /// governor allowed ([`Planner::commit_paced`]).
     pub fn commit(&mut self, governed: JointVec) {
-        self.setpoint = governed;
+        let pace = self.pace_of(&governed);
+        self.commit_paced(governed, pace);
     }
 
     /// Seed the held setpoint from the arm's first measured pose, clamped into the
@@ -511,17 +546,28 @@ impl Planner {
         self.mode = next_mode;
 
         let dt = self.cfg.cycle_period.as_secs_f64();
-        let stepped = chase_step(
-            &self.setpoint,
-            &target,
-            &self.cfg.max_joint_velocity_rad_s,
-            dt,
-        );
+        let vmax = &self.cfg.max_joint_velocity_rad_s;
+        let stepped = match origin {
+            Origin::OnPath(_) => {
+                self.proposed = Some(path::ProposedStep {
+                    from: self.setpoint,
+                    to: target,
+                    at: now,
+                    measured: measured_q,
+                });
+                chase_along(&self.setpoint, &target, vmax, dt)
+            }
+            Origin::Streamed | Origin::PlannedMove => chase_step(&self.setpoint, &target, vmax, dt),
+        };
         Tick {
             candidate: clamp_into(&self.cfg.limits, &stepped),
             streamed_hand: match origin {
                 Origin::Streamed => Some(self.model.at(&measured_q).jacobian()),
-                Origin::PlannedMove => None,
+                Origin::PlannedMove | Origin::OnPath(_) => None,
+            },
+            on_path: match origin {
+                Origin::OnPath(arms) => Some(arms),
+                Origin::Streamed | Origin::PlannedMove => None,
             },
         }
     }
@@ -535,6 +581,7 @@ impl Planner {
             Mode::Follow => {}
             Mode::JointMove(JointMove { reply, .. }) => reply.fail(self.side, failure).await,
             Mode::CartesianMove(m) => self.fail_cartesian(&m.ctx, failure).await,
+            Mode::PathShare(m) => m.fail(self, failure),
         }
     }
 
@@ -560,6 +607,10 @@ impl Planner {
                 let elapsed = m.path.clock().elapsed_secs(now);
                 self.finish_cartesian(&m.ctx, outcome, measured, elapsed)
                     .await;
+                true
+            }
+            Mode::PathShare(m) => {
+                m.end(self, outcome, measured, now);
                 true
             }
         }
@@ -647,6 +698,7 @@ impl Planner {
             },
             Mode::JointMove(m) => self.advance_joint(m, measured_q, now).await,
             Mode::CartesianMove(m) => self.advance_cartesian(m, measured_q, now).await,
+            Mode::PathShare(m) => self.advance_path_share(m, measured_q, now),
         }
     }
 
@@ -663,7 +715,7 @@ impl Planner {
         let q_des = traj.sample(now);
         let outcome = match reply.cancel_reason() {
             Some(reason) => Some(Outcome::Cancelled(reason)),
-            None if traj.clock().is_complete(now) => {
+            None if played_out(traj.clock(), now) => {
                 reply.settle_outcome(&measured_q, &q_des, traj.clock(), now)
             }
             None => None,
@@ -764,7 +816,7 @@ impl Planner {
         line.prev_sample_at = now;
         PathStep::To {
             q_des: q_next,
-            complete: line.traj.clock().is_complete(now),
+            complete: played_out(line.traj.clock(), now),
         }
     }
 
@@ -787,7 +839,7 @@ impl Planner {
     fn step_servo(servo: &ServoTrajectory<ARM_DOF>, now: Instant) -> PathStep {
         PathStep::To {
             q_des: servo.sample(now),
-            complete: servo.clock().is_complete(now),
+            complete: played_out(servo.clock(), now),
         }
     }
 
@@ -816,9 +868,8 @@ impl Planner {
             } => {
                 info!("{}: joint move start", self.side);
                 Mode::JointMove(JointMove {
-                    traj: JointTrajectory::new(
-                        self.setpoint,
-                        target,
+                    traj: JointTrajectory::through(
+                        &[self.setpoint, target],
                         &self.cfg.max_joint_velocity_rad_s,
                         &self.cfg.max_joint_acceleration_rad_s2,
                         duration,
@@ -985,6 +1036,12 @@ fn planned_end(clock: &MotionClock) -> Instant {
     clock.motion_start() + clock.duration()
 }
 
+/// Whether the motion `clock` plays on the wall clock has played out at
+/// `now`: at or past its planned end.
+fn played_out(clock: &MotionClock, now: Instant) -> bool {
+    now >= planned_end(clock)
+}
+
 impl From<Verdict> for Outcome {
     fn from(verdict: Verdict) -> Self {
         match verdict {
@@ -997,7 +1054,7 @@ impl From<Verdict> for Outcome {
 /// The reason a cancelled move_arm or move_arm_joints goal ends with:
 /// `reason`, and [`COMMANDED_JOINTS_NOTE`] after it when the arm has no fresh
 /// measurement, so its result reports the joints commanded last.
-fn cancelled_reason(reason: String, measured: &Measurement) -> String {
+pub(crate) fn cancelled_reason(reason: String, measured: &Measurement) -> String {
     match measured {
         Ok(_) => reason,
         Err(_) => format!("{reason}; {COMMANDED_JOINTS_NOTE}"),
@@ -1021,7 +1078,9 @@ mod tests {
 
     use srs_model::nalgebra::{UnitQuaternion, Vector3};
 
-    use crate::test_support::{bundled_arm, claimed_move_slot, plan_config, planner_holding};
+    use crate::test_support::{
+        POSE_TEST_Q, bundled_arm, claimed_move_slot, plan_config, planner_holding,
+    };
 
     fn joint_cmd(positions: JointVec) -> Upstream {
         Upstream::Joints(positions)
@@ -1034,9 +1093,6 @@ mod tests {
         planner.commit(held);
         planner
     }
-
-    /// An in-limit pose: elbow off its 0.05 floor, j2 inside [-3.32, 0.17].
-    const POSE_TEST_Q: JointVec = [0.0, -0.8, 0.0, 1.2, 0.0, 0.0, 0.0];
 
     /// A planner with the arm's own limits, seeded inside them: rate_step
     /// clamps into model limits, so an off-limit seed would make the tests

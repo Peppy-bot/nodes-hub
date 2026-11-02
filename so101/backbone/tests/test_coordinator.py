@@ -433,6 +433,38 @@ def test_release_resets_anchors_to_measured(fake_kinematics):
     assert c.arm_tick(time.monotonic()) is FAR_TARGET
 
 
+def test_a_held_arm_is_commanded_at_its_hold_until_its_plan_or_release(
+    fake_kinematics, follower_never_stale
+):
+    c = make_coordinator(fake_kinematics)
+    c.measured_joints.set(MEASURED)
+    assert c.try_claim_arm()
+    # Claimed and not held, the arm is silent.
+    assert c.arm_tick(0.0) is None
+    held = (0.1, 0.2, 0.3, 0.4, 0.5)
+    c.hold_arm(held)
+    # Each tick commands the hold while the follower reports, and none while
+    # it is silent.
+    assert c.arm_tick(0.01) == held
+    c.arm_published(True, held)
+    c.measured_joints.clear()
+    assert c.arm_tick(0.02) is None
+    c.measured_joints.set(MEASURED)
+    assert c.arm_tick(0.03) == held
+    # The plan installed after it owns the arm.
+    adopted = c.adopt_arm_plan(plan(held, FAR_TARGET, 1.0, (100.0,) * 5), PostureEnd())
+    assert c.arm_tick(0.04) == adopted.profile.start
+    c.abort_arm_plan(adopted)
+    assert c.arm_tick(0.05) is None
+    c.release_arm()
+    # A release ends the hold too.
+    assert c.try_claim_arm()
+    c.hold_arm(held)
+    c.release_arm()
+    assert c.try_claim_arm()
+    assert c.arm_tick(0.06) is None
+
+
 def test_follower_staleness_silences_the_stream_until_it_returns(fake_kinematics):
     # The liveness window is STALE_FOLLOWER_TIMEOUT_S, independent of the
     # control rate.

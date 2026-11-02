@@ -22,7 +22,9 @@ use srs_model::nalgebra::Isometry3;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, warn};
 
-use crate::actions::{ARM_WORDS, ask_coordinator, check_limb_free, move_seconds_from_wire};
+use crate::actions::{
+    ARM_WORDS, ask_coordinator, check_limb_free, claim_arms, collect_ends, move_seconds_from_wire,
+};
 use crate::coordinator::{CoordinatorRequest, GraspMeasurement};
 use crate::failure::{Failure, FailureKind};
 use crate::move_slot::MoveSlot;
@@ -34,18 +36,10 @@ use crate::types::{arm_pose_arrays, limb_names};
 /// naming the busy arm. A failure on the second claim unwinds the first, so
 /// a refusal never leaves a slot held.
 fn claim_both(move_slots: &ArmPair<MoveSlot>) -> std::result::Result<(), Failure> {
-    let busy_arm = |side: Side| {
+    claim_arms(&Side::BOTH, move_slots).map_err(|side| {
         let message = format!("the {side} {}", ARM_WORDS.busy);
         Failure::new(FailureKind::PreconditionFailed, message)
-    };
-    if !move_slots[Side::Left].claim() {
-        return Err(busy_arm(Side::Left));
-    }
-    if !move_slots[Side::Right].claim() {
-        move_slots[Side::Left].release();
-        return Err(busy_arm(Side::Right));
-    }
-    Ok(())
+    })
 }
 
 /// Admit a posture goal of `duration_s`: a duration the robot takes
@@ -236,20 +230,8 @@ macro_rules! posture_runner {
                 }
                 drop(done_tx);
 
-                let mut outcomes: Vec<Outcome> = Vec::with_capacity(pending);
-                let mut cancel_seen = false;
-                while outcomes.len() < pending {
-                    tokio::select! {
-                        _ = ctx.cancel_signal(), if !cancel_seen => {
-                            cancel_seen = true;
-                            cancelled.store(true, Ordering::Release);
-                        }
-                        received = done_rx.recv() => match received {
-                            Some(outcome) => outcomes.push(outcome),
-                            None => break,
-                        },
-                    }
-                }
+                let outcomes =
+                    collect_ends(pending, &mut done_rx, ctx.cancel_signal(), &cancelled).await;
 
                 let cancel = ctx.cancel_cause().map(|cause| cause.reason().to_string());
                 let ended = match summarize(pending, &outcomes, cancel) {

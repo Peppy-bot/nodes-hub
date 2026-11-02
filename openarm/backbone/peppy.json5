@@ -18,9 +18,11 @@
       // joint positions, grasp-point poses, and gripper openings.
       { name: "limb_state", tag: "v1", link_id: "limb_state" },
       // The per-limb moves: one arm to a joint target or a grasp-point pose
-      // (run by that arm's planner), one gripper to an opening (run by the
-      // coordinator). arm_name and gripper_name address the side: left_arm /
-      // right_arm and left_gripper / right_gripper.
+      // (run by that arm's planner), one or both arms along a path of joint
+      // waypoints (started by the coordinator, each arm's planner playing the
+      // path on its own clock, the two at one pace), one gripper to an
+      // opening (run by the coordinator). arm_name and gripper_name address
+      // the side: left_arm / right_arm and left_gripper / right_gripper.
       { name: "limb_motion", tag: "v1", link_id: "limb_motion" },
       // The governor proximity readout, published for any consumer that
       // binds the capability (the panel's readout, an MCP resource).
@@ -108,9 +110,10 @@
         { link_id: "postures", name: "move_to_ready" },
         { link_id: "postures", name: "move_to_home" },
         // The limb_motion contract's actions; formats come from the contract.
-        // An OpenArm arm has seven joints, so the joint move's generic joint
+        // An OpenArm arm has seven joints, so the joint moves' generic joint
         // vectors are pinned to that length: a goal carrying any other count
-        // is refused before the handler runs.
+        // is refused before the handler runs. An expected start of
+        // execute_joint_path stays open, since an empty one checks nothing.
         {
           link_id: "limb_motion",
           name: "move_arm_joints",
@@ -123,6 +126,27 @@
             },
             result_service: {
               response_message_format: { final_joint_positions: { $length: 7 } },
+            },
+          },
+        },
+        {
+          link_id: "limb_motion",
+          name: "execute_joint_path",
+          refine: {
+            goal_service: {
+              request_message_format: {
+                arms: {
+                  $items: {
+                    waypoints: { $items: { joint_positions: { $length: 7 } } },
+                    settle_tolerances_rad: { $length: 7 },
+                  },
+                },
+              },
+            },
+            result_service: {
+              response_message_format: {
+                arms: { $items: { final_joint_positions: { $length: 7 } } },
+              },
             },
           },
         },
@@ -277,6 +301,16 @@
       // max_ee_velocity_m_s, so the launcher decides it (0.8 is MoveIt
       // Servo's scale.rotational).
       max_ee_angular_velocity_rad_s: "f64",
+      // How far (rad, each joint) an arm's measured joints may stand from the
+      // start of an execute_joint_path path: from the goal's
+      // expected_start_joint_positions when the backbone takes the goal and
+      // again at the path's run start, where the arm measures once the path
+      // is judged; and at the run start from where it measured when the
+      // backbone took the goal, both clamped into its joint limits. Past it,
+      // the goal fails with precondition_failed before the path plays.
+      // Require > 0. The launcher decides it: the most an arm may stand off
+      // the start its caller planned from, or move while its path is judged.
+      start_tolerance_rad: "f64",
       // End-effector linear-speed cap (m/s) for the stream chase, used only until
       // the first governor_control message; after that the commander's streamed cap
       // (openarm_web_commander) governs. Require > 0. The sim launchers set a

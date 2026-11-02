@@ -1,21 +1,25 @@
 //! The actions and services a caller reaches the arms through. Each move
 //! goal is admitted here (validated, then its limb claimed) and handed to the
 //! planner or the coordinator that runs it; a posture goal also waits for the
-//! shares of both arms and ends with their one result; the stop and the plan
-//! check ask the coordinator and answer what it says. The times and the
-//! tolerances every move goal names are parsed here, and each action's own
-//! fields in its module.
+//! shares of both arms and ends with their one result, and an
+//! execute_joint_path goal for the share of each of its arms
+//! ([`collect_ends`]); the stop and the plan check ask the coordinator and
+//! answer what it says. The times and the tolerances every move goal names
+//! are parsed here, and each action's own fields in its module.
 
 pub mod arm;
 pub mod gripper;
+pub mod path;
 pub mod postures;
 pub mod stop;
 
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use control_core::positive_finite::PositiveFinite;
 use control_core::sync::wait_for;
+use openarm_description::{ArmPair, Side};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::coordinator::CoordinatorRequest;
@@ -32,7 +36,7 @@ const COORDINATOR_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 /// to settle after its planned end: the bound the limb_motion contract states
 /// for every duration and timeout. A plan walks the control ticks of the
 /// request, so the bound also bounds its work.
-const MAX_MOVE_DURATION_S: f64 = 60.0;
+pub(crate) const MAX_MOVE_DURATION_S: f64 = 60.0;
 
 /// Parse a tolerance off the wire: a positive finite number, or the refusal
 /// naming `field`.
@@ -99,6 +103,22 @@ fn check_limb_free(fresh: bool, streaming: bool, words: &LimbWords) -> Result<()
     Ok(())
 }
 
+/// Claim the move slot of each arm of `sides`, in their order, or give the
+/// first arm whose slot another move holds. A refusal releases the slots it
+/// claimed before it, so it never leaves a slot held.
+fn claim_arms(sides: &[Side], move_slots: &ArmPair<MoveSlot>) -> Result<(), Side> {
+    for (k, &side) in sides.iter().enumerate() {
+        if move_slots[side].claim() {
+            continue;
+        }
+        for &claimed in &sides[..k] {
+            move_slots[claimed].release();
+        }
+        return Err(side);
+    }
+    Ok(())
+}
+
 /// Admit a move on one limb: [`check_limb_free`], then claim the limb's
 /// move slot, or `precondition_failed` while the limb executes another move.
 /// The move that runs the goal releases the slot.
@@ -140,6 +160,33 @@ async fn ask_coordinator<T>(
             "the coordinator did not answer within {COORDINATOR_REPLY_TIMEOUT:?}"
         )),
     }
+}
+
+/// The ends the shares of a goal report on `ends`, once `pending` have
+/// reported or every share's sender is gone. The goal's cancel,
+/// `cancel_signal`, raises `cancelled`, which the shares poll.
+async fn collect_ends<T>(
+    pending: usize,
+    ends: &mut mpsc::Receiver<T>,
+    cancel_signal: impl Future<Output = ()>,
+    cancelled: &AtomicBool,
+) -> Vec<T> {
+    let mut cancel_signal = std::pin::pin!(cancel_signal);
+    let mut cancel_seen = false;
+    let mut received = Vec::with_capacity(pending);
+    while received.len() < pending {
+        tokio::select! {
+            () = &mut cancel_signal, if !cancel_seen => {
+                cancel_seen = true;
+                cancelled.store(true, Ordering::Release);
+            }
+            end = ends.recv() => match end {
+                Some(end) => received.push(end),
+                None => break,
+            },
+        }
+    }
+    received
 }
 
 /// [`ask_coordinator`] from inside a service handler, which the generated

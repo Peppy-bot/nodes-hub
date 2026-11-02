@@ -1,8 +1,32 @@
-//! Shared primitives for the bimanual backbone: the limb tables and the
-//! world-pose wire codec.
+//! Shared primitives for the bimanual backbone: the limb tables, the
+//! world-pose wire codec, and both arms' joints in one vector.
 
 use openarm_description::{ARM_DOF, ArmPair, Side};
+use srs_model::JointVec;
 use srs_model::nalgebra::{Isometry3, Quaternion, Translation3, UnitQuaternion};
+
+/// Joints across both arms, left (0..7) then right (7..14).
+pub const DUAL_DOF: usize = 2 * ARM_DOF;
+
+/// Both arms' joints, the left arm's then the right's.
+pub type DualJointVec = [f64; DUAL_DOF];
+
+/// Both arms' joints in one vector, the left arm's then the right's.
+pub fn dual_joints(arms: &ArmPair<JointVec>) -> DualJointVec {
+    std::array::from_fn(|i| match i {
+        i if i < ARM_DOF => arms.left[i],
+        i => arms.right[i - ARM_DOF],
+    })
+}
+
+/// The joints of `side`'s arm in `q`.
+pub fn arm_joints(q: &DualJointVec, side: Side) -> JointVec {
+    let offset = match side {
+        Side::Left => 0,
+        Side::Right => ARM_DOF,
+    };
+    std::array::from_fn(|i| q[offset + i])
+}
 
 /// Norm floor for [`pose_from_wire`]: a quaternion at or below it is refused
 /// as naming no rotation at all.
@@ -95,6 +119,20 @@ mod tests {
             assert_eq!(Side::from_gripper_name(gripper), Ok(side));
         }
         assert_eq!(names.joints_per_arm, [ARM_DOF as u32; 2]);
+    }
+
+    #[test]
+    fn both_arms_joints_split_into_each_arms() {
+        let arms = ArmPair::from_fn(|side| {
+            std::array::from_fn(|j| match side {
+                Side::Left => j as f64,
+                Side::Right => 10.0 + j as f64,
+            })
+        });
+        let dual = dual_joints(&arms);
+        assert_eq!(dual[ARM_DOF - 1], (ARM_DOF - 1) as f64);
+        assert_eq!(dual[ARM_DOF], 10.0);
+        assert_eq!(ArmPair::from_fn(|side| arm_joints(&dual, side)), arms);
     }
 
     // Pins the outbound wire ordering to the inbound one: a scalar-first slip

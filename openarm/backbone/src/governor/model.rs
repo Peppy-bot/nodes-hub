@@ -37,6 +37,12 @@ impl ConfiguredModel {
         }
     }
 
+    /// A model of its own with this one's bodies and pairs, whose failed
+    /// queries are logged apart from this one's.
+    pub fn duplicate(&self) -> Self {
+        Self::new(self.inner.clone())
+    }
+
     fn min_distance_at(
         &mut self,
         q: &[f64; GOV_DOF],
