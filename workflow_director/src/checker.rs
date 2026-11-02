@@ -13,10 +13,12 @@ use std::sync::Arc;
 
 use peppy_codec::contract::MOVES_ROBOT;
 use serde_json::Value as Json;
-use workflow_documents::expression::{Expression, FieldType, PathStep, RefPath, Type, TypeScope};
-use workflow_documents::marks::{ITEM_ID, LOCATION, REACHES_FOR_ITEM, ROBOT_FRAME};
+use workflow_documents::expression::{
+    Expr, Expression, FieldType, PathStep, RefPath, Type, TypeScope,
+};
+use workflow_documents::marks::{CHECKS_REACH, ITEM_ID, LOCATION, REACHES_FOR_ITEM, ROBOT_FRAME};
 use workflow_documents::run::{Attendance, Incidents};
-use workflow_documents::workflow::{Arg, ObservationSource, Step, StepKind};
+use workflow_documents::workflow::{Arg, Call, ObservationSource, Step, StepKind};
 use workflow_documents::{Located, Name, NameTag, RobotName, StepId, Workflow, robots_named_twice};
 
 use crate::config::AllowedContracts;
@@ -39,13 +41,15 @@ pub struct RunChoices<'a> {
 }
 
 /// Where each name of a role comes from: the role whose call or
-/// observation gives it, the producer of the result or the observation, and
-/// the format of its value.
+/// observation gives it, the producer of the result or the observation, the
+/// format of its value, and its source: the name of the result or the
+/// observation, which a loop element takes from the list of its loop.
 #[derive(Clone, Debug)]
 struct Origin {
     role: Name,
     producer: Option<Producer>,
     field: Field,
+    source: Name,
 }
 
 struct Checker<'a> {
@@ -198,19 +202,6 @@ impl<'a> Checker<'a> {
                 );
             }
         }
-    }
-
-    fn trees(&self) -> Vec<(&'a Name, &'a Step)> {
-        self.workflow
-            .initialization
-            .iter()
-            .chain(
-                self.workflow
-                    .lanes
-                    .iter()
-                    .map(|(role, lane)| (role, &lane.tree)),
-            )
-            .collect()
     }
 
     /// The binding rules: each role bound, to a present robot of its own,
@@ -393,6 +384,7 @@ impl<'a> Checker<'a> {
                     optional: false,
                     marks: BTreeSet::new(),
                 },
+                source: name.clone(),
             },
         );
     }
@@ -504,14 +496,8 @@ impl<'a> Checker<'a> {
         }
         for role in self.workflow.roles.keys().cloned().collect::<Vec<_>>() {
             let scope = self.scope_of(&role);
-            let trees: Vec<&Step> = self
-                .workflow
-                .initialization
-                .get(&role)
-                .into_iter()
-                .chain(self.workflow.lanes.get(&role).map(|lane| &lane.tree))
-                .collect();
-            for tree in trees {
+            let workflow = self.workflow;
+            for tree in workflow.trees_of(&role) {
                 self.type_tree(&role, tree, &scope);
             }
         }
@@ -544,6 +530,7 @@ impl<'a> Checker<'a> {
                                 optional: false,
                                 marks: BTreeSet::new(),
                             },
+                            source: result.clone(),
                         },
                     );
                 }
@@ -627,9 +614,8 @@ impl<'a> Checker<'a> {
                 let mut item = *item;
                 item.marks.extend(origin.field.marks.iter().cloned());
                 Some(Origin {
-                    role: origin.role,
-                    producer: origin.producer,
                     field: item,
+                    ..origin
                 })
             }
             _ => None,
@@ -656,11 +642,7 @@ impl<'a> Checker<'a> {
                 _ => return None,
             };
         }
-        Some(Origin {
-            role: root.role,
-            producer: root.producer,
-            field,
-        })
+        Some(Origin { field, ..root })
     }
 
     /// A row of a table that goes to a field with the mark location: a
@@ -1127,48 +1109,204 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// A lane that calls a member that reaches for an item has a reach
-    /// assumption whose check reads an observation of its role.
+    /// A lane that calls a member that reaches for an item first checks that
+    /// the robot reaches: with a reach assumption whose check reads an
+    /// observation of its role, or with reach checks (`reach_check_of`)
+    /// named before the reaching call on every path that read a position of
+    /// each source of the items it reaches (`reached_sources`).
     fn check_reach(&mut self) {
-        for (role, tree) in self.trees() {
-            let mut reaches = Vec::new();
-            tree.visit(&mut |step| {
-                if let StepKind::Call(call) = &step.kind {
-                    reaches.push((step.id.clone(), call.member.clone(), call.instance.clone()));
-                }
-            });
-            for (id, member, instance) in reaches {
-                let marked = self
-                    .shapes(role, &member.alias, instance.as_ref())
+        let workflow = self.workflow;
+        for role in workflow.lanes.keys() {
+            if self.reach_assumed(role) {
+                continue;
+            }
+            let calls = calls_of(workflow.trees_of(role));
+            let reaching: Vec<(&Step, &Call)> = calls
+                .iter()
+                .copied()
+                .filter(|(_, call)| self.may_have_mark(role, call, REACHES_FOR_ITEM))
+                .collect();
+            if reaching.is_empty() {
+                continue;
+            }
+            let checks: BTreeMap<&Name, BTreeSet<Name>> = calls
+                .iter()
+                .filter_map(|(_, call)| self.reach_check_of(role, call))
+                .collect();
+            let names_before = workflow.names_before_calls(role);
+            for (step, call) in reaching {
+                let checked: BTreeSet<&Name> = names_before
+                    .get(&step.id)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|name| checks.get(name))
+                    .flatten()
+                    .collect();
+                let reached = self.reached_sources(role, call);
+                let unchecked: Vec<String> = reached
                     .iter()
-                    .any(|shape| {
-                        shape
-                            .members
-                            .get(member.member.as_str())
-                            .is_some_and(|m| m.marks.contains(REACHES_FOR_ITEM))
-                    });
-                if !marked {
-                    continue;
-                }
-                let covered = self.workflow.assumptions.values().any(|assumption| {
-                    assumption.reach
-                        && assumption.check.as_ref().is_some_and(|check| {
-                            check.roots().iter().any(|root| {
-                                self.workflow
-                                    .observations
-                                    .get(root)
-                                    .is_some_and(|o| &o.role == role)
-                            })
-                        })
-                });
-                if !covered {
-                    self.error(
-                        format!("{role}.{id}"),
-                        format!("`{member}` reaches for an item; give the workflow a `kind: \"reach\"` assumption whose check reads an observation of `{role}`"),
-                    );
+                    .filter(|source| !checked.contains(source))
+                    .map(|source| format!("`{source}`"))
+                    .collect();
+                let at = format!("{role}.{}", step.id);
+                if checked.is_empty() || reached.is_empty() {
+                    self.error(at, format!("`{}` reaches for an item; give the workflow a `kind: \"reach\"` assumption whose check reads an observation of `{role}`, or put a reach check before it on every path: a call of a member whose result has a field with the mark `checks_reach`, with `as`, a `done_when` that is that field of its result, and the position of the item read from the same result as the item", call.member));
+                } else if !unchecked.is_empty() {
+                    self.error(at, format!("`{}` reaches for an item of {}, and no reach check before it on every path reads a position of it; give a reach check the position of each item that the call reaches, read from the same result or observation", call.member, unchecked.join(", ")));
                 }
             }
         }
+    }
+
+    /// Whether a reach assumption of the workflow has a check that reads an
+    /// observation of `role`.
+    fn reach_assumed(&self, role: &Name) -> bool {
+        self.workflow.assumptions.values().any(|assumption| {
+            assumption.reach
+                && assumption.check.as_ref().is_some_and(|check| {
+                    check.roots().iter().any(|root| {
+                        self.workflow
+                            .observations
+                            .get(root)
+                            .is_some_and(|o| &o.role == role)
+                    })
+                })
+        })
+    }
+
+    /// The result of `call` of `role` and the sources of the positions that
+    /// it checks (`checked_sources`), when the call is a reach check: the
+    /// result of its member has a field that tells whether the robot reaches
+    /// (`reach_verdict`), and its `done_when` is that field of its result,
+    /// alone or as a term of `&&`, so the step fails when the robot does not
+    /// reach.
+    fn reach_check_of<'c>(
+        &self,
+        role: &Name,
+        call: &'c Call,
+    ) -> Option<(&'c Name, BTreeSet<Name>)> {
+        let result = call.result.as_ref()?;
+        let done_when = call.done_when.as_ref()?;
+        let members = self.members_on_every_pin(role, call)?;
+        let verdict = reach_verdict(&members)?;
+        gates_on(done_when.expr(), result, &verdict)
+            .then(|| (result, self.checked_sources(role, call, &members)))
+    }
+
+    /// The member of `call` on each pin that the role reads, when every pin
+    /// has it and the role reads at least one pin.
+    fn members_on_every_pin(&self, role: &Name, call: &Call) -> Option<Vec<Member>> {
+        let members: Option<Vec<Member>> = self
+            .shapes(role, &call.member.alias, call.instance.as_ref())
+            .iter()
+            .map(|shape| shape.members.get(call.member.member.as_str()).cloned())
+            .collect();
+        members.filter(|members| !members.is_empty())
+    }
+
+    /// The sources of the positions that `call` of `role` checks: of each
+    /// `$ref` of an argument that the request of `members`, the member of
+    /// the call on each pin, marks `robot_frame` on every pin.
+    fn checked_sources(&self, role: &Name, call: &Call, members: &[Member]) -> BTreeSet<Name> {
+        call.args
+            .iter()
+            .filter(|(name, _)| {
+                members.iter().all(|member| {
+                    member
+                        .input
+                        .0
+                        .get(name.as_str())
+                        .is_some_and(|field| field.marks.contains(ROBOT_FRAME))
+                })
+            })
+            .flat_map(|(_, arg)| refs_of(arg))
+            .filter_map(|path| self.origin_of(role, path))
+            .map(|origin| origin.source)
+            .collect()
+    }
+
+    /// The sources of the items that `call` of `role` reaches: of each
+    /// `$ref` of its arguments that reads an item id or a position.
+    fn reached_sources(&self, role: &Name, call: &Call) -> BTreeSet<Name> {
+        call.args
+            .values()
+            .flat_map(refs_of)
+            .filter_map(|path| self.origin_of(role, path))
+            .filter(|origin| {
+                origin.field.marks.contains(ITEM_ID) || origin.field.marks.contains(ROBOT_FRAME)
+            })
+            .map(|origin| origin.source)
+            .collect()
+    }
+
+    /// Whether a pin that the role reads gives the member of `call` the mark
+    /// `mark`: a call that may reach for an item is checked as one.
+    fn may_have_mark(&self, role: &Name, call: &Call, mark: &str) -> bool {
+        self.shapes(role, &call.member.alias, call.instance.as_ref())
+            .iter()
+            .any(|shape| {
+                shape
+                    .members
+                    .get(call.member.member.as_str())
+                    .is_some_and(|member| member.marks.contains(mark))
+            })
+    }
+}
+
+/// Each call of `trees`, with its step, in tree order.
+fn calls_of<'w>(trees: impl Iterator<Item = &'w Step>) -> Vec<(&'w Step, &'w Call)> {
+    let mut calls = Vec::new();
+    for tree in trees {
+        tree.visit(&mut |step| {
+            if let StepKind::Call(call) = &step.kind {
+                calls.push((step, call));
+            }
+        });
+    }
+    calls
+}
+
+/// Each `$ref` that `arg` holds, in an object, a list or the key of a table.
+fn refs_of(arg: &Arg) -> Vec<&RefPath> {
+    match arg {
+        Arg::Ref(path) => vec![path],
+        Arg::Object(fields) => fields.values().flat_map(refs_of).collect(),
+        Arg::List(items) => items.iter().flat_map(refs_of).collect(),
+        Arg::Table { key, .. } => refs_of(key),
+        Arg::Literal(_) | Arg::Location(_) => Vec::new(),
+    }
+}
+
+/// The name of the field of the result that tells whether the robot
+/// reaches, when `members`, the member of a call on each pin, agree on it:
+/// on every pin, the one required boolean field of the result with the mark
+/// `checks_reach`, of the same name. A reach check counts only when every
+/// instance that may serve it checks reach.
+fn reach_verdict(members: &[Member]) -> Option<String> {
+    let mut verdicts = members.iter().map(|member| {
+        let mut marked = member.output.0.iter().filter(|(_, field)| {
+            field.marks.contains(CHECKS_REACH) && field.kind == FieldKind::Bool && !field.optional
+        });
+        match (marked.next(), marked.next()) {
+            (Some((name, _)), None) => Some(name.clone()),
+            _ => None,
+        }
+    });
+    let first = verdicts.next()??;
+    verdicts
+        .all(|verdict| verdict.as_ref() == Some(&first))
+        .then_some(first)
+}
+
+/// Whether `expr` is false whenever `<result>.<field>` is false: that path
+/// alone, or a conjunction (`&&`) with it as one of its terms.
+fn gates_on(expr: &Expr, result: &Name, field: &str) -> bool {
+    match expr {
+        Expr::Select(operand, selected) => {
+            selected == field && matches!(operand.as_ref(), Expr::Ident(name) if name == result)
+        }
+        Expr::And(left, right) => gates_on(left, result, field) || gates_on(right, result, field),
+        _ => false,
     }
 }
 

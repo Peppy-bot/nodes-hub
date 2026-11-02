@@ -22,8 +22,9 @@ use crate::engine::host::{CallEnd, Event, Host, Join, Joining};
 use crate::engine::plan::{Plan, Target};
 use crate::fleet::{Fleet, Instance, Robot, RobotContract, Snapshot};
 
-/// A perception contract for the tests: a scan that gives item ids and a
-/// locate that gives the position of one.
+/// A perception contract for the tests: a scan that gives item ids and
+/// their positions, 3 entries each, and a locate that gives the position of
+/// one.
 const TEST_PERCEPTION: &str = r#"
 {
   peppy_schema: "contract/v1",
@@ -34,7 +35,10 @@ const TEST_PERCEPTION: &str = r#"
         name: "scan",
         description: "The ids of the items that a description names.",
         request_message_format: { description: "string" },
-        response_message_format: { item_ids: { $type: "array", $items: { $type: "string", $marks: ["item_id"] } } },
+        response_message_format: {
+          item_ids: { $type: "array", $items: { $type: "string", $marks: ["item_id"] } },
+          positions: { $type: "array", $items: "f64", $marks: ["robot_frame"], $optional: true },
+        },
       },
       {
         name: "locate",
