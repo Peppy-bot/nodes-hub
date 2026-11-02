@@ -15,16 +15,16 @@ From: peppybot/python-uv-base:latest
     set -eux
     export DEBIAN_FRONTEND=noninteractive
     # uv resolves the shared libs as git dependencies; the base image has no
-    # git. gcc and libc6-dev link workspace_core_py, a Rust extension that uv
-    # builds from its source.
+    # git. gcc and libc6-dev link path_timing_py and workspace_core_py, Rust
+    # extensions that uv builds from their source.
     apt-get update -qq
     apt-get install -qqy --no-install-recommends git gcc libc6-dev
     rm -rf /var/lib/apt/lists/*
-    # The Rust toolchain that builds workspace_core_py: rustup's minimal
-    # profile under /opt/rust, and the toolchain's own cargo and rustc on the
-    # default PATH, where they run without rustup's environment. CI needs
-    # that: it runs the tests in an image of this part of %post alone, with
-    # an environment and a HOME of its own.
+    # The Rust toolchain that builds path_timing_py and workspace_core_py:
+    # rustup's minimal profile under /opt/rust, and the toolchain's own cargo
+    # and rustc on the default PATH, where they run without rustup's
+    # environment. CI needs that: it runs the tests in an image of this part of
+    # %post alone, with an environment and a HOME of its own.
     export RUSTUP_HOME=/opt/rust/rustup CARGO_HOME=/opt/rust/cargo
     curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
         | sh -s -- -y --no-modify-path --profile minimal --default-toolchain stable

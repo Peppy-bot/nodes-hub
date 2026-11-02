@@ -35,8 +35,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Generic, TypeVar
 
-from control_core_py import joint_path, minimum_jerk
+from control_core_py import minimum_jerk
 from control_core_py.runtime import Latch
+from path_timing_py import JointTrajectory
 from so101_description.limbs import ARM_LIMB, GRIPPER_LIMB
 from so101_description.limits import JointLimits
 from so101_description.staleness import COMMAND_SILENCE_LIMIT_S
@@ -78,7 +79,7 @@ PUBLISH_FAILED = PlanFailure(
 # The trajectory an arm plan plays: a minimum-jerk move to one target, or a
 # joint path through waypoints. Both play through sample, done, duration_s,
 # start and end.
-ArmProfile = minimum_jerk.Profile | joint_path.Profile
+ArmProfile = minimum_jerk.Profile | JointTrajectory
 
 
 def joint_past_tolerance(

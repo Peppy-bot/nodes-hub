@@ -33,9 +33,10 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import TypeVar
 
-from control_core_py import joint_path, minimum_jerk
+from control_core_py import minimum_jerk
 from control_core_py.minimum_jerk import Profile
 from control_core_py.runtime import Latch, log
+from path_timing_py import JointTrajectory
 from peppygen.exposed_actions.limb_motion import execute_joint_path
 from so101_description.limbs import ARM_LIMB, GRIPPER_LIMB
 from so101_description.limits import JointLimits
@@ -384,7 +385,7 @@ class ActionLayer:
 
     async def _plan_joint_path(
         self, start: _PathStart, goal: _JointPathGoal
-    ) -> joint_path.Profile:
+    ) -> JointTrajectory:
         """The trajectory of `goal` from where `start` holds the arm through
         its waypoints, or Refusal with the kind the goal fails with, running
         none of the path: `precondition_failed` when the measured joints of
@@ -401,11 +402,11 @@ class ActionLayer:
             self._require_start_at_expected(start.measured, goal.expected_start)
         self._coordinator.hold_arm(start.held)
         profile = await asyncio.to_thread(
-            joint_path.plan,
+            JointTrajectory.through,
             (start.held, *goal.waypoints),
-            goal.duration_s,
             self._config.max_joint_velocity_rad_s,
             self._config.max_joint_acceleration_rad_s2,
+            goal.duration_s,
         )
         # The requested duration is at most the ceiling, so a profile past
         # the ceiling runs at the floor that the caps set for the whole path.

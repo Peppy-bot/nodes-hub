@@ -21,8 +21,8 @@ from conftest import (
     make_layer,
     path_result_joints,
 )
-from control_core_py import joint_path, minimum_jerk
-from control_core_py.joint_path import JOINT_PATH_CORNER_DEVIATION, MIN_JOINT_CHANGE_RAD
+from control_core_py import minimum_jerk
+from path_timing_py import JOINT_PATH_CORNER_DEVIATION, MIN_JOINT_CHANGE_RAD, JointTrajectory
 from peppygen.exposed_actions.limb_motion import execute_joint_path
 from so101_description import limits as limits_mod
 from so101_description.kinematics import Kinematics
@@ -165,6 +165,28 @@ async def drive_path_cancelled_at_once(layer, move) -> FakeGoalContext:
     ctx.request_cancel()
     await layer.drive_joint_path(ctx, move)
     return ctx
+
+
+def rest_instant(profile, waypoint):
+    """The instant `profile` stands on `waypoint`, where its path rests: the
+    nearest to it of 1000 even instants, refined by a ternary search between
+    that instant's neighbors, over which the distance to `waypoint` falls and
+    then rises."""
+    steps = 1000
+    instants = [profile.duration_s * k / steps for k in range(steps + 1)]
+
+    def distance(t_s):
+        return math.dist(profile.sample(t_s), waypoint)
+
+    nearest = min(range(steps + 1), key=lambda k: distance(instants[k]))
+    low, high = instants[max(nearest - 1, 0)], instants[min(nearest + 1, steps)]
+    for _ in range(100):
+        third = (high - low) / 3.0
+        if distance(low + third) < distance(high - third):
+            high -= third
+        else:
+            low += third
+    return (low + high) / 2.0
 
 
 def run_gripper_plan_to_its_end(coordinator, plan, measured_at_end):
@@ -716,8 +738,8 @@ async def test_a_path_keeps_every_joint_within_its_velocity_and_acceleration_cap
     acceleration_caps = config.max_joint_acceleration_rad_s2
     # The path runs in the time its timing within the caps gives, or the
     # longer time the goal requests.
-    fastest_s = joint_path.plan(
-        (MEASURED, *CORNERED), 0.0, velocity_caps, acceleration_caps
+    fastest_s = JointTrajectory.through(
+        (MEASURED, *CORNERED), velocity_caps, acceleration_caps, 0.0
     ).duration_s
     assert plan.profile.duration_s == max(requested_s, fastest_s)
     # Over a grid of instants, each joint's mean velocity and acceleration
@@ -747,9 +769,6 @@ async def test_a_path_passes_its_inner_waypoints_without_stopping(follower_never
     coordinator, layer = make_layer()
     coordinator.measured_joints.set(MEASURED)
     _ctx, task, plan = await driving_path(coordinator, layer, admit_path(layer, *CORNERED))
-    assert all(cell.speed_in > 0.0 for cell in plan.profile.timed.cells[1:]), (
-        "the path rests at its end alone"
-    )
     # The control ticks of the whole move, at explicit instants; the follower
     # stays where the path started.
     ticks = 400
@@ -758,11 +777,12 @@ async def test_a_path_passes_its_inner_waypoints_without_stopping(follower_never
         command = coordinator.arm_tick(plan.profile.duration_s * k / ticks)
         coordinator.arm_published(True, command)
         trace.append(command)
-    mean_step = plan.profile.path.length / ticks
+    mean_step = sum(itertools.starmap(math.dist, itertools.pairwise(trace))) / ticks
     for inner in CORNERED[:-1]:
         nearest = min(range(1, ticks), key=lambda k: math.dist(trace[k], inner))
         # The arm cuts the corner within the contract's deviation, and it is
-        # still moving there: its step is no fraction of the mean.
+        # still moving there: its step is no fraction of the mean. A path
+        # rests only at waypoints, so it rests at its end alone.
         assert math.dist(trace[nearest], inner) <= JOINT_PATH_CORNER_DEVIATION + mean_step
         assert math.dist(trace[nearest - 1], trace[nearest + 1]) / 2.0 > 0.25 * mean_step
     assert trace[-1] == CORNERED[-1]
@@ -784,10 +804,8 @@ async def test_a_repeated_waypoint_stops_the_arm_on_it(offset_rad, follower_neve
     _ctx, task, plan = await driving_path(
         coordinator, layer, admit_path(layer, corner, repeat, *CORNERED[1:])
     )
-    # The path rests on the repeated waypoint and at its end: one boundary of
-    # its timing inside the path is passed at rest.
-    [at_rest] = [cell for cell in plan.profile.timed.cells[1:] if cell.speed_in == 0.0]
-    at_rest_s = at_rest.time_s
+    # The path rests on the repeated waypoint.
+    at_rest_s = rest_instant(plan.profile, repeat)
     coordinator.arm_published(True, coordinator.arm_tick(0.0))
     assert coordinator.arm_tick(at_rest_s) == pytest.approx(repeat, abs=1e-12)
     # A ten-thousandth of a second to either side the arm has barely moved,
@@ -806,10 +824,8 @@ async def test_a_path_that_turns_back_rests_at_the_turn_and_runs_back(follower_n
     # at the first waypoint.
     turn = CORNERED[0]
     _ctx, task, plan = await driving_path(coordinator, layer, admit_path(layer, turn, MEASURED))
-    # The path rests at the turn and at its end: one boundary of its timing
-    # inside the path is passed at rest.
-    [at_rest] = [cell for cell in plan.profile.timed.cells[1:] if cell.speed_in == 0.0]
-    at_rest_s = at_rest.time_s
+    # The path rests at the turn.
+    at_rest_s = rest_instant(plan.profile, turn)
     coordinator.arm_published(True, coordinator.arm_tick(0.0))
     assert coordinator.arm_tick(at_rest_s) == pytest.approx(turn, abs=1e-12)
     # A ten-thousandth of a second to either side the arm has barely moved,
@@ -837,11 +853,11 @@ async def test_a_path_sent_with_a_duration_above_its_floor_runs_that_long(follow
     velocity_caps = (0.41,) * 5
     coordinator, layer = make_layer(max_joint_velocity_rad_s=velocity_caps)
     coordinator.measured_joints.set(MEASURED)
-    fastest_s = joint_path.plan(
+    fastest_s = JointTrajectory.through(
         (MEASURED, *CORNERED),
-        0.0,
         velocity_caps,
         make_config().max_joint_acceleration_rad_s2,
+        0.0,
     ).duration_s
     assert 3.5 < fastest_s < 4.5
     ctx, task, plan = await driving_path(
@@ -970,14 +986,16 @@ async def test_the_arm_holds_where_it_is_measured_while_its_path_is_planned(
     coordinator, layer = make_layer(limits=limits)
     coordinator.measured_joints.set(measured)
     coordinator.arm_published(True, tuple(p + 0.02 for p in measured))
-    plan = joint_path.plan
     commanded_while_planning = []
 
     def plan_while_the_control_loop_ticks(*arguments):
         commanded_while_planning.append(coordinator.arm_tick(0.0))
-        return plan(*arguments)
+        return JointTrajectory.through(*arguments)
 
-    monkeypatch.setattr(joint_path, "plan", plan_while_the_control_loop_ticks)
+    monkeypatch.setattr(
+        "so101_backbone.actions.JointTrajectory",
+        SimpleNamespace(through=plan_while_the_control_loop_ticks),
+    )
     _ctx, task, installed = await driving_path(coordinator, layer, admit_path(layer, *CORNERED))
     # While the path was planned the arm was commanded to hold where the
     # follower measured it, clamped into the joint limits, and the path
@@ -993,15 +1011,17 @@ async def test_an_arm_that_moves_while_its_path_is_planned_fails_the_goal_and_in
 ):
     coordinator, layer = make_layer()
     coordinator.measured_joints.set(MEASURED)
-    plan = joint_path.plan
 
     def plan_while_the_arm_moves(*arguments):
         # Joint 3 moves 0.08 rad while the path is planned, past the start
         # tolerance.
         coordinator.measured_joints.set((0.0, 0.1, 0.28, 0.3, 0.4))
-        return plan(*arguments)
+        return JointTrajectory.through(*arguments)
 
-    monkeypatch.setattr(joint_path, "plan", plan_while_the_arm_moves)
+    monkeypatch.setattr(
+        "so101_backbone.actions.JointTrajectory",
+        SimpleNamespace(through=plan_while_the_arm_moves),
+    )
     assert START_TOLERANCE_RAD == 0.05
     ctx = await drive_path_cancelled_at_once(layer, admit_path(layer, *CORNERED))
     assert ctx.failed == (
@@ -1047,7 +1067,6 @@ async def test_both_start_checks_hold_the_configured_tolerance(monkeypatch, foll
     # fails, and so does an arm that moves 0.021 rad at joint 3 while its path
     # is planned, where 0.019 rad runs.
     tolerance_rad = 0.02
-    plan = joint_path.plan
 
     def off_at_joint_3(rad):
         return (*MEASURED[:2], MEASURED[2] + rad, *MEASURED[3:])
@@ -1076,9 +1095,12 @@ async def test_both_start_checks_hold_the_configured_tolerance(monkeypatch, foll
     def moving_while_planned(coordinator, rad):
         def plan_while_the_arm_moves(*arguments):
             coordinator.measured_joints.set(off_at_joint_3(rad))
-            return plan(*arguments)
+            return JointTrajectory.through(*arguments)
 
-        monkeypatch.setattr(joint_path, "plan", plan_while_the_arm_moves)
+        monkeypatch.setattr(
+            "so101_backbone.actions.JointTrajectory",
+            SimpleNamespace(through=plan_while_the_arm_moves),
+        )
 
     coordinator, layer = layer_measuring()
     moving_while_planned(coordinator, 0.019)
@@ -1107,9 +1129,11 @@ async def test_a_path_past_the_ceiling_at_the_caps_fails_with_rejected_and_insta
     coordinator, layer = make_layer(max_joint_velocity_rad_s=velocity_caps)
     coordinator.measured_joints.set((0.0,) * 5)
     out = (2.0, 0.0, 0.0, 0.0, 0.0)
-    out_s = joint_path.plan(((0.0,) * 5, out), 0.0, velocity_caps, acceleration_caps).duration_s
-    out_and_back_s = joint_path.plan(
-        ((0.0,) * 5, out, (0.0,) * 5), 0.0, velocity_caps, acceleration_caps
+    out_s = JointTrajectory.through(
+        ((0.0,) * 5, out), velocity_caps, acceleration_caps, 0.0
+    ).duration_s
+    out_and_back_s = JointTrajectory.through(
+        ((0.0,) * 5, out, (0.0,) * 5), velocity_caps, acceleration_caps, 0.0
     ).duration_s
     assert out_s < MAX_REQUESTED_DURATION_S < out_and_back_s
     ctx = await drive_path_cancelled_at_once(
@@ -1760,15 +1784,17 @@ async def test_a_stop_while_the_path_is_planned_off_the_loop_ends_the_goal_witho
 ):
     coordinator, layer = make_layer()
     coordinator.measured_joints.set(MEASURED)
-    plan = joint_path.plan
     planning_threads = []
 
     def plan_while_a_stop_lands(*arguments):
         planning_threads.append(threading.get_ident())
         layer.stop_moves("the operator asked")
-        return plan(*arguments)
+        return JointTrajectory.through(*arguments)
 
-    monkeypatch.setattr(joint_path, "plan", plan_while_a_stop_lands)
+    monkeypatch.setattr(
+        "so101_backbone.actions.JointTrajectory",
+        SimpleNamespace(through=plan_while_a_stop_lands),
+    )
     ctx = await drive_path_cancelled_at_once(layer, admit_path(layer, *CORNERED))
 
     # The path was planned on a thread of its own, off the event loop.

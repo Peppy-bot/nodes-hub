@@ -253,7 +253,7 @@ The follower and leader adapters are identical USB serial bridges. Install
 
 ## Shared libraries
 
-Three libs in the
+Four libs in the
 [public-peppy-libs](https://github.com/Peppy-bot/public-peppy-libs)
 repository, consumed as uv git dependencies like the Rust nodes consume
 `control_core`:
@@ -272,6 +272,11 @@ repository, consumed as uv git dependencies like the Rust nodes consume
   reach memo, and the answers of a robot without a perception camera. It is
   a PyO3 extension that uv builds from its source, so the image of the
   backbone installs a Rust toolchain for the build and removes it after.
+- `path_timing_py`: the Python bindings of `control_core`'s path timing, for
+  the backbone only: the joint trajectory of `execute_joint_path`, its
+  corners rounded and its timing under the joint velocity and acceleration
+  caps, as the OpenArm backbone plays it in Rust. It is a PyO3 extension,
+  built as `workspace_core_py` is.
 
 All three nodes follow `main`, like the Rust nodes' `control_core`.
 

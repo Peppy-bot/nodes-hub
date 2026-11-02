@@ -21,7 +21,7 @@ from conftest import (
     joint_path_goal,
     path_result_joints,
 )
-from control_core_py import joint_path
+from path_timing_py import JointTrajectory
 from peppygen.exposed_actions.limb_motion import move_arm as move_arm_prod
 from peppygen.exposed_actions.limb_motion import move_arm_joints as move_arm_joints_prod
 from peppygen.exposed_actions.limb_motion import move_gripper as move_gripper_prod
@@ -769,8 +769,8 @@ async def test_a_path_past_the_ceiling_at_the_caps_fails_with_rejected():
     # and fails with no result.
     slow = {f"max_joint_velocity_rad_s_{joint}": 0.03 for joint in range(1, 6)}
     out = [MEASURED[0] + 1.0, *MEASURED[1:]]
-    out_and_back_s = joint_path.plan(
-        (MEASURED, out, MEASURED), 0.0, (0.03,) * 5, (MAX_JOINT_ACCELERATION_RAD_S2,) * 5
+    out_and_back_s = JointTrajectory.through(
+        (MEASURED, out, MEASURED), (0.03,) * 5, (MAX_JOINT_ACCELERATION_RAD_S2,) * 5, 0.0
     ).duration_s
     assert out_and_back_s > 60.0
     async with harness.start(setup, parameters=make_parameters(**slow)) as h:
