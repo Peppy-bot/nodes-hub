@@ -74,7 +74,7 @@ wheels = [
 [[package]]
 name = "brain-core"
 version = "0.1.0"
-source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=brain_core&rev=480d2cd183b0a9058f272f49d8c7a6dea4c61e2f#480d2cd183b0a9058f272f49d8c7a6dea4c61e2f" }
+source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=brain_core&rev=cf7ba6cd87f46cc941aeeb876f8af23f73e90336#cf7ba6cd87f46cc941aeeb876f8af23f73e90336" }
 dependencies = [
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
@@ -1330,7 +1330,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "any-llm-sdk", extras = ["openrouter", "gemini"], specifier = "==1.37.0" },
-    { name = "brain-core", git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=brain_core&rev=480d2cd183b0a9058f272f49d8c7a6dea4c61e2f" },
+    { name = "brain-core", git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=brain_core&rev=cf7ba6cd87f46cc941aeeb876f8af23f73e90336" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "peppygen", directory = ".peppy/libs/peppygen" },
     { name = "peppylib", directory = ".peppy/libs/peppylib" },

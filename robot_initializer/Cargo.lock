@@ -531,7 +531,7 @@ dependencies = [
 [[package]]
 name = "control_core"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#eb844c23f88e1f526981fbb91a55b4ef89f2a107"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#cf7ba6cd87f46cc941aeeb876f8af23f73e90336"
 dependencies = [
  "thiserror 2.0.21",
  "tokio",
@@ -2636,7 +2636,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -2676,7 +2676,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.61.2",
 ]
