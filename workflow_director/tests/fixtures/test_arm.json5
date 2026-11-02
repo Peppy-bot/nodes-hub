@@ -10,6 +10,7 @@
         description: "Whether the arm reaches a position.",
         request_message_format: { position: { $type: "array", $items: "f64", $length: 3, $marks: ["robot_frame"] } },
         response_message_format: { reachable: "bool", margin: "f64" },
+        marks: ["checks_reach"],
       },
       {
         name: "find",

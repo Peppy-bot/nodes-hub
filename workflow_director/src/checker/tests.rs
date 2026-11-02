@@ -227,6 +227,65 @@ fn a_lane_that_reaches_for_an_item_needs_a_reach_assumption() {
     );
 }
 
+/// The lane of `picker` with `check` between the find and the grab.
+fn picker_checking(check: Json) -> Json {
+    let mut value = picker();
+    value.as_object_mut().unwrap().remove("assumptions");
+    let steps = value["actions"]["alpha"]["tree"]["sequence"]
+        .as_array_mut()
+        .unwrap();
+    steps.insert(1, check);
+    value
+}
+
+/// A call of `member` on the position of the item that the find saw, as
+/// `reach`, which ends when `done_when` holds.
+fn reach_check(member: &str, done_when: Option<&str>) -> Json {
+    let mut call = json!({
+        "member": member, "args": { "position": { "$ref": "seen.position" } }, "as": "reach",
+    });
+    if let Some(done_when) = done_when {
+        call["done_when"] = json!(done_when);
+    }
+    json!({ "id": "reach", "timeout_s": 5, "call": call })
+}
+
+#[test]
+fn a_lane_that_checks_the_reach_of_the_item_before_it_reaches_needs_no_reach_assumption() {
+    let checked = picker_checking(reach_check("arm.check_reach", Some("reach.reachable")));
+    assert_eq!(
+        errors(&checked, &snapshot(vec![robot("alpha")]), Some(&alpha())),
+        Vec::<String>::new()
+    );
+}
+
+/// The check counts only from a member with the mark `checks_reach`, with a
+/// `done_when` that reads its result, named before the reaching call on
+/// every path.
+#[test]
+fn a_reach_check_counts_only_when_it_gates_the_reach_on_every_path() {
+    let unmarked = picker_checking(json!({ "id": "reach", "timeout_s": 5, "call": {
+        "member": "arm.find", "args": { "description": "block" }, "as": "reach", "done_when": "reach.found",
+    } }));
+    let ungated = picker_checking(reach_check("arm.check_reach", None));
+    let reads_another = picker_checking(reach_check("arm.check_reach", Some("seen.found")));
+    let in_one_branch = picker_checking(json!({
+        "id": "maybe", "if": "seen.found", "then": reach_check("arm.check_reach", Some("reach.reachable")),
+    }));
+    let mut after = picker();
+    after.as_object_mut().unwrap().remove("assumptions");
+    after["actions"]["alpha"]["tree"]["sequence"]
+        .as_array_mut()
+        .unwrap()
+        .push(reach_check("arm.check_reach", Some("reach.reachable")));
+    for value in [unmarked, ungated, reads_another, in_one_branch, after] {
+        refuses(
+            &errors(&value, &snapshot(vec![robot("alpha")]), Some(&alpha())),
+            "alpha.grab: `arm.grab` reaches for an item; give the workflow a `kind: \"reach\"` assumption whose check reads an observation of `alpha`, or call a member that checks reach before it on every path",
+        );
+    }
+}
+
 #[test]
 fn an_observation_reads_a_service_or_a_topic() {
     let mut value = picker();
