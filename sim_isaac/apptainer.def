@@ -1,5 +1,5 @@
 Bootstrap: docker
-From: peppybot/sim-isaac:6.1.0-6
+From: peppybot/sim-isaac:6.1.0-7
 
 %labels
     Name sim-isaac

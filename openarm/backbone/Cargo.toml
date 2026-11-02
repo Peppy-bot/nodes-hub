@@ -43,5 +43,5 @@ opt-level = 3
 opt-level = 3
 
 [dev-dependencies]
-hegeltest = { version = "0.50", features = ["static-engine"] }
+hegeltest = { version = "0.51", features = ["static-engine"] }
 peppygen = { path = ".peppy/libs/peppygen", features = ["testing"] }
