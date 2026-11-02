@@ -252,7 +252,7 @@ dev = [
     { name = "mujoco", specifier = "==3.15.0" },
     { name = "pycollada", specifier = "==0.9.3" },
     { name = "pytest", specifier = ">=8" },
-    { name = "usd-core", marker = "platform_machine == 'AMD64' or platform_machine == 'x86_64' or sys_platform == 'darwin'", specifier = "==26.8" },
+    { name = "usd-core", marker = "platform_machine == 'AMD64' or platform_machine == 'x86_64' or sys_platform == 'darwin'", specifier = "==26.11" },
 ]
 
 [[package]]
@@ -284,12 +284,12 @@ wheels = [
 
 [[package]]
 name = "usd-core"
-version = "26.8"
+version = "26.11"
 source = { registry = "https://pypi.org/simple" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/5d/7b/fd674dc4c3273e18cede49c50be75d90649d38dbec6180bda83b4047a8f0/usd_core-26.8-cp311-none-macosx_10_15_universal2.whl", hash = "sha256:781ddef732e3a6d300a5fa2d0c5b8af103aa8589a88c4af77ac6608f39293880", size = 40653076, upload-time = "2026-07-20T14:32:11.676Z" },
-    { url = "https://files.pythonhosted.org/packages/c4/d7/491a3dd0f62424f92f59240c5aa5c64c03588c1b4920b00f5df2ac4f4087/usd_core-26.8-cp311-none-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:53ebbc130108c7e0e7b4af9a4fe3bdac2ae084a12db13496a50f895db527382e", size = 29611915, upload-time = "2026-07-20T14:32:14.833Z" },
-    { url = "https://files.pythonhosted.org/packages/66/18/7ccfb5c69366fa0d7590697e0f62adb4b5c20f02a3c3a674331b4bf40d43/usd_core-26.8-cp311-none-win_amd64.whl", hash = "sha256:d39cef20efdfc29473e92887487bb8c10c45e966c492b5356d32a52724c3578f", size = 13848082, upload-time = "2026-07-20T14:32:17.701Z" },
+    { url = "https://files.pythonhosted.org/packages/9b/45/b7c981c62b752d27043f60e7d29143d0feffe644af21f188440e16ade5de/usd_core-26.11-cp311-none-macosx_10_15_universal2.whl", hash = "sha256:3480fa1b68e421185a18b1651226077549e7b7047c83a7930006e83b2efd7275", size = 40973085, upload-time = "2026-10-21T05:53:56.005Z" },
+    { url = "https://files.pythonhosted.org/packages/cb/3c/1f4161b2368ebb08c44e63620ae65d17c182b5a195db6b667b13545a539d/usd_core-26.11-cp311-none-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:934edc9e11f276e93a45f5cca08fc6fb8f66d94c78ca788975cc62e7fd8b562e", size = 28836592, upload-time = "2026-10-21T05:54:03.564Z" },
+    { url = "https://files.pythonhosted.org/packages/e1/ab/57b59e82faa614ef43f53aaaa0dabe610257474b82638bca461c2cc9c219/usd_core-26.11-cp311-none-win_amd64.whl", hash = "sha256:4bbf496be5c71d9e5ac98a91d631b03ea0c401e0c539abe3167cd77ab9742b20", size = 13069723, upload-time = "2026-10-21T05:54:06.226Z" },
 ]
 
 [[package]]
