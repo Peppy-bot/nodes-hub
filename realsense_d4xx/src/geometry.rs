@@ -14,13 +14,14 @@
 //!   resolution, so both streams share the target's model and the transform
 //!   is the identity.
 //!
-//! Whatever the contract cannot carry is refused with the reason, never
-//! answered with a guess: a distortion model the contract has no name for, a
-//! focal length that is not a positive number, a rotation that is not one.
+//! Each stream's model is camera_core's `Pinhole`, the one shape a camera node
+//! answers camera_geometry:v1 from and a consumer parses it into. Whatever the
+//! contract cannot carry is refused with the reason, never answered with a
+//! guess: a distortion model the contract has no name for, a focal length
+//! that is not a positive number, a rotation that is not one.
 
-use camera_core::geometry::{
-    depth_unit_is_valid, focal_lengths_are_valid, principal_point_is_valid,
-};
+use camera_core::geometry::depth_unit_is_valid;
+use camera_core::pinhole::{Intrinsics, Pinhole};
 
 use crate::modes::AlignMode;
 use crate::stream::{Stream, StreamPair};
@@ -83,19 +84,6 @@ pub struct Calibration {
     pub depth_to_color: StreamExtrinsics,
     /// Metres per z16 sample.
     pub depth_unit: f32,
-}
-
-/// One stream's pinhole model as camera_geometry:v1 answers it.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Pinhole {
-    pub width: u32,
-    pub height: u32,
-    pub fx: f64,
-    pub fy: f64,
-    pub cx: f64,
-    pub cy: f64,
-    pub distortion_model: &'static str,
-    pub distortion: Vec<f64>,
 }
 
 /// The depth optical frame in the colour optical frame: a position in metres
@@ -173,21 +161,8 @@ fn pinhole(stream: Stream, sdk: &StreamIntrinsics) -> Result<Pinhole, String> {
         ppy,
         ..
     } = *sdk;
-    if width == 0 || height == 0 {
-        return Err(format!("the {stream} stream has no size: {width}x{height}"));
-    }
-    if !focal_lengths_are_valid(f64::from(fx), f64::from(fy)) {
-        return Err(format!(
-            "the {stream} focal lengths are not positive numbers: fx {fx}, fy {fy}"
-        ));
-    }
-    if !principal_point_is_valid(f64::from(ppx), f64::from(ppy)) {
-        return Err(format!(
-            "the {stream} principal point is not a number: ppx {ppx}, ppy {ppy}"
-        ));
-    }
     let (distortion_model, distortion) = distortion(stream, sdk)?;
-    Ok(Pinhole {
+    Pinhole::parse(&Intrinsics {
         width,
         height,
         fx: f64::from(fx),
@@ -195,8 +170,9 @@ fn pinhole(stream: Stream, sdk: &StreamIntrinsics) -> Result<Pinhole, String> {
         cx: f64::from(ppx),
         cy: f64::from(ppy),
         distortion_model,
-        distortion,
+        distortion: &distortion,
     })
+    .map_err(|error| format!("the {stream} stream: {error}"))
 }
 
 /// The contract names three models: "none", OpenCV's "plumb_bob" and its
@@ -405,12 +381,14 @@ pub(crate) mod tests {
     fn unaligned_each_stream_keeps_its_own_model_and_the_sdk_values_cross_unchanged() {
         let p = d435().published(AlignMode::None);
         let color = p.pinholes.color.unwrap();
+        let color = color.intrinsics();
         assert_eq!((color.width, color.height), (1280, 720));
         assert_eq!(
             (color.fx, color.fy, color.cx, color.cy),
             (915.25, 914.75, 641.5, 362.25)
         );
         let depth = p.pinholes.depth.unwrap();
+        let depth = depth.intrinsics();
         assert_eq!((depth.width, depth.height), (848, 480));
         assert_eq!(
             (depth.fx, depth.fy, depth.cx, depth.cy),
@@ -426,7 +404,7 @@ pub(crate) mod tests {
     fn depth_aligned_to_colour_is_colour_shaped_and_the_transform_is_the_identity() {
         let p = d435().published(AlignMode::DepthToColor);
         assert_eq!(p.pinholes.depth, p.pinholes.color);
-        assert_eq!(p.pinholes.depth.unwrap().width, 1280);
+        assert_eq!(p.pinholes.depth.unwrap().width(), 1280);
         assert_eq!(p.depth_to_color.unwrap(), Pose::IDENTITY);
     }
 
@@ -435,7 +413,7 @@ pub(crate) mod tests {
         let p = d435().published(AlignMode::ColorToDepth);
         assert_eq!(p.pinholes.color, p.pinholes.depth);
         let color = p.pinholes.color.unwrap();
-        assert_eq!((color.width, color.fx), (848, 423.5));
+        assert_eq!((color.width(), color.intrinsics().fx), (848, 423.5));
         assert_eq!(p.depth_to_color.unwrap(), Pose::IDENTITY);
     }
 
@@ -466,6 +444,7 @@ pub(crate) mod tests {
                 .pinholes
                 .color
                 .unwrap();
+            let color = color.intrinsics();
             assert_eq!(color.distortion_model, "none", "{model:?}");
             assert!(color.distortion.is_empty());
         }
@@ -481,6 +460,7 @@ pub(crate) mod tests {
             .pinholes
             .color
             .unwrap();
+        let color = color.intrinsics();
         assert_eq!(color.distortion_model, "plumb_bob");
         assert_eq!(
             color.distortion,
@@ -498,6 +478,7 @@ pub(crate) mod tests {
         calibration.streams.color.coeffs = [-0.055, 0.066, -0.0007, 0.0005, -0.021];
         let p = calibration.published(AlignMode::None);
         let color = p.pinholes.color.unwrap();
+        let color = color.intrinsics();
         assert_eq!(color.distortion_model, "inverse_plumb_bob");
         assert_eq!(
             color.distortion,
@@ -509,6 +490,7 @@ pub(crate) mod tests {
             .pinholes
             .depth
             .unwrap();
+        let depth = depth.intrinsics();
         assert_eq!(depth.distortion_model, "inverse_plumb_bob");
         assert_eq!(depth.distortion, color.distortion);
     }
@@ -582,7 +564,7 @@ pub(crate) mod tests {
                 .pinholes
                 .depth
                 .unwrap_err()
-                .contains("no size")
+                .contains("a size above 0")
         );
         let mut calibration = d435();
         calibration.streams.color.coeffs[1] = f32::NAN;

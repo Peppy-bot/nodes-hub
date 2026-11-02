@@ -15,32 +15,22 @@
 //!   aligned by construction, and the depth-to-colour transform is the
 //!   identity.
 //!
-//! A value the contract cannot carry (a focal length that is not a positive
-//! number, a depth range that is not one) is refused with the reason rather
-//! than answered: a consumer divides by these numbers.
+//! Each stream's model is camera_core's `Pinhole`, the one shape a camera
+//! node answers camera_geometry:v1 from and a consumer parses it into. A
+//! value the contract cannot carry (a size of 0, a focal length that is not a
+//! positive number, a depth range that is not one) is refused with the
+//! reason: a consumer divides by these numbers.
 //!
 //! [`depth_mm`] turns one SGBM disparity sample into the z16 reading the
 //! depth stream carries, at most [`MAX_Z16_DEPTH_MM`].
 
-use camera_core::geometry::{focal_lengths_are_valid, principal_point_is_valid};
+use camera_core::pinhole::{Intrinsics, Pinhole};
 
 use crate::size::Size;
 
 /// The largest reading the depth stream carries, millimetres. [`depth_mm`]
 /// keeps 65535 out of the stream, so the last z16 value is never a reading.
 pub const MAX_Z16_DEPTH_MM: f64 = 65534.0;
-
-/// One stream's pinhole model as camera_geometry:v1 answers it. Both streams
-/// are rectified, so neither carries distortion.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Pinhole {
-    pub width: u32,
-    pub height: u32,
-    pub fx: f64,
-    pub fy: f64,
-    pub cx: f64,
-    pub cy: f64,
-}
 
 /// The rectified left projection (P1 of `stereo_rectify`) at the eye
 /// resolution: the camera the published colour image was remapped into.
@@ -53,7 +43,8 @@ pub struct RectifiedLeft {
 }
 
 /// What the node answers over camera_geometry:v1, fixed for the session: the
-/// calibration and the capture mode do not change while it runs.
+/// calibration and the capture mode do not change while it runs. Both streams
+/// are rectified, so neither model carries distortion.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Geometry {
     pub color: Pinhole,
@@ -64,25 +55,36 @@ pub struct Geometry {
     pub max_depth_m: f64,
 }
 
-impl Pinhole {
-    /// The same camera seen through a grid of another size, as
-    /// `imgproc::resize` maps it: pixel i of the resized grid covers
-    /// source pixels around (i + 0.5) / s - 0.5, so with pixel centres on
-    /// whole numbers the principal point moves to (c + 0.5) * s - 0.5 and the
-    /// focal length scales by s. The scale is the ratio of the sizes, per
-    /// axis, which is what the resize really applied.
-    pub fn resized(&self, size: Size) -> Self {
-        let sx = f64::from(size.width) / f64::from(self.width);
-        let sy = f64::from(size.height) / f64::from(self.height);
-        Self {
-            width: size.width,
-            height: size.height,
-            fx: self.fx * sx,
-            fy: self.fy * sy,
-            cx: (self.cx + 0.5) * sx - 0.5,
-            cy: (self.cy + 0.5) * sy - 0.5,
-        }
-    }
+/// The same camera seen through a grid of another size, as
+/// `imgproc::resize` maps it: pixel i of the resized grid covers source
+/// pixels around (i + 0.5) / s - 0.5, so with pixel centres on whole numbers
+/// the principal point moves to (c + 0.5) * s - 0.5 and the focal length
+/// scales by s. The scale is the ratio of the sizes, per axis, which is what
+/// the resize really applied.
+fn resized(pinhole: &Pinhole, size: Size) -> Result<Pinhole, String> {
+    let Intrinsics {
+        width,
+        height,
+        fx,
+        fy,
+        cx,
+        cy,
+        distortion_model,
+        distortion,
+    } = pinhole.intrinsics();
+    let sx = f64::from(size.width) / f64::from(width);
+    let sy = f64::from(size.height) / f64::from(height);
+    Pinhole::parse(&Intrinsics {
+        width: size.width,
+        height: size.height,
+        fx: fx * sx,
+        fy: fy * sy,
+        cx: (cx + 0.5) * sx - 0.5,
+        cy: (cy + 0.5) * sy - 0.5,
+        distortion_model,
+        distortion,
+    })
+    .map_err(|error| format!("the depth stream: {error}"))
 }
 
 impl Geometry {
@@ -98,22 +100,17 @@ impl Geometry {
         max_depth_mm: f64,
     ) -> Result<Self, String> {
         let RectifiedLeft { fx, fy, cx, cy } = left;
-        if color.width == 0 || color.height == 0 || depth.width == 0 || depth.height == 0 {
-            return Err(format!(
-                "a published stream has no size: colour {}x{}, depth {}x{}",
-                color.width, color.height, depth.width, depth.height
-            ));
-        }
-        if !focal_lengths_are_valid(fx, fy) {
-            return Err(format!(
-                "the rectified focal lengths are not positive numbers: fx {fx}, fy {fy}"
-            ));
-        }
-        if !principal_point_is_valid(cx, cy) {
-            return Err(format!(
-                "the rectified principal point is not a number: cx {cx}, cy {cy}"
-            ));
-        }
+        let color = Pinhole::parse(&Intrinsics {
+            width: color.width,
+            height: color.height,
+            fx,
+            fy,
+            cx,
+            cy,
+            distortion_model: "none",
+            distortion: &[],
+        })
+        .map_err(|error| format!("the rectified left projection: {error}"))?;
         if !(min_depth_mm.is_finite()
             && max_depth_mm.is_finite()
             && min_depth_mm > 0.0
@@ -123,17 +120,9 @@ impl Geometry {
                 "the matcher's depth range is not a range: {min_depth_mm} mm to {max_depth_mm} mm"
             ));
         }
-        let color = Pinhole {
-            width: color.width,
-            height: color.height,
-            fx,
-            fy,
-            cx,
-            cy,
-        };
         Ok(Self {
             color,
-            depth: color.resized(depth),
+            depth: resized(&color, depth)?,
             min_depth_m: min_depth_mm / 1000.0,
             max_depth_m: max_depth_mm / 1000.0,
         })
@@ -181,16 +170,27 @@ mod tests {
 
     #[test]
     fn the_colour_model_is_the_rectified_projection_unchanged() {
-        let color = geometry(size(640, 360)).color;
+        let g = geometry(size(640, 360));
+        let color = g.color.intrinsics();
         assert_eq!((color.width, color.height), (1280, 720));
         assert_eq!((color.fx, color.fy), (LEFT.fx, LEFT.fy));
         assert_eq!((color.cx, color.cy), (LEFT.cx, LEFT.cy));
+        assert_eq!(
+            (color.distortion_model, color.distortion),
+            ("none", &[][..])
+        );
     }
 
     #[test]
     fn the_depth_model_is_the_colour_one_through_the_resized_grid() {
-        let depth = geometry(size(640, 360)).depth;
+        let g = geometry(size(640, 360));
+        let depth = g.depth.intrinsics();
         assert_eq!((depth.width, depth.height), (640, 360));
+        // Resized, the grid keeps the rectified camera's ideal lens.
+        assert_eq!(
+            (depth.distortion_model, depth.distortion),
+            ("none", &[][..])
+        );
         assert_eq!((depth.fx, depth.fy), (350.125, 350.375));
         // (c + 0.5) / 2 - 0.5, not c / 2: halving the principal point would
         // be right only for pixel centres on half numbers.
@@ -210,11 +210,9 @@ mod tests {
         // A point of the scene projects to the same place in both grids: a
         // pixel of the small grid is the centre of the block it averages.
         let g = geometry(size(320, 180));
-        let (x, y, z) = (0.3, -0.2, 1.5);
-        let u_color = g.color.fx * x / z + g.color.cx;
-        let v_color = g.color.fy * y / z + g.color.cy;
-        let u_depth = g.depth.fx * x / z + g.depth.cx;
-        let v_depth = g.depth.fy * y / z + g.depth.cy;
+        let point = [0.3, -0.2, 1.5];
+        let (u_color, v_color) = g.color.project(point).expect("in the image");
+        let (u_depth, v_depth) = g.depth.project(point).expect("in the image");
         assert!(((u_color + 0.5) / 4.0 - 0.5 - u_depth).abs() < 1e-9);
         assert!(((v_color + 0.5) / 4.0 - 0.5 - v_depth).abs() < 1e-9);
     }
@@ -224,8 +222,9 @@ mod tests {
         // hd2k is 1242 high: a downscale of 4 publishes 310 rows, and the
         // resize scaled the rows by 310 / 1242, not by a quarter.
         let g = Geometry::new(size(2208, 1242), LEFT, size(552, 310), 100.0, 65534.0).unwrap();
-        assert_eq!(g.depth.fx, LEFT.fx * 0.25);
-        assert_eq!(g.depth.fy, LEFT.fy * 310.0 / 1242.0);
+        let depth = g.depth.intrinsics();
+        assert_eq!(depth.fx, LEFT.fx * 0.25);
+        assert_eq!(depth.fy, LEFT.fy * 310.0 / 1242.0);
     }
 
     #[test]

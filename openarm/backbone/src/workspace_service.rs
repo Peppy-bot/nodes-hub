@@ -14,6 +14,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use camera_core::pinhole::{Intrinsics, Pinhole};
 use control_core::serving;
 use control_core::sync::wait_for;
 use peppygen::NodeRunner;
@@ -26,9 +27,7 @@ use tracing::info;
 use workspace_core::Camera;
 use workspace_core::design::{Positions, SurfaceHeight, ViewCheck};
 
-use crate::workspace::{
-    CameraGeometryError, PerceptionCamera, Workspace, depth_from_wire, intrinsics_from_wire,
-};
+use crate::workspace::{CameraGeometryError, PerceptionCamera, Workspace, depth_from_wire};
 
 /// How long a request waits for each of the camera's answers: short, so a
 /// camera that does not answer leaves the caller's deadline room for the
@@ -164,7 +163,7 @@ fn read_view_check(
     });
     Ok(ViewCheck::Checked {
         camera: perception.name,
-        geometry: camera_from_answers(perception, colour, depth)?,
+        geometry: Box::new(camera_from_answers(perception, colour, depth)?),
     })
 }
 
@@ -186,17 +185,19 @@ fn camera_from_answers(
                 .map_or_else(|| e.to_string(), |failure| failure.message),
         })?
         .data;
-    let intrinsics = intrinsics_from_wire(
-        colour.width,
-        colour.height,
-        colour.fx,
-        colour.fy,
-        colour.cx,
-        colour.cy,
-    )
-    .map_err(|reason| Colour {
+    let pinhole = Pinhole::parse(&Intrinsics {
+        width: colour.width,
+        height: colour.height,
+        fx: colour.fx,
+        fy: colour.fy,
+        cx: colour.cx,
+        cy: colour.cy,
+        distortion_model: &colour.distortion_model,
+        distortion: &colour.distortion,
+    })
+    .map_err(|e| Colour {
         camera,
-        reason: reason.to_owned(),
+        reason: e.to_string(),
     })?;
     let depth = depth
         .map_err(|e| match get_depth_intrinsics::Failure::of(&e) {
@@ -223,5 +224,5 @@ fn camera_from_answers(
                 reason: e.to_string(),
             }
         })?;
-    Ok(perception.camera(intrinsics, depth))
+    Ok(perception.camera(pinhole, depth))
 }

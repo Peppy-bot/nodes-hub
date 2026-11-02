@@ -15,6 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use camera_core::controls::{AutoManualMode, ControlFailure, VALUE_UNAVAILABLE};
 use camera_core::encoding::{ColorEncoding, DEPTH_ENCODING};
 use camera_core::geometry::Z_DEPTH_MODEL;
+use camera_core::pinhole::Intrinsics;
 use camera_core::v4l2::{
     CID_AUTO_WHITE_BALANCE, CID_BRIGHTNESS, CID_CONTRAST, CID_GAIN, CID_WHITE_BALANCE_TEMPERATURE,
 };
@@ -37,7 +38,7 @@ use tracing::{error, info, warn};
 use zed_camera::calibration::fetch_conf;
 use zed_camera::capture::{Capture, Grab, device_index, zed_serial};
 use zed_camera::cv_depth::CvDepth;
-use zed_camera::geometry::{Geometry, Pinhole};
+use zed_camera::geometry::Geometry;
 use zed_camera::{DepthSettings, LegalFrameRate, Resolution, Size};
 
 const GRAB_TIMEOUT: Duration = Duration::from_millis(500);
@@ -47,8 +48,6 @@ const DEPTH_UNIT_M_PER_LSB: f32 = 0.001;
 const COLOR_ENCODING: ColorEncoding = ColorEncoding::Rgb8;
 /// Depth is computed in the rectified-left (= published color) frame.
 const ALIGN_MODE: &str = "depth_to_color";
-/// Both streams are rectified images: camera_geometry's ideal pinhole.
-const DISTORTION_MODEL: &str = "none";
 
 /// The capture device shared between the pipeline loop and the control
 /// services; every access is a short lock.
@@ -240,19 +239,22 @@ fn open_pipeline(config: &PipelineConfig) -> std::result::Result<(CvDepth, Opene
         matcher.max_depth_mm(),
     );
     match &geometry {
-        Ok(g) => info!(
-            "geometry: colour fx {:.3} fy {:.3} cx {:.3} cy {:.3}, depth fx {:.3} fy {:.3} cx {:.3} cy {:.3}, {:.3} m to {:.3} m",
-            g.color.fx,
-            g.color.fy,
-            g.color.cx,
-            g.color.cy,
-            g.depth.fx,
-            g.depth.fy,
-            g.depth.cx,
-            g.depth.cy,
-            g.min_depth_m,
-            g.max_depth_m,
-        ),
+        Ok(g) => {
+            let (color, depth) = (g.color.intrinsics(), g.depth.intrinsics());
+            info!(
+                "geometry: colour fx {:.3} fy {:.3} cx {:.3} cy {:.3}, depth fx {:.3} fy {:.3} cx {:.3} cy {:.3}, {:.3} m to {:.3} m",
+                color.fx,
+                color.fy,
+                color.cx,
+                color.cy,
+                depth.fx,
+                depth.fy,
+                depth.cx,
+                depth.cy,
+                g.min_depth_m,
+                g.max_depth_m,
+            )
+        }
         Err(e) => warn!("no geometry to answer, the geometry services refuse: {e}"),
     }
 
@@ -384,14 +386,16 @@ fn color_intrinsics(
             reason.clone(),
         )
     })?;
-    let Pinhole {
+    let Intrinsics {
         width,
         height,
         fx,
         fy,
         cx,
         cy,
-    } = g.color;
+        distortion_model,
+        distortion,
+    } = g.color.intrinsics();
     Ok(get_color_intrinsics::Response::new(
         width,
         height,
@@ -399,8 +403,8 @@ fn color_intrinsics(
         fy,
         cx,
         cy,
-        DISTORTION_MODEL.to_string(),
-        Vec::new(),
+        distortion_model.to_string(),
+        distortion.to_vec(),
     ))
 }
 
@@ -415,14 +419,16 @@ fn depth_intrinsics(
             reason.clone(),
         )
     })?;
-    let Pinhole {
+    let Intrinsics {
         width,
         height,
         fx,
         fy,
         cx,
         cy,
-    } = g.depth;
+        distortion_model,
+        distortion,
+    } = g.depth.intrinsics();
     Ok(get_depth_intrinsics::Response::new(
         width,
         height,
@@ -430,8 +436,8 @@ fn depth_intrinsics(
         fy,
         cx,
         cy,
-        DISTORTION_MODEL.to_string(),
-        Vec::new(),
+        distortion_model.to_string(),
+        distortion.to_vec(),
         Z_DEPTH_MODEL.to_string(),
         g.min_depth_m,
         g.max_depth_m,

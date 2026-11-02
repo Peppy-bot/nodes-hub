@@ -8,6 +8,7 @@ description = "Bench tool: turns one depth pixel of a camera_geometry:v1 camera 
 unsafe_code = "deny"
 
 [dependencies]
+camera_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "camera_core" }
 tokio = { version = "1", features = ["full"] }
 peppygen = { path = ".peppy/libs/peppygen" }
 peppylib = { path = ".peppy/libs/peppylib" }
