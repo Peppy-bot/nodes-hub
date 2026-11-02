@@ -27,7 +27,7 @@ sam3-siglip = [
     "torch>=2.7,<3",
     # SAM 3's image processor is built on torchvision's transforms.
     "torchvision>=0.22",
-    "transformers>=5.18,<5.19",
+    "transformers>=5.22,<5.23",
     # SigLIP's tokenizer.
     "sentencepiece>=0.2",
     "protobuf>=5",
