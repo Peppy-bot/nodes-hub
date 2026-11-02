@@ -2,12 +2,6 @@ version = 1
 revision = 3
 requires-python = ">=3.12, <3.14"
 
-[manifest]
-constraints = [
-    { name = "cmeel-tinyxml2", specifier = "<11" },
-    { name = "cmeel-urdfdom", specifier = "<5" },
-]
-
 [[package]]
 name = "asttokens"
 version = "3.0.2"
