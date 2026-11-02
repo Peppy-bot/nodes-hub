@@ -155,7 +155,7 @@ jobs:
       # setup-python wants nothing but the runner's tool cache, and it spares
       # every run a Docker Hub pull. It is what the other repositories here
       # already reach for.
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.13'
 
@@ -174,7 +174,7 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '24'
           package-manager-cache: false
@@ -225,7 +225,7 @@ jobs:
       # rebuild from scratch. Cargo never removes an artifact a later build
       # superseded, so the Rust step sweeps each target dir down to what its
       # builds still use (see run-rust-tests.py).
-      - uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
+      - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
         with:
           sticky_cache: custom,path=~/.cache/nodes-hub-ci
 

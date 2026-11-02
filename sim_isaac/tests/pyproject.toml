@@ -30,10 +30,10 @@ dev = [
     "pytest>=8",
     "pycollada==0.9.3",
     # What scripts/build_so101.py compiles the SO-101's upstream MJCF with.
-    "mujoco==3.15.0",
+    "mujoco==3.17.0",
     # PyPI provides no USD wheel or source distribution for Linux ARM64.
     # That platform runs the runtime suites without the USD-specific tests.
-    "usd-core==26.8; platform_machine == 'x86_64' or platform_machine == 'AMD64' or sys_platform == 'darwin'",
+    "usd-core==26.11; platform_machine == 'x86_64' or platform_machine == 'AMD64' or sys_platform == 'darwin'",
 ]
 
 [tool.uv]
@@ -42,4 +42,4 @@ dev = [
 package = false
 
 [tool.uv.sources]
-sim_robot_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "sim_robot_core", rev = "bf279f4c9c94eb20fb89eebeaf9339913fa940a1" }
+sim_robot_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "sim_robot_core", rev = "cf7ba6cd87f46cc941aeeb876f8af23f73e90336" }

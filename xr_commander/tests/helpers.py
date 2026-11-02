@@ -168,7 +168,11 @@ def asgi_request(
     The node ships no HTTP client, and these routes are worth testing where
     they are mounted: their ordering against the frontend mount is the hazard.
     `body` takes a list of chunks to arrive as a streamed body rather than one
-    delivery.
+    delivery. The client stays connected until the app sends the last body
+    message of its response, as behind a server: a receive past the request
+    body waits for that message, then reports the disconnect. A response
+    that watches for the disconnect, as a file response does, sends its
+    whole body.
     """
     scope = {
         "type": "http",
@@ -190,16 +194,24 @@ def asgi_request(
     sent = []
     pending = list(body) if isinstance(body, list) else [body]
 
-    async def receive():
-        if not pending:
+    async def exchange():
+        answered = asyncio.Event()
+
+        async def receive():
+            if pending:
+                chunk = pending.pop(0)
+                return {"type": "http.request", "body": chunk, "more_body": bool(pending)}
+            await answered.wait()
             return {"type": "http.disconnect"}
-        chunk = pending.pop(0)
-        return {"type": "http.request", "body": chunk, "more_body": bool(pending)}
 
-    async def send(message):
-        sent.append(message)
+        async def send(message):
+            sent.append(message)
+            if message["type"] == "http.response.body" and not message.get("more_body", False):
+                answered.set()
 
-    asyncio.run(app(scope, receive, send))
+        await app(scope, receive, send)
+
+    asyncio.run(exchange())
     start = next(m for m in sent if m["type"] == "http.response.start")
     payload = b"".join(
         m.get("body", b"") for m in sent if m["type"] == "http.response.body"
