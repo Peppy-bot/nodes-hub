@@ -36,7 +36,7 @@ wheels = [
 
 [[package]]
 name = "any-llm-sdk"
-version = "1.37.0"
+version = "1.41.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anthropic" },
@@ -47,9 +47,9 @@ dependencies = [
     { name = "rich" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/aa/c3/754d9eeb1fcbf24d811912d17e6a77c942843ad57dd4f38ef9a32240ca8b/any_llm_sdk-1.37.0.tar.gz", hash = "sha256:43348783adab2a6050e5803d2f396937cf9928d76c182ce1604ee579e4ecf97f", size = 281585, upload-time = "2026-10-16T17:23:38.991Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/45/99/0f2dab7b3f08d073d9511146b0c84057275afbd60e8aac42e813204c3aba/any_llm_sdk-1.41.0.tar.gz", hash = "sha256:a75872651d69dc2368b347dcaf3619b9982cb626e8c2f1f98560a5394c2e9a03", size = 306641, upload-time = "2026-10-30T18:17:25.951Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/2b/45/b49aaacc60847c98ad3ea056472e0fe3a48617ddb86a5b1265369a7c3692/any_llm_sdk-1.37.0-py3-none-any.whl", hash = "sha256:7149338f63419a17234f59364aa42e1db5cd8321eb147c9e3da6dd9c05f1d38b", size = 345533, upload-time = "2026-10-16T17:23:37.572Z" },
+    { url = "https://files.pythonhosted.org/packages/ed/9d/6fca89b3577fb3107e833193ef5f992987b89802addbb9630df83c2e67e3/any_llm_sdk-1.41.0-py3-none-any.whl", hash = "sha256:87e75e6bbb90b90db77cdb37ce4f81169394cd3453f131be7dda5de149189df3", size = 372596, upload-time = "2026-10-30T18:17:24.219Z" },
 ]
 
 [package.optional-dependencies]
@@ -1333,7 +1333,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "any-llm-sdk", extras = ["openrouter", "gemini"], specifier = "==1.37.0" },
+    { name = "any-llm-sdk", extras = ["openrouter", "gemini"], specifier = "==1.41.0" },
     { name = "brain-core", git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=brain_core&rev=cf7ba6cd87f46cc941aeeb876f8af23f73e90336" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "peppygen", directory = ".peppy/libs/peppygen" },
