@@ -18,6 +18,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
-hegeltest = { version = "0.50", features = ["static-engine"] }
+hegeltest = { version = "0.51", features = ["static-engine"] }
 peppygen = { path = ".peppy/libs/peppygen", features = ["testing"] }
 tempfile = "3"
