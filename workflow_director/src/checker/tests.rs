@@ -227,22 +227,32 @@ fn a_lane_that_reaches_for_an_item_needs_a_reach_assumption() {
     );
 }
 
-/// The lane of `picker` with `check` between the find and the grab.
-fn picker_checking(check: Json) -> Json {
+/// The error of a grab that no reach assumption and no reach check covers.
+const UNCHECKED_GRAB: &str = "alpha.grab: `arm.grab` reaches for an item; give the workflow a `kind: \"reach\"` assumption whose check reads an observation of `alpha`, or put a reach check before it on every path";
+
+/// The lane of `picker` with `checks` between the find and the grab.
+fn picker_checking(checks: &[Json]) -> Json {
     let mut value = picker();
     value.as_object_mut().unwrap().remove("assumptions");
     let steps = value["actions"]["alpha"]["tree"]["sequence"]
         .as_array_mut()
         .unwrap();
-    steps.insert(1, check);
+    for (at, check) in checks.iter().enumerate() {
+        steps.insert(1 + at, check.clone());
+    }
     value
 }
 
-/// A call of `member` on the position of the item that the find saw, as
-/// `reach`, which ends when `done_when` holds.
-fn reach_check(member: &str, done_when: Option<&str>) -> Json {
+/// The find of a second item, a cup, as `other`.
+fn find_other() -> Json {
+    json!({ "id": "look_other", "timeout_s": 5, "call": { "member": "arm.find", "args": { "description": "cup" }, "as": "other" } })
+}
+
+/// A call of `arm.check_reach` on the position of `of`, as `reach`, which
+/// ends when `done_when` holds.
+fn reach_check(of: &str, done_when: Option<&str>) -> Json {
     let mut call = json!({
-        "member": member, "args": { "position": { "$ref": "seen.position" } }, "as": "reach",
+        "member": "arm.check_reach", "args": { "position": { "$ref": format!("{of}.position") } }, "as": "reach",
     });
     if let Some(done_when) = done_when {
         call["done_when"] = json!(done_when);
@@ -250,40 +260,160 @@ fn reach_check(member: &str, done_when: Option<&str>) -> Json {
     json!({ "id": "reach", "timeout_s": 5, "call": call })
 }
 
+/// A reach check of the position of the item that the grab reaches, named
+/// before the grab, whose `done_when` is the field with the mark
+/// `checks_reach` of its result, alone or as a term of `&&`.
 #[test]
 fn a_lane_that_checks_the_reach_of_the_item_before_it_reaches_needs_no_reach_assumption() {
-    let checked = picker_checking(reach_check("arm.check_reach", Some("reach.reachable")));
-    assert_eq!(
-        errors(&checked, &snapshot(vec![robot("alpha")]), Some(&alpha())),
-        Vec::<String>::new()
-    );
+    for done_when in [
+        "reach.reachable",
+        "reach.reachable && reach.margin > 0.01",
+        "seen.found && (reach.margin > 0.01 && reach.reachable)",
+    ] {
+        let checked = picker_checking(&[reach_check("seen", Some(done_when))]);
+        assert_eq!(
+            errors(&checked, &snapshot(vec![robot("alpha")]), Some(&alpha())),
+            Vec::<String>::new(),
+            "{done_when}"
+        );
+    }
 }
 
-/// The check counts only from a member with the mark `checks_reach`, with a
-/// `done_when` that reads its result, named before the reaching call on
-/// every path.
+/// A check counts only from a member whose result has a field with the mark
+/// `checks_reach`, with a `done_when` that is false whenever that field is
+/// false, named before the reaching call on every path.
 #[test]
 fn a_reach_check_counts_only_when_it_gates_the_reach_on_every_path() {
-    let unmarked = picker_checking(json!({ "id": "reach", "timeout_s": 5, "call": {
+    let unmarked = picker_checking(&[json!({ "id": "reach", "timeout_s": 5, "call": {
         "member": "arm.find", "args": { "description": "block" }, "as": "reach", "done_when": "reach.found",
-    } }));
-    let ungated = picker_checking(reach_check("arm.check_reach", None));
-    let reads_another = picker_checking(reach_check("arm.check_reach", Some("seen.found")));
-    let in_one_branch = picker_checking(json!({
-        "id": "maybe", "if": "seen.found", "then": reach_check("arm.check_reach", Some("reach.reachable")),
-    }));
+    } })]);
+    let in_one_branch = picker_checking(&[json!({
+        "id": "maybe", "if": "seen.found", "then": reach_check("seen", Some("reach.reachable")),
+    })]);
     let mut after = picker();
     after.as_object_mut().unwrap().remove("assumptions");
     after["actions"]["alpha"]["tree"]["sequence"]
         .as_array_mut()
         .unwrap()
-        .push(reach_check("arm.check_reach", Some("reach.reachable")));
-    for value in [unmarked, ungated, reads_another, in_one_branch, after] {
-        refuses(
-            &errors(&value, &snapshot(vec![robot("alpha")]), Some(&alpha())),
-            "alpha.grab: `arm.grab` reaches for an item; give the workflow a `kind: \"reach\"` assumption whose check reads an observation of `alpha`, or call a member that checks reach before it on every path",
+        .push(reach_check("seen", Some("reach.reachable")));
+    let mut cases = vec![
+        ("an unmarked member", unmarked),
+        (
+            "no done_when",
+            picker_checking(&[reach_check("seen", None)]),
+        ),
+        ("in one branch", in_one_branch),
+        ("after the grab", after),
+    ];
+    for done_when in [
+        "seen.found",
+        "reach.margin > 0.01",
+        "!reach.reachable",
+        "reach.reachable || seen.found",
+        "reach.reachable == true",
+    ] {
+        cases.push((
+            done_when,
+            picker_checking(&[reach_check("seen", Some(done_when))]),
+        ));
+    }
+    for (case, value) in cases {
+        let found = errors(&value, &snapshot(vec![robot("alpha")]), Some(&alpha()));
+        assert!(
+            found.iter().any(|error| error.contains(UNCHECKED_GRAB)),
+            "{case}: {found:#?}"
         );
     }
+}
+
+/// A reach check counts only for the item whose position it reads: a check
+/// of another item before the grab leaves the grab unchecked, and the error
+/// names the source of the item that the grab reaches.
+#[test]
+fn a_reach_check_covers_only_the_item_whose_position_it_reads() {
+    let fleet = snapshot(vec![robot("alpha")]);
+    let of_another =
+        picker_checking(&[find_other(), reach_check("other", Some("reach.reachable"))]);
+    let found = errors(&of_another, &fleet, Some(&alpha()));
+    assert_eq!(
+        found,
+        [
+            "alpha.grab: `arm.grab` reaches for an item of `seen`, and no reach check before it on every path reads a position of it; give a reach check the position of each item that the call reaches, read from the same result or observation"
+        ],
+    );
+
+    let mut both = picker_checking(&[find_other(), reach_check("other", Some("reach.reachable"))]);
+    let mut second = reach_check("seen", Some("near.reachable"));
+    second["id"] = json!("near");
+    second["call"]["as"] = json!("near");
+    both["actions"]["alpha"]["tree"]["sequence"]
+        .as_array_mut()
+        .unwrap()
+        .insert(3, second);
+    assert_eq!(errors(&both, &fleet, Some(&alpha())), Vec::<String>::new());
+}
+
+/// A loop element takes the source of the list of its loop: a grab of each
+/// item of a scan is checked by a reach check of the positions of that
+/// scan, and not by a check of another item.
+#[test]
+fn a_loop_element_is_checked_by_a_reach_check_of_the_list_of_its_loop() {
+    let fleet = snapshot(vec![robot("alpha")]);
+    let each_scanned = |checked: &str| {
+        let tree = json!({ "id": "pick", "sequence": [
+            { "id": "scan", "timeout_s": 5, "call": { "member": "eyes.scan", "args": { "description": "blocks" }, "as": "scanned" } },
+            { "id": "look", "timeout_s": 5, "call": { "member": "arm.find", "args": { "description": "block" }, "as": "seen" } },
+            { "id": "reach", "timeout_s": 5, "call": {
+                "member": "arm.check_reach", "args": { "position": { "$ref": checked } }, "as": "reach", "done_when": "reach.reachable",
+            } },
+            { "id": "each", "for_each": { "list": "scanned.item_ids", "as": "item" }, "max_items": 5, "body": {
+                "id": "grab", "timeout_s": 30, "call": {
+                    "member": "arm.grab",
+                    "args": { "item_id": { "$ref": "item" }, "position": { "$ref": "scanned.positions" }, "speed": 1 },
+                },
+            } },
+        ] });
+        let mut value = one_arm("alpha", tree, json!([]));
+        value.as_object_mut().unwrap().remove("assumptions");
+        value
+    };
+    assert_eq!(
+        errors(&each_scanned("scanned.positions"), &fleet, Some(&alpha())),
+        Vec::<String>::new()
+    );
+    refuses(
+        &errors(&each_scanned("seen.position"), &fleet, Some(&alpha())),
+        "alpha.grab: `arm.grab` reaches for an item of `scanned`, and no reach check before it",
+    );
+}
+
+/// A reach check counts only when every pin that the role reads gives the
+/// field of the verdict: before a binding, the role reads each pin of the
+/// fleet, and a pin of the arm whose check gives no verdict leaves the grab
+/// unchecked. Bound to the robot whose pin gives it, the check counts.
+#[test]
+fn a_reach_check_counts_only_when_every_pin_gives_its_verdict() {
+    const UNMARKED_ARM_PIN: &str =
+        "4444444444444444444444444444444444444444444444444444444444444444";
+    let unmarked = TEST_ARM.replace(
+        r#"$type: "bool", $marks: ["checks_reach"]"#,
+        r#"$type: "bool""#,
+    );
+    assert_ne!(unmarked, TEST_ARM);
+    let mut beta = robot("beta");
+    beta.contracts[0].sha256 = UNMARKED_ARM_PIN.to_owned();
+    let mut fleet = snapshot(vec![robot("alpha"), beta]);
+    fleet.contracts.insert(
+        UNMARKED_ARM_PIN.to_owned(),
+        Arc::new(ContractShape::parse(&unmarked, UNMARKED_ARM_PIN).unwrap()),
+    );
+    let checked = picker_checking(&[reach_check("seen", Some("reach.reachable"))]);
+
+    refuses(&errors(&checked, &fleet, None), UNCHECKED_GRAB);
+    assert_eq!(
+        errors(&checked, &fleet, Some(&alpha())),
+        Vec::<String>::new()
+    );
 }
 
 #[test]

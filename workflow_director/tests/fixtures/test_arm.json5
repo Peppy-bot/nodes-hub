@@ -9,8 +9,7 @@
         name: "check_reach",
         description: "Whether the arm reaches a position.",
         request_message_format: { position: { $type: "array", $items: "f64", $length: 3, $marks: ["robot_frame"] } },
-        response_message_format: { reachable: "bool", margin: "f64" },
-        marks: ["checks_reach"],
+        response_message_format: { reachable: { $type: "bool", $marks: ["checks_reach"] }, margin: "f64" },
       },
       {
         name: "find",
