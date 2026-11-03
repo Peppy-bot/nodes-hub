@@ -430,7 +430,7 @@ dependencies = [
 [[package]]
 name = "chain_kinematics"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#e4ef2415d50c60dc6cedb0613da574151237e184"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#9a654547d957468d02bccbb54c517714f997fcee"
 dependencies = [
  "control_core",
  "nalgebra",
@@ -563,7 +563,7 @@ dependencies = [
 [[package]]
 name = "control_core"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#e4ef2415d50c60dc6cedb0613da574151237e184"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#9a654547d957468d02bccbb54c517714f997fcee"
 dependencies = [
  "thiserror 2.0.21",
  "tokio",
@@ -1795,7 +1795,7 @@ dependencies = [
 [[package]]
 name = "instance_lock"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#e4ef2415d50c60dc6cedb0613da574151237e184"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#9a654547d957468d02bccbb54c517714f997fcee"
 dependencies = [
  "thiserror 2.0.21",
 ]
@@ -2512,7 +2512,7 @@ dependencies = [
 [[package]]
 name = "openarm_can"
 version = "0.2.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#e4ef2415d50c60dc6cedb0613da574151237e184"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#9a654547d957468d02bccbb54c517714f997fcee"
 dependencies = [
  "control_core",
  "nix 0.31.3",
@@ -2524,7 +2524,7 @@ dependencies = [
 [[package]]
 name = "openarm_description"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#e4ef2415d50c60dc6cedb0613da574151237e184"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#9a654547d957468d02bccbb54c517714f997fcee"
 dependencies = [
  "srs_model",
  "urdf-rs",
@@ -3867,7 +3867,7 @@ dependencies = [
 [[package]]
 name = "srs_model"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#e4ef2415d50c60dc6cedb0613da574151237e184"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#9a654547d957468d02bccbb54c517714f997fcee"
 dependencies = [
  "chain_kinematics",
  "control_core",

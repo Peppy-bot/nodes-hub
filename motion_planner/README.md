@@ -38,7 +38,14 @@ model and the ones it knows. The model gives:
   `openarm_left_ee_link2`); the grasp link (`openarm_left_tcp`) and its frame's approach
   (`+z`) and closing (`+y`) axes;
 - the body around the arms (the torso, the shoulder mounts, the head camera), and
-  OpenArm's self-collision model of `self_collision_model`.
+  OpenArm's self-collision model of `self_collision_model`, which leaves out the pairs
+  the joint limits keep apart: each upper arm (`link3`) against the torso and against its
+  own arm's base.
+
+At home (`openarm_description::home`) with the gripper closed, the robot's bodies stand
+0.077 m apart at the least, a hand from the torso. With a gripper open past about 0.45, a
+finger stands within the clearance of the torso there, so a plan to home is `unreachable`,
+the message naming the finger and the torso, until the gripper closes.
 
 `describe_arms` answers all of it.
 
@@ -128,7 +135,9 @@ model and the ones it knows. The model gives:
   conservative advancement: a step moves no point of the arm farther than the spare
   above `min_clearance_m`, and at most 1.5 cm, so every state between two checked ones
   keeps `min_clearance_m`. The messages of `unreachable` and `no_path` name the plan's
-  clearance in meters. Every state of a planned path past its start keeps the plan's
+  clearance in meters; `unreachable`'s also names, of the goal configuration that falls
+  short least, the pair of links, or the link and the map, it falls short against and
+  how far apart they stand. Every state of a planned path past its start keeps the plan's
   clearance.
 - A start closer than the plan's clearance is valid when, until that clearance is
   reached, neither the shortfall from the map nor the one from the robot's own body
@@ -162,10 +171,11 @@ model and the ones it knows. The model gives:
   the node takes the goal, and the simplifier what they leave. The goal sampling draws
   up to `goal_samples` configurations, ending early at the deadline; the attempts plan
   in all the time left, each under the whole of it; the simplifier takes at most 1000
-  iterations and starts no pass past the deadline. The check of the rounded path runs to
-  its end after the deadline, so a plan answers after its deadline by the time that check
-  takes. With more than 1 attempt, the hybrid of the attempts' paths and its checks also
-  run after the deadline.
+  iterations of what they leave, and its first pass runs to its end past the deadline, as
+  MoveIt's does. The check of the rounded path runs to its end after the deadline, so a
+  plan answers after its deadline by the time the simplifier's first pass, when the
+  attempts leave it none of the time, and that check take. With more than 1 attempt,
+  the hybrid of the attempts' paths and its checks also run after the deadline.
 - The planner makes `planning_attempts` attempts, each from its own seed: four at once,
   MoveIt's default `max_planning_threads`, and each further four once the four before
   them have ended, while the time lasts; a single attempt plans on the plan's own
@@ -234,9 +244,12 @@ Each is a choice a caller sees; the launchers' values are OpenArm v2's.
   leave the least volume, accepting a sample that meets the others by chance. Here the
   sampler draws up to `goal_samples` (64) configurations before OMPL plans, and a goal
   names one link.
-- The time: MoveIt's simplifier runs one pass once its time has passed. Here the
-  simplifier starts no pass past the deadline, and the check of the rounded path runs to
-  its end after it.
+- The time: the check of the rounded path runs to its end after the deadline.
+- Self pairs: MoveIt's OpenArm v2 SRDF (enactic/openarm_ros2,
+  `openarm_v2.0/openarm_bimanual.srdf`) disables adjacent links alone, and checks each
+  upper arm against the torso and against its own arm's base. Here those pairs are left
+  out: within the joint limits they stay 12.9 mm and 18.5 mm apart
+  (`openarm_description`'s `never_touching_pairs`).
 - Attempts: as MoveIt's, but for the departures `ompl_bridge`'s README lists under
   Attempts.
 - Repeatability: a plan is seeded from the map's stamp, so a request repeats on the same
@@ -248,7 +261,7 @@ Each is a choice a caller sees; the launchers' values are OpenArm v2's.
 | `rejected` | The request names more or fewer than one arm, an arm, joint or link the arm does not have, a name twice in one list of constraints, or a number outside its range; or the goal mixes joint and pose constraints, or its position and orientation constraints name more than one link. The message names what to send. |
 | `precondition_failed` | The camera is linked and the map has taken in no depth frame since the node started or the map was cleared, the message naming what the map waits on; or no joint positions have been measured; or a plan's start lies outside a joint limit by more than `start_tolerance_rad`, the message naming the joint. |
 | `start_in_collision` | A plan's start touches the map or the robot's own body; the message names the pair. |
-| `unreachable` | No configuration meets the goal within `goal_samples` draws and the time allowed, or every one that does comes nearer than the plan's clearance, which the message names. |
+| `unreachable` | No configuration meets the goal within `goal_samples` draws and the time allowed, or every one that does comes nearer than the plan's clearance, which the message names with the pair of links, or the link and the map, that the one falling short least falls short against. |
 | `no_path` | The planner finds no path within the time and the iterations allowed, or the start rule leaves no motion from the start; a planned waypoint falls short of the plan's clearance, or a corner's rounding does however near it the added waypoints lie; the planned path fails its check, simplified and as planned; or the time allowed ends before the plan answers. The message names the plan's clearance where it falls short. |
 | `timeout` | A check has a walk of a run or an arc left at 10 s. |
 | `attempt_failed` | The planner fails on its own: OMPL reports an error, or the plan's task ends without an answer. |
