@@ -20,9 +20,11 @@ passing the plan's `start_joint_positions` as `expected_start_joint_positions`.
 
 ## The robot
 
-The `robot` parameter names the robot the node plans for. `openarm_v2` is the one it
-knows: an unknown name stops the node with a message that lists the names. The robot
-gives:
+The node plans for the model the robot's identity names: it asks
+`robot_identity.get_identity` of the instance its `identity` slot binds, each second until
+it answers, since the robot's initializer may start after it, and then starts and serves.
+`openarm_v2` is the model it knows: another leaves it serving nothing, its log naming the
+model and the ones it knows. The model gives:
 
 - each arm by its limb name (`left_arm`, `right_arm`), its gripper's (`left_gripper`,
   `right_gripper`), and its joints in limb_state's order, with the limits

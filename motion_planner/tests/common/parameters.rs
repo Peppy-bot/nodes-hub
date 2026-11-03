@@ -21,7 +21,6 @@ pub fn parameters() -> Parameters {
         padding_offset_m: 0.04,
         padding_scale: 1.0,
         planning_attempts: 1,
-        robot: "openarm_v2".to_string(),
         start_tolerance_rad: 0.05,
         voxel_size_m: 0.02,
     }

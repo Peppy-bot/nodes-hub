@@ -1,5 +1,5 @@
-// motion_planner: plans joint paths for one arm of the robot its `robot`
-// parameter names, around what the robot's perception camera sees. It keeps a
+// motion_planner: plans joint paths for one arm of the robot its initializer's
+// robot_identity names, around what the robot's perception camera sees. It keeps a
 // voxel map of the camera's depth frames in the robot frame, the robot's own
 // body cut out at each frame's joint positions, and plans with OMPL, keeping a
 // clearance from the map and from the robot's own body, every other joint held
@@ -20,6 +20,10 @@
     ],
     depends_on: {
       contracts: [
+        // Who the robot is: its model gives the arms' chains and joint
+        // limits, their grasp and gripper links, the body, and the
+        // self-collision model. The planner serves once it has answered.
+        { name: "robot_identity", tag: "v1", link_id: "identity" },
         // The measured joint positions of the arms and the grippers'
         // openings: a plan starts from them and holds every joint it does not
         // plan, and the map cuts the robot out of each depth frame at the
@@ -54,6 +58,7 @@
         { link_id: "motion_planning", name: "clear_occupancy_map" },
       ],
       consumes: [
+        { link_id: "identity", name: "get_identity" },
         { link_id: "camera_mounts", name: "get_camera_poses" },
         { link_id: "workspace", name: "describe_workspace" },
         { link_id: "geometry", name: "get_depth_intrinsics" },
@@ -74,10 +79,6 @@
       def_file: "apptainer.def",
     },
     parameters: {
-      // The robot the planner plans for: "openarm_v2". It gives the arms'
-      // chains and joint limits, their grasp and gripper links, the body, and
-      // the self-collision model.
-      robot: "string",
       // The clearance (m) every state of a path keeps from the map and from
       // the robot's own body: 0 or more. At or above the backbone's d_safe_m,
       // so its guard does not slow the arm on a planned path.

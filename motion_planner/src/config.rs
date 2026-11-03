@@ -10,8 +10,6 @@ use control_core::positive_finite::PositiveFinite;
 use occupancy_map::Bounds;
 use peppygen::Parameters;
 
-use crate::robot::{Robot, UnknownRobot};
-
 /// The parameters of the lowest and of the highest corner of the map's box, along x, y
 /// and z of the robot frame.
 const MAP_MIN: [&str; 3] = ["map_min_x_m", "map_min_y_m", "map_min_z_m"];
@@ -19,7 +17,6 @@ const MAP_MAX: [&str; 3] = ["map_max_x_m", "map_max_y_m", "map_max_z_m"];
 
 /// The planner's settings, from the node's parameters.
 pub struct Config {
-    pub robot: Robot,
     pub min_clearance_m: f64,
     pub start_tolerance: PositiveFinite,
     pub padding: Padding,
@@ -97,10 +94,6 @@ fn map_bounds(min: [f64; 3], max: [f64; 3]) -> Result<Bounds, ConfigError> {
 
 impl Config {
     pub fn parse(params: &Parameters) -> Result<Self, ConfigError> {
-        let robot: Robot = params
-            .robot
-            .parse()
-            .or_else(|e: UnknownRobot| refuse("robot", &params.robot, e.to_string()))?;
         let padding = Padding::new(params.padding_scale, params.padding_offset_m)
             .map_err(ConfigError::Padding)?;
         let bounds = map_bounds(
@@ -116,7 +109,6 @@ impl Config {
             )
         })?;
         Ok(Self {
-            robot,
             min_clearance_m: distance("min_clearance_m", params.min_clearance_m)?,
             start_tolerance: positive("start_tolerance_rad", params.start_tolerance_rad)?,
             padding,
@@ -153,12 +145,11 @@ pub(crate) mod tests {
         Config::parse(&params).err().expect("a refusal").to_string()
     }
 
-    // The launchers' parameters parse: the robot, the map's box, a frame interval of a
-    // fifth of a second, and the attempts.
+    // The launchers' parameters parse: the map's box, a frame interval of a fifth of a
+    // second, and the attempts.
     #[test]
     fn the_launchers_parameters_parse() {
         let config = Config::parse(&parameters()).expect("a config");
-        assert_eq!(config.robot, Robot::OpenArmV2);
         assert_eq!(config.bounds.min, [-0.66, -0.82, 0.04]);
         assert_eq!(config.bounds.max, [0.66, 0.82, 1.36]);
         assert_eq!(config.frame_interval, Duration::from_millis(200));
@@ -170,14 +161,6 @@ pub(crate) mod tests {
     // says what it takes.
     #[test]
     fn a_parameter_outside_its_range_is_named() {
-        let unknown = Parameters {
-            robot: "openarm_v1".to_string(),
-            ..parameters()
-        };
-        assert_eq!(
-            refused(unknown),
-            "robot is openarm_v1; no robot is named \"openarm_v1\"; the robots are \"openarm_v2\""
-        );
         let flat = Parameters {
             map_max_z_m: 0.0,
             ..parameters()

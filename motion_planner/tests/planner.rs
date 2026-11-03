@@ -30,7 +30,7 @@ use peppygen::fixtures::harness::{Config, Harness};
 use common::{
     LEFT_READY, OPENARM_V2, PLANNING_TIME_S, RIGHT_READY, Solid, TIMEOUT, arms, at_ms, check,
     describe_camera, facing_the_robot, left_elbow, left_path, looking_at, parameters, publish_arms,
-    render, start_with_camera, start_without_camera, start_without_the_rig, take_frame,
+    render, start, start_with_camera, start_without_camera, start_without_the_rig, take_frame,
     take_frame_aligned,
 };
 
@@ -430,12 +430,14 @@ fn grasp_axes(side: Side) -> (Vector3<f64>, Vector3<f64>) {
 
 // describe_arms names each arm's joints in limb_state's order with the limits the
 // backbone enforces, its gripper, its links, its grasp link and the grasp frame's axes
-// where the model's fingers set them, and the body's links. A planner with no camera
-// linked answers it, and plans and checks around the robot's own body with no map
-// stamp.
+// where the model's fingers set them, and the body's links: those of the model the
+// robot's identity names, which the planner asked once before it served. A planner with
+// no camera linked answers it, and plans and checks around the robot's own body with
+// no map stamp.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn describe_arms_names_the_joints_limits_and_links() -> peppygen::Result<()> {
-    let (harness, _mocks) = start_without_camera(&arms(LEFT_READY, RIGHT_READY)).await?;
+    let (harness, mocks) = start_without_camera(&arms(LEFT_READY, RIGHT_READY)).await?;
+    assert_eq!(mocks.deps.identity.get_identity.captured_count(), 1);
     let described = describe_arms::poll(&harness, TIMEOUT).await?;
     assert_eq!(
         described
@@ -717,7 +719,7 @@ async fn a_camera_without_its_mounts_refuses_every_plan_and_check() -> peppygen:
         camera_mounts_vacant: true,
         ..Config::default()
     };
-    let (harness, mocks) = Harness::start_with(config, motion_planner::node::setup).await?;
+    let (harness, mocks) = start(config).await?;
     publish_arms(&mocks, at_ms(0), &arms(LEFT_READY, RIGHT_READY)).await?;
     let reason = format!(
         "{NO_DEPTH_FRAME}: the launcher binds the planner's camera, geometry and workspace \

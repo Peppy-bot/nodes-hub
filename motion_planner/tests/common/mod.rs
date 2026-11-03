@@ -23,7 +23,7 @@ use openarm_description::{ARM_DOF, ArmPair, Side, ready};
 use peppygen::consumed_topics::camera::depth_stream::{Message as DepthFrame, MessageHeader};
 use peppygen::fixtures::exposed_services::motion_planning::check_joint_path;
 use peppygen::fixtures::harness::{Config, Harness, Mocks};
-use peppygen::mock::deps::{camera, camera_mounts, geometry, limb_state, workspace};
+use peppygen::mock::deps::{camera, camera_mounts, geometry, identity, limb_state, workspace};
 
 /// Bounds every wait on the node, past the longest a plan takes. Generous: the
 /// assertions are about the answers, never about how fast they come.
@@ -198,11 +198,25 @@ fn vacant_camera() -> Config {
     }
 }
 
+/// The node over the harness as `config` binds it, its robot's identity answering that
+/// it is an OpenArm v2.
+pub async fn start(config: Config) -> peppygen::Result<(Harness, Mocks)> {
+    let (harness, mocks) = Harness::start_with(config, motion_planner::node::setup).await?;
+    mocks.deps.identity.get_identity.enqueue_response(
+        identity::get_identity::ResponseData::new(
+            "alpha".to_string(),
+            Robot::OpenArmV2.to_string(),
+            "harness".to_string(),
+        ),
+    )?;
+    Ok((harness, mocks))
+}
+
 /// The node over the harness as `config` binds it, with no camera to read, once the arms'
 /// joint positions at `arms` have arrived: a check of the left arm standing still stops
 /// being refused, and answers with no map stamp.
 async fn start_vacant(config: Config, arms: &Arms) -> peppygen::Result<(Harness, Mocks)> {
-    let (harness, mocks) = Harness::start_with(config, motion_planner::node::setup).await?;
+    let (harness, mocks) = start(config).await?;
     publish_arms(&mocks, at_ms(0), arms).await?;
     let still = left_path(&[], &[arms[Side::Left]]);
     for _ in 0..TIMEOUT.as_secs() {
@@ -233,7 +247,7 @@ pub async fn start_with_camera(camera: &Isometry3<f64>) -> peppygen::Result<(Har
         parameters: Some(parameters()),
         ..Config::default()
     };
-    let (harness, mocks) = Harness::start_with(config, motion_planner::node::setup).await?;
+    let (harness, mocks) = start(config).await?;
     describe_camera(&mocks, camera, ALIGNED)?;
     let stream = mocks
         .deps

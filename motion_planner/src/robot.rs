@@ -1,6 +1,7 @@
-//! The robots the planner plans for, named by its `robot` parameter, and the model each
-//! gives: its arms with the limits limb_motion enforces, as a plan checks them, the links
-//! describe_arms names, the body fixed around the arms, and the self-collision model.
+//! The robots the planner plans for, named by the robot_identity of its initializer, and
+//! the model each gives: its arms with the limits limb_motion enforces, as a plan checks
+//! them, the links describe_arms names, the body fixed around the arms, and the
+//! self-collision model.
 
 use std::fmt;
 use std::str::FromStr;
@@ -24,7 +25,7 @@ pub enum Robot {
 impl Robot {
     const ALL: [Self; 1] = [Self::OpenArmV2];
 
-    /// The name the `robot` parameter gives it.
+    /// The name robot_identity gives it.
     const fn name(self) -> &'static str {
         match self {
             Self::OpenArmV2 => "openarm_v2",
@@ -45,7 +46,7 @@ impl fmt::Display for Robot {
     }
 }
 
-/// A `robot` parameter that names no robot the planner plans for.
+/// A robot_identity robot that names no robot the planner plans for.
 #[derive(Debug, PartialEq, thiserror::Error)]
 #[error("no robot is named {name:?}; the robots are {}", robot_names())]
 pub struct UnknownRobot {

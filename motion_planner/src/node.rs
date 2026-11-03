@@ -23,6 +23,7 @@ use openarm_description::{ARM_DOF, ArmPair, Side};
 use peppygen::consumed_services::camera::depth_stream_info;
 use peppygen::consumed_services::camera_mounts::get_camera_poses;
 use peppygen::consumed_services::geometry::{get_depth_intrinsics, get_depth_to_color_extrinsics};
+use peppygen::consumed_services::identity::get_identity;
 use peppygen::consumed_services::workspace::describe_workspace;
 use peppygen::consumed_topics::camera::depth_stream;
 use peppygen::consumed_topics::limb_state::limb_states;
@@ -43,7 +44,7 @@ use crate::fingers::{FingerFault, riders, riders_of_both_arms};
 use crate::history::{Arms, History, Measured};
 use crate::intake::robot_mask;
 use crate::request::{CheckQuery, PlanQuery, parse_check, parse_plan};
-use crate::robot::{ArmModel, RobotModel};
+use crate::robot::{ArmModel, Robot, RobotModel};
 use crate::self_model::HeldOtherArm;
 
 /// Bounds every call to another node.
@@ -246,12 +247,32 @@ fn set_openings(model: &mut SelfCollisionModel, measured: &Measured) {
     );
 }
 
-/// Starts the node: its state from `params`, then the followers and the servers, each
-/// on its own task.
+/// Starts the node: its parameters parsed, then, once the robot's identity names its
+/// model, its state, the followers and the servers, each on its own task. The
+/// initializer that serves the identity may start after this node.
 pub async fn setup(params: Parameters, runner: Arc<NodeRunner>) -> Result<()> {
+    let config = Config::parse(&params).map_err(|e| peppygen::Error::Node(e.into()))?;
+    tokio::spawn(serve_once_identified(runner, config));
+    Ok(())
+}
+
+/// Asks the robot's identity until it names the model, then starts the node for it. A
+/// model the planner holds no model of ends the node's start: it serves nothing, and
+/// the log names the model and the ones it plans for.
+async fn serve_once_identified(runner: Arc<NodeRunner>, config: Config) {
+    let Some(model) = identify(&runner).await else {
+        return;
+    };
+    let robot: Robot = match model.parse() {
+        Ok(robot) => robot,
+        Err(e) => return error!("robot_identity names the model {model:?}: {e}"),
+    };
     let slots = camera_slots(&runner);
     let linked = !matches!(slots, CameraSlots::Vacant);
-    let node = Arc::new(start(&params, linked).map_err(peppygen::Error::Node)?);
+    let node = match start(config, robot, linked) {
+        Ok(node) => Arc::new(node),
+        Err(e) => return error!("motion planner for {robot}: {e}"),
+    };
     tokio::spawn(follow_limb_states(runner.clone(), node.clone()));
     match slots {
         CameraSlots::Linked(links) => {
@@ -267,26 +288,45 @@ pub async fn setup(params: Parameters, runner: Arc<NodeRunner>) -> Result<()> {
     tokio::spawn(serve_clear(runner.clone(), node.clone()));
     tokio::spawn(serve_checks(runner.clone(), node.clone()));
     tokio::spawn(serve_plans(runner, node));
-    Ok(())
 }
 
-/// The node at start: its parameters parsed, the robot's model fitted to its meshes,
-/// and an empty map.
+/// The model the robot's identity names, asked again each `RETRY` until it answers, or
+/// none once the node is cancelled.
+async fn identify(runner: &NodeRunner) -> Option<String> {
+    let token = runner.cancellation_token().clone();
+    let passing = LatchedLog::warn("robot_identity");
+    loop {
+        let producer = get_identity::bound_producer(runner);
+        match get_identity::poll(runner, producer, SERVICE_TIMEOUT).await {
+            Ok(answer) => {
+                passing.success();
+                return Some(answer.data.model);
+            }
+            Err(e) => passing.failure(format!("get_identity: {e}; asking again")),
+        }
+        tokio::select! {
+            _ = token.cancelled() => return None,
+            _ = tokio::time::sleep(RETRY) => {}
+        }
+    }
+}
+
+/// The node at start: the robot's model fitted to its meshes, and an empty map.
 fn start(
-    params: &Parameters,
+    config: Config,
+    robot: Robot,
     camera_linked: bool,
 ) -> std::result::Result<Node, Box<dyn std::error::Error + Send + Sync>> {
-    let config = Config::parse(params)?;
     let RobotModel {
         frame,
         arms,
         body,
         self_model,
-    } = config.robot.model()?;
+    } = robot.model()?;
     let voxels = VoxelMap::new(frame.clone(), config.voxel_size, config.bounds)?;
     info!(
         "motion planner: {}, {} m voxels, clearance {} m, {} attempts",
-        config.robot,
+        robot,
         config.voxel_size.get(),
         config.min_clearance_m,
         config.planning_attempts
@@ -1374,6 +1414,12 @@ mod tests {
 
     use crate::config::tests::parameters;
 
+    /// The node for an OpenArm v2 from `params`, the camera linked or not.
+    fn started(params: &Parameters, camera_linked: bool) -> Node {
+        let config = Config::parse(params).expect("a config");
+        start(config, Robot::OpenArmV2, camera_linked).expect("the node starts")
+    }
+
     /// Both arms at Ready, both grippers open.
     fn still() -> Measured {
         Measured {
@@ -1393,7 +1439,7 @@ mod tests {
     fn a_check_ends_by_its_time() {
         let asked_at = Instant::now();
         assert_eq!(check_deadline(asked_at) - asked_at, Duration::from_secs(10));
-        let node = start(&parameters(), false).expect("the node starts");
+        let node = started(&parameters(), false);
         measure_at(&node, SystemTime::UNIX_EPOCH, still());
         let mut turned = ready(Side::Left);
         turned[0] += 0.1;
@@ -1469,7 +1515,7 @@ mod tests {
     // plans. The hands touch with each arm at the other arm's Ready joint positions.
     #[test]
     fn the_right_arm_checks_and_plans_at_its_own_joint_positions() {
-        let node = start(&parameters(), false).expect("the node starts");
+        let node = started(&parameters(), false);
         measure_at(&node, SystemTime::UNIX_EPOCH, still());
         let bent = elbow_at(Side::Right, 1.3);
         let checked =
@@ -1497,7 +1543,7 @@ mod tests {
     // map empty.
     #[test]
     fn a_path_keeps_clear_of_the_other_arm_where_it_was_measured() {
-        let node = start(&parameters(), false).expect("the node starts");
+        let node = started(&parameters(), false);
         measure_at(&node, after(0), still());
         let across = path_of(Side::Left, &[[-0.35, -0.2, 1.38, 1.3, 0.0, 0.0, 0.0]]);
         let passing = check(&node, &across, an_hour_on()).expect("an answer");
@@ -1537,7 +1583,7 @@ mod tests {
     // plan, which plans until its deadline, answers no path.
     #[test]
     fn a_set_stop_ends_the_plan_stopped() {
-        let node = start(&parameters(), false).expect("the node starts");
+        let node = started(&parameters(), false);
         measure_at(&node, SystemTime::UNIX_EPOCH, still());
         let goal = joint_goal(&node, Side::Left, &elbow_at(Side::Left, 1.3), "shortest");
         let taken = admit(&node, &goal).expect("the goal is taken");
@@ -1606,7 +1652,7 @@ mod tests {
     // the arms are measured. A node with no camera needs the arms alone.
     #[test]
     fn a_plan_or_a_check_waits_for_a_frame_and_the_joints() {
-        let node = start(&parameters(), true).expect("the node starts");
+        let node = started(&parameters(), true);
         let waiting = |on: &str| {
             Err(Refusal::PreconditionFailed(format!(
                 "{NO_DEPTH_FRAME}: {on}"
@@ -1626,7 +1672,7 @@ mod tests {
         measure_at(&node, SystemTime::UNIX_EPOCH, still());
         assert_eq!(snapshot(&node), Ok(()));
 
-        let unlinked = start(&parameters(), false).expect("the node starts");
+        let unlinked = started(&parameters(), false);
         measure_at(&unlinked, SystemTime::UNIX_EPOCH, still());
         assert_eq!(snapshot(&unlinked), Ok(()));
     }
@@ -1638,7 +1684,7 @@ mod tests {
 
     /// A node with a camera, both arms measured every 100 ms from `from_ms` to `to_ms`.
     fn measured_node(from_ms: u64, to_ms: u64) -> Arc<Node> {
-        let node = Arc::new(start(&parameters(), true).expect("the node starts"));
+        let node = Arc::new(started(&parameters(), true));
         measure(&node, from_ms, to_ms);
         node
     }
@@ -1810,7 +1856,7 @@ mod tests {
             waiting_on("50ms after the newest limb_states message")
         );
 
-        let unmeasured = Arc::new(start(&parameters(), true).expect("the node starts"));
+        let unmeasured = Arc::new(started(&parameters(), true));
         let (newest, mut waiting) = waiting_frames(&unmeasured);
         send_frame(&newest, 1_050);
         assert_eq!(given(&mut waiting), None);
@@ -1988,7 +2034,7 @@ mod tests {
     // opening records nothing.
     #[test]
     fn a_message_records_the_joints_and_the_openings() {
-        let node = start(&parameters(), false).expect("the node starts");
+        let node = started(&parameters(), false);
         let malformed = LatchedLog::warn("limb_states");
         let left = std::array::from_fn(|i| 0.1 * i as f64);
         let right = std::array::from_fn(|i| -0.1 * i as f64);
@@ -2020,7 +2066,7 @@ mod tests {
     // stamp between two measurements, put them: halfway between closed and open.
     #[test]
     fn a_frame_cuts_the_fingers_out_at_its_openings() {
-        let node = Arc::new(start(&parameters(), true).expect("the node starts"));
+        let node = Arc::new(started(&parameters(), true));
         let opened = |left: f64| Measured {
             openings: ArmPair::new(left, 1.0 - left),
             ..still()
@@ -2121,7 +2167,7 @@ mod tests {
             padding_offset_m: 0.0,
             ..parameters()
         };
-        let node = Arc::new(start(&params, true).expect("the node starts"));
+        let node = Arc::new(started(&params, true));
         let closed = Measured {
             openings: ArmPair::new(0.0, 0.0),
             ..still()
