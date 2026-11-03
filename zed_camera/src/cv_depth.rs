@@ -1,16 +1,16 @@
 //! Rectify + SGBM depth through the `opencv` crate.
 //!
-//! This is the Stereolabs reference recipe (the same one the vendored
-//! `initCalibration` runs) expressed directly against OpenCV from Rust: parse
-//! the factory `.conf`, build the per-eye intrinsics and the inter-eye
-//! rotation, rectify to rectified projections under the lens model the conf
-//! writes (`stereo_rectify` and `init_undistort_rectify_map` for the
-//! radial-tangential model, their `fisheye` forms for the fisheye model),
-//! and remap through the result. Per frame it decodes the
-//! side-by-side YUYV, rectifies both eyes, and runs `StereoSGBM`
-//! (`MODE_SGBM_3WAY`) with the ZED default penalties, converting fixed-point
-//! disparity to millimetres. Every heavy step is a maintained OpenCV call, so
-//! the output matches the Stereolabs reference recipe.
+//! At creation it parses the factory `.conf`, builds the per-eye intrinsics
+//! and the inter-eye rotation, and computes each eye's remap into its
+//! rectified view under the lens model the conf writes: a radial-tangential
+//! pair (k1, k2, p1, p2, k3) through `stereo_rectify` and
+//! `init_undistort_rectify_map`, a fisheye pair (k1 to k4, no tangential
+//! term) through `fisheye_stereo_rectify` and
+//! `fisheye_init_undistort_rectify_map`. Per frame it decodes the
+//! side-by-side YUYV, remaps both eyes, and runs `StereoSGBM`
+//! (`MODE_SGBM_3WAY`, smoothness penalties 24 * block² and 96 * block²),
+//! converting fixed-point disparity to millimetres. Every heavy step is a
+//! maintained OpenCV call.
 
 use opencv::calib3d::{self, StereoMatcherTrait, StereoSGBM, StereoSGBM_MODE_SGBM_3WAY};
 use opencv::core::{
@@ -91,14 +91,7 @@ impl CvDepth {
             map_right_x,
             map_right_y,
             p1,
-        } = match conf.lenses {
-            Lenses::RadialTangential { left, right } => {
-                rectify_radial_tangential(&eyes, &coefficients(&left)?, &coefficients(&right)?)?
-            }
-            Lenses::Fisheye { left, right } => {
-                rectify_fisheye(&eyes, &coefficients(&left)?, &coefficients(&right)?)?
-            }
-        };
+        } = rectify(&eyes, &conf.lenses)?;
 
         // Rectified focal length is P1(0,0); disparity to depth uses it, and
         // the disparity search range derives from it and the requested floor.
@@ -156,7 +149,7 @@ impl CvDepth {
         self.num_disparities
     }
 
-    /// The rectified left projection (P1 of `stereo_rectify`): the camera the
+    /// The rectified left projection (P1 of the rectification): the camera the
     /// published colour image shows, at the eye resolution.
     pub fn rectified_left(&self) -> RectifiedLeft {
         self.rectified_left
@@ -314,13 +307,16 @@ struct Rectification {
     p1: Mat,
 }
 
-/// Rectification under OpenCV's pinhole model, whose distortion is the
-/// 5-term radial-tangential one.
-fn rectify_radial_tangential(
-    eyes: &Eyes,
-    dist_left: &Mat,
-    dist_right: &Mat,
-) -> Result<Rectification, String> {
+/// Rectification of `eyes` under the lens model of `lenses`, into pinhole
+/// views the size of the eye whose every pixel holds the scene: alpha 0 for
+/// the radial-tangential model, balance 0 and the field of view unscaled for
+/// the fisheye model.
+fn rectify(eyes: &Eyes, lenses: &Lenses) -> Result<Rectification, String> {
+    let (left, right) = match lenses {
+        Lenses::RadialTangential { left, right } => (left.as_slice(), right.as_slice()),
+        Lenses::Fisheye { left, right } => (left.as_slice(), right.as_slice()),
+    };
+    let (dist_left, dist_right) = (coefficients(left)?, coefficients(right)?);
     let (mut r1, mut r2, mut p1, mut p2, mut q) = (
         Mat::default(),
         Mat::default(),
@@ -328,50 +324,50 @@ fn rectify_radial_tangential(
         Mat::default(),
         Mat::default(),
     );
-    calib3d::stereo_rectify(
-        &eyes.k_left,
-        dist_left,
-        &eyes.k_right,
-        dist_right,
-        eyes.size,
-        &eyes.rotation,
-        &eyes.translation,
-        &mut r1,
-        &mut r2,
-        &mut p1,
-        &mut p2,
-        &mut q,
-        calib3d::CALIB_ZERO_DISPARITY,
-        0.0,
-        eyes.size,
-        None,
-        None,
-    )
+    match lenses {
+        Lenses::RadialTangential { .. } => calib3d::stereo_rectify(
+            &eyes.k_left,
+            &dist_left,
+            &eyes.k_right,
+            &dist_right,
+            eyes.size,
+            &eyes.rotation,
+            &eyes.translation,
+            &mut r1,
+            &mut r2,
+            &mut p1,
+            &mut p2,
+            &mut q,
+            calib3d::CALIB_ZERO_DISPARITY,
+            0.0,
+            eyes.size,
+            None,
+            None,
+        ),
+        Lenses::Fisheye { .. } => calib3d::fisheye_stereo_rectify(
+            &eyes.k_left,
+            &dist_left,
+            &eyes.k_right,
+            &dist_right,
+            eyes.size,
+            &eyes.rotation,
+            &eyes.translation,
+            &mut r1,
+            &mut r2,
+            &mut p1,
+            &mut p2,
+            &mut q,
+            calib3d::CALIB_ZERO_DISPARITY,
+            eyes.size,
+            0.0,
+            1.0,
+        ),
+    }
     .map_err(cv)?;
-    let (mut map_left_x, mut map_left_y) = (Mat::default(), Mat::default());
-    let (mut map_right_x, mut map_right_y) = (Mat::default(), Mat::default());
-    calib3d::init_undistort_rectify_map(
-        &eyes.k_left,
-        dist_left,
-        &r1,
-        &p1,
-        eyes.size,
-        CV_32FC1,
-        &mut map_left_x,
-        &mut map_left_y,
-    )
-    .map_err(cv)?;
-    calib3d::init_undistort_rectify_map(
-        &eyes.k_right,
-        dist_right,
-        &r2,
-        &p2,
-        eyes.size,
-        CV_32FC1,
-        &mut map_right_x,
-        &mut map_right_y,
-    )
-    .map_err(cv)?;
+    let (map_left_x, map_left_y) =
+        undistort_rectify_map(lenses, &eyes.k_left, &dist_left, &r1, &p1, eyes.size)?;
+    let (map_right_x, map_right_y) =
+        undistort_rectify_map(lenses, &eyes.k_right, &dist_right, &r2, &p2, eyes.size)?;
     Ok(Rectification {
         map_left_x,
         map_left_y,
@@ -381,71 +377,27 @@ fn rectify_radial_tangential(
     })
 }
 
-/// Rectification under OpenCV's equidistant fisheye model, into pinhole
-/// views the size of the eye whose every pixel holds the scene (balance 0,
-/// the field of view unscaled).
-fn rectify_fisheye(
-    eyes: &Eyes,
-    dist_left: &Mat,
-    dist_right: &Mat,
-) -> Result<Rectification, String> {
-    let (mut r1, mut r2, mut p1, mut p2, mut q) = (
-        Mat::default(),
-        Mat::default(),
-        Mat::default(),
-        Mat::default(),
-        Mat::default(),
-    );
-    calib3d::fisheye_stereo_rectify(
-        &eyes.k_left,
-        dist_left,
-        &eyes.k_right,
-        dist_right,
-        eyes.size,
-        &eyes.rotation,
-        &eyes.translation,
-        &mut r1,
-        &mut r2,
-        &mut p1,
-        &mut p2,
-        &mut q,
-        calib3d::CALIB_ZERO_DISPARITY,
-        eyes.size,
-        0.0,
-        1.0,
-    )
+/// One eye's remap (x, y) from its rectifying rotation `r` and projection
+/// `p`, under the lens model of `lenses`.
+fn undistort_rectify_map(
+    lenses: &Lenses,
+    k: &Mat,
+    dist: &Mat,
+    r: &Mat,
+    p: &Mat,
+    size: CvSize,
+) -> Result<(Mat, Mat), String> {
+    let (mut map_x, mut map_y) = (Mat::default(), Mat::default());
+    match lenses {
+        Lenses::RadialTangential { .. } => calib3d::init_undistort_rectify_map(
+            k, dist, r, p, size, CV_32FC1, &mut map_x, &mut map_y,
+        ),
+        Lenses::Fisheye { .. } => calib3d::fisheye_init_undistort_rectify_map(
+            k, dist, r, p, size, CV_32FC1, &mut map_x, &mut map_y,
+        ),
+    }
     .map_err(cv)?;
-    let (mut map_left_x, mut map_left_y) = (Mat::default(), Mat::default());
-    let (mut map_right_x, mut map_right_y) = (Mat::default(), Mat::default());
-    calib3d::fisheye_init_undistort_rectify_map(
-        &eyes.k_left,
-        dist_left,
-        &r1,
-        &p1,
-        eyes.size,
-        CV_32FC1,
-        &mut map_left_x,
-        &mut map_left_y,
-    )
-    .map_err(cv)?;
-    calib3d::fisheye_init_undistort_rectify_map(
-        &eyes.k_right,
-        dist_right,
-        &r2,
-        &p2,
-        eyes.size,
-        CV_32FC1,
-        &mut map_right_x,
-        &mut map_right_y,
-    )
-    .map_err(cv)?;
-    Ok(Rectification {
-        map_left_x,
-        map_left_y,
-        map_right_x,
-        map_right_y,
-        p1,
-    })
+    Ok((map_x, map_y))
 }
 
 fn remap_linear(
