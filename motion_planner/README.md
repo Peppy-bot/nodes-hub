@@ -42,10 +42,11 @@ ends the node with an error that names the model and the ones it knows. The mode
   the joint limits keep apart: each upper arm (`link3`) against the torso and against its
   own arm's base.
 
-At home (`openarm_description::home`) with the gripper closed, the robot's bodies stand
-0.077 m apart at the least, a hand from the torso. With a gripper open past about 0.45, a
-finger stands within the clearance of the torso there, so a plan to home is `unreachable`,
-the message naming the finger and the torso, until the gripper closes.
+At home (`openarm_description::home`) with the grippers closed, the robot's bodies stand
+0.077 m apart at the least, a hand from the torso. At 0.4 of a gripper's opening a finger
+stands 0.050 m from the torso there, and at 0.5 or more within the self clearance (0.039 m
+at 0.5), so a plan to home is `unreachable`, the message naming the finger and the torso,
+until the gripper closes.
 
 `describe_arms` answers all of it.
 
@@ -127,8 +128,8 @@ the message naming the finger and the torso, until the gripper closes.
   when the other links' constraints hold by chance. Goal configurations are drawn
   with the arm's inverse kinematics, up to `goal_samples` of them within the plan's
   time.
-- Every state of the path keeps `min_clearance_m` from the map and from the robot's
-  own body, measured by the self-collision model; so does the path
+- Every state of the path keeps `min_clearance_m` from the map and between each pair of
+  the robot's own links that the self-collision model checks; so does the path
   `execute_joint_path` runs from the plan's start, its corners rounded as it rounds
   them. The planner checks states at the plan's clearance, `min_clearance_m` plus 1 mm
   from the map and plus 2 mm between the robot's own links, and walks each motion by
@@ -222,9 +223,10 @@ failures come after.
 Each is a choice a caller sees; the launchers' values are OpenArm v2's.
 
 - Clearance: MoveIt checks contact alone by default (`CollisionEnv` padding 0.0), and
-  pads links against the world only (`pad_self_collisions` false). Here every state keeps `min_clearance_m` (0.04 m)
-  from the map and from the robot's own body, and a checked state 1 mm more from the
-  map and 2 mm more between the robot's own links.
+  pads links against the world only (`pad_self_collisions` false). Here every state
+  keeps `min_clearance_m` (0.04 m) from the map and between each pair of links the
+  self-collision model checks, and a checked state 1 mm more from the map and 2 mm more
+  between the robot's own links.
 - Motion check: MoveIt's OMPL checks the states of a motion 0.01 of the state space's
   extent apart (`longest_valid_segment_fraction`, moveit2 2.15.2
   `ModelBasedPlanningContext`) and nothing between them. Here every state between two
@@ -273,9 +275,9 @@ launcher sets each one. `min_clearance_m` stands at or above the backbone's
 `d_safe_m`, so the backbone's guard does not slow the arm on a planned path. A
 parameter outside its range stops the node with a message that names it.
 
-The node reads `limb_state`, `camera_mounts` and `workspace` from the backbone, and
-`camera` (`rgbd_camera:v1`) and `geometry` (`camera_geometry:v1`) from the perception
-camera. The four camera slots are optional, and bind as the plan section says.
+The node reads `identity` (`robot_identity:v1`) from the robot's initializer,
+`limb_state`, `camera_mounts` and `workspace` from the backbone, and `camera`
+(`rgbd_camera:v1`) and `geometry` (`camera_geometry:v1`) from the perception camera. The four camera slots are optional, and bind as the plan section says.
 
 ## Build, run, test
 

@@ -13,7 +13,7 @@
     tag: "v1",
     description: [
       "Plans joint paths for one arm of the robot around what the robot's depth camera has seen, and checks joint paths from other sources the same way. It moves nothing: a caller runs a path with limb_motion's execute_joint_path.",
-      "It implements motion_planning. It keeps a voxel map of the perception camera's depth frames, the robot cut out of each frame, and plans with OMPL, each state keeping a clearance from the map and the robot's own body. It reads the arms' measured joint positions from limb_state, and the camera from camera_mounts, workspace, camera and geometry; without a camera, a plan keeps clear of the robot's own body alone.",
+      "It implements motion_planning. It keeps a voxel map of the perception camera's depth frames, the robot cut out of each frame, and plans with OMPL, each state keeping a clearance from the map and between the pairs of the robot's own links its self-collision model checks. It reads the robot's model from its initializer's robot_identity, the arms' measured joint positions from limb_state, and the camera from camera_mounts, workspace, camera and geometry; without a camera, a plan keeps clear of the robot's own body alone.",
     ],
     implements: [
       { name: "motion_planning", tag: "v1", link_id: "motion_planning" },
@@ -79,8 +79,8 @@
       def_file: "apptainer.def",
     },
     parameters: {
-      // The clearance (m) every state of a path keeps from the map and from
-      // the robot's own body: 0 or more. At or above the backbone's d_safe_m,
+      // The clearance (m) every state of a path keeps from the map and between
+      // each pair of links the self-collision model checks: 0 or more. At or above the backbone's d_safe_m,
       // so its guard does not slow the arm on a planned path.
       min_clearance_m: "f64",
       // How far (rad, or m for a prismatic joint) a start may lie outside a
