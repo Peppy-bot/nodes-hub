@@ -460,12 +460,6 @@ async fn an_unknown_model_ends_the_node_with_a_fault() -> peppygen::Result<()> {
 // robot's identity names, which the planner asked once before it served. A planner with
 // no camera linked answers it, and plans and checks around the robot's own body with
 // no map stamp.
-// describe_arms names each arm's joints in limb_state's order with the limits the
-// backbone enforces, its gripper, its links, its grasp link and the grasp frame's axes
-// where the model's fingers set them, and the body's links: those of the model the
-// robot's identity names, which the planner asked once before it served. A planner with
-// no camera linked answers it, and plans and checks around the robot's own body with
-// no map stamp.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn describe_arms_names_the_joints_limits_and_links() -> peppygen::Result<()> {
     let (harness, mocks) = start_without_camera(&arms(LEFT_READY, RIGHT_READY)).await?;
@@ -631,25 +625,34 @@ async fn a_plan_holds_the_grasp_point_free_about_its_approach_axis() -> peppygen
     harness.shutdown().await
 }
 
-/// The attempts of the plan a cancel ends: each plans and simplifies a path of its own,
-/// with motion checks a millisecond or more each, so the plan runs far past the
-/// cancel's round trip.
-const CANCEL_ATTEMPTS: u32 = 1000;
+/// The goal samples of the plan a cancel ends: each draw runs the arm's inverse
+/// kinematics, and no host draws this many within the longest time a plan may take.
+const CANCEL_GOAL_SAMPLES: u32 = u32::MAX;
 
-// A cancel of a plan that nothing else ends before it arrives, of CANCEL_ATTEMPTS
-// attempts in the longest time a plan may take, ends the goal cancelled. The stop the
-// cancel sets ends the plan itself (`node::tests::a_set_stop_ends_the_plan_stopped`).
+/// A grasp point 5 m before the robot, out of either arm's reach.
+const OUT_OF_REACH: [f64; 3] = [5.0, 0.0, 1.0];
+
+// A cancel of a plan that nothing else ends before it arrives ends the goal cancelled:
+// the plan's goal sampling draws CANCEL_GOAL_SAMPLES configurations for a grasp point out
+// of reach, none of which meets it, until its deadline, the longest a plan may take. The
+// stop the cancel sets ends the plan itself (`node::tests::a_set_stop_ends_the_plan_stopped`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cancel_ends_the_goal_cancelled() -> peppygen::Result<()> {
     let params = Parameters {
-        planning_attempts: CANCEL_ATTEMPTS,
+        goal_samples: CANCEL_GOAL_SAMPLES,
         ..parameters()
     };
     let (harness, _mocks) =
         start_without_camera_with(params, &arms(LEFT_READY, RIGHT_READY)).await?;
     let long = GoalRequestData {
         allowed_planning_time_s: MAX_PLANNING_TIME_S,
-        ..plan_to(&left_elbow(1.3))
+        goal_joint_constraints: Vec::new(),
+        goal_position_constraints: vec![GoalGoalPositionConstraintsItem {
+            link_name: "openarm_left_tcp".to_string(),
+            position: OUT_OF_REACH,
+            tolerance_m: GRASP_POSITION_M,
+        }],
+        ..plan_to(&LEFT_READY)
     };
     let handle = send_goal(&harness, &long, peppygen::DEFAULT_FEEDBACK_BOUND, TIMEOUT).await?;
     assert!(handle.accepted, "{:?}", handle.refusal);
