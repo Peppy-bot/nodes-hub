@@ -3,7 +3,9 @@
 The bimanual motion authority. One node sits between whatever leads (the
 commander panel or a leader arm rig) and the four followers (two arms, two
 grippers), and everything that reaches a follower has passed through one
-governed pipeline against one self-collision model. The same binary drives
+governed pipeline against one self-collision model, `self_collision_model`'s
+OpenArm model, which leaves out the pairs the joint limits keep apart (each upper
+arm against the torso and against its own arm's base). The same binary drives
 hardware, MuJoCo, and Isaac, because the launcher decides what pairs into
 each slot.
 
