@@ -20,6 +20,7 @@ use motion_planner::fingers::riders;
 use motion_planner::history::Arms;
 use motion_planner::robot::{Robot, RobotModel};
 use openarm_description::{ARM_DOF, ArmPair, Side, ready};
+use peppygen::Parameters;
 use peppygen::consumed_topics::camera::depth_stream::{Message as DepthFrame, MessageHeader};
 use peppygen::fixtures::exposed_services::motion_planning::check_joint_path;
 use peppygen::fixtures::harness::{Config, Harness, Mocks};
@@ -171,8 +172,17 @@ pub fn left_elbow(angle: f64) -> [f64; ARM_DOF] {
 /// positions at `arms` have arrived: a check of the left arm standing still stops being
 /// refused, and answers with no map stamp.
 pub async fn start_without_camera(arms: &Arms) -> peppygen::Result<(Harness, Mocks)> {
+    start_without_camera_with(parameters(), arms).await
+}
+
+/// `start_without_camera` with the node's parameters `params`.
+pub async fn start_without_camera_with(
+    params: Parameters,
+    arms: &Arms,
+) -> peppygen::Result<(Harness, Mocks)> {
     start_vacant(
         Config {
+            parameters: Some(params),
             camera_mounts_vacant: true,
             workspace_vacant: true,
             ..vacant_camera()

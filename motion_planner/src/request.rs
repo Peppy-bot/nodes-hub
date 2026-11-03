@@ -3,7 +3,6 @@
 //! motion_planning_core. A request that does not parse is refused with `rejected`, and
 //! the message says what to send instead.
 
-use std::num::NonZeroU64;
 use std::time::Duration;
 
 use chain_kinematics::nalgebra::{Isometry3, Quaternion, UnitQuaternion, Vector3};
@@ -12,7 +11,6 @@ use control_core::positive_finite::PositiveFinite;
 use motion_planning_core::{
     Axis, Frame, Goal, GoalError, JointTarget, OrientationTarget, PositionTarget,
 };
-use ompl_bridge::Planner;
 use openarm_description::{ARM_DOF, ArmPair, Side};
 use peppygen::exposed_actions::motion_planning::plan_joint_path::{
     GoalGoalJointConstraintsItem, GoalGoalOrientationConstraintsItem,
@@ -28,34 +26,9 @@ const UNIT_NORM_SLACK: f64 = 1e-3;
 /// The longest a plan may plan, in seconds.
 pub const MAX_PLANNING_TIME_S: f64 = 60.0;
 
-/// What a plan optimizes.
-#[derive(Debug, Clone, Copy)]
-pub enum Objective {
-    /// The first valid path found.
-    Any,
-    /// The path's joint-space length, shortened until the plan's deadline.
-    Shortest,
-}
-
-impl Objective {
-    /// The planner that plans for it: RRTConnect answers the first path it finds, and
-    /// RRT* keeps shortening its path until the plan's deadline.
-    pub fn planner(self) -> Planner {
-        match self {
-            Self::Any => Planner::RrtConnect,
-            Self::Shortest => Planner::RrtStar,
-        }
-    }
-
-    /// The iterations each attempt of a plan may take: `bound` for `Any`, and no bound for
-    /// `Shortest`, which the plan's deadline, the stop flag or a cancel ends.
-    pub fn iterations(self, bound: NonZeroU64) -> NonZeroU64 {
-        match self {
-            Self::Any => bound,
-            Self::Shortest => NonZeroU64::MAX,
-        }
-    }
-}
+/// The one objective the planner serves: the first valid path RRTConnect finds,
+/// simplified in the time left.
+pub const OBJECTIVE: &str = "any";
 
 /// A plan_joint_path goal that parses.
 #[derive(Debug)]
@@ -64,7 +37,6 @@ pub struct PlanQuery {
     /// Where the path starts; `None`: where the arm stands.
     pub start: Option<[f64; ARM_DOF]>,
     pub goal: Goal,
-    pub objective: Objective,
     /// How long the plan may take.
     pub time_limit: Duration,
 }
@@ -126,15 +98,12 @@ pub fn parse_plan(
         GoalError::Frames(..) => one_link(arm, raw),
         e => e.to_string(),
     })?;
-    let objective = match raw.objective.as_str() {
-        "any" => Objective::Any,
-        "shortest" => Objective::Shortest,
-        other => {
-            return Err(format!(
-                "objective is \"any\" or \"shortest\", not {other:?}"
-            ));
-        }
-    };
+    if raw.objective != OBJECTIVE {
+        return Err(format!(
+            "objective is {OBJECTIVE:?}, not {:?}",
+            raw.objective
+        ));
+    }
     let time = raw.allowed_planning_time_s;
     if !(time > 0.0 && time <= MAX_PLANNING_TIME_S) {
         return Err(format!(
@@ -146,7 +115,6 @@ pub fn parse_plan(
         side: arm.side,
         start,
         goal,
-        objective,
         time_limit: Duration::from_secs_f64(time),
     })
 }
@@ -472,25 +440,18 @@ mod tests {
     }
 
     // A goal for the grasp link parses into the arm's side, its start where it stands,
-    // the default time, and the objective's planner; a near-unit orientation is
-    // normalized.
+    // and its time; a near-unit orientation is normalized.
     #[test]
     fn a_goal_of_the_grasp_link_parses() {
         let query = parse(&goal()).expect("a query");
         assert_eq!(query.side, Side::Left);
         assert_eq!(query.start, None);
         assert_eq!(query.time_limit, Duration::from_secs(1));
-        assert_eq!(query.objective.planner(), Planner::RrtConnect);
-        let shortest = GoalRequestData {
-            objective: "shortest".to_string(),
+        let longer = GoalRequestData {
             allowed_planning_time_s: 2.5,
             ..goal()
         };
-        let query = parse(&shortest).expect("a query");
-        assert_eq!(query.objective.planner(), Planner::RrtStar);
-        let bound = NonZeroU64::new(20_000).expect("nonzero");
-        assert_eq!(query.objective.iterations(bound), NonZeroU64::MAX);
-        assert_eq!(Objective::Any.iterations(bound), bound);
+        let query = parse(&longer).expect("a query");
         assert_eq!(query.time_limit, Duration::from_millis(2500));
         let mut started = goal();
         started.arms[0].start_joint_positions = vec![0.1; ARM_DOF];
@@ -624,14 +585,11 @@ mod tests {
                 )
             );
         }
-        let smoothest = GoalRequestData {
-            objective: "smoothest".to_string(),
+        let shortest = GoalRequestData {
+            objective: "shortest".to_string(),
             ..goal()
         };
-        assert_eq!(
-            refusal(smoothest),
-            "objective is \"any\" or \"shortest\", not \"smoothest\""
-        );
+        assert_eq!(refusal(shortest), "objective is \"any\", not \"shortest\"");
     }
 
     fn path(waypoints: Vec<Vec<f64>>) -> check_joint_path::RequestData {

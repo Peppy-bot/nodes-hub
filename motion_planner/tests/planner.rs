@@ -3,8 +3,7 @@
 //! map is cleared; the arms' own points mark nothing while they move; a check passes a
 //! planned path and stops before a table the camera sees; a frame of an alignment the
 //! camera's geometry does not describe asks the camera again; a goal holds any link of the
-//! arm, and the grasp point free about its approach axis; the objective shortest plans a
-//! path that passes its check and is no longer than any's; a cancel ends the goal
+//! arm, and the grasp point free about its approach axis; a cancel ends the goal
 //! cancelled; every refusal comes at a goal's admission; and describe_arms names the
 //! joints, the limits limb_motion enforces, the links goals take, and the gripper's links
 //! a held object may touch.
@@ -14,7 +13,9 @@ mod common;
 use chain_kinematics::nalgebra::{Point3, Quaternion, UnitQuaternion, Vector3};
 use motion_planner::fingers::riders;
 use motion_planner::node::NO_DEPTH_FRAME;
+use motion_planner::request::{MAX_PLANNING_TIME_S, OBJECTIVE};
 use openarm_description::{ARM_DOF, HardwareVersion, Side, ready};
+use peppygen::Parameters;
 use peppygen::exposed_actions::motion_planning::plan_joint_path::{
     GoalArmsItem, GoalGoalJointConstraintsItem, GoalGoalOrientationConstraintsItem,
     GoalGoalPositionConstraintsItem,
@@ -30,8 +31,8 @@ use peppygen::fixtures::harness::{Config, Harness};
 use common::{
     LEFT_READY, OPENARM_V2, PLANNING_TIME_S, RIGHT_READY, Solid, TIMEOUT, arms, at_ms, check,
     describe_camera, facing_the_robot, left_elbow, left_path, looking_at, parameters, publish_arms,
-    render, start, start_with_camera, start_without_camera, start_without_the_rig, take_frame,
-    take_frame_aligned,
+    render, start, start_with_camera, start_without_camera, start_without_camera_with,
+    start_without_the_rig, take_frame, take_frame_aligned,
 };
 
 /// How near the forearm ends to a pose a plan holds it at: meters, and radians.
@@ -77,7 +78,7 @@ fn plan_from(start: &[f64], q: &[f64; ARM_DOF]) -> GoalRequestData {
             .collect(),
         goal_position_constraints: Vec::new(),
         goal_orientation_constraints: Vec::new(),
-        objective: "any".to_string(),
+        objective: OBJECTIVE.to_string(),
         allowed_planning_time_s: PLANNING_TIME_S,
     }
 }
@@ -599,81 +600,27 @@ async fn a_plan_holds_the_grasp_point_free_about_its_approach_axis() -> peppygen
     harness.shutdown().await
 }
 
-/// The joint-space length of a plan's path, from its start through its waypoints.
-fn joint_length(result: &ResultData) -> f64 {
-    let start: [f64; ARM_DOF] = result.arms[0]
-        .start_joint_positions
-        .as_slice()
-        .try_into()
-        .expect("a position for each joint");
-    std::iter::once(start)
-        .chain(planned_waypoints(result))
-        .collect::<Vec<_>>()
-        .windows(2)
-        .map(|run| {
-            (0..ARM_DOF)
-                .map(|j| (run[1][j] - run[0][j]).powi(2))
-                .sum::<f64>()
-                .sqrt()
-        })
-        .sum()
-}
+/// The attempts of the plan a cancel ends: each plans and simplifies a path of its own,
+/// with motion checks a millisecond or more each, so the plan runs far past the
+/// cancel's round trip.
+const CANCEL_ATTEMPTS: u32 = 1000;
 
-// The objective shortest plans with RRT* until the plan's deadline. Its path passes its
-// check whole, and is no longer than the path of `any` from the same seed but for where in
-// the goal each ends: the goal holds every joint within 0.01 of its target.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_shortest_path_passes_its_check_and_is_no_longer_than_any() -> peppygen::Result<()> {
-    let (harness, _mocks) = start_without_camera(&arms(LEFT_READY, RIGHT_READY)).await?;
-    let goal = left_elbow(1.3);
-    let any = plan(&harness, &plan_to(&goal)).await.expect("a path");
-    let shortest = plan(
-        &harness,
-        &GoalRequestData {
-            objective: "shortest".to_string(),
-            ..plan_to(&goal)
-        },
-    )
-    .await
-    .expect("a path");
-    let waypoints = planned_waypoints(&shortest);
-    let checked = check(
-        &harness,
-        &left_path(&shortest.arms[0].start_joint_positions, &waypoints),
-    )
-    .await
-    .expect("an answer");
-    assert!(
-        checked.clear && checked.clear_waypoints as usize == waypoints.len(),
-        "the shortest path: {checked:?}"
-    );
-    let goal_diameter = 2.0 * 0.01 * (ARM_DOF as f64).sqrt();
-    assert!(
-        joint_length(&shortest) <= joint_length(&any) + goal_diameter,
-        "the shortest path runs {} rad, the path of any {} rad",
-        joint_length(&shortest),
-        joint_length(&any)
-    );
-    harness.shutdown().await
-}
-
-// A cancel of a plan that nothing else ends before its time limit, shortest's, ends the
-// goal cancelled. The stop the cancel sets ends the plan itself
-// (`node::tests::a_set_stop_ends_the_plan_stopped`).
+// A cancel of a plan that nothing else ends before it arrives, of CANCEL_ATTEMPTS
+// attempts in the longest time a plan may take, ends the goal cancelled. The stop the
+// cancel sets ends the plan itself (`node::tests::a_set_stop_ends_the_plan_stopped`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cancel_ends_the_goal_cancelled() -> peppygen::Result<()> {
-    let (harness, _mocks) = start_without_camera(&arms(LEFT_READY, RIGHT_READY)).await?;
-    let shortest = GoalRequestData {
-        objective: "shortest".to_string(),
+    let params = Parameters {
+        planning_attempts: CANCEL_ATTEMPTS,
+        ..parameters()
+    };
+    let (harness, _mocks) =
+        start_without_camera_with(params, &arms(LEFT_READY, RIGHT_READY)).await?;
+    let long = GoalRequestData {
+        allowed_planning_time_s: MAX_PLANNING_TIME_S,
         ..plan_to(&left_elbow(1.3))
     };
-    let handle = send_goal(
-        &harness,
-        &shortest,
-        peppygen::DEFAULT_FEEDBACK_BOUND,
-        TIMEOUT,
-    )
-    .await?;
+    let handle = send_goal(&harness, &long, peppygen::DEFAULT_FEEDBACK_BOUND, TIMEOUT).await?;
     assert!(handle.accepted, "{:?}", handle.refusal);
     assert_eq!(handle.cancel_goal(TIMEOUT).await?, CancelState::Signalled);
     let outcome = handle.get_result(TIMEOUT).await?.outcome;

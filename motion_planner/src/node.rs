@@ -18,7 +18,7 @@ use motion_planning_core::{
     StartFault, check_arm_path, insert_cut_out, plan_arm_path, start_inside_limits,
 };
 use occupancy_map::{DistanceField, Frame, Scan, VoxelMap};
-use ompl_bridge::PLANNING_THREADS;
+use ompl_bridge::{PLANNING_THREADS, Planner};
 use openarm_description::{ARM_DOF, ArmPair, Side};
 use peppygen::consumed_services::camera::depth_stream_info;
 use peppygen::consumed_services::camera_mounts::get_camera_poses;
@@ -60,8 +60,7 @@ const HISTORY_SPAN: Duration = Duration::from_secs(2);
 const RETRY: Duration = Duration::from_secs(1);
 /// The seed of every plan, joined by the map's stamp: the same request from the same
 /// start on the same map gives the same path when no part of the plan ends at its
-/// deadline. A `shortest` plan plans until its deadline, so its path depends on how far
-/// its attempts got by then.
+/// deadline.
 const PLAN_SEED: u32 = 1;
 
 /// Why a plan or a check is refused while the camera has given the map no frame; the
@@ -1330,9 +1329,9 @@ fn plan(
                         goal: &query.goal,
                         sampler: &sampler,
                         goal_samples: config.goal_samples,
-                        planner: query.objective.planner(),
+                        planner: Planner::RrtConnect,
                         deadline: *deadline,
-                        max_iterations: query.objective.iterations(config.max_iterations),
+                        max_iterations: config.max_iterations,
                         attempts: config.planning_attempts,
                         seed: PLAN_SEED,
                         min_clearance_m: config.min_clearance_m,
@@ -1477,9 +1476,9 @@ mod tests {
         }
     }
 
-    /// A goal of `objective` for the arm on `side` of `node`, from where it stands to
-    /// every joint within 0.01 of `q`, in the longest time a plan may take.
-    fn joint_goal(node: &Node, side: Side, q: &[f64; ARM_DOF], objective: &str) -> GoalRequestData {
+    /// A goal for the arm on `side` of `node`, from where it stands to every joint within
+    /// 0.01 of `q`, in the longest time a plan may take.
+    fn joint_goal(node: &Node, side: Side, q: &[f64; ARM_DOF]) -> GoalRequestData {
         GoalRequestData {
             arms: vec![GoalArmsItem {
                 arm_name: side.arm_name().to_string(),
@@ -1498,7 +1497,7 @@ mod tests {
                 .collect(),
             goal_position_constraints: Vec::new(),
             goal_orientation_constraints: Vec::new(),
-            objective: objective.to_string(),
+            objective: crate::request::OBJECTIVE.to_string(),
             allowed_planning_time_s: crate::request::MAX_PLANNING_TIME_S,
         }
     }
@@ -1525,7 +1524,7 @@ mod tests {
             "the right elbow's bend: {checked:?}"
         );
         let taken =
-            admit(&node, &joint_goal(&node, Side::Right, &bent, "any")).expect("the goal is taken");
+            admit(&node, &joint_goal(&node, Side::Right, &bent)).expect("the goal is taken");
         let (waypoints, _) =
             plan(&node, &taken, &AtomicBool::new(false)).expect("a path of the right arm");
         assert_eq!(waypoints.first(), Some(&ready(Side::Right)));
@@ -1579,13 +1578,13 @@ mod tests {
         assert_eq!([1, 3, 4, 5, 9].map(copies), [1, 3, 4, 4, 4]);
     }
 
-    // A stop set before the plan starts ends it stopped, whatever its time: a shortest
-    // plan, which plans until its deadline, answers no path.
+    // A stop set before the plan starts ends it stopped, whatever its time: the plan
+    // answers no path.
     #[test]
     fn a_set_stop_ends_the_plan_stopped() {
         let node = started(&parameters(), false);
         measure_at(&node, SystemTime::UNIX_EPOCH, still());
-        let goal = joint_goal(&node, Side::Left, &elbow_at(Side::Left, 1.3), "shortest");
+        let goal = joint_goal(&node, Side::Left, &elbow_at(Side::Left, 1.3));
         let taken = admit(&node, &goal).expect("the goal is taken");
         assert!(matches!(
             plan(&node, &taken, &AtomicBool::new(true)),

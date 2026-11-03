@@ -153,23 +153,19 @@ model and the ones it knows. The model gives:
 - A plan runs on what its admission took: the map, the arms' measured joint
   positions and the grippers' openings, and the self-collision model at them. A frame,
   a clear or a message of limb_states after acceptance changes nothing of it.
-- `objective` picks the planner, a mapping of the node: `any` plans with RRTConnect,
-  which answers the first path it finds within `max_iterations`; `shortest` plans with
-  RRT*, which keeps shortening its path until the plan's deadline.
+- `objective` is `any`: the node plans with RRTConnect, which answers the first path it
+  finds within `max_iterations`, and simplifies it in the time left. A goal of another
+  objective is refused, the message naming `any`.
 - A plan's time follows MoveIt's allowed planning time, as `motion_planning_core`
   implements it, with no share kept for any part: the goal sampling and the attempts
   take `allowed_planning_time_s`, which a request gives above 0 and at most 60, from when
   the node takes the goal, and the simplifier what they leave. The goal sampling draws
   up to `goal_samples` configurations, ending early at the deadline; the attempts plan
   in all the time left, each under the whole of it; the simplifier takes at most 1000
-  iterations and starts no pass past the deadline. So a `shortest` plan, whose RRT*
-  attempts plan until the deadline, answers its path unsimplified. The check of the
-  rounded path runs to its end after the deadline, so a plan answers after its deadline
-  by the time that check takes: at 1 attempt, on 1.5 CPUs of an amd64 host, RRT* plans
-  at a 1 s deadline answered at most 25.0 ms after it at a clearance of 0, and 14.6 ms
-  after it at 0.02 m (`motion_planning_core`'s README, The plan and its path). With more
-  than 1 attempt, the hybrid of the attempts' paths and its checks also run after the
-  deadline.
+  iterations and starts no pass past the deadline. The check of the rounded path runs to
+  its end after the deadline, so a plan answers after its deadline by the time that check
+  takes. With more than 1 attempt, the hybrid of the attempts' paths and its checks also
+  run after the deadline.
 - The planner makes `planning_attempts` attempts, each from its own seed: four at once,
   MoveIt's default `max_planning_threads`, and each further four once the four before
   them have ended, while the time lasts; a single attempt plans on the plan's own
@@ -180,9 +176,8 @@ model and the ones it knows. The model gives:
   `ompl_bridge::PLANNING_THREADS` (4), and each check of the robot's own body runs on a
   copy no other check holds.
 - A plan is seeded from the map's stamp, so the same request from the same start on
-  the same map gives the same path when no part of the plan ends at its deadline, as
-  an `any` plan that finds its path in its time. A `shortest` plan plans until its
-  deadline, so its path depends on how far its attempts got by then.
+  the same map gives the same path when no part of the plan ends at its deadline, as a
+  plan that finds its path in its time.
 - A cancel stops the plan at any part of it, and the goal ends cancelled, whatever the
   plan answers after it.
 
