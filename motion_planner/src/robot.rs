@@ -46,7 +46,7 @@ impl fmt::Display for Robot {
     }
 }
 
-/// A robot_identity robot that names no robot the planner plans for.
+/// A model name, as robot_identity gives it, of no robot the planner plans for.
 #[derive(Debug, PartialEq, thiserror::Error)]
 #[error("no robot is named {name:?}; the robots are {}", robot_names())]
 pub struct UnknownRobot {
@@ -241,9 +241,10 @@ pub(crate) mod tests {
     pub(crate) static OPENARM_V2: LazyLock<RobotModel> =
         LazyLock::new(|| Robot::OpenArmV2.model().expect("OpenArm v2's model"));
 
-    // The parameter names each robot, and a name of none is refused with the names.
+    // Each robot parses from the model name robot_identity gives it, and a name of none
+    // is refused with the names.
     #[test]
-    fn the_robot_parameter_names_a_robot() {
+    fn a_model_name_names_a_robot() {
         assert_eq!("openarm_v2".parse(), Ok(Robot::OpenArmV2));
         assert_eq!(
             "openarm_v1".parse::<Robot>().unwrap_err().to_string(),

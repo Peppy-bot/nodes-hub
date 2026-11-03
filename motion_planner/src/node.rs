@@ -4,7 +4,7 @@
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use camera_core::encoding::DEPTH_ENCODING;
@@ -246,31 +246,54 @@ fn set_openings(model: &mut SelfCollisionModel, measured: &Measured) {
     );
 }
 
+/// The fault that ends the node after its setup: a model the robot's identity names that
+/// the planner holds no model of, or a model that fails to start. The first raise shuts
+/// the node down, and `main` exits with the fault as its error.
+#[derive(Clone, Debug, Default)]
+pub struct Fault(Arc<OnceLock<String>>);
+
+impl Fault {
+    /// Records `message`, unless a fault came first, and shuts the node down.
+    fn raise(&self, runner: &NodeRunner, message: &str) {
+        error!("{message}");
+        let _ = self.0.set(message.to_owned());
+        runner.cancellation_token().cancel();
+    }
+
+    /// The end of the node: the error of its fault, if one was raised.
+    pub fn end(&self) -> Result<()> {
+        self.0.get().map_or(Ok(()), |message| {
+            Err(peppygen::Error::Node(
+                std::io::Error::other(message.clone()).into(),
+            ))
+        })
+    }
+}
+
 /// Starts the node: its parameters parsed, then, once the robot's identity names its
 /// model, its state, the followers and the servers, each on its own task. The
 /// initializer that serves the identity may start after this node.
-pub async fn setup(params: Parameters, runner: Arc<NodeRunner>) -> Result<()> {
+pub async fn setup(params: Parameters, runner: Arc<NodeRunner>, fault: Fault) -> Result<()> {
     let config = Config::parse(&params).map_err(|e| peppygen::Error::Node(e.into()))?;
-    tokio::spawn(serve_once_identified(runner, config));
+    tokio::spawn(serve_once_identified(runner, config, fault));
     Ok(())
 }
 
 /// Asks the robot's identity until it names the model, then starts the node for it. A
-/// model the planner holds no model of ends the node's start: it serves nothing, and
-/// the log names the model and the ones it plans for.
-async fn serve_once_identified(runner: Arc<NodeRunner>, config: Config) {
+/// model the planner holds no model of, or one that fails to start, raises `fault`.
+async fn serve_once_identified(runner: Arc<NodeRunner>, config: Config, fault: Fault) {
     let Some(model) = identify(&runner).await else {
         return;
     };
     let robot: Robot = match model.parse() {
         Ok(robot) => robot,
-        Err(e) => return error!("robot_identity names the model {model:?}: {e}"),
+        Err(e) => return fault.raise(&runner, &format!("robot_identity: {e}")),
     };
     let slots = camera_slots(&runner);
     let linked = !matches!(slots, CameraSlots::Vacant);
     let node = match start(config, robot, linked) {
         Ok(node) => Arc::new(node),
-        Err(e) => return error!("motion planner for {robot}: {e}"),
+        Err(e) => return fault.raise(&runner, &format!("the motion planner for {robot}: {e}")),
     };
     tokio::spawn(follow_limb_states(runner.clone(), node.clone()));
     match slots {
@@ -289,8 +312,8 @@ async fn serve_once_identified(runner: Arc<NodeRunner>, config: Config) {
     tokio::spawn(serve_plans(runner, node));
 }
 
-/// The model the robot's identity names, asked again each `RETRY` until it answers, or
-/// none once the node is cancelled.
+/// The model the robot's identity names, or none once the node is cancelled: each ask
+/// waits up to `SERVICE_TIMEOUT` for the answer, and the next follows `RETRY` after.
 async fn identify(runner: &NodeRunner) -> Option<String> {
     let token = runner.cancellation_token().clone();
     let passing = LatchedLog::warn("robot_identity");

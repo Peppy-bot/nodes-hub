@@ -31,8 +31,8 @@ use peppygen::fixtures::harness::{Config, Harness};
 use common::{
     LEFT_READY, OPENARM_V2, PLANNING_TIME_S, RIGHT_READY, Solid, TIMEOUT, arms, at_ms, check,
     describe_camera, facing_the_robot, left_elbow, left_path, looking_at, parameters, publish_arms,
-    render, start, start_with_camera, start_without_camera, start_without_camera_with,
-    start_without_the_rig, take_frame, take_frame_aligned,
+    render, start, start_identified_as, start_with_camera, start_without_camera,
+    start_without_camera_with, start_without_the_rig, take_frame, take_frame_aligned,
 };
 
 /// How near the forearm ends to a pose a plan holds it at: meters, and radians.
@@ -429,6 +429,37 @@ fn grasp_axes(side: Side) -> (Vector3<f64>, Vector3<f64>) {
     (-((a + b) / 2.0).normalize(), (b - a).normalize())
 }
 
+// A robot whose identity names a model the planner holds no model of ends the node with
+// a fault that names the model and the ones it plans for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unknown_model_ends_the_node_with_a_fault() -> peppygen::Result<()> {
+    let config = Config {
+        parameters: Some(parameters()),
+        ..Config::default()
+    };
+    let (harness, _mocks, fault) = start_identified_as(config, "openarm_v1").await?;
+    tokio::time::timeout(
+        TIMEOUT,
+        harness.node_runner().cancellation_token().cancelled(),
+    )
+    .await
+    .expect("the fault shuts the node down");
+    let fault = fault.end().expect_err("the node ends with a fault");
+    assert!(
+        fault
+            .to_string()
+            .contains("no robot is named \"openarm_v1\"; the robots are \"openarm_v2\""),
+        "{fault}"
+    );
+    harness.shutdown().await
+}
+
+// describe_arms names each arm's joints in limb_state's order with the limits the
+// backbone enforces, its gripper, its links, its grasp link and the grasp frame's axes
+// where the model's fingers set them, and the body's links: those of the model the
+// robot's identity names, which the planner asked once before it served. A planner with
+// no camera linked answers it, and plans and checks around the robot's own body with
+// no map stamp.
 // describe_arms names each arm's joints in limb_state's order with the limits the
 // backbone enforces, its gripper, its links, its grasp link and the grasp frame's axes
 // where the model's fingers set them, and the body's links: those of the model the

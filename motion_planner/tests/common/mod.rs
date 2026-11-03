@@ -18,6 +18,7 @@ use chain_kinematics::nalgebra::{
 use collision_geometry::chain::{BodyMask, Padding, PlacedMask};
 use motion_planner::fingers::riders;
 use motion_planner::history::Arms;
+use motion_planner::node::Fault;
 use motion_planner::robot::{Robot, RobotModel};
 use openarm_description::{ARM_DOF, ArmPair, Side, ready};
 use peppygen::Parameters;
@@ -211,15 +212,36 @@ fn vacant_camera() -> Config {
 /// The node over the harness as `config` binds it, its robot's identity answering that
 /// it is an OpenArm v2.
 pub async fn start(config: Config) -> peppygen::Result<(Harness, Mocks)> {
-    let (harness, mocks) = Harness::start_with(config, motion_planner::node::setup).await?;
-    mocks.deps.identity.get_identity.enqueue_response(
-        identity::get_identity::ResponseData::new(
-            "alpha".to_string(),
-            Robot::OpenArmV2.to_string(),
-            "harness".to_string(),
-        ),
-    )?;
+    let (harness, mocks, _) = start_identified_as(config, &Robot::OpenArmV2.to_string()).await?;
     Ok((harness, mocks))
+}
+
+/// The node over the harness as `config` binds it, its robot's identity answering the
+/// node's first ask that it is `model`, and the fault that ends the node.
+pub async fn start_identified_as(
+    config: Config,
+    model: &str,
+) -> peppygen::Result<(Harness, Mocks, Fault)> {
+    let fault = Fault::default();
+    let raised = fault.clone();
+    let (harness, mocks) = Harness::start_with(config, move |params, runner| {
+        motion_planner::node::setup(params, runner, raised)
+    })
+    .await?;
+    let responder = mocks
+        .deps
+        .identity
+        .get_identity
+        .next_request(TIMEOUT)
+        .await?;
+    responder
+        .respond(identity::get_identity::ResponseData::new(
+            "alpha".to_string(),
+            model.to_string(),
+            "harness".to_string(),
+        ))
+        .await?;
+    Ok((harness, mocks, fault))
 }
 
 /// The node over the harness as `config` binds it, with no camera to read, once the arms'
