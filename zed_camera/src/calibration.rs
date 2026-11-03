@@ -47,29 +47,45 @@ fn fetch_conf_from(host: &str, serial: i32) -> Result<String, String> {
         .map_err(|e| format!("read calibration body for serial {serial}: {e}"))
 }
 
-/// One eye's pinhole intrinsics and OpenCV distortion (k1, k2, p1, p2, k3);
-/// the ZED conf carries no tangential terms, so p1/p2 stay zero.
+/// One eye's pinhole intrinsics.
 #[derive(Debug)]
 pub struct CamConf {
     pub fx: f64,
     pub fy: f64,
     pub cx: f64,
     pub cy: f64,
-    pub k1: f64,
-    pub k2: f64,
-    pub k3: f64,
-    pub p1: f64,
-    pub p2: f64,
+}
+
+/// Both eyes' lens distortion under the one model the conf writes for the
+/// pair, each eye's coefficients in OpenCV's order. A coefficient the conf
+/// leaves out is zero.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Lenses {
+    /// OpenCV's 5-term radial-tangential model, (k1, k2, p1, p2, k3): the
+    /// conf writes no k4.
+    RadialTangential { left: [f64; 5], right: [f64; 5] },
+    /// OpenCV's equidistant fisheye model, (k1, k2, k3, k4): the conf writes
+    /// k4 and no tangential term.
+    Fisheye { left: [f64; 4], right: [f64; 4] },
+}
+
+/// One eye's distortion as its section writes it, before the pair is
+/// checked for one model.
+enum Distortion {
+    RadialTangential([f64; 5]),
+    Fisheye([f64; 4]),
 }
 
 /// Stereo geometry for one resolution, read exactly as the Stereolabs
-/// rectification recipe reads it: per-eye intrinsics, the baseline, the
-/// resolution-suffixed translation offsets (absent in shipping confs, hence
-/// zero), and the (rx, cv, rz) inter-eye rotation vector.
+/// rectification recipe reads it: per-eye intrinsics, the lenses'
+/// distortion, the baseline, the resolution-suffixed translation offsets
+/// (absent in shipping confs, hence zero), and the (rx, cv, rz) inter-eye
+/// rotation vector.
 #[derive(Debug)]
 pub struct StereoConf {
     pub left: CamConf,
     pub right: CamConf,
+    pub lenses: Lenses,
     pub baseline: f64,
     pub ty: f64,
     pub tz: f64,
@@ -91,30 +107,65 @@ impl StereoConf {
                 v => Ok(v.copied()),
             }
         };
-        let cam = |side: &str| -> Result<CamConf, String> {
+        let cam = |side: &str| -> Result<(CamConf, Distortion), String> {
             let section = format!("{side}_cam_{res}");
             let required = |key: &str| -> Result<f64, String> {
                 get(&section, key)?.ok_or_else(|| format!("[{section}] missing {key}"))
             };
             let optional =
                 |key: &str| -> Result<f64, String> { Ok(get(&section, key)?.unwrap_or(0.0)) };
-            Ok(CamConf {
+            let written = |key: &str| -> Result<bool, String> { Ok(get(&section, key)?.is_some()) };
+            let tangential = written("p1")? || written("p2")?;
+            if written("k5")? || written("k6")? || (written("k4")? && tangential) {
+                return Err(format!(
+                    "[{section}] writes a rational lens model (k5 or k6, or k4 with p1 or p2); \
+                     this node rectifies the radial-tangential and the fisheye models"
+                ));
+            }
+            let distortion = if written("k4")? {
+                Distortion::Fisheye([
+                    optional("k1")?,
+                    optional("k2")?,
+                    optional("k3")?,
+                    optional("k4")?,
+                ])
+            } else {
+                Distortion::RadialTangential([
+                    optional("k1")?,
+                    optional("k2")?,
+                    optional("p1")?,
+                    optional("p2")?,
+                    optional("k3")?,
+                ])
+            };
+            let intrinsics = CamConf {
                 fx: required("fx")?,
                 fy: required("fy")?,
                 cx: required("cx")?,
                 cy: required("cy")?,
-                k1: optional("k1")?,
-                k2: optional("k2")?,
-                k3: optional("k3")?,
-                p1: optional("p1")?,
-                p2: optional("p2")?,
-            })
+            };
+            Ok((intrinsics, distortion))
         };
         let stereo_required = |key: String| -> Result<f64, String> {
             get("stereo", &key)?.ok_or_else(|| format!("[STEREO] missing {key}"))
         };
-        let left = cam("left")?;
-        let right = cam("right")?;
+        let (left, left_distortion) = cam("left")?;
+        let (right, right_distortion) = cam("right")?;
+        let lenses = match (left_distortion, right_distortion) {
+            (Distortion::RadialTangential(left), Distortion::RadialTangential(right)) => {
+                Lenses::RadialTangential { left, right }
+            }
+            (Distortion::Fisheye(left), Distortion::Fisheye(right)) => {
+                Lenses::Fisheye { left, right }
+            }
+            _ => {
+                return Err(format!(
+                    "[LEFT_CAM_{0}] and [RIGHT_CAM_{0}] write different lens models (k4 in one \
+                     only); a stereo pair rectifies under one",
+                    resolution.conf_key()
+                ));
+            }
+        };
         let baseline = stereo_required("baseline".to_string())?;
         if baseline <= 0.0 {
             return Err(format!(
@@ -124,6 +175,7 @@ impl StereoConf {
         Ok(Self {
             left,
             right,
+            lenses,
             baseline,
             // Suffixed translation offsets are absent in shipping confs and
             // default to zero, exactly as the reference recipe reads them.
@@ -269,21 +321,74 @@ mod tests {
         }
     }
 
+    /// The HD sections and the stereo block of the ZED Mini SN 10383163's
+    /// factory calibration: each eye writes k1 to k4 and no tangential term.
+    const FISHEYE_HD: &str = "[LEFT_CAM_HD]\nfx=772.22\nfy=772.19\ncx=636.985\ncy=361.008\n\
+        k1=-0.029395\nk2=-0.00488804\nk3=0.0369709\nk4=-0.0227607\n\
+        [RIGHT_CAM_HD]\nfx=770.885\nfy=770.635\ncx=644.655\ncy=345.6635\n\
+        k1=-0.0325864\nk2=0.0139434\nk3=-0.00241467\nk4=0.00409011\n\
+        [STEREO]\nBaseline=62.902\nTY=0.0623366\nTZ=-0.000617955\n\
+        RX_HD=-0.00230597\nCV_HD=0.0046253\nRZ_HD=-0.000490389\n";
+
     #[test]
     fn parses_resolution_block_and_zeroes_absent_keys() {
-        let conf = "[LEFT_CAM_HD]\nfx=772.22\nfy=772.19\ncx=636.985\ncy=361.008\n\
-                    k1=-0.03\nk2=-0.004\nk3=0.037\nk4=-0.02\n\
-                    [RIGHT_CAM_HD]\nfx=770.8\nfy=770.6\ncx=644.6\ncy=345.6\nk1=-0.03\nk2=-0.004\nk3=0.02\n\
-                    [STEREO]\nBaseline=62.902\nTY=0.062\nTZ=-0.0006\nRX_HD=-0.0023\nCV_HD=0.0046\nRZ_HD=-0.0005\n";
-        let s = StereoConf::from_conf_str(conf, Resolution::Hd720).unwrap();
+        let s = StereoConf::from_conf_str(FISHEYE_HD, Resolution::Hd720).unwrap();
         assert_eq!(s.left.fx, 772.22);
         assert_eq!(s.left.cx, 636.985);
         assert_eq!(s.baseline, 62.902);
-        // p1/p2 absent -> zero; k4 is ignored by the 5-term model.
-        assert_eq!((s.left.p1, s.left.p2), (0.0, 0.0));
         // Rotation is per-resolution; translation suffix is absent -> zero,
         // matching the reference recipe (bare TY/TZ are not read).
-        assert_eq!(s.rx, -0.0023);
+        assert_eq!(s.rx, -0.00230597);
         assert_eq!((s.ty, s.tz), (0.0, 0.0));
+    }
+
+    #[test]
+    fn k4_without_a_tangential_term_is_the_fisheye_model() {
+        let s = StereoConf::from_conf_str(FISHEYE_HD, Resolution::Hd720).unwrap();
+        assert_eq!(
+            s.lenses,
+            Lenses::Fisheye {
+                left: [-0.029395, -0.00488804, 0.0369709, -0.0227607],
+                right: [-0.0325864, 0.0139434, -0.00241467, 0.00409011],
+            }
+        );
+    }
+
+    #[test]
+    fn no_k4_is_the_radial_tangential_model_in_opencv_order() {
+        let conf = "[LEFT_CAM_HD]\nfx=700\nfy=700\ncx=640\ncy=360\nk1=-0.17\nk2=0.02\np1=0.001\np2=-0.002\nk3=0.003\n\
+                    [RIGHT_CAM_HD]\nfx=700\nfy=700\ncx=640\ncy=360\nk1=-0.16\n\
+                    [STEREO]\nBaseline=120\nRX_HD=0\nCV_HD=0\nRZ_HD=0\n";
+        let s = StereoConf::from_conf_str(conf, Resolution::Hd720).unwrap();
+        assert_eq!(
+            s.lenses,
+            Lenses::RadialTangential {
+                left: [-0.17, 0.02, 0.001, -0.002, 0.003],
+                right: [-0.16, 0.0, 0.0, 0.0, 0.0],
+            }
+        );
+    }
+
+    #[test]
+    fn refuses_a_rational_model_and_a_pair_of_two_models() {
+        let cases = [
+            (
+                "k4=-0.0227607\n",
+                "k4=-0.0227607\np1=0.001\n",
+                "writes a rational lens model",
+            ),
+            (
+                "k4=-0.0227607\n",
+                "k4=-0.0227607\nk5=0.01\n",
+                "writes a rational lens model",
+            ),
+            ("k4=0.00409011\n", "", "write different lens models"),
+        ];
+        for (valid, broken, expected_error) in cases {
+            let poisoned = FISHEYE_HD.replacen(valid, broken, 1);
+            assert_ne!(poisoned, FISHEYE_HD, "{valid:?} is not in the conf");
+            let err = StereoConf::from_conf_str(&poisoned, Resolution::Hd720).unwrap_err();
+            assert!(err.contains(expected_error), "got: {err}");
+        }
     }
 }
