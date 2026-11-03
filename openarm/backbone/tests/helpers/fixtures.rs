@@ -4,7 +4,6 @@
 use std::time::{Duration, Instant};
 
 use control_core::servo::{ORIENTATION_TOLERANCE_RAD, POSITION_TOLERANCE_M};
-use openarm_backbone::arm_model;
 use openarm_description::{ARM_DOF, HardwareVersion, Side};
 use srs_model::chain_kinematics::{
     EeCaps, JointSmoothing, LEASH_M, MAX_SERVO_S, ServoState, ServoTolerances, ServoTrajectory,
@@ -54,15 +53,21 @@ pub fn panel_tolerance() -> ServoTolerances {
 }
 
 pub fn v2_right_arm() -> Arm {
-    arm_model(HardwareVersion::V2, Side::Right).expect("bundled v2 URDF builds")
+    HardwareVersion::V2
+        .arm_model(Side::Right)
+        .expect("bundled v2 URDF builds")
 }
 
 pub fn v2_left_arm() -> Arm {
-    arm_model(HardwareVersion::V2, Side::Left).expect("bundled v2 URDF builds")
+    HardwareVersion::V2
+        .arm_model(Side::Left)
+        .expect("bundled v2 URDF builds")
 }
 
 pub fn v1_left_arm() -> Arm {
-    arm_model(HardwareVersion::V1, Side::Left).expect("bundled v1 URDF builds")
+    HardwareVersion::V1
+        .arm_model(Side::Left)
+        .expect("bundled v1 URDF builds")
 }
 
 fn world_pose(position: [f64; 3], quat_xyzw: [f64; 4]) -> Isometry3<f64> {

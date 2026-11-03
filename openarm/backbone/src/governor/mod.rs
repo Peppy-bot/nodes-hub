@@ -43,7 +43,7 @@
 
 use control_core::positive_finite::PositiveFinite;
 use openarm_description::{ARM_DOF, ArmPair, HardwareVersion, Side};
-use self_collision_model::{DistanceGradient, SelfCollisionModel};
+use self_collision_model::DistanceGradient;
 use srs_model::{Jacobian, JointVec};
 use tracing::{info, warn};
 
@@ -311,7 +311,7 @@ impl Governor {
         if !valid_gripper_rate(max_gripper_rate_frac_s) {
             return Err(GovernorError::GripperRate(max_gripper_rate_frac_s));
         }
-        let model = ConfiguredModel::new(build_collision_model(version, meshes_dir)?);
+        let model = ConfiguredModel::new(self_collision_model::openarm(version, meshes_dir)?);
         Ok(Self {
             model,
             d_stop,
@@ -618,20 +618,6 @@ impl Governor {
         }
         self.guard = next;
     }
-}
-
-/// Build the self-collision model of `version` with its tight torso proxy, from the
-/// embedded URDF, its materialized meshes, and the base link of each arm.
-fn build_collision_model(
-    version: HardwareVersion,
-    meshes_dir: &str,
-) -> Result<SelfCollisionModel, GovernorError> {
-    let bases = ArmPair::from_fn(|side| version.base_link(side));
-    Ok(
-        SelfCollisionModel::builder(version.urdf(), meshes_dir, bases.left, bases.right)
-            .regions(version.torso_body(), version.torso_regions())
-            .build()?,
-    )
 }
 
 /// A valid band requires finite `0 < d_stop < d_safe` (the ramp denominator

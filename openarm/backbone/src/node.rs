@@ -184,23 +184,6 @@ fn joint_caps(
     Ok(caps)
 }
 
-/// Build one side's arm model from the embedded OpenArm description: the elbow
-/// singularity margin applied, and the URDF's tcp frame mounted so every pose the
-/// backbone solves, reports, or caps the speed of is at the gripper's grasp point.
-/// This is the single site the backbone imposes either, so the model's `limits()`
-/// carry the margin for IK seeding, trajectory sizing and the chase clamp.
-pub fn arm_model(
-    version: HardwareVersion,
-    side: openarm_description::Side,
-) -> std::result::Result<srs_model::Arm, srs_model::SrsError> {
-    srs_model::Arm::from_urdf(version.urdf(), version.base_link(side))?
-        .with_lower_floor(
-            version.elbow_joint_index(),
-            version.elbow_singularity_floor_rad(),
-        )
-        .with_tool_link(version.tcp_link(side))
-}
-
 /// The node's whole runtime, in the exact shape `NodeBuilder::run` (and the
 /// test harness) take: validate the parameters, build the models and the
 /// governor, wire the channels, and spawn the limb-name responder plus the
@@ -294,14 +277,18 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     let upstream_mode: UpstreamMode = params.upstream_mode.parse::<UpstreamMode>()?;
     info!("following upstream {upstream_mode} commands");
 
-    // Two arm models (FK/IK/Jacobian/limits, with the elbow singularity margin)
-    // and the self-collision model, all from the embedded OpenArm description.
-    // The per-side chain base and tcp links are facts of the generation's URDF,
-    // resolved from the description rather than configured, so a v2 launch cannot
-    // inherit a v1 name. The collision model walks the same chains from the same
-    // base links.
+    // Two arm models (FK/IK/Jacobian/limits) and the self-collision model, all from
+    // the embedded OpenArm description. Each arm model (`HardwareVersion::arm_model`)
+    // carries the elbow singularity margin in its `limits()`, for IK seeding,
+    // trajectory sizing and the chase clamp, and its tool at the gripper's grasp
+    // point, where every pose the backbone solves, reports, or caps the speed of lies.
+    // The per-side chain base and tcp links are facts of the generation's URDF, which
+    // the description resolves for the launch's hardware version. The collision model
+    // walks the same chains from the same base links.
     let build_arm = |side: Side| {
-        arm_model(hardware_version, side).map_err(|source| NodeError::ArmModel { side, source })
+        hardware_version
+            .arm_model(side)
+            .map_err(|source| NodeError::ArmModel { side, source })
     };
     let build_arms = || ArmPair::from_fn(&build_arm).transpose();
     let models = build_arms()?;

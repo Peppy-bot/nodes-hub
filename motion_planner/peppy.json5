@@ -1,0 +1,123 @@
+// motion_planner: plans joint paths for one arm of the robot its initializer's
+// robot_identity names, around what the robot's perception camera sees. It keeps a
+// voxel map of the camera's depth frames in the robot frame, the robot's own
+// body cut out at each frame's joint positions, and plans with OMPL, keeping a
+// clearance from the map and from the robot's own body, every other joint held
+// where it stands. It checks joint paths from other sources the same way, and
+// describes the arms by the names its goals take. It moves nothing: a caller
+// runs a path with limb_motion's execute_joint_path. See README.md.
+{
+  peppy_schema: "node/v1",
+  manifest: {
+    name: "motion_planner",
+    tag: "v1",
+    description: [
+      "Plans joint paths for one arm of the robot around what the robot's depth camera has seen, and checks joint paths from other sources the same way. It moves nothing: a caller runs a path with limb_motion's execute_joint_path.",
+      "It implements motion_planning. It keeps a voxel map of the perception camera's depth frames, the robot cut out of each frame, and plans with OMPL, each state keeping a clearance from the map and between the pairs of the robot's own links its self-collision model checks. It reads the robot's model from its initializer's robot_identity, the arms' measured joint positions from limb_state, and the camera from camera_mounts, workspace, camera and geometry; without a camera, a plan keeps clear of the robot's own body alone.",
+    ],
+    implements: [
+      { name: "motion_planning", tag: "v1", link_id: "motion_planning" },
+    ],
+    depends_on: {
+      contracts: [
+        // Who the robot is: its model gives the arms' chains and joint
+        // limits, their grasp and gripper links, the body, and the
+        // self-collision model. The planner serves once it has answered.
+        { name: "robot_identity", tag: "v1", link_id: "identity" },
+        // The measured joint positions of the arms and the grippers'
+        // openings: a plan starts from them and holds every joint it does not
+        // plan, and the map cuts the robot out of each depth frame at the
+        // positions it stood at when the frame was taken.
+        { name: "limb_state", tag: "v1", link_id: "limb_state" },
+        // The perception camera: where the robot's design carries it
+        // (camera_mounts), which camera it is (workspace), its depth frames
+        // (camera) and its geometry (geometry). With camera and geometry
+        // bound, the map reads the camera, and camera_mounts and workspace
+        // are bound too. With camera and geometry vacant, the map stays empty
+        // and plans and checks keep the clearance from the robot's own body
+        // alone, whether camera_mounts and workspace are bound or not, as on
+        // a robot without a camera rig. Any other binding refuses every plan
+        // and check, the message naming the slots to bind or leave vacant.
+        { name: "camera_mounts", tag: "v1", link_id: "camera_mounts", cardinality: "zero_or_one" },
+        { name: "workspace", tag: "v1", link_id: "workspace", cardinality: "zero_or_one" },
+        { name: "rgbd_camera", tag: "v1", link_id: "camera", cardinality: "zero_or_one" },
+        { name: "camera_geometry", tag: "v1", link_id: "geometry", cardinality: "zero_or_one" },
+      ],
+    },
+  },
+  interfaces: {
+    actions: {
+      exposes: [
+        { link_id: "motion_planning", name: "plan_joint_path" },
+      ],
+    },
+    services: {
+      exposes: [
+        { link_id: "motion_planning", name: "check_joint_path" },
+        { link_id: "motion_planning", name: "describe_arms" },
+        { link_id: "motion_planning", name: "clear_occupancy_map" },
+      ],
+      consumes: [
+        { link_id: "identity", name: "get_identity" },
+        { link_id: "camera_mounts", name: "get_camera_poses" },
+        { link_id: "workspace", name: "describe_workspace" },
+        { link_id: "geometry", name: "get_depth_intrinsics" },
+        { link_id: "geometry", name: "get_depth_to_color_extrinsics" },
+        { link_id: "camera", name: "depth_stream_info" },
+      ],
+    },
+    topics: {
+      consumes: [
+        { link_id: "limb_state", name: "limb_states" },
+        { link_id: "camera", name: "depth_stream" },
+      ],
+    },
+  },
+  execution: {
+    language: "rust",
+    container: {
+      def_file: "apptainer.def",
+    },
+    parameters: {
+      // The clearance (m) every state of a path keeps from the map and between
+      // each pair of links the self-collision model checks: 0 or more. At or above the backbone's d_safe_m,
+      // so its guard does not slow the arm on a planned path.
+      min_clearance_m: "f64",
+      // How far (rad, or m for a prismatic joint) a start may lie outside a
+      // joint limit and still be moved onto it: above 0.
+      start_tolerance_rad: "f64",
+      // How the map cuts the robot out of a depth frame: each collision piece
+      // grown to padding_scale (above 0), a mesh's about the mean of its
+      // vertices and a box, a cylinder or a sphere about its origin, and
+      // holding every point within padding_offset_m (m, 0 or more) of the
+      // scaled piece.
+      padding_scale: "f64",
+      padding_offset_m: "f64",
+      // The edge of a voxel (m): above 0.
+      voxel_size_m: "f64",
+      // The box of the robot frame the map holds (m): its lowest and its
+      // highest corner, each minimum below its maximum.
+      map_min_x_m: "f64",
+      map_min_y_m: "f64",
+      map_min_z_m: "f64",
+      map_max_x_m: "f64",
+      map_max_y_m: "f64",
+      map_max_z_m: "f64",
+      // How far (m) the camera reads: a depth beyond it clears its ray up to
+      // it and marks nothing. Above 0.
+      max_range_m: "f64",
+      // The most depth frames a second the map takes in: above 0.
+      max_update_rate_hz: "f64",
+      // The configurations the goal sampler draws for a goal: 1 or more.
+      goal_samples: "u32",
+      // The iterations each attempt of a plan may take, besides its time
+      // limit: 1 or more.
+      max_iterations: "u64",
+      // The attempts of each plan, 1 or more, each from its own seed, four at
+      // once and each further four once the four before them have ended; the
+      // paths they find join into their hybrid, as MoveIt joins the attempts
+      // of a request whose num_planning_attempts is above 1.
+      planning_attempts: "u32",
+    },
+  },
+}

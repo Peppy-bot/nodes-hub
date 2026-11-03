@@ -141,7 +141,7 @@ impl PerceptionCamera {
 }
 
 /// The pose the grasp point takes to reach `target` in `orientation`, in the
-/// robot frame. The tool frame `arm_model` mounts is the grasp frame of
+/// robot frame. The tool frame `HardwareVersion::arm_model` mounts is the grasp frame of
 /// `workspace_core`: +Z the approach out of the gripper, +Y the jaw closing
 /// axis.
 fn grasp_pose(orientation: GraspOrientation, target: [f64; 3]) -> Isometry3<f64> {
@@ -168,7 +168,7 @@ pub struct Workspace {
 
 impl Workspace {
     /// The workspace of the robot whose arms are `arms`, built by
-    /// `arm_model`, and whose cameras are `mounts`. A design with more than
+    /// `HardwareVersion::arm_model`, and whose cameras are `mounts`. A design with more than
     /// one camera that could be its perception camera is refused.
     pub fn new(arms: ArmPair<Arm>, mounts: &CameraMounts) -> Result<Self, PerceptionCameraError> {
         Ok(Self {

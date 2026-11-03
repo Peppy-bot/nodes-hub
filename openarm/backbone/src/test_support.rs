@@ -38,10 +38,12 @@ const A_MAX: JointVec = [5.0; ARM_DOF];
 /// The control period of the test planners.
 const TEST_PERIOD: Duration = Duration::from_millis(10);
 
-/// The `side` arm of `version`, built by `arm_model` from the bundled
+/// The `side` arm of `version`, built by `HardwareVersion::arm_model` from the bundled
 /// description.
 pub(crate) fn bundled_arm(version: HardwareVersion, side: Side) -> Arm {
-    crate::arm_model(version, side).expect("build the arm from the bundled URDF")
+    version
+        .arm_model(side)
+        .expect("build the arm from the bundled URDF")
 }
 
 /// The planner config of the tests: a 10 ms period, 10 rad/s on every

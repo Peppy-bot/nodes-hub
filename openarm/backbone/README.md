@@ -3,7 +3,9 @@
 The bimanual motion authority. One node sits between whatever leads (the
 commander panel or a leader arm rig) and the four followers (two arms, two
 grippers), and everything that reaches a follower has passed through one
-governed pipeline against one self-collision model. The same binary drives
+governed pipeline against one self-collision model, `self_collision_model`'s
+OpenArm model, which leaves out the pairs the joint limits keep apart (each upper
+arm against the torso and against its own arm's base). The same binary drives
 hardware, MuJoCo, and Isaac, because the launcher decides what pairs into
 each slot.
 
@@ -169,7 +171,7 @@ is the root link of the URDF: the bottom of the pedestal's base plate on the
 column axis, `+x` to the robot's front, `+y` to its left, `+z` up. It is the
 gripper's **grasp point** (midway between the pads on the jaw closing axis,
 `+z` out of the gripper), not the wrist flange they mount on:
-`openarm_description` carries the offset per generation and `arm_model` builds
+`openarm_description` carries the offset per generation and its `arm_model` builds
 the model with it, so the pose solved for, the pose reported, and the point the
 EE speed cap applies to are one frame. One move per side at a time (a
 single-flight move slot whose release rides a drop guard, held by the move,

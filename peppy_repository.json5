@@ -31,6 +31,11 @@
         path: "lerobot_recorder/peppy.json5"
       }
     },
+    motion_planner: {
+      v1: {
+        path: "motion_planner/peppy.json5"
+      }
+    },
     my_python_robot_arm: {
       v1: {
         path: "example_robot/my_robot_arm/my_python_robot_arm/peppy.json5"

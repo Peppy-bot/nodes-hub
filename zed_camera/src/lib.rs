@@ -4,7 +4,8 @@
 //! drive real hardware with plain cargo: [`calibration`] parses
 //! the per-serial factory geometry, [`resolution`] names the capture modes
 //! and their frame rates, [`size`] holds an image size, [`capture`] streams
-//! frames and drives controls through the `v4l` crate, [`depth_settings`]
+//! frames and drives controls through the `v4l` crate, [`capture_time`] carries
+//! a frame's capture instant onto the node's clock, [`depth_settings`]
 //! validates the stereo-matching settings, [`cv_depth`] rectifies and
 //! matches through the maintained opencv crate, and [`geometry`] answers
 //! where the published pixels point and turns a disparity into depth.
@@ -12,6 +13,7 @@
 pub mod calibration;
 #[cfg(all(feature = "capture", target_os = "linux"))]
 pub mod capture;
+pub mod capture_time;
 #[cfg(feature = "cv")]
 pub mod cv_depth;
 pub mod depth_settings;
