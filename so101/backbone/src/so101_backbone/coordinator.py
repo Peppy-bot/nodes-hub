@@ -155,20 +155,26 @@ class PoseSettle:
     """How a pose move ends past the planned end of its trajectory: the
     measured grasp point within the tolerances of the commanded pose, within
     timeout_s. The position is judged as the Euclidean distance, the
-    orientation as the geodesic angle."""
+    orientation as the geodesic angle, from where the plan ends when the goal
+    names none."""
 
     position: tuple[float, ...]
-    orientation: tuple[float, ...]
+    orientation: tuple[float, ...] | None
     position_tolerance_m: float
     orientation_tolerance_rad: float
     timeout_s: float
 
-    def shortfall(self, measured, _target, kinematics) -> str | None:
+    def shortfall(self, measured, target, kinematics) -> str | None:
         """How far the grasp point of the `measured` joints still stands from
         the commanded pose, or None once it is within both tolerances."""
         position, orientation = kinematics.forward_kinematics(measured)
+        commanded = (
+            kinematics.forward_kinematics(target)[1]
+            if self.orientation is None
+            else self.orientation
+        )
         distance_m = math.dist(position, self.position)
-        angle_rad = relative_rotation_rad(orientation, self.orientation)
+        angle_rad = relative_rotation_rad(orientation, commanded)
         if (
             distance_m <= self.position_tolerance_m
             and angle_rad <= self.orientation_tolerance_rad

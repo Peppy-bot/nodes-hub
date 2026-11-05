@@ -62,9 +62,6 @@ class FakeKinematics:
         self.solution = (0.1, 0.2, 0.3, 0.4, 0.5)
         self.corrupted = False
         self.solve_calls: list[tuple] = []
-        # The (position, orientation) bars each solve was handed, so a test
-        # can prove the caller's slack reached the solver.
-        self.bars: list[tuple] = []
 
     def inverse_kinematics(
         self,
@@ -76,8 +73,12 @@ class FakeKinematics:
         orientation_tolerance_rad=None,
     ):
         self.solve_calls.append(("solve", seed, position, orientation))
-        self.bars.append((position_tolerance_m, orientation_tolerance_rad))
         return None if self.corrupted else self.solution
+
+    def walk_line(self, seed, position, orientation, limits):
+        """The walk of a line: the seed and the one solve this fake scripts."""
+        solution = self.inverse_kinematics(seed, position, orientation)
+        return None if solution is None or not limits.contains(solution) else (tuple(seed), solution)
 
     def inverse_kinematics_streaming(self, seed, position, orientation):
         self.solve_calls.append(("stream", seed, position, orientation))

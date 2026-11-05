@@ -108,28 +108,19 @@
             },
           },
         },
-        // Fails a share of reachable poses with `unreachable`. The solver is
-        // lerobot's, a single QP step iterated until forward kinematics
-        // verifies the position, so the search is a local descent from the
-        // arm's current posture and finds only what that branch reaches.
-        // Measured on poses that are reachable by construction: 14% not
-        // solved from the calibration middle (every joint at zero), 39% from
-        // an arbitrary posture, concentrated near the base (25% within
-        // 0.23 m, 7% beyond 0.45 m). Such a failure means this branch did not
-        // reach the pose, not that the arm cannot; the same target often
-        // solves from a different starting posture. See so101/README.md.
+        // The move is a straight line: one verified solve per sample of it, the
+        // grasp point within 1 mm of its sample and the orientation free along
+        // the way, the last sample landing within 0.01 rad of a named orientation.
+        // The joint limits and the goal's duration time the move through the
+        // line's configurations.
         //
-        // The solve is verified against the goal's plan tolerances: the
-        // distance and the angle between the planned and the commanded
-        // pose. Five joints underactuate the three rotations, so a goal
-        // that names a tight plan_orientation_tolerance_rad often has no
-        // plan; a wide one admits the nearest orientation the arm reaches.
-        //
-        // Endpoints only: one solve for the goal, then a straight move in
-        // joint space. The end effector does not walk the straight line
-        // between the poses and nothing verifies the path it does walk
-        // (median 91 mm off that line, worst seen 472 mm). The joint limits and
-        // the goal's duration time the move.
+        // Fails a share of reachable poses with `unreachable`: the solver is a
+        // local descent from the arm's current posture, and 271 of 300 reachable
+        // poses near an arbitrary posture walk their line. Such a failure means
+        // this branch did not walk the line, not that the arm cannot reach the
+        // pose. Five joints underactuate the three rotations, so a goal off a
+        // reachable orientation often has no plan, and one that leaves orientation
+        // out is a position alone. See so101/README.md.
         { link_id: "limb_motion", name: "move_arm" },
         { link_id: "limb_motion", name: "move_gripper" },
       ]
@@ -205,8 +196,8 @@
       max_joint_velocity_rad_s_5: { $type: "f64", $default: 10.0 },
       // Per-joint peak acceleration (rad/s²), shoulder_pan..wrist_roll, that
       // every action is timed within, with the velocity caps above. A move across
-      // the widest joint's range, wrist_roll's 5.585 rad, peaks at 2 rad/s at it,
-      // the speed the arm's actions ran at before: (2 rad/s)² / 5.585 rad. Under
+      // the widest joint's range, wrist_roll's 5.585 rad, peaks at 2 rad/s at it:
+      // (2 rad/s)² / 5.585 rad. Under
       // the 38.96 rad/s² ramp each STS3215 runs its position goals at (lerobot
       // 0.6.1's SOFollower.configure writes the Acceleration register, in units
       // of 100 steps/s², 4096 steps a turn, to 254). Provisional until a hardware

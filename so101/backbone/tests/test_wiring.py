@@ -634,8 +634,6 @@ async def test_malformed_pose_goal_is_refused_and_the_server_survives():
                     position=[0.1, 0.0, 0.2],
                     orientation=[0.0, 0.0, 0.0, 0.0],
                     duration_s=0.0,
-                    plan_position_tolerance_m=0.01,
-                    plan_orientation_tolerance_rad=0.5,
                     settle_position_tolerance_m=0.01,
                     settle_orientation_tolerance_rad=0.5,
                     settle_timeout_s=2.0,
@@ -654,8 +652,6 @@ async def test_malformed_pose_goal_is_refused_and_the_server_survives():
                     position=[0.0, 0.0, 0.42],
                     orientation=[0.0, 0.0, 0.0, 1.0],
                     duration_s=0.0,
-                    plan_position_tolerance_m=0.01,
-                    plan_orientation_tolerance_rad=0.5,
                     settle_position_tolerance_m=0.01,
                     settle_orientation_tolerance_rad=0.5,
                     settle_timeout_s=2.0,
@@ -921,8 +917,6 @@ async def test_the_plan_check_answers_without_moving():
                 position=[position[0], position[1], position[2] + 0.02],
                 orientation=list(orientation),
                 duration_s=0.0,
-                plan_position_tolerance_m=0.01,
-                plan_orientation_tolerance_rad=0.5,
             )
             answer = await check_arm_move_fx.poll(h, check, TIMEOUT_S)
             assert (answer.reachable, answer.reason) == (True, "")
@@ -933,12 +927,10 @@ async def test_the_plan_check_answers_without_moving():
                 position=[position[0] + 2.0, position[1], position[2]],
                 orientation=list(orientation),
                 duration_s=0.0,
-                plan_position_tolerance_m=0.01,
-                plan_orientation_tolerance_rad=0.5,
             )
             answer = await check_arm_move_fx.poll(h, far, TIMEOUT_S)
             assert not answer.reachable
-            assert answer.reason.startswith("goal pose not planned within ")
+            assert answer.reason.startswith("goal pose not planned")
             assert answer.duration_s == 0.0
 
             # Nothing streamed downstream: the checks moved nothing.
@@ -952,8 +944,6 @@ async def test_the_plan_check_answers_without_moving():
                 position=list(position),
                 orientation=list(orientation),
                 duration_s=0.0,
-                plan_position_tolerance_m=0.01,
-                plan_orientation_tolerance_rad=0.5,
             )
             with pytest.raises(check_arm_move_fx.Failure) as raised:
                 await check_arm_move_fx.poll(h, unknown, TIMEOUT_S)
@@ -977,8 +967,6 @@ async def test_a_move_arm_goal_with_no_plan_fails_with_unreachable():
                     position=[position[0] + 2.0, position[1], position[2]],
                     orientation=list(orientation),
                     duration_s=0.0,
-                    plan_position_tolerance_m=0.01,
-                    plan_orientation_tolerance_rad=0.5,
                     settle_position_tolerance_m=0.01,
                     settle_orientation_tolerance_rad=0.5,
                     settle_timeout_s=2.0,
@@ -990,7 +978,7 @@ async def test_a_move_arm_goal_with_no_plan_fails_with_unreachable():
             assert result.status == move_arm_fx.ResultStatus.FAILED
             assert result.data is None
             assert result.failure.kind is move_arm_fx.FailureKind.UNREACHABLE
-            assert result.failure.message.startswith("goal pose not planned within ")
+            assert result.failure.message.startswith("goal pose not planned")
         finally:
             feeder.cancel()
 
@@ -1018,8 +1006,6 @@ async def test_a_streaming_leader_refuses_goals_and_checks_with_leader_streaming
                 position=list(position),
                 orientation=list(orientation),
                 duration_s=0.0,
-                plan_position_tolerance_m=0.01,
-                plan_orientation_tolerance_rad=0.5,
             )
             with pytest.raises(check_arm_move_fx.Failure) as raised:
                 await check_arm_move_fx.poll(h, check, TIMEOUT_S)

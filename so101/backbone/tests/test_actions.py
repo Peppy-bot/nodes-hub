@@ -30,11 +30,15 @@ from so101_description.kinematics import Kinematics
 from so101_description.model import KINEMATICS_URDF_PATH
 from so101_description.postures import READY_POSITIONS_RAD
 from so101_description.staleness import COMMAND_SILENCE_LIMIT_S
+from so101_description.transforms import relative_rotation_rad
 
+from so101_backbone import actions
 from so101_backbone.actions import (
     ARM_WORDS,
     GRIPPER_WORDS,
     MAX_REQUESTED_DURATION_S,
+    NOT_PLANNED,
+    NOT_PLANNED_NAMING_ORIENTATION,
     WALKED_BACK,
     JointPathMove,
     PendingSlot,
@@ -53,11 +57,10 @@ CANCEL_REASONS = {"caller": "cancelled by its caller", "sender_gone": "its sende
 # The reason of a goal that its caller cancelled.
 CANCELLED_BY_CALLER = CANCEL_REASONS["caller"]
 
-# The bars of the moves below, where a test sets no others: the plan and the
-# settle of a pose move each allow 1 cm and 0.2 rad, a joint move 0.1 rad per
+# The bars of the moves below, where a test sets no others: the settle of a
+# pose move allows 1 cm and 0.2 rad, a joint move 0.1 rad per
 # joint, a gripper move 1 % of the jaw travel, and each limb has 2 s past the
 # planned end to settle.
-PLAN = (0.01, 0.2)
 SETTLE = (0.01, 0.2, 2.0)
 JOINT_TOLERANCES = (0.1,) * 5
 
@@ -82,8 +85,8 @@ def admit_path(layer, *waypoints, **fields):
     return layer._admit_joint_path(goal.arms, goal.duration_s, goal.settle_timeout_s)
 
 
-def admit_pose(layer, position, orientation, duration_s=0.0, plan=PLAN, settle=SETTLE):
-    return layer._admit_pose_move(position, orientation, duration_s, *plan, *settle)
+def admit_pose(layer, position, orientation, duration_s=0.0, settle=SETTLE):
+    return layer._admit_pose_move(position, orientation, duration_s, *settle)
 
 
 # The gripper moves below wait up to 2 s past the planned end of their travel
@@ -1281,8 +1284,6 @@ def test_a_goal_on_a_limb_a_leader_streams_is_refused_with_leader_streaming():
             position=[0.1, 0.0, 0.2],
             orientation=[0.0, 0.0, 0.0, 1.0],
             duration_s=0.0,
-            plan_position_tolerance_m=0.01,
-            plan_orientation_tolerance_rad=0.2,
             settle_position_tolerance_m=0.01,
             settle_orientation_tolerance_rad=0.2,
             settle_timeout_s=2.0,
@@ -1448,7 +1449,7 @@ async def test_an_unreachable_pose_fails_with_unreachable_and_releases():
     await layer.drive_pose(ctx, goal, kinematics, kinematics)
     kind, message = ctx.failed
     assert kind is FailureKind.UNREACHABLE
-    assert message.startswith("goal pose not planned within ")
+    assert message.startswith("goal pose not planned")
     # The failure must say the search was local, so a caller knows to retry
     # from elsewhere rather than read it as the pose being out of reach.
     assert "local descent" in message
@@ -1494,7 +1495,7 @@ def test_gripper_effort_preference_is_admitted_and_ignored():
 
 async def test_pose_solver_surprise_still_reaches_a_terminal_result():
     class BoomKinematics(FakeKinematics):
-        def inverse_kinematics(self, seed, position, orientation):
+        def inverse_kinematics(self, seed, position, orientation, **bars):
             raise RuntimeError("solver surprise")
 
     kinematics = BoomKinematics()
@@ -1512,21 +1513,16 @@ async def test_pose_solver_surprise_still_reaches_a_terminal_result():
 IDENTITY_QUAT = (0.0, 0.0, 0.0, 1.0)
 
 
-async def test_the_callers_slack_reaches_the_solver():
-    # The bug this guards: move_arm carried both tolerance fields and the
-    # node dropped them, so a caller's stated slack changed nothing.
+async def test_the_goals_tolerances_reach_its_settle_and_no_plan_reads_them():
     kinematics = FakeKinematics()
-    # Refused rather than solved: the bars are recorded before the solve
-    # answers, and a refusal terminates without a control loop to run a plan.
-    kinematics.corrupted = True
     coordinator, layer = make_layer(kinematics)
     coordinator.measured_joints.set((0.0,) * 5)
-    move = admit_pose(
-        layer, (0.1, 0.0, 0.2), IDENTITY_QUAT, plan=(0.004, 0.05), settle=(0.004, 0.05, 2.0)
-    )
-    assert (move.goal.position_tolerance_m, move.goal.orientation_tolerance_rad) == (0.004, 0.05)
-    await layer.drive_pose(FakeGoalContext(), move, kinematics, kinematics)
-    assert kinematics.bars == [(0.004, 0.05)]
+    move = admit_pose(layer, (0.1, 0.0, 0.2), None, settle=(0.004, 0.05, 2.0))
+    assert (move.settle.position_tolerance_m, move.settle.orientation_tolerance_rad) == (0.004, 0.05)
+    assert move.goal.orientation is None
+    profile = await layer._plan_pose(kinematics, (0.0,) * 5, move.goal)
+    assert profile.duration_s > 0.0
+    assert kinematics.solve_calls == [("solve", (0.0,) * 5, (0.1, 0.0, 0.2), None)]
 
 
 @pytest.mark.parametrize("bad", [0.0, -0.001, math.nan, math.inf])
@@ -1535,14 +1531,12 @@ async def test_a_tolerance_that_is_no_bar_is_refused(bad):
     coordinator.measured_joints.set((0.0,) * 5)
     coordinator.measured_gripper.set(0.5)
     pose = ((0.1, 0.0, 0.2), IDENTITY_QUAT)
-    for plan, settle, field in (
-        ((bad, 0.2), SETTLE, "plan_position_tolerance_m"),
-        ((0.01, bad), SETTLE, "plan_orientation_tolerance_rad"),
-        (PLAN, (bad, 0.2, 2.0), "settle_position_tolerance_m"),
-        (PLAN, (0.01, bad, 2.0), "settle_orientation_tolerance_rad"),
+    for settle, field in (
+        ((bad, 0.2, 2.0), "settle_position_tolerance_m"),
+        ((0.01, bad, 2.0), "settle_orientation_tolerance_rad"),
     ):
         with pytest.raises(Refusal, match=f"{field} must be a positive number") as raised:
-            admit_pose(layer, *pose, plan=plan, settle=settle)
+            admit_pose(layer, *pose, settle=settle)
         assert raised.value.kind is FailureKind.REJECTED
     with pytest.raises(
         Refusal, match="each settle_tolerances_rad entry must be a positive number"
@@ -1565,35 +1559,23 @@ async def test_a_settle_timeout_that_is_no_duration_is_refused(bad):
     assert coordinator.try_claim_arm()
 
 
-def test_a_settle_tolerance_below_the_plan_tolerance_of_its_axis_is_refused():
-    coordinator, layer = make_layer()
-    coordinator.measured_joints.set((0.0,) * 5)
-    refusal = "settle_{0} must be at least plan_{0}: the plan may sit that far from the pose"
-    with pytest.raises(Refusal, match=refusal.format("position_tolerance_m")):
-        admit_pose(layer, (0.1, 0.0, 0.2), IDENTITY_QUAT, settle=(0.005, 0.2, 2.0))
-    with pytest.raises(Refusal, match=refusal.format("orientation_tolerance_rad")):
-        admit_pose(layer, (0.1, 0.0, 0.2), IDENTITY_QUAT, settle=(0.01, 0.1, 2.0))
-    assert coordinator.try_claim_arm()
-
-
-async def test_an_unreachable_failure_names_the_bar_it_was_judged_against():
+async def test_an_unreachable_failure_names_the_way_on():
     kinematics = FakeKinematics()
     kinematics.corrupted = True
     coordinator, layer = make_layer(kinematics)
     coordinator.measured_joints.set((0.0,) * 5)
-    move = admit_pose(
-        layer, (0.1, 0.0, 0.2), IDENTITY_QUAT, plan=(0.004, 0.05), settle=(0.004, 0.05, 2.0)
-    )
+    move = admit_pose(layer, (0.1, 0.0, 0.2), IDENTITY_QUAT, settle=(0.004, 0.05, 2.0))
     ctx = FakeGoalContext()
     await layer.drive_pose(ctx, move, kinematics, kinematics)
     kind, message = ctx.failed
     assert kind is FailureKind.UNREACHABLE
-    assert "4.0 mm" in message and "2.9 deg" in message
+    assert message == NOT_PLANNED_NAMING_ORIENTATION
+    assert "plan_joint_path" in message and "execute_joint_path" in message
 
 
 async def test_the_joint_caps_cannot_pin_the_slot_past_the_duration_ceiling():
     # A move admitted under the ceiling can still need longer than it under
-    # the joint velocity caps; that has no plan, and must not stretch.
+    # the joint velocity caps; that is refused, and must not stretch.
     kinematics = FakeKinematics()
     coordinator, layer = make_layer(kinematics, max_joint_velocity_rad_s=(1e-3,) * 5)
     coordinator.measured_joints.set((0.0,) * 5)
@@ -1601,8 +1583,8 @@ async def test_the_joint_caps_cannot_pin_the_slot_past_the_duration_ceiling():
     ctx = FakeGoalContext()
     await layer.drive_pose(ctx, goal, kinematics, kinematics)
     kind, message = ctx.failed
-    assert kind is FailureKind.UNREACHABLE
-    assert "ceiling" in message
+    assert kind is FailureKind.REJECTED
+    assert "split it into shorter moves" in message
     assert coordinator.try_claim_arm(), "a failed move must release the arm"
 
 
@@ -1613,9 +1595,13 @@ def assert_within_joint_limits(profile, max_velocity, max_acceleration):
     step_s = profile.duration_s / samples
     points = [profile.sample(k * step_s) for k in range(samples + 1)]
     slack = 1.0 + 1e-6
-    for before, here, after in zip(points, points[1:], points[2:], strict=False):
-        for joint, (a, b, c) in enumerate(zip(before, here, after, strict=True)):
+    for before, here in zip(points, points[1:], strict=False):
+        for joint, (a, b) in enumerate(zip(before, here, strict=True)):
             assert abs(b - a) / step_s <= max_velocity[joint] * slack
+    # The motion rests before it starts and after it ends.
+    at_rest = [points[0], *points, points[-1]]
+    for before, here, after in zip(at_rest, at_rest[1:], at_rest[2:], strict=False):
+        for joint, (a, b, c) in enumerate(zip(before, here, after, strict=True)):
             assert abs(c - 2.0 * b + a) / (step_s * step_s) <= max_acceleration[joint] * slack + 1e-6
 
 
@@ -1859,13 +1845,13 @@ async def test_a_stop_while_the_path_is_planned_off_the_loop_ends_the_goal_witho
 
 
 async def test_the_plan_check_answers_the_duration_the_joint_caps_floor():
-    # The EE caps are transparent and the joint caps bind: the check answers
-    # the duration the move's own trajectory takes.
+    # The joint caps bind: the check answers the duration the move's own trajectory
+    # takes.
     kinematics = FakeKinematics()
     coordinator, layer = make_layer(kinematics, max_joint_velocity_rad_s=(2.0,) * 5)
     coordinator.measured_joints.set((0.0,) * 5)
     check = await layer.check_arm_move(
-        "arm", (0.2, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, *PLAN, kinematics
+        "arm", (0.2, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, kinematics
     )
     floored = JointTrajectory.through(
         ((0.0,) * 5, kinematics.solution), (2.0,) * 5, (MAX_JOINT_ACCELERATION_RAD_S2,) * 5, 0.0
@@ -1897,11 +1883,11 @@ async def test_a_zero_settle_timeout_fails_an_arm_move_short_of_its_target_at_th
 
 async def test_the_plan_check_answers_the_duration_and_installs_nothing():
     kinematics = FakeKinematics()
-    coordinator, layer = make_layer(kinematics, max_stream_ee_velocity_m_s=0.1)
+    coordinator, layer = make_layer(kinematics)
     coordinator.measured_joints.set((0.0,) * 5)
 
     check = await layer.check_arm_move(
-        "arm", (0.2, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, *PLAN, kinematics
+        "arm", (0.2, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, kinematics
     )
 
     assert (check.reachable, check.reason) == (True, "")
@@ -1918,20 +1904,20 @@ async def test_the_plan_check_answers_unreachable_and_refuses_as_the_move_would(
 
     kinematics.corrupted = True
     check = await layer.check_arm_move(
-        "arm", (5.0, 5.0, 5.0), (0.0, 0.0, 0.0, 1.0), 0.0, *PLAN, kinematics
+        "arm", (5.0, 5.0, 5.0), (0.0, 0.0, 0.0, 1.0), 0.0, kinematics
     )
     assert (check.reachable, check.duration_s) == (False, 0.0)
-    assert check.reason.startswith("goal pose not planned within ")
+    assert check.reason.startswith("goal pose not planned")
 
     kinematics.corrupted = False
     with pytest.raises(Refusal, match="unknown arm_name") as raised:
         await layer.check_arm_move(
-            "wing", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, *PLAN, kinematics
+            "wing", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, kinematics
         )
     assert raised.value.kind is FailureKind.REJECTED
     with pytest.raises(Refusal) as raised:
         await layer.check_arm_move(
-            "arm", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 0.0), 0.0, *PLAN, kinematics
+            "arm", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 0.0), 0.0, kinematics
         )
     assert refusal_of(raised) == (
         FailureKind.REJECTED, "goal pose has an unnormalizable orientation"
@@ -1941,7 +1927,7 @@ async def test_the_plan_check_answers_unreachable_and_refuses_as_the_move_would(
     admit_joints(layer, (0.5,) * 5, 1.0)
     with pytest.raises(Refusal) as raised:
         await layer.check_arm_move(
-            "arm", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, *PLAN, kinematics
+            "arm", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, kinematics
         )
     assert refusal_of(raised) == (FailureKind.PRECONDITION_FAILED, ARM_WORDS.busy)
     assert len(kinematics.solve_calls) == 1, "a refused check pays no solve"
@@ -1952,7 +1938,7 @@ async def test_the_plan_check_needs_fresh_follower_state():
     _coordinator, layer = make_layer(kinematics)
     with pytest.raises(Refusal) as raised:
         await layer.check_arm_move(
-            "arm", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, *PLAN, kinematics
+            "arm", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, kinematics
         )
     assert refusal_of(raised) == (FailureKind.RESOURCE_UNAVAILABLE, ARM_WORDS.no_fresh_state)
 
@@ -1967,7 +1953,7 @@ async def test_a_solve_that_raises_fails_the_plan_check_with_attempt_failed():
     coordinator.measured_joints.set((0.0,) * 5)
     with pytest.raises(Refusal) as raised:
         await layer.check_arm_move(
-            "arm", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, *PLAN, kinematics
+            "arm", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, kinematics
         )
     assert refusal_of(raised) == (
         FailureKind.ATTEMPT_FAILED, "pose solve failed: RuntimeError('solver surprise')"
@@ -2018,7 +2004,7 @@ async def test_the_move_check_refuses_in_the_goals_order():
     coordinator.leader_joints.set((0.0,) * 5)
     pose = ((0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0))
     with pytest.raises(Refusal) as raised:
-        await layer.check_arm_move("arm", *pose, 0.0, *PLAN, None)
+        await layer.check_arm_move("arm", *pose, 0.0, None)
     assert refusal_of(raised) == (FailureKind.RESOURCE_UNAVAILABLE, ARM_WORDS.no_fresh_state)
     with pytest.raises(Refusal) as raised:
         admit_pose(layer, *pose)
@@ -2031,7 +2017,67 @@ async def test_the_move_check_gives_the_streaming_refusal_without_claiming():
     coordinator.leader_joints.set((0.0,) * 5)
     with pytest.raises(Refusal) as raised:
         await layer.check_arm_move(
-            "arm", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, *PLAN, None
+            "arm", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, None
         )
     assert refusal_of(raised) == (FailureKind.LEADER_STREAMING, ARM_WORDS.leader_streaming)
     assert coordinator.try_claim_arm()
+
+
+@pytest.mark.parametrize("seed", range(10))
+async def test_a_walked_line_of_the_real_arm_stays_within_the_joint_limits(seed):
+    # The real solver and model: a pose move's trajectory runs through its line's walk at
+    # the launcher's limits.
+    rng = random.Random(seed)
+    kinematics = Kinematics(KINEMATICS_URDF_PATH)
+    limits = limits_mod.from_urdf(KINEMATICS_URDF_PATH)
+    velocity, acceleration = (10.0,) * 5, (0.72,) * 5
+    coordinator, layer = make_layer(
+        kinematics,
+        limits,
+        max_joint_velocity_rad_s=velocity,
+        max_joint_acceleration_rad_s2=acceleration,
+    )
+    start = tuple(lo + (hi - lo) * rng.uniform(0.3, 0.7) for lo, hi in zip(limits.lower, limits.upper))
+    near = tuple(q + rng.uniform(-0.3, 0.3) for q in start)
+    position, orientation = kinematics.forward_kinematics(limits.clamp(near))
+    coordinator.measured_joints.set(start)
+    goal = actions._pose_goal(position, orientation, 0.0)
+    try:
+        profile = await layer._plan_pose(kinematics, start, goal)
+    except actions._PlanRefused as refused:
+        assert str(refused) == NOT_PLANNED_NAMING_ORIENTATION
+        return
+    assert_within_joint_limits(profile, velocity, acceleration)
+    assert profile.end == pytest.approx(profile.sample(profile.duration_s))
+    landed, turned = kinematics.forward_kinematics(profile.end)
+    assert math.dist(landed, position) <= 0.02
+    assert relative_rotation_rad(turned, orientation) <= 0.15
+
+
+async def test_a_short_walked_line_rests_at_none_of_its_samples():
+    # Each sample of a 1 cm line lies within a joint path's repeat of the one before it,
+    # and the line runs through them: under a second at the launcher's limits.
+    kinematics = Kinematics(KINEMATICS_URDF_PATH)
+    limits = limits_mod.from_urdf(KINEMATICS_URDF_PATH)
+    _, layer = make_layer(
+        kinematics,
+        limits,
+        max_joint_velocity_rad_s=(10.0,) * 5,
+        max_joint_acceleration_rad_s2=(0.72,) * 5,
+    )
+    start = limits.clamp(READY_POSITIONS_RAD)
+    (x, y, z), orientation = kinematics.forward_kinematics(start)
+    goal = actions._pose_goal((x, y, z + 0.01), None, 0.0)
+    profile = await layer._plan_pose(kinematics, start, goal)
+    assert profile.duration_s < 1.0
+
+
+async def test_a_position_alone_with_no_plan_is_not_told_to_leave_orientation_out():
+    kinematics = FakeKinematics()
+    kinematics.corrupted = True
+    _, layer = make_layer(kinematics)
+    with pytest.raises(actions._PlanRefused) as refused:
+        await layer._plan_pose(kinematics, (0.0,) * 5, actions._pose_goal((5.0, 5.0, 5.0), None, 0.0))
+    assert str(refused.value) == NOT_PLANNED
+    assert "leave orientation out" in NOT_PLANNED_NAMING_ORIENTATION
+    assert "leave orientation out" not in NOT_PLANNED

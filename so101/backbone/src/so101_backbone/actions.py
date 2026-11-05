@@ -26,7 +26,6 @@ joints, moved inside its joint limits where it stood past one.
 from __future__ import annotations
 
 import asyncio
-import functools
 import math
 import time
 from collections.abc import Awaitable, Callable, Sequence
@@ -34,7 +33,7 @@ from dataclasses import dataclass
 from typing import TypeVar
 
 from control_core_py.runtime import Latch, log
-from path_timing_py import JointTrajectory
+from path_timing_py import JointTrajectory, distinct_joint_waypoints
 from peppygen.exposed_actions.limb_motion import execute_joint_path
 from so101_description.limbs import ARM_LIMB, GRIPPER_LIMB
 from so101_description.limits import JointLimits
@@ -118,6 +117,25 @@ class _MoveWords:
 
 # The words of a joint path's drive, and of a pose move's.
 _PATH_MOVE_WORDS = _MoveWords(planning="path planning", goal="path goal")
+# What a caller does about a move the joint limits cannot run within the ceiling.
+_SPLIT_INTO_SHORTER_MOVES = "split it into shorter moves"
+# The same of a posture move, which a caller cannot split.
+_RAISE_THE_JOINT_LIMITS = "raise max_joint_velocity_rad_s_N or max_joint_acceleration_rad_s2_N"
+
+# Why a pose goal has no plan: the message of its `unreachable` failure and the
+# reason check_arm_move answers.
+NOT_PLANNED = (
+    "goal pose not planned: no straight line to it tracks inside the joint limits from "
+    "where the arm is now; the search is a local descent, so the same pose may solve from "
+    "a different posture; where the robot runs a motion planner, plan a path with "
+    "plan_joint_path and run it with execute_joint_path"
+)
+# The refusal of a goal that names an orientation, which has one more way on.
+NOT_PLANNED_NAMING_ORIENTATION = (
+    f"{NOT_PLANNED}; five joints end on few orientations, so leave orientation out to reach "
+    "the position alone"
+)
+
 _POSE_MOVE_WORDS = _MoveWords(planning="pose solve", goal="pose goal")
 
 # Where a drive plans an arm move from: the _PathStart of a joint path, the
@@ -175,15 +193,12 @@ class _PathStart:
 
 @dataclass(frozen=True)
 class PoseGoal:
-    """A pose to plan: the fields move_arm and check_arm_move share."""
+    """A goal to plan: the fields move_arm and check_arm_move share. An orientation of
+    None asks for the position alone."""
 
     position: tuple[float, ...]
-    orientation: tuple[float, ...]
+    orientation: tuple[float, ...] | None
     duration_s: float
-    # The caller's planning slack, judged against the goal pose alone, never
-    # the path.
-    position_tolerance_m: float
-    orientation_tolerance_rad: float
 
 
 @dataclass(frozen=True)
@@ -344,7 +359,7 @@ class ActionLayer:
         anchor = self._claim_free_arm()
         try:
             profile = self._joint_move(anchor, target, duration_s)
-            _require_within_move_ceiling(profile, "move", "shorter moves")
+            _require_within_move_ceiling(profile, *_ceiling_words(settle))
             return self._coordinator.adopt_arm_plan(profile, settle)
         except BaseException:
             # A failure between claim and adopt must not hold the slot.
@@ -373,11 +388,15 @@ class ActionLayer:
     def _joint_move(
         self, start: tuple[float, ...], end: tuple[float, ...], duration_s: float
     ) -> JointTrajectory:
-        """The straight joint move from `start` to `end`, over the longer of
-        `duration_s` and the time the joint velocity and acceleration caps
-        allow."""
+        """The straight joint move from `start` to `end`, timed as `_timed_through`
+        times it."""
+        return self._timed_through((start, end), duration_s)
+
+    def _timed_through(self, waypoints, duration_s: float) -> JointTrajectory:
+        """The move through `waypoints`, over the longer of `duration_s` and the
+        time the joint velocity and acceleration caps allow."""
         return JointTrajectory.through(
-            (start, end),
+            waypoints,
             self._config.max_joint_velocity_rad_s,
             self._config.max_joint_acceleration_rad_s2,
             duration_s,
@@ -416,7 +435,7 @@ class ActionLayer:
             self._config.max_joint_acceleration_rad_s2,
             goal.duration_s,
         )
-        _require_within_move_ceiling(profile, "path", "paths of fewer waypoints")
+        _require_within_move_ceiling(profile, "path", "split it into paths of fewer waypoints")
         self._require_still_at(start.held)
         return profile
 
@@ -501,8 +520,6 @@ class ActionLayer:
         position,
         orientation,
         duration_s: float,
-        position_tolerance_m: float,
-        orientation_tolerance_rad: float,
         settle_position_tolerance_m: float,
         settle_orientation_tolerance_rad: float,
         settle_timeout_s: float,
@@ -514,9 +531,7 @@ class ActionLayer:
         # Parsed before the claim: a refusal past this point would strand
         # the arm slot and teleop with it.
         move = _pose_move(
-            _pose_goal(
-                position, orientation, duration_s, position_tolerance_m, orientation_tolerance_rad
-            ),
+            _pose_goal(position, orientation, duration_s),
             settle_position_tolerance_m,
             settle_orientation_tolerance_rad,
             settle_timeout_s,
@@ -597,10 +612,8 @@ class ActionLayer:
                 _require_arm_name(d.arm_name)
                 return self._admit_pose_move(
                     tuple(d.position),
-                    tuple(d.orientation),
+                    d.orientation,
                     d.duration_s,
-                    d.plan_position_tolerance_m,
-                    d.plan_orientation_tolerance_rad,
                     d.settle_position_tolerance_m,
                     d.settle_orientation_tolerance_rad,
                     d.settle_timeout_s,
@@ -809,32 +822,21 @@ class ActionLayer:
             self._coordinator.release_arm()
 
     async def _plan_pose(self, solver, seed, goal: PoseGoal) -> JointTrajectory:
-        """The trajectory of `goal` from `seed`: the joint solution reached in
-        the requested duration, floored by the joint velocity and acceleration
-        caps. _PlanRefused with the reason when no solution lies inside the
-        joint limits, or the caps push the duration past the ceiling. The solve
-        runs off the event loop."""
-        solution = await asyncio.to_thread(
-            functools.partial(
-                solver.inverse_kinematics,
-                seed,
-                goal.position,
-                goal.orientation,
-                position_tolerance_m=goal.position_tolerance_m,
-                orientation_tolerance_rad=goal.orientation_tolerance_rad,
-            )
+        """The trajectory of `goal` from `seed`: through the walk of the straight
+        line to the goal, resting at no sample before the end, in the requested
+        duration, floored by the joint velocity and acceleration caps. _PlanRefused
+        with the reason when no line reaches the goal inside the joint limits, and
+        Refusal when the caps push the duration past the ceiling. The walk runs off
+        the event loop."""
+        walk = await asyncio.to_thread(
+            solver.walk_line, seed, goal.position, goal.orientation, self._limits
         )
-        if solution is None or not self._limits.contains(solution):
-            raise _PlanRefused(_unreached(goal))
-        profile = self._joint_move(seed, solution, goal.duration_s)
-        if profile.duration_s > MAX_REQUESTED_DURATION_S:
-            # The requested duration was admitted against this ceiling, and
-            # the caps can raise it past the ceiling. No goal holds the arm
-            # slot longer than the ceiling, so the move has no plan.
+        if walk is None:
             raise _PlanRefused(
-                f"the speed caps need {profile.duration_s:.0f}s for this "
-                f"move, beyond the {MAX_REQUESTED_DURATION_S:.0f}s ceiling"
+                NOT_PLANNED if goal.orientation is None else NOT_PLANNED_NAMING_ORIENTATION
             )
+        profile = self._timed_through(distinct_joint_waypoints(walk), goal.duration_s)
+        _require_within_move_ceiling(profile, "move", _SPLIT_INTO_SHORTER_MOVES)
         return profile
 
     async def check_arm_move(
@@ -843,25 +845,21 @@ class ActionLayer:
         position,
         orientation,
         duration_s: float,
-        position_tolerance_m: float,
-        orientation_tolerance_rad: float,
         solver,
     ) -> PlanCheck:
-        """Whether a move_arm goal with these planning fields has a plan from
-        where the arm is, without moving, the reason being the words the
-        goal's `unreachable` failure gives. Raises Refusal with the kind and
+        """Whether a move_arm goal with these fields has a plan from
+        where the arm is, without moving, the reason being the words of the
+        goal's failure. Raises Refusal with the kind and
         the message of the goal's refusal, in the same order as a goal: a
         field that move_arm does not take, no fresh follower state, a leader
         streaming the arm, an arm goal in flight; and with `attempt_failed`
         when the solve raises."""
         _require_arm_name(arm_name)
-        goal = _pose_goal(
-            position, orientation, duration_s, position_tolerance_m, orientation_tolerance_rad
-        )
+        goal = _pose_goal(position, orientation, duration_s)
         seed = self._free_arm_anchor()
         try:
             profile = await self._plan_pose(solver, seed, goal)
-        except _PlanRefused as e:
+        except Refusal as e:
             return PlanCheck(reachable=False, reason=str(e), duration_s=0.0)
         except Exception as e:
             log(f"pose solve failed: {e!r}")
@@ -965,59 +963,43 @@ class ActionLayer:
         return plan.frozen
 
 
-def _pose_goal(
-    position,
-    orientation,
-    duration_s: float,
-    position_tolerance_m: float,
-    orientation_tolerance_rad: float,
-) -> PoseGoal:
-    """The pose goal these wire fields name, with its orientation normalized,
-    or Refusal: a pose that is no pose, a tolerance that is no bar, or a
-    duration out of its bound."""
-    if not all(math.isfinite(v) for v in (*position, *orientation)):
+def _pose_goal(position, orientation, duration_s: float) -> PoseGoal:
+    """The goal these wire fields name, with a named orientation normalized, or
+    Refusal: a pose that is no pose, or a duration out of its bound."""
+    if not all(math.isfinite(v) for v in (*position, *(orientation or ()))):
         raise Refusal(FailureKind.REJECTED, "goal pose has non-finite values")
+    return PoseGoal(
+        position=tuple(position),
+        orientation=None if orientation is None else _normalized(orientation),
+        duration_s=_require_duration(duration_s, "duration_s"),
+    )
+
+
+def _normalized(orientation) -> tuple[float, ...]:
+    """`orientation` at unit length, or Refusal for one too short to normalize."""
     norm = math.sqrt(sum(q * q for q in orientation))
     if norm <= _QUATERNION_MIN_NORM:
         raise Refusal(FailureKind.REJECTED, "goal pose has an unnormalizable orientation")
-    position_tolerance_m = _require_tolerance(position_tolerance_m, "plan_position_tolerance_m")
-    orientation_tolerance_rad = _require_tolerance(
-        orientation_tolerance_rad, "plan_orientation_tolerance_rad"
-    )
-    return PoseGoal(
-        position=tuple(position),
-        orientation=tuple(q / norm for q in orientation),
-        duration_s=_require_duration(duration_s, "duration_s"),
-        position_tolerance_m=position_tolerance_m,
-        orientation_tolerance_rad=orientation_tolerance_rad,
-    )
+    return tuple(q / norm for q in orientation)
 
 
 def _pose_move(
     goal: PoseGoal,
-    settle_position_tolerance_m: float,
-    settle_orientation_tolerance_rad: float,
+    position_tolerance_m: float,
+    orientation_tolerance_rad: float,
     settle_timeout_s: float,
     stops_before: int,
 ) -> PoseMove:
     """The move_arm goal `goal` settles into, admitted at stop count
-    `stops_before`, or Refusal: a settle tolerance that is no bar or below
-    the plan tolerance of its axis, or a timeout out of its bound."""
-    position_tolerance_m = _require_tolerance(
-        settle_position_tolerance_m, "settle_position_tolerance_m"
-    )
-    orientation_tolerance_rad = _require_tolerance(
-        settle_orientation_tolerance_rad, "settle_orientation_tolerance_rad"
-    )
-    _require_settle_covers_plan(position_tolerance_m, goal.position_tolerance_m, "position_tolerance_m")
-    _require_settle_covers_plan(
-        orientation_tolerance_rad, goal.orientation_tolerance_rad, "orientation_tolerance_rad"
-    )
+    `stops_before`, or Refusal: a tolerance that is no bar, or a timeout out of its
+    bound."""
     settle = PoseSettle(
         position=goal.position,
         orientation=goal.orientation,
-        position_tolerance_m=position_tolerance_m,
-        orientation_tolerance_rad=orientation_tolerance_rad,
+        position_tolerance_m=_require_tolerance(position_tolerance_m, "settle_position_tolerance_m"),
+        orientation_tolerance_rad=_require_tolerance(
+            orientation_tolerance_rad, "settle_orientation_tolerance_rad"
+        ),
         timeout_s=_require_duration(settle_timeout_s, "settle_timeout_s"),
     )
     return PoseMove(goal=goal, settle=settle, stops_before=stops_before)
@@ -1117,7 +1099,7 @@ def _require_tolerance(value: float, field: str) -> float:
     return value
 
 
-def _require_within_move_ceiling(profile: JointTrajectory, what: str, split_into: str) -> None:
+def _require_within_move_ceiling(profile: JointTrajectory, what: str, remedy: str) -> None:
     """Refuse with `rejected` a trajectory past MAX_REQUESTED_DURATION_S. The
     requested duration is at most that ceiling, so such a trajectory runs at
     the floor that the joint velocity and acceleration caps set for it."""
@@ -1126,29 +1108,16 @@ def _require_within_move_ceiling(profile: JointTrajectory, what: str, split_into
     raise Refusal(
         FailureKind.REJECTED,
         f"the joint velocity and acceleration caps take {profile.duration_s:.1f} s to run "
-        f"this {what}, past the {MAX_REQUESTED_DURATION_S:.0f} s a move may take; split it "
-        f"into {split_into}",
+        f"this {what}, past the {MAX_REQUESTED_DURATION_S:.0f} s a move may take; {remedy}",
     )
 
 
-def _require_settle_covers_plan(settle_bar: float, plan_bar: float, axis: str) -> None:
-    """Refuse a settle bar below the plan bar of its axis, naming the field
-    to raise: the plan may sit that far from the pose."""
-    if settle_bar < plan_bar:
-        raise Refusal(
-            FailureKind.REJECTED,
-            f"settle_{axis} must be at least plan_{axis}: the plan may sit that far from the pose",
-        )
-
-
-def _unreached(goal: PoseGoal) -> str:
-    """Why a solve found no plan, naming the bars it was judged against."""
-    return (
-        f"goal pose not planned within {goal.position_tolerance_m * 1000:.1f} mm / "
-        f"{math.degrees(goal.orientation_tolerance_rad):.1f} deg: no solution reaches it "
-        "from where the arm is now, inside the joint limits; the search is a local "
-        "descent, so the same pose may solve from a different posture"
-    )
+def _ceiling_words(settle) -> tuple[str, str]:
+    """What a move of `settle` is called and what a caller does about it past the
+    ceiling; a caller cannot split a posture."""
+    if isinstance(settle, PostureEnd):
+        return "posture move", _RAISE_THE_JOINT_LIMITS
+    return "move", _SPLIT_INTO_SHORTER_MOVES
 
 
 def _check_limb_free(anchor, leader_streams: Callable[[], bool], words: _LimbWords):

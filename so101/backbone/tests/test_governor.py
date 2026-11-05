@@ -77,6 +77,29 @@ def test_convergence_over_ticks_reaches_the_target_exactly():
     assert current is target
 
 
+def test_a_step_only_its_midpoint_reads_as_moving_the_hand_is_scaled_to_cap_speed():
+    # A step that barely moves the hand at its start moves it at its midpoint, where
+    # the curve of the chain has turned the joint's sweep toward it.
+    class CurvingKinematics(LinearKinematics):
+        def jacobian(self, positions_rad):
+            at_start = positions_rad[0] == 0.0
+            return np.zeros((6, 5)) if at_start else super().jacobian(positions_rad)
+
+    governor = EEGovernor(CurvingKinematics(), 1.0, 0.1)
+    governed = governor.govern((0.0,) * 5, (1.0, 0.0, 0.0, 0.0, 0.0))
+    assert governed[0] == pytest.approx(0.1)
+
+
+def test_a_non_finite_midpoint_basis_holds_the_arm():
+    class BrokenKinematics(LinearKinematics):
+        def jacobian(self, positions_rad):
+            at_start = positions_rad[0] == 0.0
+            return super().jacobian(positions_rad) if at_start else np.full((6, 5), np.nan)
+
+    current = (0.0,) * 5
+    assert EEGovernor(BrokenKinematics(), 1.0, 0.1).govern(current, (0.01, 0.0, 0.0, 0.0, 0.0)) is current
+
+
 def test_rate_step_lands_exactly_and_caps_beyond():
     assert rate_step(0.0, 1.0, 0.25) == 0.25
     assert rate_step(1.0, 0.0, 0.25) == 0.75

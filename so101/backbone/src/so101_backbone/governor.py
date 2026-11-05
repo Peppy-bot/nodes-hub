@@ -19,7 +19,7 @@ import numpy as np
 def rate_step(current: float, target: float, max_step: float) -> float:
     """One scalar step toward `target`: the target itself once within the
     cap (exact landing, no float residue), else one cap-sized step. The
-    gripper's ramp and each joint of the pose path step through it."""
+    gripper's ramp and each joint of a stream step through it."""
     delta = target - current
     if abs(delta) <= max_step:
         return target
@@ -56,9 +56,17 @@ class EEGovernor:
         # and `0.0 * inf` would carry it into the result regardless.
         if not np.all(np.isfinite(delta)):
             return current
-        twist = self._kinematics.jacobian(current) @ delta
-        linear = float(np.linalg.norm(twist[:3]))
-        if not math.isfinite(linear):
+        # A Jacobian at the step's start misses the motion of a large step that barely
+        # moves the hand to first order, and one at its midpoint reads the whole step's
+        # chord to third order. The larger bounds the chord of the step at any fraction,
+        # which is a mix of them, so the scaled step holds the cap.
+        midpoint = tuple(c + 0.5 * d for c, d in zip(current, delta, strict=True))
+        at_start, at_midpoint = (
+            float(np.linalg.norm((self._kinematics.jacobian(at) @ delta)[:3]))
+            for at in (current, midpoint)
+        )
+        linear = max(at_start, at_midpoint)
+        if not (math.isfinite(at_start) and math.isfinite(at_midpoint)):
             # A basis that cannot be evaluated is not a licence to run
             # uncapped.
             return current

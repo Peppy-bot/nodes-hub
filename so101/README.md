@@ -92,73 +92,55 @@ The backbone solves with lerobot's placo-based `RobotKinematics`.
 streaming small deltas rather than for reaching a pose from anywhere.
 `so101_description.kinematics` wraps it: a point-to-point solve iterates that
 step up to `IK_MAX_ITERATIONS` and accepts only when forward kinematics puts
-the grasp point within the goal's `plan_position_tolerance_m` and
-`plan_orientation_tolerance_rad` of the target, so a `move_arm` never moves
-the arm to a pose it did not actually reach. A `move_arm` goal whose solve
-finds no solution fails with `unreachable`, and `check_arm_move` answers
-`reachable` false with the same reason.
+the grasp point where the solve asks. A `move_arm` walks the straight line to the
+pose, as the OpenArm does: one verified solve per sample of the line, the grasp
+point within 1 mm of its sample and the last sample within 0.01 rad of a named
+orientation, and plays the configurations as a joint path, so a `move_arm` never moves the arm to a pose it did
+not actually reach. A `move_arm` goal no line reaches fails with `unreachable`, and
+`check_arm_move` answers `reachable` false with the same reason. A line, a joint move
+or a posture move the joint limits cannot run within 60 s fails with `rejected`.
 
 That verification makes refusals honest, not rare. The search stays a local
 descent from the arm's current posture, so it finds solutions on that branch
-and no others. Measured against poses that are reachable by construction (a
-joint vector drawn inside the model's limits, and its forward kinematics taken
-as the target, so a solution provably exists):
+and no others, and a line must solve at each of its samples. Measured on 300
+goals near an arbitrary in-limits posture, each a pose reachable by construction
+(the forward kinematics of a joint vector within 0.6 rad of the posture):
 
-| Seed posture | Refused |
+| Goal | Plans a line |
 |---|---|
-| Every joint at zero (the calibration middle) | 14% (n=400) |
-| An arbitrary in-limits posture, which is what `move_arm` seeds from | 39% (n=300) |
+| The pose, its orientation exactly reachable | 271 of 300 |
+| The pose, its orientation off by 0.05 rad | 52 of 300 |
+| Its position alone, `orientation` left out | 218 of 300 |
 
-Refusals concentrate near the base rather than at the rim: 25% within 0.23 m
-of the base against 7% beyond 0.45 m. The gap between the seed posture and the
-target posture shows no such gradient, so distance from the seed is not what
-predicts a refusal.
+Read a refusal as *this branch did not walk the line*, not as *the arm cannot
+reach it*. The same target frequently solves from a different starting posture.
+A caller that hits a refusal can move the arm somewhere else and ask again, or,
+where the launch runs a motion planner, plan a path with `plan_joint_path` and run
+it with `execute_joint_path`.
 
-Read a refusal as *this branch did not reach the pose*, not as *the arm cannot
-reach it*. The same target frequently solves from a different starting posture,
-which is why the seed posture dominates the table above. A caller that hits a
-refusal can move the arm somewhere else and ask again.
+### The path is a straight line
 
-### The path between the endpoints is not planned
+`move_arm` walks the line to the pose and plays its configurations as a joint path.
+On those goals the grasp point stays under 1 mm off the line. The orientation is
+free along the way and lands within 0.01 rad of a named orientation. A joint step past
+0.35 rad is a jump to another branch and refuses the line.
 
-`move_arm` plans endpoints only. It runs one IK solve for the goal pose and
-then moves from the current joints to the solution in a straight line **in
-joint space**. Nothing constrains where the end effector goes in between, and
-nothing verifies it. The arm does not walk the straight line between start and
-goal; it walks whatever curve the joint move traces.
-
-Measured over 200 solved pose moves, the end effector's greatest departure
-from the straight line between the endpoints:
-
-| | Departure |
-|---|---|
-| Median | 91 mm |
-| p90 | 240 mm |
-| Worst seen | 472 mm |
-
-On an arm whose whole reach is about 0.54 m, that is not a small bow. 6% of
-moves dip more than 20 mm below *both* endpoints, so a move between two points
-above the table can pass below the lower of them.
-
-The joint limits and the goal's duration time the move.
-
-Practically: keep the volume clear around more than the straight line. Teleop
-is unaffected, since the streaming path follows the commanded stream tick by
-tick and never plans between two poses.
+The joint limits and the goal's duration time the move. Teleop follows the commanded
+stream tick by tick and plans no line.
 
 Two further limits worth knowing:
 
 - **Orientation is hard to meet.** Five joints underactuate three rotational
   degrees of freedom, so orientation is a soft, low-weight objective of the QP,
-  and a goal that names a tight `plan_orientation_tolerance_rad` often has no
-  plan. A wide one admits the nearest the arm reaches, and a bar of π or more
-  admits any orientation; the move's settle judges the orientation it did
-  reach against `settle_orientation_tolerance_rad`.
+  and a goal that names an orientation the arm cannot end on within 0.01 rad has no
+  plan. A goal that leaves `orientation` out is a position alone: the solves aim at
+  the turn the line starts with, and on those goals it ends a median 0.17 rad and at
+  most 0.96 rad from it.
 - **The reach ball bounds outward extent only.** Streamed pose targets are
   clamped into a ball fitted to the sampled reachable set
   (`backbone/src/so101_backbone/reach.py`) so the streaming solver is never
   asked for a far-out-of-reach pose. Points near the base sit inside that ball
-  and are not clamped, which is the region where refusals cluster.
+  and are not clamped.
 
 This is accepted for now. Teleop through `xr_commander` drives the streaming
 path, which is best effort and unverified by design, and is unaffected. The
