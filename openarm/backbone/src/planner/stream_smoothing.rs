@@ -16,7 +16,6 @@ const MOVEIT_LOW_PASS_COEFF: f64 = 1.5;
 
 /// One second-order Butterworth per joint, so it smooths at least as much as
 /// MoveIt's first-order filter.
-#[derive(Clone, Copy)]
 pub(super) struct StreamSmoothing([ButterworthFilter; ARM_DOF]);
 
 impl StreamSmoothing {

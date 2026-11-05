@@ -44,7 +44,7 @@
 use control_core::positive_finite::PositiveFinite;
 use openarm_description::{ARM_DOF, ArmPair, DUAL_DOF, HardwareVersion, Side};
 use self_collision_model::DistanceGradient;
-use srs_model::{Jacobian, JointVec};
+use srs_model::JointVec;
 use tracing::{info, warn};
 
 use crate::types::{DualJointVec, arm_joints};
@@ -55,6 +55,7 @@ mod model;
 mod path_check;
 mod sense;
 
+pub use limiters::HandBasis;
 use limiters::{DofSpeed, EeSpeed, Limiter, Limits, MeasuredTripwire};
 use model::ConfiguredModel;
 pub use path_check::{GuardAt, PathBlocked, PathChecker};
@@ -433,11 +434,10 @@ impl Governor {
     ///    order-independence safe rather than merely convenient.
     ///
     /// `measured` is the real joint state and opening fractions, which only the
-    /// measured-state tripwire reads. `hands` carries each side's end-effector
-    /// Jacobian at the measured pose while that side follows the operator's
-    /// stream; a planned move rides with `None` there, because it was budgeted
-    /// against the cap at admission and capping it again per tick would stretch
-    /// it past its validated duration. The arms of each path in `paths` are
+    /// measured-state tripwire reads. `hands` carries each side's [`HandBasis`]
+    /// while that side follows the operator's stream; a planned move rides with
+    /// `None` there, because the joint limits timed it and the cap covers streams.
+    /// The arms of each path in `paths` are
     /// governed along their step: the limits take one fraction across the
     /// path's joints ([`Limits::along_paths`]), the barrier removes closing
     /// motion along the step alone ([`along_paths`]), and the floor scan
@@ -451,7 +451,7 @@ impl Governor {
         prev: &GovState,
         cand: &GovState,
         measured: &GovState,
-        hands: &ArmPair<Option<Jacobian>>,
+        hands: &ArmPair<Option<HandBasis>>,
         paths: &[PathArms],
         dt: f64,
     ) -> GovState {
@@ -522,7 +522,7 @@ impl Governor {
     /// speed cap. Nothing here reads the model or another limiter's output, so
     /// the order of this list changes only which name is recorded on a tie,
     /// never the governed step.
-    fn limit_speed(&self, step: &Step, hands: &ArmPair<Option<Jacobian>>, dt: f64) -> Limits {
+    fn limit_speed(&self, step: &Step, hands: &ArmPair<Option<HandBasis>>, dt: f64) -> Limits {
         let dof_speed = DofSpeed {
             max_step: std::array::from_fn(|i| self.dof_speed_limit(i) * dt),
         };
@@ -748,7 +748,7 @@ mod tests {
     const DT: f64 = 0.01;
     /// No side carries a stream basis: collision scenarios exercise the
     /// collision stages, not the EE cap.
-    const NO_HANDS: &ArmPair<Option<Jacobian>> = &ArmPair {
+    const NO_HANDS: &ArmPair<Option<HandBasis>> = &ArmPair {
         left: None,
         right: None,
     };
@@ -2167,8 +2167,8 @@ max={} us | over budget {over}/{}",
 
         // The speed limiters alone (no model).
         let hands = ArmPair::new(
-            Some(srs_model::Jacobian::zeros()),
-            Some(srs_model::Jacobian::zeros()),
+            Some(HandBasis::flat(srs_model::Jacobian::zeros())),
+            Some(HandBasis::flat(srs_model::Jacobian::zeros())),
         );
         let prev = at(home());
         let mut cand = prev;
@@ -3583,9 +3583,9 @@ max={} us | over budget {over}/{}",
         // cap's fraction of the command, on the streamed side only.
         for enabled in [true, false] {
             let mut g = governor(enabled);
-            let mut jac = Jacobian::zeros();
+            let mut jac = srs_model::Jacobian::zeros();
             jac[(0, 0)] = 1.0;
-            let hands = ArmPair::new(Some(jac), None);
+            let hands = ArmPair::new(Some(HandBasis::flat(jac)), None);
             let prev = at(home());
             let mut cand = prev;
             cand.arms.left[0] += 0.1;
@@ -3672,6 +3672,97 @@ max={} us | over budget {over}/{}",
             g.govern_along(&prev, &close, &measured, NO_HANDS, NO_PATHS, DT),
             prev,
             "the monitor froze the closing escape"
+        );
+    }
+
+    // Both kinds of stream, engaged far from the arm through the planner and the governor at
+    // the launcher's velocity limits: the grasp point, read by forward kinematics of what
+    // each tick commands, holds the stream cap, and every joint its velocity limit. The
+    // margin covers one tick's curvature, the arc the tip travels off the chord the cap
+    // sized.
+    #[hegel::test(test_cases = 12, seed = Some(2))]
+    fn a_stream_holds_the_linear_cap_and_the_velocity_limits(tc: hegel::TestCase) {
+        use crate::planner::{PlanConfig, Planner};
+        use crate::test_support::{claimed_move_slot, plan_config};
+        use crate::upstream::Upstream;
+        use openarm_description::{HardwareVersion, Side};
+        use srs_model::JointVec;
+        use tokio::sync::mpsc;
+
+        const VELOCITY_RAD_S: JointVec = [
+            16.754666, 16.754666, 5.445426, 5.445426, 20.943946, 20.943946, 20.943946,
+        ];
+        let model = bundled_arm(HardwareVersion::V2, Side::Left);
+        let limits = model.limits();
+        let cfg = PlanConfig {
+            max_joint_velocity_rad_s: VELOCITY_RAD_S,
+            stream_ee_velocity_m_s: TEST_EE_CAP_M_S,
+            limits,
+            cycle_period: std::time::Duration::from_secs_f64(DT),
+            ..plan_config()
+        };
+        let start = ready();
+        let far: JointVec = std::array::from_fn(|i| {
+            let (lo, hi) = (limits[i].lo, limits[i].hi);
+            tc.draw(
+                hegel::generators::floats()
+                    .min_value(lo + 0.1 * (hi - lo))
+                    .max_value(hi - 0.1 * (hi - lo)),
+            )
+        });
+        let streams_pose = tc.draw(hegel::generators::booleans());
+        let mut planner = Planner::new(Side::Left, model, cfg);
+        planner.commit(start.left);
+        let command = if streams_pose {
+            Upstream::Pose(planner.world_ee_pose(&far))
+        } else {
+            Upstream::Joints(far)
+        };
+        let mut governor = v2_governor(false);
+        let (_goal_tx, mut goals) = mpsc::channel(1);
+        let move_slot = claimed_move_slot();
+        let t0 = std::time::Instant::now();
+        let period = std::time::Duration::from_secs_f64(DT);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let mut held = at(start);
+        let mut fastest = 0.0_f64;
+        for k in 0..300u32 {
+            let tick = runtime.block_on(planner.tick(
+                held.arms.left,
+                Some(command),
+                &mut goals,
+                &move_slot,
+                t0 + period * k,
+            ));
+            let mut candidate = held;
+            candidate.arms.left = tick.candidate;
+            let hands = ArmPair::new(tick.streamed_hand, None);
+            let governed = governor.govern_along(&held, &candidate, &held, &hands, NO_PATHS, DT);
+            for (i, limit) in VELOCITY_RAD_S.iter().enumerate() {
+                let speed = (governed.arms.left[i] - held.arms.left[i]).abs() / DT;
+                assert!(
+                    speed <= limit * (1.0 + 1e-9),
+                    "joint {i} at {speed} rad/s at tick {k}"
+                );
+            }
+            let (from, to) = (
+                planner.world_ee_pose(&held.arms.left),
+                planner.world_ee_pose(&governed.arms.left),
+            );
+            fastest = fastest.max((to.translation.vector - from.translation.vector).norm() / DT);
+            planner.commit(governed.arms.left);
+            held = governed;
+        }
+        assert!(
+            fastest <= TEST_EE_CAP_M_S * 1.05,
+            "the grasp point reached {fastest} m/s"
+        );
+        assert!(
+            fastest >= TEST_EE_CAP_M_S * 0.5,
+            "the stream never pressed against the cap: {fastest} m/s"
         );
     }
 }

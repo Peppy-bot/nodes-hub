@@ -9,6 +9,11 @@
 //! The basis is per side and present only while that side follows the
 //! operator's stream: a planned move tracks the schedule the joint limits
 //! timed. Openings are never capped here; a gripper does not move the hand.
+//!
+//! A Jacobian at the step's start misses the motion of a large step that barely
+//! moves the hand to first order, and one at its midpoint reads the whole step's
+//! chord to third order. The larger of the two bounds the chord of the step at any
+//! fraction, which is a mix of them, so the scaled step holds the cap.
 
 use srs_model::Jacobian;
 use srs_model::nalgebra::SVector;
@@ -19,12 +24,32 @@ use super::super::{DUAL_DOF, dof_side, step_change};
 use super::allowance::Allowance;
 use super::{Limiter, Step};
 
+/// A streamed hand's Jacobians for one tick's step.
+#[derive(Clone, Copy, Debug)]
+pub struct HandBasis {
+    /// At the held setpoint, where the step starts.
+    pub start: Jacobian,
+    /// At the midpoint of the step the planner proposes.
+    pub midpoint: Jacobian,
+}
+
+#[cfg(test)]
+impl HandBasis {
+    /// The basis of a hand whose Jacobian does not change over the step.
+    pub(crate) fn flat(jacobian: Jacobian) -> Self {
+        Self {
+            start: jacobian,
+            midpoint: jacobian,
+        }
+    }
+}
+
 pub(in crate::governor) struct EeSpeed<'tick> {
     /// The commanded cap on the hand's linear speed (m/s), validated positive.
     pub cap_m_s: f64,
-    /// Each side's end-effector Jacobian at the measured pose, present only
-    /// while that side's target is the operator's stream.
-    pub hands: &'tick ArmPair<Option<Jacobian>>,
+    /// Each side's basis, present only while that side's target is the operator's
+    /// stream.
+    pub hands: &'tick ArmPair<Option<HandBasis>>,
     pub dt: f64,
 }
 
@@ -32,15 +57,17 @@ impl EeSpeed<'_> {
     /// The uniform fraction that keeps one side's hand at or under the cap:
     /// 1.0 for a planned move (no basis) or a step already under it.
     ///
-    /// The stream boundary rejects non-finite measured states, so the Jacobian
-    /// and with it the hand speed are finite by construction; if that ever
+    /// A stream's commands are parsed finite, so the setpoint, its Jacobians and
+    /// with them the hand speed are finite by construction; if that ever
     /// stops holding, a basis that cannot be evaluated is not a licence to run
     /// uncapped, so it freezes the side like every other fail-safe here.
-    fn side_fraction(&self, jac: &Option<Jacobian>, arm_step: &[f64; ARM_DOF]) -> f64 {
-        let Some(jac) = jac else { return 1.0 };
-        let twist = jac * SVector::<f64, ARM_DOF>::from_column_slice(arm_step);
-        let hand_speed = twist.fixed_rows::<3>(0).norm() / self.dt;
-        if !hand_speed.is_finite() {
+    fn side_fraction(&self, hand: &Option<HandBasis>, arm_step: &[f64; ARM_DOF]) -> f64 {
+        let Some(hand) = hand else { return 1.0 };
+        let step = SVector::<f64, ARM_DOF>::from_column_slice(arm_step);
+        let speed_by = |jacobian: &Jacobian| (jacobian * step).fixed_rows::<3>(0).norm() / self.dt;
+        let (at_start, at_midpoint) = (speed_by(&hand.start), speed_by(&hand.midpoint));
+        let hand_speed = at_start.max(at_midpoint);
+        if !(at_start.is_finite() && at_midpoint.is_finite()) {
             0.0
         } else if hand_speed > self.cap_m_s {
             self.cap_m_s / hand_speed
@@ -96,7 +123,7 @@ mod tests {
 
     #[test]
     fn a_hand_moving_step_is_scaled_to_the_cap() {
-        let hands = ArmPair::new(Some(x_only_jacobian()), None);
+        let hands = ArmPair::new(Some(HandBasis::flat(x_only_jacobian())), None);
         let ee = EeSpeed {
             cap_m_s: 0.25,
             hands: &hands,
@@ -114,9 +141,53 @@ mod tests {
         assert_eq!(governed[1..], [0.0; GOV_DOF - 1]);
     }
 
+    // A step that barely moves the hand at the start of the step moves it at the
+    // midpoint, where the curve of the chain has turned the joint's sweep toward it.
+    #[test]
+    fn a_step_only_its_midpoint_reads_as_moving_the_hand_is_scaled_to_the_cap() {
+        let hands = ArmPair::new(
+            Some(HandBasis {
+                start: Jacobian::zeros(),
+                midpoint: x_only_jacobian(),
+            }),
+            None,
+        );
+        let ee = EeSpeed {
+            cap_m_s: 0.25,
+            hands: &hands,
+            dt: DT,
+        };
+        let mut arm = [0.0; ARM_DOF];
+        arm[0] = 0.1;
+        let step = step_with_left_arm(arm);
+        assert!((ee.allow(&step).apply(&step)[0] - 0.25 * DT).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_basis_with_a_non_finite_jacobian_freezes_the_side() {
+        let mut broken = Jacobian::zeros();
+        broken[(0, 0)] = f64::NAN;
+        let hands = ArmPair::new(
+            Some(HandBasis {
+                start: x_only_jacobian(),
+                midpoint: broken,
+            }),
+            None,
+        );
+        let ee = EeSpeed {
+            cap_m_s: 0.25,
+            hands: &hands,
+            dt: DT,
+        };
+        let mut arm = [0.0; ARM_DOF];
+        arm[0] = 0.1;
+        let step = step_with_left_arm(arm);
+        assert_eq!(ee.allow(&step).apply(&step)[0], 0.0);
+    }
+
     #[test]
     fn a_step_that_does_not_move_the_hand_passes_bit_exact() {
-        let hands = ArmPair::new(Some(Jacobian::zeros()), None);
+        let hands = ArmPair::new(Some(HandBasis::flat(Jacobian::zeros())), None);
         let ee = EeSpeed {
             cap_m_s: 0.25,
             hands: &hands,
@@ -150,7 +221,7 @@ mod tests {
         // rest of the pipeline: restrictive, never permissive.
         let mut jac = Jacobian::zeros();
         jac[(0, 0)] = f64::NAN;
-        let hands = ArmPair::new(Some(jac), None);
+        let hands = ArmPair::new(Some(HandBasis::flat(jac)), None);
         let ee = EeSpeed {
             cap_m_s: 0.25,
             hands: &hands,
@@ -172,7 +243,9 @@ mod tests {
         // streamed (basis-carrying) side and 0.2 rad on the planned one: the
         // streamed side alone is scaled to the cap, whichever side streams.
         for streamed in Side::BOTH {
-            let hands = ArmPair::from_fn(|side| (side == streamed).then(x_only_jacobian));
+            let hands = ArmPair::from_fn(|side| {
+                (side == streamed).then(|| HandBasis::flat(x_only_jacobian()))
+            });
             let ee = EeSpeed {
                 cap_m_s: 0.25,
                 hands: &hands,

@@ -57,11 +57,24 @@ pub fn pose_from_wire(
     position: [f64; 3],
     orientation: [f64; 4],
 ) -> Result<Isometry3<f64>, &'static str> {
-    if !position
-        .iter()
-        .chain(orientation.iter())
-        .all(|v| v.is_finite())
-    {
+    Ok(Isometry3::from_parts(
+        position_from_wire(position)?,
+        orientation_from_wire(orientation)?,
+    ))
+}
+
+/// A wire position, or a refusal of one with a non-finite value.
+pub fn position_from_wire(position: [f64; 3]) -> Result<Translation3<f64>, &'static str> {
+    if !position.iter().all(|v| v.is_finite()) {
+        return Err("non-finite values");
+    }
+    Ok(Translation3::new(position[0], position[1], position[2]))
+}
+
+/// A wire orientation, normalized, or a refusal of one with a non-finite value or
+/// too short to normalize.
+pub fn orientation_from_wire(orientation: [f64; 4]) -> Result<UnitQuaternion<f64>, &'static str> {
+    if !orientation.iter().all(|v| v.is_finite()) {
         return Err("non-finite values");
     }
     // The wire is scalar-last [x, y, z, w]; nalgebra's Quaternion is
@@ -72,13 +85,7 @@ pub fn pose_from_wire(
         orientation[1],
         orientation[2],
     );
-    let Some(rotation) = UnitQuaternion::try_new(quaternion, QUATERNION_MIN_NORM) else {
-        return Err("an unnormalizable orientation");
-    };
-    Ok(Isometry3::from_parts(
-        Translation3::new(position[0], position[1], position[2]),
-        rotation,
-    ))
+    UnitQuaternion::try_new(quaternion, QUATERNION_MIN_NORM).ok_or("an unnormalizable orientation")
 }
 
 /// This robot's limb tables as the limb_state contract carries them, wire

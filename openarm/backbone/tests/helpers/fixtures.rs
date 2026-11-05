@@ -1,20 +1,17 @@
 //! The OpenArm models, the launcher's limits and the field-recorded poses the
 //! plan regressions run on.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use control_core::path_timing::{JointTrajectory, distinct_joint_waypoints};
 use openarm_description::{ARM_DOF, HardwareVersion, Side};
 use srs_model::chain_kinematics::pose_miss;
 use srs_model::nalgebra::{Isometry3, Quaternion, Translation3, UnitQuaternion};
-use srs_model::{Arm, ArmAnglePolicy, JointVec, PlanLimits};
+use srs_model::{Arm, ArmAnglePolicy, JointVec};
 
-pub const EPS: f64 = 1e-9;
-
-/// How far (m, rad) a line's last solve may land from its goal.
-const LANDING_SLACK: f64 = 1e-6;
-
-/// The longest a move may take (`MAX_MOVE_DURATION_S`).
-pub const LONGEST_MOVE: Duration = Duration::from_secs(60);
+/// How far (m, rad) a line's last solve may land from its goal: a descent's
+/// convergence, as KDL's `CartToJnt` judges it.
+const LANDING_SLACK: f64 = 1e-5;
 
 /// The joint whose zero is the wrist's singular surface.
 pub const WRIST_BEND: usize = 5;
@@ -26,10 +23,6 @@ pub const A_MAX: JointVec = [0.5; ARM_DOF];
 pub const V_MAX_V2: JointVec = [
     16.754666, 16.754666, 5.445426, 5.445426, 20.943946, 20.943946, 20.943946,
 ];
-
-pub const V_MAX_V1: JointVec = [1.0; ARM_DOF];
-
-pub const TEST_DT: Duration = Duration::from_millis(10);
 
 pub const READY: JointVec = [0.1537, 0.39547, -0.4808, 0.95, -0.0008, 0.0046, -0.0008];
 
@@ -88,21 +81,16 @@ pub fn tip_world(model: &Arm, q: &JointVec) -> Isometry3<f64> {
     model.world_pose(&model.at(q).tip_pose())
 }
 
-pub fn limits_for(max_joint_velocity_rad_s: JointVec) -> PlanLimits {
-    PlanLimits {
-        max_joint_velocity_rad_s,
-        max_joint_acceleration_rad_s2: A_MAX,
-        control_period: TEST_DT,
-        max_duration: LONGEST_MOVE,
-    }
-}
-
-pub fn v2_limits() -> PlanLimits {
-    limits_for(V_MAX_V2)
-}
-
-pub fn v1_limits() -> PlanLimits {
-    limits_for(V_MAX_V1)
+/// The trajectory through `walk` at the launcher's v2 limits, resting at no sample
+/// before the end, as fast as they allow, starting at `now`.
+pub fn played(walk: &[JointVec], now: Instant) -> JointTrajectory<ARM_DOF> {
+    JointTrajectory::through(
+        &distinct_joint_waypoints(walk),
+        &V_MAX_V2,
+        &A_MAX,
+        Duration::ZERO,
+        now,
+    )
 }
 
 pub fn ready_pose(model: &Arm) -> Isometry3<f64> {

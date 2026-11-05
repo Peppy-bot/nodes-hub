@@ -22,13 +22,6 @@ use srs_model::{Arm, ArmAnglePolicy};
 /// radians): the form the panel edits and displays.
 pub type Pose = [f64; 6];
 
-const DEG: f64 = std::f64::consts::PI / 180.0;
-
-/// The slack the panel asks the backbone to plan a pose move within, sent as
-/// `move_arm`'s `plan_*` tolerances; a goal it cannot plan this closely is refused.
-pub const PLAN_POS_TOL_M: f64 = 0.005;
-pub const PLAN_ANGLE_TOL_RAD: f64 = 5.0 * DEG;
-
 /// The two per-side arm models (FK/IK/limits) behind mutexes, plus each
 /// side's URDF joint velocity limits.
 ///

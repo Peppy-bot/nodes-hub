@@ -485,9 +485,8 @@ dependencies = [
 [[package]]
 name = "chain_kinematics"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#b27d9878c574e3cbb7bf96c9909c371941bd1370"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#a0f4e6dd029afb80f037f0e88e5580d766107b83"
 dependencies = [
- "control_core",
  "nalgebra",
  "thiserror 2.0.21",
  "urdf-rs",
@@ -618,7 +617,7 @@ dependencies = [
 [[package]]
 name = "control_core"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#b27d9878c574e3cbb7bf96c9909c371941bd1370"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#a0f4e6dd029afb80f037f0e88e5580d766107b83"
 dependencies = [
  "thiserror 2.0.21",
  "tokio",
@@ -2417,7 +2416,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 [[package]]
 name = "openarm_description"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#b27d9878c574e3cbb7bf96c9909c371941bd1370"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#a0f4e6dd029afb80f037f0e88e5580d766107b83"
 dependencies = [
  "serde",
  "srs_model",
@@ -3803,10 +3802,9 @@ dependencies = [
 [[package]]
 name = "srs_model"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#b27d9878c574e3cbb7bf96c9909c371941bd1370"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#a0f4e6dd029afb80f037f0e88e5580d766107b83"
 dependencies = [
  "chain_kinematics",
- "control_core",
  "nalgebra",
  "thiserror 2.0.21",
  "urdf-rs",

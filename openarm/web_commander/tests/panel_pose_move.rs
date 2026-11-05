@@ -1,6 +1,6 @@
 //! The Cartesian arm move end to end over the panel's WebSocket: firing a pose
-//! must land a `move_arm` goal on the limb_motion mock carrying the panel's
-//! plan tolerances and the operator's settle tolerances and timeout, the
+//! must land a `move_arm` goal on the limb_motion mock carrying the operator's
+//! settle tolerances and timeout, the
 //! backbone's verdict must come back as the status as it stands, a pose the
 //! panel's own exact IK cannot solve must still reach the backbone, whose
 //! failure surfaces as the status, and a refusal of the backbone surfaces as
@@ -12,7 +12,6 @@ mod helpers;
 
 use std::time::Duration;
 
-use openarm_web_commander::{PLAN_ANGLE_TOL_RAD, PLAN_POS_TOL_M};
 use peppygen::fixtures::harness::{Config, Harness};
 use peppygen::mock::deps::limb_motion::{move_arm, move_arm_joints};
 use srs_model::nalgebra::UnitQuaternion;
@@ -24,8 +23,7 @@ const PANEL_PORT: u16 = 18637;
 /// preview.
 const SETTLED_JOINTS: [f64; 7] = [0.1, 0.1, -0.2, 0.9, 0.1, -0.1, 0.0];
 
-/// The settle fields the operator types for the pose move, each covering the
-/// panel's plan tolerance of its axis as the backbone requires.
+/// The settle fields the operator types for the pose move.
 const SETTLE_POSITION_TOLERANCE_M: f64 = 0.012;
 const SETTLE_ORIENTATION_TOLERANCE_RAD: f64 = 0.12;
 const SETTLE_TIMEOUT_S: f64 = 1.5;
@@ -47,7 +45,7 @@ fn left_pose_command(position: [f64; 3], rotation: &UnitQuaternion<f64>) -> Stri
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn firing_a_pose_carries_the_plan_and_settle_fields_and_reports_the_backbone_verdict()
+async fn firing_a_pose_carries_the_settle_fields_and_reports_the_backbone_verdict()
 -> peppygen::Result<()> {
     let (harness, mut mocks) = Harness::start_with(
         Config {
@@ -121,14 +119,6 @@ async fn firing_a_pose_carries_the_plan_and_settle_fields_and_reports_the_backbo
         .await?;
     assert_eq!(pending.request.arm_name, "left_arm");
     assert_eq!(
-        pending.request.plan_position_tolerance_m, PLAN_POS_TOL_M,
-        "the panel must ask the backbone to plan to its own position slack"
-    );
-    assert_eq!(
-        pending.request.plan_orientation_tolerance_rad, PLAN_ANGLE_TOL_RAD,
-        "the panel must ask the backbone to plan to its own orientation slack"
-    );
-    assert_eq!(
         (
             pending.request.settle_position_tolerance_m,
             pending.request.settle_orientation_tolerance_rad,
@@ -141,7 +131,11 @@ async fn firing_a_pose_carries_the_plan_and_settle_fields_and_reports_the_backbo
         ),
         "the goal must carry the operator's settle fields as typed"
     );
-    let (goal_position, goal_orientation) = (pending.request.position, pending.request.orientation);
+    let goal_position = pending.request.position;
+    let goal_orientation = pending
+        .request
+        .orientation
+        .expect("the panel names an orientation");
     let active = pending.accept().await?;
 
     ws.snapshot_until(Duration::from_secs(10), "left pose move in flight", |s| {
@@ -192,8 +186,8 @@ async fn firing_a_pose_carries_the_plan_and_settle_fields_and_reports_the_backbo
 
     // --- no exact solution still fires; the backbone's failure surfaces -----
     // Two metres out has no exact IK solution, so the preview cannot be
-    // solved; the goal must reach the backbone anyway, and its failure, the
-    // one naming the plan tolerance, must come back as the operator status.
+    // solved; the goal must reach the backbone anyway, and its failure must come
+    // back as the operator status.
     let far = [position[0] + 2.0, position[1], position[2]];
     ws.send_text(&left_pose_command(far, &rotation))
         .await
@@ -207,12 +201,9 @@ async fn firing_a_pose_carries_the_plan_and_settle_fields_and_reports_the_backbo
         .await?;
     let active = pending.accept().await?;
     active
-        .fail(
-            move_arm::FailureKind::Unreachable,
-            "goal pose not planned within 5.0 mm / 5.0 deg",
-        )
+        .fail(move_arm::FailureKind::Unreachable, "goal pose not planned")
         .await?;
-    let unreachable = "move_arm (left) failed: unreachable: goal pose not planned within 5.0 mm";
+    let unreachable = "move_arm (left) failed: unreachable: goal pose not planned";
     ws.snapshot_until(Duration::from_secs(15), "backbone failure surfaced", |s| {
         s["left_arm"]["in_flight"] == false
             && s["status"]

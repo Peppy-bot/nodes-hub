@@ -26,9 +26,7 @@ a page on port 8765 by default, with three interaction modes:
   value out of its range with `rejected`. The status line shows each refusal
   and failure as its failure kind and message, such as `backbone refused the
   goal: leader_streaming: ...` or `move_arm (left) failed: unreachable: ...`,
-  and a cancelled move with its reason. A pose's settle tolerances must cover
-  the panel's own plan tolerances of 5 mm and 5 degrees, since the plan may
-  sit that far from the composed pose. The gripper card's **settle timeout
+  and a cancelled move with its reason. The gripper card's **settle timeout
   (s)**, prefilled 2 s, is the longest the backbone waits after the commanded
   travel for the jaws to stand still. The move then reports where the jaws
   stand, and the status line says when they had not stood still by the

@@ -769,7 +769,7 @@ pub fn judge_path(
         return Err(Failure::new(FailureKind::Unreachable, stopped));
     }
     let traj = plan.trajectory(Instant::now());
-    check_move_time(&traj, "path", "paths of fewer waypoints")?;
+    check_move_time(&traj, "path", "split it into paths of fewer waypoints")?;
     checker
         .check(arms, guard, traj.path(), stop)
         .map_err(|blocked| Failure::new(FailureKind::Unreachable, blocked))
@@ -968,11 +968,11 @@ fn check_start(
 /// [`MAX_MOVE_DURATION_S`], with `rejected` and its time. The duration a goal
 /// requests lies within that ceiling, so such a trajectory takes the time
 /// the joint velocity and acceleration caps run it in. `what` names the move
-/// and `split_into` what the caller splits it into.
+/// and `remedy` what the caller does about it.
 pub(super) fn check_move_time<const N: usize>(
     traj: &JointTrajectory<N>,
     what: &str,
-    split_into: &str,
+    remedy: &str,
 ) -> Result<(), Failure> {
     let time_s = traj.clock().duration().as_secs_f64();
     if time_s <= MAX_MOVE_DURATION_S {
@@ -982,7 +982,7 @@ pub(super) fn check_move_time<const N: usize>(
         FailureKind::Rejected,
         format!(
             "the joint velocity and acceleration caps take {time_s:.1} s to run this {what}, \
-             past the {MAX_MOVE_DURATION_S:.0} s a move may take; split it into {split_into}"
+             past the {MAX_MOVE_DURATION_S:.0} s a move may take; {remedy}"
         ),
     ))
 }

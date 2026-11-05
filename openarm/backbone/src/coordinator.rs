@@ -607,11 +607,7 @@ async fn serve_request(
             None
         }
         CoordinatorRequest::CheckArmMove { request, reply } => {
-            let _ = reply.send(planners[request.side].check_cartesian(
-                &request.target,
-                request.tolerance,
-                request.duration,
-            ));
+            let _ = reply.send(planners[request.side].check_cartesian(&request));
             None
         }
         CoordinatorRequest::MeasureGrasps { reply } => {
@@ -1223,7 +1219,6 @@ mod tests {
     use control_core::path_timing::RoundedPath;
 
     use crate::planner::{PathGuard, ShareReport};
-    use crate::settle::PoseTolerance;
     use crate::types::dual_joints;
     use openarm_description::ArmOrder;
     use srs_model::nalgebra::Vector3;
@@ -2459,27 +2454,22 @@ mod tests {
         let (mut channels, followers, mut planners) = followed_arms();
         let mut recovered = BOTH_HELD.right;
         recovered[0] += 0.2;
-        let tolerance = PoseTolerance {
-            position_m: 0.001,
-            orientation_rad: 0.01,
-        };
         let pose = planner_holding(Side::Right, recovered).world_ee_pose(&recovered);
         let target = Isometry3::from_parts(
             (pose.translation.vector + Vector3::new(0.0, 0.0, 0.02)).into(),
             pose.rotation,
         );
-        let check_from = |held: JointVec| {
-            planner_holding(Side::Right, held).check_cartesian(&target, tolerance, Duration::ZERO)
+        let request = ArmMoveRequest {
+            side: Side::Right,
+            position: target.translation,
+            orientation: Some(target.rotation),
+            duration: Duration::ZERO,
         };
+        let check_from =
+            |held: JointVec| planner_holding(Side::Right, held).check_cartesian(&request);
         let (from_recovered, from_frozen) = (check_from(recovered), check_from(BOTH_HELD.right));
         assert_ne!(from_recovered, from_frozen, "the two starts plan apart");
         let (reply, answer) = oneshot::channel();
-        let request = ArmMoveRequest {
-            side: Side::Right,
-            target,
-            tolerance,
-            duration: Duration::ZERO,
-        };
         serve_as_right_recovers(
             &mut channels,
             &followers,
