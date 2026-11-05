@@ -1,11 +1,11 @@
 """The scene_manipulation and object_state provider: what get_assets_list and
-get_asset answer before and after discovery, what load_scene and clear_scene do to spawned
-objects, what get_object_states answers: an error reply until a capture, then
-the latest capture under its own stamp, every completed edit included, what
-get_object answers for one object of that capture, what a load_scene or
-spawn_object goal reports on its feedback, and the failure kind of each goal
-refused when it arrives, of each goal whose command fails, and of each error
-reply."""
+get_asset answer before and after discovery, what load_scene and clear_scene
+do to spawned objects, what get_object_states answers: an error reply until a
+capture, then the latest capture under its own stamp, every completed edit
+included, what get_object answers for one object of that capture, what a
+load_scene or spawn_object goal reports on its feedback, and the failure kind
+of each goal refused when it arrives, of each goal whose command fails, and of
+each error reply."""
 
 import asyncio
 import contextlib

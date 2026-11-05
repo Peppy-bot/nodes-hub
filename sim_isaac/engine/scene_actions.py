@@ -125,6 +125,12 @@ def _rejected(message: str) -> SceneFailure:
     return SceneFailure(REJECTED, message)
 
 
+def _unknown_asset(asset_id: str) -> SceneFailure:
+    """The refusal of an id that names no asset of the catalogue."""
+
+    return _rejected(f"Unknown asset_id: {asset_id}")
+
+
 @dataclass(frozen=True)
 class _Load:
     """A load_scene command, checked: the scene asset and the scale it
@@ -531,10 +537,10 @@ class SceneActionIO:
         # get_assets_list says so rather than answering with nothing.
         self._assets: dict[str, dict] = {}
         self._assets_ready = False
-        # The catalogue as a caller sees it, and each asset's category,
-        # both built once when the assets come.
+        # The catalogue as a caller sees it, and each entry of it by its
+        # asset id, both built once when the assets come.
         self._catalogue: list[dict] = []
-        self._category_by_asset: dict[str, str] = {}
+        self._public_by_asset: dict[str, dict] = {}
         # The spawned objects in spawn order: what each was spawned from and
         # with. Where each one is comes from the engine at capture.
         self._objects: dict[str, dict] = {}
@@ -627,8 +633,8 @@ class SceneActionIO:
                 for asset_id, asset in assets.items()
             }
             self._catalogue = _public_catalogue(self._assets.values())
-            self._category_by_asset = {
-                asset["asset_id"]: asset["category"]
+            self._public_by_asset = {
+                asset["asset_id"]: asset
                 for asset in self._catalogue
             }
             self._assets_ready = True
@@ -698,7 +704,7 @@ class SceneActionIO:
         asset = self._asset(asset_id)
 
         if asset is None:
-            raise _rejected(f"Unknown asset_id: {asset_id}")
+            raise _unknown_asset(asset_id)
 
         if asset.get("kind") != kind:
             raise _rejected(f"Asset is not {_ASSET_KIND_WORDS[kind]}: {asset_id}")
@@ -761,13 +767,12 @@ class SceneActionIO:
         self._require_catalogue()
 
         asset_id = request.data.asset_id
-        entry = next(
-            (asset for asset in self._public_assets() if asset["asset_id"] == asset_id),
-            None,
-        )
+
+        with self._lock:
+            entry = self._public_by_asset.get(asset_id)
 
         if entry is None:
-            raise _rejected(f"Unknown asset_id: {asset_id}")
+            raise _unknown_asset(asset_id)
 
         return get_asset.Response(
             asset_json=json.dumps(entry, separators=(",", ":")),
@@ -820,13 +825,15 @@ class SceneActionIO:
         snapshot = self._latest_snapshot()
 
         with self._lock:
-            category_by_asset = self._category_by_asset
+            public_by_asset = self._public_by_asset
 
         objects = []
 
         if source != "scene":
             for record in snapshot.objects:
-                asset_category = category_by_asset.get(record.asset_id, "")
+                asset_category = public_by_asset.get(record.asset_id, {}).get(
+                    "category", ""
+                )
 
                 if category is not None and category != asset_category:
                     continue
