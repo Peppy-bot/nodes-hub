@@ -196,7 +196,7 @@ async def _fetch_assets(node_runner: NodeRunner) -> list[dict]:
         response = await get_assets_list.poll(
             node_runner,
             producer,
-            get_assets_list.Request(kind=None, category=None, query=None),
+            get_assets_list.Request(kind=None, category=None, query=None, work_surface_kind=None),
             timeout=SERVICE_TIMEOUT_S,
         )
 
