@@ -18,14 +18,12 @@ POSITION = (0.5, 0.1, 0.7)
 ORIENTATION = (0.0, 0.0, 0.0, 1.0)
 # The tolerances and settle timeout the moves below name.
 BARS = {
-    "plan_position_tolerance_m": 0.001,
-    "plan_orientation_tolerance_rad": 0.01,
     "settle_position_tolerance_m": 0.02,
     "settle_orientation_tolerance_rad": 0.15,
     "settle_timeout_s": 2.0,
 }
-# The fields a check names besides the pose: the moves' plan bars.
-PLAN = {"duration_s": 0.0, **{key: BARS[key] for key in ("plan_position_tolerance_m", "plan_orientation_tolerance_rad")}}
+# The field a check names besides the pose.
+PLAN = {"duration_s": 0.0}
 
 
 def robot_on(node_runner, **kwargs) -> Robot:
