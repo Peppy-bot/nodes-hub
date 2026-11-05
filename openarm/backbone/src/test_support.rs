@@ -14,7 +14,6 @@ use std::time::Duration;
 
 use control_core::path_timing::RoundedPath;
 use openarm_description::{ARM_DOF, ArmOrder, ArmPair, HardwareVersion, Side};
-use srs_model::chain_kinematics::command_smoothing;
 use srs_model::{Arm, JointVec, Limit};
 
 use tokio::sync::mpsc;
@@ -52,7 +51,6 @@ pub(crate) fn bundled_arm(version: HardwareVersion, side: Side) -> Arm {
 pub(crate) fn plan_config() -> PlanConfig {
     PlanConfig {
         cycle_period: TEST_PERIOD,
-        smoothing: command_smoothing(TEST_PERIOD).unwrap(),
         max_joint_velocity_rad_s: [10.0; ARM_DOF],
         max_joint_acceleration_rad_s2: A_MAX,
         stream_ee_velocity_m_s: 1.0,

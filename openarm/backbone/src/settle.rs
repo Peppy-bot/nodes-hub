@@ -7,7 +7,6 @@ use std::time::{Duration, Instant};
 
 use openarm_description::ARM_DOF;
 use srs_model::JointVec;
-use srs_model::chain_kinematics::{ServoTolerances, ToleranceError};
 use srs_model::nalgebra::Isometry3;
 
 /// The slack a move's measured limb must stand within, judged from the
@@ -29,12 +28,6 @@ pub struct PoseTolerance {
 }
 
 impl PoseTolerance {
-    /// The same slack as the guarded servo's arrival bar, or the refusal of a
-    /// value that is not a slack.
-    pub fn servo(&self) -> Result<ServoTolerances, ToleranceError> {
-        ServoTolerances::new(self.position_m, self.orientation_rad)
-    }
-
     /// Refuse this settle slack where it lies below `plan`'s on an axis,
     /// naming the field to raise: the plan may sit that far from the pose.
     pub fn covers(&self, plan: &Self) -> Result<(), String> {

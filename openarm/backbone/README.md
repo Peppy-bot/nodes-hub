@@ -176,20 +176,19 @@ the model with it, so the pose solved for, the pose reported, and the point the
 EE speed cap applies to are one frame. One move per side at a time (a
 single-flight move slot whose release rides a drop guard, held by the move,
 or by the coordinator for a goal it ends before the move starts, so every
-terminal frees it). `move_arm` plans the quietest tier that works (`srs_model::plan_cartesian`): a
-line with the elbow held, a line with the elbow swiveled toward the widest
-joint-limit margin or the highest manipulability, or the guarded servo
-(`chain_kinematics::plan_servo`, a damped resolved-rate law that can cross
-singular surfaces a discrete IK walk cannot, rolled out offline and played from
-rest to rest). Every plan is timed from rest to rest within the joint velocity
-and acceleration limits
+terminal frees it). `move_arm` plans a straight line (`srs_model::plan_line`):
+with the elbow held, or swiveled toward the widest joint-limit margin or the
+highest manipulability. Every plan is timed from rest to rest within the joint
+velocity and acceleration limits
 (`control_core::path_timing`, the time-optimal timing of a path through
 waypoints), and a line is checked tick by tick for the velocity and the
-acceleration as the runtime will command it before it runs. Planning runs after
+acceleration as the runtime will command it before it runs. A line lands on the
+goal pose, so it sits inside any plan tolerance. Planning runs after
 admission (peppy's goal decision is pre-context, so reachability cannot be a
-refusal): an accepted goal whose pose no tier reaches, servo rollout
-included, fails at once with `unreachable` and `goal pose not planned within
-...`. From the planned end of its
+refusal): an accepted goal that no line reaches within 60 s fails at once with
+`unreachable` and `goal pose not planned within ...`, a message that names
+`plan_joint_path` and `execute_joint_path`, which reach what a line cannot.
+From the planned end of its
 trajectory on, an arm move keeps commanding the target and judges the
 measured arm against it: a joint move completes once every joint stands
 within its `settle_tolerances_rad` entry of its target, a Cartesian move once
@@ -503,6 +502,7 @@ The robot's own body is not checked for hiding a point from the camera.
 | `move_slot.rs` | `MoveSlot`, each limb's single-flight move slot (claim, release, and the `SlotRelease` a move holds), and the refusals of a busy limb | one owner for the slot the action handlers claim, and release when a goal never reaches the coordinator, and the planners and the coordinator release when they end a goal or its move |
 | `planner.rs` | per-arm mode machine (Follow / joint move / Cartesian move / share of an `execute_joint_path` path) -> one rate-limited candidate + the stream-tick Jacobian | knows one arm only, but for the path its share follows; never the collision model |
 | `planner/path.rs` | the shares of an `execute_joint_path` path: its start on the arms it names (`start_path`), its judgment (`judge_path`, `resume_judged_path`), the pace a committed step plays its clock at, one pace for the two clocks of a path of both arms (`commit_both`) | reaches the collision model only through the `PathGuard` `judge_path` is handed |
+| `planner/stream_smoothing.rs` | the smoothing of a streamed pose's steps: one Butterworth per joint at MoveIt Servo's default cutoff for the control period | a smoother can overshoot its input, so the planner holds its output to the velocity limit |
 | `path_checks.rs` | the judgments of `execute_joint_path` paths on a blocking thread, and the resumption of their shares on the tick each judgment comes | the loop never waits on a judgment |
 | `settle.rs` | `Settle`, `PoseTolerance` (the slack a Cartesian move is planned and settled within), the verdict an arm move gets from its planned end on, and how far a joint target or a grasp point still stands from its target | one rule for the joint and the Cartesian move |
 | `governor/mod.rs` | `GovState`, the pipeline, the runtime controls, disposition and readout | the only mutable resource is the collision model |

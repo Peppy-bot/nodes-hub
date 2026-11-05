@@ -55,16 +55,6 @@ pub enum NodeError {
     #[error("parameter follower_state_rate_hz")]
     FollowerStateRate(#[source] liveness::StaleLimitOutOfRange),
 
-    #[error(
-        "control_rate_hz ({rate_hz}) is too slow for the servo's command smoothing; \
-         its cutoff needs the loop's Nyquist rate above it"
-    )]
-    ServoSmoothing {
-        rate_hz: u32,
-        #[source]
-        source: control_core::filters::FilterError,
-    },
-
     #[error("parameter max_stream_ee_velocity_m_s")]
     EeVelocity(#[source] NotPositiveFinite),
 
@@ -204,15 +194,6 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         "a follower silent for over {:?} is frozen (followers report at {} Hz, control loop {} Hz)",
         stale_limit, params.follower_state_rate_hz, params.control_rate_hz
     );
-    // Built here, where a rate that cannot carry the cutoff is a refusal by
-    // name; every servo move copies the value.
-    let servo_smoothing =
-        srs_model::chain_kinematics::command_smoothing(cycle_period).map_err(|source| {
-            NodeError::ServoSmoothing {
-                rate_hz: params.control_rate_hz,
-                source,
-            }
-        })?;
     let max_joint_velocity_rad_s = joint_caps(
         [
             params.max_joint_velocity_rad_s_1,
@@ -355,7 +336,6 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     }
     let plan_cfg = |limits| PlanConfig {
         cycle_period,
-        smoothing: servo_smoothing,
         max_joint_velocity_rad_s,
         max_joint_acceleration_rad_s2,
         stream_ee_velocity_m_s: max_stream_ee_velocity.get(),

@@ -667,10 +667,9 @@ async fn left_arm_joint_move(
     Ok(goal.get_result(DEADLINE).await?.outcome)
 }
 
-/// The plan slack the Cartesian moves of these tests are planned within: the
-/// guarded servo's own arrival bar.
-const PLAN_POSITION_TOLERANCE_M: f64 = control_core::servo::POSITION_TOLERANCE_M;
-const PLAN_ORIENTATION_TOLERANCE_RAD: f64 = control_core::servo::ORIENTATION_TOLERANCE_RAD;
+/// The plan slack the Cartesian moves of these tests are planned within.
+const PLAN_POSITION_TOLERANCE_M: f64 = 1e-3;
+const PLAN_ORIENTATION_TOLERANCE_RAD: f64 = 1e-2;
 
 /// The settle the moves of these tests ask for: a slack the followers'
 /// tracking stays within, and a timeout that keeps a failed settle short.

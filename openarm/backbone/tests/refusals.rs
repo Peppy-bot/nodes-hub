@@ -209,14 +209,6 @@ async fn the_refusal_an_operator_reads_names_the_parameter() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_rate_too_slow_for_the_servo_smoother_is_refused_by_name() {
-    // 30 Hz puts Nyquist (15 Hz) under the servo's fixed cutoff. Before this
-    // was a refusal it was an expect inside the first Cartesian move: the node
-    // booted healthy and panicked when someone commanded a pose.
-    refusal_names("control_rate_hz", |p| p.control_rate_hz = 30).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_gripper_rate_too_slow_to_make_progress_is_refused_by_name() {
     // Below the governor's floor a full stroke would take over a minute; the
     // governor is the single authority for this bound, so the refusal arrives
