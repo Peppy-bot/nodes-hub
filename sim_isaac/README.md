@@ -360,7 +360,9 @@ remove every object scene_manipulation spawned. `get_scene` names the scene
 loaded last and its scale, and an empty asset id while the stage stands
 empty. `get_assets_list` narrows the catalogue by the `kind`, `category`
 and `query` its request sets, and `get_asset_categories` counts it per
-category. `get_objects_list` lists every object scene_manipulation spawned
+category. `get_asset` gives the full entry of one asset: Isaac keeps no
+landmark, work surface or wall of an asset, so it is the entry that
+`get_assets_list` gives, and an asset id that names no asset is rejected. `get_objects_list` lists every object scene_manipulation spawned
 with its name and its pose as of the latest capture, each in its asset's
 category and with the source `spawned`: an environment places no object of
 its own, so the source `scene` lists nothing. `get_object` answers one of

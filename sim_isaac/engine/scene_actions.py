@@ -40,6 +40,7 @@ from peppygen.exposed_actions.scene import (
 )
 from peppygen.exposed_services.objects import get_object_states
 from peppygen.exposed_services.scene import (
+    get_asset,
     get_asset_categories,
     get_assets_list,
     get_object,
@@ -575,6 +576,7 @@ class SceneActionIO:
 
         services = (
             (get_assets_list, self._handle_get_assets),
+            (get_asset, self._handle_get_asset),
             (get_asset_categories, self._handle_get_asset_categories),
             (get_objects_list, self._handle_get_objects_list),
             (get_object, self._handle_get_object),
@@ -745,6 +747,30 @@ class SceneActionIO:
                 assets,
                 separators=(",", ":"),
             ),
+        )
+
+    def _handle_get_asset(
+        self,
+        request,
+    ) -> get_asset.Response:
+        """The full entry of one asset of the catalogue. Isaac keeps no
+        landmark, work surface or wall of an asset, so the full entry is the
+        one the listing gives. Refused while the catalogue is not discovered
+        yet, and for an id that names no asset."""
+
+        self._require_catalogue()
+
+        asset_id = request.data.asset_id
+        entry = next(
+            (asset for asset in self._public_assets() if asset["asset_id"] == asset_id),
+            None,
+        )
+
+        if entry is None:
+            raise _rejected(f"Unknown asset_id: {asset_id}")
+
+        return get_asset.Response(
+            asset_json=json.dumps(entry, separators=(",", ":")),
         )
 
     def _handle_get_asset_categories(

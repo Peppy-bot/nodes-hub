@@ -21,7 +21,8 @@ _ENGINE_DIR = Path(__file__).resolve().parents[1] / "engine"
 _ACTIONS = ("apply_force", "clear_scene", "load_scene", "move_object", "move_robot", "remove_object", "spawn_object")
 _SERVICES = {
     "scene": (
-        "get_assets_list", "get_asset_categories", "get_objects_list", "get_object", "get_robots_list", "get_scene",
+        "get_assets_list", "get_asset", "get_asset_categories", "get_objects_list", "get_object", "get_robots_list",
+        "get_scene",
     ),
     "objects": ("get_object_states",),
 }
