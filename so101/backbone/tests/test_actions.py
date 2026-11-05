@@ -6,12 +6,14 @@ refusals and failures with their kinds, and how each goal ends."""
 import asyncio
 import itertools
 import math
+import random
 import threading
 import time
 from types import SimpleNamespace
 
 import pytest
 from conftest import (
+    MAX_JOINT_ACCELERATION_RAD_S2,
     MEASURED,
     START_TOLERANCE_RAD,
     FakeKinematics,
@@ -21,7 +23,6 @@ from conftest import (
     make_layer,
     path_result_joints,
 )
-from control_core_py import minimum_jerk
 from path_timing_py import JOINT_PATH_CORNER_DEVIATION, MIN_JOINT_CHANGE_RAD, JointTrajectory
 from peppygen.exposed_actions.limb_motion import execute_joint_path
 from so101_description import limits as limits_mod
@@ -500,7 +501,7 @@ async def test_an_arm_move_outside_its_tolerances_at_the_timeout_fails_with_time
         assert coordinator.arm_tick(end_s + since_end_s) == (0.5,) * 5
         coordinator.arm_published(True, (0.5,) * 5)
         assert not plan.done.is_set()
-    assert coordinator.arm_tick(end_s + 2.0) is None
+    assert coordinator.arm_tick(end_s + 2.0 + 1e-9) is None
     assert plan.done.is_set()
     ctx = FakeGoalContext()
     await layer.drive_arm(ctx, plan)
@@ -1419,32 +1420,20 @@ async def test_a_stale_follower_reports_the_commanded_pose(follower_never_stale)
     assert position == list(kinematics.forward_kinematics(kinematics.solution)[0])
 
 
-async def test_pose_move_duration_floors_at_the_linear_ee_cap():
-    # FakeKinematics FK sits at (0.1, 0.0, 0.2); the goal is 1.0 m away, so
-    # at 0.5 m/s the quintic floor is 15/8 * 1.0 / 0.5, above the joint floor.
+async def test_a_pose_move_is_timed_by_the_joint_limits_and_no_end_effector_cap():
+    # A stream cap this tight takes 100 s to carry the hand 1 m: it covers
+    # streams, so the move takes the time its joint limits allow.
     kinematics = FakeKinematics()
-    coordinator, layer = make_layer(kinematics, max_ee_velocity_m_s=0.5)
+    coordinator, layer = make_layer(kinematics, max_stream_ee_velocity_m_s=0.01)
     coordinator.measured_joints.set((0.0,) * 5)
     goal = admit_pose(layer, (1.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0))
     ctx = FakeGoalContext()
     task = asyncio.create_task(layer.drive_pose(ctx, goal, kinematics, kinematics))
     plan = await installed_plan(coordinator)
-    assert plan.profile.duration_s == pytest.approx(15.0 / 8.0 * 1.0 / 0.5)
-    coordinator.abort_arm_plan(plan)
-    await task
-
-
-async def test_pose_move_duration_floors_at_the_angular_ee_cap():
-    # A half turn from the FK's identity orientation at 1 rad/s floors the
-    # duration at 15/8 * pi.
-    kinematics = FakeKinematics()
-    coordinator, layer = make_layer(kinematics, max_ee_angular_velocity_rad_s=1.0)
-    coordinator.measured_joints.set((0.0,) * 5)
-    goal = admit_pose(layer, (0.1, 0.0, 0.2), (0.0, 0.0, 1.0, 0.0))
-    ctx = FakeGoalContext()
-    task = asyncio.create_task(layer.drive_pose(ctx, goal, kinematics, kinematics))
-    plan = await installed_plan(coordinator)
-    assert plan.profile.duration_s == pytest.approx(15.0 / 8.0 * math.pi)
+    timed = JointTrajectory.through(
+        ((0.0,) * 5, kinematics.solution), (2.0,) * 5, (MAX_JOINT_ACCELERATION_RAD_S2,) * 5, 0.0
+    )
+    assert plan.profile.duration_s == pytest.approx(timed.duration_s)
     coordinator.abort_arm_plan(plan)
     await task
 
@@ -1602,12 +1591,11 @@ async def test_an_unreachable_failure_names_the_bar_it_was_judged_against():
     assert "4.0 mm" in message and "2.9 deg" in message
 
 
-async def test_the_ee_caps_cannot_pin_the_slot_past_the_duration_ceiling():
-    # A move admitted under the ceiling can still need longer than it once
-    # the end-effector speed caps are applied; that has no plan, and must not
-    # stretch.
+async def test_the_joint_caps_cannot_pin_the_slot_past_the_duration_ceiling():
+    # A move admitted under the ceiling can still need longer than it under
+    # the joint velocity caps; that has no plan, and must not stretch.
     kinematics = FakeKinematics()
-    coordinator, layer = make_layer(kinematics, max_ee_velocity_m_s=1e-4)
+    coordinator, layer = make_layer(kinematics, max_joint_velocity_rad_s=(1e-3,) * 5)
     coordinator.measured_joints.set((0.0,) * 5)
     goal = admit_pose(layer, (5.0, 0.0, 0.2), IDENTITY_QUAT)
     ctx = FakeGoalContext()
@@ -1616,6 +1604,66 @@ async def test_the_ee_caps_cannot_pin_the_slot_past_the_duration_ceiling():
     assert kind is FailureKind.UNREACHABLE
     assert "ceiling" in message
     assert coordinator.try_claim_arm(), "a failed move must release the arm"
+
+
+def assert_within_joint_limits(profile, max_velocity, max_acceleration):
+    """Sampled densely, the trajectory moves and accelerates every joint within
+    its limits, to the rounding of the differences over a sample."""
+    samples = 400
+    step_s = profile.duration_s / samples
+    points = [profile.sample(k * step_s) for k in range(samples + 1)]
+    slack = 1.0 + 1e-6
+    for before, here, after in zip(points, points[1:], points[2:], strict=False):
+        for joint, (a, b, c) in enumerate(zip(before, here, after, strict=True)):
+            assert abs(b - a) / step_s <= max_velocity[joint] * slack
+            assert abs(c - 2.0 * b + a) / (step_s * step_s) <= max_acceleration[joint] * slack + 1e-6
+
+
+@pytest.mark.parametrize("seed", range(25))
+async def test_every_action_on_a_drawn_move_stays_within_the_joint_limits(
+    seed, follower_never_stale
+):
+    # One timing law serves every action: a joint move, a posture and a pose
+    # move, each from where the arm stands to a drawn target.
+    rng = random.Random(seed)
+    velocity = tuple(rng.uniform(0.5, 10.0) for _ in range(5))
+    acceleration = tuple(rng.uniform(0.5, 5.0) for _ in range(5))
+    target = tuple(rng.uniform(-1.5, 1.5) for _ in range(5))
+    kinematics = FakeKinematics()
+    kinematics.solution = target
+    coordinator, layer = make_layer(
+        kinematics, max_joint_velocity_rad_s=velocity, max_joint_acceleration_rad_s2=acceleration
+    )
+    coordinator.measured_joints.set((0.0,) * 5)
+
+    plan = admit_joints(layer, target, 0.0)
+    assert_within_joint_limits(plan.profile, velocity, acceleration)
+    assert plan.profile.end == target
+    coordinator.abort_arm_plan(plan)
+    coordinator.release_arm()
+
+    plan = layer._admit_posture(target, 0.0)
+    assert_within_joint_limits(plan.profile, velocity, acceleration)
+    coordinator.abort_arm_plan(plan)
+    coordinator.release_arm()
+
+    goal = admit_pose(layer, (0.1, 0.0, 0.2), IDENTITY_QUAT)
+    ctx = FakeGoalContext()
+    task = asyncio.create_task(layer.drive_pose(ctx, goal, kinematics, kinematics))
+    plan = await installed_plan(coordinator)
+    assert_within_joint_limits(plan.profile, velocity, acceleration)
+    coordinator.abort_arm_plan(plan)
+    await task
+
+
+def test_a_joint_move_past_the_ceiling_is_refused_and_frees_the_slot():
+    coordinator, layer = make_layer(max_joint_velocity_rad_s=(1e-3,) * 5)
+    coordinator.measured_joints.set((0.0,) * 5)
+    with pytest.raises(Refusal) as refused:
+        admit_joints(layer, (0.5,) * 5, 0.0)
+    assert refused.value.kind is FailureKind.REJECTED
+    assert "this move, past the 60 s" in str(refused.value)
+    assert coordinator.try_claim_arm(), "a refused move must release the arm"
 
 
 async def test_a_stopped_plan_ends_cancelled_with_the_stops_reason(follower_never_stale):
@@ -1817,9 +1865,11 @@ async def test_the_plan_check_answers_the_duration_the_joint_caps_floor():
     coordinator, layer = make_layer(kinematics, max_joint_velocity_rad_s=(2.0,) * 5)
     coordinator.measured_joints.set((0.0,) * 5)
     check = await layer.check_arm_move(
-        "arm", (0.2, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, *PLAN, kinematics, kinematics
+        "arm", (0.2, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, *PLAN, kinematics
     )
-    floored = minimum_jerk.plan((0.0,) * 5, kinematics.solution, 0.0, (2.0,) * 5).duration_s
+    floored = JointTrajectory.through(
+        ((0.0,) * 5, kinematics.solution), (2.0,) * 5, (MAX_JOINT_ACCELERATION_RAD_S2,) * 5, 0.0
+    ).duration_s
     assert (check.reachable, check.reason) == (True, "")
     assert floored > 0.0
     assert check.duration_s == pytest.approx(floored)
@@ -1847,11 +1897,11 @@ async def test_a_zero_settle_timeout_fails_an_arm_move_short_of_its_target_at_th
 
 async def test_the_plan_check_answers_the_duration_and_installs_nothing():
     kinematics = FakeKinematics()
-    coordinator, layer = make_layer(kinematics, max_ee_velocity_m_s=0.1)
+    coordinator, layer = make_layer(kinematics, max_stream_ee_velocity_m_s=0.1)
     coordinator.measured_joints.set((0.0,) * 5)
 
     check = await layer.check_arm_move(
-        "arm", (0.2, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, *PLAN, kinematics, kinematics
+        "arm", (0.2, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, *PLAN, kinematics
     )
 
     assert (check.reachable, check.reason) == (True, "")
@@ -1868,7 +1918,7 @@ async def test_the_plan_check_answers_unreachable_and_refuses_as_the_move_would(
 
     kinematics.corrupted = True
     check = await layer.check_arm_move(
-        "arm", (5.0, 5.0, 5.0), (0.0, 0.0, 0.0, 1.0), 0.0, *PLAN, kinematics, kinematics
+        "arm", (5.0, 5.0, 5.0), (0.0, 0.0, 0.0, 1.0), 0.0, *PLAN, kinematics
     )
     assert (check.reachable, check.duration_s) == (False, 0.0)
     assert check.reason.startswith("goal pose not planned within ")
@@ -1876,12 +1926,12 @@ async def test_the_plan_check_answers_unreachable_and_refuses_as_the_move_would(
     kinematics.corrupted = False
     with pytest.raises(Refusal, match="unknown arm_name") as raised:
         await layer.check_arm_move(
-            "wing", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, *PLAN, kinematics, kinematics
+            "wing", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, *PLAN, kinematics
         )
     assert raised.value.kind is FailureKind.REJECTED
     with pytest.raises(Refusal) as raised:
         await layer.check_arm_move(
-            "arm", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 0.0), 0.0, *PLAN, kinematics, kinematics
+            "arm", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 0.0), 0.0, *PLAN, kinematics
         )
     assert refusal_of(raised) == (
         FailureKind.REJECTED, "goal pose has an unnormalizable orientation"
@@ -1891,7 +1941,7 @@ async def test_the_plan_check_answers_unreachable_and_refuses_as_the_move_would(
     admit_joints(layer, (0.5,) * 5, 1.0)
     with pytest.raises(Refusal) as raised:
         await layer.check_arm_move(
-            "arm", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, *PLAN, kinematics, kinematics
+            "arm", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, *PLAN, kinematics
         )
     assert refusal_of(raised) == (FailureKind.PRECONDITION_FAILED, ARM_WORDS.busy)
     assert len(kinematics.solve_calls) == 1, "a refused check pays no solve"
@@ -1902,7 +1952,7 @@ async def test_the_plan_check_needs_fresh_follower_state():
     _coordinator, layer = make_layer(kinematics)
     with pytest.raises(Refusal) as raised:
         await layer.check_arm_move(
-            "arm", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, *PLAN, kinematics, kinematics
+            "arm", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, *PLAN, kinematics
         )
     assert refusal_of(raised) == (FailureKind.RESOURCE_UNAVAILABLE, ARM_WORDS.no_fresh_state)
 
@@ -1917,7 +1967,7 @@ async def test_a_solve_that_raises_fails_the_plan_check_with_attempt_failed():
     coordinator.measured_joints.set((0.0,) * 5)
     with pytest.raises(Refusal) as raised:
         await layer.check_arm_move(
-            "arm", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, *PLAN, kinematics, kinematics
+            "arm", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, *PLAN, kinematics
         )
     assert refusal_of(raised) == (
         FailureKind.ATTEMPT_FAILED, "pose solve failed: RuntimeError('solver surprise')"
@@ -1968,7 +2018,7 @@ async def test_the_move_check_refuses_in_the_goals_order():
     coordinator.leader_joints.set((0.0,) * 5)
     pose = ((0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0))
     with pytest.raises(Refusal) as raised:
-        await layer.check_arm_move("arm", *pose, 0.0, *PLAN, None, None)
+        await layer.check_arm_move("arm", *pose, 0.0, *PLAN, None)
     assert refusal_of(raised) == (FailureKind.RESOURCE_UNAVAILABLE, ARM_WORDS.no_fresh_state)
     with pytest.raises(Refusal) as raised:
         admit_pose(layer, *pose)
@@ -1981,7 +2031,7 @@ async def test_the_move_check_gives_the_streaming_refusal_without_claiming():
     coordinator.leader_joints.set((0.0,) * 5)
     with pytest.raises(Refusal) as raised:
         await layer.check_arm_move(
-            "arm", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, *PLAN, None, None
+            "arm", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, *PLAN, None
         )
     assert refusal_of(raised) == (FailureKind.LEADER_STREAMING, ARM_WORDS.leader_streaming)
     assert coordinator.try_claim_arm()

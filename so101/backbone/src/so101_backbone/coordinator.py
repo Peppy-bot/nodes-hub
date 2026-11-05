@@ -3,10 +3,9 @@
 Precedence per limb per tick: an admitted action plan owns the limb (streamed
 input is ignored while one runs), and a goal is admitted only while no leader
 target arrived within the deadman, so a streaming leader keeps the limb;
-otherwise a fresh streamed leader target passes through under the
-end-effector-speed governor (the joints-led
-stream's only limiter; the pose-mode stream's IK output is additionally
-rate-stepped per joint); otherwise silence, and the follower holds. The
+otherwise a fresh streamed leader target, or the pose-mode stream's IK
+output, goes downstream within the joint limits, rate-stepped per joint, under
+the end-effector-speed governor; otherwise silence, and the follower holds. The
 arm and the gripper claim independently, so a long arm move never freezes
 gripper teleop and vice versa. An arm plan owns the arm past the planned end
 of its trajectory: it keeps commanding its end sample until the measured
@@ -35,7 +34,6 @@ import time
 from dataclasses import dataclass, field
 from typing import Generic, TypeVar
 
-from control_core_py import minimum_jerk
 from control_core_py.runtime import Latch
 from path_timing_py import JointTrajectory
 from so101_description.limbs import ARM_LIMB, GRIPPER_LIMB
@@ -75,11 +73,6 @@ FOLLOWER_SILENT = PlanFailure(FailureKind.RESOURCE_UNAVAILABLE, "the follower st
 PUBLISH_FAILED = PlanFailure(
     FailureKind.ATTEMPT_FAILED, "downstream setpoint publish failed mid-goal"
 )
-
-# The trajectory an arm plan plays: a minimum-jerk move to one target, or a
-# joint path through waypoints. Both play through sample, done, duration_s,
-# start and end.
-ArmProfile = minimum_jerk.Profile | JointTrajectory
 
 
 def joint_past_tolerance(
@@ -195,7 +188,7 @@ class PostureEnd:
 
 @dataclass
 class ArmPlan:
-    profile: ArmProfile
+    profile: JointTrajectory
     # How the plan ends past the planned end of its profile, judged on the
     # measured joints each tick.
     settle: JointSettle | PoseSettle | PostureEnd
@@ -369,20 +362,12 @@ class Coordinator:
         period_s = 1.0 / config.control_rate_hz
         self._governor = EEGovernor(
             kinematics,
-            config.max_ee_velocity_m_s,
-            config.max_ee_angular_velocity_rad_s,
+            config.max_stream_ee_velocity_m_s,
             period_s,
         )
         self._gripper_tick_cap = config.max_gripper_rate_frac_s * period_s
-        # Per-tick joint steps for the pose-mode stream only: the IK output is
-        # machine-generated, and near the workspace boundary the solver can
-        # flip configurations tick to tick with joint swings the EE governor
-        # cannot see. Stepping the anchor toward each solution also seeds the
-        # next solve nearby, keeping the solver in one basin. The joints-led
-        # stream is never shaped by this: it must match lerobot's.
-        self._pose_joint_tick_caps = tuple(
-            v * period_s for v in config.max_joint_velocity_rad_s
-        )
+        # Every stream's per-tick joint steps, under the joint velocity limits.
+        self._joint_tick_caps = tuple(v * period_s for v in config.max_joint_velocity_rad_s)
         self._arm = _LimbChannel[tuple[float, ...], ArmPlan]()
         self._gripper = _LimbChannel[float, GripperPlan]()
         self._ik_failing = Latch()
@@ -473,7 +458,7 @@ class Coordinator:
     # ------------------------------------------------------------------- plans
 
     def adopt_arm_plan(
-        self, profile: ArmProfile, settle: JointSettle | PoseSettle | PostureEnd
+        self, profile: JointTrajectory, settle: JointSettle | PoseSettle | PostureEnd
     ) -> ArmPlan:
         """Install an admitted action's trajectory and its settle. Streamed
         input already in flight must not re-target the arm when the plan
@@ -661,7 +646,7 @@ class Coordinator:
             # next input re-engages from measured under the governor.
             self._arm.reset_command()
             return None
-        # Within the EE caps the leader's value goes downstream as-is.
+        # Within the EE cap the leader's value goes downstream as-is.
         self._arm.commanded = self._governor.govern(anchor, desired)
         self._arm.tick_stamp_s = self._leader_arm.wire_timestamp_s
         return self._arm.commanded
@@ -749,16 +734,17 @@ class Coordinator:
         return self._gripper.commanded
 
     def _streamed_arm_target(self, seed: tuple[float, ...] | None) -> tuple[float, ...] | None:
-        """The streamed target, or None for silence. The pose path is best
-        effort: an out-of-reach pose tracks the workspace boundary through
-        the bounded streaming solver, seeded on the anchor the caller
-        already resolved, and its solution is limit-clamped and rate-stepped
-        per joint from that anchor."""
+        """The streamed target, or None for silence, clamped into the joint
+        limits and rate-stepped per joint from the anchor the caller already
+        resolved; a sample that needs neither goes downstream as the same
+        object. The pose path is best effort: an out-of-reach pose tracks the
+        workspace boundary through the bounded streaming solver, seeded on that
+        anchor."""
         streamed = self._leader_arm.fresh(COMMAND_SILENCE_LIMIT_S)
         if self._config.upstream_mode is UpstreamMode.JOINTS:
-            # Unclamped, like the reference teleop; the follower's servo
-            # EPROM limits are the travel guard.
-            return streamed
+            if streamed is None or seed is None:
+                return streamed
+            return self._stream_step(seed, streamed)
         if streamed is None or seed is None:
             return None
         position, orientation = streamed
@@ -776,8 +762,17 @@ class Coordinator:
             self._ik_failing.trip("streamed pose corrupted the solver output; holding")
             return None
         self._ik_failing.clear()
-        clamped = self._limits.clamp(solution)
-        return tuple(
-            rate_step(anchor, target, cap)
-            for anchor, target, cap in zip(seed, clamped, self._pose_joint_tick_caps, strict=True)
+        return self._stream_step(seed, solution)
+
+    def _stream_step(
+        self, anchor: tuple[float, ...], sample: tuple[float, ...]
+    ) -> tuple[float, ...]:
+        """`sample` itself when it lies inside the joint limits and within one
+        tick of `anchor` at the joint velocity limits; otherwise clamped into the
+        limits and rate-stepped from `anchor`."""
+        clamped = self._limits.clamp(sample)
+        stepped = tuple(
+            rate_step(joint, target, cap)
+            for joint, target, cap in zip(anchor, clamped, self._joint_tick_caps, strict=True)
         )
+        return sample if stepped == sample else stepped

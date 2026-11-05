@@ -125,13 +125,11 @@
         // that names a tight plan_orientation_tolerance_rad often has no
         // plan; a wide one admits the nearest orientation the arm reaches.
         //
-        // Endpoints only: one solve for the goal, then a minimum-jerk blend
-        // in joint space. The end effector does not walk the straight line
+        // Endpoints only: one solve for the goal, then a straight move in
+        // joint space. The end effector does not walk the straight line
         // between the poses and nothing verifies the path it does walk
-        // (median 91 mm off that line, worst seen 472 mm). Because the
-        // duration floor is sized from the straight-line chord while the
-        // path flown is longer, max_ee_velocity_m_s is a nominal cap the
-        // move can exceed (median 1.20x, worst seen 2.88x).
+        // (median 91 mm off that line, worst seen 472 mm). The joint limits and
+        // the goal's duration time the move.
         { link_id: "limb_motion", name: "move_arm" },
         { link_id: "limb_motion", name: "move_gripper" },
       ]
@@ -196,41 +194,35 @@
       // downstream. 60 is the validated rate; in pose mode the streaming IK
       // runs inside the tick, so higher rates are untested there.
       control_rate_hz: "u32",
-      // Per-joint peak velocity (rad/s), shoulder_pan..wrist_roll: sizes the
-      // action trajectories (postures, joint moves, joint paths, move_arm)
-      // and bounds the per-tick joint steps of the pose stream's
-      // machine-generated IK output. Never shapes a joints-led teleop stream,
-      // which passes through under the end-effector governor alone. Universal
-      // control constants for this arm, so they keep node defaults like
-      // gains.
-      max_joint_velocity_rad_s_1: { $type: "f64", $default: 2.0 },
-      max_joint_velocity_rad_s_2: { $type: "f64", $default: 2.0 },
-      max_joint_velocity_rad_s_3: { $type: "f64", $default: 2.0 },
-      max_joint_velocity_rad_s_4: { $type: "f64", $default: 2.0 },
-      max_joint_velocity_rad_s_5: { $type: "f64", $default: 2.0 },
+      // Per-joint peak velocity (rad/s), shoulder_pan..wrist_roll: sizes every
+      // action and bounds every stream's per-tick joint steps. The URDF's joint
+      // velocity limits. Universal control constants for this arm, so they keep
+      // node defaults like gains.
+      max_joint_velocity_rad_s_1: { $type: "f64", $default: 10.0 },
+      max_joint_velocity_rad_s_2: { $type: "f64", $default: 10.0 },
+      max_joint_velocity_rad_s_3: { $type: "f64", $default: 10.0 },
+      max_joint_velocity_rad_s_4: { $type: "f64", $default: 10.0 },
+      max_joint_velocity_rad_s_5: { $type: "f64", $default: 10.0 },
       // Per-joint peak acceleration (rad/s²), shoulder_pan..wrist_roll, that
-      // a joint path (execute_joint_path) is timed within, with the velocity
-      // caps above. The arm's acceleration is bounded by the ramp each
-      // STS3215 runs its position goals at: the follower connects through
-      // lerobot 0.6.1, whose SOFollower.configure writes the servo's
-      // Acceleration register (address 41, in units of 100 steps/s², 4096
-      // steps a turn) to 254 on every motor, which is 25,400 steps/s², 38.96
-      // rad/s². A path timed within it asks no joint to speed up faster than
-      // its servo ramps. Universal control constants for this arm, so they
-      // keep node defaults like the velocity caps.
-      max_joint_acceleration_rad_s2_1: { $type: "f64", $default: 38.96 },
-      max_joint_acceleration_rad_s2_2: { $type: "f64", $default: 38.96 },
-      max_joint_acceleration_rad_s2_3: { $type: "f64", $default: 38.96 },
-      max_joint_acceleration_rad_s2_4: { $type: "f64", $default: 38.96 },
-      max_joint_acceleration_rad_s2_5: { $type: "f64", $default: 38.96 },
-      // The joints-led stream's one sanctioned limiter: max end-effector
-      // speed. A streamed sample within the caps passes through untouched;
-      // one that would exceed them moves the end effector at cap speed
-      // along the same path. Operational choices with no safe universal
-      // value, so the launcher states them (openarm's backbone holds the
-      // same pair).
-      max_ee_velocity_m_s: "f64",
-      max_ee_angular_velocity_rad_s: "f64",
+      // every action is timed within, with the velocity caps above. A move across
+      // the widest joint's range, wrist_roll's 5.585 rad, peaks at 2 rad/s at it,
+      // the speed the arm's actions ran at before: (2 rad/s)² / 5.585 rad. Under
+      // the 38.96 rad/s² ramp each STS3215 runs its position goals at (lerobot
+      // 0.6.1's SOFollower.configure writes the Acceleration register, in units
+      // of 100 steps/s², 4096 steps a turn, to 254). Provisional until a hardware
+      // run confirms it. Universal control constants for this arm, so they keep
+      // node defaults like the velocity caps.
+      max_joint_acceleration_rad_s2_1: { $type: "f64", $default: 0.72 },
+      max_joint_acceleration_rad_s2_2: { $type: "f64", $default: 0.72 },
+      max_joint_acceleration_rad_s2_3: { $type: "f64", $default: 0.72 },
+      max_joint_acceleration_rad_s2_4: { $type: "f64", $default: 0.72 },
+      max_joint_acceleration_rad_s2_5: { $type: "f64", $default: 0.72 },
+      // End-effector speed cap (m/s) on every stream, and on nothing else. A
+      // streamed sample within it passes through untouched; one that would
+      // exceed it moves the end effector at cap speed along the same path. An
+      // operational choice with no safe universal value, so the launcher states
+      // it (openarm's backbone holds the same parameter).
+      max_stream_ee_velocity_m_s: "f64",
       // Peak gripper travel rate (fraction of full travel per second);
       // within one tick's step the leader's opening passes through exactly.
       max_gripper_rate_frac_s: "f64",

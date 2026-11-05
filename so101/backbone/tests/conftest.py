@@ -115,8 +115,7 @@ def make_config(**overrides) -> Config:
         "max_joint_acceleration_rad_s2": (MAX_JOINT_ACCELERATION_RAD_S2,) * 5,
         # Transparent by default: parity tests must see pure pass-through.
         # Governor- and rate-specific tests override these downward.
-        "max_ee_velocity_m_s": 1e9,
-        "max_ee_angular_velocity_rad_s": 1e9,
+        "max_stream_ee_velocity_m_s": 1e9,
         "max_gripper_rate_frac_s": 1e9,
         "start_tolerance_rad": START_TOLERANCE_RAD,
     }
@@ -131,8 +130,11 @@ def _coordinator_on(config, kinematics, limits, reach) -> Coordinator:
 
 def make_coordinator(kinematics=None, limits=WIDE_LIMITS, reach=WIDE_REACH, **config_overrides):
     """A coordinator on make_config(**config_overrides), a FakeKinematics
-    unless `kinematics` is given, wide limits and an unbounded reach."""
-    return _coordinator_on(make_config(**config_overrides), kinematics, limits, reach)
+    unless `kinematics` is given, wide limits, an unbounded reach, and joint
+    velocity limits a stream's jump does not reach, unless overridden."""
+    transparent = {"max_joint_velocity_rad_s": (1e9,) * 5}
+    config = make_config(**{**transparent, **config_overrides})
+    return _coordinator_on(config, kinematics, limits, reach)
 
 
 def make_layer(kinematics=None, limits=WIDE_LIMITS, **config_overrides):

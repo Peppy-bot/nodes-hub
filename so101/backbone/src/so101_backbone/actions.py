@@ -33,20 +33,16 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import TypeVar
 
-from control_core_py import minimum_jerk
-from control_core_py.minimum_jerk import Profile
 from control_core_py.runtime import Latch, log
 from path_timing_py import JointTrajectory
 from peppygen.exposed_actions.limb_motion import execute_joint_path
 from so101_description.limbs import ARM_LIMB, GRIPPER_LIMB
 from so101_description.limits import JointLimits
-from so101_description.transforms import relative_rotation_rad
 from so101_description.units import NUM_JOINTS
 
 from so101_backbone.coordinator import (
     FOLLOWER_SILENT,
     ArmPlan,
-    ArmProfile,
     Coordinator,
     GripperPlan,
     JointSettle,
@@ -347,9 +343,8 @@ class ActionLayer:
         refused goal never leaves the slot held."""
         anchor = self._claim_free_arm()
         try:
-            profile = minimum_jerk.plan(
-                anchor, target, duration_s, self._config.max_joint_velocity_rad_s
-            )
+            profile = self._joint_move(anchor, target, duration_s)
+            _require_within_move_ceiling(profile, "move", "shorter moves")
             return self._coordinator.adopt_arm_plan(profile, settle)
         except BaseException:
             # A failure between claim and adopt must not hold the slot.
@@ -374,6 +369,19 @@ class ActionLayer:
         )
         self._claim_free_arm()
         return move
+
+    def _joint_move(
+        self, start: tuple[float, ...], end: tuple[float, ...], duration_s: float
+    ) -> JointTrajectory:
+        """The straight joint move from `start` to `end`, over the longer of
+        `duration_s` and the time the joint velocity and acceleration caps
+        allow."""
+        return JointTrajectory.through(
+            (start, end),
+            self._config.max_joint_velocity_rad_s,
+            self._config.max_joint_acceleration_rad_s2,
+            duration_s,
+        )
 
     def _measured_start(self) -> _PathStart | None:
         """Where a joint path starts: the measured joints, and those joints
@@ -408,15 +416,7 @@ class ActionLayer:
             self._config.max_joint_acceleration_rad_s2,
             goal.duration_s,
         )
-        # The requested duration is at most the ceiling, so a profile past
-        # the ceiling runs at the floor that the caps set for the whole path.
-        if profile.duration_s > MAX_REQUESTED_DURATION_S:
-            raise Refusal(
-                FailureKind.REJECTED,
-                f"the joint velocity and acceleration caps take {profile.duration_s:.1f} s to run "
-                f"this path, past the {MAX_REQUESTED_DURATION_S:.0f} s a move may take; split it "
-                "into paths of fewer waypoints",
-            )
+        _require_within_move_ceiling(profile, "path", "paths of fewer waypoints")
         self._require_still_at(start.held)
         return profile
 
@@ -745,7 +745,7 @@ class ActionLayer:
         move: JointPathMove | PoseMove,
         words: _MoveWords,
         find_start: Callable[[], _Start | None],
-        plan_from: Callable[[_Start], Awaitable[ArmProfile]],
+        plan_from: Callable[[_Start], Awaitable[JointTrajectory]],
         results: Callable[[tuple[float, ...], float], tuple],
         unmoved_results: Callable[[_Start], tuple],
     ) -> None:
@@ -808,25 +808,12 @@ class ActionLayer:
         finally:
             self._coordinator.release_arm()
 
-    def _ee_floor_s(self, kinematics, seed: tuple[float, ...], goal: PoseGoal) -> float:
-        """The duration floor the EE speed caps impose on a pose move. The
-        governor shapes only streamed input, so a move is sized against both
-        caps up front: the quintic's 15/8 peak over the start-to-goal chord
-        (the joint-space blend's true EE path can bow past the chord)."""
-        position, orientation = kinematics.forward_kinematics(seed)
-        travel_ratio = math.dist(position, goal.position) / self._config.max_ee_velocity_m_s
-        turn_ratio = (
-            relative_rotation_rad(orientation, goal.orientation)
-            / self._config.max_ee_angular_velocity_rad_s
-        )
-        return minimum_jerk.QUINTIC_PEAK_VELOCITY * max(travel_ratio, turn_ratio)
-
-    async def _plan_pose(self, solver, kinematics, seed, goal: PoseGoal) -> Profile:
+    async def _plan_pose(self, solver, seed, goal: PoseGoal) -> JointTrajectory:
         """The trajectory of `goal` from `seed`: the joint solution reached in
-        the requested duration, floored by the joint velocity caps and the
-        end-effector speed caps. _PlanRefused with the reason when no solution
-        lies inside the joint limits, or the caps push the duration past the
-        ceiling. The solve runs off the event loop."""
+        the requested duration, floored by the joint velocity and acceleration
+        caps. _PlanRefused with the reason when no solution lies inside the
+        joint limits, or the caps push the duration past the ceiling. The solve
+        runs off the event loop."""
         solution = await asyncio.to_thread(
             functools.partial(
                 solver.inverse_kinematics,
@@ -839,10 +826,7 @@ class ActionLayer:
         )
         if solution is None or not self._limits.contains(solution):
             raise _PlanRefused(_unreached(goal))
-        duration_s = max(goal.duration_s, self._ee_floor_s(kinematics, seed, goal))
-        profile = minimum_jerk.plan(
-            seed, solution, duration_s, self._config.max_joint_velocity_rad_s
-        )
+        profile = self._joint_move(seed, solution, goal.duration_s)
         if profile.duration_s > MAX_REQUESTED_DURATION_S:
             # The requested duration was admitted against this ceiling, and
             # the caps can raise it past the ceiling. No goal holds the arm
@@ -862,7 +846,6 @@ class ActionLayer:
         position_tolerance_m: float,
         orientation_tolerance_rad: float,
         solver,
-        kinematics,
     ) -> PlanCheck:
         """Whether a move_arm goal with these planning fields has a plan from
         where the arm is, without moving, the reason being the words the
@@ -877,7 +860,7 @@ class ActionLayer:
         )
         seed = self._free_arm_anchor()
         try:
-            profile = await self._plan_pose(solver, kinematics, seed, goal)
+            profile = await self._plan_pose(solver, seed, goal)
         except _PlanRefused as e:
             return PlanCheck(reachable=False, reason=str(e), duration_s=0.0)
         except Exception as e:
@@ -902,7 +885,7 @@ class ActionLayer:
         `unreachable`."""
 
         async def plan_from(anchor):
-            return await self._plan_pose(solver, kinematics, anchor, move.goal)
+            return await self._plan_pose(solver, anchor, move.goal)
 
         def results(joints, action_time):
             position, orientation = kinematics.forward_kinematics(joints)
@@ -1132,6 +1115,20 @@ def _require_tolerance(value: float, field: str) -> float:
     if not (math.isfinite(value) and value > 0.0):
         raise Refusal(FailureKind.REJECTED, f"{field} must be a positive number")
     return value
+
+
+def _require_within_move_ceiling(profile: JointTrajectory, what: str, split_into: str) -> None:
+    """Refuse with `rejected` a trajectory past MAX_REQUESTED_DURATION_S. The
+    requested duration is at most that ceiling, so such a trajectory runs at
+    the floor that the joint velocity and acceleration caps set for it."""
+    if profile.duration_s <= MAX_REQUESTED_DURATION_S:
+        return
+    raise Refusal(
+        FailureKind.REJECTED,
+        f"the joint velocity and acceleration caps take {profile.duration_s:.1f} s to run "
+        f"this {what}, past the {MAX_REQUESTED_DURATION_S:.0f} s a move may take; split it "
+        f"into {split_into}",
+    )
 
 
 def _require_settle_covers_plan(settle_bar: float, plan_bar: float, axis: str) -> None:

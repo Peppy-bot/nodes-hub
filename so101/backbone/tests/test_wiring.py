@@ -93,8 +93,7 @@ def make_parameters(**overrides) -> Parameters:
         "max_joint_acceleration_rad_s2_3": MAX_JOINT_ACCELERATION_RAD_S2,
         "max_joint_acceleration_rad_s2_4": MAX_JOINT_ACCELERATION_RAD_S2,
         "max_joint_acceleration_rad_s2_5": MAX_JOINT_ACCELERATION_RAD_S2,
-        "max_ee_velocity_m_s": 1e9,
-        "max_ee_angular_velocity_rad_s": 1e9,
+        "max_stream_ee_velocity_m_s": 1e9,
         "max_gripper_rate_frac_s": 8.0,
         "start_tolerance_rad": START_TOLERANCE_RAD,
     }
@@ -137,7 +136,8 @@ async def feeding_measured(h, positions=MEASURED, opening=0.0) -> asyncio.Task:
 
 
 async def test_the_joints_stream_passes_through_unchanged_and_relays_state():
-    async with harness.start(setup, parameters=make_parameters()) as h:
+    transparent = {f"max_joint_velocity_rad_s_{joint}": 1e9 for joint in range(1, 6)}
+    async with harness.start(setup, parameters=make_parameters(**transparent)) as h:
         feeder = asyncio.create_task(keep_measured_fresh(h))
         try:
             # The relay carries the measured state back up the leader slot.
@@ -153,8 +153,9 @@ async def test_the_joints_stream_passes_through_unchanged_and_relays_state():
                 first = await asyncio.wait_for(
                     h.mocks.pairings.arm.joint_setpoints.next(), TIMEOUT_S
                 )
-                # Pass-through: the leader's exact values go downstream, no
-                # clamp and no chase (the EE caps are transparent here).
+                # Pass-through: the leader's exact values go downstream (the
+                # target lies inside the joint limits, and the joint velocity
+                # limits and the EE cap are transparent here).
                 assert first.positions == pytest.approx(target)
                 assert first.efforts == []
                 # And the downstream stamp is the leader's capture stamp,
