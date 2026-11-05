@@ -271,7 +271,7 @@ pub(crate) enum Command {
     SetGovernorParams {
         d_stop: f64,
         d_safe: f64,
-        max_ee_velocity_m_s: f64,
+        max_stream_ee_velocity_m_s: f64,
         max_gripper_rate_frac_s: f64,
     },
     // Play a named gesture from the baked library. Refused while its sides

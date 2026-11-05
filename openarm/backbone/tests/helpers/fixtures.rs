@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use control_core::servo::{ORIENTATION_TOLERANCE_RAD, POSITION_TOLERANCE_M};
 use openarm_description::{ARM_DOF, HardwareVersion, Side};
 use srs_model::chain_kinematics::{
-    EeCaps, JointSmoothing, LEASH_M, MAX_SERVO_S, ServoState, ServoTolerances, ServoTrajectory,
+    JointSmoothing, LEASH_M, MAX_SERVO_S, ServoState, ServoTolerances, ServoTrajectory,
     command_smoothing, rollout,
 };
 use srs_model::nalgebra::{Isometry3, Quaternion, Translation3, UnitQuaternion};
@@ -23,10 +23,6 @@ pub const V_MAX_V2: JointVec = [
 ];
 
 pub const V_MAX_V1: JointVec = [1.0; ARM_DOF];
-
-const TEST_EE_CAP_M_S: f64 = 0.5;
-
-const TEST_EE_CAP_RAD_S: f64 = 0.8;
 
 pub const TEST_DT: Duration = Duration::from_millis(10);
 
@@ -100,10 +96,6 @@ pub fn limits_for(max_joint_velocity_rad_s: JointVec) -> PlanLimits {
     PlanLimits {
         max_joint_velocity_rad_s,
         max_joint_acceleration_rad_s2: A_MAX,
-        ee: EeCaps {
-            linear_m_s: TEST_EE_CAP_M_S,
-            angular_rad_s: TEST_EE_CAP_RAD_S,
-        },
         control_period: TEST_DT,
         smoothing: command_smoothing(TEST_DT).expect("a 100 Hz period carries the cutoff"),
     }

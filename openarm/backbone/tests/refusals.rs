@@ -114,8 +114,8 @@ async fn a_non_positive_joint_acceleration_cap_is_refused_by_name() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_non_finite_ee_speed_cap_is_refused_by_name() {
-    refusal_names("max_ee_velocity_m_s", |p| {
-        p.max_ee_velocity_m_s = f64::INFINITY
+    refusal_names("max_stream_ee_velocity_m_s", |p| {
+        p.max_stream_ee_velocity_m_s = f64::INFINITY
     })
     .await;
 }
@@ -214,14 +214,6 @@ async fn a_rate_too_slow_for_the_servo_smoother_is_refused_by_name() {
     // was a refusal it was an expect inside the first Cartesian move: the node
     // booted healthy and panicked when someone commanded a pose.
     refusal_names("control_rate_hz", |p| p.control_rate_hz = 30).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_non_finite_ee_angular_cap_is_refused_by_name() {
-    refusal_names("max_ee_angular_velocity_rad_s", |p| {
-        p.max_ee_angular_velocity_rad_s = f64::NAN;
-    })
-    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -691,12 +691,11 @@ fn apply_controls(governor: &mut Governor, planners: &mut ArmPair<Planner>, cfg:
     governor.set_enabled(cfg.enabled);
     governor.set_band(cfg.d_stop, cfg.d_safe);
     // The cap lives twice by design: the governor limits streamed hands with
-    // it, the planners budget planned moves at admission and step streamed
-    // poses with it.
-    governor.set_ee_cap(cfg.max_ee_velocity_m_s);
+    // it, and the planners step streamed poses with it.
+    governor.set_stream_ee_cap(cfg.max_stream_ee_velocity_m_s);
     governor.set_gripper_rate(cfg.max_gripper_rate_frac_s);
     for side in Side::BOTH {
-        planners[side].set_max_ee_velocity(cfg.max_ee_velocity_m_s);
+        planners[side].set_max_stream_ee_velocity(cfg.max_stream_ee_velocity_m_s);
     }
 }
 

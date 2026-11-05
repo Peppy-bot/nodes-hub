@@ -7,10 +7,8 @@
 //! preserves the step's direction.
 //!
 //! The basis is per side and present only while that side follows the
-//! operator's stream: a planned move was rolled out against the cap at
-//! admission and tracks its own schedule, so capping it again per tick would
-//! stretch it past the duration its budget was sized from. Openings are never
-//! capped here; a gripper does not move the hand.
+//! operator's stream: a planned move tracks the schedule the joint limits
+//! timed. Openings are never capped here; a gripper does not move the hand.
 
 use srs_model::Jacobian;
 use srs_model::nalgebra::SVector;

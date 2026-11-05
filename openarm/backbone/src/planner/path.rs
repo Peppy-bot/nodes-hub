@@ -750,7 +750,7 @@ pub fn start_path(
 
 /// Judge the path `plan` times for `arms` against `guard`, before any arm moves
 /// along it: `rejected` when the joint velocity and acceleration caps cannot
-/// run it within [`MAX_MOVE_DURATION_S`] ([`check_path_time`]), and
+/// run it within [`MAX_MOVE_DURATION_S`] ([`check_move_time`]), and
 /// `unreachable` when `checker` finds that the guard would hold an arm short of
 /// it, both from the path's start. The coordinator runs it beside the
 /// loop, so it takes as long as the path is long and the loop ticks on, and
@@ -769,7 +769,7 @@ pub fn judge_path(
         return Err(Failure::new(FailureKind::Unreachable, stopped));
     }
     let traj = plan.trajectory(Instant::now());
-    check_path_time(&traj)?;
+    check_move_time(&traj, "path", "paths of fewer waypoints")?;
     checker
         .check(arms, guard, traj.path(), stop)
         .map_err(|blocked| Failure::new(FailureKind::Unreachable, blocked))
@@ -964,11 +964,16 @@ fn check_start(
     Err(Failure::new(FailureKind::PreconditionFailed, message))
 }
 
-/// Fail a path whose trajectory `traj` takes longer than
+/// Fail a move whose trajectory `traj` takes longer than
 /// [`MAX_MOVE_DURATION_S`], with `rejected` and its time. The duration a goal
 /// requests lies within that ceiling, so such a trajectory takes the time
-/// the joint velocity and acceleration caps run its path in.
-fn check_path_time(traj: &JointTrajectory<DUAL_DOF>) -> Result<(), Failure> {
+/// the joint velocity and acceleration caps run it in. `what` names the move
+/// and `split_into` what the caller splits it into.
+pub(super) fn check_move_time<const N: usize>(
+    traj: &JointTrajectory<N>,
+    what: &str,
+    split_into: &str,
+) -> Result<(), Failure> {
     let time_s = traj.clock().duration().as_secs_f64();
     if time_s <= MAX_MOVE_DURATION_S {
         return Ok(());
@@ -976,9 +981,8 @@ fn check_path_time(traj: &JointTrajectory<DUAL_DOF>) -> Result<(), Failure> {
     Err(Failure::new(
         FailureKind::Rejected,
         format!(
-            "the joint velocity and acceleration caps take {time_s:.1} s to run this path, past \
-             the {MAX_MOVE_DURATION_S:.0} s a move may take; split it into paths of fewer \
-             waypoints"
+            "the joint velocity and acceleration caps take {time_s:.1} s to run this {what}, \
+             past the {MAX_MOVE_DURATION_S:.0} s a move may take; split it into {split_into}"
         ),
     ))
 }

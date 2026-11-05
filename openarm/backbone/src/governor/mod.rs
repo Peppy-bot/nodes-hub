@@ -27,7 +27,7 @@
 //! barrier and this tripwire together.
 //!
 //! The governor also runs the two speed caps (the per-DOF rate bound and the
-//! operator's end-effector speed cap) as limiters ahead of the collision
+//! operator's stream end-effector speed cap) as limiters ahead of the collision
 //! stages. They are motion shaping, not collision avoidance: they run in both
 //! modes and never touch the collision readout, so the toggle gates collision
 //! avoidance and nothing else.
@@ -265,7 +265,7 @@ pub struct Governor {
     max_joint_velocity_rad_s: f64,
     /// The operator's cap on a streamed hand's linear speed (m/s), applied by
     /// the EE-speed limiter to each side that carries a stream basis.
-    max_ee_velocity_m_s: PositiveFinite,
+    max_stream_ee_velocity_m_s: PositiveFinite,
     /// Largest rate (opening fraction per second) the coordinator's chase may
     /// drive an opening: the opening analog of the joint speed cap, bounding
     /// each tick's opening step. The `DofSpeed` clamp and the floor scan's
@@ -292,7 +292,7 @@ impl Governor {
         d_stop: f64,
         d_safe: f64,
         max_joint_velocity_rad_s: f64,
-        max_ee_velocity_m_s: PositiveFinite,
+        max_stream_ee_velocity_m_s: PositiveFinite,
         max_gripper_rate_frac_s: f64,
         enabled: bool,
     ) -> Result<Self, GovernorError> {
@@ -317,7 +317,7 @@ impl Governor {
             d_stop,
             d_safe,
             max_joint_velocity_rad_s,
-            max_ee_velocity_m_s,
+            max_stream_ee_velocity_m_s,
             max_gripper_rate_frac_s,
             enabled,
             guard: Guard::Clear,
@@ -385,16 +385,16 @@ impl Governor {
     /// Retune the end-effector speed cap at runtime (the operator's speed
     /// control). Rejects a non-positive or non-finite value, keeping the
     /// current cap, and is a no-op when unchanged so it can be called every tick.
-    pub fn set_ee_cap(&mut self, max_ee_velocity_m_s: f64) {
-        if max_ee_velocity_m_s == self.max_ee_velocity_m_s.get() {
+    pub fn set_stream_ee_cap(&mut self, max_stream_ee_velocity_m_s: f64) {
+        if max_stream_ee_velocity_m_s == self.max_stream_ee_velocity_m_s.get() {
             return;
         }
-        let Ok(cap) = PositiveFinite::parse(max_ee_velocity_m_s) else {
-            warn!("collision: ignoring invalid EE speed cap ({max_ee_velocity_m_s})");
+        let Ok(cap) = PositiveFinite::parse(max_stream_ee_velocity_m_s) else {
+            warn!("collision: ignoring invalid EE speed cap ({max_stream_ee_velocity_m_s})");
             return;
         };
-        info!("EE speed cap set to {max_ee_velocity_m_s} m/s");
-        self.max_ee_velocity_m_s = cap;
+        info!("EE speed cap set to {max_stream_ee_velocity_m_s} m/s");
+        self.max_stream_ee_velocity_m_s = cap;
     }
 
     /// Govern one bimanual step from `prev` to `cand` over `dt`, returning the
@@ -527,7 +527,7 @@ impl Governor {
             max_step: std::array::from_fn(|i| self.dof_speed_limit(i) * dt),
         };
         let ee_speed = EeSpeed {
-            cap_m_s: self.max_ee_velocity_m_s.get(),
+            cap_m_s: self.max_stream_ee_velocity_m_s.get(),
             hands,
             dt,
         };

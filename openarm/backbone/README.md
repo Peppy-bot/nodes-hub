@@ -181,8 +181,8 @@ line with the elbow held, a line with the elbow swiveled toward the widest
 joint-limit margin or the highest manipulability, or the guarded servo
 (`chain_kinematics::plan_servo`, a damped resolved-rate law that can cross
 singular surfaces a discrete IK walk cannot, rolled out offline and played from
-rest to rest). Every plan is timed from rest to rest within the velocity and
-acceleration limits the launcher sets and the hand's speed caps
+rest to rest). Every plan is timed from rest to rest within the joint velocity
+and acceleration limits
 (`control_core::path_timing`, the time-optimal timing of a path through
 waypoints), and a line is checked tick by tick for the velocity and the
 acceleration as the runtime will command it before it runs. Planning runs after
@@ -522,7 +522,7 @@ The robot's own body is not checked for hiding a point from the camera.
 
 See `peppy.json5` for the full commented list. The operational governor
 parameters (`d_stop_m`, `d_safe_m`, `collision_governor_enabled`,
-`max_ee_velocity_m_s`) are required launcher arguments with no node defaults,
+`max_stream_ee_velocity_m_s`) are required launcher arguments with no node defaults,
 and the commander's `governor_control` stream retunes them live.
 `follower_state_rate_hz` is required too: the rate the followers deliver
 measured state at, of which four silent periods freeze the limb, and under
@@ -533,9 +533,9 @@ reports once per rendered frame).
 leader slots, `"pose"` the pose_link ones, and only the named kind is
 subscribed. Link the leader into the slots that kind names, or nothing it
 streams is read and the arms never move.
-`max_ee_angular_velocity_rad_s`, required like the linear cap, caps the
-rotation of streamed poses and the servo reference; unlike the linear cap it
-is launch-time only, not retuned by the live speed control.
+`max_stream_ee_velocity_m_s` caps the hand on every stream and on nothing else:
+`move_arm`, `move_arm_joints`, the postures and `execute_joint_path` run under
+the joint limits and the goal's duration.
 `start_tolerance_rad`, required too, is how far (rad, each joint) an arm's
 measured joints may stand from the start of an `execute_joint_path` path:
 from the goal's `expected_start_joint_positions` when the coordinator takes

@@ -16,7 +16,6 @@ use peppygen::consumed_topics::collision_ctrl::governor_control;
 use peppygen::exposed_services::limb_state::get_limb_names;
 use peppygen::{NodeRunner, Parameters, Result};
 use srs_model::JointVec;
-use srs_model::chain_kinematics::EeCaps;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tracing::{error, info};
@@ -66,11 +65,8 @@ pub enum NodeError {
         source: control_core::filters::FilterError,
     },
 
-    #[error("parameter max_ee_velocity_m_s")]
+    #[error("parameter max_stream_ee_velocity_m_s")]
     EeVelocity(#[source] NotPositiveFinite),
-
-    #[error("parameter max_ee_angular_velocity_rad_s")]
-    EeAngularVelocity(#[source] NotPositiveFinite),
 
     #[error("parameter start_tolerance_rad")]
     StartTolerance(#[source] NotPositiveFinite),
@@ -241,10 +237,8 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         ],
         |joint, source| NodeError::JointAccelerationCap { joint, source },
     )?;
-    let max_ee_velocity =
-        PositiveFinite::parse(params.max_ee_velocity_m_s).map_err(NodeError::EeVelocity)?;
-    let max_ee_angular = PositiveFinite::parse(params.max_ee_angular_velocity_rad_s)
-        .map_err(NodeError::EeAngularVelocity)?;
+    let max_stream_ee_velocity =
+        PositiveFinite::parse(params.max_stream_ee_velocity_m_s).map_err(NodeError::EeVelocity)?;
     let start_tolerance =
         PositiveFinite::parse(params.start_tolerance_rad).map_err(NodeError::StartTolerance)?;
     // Enforce the documented contract: the cutoff must sit below the control loop's
@@ -321,7 +315,7 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
             .iter()
             .copied()
             .fold(0.0_f64, f64::max),
-        max_ee_velocity,
+        max_stream_ee_velocity,
         params.max_gripper_rate_frac_s,
         params.collision_governor_enabled,
     )?;
@@ -364,10 +358,7 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         smoothing: servo_smoothing,
         max_joint_velocity_rad_s,
         max_joint_acceleration_rad_s2,
-        ee: EeCaps {
-            linear_m_s: max_ee_velocity.get(),
-            angular_rad_s: max_ee_angular.get(),
-        },
+        stream_ee_velocity_m_s: max_stream_ee_velocity.get(),
         limits,
         start_tolerance_rad: start_tolerance.get(),
     };
@@ -403,7 +394,7 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         enabled: params.collision_governor_enabled,
         d_stop: params.d_stop_m,
         d_safe: params.d_safe_m,
-        max_ee_velocity_m_s: max_ee_velocity.get(),
+        max_stream_ee_velocity_m_s: max_stream_ee_velocity.get(),
         max_gripper_rate_frac_s: params.max_gripper_rate_frac_s,
     });
 

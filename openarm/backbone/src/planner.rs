@@ -32,7 +32,8 @@ use control_core::positive_finite::PositiveFinite;
 use control_core::timing::MotionClock;
 use openarm_description::{ARM_DOF, Side};
 use srs_model::chain_kinematics::{
-    EeCaps, JointSmoothing, ServoPlan, ServoTrajectory, Smoother, clamp_into, rate_step_toward,
+    EeCaps, JointSmoothing, ServoLimits, ServoPlan, ServoTrajectory, Smoother, clamp_into,
+    rate_step_toward,
 };
 use srs_model::nalgebra::Isometry3;
 use srs_model::{
@@ -80,7 +81,9 @@ pub struct PlanConfig {
     pub smoothing: control_core::filters::ButterworthFilter,
     pub max_joint_velocity_rad_s: JointVec,
     pub max_joint_acceleration_rad_s2: JointVec,
-    pub ee: EeCaps,
+    /// The operator's cap on a streamed hand's speed (m/s), which a streamed
+    /// pose steps at.
+    pub stream_ee_velocity_m_s: f64,
     pub limits: [Limit; ARM_DOF],
     /// How far (rad, each joint) the measured arm may stand from a joint
     /// path's start: from its expected start when the coordinator takes the
@@ -378,10 +381,8 @@ enum PathStep {
 }
 
 /// Where this tick's joint target came from. Only a streamed target carries a
-/// hand basis out for the governor's EE-speed limiter: a planned move was
-/// rolled out against that cap up front and tracks its own schedule, so
-/// capping it again would stretch it past the duration its budget was sized
-/// from.
+/// hand basis out for the governor's EE-speed limiter: the cap covers streams,
+/// and a planned move tracks the schedule the joint limits timed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Origin {
     Streamed,
@@ -494,19 +495,13 @@ impl Planner {
         self.model.world_ee_pose(q)
     }
 
-    /// Retune the end-effector speed cap at runtime (the commander's control).
-    /// This copy sizes planned moves at admission, the servo's rollout among
-    /// them, and steps streamed poses; a streamed joint command is capped
-    /// only by the governor's EE-speed limiter, retuned from the same control
-    /// message. The live control rescales the linear cap only: the linear cap
-    /// is enforced twice, by this servo and by the governor's EE-speed limiter,
-    /// so it binds on any streamed hand, while the angular cap is enforced only
-    /// here and a joint stream never reaches this arm of `follow_target`. A
-    /// live angular control would read as doing nothing on a joint stream, so
-    /// it stays a launch parameter until the governor limits turn rate too.
-    pub fn set_max_ee_velocity(&mut self, v: f64) {
+    /// Retune the stream's end-effector speed cap at runtime (the commander's
+    /// control). This copy steps streamed poses; a streamed joint command is
+    /// capped only by the governor's EE-speed limiter, retuned from the same
+    /// control message.
+    pub fn set_max_stream_ee_velocity(&mut self, v: f64) {
         if let Ok(cap) = PositiveFinite::parse(v) {
-            self.cfg.ee.linear_m_s = cap.get();
+            self.cfg.stream_ee_velocity_m_s = cap.get();
         }
     }
 
@@ -516,7 +511,7 @@ impl Planner {
     /// A streamed tick also carries the arm's end-effector Jacobian at the
     /// measured pose: the governor's EE-speed limiter caps a streamed hand, and
     /// this is the one place the arm's kinematic model lives. A planned move
-    /// carries `None`, because it was budgeted against the cap at admission.
+    /// carries `None`: it runs on the timing it was admitted with.
     pub async fn tick(
         &mut self,
         measured_q: JointVec,
@@ -666,11 +661,14 @@ impl Planner {
             Some(Upstream::Pose(pose)) => {
                 let q = self.setpoint;
                 let ee = self.world_ee_pose(&q);
-                let limits = self.plan_limits().servo_at(
-                    STREAMED_POSE_TOLERANCE
+                let limits = ServoLimits {
+                    max_joint_velocity: self.cfg.max_joint_velocity_rad_s,
+                    ee: self.stream_step_rates(),
+                    tolerances: STREAMED_POSE_TOLERANCE
                         .servo()
                         .expect("the servo's own slack is reachable"),
-                );
+                    dt_s: self.cfg.cycle_period.as_secs_f64(),
+                };
                 let step = rate_step_toward(self.model.chain(), &q, &ee, pose, &limits);
                 // Smoothed as a planned servo step is, then held to the
                 // velocity limit again: a smoother can overshoot its input.
@@ -820,14 +818,22 @@ impl Planner {
         }
     }
 
-    /// The motion budgets a plan is sized against and a streamed pose's step
-    /// runs under,
-    /// read off one config so acceptance and execution cannot disagree.
+    /// The rates a streamed pose steps at: the stream's cap, and the turn that
+    /// carries the wrist around the grasp point at that cap.
+    fn stream_step_rates(&self) -> EeCaps {
+        let linear_m_s = self.cfg.stream_ee_velocity_m_s;
+        EeCaps {
+            linear_m_s,
+            angular_rad_s: linear_m_s / self.model.tool().translation.vector.norm(),
+        }
+    }
+
+    /// The motion budgets a plan is sized against, read off one config so
+    /// acceptance and execution cannot disagree.
     fn plan_limits(&self) -> PlanLimits {
         PlanLimits {
             max_joint_velocity_rad_s: self.cfg.max_joint_velocity_rad_s,
             max_joint_acceleration_rad_s2: self.cfg.max_joint_acceleration_rad_s2,
-            ee: self.cfg.ee,
             control_period: self.cfg.cycle_period,
             smoothing: self.cfg.smoothing,
         }
@@ -866,15 +872,20 @@ impl Planner {
                 duration,
                 reply,
             } => {
+                let traj = JointTrajectory::through(
+                    &[self.setpoint, target],
+                    &self.cfg.max_joint_velocity_rad_s,
+                    &self.cfg.max_joint_acceleration_rad_s2,
+                    duration,
+                    now,
+                );
+                if let Err(failure) = path::check_move_time(&traj, "move", "shorter moves") {
+                    reply.fail(self.side, failure).await;
+                    return Mode::Follow;
+                }
                 info!("{}: joint move start", self.side);
                 Mode::JointMove(JointMove {
-                    traj: JointTrajectory::through(
-                        &[self.setpoint, target],
-                        &self.cfg.max_joint_velocity_rad_s,
-                        &self.cfg.max_joint_acceleration_rad_s2,
-                        duration,
-                        now,
-                    ),
+                    traj,
                     reply,
                     _move_slot: move_slot,
                 })
@@ -1185,6 +1196,45 @@ mod tests {
             done_rx.try_recv().is_err(),
             "the later goal is in flight, not ended"
         );
+    }
+
+    /// A joint move its joint limits cannot run within the move ceiling fails
+    /// with `rejected` before the arm moves, and frees its slot.
+    #[tokio::test]
+    async fn a_joint_move_past_the_ceiling_fails_before_the_arm_moves() {
+        let held = [0.0; ARM_DOF];
+        let model = bundled_arm(openarm_description::HardwareVersion::V1, Side::Left);
+        let mut planner = Planner::new(
+            Side::Left,
+            model,
+            PlanConfig {
+                // 0.5 rad at 0.001 rad/s takes 500 s.
+                max_joint_velocity_rad_s: [0.001; ARM_DOF],
+                ..plan_config()
+            },
+        );
+        planner.commit(held);
+        let (goal_tx, mut goals) = mpsc::channel(1);
+        let move_slot = claimed_move_slot();
+        let (done_tx, mut done_rx) = mpsc::channel(1);
+        goal_tx
+            .send(Goal::posture_share([0.5; ARM_DOF], done_tx))
+            .await
+            .expect("queue the goal");
+        planner
+            .tick(held, None, &mut goals, &move_slot, Instant::now())
+            .await;
+        let Outcome::Failed(failure) = done_rx.try_recv().expect("the move ends at once") else {
+            panic!("the move fails");
+        };
+        assert_eq!(failure.kind, FailureKind::Rejected);
+        assert!(
+            failure.message.contains("this move, past the 60 s"),
+            "{}",
+            failure.message
+        );
+        assert_eq!(planner.setpoint(), held, "the arm never left its pose");
+        assert!(!move_slot.is_claimed(), "the failure releases the slot");
     }
 
     /// A posture share whose arm never follows: the governor holds every
@@ -1524,7 +1574,7 @@ mod tests {
             "the step must close the gap: {before} -> {after}"
         );
         let cfg = plan_config();
-        let budget = cfg.ee.linear_m_s * cfg.cycle_period.as_secs_f64();
+        let budget = cfg.stream_ee_velocity_m_s * cfg.cycle_period.as_secs_f64();
         assert!(
             after >= before - budget * 1.01,
             "one tick may close at most its {budget} m budget: {before} -> {after}"
@@ -1547,7 +1597,7 @@ mod tests {
         let moved = planner.world_ee_pose(&stepped);
         let travelled = (moved.translation.vector - start.translation.vector).norm();
         let cfg = plan_config();
-        let budget = cfg.ee.linear_m_s * cfg.cycle_period.as_secs_f64();
+        let budget = cfg.stream_ee_velocity_m_s * cfg.cycle_period.as_secs_f64();
         assert!(
             travelled <= budget * 1.01,
             "one tick travelled {travelled} m against a {budget} m budget"
@@ -1566,7 +1616,7 @@ mod tests {
         let stepped = planner.follow_target(&Some(Upstream::Pose(twisted)));
         let moved = planner.world_ee_pose(&stepped);
         let cfg = plan_config();
-        let budget = cfg.ee.angular_rad_s * cfg.cycle_period.as_secs_f64();
+        let budget = planner.stream_step_rates().angular_rad_s * cfg.cycle_period.as_secs_f64();
         let turned = moved.rotation.angle_to(&start.rotation);
         assert!(
             turned <= budget * 1.01,
@@ -1646,10 +1696,7 @@ mod tests {
             max_joint_velocity_rad_s: [
                 16.754666, 16.754666, 5.445426, 5.445426, 20.943946, 20.943946, 20.943946,
             ],
-            ee: EeCaps {
-                linear_m_s: 0.5,
-                angular_rad_s: 0.8,
-            },
+            stream_ee_velocity_m_s: 0.5,
             limits: model.limits(),
             ..plan_config()
         };
