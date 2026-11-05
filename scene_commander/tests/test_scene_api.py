@@ -797,6 +797,18 @@ async def _load_handler_returned(commander, returned, answer):
     await asyncio.gather(answer, return_exceptions=True)
 
 
+def test_the_whole_catalogue_is_asked_with_every_field_of_the_request(commander):
+    # peppygen's Request takes every field of the contract's request, the
+    # optional ones as None: the whole catalogue names no filter.
+    async def scenario(client):
+        return await _get(client, "/api/assets")
+
+    status, _ = _call(commander, scenario)
+    assert status == 200
+    _, request = commander.services.get_assets_list.requests[0]
+    assert request == SimpleNamespace(kind=None, category=None, query=None, work_surface_kind=None)
+
+
 def test_assets_answer_503_with_the_provider_reason_until_the_catalogue_arrives(commander, caplog):
     caplog.set_level(logging.INFO)
     commander.services.get_assets_list.answers = [_busy(), _busy(), _catalogue(_SCENE)]

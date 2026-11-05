@@ -1,19 +1,23 @@
 // motion_planner: plans joint paths for one arm of the robot its initializer's
-// robot_identity names, around what the robot's perception camera sees. It keeps a
-// voxel map of the camera's depth frames in the robot frame, the robot's own
-// body cut out at each frame's joint positions, and plans with OMPL, keeping a
-// clearance from the map and from the robot's own body, every other joint held
-// where it stands. It checks joint paths from other sources the same way, and
-// describes the arms by the names its goals take. It moves nothing: a caller
-// runs a path with limb_motion's execute_joint_path. See README.md.
+// robot_identity names, around what the robot's perception camera sees and the
+// objects of its planning scene. It keeps a voxel map of the camera's depth
+// frames in the robot frame, the robot and the scene's objects cut out of each
+// frame where they stood, and plans with OMPL, keeping a clearance from the
+// map, the objects and the robot's own body, every other joint held where it
+// stands and the objects attached to the planned arm's grasp link carried with
+// it. It checks joint paths from other sources the same way, describes the arms
+// by the names its goals take, and holds the planning scene: the collision
+// objects, the objects attached to an arm's grasp link, and the pairs allowed
+// to touch. It moves nothing: a caller runs a path with limb_motion's
+// execute_joint_path. See README.md.
 {
   peppy_schema: "node/v1",
   manifest: {
     name: "motion_planner",
     tag: "v1",
     description: [
-      "Plans joint paths for one arm of the robot around what the robot's depth camera has seen, and checks joint paths from other sources the same way. It moves nothing: a caller runs a path with limb_motion's execute_joint_path.",
-      "It implements motion_planning. It keeps a voxel map of the perception camera's depth frames, the robot cut out of each frame, and plans with OMPL, each state keeping a clearance from the map and between the pairs of the robot's own links its self-collision model checks. It reads the robot's model from its initializer's robot_identity, the arms' measured joint positions from limb_state, and the camera from camera_mounts, workspace, camera and geometry; without a camera, a plan keeps clear of the robot's own body alone.",
+      "Plans joint paths for one arm of the robot around what the robot's depth camera has seen and the objects of its planning scene, and checks joint paths from other sources the same way. It moves nothing: a caller runs a path with limb_motion's execute_joint_path.",
+      "It implements motion_planning. It keeps a voxel map of the perception camera's depth frames, the robot and the planning scene's objects cut out of each frame, and plans with OMPL, each state keeping a clearance from the map, the objects and between the pairs of the robot's own links its self-collision model checks. It holds the planning scene: the collision objects, the objects attached to an arm's grasp link, and the pairs allowed to touch. It reads the robot's model from its initializer's robot_identity, the arms' measured joint positions from limb_state, and the camera from camera_mounts, workspace, camera and geometry; without a camera, a plan keeps clear of the robot's own body and the scene's objects alone.",
     ],
     implements: [
       { name: "motion_planning", tag: "v1", link_id: "motion_planning" },
@@ -56,6 +60,10 @@
         { link_id: "motion_planning", name: "check_joint_path" },
         { link_id: "motion_planning", name: "describe_arms" },
         { link_id: "motion_planning", name: "clear_occupancy_map" },
+        { link_id: "motion_planning", name: "apply_collision_objects" },
+        { link_id: "motion_planning", name: "apply_attached_collision_object" },
+        { link_id: "motion_planning", name: "set_allowed_collision" },
+        { link_id: "motion_planning", name: "get_planning_scene" },
       ],
       consumes: [
         { link_id: "identity", name: "get_identity" },
@@ -79,21 +87,25 @@
       def_file: "apptainer.def",
     },
     parameters: {
-      // The clearance (m) every state of a path keeps from the map and between
-      // each pair of links the self-collision model checks: 0 or more. At or above the backbone's d_safe_m,
-      // so its guard does not slow the arm on a planned path.
+      // The clearance (m) every state of a path keeps from the map, the
+      // planning scene's objects and between each pair of links the
+      // self-collision model checks, which get_planning_scene reports as
+      // clearance_m: 0 or more. At or above the backbone's d_safe_m, so its
+      // guard does not slow the arm on a planned path.
       min_clearance_m: "f64",
       // How far (rad, or m for a prismatic joint) a start may lie outside a
       // joint limit and still be moved onto it: above 0.
       start_tolerance_rad: "f64",
-      // How the map cuts the robot out of a depth frame: each collision piece
-      // grown to padding_scale (above 0), a mesh's about the mean of its
-      // vertices and a box, a cylinder or a sphere about its origin, and
-      // holding every point within padding_offset_m (m, 0 or more) of the
-      // scaled piece.
+      // How the map cuts the robot and the planning scene's objects out of a
+      // depth frame: each collision piece grown to padding_scale (above 0), a
+      // mesh's about the mean of its vertices and a box, a cylinder or a
+      // sphere about its origin, each shape of an object as well, a mesh
+      // about the center of its bounds, and each holding every point within
+      // padding_offset_m (m, 0 or more) of the scaled piece or shape.
       padding_scale: "f64",
       padding_offset_m: "f64",
-      // The edge of a voxel (m): above 0.
+      // The edge of a voxel (m), which get_planning_scene reports as
+      // voxel_size_m: above 0.
       voxel_size_m: "f64",
       // The box of the robot frame the map holds (m): its lowest and its
       // highest corner, each minimum below its maximum.
@@ -108,7 +120,8 @@
       max_range_m: "f64",
       // The most depth frames a second the map takes in: above 0.
       max_update_rate_hz: "f64",
-      // The configurations the goal sampler draws for a goal: 1 or more.
+      // The most goals a plan samples, as MoveIt's max_goal_samples bounds
+      // the goals its goal sampler adds: 1 or more.
       goal_samples: "u32",
       // The iterations each attempt of a plan may take, besides its time
       // limit: 1 or more.

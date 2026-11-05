@@ -1,11 +1,12 @@
 //! The grippers' fingers where they hang at the grippers' openings: the parts each arm's
 //! chain carries, placed by the self model at its side's opening. A plan carries the
-//! planned arm's fingers as riders of its hand, a goal may name a finger, and the map cuts
-//! every finger out of a depth frame. The robot's model refuses fingers that do not fit
-//! their arms when it is built.
+//! planned arm's fingers as riders of its hand, with the shapes of the objects the
+//! planning scene attaches to its grasp link, a goal may name a finger, and the map cuts
+//! every finger and every attached object out of a depth frame. The robot's model
+//! refuses fingers that do not fit their arms when it is built.
 
 use collision_geometry::chain::{ChainGeometry, Rider};
-use motion_planning_core::RiderOffTheArm;
+use motion_planning_core::{PlanningScene, RiderOffTheArm};
 use openarm_description::{ARM_DOF, ArmPair, Side};
 use self_collision_model::{FingerError, SelfCollisionModel};
 
@@ -37,4 +38,17 @@ pub fn riders_of_both_arms<'g>(
     arms: &'g ArmPair<ArmModel>,
 ) -> Result<ArmPair<Vec<Rider<'g>>>, FingerError> {
     ArmPair::from_fn(|side| riders(model, &arms[side].geometry, side)).transpose()
+}
+
+/// Every body the arm `arm` carries: `fingers`, its fingers, and the shapes of the objects
+/// `scene` attaches to its grasp link.
+pub fn with_held_objects<'a>(
+    fingers: Vec<Rider<'a>>,
+    arm: &'a ArmModel,
+    scene: &'a PlanningScene,
+) -> Vec<Rider<'a>> {
+    fingers
+        .into_iter()
+        .chain(scene.riders(arm.grasp_link, &arm.geometry))
+        .collect()
 }

@@ -1,16 +1,21 @@
 # motion_planner
 
-Plans joint paths for one arm of a robot around what its perception camera sees. The
-node keeps a voxel map of the camera's depth frames in the robot frame, plans an arm's
-path on it with OMPL, keeping a clearance from the map and from the robot's own body,
-and checks paths from other sources the same way. It implements `motion_planning:v1`
-and moves nothing: a caller runs a plan with limb_motion's `execute_joint_path`,
-passing the plan's `start_joint_positions` as `expected_start_joint_positions`.
+Plans joint paths for one arm of a robot around what its perception camera sees and the
+objects of its planning scene. The node keeps a voxel map of the camera's depth frames in
+the robot frame and a planning scene of collision objects, objects attached to an arm's
+grasp link and pairs allowed to touch, as MoveIt's planning scene holds them; it plans an
+arm's path with OMPL, keeping a clearance from the map, the objects and the robot's own
+body, and checks paths from other sources the same way. It implements
+`motion_planning:v1` and moves nothing: a caller runs a plan with limb_motion's
+`execute_joint_path`, passing the plan's `start_joint_positions` as
+`expected_start_joint_positions`.
 
 ```text
  backbone: limb_states ---------> joint history ---+--> cut-out of the robot
- backbone: camera_mounts, workspace  (2 s)         |
+ backbone: camera_mounts, workspace  (2 s)         |    and of the objects
  camera:   depth_stream, geometry --> depth points +--> voxel map (robot frame)
+ apply_collision_objects, apply_attached_collision_object,  |
+ set_allowed_collision --> planning scene ------------------+
                                                           |
  plan_joint_path --> start --> goal samples (IK) --> OMPL --> rounded path check
  check_joint_path --> start, waypoints ----------------------> rounded path check
@@ -67,9 +72,16 @@ until the gripper closes.
   mean of its vertices (a box, a cylinder or a sphere about its origin), and holds every
   point within `padding_offset_m` of the scaled piece. MoveIt's robot filter takes the
   same two numbers and grows a body by sharp planes (`collision_geometry`'s README, The
-  robot filter). A point inside the grown pieces is the robot seeing itself: its voxel
-  takes the lowest log-odds and reads free, as MoveIt sets its model cells, and its ray
-  clears the space before it.
+  robot filter). So is each shape of the planning scene's objects, by the same two
+  numbers and the same rule: within `padding_offset_m` of the shape scaled about its
+  center, a mesh's the center of its bounds; an object an arm holds stands where its
+  grasp link stood at the frame's stamp. A point inside the grown pieces or shapes is
+  the robot or an object seen: its voxel takes the lowest log-odds and reads free, as
+  MoveIt sets its model cells, though another point of the same frame ends in it, and
+  its ray clears the space before it.
+- Adding, moving or attaching an object clears every voxel it intersects where it then
+  stands: a call of `apply_collision_objects` clears where it leaves each object it adds
+  or moves, and nothing for one it then removes.
 - A frame waits for the joint positions at its stamp. Two frames wait at most: the
   oldest that has arrived since the map last took one, and the newest after it; a frame
   between them is never taken. The map takes the newer of the two whose stamp a
@@ -82,11 +94,12 @@ until the gripper closes.
   frame, a frame stamped at or before the restart marks nothing, and the frames that
   wait for joint positions on the clock before it are dropped.
 - The deprojection, the history and the cut-out are `motion_planning_core`'s
-  (`DepthCamera`, `JointHistory`, `RobotMask`, `insert_cut_out`), so a replay of
-  recorded frames and joint positions through them gives the map of each frame the
-  node takes. Which frames the map takes (the rate, the wait for the joint positions,
-  the cut-off of a clear) and where the fingers hang at each frame's openings are the
-  node's.
+  (`DepthCamera`, `JointHistory`, `RobotMask`, `insert_cut_out`, and the planning
+  scene's `PlanningScene::riders` and `PlanningScene::standing_shapes`), so a replay of
+  recorded frames, joint positions and scenes through them gives the map of each frame
+  the node takes. Which frames the map takes (the rate, the wait for the joint
+  positions, the cut-off of a clear) and where the fingers hang at each frame's
+  openings are the node's.
 - The map takes in at most `max_update_rate_hz` frames a second, one at a time; the
   frames that arrive while it takes one in wait as the bullet above says.
 - A frame's `align_mode` is the one the camera's `get_depth_intrinsics` and
@@ -95,7 +108,8 @@ until the gripper closes.
   frame encoded other than `z16` is skipped.
 - Space the camera has not seen holds nothing. A table's underside, or what stands
   behind an object, is free to a plan.
-- `clear_occupancy_map` empties the map. The frames after it fill it again: a frame
+- `clear_occupancy_map` empties the map; the planning scene stays. The frames after it
+  fill it again: a frame
   the camera took at or before the newest joint positions measured at the clear marks
   nothing, however late it arrives.
 - The four camera slots bind as one: with `camera` and `geometry` bound, the map reads
@@ -117,42 +131,60 @@ until the gripper closes.
   empty, at the arm's last measured joint positions. The other arm stands where it was
   last measured, and the grippers at their measured openings: the planned arm's
   fingers move with its hand.
-- The goal is joint constraints alone, or position and orientation constraints alone.
-  A position or orientation constraint names any link of the arm: its grasp link,
-  the link of one of its joints or a link fixed below it, or a finger where it hangs
-  at the gripper's opening; the position and the orientation constraints name one
-  link, and a goal that names two is refused with `rejected`, naming both. This
-  departs from MoveIt, whose `ConstraintSamplerManager::selectDefaultSampler`
-  (moveit_core, constraint_samplers, MoveIt 2.15.2) keeps one IK sampler, for the link
-  whose constraints leave the least sampling volume, and accepts a goal sample only
-  when the other links' constraints hold by chance. Goal configurations are drawn
-  with the arm's inverse kinematics, up to `goal_samples` of them within the plan's
-  time.
-- Every state of the path keeps `min_clearance_m` from the map and between each pair of
-  the robot's own links that the self-collision model checks; so does the path
-  `execute_joint_path` runs from the plan's start, its corners rounded as it rounds
-  them. The planner checks states at the plan's clearance, `min_clearance_m` plus 1 mm
-  from the map and plus 2 mm between the robot's own links, and walks each motion by
-  conservative advancement: a step moves no point of the arm farther than the spare
-  above `min_clearance_m`, and at most 1.5 cm, so every state between two checked ones
-  keeps `min_clearance_m`. The messages of `unreachable` and `no_path` name the plan's
-  clearance in meters; `unreachable`'s also names, of the goal configuration that falls
-  short least, the pair of links, or the link and the map, it falls short against and
-  how far apart they stand. Every state of a planned path past its start keeps the plan's
+- The goal is joint constraints alone, or position and orientation constraints alone. A
+  position or orientation constraint names any link of the arm: its grasp link, the link
+  of one of its joints or a link fixed below it, or a finger where it hangs at the
+  gripper's opening; the position and the orientation constraints name one link, and a
+  goal that names two is refused with `rejected`, naming both. This departs from MoveIt,
+  whose `ConstraintSamplerManager::selectDefaultSampler` (moveit_core,
+  constraint_samplers, MoveIt 2.15.2) keeps one IK sampler, for the link whose constraints
+  leave the least sampling volume, and accepts a goal sample only when the other links'
+  constraints hold by chance. Goals are sampled as MoveIt's `ConstrainedGoalSampler`
+  samples them: each sample sets out from the last goal found, from the start for the
+  first, through motion_planning_core's port of MoveIt's KDL inverse kinematics, and the
+  plan keeps up to `goal_samples` goals within its time.
+- Every state of the path keeps `min_clearance_m` from the map, from the planning
+  scene's objects, and between each pair of the robot's own links that the
+  self-collision model checks; so does the path `execute_joint_path` runs from the
+  plan's start, its corners rounded as it rounds them. An object attached to the planned
+  arm's grasp link moves with its hand as the fingers do. It keeps the clearance from
+  the map, the other objects and the parts of the robot the plan does not move, the
+  other arm and the body. Between an attached object and the links of the arm that
+  carries it, outside its touch links, the clearance is 0: they keep out of contact.
+  Objects one arm carries are never checked against each other, as MoveIt checks no two
+  bodies attached to one link. An object attached to the other arm's grasp link stands
+  where that arm, as measured, holds it, and the planned arm keeps the clearance from it
+  but for that arm's grasp link and touch links. The link that carries an object and its
+  touch links are never checked against it, and nor is a pair that
+  `set_allowed_collision` allows. A mesh is checked by its triangles, and a link wholly
+  inside a closed mesh collides with it. The planner checks states at the plan's
+  clearance, `min_clearance_m` plus 1 mm from the map and the objects, plus 2 mm between
+  the robot's own links, and 2 mm between an attached object and the links of the arm
+  that carries it, and walks each motion by conservative advancement: a step moves no
+  point of the arm farther than the spare above that pair's clearance, and at most 1.5
+  cm, so every state between two checked ones keeps `min_clearance_m`, or stays out of
+  contact where the clearance is 0. The messages of `unreachable` and `no_path` name the
+  plan's clearances in meters; `unreachable`'s also names, of the goal configuration
+  that falls short least, the pair it falls short against, two links, a link or a
+  carried object and the map or an object, or a carried object and a link, and how far
+  apart they stand. Every state of a planned path past its start keeps the plan's
   clearance.
 - A start closer than the plan's clearance is valid when, until that clearance is
-  reached, neither the shortfall from the map nor the one from the robot's own body
-  grows at a checked state, each on its own, to the rounding of the arithmetic
-  (1e-9 m); between two checked states each comes at most half its distance nearer.
-  The start sets each one's floor: 0 from a start below `min_clearance_m`, and from one
-  at or above it `min_clearance_m` or the start's distance less 0.2 mm (map) or 0.4 mm
-  (own body), whichever is lower. Between two checked states each dips by at most half
-  its room, its farthest checked distance above that floor, so a start nearer than
-  `min_clearance_m` stays above half its distance, a start just above it comes at most
-  0.1 mm (map) or 0.2 mm (own body) below it, and a motion ends where its step falls
-  under 0.1 mm. The rule walks the runs on the straight line from the start; any other
-  run is walked from its first state by its spare, and fails at a first state short of
-  the plan's clearance. A start outside a joint limit by no more than
+  reached, none of its shortfalls, from the map and the objects, within the robot's own
+  body, and between an attached object and the arm that carries it, grows at a checked
+  state, each on its own, to the rounding of the arithmetic (1e-9 m); between two
+  checked states each comes at most half its distance nearer. The start sets each one's
+  floor: 0 from a start below the clearance asked of it, `min_clearance_m`, or 0 for an
+  attached object against its arm, and from one at or above it that clearance or the
+  start's distance less 0.2 mm (map and objects) or 0.4 mm (own body, and an attached
+  object against its arm), whichever is lower. Between two checked states each dips by
+  at most half its room, its farthest checked distance above that floor, so a start
+  nearer than the clearance asked stays above half its distance, a start just above it
+  comes at most 0.1 mm (map and objects) or 0.2 mm (own body) below it, an attached
+  object against its arm, whose clearance is 0, never below 0, and a motion ends where
+  its step falls under 0.1 mm. The rule walks the runs on the straight line from the
+  start; any other run is walked from its first state by its spare, and fails at a first
+  state short of the plan's clearance. A start outside a joint limit by no more than
   `start_tolerance_rad` is moved onto the limit.
 - The backbone runs a path from where the arm stands, which its expected-start check
   allows up to its own `start_tolerance_rad` from the plan's start in each joint. Run
@@ -160,23 +192,24 @@ until the gripper closes.
   joints of that tolerance times the joint's reach, the bound `motion_planning_core`
   walks by, as MoveIt's execution starts within its `allowed_start_tolerance` and
   checks nothing more.
-- A plan runs on what its admission took: the map, the arms' measured joint
-  positions and the grippers' openings, and the self-collision model at them. A frame,
-  a clear or a message of limb_states after acceptance changes nothing of it.
+- A plan runs on what its admission took: the planning scene, the map, the arms'
+  measured joint positions and the grippers' openings, and the self-collision model at
+  them. A frame, a clear, a change of the scene or a message of limb_states after
+  acceptance changes nothing of it.
 - `objective` is `any`: the node plans with RRTConnect, which answers the first path it
   finds within `max_iterations`, and simplifies it in the time left. A goal of another
   objective is refused, the message naming `any`.
 - A plan's time follows MoveIt's allowed planning time, as `motion_planning_core`
-  implements it, with no share kept for any part: the goal sampling and the attempts
-  take `allowed_planning_time_s`, which a request gives above 0 and at most 60, from when
-  the node takes the goal, and the simplifier what they leave. The goal sampling draws
-  up to `goal_samples` configurations, ending early at the deadline; the attempts plan
-  in all the time left, each under the whole of it; the simplifier takes at most 1000
-  iterations of what they leave, and its first pass runs to its end past the deadline, as
-  MoveIt's does. The check of the rounded path runs to its end after the deadline, so a
-  plan answers after its deadline by the time the simplifier's first pass, when the
-  attempts leave it none of the time, and that check take. With more than 1 attempt,
-  the hybrid of the attempts' paths and its checks also run after the deadline.
+  implements it, with no share kept for any part: the goal sampling and the attempts take
+  `allowed_planning_time_s`, which a request gives above 0 and at most 60, from when the
+  node takes the goal, and the simplifier what they leave. The goal sampling keeps up to
+  `goal_samples` goals, ending early at the deadline; the attempts plan in all the time
+  left, each under the whole of it; the simplifier takes at most 1000 iterations of what
+  they leave, and its first pass runs to its end past the deadline, as MoveIt's does. The
+  check of the rounded path runs to its end after the deadline, so a plan answers after
+  its deadline by the time the simplifier's first pass, when the attempts leave it none of
+  the time, and that check take. With more than 1 attempt, the hybrid of the attempts'
+  paths and its checks also run after the deadline.
 - The planner makes `planning_attempts` attempts, each from its own seed: four at once,
   MoveIt's default `max_planning_threads`, and each further four once the four before
   them have ended, while the time lasts; a single attempt plans on the plan's own
@@ -187,8 +220,8 @@ until the gripper closes.
   `ompl_bridge::PLANNING_THREADS` (4), and each check of the robot's own body runs on a
   copy no other check holds.
 - A plan is seeded from the map's stamp, so the same request from the same start on
-  the same map gives the same path when no part of the plan ends at its deadline, as a
-  plan that finds its path in its time.
+  the same map and planning scene gives the same path when no part of the plan ends at
+  its deadline, as a plan that finds its path in its time.
 - A cancel stops the plan at any part of it, and the goal ends cancelled, whatever the
   plan answers after it.
 
@@ -200,7 +233,8 @@ frame in the map.
 ## A check
 
 `check_joint_path` checks one arm's path from its start (empty: the arm's last
-measured joint positions) through its waypoints with the checks of a plan's answer
+measured joint positions) through its waypoints, on the planning scene and the map as
+they stand, with the checks of a plan's answer
 (`motion_planning_core::check_arm_path`): the start inside its limits by
 `start_tolerance_rad` and out of contact, each waypoint inside the joint limits and,
 after the start, at the plan's clearance, each run between them walked as a plan walks
@@ -218,15 +252,98 @@ robot's MCP endpoint waits on `check_joint_path`.
 A plan's refusals come at the goal's admission, before the node takes the goal; its
 failures come after.
 
+## The planning scene
+
+The scene holds, as MoveIt's planning scene does besides its octomap, the collision
+objects other nodes add, the objects attached to an arm's grasp link that move with it,
+and the pairs of names allowed to touch. `motion_planning_core`'s `PlanningScene`
+decides every rule of it (`motion_planning_core`'s README, The planning scene); the node
+serves its four members on the scene as it stands:
+
+- `apply_collision_objects` applies its objects in order, all or none, and an empty list
+  changes nothing. "add" places an object of boxes, spheres, cylinders and closed
+  meshes, posed in the robot frame, in place of one of the same id, whose allowed pairs
+  it keeps; "move" reads the id and the pose; "remove" reads the id and drops every pair
+  that names the object.
+- `apply_attached_collision_object` attaches an object to an arm's grasp link where both
+  stand, the link where the arms' last measured joint positions put it, with touch links
+  it may touch besides that link; a detach, which reads the id alone, leaves the object
+  in the scene where it stands. Its allowed pairs stay through both.
+- `set_allowed_collision` lets an object, attached or not, touch links of the robot,
+  other objects, or `"occupancy_map"`, the voxel map, or stops it. To set a held item
+  down on a table, a caller pairs the item with the table, and the table with the
+  gripper's links too where they come nearer to it than `clearance_m`: the table is an
+  object, which every link keeps that clearance from.
+- `get_planning_scene` answers the objects no link carries and the attached objects,
+  posed in their grasp links' frames, each list in the order of the ids; each allowed
+  pair once, its names in order, the pairs in the order of their names; `clearance_m`,
+  which is `min_clearance_m`; and `voxel_size_m`.
+
+| Refusal | When |
+|---|---|
+| `rejected` | An object's id is empty, or names a link or `"occupancy_map"`; an add has no shape, or a shape that cannot be built, an open mesh among them; an add or a move has a pose whose position is not finite or whose orientation is no unit quaternion; "move" or "remove" names an unknown object; an operation names an attached object; an operation is none of the member's; an attach names an object the scene does not hold, a link that is no arm's grasp link, a touch link that is no link of the robot, an object's id among them, or an attached object; a detach names an object the scene does not hold or one no link carries; `set_allowed_collision`'s `name` is no object of the scene, or `other_names` holds a name that is no link, no object and not `"occupancy_map"`, or the object itself. The message names what to send, and the call changes nothing. |
+| `precondition_failed` | An attach before the arms' joint positions are measured. |
+
+Where the scene departs from MoveIt, each a choice a caller sees, against moveit2 2.15.2
+(`PlanningScene`, `moveit_core/planning_scene/src/planning_scene.cpp`, unless named) and
+geometric_shapes 2.3.4:
+
+- The link: an object attaches to an arm's grasp link alone, which a call names as
+  describe_arms names it. `processAttachedCollisionObjectMsg` attaches one to any link of
+  the robot (lines 1542-1547).
+- The link's contact: an attached object is never checked against the link that carries
+  it. MoveIt's FCL check exempts a link only when the object's touch links name it
+  (`collision_detection_fcl/src/collision_common.cpp`, lines 131-156), as
+  `MoveGroupInterface::attachObject` names it when it is given no touch links
+  (`move_group_interface.cpp`, line 955).
+- Ids: an empty id is refused, where MoveIt's `processCollisionObjectRemove` removes every
+  object for a remove of an empty id (lines 1939-1941). An add whose id names a link of
+  the robot, or an attached object, is refused.
+  `processCollisionObjectAdd` adds a world object of any id but its octomap's, an
+  attached object's among them, beside the attached object (lines 1893-1935).
+- A detach reads the object's id alone. MoveIt refuses one whose `link_name` names a
+  link other than the one that carries the object (lines 1720-1727).
+- Pairs: a pair names an object of the scene. MoveIt's allowed collision matrix holds
+  any two names, two links among them.
+- Touch links name links of the robot, and an object's id among them is refused. MoveIt
+  exempts an attached body that another names among its touch links
+  (`collision_detection_fcl/src/collision_common.cpp`, lines 167-173).
+- Meshes: a mesh is a closed solid, and an open one is refused; MoveIt takes the
+  triangles it is given (geometric_shapes `createMeshFromVertices`,
+  `src/mesh_operations.cpp`, line 112). A link wholly inside a closed mesh collides with
+  it (`motion_planning_core`'s README, A valid state).
+- The depth cut-out: an object's shape grows as a link's piece does, within
+  `padding_offset_m` of the scaled shape, and a mesh as itself. MoveIt's shape mask
+  grows the same two numbers by sharp planes, a box's half sides and a cylinder's radius
+  and half length each by the padding, and cuts out a mesh's convex hull
+  (geometric_shapes `bodies::Box`, `bodies::Cylinder` and `bodies::ConvexMesh`,
+  `src/bodies.cpp`; the mask's `ShapeMask::addShape`,
+  `point_containment_filter/src/shape_mask.cpp`).
+- The map at an add: adding, moving or attaching an object clears every voxel it
+  intersects. MoveIt's `PlanningSceneMonitor::excludeWorldObjectFromOctree` adds the
+  object to the shape mask of the scans to come, and its octomap keeps each voxel until
+  a scan updates it (`planning_scene_monitor/src/planning_scene_monitor.cpp`, lines
+  1038-1059).
+
 ## Departures from MoveIt
 
 Each is a choice a caller sees; the launchers' values are OpenArm v2's.
 
-- Clearance: MoveIt checks contact alone by default (`CollisionEnv` padding 0.0), and
-  pads links against the world only (`pad_self_collisions` false). Here every state
-  keeps `min_clearance_m` (0.04 m) from the map and between each pair of links the
-  self-collision model checks, and a checked state 1 mm more from the map and 2 mm more
-  between the robot's own links.
+- Clearance: MoveIt checks contact alone by default (`CollisionEnv` padding 0.0), and pads
+  links against the world only (`pad_self_collisions` false). Here every state keeps
+  `min_clearance_m` (0.04 m) from the map, the objects, an object another arm holds among
+  them, which MoveIt checks as that arm's attached body unpadded, and between each pair of
+  links the self-collision model checks, and a checked state 1 mm more from the map and
+  the objects and 2 mm more between the robot's own links. Between an attached object and
+  the links of the arm that carries it, outside its touch links, the clearance is 0: they
+  keep out of contact, 2 mm apart at a checked state, where MoveIt checks an attached
+  object against the robot unpadded. MoveIt pads no object an arm holds, since it pads
+  only links with collision geometry and the grasp point has none, which it pads by 0
+  (moveit2 2.15.2 collision_env.cpp:127-133 and :166-176, collision_env_fcl.cpp:195-196):
+  here a held object keeps `min_clearance_m` from the map and the objects. MoveIt pads a
+  link's mesh along its vertex normals (geometric_shapes 2.3.4 shapes.cpp:402-404), so a
+  face beside a right-angled edge moves out 2.8 cm at a 4 cm padding; here the clearance
+  holds all round.
 - Motion check: MoveIt's OMPL checks the states of a motion 0.01 of the state space's
   extent apart (`longest_valid_segment_fraction`, moveit2 2.15.2
   `ModelBasedPlanningContext`) and nothing between them. Here every state between two
@@ -244,8 +361,13 @@ Each is a choice a caller sees; the launchers' values are OpenArm v2's.
 - The goal: MoveIt samples goals while it plans (`ConstrainedGoalSampler`, OMPL's
   `GoalLazySamples`), and for a goal on several links samples the one whose constraints
   leave the least volume, accepting a sample that meets the others by chance. Here the
-  sampler draws up to `goal_samples` (64) configurations before OMPL plans, and a goal
-  names one link.
+  plan samples its goals, up to `goal_samples` (10), before OMPL plans, and a goal names
+  one link. For a link the last joint does not move, and for a finger of the arm, a part
+  its hand carries that hangs on a joint of its own (`Frame::Part`, `Frame::from` its
+  rider), MoveIt builds no inverse kinematics and keeps the states it samples that meet
+  the goal by chance; here the goal sampling descends toward what the goal names and takes
+  the descents' approximate ends, the goal's constraints deciding (motion_planning_core's
+  README, "The goal").
 - The time: the check of the rounded path runs to its end after the deadline.
 - Self pairs: MoveIt's OpenArm v2 SRDF (enactic/openarm_ros2,
   `openarm_v2.0/openarm_bimanual.srdf`) disables adjacent links alone, and checks each
@@ -255,15 +377,15 @@ Each is a choice a caller sees; the launchers' values are OpenArm v2's.
 - Attempts: as MoveIt's, but for the departures `ompl_bridge`'s README lists under
   Attempts.
 - Repeatability: a plan is seeded from the map's stamp, so a request repeats on the same
-  map when no part of the plan ends at its deadline; MoveIt's samplers draw from the
-  process's seed generator.
+  map and planning scene when no part of the plan ends at its deadline; MoveIt's
+  samplers draw from the process's seed generator.
 
 | Refusal or failure | When |
 |---|---|
 | `rejected` | The request names more or fewer than one arm, an arm, joint or link the arm does not have, a name twice in one list of constraints, or a number outside its range; or the goal mixes joint and pose constraints, or its position and orientation constraints name more than one link. The message names what to send. |
 | `precondition_failed` | The camera is linked and the map has taken in no depth frame since the node started or the map was cleared, the message naming what the map waits on; or no joint positions have been measured; or a plan's start lies outside a joint limit by more than `start_tolerance_rad`, the message naming the joint. |
-| `start_in_collision` | A plan's start touches the map or the robot's own body; the message names the pair. |
-| `unreachable` | No configuration meets the goal within `goal_samples` draws and the time allowed, or every one that does comes nearer than the plan's clearance, which the message names with the pair of links, or the link and the map, that the one falling short least falls short against. |
+| `start_in_collision` | A plan's start touches the map, an object of the planning scene or the robot's own body; the message names the pair. |
+| `unreachable` | No configuration meets the goal before the goal sampling ends (once the samples since the last goal found reach 1000 less the goals found so far, as MoveIt's `max_goal_sampling_attempts` bounds the samples its sampling function makes before it returns a goal, counting from the goals OMPL has taken) or within the time allowed, or every one that does comes nearer than the plan's clearance, which the message names with the pair that the one falling short least falls short against: two links, a link or a carried object and the map or an object, or a carried object and a link. |
 | `no_path` | The planner finds no path within the time and the iterations allowed, or the start rule leaves no motion from the start; a planned waypoint falls short of the plan's clearance, or a corner's rounding does however near it the added waypoints lie; the planned path fails its check, simplified and as planned; or the time allowed ends before the plan answers. The message names the plan's clearance where it falls short. |
 | `timeout` | A check has a walk of a run or an arc left at 10 s. |
 | `attempt_failed` | The planner fails on its own: OMPL reports an error, or the plan's task ends without an answer. |
