@@ -377,20 +377,21 @@ def _matches(
     )
 
 
-def _public_catalogue(assets) -> list[dict]:
+def _public_catalogue(assets: dict[str, dict]) -> list[dict]:
     """The catalogue metadata a caller sees, without the raw Isaac paths:
     scenes first in their fixed order, then every other asset by kind,
-    category and name."""
+    category and name. The asset id of each entry is its key in `assets`,
+    the id by which load_scene and spawn_object find it."""
 
     public = [
         {
-            "asset_id": asset.get("asset_id", ""),
+            "asset_id": asset_id,
             "display_name": asset.get("display_name", ""),
             "description": asset.get("description", ""),
             "kind": asset.get("kind", ""),
             "category": asset.get("category", ""),
         }
-        for asset in assets
+        for asset_id, asset in assets.items()
     ]
 
     scene_order = {
@@ -632,7 +633,7 @@ class SceneActionIO:
                 asset_id: dict(asset)
                 for asset_id, asset in assets.items()
             }
-            self._catalogue = _public_catalogue(self._assets.values())
+            self._catalogue = _public_catalogue(self._assets)
             self._public_by_asset = {
                 asset["asset_id"]: asset
                 for asset in self._catalogue
