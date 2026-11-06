@@ -712,16 +712,20 @@ fn apply_controls(governor: &mut Governor, planners: &mut ArmPair<Planner>, cfg:
 /// tick is checked and runs from where the arm stands. The per-joint
 /// velocity limit in the chase then walks the setpoint back to the
 /// operator's command, a tick's step at a time.
+///
+/// Each delivery counts once, on the tick that judges it: the watch is
+/// marked seen here, so a state that arrives later in this tick counts on
+/// the next one.
 fn admit_arms(
     liveness: &mut ArmPair<Liveness>,
     cadence: &mut ArmPair<Cadence>,
-    channels: &ArmPair<ArmChannels>,
+    channels: &mut ArmPair<ArmChannels>,
     planners: &mut ArmPair<Planner>,
     now: Instant,
     stale_limit: Duration,
 ) -> ArmPair<Admission> {
     ArmPair::from_fn(|side| {
-        let delivered = channels[side].measured.has_changed().unwrap_or(false);
+        let delivered = take_arm_delivery(&mut channels[side].measured);
         report_cadence(side, "arm", cadence[side].observe(delivered, now));
         let admission = liveness[side].admit(delivered, now, stale_limit);
         if admission == Admission::Reanchor {
@@ -766,6 +770,14 @@ fn report_cadence(side: Side, limb: &str, change: Option<CadenceChange>) {
         }
         None => {}
     }
+}
+
+/// Whether the arm follower of `measured` delivered a state since the tick
+/// that last judged it, and the mark that this tick has judged it.
+fn take_arm_delivery(measured: &mut watch::Receiver<Option<ArmState>>) -> bool {
+    let delivered = measured.has_changed().unwrap_or(false);
+    let _ = measured.borrow_and_update();
+    delivered
 }
 
 /// Whether each gripper follower delivered an opening since the last tick.
@@ -1132,9 +1144,12 @@ async fn tick_arm(
             on_path: None,
         };
     }
+    // A borrow, not a borrow_and_update: only `admit_arms` marks a
+    // delivery seen, so a state that arrived after it judged this arm still
+    // counts on the next tick.
     let measured_q = channels
         .measured
-        .borrow_and_update()
+        .borrow()
         .expect("seed gated on the first state")
         .positions;
     // Read out so no watch borrow guard is held across the await below. A
@@ -1445,6 +1460,25 @@ mod tests {
             "a streaming leader's command is chased: {:?}",
             streaming.candidate
         );
+    }
+
+    /// Each delivery counts once, on the tick that judges it: a state that
+    /// arrives after the tick judged its arm, and before the tick commands
+    /// that arm, counts on the next tick.
+    #[tokio::test]
+    async fn a_state_that_arrives_after_its_arm_was_judged_counts_on_the_next_tick() {
+        let held = [0.0, -0.8, 0.0, 1.2, 0.0, 0.0, 0.0];
+        let mut planner = planner_holding(Side::Left, held);
+        let (mut channels, measured_tx, _goal_tx) = claimed_arm_channels();
+        measured_tx.send_replace(standing_at(held));
+        assert!(take_arm_delivery(&mut channels.measured), "the first state");
+        measured_tx.send_replace(standing_at(held));
+        tick_arm(&mut channels, &mut planner, Admission::Live, Instant::now()).await;
+        assert!(
+            take_arm_delivery(&mut channels.measured),
+            "the next tick counts the state that came after the judge"
+        );
+        assert!(!take_arm_delivery(&mut channels.measured), "once only");
     }
 
     /// A posture share in flight when its follower goes stale fails at the

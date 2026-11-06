@@ -3309,7 +3309,7 @@ async fn a_joint_path_goal_the_backbone_does_not_take_is_refused_at_admission()
     assert!(
         refusal
             .message
-            .starts_with("waypoint 1 of left_arm puts joint 2 at 1.0000 rad"),
+            .starts_with("waypoint 1 of left_arm puts joint 2 at 1 rad, outside its limits ["),
         "{}",
         refusal.message
     );
