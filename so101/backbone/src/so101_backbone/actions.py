@@ -132,8 +132,9 @@ NOT_PLANNED = (
 )
 # The refusal of a goal that names an orientation, which has one more way on.
 NOT_PLANNED_NAMING_ORIENTATION = (
-    f"{NOT_PLANNED}; five joints end on few orientations, so leave orientation out to reach "
-    "the position alone"
+    f"{NOT_PLANNED}, its orientation constraint naming the slack with tolerance_rad or "
+    "free_axis; five joints end on few orientations, so leave orientation out to reach the "
+    "position alone"
 )
 
 _POSE_MOVE_WORDS = _MoveWords(planning="pose solve", goal="pose goal")
