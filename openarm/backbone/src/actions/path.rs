@@ -17,7 +17,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use openarm_description::{ARM_DOF, ArmPair, Side};
+use openarm_description::{ARM_DOF, ArmOrder, ArmPair, Side};
 use peppygen::exposed_actions::limb_motion::execute_joint_path::{
     self, ExecuteJointPathResultArmsItem,
 };
@@ -34,7 +34,7 @@ use crate::coordinator::CoordinatorRequest;
 use crate::failure::{Failure, FailureKind};
 use crate::move_slot::MoveSlot;
 use crate::planner::{
-    ArmOrder, JointPath, Outcome, PathGoal, ShareReply, ShareReport, cancelled_reason,
+    JointPath, Outcome, PathGoal, PathOrder, ShareReply, ShareReport, cancelled_reason,
 };
 use crate::settle::Settle;
 use crate::streams::LeaderActivity;
@@ -61,22 +61,8 @@ fn execute_joint_path_goal(
     let order = ArmOrder::parse(&names)?;
     let arms: Vec<(Side, &execute_joint_path::GoalArmsItem)> =
         order.sides().iter().copied().zip(&d.arms).collect();
-    let (first, first_arm) = arms[0];
-    let count = first_arm.waypoints.len();
-    if count == 0 {
-        return Err(format!(
-            "{} holds no waypoint: a joint path passes through one or more",
-            first.arm_name()
-        ));
-    }
-    if let Some((side, arm)) = arms.iter().find(|(_, arm)| arm.waypoints.len() != count) {
-        return Err(format!(
-            "{} holds {} waypoints, where {} holds {count}: every arm passes through as many",
-            side.arm_name(),
-            arm.waypoints.len(),
-            first.arm_name()
-        ));
-    }
+    let counts: Vec<usize> = d.arms.iter().map(|arm| arm.waypoints.len()).collect();
+    let count = order.waypoint_count(&counts)?;
     for (side, arm) in &arms {
         for (k, waypoint) in arm.waypoints.iter().enumerate() {
             waypoint_within_limits(*side, k, &waypoint.joint_positions, &limits[*side])?;
@@ -164,7 +150,7 @@ fn expected_start(side: Side, joints: &[f64]) -> std::result::Result<Option<Join
 /// Admit a goal on the arms `arms` names: each free in the goal's order
 /// ([`check_limb_free`]), then each claimed ([`claim_arms`]), or refused
 /// with `precondition_failed` for the first busy arm. On a goal of both arms
-/// a refusal names the arm ([`ArmOrder::failure_of`]).
+/// a refusal names the arm ([`PathOrder::failure_of`]).
 fn admit_arms(
     arms: &ArmOrder,
     fresh: &ArmPair<Arc<AtomicBool>>,

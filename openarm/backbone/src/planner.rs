@@ -52,7 +52,7 @@ use crate::upstream::Upstream;
 mod path;
 
 pub use path::{
-    ArmOrder, JointPath, PathGoal, PathGuard, PathJudgment, Resumed, ShareReply, ShareReport,
+    JointPath, PathGoal, PathGuard, PathJudgment, PathOrder, Resumed, ShareReply, ShareReport,
     chase_together, commit_both, judge_path, resume_judged_path, start_path,
 };
 #[cfg(test)]

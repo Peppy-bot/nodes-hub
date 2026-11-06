@@ -8,7 +8,7 @@ use collision_geometry::chain::{BodyGeometry, Padding, Rider};
 use motion_planning_core::{PlanningScene, PosedChain, RobotMask};
 use openarm_description::{ARM_DOF, ArmPair, Side};
 
-use crate::history::Arms;
+use crate::history::ArmJoints;
 use crate::robot::ArmModel;
 
 /// The robot of `models` and `body`, its arms at `arms` carrying `carried`, each arm's
@@ -17,7 +17,7 @@ use crate::robot::ArmModel;
 pub fn robot_mask<'a>(
     models: &'a ArmPair<ArmModel>,
     body: &'a BodyGeometry,
-    arms: &Arms,
+    arms: &ArmJoints,
     carried: &'a ArmPair<Vec<Rider<'a>>>,
     scene: &'a PlanningScene,
     padding: Padding,

@@ -187,14 +187,15 @@ fn openarm(version: HardwareVersion) -> Result<RobotModel, ModelError> {
 /// the link of the arm that carries it, or one that rides no joint of the arm, naming
 /// the finger.
 fn fingers_fit(model: &SelfCollisionModel, arm: &ArmModel) -> Result<(), FingerFault> {
-    on_the_arm(&arm.geometry, &riders(model, &arm.geometry, arm.side)?)?;
+    on_the_arm(arm, &riders(model, &arm.geometry, arm.side)?)?;
     Ok(())
 }
 
-/// Refuses a finger of `fingers` that rides no joint of the arm whose links `geometry`
-/// holds, naming the finger.
-fn on_the_arm(geometry: &ChainGeometry<ARM_DOF>, fingers: &[Rider]) -> Result<(), RiderOffTheArm> {
-    Arm::new(geometry, None).riding(fingers).map(|_| ())
+/// Refuses a finger of `fingers` that rides no joint of `arm`, naming the finger.
+fn on_the_arm(arm: &ArmModel, fingers: &[Rider]) -> Result<(), RiderOffTheArm> {
+    Arm::new(arm.name, &arm.geometry)
+        .riding(fingers)
+        .map(|_| ())
 }
 
 /// The links of `links` that have collision pieces in `geometry`, on its chain or carried
@@ -324,10 +325,8 @@ pub(crate) mod tests {
                 ..fingers[0]
             };
             assert_eq!(
-                ModelError::from(FingerFault::from(
-                    on_the_arm(&arm.geometry, &[off]).unwrap_err()
-                ))
-                .to_string(),
+                ModelError::from(FingerFault::from(on_the_arm(arm, &[off]).unwrap_err()))
+                    .to_string(),
                 format!(
                     "a finger of the self-collision model: {finger} rides the child link of \
                      joint {ARM_DOF}, and the arm's joints run from 0 to {}",

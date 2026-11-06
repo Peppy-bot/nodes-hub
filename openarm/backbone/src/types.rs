@@ -1,12 +1,9 @@
 //! Shared primitives for the bimanual backbone: the limb tables, the
 //! world-pose wire codec, and both arms' joints in one vector.
 
-use openarm_description::{ARM_DOF, ArmPair, Side};
+use openarm_description::{ARM_DOF, ArmPair, DUAL_DOF, Side};
 use srs_model::JointVec;
 use srs_model::nalgebra::{Isometry3, Quaternion, Translation3, UnitQuaternion};
-
-/// Joints across both arms, left (0..7) then right (7..14).
-pub const DUAL_DOF: usize = 2 * ARM_DOF;
 
 /// Both arms' joints, the left arm's then the right's.
 pub type DualJointVec = [f64; DUAL_DOF];

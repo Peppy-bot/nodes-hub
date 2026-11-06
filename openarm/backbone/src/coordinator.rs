@@ -1223,9 +1223,10 @@ mod tests {
 
     use control_core::path_timing::RoundedPath;
 
-    use crate::planner::{ArmOrder, PathGuard, ShareReport};
+    use crate::planner::{PathGuard, ShareReport};
     use crate::settle::PoseTolerance;
     use crate::types::dual_joints;
+    use openarm_description::ArmOrder;
     use srs_model::nalgebra::Vector3;
 
     fn cmd(opening: f64) -> Option<GripperCommand> {
