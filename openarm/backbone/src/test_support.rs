@@ -13,7 +13,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use control_core::path_timing::RoundedPath;
-use openarm_description::{ARM_DOF, ArmPair, HardwareVersion, Side};
+use openarm_description::{ARM_DOF, ArmOrder, ArmPair, HardwareVersion, Side};
 use srs_model::chain_kinematics::{EeCaps, command_smoothing};
 use srs_model::{Arm, JointVec, Limit};
 
@@ -22,8 +22,7 @@ use tokio::sync::mpsc;
 use crate::governor::{GovState, GuardAt, PathArms};
 use crate::move_slot::MoveSlot;
 use crate::planner::{
-    ArmOrder, JointPath, Measurement, PathGoal, PathGuard, PlanConfig, Planner, ShareReply,
-    ShareReport,
+    JointPath, Measurement, PathGoal, PathGuard, PlanConfig, Planner, ShareReply, ShareReport,
 };
 use crate::settle::Settle;
 

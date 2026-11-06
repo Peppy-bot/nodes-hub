@@ -42,12 +42,12 @@
 //! governor's collision model.
 
 use control_core::positive_finite::PositiveFinite;
-use openarm_description::{ARM_DOF, ArmPair, HardwareVersion, Side};
+use openarm_description::{ARM_DOF, ArmPair, DUAL_DOF, HardwareVersion, Side};
 use self_collision_model::DistanceGradient;
 use srs_model::{Jacobian, JointVec};
 use tracing::{info, warn};
 
-use crate::types::{DUAL_DOF, DualJointVec, arm_joints};
+use crate::types::{DualJointVec, arm_joints};
 
 mod barrier;
 mod limiters;
@@ -1504,11 +1504,10 @@ mod tests {
         use std::time::{Duration, Instant};
 
         use crate::failure::FailureKind;
-        use crate::planner::{
-            ArmOrder, Outcome, Resumed, judge_path, resume_judged_path, start_path,
-        };
+        use crate::planner::{Outcome, Resumed, judge_path, resume_judged_path, start_path};
         use crate::settle::Settle;
         use crate::test_support::{claimed, path_goal_through, planner_holding, share_reply};
+        use openarm_description::ArmOrder;
 
         let mut g = governor(true);
         let mut checker = g.path_checker();

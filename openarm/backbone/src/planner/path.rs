@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use control_core::path_timing::{JointTrajectory, MIN_JOINT_CHANGE_RAD, RoundedPath};
 use control_core::timing::{MotionClock, Pace};
-use openarm_description::{ARM_DOF, ArmPair, Side};
+use openarm_description::{ARM_DOF, ArmOrder, ArmPair, DUAL_DOF, Side};
 use srs_model::JointVec;
 use srs_model::chain_kinematics::clamp_into;
 use tokio::sync::mpsc;
@@ -44,7 +44,7 @@ use crate::failure::{Failure, FailureKind, stale_failure};
 use crate::governor::{GuardAt, PathArms, PathBlocked};
 use crate::move_slot::SlotRelease;
 use crate::settle::{Settle, farthest_outside, joint_shortfall, verdict};
-use crate::types::{DUAL_DOF, DualJointVec, arm_joints, dual_joints};
+use crate::types::{DualJointVec, arm_joints, dual_joints};
 
 /// The outcome of a share whose goal was cancelled: the action ends its goal
 /// with the reason of its own cancel.
@@ -75,100 +75,28 @@ pub trait PathGuard: Send {
     ) -> Result<(), String>;
 }
 
-/// The arms a joint path moves, in the order its joint arrays hold their
-/// joints: [`ARM_DOF`] for each arm, each arm's in its fixed order.
-#[derive(Clone, Debug)]
-pub struct ArmOrder(Vec<Side>);
-
-impl ArmOrder {
-    /// Parse the arm names of a goal's `arms`, in their order: one or more
-    /// of this robot's arm names, none named twice.
-    pub fn parse(arm_names: &[&str]) -> Result<Self, String> {
-        if arm_names.is_empty() {
-            return Err(format!(
-                "arms holds no arm: name one or more of {}",
-                Self::robot_arms()
-            ));
-        }
-        let sides = arm_names
-            .iter()
-            .map(|name| {
-                Side::from_arm_name(name).map_err(|_| {
-                    format!(
-                        "arms names \"{name}\", no arm of this robot: its arms are {}",
-                        Self::robot_arms()
-                    )
-                })
-            })
-            .collect::<Result<Vec<Side>, String>>()?;
-        if let Some(twice) = sides
-            .iter()
-            .enumerate()
-            .find_map(|(k, side)| sides[..k].contains(side).then_some(side))
-        {
-            return Err(format!(
-                "arms names \"{}\" twice: name each arm once",
-                twice.arm_name()
-            ));
-        }
-        Ok(Self(sides))
-    }
-
-    /// This robot's arm names, quoted, as a refusal lists them.
-    fn robot_arms() -> String {
-        Side::BOTH
-            .map(|side| format!("\"{}\"", side.arm_name()))
-            .join(" and ")
-    }
-
-    pub fn sides(&self) -> &[Side] {
-        &self.0
-    }
-
+/// What the backbone reads of the arms a goal names besides their order: the
+/// arms the governor steps along the path as one, and a share's failure in
+/// the words of the goal.
+pub trait PathOrder {
     /// `failure` of the arm on `side` in a goal of these arms, as
     /// [`share_failure`] gives it.
-    pub fn failure_of(&self, side: Side, failure: Failure) -> Failure {
+    fn failure_of(&self, side: Side, failure: Failure) -> Failure;
+
+    /// The arms the governor steps along the path as one.
+    fn path_arms(&self) -> PathArms;
+}
+
+impl PathOrder for ArmOrder {
+    fn failure_of(&self, side: Side, failure: Failure) -> Failure {
         share_failure(failure, side, self.path_arms())
     }
 
-    /// How many joint positions an array in this order holds.
-    fn joint_count(&self) -> usize {
-        self.0.len() * ARM_DOF
-    }
-
-    /// The arms the governor steps along the path as one.
     fn path_arms(&self) -> PathArms {
-        match self.0[..] {
-            [side] => PathArms::One(side),
+        match self.sides() {
+            [side] => PathArms::One(*side),
             _ => PathArms::Both,
         }
-    }
-
-    /// Each arm of this order with its joints in `array`, an array in this
-    /// order.
-    fn split<'a>(&'a self, array: &'a [f64]) -> impl Iterator<Item = (Side, JointVec)> + 'a {
-        assert_eq!(array.len(), self.joint_count(), "an array in this order");
-        self.0
-            .iter()
-            .zip(array.chunks_exact(ARM_DOF))
-            .map(|(&side, joints)| {
-                (
-                    side,
-                    joints.try_into().expect("an arm's share of the array"),
-                )
-            })
-    }
-
-    /// The joints of `side`'s arm in `array`, an array in this order: none
-    /// for an arm this order does not name.
-    fn joints_of(&self, array: &[f64], side: Side) -> Option<JointVec> {
-        self.split(array)
-            .find_map(|(named, joints)| (named == side).then_some(joints))
-    }
-
-    /// `held` with each arm of this order at its joints in `array`.
-    fn placed(&self, array: &[f64], held: &ArmPair<JointVec>) -> ArmPair<JointVec> {
-        ArmPair::from_fn(|side| self.joints_of(array, side).unwrap_or(held[side]))
     }
 }
 
@@ -730,7 +658,7 @@ fn settle_outcome(
 /// arm moves, freeing its arms:
 /// - with `precondition_failed` when an arm runs another move, and with the
 ///   stale failure when an arm has no fresh measurement in `measured`, each
-///   as [`ArmOrder::failure_of`] gives it;
+///   as [`PathOrder::failure_of`] gives it;
 /// - with `precondition_failed` when an arm measures outside the start
 ///   tolerance of its expected start ([`check_start`]).
 ///
@@ -1118,9 +1046,9 @@ mod tests {
     use crate::planner::Goal;
     use crate::planner::Tick;
     use crate::test_support::{
-        ARMS_WOULD_MEET, BOTH_HELD, NO_STOP, OpenGuard, Refusing, array_of, claimed,
-        claimed_move_slot, distance_to_segment, measured_at_setpoints, path_goal_through,
-        plan_config, planner_holding, share_reply, test_guard, test_settle,
+        ARMS_WOULD_MEET, BOTH_HELD, NO_STOP, OpenGuard, Refusing, claimed, claimed_move_slot,
+        distance_to_segment, measured_at_setpoints, path_goal_through, plan_config,
+        planner_holding, share_reply, test_guard, test_settle,
     };
 
     /// Where the path tests take the arms from [`BOTH_HELD`], inside v1's
@@ -1212,53 +1140,15 @@ mod tests {
 
     // --- Arm orders ---------------------------------------------------------
 
-    /// A goal's arms are one or more of this robot's arms, each once; any
-    /// other list is refused naming what is wrong in the words of the field.
+    /// The governor steps the arms of a goal of both arms as one, and the arm
+    /// of a goal of one arm alone.
     #[test]
-    fn a_goal_takes_each_arm_of_the_robot_at_most_once() {
-        let refused = |names: &[&str]| ArmOrder::parse(names).expect_err("refused");
+    fn the_governor_steps_the_arms_a_goal_names() {
         assert_eq!(
-            refused(&[]),
-            "arms holds no arm: name one or more of \"left_arm\" and \"right_arm\""
+            order(&["right_arm", "left_arm"]).path_arms(),
+            PathArms::Both
         );
-        assert_eq!(
-            refused(&["left_arm", "head"]),
-            "arms names \"head\", no arm of this robot: its arms are \"left_arm\" and \
-             \"right_arm\""
-        );
-        assert_eq!(
-            refused(&["right_arm", "left_arm", "right_arm"]),
-            "arms names \"right_arm\" twice: name each arm once"
-        );
-        assert_eq!(order(&["right_arm"]).sides(), [Side::Right]);
-        assert_eq!(
-            order(&["right_arm", "left_arm"]).sides(),
-            [Side::Right, Side::Left]
-        );
-    }
-
-    /// An array in an order holds the named arms' joints in that order: named
-    /// right first, its first seven joints are the right arm's, and the arms
-    /// it does not name keep where they are held.
-    #[test]
-    fn an_array_holds_each_named_arm_in_the_order_of_the_goals_arms() {
-        let right_first = order(&["right_arm", "left_arm"]);
-        let array = array_of(&right_first, &BOTH_TO);
-        assert_eq!(array[..ARM_DOF], BOTH_TO.right);
-        assert_eq!(array[ARM_DOF..], BOTH_TO.left);
-        assert_eq!(right_first.joint_count(), 2 * ARM_DOF);
-        assert_eq!(right_first.placed(&array, &BOTH_HELD), BOTH_TO);
-        assert_eq!(right_first.path_arms(), PathArms::Both);
-
-        let left = order(&["left_arm"]);
-        let array = array_of(&left, &BOTH_TO);
-        assert_eq!(array, BOTH_TO.left);
-        assert_eq!(
-            left.placed(&array, &BOTH_HELD),
-            ArmPair::new(BOTH_TO.left, BOTH_HELD.right)
-        );
-        assert_eq!(left.path_arms(), PathArms::One(Side::Left));
-        assert_eq!(left.joints_of(&array, Side::Right), None);
+        assert_eq!(order(&["left_arm"]).path_arms(), PathArms::One(Side::Left));
     }
 
     // --- Starting a path ----------------------------------------------------
