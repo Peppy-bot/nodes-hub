@@ -172,7 +172,7 @@ async fn subscribe_pair<L, R>(
 /// headset's release burst, both a quarter second: a refusal lasts as long as
 /// a follower would still follow the stream, and the burst after a grip is
 /// released reads as one unbroken stream. It covers the gaps of a stream at
-/// 4 Hz or faster; the leaders run at 30 Hz and above.
+/// 4 Hz or faster.
 pub const LEADER_STREAMING_WINDOW: Duration = Duration::from_millis(250);
 
 /// When a leader last streamed a well-formed command for one limb. Written by

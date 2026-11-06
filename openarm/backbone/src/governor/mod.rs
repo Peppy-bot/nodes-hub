@@ -196,10 +196,9 @@ const MAX_PROBE_GRIPPER_FRAC: f64 = 0.01;
 /// Another joint may still get the operator out, but the obvious command is
 /// silently held with the readout reading `stopped`, and the natural next move
 /// is to switch the guard off while the arms are in contact. This bounds how
-/// fast an overlap may worsen instead of forbidding it: at the shipped 100 Hz,
-/// 2 mm per tick, enough to cross the pockets seen in sim and slow enough to
-/// stay controlled. It applies ONLY at negative clearance; the guarded band
-/// above zero keeps the strict floor, so an approach still parks at `d_stop`.
+/// fast an overlap may worsen, enough to cross the pockets seen in sim and slow
+/// enough to stay controlled. It applies ONLY at negative clearance; the guarded
+/// band above zero keeps the strict floor, so an approach still parks at `d_stop`.
 const RECOVERY_LOSS_M_PER_S: f64 = 0.2;
 
 /// A squared gradient norm at or below this (m/rad)² means the clearance is locally

@@ -16,7 +16,7 @@ use std::time::Duration;
 use control_core::motor_health::{NOT_DRIVING_ESCALATE_AFTER, STATE_STALE_AFTER};
 use control_core::sync::lock_ignoring_poison;
 use control_core::time;
-use openarm_can::CanErrorThrottle;
+use openarm_can::{CanErrorThrottle, ReceivePass};
 use peppylib::runtime::CancellationToken;
 use tokio::sync::{oneshot, watch};
 use tokio::time::MissedTickBehavior;
@@ -35,7 +35,6 @@ const CONTEXT: &str = "gripper follow";
 
 pub struct FollowConfig {
     pub cycle_period: Duration,
-    pub recv_timeout_us: u32,
 }
 
 pub async fn run(
@@ -49,7 +48,8 @@ pub async fn run(
     let _ = started_tx.send(());
     let mut ticker = tokio::time::interval(cfg.cycle_period);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut throttle = CanErrorThrottle::new();
+    let receive = ReceivePass::new(cfg.cycle_period);
+    let mut throttle = CanErrorThrottle::new(cfg.cycle_period);
     let stale_after_ticks = time::ticks_within(STATE_STALE_AFTER, cfg.cycle_period);
     let escalate_after_ticks = time::ticks_within(NOT_DRIVING_ESCALATE_AFTER, cfg.cycle_period);
     let mut not_driving = 0u32;
@@ -74,7 +74,7 @@ pub async fn run(
         // Receive first and unconditionally, consuming the replies solicited
         // by the previous tick's refresh: the decode pass is what advances
         // the silence count, on error passes included.
-        let received = g.recv_all(cfg.recv_timeout_us);
+        let received = g.recv_all(receive);
         let state = g.get_state();
         let silent = state.passes_since_state >= stale_after_ticks;
         match drive::assess(state.status, silent, &mut not_driving, escalate_after_ticks) {

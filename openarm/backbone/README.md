@@ -324,9 +324,9 @@ goal was taken fails it with `precondition_failed` too (`left_arm stands
 than 0.001 rad from the start the path was judged from, in some joint, has
 the path judged again from the run starts, the commands still holding, so
 the path that plays is the path a judgment passed, with its `unreachable`
-and `rejected` refusals; an arm still that far after 20 judgments fails the
-goal with `precondition_failed` (`left_arm still moved 0.008 rad at joint 1
-while its path was judged 20 times; let the arm settle and send the path
+and `rejected` refusals; an arm still that far once the judgments span 0.2 s
+fails the goal with `precondition_failed` (`left_arm still moved 0.008 rad at
+joint 1 while its path was judged N times; let the arm settle and send the path
 again`). All of these come before the path plays. Otherwise each named
 arm's command moves onto the path's start, within 0.001 rad of where the
 arm stands, as a recovered follower's moves onto its measured pose, and
@@ -526,9 +526,9 @@ parameters (`d_stop_m`, `d_safe_m`, `collision_governor_enabled`,
 and the commander's `governor_control` stream retunes them live.
 `follower_state_rate_hz` is required too: the rate the followers deliver
 measured state at, of which four silent periods freeze the limb, and under
-three quarters of which draws a warning (100 for the real arms and MuJoCo;
-the Isaac fragment declares its 60 fps frame rate, since that simulation
-reports once per rendered frame).
+three quarters of which draws a warning. A launcher declares what its followers
+deliver: the real arms deliver at their `state_rate_hz`, and Isaac once per rendered
+frame.
 `upstream_mode` is likewise required: `"joints"` follows the joint_link
 leader slots, `"pose"` the pose_link ones, and only the named kind is
 subscribed. Link the leader into the slots that kind names, or nothing it
@@ -588,13 +588,11 @@ that proves the published line).
 
 **A tick's cost is proportional to the distance it travels, so it falls as the
 control rate rises.** A segment is `speed * dt` long and is probed once per
-`MAX_PROBE_ARC_RAD`, giving `v_max * dt / MAX_PROBE_ARC_RAD` probes per scan:
-at 100 Hz the 16.75 rad/s J1/J2 limit is 0.168 rad per tick and ~17 probes,
-while at 500 Hz the same jog is 0.034 rad and ~3, floored by
-`SEGMENT_SAMPLES_MIN` at 4. The work per second is about the same either way
-(~1700 vs ~2000 probes); the rate only decides whether it arrives in one
-indivisible lump that must fit inside one period, or spread thin. Sweeping
-the rate against a jog at the J1/J2 limit (Jetson, 20 s per rate):
+`MAX_PROBE_ARC_RAD`, giving `v_max * dt / MAX_PROBE_ARC_RAD` probes per scan,
+floored by `SEGMENT_SAMPLES_MIN`. The work per second is about the same at any
+rate; the rate only decides whether it arrives in one indivisible lump that must
+fit inside one period, or spread thin. Sweeping the rate against a jog at the
+J1/J2 limit (Jetson, 20 s per rate):
 
 | rate    | budget | p50     | p95     | p99     | max      | over budget  |
 | ------- | ------ | ------- | ------- | ------- | -------- | ------------ |
@@ -603,8 +601,8 @@ the rate against a jog at the J1/J2 limit (Jetson, 20 s per rate):
 | 500 Hz  | 2 ms   | 0.31 ms | 0.97 ms | 1.02 ms | 2.53 ms  | 7 / 10000    |
 | 1000 Hz | 1 ms   | 0.31 ms | 0.97 ms | 0.98 ms | 2.40 ms  | 178 / 20000  |
 
-Per-tick cost against jog speed at the shipped rate, stated in rad/s because
-that is the rate-independent quantity (Jetson, 100 Hz, 4000-tick walk):
+Per-tick cost against jog speed, stated in rad/s because that is the
+rate-independent quantity (measured on a Jetson at 100 Hz over a 4000-tick walk):
 
 | jog         | per tick  | p50     | p95     | p99     | max      |
 | ----------- | --------- | ------- | ------- | ------- | -------- |
@@ -612,8 +610,8 @@ that is the rate-independent quantity (Jetson, 100 Hz, 4000-tick walk):
 | 5.0 rad/s   | 0.050 rad | 0.40 ms | 1.01 ms | 1.34 ms | 3.77 ms  |
 | 16.75 rad/s | 0.168 rad | 0.38 ms | 1.05 ms | 2.82 ms | 10.29 ms |
 
-The last row is the J1/J2 velocity limit, the fastest any joint is chased at
-(J3/J4 are clamped lower by `DofSpeed` before the scan sees them). A live 
+The last row is the J1/J2 velocity limit (J3/J4 are clamped lower by `DofSpeed`
+before the scan sees them). A live 
 MuJoCo test of aggressive teleop logs no control-loop overruns at all; the 
 same test against a build whose clip stage refined every breach by bisection 
 logged them at ~37/min, worst 15 ms late. Overruns degrade safely when they 
