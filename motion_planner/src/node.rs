@@ -17,9 +17,9 @@ use control_core::latched_log::LatchedLog;
 use control_core::{receiving, serving};
 use motion_planning_core::{
     Arm, ArmGoal, Arms, CartesianFailure, CartesianRequest, CheckFailure, CheckRequest, Collisions,
-    DepthCamera, Goal, IkGoalSampler, PathCheck, PlanFailure, PlanRequest, PlanningScene,
-    RobotLinks, RobotPart, Scene, SceneError, SelfModel, StartFault, cartesian_path, check_path,
-    insert_cut_out, plan_path, pose_parts, start_inside_limits,
+    DepthCamera, Goal, IkGoalSampler, PathCheck, PathOrientation, PlanFailure, PlanRequest,
+    PlanningScene, RobotLinks, RobotPart, Scene, SceneError, SelfModel, StartFault, cartesian_path,
+    check_path, insert_cut_out, plan_path, pose_parts, start_inside_limits,
 };
 use occupancy_map::{DistanceField, Frame, Scan, VoxelMap};
 use ompl_bridge::{PLANNING_THREADS, Planner};
@@ -1740,6 +1740,9 @@ fn plan(
     let copies = self_model_copies(node.config.planning_attempts);
     let planned = match &query.arm_goals {
         ArmGoals::One { side, goal } => {
+            if let Some(fault) = standing_arm_fault(node, taken, side.other()) {
+                return Err(PlanEnd::Failed(FailureKind::NoPath, fault));
+            }
             let self_model =
                 HeldOtherArm::new(&snapshot.self_model, copies, *side, standing[side.other()]);
             plan_group::<ARM_DOF>(node, taken, Group::One(*side), &self_model, &|_| goal, stop)
@@ -1794,6 +1797,24 @@ fn plan(
         })
 }
 
+/// Why the arm on `side`, which the plan leaves where it starts, breaks a path orientation
+/// of its links; none where its start holds each.
+fn standing_arm_fault(node: &Node, taken: &Taken, side: Side) -> Option<String> {
+    let chain = node.arms[side].geometry.chain();
+    taken.query.path_orientations[side].iter().find_map(|held| {
+        let error = held.target.error_at(chain, &taken.standing[side]);
+        let tolerance = held.target.tolerance_rad.get();
+        (error > tolerance).then(|| {
+            format!(
+                "the start holds {} {error:.4} rad from its path orientation, past its \
+                 tolerance_rad {tolerance:.4}, and its arm stays where it starts; send a start \
+                 within it or a wider tolerance_rad",
+                held.link_name
+            )
+        })
+    })
+}
+
 /// The plan of the arms of `group`, which `taken` takes, each from its joints of where
 /// they stand to the goal `goal_of` gives it, against `self_model`: each arm's waypoints
 /// from its start, none for an arm the plan does not move.
@@ -1819,21 +1840,37 @@ fn plan_group<'g, const D: usize>(
             sampler,
         })
         .collect();
+    let path_orientations: Vec<PathOrientation> = group
+        .sides()
+        .iter()
+        .enumerate()
+        .flat_map(|(arm, side)| {
+            taken.query.path_orientations[*side]
+                .iter()
+                .map(move |held| PathOrientation {
+                    arm,
+                    link_name: &held.link_name,
+                    target: held.target,
+                })
+        })
+        .collect();
     let start = group.state(|side| taken.standing[side]);
     taken
         .snapshot
         .run(node, group, &taken.standing, self_model, |arms, scene| {
-            let request = plan_request(node, start, goals, taken.deadline, stop);
+            let request =
+                plan_request(node, start, goals, &path_orientations, taken.deadline, stop);
             plan_path(arms, scene, &request).map(|path| split(&path, group))
         })
 }
 
-/// The request of a plan of the arms of `goals` from `start`, by `deadline`, which `stop`
-/// ends.
+/// The request of a plan of the arms of `goals` from `start`, holding `path_orientations`,
+/// by `deadline`, which `stop` ends.
 fn plan_request<'a, const D: usize>(
     node: &Node,
     start: [f64; D],
     goals: Vec<ArmGoal<'a, ARM_DOF>>,
+    path_orientations: &'a [PathOrientation<'a>],
     deadline: Instant,
     stop: &'a AtomicBool,
 ) -> PlanRequest<'a, ARM_DOF, D> {
@@ -1842,6 +1879,7 @@ fn plan_request<'a, const D: usize>(
         start,
         start_tolerance: start_tolerance(node),
         goals,
+        path_orientations,
         goal_samples: config.goal_samples,
         planner: Planner::RrtConnect,
         deadline,
@@ -2144,6 +2182,7 @@ mod tests {
                 })
                 .collect(),
             goal_position_constraints: Vec::new(),
+            path_orientation_constraints: Vec::new(),
             goal_orientation_constraints: Vec::new(),
             objective: crate::request::OBJECTIVE.to_string(),
             allowed_planning_time_s: crate::request::MAX_PLANNING_TIME_S,

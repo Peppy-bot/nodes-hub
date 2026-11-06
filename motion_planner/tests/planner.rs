@@ -3,7 +3,9 @@
 //! map is cleared; the arms' own points mark nothing while they move; a check passes a
 //! planned path and stops before a table the camera sees; a frame of an alignment the
 //! camera's geometry does not describe asks the camera again; a goal holds any link of the
-//! arm, and the grasp point free about its approach axis; a cancel ends the goal
+//! arm, and the grasp point free about its approach axis; a path holds an orientation of the
+//! grasp link at each waypoint, and a start or a goal that breaks one fails with no_path; a
+//! cancel ends the goal
 //! cancelled; every refusal comes at a goal's admission; and describe_arms names the
 //! joints, the limits limb_motion enforces, the links goals take, and the gripper's links
 //! a held object may touch.
@@ -17,6 +19,7 @@ use motion_planner::request::MAX_PLANNING_TIME_S;
 use openarm_description::{ARM_DOF, HardwareVersion, Side, ready};
 use peppygen::exposed_actions::motion_planning::plan_joint_path::{
     GoalArmsItem, GoalGoalOrientationConstraintsItem, GoalGoalPositionConstraintsItem,
+    GoalPathOrientationConstraintsItem,
 };
 use peppygen::fixtures::exposed_actions::motion_planning::plan_joint_path::{
     CancelState, FailureKind, GoalRequestData, ResultData, ResultOutcome, send_goal,
@@ -520,6 +523,129 @@ async fn a_plan_holds_the_grasp_point_free_about_its_approach_axis() -> peppygen
         off_position <= GRASP_POSITION_M && off_axis <= APPROACH_AXIS_RAD,
         "the grasp point ends {off_position} m from its position, its approach axis {off_axis} rad off"
     );
+    harness.shutdown().await
+}
+
+/// The tolerance of the path orientations held here (rad).
+const PATH_TOLERANCE_RAD: f64 = 0.1;
+
+/// The left grasp link held within `PATH_TOLERANCE_RAD` of where `q` turns it, free about
+/// `free_axis`.
+fn holding_the_left_hand(
+    q: &[f64; ARM_DOF],
+    free_axis: &str,
+) -> GoalPathOrientationConstraintsItem {
+    let rotation = OPENARM_V2.arms[Side::Left]
+        .geometry
+        .chain()
+        .world_ee_pose(q)
+        .rotation;
+    GoalPathOrientationConstraintsItem {
+        link_name: "openarm_left_tcp".to_string(),
+        orientation: [rotation.i, rotation.j, rotation.k, rotation.w],
+        tolerance_rad: PATH_TOLERANCE_RAD,
+        free_axis: free_axis.to_string(),
+    }
+}
+
+// A path orientation of the grasp link, whole or free about an axis, holds at each waypoint of
+// a plan whose goal names a position alone, which takes the orientation of the constraint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_plan_holds_a_path_orientation_at_each_waypoint() -> peppygen::Result<()> {
+    let (harness, _mocks) = start_without_camera(&arms(LEFT_READY, RIGHT_READY)).await?;
+    let chain = OPENARM_V2.arms[Side::Left].geometry.chain();
+    let from = chain.world_ee_pose(&LEFT_READY);
+    let position = from.translation.vector + Vector3::new(0.0, -0.05, 0.05);
+    for free_axis in ["none", "z"] {
+        let goal = GoalRequestData {
+            goal_joint_constraints: Vec::new(),
+            goal_position_constraints: vec![GoalGoalPositionConstraintsItem {
+                link_name: "openarm_left_tcp".to_string(),
+                position: position.into(),
+                tolerance_m: GRASP_POSITION_M,
+            }],
+            path_orientation_constraints: vec![holding_the_left_hand(&LEFT_READY, free_axis)],
+            ..plan_to(&LEFT_READY)
+        };
+        let planned = plan(&harness, &goal).await.expect("a path");
+        let axis = Vector3::z();
+        for waypoint in &planned.arms[0].waypoints {
+            let [x, y, z, w] = waypoint.orientation;
+            let turned = UnitQuaternion::from_quaternion(Quaternion::new(w, x, y, z));
+            let error = if free_axis == "none" {
+                from.rotation.angle_to(&turned)
+            } else {
+                (from.rotation * axis).angle(&(turned * axis))
+            };
+            assert!(
+                error <= PATH_TOLERANCE_RAD,
+                "free about {free_axis}: a waypoint stands {error} rad from the orientation"
+            );
+        }
+    }
+    harness.shutdown().await
+}
+
+// A start past a path orientation's tolerance, an arm that stays where it starts past one, and a
+// goal of joints past one each fail with no_path, and the message names the link.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_or_a_goal_that_breaks_a_path_orientation_fails_with_no_path()
+-> peppygen::Result<()> {
+    let (harness, _mocks) = start_without_camera(&arms(LEFT_READY, RIGHT_READY)).await?;
+    let elsewhere = left_elbow(1.3);
+    let of_the_elbow = holding_the_left_hand(&elsewhere, "none");
+    let of_ready = holding_the_left_hand(&LEFT_READY, "none");
+    let starting_past_it = GoalRequestData {
+        path_orientation_constraints: vec![of_the_elbow.clone()],
+        ..plan_to(&LEFT_READY)
+    };
+    let ending_past_it = GoalRequestData {
+        path_orientation_constraints: vec![of_ready],
+        ..plan_to(&elsewhere)
+    };
+    let staying_past_it = {
+        let mut goal = plan_to(&LEFT_READY);
+        goal.arms.push(GoalArmsItem {
+            arm_name: "right_arm".to_string(),
+            start_joint_positions: Vec::new(),
+        });
+        goal.goal_joint_constraints.clear();
+        goal.path_orientation_constraints = vec![of_the_elbow];
+        goal.goal_joint_constraints.extend(
+            OPENARM_V2.arms[Side::Right]
+                .joint_names
+                .iter()
+                .zip(&RIGHT_READY)
+                .map(|(name, &position)| {
+                    peppygen::exposed_actions::motion_planning::plan_joint_path::GoalGoalJointConstraintsItem {
+                        joint_name: name.clone(),
+                        position,
+                        tolerance_above: 0.01,
+                        tolerance_below: 0.01,
+                    }
+                }),
+        );
+        goal
+    };
+    for (what, goal, says) in [
+        (
+            "a start",
+            starting_past_it,
+            "the start holds openarm_left_tcp",
+        ),
+        ("a goal", ending_past_it, "each breaking a path orientation"),
+        (
+            "an arm that stays",
+            staying_past_it,
+            "and its arm stays where it starts",
+        ),
+    ] {
+        let Err(Ended::Failed(failure)) = plan(&harness, &goal).await else {
+            panic!("{what} past a path orientation fails");
+        };
+        assert_eq!(failure.kind, FailureKind::NoPath, "{what}: {failure}");
+        assert!(failure.to_string().contains(says), "{what}: {failure}");
+    }
     harness.shutdown().await
 }
 

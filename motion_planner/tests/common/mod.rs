@@ -511,6 +511,7 @@ pub fn plan_from(start: &[f64], q: &[f64; ARM_DOF]) -> GoalRequestData {
             })
             .collect(),
         goal_position_constraints: Vec::new(),
+        path_orientation_constraints: Vec::new(),
         goal_orientation_constraints: Vec::new(),
         objective: OBJECTIVE.to_string(),
         allowed_planning_time_s: PLANNING_TIME_S,
