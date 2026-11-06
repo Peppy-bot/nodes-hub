@@ -27,9 +27,6 @@ use tracing::{error, info, warn};
 const ARM_ID_LEFT: u8 = 0;
 const ARM_ID_RIGHT: u8 = 1;
 
-/// Ceiling on the per-cycle CAN read deadline; see its use for the rationale.
-const MAX_RECV_TIMEOUT_US: u32 = 100_000;
-
 /// The arm side for the given `arm_id`, refused on an unknown value so a
 /// misconfigured run fails at startup with the value in the message.
 fn side_for(arm_id: u8) -> NodeResult<Side> {
@@ -50,8 +47,8 @@ const ENABLE_FD: bool = true;
 /// energised until the force-kill deadline. Sized well inside even the
 /// minimum 1 s grace window so the disable hook keeps most of the budget.
 const HEALTH_FLUSH_TIMEOUT: Duration = Duration::from_millis(300);
-/// The fastest this node drives the arm. The motors sit on a 1 Mbit
-/// CAN FD bus that cannot service a faster cycle; the stack runs at 100 Hz.
+/// The fastest this node drives the arm. The motors sit on a CAN FD bus that
+/// cannot service a faster cycle.
 const MAX_RATE_HZ: u32 = 1_000;
 
 /// Everything this node refuses to run on, or stops for.
@@ -68,9 +65,6 @@ pub enum NodeError {
 
     #[error("parameter state_rate_hz")]
     StateRate(#[source] RateOutOfRange),
-
-    #[error("recv_timeout_us must be in 1..={MAX_RECV_TIMEOUT_US} (100 ms), got {0}")]
-    RecvTimeout(u32),
 
     #[error("arm_id must be {ARM_ID_LEFT} (left) or {ARM_ID_RIGHT} (right), got {0}")]
     ArmId(u8),
@@ -148,7 +142,6 @@ fn alert_source(side: Side) -> String {
 struct Config {
     cycle_period: Duration,
     state_period: Duration,
-    recv_timeout_us: u32,
     side: Side,
     hardware_version: HardwareVersion,
 }
@@ -159,22 +152,12 @@ fn parse_config(params: &Parameters) -> NodeResult<Config> {
         period_from_hz(params.control_rate_hz, MAX_RATE_HZ).map_err(NodeError::ControlRate)?;
     let state_period =
         period_from_hz(params.state_rate_hz, MAX_RATE_HZ).map_err(NodeError::StateRate)?;
-    // Bounded above so a config typo cannot park recv_all in a long ppoll
-    // while it holds the CAN mutex the shutdown hooks need: 100 ms keeps
-    // the whole hook sequence inside even the minimum 1 s grace window,
-    // and real configs run around 1 ms. Bounded below because the driver
-    // refuses a zero wait on its other receive passes, and a receive that
-    // never waits turns every quiet tick into a silence pass.
-    if !(1..=MAX_RECV_TIMEOUT_US).contains(&params.recv_timeout_us) {
-        return Err(NodeError::RecvTimeout(params.recv_timeout_us));
-    }
     let side = side_for(params.arm_id)?;
     // Which OpenArm generation this arm drives; selects the embedded description.
     let hardware_version: HardwareVersion = params.hardware_version.parse()?;
     Ok(Config {
         cycle_period,
         state_period,
-        recv_timeout_us: params.recv_timeout_us,
         side,
         hardware_version,
     })
@@ -211,7 +194,6 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     let Config {
         cycle_period,
         state_period,
-        recv_timeout_us,
         side,
         hardware_version,
     } = parse_config(&params)?;
@@ -258,8 +240,8 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         params.kd1, params.kd2, params.kd3, params.kd4, params.kd5, params.kd6, params.kd7,
     ];
     info!(
-        "config: arm_id={arm_id} ({side:?}) rate={}Hz recv_timeout={}us",
-        params.control_rate_hz, recv_timeout_us
+        "config: arm_id={arm_id} ({side:?}) rate={}Hz",
+        params.control_rate_hz
     );
     info!("config: kp={kp:?} kd={kd:?}");
 
@@ -340,7 +322,6 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         kp,
         kd,
         cycle_period,
-        recv_timeout_us,
         limits: model.limits(),
         ratings,
     };
@@ -501,7 +482,6 @@ mod tests {
             kp5: 10.0,
             kp6: 10.0,
             kp7: 10.0,
-            recv_timeout_us: 1000,
             state_rate_hz: 100,
         }
     }
@@ -523,7 +503,6 @@ mod tests {
         let config = parse_config(&params()).expect("parses");
         assert_eq!(config.cycle_period, Duration::from_millis(10));
         assert_eq!(config.state_period, Duration::from_millis(10));
-        assert_eq!(config.recv_timeout_us, 1000);
         assert_eq!(config.side, Side::Left);
         assert_eq!(config.hardware_version, HardwareVersion::V2);
     }
@@ -553,20 +532,6 @@ mod tests {
                 },
             ),
             (
-                "recv_timeout_us",
-                Parameters {
-                    recv_timeout_us: 0,
-                    ..params()
-                },
-            ),
-            (
-                "recv_timeout_us",
-                Parameters {
-                    recv_timeout_us: MAX_RECV_TIMEOUT_US + 1,
-                    ..params()
-                },
-            ),
-            (
                 "arm_id",
                 Parameters {
                     arm_id: 2,
@@ -592,17 +557,15 @@ mod tests {
 
     #[test]
     fn a_launch_wrong_in_every_parameter_is_refused_in_parameter_order() {
-        let fixes: [ParameterFix; 5] = [
+        let fixes: [ParameterFix; 4] = [
             ("control_rate_hz", |p| p.control_rate_hz = 100),
             ("state_rate_hz", |p| p.state_rate_hz = 100),
-            ("recv_timeout_us", |p| p.recv_timeout_us = 1000),
             ("arm_id", |p| p.arm_id = ARM_ID_LEFT),
             ("hardware_version", |p| p.hardware_version = "v2".into()),
         ];
         let mut launch = Parameters {
             control_rate_hz: 0,
             state_rate_hz: 0,
-            recv_timeout_us: 0,
             arm_id: 2,
             hardware_version: "v3".into(),
             ..params()

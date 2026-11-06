@@ -66,12 +66,9 @@
       // built from. Required, not defaulted: running the wrong generation's model on the
       // hardware would mis-compensate gravity/Coriolis, so the launcher must be explicit.
       hardware_version: "string",
-      // Hardware-loop rate (Hz). Required: pick deliberately per deployment. The
-      // stack currently unifies on 100 Hz (backbone stream rate and arm loop rate match);
+      // Hardware-loop rate (Hz). Required: pick deliberately per deployment, and
       // confirm `overruns=0` at the target rate during bring-up.
       control_rate_hz: "u32",
-      // Per-cycle CAN read deadline (μs). Must fit the cycle budget (10 ms at 100 Hz).
-      recv_timeout_us: { $type: "u32", $default: 1000 },
       // MIT-control gains applied every control tick, one per joint (1-indexed).
       // Match the openarm teleop config (Kp/Kd).
       kp1: { $type: "f64", $default: 240.0 },

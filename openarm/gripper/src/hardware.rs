@@ -19,7 +19,7 @@ use std::time::Duration;
 use control_core::motor_health::Ratings;
 use openarm_can::{
     CanError, EnableFailure, GripperCan, GripperState, Mit, Mode, MotorParam, MotorType, PosForce,
-    v10, v20,
+    ReceivePass, v10, v20,
 };
 use openarm_description::{HardwareVersion, Side};
 
@@ -209,7 +209,7 @@ fn torque_full_scale_nm(motor_type: MotorType) -> f64 {
 /// call per variant.
 trait ModeBus {
     fn get_state(&self) -> GripperState;
-    fn recv_all(&mut self, first_timeout_us: u32) -> Result<(), CanError>;
+    fn recv_all(&mut self, pass: ReceivePass) -> Result<(), CanError>;
     fn refresh_all(&mut self) -> Result<(), CanError>;
     fn reenable(&mut self) -> Result<(), CanError>;
     fn disable_all(&mut self) -> Result<(), CanError>;
@@ -226,8 +226,8 @@ impl<M: Mode> ModeBus for GripperCan<M> {
         GripperCan::get_state(self)
     }
 
-    fn recv_all(&mut self, first_timeout_us: u32) -> Result<(), CanError> {
-        GripperCan::recv_all(self, first_timeout_us)
+    fn recv_all(&mut self, pass: ReceivePass) -> Result<(), CanError> {
+        GripperCan::recv_all(self, pass)
     }
 
     fn refresh_all(&mut self) -> Result<(), CanError> {
@@ -370,8 +370,8 @@ impl Gripper {
         self.bus().get_state()
     }
 
-    pub fn recv_all(&mut self, first_timeout_us: u32) -> Result<(), CanError> {
-        self.bus_mut().recv_all(first_timeout_us)
+    pub fn recv_all(&mut self, pass: ReceivePass) -> Result<(), CanError> {
+        self.bus_mut().recv_all(pass)
     }
 
     pub fn refresh_all(&mut self) -> Result<(), CanError> {

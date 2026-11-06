@@ -430,9 +430,8 @@ dependencies = [
 [[package]]
 name = "chain_kinematics"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#47bcc54f99872cb34b5dcf1d53871a897e780f3f"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#06566181d37da7d4e34539c2df02367281cbdb23"
 dependencies = [
- "control_core",
  "nalgebra",
  "thiserror 2.0.21",
  "urdf-rs",
@@ -563,7 +562,7 @@ dependencies = [
 [[package]]
 name = "control_core"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#47bcc54f99872cb34b5dcf1d53871a897e780f3f"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#06566181d37da7d4e34539c2df02367281cbdb23"
 dependencies = [
  "thiserror 2.0.21",
  "tokio",
@@ -1795,7 +1794,7 @@ dependencies = [
 [[package]]
 name = "instance_lock"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#47bcc54f99872cb34b5dcf1d53871a897e780f3f"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#06566181d37da7d4e34539c2df02367281cbdb23"
 dependencies = [
  "thiserror 2.0.21",
 ]
@@ -2512,7 +2511,7 @@ dependencies = [
 [[package]]
 name = "openarm_can"
 version = "0.2.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#47bcc54f99872cb34b5dcf1d53871a897e780f3f"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#06566181d37da7d4e34539c2df02367281cbdb23"
 dependencies = [
  "control_core",
  "nix 0.31.3",
@@ -2524,7 +2523,7 @@ dependencies = [
 [[package]]
 name = "openarm_description"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#47bcc54f99872cb34b5dcf1d53871a897e780f3f"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#06566181d37da7d4e34539c2df02367281cbdb23"
 dependencies = [
  "srs_model",
  "urdf-rs",
@@ -3867,10 +3866,9 @@ dependencies = [
 [[package]]
 name = "srs_model"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#47bcc54f99872cb34b5dcf1d53871a897e780f3f"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#06566181d37da7d4e34539c2df02367281cbdb23"
 dependencies = [
  "chain_kinematics",
- "control_core",
  "nalgebra",
  "thiserror 2.0.21",
  "urdf-rs",

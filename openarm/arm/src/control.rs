@@ -31,7 +31,7 @@ use crate::drive;
 use crate::friction;
 use crate::health::Monitor;
 use crate::stream::{GovernedSetpoint, MeasuredState, StreamWiring};
-use openarm_can::{ArmCan, CanErrorThrottle};
+use openarm_can::{ArmCan, CanErrorThrottle, ReceivePass};
 
 /// Set when the loop stops on a hard fault, so main can exit non-zero after
 /// the shutdown hooks have run and the daemon records the instance as failed
@@ -51,7 +51,6 @@ pub struct ControlConfig {
     pub kp: JointVec,
     pub kd: JointVec,
     pub cycle_period: Duration,
-    pub recv_timeout_us: u32,
     /// Joint position limits, parsed from the URDF, the final guard clamp applied
     /// to every governed setpoint before it reaches the motors.
     pub limits: [Limit; ARM_DOF],
@@ -124,7 +123,8 @@ async fn run_control(
 ) {
     let mut pacer =
         Pacer::new(cfg.cycle_period).expect("parse_config's period_from_hz refuses a zero period");
-    let mut can_errors = CanErrorThrottle::new();
+    let receive = ReceivePass::new(cfg.cycle_period);
+    let mut can_errors = CanErrorThrottle::new(cfg.cycle_period);
     let mut monitor = Monitor::new(cfg.ratings, cfg.cycle_period);
     let escalate_after_ticks = time::ticks_within(NOT_DRIVING_ESCALATE_AFTER, cfg.cycle_period);
     let mut not_driving = [0u32; ARM_DOF];
@@ -136,7 +136,7 @@ async fn run_control(
     }
     let _ = started_tx.send(());
     loop {
-        let (state, read) = read_state(&arm, cfg.recv_timeout_us);
+        let (state, read) = read_state(&arm, receive);
         let (q, qdot) = (state.positions, state.velocities);
         let ff_tau = feedforward(&mut model, &q, &qdot);
         wiring.measured.send_replace(Some(MeasuredState {
@@ -207,7 +207,7 @@ async fn run_control(
     tokio::time::sleep(POST_DISABLE_SLEEP).await;
     {
         let mut a = lock_ignoring_poison(&arm);
-        if let Err(e) = a.recv_all(cfg.recv_timeout_us) {
+        if let Err(e) = a.recv_all(receive) {
             error!("drain disable replies: {e}");
         }
     }
@@ -308,10 +308,10 @@ fn disable_motors(arm: &Mutex<ArmCan>) {
 /// staleness window.
 fn read_state(
     arm: &Mutex<ArmCan>,
-    recv_timeout_us: u32,
+    receive: ReceivePass,
 ) -> (openarm_can::ArmState, openarm_can::Result<()>) {
     let mut a = lock_ignoring_poison(arm);
-    let received = a.recv_all(recv_timeout_us);
+    let received = a.recv_all(receive);
     (a.get_state(), received)
 }
 

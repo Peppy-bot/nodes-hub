@@ -67,13 +67,8 @@
       // generation would command the motor in the wrong mode and the wrong direction,
       // so the launcher must be explicit. Same values the arm's `hardware_version` takes.
       hardware_version: "string",
-      // Hardware-loop rate (Hz), in 1..=1_000_000. Pick deliberately per deployment;
-      // the stack currently unifies on 100 Hz across arms and grippers.
+      // Hardware-loop rate (Hz). Pick deliberately per deployment.
       control_rate_hz: "u32",
-      // Per-cycle CAN read deadline (μs), in 1..=100_000. Should fit the cycle budget
-      // (10 ms at 100 Hz); the ceiling exists so a typo cannot park recv_all in a long
-      // ppoll holding the CAN mutex the shutdown hooks need.
-      recv_timeout_us: { $type: "u32", $default: 1000 },
       // POS_FORCE absolute speed limit (rad/s at the motor), read by the v2 command
       // path. Must be in [0.01, 100]: the wire's speed field spans that range and clamps
       // above it, so a larger value would be silently reduced rather than applied, and
@@ -92,8 +87,8 @@
       // grip it can hold indefinitely. The v1 MIT mode carries no per-command force
       // limit and reports a 0 ceiling.
       max_effort_nm: { $type: "f64", $default: 3.0 },
-      // Rate (Hz) of the always-on measured-state stream (`gripper_states`), in
-      // 1..=1_000_000; consumers' needs vary too much for a default to be meaningful.
+      // Rate (Hz) of the always-on measured-state stream (`gripper_states`); consumers'
+      // needs vary too much for a default to be meaningful.
       state_rate_hz: "u32"
     }
   },
