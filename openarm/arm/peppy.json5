@@ -70,13 +70,15 @@
       // confirm `overruns=0` at the target rate during bring-up.
       control_rate_hz: "u32",
       // MIT-control gains applied every control tick, one per joint (1-indexed). Measured on
-      // the real v2 alone, on a 40 s joint path, from the openarm teleop config's kp 240, 24,
-      // 31, 25 and kd 3, 0.2. kp1 to kp4 at 120, 240, 360 and 480 put j1's position error at
-      // 8.5, 4.9, 3.5 and 2.7 mrad at 100 Hz, and 480 raises the speed error of j2 and j3 at
-      // full speed. kd1 to kd4 stand at the top of the MIT frame's range, which takes the
-      // worst stall share at kp 360 from 2.5% to 0.6%. kp5 to kp7 at twice the config's cut
-      // the wrists' speed swing by a fifth. kd5 to kd7: at 250 Hz, stepping through 0.5, 1.0
-      // and 1.5 cut the stalls with the same tracking.
+      // the real v2 alone at 100 Hz on a 40 s joint path, from kd1 3, kd2 to kd4 4.5, and the
+      // openarm teleop config's kp5 to kp7, 24, 31, 25. kp1 to kp4 at 120, 240 and 360 put
+      // j1's position error at 8.5, 4.9 and 3.5 mrad and the worst stall share at 7.8%, 5.1%
+      // and 2.5%. With kd1 to kd4 at 5.0, the top of the MIT frame's range, kp 360 reads 3.6
+      // mrad and 0.6%, and kp 480 reads 2.7 mrad and 0.9% and raises the speed error of j2 and
+      // j3 at full speed. kp5 to kp7 at twice the config's cut the wrists' speed swing by a
+      // fifth. v2's measured friction then reads 2.1 mrad and 1.9%. kd5 to kd7: at 250 Hz, at
+      // the config's kp5 to kp7, stepping through 0.5, 1.0 and 1.5 cut the stalls with the
+      // same tracking.
       kp1: { $type: "f64", $default: 360.0 },
       kp2: { $type: "f64", $default: 360.0 },
       kp3: { $type: "f64", $default: 360.0 },

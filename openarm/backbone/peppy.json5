@@ -323,7 +323,7 @@
       // noisy stream without touching the desired position. It must sit well below the
       // control rate's Nyquist to attenuate; the default rounds the constant of enactic's
       // one-pole differentiator, 90 rad/s or about 14.3 Hz. A universal control constant
-      // (same across generations and sim/real), so it keeps a node default like the gains.
+      // (same across generations and sim/real), so it keeps a node default.
       velocity_filter_cutoff_hz: { $type: "f64", $default: 15.0 },
     }
   }

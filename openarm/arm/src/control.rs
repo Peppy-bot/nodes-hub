@@ -291,8 +291,8 @@ fn feedforward(
     let posed = model.at(q);
     let gravity = posed.gravity_torques();
     let coriolis = posed.coriolis_torques(dq_des);
-    let friction = friction::torques(friction, dq_des);
-    std::array::from_fn(|i| gravity[i] + coriolis[i] + friction[i])
+    let friction_tau = friction::torques(friction, dq_des);
+    std::array::from_fn(|i| gravity[i] + coriolis[i] + friction_tau[i])
 }
 
 /// Command the motors once: this tick's feedforward plus PD to the governed

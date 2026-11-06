@@ -145,6 +145,7 @@ struct Config {
     state_period: Duration,
     side: Side,
     hardware_version: HardwareVersion,
+    friction: friction::Params,
 }
 
 /// Parse every launch parameter, refusing the first that cannot drive an arm.
@@ -161,6 +162,7 @@ fn parse_config(params: &Parameters) -> NodeResult<Config> {
         state_period,
         side,
         hardware_version,
+        friction: friction::params(hardware_version),
     })
 }
 
@@ -197,6 +199,7 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         state_period,
         side,
         hardware_version,
+        friction,
     } = parse_config(&params)?;
     let arm_id = params.arm_id;
     let can_interface = params.can_interface.clone();
@@ -323,7 +326,7 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         kp,
         kd,
         cycle_period,
-        friction: friction::params(hardware_version),
+        friction,
         limits: model.limits(),
         ratings,
     };
@@ -507,6 +510,17 @@ mod tests {
         assert_eq!(config.state_period, Duration::from_millis(10));
         assert_eq!(config.side, Side::Left);
         assert_eq!(config.hardware_version, HardwareVersion::V2);
+        assert_eq!(config.friction, friction::params(HardwareVersion::V2));
+    }
+
+    #[test]
+    fn a_v1_launch_takes_v1s_friction() {
+        let config = parse_config(&Parameters {
+            hardware_version: "v1".into(),
+            ..params()
+        })
+        .expect("parses");
+        assert_eq!(config.friction, friction::params(HardwareVersion::V1));
     }
 
     #[test]

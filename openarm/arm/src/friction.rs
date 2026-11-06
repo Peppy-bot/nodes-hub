@@ -9,7 +9,7 @@ use openarm_description::{ARM_DOF, HardwareVersion};
 use srs_model::JointVec;
 
 /// Per-joint friction-model constants for the tanh model above.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Params {
     pub fc: JointVec,
     pub fv: JointVec,
@@ -22,7 +22,8 @@ const FV: JointVec = [0.063, 0.063, 0.604, 0.813, 0.029, 0.072, 0.084];
 
 /// The offset of openarm_teleop's `config/follower.yaml`, on both generations. `Fo` is a
 /// directional Coulomb-breakaway offset defined in each joint's positive direction, so at
-/// zero velocity the model commands a small directional bias.
+/// zero velocity the model commands a small directional bias. v2 reoriented joints 1, 3 and
+/// 4, and its sign on them is unconfirmed: a flipped joint would need its `Fo` flipped.
 const FO: JointVec = [0.088, 0.088, 0.008, -0.058, 0.005, 0.009, -0.059];
 
 /// v1's constants, from `config/follower.yaml`: this node is a stiff position controller,
@@ -37,13 +38,15 @@ const V1: Params = Params {
     k: [2.8417, 2.8417, 2.9065, 13.0038, 15.1771, 24.2287, 0.7888],
 };
 
-/// v2's constants, measured on a real v2 on a wide two-arm joint path at 40 s, 20 s and a
-/// duration of 0. `Fc` is the torque a joint's position error holds against the sign of
-/// its commanded velocity, times kp, the same at kp 120, 240 and 360, averaged over both
-/// arms. `k` brings the Coulomb term to 90% of `Fc` at 0.0075 rad/s, the command's speed
-/// once the slowest start of the 40 s path has moved two encoder counts, so a joint held
-/// by stiction breaks free with the command. The term reads the commanded velocity, so
-/// its slope at zero speed adds no feedback.
+/// v2's constants, fit on a real v2 at kp 360 on a wide two-arm joint path at 40 s, 20 s and
+/// a duration of 0. `Fc` leaves about zero of the torque a joint's position error holds
+/// against the sign of its commanded velocity, times kp, averaged over the paths and both
+/// arms. On joints 1 to 4 that torque, with the feedforward's own Coulomb term added, reads
+/// within 0.13 Nm at kp 120, 240 and 360. `k` brings the Coulomb term to 90% of `Fc` at
+/// 0.0075 rad/s, the command's speed at the median start of the 40 s path once it has moved
+/// two encoder counts, so a joint held by stiction breaks free with the command. The
+/// slowest starts read 0.0031 to 0.0055 rad/s there and get 55% to 80%. The term reads the
+/// commanded velocity, so its slope at zero speed adds no feedback.
 const V2: Params = Params {
     fc: [0.83, 0.49, 0.60, 1.09, 0.095, 0.13, 0.11],
     fv: FV,
@@ -68,10 +71,10 @@ pub fn torques(p: &Params, dq: &JointVec) -> JointVec {
 mod tests {
     use super::*;
 
-    /// The command's speed once the slowest start of a 40 s path has moved two encoder
+    /// The command's speed at the median start of a 40 s path once it has moved two encoder
     /// counts, and how much of `Fc` the Coulomb term gives by then on v2.
-    const SLOW_START_RAD_S: f64 = 0.0075;
-    const COULOMB_SHARE_AT_SLOW_START: f64 = 0.9;
+    const MEDIAN_START_RAD_S: f64 = 0.0075;
+    const COULOMB_SHARE_AT_MEDIAN_START: f64 = 0.9;
 
     /// Self-contained constants for the `torques` math (distinct, non-zero per
     /// joint), independent of each generation's constants.
@@ -123,9 +126,9 @@ mod tests {
 
     #[test]
     fn each_generation_reads_its_own_constants() {
-        assert_eq!(params(HardwareVersion::V1).fc, V1.fc);
-        assert_eq!(params(HardwareVersion::V2).fc, V2.fc);
-        assert_ne!(V1.fc, V2.fc);
+        assert_eq!(params(HardwareVersion::V1), V1);
+        assert_eq!(params(HardwareVersion::V2), V2);
+        assert_ne!(V1, V2);
     }
 
     #[test]
@@ -138,10 +141,18 @@ mod tests {
     }
 
     #[test]
-    fn v2s_coulomb_term_is_near_full_at_a_slow_start() {
-        for (i, &k) in V2.k.iter().enumerate() {
-            let share = f64::tanh(k * SLOW_START_RAD_S);
-            assert!(share >= COULOMB_SHARE_AT_SLOW_START, "joint {i}: {share}");
+    fn each_generations_coulomb_term_pushes_with_the_motion() {
+        for p in [V1, V2] {
+            assert!(p.fc.iter().chain(&p.k).all(|&x| x > 0.0));
+        }
+    }
+
+    #[test]
+    fn v2s_coulomb_term_is_near_full_at_a_median_start() {
+        let v2 = params(HardwareVersion::V2);
+        for (i, &k) in v2.k.iter().enumerate() {
+            let share = f64::tanh(k * MEDIAN_START_RAD_S);
+            assert!(share >= COULOMB_SHARE_AT_MEDIAN_START, "joint {i}: {share}");
         }
     }
 }
