@@ -263,8 +263,8 @@
       // contact is fully stopped; at/over d_safe_m it is unthrottled; between, it
       // ramps linearly. Separating motion is never throttled (recovery from a
       // tangle is always allowed). Require 0 < d_stop_m < d_safe_m. The collision
-      // model was validated against d_stop_m=0.005, d_safe_m=0.02, so an approach
-      // throttles within ~2 cm. With these values:
+      // model was validated against the launchers' values, so an approach throttles
+      // within d_safe_m. With those values:
       // - On v1, the home pose sits outside the band, so it is unthrottled.
       // - On v2 with both grippers fully open, the jaws at home sit under d_stop_m
       //   against the torso. Thus the governor holds both arms short of home.
@@ -320,11 +320,10 @@
       // Cutoff (Hz) for the first-order low-pass on each published desired velocity.
       // Desired velocity is a per-tick position delta scaled by the control rate, so it
       // amplifies setpoint noise; filtering it keeps the arm's Kd term from buzzing on a
-      // noisy stream without touching the desired position. At the 100 Hz control rate
-      // (Nyquist 50 Hz) this must sit well below Nyquist to attenuate; ~15 Hz matches the
-      // enactic reference's one-pole (its 90 rad/s constant is ~14.3 Hz) and adds about one
-      // tick of group delay. A universal control constant (same across generations and
-      // sim/real), so it keeps a node default like the gains.
+      // noisy stream without touching the desired position. It must sit well below the
+      // control rate's Nyquist to attenuate; the default rounds the constant of enactic's
+      // one-pole differentiator, 90 rad/s or about 14.3 Hz. A universal control constant
+      // (same across generations and sim/real), so it keeps a node default like the gains.
       velocity_filter_cutoff_hz: { $type: "f64", $default: 15.0 },
     }
   }

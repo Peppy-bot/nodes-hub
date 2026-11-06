@@ -36,8 +36,8 @@ use crate::upstream::UpstreamMode;
 use crate::workspace::Workspace;
 use crate::workspace_service;
 
-/// The fastest the coordination loop is driven. It paces the same 1 Mbit
-/// CAN FD arms as openarm_arm; the stack runs at 100 Hz.
+/// The fastest the coordination loop is driven. It paces the same CAN FD arms
+/// as openarm_arm.
 const MAX_RATE_HZ: u32 = 1_000;
 
 /// Everything this node refuses to run on.

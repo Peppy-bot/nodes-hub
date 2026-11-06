@@ -28,6 +28,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use control_core::path_timing::{JointTrajectory, MIN_JOINT_CHANGE_RAD, RoundedPath};
+use control_core::time::ticks_within;
 use control_core::timing::{MotionClock, Pace};
 use openarm_description::{ARM_DOF, ArmOrder, ArmPair, DUAL_DOF, Side};
 use srs_model::JointVec;
@@ -781,14 +782,18 @@ pub fn judge_path(
 /// waypoint as a repeat of the one before it, 0.001 rad.
 const RUN_START_SLACK_RAD: f64 = MIN_JOINT_CHANGE_RAD;
 
-/// How many times a joint path may be judged before it plays, the first
-/// judgment included: an arm still farther than [`RUN_START_SLACK_RAD`] from
-/// the start of the last of them fails the path. Each judgment is read on a
-/// tick after the one before it, so the cap lets an arm settle for 20 control
-/// ticks at least, 0.2 s at 100 Hz when each check ends within its tick; in
-/// simulation, an OpenArm sent a path the moment its move completed settled
-/// within 9.
-const MAX_PATH_JUDGMENTS: u32 = 20;
+/// How long, at least, an arm has to settle before a joint path plays: an arm
+/// still farther than [`RUN_START_SLACK_RAD`] from the start of the last
+/// judgment fails the path. In simulation at a 10 ms control period, an OpenArm
+/// sent a path the moment its move completed settled within 9 judgments.
+const PATH_SETTLE_WINDOW: Duration = Duration::from_millis(200);
+
+/// How many times a joint path may be judged before it plays, the first judgment
+/// included, in a loop of `cycle_period`: each judgment is read on a tick after
+/// the one before it, so the judgments span [`PATH_SETTLE_WINDOW`] at least.
+fn max_path_judgments(cycle_period: Duration) -> u32 {
+    ticks_within(PATH_SETTLE_WINDOW, cycle_period)
+}
 
 /// Whether the shares of a judged path still wait for it.
 pub enum Resumed {
@@ -819,7 +824,7 @@ pub enum Resumed {
 /// - a run start farther than [`RUN_START_SLACK_RAD`] from the path's start
 ///   in a joint has the path judged again from the run starts, the arm the
 ///   path does not name where the path holds it ([`Resumed::JudgeAgain`]),
-///   and after [`MAX_PATH_JUDGMENTS`] judgments ends each share with
+///   and after [`max_path_judgments`] judgments ends each share with
 ///   `precondition_failed`, naming the arm that still moves.
 ///
 /// A share its goal's cancel, the stop or a stale follower already ended
@@ -875,7 +880,7 @@ pub fn resume_judged_path(
         })
         .max_by(|a, b| a.2.total_cmp(&b.2));
     if let Some((side, joint, off)) = still_moving {
-        if judgment.judgments >= MAX_PATH_JUDGMENTS {
+        if judgment.judgments >= max_path_judgments(planners[side].cfg.cycle_period) {
             let failure = unsettled(side, joint, off, judgment.judgments);
             fail_awaiting_shares(planners, judgment.id, &failure);
             return Resumed::Done;
@@ -1592,59 +1597,68 @@ mod tests {
         assert_eq!(path_of(&planners.right).sample(now), dual_joints(&moved));
     }
 
+    #[test]
+    fn a_path_is_judged_for_its_settle_window_at_any_rate() {
+        let judgments = |period_ms| max_path_judgments(Duration::from_millis(period_ms));
+        assert_eq!(judgments(10), 20);
+        assert_eq!(judgments(4), 50);
+        assert_eq!(judgments(1), 200);
+    }
+
     /// An arm that never comes to rest within 0.001 rad of where it stood
     /// when its path was last judged, though within its start tolerance of
     /// where the goal was taken, fails the path with `precondition_failed`
-    /// once the path has been judged 20 times, naming the arm and the joint,
+    /// once its judgments span the settle window, naming the arm and the joint,
     /// before the path plays: the left shoulder swings 0.004 rad either side
     /// of where it was taken.
     #[tokio::test]
-    async fn an_arm_that_will_not_settle_fails_its_path_after_twenty_judgments() {
-        let (mut planners, mut judgment, mut verdict, mut done_rx) =
-            left_path_measured_at(BOTH_HELD.left, &[BOTH_TO], Duration::from_secs(1));
-        let now = Instant::now();
-        let swung = |k: u32| {
-            let mut q = BOTH_HELD.left;
-            q[0] += if k.is_multiple_of(2) { 0.004 } else { -0.004 };
-            left_measuring(q)
-        };
-        for k in 1..MAX_PATH_JUDGMENTS {
-            let Resumed::JudgeAgain(again) =
-                resume_judged_path(&mut planners, &judgment, &verdict, &swung(k), now)
-            else {
-                panic!("judgment {k}: the path is judged again");
+    async fn an_arm_that_will_not_settle_fails_its_path_after_its_settle_window() {
+        for (period_ms, last) in [(10, 20), (4, 50)] {
+            let (mut planners, mut judgment, mut verdict, mut done_rx) =
+                left_path_measured_at(BOTH_HELD.left, &[BOTH_TO], Duration::from_secs(1));
+            for side in Side::BOTH {
+                planners[side].cfg.cycle_period = Duration::from_millis(period_ms);
+            }
+            let now = Instant::now();
+            let swung = |k: u32| {
+                let mut q = BOTH_HELD.left;
+                q[0] += if k.is_multiple_of(2) { 0.004 } else { -0.004 };
+                left_measuring(q)
             };
-            judgment = *again;
-            verdict = judge_path(
-                &judgment.plan,
-                judgment.arms,
-                &test_guard(&planners),
-                &mut OpenGuard,
-                &NO_STOP,
+            for k in 1..last {
+                let Resumed::JudgeAgain(again) =
+                    resume_judged_path(&mut planners, &judgment, &verdict, &swung(k), now)
+                else {
+                    panic!("judgment {k}: the path is judged again");
+                };
+                judgment = *again;
+                verdict = judge_path(
+                    &judgment.plan,
+                    judgment.arms,
+                    &test_guard(&planners),
+                    &mut OpenGuard,
+                    &NO_STOP,
+                );
+            }
+            let resumed = resume_judged_path(&mut planners, &judgment, &verdict, &swung(last), now);
+            assert!(matches!(resumed, Resumed::Done), "the path ends");
+            assert!(!planners.left.moving(), "before it plays");
+            assert_eq!(
+                planners.left.setpoint(),
+                BOTH_HELD.left,
+                "the command holds"
+            );
+            assert_eq!(
+                outcome(done_rx.try_recv()),
+                Some(Outcome::Failed(Failure::new(
+                    FailureKind::PreconditionFailed,
+                    format!(
+                        "left_arm still moved 0.008 rad at joint 1 while its path was judged {last} \
+                         times; let the arm settle and send the path again"
+                    )
+                )))
             );
         }
-        let resumed = resume_judged_path(
-            &mut planners,
-            &judgment,
-            &verdict,
-            &swung(MAX_PATH_JUDGMENTS),
-            now,
-        );
-        assert!(matches!(resumed, Resumed::Done), "the path ends");
-        assert!(!planners.left.moving(), "before it plays");
-        assert_eq!(
-            planners.left.setpoint(),
-            BOTH_HELD.left,
-            "the command holds"
-        );
-        assert_eq!(
-            outcome(done_rx.try_recv()),
-            Some(Outcome::Failed(Failure::new(
-                FailureKind::PreconditionFailed,
-                "left_arm still moved 0.008 rad at joint 1 while its path was judged 20 times; \
-                 let the arm settle and send the path again"
-            )))
-        );
     }
 
     /// A path the joint caps run within 60 s from where the arm stood when
