@@ -5,8 +5,9 @@
   // and the scene it is attached into carries the floor and the light.
   scene: "openarm/openarm_bimanual_v1.xml",
 
-  // MIT servo gains (j1..j7) applied to every arm's position actuators so sim
-  // dynamics match the real driver. Fingers keep their MJCF defaults.
+  // MIT servo gains (j1..j7) applied to every arm's position actuators: the openarm
+  // teleop config's. The real arm's are in openarm/arm/peppy.json5. Fingers keep their
+  // MJCF defaults.
   arm_gains: {
     kp: [240.0, 240.0, 240.0, 240.0, 24.0, 31.0, 25.0],
     kd: [3.0, 3.0, 3.0, 3.0, 0.2, 0.2, 0.2],

@@ -4,6 +4,7 @@
 //! lives in the sibling modules; this is only the assembly.
 
 use crate::control::{self, ControlConfig};
+use crate::friction;
 use crate::health;
 use crate::stream;
 use control_core::serving;
@@ -322,6 +323,7 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         kp,
         kd,
         cycle_period,
+        friction: friction::params(hardware_version),
         limits: model.limits(),
         ratings,
     };

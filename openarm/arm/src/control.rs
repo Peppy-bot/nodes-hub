@@ -57,6 +57,8 @@ pub struct ControlConfig {
     pub kp: JointVec,
     pub kd: JointVec,
     pub cycle_period: Duration,
+    /// This hardware generation's friction constants.
+    pub friction: friction::Params,
     /// Joint position limits, parsed from the URDF, the final guard clamp applied
     /// to every governed setpoint before it reaches the motors.
     pub limits: [Limit; ARM_DOF],
@@ -175,7 +177,14 @@ async fn run_control(
         }
 
         let governed = *wiring.governed.borrow();
-        let tick = tick_command(&model, &q, governed, &cfg.limits, Instant::now());
+        let tick = tick_command(
+            &model,
+            &cfg.friction,
+            &q,
+            governed,
+            &cfg.limits,
+            Instant::now(),
+        );
 
         // A driver fault costs this tick's frames, not the loop: the motors
         // hold their last commanded pose, the next tick re-sends an absolute
@@ -246,6 +255,7 @@ struct TickCommand {
 /// backbone's stream is live, so the arm never lunges before the backbone is up.
 fn tick_command(
     model: &srs_model::Arm,
+    friction: &friction::Params,
     q: &JointVec,
     governed: Option<GovernedSetpoint>,
     limits: &[Limit; ARM_DOF],
@@ -260,7 +270,7 @@ fn tick_command(
         Some(setpoint) => clamp_setpoint_to_limits(&setpoint.q_des, &setpoint.dq_des, limits),
         None => (*q, ZERO),
     };
-    let ff_tau = feedforward(model, q, &dq_des);
+    let ff_tau = feedforward(model, friction, q, &dq_des);
     TickCommand {
         q_des,
         dq_des,
@@ -272,11 +282,16 @@ fn tick_command(
 /// at the commanded velocity from the posed chain (carrying the distal gripper
 /// payload), plus locally computed friction at the commanded velocity, so the PD
 /// term only corrects residual error.
-fn feedforward(model: &srs_model::Arm, q: &JointVec, dq_des: &JointVec) -> JointVec {
+fn feedforward(
+    model: &srs_model::Arm,
+    friction: &friction::Params,
+    q: &JointVec,
+    dq_des: &JointVec,
+) -> JointVec {
     let posed = model.at(q);
     let gravity = posed.gravity_torques();
     let coriolis = posed.coriolis_torques(dq_des);
-    let friction = friction::torques(&friction::NOMINAL, dq_des);
+    let friction = friction::torques(friction, dq_des);
     std::array::from_fn(|i| gravity[i] + coriolis[i] + friction[i])
 }
 
@@ -374,11 +389,15 @@ mod tests {
         }
     }
 
-    /// Gravity at `q`, with Coriolis and friction at `dq`.
+    fn v2_friction() -> friction::Params {
+        friction::params(HardwareVersion::V2)
+    }
+
+    /// Gravity at `q`, with Coriolis and v2's friction at `dq`.
     fn inverse_dynamics(model: &srs_model::Arm, q: &JointVec, dq: &JointVec) -> JointVec {
         let posed = model.at(q);
         let (gravity, coriolis) = (posed.gravity_torques(), posed.coriolis_torques(dq));
-        let friction = friction::torques(&friction::NOMINAL, dq);
+        let friction = friction::torques(&v2_friction(), dq);
         std::array::from_fn(|i| gravity[i] + coriolis[i] + friction[i])
     }
 
@@ -387,7 +406,14 @@ mod tests {
         let model = v2_arm();
         let limits = model.limits();
         let setpoint = arrived(POSE, DQ);
-        let tick = tick_command(&model, &POSE, Some(setpoint), &limits, setpoint.received);
+        let tick = tick_command(
+            &model,
+            &v2_friction(),
+            &POSE,
+            Some(setpoint),
+            &limits,
+            setpoint.received,
+        );
         assert_eq!(tick.ff_tau, inverse_dynamics(&model, &POSE, &DQ));
         let posed = model.at(&POSE);
         assert!(
@@ -398,12 +424,46 @@ mod tests {
     }
 
     #[test]
+    fn a_tick_feeds_the_friction_of_its_generation() {
+        let model = v2_arm();
+        let limits = model.limits();
+        let setpoint = arrived(POSE, DQ);
+        let tick_with = |version| {
+            tick_command(
+                &model,
+                &friction::params(version),
+                &POSE,
+                Some(setpoint),
+                &limits,
+                setpoint.received,
+            )
+        };
+        let v1 = friction::torques(&friction::params(HardwareVersion::V1), &DQ);
+        let v2 = friction::torques(&v2_friction(), &DQ);
+        let (from_v1, from_v2) = (
+            tick_with(HardwareVersion::V1),
+            tick_with(HardwareVersion::V2),
+        );
+        for i in 0..ARM_DOF {
+            let difference = from_v2.ff_tau[i] - from_v1.ff_tau[i];
+            assert!((difference - (v2[i] - v1[i])).abs() < 1e-12, "joint {i}");
+        }
+    }
+
+    #[test]
     fn a_tick_feeds_gravity_at_the_measured_pose() {
         let model = v2_arm();
         let limits = model.limits();
         let ahead = [0.5, 0.8, -0.2, 1.4, 0.4, 0.3, 0.2];
         let setpoint = arrived(ahead, ZERO);
-        let tick = tick_command(&model, &POSE, Some(setpoint), &limits, setpoint.received);
+        let tick = tick_command(
+            &model,
+            &v2_friction(),
+            &POSE,
+            Some(setpoint),
+            &limits,
+            setpoint.received,
+        );
         assert_eq!(tick.ff_tau, inverse_dynamics(&model, &POSE, &ZERO));
         assert_ne!(tick.ff_tau, inverse_dynamics(&model, &ahead, &ZERO));
         assert_eq!(tick.q_des, ahead);
@@ -413,7 +473,7 @@ mod tests {
     fn an_arm_with_no_setpoint_holds_where_it_measures() {
         let model = v2_arm();
         let limits = model.limits();
-        let tick = tick_command(&model, &POSE, None, &limits, Instant::now());
+        let tick = tick_command(&model, &v2_friction(), &POSE, None, &limits, Instant::now());
         assert_eq!(
             tick,
             TickCommand {
@@ -432,6 +492,7 @@ mod tests {
         let after = |silence| {
             tick_command(
                 &model,
+                &v2_friction(),
                 &POSE,
                 Some(setpoint),
                 &limits,
@@ -456,7 +517,14 @@ mod tests {
         let mut past_the_limit = POSE;
         past_the_limit[0] = limits[0].hi + 0.1;
         let setpoint = arrived(past_the_limit, [1.0; ARM_DOF]);
-        let tick = tick_command(&model, &POSE, Some(setpoint), &limits, setpoint.received);
+        let tick = tick_command(
+            &model,
+            &v2_friction(),
+            &POSE,
+            Some(setpoint),
+            &limits,
+            setpoint.received,
+        );
         assert_eq!(tick.dq_des[0], 0.0);
         assert_eq!(
             tick.ff_tau,

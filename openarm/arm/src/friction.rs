@@ -5,6 +5,7 @@
 //!
 //!   τ_fric[i] = Fo[i] + Fv[i]·ω[i] + Fc[i]·tanh(k[i]·ω[i])
 
+use openarm_description::{ARM_DOF, HardwareVersion};
 use srs_model::JointVec;
 
 /// Per-joint friction-model constants for the tanh model above.
@@ -16,28 +17,47 @@ pub struct Params {
     pub k: JointVec,
 }
 
-/// Friction constants from openarm_teleop's `config/follower.yaml`. This node is a stiff
-/// position controller, so it matches the teleop follower role. `follower.yaml` and
-/// `leader.yaml` agree on every constant except `Fc[5]` (joint 6: follower 0.093, leader
-/// 0.083). The `coef_tmp = 0.1` tanh softening that `ComputeFriction` always applies is
-/// folded into `k` (so `k` here is the yaml `k` times 0.1), making the runtime expression
-/// `Fo + Fv·ω + Fc·tanh(k·ω)`.
-///
-/// The enactic teleop config is not versioned, so these apply to both hardware
-/// generations. `Fo` is a directional Coulomb-breakaway offset defined in each joint's
-/// positive direction; v2.0 reoriented joints 1/3/4, so confirm the per-joint sign
-/// convention against the v2 URDF axes at bring-up (a flipped joint would need its `Fo`
-/// sign flipped). Not defaulted differently in code because the reference does not.
-///
-/// These are the physical (full) friction torques, applied directly at full weight. Fo is a
-/// non-zero static offset, so at zero velocity the model commands a small directional bias
-/// (intentional Coulomb breakaway).
-pub const NOMINAL: Params = Params {
+/// The viscous term of openarm_teleop's `config/follower.yaml`, on both generations.
+const FV: JointVec = [0.063, 0.063, 0.604, 0.813, 0.029, 0.072, 0.084];
+
+/// The offset of openarm_teleop's `config/follower.yaml`, on both generations. `Fo` is a
+/// directional Coulomb-breakaway offset defined in each joint's positive direction, so at
+/// zero velocity the model commands a small directional bias.
+const FO: JointVec = [0.088, 0.088, 0.008, -0.058, 0.005, 0.009, -0.059];
+
+/// v1's constants, from `config/follower.yaml`: this node is a stiff position controller,
+/// the teleop follower's role. `follower.yaml` and `leader.yaml` agree on every constant
+/// except `Fc[5]` (joint 6: follower 0.093, leader 0.083). The `coef_tmp = 0.1` tanh
+/// softening that `ComputeFriction` always applies is folded into `k` (so `k` here is the
+/// yaml `k` times 0.1).
+const V1: Params = Params {
     fc: [0.306, 0.306, 0.40, 0.166, 0.050, 0.093, 0.172],
-    fv: [0.063, 0.063, 0.604, 0.813, 0.029, 0.072, 0.084],
-    fo: [0.088, 0.088, 0.008, -0.058, 0.005, 0.009, -0.059],
+    fv: FV,
+    fo: FO,
     k: [2.8417, 2.8417, 2.9065, 13.0038, 15.1771, 24.2287, 0.7888],
 };
+
+/// v2's constants, measured on a real v2 on a wide two-arm joint path at 40 s, 20 s and a
+/// duration of 0. `Fc` is the torque a joint's position error holds against the sign of
+/// its commanded velocity, times kp, the same at kp 120, 240 and 360, averaged over both
+/// arms. `k` brings the Coulomb term to 90% of `Fc` at 0.0075 rad/s, the command's speed
+/// once the slowest start of the 40 s path has moved two encoder counts, so a joint held
+/// by stiction breaks free with the command. The term reads the commanded velocity, so
+/// its slope at zero speed adds no feedback.
+const V2: Params = Params {
+    fc: [0.83, 0.49, 0.60, 1.09, 0.095, 0.13, 0.11],
+    fv: FV,
+    fo: FO,
+    k: [200.0; ARM_DOF],
+};
+
+/// The friction constants of one hardware generation.
+pub fn params(version: HardwareVersion) -> Params {
+    match version {
+        HardwareVersion::V1 => V1,
+        HardwareVersion::V2 => V2,
+    }
+}
 
 /// Friction torque at velocity `dq` for the given constants.
 pub fn torques(p: &Params, dq: &JointVec) -> JointVec {
@@ -47,10 +67,14 @@ pub fn torques(p: &Params, dq: &JointVec) -> JointVec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openarm_description::ARM_DOF;
+
+    /// The command's speed once the slowest start of a 40 s path has moved two encoder
+    /// counts, and how much of `Fc` the Coulomb term gives by then on v2.
+    const SLOW_START_RAD_S: f64 = 0.0075;
+    const COULOMB_SHARE_AT_SLOW_START: f64 = 0.9;
 
     /// Self-contained constants for the `torques` math (distinct, non-zero per
-    /// joint), independent of the production [`NOMINAL`] values.
+    /// joint), independent of each generation's constants.
     const FIXTURE: Params = Params {
         fc: [0.09, 0.10, 0.12, 0.05, 0.015, 0.025, 0.05],
         fv: [0.02, 0.03, 0.18, 0.24, 0.009, 0.02, 0.025],
@@ -98,9 +122,26 @@ mod tests {
     }
 
     #[test]
-    fn nominal_constants_are_complete_and_finite() {
-        for arr in [&NOMINAL.fc, &NOMINAL.fv, &NOMINAL.fo, &NOMINAL.k] {
-            assert!(arr.iter().all(|x| x.is_finite()));
+    fn each_generation_reads_its_own_constants() {
+        assert_eq!(params(HardwareVersion::V1).fc, V1.fc);
+        assert_eq!(params(HardwareVersion::V2).fc, V2.fc);
+        assert_ne!(V1.fc, V2.fc);
+    }
+
+    #[test]
+    fn each_generations_constants_are_finite() {
+        for p in [V1, V2] {
+            for arr in [&p.fc, &p.fv, &p.fo, &p.k] {
+                assert!(arr.iter().all(|x| x.is_finite()));
+            }
+        }
+    }
+
+    #[test]
+    fn v2s_coulomb_term_is_near_full_at_a_slow_start() {
+        for (i, &k) in V2.k.iter().enumerate() {
+            let share = f64::tanh(k * SLOW_START_RAD_S);
+            assert!(share >= COULOMB_SHARE_AT_SLOW_START, "joint {i}: {share}");
         }
     }
 }

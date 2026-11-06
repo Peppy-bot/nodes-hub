@@ -11,9 +11,9 @@
   // the joints of the shared entry, which is how PhysX names their dofs.
   articulation_root: ".",
 
-  // MIT servo gains (j1..j7) applied to every arm's PhysX joint drives so sim
-  // dynamics match the real driver, plus the motor torque caps
-  // (DM8009/4340/4310) applied as max_efforts.
+  // MIT servo gains (j1..j7) applied to every arm's PhysX joint drives: the openarm
+  // teleop config's. The real arm's are in openarm/arm/peppy.json5. Plus the motor
+  // torque caps (DM8009/4340/4310) applied as max_efforts.
   arm_gains: {
     kp: [240.0, 240.0, 240.0, 240.0, 24.0, 31.0, 25.0],
     kd: [3.0, 3.0, 3.0, 3.0, 0.2, 0.2, 0.2],
