@@ -1,11 +1,11 @@
-"""The scene_manipulation and object_state provider: what get_assets_list answers
-before and after discovery, what load_scene and clear_scene do to spawned
-objects, what get_object_states answers: an error reply until a capture, then
-the latest capture under its own stamp, every completed edit included, what
-get_object answers for one object of that capture, what a load_scene or
-spawn_object goal reports on its feedback, and the failure kind of each goal
-refused when it arrives, of each goal whose command fails, and of each error
-reply."""
+"""The scene_manipulation and object_state provider: what get_assets_list and
+get_asset answer before and after discovery, what load_scene and clear_scene
+do to spawned objects, what get_object_states answers: an error reply until a
+capture, then the latest capture under its own stamp, every completed edit
+included, what get_object answers for one object of that capture, what a
+load_scene or spawn_object goal reports on its feedback, and the failure kind
+of each goal refused when it arrives, of each goal whose command fails, and of
+each error reply."""
 
 import asyncio
 import contextlib
@@ -191,6 +191,59 @@ def test_the_catalogue_is_narrowed_by_each_filter_and_a_bad_kind_is_refused(prov
 
     refused = _refused(provider, lambda: provider.io._handle_get_assets(_assets_request(kind="robot")), "rejected")
     assert refused == "kind must be scene or object"
+
+
+def _asset_request(asset_id):
+    return _request(asset_id=asset_id)
+
+
+def test_the_full_entry_of_an_asset_is_its_listed_entry_and_an_unknown_one_is_refused(provider):
+    refused = _refused(
+        provider, lambda: provider.io._handle_get_asset(_asset_request("props/blocks/red_block")), "precondition_failed",
+    )
+    assert "still discovering its asset catalogue" in refused
+
+    provider.io.set_assets(_CATALOGUE)
+    listed = json.loads(provider.io._handle_get_assets(_assets_request()).assets_json)
+    for entry in listed:
+        response = provider.io._handle_get_asset(_asset_request(entry["asset_id"]))
+        assert json.loads(response.asset_json) == entry
+
+    for unknown in ("props/blocks/green_block", ""):
+        request = _asset_request(unknown)
+        refused = _refused(provider, lambda request=request: provider.io._handle_get_asset(request), "rejected")
+        assert refused == f"Unknown asset_id: {unknown}"
+
+
+def test_an_asset_is_listed_given_and_loaded_by_its_key_in_the_catalogue(provider):
+    """The asset id of an asset is its key in the discovered catalogue, whatever id its own entry holds or lacks: the
+    listing, get_asset and load_scene name each asset by that key, and get_asset refuses any other id."""
+
+    catalogue = {
+        "scene/office": {
+            "display_name": "Office", "kind": "scene", "path": "Isaac/Environments/Office/office.usd",
+            "category": "Scenes",
+        },
+        "props/blocks/red_block": {
+            "asset_id": "props/blocks/crimson_block", "display_name": "red block", "kind": "object",
+            "path": "Isaac/Props/Blocks/red_block.usd", "category": "Blocks",
+        },
+    }
+    provider.io.set_assets(catalogue)
+
+    listed = json.loads(provider.io._handle_get_assets(_assets_request()).assets_json)
+    assert sorted(entry["asset_id"] for entry in listed) == sorted(catalogue)
+    for asset_id in catalogue:
+        given = json.loads(provider.io._handle_get_asset(_asset_request(asset_id)).asset_json)
+        assert given["asset_id"] == asset_id
+
+    for stray in ("", "props/blocks/crimson_block"):
+        request = _asset_request(stray)
+        refused = _refused(provider, lambda request=request: provider.io._handle_get_asset(request), "rejected")
+        assert refused == f"Unknown asset_id: {stray}"
+
+    provider.io._execute(provider.launcher, "load_scene", {"asset_id": "scene/office", "scale": 1.0})
+    assert provider.io._handle_get_scene(None).asset_id == "scene/office"
 
 
 def test_the_categories_count_the_catalogue_in_listing_order(provider):

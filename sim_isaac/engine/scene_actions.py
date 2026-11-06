@@ -40,6 +40,7 @@ from peppygen.exposed_actions.scene import (
 )
 from peppygen.exposed_services.objects import get_object_states
 from peppygen.exposed_services.scene import (
+    get_asset,
     get_asset_categories,
     get_assets_list,
     get_object,
@@ -122,6 +123,12 @@ class SceneFailure(Exception):
 
 def _rejected(message: str) -> SceneFailure:
     return SceneFailure(REJECTED, message)
+
+
+def _unknown_asset(asset_id: str) -> SceneFailure:
+    """The refusal of an id that names no asset of the catalogue."""
+
+    return _rejected(f"Unknown asset_id: {asset_id}")
 
 
 @dataclass(frozen=True)
@@ -370,20 +377,21 @@ def _matches(
     )
 
 
-def _public_catalogue(assets) -> list[dict]:
+def _public_catalogue(assets: dict[str, dict]) -> list[dict]:
     """The catalogue metadata a caller sees, without the raw Isaac paths:
     scenes first in their fixed order, then every other asset by kind,
-    category and name."""
+    category and name. The asset id of each entry is its key in `assets`,
+    the id by which load_scene and spawn_object find it."""
 
     public = [
         {
-            "asset_id": asset.get("asset_id", ""),
+            "asset_id": asset_id,
             "display_name": asset.get("display_name", ""),
             "description": asset.get("description", ""),
             "kind": asset.get("kind", ""),
             "category": asset.get("category", ""),
         }
-        for asset in assets
+        for asset_id, asset in assets.items()
     ]
 
     scene_order = {
@@ -530,10 +538,10 @@ class SceneActionIO:
         # get_assets_list says so rather than answering with nothing.
         self._assets: dict[str, dict] = {}
         self._assets_ready = False
-        # The catalogue as a caller sees it, and each asset's category,
-        # both built once when the assets come.
+        # The catalogue as a caller sees it, and each entry of it by its
+        # asset id, both built once when the assets come.
         self._catalogue: list[dict] = []
-        self._category_by_asset: dict[str, str] = {}
+        self._public_by_asset: dict[str, dict] = {}
         # The spawned objects in spawn order: what each was spawned from and
         # with. Where each one is comes from the engine at capture.
         self._objects: dict[str, dict] = {}
@@ -575,6 +583,7 @@ class SceneActionIO:
 
         services = (
             (get_assets_list, self._handle_get_assets),
+            (get_asset, self._handle_get_asset),
             (get_asset_categories, self._handle_get_asset_categories),
             (get_objects_list, self._handle_get_objects_list),
             (get_object, self._handle_get_object),
@@ -624,9 +633,9 @@ class SceneActionIO:
                 asset_id: dict(asset)
                 for asset_id, asset in assets.items()
             }
-            self._catalogue = _public_catalogue(self._assets.values())
-            self._category_by_asset = {
-                asset["asset_id"]: asset["category"]
+            self._catalogue = _public_catalogue(self._assets)
+            self._public_by_asset = {
+                asset["asset_id"]: asset
                 for asset in self._catalogue
             }
             self._assets_ready = True
@@ -696,7 +705,7 @@ class SceneActionIO:
         asset = self._asset(asset_id)
 
         if asset is None:
-            raise _rejected(f"Unknown asset_id: {asset_id}")
+            raise _unknown_asset(asset_id)
 
         if asset.get("kind") != kind:
             raise _rejected(f"Asset is not {_ASSET_KIND_WORDS[kind]}: {asset_id}")
@@ -747,6 +756,29 @@ class SceneActionIO:
             ),
         )
 
+    def _handle_get_asset(
+        self,
+        request,
+    ) -> get_asset.Response:
+        """The full entry of one asset of the catalogue. Isaac keeps no
+        landmark, work surface or wall of an asset, so the full entry is the
+        one the listing gives. Refused while the catalogue is not discovered
+        yet, and for an id that names no asset."""
+
+        self._require_catalogue()
+
+        asset_id = request.data.asset_id
+
+        with self._lock:
+            entry = self._public_by_asset.get(asset_id)
+
+        if entry is None:
+            raise _unknown_asset(asset_id)
+
+        return get_asset.Response(
+            asset_json=json.dumps(entry, separators=(",", ":")),
+        )
+
     def _handle_get_asset_categories(
         self,
         _request,
@@ -794,13 +826,15 @@ class SceneActionIO:
         snapshot = self._latest_snapshot()
 
         with self._lock:
-            category_by_asset = self._category_by_asset
+            public_by_asset = self._public_by_asset
 
         objects = []
 
         if source != "scene":
             for record in snapshot.objects:
-                asset_category = category_by_asset.get(record.asset_id, "")
+                asset_category = public_by_asset.get(record.asset_id, {}).get(
+                    "category", ""
+                )
 
                 if category is not None and category != asset_category:
                     continue
