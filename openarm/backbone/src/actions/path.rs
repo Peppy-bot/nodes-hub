@@ -114,16 +114,10 @@ fn waypoint_within_limits(
     if !q.iter().all(|v| v.is_finite()) {
         return Err(format!("{waypoint} holds a non-finite value"));
     }
-    let Some(j) = joint_outside_limits(q, limits) else {
-        return Ok(());
-    };
-    Err(format!(
-        "{waypoint} puts joint {} at {:.4} rad, outside its limits [{:.4}, {:.4}]",
-        j + 1,
-        q[j],
-        limits[j].lo,
-        limits[j].hi
-    ))
+    match joint_outside_limits(q, limits) {
+        None => Ok(()),
+        Some(outside) => Err(format!("{waypoint} puts {outside}")),
+    }
 }
 
 /// The expected start of the arm on `side` off the wire: none when
@@ -501,7 +495,7 @@ mod tests {
         let refused = refusal(goal(&["right_arm", "left_arm"], &past_right, None));
         assert!(
             refused.starts_with("waypoint 2 of right_arm puts joint ")
-                && refused.contains(" at -1.0000 rad, outside its limits ["),
+                && refused.contains(" at -1 rad, outside its limits ["),
             "{refused}"
         );
 
