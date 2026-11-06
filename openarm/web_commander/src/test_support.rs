@@ -41,7 +41,7 @@ pub fn governor(collision_enabled: bool) -> GovernorSettings {
         collision_enabled,
         d_stop: 0.005,
         d_safe: 0.02,
-        max_ee_velocity_m_s: 0.25,
+        max_stream_ee_velocity_m_s: 0.25,
         max_gripper_rate_frac_s: 6.0,
     }
 }

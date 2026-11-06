@@ -20,15 +20,12 @@ class Config:
     upstream_mode: UpstreamMode
     control_rate_hz: int
     # Sizes action trajectories (postures, joint moves, joint paths,
-    # move_arm) and bounds the machine-generated pose stream's per-tick joint
-    # steps. Never shapes the joints-led teleop stream, which only the EE
-    # governor may limit.
+    # move_arm) and bounds every stream's per-tick joint steps.
     max_joint_velocity_rad_s: tuple[float, ...]
-    # Times joint paths with the velocity caps: the peak acceleration
+    # Times action trajectories with the velocity caps: the peak acceleration
     # (rad/s²) of each joint.
     max_joint_acceleration_rad_s2: tuple[float, ...]
-    max_ee_velocity_m_s: float
-    max_ee_angular_velocity_rad_s: float
+    max_stream_ee_velocity_m_s: float
     max_gripper_rate_frac_s: float
     # The farthest (rad) any measured joint may stand from a joint path's
     # expected start as the path starts, and, clamped into the joint limits,
@@ -56,10 +53,7 @@ def parse(params) -> Config:
         control_rate_hz=control_rate_hz,
         max_joint_velocity_rad_s=velocity_caps,
         max_joint_acceleration_rad_s2=acceleration_caps,
-        max_ee_velocity_m_s=require_positive("max_ee_velocity_m_s", params.max_ee_velocity_m_s),
-        max_ee_angular_velocity_rad_s=require_positive(
-            "max_ee_angular_velocity_rad_s", params.max_ee_angular_velocity_rad_s
-        ),
+        max_stream_ee_velocity_m_s=require_positive("max_stream_ee_velocity_m_s", params.max_stream_ee_velocity_m_s),
         max_gripper_rate_frac_s=require_positive(
             "max_gripper_rate_frac_s", params.max_gripper_rate_frac_s
         ),

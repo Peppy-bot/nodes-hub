@@ -93,8 +93,7 @@ def make_parameters(**overrides) -> Parameters:
         "max_joint_acceleration_rad_s2_3": MAX_JOINT_ACCELERATION_RAD_S2,
         "max_joint_acceleration_rad_s2_4": MAX_JOINT_ACCELERATION_RAD_S2,
         "max_joint_acceleration_rad_s2_5": MAX_JOINT_ACCELERATION_RAD_S2,
-        "max_ee_velocity_m_s": 1e9,
-        "max_ee_angular_velocity_rad_s": 1e9,
+        "max_stream_ee_velocity_m_s": 1e9,
         "max_gripper_rate_frac_s": 8.0,
         "start_tolerance_rad": START_TOLERANCE_RAD,
     }
@@ -137,7 +136,8 @@ async def feeding_measured(h, positions=MEASURED, opening=0.0) -> asyncio.Task:
 
 
 async def test_the_joints_stream_passes_through_unchanged_and_relays_state():
-    async with harness.start(setup, parameters=make_parameters()) as h:
+    transparent = {f"max_joint_velocity_rad_s_{joint}": 1e9 for joint in range(1, 6)}
+    async with harness.start(setup, parameters=make_parameters(**transparent)) as h:
         feeder = asyncio.create_task(keep_measured_fresh(h))
         try:
             # The relay carries the measured state back up the leader slot.
@@ -153,8 +153,9 @@ async def test_the_joints_stream_passes_through_unchanged_and_relays_state():
                 first = await asyncio.wait_for(
                     h.mocks.pairings.arm.joint_setpoints.next(), TIMEOUT_S
                 )
-                # Pass-through: the leader's exact values go downstream, no
-                # clamp and no chase (the EE caps are transparent here).
+                # Pass-through: the leader's exact values go downstream (the
+                # target lies inside the joint limits, and the joint velocity
+                # limits and the EE cap are transparent here).
                 assert first.positions == pytest.approx(target)
                 assert first.efforts == []
                 # And the downstream stamp is the leader's capture stamp,
@@ -633,8 +634,6 @@ async def test_malformed_pose_goal_is_refused_and_the_server_survives():
                     position=[0.1, 0.0, 0.2],
                     orientation=[0.0, 0.0, 0.0, 0.0],
                     duration_s=0.0,
-                    plan_position_tolerance_m=0.01,
-                    plan_orientation_tolerance_rad=0.5,
                     settle_position_tolerance_m=0.01,
                     settle_orientation_tolerance_rad=0.5,
                     settle_timeout_s=2.0,
@@ -653,8 +652,6 @@ async def test_malformed_pose_goal_is_refused_and_the_server_survives():
                     position=[0.0, 0.0, 0.42],
                     orientation=[0.0, 0.0, 0.0, 1.0],
                     duration_s=0.0,
-                    plan_position_tolerance_m=0.01,
-                    plan_orientation_tolerance_rad=0.5,
                     settle_position_tolerance_m=0.01,
                     settle_orientation_tolerance_rad=0.5,
                     settle_timeout_s=2.0,
@@ -920,8 +917,6 @@ async def test_the_plan_check_answers_without_moving():
                 position=[position[0], position[1], position[2] + 0.02],
                 orientation=list(orientation),
                 duration_s=0.0,
-                plan_position_tolerance_m=0.01,
-                plan_orientation_tolerance_rad=0.5,
             )
             answer = await check_arm_move_fx.poll(h, check, TIMEOUT_S)
             assert (answer.reachable, answer.reason) == (True, "")
@@ -932,12 +927,10 @@ async def test_the_plan_check_answers_without_moving():
                 position=[position[0] + 2.0, position[1], position[2]],
                 orientation=list(orientation),
                 duration_s=0.0,
-                plan_position_tolerance_m=0.01,
-                plan_orientation_tolerance_rad=0.5,
             )
             answer = await check_arm_move_fx.poll(h, far, TIMEOUT_S)
             assert not answer.reachable
-            assert answer.reason.startswith("goal pose not planned within ")
+            assert answer.reason.startswith("goal pose not planned")
             assert answer.duration_s == 0.0
 
             # Nothing streamed downstream: the checks moved nothing.
@@ -951,8 +944,6 @@ async def test_the_plan_check_answers_without_moving():
                 position=list(position),
                 orientation=list(orientation),
                 duration_s=0.0,
-                plan_position_tolerance_m=0.01,
-                plan_orientation_tolerance_rad=0.5,
             )
             with pytest.raises(check_arm_move_fx.Failure) as raised:
                 await check_arm_move_fx.poll(h, unknown, TIMEOUT_S)
@@ -976,8 +967,6 @@ async def test_a_move_arm_goal_with_no_plan_fails_with_unreachable():
                     position=[position[0] + 2.0, position[1], position[2]],
                     orientation=list(orientation),
                     duration_s=0.0,
-                    plan_position_tolerance_m=0.01,
-                    plan_orientation_tolerance_rad=0.5,
                     settle_position_tolerance_m=0.01,
                     settle_orientation_tolerance_rad=0.5,
                     settle_timeout_s=2.0,
@@ -989,7 +978,7 @@ async def test_a_move_arm_goal_with_no_plan_fails_with_unreachable():
             assert result.status == move_arm_fx.ResultStatus.FAILED
             assert result.data is None
             assert result.failure.kind is move_arm_fx.FailureKind.UNREACHABLE
-            assert result.failure.message.startswith("goal pose not planned within ")
+            assert result.failure.message.startswith("goal pose not planned")
         finally:
             feeder.cancel()
 
@@ -1017,8 +1006,6 @@ async def test_a_streaming_leader_refuses_goals_and_checks_with_leader_streaming
                 position=list(position),
                 orientation=list(orientation),
                 duration_s=0.0,
-                plan_position_tolerance_m=0.01,
-                plan_orientation_tolerance_rad=0.5,
             )
             with pytest.raises(check_arm_move_fx.Failure) as raised:
                 await check_arm_move_fx.poll(h, check, TIMEOUT_S)

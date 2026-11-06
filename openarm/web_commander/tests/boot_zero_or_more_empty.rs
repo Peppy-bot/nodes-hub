@@ -38,7 +38,7 @@ async fn boots_clean_with_empty_zero_or_more_slots() -> peppygen::Result<()> {
     assert!(governor.collision_governor_enabled);
     assert!((governor.d_stop - 0.005).abs() < 1e-12);
     assert!((governor.d_safe - 0.02).abs() < 1e-12);
-    assert!((governor.max_ee_velocity_m_s - 0.5).abs() < 1e-12);
+    assert!((governor.max_stream_ee_velocity_m_s - 0.5).abs() < 1e-12);
 
     // With every deadman off the command frame holds None per side, so the
     // pairing setpoint streams must publish nothing. Bounded absence check:

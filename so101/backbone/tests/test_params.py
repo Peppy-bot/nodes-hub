@@ -19,8 +19,7 @@ GOOD = {
     "max_joint_acceleration_rad_s2_3": 38.96,
     "max_joint_acceleration_rad_s2_4": 38.96,
     "max_joint_acceleration_rad_s2_5": 38.96,
-    "max_ee_velocity_m_s": 1.5,
-    "max_ee_angular_velocity_rad_s": 8.0,
+    "max_stream_ee_velocity_m_s": 1.5,
     "max_gripper_rate_frac_s": 10.0,
     "start_tolerance_rad": 0.05,
 }
@@ -53,8 +52,7 @@ def test_pose_mode_parses():
         ("control_rate_hz", 0),
         ("max_joint_velocity_rad_s_3", 0.0),
         ("max_gripper_rate_frac_s", -1.0),
-        ("max_ee_velocity_m_s", 0.0),
-        ("max_ee_angular_velocity_rad_s", -2.0),
+        ("max_stream_ee_velocity_m_s", 0.0),
         # The ceiling, not just the floor: one past BUS_MAX_RATE_HZ, so raising
         # the bound without revisiting this row cannot pass unnoticed.
         ("control_rate_hz", BUS_MAX_RATE_HZ + 1),

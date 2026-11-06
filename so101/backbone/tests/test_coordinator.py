@@ -1,9 +1,13 @@
 import math
+import random
 import time
 
 import pytest
-from conftest import MEASURED, gripper_step, make_coordinator
-from control_core_py.minimum_jerk import plan
+from conftest import MEASURED, FakeKinematics, gripper_step, make_coordinator
+from path_timing_py import JointTrajectory
+from so101_description import limits as limits_mod
+from so101_description.kinematics import Kinematics
+from so101_description.model import KINEMATICS_URDF_PATH
 
 from so101_backbone.coordinator import (
     FOLLOWER_SILENT,
@@ -19,6 +23,12 @@ from so101_backbone.coordinator import (
 )
 from so101_backbone.failures import FailureKind
 from so101_backbone.params import UpstreamMode
+
+
+def plan(start, end, duration_s, velocity_caps):
+    """The trajectory of a joint move, its acceleration out of the way."""
+    return JointTrajectory.through((start, end), velocity_caps, (1e6,) * 5, duration_s)
+
 
 FAR_TARGET = (1.0, 1.1, 1.2, 1.3, 1.4)
 
@@ -41,8 +51,8 @@ def test_stream_passes_the_leader_target_through_unmodified(fake_kinematics):
     c = make_coordinator(fake_kinematics)
     c.measured_joints.set(MEASURED)
     c.leader_joints.set(FAR_TARGET)
-    # Under the caps the governed step IS the leader's tuple, the same
-    # object: no clamp, no walk, no arithmetic residue.
+    # Under the limits the governed step IS the leader's tuple, the same
+    # object: no walk, no arithmetic residue.
     assert c.arm_tick(time.monotonic()) is FAR_TARGET
 
 
@@ -381,7 +391,9 @@ def test_pose_mode_ik_output_is_rate_stepped_per_joint(fake_kinematics):
     # configurations tick to tick; the stream advances at most one tick's
     # per-joint velocity budget from the anchor toward each solution, and a
     # solution within one step lands exactly.
-    c = make_coordinator(fake_kinematics, upstream_mode=UpstreamMode.POSE)
+    c = make_coordinator(
+        fake_kinematics, upstream_mode=UpstreamMode.POSE, max_joint_velocity_rad_s=(2.0,) * 5
+    )
     c.measured_joints.set(MEASURED)
     c.leader_pose.set(((0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0)))
     # The scripted solution sits 0.1 above MEASURED per joint; 2.0 rad/s at
@@ -400,15 +412,49 @@ def test_pose_mode_ik_output_is_rate_stepped_per_joint(fake_kinematics):
     assert value == fake_kinematics.solution
 
 
-def test_streamed_targets_are_not_limit_clamped(fake_kinematics):
-    # The reference teleop forwards the leader verbatim; model limits guard
-    # action targets and IK, never the stream. The servo EPROM limits are
-    # the physical travel guard.
+def test_a_joint_stream_is_clamped_into_the_joint_limits(fake_kinematics):
     c = make_coordinator(fake_kinematics)
     c.measured_joints.set((3.0,) * 5)
-    beyond = (9.0,) * 5  # far beyond the 3.1 rad model limit
-    c.leader_joints.set(beyond)
-    assert c.arm_tick(time.monotonic()) is beyond
+    c.leader_joints.set((9.0,) * 5)  # far beyond the 3.1 rad model limit
+    assert c.arm_tick(time.monotonic()) == (3.1,) * 5
+
+
+def test_a_joint_stream_steps_at_the_joint_velocity_limits(fake_kinematics):
+    # 1 rad/s at the 100 Hz of these tests is 0.01 rad a tick.
+    c = make_coordinator(fake_kinematics, max_joint_velocity_rad_s=(1.0,) * 5)
+    c.measured_joints.set((0.0,) * 5)
+    c.leader_joints.set((0.5, -0.5, 0.0, 0.5, -0.5))
+    assert c.arm_tick(time.monotonic()) == pytest.approx((0.01, -0.01, 0.0, 0.01, -0.01))
+
+
+def test_a_joint_stream_within_the_limits_goes_downstream_as_the_same_object(fake_kinematics):
+    c = make_coordinator(fake_kinematics, max_joint_velocity_rad_s=(1.0,) * 5)
+    c.measured_joints.set((0.0,) * 5)
+    within = (0.005, -0.005, 0.0, 0.005, -0.005)
+    c.leader_joints.set(within)
+    assert c.arm_tick(time.monotonic()) is within
+
+
+def test_a_pose_stream_steps_at_the_same_joint_velocity_limits():
+    kinematics = FakeKinematics()
+    c = make_coordinator(
+        kinematics,
+        upstream_mode=UpstreamMode.POSE,
+        max_joint_velocity_rad_s=(1.0,) * 5,
+    )
+    c.measured_joints.set((0.0,) * 5)
+    kinematics.solution = (0.5,) * 5
+    c.leader_pose.set(((0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0)))
+    assert c.arm_tick(time.monotonic()) == pytest.approx((0.01,) * 5)
+
+
+def test_a_pose_stream_is_clamped_into_the_joint_limits():
+    kinematics = FakeKinematics()
+    c = make_coordinator(kinematics, upstream_mode=UpstreamMode.POSE)
+    c.measured_joints.set((3.0,) * 5)
+    kinematics.solution = (9.0,) * 5
+    c.leader_pose.set(((0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0)))
+    assert c.arm_tick(time.monotonic()) == (3.1,) * 5
 
 
 def test_release_resets_anchors_to_measured(fake_kinematics):
@@ -596,8 +642,6 @@ def test_streamed_gripper_publish_failure_resets_the_anchor(fake_kinematics):
 
 
 def test_admission_during_a_doomed_publish_anchors_on_delivered_state(fake_kinematics):
-    from control_core_py.minimum_jerk import plan as make_profile
-
     c = make_coordinator(fake_kinematics)
     c.measured_joints.set(MEASURED)
     c.leader_joints.set(FAR_TARGET)
@@ -608,14 +652,12 @@ def test_admission_during_a_doomed_publish_anchors_on_delivered_state(fake_kinem
     # measured position), never the undelivered step.
     anchor = c.arm_anchor()
     assert anchor == MEASURED
-    profile = make_profile(anchor, FAR_TARGET, 1.0, (100.0,) * 5)
+    profile = plan(anchor, FAR_TARGET, 1.0, (100.0,) * 5)
     assert profile.start == MEASURED
     c.arm_published(False, None)
 
 
 def test_a_stop_cuts_every_installed_plan_with_its_message_and_names_the_limbs(fake_kinematics):
-    from control_core_py.minimum_jerk import plan as make_profile
-
     c = make_coordinator(fake_kinematics)
     c.measured_joints.set(MEASURED)
     c.measured_gripper.set(0.0)
@@ -623,7 +665,7 @@ def test_a_stop_cuts_every_installed_plan_with_its_message_and_names_the_limbs(f
     assert (c.stop_count, c.last_stop) == (1, "stopped: nothing yet")
 
     assert c.try_claim_arm() and c.try_claim_gripper()
-    arm_plan = c.adopt_arm_plan(make_profile(MEASURED, FAR_TARGET, 1.0, (100.0,) * 5), PostureEnd())
+    arm_plan = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 1.0, (100.0,) * 5), PostureEnd())
     gripper_plan = adopt_gripper(c, 1.0)
     now = time.monotonic()
     sample = c.arm_tick(now)
@@ -742,3 +784,56 @@ def test_a_pose_settle_judges_the_measured_grasp_point_against_the_commanded_pos
     assert turned.shortfall(fake_kinematics.solution, None, fake_kinematics) == (
         "still 0.0 mm / 0.77 rad from the target"
     )
+    # A goal that names no orientation is judged against where its plan ends.
+    alone = PoseSettle(
+        position=goal_position,
+        orientation=None,
+        position_tolerance_m=0.01,
+        orientation_tolerance_rad=0.2,
+        timeout_s=2.0,
+    )
+    assert alone.shortfall(fake_kinematics.solution, fake_kinematics.solution, fake_kinematics) is None
+    assert alone.shortfall((0.0,) * 5, fake_kinematics.solution, fake_kinematics) == (
+        "still 16.3 mm / 0.00 rad from the target"
+    )
+
+
+@pytest.mark.parametrize("mode", [UpstreamMode.JOINTS, UpstreamMode.POSE])
+@pytest.mark.parametrize("seed", range(8))
+def test_a_stream_holds_the_linear_cap_and_the_velocity_limit_on_the_real_arm(
+    mode, seed, follower_never_stale
+):
+    # Both kinds of stream, engaged far from the arm: the grasp point, read by forward
+    # kinematics of what each tick commands, holds the stream cap, and every joint its
+    # velocity limit. The margin covers one tick's curvature, the arc the tip travels off
+    # the chord the cap sized.
+    rng = random.Random(seed)
+    kinematics = Kinematics(KINEMATICS_URDF_PATH)
+    limits = limits_mod.from_urdf(KINEMATICS_URDF_PATH)
+    velocity, cap, dt = (10.0,) * 5, 0.25, 0.01
+    c = make_coordinator(
+        kinematics,
+        limits,
+        upstream_mode=mode,
+        max_joint_velocity_rad_s=velocity,
+        max_stream_ee_velocity_m_s=cap,
+    )
+    q = tuple(lo + (hi - lo) * rng.uniform(0.3, 0.7) for lo, hi in zip(limits.lower, limits.upper))
+    far = tuple(lo + (hi - lo) * rng.uniform(0.05, 0.95) for lo, hi in zip(limits.lower, limits.upper))
+    far_pose = kinematics.forward_kinematics(far)
+    fastest = 0.0
+    for _ in range(300):
+        if mode is UpstreamMode.JOINTS:
+            c.leader_joints.set(far)
+        else:
+            c.leader_pose.set(far_pose)
+        c.measured_joints.set(q)
+        commanded = c.arm_tick(time.monotonic())
+        for joint, (a, b) in enumerate(zip(q, commanded, strict=True)):
+            assert abs(b - a) <= velocity[joint] * dt * (1.0 + 1e-9), f"joint {joint}"
+            assert limits.lower[joint] - 1e-9 <= b <= limits.upper[joint] + 1e-9, f"joint {joint}"
+        speed = math.dist(kinematics.forward_kinematics(q)[0], kinematics.forward_kinematics(commanded)[0]) / dt
+        fastest = max(fastest, speed)
+        q = commanded
+    assert fastest <= cap * 1.05, f"the grasp point reached {fastest} m/s"
+    assert fastest >= cap * 0.5, f"the stream never pressed against the cap: {fastest} m/s"

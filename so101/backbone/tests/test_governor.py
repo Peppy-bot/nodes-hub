@@ -32,8 +32,8 @@ class LinearKinematics:
         )
 
 
-def make_governor(max_linear=1.0, max_angular=10.0, period_s=0.1):
-    return EEGovernor(LinearKinematics(), max_linear, max_angular, period_s)
+def make_governor(max_linear=1.0, period_s=0.1):
+    return EEGovernor(LinearKinematics(), max_linear, period_s)
 
 
 def test_within_caps_returns_the_target_object():
@@ -59,22 +59,11 @@ def test_linear_step_beyond_the_cap_is_scaled_to_cap_speed():
     assert governed[1:] == (0.0, 0.0, 0.0, 0.0)
 
 
-def test_angular_step_beyond_the_cap_is_scaled():
-    governor = make_governor(max_linear=1e9, max_angular=1.0, period_s=0.1)
+def test_a_step_that_only_turns_the_tool_passes_through():
+    governor = make_governor(max_linear=1.0, period_s=0.1)
     current = (0.0, 0.0, 0.0, 0.0, 0.0)
-    target = (0.0, 0.0, 0.0, 1.0, 0.0)  # 10 rad/s about z
-    governed = governor.govern(current, target)
-    assert governed[3] == pytest.approx(0.1)
-
-
-def test_tightest_cap_wins():
-    governor = make_governor(max_linear=1.0, max_angular=1.0, period_s=0.1)
-    current = (0.0, 0.0, 0.0, 0.0, 0.0)
-    # Linear asks for scale 0.5, angular for scale 0.1: angular binds.
-    target = (0.2, 0.0, 0.0, 1.0, 0.0)
-    governed = governor.govern(current, target)
-    assert governed[0] == pytest.approx(0.02)
-    assert governed[3] == pytest.approx(0.1)
+    target = (0.0, 0.0, 0.0, 1.0, 0.0)  # 10 rad/s about z, no travel
+    assert governor.govern(current, target) is target
 
 
 def test_convergence_over_ticks_reaches_the_target_exactly():
@@ -86,6 +75,29 @@ def test_convergence_over_ticks_reaches_the_target_exactly():
         if current is target:
             break
     assert current is target
+
+
+def test_a_step_only_its_midpoint_reads_as_moving_the_hand_is_scaled_to_cap_speed():
+    # A step that barely moves the hand at its start moves it at its midpoint, where
+    # the curve of the chain has turned the joint's sweep toward it.
+    class CurvingKinematics(LinearKinematics):
+        def jacobian(self, positions_rad):
+            at_start = positions_rad[0] == 0.0
+            return np.zeros((6, 5)) if at_start else super().jacobian(positions_rad)
+
+    governor = EEGovernor(CurvingKinematics(), 1.0, 0.1)
+    governed = governor.govern((0.0,) * 5, (1.0, 0.0, 0.0, 0.0, 0.0))
+    assert governed[0] == pytest.approx(0.1)
+
+
+def test_a_non_finite_midpoint_basis_holds_the_arm():
+    class BrokenKinematics(LinearKinematics):
+        def jacobian(self, positions_rad):
+            at_start = positions_rad[0] == 0.0
+            return super().jacobian(positions_rad) if at_start else np.full((6, 5), np.nan)
+
+    current = (0.0,) * 5
+    assert EEGovernor(BrokenKinematics(), 1.0, 0.1).govern(current, (0.01, 0.0, 0.0, 0.0, 0.0)) is current
 
 
 def test_rate_step_lands_exactly_and_caps_beyond():
@@ -133,9 +145,7 @@ def test_a_curved_path_is_capped_on_speed_not_on_the_endpoint_chord():
     kinematics = PlanarArmKinematics()
     cap_m_s, period_s = 1.0, 0.1
     cap = cap_m_s * period_s
-    governor = EEGovernor(
-        kinematics, max_linear_m_s=cap_m_s, max_angular_rad_s=1e9, period_s=period_s
-    )
+    governor = EEGovernor(kinematics, max_linear_m_s=cap_m_s, period_s=period_s)
     # Half a turn of the shoulder: endpoints near each other, path a wide arc.
     current = (0.0, 2.4, 0.0, 0.0, 0.0)
     target = (math.pi, 2.4, 0.0, 0.0, 0.0)

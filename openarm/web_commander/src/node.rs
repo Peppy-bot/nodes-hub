@@ -61,7 +61,7 @@ pub enum NodeError {
     #[error("parameter http_port must name a port to serve on, not 0")]
     HttpPort,
 
-    #[error("parameter max_ee_velocity_m_s")]
+    #[error("parameter max_stream_ee_velocity_m_s")]
     EeVelocity(#[source] NotPositiveFinite),
 
     #[error("parameter joint_jog_acceleration_rad_s2")]
@@ -144,7 +144,7 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     // node parameters, kept in step with the backbone's, so the real arm starts
     // conservative (tight band, slow cap) and the sim launchers start fast.
     let max_ee_velocity =
-        PositiveFinite::parse(params.max_ee_velocity_m_s).map_err(NodeError::EeVelocity)?;
+        PositiveFinite::parse(params.max_stream_ee_velocity_m_s).map_err(NodeError::EeVelocity)?;
     let jog_acceleration = PositiveFinite::parse(params.joint_jog_acceleration_rad_s2)
         .map_err(NodeError::JogAcceleration)?;
     let jog_velocity =
@@ -167,7 +167,7 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
             collision_enabled: params.collision_governor_enabled,
             d_stop: params.d_stop,
             d_safe: params.d_safe,
-            max_ee_velocity_m_s: max_ee_velocity.get(),
+            max_stream_ee_velocity_m_s: max_ee_velocity.get(),
             max_gripper_rate_frac_s: gripper_rate.get(),
         },
         pose::JogCaps {
@@ -311,7 +311,7 @@ mod tests {
             http_port: 8765,
             joint_jog_acceleration_rad_s2: 10.0,
             joint_jog_velocity_rad_s: 1.0,
-            max_ee_velocity_m_s: 0.5,
+            max_stream_ee_velocity_m_s: 0.5,
             max_gripper_rate_frac_s: 6.0,
         }
     }

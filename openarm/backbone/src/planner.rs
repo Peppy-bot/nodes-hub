@@ -11,10 +11,9 @@
 //! under throttling - when the governor holds the setpoint, the chase simply
 //! catches up at the velocity limit once clear, with no jump. Follow's target
 //! is the leading node's command (a streamed hand's end-effector speed is
-//! capped by the governor's EE-speed limiter, fed by the Jacobian this
-//! planner hands out); a joint move's target is its trajectory's sample; a
-//! Cartesian move's is the IK of the line's pose sample, or the servo path's
-//! own sample.
+//! capped by the governor's EE-speed limiter, fed by the Jacobians this
+//! planner hands out); a joint move's target is its trajectory's sample, and a
+//! Cartesian move's is the sample of the trajectory through its line's walk.
 //!
 //! An execute_joint_path goal moves the arms it names along one path through
 //! both arms' joints, each arm's planner following its arm's share of it
@@ -26,30 +25,28 @@ use std::time::{Duration, Instant};
 
 use peppygen::exposed_actions::limb_motion::{move_arm, move_arm_joints};
 
-use control_core::chase::{chase_along, chase_step, exceeds_rate};
-use control_core::path_timing::JointTrajectory;
+use control_core::chase::{chase_along, chase_step};
+use control_core::path_timing::{JointTrajectory, distinct_joint_waypoints};
 use control_core::positive_finite::PositiveFinite;
 use control_core::timing::MotionClock;
 use openarm_description::{ARM_DOF, Side};
-use srs_model::chain_kinematics::{
-    EeCaps, JointSmoothing, ServoPlan, ServoTrajectory, Smoother, clamp_into, rate_step_toward,
-};
-use srs_model::nalgebra::Isometry3;
-use srs_model::{
-    Arm, CartesianPlan, Jacobian, JointVec, Limit, LineCursor, LinePlan, LineTrajectory,
-    PlanLimits, PlanRejection, plan_cartesian,
-};
+use srs_model::chain_kinematics::{EeCaps, StepLimits, clamp_into, rate_step_toward};
+use srs_model::nalgebra::{Isometry3, Translation3, UnitQuaternion};
+use srs_model::{Arm, JointVec, Limit, plan_line};
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
 use crate::failure::{Failure, FailureKind};
-use crate::governor::PathArms;
+use crate::governor::{HandBasis, PathArms};
 use crate::move_slot::{ARM_BUSY, MoveSlot, SlotRelease};
 use crate::settle::{PoseTolerance, Settle, Verdict, joint_shortfall, pose_shortfall, verdict};
 use crate::types::world_pose_arrays;
 use crate::upstream::Upstream;
 
 mod path;
+mod stream_smoothing;
+
+use stream_smoothing::StreamSmoothing;
 
 pub use path::{
     JointPath, PathGoal, PathGuard, PathJudgment, PathOrder, Resumed, ShareReply, ShareReport,
@@ -58,10 +55,17 @@ pub use path::{
 #[cfg(test)]
 pub(crate) use path::{OTHER_SHARE_FAILED, PathPlan};
 
-/// Slack the runtime per-tick velocity guard of a line allows over the planned
-/// limit before aborting the move: the plan sized the line at its own
-/// resolution, and the ticks that run it land where the clock puts them.
-const VELOCITY_GUARD_MARGIN: f64 = 1.5;
+/// Why a Cartesian move has no plan: the message of a `move_arm` goal's
+/// `unreachable` failure, and the reason `check_arm_move` answers.
+const NOT_PLANNED: &str = "goal pose not planned: no straight line to it tracks inside the joint \
+     limits; plan a path with plan_joint_path and run it with execute_joint_path";
+
+/// What a caller does about a move the joint limits cannot run within the longest
+/// a move may take.
+const SPLIT_INTO_SHORTER_MOVES: &str = "split it into shorter moves";
+/// The same of a posture move, which a caller cannot split.
+const RAISE_THE_JOINT_LIMITS: &str =
+    "raise max_joint_velocity_rad_s_N or max_joint_acceleration_rad_s2_N";
 
 /// The failure of a goal that reaches the planner while another move is in
 /// flight on its arm.
@@ -76,11 +80,11 @@ const POSTURE_CANCELLED: &str = "its posture goal was cancelled";
 #[derive(Clone)]
 pub struct PlanConfig {
     pub cycle_period: Duration,
-    /// The servo's command smoother, built for `cycle_period` at setup.
-    pub smoothing: control_core::filters::ButterworthFilter,
     pub max_joint_velocity_rad_s: JointVec,
     pub max_joint_acceleration_rad_s2: JointVec,
-    pub ee: EeCaps,
+    /// The operator's cap on a streamed hand's speed (m/s), which a streamed
+    /// pose steps at.
+    pub stream_ee_velocity_m_s: f64,
     pub limits: [Limit; ARM_DOF],
     /// How far (rad, each joint) the measured arm may stand from a joint
     /// path's start: from its expected start when the coordinator takes the
@@ -256,8 +260,9 @@ impl ReadyReply {
 #[derive(Clone, Copy, Debug)]
 pub struct ArmMoveRequest {
     pub side: Side,
-    pub target: Isometry3<f64>,
-    pub tolerance: PoseTolerance,
+    pub position: Translation3<f64>,
+    /// `None` asks for the position alone, at the turn the hand holds.
+    pub orientation: Option<UnitQuaternion<f64>>,
     pub duration: Duration,
 }
 
@@ -318,8 +323,8 @@ enum Mode {
     Follow,
     /// Tracking a joint trajectory for an accepted move_arm_joints goal.
     JointMove(JointMove),
-    /// Tracking a Cartesian plan for an accepted move_arm goal: a line solved
-    /// by IK each tick, or the servo's path played.
+    /// Tracking the trajectory through a straight line's walk for an accepted
+    /// move_arm goal.
     CartesianMove(CartesianMove),
     /// The arm's share of an execute_joint_path goal's path.
     PathShare(path::PathShare),
@@ -332,56 +337,17 @@ struct JointMove {
 }
 
 struct CartesianMove {
-    path: MovePath,
+    traj: JointTrajectory<ARM_DOF>,
     ctx: Box<move_arm::GoalContext>,
     /// The commanded pose the settle judges the measured grasp point against.
     target: Isometry3<f64>,
     settle: Settle<PoseTolerance>,
-    // Last commanded joint target: held on cancel/failure so the arm never snaps.
-    prev_q_des: JointVec,
     _move_slot: SlotRelease,
 }
 
-/// A line-tracking move's cursor: the trajectory, the walk along it the plan
-/// validated, and when the last tick sampled it.
-struct LineTrack {
-    traj: LineTrajectory,
-    cursor: LineCursor,
-    prev_sample_at: Instant,
-}
-
-/// How an admitted move_arm goal executes, per its [`CartesianPlan`]: track the
-/// straight line (solving IK each tick), or play the guarded servo's path when
-/// no continuous joint path tracks the line. A line's track, the trajectory
-/// with the IK cursor and the guard's clock, is boxed for its size.
-enum MovePath {
-    Line(Box<LineTrack>),
-    Servo(ServoTrajectory<ARM_DOF>),
-}
-
-impl MovePath {
-    fn clock(&self) -> &MotionClock {
-        match self {
-            Self::Line(line) => line.traj.clock(),
-            Self::Servo(servo) => servo.clock(),
-        }
-    }
-}
-
-/// One tick of a Cartesian path.
-enum PathStep {
-    /// The joint target for this tick, and whether the path has finished.
-    To { q_des: JointVec, complete: bool },
-    /// The path cannot continue; the move fails with `attempt_failed` and
-    /// this message.
-    Failed(String),
-}
-
 /// Where this tick's joint target came from. Only a streamed target carries a
-/// hand basis out for the governor's EE-speed limiter: a planned move was
-/// rolled out against that cap up front and tracks its own schedule, so
-/// capping it again would stretch it past the duration its budget was sized
-/// from.
+/// hand basis out for the governor's EE-speed limiter: the cap covers streams,
+/// and a planned move tracks the schedule the joint limits timed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Origin {
     Streamed,
@@ -392,14 +358,14 @@ enum Origin {
 }
 
 /// One planner tick's product: the velocity-limited candidate setpoint, and
-/// the end-effector Jacobian at the measured pose when the target came from
-/// the operator's stream (the governor's EE-speed limiter caps only those).
+/// the end-effector Jacobians of the step when the target came from the operator's
+/// stream (the governor's EE-speed limiter caps only those).
 /// A tick of the arm's share of a path, which holds the arm while the path is
 /// judged and steps it along the path once it runs, names the path's arms,
 /// which the governor scales along the step and never turns off it.
 pub struct Tick {
     pub candidate: JointVec,
-    pub streamed_hand: Option<Jacobian>,
+    pub streamed_hand: Option<HandBasis>,
     pub on_path: Option<PathArms>,
 }
 
@@ -432,10 +398,9 @@ pub struct Planner {
     /// The step a share of a path proposed this tick, which the commit of the
     /// governed setpoint plays the path's clock on by.
     proposed: Option<path::ProposedStep>,
-    /// The smoother a streamed pose's steps pass through, one Butterworth per
-    /// joint as a planned servo move's; reset whenever the stream is not a
-    /// pose, so a resumed stream seeds on the setpoint.
-    stream_smoothing: JointSmoothing<ARM_DOF>,
+    /// The smoother a streamed pose's steps pass through; reset whenever the
+    /// stream is not a pose, so a resumed stream seeds on the setpoint.
+    stream_smoothing: StreamSmoothing,
 }
 
 impl Planner {
@@ -446,7 +411,7 @@ impl Planner {
         Self {
             side,
             model,
-            stream_smoothing: JointSmoothing::new(cfg.smoothing),
+            stream_smoothing: StreamSmoothing::new(cfg.cycle_period),
             cfg,
             mode: Mode::Follow,
             setpoint: [0.0; ARM_DOF],
@@ -494,29 +459,23 @@ impl Planner {
         self.model.world_ee_pose(q)
     }
 
-    /// Retune the end-effector speed cap at runtime (the commander's control).
-    /// This copy sizes planned moves at admission, the servo's rollout among
-    /// them, and steps streamed poses; a streamed joint command is capped
-    /// only by the governor's EE-speed limiter, retuned from the same control
-    /// message. The live control rescales the linear cap only: the linear cap
-    /// is enforced twice, by this servo and by the governor's EE-speed limiter,
-    /// so it binds on any streamed hand, while the angular cap is enforced only
-    /// here and a joint stream never reaches this arm of `follow_target`. A
-    /// live angular control would read as doing nothing on a joint stream, so
-    /// it stays a launch parameter until the governor limits turn rate too.
-    pub fn set_max_ee_velocity(&mut self, v: f64) {
+    /// Retune the stream's end-effector speed cap at runtime (the commander's
+    /// control). This copy steps streamed poses; a streamed joint command is
+    /// capped only by the governor's EE-speed limiter, retuned from the same
+    /// control message.
+    pub fn set_max_stream_ee_velocity(&mut self, v: f64) {
         if let Ok(cap) = PositiveFinite::parse(v) {
-            self.cfg.ee.linear_m_s = cap.get();
+            self.cfg.stream_ee_velocity_m_s = cap.get();
         }
     }
 
     /// Produce this tick's candidate setpoint: admit a pending goal, advance the
     /// active mode to a joint target, then chase it under the velocity limits.
     ///
-    /// A streamed tick also carries the arm's end-effector Jacobian at the
-    /// measured pose: the governor's EE-speed limiter caps a streamed hand, and
-    /// this is the one place the arm's kinematic model lives. A planned move
-    /// carries `None`, because it was budgeted against the cap at admission.
+    /// A streamed tick also carries the end-effector Jacobians of its step: the
+    /// governor's EE-speed limiter caps a streamed hand, and this is the one place
+    /// the arm's kinematic model lives. A planned move
+    /// carries `None`: it runs on the timing it was admitted with.
     pub async fn tick(
         &mut self,
         measured_q: JointVec,
@@ -559,10 +518,18 @@ impl Planner {
             }
             Origin::Streamed | Origin::PlannedMove => chase_step(&self.setpoint, &target, vmax, dt),
         };
+        let candidate = clamp_into(&self.cfg.limits, &stepped);
         Tick {
-            candidate: clamp_into(&self.cfg.limits, &stepped),
+            candidate,
             streamed_hand: match origin {
-                Origin::Streamed => Some(self.model.at(&measured_q).jacobian()),
+                Origin::Streamed => {
+                    let midpoint: JointVec =
+                        std::array::from_fn(|i| 0.5 * (self.setpoint[i] + candidate[i]));
+                    Some(HandBasis {
+                        start: self.model.at(&self.setpoint).jacobian(),
+                        midpoint: self.model.at(&midpoint).jacobian(),
+                    })
+                }
                 Origin::PlannedMove | Origin::OnPath(_) => None,
             },
             on_path: match origin {
@@ -604,7 +571,7 @@ impl Planner {
                 true
             }
             Mode::CartesianMove(m) => {
-                let elapsed = m.path.clock().elapsed_secs(now);
+                let elapsed = m.traj.clock().elapsed_secs(now);
                 self.finish_cartesian(&m.ctx, outcome, measured, elapsed)
                     .await;
                 true
@@ -616,32 +583,24 @@ impl Planner {
         }
     }
 
-    /// Whether a `move_arm` goal to `target` has a plan from the held
-    /// setpoint, without moving: the time the move would take, or the words
-    /// of its `unreachable` failure. Refused while a move executes, as a
-    /// second goal is, with `precondition_failed`; the check claims no slot
-    /// and changes no state.
-    pub fn check_cartesian(
-        &mut self,
-        target: &Isometry3<f64>,
-        tolerance: PoseTolerance,
-        requested: Duration,
-    ) -> Result<PlanCheck, Failure> {
+    /// Whether a `move_arm` goal of `request` has a plan from the held setpoint,
+    /// without moving: the time the move would take, or the words of its failure.
+    /// Refused while a move executes, as a second goal is, with
+    /// `precondition_failed`; the check claims no slot and changes no state.
+    pub fn check_cartesian(&mut self, request: &ArmMoveRequest) -> Result<PlanCheck, Failure> {
         if !matches!(self.mode, Mode::Follow) {
             return Err(Failure::new(FailureKind::PreconditionFailed, ARM_BUSY));
         }
-        let plan = plan_cartesian(
-            &self.model,
-            target,
-            self.setpoint,
-            &self.plan_limits(),
-            requested,
-            tolerance.servo(),
-        );
-        Ok(match plan {
-            Ok(plan) => PlanCheck::Reachable(plan.duration()),
-            Err(rejection) => PlanCheck::Unreachable(not_planned(tolerance, &rejection)),
-        })
+        let Some(walk) = plan_line(&self.model, &self.line_goal(request), self.setpoint) else {
+            return Ok(PlanCheck::Unreachable(NOT_PLANNED.to_string()));
+        };
+        let traj = self.line_trajectory(&walk, request.duration, Instant::now());
+        Ok(
+            match path::check_move_time(&traj, "move", SPLIT_INTO_SHORTER_MOVES) {
+                Ok(()) => PlanCheck::Reachable(traj.clock().duration()),
+                Err(failure) => PlanCheck::Unreachable(failure.message),
+            },
+        )
     }
 
     /// Resolve the Follow target, holding the last governed setpoint when no
@@ -666,14 +625,14 @@ impl Planner {
             Some(Upstream::Pose(pose)) => {
                 let q = self.setpoint;
                 let ee = self.world_ee_pose(&q);
-                let limits = self.plan_limits().servo_at(
-                    STREAMED_POSE_TOLERANCE
-                        .servo()
-                        .expect("the servo's own slack is reachable"),
-                );
+                let limits = StepLimits {
+                    max_joint_velocity: self.cfg.max_joint_velocity_rad_s,
+                    ee: self.stream_step_rates(),
+                    dt_s: self.cfg.cycle_period.as_secs_f64(),
+                };
                 let step = rate_step_toward(self.model.chain(), &q, &ee, pose, &limits);
-                // Smoothed as a planned servo step is, then held to the
-                // velocity limit again: a smoother can overshoot its input.
+                // Smoothed, then held to the velocity limit again: a smoother
+                // can overshoot its input.
                 let smoothed = self.stream_smoothing.smooth(&step);
                 chase_step(&q, &smoothed, &limits.max_joint_velocity, limits.dt_s)
             }
@@ -739,47 +698,31 @@ impl Planner {
         Advance::ends_move(if cancelled { self.setpoint } else { q_des })
     }
 
-    /// One Cartesian tick: advance the move's path (line-tracking IK, or the
-    /// guarded servo) and end the goal on cancel, on the path giving up, or
+    /// One Cartesian tick: sample the trajectory, and end the goal on cancel, or
     /// from the planned end on as the settle judges the measured grasp point
-    /// against the commanded pose; a path at its end keeps giving its last
-    /// target. Any terminal drops `m` (and with it the slot release),
-    /// releasing the move slot.
+    /// against the commanded pose. Any terminal drops `m` (and with it the slot
+    /// release), releasing the move slot.
     async fn advance_cartesian(
         &mut self,
-        mut m: CartesianMove,
+        m: CartesianMove,
         measured_q: JointVec,
         now: Instant,
     ) -> Advance {
-        let elapsed = m.path.clock().elapsed_secs(now);
-        if let Some(cause) = m.ctx.cancel_cause() {
-            let outcome = Outcome::Cancelled(cause.reason().to_string());
-            return self.end_cartesian(&m, measured_q, outcome, elapsed).await;
-        }
-        let stepped = match &mut m.path {
-            MovePath::Line(line) => self.step_line(line, &m.prev_q_des, now),
-            MovePath::Servo(servo) => Self::step_servo(servo, now),
-        };
-        let (q_des, complete) = match stepped {
-            PathStep::To { q_des, complete } => (q_des, complete),
-            PathStep::Failed(message) => {
-                let outcome = Outcome::Failed(Failure::new(FailureKind::AttemptFailed, message));
-                return self.end_cartesian(&m, measured_q, outcome, elapsed).await;
-            }
-        };
-        m.prev_q_des = q_des;
-        let outcome = complete
-            .then(|| {
+        let q_des = m.traj.sample(now);
+        let outcome = match m.ctx.cancel_cause() {
+            Some(cause) => Some(Outcome::Cancelled(cause.reason().to_string())),
+            None if played_out(m.traj.clock(), now) => {
                 let measured = self.model.world_ee_pose(&measured_q);
                 verdict(
                     pose_shortfall(&measured, &m.target, &m.settle.tolerance),
-                    planned_end(m.path.clock()),
+                    planned_end(m.traj.clock()),
                     now,
                     m.settle.timeout,
                 )
                 .map(Outcome::from)
-            })
-            .flatten();
+            }
+            None => None,
+        };
         let Some(outcome) = outcome else {
             return Advance {
                 target: q_des,
@@ -787,74 +730,51 @@ impl Planner {
                 origin: Origin::PlannedMove,
             };
         };
-        self.end_cartesian(&m, measured_q, outcome, elapsed).await
-    }
-
-    /// Track the straight line: walk the line to the blend this tick reached,
-    /// the way the plan walked it (a short move can outpace the plan grid, so
-    /// the walk subdivides it); the last solution is the tick's setpoint.
-    fn step_line(&mut self, line: &mut LineTrack, prev_q_des: &JointVec, now: Instant) -> PathStep {
-        let blend = line.traj.blend(now);
-        let traj = &line.traj;
-        let Some(q_next) = line
-            .cursor
-            .advance(&self.model, |s| traj.pose_at_blend(s), blend)
-        else {
-            return PathStep::Failed("IK failed mid-trajectory (unreachable / singular)".into());
-        };
-        let dt = now
-            .duration_since(line.prev_sample_at)
-            .as_secs_f64()
-            .max(self.cfg.cycle_period.as_secs_f64() * 0.5);
-        let guarded = self
-            .cfg
-            .max_joint_velocity_rad_s
-            .map(|v| v * VELOCITY_GUARD_MARGIN);
-        if exceeds_rate(prev_q_des, &q_next, &guarded, dt) {
-            return PathStep::Failed("joint velocity limit exceeded near singularity".into());
-        }
-        line.prev_sample_at = now;
-        PathStep::To {
-            q_des: q_next,
-            complete: played_out(line.traj.clock(), now),
-        }
-    }
-
-    /// The motion budgets a plan is sized against and a streamed pose's step
-    /// runs under,
-    /// read off one config so acceptance and execution cannot disagree.
-    fn plan_limits(&self) -> PlanLimits {
-        PlanLimits {
-            max_joint_velocity_rad_s: self.cfg.max_joint_velocity_rad_s,
-            max_joint_acceleration_rad_s2: self.cfg.max_joint_acceleration_rad_s2,
-            ee: self.cfg.ee,
-            control_period: self.cfg.cycle_period,
-            smoothing: self.cfg.smoothing,
-        }
-    }
-
-    /// Play the guarded servo's path: the configuration its trajectory reaches
-    /// this tick. The plan sized the trajectory within every velocity and
-    /// acceleration limit.
-    fn step_servo(servo: &ServoTrajectory<ARM_DOF>, now: Instant) -> PathStep {
-        PathStep::To {
-            q_des: servo.sample(now),
-            complete: played_out(servo.clock(), now),
-        }
-    }
-
-    /// End a Cartesian move: report the terminal and hold the last commanded
-    /// target, so the arm never snaps when a move stops early.
-    async fn end_cartesian(
-        &mut self,
-        m: &CartesianMove,
-        measured_q: JointVec,
-        outcome: Outcome,
-        elapsed: f64,
-    ) -> Advance {
+        let elapsed = m.traj.clock().elapsed_secs(now);
+        let cancelled = matches!(outcome, Outcome::Cancelled(_));
         self.finish_cartesian(&m.ctx, outcome, Ok(measured_q), elapsed)
             .await;
-        Advance::ends_move(m.prev_q_des)
+        // A cancel holds where the arm already is; a settle, met or failed,
+        // holds the trajectory's end.
+        Advance::ends_move(if cancelled { self.setpoint } else { q_des })
+    }
+
+    /// The rates a streamed pose steps at: the stream's cap, and the turn that
+    /// carries the wrist around the grasp point at that cap.
+    fn stream_step_rates(&self) -> EeCaps {
+        let linear_m_s = self.cfg.stream_ee_velocity_m_s;
+        EeCaps {
+            linear_m_s,
+            angular_rad_s: linear_m_s / self.model.tool().translation.vector.norm(),
+        }
+    }
+
+    /// The pose a line of `request` walks to: its position, at its orientation or
+    /// the turn the hand holds now.
+    fn line_goal(&self, request: &ArmMoveRequest) -> Isometry3<f64> {
+        Isometry3::from_parts(
+            request.position,
+            request
+                .orientation
+                .unwrap_or_else(|| self.world_ee_pose(&self.setpoint).rotation),
+        )
+    }
+
+    /// The trajectory through `walk`, resting at no sample before the end, over the
+    /// longer of `requested` and the time the joint limits allow.
+    fn line_trajectory(
+        &self,
+        walk: &[JointVec],
+        requested: Duration,
+        now: Instant,
+    ) -> JointTrajectory<ARM_DOF> {
+        JointTrajectory::through(
+            &distinct_joint_waypoints(walk),
+            &self.cfg.max_joint_velocity_rad_s,
+            &self.cfg.max_joint_acceleration_rad_s2,
+            requested,
+            now,
+        )
     }
 
     /// Start an accepted goal in the mode that executes it.
@@ -866,15 +786,24 @@ impl Planner {
                 duration,
                 reply,
             } => {
+                let traj = JointTrajectory::through(
+                    &[self.setpoint, target],
+                    &self.cfg.max_joint_velocity_rad_s,
+                    &self.cfg.max_joint_acceleration_rad_s2,
+                    duration,
+                    now,
+                );
+                let (what, remedy) = match reply {
+                    JointReply::MoveArmJoints { .. } => ("move", SPLIT_INTO_SHORTER_MOVES),
+                    JointReply::Ready(_) => ("posture move", RAISE_THE_JOINT_LIMITS),
+                };
+                if let Err(failure) = path::check_move_time(&traj, what, remedy) {
+                    reply.fail(self.side, failure).await;
+                    return Mode::Follow;
+                }
                 info!("{}: joint move start", self.side);
                 Mode::JointMove(JointMove {
-                    traj: JointTrajectory::through(
-                        &[self.setpoint, target],
-                        &self.cfg.max_joint_velocity_rad_s,
-                        &self.cfg.max_joint_acceleration_rad_s2,
-                        duration,
-                        now,
-                    ),
+                    traj,
                     reply,
                     _move_slot: move_slot,
                 })
@@ -890,13 +819,9 @@ impl Planner {
         }
     }
 
-    /// Plan an accepted move_arm goal and start executing it, or fail it here
-    /// with `unreachable` when no path reaches the pose.
-    ///
-    /// The start pose is the FK of the held setpoint (the chase base), not the
-    /// measured pose, so the first-tick velocity guard compares the IK of the
-    /// same configuration the chase continues from and cannot false-trip when
-    /// the governor held the arm off its measured pose just before admission.
+    /// Plan an accepted move_arm goal and start executing it, or fail it here:
+    /// with `unreachable` when no line reaches the pose, and with `rejected` when
+    /// the joint limits cannot run the line within the longest a move may take.
     async fn start_cartesian(
         &mut self,
         request: ArmMoveRequest,
@@ -905,84 +830,32 @@ impl Planner {
         move_slot: SlotRelease,
         now: Instant,
     ) -> Mode {
-        let ArmMoveRequest {
-            target,
-            tolerance,
-            duration: requested,
-            ..
-        } = request;
-        let start_world = self.model.world_ee_pose(&self.setpoint);
-        let plan = plan_cartesian(
-            &self.model,
-            &target,
-            self.setpoint,
-            &self.plan_limits(),
-            requested,
-            tolerance.servo(),
+        let planning = Instant::now();
+        let target = self.line_goal(&request);
+        let Some(walk) = plan_line(&self.model, &target, self.setpoint) else {
+            let failure = Failure::new(FailureKind::Unreachable, NOT_PLANNED);
+            self.fail_cartesian(&ctx, failure).await;
+            // `move_slot` drops here: the slot is released even on this early
+            // exit.
+            return Mode::Follow;
+        };
+        // The clock starts once the plan is ready: the time planning took is no part
+        // of the motion.
+        let traj = self.line_trajectory(&walk, request.duration, now + planning.elapsed());
+        if let Err(failure) = path::check_move_time(&traj, "move", SPLIT_INTO_SHORTER_MOVES) {
+            self.fail_cartesian(&ctx, failure).await;
+            return Mode::Follow;
+        }
+        info!(
+            "{}: move_arm start, duration={:.3}s",
+            self.side,
+            traj.clock().duration().as_secs_f64(),
         );
-        let plan = match plan {
-            Ok(plan) => plan,
-            Err(rejection) => {
-                let failure =
-                    Failure::new(FailureKind::Unreachable, not_planned(tolerance, &rejection));
-                self.fail_cartesian(&ctx, failure).await;
-                // `move_slot` drops here: the slot is released even on this
-                // early exit.
-                return Mode::Follow;
-            }
-        };
-        let path = match plan {
-            CartesianPlan::Line(LinePlan {
-                duration,
-                elbow,
-                swivel,
-                start_q,
-                path,
-            }) => {
-                info!(
-                    "{}: move_arm start ({elbow:?} elbow, {swivel:?}), duration={:.3}s",
-                    self.side,
-                    duration.as_secs_f64(),
-                );
-                MovePath::Line(Box::new(LineTrack {
-                    // Seed from the plan's normalized start, not self.setpoint:
-                    // the plan validated the walk from here, so execution must
-                    // begin on the same IK branch (they can differ at a
-                    // redundancy/limit boundary). The chase still moves the arm
-                    // from its actual setpoint, velocity-limited.
-                    traj: LineTrajectory::new(start_world, target, path, duration, now),
-                    cursor: LineCursor::new(start_q, swivel),
-                    prev_sample_at: now,
-                }))
-            }
-            // No continuous joint path tracks the line: play the path the
-            // guarded servo's rollout just validated, the same damped law the
-            // operator's streaming jog crosses these walls with.
-            CartesianPlan::Servo(ServoPlan { duration, path }) => {
-                info!(
-                    "{}: move_arm start (servo-guided), duration={:.3}s",
-                    self.side,
-                    duration.as_secs_f64(),
-                );
-                MovePath::Servo(ServoTrajectory::new(path, duration, now))
-            }
-        };
-        // The line's velocity guard compares each sample against the last
-        // commanded target, so the first comparison must sit on the plan's own
-        // IK branch (start_q), which can differ from the held setpoint at a
-        // redundancy or limit boundary; seeding from the setpoint there would
-        // trip the guard on a valid line's first tick. The servo's path starts
-        // at the held setpoint, the seed its rollout stepped from.
-        let prev_q_des = match &path {
-            MovePath::Line(line) => line.cursor.q(),
-            MovePath::Servo(_) => self.setpoint,
-        };
         Mode::CartesianMove(CartesianMove {
-            path,
+            traj,
             ctx,
             target,
             settle,
-            prev_q_des,
             _move_slot: move_slot,
         })
     }
@@ -1024,13 +897,6 @@ impl Planner {
     }
 }
 
-/// The slack a streamed pose's servo step runs against: the guarded servo's
-/// own arrival bar.
-const STREAMED_POSE_TOLERANCE: PoseTolerance = PoseTolerance {
-    position_m: control_core::servo::POSITION_TOLERANCE_M,
-    orientation_rad: control_core::servo::ORIENTATION_TOLERANCE_RAD,
-};
-
 /// When the motion `clock` plays ends.
 fn planned_end(clock: &MotionClock) -> Instant {
     clock.motion_start() + clock.duration()
@@ -1061,17 +927,6 @@ pub(crate) fn cancelled_reason(reason: String, measured: &Measurement) -> String
     }
 }
 
-/// Why no plan reaches a Cartesian move within `tolerance`: the message of
-/// a `move_arm` goal's `unreachable` failure, and the reason `check_arm_move`
-/// answers.
-fn not_planned(tolerance: PoseTolerance, rejection: &PlanRejection) -> String {
-    format!(
-        "goal pose not planned within {:.1} mm / {:.1} deg: {rejection}",
-        tolerance.position_m * 1000.0,
-        tolerance.orientation_rad.to_degrees()
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1081,6 +936,23 @@ mod tests {
     use crate::test_support::{
         POSE_TEST_Q, bundled_arm, claimed_move_slot, plan_config, planner_holding,
     };
+
+    /// The slack the stream test reads its arrival against.
+    const ARRIVED: PoseTolerance = PoseTolerance {
+        position_m: 1e-3,
+        orientation_rad: 1e-2,
+    };
+
+    /// A `move_arm` request to `target`, as fast as the limits allow; a planner reads
+    /// no side off it.
+    fn request_to(target: Isometry3<f64>) -> ArmMoveRequest {
+        ArmMoveRequest {
+            side: Side::Left,
+            position: target.translation,
+            orientation: Some(target.rotation),
+            duration: Duration::ZERO,
+        }
+    }
 
     fn joint_cmd(positions: JointVec) -> Upstream {
         Upstream::Joints(positions)
@@ -1185,6 +1057,47 @@ mod tests {
             done_rx.try_recv().is_err(),
             "the later goal is in flight, not ended"
         );
+    }
+
+    /// A joint move its joint limits cannot run within the move ceiling fails
+    /// with `rejected` before the arm moves, and frees its slot.
+    #[tokio::test]
+    async fn a_posture_move_past_the_ceiling_fails_before_the_arm_moves_and_asks_for_higher_limits()
+    {
+        let held = [0.0; ARM_DOF];
+        let model = bundled_arm(openarm_description::HardwareVersion::V1, Side::Left);
+        let mut planner = Planner::new(
+            Side::Left,
+            model,
+            PlanConfig {
+                // 0.5 rad at 0.001 rad/s takes 500 s.
+                max_joint_velocity_rad_s: [0.001; ARM_DOF],
+                ..plan_config()
+            },
+        );
+        planner.commit(held);
+        let (goal_tx, mut goals) = mpsc::channel(1);
+        let move_slot = claimed_move_slot();
+        let (done_tx, mut done_rx) = mpsc::channel(1);
+        goal_tx
+            .send(Goal::posture_share([0.5; ARM_DOF], done_tx))
+            .await
+            .expect("queue the goal");
+        planner
+            .tick(held, None, &mut goals, &move_slot, Instant::now())
+            .await;
+        let Outcome::Failed(failure) = done_rx.try_recv().expect("the move ends at once") else {
+            panic!("the move fails");
+        };
+        assert_eq!(failure.kind, FailureKind::Rejected);
+        assert!(
+            failure.message.contains("this posture move, past the 60 s")
+                && failure.message.contains(RAISE_THE_JOINT_LIMITS),
+            "{}",
+            failure.message
+        );
+        assert_eq!(planner.setpoint(), held, "the arm never left its pose");
+        assert!(!move_slot.is_claimed(), "the failure releases the slot");
     }
 
     /// A posture share whose arm never follows: the governor holds every
@@ -1421,7 +1334,7 @@ mod tests {
             (start.translation.vector + Vector3::new(0.05, 0.0, 0.0)).into(),
             start.rotation,
         );
-        let checked = planner.check_cartesian(&near, STREAMED_POSE_TOLERANCE, Duration::ZERO);
+        let checked = planner.check_cartesian(&request_to(near));
         let Ok(PlanCheck::Reachable(duration)) = checked else {
             panic!("a pose 5 cm ahead has a plan: {checked:?}");
         };
@@ -1432,14 +1345,14 @@ mod tests {
             (start.translation.vector + Vector3::new(2.0, 0.0, 0.0)).into(),
             start.rotation,
         );
-        let checked = planner.check_cartesian(&far, STREAMED_POSE_TOLERANCE, Duration::ZERO);
+        let checked = planner.check_cartesian(&request_to(far));
         let Ok(PlanCheck::Unreachable(reason)) = checked else {
             panic!("a pose 2 m away has no plan: {checked:?}");
         };
-        assert!(
-            reason.starts_with("goal pose not planned within"),
-            "{reason}"
-        );
+        assert!(reason.starts_with("goal pose not planned"), "{reason}");
+        for way_on in ["plan_joint_path", "execute_joint_path"] {
+            assert!(reason.contains(way_on), "{reason}");
+        }
         assert_eq!(planner.setpoint(), POSE_TEST_Q);
 
         // While a move executes, the check is refused as a goal is.
@@ -1454,7 +1367,7 @@ mod tests {
             .tick(POSE_TEST_Q, None, &mut goals, &move_slot, Instant::now())
             .await;
         assert_eq!(
-            planner.check_cartesian(&near, STREAMED_POSE_TOLERANCE, Duration::ZERO),
+            planner.check_cartesian(&request_to(near)),
             Err(Failure::new(FailureKind::PreconditionFailed, ARM_BUSY))
         );
     }
@@ -1524,7 +1437,7 @@ mod tests {
             "the step must close the gap: {before} -> {after}"
         );
         let cfg = plan_config();
-        let budget = cfg.ee.linear_m_s * cfg.cycle_period.as_secs_f64();
+        let budget = cfg.stream_ee_velocity_m_s * cfg.cycle_period.as_secs_f64();
         assert!(
             after >= before - budget * 1.01,
             "one tick may close at most its {budget} m budget: {before} -> {after}"
@@ -1547,7 +1460,7 @@ mod tests {
         let moved = planner.world_ee_pose(&stepped);
         let travelled = (moved.translation.vector - start.translation.vector).norm();
         let cfg = plan_config();
-        let budget = cfg.ee.linear_m_s * cfg.cycle_period.as_secs_f64();
+        let budget = cfg.stream_ee_velocity_m_s * cfg.cycle_period.as_secs_f64();
         assert!(
             travelled <= budget * 1.01,
             "one tick travelled {travelled} m against a {budget} m budget"
@@ -1566,7 +1479,7 @@ mod tests {
         let stepped = planner.follow_target(&Some(Upstream::Pose(twisted)));
         let moved = planner.world_ee_pose(&stepped);
         let cfg = plan_config();
-        let budget = cfg.ee.angular_rad_s * cfg.cycle_period.as_secs_f64();
+        let budget = planner.stream_step_rates().angular_rad_s * cfg.cycle_period.as_secs_f64();
         let turned = moved.rotation.angle_to(&start.rotation);
         assert!(
             turned <= budget * 1.01,
@@ -1633,6 +1546,185 @@ mod tests {
         );
     }
 
+    // The joint limits slowed until a line's walk takes past the longest a move may
+    // take: the check answers why, in the words the goal fails with.
+    #[test]
+    fn a_line_the_limits_cannot_run_within_the_longest_move_has_no_plan() {
+        let mut planner = pose_planner();
+        let start = planner.world_ee_pose(&POSE_TEST_Q);
+        let target = Isometry3::from_parts(
+            (start.translation.vector + Vector3::new(0.05, 0.0, 0.0)).into(),
+            start.rotation,
+        );
+        planner.cfg.max_joint_velocity_rad_s = [1e-4; ARM_DOF];
+        let checked = planner.check_cartesian(&request_to(target));
+        let Ok(PlanCheck::Unreachable(reason)) = checked else {
+            panic!("the limits cannot run this line within a minute: {checked:?}");
+        };
+        assert!(reason.contains(SPLIT_INTO_SHORTER_MOVES), "{reason}");
+    }
+
+    // A goal that leaves its orientation out is a position alone: a turn no line reaches
+    // has a plan once the goal leaves it out, ending at the turn the hand starts with.
+    #[test]
+    fn a_position_alone_keeps_the_turn_the_hand_starts_with() {
+        let held = openarm_description::ready(Side::Right);
+        let mut planner = launcher_planner(Side::Right, held);
+        let start = planner.world_ee_pose(&held);
+        let target = Isometry3::from_parts(
+            (start.translation.vector + Vector3::new(0.05, 0.0, 0.0)).into(),
+            UnitQuaternion::from_axis_angle(&Vector3::x_axis(), 3.0) * start.rotation,
+        );
+        let named = planner.check_cartesian(&request_to(target));
+        assert!(matches!(named, Ok(PlanCheck::Unreachable(_))), "{named:?}");
+        let alone = ArmMoveRequest {
+            orientation: None,
+            ..request_to(target)
+        };
+        let checked = planner.check_cartesian(&alone);
+        assert!(
+            matches!(checked, Ok(PlanCheck::Reachable(_))),
+            "{checked:?}"
+        );
+        assert_eq!(planner.line_goal(&alone).rotation, start.rotation);
+    }
+
+    // A 1 cm lift takes under a second at the launcher's limits.
+    #[test]
+    fn a_one_centimeter_line_takes_under_a_second() {
+        let held = openarm_description::ready(Side::Right);
+        let mut planner = launcher_planner(Side::Right, held);
+        let mut lift = planner.world_ee_pose(&held);
+        lift.translation.vector.z += 0.01;
+        let checked = planner.check_cartesian(&request_to(lift));
+        let Ok(PlanCheck::Reachable(duration)) = checked else {
+            panic!("a 1 cm lift from ready has a plan: {checked:?}");
+        };
+        assert!(duration < Duration::from_secs(1), "{duration:?}");
+    }
+
+    // A line's walk rests at none of its states within a joint path's repeat of the one
+    // before it: it takes the time of the states it keeps.
+    #[test]
+    fn a_line_rests_at_no_near_repeat_of_its_walk() {
+        let held = openarm_description::ready(Side::Right);
+        let planner = launcher_planner(Side::Right, held);
+        let moved = |by: f64| {
+            let mut q = held;
+            q[0] += by;
+            q[1] += by;
+            q
+        };
+        let (middle, near_repeat, end) = (moved(0.2), moved(0.2 + 5e-4), moved(0.4));
+        let time_of = |walk: &[JointVec]| {
+            planner
+                .line_trajectory(walk, Duration::ZERO, Instant::now())
+                .clock()
+                .duration()
+        };
+        assert_eq!(
+            time_of(&[held, middle, near_repeat, end]),
+            time_of(&[held, middle, end])
+        );
+    }
+
+    // A streamed step's hand speed reads the step from where it starts, the held
+    // setpoint, however far the measured arm lags behind it.
+    #[tokio::test]
+    async fn a_streamed_steps_hand_basis_starts_at_the_setpoint() {
+        let mut planner = pose_planner();
+        let (_goal_tx, mut goals) = mpsc::channel(1);
+        let lagging = POSE_TEST_Q.map(|q| q + 0.3);
+        let tick = planner
+            .tick(
+                lagging,
+                None,
+                &mut goals,
+                &claimed_move_slot(),
+                Instant::now(),
+            )
+            .await;
+        let basis = tick
+            .streamed_hand
+            .expect("a streamed step has a hand basis");
+        assert_eq!(basis.start, planner.model.at(&POSE_TEST_Q).jacobian());
+    }
+
+    // A line crosses the wrist's singular surface: its walk's wrist bend changes sign
+    // and the goal has a plan, each step continuing the one before it.
+    #[test]
+    fn a_line_crosses_the_wrist_singularity() {
+        const WRIST_BEND: usize = 5;
+        let start_q: JointVec = [1.139, 1.678, 0.169, 1.339, 0.789, 0.142, 0.120];
+        let goal_q: JointVec = [0.827, 1.185, -0.038, 0.856, 1.044, -0.204, 0.530];
+        let mut planner = launcher_planner(Side::Right, start_q);
+        let target = planner.world_ee_pose(&goal_q);
+        let walk = plan_line(&planner.model, &target, start_q).expect("the line tracks");
+        assert!(walk[0][WRIST_BEND] * walk[walk.len() - 1][WRIST_BEND] < 0.0);
+        let checked = planner.check_cartesian(&request_to(target));
+        assert!(
+            matches!(checked, Ok(PlanCheck::Reachable(_))),
+            "{checked:?}"
+        );
+    }
+
+    // A goal across the wrist singularity with a configuration and no line: the
+    // plan check refuses it, and a stream to the same pose arrives at the launcher's
+    // limits, the wrist's bend changing sign on the way and every tick within the
+    // velocity limit and the joint limits.
+    #[tokio::test]
+    async fn a_pose_stream_crosses_the_wrist_where_no_line_tracks() {
+        let side = Side::Right;
+        let model = bundled_arm(openarm_description::HardwareVersion::V2, side);
+        let max_joint_velocity_rad_s = [
+            16.754666, 16.754666, 5.445426, 5.445426, 20.943946, 20.943946, 20.943946,
+        ];
+        let limits = model.limits();
+        let cfg = PlanConfig {
+            max_joint_velocity_rad_s,
+            max_joint_acceleration_rad_s2: [0.5; ARM_DOF],
+            stream_ee_velocity_m_s: 0.25,
+            limits,
+            ..plan_config()
+        };
+        const WRIST_BEND: usize = 5;
+        let start_q: JointVec = [-0.223, 1.600, 0.543, 0.543, 0.768, 0.205, -0.354];
+        let goal_q: JointVec = [-0.541, 1.614, 0.364, 0.160, 1.046, -0.227, -0.532];
+        let mut planner = Planner::new(side, model, cfg);
+        planner.commit(start_q);
+        let target = planner.world_ee_pose(&goal_q);
+        let checked = planner.check_cartesian(&request_to(target));
+        assert!(
+            matches!(checked, Ok(PlanCheck::Unreachable(_))),
+            "the goal has no line: {checked:?}"
+        );
+        let dt = planner.cfg.cycle_period.as_secs_f64();
+        let mut q = start_q;
+        for _ in 0..1000 {
+            let next = planner.follow_target(&Some(Upstream::Pose(target)));
+            for i in 0..ARM_DOF {
+                assert!(
+                    (next[i] - q[i]).abs() <= max_joint_velocity_rad_s[i] * dt * (1.0 + 1e-9),
+                    "joint {i} steps from {} to {}",
+                    q[i],
+                    next[i]
+                );
+                assert!(limits[i].contains(next[i]), "joint {i} at {}", next[i]);
+            }
+            planner.commit(next);
+            q = next;
+        }
+        assert_eq!(
+            pose_shortfall(&planner.world_ee_pose(&q), &target, &ARRIVED),
+            None,
+            "the stream ends at {q:?}"
+        );
+        assert!(
+            start_q[WRIST_BEND] * q[WRIST_BEND] < 0.0,
+            "the wrist never crossed: it ends at {q:?}"
+        );
+    }
+
     // A pose stream that arrives every second tick, a 6 cm/s lift of the hand
     // from ready, is followed as one motion: once the sweep is under way, each
     // joint's velocity changes from one tick to the next by under a tenth of
@@ -1646,10 +1738,7 @@ mod tests {
             max_joint_velocity_rad_s: [
                 16.754666, 16.754666, 5.445426, 5.445426, 20.943946, 20.943946, 20.943946,
             ],
-            ee: EeCaps {
-                linear_m_s: 0.5,
-                angular_rad_s: 0.8,
-            },
+            stream_ee_velocity_m_s: 0.5,
             limits: model.limits(),
             ..plan_config()
         };
@@ -1687,5 +1776,157 @@ mod tests {
                 "joint {i} changes velocity by {alternation:.3} rad/s between ticks on a {size:.3} rad/s sweep"
             );
         }
+    }
+
+    /// The launcher's limits on the v2 arm, at the test period.
+    const LAUNCHER_VELOCITY_RAD_S: JointVec = [
+        16.754666, 16.754666, 5.445426, 5.445426, 20.943946, 20.943946, 20.943946,
+    ];
+    const LAUNCHER_ACCELERATION_RAD_S2: JointVec = [0.5; ARM_DOF];
+
+    /// A planner of the v2 arm on `side` at the launcher's limits, holding `held`.
+    fn launcher_planner(side: Side, held: JointVec) -> Planner {
+        let model = bundled_arm(openarm_description::HardwareVersion::V2, side);
+        let cfg = PlanConfig {
+            max_joint_velocity_rad_s: LAUNCHER_VELOCITY_RAD_S,
+            max_joint_acceleration_rad_s2: LAUNCHER_ACCELERATION_RAD_S2,
+            limits: model.limits(),
+            ..plan_config()
+        };
+        let mut planner = Planner::new(side, model, cfg);
+        planner.commit(held);
+        planner
+    }
+
+    /// Asserts that `ticks`, one period apart with the arm at rest before and after,
+    /// keep every joint within the launcher's limits, to the rounding the differences
+    /// magnify.
+    fn assert_within_launcher_limits(ticks: &[JointVec], period_s: f64) {
+        for (k, w) in ticks.windows(2).enumerate() {
+            for i in 0..ARM_DOF {
+                let speed = (w[1][i] - w[0][i]).abs() / period_s;
+                assert!(
+                    speed <= LAUNCHER_VELOCITY_RAD_S[i] * (1.0 + 1e-6),
+                    "joint {i} at {speed} rad/s at tick {k}"
+                );
+            }
+        }
+        let at_rest: Vec<JointVec> = std::iter::once(ticks[0])
+            .chain(ticks.iter().copied())
+            .chain(std::iter::once(ticks[ticks.len() - 1]))
+            .collect();
+        for (k, w) in at_rest.windows(3).enumerate() {
+            for i in 0..ARM_DOF {
+                let acceleration =
+                    (w[2][i] - 2.0 * w[1][i] + w[0][i]).abs() / (period_s * period_s);
+                assert!(
+                    acceleration <= LAUNCHER_ACCELERATION_RAD_S2[i] * (1.0 + 1e-6),
+                    "joint {i} at {acceleration} rad/s^2 at tick {k}"
+                );
+            }
+        }
+    }
+
+    /// A drawn posture of `planner`'s arm, away from the ends of its joints' ranges.
+    fn drawn_posture(tc: &hegel::TestCase, limits: &[Limit; ARM_DOF]) -> JointVec {
+        std::array::from_fn(|i| {
+            let (lo, hi) = (limits[i].lo, limits[i].hi);
+            tc.draw(
+                hegel::generators::floats()
+                    .min_value(lo + 0.1 * (hi - lo))
+                    .max_value(hi - 0.1 * (hi - lo)),
+            )
+        })
+    }
+
+    // Every action on a drawn move, at the launcher's limits and a duration of 0, sampled
+    // each control period: a joint move or posture through the planner's ticks, and a pose
+    // move and a joint path through the trajectory their ticks sample.
+    #[hegel::test(test_cases = 30, seed = Some(14))]
+    fn every_action_stays_within_the_joint_limits(tc: hegel::TestCase) {
+        let side = if tc.draw(hegel::generators::booleans()) {
+            Side::Right
+        } else {
+            Side::Left
+        };
+        let limits = bundled_arm(openarm_description::HardwareVersion::V2, side).limits();
+        let start = drawn_posture(&tc, &limits);
+        let target = drawn_posture(&tc, &limits);
+        let period = plan_config().cycle_period;
+        let period_s = period.as_secs_f64();
+
+        // A joint move's and a posture's ticks.
+        let ticks = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime")
+            .block_on(async {
+                let mut planner = launcher_planner(side, start);
+                let (done_tx, _done_rx) = mpsc::channel(1);
+                let (goal_tx, mut goals) = mpsc::channel(1);
+                let move_slot = claimed_move_slot();
+                let goal = Goal::Joint {
+                    target,
+                    duration: Duration::ZERO,
+                    reply: JointReply::Ready(ReadyReply {
+                        done_tx,
+                        cancelled: Arc::new(AtomicBool::new(false)),
+                    }),
+                };
+                goal_tx.send(goal).await.expect("queue the goal");
+                let t0 = Instant::now();
+                let mut ticks = vec![start];
+                for k in 0..6000u32 {
+                    let measured = planner.setpoint();
+                    let tick = planner
+                        .tick(measured, None, &mut goals, &move_slot, t0 + period * k)
+                        .await;
+                    planner.commit(tick.candidate);
+                    ticks.push(tick.candidate);
+                    if k > 0 && matches!(planner.mode, Mode::Follow) {
+                        break;
+                    }
+                }
+                ticks
+            });
+        assert!(
+            ticks[ticks.len() - 1]
+                .iter()
+                .zip(&target)
+                .all(|(a, b)| (a - b).abs() < 1e-6),
+            "the move ends at its target"
+        );
+        assert_within_launcher_limits(&ticks, period_s);
+
+        // A joint path through both postures and back.
+        let t0 = Instant::now();
+        let path = JointTrajectory::through(
+            &[start, target, start],
+            &LAUNCHER_VELOCITY_RAD_S,
+            &LAUNCHER_ACCELERATION_RAD_S2,
+            Duration::ZERO,
+            t0,
+        );
+        let ticks_of = |traj: &JointTrajectory<ARM_DOF>| -> Vec<JointVec> {
+            let count = traj.clock().duration().as_nanos() / period.as_nanos() + 2;
+            (0..count as u32)
+                .map(|k| traj.sample(t0 + period * k))
+                .collect()
+        };
+        assert_within_launcher_limits(&ticks_of(&path), period_s);
+
+        // A pose move to where a nearby posture puts the grasp point.
+        let planner = launcher_planner(side, start);
+        let nearby: JointVec = std::array::from_fn(|i| start[i] + 0.1 * (target[i] - start[i]));
+        let goal = planner.world_ee_pose(&nearby);
+        let Some(walk) = plan_line(&planner.model, &goal, start) else {
+            tc.event("no line");
+            return;
+        };
+        tc.event("line");
+        assert_within_launcher_limits(
+            &ticks_of(&planner.line_trajectory(&walk, Duration::ZERO, t0)),
+            period_s,
+        );
     }
 }

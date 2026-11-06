@@ -61,7 +61,7 @@ impl fmt::Display for UpstreamMode {
 pub enum Upstream {
     /// Joint positions to chase directly, in the arm's fixed joint order.
     Joints(JointVec),
-    /// A world-frame end-effector pose to servo toward.
+    /// A world-frame end-effector pose to step toward.
     Pose(Isometry3<f64>),
 }
 
