@@ -5,7 +5,8 @@ and the objects of its planning scene. The node keeps a voxel map of the camera'
 frames in the robot frame and a planning scene of collision objects, objects attached to
 an arm's grasp link and pairs allowed to touch, as MoveIt's planning scene holds them; it
 plans the arms' path with OMPL, keeping a clearance from the map, the objects, the
-robot's own body and between the arms, and checks paths from other sources the same way.
+robot's own body and between the arms, computes straight lines of a link by inverse
+kinematics, and checks paths from other sources the same way.
 It implements `motion_planning:v1` and moves nothing: a caller runs a plan with
 limb_motion's `execute_joint_path`, passing every arm of the answer and each arm's
 `start_joint_positions` as its `expected_start_joint_positions`.
@@ -18,6 +19,7 @@ limb_motion's `execute_joint_path`, passing every arm of the answer and each arm
  set_allowed_collision --> planning scene ------------------+
                                                           |
  plan_joint_path --> start --> OMPL, goal samples (IK) -----> rounded path check
+ plan_cartesian_path --> start --> a step at a time (IK) ---> rounded path check
  check_joint_path --> start, waypoints ----------------------> rounded path check
                                                           |
                           <-- waypoints and grasp poses, or clear, map_stamp
@@ -246,6 +248,32 @@ The answer is the arm's `start_joint_positions`, where its path starts, and its
 `position` and `orientation` there; and `map_stamp`, the stamp of the newest depth
 frame in the map.
 
+## A Cartesian path
+
+`plan_cartesian_path` follows a link of one arm along straight lines through `waypoints`,
+as `motion_planning_core::cartesian_path` computes them after MoveIt's
+`compute_cartesian_path`, at MoveIt's precision, 1 mm and 0.01 rad, in steps of 0.01 m and
+0.035 rad.
+
+- `arm_name` names the arm. Its path starts at `start_joint_positions`, or, when that is
+  empty, at its last measured joint positions, and the other arm stands where it was last
+  measured.
+- `link_name` is its grasp link or a link fixed to it. Any other link, an inner link or a
+  finger, is refused with `rejected`, the message naming the grasp link. So are no `waypoints`
+  and a pose that is no pose (`pose_from_parts`).
+- With `avoid_collisions` true the path keeps clear of the snapshot its admission took, as a
+  plan does: refused with `precondition_failed` before the camera's depth frame, a start in
+  contact fails with `start_in_collision`, and `map_stamp` is the frame's stamp. With it false,
+  nothing is checked, no frame is needed, and the answer has no `map_stamp`.
+- It is refused with `precondition_failed` before the arms are measured and for a start
+  outside a joint limit by more than `start_tolerance_rad`.
+- A cancel ends it, at any part of it, and the goal ends cancelled.
+
+The result gives `start_joint_positions`; `waypoints`, each with the grasp point's `position`
+and `orientation` there, as much of the path as is valid; and `fraction`, the share of the
+lines covered. A path whose lines stand still has its last state as its one waypoint, and one
+whose first step fails has none.
+
 ## A check
 
 `check_joint_path` checks the path of one arm or both from their starts (empty: the
@@ -349,6 +377,16 @@ geometric_shapes 2.3.4:
 
 Each is a choice a caller sees; the launchers' values are OpenArm v2's.
 
+- A Cartesian path: MoveIt checks each state for collisions, not its start and not the motion
+  between two, and each interval's midpoint for the precision. Here the rounded path the
+  move runs is checked for both, a start in contact fails with `start_in_collision`, and a
+  start nearer than the clearance departs by the start rule in one run. MoveIt judges each
+  state alone, so a first state still nearer than its padding ends its path there. Any link
+  but the grasp link and those fixed to it is refused with `rejected`, where MoveIt's inverse
+  kinematics fails and its fraction is 0. At a clearance of 0.04 m a line among obstacles ends
+  before MoveIt's at the same padding: over the 27 drawn cases where it does, MoveIt's last state
+  stood 0 to 39 mm from the obstacle, 21 mm at the median, and no state here after the start comes
+  nearer than the clearance.
 - Clearance: MoveIt checks contact alone by default (`CollisionEnv` padding 0.0), and
   pads links against the world only (`pad_self_collisions` false). Here every state keeps
   `min_clearance_m` (0.04 m) from the map, the objects, an object an arm the plan does
