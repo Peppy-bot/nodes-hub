@@ -1400,7 +1400,7 @@ class SceneActionIO:
 
         while True:
             try:
-                await module.handle_next_request(
+                await module.handle_requests(
                     self._node_runner,
                     answer,
                 )

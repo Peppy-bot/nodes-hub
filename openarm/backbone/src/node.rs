@@ -436,7 +436,7 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         let token = node_runner.cancellation_token().clone();
         tokio::spawn(async move {
             serving::serve("get_limb_names", token.cancelled(), || {
-                get_limb_names::handle_next_request(&runner, |_request| {
+                get_limb_names::handle_requests(&runner, |_request| {
                     let names = limb_names();
                     Ok(get_limb_names::Response::new(
                         names.arm_names,

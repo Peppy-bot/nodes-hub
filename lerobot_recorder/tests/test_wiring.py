@@ -191,7 +191,7 @@ def test_a_service_handler_error_does_not_end_the_loop():
 
     class Svc:
         @staticmethod
-        async def handle_next_request(_node_runner, _handler):
+        async def handle_requests(_node_runner, _handler):
             calls["n"] += 1
             if calls["n"] == 1:
                 raise RuntimeError("handler blew up")

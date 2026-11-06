@@ -348,7 +348,7 @@ async def _serve(
     token = node_runner.cancellation_token()
     while not token.is_cancelled():
         try:
-            await svc.handle_next_request(node_runner, handler)
+            await svc.handle_requests(node_runner, handler)
         except Exception as e:
             # CancelledError is a BaseException, so shutdown's cancel passes.
             log(f"{label} service error: {e!r}")

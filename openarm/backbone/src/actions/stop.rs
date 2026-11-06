@@ -28,7 +28,7 @@ pub async fn run_stop(
     requests: mpsc::Sender<CoordinatorRequest>,
 ) {
     serving::serve("stop", token.cancelled(), || {
-        stop::handle_next_request(&runner, |request| {
+        stop::handle_requests(&runner, |request| {
             let (reply, answer) = oneshot::channel();
             let stopped = blocking_ask_coordinator(
                 &requests,

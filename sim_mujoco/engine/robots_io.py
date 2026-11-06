@@ -564,7 +564,7 @@ class RobotsIO:
     async def _serve_ready(self) -> None:
         while True:
             try:
-                await is_ready.handle_next_request(self._node_runner, self._ready)
+                await is_ready.handle_requests(self._node_runner, self._ready)
             except asyncio.CancelledError:
                 raise
             except Exception:  # pylint: disable=W0718

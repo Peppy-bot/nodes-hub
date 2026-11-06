@@ -127,7 +127,7 @@ async fn run(guide: Guide, runner: Arc<NodeRunner>, token: CancellationToken) {
         guide.arms()
     );
     serving::serve("get_guide", token.cancelled(), || {
-        get_guide::handle_next_request(&runner, |_req| Ok(guide.response()))
+        get_guide::handle_requests(&runner, |_req| Ok(guide.response()))
     })
     .await;
 }

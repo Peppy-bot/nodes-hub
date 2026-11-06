@@ -494,7 +494,7 @@ fn spawn_control_acks(node_runner: &Arc<peppygen::NodeRunner>) {
                 loop {
                     let result = tokio::select! {
                         _ = cancel_token.cancelled() => break,
-                        result = $service::handle_next_request(&runner, |request| {
+                        result = $service::handle_requests(&runner, |request| {
                             Ok($service::Response::new(request.data.$request_field))
                         }) => result,
                     };
@@ -524,7 +524,7 @@ async fn listen_for_video_stream_info_requests(
         let fps = actual_fps;
         tokio::select! {
             _ = cancel_token.cancelled() => break,
-            result = video_stream_info::handle_next_request(&node_runner, move |_request| {
+            result = video_stream_info::handle_requests(&node_runner, move |_request| {
                 Ok(video_stream_info::Response::new(
                     params.resolution.width as u32,
                     params.resolution.height as u32,

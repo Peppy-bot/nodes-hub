@@ -296,7 +296,7 @@ async def listen_for_control_acks(
     while not token.is_cancelled():
         try:
             await wait_unless_cancelled(
-                service.handle_next_request(
+                service.handle_requests(
                     node_runner,
                     lambda request: service.Response(
                         **{response_field: getattr(request.data, request_field)}
@@ -318,7 +318,7 @@ async def listen_for_video_stream_info_requests(
     while not token.is_cancelled():
         try:
             await wait_unless_cancelled(
-                video_stream_info.handle_next_request(
+                video_stream_info.handle_requests(
                     node_runner,
                     lambda _request: video_stream_info.Response(
                         width=video_params.resolution.width,

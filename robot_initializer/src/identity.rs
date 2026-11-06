@@ -62,7 +62,7 @@ async fn run(identity: Identity, runner: Arc<NodeRunner>, token: CancellationTok
         identity.core_node
     );
     serving::serve("get_identity", token.cancelled(), || {
-        get_identity::handle_next_request(&runner, |_req| {
+        get_identity::handle_requests(&runner, |_req| {
             Ok(get_identity::Response::new(
                 identity.robot.clone(),
                 identity.model.clone(),

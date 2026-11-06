@@ -98,7 +98,7 @@ macro_rules! serve_service {
             let runner = Arc::clone(&director.runner);
             loop {
                 let director = Arc::clone(&director);
-                if let Err(error) = $service::handle_next_request(&runner, move |request| {
+                if let Err(error) = $service::handle_requests(&runner, move |request| {
                     $handler(&director, request)
                 })
                 .await

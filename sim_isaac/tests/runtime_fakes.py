@@ -245,7 +245,7 @@ def _install() -> None:
     attach.GoalResponse = _GoalResponse
     is_ready = types.ModuleType("peppygen.exposed_services.robots.is_ready")
     is_ready.Response = _ReadyResponse
-    is_ready.handle_next_request = _no_readiness_request
+    is_ready.handle_requests = _no_readiness_request
     actions_robots = types.ModuleType("peppygen.exposed_actions.robots")
     actions_robots.attach = attach
     services_robots = types.ModuleType("peppygen.exposed_services.robots")

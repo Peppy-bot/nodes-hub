@@ -1336,14 +1336,14 @@ def test_a_service_gives_a_scene_failure_as_an_error_reply_of_its_own_member(pro
     module = provider.module
     replies = []
 
-    async def handle_next_request(_runner, handler):
+    async def handle_requests(_runner, handler):
         try:
             replies.append(handler(_assets_request()))
         except module.get_assets_list.Failure as failure:
             replies.append(failure)
         raise asyncio.CancelledError
 
-    module.get_assets_list.handle_next_request = handle_next_request
+    module.get_assets_list.handle_requests = handle_requests
 
     async def serve_once():
         with contextlib.suppress(asyncio.CancelledError):

@@ -318,7 +318,7 @@ pub async fn run_check_arm_move(
     activity: ArmPair<LeaderActivity>,
 ) {
     serving::serve("check_arm_move", token.cancelled(), || {
-        check_arm_move::handle_next_request(&runner, |req| {
+        check_arm_move::handle_requests(&runner, |req| {
             check_plan(&requests, &fresh, &activity, &req.data)
                 .map_err(|f| check_arm_move::Failure::new(f.kind.into(), f.message))
         })
