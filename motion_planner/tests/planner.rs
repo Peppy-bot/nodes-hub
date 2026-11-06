@@ -618,7 +618,7 @@ async fn a_camera_without_its_mounts_refuses_every_plan_and_check() -> peppygen:
 }
 
 // Each refusal the contract states comes at the goal's admission, the node taking
-// nothing: a goal of two arms, of a joint the arm lacks, of a joint target outside its
+// nothing: a goal that names an arm twice, of a joint the arm lacks, of a joint target outside its
 // limits, of a skewed orientation, of a planning time out of range, and from a start
 // outside a joint limit by more than the start tolerance.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -630,9 +630,9 @@ async fn every_refusal_comes_before_acceptance() -> peppygen::Result<()> {
         other => panic!("taken: {other:?}"),
     };
 
-    let mut two = plan_to(&goal);
-    two.arms.push(GoalArmsItem {
-        arm_name: "right_arm".to_string(),
+    let mut twice = plan_to(&goal);
+    twice.arms.push(GoalArmsItem {
+        arm_name: "left_arm".to_string(),
         start_joint_positions: Vec::new(),
     });
     let mut missing = plan_to(&goal);
@@ -653,7 +653,7 @@ async fn every_refusal_comes_before_acceptance() -> peppygen::Result<()> {
         allowed_planning_time_s: 61.0,
         ..plan_to(&goal)
     };
-    for rejected in [two, missing, beyond, skewed, slow] {
+    for rejected in [twice, missing, beyond, skewed, slow] {
         assert_eq!(
             refused(plan(&harness, &rejected).await),
             FailureKind::Rejected

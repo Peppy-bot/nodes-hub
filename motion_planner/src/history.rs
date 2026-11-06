@@ -6,7 +6,7 @@ use motion_planning_core::JointHistory;
 use openarm_description::{ARM_DOF, ArmPair, Side};
 
 /// Both arms' joint positions at one instant.
-pub type Arms = ArmPair<[f64; ARM_DOF]>;
+pub type ArmJoints = ArmPair<[f64; ARM_DOF]>;
 
 /// The values of one measurement: the left arm's joints, the right arm's, then the left
 /// and the right gripper's openings.
@@ -18,7 +18,7 @@ pub type History = JointHistory<VALUES>;
 /// Both arms' joint positions and both grippers' openings at one instant.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Measured {
-    pub arms: Arms,
+    pub arms: ArmJoints,
     pub openings: ArmPair<f64>,
 }
 

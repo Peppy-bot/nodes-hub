@@ -18,7 +18,7 @@ use chain_kinematics::nalgebra::{
 };
 use collision_geometry::chain::{BodyMask, Padding, PlacedMask, RiderBody};
 use motion_planner::fingers::riders;
-use motion_planner::history::Arms;
+use motion_planner::history::ArmJoints;
 use motion_planner::node::Fault;
 use motion_planner::request::OBJECTIVE;
 use motion_planner::robot::{Robot, RobotModel};
@@ -91,7 +91,7 @@ pub type Solid = ([f64; 3], [f64; 3]);
 /// renderer places the robot from its pieces itself.
 pub fn render(
     camera: &Isometry3<f64>,
-    arms: Option<&Arms>,
+    arms: Option<&ArmJoints>,
     boxes: &[Solid],
 ) -> Vec<Option<[f64; 3]>> {
     let none = Padding::new(1.0, 0.0).expect("the padding that grows nothing");
@@ -165,7 +165,7 @@ pub fn at_ms(ms: u64) -> SystemTime {
 }
 
 /// Both arms where `left` and `right` put them.
-pub fn arms(left: [f64; ARM_DOF], right: [f64; ARM_DOF]) -> Arms {
+pub fn arms(left: [f64; ARM_DOF], right: [f64; ARM_DOF]) -> ArmJoints {
     ArmPair::new(left, right)
 }
 
@@ -221,14 +221,14 @@ pub fn table_across(under: &[f64; ARM_DOF], over: &[f64; ARM_DOF]) -> (Solid, f6
 /// The node over the harness with the four camera slots vacant, once the arms' joint
 /// positions at `arms` have arrived: a check of the left arm standing still stops being
 /// refused, and answers with no map stamp.
-pub async fn start_without_camera(arms: &Arms) -> peppygen::Result<(Harness, Mocks)> {
+pub async fn start_without_camera(arms: &ArmJoints) -> peppygen::Result<(Harness, Mocks)> {
     start_without_camera_with(parameters(), arms).await
 }
 
 /// `start_without_camera` with the node's parameters `params`.
 pub async fn start_without_camera_with(
     params: Parameters,
-    arms: &Arms,
+    arms: &ArmJoints,
 ) -> peppygen::Result<(Harness, Mocks)> {
     start_vacant(
         Config {
@@ -244,7 +244,7 @@ pub async fn start_without_camera_with(
 
 /// `start_without_camera` with only the camera and geometry slots vacant, as on a robot
 /// without a camera rig whose backbone answers camera_mounts and workspace.
-pub async fn start_without_the_rig(arms: &Arms) -> peppygen::Result<(Harness, Mocks)> {
+pub async fn start_without_the_rig(arms: &ArmJoints) -> peppygen::Result<(Harness, Mocks)> {
     start_vacant(vacant_camera(), arms).await
 }
 
@@ -296,7 +296,7 @@ pub async fn start_identified_as(
 /// The node over the harness as `config` binds it, with no camera to read, once the arms'
 /// joint positions at `arms` have arrived: a check of the left arm standing still stops
 /// being refused, and answers with no map stamp.
-async fn start_vacant(config: Config, arms: &Arms) -> peppygen::Result<(Harness, Mocks)> {
+async fn start_vacant(config: Config, arms: &ArmJoints) -> peppygen::Result<(Harness, Mocks)> {
     let (harness, mocks) = start(config).await?;
     publish_arms(&mocks, at_ms(0), arms).await?;
     let answer = wait_for_the_arms(&harness, arms[Side::Left]).await;
@@ -439,7 +439,7 @@ pub fn describe_camera(
 }
 
 /// Publishes the arms at `arms` measured at `at`, both grippers open.
-pub async fn publish_arms(mocks: &Mocks, at: SystemTime, arms: &Arms) -> peppygen::Result<()> {
+pub async fn publish_arms(mocks: &Mocks, at: SystemTime, arms: &ArmJoints) -> peppygen::Result<()> {
     let rest = |side: Side| arms[side].to_vec();
     mocks
         .deps
