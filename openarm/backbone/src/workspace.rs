@@ -301,6 +301,10 @@ mod tests {
     use workspace_core::messages::robot_frame_placement;
     use workspace_core::{GraspDirection, View};
 
+    use std::time::Duration;
+
+    use crate::planner::{PlanCheck, PlanConfig, Planner};
+    use crate::settle::PoseTolerance;
     use crate::test_support::bundled_arm;
 
     fn arms(version: HardwareVersion) -> ArmPair<Arm> {
@@ -481,6 +485,51 @@ mod tests {
         let (view_x, view_z) = (camera.rotation[2], camera.rotation[8]);
         assert!(view_x > 0.4 && view_z < -0.8, "({view_x}, {view_z})");
         assert_eq!(workspace(HardwareVersion::V1).perception_camera(), None);
+    }
+
+    /// The reach test and the planner of `check_arm_move` agree: each grasp
+    /// that the reach test takes at a point, the planner of that arm plans
+    /// from Ready within the reach bars, as the scripted grab checks it. The
+    /// points are the grasp point and the pre-grasp point of the mug of the
+    /// eval world `workflow_mug_in_bowl`, from the right arm, and a point in
+    /// front at table height.
+    #[test]
+    fn each_grasp_the_reach_test_takes_has_a_plan_from_ready() {
+        let v2 = workspace(HardwareVersion::V2);
+        let bars = PoseTolerance {
+            position_m: REACH_TOLERANCE,
+            orientation_rad: workspace_core::GRASP_ANGLE_TOLERANCE,
+        };
+        let mut planners = ArmPair::from_fn(|side| {
+            let arm = bundled_arm(HardwareVersion::V2, side);
+            let cfg = PlanConfig {
+                limits: arm.limits(),
+                ..crate::test_support::plan_config()
+            };
+            let mut planner = Planner::new(side, arm, cfg);
+            planner.commit(openarm_description::ready(side));
+            planner
+        });
+        for target in [
+            [0.387, -0.005, 0.381],
+            [0.387, -0.005, 0.456],
+            [0.30, 0.0, 0.45],
+        ] {
+            let mut taken = 0;
+            for side in Side::BOTH {
+                for grasp in grasp_poses(target).filter(|grasp| v2.reaches(side, &[*grasp])) {
+                    taken += 1;
+                    let check = planners[side]
+                        .check_cartesian(&grasp, bars, Duration::ZERO)
+                        .expect("a planner that holds Ready checks");
+                    assert!(
+                        matches!(check, PlanCheck::Reachable(_)),
+                        "{side:?} at {target:?}: {check:?}"
+                    );
+                }
+            }
+            assert!(taken > 0, "the reach test takes no grasp at {target:?}");
+        }
     }
 
     #[test]

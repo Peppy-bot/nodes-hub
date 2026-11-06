@@ -208,8 +208,9 @@ the target, or where the governor held it short. A line that IK or the
 per-tick velocity guard cannot follow fails with `attempt_failed`. A failed
 goal gives no result. A goal that completes or ends cancelled reports the
 measured state at that moment; a cancel of its caller ends it for the reason
-`cancelled by its caller`. A posture move completes at the planned end and
-reports where each arm stands. When the arm's follower stops reporting, the
+`cancelled by its caller`. A posture move completes once each arm stands
+within 0.1 rad of the posture in every joint, fails with `timeout` 2 s after
+the planned end otherwise, and reports where each arm stands. When the arm's follower stops reporting, the
 move fails with `resource_unavailable` and `the follower stopped reporting`,
 and so does a goal that reaches the loop before every follower reported
 (`the follower has not reported its first state yet`). A goal cancelled while
@@ -365,12 +366,15 @@ arm's joints as its share measured them when it ended, in the order of
 `arms`, and the time since the path started.
 
 `move_to_ready` and `move_to_home` give each arm's planner a joint move to
-the posture. The goal completes when both moves ran their time out, not when
-the arms arrived. The governor can hold an arm short, and the backbone does
-not see an arm that stops against an object. The goal fails with the first
-failure of an arm's move, its message led by the side (`left: the follower
-stopped reporting`), and with `attempt_failed` when an arm's planner does not
-take or answer its move.
+the posture. The goal completes once both arms settled at the posture: each
+measured joint within 0.1 rad of it, by 2 s after the planned end. An arm
+that the governor holds short, or that stops against an object the backbone
+does not see, such as a bench in front of the robot, fails its move with
+`timeout`. The goal fails with the first failure of an arm's move, its
+message led by the side (`left: still 0.470 rad from the target at joint 6,
+2.0 s after the planned end`, `left: the follower stopped reporting`), and
+with `attempt_failed` when an arm's planner does not take or answer its
+move.
 
 A goal that completes or ends cancelled gives the pose of each arm:
 

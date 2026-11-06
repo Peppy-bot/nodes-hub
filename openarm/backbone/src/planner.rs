@@ -130,6 +130,16 @@ pub enum PlanCheck {
     Unreachable(String),
 }
 
+/// How the share of an arm in a posture goal (move_to_ready or move_to_home)
+/// settles: each measured joint within 0.1 rad of the posture, the tolerance
+/// the robots' endpoint calls usual for a joint move, by 2 s after the
+/// planned end. A share whose arm an object or the governor holds short of
+/// the posture fails with `timeout`, naming the joint and how far it stands.
+pub const POSTURE_SETTLE: Settle<JointVec> = Settle {
+    tolerance: [0.1; ARM_DOF],
+    timeout: Duration::from_secs(2),
+};
+
 /// One arm's share of a whole-robot ready move: where its terminal reports,
 /// and the cancel flag the admission task flips on the action's cancel.
 pub struct ReadyReply {
@@ -140,8 +150,7 @@ pub struct ReadyReply {
 /// Where a joint move reports its terminal: the move_arm_joints action goal
 /// that carried it (boxed: the goal context dwarfs the other variant) with
 /// the settle the goal asked for, or one arm's share of a posture goal
-/// (move_to_ready or move_to_home), which ends at the planned end of its
-/// trajectory.
+/// (move_to_ready or move_to_home), which settles by [`POSTURE_SETTLE`].
 pub enum JointReply {
     MoveArmJoints {
         ctx: Box<move_arm_joints::GoalContext>,
@@ -167,10 +176,11 @@ impl JointReply {
     }
 
     /// How a joint move whose trajectory has run to its planned end ends at
-    /// `now`, with the arm measuring `measured` against `target`: a posture
-    /// share completes there; a move_arm_joints goal completes once every
-    /// joint stands within its settle tolerance, fails with `timeout` once
-    /// its settle timeout has passed, and stays in flight in between.
+    /// `now`, with the arm measuring `measured` against `target`: it
+    /// completes once every joint stands within its settle tolerance, fails
+    /// with `timeout` once its settle timeout has passed, and stays in flight
+    /// in between; a posture share by [`POSTURE_SETTLE`], a move_arm_joints
+    /// goal by the settle it asked for.
     fn settle_outcome(
         &self,
         measured: &JointVec,
@@ -178,16 +188,17 @@ impl JointReply {
         clock: &MotionClock,
         now: Instant,
     ) -> Option<Outcome> {
-        match self {
-            Self::Ready(_) => Some(Outcome::Complete),
-            Self::MoveArmJoints { settle, .. } => verdict(
-                joint_shortfall(measured, target, &settle.tolerance),
-                planned_end(clock),
-                now,
-                settle.timeout,
-            )
-            .map(Outcome::from),
-        }
+        let settle = match self {
+            Self::Ready(_) => &POSTURE_SETTLE,
+            Self::MoveArmJoints { settle, .. } => settle,
+        };
+        verdict(
+            joint_shortfall(measured, target, &settle.tolerance),
+            planned_end(clock),
+            now,
+            settle.timeout,
+        )
+        .map(Outcome::from)
     }
 
     /// End the move of `planner`'s arm on `outcome`, with `measured`, the
@@ -966,6 +977,17 @@ impl Planner {
                 );
                 MovePath::Servo(ServoTrajectory::new(path, duration, now))
             }
+            // Neither the line nor the servo reaches the pose and the exact
+            // solver does: play the straight joint-space path to its
+            // solution as a servo path, from the held setpoint it starts at.
+            CartesianPlan::Joint(ServoPlan { duration, path }) => {
+                info!(
+                    "{}: move_arm start (joint path to the exact solution), duration={:.3}s",
+                    self.side,
+                    duration.as_secs_f64(),
+                );
+                MovePath::Servo(ServoTrajectory::new(path, duration, now))
+            }
         };
         // The line's velocity guard compares each sample against the last
         // commanded target, so the first comparison must sit on the plan's own
@@ -1189,9 +1211,11 @@ mod tests {
 
     /// A posture share whose arm never follows: the governor holds every
     /// step, or the arm stands against an obstacle the backbone cannot see.
-    /// The move completes on its clock.
+    /// It stays in flight until [`POSTURE_SETTLE`] times out past its planned
+    /// end, then fails with `timeout`, naming the joint and how far it
+    /// stands.
     #[tokio::test]
-    async fn a_joint_move_the_governor_holds_still_completes() {
+    async fn a_posture_share_whose_arm_never_follows_fails_with_timeout() {
         let held = [0.0; ARM_DOF];
         let target = [0.5; ARM_DOF];
         let mut planner = test_planner(held);
@@ -1207,17 +1231,36 @@ mod tests {
         let now = Instant::now();
         planner.tick(held, None, &mut goals, &move_slot, now).await;
         assert!(move_slot.is_claimed(), "the move is in flight");
+        let Mode::JointMove(JointMove { traj, .. }) = &planner.mode else {
+            panic!("the goal starts a joint move");
+        };
+        let planned_end = planned_end(traj.clock());
+        let settling = planned_end + POSTURE_SETTLE.timeout / 2;
+        planner
+            .tick(held, None, &mut goals, &move_slot, settling)
+            .await;
+        assert!(
+            done_rx.try_recv().is_err(),
+            "the arm may still settle within the posture's timeout"
+        );
         planner
             .tick(
                 held,
                 None,
                 &mut goals,
                 &move_slot,
-                now + Duration::from_secs(3600),
+                planned_end + POSTURE_SETTLE.timeout,
             )
             .await;
-        let outcome = done_rx.try_recv().expect("the move ends on its clock");
-        assert_eq!(outcome, Outcome::Complete);
+        let failure = match done_rx.try_recv().expect("the settle timed out") {
+            Outcome::Failed(failure) => failure,
+            other => panic!("an arm that never moved cannot settle: {other:?}"),
+        };
+        assert_eq!(failure.kind, FailureKind::Timeout);
+        assert_eq!(
+            failure.message,
+            "left: still 0.500 rad from the target at joint 1, 2.0 s after the planned end"
+        );
         assert_eq!(planner.setpoint(), held, "the arm never left its pose");
         assert!(!move_slot.is_claimed(), "the end releases the slot");
 
@@ -1262,8 +1305,11 @@ mod tests {
                 now + Duration::from_secs(3600),
             )
             .await;
-        let outcome = done_rx.try_recv().expect("the move ends on its clock");
-        assert_eq!(outcome, Outcome::Complete);
+        let outcome = done_rx.try_recv().expect("the settle timed out");
+        assert!(
+            matches!(&outcome, Outcome::Failed(failure) if failure.kind == FailureKind::Timeout),
+            "an arm that stands still cannot settle: {outcome:?}"
+        );
         assert!(!move_slot.is_claimed(), "the end releases the slot");
     }
 

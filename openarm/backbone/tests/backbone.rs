@@ -523,6 +523,38 @@ async fn start_with_left_followers(object_at: f64) -> peppygen::Result<(Harness,
     Ok((harness, LeftFollowers { arm, gripper }))
 }
 
+/// The first limb_states snapshot the node emits with each arm at `posture`
+/// of its side, within 1e-9 rad in every joint.
+async fn snapshot_with_both_arms_at(
+    harness: &mut Harness,
+    posture: fn(openarm_description::Side) -> [f64; 7],
+) -> peppygen::Result<peppygen::fixtures::emitted_topics::limb_state::limb_states::Message> {
+    let joints: Vec<f64> = [
+        openarm_description::Side::Left,
+        openarm_description::Side::Right,
+    ]
+    .into_iter()
+    .flat_map(posture)
+    .collect();
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    loop {
+        let snapshot = next_snapshot(harness).await?;
+        let at_posture = snapshot.joint_positions.len() == joints.len()
+            && snapshot
+                .joint_positions
+                .iter()
+                .zip(&joints)
+                .all(|(measured, posture)| (measured - posture).abs() <= 1e-9);
+        if at_posture {
+            return Ok(snapshot);
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the robot never measured both arms at {joints:?}"
+        );
+    }
+}
+
 /// The next limb_states snapshot the node emits. The node emits one only
 /// once it has seeded every limb, so the first one also says that streaming
 /// began.
@@ -1707,10 +1739,8 @@ async fn a_stop_leaves_a_settled_gripper_closed() -> peppygen::Result<()> {
 
 /// A posture result gives arm_names and, in that order, the grasp pose of
 /// each arm measured when the goal completes. limb_state gives the same
-/// pose for the same joints. A posture completes when the move's time ran
-/// out, not when the arms arrived. Here both arms stand still at HOME, so
-/// move_to_ready completes with neither arm at Ready. move_to_home gives
-/// its result the same way.
+/// pose for the same joints. Here both arms follow their setpoints, so each
+/// posture completes once both arms stand at it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_posture_result_reports_each_arms_measured_grasp_point() -> peppygen::Result<()> {
     let (mut harness, mocks) = start_ready_vacant(params()).await?;
@@ -1718,16 +1748,29 @@ async fn a_posture_result_reports_each_arms_measured_grasp_point() -> peppygen::
         mocks.deps.robot_init.is_ready,
         Arc::new(AtomicBool::new(true)),
     );
-    pump_arm_at_home!(
+    let _left = spawn_left_arm_follower(
         mocks.pairings.left_arm.joint_states,
-        peppygen::paired_topics::left_arm::joint_states
+        mocks.pairings.left_arm.joint_setpoints,
     );
-    pump_right_arm_and_grippers!(mocks);
-    let snapshot = next_snapshot(&mut harness).await?;
+    let _right = spawn_right_arm_follower(
+        mocks.pairings.right_arm.joint_states,
+        mocks.pairings.right_arm.joint_setpoints,
+    );
+    pump_gripper_half_open!(
+        mocks.pairings.left_gripper.gripper_states,
+        peppygen::paired_topics::left_gripper::gripper_states
+    );
+    pump_gripper_half_open!(
+        mocks.pairings.right_gripper.gripper_states,
+        peppygen::paired_topics::right_gripper::gripper_states
+    );
+    next_snapshot(&mut harness).await?;
 
     let ready = complete_posture!(harness, move_to_ready, 0.0);
+    let at_ready = snapshot_with_both_arms_at(&mut harness, openarm_description::ready).await?;
     let home = complete_posture!(harness, move_to_home, 0.0);
-    for result in [ready, home] {
+    let at_home = snapshot_with_both_arms_at(&mut harness, openarm_description::home).await?;
+    for (result, snapshot) in [(ready, at_ready), (home, at_home)] {
         assert_eq!(result.arm_names, ["left_arm", "right_arm"]);
         assert_all_close("positions", &result.positions, &snapshot.positions, 1e-9);
         assert_all_close(
@@ -1737,6 +1780,50 @@ async fn a_posture_result_reports_each_arms_measured_grasp_point() -> peppygen::
             1e-9,
         );
     }
+    harness.shutdown().await
+}
+
+/// A posture that an arm does not reach fails with `timeout`, its message
+/// led by the side of that arm and naming the joint and how far it stands,
+/// no sooner than 2 s after the planned end. Here the right arm stands still
+/// at HOME, as an arm that a bench in front of the robot stops does: the
+/// robot does not see the bench. move_to_home, where both arms already
+/// stand, completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_posture_an_arm_stops_short_of_fails_with_timeout() -> peppygen::Result<()> {
+    use peppygen::fixtures::exposed_actions::postures::move_to_ready;
+
+    let (mut harness, mocks) = start_ready_vacant(params()).await?;
+    pump_is_ready(
+        mocks.deps.robot_init.is_ready,
+        Arc::new(AtomicBool::new(true)),
+    );
+    let _left = spawn_left_arm_follower(
+        mocks.pairings.left_arm.joint_states,
+        mocks.pairings.left_arm.joint_setpoints,
+    );
+    pump_right_arm_and_grippers!(mocks);
+    next_snapshot(&mut harness).await?;
+
+    let goal = send_posture_goal!(harness, move_to_ready, 0.0);
+    assert!(goal.accepted, "goal refused: {:?}", goal.refusal);
+    let failure = match goal.get_result(DEADLINE).await?.outcome {
+        move_to_ready::ResultOutcome::Failed(failure) => failure,
+        other => panic!("a right arm held at HOME cannot reach Ready: {other:?}"),
+    };
+    assert_eq!(failure.kind, move_to_ready::FailureKind::Timeout);
+    assert!(
+        failure.message.starts_with("right: still ")
+            && failure.message.contains(" rad from the target at joint "),
+        "the failure names the arm and its joint: {}",
+        failure.message
+    );
+    assert!(
+        seconds_after_planned_end(&failure.message) >= 2.0,
+        "the failure came no sooner than the posture's settle timeout: {}",
+        failure.message
+    );
+    complete_posture!(harness, move_to_home, 0.0);
     harness.shutdown().await
 }
 
@@ -1863,7 +1950,29 @@ async fn a_stopped_posture_reports_where_the_arms_stopped() -> peppygen::Result<
 /// move_to_home. It gets no opening other than that one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_posture_move_leaves_the_grippers_alone() -> peppygen::Result<()> {
-    let (harness, LeftFollowers { gripper, .. }) = start_with_left_followers(0.0).await?;
+    let (mut harness, mocks) = start_ready_vacant(params()).await?;
+    pump_is_ready(
+        mocks.deps.robot_init.is_ready,
+        Arc::new(AtomicBool::new(true)),
+    );
+    let _left = spawn_left_arm_follower(
+        mocks.pairings.left_arm.joint_states,
+        mocks.pairings.left_arm.joint_setpoints,
+    );
+    let _right = spawn_right_arm_follower(
+        mocks.pairings.right_arm.joint_states,
+        mocks.pairings.right_arm.joint_setpoints,
+    );
+    pump_gripper_half_open!(
+        mocks.pairings.right_gripper.gripper_states,
+        peppygen::paired_topics::right_gripper::gripper_states
+    );
+    let gripper = spawn_left_gripper_follower(
+        mocks.pairings.left_gripper.gripper_states,
+        mocks.pairings.left_gripper.gripper_setpoints,
+        0.0,
+    );
+    next_snapshot(&mut harness).await?;
 
     let data = complete_left_gripper_move(&harness, 0.2, 0.0).await?;
     assert!(data.settled, "{data:?}");

@@ -397,6 +397,9 @@ def test_a_posture_does_not_claim_or_drive_the_gripper(follower_never_stale):
     # From its first sample to its last, the posture sends the gripper
     # nothing. The gripper stays free for its own goals.
     for now in (0.0, plan.profile.duration_s):
+        if now == plan.profile.duration_s:
+            # The follower stands at the posture by its planned end.
+            coordinator.measured_joints.set(READY_POSITIONS_RAD)
         coordinator.arm_published(True, coordinator.arm_tick(now))
         assert coordinator.gripper_tick(now) is None
     assert plan.done.is_set()
@@ -585,14 +588,33 @@ async def test_a_posture_result_reports_the_grasp_point_of_the_measured_joints(
     coordinator, layer = make_layer(kinematics)
     coordinator.measured_joints.set(MEASURED)
     plan = layer._admit_posture(READY_POSITIONS_RAD, 0.0)
-    # The plan ends. The follower measures the arm at its start position.
+    # The plan ends with the follower 0.05 rad off the posture in every
+    # joint, inside the posture's settle: the result gives where it stands.
+    near_ready = tuple(p + 0.05 for p in READY_POSITIONS_RAD)
+    coordinator.measured_joints.set(near_ready)
     run_arm_plan_to_its_end(coordinator, plan)
     ctx = FakeGoalContext()
     await layer.drive_posture(ctx, plan, kinematics)
-    position, orientation = kinematics.forward_kinematics(MEASURED)
+    position, orientation = kinematics.forward_kinematics(near_ready)
     assert position != kinematics.forward_kinematics(READY_POSITIONS_RAD)[0]
     assert ctx.completed == (["arm"], list(position), list(orientation))
     assert coordinator.try_claim_arm()
+
+
+def test_a_posture_the_arm_stops_short_of_fails_with_timeout(follower_never_stale):
+    coordinator, layer = make_layer()
+    coordinator.measured_joints.set(MEASURED)
+    plan = layer._admit_posture(READY_POSITIONS_RAD, 0.0)
+    # An object holds the arm where it started: the follower never moves.
+    coordinator.arm_published(True, coordinator.arm_tick(0.0))
+    end_s = plan.profile.duration_s
+    coordinator.arm_published(True, coordinator.arm_tick(end_s))
+    assert not plan.done.is_set(), "the arm has 2 s to settle at the posture"
+    coordinator.arm_tick(end_s + 2.0)
+    assert plan.done.is_set()
+    assert plan.failed.kind is FailureKind.TIMEOUT
+    assert plan.failed.message.startswith("still ")
+    assert plan.failed.message.endswith(" rad from the target at joint 5, 2.0 s after the planned end")
 
 
 async def test_a_posture_with_stale_follower_state_reports_empty_arrays(follower_never_stale):
@@ -600,6 +622,8 @@ async def test_a_posture_with_stale_follower_state_reports_empty_arrays(follower
     coordinator, layer = make_layer(kinematics)
     coordinator.measured_joints.set(MEASURED)
     plan = layer._admit_posture(READY_POSITIONS_RAD, 0.0)
+    # The follower stands at the posture by its planned end.
+    coordinator.measured_joints.set(READY_POSITIONS_RAD)
     run_arm_plan_to_its_end(coordinator, plan)
     # The follower sends no more state after it receives the last sample.
     # No measurement is fresh, thus the result gives no pose.

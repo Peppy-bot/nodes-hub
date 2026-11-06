@@ -42,6 +42,7 @@ from so101_description.limbs import ARM_LIMB, GRIPPER_LIMB
 from so101_description.limits import JointLimits
 from so101_description.staleness import COMMAND_SILENCE_LIMIT_S
 from so101_description.transforms import relative_rotation_rad
+from so101_description.units import NUM_JOINTS
 
 from so101_backbone.failures import FailureKind
 from so101_backbone.governor import EEGovernor, rate_step
@@ -184,13 +185,11 @@ class PoseSettle:
         return f"still {distance_m * 1000:.1f} mm / {angle_rad:.2f} rad from the target"
 
 
-@dataclass(frozen=True)
-class PostureEnd:
-    """How a posture move ends: at the planned end of its trajectory,
-    judging nothing."""
-
-    def shortfall(self, _measured, _target, _kinematics) -> None:
-        return None
+# How a posture move (move_to_ready or move_to_home) ends past the planned
+# end of its trajectory: each measured joint within 0.1 rad of the posture, the
+# tolerance the robots' endpoint calls usual for a joint move, within 2 s. An
+# arm that an object holds short of the posture fails with `timeout`.
+POSTURE_SETTLE = JointSettle(tolerances_rad=(0.1,) * NUM_JOINTS, timeout_s=2.0)
 
 
 @dataclass
@@ -198,7 +197,7 @@ class ArmPlan:
     profile: ArmProfile
     # How the plan ends past the planned end of its profile, judged on the
     # measured joints each tick.
-    settle: JointSettle | PoseSettle | PostureEnd
+    settle: JointSettle | PoseSettle
     done: asyncio.Event = field(default_factory=asyncio.Event)
     started_monotonic: float | None = None
     aborted: bool = False
@@ -473,7 +472,7 @@ class Coordinator:
     # ------------------------------------------------------------------- plans
 
     def adopt_arm_plan(
-        self, profile: ArmProfile, settle: JointSettle | PoseSettle | PostureEnd
+        self, profile: ArmProfile, settle: JointSettle | PoseSettle
     ) -> ArmPlan:
         """Install an admitted action's trajectory and its settle. Streamed
         input already in flight must not re-target the arm when the plan

@@ -1520,7 +1520,7 @@ mod tests {
 
     /// A grasp request measures each arm when the loop serves it, not when
     /// the arm's posture share ended:
-    /// - the left share runs its time out, then the left follower goes
+    /// - the left share settles at its posture, then the left follower goes
     ///   stale, so the left arm has no fresh measurement;
     /// - the right share fails on a stale follower, then the right follower
     ///   recovers, so the right arm has the grasp pose of its latest joints.
@@ -1552,6 +1552,7 @@ mod tests {
             tick_arm(arm, planner, Admission::Live, start).await;
         }
         assert!(done_rx.try_recv().is_err(), "both shares are in flight");
+        left_measured.send_replace(standing_at([0.3; ARM_DOF]));
         let late = start + Duration::from_secs(3600);
         tick_arm(
             &mut channels.left,

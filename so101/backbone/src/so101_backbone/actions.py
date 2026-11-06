@@ -50,8 +50,8 @@ from so101_backbone.coordinator import (
     Coordinator,
     GripperPlan,
     JointSettle,
+    POSTURE_SETTLE,
     PoseSettle,
-    PostureEnd,
     joint_past_tolerance,
 )
 from so101_backbone.failures import FailureKind, Refusal
@@ -342,7 +342,7 @@ class ActionLayer:
         return self._admit_trajectory(target, duration_s, settle)
 
     def _admit_trajectory(
-        self, target: tuple[float, ...], duration_s: float, settle: JointSettle | PostureEnd
+        self, target: tuple[float, ...], duration_s: float, settle: JointSettle
     ) -> ArmPlan:
         """Claim the arm's busy slot and install the trajectory to `target`
         with `settle`, or raise Refusal. The claim happens last so a
@@ -549,10 +549,10 @@ class ActionLayer:
         )
 
     def _admit_posture(self, target: tuple[float, ...], duration_s: float) -> ArmPlan:
-        """A posture move runs to the planned end of its trajectory and
-        reports the measured grasp point."""
+        """A posture move completes once the arm settles at the posture
+        (POSTURE_SETTLE), and reports the measured grasp point."""
         _require_duration(duration_s, "duration_s")
-        return self._admit_trajectory(target, duration_s, PostureEnd())
+        return self._admit_trajectory(target, duration_s, POSTURE_SETTLE)
 
     # ----------------------------------------------------- decide constructors
 
