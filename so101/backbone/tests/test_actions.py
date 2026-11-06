@@ -647,11 +647,21 @@ async def test_a_stopped_posture_reports_the_measured_grasp_point(
 def test_admission_refuses_before_claiming():
     coordinator, layer = make_layer()
     coordinator.measured_joints.set((0.0,) * 5)
-    with pytest.raises(Refusal, match="target out of joint limits") as raised:
+    with pytest.raises(Refusal) as raised:
         admit_joints(layer, (9.0,) * 5, 0.0)
-    assert raised.value.kind is FailureKind.REJECTED
+    assert refusal_of(raised) == (
+        FailureKind.REJECTED,
+        "the target puts joint 1 at 9.0 rad, outside its limits [-3.1, 3.1]",
+    )
     # A refused goal never left the slot held.
     assert coordinator.try_claim_arm()
+
+
+def test_a_target_a_hair_outside_the_limits_runs_at_the_limit():
+    coordinator, layer = make_layer()
+    coordinator.measured_joints.set((0.0,) * 5)
+    plan = admit_joints(layer, (3.1009, 0.0, 0.0, 0.0, -3.1005), 0.0)
+    assert plan.profile.sample(plan.profile.duration_s) == pytest.approx((3.1, 0.0, 0.0, 0.0, -3.1))
 
 
 UNKNOWN_ARM = 'unknown arm_name: this robot\'s arm is "arm"'
@@ -666,7 +676,10 @@ ONE_ARM_ONCE = 'arms must name this robot\'s arm, "arm", once'
         ({"arm_names": ("arm", "arm")}, ONE_ARM_ONCE),
         ({"arm_names": ()}, ONE_ARM_ONCE),
         ({"waypoints": ()}, "waypoints is empty: give at least one waypoint"),
-        ({"waypoints": ((0.1,) * 5, (9.0,) * 5)}, "waypoint 2 out of joint limits"),
+        (
+            {"waypoints": ((0.1,) * 5, (9.0,) * 5)},
+            "waypoint 2 puts joint 1 at 9.0 rad, outside its limits [-3.1, 3.1]",
+        ),
         (
             {"waypoints": ((0.1, 0.1, math.nan, 0.1, 0.1),)},
             "waypoint 1 has a non-finite joint position",

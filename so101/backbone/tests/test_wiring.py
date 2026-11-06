@@ -679,7 +679,8 @@ async def test_out_of_limit_goal_is_refused():
             TIMEOUT_S,
         )
         assert goal.refusal == move_arm_joints_fx.Failure(
-            move_arm_joints_fx.FailureKind.REJECTED, "target out of joint limits"
+            move_arm_joints_fx.FailureKind.REJECTED,
+            "the target puts joint 1 at 9.0 rad, outside its limits [-1.91986, 1.91986]",
         )
 
 
@@ -702,7 +703,10 @@ async def test_a_joint_path_goal_this_robot_does_not_take_is_refused():
     async with harness.start(setup, parameters=make_parameters()) as h:
         await publish_measured(h)
         for goal_data, refusal in (
-            (joint_path_goal(MEASURED, [9.0] * 5), "waypoint 2 out of joint limits"),
+            (
+                joint_path_goal(MEASURED, [9.0] * 5),
+                "waypoint 2 puts joint 1 at 9.0 rad, outside its limits [-1.91986, 1.91986]",
+            ),
             (
                 joint_path_goal(MEASURED, arm_names=["left_arm"]),
                 'unknown arm_name: this robot\'s arm is "arm"',

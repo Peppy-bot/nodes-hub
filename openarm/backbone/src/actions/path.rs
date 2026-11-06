@@ -26,7 +26,7 @@ use srs_model::{JointVec, Limit};
 use tokio::sync::{mpsc, oneshot};
 use tracing::error;
 
-use crate::actions::arm::{joint_outside_limits, joint_tolerances_from_wire};
+use crate::actions::arm::{joint_tolerances_from_wire, within_limits};
 use crate::actions::{
     ARM_WORDS, check_limb_free, claim_arms, collect_ends, move_seconds_from_wire,
 };
@@ -63,17 +63,20 @@ fn execute_joint_path_goal(
         order.sides().iter().copied().zip(&d.arms).collect();
     let counts: Vec<usize> = d.arms.iter().map(|arm| arm.waypoints.len()).collect();
     let count = order.waypoint_count(&counts)?;
-    for (side, arm) in &arms {
-        for (k, waypoint) in arm.waypoints.iter().enumerate() {
-            waypoint_within_limits(*side, k, &waypoint.joint_positions, &limits[*side])?;
-        }
-    }
-    let waypoints = (0..count)
-        .map(|k| {
-            arms.iter()
-                .flat_map(|(_, arm)| arm.waypoints[k].joint_positions)
-                .collect()
+    let taken = arms
+        .iter()
+        .map(|(side, arm)| {
+            arm.waypoints
+                .iter()
+                .enumerate()
+                .map(|(k, waypoint)| {
+                    waypoint_within_limits(*side, k, &waypoint.joint_positions, &limits[*side])
+                })
+                .collect::<std::result::Result<Vec<JointVec>, String>>()
         })
+        .collect::<std::result::Result<Vec<Vec<JointVec>>, String>>()?;
+    let waypoints = (0..count)
+        .map(|k| taken.iter().flat_map(|arm| arm[k]).collect())
         .collect();
     let expected_starts = arms
         .iter()
@@ -101,23 +104,20 @@ fn execute_joint_path_goal(
     })
 }
 
-/// Refuse `q`, waypoint `k` (from 0) of the arm on `side`, where it is not
-/// finite or puts a joint outside `limits`, naming the waypoint and the
-/// joint.
+/// `q`, waypoint `k` (from 0) of the arm on `side`, inside `limits`
+/// ([`within_limits`]), or its refusal where it is not finite or puts a
+/// joint outside `limits`, naming the waypoint and the joint.
 fn waypoint_within_limits(
     side: Side,
     k: usize,
     q: &JointVec,
     limits: &[Limit; ARM_DOF],
-) -> std::result::Result<(), String> {
+) -> std::result::Result<JointVec, String> {
     let waypoint = format!("waypoint {} of {}", k + 1, side.arm_name());
     if !q.iter().all(|v| v.is_finite()) {
         return Err(format!("{waypoint} holds a non-finite value"));
     }
-    match joint_outside_limits(q, limits) {
-        None => Ok(()),
-        Some(outside) => Err(format!("{waypoint} puts {outside}")),
-    }
+    within_limits(q, limits).map_err(|outside| format!("{waypoint} puts {outside}"))
 }
 
 /// The expected start of the arm on `side` off the wire: none when
@@ -433,6 +433,19 @@ mod tests {
             assert_eq!(parsed.expected_starts, sides.map(|side| Some(start[side])));
             assert_eq!(parsed.settle.tolerance, vec![0.03; 2 * ARM_DOF]);
         }
+    }
+
+    /// A waypoint whose elbow lies a hair under its floor, as a measured
+    /// pose can, runs at the floor; its other joints run as sent.
+    #[test]
+    fn a_waypoint_a_hair_outside_its_limits_runs_at_the_limit() {
+        let mut waypoints = [joints(0.10, 0.12)];
+        waypoints[0][Side::Left][3] = 0.0499925;
+        let request = goal(&["left_arm"], &waypoints, None);
+        let parsed = execute_joint_path_goal(&request, &limits()).expect("a goal at the limits");
+        let mut expected = [0.10; ARM_DOF];
+        expected[3] = 0.05;
+        assert_eq!(parsed.path.waypoints, [expected.to_vec()]);
     }
 
     /// A goal of one arm moves that arm alone, and an arm with no expected

@@ -94,8 +94,15 @@ fn arm_move_request(
     })
 }
 
-/// A joint position outside the limits of its joint: the joint counted from
-/// 0, its position and its limits.
+/// How far outside a joint limit a target may lie and still be taken, at
+/// that limit (rad). A measured position sent back as a target lies that
+/// close: an elbow that Home holds at its floor settles a hair on either
+/// side of it.
+pub(super) const LIMIT_SLACK_RAD: f64 = 0.001;
+
+/// A joint position farther outside the limits of its joint than
+/// [`LIMIT_SLACK_RAD`]: the joint counted from 0, its position and its
+/// limits.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct OutsideLimits {
     pub joint: usize,
@@ -118,18 +125,25 @@ impl std::fmt::Display for OutsideLimits {
     }
 }
 
-/// The first joint whose position in `q` lies outside `limits`, if any.
-pub(super) fn joint_outside_limits(
+/// `q` with each joint outside its limits by at most [`LIMIT_SLACK_RAD`]
+/// taken at the limit, or the first joint that lies farther out.
+pub(super) fn within_limits(
     q: &JointVec,
     limits: &[Limit; ARM_DOF],
-) -> Option<OutsideLimits> {
-    (0..ARM_DOF)
-        .find(|&j| !(limits[j].lo..=limits[j].hi).contains(&q[j]))
-        .map(|joint| OutsideLimits {
-            joint,
-            position: q[joint],
-            limits: limits[joint],
-        })
+) -> std::result::Result<JointVec, OutsideLimits> {
+    let mut taken = *q;
+    for (joint, (position, limit)) in taken.iter_mut().zip(limits).enumerate() {
+        let slack = limit.lo - LIMIT_SLACK_RAD..=limit.hi + LIMIT_SLACK_RAD;
+        if !slack.contains(position) {
+            return Err(OutsideLimits {
+                joint,
+                position: *position,
+                limits: *limit,
+            });
+        }
+        *position = position.clamp(limit.lo, limit.hi);
+    }
+    Ok(taken)
 }
 
 /// A `move_arm` goal parsed off the wire: the move to plan, and the settle it
@@ -162,7 +176,8 @@ fn move_arm_goal(d: &move_arm::GoalRequestData) -> std::result::Result<MoveArmGo
 }
 
 /// A `move_arm_joints` goal parsed off the wire: a finite target inside the
-/// arm's joint limits, the duration, and the settle it asks for.
+/// arm's joint limits ([`within_limits`]), the duration, and the settle it
+/// asks for.
 struct JointMoveRequest {
     side: Side,
     target: JointVec,
@@ -179,16 +194,15 @@ fn joint_move_request(
         return Err("non-finite joint target".to_string());
     }
     let duration = move_seconds_from_wire("duration_s", d.duration_s)?;
-    if let Some(outside) = joint_outside_limits(&d.joint_positions, &limits[side]) {
-        return Err(format!("the target puts {outside}"));
-    }
+    let target = within_limits(&d.joint_positions, &limits[side])
+        .map_err(|outside| format!("the target puts {outside}"))?;
     let settle = Settle {
         tolerance: joint_tolerances_from_wire(d.settle_tolerances_rad)?,
         timeout: move_seconds_from_wire("settle_timeout_s", d.settle_timeout_s)?,
     };
     Ok(JointMoveRequest {
         side,
-        target: d.joint_positions,
+        target,
         duration,
         settle,
     })
@@ -382,10 +396,11 @@ mod tests {
     }
 
     /// An elbow measured a hair under its floor, as a world saved at Home
-    /// can hold it, is refused with the joint, its position and its limits,
-    /// and the elbow at its floor is taken.
+    /// can hold it, is taken at its floor; one farther under it is refused
+    /// with the joint, its position and its limits.
     #[test]
-    fn a_joint_target_outside_its_limits_is_refused_with_the_joint_its_position_and_its_limits() {
+    fn a_joint_target_a_hair_outside_its_limits_is_taken_at_the_limit_and_one_farther_out_refused()
+    {
         let limits = ArmPair::from_fn(|side| {
             crate::test_support::bundled_arm(openarm_description::HardwareVersion::V2, side)
                 .limits()
@@ -397,13 +412,18 @@ mod tests {
             settle_tolerances_rad: [0.01; ARM_DOF],
             settle_timeout_s: 1.0,
         };
-        goal.joint_positions[3] = 0.0499925;
+        goal.joint_positions[3] = 0.0489;
         assert_eq!(
             joint_move_request(&goal, &limits).err().as_deref(),
-            Some("the target puts joint 4 at 0.0499925 rad, outside its limits [0.05, 2.4435]")
+            Some("the target puts joint 4 at 0.0489 rad, outside its limits [0.05, 2.4435]")
         );
-        goal.joint_positions[3] = 0.05;
-        assert!(joint_move_request(&goal, &limits).is_ok());
+        for position in [0.0499925, 0.05, 0.0491] {
+            goal.joint_positions[3] = position;
+            let taken = joint_move_request(&goal, &limits).unwrap().target;
+            assert_eq!(taken[3], 0.05, "{position}");
+        }
+        goal.joint_positions[3] = 0.4;
+        assert_eq!(joint_move_request(&goal, &limits).unwrap().target[3], 0.4);
     }
 
     #[test]
