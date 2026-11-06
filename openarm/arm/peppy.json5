@@ -69,8 +69,11 @@
       // Hardware-loop rate (Hz). Required: pick deliberately per deployment, and
       // confirm `overruns=0` at the target rate during bring-up.
       control_rate_hz: "u32",
-      // MIT-control gains applied every control tick, one per joint (1-indexed).
-      // Match the openarm teleop config (Kp/Kd).
+      // MIT-control gains applied every control tick, one per joint (1-indexed). kp and
+      // kd1 are the openarm teleop config's. kd2 to kd7 stand above it: on the real v2 at
+      // 250 Hz, stepping kd5 to kd7 through 0.5, 1.0 and 1.5 and then kd2 to kd4 from 3.0
+      // to 4.5 cut the stalls of a 40 s joint path with the same tracking, and the result
+      // at 100 Hz stalls in 6% of its windows against 25%. Measured on v2 alone.
       kp1: { $type: "f64", $default: 240.0 },
       kp2: { $type: "f64", $default: 240.0 },
       kp3: { $type: "f64", $default: 240.0 },
@@ -79,12 +82,12 @@
       kp6: { $type: "f64", $default: 31.0 },
       kp7: { $type: "f64", $default: 25.0 },
       kd1: { $type: "f64", $default: 3.0 },
-      kd2: { $type: "f64", $default: 3.0 },
-      kd3: { $type: "f64", $default: 3.0 },
-      kd4: { $type: "f64", $default: 3.0 },
-      kd5: { $type: "f64", $default: 0.2 },
-      kd6: { $type: "f64", $default: 0.2 },
-      kd7: { $type: "f64", $default: 0.2 },
+      kd2: { $type: "f64", $default: 4.5 },
+      kd3: { $type: "f64", $default: 4.5 },
+      kd4: { $type: "f64", $default: 4.5 },
+      kd5: { $type: "f64", $default: 1.5 },
+      kd6: { $type: "f64", $default: 1.5 },
+      kd7: { $type: "f64", $default: 1.5 },
       // Rate (Hz) of the always-on measured-state stream (`joint_states`), which the
       // backbone consumes. Required: consumers' needs vary too much for a default.
       state_rate_hz: "u32",

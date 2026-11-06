@@ -29,9 +29,9 @@ pub struct Params {
 /// convention against the v2 URDF axes at bring-up (a flipped joint would need its `Fo`
 /// sign flipped). Not defaulted differently in code because the reference does not.
 ///
-/// These are the physical (full) friction torques, applied directly at full weight
-/// (matching the openarm teleop follower). Fo is a non-zero static offset, so at rest the
-/// model commands a small directional bias (intentional Coulomb breakaway).
+/// These are the physical (full) friction torques, applied directly at full weight. Fo is a
+/// non-zero static offset, so at zero velocity the model commands a small directional bias
+/// (intentional Coulomb breakaway).
 pub const NOMINAL: Params = Params {
     fc: [0.306, 0.306, 0.40, 0.166, 0.050, 0.093, 0.172],
     fv: [0.063, 0.063, 0.604, 0.813, 0.029, 0.072, 0.084],
@@ -39,9 +39,9 @@ pub const NOMINAL: Params = Params {
     k: [2.8417, 2.8417, 2.9065, 13.0038, 15.1771, 24.2287, 0.7888],
 };
 
-/// Friction torque at velocity `qdot` for the given constants.
-pub fn torques(p: &Params, qdot: &JointVec) -> JointVec {
-    std::array::from_fn(|i| p.fo[i] + p.fv[i] * qdot[i] + p.fc[i] * f64::tanh(p.k[i] * qdot[i]))
+/// Friction torque at velocity `dq` for the given constants.
+pub fn torques(p: &Params, dq: &JointVec) -> JointVec {
+    std::array::from_fn(|i| p.fo[i] + p.fv[i] * dq[i] + p.fc[i] * f64::tanh(p.k[i] * dq[i]))
 }
 
 #[cfg(test)]

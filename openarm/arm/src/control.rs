@@ -2,9 +2,9 @@
 //! control loop following the backbone's governed setpoint. The bimanual coordination
 //! backbone (openarm_backbone) owns all trajectory generation, stream following, and
 //! collision governing, and streams the resolved (q_des, dq_des) per arm; this
-//! loop adds only the realtime feedforward (gravity/Coriolis/friction the backbone
-//! cannot compute remotely) and a final clamp to the joint limits, then commands
-//! the motors. There is no mode state machine and no streaming logic here.
+//! loop adds only the realtime feedforward (gravity at the pose it measures, Coriolis
+//! and friction at the commanded velocity) and a final clamp to the joint limits, then
+//! commands the motors. There is no mode state machine and no streaming logic here.
 //!
 //! On shutdown the loop disables the motors and lets the arm go limp. It does not
 //! park to a pose: a collision-aware return-to-home is the backbone's job (it sees both
@@ -42,6 +42,12 @@ const CONTEXT: &str = "arm control";
 
 /// All-zero joint vector: the desired velocity sent while holding a pose.
 const ZERO: JointVec = [0.0; ARM_DOF];
+
+/// How long a governed setpoint's velocity holds after it arrives. Once the stream has
+/// been silent this long, the arm holds the setpoint's position at zero velocity, with
+/// the `kd` term and the feedforward at rest. The largest gap between setpoints on the
+/// real arm on a Jetson was 38 ms.
+const SETPOINT_STALE_AFTER: Duration = Duration::from_millis(50);
 
 /// Settle time after disabling the motors on shutdown, before draining ACK
 /// frames. Mirrors the ROS2 v10_simple_hardware on_deactivate sleep.
@@ -107,15 +113,16 @@ async fn supervise(
     token.cancel();
 }
 
-/// The single motor-owning control loop. Each tick reads the measured state,
-/// computes the feedforward, reports the measured state upward, and commands the
-/// motors to the latest governed setpoint (clamped), holding the measured pose
-/// until the first governed setpoint arrives or whenever the stream is empty. On
-/// cancellation it disables the motors and signals `shutdown_tx`.
+/// The single motor-owning control loop. Each tick reads the measured state, reports
+/// it upward, and commands the motors to the latest governed setpoint (clamped) with
+/// the feedforward at that setpoint's velocity, holding the measured pose until the
+/// first governed setpoint arrives or whenever the stream is empty, and the setpoint's
+/// position once its stream goes silent. On cancellation it disables the motors and
+/// signals `shutdown_tx`.
 async fn run_control(
     arm: Arc<Mutex<ArmCan>>,
     cfg: ControlConfig,
-    mut model: srs_model::Arm,
+    model: srs_model::Arm,
     wiring: StreamWiring,
     token: CancellationToken,
     shutdown_tx: oneshot::Sender<()>,
@@ -138,7 +145,6 @@ async fn run_control(
     loop {
         let (state, read) = read_state(&arm, receive);
         let (q, qdot) = (state.positions, state.velocities);
-        let ff_tau = feedforward(&mut model, &q, &qdot);
         wiring.measured.send_replace(Some(MeasuredState {
             positions: q,
             velocities: qdot,
@@ -168,22 +174,15 @@ async fn run_control(
             }
         }
 
-        // Follow the latest governed setpoint; hold the measured pose (zero
-        // desired velocity) until the backbone's stream is live, so the arm never
-        // lunges before the backbone is up.
-        let (q_des, dq_des) = match *wiring.governed.borrow() {
-            Some(GovernedSetpoint { q_des, dq_des }) => {
-                clamp_setpoint_to_limits(&q_des, &dq_des, &cfg.limits)
-            }
-            None => (q, ZERO),
-        };
+        let governed = *wiring.governed.borrow();
+        let tick = tick_command(&model, &q, governed, &cfg.limits, Instant::now());
 
         // A driver fault costs this tick's frames, not the loop: the motors
         // hold their last commanded pose, the next tick re-sends an absolute
         // command, and the disable that stopping would imply travels over the
         // same socket that just failed. One verdict per tick, first error wins,
         // so a persistent fault logs as one throttled burst.
-        let sent = command(&arm, &cfg, &ff_tau, &q_des, &dq_des, &token);
+        let sent = command(&arm, &cfg, &tick, &token);
         match read.and(sent) {
             Ok(()) => can_errors.success(CONTEXT),
             Err(e) => can_errors.failure(CONTEXT, &e),
@@ -233,14 +232,51 @@ fn reenable_motors(arm: &Mutex<ArmCan>, token: &CancellationToken) {
     }
 }
 
-/// One tick of rigid-body feedforward: gravity and Coriolis from the posed chain
-/// (carrying the distal gripper payload) plus locally computed friction, so the
-/// PD term only corrects residual error.
-fn feedforward(model: &mut srs_model::Arm, q: &JointVec, qdot: &JointVec) -> JointVec {
+/// What one tick commands the motors.
+#[derive(Debug, PartialEq)]
+struct TickCommand {
+    q_des: JointVec,
+    dq_des: JointVec,
+    ff_tau: JointVec,
+}
+
+/// One tick's command from the measured pose at `now`: the latest governed setpoint
+/// clamped into the joint limits, at zero velocity once [`SETPOINT_STALE_AFTER`] has
+/// passed since it arrived, or the measured pose at zero desired velocity until the
+/// backbone's stream is live, so the arm never lunges before the backbone is up.
+fn tick_command(
+    model: &srs_model::Arm,
+    q: &JointVec,
+    governed: Option<GovernedSetpoint>,
+    limits: &[Limit; ARM_DOF],
+    now: Instant,
+) -> TickCommand {
+    let (q_des, dq_des) = match governed {
+        Some(setpoint)
+            if now.saturating_duration_since(setpoint.received) > SETPOINT_STALE_AFTER =>
+        {
+            clamp_setpoint_to_limits(&setpoint.q_des, &ZERO, limits)
+        }
+        Some(setpoint) => clamp_setpoint_to_limits(&setpoint.q_des, &setpoint.dq_des, limits),
+        None => (*q, ZERO),
+    };
+    let ff_tau = feedforward(model, q, &dq_des);
+    TickCommand {
+        q_des,
+        dq_des,
+        ff_tau,
+    }
+}
+
+/// One tick of rigid-body feedforward: gravity at the measured pose and Coriolis
+/// at the commanded velocity from the posed chain (carrying the distal gripper
+/// payload), plus locally computed friction at the commanded velocity, so the PD
+/// term only corrects residual error.
+fn feedforward(model: &srs_model::Arm, q: &JointVec, dq_des: &JointVec) -> JointVec {
     let posed = model.at(q);
     let gravity = posed.gravity_torques();
-    let coriolis = posed.coriolis_torques(qdot);
-    let friction = friction::torques(&friction::NOMINAL, qdot);
+    let coriolis = posed.coriolis_torques(dq_des);
+    let friction = friction::torques(&friction::NOMINAL, dq_des);
     std::array::from_fn(|i| gravity[i] + coriolis[i] + friction[i])
 }
 
@@ -249,9 +285,7 @@ fn feedforward(model: &mut srs_model::Arm, q: &JointVec, qdot: &JointVec) -> Joi
 fn command(
     arm: &Mutex<ArmCan>,
     cfg: &ControlConfig,
-    ff_tau: &JointVec,
-    q_des: &JointVec,
-    dq_des: &JointVec,
+    tick: &TickCommand,
     token: &CancellationToken,
 ) -> openarm_can::Result<()> {
     let mut a = lock_ignoring_poison(arm);
@@ -261,7 +295,7 @@ fn command(
     if token.is_cancelled() {
         return Ok(());
     }
-    a.mit_control(&cfg.kp, &cfg.kd, q_des, dq_des, ff_tau)
+    a.mit_control(&cfg.kp, &cfg.kd, &tick.q_des, &tick.dq_des, &tick.ff_tau)
 }
 
 /// Clamp a governed setpoint into the joint position limits, the final guard
@@ -318,6 +352,118 @@ fn read_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openarm_description::{HardwareVersion, Side};
+
+    /// A posture of the v2 right arm, bent at the elbow and inside its limits.
+    const POSE: JointVec = [0.15, 0.4, -0.48, 0.95, 0.1, 0.1, 0.1];
+    /// A commanded velocity on every joint.
+    const DQ: JointVec = [0.3, -0.2, 0.25, 0.4, -0.5, 0.2, 0.1];
+
+    fn v2_arm() -> srs_model::Arm {
+        HardwareVersion::V2
+            .arm_model(Side::Right)
+            .expect("build the arm from the bundled URDF")
+    }
+
+    /// A setpoint that arrived just now.
+    fn arrived(q_des: JointVec, dq_des: JointVec) -> GovernedSetpoint {
+        GovernedSetpoint {
+            q_des,
+            dq_des,
+            received: Instant::now(),
+        }
+    }
+
+    /// Gravity at `q`, with Coriolis and friction at `dq`.
+    fn inverse_dynamics(model: &srs_model::Arm, q: &JointVec, dq: &JointVec) -> JointVec {
+        let posed = model.at(q);
+        let (gravity, coriolis) = (posed.gravity_torques(), posed.coriolis_torques(dq));
+        let friction = friction::torques(&friction::NOMINAL, dq);
+        std::array::from_fn(|i| gravity[i] + coriolis[i] + friction[i])
+    }
+
+    #[test]
+    fn a_tick_feeds_friction_and_coriolis_at_the_commanded_velocity() {
+        let model = v2_arm();
+        let limits = model.limits();
+        let setpoint = arrived(POSE, DQ);
+        let tick = tick_command(&model, &POSE, Some(setpoint), &limits, setpoint.received);
+        assert_eq!(tick.ff_tau, inverse_dynamics(&model, &POSE, &DQ));
+        let posed = model.at(&POSE);
+        assert!(
+            posed.coriolis_torques(&DQ).iter().any(|&tau| tau != 0.0),
+            "the velocity turns a Coriolis term on"
+        );
+        assert_ne!(tick.ff_tau, inverse_dynamics(&model, &POSE, &ZERO));
+    }
+
+    #[test]
+    fn a_tick_feeds_gravity_at_the_measured_pose() {
+        let model = v2_arm();
+        let limits = model.limits();
+        let ahead = [0.5, 0.8, -0.2, 1.4, 0.4, 0.3, 0.2];
+        let setpoint = arrived(ahead, ZERO);
+        let tick = tick_command(&model, &POSE, Some(setpoint), &limits, setpoint.received);
+        assert_eq!(tick.ff_tau, inverse_dynamics(&model, &POSE, &ZERO));
+        assert_ne!(tick.ff_tau, inverse_dynamics(&model, &ahead, &ZERO));
+        assert_eq!(tick.q_des, ahead);
+    }
+
+    #[test]
+    fn an_arm_with_no_setpoint_holds_where_it_measures() {
+        let model = v2_arm();
+        let limits = model.limits();
+        let tick = tick_command(&model, &POSE, None, &limits, Instant::now());
+        assert_eq!(
+            tick,
+            TickCommand {
+                q_des: POSE,
+                dq_des: ZERO,
+                ff_tau: inverse_dynamics(&model, &POSE, &ZERO),
+            }
+        );
+    }
+
+    #[test]
+    fn a_setpoint_that_stops_arriving_holds_its_position_at_zero_velocity() {
+        let model = v2_arm();
+        let limits = model.limits();
+        let setpoint = arrived(POSE, DQ);
+        let after = |silence| {
+            tick_command(
+                &model,
+                &POSE,
+                Some(setpoint),
+                &limits,
+                setpoint.received + silence,
+            )
+        };
+        assert_eq!(after(SETPOINT_STALE_AFTER).dq_des, DQ);
+        assert_eq!(
+            after(SETPOINT_STALE_AFTER + Duration::from_millis(1)),
+            TickCommand {
+                q_des: POSE,
+                dq_des: ZERO,
+                ff_tau: inverse_dynamics(&model, &POSE, &ZERO),
+            }
+        );
+    }
+
+    #[test]
+    fn a_tick_feeds_no_outward_velocity_at_a_limit() {
+        let model = v2_arm();
+        let limits = model.limits();
+        let mut past_the_limit = POSE;
+        past_the_limit[0] = limits[0].hi + 0.1;
+        let setpoint = arrived(past_the_limit, [1.0; ARM_DOF]);
+        let tick = tick_command(&model, &POSE, Some(setpoint), &limits, setpoint.received);
+        assert_eq!(tick.dq_des[0], 0.0);
+        assert_eq!(
+            tick.ff_tau,
+            inverse_dynamics(&model, &POSE, &tick.dq_des),
+            "the feedforward runs at the clamped velocity"
+        );
+    }
 
     fn unit_limits() -> [Limit; ARM_DOF] {
         std::array::from_fn(|_| Limit { lo: -1.0, hi: 1.0 })
